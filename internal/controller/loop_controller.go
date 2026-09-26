@@ -99,7 +99,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
-		desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
+		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
+		// (S1). Running is the default for a normal Loop.
+		if loop.Spec.Suspend {
+			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+		} else {
+			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
+		}
 		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{
 			{
 				Name:  "agent",

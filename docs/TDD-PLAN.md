@@ -28,7 +28,7 @@ after-the-fact — kept. Adding the missing seams:
 | # | Slice | Seam | Status |
 |---|-------|------|--------|
 | S0 | Loop → a Sandbox owned by it exists; phase set to Pending; idempotent on re-reconcile | envtest | ✅ green (written after code — noted) |
-| S1 | A Loop with `spec.suspend:true` does not run a Running sandbox | envtest | ⬜ red |
+| S1 | A Loop with `spec.suspend:true` does not run a Running sandbox | envtest | ✅ green |
 | S2 | A pre-existing Sandbox (from a prior controller instance) is not re-created | envtest | ⬜ |
 | S3 | `status.observedGeneration` tracks spec changes | envtest | ⬜ |
 

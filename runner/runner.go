@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -52,8 +53,13 @@ const (
 	// tests reference the same name instead of a repeated literal (goconst).
 	toolNameShell = "shell"
 
-	// I5: shell command timeout.
-	shellTimeout = 60 * time.Second
+	// I5: shell command timeout (I10: injectable via runConfig.ShellTimeout;
+	// this is the default).
+	defaultShellTimeout = 60 * time.Second
+
+	// I10: how long Wait tolerates pipes held open by straggler processes after
+	// the command's main process exits, before it stops waiting on them.
+	shellWaitDelay = 2 * time.Second
 )
 
 // runConfig is the input to run. BaseURL points at an OpenAI-compatible
@@ -67,6 +73,10 @@ type runConfig struct {
 	// MaxSteps caps the number of model rounds (tool-call loops). I5: was a
 	// hard const of 5; now configurable. Zero uses defaultMaxSteps.
 	MaxSteps int
+	// ShellTimeout bounds a single shell tool call (I10: was a hard const 60s).
+	// Zero uses defaultShellTimeout. The whole process group is killed on
+	// timeout, so a command that backgrounds a child can't hang the runner.
+	ShellTimeout time.Duration
 }
 
 // Result is the result file schema (Phase 0 subset of the Phase 1 contract).
@@ -182,13 +192,18 @@ func run(cfg runConfig) Result {
 		maxSteps = defaultMaxSteps
 	}
 
+	shellTimeout := cfg.ShellTimeout
+	if shellTimeout <= 0 {
+		shellTimeout = defaultShellTimeout
+	}
+
 	messages := []chatMessage{
 		{Role: jsonRoleSystem, Content: systemPrompt},
 		{Role: jsonRoleUser, Content: cfg.Prompt},
 	}
 
 	answer, trace, modelErr := driveModel(
-		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages, maxSteps,
+		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages, maxSteps, shellTimeout,
 	)
 
 	res := Result{
@@ -276,8 +291,11 @@ func callModel(
 
 // execShell runs the shell command named in a tool call's arguments JSON in
 // the workspace and returns combined output. I5: the output is capped to
-// maxToolOutputBytes before being fed back to the model.
-func execShell(workspace, argsJSON string) (string, error) {
+// maxToolOutputBytes before being fed back to the model. I10: the command runs
+// in its own process group; on timeout (or after the command returns) the whole
+// group is killed so a backgrounded child can't hold the pipe open and hang the
+// runner past the timeout.
+func execShell(workspace, argsJSON string, timeout time.Duration) (string, error) {
 	var args struct {
 		Command string `json:"command"`
 	}
@@ -285,10 +303,34 @@ func execShell(workspace, argsJSON string) (string, error) {
 		return "", fmt.Errorf("bad tool args: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), shellTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
 	cmd.Dir = workspace
+	// I10: run in its own process group so we can kill the whole group (the
+	// command plus any children it spawned) on timeout, not just `sh`.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Kill the entire process group when the context is done (timeout) —
+	// CommandContext's default only signals the direct child.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// I10: stop waiting on pipes held by straggler processes once the main
+	// process has exited and been waited on.
+	cmd.WaitDelay = shellWaitDelay
+	// Belt-and-suspenders: also kill the group if Wait returns early (the
+	// default WaitDelay path) before Cancel fires. On both success and failure
+	// the group must not outlive the tool call, or a backgrounded process
+	// leaks across steps.
+	defer func() {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}()
+
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return truncateToolOutput(string(out) + " (exit: " + err.Error() + ")"), nil
@@ -320,7 +362,7 @@ func knownToolNames() map[string]bool {
 // truncated before being fed back.
 func driveModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string,
-	messages []chatMessage, maxSteps int,
+	messages []chatMessage, maxSteps int, shellTimeout time.Duration,
 ) (string, []string, string) {
 	known := knownToolNames()
 	trace := []string{}
@@ -355,7 +397,7 @@ func driveModel(
 				})
 				continue
 			}
-			out, err := execShell(workspace, tc.Function.Arguments)
+			out, err := execShell(workspace, tc.Function.Arguments, shellTimeout)
 			if err != nil {
 				out = err.Error()
 			}

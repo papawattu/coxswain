@@ -117,7 +117,12 @@ is targeted (OpenAI-compatible fits the homelab vLLM stack).
 
 ### I5. Runner robustness
 
-- [ ] Done
+- [x] Done — commit `5c91a50` (I5+I7 together)
+
+  - HTTP status checked (401/500 → blocked with "HTTP <n>: <body>" in notes);
+    `io.ReadAll` error checked; unknown tool names rejected (not executed);
+    shell output capped to 16 KiB; `maxSteps` configurable via
+    `runConfig.MaxSteps`; `itoa` wrapper dropped.
 
 **Where:** `runner/runner.go`.
 

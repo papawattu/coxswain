@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/papawattu/coxswain/runner/testhelper"
 )
@@ -147,5 +148,95 @@ func TestRunnerRespectsConfigurableMaxSteps(t *testing.T) {
 	}
 	if !strings.Contains(res.VerificationNotes, "maxSteps") {
 		t.Errorf("verificationNotes = %q; want a maxSteps note", res.VerificationNotes)
+	}
+}
+
+// I10: a command that leaves a background child running (a dev server, a
+// `sleep & wait`) must not hang the runner past the shell timeout.
+// CommandContext kills only `sh`; the child inherits the pipe and
+// CombinedOutput waits for its EOF (which for a server is never). Fix: run the
+// command in its own process group, kill the whole group on timeout, and use
+// WaitDelay so Wait stops waiting on stragglers. Seam: runConfig.ShellTimeout
+// (injected ~1s) + the wall time run() takes + the result file.
+func TestRunnerShellTimeoutKillsBackgroundChildren(t *testing.T) {
+	fake := testhelper.New(
+		testhelper.ModelResponse{
+			ToolCall: &testhelper.ToolCall{
+				ID:        "call_bg",
+				Name:      toolNameShell,
+				Arguments: `{"command":"sleep 30 & wait"}`,
+			},
+		},
+	)
+	defer fake.Close()
+
+	done := make(chan struct{})
+	var res Result
+	start := time.Now()
+	go func() {
+		res = run(runConfig{
+			Prompt:       "start a server",
+			Workspace:    t.TempDir(),
+			BaseURL:      fake.URL,
+			Model:        fakeModelName,
+			ShellTimeout: 1 * time.Second,
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("run() did not return within 5s; the shell timeout did not kill the " +
+			"background child (hangs until the child exits)")
+	}
+
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("run() took %v; the 1s shell timeout + group kill should return in "+
+			"~1-2s, not wait for the 30s child", elapsed)
+	}
+	if res.Status != statusSuccess && res.Status != statusBlocked {
+		t.Fatalf("status = %q, want success or blocked", res.Status)
+	}
+}
+
+// I10 (success path): a command that succeeds but detaches a background child
+// must not leak that child across steps — the process group is killed after the
+// command returns too, so the pipe is not held open.
+func TestRunnerShellTimeoutKillsChildAfterSuccess(t *testing.T) {
+	fake := testhelper.New(
+		testhelper.ModelResponse{
+			ToolCall: &testhelper.ToolCall{
+				ID:        "call_bg2",
+				Name:      toolNameShell,
+				Arguments: `{"command":"(sleep 30 &) ; echo started"}`,
+			},
+		},
+	)
+	defer fake.Close()
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		res := run(runConfig{
+			Prompt:       "detach a bg job",
+			Workspace:    t.TempDir(),
+			BaseURL:      fake.URL,
+			Model:        fakeModelName,
+			ShellTimeout: 2 * time.Second,
+		})
+		_ = res
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("run() did not return within 5s; the post-success group kill did not " +
+			"release the pipe held by the background child")
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("run() took %v; the post-success group kill should release the "+
+			"pipe quickly", elapsed)
 	}
 }

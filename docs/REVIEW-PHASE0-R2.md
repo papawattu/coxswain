@@ -87,7 +87,7 @@ has a test where the agent edits a protected file **and** rewrites
 
 ### D8. Foreign-owned sandbox should surface as a condition, not a retry storm
 
-- [ ] Added to Phase 1 plan
+- [x] Added to Phase 1 plan — **B6** in `docs/TDD-PLAN-PHASE1.md`.
 
 **Where:** `internal/controller/loop_controller.go` (`ensureSandbox`, after
 `900c72f`); `docs/TDD-PLAN-PHASE1.md`.

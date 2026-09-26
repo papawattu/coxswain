@@ -76,6 +76,17 @@ model.
 - **B5** — *maxIterations.* A Loop that keeps failing stops at `maxIterations`
   with `Failed:MaxIterations` (terminal). Seam: a Loop with `maxIterations: 2`
   that always fails → `Failed:MaxIterations` after 2 tries.
+- **B6** — *Foreign-owned sandbox → condition, not a retry storm (D8).*
+  `ensureSandbox` returns `AlreadyOwnedError` when the Loop's sandbox is owned
+  by a different controller (I2, `900c72f`); as-is that loops `Reconcile` into
+  an exponential-backoff requeue forever, visible only in logs. Fix (when the
+  phase machine + conditions exist): on `AlreadyOwnedError`, emit a `Warning`
+  event, set condition `SandboxReady=False` reason `SandboxNameConflict`, and
+  **return nil** (no error, no requeue). Seam: the foreign-owner test in
+  `loop_adoption_test.go` is updated to assert the condition + event and that
+  `Reconcile` returns nil (it currently asserts an error — that assertion is
+  deliberately left as a red marker until B6 lands). Do not implement before
+  the condition/event infrastructure from B1 exists.
 
 ## Settled design questions (2026-09-26, all confirmed with user)
 

@@ -1,4 +1,4 @@
-apiVersion: cox.cox.dev/v1alpha1
+apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
   labels:

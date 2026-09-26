@@ -3,7 +3,7 @@
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
 cliVersion: 4.16.0
-domain: cox.dev
+domain: wattu.com
 layout:
 - go.kubebuilder.io/v4
 projectName: coxswain
@@ -13,8 +13,8 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: cox.dev
-  group: cox
+  domain: wattu.com
+  group: coxswain
   kind: Loop
   path: github.com/papawattu/coxswain/api/v1alpha1
   version: v1alpha1

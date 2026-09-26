@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.22.0
-  name: loops.cox.cox.dev
+  name: loops.coxswain.wattu.com
 spec:
-  group: cox.cox.dev
+  group: coxswain.wattu.com
   names:
     kind: Loop
     listKind: LoopList

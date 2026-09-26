@@ -23,7 +23,7 @@ rules:
   verbs:
   - get
 - apiGroups:
-  - cox.cox.dev
+  - coxswain.wattu.com
   resources:
   - loops
   verbs:
@@ -35,13 +35,13 @@ rules:
   - update
   - watch
 - apiGroups:
-  - cox.cox.dev
+  - coxswain.wattu.com
   resources:
   - loops/finalizers
   verbs:
   - update
 - apiGroups:
-  - cox.cox.dev
+  - coxswain.wattu.com
   resources:
   - loops/status
   verbs:

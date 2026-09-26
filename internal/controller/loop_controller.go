@@ -44,9 +44,9 @@ type LoopReconciler struct {
 	SandboxImage string
 }
 
-// +kubebuilder:rbac:groups=cox.cox.dev,resources=loops,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=cox.cox.dev,resources=loops/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=cox.cox.dev,resources=loops/finalizers,verbs=update
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
 

@@ -13,9 +13,21 @@ import (
 
 // Received is the last request body the fake server saw, decoded.
 type Received struct {
-	Model    string             `json:"model"`
-	Messages []ReceivedMessage  `json:"messages"`
-	Tools    []json.RawMessage  `json:"tools"`
+	Model    string            `json:"model"`
+	Messages []ReceivedMessage `json:"messages"`
+	Tools    []json.RawMessage `json:"tools"`
+}
+
+// ToolResultMessages returns the messages in a request that are tool results
+// (role "tool"), so a test can assert the runner fed a tool call's output back.
+func (r Received) ToolResultMessages() []ReceivedMessage {
+	var out []ReceivedMessage
+	for _, m := range r.Messages {
+		if m.Role == "tool" {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 type ReceivedMessage struct {

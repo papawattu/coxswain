@@ -37,3 +37,16 @@ after-the-fact — kept. Adding the missing seams:
 The full phase state machine, budgets, stall detection, checkpointing, and memory
 curation are Phase 1+. Testing them now would be horizontal slicing (testing the
 shape of imagined behavior before it exists).
+
+## Status (2026-09-26)
+
+All seams in this plan are green and committed. Runner: R1-R5 (R5 folded into
+R1). Controller: S0 (pre-existing, kept), S1 (suspend - real red→green),
+S2/S3 (verification tests). goconst lint fixed by a shared test fixture. Full
+suite green; lint clean.
+
+**Next (not TDD-ordered yet):** the Phase 0 "done when" e2e - prove a Loop
+creates a Sandbox on a *real* cluster. Note: the dev box has a k3s cluster
+(pi0/pi1, v1.36.2) but no `kind` on PATH; the e2e environment decision
+(kind vs k3s, agent-sandbox controller install) is pending the e2e-prereqs
+investigation.

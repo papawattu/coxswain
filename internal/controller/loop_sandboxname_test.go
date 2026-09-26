@@ -17,32 +17,26 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-// P3 tidy-up: sandboxName keeps the Loop's sandbox name within the 63-char k8s
-// limit. Short Loop names pass through; long ones are hash-truncated.
+// sandboxName is now simply <loop>-sandbox. The guarantee that the result is a
+// valid DNS-1035 label <= 63 chars comes from the CRD's CEL validation on the
+// Loop name (D20: max 55 chars), not from sandboxName. These tests pin the
+// trivial behaviour.
 var _ = Describe("sandboxName", func() {
-	It("passes short names through unchanged", func() {
+	It("is <name>-sandbox", func() {
 		Expect(sandboxName("smoke")).To(Equal("smoke-sandbox"))
 		Expect(sandboxName("test-resource")).To(Equal("test-resource-sandbox"))
 	})
 
-	It("keeps the result within 63 chars for long names", func() {
-		long := ""
-		for range 80 {
-			long += "x"
-		}
-		got := sandboxName(long)
+	It("stays within 63 chars for a 55-char (the max valid) Loop name", func() {
+		name := strings.Repeat("a", 55)
+		got := sandboxName(name)
+		Expect(got).To(HaveLen(55 + len("-sandbox")))
 		Expect(len(got)).To(BeNumerically("<=", 63))
-	})
-
-	It("is deterministic and distinct per name", func() {
-		a := sandboxName("a-very-long-loop-name-that-would-overflow-the-63-char-limit-abcdef")
-		b := sandboxName("a-very-long-loop-name-that-would-overflow-the-63-char-limit-abcdef")
-		c := sandboxName("a-very-long-loop-name-that-would-overflow-the-63-char-limit-XYZZYZ")
-		Expect(a).To(Equal(b), "same name must produce the same sandbox name")
-		Expect(a).ToNot(Equal(c), "different names must produce different sandbox names")
 	})
 })

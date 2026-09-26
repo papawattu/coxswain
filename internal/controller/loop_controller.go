@@ -18,9 +18,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"unicode/utf8"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -152,24 +149,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	return nil
 }
 
-// sandboxName returns the Loop's Sandbox name, hash-truncated to stay within
-// the 63-char k8s limit (P3 tidy-up): <loop>-sandbox, or a short prefix + the
-// first 12 hex chars of sha256(loop name) when that would overflow.
+// sandboxName returns the Loop's Sandbox name: <loop>-sandbox. The Loop name
+// is CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
+// is always a valid DNS-1035 label <= 63 chars and needs no truncation.
 func sandboxName(loopName string) string {
-	const maxLen = 63
-	candidate := loopName + "-sandbox"
-	if len(candidate) <= maxLen {
-		return candidate
-	}
-	h := sha256.Sum256([]byte(loopName))
-	suffix := hex.EncodeToString(h[:])[:12]
-	// Leave room for "-" + the 12-char hash suffix (13 chars).
-	prefix := loopName[:maxLen-13]
-	// Back off the prefix to a UTF-8 rune boundary.
-	for len(prefix) > 0 && !utf8.RuneStart(prefix[len(prefix)-1]) {
-		prefix = prefix[:len(prefix)-1]
-	}
-	return prefix + "-" + suffix
+	return loopName + "-sandbox"
 }
 
 // sandboxImage returns the configured sandbox image, or a sensible Go dev default.

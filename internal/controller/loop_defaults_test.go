@@ -50,10 +50,13 @@ var _ = Describe("Loop maxIterations default", func() {
 	})
 
 	AfterEach(func() {
+		// I19: delete the namespace with a live context, then cancel — the old
+		// order cancelled first, so the delete ran on a cancelled context and
+		// failed silently. Use context.Background() so cleanup is robust.
+		_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		if cancel != nil {
 			cancel()
 		}
-		_ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	})
 
 	It("applies the maxIterations default when the loop block is omitted", func() {
@@ -77,17 +80,15 @@ var _ = Describe("Loop maxIterations default", func() {
 		}}
 		Expect(k8sClient.Create(ctx, u)).To(Succeed())
 
-		// Read it back via unstructured (Kind set so the Get is well-formed) and
-		// assert the CRD applied the maxIterations default.
+		// I19: CRD defaulting is applied synchronously at create, so a plain Get
+		// + Expect is enough — no Eventually needed. (The Get target needs its
+		// GVK set, or the client refuses the Get with "Kind is missing".)
 		got := &unstructured.Unstructured{}
 		got.SetGroupVersionKind(u.GroupVersionKind())
-		Eventually(func() bool {
-			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "no-loop-block"}, got); err != nil {
-				return false
-			}
-			v, found, err := unstructured.NestedInt64(got.Object, "spec", "loop", "maxIterations")
-			return found && err == nil && v == int64(10)
-		}, time.Second*30, time.Second).Should(BeTrue(),
-			"the CRD must default spec.loop.maxIterations to 10 when the loop block is omitted")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "no-loop-block"}, got)).To(Succeed())
+		v, found, err := unstructured.NestedInt64(got.Object, "spec", "loop", "maxIterations")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(found).To(BeTrue(), "spec.loop.maxIterations must be present after defaulting")
+		Expect(v).To(Equal(int64(10)), "the CRD must default spec.loop.maxIterations to 10 when the loop block is omitted")
 	})
 })

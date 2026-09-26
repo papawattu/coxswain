@@ -22,7 +22,6 @@ import (
 // them as consts avoids a 4-6 occurrence lint failure across the module.
 const (
 	systemPrompt   = "You are a coding agent inside a Kubernetes sandbox. Be concise."
-	fakeModelName  = "fake-model"
 	resultDirName  = ".coxswain"
 	resultFileName = "result.json"
 

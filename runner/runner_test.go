@@ -8,6 +8,10 @@ import (
 	"github.com/papawattu/coxswain/runner/testhelper"
 )
 
+// fakeModelName is the model string the fake server is configured with. It is
+// a test fixture (I8) — it lives in the test package, not runner.go.
+const fakeModelName = "fake-model"
+
 // R1: Given a prompt, the runner writes a result.json with
 // status:"success" and a non-empty summary. The model is a fake (the one
 // system boundary we mock); the seam is the result file, not the model call.

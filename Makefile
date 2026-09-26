@@ -68,17 +68,17 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # skips it. Test it explicitly so `make test` covers both modules.
 .PHONY: runner-test
 runner-test: ## Run the runner module's tests (separate go.mod).
-	cd runner && go test ./... -coverprofile cover-runner.out
+	cd runner && go vet ./... && go test ./... -coverprofile cover-runner.out
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run
-	cd runner && ../bin/golangci-lint run
+	cd runner && "$(GOLANGCI_LINT)" run
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	"$(GOLANGCI_LINT)" run --fix
-	cd runner && ../bin/golangci-lint run --fix
+	cd runner && "$(GOLANGCI_LINT)" run --fix
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.

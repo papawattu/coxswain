@@ -56,7 +56,16 @@ one commit is fine), then the round-1 P3 batch, then D5.
 
 ### I13. Runner nits from `88d3eb3` / `7f60865`
 
-- [ ] Done
+- [x] Done — commit `2622d62`
+
+  - The shell-timeout test now also asserts the fed-back tool-result message
+    (request 2) carries the kill/exit text (timeout visible to the model).
+  - `truncateToolOutput` `elided` is computed from the actual head/tail lengths
+    (after rune backing-off).
+  - `knownToolNames()` wrapper dropped; `knownTools` used directly.
+  - `run()`: `http.Client.Timeout` dropped; the per-request context is the only
+    model timeout.
+  - `setsid` escape noted (accepted, no action) in `execShell`.
 
 - `runner_robustness_test.go` `TestRunnerShellTimeoutKillsBackgroundChildren`
   asserts only wall time and a success/blocked status. The I10 acceptance

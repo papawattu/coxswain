@@ -238,7 +238,8 @@ run Phase 3 e2e on the homelab Ceph cluster (RBD supports snapshots).
   manager + metrics. Automate the manual steps in `E2E-PHASE0.md` (apply Loop
   → Sandbox exists with owner ref → log line). Use `make deploy`
   (`config/default` overlay) instead of the hand-patched namespace workaround.
-- [ ] **Scratch file committed** — delete
+- [x] **Scratch file committed** — delete — done by `5762374` (the scratch
+  scout file `docs/e2e-prereqs-scout-2026-09-26T21-02-17.md` was deleted)
   `docs/e2e-prereqs-scout-2026-09-26T21-02-17.md`.
 - [ ] **Controller tidy-ups** (`loop_controller.go`): type the logger param as
   `logr.Logger`; combine the two `Status().Update` calls into one; the

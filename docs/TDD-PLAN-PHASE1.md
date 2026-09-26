@@ -92,9 +92,46 @@ model.
   per check directly (not a termination message) and asserts the phase. A minimal
   verify Job image (clone + one tamper init container + one check init container
   per check) is built in Phase 1 and runs isolated (D12).
+- **B3a** — *Canary / negative control (ADR-0005 D17).* The code under test can
+  subvert the test process in-process (an `init(){ if testing.Testing() {
+  os.Exit(0) } }` makes `go test` exit 0 without running tests; no protected file
+  changes, so the glob diff is empty). Mitigation: the verify Job includes a
+  **canary check container** — the trusted tamper container generates a canary
+  test per tested package (random name, `t.Fatal` with a random token) into a
+  *separate copy* of the checkout, and a canary check container runs it that
+  **must fail** and whose failure must be reported by `go test` (non-zero exit).
+  A binary that exits 0 regardless of tests makes the canary *pass* →
+  **`Failed:SubvertedVerify`** (a new terminal reason; added to CONTEXT.md
+  "Failure reason"). Seam: envtest — assert the verify Job spec the operator
+  builds contains a canary check container (trusted image, over a separate
+  checkout copy); and the controller decision: canary container exit 0 ⇒
+  `Failed:SubvertedVerify`. e2e fixture: the round-8 probe (`init(){ if
+  testing.Testing() { os.Exit(0) } }`) as a fixture must end non-`Succeeded`.
+- **B3b** — *Restart semantics (ADR-0005 D18).* The operator reads the *single*
+  pod of the verify Job; `restartPolicy: OnFailure` / `backoffLimit > 0` would
+  restart or recreate pods and break "check *k* failed ⇒ iterate". Fix: the Job
+  spec has **`restartPolicy: Never`, `backoffLimit: 0`, `activeDeadlineSeconds`**
+  (D12); the operator reads the single pod by the Job's `controller-uid` label —
+  **zero or >1 pods ⇒ `VerifyError`**; `VerifyError`'s re-run creates a **new
+  Job** (name includes an attempt suffix), never reuses one. Seam: envtest —
+  assert the Job spec has `restartPolicy: Never` + `backoffLimit: 0`;
+  controller — a second pod for the Job's `controller-uid` ⇒ `VerifyError` (not
+  a pass); the re-run creates a new Job with an attempt suffix.
+- **B3c** — *Read-only checkout (ADR-0005 D19).* The "otherwise writable"
+  checkout branch let agent code in check 1 rewrite `*_test.go` after the
+  tamper check, so check 2 could compile doctored tests. Fix: the checkout is
+  mounted **read-only into every check container** (unconditional); each check
+  gets its own writable scratch `emptyDir` for `HOME`, `GOCACHE`, `GOPATH`,
+  `TMPDIR`; a check needing a writable tree gets a fresh copy from a trusted
+  init step. Seam: envtest — assert every check container mounts the checkout
+  `readOnly: true` and has its own scratch `emptyDir`.
 - **B4** — *Iteration + history.* Each transition increments `status.iteration`
-  and appends to `status.history[]` (the audit trail, incl. `verifiedCommit`).
-  Seam: assert iteration count and history entries after a multi-iteration run.
+  and appends to `status.history[]` (the audit trail, incl. `verifiedCommit`);
+  **also records which checks were `NotRun` after the first failing check
+  (I14)** — sequential init containers stop at the first non-zero, so the model
+  fixes one check per iteration and the next prompt targets the not-run set.
+  Seam: assert iteration count + history entries after a multi-iteration run,
+  and that checks after the first failing one are recorded as `NotRun`.
 - **B5** — *maxIterations.* A Loop that keeps failing stops at `maxIterations`
   with `Failed:MaxIterations` (terminal). Seam: a Loop with `maxIterations: 2`
   that always fails → `Failed:MaxIterations` after 2 tries.
@@ -205,7 +242,9 @@ is Phase 4 — Phase 1 uses `spec.approval.mode: Auto` only.
 
 A1 → A2 → A3 → A4 (runner, each red→green — note A4 is now *context
 continuity*; the old A4 "runner runs checks" is dropped per ADR-0005), then
-B1 → B2 → B3 → B4 → B5 → B6 (controller, each red→green). B2 (TamperedVerify
+B1 → B2 → B3 → B3a → B3b → B3c → B4 → B5 → B6 (controller, each red→green;
+B3's verify path is expanded into B3a/B3b/B3c for the D17 canary, D18 restart
+semantics, and D19 read-only checkout). B2 (TamperedVerify
 via base-ref hashing) is the highest-value test — the anti-gaming guarantee
 (D7). B6 (foreign-owned sandbox → condition, D8) needs B1's condition/event
 infrastructure.

@@ -32,7 +32,17 @@ Still open: **D10 (P1, before B2)**, D9, D11–D13, I9, and I4 (owner decision).
 
 ### I10. Shell timeout doesn't fire when the command leaves a child running
 
-- [ ] Done
+- [x] Done — commit `88d3eb3`
+
+  - `runConfig.ShellTimeout` (injected ~1s in the test, default 60s). `execShell`
+    runs the command in its own process group (`SysProcAttr{Setpgid: true}`),
+    `cmd.Cancel` kills the whole group (`syscall.Kill(-pid, SIGKILL)`) on
+    timeout, `cmd.WaitDelay` (2s) stops `Wait` waiting on stragglers, and the
+    group is also killed after the command returns so a backgrounded process
+    doesn't leak across steps.
+  - Red: `TestRunnerShellTimeoutKillsBackgroundChildren` (`sleep 30 & wait`, 1s
+    timeout) returns in ~1s (would hang ~30s); `TestRunnerShellTimeoutKillsChildAfterSuccess`
+    (detached bg child) returns in ~2s.
 
 **Where:** `runner/runner.go` `execShell` (`exec.CommandContext` +
 `CombinedOutput`).
@@ -69,7 +79,12 @@ tests green.
 
 ### I11. HTTP client timeout of 60 s is too short for real models
 
-- [ ] Done
+- [x] Done — commit `7f60865`
+
+  - `runConfig.ModelTimeout` (default 10min); each request wrapped in
+    `context.WithTimeout(ctx, modelTimeout)` so a run deadline can cancel it.
+    Test: 500ms delay vs 200ms timeout → `blocked` with a deadline message;
+    100ms delay vs 5s timeout → `success`.
 
 **Where:** `runner/runner.go` `run` (`&http.Client{Timeout: 60 * time.Second}`).
 
@@ -89,7 +104,16 @@ success.
 
 ### I12. Runner nits from `5c91a50`
 
-- [ ] Done
+- [x] Done — commit `7f60865`
+
+  - `truncateToolOutput` keeps head (4KiB) + tail (12KiB) with a
+    `… (N bytes elided) …` marker; cuts are on UTF-8 rune boundaries
+    (`cutRunePrefix`/`cutRuneSuffix`); the same rune-safe cut is applied to the
+    256-byte `errBody` cut in `callModel`.
+  - `resp.Body.Close()` defer is now `defer func() { _ = resp.Body.Close() }()`
+    (the no-op wrapper is gone).
+  - `knownTools` is now a package-level `var`; the truncation test asserts the
+    tail survives (HEAD-MARKER + TAIL-MARKER both kept).
 
 - `truncateToolOutput` keeps the **head** of the output. For builds and tests
   the useful part (the failure, the summary line) is usually at the **tail**.

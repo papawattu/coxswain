@@ -85,7 +85,7 @@ One plan→implement→verify cycle. Each iteration produces a commit on the Loo
 _Avoid_: round, step, pass
 
 **Acceptance checks**:
-User-authored verify commands in the Loop spec. The only gate that can flip a Loop to Succeeded. Their source files are protected paths. Per ADR-0005, the operator computes the baseline hashes from the **base ref** at Loop start and compares them against the protected paths **at the iteration commit** (via the verify Job) before any check runs — the agent never reports these hashes.
+User-authored verify commands in the Loop spec. The only gate that can flip a Loop to Succeeded. Their source files are protected paths. Per ADR-0005 (round 4, D10), the operator pins `status.baseCommit` (resolved from the workspace ref at Loop start) and protected paths are globs; the verify Job runs `git diff --name-only <baseCommit> <verifiedCommit> -- <globs>` before any check runs — the agent never reports the hashes, and the diff catches added/modified/deleted/renamed protected files.
 _Avoid_: tests, verify, gates
 
 **Agent checks**:
@@ -97,7 +97,7 @@ A one-shot object with a single goal. It ends in Succeeded or Failed. New goal =
 _Avoid_: task, job, run
 
 **TamperedVerify**:
-A failure reason set when the protected acceptance-check paths, hashed by the operator at the iteration commit, differ from the baseline the operator computed from the base ref (ADR-0005 — the agent never reports these hashes). The iteration fails before any check runs.
+A failure reason set when the verify Job's `git diff --name-only <baseCommit> <verifiedCommit> -- <protected globs>` is non-empty — i.e. a protected acceptance-check file was added, modified, deleted, or renamed relative to the operator-pinned base commit (ADR-0005 round 4, D10; the agent never reports these). The iteration fails before any check runs.
 _Avoid_: tamper, sabotage, game
 
 **Audit trail**:

@@ -32,7 +32,7 @@ must be settled before B2 is built.
 
 ### D10. Protected-path hashing misses new files; replace hashes with a pinned base commit + protected globs
 
-- [x] Decided (amend ADR-0005) — commit `TICKME`
+- [x] Decided (amend ADR-0005) — commit `23e7f0d`
 
   - ADR-0005 rewritten: `status.baseCommit` (resolved from `spec.workspace.ref`
     at Loop start, pinned) + `spec.verify.protectedPaths[]` globs (per-language
@@ -163,7 +163,7 @@ list. Note for B3's test: envtest has no Job controller, so the test sets Job
 
 ### D9. B6 "return nil, no requeue" can wedge the Loop
 
-- [x] Plan amended — `TDD-PLAN-PHASE1.md` B6 (commit `TICKME`)
+- [x] Plan amended — `TDD-PLAN-PHASE1.md` B6 (commit `23e7f0d`)
 
   - B6 now: `return nil` + `RequeueAfter(5m)` while `SandboxNameConflict` is set
     (or a `Watches` on Sandboxes by name). Added B6 test: delete the foreign

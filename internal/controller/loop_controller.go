@@ -83,8 +83,15 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 }
 
 // ensureSandbox creates the Loop's Sandbox if it does not already exist, and
-// logs it. It is idempotent: an existing Sandbox is left functionally
-// untouched (we only re-assert ownership and the container spec).
+// logs it. It is idempotent: an existing sandbox is left functionally
+// untouched except that we re-assert ownership and the container spec.
+//
+// I2: the controller owner ref is set *inside* the mutate func, after
+// CreateOrUpdate's Get has populated `desired` with the server copy. Setting
+// it beforehand (on the empty desired) is dropped by the Get for an existing
+// sandbox, which orphans it (no GC, no Owns mapping). For a sandbox owned by
+// a *different* controller, SetControllerReference returns AlreadyOwnedError,
+// so we never silently take it over.
 func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, log interface {
 	Info(string, ...any)
 }) error {
@@ -93,9 +100,6 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			Name:      loop.Name + "-sandbox",
 			Namespace: loop.Namespace,
 		},
-	}
-	if err := controllerutil.SetControllerReference(loop, desired, r.Scheme); err != nil {
-		return err
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
@@ -115,7 +119,10 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				Command: []string{"sh", "-c", "sleep infinity"},
 			},
 		}
-		return nil
+		// Set the controller owner ref here, on the (possibly server-populated)
+		// object. Returns AlreadyOwnedError if a different controller already
+		// owns it (I2: never take over a foreign sandbox).
+		return controllerutil.SetControllerReference(loop, desired, r.Scheme)
 	})
 	if err != nil {
 		return err

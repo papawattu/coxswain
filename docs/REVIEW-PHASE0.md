@@ -39,7 +39,7 @@ already decodes `Tools` from the request, but no test asserts on it.
 
 ### I2. Adopted Sandbox gets no owner reference
 
-- [ ] Done
+- [x] Done (S2 extended + new foreign-ownership test in loop_adoption_test.go; SetControllerReference moved into the mutate func in loop_controller.go)
 
 **Where:** `internal/controller/loop_controller.go:97-117` (`ensureSandbox`).
 

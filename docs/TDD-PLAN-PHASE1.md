@@ -39,13 +39,15 @@ the work for that phase, and writes `result.json` (which carries the reported
   (Phase 0 R3 already proved tool exec); here it additionally must write
   `result.json.status` per the phase outcome and `filesChanged[]`. Seam: workspace
   files + result.
-- **A4** — *Verifying phase.* The runner runs each acceptance check (a shell
-  command) and records exit codes. Exit 0 = pass. The verify output is written so
-  the operator can feed it into the next prompt. Seam: workspace + result.
-- **A5** — *Model context continuity.* Across Planning→Implementing→Verifying
-  within one iteration, the runner keeps the same conversation (the model is
-  called with the accumulated message history, not reset each phase). Seam: the
-  fake model's request history across a multi-phase run.
+- **A4** — *Model context continuity.* Across Planning→Implementing within one
+  iteration, the runner keeps the same conversation (the model is called with the
+  accumulated message history, not reset each phase). Seam: the fake model's
+  request history across a multi-phase run.
+
+> **A4 (old: Verifying phase) is DROPPED (ADR-0005).** The runner does **not**
+> run acceptance checks or report exit codes. Verify evidence is obtained by the
+> operator via an isolated Job (B3) and base-ref hashing (B2); the runner's job
+> ends at writing `result.json` (claims) and pushing its commit.
 
 ### B. Controller reconcile state machine (`internal/controller/`)
 The Phase 0 controller only ensured the sandbox + set `Pending`. Phase 1 drives
@@ -59,17 +61,28 @@ model.
   `Verifying → Implementing` (re-plan/implement on failure), `Verifying → Failed`
   on `MaxIterations`. Seam: cluster state via envtest (set observedPhase, reconcile,
   assert phase).
-- **B2** — *Protected paths / TamperedVerify.* The operator hashes the
-  acceptance-check source files at iteration start; if they changed during
-  implement, the iteration fails with `TamperedVerify` **before any check runs**
-  (terminal). Seam: create a Loop with a protected test file, mutate it in the
-  "implement" step (simulate the runner), reconcile, assert `Failed:
-  TamperedVerify` and that no verify check ran. This is the core anti-gaming test.
-- **B3** — *Deterministic verify.* Run each acceptance check; all exit 0 →
-  `Succeeded`; any non-zero → feed output forward to the next implement prompt.
-  Seam: envtest with a fake "check ran" signal (or a real shell in a sandbox —
-  but for the controller unit test, the verify *outcome* is an input, not
-  recomputed).
+- **B2** — *Protected paths / TamperedVerify (ADR-0005).* The operator hashes
+  the protected paths **at the base ref at Loop start** (baseline, stored in
+  `status.verify.baselineHashes`). At `Verifying`, the verify Job hashes the
+  protected paths **at the iteration commit**; the operator compares baseline vs
+  iteration-commit and, on any divergence, fails the iteration with
+  `TamperedVerify` **before any check runs** (terminal). The agent has no write
+  path to the evidence. Seam: create a Loop with a protected test file, "mutate
+  it in the implement step" (commit the mutation on the iteration commit), and —
+  **to prove the anti-gaming property** — also have the (fake) runner rewrite
+  `result.json` to *claim* the baseline hash still matches. The operator ignores
+  that claim, compares its own base-ref baseline to the iteration-commit hash,
+  and the Loop ends `Failed:TamperedVerify` with no verify check run. **This is
+  the core anti-gaming test (D7 acceptance).**
+- **B3** — *Deterministic verify via the Job (ADR-0005).* At `Verifying`, the
+  operator creates a short-lived verify Job (fresh pod, no shared process
+  namespace with the sandbox) that checks out the Loop branch at the iteration
+  commit and runs the acceptance checks **from the base ref**; the operator
+  reads the Job's status/exit code from the API. All exit 0 → `Succeeded`; any
+  non-zero → feed the Job's output into the next implement prompt. Seam: envtest
+  where the verify *outcome* is the Job's status (an input the operator read,
+  not a value from `result.json` and not recomputed by the operator). A minimal
+  verify Job image (checkout + run commands + exit code) is built in Phase 1.
 - **B4** — *Iteration + history.* Each transition increments `status.iteration`
   and appends to `status.history[]` (the audit trail). Seam: assert iteration
   count and history entries after a multi-iteration run.
@@ -101,19 +114,21 @@ model.
    shell that can patch its own Loop status can lie about its own progress,
    which breaks determinism + auditability and contradicts CONTEXT.md's
    "result file is the only output the operator reads." See ADR-0004.
-2. **Tamper hash = runner reports.** The runner reports the sha256 of each
-   acceptance-check source file in `result.json` (baseline at iteration start,
-   re-reported after implement). The operator compares reported hashes to the
-   recorded baseline and *decides* `TamperedVerify` (terminal, before any check
-   runs). The operator never opens files — it stays content-free. The runner is
-   trusted to report hashes honestly (the operator can't verify the hash is of
-   the real file; this is the accepted trade-off for keeping the operator
-   deterministic). *(Note: D3 verify-isolation in REVIEW-PHASE0.md — how to stop
-   the agent gaming the checks beyond file-hashing — is still open and must be
-   decided before cutting B2.)*
-3. **Verify = runner executes, operator decides.** The runner runs each
-   acceptance check in the sandbox and reports exit codes in `result.json`.
-   The operator reads the outcome and decides Succeeded vs re-implement.
+2. **Tamper hash = operator computes from the base ref (REVISED, ADR-0005).**
+   ~~Runner reports the sha256 of each protected file in `result.json`~~ → the
+   runner **does not report** hashes. The operator computes the baseline
+   **once, from the base ref, at Loop start**, and at `Verifying` the verify
+   Job hashes the protected paths **at the iteration commit**; the operator
+   compares and decides `TamperedVerify` (terminal, before any check runs).
+   The agent has no write path to the evidence. See ADR-0005.
+3. **Verify = isolated Job, operator reads Job status (REVISED, ADR-0005).**
+   ~~Runner runs each acceptance check and reports exit codes in
+   `result.json`~~ → at `Verifying` the operator creates a short-lived Job
+   (fresh pod, no shared process namespace with the sandbox) that checks out
+   the Loop branch at the iteration commit, runs the acceptance checks (from
+   the base ref), and reports via container exit code / Job status, which the
+   operator reads from the API. `result.json` carries claims only. See
+   ADR-0005.
 
 ## CRD changes (Phase 1)
 
@@ -134,15 +149,25 @@ model.
 - `history []HistoryEntry` — the audit trail: `{ iteration, phase, reason, message, timestamp }`
 - `iteration` (int) — already present from Phase 0
 - `verify` `{ lastCheckResults []string, baselineHashes []FileHash }` — the
-  recorded hash baseline for TamperedVerify (design Q2) and the last verify
-  output to feed forward
+  recorded hash baseline for TamperedVerify (**operator-computed from the base
+  ref** at Loop start, ADR-0005) and the last verify outcome (from the verify
+  Job) to feed forward
 
 `FileHash` = `{ path string, sha256 string }`.
 
+**`result.json` (the runner's claims file) carries NO verify-evidence fields**
+(ADR-0005). Its schema for Phase 1 is: `status` (success|blocked|needs_input),
+`summary`, `filesChanged[]`, `verificationNotes` (a *claim*, free text),
+`nextIterationPlan?`, `lessons[]`, and the reported `observedPhase`. The verify
+outcome and protected-path hashes are **not** in `result.json` — they come from
+the verify Job (outcome) and the operator's own base-ref hashing (baseline).
+
 RBAC: the runner gets **no** Loop RBAC (ADR-0004) — it is credential-free and
-only writes `result.json`. The operator keeps full CRUD on loops + sandboxes and
-*also* gains the ability to read `result.json` from the sandbox (D2: `pods/exec`
-to `cat`, a shared PVC, or a read-only sidecar — decided in ADR-0005).
+only writes `result.json`. The operator keeps full CRUD on loops + sandboxes
+and, per ADR-0005, gains:
+- `pods/exec` — to `cat` the runner's claims `result.json` out of the sandbox.
+- `jobs` create/delete/list/get (in the Loop's namespace) — to create the verify
+  Job and read its status (the verify evidence).
 
 
 ## Out of scope for Phase 1
@@ -154,6 +179,9 @@ is Phase 4 — Phase 1 uses `spec.approval.mode: Auto` only.
 
 ## Suggested slice order (once seams are confirmed)
 
-A1 → A2 → A3 → A4 → A5 (runner, each red→green), then
-B1 → B2 → B3 → B4 → B5 (controller, each red→green). B2 (TamperedVerify) is the
-highest-value test — the anti-gaming guarantee.
+A1 → A2 → A3 → A4 (runner, each red→green — note A4 is now *context
+continuity*; the old A4 "runner runs checks" is dropped per ADR-0005), then
+B1 → B2 → B3 → B4 → B5 → B6 (controller, each red→green). B2 (TamperedVerify
+via base-ref hashing) is the highest-value test — the anti-gaming guarantee
+(D7). B6 (foreign-owned sandbox → condition, D8) needs B1's condition/event
+infrastructure.

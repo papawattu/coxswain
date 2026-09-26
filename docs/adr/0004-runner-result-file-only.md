@@ -18,11 +18,14 @@ The phase channel, precisely:
   argument when it `exec`s into the sandbox. The operator is the writer; the
   runner never writes Loop status.
 - **Runner → operator:** the runner does the work and writes `result.json`
-  (status, summary, filesChanged, verificationNotes, lessons, and — in Phase 1 —
-  the verify outcome + reported file hashes). The operator reads `result.json`
-  (via `kubectl exec cat` or a shared PVC, per ADR-0005/D2) and **it** updates
-  `loop.Status.ObservedPhase`, `loop.Status.Iteration`, `loop.Status.History`,
-  etc. from what the result file reported.
+  (status, summary, filesChanged, verificationNotes, lessons, nextIterationPlan,
+  needs_input). **These are claims, not evidence** — see ADR-0005. The operator
+  reads `result.json` (via `kubectl exec cat`, per ADR-0005/D2) and uses the
+  claims to build the next prompt / PR description / audit text. The operator
+  **never** gates on a `result.json` field; verify evidence (check outcome,
+  protected-path hashes) is obtained independently (ADR-0005). The operator
+  updates `loop.Status.ObservedPhase`, `loop.Status.Iteration`,
+  `loop.Status.History`, etc. from the claims + its own evidence.
 
 `loop.Status.ObservedPhase` therefore remains a field, but it is the
 **operator's record of what the runner reported**, written by the operator — not
@@ -50,11 +53,17 @@ runner's write access to it.
 ## Consequences
 
 - The runner image is credential-free. No `ServiceAccount` token is mounted.
-- The operator gains the ability to read `result.json` from the sandbox (D2:
-  `pods/exec` to `cat`, a shared PVC the operator also mounts, or a read-only
-  sidecar — decided in ADR-0005). This is the operator reading *evidence*,
-  which is allowed (the operator may read exit codes, the result file, and
-  hashes); it is not the operator *inspecting content to judge quality*.
+- **Amended by ADR-0005:** the operator reads `result.json` for the agent's
+  *claims* only (via `pods/exec`). Verify *evidence* (check outcome, protected
+  hashes) is obtained by the operator independently — an isolated Job at the
+  iteration commit with checks from the base ref, and baseline hashes computed
+  from the base ref. `result.json` carries no verify-evidence fields, and the
+  operator never reads back `.coxswain/desired-phase` (it writes it as a hint
+  only; `status.desiredPhase` is the only truth).
+- The operator gains `pods/exec` (read claims) and `jobs` create/delete/list/get
+  (obtain evidence) RBAC. Reading the Job's status is the operator reading
+  *evidence* (allowed: the operator may read exit codes and hashes it obtained);
+  it is not the operator *inspecting content to judge quality*.
 - The Phase 1 A1 runner seam does **not** include a "patch Loop status" mock.
   The runner test asserts only on `result.json` + workspace files + the fake
   model's request history.

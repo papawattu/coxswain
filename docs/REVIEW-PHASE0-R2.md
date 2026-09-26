@@ -32,7 +32,23 @@ but neither box is ticked in `REVIEW-PHASE0.md` — tick both with the hashes.
 
 ### D7. Phase 1 plan still lets the runner self-report verify evidence
 
-- [ ] Decided (ADR: 0005)
+- [x] Decided (ADR: 0005)
+
+  - ADR-0005 (`docs/adr/0005-operator-verifies-via-isolated-job.md`): result.json
+    carries the agent's **claims only** — never evidence the operator gates on.
+    Verify evidence = an isolated Job at the iteration commit (checks from the
+    base ref, reported via Job status) + baseline hashes the operator computes
+    from the base ref at Loop start.
+  - ADR-0004 amended: operator never reads `.coxswain/desired-phase` back
+    (`status.desiredPhase` is the only truth); result.json has no verify-evidence
+    fields.
+  - `TDD-PLAN-PHASE1.md`: settled Q2–3 rewritten; old A4 (runner runs checks)
+    dropped and renumbered; B2/B3 seams now Job/Operator evidence (B2's seam is
+    the anti-gaming test: agent edits a protected file **and** forges
+    result.json to claim the baseline matches → Loop still ends
+    `Failed:TamperedVerify`).
+  - `CONTEXT.md`: Acceptance checks + TamperedVerify entries updated to the
+    base-ref / iteration-commit model.
 
 **Where:** `docs/adr/0004-runner-result-file-only.md`;
 `docs/TDD-PLAN-PHASE1.md` settled questions 2 ("Tamper hash = runner

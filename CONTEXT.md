@@ -85,7 +85,7 @@ One plan→implement→verify cycle. Each iteration produces a commit on the Loo
 _Avoid_: round, step, pass
 
 **Acceptance checks**:
-User-authored verify commands in the Loop spec. The only gate that can flip a Loop to Succeeded. Their source files are protected paths — the operator diffs them after each implement and fails the iteration if they changed.
+User-authored verify commands in the Loop spec. The only gate that can flip a Loop to Succeeded. Their source files are protected paths. Per ADR-0005, the operator computes the baseline hashes from the **base ref** at Loop start and compares them against the protected paths **at the iteration commit** (via the verify Job) before any check runs — the agent never reports these hashes.
 _Avoid_: tests, verify, gates
 
 **Agent checks**:
@@ -97,7 +97,7 @@ A one-shot object with a single goal. It ends in Succeeded or Failed. New goal =
 _Avoid_: task, job, run
 
 **TamperedVerify**:
-A failure reason set when protected acceptance-check files differ from their hash recorded at the start of the iteration. The iteration fails before any check runs.
+A failure reason set when the protected acceptance-check paths, hashed by the operator at the iteration commit, differ from the baseline the operator computed from the base ref (ADR-0005 — the agent never reports these hashes). The iteration fails before any check runs.
 _Avoid_: tamper, sabotage, game
 
 **Audit trail**:

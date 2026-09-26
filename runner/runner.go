@@ -64,12 +64,16 @@ func run(cfg runConfig) Result {
 		{"role": "user", "content": cfg.Prompt},
 	}
 
-	answer, trace := driveModel(context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages)
+	answer, trace, modelErr := driveModel(context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages)
 
 	res := Result{
 		Status:    "success",
 		Summary:   answer,
 		ToolTrace: trace,
+	}
+	if modelErr != "" {
+		res.Status = "blocked"
+		res.VerificationNotes = modelErr
 	}
 	// R5's path is created here; R1 only needs it to exist.
 	if err := writeResult(filepath.Join(cfg.Workspace, ".coxswain", "result.json"), res); err != nil {
@@ -165,19 +169,19 @@ func itoa(n int) string { return strconv.Itoa(n) }
 // trace. It loops on tool calls: when the model returns shell tool calls, each
 // is executed in the workspace and the combined output is fed back as a tool
 // message, until the model returns a plain answer (or maxSteps is reached).
-func driveModel(ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string, messages []map[string]any) (string, []string) {
+func driveModel(ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string, messages []map[string]any) (string, []string, string) {
 	trace := []string{}
 	const maxSteps = 5
 
 	for step := 0; step < maxSteps; step++ {
 		msg, err := callModel(ctx, client, baseURL, apiKey, model, messages)
 		if err != nil {
-			return "", append(trace, "call model: "+err.Error())
+			return "", append(trace, "call model: "+err.Error()), err.Error()
 		}
 
 		// No tool calls → the model is done; its content is the final answer.
 		if len(msg.ToolCalls) == 0 {
-			return msg.Content, trace
+			return msg.Content, trace, ""
 		}
 
 		// Record the assistant turn, then execute each tool call and feed the
@@ -194,7 +198,7 @@ func driveModel(ctx context.Context, client *http.Client, baseURL, apiKey, model
 			})
 		}
 	}
-	return "", append(trace, "maxSteps reached without a final answer")
+	return "", append(trace, "maxSteps reached without a final answer"), "maxSteps reached without a final answer"
 }
 
 // writeResult marshals r to path, creating parent directories.

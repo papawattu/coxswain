@@ -16,7 +16,7 @@ base URL, the test points it at the fake). No mocking of the runner's own code.
 | R1 | Given a prompt, the runner writes a `result.json` with `status:"success"` and a non-empty `summary` | result file | ✅ green |
 | R2 | The runner sends the prompt as the user message to the model endpoint | fake model (request body) | ✅ green |
 | R3 | A `shell` tool call from the model is executed in the workspace; its output is fed back | workspace + fake model | ✅ green |
-| R4 | When the model endpoint is unreachable, the runner still writes a `result.json` (non-panic, `status:"blocked"`) | result file | ⬜ |
+| R4 | When the model endpoint is unreachable, the runner still writes a `result.json` (non-panic, `status:"blocked"`) | result file | ✅ green |
 | R5 | `result.json` is written to `$COX_WORKSPACE/.coxswain/result.json`, creating parent dirs | result file path | ⬜ |
 
 ## Operator (module: `internal/controller`)

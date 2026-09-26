@@ -56,13 +56,13 @@ var _ = Describe("Loop Controller", func() {
 						Namespace: resourceNamespace,
 					},
 					Spec: coxv1alpha1.LoopSpec{
-						Goal: "make the failing test pass",
+						Goal: loopGoal,
 						Workspace: coxv1alpha1.Workspace{
 							Repo: "https://github.com/papawattu/coxswain.git",
-							Ref:  "main",
+							Ref:  loopRef,
 						},
 						Verify: coxv1alpha1.VerifyConfig{
-							AcceptanceChecks: []string{"go test ./..."},
+							AcceptanceChecks: []string{loopCheckCmd},
 						},
 					},
 				}

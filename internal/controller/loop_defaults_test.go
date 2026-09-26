@@ -61,23 +61,9 @@ var _ = Describe("Loop maxIterations default", func() {
 
 	It("applies the maxIterations default when the loop block is omitted", func() {
 		// Create the Loop via unstructured, omitting the whole loop: block, so
-		// the CRD's defaulting is what must supply maxIterations.
-		u := &unstructured.Unstructured{Object: map[string]any{
-			"apiVersion": "coxswain.wattu.com/v1alpha1",
-			"kind":       "Loop",
-			"metadata":   map[string]any{"name": "no-loop-block", "namespace": ns},
-			"spec": map[string]any{
-				"goal": "make the failing test pass",
-				"workspace": map[string]any{
-					"repo": testRepoURL,
-					"ref":  "main",
-				},
-				"verify": map[string]any{
-					"acceptanceChecks": []any{"go test ./..."},
-				},
-				// no "loop" key
-			},
-		}}
+		// the CRD's defaulting is what must supply maxIterations. (loopBlock
+		// nil => no "loop" key.)
+		u := mkUnstructuredLoop("no-loop-block", ns, loopRepo)
 		Expect(k8sClient.Create(ctx, u)).To(Succeed())
 
 		// I19: CRD defaulting is applied synchronously at create, so a plain Get

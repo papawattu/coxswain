@@ -45,15 +45,17 @@ const (
 // authenticated. The sandbox clones repo at ref on start and works on a
 // single branch per Loop (docs/CONTEXT.md: "Workspace").
 type Workspace struct {
-	// repo is the git URL to clone. HTTPS (`https://github.com/...`) and SSH
-	// (`git@github.com:...`) are both accepted — go-git handles both; the
-	// Format=uri constraint was dropped (P3) because it rejected SSH remotes.
+	// repo is the git URL to clone. Accepts HTTPS (`https://…`), SSH
+	// (`ssh://…`), and scp-style (`user@host:path`) remotes — go-git handles
+	// all three. Must be non-empty and match the pattern; rejected at
+	// admission (I18).
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(https://|ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:).+`
 	Repo string `json:"repo"`
 
 	// ref is the branch, tag, or commit to check out. Defaults to the repo's
-	// default branch when empty. (The +kubebuilder:default="" marker was a
-	// no-op and removed — P3.)
+	// default branch when empty.
 	// +optional
 	Ref string `json:"ref,omitempty"`
 

@@ -97,7 +97,7 @@ var _ = Describe("Loop existing-sandbox adoption", func() {
 		Expect(ctrlOwners).To(HaveLen(1),
 			"the adopted sandbox must have exactly one controller owner ref (got %+v)", list.Items[0].OwnerReferences)
 		Expect(ctrlOwners[0].Name).To(Equal(name), "the controller owner must be the Loop")
-		Expect(ctrlOwners[0].Kind).To(Equal("Loop"))
+		Expect(ctrlOwners[0].Kind).To(Equal(loopKind))
 		Expect(ctrlOwners[0].UID).To(Equal(loop.UID))
 	})
 
@@ -169,7 +169,7 @@ var _ = Describe("Loop existing-sandbox adoption", func() {
 			if o.UID == foreignUID && o.Kind == "ConfigMap" {
 				stillForeign = true
 			}
-			if o.Kind == "Loop" && o.Name == fName {
+			if o.Kind == loopKind && o.Name == fName {
 				Fail("the sandbox was taken over by the Loop (owner ref rewritten)")
 			}
 		}

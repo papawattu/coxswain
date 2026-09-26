@@ -1,9 +1,0 @@
-apiVersion: coxswain.wattu.com/v1alpha1
-kind: Loop
-metadata:
-  labels:
-    app.kubernetes.io/name: coxscaf
-    app.kubernetes.io/managed-by: kustomize
-  name: loop-sample
-spec:
-  # TODO(user): Add fields here

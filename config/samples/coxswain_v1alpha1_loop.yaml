@@ -1,0 +1,14 @@
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: loop-sample
+spec:
+  goal: "make the failing test pass"
+  workspace:
+    repo: "https://github.com/papawattu/coxswain.git"
+    ref: "main"
+  verify:
+    acceptanceChecks:
+      - "go test ./..."
+  loop:
+    maxIterations: 3

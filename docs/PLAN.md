@@ -6,13 +6,13 @@
 
 **Stack:** Go, kubebuilder v4.16, controller-runtime v0.25. Workspaces run on agent-sandbox (v1beta1: `Sandbox`, `SandboxTemplate`, `SandboxClaim`, `SandboxWarmPool`). Dev targets k8s 1.32 (kind stable); production requires k8s ≥1.37 (agent-sandbox requirement). Agents are pluggable behind the runner contract — start with a direct Claude API call, add kagent/Codex later.
 
-**Identity:** keep the name "Coxswain" (ADR-0001). Go module path is `github.com/<owner>/coxswain`, not `cox.dev` (domain is taken; the name is crowded on GitHub — differentiation is in the README).
+**Identity:** keep the name "Coxswain" (ADR-0001). Go module path is `github.com/papawattu/coxswain`. The CRD API group is `coxswain.wattu.com` (owned domain — `cox.dev` is taken, and `cox.cox.dev` was renamed in commit e5027e9).
 
 Timelines assume part-time solo work.
 
 ## Phase 0: Foundations (week 1)
 
-- Scaffold the repo with kubebuilder v4: group `cox.dev/v1alpha1`, `kind: Loop`. (Module path is the GitHub path; the CRD API group `cox.dev` is a separate, free string — re-check it's unused in the CNCF landscape before Phase 6.)
+- Scaffold the repo with kubebuilder v4: group `coxswain.wattu.com/v1alpha1`, `kind: Loop`. (Module path is the GitHub path; the CRD API group `coxswain.wattu.com` is under a domain we own — the CNCF-landscape check remains a pre-Phase-6 item.)
 - Set up a kind cluster (k8s 1.32) with agent-sandbox installed. Read the agent-sandbox README for install prerequisites (StorageClass needs, node labels, how `sandboxd` runs) — budget an hour.
 - Create a `SandboxTemplate` for a Go dev image that has `git` and the Go toolchain.
 - Build the **runner** image: a Go binary that reads a prompt from an env var, calls the Claude API, exposes `shell`/`fs`/`git` tools, and writes `result.json`. No phase-driver state machine yet — run once, write the result, exit. This is the smoke-test runner; the full phase driver lands in Phase 1.
@@ -93,7 +93,7 @@ Self-learning across Loops, per repo.
 - RBAC least privilege, a default NetworkPolicy per sandbox, secrets for model keys and git tokens.
 - Metrics: iterations per Loop, pass rate, tokens per success, stall rate, memory-write rate.
 - A Helm chart, docs, three example Loops, and a demo video.
-- Confirm the `cox.dev` API group and the CNCF landscape entry are clear.
+- Confirm the `coxswain.wattu.com` group has no collision in the CNCF landscape entry (the group itself is under a domain we own).
 - Tag v0.1.0.
 
 ## Decisions already made (from the design session)
@@ -120,6 +120,6 @@ These are settled — see ADRs and CONTEXT.md. Listed here so the plan and the m
 
 ## Before Phase 0
 
-- [ ] Confirm the `cox.dev` API group string is unused (name-collision check covered the repo/domain; the API group is a separate namespace)
+- [x] Confirm the API group string is unused — done by renaming the group to `coxswain.wattu.com` (owned domain; commit e5027e9). CNCF landscape check for a "Coxswain" entry remains below.
 - [ ] Check the CNCF landscape for an existing "Coxswain" entry
 - [ ] Read the agent-sandbox README end to end; note install prerequisites and the `sandboxd` model

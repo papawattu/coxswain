@@ -109,7 +109,16 @@ foreign-owner test asserts the condition + event and `Reconcile` returns nil.
 
 ### I6. D4 rename leftovers
 
-- [ ] Done
+- [x] Done
+
+  - `cmd/main.go`: `LeaderElectionID` → `a54de9d2.coxswain.wattu.com`.
+  - `docs/PLAN.md`: group → `coxswain.wattu.com`; "confirm cox.dev unused" to-dos
+    dropped (done by e5027e9).
+  - `docs/E2E-PHASE0.md`: repro updated to `coxswain.wattu.com_loops.yaml` +
+    `apiVersion: coxswain.wattu.com/v1alpha1`.
+  - `config/samples/cox_v1alpha1_loop.yaml` → `coxswain_v1alpha1_loop.yaml`
+    (stub replaced with the real smoke Loop); kustomization updated.
+  - Deleted scratch `docs/e2e-prereqs-scout-2026-09-26T21-02-17.md`.
 
 **Where / fix** (`grep -rn 'cox\.dev'`, excluding ADR-0001 and round-1 review):
 - `cmd/main.go:169` — `LeaderElectionID: "a54de9d2.cox.dev"` →

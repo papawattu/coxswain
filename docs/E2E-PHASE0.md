@@ -33,7 +33,7 @@ kubectl config use-context kind-coxswain
 
 # types
 kubectl apply -f config/crd/external/agents.x-k8s.io_sandboxes.yaml
-kubectl apply -f config/crd/bases/cox.cox.dev_loops.yaml
+kubectl apply -f config/crd/bases/coxswain.wattu.com_loops.yaml
 
 # operator image
 docker build -t coxswain-operator:dev -f Dockerfile .
@@ -53,7 +53,7 @@ kubectl apply -f <patched manager.yaml>
 
 # the smoke Loop
 kubectl apply -f - <<EOF
-apiVersion: cox.cox.dev/v1alpha1
+apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata: {name: smoke, namespace: coxswain-system}
 spec:

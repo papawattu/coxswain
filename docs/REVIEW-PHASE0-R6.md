@@ -34,7 +34,15 @@ decision).
 
 ### D14. The termination message is written from inside the container that runs the agent's code
 
-- [ ] Decided (amend ADR-0005 "Job reporting contract")
+- [x] Decided (amend ADR-0005 "Job reporting contract") — commit `42341f5`
+
+  - Every gate value is a kubelet-recorded container exit code, one check per
+    container: a clone init container; a tamper-check init container (trusted
+    image, only `git` + the glob diff, before any agent code runs); each check
+    its own init container. Operator reads `status.initContainerStatuses[i].state.terminated.exitCode`;
+    no reserved tampered code, no termination message as a gate value. `pods/log`
+    stays the feed-forward channel (claims-grade). B3 seam sets
+    `initContainerStatuses[].state.terminated.exitCode` per check.
 
 **Where:** `docs/adr/0005-operator-verifies-via-isolated-job.md` "Job
 reporting contract (D13)"; `docs/TDD-PLAN-PHASE1.md` B3.
@@ -87,7 +95,11 @@ iterate, with k recorded in history.
 
 ### D15. Resolving refs to SHAs needs git access in the operator
 
-- [ ] Decided
+- [x] Decided — ADR-0005 (D15) + TDD-PLAN-PHASE1 RBAC — commit `42341f5`
+
+  - Chose (a): go-git `remote.List` in-process (no binary); operator reads
+    `spec.workspace.gitCredentialSecret`; `secrets/get` added to the operator
+    RBAC in the Loop namespace.
 
 **Where:** ADR-0005 Decision §1 and §3 ("`git ls-remote`, or a tiny resolve
 step").
@@ -105,7 +117,11 @@ Recommendation: (a) for simplicity. Record the choice and the RBAC.
 
 ### D16. "Per-language default" globs need a language the operator can't detect
 
-- [ ] Decided
+- [x] Decided — ADR-0005 (D16) + TDD-PLAN-PHASE1 CRD — commit `42341f5`
+
+  - Explicit `spec.verify.preset` (enum, default `go`) + `protectedPaths[]`
+    (adds) + `protectedPathsOverride` (replaces); the "files a check references"
+    heuristic is dropped.
 
 **Where:** ADR-0005 Decision §2; `TDD-PLAN-PHASE1.md` CRD field
 `verify.protectedPaths[]`.

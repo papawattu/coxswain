@@ -200,7 +200,11 @@ func run(cfg runConfig) Result {
 	if modelTimeout <= 0 {
 		modelTimeout = defaultModelTimeout
 	}
-	client := &http.Client{Timeout: modelTimeout}
+	// I13: no http.Client.Timeout — the per-request context (driveModel's
+	// context.WithTimeout(ctx, modelTimeout)) is the one a run deadline can
+	// cancel. A client-level timeout would race it and could cut a long request
+	// short (I11) or make cancellation redundant.
+	client := &http.Client{}
 
 	maxSteps := cfg.MaxSteps
 	if maxSteps <= 0 {
@@ -321,6 +325,9 @@ func execShell(workspace, argsJSON string, timeout time.Duration) (string, error
 	cmd.Dir = workspace
 	// I10: run in its own process group so we can kill the whole group (the
 	// command plus any children it spawned) on timeout, not just `sh`.
+	// Note (I13, accepted, no action): a command that calls `setsid` escapes the
+	// process group and can outlive the tool call; with WaitDelay it can no
+	// longer hang the runner, so inside the sandbox this is acceptable.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Kill the entire process group when the context is done (timeout) —
 	// CommandContext's default only signals the direct child.
@@ -360,9 +367,11 @@ func truncateToolOutput(s string) string {
 	}
 	const headBytes = 4096
 	tailBytes := maxToolOutputBytes - headBytes // keep head + tail within the cap
-	elided := max(0, len(s)-headBytes-tailBytes)
 	head := cutRunePrefix(s, headBytes)
 	tail := cutRuneSuffix(s, tailBytes)
+	// I13: compute the elided count from the actual head/tail lengths (after the
+	// rune-boundary backing-off), not before — otherwise it's off by up to 6 bytes.
+	elided := len(s) - len(head) - len(tail)
 	return head + fmt.Sprintf("… (%d bytes elided) …\n", elided) + tail
 }
 
@@ -393,11 +402,9 @@ func cutRuneSuffix(s string, n int) string {
 }
 
 // knownTools is the set of tool names the runner will execute (I5); an unknown
-// name is rejected rather than silently run as a shell command. I12: a
-// package-level map instead of rebuilding it on every driveModel call.
+// name is rejected rather than silently run as a shell command. I12/I13:
+// a package-level var used directly (no per-call map, no wrapper).
 var knownTools = map[string]bool{toolNameShell: true}
-
-func knownToolNames() map[string]bool { return knownTools }
 
 // driveModel sends the messages and returns the assistant's text answer plus a
 // trace. It loops on tool calls: when the model returns tool calls, each known
@@ -409,7 +416,7 @@ func driveModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string,
 	messages []chatMessage, maxSteps int, shellTimeout, modelTimeout time.Duration,
 ) (string, []string, string) {
-	known := knownToolNames()
+	known := knownTools
 	trace := []string{}
 
 	for step := range maxSteps {

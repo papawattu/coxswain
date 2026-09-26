@@ -210,6 +210,21 @@ func TestRunnerShellTimeoutKillsBackgroundChildren(t *testing.T) {
 	if res.Status != statusSuccess && res.Status != statusBlocked {
 		t.Fatalf("status = %q, want success or blocked", res.Status)
 	}
+	// I13: the timeout must be visible to the model — the tool-result message fed
+	// back in request 2 (after the tool call) must carry the kill/exit text, so
+	// the model knows the command was cut off rather than succeeding.
+	if len(fake.Requests) < 2 {
+		t.Fatalf("expected >=2 requests (tool call + tool result), got %d", len(fake.Requests))
+	}
+	toolMsgs := fake.Requests[1].ToolResultMessages()
+	if len(toolMsgs) == 0 {
+		t.Fatalf("no tool-result message in request 2")
+	}
+	got := toolMsgs[0].Content
+	if !strings.Contains(got, "signal: killed") && !strings.Contains(got, "exit:") &&
+		!strings.Contains(got, "timeout") && !strings.Contains(got, "killed") {
+		t.Errorf("fed-back tool message = %q; want the timeout/kill to be visible to the model (signal: killed / exit)", got)
+	}
 }
 
 // I10 (success path): a command that succeeds but detaches a background child

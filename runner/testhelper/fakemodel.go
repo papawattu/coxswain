@@ -82,10 +82,32 @@ func (fm *FakeModel) handle(w http.ResponseWriter, r *http.Request) {
 	if idx < len(fm.Responses) {
 		resp = fm.Responses[idx]
 	}
+	// Hardening (I1): a queued tool call is only emitted if the request
+	// actually advertised a tool of that name. This keeps R3 honest — it can
+	// no longer pass while the runner forgets to send its `tools` array.
+	if resp.ToolCall != nil && !advertisesTool(rec, resp.ToolCall.Name) {
+		resp = ModelResponse{Content: "no shell tool advertised; cannot call it"}
+	}
 	fm.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(encodeResponse(resp))
+}
+
+// advertisesTool reports whether the request's tools array declares a function
+// named `name` (OpenAI function-calling schema).
+func advertisesTool(rec Received, name string) bool {
+	for _, raw := range rec.Tools {
+		var tool struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if json.Unmarshal(raw, &tool) == nil && tool.Function.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // defaultResponse is emitted once the queued responses are exhausted.

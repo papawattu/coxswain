@@ -17,7 +17,7 @@ Priority: **P1** = fix before Phase 1 starts. **P2** = decide during Phase 1
 
 ### I1. Runner never advertises tools to the model
 
-- [ ] Done
+- [x] Done (I1 test: runner_tools_test.go; fake hardened in testhelper/fakemodel.go)
 
 **Where:** `runner/runner.go:88` (`callModel`).
 

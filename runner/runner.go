@@ -84,9 +84,14 @@ func run(cfg runConfig) Result {
 }
 
 // callModel posts one chat-completions request and returns the assistant
-// message (with any tool calls).
+// message (with any tool calls). The request always advertises the runner's
+// tools (I1) so a real model can emit a shell tool call.
 func callModel(ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []map[string]any) (assistantMessage, error) {
-	reqBody, err := json.Marshal(map[string]any{"model": model, "messages": messages})
+	reqBody, err := json.Marshal(map[string]any{
+		"model":    model,
+		"messages": messages,
+		"tools":    shellToolSchema(),
+	})
 	if err != nil {
 		return assistantMessage{}, err
 	}
@@ -119,6 +124,28 @@ func callModel(ctx context.Context, client *http.Client, baseURL, apiKey, model 
 		return assistantMessage{}, fmt.Errorf("no choices in response")
 	}
 	return parsed.Choices[0].Message, nil
+}
+
+// shellToolSchema is the OpenAI function-calling schema for the runner's shell
+// tool. It is advertised on every request so the model knows it can call
+// shell({command: string}).
+func shellToolSchema() []map[string]any {
+	return []map[string]any{
+		{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "shell",
+				"description": "Run a shell command in the workspace and return its combined output.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string", "description": "The shell command to run."},
+					},
+					"required": []string{"command"},
+				},
+			},
+		},
+	}
 }
 
 // assistantMessageFor serializes an assistant turn (with tool calls) back into

@@ -125,17 +125,27 @@ model.
   `TMPDIR`; a check needing a writable tree gets a fresh copy from a trusted
   init step. Seam: envtest — assert every check container mounts the checkout
   `readOnly: true` and has its own scratch `emptyDir`.
-- **B3d** — *Advisory static diff scan (ADR-0005 D17, mitigation 3).* The
+- **B3d** — *Advisory static diff scan (ADR-0005 D17, mitigation 3; D21).* The
   in-process test-subversion canary (B3a) is the automated gate; this is the
-  *advisory* layer that runs alongside it. Grep the base→verified diff of
+  *advisory* layer that runs alongside it. It scans the base→verified diff of
   **non-protected** files for `testing.Testing()`, `os.Exit` inside `init`,
-  `//go:linkname`, and `flag.Lookup("test.`. **Advisory only — never a gate:**
-  a hit emits a `Warning` event + a history note and forces `spec.pr.ready=false`
-  (the Phase 6 PR opens as a *non-ready draft*), but does **not** fail the Loop.
-  Seam: envtest — a Loop whose non-protected change contains `testing.Testing()`
-  in an `init` still reaches `Succeeded`, but a `Warning` event is recorded, a
-  history note is appended, and the PR (when opened) is flagged non-ready. A
-  clean change produces no such event/note.
+  `//go:linkname`, and `flag.Lookup("test.`. **Advisory only — never a gate, and
+  never writes `spec`** (D21: `spec` is user-owned desired state — rewriting it
+  fights `kubectl apply`/GitOps, bumps `generation`, and blurs the audit
+  trail). Instead a hit records a `VerifySuspicious=True` **condition** (reason
+  `SubversionPatternInDiff`, message listing the matched patterns + files) and a
+  history note. Phase 6's PR step reads that condition:
+  `effectiveReady = spec.pr.ready && !VerifySuspicious`. Reporting channel: the
+  scan runs as its own trusted init container **after the tamper check**; hits
+  are reported by its **termination message** (acceptable here — no agent code
+  runs in that container, per D15) and the container **exits 0 either way** so
+  the scan can never block the checks. A missing/garbled message is treated as
+  "scan unavailable" (a `Warning` event), **not** as clean. Seam: envtest — a
+  Loop whose non-protected change contains `testing.Testing()` in an `init`
+  still reaches `Succeeded`, and the operator records the
+  `VerifySuspicious=True` condition + a `Warning` event + a history note, with
+  **`spec` unchanged (generation stays the same)**; a clean change records no
+  such condition/event/note.
 - **B4** — *Iteration + history.* Each transition increments `status.iteration`
   and appends to `status.history[]` (the audit trail, incl. `verifiedCommit`);
   **also records which checks were `NotRun` after the first failing check

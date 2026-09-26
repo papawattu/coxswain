@@ -40,6 +40,10 @@ _Avoid_: pull request, merge request, branch
 The string attached to `Failed` or a warning. Terminal reasons: `TamperedVerify`, `SubvertedVerify` (the canary control passed, i.e. a test binary that exits 0 regardless of tests — ADR-0005 round 8, D17), `CheckpointUnavailable`, `MaxIterations`, `PlanRejected` (onReject=Fail), `BudgetExceeded` (onExceeded=Fail), `Stalled` (stallAction=Fail). Resumable reasons: `RunnerNoResult`, `PhaseTimeout`, `SandboxCrash`, `VerifyError` (re-run once, then terminal if it crashes again), `GitPushFailed`. `BudgetExceeded` and `Stalled` go to Paused instead of Failed when their configured action is Pause.
 _Avoid_: error, fault, exception
 
+**VerifySuspicious condition**:
+An advisory, non-terminal `VerifySuspicious=True` condition (reason `SubversionPatternInDiff`) the operator records when the D17 static diff scan (ADR-0005, D21) finds a subversion pattern (`testing.Testing()`, `os.Exit` in `init`, `//go:linkname`, `flag.Lookup("test.`) in the base→verified diff of *non-protected* files. It is **advisory only** — the Loop can still reach `Succeeded`, and the condition never writes `spec` (which is user-owned). Phase 6's PR step reads it: `effectiveReady = spec.pr.ready && !VerifySuspicious`, so a suspicious Loop opens its draft PR as non-ready.
+_Avoid_: failure, block, reject
+
 **Phase**:
 One of: Pending, Planning, AwaitingApproval, Implementing, Verifying, Succeeded, Failed, Paused, CleaningUp. Succeeded and Failed are terminal. Paused stores `status.pausedFrom` and resumes to that exact phase. CleaningUp is where finalizers delete the sandbox and GC old checkpoints; the Loop object is deleted only after CleaningUp completes.
 _Avoid_: state, stage, step

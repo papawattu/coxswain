@@ -234,16 +234,25 @@ detection is forgeable by the same process. So:
      `go test` (non-zero exit). A binary that exits 0 regardless of tests makes
      the canary pass → `TamperedVerify` (or a new `SubvertedVerify` reason).
      Cheap, and the always-exit-0 trick is the obvious one a model stumbles into.
-  2. **Static flag on the diff (advisory, not a gate).** The trusted tamper
-     container greps the base→verified diff of *non-protected* files for
-     `testing.Testing()`, `os.Exit` inside `init`, `//go:linkname`,
-     `flag.Lookup("test.` and records hits as a `Warning` event + history note,
-     and forces `spec.pr.ready=false`. With `approval: Manual` (Phase 4), a hit
-     could pause for approval.
+  2. **Static flag on the diff (advisory, not a gate — D21).** A dedicated
+     trusted init container (after the tamper check) greps the base→verified
+     diff of *non-protected* files for `testing.Testing()`, `os.Exit` inside
+     `init`, `//go:linkname`, `flag.Lookup("test.` and reports hits by its
+     **termination message** (acceptable — no agent code runs in that container,
+     per D15). It **exits 0 either way** so the scan can never block the checks;
+     a missing/garbled message is "scan unavailable" (a `Warning` event), not
+     clean. A hit records a `VerifySuspicious=True` **condition** (reason
+     `SubversionPatternInDiff`) + a history note. It does **not** write `spec`
+     (D21: `spec` is user-owned; rewriting it fights GitOps and blurs the audit
+     trail) — Phase 6's PR step computes
+     `effectiveReady = spec.pr.ready && !VerifySuspicious`.
   3. **Optional (Phase 6):** the Judge sidecar gets the diff and is asked
      specifically whether the change games the tests.
 - **Acceptance:** B3 gains a slice for the canary (the probe above as a fixture
-  must end non-`Succeeded`); CONTEXT.md wording updated.
+  must end non-`Succeeded`) and a slice for the advisory scan (D21: a subversion
+  pattern in the diff of a non-protected file records a `VerifySuspicious=True`
+  condition + `Warning` event + history note, with `spec` unchanged); CONTEXT.md
+  wording updated.
 
 ### Resolving refs to SHAs (D15)
 

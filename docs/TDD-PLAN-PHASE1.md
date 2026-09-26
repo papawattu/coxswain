@@ -125,6 +125,17 @@ model.
   `TMPDIR`; a check needing a writable tree gets a fresh copy from a trusted
   init step. Seam: envtest — assert every check container mounts the checkout
   `readOnly: true` and has its own scratch `emptyDir`.
+- **B3d** — *Advisory static diff scan (ADR-0005 D17, mitigation 3).* The
+  in-process test-subversion canary (B3a) is the automated gate; this is the
+  *advisory* layer that runs alongside it. Grep the base→verified diff of
+  **non-protected** files for `testing.Testing()`, `os.Exit` inside `init`,
+  `//go:linkname`, and `flag.Lookup("test.`. **Advisory only — never a gate:**
+  a hit emits a `Warning` event + a history note and forces `spec.pr.ready=false`
+  (the Phase 6 PR opens as a *non-ready draft*), but does **not** fail the Loop.
+  Seam: envtest — a Loop whose non-protected change contains `testing.Testing()`
+  in an `init` still reaches `Succeeded`, but a `Warning` event is recorded, a
+  history note is appended, and the PR (when opened) is flagged non-ready. A
+  clean change produces no such event/note.
 - **B4** — *Iteration + history.* Each transition increments `status.iteration`
   and appends to `status.history[]` (the audit trail, incl. `verifiedCommit`);
   **also records which checks were `NotRun` after the first failing check
@@ -242,8 +253,9 @@ is Phase 4 — Phase 1 uses `spec.approval.mode: Auto` only.
 
 A1 → A2 → A3 → A4 (runner, each red→green — note A4 is now *context
 continuity*; the old A4 "runner runs checks" is dropped per ADR-0005), then
-B1 → B2 → B3 → B3a → B3b → B3c → B4 → B5 → B6 (controller, each red→green;
-B3's verify path is expanded into B3a/B3b/B3c for the D17 canary, D18 restart
+B1 → B2 → B3 → B3a → B3b → B3c → B3d → B4 → B5 → B6 (controller, each red→green;
+B3's verify path is expanded into B3a/B3b/B3c/B3d for the D17 canary + advisory
+scan, D18 restart
 semantics, and D19 read-only checkout). B2 (TamperedVerify
 via base-ref hashing) is the highest-value test — the anti-gaming guarantee
 (D7). B6 (foreign-owned sandbox → condition, D8) needs B1's condition/event

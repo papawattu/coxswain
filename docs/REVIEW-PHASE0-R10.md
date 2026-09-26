@@ -75,7 +75,9 @@ updated/removed accordingly.
 
 ### I16. D17 mitigation 3 (advisory diff scan) has no plan slice
 
-- [ ] Done
+- [x] Done — `6e14e6f`? no, landed as **B3d** in `TDD-PLAN-PHASE1.md` (the
+  commit that adds it). Advisory only, never a gate; slice order now
+  `… B3c → B3d → B4 …`.
 
 ADR-0005 D17 lists three mitigations; `TDD-PLAN-PHASE1.md` has B3a
 (canary) but nothing for the advisory static scan (grep the base→verified

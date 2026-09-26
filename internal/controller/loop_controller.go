@@ -18,7 +18,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"unicode/utf8"
 
+	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,8 +31,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-
-	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
 // LoopReconciler reconciles a Loop object.
@@ -53,28 +55,29 @@ type LoopReconciler struct {
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	var loop coxv1alpha1.Loop
 	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
 		// Deleted or never existed: nothing to do.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if err := r.ensureSandbox(ctx, &loop, log); err != nil {
+	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Record that we observed this generation.
+	// Combine the two status updates (observedGeneration + phase) into one so a
+	// reconcile does at most one Status().Update (P3 tidy-up).
+	changed := false
 	if loop.Status.ObservedGeneration != loop.Generation {
 		loop.Status.ObservedGeneration = loop.Generation
-		if err := r.Status().Update(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
+		changed = true
 	}
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
+		changed = true
+	}
+	if changed {
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -93,12 +96,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // sandbox, which orphans it (no GC, no Owns mapping). For a sandbox owned by
 // a *different* controller, SetControllerReference returns AlreadyOwnedError,
 // so we never silently take it over.
-func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, log interface {
-	Info(string, ...any)
-}) error {
+func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	// Pull the logger from the context (the controller-runtime idiom) so the
+	// function doesn't take both a context and a logger (logcheck).
+	log := logf.FromContext(ctx)
 	desired := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      loop.Name + "-sandbox",
+			Name:      sandboxName(loop.Name),
 			Namespace: loop.Namespace,
 		},
 	}
@@ -130,12 +134,42 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	}
 
 	// Phase 0 done-when: the controller logs the sandbox it created/updated.
-	log.Info("ensured loop sandbox",
-		"sandbox", desired.Name,
-		"operation", op,
-		"loop", loop.Name,
-	)
+	// Log at V(1) when nothing changed so a steady-state reconcile is quiet
+	// (P3 tidy-up); created/updated still logs at info.
+	if op == controllerutil.OperationResultNone {
+		log.V(1).Info("ensured loop sandbox",
+			"sandbox", desired.Name,
+			"operation", op,
+			"loop", loop.Name,
+		)
+	} else {
+		log.Info("ensured loop sandbox",
+			"sandbox", desired.Name,
+			"operation", op,
+			"loop", loop.Name,
+		)
+	}
 	return nil
+}
+
+// sandboxName returns the Loop's Sandbox name, hash-truncated to stay within
+// the 63-char k8s limit (P3 tidy-up): <loop>-sandbox, or a short prefix + the
+// first 12 hex chars of sha256(loop name) when that would overflow.
+func sandboxName(loopName string) string {
+	const maxLen = 63
+	candidate := loopName + "-sandbox"
+	if len(candidate) <= maxLen {
+		return candidate
+	}
+	h := sha256.Sum256([]byte(loopName))
+	suffix := hex.EncodeToString(h[:])[:12]
+	// Leave room for "-" + the 12-char hash suffix (13 chars).
+	prefix := loopName[:maxLen-13]
+	// Back off the prefix to a UTF-8 rune boundary.
+	for len(prefix) > 0 && !utf8.RuneStart(prefix[len(prefix)-1]) {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return prefix + "-" + suffix
 }
 
 // sandboxImage returns the configured sandbox image, or a sensible Go dev default.

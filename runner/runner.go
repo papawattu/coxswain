@@ -17,9 +17,11 @@ import (
 	"time"
 )
 
-// String constants (goconst). The runner advertises and reports these to the
-// model and in result.json; the tests reference the same literals, so keeping
-// them as consts avoids a 4-6 occurrence lint failure across the module.
+// String constants. systemPrompt/resultDirName/resultFileName are the runner's
+// fixed strings; the jsonRole*/jsonToolFunction consts are protocol *values*
+// (OpenAI role and tool-type strings) that the tests legitimately assert
+// against. (I7: the wire format is now built from typed structs with json tags,
+// so the jsonKey* field-name consts are gone.)
 const (
 	systemPrompt   = "You are a coding agent inside a Kubernetes sandbox. Be concise."
 	resultDirName  = ".coxswain"
@@ -29,30 +31,29 @@ const (
 	statusSuccess = "success"
 	statusBlocked = "blocked"
 
-	// OpenAI-compatible chat field-name keys (map keys, repeated in the
-	// request/response builders).
-	jsonKeyRole      = "role"
-	jsonKeyType      = "type"
-	jsonKeyContent   = "content"
-	jsonKeyModel     = "model"
-	jsonKeyMessages  = "messages"
-	jsonKeyTools     = "tools"
-	jsonKeyFunction  = "function"
-	jsonKeyName      = "name"
-	jsonKeyID        = "id"
-	jsonKeyObject    = "object"
-	jsonKeyString    = "string"
-	jsonKeyCommand   = "command"
-	jsonKeyArguments = "arguments"
-
-	// role values.
+	// OpenAI chat role values (asserted by tests).
 	jsonRoleSystem    = "system"
 	jsonRoleUser      = "user"
 	jsonRoleAssistant = "assistant"
 	jsonRoleTool      = "tool"
 
-	// tool type value.
+	// OpenAI tool type value (asserted by the I1 tools test).
 	jsonToolFunction = "function"
+
+	// I5: cap on shell output fed back to the model, so a chatty command can't
+	// blow the context or the result. 16 KiB.
+	maxToolOutputBytes = 16 * 1024
+
+	// I5: default max model steps (tool-call rounds). 5 (the Phase 0 value) was
+	// too low for a real agent; the test default is overridden via runConfig.
+	defaultMaxSteps = 25
+
+	// I5: the single tool the runner advertises and executes. A const so the
+	// tests reference the same name instead of a repeated literal (goconst).
+	toolNameShell = "shell"
+
+	// I5: shell command timeout.
+	shellTimeout = 60 * time.Second
 )
 
 // runConfig is the input to run. BaseURL points at an OpenAI-compatible
@@ -63,6 +64,9 @@ type runConfig struct {
 	BaseURL   string
 	APIKey    string
 	Model     string
+	// MaxSteps caps the number of model rounds (tool-call loops). I5: was a
+	// hard const of 5; now configurable. Zero uses defaultMaxSteps.
+	MaxSteps int
 }
 
 // Result is the result file schema (Phase 0 subset of the Phase 1 contract).
@@ -76,20 +80,96 @@ type Result struct {
 	ToolTrace         []string `json:"toolTrace,omitempty"`
 }
 
-// assistantMessage is the parsed assistant turn from the model, including any
-// tool calls.
+// ---------------------------------------------------------------------------
+// OpenAI-compatible chat-completions wire types (I7).
+//
+// These are the typed request/response shapes. The request is built from
+// these (no map[string]any, no key-typo risk); the response is decoded into
+// them. Field names live in the json tags.
+// ---------------------------------------------------------------------------
+
+// chatRequest is one POST /chat/completions body.
+type chatRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Tools    []toolDef     `json:"tools,omitempty"`
+}
+
+// chatMessage is one message in the conversation. Role is one of
+// system/user/assistant/tool. Assistant messages may carry ToolCalls; tool
+// messages reference the tool call they answer via ToolCallID.
+type chatMessage struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// toolDef is one advertised tool (function-calling schema).
+type toolDef struct {
+	Type     string `json:"type"` // "function"
+	Function fnDef  `json:"function"`
+}
+
+// fnDef is the function part of a tool definition.
+type fnDef struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  paramSchema `json:"parameters"`
+}
+
+// paramSchema is a JSON-Schema object describing the function's arguments.
+type paramSchema struct {
+	Type       string                `json:"type"` // "object"
+	Properties map[string]propSchema `json:"properties"`
+	Required   []string              `json:"required"`
+}
+
+// propSchema is one property in the function's parameter schema.
+type propSchema struct {
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+}
+
+// assistantMessage is the parsed assistant turn from the model. It is the same
+// shape as chatMessage for the assistant role; kept as its own type for the
+// response decode.
 type assistantMessage struct {
 	Content   string     `json:"content"`
 	ToolCalls []toolCall `json:"tool_calls,omitempty"`
 }
 
+// toolCall is a model-requested function call.
 type toolCall struct {
 	ID       string `json:"id"`
 	Function fnCall `json:"function"`
 }
 
+// fnCall is the function part of a tool call (name + raw arguments JSON).
 type fnCall struct {
+	Name      string `json:"name"`
 	Arguments string `json:"arguments"` // raw JSON string, e.g. {"command":"..."}
+}
+
+// shellToolSchema is the OpenAI function-calling schema for the runner's shell
+// tool (I7: typed, built from the wire structs).
+func shellToolSchema() []toolDef {
+	return []toolDef{
+		{
+			Type: jsonToolFunction,
+			Function: fnDef{
+				Name:        toolNameShell,
+				Description: "Run a shell command in the workspace and return its combined output.",
+				Parameters: paramSchema{
+					Type: "object",
+					Properties: map[string]propSchema{
+						"command": {Type: "string", Description: "The shell command to run."},
+					},
+					Required: []string{"command"},
+				},
+			},
+		},
+	}
 }
 
 // run drives the model and writes the result file. It returns the result it
@@ -97,13 +177,18 @@ type fnCall struct {
 func run(cfg runConfig) Result {
 	client := &http.Client{Timeout: 60 * time.Second}
 
-	messages := []map[string]any{
-		{jsonKeyRole: jsonRoleSystem, jsonKeyContent: systemPrompt},
-		{jsonKeyRole: jsonRoleUser, jsonKeyContent: cfg.Prompt},
+	maxSteps := cfg.MaxSteps
+	if maxSteps <= 0 {
+		maxSteps = defaultMaxSteps
+	}
+
+	messages := []chatMessage{
+		{Role: jsonRoleSystem, Content: systemPrompt},
+		{Role: jsonRoleUser, Content: cfg.Prompt},
 	}
 
 	answer, trace, modelErr := driveModel(
-		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages,
+		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages, maxSteps,
 	)
 
 	res := Result{
@@ -127,13 +212,14 @@ func run(cfg runConfig) Result {
 // message (with any tool calls). The request always advertises the runner's
 // tools (I1) so a real model can emit a shell tool call.
 func callModel(
-	ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []map[string]any,
+	ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []chatMessage,
 ) (assistantMessage, error) {
-	reqBody, err := json.Marshal(map[string]any{
-		jsonKeyModel:    model,
-		jsonKeyMessages: messages,
-		jsonKeyTools:    shellToolSchema(),
-	})
+	body := chatRequest{
+		Model:    model,
+		Messages: messages,
+		Tools:    shellToolSchema(),
+	}
+	reqBody, err := json.Marshal(body)
 	if err != nil {
 		return assistantMessage{}, err
 	}
@@ -157,7 +243,23 @@ func callModel(
 		}
 	}()
 
-	raw, _ := io.ReadAll(resp.Body)
+	// I5: check the HTTP status before decoding. A 401/403/500 was previously
+	// misreported as "no choices in response" (the body is an error, not a
+	// completion).
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return assistantMessage{}, fmt.Errorf("read response body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Include the server's error body (truncated) so the cause is visible
+		// in the result's verificationNotes.
+		errBody := string(raw)
+		if len(errBody) > 256 {
+			errBody = errBody[:256] + "…"
+		}
+		return assistantMessage{}, fmt.Errorf("model returned HTTP %d: %s", resp.StatusCode, errBody)
+	}
+
 	var parsed struct {
 		Choices []struct {
 			Message assistantMessage `json:"message"`
@@ -172,51 +274,9 @@ func callModel(
 	return parsed.Choices[0].Message, nil
 }
 
-// shellToolSchema is the OpenAI function-calling schema for the runner's shell
-// tool. It is advertised on every request so the model knows it can call
-// shell({command: string}).
-func shellToolSchema() []map[string]any {
-	return []map[string]any{
-		{
-			jsonKeyType: jsonToolFunction,
-			jsonKeyFunction: map[string]any{
-				jsonKeyName:   "shell",
-				"description": "Run a shell command in the workspace and return its combined output.",
-				"parameters": map[string]any{
-					jsonKeyType: jsonKeyObject,
-					"properties": map[string]any{
-						jsonKeyCommand: map[string]any{jsonKeyType: jsonKeyString, "description": "The shell command to run."},
-					},
-					"required": []string{jsonKeyCommand},
-				},
-			},
-		},
-	}
-}
-
-// assistantMessageFor serializes an assistant turn (with tool calls) back into
-// the message list for the next request.
-func assistantMessageFor(m assistantMessage) map[string]any {
-	out := map[string]any{jsonKeyRole: jsonRoleAssistant, jsonKeyContent: m.Content}
-	if len(m.ToolCalls) > 0 {
-		tcs := make([]map[string]any, 0, len(m.ToolCalls))
-		for _, tc := range m.ToolCalls {
-			tcs = append(tcs, map[string]any{
-				jsonKeyID:   tc.ID,
-				jsonKeyType: jsonToolFunction,
-				jsonKeyFunction: map[string]any{
-					jsonKeyName:      "shell",
-					jsonKeyArguments: tc.Function.Arguments,
-				},
-			})
-		}
-		out["tool_calls"] = tcs
-	}
-	return out
-}
-
 // execShell runs the shell command named in a tool call's arguments JSON in
-// the workspace and returns combined output.
+// the workspace and returns combined output. I5: the output is capped to
+// maxToolOutputBytes before being fed back to the model.
 func execShell(workspace, argsJSON string) (string, error) {
 	var args struct {
 		Command string `json:"command"`
@@ -225,28 +285,45 @@ func execShell(workspace, argsJSON string) (string, error) {
 		return "", fmt.Errorf("bad tool args: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shellTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
 	cmd.Dir = workspace
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(out) + " (exit: " + err.Error() + ")", nil
+		return truncateToolOutput(string(out) + " (exit: " + err.Error() + ")"), nil
 	}
-	return string(out), nil
+	return truncateToolOutput(string(out)), nil
 }
 
-func itoa(n int) string { return strconv.Itoa(n) }
+// truncateToolOutput caps s to maxToolOutputBytes, appending a marker if it
+// was truncated (I5).
+func truncateToolOutput(s string) string {
+	if len(s) <= maxToolOutputBytes {
+		return s
+	}
+	return s[:maxToolOutputBytes] + fmt.Sprintf("… (truncated %d bytes)", len(s)-maxToolOutputBytes)
+}
+
+// knownToolNames returns the set of tool names the runner can execute. I5:
+// an unknown tool name is rejected rather than silently run as a shell
+// command.
+func knownToolNames() map[string]bool {
+	return map[string]bool{toolNameShell: true}
+}
 
 // driveModel sends the messages and returns the assistant's text answer plus a
-// trace. It loops on tool calls: when the model returns shell tool calls, each
-// is executed in the workspace and the combined output is fed back as a tool
-// message, until the model returns a plain answer (or maxSteps is reached).
+// trace. It loops on tool calls: when the model returns tool calls, each known
+// one is executed in the workspace and the output fed back as a tool message,
+// until the model returns a plain answer (or maxSteps is reached). I5:
+// unknown tool names are rejected (not executed), and shell output is
+// truncated before being fed back.
 func driveModel(
-	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string, messages []map[string]any,
+	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string,
+	messages []chatMessage, maxSteps int,
 ) (string, []string, string) {
+	known := knownToolNames()
 	trace := []string{}
-	const maxSteps = 5
 
 	for step := range maxSteps {
 		msg, err := callModel(ctx, client, baseURL, apiKey, model, messages)
@@ -259,19 +336,34 @@ func driveModel(
 			return msg.Content, trace, ""
 		}
 
-		// Record the assistant turn, then execute each tool call and feed the
-		// results back.
-		messages = append(messages, assistantMessageFor(msg))
+		// Record the assistant turn (with its tool calls) for the next request.
+		messages = append(messages, chatMessage{
+			Role:      jsonRoleAssistant,
+			Content:   msg.Content,
+			ToolCalls: msg.ToolCalls,
+		})
 		for _, tc := range msg.ToolCalls {
+			if !known[tc.Function.Name] {
+				// I5: reject an unknown tool instead of executing it as a shell
+				// command. Feed the model a tool error so it can recover.
+				msg := "unknown tool: " + tc.Function.Name
+				trace = append(trace, "step "+strconv.Itoa(step)+": "+msg)
+				messages = append(messages, chatMessage{
+					Role:       jsonRoleTool,
+					ToolCallID: tc.ID,
+					Content:    msg,
+				})
+				continue
+			}
 			out, err := execShell(workspace, tc.Function.Arguments)
 			if err != nil {
 				out = err.Error()
 			}
-			trace = append(trace, "step "+itoa(step)+": "+out)
-			messages = append(messages, map[string]any{
-				jsonKeyRole:    jsonRoleTool,
-				"tool_call_id": tc.ID,
-				jsonKeyContent: out,
+			trace = append(trace, "step "+strconv.Itoa(step)+": "+out)
+			messages = append(messages, chatMessage{
+				Role:       jsonRoleTool,
+				ToolCallID: tc.ID,
+				Content:    out,
 			})
 		}
 	}

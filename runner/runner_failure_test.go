@@ -14,7 +14,7 @@ func TestRunnerWritesBlockedResultOnModelFailure(t *testing.T) {
 
 	// A base URL that points at a dead port — the model call cannot succeed.
 	run(runConfig{
-		Prompt:    "do something",
+		Prompt:    doSomethingPrompt,
 		Workspace: workdir,
 		BaseURL:   "http://127.0.0.1:1", // port 1 is effectively unreachable
 		Model:     fakeModelName,

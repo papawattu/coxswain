@@ -21,7 +21,7 @@ func TestRunnerAdvertisesShellToolToModel(t *testing.T) {
 	defer fake.Close()
 
 	run(runConfig{
-		Prompt:    "do something",
+		Prompt:    doSomethingPrompt,
 		Workspace: t.TempDir(),
 		BaseURL:   fake.URL,
 		Model:     "fake-model",
@@ -59,7 +59,7 @@ func TestRunnerAdvertisesShellToolToModel(t *testing.T) {
 		if tool.Type != jsonToolFunction {
 			t.Fatalf("tool %s has type %q, want \"function\"", tool.Function.Name, tool.Type)
 		}
-		if tool.Function.Name != "shell" {
+		if tool.Function.Name != toolNameShell {
 			continue
 		}
 		foundShell = true

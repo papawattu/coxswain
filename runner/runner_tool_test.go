@@ -23,7 +23,7 @@ func TestRunnerExecutesShellToolAndFeedsOutputBack(t *testing.T) {
 		testhelper.ModelResponse{
 			ToolCall: &testhelper.ToolCall{
 				ID:        "call_1",
-				Name:      "shell",
+				Name:      toolNameShell,
 				Arguments: `{"command":"echo created > marker.txt"}`,
 			},
 		},

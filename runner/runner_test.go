@@ -12,6 +12,10 @@ import (
 // a test fixture (I8) — it lives in the test package, not runner.go.
 const fakeModelName = "fake-model"
 
+// doSomethingPrompt is a throwaway prompt used across several tests (goconst
+// wants it shared rather than repeated). It is a test fixture, not protocol.
+const doSomethingPrompt = "do something"
+
 // R1: Given a prompt, the runner writes a result.json with
 // status:"success" and a non-empty summary. The model is a fake (the one
 // system boundary we mock); the seam is the result file, not the model call.

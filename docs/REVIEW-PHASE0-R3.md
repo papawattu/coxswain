@@ -29,7 +29,18 @@ Still open from round 2: **D7 (P1, blocks Phase 1 B2/B3)**, D8, I6.
 
 ### I7. Replace `map[string]any` + JSON-key consts with typed request structs
 
-- [ ] Done
+- [x] Done
+
+  - Typed wire structs in `runner/runner.go`: `chatRequest` (model/messages/
+    tools), `chatMessage` (role/content/tool_calls/tool_call_id), `toolDef`,
+    `fnDef`, `paramSchema`, `propSchema`. `callModel`/`driveModel`/`assistant
+    message` build from these — no `map[string]any` in the request/response
+    path; the `jsonKey*` consts are gone. `jsonRole*` + `jsonToolFunction` are
+    kept as protocol *value* consts the tests assert against (I7 allows this).
+  - **Done together with I5** as the review asked: the rewrite of
+    `callModel`/`driveModel` is the single pass.
+  - All runner tests green with unchanged assertions (R1–R4, R3, R5, I1 tools
+    test) — verified.
 
 **Where:** `runner/runner.go` — the `jsonKey*` / `jsonRole*` /
 `jsonToolFunction` const block, `callModel`, `shellToolSchema`,
@@ -56,7 +67,14 @@ consts gone; all runner tests green without edits to their assertions;
 
 ### I8. Small follow-ups from `2bc945f`
 
-- [ ] Done
+- [x] Done
+
+  - `fakeModelName` ("fake-model") moved from `runner.go` to `runner_test.go`
+    (test fixture). `runner.go` no longer references it.
+  - Makefile `lint`/`lint-fix` use `$(GOLANGCI_LINT)` (absolute path) for the
+    runner too, so an overridden `GOLANGCI_LINT` applies to both modules
+    (verified with a wrapper that logged its invocation path).
+  - Makefile `runner-test` now runs `go vet ./...` on the runner module as well.
 
 - `runner/runner.go` const block: `fakeModelName = "fake-model"` is a test
   fixture in production code. Move it to a `_test.go` file (or the

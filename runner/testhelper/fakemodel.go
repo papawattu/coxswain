@@ -51,6 +51,15 @@ type ModelResponse struct {
 	Content string
 	// ToolCall, when non-nil, makes the assistant message a tool call.
 	ToolCall *ToolCall
+	// I5: when StatusCode != 0, the fake returns this HTTP status with RawBody
+	// (as the body) instead of encoding a normal completion — to test the
+	// runner's non-200 handling.
+	StatusCode int
+	RawBody    string
+	// I5: when true, a queued ToolCall is emitted even if the request did not
+	// advertise a tool of that name (lets a test exercise unknown-tool
+	// rejection without the I1 advertise guard).
+	SkipAdvertiseCheck bool
 }
 
 type ToolCall struct {
@@ -82,10 +91,16 @@ func (fm *FakeModel) handle(w http.ResponseWriter, r *http.Request) {
 	if idx < len(fm.Responses) {
 		resp = fm.Responses[idx]
 	}
+	// I5: emit a raw HTTP error if this response is one.
+	if resp.StatusCode != 0 {
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write([]byte(resp.RawBody))
+		return
+	}
 	// Hardening (I1): a queued tool call is only emitted if the request
 	// actually advertised a tool of that name. This keeps R3 honest — it can
 	// no longer pass while the runner forgets to send its `tools` array.
-	if resp.ToolCall != nil && !advertisesTool(rec, resp.ToolCall.Name) {
+	if resp.ToolCall != nil && !resp.SkipAdvertiseCheck && !advertisesTool(rec, resp.ToolCall.Name) {
 		resp = ModelResponse{Content: "no shell tool advertised; cannot call it"}
 	}
 	fm.mu.Unlock()

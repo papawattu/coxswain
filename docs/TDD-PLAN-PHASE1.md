@@ -13,16 +13,25 @@ state machine.
 
 ### A. Runner as phase driver (`runner/`)
 The Phase 0 runner ran once and exited. Phase 1 replaces it with a daemon that:
-reads `desiredPhase` (the operator writes it — via a file the runner watches, or
-an env/polling channel), does the work for that phase, and writes `observedPhase`
-plus `result.json`. Model context survives across phases within an iteration.
+reads `desiredPhase` (the operator writes it to `.coxswain/desired-phase`), does
+the work for that phase, and writes `result.json` (which carries the reported
+`observedPhase`). Model context survives across phases within an iteration.
+
+> **Channel (ADR-0004):** the runner writes **`result.json` only** and gets **no
+> Loop-status RBAC**. It does not patch the Loop's status. The operator reads
+> `result.json` and *it* writes `loop.Status.ObservedPhase`/`Iteration`/`History`.
+> `observedPhase` in `result.json` is the runner's *report*; the operator turns
+> that report into the Loop status. This is what changed from the earlier
+> status-subresource decision.
 
 **Candidate seams (to confirm):**
-- **A1** — *Phase contract.* The runner reads `loop.Status.DesiredPhase` (via the
-  API), does the work, and patches `loop.Status.ObservedPhase` + writes
-  `result.json`. The seam is the **Loop status** (observed via the API client in
-  the test) + the workspace + result.json — never the model internals. A fake
-  model drives the phase work. The runner gets RBAC to patch Loop `status`.
+- **A1** — *Phase contract.* The runner reads `desiredPhase` from
+  `.coxswain/desired-phase`, does the work, and writes `result.json` (with the
+  reported `observedPhase` + the Phase 0 result fields). The seam is the
+  **result file** + the workspace + the fake model's request history — never the
+  model internals. A fake model drives the phase work. The runner gets **no**
+  Loop-status RBAC (ADR-0004); the test asserts only on `result.json` + workspace
+  files. (The earlier "patch Loop status" mock is gone.)
 - **A2** — *Planning phase.* Given a goal, the runner writes `PLAN.md` at
   `.coxswain/PLAN.md` with a ≤4KB summary, and sets `observedPhase=Planning`
   complete. Seam: the PLAN.md file + result.
@@ -70,13 +79,17 @@ model.
 
 ## Settled design questions (2026-09-26, all confirmed with user)
 
-1. **Phase channel = Loop status subresource.** `desiredPhase` and
-   `observedPhase` are Loop status fields (`status.desiredPhase`,
-   `status.observedPhase`). The operator is a pure state machine: it sets
-   `desiredPhase` and reads `observedPhase`. The runner is the only thing that
-   touches the workspace; it patches `loop.status` via the API. **Consequence:
-   the runner needs RBAC to `patch`/`update` the Loop `status` subresource**, and
-   `LoopStatus` gains `desiredPhase` + `observedPhase` fields (see "CRD changes").
+1. **Phase channel (REVISED, ADR-0004).** ~~Loop status subresource~~ → **result
+   file only.** The runner writes `result.json` (which reports the
+   `observedPhase`) and gets **no Loop-status RBAC**. The operator reads
+   `result.json` and writes `loop.Status.ObservedPhase`/`Iteration`/`History`.
+   The operator communicates `desiredPhase` to the runner via a file on the
+   workspace (`.coxswain/desired-phase`). `loop.Status.ObservedPhase` stays a
+   field, but it is the operator's *record of the runner's report*, written by
+   the operator — not a value the runner writes. Rationale: a runner with a
+   shell that can patch its own Loop status can lie about its own progress,
+   which breaks determinism + auditability and contradicts CONTEXT.md's
+   "result file is the only output the operator reads." See ADR-0004.
 2. **Tamper hash = runner reports.** The runner reports the sha256 of each
    acceptance-check source file in `result.json` (baseline at iteration start,
    re-reported after implement). The operator compares reported hashes to the
@@ -84,7 +97,9 @@ model.
    runs). The operator never opens files — it stays content-free. The runner is
    trusted to report hashes honestly (the operator can't verify the hash is of
    the real file; this is the accepted trade-off for keeping the operator
-   deterministic).
+   deterministic). *(Note: D3 verify-isolation in REVIEW-PHASE0.md — how to stop
+   the agent gaming the checks beyond file-hashing — is still open and must be
+   decided before cutting B2.)*
 3. **Verify = runner executes, operator decides.** The runner runs each
    acceptance check in the sandbox and reports exit codes in `result.json`.
    The operator reads the outcome and decides Succeeded vs re-implement.
@@ -102,19 +117,21 @@ model.
 - `approval` (already in the enum; `mode: Auto|Manual`, `onReject: Replan|Fail`)
   — Phase 1 uses `mode: Auto` only; the Manual gate is Phase 4.
 
-`LoopStatus` gains:
-- `desiredPhase` / `observedPhase` (Phase) — the phase channel (design Q1)
+`LoopStatus` gains (all **operator-written**; ADR-0004 — the runner never writes these, it only reports them in `result.json`):
+- `desiredPhase` / `observedPhase` (Phase) — the operator records the phase it asked for and the phase the runner reported. `desiredPhase` is also copied to `.coxswain/desired-phase` for the runner to read.
 - `plan` `{ summary string (≤4KB), hash string (sha256 of PLAN.md) }`
 - `history []HistoryEntry` — the audit trail: `{ iteration, phase, reason, message, timestamp }`
-- `iteration` (int32) — already present from Phase 0
+- `iteration` (int) — already present from Phase 0
 - `verify` `{ lastCheckResults []string, baselineHashes []FileHash }` — the
   recorded hash baseline for TamperedVerify (design Q2) and the last verify
   output to feed forward
 
 `FileHash` = `{ path string, sha256 string }`.
 
-RBAC: the runner (a ServiceAccount in the sandbox) gets `update`/`patch` on
-`loops/status`. The operator keeps full CRUD on loops + sandboxes.
+RBAC: the runner gets **no** Loop RBAC (ADR-0004) — it is credential-free and
+only writes `result.json`. The operator keeps full CRUD on loops + sandboxes and
+*also* gains the ability to read `result.json` from the sandbox (D2: `pods/exec`
+to `cat`, a shared PVC, or a read-only sidecar — decided in ADR-0005).
 
 
 ## Out of scope for Phase 1

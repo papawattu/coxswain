@@ -38,16 +38,20 @@ func TestRunnerSurfacesHTTPErrorAsBlocked(t *testing.T) {
 	}
 }
 
-// I5: a chatty shell command's output must be truncated before it is fed back
-// to the model (cap ~16 KiB), so the context can't be blown.
+// I5 (refined I12): a chatty shell command's output must be truncated before it
+// is fed back to the model (cap ~16 KiB), keeping the head and the tail with an
+// elided marker (the useful part of a build/test is usually at the end).
 func TestRunnerTruncatesLongToolOutput(t *testing.T) {
 	workdir := t.TempDir()
+	// Print a distinctive head, then a lot of filler, then a distinctive tail.
+	// After truncation the head and the tail must both survive, with an elided
+	// marker between them.
 	fake := testhelper.New(
 		testhelper.ModelResponse{
 			ToolCall: &testhelper.ToolCall{
 				ID:        "call_big",
 				Name:      toolNameShell,
-				Arguments: `{"command":"yes A | head -n 200000"}`,
+				Arguments: `{"command":"printf 'HEAD-MARKER'; yes FILLER | head -n 200000; printf 'TAIL-MARKER'"}`,
 			},
 		},
 	)
@@ -60,7 +64,6 @@ func TestRunnerTruncatesLongToolOutput(t *testing.T) {
 		Model:     fakeModelName,
 	})
 
-	// The tool message fed back (request 2) must be bounded, not 200k chars.
 	if len(fake.Requests) < 2 {
 		t.Fatalf("expected >=2 requests, got %d", len(fake.Requests))
 	}
@@ -68,9 +71,18 @@ func TestRunnerTruncatesLongToolOutput(t *testing.T) {
 	if len(toolMsgs) == 0 {
 		t.Fatalf("no tool-result message in request 2")
 	}
-	got := len(toolMsgs[0].Content)
-	if got > maxToolOutputBytes+64 { // + slack for the truncation marker
-		t.Errorf("tool output length = %d bytes; want <= ~%d (truncated)", got, maxToolOutputBytes)
+	got := toolMsgs[0].Content
+	if len(got) > maxToolOutputBytes+64 { // + slack for the elided marker
+		t.Errorf("tool output length = %d bytes; want <= ~%d (truncated)", len(got), maxToolOutputBytes)
+	}
+	if !strings.Contains(got, "HEAD-MARKER") {
+		t.Errorf("tool output lost the head; want the head kept on truncation")
+	}
+	if !strings.Contains(got, "TAIL-MARKER") {
+		t.Errorf("tool output lost the tail; I12 wants head+tail kept on truncation")
+	}
+	if !strings.Contains(got, "bytes elided") {
+		t.Errorf("tool output has no elided marker; want a marker between head and tail")
 	}
 }
 
@@ -238,5 +250,54 @@ func TestRunnerShellTimeoutKillsChildAfterSuccess(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("run() took %v; the post-success group kill should release the "+
 			"pipe quickly", elapsed)
+	}
+}
+
+// I11: the model HTTP timeout must be configurable (a local 27B-class model or
+// a long-context request can exceed the old hard 60s). With a ModelTimeout
+// smaller than the model's response delay, run() must time out -> blocked with a
+// timeout message. With a ModelTimeout larger than the delay, it must succeed.
+func TestRunnerModelTimeoutConfigurable(t *testing.T) {
+	// Case 1: a 500ms delay against a 200ms timeout -> blocked (timeout).
+	fakeSlow := testhelper.New(testhelper.ModelResponse{
+		Content: "slow answer",
+		Delay:   500 * time.Millisecond,
+	})
+	defer fakeSlow.Close()
+
+	slowRes := run(runConfig{
+		Prompt:       "think hard",
+		Workspace:    t.TempDir(),
+		BaseURL:      fakeSlow.URL,
+		Model:        fakeModelName,
+		ModelTimeout: 200 * time.Millisecond,
+	})
+	if slowRes.Status != statusBlocked {
+		t.Fatalf("slow case: status = %q, want blocked (timeout)", slowRes.Status)
+	}
+	if !strings.Contains(slowRes.VerificationNotes, "timeout") &&
+		!strings.Contains(slowRes.VerificationNotes, "deadline") {
+		t.Errorf("slow case: verificationNotes = %q; want a timeout/deadline message", slowRes.VerificationNotes)
+	}
+
+	// Case 2: a 100ms delay against a 5s timeout -> success.
+	fakeFast := testhelper.New(testhelper.ModelResponse{
+		Content: "quick answer",
+		Delay:   100 * time.Millisecond,
+	})
+	defer fakeFast.Close()
+
+	fastRes := run(runConfig{
+		Prompt:       "think",
+		Workspace:    t.TempDir(),
+		BaseURL:      fakeFast.URL,
+		Model:        fakeModelName,
+		ModelTimeout: 5 * time.Second,
+	})
+	if fastRes.Status != statusSuccess {
+		t.Fatalf("fast case: status = %q, want success", fastRes.Status)
+	}
+	if fastRes.Summary != "quick answer" {
+		t.Errorf("fast case: summary = %q, want the model's answer", fastRes.Summary)
 	}
 }

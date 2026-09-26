@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // String constants. systemPrompt/resultDirName/resultFileName are the runner's
@@ -57,6 +58,11 @@ const (
 	// this is the default).
 	defaultShellTimeout = 60 * time.Second
 
+	// I11: default per-model-request timeout (was a hard 60s, too short for a
+	// local 27B-class model or a long-context request). Overridable via
+	// runConfig.ModelTimeout.
+	defaultModelTimeout = 10 * time.Minute
+
 	// I10: how long Wait tolerates pipes held open by straggler processes after
 	// the command's main process exits, before it stops waiting on them.
 	shellWaitDelay = 2 * time.Second
@@ -77,6 +83,11 @@ type runConfig struct {
 	// Zero uses defaultShellTimeout. The whole process group is killed on
 	// timeout, so a command that backgrounds a child can't hang the runner.
 	ShellTimeout time.Duration
+	// ModelTimeout bounds a single model HTTP request (I11: was a hard const
+	// 60s, too short for a local 27B-class model / long-context request). Zero
+	// uses defaultModelTimeout. The per-request context is kept so a run
+	// deadline can cancel it later.
+	ModelTimeout time.Duration
 }
 
 // Result is the result file schema (Phase 0 subset of the Phase 1 contract).
@@ -185,7 +196,11 @@ func shellToolSchema() []toolDef {
 // run drives the model and writes the result file. It returns the result it
 // wrote. This is the seam the tests observe.
 func run(cfg runConfig) Result {
-	client := &http.Client{Timeout: 60 * time.Second}
+	modelTimeout := cfg.ModelTimeout
+	if modelTimeout <= 0 {
+		modelTimeout = defaultModelTimeout
+	}
+	client := &http.Client{Timeout: modelTimeout}
 
 	maxSteps := cfg.MaxSteps
 	if maxSteps <= 0 {
@@ -203,7 +218,8 @@ func run(cfg runConfig) Result {
 	}
 
 	answer, trace, modelErr := driveModel(
-		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages, maxSteps, shellTimeout,
+		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
+		messages, maxSteps, shellTimeout, modelTimeout,
 	)
 
 	res := Result{
@@ -252,11 +268,7 @@ func callModel(
 	if err != nil {
 		return assistantMessage{}, err
 	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			_ = cerr
-		}
-	}()
+	defer func() { _ = resp.Body.Close() }()
 
 	// I5: check the HTTP status before decoding. A 401/403/500 was previously
 	// misreported as "no choices in response" (the body is an error, not a
@@ -267,10 +279,10 @@ func callModel(
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Include the server's error body (truncated) so the cause is visible
-		// in the result's verificationNotes.
+		// in the result's verificationNotes. I12: cut on a rune boundary.
 		errBody := string(raw)
 		if len(errBody) > 256 {
-			errBody = errBody[:256] + "…"
+			errBody = cutRunePrefix(errBody, 256) + "…"
 		}
 		return assistantMessage{}, fmt.Errorf("model returned HTTP %d: %s", resp.StatusCode, errBody)
 	}
@@ -338,21 +350,54 @@ func execShell(workspace, argsJSON string, timeout time.Duration) (string, error
 	return truncateToolOutput(string(out)), nil
 }
 
-// truncateToolOutput caps s to maxToolOutputBytes, appending a marker if it
-// was truncated (I5).
+// truncateToolOutput caps s to maxToolOutputBytes, keeping the head and the
+// tail (the useful part of a build/test is usually at the end) with a marker
+// between them (I5, refined I12: head+tail, not head-only). Cuts are made on
+// UTF-8 rune boundaries so a multi-byte character is not split.
 func truncateToolOutput(s string) string {
 	if len(s) <= maxToolOutputBytes {
 		return s
 	}
-	return s[:maxToolOutputBytes] + fmt.Sprintf("… (truncated %d bytes)", len(s)-maxToolOutputBytes)
+	const headBytes = 4096
+	tailBytes := maxToolOutputBytes - headBytes // keep head + tail within the cap
+	elided := max(0, len(s)-headBytes-tailBytes)
+	head := cutRunePrefix(s, headBytes)
+	tail := cutRuneSuffix(s, tailBytes)
+	return head + fmt.Sprintf("… (%d bytes elided) …\n", elided) + tail
 }
 
-// knownToolNames returns the set of tool names the runner can execute. I5:
-// an unknown tool name is rejected rather than silently run as a shell
-// command.
-func knownToolNames() map[string]bool {
-	return map[string]bool{toolNameShell: true}
+// cutRunePrefix returns the first n bytes of s, backing off to the previous
+// UTF-8 rune start if s[n] is a continuation byte (so a rune is not split).
+func cutRunePrefix(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
+
+// cutRuneSuffix returns the last n bytes of s, advancing to the next UTF-8 rune
+// start if the first byte of the slice is a continuation byte.
+func cutRuneSuffix(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
+}
+
+// knownTools is the set of tool names the runner will execute (I5); an unknown
+// name is rejected rather than silently run as a shell command. I12: a
+// package-level map instead of rebuilding it on every driveModel call.
+var knownTools = map[string]bool{toolNameShell: true}
+
+func knownToolNames() map[string]bool { return knownTools }
 
 // driveModel sends the messages and returns the assistant's text answer plus a
 // trace. It loops on tool calls: when the model returns tool calls, each known
@@ -362,13 +407,17 @@ func knownToolNames() map[string]bool {
 // truncated before being fed back.
 func driveModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string,
-	messages []chatMessage, maxSteps int, shellTimeout time.Duration,
+	messages []chatMessage, maxSteps int, shellTimeout, modelTimeout time.Duration,
 ) (string, []string, string) {
 	known := knownToolNames()
 	trace := []string{}
 
 	for step := range maxSteps {
-		msg, err := callModel(ctx, client, baseURL, apiKey, model, messages)
+		// I11: bound each model request with modelTimeout, derived from the
+		// caller's ctx so a run deadline can still cancel it.
+		reqCtx, cancel := context.WithTimeout(ctx, modelTimeout)
+		msg, err := callModel(reqCtx, client, baseURL, apiKey, model, messages)
+		cancel()
 		if err != nil {
 			return "", append(trace, "call model: "+err.Error()), err.Error()
 		}

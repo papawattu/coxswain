@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"time"
 )
 
 // Received is the last request body the fake server saw, decoded.
@@ -60,6 +61,10 @@ type ModelResponse struct {
 	// advertise a tool of that name (lets a test exercise unknown-tool
 	// rejection without the I1 advertise guard).
 	SkipAdvertiseCheck bool
+	// I11: delay the response by this duration (lets a test exercise the
+	// runner's model timeout: set a small ModelTimeout and a larger Delay to
+	// force a timeout).
+	Delay time.Duration
 }
 
 type ToolCall struct {
@@ -90,6 +95,9 @@ func (fm *FakeModel) handle(w http.ResponseWriter, r *http.Request) {
 	resp := fm.defaultResponse()
 	if idx < len(fm.Responses) {
 		resp = fm.Responses[idx]
+	}
+	if resp.Delay > 0 {
+		time.Sleep(resp.Delay)
 	}
 	// I5: emit a raw HTTP error if this response is one.
 	if resp.StatusCode != 0 {

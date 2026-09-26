@@ -47,8 +47,7 @@ const (
 type Workspace struct {
 	// repo is the git URL to clone. Accepts HTTPS (`https://…`), SSH
 	// (`ssh://…`), and scp-style (`user@host:path`) remotes — go-git handles
-	// all three. Must be non-empty and match the pattern; rejected at
-	// admission (I18).
+	// all three. Must be non-empty and match the pattern.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Pattern=`^(https://|ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:).+`

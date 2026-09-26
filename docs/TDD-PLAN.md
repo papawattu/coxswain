@@ -29,7 +29,7 @@ after-the-fact — kept. Adding the missing seams:
 |---|-------|------|--------|
 | S0 | Loop → a Sandbox owned by it exists; phase set to Pending; idempotent on re-reconcile | envtest | ✅ green (written after code — noted) |
 | S1 | A Loop with `spec.suspend:true` does not run a Running sandbox | envtest | ✅ green |
-| S2 | A pre-existing Sandbox (from a prior controller instance) is not re-created | envtest | ⬜ |
+| S2 | A pre-existing Sandbox (from a prior controller instance) is not re-created | envtest | ✅ green (verification — CreateOrUpdate adopts by name) |
 | S3 | `status.observedGeneration` tracks spec changes | envtest | ✅ green (verification — controller already correct) |
 
 ## Out of scope for Phase 0

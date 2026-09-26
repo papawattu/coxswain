@@ -99,6 +99,7 @@ type LoopSpec struct {
 
 	// loop holds iteration and phase-timeout settings.
 	// +optional
+	// +kubebuilder:default={}
 	Loop LoopSettings `json:"loop,omitempty"`
 
 	// suspend, when true, pauses the Loop at its current phase.

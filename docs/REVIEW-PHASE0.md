@@ -70,7 +70,8 @@ and the `pre-existing` label.
 
 ### I3. CI never tests or lints the `runner/` module
 
-- [ ] Done
+- [x] Done (commit 2bc945f: `make test`/`make lint`/`lint-fix` now cover the
+      runner module; runner lint findings fixed in the same commit)
 
 **Where:** `Makefile` (`test`, `lint` targets), `.github/workflows/test.yml`,
 `.github/workflows/lint.yml`.
@@ -137,7 +138,7 @@ is targeted (OpenAI-compatible fits the homelab vLLM stack).
 
 ### D1. Runner must not write Loop status
 
-- [ ] Decided (ADR: ____)
+- [x] Decided (ADR: 0004, commit e19c5a2)
 
 `CONTEXT.md` ("Runner") says the runner writes `status.observedPhase`. That
 needs RBAC for the sandbox to patch Loop status, and the runner's credentials
@@ -150,7 +151,15 @@ progress only via the result file.
 
 ### D2. How the operator reads `result.json`
 
-- [ ] Decided (ADR: ____)
+- [ ] Decided (ADR: 0005, folded into D7)
+
+Undesigned. Options: operator `exec`s `cat` into the sandbox (needs
+`pods/exec` RBAC), a shared PVC the operator mounts, or a small read-only
+sidecar. Choice affects RBAC and D1.
+
+> Round 2 (REVIEW-PHASE0-R2): D2 and D3 are being decided together by
+> ADR-0005 (D7) — how the operator obtains verify *evidence*. result.json
+> carries the agent's claims only, never evidence the operator gates on.
 
 Undesigned. Options: operator `exec`s `cat` into the sandbox (needs
 `pods/exec` RBAC), a shared PVC the operator mounts, or a small read-only
@@ -158,7 +167,7 @@ sidecar. Choice affects RBAC and D1.
 
 ### D3. Verify isolation / what "protected paths" means
 
-- [ ] Decided (ADR: ____)
+- [ ] Decided (ADR: 0005, folded into D7)
 
 Verify runs in the same sandbox where the agent has a shell. For a check like
 `go test ./...` there is no single "source file" to hash, and the agent can
@@ -171,7 +180,9 @@ the workspace. Otherwise specify exactly which paths are hashed.
 
 ### D4. API group is `cox.cox.dev` under a domain we don't own
 
-- [ ] Decided
+- [x] Decided — renamed to `coxswain.wattu.com` (commit e5027e9). Leftover
+      `cox.dev` references in cmd/main.go + docs are tracked as I6 in
+      REVIEW-PHASE0-R2.
 
 Kubebuilder produced `cox.cox.dev` (domain `cox.dev` + group `cox`); the plan
 says `cox.dev`. ADR-0001 records that `cox.dev` is taken. Owning the group's

@@ -215,34 +215,41 @@ run Phase 3 e2e on the homelab Ceph cluster (RBD supports snapshots).
 
 ## P3 — Cleanup
 
-- [ ] **License headers corrupted** — `api/v1alpha1/loop_types.go`,
+- [x] **License headers corrupted** — `api/v1alpha1/loop_types.go`,
   `internal/controller/loop_controller.go`,
   `internal/controller/loop_controller_test.go` read `" IS" BASIS` with a
   missing newline (and a duplicated line in `loop_types.go`). Restore from
-  `hack/boilerplate.go.txt`.
+  `hack/boilerplate.go.txt`. — done `794045b`
 - [x] **Sample CR is a stub** — `config/samples/cox_v1alpha1_loop.yaml` still
   has `TODO(user)` and label `app.kubernetes.io/name: coxscaf`. Replace with
   the smoke Loop from `E2E-PHASE0.md`.  (Done: `5762374` renamed it to
   `coxswain_v1alpha1_loop.yaml` and replaced the stub with the real smoke Loop.)
-- [ ] **`maxIterations` default is fragile** — `LoopSpec.Loop`
+- [x] **`maxIterations` default is fragile** — `LoopSpec.Loop`
   (`loop_types.go:102`) has no `+kubebuilder:default={}`, so a YAML Loop that
   omits `loop:` gets no default (Go clients happen to send `loop: {}`). Add
   the marker, regenerate, add an envtest creating the Loop via unstructured
-  without `loop`.
-- [ ] **`Workspace.Ref`** (`loop_types.go:56`) — `+kubebuilder:default=""` is
+  without `loop`. — done `924cf48`
+- [x] **`Workspace.Ref`** (`loop_types.go:56`) — `+kubebuilder:default=""` is
   a no-op; remove. `Repo` has `Format=uri` (line 50) which rejects SSH remotes
-  (`git@github.com:...`); decide whether SSH is supported and adjust.
-- [ ] **`go.mod`** marks `sigs.k8s.io/agent-sandbox` as `// indirect` though
-  it's imported directly — run `go mod tidy`.
+  (`git@github.com:...`); decide whether SSH is supported and adjust. — done
+  `ef0d6bb` (no-op marker removed; `Format=uri` dropped so HTTPS + SSH remotes
+  both accepted)
+- [x] **`go.mod`** marks `sigs.k8s.io/agent-sandbox` as `// indirect` though
+  it's imported directly — run `go mod tidy`. — done `7633467`
 - [ ] **e2e suite is still scaffold** — `test/e2e/e2e_test.go` only checks
   manager + metrics. Automate the manual steps in `E2E-PHASE0.md` (apply Loop
   → Sandbox exists with owner ref → log line). Use `make deploy`
   (`config/default` overlay) instead of the hand-patched namespace workaround.
+  *(Deferred — the round-9 reviewer explicitly left this out of the P3 batch so
+  B1's `loop_types.go`/`loop_controller.go` diff stays clean.)*
 - [x] **Scratch file committed** — delete — done by `5762374` (the scratch
   scout file `docs/e2e-prereqs-scout-2026-09-26T21-02-17.md` was deleted)
   `docs/e2e-prereqs-scout-2026-09-26T21-02-17.md`.
-- [ ] **Controller tidy-ups** (`loop_controller.go`): type the logger param as
+- [x] **Controller tidy-ups** (`loop_controller.go`): type the logger param as
   `logr.Logger`; combine the two `Status().Update` calls into one; the
   "ensured loop sandbox" log fires on every reconcile — log at V(1) when
   `op == unchanged`; `<loop>-sandbox` can exceed 63 chars — cap Loop name
-  length via CRD validation or hash-truncate the Sandbox name.
+  length via CRD validation or hash-truncate the Sandbox name. — done `9555cdf`
+  (ensureSandbox pulls the logger via logf.FromContext; the two Status().Update
+  calls combined into one; V(1) log when unchanged; sandboxName hash-truncates
+  to 63 chars with a unit test)

@@ -46,7 +46,9 @@ S2/S3 (verification tests). goconst lint fixed by a shared test fixture. Full
 suite green; lint clean.
 
 **Next (not TDD-ordered yet):** the Phase 0 "done when" e2e - prove a Loop
-creates a Sandbox on a *real* cluster. Note: the dev box has a k3s cluster
-(pi0/pi1, v1.36.2) but no `kind` on PATH; the e2e environment decision
-(kind vs k3s, agent-sandbox controller install) is pending the e2e-prereqs
-investigation.
+creates a Sandbox on a *real* cluster. DECISION (2026-09-26): use a fresh
+**kind** cluster (`coxswain`); **skip** running the agent-sandbox controller
+(Phase 0 literal = the operator creates the Sandbox OBJECT and logs it). Apply
+the vendored CRD so the type exists; build+kind-load the operator image; deploy
+via kustomize; apply a sample Loop; verify the Sandbox object appears and the
+operator logged it.

@@ -6,6 +6,9 @@
 # If you use Podman, re-include your source directories by name,
 # such as !cmd, !api, and !internal.
 # See https://github.com/containers/buildah/issues/6417
+!cmd
+!api
+!internal
 !**/*.go
 **/*_test.go
 

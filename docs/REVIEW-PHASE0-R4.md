@@ -32,7 +32,20 @@ must be settled before B2 is built.
 
 ### D10. Protected-path hashing misses new files; replace hashes with a pinned base commit + protected globs
 
-- [ ] Decided (amend ADR-0005)
+- [x] Decided (amend ADR-0005) — commit `TICKME`
+
+  - ADR-0005 rewritten: `status.baseCommit` (resolved from `spec.workspace.ref`
+    at Loop start, pinned) + `spec.verify.protectedPaths[]` globs (per-language
+    default when empty; Go: `**/*_test.go`, `**/testdata/**`, `go.mod`, `go.sum`,
+    + files the checks reference). Tamper check = `git diff --name-only
+    <baseCommit> <verifiedCommit> -- <globs>` in the verify Job, before any check
+    runs — catches added/modified/deleted/renamed, no stored hashes, operator
+    stays content-free (no clone).
+  - `TDD-PLAN-PHASE1.md`: `verify.acceptanceCheckPaths[]` → `verify.protectedPaths[]`;
+    `status.verify.baselineHashes` → `status.baseCommit`; B2 anti-gaming test set =
+    (a) edit existing `*_test.go`, (b) **add** new `*_test.go` `TestMain`→`os.Exit(0)`,
+    (c) add a `replace` to `go.mod`; each ends `Failed:TamperedVerify` with no check
+    run, even when the fake `result.json` claims otherwise.
 
 **Where:** `docs/adr/0005-operator-verifies-via-isolated-job.md` (Decision
 §2); `docs/TDD-PLAN-PHASE1.md` B2, CRD field `verify.acceptanceCheckPaths[]`
@@ -78,7 +91,12 @@ check run, even when the fake runner's `result.json` claims otherwise.
 
 ### D11. Bind the verified commit to what gets reported and PR'd
 
-- [ ] Decided
+- [x] Decided — ADR-0005 (D11 section)
+
+  - At `Verifying` start the operator resolves the branch head itself
+    (`ls-remote`), records `status.history[n].verifiedCommit`, and the Job checks
+    out **that SHA** (not the branch name). `Succeeded` records the verified SHA;
+    the Phase 6 PR must open at exactly that SHA or fail if the branch head moved.
 
 **Where:** ADR-0005 Decision §1 ("the commit the runner pushed after
 implement"); Phase 6 PR flow.
@@ -96,7 +114,12 @@ branch head moved.
 
 ### D12. The verify Job runs untrusted code — isolate it like the sandbox
 
-- [ ] Decided
+- [x] Decided — ADR-0005 (D12 section)
+
+  - The Job gets `automountServiceAccountToken: false`, read-only clone creds
+    only (never the push token), the sandbox's NetworkPolicy, resource limits +
+    `activeDeadlineSeconds`, and the same runtime class (e.g. gVisor). Consider
+    running it as an agent-sandbox `Sandbox` so isolation lives in one place.
 
 **Where:** ADR-0005 Consequences.
 
@@ -113,7 +136,14 @@ Job so isolation policy lives in one place.
 
 ### D13. Job reporting contract: distinguish tampered / failed / errored
 
-- [ ] Decided
+- [x] Decided — ADR-0005 (D13 section)
+
+  - Tamper check runs first (reserved *tampered* exit code); checks run with
+    per-check exit codes in a termination message (`/dev/termination-log`, ≤4 KB
+    JSON). Operator reads pod status → `TamperedVerify` / iterate / `VerifyError`
+    (re-run once). `pods/log` added to the operator RBAC for the raw log (fed to
+    the next prompt). B3 test note recorded: envtest has no Job controller, so
+    the test sets Job / pod status directly.
 
 **Where:** ADR-0005 Decision §1–2; `TDD-PLAN-PHASE1.md` B2/B3.
 
@@ -133,7 +163,12 @@ list. Note for B3's test: envtest has no Job controller, so the test sets Job
 
 ### D9. B6 "return nil, no requeue" can wedge the Loop
 
-- [ ] Plan amended
+- [x] Plan amended — `TDD-PLAN-PHASE1.md` B6 (commit `TICKME`)
+
+  - B6 now: `return nil` + `RequeueAfter(5m)` while `SandboxNameConflict` is set
+    (or a `Watches` on Sandboxes by name). Added B6 test: delete the foreign
+    sandbox → the next reconcile creates the Loop's own and clears the
+    condition.
 
 **Where:** `docs/TDD-PLAN-PHASE1.md` B6.
 
@@ -152,7 +187,11 @@ the next reconcile creates the Loop's own and clears the condition.
 
 ### I9. Operator `pods/exec` is namespace-wide
 
-- [ ] Noted in ADR-0005
+- [x] Noted in ADR-0005
+
+  - ADR-0005 Consequences: `pods/exec` is namespace-wide; acceptable for Phase
+    1, revisit in Phase 7 hardening (a read-only sidecar serving `result.json`
+    would remove the need for exec).
 
 `pods/exec` on the operator's ClusterRole lets it exec into any pod in any
 Loop namespace. Acceptable for Phase 1; record it in ADR-0005 Consequences and

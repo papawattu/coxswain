@@ -215,9 +215,10 @@ run Phase 3 e2e on the homelab Ceph cluster (RBD supports snapshots).
   `internal/controller/loop_controller_test.go` read `" IS" BASIS` with a
   missing newline (and a duplicated line in `loop_types.go`). Restore from
   `hack/boilerplate.go.txt`.
-- [ ] **Sample CR is a stub** — `config/samples/cox_v1alpha1_loop.yaml` still
+- [x] **Sample CR is a stub** — `config/samples/cox_v1alpha1_loop.yaml` still
   has `TODO(user)` and label `app.kubernetes.io/name: coxscaf`. Replace with
-  the smoke Loop from `E2E-PHASE0.md`.
+  the smoke Loop from `E2E-PHASE0.md`.  (Done: `5762374` renamed it to
+  `coxswain_v1alpha1_loop.yaml` and replaced the stub with the real smoke Loop.)
 - [ ] **`maxIterations` default is fragile** — `LoopSpec.Loop`
   (`loop_types.go:102`) has no `+kubebuilder:default={}`, so a YAML Loop that
   omits `loop:` gets no default (Go clients happen to send `loop: {}`). Add

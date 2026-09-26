@@ -61,45 +61,60 @@ model.
   `Verifying → Implementing` (re-plan/implement on failure), `Verifying → Failed`
   on `MaxIterations`. Seam: cluster state via envtest (set observedPhase, reconcile,
   assert phase).
-- **B2** — *Protected paths / TamperedVerify (ADR-0005).* The operator hashes
-  the protected paths **at the base ref at Loop start** (baseline, stored in
-  `status.verify.baselineHashes`). At `Verifying`, the verify Job hashes the
-  protected paths **at the iteration commit**; the operator compares baseline vs
-  iteration-commit and, on any divergence, fails the iteration with
-  `TamperedVerify` **before any check runs** (terminal). The agent has no write
-  path to the evidence. Seam: create a Loop with a protected test file, "mutate
-  it in the implement step" (commit the mutation on the iteration commit), and —
-  **to prove the anti-gaming property** — also have the (fake) runner rewrite
-  `result.json` to *claim* the baseline hash still matches. The operator ignores
-  that claim, compares its own base-ref baseline to the iteration-commit hash,
-  and the Loop ends `Failed:TamperedVerify` with no verify check run. **This is
-  the core anti-gaming test (D7 acceptance).**
-- **B3** — *Deterministic verify via the Job (ADR-0005).* At `Verifying`, the
-  operator creates a short-lived verify Job (fresh pod, no shared process
-  namespace with the sandbox) that checks out the Loop branch at the iteration
-  commit and runs the acceptance checks **from the base ref**; the operator
-  reads the Job's status/exit code from the API. All exit 0 → `Succeeded`; any
-  non-zero → feed the Job's output into the next implement prompt. Seam: envtest
-  where the verify *outcome* is the Job's status (an input the operator read,
-  not a value from `result.json` and not recomputed by the operator). A minimal
-  verify Job image (checkout + run commands + exit code) is built in Phase 1.
+- **B2** — *Protected paths / TamperedVerify via base-commit glob diff
+  (ADR-0005 round-4 D10).* The operator pins `status.baseCommit` (resolved from
+  `spec.workspace.ref` at Loop start). Protected paths are globs
+  (`spec.verify.protectedPaths[]`, per-language default when empty). At
+  `Verifying`, the verify Job runs `git diff --name-only <baseCommit>
+  <verifiedCommit> -- <globs>` **before any check runs**; non-empty ⇒
+  `TamperedVerify` (terminal). The agent has no write path to the evidence
+  (the two SHAs are operator-pinned). **Anti-gaming test set (D10 acceptance):**
+  (a) edit an existing `*_test.go`; (b) **add a new `*_test.go` with `TestMain`
+  → `os.Exit(0)`**; (c) **add a `replace` to `go.mod`** — each ends
+  `Failed:TamperedVerify` with **no check run**, even when the fake runner's
+  `result.json` claims the protected paths are untouched. **This is the core
+  anti-gaming test (D7/D10 acceptance).**
+- **B3** — *Deterministic verify via the Job's pod status (ADR-0005 D11/D13).*
+  At `Verifying` start the operator resolves the Loop branch head to a SHA and
+  records `history[n].verifiedCommit` (D11). The operator creates a short-lived
+  verify Job (fresh pod, no shared process namespace, isolated per D12) that
+  checks out **that SHA** and: first runs the tamper glob diff (reserved
+  *tampered* exit code on divergence), then runs the acceptance checks, reporting
+  per-check exit codes in a termination message (`/dev/termination-log`). The
+  operator reads the Job pod status from the API (reserved code →
+  `TamperedVerify`; all checks exit 0 → `Succeeded`; a check non-zero → feed the
+  pod **log** into the next prompt via `pods/log`; Job errored → `VerifyError`
+  re-run once). Seam: **envtest has no Job controller**, so the B3 test sets the
+  Job / pod status directly (reserved code / termination message) and asserts
+  the phase — it does not run a real Job. The verify *outcome* is the Job status
+  the operator read (not a `result.json` value, not recomputed by the operator).
+  A minimal verify Job image (checkout a pinned SHA + run the glob diff + run
+  the checks + report reserved codes / termination message) is built in Phase 1
+  and runs isolated (D12): no SA token, read-only clone creds, sandbox
+  NetworkPolicy, resource limits + `activeDeadlineSeconds`, runtime class.
 - **B4** — *Iteration + history.* Each transition increments `status.iteration`
-  and appends to `status.history[]` (the audit trail). Seam: assert iteration
-  count and history entries after a multi-iteration run.
+  and appends to `status.history[]` (the audit trail, incl. `verifiedCommit`).
+  Seam: assert iteration count and history entries after a multi-iteration run.
 - **B5** — *maxIterations.* A Loop that keeps failing stops at `maxIterations`
   with `Failed:MaxIterations` (terminal). Seam: a Loop with `maxIterations: 2`
   that always fails → `Failed:MaxIterations` after 2 tries.
-- **B6** — *Foreign-owned sandbox → condition, not a retry storm (D8).*
-  `ensureSandbox` returns `AlreadyOwnedError` when the Loop's sandbox is owned
-  by a different controller (I2, `900c72f`); as-is that loops `Reconcile` into
-  an exponential-backoff requeue forever, visible only in logs. Fix (when the
-  phase machine + conditions exist): on `AlreadyOwnedError`, emit a `Warning`
-  event, set condition `SandboxReady=False` reason `SandboxNameConflict`, and
-  **return nil** (no error, no requeue). Seam: the foreign-owner test in
-  `loop_adoption_test.go` is updated to assert the condition + event and that
-  `Reconcile` returns nil (it currently asserts an error — that assertion is
-  deliberately left as a red marker until B6 lands). Do not implement before
-  the condition/event infrastructure from B1 exists.
+- **B6** — *Foreign-owned sandbox → condition + requeue, not a retry storm or
+  a wedge (D8 + D9).* `ensureSandbox` returns `AlreadyOwnedError` when the
+  Loop's sandbox is owned by a different controller (I2, `900c72f`); as-is that
+  loops `Reconcile` into an exponential-backoff requeue forever, visible only in
+  logs. Fix (when the phase machine + conditions exist): on `AlreadyOwnedError`,
+  emit a `Warning` event, set condition `SandboxReady=False` reason
+  `SandboxNameConflict`, **return nil, and `RequeueAfter` a long interval (e.g.
+  5m) while the condition is set** (D9: a plain `return nil` wedges the Loop
+  because `Owns(&Sandbox{})` only maps events from sandboxes owned by this Loop,
+  so a later deletion of the foreign sandbox enqueues nothing). Alternative:
+  a `Watches` on Sandboxes mapping by name (`<loop>-sandbox` → Loop). Seam:
+  (1) the foreign-owner test in `loop_adoption_test.go` is updated to assert the
+  condition + event and that `Reconcile` returns nil with a requeue (it
+  currently asserts an error — deliberately left as a red marker until B6
+  lands); (2) **delete the foreign sandbox → the next reconcile creates the
+  Loop's own sandbox and clears the condition.** Do not implement before the
+  condition/event infrastructure from B1 exists.
 
 ## Settled design questions (2026-09-26, all confirmed with user)
 
@@ -114,13 +129,17 @@ model.
    shell that can patch its own Loop status can lie about its own progress,
    which breaks determinism + auditability and contradicts CONTEXT.md's
    "result file is the only output the operator reads." See ADR-0004.
-2. **Tamper hash = operator computes from the base ref (REVISED, ADR-0005).**
-   ~~Runner reports the sha256 of each protected file in `result.json`~~ → the
-   runner **does not report** hashes. The operator computes the baseline
-   **once, from the base ref, at Loop start**, and at `Verifying` the verify
-   Job hashes the protected paths **at the iteration commit**; the operator
-   compares and decides `TamperedVerify` (terminal, before any check runs).
-   The agent has no write path to the evidence. See ADR-0005.
+2. **Tamper check = base-commit glob diff (REVISED, ADR-0005 round-4 D10).**
+   ~~Operator computes baseline hashes from the base ref~~ → the operator pins
+   **`status.baseCommit`** (resolved from `spec.workspace.ref` at Loop start) and
+   protected paths are **globs** (`spec.verify.protectedPaths[]`, per-language
+   default when empty — for Go: `**/*_test.go`, `**/testdata/**`, `go.mod`,
+   `go.sum`, + files the checks reference). At `Verifying`, the verify Job runs
+   `git diff --name-only <baseCommit> <verifiedCommit> -- <globs>`; non-empty ⇒
+   `TamperedVerify` (terminal, before any check runs). This catches **added,
+   modified, deleted, and renamed** protected files (a hash list missed added
+   files — D10), needs no stored hashes, and keeps the operator content-free
+   (it never clones or holds file content). See ADR-0005.
 3. **Verify = isolated Job, operator reads Job status (REVISED, ADR-0005).**
    ~~Runner runs each acceptance check and reports exit codes in
    `result.json`~~ → at `Verifying` the operator creates a short-lived Job
@@ -134,9 +153,13 @@ model.
 
 `LoopSpec` gains:
 - `workspace.gitCredentialSecret` (string, optional) — secret with the git token
-- `verify.acceptanceCheckPaths[]` (optional) — if empty, the runner protects the
-  whole repo root (or a configurable default); these are the protected paths for
-  TamperedVerify. (The plan's `acceptanceChecks[]` commands stay as-is.)
+- `verify.protectedPaths[]` (optional, **globs**; ADR-0005 round-4 D10) — the
+  protected paths for the TamperedVerify glob diff. If empty, a per-language
+  default applies — for Go: `**/*_test.go`, `**/testdata/**`, `go.mod`, `go.sum`,
+  + any files a check command references (`Makefile` if a check calls `make`).
+  Protecting `go.mod`/`go.sum` means the agent can't add dependencies
+  (documented; overridable). (The plan's `acceptanceChecks[]` commands stay
+  as-is.)
 - `loop.phaseTimeout` (metav1.Duration, default 30m) — Phase 1 adds the field;
   the timeout *enforcement* (restart from checkpoint) is Phase 3, so Phase 1
   only records it.
@@ -145,29 +168,30 @@ model.
 
 `LoopStatus` gains (all **operator-written**; ADR-0004 — the runner never writes these, it only reports them in `result.json`):
 - `desiredPhase` / `observedPhase` (Phase) — the operator records the phase it asked for and the phase the runner reported. `desiredPhase` is also copied to `.coxswain/desired-phase` for the runner to read.
+- `baseCommit` (string) — the SHA resolved from `spec.workspace.ref` at Loop start, pinned for the Loop's life (ADR-0005 round-4 D10). **Replaces** the old `verify.baselineHashes`.
 - `plan` `{ summary string (≤4KB), hash string (sha256 of PLAN.md) }`
-- `history []HistoryEntry` — the audit trail: `{ iteration, phase, reason, message, timestamp }`
+- `history []HistoryEntry` — the audit trail: `{ iteration, phase, reason, message, timestamp, verifiedCommit string (the SHA the verify Job checks out, set at `Verifying` start — ADR-0005 D11) }`
 - `iteration` (int) — already present from Phase 0
-- `verify` `{ lastCheckResults []string, baselineHashes []FileHash }` — the
-  recorded hash baseline for TamperedVerify (**operator-computed from the base
-  ref** at Loop start, ADR-0005) and the last verify outcome (from the verify
-  Job) to feed forward
-
-`FileHash` = `{ path string, sha256 string }`.
+- `verify` `{ lastCheckResults []string }` — the last verify outcome (from the verify Job's termination message / pod status) to feed forward. (The old `baselineHashes` is gone — replaced by `baseCommit` + the Job's glob diff.)
 
 **`result.json` (the runner's claims file) carries NO verify-evidence fields**
 (ADR-0005). Its schema for Phase 1 is: `status` (success|blocked|needs_input),
 `summary`, `filesChanged[]`, `verificationNotes` (a *claim*, free text),
 `nextIterationPlan?`, `lessons[]`, and the reported `observedPhase`. The verify
-outcome and protected-path hashes are **not** in `result.json` — they come from
-the verify Job (outcome) and the operator's own base-ref hashing (baseline).
+outcome and the tamper verdict are **not** in `result.json` — they come from
+the verify Job (pod status: reserved codes + termination message).
 
 RBAC: the runner gets **no** Loop RBAC (ADR-0004) — it is credential-free and
 only writes `result.json`. The operator keeps full CRUD on loops + sandboxes
 and, per ADR-0005, gains:
-- `pods/exec` — to `cat` the runner's claims `result.json` out of the sandbox.
+- `pods/exec` — to `cat` the runner's claims `result.json` out of the sandbox
+  (namespace-wide; I9 — revisit in Phase 7).
 - `jobs` create/delete/list/get (in the Loop's namespace) — to create the verify
   Job and read its status (the verify evidence).
+- `pods/get` (in the Loop's namespace) — to read the verify Job's pod status
+  (reserved exit code / termination message; D13).
+- `pods/log` (in the Loop's namespace) — to fetch the raw verify Job log to feed
+  the next implement prompt (D13).
 
 
 ## Out of scope for Phase 1

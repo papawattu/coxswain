@@ -34,7 +34,11 @@ needs a kind cluster, which is the owner's call). Tick those items in
 
 ### D20. Sandbox names must be DNS-1035 labels — agent-sandbox names a Service after them
 
-- [ ] Decided
+- [x] Decided — `6e14e6f`: CEL XValidation on the Loop root (metadata.name must
+  be a DNS-1035 label of <= 55 chars); sandboxName simplified to <name>-sandbox
+  (hash-truncation + UTF-8 back-off removed); envtest proves fix.auth / 1-bug /
+  56-char are rejected and a 55-char name is accepted with Sandbox
+  <name>-sandbox.
 
 **Where:** `internal/controller/loop_controller.go` `sandboxName`;
 `api/v1alpha1/loop_types.go` (Loop CRD validation).
@@ -75,9 +79,8 @@ updated/removed accordingly.
 
 ### I16. D17 mitigation 3 (advisory diff scan) has no plan slice
 
-- [x] Done — `6e14e6f`? no, landed as **B3d** in `TDD-PLAN-PHASE1.md` (the
-  commit that adds it). Advisory only, never a gate; slice order now
-  `… B3c → B3d → B4 …`.
+- [x] Done — `e413ae7`: added **B3d** to `TDD-PLAN-PHASE1.md`. Advisory only,
+  never a gate; slice order now `… B3c → B3d → B4 …`.
 
 ADR-0005 D17 lists three mitigations; `TDD-PLAN-PHASE1.md` has B3a
 (canary) but nothing for the advisory static scan (grep the base→verified
@@ -88,7 +91,9 @@ or mark it explicitly deferred to Phase 6 in both the ADR and the plan.
 
 ### I18. `Workspace.Repo` lost all validation; review notes leaked into the API docs
 
-- [ ] Done
+- [x] Done — `87af144`: MinLength=1 + a pattern accepting https://, ssh://, and
+  scp-style remotes (empty and non-URL rejected at admission, proven by
+  envtest); the field comments no longer leak review-process history.
 
 **Where:** `api/v1alpha1/loop_types.go` (`ef0d6bb`).
 
@@ -106,7 +111,10 @@ or mark it explicitly deferred to Phase 6 in both the ADR and the plan.
 
 ### I19. `loop_defaults_test.go` cleanup uses a cancelled context
 
-- [ ] Done
+- [x] Done — `3a7d369`: AfterEach now deletes the namespace with a live context
+  *before* cancelling (the old order ran the delete on a cancelled context and
+  failed silently); the Eventually is a plain Get + Expect (CRD defaulting is
+  synchronous at create; the Get target needs its GVK set).
 
 `AfterEach` calls `cancel()` and then `k8sClient.Delete(ctx, ns)` with the
 same, now-cancelled `ctx`, so the delete always fails silently. Delete first,

@@ -36,7 +36,15 @@ Bookkeeping: the I16 tick line in `REVIEW-PHASE0-R10.md` currently reads
 
 ### D21. The advisory scan must not write the user's `spec`, and needs a reporting channel
 
-- [ ] Plan amended
+- [x] Plan amended — `d42e5ad`: B3d + ADR-0005 D17 mitigation 3 now record a
+  `VerifySuspicious=True` condition (reason `SubversionPatternInDiff`) + history
+  note instead of writing `spec`; Phase 6 computes
+  `effectiveReady = spec.pr.ready && !VerifySuspicious`; the scan runs as its own
+  trusted init container (after the tamper check) reporting via its termination
+  message, exiting 0 either way (missing/garbled → "scan unavailable", not
+  clean); B3d seam asserts the condition + event + history note with `spec`
+  unchanged (generation stays the same). CONTEXT.md gains a `VerifySuspicious`
+  condition entry.
 
 **Where:** `docs/TDD-PLAN-PHASE1.md` B3d ("forces `spec.pr.ready=false`");
 ADR-0005 D17 mitigation 3 (same wording originated in round 8's review —
@@ -73,7 +81,8 @@ that `spec` is unchanged (`generation` stays the same); plan and ADR agree.
 
 ### I21. One review ID left in the API field docs
 
-- [ ] Done
+- [x] Done — `3911606`: dropped "(I18)" from the `Workspace.Repo` comment;
+  CRD regenerated.
 
 `api/v1alpha1/loop_types.go` `Workspace.Repo` comment ends "rejected at
 admission (I18)". Drop "(I18)" and regenerate the CRD — same reason as I18:

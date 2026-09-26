@@ -5,7 +5,10 @@
 `result.json`, and verify isolation). Amends ADR-0004.
 **Revised:** round 4 (D10) replaced the hash-list tamper check with a pinned
 `baseCommit` + protected globs; D11 pins the verified commit; D12 isolates the
-Job; D13 fixes the Job reporting contract.
+Job; D13 fixes the Job reporting contract. Round 6 (D14) made every gate value a
+kubelet-recorded container exit code, one check per container (the termination
+message was forgeable); D15 resolves refs via go-git; D16 makes the protected
+preset an explicit `spec.verify.preset` enum.
 
 ## Context
 
@@ -77,22 +80,38 @@ Concretely:
 3. **At `Verifying` start** the operator resolves the Loop branch head to a
    SHA and records `status.history[n].verifiedCommit` (D11 — the Job checks out
    *that* SHA, not the branch name, so a force-push after verify can't slip in).
-4. **The operator creates a short-lived Job** (a fresh pod, **no shared process
-   namespace with the sandbox**, the agent never touches it; isolation per D12)
-   that, in order:
-   a. **Tamper check (first, before any check runs):** `git diff --name-only
-      <baseCommit> <verifiedCommit> -- <protectedGlobs>`. Non-empty ⇒ the pod
-      exits with the *tampered* reserved code (init container or first main
-      step; D13).
-   b. **Checks:** run each `acceptanceChecks` command, reporting per-check
-      exit codes (D13's reserved-code / termination-message contract).
-5. **The operator reads the Job pod status** from the API and decides:
-   - tamper code → `TamperedVerify` (terminal), **no check runs**;
-   - all checks exit 0 → `Succeeded` (record the verified SHA);
-   - a check exits non-zero → re-plan/implement (feed the pod log into the next
-     prompt);
-   - the Job itself errored (crash, no report) → `VerifyError` (re-run once,
-     then terminal — CONTEXT.md "Failure reason").
+4. **The operator creates a short-lived verify Job** (a fresh pod, **no shared
+   process namespace with the sandbox**, the agent never touches it; isolation
+   per D12). **Every gate value is a container exit code recorded by the
+   kubelet, one check per container (D14):** the termination message is written
+   from inside the container that runs the agent's code, so the agent's
+   `init()`/`TestMain` could write `{"checks":[0,0]}` and kill the harness. A
+   kubelet-recorded exit code is the only per-container value the code inside
+   can't forge after the fact (it can choose its own exit code, but that's just
+   "this check passed/failed", which is honest for that check). So:
+   - **A clone init container** checks out `verifiedCommit` into an `emptyDir`
+     (read-only for the check containers if the checks don't need to write;
+     fresh copy per check otherwise).
+   - **The tamper check is the next init container** — a trusted image running
+     *only* `git` + `git diff --name-only <baseCommit> <verifiedCommit> --
+     <protectedGlobs>`. It runs **before any agent code is a running process**.
+     Non-zero ⇒ `TamperedVerify`. Nothing the agent wrote executes in this
+     container, and there is no *reserved* exit code to collide with (an agent
+     check can't produce a false `TamperedVerify` by exiting with a reserved
+     code, because the tamper check is its own container).
+   - **Each acceptance check is its own init container** (run sequentially),
+     its exit code *is* the check's result.
+5. **The operator reads `status.initContainerStatuses[i].state.terminated.exitCode`
+   from the API** and decides:
+   - tamper container non-zero → `TamperedVerify` (terminal), **no check
+     container runs**;
+   - all check containers exit 0 → `Succeeded` (record the verified SHA);
+   - check *k* exits non-zero → re-plan/implement (record *k* in history; feed
+     the pod **log** into the next prompt);
+   - the pod itself errored (crash, missing status) → `VerifyError` (re-run
+     once, then terminal — CONTEXT.md "Failure reason").
+   **Pod logs (`pods/log`) are the feed-forward channel for the next prompt —
+   claims-grade input to the model, never a gate.**
 6. **`result.json` is read by the operator only for the claims** (via `pods/exec`
    `cat`; see I9). It is never the input to a gate decision, and it has no
    verify-evidence fields.
@@ -142,22 +161,52 @@ the API server, or credentials mounted into the Job. So the Job gets:
 (e.g. gVisor) if one is configured. (Consider running it as an agent-sandbox
 `Sandbox` rather than a raw `Job` so isolation policy lives in one place.)
 
-### Job reporting contract (D13)
+### Gate evidence = kubelet-recorded exit codes, one check per container (D14, supersedes D13)
 
-One pod does the tamper check + N checks and must report three distinct
-outcomes the operator treats differently: **tampered** (terminal
-`TamperedVerify`), **check failed** (iterate), **infra error** (`VerifyError`,
-re-run once). The contract (choose one; Phase 1 picks the first):
+The D13 draft sent per-check exit codes to `/dev/termination-log`. **That is
+forgeable:** the termination message is written from inside the container that
+runs the agent's code, so the agent's `init()`/`TestMain` can write
+`{"checks":[0,0]}` and kill the harness (or leave a background writer that
+rewrites it). The only per-container value the code inside can't forge after
+the fact is the **kubelet-recorded container exit code** — the agent can choose
+its own exit code, but that's just "this check passed/failed", which is honest
+for that check. So every gate value is an exit code, one check per container
+(Decision §4-5 above):
+- **Tamper check** = a dedicated init container (trusted image, only `git` +
+  the glob diff), before any agent code runs. Non-zero ⇒ `TamperedVerify`.
+- **Each check** = its own init container; its exit code is the result.
+- **No reserved *tampered* exit code** (the tamper check is its own container,
+  so an agent check can't trigger a false `TamperedVerify` by exiting with a
+  reserved code). **No termination message as a gate value.**
+- `pods/log` stays the feed-forward channel for the next prompt (claims-grade,
+  never a gate).
+- **B3 test note:** envtest has no Job controller, so the B3 test sets
+  `initContainerStatuses[].state.terminated.exitCode` per check directly (not a
+  termination message) and asserts: tamper container non-zero → `TamperedVerify`
+  with no check container run; all checks 0 → `Succeeded`; check *k* non-zero →
+  iterate, with *k* recorded in history.
 
-- **Reserved exit codes** in the main container: the tamper check runs first;
-  if it diverges, the pod exits with a reserved *tampered* code (distinct from
-  any check exit code). Per-check exit codes go to a **termination message**
-  (`/dev/termination-log`, ≤4 KB JSON: per-check exit codes) read from pod
-  status.
-- **`pods/log` RBAC** is added so the operator can fetch the raw Job log to feed
-  the next implement prompt (evidence + signal, separate from the gate).
-- **B3 test note:** envtest has no Job controller, so the B3 test sets the Job
-  / pod status directly (it does not run a real Job).
+### Resolving refs to SHAs (D15)
+
+`ls-remote` needs `git` in the operator, but the manager image is distroless
+(no `git` binary), and `ls-remote` against a private repo needs the git
+credential in the **operator** in every Loop namespace. **Choice: (a) go-git's
+`remote.List` in-process** (no binary; the operator reads
+`spec.workspace.gitCredentialSecret`). **RBAC: add `secrets/get` in the Loop's
+namespace.** (Option (b), a tiny "resolve" Job that reports the SHA via its
+termination message, is acceptable *here* — unlike D14 — because no agent code
+runs in that container; but (a) is simpler and we choose it.)
+
+### Protected-path preset (D16)
+
+"Per-language default" globs need a language the content-free operator can't
+detect (it never sees the repo), and "files a check command references" needs
+shell parsing. So the preset is **explicit in the spec**: `spec.verify.preset`
+(enum, default `go` for Phase 1) expands to the language's glob set (the Go set
+for `go`); `spec.verify.protectedPaths[]` **adds** to it; `protectedPathsOverride:
+true` (or `preset: none`) **replaces** it. Drop the "files a check references"
+heuristic; document that a check calling `make` should list `Makefile` in
+`protectedPaths`.
 
 ## Minimum acceptable alternative (recorded as accepted risk)
 

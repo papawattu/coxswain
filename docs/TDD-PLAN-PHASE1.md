@@ -77,21 +77,21 @@ model.
 - **B3** — *Deterministic verify via the Job's pod status (ADR-0005 D11/D13).*
   At `Verifying` start the operator resolves the Loop branch head to a SHA and
   records `history[n].verifiedCommit` (D11). The operator creates a short-lived
-  verify Job (fresh pod, no shared process namespace, isolated per D12) that
-  checks out **that SHA** and: first runs the tamper glob diff (reserved
-  *tampered* exit code on divergence), then runs the acceptance checks, reporting
-  per-check exit codes in a termination message (`/dev/termination-log`). The
-  operator reads the Job pod status from the API (reserved code →
-  `TamperedVerify`; all checks exit 0 → `Succeeded`; a check non-zero → feed the
-  pod **log** into the next prompt via `pods/log`; Job errored → `VerifyError`
-  re-run once). Seam: **envtest has no Job controller**, so the B3 test sets the
-  Job / pod status directly (reserved code / termination message) and asserts
-  the phase — it does not run a real Job. The verify *outcome* is the Job status
-  the operator read (not a `result.json` value, not recomputed by the operator).
-  A minimal verify Job image (checkout a pinned SHA + run the glob diff + run
-  the checks + report reserved codes / termination message) is built in Phase 1
-  and runs isolated (D12): no SA token, read-only clone creds, sandbox
-  NetworkPolicy, resource limits + `activeDeadlineSeconds`, runtime class.
+  verify Job (fresh pod, no shared process namespace, isolated per D12). **Every
+  gate value is a kubelet-recorded container exit code, one check per container
+  (D14 — the termination message was forgeable):** a clone init container checks
+  out the pinned SHA; a tamper-check init container (trusted image, only `git` +
+  the glob diff, before any agent code runs) exits non-zero on divergence;
+  **each acceptance check is its own init container**. The operator reads
+  `status.initContainerStatuses[i].state.terminated.exitCode` (tamper non-zero →
+  `TamperedVerify` with no check container run; all checks 0 → `Succeeded`; check
+  *k* non-zero → iterate with *k* in history; pod errored → `VerifyError`
+  re-run once). Pod **logs** (`pods/log`) are the feed-forward channel for the
+  next prompt (claims-grade, never a gate). Seam: **envtest has no Job
+  controller**, so the B3 test sets `initContainerStatuses[].state.terminated.exitCode`
+  per check directly (not a termination message) and asserts the phase. A minimal
+  verify Job image (clone + one tamper init container + one check init container
+  per check) is built in Phase 1 and runs isolated (D12).
 - **B4** — *Iteration + history.* Each transition increments `status.iteration`
   and appends to `status.history[]` (the audit trail, incl. `verifiedCommit`).
   Seam: assert iteration count and history entries after a multi-iteration run.
@@ -129,17 +129,20 @@ model.
    shell that can patch its own Loop status can lie about its own progress,
    which breaks determinism + auditability and contradicts CONTEXT.md's
    "result file is the only output the operator reads." See ADR-0004.
-2. **Tamper check = base-commit glob diff (REVISED, ADR-0005 round-4 D10).**
-   ~~Operator computes baseline hashes from the base ref~~ → the operator pins
-   **`status.baseCommit`** (resolved from `spec.workspace.ref` at Loop start) and
-   protected paths are **globs** (`spec.verify.protectedPaths[]`, per-language
-   default when empty — for Go: `**/*_test.go`, `**/testdata/**`, `go.mod`,
-   `go.sum`, + files the checks reference). At `Verifying`, the verify Job runs
-   `git diff --name-only <baseCommit> <verifiedCommit> -- <globs>`; non-empty ⇒
-   `TamperedVerify` (terminal, before any check runs). This catches **added,
-   modified, deleted, and renamed** protected files (a hash list missed added
-   files — D10), needs no stored hashes, and keeps the operator content-free
-   (it never clones or holds file content). See ADR-0005.
+2. **Tamper check = base-commit glob diff (REVISED, ADR-0005 round-4 D10; round-6
+   D14/D16).** ~~Operator computes baseline hashes from the base ref~~ → the
+   operator pins **`status.baseCommit`** (resolved from `spec.workspace.ref` at
+   Loop start via go-git — D15) and protected paths come from **
+   `spec.verify.preset`** (enum, default `go`) + `protectedPaths[]` (+
+   `protectedPathsOverride`). At `Verifying`, the verify Job's **tamper-check
+   init container** (trusted image, only `git` + the glob diff, before any agent
+   code runs) does `git diff --name-only <baseCommit> <verifiedCommit> --
+   <globs>`; non-zero exit ⇒ `TamperedVerify` (terminal, before any check
+   container runs). This catches **added, modified, deleted, and renamed**
+   protected files (a hash list missed added files — D10), needs no stored
+   hashes, and keeps the operator content-free (it never clones or holds file
+   content). The check *results* are the exit codes of per-check init containers
+   (D14 — the termination message was forgeable). See ADR-0005.
 3. **Verify = isolated Job, operator reads Job status (REVISED, ADR-0005).**
    ~~Runner runs each acceptance check and reports exit codes in
    `result.json`~~ → at `Verifying` the operator creates a short-lived Job
@@ -153,13 +156,7 @@ model.
 
 `LoopSpec` gains:
 - `workspace.gitCredentialSecret` (string, optional) — secret with the git token
-- `verify.protectedPaths[]` (optional, **globs**; ADR-0005 round-4 D10) — the
-  protected paths for the TamperedVerify glob diff. If empty, a per-language
-  default applies — for Go: `**/*_test.go`, `**/testdata/**`, `go.mod`, `go.sum`,
-  + any files a check command references (`Makefile` if a check calls `make`).
-  Protecting `go.mod`/`go.sum` means the agent can't add dependencies
-  (documented; overridable). (The plan's `acceptanceChecks[]` commands stay
-  as-is.)
+- `verify.protectedPaths[]` (optional, **globs**) + `verify.preset` (enum, default `go`; ADR-0005 round-6 D16) + `verify.protectedPathsOverride` (bool, default false) — the protected paths for the TamperedVerify glob diff. The content-free operator can't detect the repo's language, so the preset is **explicit**: `preset: go` expands to the Go glob set (`**/*_test.go`, `**/testdata/**`, `go.mod`, `go.sum`); `protectedPaths[]` **adds** to it; `protectedPathsOverride: true` (or `preset: none`) **replaces** it. Drop the "files a check references" heuristic; document that a check calling `make` should list `Makefile` in `protectedPaths`. Protecting `go.mod`/`go.sum` means the agent can't add dependencies (documented). (The plan's `acceptanceChecks[]` commands stay as-is.)
 - `loop.phaseTimeout` (metav1.Duration, default 30m) — Phase 1 adds the field;
   the timeout *enforcement* (restart from checkpoint) is Phase 3, so Phase 1
   only records it.
@@ -172,14 +169,14 @@ model.
 - `plan` `{ summary string (≤4KB), hash string (sha256 of PLAN.md) }`
 - `history []HistoryEntry` — the audit trail: `{ iteration, phase, reason, message, timestamp, verifiedCommit string (the SHA the verify Job checks out, set at `Verifying` start — ADR-0005 D11) }`
 - `iteration` (int) — already present from Phase 0
-- `verify` `{ lastCheckResults []string }` — the last verify outcome (from the verify Job's termination message / pod status) to feed forward. (The old `baselineHashes` is gone — replaced by `baseCommit` + the Job's glob diff.)
+- `verify` `{ lastCheckResults []string }` — the last verify outcome (from the verify Job's `initContainerStatuses` exit codes, one check per container — ADR-0005 D14) to feed forward. (The old `baselineHashes` is gone — replaced by `baseCommit` + the Job's glob diff.)
 
 **`result.json` (the runner's claims file) carries NO verify-evidence fields**
 (ADR-0005). Its schema for Phase 1 is: `status` (success|blocked|needs_input),
 `summary`, `filesChanged[]`, `verificationNotes` (a *claim*, free text),
 `nextIterationPlan?`, `lessons[]`, and the reported `observedPhase`. The verify
 outcome and the tamper verdict are **not** in `result.json` — they come from
-the verify Job (pod status: reserved codes + termination message).
+the verify Job (pod `initContainerStatuses` exit codes, one check per container — D14).
 
 RBAC: the runner gets **no** Loop RBAC (ADR-0004) — it is credential-free and
 only writes `result.json`. The operator keeps full CRUD on loops + sandboxes
@@ -189,9 +186,12 @@ and, per ADR-0005, gains:
 - `jobs` create/delete/list/get (in the Loop's namespace) — to create the verify
   Job and read its status (the verify evidence).
 - `pods/get` (in the Loop's namespace) — to read the verify Job's pod status
-  (reserved exit code / termination message; D13).
+  (`initContainerStatuses[].state.terminated.exitCode`, one check per container;
+  D14).
 - `pods/log` (in the Loop's namespace) — to fetch the raw verify Job log to feed
-  the next implement prompt (D13).
+  the next implement prompt (claims-grade, never a gate; D14).
+- `secrets/get` (in the Loop's namespace) — to read
+  `spec.workspace.gitCredentialSecret` for go-git ref resolution (D15).
 
 
 ## Out of scope for Phase 1

@@ -90,14 +90,16 @@ spec:
                       holding git credentials for pushing the Loop's branch.
                     type: string
                   ref:
-                    default: ""
                     description: |-
                       ref is the branch, tag, or commit to check out. Defaults to the repo's
-                      default branch when empty.
+                      default branch when empty. (The +kubebuilder:default="" marker was a
+                      no-op and removed — P3.)
                     type: string
                   repo:
-                    description: repo is the git URL to clone, e.g. https://github.com/papawattu/pixme.git
-                    format: uri
+                    description: |-
+                      repo is the git URL to clone. HTTPS (`https://github.com/...`) and SSH
+                      (`git@github.com:...`) are both accepted — go-git handles both; the
+                      Format=uri constraint was dropped (P3) because it rejected SSH remotes.
                     type: string
                 required:
                 - repo

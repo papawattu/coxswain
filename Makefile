@@ -62,6 +62,23 @@ vet: ## Run go vet against code.
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	$(MAKE) runner-test
+
+# I3: the runner is a separate Go module (runner/go.mod); the root `go list ./...`
+# skips it. Test it explicitly so `make test` covers both modules.
+.PHONY: runner-test
+runner-test: ## Run the runner module's tests (separate go.mod).
+	cd runner && go test ./... -coverprofile cover-runner.out
+
+.PHONY: lint
+lint: golangci-lint ## Run golangci-lint linter
+	"$(GOLANGCI_LINT)" run
+	cd runner && ../bin/golangci-lint run
+
+.PHONY: lint-fix
+lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
+	"$(GOLANGCI_LINT)" run --fix
+	cd runner && ../bin/golangci-lint run --fix
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -69,7 +86,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # - KUBECTL_KUBERC=true
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= coxscaf-test-e2e
+KIND_CLUSTER ?= coxswain-test-e2e
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -93,14 +110,6 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
-
-.PHONY: lint
-lint: golangci-lint ## Run golangci-lint linter
-	"$(GOLANGCI_LINT)" run
-
-.PHONY: lint-fix
-lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
-	"$(GOLANGCI_LINT)" run --fix
 
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration

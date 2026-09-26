@@ -21,7 +21,7 @@ func TestRunnerWritesSuccessResult(t *testing.T) {
 		Prompt:    "make the failing test pass",
 		Workspace: workdir,
 		BaseURL:   fake.URL,
-		Model:     "fake-model",
+		Model:     fakeModelName,
 	})
 
 	if res.Status != "success" {

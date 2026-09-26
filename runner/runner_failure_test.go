@@ -17,7 +17,7 @@ func TestRunnerWritesBlockedResultOnModelFailure(t *testing.T) {
 		Prompt:    "do something",
 		Workspace: workdir,
 		BaseURL:   "http://127.0.0.1:1", // port 1 is effectively unreachable
-		Model:     "fake-model",
+		Model:     fakeModelName,
 	})
 
 	resultPath := filepath.Join(workdir, ".coxswain", "result.json")

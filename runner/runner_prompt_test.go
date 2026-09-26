@@ -18,14 +18,14 @@ func TestRunnerSendsPromptAsUserMessage(t *testing.T) {
 		Prompt:    prompt,
 		Workspace: t.TempDir(),
 		BaseURL:   fake.URL,
-		Model:     "fake-model",
+		Model:     fakeModelName,
 	})
 
 	if len(fake.Requests) == 0 {
 		t.Fatal("model was never called")
 	}
 	req := fake.Requests[0]
-	if req.Model != "fake-model" {
+	if req.Model != fakeModelName {
 		t.Errorf("model = %q, want fake-model", req.Model)
 	}
 

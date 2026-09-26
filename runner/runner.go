@@ -17,6 +17,45 @@ import (
 	"time"
 )
 
+// String constants (goconst). The runner advertises and reports these to the
+// model and in result.json; the tests reference the same literals, so keeping
+// them as consts avoids a 4-6 occurrence lint failure across the module.
+const (
+	systemPrompt   = "You are a coding agent inside a Kubernetes sandbox. Be concise."
+	fakeModelName  = "fake-model"
+	resultDirName  = ".coxswain"
+	resultFileName = "result.json"
+
+	// result.json status values (Phase 0 subset).
+	statusSuccess = "success"
+	statusBlocked = "blocked"
+
+	// OpenAI-compatible chat field-name keys (map keys, repeated in the
+	// request/response builders).
+	jsonKeyRole      = "role"
+	jsonKeyType      = "type"
+	jsonKeyContent   = "content"
+	jsonKeyModel     = "model"
+	jsonKeyMessages  = "messages"
+	jsonKeyTools     = "tools"
+	jsonKeyFunction  = "function"
+	jsonKeyName      = "name"
+	jsonKeyID        = "id"
+	jsonKeyObject    = "object"
+	jsonKeyString    = "string"
+	jsonKeyCommand   = "command"
+	jsonKeyArguments = "arguments"
+
+	// role values.
+	jsonRoleSystem    = "system"
+	jsonRoleUser      = "user"
+	jsonRoleAssistant = "assistant"
+	jsonRoleTool      = "tool"
+
+	// tool type value.
+	jsonToolFunction = "function"
+)
+
 // runConfig is the input to run. BaseURL points at an OpenAI-compatible
 // /chat/completions endpoint; the test points it at a fake.
 type runConfig struct {
@@ -46,8 +85,8 @@ type assistantMessage struct {
 }
 
 type toolCall struct {
-	ID        string `json:"id"`
-	Function  fnCall `json:"function"`
+	ID       string `json:"id"`
+	Function fnCall `json:"function"`
 }
 
 type fnCall struct {
@@ -60,24 +99,26 @@ func run(cfg runConfig) Result {
 	client := &http.Client{Timeout: 60 * time.Second}
 
 	messages := []map[string]any{
-		{"role": "system", "content": "You are a coding agent inside a Kubernetes sandbox. Be concise."},
-		{"role": "user", "content": cfg.Prompt},
+		{jsonKeyRole: jsonRoleSystem, jsonKeyContent: systemPrompt},
+		{jsonKeyRole: jsonRoleUser, jsonKeyContent: cfg.Prompt},
 	}
 
-	answer, trace, modelErr := driveModel(context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages)
+	answer, trace, modelErr := driveModel(
+		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace, messages,
+	)
 
 	res := Result{
-		Status:    "success",
+		Status:    statusSuccess,
 		Summary:   answer,
 		ToolTrace: trace,
 	}
 	if modelErr != "" {
-		res.Status = "blocked"
+		res.Status = statusBlocked
 		res.VerificationNotes = modelErr
 	}
 	// R5's path is created here; R1 only needs it to exist.
-	if err := writeResult(filepath.Join(cfg.Workspace, ".coxswain", "result.json"), res); err != nil {
-		res.Status = "blocked"
+	if err := writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res); err != nil {
+		res.Status = statusBlocked
 		res.VerificationNotes = fmt.Sprintf("write result: %v", err)
 	}
 	return res
@@ -86,11 +127,13 @@ func run(cfg runConfig) Result {
 // callModel posts one chat-completions request and returns the assistant
 // message (with any tool calls). The request always advertises the runner's
 // tools (I1) so a real model can emit a shell tool call.
-func callModel(ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []map[string]any) (assistantMessage, error) {
+func callModel(
+	ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []map[string]any,
+) (assistantMessage, error) {
 	reqBody, err := json.Marshal(map[string]any{
-		"model":    model,
-		"messages": messages,
-		"tools":    shellToolSchema(),
+		jsonKeyModel:    model,
+		jsonKeyMessages: messages,
+		jsonKeyTools:    shellToolSchema(),
 	})
 	if err != nil {
 		return assistantMessage{}, err
@@ -109,7 +152,11 @@ func callModel(ctx context.Context, client *http.Client, baseURL, apiKey, model 
 	if err != nil {
 		return assistantMessage{}, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			_ = cerr
+		}
+	}()
 
 	raw, _ := io.ReadAll(resp.Body)
 	var parsed struct {
@@ -132,16 +179,16 @@ func callModel(ctx context.Context, client *http.Client, baseURL, apiKey, model 
 func shellToolSchema() []map[string]any {
 	return []map[string]any{
 		{
-			"type": "function",
-			"function": map[string]any{
-				"name":        "shell",
+			jsonKeyType: jsonToolFunction,
+			jsonKeyFunction: map[string]any{
+				jsonKeyName:   "shell",
 				"description": "Run a shell command in the workspace and return its combined output.",
 				"parameters": map[string]any{
-					"type": "object",
+					jsonKeyType: jsonKeyObject,
 					"properties": map[string]any{
-						"command": map[string]any{"type": "string", "description": "The shell command to run."},
+						jsonKeyCommand: map[string]any{jsonKeyType: jsonKeyString, "description": "The shell command to run."},
 					},
-					"required": []string{"command"},
+					"required": []string{jsonKeyCommand},
 				},
 			},
 		},
@@ -151,16 +198,16 @@ func shellToolSchema() []map[string]any {
 // assistantMessageFor serializes an assistant turn (with tool calls) back into
 // the message list for the next request.
 func assistantMessageFor(m assistantMessage) map[string]any {
-	out := map[string]any{"role": "assistant", "content": m.Content}
+	out := map[string]any{jsonKeyRole: jsonRoleAssistant, jsonKeyContent: m.Content}
 	if len(m.ToolCalls) > 0 {
 		tcs := make([]map[string]any, 0, len(m.ToolCalls))
 		for _, tc := range m.ToolCalls {
 			tcs = append(tcs, map[string]any{
-				"id":   tc.ID,
-				"type": "function",
-				"function": map[string]any{
-					"name":      "shell",
-					"arguments": tc.Function.Arguments,
+				jsonKeyID:   tc.ID,
+				jsonKeyType: jsonToolFunction,
+				jsonKeyFunction: map[string]any{
+					jsonKeyName:      "shell",
+					jsonKeyArguments: tc.Function.Arguments,
 				},
 			})
 		}
@@ -196,11 +243,13 @@ func itoa(n int) string { return strconv.Itoa(n) }
 // trace. It loops on tool calls: when the model returns shell tool calls, each
 // is executed in the workspace and the combined output is fed back as a tool
 // message, until the model returns a plain answer (or maxSteps is reached).
-func driveModel(ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string, messages []map[string]any) (string, []string, string) {
+func driveModel(
+	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string, messages []map[string]any,
+) (string, []string, string) {
 	trace := []string{}
 	const maxSteps = 5
 
-	for step := 0; step < maxSteps; step++ {
+	for step := range maxSteps {
 		msg, err := callModel(ctx, client, baseURL, apiKey, model, messages)
 		if err != nil {
 			return "", append(trace, "call model: "+err.Error()), err.Error()
@@ -221,7 +270,9 @@ func driveModel(ctx context.Context, client *http.Client, baseURL, apiKey, model
 			}
 			trace = append(trace, "step "+itoa(step)+": "+out)
 			messages = append(messages, map[string]any{
-				"role": "tool", "tool_call_id": tc.ID, "content": out,
+				jsonKeyRole:    jsonRoleTool,
+				"tool_call_id": tc.ID,
+				jsonKeyContent: out,
 			})
 		}
 	}

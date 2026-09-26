@@ -45,8 +45,8 @@ func TestRunnerAdvertisesShellToolToModel(t *testing.T) {
 				Name        string `json:"name"`
 				Description string `json:"description"`
 				Parameters  struct {
-					Type                 string `json:"type"`
-					Properties           map[string]struct {
+					Type       string `json:"type"`
+					Properties map[string]struct {
 						Type string `json:"type"`
 					} `json:"properties"`
 					Required []string `json:"required"`
@@ -56,7 +56,7 @@ func TestRunnerAdvertisesShellToolToModel(t *testing.T) {
 		if err := json.Unmarshal(raw, &tool); err != nil {
 			t.Fatalf("tool entry is not valid JSON: %v (%s)", err, string(raw))
 		}
-		if tool.Type != "function" {
+		if tool.Type != jsonToolFunction {
 			t.Fatalf("tool %s has type %q, want \"function\"", tool.Function.Name, tool.Type)
 		}
 		if tool.Function.Name != "shell" {

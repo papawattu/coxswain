@@ -8,7 +8,9 @@
 Job; D13 fixes the Job reporting contract. Round 6 (D14) made every gate value a
 kubelet-recorded container exit code, one check per container (the termination
 message was forgeable); D15 resolves refs via go-git; D16 makes the protected
-preset an explicit `spec.verify.preset` enum.
+preset an explicit `spec.verify.preset` enum. Round 8 (D17) names the residual
+in-process test-subversion risk + layered mitigations; D18 pins restart/pod
+semantics; D19 makes the checkout read-only into every check container.
 
 ## Context
 
@@ -90,8 +92,12 @@ Concretely:
    can't forge after the fact (it can choose its own exit code, but that's just
    "this check passed/failed", which is honest for that check). So:
    - **A clone init container** checks out `verifiedCommit` into an `emptyDir`
-     (read-only for the check containers if the checks don't need to write;
-     fresh copy per check otherwise).
+     mounted **read-only into every check container (D19, unconditional — the
+     "otherwise writable" branch let agent code in check 1 rewrite `*_test.go`
+     after the tamper check, so check 2 could compile doctored tests)**. Each
+     check container gets its **own writable scratch** (`emptyDir` for `HOME`,
+     `GOCACHE`, `GOPATH`, `TMPDIR`). If a check genuinely needs a writable tree,
+     it gets a **fresh copy** made by a trusted init step, never the shared one.
    - **The tamper check is the next init container** — a trusted image running
      *only* `git` + `git diff --name-only <baseCommit> <verifiedCommit> --
      <protectedGlobs>`. It runs **before any agent code is a running process**.
@@ -186,6 +192,59 @@ for that check. So every gate value is an exit code, one check per container
   with no check container run; all checks 0 → `Succeeded`; check *k* non-zero →
   iterate, with *k* recorded in history.
 
+### Restart / pod-selection semantics (D18)
+
+Pin these or the operator reads the wrong pod and breaks "check *k* failed ⇒
+iterate":
+- pod **`restartPolicy: Never`** (a failing init container is **not** restarted
+  in place — with `OnFailure` a flaky/time-dependent check could re-run and pass);
+- Job **`backoffLimit: 0`** (no new pods after a failure, so "read
+  `initContainerStatuses`" is unambiguous);
+- `activeDeadlineSeconds` set (D12).
+- The operator reads the **single pod** selected by the Job's `controller-uid`
+  label; **zero or >1 pods ⇒ `VerifyError`**.
+- `VerifyError`'s "re-run once" creates a **new Job**, never relies on Job
+  retries.
+- B3 test: a second pod appearing is a `VerifyError`, not a pass.
+
+### Residual risk: in-process test subversion (D17)
+
+The tamper check guarantees the test *definitions* are unchanged. It **cannot**
+guarantee the *code under test* doesn't subvert the test process, because that
+code runs inside it. Verified with a probe — a non-test, unprotected file:
+
+```go
+// add.go (Add is deliberately broken)
+func init() { if testing.Testing() { os.Exit(0) } }
+```
+
+`go test ./...` prints `ok` and exits 0; `TestAdd` never runs. No protected file
+changed, so the glob diff is empty and the check container exits 0 →
+`Succeeded`. Variants: `//go:linkname` into `testing`, a fake `--- PASS`
+stream, monkeypatching the runner in interpreted languages. Any output-based
+detection is forgeable by the same process. So:
+
+- **Acceptance checks are the only *automated* gate. A human reviewing the draft
+  PR (Phase 6, draft by default) is the final gate.**
+- **Layered cheap mitigations** (none complete alone):
+  1. **Negative control (canary).** In the trusted tamper container, generate a
+     canary test per tested package (random name, `t.Fatal` with a random
+     token) into a *separate copy* of the checkout and run one extra check
+     container on it that **must fail** and whose failure must be reported by
+     `go test` (non-zero exit). A binary that exits 0 regardless of tests makes
+     the canary pass → `TamperedVerify` (or a new `SubvertedVerify` reason).
+     Cheap, and the always-exit-0 trick is the obvious one a model stumbles into.
+  2. **Static flag on the diff (advisory, not a gate).** The trusted tamper
+     container greps the base→verified diff of *non-protected* files for
+     `testing.Testing()`, `os.Exit` inside `init`, `//go:linkname`,
+     `flag.Lookup("test.` and records hits as a `Warning` event + history note,
+     and forces `spec.pr.ready=false`. With `approval: Manual` (Phase 4), a hit
+     could pause for approval.
+  3. **Optional (Phase 6):** the Judge sidecar gets the diff and is asked
+     specifically whether the change games the tests.
+- **Acceptance:** B3 gains a slice for the canary (the probe above as a fixture
+  must end non-`Succeeded`); CONTEXT.md wording updated.
+
 ### Resolving refs to SHAs (D15)
 
 `ls-remote` needs `git` in the operator, but the manager image is distroless
@@ -239,26 +298,34 @@ impractical, and it is recorded here so the residual risk is explicit.
 
 ## Consequences
 
-- The operator gains `jobs` create/delete/list/get, `pods/get` (Job pod
-  status), `pods/log` (D13), and `pods/exec` (read claims) RBAC in the Loop's
-  namespace. `pods/exec` is namespace-wide (I9); revisit in Phase 7.
-- A verify Job image is needed (a small image that checks out a pinned SHA,
-  runs the glob diff + the checks, and reports via reserved exit codes + a
-  termination message). Phase 1 builds a minimal one. It runs isolated (D12):
-  no SA token, read-only clone creds, sandbox NetworkPolicy, limits, runtime
-  class.
+- The operator gains `jobs` create/delete/list/get, `pods/get` (Job pod status,
+  `initContainerStatuses` exit codes — D14), `pods/log` (feed-forward, D14),
+  `pods/exec` (read claims), and `secrets/get` (go-git ref resolution, D15) RBAC
+  in the Loop's namespace. `pods/exec` is namespace-wide (I9); revisit in Phase 7.
+- A verify Job image is needed (a small image with a clone init container,
+  a tamper-check init container, and one check init container per check — D14).
+  Phase 1 builds a minimal one. It runs isolated (D12): no SA token, read-only
+  clone creds, sandbox NetworkPolicy, limits, runtime class; restart semantics
+  pinned (D18: `restartPolicy: Never`, `backoffLimit: 0`, single pod by
+  `controller-uid`). The checkout is mounted read-only into every check
+  container (D19).
 - `loop.Status` changes: `verify.baselineHashes` is **removed** and replaced by
   `baseCommit` (string, set at Loop start). `history[]` entries gain
-  `verifiedCommit` (string, set at `Verifying` start). The runner writes none of
-  these.
+  `verifiedCommit` (string, set at `Verifying` start) and record which checks
+  were **not run** (I14: sequential init containers stop at the first failing
+  check — the model fixes one check per iteration; record the not-run set so the
+  next prompt can target them; revisit with one pod per check if iteration
+  counts suffer). The runner writes none of these.
 - `spec.verify.acceptanceCheckPaths[]` is **replaced** by
-  `spec.verify.protectedPaths[]` (globs; per-language default when empty).
+  `spec.verify.protectedPaths[]` + `spec.verify.preset` (enum, default `go`)
+  + `spec.verify.protectedPathsOverride` (D16).
 - The Phase 1 B-slices change: **B2** (TamperedVerify) becomes "Job/Operator
   compares the base-commit glob diff to the verified commit" (the anti-gaming
   test set is a: edit an existing `*_test.go`; **b: add a new `*_test.go` with
   `TestMain` → `os.Exit(0)`; c: add a `replace` to `go.mod`; each ends
   `Failed:TamperedVerify` with no check run, even when the fake `result.json`
-  claims otherwise); **B3** (deterministic verify) becomes "operator reads Job
-  pod status (reserved codes + termination message)". **A4** (runner runs
-  checks + reports exit codes) is **dropped** — the runner does not run or
-  report checks.
+  claims otherwise); **B3** (deterministic verify) becomes "operator reads the
+  Job's `initContainerStatuses` exit codes, one check per container" (D14), with
+  a canary slice for in-process subversion (D17) and a restart-semantics case
+  (D18: a second pod ⇒ `VerifyError`). **A4** (runner runs checks + reports exit
+  codes) is **dropped** — the runner does not run or report checks.

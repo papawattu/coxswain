@@ -85,7 +85,7 @@ One plan→implement→verify cycle. Each iteration produces a commit on the Loo
 _Avoid_: round, step, pass
 
 **Acceptance checks**:
-User-authored verify commands in the Loop spec. The only gate that can flip a Loop to Succeeded. Their source files are protected paths. Per ADR-0005 (round 4, D10), the operator pins `status.baseCommit` (resolved from the workspace ref at Loop start) and protected paths are globs; the verify Job runs `git diff --name-only <baseCommit> <verifiedCommit> -- <globs>` before any check runs — the agent never reports the hashes, and the diff catches added/modified/deleted/renamed protected files.
+User-authored verify commands in the Loop spec. The only *automated* gate that can flip a Loop to Succeeded; a human reviewing the draft PR (Phase 6, draft by default) is the final gate (ADR-0005 round 8, D17 — the code under test can subvert the test process in-process, which no automated check fully rules out). Their source files are protected paths. Per ADR-0005 (round 4, D10), the operator pins `status.baseCommit` (resolved from the workspace ref at Loop start) and protected paths come from `spec.verify.preset` + globs; the verify Job runs `git diff --name-only <baseCommit> <verifiedCommit> -- <globs>` in a trusted tamper-check init container before any check runs — the agent never reports the hashes, and the diff catches added/modified/deleted/renamed protected files.
 _Avoid_: tests, verify, gates
 
 **Agent checks**:

@@ -1,0 +1,50 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - agents.x-k8s.io
+  resources:
+  - sandboxes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - agents.x-k8s.io
+  resources:
+  - sandboxes/status
+  verbs:
+  - get
+- apiGroups:
+  - cox.cox.dev
+  resources:
+  - loops
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cox.cox.dev
+  resources:
+  - loops/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - cox.cox.dev
+  resources:
+  - loops/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -49,11 +49,9 @@ var _ = Describe("Loop suspend handling", func() {
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
-				Goal:    "anything",
-				Suspend: true,
-				Workspace: coxv1alpha1.Workspace{
-					Repo: "https://example.com/repo.git",
-				},
+				Goal:      "anything",
+				Suspend:   true,
+				Workspace: testWorkspace(),
 			},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())

@@ -44,10 +44,8 @@ var _ = Describe("Loop observedGeneration tracking", func() {
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
-				Goal: "v1",
-				Workspace: coxv1alpha1.Workspace{
-					Repo: "https://example.com/repo.git",
-				},
+				Goal:      "v1",
+				Workspace: testWorkspace(),
 			},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())

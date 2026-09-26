@@ -35,7 +35,14 @@ B2/B3 can be built as designed while it's decided.
 
 ### D17. Code under test can subvert the test runner in-process; the tamper check can't see it
 
-- [ ] Decided (ADR-0005 "Residual risk" + mitigations)
+- [x] Decided (ADR-0005 "Residual risk" + mitigations) — commit `b58a548`
+
+  - ADR-0005 has a "Residual risk: in-process test subversion (D17)" section:
+    acceptance checks are the only *automated* gate; the human draft-PR review
+    (Phase 6) is the final gate; layered cheap mitigations (negative canary
+    control, static flag on the diff of non-protected files, optional Judge).
+  - B3 gains a canary slice (the probe as a fixture must end non-`Succeeded`);
+    CONTEXT.md "Acceptance checks" softened to "only automated gate".
 
 **Where:** ADR-0005 (Decision, Why); CONTEXT.md "Acceptance checks" ("the
 only gate that can flip a Loop to Succeeded").
@@ -87,7 +94,12 @@ fixture must end non-`Succeeded`); CONTEXT.md wording updated.
 
 ### D18. Job / pod restart semantics must be pinned or the operator reads the wrong pod
 
-- [ ] Decided
+- [x] Decided — ADR-0005 (D18) + B3 — commit `b58a548`
+
+  - Pod `restartPolicy: Never`, Job `backoffLimit: 0`, `activeDeadlineSeconds`
+    set; operator reads the single pod by the Job's `controller-uid` label
+    (zero or >1 pods ⇒ `VerifyError`); "re-run once" creates a new Job. B3 test:
+    a second pod is a `VerifyError`, not a pass.
 
 **Where:** ADR-0005 Decision §4–5; B3.
 
@@ -106,7 +118,12 @@ relies on Job retries. Add both to B3's test (a second pod appearing is a
 
 ### D19. Check containers must not share a writable checkout
 
-- [ ] Decided
+- [x] Decided — ADR-0005 (D19) — commit `b58a548`
+
+  - Unconditional: the checkout is mounted **read-only** into every check
+    container; each check gets its own writable scratch (`emptyDir` for
+    `HOME`/`GOCACHE`/`GOPATH`/`TMPDIR`); a check needing a writable tree gets a
+    fresh copy from a trusted init step, never the shared one.
 
 **Where:** ADR-0005 Decision §4 ("read-only … if the checks don't need to
 write; fresh copy per check otherwise").
@@ -127,7 +144,11 @@ one.
 
 ### I14. Init containers stop at the first failing check
 
-- [ ] Noted in ADR-0005
+- [x] Noted in ADR-0005 — commit `b58a548`
+
+  - ADR-0005 Consequences: sequential init containers stop at the first failing
+    check (one fix per iteration); `history[]` records which checks were not
+    run; revisit with one pod per check if iteration counts suffer.
 
 Sequential init containers stop at the first non-zero exit, so a later
 failing check is never run and never fed forward; the model fixes one check

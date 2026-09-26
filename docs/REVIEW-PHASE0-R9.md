@@ -32,7 +32,16 @@ draft PR is the final gate" wording is right.
 
 ### I15. `TDD-PLAN-PHASE1.md` doesn't have the D17–D19 slices the ADR promises
 
-- [ ] Done
+- [x] Done — commit `6f67407` (+ `SubvertedVerify` added to CONTEXT.md "Failure reason")
+
+  - Added B3a (canary/negative control, D17 → `Failed:SubvertedVerify`, round-8
+    probe as e2e fixture), B3b (restart semantics, D18 → `restartPolicy: Never`,
+    `backoffLimit: 0`, single pod by `controller-uid` else `VerifyError`, re-run =
+    new Job with attempt suffix), B3c (read-only checkout, D19 → every check
+    container `readOnly: true` + own scratch `emptyDir`), and B4's `NotRun`
+    history (I14). Slice order updated to B1-B2-B3-B3a-B3b-B3c-B4-B5-B6.
+  - `grep -ic 'canary|backoffLimit|restartPolicy|read-only|readOnly|SubvertedVerify'` on
+    the plan returns 16 (was 0).
 
 **Where:** `docs/TDD-PLAN-PHASE1.md` (B3 and the slice order);
 ADR-0005 says "B3 gains a slice for the canary" and lists restart-semantics

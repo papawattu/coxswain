@@ -1,5 +1,23 @@
 # coxscaf - AI Agent Guide
 
+## Review protocol
+
+A separate reviewer agent reviews commits and hands back work as docs only.
+
+- **Review docs:** `docs/REVIEW-PHASE<N>.md` (round 1) and
+  `docs/REVIEW-PHASE<N>-R<k>.md` (round k). All rounds share one format:
+  P1/P2/P3 issues, each with a checkbox, **Where / Problem / Fix /
+  Acceptance**. Issue IDs (`I<n>`, `D<n>`) are unique across rounds.
+- **Each review is one commit** with subject `review(phase<N>-r<k>): …`,
+  touching `docs/` only, tagged `review/phase<N>-r<k>` (lightweight tag).
+- **Builder: watch for new reviews** with `git tag -l 'review/*'` (or
+  `git log --grep '^review('`). Before each work session, read any review
+  tagged since your last one. P1 items block the next phase.
+- **Closing an issue:** tick its box in the review doc and add the fixing
+  commit hash. Reference the issue ID in the fix commit subject
+  (e.g. `I6: …`). Don't edit other parts of a review doc; reply to a
+  verdict by adding a `Builder response:` line under the issue.
+
 ## Project Structure
 
 **Single-group layout (default):**

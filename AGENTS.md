@@ -24,6 +24,10 @@ pull requests; design is reviewed in review docs.**
   **unresolved** until fixed; **required conversation resolution** makes them
   block the merge. The builder addresses each comment with a follow-up commit on
   the branch (don't force-push over reviewed commits) and replies on the thread.
+- **The builder never resolves a review thread.** It pushes the fix and
+  replies with what changed and how it was verified; the **reviewer**
+  re-checks and resolves the thread (or replies with what's still wrong). A
+  later review with `Verdict: OK` supersedes an earlier `Verdict: CHANGES`.
 - **The owner merges** when the verdict is OK and no threads are open. Neither
   the builder nor the reviewer merges to `main`. Squash-merge with the PR title
   as the subject (`C2: …`, `I34: …`).

@@ -46,7 +46,8 @@ type AgentPolicySpec struct {
 	// common case at admission); the controller is the second (catches everything).
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
-	// +kubebuilder:validation:XValidation:rule="self.all(e, e.startsWith('/') && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')",message="exec entries must be absolute paths at or outside the writable mounts (not under /workspace, /scratch, /tmp)"
+	// +kubebuilder:validation:items:MaxLength=512
+	// +kubebuilder:validation:XValidation:rule="self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')",message="exec entries must be canonical absolute paths (no ., .., //, trailing /) at or outside the writable mounts"
 	Exec []string `json:"exec,omitempty"`
 
 	// network is the host:port endpoints the agent may reach (e.g.

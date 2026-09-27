@@ -97,6 +97,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// C6a (R15 round 2): check for non-canonical exec paths BEFORE creating
+	// the sandbox (defence in depth: the CRD CEL catches the common case at
+	// admission; this catches anything that slips through). If a bad path is
+	// found, set the PolicyValid=False condition and skip ensureSandbox.
+	if polName, badPath := r.findNonCanonicalExecPath(ctx, &loop); polName != "" {
+		setCondition(&loop, "PolicyValid", metav1.ConditionFalse, "NonCanonicalExecPath",
+			fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", polName, badPath))
+		if err := r.Status().Update(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -156,7 +169,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, TamperedVerifyReason,
+			setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
 				"a protected path changed between baseCommit and verifiedCommit; terminal")
 			changed = true
 		}
@@ -207,11 +220,9 @@ func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alp
 		// effective policy or the eBPF engine. A path with '..' or '//' or a
 		// trailing '/' is non-canonical and could resolve to a writable mount
 		// after normalization.
-		for _, e := range ap.Spec.Exec {
-			if isNonCanonicalPath(e) {
-				return "", false, fmt.Errorf("AgentPolicy %s/%s: exec entry %q is non-canonical (no '..' or '//' or trailing '/')", loop.Namespace, name, e)
-			}
-		}
+		// Non-canonical exec paths are rejected by findNonCanonicalExecPath
+		// before ensureSandbox (R15 round 2: the check runs before the sandbox
+		// is created, and sets a condition rather than an error-requeue).
 		union.Exec = append(union.Exec, ap.Spec.Exec...)
 		union.Network = append(union.Network, ap.Spec.Network...)
 		union.Files = append(union.Files, ap.Spec.Files...)
@@ -570,10 +581,10 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 // is the terminal phase (e.g. "Failed") so each terminal outcome is recorded
 // once with its reason (e.g. TamperedVerify). It is the operator's audit record
 // (ADR-0004); the runner never writes it.
-func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status metav1.ConditionStatus, reason, message string) {
+func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
 	now := metav1.Now()
 	for i := range loop.Status.Conditions {
-		if loop.Status.Conditions[i].Type == string(condType) {
+		if loop.Status.Conditions[i].Type == condType {
 			if loop.Status.Conditions[i].Reason == reason &&
 				loop.Status.Conditions[i].Message == message &&
 				loop.Status.Conditions[i].Status == status {
@@ -587,7 +598,7 @@ func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status
 		}
 	}
 	loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
-		Type:               string(condType),
+		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
@@ -623,14 +634,39 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// isNonCanonicalPath returns true if the path is non-canonical: it contains a
-// '..' segment, a '//' (double slash), or ends with a '/'. The eBPF engine and
-// the filesystem normalize such paths, so a non-canonical path that looks
-// outside the writable mounts could resolve to one (e.g. "/usr/../tmp/git").
-// The CRD CEL XValidation can't reject these (cost budget), so the controller
-// rejects them in effectivePolicyHash before they reach the effective policy.
+// findNonCanonicalExecPath scans the Loop's referenced AgentPolicies for
+// non-canonical exec paths (defence in depth: the CRD CEL XValidation catches
+// the common case at admission; this catches anything that slips through).
+// Returns the first bad (policy, path) pair, or ("", "") if all are canonical.
+// Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
+func (r *LoopReconciler) findNonCanonicalExecPath(ctx context.Context, loop *coxv1alpha1.Loop) (string, string) {
+	for _, name := range loop.Spec.PolicyRefs {
+		ap := &coxv1alpha1.AgentPolicy{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
+			continue
+		}
+		for _, e := range ap.Spec.Exec {
+			if isNonCanonicalPath(e) {
+				return ap.Name, e
+			}
+		}
+	}
+	return "", ""
+}
+
+// isNonCanonicalPath returns true if the path is non-canonical: it contains
+// a '.' or '..' segment, a '//' (double slash), or ends with a '/'. The eBPF
+// engine and the filesystem normalize such paths, so a non-canonical path
+// that looks outside the writable mounts could resolve to one (e.g.
+// "/usr/../tmp/git" or "/./tmp/git"). The CRD CEL XValidation catches the
+// common case at admission (with items:MaxLength bounding the string length);
+// the controller is the second line of defence (catches everything).
 func isNonCanonicalPath(p string) bool {
 	if strings.Contains(p, "..") {
+		return true
+	}
+	// Catch '.' segments: "/./tmp/git" resolves to "/tmp/git".
+	if strings.Contains(p, "/./") {
 		return true
 	}
 	if strings.Contains(p, "//") {

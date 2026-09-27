@@ -31,8 +31,9 @@ import (
 // allow (a real binary outside the writable mounts, satisfying the exec
 // absolute-path CEL rule). Shared so goconst doesn't flag the repeated literal.
 const (
-	c6aGitBin   = "/usr/bin/git"
-	c6aTestRepo = "https://github.com/papawattu/coxswain.git"
+	c6aGitBin        = "/usr/bin/git"
+	c6aTestRepo      = "https://github.com/papawattu/coxswain.git"
+	nonCanonLoopName = "noncanon-loop"
 )
 
 var _ = Describe("C6a effective AgentPolicy union", func() {
@@ -160,7 +161,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 
 		// A Loop that references this AgentPolicy must fail reconciliation.
 		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "noncanon-loop", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: nonCanonLoopName, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal: "test non-canonical exec path rejection",
 				Workspace: coxv1alpha1.Workspace{
@@ -177,10 +178,32 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		// Reconcile: the controller must reject the non-canonical path.
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "noncanon-loop"}})
+		// Reconcile: the controller must set the PolicyValid=False condition
+		// (NonCanonicalExecPath) and NOT create a sandbox pod.
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: nonCanonLoopName}})
+		Expect(err).ToNot(HaveOccurred(),
+			"the controller sets a condition, not an error (R15 round 2)")
+
+		// Assert the condition is set.
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: nonCanonLoopName}, gotLoop)).To(Succeed())
+		var policyValid *metav1.Condition
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == "PolicyValid" {
+				policyValid = &gotLoop.Status.Conditions[i]
+			}
+		}
+		Expect(policyValid).ToNot(BeNil(),
+			"the Loop must have a PolicyValid condition when a non-canonical exec path is found")
+		Expect(policyValid.Status).To(Equal(metav1.ConditionFalse),
+			"PolicyValid must be False for a non-canonical exec path")
+		Expect(policyValid.Reason).To(Equal("NonCanonicalExecPath"),
+			"the reason must be NonCanonicalExecPath")
+
+		// Assert no sandbox pod was created.
+		sandboxPod := &corev1.Pod{}
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "noncanon-loop-sandbox"}, sandboxPod)
 		Expect(err).To(HaveOccurred(),
-			"the controller must reject a Loop with a non-canonical exec path")
-		Expect(err.Error()).To(ContainSubstring("non-canonical"))
+			"a Loop with a non-canonical exec path must NOT get a sandbox pod")
 	})
 })

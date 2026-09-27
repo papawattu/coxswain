@@ -75,13 +75,14 @@ spec:
                   reaches the eBPF engine. The CRD is the first line of defence (catches the
                   common case at admission); the controller is the second (catches everything).
                 items:
+                  maxLength: 512
                   type: string
                 maxItems: 64
                 type: array
                 x-kubernetes-validations:
-                - message: exec entries must be absolute paths at or outside the writable
-                    mounts (not under /workspace, /scratch, /tmp)
-                  rule: self.all(e, e.startsWith('/') && !e.startsWith('/workspace/')
+                - message: exec entries must be canonical absolute paths (no ., ..,
+                    //, trailing /) at or outside the writable mounts
+                  rule: self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.startsWith('/workspace/')
                     && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch'
                     && !e.startsWith('/tmp/') && e != '/tmp')
               files:

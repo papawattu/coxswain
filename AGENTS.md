@@ -15,12 +15,18 @@ pull requests; design is reviewed in review docs.**
   a kind run for anything that changes the sandbox pod).
 - **Mark it ready for review** when CI (`make test`, `make lint`, and the
   kind e2e once it exists) is green and the slice's acceptance is met.
-- **The reviewer reviews on the PR**: inline comments on the code, then
-  *Approve* or *Request changes*. P1 findings are *Request changes*. Address
-  each comment with a follow-up commit on the branch (don't force-push over
-  reviewed commits) and reply on the thread.
-- **The owner merges.** Neither the builder nor the reviewer merges to
-  `main`. Squash-merge with the PR title as the subject (`C2: …`, `I34: …`).
+- **The reviewer reviews on the PR with comment reviews, not approvals.** The
+  builder, reviewer and owner all act through the same GitHub account, and GitHub
+  does not let an account approve its own PR — so a required approval could never
+  be satisfied. Instead: the reviewer submits a **Comment** review whose body
+  starts with the verdict (`Verdict: OK`, `Verdict: OK + notes`, or
+  `Verdict: CHANGES`). Each finding is an inline comment. P1 findings stay
+  **unresolved** until fixed; **required conversation resolution** makes them
+  block the merge. The builder addresses each comment with a follow-up commit on
+  the branch (don't force-push over reviewed commits) and replies on the thread.
+- **The owner merges** when the verdict is OK and no threads are open. Neither
+  the builder nor the reviewer merges to `main`. Squash-merge with the PR title
+  as the subject (`C2: …`, `I34: …`).
 - **After merge:** delete the branch, pull `main`, and start the next slice
   from it.
 

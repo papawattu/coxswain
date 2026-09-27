@@ -153,12 +153,15 @@ type LoopStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Iteration",type=integer,JSONPath=`.status.iteration`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
-// D20: the Loop name names the Sandbox and its Service, so it must be a
-// DNS-1035 label (lowercase, start with a letter, no dots) of at most 55
-// chars (63 - len("-sandbox")). Loop names are normally DNS-1123 subdomains
+// D20: the Loop name names the Sandbox (and its Service, if one is enabled),
+// so it must be a DNS-1035 label (lowercase, start with a letter, no dots) of
+// at most 55 chars (63 - len("-sandbox")). The per-Sandbox Service is opt-in
+// (spec.service: true, D22) and Coxswain does not set it, but a stricter name
+// costs nothing and is still required if a Service is ever enabled (e.g. a
+// runner health endpoint). Loop names are normally DNS-1123 subdomains
 // (dots/digits/253 chars allowed), so this is enforced at admission rather
 // than left to a later Service-create failure.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$') && size(self.metadata.name) <= 55",message="Loop name must be a DNS-1035 label of at most 55 characters (it names the Sandbox and its Service)"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$') && size(self.metadata.name) <= 55",message="Loop name must be a DNS-1035 label of at most 55 characters (it names the Sandbox, and its Service if one is enabled)"
 
 // Loop is the Schema for the loops API.
 type Loop struct {

@@ -92,19 +92,60 @@ KIND_CLUSTER ?= coxswain-test-e2e
 # envtest suite is the canary for API drift, not the prod cluster.
 KIND_NODE_IMAGE ?= kindest/node:v1.34.0
 
-.PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+# I23: agent-sandbox is installed from its *release* manifest (the source
+# k8s/controller.yaml is a ko:// placeholder, which is what made Phase 0 think
+# no controller image existed). The version is pinned here, in exactly one
+# place, and the release manifest is derived from it.
+AGENT_SANDBOX_VERSION ?= v1.0.4
+AGENT_SANDBOX_MANIFEST ?= https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)/sandbox.yaml
+# The controller image the release manifest references (pre-loaded into the
+# kind node so an offline host doesn't depend on the node reaching
+# registry.k8s.io).
+AGENT_SANDBOX_CONTROLLER_IMAGE ?= registry.k8s.io/agent-sandbox/agent-sandbox-controller:$(AGENT_SANDBOX_VERSION)
+
+.PHONY: kind-up
+kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGENT_SANDBOX_VERSION)
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
 	}
 	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
+		*"$(KIND_CLUSTER)*") \
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)' on $(KIND_NODE_IMAGE)..."; \
 			$(KIND) create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE) ;; \
 	esac
+	@echo "Installing agent-sandbox $(AGENT_SANDBOX_VERSION) from the release manifest..."
+	curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" | kubectl apply -f -
+	@echo "Pre-loading the controller image into the kind node (offline-host fallback)"
+	@docker pull "$(AGENT_SANDBOX_CONTROLLER_IMAGE)" >/dev/null 2>&1 \
+		&& $(KIND) load docker-image "$(AGENT_SANDBOX_CONTROLLER_IMAGE)" --name $(KIND_CLUSTER) \
+		|| echo "(could not pre-load $(AGENT_SANDBOX_CONTROLLER_IMAGE); the node will pull it)"
+	@echo "Waiting for the agent-sandbox controller to be ready..."
+	kubectl rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=120s
+
+.PHONY: kind-smoke
+kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True
+	@kubectl create namespace d22-smoke --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	@echo "Creating a bare Sandbox in ns d22-smoke and waiting for Ready=True..."
+	@printf '%s\n' 'apiVersion: agents.x-k8s.io/v1beta1' 'kind: Sandbox' 'metadata:' '  name: d22-smoke' '  namespace: d22-smoke' 'spec:' '  podTemplate:' '    spec:' '      containers:' '        - name: agent' '          image: docker.io/library/busybox:latest' '          command: ["sh", "-c", "sleep 3600"]' | kubectl apply -f -
+	@for i in $$(seq 1 48); do \
+		r=$$(kubectl get sandbox d22-smoke -n d22-smoke -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null); \
+		if [ "$$r" = "True" ]; then echo "Sandbox d22-smoke is Ready (D22 reproduced)."; break; fi; \
+		if [ $$i -eq 48 ]; then echo "Sandbox d22-smoke did not reach Ready in 240s"; exit 1; fi; \
+		sleep 5; \
+	done
+
+.PHONY: crd-drift-check
+crd-drift-check: ## Fail if the vendored agent-sandbox CRD drifts from the release manifest
+	@echo "Checking vendored CRD against the agent-sandbox $(AGENT_SANDBOX_VERSION) release manifest..."
+	@curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" > /tmp/cox-agent-sandbox.yaml
+	@python3 -c "import yaml,sys; rel=[d for d in yaml.safe_load_all(open('/tmp/cox-agent-sandbox.yaml')) if d and d.get('kind')=='CustomResourceDefinition' and 'sandboxes.agents.x-k8s.io' in d['metadata']['name']][0]; vend=yaml.safe_load(open('config/crd/external/agents.x-k8s.io_sandboxes.yaml')); ks=lambda d: sorted(d['spec']['versions'][0]['schema']['openAPIV3Schema']['properties']['spec']['properties'].keys()); r,v=ks(rel),ks(vend); sys.exit(1) if r!=v else print('Vendored agent-sandbox CRD matches the release manifest.')"
+	@rm -f /tmp/cox-agent-sandbox.yaml
+
+.PHONY: setup-test-e2e
+setup-test-e2e: kind-up crd-drift-check ## Set up a Kind cluster for e2e tests (with agent-sandbox installed)
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.

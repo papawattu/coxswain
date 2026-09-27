@@ -38,7 +38,7 @@ explains Phase 0's "no pullable image"), the Service is opt-in via
 
 ### I23. Make the agent-sandbox install reproducible, not a commit-message recipe
 
-- [ ] Done
+- [x] Done (commit I23: Makefile kind-up/kind-smoke/crd-drift-check + AGENT_SANDBOX_VERSION). `AGENT_SANDBOX_VERSION ?= v1.0.4` is the single source of the version (manifest + controller image derived from it). `make kind-up` creates the kind cluster on `$(KIND_NODE_IMAGE)`, applies the v1.0.4 *release* manifest, pre-loads the controller image into the node, and waits for the controller rollout; `make kind-smoke` creates a bare `Sandbox` and waits for `Ready=True` (D22's evidence, rerunnable); `setup-test-e2e` now depends on `kind-up crd-drift-check`; `make crd-drift-check` compares the vendored `config/crd/external/agents.x-k8s.io_sandboxes.yaml` against the release manifest so the two can't drift. Acceptance proven from a clean machine: `make kind-up` + `make kind-smoke` reproduced D22 (controller rolled out, bare Sandbox Ready=True).
 
 **Where:** `5dcfaa4` commit message (the only record of the install steps);
 `Makefile`; `docs/E2E-PHASE0.md`.
@@ -68,7 +68,7 @@ D22's result; the version string exists in exactly one place.
 
 ### I24. D20's stated reason is now inaccurate
 
-- [ ] Done
+- [x] Done (same commit as I24). The Loop-name CEL message and the `loop_types.go` comment now read "it names the Sandbox, and its Service if one is enabled" (was "the Sandbox and its Service"); the comment also notes the Service is opt-in (spec.service, D22) and that the stricter name is still enforced in case a Service is ever enabled. CRD regenerated.
 
 The Loop-name CEL rule's message and the `loop_types.go` comment say the name
 "names the Sandbox and its Service". D22 found the Service is opt-in

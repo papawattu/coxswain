@@ -2,7 +2,29 @@
 
 ## Review protocol
 
-A separate reviewer agent reviews commits and hands back work as docs only.
+A separate reviewer agent reviews the builder's work. **Code is reviewed on
+pull requests; design is reviewed in review docs.**
+
+### Pull requests (code — from Phase 1 slice C2 onward)
+
+- **Never commit to `main` directly.** One branch and one PR per slice or
+  review item: `slice/<id>-<short-name>` (e.g. `slice/c2-model-proxy`) or
+  `fix/<id>-<short-name>` (e.g. `fix/i34-agent-env`).
+- **Open the PR as a draft early** and push as you go. The PR description
+  names the slice / issue IDs it closes and how it was verified (tests, and
+  a kind run for anything that changes the sandbox pod).
+- **Mark it ready for review** when CI (`make test`, `make lint`, and the
+  kind e2e once it exists) is green and the slice's acceptance is met.
+- **The reviewer reviews on the PR**: inline comments on the code, then
+  *Approve* or *Request changes*. P1 findings are *Request changes*. Address
+  each comment with a follow-up commit on the branch (don't force-push over
+  reviewed commits) and reply on the thread.
+- **The owner merges.** Neither the builder nor the reviewer merges to
+  `main`. Squash-merge with the PR title as the subject (`C2: …`, `I34: …`).
+- **After merge:** delete the branch, pull `main`, and start the next slice
+  from it.
+
+### Review docs (design, cross-cutting issues, owner decisions)
 
 - **Review docs:** `docs/REVIEW-PHASE<N>.md` (round 1) and
   `docs/REVIEW-PHASE<N>-R<k>.md` (round k). All rounds share one format:
@@ -10,6 +32,11 @@ A separate reviewer agent reviews commits and hands back work as docs only.
   Acceptance**. Issue IDs (`I<n>`, `D<n>`) are unique across rounds.
 - **Each review is one commit** with subject `review(phase<N>-r<k>): …`,
   touching `docs/` only, tagged `review/phase<N>-r<k>` (lightweight tag).
+  Review docs go through a PR too (branch `review-phase<N>-r<k>`, hyphens so it never clashes with the tag) once `main`
+  is protected; the tag is applied to the merged commit.
+- **What goes where:** a finding about specific lines of code → PR review
+  comment. A finding about design, an ADR, the plan, or something spanning
+  several slices, or a question for the owner → review doc.
 - **Builder: watch for new reviews** with `git tag -l 'review/*'` (or
   `git log --grep '^review('`). Before each work session, read any review
   tagged since your last one. P1 items block the next phase.

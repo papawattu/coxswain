@@ -452,8 +452,6 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		podDesired.Spec.Containers = []corev1.Container{{
 			Name:  "proxy",
 			Image: r.proxyImage(),
-			// sleep infinity is a stand-in until the proxy binary exists (C2b).
-			Command: []string{"sh", "-c", "sleep infinity"},
 			Resources: corev1.ResourceRequirements{
 				Limits: corev1.ResourceList{
 					corev1.ResourceCPU:              resource.MustParse("100m"),
@@ -473,6 +471,21 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 				ReadOnlyRootFilesystem:   &readOnlyRootfs,
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			// D33 kind-run acceptance: the stand-in must prove at runtime that it
+			// CAN read the 0444 model-creds Secret file (UID 65533, read-only
+			// rootfs). It logs the read to stdout (-> the pod log) and then keeps
+			// the pod alive. A permission error would surface as a crash / an
+			// empty log, which the acceptance run checks for.
+			Command: []string{
+				"sh", "-c",
+				"echo 'proxy-stand-in: checking model-creds'; " +
+					"if head -c 64 /model-creds/* >/dev/null 2>&1; then " +
+					"echo 'proxy: model-creds readable (0444 secret file present)'; " +
+					"else " +
+					"echo 'proxy: model-creds NOT readable' && exit 1; " +
+					"fi; " +
+					"exec sleep infinity",
 			},
 			VolumeMounts: []corev1.VolumeMount{
 				// The model key lives ONLY here (the proxy pod), never the agent (C2).

@@ -2,7 +2,7 @@
 
 A Kubernetes operator that runs long-lived **plan → implement → verify** loops for coding agents. Each loop runs in an isolated [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) workspace, stops on success, budget or stall, and hands back a pull request.
 
-> **Status: pre-alpha.** Today the operator accepts a `Loop`, creates its sandbox, and tracks the loop's phase. The agent runner, verification and pull requests are being built in Phase 1 — see [docs/PLAN.md](docs/PLAN.md).
+> **Status: pre-alpha.** Today the operator accepts a `Loop`, creates its hardened sandbox (zero-credential agent pod, ADR-0006), and tracks the loop's phase. The agent runner, verification and pull requests are being built in Phase 1 — see [docs/PLAN.md](docs/PLAN.md). **Agent image stand-in (I37):** when `spec.agent.image` is omitted the sandbox runs `docker.io/library/golang:1.26` + `sleep infinity` as a Phase 0 stand-in — it is hardened but not an agent. The reference runner image lands with the A-slices; until then treat the default as a stand-in, not the hardened agent-agnostic default.
 
 ## Getting started
 

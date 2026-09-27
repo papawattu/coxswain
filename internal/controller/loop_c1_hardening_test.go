@@ -104,6 +104,74 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		Expect(*sc.ReadOnlyRootFilesystem).To(BeTrue(),
 			"read-only rootfs must be on, with /workspace + scratch as emptyDir volumes")
 
+		// I35 (R10): runAsNonRoot without a UID breaks the default golang image on
+		// kind (CreateContainerConfigError). The agent must pin a UID/GID and the
+		// pod must set fsGroup so /workspace + /scratch are writable by it; HOME and
+		// TMPDIR point at the writable scratch (a read-only rootfs otherwise breaks
+		// every tool that writes ~/.cache or /tmp).
+		By("pinning a non-root UID/GID and a fsGroup (I35)")
+		Expect(sc.RunAsUser).NotTo(BeNil())
+		Expect(*sc.RunAsUser).To(BeNumerically("==", 65532), "runAsUser must be the platform non-root UID (65532)")
+		Expect(sc.RunAsGroup).NotTo(BeNil())
+		Expect(*sc.RunAsGroup).To(BeNumerically("==", 65532), "runAsGroup must be the platform non-root GID (65532)")
+		Expect(pod.SecurityContext).NotTo(BeNil())
+		Expect(pod.SecurityContext.FSGroup).NotTo(BeNil())
+		Expect(*pod.SecurityContext.FSGroup).To(BeNumerically("==", 65532), "fsGroup must match the agent UID so emptyDir volumes are writable")
+
+		By("pointing HOME at the writable scratch (I35)")
+		envByName := map[string]string{}
+		for _, e := range agent.Env {
+			envByName[e.Name] = e.Value
+		}
+		Expect(envByName["HOME"]).To(Equal("/scratch"), "HOME must be on the writable scratch volume")
+
+		// P1 (R13): TMPDIR pointed at /scratch/tmp, a directory a fresh emptyDir
+		// never creates, so go build / mktemp failed, and tools that hard-code /tmp
+		// stayed broken under a read-only rootfs. The fix mounts a dedicated
+		// emptyDir at /tmp (writable) and does NOT override TMPDIR — covering both
+		// TMPDIR-honoring and /tmp-hardcoding tools.
+		By("mounting a writable /tmp emptyDir and not overriding TMPDIR (P1)")
+		_, hasTmpdir := envByName["TMPDIR"]
+		Expect(hasTmpdir).To(BeFalse(),
+			"TMPDIR must not be overridden (the agent uses the image default, backed by the /tmp mount)")
+		var tmpMount *corev1.VolumeMount
+		for i := range agent.VolumeMounts {
+			if agent.VolumeMounts[i].MountPath == "/tmp" {
+				tmpMount = &agent.VolumeMounts[i]
+			}
+		}
+		Expect(tmpMount).NotTo(BeNil(), "the agent must mount a writable emptyDir at /tmp")
+		Expect(tmpMount.ReadOnly).To(BeFalse(), "/tmp must be writable")
+		for _, v := range pod.Volumes {
+			if v.Name == tmpMount.Name {
+				Expect(v.EmptyDir).NotTo(BeNil(), "/tmp must back onto an emptyDir volume")
+			}
+		}
+
+		// P3 (R13): the writable emptyDirs must carry explicit sizeLimits that sum
+		// under the container's ephemeral limit, so a full /workspace / scratch /
+		// tmp surfaces as a bounded pod eviction rather than filling the node.
+		By("giving the writable emptyDirs bounded sizeLimits (P3, I36)")
+		totalLimit := int64(0)
+		for _, v := range pod.Volumes {
+			if v.EmptyDir != nil {
+				Expect(v.EmptyDir.SizeLimit).NotTo(BeNil(), "emptyDir volume %q must have a sizeLimit", v.Name)
+				totalLimit += v.EmptyDir.SizeLimit.Value()
+			}
+		}
+		containerLimit := agent.Resources.Limits[corev1.ResourceEphemeralStorage]
+		Expect(totalLimit).To(BeNumerically("<=", containerLimit.Value()),
+			"writable emptyDir sizeLimits must sum under the container ephemeral limit")
+
+		// I36 (R10): ADR-0006 item 4 requires CPU/memory limits; C1 set none, so one
+		// agent could starve the node. Also an ephemeral-storage limit — /workspace
+		// and /scratch are emptyDir and an agent can fill the node's disk.
+		By("setting CPU, memory, and ephemeral-storage limits (I36)")
+		Expect(agent.Resources.Limits).NotTo(BeEmpty(), "the agent must have resource limits (I36)")
+		Expect(agent.Resources.Limits).To(HaveKey(corev1.ResourceCPU), "a CPU limit is required (I36)")
+		Expect(agent.Resources.Limits).To(HaveKey(corev1.ResourceMemory), "a memory limit is required (I36)")
+		Expect(agent.Resources.Limits).To(HaveKey(corev1.ResourceEphemeralStorage), "an ephemeral-storage limit is required (I36)")
+
 		Expect(sc.SeccompProfile).NotTo(BeNil())
 		Expect(sc.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault),
 			"seccomp must be RuntimeDefault")

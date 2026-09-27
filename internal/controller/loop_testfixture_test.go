@@ -59,17 +59,19 @@ const (
 	// Sandbox pod spec (goconst: it appears in several test files).
 	agentContainerName = "agent"
 
-	unstructuredGoal = "goal"
-	unstructuredWs   = "workspace"
-	unstructuredRepo = "repo"
-	unstructuredRef  = "ref"
-	unstructuredVer  = "verify"
-	unstructuredAcck = "acceptanceChecks"
-	unstructuredKind = "kind"
-	unstructuredMeta = "metadata"
-	unstructuredAPI  = "apiVersion"
-	unstructuredSpec = "spec"
-	unstructuredName = "name"
+	unstructuredGoal  = "goal"
+	unstructuredWs    = "workspace"
+	unstructuredRepo  = "repo"
+	unstructuredRef   = "ref"
+	unstructuredVer   = "verify"
+	unstructuredAcck  = "acceptanceChecks"
+	unstructuredKind  = "kind"
+	unstructuredMeta  = "metadata"
+	unstructuredAPI   = "apiVersion"
+	unstructuredSpec  = "spec"
+	unstructuredName  = "name"
+	unstructuredEnv   = "env"
+	unstructuredValue = "value"
 )
 
 // mkUnstructuredLoop builds an unstructured Loop with the given name,

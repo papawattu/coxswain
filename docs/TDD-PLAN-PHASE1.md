@@ -73,7 +73,16 @@ spec, the e2e runs an "evil agent" image.
   automount, runAsNonRoot, drop-all-caps, allowPrivilegeEscalation false,
   seccomp RuntimeDefault, read-only rootfs + `/workspace` + `scratch` emptyDirs,
   and no secret volume in the agent container; envtest seam
-  `loop_c1_hardening_test.go`.)* The operator builds the Sandbox with `automountServiceAccountToken: false`, `runAsNonRoot`, drop all
+  `loop_c1_hardening_test.go`. Round 10 addenda (I34-I38) landed with it: I34
+  `spec.agent.env` is literal-only `[]AgentEnvVar` (no `valueFrom`, CEL rejects
+  `COX_*` names — `loop_i34_agentenv_test.go`); I35 pins `runAsUser`/`runAsGroup`/
+  `fsGroup`=65532 + `HOME`/`TMPDIR` on `/scratch` so the read-only-rootfs agent
+  can start and write (the envtest's RED is the `CreateContainerConfigError`
+  that only kind catches — see docs/REVIEW-PHASE1-R10.md); I36 sets CPU/memory/
+  ephemeral-storage limits; I37 notes the golang stand-in default in the README
+  status line + ADR-0006; I38 moves the `+optional` markers to their own lines so
+  `make manifests generate` is self-consistent (verified: zero `+optional` in the
+  CRD, fields optional).)* The operator builds the Sandbox with `automountServiceAccountToken: false`, `runAsNonRoot`, drop all
 caps, `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`, read-only root
 fs + writable `/workspace` + scratch, CPU/mem limits, and a `runtimeClassName`
 when the cluster offers one. CRD: `spec.agent { image, model,

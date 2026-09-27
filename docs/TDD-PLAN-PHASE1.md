@@ -100,6 +100,17 @@ mounted into the proxy **and not** the agent, and the agent's env has
 `COX_MODEL_BASE_URL` set to the localhost proxy. e2e — the reference runner, with
 the fake model behind the proxy, reaches `result.json` without any key in the
 agent env.
+
+  - DONE (envtest seam): `internal/controller/loop_c2_proxy_test.go` — the
+    sandbox pod has the proxy container; the model-creds Secret volume is
+    mounted (read-only) into the proxy and **not** the agent; the agent's env
+    carries `COX_MODEL_BASE_URL=http://localhost:8080`; the pod declares the
+    model-creds volume as a Secret referencing `spec.agent.endpointSecretRef`.
+    The operator now adds the proxy container + Secret volume to
+    `ensureSandbox` (`proxyImage()` helper, `COX_PROXY_IMAGE` override). The
+    proxy container is a `sleep infinity` stand-in — the real proxy binary
+    (auth injection + forwarding + token metering) and the e2e (reference
+    runner through the proxy with the fake model) are follow-on.
 - **C3** — *NetworkPolicy generated from `AgentPolicy` (ADR-0007 Q6).* A
 `NetworkPolicy` on the sandbox is **generated from the Loop's effective
 `AgentPolicy`** egress allows (allowed hosts/CIDRs + ports), default-deny:

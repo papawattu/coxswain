@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"os"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -29,6 +30,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
+// model key; it talks to the local proxy on COX_MODEL_BASE_URL, which holds the
+// key (mounted only into the proxy) and injects auth.
+const (
+	// proxyContainerName is the name of the model proxy sidecar container.
+	proxyContainerName = "proxy"
+	// modelCredsVolume is the name of the Secret volume that carries the model
+	// API key + base URL (mounted read-only into the proxy only).
+	modelCredsVolume = "model-creds"
+	// coxModelBaseURL is the env var the operator sets on the agent so it talks
+	// to the local proxy (a Loop cannot override it: COX_* names are rejected
+	// at admission, I34).
+	coxModelBaseURL = "COX_MODEL_BASE_URL"
+	// localhostProxyBaseURL is where the proxy listens on the sandbox pod's
+	// loopback interface. The agent reaches it over localhost, not the network.
+	localhostProxyBaseURL = "http://localhost:8080"
+	// readOnlyMode is the default file mode for the model-creds Secret volume
+	// (0444: the key is read-only, even in the proxy).
+	readOnlyMode int32 = 0o444
 )
 
 // LoopReconciler reconciles a Loop object.
@@ -194,8 +216,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// fresh emptyDir never creates, so go build / mktemp failed; instead a
 		// dedicated emptyDir is mounted at /tmp (writable), which also covers the
 		// tools that hard-code /tmp.
-		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+1)
+		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+2)
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
+		// C2 (ADR-0006 item 2): the agent holds no model key. It talks to the local
+		// proxy sidecar (COX_MODEL_BASE_URL), which holds the key and injects auth.
+		// The operator sets this; a Loop cannot override it (COX_* names are
+		// rejected at admission, I34) so the agent cannot be pointed past the proxy.
+		agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: localhostProxyBaseURL})
 		for _, e := range loop.Spec.Agent.Env {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
 		}
@@ -241,6 +268,57 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 					{Name: "tmp", MountPath: "/tmp"},
 				},
 			},
+			// C2 (ADR-0006 item 2): the model proxy sidecar. It holds the model key
+			// (mounted ONLY here, from the cox-model-creds Secret), injects the auth
+			// header, forwards only to the configured endpoint, and meters tokens (the
+			// Phase 2 metering sidecar, built now as the credential boundary). The
+			// agent reaches it on localhost:8080 and holds no key. sleep infinity is a
+			// stand-in until the proxy binary exists.
+			{
+				Name:    proxyContainerName,
+				Image:   r.proxyImage(),
+				Command: []string{"sh", "-c", "sleep infinity"},
+				Env: []corev1.EnvVar{
+					// The proxy reads the key + endpoint from the mounted Secret
+					// (mounted read-only into the proxy only, below).
+					{Name: "MODEL_API_KEY", ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: loop.Spec.Agent.EndpointSecretRef},
+							Key:                  "api-key",
+						},
+					}},
+					{Name: "MODEL_BASE_URL", ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: loop.Spec.Agent.EndpointSecretRef},
+							Key:                  "base-url",
+						},
+					}},
+				},
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:              resource.MustParse("100m"),
+						corev1.ResourceMemory:           resource.MustParse("128Mi"),
+						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						corev1.ResourceMemory: resource.MustParse("32Mi"),
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &falseP,
+					RunAsNonRoot:             &trueP,
+					RunAsUser:                &nonRootUID,
+					RunAsGroup:               &nonRootGID,
+					ReadOnlyRootFilesystem:   &readOnlyRootfs,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					// The model key lives ONLY here (the proxy), never the agent (C2).
+					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
+				},
+			},
 		}
 		// P3 (R13, I36): the writable emptyDirs carry explicit sizeLimits that sum
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
@@ -256,6 +334,22 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				SizeLimit: newLimit("100Mi"),
 			}}},
+		}
+		// C2 (ADR-0006 item 2): the model-creds Secret volume, mounted (read-only)
+		// only into the proxy container above. It carries the model API key +
+		// base URL; the agent never sees it.
+		if loop.Spec.Agent.EndpointSecretRef != "" {
+			secretMode := readOnlyMode
+			desired.Spec.PodTemplate.Spec.Volumes = append(desired.Spec.PodTemplate.Spec.Volumes,
+				corev1.Volume{
+					Name: modelCredsVolume,
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName:  loop.Spec.Agent.EndpointSecretRef,
+							DefaultMode: &secretMode,
+						},
+					},
+				})
 		}
 		// Set the controller owner ref here, on the (possibly server-populated)
 		// object. Returns AlreadyOwnedError if a different controller already
@@ -429,6 +523,16 @@ func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status
 func (r *LoopReconciler) sandboxImage() string {
 	if r.SandboxImage != "" {
 		return r.SandboxImage
+	}
+	return "docker.io/library/golang:1.26"
+}
+
+// proxyImage returns the model proxy sidecar image. Defaults to a dev stand-in
+// (sleep infinity); a real proxy binary is a follow-on (C2's e2e drives the
+// reference runner through it). Overridable via PROXY_IMAGE for the smoke test.
+func (r *LoopReconciler) proxyImage() string {
+	if v := os.Getenv("COX_PROXY_IMAGE"); v != "" {
+		return v
 	}
 	return "docker.io/library/golang:1.26"
 }

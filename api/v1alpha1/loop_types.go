@@ -121,6 +121,19 @@ type LoopStatus struct {
 	// +optional
 	Iteration int `json:"iteration,omitempty"`
 
+	// desiredPhase is the phase the operator has asked the runner to be in.
+	// It is also copied to .coxswain/desired-phase for the runner to read.
+	// The operator is the sole writer of Loop status (ADR-0004); the runner
+	// never sets this — it only reports observedPhase in result.json.
+	// +optional
+	DesiredPhase LoopPhase `json:"desiredPhase,omitempty"`
+
+	// observedPhase is the operator's record of the phase the runner reported
+	// in result.json. It is the input to the transition table (B1). The runner
+	// never writes this field directly (ADR-0004).
+	// +optional
+	ObservedPhase LoopPhase `json:"observedPhase,omitempty"`
+
 	// conditions represent the current state of the Loop resource.
 	// Each condition has a unique type and reflects the status of a specific
 	// aspect of the resource. Status is one of True, False, or Unknown.

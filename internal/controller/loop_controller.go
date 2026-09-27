@@ -74,6 +74,18 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
 		changed = true
 	}
+	// B1: advance the phase machine when the runner reports a valid forward step.
+	// nextPhase(phase, observedPhase) returns the next phase when observedPhase
+	// is the immediate-next phase after the operator's current phase, and leaves
+	// it unchanged otherwise (terminal phases, missing/garbled reports). The
+	// operator never interprets runner output beyond this pure match
+	// (ADR-0004). The iterate/terminal branches (Verifying -> Implementing /
+	// Failed) are completed by B3 (verify outcome) and B4 (iteration count).
+	if next := nextPhase(loop.Status.Phase, loop.Status.ObservedPhase); next != loop.Status.Phase {
+		loop.Status.Phase = next
+		loop.Status.DesiredPhase = next
+		changed = true
+	}
 	if changed {
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
@@ -154,6 +166,40 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 // is always a valid DNS-1035 label <= 63 chars and needs no truncation.
 func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
+}
+
+// nextPhase is the operator's phase-transition table (B1). It is a pure
+// function of the operator's current phase and the phase the runner reported
+// having finished (observedPhase). The operator advances one step when the
+// runner reports the phase it was asked to do (observedPhase == desiredPhase
+// is checked by the caller); an unasked-for report leaves the phase unchanged.
+//
+// The happy path: Pending -> Planning -> Implementing -> Verifying -> Succeeded.
+// The iterate branch (Verifying -> Implementing when checks fail) and the
+// terminal branches (-> Failed on MaxIterations, -> Failed on TamperedVerify)
+// need inputs that land in B3 (verify outcome) and B4 (iteration count), so
+// they are not yet wired here — Verifying currently advances only to Succeeded.
+func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
+	switch current {
+	case coxv1alpha1.LoopPhasePending:
+		if reported == coxv1alpha1.LoopPhasePlanning {
+			return coxv1alpha1.LoopPhasePlanning
+		}
+	case coxv1alpha1.LoopPhasePlanning:
+		if reported == coxv1alpha1.LoopPhaseImplementing {
+			return coxv1alpha1.LoopPhaseImplementing
+		}
+	case coxv1alpha1.LoopPhaseImplementing:
+		if reported == coxv1alpha1.LoopPhaseVerifying {
+			return coxv1alpha1.LoopPhaseVerifying
+		}
+	case coxv1alpha1.LoopPhaseVerifying:
+		if reported == coxv1alpha1.LoopPhaseSucceeded {
+			return coxv1alpha1.LoopPhaseSucceeded
+		}
+	}
+	// Terminal phases and unrecognised (current, reported) pairs stay put.
+	return current
 }
 
 // sandboxImage returns the configured sandbox image, or a sensible Go dev default.

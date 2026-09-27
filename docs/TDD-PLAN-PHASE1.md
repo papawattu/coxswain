@@ -54,6 +54,13 @@ The Phase 0 controller only ensured the sandbox + set `Pending`. Phase 1 drives
 the phase enum based on `status.observedPhase` (from the runner) and the trust
 model.
 
+**Slice status:** B1 ✅ done — `status.desiredPhase`/`status.observedPhase` added
+(CRD); `nextPhase(current, reported)` pure transition function (happy path
+Pending → Planning → Implementing → Verifying → Succeeded; terminal + iterate/
+failed branches left for B3/B4); Reconcile advances the machine when the runner
+reports a valid forward step. Tests: pure `nextPhase` table + envtest (advance
+on valid report, no-op on skip-ahead).
+
 **Candidate seams (to confirm):**
 - **B1** — *Phase transitions.* The controller reads `status.observedPhase` (the
   runner's signal) and advances `status.phase` per the transition table:

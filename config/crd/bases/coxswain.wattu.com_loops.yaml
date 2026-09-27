@@ -175,6 +175,23 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              desiredPhase:
+                description: |-
+                  desiredPhase is the phase the operator has asked the runner to be in.
+                  It is also copied to .coxswain/desired-phase for the runner to read.
+                  The operator is the sole writer of Loop status (ADR-0004); the runner
+                  never sets this — it only reports observedPhase in result.json.
+                enum:
+                - Pending
+                - Planning
+                - AwaitingApproval
+                - Implementing
+                - Verifying
+                - Succeeded
+                - Failed
+                - Paused
+                - CleaningUp
+                type: string
               iteration:
                 default: 0
                 description: iteration is the 1-based count of plan→implement→verify
@@ -184,6 +201,22 @@ spec:
                 description: observedGeneration is the spec generation last reconciled.
                 format: int64
                 type: integer
+              observedPhase:
+                description: |-
+                  observedPhase is the operator's record of the phase the runner reported
+                  in result.json. It is the input to the transition table (B1). The runner
+                  never writes this field directly (ADR-0004).
+                enum:
+                - Pending
+                - Planning
+                - AwaitingApproval
+                - Implementing
+                - Verifying
+                - Succeeded
+                - Failed
+                - Paused
+                - CleaningUp
+                type: string
               phase:
                 default: Pending
                 description: phase is the current phase of the state machine.

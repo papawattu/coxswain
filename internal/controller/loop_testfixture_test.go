@@ -17,6 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
+	"time"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -31,6 +34,14 @@ const testRepoURL = "https://example.com/repo.git"
 // repo, so the individual test files don't each repeat the literal.
 func testWorkspace() coxv1alpha1.Workspace {
 	return coxv1alpha1.Workspace{Repo: testRepoURL}
+}
+
+// nowSuffix returns a unique-enough suffix (nanoseconds) for self-contained
+// envtest specs that create/delete their own namespace. The established idiom
+// across the controller test files; centralised here so new specs stay
+// consistent.
+func nowSuffix() string {
+	return fmt.Sprint(time.Now().UnixNano())
 }
 
 // Shared unstructured-Loop test fixture values. Named package-level constants

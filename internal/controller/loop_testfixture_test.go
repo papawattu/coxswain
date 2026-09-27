@@ -53,6 +53,8 @@ const (
 	loopGoal       = "make the failing test pass"
 	loopRepo       = testRepoURL
 	loopRef        = "main"
+	runnerImage    = "docker.io/library/golang:1.26"
+	testModel      = "local-model"
 	loopCheckCmd   = "go test ./..."
 
 	// agentContainerName is the name of the Loop's agent container in the

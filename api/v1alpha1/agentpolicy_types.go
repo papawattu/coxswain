@@ -47,7 +47,7 @@ type AgentPolicySpec struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=512
-	// +kubebuilder:validation:XValidation:rule="self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')",message="exec entries must be canonical absolute paths (no ., .., //, trailing /) at or outside the writable mounts"
+	// +kubebuilder:validation:XValidation:rule="self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.contains('/./') && !e.contains('/../') && !e.endsWith('/.') && !e.endsWith('/..') && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')",message="exec entries must be canonical absolute paths (no ., .., //, trailing /) at or outside the writable mounts"
 	Exec []string `json:"exec,omitempty"`
 
 	// network is the host:port endpoints the agent may reach (e.g.
@@ -66,10 +66,12 @@ type AgentPolicySpec struct {
 // AgentPolicyStatus defines the observed state of an AgentPolicy.
 type AgentPolicyStatus struct {
 	// generation is the spec generation this status was computed from (so the
-	// operator can tell a status is stale). +optional
+	// operator can tell a status is stale).
+	// +optional
 	Generation int64 `json:"generation,omitempty"`
 
-	// observedGeneration is the last processed generation. +optional
+	// observedGeneration is the last processed generation.
+	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 

@@ -34,6 +34,9 @@ const (
 	c6aGitBin        = "/usr/bin/git"
 	c6aTestRepo      = "https://github.com/papawattu/coxswain.git"
 	nonCanonLoopName = "noncanon-loop"
+	policyValidType  = "PolicyValid"
+	missingPolName   = "missing-pol-loop"
+	cleanLoopName    = "clean-loop"
 )
 
 var _ = Describe("C6a effective AgentPolicy union", func() {
@@ -146,64 +149,136 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 		// path" spec below for the controller-level test.
 	})
 
-	It("rejects a Loop that references an AgentPolicy with a non-canonical exec path", func() {
+	It("rejects an AgentPolicy with a non-canonical exec path at admission (CEL)", func() {
 		ns := "c6a-noncanon-loop"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
-		// The CRD accepts non-canonical paths (CEL cost budget), so create succeeds.
+		// R15 round 3: the CEL rule now rejects non-canonical paths at admission
+		// (the contains/endsWith checks fit the budget with items:MaxLength=512).
+		// /usr/../tmp/git is rejected by the CRD, not the controller.
 		ap := &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "noncanon", Namespace: ns},
 			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/../tmp/git"}},
 		}
-		Expect(k8sClient.Create(ctx, ap)).To(Succeed(),
-			"the CRD accepts non-canonical paths (CEL cost budget); the controller rejects them")
+		Expect(k8sClient.Create(ctx, ap)).ToNot(Succeed(),
+			"the CRD must reject /usr/../tmp/git (contains '/../')")
 
-		// A Loop that references this AgentPolicy must fail reconciliation.
+		// /./tmp/git is also rejected.
+		ap2 := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "noncanon2", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/./tmp/git"}},
+		}
+		Expect(k8sClient.Create(ctx, ap2)).ToNot(Succeed(),
+			"the CRD must reject /./tmp/git (contains '/./')")
+
+		// A canonical path is accepted.
+		ap3 := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "canon", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/bin/git"}},
+		}
+		Expect(k8sClient.Create(ctx, ap3)).To(Succeed(),
+			"the CRD must accept a canonical path")
+	})
+})
+
+var _ = Describe("C6a (R15 round 3): fail-closed policy validation", func() {
+	It("rejects a Loop that references a nonexistent AgentPolicy (PolicyNotFound)", func() {
+		ns := "c6a-nonexistent-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
 		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: nonCanonLoopName, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: missingPolName, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
-				Goal: "test non-canonical exec path rejection",
+				Goal: "test missing policy rejection",
 				Workspace: coxv1alpha1.Workspace{
 					Repo: c6aTestRepo,
 					Ref:  loopRef,
 				},
-				Verify: coxv1alpha1.VerifyConfig{
-					AcceptanceChecks: []string{"go test ./..."},
+				PolicyRefs: []string{"does-not-exist"},
+				Agent: coxv1alpha1.AgentConfig{
+					Image: runnerImage,
+					Model: testModel,
 				},
-				Agent:      coxv1alpha1.AgentConfig{Model: "test"},
-				Loop:       coxv1alpha1.LoopSettings{MaxIterations: 1},
-				PolicyRefs: []string{"noncanon"},
+				Loop: coxv1alpha1.LoopSettings{MaxIterations: 1},
 			},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		// Reconcile: the controller must set the PolicyValid=False condition
-		// (NonCanonicalExecPath) and NOT create a sandbox pod.
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: nonCanonLoopName}})
-		Expect(err).ToNot(HaveOccurred(),
-			"the controller sets a condition, not an error (R15 round 2)")
+		// Reconcile: the controller must set PolicyValid=False (PolicyNotFound)
+		// and NOT create a sandbox pod.
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: missingPolName}})
+		Expect(err).ToNot(HaveOccurred())
 
-		// Assert the condition is set.
+		// Check the condition.
 		gotLoop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: nonCanonLoopName}, gotLoop)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: missingPolName}, gotLoop)).To(Succeed())
 		var policyValid *metav1.Condition
 		for i := range gotLoop.Status.Conditions {
-			if gotLoop.Status.Conditions[i].Type == "PolicyValid" {
+			if gotLoop.Status.Conditions[i].Type == policyValidType {
 				policyValid = &gotLoop.Status.Conditions[i]
 			}
 		}
-		Expect(policyValid).ToNot(BeNil(),
-			"the Loop must have a PolicyValid condition when a non-canonical exec path is found")
-		Expect(policyValid.Status).To(Equal(metav1.ConditionFalse),
-			"PolicyValid must be False for a non-canonical exec path")
-		Expect(policyValid.Reason).To(Equal("NonCanonicalExecPath"),
-			"the reason must be NonCanonicalExecPath")
+		Expect(policyValid).ToNot(BeNil(), "the Loop must have a PolicyValid condition")
+		Expect(policyValid.Status).To(Equal(metav1.ConditionFalse))
+		Expect(policyValid.Reason).To(Equal("PolicyNotFound"),
+			"a missing AgentPolicy must produce reason PolicyNotFound")
 
-		// Assert no sandbox pod was created.
+		// No sandbox pod.
 		sandboxPod := &corev1.Pod{}
-		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "noncanon-loop-sandbox"}, sandboxPod)
-		Expect(err).To(HaveOccurred(),
-			"a Loop with a non-canonical exec path must NOT get a sandbox pod")
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "missing-pol-loop-sandbox"}, sandboxPod)
+		Expect(err).To(HaveOccurred(), "a Loop with a missing AgentPolicy must NOT get a sandbox pod")
+	})
+
+	It("sets PolicyValid=True on a clean pass", func() {
+		ns := "c6a-clean-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		// Create a valid AgentPolicy.
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "clean-pol", Namespace: ns},
+			Spec: coxv1alpha1.AgentPolicySpec{
+				Exec: []string{"/usr/bin/git"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
+
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: cleanLoopName, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal: "test clean policy pass",
+				Workspace: coxv1alpha1.Workspace{
+					Repo: c6aTestRepo,
+					Ref:  loopRef,
+				},
+				PolicyRefs: []string{"clean-pol"},
+				Agent: coxv1alpha1.AgentConfig{
+					Image: runnerImage,
+					Model: testModel,
+				},
+				Loop: coxv1alpha1.LoopSettings{MaxIterations: 1},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Reconcile: the controller should set PolicyValid=True.
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: cleanLoopName}})
+		Expect(err).ToNot(HaveOccurred())
+
+		// Check the condition.
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cleanLoopName}, gotLoop)).To(Succeed())
+		var policyValid *metav1.Condition
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == policyValidType {
+				policyValid = &gotLoop.Status.Conditions[i]
+			}
+		}
+		Expect(policyValid).ToNot(BeNil(), "the Loop must have a PolicyValid condition")
+		Expect(policyValid.Status).To(Equal(metav1.ConditionTrue),
+			"a clean policy pass must set PolicyValid=True")
+		Expect(policyValid.Reason).To(Equal("Valid"))
 	})
 })

@@ -82,9 +82,10 @@ spec:
                 x-kubernetes-validations:
                 - message: exec entries must be canonical absolute paths (no ., ..,
                     //, trailing /) at or outside the writable mounts
-                  rule: self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.startsWith('/workspace/')
-                    && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch'
-                    && !e.startsWith('/tmp/') && e != '/tmp')
+                  rule: self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.contains('/./')
+                    && !e.contains('/../') && !e.endsWith('/.') && !e.endsWith('/..')
+                    && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/')
+                    && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')
               files:
                 description: |-
                   files is the paths the agent may access (e.g. "/workspace"). The agent's
@@ -108,12 +109,11 @@ spec:
               generation:
                 description: |-
                   generation is the spec generation this status was computed from (so the
-                  operator can tell a status is stale). +optional
+                  operator can tell a status is stale).
                 format: int64
                 type: integer
               observedGeneration:
                 description: observedGeneration is the last processed generation.
-                  +optional
                 format: int64
                 type: integer
             type: object

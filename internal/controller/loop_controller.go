@@ -24,6 +24,7 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -97,17 +98,27 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// C6a (R15 round 2): check for non-canonical exec paths BEFORE creating
-	// the sandbox (defence in depth: the CRD CEL catches the common case at
-	// admission; this catches anything that slips through). If a bad path is
-	// found, set the PolicyValid=False condition and skip ensureSandbox.
-	if polName, badPath := r.findNonCanonicalExecPath(ctx, &loop); polName != "" {
-		setCondition(&loop, "PolicyValid", metav1.ConditionFalse, "NonCanonicalExecPath",
-			fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", polName, badPath))
+	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
+	// creating the sandbox (defence in depth: the CRD CEL catches the common
+	// case at admission; this catches anything that slips through, including
+	// missing/unreadable policies). If validation fails, set
+	// PolicyValid=False and suspend the sandbox (if running).
+	if polResult := r.validateAgentPolicies(ctx, &loop); !polResult.valid {
+		setCondition(&loop, "PolicyValid", metav1.ConditionFalse, polResult.reason, polResult.message)
+		// Suspend an already-running sandbox (D30-gate pattern): set
+		// operatingMode to 0 so the sandbox pod is scaled down.
+		if err := r.suspendSandboxIfRunning(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
+	}
+	// Clean pass: set PolicyValid=True (R15 round 3: nothing ever set it
+	// True before, so a fixed path left the old False condition forever).
+	if len(loop.Spec.PolicyRefs) > 0 {
+		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
 	}
 
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
@@ -634,24 +645,68 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// findNonCanonicalExecPath scans the Loop's referenced AgentPolicies for
-// non-canonical exec paths (defence in depth: the CRD CEL XValidation catches
-// the common case at admission; this catches anything that slips through).
-// Returns the first bad (policy, path) pair, or ("", "") if all are canonical.
+// suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it
+// is currently Running. Called when a Loop's AgentPolicy becomes invalid
+// (R15 round 3: an already-running sandbox must be suspended, not left
+// as-is). If the sandbox doesn't exist, this is a no-op.
+func (r *LoopReconciler) suspendSandboxIfRunning(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	sb := &sandboxv1beta1.Sandbox{}
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
+	if err := r.Get(ctx, key, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // no sandbox to suspend
+		}
+		return fmt.Errorf("get sandbox %s: %w", key, err)
+	}
+	if sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
+		return nil // already suspended
+	}
+	sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	if err := r.Update(ctx, sb); err != nil {
+		return fmt.Errorf("suspend sandbox %s: %w", key, err)
+	}
+	logf.FromContext(ctx).Info("suspended sandbox (policy invalid)", "sandbox", sandboxName(loop.Name), "loop", loop.Name)
+	return nil
+}
+
+// policyValidationResult is the outcome of validating a Loop's referenced
+// AgentPolicies before the sandbox is created or the eBPF engine is reached.
+type policyValidationResult struct {
+	// valid is true when all referenced policies exist and have canonical
+	// exec paths.
+	valid bool
+	// reason is the metav1.ConditionReason (NonCanonicalExecPath or
+	// PolicyNotFound) when valid is false.
+	reason string
+	// message is the human-readable explanation.
+	message string
+}
+
+// validateAgentPolicies scans the Loop's referenced AgentPolicies for
+// non-canonical exec paths and missing/unreadable policies.
+// R15 round 3: a missing or unreadable referenced policy is treated as
+// not-valid (PolicyNotFound), not ignored (fail-closed).
 // Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
-func (r *LoopReconciler) findNonCanonicalExecPath(ctx context.Context, loop *coxv1alpha1.Loop) (string, string) {
+func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
 	for _, name := range loop.Spec.PolicyRefs {
 		ap := &coxv1alpha1.AgentPolicy{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
-			continue
+			if apierrors.IsNotFound(err) {
+				return policyValidationResult{valid: false, reason: "PolicyNotFound",
+					message: fmt.Sprintf("AgentPolicy %s/%s not found (referenced by policyRefs)", loop.Namespace, name)}
+			}
+			// Unreadable (transient error): fail closed.
+			return policyValidationResult{valid: false, reason: "PolicyNotFound",
+				message: fmt.Sprintf("AgentPolicy %s/%s could not be read: %v", loop.Namespace, name, err)}
 		}
 		for _, e := range ap.Spec.Exec {
 			if isNonCanonicalPath(e) {
-				return ap.Name, e
+				return policyValidationResult{valid: false, reason: "NonCanonicalExecPath",
+					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
 			}
 		}
 	}
-	return "", ""
+	return policyValidationResult{valid: true}
 }
 
 // isNonCanonicalPath returns true if the path is non-canonical: it contains

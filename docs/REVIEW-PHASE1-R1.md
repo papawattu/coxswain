@@ -33,7 +33,10 @@ transition in the table breaks ADR-0005 — see D23.
 
 ### D23. `Verifying → Succeeded` is driven by the runner's report
 
-- [ ] Done
+- [x] Done (5f42363: the `Verifying` case is deleted from `nextPhase` — no path
+  returns `Succeeded` or `Failed`; the claim-driven path stops at `Verifying` and
+  every exit out of `Verifying` is evidence-gated by `verifyOutcome(job)` in B3.
+  Pure table + envtest updated red → green.)
 
 **Where:** `internal/controller/loop_controller.go` `nextPhase`
 (`case LoopPhaseVerifying: if reported == LoopPhaseSucceeded`);
@@ -104,7 +107,9 @@ claim so it isn't folklore.
 
 ### I22. `desiredPhase` is recorded but nothing writes `.coxswain/desired-phase` yet
 
-- [ ] Noted in plan
+- [x] Noted in plan (5f42363: field doc now says the `.coxswain/desired-phase`
+  copy "will be" implemented in the Phase 1 runner/exec wiring slice, not that
+  it is.)
 
 `LoopStatus.desiredPhase`'s doc says it "is also copied to
 `.coxswain/desired-phase` for the runner to read", but no code does that yet

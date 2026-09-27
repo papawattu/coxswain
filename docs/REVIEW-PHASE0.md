@@ -88,7 +88,9 @@ locally; CI workflows invoke the updated targets.
 
 ### I4. Phase 0 "done when" is inconsistent with what was delivered
 
-- [ ] Done
+- [x] Done (owner chose option (a): PLAN.md Phase 0 "done when" narrowed to
+  "operator creates + logs the Sandbox object"; runner-in-sandbox + agent-sandbox
+  controller moved to Phase 1. Commit 142a928.)
 
 **Where:** `docs/PLAN.md` (Phase 0), `docs/E2E-PHASE0.md`, `cmd/main.go`,
 `internal/controller/loop_controller.go`.
@@ -197,7 +199,8 @@ file names, RBAC markers, samples, docs.
 
 ### D5. Pin one Kubernetes version for dev + CI
 
-- [ ] Decided
+- [x] Decided (owner: pin dev/CI to k8s 1.34 — kind node image + envtest pinned
+  in the Makefile; production floor stays >=1.37. Commit 142a928.)
 
 Plan says dev = 1.32, the kind cluster ran 1.34, envtest uses 1.37,
 production needs ≥1.37 (agent-sandbox). Pick one for kind + envtest + CI and
@@ -205,7 +208,8 @@ update `CONTEXT.md` ("Version target") and `docs/PLAN.md`.
 
 ### D6. Mandatory checkpoints vs kind
 
-- [ ] Decided
+- [x] Decided (owner: Phase 3 snapshot e2e on kind + csi-hostpath-driver, not
+  the homelab Ceph cluster. Commit 142a928.)
 
 Checkpointing is mandatory (Phase 3), but kind has no VolumeSnapshot support
 by default. Plan for csi-hostpath-driver + snapshot CRDs in the kind setup, or

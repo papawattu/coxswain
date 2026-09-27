@@ -98,9 +98,11 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 
 		var got coxv1alpha1.Loop
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "loop-c6a-none"}, &got)).To(Succeed())
-		// With no policyRefs the operator records no effective policy (default-deny
-		// minimum); the hash must stay empty.
-		Expect(got.Status.Policy == nil || got.Status.Policy.EffectiveHash == "").To(BeTrue(),
-			"no policyRefs means no effective policy hash (default-deny minimum)")
+		// P1 #1 (R15): a no-policyRefs Loop runs the platform minimum, which is
+		// still translated/emitted/enforced — so the operator records its hash
+		// (the hash of the empty EffectivePolicy), not an empty hash.
+		Expect(got.Status.Policy).NotTo(BeNil(), "the platform minimum policy must be recorded")
+		Expect(got.Status.Policy.EffectiveHash).To(Equal(policy.EffectiveHash(policy.EffectivePolicy{})),
+			"no policyRefs means the platform-minimum effective policy (its hash is recorded)")
 	})
 })

@@ -97,8 +97,37 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// C6b (ADR-0007 Q3/D30): resolve the effective policy, apply it through the
+	// Enforcer (the gate has something behind it, P1 #2), and record the hash.
+	// The gate applies to EVERY Loop (no policyRefs = the platform minimum,
+	// still translated/emitted/enforced).
+	effective, err := r.effectivePolicy(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if r.Enforcer != nil {
+		if err := r.Enforcer.Apply(ctx, &loop, effective); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if loop.Status.Policy == nil {
+		loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+	}
+	if loop.Status.Policy.EffectiveHash != policy.EffectiveHash(effective) {
+		loop.Status.Policy.EffectiveHash = policy.EffectiveHash(effective)
+	}
+
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
+	}
+	// D30: record the PolicyEnforced condition (True when enforcing, False +
+	// reason otherwise) after the sandbox is ensured.
+	if enf, rs := r.enforcementStatus(ctx, &loop); enf {
+		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
+			"the eBPF engine is enforcing the Loop's effective policy")
+	} else {
+		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs,
+			"engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)")
 	}
 
 	// Combine the two status updates (observedGeneration + phase) into one so a
@@ -161,22 +190,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			changed = true
 		}
 	}
-	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
-	// union of the allows across every AgentPolicy the Loop references
-	// (spec.policyRefs[]). The operator computes the hash and stores it in
-	// status.policy.effectiveHash so the decision audit shows what the agent was
-	// allowed to do (D32); the hash is over the union, not stored allows.
-	if effectiveHash, found, err := r.effectivePolicyHash(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
-	} else if found {
-		if loop.Status.Policy == nil {
-			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
-		}
-		if loop.Status.Policy.EffectiveHash != effectiveHash {
-			loop.Status.Policy.EffectiveHash = effectiveHash
-			changed = true
-		}
-	}
 	if changed {
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
@@ -186,22 +199,15 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	return ctrl.Result{}, nil
 }
 
-// enforcementStatus (D30, ADR-0007) returns whether the D30 gate applies to the
-// Loop (only when it declares a user policy via spec.policyRefs), whether the
-// eBPF engine is enforcing that policy, and the reason when it is not. A
-// no-policyRefs Loop runs the default-deny minimum (enforced by the pod
-// hardening, C1) and is not gated on the engine, so the gate does not apply.
-// When the gate applies and the engine is unavailable (nil Enforcer) the
-// reason is EngineUnavailable (fail-closed: the agent never runs).
-func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha1.Loop) (gateApplies, enforced bool, reason string) {
-	if len(loop.Spec.PolicyRefs) == 0 {
-		return false, true, "" // no user policy -> not gated; runs the default-deny minimum
-	}
+// enforcementStatus (D30, ADR-0007) reports whether the eBPF engine is enforcing
+// the Loop's policy. The gate applies to EVERY Loop (no policyRefs = the
+// platform minimum, still enforced); with no Enforcer (engine not installed) it
+// reports EngineUnavailable, so the sandbox is held Suspended (fail-closed).
+func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha1.Loop) (enforced bool, reason string) {
 	if r.Enforcer == nil {
-		return true, false, engine.ReasonEngineUnavailable
+		return false, engine.ReasonEngineUnavailable
 	}
-	enf, rsn := r.Enforcer.Enforcing(ctx, loop)
-	return true, enf, rsn
+	return r.Enforcer.Enforcing(ctx, loop)
 }
 
 // PolicyEnforcedCondition is the non-phase condition type recording whether the
@@ -214,21 +220,24 @@ const PolicyEnforcedCondition = "PolicyEnforced"
 // was applied (false when policyRefs is empty — the default-deny minimum). A
 // referenced AgentPolicy that does not exist is an error (the operator must not
 // silently run an agent with a narrower policy than the Loop declared).
-func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
-	if len(loop.Spec.PolicyRefs) == 0 {
-		return "", false, nil
-	}
+// effectivePolicy resolves the Loop's effective policy: the union of the
+// referenced AgentPolicies, or the platform minimum (empty EffectivePolicy) when
+// there are no policyRefs (D30: the platform minimum is still translated,
+// emitted, and enforced — the gate applies to EVERY Loop). It errors if a
+// referenced AgentPolicy is missing (the operator must not silently run an
+// agent narrower than declared).
+func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.Loop) (policy.EffectivePolicy, error) {
 	union := policy.EffectivePolicy{}
 	for _, name := range loop.Spec.PolicyRefs {
 		var ap coxv1alpha1.AgentPolicy
 		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
-			return "", false, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+			return policy.EffectivePolicy{}, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
 		}
 		union.Exec = append(union.Exec, ap.Spec.Exec...)
 		union.Network = append(union.Network, ap.Spec.Network...)
 		union.Files = append(union.Files, ap.Spec.Files...)
 	}
-	return policy.EffectiveHash(union), true, nil
+	return union, nil
 }
 
 // ensureSandbox creates the Loop's Sandbox if it does not already exist, and
@@ -245,22 +254,6 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
 	log := logf.FromContext(ctx)
-
-	// D30 (ADR-0007): the agent only runs (OperatingMode Running) on positive
-	// evidence the eBPF engine is enforcing the Loop's policy. The gate applies
-	// when the Loop declares a user policy (policyRefs set); a no-policyRefs
-	// Loop runs the default-deny minimum (enforced by the pod hardening, C1) and
-	// is not gated on the engine. When the gate applies and the engine is not
-	// enforcing, the sandbox is held Suspended and PolicyEnforced=False is
-	// recorded (fail-closed; the Loop is never failed).
-	gateApplies, enforced, reason := r.enforcementStatus(ctx, loop)
-	if gateApplies {
-		if enforced {
-			setCondition(loop, PolicyEnforcedCondition, metav1.ConditionTrue, "Enforcing", "the eBPF engine is enforcing the Loop's policy")
-		} else {
-			setCondition(loop, PolicyEnforcedCondition, metav1.ConditionFalse, reason, "the eBPF engine is not enforcing the Loop's policy; the sandbox is held Suspended (D30 fail-closed)")
-		}
-	}
 
 	desired := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
@@ -290,14 +283,19 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		falseP := false
 		trueP := true
 		readOnlyRootfs := true
-		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
-		// (S1). Running is the default for a normal Loop. The D30 gate also
-		// holds it Suspended when a declared policy is not enforced.
-		if loop.Spec.Suspend || (gateApplies && !enforced) {
+		// D30 (P1 #1): the gate applies to EVERY Loop — no policyRefs means the
+		// platform-minimum policy, still translated/emitted/enforced. Without an
+		// enforcing engine the sandbox is held Suspended (fail-closed).
+		enforced, _ := r.enforcementStatus(ctx, loop)
+		if loop.Spec.Suspend || !enforced {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
+		// P1 #2: the sandbox pod carries the coxswain.io/loop label the
+		// KubeArmorPolicy selector targets (the emitter asserts the selector
+		// matches this label).
+		desired.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{"coxswain.io/loop": loop.Name}
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
 		// C2 (P2): never share the process namespace. The proxy and agent run as
 		// different UIDs, but a shared PID namespace would let the (untrusted) agent

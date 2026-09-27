@@ -39,22 +39,23 @@ type KubeArmorPolicy struct {
 	OwnerLoop string
 	// Selector is the pod label match (KubeArmor matches pods, not containers).
 	Selector map[string]string
-	// Action is the base action: "Allow" for the emitted allows. KubeArmor's
-	// base action for the policy is the platform minimum; each rule adds an Allow.
+	// Action is the base action: "Allow" for the emitted allows.
 	Action string
-	// Syscalls carries the allowed exec paths/syscalls.
-	Syscalls *KubeArmorSyscalls
+	// Process carries the allowed exec paths (the command allowlist, ADR-0007
+	// Q3). Exec allowlisting is process.matchPaths with action: Allow; the
+	// syscalls block has no action and is monitoring-only, so it is not used.
+	Process *KubeArmorProcess
 	// Network carries the allowed egress.
 	Network *KubeArmorNetwork
 	// File carries the allowed file paths.
 	File *KubeArmorFile
 }
 
-// KubeArmorSyscalls is the syscalls block of a KubeArmorPolicy.
-type KubeArmorSyscalls struct {
+// KubeArmorProcess is the process block of a KubeArmorPolicy (exec allows).
+type KubeArmorProcess struct {
 	Action        string   `json:"action"`
 	MatchPaths    []string `json:"matchPaths,omitempty"`
-	MatchSyscalls []string `json:"matchSyscalls,omitempty"`
+	MatchPatterns []string `json:"matchPatterns,omitempty"`
 }
 
 // KubeArmorNetwork is the network block of a KubeArmorPolicy. KubeArmor matches
@@ -112,7 +113,7 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *Ku
 	dedupeSorted(&filePaths)
 
 	if len(execPaths) > 0 {
-		kap.Syscalls = &KubeArmorSyscalls{Action: kaptAllowAction, MatchPaths: execPaths}
+		kap.Process = &KubeArmorProcess{Action: kaptAllowAction, MatchPaths: execPaths}
 	}
 	if len(dnsQueries) > 0 {
 		kap.Network = &KubeArmorNetwork{Action: kaptAllowAction, MatchDNSQueries: dnsQueries}

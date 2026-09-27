@@ -38,11 +38,11 @@ func TestEmitKubeArmorPolicySelectorAndRules(t *testing.T) {
 	}
 
 	// exec -> syscalls.matchPaths (git, go).
-	if kap.Syscalls == nil {
+	if kap.Process == nil {
 		t.Fatalf("exec allows must produce a syscalls block")
 	}
-	if !slices.Contains(kap.Syscalls.MatchPaths, "git") || !slices.Contains(kap.Syscalls.MatchPaths, "go") {
-		t.Fatalf("syscalls.matchPaths must include git and go, got %v", kap.Syscalls.MatchPaths)
+	if !slices.Contains(kap.Process.MatchPaths, "git") || !slices.Contains(kap.Process.MatchPaths, "go") {
+		t.Fatalf("process.matchPaths must include git and go, got %v", kap.Process.MatchPaths)
 	}
 
 	// network -> network.matchDNSQueries, with the :port stripped (D29 model:
@@ -75,7 +75,7 @@ func TestEmitKubeArmorPolicyUnionsContainers(t *testing.T) {
 	// platform minimum localhost is on the agent, the model endpoint on the
 	// proxy). The union must include both the user's exec and network.
 	kap := EmitKubeArmorPolicy("l", "n", ep)
-	if !slices.Contains(kap.Syscalls.MatchPaths, "git") {
+	if !slices.Contains(kap.Process.MatchPaths, "git") {
 		t.Fatalf("union must include the agent's exec allow git")
 	}
 	if !slices.Contains(kap.Network.MatchDNSQueries, "api.example.com") {
@@ -94,8 +94,8 @@ func TestEmitKubeArmorPolicyDefaultDeny(t *testing.T) {
 	ep := policy.Translate(policy.EffectivePolicy{})
 	kap := EmitKubeArmorPolicy("l", "n", ep)
 	// exec: none (the platform minimum has no user exec allows).
-	if kap.Syscalls != nil {
-		t.Fatalf("default-deny must produce no sysallows block (no user exec), got %v", kap.Syscalls)
+	if kap.Process != nil {
+		t.Fatalf("default-deny must produce no process block (no user exec), got %v", kap.Process)
 	}
 	// network: only the platform minimum (localhost + the model endpoint), NOT a
 	// user allow. The emitter emits a network block only if there are network
@@ -107,4 +107,23 @@ func TestEmitKubeArmorPolicyDefaultDeny(t *testing.T) {
 	if slices.Contains(kap.Network.MatchDNSQueries, "api.example.com") {
 		t.Fatalf("default-deny must not carry a user network allow, got %v", kap.Network.MatchDNSQueries)
 	}
+}
+
+func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
+	// P1 (R15): exec allows must be emitted under process.matchPaths with
+	// action: Allow, NOT syscalls (which has no action and is monitoring-only).
+	ep := policy.Translate(policy.EffectivePolicy{Exec: []string{"/usr/bin/git", "go"}})
+	kap := EmitKubeArmorPolicy("l", "n", ep)
+	if kap.Process == nil {
+		t.Fatalf("exec allows must produce a process block (got nil)")
+	}
+	if kap.Process.Action != "Allow" {
+		t.Fatalf("process.action must be Allow, got %q", kap.Process.Action)
+	}
+	if !slices.Contains(kap.Process.MatchPaths, "/usr/bin/git") || !slices.Contains(kap.Process.MatchPaths, "go") {
+		t.Fatalf("process.matchPaths must include the exec allows, got %v", kap.Process.MatchPaths)
+	}
+	// The syscalls block (monitoring-only, no action) must NOT be used for exec
+	// allows. The KubeArmorPolicy struct no longer has a Syscalls field; exec is
+	// the Process block only.
 }

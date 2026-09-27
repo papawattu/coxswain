@@ -38,6 +38,7 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/controller"
+	"github.com/papawattu/coxswain/internal/engine"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -185,8 +186,9 @@ func main() {
 	}
 
 	if err := (&controller.LoopReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Enforcer: &engine.KubeArmorEnforcer{Client: mgr.GetClient()},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")
 		os.Exit(1)

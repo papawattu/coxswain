@@ -51,9 +51,9 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		r   *LoopReconciler
 	)
 
-	buildLoop := func(name, ns string, policyRefs ...string) *coxv1alpha1.Loop {
+	buildLoop := func(ns string, policyRefs ...string) *coxv1alpha1.Loop {
 		return &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: "l1", Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:       "g",
 				Workspace:  coxv1alpha1.Workspace{Repo: "https://example.com/x.git"},
@@ -88,7 +88,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 		createPolicy(ns)
-		Expect(k8sClient.Create(ctx, buildLoop("l1", ns, "p1"))).To(Succeed())
+		Expect(k8sClient.Create(ctx, buildLoop(ns, "p1"))).To(Succeed())
 
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
 		Expect(err).NotTo(HaveOccurred()) // fail-closed waits, never errors / never fails the Loop
@@ -113,7 +113,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 		createPolicy(ns)
-		Expect(k8sClient.Create(ctx, buildLoop("l1", ns, "p1"))).To(Succeed())
+		Expect(k8sClient.Create(ctx, buildLoop(ns, "p1"))).To(Succeed())
 
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
 		Expect(err).NotTo(HaveOccurred())
@@ -127,22 +127,56 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 	})
 
-	It("does not gate a no-policyRefs Loop (runs the default-deny minimum)", func() {
+	It("gates a no-policyRefs Loop too (P1 #1: the gate applies to EVERY Loop)", func() {
 		ctx = context.Background()
 		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()} // no Enforcer
 
 		ns := "c6b-nogate"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
-		Expect(k8sClient.Create(ctx, buildLoop("l1", ns))).To(Succeed())
+		Expect(k8sClient.Create(ctx, buildLoop(ns))).To(Succeed())
 
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
 		Expect(err).NotTo(HaveOccurred())
 
+		// P1 #1: a no-policyRefs Loop runs the platform minimum, still gated on the
+		// engine. With no Enforcer (engine not installed) it is held Suspended +
+		// PolicyEnforced=False (fail-closed), never Running unenforced.
 		Eventually(func() bool {
-			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeRunning
-		}, "10s").Should(BeTrue(), "a no-policyRefs Loop runs the default-deny minimum and is not gated on the engine")
+			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeSuspended
+		}, "10s").Should(BeTrue(), "a no-policyRefs Loop with no engine must be held Suspended (P1 #1)")
+		loop := getLoop(ns, "l1")
+		c := conditionByType(loop.Status.Conditions, "PolicyEnforced")
+		Expect(c).NotTo(BeNil(), "the PolicyEnforced condition must exist")
+		Expect(string(c.Status)).To(Equal("False"), "no engine -> PolicyEnforced=False (fail-closed)")
+		Expect(c.Reason).To(Equal("EngineUnavailable"), "no Enforcer -> reason EngineUnavailable")
+		Expect(string(loop.Status.Phase)).NotTo(Equal(string(coxv1alpha1.LoopPhaseFailed)), "the Loop is never failed by the gate")
 	})
+	It("applies the effective policy via Enforcer.Apply and labels the pod (P1 #2)", func() {
+		ctx = context.Background()
+		rec := &recordingEnforcer{}
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: rec}
+
+		ns := "c6b-apply"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		createPolicy(ns)
+		Expect(k8sClient.Create(ctx, buildLoop(ns, "p1"))).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// P1 #2: the operator must call Enforcer.Apply with the effective policy.
+		Expect(rec.applied).NotTo(BeEmpty(), "the operator must call Enforcer.Apply with the effective policy")
+
+		// P1 #2: the sandbox pod template must carry the coxswain.io/loop label the
+		// KubeArmorPolicy selector targets.
+		sbx := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: "l1-sandbox"}, sbx)).To(Succeed())
+		Expect(sbx.Spec.PodTemplate.ObjectMeta.Labels).To(HaveKeyWithValue("coxswain.io/loop", "l1"),
+			"the sandbox pod template must carry the coxswain.io/loop label the KubeArmorPolicy selects on")
+	})
+
 })
 
 // conditionByType finds a condition by type.
@@ -153,4 +187,18 @@ func conditionByType(conds []metav1.Condition, t string) *metav1.Condition {
 		}
 	}
 	return nil
+}
+
+// recordingEnforcer records the Apply calls so the test can assert the operator
+// applies the effective policy (P1 #2: the gate must have something behind it).
+type recordingEnforcer struct {
+	applied []policy.EffectivePolicy
+}
+
+func (f *recordingEnforcer) Apply(_ context.Context, _ *coxv1alpha1.Loop, p policy.EffectivePolicy) error {
+	f.applied = append(f.applied, p)
+	return nil
+}
+func (f *recordingEnforcer) Enforcing(_ context.Context, _ *coxv1alpha1.Loop) (bool, string) {
+	return true, ""
 }

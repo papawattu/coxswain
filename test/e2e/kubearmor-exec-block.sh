@@ -47,10 +47,40 @@ NAMESPACE=default
 LOOP=execblock
 AGENT_POLICY=allow-go
 ALLOWED_BINARY=go          # in the AgentPolicy exec allow
-DISALLOWED_BINARY=curl     # NOT in the allow -> must be blocked
-# C6a (PR #7) validates AgentPolicy.exec entries as absolute paths outside the
-# writable mounts; point at the real binary, not the bare name.
 ALLOWED_BINARY_PATH=/usr/local/go/bin/go
+DISALLOWED_BINARY=curl     # NOT in the allow -> must be blocked
+DISALLOWED_BINARY_PATH=/usr/bin/curl
+# Spoof case (P1 R16): the policy ALSO allows cp so the test can plant a
+# copy of curl at a path NOT in the allow list; running the copy must be
+# denied (a path-only exec item matches the absolute path, not the basename).
+SPOOF_BINARY_PATH=/usr/bin/cp
+SPOOF_TARGET_PATH=/tmp/go
+# C6a (PR #7) validates AgentPolicy.exec entries as absolute paths outside the
+# writable mounts; point at the real binaries, not bare names.
+
+# assert-blocked: exec PATH in the agent container and require BOTH a non-zero
+# exit AND "permission denied" on stderr. A bare non-zero rc is NOT proof of a
+# block: a missing binary, a wrong container name, or a restarting pod would
+# also fail the exec (P2). The real BPF-LSM block prints "exec <path>:
+# permission denied" (rc 255 from kubectl). Usage: assert-blocked POD PATH...
+assert_blocked() {
+  pod=$1; shift
+  local out rc
+  out=$($KUBECTL exec "$pod" -n "$NAMESPACE" -c agent -- "$@" 2>&1)
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    echo "   FAIL: exec $* RAN (exit 0) — KubeArmor is NOT enforcing the policy"
+    return 1
+  fi
+  if ! grep -qi 'permission denied' <<<"$out"; then
+    echo "   FAIL: exec $* failed (exit $rc) but WITHOUT 'permission denied' — this is not a BPF-LSM block"
+    echo "   (a missing binary, wrong container, or a restarting pod also fails the exec;"
+    echo "    the block must look like 'exec <path>: permission denied')"
+    echo "   stderr was: $out"
+    return 1
+  fi
+  return 0
+}
 
 # The KubeArmor CLI (karmor) is the installer. Download it pinned if not present.
 KARMOR_VERSION="${KARMOR_VERSION:-1.4.9}"
@@ -89,7 +119,7 @@ if [ "$FILE_POSTURE" != "block" ]; then
 fi
 echo "   defaultFilePosture=block (exec allowlist will actually block)"
 
-echo "==> creating AgentPolicy ${AGENT_POLICY} (exec: [${ALLOWED_BINARY}]) + Loop ${LOOP}"
+echo "==> creating AgentPolicy ${AGENT_POLICY} (exec: [${ALLOWED_BINARY_PATH}, ${SPOOF_BINARY_PATH}]) + Loop ${LOOP}"
 $KUBECTL apply -f - <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: AgentPolicy
@@ -99,6 +129,7 @@ metadata:
 spec:
   exec:
     - ${ALLOWED_BINARY_PATH}
+    - ${SPOOF_BINARY_PATH}
 ---
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
@@ -119,7 +150,7 @@ spec:
     maxIterations: 1
 EOF
 
-echo "==> waiting for the KubeArmorPolicy coxswain-${LOOP} (process.matchPaths execname ${ALLOWED_BINARY} + absolute path, action Block)"
+echo "==> waiting for the KubeArmorPolicy coxswain-${LOOP} (process.matchPaths path-only items + action Block)"
 for i in $(seq 1 30); do
   if $KUBECTL get kubearmorpolicy "coxswain-${LOOP}" -n "$NAMESPACE" >/dev/null 2>&1; then
     break
@@ -160,25 +191,31 @@ done
 [ -n "$POD" ] || { echo "recreated sandbox pod never became Ready"; exit 1; }
 echo "   fresh pod: $POD"
 
-echo "==> ALLOWED: exec ${ALLOWED_BINARY} in the agent (must succeed)"
-if $KUBECTL exec "$POD" -n "$NAMESPACE" -c agent -- "$ALLOWED_BINARY" version >/dev/null 2>&1; then
-  echo "   PASS: ${ALLOWED_BINARY} ran (allowed by policy)"
+echo "==> ALLOWED: exec ${ALLOWED_BINARY_PATH} in the agent (must succeed)"
+if $KUBECTL exec "$POD" -n "$NAMESPACE" -c agent -- "${ALLOWED_BINARY_PATH}" version >/dev/null 2>&1; then
+  echo "   PASS: ${ALLOWED_BINARY_PATH} ran (allowed by policy)"
 else
-  echo "   FAIL: ${ALLOWED_BINARY} did NOT run (should be allowed)"; exit 1
+  echo "   FAIL: ${ALLOWED_BINARY_PATH} did NOT run (should be allowed)"; exit 1
 fi
 
-echo "==> DISALLOWED: exec ${DISALLOWED_BINARY} in the agent (must be BLOCKED)"
-set +e
-$KUBECTL exec "$POD" -n "$NAMESPACE" -c agent -- "$DISALLOWED_BINARY" --version >/dev/null 2>&1
-disallowed_rc=$?
-set -e
-if [ "$disallowed_rc" -ne 0 ]; then
-  echo "   PASS: ${DISALLOWED_BINARY} was BLOCKED (exit ${disallowed_rc}) — enforcement is active"
-else
-  echo "   FAIL: ${DISALLOWED_BINARY} RAN (exit 0) — KubeArmor is NOT enforcing the policy in this environment"
-  echo "   (the policy is accepted + loaded on the pod, but BPF-LSM process enforcement did not block the exec)"
-  exit 1
+echo "==> DISALLOWED: exec ${DISALLOWED_BINARY_PATH} in the agent (must be BLOCKED with permission denied)"
+assert_blocked "$POD" "${DISALLOWED_BINARY_PATH}" --version \
+  && echo "   PASS: ${DISALLOWED_BINARY_PATH} was BLOCKED (permission denied) — enforcement is active" \
+  || exit 1
+
+echo "==> SPOOF: plant a copy of curl at ${SPOOF_TARGET_PATH} via the allowed ${SPOOF_BINARY_PATH}, then run it (must be BLOCKED)"
+# Plant the copy as root (kubectl exec -c agent runs as root; the in-sandbox
+# agent process is non-root per I34 and cannot write to root-owned /tmp).
+if ! $KUBECTL exec "$POD" -n "$NAMESPACE" -c agent -- "${SPOOF_BINARY_PATH}" "${DISALLOWED_BINARY_PATH}" "${SPOOF_TARGET_PATH}" >/dev/null 2>&1; then
+  echo "   FAIL: ${SPOOF_BINARY_PATH} (an allowed binary) could not run as root — the allowed exec is broken, the spoof case is invalid"; exit 1
 fi
+if ! $KUBECTL exec "$POD" -n "$NAMESPACE" -c agent -- "${ALLOWED_BINARY_PATH}" version >/dev/null 2>&1; then
+  echo "   FAIL: spoof target check (go version) failed — the agent cannot run allowed execs anymore (setup broken)"; exit 1
+fi
+echo "   planted ${SPOOF_TARGET_PATH} (a copy of ${DISALLOWED_BINARY_PATH} in a writable dir, root-owned)"
+assert_blocked "$POD" "${SPOOF_TARGET_PATH}" --version \
+  && echo "   PASS: ${SPOOF_TARGET_PATH} was BLOCKED (permission denied) — a same-named binary in a writable dir does NOT satisfy the allow (path-only items match the absolute path, not the basename)" \
+  || exit 1
 
 echo "==> cleanup"
 $KUBECTL delete loop "$LOOP" -n "$NAMESPACE" >/dev/null 2>&1 || true

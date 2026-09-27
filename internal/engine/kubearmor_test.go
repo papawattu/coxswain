@@ -44,11 +44,14 @@ func TestEmitKubeArmorPolicyShape(t *testing.T) {
 	}
 }
 
-// P1 #3: exec allows are emitted under process.matchPaths (objects with
-// execname + path), action Allow — NOT syscalls.
-// P1 #4 (R15): the path is an ABSOLUTE location for the real binary (with the
-// basename as execname), NOT the spoofable /**/<name> form — a same-named binary
-// in a writable dir must not satisfy the allow.
+// P1 #3: exec allows are emitted under process.matchPaths (path-only objects),
+// action Allow — NOT syscalls.
+// P1 (R16): the item carries ONLY the ABSOLUTE path for the real binary — no
+// execname key at all. KubeArmor v1.7.5's BPF-LSM keys the process rule on the
+// exec'd file's dentry name when the item sets execname and IGNORES path, so
+// execname+path matches any file named <basename> anywhere (the same spoof hole
+// as /**/<name>). A path-only item matches the exec's absolute path, so a
+// spoofed copy (e.g. /tmp/go) is denied.
 func TestEmitKubeArmorPolicyExecPathIsAbsoluteNotSpoofable(t *testing.T) {
 	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
 		Exec: []string{"go"},
@@ -67,9 +70,10 @@ func TestEmitKubeArmorPolicyExecPathIsAbsoluteNotSpoofable(t *testing.T) {
 	if first["path"] != "/usr/local/go/bin/go" {
 		t.Errorf("exec allow %q must be emitted as the absolute path /usr/local/go/bin/go (not the spoofable /**/go), got %q", "go", first["path"])
 	}
-	// execname carries the basename KubeArmor's BPF matches on.
-	if first["execname"] != "go" {
-		t.Errorf("exec allow %q must set execname to the basename go, got %q", "go", first["execname"])
+	// No execname key: with execname set, v1.7.5's rule key is the execname and
+	// path is ignored, so any file named "go" anywhere would satisfy the allow.
+	if _, has := first["execname"]; has {
+		t.Errorf("exec allow item must NOT set execname (it overrides path in v1.7.5's BPF-LSM rule keying and re-opens the spoof hole), got %q", first["execname"])
 	}
 }
 
@@ -99,9 +103,12 @@ func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 	items, _ := proc["matchPaths"].([]any)
 	paths := make([]string, 0, len(items))
 	for _, it := range items {
-		// P1 #2: items are objects, not strings. P1 #4: each has execname + abs path.
+		// P1 #2: items are objects, not strings. P1 (R16): path-only items.
 		m := it.(map[string]any)
 		paths = append(paths, m["path"].(string))
+		if _, has := m["execname"]; has {
+			t.Fatalf("process.matchPaths item %v must not carry execname (it overrides path in v1.7.5's rule keying)", m)
+		}
 	}
 	// Absolute paths for the real binaries (not /**/git, /**/go).
 	if !slices.Contains(paths, "/usr/bin/git") || !slices.Contains(paths, "/usr/local/go/bin/go") {

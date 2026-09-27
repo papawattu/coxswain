@@ -232,8 +232,9 @@ operated. They amend the Q3 install story, not the ADR's decisions.
   `defaultFilePosture: audit`, so a disallowed exec is *evaluated and logged*
   ("Armored Up" + an audit alert) but **allowed**. Implication: the posture
   must be `block` (plus `process` visibility) **before the node agent first
-  starts** — hence `make kind-up` passes `-b all -viz process,file,network`
-  to `karmor install` rather than editing the config afterwards.
+  starts** — hence `make kind-up` passes `-b all --viz process,file,network`
+  to `karmor install` rather than editing the config afterwards (karmor v1.4.9
+  rejects the `-viz` shorthand; only `-b`/`-a`/`-i` have shorthands).
 - **F2 — a KubeArmor agent stop/restart can wedge the node's BPF subsystem
   (kernel 6.1).** Observed: an agent process exiting through SIGKILL hung in
   D state at `bpf_trampoline_unlink_prog → unregister_ftrace_direct_multi →

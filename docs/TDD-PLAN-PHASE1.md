@@ -245,10 +245,15 @@ in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
     `visibility: process,file,network,capabilities`, then restarts the KubeArmor
     DaemonSet so the live BPF map flips; the e2e asserts `defaultFilePosture=block`
     up front so a misconfigured env fails with a clear posture message. (2)
-    **`/**/<name>` spoofing** — each `process.matchPaths` item now carries
-    `{execname: <basename>, path: <absolute location for the real binary>}`
-    (go → `/usr/local/go/bin/go` via a `defaultExecPaths` map), so a same-named
-    binary in a writable dir does not satisfy the allow. (3) **base-manifest
+    **`/**/<name>` spoofing** — each `process.matchPaths` item carries ONLY
+    `{path: <absolute location for the real binary>}` (go →
+    `/usr/local/go/bin/go` via a `defaultExecPaths` map), so a same-named
+    binary in a writable dir does not satisfy the allow. (R16 correction:
+    the item must NOT also set `execname` — v1.7.5's BPF-LSM keys the process
+    rule on the exec'd file's dentry name when execname is present and IGNORES
+    path, so `execname`+`path` is exactly as spoofable as `/**/<name>`;
+    reproduced on coxswain-dev: an `execname`+`path` item allowed a copied
+    `/tmp/go`, the path-only item denied it.) (3) **base-manifest
     flag** — `--allow-unenforced` removed from `config/manager/manager.yaml` (so
     `make deploy` / `dist/install.yaml` ship fail-closed); added
     `config/manager/allow-unenforced.yaml` as a dev/kind overlay that `make deploy`

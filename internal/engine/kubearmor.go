@@ -60,15 +60,16 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 	network = dedupe(network)
 	files = dedupe(files)
 
-	// exec allows -> process.matchPaths items. Each item carries:
-	//   - execname: the binary basename (KubeArmor's BPF-LSM matches the exec
-	//     on the binary name; the CRD requires it to have no slashes).
-	//   - path: an ABSOLUTE path pattern for the real binary. The spoofable
-	//     form "/**/<name>" matched the basename at ANY depth, so an agent could
-	//     drop a binary named "go" into a writable dir (e.g. /workspace/go) and
-	//     it would match — the R15 P1 spoofing finding. An absolute path pins the
-	//     match to the real location so a same-named binary elsewhere does not
-	//     satisfy the allow.
+	// exec allows -> process.matchPaths items ({path}). Each item carries ONLY
+	// path: an ABSOLUTE path pattern for the real binary. KubeArmor v1.7.5's
+	// BPF-LSM keys the process rule on the exec'd file's dentry name when the
+	// item sets execname, and IGNORES path (enforcer/bpflsm/rulesHandling.go:
+	// the rule key is execname if present, else path) — so an execname (or the
+	// old /**/<name> form) matches any file with that name at ANY depth, and a
+	// same-named binary dropped into a writable dir (e.g. /tmp/go) would
+	// satisfy the allow. Path-only items match the exec's absolute path, so a
+	// spoofed copy elsewhere is denied (reproduced: path-only item blocks
+	// /tmp/go with permission denied, execname+path item allows it).
 	spec := map[string]any{
 		// Default-deny posture: KubeArmor's spec.action defaults to Audit (log
 		// only, nothing blocked). Set it to Block so disallows are enforced; the
@@ -78,15 +79,15 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 			"matchLabels": map[string]any{"coxswain.io/loop": loopName},
 		},
 	}
-	// exec allows -> process.matchPaths items ({execname, path}), action Allow.
+	// exec allows -> process.matchPaths items ({path} ONLY), action Allow.
 	// P1 #3: process (NOT syscalls, which is monitoring-only and has no action).
-	// P1 #4 (R15): absolute-path + execname (not the spoofable /**/basename).
+	// P1 (R16): path-only — execname overrides path in v1.7.5's BPF-LSM rule
+	// keying, so an execname+path item is exactly as spoofable as /**/<name>.
 	if len(exec) > 0 {
 		items := make([]any, 0, len(exec))
 		for _, e := range exec {
 			items = append(items, map[string]any{
-				"execname": execBaseName(e),
-				"path":     execAbsPath(e),
+				"path": execAbsPath(e),
 			})
 		}
 		spec["process"] = map[string]any{
@@ -134,21 +135,16 @@ func toPathItems(paths []string) []any {
 	return out
 }
 
-// execBaseName returns the basename of an exec allow ("/usr/bin/go" -> "go").
-// KubeArmor's process.matchPaths[].execname must match ^[^\\/]+$ (a name with no
-// slashes), so a user allow that is already a path is reduced to its basename.
-func execBaseName(e string) string {
-	if i := strings.LastIndexByte(e, '/'); i >= 0 {
-		return e[i+1:]
-	}
-	return e
-}
-
-// execAbsPath returns the absolute path pattern for an exec allow. A bare binary
-// name (e.g. "go") is resolved to its canonical location in the sandbox image so
-// the match is pinned to the real binary and a same-named binary a writable dir
-// (e.g. /workspace/go) does NOT satisfy the allow (the R15 P1 spoofing fix). An
-// allow that already carries a path is used as-is.
+// execAbsPath returns the absolute path pattern for an exec allow. A bare
+// binary name (e.g. "go") is resolved to its canonical location in the sandbox
+// image so the match is pinned to the real binary and a same-named binary in a
+// writable dir (e.g. /workspace/go) does NOT satisfy the allow (the R15 P1
+// spoofing fix). An allow that already carries a path is used as-is.
+//
+// The name table is a STOPGAP for legacy bare-name allows: PR #7 (C6a) makes
+// AgentPolicy.exec take absolute paths validated at admission (rejecting bare
+// names), and once that lands this function only passes validated paths through
+// — the table should then be deleted, not extended.
 func execAbsPath(e string) string {
 	if strings.Contains(e, "/") {
 		return e
@@ -201,8 +197,11 @@ func toProtocolItems(protocols []string) []any {
 // matches egress by DNS query name + protocol — it CANNOT express a host:port
 // allow (the schema's matchProtocols items are protocol NAMES: tcp/udp, not
 // "tcp:443"). So a "host:443" allow becomes "host" + protocol "tcp": the port is
-// LOST — the allow widens to host:* (a PolicyTranslationLossy situation, tracked;
-// the fix is the NetworkPolicy carrying the port, not KubeArmor).
+// LOST — the allow widens to host:*, and KubeArmor alone cannot keep the
+// source rule's precision. That is the condition for the PolicyTranslationLossy
+// Loop status flag (D33 follow-up): whenever the effective policy carries a
+// host:PORT network allow, the operator must record it; the NetworkPolicy
+// (D34, post-C6) carries the host:port precision where KubeArmor cannot.
 func splitNetworkAllows(ends []string) (domains, protocols []string) {
 	for _, e := range ends {
 		host, port := splitHostPort(e)

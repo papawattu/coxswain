@@ -143,12 +143,14 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 			 -e 's/defaultCapabilitiesPosture:.*/defaultCapabilitiesPosture: block/' \
 			 -e 's/visibility:.*/visibility: process,file,network,capabilities/' \
 		| kubectl apply -f - \
-		&& KA_DS=$$(kubectl -n "$$KA_NS" get daemonset --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/{print "daemonset/"$$2; exit}') \
-		&& [ -n "$$KA_DS" ] \
-		&& echo "   KubeArmor agent DaemonSet in ns $$KA_NS: $$KA_DS" \
-		&& kubectl -n "$$KA_NS" rollout restart "$$KA_DS" \
-		&& kubectl -n "$$KA_NS" rollout status "$$KA_DS" --timeout=120s \
-		|| { echo "Could not restart the KubeArmor agent in ns $$KA_NS (posture may stay audit -> exec e2e will not block)"; exit 1; }
+		&& KA_AGENT=$$(kubectl get daemonset -A --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/ {print "$$1\t"$$2; exit}') \
+		&& [ -n "$$KA_AGENT" ] \
+		&& echo "   KubeArmor agent DaemonSet: $$KA_AGENT" \
+		&& KA_DNS=$$(echo "$$KA_AGENT" | cut -f1) && \
+		KA_DN=$$(echo "$$KA_AGENT" | cut -f2) && \
+		kubectl -n "$$KA_DNS" rollout restart "daemonset/$$KA_DN" \
+		&& kubectl -n "$$KA_DNS" rollout status "daemonset/$$KA_DN" --timeout=120s \
+		|| { echo "Could not restart the KubeArmor agent (posture may stay audit -> exec e2e will not block)"; exit 1; }
 
 .PHONY: kind-smoke
 kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True

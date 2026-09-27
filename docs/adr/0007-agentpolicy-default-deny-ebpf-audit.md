@@ -128,6 +128,72 @@ the module proxy — **nothing is open by default**.
 - The model proxy's own egress to the model endpoint is **platform
   infrastructure, allowed by the operator, not by the user's policy**.
 
+**Per-container egress is enforced by the eBPF layer, not the NetworkPolicy
+(D29, round 9).** A Kubernetes `NetworkPolicy` selects **pods**, not
+containers. The proxy container must reach the model endpoint, so a pod-scoped
+NetworkPolicy has to allow it for the **whole sandbox pod** — and the
+**agent** container then reaches it too, bypassing the proxy (and, if the
+endpoint needs no key — the homelab vLLM is the likely first target — the agent
+gets unmetered, unaudited model access). The **eBPF layer** is what enforces
+**per-container** egress; the NetworkPolicy is only the coarse outer fence
+(the union of both containers' allows). The engine policy scopes by
+**container** in the pod (KubeArmor can do this):
+- the **agent container's** policy allows network connects only to
+  `localhost` (the proxy) **plus the user's `AgentPolicy` allows** — nothing
+  else;
+- the **proxy container's** policy allows only the model endpoint.
+
+C5 gains a case: the evil agent calls the model endpoint **directly** (not
+through the proxy) → **blocked by eBPF**, recorded in the activity audit, and
+**absent from the proxy's metering**.
+
+**Fail closed when the engine isn't enforcing (D30, round 9).** If the eBPF
+engine isn't installed, isn't running on the node the sandbox lands on, lacks
+BPF-LSM there (e.g. a K3s node without it), or the translated policy was
+rejected, the agent would run **unrestricted** and nothing would say so
+(KubeArmor can fall back to AppArmor or audit-only depending on the node). The
+operator lets the sandbox run (`OperatingMode: Running` / the agent container
+started) **only once it has positive evidence that enforcement is active on
+*that node* for *that Loop's policy*** — e.g. the engine policy's status is
+applied **and** the node reports BPF-LSM enforcement. Otherwise it sets a
+**`PolicyEnforced=False` condition** with a reason — `EngineUnavailable` |
+`NodeNotEnforcing` | `PolicyRejected` — and the Loop **waits** (no terminal
+reason, consistent with Q5's "never fail the Loop"; *the owner may prefer a
+terminal reason — flag, don't pick*). Seam: envtest with the engine's status
+objects faked; e2e on kind with the engine removed → the sandbox **never
+runs**.
+
+## Learn mode (D31, round 9)
+
+Default-deny exec is hard to author by hand: real agents (Claude Code, pi,
+Codex) exec a lot (`node`, `bash`, `git`, toolchains, their own helpers), so a
+working per-agent-image policy is trial and error. Add a **learn mode**:
+
+- `AgentPolicy` (or the Loop) can request an **audit-only posture** — the
+  engine records instead of blocking;
+- a small tool (`kubectl cox policy suggest <loop>` later) turns the recorded
+  activity into a candidate `AgentPolicy` for a human to review;
+- **reference policies** per supported agent image ship under
+  `config/samples/policies/`.
+
+Learn mode must be **explicit**, **visible in status** (`PolicyEnforced=False`,
+reason `AuditOnly`), and **never the default**.
+
+## Which pods an `AgentPolicy` covers (D32, round 9)
+
+The user's `AgentPolicy` selects **the Loop's sandbox pod** (agent + proxy
+containers, per D29). It does **not** cover:
+
+- **Verify Job pods** (ADR-0005 D12) run the agent's committed code. They get a
+  **fixed, operator-owned *verify* policy** (checkout tools + the check
+  commands' toolchain, no egress) — **not** the user's `AgentPolicy`.
+- **Publish step / trusted sidecars** (C4) are **operator-owned, not
+  user-policed** — kept out of the agent container's policy selector.
+- **Policy changes mid-Loop** apply at the **next iteration boundary**, and each
+  `status.history[]` entry records the **effective policy's hash/generation**,
+  so the decision audit shows what the agent was allowed to do in each
+  iteration.
+
 ## Consequences
 
 - New CRD `AgentPolicy` (+ optional `ClusterAgentPolicy`) and a
@@ -137,13 +203,19 @@ the module proxy — **nothing is open by default**.
   kind-up`, version pinned once, like agent-sandbox), behind an internal
   interface.
 - `status` gains `policy.blockedCount` + a `PolicyBlocked` condition.
+- **`blockedCount` source (I32, round 9):** the operator derives it by
+  **consuming the engine's alert stream** (the KubeArmor relay) — a new runtime
+  dependency and a new **trust edge** (the operator reads engine alerts). C8's
+  seam names this mechanism; a **relay outage must show "count unknown", not
+  zero** (so a stuck Loop's cause is never masked as "nothing was blocked").
 - The README sample ships a minimal `AgentPolicy`. The C5 evil-agent test's
   expected failures are the **absence of allows**.
 - ADR-0006: gVisor opt-in (not default); open decision 2 resolved by Q6.
 - Plan slices: C3 = NetworkPolicy generated from `AgentPolicy`; new
   **C6** (AgentPolicy CRD + engine-policy translation), **C7** (activity-audit
   stream), **C8** (`PolicyBlocked` condition + counter); C5 extended with a
-  disallowed command and a disallowed host.
+  disallowed command and a disallowed host **and a direct model-endpoint call
+  (blocked by eBPF, per D29)**.
 - Production: the homelab K3s nodes must pass the same BPF-LSM/BTF host check
   before eBPF enforcement is relied on there.
 
@@ -151,7 +223,8 @@ the module proxy — **nothing is open by default**.
 
 - **ADR-0006's open decision 1** (first real agent to adapt) is still open and
   is *not* answered by Q1 (Q1 only fixes the agnostic layer). It is listed,
-  not picked.
+  not picked. **D31's reference policies should start with whichever agent the
+  owner picks** (I33, round 9).
 - Q2/Q3/Q4/Q6's *implementation choices* (namespaced `AgentPolicy` +
   `spec.policyRefs[]`; KubeArmor over Tetragon; JSON-lines envelope; two-layer
   egress) are the **reviewer's** recommendations and are overridable by the

@@ -113,15 +113,18 @@ pinned commit.
 - **C5** — *Evil-agent e2e (the isolation proof).* An "evil agent" image runs
 that tries, in order: read a mounted secret, reach the K8s API server,
 `curl` the internet, push to the git remote, **run a disallowed command
-(eBPF-blocked exec)**, and **connect to a disallowed host**. **Every attempt
-must be blocked**, and none may affect the Loop's evidence (the verify Job
-still sees the committed SHA; the Loop's phase/evidence are unchanged) — a
-blocked attempt does **not** fail or pause the Loop (ADR-0007 Q5: block-and-
-record), but **each block appears in the activity-audit stream** (Q4) and
-increments `status.policy.blockedCount`. Seam: e2e on kind — assert each
+(eBPF-blocked exec)**, **connect to a disallowed host**, and **call the model
+endpoint directly** (not through the proxy — D29: this must be blocked by
+**eBPF**, not the pod-level NetworkPolicy). **Every attempt must be blocked**,
+and none may affect the Loop's evidence (the verify Job still sees the
+committed SHA; the Loop's phase/evidence are unchanged) — a blocked attempt
+does **not** fail or pause the Loop (ADR-0007 Q5: block-and-record), but **each
+block appears in the activity-audit stream** (Q4), the direct-endpoint call is
+**absent from the proxy's metering** (D29), and each increments
+`status.policy.blockedCount`. Seam: e2e on kind — assert each
 attempt's exit/output shows denial, the Loop keeps running, and each block is
 in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
-- **C6** — *`AgentPolicy` CRD + engine-policy translation (ADR-0007 Q2/Q3).*
+- **C6** — *`AgentPolicy` CRD + engine-policy translation (ADR-0007 Q2/Q3/D29).*
 The new `AgentPolicy` CRD (group `coxswain.wattu.com`; default-deny, additive
 allows; union across policies; `spec.policyRefs[]` on the Loop; optional
 cluster-scoped `ClusterAgentPolicy`). The operator **translates** a Loop's
@@ -130,7 +133,11 @@ in BPF-LSM mode selecting the Loop's sandbox pod, owned by the Loop) behind an
 internal interface (swappable for Tetragon). Default-deny when no policy: the
 generated engine policy allows only the platform minimum. Seam: **envtest** —
 for a given set of allows, the generated `KubeArmorPolicy`/`NetworkPolicy`
-carries exactly those allows; with no policy, the default is deny.
+carries exactly those allows; with no policy, the default is deny. The engine
+policy is scoped **per-container** (D29): the agent container allows
+`localhost` + the policy's allows only; the proxy container allows only the
+model endpoint. The operator gates the sandbox on **positive evidence
+enforcement is active on the node** (`PolicyEnforced`, D30).
 - **C7** — *Activity-audit stream (ADR-0007 Q4).* Coxswain **emits** agent-
 activity audit as JSON lines on each trusted source's stdout with the common
 envelope `{time, loop, namespace, iteration, source, action, target, verdict,
@@ -392,8 +399,12 @@ sandbox → condition, D8) needs B1's condition/event infrastructure. C5 (the
 evil-agent e2e) is the slice that proves ADR-0006 + ADR-0007 and gates B3's
 evidence as meaningful.
 
-**Gate (REVIEW-PHASE1-R8):** no C3/C6/C7 code until the reviewer has reviewed
-ADR-0007. C1, C2, C4 (and C8, C5's non-policy parts) may proceed meanwhile.
+**Gate (REVIEW-PHASE1-R8/R9):** no C3/C6/C7 code until the reviewer has
+reviewed ADR-0007. C1, C2, C4 (and C8, C5's non-policy parts) may proceed
+meanwhile. D29 (per-container egress via eBPF) and D30 (fail-closed when the
+engine isn't enforcing) are **P1 ADR-0007 amendments that block C3/C6 code** —
+they must be folded in (done in round 9) before those slices build on the
+NetworkPolicy-only model.
 
 **Infra:** `make kind-up` gains a step to install the eBPF engine (version
 pinned once, like agent-sandbox) and a smoke that proves a disallowed `exec` is

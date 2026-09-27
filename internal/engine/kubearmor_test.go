@@ -44,11 +44,12 @@ func TestEmitKubeArmorPolicyShape(t *testing.T) {
 	}
 }
 
-// P1 #3: exec allows are emitted under process.matchPaths (objects {path}),
-// action Allow — NOT syscalls.
-// KubeArmor's process.matchPaths[].path requires an absolute-path pattern (^/+.*[^/]$), not a bare
-// binary name. The emitter must emit exec allows as */<binary> (match at any depth).
-func TestEmitKubeArmorPolicyExecPathIsAbsolutePattern(t *testing.T) {
+// P1 #3: exec allows are emitted under process.matchPaths (objects with
+// execname + path), action Allow — NOT syscalls.
+// P1 #4 (R15): the path is an ABSOLUTE location for the real binary (with the
+// basename as execname), NOT the spoofable /**/<name> form — a same-named binary
+// in a writable dir must not satisfy the allow.
+func TestEmitKubeArmorPolicyExecPathIsAbsoluteNotSpoofable(t *testing.T) {
 	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
 		Exec: []string{"go"},
 	}))
@@ -62,8 +63,13 @@ func TestEmitKubeArmorPolicyExecPathIsAbsolutePattern(t *testing.T) {
 		t.Fatal("no process.matchPaths")
 	}
 	first := items[0].(map[string]any)
-	if first["path"] != "/**/go" {
-		t.Errorf("exec allow %q must be emitted as the absolute pattern /**/go (KubeArmor requires a path), got %q", "go", first["path"])
+	// The path must be an absolute location for the real go binary, not /**/go.
+	if first["path"] != "/usr/local/go/bin/go" {
+		t.Errorf("exec allow %q must be emitted as the absolute path /usr/local/go/bin/go (not the spoofable /**/go), got %q", "go", first["path"])
+	}
+	// execname carries the basename KubeArmor's BPF matches on.
+	if first["execname"] != "go" {
+		t.Errorf("exec allow %q must set execname to the basename go, got %q", "go", first["execname"])
 	}
 }
 
@@ -93,12 +99,13 @@ func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 	items, _ := proc["matchPaths"].([]any)
 	paths := make([]string, 0, len(items))
 	for _, it := range items {
-		// P1 #2: items are objects {path: ...}, not strings.
+		// P1 #2: items are objects, not strings. P1 #4: each has execname + abs path.
 		m := it.(map[string]any)
 		paths = append(paths, m["path"].(string))
 	}
-	if !slices.Contains(paths, "/**/"+testExecGit) || !slices.Contains(paths, "/**/"+testExecGo) {
-		t.Fatalf("process.matchPaths must include /**/git and /**/go, got %v", paths)
+	// Absolute paths for the real binaries (not /**/git, /**/go).
+	if !slices.Contains(paths, "/usr/bin/git") || !slices.Contains(paths, "/usr/local/go/bin/go") {
+		t.Fatalf("process.matchPaths must include /usr/bin/git and /usr/local/go/bin/go, got %v", paths)
 	}
 	if _, has := spec["syscalls"]; has {
 		t.Fatal("syscalls must NOT be set (monitoring-only); exec allows live in process")
@@ -144,8 +151,8 @@ func TestEmitKubeArmorPolicyUnionsContainers(t *testing.T) {
 	for _, it := range items {
 		paths = append(paths, it.(map[string]any)["path"].(string))
 	}
-	if len(paths) != 1 || paths[0] != "/**/"+testExecGit {
-		t.Fatalf("union across containers must keep the agent's exec allow, got %v", paths)
+	if len(paths) != 1 || paths[0] != "/usr/bin/git" {
+		t.Fatalf("union across containers must keep the agent's exec allow (/usr/bin/git), got %v", paths)
 	}
 }
 

@@ -1,0 +1,29 @@
+# Dev/kind escape hatch (C6b, R15 P1): --allow-unenforced.
+#
+# This file is INTENTIONALLY NOT part of config/manager's kustomization and NOT
+# in config/default, so the base install (make deploy / dist/install.yaml)
+# does NOT ship it. Without the flag the D30 gate is fail-closed: the sandbox
+# is held Suspended until the eBPF engine reports positive enforcement
+# evidence (the I32 relay, not yet wired), and every Loop waits.
+#
+# For local kind dev (where the enforcement-evidence relay is not wired yet),
+# apply this overlay AFTER `make deploy` so Loops can run. They run with
+# PolicyEnforced=False reason EnforcementDisabled (loudly visible, never True).
+# Do NOT apply this to production.
+#
+#   make deploy IMG=<img>            # base install, fail-closed (no flag)
+#   kubectl apply -f config/manager/allow-unenforced.yaml   # dev only
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --allow-unenforced

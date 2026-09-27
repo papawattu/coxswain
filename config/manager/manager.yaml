@@ -63,12 +63,6 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
-          # WARNING (dev only): --allow-unenforced lets Loops run before the eBPF
-          # engine has positive enforcement evidence (the I32 relay, not yet
-          # wired). Loops run with PolicyEnforced=False reason EnforcementDisabled.
-          # REMOVE this flag in production — without it the D30 gate holds the
-          # sandbox Suspended until enforcement is proven (fail-closed).
-          - --allow-unenforced
         image: controller:latest
         name: manager
         ports:

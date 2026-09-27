@@ -10,13 +10,19 @@
 # Prerequisites (set up by `make kind-up` + the operator deploy):
 #   - a kind cluster (KIND_CLUSTER) with the agent-sandbox controller
 #   - KubeArmor installed (karmor install --tag v1.7.5)
+#   - KubeArmor's default posture set to block (defaultFilePosture: block +
+#     process in visibility). KubeArmor v1.7.5 gates the exec allowlist's
+#     block-vs-audit on defaultFilePosture (NOT spec.action); karmor install
+#     defaults it to audit, so a disallowed exec is logged but ALLOWED unless
+#     the posture is block. `make kind-up` sets this; if it is missing here the
+#     script fails with a clear posture message (not a confusing "curl ran").
 #   - the coxswain operator deployed with --allow-unenforced
 #
 # What it does:
 #   1. Create an AgentPolicy that allows ONLY the "go" binary (exec).
 #   2. Create a Loop referencing that policy.
 #   3. Wait for the operator to create the Sandbox + the KubeArmorPolicy
-#      (process.matchPaths = [{path: /**/go}], top-level action Block).
+#      (process.matchPaths = [{execname: go, path: /usr/local/go/bin/go}], top-level action Block).
 #   4. kubectl exec an ALLOWED binary (go) in the agent container -> must succeed.
 #   5. kubectl exec a DISALLOWED binary (curl) in the agent container -> must be
 #      blocked (non-zero exit / Permission denied).
@@ -62,6 +68,21 @@ echo "==> KubeArmor installed?"
 kubectl get pods -n kubearmor >/dev/null 2>&1 || { echo "KubeArmor not installed in $KIND_CLUSTER"; exit 1; }
 echo "   (karmor install --tag ${KUBEARMOR_VERSION} — pinned in make kind-up)"
 
+echo "==> KubeArmor default posture is block? (required for exec blocking)"
+# KubeArmor v1.7.5's BPF-LSM exec block/audit toggle is driven by defaultFilePosture
+# (not spec.action). karmor install defaults it to audit, so a disallowed exec is
+# logged but ALLOWED. This assertion turns a misconfigured env into a clear failure
+# rather than the confusing "curl ran" below.
+FILE_POSTURE=$(kubectl -n kubearmor get configmap kubearmor-config -o jsonpath='{.data.defaultFilePosture}' 2>/dev/null || true)
+if [ "$FILE_POSTURE" != "block" ]; then
+  echo "   FAIL: defaultFilePosture is '${FILE_POSTURE:-unset}', not 'block' — a disallowed exec would be logged but ALLOWED."
+  echo "   Run: kubectl -n kubearmor edit configmap kubearmor-config -> defaultFilePosture: block,"
+  echo "         visibility: process,file,network,capabilities, then 'kubectl -n kubearmor rollout restart daemonset/kubearmor'"
+  echo "   (make kind-up does this automatically)"
+  exit 1
+fi
+echo "   defaultFilePosture=block (exec allowlist will actually block)"
+
 echo "==> creating AgentPolicy ${AGENT_POLICY} (exec: [${ALLOWED_BINARY}]) + Loop ${LOOP}"
 kubectl apply -f - <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
@@ -92,7 +113,7 @@ spec:
     maxIterations: 1
 EOF
 
-echo "==> waiting for the KubeArmorPolicy coxswain-${LOOP} (process.matchPaths /**/${ALLOWED_BINARY}, action Block)"
+echo "==> waiting for the KubeArmorPolicy coxswain-${LOOP} (process.matchPaths execname ${ALLOWED_BINARY} + absolute path, action Block)"
 for i in $(seq 1 30); do
   if kubectl get kubearmorpolicy "coxswain-${LOOP}" -n "$NAMESPACE" >/dev/null 2>&1; then
     break

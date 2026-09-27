@@ -133,6 +133,17 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 	@bin/karmor install --tag $(KUBEARMOR_VERSION) || \
 		{ echo "KubeArmor install failed (needs --tag $(KUBEARMOR_VERSION), the v-prefix is mandatory for Docker Hub tags)"; exit 1; }
 	@echo "KubeArmor $(KUBEARMOR_VERSION) installed (BPF-LSM enforcer)."
+	@echo "Setting KubeArmor's default posture to block (BPF-LSM exec/whitelist enforcement)."
+	@echo "KubeArmor v1.7.5 gates the exec allowlist's block-vs-audit on defaultFilePosture (NOT spec.action); karmor install defaults it to audit, so a disallowed exec would be logged but allowed. Set it to block + enable process visibility so the operator's allowlist actually blocks." \
+		&& kubectl -n kubearmor get configmap kubearmor-config -o yaml \
+		| sed -e 's/defaultFilePosture:.*/defaultFilePosture: block/' \
+			 -e 's/defaultNetworkPosture:.*/defaultNetworkPosture: block/' \
+			 -e 's/defaultCapabilitiesPosture:.*/defaultCapabilitiesPosture: block/' \
+			 -e 's/visibility:.*/visibility: process,file,network,capabilities/' \
+		| kubectl apply -f - \
+		&& kubectl -n kubearmor rollout restart daemonset/kubearmor \
+		&& kubectl -n kubearmor rollout status daemonset/kubearmor --timeout=120s \
+		|| { echo "Could not set KubeArmor block posture (posture stays audit -> exec e2e will not block)"; exit 1; }
 
 .PHONY: kind-smoke
 kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True
@@ -237,10 +248,19 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
+# dev/kind escape hatch overlay (C6b, R15 P1): re-adds --allow-unenforced on top
+# of the base install. NOT part of dist/install.yaml (the production bundle is
+# fail-closed). Apply AFTER `make deploy`. See the file's header for detail.
+#   make deploy IMG=<img>            # base install, fail-closed (no flag)
+#   kubectl apply -f config/manager/allow-unenforced.yaml   # dev only
+
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+	# Dev/kind: apply the --allow-unenforced escape hatch (NOT in the base install).
+	# A production install must NOT apply this overlay.
+	"$(KUBECTL)" apply -f config/manager/allow-unenforced.yaml
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.

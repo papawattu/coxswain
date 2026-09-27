@@ -2,6 +2,7 @@ package engine
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/papawattu/coxswain/internal/policy"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -58,16 +59,16 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 	exec = dedupe(exec)
 	network = dedupe(network)
 	files = dedupe(files)
-	// KubeArmor's process.matchPaths[].path requires an absolute-path pattern
-	// (^/+.*[^/]$), not a bare binary name. A user allow like "go" is emitted as
-	// "/**/go" so it matches the binary at any depth (the agent's PATH). KubeArmor's
-	// path validation requires an absolute path (^/+.*[^/]$), so the leading slash is
-	// mandatory.
-	execPaths := make([]string, 0, len(exec))
-	for _, e := range exec {
-		execPaths = append(execPaths, "/**/"+e)
-	}
 
+	// exec allows -> process.matchPaths items. Each item carries:
+	//   - execname: the binary basename (KubeArmor's BPF-LSM matches the exec
+	//     on the binary name; the CRD requires it to have no slashes).
+	//   - path: an ABSOLUTE path pattern for the real binary. The spoofable
+	//     form "/**/<name>" matched the basename at ANY depth, so an agent could
+	//     drop a binary named "go" into a writable dir (e.g. /workspace/go) and
+	//     it would match — the R15 P1 spoofing finding. An absolute path pins the
+	//     match to the real location so a same-named binary elsewhere does not
+	//     satisfy the allow.
 	spec := map[string]any{
 		// Default-deny posture: KubeArmor's spec.action defaults to Audit (log
 		// only, nothing blocked). Set it to Block so disallows are enforced; the
@@ -77,12 +78,20 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 			"matchLabels": map[string]any{"coxswain.io/loop": loopName},
 		},
 	}
-	// exec allows → process.matchPaths items ({path}), action Allow.
+	// exec allows -> process.matchPaths items ({execname, path}), action Allow.
 	// P1 #3: process (NOT syscalls, which is monitoring-only and has no action).
+	// P1 #4 (R15): absolute-path + execname (not the spoofable /**/basename).
 	if len(exec) > 0 {
+		items := make([]any, 0, len(exec))
+		for _, e := range exec {
+			items = append(items, map[string]any{
+				"execname": execBaseName(e),
+				"path":     execAbsPath(e),
+			})
+		}
 		spec["process"] = map[string]any{
 			kaptActionKey: kaptAllowAction,
-			"matchPaths":  toPathItems(execPaths),
+			"matchPaths":  items,
 		}
 	}
 	// network allows → matchDNSQueries items ({domain}) + matchProtocols items
@@ -123,6 +132,47 @@ func toPathItems(paths []string) []any {
 		out[i] = map[string]any{"path": p}
 	}
 	return out
+}
+
+// execBaseName returns the basename of an exec allow ("/usr/bin/go" -> "go").
+// KubeArmor's process.matchPaths[].execname must match ^[^\\/]+$ (a name with no
+// slashes), so a user allow that is already a path is reduced to its basename.
+func execBaseName(e string) string {
+	if i := strings.LastIndexByte(e, '/'); i >= 0 {
+		return e[i+1:]
+	}
+	return e
+}
+
+// execAbsPath returns the absolute path pattern for an exec allow. A bare binary
+// name (e.g. "go") is resolved to its canonical location in the sandbox image so
+// the match is pinned to the real binary and a same-named binary a writable dir
+// (e.g. /workspace/go) does NOT satisfy the allow (the R15 P1 spoofing fix). An
+// allow that already carries a path is used as-is.
+func execAbsPath(e string) string {
+	if strings.Contains(e, "/") {
+		return e
+	}
+	if p, ok := defaultExecPaths[e]; ok {
+		return p
+	}
+	// Unknown binary: fall back to the conventional /usr/bin location. Still
+	// absolute, so a spoofed copy elsewhere does not match.
+	return "/usr/bin/" + e
+}
+
+// defaultExecPaths maps common binaries to their canonical location in the
+// default Go dev sandbox image (docker.io/library/golang:1.26). These are the
+// locations the exec allow actually needs to reach; the agent's PATH includes
+// them. If a future agent image differs, the allow should carry the full path.
+var defaultExecPaths = map[string]string{
+	"go":     "/usr/local/go/bin/go",
+	"git":    "/usr/bin/git",
+	"sh":     "/bin/sh",
+	"bash":   "/bin/bash",
+	"curl":   "/bin/curl",
+	"wget":   "/bin/wget",
+	"python": "/usr/bin/python",
 }
 
 // toDomainItems turns DNS names into KubeArmor matchDNSQueries items ({domain: s}).

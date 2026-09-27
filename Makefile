@@ -104,7 +104,7 @@ KUBEARMOR_VERSION ?= v1.7.5
 # These are passed to `karmor install` so the posture is in the KubeArmorConfig
 # BEFORE the node agent starts — see the finding below why it must NOT be a
 # post-install edit + agent restart.
-KUBEARMOR_POSTURE_FLAGS ?= -b all -viz process,file,network
+KUBEARMOR_POSTURE_FLAGS ?= -b all --viz process,file,network
 AGENT_SANDBOX_MANIFEST ?= https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)/sandbox.yaml
 # The controller image the release manifest references (pre-loaded into the
 # kind node so an offline host doesn't depend on the node reaching

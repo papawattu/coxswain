@@ -48,9 +48,15 @@ LOOP=execblock
 AGENT_POLICY=allow-go
 ALLOWED_BINARY=go          # in the AgentPolicy exec allow
 DISALLOWED_BINARY=curl     # NOT in the allow -> must be blocked
+# C6a (PR #7) validates AgentPolicy.exec entries as absolute paths outside the
+# writable mounts; point at the real binary, not the bare name.
+ALLOWED_BINARY_PATH=/usr/local/go/bin/go
 
 # The KubeArmor CLI (karmor) is the installer. Download it pinned if not present.
 KARMOR_VERSION="${KARMOR_VERSION:-1.4.9}"
+# Pin kubectl to the kind context so a host kubeconfig pointing elsewhere (e.g. a
+# real cluster) never shadows the e2e target cluster.
+KUBECTL="kubectl --context kind-${KIND_CLUSTER}"
 karmor() {
   if [ -x ./bin/karmor ]; then ./bin/karmor "$@"; else
     mkdir -p bin
@@ -65,7 +71,7 @@ echo "==> cluster: $(kind get clusters | tr '\n' ' ')"
 kind get clusters | grep -qx "$KIND_CLUSTER" || { echo "kind cluster $KIND_CLUSTER not found (make kind-up)"; exit 1; }
 
 echo "==> KubeArmor installed?"
-kubectl get pods -n kubearmor >/dev/null 2>&1 || { echo "KubeArmor not installed in $KIND_CLUSTER"; exit 1; }
+$KUBECTL get pods -n kubearmor >/dev/null 2>&1 || { echo "KubeArmor not installed in $KIND_CLUSTER"; exit 1; }
 echo "   (karmor install --tag ${KUBEARMOR_VERSION} — pinned in make kind-up)"
 
 echo "==> KubeArmor default posture is block? (required for exec blocking)"
@@ -73,7 +79,7 @@ echo "==> KubeArmor default posture is block? (required for exec blocking)"
 # (not spec.action). karmor install defaults it to audit, so a disallowed exec is
 # logged but ALLOWED. This assertion turns a misconfigured env into a clear failure
 # rather than the confusing "curl ran" below.
-FILE_POSTURE=$(kubectl -n kubearmor get configmap kubearmor-config -o jsonpath='{.data.defaultFilePosture}' 2>/dev/null || true)
+FILE_POSTURE=$($KUBECTL -n kubearmor get configmap kubearmor-config -o jsonpath='{.data.defaultFilePosture}' 2>/dev/null || true)
 if [ "$FILE_POSTURE" != "block" ]; then
   echo "   FAIL: defaultFilePosture is '${FILE_POSTURE:-unset}', not 'block' — a disallowed exec would be logged but ALLOWED."
   echo "   Re-run kind-up so the posture is set via `karmor install` flags (-b all) BEFORE the agent starts."
@@ -84,7 +90,7 @@ fi
 echo "   defaultFilePosture=block (exec allowlist will actually block)"
 
 echo "==> creating AgentPolicy ${AGENT_POLICY} (exec: [${ALLOWED_BINARY}]) + Loop ${LOOP}"
-kubectl apply -f - <<EOF
+$KUBECTL apply -f - <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: AgentPolicy
 metadata:
@@ -92,7 +98,7 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   exec:
-    - ${ALLOWED_BINARY}
+    - ${ALLOWED_BINARY_PATH}
 ---
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
@@ -115,12 +121,12 @@ EOF
 
 echo "==> waiting for the KubeArmorPolicy coxswain-${LOOP} (process.matchPaths execname ${ALLOWED_BINARY} + absolute path, action Block)"
 for i in $(seq 1 30); do
-  if kubectl get kubearmorpolicy "coxswain-${LOOP}" -n "$NAMESPACE" >/dev/null 2>&1; then
+  if $KUBECTL get kubearmorpolicy "coxswain-${LOOP}" -n "$NAMESPACE" >/dev/null 2>&1; then
     break
   fi
   sleep 2
 done
-KAP=$(kubectl get kubearmorpolicy "coxswain-${LOOP}" -n "$NAMESPACE" -o json 2>/dev/null || true)
+KAP=$($KUBECTL get kubearmorpolicy "coxswain-${LOOP}" -n "$NAMESPACE" -o json 2>/dev/null || true)
 [ -n "$KAP" ] || { echo "KubeArmorPolicy coxswain-${LOOP} not created (operator not running with RBAC?)"; exit 1; }
 echo "   spec.action = $(echo "$KAP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"].get("action"))')"
 echo "   process.matchPaths = $(echo "$KAP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"].get("process",{}).get("matchPaths"))')"
@@ -128,10 +134,10 @@ echo "   process.matchPaths = $(echo "$KAP" | python3 -c 'import json,sys; print
 echo "==> waiting for the sandbox pod to be Ready"
 POD=""
 for i in $(seq 1 40); do
-  POD=$(kubectl get pods -n "$NAMESPACE" -l "coxswain.io/loop=${LOOP}" \
+  POD=$($KUBECTL get pods -n "$NAMESPACE" -l "coxswain.io/loop=${LOOP}" \
         -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' 2>/dev/null | head -1 || true)
   [ -n "$POD" ] || { sleep 5; continue; }
-  ready=$(kubectl get pod "$POD" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  ready=$($KUBECTL get pod "$POD" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
   if [ "$ready" = "True" ]; then break; fi
   sleep 5
 done
@@ -141,13 +147,13 @@ echo "   pod: $POD"
 # KubeArmor applies policies at pod creation (NRI). Recreate the pod once so the
 # policy is definitely applied to a fresh pod (avoids a policy-after-pod race).
 echo "==> recreating the pod so KubeArmor applies the policy to a fresh pod"
-kubectl delete pod "$POD" -n "$NAMESPACE" >/dev/null 2>&1 || true
+$KUBECTL delete pod "$POD" -n "$NAMESPACE" >/dev/null 2>&1 || true
 POD=""
 for i in $(seq 1 40); do
-  POD=$(kubectl get pods -n "$NAMESPACE" -l "coxswain.io/loop=${LOOP}" \
+  POD=$($KUBECTL get pods -n "$NAMESPACE" -l "coxswain.io/loop=${LOOP}" \
         -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' 2>/dev/null | head -1 || true)
   [ -n "$POD" ] || { sleep 5; continue; }
-  ready=$(kubectl get pod "$POD" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  ready=$($KUBECTL get pod "$POD" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
   if [ "$ready" = "True" ]; then break; fi
   sleep 5
 done
@@ -155,7 +161,7 @@ done
 echo "   fresh pod: $POD"
 
 echo "==> ALLOWED: exec ${ALLOWED_BINARY} in the agent (must succeed)"
-if kubectl exec "$POD" -n "$NAMESPACE" -c agent -- "$ALLOWED_BINARY" version >/dev/null 2>&1; then
+if $KUBECTL exec "$POD" -n "$NAMESPACE" -c agent -- "$ALLOWED_BINARY" version >/dev/null 2>&1; then
   echo "   PASS: ${ALLOWED_BINARY} ran (allowed by policy)"
 else
   echo "   FAIL: ${ALLOWED_BINARY} did NOT run (should be allowed)"; exit 1
@@ -163,7 +169,7 @@ fi
 
 echo "==> DISALLOWED: exec ${DISALLOWED_BINARY} in the agent (must be BLOCKED)"
 set +e
-kubectl exec "$POD" -n "$NAMESPACE" -c agent -- "$DISALLOWED_BINARY" --version >/dev/null 2>&1
+$KUBECTL exec "$POD" -n "$NAMESPACE" -c agent -- "$DISALLOWED_BINARY" --version >/dev/null 2>&1
 disallowed_rc=$?
 set -e
 if [ "$disallowed_rc" -ne 0 ]; then
@@ -175,7 +181,7 @@ else
 fi
 
 echo "==> cleanup"
-kubectl delete loop "$LOOP" -n "$NAMESPACE" >/dev/null 2>&1 || true
-kubectl delete agentpolicy "$AGENT_POLICY" -n "$NAMESPACE" >/dev/null 2>&1 || true
+$KUBECTL delete loop "$LOOP" -n "$NAMESPACE" >/dev/null 2>&1 || true
+$KUBECTL delete agentpolicy "$AGENT_POLICY" -n "$NAMESPACE" >/dev/null 2>&1 || true
 
 echo "PASS: the operator's KubeArmorPolicy enforces (allowed exec runs, disallowed exec blocked)"

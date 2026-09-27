@@ -195,9 +195,21 @@ in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
     `EnginePolicy` (assert selector + syscall/network/file fields); (2) envtest
     with a fake `Enforcer` (not-enforcing → sandbox Suspended + condition;
     enforcing → Running). **Real-engine e2e (KubeArmor installed on kind via a
-    `make kind-up` step + a disallowed `exec` actually blocked) is DEFERRED as a
-    follow-on**: the KubeArmorPolicy CRD has no enforcement status field
-    (`status: {}`), so D30's evidence is the agent's telemetry/alert stream
+    `make kind-up` step + a disallowed `exec` actually blocked) is RUN as
+    `make kubearmor-e2e` (test/e2e/kubearmor-exec-block.sh) — installed
+    KubeArmor v1.7.5 on kind 1.34 (pinned `karmor install --tag v1.7.5`, the
+    v-prefix mandatory) and proved the operator's KubeArmorPolicy is accepted +
+    loaded on the pod (karmor probe: pod 'Armored Up', Active LSM BPFLSM) and
+    the allowed exec runs. Two emitter bugs found + fixed by the e2e: exec
+    allows emitted as `/**/<binary>` (KubeArmor's `process.matchPaths[].path`
+    requires an absolute-path pattern) and `spec.action: Block` (default-deny;
+    without it KubeArmor defaults to Audit and nothing is blocked). **Honest
+    result: the disallowed exec (curl) was NOT blocked in that environment**
+    (a KubeArmor BPF-LSM process-enforcement gap, not diagnosed); the script
+    asserts the block and fails if not enforced, so a green run is the proof
+    and it does not currently go green. D30's `Enforcing()` evidence is still
+    the agent's telemetry/alert stream (I32 relay), not the policy object: the
+    KubeArmorPolicy CRD has no enforcement status field (`status: {}`), so D30's evidence is the agent's telemetry/alert stream
     (I32), a real-runtime dependency; and per-container scoping (D29) is NOT
     expressible in one KubeArmorPolicy (selector is pod-level), so the
     agent=localhost / proxy=model-endpoint split is enforced by the

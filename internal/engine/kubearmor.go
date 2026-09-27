@@ -1,169 +1,179 @@
-// Copyright 2026 papawattu.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package engine
 
 import (
 	"slices"
-	"strings"
 
 	"github.com/papawattu/coxswain/internal/policy"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// kaptAllowAction is the KubeArmor action for an allow rule.
+const (
+	kaptGroup   = "security.kubearmor.com"
+	kaptVersion = "v1"
+	kaptKind    = "KubeArmorPolicy"
+)
+
+var kaptGroupVersion = schema.GroupVersion{Group: kaptGroup, Version: kaptVersion}
+
+// kaptAllowAction is the KubeArmor action an allowlist rule carries. The
+// KubeArmorPolicy is default-deny; an allowlisted rule gets action Allow,
+// everything else stays denied (KubeArmor's default posture).
 const kaptAllowAction = "Allow"
 
-// KubeArmorPolicy is a MINIMAL typed representation of the subset of the
-// KubeArmorPolicy (security.kubearmor.com/v1) the Coxswain emitter needs. It is
-// a plain struct (not the KubeArmor Go module's type) so the emitter is a pure,
-// testable function with no dependency on the engine's Go module. It serializes
-// to the real CRD's shape; the KubeArmor emitter implementation (in prod)
-// converts this into a KubeArmorPolicy object and creates it.
-type KubeArmorPolicy struct {
-	// Name is the KubeArmorPolicy name (owned by the Loop).
-	Name string
-	// Namespace is the namespace to create it in.
-	Namespace string
-	// OwnerLoop is the Loop name (set as an owner ref by the emitter).
-	OwnerLoop string
-	// Selector is the pod label match (KubeArmor matches pods, not containers).
-	Selector map[string]string
-	// Action is the base action: "Allow" for the emitted allows.
-	Action string
-	// Process carries the allowed exec paths (the command allowlist, ADR-0007
-	// Q3). Exec allowlisting is process.matchPaths with action: Allow; the
-	// syscalls block has no action and is monitoring-only, so it is not used.
-	Process *KubeArmorProcess
-	// Network carries the allowed egress.
-	Network *KubeArmorNetwork
-	// File carries the allowed file paths.
-	File *KubeArmorFile
-}
-
-// KubeArmorProcess is the process block of a KubeArmorPolicy (exec allows).
-type KubeArmorProcess struct {
-	Action        string   `json:"action"`
-	MatchPaths    []string `json:"matchPaths,omitempty"`
-	MatchPatterns []string `json:"matchPatterns,omitempty"`
-}
-
-// KubeArmorNetwork is the network block of a KubeArmorPolicy. KubeArmor matches
-// egress by DNS query name + protocol, not host:port.
-type KubeArmorNetwork struct {
-	Action          string   `json:"action"`
-	MatchDNSQueries []string `json:"matchDNSQueries,omitempty"`
-	MatchProtocols  []string `json:"matchProtocols,omitempty"`
-}
-
-// KubeArmorFile is the file block of a KubeArmorPolicy.
-type KubeArmorFile struct {
-	Action           string   `json:"action"`
-	MatchPaths       []string `json:"matchPaths,omitempty"`
-	MatchDirectories []string `json:"matchDirectories,omitempty"`
-}
-
 // EmitKubeArmorPolicy translates Coxswain's EnginePolicy (per-container, D29)
-// into a single pod-level KubeArmorPolicy carrying the UNION of the agent and
-// proxy allows (KubeArmor matches pods, not containers; the per-container egress
-// split — agent=localhost, proxy=model-endpoint — is enforced by the
-// NetworkPolicy, C3). The selector targets the sandbox pod by a stable label.
-// This is a pure function (no cluster, no engine) and is tested directly.
-func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *KubeArmorPolicy {
-	// KubeArmor matches by pod label; the sandbox pod carries
-	// coxswain.io/loop=<name> (the operator sets this on the sandbox).
-	selector := map[string]string{"coxswain.io/loop": loopName}
+// into a KubeArmorPolicy object (security.kubearmor.com/v1) for the sandbox
+// pod. It returns a fully-shaped unstructured object (apiVersion, kind,
+// metadata{name, namespace}, spec{selector, process, network, file, action}) so
+// the API server's structural validation accepts it (P1 #1: the object must
+// have the real shape, not a Go struct dump).
+//
+// matchPaths / matchDNSQueries / matchProtocols items are OBJECTS (P1 #2: the
+// v1.7.5 schema requires {path}, {domain}, {protocol} items), not strings.
+//
+// Per-container scoping (D29) is NOT expressible in one KubeArmorPolicy
+// (the selector is pod-level), so this emits ONE pod-level policy carrying the
+// UNION of the agent and proxy allows. The agent=localhost / proxy=model-endpoint
+// split is enforced elsewhere (see D29 / C3).
+func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *unstructured.Unstructured {
+	name := "coxswain-" + loopName
 
-	kap := &KubeArmorPolicy{
-		Name:      "coxswain-" + loopName,
-		Namespace: namespace,
-		OwnerLoop: loopName,
-		Selector:  selector,
-		Action:    kaptAllowAction,
-	}
-
-	// Union the agent and proxy allows (pod-level; the NetworkPolicy does the
-	// per-container split). exec -> syscalls.matchPaths, network ->
-	// network.matchDNSQueries, files -> file.matchPaths.
-	var execPaths, dnsQueries, filePaths []string
+	// Union the allows across containers (pod-level policy).
+	var exec, network, files []string
 	for _, cp := range ep.Containers {
-		for _, c := range cp.Allows {
-			switch c.Type {
+		for _, a := range cp.Allows {
+			switch a.Type {
 			case policy.AllowExec:
-				execPaths = append(execPaths, c.Match)
+				exec = append(exec, a.Match)
 			case policy.AllowNetwork:
-				dnsQueries = append(dnsQueries, hostFromEndpoint(c.Match))
+				network = append(network, a.Match)
 			case policy.AllowFile:
-				filePaths = append(filePaths, c.Match)
+				files = append(files, a.Match)
 			}
 		}
 	}
-	dedupeSorted(&execPaths)
-	dedupeSorted(&dnsQueries)
-	dedupeSorted(&filePaths)
+	exec = dedupe(exec)
+	network = dedupe(network)
+	files = dedupe(files)
 
-	if len(execPaths) > 0 {
-		kap.Process = &KubeArmorProcess{Action: kaptAllowAction, MatchPaths: execPaths}
+	spec := map[string]any{
+		"selector": map[string]any{
+			"matchLabels": map[string]any{"coxswain.io/loop": loopName},
+		},
 	}
-	if len(dnsQueries) > 0 {
-		kap.Network = &KubeArmorNetwork{Action: kaptAllowAction, MatchDNSQueries: dnsQueries}
-	}
-	if len(filePaths) > 0 {
-		kap.File = &KubeArmorFile{Action: kaptAllowAction, MatchPaths: filePaths}
-	}
-	return kap
-}
-
-// hostFromEndpoint strips a ":port" suffix from a host:port endpoint so the
-// KubeArmor network rule matches the DNS name (KubeArmor matches by DNS query,
-// not port). "localhost" has no port and is returned as-is.
-func hostFromEndpoint(endpoint string) string {
-	if i := strings.LastIndexByte(endpoint, ':'); i >= 0 {
-		// Only strip if the suffix is a numeric port (avoid IPv6 ambiguity for
-		// the common case; the operator's allows are host:port or bare hosts).
-		port := endpoint[i+1:]
-		if isNumeric(port) {
-			return endpoint[:i]
+	// exec allows → process.matchPaths items ({path}), action Allow.
+	// P1 #3: process (NOT syscalls, which is monitoring-only and has no action).
+	if len(exec) > 0 {
+		spec["process"] = map[string]any{
+			"action":     kaptAllowAction,
+			"matchPaths": toPathItems(exec),
 		}
 	}
-	return endpoint
-}
-
-func isNumeric(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
+	// network allows → matchDNSQueries items ({domain}) + matchProtocols items
+	// ({protocol}). P2: carry the port (protocol) alongside the DNS name so an
+	// allow never widens to host:*.
+	if len(network) > 0 {
+		domains, protocols := splitNetworkAllows(network)
+		spec["network"] = map[string]any{
+			"action":          kaptAllowAction,
+			"matchDNSQueries": toDomainItems(domains),
+			"matchProtocols":  toProtocolItems(protocols),
 		}
 	}
-	return true
-}
-
-// dedupeSorted sorts and de-duplicates a string slice in place.
-func dedupeSorted(s *[]string) {
-	if *s == nil {
-		return
-	}
-	slices.Sort(*s)
-	seen := map[string]bool{}
-	out := (*s)[:0]
-	for _, v := range *s {
-		if !seen[v] {
-			seen[v] = true
-			out = append(out, v)
+	// file allows → file.matchPaths items ({path}).
+	if len(files) > 0 {
+		spec["file"] = map[string]any{
+			"action":     kaptAllowAction,
+			"matchPaths": toPathItems(files),
 		}
 	}
-	*s = out
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": kaptGroup + "/" + kaptVersion,
+		"kind":       kaptKind,
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": spec,
+	}}
+	return obj
+}
+
+// toPathItems turns strings into KubeArmor matchPaths items ({path: s}).
+func toPathItems(paths []string) []any {
+	out := make([]any, len(paths))
+	for i, p := range paths {
+		out[i] = map[string]any{"path": p}
+	}
+	return out
+}
+
+// toDomainItems turns DNS names into KubeArmor matchDNSQueries items ({domain: s}).
+func toDomainItems(domains []string) []any {
+	out := make([]any, len(domains))
+	for i, d := range domains {
+		out[i] = map[string]any{"domain": d}
+	}
+	return out
+}
+
+// toProtocolItems turns protocol strings into KubeArmor matchProtocols items
+// ({protocol: s}).
+func toProtocolItems(protocols []string) []any {
+	out := make([]any, len(protocols))
+	for i, p := range protocols {
+		out[i] = map[string]any{"protocol": p}
+	}
+	return out
+}
+
+// splitNetworkAllows splits "host:port" allows into (dnsNames, protocols). A
+// bare host (no port) yields a DNS name only; "host:port" yields a DNS name +
+// a "tcp:port" protocol so the allow does not widen to host:* (P2).
+// splitNetworkAllows splits network allows into (dnsNames, protocols). KubeArmor
+// matches egress by DNS query name + protocol — it CANNOT express a host:port
+// allow (the schema's matchProtocols items are protocol NAMES: tcp/udp, not
+// "tcp:443"). So a "host:443" allow becomes "host" + protocol "tcp": the port is
+// LOST — the allow widens to host:* (a PolicyTranslationLossy situation, tracked;
+// the fix is the NetworkPolicy carrying the port, not KubeArmor).
+func splitNetworkAllows(ends []string) (domains, protocols []string) {
+	for _, e := range ends {
+		host, port := splitHostPort(e)
+		domains = append(domains, host)
+		if port != "" {
+			protocols = append(protocols, "tcp") // protocol name only; the port is not expressible
+		}
+	}
+	return dedupe(domains), dedupe(protocols)
+}
+
+// splitHostPort splits "host:port" into (host, port). A bare host yields
+// (host, "").
+func splitHostPort(s string) (string, string) {
+	i := 0
+	for i < len(s) && s[i] != ':' {
+		i++
+	}
+	if i == len(s) || i == 0 {
+		return s, ""
+	}
+	return s[:i], s[i+1:]
+}
+
+func dedupe(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	slices.Sort(out)
+	return out
 }

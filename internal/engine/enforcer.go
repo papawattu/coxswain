@@ -50,8 +50,9 @@ type Enforcer interface {
 
 // EngineEnforcementReasons are the D30 reasons for PolicyEnforced=False.
 const (
-	ReasonEngineUnavailable = "EngineUnavailable"
-	ReasonNodeNotEnforcing  = "NodeNotEnforcing"
-	ReasonPolicyRejected    = "PolicyRejected"
-	ReasonAuditOnly         = "AuditOnly"
+	ReasonEngineUnavailable   = "EngineUnavailable"
+	ReasonNodeNotEnforcing    = "NodeNotEnforcing"
+	ReasonPolicyRejected      = "PolicyRejected"
+	ReasonAuditOnly           = "AuditOnly"
+	ReasonEnforcementDisabled = "EnforcementDisabled" // P1 merge: --allow-unenforced escape hatch (off by default)
 )

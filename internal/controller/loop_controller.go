@@ -80,6 +80,11 @@ type LoopReconciler struct {
 	// EngineUnavailable) and holds the sandbox Suspended. A fake is used in
 	// envtest to drive the gate.
 	Enforcer engine.Enforcer
+	// AllowUnenforced is the off-by-default escape hatch (P1 merge): when true,
+	// Loops run with PolicyEnforced=False reason EnforcementDisabled rather
+	// than being held Suspended forever. Set explicitly (--allow-unenforced);
+	// a dev/testing escape hatch, never the default.
+	AllowUnenforced bool
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -88,6 +93,7 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -120,14 +126,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
-	// D30: record the PolicyEnforced condition (True when enforcing, False +
-	// reason otherwise) after the sandbox is ensured.
-	if enf, rs := r.enforcementStatus(ctx, &loop); enf {
+	// D30: record the PolicyEnforced condition. True+Enforcing when the engine is
+	// enforcing; False+reason otherwise. The AllowUnenforced escape hatch lets
+	// the Loop run but is NOT enforced — it records False+EnforcementDisabled
+	// (loudly visible), never True.
+	if enf, rs := r.enforcementStatus(ctx, &loop); enf && rs != engine.ReasonEnforcementDisabled {
 		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
 			"the eBPF engine is enforcing the Loop's effective policy")
 	} else {
-		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs,
-			"engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)")
+		msg := "engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)"
+		if rs == engine.ReasonEnforcementDisabled {
+			msg = "--allow-unenforced is set: the Loop runs but is NOT enforced (dev escape hatch)"
+		}
+		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
 	}
 
 	// Combine the two status updates (observedGeneration + phase) into one so a
@@ -205,9 +216,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // reports EngineUnavailable, so the sandbox is held Suspended (fail-closed).
 func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha1.Loop) (enforced bool, reason string) {
 	if r.Enforcer == nil {
+		if r.AllowUnenforced {
+			return true, engine.ReasonEnforcementDisabled // run, but NOT enforced
+		}
 		return false, engine.ReasonEngineUnavailable
 	}
-	return r.Enforcer.Enforcing(ctx, loop)
+	enforcing, reason := r.Enforcer.Enforcing(ctx, loop)
+	if !enforcing && r.AllowUnenforced {
+		return true, engine.ReasonEnforcementDisabled // run anyway, not enforced
+	}
+	return enforcing, reason
 }
 
 // PolicyEnforcedCondition is the non-phase condition type recording whether the

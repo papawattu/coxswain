@@ -46,8 +46,71 @@ the work for that phase, and writes `result.json` (which carries the reported
 
 > **A4 (old: Verifying phase) is DROPPED (ADR-0005).** The runner does **not**
 > run acceptance checks or report exit codes. Verify evidence is obtained by the
-> operator via an isolated Job (B3) and base-ref hashing (B2); the runner's job
-> ends at writing `result.json` (claims) and pushing its commit.
+> operator via an isolated Job (B3) and base-commit glob diff (B2); the runner's job
+> ends at writing `result.json` (claims) and making local commits (the operator
+> publishes them, ADR-0006).
+
+> **Agent-agnostic (ADR-0006, revised D26).** The runner is the **
+> reference/conformance agent**, not the flagship. Any image that honours the
+> contract (reads `.coxswain/` instructions, edits `/workspace`, commits locally,
+> writes `result.json`) is a runner. The reference runner calls the model through
+> `COX_MODEL_BASE_URL` — in production that is a **localhost proxy sidecar** in
+> the sandbox pod that holds the real model key (the agent holds **zero
+> credentials**, ADR-0006); in tests it is the fake model. `spec.agent` names the
+> agent image + model + `endpointSecretRef` (mounted into the proxy, never the
+> agent).
+
+### C. Isolation (ADR-0006, revised D26 — the product)
+
+The isolation is what makes B2/B3's evidence meaningful, so these slices come
+**before B3**. They make the sandbox a zero-credential, deny-by-default boundary
+and prove it. Each is a red→green seam; the envtest asserts the built Sandbox pod
+spec, the e2e runs an "evil agent" image.
+
+**Candidate seams (to confirm):**
+- **C1** — *Sandbox pod hardening + `spec.agent`.* The operator builds the
+  Sandbox with `automountServiceAccountToken: false`, `runAsNonRoot`, drop all
+caps, `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`, read-only root
+fs + writable `/workspace` + scratch, CPU/mem limits, and a `runtimeClassName`
+when the cluster offers one. CRD: `spec.agent { image, model,
+endpointSecretRef, env?, egressAllow? }` + a `coxswain-agent-defaults` ConfigMap
+for defaults. Seam: envtest — assert the built Sandbox pod spec carries every
+hardening field, no SA token automount, and no secret volume mounted into the
+**agent** container.
+- **C2** — *Model proxy sidecar.* The sandbox pod gains a second container (the
+proxy) that holds the model key (mounted **only** into the proxy), injects auth,
+forwards only to the configured endpoint, and meters tokens (the Phase 2
+metering sidecar, built now as the credential boundary). The agent talks to
+`COX_MODEL_BASE_URL=http://localhost:<port>` and holds no key. Seam: envtest —
+assert the sandbox pod has the proxy container, the model secret volume is
+mounted into the proxy **and not** the agent, and the agent's env has
+`COX_MODEL_BASE_URL` set to the localhost proxy. e2e — the reference runner, with
+the fake model behind the proxy, reaches `result.json` without any key in the
+agent env.
+- **C3** — *NetworkPolicy deny-by-default egress.* A NetworkPolicy on the
+sandbox allows egress **only** from the proxy container to the model endpoint +
+DNS; the agent container reaches nothing but `localhost`. Package installs are
+the hard case (owner decision, ADR-0006 "Open owner decisions"). Seam: envtest
+— assert a NetworkPolicy exists for the sandbox with the deny-by-default egress
+rule (egress from proxy to the model endpoint only; the agent egresses
+nowhere but localhost).
+- **C4** — *Trusted publish step.* After the agent commits locally, a trusted
+component outside the agent's control (an operator-created "publish" Job, or a
+sidecar sharing only the workspace volume + the push token) pushes the Loop
+branch and **pins `status.currentVerify.verifiedCommit` (D11/D27)** to the same
+SHA — the agent cannot force-push after verify. The agent holds no push token.
+Seam: envtest/e2e — assert the publish Job's pod has the push token and the
+agent container does not; after a publish the operator's pinned commit equals
+the published SHA; a force-push attempt by the agent is not reflected in the
+pinned commit.
+- **C5** — *Evil-agent e2e (the isolation proof).* An "evil agent" image runs
+that tries, in order: read a mounted secret, reach the K8s API server,
+`curl` the internet, and push to the git remote. **Every attempt must fail**,
+and none of the attempts may affect the Loop's evidence (the verify Job still
+sees the committed SHA; the Loop's phase/evidence are unchanged by the failed
+attempts). Seam: e2e on kind — assert each attempt's exit/output shows denial
+and the Loop's `status.verify`/phase are unaffected. (This is the slice that
+makes ADR-0006's guarantee concrete.)
 
 ### B. Controller reconcile state machine (`internal/controller/`)
 The Phase 0 controller only ensured the sandbox + set `Pending`. Phase 1 drives
@@ -223,6 +286,10 @@ stops at Verifying; a runner report of Succeeded does not exit Verifying).
 ## CRD changes (Phase 1)
 
 `LoopSpec` gains:
+- `agent` `{ image, model, endpointSecretRef, env?, egressAllow? }` (ADR-0006) —
+  the agent image + model + the secret ref holding the base URL + API key
+  (mounted into the **proxy sidecar**, never the agent). Defaults from a
+  `coxswain-agent-defaults` ConfigMap so the README sample stays short.
 - `workspace.gitCredentialSecret` (string, optional) — secret with the git token
 - `verify.protectedPaths[]` (optional, **globs**) + `verify.preset` (enum, default `go`; ADR-0005 round-6 D16) + `verify.protectedPathsOverride` (bool, default false) — the protected paths for the TamperedVerify glob diff. The content-free operator can't detect the repo's language, so the preset is **explicit**: `preset: go` expands to the Go glob set (`**/*_test.go`, `**/testdata/**`, `go.mod`, `go.sum`); `protectedPaths[]` **adds** to it; `protectedPathsOverride: true` (or `preset: none`) **replaces** it. Drop the "files a check references" heuristic; document that a check calling `make` should list `Makefile` in `protectedPaths`. Protecting `go.mod`/`go.sum` means the agent can't add dependencies (documented). (The plan's `acceptanceChecks[]` commands stay as-is.)
 - `loop.phaseTimeout` (metav1.Duration, default 30m) — Phase 1 adds the field;
@@ -234,6 +301,7 @@ stops at Verifying; a runner report of Succeeded does not exit Verifying).
 `LoopStatus` gains (all **operator-written**; ADR-0004 — the runner never writes these, it only reports them in `result.json`):
 - `desiredPhase` / `observedPhase` (Phase) — the operator records the phase it asked for and the phase the runner reported. `desiredPhase` is also copied to `.coxswain/desired-phase` for the runner to read.
 - `baseCommit` (string) — the SHA resolved from `spec.workspace.ref` at Loop start, pinned for the Loop's life (ADR-0005 round-4 D10). **Replaces** the old `verify.baselineHashes`.
+- `currentVerify` `{ verifiedCommit string }` (ADR-0006/D27) — the operator's pin of the **current** iteration's verified commit, written on entering `Verifying` (D11) and used to bind the verify evidence to the commit being verified. Distinct from `verify.verifiedCommit` (what the *evidence* names); a mismatch or empty pin makes the evidence Unknown (fail-closed).
 - `plan` `{ summary string (≤4KB), hash string (sha256 of PLAN.md) }`
 - `history []HistoryEntry` — the audit trail: `{ iteration, phase, reason, message, timestamp, verifiedCommit string (the SHA the verify Job checks out, set at `Verifying` start — ADR-0005 D11) }`
 - `iteration` (int) — already present from Phase 0
@@ -271,12 +339,18 @@ is Phase 4 — Phase 1 uses `spec.approval.mode: Auto` only.
 
 ## Suggested slice order (once seams are confirmed)
 
-A1 → A2 → A3 → A4 (runner, each red→green — note A4 is now *context
-continuity*; the old A4 "runner runs checks" is dropped per ADR-0005), then
-B1 → B2 → B3 → B3a → B3b → B3c → B3d → B4 → B5 → B6 (controller, each red→green;
-B3's verify path is expanded into B3a/B3b/B3c/B3d for the D17 canary + advisory
-scan, D18 restart
-semantics, and D19 read-only checkout). B2 (TamperedVerify
-via base-ref hashing) is the highest-value test — the anti-gaming guarantee
-(D7). B6 (foreign-owned sandbox → condition, D8) needs B1's condition/event
-infrastructure.
+The isolation slices (C1–C5, ADR-0006) come **before B3** — they are what make
+B2/B3's evidence meaningful. After D27:
+
+C1 (sandbox hardening + `spec.agent`) → C2 (model proxy sidecar) → C3
+(NetworkPolicy deny-by-default) → C4 (trusted publish step) → C5 (evil-agent
+e2e), then the reference runner A1 → A2 → A3 → A4 (now driving the conformance
+agent through the proxy, `COX_MODEL_BASE_URL` = localhost, each red→green —
+note A4 is now *context continuity*; the old A4 "runner runs checks" is dropped
+per ADR-0005), then B3 → B3a → B3b → B3c → B3d (the verify path, expanded for the
+D17 canary + advisory scan, D18 restart semantics, D19 read-only checkout) →
+B4 → B5 → B6. B1 and B2 (the claim-driven phase machine + TamperedVerify via
+base-commit glob diff) are already done. B2's anti-gaming guarantee (D7) is the
+highest-value test; B6 (foreign-owned sandbox → condition, D8) needs B1's
+condition/event infrastructure. C5 (the evil-agent e2e) is the slice that proves
+ADR-0006's guarantee and gates B3's evidence as meaningful.

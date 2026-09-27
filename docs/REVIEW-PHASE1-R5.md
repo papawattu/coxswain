@@ -63,7 +63,7 @@ pass iteration N+1.
 
 ### D26. Make the agent a first-class, pluggable part of the Loop
 
-- [ ] Decided (ADR-0006) — **needs the owner's choice on the first agent**
+- [ ] ~~Decided (ADR-0006)~~ — **superseded by R6 D26** (round 6 reframes D26: isolation is the product; the agent holds zero credentials. ADR-0006 is now written against the revised D26.)
 
 **Where:** `runner/` (a library with no `main`, no image), `api/v1alpha1`
 (no agent/model fields), `TDD-PLAN-PHASE1.md` (A1–A4 not started; B-slices

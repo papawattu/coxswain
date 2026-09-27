@@ -33,10 +33,10 @@ Timelines assume part-time solo work.
   - `spec.loop`: `{ maxIterations, phaseTimeout }`
   - `spec.approval`: `{ mode: Auto|Manual, onReject: Replan|Fail }`
   - `spec.suspend` (bool)
-- Build the **Runner** as the in-sandbox phase driver (replaces the smoke-test runner): the operator sets `status.desiredPhase`, the runner does the work and writes `status.observedPhase` + `result.json`. Model context survives across phases within an iteration.
+- Build the **Runner** as the in-sandbox **conformance** agent (ADR-0006): any image that reads its instructions from `.coxswain/`, edits `/workspace`, commits locally, and writes `result.json` is a runner. The runner gets **no credentials** (ADR-0006: the model key is held by a proxy sidecar; the operator publishes the branch) and writes `result.json` **only** — the operator reads it and writes `loop.status.observedPhase` (ADR-0004). Model context survives across phases within an iteration.
 - Build the reconcile state machine over the settled phase enum:
   `Pending → Planning → [AwaitingApproval] → Implementing → Verifying → { Succeeded | →Implementing | Failed | Paused }`, plus `CleaningUp`.
-- **Protected paths from day one:** hash the acceptance-check source files at iteration start; if they changed during implement, fail the iteration with `TamperedVerify` **before any check runs** (terminal).
+- **Protected paths from day one (ADR-0005 D10/D14):** the operator pins `status.baseCommit` at Loop start; at `Verifying`, an isolated verify Job runs `git diff --name-only <baseCommit> <verifiedCommit> -- <globs>` in a trusted init container **before any check or agent code runs**; non-zero ⇒ `TamperedVerify` **before any check runs** (terminal). The operator never gates on a `result.json` claim or a stored hash.
 - Make verify deterministic only: run each acceptance check, exit code 0 = pass.
 - Feed failures forward: write verify output into the next implement prompt.
 - Record `status.phase`, `status.iteration`, and `status.history[]`.

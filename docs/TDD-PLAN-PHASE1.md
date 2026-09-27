@@ -157,19 +157,36 @@ block appears in the activity-audit stream** (Q4), the direct-endpoint call is
 attempt's exit/output shows denial, the Loop keeps running, and each block is
 in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
 - **C6** — *`AgentPolicy` CRD + engine-policy translation (ADR-0007 Q2/Q3/D29).*
-The new `AgentPolicy` CRD (group `coxswain.wattu.com`; default-deny, additive
-allows; union across policies; `spec.policyRefs[]` on the Loop; optional
-cluster-scoped `ClusterAgentPolicy`). The operator **translates** a Loop's
-effective allows into the eBPF engine's policy (reviewer rec: a `KubeArmorPolicy`
-in BPF-LSM mode selecting the Loop's sandbox pod, owned by the Loop) behind an
-internal interface (swappable for Tetragon). Default-deny when no policy: the
-generated engine policy allows only the platform minimum. Seam: **envtest** —
-for a given set of allows, the generated `KubeArmorPolicy`/`NetworkPolicy`
-carries exactly those allows; with no policy, the default is deny. The engine
-policy is scoped **per-container** (D29): the agent container allows
-`localhost` + the policy's allows only; the proxy container allows only the
-model endpoint. The operator gates the sandbox on **positive evidence
-enforcement is active on the node** (`PolicyEnforced`, D30).
+  Split into C6a (the CRD + the **pure** effective-allows→engine-policy
+  translation, test-first) and C6b (wire the translation into the engine
+  runtime + the `PolicyEnforced` gate). The box stays open until both are done.
+  - **C6a — CRD + pure translation (DONE).** New `AgentPolicy` CRD
+    (group `coxswain.wattu.com`, namespaced; default-deny, additive allows;
+    union across policies via `spec.policyRefs[]` on the Loop; optional
+    cluster-scoped `ClusterAgentPolicy` is a follow-on). A pure function
+    `internal/policy/effective.go: Translate(effective []AllowRule)` returns an
+    **engine policy spec** (per-container, D29): the agent container allows
+    `localhost` + the policy's allows only; the proxy container allows only the
+    model endpoint; default-deny when there are no allows (platform minimum
+    only). The translation is engine-agnostic (a Go struct the engine emitter in
+    C6b renders) so it is swappable and testable without the engine. Seam:
+    **pure unit test** over a set of allows — the generated engine policy carries
+    exactly those allows per container, and with no policy the default is deny
+    (only the platform minimum); `policy.EffectiveHash` gives a canonical SHA-256
+    of the union allows for the decision audit (D32). CRD seam: **envtest** — a
+    Loop with `spec.policyRefs: [p1, p2]` records `status.policy.effectiveHash` =
+    the union of both policies' allows (a missing referenced AgentPolicy is a
+    reconcile error, not a silent narrow policy); a Loop with no policyRefs leaves
+    the hash empty (default-deny minimum).
+  - **C6b — engine runtime + gate (remaining).** The operator **emits** a
+    `KubeArmorPolicy` in BPF-LSM mode selecting the Loop's sandbox pod, owned by
+    the Loop (behind an internal interface, swappable for Tetragon), and gates
+    the sandbox on **positive evidence** enforcement is active on the node
+    (`PolicyEnforced`, D30 — `EngineUnavailable` | `NodeNotEnforcing` |
+    `PolicyRejected`; the Loop waits, no terminal reason). `make kind-up` gains
+    the engine install step + the disallowed-`exec` smoke. The generated
+    `NetworkPolicy` (the coarse outer fence) is C3.
+
 - **C7** — *Activity-audit stream (ADR-0007 Q4).* Coxswain **emits** agent-
 activity audit as JSON lines on each trusted source's stdout with the common
 envelope `{time, loop, namespace, iteration, source, action, target, verdict,

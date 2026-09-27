@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -75,6 +77,7 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -148,6 +151,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			changed = true
 		}
 	}
+	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
+	// union of the allows across every AgentPolicy the Loop references
+	// (spec.policyRefs[]). The operator computes the hash and stores it in
+	// status.policy.effectiveHash so the decision audit shows what the agent was
+	// allowed to do (D32); the hash is over the union, not stored allows.
+	if effectiveHash, found, err := r.effectivePolicyHash(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	} else if found {
+		if loop.Status.Policy == nil {
+			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+		}
+		if loop.Status.Policy.EffectiveHash != effectiveHash {
+			loop.Status.Policy.EffectiveHash = effectiveHash
+			changed = true
+		}
+	}
 	if changed {
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
@@ -155,6 +174,29 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// effectivePolicyHash computes the canonical hash of the Loop's effective
+// AgentPolicy (C6a): the union of the allows across every AgentPolicy the Loop
+// references (spec.policyRefs[]). It returns the hash and whether any policy
+// was applied (false when policyRefs is empty — the default-deny minimum). A
+// referenced AgentPolicy that does not exist is an error (the operator must not
+// silently run an agent with a narrower policy than the Loop declared).
+func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+	if len(loop.Spec.PolicyRefs) == 0 {
+		return "", false, nil
+	}
+	union := policy.EffectivePolicy{}
+	for _, name := range loop.Spec.PolicyRefs {
+		var ap coxv1alpha1.AgentPolicy
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
+			return "", false, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+		}
+		union.Exec = append(union.Exec, ap.Spec.Exec...)
+		union.Network = append(union.Network, ap.Spec.Network...)
+		union.Files = append(union.Files, ap.Spec.Files...)
+	}
+	return policy.EffectiveHash(union), true, nil
 }
 
 // ensureSandbox creates the Loop's Sandbox if it does not already exist, and

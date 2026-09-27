@@ -143,7 +143,7 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 			 -e 's/defaultCapabilitiesPosture:.*/defaultCapabilitiesPosture: block/' \
 			 -e 's/visibility:.*/visibility: process,file,network,capabilities/' \
 		| kubectl apply -f - \
-		&& KA_AGENT=$$(kubectl get daemonset -A --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/ {print "$$1\t"$$2; exit}') \
+		&& KA_AGENT=$$(kubectl get daemonset -A --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/ && $$2 !~ /snitch/ {print $$1 "\t" $$2; exit}') \
 		&& [ -n "$$KA_AGENT" ] \
 		&& echo "   KubeArmor agent DaemonSet: $$KA_AGENT" \
 		&& KA_DNS=$$(echo "$$KA_AGENT" | cut -f1) && \

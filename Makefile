@@ -268,7 +268,7 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 	# Dev/kind: re-add the --allow-unenforced escape hatch (NOT in the base
 	# install, so dist/install.yaml stays fail-closed). Applied as a merge-patch
 	# (not kubectl apply) on the operator Deployment in the <app>-system ns.
-	"$(KUBECTL)" -n coxswain-system patch deployment controller-manager --type=merge -f config/manager/allow-unenforced.yaml
+	"$(KUBECTL)" -n coxswain-system patch deployment controller-manager --type=merge --patch-file config/manager/allow-unenforced.yaml
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.

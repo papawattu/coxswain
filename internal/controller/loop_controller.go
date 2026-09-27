@@ -82,6 +82,11 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
+// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy): it
+// creates/updates them, watches them (Owns mapping), and lets GC delete them
+// with the Loop. Only the verbs the controller actually uses.
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

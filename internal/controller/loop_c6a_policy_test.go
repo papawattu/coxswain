@@ -30,7 +30,10 @@ import (
 // c6aGitBin is the absolute path of the git binary the C6a test AgentPolicies
 // allow (a real binary outside the writable mounts, satisfying the exec
 // absolute-path CEL rule). Shared so goconst doesn't flag the repeated literal.
-const c6aGitBin = "/usr/bin/git"
+const (
+	c6aGitBin   = "/usr/bin/git"
+	c6aTestRepo = "https://github.com/papawattu/coxswain.git"
+)
 
 var _ = Describe("C6a effective AgentPolicy union", func() {
 	var (
@@ -48,7 +51,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      goal,
-				Workspace: coxv1alpha1.Workspace{Repo: repo, Ref: "main"},
+				Workspace: coxv1alpha1.Workspace{Repo: repo, Ref: loopRef},
 			},
 		}
 	}
@@ -134,5 +137,50 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 				Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{spoof}},
 			})).To(HaveOccurred(), "a path at or under a writable mount (%s) must be rejected", spoof)
 		}
+
+		// Non-canonical paths that resolve to a writable mount after normalization
+		// are NOT rejected by the CRD CEL rule (cost budget), but ARE rejected by
+		// the controller in effectivePolicyHash (P1, R15). See the
+		// "rejects a Loop that references an AgentPolicy with a non-canonical exec
+		// path" spec below for the controller-level test.
+	})
+
+	It("rejects a Loop that references an AgentPolicy with a non-canonical exec path", func() {
+		ns := "c6a-noncanon-loop"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// The CRD accepts non-canonical paths (CEL cost budget), so create succeeds.
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "noncanon", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/../tmp/git"}},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed(),
+			"the CRD accepts non-canonical paths (CEL cost budget); the controller rejects them")
+
+		// A Loop that references this AgentPolicy must fail reconciliation.
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "noncanon-loop", Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal: "test non-canonical exec path rejection",
+				Workspace: coxv1alpha1.Workspace{
+					Repo: c6aTestRepo,
+					Ref:  loopRef,
+				},
+				Verify: coxv1alpha1.VerifyConfig{
+					AcceptanceChecks: []string{"go test ./..."},
+				},
+				Agent:      coxv1alpha1.AgentConfig{Model: "test"},
+				Loop:       coxv1alpha1.LoopSettings{MaxIterations: 1},
+				PolicyRefs: []string{"noncanon"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Reconcile: the controller must reject the non-canonical path.
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "noncanon-loop"}})
+		Expect(err).To(HaveOccurred(),
+			"the controller must reject a Loop with a non-canonical exec path")
+		Expect(err.Error()).To(ContainSubstring("non-canonical"))
 	})
 })

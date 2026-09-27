@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
@@ -52,6 +53,15 @@ const (
 	// readOnlyMode is the default file mode for the model-creds Secret volume
 	// (0444: the key is read-only, even in the proxy).
 	readOnlyMode int32 = 0o444
+
+	// The agent's writable mount points. Single source of truth for the pod spec;
+	// the AgentPolicy exec XValidation (api/v1alpha1/agentpolicy_types.go) MUST
+	// stay in sync with this set — a CRD CEL rule cannot reference Go code, so
+	// adding a mount here without updating the XValidation would silently make
+	// the new mount a spoofable exec target.
+	agentWorkspaceMount = "/workspace"
+	agentScratchMount   = "/scratch"
+	agentTmpMount       = "/tmp"
 )
 
 // LoopReconciler reconciles a Loop object.
@@ -192,6 +202,16 @@ func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alp
 		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
 			return "", false, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
 		}
+		// P1 (R15): the CEL XValidation can't reject non-canonical paths (CRD CEL
+		// cost budget), so the controller rejects them here before they reach the
+		// effective policy or the eBPF engine. A path with '..' or '//' or a
+		// trailing '/' is non-canonical and could resolve to a writable mount
+		// after normalization.
+		for _, e := range ap.Spec.Exec {
+			if isNonCanonicalPath(e) {
+				return "", false, fmt.Errorf("AgentPolicy %s/%s: exec entry %q is non-canonical (no '..' or '//' or trailing '/')", loop.Namespace, name, e)
+			}
+		}
 		union.Exec = append(union.Exec, ap.Spec.Exec...)
 		union.Network = append(union.Network, ap.Spec.Network...)
 		union.Files = append(union.Files, ap.Spec.Files...)
@@ -319,11 +339,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: "workspace", MountPath: "/workspace"},
-				{Name: "scratch", MountPath: "/scratch"},
+				{Name: "workspace", MountPath: agentWorkspaceMount},
+				{Name: "scratch", MountPath: agentScratchMount},
 				// P1 (R13): a writable /tmp so go build / mktemp / any tool that
 				// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
-				{Name: "tmp", MountPath: "/tmp"},
+				{Name: "tmp", MountPath: agentTmpMount},
 			},
 		}
 		podContainers := []corev1.Container{agentContainer}
@@ -373,6 +393,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
 		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
 		// rather than filling the node. 500+350+100 = 950Mi < 1Gi.
+		// writableMountPaths is the single source of truth for the agent's writable
+		// mount points; the AgentPolicy exec XValidation hard-codes the same set
+		// (a CRD CEL rule cannot reference Go code), so adding a mount here MUST
+		// also update the XValidation in api/v1alpha1/agentpolicy_types.go or the
+		// new mount would silently become a spoofable exec target.
+		writableMountPaths := []string{agentWorkspaceMount, agentScratchMount, agentTmpMount}
+		_ = writableMountPaths // single source of truth (see comment)
 		desired.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
 			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				SizeLimit: newLimit("500Mi"),
@@ -594,4 +621,23 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&sandboxv1beta1.Sandbox{}).
 		Named("loop").
 		Complete(r)
+}
+
+// isNonCanonicalPath returns true if the path is non-canonical: it contains a
+// '..' segment, a '//' (double slash), or ends with a '/'. The eBPF engine and
+// the filesystem normalize such paths, so a non-canonical path that looks
+// outside the writable mounts could resolve to one (e.g. "/usr/../tmp/git").
+// The CRD CEL XValidation can't reject these (cost budget), so the controller
+// rejects them in effectivePolicyHash before they reach the effective policy.
+func isNonCanonicalPath(p string) bool {
+	if strings.Contains(p, "..") {
+		return true
+	}
+	if strings.Contains(p, "//") {
+		return true
+	}
+	if len(p) > 1 && strings.HasSuffix(p, "/") {
+		return true
+	}
+	return false
 }

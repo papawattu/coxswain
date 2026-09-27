@@ -32,8 +32,18 @@ type AgentPolicySpec struct {
 	// spoofable — the agent could write its own /tmp/git that does anything and
 	// claim it is the allowed "git". The eBPF engine matches the binary by
 	// absolute path, so the allow must name a real binary outside the writable
-	// mounts. The XValidation rejects bare names (no leading /) and anything at
-	// or under the writable mounts (/workspace, /scratch, /tmp).
+	// mounts.
+	//
+	// The XValidation rejects bare names (no leading /) and anything at or under
+	// the writable mounts (/workspace, /scratch, /tmp).
+	//
+	// P1 (R15): non-canonical paths that resolve to a writable mount after
+	// normalization ("//tmp/git", "/usr/../tmp/git") are NOT caught by this CEL
+	// rule — adding a !contains('..') check would push the CRD over the CEL cost
+	// budget (2.0x over). They ARE caught by the controller in
+	// effectivePolicyHash (isNonCanonicalPath), which rejects the Loop before it
+	// reaches the eBPF engine. The CRD is the first line of defence (catches the
+	// common case at admission); the controller is the second (catches everything).
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:XValidation:rule="self.all(e, e.startsWith('/') && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')",message="exec entries must be absolute paths at or outside the writable mounts (not under /workspace, /scratch, /tmp)"

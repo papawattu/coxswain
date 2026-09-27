@@ -68,6 +68,18 @@ var _ = Describe("C2: model proxy sidecar (ADR-0006)", func() {
 		}
 	}
 
+	// buildLoopNoAgent is a Loop with NO spec.agent at all (the README sample):
+	// the agent runs with no model, so there is no proxy / no key.
+	buildLoopNoAgent := func(name, ns string) *coxv1alpha1.Loop {
+		return &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: testWorkspace(),
+			},
+		}
+	}
+
 	reconcileToSandbox := func(r *LoopReconciler, name, ns string) *sandboxv1beta1.Sandbox {
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -101,7 +113,7 @@ var _ = Describe("C2: model proxy sidecar (ADR-0006)", func() {
 		return m
 	}
 
-	It("mounts the model key into the proxy and not the agent, and points the agent at the proxy (C2)", func() {
+	It("mounts the model key into the proxy and not the agent, and points the agent at the proxy (C2a: ref set)", func() {
 		ns := "c2-proxy-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -143,5 +155,70 @@ var _ = Describe("C2: model proxy sidecar (ADR-0006)", func() {
 		Expect(credsVol.Secret).NotTo(BeNil(), "the model-creds volume must be a Secret volume")
 		Expect(credsVol.Secret.SecretName).To(Equal(modelCredsSecret),
 			"the model-creds volume must reference the Loop's endpointSecretRef Secret")
+
+		By("delivering the key only as a file, not env (P2)")
+		// The key must NOT be delivered via env (it leaks to child processes,
+		// crash dumps, /proc/<pid>/environ). Only the read-only file mount.
+		proxyEnv := envByName(proxy)
+		Expect(proxyEnv).NotTo(HaveKey("MODEL_API_KEY"),
+			"the model key must not be delivered to the proxy via env (P2: env leaks)")
+		Expect(proxyEnv).NotTo(HaveKey("MODEL_BASE_URL"),
+			"the model base URL must not be delivered to the proxy via env (P2)")
+
+		By("giving the proxy its own UID, not the agent's (P2)")
+		proxySC := proxy.SecurityContext
+		Expect(proxySC).NotTo(BeNil())
+		Expect(proxySC.RunAsUser).NotTo(BeNil(), "the proxy must pin its own UID (P2)")
+		Expect(*proxySC.RunAsUser).NotTo(Equal(int64(65532)),
+			"the proxy must NOT run as the agent's UID (a shared PID ns / volume could expose the key)")
+
+		By("not sharing the process namespace (P2)")
+		Expect(pod.ShareProcessNamespace).NotTo(BeNil(),
+			"shareProcessNamespace must be explicit (P2)")
+		Expect(*pod.ShareProcessNamespace).To(BeFalse(),
+			"the pod must not share the process namespace (the key would be readable in /proc/<pid>/environ)")
+	})
+
+	It("builds a VALID pod with no proxy when endpointSecretRef is unset (P1: no half-configured proxy)", func() {
+		ns := "c2-noref-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "c2noref"
+		// A Loop with NO spec.agent (like the README sample): the agent runs with
+		// no model. There must be NO proxy container, no model-creds volume, and
+		// no COX_MODEL_BASE_URL — never a half-configured proxy (P1: the pod must
+		// be valid, not InvalidConfiguration on secretKeyRef.name "").
+		Expect(k8sClient.Create(ctx, buildLoopNoAgent(name, ns))).To(Succeed())
+		sb := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
+
+		pod := &sb.Spec.PodTemplate.Spec
+		By("NOT adding a proxy container when there is no model endpoint")
+		Expect(containerByName(sb, proxyContainerName)).To(BeNil(),
+			"no proxy container when endpointSecretRef is unset (P1)")
+
+		By("NOT adding the model-creds volume")
+		for _, v := range pod.Volumes {
+			Expect(v.Name).NotTo(Equal(modelCredsVolume),
+				"no model-creds volume when endpointSecretRef is unset (P1)")
+		}
+
+		By("NOT setting COX_MODEL_BASE_URL on the agent")
+		agent := containerByName(sb, agentContainerName)
+		Expect(agent).NotTo(BeNil(), "the agent container must still be present")
+		agentEnv := envByName(agent)
+		Expect(agentEnv).NotTo(HaveKey(coxModelBaseURL),
+			"COX_MODEL_BASE_URL must not be set when there is no proxy (P1)")
+
+		By("leaving every container with a valid env (no empty secretKeyRef)")
+		for i := range pod.Containers {
+			for _, e := range pod.Containers[i].Env {
+				if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+					Expect(e.ValueFrom.SecretKeyRef.Name).NotTo(BeEmpty(),
+						"container %q must not reference an empty secret name (P1: pod was InvalidConfiguration on kind)",
+						pod.Containers[i].Name)
+				}
+			}
+		}
 	})
 })

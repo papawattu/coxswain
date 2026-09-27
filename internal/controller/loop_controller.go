@@ -19,7 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+
+	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
@@ -28,11 +31,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
@@ -112,6 +118,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
+		}
+		if polResult.transientReadError {
+			// Requeue: the policy could not be read due to a transient
+			// error. Retry after a short delay.
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		return ctrl.Result{}, nil
 	}
@@ -636,13 +647,70 @@ func (r *LoopReconciler) proxyImage() string {
 	return "docker.io/library/golang:1.26"
 }
 
+// loopPolicyRefsFieldIndex is a field index on Loop.spec.policyRefs, used by
+// the AgentPolicy watch's map function to efficiently find the Loops that
+// reference a given AgentPolicy (R15 round 4 P2).
+const loopPolicyRefsFieldIndex = "spec.policyRefs"
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
+	// watch's map function uses this index to find the Loops that reference
+	// a given AgentPolicy, avoiding a namespace-wide list per event).
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &coxv1alpha1.Loop{}, loopPolicyRefsFieldIndex,
+		func(obj client.Object) []string {
+			loop, ok := obj.(*coxv1alpha1.Loop)
+			if !ok {
+				return nil
+			}
+			return loop.Spec.PolicyRefs
+		}); err != nil {
+		return fmt.Errorf("index Loop.spec.policyRefs: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&coxv1alpha1.Loop{}).
 		Owns(&sandboxv1beta1.Sandbox{}).
+		// Watch AgentPolicy: when a referenced policy is created, edited, or
+		// deleted, re-reconcile the Loops that reference it (R15 round 4 P2:
+		// a policy created after its Loop must not leave the Loop stuck at
+		// PolicyNotFound; a policy edit must refresh the recorded hash).
+		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
+			r.agentPolicyToLoopRequests)).
 		Named("loop").
 		Complete(r)
+}
+
+// agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace
+// whose spec.policyRefs contains its name. Used by the AgentPolicy watch to
+// re-reconcile the affected Loops when the policy changes (R15 round 4 P2).
+//
+// In production, the field index on spec.policyRefs (registered in
+// SetupWithManager) makes this an O(1) lookup. In the envtest suite (no
+// field indexer), it falls back to a namespace-wide list + filter, which is
+// correct and sufficient for tests.
+func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	ap, ok := obj.(*coxv1alpha1.AgentPolicy)
+	if !ok {
+		return nil
+	}
+	loops := &coxv1alpha1.LoopList{}
+	if err := r.List(ctx, loops, client.InNamespace(ap.Namespace)); err != nil {
+		logf.FromContext(ctx).Error(err, "list Loops in namespace for AgentPolicy watch",
+			"policy", ap.Name, "namespace", ap.Namespace)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(loops.Items))
+	for i := range loops.Items {
+		if slices.Contains(loops.Items[i].Spec.PolicyRefs, ap.Name) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: loops.Items[i].Namespace,
+					Name:      loops.Items[i].Name,
+				},
+			})
+		}
+	}
+	return requests
 }
 
 // suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it
@@ -679,7 +747,8 @@ type policyValidationResult struct {
 	// PolicyNotFound) when valid is false.
 	reason string
 	// message is the human-readable explanation.
-	message string
+	message            string
+	transientReadError bool
 }
 
 // validateAgentPolicies scans the Loop's referenced AgentPolicies for
@@ -687,6 +756,10 @@ type policyValidationResult struct {
 // R15 round 3: a missing or unreadable referenced policy is treated as
 // not-valid (PolicyNotFound), not ignored (fail-closed).
 // Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
+// validateAgentPolicies checks that every referenced AgentPolicy exists and
+// has canonical exec paths. Returns a policyValidationResult. The
+// transientReadError field is true when the policy could not be read due to a
+// transient error (not a NotFound), in which case the caller should requeue.
 func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
 	for _, name := range loop.Spec.PolicyRefs {
 		ap := &coxv1alpha1.AgentPolicy{}
@@ -695,9 +768,10 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 				return policyValidationResult{valid: false, reason: "PolicyNotFound",
 					message: fmt.Sprintf("AgentPolicy %s/%s not found (referenced by policyRefs)", loop.Namespace, name)}
 			}
-			// Unreadable (transient error): fail closed.
+			// Unreadable (transient error): fail closed, requeue.
 			return policyValidationResult{valid: false, reason: "PolicyNotFound",
-				message: fmt.Sprintf("AgentPolicy %s/%s could not be read: %v", loop.Namespace, name, err)}
+				message:            fmt.Sprintf("AgentPolicy %s/%s could not be read: %v", loop.Namespace, name, err),
+				transientReadError: true}
 		}
 		for _, e := range ap.Spec.Exec {
 			if isNonCanonicalPath(e) {

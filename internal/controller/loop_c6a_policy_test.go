@@ -37,6 +37,7 @@ const (
 	policyValidType  = "PolicyValid"
 	missingPolName   = "missing-pol-loop"
 	cleanLoopName    = "clean-loop"
+	watchLoopName    = "watch-loop"
 )
 
 var _ = Describe("C6a effective AgentPolicy union", func() {
@@ -175,7 +176,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 		// A canonical path is accepted.
 		ap3 := &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "canon", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/bin/git"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin}},
 		}
 		Expect(k8sClient.Create(ctx, ap3)).To(Succeed(),
 			"the CRD must accept a canonical path")
@@ -280,5 +281,116 @@ var _ = Describe("C6a (R15 round 3): fail-closed policy validation", func() {
 		Expect(policyValid.Status).To(Equal(metav1.ConditionTrue),
 			"a clean policy pass must set PolicyValid=True")
 		Expect(policyValid.Reason).To(Equal("Valid"))
+	})
+})
+
+var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
+	It("reconciles a Loop when its AgentPolicy is created after the Loop", func() {
+		ns := "c6a-policy-watch-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		// Create the Loop FIRST (without the AgentPolicy).
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: watchLoopName, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal: "test policy watch",
+				Workspace: coxv1alpha1.Workspace{
+					Repo: c6aTestRepo,
+					Ref:  loopRef,
+				},
+				PolicyRefs: []string{"late-policy"},
+				Agent: coxv1alpha1.AgentConfig{
+					Image: runnerImage,
+					Model: testModel,
+				},
+				Loop: coxv1alpha1.LoopSettings{MaxIterations: 1},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Reconcile: the policy doesn't exist yet, so the Loop gets
+		// PolicyValid=False (PolicyNotFound).
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: watchLoopName}})
+		Expect(err).ToNot(HaveOccurred())
+
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: watchLoopName}, gotLoop)).To(Succeed())
+		var policyValid *metav1.Condition
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == policyValidType {
+				policyValid = &gotLoop.Status.Conditions[i]
+			}
+		}
+		Expect(policyValid).ToNot(BeNil())
+		Expect(policyValid.Status).To(Equal(metav1.ConditionFalse),
+			"before the policy exists, the Loop must be PolicyValid=False")
+		Expect(policyValid.Reason).To(Equal("PolicyNotFound"))
+
+		// Now create the AgentPolicy.
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "late-policy", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin}},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
+
+		// The envtest suite has no running manager, so the Watches won't
+		// fire automatically. Manually call Reconcile to simulate the watch
+		// event.
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: watchLoopName}})
+		Expect(err).ToNot(HaveOccurred())
+
+		// The Loop should now be PolicyValid=True and have a sandbox.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: watchLoopName}, gotLoop)).To(Succeed())
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == policyValidType {
+				Expect(gotLoop.Status.Conditions[i].Status).To(Equal(metav1.ConditionTrue),
+					"after the policy is created, the Loop must be PolicyValid=True")
+				break
+			}
+		}
+	})
+
+	It("unit tests the agentPolicyToLoopRequests map function", func() {
+		ns := "c6a-map-func-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		// Create two Loops, one referencing "test-policy" and one not.
+		loop1 := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "ref-loop", Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:       "test map func",
+				Workspace:  coxv1alpha1.Workspace{Repo: c6aTestRepo, Ref: loopRef},
+				PolicyRefs: []string{"test-policy"},
+				Agent:      coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+				Loop:       coxv1alpha1.LoopSettings{MaxIterations: 1},
+			},
+		}
+		loop2 := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "unrelated-loop", Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      "test map func",
+				Workspace: coxv1alpha1.Workspace{Repo: c6aTestRepo, Ref: loopRef},
+				Agent:     coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+				Loop:      coxv1alpha1.LoopSettings{MaxIterations: 1},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop1)).To(Succeed())
+		Expect(k8sClient.Create(ctx, loop2)).To(Succeed())
+
+		// Create the AgentPolicy.
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-policy", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin}},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
+
+		// Unit test the map function: it should return only ref-loop.
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		requests := r.agentPolicyToLoopRequests(ctx, ap)
+		Expect(requests).To(HaveLen(1),
+			"the map function should return only the Loop that references the policy")
+		Expect(requests[0].Name).To(Equal("ref-loop"))
+		Expect(requests[0].Namespace).To(Equal(ns))
 	})
 })

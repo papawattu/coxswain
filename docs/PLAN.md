@@ -19,13 +19,13 @@ Timelines assume part-time solo work.
 
 **Done when (narrowed, I4):** `kubectl apply` of a Loop causes the operator to **create and log the Sandbox object** for it (the Sandbox is the operator's own output; its Pod does not have to appear — running the agent-sandbox controller that materialises the Pod is Phase 1). The e2e proves exactly this on a kind cluster (see `docs/E2E-PHASE0.md`). The runner-in-sandbox run and the agent-sandbox controller were **moved to Phase 1** rather than closing them here, so Phase 0's "done when" matches what was actually proven.
 
-> **Phase 0 sign-off (I4, decided 2026-09-27):** closed by the narrow done-when above. The runner-in-sandbox smoke run and running the agent-sandbox controller are Phase 1 work (they need a running agent-sandbox controller, which has no pullable image — the Phase 1 plan builds the verify Job image and runs the controller in kind).
+> **Phase 0 sign-off (I4, decided 2026-09-27):** closed by the narrow done-when above. The runner-in-sandbox smoke run and running the agent-sandbox controller are Phase 1 work. **D22 (2026-09-27) confirmed the controller does have a pullable image** — `registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.4` from the v1.0.4 *release* manifest (the source `k8s/controller.yaml` is a `ko://` placeholder, which is what made Phase 0 think no image existed) — and that it runs + reconciles on kind 1.34.
 
 ## Phase 1: The loop, minimal (weeks 2–3)
 
 **The trust model lands here, not in Phase 6.**
 
-- **(Moved from Phase 0, I4)** Bring the sandbox to life end-to-end: run the agent-sandbox controller in the kind cluster so the operator's `Sandbox` materialises a Pod, and smoke-run the runner *inside* the sandbox (it calls the model and writes `result.json` the controller logs). Phase 0 proved the operator creates the Sandbox object; this is the step that proves the agent actually runs in it.
+- **(Moved from Phase 0, I4)** Bring the sandbox to life end-to-end: run the agent-sandbox controller in the kind cluster (D22: the v1.0.4 release manifest installs it, image `registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.4`; it reconciles a `Sandbox` to a Running pod on kind 1.34) so the operator's `Sandbox` materialises a Pod, and smoke-run the runner *inside* the sandbox (it calls the model and writes `result.json` the controller logs). Phase 0 proved the operator creates the Sandbox object; this is the step that proves the agent actually runs in it. Opt into the per-Sandbox Service with `spec.service: true` where a Service is needed (D22).
 - Write the Loop CRD types:
   - `spec.goal` (string)
   - `spec.workspace`: `{ repo, ref, gitCredentialSecret }` — clone at `ref`, one branch per Loop (`coxswain/<loop-name>`), pushed after each iteration
@@ -115,6 +115,7 @@ These are settled — see ADRs and CONTEXT.md. Listed here so the plan and the m
 9. **Phase 0 "done when" is narrow (I4, 2026-09-27):** the operator creating + logging the Sandbox object. The runner-in-sandbox smoke run and the agent-sandbox controller move to Phase 1.
 10. **Dev/CI k8s version is 1.34 (D5, 2026-09-27):** kind + envtest + CI all pin 1.34; the production floor stays >=1.37.
 11. **Phase 3 snapshot e2e runs on kind + csi-hostpath-driver (D6, 2026-09-27):** kind gets the snapshot CRDs + hostpath CSI so the whole flow stays on one local cluster.
+12. **agent-sandbox v1.0.4 runs on k8s 1.34 (D22, 2026-09-27, smoke-verified):** the controller installs (image `registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.4`, from the *release* manifest — the source `k8s/controller.yaml` is a `ko://` placeholder) and reconciles a bare `Sandbox` to a Running pod on kind 1.34, so dev/CI pinning 1.34 is safe. The per-Sandbox **Service is opt-in** (`spec.service: true`), not created by default — so the D20 DNS-1035-name constraint only matters when we opt into a Service. The vendored CRD at `config/crd/external/` already matches v1.0.4 (it has `spec.service`, `shutdownPolicy`, `shutdownTime`), so no re-vendoring is needed. The earlier "needs >=1.37" claim was folklore — v1.0.4's docs state no minimum server version and it reconciles on 1.34; the production floor stays >=1.37 only because the operator is expected to track the agent-sandbox release line, not because 1.34 was broken.
 
 ## Risks
 
@@ -123,7 +124,7 @@ These are settled — see ADRs and CONTEXT.md. Listed here so the plan and the m
 - **Oscillation (not stall).** An agent that alternates between two failure modes never trips the consecutive-hash stall detector. Deferred; needs its own detector. Flagged, not scheduled.
 - **Memory pollution.** A bad lesson, once written, biases every future Loop on that repo. Mitigations: the curator gate, dedup, and `cox memory` inspection + deletion. (No automated forgetting yet — a future concern.)
 - **Overlap with kagent or agent-sandbox.** Stay the orchestration layer on top of them; the runner contract is the seam. Contribute upstream where it makes sense.
-- **agent-sandbox is v1beta1 / k8s 1.37.** The API can move under us. **Dev/CI pin k8s 1.34 (D5); production needs >=1.37 for agent-sandbox.** Isolate the dependency behind a thin internal interface so an upgrade is contained.
+- **agent-sandbox is v1beta1 / fast-moving.** The API can move under us. **Dev/CI pin k8s 1.34 (D5); agent-sandbox v1.0.4 is smoke-verified on 1.34 (D22), and the production floor stays >=1.37 only to track the agent-sandbox release line, not because 1.34 is unsupported.** The per-Sandbox Service is opt-in (`spec.service: true`) and the vendored CRD already matches v1.0.4. Isolate the dependency behind a thin internal interface so an upgrade is contained.
 
 ## Before Phase 0
 

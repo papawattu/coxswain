@@ -80,7 +80,7 @@ in `nextPhase` returns `Succeeded` or `Failed`.
 
 ### D22. Confirm agent-sandbox v1.0.4 runs on kind 1.34 before Phase 1 depends on it
 
-- [ ] Verified
+- [x] Verified (commit 5b098c8 docs; smoke run on kind `coxswain-d22`, node v1.34.0). The v1.0.4 **release** manifest (`releases/download/v1.0.4/sandbox.yaml`) uses the real image `registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.4` (the source `k8s/controller.yaml` is a `ko://` placeholder — the reason Phase 0 thought no image existed). The controller rolls out 1/1 Running, acquires the leader lease, and reconciles a bare `Sandbox` to a Running pod (Sandbox Ready=True). The per-Sandbox Service is **opt-in** (`spec.service: true`) — with it enabled the Service `d22-smoke` + `serviceFQDN` appear. The vendored CRD at `config/crd/external/` already matches v1.0.4 (has `spec.service`/`shutdownPolicy`/`shutdownTime`), so no re-vendoring. Result recorded in `docs/PLAN.md` decision 12 + risk line; the "needs >=1.37" folklore is corrected (it reconciles on 1.34; the floor is a release-tracking decision, not a hard requirement).
 
 **Where:** `docs/PLAN.md` decisions 9–10; `Makefile` `KIND_NODE_IMAGE`,
 `ENVTEST_K8S_VERSION`.

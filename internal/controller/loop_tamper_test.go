@@ -15,68 +15,87 @@
 package controller
 
 import (
+	"fmt"
 	"testing"
 )
 
-// TestTamperVerdict is the B2 (D10) anti-gaming seam. The tamper decision must
-// be driven ONLY by the tamper-check container's exit code (the operator's
-// own evidence from the two pinned SHAs), never by the runner's result.json
-// claim. A naive implementation that lets resultClaimsSuccess override the
-// exit code fails the anti-gaming cases below.
+func int32Ptr(v int32) *int32 {
+	p := new(int32)
+	*p = v
+	return p
+}
+
+// Shared commit SHAs for the tamper-evidence table (named to keep goconst
+// quiet; they are arbitrary distinct values, not real SHAs).
+const (
+	commitSame = "aaaa1111"
+	commitDiff = "bbbb2222"
+)
+
+// TestTamperVerdict is the B2/D24 tri-state seam. The decision is a pure
+// function of the operator's OWN evidence (a *int32 tamper exit code + the
+// verifiedCommit it names) and returns a tri-state. It never reads the
+// runner's result.json claim (I28). The real-git-diff fixtures that produce a
+// non-zero tamper code are exercised by the internal/tamper package tests
+// (D25); this table covers the decision rule itself.
 func TestTamperVerdict(t *testing.T) {
 	cases := []struct {
-		name             string
-		tamperExitCode   int
-		resultClaimsOK   bool
-		wantTampered     bool
-		wantTerminalReas string
+		name        string
+		exitCode    *int32
+		evidenceCmt string
+		verifiedCmt string
+		want        TamperVerdict
 	}{
-		// A protected path changed (tamper container non-zero) — the three D10
-		// fixtures all surface this way in a real Job — and the runner CLAIMS
-		// success. Anti-gaming: it must still be TamperedVerify.
-		{"edit existing *_test.go, runner claims success", 1, true, true, TamperedVerifyReason},
-		{"add new *_test.go with TestMain->os.Exit(0), runner claims success", 1, true, true, TamperedVerifyReason},
-		{"add replace directive to go.mod, runner claims success", 2, true, true, TamperedVerifyReason},
-		// Tamper container clean (0) — no protected path changed. Not tampered,
-		// even though the runner also claims success (the verify proceeds to the
-		// check containers, B3).
-		{"clean diff, runner claims success", 0, true, false, ""},
-		// Clean diff but the runner reports a BLOCKED/failed run — still not a
-		// tamper verdict; the decision never reads the claim either way.
-		{"clean diff, runner claims blocked", 0, false, false, ""},
-		// Non-zero exit code is tampered regardless of the claim.
-		{"non-zero exit, runner claims blocked", 1, false, true, TamperedVerifyReason},
+		// nil = no evidence (never ran / Job crashed / status lost) -> Unknown,
+		// NEVER clean (D24 fail-closed).
+		{"nil tamper evidence -> Unknown (not clean)", nil, "", "", TamperUnknown},
+		// explicit 0 from a terminated container -> Clean.
+		{"explicit 0 -> Clean", int32Ptr(0), "", "", TamperClean},
+		// non-zero -> Tampered (terminal), the anti-gaming property.
+		{"non-zero exit -> Tampered", int32Ptr(1), "", "", TamperTampered},
+		{"non-zero exit (code 2) -> Tampered", int32Ptr(2), "", "", TamperTampered},
+		// Stale evidence: the evidence names a different verifiedCommit than the
+		// current one -> treated as nil (Unknown), even if it is a clean 0
+		// (D24.3: evidence from a previous iteration's Job can't be reused).
+		{"stale clean evidence (commit mismatch) -> Unknown", int32Ptr(0), commitSame, commitDiff, TamperUnknown},
+		{"stale tampered evidence (commit mismatch) -> Unknown", int32Ptr(1), commitSame, commitDiff, TamperUnknown},
+		// Same commit -> the evidence is current; the code decides.
+		{"current commit, 0 -> Clean", int32Ptr(0), commitSame, commitSame, TamperClean},
+		{"current commit, non-zero -> Tampered", int32Ptr(1), commitSame, commitSame, TamperTampered},
+		// Empty evidence commit (B2 wiring) skips the stale guard; the code decides.
+		{"empty evidence commit, non-zero -> Tampered", int32Ptr(1), "", commitSame, TamperTampered},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotTampered, gotReason := tamperVerdict(tc.tamperExitCode, tc.resultClaimsOK)
-			if gotTampered != tc.wantTampered {
-				t.Errorf("tamperVerdict(%d, %v) tampered = %v, want %v",
-					tc.tamperExitCode, tc.resultClaimsOK, gotTampered, tc.wantTampered)
-			}
-			if gotReason != tc.wantTerminalReas {
-				t.Errorf("tamperVerdict(%d, %v) terminalReason = %q, want %q",
-					tc.tamperExitCode, tc.resultClaimsOK, gotReason, tc.wantTerminalReas)
+			got := tamperVerdict(tc.exitCode, tc.evidenceCmt, tc.verifiedCmt)
+			if got != tc.want {
+				t.Errorf("tamperVerdict(%v, %q, %q) = %v, want %v",
+					desc(tc.exitCode), tc.evidenceCmt, tc.verifiedCmt, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestTamperVerdictIgnoresClaim is the core anti-gaming assertion, stated
-// directly: for a non-zero tamper exit code the verdict is TamperedVerify no
-// matter what the claim is. This pins the D10 property that result.json (which
-// the agent can forge, sharing the runner's shell) is never a gate.
-func TestTamperVerdictIgnoresClaim(t *testing.T) {
-	claimSuccess := true
-	claimBlocked := false
-	// Same exit code, opposite claims — the verdict must be identical.
-	a, reasonA := tamperVerdict(1, claimSuccess)
-	b, reasonB := tamperVerdict(1, claimBlocked)
-	if a != true || b != true {
-		t.Fatalf("a non-zero tamper exit must always be tampered, got %v / %v", a, b)
+// TestTamperVerdictNonZeroIsTerminalRegardlessOfEvidenceCommit pins the D24
+// acceptance: non-zero tamper evidence is terminal for the SAME verifiedCommit,
+// and nil/unknown never advances. The "regardless of claim" property is proven
+// at the envtest seam (the runner claims done, the evidence says tampered ->
+// Failed), so this test no longer takes a claim (I28).
+func TestTamperVerdictNonZeroIsTerminal(t *testing.T) {
+	if got := tamperVerdict(int32Ptr(1), commitSame, commitSame); got != TamperTampered {
+		t.Fatalf("non-zero current-commit evidence must be Tampered, got %v", got)
 	}
-	if reasonA != TamperedVerifyReason || reasonB != TamperedVerifyReason {
-		t.Fatalf("a non-zero tamper exit must always be %s, got %q / %q",
-			TamperedVerifyReason, reasonA, reasonB)
+	if got := tamperVerdict(nil, commitSame, commitSame); got != TamperUnknown {
+		t.Fatalf("nil evidence must be Unknown (not clean), got %v", got)
 	}
+	if got := tamperVerdict(int32Ptr(0), commitSame, commitSame); got != TamperClean {
+		t.Fatalf("explicit 0 current-commit evidence must be Clean, got %v", got)
+	}
+}
+
+func desc(p *int32) string {
+	if p == nil {
+		return "nil"
+	}
+	return fmt.Sprint(*p)
 }

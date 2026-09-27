@@ -102,21 +102,42 @@ type VerifyConfig struct {
 // VerifyStatus is the operator's record of the last verify run's evidence
 // (ADR-0005 D14). The values are kubelet-recorded container exit codes from
 // the verify Job's pod, never result.json claims.
+//
+// Integrity invariant (ADR-0005 D12): only the manager role may write
+// loops/status; it holds this verify evidence. The scaffolded loop_editor_role
+// and loop_admin_role grant loops/status `get` only, so today nothing but the
+// operator can set these fields. Keep it that way.
 type VerifyStatus struct {
-	// tamperExitCode is the tamper-check init container's exit code (0 = clean,
-	// non-zero = a protected path differs between baseCommit and verifiedCommit).
-	// The operator reads it from the Job pod's initContainerStatuses; a non-zero
-	// value makes the verify terminal TamperedVerify (B2) before any check runs.
-	// -1 (or unset) means no verify has run yet.
-	// +kubebuilder:default=-1
+	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
+	// operator records it from the branch head it resolved itself at Verifying
+	// start. Evidence that names a different verifiedCommit (e.g. left over from a
+	// previous iteration's Job) is treated as no evidence (D24).
 	// +optional
-	TamperExitCode int `json:"tamperExitCode,omitempty"`
+	VerifiedCommit string `json:"verifiedCommit,omitempty"`
+
+	// jobName is the verify Job the evidence came from (D24). Recording it (and
+	// the attempt) means evidence from a previous Job cannot be reused for the
+	// current verifiedCommit.
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+
+	// tamperExitCode is the tamper-check init container's exit code. A NON-NIL
+	// value means the operator copied it from a TERMINATED tamper init container
+	// (0 = clean, non-zero = a protected path differs between baseCommit and
+	// verifiedCommit). nil means no evidence (never ran, Job crashed before the
+	// tamper container finished, or status was lost) — and nil is NEVER treated
+	// as clean (D24 fail-closed). Only a value from a terminated container for
+	// the current verifiedCommit counts.
+	// +optional
+	TamperExitCode *int32 `json:"tamperExitCode,omitempty"`
 
 	// lastCheckResults carries the per-check exit codes from the last verify run
-	// (one entry per acceptance check, in order) to feed forward (B3).
+	// (one entry per acceptance check, in order) to feed forward (B3). A nil entry
+	// means that check did not run (I14 NotRun); a non-nil 0 means it ran and
+	// passed. B3 distinguishes the two.
 	// +listType=atomic
 	// +optional
-	LastCheckResults []int `json:"lastCheckResults,omitempty"`
+	LastCheckResults []*int32 `json:"lastCheckResults,omitempty"`
 }
 
 // LoopSettings holds the loop-level knobs.

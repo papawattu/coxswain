@@ -86,19 +86,32 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		loop.Status.DesiredPhase = next
 		changed = true
 	}
-	// B2 (D10): at Verifying, the operator's own tamper evidence is the gate.
-	// A non-zero tamper-check exit code (a protected path differs between the
-	// two operator-pinned SHAs) ends the Loop Failed:TamperedVerify, TERMINAL,
-	// before any acceptance check runs. This is independent of the runner's
-	// result.json claim (tamperVerdict never reads it). In envtest the B-slice
-	// tests set status.verify.tamperExitCode directly (no Job controller); in a
-	// real cluster B3 reads it from the verify Job pod's initContainerStatuses.
-	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying &&
-		loop.Status.Verify != nil &&
-		loop.Status.Verify.TamperExitCode > 0 {
-		if tampered, reason := tamperVerdict(loop.Status.Verify.TamperExitCode, false); tampered {
+	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
+	// gate. tamperVerdict is a tri-state over the operator's evidence (a pointer
+	// to the terminated tamper init container's exit code + the verifiedCommit
+	// it names), and never reads the runner's result.json claim:
+	//   - TamperTampered -> Failed:TamperedVerify, TERMINAL, before any check
+	//     runs (the anti-gaming property: a runner that edited a protected file
+	//     and reported success still ends Failed).
+	//   - TamperClean    -> not a B2 decision; B3's check containers decide the
+	//     outcome from there.
+	//   - TamperUnknown  -> no evidence (nil, or stale for a different
+	//     verifiedCommit/Job); NEVER treated as clean (D24 fail-closed), so the
+	//     Loop stays in Verifying and B3 cannot reach Succeeded on it.
+	// In envtest the B-slice tests set status.verify.* directly (no Job
+	// controller); in a real cluster B3 reads the tamper exit code from the
+	// verify Job pod's initContainerStatuses.
+	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying && loop.Status.Verify != nil {
+		// The operator's current verifiedCommit is resolved at Verifying start
+		// (D11, B3); in B2 the evidence's own verifiedCommit is the reference, so
+		// the stale-evidence guard is exercised at the pure-function seam (the
+		// Reconcile wiring passes the evidence's commit as both the evidence and
+		// the current reference). B3 wires in the separately-resolved current
+		// commit so a force-push / previous-iteration Job can't be reused.
+		v := loop.Status.Verify
+		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, v.VerifiedCommit) == TamperTampered {
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, reason,
+			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, TamperedVerifyReason,
 				"a protected path changed between baseCommit and verifiedCommit; terminal")
 			changed = true
 		}
@@ -223,25 +236,58 @@ func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
 // (ADR-0005 D10). It is set before any acceptance check runs.
 const TamperedVerifyReason = "TamperedVerify"
 
-// tamperVerdict is the operator's TamperedVerify decision at Verifying (B2).
+// TamperVerdict is the tri-state outcome of the operator's TamperedVerify
+// decision at Verifying (ADR-0005 D24). The operator's evidence is a pointer:
+// a NON-NIL tamper exit code comes from a terminated tamper init container for
+// the current verifiedCommit; nil means no evidence.
+type TamperVerdict int
+
+const (
+	// TamperUnknown means there is no tamper evidence (nil tamperExitCode, or
+	// evidence from a different verifiedCommit/Job). It is NEVER treated as
+	// clean (D24 fail-closed): the Loop cannot advance out of Verifying on it.
+	TamperUnknown TamperVerdict = iota
+	// TamperClean means a terminated tamper init container for the current
+	// verifiedCommit exited 0 (no protected path changed). The verify proceeds
+	// to the check containers (B3).
+	TamperClean
+	// TamperTampered means a protected path differs between baseCommit and
+	// verifiedCommit (terminated tamper container exited non-zero). Terminal
+	// Failed:TamperedVerify (B2), before any check runs.
+	TamperTampered
+)
+
+// tamperVerdict is the operator's TamperedVerify decision at Verifying (B2/D24).
+// It is a pure function of the operator's OWN evidence — a pointer to the
+// tamper-check container's exit code plus the verifiedCommit that evidence
+// names — and returns a tri-state:
 //
-// It is a pure function of the tamper-check container's exit code and the
-// runner's claim from result.json:
-//   - tamperExitCode != 0 (a protected path differs between the two operator-
-//     pinned SHAs, per the Job's `git diff --name-only <baseCommit>
-//     <verifiedCommit> -- <globs>`) ⇒ TamperedVerify, terminal, BEFORE any
-//     check runs. This is independent of resultClaimsSuccess — the anti-gaming
-//     property (D10): a runner that edited a protected file and reported
-//     status=success still ends Failed:TamperedVerify.
-//   - tamperExitCode == 0 ⇒ not tampered; the verify proceeds to the check
-//     containers (B3). resultClaimsSuccess is irrelevant to the tamper
-//     decision (it is claims-grade, never a gate).
-func tamperVerdict(tamperExitCode int, resultClaimsSuccess bool) (tampered bool, terminalReason string) {
-	_ = resultClaimsSuccess // deliberately unused: the decision never reads a claim
-	if tamperExitCode != 0 {
-		return true, TamperedVerifyReason
+//
+//	tamperExitCode == nil            -> TamperUnknown (no evidence; NEVER clean)
+//	*exitCode names a stale verifiedCommit -> TamperUnknown (stale, treated as nil)
+//	*exitCode == 0                    -> TamperClean
+//	*exitCode != 0                    -> TamperTampered (terminal Failed:TamperedVerify)
+//
+
+// The decision never reads the runner's result.json claim (I28/D10 anti-gaming:
+// a runner that edited a protected file and reported success still ends
+// Failed:TamperedVerify when the evidence is non-zero).
+func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string) TamperVerdict {
+	// No evidence (nil) -> Unknown. D24 fail-closed: absence of evidence is not a
+	// pass.
+	if tamperExitCode == nil {
+		return TamperUnknown
 	}
-	return false, ""
+	// Stale evidence: the evidence names a different verifiedCommit than the
+	// current one (e.g. left over from a previous iteration's Job) -> treated as
+	// nil (D24.3).
+	if evidenceCommit != "" && verifiedCommit != "" && evidenceCommit != verifiedCommit {
+		return TamperUnknown
+	}
+	if *tamperExitCode == 0 {
+		return TamperClean
+	}
+	return TamperTampered
 }
 
 // setCondition upserts a condition on the Loop's status. The condition's Type

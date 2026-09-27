@@ -27,18 +27,25 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
-// B2 (D10) anti-gaming envtest. The operator's TamperedVerify decision at
-// Verifying is driven by its OWN tamper evidence (status.verify.tamperExitCode,
-// which B3 reads from the verify Job pod's initContainerStatuses), never by the
-// runner's result.json claim. In envtest (no Job controller) the tests set
-// status.verify.tamperExitCode directly. A non-zero tamper code ends the Loop
-// Failed:TamperedVerify, terminal, before any check runs — even when the
-// runner reports Verifying done (the claim) with a success-flavoured status.
-var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10)", func() {
+func int32PtrEnv(v int32) *int32 {
+	p := new(int32)
+	*p = v
+	return p
+}
+
+// B2 (D10/D24) anti-gaming + fail-closed envtest. The operator's TamperedVerify
+// decision at Verifying is driven by its OWN evidence (status.verify.*), never
+// by the runner's result.json claim. In envtest (no Job controller) the tests
+// set status.verify.* directly.
+//
+// The tri-state (D24): nil tamper evidence is NEVER clean (fail-closed) — the
+// Loop stays in Verifying and B3 cannot reach Succeeded on it. Explicit 0 is
+// clean (B3's check containers then decide). Non-zero ends Failed:TamperedVerify
+// (terminal) even when the runner claims Verifying done.
+var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func() {
 	ctx := context.Background()
 
-	// driveToVerifying drives a fresh Loop through the B1 claim path to
-	// Verifying (Pending -> Planning -> Implementing -> Verifying).
+	// driveToVerifying drives a fresh Loop through the B1 claim path to Verifying.
 	driveToVerifying := func(nn types.NamespacedName) {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		for _, reported := range []coxv1alpha1.LoopPhase{
@@ -55,30 +62,37 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10)", func() {
 		}
 	}
 
+	makeLoop := func(ns, name string) types.NamespacedName {
+		nn := types.NamespacedName{Name: name, Namespace: ns}
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		return nn
+	}
+
 	It("ends Failed:TamperedVerify (terminal) when the tamper code is non-zero, even though the runner claims success (D10 anti-gaming)", func() {
 		ns := "b2-tamper-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
-		nn := types.NamespacedName{Name: "b2-tamper", Namespace: ns}
-		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "b2-tamper", Namespace: ns},
-			Spec:       coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()},
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-
-		// Drive to Verifying, then set the operator's tamper evidence (a
-		// protected path changed between the pinned SHAs) + the runner's claim
-		// that it's done (the anti-gaming claim).
+		nn := makeLoop(ns, "b2-tamper")
 		driveToVerifying(nn)
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"setup: the Loop must reach Verifying before the tamper verdict")
 
-		got.Status.Verify = &coxv1alpha1.VerifyStatus{TamperExitCode: 1}
-		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying // the runner's claim
+		// The operator's tamper evidence: a protected path changed (non-zero),
+		// for the current verifiedCommit. Plus the runner's claim that it's done.
+		got.Status.Verify = &coxv1alpha1.VerifyStatus{
+			TamperExitCode: int32PtrEnv(1),
+			VerifiedCommit: "deadbeef",
+			JobName:        "b2-tamper-verify-1",
+		}
+		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
 
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -99,23 +113,20 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10)", func() {
 			"the terminal condition must record reason TamperedVerify (the operator's evidence, not the claim)")
 	})
 
-	It("stays Verifying when the tamper code is clean (0) — no tamper verdict", func() {
+	It("stays Verifying when the tamper code is clean (0) — B3's checks decide the outcome", func() {
 		ns := "b2-clean-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
-		nn := types.NamespacedName{Name: "b2-clean", Namespace: ns}
-		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "b2-clean", Namespace: ns},
-			Spec:       coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()},
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		nn := makeLoop(ns, "b2-clean")
 		driveToVerifying(nn)
-
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
-		got.Status.Verify = &coxv1alpha1.VerifyStatus{TamperExitCode: 0} // clean
+		got.Status.Verify = &coxv1alpha1.VerifyStatus{
+			TamperExitCode: int32PtrEnv(0),
+			VerifiedCommit: "deadbeef",
+		}
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
 
@@ -125,6 +136,35 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10)", func() {
 
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
-			"a clean tamper code must not flip the Loop to Failed; the checks (B3) decide the outcome")
+			"a clean tamper code must not flip the Loop to Failed; B3's checks decide")
+	})
+
+	It("stays Verifying when there is NO tamper evidence (nil) — D24 fail-closed, never clean", func() {
+		ns := "b2-nonev-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		nn := makeLoop(ns, "b2-nonev")
+		driveToVerifying(nn)
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
+		// No verify block at all (the Job never ran / crashed before the tamper
+		// container finished / status lost). Absence of evidence is NOT a pass.
+		got.Status.Verify = nil
+		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
+		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"D24: nil tamper evidence must not advance the Loop out of Verifying (fail-closed)")
+		Expect(got.Status.Phase).ToNot(Equal(coxv1alpha1.LoopPhaseSucceeded),
+			"the Loop must NOT reach Succeeded on no evidence")
+		Expect(got.Status.Phase).ToNot(Equal(coxv1alpha1.LoopPhaseFailed),
+			"no evidence is Unknown, not Tampered — it must not end Failed either")
 	})
 })

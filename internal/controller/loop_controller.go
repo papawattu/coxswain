@@ -23,8 +23,12 @@ import (
 	"encoding/json"
 	"fmt"
 
+	neturl "net/url"
+	"strconv"
+
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -115,6 +119,9 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// sandbox so the agent's COX_MODEL_BASE_URL target exists in the same pass.
 	if loop.Spec.Agent.EndpointSecretRef != "" {
 		if err := r.ensureProxy(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.ensureNetworkPolicy(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else {
@@ -438,6 +445,162 @@ func proxyServiceURL(loopName, namespace string) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d", proxyServiceName(loopName), namespace, proxyPort)
 }
 
+// ensureNetworkPolicy creates the per-Loop NetworkPolicies (D34):
+//  1. Agent pod NetworkPolicy: default-deny egress, allow only to the
+//     proxy pod on 8080 and DNS (port 53 UDP/TCP). No ingress.
+//  2. Proxy pod NetworkPolicy: ingress only from the agent pod on 8080,
+//     egress only to the model endpoint and DNS (port 53 UDP/TCP).
+//
+// Both are owner-ref'd to the Loop so they are GC'd with it.
+func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	ns := loop.Namespace
+	loopName := loop.Name
+
+	// Read the model endpoint from the secret (for the proxy egress rule).
+	modelEndpoint := ""
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: loop.Spec.Agent.EndpointSecretRef}, secret); err == nil {
+			if url, ok := secret.Data["MODEL_BASE_URL"]; ok {
+				modelEndpoint = string(url)
+			}
+		}
+	}
+
+	// Agent pod NetworkPolicy: default-deny egress to proxy + DNS.
+	agentNP := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      loopName + "-agent-netpol",
+			Namespace: ns,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					netpolComponentLabel: netpolAgentComponent,
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To:    []networkingv1.NetworkPolicyPeer{proxyLabelPeer()},
+					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
+						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
+					},
+				},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(loop, agentNP, r.Scheme); err != nil {
+		return fmt.Errorf("set owner ref on agent NetworkPolicy: %w", err)
+	}
+	if _, err := r.createOrUpdateNP(ctx, agentNP); err != nil {
+		return fmt.Errorf("create or update agent NetworkPolicy: %w", err)
+	}
+
+	// Proxy pod NetworkPolicy: ingress from agent on 8080, egress to model endpoint + DNS.
+	proxyNP := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      loopName + "-proxy-netpol",
+			Namespace: ns,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: proxyLabels(loopName),
+			},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From:  []networkingv1.NetworkPolicyPeer{agentLabelPeer()},
+					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+				},
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
+						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
+					},
+				},
+			},
+		},
+	}
+	if modelEndpoint != "" {
+		if port := modelEndpointPort(modelEndpoint); port > 0 {
+			proxyNP.Spec.Egress = append(proxyNP.Spec.Egress, networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(int32(port)), Protocol: new(corev1.ProtocolTCP)}},
+			})
+		}
+	}
+	if err := controllerutil.SetControllerReference(loop, proxyNP, r.Scheme); err != nil {
+		return fmt.Errorf("set owner ref on proxy NetworkPolicy: %w", err)
+	}
+	if _, err := r.createOrUpdateNP(ctx, proxyNP); err != nil {
+		return fmt.Errorf("create or update proxy NetworkPolicy: %w", err)
+	}
+
+	return nil
+}
+
+// proxyLabelPeer returns a NetworkPolicyPeer that selects the proxy pod.
+func proxyLabelPeer() networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				netpolComponentLabel: "model-proxy",
+			},
+		},
+	}
+}
+
+// agentLabelPeer returns a NetworkPolicyPeer that selects the agent pod.
+func agentLabelPeer() networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				netpolComponentLabel: netpolAgentComponent,
+			},
+		},
+	}
+}
+
+// intstrPtr32 returns a pointer to an intstr.IntOrString with the given int.
+func intstrPtr32(v int32) *intstr.IntOrString {
+	ips := intstr.FromInt32(v)
+	return &ips
+}
+
+// protoPtr returns a pointer to the given Protocol.
+// modelEndpointPort extracts the port from a model endpoint URL.
+func modelEndpointPort(rawURL string) int {
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return 0
+	}
+	return port
+}
+
+// createOrUpdateNP creates or updates a NetworkPolicy.
+func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
+	return controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+		return nil
+	})
+}
+
+// netpolAgentComponent is the app.kubernetes.io/component label value for
+// the agent pod (D34 NetworkPolicy uses this to select the agent pod).
+const (
+	netpolAgentComponent = "agent"
+	netpolComponentLabel = "app.kubernetes.io/component"
+)
+
 // proxyLabels is the label set the per-Loop proxy pod carries and the proxy
 // Service selects on (D33). The Service selects ONLY these labels, so no other
 // pod in the namespace can be reached through <loop>-proxy (D29: this Loop's
@@ -445,8 +608,8 @@ func proxyServiceURL(loopName, namespace string) string {
 // rest).
 func proxyLabels(loopName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/component": "model-proxy",
-		"coxswain.io/proxy-for":       loopName,
+		netpolComponentLabel:    "model-proxy",
+		"coxswain.io/proxy-for": loopName,
 	}
 }
 

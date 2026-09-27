@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -21,6 +21,12 @@ func intstrPtr(v int32) *intstr.IntOrString {
 	ips := intstr.FromInt32(v)
 	return &ips
 }
+
+const (
+	d34TestRepo     = "https://github.com/papawattu/coxswain.git"
+	d34TestKey      = "key"
+	d34TestEndpoint = "http://model-endpoint:8000"
+)
 
 var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 	ctx := context.Background()
@@ -33,7 +39,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: loopName, Namespace: ns},
 			Spec: cxv1alpha1.LoopSpec{
 				Goal:      "D34 NetworkPolicy test",
-				Workspace: cxv1alpha1.Workspace{Repo: c6aTestRepo, Ref: loopRef},
+				Workspace: cxv1alpha1.Workspace{Repo: d34TestRepo, Ref: loopRef},
 				Agent: cxv1alpha1.AgentConfig{
 					Image:             runnerImage,
 					Model:             testModel,
@@ -45,7 +51,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 	}
 
 	// reconcile calls Reconcile and expects success.
-	reconcile := func(name, ns string) {
+	reconcileLoop := func(name, ns string) {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		Expect(err).ToNot(HaveOccurred(), "reconcile %s/%s: %v", ns, name, err)
@@ -58,8 +64,8 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "netpol-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:  "key",
-				modelBaseURL: "http://model-endpoint:8000",
+				modelAPIKey:  d34TestKey,
+				modelBaseURL: d34TestEndpoint,
 			},
 		}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
@@ -67,7 +73,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		loop := buildLoopWithNetPol("agent-np", ns, "netpol-creds")
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		reconcile("agent-np", ns)
+		reconcileLoop("agent-np", ns)
 
 		// The agent pod is named <loop>-sandbox. The NetworkPolicy must
 		// select it and set up default-deny egress to:
@@ -109,8 +115,8 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "proxy-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:  "key",
-				modelBaseURL: "http://model-endpoint:8000",
+				modelAPIKey:  d34TestKey,
+				modelBaseURL: d34TestEndpoint,
 			},
 		}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
@@ -118,7 +124,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		loop := buildLoopWithNetPol("proxy-np", ns, "proxy-creds")
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		reconcile("proxy-np", ns)
+		reconcileLoop("proxy-np", ns)
 
 		// The proxy NetworkPolicy must:
 		//   - Select the proxy pod (via proxy labels)
@@ -147,8 +153,10 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			Expect(np.Spec.Ingress).ToNot(BeEmpty(),
 				"the proxy NetworkPolicy must have ingress rules")
 			for _, ing := range np.Spec.Ingress {
-				Expect(ing.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{Port: intstrPtr(8080)}),
-					"the proxy ingress must allow port 8080")
+				Expect(ing.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+					Protocol: new(corev1.ProtocolTCP),
+					Port:     intstrPtr(8080),
+				}), "the proxy ingress must allow port 8080 TCP")
 			}
 
 			// Egress: model endpoint + DNS.

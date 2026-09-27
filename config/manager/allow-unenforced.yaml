@@ -17,7 +17,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: controller-manager
-  namespace: system
+  # The operator Deployment is in the <app>-system namespace (make deploy applies
+  # config/default, built into coxswain-system). Must match for the kubectl patch
+  # to find the Deployment.
+  namespace: coxswain-system
 spec:
   template:
     spec:

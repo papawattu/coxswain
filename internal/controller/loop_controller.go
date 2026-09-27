@@ -20,10 +20,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -81,7 +83,6 @@ type LoopReconciler struct {
 
 	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
 	// stand-in; overridable for the smoke test (e.g. the real proxy image).
-	ProxyImage string
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -434,120 +435,50 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		return fmt.Errorf("ensure proxy service %s/%s: %w", ns, proxyServiceName(loopName), err)
 	}
 
-	// --- proxy pod ---
-	proxySpecHash := proxyPodSpecHash(loop)
-	podDesired := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      proxyPodName(loopName),
-			Namespace: ns,
-			Labels:    proxyLabels(loopName),
-		},
+	// --- proxy pod (R15 fix: Get/create/delete, never Update a Pod spec) ---
+	// Build the desired pod spec first, then hash it. The hash covers the
+	// actual spec (image, command, limits, volumes), so any operator upgrade
+	// that changes the spec produces a different hash.
+	podDesired := buildProxyPod(loop, loopName, ns)
+	// Set the Loop as the controller owner (D33: GC with the Loop).
+	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
+		return fmt.Errorf("set owner ref on proxy pod %s/%s: %w", ns, proxyPodName(loopName), ownerErr)
 	}
-	podOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, podDesired, func() error {
-		falseP := false
-		trueP := true
-		readOnlyRootfs := true
-		// D33: the same hardening as the agent (I36 parity): non-root own UID
-		// (distinct from the agent's 65532), read-only rootfs, drop ALL caps,
-		// seccomp runtime default, no SA token, limits.
-		proxyUID := int64(65533)
-		proxyGID := int64(65533)
-		podDesired.Spec.AutomountServiceAccountToken = &falseP
-		podDesired.Spec.SecurityContext = &corev1.PodSecurityContext{
-			RunAsUser:  &proxyUID,
-			RunAsGroup: &proxyGID,
+	proxySpecHash := proxyPodSpecHash(podDesired)
+	podDesired.Annotations = map[string]string{proxySpecHashAnnotation: proxySpecHash}
+
+	existingPod := &corev1.Pod{}
+	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: proxyPodName(loopName)}, existingPod)
+	if apierrors.IsNotFound(err) {
+		// Pod doesn't exist: create it.
+		if createErr := r.Create(ctx, podDesired); createErr != nil {
+			return fmt.Errorf("create proxy pod %s/%s: %w", ns, proxyPodName(loopName), createErr)
 		}
-		podDesired.Spec.Containers = []corev1.Container{{
-			Name:  "proxy",
-			Image: r.proxyImage(),
-			Resources: corev1.ResourceRequirements{
-				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:              resource.MustParse("100m"),
-					corev1.ResourceMemory:           resource.MustParse("128Mi"),
-					corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
-				},
-				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("10m"),
-					corev1.ResourceMemory: resource.MustParse("32Mi"),
-				},
-			},
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: &falseP,
-				RunAsNonRoot:             &trueP,
-				RunAsUser:                &proxyUID,
-				RunAsGroup:               &proxyGID,
-				ReadOnlyRootFilesystem:   &readOnlyRootfs,
-				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-			},
-			// D33 kind-run acceptance: the stand-in must prove at runtime that it
-			// CAN read the 0444 model-creds Secret file (UID 65533, read-only
-			// rootfs). It logs the read to stdout (-> the pod log) and then keeps
-			// the pod alive. A permission error would surface as a crash / an
-			// empty log, which the acceptance run checks for.
-			Command: []string{
-				"sh", "-c",
-				"echo 'proxy-stand-in: checking model-creds'; " +
-					"if head -c 64 /model-creds/* >/dev/null 2>&1; then " +
-					"echo 'proxy: model-creds readable (0444 secret file present)'; " +
-					"else " +
-					"echo 'proxy: model-creds NOT readable' && exit 1; " +
-					"fi; " +
-					"exec sleep infinity",
-			},
-			VolumeMounts: []corev1.VolumeMount{
-				// The model key lives ONLY here (the proxy pod), never the agent (C2).
-				// P2: delivered as a read-only file, never env (env leaks to child
-				// processes, crash dumps, /proc/<pid>/environ).
-				{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
-			},
-		}}
-		// The model-creds Secret volume: read-only file mount (0444), the only
-		// place the model key lives in the cluster (C2/ADR-0006 item 2).
-		secretMode := readOnlyMode
-		podDesired.Spec.Volumes = []corev1.Volume{{
-			Name: modelCredsVolume,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  loop.Spec.Agent.EndpointSecretRef,
-					DefaultMode: &secretMode,
-				},
-			},
-		}}
-		podDesired.Annotations = map[string]string{proxySpecHashAnnotation: proxySpecHash}
-		return controllerutil.SetControllerReference(loop, podDesired, r.Scheme)
-	})
-	if err != nil {
-		return fmt.Errorf("ensure proxy pod %s/%s: %w", ns, proxyPodName(loopName), err)
-	}
-	// P2 (R15): if the existing pod's spec hash doesn't match the desired
-	// hash, the operator upgrade changed the pod spec. A bare Pod's spec is
-	// immutable, so delete and recreate.
-	if podOp == controllerutil.OperationResultUpdated {
-		existing := &corev1.Pod{}
-		if getErr := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: proxyPodName(loopName)}, existing); getErr == nil {
-			if existing.Annotations[proxySpecHashAnnotation] != proxySpecHash {
-				log.Info("proxy pod spec drift detected, deleting for recreation",
-					"proxy", proxyPodName(loopName), "loop", loopName)
-				if delErr := r.Delete(ctx, existing); delErr != nil {
-					return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
-				}
-			}
+		log.Info("ensured loop proxy (created)",
+			"proxy", proxyPodName(loopName), "namespace", ns, "loop", loopName)
+	} else if err != nil {
+		return fmt.Errorf("get proxy pod %s/%s: %w", ns, proxyPodName(loopName), err)
+	} else if existingPod.Annotations[proxySpecHashAnnotation] != proxySpecHash {
+		// Pod exists but the spec hash doesn't match: delete and requeue.
+		// A bare Pod's spec is immutable, so we can't Update it. Deleting
+		// triggers the Owns(Pod) watch, which re-reconciles and creates the
+		// new pod.
+		log.Info("proxy pod spec drift detected, deleting for recreation",
+			"proxy", proxyPodName(loopName), "loop", loopName)
+		if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
 		}
+		// Requeue so the next pass creates the new pod (the delete is
+		// asynchronous; the pod may not be gone yet).
+		return nil // the Owns(Pod) watch will trigger a re-reconcile
 	}
+	// Pod exists and hash matches: nothing to do.
+	podOp := controllerutil.OperationResultNone
 
 	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
-		log.V(1).Info("ensured loop proxy",
+		log.V(1).Info("ensured loop proxy (no change)",
 			"proxy", proxyPodName(loopName),
 			"namespace", ns,
-			"operation", "none",
-			"loop", loopName,
-		)
-	} else {
-		log.Info("ensured loop proxy",
-			"proxy", proxyPodName(loopName),
-			"namespace", ns,
-			"operation", podOp,
 			"loop", loopName,
 		)
 	}
@@ -695,17 +626,6 @@ func (r *LoopReconciler) sandboxImage() string {
 	return "docker.io/library/golang:1.26"
 }
 
-// proxyImage returns the model proxy sidecar image. It is the reconciler's
-// ProxyImage field (set from a manager flag in cmd/main.go, like SandboxImage),
-// or a dev stand-in (sleep infinity) when unset. The real proxy binary (auth
-// injection, forward-only-to-endpoint, metering) is C2b.
-func (r *LoopReconciler) proxyImage() string {
-	if r.ProxyImage != "" {
-		return r.ProxyImage
-	}
-	return "docker.io/library/golang:1.26"
-}
-
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -719,16 +639,98 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// buildProxyPod constructs the desired proxy pod for a Loop (D33). The spec
+// is the same hardening as the agent (I36 parity): non-root own UID,
+// read-only rootfs, drop ALL caps, seccomp runtime default, no SA token,
+// limits. The model-creds Secret is mounted read-only into the proxy pod ONLY
+// (C2/ADR-0006 item 2); the agent pod never sees the key.
+func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns string) *corev1.Pod {
+	falseP := false
+	trueP := true
+	readOnlyRootfs := true
+	proxyUID := int64(65533)
+	proxyGID := int64(65533)
+	secretMode := readOnlyMode
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxyPodName(loopName),
+			Namespace: ns,
+			Labels:    proxyLabels(loopName),
+		},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &falseP,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser:  &proxyUID,
+				RunAsGroup: &proxyGID,
+			},
+			Containers: []corev1.Container{{
+				Name:  "proxy",
+				Image: "example.com/coxswain/proxy:v1", // stand-in; a real binary in a future slice
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:              resource.MustParse("100m"),
+						corev1.ResourceMemory:           resource.MustParse("128Mi"),
+						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						corev1.ResourceMemory: resource.MustParse("32Mi"),
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &falseP,
+					RunAsNonRoot:             &trueP,
+					RunAsUser:                &proxyUID,
+					RunAsGroup:               &proxyGID,
+					ReadOnlyRootFilesystem:   &readOnlyRootfs,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				},
+				// D33 kind-run acceptance: the stand-in must prove at runtime
+				// that it CAN read the 0444 model-creds Secret file.
+				Command: []string{
+					"sh", "-c",
+					"echo 'proxy-stand-in: checking model-creds'; " +
+						"if head -c 64 /model-creds/* >/dev/null 2>&1; then " +
+						"echo 'proxy: model-creds readable (0444 secret file present)'; " +
+						"else " +
+						"echo 'proxy: model-creds NOT readable' && exit 1; " +
+						"fi; " +
+						"exec sleep infinity",
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
+				},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: modelCredsVolume,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName:  loop.Spec.Agent.EndpointSecretRef,
+						DefaultMode: &secretMode,
+					},
+				},
+			}},
+		},
+	}
+	return pod
+}
+
 // proxyPodSpecHash computes a stable hash of the proxy pod's desired spec
-// (P2, R15). The hash covers the fields that change across operator releases
-// or Loop updates. Since endpointSecretRef is immutable (P2, R15), the only
-// drift source is operator upgrades (image, command, limits). The hash is
+// (R15 fix: hash the actual pod spec, not a literal string). The hash is
 // stored on the pod as the proxySpecHashAnnotation; on a mismatch the operator
 // deletes and recreates the pod (spec.volumes is immutable on a bare Pod).
-func proxyPodSpecHash(loop *coxv1alpha1.Loop) string {
+func proxyPodSpecHash(pod *corev1.Pod) string {
+	// Hash the spec only (not the metadata, which includes the annotation we're
+	// computing — that would be a circular dependency).
+	data, err := json.Marshal(pod.Spec)
+	if err != nil {
+		// The spec is a Go struct of known types; marshaling should never fail.
+		// If it does, return a fixed hash so the pod is never deleted.
+		return "unhashable"
+	}
 	h := sha256.New()
-	h.Write([]byte("proxy-spec-hash-v1|"))
-	h.Write([]byte(loop.Spec.Agent.EndpointSecretRef))
-	h.Write([]byte("|stand-in-v1"))
+	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }

@@ -46,6 +46,40 @@ func TestEmitKubeArmorPolicyShape(t *testing.T) {
 
 // P1 #3: exec allows are emitted under process.matchPaths (objects {path}),
 // action Allow — NOT syscalls.
+// KubeArmor's process.matchPaths[].path requires an absolute-path pattern (^/+.*[^/]$), not a bare
+// binary name. The emitter must emit exec allows as */<binary> (match at any depth).
+func TestEmitKubeArmorPolicyExecPathIsAbsolutePattern(t *testing.T) {
+	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
+		Exec: []string{"go"},
+	}))
+	spec := obj.Object["spec"].(map[string]any)
+	proc, ok := spec["process"].(map[string]any)
+	if !ok {
+		t.Fatal("no process block")
+	}
+	items, _ := proc["matchPaths"].([]any)
+	if len(items) == 0 {
+		t.Fatal("no process.matchPaths")
+	}
+	first := items[0].(map[string]any)
+	if first["path"] != "/**/go" {
+		t.Errorf("exec allow %q must be emitted as the absolute pattern /**/go (KubeArmor requires a path), got %q", "go", first["path"])
+	}
+}
+
+// The policy must be default-deny at the spec level: spec.action = Block, with the
+// per-rule action: Allow as the carve-out. Without it KubeArmor defaults to Audit
+// (log only) and nothing is actually blocked.
+func TestEmitKubeArmorPolicyTopLevelActionIsBlock(t *testing.T) {
+	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
+		Exec: []string{"go"},
+	}))
+	spec := obj.Object["spec"].(map[string]any)
+	if spec["action"] != "Block" {
+		t.Fatalf("spec.action must be Block (default-deny), got %v (KubeArmor defaults to Audit without it)", spec["action"])
+	}
+}
+
 func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 	obj := EmitKubeArmorPolicy("loop-x", "ns-x", epForTest())
 	spec := obj.Object["spec"].(map[string]any)
@@ -63,8 +97,8 @@ func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 		m := it.(map[string]any)
 		paths = append(paths, m["path"].(string))
 	}
-	if !slices.Contains(paths, testExecGit) || !slices.Contains(paths, testExecGo) {
-		t.Fatalf("process.matchPaths must include git and go, got %v", paths)
+	if !slices.Contains(paths, "/**/"+testExecGit) || !slices.Contains(paths, "/**/"+testExecGo) {
+		t.Fatalf("process.matchPaths must include /**/git and /**/go, got %v", paths)
 	}
 	if _, has := spec["syscalls"]; has {
 		t.Fatal("syscalls must NOT be set (monitoring-only); exec allows live in process")
@@ -110,7 +144,7 @@ func TestEmitKubeArmorPolicyUnionsContainers(t *testing.T) {
 	for _, it := range items {
 		paths = append(paths, it.(map[string]any)["path"].(string))
 	}
-	if len(paths) != 1 || paths[0] != testExecGit {
+	if len(paths) != 1 || paths[0] != "/**/"+testExecGit {
 		t.Fatalf("union across containers must keep the agent's exec allow, got %v", paths)
 	}
 }

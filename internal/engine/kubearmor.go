@@ -58,8 +58,21 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 	exec = dedupe(exec)
 	network = dedupe(network)
 	files = dedupe(files)
+	// KubeArmor's process.matchPaths[].path requires an absolute-path pattern
+	// (^/+.*[^/]$), not a bare binary name. A user allow like "go" is emitted as
+	// "/**/go" so it matches the binary at any depth (the agent's PATH). KubeArmor's
+	// path validation requires an absolute path (^/+.*[^/]$), so the leading slash is
+	// mandatory.
+	execPaths := make([]string, 0, len(exec))
+	for _, e := range exec {
+		execPaths = append(execPaths, "/**/"+e)
+	}
 
 	spec := map[string]any{
+		// Default-deny posture: KubeArmor's spec.action defaults to Audit (log
+		// only, nothing blocked). Set it to Block so disallows are enforced; the
+		// per-rule action: Allow is the carve-out.
+		"action": "Block",
 		"selector": map[string]any{
 			"matchLabels": map[string]any{"coxswain.io/loop": loopName},
 		},
@@ -69,7 +82,7 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 	if len(exec) > 0 {
 		spec["process"] = map[string]any{
 			kaptActionKey: kaptAllowAction,
-			"matchPaths":  toPathItems(exec),
+			"matchPaths":  toPathItems(execPaths),
 		}
 	}
 	// network allows → matchDNSQueries items ({domain}) + matchProtocols items

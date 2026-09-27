@@ -97,6 +97,7 @@ KIND_NODE_IMAGE ?= kindest/node:v1.34.0
 # no controller image existed). The version is pinned here, in exactly one
 # place, and the release manifest is derived from it.
 AGENT_SANDBOX_VERSION ?= v1.0.4
+KUBEARMOR_VERSION ?= v1.7.5
 AGENT_SANDBOX_MANIFEST ?= https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)/sandbox.yaml
 # The controller image the release manifest references (pre-loaded into the
 # kind node so an offline host doesn't depend on the node reaching
@@ -124,6 +125,14 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 		|| echo "(could not pre-load $(AGENT_SANDBOX_CONTROLLER_IMAGE); the node will pull it)"
 	@echo "Waiting for the agent-sandbox controller to be ready..."
 	kubectl rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=120s
+	@echo "Installing KubeArmor $(KUBEARMOR_VERSION) via the pinned karmor CLI..."
+	@mkdir -p bin
+	@command -v bin/karmor >/dev/null 2>&1 || \
+		curl -sfL "https://github.com/kubearmor/kubearmor-client/releases/download/v1.4.9/karmor_1.4.9_linux_amd64.tar.gz" \
+		| tar xz -C bin
+	@bin/karmor install --tag $(KUBEARMOR_VERSION) || \
+		{ echo "KubeArmor install failed (needs --tag $(KUBEARMOR_VERSION), the v-prefix is mandatory for Docker Hub tags)"; exit 1; }
+	@echo "KubeArmor $(KUBEARMOR_VERSION) installed (BPF-LSM enforcer)."
 
 .PHONY: kind-smoke
 kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True
@@ -146,6 +155,12 @@ crd-drift-check: ## Fail if the vendored agent-sandbox CRD drifts from the relea
 
 .PHONY: setup-test-e2e
 setup-test-e2e: kind-up crd-drift-check ## Set up a Kind cluster for e2e tests (with agent-sandbox installed)
+
+# C6b exec-block e2e: install KubeArmor (pinned) and prove a disallowed exec in
+# the agent container is blocked by the operator's KubeArmorPolicy. Requires the
+# kind cluster + operator (make deploy with --allow-unenforced) already running.
+kubearmor-e2e:
+	@KUBEARMOR_VERSION=$(KUBEARMOR_VERSION) bash test/e2e/kubearmor-exec-block.sh
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.

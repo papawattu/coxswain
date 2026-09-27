@@ -143,10 +143,12 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 			 -e 's/defaultCapabilitiesPosture:.*/defaultCapabilitiesPosture: block/' \
 			 -e 's/visibility:.*/visibility: process,file,network,capabilities/' \
 		| kubectl apply -f - \
-		&& KA_DS_NS=$$(kubectl get daemonset -A --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/{print $$1; exit}') \
-		&& [ -n "$$KA_DS_NS" ] \
-		&& kubectl -n "$$KA_DS_NS" rollout restart daemonset/kubearmor \
-		&& kubectl -n "$$KA_DS_NS" rollout status daemonset/kubearmor --timeout=120s \
+		&& KA_DS=$$(kubectl get daemonset -A -l 'kubearmor-app=kubearmor' --no-headers 2>/dev/null | awk 'NF{print "$$1/"$$2; exit}') \
+		&& { [ -n "$$KA_DS" ] || KA_DS=$$(kubectl get daemonset -A --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/{print "$$1/"$$2; exit}'); } \
+		&& [ -n "$$KA_DS" ] \
+		&& echo "   KubeArmor agent DaemonSet: $$KA_DS" \
+		&& kubectl rollout restart "$$KA_DS" \
+		&& kubectl rollout status "$$KA_DS" --timeout=120s \
 		|| { echo "Could not set KubeArmor block posture (posture stays audit -> exec e2e will not block)"; exit 1; }
 
 .PHONY: kind-smoke

@@ -80,7 +80,7 @@ Policy and splits the audit terms; C3/C6/C7 are in the plan with seams.
 
 ### I31. Owner's CONTEXT.md edit landed inside the D27 commit
 
-- [ ] Done (process note)
+- [x] Done (process note: AGENTS.md Review protocol now requires explicit-path `git add`, never `-A`, I31)
 
 `c0942a4` ("D27: stale-evidence check…") also contains the owner's
 `CONTEXT.md` change, because it was staged in the shared tree when the

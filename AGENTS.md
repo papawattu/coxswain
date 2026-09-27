@@ -17,6 +17,13 @@ A separate reviewer agent reviews commits and hands back work as docs only.
   commit hash. Reference the issue ID in the fix commit subject
   (e.g. `I6: …`). Don't edit other parts of a review doc; reply to a
   verdict by adding a `Builder response:` line under the issue.
+- **Stage explicit paths, never `git add -A`** (I31). The owner and reviewer
+  both edit files in the same tree; `git add -A` sweeps their in-progress edits
+  (e.g. the owner's `CONTEXT.md` direction change) into builder commits and
+  mis-attributes product-direction changes to bug fixes. Always `git add
+  <explicit files>` so a commit contains only what the builder changed. Don't
+  rewrite history to fix an accidental sweep — note it and use explicit paths
+  from then on.
 
 ## Project Structure
 

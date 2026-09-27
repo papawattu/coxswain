@@ -229,3 +229,23 @@ containers, per D29). It does **not** cover:
   `spec.policyRefs[]`; KubeArmor over Tetragon; JSON-lines envelope; two-layer
   egress) are the **reviewer's** recommendations and are overridable by the
   owner — recorded here as recommendations, not settled.
+
+## Known limit: NetworkPolicy cannot match DNS names (D34, alongside I41)
+
+Kubernetes `NetworkPolicy` selects by pod/namespace labels or IP blocks, not
+by DNS name. For the proxy's model egress rule (D34), this means:
+
+- An **in-cluster** endpoint (a same-namespace Service name like `vllm:8000`)
+  is expressed as a same-namespace podSelector — which admits **any** pod in
+  that namespace on the model port, not just the target Service. The
+  hostname-level precision (only `vllm`, not `other-service`) is enforced by
+  the proxy's **KubeArmor** policy (D35), which CAN match the DNS query
+  domain.
+- An **external** endpoint (FQDN that does not resolve to an in-cluster IP)
+  cannot be expressed in a NetworkPolicy at all. The model egress rule is
+  omitted (fail-closed) and the hostname-level allow belongs to the
+  KubeArmor proxy policy.
+
+This is recorded here so that the D34 NetworkPolicy's coarser-grained
+model-egress peer is understood as the outer fence (port-level), with the
+D35 KubeArmor policy providing the inner fence (hostname-level).

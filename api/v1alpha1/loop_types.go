@@ -190,6 +190,19 @@ type AgentConfig struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="endpointSecretRef is immutable (the proxy pod's spec.volumes cannot change)"
 	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
 
+	// modelEndpoint is the model server's in-cluster address (host:port,
+	// e.g. "vllm:8000"). It is NOT secret — only the API key is. D34 uses it
+	// to build the proxy pod's NetworkPolicy egress rule (NetworkPolicy
+	// cannot match DNS names, only pod/namespace selectors or IP blocks).
+	// Immutable for the same reason as endpointSecretRef: it changes the
+	// proxy NetworkPolicy, and the D33 spec-hash contract keeps things
+	// simple by not allowing post-creation changes.
+	//
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="modelEndpoint is immutable"
+	// +kubebuilder:validation:MaxLength=253
+	ModelEndpoint string `json:"modelEndpoint,omitempty"`
+
 	// env carries literal-only environment variables for the agent container
 	// (I34: a valueFrom/secretKeyRef form is not expressible here, so a Loop
 	// author cannot inject a Secret into the agent). Names are limited to

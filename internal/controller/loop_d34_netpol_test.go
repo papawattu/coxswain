@@ -7,13 +7,13 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
 // intstrPtr returns a pointer to an intstr.IntOrString with the given int.
@@ -31,10 +31,7 @@ const (
 var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 	ctx := context.Background()
 
-	// Helper: build a Loop with an endpointSecretRef (so the proxy pod +
-	// Service are created, and the NetworkPolicy has a model endpoint to
-	// reference in the proxy egress rule).
-	buildLoopWithNetPol := func(loopName, ns, secretName string) *cxv1alpha1.Loop {
+	buildLoopWithNetPol := func(loopName, ns, secretName, modelEndpoint string) *cxv1alpha1.Loop {
 		return &cxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: loopName, Namespace: ns},
 			Spec: cxv1alpha1.LoopSpec{
@@ -44,124 +41,204 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 					Image:             runnerImage,
 					Model:             testModel,
 					EndpointSecretRef: secretName,
+					ModelEndpoint:     modelEndpoint,
 				},
 				Loop: cxv1alpha1.LoopSettings{MaxIterations: 1},
 			},
 		}
 	}
 
-	// reconcile calls Reconcile and expects success.
 	reconcileLoop := func(name, ns string) {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		Expect(err).ToNot(HaveOccurred(), "reconcile %s/%s: %v", ns, name, err)
 	}
 
-	It("creates a per-Loop NetworkPolicy for the agent pod (default-deny egress to proxy + DNS)", func() {
+	makeSecret := func(name, ns string) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:  d34TestKey,
+				modelBaseURL: d34TestEndpoint,
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+	}
+
+	It("agent NetworkPolicy: per-Loop podSelector, ingress deny-all, egress to own proxy + kube-dns", func() {
 		ns := "d34-agent-netpol"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		makeSecret("netpol-creds", ns)
 
-		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "netpol-creds", Namespace: ns},
-			StringData: map[string]string{
-				modelAPIKey:  d34TestKey,
-				modelBaseURL: d34TestEndpoint,
-			},
-		}
-		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
-
-		loop := buildLoopWithNetPol("agent-np", ns, "netpol-creds")
+		loop := buildLoopWithNetPol("agent-np", ns, "netpol-creds", "vllm:8000")
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-
 		reconcileLoop("agent-np", ns)
 
-		// The agent pod is named <loop>-sandbox. The NetworkPolicy must
-		// select it and set up default-deny egress to:
-		//   1. The proxy pod on port 8080 (via the proxy labels)
-		//   2. DNS (port 53 UDP/TCP)
-		//   3. The AgentPolicy network allows (none in this test)
-		// Ingress: none (default-deny).
-
-		// Check that a NetworkPolicy named <loop>-agent-netpol exists.
 		np := &networkingv1.NetworkPolicy{}
-		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "agent-np-agent-netpol"}, np)
-		// The NetworkPolicy may not exist yet if the implementation hasn't
-		// been written. This test is RED first.
-		if !apierrors.IsNotFound(err) {
-			// If it exists, verify the shape.
-			Expect(err).ToNot(HaveOccurred())
-			Expect(np.OwnerReferences).To(HaveLen(1),
-				"the NetworkPolicy must be owner-ref'd to the Loop")
-			Expect(np.OwnerReferences[0].Kind).To(Equal("Loop"))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "agent-np-agent-netpol"}, np)).To(Succeed())
 
-			// Pod selector: select the agent pod.
-			Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
-				"app.kubernetes.io/component", "agent",
-			), "the NetworkPolicy must select the agent pod")
+		// Owner ref to the Loop.
+		Expect(np.OwnerReferences).To(HaveLen(1))
+		Expect(np.OwnerReferences[0].Kind).To(Equal("Loop"))
+		Expect(np.OwnerReferences[0].Name).To(Equal("agent-np"))
 
-			// Policy types: Egress (no ingress rules)
-			Expect(np.Spec.PolicyTypes).To(ContainElement(networkingv1.PolicyTypeEgress))
+		// Pod selector: per-Loop agent labels (P1-1: names only its own Loop).
+		Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/loop", "agent-np",
+		))
+		Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"app.kubernetes.io/component", "agent",
+		))
 
-			// Egress rules: at least proxy on 8080 + DNS.
-			Expect(np.Spec.Egress).ToNot(BeEmpty(),
-				"the agent NetworkPolicy must have egress rules")
-		}
+		// Policy types: Ingress (deny-all) + Egress (P1-2).
+		Expect(np.Spec.PolicyTypes).To(ContainElement(networkingv1.PolicyTypeIngress))
+		Expect(np.Spec.PolicyTypes).To(ContainElement(networkingv1.PolicyTypeEgress))
+
+		// Ingress: zero rules (deny-all).
+		Expect(np.Spec.Ingress).To(BeEmpty(),
+			"the agent NetworkPolicy must have zero ingress rules (deny-all)")
+
+		// Egress rule 0: to this Loop's proxy on 8080 (per-Loop peer, P1-1).
+		Expect(np.Spec.Egress).To(HaveLen(2))
+		proxyEgress := np.Spec.Egress[0]
+		Expect(proxyEgress.To).To(HaveLen(1))
+		Expect(proxyEgress.To[0].PodSelector).ToNot(BeNil())
+		Expect(proxyEgress.To[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/proxy-for", "agent-np",
+		), "the proxy peer must name this Loop (P1-1)")
+		Expect(proxyEgress.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+			Protocol: new(corev1.ProtocolTCP),
+			Port:     intstrPtr(8080),
+		}))
+
+		// Egress rule 1: DNS to kube-dns in kube-system (P1-3).
+		dnsEgress := np.Spec.Egress[1]
+		Expect(dnsEgress.To).To(HaveLen(1))
+		dnsPeer := dnsEgress.To[0]
+		Expect(dnsPeer.NamespaceSelector).ToNot(BeNil())
+		Expect(dnsPeer.NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+			"kubernetes.io/metadata.name", "kube-system",
+		))
+		Expect(dnsPeer.PodSelector).ToNot(BeNil())
+		Expect(dnsPeer.PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"k8s-app", "kube-dns",
+		))
+		Expect(dnsEgress.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+			Protocol: new(corev1.ProtocolUDP),
+			Port:     intstrPtr(53),
+		}))
 	})
 
-	It("creates a per-Loop NetworkPolicy for the proxy pod (ingress from agent, egress to endpoint + DNS)", func() {
+	It("proxy NetworkPolicy: per-Loop podSelector, ingress from own agent, egress to model peer + kube-dns", func() {
 		ns := "d34-proxy-netpol"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		makeSecret("proxy-creds", ns)
 
-		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "proxy-creds", Namespace: ns},
-			StringData: map[string]string{
-				modelAPIKey:  d34TestKey,
-				modelBaseURL: d34TestEndpoint,
-			},
-		}
-		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
-
-		loop := buildLoopWithNetPol("proxy-np", ns, "proxy-creds")
+		loop := buildLoopWithNetPol("proxy-np", ns, "proxy-creds", "vllm:8000")
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-
 		reconcileLoop("proxy-np", ns)
 
-		// The proxy NetworkPolicy must:
-		//   - Select the proxy pod (via proxy labels)
-		//   - Ingress: only from the agent pod on 8080
-		//   - Egress: only to the model endpoint + DNS
 		np := &networkingv1.NetworkPolicy{}
-		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "proxy-np-proxy-netpol"}, np)
-		if !apierrors.IsNotFound(err) {
-			Expect(err).ToNot(HaveOccurred())
-			Expect(np.OwnerReferences).To(HaveLen(1))
-			Expect(np.OwnerReferences[0].Kind).To(Equal("Loop"))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "proxy-np-proxy-netpol"}, np)).To(Succeed())
 
-			// Pod selector: the proxy labels.
-			Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
-				"app.kubernetes.io/component", "model-proxy",
-			), "the NetworkPolicy must select the proxy pod")
-			Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
-				"coxswain.io/proxy-for", "proxy-np",
-			))
+		Expect(np.OwnerReferences).To(HaveLen(1))
+		Expect(np.OwnerReferences[0].Kind).To(Equal("Loop"))
 
-			// Policy types: Ingress + Egress.
-			Expect(np.Spec.PolicyTypes).To(ContainElement(networkingv1.PolicyTypeIngress))
-			Expect(np.Spec.PolicyTypes).To(ContainElement(networkingv1.PolicyTypeEgress))
+		// Pod selector: per-Loop proxy labels (P1-1).
+		Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/proxy-for", "proxy-np",
+		))
+		Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"app.kubernetes.io/component", "model-proxy",
+		))
 
-			// Ingress: only from the agent pod on 8080.
-			Expect(np.Spec.Ingress).ToNot(BeEmpty(),
-				"the proxy NetworkPolicy must have ingress rules")
-			for _, ing := range np.Spec.Ingress {
-				Expect(ing.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
-					Protocol: new(corev1.ProtocolTCP),
-					Port:     intstrPtr(8080),
-				}), "the proxy ingress must allow port 8080 TCP")
-			}
+		// Ingress: only from this Loop's agent on 8080 (per-Loop peer, P1-1).
+		Expect(np.Spec.Ingress).To(HaveLen(1))
+		Expect(np.Spec.Ingress[0].From).To(HaveLen(1))
+		Expect(np.Spec.Ingress[0].From[0].PodSelector).ToNot(BeNil())
+		Expect(np.Spec.Ingress[0].From[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/loop", "proxy-np",
+		), "the agent peer must name this Loop (P1-1)")
+		Expect(np.Spec.Ingress[0].Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+			Protocol: new(corev1.ProtocolTCP),
+			Port:     intstrPtr(8080),
+		}))
 
-			// Egress: model endpoint + DNS.
-			Expect(np.Spec.Egress).ToNot(BeEmpty(),
-				"the proxy NetworkPolicy must have egress rules")
-		}
+		// Egress: DNS + model endpoint.
+		Expect(np.Spec.Egress).To(HaveLen(2))
+
+		// Egress rule 0: DNS to kube-dns (P1-3).
+		Expect(np.Spec.Egress[0].To).To(HaveLen(1))
+		Expect(np.Spec.Egress[0].To[0].NamespaceSelector).ToNot(BeNil())
+		Expect(np.Spec.Egress[0].To[0].NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+			"kubernetes.io/metadata.name", "kube-system",
+		))
+
+		// Egress rule 1: model endpoint (vllm:8000 → same-namespace podSelector, P1-4).
+		Expect(np.Spec.Egress[1].To).To(HaveLen(1))
+		Expect(np.Spec.Egress[1].To[0].PodSelector).ToNot(BeNil(),
+			"in-cluster Service name should produce a podSelector peer (P1-4)")
+		Expect(np.Spec.Egress[1].Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+			Protocol: new(corev1.ProtocolTCP),
+			Port:     intstrPtr(8000),
+		}))
+	})
+
+	It("two Loops in one namespace get disjoint NetworkPolicies (P1-1 acceptance)", func() {
+		ns := "d34-two-loops"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		makeSecret("creds-a", ns)
+		makeSecret("creds-b", ns)
+
+		loopA := buildLoopWithNetPol("loop-a", ns, "creds-a", "vllm-a:8000")
+		loopB := buildLoopWithNetPol("loop-b", ns, "creds-b", "vllm-b:8001")
+		Expect(k8sClient.Create(ctx, loopA)).To(Succeed())
+		Expect(k8sClient.Create(ctx, loopB)).To(Succeed())
+		reconcileLoop("loop-a", ns)
+		reconcileLoop("loop-b", ns)
+
+		// Agent NP for loop-a must NOT match loop-b's agent.
+		npA := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "loop-a-agent-netpol"}, npA)).To(Succeed())
+		Expect(npA.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue("coxswain.io/loop", "loop-a"))
+		// The proxy peer in loop-a's agent NP must name loop-a's proxy.
+		Expect(npA.Spec.Egress[0].To[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/proxy-for", "loop-a",
+		))
+
+		// Agent NP for loop-b must NOT match loop-a's agent.
+		npB := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "loop-b-agent-netpol"}, npB)).To(Succeed())
+		Expect(npB.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue("coxswain.io/loop", "loop-b"))
+		Expect(npB.Spec.Egress[0].To[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/proxy-for", "loop-b",
+		))
+
+		// Proxy NP for loop-a: ingress only from loop-a's agent.
+		npProxyA := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "loop-a-proxy-netpol"}, npProxyA)).To(Succeed())
+		Expect(npProxyA.Spec.Ingress[0].From[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/loop", "loop-a",
+		))
+	})
+
+	It("sandbox pod template carries the per-Loop agent labels (P1-1: NetworkPolicy can select it)", func() {
+		ns := "d34-agent-labels"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		makeSecret("label-creds", ns)
+
+		loop := buildLoopWithNetPol("label-np", ns, "label-creds", "vllm:8000")
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcileLoop("label-np", ns)
+
+		// The Sandbox CR's pod template should carry the agent labels.
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "label-np-sandbox"}, sb)).To(Succeed())
+		Expect(sb.Spec.PodTemplate.ObjectMeta.Labels).To(HaveKeyWithValue(
+			"coxswain.io/loop", "label-np",
+		), "the sandbox pod template must carry coxswain.io/loop (D34 P1-1)")
+		Expect(sb.Spec.PodTemplate.ObjectMeta.Labels).To(HaveKeyWithValue(
+			"app.kubernetes.io/component", "agent",
+		))
 	})
 })

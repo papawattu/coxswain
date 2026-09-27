@@ -22,9 +22,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-
+	"maps"
+	"net"
 	neturl "net/url"
 	"strconv"
+	"strings"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -101,6 +103,8 @@ type LoopReconciler struct {
 // with the Loop. Only the verbs the controller actually uses.
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
+// D34: the operator creates per-Loop NetworkPolicies (ensureNetworkPolicy).
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -246,6 +250,17 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
+		// D34: the sandbox pod carries the per-Loop agent label set so the
+		// per-Loop NetworkPolicy can select ONLY this Loop's agent (a
+		// component-only selector would let any agent in the namespace use
+		// any Loop's proxy). agent-sandbox propagates
+		// spec.podTemplate.metadata.labels to the pod (C6b relies on this
+		// for the KubeArmorPolicy selector). Merged, not overwritten, so it
+		// composes with C6b's coxswain.io/loop label when both slices land.
+		if desired.Spec.PodTemplate.ObjectMeta.Labels == nil {
+			desired.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{}
+		}
+		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, agentPodLabels(loop.Name))
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
 		// C2 (P2): never share the process namespace. The proxy and agent run as
 		// different UIDs, but a shared PID namespace would let the (untrusted) agent
@@ -445,51 +460,112 @@ func proxyServiceURL(loopName, namespace string) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d", proxyServiceName(loopName), namespace, proxyPort)
 }
 
+// dnsPeer is the NetworkPolicy peer for cluster DNS (P1-3, R16 review):
+// port 53 to the kube-dns pods in kube-system ONLY. A port-only rule would
+// allow 53 to any destination (a ready-made exfiltration channel via an
+// attacker-controlled DNS server).
+func dnsPeer() networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"kubernetes.io/metadata.name": "kube-system",
+			},
+		},
+		PodSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"k8s-app": "kube-dns",
+			},
+		},
+	}
+}
+
+// dnsPorts returns the DNS egress/ingress port set (53 UDP + TCP).
+func dnsPorts() []networkingv1.NetworkPolicyPort {
+	return []networkingv1.NetworkPolicyPort{
+		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
+		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
+	}
+}
+
+// modelPeer is the NetworkPolicy peer for the proxy's model egress (P1-4,
+// R16 review). NetworkPolicy cannot match DNS names, so:
+//   - a bare in-cluster Service name (single-label, same namespace as the
+//     policy): a podSelector over all pods in that namespace — the tightest
+//     selector that resolves the name without needing to watch Services. The
+//     hostname-level precision (only this host, not the whole namespace) is
+//     enforced by the proxy's KubeArmor policy (D35) which CAN match the DNS
+//     query. Recorded as a known limit in ADR-0007 alongside I41.
+//   - a numeric IP: an exact ipBlock /32.
+//   - anything else (external FQDN that does not resolve here): no peer —
+//     the model egress rule is omitted entirely (fail-closed), and the
+//     hostname-level allow belongs to D35's KubeArmor proxy policy.
+func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
+	host := endpoint
+	if strings.Contains(endpoint, "://") {
+		if u, err := neturl.Parse(endpoint); err == nil && u.Host != "" {
+			host = u.Host
+		}
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		cidr := ip.String() + "/32"
+		return &networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}}
+	}
+	if len(host) > 0 && host[0] != '.' && !strings.Contains(host, ".") {
+		return &networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{}},
+		}
+	}
+	return nil
+}
+
 // ensureNetworkPolicy creates the per-Loop NetworkPolicies (D34):
-//  1. Agent pod NetworkPolicy: default-deny egress, allow only to the
-//     proxy pod on 8080 and DNS (port 53 UDP/TCP). No ingress.
-//  2. Proxy pod NetworkPolicy: ingress only from the agent pod on 8080,
-//     egress only to the model endpoint and DNS (port 53 UDP/TCP).
+//  1. Agent pod: ingress deny-all; egress only to THIS Loop's proxy on 8080
+//     and cluster DNS (kube-dns in kube-system, port 53 UDP/TCP).
+//  2. Proxy pod: ingress only from THIS Loop's agent on 8080; egress only to
+//     the model endpoint peer (pod selector or ipBlock) and cluster DNS.
 //
-// Both are owner-ref'd to the Loop so they are GC'd with it.
+// Every selector and peer is per-Loop (P1-1, R16 review): the agent pod
+// carries coxswain.io/loop=<loop> + the agent component label (set on the
+// Sandbox pod template by ensureSandbox), the proxy pod carries
+// coxswain.io/proxy-for=<loop> (D33). Two Loops in one namespace therefore
+// get two disjoint policy pairs and no cross-Loop traffic is allowed.
+//
+// Both policies are owner-ref'd to the Loop so they are GC'd with it.
 func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	ns := loop.Namespace
 	loopName := loop.Name
-
-	// Read the model endpoint from the secret (for the proxy egress rule).
-	modelEndpoint := ""
-	if loop.Spec.Agent.EndpointSecretRef != "" {
-		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: loop.Spec.Agent.EndpointSecretRef}, secret); err == nil {
-			if url, ok := secret.Data["MODEL_BASE_URL"]; ok {
-				modelEndpoint = string(url)
-			}
-		}
+	agentLabels := agentPodLabels(loopName)
+	proxyL := proxyLabels(loopName)
+	proxyPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: proxyL},
+	}
+	agentPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
 	}
 
-	// Agent pod NetworkPolicy: default-deny egress to proxy + DNS.
+	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
+	// none" — the agent pod must be unreachable from every other pod,
+	// including other Loops' agents), egress to this Loop's proxy + DNS.
 	agentNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-agent-netpol",
 			Namespace: ns,
 		},
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					netpolComponentLabel: netpolAgentComponent,
-				},
-			},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			PodSelector: metav1.LabelSelector{MatchLabels: agentLabels},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+			Ingress:     []networkingv1.NetworkPolicyIngressRule{},
 			Egress: []networkingv1.NetworkPolicyEgressRule{
 				{
-					To:    []networkingv1.NetworkPolicyPeer{proxyLabelPeer()},
+					To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
 					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
 				},
 				{
-					Ports: []networkingv1.NetworkPolicyPort{
-						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
-						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
-					},
+					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+					Ports: dnsPorts(),
 				},
 			},
 		},
@@ -501,37 +577,39 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		return fmt.Errorf("create or update agent NetworkPolicy: %w", err)
 	}
 
-	// Proxy pod NetworkPolicy: ingress from agent on 8080, egress to model endpoint + DNS.
+	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, egress
+	// to the model endpoint peer + cluster DNS.
 	proxyNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-proxy-netpol",
 			Namespace: ns,
 		},
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{
-				MatchLabels: proxyLabels(loopName),
-			},
+			PodSelector: metav1.LabelSelector{MatchLabels: proxyL},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{
 				{
-					From:  []networkingv1.NetworkPolicyPeer{agentLabelPeer()},
+					From:  []networkingv1.NetworkPolicyPeer{agentPeer},
 					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
 				},
 			},
 			Egress: []networkingv1.NetworkPolicyEgressRule{
 				{
-					Ports: []networkingv1.NetworkPolicyPort{
-						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
-						{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
-					},
+					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+					Ports: dnsPorts(),
 				},
 			},
 		},
 	}
-	if modelEndpoint != "" {
-		if port := modelEndpointPort(modelEndpoint); port > 0 {
+	// P2 (R16 review): the model endpoint is a non-secret Loop spec field
+	// (agent.modelEndpoint), not read from the Secret (which would require
+	// cluster-wide secrets RBAC and a cluster-wide Secret informer).
+	if loop.Spec.Agent.ModelEndpoint != "" {
+		if peer := modelPeer(loop.Spec.Agent.ModelEndpoint); peer != nil {
+			port := intstrPtr32(int32(modelEndpointPort(loop.Spec.Agent.ModelEndpoint)))
 			proxyNP.Spec.Egress = append(proxyNP.Spec.Egress, networkingv1.NetworkPolicyEgressRule{
-				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(int32(port)), Protocol: new(corev1.ProtocolTCP)}},
+				To:    []networkingv1.NetworkPolicyPeer{*peer},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
 			})
 		}
 	}
@@ -545,25 +623,16 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	return nil
 }
 
-// proxyLabelPeer returns a NetworkPolicyPeer that selects the proxy pod.
-func proxyLabelPeer() networkingv1.NetworkPolicyPeer {
-	return networkingv1.NetworkPolicyPeer{
-		PodSelector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				netpolComponentLabel: "model-proxy",
-			},
-		},
-	}
-}
-
-// agentLabelPeer returns a NetworkPolicyPeer that selects the agent pod.
-func agentLabelPeer() networkingv1.NetworkPolicyPeer {
-	return networkingv1.NetworkPolicyPeer{
-		PodSelector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				netpolComponentLabel: netpolAgentComponent,
-			},
-		},
+// agentPodLabels is the label set the agent (sandbox) pod carries (D34):
+// the per-Loop identity (coxswain.io/loop) plus the agent component. The
+// per-Loop NetworkPolicy podSelector and the proxy's ingress peer select
+// EXACTLY this set, so policies never leak across Loops in a namespace.
+// C6b's KubeArmorPolicy selector also keys on coxswain.io/loop, so the two
+// slices compose on the same label.
+func agentPodLabels(loopName string) map[string]string {
+	return map[string]string{
+		"coxswain.io/loop":   loopName,
+		netpolComponentLabel: netpolAgentComponent,
 	}
 }
 
@@ -573,18 +642,24 @@ func intstrPtr32(v int32) *intstr.IntOrString {
 	return &ips
 }
 
-// protoPtr returns a pointer to the given Protocol.
-// modelEndpointPort extracts the port from a model endpoint URL.
+// modelEndpointPort extracts the port from a model endpoint (host:port or URL).
 func modelEndpointPort(rawURL string) int {
-	u, err := neturl.Parse(rawURL)
-	if err != nil {
-		return 0
+	// If it looks like a URL (has a scheme), parse it as such.
+	if strings.Contains(rawURL, "://") {
+		if u, err := neturl.Parse(rawURL); err == nil {
+			if p, err2 := strconv.Atoi(u.Port()); err2 == nil {
+				return p
+			}
+			return 0
+		}
 	}
-	port, err := strconv.Atoi(u.Port())
-	if err != nil {
-		return 0
+	// Otherwise treat it as host:port.
+	if _, p, err := net.SplitHostPort(rawURL); err == nil {
+		if ip, err2 := strconv.Atoi(p); err2 == nil {
+			return ip
+		}
 	}
-	return port
+	return 0
 }
 
 // createOrUpdateNP creates or updates a NetworkPolicy.

@@ -255,20 +255,25 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
-# dev/kind escape hatch overlay (C6b, R15 P1): re-adds --allow-unenforced on top
-# of the base install. NOT part of dist/install.yaml (the production bundle is
-# fail-closed). Apply AFTER `make deploy`. See the file's header for detail.
-#   make deploy IMG=<img>            # base install, fail-closed (no flag)
-#   kubectl apply -f config/manager/allow-unenforced.yaml   # dev only
+# deploy = the base install (fail-closed: no --allow-unenforced). The D30 gate
+# holds the sandbox Suspended until the eBPF engine proves enforcement (the I32
+# relay, not yet wired). This is what a production install (dist/install.yaml)
+# ships.
+#
+# deploy-dev = base + --allow-unenforced, via the config/dev kustomize overlay.
+# For local kind dev only, so Loops run before the enforcement-evidence seam is
+# wired (they run with PolicyEnforced=False reason EnforcementDisabled, loudly).
+# Never use for production.
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config (fail-closed; no --allow-unenforced).
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
-	# Dev/kind: re-add the --allow-unenforced escape hatch (NOT in the base
-	# install, so dist/install.yaml stays fail-closed). Applied as a merge-patch
-	# (not kubectl apply) on the operator Deployment in the <app>-system ns.
-	"$(KUBECTL)" -n coxswain-system patch deployment controller-manager --type=merge --patch-file config/manager/allow-unenforced.yaml
+
+.PHONY: deploy-dev
+deploy-dev: manifests kustomize ## Dev/kind only: deploy the controller with --allow-unenforced (Loops run before the I32 enforcement-evidence relay is wired). Not for production.
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
+	"$(KUSTOMIZE)" build config/dev | "$(KUBECTL)" apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.

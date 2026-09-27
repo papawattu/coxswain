@@ -13,17 +13,19 @@ Timelines assume part-time solo work.
 ## Phase 0: Foundations (week 1)
 
 - Scaffold the repo with kubebuilder v4: group `coxswain.wattu.com/v1alpha1`, `kind: Loop`. (Module path is the GitHub path; the CRD API group `coxswain.wattu.com` is under a domain we own — the CNCF-landscape check remains a pre-Phase-6 item.)
-- Set up a kind cluster (k8s 1.32) with agent-sandbox installed. Read the agent-sandbox README for install prerequisites (StorageClass needs, node labels, how `sandboxd` runs) — budget an hour.
-- Create a `SandboxTemplate` for a Go dev image that has `git` and the Go toolchain.
-- Build the **runner** image: a Go binary that reads a prompt from an env var, calls the Claude API, exposes `shell`/`fs`/`git` tools, and writes `result.json`. No phase-driver state machine yet — run once, write the result, exit. This is the smoke-test runner; the full phase driver lands in Phase 1.
+- Set up a kind cluster (**k8s 1.34**, pinned — D5) with the agent-sandbox CRDs applied.
+- Create the Loop CRD (`api/v1alpha1`), the operator that creates a `Sandbox` per Loop, and the runner module (a Go binary that calls an OpenAI-compatible model and writes `result.json`).
 - Add CI: golangci-lint, unit tests, envtest (apply the agent-sandbox CRDs into the envtest setup before starting).
 
-**Done when:** `kubectl apply` of an empty Loop creates a Sandbox, the smoke-test runner runs inside it, calls the model, and writes a `result.json` the controller logs.
+**Done when (narrowed, I4):** `kubectl apply` of a Loop causes the operator to **create and log the Sandbox object** for it (the Sandbox is the operator's own output; its Pod does not have to appear — running the agent-sandbox controller that materialises the Pod is Phase 1). The e2e proves exactly this on a kind cluster (see `docs/E2E-PHASE0.md`). The runner-in-sandbox run and the agent-sandbox controller were **moved to Phase 1** rather than closing them here, so Phase 0's "done when" matches what was actually proven.
+
+> **Phase 0 sign-off (I4, decided 2026-09-27):** closed by the narrow done-when above. The runner-in-sandbox smoke run and running the agent-sandbox controller are Phase 1 work (they need a running agent-sandbox controller, which has no pullable image — the Phase 1 plan builds the verify Job image and runs the controller in kind).
 
 ## Phase 1: The loop, minimal (weeks 2–3)
 
 **The trust model lands here, not in Phase 6.**
 
+- **(Moved from Phase 0, I4)** Bring the sandbox to life end-to-end: run the agent-sandbox controller in the kind cluster so the operator's `Sandbox` materialises a Pod, and smoke-run the runner *inside* the sandbox (it calls the model and writes `result.json` the controller logs). Phase 0 proved the operator creates the Sandbox object; this is the step that proves the agent actually runs in it.
 - Write the Loop CRD types:
   - `spec.goal` (string)
   - `spec.workspace`: `{ repo, ref, gitCredentialSecret }` — clone at `ref`, one branch per Loop (`coxswain/<loop-name>`), pushed after each iteration
@@ -51,6 +53,8 @@ Timelines assume part-time solo work.
 **Done when:** a deliberately impossible goal stops cleanly with the right reason (`Stalled` or `BudgetExceeded`) instead of spinning, and a paused Loop resumes where it left off.
 
 ## Phase 3: Durability (weeks 5–6)
+
+> **D6 (decided 2026-09-27):** Phase 3 snapshot e2e runs on **kind + csi-hostpath-driver** — kind gets the `VolumeSnapshot` CRDs + the hostpath CSI driver so the whole flow (incl. checkpoints) stays on one local cluster. (The homelab Ceph RBD alternative was rejected to avoid a second cluster.)
 
 - Take a **VolumeSnapshot** after each verify; store the reference in `status.checkpoint`. Name `checkpoint-<loop-name>-iter-<N>`.
 - Checkpointing is **mandatory**: if the StorageClass doesn't support snapshots, fail at start with `CheckpointUnavailable` (terminal) rather than run without durability.
@@ -108,6 +112,9 @@ These are settled — see ADRs and CONTEXT.md. Listed here so the plan and the m
 6. **kubectl-cox talks to the CRD directly**, no operator HTTP API.
 7. **PR opened by the runner**, draft by default, operator doesn't watch it.
 8. **Shared memory is cluster-local** with manual export/import; never distributed.
+9. **Phase 0 "done when" is narrow (I4, 2026-09-27):** the operator creating + logging the Sandbox object. The runner-in-sandbox smoke run and the agent-sandbox controller move to Phase 1.
+10. **Dev/CI k8s version is 1.34 (D5, 2026-09-27):** kind + envtest + CI all pin 1.34; the production floor stays >=1.37.
+11. **Phase 3 snapshot e2e runs on kind + csi-hostpath-driver (D6, 2026-09-27):** kind gets the snapshot CRDs + hostpath CSI so the whole flow stays on one local cluster.
 
 ## Risks
 
@@ -116,7 +123,7 @@ These are settled — see ADRs and CONTEXT.md. Listed here so the plan and the m
 - **Oscillation (not stall).** An agent that alternates between two failure modes never trips the consecutive-hash stall detector. Deferred; needs its own detector. Flagged, not scheduled.
 - **Memory pollution.** A bad lesson, once written, biases every future Loop on that repo. Mitigations: the curator gate, dedup, and `cox memory` inspection + deletion. (No automated forgetting yet — a future concern.)
 - **Overlap with kagent or agent-sandbox.** Stay the orchestration layer on top of them; the runner contract is the seam. Contribute upstream where it makes sense.
-- **agent-sandbox is v1beta1 / k8s 1.37.** The API can move under us. Pin the version in Phase 0 and isolate the dependency behind a thin internal interface so an upgrade is contained.
+- **agent-sandbox is v1beta1 / k8s 1.37.** The API can move under us. **Dev/CI pin k8s 1.34 (D5); production needs >=1.37 for agent-sandbox.** Isolate the dependency behind a thin internal interface so an upgrade is contained.
 
 ## Before Phase 0
 

@@ -87,6 +87,10 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= coxswain-test-e2e
+# D5: pin the dev/CI k8s version to 1.34 across kind + envtest. The production
+# floor stays >=1.37 for agent-sandbox; dev runs one lower on purpose so the
+# envtest suite is the canary for API drift, not the prod cluster.
+KIND_NODE_IMAGE ?= kindest/node:v1.34.0
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -98,8 +102,8 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 		*"$(KIND_CLUSTER)"*) \
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			echo "Creating Kind cluster '$(KIND_CLUSTER)' on $(KIND_NODE_IMAGE)..."; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) --image $(KIND_NODE_IMAGE) ;; \
 	esac
 
 .PHONY: test-e2e
@@ -210,10 +214,10 @@ ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; 
   [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v")
 
-#ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
-ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
-  [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
-  printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
+ #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST
+ # binaries (i.e. 1.31). Pinned explicitly (D5) so envtest does not silently track
+ # the k8s.io/* client-lib version in go.mod (which would drift the apiserver).
+ENVTEST_K8S_VERSION ?= 1.34.0
 
 GOLANGCI_LINT_VERSION ?= v2.13.1
 .PHONY: kustomize

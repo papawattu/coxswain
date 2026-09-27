@@ -69,6 +69,9 @@ spec:
                       author cannot inject a Secret into the agent). Names are limited to
                       avoid the platform-owned COX_* namespace (the operator sets
                       COX_MODEL_BASE_URL in C2; a Loop must not point the agent past the proxy).
+                      P3 (R13): a map list keyed on name so the API server rejects duplicate env
+                      names (an atomic list silently let [{FOO,a},{FOO,b}] through and the
+                      kubelet kept the last one).
                     items:
                       description: |-
                         AgentEnvVar is a literal-only environment variable for the agent container
@@ -99,6 +102,9 @@ spec:
                       type: object
                     maxItems: 64
                     type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                   image:
                     description: |-
                       image is the agent container image (e.g. the reference conformance runner

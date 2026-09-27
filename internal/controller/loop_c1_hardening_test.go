@@ -118,14 +118,50 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		Expect(pod.SecurityContext.FSGroup).NotTo(BeNil())
 		Expect(*pod.SecurityContext.FSGroup).To(BeNumerically("==", 65532), "fsGroup must match the agent UID so emptyDir volumes are writable")
 
-		By("pointing HOME and TMPDIR at the writable scratch (I35)")
+		By("pointing HOME at the writable scratch (I35)")
 		envByName := map[string]string{}
 		for _, e := range agent.Env {
 			envByName[e.Name] = e.Value
 		}
 		Expect(envByName["HOME"]).To(Equal("/scratch"), "HOME must be on the writable scratch volume")
-		Expect(envByName["TMPDIR"]).NotTo(BeEmpty(), "TMPDIR must be set")
-		Expect(envByName["TMPDIR"]).To(HavePrefix("/scratch"), "TMPDIR must be on the writable scratch volume")
+
+		// P1 (R13): TMPDIR pointed at /scratch/tmp, a directory a fresh emptyDir
+		// never creates, so go build / mktemp failed, and tools that hard-code /tmp
+		// stayed broken under a read-only rootfs. The fix mounts a dedicated
+		// emptyDir at /tmp (writable) and does NOT override TMPDIR — covering both
+		// TMPDIR-honoring and /tmp-hardcoding tools.
+		By("mounting a writable /tmp emptyDir and not overriding TMPDIR (P1)")
+		_, hasTmpdir := envByName["TMPDIR"]
+		Expect(hasTmpdir).To(BeFalse(),
+			"TMPDIR must not be overridden (the agent uses the image default, backed by the /tmp mount)")
+		var tmpMount *corev1.VolumeMount
+		for i := range agent.VolumeMounts {
+			if agent.VolumeMounts[i].MountPath == "/tmp" {
+				tmpMount = &agent.VolumeMounts[i]
+			}
+		}
+		Expect(tmpMount).NotTo(BeNil(), "the agent must mount a writable emptyDir at /tmp")
+		Expect(tmpMount.ReadOnly).To(BeFalse(), "/tmp must be writable")
+		for _, v := range pod.Volumes {
+			if v.Name == tmpMount.Name {
+				Expect(v.EmptyDir).NotTo(BeNil(), "/tmp must back onto an emptyDir volume")
+			}
+		}
+
+		// P3 (R13): the writable emptyDirs must carry explicit sizeLimits that sum
+		// under the container's ephemeral limit, so a full /workspace / scratch /
+		// tmp surfaces as a bounded pod eviction rather than filling the node.
+		By("giving the writable emptyDirs bounded sizeLimits (P3, I36)")
+		totalLimit := int64(0)
+		for _, v := range pod.Volumes {
+			if v.EmptyDir != nil {
+				Expect(v.EmptyDir.SizeLimit).NotTo(BeNil(), "emptyDir volume %q must have a sizeLimit", v.Name)
+				totalLimit += v.EmptyDir.SizeLimit.Value()
+			}
+		}
+		containerLimit := agent.Resources.Limits[corev1.ResourceEphemeralStorage]
+		Expect(totalLimit).To(BeNumerically("<=", containerLimit.Value()),
+			"writable emptyDir sizeLimits must sum under the container ephemeral limit")
 
 		// I36 (R10): ADR-0006 item 4 requires CPU/memory limits; C1 set none, so one
 		// agent could starve the node. Also an ephemeral-storage limit — /workspace

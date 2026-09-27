@@ -190,6 +190,11 @@ type AgentConfig struct {
 	// avoid the platform-owned COX_* namespace (the operator sets
 	// COX_MODEL_BASE_URL in C2; a Loop must not point the agent past the proxy).
 	// +kubebuilder:validation:MaxItems=64
+	// P3 (R13): a map list keyed on name so the API server rejects duplicate env
+	// names (an atomic list silently let [{FOO,a},{FOO,b}] through and the
+	// kubelet kept the last one).
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	Env []AgentEnvVar `json:"env,omitempty"`
 }

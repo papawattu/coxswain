@@ -52,7 +52,7 @@ var _ = Describe("I34: spec.agent.env is literal-only, no COX_* names", func() {
 
 		u := baseLoop("env-secret", ns)
 		Expect(unstructured.SetNestedField(u.Object, map[string]any{
-			"env": []any{
+			unstructuredEnv: []any{
 				map[string]any{
 					unstructuredName: "GITHUB_TOKEN",
 					"valueFrom": map[string]any{
@@ -70,7 +70,7 @@ var _ = Describe("I34: spec.agent.env is literal-only, no COX_* names", func() {
 		stored.SetGroupVersionKind(agentGVK)
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "env-secret", Namespace: ns}, stored)).To(Succeed())
 
-		envItems, found, err := unstructured.NestedSlice(stored.Object, "spec", "agent", "env")
+		envItems, found, err := unstructured.NestedSlice(stored.Object, "spec", "agent", unstructuredEnv)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(found).To(BeTrue())
 		Expect(envItems).NotTo(BeEmpty())
@@ -88,12 +88,31 @@ var _ = Describe("I34: spec.agent.env is literal-only, no COX_* names", func() {
 
 		u := baseLoop("env-coxname", ns)
 		Expect(unstructured.SetNestedField(u.Object, map[string]any{
-			"env": []any{
-				map[string]any{unstructuredName: "COX_MODEL_BASE_URL", "value": "http://evil.example"},
+			unstructuredEnv: []any{
+				map[string]any{unstructuredName: "COX_MODEL_BASE_URL", unstructuredValue: "http://evil.example"},
 			},
 		}, "spec", "agent")).To(Succeed())
 
 		err := k8sClient.Create(ctx, u)
 		Expect(err).To(HaveOccurred(), "an agent.env with a COX_* name must be rejected at admission (I34)")
+	})
+
+	// P3 (R13): duplicate env names are now rejected (the Env list is a map
+	// keyed on name) instead of silently letting the kubelet keep the last one.
+	It("rejects an agent.env with a duplicate name at admission (P3)", func() {
+		ns := "i34-dupname-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		u := baseLoop("env-dupname", ns)
+		Expect(unstructured.SetNestedField(u.Object, map[string]any{
+			unstructuredEnv: []any{
+				map[string]any{unstructuredName: "FOO", unstructuredValue: "a"},
+				map[string]any{unstructuredName: "FOO", unstructuredValue: "b"},
+			},
+		}, "spec", "agent")).To(Succeed())
+
+		err := k8sClient.Create(ctx, u)
+		Expect(err).To(HaveOccurred(), "a duplicate agent.env name must be rejected at admission (P3: map list keyed on name)")
 	})
 })

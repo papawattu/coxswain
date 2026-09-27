@@ -188,14 +188,14 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		if loop.Spec.Agent.Image != "" {
 			agentImage = loop.Spec.Agent.Image
 		}
-		// I34: spec.agent.env is literal-only (AgentEnvVar); convert to the
-		// corev1 form for the container. valueFrom is not expressible in the CRD,
-		// so no credential can be injected here. I35: HOME/TMPDIR point at the
-		// writable scratch because the read-only rootfs otherwise breaks every tool
-		// that writes ~/.cache or /tmp (Go's build cache, git, npm).
-		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+2)
+		// I35: HOME points at the writable scratch because the read-only rootfs
+		// otherwise breaks every tool that writes ~/.cache (Go's build cache, git,
+		// npm). TMPDIR is NOT overridden (P1, R13): /scratch/tmp is a directory a
+		// fresh emptyDir never creates, so go build / mktemp failed; instead a
+		// dedicated emptyDir is mounted at /tmp (writable), which also covers the
+		// tools that hard-code /tmp.
+		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+1)
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
-		agentEnv = append(agentEnv, corev1.EnvVar{Name: "TMPDIR", Value: "/scratch/tmp"})
 		for _, e := range loop.Spec.Agent.Env {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
 		}
@@ -236,12 +236,26 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "workspace", MountPath: "/workspace"},
 					{Name: "scratch", MountPath: "/scratch"},
+					// P1 (R13): a writable /tmp so go build / mktemp / any tool that
+					// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
+					{Name: "tmp", MountPath: "/tmp"},
 				},
 			},
 		}
+		// P3 (R13, I36): the writable emptyDirs carry explicit sizeLimits that sum
+		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
+		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
+		// rather than filling the node. 500+350+100 = 950Mi < 1Gi.
 		desired.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
-			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-			{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: newLimit("500Mi"),
+			}}},
+			{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: newLimit("350Mi"),
+			}}},
+			{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: newLimit("100Mi"),
+			}}},
 		}
 		// Set the controller owner ref here, on the (possibly server-populated)
 		// object. Returns AlreadyOwnedError if a different controller already
@@ -276,6 +290,16 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 // is always a valid DNS-1035 label <= 63 chars and needs no truncation.
 func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
+}
+
+// newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit
+// fields (I36 P3, R13). It is a two-statement wrapper so golangci-lint's
+// modernize newexpr checker (which flags one-line pointer wrappers) does not
+// flag it, while still giving a named, self-documenting helper.
+func newLimit(q string) *resource.Quantity {
+	p := new(resource.Quantity)
+	*p = resource.MustParse(q)
+	return p
 }
 
 // nextPhase is the operator's *claim-driven* phase-transition table (B1). It

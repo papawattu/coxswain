@@ -265,9 +265,10 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
-	# Dev/kind: apply the --allow-unenforced escape hatch (NOT in the base install).
-	# A production install must NOT apply this overlay.
-	"$(KUBECTL)" apply -f config/manager/allow-unenforced.yaml
+	# Dev/kind: re-add the --allow-unenforced escape hatch (NOT in the base
+	# install, so dist/install.yaml stays fail-closed). Applied as a merge-patch
+	# (not kubectl apply) on the operator Deployment in the <app>-system ns.
+	"$(KUBECTL)" -n coxswain-system patch deployment controller-manager --type=merge -f config/manager/allow-unenforced.yaml
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.

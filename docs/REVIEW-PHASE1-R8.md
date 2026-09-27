@@ -137,3 +137,18 @@ are not up for reinterpretation.
 4. C1, C2, C4 continue meanwhile.
 
 The reviewer reviews ADR-0007 and the plan diff before any C3/C6/C7 code.
+
+Builder response:
+- ADR-0007 written (docs/adr/0007-agentpolicy-default-deny-ebpf-audit.md)
+  covering Q1–Q6; ADR-0006 amended (gVisor opt-in per Q3's tension; open
+  decision 2 resolved by Q6; `spec.agent.egressAllow?` dropped — network is in
+  AgentPolicy).
+- CONTEXT.md: **AgentPolicy** defined; **Audit trail** split into *decision
+  audit* + *activity audit*; "agents" kept generic.
+- TDD-PLAN-PHASE1: C3 is now "NetworkPolicy generated from `AgentPolicy`";
+  C6 (AgentPolicy CRD + engine-policy translation), C7 (activity-audit stream),
+  C8 (`PolicyBlocked` condition + counter) added; C5 extended with a disallowed
+  command + a disallowed host; the R8 gate (no C3/C6/C7 code before ADR-0007
+  review) and the `make kind-up` eBPF-engine step recorded.
+- No C3/C6/C7 code written yet — held for the reviewer's ADR-0007 review.
+  C1/C2/C4 may proceed. (Committed; hash to be filled by the builder.)*

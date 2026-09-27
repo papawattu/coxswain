@@ -73,14 +73,20 @@ Recorded for the plan:
 
 4. **Pod hardening, on by default.** `runAsNonRoot`, drop all capabilities,
    `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`, read-only root
-   filesystem with writable `/workspace` + scratch, CPU/memory limits, and a
-   `runtimeClassName` (gVisor/kata) when the cluster offers one.
+   filesystem with writable `/workspace` + scratch, CPU/memory limits.
+   **`runtimeClassName` (gVisor/kata) is NOT a default (amended by ADR-0007
+   Q3):** gVisor intercepts syscalls in user space, so a host eBPF engine does
+   not see or enforce inside a gVisor sandbox — with eBPF chosen as the
+   enforcement layer (ADR-0007), gVisor is an **opt-in** where the engine
+   supports it, and enforcement is then the runtime's, not eBPF's.
    agent-sandbox's `SandboxBlueprint` is the natural place to carry this.
 
-5. **Loop API.** `spec.agent: { image, model, endpointSecretRef, env?,
-   egressAllow? }`. `endpointSecretRef` holds the base URL + API key and is
-   mounted into the **proxy**, never the agent. Cluster defaults come from a
+5. **Loop API.** `spec.agent: { image, model, endpointSecretRef, env? }`.
+   `endpointSecretRef` holds the base URL + API key and is mounted into the
+   **proxy**, never the agent. Cluster defaults come from a
    `coxswain-agent-defaults` ConfigMap so the README sample stays short.
+   (The `egressAllow?` field was dropped — **network allowlists live in
+   `AgentPolicy`, not `spec.agent`, per ADR-0007 Q6.**)
 
 6. **Tests that prove isolation, not just behavior.**
    - envtest asserts the built Sandbox pod spec has **no token automount, no
@@ -109,27 +115,21 @@ verify before isolation would verify an agent that still holds the keys.
 
 ## Open owner decisions (NOT picked by the builder)
 
-Per the review, two choices are the owner's. The builder lists them and does
-**not** pick either:
+Per the review, two choices were the owner's. Status at round 8:
 
-1. **First real agent to adapt.** Which existing coding agent gets an adapter
-   image first, so a real (non-reference) agent can run end to end?
-   Candidates named in the review: Claude Code, pi, Codex, OpenHands.
-   (The reference `runner/` is built either way as the conformance agent; this
-   decision is about which *external* agent to adapt first and what its
-   isolation surface — own tools, network needs, credentials — requires.)
+1. **First real agent to adapt** — **STILL OPEN.** Which existing agent gets an
+   adapter image first, so a real (non-reference) agent can run end to end?
+   Candidates: Claude Code, pi, Codex, OpenHands. (The reference `runner/` is
+   built either way as the conformance agent.) Q1 (ADR-0007) only fixes the
+   agnostic layer; it does not pick the first agent.
 
-2. **Egress policy for dependency installs.** How do package installs
-   (`go mod download`, `npm install`, …) work under deny-by-default egress?
-   Candidates named in the review:
-   - a **pre-warmed module cache baked into the image** (no egress needed for
-     common deps; image grows; cache must be refreshed);
-   - a **caching proxy the NetworkPolicy allows** (the agent's egress goes to
-     the proxy, which pulls and caches; one more trusted hop); or
-   - an **explicit `spec.agent.egressAllow[]`** (the operator lists allowed
-     hosts per Loop; explicit but per-Loop noise).
-
-   Whichever is chosen must not open general internet egress by default.
+2. ~~**Egress policy for dependency installs**~~ — **RESOLVED by ADR-0007 Q6.**
+   The owner decided network allowlists live in `AgentPolicy` (allowed
+   hosts/CIDRs + ports), default-deny with additive allows, enforced in two
+   layers (a generated `NetworkPolicy` + the eBPF engine's network rules). A
+   Loop that needs `go mod download` gets it by a policy that allows the
+   module proxy; nothing is open by default. This supersedes the three
+   candidates listed here.
 
 ## Consequences
 

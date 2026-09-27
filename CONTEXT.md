@@ -18,6 +18,21 @@ _Avoid_: curation, reviewer, filter
 The in-sandbox daemon that executes phases and talks to a model. Pluggable: Claude API, kagent, Codex. The only component allowed to inspect workspace contents. The operator sets `status.desiredPhase`; the runner does the work and writes `status.observedPhase` plus the result file. Runs continuously for the Loop's life; model context survives across phases within an iteration. If `observedPhase` doesn't advance within `spec.loop.phaseTimeout` (default 30 min), the operator sets `Failed:PhaseTimeout` and restarts the sandbox from the last checkpoint.
 _Avoid_: phase driver, agent, worker, executor, bot
 
+**AgentPolicy**:
+A default-deny allowlist of what an agent may do, its own CRD (`AgentPolicy`,
+group `coxswain.wattu.com`; optional cluster-scoped `ClusterAgentPolicy`). With
+no policy, an agent may only do the platform minimum (run its entrypoint,
+read/write its own workspace, talk to the model proxy on localhost); every other
+capability — command/process exec, file access, network egress hosts+ports — is
+granted by **adding allow rules** (rules are only ever allows; multiple policies
+combine as the union of allows). Enforced by an **eBPF/LSM engine outside the
+agent** (reviewer rec: KubeArmor in BPF-LSM mode; the operator translates each
+Loop's effective allows into an engine policy owned by the Loop) plus a
+generated `NetworkPolicy`. A violation is **blocked and recorded** in the
+activity audit — it does not fail or pause the Loop (no terminal reason). Who
+may create policies is a different RBAC role from who may create Loops.
+_Avoid_: policy (ambiguous), RBAC, profile
+
 **Judge**:
 An optional sidecar that produces a pass/fail verdict after deterministic verify checks. Its output is opaque to the operator — a boolean plus a score. It can never be the only gate.
 _Avoid_: reviewer, evaluator, critic, LLM judge
@@ -106,6 +121,10 @@ _Avoid_: task, job, run
 A failure reason set when the verify Job's `git diff --name-only <baseCommit> <verifiedCommit> -- <protected globs>` is non-empty — i.e. a protected acceptance-check file was added, modified, deleted, or renamed relative to the operator-pinned base commit (ADR-0005 round 4, D10; the agent never reports these). The iteration fails before any check runs.
 _Avoid_: tamper, sabotage, game
 
-**Audit trail**:
-The append-only record of every operator decision: phase transitions, budget checks, stall hashes, verify results, approvals. Stored in Kubernetes events plus a `status.history[]` on the Loop. Never in logs alone.
+**Decision audit** (audit trail):
+The append-only record of every **operator** decision: phase transitions, budget checks, stall hashes, verify results, approvals. Stored in Kubernetes events plus a `status.history[]` on the Loop. Never in logs alone.
 _Avoid_: logs, trace, telemetry
+
+**Activity audit**:
+The streamed record of **agent activity** (distinct from decision audit). Coxswain **emits** it as a structured JSON-lines stream on each trusted source's stdout and does **not** store it — capture is the cluster's choice (e.g. Alloy/Loki). Sources are trusted components only: the model proxy (each request/response + token counts), the eBPF engine (process exec, file access, network connects — allowed and blocked), and the operator (its own decisions). The agent's own traces are not audit. Common envelope: `{time, loop, namespace, iteration, source, action, target, verdict, detail}`. A policy block is recorded here (and counted in `status.policy.blockedCount` + a `PolicyBlocked` condition).
+_Avoid_: logging, telemetry, trace

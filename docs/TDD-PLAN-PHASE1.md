@@ -87,13 +87,16 @@ mounted into the proxy **and not** the agent, and the agent's env has
 `COX_MODEL_BASE_URL` set to the localhost proxy. e2e — the reference runner, with
 the fake model behind the proxy, reaches `result.json` without any key in the
 agent env.
-- **C3** — *NetworkPolicy deny-by-default egress.* A NetworkPolicy on the
-sandbox allows egress **only** from the proxy container to the model endpoint +
-DNS; the agent container reaches nothing but `localhost`. Package installs are
-the hard case (owner decision, ADR-0006 "Open owner decisions"). Seam: envtest
-— assert a NetworkPolicy exists for the sandbox with the deny-by-default egress
-rule (egress from proxy to the model endpoint only; the agent egresses
-nowhere but localhost).
+- **C3** — *NetworkPolicy generated from `AgentPolicy` (ADR-0007 Q6).* A
+`NetworkPolicy` on the sandbox is **generated from the Loop's effective
+`AgentPolicy`** egress allows (allowed hosts/CIDRs + ports), default-deny:
+with no allows the agent egresses nowhere but `localhost`, and the proxy's own
+egress to the model endpoint is platform infrastructure (allowed by the
+operator, not the user's policy). This is the coarse pod-level layer; the
+process-level egress + its audit records come from the eBPF engine (C6). Seam:
+envtest — given a set of egress allows, the generated `NetworkPolicy` for the
+sandbox allows exactly those and denies the rest; with no policy the default is
+deny (agent egresses only localhost).
 - **C4** — *Trusted publish step.* After the agent commits locally, a trusted
 component outside the agent's control (an operator-created "publish" Job, or a
 sidecar sharing only the workspace volume + the push token) pushes the Loop
@@ -105,12 +108,39 @@ the published SHA; a force-push attempt by the agent is not reflected in the
 pinned commit.
 - **C5** — *Evil-agent e2e (the isolation proof).* An "evil agent" image runs
 that tries, in order: read a mounted secret, reach the K8s API server,
-`curl` the internet, and push to the git remote. **Every attempt must fail**,
-and none of the attempts may affect the Loop's evidence (the verify Job still
-sees the committed SHA; the Loop's phase/evidence are unchanged by the failed
-attempts). Seam: e2e on kind — assert each attempt's exit/output shows denial
-and the Loop's `status.verify`/phase are unaffected. (This is the slice that
-makes ADR-0006's guarantee concrete.)
+`curl` the internet, push to the git remote, **run a disallowed command
+(eBPF-blocked exec)**, and **connect to a disallowed host**. **Every attempt
+must be blocked**, and none may affect the Loop's evidence (the verify Job
+still sees the committed SHA; the Loop's phase/evidence are unchanged) — a
+blocked attempt does **not** fail or pause the Loop (ADR-0007 Q5: block-and-
+record), but **each block appears in the activity-audit stream** (Q4) and
+increments `status.policy.blockedCount`. Seam: e2e on kind — assert each
+attempt's exit/output shows denial, the Loop keeps running, and each block is
+in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
+- **C6** — *`AgentPolicy` CRD + engine-policy translation (ADR-0007 Q2/Q3).*
+The new `AgentPolicy` CRD (group `coxswain.wattu.com`; default-deny, additive
+allows; union across policies; `spec.policyRefs[]` on the Loop; optional
+cluster-scoped `ClusterAgentPolicy`). The operator **translates** a Loop's
+effective allows into the eBPF engine's policy (reviewer rec: a `KubeArmorPolicy`
+in BPF-LSM mode selecting the Loop's sandbox pod, owned by the Loop) behind an
+internal interface (swappable for Tetragon). Default-deny when no policy: the
+generated engine policy allows only the platform minimum. Seam: **envtest** —
+for a given set of allows, the generated `KubeArmorPolicy`/`NetworkPolicy`
+carries exactly those allows; with no policy, the default is deny.
+- **C7** — *Activity-audit stream (ADR-0007 Q4).* Coxswain **emits** agent-
+activity audit as JSON lines on each trusted source's stdout with the common
+envelope `{time, loop, namespace, iteration, source, action, target, verdict,
+detail}`; it never stores it. Sources: the model proxy (each request/response
++ token counts), the eBPF engine (exec/file/network, allowed and blocked, with
+the Loop's labels), and the operator (its decisions). Seam: the proxy's JSON
+lines carry the loop/iteration labels; the engine's alerts carry the Loop
+labels; the agent's own traces are not emitted as audit.
+- **C8** — *`PolicyBlocked` condition + counter (ADR-0007 Q5).* A blocked
+action increments `status.policy.blockedCount` and sets a `PolicyBlocked`
+condition carrying the latest blocked target, so a stuck Loop's cause is
+visible without reading logs. No terminal reason. Seam: envtest — after a
+blocked action the counter increments and the `PolicyBlocked` condition is set
+with the target; the Loop is not failed or paused.
 
 ### B. Controller reconcile state machine (`internal/controller/`)
 The Phase 0 controller only ensured the sandbox + set `Pending`. Phase 1 drives
@@ -339,18 +369,28 @@ is Phase 4 — Phase 1 uses `spec.approval.mode: Auto` only.
 
 ## Suggested slice order (once seams are confirmed)
 
-The isolation slices (C1–C5, ADR-0006) come **before B3** — they are what make
-B2/B3's evidence meaningful. After D27:
+The isolation slices (C1–C8, ADR-0006 + ADR-0007) come **before B3** — they are
+what make B2/B3's evidence meaningful. After D27:
 
-C1 (sandbox hardening + `spec.agent`) → C2 (model proxy sidecar) → C3
-(NetworkPolicy deny-by-default) → C4 (trusted publish step) → C5 (evil-agent
-e2e), then the reference runner A1 → A2 → A3 → A4 (now driving the conformance
-agent through the proxy, `COX_MODEL_BASE_URL` = localhost, each red→green —
-note A4 is now *context continuity*; the old A4 "runner runs checks" is dropped
-per ADR-0005), then B3 → B3a → B3b → B3c → B3d (the verify path, expanded for the
-D17 canary + advisory scan, D18 restart semantics, D19 read-only checkout) →
-B4 → B5 → B6. B1 and B2 (the claim-driven phase machine + TamperedVerify via
-base-commit glob diff) are already done. B2's anti-gaming guarantee (D7) is the
-highest-value test; B6 (foreign-owned sandbox → condition, D8) needs B1's
-condition/event infrastructure. C5 (the evil-agent e2e) is the slice that proves
-ADR-0006's guarantee and gates B3's evidence as meaningful.
+C1 (sandbox hardening + `spec.agent`) → C2 (model proxy sidecar) → C6
+(`AgentPolicy` CRD + engine-policy translation) → C3 (NetworkPolicy generated
+from `AgentPolicy`) → C4 (trusted publish step) → C8 (`PolicyBlocked` condition
++ counter) → C7 (activity-audit stream) → C5 (evil-agent e2e, extended with a
+disallowed command + a disallowed host), then the reference runner A1 → A2 →
+A3 → A4 (now driving the conformance agent through the proxy, `COX_MODEL_BASE_URL`
+= localhost, each red→green — note A4 is now *context continuity*; the old A4
+"runner runs checks" is dropped per ADR-0005), then B3 → B3a → B3b → B3c → B3d
+(the verify path, expanded for the D17 canary + advisory scan, D18 restart
+semantics, D19 read-only checkout) → B4 → B5 → B6. B1 and B2 (the claim-driven
+phase machine + TamperedVerify via base-commit glob diff) are already done.
+B2's anti-gaming guarantee (D7) is the highest-value test; B6 (foreign-owned
+sandbox → condition, D8) needs B1's condition/event infrastructure. C5 (the
+evil-agent e2e) is the slice that proves ADR-0006 + ADR-0007 and gates B3's
+evidence as meaningful.
+
+**Gate (REVIEW-PHASE1-R8):** no C3/C6/C7 code until the reviewer has reviewed
+ADR-0007. C1, C2, C4 (and C8, C5's non-policy parts) may proceed meanwhile.
+
+**Infra:** `make kind-up` gains a step to install the eBPF engine (version
+pinned once, like agent-sandbox) and a smoke that proves a disallowed `exec` is
+blocked on kind (ADR-0007 Q3).

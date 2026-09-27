@@ -1,4 +1,4 @@
-# coxscaf - AI Agent Guide
+# coxswain - AI Agent Guide
 
 ## Review protocol
 

@@ -29,7 +29,7 @@ make docker-build IMG=coxswain:dev
 kind load docker-image coxswain:dev --name coxswain
 make deploy IMG=coxswain:dev
 
-kubectl rollout status deploy/coxscaf-controller-manager -n coxscaf-system
+kubectl rollout status deploy/coxswain-controller-manager -n coxswain-system
 ```
 
 ### 3. Start a loop

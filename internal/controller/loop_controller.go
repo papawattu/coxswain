@@ -153,6 +153,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
+		// C1 (ADR-0006 item 4): the sandbox pod is a zero-credential, hardened
+		// boundary. No SA token automount; the agent is non-root, drops all caps,
+		// cannot escalate privilege, is seccomp-constrained, and runs a read-only
+		// rootfs with only /workspace + scratch writable.
+		falseP := false
+		trueP := true
+		readOnlyRootfs := true
 		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
 		// (S1). Running is the default for a normal Loop.
 		if loop.Spec.Suspend {
@@ -160,14 +167,38 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
+		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
+		// The agent container: spec.agent.image when set, else the dev default
+		// (C1). It holds no credentials (ADR-0006) — the model key lives only in
+		// the proxy sidecar (C2), mounted there in a later slice.
+		agentImage := r.sandboxImage()
+		if loop.Spec.Agent.Image != "" {
+			agentImage = loop.Spec.Agent.Image
+		}
 		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{
 			{
 				Name:  "agent",
-				Image: r.sandboxImage(),
+				Image: agentImage,
 				// Keep the container alive until the phase driver (Phase 1)
 				// takes over. sleep infinity is a stand-in.
 				Command: []string{"sh", "-c", "sleep infinity"},
+				Env:     loop.Spec.Agent.Env,
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &falseP,
+					RunAsNonRoot:             &trueP,
+					ReadOnlyRootFilesystem:   &readOnlyRootfs,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "workspace", MountPath: "/workspace"},
+					{Name: "scratch", MountPath: "/scratch"},
+				},
 			},
+		}
+		desired.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
+			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		}
 		// Set the controller owner ref here, on the (possibly server-populated)
 		// object. Returns AlreadyOwnedError if a different controller already

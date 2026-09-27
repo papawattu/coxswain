@@ -55,6 +55,10 @@ const (
 	loopRef        = "main"
 	loopCheckCmd   = "go test ./..."
 
+	// agentContainerName is the name of the Loop's agent container in the
+	// Sandbox pod spec (goconst: it appears in several test files).
+	agentContainerName = "agent"
+
 	unstructuredGoal = "goal"
 	unstructuredWs   = "workspace"
 	unstructuredRepo = "repo"

@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -163,6 +164,30 @@ type LoopSettings struct {
 }
 
 // LoopSpec defines the desired state of a Loop.
+// AgentConfig selects the agent image and model for a Loop's sandbox.
+// The agent holds no credentials (ADR-0006): endpointSecretRef holds the model
+// base URL + API key and is mounted only into the model-proxy sidecar; the
+// agent container is hardened (no SA token automount, runAsNonRoot, drop all
+// caps, seccomp, read-only rootfs) and talks to the model over localhost.
+type AgentConfig struct {
+	// image is the agent container image (e.g. the reference conformance runner
+	// or an adapter for an external agent). Required when agent is set.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// model is the model name/identifier the proxy uses when calling the
+	// endpoint. +optional
+	Model string `json:"model,omitempty"`
+
+	// endpointSecretRef is the name of a Secret in the Loop's namespace holding
+	// the model base URL + API key. It is mounted only into the proxy sidecar,
+	// never the agent container. +optional
+	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
+
+	// env carries extra environment variables for the agent container. +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+}
+
 // A Loop is one-shot and single-goal (docs/adr/0003).
 type LoopSpec struct {
 	// goal is the natural-language objective for this Loop.
@@ -177,6 +202,13 @@ type LoopSpec struct {
 	// verify declares the acceptance checks (the only gate to Succeeded).
 	// +optional
 	Verify VerifyConfig `json:"verify,omitempty"`
+
+	// agent selects the agent image and model the sandbox runs. The agent holds
+	// no credentials (ADR-0006): the model key in endpointSecretRef is mounted
+	// only into the proxy sidecar, and the agent talks to the model through
+	// localhost. The agent container is hardened by the operator (C1).
+	// +optional
+	Agent AgentConfig `json:"agent,omitempty"`
 
 	// loop holds iteration and phase-timeout settings.
 	// +optional

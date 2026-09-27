@@ -68,8 +68,12 @@ and prove it. Each is a red→green seam; the envtest asserts the built Sandbox 
 spec, the e2e runs an "evil agent" image.
 
 **Candidate seams (to confirm):**
-- **C1** — *Sandbox pod hardening + `spec.agent`.* The operator builds the
-  Sandbox with `automountServiceAccountToken: false`, `runAsNonRoot`, drop all
+- **C1** — *Sandbox pod hardening + `spec.agent`.* *(DONE — see `main`; the
+  operator builds the agent container with `spec.agent.image`, no SA token
+  automount, runAsNonRoot, drop-all-caps, allowPrivilegeEscalation false,
+  seccomp RuntimeDefault, read-only rootfs + `/workspace` + `scratch` emptyDirs,
+  and no secret volume in the agent container; envtest seam
+  `loop_c1_hardening_test.go`.)* The operator builds the Sandbox with `automountServiceAccountToken: false`, `runAsNonRoot`, drop all
 caps, `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`, read-only root
 fs + writable `/workspace` + scratch, CPU/mem limits, and a `runtimeClassName`
 when the cluster offers one. CRD: `spec.agent { image, model,

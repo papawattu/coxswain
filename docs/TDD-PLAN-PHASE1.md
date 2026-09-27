@@ -178,14 +178,30 @@ in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
     the union of both policies' allows (a missing referenced AgentPolicy is a
     reconcile error, not a silent narrow policy); a Loop with no policyRefs leaves
     the hash empty (default-deny minimum).
-  - **C6b — engine runtime + gate (remaining).** The operator **emits** a
-    `KubeArmorPolicy` in BPF-LSM mode selecting the Loop's sandbox pod, owned by
-    the Loop (behind an internal interface, swappable for Tetragon), and gates
-    the sandbox on **positive evidence** enforcement is active on the node
-    (`PolicyEnforced`, D30 — `EngineUnavailable` | `NodeNotEnforcing` |
-    `PolicyRejected`; the Loop waits, no terminal reason). `make kind-up` gains
-    the engine install step + the disallowed-`exec` smoke. The generated
-    `NetworkPolicy` (the coarse outer fence) is C3.
+  - **C6b — engine runtime + gate.** The operator is engine-agnostic behind an
+    internal `engine.Enforcer` interface (set to a fake in envtest, to the
+    KubeArmor emitter in prod): `Apply(ctx, loop, enginePolicy) error` (emit the
+    policy object) and `Enforcing(ctx, loop) (bool, reason string)` (D30
+    evidence). The KubeArmor emitter translates Coxswain's `EnginePolicy` into a
+    `KubeArmorPolicy` (group `security.kubearmor.com/v1`): `selector.matchLabels`
+    targets the sandbox pod; `syscalls.matchPaths`/`matchSyscalls`,
+    `network.matchDNSQueries` (host:port → DNS name) + `matchProtocols`, and
+    `file.matchPaths` carry the allows; `action: Allow` per rule, base default
+    the platform minimum. The D30 gate: before `ensureSandbox` sets OperatingMode
+    Running, the operator calls `Enforcing()`; on not-enforcing it holds the
+    sandbox Suspended + `PolicyEnforced=False` (reason `EngineUnavailable` |
+    `NodeNotEnforcing` | `PolicyRejected`) and requeues — never fails the Loop
+    (Q5). Seams: (1) pure unit test for the KubeArmorPolicy emitter over an
+    `EnginePolicy` (assert selector + syscall/network/file fields); (2) envtest
+    with a fake `Enforcer` (not-enforcing → sandbox Suspended + condition;
+    enforcing → Running). **Real-engine e2e (KubeArmor installed on kind via a
+    `make kind-up` step + a disallowed `exec` actually blocked) is DEFERRED as a
+    follow-on**: the KubeArmorPolicy CRD has no enforcement status field
+    (`status: {}`), so D30's evidence is the agent's telemetry/alert stream
+    (I32), a real-runtime dependency; and per-container scoping (D29) is NOT
+    expressible in one KubeArmorPolicy (selector is pod-level), so the
+    agent=localhost / proxy=model-endpoint split is enforced by the
+    NetworkPolicy (C3) with the KubeArmorPolicy as the pod-level fence.
 
 - **C7** — *Activity-audit stream (ADR-0007 Q4).* Coxswain **emits** agent-
 activity audit as JSON lines on each trusted source's stdout with the common

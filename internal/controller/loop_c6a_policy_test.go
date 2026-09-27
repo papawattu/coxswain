@@ -55,7 +55,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"git"}, Network: []string{"proxy.golang.org:443"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{agentPolicyExecGit}, Network: []string{"proxy.golang.org:443"}},
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p2", Namespace: ns},
@@ -72,7 +72,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 
 		// The expected union hash: exec={git,go}, network={proxy.golang.org:443}, files={/data}.
 		want := policy.EffectiveHash(policy.EffectivePolicy{
-			Exec:    []string{"git", "go"},
+			Exec:    []string{agentPolicyExecGit, "go"},
 			Network: []string{"proxy.golang.org:443"},
 			Files:   []string{"/data"},
 		})

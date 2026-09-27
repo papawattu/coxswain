@@ -30,6 +30,10 @@ import (
 // git), so one shared constant avoids goconst churn.
 const testRepoURL = "https://example.com/repo.git"
 
+// agentPolicyExecGit is the exec allow the AgentPolicy test fixtures reference
+// (git), shared across the policy test files to avoid goconst churn.
+const agentPolicyExecGit = "git"
+
 // testWorkspace returns a LoopSpec workspace pointing at the shared fixture
 // repo, so the individual test files don't each repeat the literal.
 func testWorkspace() coxv1alpha1.Workspace {

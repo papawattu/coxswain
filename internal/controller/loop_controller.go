@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -70,6 +71,15 @@ type LoopReconciler struct {
 	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
 	// stand-in; overridable for the smoke test (e.g. the real proxy image).
 	ProxyImage string
+
+	// Enforcer is the eBPF engine seam (ADR-0007 Q3/D30). When set, the operator
+	// applies the Loop's effective policy through it and gates the sandbox on
+	// positive enforcement evidence (fail-closed: the agent never runs until the
+	// engine is enforcing). When nil (e.g. the engine is not installed), the
+	// operator treats enforcement as unavailable (PolicyEnforced=False,
+	// EngineUnavailable) and holds the sandbox Suspended. A fake is used in
+	// envtest to drive the gate.
+	Enforcer engine.Enforcer
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -146,7 +156,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, TamperedVerifyReason,
+			setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
 				"a protected path changed between baseCommit and verifiedCommit; terminal")
 			changed = true
 		}
@@ -175,6 +185,28 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	return ctrl.Result{}, nil
 }
+
+// enforcementStatus (D30, ADR-0007) returns whether the D30 gate applies to the
+// Loop (only when it declares a user policy via spec.policyRefs), whether the
+// eBPF engine is enforcing that policy, and the reason when it is not. A
+// no-policyRefs Loop runs the default-deny minimum (enforced by the pod
+// hardening, C1) and is not gated on the engine, so the gate does not apply.
+// When the gate applies and the engine is unavailable (nil Enforcer) the
+// reason is EngineUnavailable (fail-closed: the agent never runs).
+func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha1.Loop) (gateApplies, enforced bool, reason string) {
+	if len(loop.Spec.PolicyRefs) == 0 {
+		return false, true, "" // no user policy -> not gated; runs the default-deny minimum
+	}
+	if r.Enforcer == nil {
+		return true, false, engine.ReasonEngineUnavailable
+	}
+	enf, rsn := r.Enforcer.Enforcing(ctx, loop)
+	return true, enf, rsn
+}
+
+// PolicyEnforcedCondition is the non-phase condition type recording whether the
+// eBPF engine is enforcing the Loop's policy (D30).
+const PolicyEnforcedCondition = "PolicyEnforced"
 
 // effectivePolicyHash computes the canonical hash of the Loop's effective
 // AgentPolicy (C6a): the union of the allows across every AgentPolicy the Loop
@@ -213,6 +245,23 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
 	log := logf.FromContext(ctx)
+
+	// D30 (ADR-0007): the agent only runs (OperatingMode Running) on positive
+	// evidence the eBPF engine is enforcing the Loop's policy. The gate applies
+	// when the Loop declares a user policy (policyRefs set); a no-policyRefs
+	// Loop runs the default-deny minimum (enforced by the pod hardening, C1) and
+	// is not gated on the engine. When the gate applies and the engine is not
+	// enforcing, the sandbox is held Suspended and PolicyEnforced=False is
+	// recorded (fail-closed; the Loop is never failed).
+	gateApplies, enforced, reason := r.enforcementStatus(ctx, loop)
+	if gateApplies {
+		if enforced {
+			setCondition(loop, PolicyEnforcedCondition, metav1.ConditionTrue, "Enforcing", "the eBPF engine is enforcing the Loop's policy")
+		} else {
+			setCondition(loop, PolicyEnforcedCondition, metav1.ConditionFalse, reason, "the eBPF engine is not enforcing the Loop's policy; the sandbox is held Suspended (D30 fail-closed)")
+		}
+	}
+
 	desired := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sandboxName(loop.Name),
@@ -242,8 +291,9 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		trueP := true
 		readOnlyRootfs := true
 		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
-		// (S1). Running is the default for a normal Loop.
-		if loop.Spec.Suspend {
+		// (S1). Running is the default for a normal Loop. The D30 gate also
+		// holds it Suspended when a declared policy is not enforced.
+		if loop.Spec.Suspend || (gateApplies && !enforced) {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
@@ -540,13 +590,13 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 }
 
 // setCondition upserts a condition on the Loop's status. The condition's Type
-// is the terminal phase (e.g. "Failed") so each terminal outcome is recorded
-// once with its reason (e.g. TamperedVerify). It is the operator's audit record
-// (ADR-0004); the runner never writes it.
-func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status metav1.ConditionStatus, reason, message string) {
+// is a string (a terminal phase like "Failed", or a non-phase condition type
+// like "PolicyEnforced"). It is the operator's audit record (ADR-0004); the
+// runner never writes it.
+func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
 	now := metav1.Now()
 	for i := range loop.Status.Conditions {
-		if loop.Status.Conditions[i].Type == string(condType) {
+		if loop.Status.Conditions[i].Type == condType {
 			if loop.Status.Conditions[i].Reason == reason &&
 				loop.Status.Conditions[i].Message == message &&
 				loop.Status.Conditions[i].Status == status {
@@ -560,7 +610,7 @@ func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status
 		}
 	}
 	loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
-		Type:               string(condType),
+		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,

@@ -85,7 +85,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	var allowUnenforced bool
 	flag.BoolVar(&allowUnenforced, "allow-unenforced", false,
-		"Run Loops even when the eBPF engine is not enforcing (off by default). Set this explicitly as a dev/testing escape hatch; Loops run with PolicyEnforced=False reason EnforcementDisabled. Until real enforcement evidence (the I32 relay) lands, this is the only way to run an agent.")
+		"Run Loops even when the eBPF engine is not enforcing (off by default; dev escape hatch). "+
+			"Loops run with PolicyEnforced=False reason EnforcementDisabled.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{

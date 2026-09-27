@@ -7,9 +7,14 @@ import (
 	"github.com/papawattu/coxswain/internal/policy"
 )
 
+const (
+	testExecGit = "git"
+	testExecGo  = "go"
+)
+
 func epForTest() policy.EnginePolicy {
 	return policy.Translate(policy.EffectivePolicy{
-		Exec:    []string{"git", "go"},
+		Exec:    []string{testExecGit, testExecGo},
 		Network: []string{"proxy.golang.org:443"},
 		Files:   []string{"/data"},
 	})
@@ -58,7 +63,7 @@ func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 		m := it.(map[string]any)
 		paths = append(paths, m["path"].(string))
 	}
-	if !slices.Contains(paths, "git") || !slices.Contains(paths, "go") {
+	if !slices.Contains(paths, testExecGit) || !slices.Contains(paths, testExecGo) {
 		t.Fatalf("process.matchPaths must include git and go, got %v", paths)
 	}
 	if _, has := spec["syscalls"]; has {
@@ -77,7 +82,7 @@ func TestEmitKubeArmorPolicyNetworkItemsAreObjectsWithPort(t *testing.T) {
 		t.Fatal("network block must exist")
 	}
 	dns := net["matchDNSQueries"].([]any)
-	var domains []string
+	domains := make([]string, 0, len(dns))
 	for _, it := range dns {
 		domains = append(domains, it.(map[string]any)["domain"].(string))
 	}
@@ -85,7 +90,7 @@ func TestEmitKubeArmorPolicyNetworkItemsAreObjectsWithPort(t *testing.T) {
 		t.Fatalf("matchDNSQueries must include proxy.golang.org (port stripped from the name), got %v", domains)
 	}
 	prots := net["matchProtocols"].([]any)
-	var protocols []string
+	protocols := make([]string, 0, len(prots))
 	for _, it := range prots {
 		protocols = append(protocols, it.(map[string]any)["protocol"].(string))
 	}
@@ -101,11 +106,11 @@ func TestEmitKubeArmorPolicyUnionsContainers(t *testing.T) {
 	obj := EmitKubeArmorPolicy("loop-x", "ns-x", ep)
 	spec := obj.Object["spec"].(map[string]any)
 	items := spec["process"].(map[string]any)["matchPaths"].([]any)
-	var paths []string
+	paths := make([]string, 0, len(items))
 	for _, it := range items {
 		paths = append(paths, it.(map[string]any)["path"].(string))
 	}
-	if len(paths) != 1 || paths[0] != "git" {
+	if len(paths) != 1 || paths[0] != testExecGit {
 		t.Fatalf("union across containers must keep the agent's exec allow, got %v", paths)
 	}
 }

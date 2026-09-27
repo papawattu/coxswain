@@ -98,7 +98,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeSuspended
 		}, "10s").Should(BeTrue(), "the sandbox must be held Suspended while the engine is not enforcing (D30)")
 
-		cond := conditionByType(getLoop(ns, "l1").Status.Conditions, "PolicyEnforced")
+		cond := policyEnforcedCondition(getLoop(ns, "l1").Status.Conditions)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal("NodeNotEnforcing"))
@@ -123,7 +123,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeRunning
 		}, "10s").Should(BeTrue(), "the sandbox must run when the engine is enforcing (D30)")
 
-		cond := conditionByType(getLoop(ns, "l1").Status.Conditions, "PolicyEnforced")
+		cond := policyEnforcedCondition(getLoop(ns, "l1").Status.Conditions)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 	})
@@ -147,7 +147,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeSuspended
 		}, "10s").Should(BeTrue(), "a no-policyRefs Loop with no engine must be held Suspended (P1 #1)")
 		loop := getLoop(ns, "l1")
-		c := conditionByType(loop.Status.Conditions, "PolicyEnforced")
+		c := policyEnforcedCondition(loop.Status.Conditions)
 		Expect(c).NotTo(BeNil(), "the PolicyEnforced condition must exist")
 		Expect(string(c.Status)).To(Equal("False"), "no engine -> PolicyEnforced=False (fail-closed)")
 		Expect(c.Reason).To(Equal("EngineUnavailable"), "no Enforcer -> reason EngineUnavailable")
@@ -197,7 +197,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		ownerRefs := kap.GetOwnerReferences()
 		Expect(ownerRefs).NotTo(BeEmpty(), "the KubeArmorPolicy must be owner-ref'd to the Loop")
 		Expect(ownerRefs[0].Name).To(Equal("l1"), "the owner ref must point at the Loop")
-		Expect(string(ownerRefs[0].Kind)).To(Equal("Loop"), "the owner ref kind must be Loop")
+		Expect(ownerRefs[0].Kind).To(Equal("Loop"), "the owner ref kind must be Loop")
 		Expect(ownerRefs[0].UID).NotTo(BeEmpty(), "the owner ref must carry the Loop's UID")
 	})
 
@@ -218,7 +218,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeRunning
 		}, "10s").Should(BeTrue(), "AllowUnenforced lets the Loop run")
 		loop := getLoop(ns, "l1")
-		c := conditionByType(loop.Status.Conditions, "PolicyEnforced")
+		c := policyEnforcedCondition(loop.Status.Conditions)
 		Expect(c).NotTo(BeNil(), "the PolicyEnforced condition must exist")
 		Expect(string(c.Status)).To(Equal("False"), "AllowUnenforced runs the Loop but it is NOT enforced")
 		Expect(c.Reason).To(Equal("EnforcementDisabled"), "reason must be EnforcementDisabled (loudly visible)")
@@ -226,10 +226,10 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 })
 
-// conditionByType finds a condition by type.
-func conditionByType(conds []metav1.Condition, t string) *metav1.Condition {
+// policyEnforcedCondition finds the PolicyEnforced condition.
+func policyEnforcedCondition(conds []metav1.Condition) *metav1.Condition {
 	for i := range conds {
-		if conds[i].Type == t {
+		if conds[i].Type == "PolicyEnforced" {
 			return &conds[i]
 		}
 	}

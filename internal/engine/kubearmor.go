@@ -19,7 +19,10 @@ var kaptGroupVersion = schema.GroupVersion{Group: kaptGroup, Version: kaptVersio
 // kaptAllowAction is the KubeArmor action an allowlist rule carries. The
 // KubeArmorPolicy is default-deny; an allowlisted rule gets action Allow,
 // everything else stays denied (KubeArmor's default posture).
-const kaptAllowAction = "Allow"
+const (
+	kaptAllowAction = "Allow"
+	kaptActionKey   = "action"
+)
 
 // EmitKubeArmorPolicy translates Coxswain's EnginePolicy (per-container, D29)
 // into a KubeArmorPolicy object (security.kubearmor.com/v1) for the sandbox
@@ -65,8 +68,8 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 	// P1 #3: process (NOT syscalls, which is monitoring-only and has no action).
 	if len(exec) > 0 {
 		spec["process"] = map[string]any{
-			"action":     kaptAllowAction,
-			"matchPaths": toPathItems(exec),
+			kaptActionKey: kaptAllowAction,
+			"matchPaths":  toPathItems(exec),
 		}
 	}
 	// network allows → matchDNSQueries items ({domain}) + matchProtocols items
@@ -75,7 +78,7 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 	if len(network) > 0 {
 		domains, protocols := splitNetworkAllows(network)
 		spec["network"] = map[string]any{
-			"action":          kaptAllowAction,
+			kaptActionKey:     kaptAllowAction,
 			"matchDNSQueries": toDomainItems(domains),
 			"matchProtocols":  toProtocolItems(protocols),
 		}
@@ -83,8 +86,8 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 	// file allows → file.matchPaths items ({path}).
 	if len(files) > 0 {
 		spec["file"] = map[string]any{
-			"action":     kaptAllowAction,
-			"matchPaths": toPathItems(files),
+			kaptActionKey: kaptAllowAction,
+			"matchPaths":  toPathItems(files),
 		}
 	}
 

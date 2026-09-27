@@ -72,7 +72,7 @@ project isn't actually licensed for reuse. Add the standard Apache-2.0
 
 ### I27. Guard the README against drift
 
-- [ ] Done — deferred to the e2e slice (per owner: fold I27 into the e2e work). The round-1 deferred `test/e2e` suite is where the README path gets a shared script of truth; the per-slice "update README step 4 if `kubectl get loops` changes" checklist line and the `make deploy` kustomize-edit note land with it.
+- [ ] Done — deferred to the e2e slice (per reviewer: fold I27 into the e2e work). The round-1 deferred `test/e2e` suite is where the README path gets a shared script of truth; the per-slice "update README step 4 if `kubectl get loops` changes" checklist line and the `make deploy` kustomize-edit note land with it.
 
 **Problem:** nothing tests the README's commands. Each Phase 1 slice changes
 what a Loop does (B1 phase moves, runner wiring, verify Job), and the

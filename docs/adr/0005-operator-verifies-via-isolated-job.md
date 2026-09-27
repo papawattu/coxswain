@@ -167,6 +167,15 @@ the API server, or credentials mounted into the Job. So the Job gets:
 (e.g. gVisor) if one is configured. (Consider running it as an agent-sandbox
 `Sandbox` rather than a raw `Job` so isolation policy lives in one place.)
 
+**Status-write invariant (I29, round-4):** the verify evidence now lives in
+`loops/status` (`status.verify.*`), so its integrity depends on nothing but
+who may write `loops/status`. The scaffolded `loop_editor_role` and
+`loop_admin_role` grant `loops/status` `get` only — today only the manager
+role can write it. **Keep it that way:** only the manager role may write
+`loops/status`; it holds the verify evidence. A later RBAC edit that widens
+`loops/status` write to a non-manager role would let a non-operator forge the
+tamper/check exit codes and must be treated as a break of this invariant.
+
 ### Gate evidence = kubelet-recorded exit codes, one check per container (D14, supersedes D13)
 
 The D13 draft sent per-check exit codes to `/dev/termination-log`. **That is

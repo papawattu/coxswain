@@ -30,7 +30,7 @@ Two gaps would carry straight into B3 and must be closed first.
 
 ### D24. "No evidence" is indistinguishable from "clean"
 
-- [ ] Done
+- [x] Done (f6ab491)
 
 **Where:** `api/v1alpha1/loop_types.go` `VerifyStatus.TamperExitCode int
 \`json:"tamperExitCode,omitempty"\``; `tamperVerdict` in
@@ -65,7 +65,7 @@ evidence for a different `verifiedCommit` / Job is treated as nil.
 
 ### D25. The Go preset globs miss repo-root files under git's default pathspec
 
-- [ ] Done
+- [x] Done (cb7da6f)
 
 **Where:** the Go preset (`**/*_test.go`, `**/testdata/**`, `go.mod`,
 `go.sum` — `loop_types.go:80`) and whatever runs the tamper check's
@@ -108,7 +108,7 @@ covered; no test name claims fixture coverage it doesn't exercise.
 
 ### I28. `tamperVerdict` takes a claim only to ignore it
 
-- [ ] Done
+- [x] Done (f6ab491)
 
 `tamperVerdict(tamperExitCode int, resultClaimsSuccess bool)` does
 `_ = resultClaimsSuccess`. Accepting the claim invites a future edit to use
@@ -118,7 +118,7 @@ already exists.
 
 ### I29. Say who can write `status.verify`
 
-- [ ] Done
+- [x] Done (3dbe4f9)
 
 The evidence now lives in Loop status, so its integrity depends on nothing
 but the operator writing `loops/status`. Checked at review time: the
@@ -129,7 +129,7 @@ it holds verify evidence"), so a later RBAC edit doesn't quietly break it.
 
 ### I30. Attribution in the R3 bookkeeping
 
-- [ ] Done
+- [x] Done (3dbe4f9)
 
 `REVIEW-PHASE1-R3.md` I27 says "deferred … (per owner: fold I27 into the
 e2e work)". That instruction came from the reviewer, not the owner. Change to

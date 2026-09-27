@@ -33,6 +33,10 @@ func int32PtrEnv(v int32) *int32 {
 	return p
 }
 
+// A fixed commit SHA the B2 envtest cases use for both the evidence's and the
+// operator-pinned verified commit (named to keep goconst quiet).
+const b2Commit = "deadbeef"
+
 // B2 (D10/D24) anti-gaming + fail-closed envtest. The operator's TamperedVerify
 // decision at Verifying is driven by its OWN evidence (status.verify.*), never
 // by the runner's result.json claim. In envtest (no Job controller) the tests
@@ -87,11 +91,14 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 
 		// The operator's tamper evidence: a protected path changed (non-zero),
 		// for the current verifiedCommit. Plus the runner's claim that it's done.
+		// The operator pinned the current commit (D11) to the SAME SHA the
+		// evidence names, so the evidence is bound (D27).
 		got.Status.Verify = &coxv1alpha1.VerifyStatus{
 			TamperExitCode: int32PtrEnv(1),
-			VerifiedCommit: "deadbeef",
+			VerifiedCommit: b2Commit,
 			JobName:        "b2-tamper-verify-1",
 		}
+		got.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: b2Commit}
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
 
@@ -123,10 +130,13 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		driveToVerifying(nn)
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
+		// Clean tamper code (0) bound to the current commit (D27): the evidence
+		// names the same SHA the operator pinned, so it counts.
 		got.Status.Verify = &coxv1alpha1.VerifyStatus{
 			TamperExitCode: int32PtrEnv(0),
-			VerifiedCommit: "deadbeef",
+			VerifiedCommit: b2Commit,
 		}
+		got.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: b2Commit}
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
 
@@ -166,5 +176,40 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 			"the Loop must NOT reach Succeeded on no evidence")
 		Expect(got.Status.Phase).ToNot(Equal(coxv1alpha1.LoopPhaseFailed),
 			"no evidence is Unknown, not Tampered — it must not end Failed either")
+	})
+
+	It("stays Verifying when the evidence names a DIFFERENT commit than the pinned current one (D27 stale evidence)", func() {
+		ns := "b2-stale-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		nn := makeLoop(ns, "b2-stale")
+		driveToVerifying(nn)
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
+		// The evidence is a CLEAN 0, but it names commit A ("aaaa") — leftover from
+		// a previous iteration's Job — while the operator pinned the CURRENT
+		// commit to B ("bbbb") at Verifying start (D11). A clean-but-stale
+		// evidence must NOT be treated as clean (D27 fail-closed): the Loop stays
+		// in Verifying and B3 cannot reach Succeeded on it.
+		got.Status.Verify = &coxv1alpha1.VerifyStatus{
+			TamperExitCode: int32PtrEnv(0),
+			VerifiedCommit: "aaaa",
+			JobName:        "b2-stale-verify-1",
+		}
+		got.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "bbbb"}
+		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
+		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"D27: a clean-0 evidence bound to a different commit than the pinned current must not advance the Loop")
+		Expect(got.Status.Phase).ToNot(Equal(coxv1alpha1.LoopPhaseSucceeded),
+			"stale evidence must not be treated as clean (the loop must not reach Succeeded on it)")
 	})
 })

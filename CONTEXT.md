@@ -1,6 +1,8 @@
 # Coxswain
 
-A Kubernetes operator that runs long-lived plan → implement → verify loops for coding agents. Each loop runs in an isolated workspace and stops on success, budget, or stall.
+A Kubernetes operator that runs long-lived plan → implement → verify loops for agents. Each loop runs in an isolated workspace and stops on success, budget, or stall.
+
+Agent isolation is the goal, so they can only do what is allowed by policy.  Network isolation, command white lists and auditing.
 
 ## Language
 

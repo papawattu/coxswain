@@ -210,6 +210,23 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              currentVerify:
+                description: |-
+                  currentVerify is the operator's pin of the CURRENT iteration's verified
+                  commit, written by the operator on entering Verifying (D11) and used to
+                  bind the verify evidence to the commit being verified. It is distinct from
+                  verify.verifiedCommit (the commit the *evidence* names): a mismatch between
+                  the two means the evidence is stale (from a previous iteration's Job or a
+                  force-pushed branch) and must be treated as no evidence (D27 fail-closed).
+                properties:
+                  verifiedCommit:
+                    description: |-
+                      verifiedCommit is the SHA the operator resolved from the Loop branch head
+                      at Verifying start and pinned for this iteration (D11). The verify Job
+                      checks out exactly this SHA, and the evidence's verifiedCommit must equal
+                      it for the evidence to count.
+                    type: string
+                type: object
               desiredPhase:
                 description: |-
                   desiredPhase is the phase the operator has asked the runner to be in.

@@ -48,12 +48,13 @@ func TestTamperVerdict(t *testing.T) {
 	}{
 		// nil = no evidence (never ran / Job crashed / status lost) -> Unknown,
 		// NEVER clean (D24 fail-closed).
-		{"nil tamper evidence -> Unknown (not clean)", nil, "", "", TamperUnknown},
-		// explicit 0 from a terminated container -> Clean.
-		{"explicit 0 -> Clean", int32Ptr(0), "", "", TamperClean},
+		{"nil tamper evidence -> Unknown (not clean)", nil, commitSame, commitSame, TamperUnknown},
+		// explicit 0 from a terminated container, bound to the current commit
+		// -> Clean (D24; D27 requires a non-empty matching binding).
+		{"explicit 0 -> Clean", int32Ptr(0), commitSame, commitSame, TamperClean},
 		// non-zero -> Tampered (terminal), the anti-gaming property.
-		{"non-zero exit -> Tampered", int32Ptr(1), "", "", TamperTampered},
-		{"non-zero exit (code 2) -> Tampered", int32Ptr(2), "", "", TamperTampered},
+		{"non-zero exit -> Tampered", int32Ptr(1), commitSame, commitSame, TamperTampered},
+		{"non-zero exit (code 2) -> Tampered", int32Ptr(2), commitSame, commitSame, TamperTampered},
 		// Stale evidence: the evidence names a different verifiedCommit than the
 		// current one -> treated as nil (Unknown), even if it is a clean 0
 		// (D24.3: evidence from a previous iteration's Job can't be reused).
@@ -62,8 +63,15 @@ func TestTamperVerdict(t *testing.T) {
 		// Same commit -> the evidence is current; the code decides.
 		{"current commit, 0 -> Clean", int32Ptr(0), commitSame, commitSame, TamperClean},
 		{"current commit, non-zero -> Tampered", int32Ptr(1), commitSame, commitSame, TamperTampered},
-		// Empty evidence commit (B2 wiring) skips the stale guard; the code decides.
-		{"empty evidence commit, non-zero -> Tampered", int32Ptr(1), "", commitSame, TamperTampered},
+		// D27 fail-closed on a missing binding: an empty commit on EITHER side
+		// means the evidence isn't bound to a known current commit -> Unknown
+		// (never Clean, never Tampered-advancing).
+		{"empty evidence commit -> Unknown (D27)", int32Ptr(1), "", commitSame, TamperUnknown},
+		{"empty current commit -> Unknown (D27)", int32Ptr(1), commitSame, "", TamperUnknown},
+		{"both commits empty -> Unknown (D27)", int32Ptr(0), "", "", TamperUnknown},
+		// Clean 0 with an empty binding is NOT clean (D27: fail-closed, not the
+		// old skip-when-empty behavior).
+		{"empty evidence commit, code 0 -> Unknown (D27)", int32Ptr(0), "", commitSame, TamperUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

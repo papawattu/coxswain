@@ -140,6 +140,20 @@ type VerifyStatus struct {
 	LastCheckResults []*int32 `json:"lastCheckResults,omitempty"`
 }
 
+// CurrentVerifyStatus is the operator's pin of the current iteration's verified
+// commit (D11/D27). The operator writes verifiedCommit on entering Verifying
+// (resolved from the branch head it read itself, never from the agent), and the
+// verify evidence must name the same commit to be accepted. A mismatch or an
+// empty pin makes the evidence Unknown (fail-closed).
+type CurrentVerifyStatus struct {
+	// verifiedCommit is the SHA the operator resolved from the Loop branch head
+	// at Verifying start and pinned for this iteration (D11). The verify Job
+	// checks out exactly this SHA, and the evidence's verifiedCommit must equal
+	// it for the evidence to count.
+	// +optional
+	VerifiedCommit string `json:"verifiedCommit,omitempty"`
+}
+
 // LoopSettings holds the loop-level knobs.
 type LoopSettings struct {
 	// maxIterations caps the plan→implement→verify cycles.
@@ -213,6 +227,15 @@ type LoopStatus struct {
 	// in envtest (no Job controller) the B-slice tests set them directly.
 	// +optional
 	Verify *VerifyStatus `json:"verify,omitempty"`
+
+	// currentVerify is the operator's pin of the CURRENT iteration's verified
+	// commit, written by the operator on entering Verifying (D11) and used to
+	// bind the verify evidence to the commit being verified. It is distinct from
+	// verify.verifiedCommit (the commit the *evidence* names): a mismatch between
+	// the two means the evidence is stale (from a previous iteration's Job or a
+	// force-pushed branch) and must be treated as no evidence (D27 fail-closed).
+	// +optional
+	CurrentVerify *CurrentVerifyStatus `json:"currentVerify,omitempty"`
 
 	// conditions represent the current state of the Loop resource.
 	// Each condition has a unique type and reflects the status of a specific

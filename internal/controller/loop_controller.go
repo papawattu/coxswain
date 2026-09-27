@@ -102,14 +102,20 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// controller); in a real cluster B3 reads the tamper exit code from the
 	// verify Job pod's initContainerStatuses.
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying && loop.Status.Verify != nil {
-		// The operator's current verifiedCommit is resolved at Verifying start
-		// (D11, B3); in B2 the evidence's own verifiedCommit is the reference, so
-		// the stale-evidence guard is exercised at the pure-function seam (the
-		// Reconcile wiring passes the evidence's commit as both the evidence and
-		// the current reference). B3 wires in the separately-resolved current
-		// commit so a force-push / previous-iteration Job can't be reused.
+		// The operator's CURRENT verified commit is the one it pinned on entering
+		// Verifying (status.currentVerify.verifiedCommit, D11) — never the
+		// evidence's own commit (D27: passing the evidence's commit as both args
+		// made the stale guard a no-op in prod). The evidence's verifiedCommit
+		// (status.verify.verifiedCommit) is what the evidence NAMES. A mismatch
+		// between the two, or an empty pin, makes tamperVerdict return Unknown
+		// (fail-closed), so leftover evidence from a previous iteration's Job or a
+		// force-pushed branch cannot be reused to reach Succeeded.
 		v := loop.Status.Verify
-		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, v.VerifiedCommit) == TamperTampered {
+		var currentCommit string
+		if loop.Status.CurrentVerify != nil {
+			currentCommit = loop.Status.CurrentVerify.VerifiedCommit
+		}
+		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, TamperedVerifyReason,
 				"a protected path changed between baseCommit and verifiedCommit; terminal")
@@ -264,7 +270,7 @@ const (
 //
 //
 //	tamperExitCode == nil            -> TamperUnknown (no evidence; NEVER clean)
-//	*exitCode names a stale verifiedCommit -> TamperUnknown (stale, treated as nil)
+//	commit binding missing or stale    -> TamperUnknown (D27: both commits non-empty AND equal)
 //	*exitCode == 0                    -> TamperClean
 //	*exitCode != 0                    -> TamperTampered (terminal Failed:TamperedVerify)
 //
@@ -278,10 +284,12 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 	if tamperExitCode == nil {
 		return TamperUnknown
 	}
-	// Stale evidence: the evidence names a different verifiedCommit than the
-	// current one (e.g. left over from a previous iteration's Job) -> treated as
-	// nil (D24.3).
-	if evidenceCommit != "" && verifiedCommit != "" && evidenceCommit != verifiedCommit {
+	// D27 fail-closed on a missing or stale binding: the evidence must be bound
+	// to a KNOWN current commit. If either commit is empty (the evidence names no
+	// commit, or the operator hasn't pinned the current one yet) or they differ
+	// (leftover from a previous iteration's Job / a force-pushed branch), the
+	// evidence is Unknown — never Clean, never Tampered-advancing.
+	if evidenceCommit == "" || verifiedCommit == "" || evidenceCommit != verifiedCommit {
 		return TamperUnknown
 	}
 	if *tamperExitCode == 0 {

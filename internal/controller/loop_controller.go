@@ -379,31 +379,43 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 // NotFound on Get is not an error.
 func (r *LoopReconciler) cleanupProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	log := logf.FromContext(ctx)
-	// Delete the proxy pod.
+	// Delete the proxy pod (only if we control it, I2: never take over a
+	// foreign object).
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)
 	if err == nil {
-		if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+		if !metav1.IsControlledBy(pod, loop) {
+			log.Info("proxy pod exists but is not controlled by this Loop; not deleting",
+				"proxy", proxyPodName(loop.Name), "loop", loop.Name)
+		} else if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
 			return fmt.Errorf("delete proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), delErr)
+		} else {
+			log.Info("deleted proxy pod (endpointSecretRef absent)", "proxy", proxyPodName(loop.Name), "loop", loop.Name)
 		}
-		log.Info("deleted proxy pod (endpointSecretRef absent)", "proxy", proxyPodName(loop.Name), "loop", loop.Name)
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
 	}
-	// Delete the proxy Service.
+	// Delete the proxy Service (only if we control it).
 	svc := &corev1.Service{}
 	err = r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyServiceName(loop.Name)}, svc)
 	if err == nil {
-		if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
+		if !metav1.IsControlledBy(svc, loop) {
+			log.Info("proxy Service exists but is not controlled by this Loop; not deleting",
+				"proxy", proxyServiceName(loop.Name), "loop", loop.Name)
+		} else if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
 			return fmt.Errorf("delete proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), delErr)
+		} else {
+			log.Info("deleted proxy Service (endpointSecretRef absent)", "proxy", proxyServiceName(loop.Name), "loop", loop.Name)
 		}
-		log.Info("deleted proxy Service (endpointSecretRef absent)", "proxy", proxyServiceName(loop.Name), "loop", loop.Name)
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), err)
 	}
 	return nil
 }
 
+// sandboxName returns the Loop's Sandbox name (<loop>-sandbox). The name is
+// CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
+// is always a valid DNS-1035 label <= 63 chars and needs no truncation.
 func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
 }
@@ -439,10 +451,11 @@ func proxyLabels(loopName string) map[string]string {
 }
 
 // proxyImage returns the model proxy pod image. It is the reconciler's
-// ProxyImage field (set from a manager flag in cmd/main.go, like SandboxImage),
-// or a working stand-in (golang:1.26) when unset. The stand-in has POSIX
-// sh, head, and sleep — enough for the D33 kind-run acceptance (the
-// model-creds read + sleep infinity).
+// ProxyImage field (settable in tests and future slices; a manager flag
+// --proxy-image is a candidate for a future C2b), or a working stand-in
+// (golang:1.26) when unset. The stand-in has POSIX sh, head, and sleep —
+// enough for the D33 kind-run acceptance (the model-creds read + sleep
+// infinity).
 func (r *LoopReconciler) proxyImage() string {
 	if r.ProxyImage != "" {
 		return r.ProxyImage
@@ -514,11 +527,17 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		// Pod exists but the spec hash doesn't match: delete and requeue.
 		// A bare Pod's spec is immutable, so we can't Update it. Deleting
 		// triggers the Owns(Pod) watch, which re-reconciles and creates the
-		// new pod.
-		log.Info("proxy pod spec drift detected, deleting for recreation",
-			"proxy", proxyPodName(loopName), "loop", loopName)
-		if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
-			return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
+		// new pod. Only delete if we control it (I2: never take over a
+		// foreign object).
+		if !metav1.IsControlledBy(existingPod, loop) {
+			log.Info("proxy pod spec drift detected but pod is not controlled by this Loop; not deleting",
+				"proxy", proxyPodName(loopName), "loop", loopName)
+		} else {
+			log.Info("proxy pod spec drift detected, deleting for recreation",
+				"proxy", proxyPodName(loopName), "loop", loopName)
+			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
+			}
 		}
 		// Requeue so the next pass creates the new pod (the delete is
 		// asynchronous; the pod may not be gone yet).

@@ -54,9 +54,10 @@ const (
 	loopRepo       = testRepoURL
 	loopRef        = "main"
 	// runnerImage and testModel are shared test constants (goconst).
-	runnerImage  = "example.com/coxswain/runner:v1"
-	testModel    = "local-model"
-	loopCheckCmd = "go test ./..."
+	runnerImage   = "example.com/coxswain/runner:v1"
+	testModel     = "local-model"
+	sleepInfinity = "sleep infinity"
+	loopCheckCmd  = "go test ./..."
 
 	// agentContainerName is the name of the Loop's agent container in the
 	// Sandbox pod spec (goconst: it appears in several test files).

@@ -65,7 +65,7 @@ var _ = Describe("Loop existing-sandbox adoption", func() {
 					PodTemplate: sandboxv1beta1.PodTemplate{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{
-								{Name: agentContainerName, Image: "docker.io/library/golang:1.26", Command: []string{"sh", "-c", "sleep infinity"}},
+								{Name: agentContainerName, Image: "docker.io/library/golang:1.26", Command: []string{"sh", "-c", sleepInfinity}},
 							},
 						},
 					},
@@ -144,7 +144,7 @@ var _ = Describe("Loop existing-sandbox adoption", func() {
 					PodTemplate: sandboxv1beta1.PodTemplate{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{
-								{Name: agentContainerName, Image: "docker.io/library/golang:1.26", Command: []string{"sh", "-c", "sleep infinity"}},
+								{Name: agentContainerName, Image: "docker.io/library/golang:1.26", Command: []string{"sh", "-c", sleepInfinity}},
 							},
 						},
 					},

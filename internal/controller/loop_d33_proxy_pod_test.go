@@ -48,6 +48,7 @@ const (
 	d33ModelCredsSecret = "cox-model-creds"
 	modelAPIKey         = "MODEL_API_KEY"
 	modelBaseURL        = "MODEL_BASE_URL"
+	cleanLoopProxy      = "clean-loop-proxy"
 )
 
 var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)", func() {
@@ -349,6 +350,83 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 			"the proxy pod must be recreated (new UID) after a hash mismatch")
 		Expect(newPod.Annotations[proxySpecHashAnnotation]).To(Equal(originalHash),
 			"the recreated pod must carry the current hash")
+	})
+
+	It("deletes the proxy pod and Service when endpointSecretRef is removed (R15 round 4)", func() {
+		ns := "d34r3-cleanup" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "clean-creds", Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:  "dummy-key",
+				modelBaseURL: "http://fake-endpoint:8000",
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		Expect(k8sClient.Create(ctx, buildLoopWithSecret("clean-loop", ns, "clean-creds"))).To(Succeed())
+
+		// Reconcile: creates the proxy pod + Service.
+		reconcile("clean-loop", ns)
+
+		// Verify the proxy pod exists.
+		proxyPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cleanLoopProxy}, proxyPod)).To(Succeed())
+
+		// Remove the endpointSecretRef from the Loop.
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "clean-loop"}, loop)).To(Succeed())
+		loop.Spec.Agent.EndpointSecretRef = ""
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+
+		// Reconcile: cleanupProxy should delete the proxy pod + Service.
+		reconcile("clean-loop", ns)
+
+		// The proxy pod should be gone (or in the process of being deleted).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cleanLoopProxy}, &corev1.Pod{})).ToNot(Succeed(),
+			"the proxy pod must be deleted when endpointSecretRef is removed")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cleanLoopProxy}, &corev1.Service{})).ToNot(Succeed(),
+			"the proxy Service must be deleted when endpointSecretRef is removed")
+	})
+
+	It("does not delete an unowned proxy pod (R15 round 4)", func() {
+		ns := "d34r3-unowned" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		// Create a Loop WITHOUT endpointSecretRef.
+		loop := buildLoopWithSecret("unowned-loop", ns, "")
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Pre-create an UNOWNED proxy pod with the proxy label (no owner ref).
+		unownedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "unowned-loop-proxy",
+				Namespace: ns,
+				Labels: map[string]string{
+					"app.kubernetes.io/component": "model-proxy",
+					"coxswain.io/proxy-for":       "unowned-loop",
+				},
+				Annotations: map[string]string{
+					proxySpecHashAnnotation: "stale-hash-000000",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "proxy",
+					Image:   "golang:1.26",
+					Command: []string{"sh", "-c", sleepInfinity},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, unownedPod)).To(Succeed())
+
+		// Reconcile: cleanupProxy should NOT delete the unowned pod.
+		reconcile("unowned-loop", ns)
+
+		// The unowned pod must survive.
+		survivingPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "unowned-loop-proxy"}, survivingPod)).To(Succeed(),
+			"an unowned proxy pod must survive cleanupProxy")
 	})
 })
 

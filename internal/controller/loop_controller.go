@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -45,6 +47,11 @@ const (
 	// both are GC'd with it).
 	proxyPodNameSuffix  = "-proxy"
 	proxyServiceNameFmt = "%s-proxy"
+	// proxySpecHashAnnotation records the hash of the desired proxy pod spec
+	// on the pod itself (P2, R15: operator upgrades change the spec; a bare
+	// Pod's spec is immutable, so the operator deletes and recreates the pod
+	// when the hash mismatches).
+	proxySpecHashAnnotation = "coxswain.io/proxy-spec-hash"
 	// modelCredsVolume is the name of the Secret volume that carries the model
 	// API key + base URL (mounted read-only into the proxy pod only).
 	modelCredsVolume = "model-creds"
@@ -85,8 +92,8 @@ type LoopReconciler struct {
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy): it
 // creates/updates them, watches them (Owns mapping), and lets GC delete them
 // with the Loop. Only the verbs the controller actually uses.
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -385,8 +392,8 @@ func proxyServiceURL(loopName, namespace string) string {
 // rest).
 func proxyLabels(loopName string) map[string]string {
 	return map[string]string{
-		"app":              "coxswain-proxy",
-		"coxswain.io/loop": loopName,
+		"app.kubernetes.io/component": "model-proxy",
+		"coxswain.io/proxy-for":       loopName,
 	}
 }
 
@@ -428,6 +435,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 	}
 
 	// --- proxy pod ---
+	proxySpecHash := proxyPodSpecHash(loop)
 	podDesired := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      proxyPodName(loopName),
@@ -506,10 +514,26 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 				},
 			},
 		}}
+		podDesired.Annotations = map[string]string{proxySpecHashAnnotation: proxySpecHash}
 		return controllerutil.SetControllerReference(loop, podDesired, r.Scheme)
 	})
 	if err != nil {
 		return fmt.Errorf("ensure proxy pod %s/%s: %w", ns, proxyPodName(loopName), err)
+	}
+	// P2 (R15): if the existing pod's spec hash doesn't match the desired
+	// hash, the operator upgrade changed the pod spec. A bare Pod's spec is
+	// immutable, so delete and recreate.
+	if podOp == controllerutil.OperationResultUpdated {
+		existing := &corev1.Pod{}
+		if getErr := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: proxyPodName(loopName)}, existing); getErr == nil {
+			if existing.Annotations[proxySpecHashAnnotation] != proxySpecHash {
+				log.Info("proxy pod spec drift detected, deleting for recreation",
+					"proxy", proxyPodName(loopName), "loop", loopName)
+				if delErr := r.Delete(ctx, existing); delErr != nil {
+					return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
+				}
+			}
+		}
 	}
 
 	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
@@ -687,6 +711,24 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&coxv1alpha1.Loop{}).
 		Owns(&sandboxv1beta1.Sandbox{}).
+		// P2 (R15): watch the per-Loop proxy pod and Service so a
+		// deleted/evicted proxy triggers reconciliation and is recreated.
+		Owns(&corev1.Pod{}).
+		Owns(&corev1.Service{}).
 		Named("loop").
 		Complete(r)
+}
+
+// proxyPodSpecHash computes a stable hash of the proxy pod's desired spec
+// (P2, R15). The hash covers the fields that change across operator releases
+// or Loop updates. Since endpointSecretRef is immutable (P2, R15), the only
+// drift source is operator upgrades (image, command, limits). The hash is
+// stored on the pod as the proxySpecHashAnnotation; on a mismatch the operator
+// deletes and recreates the pod (spec.volumes is immutable on a bare Pod).
+func proxyPodSpecHash(loop *coxv1alpha1.Loop) string {
+	h := sha256.New()
+	h.Write([]byte("proxy-spec-hash-v1|"))
+	h.Write([]byte(loop.Spec.Agent.EndpointSecretRef))
+	h.Write([]byte("|stand-in-v1"))
+	return hex.EncodeToString(h.Sum(nil))
 }

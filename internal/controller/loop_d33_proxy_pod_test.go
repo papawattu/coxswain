@@ -56,8 +56,8 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 				Goal:      loopGoal,
 				Workspace: testWorkspace(),
 				Agent: coxv1alpha1.AgentConfig{
-					Image:             "example.com/coxswain/runner:v1",
-					Model:             "local-model",
+					Image:             runnerImage,
+					Model:             testModel,
 					EndpointSecretRef: d33ModelCredsSecret,
 				},
 			},
@@ -70,6 +70,21 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      loopGoal,
 				Workspace: testWorkspace(),
+			},
+		}
+	}
+
+	buildLoopWithSecret := func(name, ns, secretName string) *coxv1alpha1.Loop {
+		return &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: testWorkspace(),
+				Agent: coxv1alpha1.AgentConfig{
+					Image:             runnerImage,
+					Model:             testModel,
+					EndpointSecretRef: secretName,
+				},
 			},
 		}
 	}
@@ -217,6 +232,75 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p)).NotTo(Succeed())
 		svc := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, svc)).NotTo(Succeed())
+	})
+
+	It("P1 (R15): the proxy pod does NOT carry coxswain.io/loop (disjoint from the agent selector)", func() {
+		ns := "d33-p1-label"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		secretName := "p1-creds"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+			StringData: map[string]string{"MODEL_API_KEY": "k", "MODEL_BASE_URL": "http://m.example:8000"}})).To(Succeed())
+		name := "d33p1"
+		Expect(k8sClient.Create(ctx, buildLoopWithSecret(name, ns, secretName))).To(Succeed())
+		reconcile(name, ns)
+
+		// The proxy pod must NOT carry coxswain.io/loop.
+		p := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p)).To(Succeed())
+		Expect(p.Labels).NotTo(HaveKey("coxswain.io/loop"),
+			"P1: the proxy pod must not carry the agent's coxswain.io/loop label")
+		Expect(p.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
+		Expect(p.Labels).To(HaveKeyWithValue("coxswain.io/proxy-for", name))
+
+		// The Service selects ONLY the proxy labels.
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, svc)).To(Succeed())
+		Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
+		Expect(svc.Spec.Selector).To(HaveKeyWithValue("coxswain.io/proxy-for", name))
+		Expect(svc.Spec.Selector).NotTo(HaveKey("coxswain.io/loop"))
+
+		// Note: the sandbox pod's coxswain.io/loop label is set by the
+		// agent-sandbox controller, not by our controller, so it's not
+		// checkable from envtest. The P1 guarantee is that the proxy pod
+		// does NOT carry the label, which is asserted above. The KubeArmorPolicy
+		// selector (C6b) uses coxswain.io/loop and will therefore match only
+		// the sandbox pod, not the proxy pod.
+	})
+
+	It("P2 (R15): deleting the proxy pod triggers reconciliation and recreation", func() {
+		ns := "d33-p2-recreate"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		secretName := "p2-creds"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
+			StringData: map[string]string{"MODEL_API_KEY": "k", "MODEL_BASE_URL": "http://m.example:8000"}})).To(Succeed())
+		name := "d33p2"
+		Expect(k8sClient.Create(ctx, buildLoopWithSecret(name, ns, secretName))).To(Succeed())
+		reconcile(name, ns)
+
+		// The proxy pod exists.
+		p := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p)).To(Succeed())
+		originalUID := p.UID
+
+		// Delete the proxy pod.
+		Expect(k8sClient.Delete(ctx, p)).To(Succeed())
+
+		// Reconcile the Loop: the controller must recreate the proxy pod.
+		// Note: the local `reconcile` closure shadows the `reconcile` package,
+		// so we create a separate reconciler and call Reconcile directly.
+		// Use the local reconcile closure (which shadows the reconcile package
+		// name but does exactly what we need: Reconcile the Loop and assert
+		// no error).
+		reconcile(name, ns)
+
+		// The proxy pod is back (with a new UID).
+		By("recreating the proxy pod after deletion")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p)).To(Succeed(),
+			"P2: the proxy pod must be recreated after deletion")
+		Expect(p.UID).NotTo(Equal(originalUID))
+		Expect(p.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
 	})
 })
 

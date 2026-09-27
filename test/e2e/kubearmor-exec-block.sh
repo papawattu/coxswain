@@ -76,8 +76,8 @@ echo "==> KubeArmor default posture is block? (required for exec blocking)"
 FILE_POSTURE=$(kubectl -n kubearmor get configmap kubearmor-config -o jsonpath='{.data.defaultFilePosture}' 2>/dev/null || true)
 if [ "$FILE_POSTURE" != "block" ]; then
   echo "   FAIL: defaultFilePosture is '${FILE_POSTURE:-unset}', not 'block' — a disallowed exec would be logged but ALLOWED."
-  echo "   Run: kubectl -n kubearmor edit configmap kubearmor-config -> defaultFilePosture: block,"
-  echo "         visibility: process,file,network,capabilities, then 'kubectl -n kubearmor rollout restart daemonset/kubearmor'"
+  echo "   Re-run kind-up so the posture is set via `karmor install` flags (-b all) BEFORE the agent starts."
+  echo "   Do NOT patch the config + rollout-restart the agent: on kernel 6.1 an agent restart can wedge the node's BPF subsystem (ADR-0007 finding F2)."
   echo "   (make kind-up does this automatically)"
   exit 1
 fi

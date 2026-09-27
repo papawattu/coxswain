@@ -219,6 +219,39 @@ containers, per D29). It does **not** cover:
 - Production: the homelab K3s nodes must pass the same BPF-LSM/BTF host check
   before eBPF enforcement is relied on there.
 
+## Findings (observed, 2026-09-27, dev host kernel 6.1.0-53, KubeArmor v1.7.5)
+
+These are runtime observations that shape how the engine is installed and
+operated. They amend the Q3 install story, not the ADR's decisions.
+
+- **F1 — the exec allowlist's block posture is `defaultFilePosture`, not
+  `spec.action`.** KubeArmor v1.7.5's BPF-LSM gates the process allowlist's
+  block-vs-audit choice on the default posture (the block sentinel is keyed on
+  `defaultPosture.FileAction` in the agent's `rulesHandling.go`); the policy's
+  top-level `action: Block` is not what does it. `karmor install` defaults
+  `defaultFilePosture: audit`, so a disallowed exec is *evaluated and logged*
+  ("Armored Up" + an audit alert) but **allowed**. Implication: the posture
+  must be `block` (plus `process` visibility) **before the node agent first
+  starts** — hence `make kind-up` passes `-b all -viz process,file,network`
+  to `karmor install` rather than editing the config afterwards.
+- **F2 — a KubeArmor agent stop/restart can wedge the node's BPF subsystem
+  (kernel 6.1).** Observed: an agent process exiting through SIGKILL hung in
+  D state at `bpf_trampoline_unlink_prog → unregister_ftrace_direct_multi →
+  ftrace_shutdown → synchronize_rcu_tasks` (with `rcu_tasks_kthread` also D),
+  holding the BPF trampoline lock; every subsequent `bpf_prog_load` on the
+  host then blocked (a fresh cluster's snitch `bpf_check` sat in
+  `bpf_trampoline_get`), so no new BPF-LSM program could load until the host
+  rebooted. Consequences:
+  - `make kind-up` **must not** `rollout restart` the KubeArmor agent after
+    changing the posture (the old edit-config + restart flow is both
+    unnecessary per F1 and host-disruptive per F2).
+  - **Production installs must treat KubeArmor agent restarts/upgrades as
+    node-disruptive operations: drain the node first** (a hung agent
+    teardown takes the node's BPF subsystem down with it — not just the
+    agent). Same applies to `kind delete` of a cluster whose agent has hung
+    (it can hang the control-plane container's teardown); the only reliable
+    recovery is a host reboot.
+
 ## Open owner decisions (NOT picked by the builder)
 
 - **ADR-0006's open decision 1** (first real agent to adapt) is still open and

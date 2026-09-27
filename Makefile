@@ -98,6 +98,13 @@ KIND_NODE_IMAGE ?= kindest/node:v1.34.0
 # place, and the release manifest is derived from it.
 AGENT_SANDBOX_VERSION ?= v1.0.4
 KUBEARMOR_VERSION ?= v1.7.5
+# KubeArmor install posture flags: block for file/network/capabilities (the exec
+# allowlist's block-vs-audit is gated on defaultFilePosture, NOT spec.action) +
+# process visibility (needed for the process rules to be visible/evaluated).
+# These are passed to `karmor install` so the posture is in the KubeArmorConfig
+# BEFORE the node agent starts — see the finding below why it must NOT be a
+# post-install edit + agent restart.
+KUBEARMOR_POSTURE_FLAGS ?= -b all -viz process,file,network
 AGENT_SANDBOX_MANIFEST ?= https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)/sandbox.yaml
 # The controller image the release manifest references (pre-loaded into the
 # kind node so an offline host doesn't depend on the node reaching
@@ -130,27 +137,19 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 	@command -v bin/karmor >/dev/null 2>&1 || \
 		curl -sfL "https://github.com/kubearmor/kubearmor-client/releases/download/v1.4.9/karmor_1.4.9_linux_amd64.tar.gz" \
 		| tar xz -C bin
-	@bin/karmor install --tag $(KUBEARMOR_VERSION) || \
+	@bin/karmor install $(KUBEARMOR_POSTURE_FLAGS) --tag $(KUBEARMOR_VERSION) || \
 		{ echo "KubeArmor install failed (needs --tag $(KUBEARMOR_VERSION), the v-prefix is mandatory for Docker Hub tags)"; exit 1; }
 	@echo "KubeArmor $(KUBEARMOR_VERSION) installed (BPF-LSM enforcer)."
-	@echo "Setting KubeArmor's default posture to block (BPF-LSM exec/whitelist enforcement)."
-	@echo "KubeArmor v1.7.5 gates the exec allowlist's block-vs-audit on defaultFilePosture (NOT spec.action); karmor install defaults it to audit, so a disallowed exec would be logged but allowed. Set it to block + enable process visibility so the operator's allowlist actually blocks." \
+	@echo "Verifying the KubeArmor default posture is block (BPF-LSM exec/whitelist enforcement)."
+	@echo "The posture is set via karmor install flags ($(KUBEARMOR_POSTURE_FLAGS)), NOT by editing the config + restarting the agent: KubeArmor v1.7.5 gates the exec allowlist's block-vs-audit on defaultFilePosture (NOT spec.action), so block must be in place before the agent first starts. A post-install config edit + agent rollout-restart is also host-disruptive: on kernel 6.1 a BPF-LSM agent stop can hang in bpf_trampoline teardown and wedge the node's BPF subsystem (see ADR-0007, findings)." \
 		&& KA_NS=$$(kubectl get configmap -A --no-headers 2>/dev/null | awk '$$2=="kubearmor-config"{print $$1; exit}') \
 		&& [ -n "$$KA_NS" ] \
-		&& kubectl -n "$$KA_NS" get configmap kubearmor-config -o yaml \
-		| sed -e 's/defaultFilePosture:.*/defaultFilePosture: block/' \
-			 -e 's/defaultNetworkPosture:.*/defaultNetworkPosture: block/' \
-			 -e 's/defaultCapabilitiesPosture:.*/defaultCapabilitiesPosture: block/' \
-			 -e 's/visibility:.*/visibility: process,file,network,capabilities/' \
-		| kubectl apply -f - \
-		&& KA_AGENT=$$(kubectl get daemonset -A --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/ && $$2 !~ /snitch/ {print $$1 "\t" $$2; exit}') \
-		&& [ -n "$$KA_AGENT" ] \
-		&& echo "   KubeArmor agent DaemonSet: $$KA_AGENT" \
-		&& KA_DNS=$$(echo "$$KA_AGENT" | cut -f1) && \
-		KA_DN=$$(echo "$$KA_AGENT" | cut -f2) && \
-		kubectl -n "$$KA_DNS" rollout restart "daemonset/$$KA_DN" \
-		&& kubectl -n "$$KA_DNS" rollout status "daemonset/$$KA_DN" --timeout=120s \
-		|| { echo "Could not restart the KubeArmor agent (posture may stay audit -> exec e2e will not block)"; exit 1; }
+		&& FP=$$(kubectl -n "$$KA_NS" get configmap kubearmor-config -o jsonpath='{.data.defaultFilePosture}' 2>/dev/null) \
+		&& VP=$$(kubectl -n "$$KA_NS" get configmap kubearmor-config -o jsonpath='{.data.visibility}' 2>/dev/null) \
+		&& echo "   defaultFilePosture=$$FP visibility=$$VP" \
+		&& [ "$$FP" = "block" ] \
+		&& case "$$VP" in *process*) true;; *) echo "process visibility missing"; false;; esac \
+		|| { echo "Posture is not block (defaultFilePosture=$$FP): a disallowed exec would be logged but allowed. Check KUBEARMOR_POSTURE_FLAGS."; exit 1; }
 
 .PHONY: kind-smoke
 kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True

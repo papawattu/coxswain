@@ -35,7 +35,7 @@ true as Phase 1 lands.
 
 ### I25. Rename the leftover `coxscaf` scaffold name everywhere
 
-- [ ] Done
+- [x] Done (commit 36f4b50). Renamed `coxscaf` -> `coxswain` across config/ (namespace, namePrefix, labels), RBAC comments, Makefile buildx builder name, test/e2e consts + managerImage, AGENTS.md title, and the two README step-2 references in the same commit. `grep -rn coxscaf` (excluding bin/.git/REVIEW-*) is empty; build + e2e vet green.
 
 **Where:** `config/default/kustomization.yaml` (`namespace: coxscaf-system`,
 `namePrefix: coxscaf-`), `app.kubernetes.io/name: coxscaf` labels across
@@ -59,7 +59,7 @@ reaches the rollout.
 
 ### I26. Add a LICENSE file
 
-- [ ] Done
+- [x] Done (commit cf9c312). Standard Apache-2.0 LICENSE at the repo root, copyright line "Copyright 2026 papawattu" matching hack/boilerplate.go.txt.
 
 The README and every Go file header say Apache 2.0, but there's no
 `LICENSE` file at the repo root, so GitHub shows "no license" and the
@@ -72,7 +72,7 @@ project isn't actually licensed for reuse. Add the standard Apache-2.0
 
 ### I27. Guard the README against drift
 
-- [ ] Done
+- [ ] Done — deferred to the e2e slice (per owner: fold I27 into the e2e work). The round-1 deferred `test/e2e` suite is where the README path gets a shared script of truth; the per-slice "update README step 4 if `kubectl get loops` changes" checklist line and the `make deploy` kustomize-edit note land with it.
 
 **Problem:** nothing tests the README's commands. Each Phase 1 slice changes
 what a Loop does (B1 phase moves, runner wiring, verify Job), and the

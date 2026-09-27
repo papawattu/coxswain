@@ -94,12 +94,35 @@ hardening field, no SA token automount, and no secret volume mounted into the
 proxy) that holds the model key (mounted **only** into the proxy), injects auth,
 forwards only to the configured endpoint, and meters tokens (the Phase 2
 metering sidecar, built now as the credential boundary). The agent talks to
-`COX_MODEL_BASE_URL=http://localhost:<port>` and holds no key. Seam: envtest —
-assert the sandbox pod has the proxy container, the model secret volume is
-mounted into the proxy **and not** the agent, and the agent's env has
-`COX_MODEL_BASE_URL` set to the localhost proxy. e2e — the reference runner, with
-the fake model behind the proxy, reaches `result.json` without any key in the
-agent env.
+`COX_MODEL_BASE_URL=http://localhost:<port>` and holds no key. Split into two
+sub-slices (C2a is the pod wiring; C2b is the proxy binary + e2e — the slice's
+box stays open until both are done):
+
+  - **C2a — pod wiring (DONE).** The operator adds the proxy container (when
+    `spec.agent.endpointSecretRef` is set; with no ref the pod has no proxy,
+    no key, no `COX_MODEL_BASE_URL` — P1: never a half-configured proxy) and the
+    model-creds Secret volume (read-only file, mounted only into the proxy —
+    not env, P2); the agent's env carries `COX_MODEL_BASE_URL=http://localhost:
+    8080`; the proxy runs as its own UID (65533), the pod sets
+    `shareProcessNamespace: false`, and the proxy image is a `LoopReconciler`
+    `ProxyImage` field (not `os.Getenv` in reconcile, P3). Seam: envtest —
+    `internal/controller/loop_c2_proxy_test.go` asserts, with the ref set: the
+    proxy container exists; the model-creds volume is mounted into the proxy and
+    not the agent; the agent's env has `COX_MODEL_BASE_URL` set to the localhost
+    proxy; the key is NOT delivered via env; the proxy has its own UID; the pod
+    has `shareProcessNamespace: false`; and, with the ref UNSET: no proxy
+    container, no model-creds volume, no `COX_MODEL_BASE_URL`, and no container
+    references an empty secret name (the kind `InvalidConfiguration` the pod hit
+    when the proxy was unconditional). The proxy container is a `sleep infinity`
+    stand-in.
+
+  - **C2b — proxy binary + e2e (remaining).** Build the real proxy: read the key
+    + endpoint from the mounted file, inject the auth header, forward
+    **only** to the configured endpoint (no other host), and meter tokens
+    (Phase 2 metering). e2e — the reference runner, with the fake model behind
+    the proxy, reaches `result.json` **without any key in the agent env**; the
+    agent's only model path is `localhost:8080`. Until C2b lands, C2's box stays
+    open.
 - **C3** — *NetworkPolicy generated from `AgentPolicy` (ADR-0007 Q6).* A
 `NetworkPolicy` on the sandbox is **generated from the Loop's effective
 `AgentPolicy`** egress allows (allowed hosts/CIDRs + ports), default-deny:

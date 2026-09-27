@@ -31,6 +31,27 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
+// model key; it talks to the local proxy on COX_MODEL_BASE_URL, which holds the
+// key (mounted only into the proxy) and injects auth.
+const (
+	// proxyContainerName is the name of the model proxy sidecar container.
+	proxyContainerName = "proxy"
+	// modelCredsVolume is the name of the Secret volume that carries the model
+	// API key + base URL (mounted read-only into the proxy only).
+	modelCredsVolume = "model-creds"
+	// coxModelBaseURL is the env var the operator sets on the agent so it talks
+	// to the local proxy (a Loop cannot override it: COX_* names are rejected
+	// at admission, I34).
+	coxModelBaseURL = "COX_MODEL_BASE_URL"
+	// localhostProxyBaseURL is where the proxy listens on the sandbox pod's
+	// loopback interface. The agent reaches it over localhost, not the network.
+	localhostProxyBaseURL = "http://localhost:8080"
+	// readOnlyMode is the default file mode for the model-creds Secret volume
+	// (0444: the key is read-only, even in the proxy).
+	readOnlyMode int32 = 0o444
+)
+
 // LoopReconciler reconciles a Loop object.
 //
 // Phase 0 scope: ensure the Loop's Sandbox exists and log it. The phase state
@@ -43,6 +64,10 @@ type LoopReconciler struct {
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
+
+	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
+	// stand-in; overridable for the smoke test (e.g. the real proxy image).
+	ProxyImage string
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -158,16 +183,22 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// boundary. No SA token automount; the agent is non-root, drops all caps,
 		// cannot escalate privilege, is seccomp-constrained, and runs a read-only
 		// rootfs with only /workspace + scratch writable.
-		falseP := false
-		trueP := true
-		readOnlyRootfs := true
-		// I35 (R10): the platform non-root UID/GID. runAsNonRoot alone is not
-		// enough — the default golang image has no USER and the kubelet refuses to
-		// start it (CreateContainerConfigError) unless a UID is pinned. fsGroup
-		// makes the emptyDir /workspace + /scratch volumes writable by it.
 		nonRootUID := int64(65532)
 		nonRootGID := int64(65532)
 		nonRootFSGroup := int64(65532)
+		// C2 (P2): the proxy runs as its OWN non-root UID, distinct from the agent,
+		// so a future shared PID namespace or shared volume cannot expose the model
+		// key to the untrusted agent.
+		proxyUID := int64(65533)
+		proxyGID := int64(65533)
+		// C2 (P1): the proxy + model access exist only when a model endpoint is
+		// configured. With no endpointSecretRef the agent runs with no model — no
+		// proxy container, no key, no COX_MODEL_BASE_URL (never a half-configured
+		// proxy that would make the pod InvalidConfiguration on an empty secret).
+		hasModel := loop.Spec.Agent.EndpointSecretRef != ""
+		falseP := false
+		trueP := true
+		readOnlyRootfs := true
 		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
 		// (S1). Running is the default for a normal Loop.
 		if loop.Spec.Suspend {
@@ -176,6 +207,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
+		// C2 (P2): never share the process namespace. The proxy and agent run as
+		// different UIDs, but a shared PID namespace would let the (untrusted) agent
+		// read /proc/<proxy-pid>/environ and leak the model key. Explicitly false.
+		noShare := false
+		desired.Spec.PodTemplate.Spec.ShareProcessNamespace = &noShare
 		// I35: fsGroup so the /workspace + /scratch emptyDir volumes are owned by
 		// the agent's UID (writable). Set on the pod security context.
 		desired.Spec.PodTemplate.Spec.SecurityContext = &corev1.PodSecurityContext{
@@ -194,8 +230,16 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// fresh emptyDir never creates, so go build / mktemp failed; instead a
 		// dedicated emptyDir is mounted at /tmp (writable), which also covers the
 		// tools that hard-code /tmp.
-		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+1)
+		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+2)
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
+		// C2 (ADR-0006 item 2): the agent holds no model key. It talks to the local
+		// proxy sidecar (COX_MODEL_BASE_URL), which holds the key and injects auth.
+		// The operator sets this; a Loop cannot override it (COX_* names are
+		// rejected at admission, I34) so the agent cannot be pointed past the proxy.
+		// Only set when a model endpoint exists (P1: no half-configured proxy).
+		if hasModel {
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: localhostProxyBaseURL})
+		}
 		for _, e := range loop.Spec.Agent.Env {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
 		}
@@ -209,39 +253,80 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			corev1.ResourceMemory:           resource.MustParse("512Mi"),
 			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
 		}
-		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{
-			{
-				Name:  "agent",
-				Image: agentImage,
-				// Keep the container alive until the phase driver (Phase 1)
-				// takes over. sleep infinity is a stand-in.
+		agentContainer := corev1.Container{
+			Name:  "agent",
+			Image: agentImage,
+			// Keep the container alive until the phase driver (Phase 1)
+			// takes over. sleep infinity is a stand-in.
+			Command: []string{"sh", "-c", "sleep infinity"},
+			Env:     agentEnv,
+			Resources: corev1.ResourceRequirements{
+				Limits: agentLimits,
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: &falseP,
+				RunAsNonRoot:             &trueP,
+				RunAsUser:                &nonRootUID,
+				RunAsGroup:               &nonRootGID,
+				ReadOnlyRootFilesystem:   &readOnlyRootfs,
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "workspace", MountPath: "/workspace"},
+				{Name: "scratch", MountPath: "/scratch"},
+				// P1 (R13): a writable /tmp so go build / mktemp / any tool that
+				// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
+				{Name: "tmp", MountPath: "/tmp"},
+			},
+		}
+		podContainers := []corev1.Container{agentContainer}
+		if hasModel {
+			// C2 (ADR-0006 item 2): the model proxy sidecar. It holds the model key
+			// (mounted ONLY here, from the model-creds Secret, as a read-only FILE —
+			// not env, P2), injects the auth header, forwards only to the configured
+			// endpoint, and meters tokens (the Phase 2 metering sidecar, built now as
+			// the credential boundary). The agent reaches it on localhost:8080 and
+			// holds no key. Runs as its OWN UID (P2). sleep infinity is a stand-in
+			// until the proxy binary exists (C2b).
+			podContainers = append(podContainers, corev1.Container{
+				Name:    proxyContainerName,
+				Image:   r.proxyImage(),
 				Command: []string{"sh", "-c", "sleep infinity"},
-				Env:     agentEnv,
+				// P2: the key is delivered ONLY as the /model-creds file mount below,
+				// never via env (env leaks to child processes, crash dumps, and
+				// /proc/<pid>/environ).
 				Resources: corev1.ResourceRequirements{
-					Limits: agentLimits,
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:              resource.MustParse("100m"),
+						corev1.ResourceMemory:           resource.MustParse("128Mi"),
+						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+					},
 					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("100m"),
-						corev1.ResourceMemory: resource.MustParse("128Mi"),
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						corev1.ResourceMemory: resource.MustParse("32Mi"),
 					},
 				},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: &falseP,
 					RunAsNonRoot:             &trueP,
-					RunAsUser:                &nonRootUID,
-					RunAsGroup:               &nonRootGID,
+					RunAsUser:                &proxyUID,
+					RunAsGroup:               &proxyGID,
 					ReadOnlyRootFilesystem:   &readOnlyRootfs,
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
 				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: "/workspace"},
-					{Name: "scratch", MountPath: "/scratch"},
-					// P1 (R13): a writable /tmp so go build / mktemp / any tool that
-					// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
-					{Name: "tmp", MountPath: "/tmp"},
+					// The model key lives ONLY here (the proxy), never the agent (C2).
+					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
 				},
-			},
+			})
 		}
+		desired.Spec.PodTemplate.Spec.Containers = podContainers
 		// P3 (R13, I36): the writable emptyDirs carry explicit sizeLimits that sum
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
 		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
@@ -256,6 +341,22 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				SizeLimit: newLimit("100Mi"),
 			}}},
+		}
+		// C2 (ADR-0006 item 2): the model-creds Secret volume, mounted (read-only)
+		// only into the proxy container above. It carries the model API key +
+		// base URL; the agent never sees it.
+		if loop.Spec.Agent.EndpointSecretRef != "" {
+			secretMode := readOnlyMode
+			desired.Spec.PodTemplate.Spec.Volumes = append(desired.Spec.PodTemplate.Spec.Volumes,
+				corev1.Volume{
+					Name: modelCredsVolume,
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName:  loop.Spec.Agent.EndpointSecretRef,
+							DefaultMode: &secretMode,
+						},
+					},
+				})
 		}
 		// Set the controller owner ref here, on the (possibly server-populated)
 		// object. Returns AlreadyOwnedError if a different controller already
@@ -429,6 +530,17 @@ func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status
 func (r *LoopReconciler) sandboxImage() string {
 	if r.SandboxImage != "" {
 		return r.SandboxImage
+	}
+	return "docker.io/library/golang:1.26"
+}
+
+// proxyImage returns the model proxy sidecar image. It is the reconciler's
+// ProxyImage field (set from a manager flag in cmd/main.go, like SandboxImage),
+// or a dev stand-in (sleep infinity) when unset. The real proxy binary (auth
+// injection, forward-only-to-endpoint, metering) is C2b.
+func (r *LoopReconciler) proxyImage() string {
+	if r.ProxyImage != "" {
+		return r.ProxyImage
 	}
 	return "docker.io/library/golang:1.26"
 }

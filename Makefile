@@ -135,14 +135,18 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 	@echo "KubeArmor $(KUBEARMOR_VERSION) installed (BPF-LSM enforcer)."
 	@echo "Setting KubeArmor's default posture to block (BPF-LSM exec/whitelist enforcement)."
 	@echo "KubeArmor v1.7.5 gates the exec allowlist's block-vs-audit on defaultFilePosture (NOT spec.action); karmor install defaults it to audit, so a disallowed exec would be logged but allowed. Set it to block + enable process visibility so the operator's allowlist actually blocks." \
-		&& kubectl -n kubearmor get configmap kubearmor-config -o yaml \
+		&& KA_NS=$$(kubectl get configmap -A --no-headers 2>/dev/null | awk '$$2=="kubearmor-config"{print $$1; exit}') \
+		&& [ -n "$$KA_NS" ] \
+		&& kubectl -n "$$KA_NS" get configmap kubearmor-config -o yaml \
 		| sed -e 's/defaultFilePosture:.*/defaultFilePosture: block/' \
 			 -e 's/defaultNetworkPosture:.*/defaultNetworkPosture: block/' \
 			 -e 's/defaultCapabilitiesPosture:.*/defaultCapabilitiesPosture: block/' \
 			 -e 's/visibility:.*/visibility: process,file,network,capabilities/' \
 		| kubectl apply -f - \
-		&& kubectl -n kubearmor rollout restart daemonset/kubearmor \
-		&& kubectl -n kubearmor rollout status daemonset/kubearmor --timeout=120s \
+		&& KA_DS_NS=$$(kubectl get daemonset -A --no-headers 2>/dev/null | awk '$$2 ~ /kubearmor/{print $$1; exit}') \
+		&& [ -n "$$KA_DS_NS" ] \
+		&& kubectl -n "$$KA_DS_NS" rollout restart daemonset/kubearmor \
+		&& kubectl -n "$$KA_DS_NS" rollout status daemonset/kubearmor --timeout=120s \
 		|| { echo "Could not set KubeArmor block posture (posture stays audit -> exec e2e will not block)"; exit 1; }
 
 .PHONY: kind-smoke

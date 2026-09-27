@@ -29,7 +29,7 @@ into ADR-0007 before C3/C6 code.
 
 ### D29. Pod-level egress can't keep the agent away from the model endpoint
 
-- [ ] Decided (ADR-0007 amendment)
+- [x] Decided (ADR-0007 amendment, 19ef081)
 
 **Problem:** a Kubernetes `NetworkPolicy` selects **pods**, not containers.
 The proxy container must reach the model endpoint, so the generated
@@ -56,7 +56,7 @@ the translated policy was rejected, the agent runs **unrestricted** and
 nothing says so. KubeArmor in particular can fall back to AppArmor or to
 audit-only depending on the node.
 
-- [ ] Decided (ADR-0007 amendment)
+- [x] Decided (ADR-0007 amendment, 19ef081)
 
 **Fix:** the operator only lets the sandbox run (sandbox `OperatingMode:
 Running`, or the agent container started) once it has positive evidence
@@ -75,7 +75,7 @@ never runs.
 
 ### D31. Default-deny exec needs a way to discover the allows an agent needs
 
-- [ ] Decided
+- [x] Decided (19ef081, ADR-0007 "Learn mode")
 
 Real agents (Claude Code, pi, Codex) exec a lot: `node`, `bash`, `git`,
 language toolchains, their own helpers. With default-deny, writing a working
@@ -90,7 +90,7 @@ never the default.
 
 ### D32. Say which pods an AgentPolicy covers
 
-- [ ] Decided
+- [x] Decided (19ef081, ADR-0007 "Which pods an AgentPolicy covers")
 
 ADR-0007 says the policy selects "that Loop's sandbox pod". Also decide:
 - **Verify Job pods** run the agent's committed code (ADR-0005 D12). They

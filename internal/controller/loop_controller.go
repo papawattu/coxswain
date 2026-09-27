@@ -81,8 +81,10 @@ type LoopReconciler struct {
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
 
-	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
-	// stand-in; overridable for the smoke test (e.g. the real proxy image).
+	// ProxyImage is the model proxy pod image (D33). Defaults to a working
+	// stand-in (golang:1.26, which has POSIX sh/head/sleep); overridable for
+	// the smoke test or when a real proxy binary lands (C2b).
+	ProxyImage string
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -113,6 +115,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// sandbox so the agent's COX_MODEL_BASE_URL target exists in the same pass.
 	if loop.Spec.Agent.EndpointSecretRef != "" {
 		if err := r.ensureProxy(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		// R15 round 3: if the endpointSecretRef is absent (or was removed),
+		// delete the proxy pod and Service (if they exist). A live, key-holding
+		// proxy must not outlive the Loop's intent to use it.
+		if err := r.cleanupProxy(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -364,6 +373,37 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 // sandboxName returns the Loop's Sandbox name: <loop>-sandbox. The Loop name
 // is CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
 // is always a valid DNS-1035 label <= 63 chars and needs no truncation.
+// cleanupProxy deletes the Loop's proxy pod and Service (if they exist).
+// Called when endpointSecretRef is absent (R15 round 3: a live, key-holding
+// proxy must not outlive the Loop's intent to use it). Idempotent: a
+// NotFound on Get is not an error.
+func (r *LoopReconciler) cleanupProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	// Delete the proxy pod.
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)
+	if err == nil {
+		if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), delErr)
+		}
+		log.Info("deleted proxy pod (endpointSecretRef absent)", "proxy", proxyPodName(loop.Name), "loop", loop.Name)
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
+	}
+	// Delete the proxy Service.
+	svc := &corev1.Service{}
+	err = r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyServiceName(loop.Name)}, svc)
+	if err == nil {
+		if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), delErr)
+		}
+		log.Info("deleted proxy Service (endpointSecretRef absent)", "proxy", proxyServiceName(loop.Name), "loop", loop.Name)
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), err)
+	}
+	return nil
+}
+
 func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
 }
@@ -396,6 +436,18 @@ func proxyLabels(loopName string) map[string]string {
 		"app.kubernetes.io/component": "model-proxy",
 		"coxswain.io/proxy-for":       loopName,
 	}
+}
+
+// proxyImage returns the model proxy pod image. It is the reconciler's
+// ProxyImage field (set from a manager flag in cmd/main.go, like SandboxImage),
+// or a working stand-in (golang:1.26) when unset. The stand-in has POSIX
+// sh, head, and sleep — enough for the D33 kind-run acceptance (the
+// model-creds read + sleep infinity).
+func (r *LoopReconciler) proxyImage() string {
+	if r.ProxyImage != "" {
+		return r.ProxyImage
+	}
+	return "docker.io/library/golang:1.26"
 }
 
 // ensureProxy creates the Loop's per-Loop model-proxy pod + Service (D33,
@@ -439,7 +491,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 	// Build the desired pod spec first, then hash it. The hash covers the
 	// actual spec (image, command, limits, volumes), so any operator upgrade
 	// that changes the spec produces a different hash.
-	podDesired := buildProxyPod(loop, loopName, ns)
+	podDesired := buildProxyPod(loop, loopName, ns, r.proxyImage())
 	// Set the Loop as the controller owner (D33: GC with the Loop).
 	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
 		return fmt.Errorf("set owner ref on proxy pod %s/%s: %w", ns, proxyPodName(loopName), ownerErr)
@@ -644,7 +696,7 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // read-only rootfs, drop ALL caps, seccomp runtime default, no SA token,
 // limits. The model-creds Secret is mounted read-only into the proxy pod ONLY
 // (C2/ADR-0006 item 2); the agent pod never sees the key.
-func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns string) *corev1.Pod {
+func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.Pod {
 	falseP := false
 	trueP := true
 	readOnlyRootfs := true
@@ -666,7 +718,7 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns string) *corev1.Pod {
 			},
 			Containers: []corev1.Container{{
 				Name:  "proxy",
-				Image: "example.com/coxswain/proxy:v1", // stand-in; a real binary in a future slice
+				Image: image,
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
 						corev1.ResourceCPU:              resource.MustParse("100m"),

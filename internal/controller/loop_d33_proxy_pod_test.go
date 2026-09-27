@@ -44,7 +44,11 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
-const d33ModelCredsSecret = "cox-model-creds"
+const (
+	d33ModelCredsSecret = "cox-model-creds"
+	modelAPIKey         = "MODEL_API_KEY"
+	modelBaseURL        = "MODEL_BASE_URL"
+)
 
 var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)", func() {
 	ctx := context.Background()
@@ -240,7 +244,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 		secretName := "p1-creds"
 		Expect(k8sClient.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
-			StringData: map[string]string{"MODEL_API_KEY": "k", "MODEL_BASE_URL": "http://m.example:8000"}})).To(Succeed())
+			StringData: map[string]string{modelAPIKey: "k", modelBaseURL: "http://m.example:8000"}})).To(Succeed())
 		name := "d33p1"
 		Expect(k8sClient.Create(ctx, buildLoopWithSecret(name, ns, secretName))).To(Succeed())
 		reconcile(name, ns)
@@ -274,7 +278,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 		secretName := "p2-creds"
 		Expect(k8sClient.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: ns},
-			StringData: map[string]string{"MODEL_API_KEY": "k", "MODEL_BASE_URL": "http://m.example:8000"}})).To(Succeed())
+			StringData: map[string]string{modelAPIKey: "k", modelBaseURL: "http://m.example:8000"}})).To(Succeed())
 		name := "d33p2"
 		Expect(k8sClient.Create(ctx, buildLoopWithSecret(name, ns, secretName))).To(Succeed())
 		reconcile(name, ns)
@@ -302,6 +306,50 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		Expect(p.UID).NotTo(Equal(originalUID))
 		Expect(p.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
 	})
+
+	It("recreates the proxy pod when the spec hash annotation is stale (R15 round 3)", func() {
+		ns := "d34-p2-drift" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "drift-creds", Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:      "dummy-key",
+				"MODEL_BASE_URL": "http://fake-endpoint:8000",
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		Expect(k8sClient.Create(ctx, buildLoopWithSecret("drift-loop", ns, "drift-creds"))).To(Succeed())
+
+		// Reconcile: creates the sandbox + proxy pod.
+		reconcile("drift-loop", ns)
+
+		// Get the proxy pod's current hash and UID.
+		proxyPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "drift-loop-proxy"}, proxyPod)).To(Succeed())
+		originalUID := proxyPod.UID
+		originalHash := proxyPod.Annotations[proxySpecHashAnnotation]
+		Expect(originalHash).ToNot(BeEmpty())
+
+		// Tamper with the hash annotation to simulate a stale spec.
+		proxyPod.Annotations[proxySpecHashAnnotation] = "stale-hash-000000"
+		Expect(k8sClient.Update(ctx, proxyPod)).To(Succeed())
+
+		// Reconcile: the hash mismatch should trigger a delete + recreate.
+		reconcile("drift-loop", ns)
+		reconcile("drift-loop", ns)
+
+		// Get the new proxy pod: it should have a new UID and the current hash.
+		newPod := &corev1.Pod{}
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "drift-loop-proxy"}, newPod)
+		}, "5s", "250ms").Should(Succeed())
+
+		Expect(newPod.UID).ToNot(Equal(originalUID),
+			"the proxy pod must be recreated (new UID) after a hash mismatch")
+		Expect(newPod.Annotations[proxySpecHashAnnotation]).To(Equal(originalHash),
+			"the recreated pod must carry the current hash")
+	})
 })
 
 // isOwnedByLoop reports whether obj carries a controller owner reference to a
@@ -314,3 +362,15 @@ func isOwnedByLoop(obj metav1.Object, loopName string) bool {
 	}
 	return false
 }
+
+var _ = Describe("D33 proxy image", func() {
+	It("defaults to the working stand-in when ProxyImage is unset", func() {
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(r.proxyImage()).To(Equal("docker.io/library/golang:1.26"))
+	})
+
+	It("honours the ProxyImage override", func() {
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), ProxyImage: "my-registry/proxy:v9"}
+		Expect(r.proxyImage()).To(Equal("my-registry/proxy:v9"))
+	})
+})

@@ -27,6 +27,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+// c6aGitBin is the absolute path of the git binary the C6a test AgentPolicies
+// allow (a real binary outside the writable mounts, satisfying the exec
+// absolute-path CEL rule). Shared so goconst doesn't flag the repeated literal.
+const c6aGitBin = "/usr/bin/git"
+
 var _ = Describe("C6a effective AgentPolicy union", func() {
 	var (
 		ctx context.Context
@@ -55,11 +60,11 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"git"}, Network: []string{"proxy.golang.org:443"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin}, Network: []string{"proxy.golang.org:443"}},
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p2", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"go"}, Files: []string{"/data"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/local/go/bin/go"}, Files: []string{"/data"}},
 		})).To(Succeed())
 
 		loop := buildLoop("loop-c6a-union", ns, "make it pass", "https://github.com/papawattu/coxswain.git")
@@ -70,9 +75,9 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "loop-c6a-union"}})
 		Expect(err).NotTo(HaveOccurred())
 
-		// The expected union hash: exec={git,go}, network={proxy.golang.org:443}, files={/data}.
+		// The expected union hash: exec={c6aGitBin,/usr/local/go/bin/go}, network={proxy.golang.org:443}, files={/data}.
 		want := policy.EffectiveHash(policy.EffectivePolicy{
-			Exec:    []string{"git", "go"},
+			Exec:    []string{c6aGitBin, "/usr/local/go/bin/go"},
 			Network: []string{"proxy.golang.org:443"},
 			Files:   []string{"/data"},
 		})
@@ -102,5 +107,32 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 		// minimum); the hash must stay empty.
 		Expect(got.Status.Policy == nil || got.Status.Policy.EffectiveHash == "").To(BeTrue(),
 			"no policyRefs means no effective policy hash (default-deny minimum)")
+	})
+
+	It("rejects exec entries that are not absolute paths or are under the writable mounts", func() {
+		ns := "c6a-exec-validation"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// A valid absolute path outside the writable mounts is accepted.
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "ok", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin}},
+		})).To(Succeed(), "a real binary path outside the writable mounts must be allowed")
+
+		// A bare command name (no leading /) is rejected — it is spoofable.
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "bare", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"git"}},
+		})).To(MatchError(ContainSubstring("exec")), "a bare command name must be rejected by the CEL rule")
+
+		// A path under a writable mount (/tmp) is rejected — the agent could write
+		// its own /tmp/git and spoof the allow.
+		for _, spoof := range []string{"/tmp/git", "/workspace", "/scratch/foo", "/tmp"} {
+			Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "spoof", Namespace: ns},
+				Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{spoof}},
+			})).To(HaveOccurred(), "a path at or under a writable mount (%s) must be rejected", spoof)
+		}
 	})
 })

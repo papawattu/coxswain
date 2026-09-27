@@ -53,12 +53,27 @@ spec:
             properties:
               exec:
                 description: |-
-                  exec is the commands the agent may run (e.g. "git", "go", "node"). An
-                  empty list means the agent may run no commands beyond the platform
-                  minimum (its own entrypoint). +optional
+                  exec is the commands the agent may run, as ABSOLUTE binary paths (e.g.
+                  "/usr/bin/git", "/usr/local/go/bin/go"). An empty list means the agent may
+                  run no commands beyond the platform minimum (its own entrypoint).
+
+                  Absolute paths are required (P1, ADR-0007 Q3): the agent has three writable
+                  mounts (/workspace, /scratch, /tmp), so a bare command name ("git") is
+                  spoofable — the agent could write its own /tmp/git that does anything and
+                  claim it is the allowed "git". The eBPF engine matches the binary by
+                  absolute path, so the allow must name a real binary outside the writable
+                  mounts. The XValidation rejects bare names (no leading /) and anything at
+                  or under the writable mounts (/workspace, /scratch, /tmp).
                 items:
                   type: string
+                maxItems: 64
                 type: array
+                x-kubernetes-validations:
+                - message: exec entries must be absolute paths at or outside the writable
+                    mounts (not under /workspace, /scratch, /tmp)
+                  rule: self.all(e, e.startsWith('/') && !e.startsWith('/workspace/')
+                    && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch'
+                    && !e.startsWith('/tmp/') && e != '/tmp')
               files:
                 description: |-
                   files is the paths the agent may access (e.g. "/workspace"). The agent's

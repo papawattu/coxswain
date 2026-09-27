@@ -223,9 +223,39 @@ in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
     owner-ref'd) is wired in `cmd/main.go`; (3) exec allows are emitted under
     `process.matchPaths` + `action: Allow`, not `syscalls` (monitoring-only).
     `Enforcing` fails closed (NodeNotEnforcing) until the I32 relay is wired.
+    **R15 P1s fixed (9a951f2):** (1) the D30 gate applies to EVERY Loop (no
+    policyRefs = the platform minimum, still translated/emitted/enforced; the old
+    no-policyRefs-ungated spec is inverted); (2) the gate has something behind it —
+    Reconcile calls `Enforcer.Apply` before the gate, the sandbox pod template
+    carries the `coxswain.io/loop` label the selector targets, and a real
+    `KubeArmorEnforcer` (unstructured create/update of the KubeArmorPolicy,
+    owner-ref'd) is wired in `cmd/main.go`; (3) exec allows are emitted under
+    `process.matchPaths` + `action: Allow`, not `syscalls` (monitoring-only).
+    `Enforcing` fails closed (NodeNotEnforcing) until the I32 relay is wired.
     **Remaining:** the real kind e2e (KubeArmor on kind via `make kind-up` + a
     disallowed exec actually blocked) + the D29 per-container proposal (P2, a
     review doc before any C3 code).
+    **R15 P1 round 2 (5068c15):** (1) **exec-block posture** — root cause of
+    "the disallowed exec ran": KubeArmor v1.7.5's BPF-LSM gates the exec
+    allowlist's block-vs-audit on `defaultFilePosture` (NOT `spec.action`; the
+    process whitelist's block sentinel is keyed on `defaultPosture.FileAction` in
+    `enforcer/bpflsm/rulesHandling.go`), and `karmor install` defaults it to
+    `audit`. `make kind-up` now sets `kubearmor-config` to
+    `defaultFilePosture/NetworkPosture/CapabilitiesPosture: block` +
+    `visibility: process,file,network,capabilities`, then restarts the KubeArmor
+    DaemonSet so the live BPF map flips; the e2e asserts `defaultFilePosture=block`
+    up front so a misconfigured env fails with a clear posture message. (2)
+    **`/**/<name>` spoofing** — each `process.matchPaths` item now carries
+    `{execname: <basename>, path: <absolute location for the real binary>}`
+    (go → `/usr/local/go/bin/go` via a `defaultExecPaths` map), so a same-named
+    binary in a writable dir does not satisfy the allow. (3) **base-manifest
+    flag** — `--allow-unenforced` removed from `config/manager/manager.yaml` (so
+    `make deploy` / `dist/install.yaml` ship fail-closed); added
+    `config/manager/allow-unenforced.yaml` as a dev/kind overlay that `make deploy`
+    applies. **Remaining:** the real kind e2e run (needs a kind+KubeArmor host to
+    go green once the posture is block); the D29 per-container proposal is now
+    superseded by the owner's R13 decision (option c: the proxy in its own pod —
+    `docs/REVIEW-PHASE1-R13.md`), implemented as D33–D35.
 
 - **C7** — *Activity-audit stream (ADR-0007 Q4).* Coxswain **emits** agent-
 activity audit as JSON lines on each trusted source's stdout with the common

@@ -30,7 +30,7 @@ tamper test.
 
 ### D27. The stale-evidence check can't fire in production
 
-- [ ] Done
+- [x] Done (c0942a4)
 
 **Where:** `internal/controller/loop_controller.go:112`
 (`tamperVerdict(v.TamperExitCode, v.VerifiedCommit, v.VerifiedCommit)`) and

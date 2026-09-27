@@ -30,7 +30,7 @@ Still open: **D27 (P1)** from round 5.
 
 ### D26 (revised). Coxswain isolates *any* agent; the agent holds no credentials
 
-- [ ] Decided (ADR-0006)
+- [ ] Decided (ADR-0006) — **drafted** (0cafed9). ADR-0006 is committed against the revised D26 (agent-agnostic contract, zero credentials, proxy sidecar, egress deny-by-default, pod hardening, publish step, evil-agent e2e; isolation slices C1–C5 resequenced before B3). The **two open owner decisions** (first real agent to adapt; egress policy for dependency installs) are listed in ADR-0006 but NOT picked — the box stays unticked until the owner decides them.
 
 **This supersedes round 5's D26 recommendation.** Round 5 framed the choice
 as "which agent do we build" and recommended growing `runner/` first. The

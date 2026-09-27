@@ -122,7 +122,8 @@ type LoopStatus struct {
 	Iteration int `json:"iteration,omitempty"`
 
 	// desiredPhase is the phase the operator has asked the runner to be in.
-	// It is also copied to .coxswain/desired-phase for the runner to read.
+	// It will also be copied to .coxswain/desired-phase for the runner to read
+	// (Phase 1 runner/exec wiring slice, not yet implemented).
 	// The operator is the sole writer of Loop status (ADR-0004); the runner
 	// never sets this — it only reports observedPhase in result.json.
 	// +optional

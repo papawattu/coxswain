@@ -52,9 +52,22 @@ var _ = Describe("nextPhase (B1 transition table)", func() {
 		Expect(got).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 	})
 
-	It("advances Verifying -> Succeeded on the happy path", func() {
-		got := nextPhase(coxv1alpha1.LoopPhaseVerifying, coxv1alpha1.LoopPhaseSucceeded)
-		Expect(got).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+	It("does NOT let the runner's report move Verifying -> Succeeded (D23: Succeeded is evidence-gated)", func() {
+		// ADR-0004/0005: observedPhase is the runner's *claim*, and no gate
+		// decision may be made on a claim. Succeeded is the gate — it must follow
+		// only from verify-Job evidence (B2/B3/B3a: tamper exit 0, canary
+		// behaving, every check exit 0), never from the runner reporting
+		// Succeeded. So a report of Succeeded while in Verifying leaves the
+		// operator in Verifying; the exit is decided by verifyOutcome(job) in B3.
+		Expect(nextPhase(coxv1alpha1.LoopPhaseVerifying, coxv1alpha1.LoopPhaseSucceeded)).
+			To(Equal(coxv1alpha1.LoopPhaseVerifying),
+				"the runner's claim must never complete the Loop; only verify evidence can")
+		// Likewise a report of Failed/Implementing from Verifying is a claim, not
+		// an operator decision — nextPhase handles no exit from Verifying at all.
+		Expect(nextPhase(coxv1alpha1.LoopPhaseVerifying, coxv1alpha1.LoopPhaseFailed)).
+			To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		Expect(nextPhase(coxv1alpha1.LoopPhaseVerifying, coxv1alpha1.LoopPhaseImplementing)).
+			To(Equal(coxv1alpha1.LoopPhaseVerifying))
 	})
 
 	It("does not advance when the runner's report is not the immediate next phase", func() {

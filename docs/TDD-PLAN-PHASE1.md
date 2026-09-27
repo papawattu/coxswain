@@ -55,11 +55,14 @@ the phase enum based on `status.observedPhase` (from the runner) and the trust
 model.
 
 **Slice status:** B1 ✅ done — `status.desiredPhase`/`status.observedPhase` added
-(CRD); `nextPhase(current, reported)` pure transition function (happy path
-Pending → Planning → Implementing → Verifying → Succeeded; terminal + iterate/
-failed branches left for B3/B4); Reconcile advances the machine when the runner
-reports a valid forward step. Tests: pure `nextPhase` table + envtest (advance
-on valid report, no-op on skip-ahead).
+(CRD); `nextPhase(current, reported)` pure transition function handling only the
+claim-driven steps (Pending → Planning → Implementing → **Verifying**). **The
+runner's report never moves a Loop out of Verifying** (D23): every exit from
+Verifying (→ Succeeded, → Implementing, → Failed:*) is evidence-gated and decided
+by `verifyOutcome(job)` in B3 from the verify Job's container exit codes — never
+by `observedPhase` (ADR-0004: it's a claim; ADR-0005: no gate on a claim). Tests:
+pure `nextPhase` table (incl. the D23 stay-put cases) + envtest (claim-driven path
+stops at Verifying; a runner report of Succeeded does not exit Verifying).
 
 **Candidate seams (to confirm):**
 - **B1** — *Phase transitions.* The controller reads `status.observedPhase` (the

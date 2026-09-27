@@ -89,7 +89,7 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 	})
 
-	It("advances Planning -> Implementing -> Verifying -> Succeeded on the happy path", func() {
+	It("advances Pending -> Planning -> Implementing -> Verifying, and stops there (D23)", func() {
 		ns := "b1-happy-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
@@ -97,17 +97,41 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 
 		nn := makeLoop(ns, "b1-happy")
 
-		// Prime left Phase=Pending. Drive the full happy path:
-		// Pending -> Planning -> Implementing -> Verifying -> Succeeded.
+		// Prime left Phase=Pending. Drive the claim-driven path as far as it
+		// goes: Pending -> Planning -> Implementing -> Verifying. The exit from
+		// Verifying to Succeeded is evidence-gated (verify Job, B3) and must NOT
+		// be driven by a runner report, so the happy-path-to-Succeeded test lives
+		// in B3, not here.
 		reportPhase(ns, "b1-happy", coxv1alpha1.LoopPhasePlanning)
 		reportPhase(ns, "b1-happy", coxv1alpha1.LoopPhaseImplementing)
 		reportPhase(ns, "b1-happy", coxv1alpha1.LoopPhaseVerifying)
-		reportPhase(ns, "b1-happy", coxv1alpha1.LoopPhaseSucceeded)
 
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
-			"the happy path should end in Succeeded")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"the claim-driven path should stop at Verifying")
+	})
+
+	It("does not let a runner report of Succeeded exit Verifying (D23, cluster seam)", func() {
+		ns := "b1-nogate-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		nn := makeLoop(ns, "b1-nogate")
+		// Drive to Verifying first.
+		reportPhase(ns, "b1-nogate", coxv1alpha1.LoopPhasePlanning)
+		reportPhase(ns, "b1-nogate", coxv1alpha1.LoopPhaseImplementing)
+		reportPhase(ns, "b1-nogate", coxv1alpha1.LoopPhaseVerifying)
+
+		// The runner now claims Succeeded, but with no verify Job the operator
+		// must stay in Verifying — Succeeded is only ever evidence-gated (B3).
+		reportPhase(ns, "b1-nogate", coxv1alpha1.LoopPhaseSucceeded)
+
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"a runner report of Succeeded must not complete the Loop without verify evidence")
 	})
 
 	It("does not advance when the runner's report skips ahead", func() {

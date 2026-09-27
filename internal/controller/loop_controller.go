@@ -168,17 +168,19 @@ func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
 }
 
-// nextPhase is the operator's phase-transition table (B1). It is a pure
-// function of the operator's current phase and the phase the runner reported
-// having finished (observedPhase). The operator advances one step when the
-// runner reports the phase it was asked to do (observedPhase == desiredPhase
-// is checked by the caller); an unasked-for report leaves the phase unchanged.
+// nextPhase is the operator's *claim-driven* phase-transition table (B1). It
+// is a pure function of the operator's current phase and the phase the runner
+// reported having finished (observedPhase). It advances one step when
+// observedPhase is the immediate-next phase after current:
 //
-// The happy path: Pending -> Planning -> Implementing -> Verifying -> Succeeded.
-// The iterate branch (Verifying -> Implementing when checks fail) and the
-// terminal branches (-> Failed on MaxIterations, -> Failed on TamperedVerify)
-// need inputs that land in B3 (verify outcome) and B4 (iteration count), so
-// they are not yet wired here — Verifying currently advances only to Succeeded.
+//	Pending -> Planning -> Implementing -> Verifying
+//
+// It never returns Succeeded or Failed. Every exit out of Verifying (→ Succeeded,
+// → Implementing, → Failed:*) is evidence-gated and decided by
+// verifyOutcome(job) in B3 from the verify Job's container exit codes — never by
+// the runner's report (ADR-0004: observedPhase is a claim; ADR-0005: no gate
+// decision on a claim). Terminal phases and unrecognised / skip-ahead reports
+// leave the phase unchanged.
 func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
 	switch current {
 	case coxv1alpha1.LoopPhasePending:
@@ -193,12 +195,9 @@ func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
 		if reported == coxv1alpha1.LoopPhaseVerifying {
 			return coxv1alpha1.LoopPhaseVerifying
 		}
-	case coxv1alpha1.LoopPhaseVerifying:
-		if reported == coxv1alpha1.LoopPhaseSucceeded {
-			return coxv1alpha1.LoopPhaseSucceeded
-		}
+		// Verifying, Succeeded, Failed: no claim-driven exit. Verifying's exit is
+		// evidence-gated (B3); Succeeded/Failed are terminal.
 	}
-	// Terminal phases and unrecognised (current, reported) pairs stay put.
 	return current
 }
 

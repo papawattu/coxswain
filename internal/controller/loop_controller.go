@@ -86,6 +86,23 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		loop.Status.DesiredPhase = next
 		changed = true
 	}
+	// B2 (D10): at Verifying, the operator's own tamper evidence is the gate.
+	// A non-zero tamper-check exit code (a protected path differs between the
+	// two operator-pinned SHAs) ends the Loop Failed:TamperedVerify, TERMINAL,
+	// before any acceptance check runs. This is independent of the runner's
+	// result.json claim (tamperVerdict never reads it). In envtest the B-slice
+	// tests set status.verify.tamperExitCode directly (no Job controller); in a
+	// real cluster B3 reads it from the verify Job pod's initContainerStatuses.
+	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying &&
+		loop.Status.Verify != nil &&
+		loop.Status.Verify.TamperExitCode > 0 {
+		if tampered, reason := tamperVerdict(loop.Status.Verify.TamperExitCode, false); tampered {
+			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, reason,
+				"a protected path changed between baseCommit and verifiedCommit; terminal")
+			changed = true
+		}
+	}
 	if changed {
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
@@ -199,6 +216,61 @@ func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
 		// evidence-gated (B3); Succeeded/Failed are terminal.
 	}
 	return current
+}
+
+// TamperedVerifyReason is the terminal Failed reason recorded when a protected
+// path changed between the operator-pinned baseCommit and verifiedCommit
+// (ADR-0005 D10). It is set before any acceptance check runs.
+const TamperedVerifyReason = "TamperedVerify"
+
+// tamperVerdict is the operator's TamperedVerify decision at Verifying (B2).
+//
+// It is a pure function of the tamper-check container's exit code and the
+// runner's claim from result.json:
+//   - tamperExitCode != 0 (a protected path differs between the two operator-
+//     pinned SHAs, per the Job's `git diff --name-only <baseCommit>
+//     <verifiedCommit> -- <globs>`) ⇒ TamperedVerify, terminal, BEFORE any
+//     check runs. This is independent of resultClaimsSuccess — the anti-gaming
+//     property (D10): a runner that edited a protected file and reported
+//     status=success still ends Failed:TamperedVerify.
+//   - tamperExitCode == 0 ⇒ not tampered; the verify proceeds to the check
+//     containers (B3). resultClaimsSuccess is irrelevant to the tamper
+//     decision (it is claims-grade, never a gate).
+func tamperVerdict(tamperExitCode int, resultClaimsSuccess bool) (tampered bool, terminalReason string) {
+	_ = resultClaimsSuccess // deliberately unused: the decision never reads a claim
+	if tamperExitCode != 0 {
+		return true, TamperedVerifyReason
+	}
+	return false, ""
+}
+
+// setCondition upserts a condition on the Loop's status. The condition's Type
+// is the terminal phase (e.g. "Failed") so each terminal outcome is recorded
+// once with its reason (e.g. TamperedVerify). It is the operator's audit record
+// (ADR-0004); the runner never writes it.
+func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status metav1.ConditionStatus, reason, message string) {
+	now := metav1.Now()
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == string(condType) {
+			if loop.Status.Conditions[i].Reason == reason &&
+				loop.Status.Conditions[i].Message == message &&
+				loop.Status.Conditions[i].Status == status {
+				return // unchanged
+			}
+			loop.Status.Conditions[i].Status = status
+			loop.Status.Conditions[i].Reason = reason
+			loop.Status.Conditions[i].Message = message
+			loop.Status.Conditions[i].LastTransitionTime = now
+			return
+		}
+	}
+	loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
+		Type:               string(condType),
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+	})
 }
 
 // sandboxImage returns the configured sandbox image, or a sensible Go dev default.

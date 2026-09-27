@@ -73,6 +73,50 @@ type VerifyConfig struct {
 	// +listType=atomic
 	// +optional
 	AcceptanceChecks []string `json:"acceptanceChecks,omitempty"`
+
+	// preset selects the per-language protected-path glob set used by the
+	// TamperedVerify glob diff (ADR-0005 D16). The operator cannot infer the
+	// repo's language, so the preset is explicit. "go" (the default) expands to
+	// **/*_test.go, **/testdata/**, go.mod, go.sum; "none" uses only
+	// protectedPaths; "protectedPathsOverride" or preset none replaces the set
+	// entirely.
+	// +kubebuilder:validation:Enum=go;none
+	// +kubebuilder:default=go
+	// +optional
+	Preset string `json:"preset,omitempty"`
+
+	// protectedPaths are glob patterns of paths the agent must not change
+	// (ADR-0005 D10). They ADD to the preset's glob set; a change to any of
+	// them between baseCommit and verifiedCommit is TamperedVerify (terminal).
+	// A check that calls `make` should list `Makefile` here explicitly.
+	// +listType=atomic
+	// +optional
+	ProtectedPaths []string `json:"protectedPaths,omitempty"`
+
+	// protectedPathsOverride, when true, replaces the preset's glob set with
+	// only protectedPaths (ADR-0005 D16). Equivalent to preset: none.
+	// +optional
+	ProtectedPathsOverride bool `json:"protectedPathsOverride,omitempty"`
+}
+
+// VerifyStatus is the operator's record of the last verify run's evidence
+// (ADR-0005 D14). The values are kubelet-recorded container exit codes from
+// the verify Job's pod, never result.json claims.
+type VerifyStatus struct {
+	// tamperExitCode is the tamper-check init container's exit code (0 = clean,
+	// non-zero = a protected path differs between baseCommit and verifiedCommit).
+	// The operator reads it from the Job pod's initContainerStatuses; a non-zero
+	// value makes the verify terminal TamperedVerify (B2) before any check runs.
+	// -1 (or unset) means no verify has run yet.
+	// +kubebuilder:default=-1
+	// +optional
+	TamperExitCode int `json:"tamperExitCode,omitempty"`
+
+	// lastCheckResults carries the per-check exit codes from the last verify run
+	// (one entry per acceptance check, in order) to feed forward (B3).
+	// +listType=atomic
+	// +optional
+	LastCheckResults []int `json:"lastCheckResults,omitempty"`
 }
 
 // LoopSettings holds the loop-level knobs.
@@ -134,6 +178,20 @@ type LoopStatus struct {
 	// never writes this field directly (ADR-0004).
 	// +optional
 	ObservedPhase LoopPhase `json:"observedPhase,omitempty"`
+
+	// baseCommit is the SHA resolved from spec.workspace.ref at Loop start and
+	// pinned for the Loop's life (ADR-0005 D10). It is one of the two operator-
+	// pinned SHAs the TamperedVerify glob diff compares; the agent has no write
+	// path to it. Immutable once set.
+	// +optional
+	BaseCommit string `json:"baseCommit,omitempty"`
+
+	// verify carries the operator's record of the last verify run's evidence
+	// (ADR-0005 D14): the tamper-check container's exit code (0 = clean) and the
+	// per-check exit codes. These are kubelet-recorded, not result.json claims;
+	// in envtest (no Job controller) the B-slice tests set them directly.
+	// +optional
+	Verify *VerifyStatus `json:"verify,omitempty"`
 
 	// conditions represent the current state of the Loop resource.
 	// Each condition has a unique type and reflects the status of a specific

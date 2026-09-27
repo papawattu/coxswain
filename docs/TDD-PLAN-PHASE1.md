@@ -202,6 +202,18 @@ in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
     expressible in one KubeArmorPolicy (selector is pod-level), so the
     agent=localhost / proxy=model-endpoint split is enforced by the
     NetworkPolicy (C3) with the KubeArmorPolicy as the pod-level fence.
+    **R15 P1s fixed (9a951f2):** (1) the D30 gate applies to EVERY Loop (no
+    policyRefs = the platform minimum, still translated/emitted/enforced; the old
+    no-policyRefs-ungated spec is inverted); (2) the gate has something behind it —
+    Reconcile calls `Enforcer.Apply` before the gate, the sandbox pod template
+    carries the `coxswain.io/loop` label the selector targets, and a real
+    `KubeArmorEnforcer` (unstructured create/update of the KubeArmorPolicy,
+    owner-ref'd) is wired in `cmd/main.go`; (3) exec allows are emitted under
+    `process.matchPaths` + `action: Allow`, not `syscalls` (monitoring-only).
+    `Enforcing` fails closed (NodeNotEnforcing) until the I32 relay is wired.
+    **Remaining:** the real kind e2e (KubeArmor on kind via `make kind-up` + a
+    disallowed exec actually blocked) + the D29 per-container proposal (P2, a
+    review doc before any C3 code).
 
 - **C7** — *Activity-audit stream (ADR-0007 Q4).* Coxswain **emits** agent-
 activity audit as JSON lines on each trusted source's stdout with the common

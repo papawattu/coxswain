@@ -151,4 +151,4 @@ Builder response:
   command + a disallowed host; the R8 gate (no C3/C6/C7 code before ADR-0007
   review) and the `make kind-up` eBPF-engine step recorded.
 - No C3/C6/C7 code written yet — held for the reviewer's ADR-0007 review.
-  C1/C2/C4 may proceed. (Committed; hash to be filled by the builder.)*
+  C1/C2/C4 may proceed. Committed as 13a0027.

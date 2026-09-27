@@ -146,3 +146,13 @@ Per the review, two choices were the owner's. Status at round 8:
   credential boundary (CONTEXT.md budgets/metering notes updated).
 - The `spec.agent` CRD fields and the `coxswain-agent-defaults` ConfigMap are
   new Phase 1 surfaces (the README sample gets an `agent:` block).
+- **Agent image stand-in (I37, round 10):** when `spec.agent.image` is omitted the
+  sandbox runs `docker.io/library/golang:1.26` + `sleep infinity` as a Phase 0
+  stand-in. It is hardened (zero credentials, no token automount, read-only
+  rootfs, limits) but it is *not* an agent, and it is a general rootless image
+  that contradicts the "agent-agnostic, minimal" default the ADR describes. The
+  reference runner image lands with the A-slices; until then the stand-in default
+  is documented in the README's status line, and `spec.agent.image` should be set
+  explicitly by any real run. Revisit once the runner image exists: either make
+  the runner image the default (option a) or require `spec.agent.image` via CEL
+  (option b).

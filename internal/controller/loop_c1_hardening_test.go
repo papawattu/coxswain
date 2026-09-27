@@ -104,6 +104,38 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		Expect(*sc.ReadOnlyRootFilesystem).To(BeTrue(),
 			"read-only rootfs must be on, with /workspace + scratch as emptyDir volumes")
 
+		// I35 (R10): runAsNonRoot without a UID breaks the default golang image on
+		// kind (CreateContainerConfigError). The agent must pin a UID/GID and the
+		// pod must set fsGroup so /workspace + /scratch are writable by it; HOME and
+		// TMPDIR point at the writable scratch (a read-only rootfs otherwise breaks
+		// every tool that writes ~/.cache or /tmp).
+		By("pinning a non-root UID/GID and a fsGroup (I35)")
+		Expect(sc.RunAsUser).NotTo(BeNil())
+		Expect(*sc.RunAsUser).To(BeNumerically("==", 65532), "runAsUser must be the platform non-root UID (65532)")
+		Expect(sc.RunAsGroup).NotTo(BeNil())
+		Expect(*sc.RunAsGroup).To(BeNumerically("==", 65532), "runAsGroup must be the platform non-root GID (65532)")
+		Expect(pod.SecurityContext).NotTo(BeNil())
+		Expect(pod.SecurityContext.FSGroup).NotTo(BeNil())
+		Expect(*pod.SecurityContext.FSGroup).To(BeNumerically("==", 65532), "fsGroup must match the agent UID so emptyDir volumes are writable")
+
+		By("pointing HOME and TMPDIR at the writable scratch (I35)")
+		envByName := map[string]string{}
+		for _, e := range agent.Env {
+			envByName[e.Name] = e.Value
+		}
+		Expect(envByName["HOME"]).To(Equal("/scratch"), "HOME must be on the writable scratch volume")
+		Expect(envByName["TMPDIR"]).NotTo(BeEmpty(), "TMPDIR must be set")
+		Expect(envByName["TMPDIR"]).To(HavePrefix("/scratch"), "TMPDIR must be on the writable scratch volume")
+
+		// I36 (R10): ADR-0006 item 4 requires CPU/memory limits; C1 set none, so one
+		// agent could starve the node. Also an ephemeral-storage limit — /workspace
+		// and /scratch are emptyDir and an agent can fill the node's disk.
+		By("setting CPU, memory, and ephemeral-storage limits (I36)")
+		Expect(agent.Resources.Limits).NotTo(BeEmpty(), "the agent must have resource limits (I36)")
+		Expect(agent.Resources.Limits).To(HaveKey(corev1.ResourceCPU), "a CPU limit is required (I36)")
+		Expect(agent.Resources.Limits).To(HaveKey(corev1.ResourceMemory), "a memory limit is required (I36)")
+		Expect(agent.Resources.Limits).To(HaveKey(corev1.ResourceEphemeralStorage), "an ephemeral-storage limit is required (I36)")
+
 		Expect(sc.SeccompProfile).NotTo(BeNil())
 		Expect(sc.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault),
 			"seccomp must be RuntimeDefault")

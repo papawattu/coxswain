@@ -17,7 +17,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -175,17 +174,47 @@ type AgentConfig struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
-	// model is the model name/identifier the proxy uses when calling the
-	// endpoint. +optional
+	// model is the model name/identifier the proxy uses when calling the endpoint.
+	// +optional
 	Model string `json:"model,omitempty"`
 
 	// endpointSecretRef is the name of a Secret in the Loop's namespace holding
 	// the model base URL + API key. It is mounted only into the proxy sidecar,
-	// never the agent container. +optional
+	// never the agent container.
+	// +optional
 	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
 
-	// env carries extra environment variables for the agent container. +optional
-	Env []corev1.EnvVar `json:"env,omitempty"`
+	// env carries literal-only environment variables for the agent container
+	// (I34: a valueFrom/secretKeyRef form is not expressible here, so a Loop
+	// author cannot inject a Secret into the agent). Names are limited to
+	// avoid the platform-owned COX_* namespace (the operator sets
+	// COX_MODEL_BASE_URL in C2; a Loop must not point the agent past the proxy).
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	Env []AgentEnvVar `json:"env,omitempty"`
+}
+
+// AgentEnvVar is a literal-only environment variable for the agent container
+// (I34, REVIEW-PHASE1-R10). It deliberately does NOT carry the
+// corev1.EnvVar's valueFrom field, so it cannot reference a Secret or ConfigMap
+// — a Loop author cannot thereby inject a credential into the untrusted agent
+// (ADR-0006). Names must not start with the platform-owned COX_ prefix (the
+// operator sets COX_MODEL_BASE_URL in C2; a Loop must not point the agent past
+// the proxy). Enforced by a CEL rule because Kubernetes structural schemas use
+// RE2 (no negative lookahead) and prune unknown fields rather than rejecting
+// them.
+type AgentEnvVar struct {
+	// name of the environment variable.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('COX_')",message="agent env names must not use the platform-owned COX_ prefix (I34)"
+	Name string `json:"name"`
+
+	// value is the literal value.
+	// +kubebuilder:validation:MaxLength=16384
+	// +optional
+	Value string `json:"value,omitempty"`
 }
 
 // A Loop is one-shot and single-goal (docs/adr/0003).

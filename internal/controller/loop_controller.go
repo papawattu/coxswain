@@ -21,6 +21,7 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -160,6 +161,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		falseP := false
 		trueP := true
 		readOnlyRootfs := true
+		// I35 (R10): the platform non-root UID/GID. runAsNonRoot alone is not
+		// enough — the default golang image has no USER and the kubelet refuses to
+		// start it (CreateContainerConfigError) unless a UID is pinned. fsGroup
+		// makes the emptyDir /workspace + /scratch volumes writable by it.
+		nonRootUID := int64(65532)
+		nonRootGID := int64(65532)
+		nonRootFSGroup := int64(65532)
 		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
 		// (S1). Running is the default for a normal Loop.
 		if loop.Spec.Suspend {
@@ -168,12 +176,38 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
+		// I35: fsGroup so the /workspace + /scratch emptyDir volumes are owned by
+		// the agent's UID (writable). Set on the pod security context.
+		desired.Spec.PodTemplate.Spec.SecurityContext = &corev1.PodSecurityContext{
+			FSGroup: &nonRootFSGroup,
+		}
 		// The agent container: spec.agent.image when set, else the dev default
 		// (C1). It holds no credentials (ADR-0006) — the model key lives only in
 		// the proxy sidecar (C2), mounted there in a later slice.
 		agentImage := r.sandboxImage()
 		if loop.Spec.Agent.Image != "" {
 			agentImage = loop.Spec.Agent.Image
+		}
+		// I34: spec.agent.env is literal-only (AgentEnvVar); convert to the
+		// corev1 form for the container. valueFrom is not expressible in the CRD,
+		// so no credential can be injected here. I35: HOME/TMPDIR point at the
+		// writable scratch because the read-only rootfs otherwise breaks every tool
+		// that writes ~/.cache or /tmp (Go's build cache, git, npm).
+		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+2)
+		agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
+		agentEnv = append(agentEnv, corev1.EnvVar{Name: "TMPDIR", Value: "/scratch/tmp"})
+		for _, e := range loop.Spec.Agent.Env {
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
+		}
+		// I36 (R10): ADR-0006 item 4 requires CPU/memory limits (one agent must not
+		// starve the node) + an ephemeral-storage limit (/workspace + /scratch are
+		// emptyDir; an agent can fill the node's disk). Platform defaults here; a
+		// per-Loop override bounded by a cluster maximum is a follow-on (I36) once
+		// the coxswain-agent-defaults ConfigMap exists.
+		agentLimits := corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse("500m"),
+			corev1.ResourceMemory:           resource.MustParse("512Mi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
 		}
 		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{
 			{
@@ -182,10 +216,19 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				// Keep the container alive until the phase driver (Phase 1)
 				// takes over. sleep infinity is a stand-in.
 				Command: []string{"sh", "-c", "sleep infinity"},
-				Env:     loop.Spec.Agent.Env,
+				Env:     agentEnv,
+				Resources: corev1.ResourceRequirements{
+					Limits: agentLimits,
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("100m"),
+						corev1.ResourceMemory: resource.MustParse("128Mi"),
+					},
+				},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: &falseP,
 					RunAsNonRoot:             &trueP,
+					RunAsUser:                &nonRootUID,
+					RunAsGroup:               &nonRootGID,
 					ReadOnlyRootFilesystem:   &readOnlyRootfs,
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},

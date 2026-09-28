@@ -437,8 +437,8 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			// Running). Read the live objects: hold Suspended when any of this
 			// Loop's netpol names exists and is NOT controlled by the Loop
 			// (same gate pattern as D35a). Absent netpols are not a conflict
-			// (ensureNetworkPolicy creates them; an error reading one is not a
-			// conflict either — that is a reconcile error, not a gate flip).
+			// (ensureNetworkPolicy creates them); a real read error FAILS CLOSED
+			// (Suspended), consistent with needsEgressProxy.
 			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
 				foreignNetPols(ctx, r, loop) {
 				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
@@ -1284,6 +1284,19 @@ func hadEgressConflict(loop *coxv1alpha1.Loop) bool {
 	return false
 }
 
+// hadNetpolConflict reports whether the Loop has an active
+// NetworkPolicyConflict=True/ForeignNetworkPolicy condition (I42c: the
+// clearing at the end of ensureNetworkPolicy must only fire when a conflict
+// was previously recorded, otherwise it would write a spurious Resolved).
+func hadNetpolConflict(loop *coxv1alpha1.Loop) bool {
+	for _, c := range loop.Status.Conditions {
+		if c.Type == "NetworkPolicyConflict" && c.Status == metav1.ConditionTrue && c.Reason == "ForeignNetworkPolicy" {
+			return true
+		}
+	}
+	return false
+}
+
 // cleanupEgressProxy deletes the egress proxy pod + Service when the effective
 // policy has no network allows (I42b). No-op when they don't exist.
 func (r *LoopReconciler) cleanupEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
@@ -1377,16 +1390,12 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// ensureSandbox (order-independent, round 3) is what actually holds it
 	// Suspended across reconciles; a non-conflict error below still returns
 	// and requeues.
-	var (
-		foreignConflict bool
-		allNetPolsOK    bool
-	)
+	var foreignConflict bool
 	mapForeign := func(npName string, err error) error {
 		if !errors.Is(err, errForeignNetpol) {
 			return err
 		}
 		foreignConflict = true
-		allNetPolsOK = false
 		setCondition(loop, "NetworkPolicyConflict", metav1.ConditionTrue, "ForeignNetworkPolicy",
 			"NetworkPolicy "+npName+" exists but is not controlled by this Loop; left untouched")
 		return nil
@@ -1408,8 +1417,6 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		if merr := mapForeign(agentNP.Name, err); merr != nil {
 			return merr
 		}
-	} else {
-		allNetPolsOK = true
 	}
 
 	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, egress
@@ -1452,8 +1459,6 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		if merr := mapForeign(proxyNP.Name, err); merr != nil {
 			return merr
 		}
-	} else {
-		allNetPolsOK = true
 	}
 
 	// I42c: the egress proxy NetworkPolicy is created only when the egress
@@ -1518,20 +1523,26 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			if merr := mapForeign(egressProxyNP.Name, err); merr != nil {
 				return merr
 			}
-		} else {
-			allNetPolsOK = true
 		}
+	}
+
+	// I42c: clean up the egress proxy NetworkPolicy when the egress proxy is
+	// no longer expected (the network allows went away). (The egress proxy
+	// netpol is created only when egressExpected, above; cleanup runs in the
+	// ELSE branch — a call inside the if-block would delete the netpol just
+	// created.)
+	if !egressExpected {
 		if merr := r.cleanupEgressProxyNetpol(ctx, loop); merr != nil {
 			return merr
 		}
 	}
 
-	// I42c review P2 (round 3): every netpol create/update succeeded -> the
-	// conflict is resolved; clear NetworkPolicyConflict to False/Resolved so a
-	// cleared conflict never lingers True forever (the agent netpol is only
-	// ensured when a model endpoint or network allows exist, so track OK
-	// across the createOrUpdateNPs that ran).
-	if allNetPolsOK {
+	// I42c review P2 (round 3): the conflict is resolved once no createOrUpdateNP
+	// hit a foreign netpol this reconcile. Clear NetworkPolicyConflict to
+	// False/Resolved when it was previously True and no conflict ran (the
+	// hadEgressConflict pattern); the live-objects gate in ensureSandbox is the
+	// source of truth for suspension, so a stale condition cannot wedge it.
+	if !foreignConflict && hadNetpolConflict(loop) {
 		setCondition(loop, "NetworkPolicyConflict", metav1.ConditionFalse, "Resolved",
 			"all per-Loop NetworkPolicies are controlled by this Loop")
 	}
@@ -1548,15 +1559,19 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 // and is NOT controlled by the Loop (I42c review P2 round 3: the sandbox
 // gate that holds the sandbox Suspended on a foreign netpol must be
 // order-independent of ensureNetworkPolicy, so it reads the live objects
-// itself). A read error is not a conflict (it surfaces as a reconcile
-// error); an absent netpol is not a conflict (ensureNetworkPolicy creates
-// it).
+// itself). It fails CLOSED on a real read error (true: hold Suspended;
+// consistent with needsEgressProxy): the reconcile requeues on the same
+// error, so a transient failure is not terminal. An ABSENT netpol is not a
+// conflict (ensureNetworkPolicy creates it).
 func foreignNetPols(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
 	for _, name := range []string{loop.Name + "-agent-netpol", loop.Name + "-proxy-netpol", loop.Name + "-egress-proxy-netpol"} {
 		np := &networkingv1.NetworkPolicy{}
 		err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, np)
-		if apierrors.IsNotFound(err) || err != nil {
+		if apierrors.IsNotFound(err) {
 			continue
+		}
+		if err != nil {
+			return true
 		}
 		if !metav1.IsControlledBy(np, loop) {
 			return true

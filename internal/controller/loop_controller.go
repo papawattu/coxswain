@@ -691,14 +691,29 @@ func proxyLabels(loopName string) map[string]string {
 // proxyImage returns the model proxy pod image. It is the reconciler's
 // ProxyImage field (settable in tests and future slices; a manager flag
 // --proxy-image is a candidate for a future C2b), or a working stand-in
-// (golang:1.26) when unset. The stand-in has POSIX sh, head, and sleep —
-// enough for the D33 kind-run acceptance (the model-creds read + sleep
-// infinity).
+// (the Go reverse proxy) when unset. The stand-in checks the model-creds
+// Secret at startup (D33 acceptance) and forwards to MODEL_ENDPOINT.
 func (r *LoopReconciler) proxyImage() string {
 	if r.ProxyImage != "" {
 		return r.ProxyImage
 	}
-	return "docker.io/library/golang:1.26"
+	return "coxswain-proxy:standin"
+}
+
+// modelEndpointValue returns the value of the MODEL_ENDPOINT env var for the
+// proxy pod. It prefers the non-secret Loop spec field (agent.modelEndpoint);
+// when unset it falls back to the Secret's MODEL_BASE_URL (read at reconcile
+// time, not at pod start, so the pod spec does not change if the Secret does).
+func modelEndpointValue(loop *coxv1alpha1.Loop) string {
+	if loop.Spec.Agent.ModelEndpoint != "" {
+		v := loop.Spec.Agent.ModelEndpoint
+		// Ensure it's a URL the Go reverse proxy can parse.
+		if !strings.Contains(v, "://") {
+			v = "http://" + v
+		}
+		return v
+	}
+	return ""
 }
 
 // ensureProxy creates the Loop's per-Loop model-proxy pod + Service (D33,
@@ -996,17 +1011,13 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
-				// D33 kind-run acceptance: the stand-in must prove at runtime
-				// that it CAN read the 0444 model-creds Secret file.
-				Command: []string{
-					"sh", "-c",
-					"echo 'proxy-stand-in: checking model-creds'; " +
-						"if head -c 64 /model-creds/* >/dev/null 2>&1; then " +
-						"echo 'proxy: model-creds readable (0444 secret file present)'; " +
-						"else " +
-						"echo 'proxy: model-creds NOT readable' && exit 1; " +
-						"fi; " +
-						"exec sleep infinity",
+				// The proxy binary checks the model-creds Secret at startup
+				// (D33 acceptance) and forwards to MODEL_ENDPOINT.
+				Env: []corev1.EnvVar{
+					{
+						Name:  "MODEL_ENDPOINT",
+						Value: modelEndpointValue(loop),
+					},
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},

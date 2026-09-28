@@ -444,7 +444,7 @@ func isOwnedByLoop(obj metav1.Object, loopName string) bool {
 var _ = Describe("D33 proxy image", func() {
 	It("defaults to the working stand-in when ProxyImage is unset", func() {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		Expect(r.proxyImage()).To(Equal("docker.io/library/golang:1.26"))
+		Expect(r.proxyImage()).To(Equal("coxswain-proxy:standin"))
 	})
 
 	It("honours the ProxyImage override", func() {

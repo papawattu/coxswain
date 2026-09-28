@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -162,6 +163,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		loop.Status.ObservedGeneration = loop.Generation
 		changed = true
 	}
+	// D35b: ensureProxy may have set or cleared the ProxyConflict condition.
+	// The condition is on the loop object; persist it.
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == "ProxyConflict" {
+			changed = true
+			break
+		}
+	}
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
@@ -210,7 +219,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, TamperedVerifyReason,
+			setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
 				"a protected path changed between baseCommit and verifiedCommit; terminal")
 			changed = true
 		}
@@ -245,6 +254,28 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		},
 	}
 
+	// D35a: the sandbox must not be Running until the proxy pod is Ready.
+	// When endpointSecretRef is set, the agent's COX_MODEL_BASE_URL points at
+	// the proxy Service; a Running sandbox with a not-yet-Ready proxy would
+	// get connection-refused on every model call. The gate keeps the sandbox
+	// Suspended until the proxy pod reports Ready. A Loop with no
+	// endpointSecretRef has no proxy, so the gate does not apply.
+	proxyReady := true
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		proxyPod := &corev1.Pod{}
+		proxyName := loop.Name + "-proxy"
+		err := r.Get(ctx, types.NamespacedName{Name: proxyName, Namespace: loop.Namespace}, proxyPod)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				proxyReady = false
+			} else {
+				return err
+			}
+		} else {
+			proxyReady = isPodReady(proxyPod)
+		}
+	}
+
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
 		// C1 (ADR-0006 item 4): the sandbox pod is a zero-credential, hardened
 		// boundary. No SA token automount; the agent is non-root, drops all caps,
@@ -262,8 +293,10 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		trueP := true
 		readOnlyRootfs := true
 		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
-		// (S1). Running is the default for a normal Loop.
-		if loop.Spec.Suspend {
+		// (S1). D35a: a Loop with a model endpoint must not run a Running
+		// sandbox until the proxy pod is Ready. Running is the default for a
+		// normal Loop with no model endpoint (or a Ready proxy).
+		if loop.Spec.Suspend || !proxyReady {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
@@ -804,6 +837,20 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 			"proxy", proxyPodName(loopName), "namespace", ns, "loop", loopName)
 	} else if err != nil {
 		return fmt.Errorf("get proxy pod %s/%s: %w", ns, proxyPodName(loopName), err)
+	} else if !metav1.IsControlledBy(existingPod, loop) {
+		// D35b: a pod with the name <loop>-proxy exists but is NOT controlled
+		// by this Loop. It has the proxy labels (so the NetworkPolicy would
+		// route agent traffic to it) but it's a foreign object. I2: never take
+		// over a foreign object. Set ProxyConflict=True so the user knows.
+		setCondition(loop, "ProxyConflict", "True", "ForeignProxy",
+			fmt.Sprintf("a foreign pod named %s exists in %s; the agent traffic would be routed to it. Delete it or label it correctly.",
+				proxyPodName(loopName), ns))
+		log.Info("proxy pod exists but is not controlled by this Loop; ProxyConflict set",
+			"proxy", proxyPodName(loopName), "loop", loopName)
+		// Do NOT create or delete the foreign pod. Return nil so the
+		// reconcile continues (the sandbox stays Suspended via the D35a
+		// gate because the foreign pod is not the controller's proxy).
+		return nil
 	} else if existingPod.Annotations[proxySpecHashAnnotation] != proxySpecHash {
 		// Pod exists but the spec hash doesn't match: delete and requeue.
 		// A bare Pod's spec is immutable, so we can't Update it. Deleting
@@ -826,6 +873,18 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 	}
 	// Pod exists and hash matches: nothing to do.
 	podOp := controllerutil.OperationResultNone
+
+	// D35b: clear the ProxyConflict condition if it was set in a previous
+	// reconcile (e.g., the user deleted the foreign pod and the controller
+	// created its own).
+	if loop.Status.Conditions != nil {
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == "ProxyConflict" {
+				loop.Status.Conditions = append(loop.Status.Conditions[:i], loop.Status.Conditions[i+1:]...)
+				break
+			}
+		}
+	}
 
 	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
 		log.V(1).Info("ensured loop proxy (no change)",
@@ -945,10 +1004,22 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 // is the terminal phase (e.g. "Failed") so each terminal outcome is recorded
 // once with its reason (e.g. TamperedVerify). It is the operator's audit record
 // (ADR-0004); the runner never writes it.
-func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status metav1.ConditionStatus, reason, message string) {
+// isPodReady reports whether a Pod has the PodReady condition set to True
+// and all containers report ready (D35a: the sandbox must not be Running
+// until the proxy pod is Ready).
+func isPodReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
 	now := metav1.Now()
 	for i := range loop.Status.Conditions {
-		if loop.Status.Conditions[i].Type == string(condType) {
+		if loop.Status.Conditions[i].Type == condType {
 			if loop.Status.Conditions[i].Reason == reason &&
 				loop.Status.Conditions[i].Message == message &&
 				loop.Status.Conditions[i].Status == status {
@@ -962,7 +1033,7 @@ func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status
 		}
 	}
 	loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
-		Type:               string(condType),
+		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,

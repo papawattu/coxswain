@@ -324,8 +324,8 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "drift-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:      "dummy-key",
-				"MODEL_BASE_URL": "http://fake-endpoint:8000",
+				modelAPIKey:  "dummy-key",
+				modelBaseURL: "http://fake-endpoint:8000",
 			},
 		}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())

@@ -458,6 +458,17 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		noShare := false
 		desired.Spec.PodTemplate.Spec.ShareProcessNamespace = &noShare
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
+		// ndots:1 so the agent's resolver sends absolute names for the
+		// in-cluster Service URLs (COX_MODEL_BASE_URL, HTTPS_PROXY) without
+		// search-suffix expansion. KubeArmor's matchDNSQueries is an allowlist
+		// of the bare Service FQDNs; with ndots:5 (the k8s default) the
+		// resolver first queries <name>.<search-suffix> which is NOT on the
+		// allowlist, so KubeArmor denies the lookup (EPERM) and the agent
+		// cannot resolve the proxy or egress proxy Service names.
+		ndotsVal := "1"
+		desired.Spec.PodTemplate.Spec.DNSConfig = &corev1.PodDNSConfig{
+			Options: []corev1.PodDNSConfigOption{{Name: "ndots", Value: &ndotsVal}},
+		}
 		// I35: fsGroup so the /workspace + /scratch emptyDir volumes are owned by
 		// the agent's UID (writable). Set on the pod security context.
 		desired.Spec.PodTemplate.Spec.SecurityContext = &corev1.PodSecurityContext{
@@ -486,7 +497,33 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		if hasModel {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: proxyServiceURL(loop.Name, loop.Namespace)})
 		}
+		// I42d: when the egress proxy is expected (network allows present, or the
+		// policy cannot be read — the fail-closed needsEgressProxy gate), the agent
+		// routes external HTTP egress through the operator's egress proxy and model
+		// calls bypass it. Standard (unprefixed) names so any HTTP client picks
+		// them up. The COX_MODEL_BASE_URL host is in NO_PROXY so model calls go
+		// straight to the model proxy. A user spec.agent.env var that collides
+		// with one of these operator names is DROPPED: the operator value wins
+		// (an agent that could re-route its own egress away from the egress proxy
+		// would defeat the network allowlist).
+		if needsEgressProxy(ctx, r, loop) {
+			// The append must extend agentEnv, NOT replace it: replacing would
+			// drop everything appended before (COX_MODEL_BASE_URL, HOME, ...).
+			noProxy := egressNOProxy(loop)
+			agentEnv = append(agentEnv, operatorProxyEnv(loop.Name, loop.Namespace)...)
+			agentEnv = append(agentEnv,
+				corev1.EnvVar{Name: "NO_PROXY", Value: noProxy},
+				corev1.EnvVar{Name: "no_proxy", Value: noProxy},
+			)
+		}
 		for _, e := range loop.Spec.Agent.Env {
+			if isOperatorProxyEnv(e.Name) {
+				// A user spec.agent.env var colliding with the operator-owned proxy
+				// names is dropped (I42d): the operator value wins so the agent
+				// cannot re-route its egress away from the egress proxy. A non-
+				// colliding name falls through and is preserved.
+				continue
+			}
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
 		}
 		// I36 (R10): ADR-0006 item 4 requires CPU/memory limits (one agent must not
@@ -969,7 +1006,83 @@ func proxyServiceName(loopName string) string {
 // attributable to the Loop (D35).
 
 func proxyServiceURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc:%d", proxyServiceName(loopName), namespace, proxyPort)
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", proxyServiceName(loopName), namespace, proxyPort)
+}
+
+// egressProxyServiceURL is the in-cluster URL the agent's *_PROXY env vars
+// point at (I42d): http://<loop>-egress-proxy.<namespace>.svc:3128. The
+// egress proxy enforces the hostname:port allowlist at the HTTP CONNECT / SNI
+// / Host layer (ADR-0007); the agent routes external egress through it and
+// model calls bypass it via NO_PROXY.
+func egressProxyServiceURL(loopName, namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", egressProxyServiceName(loopName), namespace, egressProxyPort)
+}
+
+// egressNOProxy is the agent's NO_PROXY value (I42d): the model proxy Service
+// (short + FQDN form, so model calls — which hit COX_MODEL_BASE_URL, the model
+// proxy's .svc URL — bypass the egress proxy) + localhost/loopback. The model
+// proxy's host matches the COX_MODEL_BASE_URL host, which is what proxy clients
+// match NO_PROXY by.
+func egressNOProxy(loop *coxv1alpha1.Loop) string {
+	proxySvc := proxyServiceName(loop.Name)
+	return strings.Join([]string{
+		proxySvc + "." + loop.Namespace + ".svc",
+		proxySvc + "." + loop.Namespace + ".svc.cluster.local",
+		"localhost",
+		"127.0.0.1",
+	}, ",")
+}
+
+// operatorProxyEnvNames are the agent env var names the operator owns for the
+// egress proxy (I42d): the standard proxy vars in BOTH cases (clients are
+// inconsistent about case — curl reads only lowercase http_proxy, Go reads
+// either, wget/pip/npm/git/apt mostly lowercase) + ALL_PROXY, which clients
+// also honour. A user spec.agent.env var with one of these names is dropped:
+// the operator value wins, so the agent cannot re-route its egress away from
+// the egress proxy (the network allowlist is operator policy). ALL_PROXY is
+// reserved (not emitted): it would catch model traffic, which must bypass the
+// egress proxy via NO_PROXY.
+var operatorProxyEnvNames = map[string]struct{}{
+	"HTTPS_PROXY": {},
+	"https_proxy": {},
+	"HTTP_PROXY":  {},
+	"http_proxy":  {},
+	"NO_PROXY":    {},
+	"no_proxy":    {},
+	"ALL_PROXY":   {},
+	"all_proxy":   {},
+}
+
+// operatorProxyEnv returns the operator-owned proxy env vars for the egress
+// proxy (I42d): HTTPS_PROXY/https_proxy and HTTP_PROXY/http_proxy point at
+// the egress proxy Service. NO_PROXY/no_proxy are appended by the caller
+// (they carry the per-Loop egressNOProxy value).
+func operatorProxyEnv(loopName, namespace string) []corev1.EnvVar {
+	proxyURL := egressProxyServiceURL(loopName, namespace)
+	return []corev1.EnvVar{
+		{Name: "HTTPS_PROXY", Value: proxyURL},
+		{Name: "https_proxy", Value: proxyURL},
+		{Name: "HTTP_PROXY", Value: proxyURL},
+		{Name: "http_proxy", Value: proxyURL},
+	}
+}
+
+// isOperatorProxyEnv reports whether name is one of the operator-owned proxy
+// env names (I42d).
+func isOperatorProxyEnv(name string) bool {
+	_, ok := operatorProxyEnvNames[name]
+	return ok
+}
+
+// operatorProxyNames returns the uppercase + lowercase forms of each given
+// uppercase proxy env name (I42d) — the two forms the operator emits/reserves
+// for that name.
+func operatorProxyNames(names ...string) []string {
+	out := make([]string, 0, len(names)*2)
+	for _, n := range names {
+		out = append(out, n, strings.ToLower(n))
+	}
+	return out
 }
 
 // proxyLabels is the label set the per-Loop proxy pod carries and the proxy

@@ -112,12 +112,21 @@ type EffectivePolicy struct {
 // default to deny. With no effective allows, the agent gets only the proxy
 // FQDN + DNS and the proxy only the model endpoint — the platform minimum.
 //
-// proxyFQDN is the per-Loop proxy Service FQDN (<loop>-proxy.<ns>.svc).
-// It is platform infrastructure, not part of the user's AgentPolicy.
-func Translate(p EffectivePolicy, proxyFQDN string) EnginePolicy {
-	agentAllows := make([]Allow, 0, 2+len(p.Exec)+len(p.Network)+len(p.Files))
+// proxyFQDN is the per-Loop proxy Service FQDN (<loop>-proxy.<ns>.svc) and
+// egressProxyFQDN is the per-Loop egress proxy Service FQDN
+// (<loop>-egress-proxy.<ns>.svc); both are platform infrastructure, not part
+// of the user's AgentPolicy. egressProxyFQDN is added to the agent's DNS
+// allowlist only when it is non-empty (i.e. the effective policy has network
+// allows, so the egress proxy exists and the agent's *_PROXY env points at it
+// — I42d); with no allows the agent has no external egress and the name must
+// not appear in the allowlist.
+func Translate(p EffectivePolicy, proxyFQDN, egressProxyFQDN string) EnginePolicy {
+	agentAllows := make([]Allow, 0, 3+len(p.Exec)+len(p.Network)+len(p.Files))
 	// D33: the agent reaches the proxy via its Service FQDN (not localhost).
 	agentAllows = append(agentAllows, Allow{Type: AllowNetwork, Match: proxyFQDN})
+	if egressProxyFQDN != "" {
+		agentAllows = append(agentAllows, Allow{Type: AllowNetwork, Match: egressProxyFQDN})
+	}
 	// DNS resolution: allow udp+tcp DNS so the FQDN can be resolved.
 	agentAllows = append(agentAllows, Allow{Type: AllowNetwork, Match: dnsAllow})
 	for _, c := range p.Exec {

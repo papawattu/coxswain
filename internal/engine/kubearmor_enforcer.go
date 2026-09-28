@@ -24,7 +24,15 @@ type KubeArmorEnforcer struct {
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective
 // policy, owned by the Loop.
 func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p policy.EffectivePolicy) error {
-	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p, proxyServiceFQDN(loop.Name, loop.Namespace)))
+	// I42d: the egress proxy FQDN goes in the agent's DNS allowlist only when
+	// the effective policy has network allows — that is exactly when the egress
+	// proxy exists and the agent's *_PROXY env points at it. With no allows the
+	// agent has no external egress and the name stays out of the allowlist.
+	egressFQDN := ""
+	if len(p.Network) > 0 {
+		egressFQDN = loop.Name + "-egress-proxy." + loop.Namespace + ".svc"
+	}
+	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p, proxyServiceFQDN(loop.Name, loop.Namespace), egressFQDN))
 	// P2: owner-ref the KubeArmorPolicy to the Loop so it is GC'd when the Loop
 	// is deleted (and a later same-name Loop doesn't inherit a stale policy).
 	if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {

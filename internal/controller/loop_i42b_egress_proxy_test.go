@@ -139,20 +139,22 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
 		})).To(Succeed())
 
-		loop := buildLoop("allow-loop", ns, []string{i42bPolicyName})
+		// i42dAllowLoop is the shared "network allows present" Loop name
+		// (loop_i42_env_test.go); the literal must stay a constant (goconst).
+		loop := buildLoop(i42dAllowLoop, ns, []string{i42bPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "allow-loop"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42dAllowLoop}})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Egress proxy pod exists.
 		pod := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "allow-loop-egress-proxy"}, pod)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop + "-egress-proxy"}, pod)).To(Succeed(),
 			"the egress proxy pod must be created when network allows are present")
 
 		// Verify the pod carries the correct labels (DISJOINT from agent/model proxy).
 		Expect(pod.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "egress-proxy"))
-		Expect(pod.Labels).To(HaveKeyWithValue("coxswain.io/egress-proxy-for", "allow-loop"))
+		Expect(pod.Labels).To(HaveKeyWithValue("coxswain.io/egress-proxy-for", i42dAllowLoop))
 		Expect(pod.Labels).ToNot(HaveKey("coxswain.io/loop"),
 			"the egress proxy pod must NOT carry coxswain.io/loop (the KubeArmorPolicy selector)")
 		Expect(pod.Labels).ToNot(HaveKeyWithValue("app.kubernetes.io/component", "agent"))
@@ -217,12 +219,12 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// Owner refs on pod and Service (P2 review).
 		loopRef := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "allow-loop"}, loopRef)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop}, loopRef)).To(Succeed())
 		Expect(metav1.IsControlledBy(pod, loopRef)).To(BeTrue(), "the egress proxy pod must be owned by the Loop")
 
 		// Egress proxy Service exists.
 		svc := &corev1.Service{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "allow-loop-egress-proxy"}, svc)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop + "-egress-proxy"}, svc)).To(Succeed(),
 			"the egress proxy Service must be created")
 		Expect(svc.Spec.Ports).To(HaveLen(1))
 		Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(3128))
@@ -234,7 +236,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// The sandbox must be Suspended (the egress proxy pod is not Ready yet).
 		sb := &sandboxv1beta1.Sandbox{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "allow-loop-sandbox"}, sb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop + "-sandbox"}, sb)).To(Succeed())
 		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
 			"the sandbox must be Suspended when the egress proxy is not Ready")
 	})

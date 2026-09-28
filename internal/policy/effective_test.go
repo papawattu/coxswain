@@ -28,7 +28,7 @@ import (
 // default to deny. This is the ADR-0007 Q2 guarantee — with no policy the agent
 // can do only the platform minimum.
 func TestTranslateDefaultDenyPlatformMinimum(t *testing.T) {
-	got := Translate(EffectivePolicy{}, "l1-proxy.ns.svc")
+	got := Translate(EffectivePolicy{}, "l1-proxy.ns.svc", "")
 	want := EnginePolicy{
 		Containers: []ContainerPolicy{
 			{
@@ -57,7 +57,7 @@ func TestTranslateAgentAllowsCoverThePolicy(t *testing.T) {
 		Exec:    []string{"/usr/bin/git", "/usr/bin/go"},
 		Network: []string{"proxy.golang.org:443", "sum.golang.org:443"},
 		Files:   []string{"/workspace"},
-	}, "l1-proxy.ns.svc")
+	}, "l1-proxy.ns.svc", "")
 
 	var agent, proxy *ContainerPolicy
 	for i := range got.Containers {
@@ -124,5 +124,45 @@ func TestEffectiveHashNoCommaCollision(t *testing.T) {
 	if EffectiveHash(p3) != h2 {
 		t.Errorf("EffectiveHash not deterministic: %q and %q hash differently",
 			[]string{"a", "b"}, []string{"b", "a"})
+	}
+}
+
+// TestTranslateEgressProxyFQDNInAgentDNSAllowlist (I42d): when the effective
+// policy has network allows (so the egress proxy exists and the agent's
+// *_PROXY env points at it), the agent's DNS allowlist must include the
+// egress proxy Service FQDN — otherwise KubeArmor's matchDNSQueries allowlist
+// blocks the agent from resolving <loop>-egress-proxy.<ns>.svc and every
+// proxied request fails. With no network allows the egress proxy does not
+// exist and the FQDN must not appear in the allowlist.
+func TestTranslateEgressProxyFQDNInAgentDNSAllowlist(t *testing.T) {
+	agentAllows := func(ep EnginePolicy) map[string]int {
+		for _, c := range ep.Containers {
+			if c.Container == ContainerAgent {
+				m := map[string]int{}
+				for _, a := range c.Allows {
+					m[a.Match]++
+				}
+				return m
+			}
+		}
+		t.Fatalf("no agent container in %+v", ep)
+		return nil
+	}
+
+	// With network allows: the egress proxy FQDN is present (exactly once).
+	withAllows := Translate(EffectivePolicy{Network: []string{"proxy.golang.org:443"}}, "l1-proxy.ns.svc", "l1-egress-proxy.ns.svc")
+	if n := agentAllows(withAllows)["l1-egress-proxy.ns.svc"]; n != 1 {
+		t.Errorf("with network allows the egress proxy FQDN must appear exactly once in the agent allows, got %d (full: %+v)", n, withAllows.Containers)
+	}
+	// The model proxy FQDN is still present too (D33).
+	if n := agentAllows(withAllows)["l1-proxy.ns.svc"]; n != 1 {
+		t.Errorf("the model proxy FQDN must still appear once with network allows, got %d", n)
+	}
+
+	// No network allows: no egress proxy, so its FQDN must NOT be in the
+	// allowlist (an empty egressProxyFQDN arg is the caller's signal).
+	noAllows := Translate(EffectivePolicy{}, "l1-proxy.ns.svc", "")
+	if n := agentAllows(noAllows)["l1-egress-proxy.ns.svc"]; n != 0 {
+		t.Errorf("with no network allows the egress proxy FQDN must not appear in the agent allows, got %d", n)
 	}
 }

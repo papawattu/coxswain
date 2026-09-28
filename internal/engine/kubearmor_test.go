@@ -17,7 +17,7 @@ func epForTest() policy.EnginePolicy {
 		Exec:    []string{testExecGit, testExecGo},
 		Network: []string{"proxy.golang.org:443"},
 		Files:   []string{"/data"},
-	}, "l1-proxy.ns.svc")
+	}, "l1-proxy.ns.svc", "l1-egress-proxy.ns.svc")
 }
 
 // P1 #1: the emitted object must have the real KubeArmorPolicy shape
@@ -55,7 +55,7 @@ func TestEmitKubeArmorPolicyShape(t *testing.T) {
 func TestEmitKubeArmorPolicyExecPathIsAbsoluteNotSpoofable(t *testing.T) {
 	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
 		Exec: []string{"go"},
-	}, "l1-proxy.ns.svc"))
+	}, "l1-proxy.ns.svc", ""))
 	spec := obj.Object["spec"].(map[string]any)
 	proc, ok := spec["process"].(map[string]any)
 	if !ok {
@@ -83,7 +83,7 @@ func TestEmitKubeArmorPolicyExecPathIsAbsoluteNotSpoofable(t *testing.T) {
 func TestEmitKubeArmorPolicyTopLevelActionIsBlock(t *testing.T) {
 	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
 		Exec: []string{"go"},
-	}, "l1-proxy.ns.svc"))
+	}, "l1-proxy.ns.svc", ""))
 	spec := obj.Object["spec"].(map[string]any)
 	if spec["action"] != "Block" {
 		t.Fatalf("spec.action must be Block (default-deny), got %v (KubeArmor defaults to Audit without it)", spec["action"])
@@ -148,8 +148,8 @@ func TestEmitKubeArmorPolicyNetworkItemsAreObjectsWithPort(t *testing.T) {
 }
 
 func TestEmitKubeArmorPolicyUnionsContainers(t *testing.T) {
-	agent := policy.Translate(policy.EffectivePolicy{Exec: []string{"/usr/bin/git"}}, "loop-x-proxy.ns-x.svc")
-	proxy := policy.Translate(policy.EffectivePolicy{}, "")
+	agent := policy.Translate(policy.EffectivePolicy{Exec: []string{"/usr/bin/git"}}, "loop-x-proxy.ns-x.svc", "")
+	proxy := policy.Translate(policy.EffectivePolicy{}, "", "")
 	ep := policy.EnginePolicy{Containers: []policy.ContainerPolicy{agent.Containers[0], proxy.Containers[0]}}
 	obj := EmitKubeArmorPolicy("loop-x", "ns-x", ep)
 	spec := obj.Object["spec"].(map[string]any)
@@ -206,7 +206,7 @@ func TestNetworkLossy(t *testing.T) {
 // in the KubeArmorPolicy network block (D33: the agent needs both UDP and TCP
 // DNS to resolve the proxy Service FQDN).
 func TestEmitKubeArmorPolicyDNSAllowUDPAndTCP(t *testing.T) {
-	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{}, "l1-proxy.ns.svc"))
+	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{}, "l1-proxy.ns.svc", ""))
 	spec := obj.Object["spec"].(map[string]any)
 	net := spec["network"].(map[string]any)
 	protocols := net["matchProtocols"].([]any)

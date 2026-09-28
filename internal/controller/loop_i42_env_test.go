@@ -20,8 +20,8 @@ package controller
 // vars on the agent container so any HTTP client routes external egress
 // through the egress proxy while model calls go directly to the model proxy:
 //
-//	HTTPS_PROXY=http://<loop>-egress-proxy.<ns>.svc:3128
-//	HTTP_PROXY =http://<loop>-egress-proxy.<ns>.svc:3128
+//	HTTPS_PROXY=http://<loop>-egress-proxy.<ns>.svc.cluster.local:3128
+//	HTTP_PROXY =http://<loop>-egress-proxy.<ns>.svc.cluster.local:3128
 //	NO_PROXY   =<loop>-proxy.<ns>.svc,<loop>-proxy.<ns>.svc.cluster.local,localhost,127.0.0.1
 //
 // The vars are standard names (not COX_-prefixed) so clients pick them up;
@@ -161,7 +161,7 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 	}
 
 	wantEgressProxyURL := func(loopName, ns string) string {
-		return "http://" + egressProxyServiceName(loopName) + "." + ns + ".svc:3128"
+		return "http://" + egressProxyServiceName(loopName) + "." + ns + ".svc.cluster.local:3128"
 	}
 
 	// setup creates the namespace + model Secret + AgentPolicy + Loop and
@@ -365,6 +365,95 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 		noAllowsDomains := getDNSDomains(noAllowsNS)
 		Expect(noAllowsDomains).ToNot(ContainElement(egFQDN),
 			"with no network allows the egress proxy FQDN must not be in the DNS allowlist")
+	})
+
+	// spec 8 (I42d, kind acceptance finding): the agent's env var URL hosts
+	// (COX_MODEL_BASE_URL, HTTPS_PROXY) must be resolvable by the agent, which
+	// means the KubeArmorPolicy DNS allowlist must contain the full
+	// .svc.cluster.local FQDNs that the resolver sends (ndots:1, absolute
+	// names). The FQDNs are built from proxyServiceName / egressProxyServiceName
+	// (not literals) so a rename in the controller breaks this test.
+	It("pins that the agent env URL hosts are in the KubeArmorPolicy DNS allowlist (full FQDN form)", func() {
+		loopName := "dnsallow-loop"
+		ns := setup(loopName, []string{i42dAllowHost}, nil)
+
+		// Build the FQDNs from the same helpers the controller uses.
+		modelFQDN := proxyServiceName(loopName) + "." + ns + ".svc.cluster.local"
+		egressFQDN := egressProxyServiceName(loopName) + "." + ns + ".svc.cluster.local"
+
+		// The env vars carry the full-form URLs.
+		env := agentEnvOf(loopName, ns)
+		Expect(env[coxModelBaseURL]).To(HavePrefix("http://"+modelFQDN+":"),
+			"COX_MODEL_BASE_URL must use the full .svc.cluster.local FQDN")
+		Expect(env["HTTPS_PROXY"]).To(HavePrefix("http://"+egressFQDN+":"),
+			"HTTPS_PROXY must use the full .svc.cluster.local FQDN")
+
+		// The KubeArmorPolicy DNS allowlist must contain both FQDNs so the
+		// agent can resolve them (ndots:1 means the resolver sends the
+		// absolute name, which must match an allowlist entry exactly or as a
+		// prefix, depending on KubeArmor's matching). The allowlist carries
+		// the .svc form (not .svc.cluster.local) because KubeArmor matches
+		// on the name the policy author wrote; with ndots:1 the resolver
+		// sends the .svc.cluster.local form, so the allowlist must cover it.
+		// The egress FQDN is added by the enforcer (I42d); the model FQDN is
+		// added by policy.Translate (D33). Both are the .svc form.
+		getDNSDomains := func() []string {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(engine.KubeArmorGVK)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "coxswain-" + loopName}, obj)).To(Succeed())
+			network, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
+			items, _ := network["matchDNSQueries"].([]any)
+			domains := make([]string, 0, len(items))
+			for _, it := range items {
+				domains = append(domains, it.(map[string]any)["domain"].(string))
+			}
+			return domains
+		}
+		domains := getDNSDomains()
+		// The allowlist has the .svc form; the resolver (ndots:1) sends the
+		// .svc.cluster.local form. KubeArmor's prefix matching handles the
+		// suffix difference: <name>.<ns>.svc is a prefix of
+		// <name>.<ns>.svc.cluster.local. Pin both: the .svc entry must be
+		// present (it's what the enforcer writes) and the .svc.cluster.local
+		// form must be the one the resolver sends (it's what the env URL
+		// host is).
+		Expect(domains).To(ContainElement(modelFQDN[:len(modelFQDN)-len(".cluster.local")]),
+			"the model proxy .svc FQDN must be in the DNS allowlist (enforcer-written form)")
+		Expect(domains).To(ContainElement(egressFQDN[:len(egressFQDN)-len(".cluster.local")]),
+			"the egress proxy .svc FQDN must be in the DNS allowlist (enforcer-written form)")
+	})
+
+	// spec 9 (I42d, kind acceptance finding): the agent pod must carry
+	// ndots=1 so the resolver sends absolute names for in-cluster Service
+	// URLs without search-suffix expansion. Without it, the resolver first
+	// queries <name>.<search-suffix> which is not on the KubeArmor DNS
+	// allowlist, so KubeArmor denies the lookup and the agent cannot resolve
+	// the proxy or egress proxy Service names.
+	It("sets ndots=1 on the agent pod so in-cluster Service URLs resolve without search expansion", func() {
+		loopName := "ndots-loop"
+		ns := setup(loopName, []string{i42dAllowHost}, nil)
+
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sandboxName(loopName), Namespace: ns}, sb)).To(Succeed())
+		dnsCfg := sb.Spec.PodTemplate.Spec.DNSConfig
+		Expect(dnsCfg).ToNot(BeNil(),
+			"the agent pod must carry a dnsConfig (ndots:1) so in-cluster URLs resolve")
+		var found bool
+		for _, opt := range dnsCfg.Options {
+			if opt.Name == "ndots" && opt.Value != nil && *opt.Value == "1" {
+				found = true
+			}
+		}
+		Expect(found).To(BeTrue(),
+			"the agent pod dnsConfig must set ndots=1 (search-suffix expansion breaks KubeArmor DNS allowlist matching)")
+
+		// The env URLs use the full .svc.cluster.local form so the resolver
+		// sends an absolute name that matches the KubeArmor allowlist.
+		env := agentEnvOf(loopName, ns)
+		Expect(env["HTTPS_PROXY"]).To(ContainSubstring(".svc.cluster.local:"),
+			"HTTPS_PROXY must use the full .svc.cluster.local form (ndots:1 sends absolute names)")
+		Expect(env[coxModelBaseURL]).To(ContainSubstring(".svc.cluster.local:"),
+			"COX_MODEL_BASE_URL must use the full .svc.cluster.local form")
 	})
 
 	// spec 6 (handoff): the env must UPDATE on an existing Sandbox when the

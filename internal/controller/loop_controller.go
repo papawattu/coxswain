@@ -458,6 +458,17 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		noShare := false
 		desired.Spec.PodTemplate.Spec.ShareProcessNamespace = &noShare
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
+		// ndots:1 so the agent's resolver sends absolute names for the
+		// in-cluster Service URLs (COX_MODEL_BASE_URL, HTTPS_PROXY) without
+		// search-suffix expansion. KubeArmor's matchDNSQueries is an allowlist
+		// of the bare Service FQDNs; with ndots:5 (the k8s default) the
+		// resolver first queries <name>.<search-suffix> which is NOT on the
+		// allowlist, so KubeArmor denies the lookup (EPERM) and the agent
+		// cannot resolve the proxy or egress proxy Service names.
+		ndotsVal := "1"
+		desired.Spec.PodTemplate.Spec.DNSConfig = &corev1.PodDNSConfig{
+			Options: []corev1.PodDNSConfigOption{{Name: "ndots", Value: &ndotsVal}},
+		}
 		// I35: fsGroup so the /workspace + /scratch emptyDir volumes are owned by
 		// the agent's UID (writable). Set on the pod security context.
 		desired.Spec.PodTemplate.Spec.SecurityContext = &corev1.PodSecurityContext{
@@ -995,7 +1006,7 @@ func proxyServiceName(loopName string) string {
 // attributable to the Loop (D35).
 
 func proxyServiceURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc:%d", proxyServiceName(loopName), namespace, proxyPort)
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", proxyServiceName(loopName), namespace, proxyPort)
 }
 
 // egressProxyServiceURL is the in-cluster URL the agent's *_PROXY env vars
@@ -1004,7 +1015,7 @@ func proxyServiceURL(loopName, namespace string) string {
 // / Host layer (ADR-0007); the agent routes external egress through it and
 // model calls bypass it via NO_PROXY.
 func egressProxyServiceURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc:%d", egressProxyServiceName(loopName), namespace, egressProxyPort)
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", egressProxyServiceName(loopName), namespace, egressProxyPort)
 }
 
 // egressNOProxy is the agent's NO_PROXY value (I42d): the model proxy Service

@@ -156,7 +156,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		Expect(agentEnv).To(HaveKey(coxModelBaseURL),
 			"the agent must be pointed at the proxy Service via COX_MODEL_BASE_URL (D33)")
 		Expect(agentEnv[coxModelBaseURL].Value).To(Equal(proxyServiceURL(name, ns)),
-			"COX_MODEL_BASE_URL must be http://<loop>-proxy.<ns>.svc:8080")
+			"COX_MODEL_BASE_URL must be http://<loop>-proxy.<ns>.svc.cluster.local:8080")
 
 		By("creating the proxy Pod, owner-referenced to the Loop")
 		p := &corev1.Pod{}

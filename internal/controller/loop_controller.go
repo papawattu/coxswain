@@ -78,6 +78,8 @@ const (
 	agentWorkspaceMount = "/workspace"
 	agentScratchMount   = "/scratch"
 	agentTmpMount       = "/tmp"
+	// allCaps is the capability name for the Drop: ALL security context.
+	allCaps corev1.Capability = "ALL"
 )
 
 // LoopReconciler reconciles a Loop object.
@@ -107,6 +109,12 @@ type LoopReconciler struct {
 	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
 	// stand-in; overridable for the smoke test (e.g. the real proxy image).
 	ProxyImage string
+
+	// EgressProxyImage is the egress proxy sidecar image (I42b). Defaults to a
+	// Go dev stand-in; overridable for the smoke test (e.g. the real egress
+	// proxy image). When the effective policy has no network allows, the
+	// egress proxy pod is not created and this image is unused.
+	EgressProxyImage string
 
 	// PodCIDR / ServiceCIDR are the cluster's pod and service CIDRs (I42e +
 	// I42c NetworkPolicy carve-outs). Read from the operator's environment
@@ -288,23 +296,9 @@ func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alp
 	if len(loop.Spec.PolicyRefs) == 0 {
 		return "", false, nil
 	}
-	union := policy.EffectivePolicy{}
-	for _, name := range loop.Spec.PolicyRefs {
-		var ap coxv1alpha1.AgentPolicy
-		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
-			return "", false, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
-		}
-		// P1 (R15): the CEL XValidation can't reject non-canonical paths (CRD CEL
-		// cost budget), so the controller rejects them here before they reach the
-		// effective policy or the eBPF engine. A path with '..' or '//' or a
-		// trailing '/' is non-canonical and could resolve to a writable mount
-		// after normalization.
-		// Non-canonical exec paths are rejected by findNonCanonicalExecPath
-		// before ensureSandbox (R15 round 2: the check runs before the sandbox
-		// is created, and sets a condition rather than an error-requeue).
-		union.Exec = append(union.Exec, ap.Spec.Exec...)
-		union.Network = append(union.Network, ap.Spec.Network...)
-		union.Files = append(union.Files, ap.Spec.Files...)
+	union, err := r.effectivePolicy(ctx, loop)
+	if err != nil {
+		return "", false, err
 	}
 	return policy.EffectiveHash(union), true, nil
 }
@@ -421,6 +415,19 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 				}
 			}
+			// I42b: the egress proxy pod must be Ready and owned by the Loop when
+			// the effective policy has network allows. Same gate pattern as D35a.
+			// Fails closed: a transient error reading the AgentPolicies holds the
+			// sandbox Suspended (reconcile requeues), never skips the gate.
+			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
+				needsEgressProxy(ctx, r, loop) {
+				egressPod := &corev1.Pod{}
+				errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egressPod)
+				egressReady := errE == nil && metav1.IsControlledBy(egressPod, loop) && isPodReady(egressPod)
+				if !egressReady {
+					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+				}
+			}
 		}
 		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
 		// (KubeArmorPolicy selector) and the D33 agent component label
@@ -497,7 +504,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				RunAsUser:                &nonRootUID,
 				RunAsGroup:               &nonRootGID,
 				ReadOnlyRootFilesystem:   &readOnlyRootfs,
-				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			VolumeMounts: []corev1.VolumeMount{
@@ -869,7 +876,7 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 					RunAsUser:                &proxyUID,
 					RunAsGroup:               &proxyGID,
 					ReadOnlyRootFilesystem:   &readOnlyRootfs,
-					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
 				// (D33 acceptance) and forwards to MODEL_ENDPOINT. The Go stand-in
@@ -977,6 +984,326 @@ func (r *LoopReconciler) ensureProxyOrCleanup(ctx context.Context, loop *coxv1al
 		return r.ensureProxy(ctx, loop)
 	}
 	return r.cleanupProxy(ctx, loop)
+}
+
+// egressProxyPort is the port the egress proxy listens on (3128, the standard
+// HTTP CONNECT proxy port).
+const egressProxyPort int32 = 3128
+
+// egressProxyPodName returns the egress proxy pod name for a Loop.
+func egressProxyPodName(loopName string) string { return loopName + "-egress-proxy" }
+
+// egressProxyServiceName returns the egress proxy Service name for a Loop.
+func egressProxyServiceName(loopName string) string { return loopName + "-egress-proxy" }
+
+// egressProxyLabels returns the egress proxy pod + Service labels. These are
+// DISJOINT from the model proxy labels (D33) and from the agent pod labels
+// (C6b). The egress proxy must NOT carry coxswain.io/loop (the KubeArmorPolicy
+// selector) or app.kubernetes.io/component=agent (the agent NetworkPolicy
+// selector), or the agent's exec/network rules would bind to the egress proxy
+// pod. The egress proxy gets its own component label + egress-proxy-for label.
+func egressProxyLabels(loopName string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":       "coxswain-egress-proxy",
+		"app.kubernetes.io/instance":   loopName,
+		"app.kubernetes.io/component":  "egress-proxy",
+		"app.kubernetes.io/part-of":    "coxswain",
+		"coxswain.io/egress-proxy-for": loopName,
+	}
+}
+
+// needsEgressProxy reports whether the egress proxy is required for the gate:
+// either the effective policy has network allows, or the effective policy
+// could not be read. A read error fails CLOSED (P2 review: err == nil &&
+// hasAllows would skip the gate on a transient Get error — with the gate
+// skipped and ensureEgressProxy returning the same error, the sandbox could
+// be set Running on a later reconcile of the error window). The sandbox gate
+// uses this as "require the egress proxy to be Ready"; the error case keeps
+// the sandbox Suspended and the reconcile requeues on the error.
+func needsEgressProxy(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
+	_, hasAllows, err := r.effectivePolicyNetwork(ctx, loop)
+	return err != nil || hasAllows
+}
+
+// effectivePolicyNetwork returns the union of the network allows across the
+// Loop's referenced AgentPolicies (the egress proxy's allowlist, I42b). The
+// second return value (hasAllows) is false when there are no network allows
+// (the egress proxy is not needed). Errors are returned (never swallowed):
+// a missing or unreadable referenced policy makes the egress-proxy gate fail
+// closed (P3 review: a second copy of the union that swallowed Get errors
+// would create the egress proxy with a nil union if the ordering with
+// validateAgentPolicies ever changed).
+func (r *LoopReconciler) effectivePolicyNetwork(ctx context.Context, loop *coxv1alpha1.Loop) ([]string, bool, error) {
+	union, err := r.effectivePolicy(ctx, loop)
+	if err != nil {
+		return nil, false, err
+	}
+	return union.Network, len(union.Network) > 0, nil
+}
+
+// egressProxyImage returns the egress proxy pod image. It is the reconciler's
+// EgressProxyImage field (settable in tests; a manager flag --egress-proxy-image
+// is a candidate for a future slice), or the egress proxy stand-in when unset.
+func (r *LoopReconciler) egressProxyImage() string {
+	if r.EgressProxyImage != "" {
+		return r.EgressProxyImage
+	}
+	return "coxswain-egress-proxy:standin"
+}
+
+// buildEgressProxyPod builds the egress proxy pod spec (I42b). The pod carries
+// the effective policy's network allows as EGRESS_POLICY_JSON, the effective
+// policy hash as EGRESS_POLICY_HASH, and the operator's pod/service CIDRs as
+// POD_CIDR / SERVICE_CIDR. UID/GID 65534 (nobody); no SA token; no model
+// creds; no HTTPS_PROXY / HTTP_PROXY (I42d sets those on the agent container).
+func buildEgressProxyPod(loopName, ns, image string, networkAllows []string, policyHash string, podCIDR, serviceCIDR string) *corev1.Pod {
+	falseP := false
+	trueP := true
+	readOnlyRootfs := true
+	uid := int64(65534)
+	gid := int64(65534)
+
+	// Serialize the network allows as a JSON array for the egress proxy.
+	policyJSON, _ := json.Marshal(networkAllows)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      egressProxyPodName(loopName),
+			Namespace: ns,
+			Labels:    egressProxyLabels(loopName),
+		},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &falseP,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser:  &uid,
+				RunAsGroup: &gid,
+			},
+			Containers: []corev1.Container{{
+				Name:  "egress-proxy",
+				Image: image,
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:              resource.MustParse("100m"),
+						corev1.ResourceMemory:           resource.MustParse("128Mi"),
+						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						corev1.ResourceMemory: resource.MustParse("32Mi"),
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &falseP,
+					RunAsNonRoot:             &trueP,
+					RunAsUser:                &uid,
+					RunAsGroup:               &gid,
+					ReadOnlyRootFilesystem:   &readOnlyRootfs,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				},
+				Env: []corev1.EnvVar{
+					{Name: "EGRESS_POLICY_JSON", Value: string(policyJSON)},
+					{Name: "EGRESS_POLICY_HASH", Value: policyHash},
+					{Name: "LOOP_NAME", Value: loopName},
+					{Name: "LOOP_NAMESPACE", Value: ns},
+					{Name: "POD_CIDR", Value: podCIDR},
+					{Name: "SERVICE_CIDR", Value: serviceCIDR},
+				},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{
+						TCPSocket: &corev1.TCPSocketAction{
+							Port: intstr.FromInt32(egressProxyPort),
+						},
+					},
+					InitialDelaySeconds: 1,
+					PeriodSeconds:       5,
+				},
+				LivenessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{
+						TCPSocket: &corev1.TCPSocketAction{
+							Port: intstr.FromInt32(egressProxyPort),
+						},
+					},
+					InitialDelaySeconds: 3,
+					PeriodSeconds:       10,
+				},
+			},
+			}},
+	}
+	return pod
+}
+
+// egressProxyPodSpecHash computes a stable hash of the egress proxy pod's
+// desired spec (D33 pattern: hash the actual pod spec, store as annotation,
+// delete+recreate on mismatch).
+func egressProxyPodSpecHash(pod *corev1.Pod) string {
+	data, err := json.Marshal(pod.Spec)
+	if err != nil {
+		return "unhashable"
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+// ensureEgressProxy creates the egress proxy pod + Service when the effective
+// policy has network allows (I42b). No-op when there are no network allows.
+// The pod is gated on the D35a pattern: owned by the Loop + Ready.
+func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	// One read of the referenced AgentPolicies for the whole path (P3: no
+	// second union that swallows Get errors). Fails closed: a transient error
+	// propagates and the reconcile requeues; it must not be treated as
+	// "no allows".
+	networkAllows, hasAllows, err := r.effectivePolicyNetwork(ctx, loop)
+	if err != nil {
+		return fmt.Errorf("resolve egress proxy network allows for %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	if !hasAllows {
+		// No network allows: no egress proxy needed. Clean up if one exists.
+		// P3: clear a stale EgressProxyConflict here too — if a foreign pod once
+		// held the name and the allows are later removed, the D35b clear below
+		// is unreachable on this early return, so the condition would report a
+		// conflict that no longer applies.
+		if hadEgressConflict(loop) {
+			setCondition(loop, "EgressProxyConflict", metav1.ConditionFalse, "Resolved",
+				"the egress proxy is no longer required (no network allows)")
+		}
+		return r.cleanupEgressProxy(ctx, loop)
+	}
+
+	ns := loop.Namespace
+	loopName := loop.Name
+
+	// --- egress proxy Service ---
+	svcDesired := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      egressProxyServiceName(loopName),
+			Namespace: ns,
+		},
+	}
+	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
+		svcDesired.Labels = egressProxyLabels(loopName)
+		svcDesired.Spec.Ports = []corev1.ServicePort{{
+			Name:       "http",
+			Port:       egressProxyPort,
+			TargetPort: intstr.FromInt32(egressProxyPort),
+			Protocol:   corev1.ProtocolTCP,
+		}}
+		svcDesired.Spec.Selector = egressProxyLabels(loopName)
+		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("ensure egress proxy service %s/%s: %w", ns, egressProxyServiceName(loopName), err)
+	}
+	log.V(1).Info("ensured loop egress proxy service", "op", svcOp, "service", egressProxyServiceName(loopName))
+
+	// --- egress proxy pod (Get/create/delete, never Update a Pod spec) ---
+	// Compute the effective policy hash for the EGRESS_POLICY_HASH env var.
+	policyHash, _, hashErr := r.effectivePolicyHash(ctx, loop)
+	if hashErr != nil {
+		return fmt.Errorf("compute egress proxy policy hash for %s/%s: %w", ns, loopName, hashErr)
+	}
+	podDesired := buildEgressProxyPod(loopName, ns, r.egressProxyImage(), networkAllows, policyHash, r.PodCIDR, r.ServiceCIDR)
+	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
+		return fmt.Errorf("set owner ref on egress proxy pod %s/%s: %w", ns, egressProxyPodName(loopName), ownerErr)
+	}
+	egressSpecHash := egressProxyPodSpecHash(podDesired)
+	podDesired.Annotations = map[string]string{proxySpecHashAnnotation: egressSpecHash}
+
+	existingPod := &corev1.Pod{}
+	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: egressProxyPodName(loopName)}, existingPod)
+	// EgressProxyConflict (P2 review): a separate condition type from the model
+	// proxy's ProxyConflict (D35), so the two proxies never overwrite each
+	// other on a Loop that runs both. A foreign <loop>-egress-proxy must not be
+	// opened or deleted (I2).
+	if err == nil && !metav1.IsControlledBy(existingPod, loop) {
+		setCondition(loop, "EgressProxyConflict", metav1.ConditionTrue, "ForeignEgressProxy",
+			fmt.Sprintf("foreign egress proxy pod in %s/%s; sandbox held Suspended", ns, egressProxyPodName(loopName)))
+		log.Info("egress proxy pod is foreign; setting EgressProxyConflict",
+			"egressProxy", egressProxyPodName(loopName), "loop", loopName)
+		return nil
+	}
+	if apierrors.IsNotFound(err) {
+		if createErr := r.Create(ctx, podDesired); createErr != nil {
+			return fmt.Errorf("create egress proxy pod %s/%s: %w", ns, egressProxyPodName(loopName), createErr)
+		}
+		log.Info("ensured loop egress proxy (created)",
+			"egressProxy", egressProxyPodName(loopName), "namespace", ns, "loop", loopName)
+	} else if err != nil {
+		return fmt.Errorf("get egress proxy pod %s/%s: %w", ns, egressProxyPodName(loopName), err)
+	} else if existingPod.Annotations[proxySpecHashAnnotation] != egressSpecHash {
+		// Spec drift: delete and recreate (the Owns(Pod) watch triggers re-reconcile).
+		if !metav1.IsControlledBy(existingPod, loop) {
+			log.Info("egress proxy pod spec drift detected but pod is not controlled by this Loop; not deleting",
+				"egressProxy", egressProxyPodName(loopName), "loop", loopName)
+		} else {
+			log.Info("egress proxy pod spec drift detected, deleting for recreation",
+				"egressProxy", egressProxyPodName(loopName), "loop", loopName)
+			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("delete drifted egress proxy pod %s/%s: %w", ns, egressProxyPodName(loopName), delErr)
+			}
+		}
+		return nil
+	}
+
+	// D35b pattern: clear EgressProxyConflict when the controller's own egress
+	// proxy is in place (no foreign pod occupies the name). The PolicyRefs
+	// guard is unnecessary here: this path only runs with allows, which
+	// implies PolicyRefs is non-empty.
+	if hadEgressConflict(loop) {
+		setCondition(loop, "EgressProxyConflict", metav1.ConditionFalse, "Resolved",
+			"the foreign egress proxy pod is gone")
+	}
+
+	return nil
+}
+
+// hadEgressConflict reports whether the Loop has an active
+// EgressProxyConflict=True/ForeignEgressProxy condition.
+func hadEgressConflict(loop *coxv1alpha1.Loop) bool {
+	for _, c := range loop.Status.Conditions {
+		if c.Type == "EgressProxyConflict" && c.Status == metav1.ConditionTrue && c.Reason == "ForeignEgressProxy" {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanupEgressProxy deletes the egress proxy pod + Service when the effective
+// policy has no network allows (I42b). No-op when they don't exist.
+func (r *LoopReconciler) cleanupEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	ns := loop.Namespace
+	loopName := loop.Name
+
+	// Delete the pod if it exists and is owned by the Loop.
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: egressProxyPodName(loopName)}, pod); err == nil {
+		if metav1.IsControlledBy(pod, loop) {
+			if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("delete egress proxy pod %s/%s: %w", ns, egressProxyPodName(loopName), delErr)
+			}
+			log.Info("cleaned up egress proxy pod (no network allows)",
+				"egressProxy", egressProxyPodName(loopName), "loop", loopName)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get egress proxy pod %s/%s: %w", ns, egressProxyPodName(loopName), err)
+	}
+
+	// Delete the Service if it exists and is owned by the Loop.
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: egressProxyServiceName(loopName)}, svc); err == nil {
+		if metav1.IsControlledBy(svc, loop) {
+			if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("delete egress proxy service %s/%s: %w", ns, egressProxyServiceName(loopName), delErr)
+			}
+			log.Info("cleaned up egress proxy service (no network allows)",
+				"egressProxy", egressProxyServiceName(loopName), "loop", loopName)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get egress proxy service %s/%s: %w", ns, egressProxyServiceName(loopName), err)
+	}
+	return nil
 }
 
 func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
@@ -1292,6 +1619,10 @@ func (r *LoopReconciler) ensureProxyAndNetPolicies(ctx context.Context, loop *co
 	if err := r.ensureProxyOrCleanup(ctx, loop); err != nil {
 		return false, err
 	}
+	// I42b: the egress proxy pod + Service (gated on network allows).
+	if err := r.ensureEgressProxy(ctx, loop); err != nil {
+		return false, err
+	}
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		return false, err
 	}
@@ -1384,6 +1715,7 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		logf.Log.Info("POD_CIDR / SERVICE_CIDR unset: the IP-in-pod/service-CIDR in-cluster-allow check is disabled; an in-cluster allow given as a bare IP in that range is caught only by the egress proxy's resolved-IP backstop",
 			"podCIDR", r.PodCIDR, "serviceCIDR", r.ServiceCIDR)
 	}
+
 	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
 	// watch's map function uses this index to find the Loops that reference
 	// a given AgentPolicy, avoiding a namespace-wide list per event).

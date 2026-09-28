@@ -25,6 +25,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 )
 
 // Allow-type constants. The engine (C6b) maps these onto its own rule types.
@@ -172,4 +175,32 @@ func EffectiveHash(p EffectivePolicy) string {
 	}
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum)
+}
+
+// ComponentProxyLabel and ComponentEgressProxyLabel are the values of the
+// app.kubernetes.io/component label on the two operator-owned proxy pods
+// (the model proxy and the egress proxy). The operator's manager scopes its
+// Pod/Service cache to these label values (cmd/main.go) so it does not cache
+// every Pod and Service in the cluster. The cache MUST include every
+// component the operator Gets through that cache: a component label absent
+// here is a cache miss that turns into a spurious Create (AlreadyExists) on
+// the first reconcile of a resource owned by the operator (I42b kind
+// acceptance finding: the egress proxy was created outside the scoped cache,
+// so the operator's cached Get missed and CreateOrUpdate fell through to
+// Create every reconcile).
+const (
+	ComponentLabelKey         = "app.kubernetes.io/component"
+	ComponentProxyLabel       = "model-proxy"
+	ComponentEgressProxyLabel = "egress-proxy"
+)
+
+// ProxyComponentSelector is the label selector for the operator's Pod and
+// Service cache. It matches the model proxy and the egress proxy — the two
+// operator-owned per-Loop proxy components the operator Gets through the
+// cache. It must stay in sync with proxyLabels (internal/controller) and
+// egressProxyLabels (internal/controller); TestProxyComponentSelector pins
+// both.
+func ProxyComponentSelector() labels.Selector {
+	r, _ := labels.NewRequirement(ComponentLabelKey, selection.In, []string{ComponentProxyLabel, ComponentEgressProxyLabel})
+	return labels.NewSelector().Add(*r)
 }

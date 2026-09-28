@@ -26,7 +26,6 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -43,6 +42,7 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/controller"
 	"github.com/papawattu/coxswain/internal/engine"
+	"github.com/papawattu/coxswain/internal/policy"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -172,23 +172,19 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Cache: cache.Options{
-			// P2 (R15 review on PR #12): scope the Pod and Service cache to the
-			// proxy label so the operator doesn't cache every Pod and Service in
-			// the cluster. The proxy pod carries
-			// app.kubernetes.io/component=model-proxy; the Service carries the
-			// same label. D34's NetworkPolicy watches will need a similar
-			// scope (headdup from the R15 review).
+			// Scope the Pod and Service cache to the operator's two proxy
+			// components (the model proxy and the egress proxy) so the
+			// operator doesn't cache every Pod and Service in the cluster
+			// (P2, R15 review on PR #12; widened for the egress proxy in
+			// I42b). The selector is policy.ProxyComponentSelector
+			// (internal/policy) so it is tested against the label sets the
+			// operator owns — a component the operator Gets through this cache
+			// but that is missing here is a cache miss that turns into a
+			// spurious Create (AlreadyExists) on the first reconcile of that
+			// resource.
 			ByObject: map[client.Object]cache.ByObject{
-				&corev1.Pod{}: {
-					Label: labels.SelectorFromSet(labels.Set{
-						"app.kubernetes.io/component": "model-proxy",
-					}),
-				},
-				&corev1.Service{}: {
-					Label: labels.SelectorFromSet(labels.Set{
-						"app.kubernetes.io/component": "model-proxy",
-					}),
-				},
+				&corev1.Pod{}:     {Label: policy.ProxyComponentSelector()},
+				&corev1.Service{}: {Label: policy.ProxyComponentSelector()},
 			},
 		},
 		Metrics:                metricsServerOptions,

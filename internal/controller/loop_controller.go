@@ -43,8 +43,6 @@ const (
 	proxyContainerName = "proxy"
 	// modelCredsVolume is the name of the Secret volume that carries the model
 	// API key + base URL (mounted read-only into the proxy only)
-	// modelCredsVolume is the name of the Secret volume that carries the model
-	// API key + base URL (mounted read-only into the proxy only)
 	modelCredsVolume = "model-creds"
 	// PolicyTranslationLossyCondition is the Loop condition that reports
 	// a lossy translation (I41).
@@ -130,16 +128,17 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 	// I41: a host:PORT network allow that the engine can't express at that
 	// precision (the port is dropped) must set PolicyTranslationLossy=True.
-	// The condition becomes False/PortEnforcedByNetworkPolicy once D34's
-	// per-Loop NetworkPolicy carries the port for that allow.
+	// The NetworkPolicy does NOT carry AgentPolicy network allows (I42 is
+	// open), so the port precision is not enforced anywhere — the allow is
+	// hostname-only, any port, until I42 is resolved.
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
 		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
 			"KubeArmorDroppedPorts",
-			"these network allows lost their port in the KubeArmor translation: "+strings.Join(lossy, ", ")+
-				" (host:port precision is enforced by the per-Loop NetworkPolicy)")
+			"these network allows lost their port in the KubeArmor translation and are "+
+				"enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
 	} else {
 		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
-			"PortEnforcedByNetworkPolicy",
+			"NoPortLoss",
 			"no network allows lost their port in the translation")
 	}
 

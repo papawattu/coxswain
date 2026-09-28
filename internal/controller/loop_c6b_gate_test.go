@@ -282,7 +282,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		c := translationLossyCondition(loop.Status.Conditions)
 		Expect(c).NotTo(BeNil(), "the PolicyTranslationLossy condition must exist")
 		Expect(string(c.Status)).To(Equal("False"), "a bare host allow must set PolicyTranslationLossy=False")
-		Expect(c.Reason).To(Equal("PortEnforcedByNetworkPolicy"))
+		Expect(c.Reason).To(Equal("NoPortLoss"))
 	})
 
 })

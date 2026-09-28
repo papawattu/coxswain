@@ -522,6 +522,13 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 	// is Resolved, and the sandbox goes Running.
 	It("does not overwrite a foreign agent NetworkPolicy; holds the sandbox Suspended across reconciles; resolves on deletion", func() {
 		ns := "i42c-foreign-" + nowSuffix()
+		// The two repeated literals hoisted to locals (goconst: they appear 3x
+		// each in this spec, and a package-level constant would collide with
+		// the per-namespace scope — each spec uses its own ns).
+		const (
+			foreignNetpolName  = "foreign-agent-netpol"
+			foreignSandboxName = "foreign-sandbox"
+		)
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
@@ -541,7 +548,7 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 			},
 		}
 		foreignNP := &networkingv1.NetworkPolicy{
-			ObjectMeta: metav1.ObjectMeta{Name: "foreign-agent-netpol", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: foreignNetpolName, Namespace: ns},
 			Spec:       foreignSpec,
 		}
 		Expect(k8sClient.Create(ctx, foreignNP)).To(Succeed())
@@ -572,7 +579,7 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		reconcileI42C("foreign", ns)
 
 		sb := &sandboxv1beta1.Sandbox{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-sandbox"}, sb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreignSandboxName}, sb)).To(Succeed())
 		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
 			"the sandbox must be Suspended while a foreign netpol occupies the name, even with both proxy pods Ready")
 
@@ -581,14 +588,14 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		// ensureNetworkPolicy), so a second pass must NOT flip it back to
 		// Running. This is the flap the round-3 fix removed.
 		reconcileI42C("foreign", ns)
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-sandbox"}, sb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreignSandboxName}, sb)).To(Succeed())
 		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
 			"the sandbox must STAY Suspended on the second reconcile (no flap back to Running)")
 
 		// The foreign netpol is untouched (same spec, still unowned) after all
 		// three reconciles.
 		got := &networkingv1.NetworkPolicy{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-agent-netpol"}, got)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreignNetpolName}, got)).To(Succeed())
 		Expect(equality.Semantic.DeepEqual(got.Spec.PodSelector, foreignSpec.PodSelector)).To(BeTrue(), "the foreign netpol's podSelector must NOT be overwritten")
 		Expect(got.Spec.Egress).To(HaveLen(1))
 		Expect(got.Spec.Egress[0].To).To(HaveLen(1))
@@ -617,7 +624,7 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 
 		// Our agent netpol now exists with our controller ref.
 		ourNP := &networkingv1.NetworkPolicy{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-agent-netpol"}, ourNP)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreignNetpolName}, ourNP)).To(Succeed(),
 			"our agent netpol must be created after the foreign one is deleted")
 		resolvedLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign"}, resolvedLoop)).To(Succeed())
@@ -638,7 +645,7 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		Expect(resolvedConflict.Reason).To(Equal("Resolved"))
 
 		// The sandbox goes Running (both proxies Ready, no conflict).
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-sandbox"}, sb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreignSandboxName}, sb)).To(Succeed())
 		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
 			"the sandbox must go Running once the foreign netpol is deleted and the conflict is resolved")
 	})

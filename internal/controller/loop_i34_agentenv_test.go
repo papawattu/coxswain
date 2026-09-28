@@ -24,7 +24,7 @@ import (
 var _ = Describe("I34: spec.agent.env is literal-only, no COX_* names", func() {
 	ctx := context.Background()
 
-	agentGVK := schema.GroupVersionKind{Group: "coxswain.wattu.com", Version: "v1alpha1", Kind: "Loop"}
+	agentGVK := schema.GroupVersionKind{Group: "coxswain.wattu.com", Version: "v1alpha1", Kind: loopKind}
 
 	// baseLoop is a minimal unstructured Loop with an agent block.
 	baseLoop := func(name, ns string) *unstructured.Unstructured {

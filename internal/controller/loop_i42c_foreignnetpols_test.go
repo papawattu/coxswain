@@ -137,7 +137,7 @@ func TestForeignNetPolsOwnedIsNotConflict(t *testing.T) {
 	loop.UID = loopUID
 	ownedNP.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: "coxswain.wattu.com/v1alpha1",
-		Kind:       "Loop",
+		Kind:       loopKind,
 		Name:       loopName,
 		UID:        loopUID,
 		Controller: ptrToBool(),

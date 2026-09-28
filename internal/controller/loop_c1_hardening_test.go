@@ -52,6 +52,7 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 					Image:             runnerImage,
 					Model:             testModel,
 					EndpointSecretRef: "cox-model-creds",
+					ModelEndpoint:     d34ModelEndpoint,
 				},
 			},
 		}

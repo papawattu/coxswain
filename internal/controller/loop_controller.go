@@ -27,6 +27,7 @@ import (
 	neturl "net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -122,6 +123,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// configured (P1 parity: no half-configured proxy). Created after the
 	// sandbox so the agent's COX_MODEL_BASE_URL target exists in the same pass.
 	if loop.Spec.Agent.EndpointSecretRef != "" {
+		// R17 P1: endpointSecretRef and modelEndpoint must be set together.
+		// A Loop with a Secret but no endpoint would crash-loop the proxy
+		// (MODEL_ENDPOINT empty → log.Fatal). Reject at the controller level
+		// (the CEL Pattern validates the SHAPE of modelEndpoint, but cannot
+		// express a cross-field require-pair rule).
+		if loop.Spec.Agent.ModelEndpoint == "" {
+			setCondition(&loop, "PolicyValid", "False", "MissingModelEndpoint",
+				"endpointSecretRef is set but modelEndpoint is empty; both must be provided together")
+			if err := r.Status().Update(ctx, &loop); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 		if err := r.ensureProxy(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -549,6 +563,18 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
 	// none" — the agent pod must be unreachable from every other pod,
 	// including other Loops' agents), egress to this Loop's proxy + DNS.
+	//
+	// P2 (R17): the AgentPolicy `network` allows are NOT yet translated
+	// into egress rules. AgentPolicy (C6a, PR #7) is not merged on this
+	// branch, so `loop.Spec.PolicyRefs` and the AgentPolicy type are not
+	// available. When C6a merges, the operator must read each referenced
+	// AgentPolicy's `spec.network` and add port-only egress rules for
+	// each allow (NetworkPolicy cannot match hostnames — the host-level
+	// precision is D35's KubeArmor agent policy). Until then, an
+	// AgentPolicy network allow has no effect on the NetworkPolicy (the
+	// agent reaches only the proxy and DNS). This is fail-closed (the
+	// safe direction) but the feature is silently incomplete; the gap is
+	// recorded in ADR-0007.
 	agentNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-agent-netpol",

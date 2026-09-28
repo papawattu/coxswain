@@ -179,6 +179,14 @@ run: manifests generate fmt vet ## Run a controller from your host.
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t ${IMG} .
 
+# Build the D33/D34 proxy stand-in image. Used by the kind e2e and by
+# make kind-up / deploy-dev. The image is loaded into the kind cluster
+# via `kind load docker-image coxswain-proxy:standin`.
+PROXY_IMG ?= coxswain-proxy:standin
+.PHONY: proxy-build
+proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
+	$(CONTAINER_TOOL) build -t $(PROXY_IMG) cmd/proxy-standin/
+
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}

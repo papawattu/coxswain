@@ -133,10 +133,14 @@ spec:
                       proxy NetworkPolicy, and the D33 spec-hash contract keeps things
                       simple by not allowing post-creation changes.
                     maxLength: 253
+                    pattern: ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$
                     type: string
                     x-kubernetes-validations:
                     - message: modelEndpoint is immutable
-                      rule: self == oldSelf
+                      rule: self == oldSelf || self == ''
+                    - message: modelEndpoint port must be 1-65535
+                      rule: self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1])
+                        <= 65535
                 type: object
               goal:
                 description: goal is the natural-language objective for this Loop.

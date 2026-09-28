@@ -199,8 +199,10 @@ type AgentConfig struct {
 	// simple by not allowing post-creation changes.
 	//
 	// +optional
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="modelEndpoint is immutable"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf || self == ''",message="modelEndpoint is immutable"
 	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$"
+	// +kubebuilder:validation:XValidation:rule="self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1]) <= 65535",message="modelEndpoint port must be 1-65535"
 	ModelEndpoint string `json:"modelEndpoint,omitempty"`
 
 	// env carries literal-only environment variables for the agent container

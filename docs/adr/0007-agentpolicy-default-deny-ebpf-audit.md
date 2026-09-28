@@ -249,3 +249,16 @@ by DNS name. For the proxy's model egress rule (D34), this means:
 This is recorded here so that the D34 NetworkPolicy's coarser-grained
 model-egress peer is understood as the outer fence (port-level), with the
 D35 KubeArmor policy providing the inner fence (hostname-level).
+
+**AgentPolicy network allows (D34, R17 P2):** the agent's `AgentPolicy`
+`spec.network` allows (e.g. `proxy.golang.org:443`) are NOT yet translated
+into the agent NetworkPolicy's egress rules. AgentPolicy (C6a, PR #7) is not
+merged on the D34 branch, so `spec.policyRefs` and the AgentPolicy type are
+unavailable. When C6a merges, the operator must read each referenced
+AgentPolicy's `spec.network` and add **port-only** egress rules (NetworkPolicy
+cannot match hostnames). The hostname-level precision is the D35 KubeArmor
+agent policy (`matchDNSQueries`). Until then, an AgentPolicy network allow
+has no effect on the NetworkPolicy — the agent reaches only the proxy and
+DNS. This is fail-closed (the safe direction) but the feature is silently
+incomplete; the user gets no signal. The gap is tracked here and must be
+closed when C6a + D35 merge.

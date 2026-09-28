@@ -7,6 +7,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -23,9 +24,10 @@ func intstrPtr(v int32) *intstr.IntOrString {
 }
 
 const (
-	d34TestRepo     = "https://github.com/papawattu/coxswain.git"
-	d34TestKey      = "key"
-	d34TestEndpoint = "http://model-endpoint:8000"
+	d34TestRepo      = "https://github.com/papawattu/coxswain.git"
+	d34TestKey       = "key"
+	d34TestEndpoint  = "http://model-endpoint:8000"
+	d34ModelEndpoint = "fake-model:8000"
 )
 
 var _ = Describe("D34: per-Loop NetworkPolicy", func() {
@@ -241,4 +243,136 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			"app.kubernetes.io/component", "agent",
 		))
 	})
+
+	// P2 (R17): modelEndpoint CEL validation — accept host:port, reject
+	// scheme and bad port.
+	It("modelEndpoint: accepts valid host:port, rejects scheme and bad port (R17 P2)", func() {
+		// Accept: vllm:8000
+		ns := "d34-endpoint-valid"
+		_ = k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		loop := &cxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "ep-valid", Namespace: ns},
+			Spec: cxv1alpha1.LoopSpec{
+				Goal: loopGoal,
+				Workspace: cxv1alpha1.Workspace{
+					Repo: d34TestRepo,
+					Ref:  loopRef,
+				},
+				Agent: cxv1alpha1.AgentConfig{
+					Image:         runnerImage,
+					Model:         testModel,
+					ModelEndpoint: "vllm:8000",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Reject: http://x:1 (scheme not allowed)
+		loop2 := &cxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "ep-scheme", Namespace: ns},
+			Spec: cxv1alpha1.LoopSpec{
+				Goal: loopGoal,
+				Workspace: cxv1alpha1.Workspace{
+					Repo: d34TestRepo,
+					Ref:  loopRef,
+				},
+				Agent: cxv1alpha1.AgentConfig{
+					Image:         runnerImage,
+					Model:         testModel,
+					ModelEndpoint: "http://x:1",
+				},
+			},
+		}
+		err := k8sClient.Create(ctx, loop2)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Or(ContainSubstring("pattern"), ContainSubstring("Invalid value")))
+
+		// Reject: x (no port)
+		loop3 := &cxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "ep-nopart", Namespace: ns},
+			Spec: cxv1alpha1.LoopSpec{
+				Goal: loopGoal,
+				Workspace: cxv1alpha1.Workspace{
+					Repo: d34TestRepo,
+					Ref:  loopRef,
+				},
+				Agent: cxv1alpha1.AgentConfig{
+					Image:         runnerImage,
+					Model:         testModel,
+					ModelEndpoint: "x",
+				},
+			},
+		}
+		err = k8sClient.Create(ctx, loop3)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Or(ContainSubstring("pattern"), ContainSubstring("Invalid value")))
+
+		// Reject: x:99999 (port > 65535)
+		loop4 := &cxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "ep-badport", Namespace: ns},
+			Spec: cxv1alpha1.LoopSpec{
+				Goal: loopGoal,
+				Workspace: cxv1alpha1.Workspace{
+					Repo: d34TestRepo,
+					Ref:  loopRef,
+				},
+				Agent: cxv1alpha1.AgentConfig{
+					Image:         runnerImage,
+					Model:         testModel,
+					ModelEndpoint: "x:99999",
+				},
+			},
+		}
+		err = k8sClient.Create(ctx, loop4)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Or(ContainSubstring("pattern"), ContainSubstring("Invalid value")))
+	})
+
+	// P1 (R17): endpointSecretRef without modelEndpoint — the controller
+	// must NOT create the proxy (require-pair).
+	It("endpointSecretRef without modelEndpoint: no proxy, PolicyValid=False (R17 P1)", func() {
+		ns := "d34-noreq"
+		_ = k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		_ = k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: ns},
+		})
+		loop := &cxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "noreq", Namespace: ns},
+			Spec: cxv1alpha1.LoopSpec{
+				Goal: loopGoal,
+				Workspace: cxv1alpha1.Workspace{
+					Repo: d34TestRepo,
+					Ref:  loopRef,
+				},
+				Agent: cxv1alpha1.AgentConfig{
+					Image:             runnerImage,
+					Model:             testModel,
+					EndpointSecretRef: "creds",
+					// ModelEndpoint intentionally empty
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcileLoop("noreq", ns)
+
+		// No proxy pod should exist.
+		proxy := &corev1.Pod{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: "noreq-proxy", Namespace: ns}, proxy)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		// PolicyValid condition should be False with MissingModelEndpoint.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "noreq", Namespace: ns}, loop)).To(Succeed())
+		var pv *metav1.Condition
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == "PolicyValid" {
+				pv = &loop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(pv).ToNot(BeNil())
+		Expect(pv.Status).To(Equal(metav1.ConditionFalse))
+		Expect(pv.Reason).To(Equal("MissingModelEndpoint"))
+	})
+
 })

@@ -59,9 +59,18 @@ spec:
                   endpointSecretRef:
                     description: |-
                       endpointSecretRef is the name of a Secret in the Loop's namespace holding
-                      the model base URL + API key. It is mounted only into the proxy sidecar,
-                      never the agent container.
+                      the model base URL + API key. It is mounted only into the proxy pod
+                      (D33), never the agent container.
+
+                      Immutable (P2, R15 review on PR #12): the proxy is a bare Pod and
+                      spec.volumes is immutable, so changing this field after creation would
+                      make CreateOrUpdate's Update fail. The operator rejects the change at
+                      admission; a new secret requires a new Loop.
                     type: string
+                    x-kubernetes-validations:
+                    - message: endpointSecretRef is immutable (the proxy pod's spec.volumes
+                        cannot change)
+                      rule: self == oldSelf
                   env:
                     description: |-
                       env carries literal-only environment variables for the agent container

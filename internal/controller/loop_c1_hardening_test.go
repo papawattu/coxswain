@@ -49,8 +49,8 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 				Goal:      loopGoal,
 				Workspace: testWorkspace(),
 				Agent: coxv1alpha1.AgentConfig{
-					Image:             "example.com/coxswain/runner:v1",
-					Model:             "local-model",
+					Image:             runnerImage,
+					Model:             testModel,
 					EndpointSecretRef: "cox-model-creds",
 				},
 			},
@@ -193,7 +193,7 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		sb := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
 
 		agent := agentContainer(sb)
-		Expect(agent.Image).To(Equal("example.com/coxswain/runner:v1"),
+		Expect(agent.Image).To(Equal(runnerImage),
 			"the agent container must use spec.agent.image when set")
 	})
 })

@@ -18,7 +18,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
 	"time"
@@ -32,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,7 +51,6 @@ import (
 // key (mounted only into the proxy) and injects auth.
 const (
 	// proxyContainerName is the name of the model proxy sidecar container.
-	proxyContainerName = "proxy"
 	// modelCredsVolume is the name of the Secret volume that carries the model
 	// API key + base URL (mounted read-only into the proxy only).
 	modelCredsVolume = "model-creds"
@@ -56,7 +60,6 @@ const (
 	coxModelBaseURL = "COX_MODEL_BASE_URL"
 	// localhostProxyBaseURL is where the proxy listens on the sandbox pod's
 	// loopback interface. The agent reaches it over localhost, not the network.
-	localhostProxyBaseURL = "http://localhost:8080"
 	// readOnlyMode is the default file mode for the model-creds Secret volume
 	// (0444: the key is read-only, even in the proxy).
 	readOnlyMode int32 = 0o444
@@ -107,6 +110,9 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
+// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -191,6 +197,12 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// D33: the per-Loop proxy pod + Service exist only when a model endpoint is
+	// configured (P1 parity: no half-configured proxy).
+	if err := r.ensureProxyOrCleanup(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -387,14 +399,9 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		nonRootUID := int64(65532)
 		nonRootGID := int64(65532)
 		nonRootFSGroup := int64(65532)
-		// C2 (P2): the proxy runs as its OWN non-root UID, distinct from the agent,
-		// so a future shared PID namespace or shared volume cannot expose the model
-		// key to the untrusted agent.
-		proxyUID := int64(65533)
-		proxyGID := int64(65533)
-		// C2 (P1): the proxy + model access exist only when a model endpoint is
+		// D33 (P1): the proxy + model access exist only when a model endpoint is
 		// configured. With no endpointSecretRef the agent runs with no model — no
-		// proxy container, no key, no COX_MODEL_BASE_URL (never a half-configured
+		// proxy pod, no key, no COX_MODEL_BASE_URL (never a half-configured
 		// proxy that would make the pod InvalidConfiguration on an empty secret).
 		hasModel := loop.Spec.Agent.EndpointSecretRef != ""
 		falseP := false
@@ -418,15 +425,15 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 			}
 		}
-		// C6b (P1 #2): the sandbox pod carries the coxswain.io/loop label the
-		// KubeArmorPolicy selector targets.
-		desired.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{"coxswain.io/loop": loop.Name}
+		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
+		// (KubeArmorPolicy selector) and the D33 agent component label
+		// (NetworkPolicy podSelector). MERGE into the map (maps.Copy) so both
+		// compose — an assignment would clobber whichever was set first.
+		if desired.Spec.PodTemplate.ObjectMeta.Labels == nil {
+			desired.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{}
+		}
+		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, map[string]string{"coxswain.io/loop": loop.Name})
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
-		// C2 (P2): never share the process namespace. The proxy and agent run as
-		// different UIDs, but a shared PID namespace would let the (untrusted) agent
-		// read /proc/<proxy-pid>/environ and leak the model key. Explicitly false.
-		noShare := false
-		desired.Spec.PodTemplate.Spec.ShareProcessNamespace = &noShare
 		// I35: fsGroup so the /workspace + /scratch emptyDir volumes are owned by
 		// the agent's UID (writable). Set on the pod security context.
 		desired.Spec.PodTemplate.Spec.SecurityContext = &corev1.PodSecurityContext{
@@ -453,7 +460,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// rejected at admission, I34) so the agent cannot be pointed past the proxy.
 		// Only set when a model endpoint exists (P1: no half-configured proxy).
 		if hasModel {
-			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: localhostProxyBaseURL})
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: proxyServiceURL(loop.Name, loop.Namespace)})
 		}
 		for _, e := range loop.Spec.Agent.Env {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
@@ -499,49 +506,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				{Name: "tmp", MountPath: agentTmpMount},
 			},
 		}
-		podContainers := []corev1.Container{agentContainer}
-		if hasModel {
-			// C2 (ADR-0006 item 2): the model proxy sidecar. It holds the model key
-			// (mounted ONLY here, from the model-creds Secret, as a read-only FILE —
-			// not env, P2), injects the auth header, forwards only to the configured
-			// endpoint, and meters tokens (the Phase 2 metering sidecar, built now as
-			// the credential boundary). The agent reaches it on localhost:8080 and
-			// holds no key. Runs as its OWN UID (P2). sleep infinity is a stand-in
-			// until the proxy binary exists (C2b).
-			podContainers = append(podContainers, corev1.Container{
-				Name:    proxyContainerName,
-				Image:   r.proxyImage(),
-				Command: []string{"sh", "-c", "sleep infinity"},
-				// P2: the key is delivered ONLY as the /model-creds file mount below,
-				// never via env (env leaks to child processes, crash dumps, and
-				// /proc/<pid>/environ).
-				Resources: corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse("100m"),
-						corev1.ResourceMemory:           resource.MustParse("128Mi"),
-						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
-					},
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("10m"),
-						corev1.ResourceMemory: resource.MustParse("32Mi"),
-					},
-				},
-				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: &falseP,
-					RunAsNonRoot:             &trueP,
-					RunAsUser:                &proxyUID,
-					RunAsGroup:               &proxyGID,
-					ReadOnlyRootFilesystem:   &readOnlyRootfs,
-					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-				},
-				VolumeMounts: []corev1.VolumeMount{
-					// The model key lives ONLY here (the proxy), never the agent (C2).
-					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
-				},
-			})
-		}
-		desired.Spec.PodTemplate.Spec.Containers = podContainers
+		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{agentContainer}
 		// P3 (R13, I36): the writable emptyDirs carry explicit sizeLimits that sum
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
 		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
@@ -564,22 +529,8 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				SizeLimit: newLimit("100Mi"),
 			}}},
 		}
-		// C2 (ADR-0006 item 2): the model-creds Secret volume, mounted (read-only)
-		// only into the proxy container above. It carries the model API key +
-		// base URL; the agent never sees it.
-		if loop.Spec.Agent.EndpointSecretRef != "" {
-			secretMode := readOnlyMode
-			desired.Spec.PodTemplate.Spec.Volumes = append(desired.Spec.PodTemplate.Spec.Volumes,
-				corev1.Volume{
-					Name: modelCredsVolume,
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{
-							SecretName:  loop.Spec.Agent.EndpointSecretRef,
-							DefaultMode: &secretMode,
-						},
-					},
-				})
-		}
+		// D33: the model-creds Secret is mounted into the per-Loop proxy pod
+		// (ensureProxy), NOT the sandbox pod. The agent holds no key (C2).
 		// Set the controller owner ref here, on the (possibly server-populated)
 		// object. Returns AlreadyOwnedError if a different controller already
 		// owns it (I2: never take over a foreign sandbox).
@@ -719,6 +670,290 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 	return TamperTampered
 }
 
+func (r *LoopReconciler) cleanupProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	// Delete the proxy pod (only if we control it, I2: never take over a
+	// foreign object).
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)
+	if err == nil {
+		if !metav1.IsControlledBy(pod, loop) {
+			log.Info("proxy pod exists but is not controlled by this Loop; not deleting",
+				"proxy", proxyPodName(loop.Name), "loop", loop.Name)
+		} else if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), delErr)
+		} else {
+			log.Info("deleted proxy pod (endpointSecretRef absent)", "proxy", proxyPodName(loop.Name), "loop", loop.Name)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
+	}
+	// Delete the proxy Service (only if we control it).
+	svc := &corev1.Service{}
+	err = r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyServiceName(loop.Name)}, svc)
+	if err == nil {
+		if !metav1.IsControlledBy(svc, loop) {
+			log.Info("proxy Service exists but is not controlled by this Loop; not deleting",
+				"proxy", proxyServiceName(loop.Name), "loop", loop.Name)
+		} else if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), delErr)
+		} else {
+			log.Info("deleted proxy Service (endpointSecretRef absent)", "proxy", proxyServiceName(loop.Name), "loop", loop.Name)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), err)
+	}
+	return nil
+}
+
+// sandboxName returns the Loop's Sandbox name (<loop>-sandbox). The name is
+// CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
+// is always a valid DNS-1035 label <= 63 chars and needs no truncation.
+
+func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	ns := loop.Namespace
+	loopName := loop.Name
+
+	// --- proxy Service ---
+	svcDesired := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxyServiceName(loopName),
+			Namespace: ns,
+		},
+	}
+	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
+		svcDesired.Labels = proxyLabels(loopName)
+		svcDesired.Spec.Ports = []corev1.ServicePort{{
+			Name:       "http",
+			Port:       proxyPort,
+			TargetPort: intstr.FromInt32(proxyPort),
+			Protocol:   corev1.ProtocolTCP,
+		}}
+		svcDesired.Spec.Selector = proxyLabels(loopName)
+		// ClusterIP (the default): no external exposure; only in-cluster callers
+		// (the agent, via COX_MODEL_BASE_URL) reach it. D34's NetworkPolicy then
+		// restricts who may call it.
+		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("ensure proxy service %s/%s: %w", ns, proxyServiceName(loopName), err)
+	}
+
+	// --- proxy pod (R15 fix: Get/create/delete, never Update a Pod spec) ---
+	// Build the desired pod spec first, then hash it. The hash covers the
+	// actual spec (image, command, limits, volumes), so any operator upgrade
+	// that changes the spec produces a different hash.
+	podDesired := buildProxyPod(loop, loopName, ns, r.proxyImage())
+	// Set the Loop as the controller owner (D33: GC with the Loop).
+	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
+		return fmt.Errorf("set owner ref on proxy pod %s/%s: %w", ns, proxyPodName(loopName), ownerErr)
+	}
+	proxySpecHash := proxyPodSpecHash(podDesired)
+	podDesired.Annotations = map[string]string{proxySpecHashAnnotation: proxySpecHash}
+
+	existingPod := &corev1.Pod{}
+	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: proxyPodName(loopName)}, existingPod)
+	if apierrors.IsNotFound(err) {
+		// Pod doesn't exist: create it.
+		if createErr := r.Create(ctx, podDesired); createErr != nil {
+			return fmt.Errorf("create proxy pod %s/%s: %w", ns, proxyPodName(loopName), createErr)
+		}
+		log.Info("ensured loop proxy (created)",
+			"proxy", proxyPodName(loopName), "namespace", ns, "loop", loopName)
+	} else if err != nil {
+		return fmt.Errorf("get proxy pod %s/%s: %w", ns, proxyPodName(loopName), err)
+	} else if existingPod.Annotations[proxySpecHashAnnotation] != proxySpecHash {
+		// Pod exists but the spec hash doesn't match: delete and requeue.
+		// A bare Pod's spec is immutable, so we can't Update it. Deleting
+		// triggers the Owns(Pod) watch, which re-reconciles and creates the
+		// new pod. Only delete if we control it (I2: never take over a
+		// foreign object).
+		if !metav1.IsControlledBy(existingPod, loop) {
+			log.Info("proxy pod spec drift detected but pod is not controlled by this Loop; not deleting",
+				"proxy", proxyPodName(loopName), "loop", loopName)
+		} else {
+			log.Info("proxy pod spec drift detected, deleting for recreation",
+				"proxy", proxyPodName(loopName), "loop", loopName)
+			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
+			}
+		}
+		// Requeue so the next pass creates the new pod (the delete is
+		// asynchronous; the pod may not be gone yet).
+		return nil // the Owns(Pod) watch will trigger a re-reconcile
+	}
+	// Pod exists and hash matches: nothing to do.
+	podOp := controllerutil.OperationResultNone
+
+	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
+		log.V(1).Info("ensured loop proxy (no change)",
+			"proxy", proxyPodName(loopName),
+			"namespace", ns,
+			"loop", loopName,
+		)
+	}
+	return nil
+}
+
+// newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit
+// fields (I36 P3, R13). It is a two-statement wrapper so golangci-lint's
+// modernize newexpr checker (which flags one-line pointer wrappers) does not
+// flag it, while still giving a named, self-documenting helper.
+
+func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.Pod {
+	secretMode := readOnlyMode
+	falseP := false
+	trueP := true
+	readOnlyRootfs := true
+	proxyUID := int64(65533)
+	proxyGID := int64(65533)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxyPodName(loopName),
+			Namespace: ns,
+			Labels:    proxyLabels(loopName),
+		},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &falseP,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser:  &proxyUID,
+				RunAsGroup: &proxyGID,
+			},
+			Containers: []corev1.Container{{
+				Name:  "proxy",
+				Image: image,
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:              resource.MustParse("100m"),
+						corev1.ResourceMemory:           resource.MustParse("128Mi"),
+						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						corev1.ResourceMemory: resource.MustParse("32Mi"),
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &falseP,
+					RunAsNonRoot:             &trueP,
+					RunAsUser:                &proxyUID,
+					RunAsGroup:               &proxyGID,
+					ReadOnlyRootFilesystem:   &readOnlyRootfs,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				},
+				// D33 kind-run acceptance: the stand-in must prove at runtime
+				// that it CAN read the 0444 model-creds Secret file.
+				Command: []string{
+					"sh", "-c",
+					"echo 'proxy-stand-in: checking model-creds'; " +
+						"if head -c 64 /model-creds/* >/dev/null 2>&1; then " +
+						"echo 'proxy: model-creds readable (0444 secret file present)'; " +
+						"else " +
+						"echo 'proxy: model-creds NOT readable' && exit 1; " +
+						"fi; " +
+						"exec sleep infinity",
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
+				},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: modelCredsVolume,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName:  loop.Spec.Agent.EndpointSecretRef,
+						DefaultMode: &secretMode,
+					},
+				},
+			}},
+		},
+	}
+	return pod
+}
+
+// proxyPodSpecHash computes a stable hash of the proxy pod's desired spec
+// (R15 fix: hash the actual pod spec, not a literal string). The hash is
+// stored on the pod as the proxySpecHashAnnotation; on a mismatch the operator
+// deletes and recreates the pod (spec.volumes is immutable on a bare Pod).
+
+func proxyPodSpecHash(pod *corev1.Pod) string {
+	// Hash the spec only (not the metadata, which includes the annotation we're
+	// computing — that would be a circular dependency).
+	data, err := json.Marshal(pod.Spec)
+	if err != nil {
+		// The spec is a Go struct of known types; marshaling should never fail.
+		// If it does, return a fixed hash so the pod is never deleted.
+		return "unhashable"
+	}
+	h := sha256.New()
+	h.Write(data)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func proxyLabels(loopName string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/component": "model-proxy",
+		"coxswain.io/proxy-for":       loopName,
+	}
+}
+
+// proxyImage returns the model proxy pod image. It is the reconciler's
+// ProxyImage field (settable in tests and future slices; a manager flag
+// --proxy-image is a candidate for a future C2b), or a working stand-in
+// (golang:1.26) when unset. The stand-in has POSIX sh, head, and sleep —
+// enough for the D33 kind-run acceptance (the model-creds read + sleep
+// infinity).
+
+func proxyPodName(loopName string) string {
+	return loopName + proxyPodNameSuffix
+}
+
+func proxyServiceName(loopName string) string {
+	return fmt.Sprintf(proxyServiceNameFmt, loopName)
+}
+
+// proxyServiceURL is the in-cluster Service URL the agent's COX_MODEL_BASE_URL
+// points at (D33): http://<loop>-proxy.<namespace>.svc:8080. The per-Loop
+// Service identity is also what makes the proxy's activity-audit records
+// attributable to the Loop (D35).
+
+func proxyServiceURL(loopName, namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc:%d", proxyServiceName(loopName), namespace, proxyPort)
+}
+
+// proxyLabels is the label set the per-Loop proxy pod carries and the proxy
+// Service selects on (D33). The Service selects ONLY these labels, so no other
+// pod in the namespace can be reached through <loop>-proxy (D29: this Loop's
+// key is only usable by this Loop's agent; D34's NetworkPolicy enforces the
+// rest).
+
+const (
+	// proxyPodNameSuffix / proxyServiceNameFmt are the per-Loop proxy pod and
+	// Service names: <loop>-proxy (one each, owner-referenced to the Loop so
+	// both are GC'd with it).
+	proxyPodNameSuffix  = "-proxy"
+	proxyServiceNameFmt = "%s-proxy"
+	// proxySpecHashAnnotation records the hash of the desired proxy pod spec
+	// on the pod itself (P2, R15: operator upgrades change the spec; a bare
+	// Pod's spec is immutable, so the operator deletes and recreates the pod
+	// when the hash mismatches).
+	proxySpecHashAnnotation       = "coxswain.io/proxy-spec-hash"
+	proxyPort               int32 = 8080
+)
+
+// ensureProxyOrCleanup (D33) creates the per-Loop proxy pod + Service when a
+// model endpoint is configured, and deletes them when it is not.
+func (r *LoopReconciler) ensureProxyOrCleanup(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		return r.ensureProxy(ctx, loop)
+	}
+	return r.cleanupProxy(ctx, loop)
+}
+
 // setCondition upserts a condition on the Loop's status. The condition's Type
 // is a string (a terminal phase like "Failed", or a non-phase condition type
 // like "PolicyEnforced" or "PolicyValid"). It is the operator's audit record
@@ -790,6 +1025,9 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&coxv1alpha1.Loop{}).
 		Owns(&sandboxv1beta1.Sandbox{}).
+		// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
+		Owns(&corev1.Pod{}).
+		Owns(&corev1.Service{}).
 		// Watch AgentPolicy: when a referenced policy is created, edited, or
 		// deleted, re-reconcile the Loops that reference it (R15 round 4 P2:
 		// a policy created after its Loop must not leave the Loop stuck at

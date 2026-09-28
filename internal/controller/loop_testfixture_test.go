@@ -60,6 +60,7 @@ const (
 	runnerImage    = "docker.io/library/golang:1.26"
 	testModel      = "local-model"
 	loopCheckCmd   = "go test ./..."
+	sleepInfinity  = "sleep infinity"
 
 	// agentContainerName is the name of the Loop's agent container in the
 	// Sandbox pod spec (goconst: it appears in several test files).

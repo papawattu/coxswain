@@ -39,8 +39,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/engine"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -69,9 +71,13 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
+		// The real KubeArmor enforcer: spec 7 asserts the agent
+		// KubeArmorPolicy's DNS allowlist, which the fakeEnforcer-based
+		// specs in this suite never exercise.
 		r = &LoopReconciler{
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
+			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient},
 			PodCIDR:          i42bPodCIDR,
 			ServiceCIDR:      i42bServiceCIDR,
 			EgressProxyImage: i42bEgressProxyImg,
@@ -299,6 +305,66 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 			"a user all_proxy must be dropped (the operator reserves it)")
 		Expect(env).To(HaveKeyWithValue("KEEP_ME", "survives"),
 			"non-colliding user env vars must be preserved")
+	})
+
+	// spec 7 (I42d, kind acceptance finding): the agent's KubeArmorPolicy
+	// matchDNSQueries must contain <loop>-egress-proxy.<ns>.svc IFF the effective
+	// policy has network allows. Without it, KubeArmor's DNS allowlist blocks the
+	// agent from resolving the egress proxy Service name and every proxied
+	// request fails (allowed hosts time out in DNS); with no allows the egress
+	// proxy does not exist and the name must not appear in the allowlist.
+	It("includes the egress proxy FQDN in the agent KubeArmorPolicy DNS allowlist iff network allows are present", func() {
+		getDNSDomains := func(ns string) []string {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(engine.KubeArmorGVK)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "coxswain-" + i42dAllowLoop}, obj)).To(Succeed(),
+				"the agent KubeArmorPolicy must exist")
+			network, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
+			items, _ := network["matchDNSQueries"].([]any)
+			domains := make([]string, 0, len(items))
+			for _, it := range items {
+				domains = append(domains, it.(map[string]any)["domain"].(string))
+			}
+			return domains
+		}
+
+		// With allows: the egress proxy FQDN is in the DNS allowlist (and the
+		// model proxy FQDN is still there too, D33).
+		withAllowsNS := "i42d-kapt-allow-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: withAllowsNS}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: withAllowsNS}})
+		})
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42dPolicyName, Namespace: withAllowsNS},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42dAllowHost}},
+		})).To(Succeed())
+		loop := buildLoop(i42dAllowLoop, withAllowsNS, nil)
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcileLoop(i42dAllowLoop, withAllowsNS)
+
+		egFQDN := i42dAllowLoop + "-egress-proxy." + withAllowsNS + ".svc"
+		withAllowsDomains := getDNSDomains(withAllowsNS)
+		Expect(withAllowsDomains).To(ContainElement(egFQDN),
+			"with network allows the agent DNS allowlist must include the egress proxy FQDN so the agent can resolve it")
+		Expect(withAllowsDomains).To(ContainElement(i42dAllowLoop+"-proxy."+withAllowsNS+".svc"),
+			"the model proxy FQDN must still be in the DNS allowlist")
+
+		// No allows: the egress proxy does not exist; its FQDN must NOT appear.
+		noAllowsNS := "i42d-kapt-noallow-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: noAllowsNS}})).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: noAllowsNS}}) })
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42dPolicyName, Namespace: noAllowsNS},
+			Spec:       coxv1alpha1.AgentPolicySpec{},
+		})).To(Succeed())
+		noAllowLoop := buildLoop(i42dAllowLoop, noAllowsNS, nil)
+		Expect(k8sClient.Create(ctx, noAllowLoop)).To(Succeed())
+		reconcileLoop(i42dAllowLoop, noAllowsNS)
+
+		noAllowsDomains := getDNSDomains(noAllowsNS)
+		Expect(noAllowsDomains).ToNot(ContainElement(egFQDN),
+			"with no network allows the egress proxy FQDN must not be in the DNS allowlist")
 	})
 
 	// spec 6 (handoff): the env must UPDATE on an existing Sandbox when the

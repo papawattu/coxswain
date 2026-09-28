@@ -23,9 +23,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net"
 	neturl "net/url"
 	"strconv"
-	"net"
 	"strings"
 
 	"time"
@@ -35,6 +35,7 @@ import (
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -156,46 +157,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
 	}
 
-	// C6b (ADR-0007 Q3/D30): resolve the effective policy, apply it through the
-	// Enforcer (the gate has something behind it, P1 #2), and record the hash.
-	// The gate applies to EVERY Loop (no policyRefs = the platform minimum,
-	// still translated/emitted/enforced).
-	effective, err := r.effectivePolicy(ctx, &loop)
-	if err != nil {
+	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
-	}
-	if r.Enforcer != nil {
-		if err := r.Enforcer.Apply(ctx, &loop, effective); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
-	// I41: report the lossy translation. A host:PORT network allow that loses
-	// its port in the KubeArmor translation must set PolicyTranslationLossy=True
-	// (the port is dropped; the allow widens to host:*). Once the per-Loop
-	// NetworkPolicy carries the port (D34/I42), the condition becomes False.
-	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
-		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
-			"KubeArmorDroppedPorts",
-			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
-	} else {
-		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
-			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
-	}
-
-	// D30: record the PolicyEnforced condition. True+Enforcing when the engine is
-	// enforcing; False+reason otherwise. The AllowUnenforced escape hatch lets
-	// the Loop run but is NOT enforced — it records False+EnforcementDisabled
-	// (loudly visible), never True.
-	if enf, rs := r.enforcementStatus(ctx, &loop); enf && rs != engine.ReasonEnforcementDisabled {
-		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
-			"the eBPF engine is enforcing the Loop's effective policy")
-	} else {
-		msg := "engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)"
-		if rs == engine.ReasonEnforcementDisabled {
-			msg = "--allow-unenforced is set: the Loop runs but is NOT enforced (dev escape hatch)"
-		}
-		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
 	}
 	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
 	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
@@ -218,24 +181,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	// D33: the per-Loop proxy pod + Service exist only when a model endpoint is
-	// configured (P1 parity: no half-configured proxy).
-	if err := r.ensureProxyOrCleanup(ctx, &loop); err != nil {
+	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
+	changed, err := r.ensureProxyAndNetPolicies(ctx, &loop)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// D34: the per-Loop NetworkPolicies exist only when a model endpoint is
-	// configured (the agent needs egress to the proxy + DNS; the proxy needs
-	// egress to the model endpoint + DNS).
-	if loop.Spec.Agent.EndpointSecretRef != "" {
-		if err := r.ensureNetworkPolicy(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Combine the two status updates (observedGeneration + phase) into one so a
-	// reconcile does at most one Status().Update (P3 tidy-up).
-	changed := false
 	if loop.Status.ObservedGeneration != loop.Generation {
 		loop.Status.ObservedGeneration = loop.Generation
 		changed = true
@@ -451,6 +401,16 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			if !enforced {
 				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 			}
+			// D35a: the proxy pod must be Ready and owned by the Loop.
+			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
+				loop.Spec.Agent.EndpointSecretRef != "" {
+				proxyPod := &corev1.Pod{}
+				perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
+				proxyReady := perr == nil && metav1.IsControlledBy(proxyPod, loop) && isPodReady(proxyPod)
+				if !proxyReady {
+					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+				}
+			}
 		}
 		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
 		// (KubeArmorPolicy selector) and the D33 agent component label
@@ -461,6 +421,10 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		}
 		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, map[string]string{"coxswain.io/loop": loop.Name})
 		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, agentPodLabels(loop.Name))
+		// I36: the agent and any future sidecars do not share a process
+		// namespace (no nsenter / /proc/<pid> cross-container access).
+		noShare := false
+		desired.Spec.PodTemplate.Spec.ShareProcessNamespace = &noShare
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
 		// I35: fsGroup so the /workspace + /scratch emptyDir volumes are owned by
 		// the agent's UID (writable). Set on the pod security context.
@@ -716,6 +680,7 @@ func (r *LoopReconciler) cleanupProxy(ctx context.Context, loop *coxv1alpha1.Loo
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
 	}
+
 	// Delete the proxy Service (only if we control it).
 	svc := &corev1.Service{}
 	err = r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyServiceName(loop.Name)}, svc)
@@ -783,6 +748,14 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 
 	existingPod := &corev1.Pod{}
 	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: proxyPodName(loopName)}, existingPod)
+	// D35b: a foreign <loop>-proxy must not be opened or deleted (I2).
+	if err == nil && !metav1.IsControlledBy(existingPod, loop) {
+		setCondition(loop, "ProxyConflict", metav1.ConditionTrue, "ForeignProxy",
+			fmt.Sprintf("foreign proxy pod in %s/%s; sandbox held Suspended", ns, proxyPodName(loopName)))
+		log.Info("proxy pod is foreign; setting ProxyConflict",
+			"proxy", proxyPodName(loopName), "loop", loopName)
+		return nil
+	}
 	if apierrors.IsNotFound(err) {
 		// Pod doesn't exist: create it.
 		if createErr := r.Create(ctx, podDesired); createErr != nil {
@@ -821,6 +794,22 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 			"namespace", ns,
 			"loop", loopName,
 		)
+	}
+	// D35b: clear ProxyConflict when the controller's own proxy is in place.
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		hadConflict := false
+		for _, c := range loop.Status.Conditions {
+			if c.Type == "ProxyConflict" && c.Status == metav1.ConditionTrue {
+				hadConflict = true
+			}
+		}
+		if hadConflict {
+			setCondition(loop, "ProxyConflict", metav1.ConditionFalse, "Resolved",
+				"the foreign proxy pod is gone")
+		} else {
+			setCondition(loop, "ProxyConflict", metav1.ConditionFalse, "NoConflict",
+				"no foreign proxy pod detected")
+		}
 	}
 	return nil
 }
@@ -1179,18 +1168,6 @@ func agentPodLabels(loopName string) map[string]string {
 
 // intstrPtr32 returns a pointer to an intstr.IntOrString with the given int.
 
-func modelEndpointValue(loop *coxv1alpha1.Loop) string {
-	if loop.Spec.Agent.ModelEndpoint != "" {
-		v := loop.Spec.Agent.ModelEndpoint
-		// Ensure it's a URL the Go reverse proxy can parse.
-		if !strings.Contains(v, "://") {
-			v = "http://" + v
-		}
-		return v
-	}
-	return ""
-}
-
 // ensureProxy creates the Loop's per-Loop model-proxy pod + Service (D33,
 // replaces the C2a sidecar). It is idempotent. The model-creds Secret is
 // mounted read-only into the proxy pod ONLY (C2/ADR-0006 item 2); the agent
@@ -1232,7 +1209,84 @@ const (
 	netpolAgentComponent = "agent"
 	// netpolComponentLabel is the app.kubernetes.io/component label key.
 	netpolComponentLabel = "app.kubernetes.io/component"
+	// netpolProxyComponent is the component label the D34 proxy NetworkPolicy
+	// selects on.
+	netpolProxyComponent = "model-proxy"
+	// netpolProxyForLabel is the per-Loop label the D34 proxy NetworkPolicy
+	// uses to scope to a specific Loop.
+	netpolProxyForLabel = "coxswain.io/proxy-for"
 )
+
+// isPodReady reports whether a Pod has the PodReady condition set to True
+// (D35a: the sandbox must not be Running until the proxy pod is Ready).
+func isPodReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// applyEffectivePolicyAndConditions (C6b+I41+D30) resolves the effective
+// policy, applies it through the Enforcer, records the hash, and sets the
+// PolicyTranslationLossy and PolicyEnforced conditions.
+func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	effective, err := r.effectivePolicy(ctx, loop)
+	if err != nil {
+		return err
+	}
+	if r.Enforcer != nil {
+		if err := r.Enforcer.Apply(ctx, loop, effective); err != nil {
+			return err
+		}
+	}
+	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
+		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
+			"KubeArmorDroppedPorts",
+			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
+	} else {
+		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
+			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
+	}
+	if enf, rs := r.enforcementStatus(ctx, loop); enf && rs != engine.ReasonEnforcementDisabled {
+		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
+			"the eBPF engine is enforcing the Loop's effective policy")
+	} else {
+		msg := "engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)"
+		if rs == engine.ReasonEnforcementDisabled {
+			msg = "--allow-unenforced is set: the Loop runs but is NOT enforced (dev escape hatch)"
+		}
+		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
+	}
+	return nil
+}
+
+// ensureProxyAndNetPolicies runs the D33 proxy, D34 NetworkPolicy, and D35
+// condition snapshot. It returns whether the Loop's conditions changed.
+func (r *LoopReconciler) ensureProxyAndNetPolicies(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
+
+	if err := r.ensureProxyOrCleanup(ctx, loop); err != nil {
+		return false, err
+	}
+	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
+		return false, err
+	}
+	return !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions), nil
+}
+
+// ensureNetPoliciesIfConfigured creates the per-Loop NetworkPolicies when a
+// model endpoint is configured (D34). A no-op when endpointSecretRef is
+// absent.
+func (r *LoopReconciler) ensureNetPoliciesIfConfigured(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if loop.Spec.Agent.EndpointSecretRef == "" {
+		return nil
+	}
+	return r.ensureNetworkPolicy(ctx, loop)
+}
+
 // setCondition upserts a condition on the Loop's status. The condition's Type
 // is a string (a terminal phase like "Failed", or a non-phase condition type
 // like "PolicyEnforced" or "PolicyValid"). It is the operator's audit record

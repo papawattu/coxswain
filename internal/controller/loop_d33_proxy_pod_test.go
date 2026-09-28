@@ -64,7 +64,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 					Image:             runnerImage,
 					Model:             testModel,
 					EndpointSecretRef: d33ModelCredsSecret,
-						ModelEndpoint:     d34ModelEndpoint,
+					ModelEndpoint:     d34ModelEndpoint,
 				},
 			},
 		}

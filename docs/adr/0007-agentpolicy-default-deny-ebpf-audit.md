@@ -339,12 +339,33 @@ The egress proxy is an **HTTP/HTTPS forward proxy** (the same shape as
 1. **HTTP CONNECT:** for HTTPS, the client sends
    `CONNECT host:port`. The proxy checks `host:port` against the effective
    allows. Disallowed → `403 Forbidden` + audit record (blocked). Allowed →
-   the proxy opens a TCP tunnel to the target and relays bytes.
+   the proxy resolves the host **itself**, checks the resolved IP (below),
+   and opens a TCP tunnel to **that IP** (the same one it checked — no
+   re-resolution at dial time, so no TOCTOU re-resolution) and relays bytes.
 2. **SNI / Host header:** for plain HTTP, the `Host` header is checked.
    For HTTPS CONNECT, the SNI (from the TLS ClientHello) is checked as a
-   second gate (in case the CONNECT host was a wildcard or the policy allows
-   the host but not the specific SNI). Disallowed → tunnel closed + audit
-   record.
+   second gate. The rule is strict: **the SNI must equal the CONNECT host**
+   and both must be in the effective allows. SNI ≠ CONNECT host → tunnel
+   closed + audit record (blocked). **No SNI** (ECH, or a client that omits
+   it) → tunnel closed + audit record (blocked). Disallowed in any case →
+   audit record.
+
+**Resolved-IP check (SSRF defence):** the CONNECT/SNI/Host check is a
+**hostname** check. The proxy therefore resolves the hostname itself (via the
+cluster DNS the egress proxy's NetworkPolicy allows) and, **before dialing**,
+rejects the connection if any resolved IP is in a non-allowlisted private or
+cluster-internal range: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+`169.254.0.0/16` (link-local, including the cloud metadata endpoint),
+`127.0.0.0/8`, `100.64.0.0/10`, `::1`, `fc00::/7`, `fe80::/10`, and the
+cluster **pod** and **service** CIDRs. In **Phase 1, allows must not name
+in-cluster targets** (a `*.svc` name, a cluster DNS suffix, or an in-CIDR IP
+literal is rejected at policy-validation time, alongside the existing
+`COX_`-name validation); the resolved-IP check is the backstop that makes
+"in-cluster target" unexploitable even if an allow slips through (DNS
+rebinding, an attacker-controlled domain in the allowlist, a split-horizon
+name, or a name that changes resolution between validation and dial).
+The resolved IP is recorded in the audit `detail` (below) so a rebind is
+visible after the fact.
 
 **Why this resolves I41's port loss:** the egress proxy enforces **host AND
 port** — the full `host:port` pair from the `AgentPolicy` allow. A KubeArmor
@@ -359,10 +380,25 @@ enforcement layer.
 
 **What the proxy does NOT do:** it does not terminate TLS (it tunnels bytes
 after the CONNECT handshake). It does not inspect the payload. It does not
-MITM. The SNI check reads the ClientHello's SNI field from the first TLS
-record the client sends over the tunnel (the proxy sees the ClientHello
-because the client sends it through the tunnel); if the SNI is absent or the
-policy allows the CONNECT host but not the SNI, the proxy closes the tunnel.
+MITM. The SNI check reads the SNI field from the first TLS record the client
+sends over the tunnel (the proxy sees the ClientHello because the client
+sends it through the tunnel); if the SNI is absent, disagrees with the
+CONNECT host, or is not itself in the effective allows, the proxy closes the
+tunnel and records the block.
+
+**Known limits of tunnel-only mode (recorded, not solved):**
+
+- **Domain fronting:** the proxy sees the SNI but **not** the inner HTTP
+  `Host` header (TLS is opaque). An allowlisted CDN hostname can therefore
+  front a disallowed origin that shares the CDN's TLS certificate. A
+  tunnel-only proxy cannot close this; only a TLS-terminating proxy (out of
+  scope, below) could. Phase 1 records this as a policy-authoring concern:
+  authors of CDN allows should understand that the CDN's fronted origins
+  are effectively co-allowlisted.
+- **No SNI:** denied (see the SNI rule above), rather than allowed on the
+  CONNECT host alone — denying is the fail-closed choice.
+- **ECH (Encrypted Client Hello):** the SNI is encrypted; the proxy treats
+  the connection as SNI-absent and denies it (Phase 1 does not decrypt ECH).
 
 **Tools that ignore the proxy fail closed:** the operator sets
 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` on the agent container (below).
@@ -384,14 +420,22 @@ proxy, not the egress proxy):
 |---|---|
 | `HTTPS_PROXY` | `http://<loop>-egress-proxy.<ns>.svc:3128` |
 | `HTTP_PROXY` | `http://<loop>-egress-proxy.<ns>.svc:3128` |
-| `NO_PROXY` | `<loop>-model-proxy.<ns>,localhost,127.0.0.1,<cluster DNS IP>` |
+| `NO_PROXY` | `<loop>-proxy.<ns>.svc,<loop>-proxy.<ns>.svc.cluster.local,localhost,127.0.0.1` |
 
 - **Port 3128** (the standard Squid/forward-proxy port) is the egress proxy's
   listen port. The model proxy (D33) listens on 8080.
-- **`NO_PROXY`** excludes the model proxy Service (the agent talks to it
-  directly for model calls, not through the egress proxy), localhost, and the
-  cluster DNS resolver IP (so DNS resolution works; the agent's NetworkPolicy
-  already allows DNS egress to kube-dns).
+- **`NO_PROXY`** excludes the model proxy Service — **`<loop>-proxy`**
+  (D33's Service name; not `<loop>-model-proxy`) — in both its short
+  (`.svc`) and FQDN (`.svc.cluster.local`) forms, plus localhost. DNS is not
+  HTTP, so the cluster DNS IP deliberately does **not** appear in `NO_PROXY`
+  (an entry there would be inert). The agent's NetworkPolicy already allows
+  DNS egress to kube-dns.
+- **`COX_MODEL_BASE_URL` must match a `NO_PROXY` entry.** The operator sets
+  `COX_MODEL_BASE_URL` to the model proxy's `.svc` URL (D33). If it did not
+  match a `NO_PROXY` entry, the agent's model calls would be routed through
+  the egress proxy, which would **deny** them (the model endpoint is not in
+  the agent's effective network allows). The operator keeps the two in
+  sync when it sets them.
 - **`COX_`-style reservation:** the `COX_` env var prefix is reserved for
   operator-managed variables (I34: `COX_MODEL_BASE_URL`,
   `COX_WORKSPACE_PATH`, etc.). The proxy env vars are **not** `COX_`-prefixed
@@ -435,20 +479,32 @@ D34 — ingress from agent on 8080, egress to model endpoint peer + DNS.
 - `PolicyTypes: [Ingress, Egress]`
 - **Ingress:** only from this Loop's agent pod on port 3128 TCP. (Per-Loop
   labels, same as the model proxy's ingress rule.)
-- **Egress:** **wide** — to **any** IP on **any** port, plus DNS. See below.
+- **Egress:** two rules:
+  1. **External, with carve-outs:** `ipBlock {cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, <pod CIDR>, <service CIDR>]}` plus the v6 mirror (`::/0` except `fc00::/7`, `fe80::/10`, `::1/128`). The carve-outs cover every cluster-internal and link-local range the proxy could otherwise pivot into (kube-apiserver, other Loops' model proxies **and their mounted keys**, node/kubelet ports, other namespaces' services, `169.254.169.254`). The pod and service CIDRs come from the operator's config (the controller reads them at install; kind/k3s expose them in the `kube-system` config / `--pod-network-cidr` / `--service-cluster-ip-range`), not auto-discovery per Loop.
+  2. **kube-dns** on 53 UDP+TCP (the proxy resolves CONNECT hosts itself —
+     see the resolved-IP check in the enforcement section).
 
-**Why the egress proxy's wide egress is acceptable:** the egress proxy is
-the **enforcement point**. It is the only pod that can reach external
-hosts, and it does so only after checking the CONNECT/SNI/Host against the
-effective `AgentPolicy` allows. A disallowed host:port is rejected with 403
-**before** the proxy opens a TCP connection to the target. The wide NetworkPolicy
-egress on the egress proxy pod is the **coarse outer fence** — it says "this
-pod can open TCP connections to anywhere," but the **application-level
-enforcement** (the CONNECT/SNI/Host check) is what actually decides which
-hosts:ports are reached. This is the same trust model as the model proxy
-(D33): the model proxy pod has egress to the model endpoint, and the
-enforcement is at the proxy's application layer (it forwards only to the
-configured `MODEL_ENDPOINT`).
+**Why the egress proxy's egress is this wide (and no wider):** the egress
+proxy is the **enforcement point**, but enforcement is layered —
+
+1. the **NetworkPolicy** above is the **outer fence**: the pod can never
+   reach cluster-internal IPs at all (they are carved out of the `ipBlock`),
+   so even a fully compromised proxy is not an SSRF pivot into the apiserver,
+   other Loops' model proxies/keys, node ports, or the metadata endpoint;
+2. the **proxy's resolved-IP check** is the **middle layer**: an
+   allowlisted hostname whose resolution lands in a carved-out range is
+   rejected **before** the dial (and the dial is to the same checked IP —
+   no TOCTOU re-resolution), so DNS rebinding and split-horizon names cannot
+   reach a private address even on the external path;
+3. the **CONNECT/SNI/Host + port check** is the **inner enforcement**: the
+   hostname itself must be in the effective `AgentPolicy` allows.
+
+The `ipBlock` carve-outs make the NetworkPolicy "wide" in the sense that it
+allows the public internet — that is what a public egress proxy needs — but
+"wide" no longer includes the cluster. This is the same trust model as the
+model proxy (D33): the model proxy pod has egress only to the model endpoint
+peer + DNS, and the enforcement is at the proxy's application layer (it
+forwards only to the configured `MODEL_ENDPOINT`).
 
 The egress proxy's own KubeArmor policy (D35 part 2, when C6b merges) will
 add a **second layer**: the proxy's process is allowed to exec only its own
@@ -474,9 +530,8 @@ The egress proxy pod gets the **same hardening as the model proxy pod**
 | `allowPrivilegeEscalation` | false |
 | `capabilities.drop` | `["ALL"]` |
 | `seccompProfile.type` | `RuntimeDefault` |
-| `automountServiceAccountToken` | false (on the pod) |
-| `automountServiceAccountToken` | false (on the egress proxy container) |
-| Resources | limits: cpu 500m, memory 128Mi; requests: cpu 10m, memory 32Mi |
+| `automountServiceAccountToken` | false (pod field; no container-level row — the proxy needs no SA token) |
+| Resources | limits: cpu 100m, memory 128Mi; requests: cpu 10m, memory 32Mi (CPU parity with the D33 model proxy: 100m limit / 10m request) |
 | Liveness/readiness probes | TCP on port 3128 |
 
 The egress proxy is a **non-root, read-only, no-privilege-escalation** pod
@@ -500,7 +555,7 @@ connection attempt (allowed and blocked), using the Q4 envelope:
   "action": "connect",
   "target": "proxy.golang.org:443",
   "verdict": "allowed",
-  "detail": "sni=proxy.golang.org, proto=https"
+  "detail": "sni=proxy.golang.org, proto=https, ip=151.101.0.223, policy=<hash>"
 }
 ```
 
@@ -508,9 +563,24 @@ connection attempt (allowed and blocked), using the Q4 envelope:
   `"kubearmor"`).
 - `action`: `"connect"` (CONNECT tunnel) or `"http"` (plain HTTP request).
 - `target`: the `host:port` from the CONNECT line or Host header.
-- `verdict`: `"allowed"` (tunnel opened) or `"blocked"` (403 returned).
-- `detail`: the SNI (if present), the protocol (http/https), and the
-  policy hash (for correlation with the `status.policy.effectiveHash`).
+- `verdict`: `"allowed"` (tunnel opened) or `"blocked"` (403 / tunnel
+  closed).
+- `detail`: the SNI (if present), the protocol (http/https), the **resolved
+  IP the tunnel dials** (the SSRF defence — a rebind to a different IP is
+  visible after the fact), and the policy hash (correlation with
+  `status.policy.effectiveHash`).
+
+**`iteration`:** the Q4 envelope carries `iteration` so records can be joined
+per plan→implement→verify cycle. The egress proxy is a long-lived pod and its
+env is immutable, so it **cannot** read `status.iteration` itself. The proxy
+emits the record **without** `iteration`; the **relay** (the thing that joins
+records from all sources into the Q4 stream) fills `iteration` by looking up
+the Loop's current `status.iteration` at capture time. This is the same
+joining the relay already does for the model proxy and eBPF engine sources
+(they too stream without a per-record iteration, which the relay attaches by
+time window). A record captured between two iterations is attributed to the
+iteration in effect at capture time; the `policy` hash in `detail`
+disambiguates if the effective policy changed mid-iteration.
 
 This gives the activity audit (Q4) a **single point** to record all egress:
 every external connection the agent makes goes through the egress proxy, so
@@ -528,14 +598,15 @@ not zero.
 
 | Failure | Behaviour |
 |---|---|
-| Egress proxy pod not Ready (crash, ImagePullBackOff) | The agent's HTTP clients get connection-refused on the proxy (exit 7). The agent's tools that honour `HTTPS_PROXY` fail to connect and retry or report an error. The Loop does **not** fail (Q5: no terminal reason for a policy violation; a proxy outage is an infrastructure problem, not a policy violation). The `PolicyEnforced` condition is unaffected (the eBPF engine is still enforcing). The operator should alert on the egress proxy pod's `Ready` condition (same as the model proxy pod under D35a). |
-| Egress proxy pod is a **foreign** pod (not owned by the Loop) | The `ProxyConflict` condition (D35b) applies: `ProxyConflict=True` reason `ForeignEgressProxy`, the sandbox stays Suspended, the foreign pod is **not** deleted (I2). The agent cannot reach the foreign proxy (the NetworkPolicy ingress is per-Loop labels, but the foreign pod carries the egress proxy labels, so the NetworkPolicy **would** allow agent → foreign proxy — the `ProxyConflict` gate prevents this by keeping the sandbox Suspended). |
-| AgentPolicy network allows are empty (no `spec.network` entries) | The egress proxy pod is **not created** (same gate as the model proxy: only when `endpointSecretRef` is set). The agent's NetworkPolicy has only the model-proxy + DNS egress rules. No egress proxy env vars are set. The agent has no external egress (fail-closed). |
+| Egress proxy pod not Ready (crash, ImagePullBackOff) | **Gated, like the model proxy (D35a):** the sandbox stays **Suspended** (not Running) until the egress proxy pod is owned by the Loop **and** Ready — the same `IsControlledBy` + `PodReady` gate D35a applies to the model proxy. The agent never starts with `HTTPS_PROXY` pointing at nothing or at a foreign pod. A proxy outage is an infrastructure problem, not a policy violation, so the Loop is **not** failed (Q5); `PolicyEnforced` is unaffected. The operator should alert on the egress proxy pod's `Ready` condition (same as the model proxy pod under D35a). |
+| Egress proxy pod is a **foreign** pod (not owned by the Loop) | Same gate as above: `IsControlledBy` is false, so the sandbox stays Suspended, and `ProxyConflict=True` reason `ForeignEgressProxy` records the conflict. The foreign pod is **not** deleted (I2). (The `ProxyConflict` condition is the *record*; the *gate* is the owned+Ready check — consistent with the not-Ready row.) |
+| AgentPolicy network allows are empty (no `spec.network` entries) | The egress proxy pod is **not created** — the gate for the egress proxy is "the effective policy has `spec.network` allows", **distinct from** the model proxy's gate (`endpointSecretRef` is set). The agent's NetworkPolicy has only the model-proxy + DNS egress rules. No `*_PROXY` env vars are set. The agent has no external egress (fail-closed). |
 | AgentPolicy network allows change mid-Loop | The effective policy is carried on the egress proxy pod's env (immutable after creation). The operator deletes and recreates the pod when the effective policy changes (same drift-recreate pattern as D33's model proxy). The sandbox stays Running during the recreate: in-flight agent connections to the old pod are dropped, and the agent retries against the new pod via the Service (whose stable name keeps the agent's `HTTPS_PROXY` value unchanged). The `status.policy.effectiveHash` is updated on the next reconcile. |
-| Egress proxy bug: CONNECT check skipped (e.g. a deserialisation error) | The egress proxy's NetworkPolicy egress is wide, so the NetworkPolicy layer alone does not catch this — the D35 part 2 KubeArmor policy for the egress proxy (above) is the backstop. Until D35 part 2 lands, the observable signal is the per-connection audit record: a `verdict: allowed` for a host outside the effective allows is anomalous. Once D35 part 2 lands, a bypassed CONNECT check that connects to a disallowed host:port is blocked by KubeArmor and recorded in the audit. This is the "inner fence catches the outer fence's bug" pattern. |
+| Egress proxy bug: CONNECT check skipped (e.g. a deserialisation error) | The egress proxy's NetworkPolicy egress is the `ipBlock` with cluster-internal carve-outs (above), so the NetworkPolicy layer stops a skipped check from reaching the cluster but not from reaching the public internet — the D35 part 2 KubeArmor policy for the egress proxy (above) is the backstop for the public-internet case. Until D35 part 2 lands, the observable signal is the per-connection audit record: a `verdict: allowed` for a host outside the effective allows is anomalous. Once D35 part 2 lands, a bypassed CONNECT check that connects to a disallowed host:port is blocked by KubeArmor and recorded in the audit. This is the "inner fence catches the outer fence's bug" pattern. |
 | Agent uses a tool that ignores `HTTPS_PROXY` (raw TCP, `/dev/tcp`, `nc`) | The NetworkPolicy blocks the raw egress (the agent pod's egress is default-deny except to the proxy pods + DNS). KubeArmor records the blocked connection. The tool gets a connection timeout (exit 28) or connection refused (exit 7, if the target is a cluster-internal pod on a non-allowed port). |
-| DNS resolution for an allowed host fails (the host doesn't exist) | The agent's DNS query goes to kube-dns (allowed by the NetworkPolicy). The DNS query fails (NXDOMAIN). The agent's HTTP client reports a DNS error. The egress proxy is never contacted. No audit record is emitted (the connection was not attempted). This is correct behaviour: the host is allowed but doesn't exist. |
-| Egress proxy's wide egress is abused by a compromised egress proxy pod | The egress proxy runs as UID 65534 (nobody), read-only rootfs, no privilege escalation, no SA token. A compromised proxy can open TCP connections to any host (its NetworkPolicy allows wide egress), but it **cannot** read the model credentials (not mounted), **cannot** write to the agent's workspace (not mounted), and **cannot** exec any binary other than its own (KubeArmor D35 part 2). The blast radius is: exfiltration of data the agent has already sent through the proxy (the proxy sees the CONNECT/Host but not the TLS payload, since it tunnels bytes after the CONNECT handshake). This is the same trust model as the model proxy (D33): a compromised model proxy can read the model API key (it's mounted) and the model responses. The egress proxy is **less** privileged than the model proxy (no secrets mounted). |
+| DNS resolution for an allowed host fails (the host doesn't exist) | The agent's HTTP client (honouring `HTTPS_PROXY`) sends a CONNECT; the egress proxy resolves the host via kube-dns, gets NXDOMAIN, and returns an error to the client. No tunnel is opened, and a **blocked** audit record is emitted (`verdict: blocked`, `detail: dns=nxdomain`). This is correct behaviour: the host is allowed but doesn't exist. |
+| **DNS rebinding:** an allowlisted host's resolution flips to a private/cluster IP between the allowlist check and the dial (an attacker-controlled or rebind-prone name) | The proxy resolves **once**, rejects private/link-local/cluster-CIDR IPs **before** the dial, and dials **the same IP it checked** (no TOCTOU re-resolution). A rebind that lands in a carved-out range is **blocked** and audited (`verdict: blocked`, `detail` records the rejected IP). A rebind that lands in the **public** range is dialled to the new IP — but that is within the allowlist's intent (the hostname is allowed); the `detail` IP makes any rebind visible after the fact. The NetworkPolicy `ipBlock` carve-outs are the backstop for the in-cluster/private cases at the pod level. |
+| Egress proxy's egress is abused by a compromised egress proxy pod | The egress proxy runs as UID 65534, read-only rootfs, no privilege escalation, no SA token. Its NetworkPolicy egress is the `ipBlock` with cluster-internal + link-local carve-outs (above), so a compromised proxy **cannot** reach the apiserver, other Loops' model proxies **and their keys**, node/kubelet ports, or `169.254.169.254` — the SSRF pivot is closed at the NetworkPolicy layer. It **cannot** read the model credentials (not mounted), **cannot** write to the agent's workspace (not mounted), and **cannot** exec any binary other than its own (KubeArmor D35 part 2). Its blast radius is public-internet exfiltration of data the agent has already sent through the proxy (the proxy sees the CONNECT/Host/SNI and the resolved IP but not the TLS payload, since it tunnels bytes). This is **less** privileged than the model proxy (no secrets mounted, no cluster-internal reach). |
 
 ### Consequences for existing design decisions
 
@@ -567,12 +638,13 @@ not zero.
   model proxy and the eBPF engine). The `source` field value is
   `"egress-proxy"`.
 - **Plan slices:** a new slice **I42** (egress proxy pod + Service +
-  NetworkPolicy + env vars + audit) is added. It sits on top of D35 (the
-  gate) and C6b (the KubeArmor engine). The implementation is a new
-  `ensureEgressProxy` function in the controller (same shape as
+  NetworkPolicy + env vars + owned-and-Ready gate + audit) is added. It sits
+  on top of D35 (the gate) and C6b (the KubeArmor engine). The implementation
+  is a new `ensureEgressProxy` function in the controller (same shape as
   `ensureProxy` for the model proxy), a new `cmd/egress-proxy/` stand-in (same
-  shape as `cmd/proxy-standin/`), and a new NetworkPolicy
-  (`<loop>-egress-proxy-netpol`).
+  shape as `cmd/proxy-standin/`), a new NetworkPolicy
+  (`<loop>-egress-proxy-netpol`), and the D35a-style owned+Ready gate extended
+  to the egress proxy.
 
 ### What is NOT in scope for this ADR amendment
 
@@ -584,8 +656,12 @@ not zero.
   Go `net/http` reverse proxy is sufficient for Phase 1; a load-balanced
   egress proxy is a Phase 2 concern).
 - The **shared egress proxy** optimisation (Phase 2, above).
-- **DNS-over-HTTPS** enforcement (an agent that uses DoH bypasses the
-  NetworkPolicy's DNS restriction and the proxy's SNI check. This is a known
-  gap; the KubeArmor agent policy's `matchDNSQueries` rule (D35 part 2)
-  catches DoH traffic to non-allowed DNS servers. DoH to an allowed DNS
-  server is not caught by Phase 1.)
+- **DNS-over-HTTPS:** the agent has **no raw egress** (its NetworkPolicy
+  allows only the model proxy, the egress proxy, and kube-dns). So DoH
+  (HTTPS to e.g. `1.1.1.1:443` or `dns.google:443`) has to go through the
+  egress proxy as a CONNECT, and it is **enforced like any other host**:
+  blocked unless that DoH host is in the allowlist. It does **not** bypass
+  the NetworkPolicy, and it is not caught by KubeArmor `matchDNSQueries`
+  (there is no separate DNS channel to match). DoH is only possible to an
+  allowlisted DoH host, and is then indistinguishable from other allowed
+  HTTPS — a policy-authoring concern, not an enforcement gap.

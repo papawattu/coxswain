@@ -64,10 +64,8 @@ allow at all. That fails closed, but the feature is silently absent (no
 package downloads). NetworkPolicy can't match hostnames. The obvious
 translation, a port-only rule (`ports: [443]`, no `to:`), lets the agent reach
 **any** host on that port. That is the evil-agent exfiltration path D34 closes.
-KubeArmor's DNS matching doesn't close it either, because an agent can
-connect to a hard-coded IP without any lookup. (D34's proposed
-`NetworkAllowsNotEnforced` condition was a design comment only — it was never
-implemented — so the gap was invisible until this review.)
+KubeArmor's DNS matching (D35) doesn't close it either, because an agent can
+connect to a hard-coded IP without any lookup.
 
 **Options:**
 - **(a) Resolved `ipBlock`s:** the operator resolves each allowed FQDN and
@@ -82,14 +80,25 @@ implemented — so the gap was invisible until this review.)
 - **(c) FQDN-aware CNI:** require Cilium (`toFQDNs`) or similar. Precise,
   but it adds a cluster requirement (kind/k3s would need Cilium).
 
-**Until decided:** agent egress stays proxy + DNS only (fail-closed). ADR-0007
-records this as an open question, not a "port-only rules" plan.
-(`NetworkAllowsNotEnforced`, proposed in D34's design comment, was never
-implemented — see the I42 resolution in ADR-0007.)
+**Until decided:** agent egress stays proxy + DNS only (fail-closed). The
+Loop gets a condition (e.g. `NetworkAllowsNotEnforced`) listing the allows
+that aren't applied, so the gap is visible. ADR-0007 records this as an open
+question, not a "port-only rules" plan.
 
 **Acceptance (after the decision):** in the D34/C5 kind e2e, an allowed host
 is reachable from the agent, a non-allowed host on the same port is not, and
 a direct IP connection to a non-allowed host on the same port is not.
+
+**Builder response (PR #16, 2026-09-28):** on dropping
+`NetworkAllowsNotEnforced` — agreed with the reviewer's condition: it can be
+dropped **only if** the first I42 implementation slice is the egress proxy
+itself. The ADR amendment (PR #16) specifies the egress proxy as the I42 slice
+(`ensureEgressProxy` + `cmd/egress-proxy/` stand-in + the egress proxy
+NetworkPolicy + the `*_PROXY` env vars + the audit record, one slice), so no
+interim `NetworkAllowsNotEnforced` condition is needed: agent egress stays
+proxy + DNS (fail-closed) until that slice lands, and the ADR records the gap
+in the meantime. Note the condition was never implemented — it existed only
+in D34's design comment, so "dropping" it is dropping a proposal, not code.
 
 ---
 

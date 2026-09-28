@@ -1375,6 +1375,15 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ServiceCIDR == "" {
 		r.ServiceCIDR = os.Getenv("SERVICE_CIDR")
 	}
+	// P3 (I42e review): make an unset CIDR config visible. When either is
+	// empty the IP-in-pod/service-CIDR cases of findInClusterNetworkAllow are
+	// skipped, so an in-cluster allow given as a bare IP literal in that range
+	// is not caught by the first layer (only the egress proxy's resolved-IP
+	// backstop is). Log once at startup so a misconfigured install is obvious.
+	if r.PodCIDR == "" || r.ServiceCIDR == "" {
+		logf.Log.Info("POD_CIDR / SERVICE_CIDR unset: the IP-in-pod/service-CIDR in-cluster-allow check is disabled; an in-cluster allow given as a bare IP in that range is caught only by the egress proxy's resolved-IP backstop",
+			"podCIDR", r.PodCIDR, "serviceCIDR", r.ServiceCIDR)
+	}
 	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
 	// watch's map function uses this index to find the Loops that reference
 	// a given AgentPolicy, avoiding a namespace-wide list per event).
@@ -1473,65 +1482,13 @@ type policyValidationResult struct {
 	transientReadError bool
 }
 
-// findInClusterNetworkAllow returns the first network allow in the union that
-// names an in-cluster target (I42e, first layer of the SSRF defence): an IP
-// literal inside the operator's pod or service CIDR, or the string localhost /
-// 127.0.0.1. The name-suffix cases (.svc / .svc.cluster.local) are rejected
-// by the CRD CEL rule (which fires at admission). Returns ("", false) when
-// every allow is a legitimate external target.
+// findInClusterNetworkAllow (I42e) delegates to the pure policy check. It
+// catches an in-cluster network allow — an in-cluster name (mirroring the CRD
+// CEL rule, so pre-rule objects and future CRD drift are caught), a loopback /
+// unspecified / link-local hostname, or an IP literal inside the operator's
+// pod/service CIDR — before the egress proxy is created.
 func (r *LoopReconciler) findInClusterNetworkAllow(allows []string) (string, bool) {
-	cidrs := make([]string, 0, 2)
-	if r.PodCIDR != "" {
-		cidrs = append(cidrs, r.PodCIDR)
-	}
-	if r.ServiceCIDR != "" {
-		cidrs = append(cidrs, r.ServiceCIDR)
-	}
-	for _, a := range allows {
-		host := hostPartOfAllow(a)
-		if host == "" {
-			continue // malformed: the egress proxy rejects it at dial time
-		}
-		if host == "localhost" || host == "127.0.0.1" {
-			return a, true
-		}
-		if ip := net.ParseIP(host); ip != nil && len(cidrs) > 0 {
-			for _, cidr := range cidrs {
-				if ipInCIDR(ip, cidr) {
-					return a, true
-				}
-			}
-		}
-	}
-	return "", false
-}
-
-// hostPartOfAllow returns the host part of a "host:port" network allow (I42e).
-// It mirrors the engine's splitHostPort: a bare host (no port) is not a valid
-// network allow and yields ""; an IPv6 host is bracketed ("[::1]:443"), and
-// the brackets are stripped so the literal can be parsed as an IP.
-func hostPartOfAllow(entry string) string {
-	host, _, err := net.SplitHostPort(entry)
-	if err != nil {
-		return ""
-	}
-	host = strings.Trim(host, "[]")
-	if host == "" {
-		return ""
-	}
-	return strings.ToLower(host)
-}
-
-// ipInCIDR reports whether ip falls within the CIDR. A malformed CIDR in the
-// operator config never matches (the CRD CEL rule still catches the name
-// cases; a misconfigured CIDR should be fixed at the deployment, not silently
-// block every reconcile).
-func ipInCIDR(ip net.IP, cidr string) bool {
-	_, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return false
-	}
-	return ipnet.Contains(ip)
+	return policy.FindInClusterNetworkAllow(allows, r.PodCIDR, r.ServiceCIDR)
 }
 
 // validateAgentPolicies checks that every referenced AgentPolicy exists and
@@ -1567,14 +1524,15 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 		}
 		unionNetwork = append(unionNetwork, ap.Spec.Network...)
 	}
-	// I42e: reject in-cluster network allows (localhost / IP in pod/service CIDR).
-	// The CRD CEL rule handles the .svc / .svc.cluster.local suffix cases at
-	// admission; the controller catches the CIDR cases (which need the
-	// operator's CIDR config) and localhost (which the CEL rule also catches,
-	// but re-checking here is defence in depth).
+	// I42e: reject in-cluster network allows. The CRD CEL rule handles the
+	// .svc / .svc.cluster.local / localhost / 127.0.0.1 name cases at
+	// admission; the controller catches the same name cases (mirrored, so pre-
+	// rule objects and future CRD drift are caught), the other loopback /
+	// unspecified / link-local forms, and the IP-in-pod/service-CIDR cases
+	// (which need the operator's CIDR config).
 	if offending, ok := r.findInClusterNetworkAllow(unionNetwork); ok {
 		return policyValidationResult{valid: false, reason: "InClusterAllow",
-			message: fmt.Sprintf("AgentPolicy network allow %q names an in-cluster target (localhost / 127.0.0.1 / IP in pod or service CIDR); the agent's external egress is enforced by the egress proxy and an in-cluster target is an SSRF path", offending)}
+			message: fmt.Sprintf("AgentPolicy network allow %q names an in-cluster target (.svc / .svc.cluster.local / cluster.local, localhost, a loopback / unspecified / link-local IP, or an IP in the pod or service CIDR); the agent's external egress is enforced by the egress proxy and an in-cluster target is an SSRF path", offending)}
 	}
 	return policyValidationResult{valid: true}
 }

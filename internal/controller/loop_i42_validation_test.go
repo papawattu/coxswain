@@ -267,29 +267,43 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 		}
 	})
 
-	It("rejects localhost and 127.0.0.1", func() {
-		for _, a := range []string{"localhost:8080", "127.0.0.1:443", "127.0.0.1:80"} {
+	It("rejects loopback / unspecified / link-local IP forms (review P3)", func() {
+		// P3: the first layer rejects the well-known loopback / unspecified /
+		// link-local forms outright, not just localhost / 127.0.0.1. The egress
+		// proxy's resolved-IP check (I42a) is the backstop for rebinding /
+		// split-horizon, but these forms should be caught here too.
+		for _, a := range []string{
+			"localhost:8080", "127.0.0.1:443", "127.0.0.0:443", "127.0.0.2:80",
+			"127.0.0.255:80", "127.255.255.255:80", "0.0.0.0:80",
+			"169.254.0.0:80", "169.254.169.254:80", "[::1]:443", "[::]:443",
+		} {
 			offending, ok := r.findInClusterNetworkAllow([]string{a})
-			Expect(ok).To(BeTrue(), "%s must be rejected", a)
+			Expect(ok).To(BeTrue(), "%s must be rejected as an in-cluster loopback/unspecified/link-local form", a)
+			Expect(offending).To(Equal(a))
+		}
+	})
+
+	It("rejects in-cluster name suffixes case-insensitively and trailing-dot-aware (review P2)", func() {
+		// P2: the controller mirrors the CRD CEL rule's name check, but
+		// case-insensitively and trailing-dot-aware, so objects created before
+		// the rule and future CRD drift are caught too.
+		for _, a := range []string{
+			"my-service.default.svc:443", "api.default.SVC:443",
+			"Kubernetes.Default.Svc:443", "my-svc.default.svc.:443",
+			"kubernetes.default.svc.cluster.local.:443",
+			"KUBERNETES.DEFAULT.SVC.:443", "my-svc.default.cluster.local:443",
+		} {
+			offending, ok := r.findInClusterNetworkAllow([]string{a})
+			Expect(ok).To(BeTrue(), "%s must be rejected as an in-cluster name suffix", a)
 			Expect(offending).To(Equal(a))
 		}
 	})
 
 	It("allows legitimate external hosts and IPs", func() {
-		for _, a := range []string{i42eExternalHost, "8.8.8.8:443", "1.1.1.1:53"} {
+		for _, a := range []string{i42eExternalHost, "8.8.8.8:443", "1.1.1.1:53", "servicewarehouse.example.com:443", "api.github.com:443"} {
 			_, ok := r.findInClusterNetworkAllow([]string{a})
 			Expect(ok).To(BeFalse(), "%s must NOT be flagged as in-cluster", a)
 		}
-	})
-
-	It("handles IPv6 loopback (127.0.0.1 is IPv4; ::1 is the IPv6 equivalent)", func() {
-		// The hostPartOfAllow strips brackets from bracketed IPv6.
-		// ::1 is not in the pod/service CIDRs (which are IPv4), so it is not
-		// caught by the CIDR check. The egress proxy's resolved-IP check
-		// (I42a) is the backstop for ::1 (it's in the standard carve-outs).
-		_, ok := r.findInClusterNetworkAllow([]string{"[::1]:443"})
-		Expect(ok).To(BeFalse(),
-			"::1 is not in the IPv4 pod/service CIDRs; the egress proxy's standard carve-outs catch it")
 	})
 
 	It("ignores malformed entries (no port)", func() {

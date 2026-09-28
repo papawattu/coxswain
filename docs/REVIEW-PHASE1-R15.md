@@ -188,3 +188,59 @@ agent workflows", recording:
 
 It also updates `docs/PLAN.md` so the phases after Phase 1 are expressed as
 core + extension points + workflow definitions.
+
+---
+
+## P2: Design
+
+### D37. Visualise a workflow and monitor a run (the console)
+
+- [x] Direction approved by the owner (mockup, 2026-09-28: "LGTM")
+- [ ] Planned as slices
+
+**Mockup:** https://claude.ai/artifact/Vri421Q6n4LBrukyuiMoDv (private to
+the owner; share it from the page if others need it). It has two views.
+
+**1. Flow: the workflow definition as a graph, with live runs on it.**
+- Stages are cards (isolated agent work) and gates are diamonds (a human or
+  evidence decides). Maintain's loop back to a new Intent is drawn.
+- Live overlay: runs active in each stage, and runs waiting at each gate
+  (amber).
+- The **extension slots** for the workflow are shown under the graph, marking
+  which are the built-in defaults and which are external implementations
+  (D36).
+- A sidebar lists workflow definitions (SDLC, research report, infra change,
+  …), since the console is not SDLC-specific (D36).
+- The run totals: in flight, waiting for a human, blocked, delivered.
+
+**2. Run monitor: one run in detail.**
+- A stage timeline with the current gate.
+- **Isolation & health**, observed by the operator (never agent-reported):
+  sandbox mode, `PolicyValid`, eBPF enforcing, model/egress proxy owned and
+  Ready, NetworkPolicies, `ProxyConflict`.
+- The **gate ledger**: hash-chained entries (gate, verdict, approver,
+  hash ← prev), with the "chain verified" state and the ledger store shown.
+- **Checks & evidence**: operator-run checks, the pinned commit, and the
+  tamper result. Advisory agents' notes are marked advisory.
+- A **live activity audit** (ADR-0007 Q4 stream): egress-proxy, KubeArmor,
+  model-proxy, operator and memory events with allowed/blocked verdicts,
+  and a "blocked only" filter.
+- Human actions (Review plan, approve, Suspend) are the only write paths, and
+  each goes through RBAC and lands in the ledger.
+
+**Constraints (the extension contract applies to the console too):**
+- the console is **read-mostly**. Its writes are gate approvals and
+  suspend/resume only, made as the signed-in human, recorded in the ledger,
+  and never on an agent's behalf;
+- everything shown comes from operator-held state (status, events, the audit
+  stream, the ledger), never from files the agent wrote;
+- the console is itself an **extension point** ("Views"), with a simple
+  built-in default: the web console in the mockup, or a `kubectl coxswain`
+  TUI. Solid external options: a Grafana plugin or a Backstage plugin;
+- agent-supplied text (plans, audit `detail`, memory content) is rendered as
+  untrusted data: escaped, never as HTML.
+
+**Acceptance:** D37 is folded into ADR-0008 as the "Views" extension point
+plus its built-in default. The builder adds console slices to
+`docs/PLAN.md` after the ledger and workflow-definition slices exist, since
+the console reads them. No code before the owner confirms the ordering.

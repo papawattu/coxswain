@@ -32,6 +32,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -468,26 +469,60 @@ func closeQuietly(c net.Conn) {
 	_ = c.Close()
 }
 
-// relayConn is a net.Conn whose read deadline is refreshed to now+timeout
-// before every Read (a real idle timeout: an active tunnel keeps its deadline
-// pushed out, a silent one hits it). Writes use no deadline.
+// relayConn is a net.Conn whose read deadline is refreshed before every Read
+// from a SHARED last-activity timestamp. The deadline is set to
+// lastActivity+idle, so a Read on EITHER direction that sees bytes pushes the
+// deadline out for both: idle means no bytes in either direction, not no bytes
+// in one direction. This is what keeps a long download alive — during a
+// download the client->server side is silent, but the server->client side is
+// active and keeps pushing the deadline, so the silent side is never cut mid-
+// transfer. A deadline that fires while the other side was recently active is
+// extended and retried (the other side's bytes will arrive and push the
+// deadline); a deadline that fires with no activity in either direction is
+// treated as a real idle timeout and the relay tears down.
 type relayConn struct {
 	net.Conn
-	timeout time.Duration
+	idle time.Duration
+	last *atomic.Int64
 }
 
+// Read refreshes the shared deadline and reads, retrying on a deadline error
+// if the other direction was recently active (extending the deadline so the
+// in-flight bytes can arrive). Returns the first non-deadline error.
 func (r *relayConn) Read(p []byte) (int, error) {
-	// The embedded conn's SetReadDeadline/Read are called explicitly (not via
-	// the promoted r.SetReadDeadline/r.Read, which would recurse). See the
-	// QF1008 exclusion in .golangci.yml for the reasoning.
-	_ = r.Conn.SetReadDeadline(time.Now().Add(r.timeout))
-	return r.Conn.Read(p)
+	for {
+		lastNano := r.last.Load()
+		if err := r.Conn.SetReadDeadline(time.Unix(0, lastNano).Add(r.idle)); err != nil {
+			return 0, err
+		}
+		// The embedded conn's Read is called explicitly (not the promoted
+		// r.Read, which would recurse); see the QF1008 exclusion in
+		// .golangci.yml.
+		n, err := r.Conn.Read(p) //nolint:staticcheck
+		if err == nil {
+			if n > 0 {
+				r.last.Store(time.Now().UnixNano())
+			}
+			return n, nil
+		}
+		// A deadline error: if the OTHER direction saw bytes since the deadline
+		// we set (lastNano advanced past it), the tunnel is active — extend the
+		// deadline and retry instead of tearing down. Otherwise no activity in
+		// either direction; return the error so the relay tears down.
+		if errors.Is(err, os.ErrDeadlineExceeded) && r.last.Load() > lastNano {
+			continue
+		}
+		return n, err
+	}
 }
 
-// idleTimeout wraps both relay directions so a silent tunnel is torn down
-// after idleTimeout with no activity, while an active tunnel (bytes flowing
-// in either direction) never hits it. The deadline is refreshed per Read, so
-// long downloads/clones are not cut (unlike a hard cap after open).
+// relay copies bytes between client and server until one direction ends. Idle
+// (no bytes in EITHER direction) for idle tears the tunnel down; an active
+// tunnel (bytes in either direction) runs until a real end. On a one-sided EOF
+// (a side closed its write half) the relay half-closes (CloseWrite) the other
+// direction so the remaining in-flight bytes drain, then tears down — instead
+// of closing both conns mid-transfer. clientHello and any bytes buffered in
+// clientBuf after the ClientHello are forwarded to the server first.
 func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn, clientHello []byte, idle time.Duration) {
 	defer closeQuietly(client)
 	defer closeQuietly(server)
@@ -511,23 +546,71 @@ func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn, client
 			_, _ = clientBuf.Discard(n)
 		}
 	}
-	// Wrap both directions in an idle-timeout conn: each Read refreshes the
-	// deadline to now+relayIdleTimeout, so an active tunnel never times out
-	// and a silent one is torn down after relayIdleTimeout of no activity.
-	clientRC := &relayConn{Conn: client, timeout: idle}
-	serverRC := &relayConn{Conn: server, timeout: idle}
-	done := make(chan struct{}, 2)
+	// Both directions share one last-activity timestamp so idle means no bytes
+	// in either direction.
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
+	clientRC := &relayConn{Conn: client, idle: idle, last: &last}
+	serverRC := &relayConn{Conn: server, idle: idle, last: &last}
+	// copyDone signals that one direction's copy finished (a real EOF/error or
+	// an idle teardown). It carries whether the finish was a one-sided EOF
+	// (half-close) vs an idle timeout (tear down both).
+	type copyResult struct {
+		done bool
+		half bool // true: one-sided EOF (CloseWrite the other); false: idle/teardown
+	}
+	resC, resS := make(chan copyResult, 1), make(chan copyResult, 1)
 	go func() {
-		_, _ = io.Copy(serverRC, clientRC) // client -> server
-		done <- struct{}{}
+		_, err := io.Copy(server, clientRC) // client -> server
+		if err == nil {
+			// The client closed its write half (EOF): half-close the server's
+			// read half so the server sees EOF and can finish sending (e.g. a
+			// download that completes). The server->client copy keeps draining
+			// the in-flight bytes until the peer closes; we wait for it (resS) at
+			// the end so the transfer completes before the deferred closes.
+			if tc, ok := server.(interface{ CloseWrite() error }); ok {
+				_ = tc.CloseWrite()
+			}
+			resC <- copyResult{done: true, half: true}
+			return
+		}
+		// Error (idle timeout or other): tear down BOTH conns so the other copy
+		// returns (its Read errors on the closed conn) and signals resS.
+		resC <- copyResult{done: true}
 		closeQuietly(server)
-	}()
-	go func() {
-		_, _ = io.Copy(client, serverRC) // server -> client
-		done <- struct{}{}
 		closeQuietly(client)
 	}()
-	<-done
+	go func() {
+		_, err := io.Copy(client, serverRC) // server -> client
+		if err == nil {
+			// The server closed its write half (EOF): half-close the client's
+			// read half so the client sees EOF. The client->server copy keeps
+			// draining until the client closes; we wait for it (resC) at the end.
+			if tc, ok := client.(interface{ CloseWrite() error }); ok {
+				_ = tc.CloseWrite()
+			}
+			resS <- copyResult{done: true, half: true}
+			return
+		}
+		// Error (idle timeout or other): tear down BOTH conns so the other copy
+		// returns and signals resC.
+		resS <- copyResult{done: true}
+		closeQuietly(server)
+		closeQuietly(client)
+	}()
+	// Wait for both directions to finish.
+	//
+	//   - Idle timeout: the finishing copy's goroutine already closed the
+	//     conns (tear-down); the other copy returns on that close and signals,
+	//     so both channels close promptly and relay returns — the deferred
+	//     closes are no-ops.
+	//   - One-sided EOF: the finishing copy half-closed its end (CloseWrite)
+	//     and is waiting. The other copy keeps draining the in-flight bytes and
+	//     finishes when the peer sees the EOF and closes; waiting for it here
+	//     lets the transfer complete before the deferred closes fire (which are
+	//     then no-ops on already-closed conns).
+	<-resC
+	<-resS
 }
 
 // copyHeader copies response headers (a small subset; enough for the agent's

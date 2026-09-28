@@ -486,13 +486,15 @@ func TestRelayForwardsBufferedBytes(t *testing.T) {
 	}
 }
 
-// TestRelayIdleTimeout proves a real idle timeout: a tunnel that trickles
-// bytes past the idle window stays open (the deadline is reset per read),
-// while a silent tunnel is torn down after the idle window. Both directions
-// use TCP conns (honoring SetReadDeadline, unlike net.Pipe).
+// TestRelayIdleTimeout proves idle means no bytes in EITHER direction. The
+// server->client side trickling past 2x the idle window while the client stays
+// silent must keep the tunnel open (the silent client->server side is never
+// cut because the other side is active); a tunnel silent both ways is torn
+// down after the idle window. Both directions use TCP conns (honoring
+// SetReadDeadline, unlike net.Pipe).
 func TestRelayIdleTimeout(t *testing.T) {
-	// Silent case: neither side sends, so both directions hit the idle
-	// deadline and the relay tears down after the idle window.
+	// Silent-both-ways case: neither side sends, so no bytes in either
+	// direction and the relay tears down after the idle window.
 	client, server := newTCPConnPair(t)
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
@@ -502,34 +504,46 @@ func TestRelayIdleTimeout(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
 		t.Fatalf("silent tunnel torn down after %v; want >= 250ms (the idle window)", elapsed)
 	}
-	// Active case: one side keeps sending one byte every 100ms, well within
-	// the 300ms idle window. The relay must NOT tear down; it runs until we
-	// close the client. Bound the test so it cannot hang.
+	// Active-one-side case (the reviewer's long-download scenario): the server
+	// trickles one byte to the client every 150ms for ~800ms — well past 2x the
+	// 300ms idle window — while the client stays silent. The silent
+	// client->server side must NOT be torn down because the server->client side
+	// is active (shared last-activity). The relay must stay open; it only
+	// returns when the server closes (a one-sided EOF the relay half-closes on).
 	c2, s2 := newTCPConnPair(t)
 	defer func() { _ = c2.Close() }()
 	defer func() { _ = s2.Close() }()
 	clientBuf2 := bufio.NewReadWriter(bufio.NewReader(c2), bufio.NewWriter(c2))
-	activeDone := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
 		relay(c2, clientBuf2, s2, nil, 300*time.Millisecond)
-		close(activeDone)
+		close(done)
 	}()
-	// Trickle one byte from s2 to c2 every 100ms for ~800ms (well past one
-	// 300ms idle window without activity, but always active in that
-	// direction).
+	// Trickle from s2 (the server) to c2 (the client) every 150ms for ~800ms.
 	deadline := time.Now().Add(800 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		_, _ = s2.Write([]byte{0x01})
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 	}
-	// The relay should still be running (not torn down by the idle timeout).
-	// Close the client to end it.
-	_ = c2.Close()
+	// The relay must still be running (not torn down: the client->server side
+	// was silent for the whole 800ms, past 2x the 300ms idle window, but the
+	// server->client side was active). If it were torn down, done would be
+	// closed by now.
 	select {
-	case <-activeDone:
-		// relay returned after the client closed - expected.
+	case <-done:
+		t.Fatal("relay was torn down while the server was still sending: " +
+			"idle treated the silent client->server side as idle instead of the whole tunnel")
+	case <-time.After(150 * time.Millisecond):
+		// still running - expected.
+	}
+	// Close the server: a one-sided EOF the relay half-closes the client on,
+	// then returns. The relay must drain the in-flight bytes and return.
+	_ = s2.Close()
+	select {
+	case <-done:
+		// relay returned after the server closed - expected.
 	case <-time.After(2 * time.Second):
-		t.Fatal("relay did not return after the client closed")
+		t.Fatal("relay did not return after the server closed")
 	}
 }
 

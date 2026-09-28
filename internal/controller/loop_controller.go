@@ -158,6 +158,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	// I41: report the lossy translation. A host:PORT network allow that loses
+	// its port in the KubeArmor translation must set PolicyTranslationLossy=True
+	// (the port is dropped; the allow widens to host:*). Once the per-Loop
+	// NetworkPolicy carries the port (D34/I42), the condition becomes False.
+	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
+		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
+			"KubeArmorDroppedPorts",
+			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
+	} else {
+		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
+			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
+	}
+
 	// D30: record the PolicyEnforced condition. True+Enforcing when the engine is
 	// enforcing; False+reason otherwise. The AllowUnenforced escape hatch lets
 	// the Loop run but is NOT enforced — it records False+EnforcementDisabled
@@ -318,6 +331,12 @@ func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha
 // PolicyEnforcedCondition is the non-phase condition type recording whether the
 // eBPF engine is enforcing the Loop's policy (D30).
 const PolicyEnforcedCondition = "PolicyEnforced"
+
+// PolicyTranslationLossyCondition is the Loop condition that reports a lossy
+// KubeArmor translation (I41): a host:PORT network allow that loses its port
+// in the translation. True + reason KubeArmorDroppedPorts lists the widened
+// allows; False + reason NoPortLoss when no port was lost.
+const PolicyTranslationLossyCondition = "PolicyTranslationLossy"
 
 // effectivePolicy resolves the Loop's effective policy: the union of the
 // referenced AgentPolicies, or the platform minimum (empty EffectivePolicy) when

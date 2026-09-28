@@ -172,3 +172,31 @@ func TestEmitKubeArmorPolicyDefaultDeny(t *testing.T) {
 		}
 	}
 }
+func TestNetworkLossy(t *testing.T) {
+	// host:PORT allows are lossy (the port is dropped).
+	lossy := NetworkLossy([]string{"pypi.org:443", "localhost:8080"})
+	if len(lossy) != 2 {
+		t.Fatalf("expected 2 lossy allows, got %d: %v", len(lossy), lossy)
+	}
+	if lossy[0] != "pypi.org:443" || lossy[1] != "localhost:8080" {
+		t.Errorf("unexpected lossy allows: %v", lossy)
+	}
+
+	// Bare hosts are NOT lossy.
+	lossy = NetworkLossy([]string{"pypi.org", "localhost"})
+	if len(lossy) != 0 {
+		t.Errorf("expected 0 lossy allows for bare hosts, got %d: %v", len(lossy), lossy)
+	}
+
+	// Mixed: only the host:port ones are lossy.
+	lossy = NetworkLossy([]string{"pypi.org", "github.com:443"})
+	if len(lossy) != 1 || lossy[0] != "github.com:443" {
+		t.Errorf("expected [github.com:443], got %v", lossy)
+	}
+
+	// Empty input.
+	lossy = NetworkLossy(nil)
+	if len(lossy) != 0 {
+		t.Errorf("expected 0 lossy allows for nil input, got %d", len(lossy))
+	}
+}

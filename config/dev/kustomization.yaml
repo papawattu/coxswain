@@ -1,0 +1,12 @@
+# Dev/kind only: the base install (config/default) plus --allow-unenforced.
+# Never use for production — Loops run with PolicyEnforced=False (EnforcementDisabled).
+resources:
+- ../default
+patches:
+- target:
+    kind: Deployment
+    name: controller-manager
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --allow-unenforced

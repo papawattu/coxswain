@@ -69,7 +69,10 @@ var _ = Describe("Manager", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
 		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
+		// deploy-dev adds --allow-unenforced (config/dev overlay) so Loops run in the
+		// e2e before the I32 enforcement-evidence relay is wired. The production
+		// 'make deploy' stays fail-closed.
+		cmd = exec.Command("make", "deploy-dev", fmt.Sprintf("IMG=%s", managerImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 	})

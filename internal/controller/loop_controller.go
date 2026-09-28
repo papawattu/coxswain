@@ -24,6 +24,7 @@ import (
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -79,6 +80,17 @@ type LoopReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// Enforcer is the eBPF engine seam (ADR-0007 Q3/D30). When set, the operator
+	// emits the Loop's effective policy through the engine and gates the sandbox
+	// on positive evidence that enforcement is active (D30). When nil, the
+	// operator treats enforcement as unavailable (PolicyEnforced=False,
+	// reason EngineUnavailable) and holds the sandbox Suspended (fail-closed).
+	Enforcer engine.Enforcer
+	// AllowUnenforced is the off-by-default escape hatch (P1 merge): when true,
+	// Loops run with PolicyEnforced=False reason EnforcementDisabled rather
+	// than being held Suspended. For dev/kind only — never in production.
+	AllowUnenforced bool
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
@@ -94,6 +106,7 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -130,6 +143,39 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if len(loop.Spec.PolicyRefs) > 0 {
 		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
 	}
+
+	// C6b (ADR-0007 Q3/D30): resolve the effective policy, apply it through the
+	// Enforcer (the gate has something behind it, P1 #2), and record the hash.
+	// The gate applies to EVERY Loop (no policyRefs = the platform minimum,
+	// still translated/emitted/enforced).
+	effective, err := r.effectivePolicy(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if r.Enforcer != nil {
+		if err := r.Enforcer.Apply(ctx, &loop, effective); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// D30: record the PolicyEnforced condition. True+Enforcing when the engine is
+	// enforcing; False+reason otherwise. The AllowUnenforced escape hatch lets
+	// the Loop run but is NOT enforced — it records False+EnforcementDisabled
+	// (loudly visible), never True.
+	if enf, rs := r.enforcementStatus(ctx, &loop); enf && rs != engine.ReasonEnforcementDisabled {
+		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
+			"the eBPF engine is enforcing the Loop's effective policy")
+	} else {
+		msg := "engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)"
+		if rs == engine.ReasonEnforcementDisabled {
+			msg = "--allow-unenforced is set: the Loop runs but is NOT enforced (dev escape hatch)"
+		}
+		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
+	}
+	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
+	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
+	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
+	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
@@ -251,6 +297,48 @@ func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alp
 	return policy.EffectiveHash(union), true, nil
 }
 
+// enforcementStatus (D30, ADR-0007) reports whether the eBPF engine is enforcing
+// the Loop's policy. The gate applies to EVERY Loop (no policyRefs = the
+// platform minimum, still enforced); with no Enforcer (engine not installed) it
+// reports EngineUnavailable, so the sandbox is held Suspended (fail-closed).
+func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha1.Loop) (enforced bool, reason string) {
+	if r.Enforcer == nil {
+		if r.AllowUnenforced {
+			return true, engine.ReasonEnforcementDisabled // run, but NOT enforced
+		}
+		return false, engine.ReasonEngineUnavailable
+	}
+	enforcing, reason := r.Enforcer.Enforcing(ctx, loop)
+	if !enforcing && r.AllowUnenforced {
+		return true, engine.ReasonEnforcementDisabled // run anyway, not enforced
+	}
+	return enforcing, reason
+}
+
+// PolicyEnforcedCondition is the non-phase condition type recording whether the
+// eBPF engine is enforcing the Loop's policy (D30).
+const PolicyEnforcedCondition = "PolicyEnforced"
+
+// effectivePolicy resolves the Loop's effective policy: the union of the
+// referenced AgentPolicies, or the platform minimum (empty EffectivePolicy) when
+// there are no policyRefs (D30: the platform minimum is still translated,
+// emitted, and enforced — the gate applies to EVERY Loop). It errors if a
+// referenced AgentPolicy is missing (the operator must not silently run an
+// agent narrower than declared).
+func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.Loop) (policy.EffectivePolicy, error) {
+	union := policy.EffectivePolicy{}
+	for _, name := range loop.Spec.PolicyRefs {
+		var ap coxv1alpha1.AgentPolicy
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
+			return policy.EffectivePolicy{}, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+		}
+		union.Exec = append(union.Exec, ap.Spec.Exec...)
+		union.Network = append(union.Network, ap.Spec.Network...)
+		union.Files = append(union.Files, ap.Spec.Files...)
+	}
+	return union, nil
+}
+
 // ensureSandbox creates the Loop's Sandbox if it does not already exist, and
 // logs it. It is idempotent: an existing sandbox is left functionally
 // untouched except that we re-assert ownership and the container spec.
@@ -300,6 +388,20 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
+		// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
+		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
+		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
+		// invalid policy suspends via suspendSandboxIfRunning, and unenforced
+		// also suspends here.
+		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
+			enforced, _ := r.enforcementStatus(ctx, loop)
+			if !enforced {
+				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+			}
+		}
+		// C6b (P1 #2): the sandbox pod carries the coxswain.io/loop label the
+		// KubeArmorPolicy selector targets.
+		desired.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{"coxswain.io/loop": loop.Name}
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
 		// C2 (P2): never share the process namespace. The proxy and agent run as
 		// different UIDs, but a shared PID namespace would let the (untrusted) agent
@@ -599,8 +701,8 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 }
 
 // setCondition upserts a condition on the Loop's status. The condition's Type
-// is the terminal phase (e.g. "Failed") so each terminal outcome is recorded
-// once with its reason (e.g. TamperedVerify). It is the operator's audit record
+// is a string (a terminal phase like "Failed", or a non-phase condition type
+// like "PolicyEnforced" or "PolicyValid"). It is the operator's audit record
 // (ADR-0004); the runner never writes it.
 func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
 	now := metav1.Now()

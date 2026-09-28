@@ -178,14 +178,89 @@ in the audit stream. (The slice that makes ADR-0006 + ADR-0007 concrete.)
     the union of both policies' allows (a missing referenced AgentPolicy is a
     reconcile error, not a silent narrow policy); a Loop with no policyRefs leaves
     the hash empty (default-deny minimum).
-  - **C6b — engine runtime + gate (remaining).** The operator **emits** a
-    `KubeArmorPolicy` in BPF-LSM mode selecting the Loop's sandbox pod, owned by
-    the Loop (behind an internal interface, swappable for Tetragon), and gates
-    the sandbox on **positive evidence** enforcement is active on the node
-    (`PolicyEnforced`, D30 — `EngineUnavailable` | `NodeNotEnforcing` |
-    `PolicyRejected`; the Loop waits, no terminal reason). `make kind-up` gains
-    the engine install step + the disallowed-`exec` smoke. The generated
-    `NetworkPolicy` (the coarse outer fence) is C3.
+  - **C6b — engine runtime + gate.** The operator is engine-agnostic behind an
+    internal `engine.Enforcer` interface (set to a fake in envtest, to the
+    KubeArmor emitter in prod): `Apply(ctx, loop, enginePolicy) error` (emit the
+    policy object) and `Enforcing(ctx, loop) (bool, reason string)` (D30
+    evidence). The KubeArmor emitter translates Coxswain's `EnginePolicy` into a
+    `KubeArmorPolicy` (group `security.kubearmor.com/v1`): `selector.matchLabels`
+    targets the sandbox pod; `syscalls.matchPaths`/`matchSyscalls`,
+    `network.matchDNSQueries` (host:port → DNS name) + `matchProtocols`, and
+    `file.matchPaths` carry the allows; `action: Allow` per rule, base default
+    the platform minimum. The D30 gate: before `ensureSandbox` sets OperatingMode
+    Running, the operator calls `Enforcing()`; on not-enforcing it holds the
+    sandbox Suspended + `PolicyEnforced=False` (reason `EngineUnavailable` |
+    `NodeNotEnforcing` | `PolicyRejected`) and requeues — never fails the Loop
+    (Q5). Seams: (1) pure unit test for the KubeArmorPolicy emitter over an
+    `EnginePolicy` (assert selector + syscall/network/file fields); (2) envtest
+    with a fake `Enforcer` (not-enforcing → sandbox Suspended + condition;
+    enforcing → Running). **Real-engine e2e (KubeArmor installed on kind via a
+    `make kind-up` step + a disallowed `exec` actually blocked) is RUN as
+    `make kubearmor-e2e` (test/e2e/kubearmor-exec-block.sh) — installed
+    KubeArmor v1.7.5 on kind 1.34 (pinned `karmor install --tag v1.7.5`, the
+    v-prefix mandatory) and proved the operator's KubeArmorPolicy is accepted +
+    loaded on the pod (karmor probe: pod 'Armored Up', Active LSM BPFLSM) and
+    the allowed exec runs. Two emitter bugs found + fixed by the e2e: exec
+    allows emitted as `/**/<binary>` (KubeArmor's `process.matchPaths[].path`
+    requires an absolute-path pattern) and `spec.action: Block` (default-deny;
+    without it KubeArmor defaults to Audit and nothing is blocked). **Honest
+    result: the disallowed exec (curl) was NOT blocked in that environment**
+    (a KubeArmor BPF-LSM process-enforcement gap, not diagnosed); the script
+    asserts the block and fails if not enforced, so a green run is the proof
+    and it does not currently go green. D30's `Enforcing()` evidence is still
+    the agent's telemetry/alert stream (I32 relay), not the policy object: the
+    KubeArmorPolicy CRD has no enforcement status field (`status: {}`), so D30's evidence is the agent's telemetry/alert stream
+    (I32), a real-runtime dependency; and per-container scoping (D29) is NOT
+    expressible in one KubeArmorPolicy (selector is pod-level), so the
+    agent=localhost / proxy=model-endpoint split is enforced by the
+    NetworkPolicy (C3) with the KubeArmorPolicy as the pod-level fence.
+    **R15 P1s fixed (9a951f2):** (1) the D30 gate applies to EVERY Loop (no
+    policyRefs = the platform minimum, still translated/emitted/enforced; the old
+    no-policyRefs-ungated spec is inverted); (2) the gate has something behind it —
+    Reconcile calls `Enforcer.Apply` before the gate, the sandbox pod template
+    carries the `coxswain.io/loop` label the selector targets, and a real
+    `KubeArmorEnforcer` (unstructured create/update of the KubeArmorPolicy,
+    owner-ref'd) is wired in `cmd/main.go`; (3) exec allows are emitted under
+    `process.matchPaths` + `action: Allow`, not `syscalls` (monitoring-only).
+    `Enforcing` fails closed (NodeNotEnforcing) until the I32 relay is wired.
+    **R15 P1s fixed (9a951f2):** (1) the D30 gate applies to EVERY Loop (no
+    policyRefs = the platform minimum, still translated/emitted/enforced; the old
+    no-policyRefs-ungated spec is inverted); (2) the gate has something behind it —
+    Reconcile calls `Enforcer.Apply` before the gate, the sandbox pod template
+    carries the `coxswain.io/loop` label the selector targets, and a real
+    `KubeArmorEnforcer` (unstructured create/update of the KubeArmorPolicy,
+    owner-ref'd) is wired in `cmd/main.go`; (3) exec allows are emitted under
+    `process.matchPaths` + `action: Allow`, not `syscalls` (monitoring-only).
+    `Enforcing` fails closed (NodeNotEnforcing) until the I32 relay is wired.
+    **Remaining:** the real kind e2e (KubeArmor on kind via `make kind-up` + a
+    disallowed exec actually blocked) + the D29 per-container proposal (P2, a
+    review doc before any C3 code).
+    **R15 P1 round 2 (5068c15):** (1) **exec-block posture** — root cause of
+    "the disallowed exec ran": KubeArmor v1.7.5's BPF-LSM gates the exec
+    allowlist's block-vs-audit on `defaultFilePosture` (NOT `spec.action`; the
+    process whitelist's block sentinel is keyed on `defaultPosture.FileAction` in
+    `enforcer/bpflsm/rulesHandling.go`), and `karmor install` defaults it to
+    `audit`. `make kind-up` now sets `kubearmor-config` to
+    `defaultFilePosture/NetworkPosture/CapabilitiesPosture: block` +
+    `visibility: process,file,network,capabilities`, then restarts the KubeArmor
+    DaemonSet so the live BPF map flips; the e2e asserts `defaultFilePosture=block`
+    up front so a misconfigured env fails with a clear posture message. (2)
+    **`/**/<name>` spoofing** — each `process.matchPaths` item carries ONLY
+    `{path: <absolute location for the real binary>}` (go →
+    `/usr/local/go/bin/go` via a `defaultExecPaths` map), so a same-named
+    binary in a writable dir does not satisfy the allow. (R16 correction:
+    the item must NOT also set `execname` — v1.7.5's BPF-LSM keys the process
+    rule on the exec'd file's dentry name when execname is present and IGNORES
+    path, so `execname`+`path` is exactly as spoofable as `/**/<name>`;
+    reproduced on coxswain-dev: an `execname`+`path` item allowed a copied
+    `/tmp/go`, the path-only item denied it.) (3) **base-manifest
+    flag** — `--allow-unenforced` removed from `config/manager/manager.yaml` (so
+    `make deploy` / `dist/install.yaml` ship fail-closed); added
+    `config/manager/allow-unenforced.yaml` as a dev/kind overlay that `make deploy`
+    applies. **Remaining:** the real kind e2e run (needs a kind+KubeArmor host to
+    go green once the posture is block); the D29 per-container proposal is now
+    superseded by the owner's R13 decision (option c: the proxy in its own pod —
+    `docs/REVIEW-PHASE1-R13.md`), implemented as D33–D35.
 
 - **C7** — *Activity-audit stream (ADR-0007 Q4).* Coxswain **emits** agent-
 activity audit as JSON lines on each trusted source's stdout with the common

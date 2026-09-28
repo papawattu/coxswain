@@ -79,6 +79,21 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 		}
 	})
 
+	// makeSecret creates a model-creds Secret so the Loop has an
+	// EndpointSecretRef (like a real Loop): with a model endpoint the agent
+	// gets COX_MODEL_BASE_URL (the model proxy .svc URL), which is what spec 3
+	// asserts NO_PROXY excludes.
+	makeSecret := func(name, ns string) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:  d34TestKey,
+				modelBaseURL: "http://model-endpoint:8000",
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+	}
+
 	buildLoop := func(name, ns string, env []coxv1alpha1.AgentEnvVar) *coxv1alpha1.Loop {
 		return &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -86,29 +101,36 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 				Goal:       "i42d test",
 				Workspace:  coxv1alpha1.Workspace{Repo: i42bTestRepo, Ref: loopRef},
 				PolicyRefs: []string{i42dPolicyName},
-				Agent:      coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel, Env: env},
+				Agent: coxv1alpha1.AgentConfig{
+					Image:             runnerImage,
+					Model:             testModel,
+					Env:               env,
+					EndpointSecretRef: name + "-model",
+					ModelEndpoint:     "model-endpoint:8000",
+				},
 			},
 		}
 	}
 
-	// reconcileAgentEnv creates the namespace + AgentPolicy + Loop,
-	// reconciles, and returns the agent container's env from the sandbox
-	// spec as a name->value map (env may not contain duplicate names).
-	reconcileAgentEnv := func(loopName, ns string, policyNetwork []string, env []coxv1alpha1.AgentEnvVar) map[string]string {
-		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+	// setPolicyNetwork (re)writes the test AgentPolicy's network allows in ns.
+	// A new allows value makes needsEgressProxy flip, so a re-reconcile must
+	// update the existing sandbox's agent env.
+	setPolicyNetwork := func(ns string, network []string) {
+		ap := &coxv1alpha1.AgentPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dPolicyName}, ap)).To(Succeed())
+		ap.Spec.Network = network
+		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
+	}
 
-		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
-			ObjectMeta: metav1.ObjectMeta{Name: i42dPolicyName, Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Network: policyNetwork},
-		})).To(Succeed())
-
-		loop := buildLoop(loopName, ns, env)
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-
+	// reconcileLoop reconciles the Loop once in ns.
+	reconcileLoop := func(loopName, ns string) {
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
 		Expect(err).NotTo(HaveOccurred())
+	}
 
+	// agentEnvOf returns the agent container's env from the sandbox spec as a
+	// name->value map (env may not contain duplicate names).
+	agentEnvOf := func(loopName, ns string) map[string]string {
 		sb := &sandboxv1beta1.Sandbox{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-sandbox"}, sb)).To(Succeed(),
 			"the sandbox must exist after reconcile")
@@ -132,10 +154,32 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 		return "http://" + egressProxyServiceName(loopName) + "." + ns + ".svc:3128"
 	}
 
+	// setup creates the namespace + model Secret + AgentPolicy + Loop and
+	// reconciles once; it returns the namespace (cleaned up on test exit).
+	setup := func(loopName string, policyNetwork []string, env []coxv1alpha1.AgentEnvVar) string {
+		ns := "i42d-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) })
+
+		makeSecret(loopName+"-model", ns)
+
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42dPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: policyNetwork},
+		})).To(Succeed())
+
+		loop := buildLoop(loopName, ns, env)
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		reconcileLoop(loopName, ns)
+		return ns
+	}
+
 	// spec 1: network allows present -> *_PROXY set with the expected values.
 	It("sets HTTPS_PROXY, HTTP_PROXY and NO_PROXY when the effective policy has network allows", func() {
-		ns := "i42d-allow-" + nowSuffix()
-		env := reconcileAgentEnv("allow-loop", ns, []string{i42dAllowHost}, nil)
+		loopName := "allow-loop"
+		ns := setup(loopName, []string{i42dAllowHost}, nil)
+		env := agentEnvOf(loopName, ns)
 
 		wantURL := wantEgressProxyURL("allow-loop", ns)
 		Expect(env["HTTPS_PROXY"]).To(Equal(wantURL),
@@ -155,8 +199,9 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 
 	// spec 2: no network allows -> *_PROXY NOT set.
 	It("does not set the proxy env vars when there are no network allows", func() {
-		ns := "i42d-noallow-" + nowSuffix()
-		env := reconcileAgentEnv("noallow-loop", ns, nil, nil)
+		loopName := "noallow-loop"
+		ns := setup(loopName, nil, nil)
+		env := agentEnvOf(loopName, ns)
 
 		Expect(env).ToNot(HaveKey("HTTPS_PROXY"),
 			"HTTPS_PROXY must not be set without network allows (the agent has no external egress)")
@@ -167,8 +212,9 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 	// spec 3: COX_MODEL_BASE_URL's host matches a NO_PROXY entry, so model
 	// calls bypass the egress proxy.
 	It("excludes the model proxy from the egress proxy via NO_PROXY", func() {
-		ns := "i42d-noproxy-" + nowSuffix()
-		env := reconcileAgentEnv("noproxy-loop", ns, []string{i42dAllowHost}, nil)
+		loopName := "noproxy-loop"
+		ns := setup(loopName, []string{i42dAllowHost}, nil)
+		env := agentEnvOf(loopName, ns)
 
 		baseURL := env[coxModelBaseURL]
 		Expect(baseURL).ToNot(BeEmpty(), "COX_MODEL_BASE_URL must be set (a model endpoint is configured)")
@@ -187,8 +233,9 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 
 	// spec 4: standard names, not COX_-prefixed.
 	It("uses the standard proxy env var names (not COX_-prefixed)", func() {
-		ns := "i42d-names-" + nowSuffix()
-		env := reconcileAgentEnv("names-loop", ns, []string{i42dAllowHost}, nil)
+		loopName := "names-loop"
+		ns := setup(loopName, []string{i42dAllowHost}, nil)
+		env := agentEnvOf(loopName, ns)
 
 		Expect(env).To(HaveKey("HTTPS_PROXY"))
 		Expect(env).To(HaveKey("HTTP_PROXY"))
@@ -203,12 +250,13 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 	// wins. The agent must not be able to re-route its egress away from the
 	// egress proxy (the network allowlist is operator policy).
 	It("drops user spec.agent.env vars that collide with the operator proxy names", func() {
-		ns := "i42d-userconflict-" + nowSuffix()
-		env := reconcileAgentEnv("userconflict-loop", ns, []string{i42dAllowHost}, []coxv1alpha1.AgentEnvVar{
+		loopName := "userconflict-loop"
+		ns := setup(loopName, []string{i42dAllowHost}, []coxv1alpha1.AgentEnvVar{
 			{Name: "HTTP_PROXY", Value: i42dUserProxy},
 			{Name: "NO_PROXY", Value: i42dUserNOProxy},
 			{Name: "KEEP_ME", Value: "survives"},
 		})
+		env := agentEnvOf(loopName, ns)
 
 		wantURL := wantEgressProxyURL("userconflict-loop", ns)
 		Expect(env["HTTP_PROXY"]).To(Equal(wantURL),
@@ -217,5 +265,42 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 			"the operator NO_PROXY must win over a user spec.agent.env value")
 		Expect(env).To(HaveKeyWithValue("KEEP_ME", "survives"),
 			"non-colliding user env vars must be preserved")
+	})
+
+	// spec 6 (handoff): the env must UPDATE on an existing Sandbox when the
+	// effective policy's network allows are added or removed — the operator
+	// re-asserts the agent container spec on every reconcile (CreateOrUpdate
+	// mutates the live sandbox), so a policy edit propagates to the sandbox
+	// spec (and, via the sandbox controller's template-hash reconcile, to the
+	// pod). Same Loop: add the allows, re-reconcile -> env appears; remove
+	// them, re-reconcile -> env is gone again.
+	It("updates the existing Sandbox's agent env when network allows are added or removed", func() {
+		loopName := "upd-loop"
+		// Start with NO allows: the sandbox exists without the proxy env.
+		ns := setup(loopName, nil, nil)
+
+		env := agentEnvOf(loopName, ns)
+		Expect(env).ToNot(HaveKey("HTTPS_PROXY"), "setup: no allows -> no proxy env on the new sandbox")
+
+		// Add a network allow and re-reconcile the SAME Loop: the existing
+		// sandbox's agent env must gain the proxy vars.
+		setPolicyNetwork(ns, []string{i42dAllowHost})
+		reconcileLoop(loopName, ns)
+
+		env = agentEnvOf(loopName, ns)
+		wantURL := wantEgressProxyURL(loopName, ns)
+		Expect(env["HTTPS_PROXY"]).To(Equal(wantURL),
+			"adding a network allow must set HTTPS_PROXY on the existing sandbox")
+		Expect(env["HTTP_PROXY"]).To(Equal(wantURL))
+		Expect(env).To(HaveKey("NO_PROXY"))
+
+		// Remove the allow and re-reconcile: the proxy vars must be gone.
+		setPolicyNetwork(ns, nil)
+		reconcileLoop(loopName, ns)
+
+		env = agentEnvOf(loopName, ns)
+		Expect(env).ToNot(HaveKey("HTTPS_PROXY"), "removing the allows must unset HTTPS_PROXY on the existing sandbox")
+		Expect(env).ToNot(HaveKey("HTTP_PROXY"))
+		Expect(env).ToNot(HaveKey("NO_PROXY"))
 	})
 })

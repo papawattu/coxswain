@@ -32,6 +32,7 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -140,6 +141,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// D33: the per-Loop proxy pod + Service exist only when a model endpoint is
 	// configured (P1 parity: no half-configured proxy). Created after the
 	// sandbox so the agent's COX_MODEL_BASE_URL target exists in the same pass.
+	// Capture the conditions before ensureProxy so we can detect a change (P3:
+	// write status only when it actually moved).
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
 	if loop.Spec.Agent.EndpointSecretRef != "" {
 		if err := r.ensureProxy(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
@@ -164,13 +169,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		changed = true
 	}
 	// D35b: ensureProxy may have set or resolved the ProxyConflict
-	// condition. The condition is on the loop object; persist it. The
-	// condition is set to True/ForeignProxy when a foreign pod occupies
-	// the proxy name, and to False/Resolved when the controller's own
-	// proxy pod is in place. We persist it whenever endpointSecretRef is
-	// set (the condition only exists in that case).
+	// condition. Persist the status only when it actually changed (P3:
+	// avoid a Status().Update on every reconcile when nothing moved).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
-		changed = true
+		changed = changed || !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 	}
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	if loop.Status.Phase == "" {
@@ -884,11 +886,22 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 	// D35b: if the ProxyConflict condition was set in a previous reconcile
 	// (a foreign pod occupied the proxy name) and the controller's own
 	// proxy pod is now in place (created or hash-matched), set the
-	// condition to False/Resolved. This gives the user an audit trail and
-	// avoids the "condition deleted but the deletion was never persisted"
-	// bug (the removed condition would still be visible on the next Get).
-	setCondition(loop, "ProxyConflict", "False", "Resolved",
-		"the proxy pod is now controlled by this Loop")
+	// condition to False. Use Resolved only on a True→False transition;
+	// NoConflict when the condition was never True.
+	wasTrue := false
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == "ProxyConflict" && loop.Status.Conditions[i].Status == "True" {
+			wasTrue = true
+			break
+		}
+	}
+	if wasTrue {
+		setCondition(loop, "ProxyConflict", "False", "Resolved",
+			"the proxy pod is now controlled by this Loop")
+	} else {
+		setCondition(loop, "ProxyConflict", "False", "NoConflict",
+			"no foreign proxy pod was detected")
+	}
 
 	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
 		log.V(1).Info("ensured loop proxy (no change)",

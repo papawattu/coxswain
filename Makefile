@@ -111,11 +111,14 @@ AGENT_SANDBOX_MANIFEST ?= https://github.com/kubernetes-sigs/agent-sandbox/relea
 # registry.k8s.io).
 AGENT_SANDBOX_CONTROLLER_IMAGE ?= registry.k8s.io/agent-sandbox/agent-sandbox-controller:$(AGENT_SANDBOX_VERSION)
 
+PROXY_IMG ?= coxswain-proxy:standin
+
 .PHONY: proxy-build
 proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
 	$(CONTAINER_TOOL) build -t $(PROXY_IMG) -f cmd/proxy-standin/Dockerfile .
 
 
+.PHONY: kind-up
 kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGENT_SANDBOX_VERSION)
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
@@ -153,10 +156,10 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 		&& echo "   defaultFilePosture=$$FP visibility=$$VP" \
 		&& [ "$$FP" = "block" ] \
 		&& case "$$VP" in *process*) true;; *) echo "process visibility missing"; false;; esac \
-	$(MAKE) proxy-build
-	kind load docker-image $(PROXY_IMG) --name $(KIND_CLUSTER)
-
 		|| { echo "Posture is not block (defaultFilePosture=$$FP): a disallowed exec would be logged but allowed. Check KUBEARMOR_POSTURE_FLAGS."; exit 1; }
+	@echo "Building the proxy stand-in image and loading it into the kind node..."
+	$(MAKE) proxy-build
+	$(KIND) load docker-image "$(PROXY_IMG)" --name $(KIND_CLUSTER)
 
 .PHONY: kind-smoke
 kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True

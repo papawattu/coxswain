@@ -163,13 +163,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		loop.Status.ObservedGeneration = loop.Generation
 		changed = true
 	}
-	// D35b: ensureProxy may have set or cleared the ProxyConflict condition.
-	// The condition is on the loop object; persist it.
-	for i := range loop.Status.Conditions {
-		if loop.Status.Conditions[i].Type == "ProxyConflict" {
-			changed = true
-			break
-		}
+	// D35b: ensureProxy may have set or resolved the ProxyConflict
+	// condition. The condition is on the loop object; persist it. The
+	// condition is set to True/ForeignProxy when a foreign pod occupies
+	// the proxy name, and to False/Resolved when the controller's own
+	// proxy pod is in place. We persist it whenever endpointSecretRef is
+	// set (the condition only exists in that case).
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		changed = true
 	}
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	if loop.Status.Phase == "" {
@@ -272,7 +273,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				return err
 			}
 		} else {
-			proxyReady = isPodReady(proxyPod)
+			// P1: a foreign Ready pod must NOT open the gate. The gate
+			// requires that the proxy pod is BOTH controlled by this Loop
+			// AND Ready. A foreign pod with the proxy labels would receive
+			// the Service's traffic; the sandbox must stay Suspended.
+			proxyReady = metav1.IsControlledBy(proxyPod, loop) && isPodReady(proxyPod)
 		}
 	}
 
@@ -735,6 +740,8 @@ func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.
 const (
 	netpolAgentComponent = "agent"
 	netpolComponentLabel = "app.kubernetes.io/component"
+	netpolProxyForLabel  = "coxswain.io/proxy-for"
+	netpolProxyComponent = "model-proxy"
 )
 
 // proxyLabels is the label set the per-Loop proxy pod carries and the proxy
@@ -744,8 +751,8 @@ const (
 // rest).
 func proxyLabels(loopName string) map[string]string {
 	return map[string]string{
-		netpolComponentLabel:    "model-proxy",
-		"coxswain.io/proxy-for": loopName,
+		netpolComponentLabel: "model-proxy",
+		netpolProxyForLabel:  loopName,
 	}
 }
 
@@ -874,17 +881,14 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 	// Pod exists and hash matches: nothing to do.
 	podOp := controllerutil.OperationResultNone
 
-	// D35b: clear the ProxyConflict condition if it was set in a previous
-	// reconcile (e.g., the user deleted the foreign pod and the controller
-	// created its own).
-	if loop.Status.Conditions != nil {
-		for i := range loop.Status.Conditions {
-			if loop.Status.Conditions[i].Type == "ProxyConflict" {
-				loop.Status.Conditions = append(loop.Status.Conditions[:i], loop.Status.Conditions[i+1:]...)
-				break
-			}
-		}
-	}
+	// D35b: if the ProxyConflict condition was set in a previous reconcile
+	// (a foreign pod occupied the proxy name) and the controller's own
+	// proxy pod is now in place (created or hash-matched), set the
+	// condition to False/Resolved. This gives the user an audit trail and
+	// avoids the "condition deleted but the deletion was never persisted"
+	// bug (the removed condition would still be visible on the next Get).
+	setCondition(loop, "ProxyConflict", "False", "Resolved",
+		"the proxy pod is now controlled by this Loop")
 
 	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
 		log.V(1).Info("ensured loop proxy (no change)",

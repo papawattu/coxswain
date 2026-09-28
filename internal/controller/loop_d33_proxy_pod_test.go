@@ -265,13 +265,13 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		Expect(p.Labels).NotTo(HaveKey("coxswain.io/loop"),
 			"P1: the proxy pod must not carry the agent's coxswain.io/loop label")
 		Expect(p.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
-		Expect(p.Labels).To(HaveKeyWithValue("coxswain.io/proxy-for", name))
+		Expect(p.Labels).To(HaveKeyWithValue(netpolProxyForLabel, name))
 
 		// The Service selects ONLY the proxy labels.
 		svc := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, svc)).To(Succeed())
 		Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
-		Expect(svc.Spec.Selector).To(HaveKeyWithValue("coxswain.io/proxy-for", name))
+		Expect(svc.Spec.Selector).To(HaveKeyWithValue(netpolProxyForLabel, name))
 		Expect(svc.Spec.Selector).NotTo(HaveKey("coxswain.io/loop"))
 
 		// Note: the sandbox pod's coxswain.io/loop label is set by the
@@ -417,8 +417,8 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 				Name:      "unowned-loop-proxy",
 				Namespace: ns,
 				Labels: map[string]string{
-					"app.kubernetes.io/component": "model-proxy",
-					"coxswain.io/proxy-for":       "unowned-loop",
+					netpolComponentLabel: "model-proxy",
+					netpolProxyForLabel:  "unowned-loop",
 				},
 				Annotations: map[string]string{
 					proxySpecHashAnnotation: "stale-hash-000000",

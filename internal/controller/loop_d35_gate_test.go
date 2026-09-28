@@ -20,14 +20,16 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 	// Local consts (the shared consts from the main suite are not available
 	// in this file because it's a separate Describe).
 	const (
-		d35TestRepo      = "https://github.com/papawattu/coxswain.git"
-		d35TestKey       = "key"
-		d35ModelEndpoint = "fake-model:8000"
-		d35RunnerImage   = "docker.io/library/golang:1.26"
-		d35TestModel     = "test-model"
-		d35SecretName    = "d35-creds"
-		d35LoopName      = "d35-gate"
-		d35Namespace     = "d35-gate-ns"
+		d35TestRepo         = "https://github.com/papawattu/coxswain.git"
+		d35TestKey          = "key"
+		d35ModelEndpoint    = "fake-model:8000"
+		d35RunnerImage      = "docker.io/library/golang:1.26"
+		d35TestModel        = "test-model"
+		d35SecretName       = "d35-creds"
+		d35LoopName         = "d35-gate"
+		d35Namespace        = "d35-gate-ns"
+		d35ForeignContainer = "foreign"
+		d35ProxyConflict    = "ProxyConflict"
 	)
 
 	// buildD35Loop creates a Loop with endpointSecretRef + modelEndpoint set.
@@ -67,8 +69,8 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 		_ = k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: d35SecretName, Namespace: d35Namespace},
 			StringData: map[string]string{
-				"MODEL_API_KEY": "d35-test-key",
-				modelBaseURL:    "http://" + d35ModelEndpoint,
+				modelAPIKey:  d35TestKey,
+				modelBaseURL: "http://" + d35ModelEndpoint,
 			},
 		})
 	})
@@ -167,8 +169,8 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 		_ = k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: d35SecretName, Namespace: ns},
 			StringData: map[string]string{
-				"MODEL_API_KEY": "d35-test-key",
-				modelBaseURL:    "http://" + d35ModelEndpoint,
+				modelAPIKey:  d35TestKey,
+				modelBaseURL: "http://" + d35ModelEndpoint,
 			},
 		})
 		conflictLoopName := "d35-conflict"
@@ -184,13 +186,13 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 				Name:      conflictLoopName + "-proxy",
 				Namespace: ns,
 				Labels: map[string]string{
-					"app.kubernetes.io/component": "model-proxy",
-					"coxswain.io/proxy-for":       conflictLoopName,
+					netpolComponentLabel: netpolProxyComponent,
+					netpolProxyForLabel:  conflictLoopName,
 				},
 			},
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{
-					Name:  "foreign",
+					Name:  d35ForeignContainer,
 					Image: "docker.io/library/busybox:1.36",
 				}},
 			},
@@ -212,7 +214,7 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 			Name: conflictLoopName, Namespace: ns,
 		}, loop)).To(Succeed())
 		for i := range loop.Status.Conditions {
-			if loop.Status.Conditions[i].Type == "ProxyConflict" {
+			if loop.Status.Conditions[i].Type == d35ProxyConflict {
 				conflict = &loop.Status.Conditions[i]
 				break
 			}
@@ -220,6 +222,113 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 		Expect(conflict).ToNot(BeNil(), "ProxyConflict condition must be set when a foreign pod has the proxy name")
 		Expect(conflict.Status).To(Equal(metav1.ConditionTrue),
 			"ProxyConflict must be True when a foreign pod occupies the proxy name")
+		Expect(conflict.Reason).To(Equal("ForeignProxy"))
+
+		// P1 acceptance: the sandbox must be Suspended (the foreign pod is
+		// NOT controlled by the Loop, so the gate stays closed even if the
+		// foreign pod is Ready).
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: conflictLoopName + "-sandbox", Namespace: ns,
+		}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the sandbox must stay Suspended when a foreign pod occupies the proxy name (P1)")
+
+		// P2 acceptance: delete the foreign pod and reconcile. The
+		// controller should create its own proxy pod and set
+		// ProxyConflict=False/Resolved (not delete the condition).
+		Expect(k8sClient.Delete(ctx, foreignPod)).To(Succeed())
+		reconcileLoop(conflictLoopName, ns)
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: conflictLoopName, Namespace: ns,
+		}, loop)).To(Succeed())
+		var resolved *metav1.Condition
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == d35ProxyConflict {
+				resolved = &loop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(resolved).ToNot(BeNil(),
+			"ProxyConflict condition must be set to False/Resolved (not deleted)")
+		Expect(resolved.Status).To(Equal(metav1.ConditionFalse),
+			"ProxyConflict must be False after the foreign pod is deleted")
+		Expect(resolved.Reason).To(Equal("Resolved"))
+	})
+
+	It("D35a P1: a foreign Ready pod does NOT open the gate", func() {
+		// P1 acceptance: a foreign <loop>-proxy pod that IS Ready must not
+		// make the sandbox Running. The gate requires IsControlledBy && Ready.
+		ns := "d35-p1-ns"
+		_ = k8sClient.Create(ctx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: ns},
+		})
+		_ = k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: d35SecretName, Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:  d35TestKey,
+				modelBaseURL: "http://" + d35ModelEndpoint,
+			},
+		})
+		loopName := "d35-p1"
+		loop := buildD35Loop(loopName, ns)
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Pre-create a FOREIGN Ready pod with the proxy name.
+		foreignPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      loopName + "-proxy",
+				Namespace: ns,
+				Labels: map[string]string{
+					netpolComponentLabel: netpolProxyComponent,
+					netpolProxyForLabel:  loopName,
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  d35ForeignContainer,
+					Image: "docker.io/library/busybox:1.36",
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, foreignPod)).To(Succeed())
+		// Mark it Ready.
+		readyCond := corev1.PodCondition{
+			Type:   corev1.PodReady,
+			Status: corev1.ConditionTrue,
+			Reason: "ContainersReady",
+		}
+		foreignPod.Status.Conditions = append(foreignPod.Status.Conditions, readyCond)
+		foreignPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  d35ForeignContainer,
+			Ready: true,
+		}}
+		Expect(k8sClient.Status().Update(ctx, foreignPod)).To(Succeed())
+
+		// Reconcile: the foreign pod is Ready but NOT controlled by the
+		// Loop, so the sandbox must be Suspended and ProxyConflict=True.
+		reconcileLoop(loopName, ns)
+
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: loopName + "-sandbox", Namespace: ns,
+		}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"a foreign Ready pod must NOT open the gate (P1)")
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: loopName, Namespace: ns,
+		}, loop)).To(Succeed())
+		var conflict *metav1.Condition
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == d35ProxyConflict {
+				conflict = &loop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(conflict).ToNot(BeNil(), "ProxyConflict must be set (P1)")
+		Expect(conflict.Status).To(Equal(metav1.ConditionTrue))
 		Expect(conflict.Reason).To(Equal("ForeignProxy"))
 	})
 })

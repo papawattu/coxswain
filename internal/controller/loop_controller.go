@@ -988,12 +988,11 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// P2 (R17 R18): the AgentPolicy `network` allows are NOT translated
 	// into egress rules. The naive port-only approach is rejected (I42,
 	// docs/REVIEW-PHASE1-R14.md): a port-only rule is "any host on that
-	// port," which is the exfiltration path. The hostname-level precision
-	// must come from D35's KubeArmor agent policy (matchDNSQueries). Until
-	// I42 is resolved, agent egress stays proxy + DNS. When C6a merges and
-	// I42 is resolved, the operator should set a NetworkAllowsNotEnforced
-	// condition on the Loop if it has AgentPolicy network allows that are
-	// not yet enforced. The gap is recorded in ADR-0007.
+	// port," which is the exfiltration path. I42 is resolved by an
+	// operator-owned per-Loop egress proxy that enforces the hostname:port
+	// allowlist at the HTTP CONNECT / SNI / Host layer (ADR-0007, "I42
+	// resolution"). Until that slice lands, agent egress stays proxy + DNS
+	// (fail-closed).
 	agentNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-agent-netpol",

@@ -1,4 +1,4 @@
-# Phase 1 review, round 15: long-term direction (AI-native SDLC)
+# Phase 1 review, round 15: long-term direction (a general workflow orchestrator)
 
 Design round, 2026-09-28, since tag `review/phase1-r14`. It records the
 owner's long-term goal and the gap analysis behind it, so later slices and
@@ -8,17 +8,45 @@ ADRs can be judged against it. There are no code findings in this round.
 
 ## P1: Owner decision
 
-### D36. coxswain and the AI-native SDLC: build engine, or the whole lifecycle?
+### D36. coxswain's long-term shape: a general orchestrator for gated, isolated agent workflows
 
 - [x] Decided (owner, 2026-09-28): **option (d), an extensible core** (below)
 - [ ] ADR written
 
-**Owner decision:** coxswain should provide a way to implement **every**
-capability in the gap table, but **via extensions**. The core defines the
-extension points, contracts and trust boundaries; implementations plug in.
-Example: *memory* could be Honcho. That makes the answer neither (a) nor (b)
-as written: coxswain owns the lifecycle's **seams**, not every
-implementation.
+**Owner decision:**
+- **Not SDLC-specific.** coxswain orchestrates **any** workflow that needs
+  this kind of orchestration: stages carried out by untrusted agents in
+  isolation, human or evidence gates between stages, an approval record, and
+  a result handed back. The AI-native SDLC is the first and motivating
+  **workflow definition**, not the product's shape. Consistent with the
+  earlier owner direction that coxswain must not assume coding agents.
+- **Every capability via extensions.** The core defines the extension points,
+  contracts and trust boundaries; implementations plug in. Example: memory
+  could be Honcho.
+- **Simple defaults, solid externals.** Each extension point ships a simple
+  built-in default so coxswain works end-to-end with nothing extra installed;
+  a solid external implementation plugs in through the same contract.
+
+**What's generic in the core vs. what the SDLC brings:**
+- **Generic core:** the workflow/stage graph, gates and approvals, the ledger,
+  isolated agent execution (sandbox, proxies, NetworkPolicy, eBPF policy),
+  operator-held evidence and checks, the audit stream, and the extension
+  contract.
+- **The SDLC as one workflow definition:** its stages (intent → spec → plan
+  → build → test → deploy → maintain), its artifacts (a repo, a PR), its
+  checks (tests, tamper detection on protected paths) and its deliverable (a
+  PR or release).
+- **Other workflows** plug in their own stages, checks and deliverables: e.g.
+  research/report pipelines, data processing, infra changes, document review.
+  None of them touch the core.
+
+**Implication for today's code:** Loop/Sandbox/proxies/gates are already
+largely workflow-agnostic. The coding-specific parts are the plan →
+implement → verify phase names, the repo/PR assumptions and the
+git-specific tamper checks. They should end up behind the workflow-definition
+and "deliver" extension points, not in the core API. No change is needed
+now; it's a constraint on new slices (don't bake more coding assumptions into
+the core API).
 
 **Context:** the owner's long-term plan is for coxswain to implement the
 AI-native SDLC as packaged in
@@ -89,12 +117,12 @@ them: stages, gates, a ledger, intake, deploy and monitoring.
   |---|---|---|---|
   | Memory | lessons and context carried across runs | notes file in the repo (per-repo `.coxswain/memory.md`), read-only to the agent, curated by the operator | Honcho |
   | Intake | turning outside demand into work items | `kubectl apply` a Loop, or a label on a GitHub issue | forms, email, hermes kanban |
-  | Workflow / stages | the stage graph that drives Loops (intent → … → maintain) | a fixed linear graph: intent → plan → build → test → PR | the ai-native-sdlc skill, hermes, Argo Workflows |
+  | Workflow definition | the stages, gates and checks of a workflow (the SDLC is one) | a simple linear graph format, shipped with an **SDLC example definition** | the ai-native-sdlc skill, hermes, Argo Workflows |
   | Gate approvers | who may approve a gate, and how they're notified | an annotation or `kubectl coxswain approve` by a human with RBAC | GitHub review, Slack |
   | Ledger store | where approvals are recorded | a hash-chained file committed to git (core verifies the chain) | an external append-only log |
   | Agent roles | extra advisory agents (reviewer, PM, judge) | one runner, no extra roles | any runner image (advisory only) |
-  | Evals | the harness that scores agent configurations | run a list of eval Loops and report pass/fail | ai-native-sdlc evals, custom suites |
-  | Deploy | the release / production-gate step | stop at a merged PR (no deploy) | Argo CD, Flux |
+  | Checks / evals | stage checks (evidence) and the harness that scores agent configurations | run a command in an isolated verify pod and report pass/fail (today's verify); eval = a list of such runs | ai-native-sdlc evals, custom suites |
+  | Deliver | where a workflow's result goes (a PR, a release, a report, a dataset) behind a gate | open a PR (the SDLC case) or write an artifact | Argo CD/Flux for deploys, object stores, ticket systems |
   | Maintain / monitoring | signals that open new Loops | a webhook that turns an alert into a new Loop | Prometheus/Alertmanager with bands |
   | Enforcement engine | the eBPF policy engine (already a seam: C6b `Enforcer`) | KubeArmor (today) | Tetragon |
   | Model proxy | the credential-holding model gateway (already a seam: D33) | the stand-in forwarder (today) | LiteLLM, a vendor gateway |
@@ -146,12 +174,17 @@ plugged in:
    suggestion is both.
 
 **Acceptance:** the owner answers questions 2–4. The builder then writes
-ADR-0008, "coxswain as an extensible SDLC core", recording:
-- the extension points above;
+ADR-0008, "coxswain as a general, extensible orchestrator for gated, isolated
+agent workflows", recording:
+- the generic core vs. workflow definitions;
+- the extension points with their built-in defaults;
 - the extension contract (the invariants);
 - the mechanism;
-- the first two built-in extensions to prove it. Suggested: **memory via
-  Honcho** and **gate approvers via GitHub review**.
+- the SDLC as the first shipped workflow definition, plus a second,
+  non-coding example definition sketched to prove the core isn't
+  SDLC-shaped;
+- the first two external extensions: memory via Honcho, and gate approvers
+  via GitHub review.
 
 It also updates `docs/PLAN.md` so the phases after Phase 1 are expressed as
-extension points plus default implementations.
+core + extension points + workflow definitions.

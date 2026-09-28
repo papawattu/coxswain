@@ -276,7 +276,7 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 	})
 
 	It("allows legitimate external hosts and IPs", func() {
-		for _, a := range []string{"proxy.golang.org:443", "8.8.8.8:443", "1.1.1.1:53"} {
+		for _, a := range []string{i42eExternalHost, "8.8.8.8:443", "1.1.1.1:53"} {
 			_, ok := r.findInClusterNetworkAllow([]string{a})
 			Expect(ok).To(BeFalse(), "%s must NOT be flagged as in-cluster", a)
 		}

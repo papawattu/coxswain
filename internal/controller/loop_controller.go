@@ -1012,12 +1012,17 @@ func egressProxyLabels(loopName string) map[string]string {
 	}
 }
 
-// needsEgressProxy reports whether the effective policy has network allows
-// (the egress proxy is needed). A read error fails closed (the caller holds
-// the sandbox Suspended; the reconcile requeues on the error).
+// needsEgressProxy reports whether the egress proxy is required for the gate:
+// either the effective policy has network allows, or the effective policy
+// could not be read. A read error fails CLOSED (P2 review: err == nil &&
+// hasAllows would skip the gate on a transient Get error — with the gate
+// skipped and ensureEgressProxy returning the same error, the sandbox could
+// be set Running on a later reconcile of the error window). The sandbox gate
+// uses this as "require the egress proxy to be Ready"; the error case keeps
+// the sandbox Suspended and the reconcile requeues on the error.
 func needsEgressProxy(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
 	_, hasAllows, err := r.effectivePolicyNetwork(ctx, loop)
-	return err == nil && hasAllows
+	return err != nil || hasAllows
 }
 
 // effectivePolicyNetwork returns the union of the network allows across the

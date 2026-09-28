@@ -50,6 +50,10 @@ const (
 	// i42d test constants.
 	i42dPolicyName = "i42d-pol"
 	i42dAllowHost  = i42eExternalHost
+	// i42dAllowLoop is the Loop name for the "network allows present" specs.
+	// Shared with loop_i42b_egress_proxy_test.go so the repeated literal is a
+	// constant (goconst).
+	i42dAllowLoop = "allow-loop"
 	// i42dUserProxy / i42dUserNOProxy are user spec.agent.env values that
 	// collide with the operator-owned proxy names. The operator value must
 	// win (they are dropped).
@@ -177,24 +181,42 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 
 	// spec 1: network allows present -> *_PROXY set with the expected values.
 	It("sets HTTPS_PROXY, HTTP_PROXY and NO_PROXY when the effective policy has network allows", func() {
-		loopName := "allow-loop"
+		loopName := i42dAllowLoop
 		ns := setup(loopName, []string{i42dAllowHost}, nil)
 		env := agentEnvOf(loopName, ns)
 
-		wantURL := wantEgressProxyURL("allow-loop", ns)
-		Expect(env["HTTPS_PROXY"]).To(Equal(wantURL),
-			"HTTPS_PROXY must point at the egress proxy Service on port 3128")
-		Expect(env["HTTP_PROXY"]).To(Equal(wantURL),
-			"HTTP_PROXY must point at the egress proxy Service on port 3128")
+		wantURL := wantEgressProxyURL(i42dAllowLoop, ns)
+		// Both cases of each proxy var are set: clients are inconsistent about
+		// case (curl reads only lowercase http_proxy; Go reads either; wget/pip
+		// /npm/git/apt mostly lowercase), so the operator emits both.
+		for _, name := range operatorProxyNames("HTTPS_PROXY", "HTTP_PROXY") {
+			Expect(env[name]).To(Equal(wantURL),
+				"%s must point at the egress proxy Service on port 3128", name)
+		}
 
-		// NO_PROXY: the model proxy Service (short + FQDN form) + localhost.
-		noProxy := env["NO_PROXY"]
-		Expect(noProxy).To(ContainSubstring(proxyServiceName("allow-loop")+"."+ns+".svc"),
-			"NO_PROXY must include the model proxy Service name")
-		Expect(noProxy).To(ContainSubstring(proxyServiceName("allow-loop")+"."+ns+".svc.cluster.local"),
-			"NO_PROXY must include the model proxy Service FQDN")
-		Expect(noProxy).To(ContainSubstring("localhost"))
-		Expect(noProxy).To(ContainSubstring("127.0.0.1"))
+		// NO_PROXY (both cases): the model proxy Service (short + FQDN form)
+		// + localhost.
+		for _, name := range operatorProxyNames("NO_PROXY") {
+			noProxy := env[name]
+			Expect(noProxy).To(ContainSubstring(proxyServiceName(i42dAllowLoop)+"."+ns+".svc"),
+				"%s must include the model proxy Service name", name)
+			Expect(noProxy).To(ContainSubstring(proxyServiceName(i42dAllowLoop)+"."+ns+".svc.cluster.local"),
+				"%s must include the model proxy Service FQDN", name)
+			Expect(noProxy).To(ContainSubstring("localhost"))
+			Expect(noProxy).To(ContainSubstring("127.0.0.1"))
+		}
+
+		// ALL_PROXY is NOT set (reserved): it would catch model traffic, which
+		// must bypass the egress proxy via NO_PROXY.
+		Expect(env).ToNot(HaveKey("ALL_PROXY"))
+		Expect(env).ToNot(HaveKey("all_proxy"))
+
+		// Regression guard: the proxy vars must be APPENDED to the agent env,
+		// not replace it — the pre-existing vars (COX_MODEL_BASE_URL, HOME)
+		// must survive alongside them.
+		Expect(env[coxModelBaseURL]).To(Equal(proxyServiceURL(i42dAllowLoop, ns)),
+			"COX_MODEL_BASE_URL must survive alongside the proxy env vars")
+		Expect(env).To(HaveKeyWithValue("HOME", "/scratch"))
 	})
 
 	// spec 2: no network allows -> *_PROXY NOT set.
@@ -253,16 +275,28 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 		loopName := "userconflict-loop"
 		ns := setup(loopName, []string{i42dAllowHost}, []coxv1alpha1.AgentEnvVar{
 			{Name: "HTTP_PROXY", Value: i42dUserProxy},
+			{Name: "http_proxy", Value: i42dUserProxy},
 			{Name: "NO_PROXY", Value: i42dUserNOProxy},
+			{Name: "no_proxy", Value: i42dUserNOProxy},
+			// all_proxy is reserved (not emitted): a user setting it must be
+			// dropped too, or it would route traffic the egress proxy is not
+			// meant to handle.
+			{Name: "all_proxy", Value: i42dUserProxy},
 			{Name: "KEEP_ME", Value: "survives"},
 		})
 		env := agentEnvOf(loopName, ns)
 
 		wantURL := wantEgressProxyURL("userconflict-loop", ns)
-		Expect(env["HTTP_PROXY"]).To(Equal(wantURL),
-			"the operator HTTP_PROXY must win over a user spec.agent.env value")
-		Expect(env).ToNot(HaveKeyWithValue("NO_PROXY", i42dUserNOProxy),
-			"the operator NO_PROXY must win over a user spec.agent.env value")
+		for _, name := range operatorProxyNames("HTTP_PROXY") {
+			Expect(env[name]).To(Equal(wantURL),
+				"the operator %s must win over a user spec.agent.env value", name)
+		}
+		for _, name := range operatorProxyNames("NO_PROXY") {
+			Expect(env).ToNot(HaveKeyWithValue(name, i42dUserNOProxy),
+				"the operator %s must win over a user spec.agent.env value", name)
+		}
+		Expect(env).ToNot(HaveKey("all_proxy"),
+			"a user all_proxy must be dropped (the operator reserves it)")
 		Expect(env).To(HaveKeyWithValue("KEEP_ME", "survives"),
 			"non-colliding user env vars must be preserved")
 	})

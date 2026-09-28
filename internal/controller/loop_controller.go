@@ -496,11 +496,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// (an agent that could re-route its own egress away from the egress proxy
 		// would defeat the network allowlist).
 		if needsEgressProxy(ctx, r, loop) {
-			proxyURL := egressProxyServiceURL(loop.Name, loop.Namespace)
+			// The append must extend agentEnv, NOT replace it: replacing would
+			// drop everything appended before (COX_MODEL_BASE_URL, HOME, ...).
+			noProxy := egressNOProxy(loop)
+			agentEnv = append(agentEnv, operatorProxyEnv(loop.Name, loop.Namespace)...)
 			agentEnv = append(agentEnv,
-				corev1.EnvVar{Name: "HTTPS_PROXY", Value: proxyURL},
-				corev1.EnvVar{Name: "HTTP_PROXY", Value: proxyURL},
-				corev1.EnvVar{Name: "NO_PROXY", Value: egressNOProxy(loop)},
+				corev1.EnvVar{Name: "NO_PROXY", Value: noProxy},
+				corev1.EnvVar{Name: "no_proxy", Value: noProxy},
 			)
 		}
 		for _, e := range loop.Spec.Agent.Env {
@@ -1021,13 +1023,37 @@ func egressNOProxy(loop *coxv1alpha1.Loop) string {
 }
 
 // operatorProxyEnvNames are the agent env var names the operator owns for the
-// egress proxy (I42d). A user spec.agent.env var with one of these names is
-// dropped: the operator value wins, so the agent cannot re-route its egress
-// away from the egress proxy (the network allowlist is operator policy).
+// egress proxy (I42d): the standard proxy vars in BOTH cases (clients are
+// inconsistent about case — curl reads only lowercase http_proxy, Go reads
+// either, wget/pip/npm/git/apt mostly lowercase) + ALL_PROXY, which clients
+// also honour. A user spec.agent.env var with one of these names is dropped:
+// the operator value wins, so the agent cannot re-route its egress away from
+// the egress proxy (the network allowlist is operator policy). ALL_PROXY is
+// reserved (not emitted): it would catch model traffic, which must bypass the
+// egress proxy via NO_PROXY.
 var operatorProxyEnvNames = map[string]struct{}{
 	"HTTPS_PROXY": {},
+	"https_proxy": {},
 	"HTTP_PROXY":  {},
+	"http_proxy":  {},
 	"NO_PROXY":    {},
+	"no_proxy":    {},
+	"ALL_PROXY":   {},
+	"all_proxy":   {},
+}
+
+// operatorProxyEnv returns the operator-owned proxy env vars for the egress
+// proxy (I42d): HTTPS_PROXY/https_proxy and HTTP_PROXY/http_proxy point at
+// the egress proxy Service. NO_PROXY/no_proxy are appended by the caller
+// (they carry the per-Loop egressNOProxy value).
+func operatorProxyEnv(loopName, namespace string) []corev1.EnvVar {
+	proxyURL := egressProxyServiceURL(loopName, namespace)
+	return []corev1.EnvVar{
+		{Name: "HTTPS_PROXY", Value: proxyURL},
+		{Name: "https_proxy", Value: proxyURL},
+		{Name: "HTTP_PROXY", Value: proxyURL},
+		{Name: "http_proxy", Value: proxyURL},
+	}
 }
 
 // isOperatorProxyEnv reports whether name is one of the operator-owned proxy
@@ -1035,6 +1061,17 @@ var operatorProxyEnvNames = map[string]struct{}{
 func isOperatorProxyEnv(name string) bool {
 	_, ok := operatorProxyEnvNames[name]
 	return ok
+}
+
+// operatorProxyNames returns the uppercase + lowercase forms of each given
+// uppercase proxy env name (I42d) — the two forms the operator emits/reserves
+// for that name.
+func operatorProxyNames(names ...string) []string {
+	out := make([]string, 0, len(names)*2)
+	for _, n := range names {
+		out = append(out, n, strings.ToLower(n))
+	}
+	return out
 }
 
 // proxyLabels is the label set the per-Loop proxy pod carries and the proxy

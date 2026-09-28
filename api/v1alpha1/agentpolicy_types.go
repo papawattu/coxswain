@@ -51,10 +51,22 @@ type AgentPolicySpec struct {
 	Exec []string `json:"exec,omitempty"`
 
 	// network is the host:port endpoints the agent may reach (e.g.
-	// "proxy.golang.org:443"). localhost is always allowed (the model proxy
-	// sidecar); the model endpoint is reached only by the proxy, never the
-	// agent (D29). An empty list means the agent may egress only to localhost.
+	// "proxy.golang.org:443"). The model endpoint is reached only by the model
+	// proxy, never the agent (D29). An empty list means the agent has no
+	// external egress.
+	//
+	// I42e (first layer of the SSRF defence): an allow must not name an
+	// in-cluster target, because the agent's egress is enforced by the
+	// operator's egress proxy (I42a/I42b) — an in-cluster "external" allow is
+	// the exfiltration path. The CEL XValidation rejects the name suffixes the
+	// CRD can check without cluster config ("...svc" / "...svc.cluster.local",
+	// i.e. a Service FQDN); the IP-in-pod/service-CIDR and localhost cases need
+	// the operator's CIDR config and are rejected controller-side (reason
+	// InClusterAllow, PolicyValid=False) before the egress proxy is created.
 	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=512
+	// +kubebuilder:validation:XValidation:rule="self.all(e, !e.startsWith('localhost:') && !e.startsWith('127.0.0.1:') && !e.contains('.svc:') && !e.contains('.svc.cluster.local:'))",message="network allows must not name in-cluster targets (.svc / .svc.cluster.local / localhost / 127.0.0.1): the agent's external egress is enforced by the egress proxy, and an in-cluster target is an SSRF path"
 	Network []string `json:"network,omitempty"`
 
 	// files is the paths the agent may access (e.g. "/workspace"). The agent's

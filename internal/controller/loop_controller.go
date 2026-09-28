@@ -25,6 +25,7 @@ import (
 	"maps"
 	"net"
 	neturl "net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -106,6 +107,15 @@ type LoopReconciler struct {
 	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
 	// stand-in; overridable for the smoke test (e.g. the real proxy image).
 	ProxyImage string
+
+	// PodCIDR / ServiceCIDR are the cluster's pod and service CIDRs (I42e +
+	// I42c NetworkPolicy carve-outs). Read from the operator's environment
+	// (POD_CIDR / SERVICE_CIDR) at startup unless overridden here (tests).
+	// When empty the controller-side in-cluster check skips the CIDR cases
+	// (the CRD CEL rule still rejects .svc / localhost), and I42c's
+	// egress-proxy NetworkPolicy omits the operator-supplied carve-outs.
+	PodCIDR     string
+	ServiceCIDR string
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -1355,6 +1365,16 @@ const loopPolicyRefsFieldIndex = "spec.policyRefs"
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// I42e + I42c: read the cluster's pod/service CIDRs from the environment
+	// (set at deployment, e.g. kind/k3s exposes these as --pod-network-cidr /
+	// --service-cluster-ip-range flags). Empty values mean the CIDR cases are
+	// not checked (the CRD CEL rule still catches .svc / localhost).
+	if r.PodCIDR == "" {
+		r.PodCIDR = os.Getenv("POD_CIDR")
+	}
+	if r.ServiceCIDR == "" {
+		r.ServiceCIDR = os.Getenv("SERVICE_CIDR")
+	}
 	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
 	// watch's map function uses this index to find the Loops that reference
 	// a given AgentPolicy, avoiding a namespace-wide list per event).
@@ -1453,14 +1473,80 @@ type policyValidationResult struct {
 	transientReadError bool
 }
 
+// findInClusterNetworkAllow returns the first network allow in the union that
+// names an in-cluster target (I42e, first layer of the SSRF defence): an IP
+// literal inside the operator's pod or service CIDR, or the string localhost /
+// 127.0.0.1. The name-suffix cases (.svc / .svc.cluster.local) are rejected
+// by the CRD CEL rule (which fires at admission). Returns ("", false) when
+// every allow is a legitimate external target.
+func (r *LoopReconciler) findInClusterNetworkAllow(allows []string) (string, bool) {
+	cidrs := make([]string, 0, 2)
+	if r.PodCIDR != "" {
+		cidrs = append(cidrs, r.PodCIDR)
+	}
+	if r.ServiceCIDR != "" {
+		cidrs = append(cidrs, r.ServiceCIDR)
+	}
+	for _, a := range allows {
+		host := hostPartOfAllow(a)
+		if host == "" {
+			continue // malformed: the egress proxy rejects it at dial time
+		}
+		if host == "localhost" || host == "127.0.0.1" {
+			return a, true
+		}
+		if ip := net.ParseIP(host); ip != nil && len(cidrs) > 0 {
+			for _, cidr := range cidrs {
+				if ipInCIDR(ip, cidr) {
+					return a, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// hostPartOfAllow returns the host part of a "host:port" network allow (I42e).
+// It mirrors the engine's splitHostPort: a bare host (no port) is not a valid
+// network allow and yields ""; an IPv6 host is bracketed ("[::1]:443"), and
+// the brackets are stripped so the literal can be parsed as an IP.
+func hostPartOfAllow(entry string) string {
+	host, _, err := net.SplitHostPort(entry)
+	if err != nil {
+		return ""
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return ""
+	}
+	return strings.ToLower(host)
+}
+
+// ipInCIDR reports whether ip falls within the CIDR. A malformed CIDR in the
+// operator config never matches (the CRD CEL rule still catches the name
+// cases; a misconfigured CIDR should be fixed at the deployment, not silently
+// block every reconcile).
+func ipInCIDR(ip net.IP, cidr string) bool {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	return ipnet.Contains(ip)
+}
+
 // validateAgentPolicies checks that every referenced AgentPolicy exists and
-// has canonical exec paths. Returns a policyValidationResult. The
+// has canonical exec paths and no in-cluster network allows (I42e).
+// Returns a policyValidationResult. The
 // transientReadError field is true when the policy could not be read due to a
 // transient error (not a NotFound), in which case the caller should requeue.
 // R15 round 3: a missing or unreadable referenced policy is treated as
 // not-valid (PolicyNotFound), not ignored (fail-closed).
+// I42e: an in-cluster network allow (localhost / IP in pod/service CIDR) is
+// rejected with reason InClusterAllow (PolicyValid=False + sandbox suspend,
+// same fail-closed pattern as C6a's PolicyNotFound).
 // Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
 func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
+	unionNetwork := make([]string, 0)
 	for _, name := range loop.Spec.PolicyRefs {
 		ap := &coxv1alpha1.AgentPolicy{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
@@ -1479,6 +1565,16 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
 			}
 		}
+		unionNetwork = append(unionNetwork, ap.Spec.Network...)
+	}
+	// I42e: reject in-cluster network allows (localhost / IP in pod/service CIDR).
+	// The CRD CEL rule handles the .svc / .svc.cluster.local suffix cases at
+	// admission; the controller catches the CIDR cases (which need the
+	// operator's CIDR config) and localhost (which the CEL rule also catches,
+	// but re-checking here is defence in depth).
+	if offending, ok := r.findInClusterNetworkAllow(unionNetwork); ok {
+		return policyValidationResult{valid: false, reason: "InClusterAllow",
+			message: fmt.Sprintf("AgentPolicy network allow %q names an in-cluster target (localhost / 127.0.0.1 / IP in pod or service CIDR); the agent's external egress is enforced by the egress proxy and an in-cluster target is an SSRF path", offending)}
 	}
 	return policyValidationResult{valid: true}
 }

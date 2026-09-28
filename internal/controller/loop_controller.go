@@ -25,6 +25,7 @@ import (
 	"maps"
 	"net"
 	neturl "net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -106,6 +107,15 @@ type LoopReconciler struct {
 	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
 	// stand-in; overridable for the smoke test (e.g. the real proxy image).
 	ProxyImage string
+
+	// PodCIDR / ServiceCIDR are the cluster's pod and service CIDRs (I42e +
+	// I42c NetworkPolicy carve-outs). Read from the operator's environment
+	// (POD_CIDR / SERVICE_CIDR) at startup unless overridden here (tests).
+	// When empty the controller-side in-cluster check skips the CIDR cases
+	// (the CRD CEL rule still rejects .svc / localhost), and I42c's
+	// egress-proxy NetworkPolicy omits the operator-supplied carve-outs.
+	PodCIDR     string
+	ServiceCIDR string
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -1355,6 +1365,25 @@ const loopPolicyRefsFieldIndex = "spec.policyRefs"
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// I42e + I42c: read the cluster's pod/service CIDRs from the environment
+	// (set at deployment, e.g. kind/k3s exposes these as --pod-network-cidr /
+	// --service-cluster-ip-range flags). Empty values mean the CIDR cases are
+	// not checked (the CRD CEL rule still catches .svc / localhost).
+	if r.PodCIDR == "" {
+		r.PodCIDR = os.Getenv("POD_CIDR")
+	}
+	if r.ServiceCIDR == "" {
+		r.ServiceCIDR = os.Getenv("SERVICE_CIDR")
+	}
+	// P3 (I42e review): make an unset CIDR config visible. When either is
+	// empty the IP-in-pod/service-CIDR cases of findInClusterNetworkAllow are
+	// skipped, so an in-cluster allow given as a bare IP literal in that range
+	// is not caught by the first layer (only the egress proxy's resolved-IP
+	// backstop is). Log once at startup so a misconfigured install is obvious.
+	if r.PodCIDR == "" || r.ServiceCIDR == "" {
+		logf.Log.Info("POD_CIDR / SERVICE_CIDR unset: the IP-in-pod/service-CIDR in-cluster-allow check is disabled; an in-cluster allow given as a bare IP in that range is caught only by the egress proxy's resolved-IP backstop",
+			"podCIDR", r.PodCIDR, "serviceCIDR", r.ServiceCIDR)
+	}
 	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
 	// watch's map function uses this index to find the Loops that reference
 	// a given AgentPolicy, avoiding a namespace-wide list per event).
@@ -1453,14 +1482,28 @@ type policyValidationResult struct {
 	transientReadError bool
 }
 
+// findInClusterNetworkAllow (I42e) delegates to the pure policy check. It
+// catches an in-cluster network allow — an in-cluster name (mirroring the CRD
+// CEL rule, so pre-rule objects and future CRD drift are caught), a loopback /
+// unspecified / link-local hostname, or an IP literal inside the operator's
+// pod/service CIDR — before the egress proxy is created.
+func (r *LoopReconciler) findInClusterNetworkAllow(allows []string) (string, bool) {
+	return policy.FindInClusterNetworkAllow(allows, r.PodCIDR, r.ServiceCIDR)
+}
+
 // validateAgentPolicies checks that every referenced AgentPolicy exists and
-// has canonical exec paths. Returns a policyValidationResult. The
+// has canonical exec paths and no in-cluster network allows (I42e).
+// Returns a policyValidationResult. The
 // transientReadError field is true when the policy could not be read due to a
 // transient error (not a NotFound), in which case the caller should requeue.
 // R15 round 3: a missing or unreadable referenced policy is treated as
 // not-valid (PolicyNotFound), not ignored (fail-closed).
+// I42e: an in-cluster network allow (localhost / IP in pod/service CIDR) is
+// rejected with reason InClusterAllow (PolicyValid=False + sandbox suspend,
+// same fail-closed pattern as C6a's PolicyNotFound).
 // Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
 func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
+	unionNetwork := make([]string, 0)
 	for _, name := range loop.Spec.PolicyRefs {
 		ap := &coxv1alpha1.AgentPolicy{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
@@ -1479,6 +1522,17 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
 			}
 		}
+		unionNetwork = append(unionNetwork, ap.Spec.Network...)
+	}
+	// I42e: reject in-cluster network allows. The CRD CEL rule handles the
+	// .svc / .svc.cluster.local / localhost / 127.0.0.1 name cases at
+	// admission; the controller catches the same name cases (mirrored, so pre-
+	// rule objects and future CRD drift are caught), the other loopback /
+	// unspecified / link-local forms, and the IP-in-pod/service-CIDR cases
+	// (which need the operator's CIDR config).
+	if offending, ok := r.findInClusterNetworkAllow(unionNetwork); ok {
+		return policyValidationResult{valid: false, reason: "InClusterAllow",
+			message: fmt.Sprintf("AgentPolicy network allow %q names an in-cluster target (.svc / .svc.cluster.local / cluster.local, localhost, a loopback / unspecified / link-local IP, or an IP in the pod or service CIDR); the agent's external egress is enforced by the egress proxy and an in-cluster target is an SSRF path", offending)}
 	}
 	return policyValidationResult{valid: true}
 }

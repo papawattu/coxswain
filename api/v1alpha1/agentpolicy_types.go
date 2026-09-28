@@ -51,10 +51,41 @@ type AgentPolicySpec struct {
 	Exec []string `json:"exec,omitempty"`
 
 	// network is the host:port endpoints the agent may reach (e.g.
-	// "proxy.golang.org:443"). localhost is always allowed (the model proxy
-	// sidecar); the model endpoint is reached only by the proxy, never the
-	// agent (D29). An empty list means the agent may egress only to localhost.
+	// "proxy.golang.org:443"). The model endpoint is reached only by the model
+	// proxy, never the agent (D29). An empty list means the agent has no
+	// external egress.
+	//
+	// I42e (first layer of the SSRF defence): an allow must not name an
+	// in-cluster target, because the agent's egress is enforced by the
+	// operator's egress proxy (I42a/I42b) — an in-cluster "external" allow is
+	// the exfiltration path. This CEL rule is the cheap first layer that fires
+	// at admission; it rejects, case-insensitively (lowerAscii) and
+	// trailing-dot-aware, the in-cluster name suffixes the CRD can check
+	// without cluster config (".svc" / ".svc.cluster.local" / ".cluster.local",
+	// i.e. a Service / cluster-local FQDN) and the literal loopback hostnames
+	// localhost / 127.0.0.1.
+	//
+	// The rule uses only the free string methods (startsWith / endsWith /
+	// contains / lowerAscii): a regex (matches) cannot express the dotted
+	// suffixes because CEL string literals do not process backslash escapes
+	// (\. is an illegal escape), so a literal backslash can never reach the
+	// regex. Consequence (documented per review P2/P3): the CRD name rule is a
+	// deliberate, cheap first layer and the controller-side check
+	// (policy.FindInClusterNetworkAllow, run before the egress proxy is
+	// created) is the authoritative first layer. The controller catches, for
+	// every object (including ones created before this rule and any future CRD
+	// drift): the .svc / .svc.cluster.local / cluster.local name suffixes
+	// (mirrored, case-insensitive, trailing-dot-aware — so the trailing root-dot
+	// forms "…svc.", "…svc.cluster.local." that this rule admits because the
+	// host text is followed by ":port", not the suffix itself, are still
+	// rejected by the controller), the full loopback / unspecified / link-local
+	// IP forms (127/8, 169.254/16, 0.0.0.0, [::], etc.), and IP literals inside
+	// the operator's pod/service CIDR. The egress proxy's resolved-IP check
+	// (I42a) is the backstop that catches rebinding / split-horizon.
 	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=512
+	// +kubebuilder:validation:XValidation:rule="self.all(e, !(e.contains('.svc:') || e.contains('.svc.cluster.local:') || e.contains('.cluster.local:') || e.lowerAscii().contains('.svc:') || e.lowerAscii().contains('.svc.cluster.local:') || e.lowerAscii().contains('.cluster.local:') || e.startsWith('localhost') || e.startsWith('127.0.0.1') || e.endsWith('.svc:') || e.endsWith('.svc.cluster.local:') || e.endsWith('.cluster.local:') || e.lowerAscii().endsWith('.svc:') || e.lowerAscii().endsWith('.svc.cluster.local:') || e.lowerAscii().endsWith('.cluster.local:') || e.endsWith('.svc.') || e.endsWith('.svc.cluster.local.') || e.endsWith('.cluster.local.') || e.lowerAscii().endsWith('.svc.') || e.lowerAscii().endsWith('.svc.cluster.local.') || e.lowerAscii().endsWith('.cluster.local.')))",message="network allows must not name in-cluster targets (.svc / .svc.cluster.local / .cluster.local / localhost / 127.0.0.1): the agent's external egress is enforced by the egress proxy, and an in-cluster target is an SSRF path"
 	Network []string `json:"network,omitempty"`
 
 	// files is the paths the agent may access (e.g. "/workspace"). The agent's

@@ -277,6 +277,420 @@ visible without reading logs. No terminal reason. Seam: envtest — after a
 blocked action the counter increments and the `PolicyBlocked` condition is set
 with the target; the Loop is not failed or paused.
 
+### I. I42 egress proxy (ADR-0007 I42 resolution — the network enforcement layer)
+
+The I42 slices implement the per-Loop egress proxy that enforces the effective
+`AgentPolicy` network allows at the HTTP/HTTPS layer. They sit on top of D35
+(proxy gate) and C6b (KubeArmor engine), and before B3 (verify evidence
+requires meaningful isolation). Each slice is red→green; envtest-first, then
+kind acceptance on `--context kind-coxswain-dev`.
+
+The ADR (docs/adr/0007-*.md, the I42 resolution section) is the authoritative
+design; this plan breaks it into buildable slices.
+
+#### I42a — `cmd/egress-proxy/` binary (the stand-in enforcement core)
+
+**Scope:** a new Go binary (`cmd/egress-proxy/main.go` + `internal/egress/`) that
+implements the HTTP/HTTPS forward proxy:
+- Listens on `:3128` (env `EGRESS_PROXY_PORT`, default 3128).
+- Reads the effective policy allows from a mounted file (or env `EGRESS_POLICY_JSON`
+for Phase 1 simplification): a JSON array of `{host, port}` pairs.
+- **CONNECT handling:** parses the `CONNECT host:port` line. Checks `host:port`
+  against the allows (exact host match, exact port match; host match is
+  case-insensitive, port is the literal number from the allow). Disallowed →
+  `403 Forbidden` + JSON audit record (blocked). Allowed → resolves the host
+  **itself** (Go `net.Resolver`, using the pod's DNS), rejects if any resolved
+  IP is in a carved-out range (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`,
+  `127/8`, `100.64/10`, `::1`, `fc00::/7`, `fe80::/10`, plus the pod CIDR and
+  service CIDR passed as env `POD_CIDR` / `SERVICE_CIDR`), then opens a TCP
+  dial to **that resolved IP** (same IP — no re-resolution) and relays bytes
+  bidirectionally.
+- **SNI check:** after the CONNECT tunnel is open (proxy returned 200), the
+  proxy reads the first bytes from the client. If they look like a TLS
+  ClientHello (record type 0x16), extract the SNI (TLS extension 0x0000). If
+  SNI is present and ≠ the CONNECT host → close tunnel + audit (blocked).
+  SNI present and = CONNECT host → proceed. SNI absent → close tunnel + audit
+  (blocked). (ECH is treated as SNI-absent.)
+- **Plain HTTP (non-CONNECT):** parse the request line's `Host` header. Check
+  `host:port` against allows. Disallowed → `403` + audit. Allowed → proxy the
+  request (forward to the resolved IP).
+- **JSON audit on stdout:** every connection attempt (allowed and blocked)
+  emits a single JSON line with the Q4 envelope fields: `{time, loop, namespace,
+  source: "egress-proxy", action: "connect"|"http", target: "host:port",
+  verdict: "allowed"|"blocked", detail: "sni=..., proto=..., ip=..., policy=..."}`.
+  The `loop` and `namespace` fields come from env (`LOOP_NAME`, `LOOP_NAMESPACE`).
+  The `policy` field is `EGRESS_POLICY_HASH` env. `iteration` is NOT emitted
+  by the proxy (the relay fills it by time window).
+- No TLS termination. No payload inspection. No MITM.
+- No secrets mounted. No SA token. Read-only rootfs. UID 65534.
+
+**envtest-first tests** (none applicable — this is a binary, tested via unit tests
+on the internal package + kind e2e):
+- **Unit tests** (`internal/egress/`): table-driven test of the CONNECT check
+  (allowed host:port passes, disallowed host 403s, disallowed port 403s, exact
+  match semantics); resolved-IP rejection (a mock resolver returning a private
+  IP → blocked; a public IP → allowed; a rebind to a pod-CIDR IP → blocked);
+  SNI extraction (a synthetic ClientHello with SNI = CONNECT host → proceed;
+  SNI ≠ CONNECT host → closed; no SNI → closed); audit record shape (allowed
+  record has the right fields; blocked record has the right `detail`).
+
+**kind acceptance** (`--context kind-coxswain-dev`):
+- A `make egress-proxy-e2e` script (or an addition to the existing e2e)
+deploys a minimal egress proxy pod (the `cmd/egress-proxy` binary image) in
+  a namespace, with a fixed policy allowing `example.com:443`. A test agent
+  pod (curl, `HTTPS_PROXY` pointed at the proxy) sends: (a) `curl https://example.com`
+  → succeeds (or at minimum gets a non-403 from the proxy); (b) `curl https://disallowed.com`
+  → gets 403 from the proxy; (c) `curl --resolve` or a raw `nc` to a
+  cluster-internal IP → connection refused/timeout (NetworkPolicy blocks it).
+The script asserts the proxy's stdout contains the expected audit JSON lines
+  (one `allowed` for example.com, one `blocked` for disallowed.com).
+
+**Dependencies:** none (this is a leaf binary). The binary must be buildable
+  into an image before I42b uses it.
+
+#### I42b — `ensureEgressProxy` controller function (pod + Service + gate)
+
+**Scope:** the operator creates and manages the egress proxy pod + Service,
+  gated on the effective policy having network allows.
+- **Gate:** the egress proxy pod is created only when the Loop's effective
+  `AgentPolicy` (union of `spec.policyRefs`) has at least one `spec.network`
+  allow. This gate is **distinct** from the model proxy's gate
+  (`spec.agent.endpointSecretRef` is set).
+- **Pod spec:** same shape as the model proxy pod (D33) but:
+  - Container image: `EgressProxyImage` field on `LoopReconciler` (like
+    `ProxyImage` for the model proxy).
+  - UID/GID: 65534 (distinct from agent 65532, model proxy 65533).
+  - Env: `EGRESS_POLICY_HASH` (the `status.policy.effectiveHash` value),
+    `LOOP_NAME`, `LOOP_NAMESPACE`, `POD_CIDR`, `SERVICE_CIDR` (from operator
+    config, read once at controller init), `EGRESS_POLICY_JSON` (the effective
+    network allows as JSON, for the Phase-1 binary to read; a future version
+    mounts a file).
+  - No `HTTPS_PROXY`/`HTTP_PROXY` (it doesn't proxy its own traffic).
+  - Resources: limits cpu 100m, memory 128Mi; requests cpu 10m, memory 32Mi
+    (parity with model proxy).
+  - Liveness/readiness: TCP on 3128.
+  - `automountServiceAccountToken: false` (pod-level).
+  - Labels: `coxswain.io/loop: <loop>` + `coxswain.io/role: egress-proxy`
+    (the `role` label distinguishes it from the model proxy's
+    `coxswain.io/role: proxy` for NetworkPolicy selectors and the
+    `ProxyConflict` gate).
+- **Service:** `<loop>-egress-proxy` in the Loop's namespace, port 3128 TCP,
+  selector matching the egress proxy pod labels. Stable name (the agent's
+  `HTTPS_PROXY` points at it; a policy-change recreate keeps the Service stable).
+- **Owner ref:** owned by the Loop (garbage collection + `IsControlledBy` gate).
+- **Owned+Ready gate (D35a pattern):** before the sandbox pod is set to
+  OperatingMode Running, when the egress proxy is expected (network allows
+  present), the operator checks: the egress proxy pod exists AND
+  `metav1.IsControlledBy(egressPod, loop)` AND `isPodReady(egressPod)`. If any
+  is false → sandbox stays Suspended (not Failed, not OperatingMode Running).
+  This is the same gate D35a applies to the model proxy.
+- **ProxyConflict:** if a pod named `<loop>-egress-proxy` exists and
+  `IsControlledBy` is false → `ProxyConflict=True` reason
+  `ForeignEgressProxy` (records the conflict; the owned+Ready gate is what
+  actually blocks the sandbox from Running). The foreign pod is NOT deleted (I2).
+- **Policy-change recreate:** if `status.policy.effectiveHash` changes and the
+  egress proxy pod's `EGRESS_POLICY_HASH` env no longer matches, the operator
+  deletes and recreates the pod (the Service name stays stable, so the agent's
+  `HTTPS_PROXY` value is unchanged). Same drift-recreate pattern as D33.
+
+**envtest-first tests** (`internal/controller/loop_i42_egress_test.go`):
+1. **Gate: no network allows → no egress proxy pod.** A Loop with a policyRef
+   to an AgentPolicy that has `spec.network: []` (or no network section) →
+   after reconcile, no pod named `<loop>-egress-proxy` exists, no Service, no
+   `*_PROXY` env on the agent container.
+2. **Gate: network allows present → egress proxy pod + Service created.** A
+   Loop with a policyRef allowing `proxy.golang.org:443` → after reconcile, a
+   pod named `<loop>-egress-proxy` exists (owned by the Loop, UID 65534, env
+   carries `EGRESS_POLICY_HASH` = the effective hash, liveness TCP 3128), a
+   Service `<loop>-egress-proxy` exists (port 3128), and the sandbox is
+   Suspended (the egress proxy pod is not yet Ready).
+3. **Owned+Ready gate: not Ready → sandbox Suspended.** With the egress proxy
+   pod present but not Ready (no Ready condition) → sandbox stays Suspended,
+   not OperatingMode Running.
+4. **Owned+Ready gate: Ready → sandbox Running.** With the egress proxy pod
+   present, owned by the Loop, and Ready → sandbox transitions to
+   OperatingMode Running.
+5. **Foreign pod → ProxyConflict + Suspended.** A pod named
+   `<loop>-egress-proxy` exists but is owned by a different controller →
+   `ProxyConflict=True` reason `ForeignEgressProxy`, sandbox Suspended.
+6. **Policy change → pod recreate.** A Loop whose effective hash changes
+   (a new AgentPolicy is referenced) → the old egress proxy pod is deleted and
+   a new one created with the updated `EGRESS_POLICY_HASH`; the Service name
+   is unchanged.
+
+**kind acceptance** (`--context kind-coxswain-dev`):
+- A Loop with a network-allowing AgentPolicy is created; the operator creates
+  the egress proxy pod + Service; the sandbox is Suspended until the proxy is
+  Ready. Once the proxy image is pulled and the pod is Ready, the sandbox
+  transitions to Running. A `kubectl get pods` shows the egress proxy pod
+  Ready. The agent container's env shows `HTTPS_PROXY=http://<loop>-egress-proxy.
+  <ns>.svc:3128`.
+
+**Dependencies:** I42a (the binary must exist as an image), D35a (the
+owned+Ready gate pattern is already implemented for the model proxy — the
+egress proxy reuses it), C6a (the effective policy union + hash computation
+exists).
+
+#### I42c — NetworkPolicy changes (agent egress + egress-proxy egress)
+
+**Scope:** the agent pod's NetworkPolicy gains an egress rule to the egress
+  proxy; a new NetworkPolicy is created for the egress proxy pod.
+- **Agent NetworkPolicy** (`<loop>-agent-netpol`, existing from D34): add a
+  fourth egress rule — to the egress proxy pod (selector
+  `coxswain.io/loop=<loop>`, `coxswain.io/role=egress-proxy`) on port 3128
+  TCP. This rule is present only when the egress proxy is expected (network
+  allows present); with no network allows the agent's egress rules are
+  model-proxy + DNS only (as now).
+- **Egress proxy NetworkPolicy** (`<loop>-egress-proxy-netpol`, new):
+  - `PolicyTypes: [Ingress, Egress]`.
+  - **Ingress:** only from this Loop's agent pod (selector
+    `coxswain.io/loop=<loop>`, `coxswain.io/role=agent`) on port 3128 TCP.
+  - **Egress rule 1 (external with carve-outs):**
+    `ipBlock {cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, <POD_CIDR>, <SERVICE_CIDR>]}`
+    plus the v6 mirror: `ipBlock {cidr: ::/0, except: [fc00::/7, fe80::/10,
+    ::1/128]}`. No port restriction (the proxy dials any port the allow
+    specifies; the application layer enforces the port).
+  - **Egress rule 2 (DNS):** to kube-dns (`kube-system`,
+    `k8s-app=kube-dns`) on 53 UDP+TCP.
+  - **Where the CIDRs come from:** the `LoopReconciler` reads `POD_CIDR` and
+    `SERVICE_CIDR` from its own config (the controller's env, set at
+    deployment: kind/k3s exposes these in the kube-system config or as
+    `--pod-network-cidr` / `--service-cluster-ip-range` flags; the operator
+    reads them once at startup and stores them as fields on the reconciler,
+    analogous to `ProxyImage` / `EgressProxyImage`). They are NOT discovered
+    per-Loop. In the envtest, the reconciler is constructed with test
+    CIDR values.
+- **Model proxy NetworkPolicy** (`<loop>-proxy-netpol`): unchanged from D34.
+
+**envtest-first tests** (`internal/controller/loop_i42_netpol_test.go`):
+1. **Agent netpol with egress proxy expected:** a Loop with network allows →
+   the agent's NetworkPolicy has exactly 4 egress rules: model proxy:8080,
+   egress proxy:3128, kube-dns:53 UDP, kube-dns:53 TCP (or a single kube-dns
+   rule with both ports). Assert the egress-proxy rule's peer selector
+   (`coxswain.io/role=egress-proxy`) and port 3128.
+2. **Agent netpol without egress proxy (no network allows):** the agent's
+   NetworkPolicy has only 3 egress rules (model proxy + DNS); no egress-proxy
+   rule.
+3. **Egress proxy netpol created:** a Loop with network allows → a
+   NetworkPolicy named `<loop>-egress-proxy-netpol` exists. Assert: PolicyTypes
+   include Ingress + Egress; the ingress rule's peer is the agent (role=agent)
+   on port 3128; the egress rule 1 has `ipBlock.cidr=0.0.0.0/0` with the
+   `except` list containing the expected carve-out CIDRs (including the
+   reconciler's configured POD_CIDR and SERVICE_CIDR); the egress rule 2 is
+   kube-dns on 53.
+4. **Egress proxy netpol NOT created without network allows:** no NetworkPolicy
+   named `<loop>-egress-proxy-netpol`.
+5. **Carve-out CIDRs are from config:** change the reconciler's POD_CIDR to a
+   different value → the egress proxy netpol's `except` list reflects the new
+   value (not hardcoded).
+
+**kind acceptance** (`--context kind-coxswain-dev`):
+- With a Loop that has network allows, `kubectl get netpol` shows
+  `<loop>-egress-proxy-netpol`. `kubectl get netpol <loop>-agent-netpol -o yaml`
+  shows the egress-proxy rule. From inside the agent pod, a raw `curl` to a
+  cluster-internal IP (e.g. the kube-apiserver service IP) is blocked
+  (connection timeout); a `curl` through the proxy to an allowed external host
+  succeeds.
+
+**Dependencies:** I42b (the egress proxy pod + its labels must exist for the
+NetworkPolicy selectors to target).
+
+#### I42d — `*_PROXY` / `NO_PROXY` env vars on the agent container
+
+**Scope:** when the egress proxy is expected (network allows present), the
+  operator sets three env vars on the agent container:
+- `HTTPS_PROXY=http://<loop>-egress-proxy.<ns>.svc:3128`
+- `HTTP_PROXY=http://<loop>-egress-proxy.<ns>.svc:3128`
+- `NO_PROXY=<loop>-proxy.<ns>.svc,<loop>-proxy.<ns>.svc.cluster.local,localhost,127.0.0.1`
+
+  The `COX_MODEL_BASE_URL` must match a `NO_PROXY` entry (the operator sets it
+  to the model proxy's `.svc` URL; the `NO_PROXY` list includes it). With no
+  network allows, these three vars are NOT set (the agent has no external
+  egress; the model proxy is the only proxy and it's reached directly via
+  `COX_MODEL_BASE_URL`).
+
+  These vars are added to the agent container's env alongside the existing
+  `COX_MODEL_BASE_URL` (D33) and any user `spec.agent.env` vars. They use the
+  standard names (not `COX_`-prefixed) so any HTTP client picks them up.
+
+**envtest-first tests** (`internal/controller/loop_i42_env_test.go`):
+1. **Network allows present → `*_PROXY` set.** A Loop with a network-allowing
+   policy → the agent container's env includes `HTTPS_PROXY`, `HTTP_PROXY`,
+   `NO_PROXY` with the expected values (assert the proxy URL contains the
+   egress proxy Service name + port 3128; `NO_PROXY` contains the model proxy
+   Service name + localhost).
+2. **No network allows → `*_PROXY` NOT set.** A Loop with a policy that has no
+   network allows → the agent container's env does NOT include `HTTPS_PROXY`,
+   `HTTP_PROXY`, or `NO_PROXY`.
+3. **`COX_MODEL_BASE_URL` matches `NO_PROXY`.** Assert the `COX_MODEL_BASE_URL`
+   value (the model proxy `.svc` URL) appears as a prefix of one of the
+   `NO_PROXY` entries (i.e. model calls won't be routed through the egress
+   proxy).
+4. **Standard names (not `COX_`).** Assert the env var names are exactly
+   `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (not `COX_HTTPS_PROXY` etc.).
+
+**kind acceptance** (`--context kind-coxswain-dev`):
+- `kubectl exec` into the agent pod (or inspect the pod spec) shows the three
+  env vars with the correct values. A `curl https://<allowed-host>` from the
+  agent goes through the egress proxy (the proxy's audit log records it); a
+  `curl <model-proxy-url>` does NOT go through the egress proxy (the model
+  proxy's audit log records it, not the egress proxy's).
+
+**Dependencies:** I42b (the egress proxy Service must exist for the URL to be
+  meaningful).
+
+#### I42e — Phase-1 policy validation: reject in-cluster allows
+
+**Scope:** the `AgentPolicy` CRD's validation (or the controller's
+  effective-policy computation) rejects any `spec.network` allow that names an
+  in-cluster target. An in-cluster target is:
+- A hostname ending in `.svc` or `.svc.cluster.local` (cluster DNS suffix).
+- An IP literal that falls within the pod CIDR or service CIDR (the same
+  CIDRs from the operator config used in I42c's NetworkPolicy).
+- The string `localhost` or `127.0.0.1` (the agent's own loopback; the agent
+  should not be "allowing" itself as an external target).
+
+  Rejection is at **policy validation time** (the Loop's reconcile errors with
+  a clear message naming the offending allow), not silently dropped. This is
+  the first layer of the SSRF defence; the egress proxy's resolved-IP check
+  (I42a) is the backstop that catches rebinding/split-horizon even if a
+  name passes validation.
+
+  Implementation: a new CEL XValidation rule on `AgentPolicy.spec.network[].host`
+  (rejects `*.svc`, `*.svc.cluster.local` suffixes) + a controller-side check
+  (rejects IP literals in the pod/service CIDRs and `localhost`/`127.0.0.1`).
+  The CEL rule handles the suffix cases (pure, no config needed); the
+  controller-side check handles the CIDR cases (needs the operator config).
+
+**envtest-first tests** (`internal/controller/loop_i42_validation_test.go`):
+1. **`.svc` suffix rejected.** An AgentPolicy with `spec.network: [{host:
+   "my-service.default.svc", port: 443}]` → the Loop's reconcile errors (the
+   condition or event names the offending host); the sandbox is NOT created.
+2. **IP in pod CIDR rejected.** An AgentPolicy with `spec.network: [{host:
+   "10.244.0.5", port: 8080}]` (where the test reconciler's POD_CIDR is
+   `10.244.0.0/16`) → reconcile errors.
+3. **IP in service CIDR rejected.** An AgentPolicy with `spec.network: [{host:
+   "10.96.0.1", port: 443}]` (where SERVICE_CIDR is `10.96.0.0/12`) →
+   reconcile errors.
+4. **`localhost` rejected.** An AgentPolicy with `spec.network: [{host:
+   "localhost", port: 8080}]` → reconcile errors.
+5. **Legitimate external host passes.** An AgentPolicy with `spec.network:
+   [{host: "proxy.golang.org", port: 443}]` → reconcile succeeds, the egress
+   proxy is created.
+6. **CEL suffix rejection (CRD-level).** Creating an AgentPolicy directly
+   (not via a Loop) with a `.svc` hostname → the API server rejects it
+   (the CEL rule fires). This is an envtest that creates the AgentPolicy CR
+   and asserts the create fails.
+
+**kind acceptance** (`--context kind-coxswain-dev`):
+- `kubectl apply` an AgentPolicy with a `.svc` host → the API server rejects
+  it (CEL rule). A Loop referencing it → reconcile error visible in the Loop's
+  status/conditions.
+
+**Dependencies:** none for the CEL rule (pure CRD validation); the
+  controller-side CIDR check depends on the same operator config as I42c.
+
+#### I42f — D35 part 2: KubeArmor policy for the egress proxy (and model proxy)
+
+**Scope:** extend the `EmitKubeArmorPolicy` function (C6b) to emit KubeArmor
+  policies for BOTH proxy pods (the egress proxy AND the model proxy), in
+  addition to the existing agent pod policy. The KubeArmor policy is the
+  **inner fence** that catches any bug in the proxy's application-level
+  enforcement.
+- **Egress proxy KubeArmor policy:** selector targets the egress proxy pod
+  (labels `coxswain.io/loop=<loop>`, `coxswain.io/role=egress-proxy`);
+  `process.matchPaths` allows only the egress proxy binary (its absolute path
+  in the image); `network.matchDNSQueries` + `matchProtocols` carry the
+  effective `AgentPolicy` network allows (the same host:port pairs, translated
+  to KubeArmor's DNS + protocol form — the port is lost in translation, which
+  is fine because the egress proxy's NetworkPolicy + application layer carry
+  the port precision). `action: Allow` per rule; `spec.action: Block`.
+- **Model proxy KubeArmor policy:** selector targets the model proxy pod
+  (labels `coxswain.io/loop=<loop>`, `coxswain.io/role=proxy`);
+  `process.matchPaths` allows only the model proxy binary; `network` allows
+  the model endpoint host (from `spec.agent.endpointSecretRef`'s resolved
+  endpoint — or, in Phase 1, the model proxy's configured target). This is
+  the "D35 part 2" for the model proxy (it did not have a KubeArmor policy
+  before; only the agent pod did).
+- **Same emitter:** the `EmitKubeArmorPolicy` function (or a sibling
+  `EmitProxyKubeArmorPolicy`) in `internal/engine` takes an `EffectivePolicy`
+  (or a new `ProxyPolicy` struct) and emits the KubeArmorPolicy. The egress
+  proxy's process allows are `{path: <egress-proxy binary absolute path>}`;
+  the model proxy's are `{path: <model-proxy binary absolute path>}`. The
+  network allows are the effective `AgentPolicy` network allows for the
+  egress proxy; for the model proxy, the network allows are the model
+  endpoint (single host:port).
+- **Owner ref:** each KubeArmorPolicy is owned by the Loop (garbage
+  collection).
+- **Gate:** the KubeArmor policies are emitted by the `Enforcer.Apply` call
+  (C6b's existing seam) — the operator calls `Enforcer.Apply` for the agent
+  pod's policy AND for each proxy pod's policy. The D30 gate
+  (`Enforcing()` check) applies to ALL of them: if the engine is not
+  enforcing, the sandbox stays Suspended.
+
+**envtest-first tests** (`internal/engine/kubearmor_i42_test.go` +
+`internal/controller/loop_i42_kubearmor_test.go`):
+1. **Egress proxy KubeArmor policy shape:** given an `EffectivePolicy` with
+   network allows `[{host: "proxy.golang.org", port: 443}]`, the emitted
+   KubeArmorPolicy for the egress proxy has: selector matching the egress
+   proxy pod labels; `process.matchPaths` = `[{path: /usr/local/bin/egress-
+   proxy}]` (the binary's absolute path); `network.matchDNSQueries` =
+   `[{domain: proxy.golang.org}]`; `spec.action: Block`.
+2. **Model proxy KubeArmor policy shape:** the emitted KubeArmorPolicy for the
+   model proxy has: selector matching the model proxy pod labels;
+   `process.matchPaths` = `[{path: /usr/local/bin/proxy}]`; `network` allows
+   the model endpoint.
+3. **Both policies owned by the Loop:** envtest — after reconcile with both
+   proxies expected, two KubeArmorPolicy objects exist (one per proxy), both
+   owner-ref'd to the Loop.
+4. **No egress proxy → no egress proxy KubeArmorPolicy:** a Loop with no
+   network allows → only the model proxy's KubeArmorPolicy exists (if the
+   model proxy is expected), not the egress proxy's.
+
+**kind acceptance** (`--context kind-coxswain-dev`, requires KubeArmor
+installed, same as `make kubearmor-e2e`):
+- A Loop with network allows + a model endpoint → two KubeArmorPolicy objects
+  exist. A disallowed exec in the egress proxy pod (e.g. `curl` when only the
+  egress proxy binary is allowed) is blocked. A disallowed network connection
+  from the egress proxy pod to a host not in the effective allows is blocked
+  by KubeArmor (the inner fence catches the case where the application-level
+  CONNECT check is buggy). Assert the KubeArmor policy is loaded on the pod
+  (karmor probe or the policy's status).
+
+**Dependencies:** C6b (the `Enforcer` interface + `EmitKubeArmorPolicy`
+function + the D30 gate exist), I42b (the egress proxy pod + labels exist for
+the selector), I42a (the egress proxy binary's absolute path is known).
+
+#### I42 slice order and dependencies
+
+```
+I42a (binary)  ──┐
+                 ├──→  I42b (controller: pod+Service+gate)  ──→  I42c (NetworkPolicies)
+I42e (validation) ─┘                                              │
+                                                                   ├──→  I42d (env vars)
+                                                                   │
+C6b (KubeArmor) ──────────────────────────────────────────────────┘
+                                                                   │
+                                                                   └──→  I42f (D35 part 2 KubeArmor for proxies)
+```
+
+- I42a and I42e are independent (can be built in parallel).
+- I42b depends on I42a (the binary image) + D35a (gate pattern) + C6a (policy
+  union).
+- I42c depends on I42b (labels for selectors).
+- I42d depends on I42b (Service name for the URL).
+- I42f depends on C6b + I42b + I42a.
+- I42c and I42d can be done in parallel (both depend on I42b, not on each
+  other).
+- **Full I42 acceptance:** a kind e2e that creates a Loop with a
+  network-allowing AgentPolicy + a model endpoint, and asserts: the egress
+  proxy pod is Ready; the agent's `HTTPS_PROXY` is set; an allowed external
+  host is reachable through the proxy (audit records it); a disallowed host is
+  403'd (audit records it); a raw TCP connection to a cluster-internal IP is
+  blocked (NetworkPolicy); a `.svc` allow is rejected at validation; the
+  KubeArmor policies exist for both proxies. This is the end-to-end I42 proof.
+
 ### B. Controller reconcile state machine (`internal/controller/`)
 The Phase 0 controller only ensured the sandbox + set `Pending`. Phase 1 drives
 the phase enum based on `status.observedPhase` (from the runner) and the trust
@@ -510,8 +924,11 @@ what make B2/B3's evidence meaningful. After D27:
 C1 (sandbox hardening + `spec.agent`) → C2 (model proxy sidecar) → C6
 (`AgentPolicy` CRD + engine-policy translation) → C3 (NetworkPolicy generated
 from `AgentPolicy`) → C4 (trusted publish step) → C8 (`PolicyBlocked` condition
-+ counter) → C7 (activity-audit stream) → C5 (evil-agent e2e, extended with a
-disallowed command + a disallowed host), then the reference runner A1 → A2 →
++ counter) → C7 (activity-audit stream) → **I42a → I42e (parallel) → I42b →
+I42c + I42d (parallel) → I42f** (the egress proxy: binary, validation,
+controller, NetworkPolicies, env vars, KubeArmor for proxies) → C5 (evil-agent
+e2e, extended with a disallowed command + a disallowed host + a disallowed
+external host via the egress proxy), then the reference runner A1 → A2 →
 A3 → A4 (now driving the conformance agent through the proxy, `COX_MODEL_BASE_URL`
 = localhost, each red→green — note A4 is now *context continuity*; the old A4
 "runner runs checks" is dropped per ADR-0005), then B3 → B3a → B3b → B3c → B3d
@@ -521,7 +938,8 @@ phase machine + TamperedVerify via base-commit glob diff) are already done.
 B2's anti-gaming guarantee (D7) is the highest-value test; B6 (foreign-owned
 sandbox → condition, D8) needs B1's condition/event infrastructure. C5 (the
 evil-agent e2e) is the slice that proves ADR-0006 + ADR-0007 and gates B3's
-evidence as meaningful.
+evidence as meaningful. I42 (the egress proxy) sits between C7 and C5: it is
+the network enforcement layer that C5's "disallowed host" test case exercises.
 
 **Gate (REVIEW-PHASE1-R8/R9):** no C3/C6/C7 code until the reviewer has
 reviewed ADR-0007. C1, C2, C4 (and C8, C5's non-policy parts) may proceed

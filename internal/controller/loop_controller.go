@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -1356,6 +1357,26 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// allowlist at the HTTP CONNECT / SNI / Host layer (ADR-0007, "I42
 	// resolution"). Until that slice lands, agent egress stays proxy + DNS
 	// (fail-closed).
+	// I42c review P2 (round 2): a FOREIGN NetworkPolicy of the same name is
+	// never overwritten. A conflict (errForeignNetpol from createOrUpdateNP)
+	// sets NetworkPolicyConflict=True/ForeignNetworkPolicy, suspends any
+	// running sandbox (fail-closed: the agent's netpol may not be the one the
+	// operator built), and returns nil so reconcile does not error-loop. A
+	// second reconcile re-checks (the foreign object may be gone).
+	var foreignConflict bool
+	mapForeign := func(npName string, err error) error {
+		if !errors.Is(err, errForeignNetpol) {
+			return err
+		}
+		foreignConflict = true
+		setCondition(loop, "NetworkPolicyConflict", metav1.ConditionTrue, "ForeignNetworkPolicy",
+			"NetworkPolicy "+npName+" exists but is not controlled by this Loop; left untouched")
+		if r.suspendSandboxIfRunning(ctx, loop) != nil {
+			return fmt.Errorf("suspend sandbox on foreign NetworkPolicy conflict (%s): %w", npName, err)
+		}
+		return nil
+	}
+
 	agentNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-agent-netpol",
@@ -1368,11 +1389,10 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			Egress:      agentEgress,
 		},
 	}
-	if err := controllerutil.SetControllerReference(loop, agentNP, r.Scheme); err != nil {
-		return fmt.Errorf("set owner ref on agent NetworkPolicy: %w", err)
-	}
-	if _, err := r.createOrUpdateNP(ctx, agentNP); err != nil {
-		return fmt.Errorf("create or update agent NetworkPolicy: %w", err)
+	if _, err := r.createOrUpdateNP(ctx, loop, agentNP); err != nil {
+		if merr := mapForeign(agentNP.Name, err); merr != nil {
+			return merr
+		}
 	}
 
 	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, egress
@@ -1411,11 +1431,10 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			})
 		}
 	}
-	if err := controllerutil.SetControllerReference(loop, proxyNP, r.Scheme); err != nil {
-		return fmt.Errorf("set owner ref on proxy NetworkPolicy: %w", err)
-	}
-	if _, err := r.createOrUpdateNP(ctx, proxyNP); err != nil {
-		return fmt.Errorf("create or update proxy NetworkPolicy: %w", err)
+	if _, err := r.createOrUpdateNP(ctx, loop, proxyNP); err != nil {
+		if merr := mapForeign(proxyNP.Name, err); merr != nil {
+			return merr
+		}
 	}
 
 	// I42c: the egress proxy NetworkPolicy is created only when the egress
@@ -1476,16 +1495,21 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 				},
 			},
 		}
-		if err := controllerutil.SetControllerReference(loop, egressProxyNP, r.Scheme); err != nil {
-			return fmt.Errorf("set owner ref on egress-proxy NetworkPolicy: %w", err)
-		}
-		if _, err := r.createOrUpdateNP(ctx, egressProxyNP); err != nil {
-			return fmt.Errorf("create or update egress-proxy NetworkPolicy: %w", err)
+		if _, err := r.createOrUpdateNP(ctx, loop, egressProxyNP); err != nil {
+			if merr := mapForeign(egressProxyNP.Name, err); merr != nil {
+				return merr
+			}
 		}
 	} else if err := r.cleanupEgressProxyNetpol(ctx, loop); err != nil {
 		return err
 	}
 
+	if foreignConflict {
+		if err := r.Status().Update(ctx, loop); err != nil {
+			return fmt.Errorf("update Loop status (NetworkPolicyConflict): %w", err)
+		}
+		return nil
+	}
 	return nil
 }
 
@@ -1524,7 +1548,18 @@ func (r *LoopReconciler) cleanupEgressProxyNetpol(ctx context.Context, loop *cox
 // C6b's KubeArmorPolicy selector also keys on coxswain.io/loop, so the two
 // slices compose on the same label.
 
-func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
+// createOrUpdateNP creates or updates a NetworkPolicy.
+//
+// I42c review P2 (round 2): the fixed createOrUpdateNP re-asserts the desired
+// spec on an existing NetworkPolicy; it must NOT do so for a FOREIGN object
+// occupying the name (the P1 fix would otherwise overwrite someone else's
+// netpol with the Loop's). When the live object exists and is not controlled
+// by the Loop, the mutate returns errForeignNetpol (sentinel) and the object
+// is left untouched; the caller maps the sentinel to a NetworkPolicyConflict
+// condition and holds the sandbox Suspended.
+var errForeignNetpol = errors.New("NetworkPolicy is owned by another controller (foreign)")
+
+func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, loop *coxv1alpha1.Loop, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
 	// I42c review P1: the desired spec must be applied inside the mutate
 	// func. controllerutil.CreateOrUpdate first Gets the live object into np
 	// (overwriting the spec we built), then runs the mutate; a no-op mutate
@@ -1534,6 +1569,16 @@ func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.
 	// propagate). Capture the desired spec beforehand and re-assert it.
 	desired := np.DeepCopy()
 	return controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+		// P2 (round 2): a foreign netpol of the same name is left untouched
+		// (never take over, I2/I42b). controllerutil.CreateOrUpdate has
+		// populated np's object meta from the Get, so np.CreationTimestamp
+		// is zero only when it was the one we just created.
+		if !np.CreationTimestamp.IsZero() && !metav1.IsControlledBy(np, loop) {
+			return errForeignNetpol
+		}
+		if err := controllerutil.SetControllerReference(loop, np, r.Scheme); err != nil {
+			return fmt.Errorf("set owner ref on NetworkPolicy %s: %w", np.Name, err)
+		}
 		np.Spec = *desired.Spec.DeepCopy()
 		if np.Labels == nil {
 			np.Labels = map[string]string{}

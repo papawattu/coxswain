@@ -35,8 +35,10 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -498,5 +500,69 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		}
 		Expect(exceptSet).To(HaveKey(i42cAltPodCIDR), "the existing netpol must be UPDATED to the new POD_CIDR (P1: createOrUpdateNP no-op mutate froze it)")
 		Expect(exceptSet).ToNot(HaveKey(i42cPodCIDR), "the old POD_CIDR must be gone from the updated except list")
+	})
+
+	// spec 8 (I42c review P2, round 2): a FOREIGN agent NetworkPolicy of the
+	// same name is never overwritten. createOrUpdateNP's P1 fix re-asserts the
+	// desired spec on an existing netpol; it must not do so for a foreign
+	// one. The reconcile sets NetworkPolicyConflict=True/ForeignNetworkPolicy,
+	// leaves the foreign netpol untouched, and holds the sandbox Suspended.
+	It("does not overwrite a foreign agent NetworkPolicy; sets NetworkPolicyConflict and suspends", func() {
+		ns := "i42c-foreign-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42cPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42cExternalAllow}},
+		})).To(Succeed())
+		makeSecret("foreign-model", ns)
+		loop := buildLoopI42C("foreign", ns, "foreign-model", []string{i42cPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// A FOREIGN agent netpol occupying the name (not owned by the Loop).
+		foreignSpec := networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/foreign": "true"}},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "1.2.3.4/32"}}}},
+			},
+		}
+		foreignNP := &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "foreign-agent-netpol", Namespace: ns},
+			Spec:       foreignSpec,
+		}
+		Expect(k8sClient.Create(ctx, foreignNP)).To(Succeed())
+
+		reconcileI42C("foreign", ns)
+
+		// The foreign netpol is untouched (same spec, still unowned).
+		got := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-agent-netpol"}, got)).To(Succeed())
+		Expect(equality.Semantic.DeepEqual(got.Spec.PodSelector, foreignSpec.PodSelector)).To(BeTrue(), "the foreign netpol's podSelector must NOT be overwritten")
+		Expect(got.Spec.Egress).To(HaveLen(1))
+		Expect(got.Spec.Egress[0].To).To(HaveLen(1))
+		Expect(got.Spec.Egress[0].To[0].IPBlock.CIDR).To(Equal("1.2.3.4/32"), "the foreign netpol's egress spec must NOT be overwritten")
+		Expect(got.OwnerReferences).To(BeEmpty(), "the foreign netpol must NOT gain the Loop's owner ref")
+
+		// The Loop has NetworkPolicyConflict=True/ForeignNetworkPolicy.
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign"}, gotLoop)).To(Succeed())
+		var conflict *metav1.Condition
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == "NetworkPolicyConflict" {
+				conflict = &gotLoop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(conflict).ToNot(BeNil(), "NetworkPolicyConflict condition must be set")
+		Expect(conflict.Status).To(Equal(metav1.ConditionTrue))
+		Expect(conflict.Reason).To(Equal("ForeignNetworkPolicy"))
+
+		// The sandbox is held Suspended (fail-closed: the agent's netpol is not
+		// the one the operator built).
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-sandbox"}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the sandbox must be Suspended while a foreign netpol occupies the name")
 	})
 })

@@ -11,7 +11,7 @@ jobs:
     permissions:
       contents: read
     name: e2e
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","kind"]') }}
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -23,7 +23,9 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      # kind is preinstalled on self-hosted kind VMs; install only for fork PRs on ubuntu-latest
+      - name: Install kind (ubuntu-latest only)
+        if: github.event.pull_request.head.repo.fork
         run: |
           curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
           chmod +x ./kind

@@ -40,6 +40,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -57,7 +58,10 @@ const (
 	i42bServiceCIDR    = "10.96.0.0/12"
 	i42bEgressProxyImg = "coxswain-egress-proxy:standin"
 	i42bForeignImage   = "docker.io/library/busybox:1.36"
+	i42bForeignName    = "foreign"
 	i42bDriftPodName   = "drift-loop-egress-proxy"
+	i42bDriftLoopName  = "drift-loop"
+	i42bEgressConflict = "EgressProxyConflict"
 	i42bLossyLoopName  = "lossy-loop"
 )
 
@@ -175,12 +179,58 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(json.Unmarshal([]byte(policyJSONEnv.Value), &allows)).To(Succeed())
 		Expect(allows).To(ContainElement(i42bExternalAllow))
 
+		// Hardening (P2 review): pin the security posture so a future edit
+		// that drops RunAsNonRoot, flips the SA-token automount, or stops
+		// passing the CIDRs fails here. This pod fronts all agent egress.
+		Expect(pod.Spec.AutomountServiceAccountToken).ToNot(BeNil())
+		Expect(*pod.Spec.AutomountServiceAccountToken).To(BeFalse(), "no SA token on the egress proxy pod")
+		Expect(pod.Spec.SecurityContext).ToNot(BeNil())
+		Expect(*pod.Spec.SecurityContext.RunAsUser).To(BeEquivalentTo(65534))
+		Expect(*pod.Spec.SecurityContext.RunAsGroup).To(BeEquivalentTo(65534))
+		sc := container.SecurityContext
+		Expect(sc).ToNot(BeNil())
+		Expect(*sc.RunAsUser).To(BeEquivalentTo(65534))
+		Expect(*sc.RunAsGroup).To(BeEquivalentTo(65534))
+		Expect(*sc.RunAsNonRoot).To(BeTrue(), "RunAsNonRoot must be set")
+		Expect(*sc.ReadOnlyRootFilesystem).To(BeTrue(), "read-only rootfs")
+		Expect(*sc.AllowPrivilegeEscalation).To(BeFalse(), "no privilege escalation")
+		Expect(sc.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")), "drop ALL capabilities")
+		Expect(sc.SeccompProfile).ToNot(BeNil())
+		Expect(sc.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
+
+		// Readiness probe is TCP 3128.
+		Expect(container.ReadinessProbe).ToNot(BeNil())
+		Expect(container.ReadinessProbe.TCPSocket).ToNot(BeNil())
+		Expect(container.ReadinessProbe.TCPSocket.Port.IntVal).To(BeEquivalentTo(3128))
+
+		// The CIDR env vars must carry the reconciler's values (P2 review).
+		envByName := map[string]string{}
+		for _, e := range container.Env {
+			envByName[e.Name] = e.Value
+		}
+		Expect(envByName["POD_CIDR"]).To(Equal(i42bPodCIDR))
+		Expect(envByName["SERVICE_CIDR"]).To(Equal(i42bServiceCIDR))
+
+		// EGRESS_POLICY_HASH equals the effective policy hash (P2 review).
+		wantHash := policy.EffectiveHash(policy.EffectivePolicy{Network: []string{i42bExternalAllow}})
+		Expect(envByName["EGRESS_POLICY_HASH"]).To(Equal(wantHash))
+
+		// Owner refs on pod and Service (P2 review).
+		loopRef := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "allow-loop"}, loopRef)).To(Succeed())
+		Expect(metav1.IsControlledBy(pod, loopRef)).To(BeTrue(), "the egress proxy pod must be owned by the Loop")
+
 		// Egress proxy Service exists.
 		svc := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "allow-loop-egress-proxy"}, svc)).To(Succeed(),
 			"the egress proxy Service must be created")
 		Expect(svc.Spec.Ports).To(HaveLen(1))
 		Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(3128))
+		Expect(metav1.IsControlledBy(svc, loopRef)).To(BeTrue(), "the egress proxy Service must be owned by the Loop")
+		// The Service selector must equal the pod labels (P2 review).
+		for k, v := range pod.Labels {
+			Expect(svc.Spec.Selector[k]).To(Equal(v), "Service selector must match pod label %s", k)
+		}
 
 		// The sandbox must be Suspended (the egress proxy pod is not Ready yet).
 		sb := &sandboxv1beta1.Sandbox{}
@@ -248,7 +298,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			},
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{
-					Name:  "foreign",
+					Name:  i42bForeignName,
 					Image: i42bForeignImage,
 				}},
 			},
@@ -270,7 +320,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "conflict-loop"}, gotLoop)).To(Succeed())
 		var conflict *metav1.Condition
 		for i := range gotLoop.Status.Conditions {
-			if gotLoop.Status.Conditions[i].Type == "EgressProxyConflict" {
+			if gotLoop.Status.Conditions[i].Type == i42bEgressConflict {
 				conflict = &gotLoop.Status.Conditions[i]
 				break
 			}
@@ -297,11 +347,11 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
 		})).To(Succeed())
 
-		loop := buildLoop("drift-loop", ns, []string{i42bPolicyName})
+		loop := buildLoop(i42bDriftLoopName, ns, []string{i42bPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
 		// First reconcile: creates the egress proxy pod.
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "drift-loop"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42bDriftLoopName}})
 		Expect(err).NotTo(HaveOccurred())
 
 		pod1 := &corev1.Pod{}
@@ -314,18 +364,41 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		ap.Spec.Network = append(ap.Spec.Network, "api.openai.com:443")
 		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
 
-		// Second reconcile: the pod spec hash changes (EGRESS_POLICY_JSON changed),
-		// so the pod is deleted and recreated.
-		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "drift-loop"}})
+		// Second reconcile: the pod spec hash changes (EGRESS_POLICY_JSON
+		// changed), so the pod is deleted. Recreation happens on the NEXT
+		// reconcile (delete+recreate pattern), so a third Reconcile is needed
+		// before asserting the new pod (P2 review: the test previously passed
+		// without ever checking the recreate).
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42bDriftLoopName}})
 		Expect(err).NotTo(HaveOccurred())
 
-		// The old pod should be gone (deleted).
-		podOld := &corev1.Pod{}
-		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42bDriftPodName}, podOld)
-		if err == nil {
-			Expect(podOld.UID).ToNot(Equal(uid1),
-				"the egress proxy pod must be recreated on policy change (drift detection)")
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42bDriftLoopName}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The recreated pod exists with a NEW UID, the updated EGRESS_POLICY_JSON
+		// (both allows) and the updated EGRESS_POLICY_HASH.
+		podNew := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42bDriftPodName}, podNew)).To(Succeed(),
+			"the egress proxy pod must be recreated on policy change")
+		Expect(podNew.UID).ToNot(Equal(uid1), "the recreated pod must have a new UID")
+		var container corev1.Container
+		for _, c := range podNew.Spec.Containers {
+			if c.Name == "egress-proxy" {
+				container = c
+				break
+			}
 		}
+		envByName := map[string]string{}
+		for _, e := range container.Env {
+			envByName[e.Name] = e.Value
+		}
+		var newAllows []string
+		Expect(json.Unmarshal([]byte(envByName["EGRESS_POLICY_JSON"]), &newAllows)).To(Succeed())
+		Expect(newAllows).To(ContainElement(i42bExternalAllow))
+		Expect(newAllows).To(ContainElement("api.openai.com:443"), "the recreated pod must carry the new allow")
+		wantHash := policy.EffectiveHash(policy.EffectivePolicy{Network: []string{i42bExternalAllow, "api.openai.com:443"}})
+		Expect(envByName["EGRESS_POLICY_HASH"]).To(Equal(wantHash), "the recreated pod must carry the updated policy hash")
+
 		// The Service should still exist (unchanged).
 		svc := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42bDriftPodName}, svc)).To(Succeed(),
@@ -410,7 +483,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			},
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{
-					Name:  "foreign",
+					Name:  i42bForeignName,
 					Image: i42bForeignImage,
 				}},
 			},
@@ -422,7 +495,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, gotLoop)).To(Succeed())
 			var conflict *metav1.Condition
 			for i := range gotLoop.Status.Conditions {
-				if gotLoop.Status.Conditions[i].Type == "EgressProxyConflict" {
+				if gotLoop.Status.Conditions[i].Type == i42bEgressConflict {
 					conflict = &gotLoop.Status.Conditions[i]
 					break
 				}
@@ -461,6 +534,84 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(proxyConflict).ToNot(BeNil(), "the model proxy's ProxyConflict condition must still be present")
 		Expect(proxyConflict.Status).To(Equal(metav1.ConditionFalse),
 			"the healthy model proxy must report no conflict even while the egress proxy is foreign")
+	})
+
+	// spec 9 (P3 review): a stale EgressProxyConflict=True is cleared on the
+	// no-allows path. A foreign pod once held the name (condition True), then
+	// the network allows are removed; the early cleanup return must clear the
+	// condition (it is moot: no egress proxy is required anymore) rather than
+	// report a conflict that no longer applies.
+	It("clears a stale EgressProxyConflict when the network allows are removed", func() {
+		ns := "i42b-stale-" + nowSuffix()
+		const loopName = "stale-loop"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42bPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+
+		loop := buildLoop(loopName, ns, []string{i42bPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Pre-create a FOREIGN pod with the egress proxy name.
+		foreignPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      loopName + "-egress-proxy",
+				Namespace: ns,
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  i42bForeignName,
+					Image: i42bForeignImage,
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, foreignPod)).To(Succeed())
+
+		// Reconcile 1: the foreign pod holds the name -> EgressProxyConflict=True.
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, gotLoop)).To(Succeed())
+		var conflict *metav1.Condition
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == i42bEgressConflict {
+				conflict = &gotLoop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(conflict).ToNot(BeNil(), "reconcile 1: the foreign egress proxy pod must set EgressProxyConflict")
+		Expect(conflict.Status).To(Equal(metav1.ConditionTrue))
+
+		// Remove the network allows (the egress proxy is no longer required).
+		ap := &coxv1alpha1.AgentPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42bPolicyName}, ap)).To(Succeed())
+		ap.Spec.Network = nil
+		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
+
+		// Reconcile 2: the no-allows path runs (early return) and must clear the
+		// stale condition.
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, gotLoop)).To(Succeed())
+		var cleared *metav1.Condition
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == i42bEgressConflict {
+				cleared = &gotLoop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(cleared).ToNot(BeNil(), "reconcile 2: the condition must still exist (cleared, not removed)")
+		Expect(cleared.Status).To(Equal(metav1.ConditionFalse),
+			"the stale EgressProxyConflict must be cleared when the network allows are removed")
+		Expect(cleared.Reason).To(Equal("Resolved"))
+
+		// The foreign pod must still exist (I2 never-take-over, even on cleanup).
+		gotForeign := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-egress-proxy"}, gotForeign)).To(Succeed(),
+			"the foreign pod must NOT be deleted by the cleanup path either")
 	})
 
 	// spec 7: PolicyTranslationLossy condition when network allows are present.

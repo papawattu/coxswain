@@ -1,12 +1,28 @@
 # Dev/kind only: the base install (config/default) plus --allow-unenforced.
 # Never use for production — Loops run with PolicyEnforced=False (EnforcementDisabled).
+#
+# I42c review P2: the egress-proxy NetworkPolicy carve-outs and the I42e
+# in-cluster-allow CIDR check need the cluster's pod/service CIDRs. The base
+# manifest never sets them, so a deployed operator had an empty except list
+# (the carve-outs silently missing) and the CIDR validation disabled. Wire
+# them into the manager Deployment here, with the kind defaults (the kind
+# cluster's --pod-network-cidr / --service-cluster-ip-range). For a
+# non-kind cluster, edit the two values below (or extend deploy-dev to
+# pass them) so they match the cluster's actual CIDRs.
 resources:
 - ../default
 patches:
 - target:
     kind: Deployment
-    name: controller-manager
+    name: coxswain-controller-manager
   patch: |-
     - op: add
       path: /spec/template/spec/containers/0/args/-
       value: --allow-unenforced
+    - op: add
+      path: /spec/template/spec/containers/0/env
+      value:
+        - name: POD_CIDR
+          value: "10.244.0.0/16"
+        - name: SERVICE_CIDR
+          value: "10.96.0.0/12"

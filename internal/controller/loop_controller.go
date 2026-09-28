@@ -1311,12 +1311,36 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	loopName := loop.Name
 	agentLabels := agentPodLabels(loopName)
 	proxyL := proxyLabels(loopName)
+	egressProxyL := egressProxyLabels(loopName)
 	proxyPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: proxyL},
+	}
+	egressProxyPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: egressProxyL},
 	}
 	agentPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
 	}
+	// I42c: the agent's egress to the egress proxy is expected only when the
+	// egress proxy is expected (network allows present); with no network
+	// allows the agent's egress stays model-proxy + DNS (D34).
+	egressExpected := needsEgressProxy(ctx, r, loop)
+	agentEgress := []networkingv1.NetworkPolicyEgressRule{
+		{
+			To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+		},
+	}
+	if egressExpected {
+		agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
+			To:    []networkingv1.NetworkPolicyPeer{egressProxyPeer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(egressProxyPort), Protocol: new(corev1.ProtocolTCP)}},
+		})
+	}
+	agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
+		To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+		Ports: dnsPorts(),
+	})
 
 	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
 	// none" — the agent pod must be unreachable from every other pod,
@@ -1339,16 +1363,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			PodSelector: metav1.LabelSelector{MatchLabels: agentLabels},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress:     []networkingv1.NetworkPolicyIngressRule{},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{
-					To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
-					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
-				},
-				{
-					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
-					Ports: dnsPorts(),
-				},
-			},
+			Egress:      agentEgress,
 		},
 	}
 	if err := controllerutil.SetControllerReference(loop, agentNP, r.Scheme); err != nil {
@@ -1401,6 +1416,58 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		return fmt.Errorf("create or update proxy NetworkPolicy: %w", err)
 	}
 
+	// I42c: the egress proxy NetworkPolicy is created only when the egress
+	// proxy is expected (network allows present). Ingress: only from this
+	// Loop's agent on 3128. Egress: the external world with carve-outs (the
+	// proxy dials any port the allow specifies; the application layer enforces
+	// the port) + DNS to kube-dns.
+	if egressExpected {
+		egressProxyNP := &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      loopName + "-egress-proxy-netpol",
+				Namespace: ns,
+			},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: egressProxyL},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+				Ingress: []networkingv1.NetworkPolicyIngressRule{
+					{
+						From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+						Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(egressProxyPort), Protocol: new(corev1.ProtocolTCP)}},
+					},
+				},
+				Egress: []networkingv1.NetworkPolicyEgressRule{
+					{
+						// Egress rule 1: external with carve-outs (no port
+						// restriction). The except list carves out the RFC1918 /
+						// loopback / link-local / multicast / reserved ranges
+						// plus the cluster's POD_CIDR and SERVICE_CIDR (from the
+						// operator's config), mirroring the egress binary's own
+						// resolved-IP carve-outs (I42a) so the two layers agree.
+						To: []networkingv1.NetworkPolicyPeer{
+							{
+								IPBlock: &networkingv1.IPBlock{
+									CIDR:   "0.0.0.0/0",
+									Except: egressCarveOutCIDRs(r.PodCIDR, r.ServiceCIDR),
+								},
+							},
+						},
+					},
+					{
+						To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+						Ports: dnsPorts(),
+					},
+				},
+			},
+		}
+		if err := controllerutil.SetControllerReference(loop, egressProxyNP, r.Scheme); err != nil {
+			return fmt.Errorf("set owner ref on egress-proxy NetworkPolicy: %w", err)
+		}
+		if _, err := r.createOrUpdateNP(ctx, egressProxyNP); err != nil {
+			return fmt.Errorf("create or update egress-proxy NetworkPolicy: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -1442,6 +1509,33 @@ func dnsPorts() []networkingv1.NetworkPolicyPort {
 		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
 		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
 	}
+}
+
+// egressCarveOutCIDRs is the except list for the egress proxy's external
+// egress ipBlock (0.0.0.0/0 minus these). It carves out the RFC1918 / loopback
+// / link-local / multicast / reserved ranges plus the cluster's POD_CIDR and
+// SERVICE_CIDR (from the operator's config, not per-Loop discovery), mirroring
+// the egress binary's own resolved-IP carve-outs (I42a) so the two layers
+// agree. An empty POD_CIDR / SERVICE_CIDR contributes no entry (the operator
+// was not configured with those CIDRs).
+func egressCarveOutCIDRs(podCIDR, serviceCIDR string) []string {
+	cidrs := []string{
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+		"0.0.0.0/8",      // reserved / 0.0.0.0
+		"224.0.0.0/4",    // multicast
+		"240.0.0.0/4",    // reserved
+		"169.254.0.0/16", // link-local
+		"127.0.0.0/8",    // loopback
+	}
+	if podCIDR != "" {
+		cidrs = append(cidrs, podCIDR)
+	}
+	if serviceCIDR != "" {
+		cidrs = append(cidrs, serviceCIDR)
+	}
+	return cidrs
 }
 
 // modelPeer is the NetworkPolicy peer for the proxy's model egress (P1-4,
@@ -1629,11 +1723,14 @@ func (r *LoopReconciler) ensureProxyAndNetPolicies(ctx context.Context, loop *co
 	return !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions), nil
 }
 
-// ensureNetPoliciesIfConfigured creates the per-Loop NetworkPolicies when a
-// model endpoint is configured (D34). A no-op when endpointSecretRef is
-// absent.
+// ensureNetPoliciesIfConfigured creates the per-Loop NetworkPolicies when
+// they are expected: a model endpoint is configured (D34: the model proxy and
+// the agent NetworkPolicies are only useful when there is a model to reach),
+// or the effective policy has network allows (I42c: the egress proxy and its
+// NetworkPolicy are expected). A no-op when neither is the case (nothing to
+// allow-egress to).
 func (r *LoopReconciler) ensureNetPoliciesIfConfigured(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if loop.Spec.Agent.EndpointSecretRef == "" {
+	if loop.Spec.Agent.EndpointSecretRef == "" && !needsEgressProxy(ctx, r, loop) {
 		return nil
 	}
 	return r.ensureNetworkPolicy(ctx, loop)

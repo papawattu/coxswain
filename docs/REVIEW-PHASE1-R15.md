@@ -85,19 +85,25 @@ them: stages, gates, a ledger, intake, deploy and monitoring.
   evidence gates and the ledger's integrity. Extensions supply everything
   else. Candidate extension points, one per capability:
 
-  | Extension point | What it supplies | Example implementations |
-  |---|---|---|
-  | Memory | lessons and context carried across runs | Honcho, git-backed notes |
-  | Intake | turning outside demand into work items | GitHub issues, forms, email, hermes kanban |
-  | Workflow / stages | the stage graph that drives Loops (intent → … → maintain) | a built-in graph, the ai-native-sdlc skill, hermes |
-  | Gate approvers | who may approve a gate, and how they're notified | GitHub review, Slack, a CLI |
-  | Ledger store | where approvals are recorded | git, a CRD, an external log |
-  | Agent roles | extra advisory agents (reviewer, PM, judge) | any runner image |
-  | Evals | the harness that scores agent configurations | ai-native-sdlc evals, custom suites |
-  | Deploy | the release / production-gate step | Argo CD, Flux, a script |
-  | Maintain / monitoring | signals that open new Loops | Prometheus alerts, bands |
-  | Enforcement engine | the eBPF policy engine (already a seam: C6b `Enforcer`) | KubeArmor, Tetragon |
-  | Model proxy | the credential-holding model gateway (already a seam: D33) | the stand-in, LiteLLM, a vendor gateway |
+  | Extension point | What it supplies | Built-in default (ships with coxswain) | Solid external implementations |
+  |---|---|---|---|
+  | Memory | lessons and context carried across runs | notes file in the repo (per-repo `.coxswain/memory.md`), read-only to the agent, curated by the operator | Honcho |
+  | Intake | turning outside demand into work items | `kubectl apply` a Loop, or a label on a GitHub issue | forms, email, hermes kanban |
+  | Workflow / stages | the stage graph that drives Loops (intent → … → maintain) | a fixed linear graph: intent → plan → build → test → PR | the ai-native-sdlc skill, hermes, Argo Workflows |
+  | Gate approvers | who may approve a gate, and how they're notified | an annotation or `kubectl coxswain approve` by a human with RBAC | GitHub review, Slack |
+  | Ledger store | where approvals are recorded | a hash-chained file committed to git (core verifies the chain) | an external append-only log |
+  | Agent roles | extra advisory agents (reviewer, PM, judge) | one runner, no extra roles | any runner image (advisory only) |
+  | Evals | the harness that scores agent configurations | run a list of eval Loops and report pass/fail | ai-native-sdlc evals, custom suites |
+  | Deploy | the release / production-gate step | stop at a merged PR (no deploy) | Argo CD, Flux |
+  | Maintain / monitoring | signals that open new Loops | a webhook that turns an alert into a new Loop | Prometheus/Alertmanager with bands |
+  | Enforcement engine | the eBPF policy engine (already a seam: C6b `Enforcer`) | KubeArmor (today) | Tetragon |
+  | Model proxy | the credential-holding model gateway (already a seam: D33) | the stand-in forwarder (today) | LiteLLM, a vendor gateway |
+
+  **Every extension point ships a simple built-in default**, so coxswain
+  works end-to-end with nothing extra installed. A solid external
+  implementation replaces the default through the same contract. The
+  defaults stay deliberately small, since they're the reference
+  implementation of each contract, not a competitor to the external tools.
 
   Two of these seams already exist (the enforcement `Enforcer` interface and
   the model proxy image), which shows the pattern works.

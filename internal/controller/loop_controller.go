@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/engine"
@@ -41,8 +42,13 @@ const (
 	// proxyContainerName is the name of the model proxy sidecar container.
 	proxyContainerName = "proxy"
 	// modelCredsVolume is the name of the Secret volume that carries the model
-	// API key + base URL (mounted read-only into the proxy only).
+	// API key + base URL (mounted read-only into the proxy only)
+	// modelCredsVolume is the name of the Secret volume that carries the model
+	// API key + base URL (mounted read-only into the proxy only)
 	modelCredsVolume = "model-creds"
+	// PolicyTranslationLossyCondition is the Loop condition that reports
+	// a lossy translation (I41).
+	PolicyTranslationLossyCondition = "PolicyTranslationLossy"
 	// coxModelBaseURL is the env var the operator sets on the agent so it talks
 	// to the local proxy (a Loop cannot override it: COX_* names are rejected
 	// at admission, I34).
@@ -121,6 +127,20 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 	if loop.Status.Policy.EffectiveHash != policy.EffectiveHash(effective) {
 		loop.Status.Policy.EffectiveHash = policy.EffectiveHash(effective)
+	}
+	// I41: a host:PORT network allow that the engine can't express at that
+	// precision (the port is dropped) must set PolicyTranslationLossy=True.
+	// The condition becomes False/PortEnforcedByNetworkPolicy once D34's
+	// per-Loop NetworkPolicy carries the port for that allow.
+	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
+		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
+			"KubeArmorDroppedPorts",
+			"these network allows lost their port in the KubeArmor translation: "+strings.Join(lossy, ", ")+
+				" (host:port precision is enforced by the per-Loop NetworkPolicy)")
+	} else {
+		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
+			"PortEnforcedByNetworkPolicy",
+			"no network allows lost their port in the translation")
 	}
 
 	if err := r.ensureSandbox(ctx, &loop); err != nil {

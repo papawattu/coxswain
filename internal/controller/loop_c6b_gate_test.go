@@ -224,7 +224,78 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		Expect(c.Reason).To(Equal("EnforcementDisabled"), "reason must be EnforcementDisabled (loudly visible)")
 	})
 
+	It("sets PolicyTranslationLossy=True when a host:PORT network allow loses its port (I41)", func() {
+		ctx = context.Background()
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		ns := "c6b-lossy"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// Create an AgentPolicy with a host:PORT network allow.
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "lossy-pol", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{"pypi.org:443"}},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
+
+		// Create a Loop referencing the policy.
+		loop := buildLoop(ns)
+		loop.Name = "lossy-loop"
+		loop.Spec.PolicyRefs = []string{"lossy-pol"}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "lossy-loop"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		loop = getLoop(ns, "lossy-loop")
+		c := translationLossyCondition(loop.Status.Conditions)
+		Expect(c).NotTo(BeNil(), "the PolicyTranslationLossy condition must exist")
+		Expect(string(c.Status)).To(Equal("True"), "a host:PORT allow must set PolicyTranslationLossy=True")
+		Expect(c.Reason).To(Equal("KubeArmorDroppedPorts"))
+		Expect(c.Message).To(ContainSubstring("pypi.org:443"))
+	})
+
+	It("sets PolicyTranslationLossy=False when all network allows are bare hosts (I41)", func() {
+		ctx = context.Background()
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		ns := "c6b-notlossy"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// Create an AgentPolicy with a bare host network allow (no port).
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "notlossy-pol", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{"pypi.org"}},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
+
+		// Create a Loop referencing the policy.
+		loop := buildLoop(ns)
+		loop.Name = "notlossy-loop"
+		loop.Spec.PolicyRefs = []string{"notlossy-pol"}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "notlossy-loop"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		loop = getLoop(ns, "notlossy-loop")
+		c := translationLossyCondition(loop.Status.Conditions)
+		Expect(c).NotTo(BeNil(), "the PolicyTranslationLossy condition must exist")
+		Expect(string(c.Status)).To(Equal("False"), "a bare host allow must set PolicyTranslationLossy=False")
+		Expect(c.Reason).To(Equal("PortEnforcedByNetworkPolicy"))
+	})
+
 })
+
+// translationLossyCondition finds the PolicyTranslationLossy condition.
+func translationLossyCondition(conds []metav1.Condition) *metav1.Condition {
+	for i := range conds {
+		if conds[i].Type == PolicyTranslationLossyCondition {
+			return &conds[i]
+		}
+	}
+	return nil
+}
 
 // policyEnforcedCondition finds the PolicyEnforced condition.
 func policyEnforcedCondition(conds []metav1.Condition) *metav1.Condition {

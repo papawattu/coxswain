@@ -402,6 +402,137 @@ func TestConnectSNIRecordTooLarge(t *testing.T) {
 	}
 }
 
+// --- relay tests (R15 P2: buffered bytes + idle timeout) ---
+
+// newTCPConnPair creates a real TCP client<->server pair over a localhost
+// listener. The returned (client, server) are the two endpoints of the
+// accepted connection; both honor SetReadDeadline (net.Pipe does not).
+func newTCPConnPair(t *testing.T) (client, server net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	got := make(chan net.Conn, 1)
+	go func() {
+		s, err := ln.Accept()
+		if err == nil {
+			got <- s
+		}
+	}()
+	client, err = net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	server = <-got
+	return client, server
+}
+
+// TestRelayForwardsBufferedBytes proves the bytes a client sends right after
+// the ClientHello (which sit in clientBuf after the hello is read) are
+// forwarded to the server, not dropped. relay reads from `client` (a real
+// TCP conn, so the bufio fill is real) and writes to `server` (a pipe whose
+// other end the test reads). The TCP pair is fed hello + extra in one go so
+// the bufio fill on relay's client reads them together; the test asserts the
+// upstream receives both the hello and the extra (the reviewer's 0-RTT /
+// pipelined-record case).
+func TestRelayForwardsBufferedBytes(t *testing.T) {
+	hello := egresstest.BuildClientHello(testAllowHost)
+	extra := []byte("0-RTT-early-data")
+	// relay's `client`: a real TCP conn. newTCPConnPair returns (dial,
+	// accept). We write to the accept side so the dial side (relay's client)
+	// receives the bytes in its read buffer.
+	tcpDial, tcpAccept := newTCPConnPair(t)
+	defer func() { _ = tcpDial.Close() }()
+	defer func() { _ = tcpAccept.Close() }()
+	// relay's `server`: another real TCP conn (honors deadlines, unlike a
+	// pipe). We read from its dial side what relay wrote to its accept side.
+	srvDial, srvAccept := newTCPConnPair(t)
+	defer func() { _ = srvDial.Close() }()
+	defer func() { _ = srvAccept.Close() }()
+	// Feed hello + extra into the accept side; the dial side (relay's
+	// client) receives them in its read buffer (same segment -> the bufio
+	// fill reads them all, so the extra sits in clientBuf after the hello
+	// is consumed for the SNI check).
+	go func() {
+		_, _ = tcpAccept.Write(hello)
+		_, _ = tcpAccept.Write(extra)
+	}()
+	clientBuf := bufio.NewReadWriter(bufio.NewReader(tcpDial), bufio.NewWriter(tcpDial))
+	// relay reads from tcpDial (its client) and writes to srvAccept (its
+	// server); the test reads what relay wrote from srvDial.
+	relay(tcpDial, clientBuf, srvAccept, hello, time.Second)
+	// Read what relay forwarded to srvAccept (writes to srvAccept are read
+	// from srvDial).
+	_ = srvDial.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 4096)
+	var got []byte
+	for {
+		n, err := srvDial.Read(buf)
+		if n > 0 {
+			got = append(got, buf[:n]...)
+		}
+		if err != nil || len(got) >= len(hello)+len(extra) {
+			break
+		}
+	}
+	if !bytes.HasPrefix(got, hello) {
+		t.Fatalf("upstream did not receive the ClientHello first; got %d bytes", len(got))
+	}
+	rest := got[len(hello):]
+	if !bytes.Contains(rest, extra) {
+		t.Fatalf("upstream did not receive the buffered extra bytes %q; rest=%q", extra, rest)
+	}
+}
+
+// TestRelayIdleTimeout proves a real idle timeout: a tunnel that trickles
+// bytes past the idle window stays open (the deadline is reset per read),
+// while a silent tunnel is torn down after the idle window. Both directions
+// use TCP conns (honoring SetReadDeadline, unlike net.Pipe).
+func TestRelayIdleTimeout(t *testing.T) {
+	// Silent case: neither side sends, so both directions hit the idle
+	// deadline and the relay tears down after the idle window.
+	client, server := newTCPConnPair(t)
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+	clientBuf := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+	start := time.Now()
+	relay(client, clientBuf, server, nil, 300*time.Millisecond)
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("silent tunnel torn down after %v; want >= 250ms (the idle window)", elapsed)
+	}
+	// Active case: one side keeps sending one byte every 100ms, well within
+	// the 300ms idle window. The relay must NOT tear down; it runs until we
+	// close the client. Bound the test so it cannot hang.
+	c2, s2 := newTCPConnPair(t)
+	defer func() { _ = c2.Close() }()
+	defer func() { _ = s2.Close() }()
+	clientBuf2 := bufio.NewReadWriter(bufio.NewReader(c2), bufio.NewWriter(c2))
+	activeDone := make(chan struct{})
+	go func() {
+		relay(c2, clientBuf2, s2, nil, 300*time.Millisecond)
+		close(activeDone)
+	}()
+	// Trickle one byte from s2 to c2 every 100ms for ~800ms (well past one
+	// 300ms idle window without activity, but always active in that
+	// direction).
+	deadline := time.Now().Add(800 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, _ = s2.Write([]byte{0x01})
+		time.Sleep(100 * time.Millisecond)
+	}
+	// The relay should still be running (not torn down by the idle timeout).
+	// Close the client to end it.
+	_ = c2.Close()
+	select {
+	case <-activeDone:
+		// relay returned after the client closed - expected.
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not return after the client closed")
+	}
+}
+
 // --- helpers ---
 
 func mustParse(s string) *url.URL {

@@ -128,6 +128,9 @@ type h struct {
 	// transport is the shared upstream Transport (lazily created by
 	// transport()).
 	transport_ *http.Transport
+	// relayIdle is the per-Read idle timeout for the relay (relayIdleTimeout
+	// in production; a test swaps it for a short value to exercise teardown).
+	relayIdle time.Duration
 }
 
 // sniReadTimeout bounds the read of the TLS ClientHello record over a
@@ -154,6 +157,7 @@ func newHandlerWithResolver(allows, extraCIDRs []string, loopName, namespace, po
 		namespace:  namespace,
 		policyHash: policyHash,
 		resolver:   r,
+		relayIdle:  relayIdleTimeout,
 	}
 }
 
@@ -284,7 +288,7 @@ func (p *h) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	p.audit("connect", r.Host, "allowed",
 		"sni="+host+", proto=https, ip="+resolvedIP.String()+", policy="+p.policyHash)
-	relay(clientConn, clientBuf, serverConn, peeked)
+	relay(clientConn, clientBuf, serverConn, peeked, p.relayIdle)
 }
 
 // handlePlainHTTP implements the plain-HTTP path: check the Host header and
@@ -464,35 +468,65 @@ func closeQuietly(c net.Conn) {
 	_ = c.Close()
 }
 
-func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn, clientHello []byte) {
-	_ = clientBuf // the ClientHello has been read out of this reader above; nothing to drain.
+// relayConn is a net.Conn whose read deadline is refreshed to now+timeout
+// before every Read (a real idle timeout: an active tunnel keeps its deadline
+// pushed out, a silent one hits it). Writes use no deadline.
+type relayConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (r *relayConn) Read(p []byte) (int, error) {
+	// The embedded conn's SetReadDeadline/Read are called explicitly (not via
+	// the promoted r.SetReadDeadline/r.Read, which would recurse). See the
+	// QF1008 exclusion in .golangci.yml for the reasoning.
+	_ = r.Conn.SetReadDeadline(time.Now().Add(r.timeout))
+	return r.Conn.Read(p)
+}
+
+// idleTimeout wraps both relay directions so a silent tunnel is torn down
+// after idleTimeout with no activity, while an active tunnel (bytes flowing
+// in either direction) never hits it. The deadline is refreshed per Read, so
+// long downloads/clones are not cut (unlike a hard cap after open).
+func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn, clientHello []byte, idle time.Duration) {
 	defer closeQuietly(client)
 	defer closeQuietly(server)
 	// The ClientHello record (header + record) was read from the client for
-	// the SNI check; it has been consumed out of the buffered reader, so
-	// write it to the server first to restore the full handshake stream.
+	// the SNI check. It was consumed out of the buffered reader; write it to
+	// the server first to restore the full handshake stream.
 	if len(clientHello) > 0 {
 		_, _ = server.Write(clientHello)
 	}
-	// An idle tunnel is torn down (relayIdleTimeout); an active tunnel runs
-	// until one side closes.
-	_ = client.SetDeadline(time.Time{})
-	_ = server.SetDeadline(time.Time{})
+	// A bufio fill reads up to 4 KiB from the socket, so bytes the client sent
+	// right after the ClientHello (0-RTT early data, a pipelined record,
+	// anything in the same segment) sit in clientBuf. Forward them to the
+	// server BEFORE starting the copy, then copy from the buffered reader (not
+	// the raw conn) so no client bytes are skipped.
+	// (clientBuf.Reader.Buffered/Peek are called via the explicit .Reader. to
+	// avoid an ambiguous-selector error; see the QF1008 exclusion in
+	// .golangci.yml.)
+	if n := clientBuf.Reader.Buffered(); n > 0 {
+		if buffered, _ := clientBuf.Reader.Peek(n); len(buffered) > 0 {
+			_, _ = server.Write(buffered)
+			_, _ = clientBuf.Discard(n)
+		}
+	}
+	// Wrap both directions in an idle-timeout conn: each Read refreshes the
+	// deadline to now+relayIdleTimeout, so an active tunnel never times out
+	// and a silent one is torn down after relayIdleTimeout of no activity.
+	clientRC := &relayConn{Conn: client, timeout: idle}
+	serverRC := &relayConn{Conn: server, timeout: idle}
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(server, client)
+		_, _ = io.Copy(serverRC, clientRC) // client -> server
 		done <- struct{}{}
 		closeQuietly(server)
 	}()
 	go func() {
-		_, _ = io.Copy(client, server)
+		_, _ = io.Copy(client, serverRC) // server -> client
 		done <- struct{}{}
 		closeQuietly(client)
 	}()
-	time.AfterFunc(relayIdleTimeout, func() {
-		closeQuietly(client)
-		closeQuietly(server)
-	})
 	<-done
 }
 

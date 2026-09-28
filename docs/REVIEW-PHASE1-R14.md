@@ -44,3 +44,47 @@ output.
   fails.
 - The `splitNetworkAllows` comment points at this issue instead of "D33
   follow-up".
+
+---
+
+## P1: Owner decision
+
+### I42. How does the agent reach the hosts its AgentPolicy allows?
+
+- [ ] Decided (owner)
+- [ ] Done
+
+**Where:** ADR-0007 (the D34 "AgentPolicy network allows" paragraph),
+`ensureNetworkPolicy` (agent egress), and D35.
+
+**Problem:** since D34 (PR #13), the agent pod's NetworkPolicy is default-deny
+egress: it may reach only its proxy and cluster DNS. An `AgentPolicy`
+`network` allow (e.g. `proxy.golang.org:443`) is therefore not enforced as an
+allow at all. That fails closed, but the feature is silently absent (no
+package downloads). NetworkPolicy can't match hostnames. The obvious
+translation, a port-only rule (`ports: [443]`, no `to:`), lets the agent reach
+**any** host on that port. That is the evil-agent exfiltration path D34 closes.
+KubeArmor's DNS matching (D35) doesn't close it either, because an agent can
+connect to a hard-coded IP without any lookup.
+
+**Options:**
+- **(a) Resolved `ipBlock`s:** the operator resolves each allowed FQDN and
+  emits /32 rules, re-resolving on a timer. No new components, but it's
+  fragile for CDNs and round-robin DNS, and allows can lag DNS changes.
+- **(b) Egress proxy (recommended):** the agent's external traffic goes
+  through an operator-owned egress proxy that enforces the hostname
+  allowlist (HTTP CONNECT + SNI/Host check), per Loop or shared. The agent's
+  NetworkPolicy allows only its model proxy, the egress proxy and DNS. This
+  mirrors D29 (the model proxy), works for any CNI, and gives the activity
+  audit (ADR-0007 Q4) a single point to record egress.
+- **(c) FQDN-aware CNI:** require Cilium (`toFQDNs`) or similar. Precise,
+  but it adds a cluster requirement (kind/k3s would need Cilium).
+
+**Until decided:** agent egress stays proxy + DNS only (fail-closed). The
+Loop gets a condition (e.g. `NetworkAllowsNotEnforced`) listing the allows
+that aren't applied, so the gap is visible. ADR-0007 records this as an open
+question, not a "port-only rules" plan.
+
+**Acceptance (after the decision):** in the D34/C5 kind e2e, an allowed host
+is reachable from the agent, a non-allowed host on the same port is not, and
+a direct IP connection to a non-allowed host on the same port is not.

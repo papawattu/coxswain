@@ -51,7 +51,7 @@ output.
 
 ### I42. How does the agent reach the hosts its AgentPolicy allows?
 
-- [ ] Decided (owner)
+- [x] Decided (owner, 2026-09-28): **option (b), egress proxy**
 - [ ] Done
 
 **Where:** ADR-0007 (the D34 "AgentPolicy network allows" paragraph),
@@ -88,3 +88,17 @@ question, not a "port-only rules" plan.
 **Acceptance (after the decision):** in the D34/C5 kind e2e, an allowed host
 is reachable from the agent, a non-allowed host on the same port is not, and
 a direct IP connection to a non-allowed host on the same port is not.
+
+---
+
+## Owner decisions (2026-09-28)
+
+- **I42 → (b) egress proxy.** The agent's external traffic goes through an
+  operator-owned egress proxy that enforces the AgentPolicy hostname
+  allowlist (HTTP CONNECT + SNI/Host check). The agent's NetworkPolicy allows
+  only its model proxy, the egress proxy and cluster DNS. No port-only
+  NetworkPolicy rules, ever. The builder records this as an ADR-0007
+  amendment before implementing it.
+- **`spec.agent.modelEndpoint` confirmed** (added in D34, PR #13): a non-secret
+  `host:port` that is CEL-validated, immutable, and required together with
+  `endpointSecretRef`. The operator needs no Secrets RBAC.

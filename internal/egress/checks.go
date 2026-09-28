@@ -72,9 +72,22 @@ var carveOutCIDRs = []string{
 	"169.254.0.0/16",
 	"127.0.0.0/8",
 	"100.64.0.0/10",
+	// 0.0.0.0/8: dialing 0.0.0.0 on Linux reaches the local host (the
+	// proxy pod itself).
+	"0.0.0.0/8",
+	// 224.0.0.0/4 multicast and 240.0.0.0/4 reserved (incl. 255.255.255.255
+	// broadcast): not routable destinations.
+	"224.0.0.0/4",
+	"240.0.0.0/4",
 	"::1/128",
+	// The unspecified address: on Linux, dialing :: behaves like 0.0.0.0
+	// (local host).
+	"::/128",
 	"fc00::/7",
 	"fe80::/10",
+	// 64:ff9b::/96 (NAT64 well-known prefix): can map a private IPv4 behind
+	// a public-looking IPv6. The IETF well-known NAT64 prefix is 64:ff9b::/96.
+	"64:ff9b::/96",
 }
 
 // CheckResolvedIP reports whether the proxy may dial the resolved IP: it is

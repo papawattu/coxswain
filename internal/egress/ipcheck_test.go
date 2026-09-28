@@ -28,6 +28,26 @@ func TestCheckResolvedIP(t *testing.T) {
 		{"v6 loopback", "::1", false},
 		{"v6 link-local", "fe80::1", false},
 		{"v6 ULA", "fc00::1", false},
+		// 0.0.0.0/8: dialing 0.0.0.0 on Linux reaches the local host.
+		{"0.0.0.0/8 (local host)", "0.0.0.0", false},
+		{"0.0.0.0/8 (x.x.x.x)", "0.1.2.3", false},
+		// 224.0.0.0/4 multicast.
+		{"multicast 224.0.0.0/4", "224.0.0.1", false},
+		{"multicast 239.255.255.255", "239.255.255.255", false},
+		// 240.0.0.0/4 reserved (incl. 255.255.255.255 broadcast).
+		{"reserved 240.0.0.0/4", "240.0.0.1", false},
+		{"broadcast 255.255.255.255", "255.255.255.255", false},
+		// 64:ff9b::/96 NAT64 well-known prefix: a NAT64 address mapping to a
+		// private IPv4 is rejected by the containment check. The last 4 bytes
+		// embed the v4 (ac10:1 = 172.16.0.1, private).
+		{"NAT64 well-known prefix (private v4)", "64:ff9b:0:0:0:0:ac10:1", false},
+		// ::/128 unspecified: dialing :: behaves like 0.0.0.0 (local host).
+		{"unspecified ::/128", "::", false},
+		// The mapped form ::ffff:a.b.c.d is handled via To4 — a mapped
+		// private IPv4 is rejected by the v4 carve-outs, a mapped public
+		// IPv4 is dialable.
+		{"mapped private v4 (via To4)", "::ffff:10.0.0.1", false},
+		{"mapped public v4 (via To4)", "::ffff:151.101.0.223", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

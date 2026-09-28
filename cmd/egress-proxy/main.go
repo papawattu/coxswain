@@ -27,6 +27,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/textproto"
 	"os"
 	"os/signal"
 	"strconv"
@@ -121,11 +122,26 @@ type h struct {
 	namespace  string
 	policyHash string
 	resolver   resolver
+	// dial is the upstream dial seam (nil in production: dial the
+	// checked IP:port directly; a test swaps it for a fake-upstream dialer).
+	dialer func(ctx context.Context, network, addr string) (net.Conn, error)
+	// transport is the shared upstream Transport (lazily created by
+	// transport()).
+	transport_ *http.Transport
 }
 
-func newHandler(allows, extraCIDRs []string, loopName, namespace, policyHash string) *h {
-	return newHandlerWithResolver(allows, extraCIDRs, loopName, namespace, policyHash, net.DefaultResolver)
-}
+// sniReadTimeout bounds the read of the TLS ClientHello record over a
+// CONNECT tunnel. A silent client must time out (audited as blocked), not
+// pin the relay goroutine; 10s is generous for a local client.
+const sniReadTimeout = 10 * time.Second
+
+// dnsTimeout bounds a DNS lookup so a slow resolver cannot pin handlers.
+const dnsTimeout = 5 * time.Second
+
+// relayIdleTimeout bounds an idle CONNECT tunnel: after the SNI is verified
+// the tunnel is pure byte relay, and a tunnel with no traffic for this long
+// is torn down (the client reconnects; a fresh CONNECT re-runs the checks).
+const relayIdleTimeout = 5 * time.Minute
 
 // newHandlerWithResolver builds the handler with an explicit resolver. The
 // production binary passes net.DefaultResolver (the pod's DNS); unit tests
@@ -172,8 +188,9 @@ func (p *h) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "host not allowed", http.StatusForbidden)
 		return
 	}
-	// Resolve the host ourselves and check the resolved IP (SSRF backstop).
-	resolvedIP, ok, resolveErr := p.resolveAndCheck(host)
+	// Resolve the host ourselves and check the resolved IP (SSRF backstop),
+	// with a bounded lookup (a slow resolver must not pin the handler).
+	resolvedIP, ok, resolveErr := p.resolveAndCheck(r.Context(), host)
 	if !ok {
 		detail := "reason=resolved-ip-rejected"
 		if resolveErr != nil {
@@ -211,30 +228,63 @@ func (p *h) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// tunnel.
 	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	// The proxy sees the ClientHello over the tunnel; verify the SNI before
-	// relaying the payload.
-	peeked, _ := clientBuf.Peek(512)
-	if sni, sniOK := egress.ExtractSNI(peeked); sniOK {
-		if sni != host {
-			p.audit("connect", r.Host, "blocked",
-				"sni="+sni+", ip="+resolvedIP.String()+", policy="+p.policyHash)
-			closeQuietly(serverConn)
-			closeQuietly(clientConn)
-			return
+	// relaying the payload. Read the ClientHello record explicitly (not a
+	// fixed-size Peek, which blocks on short hellos and misses the SNI on
+	// long ones): set a read deadline, read the 5-byte TLS record header,
+	// reject a non-handshake type, cap the record length, io.ReadFull the
+	// record, then parse the SNI. On success the deadline is cleared and
+	// header + record + the rest are relayed. A client that sends nothing
+	// times out (deadline) and is audited as blocked.
+	var peeked []byte
+	var sni string
+	sniOK := false
+	if err := clientConn.SetReadDeadline(time.Now().Add(sniReadTimeout)); err != nil {
+		p.audit("connect", r.Host, "blocked", "reason=read-deadline-failed, ip="+resolvedIP.String()+", policy="+p.policyHash)
+		closeQuietly(serverConn)
+		closeQuietly(clientConn)
+		return
+	}
+	var hdr [5]byte
+	if _, err := io.ReadFull(clientBuf, hdr[:]); err == nil && hdr[0] == 0x16 {
+		// Handshake record. Cap recLen (a ClientHello is far smaller than
+		// 16 KiB; anything larger is not a ClientHello and is denied) before
+		// allocating.
+		recLen := int(hdr[3])<<8 | int(hdr[4])
+		if recLen > 0 && recLen <= 16*1024 {
+			record := make([]byte, recLen)
+			if _, err := io.ReadFull(clientBuf, record); err == nil {
+				peeked = append(hdr[:], record...)
+				sni, sniOK = egress.ExtractSNI(peeked)
+			}
 		}
-	} else {
-		// No SNI (or not TLS): the ADR says deny on absent SNI for the
-		// TLS path. A non-TLS CONNECT (e.g. a SOCKS-like tunnel) has no
-		// SNI to check; the Host check above already applied. Deny here is
-		// the fail-closed choice for the TLS case; we cannot reliably tell
-		// the two apart, so deny on no-SNI.
-		p.audit("connect", r.Host, "blocked", "sni=absent, ip="+resolvedIP.String()+", policy="+p.policyHash)
+	}
+	_ = clientConn.SetReadDeadline(time.Time{}) // clear: the relay reads with no deadline
+	if !sniOK {
+		// The SNI could not be verified: a silent client (deadline timeout),
+		// a non-TLS CONNECT (no 0x16 record type), a truncated/oversized
+		// record, or a ClientHello without server_name. Deny is the
+		// fail-closed choice (ADR-0007 I42 resolution). sni=absent-in-hello
+		// marks the last case (a well-formed hello, no server_name); a
+		// silent client or non-TLS bytes are audited as sni=absent.
+		detail := "sni=absent, ip=" + resolvedIP.String() + ", policy=" + p.policyHash
+		if len(peeked) >= 5 && peeked[0] == 0x16 {
+			detail = "sni=absent-in-hello, ip=" + resolvedIP.String() + ", policy=" + p.policyHash
+		}
+		p.audit("connect", r.Host, "blocked", detail)
+		closeQuietly(serverConn)
+		closeQuietly(clientConn)
+		return
+	}
+	if sni != host {
+		p.audit("connect", r.Host, "blocked",
+			"sni="+sni+", ip="+resolvedIP.String()+", policy="+p.policyHash)
 		closeQuietly(serverConn)
 		closeQuietly(clientConn)
 		return
 	}
 	p.audit("connect", r.Host, "allowed",
 		"sni="+host+", proto=https, ip="+resolvedIP.String()+", policy="+p.policyHash)
-	relay(clientConn, clientBuf, serverConn)
+	relay(clientConn, clientBuf, serverConn, peeked)
 }
 
 // handlePlainHTTP implements the plain-HTTP path: check the Host header and
@@ -256,7 +306,7 @@ func (p *h) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "host not allowed", http.StatusForbidden)
 		return
 	}
-	resolvedIP, ok, resolveErr := p.resolveAndCheck(hostNoPort)
+	resolvedIP, ok, resolveErr := p.resolveAndCheck(r.Context(), hostNoPort)
 	if !ok {
 		detail := "reason=resolved-ip-rejected"
 		if resolveErr != nil {
@@ -266,28 +316,91 @@ func (p *h) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "host resolves to a disallowed address", http.StatusForbidden)
 		return
 	}
+	if err := p.proxyRequest(w, r, resolvedIP, port); err != nil {
+		// The upstream failed: the attempt did not succeed end-to-end. The
+		// audit records it as blocked (reason=upstream-error) rather than
+		// claimed allowed (the allowed audit is emitted only after the
+		// upstream responds).
+		p.audit("http", r.Host, "blocked", "reason=upstream-error, policy="+p.policyHash)
+		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
 	p.audit("http", r.Host, "allowed",
 		"proto=http, ip="+resolvedIP.String()+", policy="+p.policyHash)
-	// Proxy the request to the resolved IP.
-	r.URL.Scheme = "http"
-	r.URL.Host = net.JoinHostPort(resolvedIP.String(), strconv.Itoa(port))
-	proxy := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// addr is already the resolved IP:port; dial it directly (the
-			// same IP we checked — no re-resolution).
-			return net.DialTimeout(network, addr, 10*time.Second)
-		},
+}
+
+// proxyRequest forwards a plain-HTTP request to the already-checked resolved
+// IP and copies the response to w. It returns the upstream error (nil on
+// success). The request is cloned and normalised into a client request:
+// RequestURI is cleared (a server request must not be re-sent as a client
+// request), hop-by-hop and Proxy-* headers are stripped (they terminate at
+// the proxy; forwarding Proxy-Authorization would leak it upstream), and
+// Host is kept so the upstream virtual host matches.
+func (p *h) proxyRequest(w http.ResponseWriter, r *http.Request, resolvedIP net.IP, port int) error {
+	out := r.Clone(r.Context())
+	out.RequestURI = ""
+	out.URL.Scheme = "http"
+	out.URL.Host = net.JoinHostPort(resolvedIP.String(), strconv.Itoa(port))
+	out.Header.Del("Proxy-Authorization")
+	out.Header.Del("Proxy-Connection")
+	// Hop-by-hop headers (RFC 9110 §7.6.1) are not end-to-end; "Connection"
+	// plus the header names it lists are stripped too.
+	if connList := out.Header.Values("Connection"); len(connList) > 0 {
+		for _, c := range connList {
+			for h := range strings.SplitSeq(c, ",") {
+				out.Header.Del(textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(h)))
+			}
+		}
+		out.Header.Del("Connection")
 	}
-	client := &http.Client{Transport: proxy}
-	resp, err := client.Do(r)
+	// The target is already the checked IP:port; the dial goes there via the
+	// shared transport's dialer (no re-resolution, no re-lookup).
+	client := &http.Client{
+		Transport: p.transport(),
+		Timeout:   60 * time.Second,
+	}
+	resp, err := client.Do(out)
 	if err != nil {
-		http.Error(w, "upstream error", http.StatusBadGateway)
-		return
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+	return nil
+}
+
+// transport returns the shared upstream Transport: one pool for the process
+// (instead of allocating a Transport per request) with bounded timeouts —
+// ResponseHeaderTimeout caps the wait for upstream headers, the Client
+// Timeout caps the whole exchange, and the dial goes through the handler's
+// dial seam.
+func (p *h) transport() *http.Transport {
+	if p.transport_ != nil {
+		return p.transport_
+	}
+	t := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return p.dial(ctx, network, addr)
+		},
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	}
+	p.transport_ = t
+	return t
+}
+
+// dial is the upstream dial seam. Production dials the already-checked
+// IP:port directly (bounded timeout; the address is a literal IP, so no
+// re-resolution). Tests swap p.dialer for a dialer that serves a fake
+// upstream from a public-looking address (127/8 is carved out of the
+// dialable range).
+func (p *h) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if p.dialer != nil {
+		return p.dialer(ctx, network, addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
 }
 
 // resolveAndCheck resolves host and returns (ip, ok, resolveErr). ok is true
@@ -296,7 +409,7 @@ func (p *h) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 // resolveErr is the resolution error (nil on success); the caller uses it to
 // record dns=nxdomain in the audit detail (ADR failure mode: an allowed host
 // that does not exist is blocked and audited, not silently dropped).
-func (p *h) resolveAndCheck(host string) (net.IP, bool, error) {
+func (p *h) resolveAndCheck(ctx context.Context, host string) (net.IP, bool, error) {
 	// A literal IP (not a hostname) is checked directly.
 	if ip := net.ParseIP(host); ip != nil {
 		if egress.CheckResolvedIPWithCarveOuts(ip, p.extraCIDRs) {
@@ -304,7 +417,9 @@ func (p *h) resolveAndCheck(host string) (net.IP, bool, error) {
 		}
 		return nil, false, nil
 	}
-	ips, err := p.resolver.LookupIPAddr(context.Background(), host)
+	dnsCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
+	defer cancel()
+	ips, err := p.resolver.LookupIPAddr(dnsCtx, host)
 	if err != nil || len(ips) == 0 {
 		return nil, false, err
 	}
@@ -349,18 +464,20 @@ func closeQuietly(c net.Conn) {
 	_ = c.Close()
 }
 
-func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn) {
+func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn, clientHello []byte) {
+	_ = clientBuf // the ClientHello has been read out of this reader above; nothing to drain.
 	defer closeQuietly(client)
 	defer closeQuietly(server)
-	// Drain the peeked client bytes (the ClientHello the proxy already saw
-	// for the SNI check) into the server so the server sees the full
-	// handshake.
-	if clientBuf != nil && clientBuf.Reader.Buffered() > 0 {
-		buf := make([]byte, clientBuf.Reader.Buffered())
-		if _, err := clientBuf.Read(buf); err == nil {
-			_, _ = server.Write(buf)
-		}
+	// The ClientHello record (header + record) was read from the client for
+	// the SNI check; it has been consumed out of the buffered reader, so
+	// write it to the server first to restore the full handshake stream.
+	if len(clientHello) > 0 {
+		_, _ = server.Write(clientHello)
 	}
+	// An idle tunnel is torn down (relayIdleTimeout); an active tunnel runs
+	// until one side closes.
+	_ = client.SetDeadline(time.Time{})
+	_ = server.SetDeadline(time.Time{})
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(server, client)
@@ -372,6 +489,10 @@ func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn) {
 		done <- struct{}{}
 		closeQuietly(client)
 	}()
+	time.AfterFunc(relayIdleTimeout, func() {
+		closeQuietly(client)
+		closeQuietly(server)
+	})
 	<-done
 }
 

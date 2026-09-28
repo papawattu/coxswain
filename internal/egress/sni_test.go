@@ -2,71 +2,11 @@ package egress
 
 import (
 	"bytes"
-	"encoding/binary"
+	"strings"
 	"testing"
+
+	"github.com/papawattu/coxswain/internal/egress/egresstest"
 )
-
-// writeBE writes a uint16 in big-endian to w, panicking on error. A bytes.
-// Buffer never errors, so this keeps errcheck satisfied without noise.
-func writeBE(w *bytes.Buffer, v uint16) {
-	if err := binary.Write(w, binary.BigEndian, v); err != nil {
-		panic(err)
-	}
-}
-
-// buildClientHello constructs a minimal TLS 1.2 ClientHello with the given SNI
-// (server_name extension 0x0000). An empty SNI builds a ClientHello with no
-// server_name extension (the ECH / no-SNI case). The bytes start with the TLS
-// record header (type 0x16) so the proxy's "is this a TLS ClientHello" sniff
-// recognises it.
-func buildClientHello(sni string) []byte {
-	extName := []byte(sni)
-	// server_name extension: type(0x0000) + len + server_name_list_len(2) +
-	// name_type(1) + name_len(2) + name.
-	var ext bytes.Buffer
-	ext.Write([]byte{0x00, 0x00}) // extension type: server_name
-	var extBody bytes.Buffer
-	if len(extName) > 0 {
-		listLen := 1 + 2 + len(extName) // name_type + name_len field + name
-		writeBE(&extBody, uint16(listLen))
-		extBody.Write([]byte{0x00}) // name type: host_name
-		writeBE(&extBody, uint16(len(extName)))
-		extBody.Write(extName)
-	}
-	writeBE(&ext, uint16(extBody.Len()))
-	ext.Write(extBody.Bytes())
-
-	// ClientHello body: client_version(2) + random(32) + session_id_len(1)+0 +
-	// cipher_suites(2) + compression(1)+1 + extensions(2+ext)
-	var hello bytes.Buffer
-	hello.Write([]byte{0x03, 0x03})           // client_version TLS 1.2
-	hello.Write(make([]byte, 32))             // random
-	hello.Write([]byte{0x00})                 // session_id length 0
-	ciphers := []byte{0x13, 0x01, 0x13, 0x02} // two ciphers
-	writeBE(&hello, uint16(len(ciphers)))
-	hello.Write(ciphers)
-	hello.Write([]byte{0x01, 0x00}) // compression: 1 method, null
-	writeBE(&hello, uint16(ext.Len()))
-	hello.Write(ext.Bytes())
-
-	// Handshake header: type(0x01 ClientHello) + 3-byte length
-	var hs bytes.Buffer
-	hs.Write([]byte{0x01})
-	var lenB [3]byte
-	l := hello.Len()
-	lenB[0] = byte(l >> 16)
-	lenB[1] = byte(l >> 8)
-	lenB[2] = byte(l)
-	hs.Write(lenB[:])
-	hs.Write(hello.Bytes())
-
-	// TLS record: type 0x16 (handshake), version 0x0301, 2-byte length
-	var rec bytes.Buffer
-	rec.Write([]byte{0x16, 0x03, 0x01})
-	writeBE(&rec, uint16(hs.Len()))
-	rec.Write(hs.Bytes())
-	return rec.Bytes()
-}
 
 func TestExtractSNI(t *testing.T) {
 	tests := []struct {
@@ -75,9 +15,9 @@ func TestExtractSNI(t *testing.T) {
 		wantSNI string
 		wantOK  bool
 	}{
-		{"normal SNI", buildClientHello(testAllowHost), testAllowHost, true},
-		{"SNI with dots and port-free host", buildClientHello(testAllowHost2), testAllowHost2, true},
-		{"no SNI (ECH / omitted) -> absent", buildClientHello(""), "", false},
+		{"normal SNI", egresstest.BuildClientHello(testAllowHost), testAllowHost, true},
+		{"SNI with dots and port-free host", egresstest.BuildClientHello(testAllowHost2), testAllowHost2, true},
+		{"no SNI (ECH / omitted) -> absent", egresstest.BuildClientHello(""), "", false},
 		{"not a TLS record (plain HTTP) -> not found", []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), "", false},
 		{"random bytes -> not found", []byte{0x01, 0x02, 0x03}, "", false},
 	}
@@ -89,6 +29,146 @@ func TestExtractSNI(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestExtractSNITruncatedLengths is the table of truncated/oversized length
+// fields from the wire: every one must deny (("", false)) — never panic,
+// never read out of bounds, never return a spurious SNI.
+func TestExtractSNITruncatedLengths(t *testing.T) {
+	hello := egresstest.BuildClientHello(testAllowHost) // a fully valid hello to corrupt
+	type patch struct {
+		off int
+		val byte
+	}
+	cases := map[string][]patch{
+		"record length 0xffff (past end)":      {{3, 0xff}, {4, 0xff}},
+		"record length 0 (empty record)":       {{3, 0x00}, {4, 0x00}},
+		"handshake length 0xffffff (past end)": {{5, 0xff}, {6, 0xff}, {7, 0xff}},
+		"handshake length 0 (empty handshake)": {{5, 0x00}, {6, 0x00}, {7, 0x00}},
+		"session id length past end":           {{43, 0xff}},
+		"cipher suites length past end":        {{44, 0xff}, {45, 0xff}},
+		"cipher suites length 0 (empty)":       {{44, 0x00}, {45, 0x00}},
+		"num compression methods past end":     {{50, 0xff}},
+		"extensions length past end":           {{52, 0xff}, {53, 0xff}},
+		"extensions length 0 (no server_name)": {{52, 0x00}, {53, 0x00}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			out := append([]byte(nil), hello...)
+			for _, e := range c {
+				out[e.off] = e.val
+			}
+			if got, ok := ExtractSNI(out); ok {
+				t.Fatalf("ExtractSNI = (%q, true); want deny", got)
+			}
+		})
+	}
+	// A record type that is not a handshake (0x17 = change_cipher_spec) must
+	// deny — the handler only relays a 0x16 record to ExtractSNI, but the
+	// parser must also refuse it defensively.
+	t.Run("record type not handshake", func(t *testing.T) {
+		out := append([]byte(nil), hello...)
+		out[0] = 0x17
+		if got, ok := ExtractSNI(out); ok {
+			t.Fatalf("ExtractSNI = (%q, true); want deny", got)
+		}
+	})
+	// A handshake type that is not a ClientHello (0x02 = ServerHello) must
+	// deny.
+	t.Run("handshake type not client hello", func(t *testing.T) {
+		out := append([]byte(nil), hello...)
+		out[5] = 0x02
+		if got, ok := ExtractSNI(out); ok {
+			t.Fatalf("ExtractSNI = (%q, true); want deny", got)
+		}
+	})
+	// A server_name extension whose own length points past the end of the
+	// record must deny (walkExtensions bounds-checks the ext body).
+	t.Run("server_name ext length past end", func(t *testing.T) {
+		out := append([]byte(nil), hello...)
+		for i := 52; i+4 <= len(out); i++ {
+			if out[i] == 0x00 && out[i+1] == 0x00 {
+				out[i+2], out[i+3] = 0xff, 0xff
+				break
+			}
+		}
+		if got, ok := ExtractSNI(out); ok {
+			t.Fatalf("ExtractSNI = (%q, true); want deny", got)
+		}
+	})
+	// A server_name list length that points past the end of the ext body
+	// must deny (bounds-checked inside walkExtensions).
+	t.Run("server_name list length past end", func(t *testing.T) {
+		out := append([]byte(nil), hello...)
+		for i := 52; i+4 <= len(out); i++ {
+			if out[i] == 0x00 && out[i+1] == 0x00 {
+				// listLen is at the start of the ext body (i+4).
+				out[i+4], out[i+5] = 0xff, 0xff
+				break
+			}
+		}
+		if got, ok := ExtractSNI(out); ok {
+			t.Fatalf("ExtractSNI = (%q, true); want deny", got)
+		}
+	})
+	// A name length that points past the end of the server_name list must
+	// deny (bounds-checked inside walkExtensions).
+	t.Run("name length past end", func(t *testing.T) {
+		out := append([]byte(nil), hello...)
+		for i := 52; i+4 <= len(out); i++ {
+			if out[i] == 0x00 && out[i+1] == 0x00 {
+				// nameLen sits at body+3 (after listLen(2)+nameType(1)).
+				out[i+4+3], out[i+4+4] = 0xff, 0xff
+				break
+			}
+		}
+		if got, ok := ExtractSNI(out); ok {
+			t.Fatalf("ExtractSNI = (%q, true); want deny", got)
+		}
+	})
+	// A record truncated to half its length (partial buffer) must deny —
+	// the parser no longer "tolerates" a partial buffer.
+	t.Run("truncated record (half cut off)", func(t *testing.T) {
+		if got, ok := ExtractSNI(hello[:len(hello)/2]); ok {
+			t.Fatalf("ExtractSNI = (%q, true); want deny", got)
+		}
+	})
+}
+
+// TestExtractSNISNIPastByte512 proves the parser finds the SNI when it
+// sits after byte 512 of the record (a large pre-SNI extension). This is
+// the unit-level twin of the handler's "SNI past byte 512" case: the old
+// Peek(512) returned only the first 512 bytes and reported SNI absent.
+func TestExtractSNISNIPastByte512(t *testing.T) {
+	// padLen=480: dummy ext of 476 bytes before server_name pushes the
+	// SNI well past byte 512.
+	hello := egresstest.BuildHelloWithPadding(testAllowHost, 480)
+	// Sanity: the SNI really is past byte 512 in the record.
+	idx := bytes.Index(hello, []byte(testAllowHost))
+	if idx < 512 {
+		t.Fatalf("test setup: SNI at offset %d is not past byte 512", idx)
+	}
+	got, ok := ExtractSNI(hello)
+	if !ok || got != testAllowHost {
+		t.Fatalf("ExtractSNI with SNI past byte 512 = (%q, %v); want (%q, true)", got, ok, testAllowHost)
+	}
+}
+
+// FuzzExtractSNI: the SNI parser must never panic on any input, and any SNI
+// it returns must be a real substring of the input (it must not read past
+// the input or fabricate bytes).
+func FuzzExtractSNI(f *testing.F) {
+	f.Add(egresstest.BuildClientHello(testAllowHost))
+	f.Add(egresstest.BuildClientHello(""))
+	f.Add([]byte{0x16, 0x03, 0x01, 0x00, 0x05, 0x01})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		sni, ok := ExtractSNI(b)
+		if ok && len(sni) > 0 {
+			if !strings.Contains(string(b), sni) {
+				t.Fatalf("returned SNI %q is not a substring of the input", sni)
+			}
+		}
+	})
 }
 
 // A real-world ClientHello must also round-trip: the standard TLS record with
@@ -105,12 +185,13 @@ func TestExtractSNIOtherExtensionsPresent(t *testing.T) {
 	// extension 0x0000 (server_name): type(2) + len(2) + body
 	var sniBody bytes.Buffer
 	listLen := 1 + 2 + len(extName)
-	writeBE(&sniBody, uint16(listLen))
+	// server_name_list_len(2) + name_type(1) + name_len(2) + name
+	sniBody.Write([]byte{byte(listLen >> 8), byte(listLen)})
 	sniBody.Write([]byte{0x00}) // name type: host_name
-	writeBE(&sniBody, uint16(len(extName)))
+	sniBody.Write([]byte{byte(len(extName) >> 8), byte(len(extName))})
 	sniBody.Write(extName)
 	extList.Write([]byte{0x00, 0x00}) // extension type: server_name
-	writeBE(&extList, uint16(sniBody.Len()))
+	extList.Write([]byte{byte(sniBody.Len() >> 8), byte(sniBody.Len())})
 	extList.Write(sniBody.Bytes())
 
 	var hello bytes.Buffer
@@ -118,10 +199,10 @@ func TestExtractSNIOtherExtensionsPresent(t *testing.T) {
 	hello.Write(make([]byte, 32))
 	hello.Write([]byte{0x00})
 	ciphers := []byte{0x13, 0x01}
-	writeBE(&hello, uint16(len(ciphers)))
+	hello.Write([]byte{byte(len(ciphers) >> 8), byte(len(ciphers))})
 	hello.Write(ciphers)
 	hello.Write([]byte{0x01, 0x00})
-	writeBE(&hello, uint16(extList.Len()))
+	hello.Write([]byte{byte(extList.Len() >> 8), byte(extList.Len())})
 	hello.Write(extList.Bytes())
 
 	var hs bytes.Buffer
@@ -134,7 +215,7 @@ func TestExtractSNIOtherExtensionsPresent(t *testing.T) {
 
 	var rec bytes.Buffer
 	rec.Write([]byte{0x16, 0x03, 0x01})
-	writeBE(&rec, uint16(hs.Len()))
+	rec.Write([]byte{byte(hs.Len() >> 8), byte(hs.Len())})
 	rec.Write(hs.Bytes())
 
 	got, ok := ExtractSNI(rec.Bytes())

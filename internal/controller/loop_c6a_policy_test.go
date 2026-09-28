@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -387,7 +388,24 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
 
 		// Unit test the map function: it should return only ref-loop.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		// Use the cached client (loopCache) so the field-indexed path
+		// (MatchingFields on spec.policyRefs) is exercised (R15 OK-notes).
+		// The Loops were created via the direct API; wait for the cache to
+		// see them before calling the map function.
+		cachedClient, err := client.New(cfg, client.Options{
+			Scheme: k8sClient.Scheme(),
+			Cache:  &client.CacheOptions{Reader: loopCache},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() bool {
+			loops := &coxv1alpha1.LoopList{}
+			if err := cachedClient.List(ctx, loops, client.InNamespace(ns)); err != nil {
+				return false
+			}
+			return len(loops.Items) == 2
+		}, "10s").Should(BeTrue(), "the cache must see both Loops")
+
+		r := &LoopReconciler{Client: cachedClient, Scheme: k8sClient.Scheme()}
 		requests := r.agentPolicyToLoopRequests(ctx, ap)
 		Expect(requests).To(HaveLen(1),
 			"the map function should return only the Loop that references the policy")

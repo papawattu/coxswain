@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 
 	"time"
@@ -683,46 +682,21 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace
 // whose spec.policyRefs contains its name. Used by the AgentPolicy watch to
 // re-reconcile the affected Loops when the policy changes (R15 round 4 P2).
-//
-// In production, the field index on spec.policyRefs (registered in
-// SetupWithManager) makes this an O(1) lookup. In the envtest suite (plain
-// client.New, no cache), the field index is not available, so the List with
-// MatchingFields returns a "field label not supported" error; we fall back
-// to a namespace-wide list + filter, which is correct and sufficient for
-// tests.
+// The field index on spec.policyRefs (registered in SetupWithManager and in
+// the envtest suite) makes this an O(1) lookup.
 func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj client.Object) []reconcile.Request {
 	ap, ok := obj.(*coxv1alpha1.AgentPolicy)
 	if !ok {
 		return nil
 	}
 	loops := &coxv1alpha1.LoopList{}
-	err := r.List(ctx, loops,
+	if err := r.List(ctx, loops,
 		client.InNamespace(ap.Namespace),
 		client.MatchingFields{loopPolicyRefsFieldIndex: ap.Name},
-	)
-	if err != nil {
-		// Envtest fallback: the field index is not registered on a plain
-		// client.New (no cache). Fall back to a namespace-wide list + filter.
-		logf.FromContext(ctx).Info("field index unavailable, falling back to namespace-wide list",
+	); err != nil {
+		logf.FromContext(ctx).Error(err, "list Loops by policyRefs index for AgentPolicy watch",
 			"policy", ap.Name, "namespace", ap.Namespace)
-		loops = &coxv1alpha1.LoopList{}
-		if err := r.List(ctx, loops, client.InNamespace(ap.Namespace)); err != nil {
-			logf.FromContext(ctx).Error(err, "list Loops in namespace for AgentPolicy watch",
-				"policy", ap.Name, "namespace", ap.Namespace)
-			return nil
-		}
-		requests := make([]reconcile.Request, 0, len(loops.Items))
-		for i := range loops.Items {
-			if slices.Contains(loops.Items[i].Spec.PolicyRefs, ap.Name) {
-				requests = append(requests, reconcile.Request{
-					NamespacedName: types.NamespacedName{
-						Namespace: loops.Items[i].Namespace,
-						Name:      loops.Items[i].Name,
-					},
-				})
-			}
-		}
-		return requests
+		return nil
 	}
 	requests := make([]reconcile.Request, 0, len(loops.Items))
 	for i := range loops.Items {

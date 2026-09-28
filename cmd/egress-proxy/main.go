@@ -74,9 +74,11 @@ func main() {
 	}()
 
 	// A single forward proxy server handles both CONNECT (HTTPS) and plain
-	// HTTP. The handler applies the egress checks per request.
+	// HTTP. The handler applies the egress checks per request. The resolver
+	// is the pod's own net.Resolver (cluster DNS); a seam so unit tests can
+	// inject a mock (rebind / NXDOMAIN cases).
 	srv := &http.Server{
-		Handler:           newHandler(allows, extraCIDRs, loopName, namespace, policyHash),
+		Handler:           newHandlerWithResolver(allows, extraCIDRs, loopName, namespace, policyHash, net.DefaultResolver),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -103,6 +105,13 @@ func readAllows(raw string) []string {
 	return out
 }
 
+// resolver is the DNS seam the proxy resolves CONNECT/Host names through.
+// The production binary uses net.DefaultResolver (the pod's cluster DNS); unit
+// tests inject a mock to exercise rebind / NXDOMAIN behaviour hermetically.
+type resolver interface {
+	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+}
+
 // h is the forward-proxy handler. It applies the egress checks to each
 // connection and relays bytes after the checks pass.
 type h struct {
@@ -111,15 +120,24 @@ type h struct {
 	loopName   string
 	namespace  string
 	policyHash string
+	resolver   resolver
 }
 
 func newHandler(allows, extraCIDRs []string, loopName, namespace, policyHash string) *h {
+	return newHandlerWithResolver(allows, extraCIDRs, loopName, namespace, policyHash, net.DefaultResolver)
+}
+
+// newHandlerWithResolver builds the handler with an explicit resolver. The
+// production binary passes net.DefaultResolver (the pod's DNS); unit tests
+// pass a mock to exercise rebind / NXDOMAIN behaviour hermetically.
+func newHandlerWithResolver(allows, extraCIDRs []string, loopName, namespace, policyHash string, r resolver) *h {
 	return &h{
 		allows:     allows,
 		extraCIDRs: extraCIDRs,
 		loopName:   loopName,
 		namespace:  namespace,
 		policyHash: policyHash,
+		resolver:   r,
 	}
 }
 
@@ -139,48 +157,54 @@ func (p *h) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *h) handleConnect(w http.ResponseWriter, r *http.Request) {
 	host, portStr, err := net.SplitHostPort(r.Host)
 	if err != nil {
-		p.audit(r, "connect", r.Host, "blocked", "reason=bad-host")
+		p.audit("connect", r.Host, "blocked", "reason=bad-host")
 		http.Error(w, "bad CONNECT host", http.StatusBadGateway)
 		return
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		p.audit(r, "connect", r.Host, "blocked", "reason=bad-port")
+		p.audit("connect", r.Host, "blocked", "reason=bad-port")
 		http.Error(w, "bad CONNECT port", http.StatusBadGateway)
 		return
 	}
 	if !egress.CheckAllow(p.allows, host, port) {
-		p.audit(r, "connect", r.Host, "blocked", "reason=not-allowed, policy="+p.policyHash)
+		p.audit("connect", r.Host, "blocked", "reason=not-allowed, policy="+p.policyHash)
 		http.Error(w, "host not allowed", http.StatusForbidden)
 		return
 	}
 	// Resolve the host ourselves and check the resolved IP (SSRF backstop).
-	resolvedIP, ok := p.resolveAndCheck(host)
+	resolvedIP, ok, resolveErr := p.resolveAndCheck(host)
 	if !ok {
-		p.audit(r, "connect", r.Host, "blocked", "reason=resolved-ip-rejected, policy="+p.policyHash)
+		detail := "reason=resolved-ip-rejected"
+		if resolveErr != nil {
+			// An allowed host that does not resolve (NXDOMAIN) is blocked and
+			// audited with dns=nxdomain (ADR failure mode), distinct from an
+			// allowlisted name whose resolution lands in a carved-out range.
+			detail = "dns=nxdomain"
+		}
+		p.audit("connect", r.Host, "blocked", detail+", policy="+p.policyHash)
 		http.Error(w, "host resolves to a disallowed address", http.StatusForbidden)
 		return
 	}
 	// Open the tunnel: hijack the response and relay to the resolved IP.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		p.audit(r, "connect", r.Host, "blocked", "reason=no-hijack")
+		p.audit("connect", r.Host, "blocked", "reason=no-hijack")
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
-		p.audit(r, "connect", r.Host, "blocked", "reason=hijack-failed")
+		p.audit("connect", r.Host, "blocked", "reason=hijack-failed")
 		http.Error(w, "hijack failed", http.StatusInternalServerError)
 		return
 	}
 	target := net.JoinHostPort(resolvedIP.String(), strconv.Itoa(port))
 	serverConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		p.audit(r, "connect", r.Host, "blocked", "reason=dial-failed, ip="+resolvedIP.String())
+		p.audit("connect", r.Host, "blocked", "reason=dial-failed, ip="+resolvedIP.String())
 		_, _ = clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		clientConn.Close()
-		serverConn = nil
+		closeQuietly(clientConn)
 		return
 	}
 	// 200 for the CONNECT so the client starts the TLS handshake over the
@@ -191,10 +215,10 @@ func (p *h) handleConnect(w http.ResponseWriter, r *http.Request) {
 	peeked, _ := clientBuf.Peek(512)
 	if sni, sniOK := egress.ExtractSNI(peeked); sniOK {
 		if sni != host {
-			p.audit(r, "connect", r.Host, "blocked",
+			p.audit("connect", r.Host, "blocked",
 				"sni="+sni+", ip="+resolvedIP.String()+", policy="+p.policyHash)
-			serverConn.Close()
-			clientConn.Close()
+			closeQuietly(serverConn)
+			closeQuietly(clientConn)
 			return
 		}
 	} else {
@@ -203,12 +227,12 @@ func (p *h) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// SNI to check; the Host check above already applied. Deny here is
 		// the fail-closed choice for the TLS case; we cannot reliably tell
 		// the two apart, so deny on no-SNI.
-		p.audit(r, "connect", r.Host, "blocked", "sni=absent, ip="+resolvedIP.String()+", policy="+p.policyHash)
-		serverConn.Close()
-		clientConn.Close()
+		p.audit("connect", r.Host, "blocked", "sni=absent, ip="+resolvedIP.String()+", policy="+p.policyHash)
+		closeQuietly(serverConn)
+		closeQuietly(clientConn)
 		return
 	}
-	p.audit(r, "connect", r.Host, "allowed",
+	p.audit("connect", r.Host, "allowed",
 		"sni="+host+", proto=https, ip="+resolvedIP.String()+", policy="+p.policyHash)
 	relay(clientConn, clientBuf, serverConn)
 }
@@ -228,17 +252,21 @@ func (p *h) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !egress.CheckAllow(p.allows, hostNoPort, port) {
-		p.audit(r, "http", r.Host, "blocked", "reason=not-allowed, policy="+p.policyHash)
+		p.audit("http", r.Host, "blocked", "reason=not-allowed, policy="+p.policyHash)
 		http.Error(w, "host not allowed", http.StatusForbidden)
 		return
 	}
-	resolvedIP, ok := p.resolveAndCheck(hostNoPort)
+	resolvedIP, ok, resolveErr := p.resolveAndCheck(hostNoPort)
 	if !ok {
-		p.audit(r, "http", r.Host, "blocked", "reason=resolved-ip-rejected, policy="+p.policyHash)
+		detail := "reason=resolved-ip-rejected"
+		if resolveErr != nil {
+			detail = "dns=nxdomain"
+		}
+		p.audit("http", r.Host, "blocked", detail+", policy="+p.policyHash)
 		http.Error(w, "host resolves to a disallowed address", http.StatusForbidden)
 		return
 	}
-	p.audit(r, "http", r.Host, "allowed",
+	p.audit("http", r.Host, "allowed",
 		"proto=http, ip="+resolvedIP.String()+", policy="+p.policyHash)
 	// Proxy the request to the resolved IP.
 	r.URL.Scheme = "http"
@@ -256,44 +284,45 @@ func (p *h) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// resolveAndCheck resolves host and returns the first resolved IP that passes
-// the carve-out check. It returns (nil, false) if the host does not resolve or
-// every resolved IP is in a carved-out range. The caller dials the SAME IP
-// that is returned (no TOCTOU re-resolution).
-func (p *h) resolveAndCheck(host string) (net.IP, bool) {
+// resolveAndCheck resolves host and returns (ip, ok, resolveErr). ok is true
+// only if the host resolved AND every resolved IP passes the carve-out check.
+// The caller dials the SAME IP that is returned (no TOCTOU re-resolution).
+// resolveErr is the resolution error (nil on success); the caller uses it to
+// record dns=nxdomain in the audit detail (ADR failure mode: an allowed host
+// that does not exist is blocked and audited, not silently dropped).
+func (p *h) resolveAndCheck(host string) (net.IP, bool, error) {
 	// A literal IP (not a hostname) is checked directly.
 	if ip := net.ParseIP(host); ip != nil {
 		if egress.CheckResolvedIPWithCarveOuts(ip, p.extraCIDRs) {
-			return ip, true
+			return ip, true, nil
 		}
-		return nil, false
+		return nil, false, nil
 	}
-	ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), host)
+	ips, err := p.resolver.LookupIPAddr(context.Background(), host)
 	if err != nil || len(ips) == 0 {
-		return nil, false
+		return nil, false, err
 	}
-	// Prefer the first dialable IP; if the first is rejected but a later one
-	// is not, reject (fail-closed: a name that resolves to a mix is
-	// suspicious). Actually the ADR says reject if ANY resolved IP is in a
-	// carved-out range, so check all.
+	// The ADR says reject if ANY resolved IP is in a carved-out range, so
+	// check all (a name that resolves to a mix of public + private is a
+	// rebind / split-horizon attack).
 	for _, ip := range ips {
 		if !egress.CheckResolvedIPWithCarveOuts(ip.IP, p.extraCIDRs) {
-			return nil, false
+			return nil, false, nil
 		}
 	}
-	return ips[0].IP, true
+	return ips[0].IP, true, nil
 }
 
 // audit emits a Q4 audit record on stdout. It is best-effort: a failed write
 // does not fail the connection (the proxy's job is the tunnel; the audit is
 // observability).
-func (p *h) audit(r *http.Request, action, target, verdict, detail string) {
+func (p *h) audit(action, target, verdict, detail string) {
 	rec := egress.AuditRecord{
 		Time:      time.Now().UTC().Format(time.RFC3339),
 		Loop:      p.loopName,
@@ -313,15 +342,22 @@ func (p *h) audit(r *http.Request, action, target, verdict, detail string) {
 		log.Printf("egress-proxy: audit write: %v", err)
 	}
 }
+
+// closeQuietly closes a conn, ignoring the error (best-effort cleanup after a
+// rejection or relay teardown — the conn is going away either way).
+func closeQuietly(c net.Conn) {
+	_ = c.Close()
+}
+
 func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn) {
-	defer client.Close()
-	defer server.Close()
+	defer closeQuietly(client)
+	defer closeQuietly(server)
 	// Drain the peeked client bytes (the ClientHello the proxy already saw
 	// for the SNI check) into the server so the server sees the full
 	// handshake.
 	if clientBuf != nil && clientBuf.Reader.Buffered() > 0 {
 		buf := make([]byte, clientBuf.Reader.Buffered())
-		if _, err := clientBuf.Reader.Read(buf); err == nil {
+		if _, err := clientBuf.Read(buf); err == nil {
 			_, _ = server.Write(buf)
 		}
 	}
@@ -329,12 +365,12 @@ func relay(client net.Conn, clientBuf *bufio.ReadWriter, server net.Conn) {
 	go func() {
 		_, _ = io.Copy(server, client)
 		done <- struct{}{}
-		_ = server.Close()
+		closeQuietly(server)
 	}()
 	go func() {
 		_, _ = io.Copy(client, server)
 		done <- struct{}{}
-		_ = client.Close()
+		closeQuietly(client)
 	}()
 	<-done
 }

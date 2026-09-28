@@ -1,13 +1,74 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 )
+
+// --- mock resolver (rebind / NXDOMAIN cases) ---
+
+// mockResolver resolves every host to the configured IPs (or returns err).
+// It lets the tests exercise the resolved-IP backstop hermetically: a name
+// that "rebinds" to a private IP, and a name that does not resolve at all.
+type mockResolver struct {
+	ips []netip.Addr
+	err error
+}
+
+func (m mockResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	var out []net.IPAddr
+	for _, a := range m.ips {
+		out = append(out, net.IPAddr{IP: a.AsSlice()})
+	}
+	return out, nil
+}
+
+// TestResolveAndCheckRebind proves the SSRF backstop at the handler seam: an
+// allowlisted host whose resolution lands in a carved-out range (a rebind to
+// the pod CIDR) is rejected, even though the hostname check passed.
+func TestResolveAndCheckRebind(t *testing.T) {
+	res := &mockResolver{ips: []netip.Addr{netip.MustParseAddr("10.244.0.5")}}
+	p := newHandlerWithResolver([]string{"rebind.example:443"}, []string{"10.244.0.0/16"}, "l", "ns", "h", res)
+	if _, ok, _ := p.resolveAndCheck("rebind.example"); ok {
+		t.Fatal("a host rebinding to the pod CIDR must be rejected")
+	}
+	// A public resolution of the same (allowlisted) host is dialable.
+	res2 := &mockResolver{ips: []netip.Addr{netip.MustParseAddr("151.101.0.223")}}
+	p2 := newHandlerWithResolver([]string{"rebind.example:443"}, []string{"10.244.0.0/16"}, "l", "ns", "h", res2)
+	ip, ok, _ := p2.resolveAndCheck("rebind.example")
+	if !ok || ip.String() != "151.101.0.223" {
+		t.Fatalf("a public rebind must be dialable to the same IP; got (%v, %v)", ip, ok)
+	}
+}
+
+// TestResolveAndCheckNXDOMAIN proves the ADR failure mode: an allowlisted
+// host that does not resolve is rejected with the NXDOMAIN error surfaced so
+// the caller can audit dns=nxdomain (distinct from a carved-out IP).
+func TestResolveAndCheckNXDOMAIN(t *testing.T) {
+	noSuchHostErr := &net.DNSError{Name: "ghost.example", Err: "no such host", IsNotFound: true}
+	res := &mockResolver{err: noSuchHostErr}
+	p := newHandlerWithResolver([]string{"ghost.example:443"}, nil, "l", "ns", "h", res)
+	if _, ok, err := p.resolveAndCheck("ghost.example"); ok || err == nil {
+		t.Fatalf("an unresolvable host must be rejected with the resolve error; got (%v, %v)", ok, err)
+	}
+	// A mix of public + private resolutions is rejected (no error: the IPs
+	// resolved, one just landed in a carved-out range).
+	res2 := &mockResolver{ips: []netip.Addr{netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("169.254.1.1")}}
+	p2 := newHandlerWithResolver([]string{"ghost.example:443"}, nil, "l", "ns", "h", res2)
+	if _, ok, err := p2.resolveAndCheck("ghost.example"); ok || err != nil {
+		t.Fatalf("a public+private mix must be rejected without a resolve error; got (%v, %v)", ok, err)
+	}
+}
 
 // TestPlainHTTPBlockedByResolvedIP verifies the plain-HTTP path: a host that
 // is in the allow list but resolves (is a literal) to a private IP is blocked

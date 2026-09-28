@@ -11,7 +11,7 @@ import (
 func TestCheckAllow(t *testing.T) {
 	// The allows are the effective AgentPolicy network allows as host:port
 	// strings (the same form as policy.EffectivePolicy.Network).
-	allows := []string{"proxy.golang.org:443", "api.github.com:443"}
+	allows := []string{testAllowHost + ":443", testAllowHost2 + ":443"}
 
 	tests := []struct {
 		name   string
@@ -19,13 +19,13 @@ func TestCheckAllow(t *testing.T) {
 		port   int
 		wantOK bool
 	}{
-		{"allowed host and port", "proxy.golang.org", 443, true},
-		{"allowed host, disallowed port", "proxy.golang.org", 8080, false},
+		{"allowed host and port", testAllowHost, 443, true},
+		{"allowed host, disallowed port", testAllowHost, 8080, false},
 		{"disallowed host", "evil.example.com", 443, false},
 		{"host is case-insensitive", "PROXY.GOLANG.ORG", 443, true},
-		{"empty allows deny everything", "proxy.golang.org", 443, false}, // empty set
-		{"second allow is honored", "api.github.com", 443, true},
-		{"second allow wrong port", "api.github.com", 8443, false},
+		{"empty allows deny everything", testAllowHost, 443, false}, // empty set
+		{"second allow is honored", testAllowHost2, 443, true},
+		{"second allow wrong port", testAllowHost2, 8443, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -44,11 +44,11 @@ func TestCheckAllow(t *testing.T) {
 // CheckAllow rejects a host with a different suffix (no substring match) —
 // "golang.org" must not match an allow of "proxy.golang.org".
 func TestCheckAllowNoSubstring(t *testing.T) {
-	allowSet := []string{"proxy.golang.org:443"}
+	allowSet := []string{testAllowHost + ":443"}
 	if CheckAllow(allowSet, "golang.org", 443) {
-		t.Fatal("golang.org must not match an allow of proxy.golang.org")
+		t.Fatal("golang.org must not match an allow of " + testAllowHost)
 	}
 	if CheckAllow(allowSet, "xproxy.golang.org", 443) {
-		t.Fatal("xproxy.golang.org must not match an allow of proxy.golang.org")
+		t.Fatal("xproxy.golang.org must not match an allow of " + testAllowHost)
 	}
 }

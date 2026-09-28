@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+// Shared literals across the egress test files (named to keep goconst quiet —
+// the same hosts appear in policy_test.go and sni_test.go too).
+const (
+	testAllowHost  = "proxy.golang.org"
+	testAllowHost2 = "api.github.com"
+)
+
 // The audit record is the Q4 envelope (ADR-0007 Q4) with source=egress-proxy.
 // The proxy emits it WITHOUT iteration (the relay fills iteration by time
 // window); it carries the resolved IP so a DNS rebind is visible after the
@@ -14,11 +21,11 @@ func TestAuditRecordShape(t *testing.T) {
 		Time:      "2026-09-28T12:00:00Z",
 		Loop:      "loop-x",
 		Namespace: "ns-x",
-		Source:    "egress-proxy",
+		Source:    Source,
 		Action:    "connect",
-		Target:    "proxy.golang.org:443",
+		Target:    testAllowHost + ":443",
 		Verdict:   "allowed",
-		Detail:    "sni=proxy.golang.org, proto=https, ip=151.101.0.223, policy=abc123",
+		Detail:    "sni=" + testAllowHost + ", proto=https, ip=151.101.0.223, policy=abc123",
 	}
 	data, err := json.Marshal(rec)
 	if err != nil {
@@ -39,8 +46,8 @@ func TestAuditRecordShape(t *testing.T) {
 	if _, ok := m["iteration"]; ok {
 		t.Fatalf("audit record must NOT carry iteration (the relay fills it): %s", data)
 	}
-	if m["source"] != "egress-proxy" {
-		t.Fatalf("source must be egress-proxy, got %v", m["source"])
+	if m["source"] != Source {
+		t.Fatalf("source must be %s, got %v", Source, m["source"])
 	}
 	// The resolved IP is in detail (the SSRF backstop observability).
 	if !contains(m["detail"].(string), "ip=151.101.0.223") {
@@ -52,7 +59,7 @@ func TestAuditRecordBlocked(t *testing.T) {
 	rec := AuditRecord{
 		Loop:      "loop-x",
 		Namespace: "ns-x",
-		Source:    "egress-proxy",
+		Source:    Source,
 		Action:    "connect",
 		Target:    "evil.example.com:443",
 		Verdict:   "blocked",

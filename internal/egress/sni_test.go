@@ -6,6 +6,14 @@ import (
 	"testing"
 )
 
+// writeBE writes a uint16 in big-endian to w, panicking on error. A bytes.
+// Buffer never errors, so this keeps errcheck satisfied without noise.
+func writeBE(w *bytes.Buffer, v uint16) {
+	if err := binary.Write(w, binary.BigEndian, v); err != nil {
+		panic(err)
+	}
+}
+
 // buildClientHello constructs a minimal TLS 1.2 ClientHello with the given SNI
 // (server_name extension 0x0000). An empty SNI builds a ClientHello with no
 // server_name extension (the ECH / no-SNI case). The bytes start with the TLS
@@ -20,25 +28,25 @@ func buildClientHello(sni string) []byte {
 	var extBody bytes.Buffer
 	if len(extName) > 0 {
 		listLen := 1 + 2 + len(extName) // name_type + name_len field + name
-		binary.Write(&extBody, binary.BigEndian, uint16(listLen))
+		writeBE(&extBody, uint16(listLen))
 		extBody.Write([]byte{0x00}) // name type: host_name
-		binary.Write(&extBody, binary.BigEndian, uint16(len(extName)))
+		writeBE(&extBody, uint16(len(extName)))
 		extBody.Write(extName)
 	}
-	binary.Write(&ext, binary.BigEndian, uint16(extBody.Len()))
+	writeBE(&ext, uint16(extBody.Len()))
 	ext.Write(extBody.Bytes())
 
 	// ClientHello body: client_version(2) + random(32) + session_id_len(1)+0 +
 	// cipher_suites(2) + compression(1)+1 + extensions(2+ext)
 	var hello bytes.Buffer
-	hello.Write([]byte{0x03, 0x03}) // client_version TLS 1.2
-	hello.Write(make([]byte, 32))   // random
-	hello.Write([]byte{0x00})       // session_id length 0
+	hello.Write([]byte{0x03, 0x03})           // client_version TLS 1.2
+	hello.Write(make([]byte, 32))             // random
+	hello.Write([]byte{0x00})                 // session_id length 0
 	ciphers := []byte{0x13, 0x01, 0x13, 0x02} // two ciphers
-	binary.Write(&hello, binary.BigEndian, uint16(len(ciphers)))
+	writeBE(&hello, uint16(len(ciphers)))
 	hello.Write(ciphers)
 	hello.Write([]byte{0x01, 0x00}) // compression: 1 method, null
-	binary.Write(&hello, binary.BigEndian, uint16(ext.Len()))
+	writeBE(&hello, uint16(ext.Len()))
 	hello.Write(ext.Bytes())
 
 	// Handshake header: type(0x01 ClientHello) + 3-byte length
@@ -55,7 +63,7 @@ func buildClientHello(sni string) []byte {
 	// TLS record: type 0x16 (handshake), version 0x0301, 2-byte length
 	var rec bytes.Buffer
 	rec.Write([]byte{0x16, 0x03, 0x01})
-	binary.Write(&rec, binary.BigEndian, uint16(hs.Len()))
+	writeBE(&rec, uint16(hs.Len()))
 	rec.Write(hs.Bytes())
 	return rec.Bytes()
 }
@@ -67,8 +75,8 @@ func TestExtractSNI(t *testing.T) {
 		wantSNI string
 		wantOK  bool
 	}{
-		{"normal SNI", buildClientHello("proxy.golang.org"), "proxy.golang.org", true},
-		{"SNI with dots and port-free host", buildClientHello("api.github.com"), "api.github.com", true},
+		{"normal SNI", buildClientHello(testAllowHost), testAllowHost, true},
+		{"SNI with dots and port-free host", buildClientHello(testAllowHost2), testAllowHost2, true},
 		{"no SNI (ECH / omitted) -> absent", buildClientHello(""), "", false},
 		{"not a TLS record (plain HTTP) -> not found", []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), "", false},
 		{"random bytes -> not found", []byte{0x01, 0x02, 0x03}, "", false},
@@ -97,12 +105,12 @@ func TestExtractSNIOtherExtensionsPresent(t *testing.T) {
 	// extension 0x0000 (server_name): type(2) + len(2) + body
 	var sniBody bytes.Buffer
 	listLen := 1 + 2 + len(extName)
-	binary.Write(&sniBody, binary.BigEndian, uint16(listLen))
+	writeBE(&sniBody, uint16(listLen))
 	sniBody.Write([]byte{0x00}) // name type: host_name
-	binary.Write(&sniBody, binary.BigEndian, uint16(len(extName)))
+	writeBE(&sniBody, uint16(len(extName)))
 	sniBody.Write(extName)
 	extList.Write([]byte{0x00, 0x00}) // extension type: server_name
-	binary.Write(&extList, binary.BigEndian, uint16(sniBody.Len()))
+	writeBE(&extList, uint16(sniBody.Len()))
 	extList.Write(sniBody.Bytes())
 
 	var hello bytes.Buffer
@@ -110,10 +118,10 @@ func TestExtractSNIOtherExtensionsPresent(t *testing.T) {
 	hello.Write(make([]byte, 32))
 	hello.Write([]byte{0x00})
 	ciphers := []byte{0x13, 0x01}
-	binary.Write(&hello, binary.BigEndian, uint16(len(ciphers)))
+	writeBE(&hello, uint16(len(ciphers)))
 	hello.Write(ciphers)
 	hello.Write([]byte{0x01, 0x00})
-	binary.Write(&hello, binary.BigEndian, uint16(extList.Len()))
+	writeBE(&hello, uint16(extList.Len()))
 	hello.Write(extList.Bytes())
 
 	var hs bytes.Buffer
@@ -126,7 +134,7 @@ func TestExtractSNIOtherExtensionsPresent(t *testing.T) {
 
 	var rec bytes.Buffer
 	rec.Write([]byte{0x16, 0x03, 0x01})
-	binary.Write(&rec, binary.BigEndian, uint16(hs.Len()))
+	writeBE(&rec, uint16(hs.Len()))
 	rec.Write(hs.Bytes())
 
 	got, ok := ExtractSNI(rec.Bytes())

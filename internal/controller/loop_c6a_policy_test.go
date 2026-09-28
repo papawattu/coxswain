@@ -38,6 +38,7 @@ const (
 	missingPolName   = "missing-pol-loop"
 	cleanLoopName    = "clean-loop"
 	watchLoopName    = "watch-loop"
+	editPolicyName   = "edit-policy"
 )
 
 var _ = Describe("C6a effective AgentPolicy union", func() {
@@ -392,5 +393,57 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 			"the map function should return only the Loop that references the policy")
 		Expect(requests[0].Name).To(Equal("ref-loop"))
 		Expect(requests[0].Namespace).To(Equal(ns))
+	})
+
+	It("updates the Loop's recorded effective hash when a referenced policy's exec is edited", func() {
+		ns := "c6a-hash-edit-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		// Create the AgentPolicy with one exec allow.
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: editPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin}},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
+
+		// Create the Loop referencing the policy.
+		loopName := "hash-edit-loop"
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: loopName, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:       "test hash edit",
+				Workspace:  coxv1alpha1.Workspace{Repo: c6aTestRepo, Ref: loopRef},
+				PolicyRefs: []string{editPolicyName},
+				Agent:      coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+				Loop:       coxv1alpha1.LoopSettings{MaxIterations: 1},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).ToNot(HaveOccurred())
+
+		// Capture the initial hash.
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, gotLoop)).To(Succeed())
+		Expect(gotLoop.Status.Policy).ToNot(BeNil())
+		initialHash := gotLoop.Status.Policy.EffectiveHash
+		Expect(initialHash).ToNot(BeEmpty())
+
+		// Edit the policy: add a second exec allow.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: editPolicyName}, ap)).To(Succeed())
+		ap.Spec.Exec = append(ap.Spec.Exec, "/usr/bin/curl")
+		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
+
+		// Re-reconcile (simulating the AgentPolicy watch event).
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).ToNot(HaveOccurred())
+
+		// The recorded hash must have changed.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, gotLoop)).To(Succeed())
+		Expect(gotLoop.Status.Policy).ToNot(BeNil())
+		Expect(gotLoop.Status.Policy.EffectiveHash).ToNot(Equal(initialHash),
+			"the effective hash must change when a referenced policy's exec is edited")
 	})
 })

@@ -685,30 +685,53 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // re-reconcile the affected Loops when the policy changes (R15 round 4 P2).
 //
 // In production, the field index on spec.policyRefs (registered in
-// SetupWithManager) makes this an O(1) lookup. In the envtest suite (no
-// field indexer), it falls back to a namespace-wide list + filter, which is
-// correct and sufficient for tests.
+// SetupWithManager) makes this an O(1) lookup. In the envtest suite (plain
+// client.New, no cache), the field index is not available, so the List with
+// MatchingFields returns a "field label not supported" error; we fall back
+// to a namespace-wide list + filter, which is correct and sufficient for
+// tests.
 func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj client.Object) []reconcile.Request {
 	ap, ok := obj.(*coxv1alpha1.AgentPolicy)
 	if !ok {
 		return nil
 	}
 	loops := &coxv1alpha1.LoopList{}
-	if err := r.List(ctx, loops, client.InNamespace(ap.Namespace)); err != nil {
-		logf.FromContext(ctx).Error(err, "list Loops in namespace for AgentPolicy watch",
+	err := r.List(ctx, loops,
+		client.InNamespace(ap.Namespace),
+		client.MatchingFields{loopPolicyRefsFieldIndex: ap.Name},
+	)
+	if err != nil {
+		// Envtest fallback: the field index is not registered on a plain
+		// client.New (no cache). Fall back to a namespace-wide list + filter.
+		logf.FromContext(ctx).Info("field index unavailable, falling back to namespace-wide list",
 			"policy", ap.Name, "namespace", ap.Namespace)
-		return nil
+		loops = &coxv1alpha1.LoopList{}
+		if err := r.List(ctx, loops, client.InNamespace(ap.Namespace)); err != nil {
+			logf.FromContext(ctx).Error(err, "list Loops in namespace for AgentPolicy watch",
+				"policy", ap.Name, "namespace", ap.Namespace)
+			return nil
+		}
+		requests := make([]reconcile.Request, 0, len(loops.Items))
+		for i := range loops.Items {
+			if slices.Contains(loops.Items[i].Spec.PolicyRefs, ap.Name) {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: loops.Items[i].Namespace,
+						Name:      loops.Items[i].Name,
+					},
+				})
+			}
+		}
+		return requests
 	}
 	requests := make([]reconcile.Request, 0, len(loops.Items))
 	for i := range loops.Items {
-		if slices.Contains(loops.Items[i].Spec.PolicyRefs, ap.Name) {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: loops.Items[i].Namespace,
-					Name:      loops.Items[i].Name,
-				},
-			})
-		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: loops.Items[i].Namespace,
+				Name:      loops.Items[i].Name,
+			},
+		})
 	}
 	return requests
 }
@@ -751,15 +774,13 @@ type policyValidationResult struct {
 	transientReadError bool
 }
 
-// validateAgentPolicies scans the Loop's referenced AgentPolicies for
-// non-canonical exec paths and missing/unreadable policies.
-// R15 round 3: a missing or unreadable referenced policy is treated as
-// not-valid (PolicyNotFound), not ignored (fail-closed).
-// Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
 // validateAgentPolicies checks that every referenced AgentPolicy exists and
 // has canonical exec paths. Returns a policyValidationResult. The
 // transientReadError field is true when the policy could not be read due to a
 // transient error (not a NotFound), in which case the caller should requeue.
+// R15 round 3: a missing or unreadable referenced policy is treated as
+// not-valid (PolicyNotFound), not ignored (fail-closed).
+// Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
 func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
 	for _, name := range loop.Spec.PolicyRefs {
 		ap := &coxv1alpha1.AgentPolicy{}

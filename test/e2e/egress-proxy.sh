@@ -35,8 +35,11 @@ KIND_CLUSTER="${KIND_CLUSTER:-coxswain-dev}"
 NAMESPACE=i42a-egress
 IMG="${EGRESS_IMG:-coxswain-egress-proxy:standin}"
 # The proxy's allow policy: one allowed host:port. The e2e uses a host the
-# kind node can actually reach for the allowed case.
+# kind node can actually reach for the allowed case. EGRESS_POLICY_JSON must
+# be a JSON array of "host:port" strings (the shape the binary parses).
 ALLOW_HOST="${EGRESS_E2E_ALLOW_HOST:-proxy.golang.org:443}"
+ALLOW_JSON='["'${ALLOW_HOST}'"]'  # JSON array of "host:port" (YAML single-quoted value)
+ALLOW_NAME=$(echo "$ALLOW_HOST" | cut -d: -f1)
 DISALLOW_HOST="example.invalid:443"
 # The kind node's pod CIDR, so the proxy carves it out (SSRF backstop).
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
@@ -82,7 +85,7 @@ spec:
         - name: EGRESS_PROXY_PORT
           value: "3128"
         - name: EGRESS_POLICY_JSON
-          value: "${ALLOW_HOST}"
+          value: '${ALLOW_JSON}'
         - name: EGRESS_POLICY_HASH
           value: "e2e-hash"
         - name: LOOP_NAME
@@ -151,7 +154,7 @@ fail=0
 
 # --- 2. Allowed host:port over HTTPS (CONNECT + matching SNI) -------------
 echo "   [2] allowed host ${ALLOW_HOST} over HTTPS (must be relayed)..."
-if run_curl -x "$PROXY_URL" "https://${ALLOW_HOST%/}..." >/tmp/egress-allowed.out 2>/tmp/egress-allowed.err; then
+if run_curl -x "$PROXY_URL" "https://${ALLOW_NAME}/" >/tmp/egress-allowed.out 2>/tmp/egress-allowed.err; then
   echo "     OK: allowed host relayed ($(wc -c < /tmp/egress-allowed.out) bytes)"
 else
   echo "     FAIL: allowed host was not relayed"
@@ -191,31 +194,24 @@ fi
 
 # --- 4. SNI mismatch (must be tunnel-closed / fail-closed) ---------------
 echo "   [4] SNI mismatch (must be fail-closed)..."
-# curl always sends the CONNECT host as the SNI, so a mismatch is hard to
-# induce with curl alone. We use openssl s_client with a deliberately wrong
-# -servername to send a ClientHello whose SNI differs from the CONNECT host.
-# The proxy must close the tunnel (the client sees a connection reset /
-# handshake failure) and log a blocked record.
+# The proxy's SNI check reads the ClientHello that the client sends AFTER the
+# proxy has returned 200 for CONNECT. Inducing a CONNECT + mismatched-SNI
+# ClientHello from the client pod needs a raw tunnel client (curl and
+# openssl s_client cannot both do the CONNECT and control the SNI of the
+# inner handshake). The SNI check is therefore proven hermetically by the
+# unit test (internal/egress/sni_test.go: mismatch and no-SNI both deny), and
+# this case here is a best-effort client-visible smoke: a direct
+# s_client handshake against the proxy (no CONNECT) must not establish a
+# tunnel — the proxy only speaks HTTP on :3128.
 SNI_ALLOWED_HOST=$(echo "$ALLOW_HOST" | cut -d: -f1)
 if $KUBECTL -n "$NAMESPACE" exec egress-client -- \
     timeout 15 openssl s_client -connect "${PROXY_IP}:3128" \
       -servername "totally-different.example" \
       </dev/null >/tmp/egress-sni.out 2>/tmp/egress-sni.err; then
-  # If the tunnel is established and the handshake succeeds, the SNI check
-  # was bypassed — FAIL. (A tunnel close / handshake failure is the expected
-  # fail-closed result.)
-  if grep -q "CONNECT established\|Connection established" /tmp/egress-sni.out; then
-    echo "     (SNI-mismatch case: see the proxy log for the verdict)"
-  fi
+  echo "     WARN: a plain handshake against the proxy succeeded (should not happen without CONNECT)"
+  fail=1
 else
-  echo "     OK: SNI-mismatch tunnel closed (client saw a failure, fail-closed)"
-fi
-# The proxy should have logged a blocked record for the SNI mismatch.
-if $KUBECTL -n "$NAMESPACE" logs egress-proxy-e2e 2>/dev/null | grep -qE '"sni=".*"verdict":"blocked"|sni=totally-different.example'; then
-  echo "     OK: SNI-mismatch blocked audit record present"
-else
-  echo "     NOTE: SNI-mismatch audit not explicitly matched (the allowed+disallowed cases already prove the audit path); verify the proxy log below"
-  $KUBECTL -n "$NAMESPACE" logs egress-proxy-e2e | tail -10 || true
+  echo "     OK: no tunnel without a CONNECT (fail-closed; SNI mismatch itself is unit-tested)"
 fi
 
 # --- 5. Raw TCP to a private-IP host (resolved-IP backstop) --------------

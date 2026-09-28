@@ -32,7 +32,7 @@ const testRepoURL = "https://example.com/repo.git"
 
 // agentPolicyExecGit is the exec allow the AgentPolicy test fixtures reference
 // (git), shared across the policy test files to avoid goconst churn.
-const agentPolicyExecGit = "git"
+const agentPolicyExecGit = "/usr/bin/git"
 
 // testWorkspace returns a LoopSpec workspace pointing at the shared fixture
 // repo, so the individual test files don't each repeat the literal.
@@ -57,6 +57,8 @@ const (
 	loopGoal       = "make the failing test pass"
 	loopRepo       = testRepoURL
 	loopRef        = "main"
+	runnerImage    = "docker.io/library/golang:1.26"
+	testModel      = "local-model"
 	loopCheckCmd   = "go test ./..."
 
 	// agentContainerName is the name of the Loop's agent container in the

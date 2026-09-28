@@ -106,3 +106,22 @@ func TestTranslateAgentAllowsCoverThePolicy(t *testing.T) {
 		t.Errorf("the proxy must allow only the model endpoint (got %+v)", proxy.Allows)
 	}
 }
+
+// TestEffectiveHashNoCommaCollision verifies that the hash is unambiguous for
+// entries containing commas (R15 P3: ["a,b"] and ["a","b"] must NOT collide).
+func TestEffectiveHashNoCommaCollision(t *testing.T) {
+	p1 := EffectivePolicy{Exec: []string{"a,b"}}
+	p2 := EffectivePolicy{Exec: []string{"a", "b"}}
+	h1 := EffectiveHash(p1)
+	h2 := EffectiveHash(p2)
+	if h1 == h2 {
+		t.Errorf("EffectiveHash collision: %q and %q both hash to %s",
+			[]string{"a,b"}, []string{"a", "b"}, h1)
+	}
+	// Sanity: identical policies produce identical hashes.
+	p3 := EffectivePolicy{Exec: []string{"a", "b"}}
+	if EffectiveHash(p3) != h2 {
+		t.Errorf("EffectiveHash not deterministic: %q and %q hash differently",
+			[]string{"a", "b"}, []string{"b", "a"})
+	}
+}

@@ -21,18 +21,24 @@ import (
 	"fmt"
 	"strings"
 
+	"time"
+
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
@@ -42,11 +48,8 @@ const (
 	// proxyContainerName is the name of the model proxy sidecar container.
 	proxyContainerName = "proxy"
 	// modelCredsVolume is the name of the Secret volume that carries the model
-	// API key + base URL (mounted read-only into the proxy only)
+	// API key + base URL (mounted read-only into the proxy only).
 	modelCredsVolume = "model-creds"
-	// PolicyTranslationLossyCondition is the Loop condition that reports
-	// a lossy translation (I41).
-	PolicyTranslationLossyCondition = "PolicyTranslationLossy"
 	// coxModelBaseURL is the env var the operator sets on the agent so it talks
 	// to the local proxy (a Loop cannot override it: COX_* names are rejected
 	// at admission, I34).
@@ -57,6 +60,15 @@ const (
 	// readOnlyMode is the default file mode for the model-creds Secret volume
 	// (0444: the key is read-only, even in the proxy).
 	readOnlyMode int32 = 0o444
+
+	// The agent's writable mount points. Single source of truth for the pod spec;
+	// the AgentPolicy exec XValidation (api/v1alpha1/agentpolicy_types.go) MUST
+	// stay in sync with this set — a CRD CEL rule cannot reference Go code, so
+	// adding a mount here without updating the XValidation would silently make
+	// the new mount a spoofable exec target.
+	agentWorkspaceMount = "/workspace"
+	agentScratchMount   = "/scratch"
+	agentTmpMount       = "/tmp"
 )
 
 // LoopReconciler reconciles a Loop object.
@@ -68,6 +80,17 @@ type LoopReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// Enforcer is the eBPF engine seam (ADR-0007 Q3/D30). When set, the operator
+	// emits the Loop's effective policy through the engine and gates the sandbox
+	// on positive evidence that enforcement is active (D30). When nil, the
+	// operator treats enforcement as unavailable (PolicyEnforced=False,
+	// reason EngineUnavailable) and holds the sandbox Suspended (fail-closed).
+	Enforcer engine.Enforcer
+	// AllowUnenforced is the off-by-default escape hatch (P1 merge): when true,
+	// Loops run with PolicyEnforced=False reason EnforcementDisabled rather
+	// than being held Suspended. For dev/kind only — never in production.
+	AllowUnenforced bool
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
@@ -75,20 +98,6 @@ type LoopReconciler struct {
 	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
 	// stand-in; overridable for the smoke test (e.g. the real proxy image).
 	ProxyImage string
-
-	// Enforcer is the eBPF engine seam (ADR-0007 Q3/D30). When set, the operator
-	// applies the Loop's effective policy through it and gates the sandbox on
-	// positive enforcement evidence (fail-closed: the agent never runs until the
-	// engine is enforcing). When nil (e.g. the engine is not installed), the
-	// operator treats enforcement as unavailable (PolicyEnforced=False,
-	// EngineUnavailable) and holds the sandbox Suspended. A fake is used in
-	// envtest to drive the gate.
-	Enforcer engine.Enforcer
-	// AllowUnenforced is the off-by-default escape hatch (P1 merge): when true,
-	// Loops run with PolicyEnforced=False reason EnforcementDisabled rather
-	// than being held Suspended forever. Set explicitly (--allow-unenforced);
-	// a dev/testing escape hatch, never the default.
-	AllowUnenforced bool
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -107,6 +116,34 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
+	// creating the sandbox (defence in depth: the CRD CEL catches the common
+	// case at admission; this catches anything that slips through, including
+	// missing/unreadable policies). If validation fails, set
+	// PolicyValid=False and suspend the sandbox (if running).
+	if polResult := r.validateAgentPolicies(ctx, &loop); !polResult.valid {
+		setCondition(&loop, "PolicyValid", metav1.ConditionFalse, polResult.reason, polResult.message)
+		// Suspend an already-running sandbox (D30-gate pattern): set
+		// operatingMode to 0 so the sandbox pod is scaled down.
+		if err := r.suspendSandboxIfRunning(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Status().Update(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		if polResult.transientReadError {
+			// Requeue: the policy could not be read due to a transient
+			// error. Retry after a short delay.
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+	// Clean pass: set PolicyValid=True (R15 round 3: nothing ever set it
+	// True before, so a fixed path left the old False condition forever).
+	if len(loop.Spec.PolicyRefs) > 0 {
+		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
+	}
+
 	// C6b (ADR-0007 Q3/D30): resolve the effective policy, apply it through the
 	// Enforcer (the gate has something behind it, P1 #2), and record the hash.
 	// The gate applies to EVERY Loop (no policyRefs = the platform minimum,
@@ -120,31 +157,20 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			return ctrl.Result{}, err
 		}
 	}
-	if loop.Status.Policy == nil {
-		loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
-	}
-	if loop.Status.Policy.EffectiveHash != policy.EffectiveHash(effective) {
-		loop.Status.Policy.EffectiveHash = policy.EffectiveHash(effective)
-	}
-	// I41: a host:PORT network allow that the engine can't express at that
-	// precision (the port is dropped) must set PolicyTranslationLossy=True.
-	// The NetworkPolicy does NOT carry AgentPolicy network allows (I42 is
-	// open), so the port precision is not enforced anywhere — the allow is
-	// hostname-only, any port, until I42 is resolved.
+
+	// I41: report the lossy translation. A host:PORT network allow that loses
+	// its port in the KubeArmor translation must set PolicyTranslationLossy=True
+	// (the port is dropped; the allow widens to host:*). Once the per-Loop
+	// NetworkPolicy carries the port (D34/I42), the condition becomes False.
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
 		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
 			"KubeArmorDroppedPorts",
-			"these network allows lost their port in the KubeArmor translation and are "+
-				"enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
+			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
 	} else {
 		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
-			"NoPortLoss",
-			"no network allows lost their port in the translation")
+			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
 	}
 
-	if err := r.ensureSandbox(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
-	}
 	// D30: record the PolicyEnforced condition. True+Enforcing when the engine is
 	// enforcing; False+reason otherwise. The AllowUnenforced escape hatch lets
 	// the Loop run but is NOT enforced — it records False+EnforcementDisabled
@@ -158,6 +184,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			msg = "--allow-unenforced is set: the Loop runs but is NOT enforced (dev escape hatch)"
 		}
 		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
+	}
+	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
+	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
+	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
+	// gates apply: an invalid policy suspends, and unenforced also suspends.
+
+	if err := r.ensureSandbox(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Combine the two status updates (observedGeneration + phase) into one so a
@@ -220,6 +254,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			changed = true
 		}
 	}
+	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
+	// union of the allows across every AgentPolicy the Loop references
+	// (spec.policyRefs[]). The operator computes the hash and stores it in
+	// status.policy.effectiveHash so the decision audit shows what the agent was
+	// allowed to do (D32); the hash is over the union, not stored allows.
+	if effectiveHash, found, err := r.effectivePolicyHash(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	} else if found {
+		if loop.Status.Policy == nil {
+			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+		}
+		if loop.Status.Policy.EffectiveHash != effectiveHash {
+			loop.Status.Policy.EffectiveHash = effectiveHash
+			changed = true
+		}
+	}
 	if changed {
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
@@ -227,6 +277,37 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// effectivePolicyHash computes the canonical hash of the Loop's effective
+// AgentPolicy (C6a): the union of the allows across every AgentPolicy the Loop
+// references (spec.policyRefs[]). It returns the hash and whether any policy
+// was applied (false when policyRefs is empty — the default-deny minimum). A
+// referenced AgentPolicy that does not exist is an error (the operator must not
+// silently run an agent with a narrower policy than the Loop declared).
+func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+	if len(loop.Spec.PolicyRefs) == 0 {
+		return "", false, nil
+	}
+	union := policy.EffectivePolicy{}
+	for _, name := range loop.Spec.PolicyRefs {
+		var ap coxv1alpha1.AgentPolicy
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
+			return "", false, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+		}
+		// P1 (R15): the CEL XValidation can't reject non-canonical paths (CRD CEL
+		// cost budget), so the controller rejects them here before they reach the
+		// effective policy or the eBPF engine. A path with '..' or '//' or a
+		// trailing '/' is non-canonical and could resolve to a writable mount
+		// after normalization.
+		// Non-canonical exec paths are rejected by findNonCanonicalExecPath
+		// before ensureSandbox (R15 round 2: the check runs before the sandbox
+		// is created, and sets a condition rather than an error-requeue).
+		union.Exec = append(union.Exec, ap.Spec.Exec...)
+		union.Network = append(union.Network, ap.Spec.Network...)
+		union.Files = append(union.Files, ap.Spec.Files...)
+	}
+	return policy.EffectiveHash(union), true, nil
 }
 
 // enforcementStatus (D30, ADR-0007) reports whether the eBPF engine is enforcing
@@ -251,12 +332,12 @@ func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha
 // eBPF engine is enforcing the Loop's policy (D30).
 const PolicyEnforcedCondition = "PolicyEnforced"
 
-// effectivePolicyHash computes the canonical hash of the Loop's effective
-// AgentPolicy (C6a): the union of the allows across every AgentPolicy the Loop
-// references (spec.policyRefs[]). It returns the hash and whether any policy
-// was applied (false when policyRefs is empty — the default-deny minimum). A
-// referenced AgentPolicy that does not exist is an error (the operator must not
-// silently run an agent with a narrower policy than the Loop declared).
+// PolicyTranslationLossyCondition is the Loop condition that reports a lossy
+// KubeArmor translation (I41): a host:PORT network allow that loses its port
+// in the translation. True + reason KubeArmorDroppedPorts lists the widened
+// allows; False + reason NoPortLoss when no port was lost.
+const PolicyTranslationLossyCondition = "PolicyTranslationLossy"
+
 // effectivePolicy resolves the Loop's effective policy: the union of the
 // referenced AgentPolicies, or the platform minimum (empty EffectivePolicy) when
 // there are no policyRefs (D30: the platform minimum is still translated,
@@ -291,7 +372,6 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
 	log := logf.FromContext(ctx)
-
 	desired := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sandboxName(loop.Name),
@@ -320,18 +400,26 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		falseP := false
 		trueP := true
 		readOnlyRootfs := true
-		// D30 (P1 #1): the gate applies to EVERY Loop — no policyRefs means the
-		// platform-minimum policy, still translated/emitted/enforced. Without an
-		// enforcing engine the sandbox is held Suspended (fail-closed).
-		enforced, _ := r.enforcementStatus(ctx, loop)
-		if loop.Spec.Suspend || !enforced {
+		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
+		// (S1). Running is the default for a normal Loop.
+		if loop.Spec.Suspend {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
-		// P1 #2: the sandbox pod carries the coxswain.io/loop label the
-		// KubeArmorPolicy selector targets (the emitter asserts the selector
-		// matches this label).
+		// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
+		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
+		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
+		// invalid policy suspends via suspendSandboxIfRunning, and unenforced
+		// also suspends here.
+		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
+			enforced, _ := r.enforcementStatus(ctx, loop)
+			if !enforced {
+				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+			}
+		}
+		// C6b (P1 #2): the sandbox pod carries the coxswain.io/loop label the
+		// KubeArmorPolicy selector targets.
 		desired.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{"coxswain.io/loop": loop.Name}
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
 		// C2 (P2): never share the process namespace. The proxy and agent run as
@@ -404,11 +492,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: "workspace", MountPath: "/workspace"},
-				{Name: "scratch", MountPath: "/scratch"},
+				{Name: "workspace", MountPath: agentWorkspaceMount},
+				{Name: "scratch", MountPath: agentScratchMount},
 				// P1 (R13): a writable /tmp so go build / mktemp / any tool that
 				// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
-				{Name: "tmp", MountPath: "/tmp"},
+				{Name: "tmp", MountPath: agentTmpMount},
 			},
 		}
 		podContainers := []corev1.Container{agentContainer}
@@ -458,6 +546,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
 		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
 		// rather than filling the node. 500+350+100 = 950Mi < 1Gi.
+		// writableMountPaths is the single source of truth for the agent's writable
+		// mount points; the AgentPolicy exec XValidation hard-codes the same set
+		// (a CRD CEL rule cannot reference Go code), so adding a mount here MUST
+		// also update the XValidation in api/v1alpha1/agentpolicy_types.go or the
+		// new mount would silently become a spoofable exec target.
+		writableMountPaths := []string{agentWorkspaceMount, agentScratchMount, agentTmpMount}
+		_ = writableMountPaths // single source of truth (see comment)
 		desired.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
 			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				SizeLimit: newLimit("500Mi"),
@@ -626,8 +721,8 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 
 // setCondition upserts a condition on the Loop's status. The condition's Type
 // is a string (a terminal phase like "Failed", or a non-phase condition type
-// like "PolicyEnforced"). It is the operator's audit record (ADR-0004); the
-// runner never writes it.
+// like "PolicyEnforced" or "PolicyValid"). It is the operator's audit record
+// (ADR-0004); the runner never writes it.
 func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
 	now := metav1.Now()
 	for i := range loop.Status.Conditions {
@@ -672,11 +767,158 @@ func (r *LoopReconciler) proxyImage() string {
 	return "docker.io/library/golang:1.26"
 }
 
+// loopPolicyRefsFieldIndex is a field index on Loop.spec.policyRefs, used by
+// the AgentPolicy watch's map function to efficiently find the Loops that
+// reference a given AgentPolicy (R15 round 4 P2).
+const loopPolicyRefsFieldIndex = "spec.policyRefs"
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
+	// watch's map function uses this index to find the Loops that reference
+	// a given AgentPolicy, avoiding a namespace-wide list per event).
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &coxv1alpha1.Loop{}, loopPolicyRefsFieldIndex,
+		func(obj client.Object) []string {
+			loop, ok := obj.(*coxv1alpha1.Loop)
+			if !ok {
+				return nil
+			}
+			return loop.Spec.PolicyRefs
+		}); err != nil {
+		return fmt.Errorf("index Loop.spec.policyRefs: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&coxv1alpha1.Loop{}).
 		Owns(&sandboxv1beta1.Sandbox{}).
+		// Watch AgentPolicy: when a referenced policy is created, edited, or
+		// deleted, re-reconcile the Loops that reference it (R15 round 4 P2:
+		// a policy created after its Loop must not leave the Loop stuck at
+		// PolicyNotFound; a policy edit must refresh the recorded hash).
+		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
+			r.agentPolicyToLoopRequests)).
 		Named("loop").
 		Complete(r)
+}
+
+// agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace
+// whose spec.policyRefs contains its name. Used by the AgentPolicy watch to
+// re-reconcile the affected Loops when the policy changes (R15 round 4 P2).
+// The field index on spec.policyRefs (registered in SetupWithManager and in
+// the envtest suite) makes this an O(1) lookup.
+func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	ap, ok := obj.(*coxv1alpha1.AgentPolicy)
+	if !ok {
+		return nil
+	}
+	loops := &coxv1alpha1.LoopList{}
+	if err := r.List(ctx, loops,
+		client.InNamespace(ap.Namespace),
+		client.MatchingFields{loopPolicyRefsFieldIndex: ap.Name},
+	); err != nil {
+		logf.FromContext(ctx).Error(err, "list Loops by policyRefs index for AgentPolicy watch",
+			"policy", ap.Name, "namespace", ap.Namespace)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(loops.Items))
+	for i := range loops.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: loops.Items[i].Namespace,
+				Name:      loops.Items[i].Name,
+			},
+		})
+	}
+	return requests
+}
+
+// suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it
+// is currently Running. Called when a Loop's AgentPolicy becomes invalid
+// (R15 round 3: an already-running sandbox must be suspended, not left
+// as-is). If the sandbox doesn't exist, this is a no-op.
+func (r *LoopReconciler) suspendSandboxIfRunning(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	sb := &sandboxv1beta1.Sandbox{}
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
+	if err := r.Get(ctx, key, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // no sandbox to suspend
+		}
+		return fmt.Errorf("get sandbox %s: %w", key, err)
+	}
+	if sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
+		return nil // already suspended
+	}
+	sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	if err := r.Update(ctx, sb); err != nil {
+		return fmt.Errorf("suspend sandbox %s: %w", key, err)
+	}
+	logf.FromContext(ctx).Info("suspended sandbox (policy invalid)", "sandbox", sandboxName(loop.Name), "loop", loop.Name)
+	return nil
+}
+
+// policyValidationResult is the outcome of validating a Loop's referenced
+// AgentPolicies before the sandbox is created or the eBPF engine is reached.
+type policyValidationResult struct {
+	// valid is true when all referenced policies exist and have canonical
+	// exec paths.
+	valid bool
+	// reason is the metav1.ConditionReason (NonCanonicalExecPath or
+	// PolicyNotFound) when valid is false.
+	reason string
+	// message is the human-readable explanation.
+	message            string
+	transientReadError bool
+}
+
+// validateAgentPolicies checks that every referenced AgentPolicy exists and
+// has canonical exec paths. Returns a policyValidationResult. The
+// transientReadError field is true when the policy could not be read due to a
+// transient error (not a NotFound), in which case the caller should requeue.
+// R15 round 3: a missing or unreadable referenced policy is treated as
+// not-valid (PolicyNotFound), not ignored (fail-closed).
+// Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
+func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
+	for _, name := range loop.Spec.PolicyRefs {
+		ap := &coxv1alpha1.AgentPolicy{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
+			if apierrors.IsNotFound(err) {
+				return policyValidationResult{valid: false, reason: "PolicyNotFound",
+					message: fmt.Sprintf("AgentPolicy %s/%s not found (referenced by policyRefs)", loop.Namespace, name)}
+			}
+			// Unreadable (transient error): fail closed, requeue.
+			return policyValidationResult{valid: false, reason: "PolicyNotFound",
+				message:            fmt.Sprintf("AgentPolicy %s/%s could not be read: %v", loop.Namespace, name, err),
+				transientReadError: true}
+		}
+		for _, e := range ap.Spec.Exec {
+			if isNonCanonicalPath(e) {
+				return policyValidationResult{valid: false, reason: "NonCanonicalExecPath",
+					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
+			}
+		}
+	}
+	return policyValidationResult{valid: true}
+}
+
+// isNonCanonicalPath returns true if the path is non-canonical: it contains
+// a '.' or '..' segment, a '//' (double slash), or ends with a '/'. The eBPF
+// engine and the filesystem normalize such paths, so a non-canonical path
+// that looks outside the writable mounts could resolve to one (e.g.
+// "/usr/../tmp/git" or "/./tmp/git"). The CRD CEL XValidation catches the
+// common case at admission (with items:MaxLength bounding the string length);
+// the controller is the second line of defence (catches everything).
+func isNonCanonicalPath(p string) bool {
+	if strings.Contains(p, "..") {
+		return true
+	}
+	// Catch '.' segments: "/./tmp/git" resolves to "/tmp/git".
+	if strings.Contains(p, "/./") {
+		return true
+	}
+	if strings.Contains(p, "//") {
+		return true
+	}
+	if len(p) > 1 && strings.HasSuffix(p, "/") {
+		return true
+	}
+	return false
 }

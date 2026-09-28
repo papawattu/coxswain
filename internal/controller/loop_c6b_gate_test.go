@@ -287,20 +287,20 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 })
 
-// translationLossyCondition finds the PolicyTranslationLossy condition.
-func translationLossyCondition(conds []metav1.Condition) *metav1.Condition {
+// policyEnforcedCondition finds the PolicyEnforced condition.
+func policyEnforcedCondition(conds []metav1.Condition) *metav1.Condition {
 	for i := range conds {
-		if conds[i].Type == PolicyTranslationLossyCondition {
+		if conds[i].Type == "PolicyEnforced" {
 			return &conds[i]
 		}
 	}
 	return nil
 }
 
-// policyEnforcedCondition finds the PolicyEnforced condition.
-func policyEnforcedCondition(conds []metav1.Condition) *metav1.Condition {
+// translationLossyCondition finds the PolicyTranslationLossy condition.
+func translationLossyCondition(conds []metav1.Condition) *metav1.Condition {
 	for i := range conds {
-		if conds[i].Type == "PolicyEnforced" {
+		if conds[i].Type == PolicyTranslationLossyCondition {
 			return &conds[i]
 		}
 	}

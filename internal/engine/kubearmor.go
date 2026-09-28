@@ -215,32 +215,6 @@ func splitNetworkAllows(ends []string) (domains, protocols []string) {
 
 // splitHostPort splits "host:port" into (host, port). A bare host yields
 // (host, "").
-// TranslationResult reports what the engine's translation dropped. The
-// controller uses this to set PolicyTranslationLossy on the Loop when the
-// translation is lossy (I41: a host:PORT allow that loses its port must be
-// reported, not silently widened).
-type TranslationResult struct {
-	// DroppedNetworkPorts lists the host:port allows that lost their port
-	// during translation (e.g. "pypi.org:443" -> "pypi.org" + tcp). Empty
-	// means the translation was not lossy.
-	DroppedNetworkPorts []string
-}
-
-// NetworkLossy returns the host:port network allows that the KubeArmor
-// translation cannot express at that precision (the port is dropped). A bare
-// host (no port) is not lossy. This is the single source of truth for the
-// PolicyTranslationLossy condition (I41).
-func NetworkLossy(ends []string) []string {
-	var lossy []string
-	for _, e := range ends {
-		_, port := splitHostPort(e)
-		if port != "" {
-			lossy = append(lossy, e)
-		}
-	}
-	return lossy
-}
-
 func splitHostPort(s string) (string, string) {
 	i := 0
 	for i < len(s) && s[i] != ':' {
@@ -267,4 +241,30 @@ func dedupe(in []string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// TranslationResult reports what the engine's translation dropped. The
+// controller uses this to set PolicyTranslationLossy on the Loop when the
+// translation is lossy (I41: a host:PORT allow that loses its port must be
+// reported, not silently widened).
+type TranslationResult struct {
+	// DroppedNetworkPorts lists the host:port allows that lost their port
+	// during translation (e.g. "pypi.org:443" -> "pypi.org" + tcp). Empty
+	// means the translation was not lossy.
+	DroppedNetworkPorts []string
+}
+
+// NetworkLossy returns the host:port network allows that the KubeArmor
+// translation cannot express at that precision (the port is dropped). A bare
+// host (no port) is not lossy. This is the single source of truth for the
+// PolicyTranslationLossy condition (I41).
+func NetworkLossy(ends []string) []string {
+	var lossy []string
+	for _, e := range ends {
+		_, port := splitHostPort(e)
+		if port != "" {
+			lossy = append(lossy, e)
+		}
+	}
+	return lossy
 }

@@ -172,7 +172,6 @@ func TestEmitKubeArmorPolicyDefaultDeny(t *testing.T) {
 		}
 	}
 }
-
 func TestNetworkLossy(t *testing.T) {
 	// host:PORT allows are lossy (the port is dropped).
 	lossy := NetworkLossy([]string{"pypi.org:443", "localhost:8080"})

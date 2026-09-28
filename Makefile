@@ -188,7 +188,7 @@ docker-build: ## Build docker image with the manager.
 PROXY_IMG ?= coxswain-proxy:standin
 .PHONY: proxy-build
 proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
-	$(CONTAINER_TOOL) build -t $(PROXY_IMG) cmd/proxy-standin/
+	$(CONTAINER_TOOL) build -t $(PROXY_IMG) -f cmd/proxy-standin/Dockerfile .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

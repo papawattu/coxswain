@@ -32,9 +32,14 @@ func main() {
 				continue
 			}
 			buf, _ := io.ReadAll(io.LimitReader(f, 64))
-			f.Close()
+			if err := f.Close(); err != nil {
+				log.Printf("proxy: cannot close %s: %v", path, err)
+			}
 			if len(buf) > 0 {
-				fmt.Fprintf(os.Stdout, "proxy: model-creds readable (%s, %d bytes)\n", e.Name(), len(buf))
+				msg := fmt.Sprintf("proxy: model-creds readable (%s, %d bytes)\n", e.Name(), len(buf))
+				if _, err := fmt.Fprint(os.Stdout, msg); err != nil {
+					log.Printf("proxy: cannot write to stdout: %v", err)
+				}
 				found = true
 			}
 		}
@@ -55,6 +60,8 @@ func main() {
 		log.Fatalf("bad MODEL_ENDPOINT %q: %v", target, err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(u)
-	fmt.Fprintf(os.Stdout, "proxy-stand-in: forwarding to %s\n", target)
+	if _, err := fmt.Fprintf(os.Stdout, "proxy-stand-in: forwarding to %s\n", target); err != nil {
+		log.Printf("proxy: cannot write to stdout: %v", err)
+	}
 	log.Fatal(http.ListenAndServe(":8080", proxy))
 }

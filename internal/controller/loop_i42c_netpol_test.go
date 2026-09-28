@@ -502,12 +502,25 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		Expect(exceptSet).ToNot(HaveKey(i42cPodCIDR), "the old POD_CIDR must be gone from the updated except list")
 	})
 
-	// spec 8 (I42c review P2, round 2): a FOREIGN agent NetworkPolicy of the
-	// same name is never overwritten. createOrUpdateNP's P1 fix re-asserts the
-	// desired spec on an existing netpol; it must not do so for a foreign
-	// one. The reconcile sets NetworkPolicyConflict=True/ForeignNetworkPolicy,
-	// leaves the foreign netpol untouched, and holds the sandbox Suspended.
-	It("does not overwrite a foreign agent NetworkPolicy; sets NetworkPolicyConflict and suspends", func() {
+	// spec 8 (I42c review P2, round 2 + round 3): a FOREIGN agent
+	// NetworkPolicy of the same name is never overwritten. createOrUpdateNP's
+	// P1 fix re-asserts the desired spec on an existing netpol; it must not do
+	// so for a foreign one. The reconcile sets
+	// NetworkPolicyConflict=True/ForeignNetworkPolicy, leaves the foreign
+	// netpol untouched, and the order-independent gate in ensureSandbox holds
+	// the sandbox Suspended across reconciles (it reads the live netpol
+	// objects, so it does not flap back to Running the next reconcile).
+	//
+	// Round 3 made this spec meaningful (it previously reconciled once with no
+	// Ready proxy pods, so the D35a/I42b gates already held it Suspended
+	// regardless of the netpol conflict): (1) mark the model-proxy and
+	// egress-proxy pods Ready so the D35a/I42b gates pass and the netpol gate
+	// is the one holding it Suspended; (2) reconcile twice, asserting Suspended
+	// after each (the second reconcile would flip it back to Running if the
+	// gate were order-dependent); (3) delete the foreign netpol, reconcile,
+	// and assert our netpol is created with our controller ref, the condition
+	// is Resolved, and the sandbox goes Running.
+	It("does not overwrite a foreign agent NetworkPolicy; holds the sandbox Suspended across reconciles; resolves on deletion", func() {
 		ns := "i42c-foreign-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -533,9 +546,47 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		}
 		Expect(k8sClient.Create(ctx, foreignNP)).To(Succeed())
 
+		// First reconcile: creates the sandbox + proxies. The D35a/I42b gates
+		// hold it Suspended (the proxy pods are not Ready yet).
 		reconcileI42C("foreign", ns)
 
-		// The foreign netpol is untouched (same spec, still unowned).
+		// Mark the model-proxy and egress-proxy pods Ready so the D35a/I42b
+		// gates pass. With both proxies Ready and no netpol conflict, the
+		// sandbox would be Running; the ONLY thing holding it Suspended is the
+		// order-independent netpol gate (foreign agent netpol).
+		for _, podName := range []string{"foreign-proxy", "foreign-egress-proxy"} {
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: podName}, pod)).To(Succeed(),
+				"proxy pod %s must exist", podName)
+			pod.Status.Conditions = []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed(),
+				"mark %s Ready", podName)
+		}
+
+		// Second reconcile: both proxies are Ready, so the D35a/I42b gates
+		// pass; the netpol gate must hold it Suspended (fail-closed: the agent's
+		// netpol is the foreign one, not the one the operator built).
+		reconcileI42C("foreign", ns)
+
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-sandbox"}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the sandbox must be Suspended while a foreign netpol occupies the name, even with both proxy pods Ready")
+
+		// Third reconcile: the gate is order-independent (it reads the live
+		// netpol objects in ensureSandbox, which runs before
+		// ensureNetworkPolicy), so a second pass must NOT flip it back to
+		// Running. This is the flap the round-3 fix removed.
+		reconcileI42C("foreign", ns)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-sandbox"}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the sandbox must STAY Suspended on the second reconcile (no flap back to Running)")
+
+		// The foreign netpol is untouched (same spec, still unowned) after all
+		// three reconciles.
 		got := &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-agent-netpol"}, got)).To(Succeed())
 		Expect(equality.Semantic.DeepEqual(got.Spec.PodSelector, foreignSpec.PodSelector)).To(BeTrue(), "the foreign netpol's podSelector must NOT be overwritten")
@@ -558,11 +609,37 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		Expect(conflict.Status).To(Equal(metav1.ConditionTrue))
 		Expect(conflict.Reason).To(Equal("ForeignNetworkPolicy"))
 
-		// The sandbox is held Suspended (fail-closed: the agent's netpol is not
-		// the one the operator built).
-		sb := &sandboxv1beta1.Sandbox{}
+		// Delete the foreign netpol. The next reconcile creates our agent netpol
+		// (with our controller ref) and clears the condition to Resolved; with
+		// both proxies Ready and no conflict, the sandbox goes Running.
+		Expect(k8sClient.Delete(ctx, foreignNP)).To(Succeed())
+		reconcileI42C("foreign", ns)
+
+		// Our agent netpol now exists with our controller ref.
+		ourNP := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-agent-netpol"}, ourNP)).To(Succeed(),
+			"our agent netpol must be created after the foreign one is deleted")
+		resolvedLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign"}, resolvedLoop)).To(Succeed())
+		Expect(metav1.IsControlledBy(ourNP, resolvedLoop)).To(BeTrue(),
+			"our agent netpol must carry the Loop's controller ref")
+
+		// The condition is Resolved (cleared by the hadNetpolConflict path).
+		var resolvedConflict *metav1.Condition
+		for i := range resolvedLoop.Status.Conditions {
+			if resolvedLoop.Status.Conditions[i].Type == "NetworkPolicyConflict" {
+				resolvedConflict = &resolvedLoop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(resolvedConflict).ToNot(BeNil(), "NetworkPolicyConflict condition must still be present")
+		Expect(resolvedConflict.Status).To(Equal(metav1.ConditionFalse),
+			"NetworkPolicyConflict must be cleared to False once the foreign netpol is gone")
+		Expect(resolvedConflict.Reason).To(Equal("Resolved"))
+
+		// The sandbox goes Running (both proxies Ready, no conflict).
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-sandbox"}, sb)).To(Succeed())
-		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
-			"the sandbox must be Suspended while a foreign netpol occupies the name")
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
+			"the sandbox must go Running once the foreign netpol is deleted and the conflict is resolved")
 	})
 })

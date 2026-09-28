@@ -28,13 +28,13 @@ import (
 // default to deny. This is the ADR-0007 Q2 guarantee — with no policy the agent
 // can do only the platform minimum.
 func TestTranslateDefaultDenyPlatformMinimum(t *testing.T) {
-	got := Translate(EffectivePolicy{})
+	got := Translate(EffectivePolicy{}, "l1-proxy.ns.svc")
 	want := EnginePolicy{
 		Containers: []ContainerPolicy{
 			{
 				Container: ContainerAgent,
 				Default:   Deny,
-				Allows:    []Allow{{Type: AllowNetwork, Match: localhostEndpoint}},
+				Allows:    []Allow{{Type: AllowNetwork, Match: "l1-proxy.ns.svc"}, {Type: AllowNetwork, Match: dnsAllow}},
 			},
 			{
 				Container: ContainerProxy,
@@ -54,10 +54,10 @@ func TestTranslateDefaultDenyPlatformMinimum(t *testing.T) {
 // endpoint — it never gets the user's allows (D29).
 func TestTranslateAgentAllowsCoverThePolicy(t *testing.T) {
 	got := Translate(EffectivePolicy{
-		Exec:    []string{"git", "go"},
+		Exec:    []string{"/usr/bin/git", "/usr/bin/go"},
 		Network: []string{"proxy.golang.org:443", "sum.golang.org:443"},
 		Files:   []string{"/workspace"},
-	})
+	}, "l1-proxy.ns.svc")
 
 	var agent, proxy *ContainerPolicy
 	for i := range got.Containers {
@@ -77,11 +77,12 @@ func TestTranslateAgentAllowsCoverThePolicy(t *testing.T) {
 	}
 	// Every user allow must be present exactly once.
 	expectAgent := map[string]int{
-		AllowNetwork + ":" + localhostEndpoint: 1,
+		AllowNetwork + ":l1-proxy.ns.svc":      1,
+		AllowNetwork + ":" + dnsAllow:          1,
 		AllowNetwork + ":proxy.golang.org:443": 1,
 		AllowNetwork + ":sum.golang.org:443":   1,
-		AllowExec + ":git":                     1,
-		AllowExec + ":go":                      1,
+		AllowExec + ":/usr/bin/git":            1,
+		AllowExec + ":/usr/bin/go":             1,
 		AllowFile + ":/workspace":              1,
 	}
 	count := map[string]int{}

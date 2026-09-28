@@ -53,12 +53,13 @@ const Deny = "deny"
 // the user's AgentPolicy (Q6: the model proxy's own egress is platform
 // infrastructure, allowed by the operator).
 const (
-	// localhostEndpoint is the agent's only always-allowed network target: the
-	// model proxy sidecar on loopback (D29: the agent reaches the model only
-	// through the proxy, never the endpoint directly).
-	localhostEndpoint = "localhost:8080"
-	// modelEndpoint is the proxy's only always-allowed network target: the
-	// model endpoint.
+	// dnsAllow is the platform-minimum DNS allow for the agent: udp+tcp DNS
+	// so the agent can resolve the proxy Service FQDN via kube-dns.
+	// (D33: the proxy is a separate pod, not a sidecar — the agent reaches
+	// it via <loop>-proxy.<ns>.svc, which requires DNS resolution.)
+	dnsAllow = "dns/udp+tcp"
+	// modelEndpoint is the proxy's always-allowed network target: the model
+	// endpoint (platform infrastructure, not the user's AgentPolicy).
 	modelEndpoint = "model-endpoint"
 )
 
@@ -102,13 +103,20 @@ type EffectivePolicy struct {
 }
 
 // Translate turns a Loop's effective allows into the engine policy (C6a). It is
-// pure and total: the agent container gets localhost (the proxy) plus the
+// pure and total: the agent container gets the proxy Service FQDN + DNS
+// (D33: the proxy is a separate pod, reached via its Service) plus the
 // effective allows; the proxy container gets only the model endpoint; both
-// default to deny. With no effective allows, the agent gets only localhost and
-// the proxy only the model endpoint — the platform minimum (default-deny).
-func Translate(p EffectivePolicy) EnginePolicy {
-	agentAllows := make([]Allow, 0, 1+len(p.Exec)+len(p.Network)+len(p.Files))
-	agentAllows = append(agentAllows, Allow{Type: AllowNetwork, Match: localhostEndpoint})
+// default to deny. With no effective allows, the agent gets only the proxy
+// FQDN + DNS and the proxy only the model endpoint — the platform minimum.
+//
+// proxyFQDN is the per-Loop proxy Service FQDN (<loop>-proxy.<ns>.svc).
+// It is platform infrastructure, not part of the user's AgentPolicy.
+func Translate(p EffectivePolicy, proxyFQDN string) EnginePolicy {
+	agentAllows := make([]Allow, 0, 2+len(p.Exec)+len(p.Network)+len(p.Files))
+	// D33: the agent reaches the proxy via its Service FQDN (not localhost).
+	agentAllows = append(agentAllows, Allow{Type: AllowNetwork, Match: proxyFQDN})
+	// DNS resolution: allow udp+tcp DNS so the FQDN can be resolved.
+	agentAllows = append(agentAllows, Allow{Type: AllowNetwork, Match: dnsAllow})
 	for _, c := range p.Exec {
 		agentAllows = append(agentAllows, Allow{Type: AllowExec, Match: c})
 	}
@@ -134,9 +142,10 @@ func Translate(p EffectivePolicy) EnginePolicy {
 // with the same effective allows (regardless of how they were unioned or in
 // what order) hash identically, so the decision audit can record "what the
 // agent was allowed to do" without storing the allows themselves (D32). The
-// platform-minimum endpoints (localhost for the agent, the model endpoint for
-// the proxy) are NOT part of the hash — they are always present and not the
-// user's policy; the hash is over the user's effective allows only.
+// platform-minimum endpoints (the proxy Service FQDN for the agent, the
+// model endpoint for the proxy) are NOT part of the hash — they are always
+// present and not the user's policy; the hash is over the user's effective
+// allows only.
 // EffectiveHash computes a canonical hash of the effective policy.
 // R15 P3: the old form (strings.Join with ",") collided on entries containing
 // a comma (["a,b"] and ["a","b"] both produced "a,b"). The fix hashes a

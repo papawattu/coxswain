@@ -17,7 +17,7 @@ func epForTest() policy.EnginePolicy {
 		Exec:    []string{testExecGit, testExecGo},
 		Network: []string{"proxy.golang.org:443"},
 		Files:   []string{"/data"},
-	})
+	}, "l1-proxy.ns.svc")
 }
 
 // P1 #1: the emitted object must have the real KubeArmorPolicy shape
@@ -55,7 +55,7 @@ func TestEmitKubeArmorPolicyShape(t *testing.T) {
 func TestEmitKubeArmorPolicyExecPathIsAbsoluteNotSpoofable(t *testing.T) {
 	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
 		Exec: []string{"go"},
-	}))
+	}, "l1-proxy.ns.svc"))
 	spec := obj.Object["spec"].(map[string]any)
 	proc, ok := spec["process"].(map[string]any)
 	if !ok {
@@ -83,7 +83,7 @@ func TestEmitKubeArmorPolicyExecPathIsAbsoluteNotSpoofable(t *testing.T) {
 func TestEmitKubeArmorPolicyTopLevelActionIsBlock(t *testing.T) {
 	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
 		Exec: []string{"go"},
-	}))
+	}, "l1-proxy.ns.svc"))
 	spec := obj.Object["spec"].(map[string]any)
 	if spec["action"] != "Block" {
 		t.Fatalf("spec.action must be Block (default-deny), got %v (KubeArmor defaults to Audit without it)", spec["action"])
@@ -148,8 +148,8 @@ func TestEmitKubeArmorPolicyNetworkItemsAreObjectsWithPort(t *testing.T) {
 }
 
 func TestEmitKubeArmorPolicyUnionsContainers(t *testing.T) {
-	agent := policy.Translate(policy.EffectivePolicy{Exec: []string{"git"}})
-	proxy := policy.Translate(policy.EffectivePolicy{})
+	agent := policy.Translate(policy.EffectivePolicy{Exec: []string{"/usr/bin/git"}}, "loop-x-proxy.ns-x.svc")
+	proxy := policy.Translate(policy.EffectivePolicy{}, "")
 	ep := policy.EnginePolicy{Containers: []policy.ContainerPolicy{agent.Containers[0], proxy.Containers[0]}}
 	obj := EmitKubeArmorPolicy("loop-x", "ns-x", ep)
 	spec := obj.Object["spec"].(map[string]any)
@@ -198,5 +198,39 @@ func TestNetworkLossy(t *testing.T) {
 	lossy = NetworkLossy(nil)
 	if len(lossy) != 0 {
 		t.Errorf("expected 0 lossy allows for nil input, got %d", len(lossy))
+	}
+}
+
+// TestEmitKubeArmorPolicyDNSAllowVerifiesUDPAndTCP verifies that the
+// platform-minimum DNS allow (dns/udp+tcp) produces matchProtocols [udp, tcp]
+// in the KubeArmorPolicy network block (D33: the agent needs both UDP and TCP
+// DNS to resolve the proxy Service FQDN).
+func TestEmitKubeArmorPolicyDNSAllowUDPAndTCP(t *testing.T) {
+	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{}, "l1-proxy.ns.svc"))
+	spec := obj.Object["spec"].(map[string]any)
+	net := spec["network"].(map[string]any)
+	protocols := net["matchProtocols"].([]any)
+	got := map[string]bool{}
+	for _, item := range protocols {
+		p := item.(map[string]any)
+		got[p["protocol"].(string)] = true
+	}
+	if !got["udp"] {
+		t.Errorf("matchProtocols must include udp (for DNS), got %v", protocols)
+	}
+	if !got["tcp"] {
+		t.Errorf("matchProtocols must include tcp (for DNS over TCP), got %v", protocols)
+	}
+	// The proxy Service FQDN must be a matchDNSQueries item.
+	domains := net["matchDNSQueries"].([]any)
+	found := false
+	for _, item := range domains {
+		d := item.(map[string]any)
+		if d["domain"] == "l1-proxy.ns.svc" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("matchDNSQueries must include l1-proxy.ns.svc (the proxy Service FQDN), got %v", domains)
 	}
 }

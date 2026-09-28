@@ -24,7 +24,7 @@ type KubeArmorEnforcer struct {
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective
 // policy, owned by the Loop.
 func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p policy.EffectivePolicy) error {
-	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p))
+	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p, proxyServiceFQDN(loop.Name, loop.Namespace)))
 	// P2: owner-ref the KubeArmorPolicy to the Loop so it is GC'd when the Loop
 	// is deleted (and a later same-name Loop doesn't inherit a stale policy).
 	if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {
@@ -64,3 +64,9 @@ func (e *KubeArmorEnforcer) Enforcing(_ context.Context, _ *v1alpha1.Loop) (bool
 
 // KubeArmorGVK is the GroupVersionKind of a KubeArmorPolicy.
 var KubeArmorGVK = schema.GroupVersionKind{Group: kaptGroup, Version: kaptVersion, Kind: kaptKind}
+
+// proxyServiceFQDN returns the per-Loop proxy Service FQDN that the agent
+// resolves via DNS to reach the model proxy (D33: <loop>-proxy.<ns>.svc).
+func proxyServiceFQDN(loopName, ns string) string {
+	return loopName + "-proxy." + ns + ".svc"
+}

@@ -202,8 +202,26 @@ func toProtocolItems(protocols []string) []any {
 // Loop status flag (D33 follow-up): whenever the effective policy carries a
 // host:PORT network allow, the operator must record it; the NetworkPolicy
 // (D34, post-C6) carries the host:port precision where KubeArmor cannot.
+// splitNetworkAllows splits network allows into (dnsNames, protocols).
+// KubeArmor matches egress by DNS query name + protocol — it CANNOT express
+// a host:port allow (the schema's matchProtocols items are protocol NAMES:
+// tcp/udp, not "tcp:443"). So a "host:443" allow becomes "host" + protocol
+// "tcp": the port is LOST — the allow widens to host:*, and KubeArmor alone
+// cannot keep the source rule's precision. That is the condition for the
+// PolicyTranslationLossy Loop status flag (D33 follow-up).
+//
+// Special formats:
+//   - "dns/udp+tcp" (the platform-minimum DNS allow): produces protocols
+//     ["udp", "tcp"] with no domain (it's a protocol allow, not a query).
+//   - "host:port": produces domain "host" + protocol "tcp" (port is lost).
+//   - "host" (bare): produces domain "host" only.
 func splitNetworkAllows(ends []string) (domains, protocols []string) {
 	for _, e := range ends {
+		// Platform-minimum DNS allow: "dns/udp+tcp" -> protocols [udp, tcp].
+		if e == "dns/udp+tcp" {
+			protocols = append(protocols, "udp", "tcp")
+			continue
+		}
 		host, port := splitHostPort(e)
 		domains = append(domains, host)
 		if port != "" {

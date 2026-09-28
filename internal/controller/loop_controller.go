@@ -862,17 +862,15 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
-				// D33 kind-run acceptance: the stand-in must prove at runtime
-				// that it CAN read the 0444 model-creds Secret file.
-				Command: []string{
-					"sh", "-c",
-					"echo 'proxy-stand-in: checking model-creds'; " +
-						"if head -c 64 /model-creds/* >/dev/null 2>&1; then " +
-						"echo 'proxy: model-creds readable (0444 secret file present)'; " +
-						"else " +
-						"echo 'proxy: model-creds NOT readable' && exit 1; " +
-						"fi; " +
-						"exec sleep infinity",
+				// (D33 acceptance) and forwards to MODEL_ENDPOINT. The Go stand-in
+				// reads the 0444 model-creds Secret at startup and exits 1 if no
+				// readable key file is found (the ..data atomic-mount entry is
+				// skipped).
+				Env: []corev1.EnvVar{
+					{
+						Name:  "MODEL_ENDPOINT",
+						Value: modelEndpointValue(loop),
+					},
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
@@ -1175,6 +1173,20 @@ func agentPodLabels(loopName string) map[string]string {
 // they are garbage-collected with it (a deleted Loop never leaves a live
 // proxy holding a key behind).
 
+// modelEndpointValue returns the model endpoint as a full URL for the proxy's
+// MODEL_ENDPOINT env var. A bare host:port (no scheme) gets "http://"
+// prefixed (httputil.NewSingleHostReverseProxy requires a full URL).
+func modelEndpointValue(loop *coxv1alpha1.Loop) string {
+	eps := loop.Spec.Agent.ModelEndpoint
+	if eps == "" {
+		return ""
+	}
+	if strings.HasPrefix(eps, "http://") || strings.HasPrefix(eps, "https://") {
+		return eps
+	}
+	return "http://" + eps
+}
+
 func modelEndpointPort(rawURL string) int {
 	// If it looks like a URL (has a scheme), parse it as such.
 	if strings.Contains(rawURL, "://") {
@@ -1324,15 +1336,17 @@ func (r *LoopReconciler) sandboxImage() string {
 	return "docker.io/library/golang:1.26"
 }
 
-// proxyImage returns the model proxy sidecar image. It is the reconciler's
-// ProxyImage field (set from a manager flag in cmd/main.go, like SandboxImage),
-// or a dev stand-in (sleep infinity) when unset. The real proxy binary (auth
-// injection, forward-only-to-endpoint, metering) is C2b.
+// proxyImage returns the model proxy pod image. It is the reconciler's
+// ProxyImage field (settable in tests and future slices; a manager flag
+// --proxy-image is a candidate for a future C2b), or the forwarding proxy
+// stand-in (coxswain-proxy:standin) when unset. The stand-in is a Go reverse
+// proxy that reads the model-creds Secret at startup and forwards to
+// MODEL_ENDPOINT.
 func (r *LoopReconciler) proxyImage() string {
 	if r.ProxyImage != "" {
 		return r.ProxyImage
 	}
-	return "docker.io/library/golang:1.26"
+	return "coxswain-proxy:standin"
 }
 
 // loopPolicyRefsFieldIndex is a field index on Loop.spec.policyRefs, used by

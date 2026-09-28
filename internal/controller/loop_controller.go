@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	netip "net/netip"
 	neturl "net/url"
 	"os"
 	"strconv"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
@@ -1438,17 +1440,31 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 				},
 				Egress: []networkingv1.NetworkPolicyEgressRule{
 					{
-						// Egress rule 1: external with carve-outs (no port
-						// restriction). The except list carves out the RFC1918 /
-						// loopback / link-local / multicast / reserved ranges
-						// plus the cluster's POD_CIDR and SERVICE_CIDR (from the
-						// operator's config), mirroring the egress binary's own
-						// resolved-IP carve-outs (I42a) so the two layers agree.
+						// Egress rule 1: external v4 with carve-outs (no port
+						// restriction). The except list is derived from the egress
+						// binary's own resolved-IP carve-outs (I42a,
+						// egress.CarveOutCIDRsV4) plus the cluster's POD_CIDR and
+						// SERVICE_CIDR (from the operator's config), so the two
+						// layers cannot drift.
 						To: []networkingv1.NetworkPolicyPeer{
 							{
 								IPBlock: &networkingv1.IPBlock{
 									CIDR:   "0.0.0.0/0",
 									Except: egressCarveOutCIDRs(r.PodCIDR, r.ServiceCIDR),
+								},
+							},
+						},
+					},
+					{
+						// Egress rule 1b (I42c review P3): the v6 mirror (plan's
+						// "v6 mirror" rule) so an allowed host that resolves
+						// AAAA-first works on a dual-stack cluster. Derived from the
+						// egress binary's v6 carve-outs (egress.CarveOutCIDRsV6).
+						To: []networkingv1.NetworkPolicyPeer{
+							{
+								IPBlock: &networkingv1.IPBlock{
+									CIDR:   "::/0",
+									Except: egress.CarveOutCIDRsV6(),
 								},
 							},
 						},
@@ -1466,8 +1482,38 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		if _, err := r.createOrUpdateNP(ctx, egressProxyNP); err != nil {
 			return fmt.Errorf("create or update egress-proxy NetworkPolicy: %w", err)
 		}
+	} else if err := r.cleanupEgressProxyNetpol(ctx, loop); err != nil {
+		return err
 	}
 
+	return nil
+}
+
+// cleanupEgressProxyNetpol (I42c review P2) deletes the egress proxy
+// NetworkPolicy when the egress proxy is no longer expected (the network
+// allows went away). I42b's cleanupEgressProxy deletes the pod and Service; the
+// netpol must go too, or it is drift the reconciler should own (and, with the
+// P1 update fix, it would otherwise keep a stale except list). A FOREIGN netpol
+// occupying the name is left alone (I2/I42b never-take-over: only delete when
+// the netpol is controlled by this Loop).
+func (r *LoopReconciler) cleanupEgressProxyNetpol(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	np := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: loop.Name + "-egress-proxy-netpol"}, np)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get egress proxy NetworkPolicy %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	if !metav1.IsControlledBy(np, loop) {
+		// Foreign object: leave it alone (never take over, I2/I42b).
+		return nil
+	}
+	if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete egress proxy NetworkPolicy %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	logf.FromContext(ctx).Info("cleaned up egress proxy NetworkPolicy (no network allows)",
+		"networkPolicy", np.Name, "loop", loop.Name)
 	return nil
 }
 
@@ -1479,7 +1525,20 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 // slices compose on the same label.
 
 func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
+	// I42c review P1: the desired spec must be applied inside the mutate
+	// func. controllerutil.CreateOrUpdate first Gets the live object into np
+	// (overwriting the spec we built), then runs the mutate; a no-op mutate
+	// sees DeepEqual(existing, obj) and returns OperationResultNone, freezing
+	// an existing NetworkPolicy's spec on the first reconcile (adds/removes
+	// of network allows and POD_CIDR/SERVICE_CIDR changes would never
+	// propagate). Capture the desired spec beforehand and re-assert it.
+	desired := np.DeepCopy()
 	return controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+		np.Spec = *desired.Spec.DeepCopy()
+		if np.Labels == nil {
+			np.Labels = map[string]string{}
+		}
+		maps.Copy(np.Labels, desired.Labels)
 		return nil
 	})
 }
@@ -1512,23 +1571,15 @@ func dnsPorts() []networkingv1.NetworkPolicyPort {
 }
 
 // egressCarveOutCIDRs is the except list for the egress proxy's external
-// egress ipBlock (0.0.0.0/0 minus these). It carves out the RFC1918 / loopback
-// / link-local / multicast / reserved ranges plus the cluster's POD_CIDR and
-// SERVICE_CIDR (from the operator's config, not per-Loop discovery), mirroring
-// the egress binary's own resolved-IP carve-outs (I42a) so the two layers
-// agree. An empty POD_CIDR / SERVICE_CIDR contributes no entry (the operator
-// was not configured with those CIDRs).
+// egress ipBlock (0.0.0.0/0 minus these). It is DERIVED from
+// internal/egress.CarveOutCIDRsV4 (the egress binary's own resolved-IP
+// carve-outs, I42a) plus the cluster's POD_CIDR and SERVICE_CIDR (from the
+// operator's config, not per-Loop discovery), so the netpol layer and the
+// egress binary layer cannot drift (I42c review P2: a second hand-written v4
+// list had already lost 100.64.0.0/10). An empty POD_CIDR / SERVICE_CIDR
+// contributes no entry (the operator was not configured with those CIDRs).
 func egressCarveOutCIDRs(podCIDR, serviceCIDR string) []string {
-	cidrs := []string{
-		"10.0.0.0/8",     // RFC1918
-		"172.16.0.0/12",  // RFC1918
-		"192.168.0.0/16", // RFC1918
-		"0.0.0.0/8",      // reserved / 0.0.0.0
-		"224.0.0.0/4",    // multicast
-		"240.0.0.0/4",    // reserved
-		"169.254.0.0/16", // link-local
-		"127.0.0.0/8",    // loopback
-	}
+	cidrs := append([]string{}, egress.CarveOutCIDRsV4()...)
 	if podCIDR != "" {
 		cidrs = append(cidrs, podCIDR)
 	}
@@ -1802,6 +1853,20 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if r.ServiceCIDR == "" {
 		r.ServiceCIDR = os.Getenv("SERVICE_CIDR")
+	}
+	// I42c review P2: validate the CIDRs. A v6 or comma-separated dual-stack
+	// value, or a typo, would be put into a v4 ipBlock.except entry; the API
+	// server would reject the NetworkPolicy and every reconcile would error.
+	// Fail fast at startup instead (fail-closed: an invalid value must not be
+	// silently dropped into the netpol).
+	for name, val := range map[string]string{"POD_CIDR": r.PodCIDR, "SERVICE_CIDR": r.ServiceCIDR} {
+		if val == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(val)
+		if err != nil || !p.Addr().Is4() {
+			return fmt.Errorf("%s must be a single IPv4 CIDR (got %q; err: %v)", name, val, err)
+		}
 	}
 	// P3 (I42e review): make an unset CIDR config visible. When either is
 	// empty the IP-in-pod/service-CIDR cases of findInClusterNetworkAllow are

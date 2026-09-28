@@ -21,9 +21,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
+	netip "net/netip"
 	neturl "net/url"
 	"os"
 	"strconv"
@@ -32,6 +34,7 @@ import (
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
@@ -427,6 +430,18 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				if !egressReady {
 					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 				}
+			}
+			// I42c review P2 (round 3): the NetworkPolicy gate must be
+			// ORDER-INDEPENDENT (ensureSandbox runs before ensureNetworkPolicy,
+			// so the conflict set there would flap the next reconcile back to
+			// Running). Read the live objects: hold Suspended when any of this
+			// Loop's netpol names exists and is NOT controlled by the Loop
+			// (same gate pattern as D35a). Absent netpols are not a conflict
+			// (ensureNetworkPolicy creates them); a real read error FAILS CLOSED
+			// (Suspended), consistent with needsEgressProxy.
+			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
+				foreignNetPols(ctx, r, loop) {
+				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 			}
 		}
 		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
@@ -1269,6 +1284,19 @@ func hadEgressConflict(loop *coxv1alpha1.Loop) bool {
 	return false
 }
 
+// hadNetpolConflict reports whether the Loop has an active
+// NetworkPolicyConflict=True/ForeignNetworkPolicy condition (I42c: the
+// clearing at the end of ensureNetworkPolicy must only fire when a conflict
+// was previously recorded, otherwise it would write a spurious Resolved).
+func hadNetpolConflict(loop *coxv1alpha1.Loop) bool {
+	for _, c := range loop.Status.Conditions {
+		if c.Type == "NetworkPolicyConflict" && c.Status == metav1.ConditionTrue && c.Reason == "ForeignNetworkPolicy" {
+			return true
+		}
+	}
+	return false
+}
+
 // cleanupEgressProxy deletes the egress proxy pod + Service when the effective
 // policy has no network allows (I42b). No-op when they don't exist.
 func (r *LoopReconciler) cleanupEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
@@ -1311,12 +1339,36 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	loopName := loop.Name
 	agentLabels := agentPodLabels(loopName)
 	proxyL := proxyLabels(loopName)
+	egressProxyL := egressProxyLabels(loopName)
 	proxyPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: proxyL},
+	}
+	egressProxyPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: egressProxyL},
 	}
 	agentPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
 	}
+	// I42c: the agent's egress to the egress proxy is expected only when the
+	// egress proxy is expected (network allows present); with no network
+	// allows the agent's egress stays model-proxy + DNS (D34).
+	egressExpected := needsEgressProxy(ctx, r, loop)
+	agentEgress := []networkingv1.NetworkPolicyEgressRule{
+		{
+			To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+		},
+	}
+	if egressExpected {
+		agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
+			To:    []networkingv1.NetworkPolicyPeer{egressProxyPeer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(egressProxyPort), Protocol: new(corev1.ProtocolTCP)}},
+		})
+	}
+	agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
+		To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+		Ports: dnsPorts(),
+	})
 
 	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
 	// none" — the agent pod must be unreachable from every other pod,
@@ -1330,6 +1382,25 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// allowlist at the HTTP CONNECT / SNI / Host layer (ADR-0007, "I42
 	// resolution"). Until that slice lands, agent egress stays proxy + DNS
 	// (fail-closed).
+	// I42c review P2 (round 2): a FOREIGN NetworkPolicy of the same name is
+	// never overwritten. A conflict (errForeignNetpol from createOrUpdateNP)
+	// sets NetworkPolicyConflict=True/ForeignNetworkPolicy and holds the
+	// sandbox Suspended (fail-closed: the agent's netpol may not be the one
+	// the operator built). Reconcile does not error-loop: the sandbox gate in
+	// ensureSandbox (order-independent, round 3) is what actually holds it
+	// Suspended across reconciles; a non-conflict error below still returns
+	// and requeues.
+	var foreignConflict bool
+	mapForeign := func(npName string, err error) error {
+		if !errors.Is(err, errForeignNetpol) {
+			return err
+		}
+		foreignConflict = true
+		setCondition(loop, "NetworkPolicyConflict", metav1.ConditionTrue, "ForeignNetworkPolicy",
+			"NetworkPolicy "+npName+" exists but is not controlled by this Loop; left untouched")
+		return nil
+	}
+
 	agentNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-agent-netpol",
@@ -1339,23 +1410,13 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			PodSelector: metav1.LabelSelector{MatchLabels: agentLabels},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress:     []networkingv1.NetworkPolicyIngressRule{},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{
-					To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
-					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
-				},
-				{
-					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
-					Ports: dnsPorts(),
-				},
-			},
+			Egress:      agentEgress,
 		},
 	}
-	if err := controllerutil.SetControllerReference(loop, agentNP, r.Scheme); err != nil {
-		return fmt.Errorf("set owner ref on agent NetworkPolicy: %w", err)
-	}
-	if _, err := r.createOrUpdateNP(ctx, agentNP); err != nil {
-		return fmt.Errorf("create or update agent NetworkPolicy: %w", err)
+	if _, err := r.createOrUpdateNP(ctx, loop, agentNP); err != nil {
+		if merr := mapForeign(agentNP.Name, err); merr != nil {
+			return merr
+		}
 	}
 
 	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, egress
@@ -1394,13 +1455,156 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			})
 		}
 	}
-	if err := controllerutil.SetControllerReference(loop, proxyNP, r.Scheme); err != nil {
-		return fmt.Errorf("set owner ref on proxy NetworkPolicy: %w", err)
-	}
-	if _, err := r.createOrUpdateNP(ctx, proxyNP); err != nil {
-		return fmt.Errorf("create or update proxy NetworkPolicy: %w", err)
+	if _, err := r.createOrUpdateNP(ctx, loop, proxyNP); err != nil {
+		if merr := mapForeign(proxyNP.Name, err); merr != nil {
+			return merr
+		}
 	}
 
+	// I42c: the egress proxy NetworkPolicy is created only when the egress
+	// proxy is expected (network allows present). Ingress: only from this
+	// Loop's agent on 3128. Egress: the external world with carve-outs (the
+	// proxy dials any port the allow specifies; the application layer enforces
+	// the port) + DNS to kube-dns.
+	if egressExpected {
+		egressProxyNP := &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      loopName + "-egress-proxy-netpol",
+				Namespace: ns,
+			},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: egressProxyL},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+				Ingress: []networkingv1.NetworkPolicyIngressRule{
+					{
+						From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+						Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(egressProxyPort), Protocol: new(corev1.ProtocolTCP)}},
+					},
+				},
+				Egress: []networkingv1.NetworkPolicyEgressRule{
+					{
+						// Egress rule 1: external v4 with carve-outs (no port
+						// restriction). The except list is derived from the egress
+						// binary's own resolved-IP carve-outs (I42a,
+						// egress.CarveOutCIDRsV4) plus the cluster's POD_CIDR and
+						// SERVICE_CIDR (from the operator's config), so the two
+						// layers cannot drift.
+						To: []networkingv1.NetworkPolicyPeer{
+							{
+								IPBlock: &networkingv1.IPBlock{
+									CIDR:   "0.0.0.0/0",
+									Except: egressCarveOutCIDRs(r.PodCIDR, r.ServiceCIDR),
+								},
+							},
+						},
+					},
+					{
+						// Egress rule 1b (I42c review P3): the v6 mirror (plan's
+						// "v6 mirror" rule) so an allowed host that resolves
+						// AAAA-first works on a dual-stack cluster. Derived from the
+						// egress binary's v6 carve-outs (egress.CarveOutCIDRsV6).
+						To: []networkingv1.NetworkPolicyPeer{
+							{
+								IPBlock: &networkingv1.IPBlock{
+									CIDR:   "::/0",
+									Except: egress.CarveOutCIDRsV6(),
+								},
+							},
+						},
+					},
+					{
+						To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+						Ports: dnsPorts(),
+					},
+				},
+			},
+		}
+		if _, err := r.createOrUpdateNP(ctx, loop, egressProxyNP); err != nil {
+			if merr := mapForeign(egressProxyNP.Name, err); merr != nil {
+				return merr
+			}
+		}
+	}
+
+	// I42c: clean up the egress proxy NetworkPolicy when the egress proxy is
+	// no longer expected (the network allows went away). (The egress proxy
+	// netpol is created only when egressExpected, above; cleanup runs in the
+	// ELSE branch — a call inside the if-block would delete the netpol just
+	// created.)
+	if !egressExpected {
+		if merr := r.cleanupEgressProxyNetpol(ctx, loop); merr != nil {
+			return merr
+		}
+	}
+
+	// I42c review P2 (round 3): the conflict is resolved once no createOrUpdateNP
+	// hit a foreign netpol this reconcile. Clear NetworkPolicyConflict to
+	// False/Resolved when it was previously True and no conflict ran (the
+	// hadEgressConflict pattern); the live-objects gate in ensureSandbox is the
+	// source of truth for suspension, so a stale condition cannot wedge it.
+	if !foreignConflict && hadNetpolConflict(loop) {
+		setCondition(loop, "NetworkPolicyConflict", metav1.ConditionFalse, "Resolved",
+			"all per-Loop NetworkPolicies are controlled by this Loop")
+	}
+	if foreignConflict {
+		if err := r.Status().Update(ctx, loop); err != nil {
+			return fmt.Errorf("update Loop status (NetworkPolicyConflict): %w", err)
+		}
+		return nil
+	}
+	return nil
+}
+
+// foreignNetPols reports whether any of this Loop's NetworkPolicies exists
+// and is NOT controlled by the Loop (I42c review P2 round 3: the sandbox
+// gate that holds the sandbox Suspended on a foreign netpol must be
+// order-independent of ensureNetworkPolicy, so it reads the live objects
+// itself). It fails CLOSED on a real read error (true: hold Suspended;
+// consistent with needsEgressProxy): the reconcile requeues on the same
+// error, so a transient failure is not terminal. An ABSENT netpol is not a
+// conflict (ensureNetworkPolicy creates it).
+func foreignNetPols(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
+	for _, name := range []string{loop.Name + "-agent-netpol", loop.Name + "-proxy-netpol", loop.Name + "-egress-proxy-netpol"} {
+		np := &networkingv1.NetworkPolicy{}
+		err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, np)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return true
+		}
+		if !metav1.IsControlledBy(np, loop) {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanupEgressProxyNetpol (I42c review P2) deletes the egress proxy
+// NetworkPolicy when the egress proxy is no longer expected (the network
+// allows went away). I42b's cleanupEgressProxy deletes the pod and Service; the
+// netpol must go too, or it is drift the reconciler should own (and, with the
+// P1 update fix, it would otherwise keep a stale except list). A FOREIGN netpol
+// occupying the name is left alone (I2/I42b never-take-over: only delete when
+// the netpol is controlled by this Loop).
+func (r *LoopReconciler) cleanupEgressProxyNetpol(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	np := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: loop.Name + "-egress-proxy-netpol"}, np)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get egress proxy NetworkPolicy %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	if !metav1.IsControlledBy(np, loop) {
+		// Foreign object: leave it alone (never take over, I2/I42b).
+		return nil
+	}
+	if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete egress proxy NetworkPolicy %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	logf.FromContext(ctx).Info("cleaned up egress proxy NetworkPolicy (no network allows)",
+		"networkPolicy", np.Name, "loop", loop.Name)
 	return nil
 }
 
@@ -1411,8 +1615,42 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 // C6b's KubeArmorPolicy selector also keys on coxswain.io/loop, so the two
 // slices compose on the same label.
 
-func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
+// createOrUpdateNP creates or updates a NetworkPolicy.
+//
+// I42c review P2 (round 2): the fixed createOrUpdateNP re-asserts the desired
+// spec on an existing NetworkPolicy; it must NOT do so for a FOREIGN object
+// occupying the name (the P1 fix would otherwise overwrite someone else's
+// netpol with the Loop's). When the live object exists and is not controlled
+// by the Loop, the mutate returns errForeignNetpol (sentinel) and the object
+// is left untouched; the caller maps the sentinel to a NetworkPolicyConflict
+// condition and holds the sandbox Suspended.
+var errForeignNetpol = errors.New("NetworkPolicy is owned by another controller (foreign)")
+
+func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, loop *coxv1alpha1.Loop, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
+	// I42c review P1: the desired spec must be applied inside the mutate
+	// func. controllerutil.CreateOrUpdate first Gets the live object into np
+	// (overwriting the spec we built), then runs the mutate; a no-op mutate
+	// sees DeepEqual(existing, obj) and returns OperationResultNone, freezing
+	// an existing NetworkPolicy's spec on the first reconcile (adds/removes
+	// of network allows and POD_CIDR/SERVICE_CIDR changes would never
+	// propagate). Capture the desired spec beforehand and re-assert it.
+	desired := np.DeepCopy()
 	return controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+		// P2 (round 2): a foreign netpol of the same name is left untouched
+		// (never take over, I2/I42b). controllerutil.CreateOrUpdate has
+		// populated np's object meta from the Get, so np.CreationTimestamp
+		// is zero only when it was the one we just created.
+		if !np.CreationTimestamp.IsZero() && !metav1.IsControlledBy(np, loop) {
+			return errForeignNetpol
+		}
+		if err := controllerutil.SetControllerReference(loop, np, r.Scheme); err != nil {
+			return fmt.Errorf("set owner ref on NetworkPolicy %s: %w", np.Name, err)
+		}
+		np.Spec = *desired.Spec.DeepCopy()
+		if np.Labels == nil {
+			np.Labels = map[string]string{}
+		}
+		maps.Copy(np.Labels, desired.Labels)
 		return nil
 	})
 }
@@ -1442,6 +1680,25 @@ func dnsPorts() []networkingv1.NetworkPolicyPort {
 		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
 		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
 	}
+}
+
+// egressCarveOutCIDRs is the except list for the egress proxy's external
+// egress ipBlock (0.0.0.0/0 minus these). It is DERIVED from
+// internal/egress.CarveOutCIDRsV4 (the egress binary's own resolved-IP
+// carve-outs, I42a) plus the cluster's POD_CIDR and SERVICE_CIDR (from the
+// operator's config, not per-Loop discovery), so the netpol layer and the
+// egress binary layer cannot drift (I42c review P2: a second hand-written v4
+// list had already lost 100.64.0.0/10). An empty POD_CIDR / SERVICE_CIDR
+// contributes no entry (the operator was not configured with those CIDRs).
+func egressCarveOutCIDRs(podCIDR, serviceCIDR string) []string {
+	cidrs := append([]string{}, egress.CarveOutCIDRsV4()...)
+	if podCIDR != "" {
+		cidrs = append(cidrs, podCIDR)
+	}
+	if serviceCIDR != "" {
+		cidrs = append(cidrs, serviceCIDR)
+	}
+	return cidrs
 }
 
 // modelPeer is the NetworkPolicy peer for the proxy's model egress (P1-4,
@@ -1629,11 +1886,14 @@ func (r *LoopReconciler) ensureProxyAndNetPolicies(ctx context.Context, loop *co
 	return !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions), nil
 }
 
-// ensureNetPoliciesIfConfigured creates the per-Loop NetworkPolicies when a
-// model endpoint is configured (D34). A no-op when endpointSecretRef is
-// absent.
+// ensureNetPoliciesIfConfigured creates the per-Loop NetworkPolicies when
+// they are expected: a model endpoint is configured (D34: the model proxy and
+// the agent NetworkPolicies are only useful when there is a model to reach),
+// or the effective policy has network allows (I42c: the egress proxy and its
+// NetworkPolicy are expected). A no-op when neither is the case (nothing to
+// allow-egress to).
 func (r *LoopReconciler) ensureNetPoliciesIfConfigured(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if loop.Spec.Agent.EndpointSecretRef == "" {
+	if loop.Spec.Agent.EndpointSecretRef == "" && !needsEgressProxy(ctx, r, loop) {
 		return nil
 	}
 	return r.ensureNetworkPolicy(ctx, loop)
@@ -1705,6 +1965,20 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if r.ServiceCIDR == "" {
 		r.ServiceCIDR = os.Getenv("SERVICE_CIDR")
+	}
+	// I42c review P2: validate the CIDRs. A v6 or comma-separated dual-stack
+	// value, or a typo, would be put into a v4 ipBlock.except entry; the API
+	// server would reject the NetworkPolicy and every reconcile would error.
+	// Fail fast at startup instead (fail-closed: an invalid value must not be
+	// silently dropped into the netpol).
+	for name, val := range map[string]string{"POD_CIDR": r.PodCIDR, "SERVICE_CIDR": r.ServiceCIDR} {
+		if val == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(val)
+		if err != nil || !p.Addr().Is4() {
+			return fmt.Errorf("%s must be a single IPv4 CIDR (got %q; err: %v)", name, val, err)
+		}
 	}
 	// P3 (I42e review): make an unset CIDR config visible. When either is
 	// empty the IP-in-pod/service-CIDR cases of findInClusterNetworkAllow are

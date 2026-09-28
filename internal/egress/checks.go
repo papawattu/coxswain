@@ -90,6 +90,33 @@ var carveOutCIDRs = []string{
 	"64:ff9b::/96",
 }
 
+// CarveOutCIDRsV4 returns the standard non-allowlisted IPv4 ranges (the v4
+// subset of carveOutCIDRs). Callers build NetworkPolicy ipBlock except lists
+// from this so the netpol layer cannot drift from the egress binary's
+// resolved-IP carve-outs (I42c review: a second hand-written v4 list had
+// already lost 100.64.0.0/10).
+func CarveOutCIDRsV4() []string {
+	out := make([]string, 0, len(carveOutCIDRs))
+	for _, c := range carveOutCIDRs {
+		if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is4() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// CarveOutCIDRsV6 returns the standard non-allowlisted IPv6 ranges (the v6
+// subset of carveOutCIDRs), for the same drift-free netpol except lists.
+func CarveOutCIDRsV6() []string {
+	out := make([]string, 0, len(carveOutCIDRs))
+	for _, c := range carveOutCIDRs {
+		if p, err := netip.ParsePrefix(c); err == nil && !p.Addr().Is4() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // IPInCarveOuts reports whether ip falls in the standard non-allowlisted
 // (in-cluster / private / loopback / link-local / CGNAT) ranges — the same
 // list the egress proxy uses to reject resolved IPs (CheckResolvedIP) — plus

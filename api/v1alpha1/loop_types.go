@@ -154,6 +154,23 @@ type CurrentVerifyStatus struct {
 	VerifiedCommit string `json:"verifiedCommit,omitempty"`
 }
 
+// PolicyStatus is the operator's record of the effective AgentPolicy for the
+// agent (ADR-0007 Q2). It is set by the operator only; the agent has no write
+// path to it.
+type PolicyStatus struct {
+	// effectiveHash is the SHA-256 of the canonical effective allows (the union
+	// of the allows across every AgentPolicy the Loop references, with the
+	// platform-minimum endpoints). It lets the decision audit show what the agent
+	// was allowed to do in each iteration (D32). Empty when no policy is applied.
+	// +optional
+	EffectiveHash string `json:"effectiveHash,omitempty"`
+
+	// blockedCount is the number of actions the engine has blocked for this Loop
+	// (ADR-0007 Q5 / C8). It is derived by the operator from the engine's alert
+	// stream; a relay outage must surface as "unknown", not zero (I32). +optional
+	BlockedCount *int64 `json:"blockedCount,omitempty"`
+}
+
 // LoopSettings holds the loop-level knobs.
 type LoopSettings struct {
 	// maxIterations caps the plan→implement→verify cycles.
@@ -244,6 +261,12 @@ type LoopSpec struct {
 	// +optional
 	Agent AgentConfig `json:"agent,omitempty"`
 
+	// policyRefs is the list of AgentPolicy names (in the Loop's namespace) whose
+	// allows the agent may use. The effective policy is the union of their allows
+	// (ADR-0007 Q2). With no policyRefs the agent runs default-deny (the platform
+	// minimum only). +optional
+	PolicyRefs []string `json:"policyRefs,omitempty"`
+
 	// loop holds iteration and phase-timeout settings.
 	// +optional
 	// +kubebuilder:default={}
@@ -314,6 +337,13 @@ type LoopStatus struct {
 	// observedGeneration is the spec generation last reconciled.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// policy is the operator's record of the effective AgentPolicy for the
+	// agent (ADR-0007 Q2): the union of the allows across every AgentPolicy the
+	// Loop references (spec.policyRefs[]). effectiveHash is the SHA-256 of the
+	// canonical effective allows, so the decision audit shows what the agent was
+	// allowed to do (D32); it is set by the operator, never the agent. +optional
+	Policy *PolicyStatus `json:"policy,omitempty"`
 }
 
 // +kubebuilder:object:root=true

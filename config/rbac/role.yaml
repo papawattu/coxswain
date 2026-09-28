@@ -25,6 +25,14 @@ rules:
 - apiGroups:
   - coxswain.wattu.com
   resources:
+  - agentpolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - coxswain.wattu.com
+  resources:
   - loops
   verbs:
   - create

@@ -18,17 +18,26 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
+
+	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
@@ -50,6 +59,15 @@ const (
 	// readOnlyMode is the default file mode for the model-creds Secret volume
 	// (0444: the key is read-only, even in the proxy).
 	readOnlyMode int32 = 0o444
+
+	// The agent's writable mount points. Single source of truth for the pod spec;
+	// the AgentPolicy exec XValidation (api/v1alpha1/agentpolicy_types.go) MUST
+	// stay in sync with this set — a CRD CEL rule cannot reference Go code, so
+	// adding a mount here without updating the XValidation would silently make
+	// the new mount a spoofable exec target.
+	agentWorkspaceMount = "/workspace"
+	agentScratchMount   = "/scratch"
+	agentTmpMount       = "/tmp"
 )
 
 // LoopReconciler reconciles a Loop object.
@@ -75,6 +93,7 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -82,6 +101,34 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
 		// Deleted or never existed: nothing to do.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
+	// creating the sandbox (defence in depth: the CRD CEL catches the common
+	// case at admission; this catches anything that slips through, including
+	// missing/unreadable policies). If validation fails, set
+	// PolicyValid=False and suspend the sandbox (if running).
+	if polResult := r.validateAgentPolicies(ctx, &loop); !polResult.valid {
+		setCondition(&loop, "PolicyValid", metav1.ConditionFalse, polResult.reason, polResult.message)
+		// Suspend an already-running sandbox (D30-gate pattern): set
+		// operatingMode to 0 so the sandbox pod is scaled down.
+		if err := r.suspendSandboxIfRunning(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Status().Update(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		if polResult.transientReadError {
+			// Requeue: the policy could not be read due to a transient
+			// error. Retry after a short delay.
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+	// Clean pass: set PolicyValid=True (R15 round 3: nothing ever set it
+	// True before, so a fixed path left the old False condition forever).
+	if len(loop.Spec.PolicyRefs) > 0 {
+		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
 	}
 
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
@@ -143,8 +190,24 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, TamperedVerifyReason,
+			setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
 				"a protected path changed between baseCommit and verifiedCommit; terminal")
+			changed = true
+		}
+	}
+	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
+	// union of the allows across every AgentPolicy the Loop references
+	// (spec.policyRefs[]). The operator computes the hash and stores it in
+	// status.policy.effectiveHash so the decision audit shows what the agent was
+	// allowed to do (D32); the hash is over the union, not stored allows.
+	if effectiveHash, found, err := r.effectivePolicyHash(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	} else if found {
+		if loop.Status.Policy == nil {
+			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+		}
+		if loop.Status.Policy.EffectiveHash != effectiveHash {
+			loop.Status.Policy.EffectiveHash = effectiveHash
 			changed = true
 		}
 	}
@@ -155,6 +218,37 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// effectivePolicyHash computes the canonical hash of the Loop's effective
+// AgentPolicy (C6a): the union of the allows across every AgentPolicy the Loop
+// references (spec.policyRefs[]). It returns the hash and whether any policy
+// was applied (false when policyRefs is empty — the default-deny minimum). A
+// referenced AgentPolicy that does not exist is an error (the operator must not
+// silently run an agent with a narrower policy than the Loop declared).
+func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+	if len(loop.Spec.PolicyRefs) == 0 {
+		return "", false, nil
+	}
+	union := policy.EffectivePolicy{}
+	for _, name := range loop.Spec.PolicyRefs {
+		var ap coxv1alpha1.AgentPolicy
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
+			return "", false, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+		}
+		// P1 (R15): the CEL XValidation can't reject non-canonical paths (CRD CEL
+		// cost budget), so the controller rejects them here before they reach the
+		// effective policy or the eBPF engine. A path with '..' or '//' or a
+		// trailing '/' is non-canonical and could resolve to a writable mount
+		// after normalization.
+		// Non-canonical exec paths are rejected by findNonCanonicalExecPath
+		// before ensureSandbox (R15 round 2: the check runs before the sandbox
+		// is created, and sets a condition rather than an error-requeue).
+		union.Exec = append(union.Exec, ap.Spec.Exec...)
+		union.Network = append(union.Network, ap.Spec.Network...)
+		union.Files = append(union.Files, ap.Spec.Files...)
+	}
+	return policy.EffectiveHash(union), true, nil
 }
 
 // ensureSandbox creates the Loop's Sandbox if it does not already exist, and
@@ -277,11 +371,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: "workspace", MountPath: "/workspace"},
-				{Name: "scratch", MountPath: "/scratch"},
+				{Name: "workspace", MountPath: agentWorkspaceMount},
+				{Name: "scratch", MountPath: agentScratchMount},
 				// P1 (R13): a writable /tmp so go build / mktemp / any tool that
 				// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
-				{Name: "tmp", MountPath: "/tmp"},
+				{Name: "tmp", MountPath: agentTmpMount},
 			},
 		}
 		podContainers := []corev1.Container{agentContainer}
@@ -331,6 +425,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
 		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
 		// rather than filling the node. 500+350+100 = 950Mi < 1Gi.
+		// writableMountPaths is the single source of truth for the agent's writable
+		// mount points; the AgentPolicy exec XValidation hard-codes the same set
+		// (a CRD CEL rule cannot reference Go code), so adding a mount here MUST
+		// also update the XValidation in api/v1alpha1/agentpolicy_types.go or the
+		// new mount would silently become a spoofable exec target.
+		writableMountPaths := []string{agentWorkspaceMount, agentScratchMount, agentTmpMount}
+		_ = writableMountPaths // single source of truth (see comment)
 		desired.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
 			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				SizeLimit: newLimit("500Mi"),
@@ -501,10 +602,10 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 // is the terminal phase (e.g. "Failed") so each terminal outcome is recorded
 // once with its reason (e.g. TamperedVerify). It is the operator's audit record
 // (ADR-0004); the runner never writes it.
-func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status metav1.ConditionStatus, reason, message string) {
+func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
 	now := metav1.Now()
 	for i := range loop.Status.Conditions {
-		if loop.Status.Conditions[i].Type == string(condType) {
+		if loop.Status.Conditions[i].Type == condType {
 			if loop.Status.Conditions[i].Reason == reason &&
 				loop.Status.Conditions[i].Message == message &&
 				loop.Status.Conditions[i].Status == status {
@@ -518,7 +619,7 @@ func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status
 		}
 	}
 	loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
-		Type:               string(condType),
+		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
@@ -545,11 +646,158 @@ func (r *LoopReconciler) proxyImage() string {
 	return "docker.io/library/golang:1.26"
 }
 
+// loopPolicyRefsFieldIndex is a field index on Loop.spec.policyRefs, used by
+// the AgentPolicy watch's map function to efficiently find the Loops that
+// reference a given AgentPolicy (R15 round 4 P2).
+const loopPolicyRefsFieldIndex = "spec.policyRefs"
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
+	// watch's map function uses this index to find the Loops that reference
+	// a given AgentPolicy, avoiding a namespace-wide list per event).
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &coxv1alpha1.Loop{}, loopPolicyRefsFieldIndex,
+		func(obj client.Object) []string {
+			loop, ok := obj.(*coxv1alpha1.Loop)
+			if !ok {
+				return nil
+			}
+			return loop.Spec.PolicyRefs
+		}); err != nil {
+		return fmt.Errorf("index Loop.spec.policyRefs: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&coxv1alpha1.Loop{}).
 		Owns(&sandboxv1beta1.Sandbox{}).
+		// Watch AgentPolicy: when a referenced policy is created, edited, or
+		// deleted, re-reconcile the Loops that reference it (R15 round 4 P2:
+		// a policy created after its Loop must not leave the Loop stuck at
+		// PolicyNotFound; a policy edit must refresh the recorded hash).
+		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
+			r.agentPolicyToLoopRequests)).
 		Named("loop").
 		Complete(r)
+}
+
+// agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace
+// whose spec.policyRefs contains its name. Used by the AgentPolicy watch to
+// re-reconcile the affected Loops when the policy changes (R15 round 4 P2).
+// The field index on spec.policyRefs (registered in SetupWithManager and in
+// the envtest suite) makes this an O(1) lookup.
+func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	ap, ok := obj.(*coxv1alpha1.AgentPolicy)
+	if !ok {
+		return nil
+	}
+	loops := &coxv1alpha1.LoopList{}
+	if err := r.List(ctx, loops,
+		client.InNamespace(ap.Namespace),
+		client.MatchingFields{loopPolicyRefsFieldIndex: ap.Name},
+	); err != nil {
+		logf.FromContext(ctx).Error(err, "list Loops by policyRefs index for AgentPolicy watch",
+			"policy", ap.Name, "namespace", ap.Namespace)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(loops.Items))
+	for i := range loops.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: loops.Items[i].Namespace,
+				Name:      loops.Items[i].Name,
+			},
+		})
+	}
+	return requests
+}
+
+// suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it
+// is currently Running. Called when a Loop's AgentPolicy becomes invalid
+// (R15 round 3: an already-running sandbox must be suspended, not left
+// as-is). If the sandbox doesn't exist, this is a no-op.
+func (r *LoopReconciler) suspendSandboxIfRunning(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	sb := &sandboxv1beta1.Sandbox{}
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
+	if err := r.Get(ctx, key, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // no sandbox to suspend
+		}
+		return fmt.Errorf("get sandbox %s: %w", key, err)
+	}
+	if sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
+		return nil // already suspended
+	}
+	sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	if err := r.Update(ctx, sb); err != nil {
+		return fmt.Errorf("suspend sandbox %s: %w", key, err)
+	}
+	logf.FromContext(ctx).Info("suspended sandbox (policy invalid)", "sandbox", sandboxName(loop.Name), "loop", loop.Name)
+	return nil
+}
+
+// policyValidationResult is the outcome of validating a Loop's referenced
+// AgentPolicies before the sandbox is created or the eBPF engine is reached.
+type policyValidationResult struct {
+	// valid is true when all referenced policies exist and have canonical
+	// exec paths.
+	valid bool
+	// reason is the metav1.ConditionReason (NonCanonicalExecPath or
+	// PolicyNotFound) when valid is false.
+	reason string
+	// message is the human-readable explanation.
+	message            string
+	transientReadError bool
+}
+
+// validateAgentPolicies checks that every referenced AgentPolicy exists and
+// has canonical exec paths. Returns a policyValidationResult. The
+// transientReadError field is true when the policy could not be read due to a
+// transient error (not a NotFound), in which case the caller should requeue.
+// R15 round 3: a missing or unreadable referenced policy is treated as
+// not-valid (PolicyNotFound), not ignored (fail-closed).
+// Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
+func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
+	for _, name := range loop.Spec.PolicyRefs {
+		ap := &coxv1alpha1.AgentPolicy{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
+			if apierrors.IsNotFound(err) {
+				return policyValidationResult{valid: false, reason: "PolicyNotFound",
+					message: fmt.Sprintf("AgentPolicy %s/%s not found (referenced by policyRefs)", loop.Namespace, name)}
+			}
+			// Unreadable (transient error): fail closed, requeue.
+			return policyValidationResult{valid: false, reason: "PolicyNotFound",
+				message:            fmt.Sprintf("AgentPolicy %s/%s could not be read: %v", loop.Namespace, name, err),
+				transientReadError: true}
+		}
+		for _, e := range ap.Spec.Exec {
+			if isNonCanonicalPath(e) {
+				return policyValidationResult{valid: false, reason: "NonCanonicalExecPath",
+					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
+			}
+		}
+	}
+	return policyValidationResult{valid: true}
+}
+
+// isNonCanonicalPath returns true if the path is non-canonical: it contains
+// a '.' or '..' segment, a '//' (double slash), or ends with a '/'. The eBPF
+// engine and the filesystem normalize such paths, so a non-canonical path
+// that looks outside the writable mounts could resolve to one (e.g.
+// "/usr/../tmp/git" or "/./tmp/git"). The CRD CEL XValidation catches the
+// common case at admission (with items:MaxLength bounding the string length);
+// the controller is the second line of defence (catches everything).
+func isNonCanonicalPath(p string) bool {
+	if strings.Contains(p, "..") {
+		return true
+	}
+	// Catch '.' segments: "/./tmp/git" resolves to "/tmp/git".
+	if strings.Contains(p, "/./") {
+		return true
+	}
+	if strings.Contains(p, "//") {
+		return true
+	}
+	if len(p) > 1 && strings.HasSuffix(p, "/") {
+		return true
+	}
+	return false
 }

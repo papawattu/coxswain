@@ -124,6 +124,9 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 		|| echo "(could not pre-load $(AGENT_SANDBOX_CONTROLLER_IMAGE); the node will pull it)"
 	@echo "Waiting for the agent-sandbox controller to be ready..."
 	kubectl rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=120s
+	@echo "Building and loading the proxy stand-in image ($(PROXY_IMG)) into the kind node..."
+	$(MAKE) proxy-build
+	$(KIND) load docker-image "$(PROXY_IMG)" --name $(KIND_CLUSTER)
 
 .PHONY: kind-smoke
 kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True
@@ -179,9 +182,9 @@ run: manifests generate fmt vet ## Run a controller from your host.
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t ${IMG} .
 
-# Build the D33/D34 proxy stand-in image. Used by the kind e2e and by
-# make kind-up / deploy-dev. The image is loaded into the kind cluster
-# via `kind load docker-image coxswain-proxy:standin`.
+# Build the D33/D34 proxy stand-in image. Wired into kind-up so a fresh
+# cluster always has the image loaded. Override PROXY_IMG to build a
+# different tag (e.g. for a specific test run).
 PROXY_IMG ?= coxswain-proxy:standin
 .PHONY: proxy-build
 proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).

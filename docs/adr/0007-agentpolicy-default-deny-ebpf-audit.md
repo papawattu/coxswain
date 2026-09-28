@@ -251,14 +251,20 @@ model-egress peer is understood as the outer fence (port-level), with the
 D35 KubeArmor policy providing the inner fence (hostname-level).
 
 **AgentPolicy network allows (D34, R17 P2):** the agent's `AgentPolicy`
-`spec.network` allows (e.g. `proxy.golang.org:443`) are NOT yet translated
-into the agent NetworkPolicy's egress rules. AgentPolicy (C6a, PR #7) is not
+`spec.network` allows (e.g. `proxy.golang.org:443`) are NOT translated into
+the agent NetworkPolicy's egress rules. AgentPolicy (C6a, PR #7) is not
 merged on the D34 branch, so `spec.policyRefs` and the AgentPolicy type are
-unavailable. When C6a merges, the operator must read each referenced
-AgentPolicy's `spec.network` and add **port-only** egress rules (NetworkPolicy
-cannot match hostnames). The hostname-level precision is the D35 KubeArmor
-agent policy (`matchDNSQueries`). Until then, an AgentPolicy network allow
-has no effect on the NetworkPolicy — the agent reaches only the proxy and
-DNS. This is fail-closed (the safe direction) but the feature is silently
-incomplete; the user gets no signal. The gap is tracked here and must be
-closed when C6a + D35 merge.
+unavailable. Until then, the agent's egress is proxy + DNS only (fail-closed).
+
+**Open design question — I42 (docs/REVIEW-PHASE1-R14.md):** how to express
+AgentPolicy network allows in a NetworkPolicy. The naive approach — a
+**port-only** egress rule (e.g. port 443, no peer) — is **not acceptable**:
+NetworkPolicy cannot match hostnames, so a port-only rule is "any host on
+443," which is the exfiltration path (the agent can reach any host on 443,
+including an attacker's DNS/DoT server). The hostname-level precision must
+come from a layer that CAN match DNS names: the D35 KubeArmor agent policy
+(`matchDNSQueries`). Until I42 is resolved, agent egress stays proxy + DNS.
+When C6a merges and I42 is resolved, the operator should set a
+`NetworkAllowsNotEnforced` condition on the Loop if it has AgentPolicy
+network allows that are not yet enforced by the NetworkPolicy, so the user
+gets a signal that the allows are not active.

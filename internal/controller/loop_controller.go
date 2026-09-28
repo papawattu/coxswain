@@ -115,6 +115,23 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// R17 R18: the require-pair (endpointSecretRef and modelEndpoint must be
+	// set together) is enforced at admission by a CEL rule on AgentConfig
+	// (has(self.endpointSecretRef) == has(self.modelEndpoint)). The controller
+	// check below is a second line of defence (e.g. for Loops created before
+	// the CRD update, or if the CEL budget changes). It runs BEFORE
+	// ensureSandbox so a bad Loop never gets a sandbox pod. The condition
+	// type is ModelConfigValid (not PolicyValid — this is about the model
+	// endpoint configuration, not the AgentPolicy).
+	if loop.Spec.Agent.EndpointSecretRef != "" && loop.Spec.Agent.ModelEndpoint == "" {
+		setCondition(&loop, "ModelConfigValid", "False", "MissingModelEndpoint",
+			"endpointSecretRef is set but modelEndpoint is empty; both must be provided together")
+		if err := r.Status().Update(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -123,19 +140,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// configured (P1 parity: no half-configured proxy). Created after the
 	// sandbox so the agent's COX_MODEL_BASE_URL target exists in the same pass.
 	if loop.Spec.Agent.EndpointSecretRef != "" {
-		// R17 P1: endpointSecretRef and modelEndpoint must be set together.
-		// A Loop with a Secret but no endpoint would crash-loop the proxy
-		// (MODEL_ENDPOINT empty → log.Fatal). Reject at the controller level
-		// (the CEL Pattern validates the SHAPE of modelEndpoint, but cannot
-		// express a cross-field require-pair rule).
-		if loop.Spec.Agent.ModelEndpoint == "" {
-			setCondition(&loop, "PolicyValid", "False", "MissingModelEndpoint",
-				"endpointSecretRef is set but modelEndpoint is empty; both must be provided together")
-			if err := r.Status().Update(ctx, &loop); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
 		if err := r.ensureProxy(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -564,17 +568,15 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// none" — the agent pod must be unreachable from every other pod,
 	// including other Loops' agents), egress to this Loop's proxy + DNS.
 	//
-	// P2 (R17): the AgentPolicy `network` allows are NOT yet translated
-	// into egress rules. AgentPolicy (C6a, PR #7) is not merged on this
-	// branch, so `loop.Spec.PolicyRefs` and the AgentPolicy type are not
-	// available. When C6a merges, the operator must read each referenced
-	// AgentPolicy's `spec.network` and add port-only egress rules for
-	// each allow (NetworkPolicy cannot match hostnames — the host-level
-	// precision is D35's KubeArmor agent policy). Until then, an
-	// AgentPolicy network allow has no effect on the NetworkPolicy (the
-	// agent reaches only the proxy and DNS). This is fail-closed (the
-	// safe direction) but the feature is silently incomplete; the gap is
-	// recorded in ADR-0007.
+	// P2 (R17 R18): the AgentPolicy `network` allows are NOT translated
+	// into egress rules. The naive port-only approach is rejected (I42,
+	// docs/REVIEW-PHASE1-R14.md): a port-only rule is "any host on that
+	// port," which is the exfiltration path. The hostname-level precision
+	// must come from D35's KubeArmor agent policy (matchDNSQueries). Until
+	// I42 is resolved, agent egress stays proxy + DNS. When C6a merges and
+	// I42 is resolved, the operator should set a NetworkAllowsNotEnforced
+	// condition on the Loop if it has AgentPolicy network allows that are
+	// not yet enforced. The gap is recorded in ADR-0007.
 	agentNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-agent-netpol",

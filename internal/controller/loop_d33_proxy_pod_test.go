@@ -81,6 +81,13 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 	}
 
 	buildLoopWithSecret := func(name, ns, secretName string) *coxv1alpha1.Loop {
+		// The CEL require-pair (has(self.endpointSecretRef) == has(self.modelEndpoint))
+		// means both fields must be set or both must be absent. When secretName
+		// is empty, ModelEndpoint is also empty (a Loop with no model config).
+		modelEndpoint := ""
+		if secretName != "" {
+			modelEndpoint = d34ModelEndpoint
+		}
 		return &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
@@ -90,7 +97,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 					Image:             runnerImage,
 					Model:             testModel,
 					EndpointSecretRef: secretName,
-					ModelEndpoint:     d34ModelEndpoint,
+					ModelEndpoint:     modelEndpoint,
 				},
 			},
 		}
@@ -375,10 +382,15 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		proxyPod := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cleanLoopProxy}, proxyPod)).To(Succeed())
 
-		// Remove the endpointSecretRef from the Loop.
+		// Remove the endpointSecretRef from the Loop. The CEL require-pair
+		// (has(self.endpointSecretRef) == has(self.modelEndpoint)) also
+		// requires clearing modelEndpoint (immutable fields can't be set to
+		// empty after creation, so this Update is only valid because the
+		// CEL rule allows the pair to both be absent).
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "clean-loop"}, loop)).To(Succeed())
 		loop.Spec.Agent.EndpointSecretRef = ""
+		loop.Spec.Agent.ModelEndpoint = ""
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
 
 		// Reconcile: cleanupProxy should delete the proxy pod + Service.

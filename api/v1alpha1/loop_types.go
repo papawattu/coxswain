@@ -168,6 +168,8 @@ type LoopSettings struct {
 // base URL + API key and is mounted only into the model-proxy sidecar; the
 // agent container is hardened (no SA token automount, runAsNonRoot, drop all
 // caps, seccomp, read-only rootfs) and talks to the model over localhost.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.endpointSecretRef) == has(self.modelEndpoint)",message="endpointSecretRef and modelEndpoint must be set together (a Loop with a model Secret must also name the model endpoint)"
 type AgentConfig struct {
 	// image is the agent container image (e.g. the reference conformance runner
 	// or an adapter for an external agent). Required when agent is set.

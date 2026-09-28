@@ -142,6 +142,10 @@ spec:
                       rule: self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1])
                         <= 65535
                 type: object
+                x-kubernetes-validations:
+                - message: endpointSecretRef and modelEndpoint must be set together
+                    (a Loop with a model Secret must also name the model endpoint)
+                  rule: has(self.endpointSecretRef) == has(self.modelEndpoint)
               goal:
                 description: goal is the natural-language objective for this Loop.
                 minLength: 1

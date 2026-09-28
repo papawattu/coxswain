@@ -90,6 +90,19 @@ var carveOutCIDRs = []string{
 	"64:ff9b::/96",
 }
 
+// IPInCarveOuts reports whether ip falls in the standard non-allowlisted
+// (in-cluster / private / loopback / link-local / CGNAT) ranges — the same
+// list the egress proxy uses to reject resolved IPs (CheckResolvedIP) — plus
+// any operator-supplied extraCIDRs (the operator's pod/service CIDRs). It is
+// the authoritative "is this IP an in-cluster target" range check, shared so
+// the controller's I42e AgentPolicy validation (internal/policy) and the
+// egress proxy's runtime resolved-IP check reject the same set.
+//
+// An unparseable IP is rejected (fail-closed): it is reported as in-cluster.
+func IPInCarveOuts(ip net.IP, extraCIDRs []string) bool {
+	return inCarveOuts(ip, append(append([]string{}, carveOutCIDRs...), extraCIDRs...))
+}
+
 // CheckResolvedIP reports whether the proxy may dial the resolved IP: it is
 // dialable only if it is NOT in a standard private/link-local/loopback/CGNAT
 // range. This is the resolved-IP check (SSRF defence) from the ADR — the

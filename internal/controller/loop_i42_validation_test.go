@@ -267,18 +267,23 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 		}
 	})
 
-	It("rejects loopback / unspecified / link-local IP forms (review P3)", func() {
-		// P3: the first layer rejects the well-known loopback / unspecified /
-		// link-local forms outright, not just localhost / 127.0.0.1. The egress
-		// proxy's resolved-IP check (I42a) is the backstop for rebinding /
-		// split-horizon, but these forms should be caught here too.
+	It("rejects loopback / unspecified / link-local / CGNAT / multicast IP forms (review P2/P3)", func() {
+		// P3 + P2(range): the first layer rejects the non-allowlisted IP ranges
+		// by range (egress.IPInCarveOuts OR the Go range predicates), not a fixed
+		// string list — so 127.0.0.3, 169.254.1.1, [fe80::1], [fd12::1], CGNAT
+		// 100.64.1.1, and IPv6 site-local multicast [ff02::1] are all caught.
+		// The egress proxy's resolved-IP check (I42a) is the backstop for
+		// rebinding / split-horizon, but these forms are caught here too.
 		for _, a := range []string{
 			"localhost:8080", "127.0.0.1:443", "127.0.0.0:443", "127.0.0.2:80",
-			"127.0.0.255:80", "127.255.255.255:80", "0.0.0.0:80",
-			"169.254.0.0:80", "169.254.169.254:80", "[::1]:443", "[::]:443",
+			"127.0.0.3:80", "127.0.0.255:80", "127.255.255.255:80", "0.0.0.0:80",
+			"169.254.0.0:80", "169.254.1.1:80", "169.254.169.254:80",
+			"[::1]:443", "[::]:443", "[fe80::1]:443", "[fd12::1]:443",
+			"[ff02::1]:443", "100.64.1.1:443", "192.168.1.10:443",
+			"255.255.255.255:80", "224.0.0.1:443",
 		} {
 			offending, ok := r.findInClusterNetworkAllow([]string{a})
-			Expect(ok).To(BeTrue(), "%s must be rejected as an in-cluster loopback/unspecified/link-local form", a)
+			Expect(ok).To(BeTrue(), "%s must be rejected as an in-cluster non-allowlisted IP range", a)
 			Expect(offending).To(Equal(a))
 		}
 	})
@@ -314,17 +319,34 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 		Expect(ok).To(BeFalse(), "a malformed entry (no port) is skipped")
 	})
 
-	It("returns false when the reconciler has no CIDRs configured", func() {
-		// When PodCIDR / ServiceCIDR are empty (operator config not set),
-		// the CIDR cases are skipped (fail-open on a misconfigured CIDR is
-		// wrong; the CRD CEL rule still catches .svc / localhost).
+	It("skips only the operator-CIDR case when the reconciler has no CIDRs configured", func() {
+		// When PodCIDR / ServiceCIDR are empty (operator config not set), the
+		// operator-CIDR case is skipped. Use an IP in a NON-standard range
+		// (TEST-NET-3) so it is flagged only via the operator's explicit CIDR,
+		// not the standard range check (which now always runs, correctly
+		// fail-closed, for 127/8 / RFC1918 / link-local / CGNAT / multicast).
 		rNoCIDR := &LoopReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			// PodCIDR / ServiceCIDR are empty.
 		}
-		_, ok := rNoCIDR.findInClusterNetworkAllow([]string{"10.244.0.5:8080"})
+		_, ok := rNoCIDR.findInClusterNetworkAllow([]string{"203.0.113.5:8080"})
 		Expect(ok).To(BeFalse(),
-			"with no CIDRs configured, the CIDR check is skipped (the CRD CEL rule still catches .svc / localhost)")
+			"with no operator CIDRs configured, an IP outside the standard ranges is not flagged by the operator-CIDR case")
+		// ...and it IS flagged once the operator carves out that range.
+		rWithCIDR := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), PodCIDR: "203.0.113.0/24"}
+		_, ok = rWithCIDR.findInClusterNetworkAllow([]string{"203.0.113.5:8080"})
+		Expect(ok).To(BeTrue(),
+			"with the operator's pod CIDR configured, an IP in that CIDR is flagged")
+	})
+
+	It("still catches standard-range IPs even with no operator CIDRs (fail-closed)", func() {
+		// The standard-range check (loopback / RFC1918 / link-local / CGNAT /…
+		// multicast) runs regardless of the operator CIDR config — a 10.x pod
+		// IP is in-cluster whether or not the operator told us the pod CIDR.
+		rNoCIDR := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, ok := rNoCIDR.findInClusterNetworkAllow([]string{"10.244.0.5:8080"})
+		Expect(ok).To(BeTrue(),
+			"an IP in a standard private range is in-cluster regardless of the operator CIDR config")
 	})
 })

@@ -5,6 +5,10 @@ import (
 	"testing"
 )
 
+// testPodCIDR is the operator pod CIDR shared by the carve-out tests so the
+// literal is not repeated (goconst).
+const testPodCIDR = "10.200.0.0/16"
+
 // CheckResolvedIP is the SSRF backstop (ADR-0007 I42 resolution): before the
 // proxy dials, every resolved IP must fall outside the non-allowlisted
 // private, link-local, loopback, and cluster-internal ranges. The dial goes to
@@ -67,7 +71,7 @@ func TestCheckResolvedIP(t *testing.T) {
 // CIDR may be a public-looking range on some configs, so the operator must be
 // able to carve it out explicitly).
 func TestCheckResolvedIPCIDRCarveOuts(t *testing.T) {
-	carve := []string{"10.200.0.0/16", "10.96.0.0/12"} // pod + service CIDRs
+	carve := []string{testPodCIDR, "10.96.0.0/12"} // pod + service CIDRs
 	tests := []struct {
 		name string
 		ip   string
@@ -83,6 +87,41 @@ func TestCheckResolvedIPCIDRCarveOuts(t *testing.T) {
 			ip := net.ParseIP(tc.ip)
 			if got := CheckResolvedIPWithCarveOuts(ip, carve); got != tc.want {
 				t.Fatalf("CheckResolvedIPWithCarveOuts(%s) = %v; want %v", tc.ip, got, tc.want)
+			}
+		})
+	}
+}
+
+// IPInCarveOuts is the exported form of the same range check the controller's
+// I42e AgentPolicy validation (internal/policy) reuses. It must reject the
+// same non-allowlisted set CheckResolvedIP rejects (no extra operator CIDRs),
+// plus any operator-supplied extraCIDRs.
+func TestIPInCarveOuts(t *testing.T) {
+	tests := []struct {
+		name       string
+		ip         string
+		extra      []string
+		inCarveOut bool // true = in-cluster / non-allowlisted
+	}{
+		{"public", "151.101.0.223", nil, false},
+		{"loopback 127/8", "127.0.0.3", nil, true},
+		{"link-local metadata", "169.254.1.1", nil, true},
+		{"CGNAT", "100.64.1.1", nil, true},
+		{"v6 loopback", "::1", nil, true},
+		{"v6 link-local", "fe80::1", nil, true},
+		{"v6 ULA", "fd12::1", nil, true},
+		{"v6 unspecified", "::", nil, true},
+		{"public not in operator CIDR", "8.8.8.8", []string{testPodCIDR}, false},
+		{"in operator pod CIDR", "10.200.5.5", []string{testPodCIDR}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("bad test IP %q", tc.ip)
+			}
+			if got := IPInCarveOuts(ip, tc.extra); got != tc.inCarveOut {
+				t.Fatalf("IPInCarveOuts(%s, %v) = %v; want %v", tc.ip, tc.extra, got, tc.inCarveOut)
 			}
 		})
 	}

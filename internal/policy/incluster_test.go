@@ -66,13 +66,20 @@ func TestFindInClusterNetworkAllow(t *testing.T) {
 		}
 	}
 
-	// P3: loopback / unspecified / link-local IP forms (rejected at the first
-	// layer regardless of the CIDR config).
+	// P3 + P2(range): loopback / unspecified / link-local / CGNAT / NAT64 /
+	// reserved IP forms, caught by the range check (egress.IPInCarveOuts), not a
+	// fixed string list — so 127.0.0.3, 169.254.1.1, [fe80::1], [fd12::1] are
+	// all rejected. Rejected at the first layer regardless of the CIDR config.
 	loopbackCases := []string{
 		"localhost:8080", "127.0.0.1:443", "127.0.0.0:443",
-		"127.0.0.2:80", "127.0.0.255:80", "127.255.255.255:80",
-		"0.0.0.0:80", "169.254.0.0:80", "169.254.169.254:80",
-		"[::1]:443", "[::]:443",
+		"127.0.0.2:80", "127.0.0.3:80", "127.0.0.255:80", "127.255.255.255:80",
+		"0.0.0.0:80", "0.1.2.3:80",
+		"169.254.0.0:80", "169.254.1.1:80", "169.254.169.254:80",
+		"[::1]:443", "[::]:443", "[fe80::1]:443", "[fd12::1]:443",
+		"[fc00::abcd]:443", "[64:ff9b::1.1.2.3]:443", "[ff02::1]:443",
+		"100.64.1.1:443",                                     // CGNAT
+		"192.168.1.10:443", "172.16.5.5:443", "10.0.0.7:443", // RFC1918
+		"255.255.255.255:80", "224.0.0.1:443", // broadcast / multicast
 	}
 	for _, a := range loopbackCases {
 		got, ok := FindInClusterNetworkAllow([]string{a}, "", "")
@@ -93,12 +100,13 @@ func TestFindInClusterNetworkAllow(t *testing.T) {
 		allow     string
 		inCluster bool
 	}{
-		{"10.244.0.5:8080", true},  // pod CIDR
-		{"10.244.99.99:443", true}, // pod CIDR
-		{"10.96.0.1:443", true},    // service CIDR
-		{"10.96.255.255:80", true}, // service CIDR
-		{"8.8.8.8:443", false},     // public
-		{"1.1.1.1:53", false},      // public
+		{"10.244.0.5:8080", true},    // pod CIDR
+		{"10.244.99.99:443", true},   // pod CIDR
+		{"10.96.0.1:443", true},      // service CIDR
+		{"10.96.255.255:80", true},   // service CIDR
+		{"8.8.8.8:443", false},       // public
+		{"1.1.1.1:53", false},        // public
+		{"93.184.216.34:443", false}, // public (example.com)
 	}
 	for _, c := range cidrCases {
 		got, ok := FindInClusterNetworkAllow([]string{c.allow}, podCIDR, serviceCIDR)
@@ -110,11 +118,19 @@ func TestFindInClusterNetworkAllow(t *testing.T) {
 		}
 	}
 
-	// CIDR cases are skipped when the operator config is unset (the name and
-	// loopback checks still run).
-	_, ok := FindInClusterNetworkAllow([]string{"10.244.0.5:8080"}, "", "")
+	// The operator-CIDR-only case is skipped when the operator config is unset.
+	// Use an IP in a NON-standard range (TEST-NET-3) that is only flagged via
+	// the operator's explicit CIDR — with no CIDRs configured it must not be
+	// flagged. (Standard-range IPs like 10.244.0.5 are now always caught by
+	// the range check, correctly fail-closed, even without operator CIDRs.)
+	_, ok := FindInClusterNetworkAllow([]string{"203.0.113.5:8080"}, "", "")
 	if ok {
-		t.Error("with no CIDRs configured, an IP-in-CIDR allow must NOT be flagged (the CRD CEL rule + egress proxy backstop cover it)")
+		t.Error("with no operator CIDRs configured, an IP outside the standard ranges must NOT be flagged")
+	}
+	// ...and it IS flagged once the operator carves out that range.
+	_, ok = FindInClusterNetworkAllow([]string{"203.0.113.5:8080"}, "203.0.113.0/24", "")
+	if !ok {
+		t.Error("with the operator's pod CIDR configured, an IP in that CIDR must be flagged")
 	}
 
 	// Malformed entries (no port) are skipped.

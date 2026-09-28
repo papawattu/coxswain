@@ -185,6 +185,8 @@ type LoopSettings struct {
 // base URL + API key and is mounted only into the model-proxy sidecar; the
 // agent container is hardened (no SA token automount, runAsNonRoot, drop all
 // caps, seccomp, read-only rootfs) and talks to the model over localhost.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.endpointSecretRef) == has(self.modelEndpoint)",message="endpointSecretRef and modelEndpoint must be set together (a Loop with a model Secret must also name the model endpoint)"
 type AgentConfig struct {
 	// image is the agent container image (e.g. the reference conformance runner
 	// or an adapter for an external agent). Required when agent is set.
@@ -206,6 +208,21 @@ type AgentConfig struct {
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="endpointSecretRef is immutable (the proxy pod's spec.volumes cannot change)"
 	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
+
+	// modelEndpoint is the model server's in-cluster address (host:port,
+	// e.g. "vllm:8000"). It is NOT secret — only the API key is. D34 uses it
+	// to build the proxy pod's NetworkPolicy egress rule (NetworkPolicy
+	// cannot match DNS names, only pod/namespace selectors or IP blocks).
+	// Immutable for the same reason as endpointSecretRef: it changes the
+	// proxy NetworkPolicy, and the D33 spec-hash contract keeps things
+	// simple by not allowing post-creation changes.
+	//
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf || self == ''",message="modelEndpoint is immutable"
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$"
+	// +kubebuilder:validation:XValidation:rule="self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1]) <= 65535",message="modelEndpoint port must be 1-65535"
+	ModelEndpoint string `json:"modelEndpoint,omitempty"`
 
 	// env carries literal-only environment variables for the agent container
 	// (I34: a valueFrom/secretKeyRef form is not expressible here, so a Loop

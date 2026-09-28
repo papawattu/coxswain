@@ -33,6 +33,10 @@ kind load docker-image coxswain:dev --name coxswain
 # enforcement is proven).
 make deploy-dev IMG=coxswain:dev
 
+# The proxy stand-in image is built and loaded by `make kind-up` (the
+# default proxyImage for a Loop with a model endpoint is coxswain-proxy:standin).
+# If you build it manually: make proxy-build && kind load docker-image coxswain-proxy:standin --name coxswain
+
 kubectl rollout status deploy/coxswain-controller-manager -n coxswain-system
 ```
 

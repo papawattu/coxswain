@@ -263,3 +263,42 @@ operated. They amend the Q3 install story, not the ADR's decisions.
   `spec.policyRefs[]`; KubeArmor over Tetragon; JSON-lines envelope; two-layer
   egress) are the **reviewer's** recommendations and are overridable by the
   owner — recorded here as recommendations, not settled.
+
+## Known limit: NetworkPolicy cannot match DNS names (D34, alongside I41)
+
+Kubernetes `NetworkPolicy` selects by pod/namespace labels or IP blocks, not
+by DNS name. For the proxy's model egress rule (D34), this means:
+
+- An **in-cluster** endpoint (a same-namespace Service name like `vllm:8000`)
+  is expressed as a same-namespace podSelector — which admits **any** pod in
+  that namespace on the model port, not just the target Service. The
+  hostname-level precision (only `vllm`, not `other-service`) is enforced by
+  the proxy's **KubeArmor** policy (D35), which CAN match the DNS query
+  domain.
+- An **external** endpoint (FQDN that does not resolve to an in-cluster IP)
+  cannot be expressed in a NetworkPolicy at all. The model egress rule is
+  omitted (fail-closed) and the hostname-level allow belongs to the
+  KubeArmor proxy policy.
+
+This is recorded here so that the D34 NetworkPolicy's coarser-grained
+model-egress peer is understood as the outer fence (port-level), with the
+D35 KubeArmor policy providing the inner fence (hostname-level).
+
+**AgentPolicy network allows (D34, R17 P2):** the agent's `AgentPolicy`
+`spec.network` allows (e.g. `proxy.golang.org:443`) are NOT translated into
+the agent NetworkPolicy's egress rules. AgentPolicy (C6a, PR #7) is not
+merged on the D34 branch, so `spec.policyRefs` and the AgentPolicy type are
+unavailable. Until then, the agent's egress is proxy + DNS only (fail-closed).
+
+**Open design question — I42 (docs/REVIEW-PHASE1-R14.md):** how to express
+AgentPolicy network allows in a NetworkPolicy. The naive approach — a
+**port-only** egress rule (e.g. port 443, no peer) — is **not acceptable**:
+NetworkPolicy cannot match hostnames, so a port-only rule is "any host on
+443," which is the exfiltration path (the agent can reach any host on 443,
+including an attacker's DNS/DoT server). The hostname-level precision must
+come from a layer that CAN match DNS names: the D35 KubeArmor agent policy
+(`matchDNSQueries`). Until I42 is resolved, agent egress stays proxy + DNS.
+When C6a merges and I42 is resolved, the operator should set a
+`NetworkAllowsNotEnforced` condition on the Loop if it has AgentPolicy
+network allows that are not yet enforced by the NetworkPolicy, so the user
+gets a signal that the allows are not active.

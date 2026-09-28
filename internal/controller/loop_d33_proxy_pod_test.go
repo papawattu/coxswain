@@ -64,6 +64,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 					Image:             runnerImage,
 					Model:             testModel,
 					EndpointSecretRef: d33ModelCredsSecret,
+					ModelEndpoint:     d34ModelEndpoint,
 				},
 			},
 		}
@@ -80,16 +81,20 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 	}
 
 	buildLoopWithSecret := func(name, ns, secretName string) *coxv1alpha1.Loop {
+		agent := coxv1alpha1.AgentConfig{
+			Image:             runnerImage,
+			Model:             testModel,
+			EndpointSecretRef: secretName,
+		}
+		if secretName != "" {
+			agent.ModelEndpoint = d34ModelEndpoint
+		}
 		return &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      loopGoal,
 				Workspace: testWorkspace(),
-				Agent: coxv1alpha1.AgentConfig{
-					Image:             runnerImage,
-					Model:             testModel,
-					EndpointSecretRef: secretName,
-				},
+				Agent:     agent,
 			},
 		}
 	}
@@ -256,13 +261,13 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		Expect(p.Labels).NotTo(HaveKey("coxswain.io/loop"),
 			"P1: the proxy pod must not carry the agent's coxswain.io/loop label")
 		Expect(p.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
-		Expect(p.Labels).To(HaveKeyWithValue("coxswain.io/proxy-for", name))
+		Expect(p.Labels).To(HaveKeyWithValue(netpolProxyForLabel, name))
 
 		// The Service selects ONLY the proxy labels.
 		svc := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, svc)).To(Succeed())
 		Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "model-proxy"))
-		Expect(svc.Spec.Selector).To(HaveKeyWithValue("coxswain.io/proxy-for", name))
+		Expect(svc.Spec.Selector).To(HaveKeyWithValue(netpolProxyForLabel, name))
 		Expect(svc.Spec.Selector).NotTo(HaveKey("coxswain.io/loop"))
 
 		// Note: the sandbox pod's coxswain.io/loop label is set by the
@@ -315,8 +320,8 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "drift-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:      "dummy-key",
-				"MODEL_BASE_URL": "http://fake-endpoint:8000",
+				modelAPIKey:  "dummy-key",
+				modelBaseURL: "http://fake-endpoint:8000",
 			},
 		}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
@@ -377,6 +382,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "clean-loop"}, loop)).To(Succeed())
 		loop.Spec.Agent.EndpointSecretRef = ""
+		loop.Spec.Agent.ModelEndpoint = ""
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
 
 		// Reconcile: cleanupProxy should delete the proxy pod + Service.
@@ -403,8 +409,8 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 				Name:      "unowned-loop-proxy",
 				Namespace: ns,
 				Labels: map[string]string{
-					"app.kubernetes.io/component": "model-proxy",
-					"coxswain.io/proxy-for":       "unowned-loop",
+					netpolComponentLabel: "model-proxy",
+					netpolProxyForLabel:  "unowned-loop",
 				},
 				Annotations: map[string]string{
 					proxySpecHashAnnotation: "stale-hash-000000",
@@ -444,7 +450,7 @@ func isOwnedByLoop(obj metav1.Object, loopName string) bool {
 var _ = Describe("D33 proxy image", func() {
 	It("defaults to the working stand-in when ProxyImage is unset", func() {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		Expect(r.proxyImage()).To(Equal("docker.io/library/golang:1.26"))
+		Expect(r.proxyImage()).To(Equal("coxswain-proxy:standin"))
 	})
 
 	It("honours the ProxyImage override", func() {

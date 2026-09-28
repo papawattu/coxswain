@@ -123,7 +123,29 @@ spec:
                     description: model is the model name/identifier the proxy uses
                       when calling the endpoint.
                     type: string
+                  modelEndpoint:
+                    description: |-
+                      modelEndpoint is the model server's in-cluster address (host:port,
+                      e.g. "vllm:8000"). It is NOT secret — only the API key is. D34 uses it
+                      to build the proxy pod's NetworkPolicy egress rule (NetworkPolicy
+                      cannot match DNS names, only pod/namespace selectors or IP blocks).
+                      Immutable for the same reason as endpointSecretRef: it changes the
+                      proxy NetworkPolicy, and the D33 spec-hash contract keeps things
+                      simple by not allowing post-creation changes.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: modelEndpoint is immutable
+                      rule: self == oldSelf || self == ''
+                    - message: modelEndpoint port must be 1-65535
+                      rule: self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1])
+                        <= 65535
                 type: object
+                x-kubernetes-validations:
+                - message: endpointSecretRef and modelEndpoint must be set together
+                    (a Loop with a model Secret must also name the model endpoint)
+                  rule: has(self.endpointSecretRef) == has(self.modelEndpoint)
               goal:
                 description: goal is the natural-language objective for this Loop.
                 minLength: 1

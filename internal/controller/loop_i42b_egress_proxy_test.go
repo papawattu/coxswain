@@ -35,6 +35,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -50,7 +51,8 @@ const (
 	// i42b test constants.
 	i42bPolicyName     = "i42b-pol"
 	i42bTestRepo       = "https://github.com/papawattu/coxswain.git"
-	i42bExternalAllow  = "proxy.golang.org:443"
+	i42bExternalAllow  = i42eExternalHost
+	i42bConfLoopName   = "egconf-loop"
 	i42bPodCIDR        = "10.244.0.0/16"
 	i42bServiceCIDR    = "10.96.0.0/12"
 	i42bEgressProxyImg = "coxswain-egress-proxy:standin"
@@ -261,17 +263,19 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "conflict-loop-egress-proxy"}, gotForeign)).To(Succeed(),
 			"the foreign egress proxy pod must NOT be deleted (I2 never-take-over)")
 
-		// The Loop must have a ProxyConflict condition.
+		// The Loop must have an EgressProxyConflict condition (P2 review: the
+		// egress proxy's conflict is a separate condition type from the model
+		// proxy's ProxyConflict, so the two never overwrite each other).
 		gotLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "conflict-loop"}, gotLoop)).To(Succeed())
 		var conflict *metav1.Condition
 		for i := range gotLoop.Status.Conditions {
-			if gotLoop.Status.Conditions[i].Type == "ProxyConflict" {
+			if gotLoop.Status.Conditions[i].Type == "EgressProxyConflict" {
 				conflict = &gotLoop.Status.Conditions[i]
 				break
 			}
 		}
-		Expect(conflict).ToNot(BeNil(), "ProxyConflict condition must be set")
+		Expect(conflict).ToNot(BeNil(), "EgressProxyConflict condition must be set")
 		Expect(conflict.Status).To(Equal(metav1.ConditionTrue))
 		Expect(conflict.Reason).To(Equal("ForeignEgressProxy"))
 
@@ -361,6 +365,102 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			Expect(pod.Labels["app.kubernetes.io/component"]).ToNot(Equal("agent"),
 				"the egress proxy pod must NOT carry the agent component label")
 		}
+	})
+
+	// spec 8 (P2 review): the egress proxy's conflict is a SEPARATE condition
+	// (EgressProxyConflict), so the model proxy's ProxyConflict (D35) and the
+	// egress proxy's conflict can never overwrite each other. A healthy model
+	// proxy (ProxyConflict=False/NoConflict) plus a FOREIGN egress proxy pod
+	// must keep EgressProxyConflict=True (ForeignEgressProxy) across two
+	// reconciles, without the healthy model proxy's NoConflict writing
+	// ProxyConflict=False over it.
+	It("keeps EgressProxyConflict=True (ForeignEgressProxy) across reconciles when a foreign egress proxy pod is present alongside a healthy model proxy", func() {
+		ns := "i42b-egconf-" + nowSuffix()
+		const loopName = i42bConfLoopName
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// The model creds Secret (required alongside endpointSecretRef).
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "egconf-creds", Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:  "key",
+				modelBaseURL: "http://fake-model:8000",
+			},
+		})).To(Succeed())
+
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42bPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+
+		// A Loop with BOTH a model endpoint (so the model proxy runs) and a
+		// network allow (so the egress proxy is expected). modelEndpoint and
+		// endpointSecretRef must be set together (CRD CEL rule).
+		loop := buildLoop(loopName, ns, []string{i42bPolicyName})
+		loop.Spec.Agent.ModelEndpoint = "fake-model:8000"
+		loop.Spec.Agent.EndpointSecretRef = "egconf-creds"
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Pre-create a FOREIGN pod with the egress proxy name (not owned by the Loop).
+		foreignPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      loopName + "-egress-proxy",
+				Namespace: ns,
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "foreign",
+					Image: i42bForeignImage,
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, foreignPod)).To(Succeed())
+
+		checkEgressConflict := func(reconcileNo int) {
+			gotLoop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, gotLoop)).To(Succeed())
+			var conflict *metav1.Condition
+			for i := range gotLoop.Status.Conditions {
+				if gotLoop.Status.Conditions[i].Type == "EgressProxyConflict" {
+					conflict = &gotLoop.Status.Conditions[i]
+					break
+				}
+			}
+			Expect(conflict).ToNot(BeNil(),
+				fmt.Sprintf("reconcile %d: the Loop must have an EgressProxyConflict condition when a foreign egress proxy pod is present", reconcileNo))
+			Expect(conflict.Status).To(Equal(metav1.ConditionTrue),
+				fmt.Sprintf("reconcile %d: EgressProxyConflict must stay True while the foreign pod is present (the healthy model proxy must not clear it)", reconcileNo))
+			Expect(conflict.Reason).To(Equal("ForeignEgressProxy"))
+		}
+
+		// Reconcile 1: the model proxy is ensured (healthy, no conflict) and the
+		// egress proxy name is occupied by a foreign pod.
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+		checkEgressConflict(1)
+
+		// Reconcile 2: the healthy model proxy's D35b path runs again and must
+		// NOT clear the egress conflict.
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+		checkEgressConflict(2)
+
+		// The model proxy's own condition is unaffected (False/NoConflict or
+		// True/ForeignProxy — in this fixture it is the controller's own proxy,
+		// so NoConflict/Resolved).
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, gotLoop)).To(Succeed())
+		var proxyConflict *metav1.Condition
+		for i := range gotLoop.Status.Conditions {
+			if gotLoop.Status.Conditions[i].Type == "ProxyConflict" {
+				proxyConflict = &gotLoop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(proxyConflict).ToNot(BeNil(), "the model proxy's ProxyConflict condition must still be present")
+		Expect(proxyConflict.Status).To(Equal(metav1.ConditionFalse),
+			"the healthy model proxy must report no conflict even while the egress proxy is foreign")
 	})
 
 	// spec 7: PolicyTranslationLossy condition when network allows are present.

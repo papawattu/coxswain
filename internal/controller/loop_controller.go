@@ -1195,11 +1195,14 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 
 	existingPod := &corev1.Pod{}
 	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: egressProxyPodName(loopName)}, existingPod)
-	// ProxyConflict: a foreign <loop>-egress-proxy must not be opened or deleted (I2).
+	// EgressProxyConflict (P2 review): a separate condition type from the model
+	// proxy's ProxyConflict (D35), so the two proxies never overwrite each
+	// other on a Loop that runs both. A foreign <loop>-egress-proxy must not be
+	// opened or deleted (I2).
 	if err == nil && !metav1.IsControlledBy(existingPod, loop) {
-		setCondition(loop, "ProxyConflict", metav1.ConditionTrue, "ForeignEgressProxy",
+		setCondition(loop, "EgressProxyConflict", metav1.ConditionTrue, "ForeignEgressProxy",
 			fmt.Sprintf("foreign egress proxy pod in %s/%s; sandbox held Suspended", ns, egressProxyPodName(loopName)))
-		log.Info("egress proxy pod is foreign; setting ProxyConflict",
+		log.Info("egress proxy pod is foreign; setting EgressProxyConflict",
 			"egressProxy", egressProxyPodName(loopName), "loop", loopName)
 		return nil
 	}
@@ -1226,16 +1229,17 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		return nil
 	}
 
-	// D35b pattern: clear ProxyConflict when the controller's own egress proxy is in place.
+	// D35b pattern: clear EgressProxyConflict when the controller's own egress
+	// proxy is in place (no foreign pod occupies the name).
 	if loop.Spec.PolicyRefs != nil {
 		hadConflict := false
 		for _, c := range loop.Status.Conditions {
-			if c.Type == "ProxyConflict" && c.Status == metav1.ConditionTrue && c.Reason == "ForeignEgressProxy" {
+			if c.Type == "EgressProxyConflict" && c.Status == metav1.ConditionTrue && c.Reason == "ForeignEgressProxy" {
 				hadConflict = true
 			}
 		}
 		if hadConflict {
-			setCondition(loop, "ProxyConflict", metav1.ConditionFalse, "Resolved",
+			setCondition(loop, "EgressProxyConflict", metav1.ConditionFalse, "Resolved",
 				"the foreign egress proxy pod is gone")
 		}
 	}

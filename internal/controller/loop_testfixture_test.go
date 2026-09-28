@@ -30,6 +30,10 @@ import (
 // git), so one shared constant avoids goconst churn.
 const testRepoURL = "https://example.com/repo.git"
 
+// agentPolicyExecGit is the exec allow the AgentPolicy test fixtures reference
+// (git), shared across the policy test files to avoid goconst churn.
+const agentPolicyExecGit = "/usr/bin/git"
+
 // testWorkspace returns a LoopSpec workspace pointing at the shared fixture
 // repo, so the individual test files don't each repeat the literal.
 func testWorkspace() coxv1alpha1.Workspace {
@@ -53,11 +57,10 @@ const (
 	loopGoal       = "make the failing test pass"
 	loopRepo       = testRepoURL
 	loopRef        = "main"
-	// runnerImage and testModel are shared test constants (goconst).
-	runnerImage   = "example.com/coxswain/runner:v1"
-	testModel     = "local-model"
-	sleepInfinity = "sleep infinity"
-	loopCheckCmd  = "go test ./..."
+	runnerImage    = "docker.io/library/golang:1.26"
+	testModel      = "local-model"
+	loopCheckCmd   = "go test ./..."
+	sleepInfinity  = "sleep infinity"
 
 	// agentContainerName is the name of the Loop's agent container in the
 	// Sandbox pod spec (goconst: it appears in several test files).

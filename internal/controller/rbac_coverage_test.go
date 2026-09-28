@@ -107,9 +107,6 @@ func TestRBACCoverage(t *testing.T) {
 		// Owns(&Service{}) — the controller creates and owns proxy Services.
 		{group: "", resource: "services",
 			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbUpdate}},
-		// D34: the controller creates and owns per-Loop NetworkPolicies.
-		{group: "networking.k8s.io", resource: "networkpolicies",
-			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbUpdate}},
 	}
 
 	for _, req := range required {

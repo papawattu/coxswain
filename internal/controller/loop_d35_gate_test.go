@@ -62,7 +62,8 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+			Enforcer: &fakeEnforcer{enforcing: true, reason: "Enforcing"}}
 		_ = k8sClient.Create(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: d35Namespace},
 		})

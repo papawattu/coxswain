@@ -112,10 +112,19 @@ AGENT_SANDBOX_MANIFEST ?= https://github.com/kubernetes-sigs/agent-sandbox/relea
 AGENT_SANDBOX_CONTROLLER_IMAGE ?= registry.k8s.io/agent-sandbox/agent-sandbox-controller:$(AGENT_SANDBOX_VERSION)
 
 PROXY_IMG ?= coxswain-proxy:standin
+EGRESS_IMG ?= coxswain-egress-proxy:standin
 
 .PHONY: proxy-build
 proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
 	$(CONTAINER_TOOL) build -t $(PROXY_IMG) -f cmd/proxy-standin/Dockerfile .
+
+.PHONY: egress-proxy-build
+egress-proxy-build: ## Build the egress proxy image (coxswain-egress-proxy:standin).
+	$(CONTAINER_TOOL) build -t $(EGRESS_IMG) -f cmd/egress-proxy/Dockerfile .
+
+.PHONY: egress-proxy-e2e
+egress-proxy-e2e: ## Run the I42a egress proxy kind e2e (real proxy, TLS + plain HTTP).
+	@bash test/e2e/egress-proxy.sh
 
 
 .PHONY: kind-up

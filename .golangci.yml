@@ -52,6 +52,17 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # QF1008 ("could remove embedded field from selector") is a style hint
+      # that is wrong in two places in cmd/egress-proxy: the relayConn.Read
+      # override MUST call r.Conn.SetReadDeadline/r.Conn.Read explicitly
+      # (calling r.SetReadDeadline/r.Read would recurse into the promoted
+      # method), and clientBuf.Reader.Buffered/Peek are unambiguous there
+      # (clientBuf.Buffered would be ambiguous between Reader's and the
+      # writer's promoted methods). Exclude the hint for the whole package.
+      - linters:
+          - staticcheck
+        path: cmd/egress-proxy/*
+        text: QF1008
     paths:
       - third_party$
       - builtin$

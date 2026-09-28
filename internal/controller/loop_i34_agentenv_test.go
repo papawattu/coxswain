@@ -36,7 +36,7 @@ var _ = Describe("I34: spec.agent.env is literal-only, no COX_* names", func() {
 				"goal": "do the thing",
 				"workspace": map[string]any{
 					"repo": "https://example.com/repo.git",
-					"ref":  "main",
+					"ref":  loopRef,
 				},
 				"verify": map[string]any{"acceptanceChecks": []any{"go test ./..."}},
 			},

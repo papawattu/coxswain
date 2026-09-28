@@ -23,9 +23,31 @@ import (
 // only ever allows; a Loop's effective policy is the union of the allows across
 // every AgentPolicy it references (spec.policyRefs[]).
 type AgentPolicySpec struct {
-	// exec is the commands the agent may run (e.g. "git", "go", "node"). An
-	// empty list means the agent may run no commands beyond the platform
-	// minimum (its own entrypoint). +optional
+	// exec is the commands the agent may run, as ABSOLUTE binary paths (e.g.
+	// "/usr/bin/git", "/usr/local/go/bin/go"). An empty list means the agent may
+	// run no commands beyond the platform minimum (its own entrypoint).
+	//
+	// Absolute paths are required (P1, ADR-0007 Q3): the agent has three writable
+	// mounts (/workspace, /scratch, /tmp), so a bare command name ("git") is
+	// spoofable — the agent could write its own /tmp/git that does anything and
+	// claim it is the allowed "git". The eBPF engine matches the binary by
+	// absolute path, so the allow must name a real binary outside the writable
+	// mounts.
+	//
+	// The XValidation rejects bare names (no leading /) and anything at or under
+	// the writable mounts (/workspace, /scratch, /tmp).
+	//
+	// P1 (R15): non-canonical paths that resolve to a writable mount after
+	// normalization ("//tmp/git", "/usr/../tmp/git") are NOT caught by this CEL
+	// rule — adding a !contains('..') check would push the CRD over the CEL cost
+	// budget (2.0x over). They ARE caught by the controller in
+	// effectivePolicyHash (isNonCanonicalPath), which rejects the Loop before it
+	// reaches the eBPF engine. The CRD is the first line of defence (catches the
+	// common case at admission); the controller is the second (catches everything).
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=512
+	// +kubebuilder:validation:XValidation:rule="self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.contains('/./') && !e.contains('/../') && !e.endsWith('/.') && !e.endsWith('/..') && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/') && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')",message="exec entries must be canonical absolute paths (no ., .., //, trailing /) at or outside the writable mounts"
 	Exec []string `json:"exec,omitempty"`
 
 	// network is the host:port endpoints the agent may reach (e.g.
@@ -44,10 +66,12 @@ type AgentPolicySpec struct {
 // AgentPolicyStatus defines the observed state of an AgentPolicy.
 type AgentPolicyStatus struct {
 	// generation is the spec generation this status was computed from (so the
-	// operator can tell a status is stale). +optional
+	// operator can tell a status is stale).
+	// +optional
 	Generation int64 `json:"generation,omitempty"`
 
-	// observedGeneration is the last processed generation. +optional
+	// observedGeneration is the last processed generation.
+	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 

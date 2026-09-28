@@ -22,9 +22,9 @@ package policy
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"slices"
-	"strings"
 )
 
 // Allow-type constants. The engine (C6b) maps these onto its own rule types.
@@ -137,14 +137,30 @@ func Translate(p EffectivePolicy) EnginePolicy {
 // platform-minimum endpoints (localhost for the agent, the model endpoint for
 // the proxy) are NOT part of the hash — they are always present and not the
 // user's policy; the hash is over the user's effective allows only.
+// EffectiveHash computes a canonical hash of the effective policy.
+// R15 P3: the old form (strings.Join with ",") collided on entries containing
+// a comma (["a,b"] and ["a","b"] both produced "a,b"). The fix hashes a
+// canonical JSON encoding of the sorted struct, which is unambiguous.
 func EffectiveHash(p EffectivePolicy) string {
-	exec := append([]string{}, p.Exec...)
-	network := append([]string{}, p.Network...)
-	files := append([]string{}, p.Files...)
-	slices.Sort(exec)
-	slices.Sort(network)
-	slices.Sort(files)
-	form := fmt.Sprintf("exec=%s|network=%s|files=%s", strings.Join(exec, ","), strings.Join(network, ","), strings.Join(files, ","))
-	sum := sha256.Sum256([]byte(form))
+	canonical := struct {
+		Exec    []string `json:"exec"`
+		Network []string `json:"network"`
+		Files   []string `json:"files"`
+	}{
+		Exec:    append([]string{}, p.Exec...),
+		Network: append([]string{}, p.Network...),
+		Files:   append([]string{}, p.Files...),
+	}
+	slices.Sort(canonical.Exec)
+	slices.Sort(canonical.Network)
+	slices.Sort(canonical.Files)
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		// The struct is a known type; marshaling should never fail.
+		// If it does, return a fixed hash so the policy is never silently
+		// treated as changed.
+		return "unhashable"
+	}
+	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum)
 }

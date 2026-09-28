@@ -97,13 +97,25 @@ KIND_NODE_IMAGE ?= kindest/node:v1.34.0
 # no controller image existed). The version is pinned here, in exactly one
 # place, and the release manifest is derived from it.
 AGENT_SANDBOX_VERSION ?= v1.0.4
+KUBEARMOR_VERSION ?= v1.7.5
+# KubeArmor install posture flags: block for file/network/capabilities (the exec
+# allowlist's block-vs-audit is gated on defaultFilePosture, NOT spec.action) +
+# process visibility (needed for the process rules to be visible/evaluated).
+# These are passed to `karmor install` so the posture is in the KubeArmorConfig
+# BEFORE the node agent starts — see the finding below why it must NOT be a
+# post-install edit + agent restart.
+KUBEARMOR_POSTURE_FLAGS ?= -b all --viz process,file,network
 AGENT_SANDBOX_MANIFEST ?= https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$(AGENT_SANDBOX_VERSION)/sandbox.yaml
 # The controller image the release manifest references (pre-loaded into the
 # kind node so an offline host doesn't depend on the node reaching
 # registry.k8s.io).
 AGENT_SANDBOX_CONTROLLER_IMAGE ?= registry.k8s.io/agent-sandbox/agent-sandbox-controller:$(AGENT_SANDBOX_VERSION)
 
-.PHONY: kind-up
+.PHONY: proxy-build
+proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
+	$(CONTAINER_TOOL) build -t $(PROXY_IMG) -f cmd/proxy-standin/Dockerfile .
+
+
 kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGENT_SANDBOX_VERSION)
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
@@ -124,9 +136,27 @@ kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGEN
 		|| echo "(could not pre-load $(AGENT_SANDBOX_CONTROLLER_IMAGE); the node will pull it)"
 	@echo "Waiting for the agent-sandbox controller to be ready..."
 	kubectl rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=120s
-	@echo "Building and loading the proxy stand-in image ($(PROXY_IMG)) into the kind node..."
+	@echo "Installing KubeArmor $(KUBEARMOR_VERSION) via the pinned karmor CLI..."
+	@mkdir -p bin
+	@command -v bin/karmor >/dev/null 2>&1 || \
+		curl -sfL "https://github.com/kubearmor/kubearmor-client/releases/download/v1.4.9/karmor_1.4.9_linux_amd64.tar.gz" \
+		| tar xz -C bin
+	@bin/karmor install $(KUBEARMOR_POSTURE_FLAGS) --tag $(KUBEARMOR_VERSION) || \
+		{ echo "KubeArmor install failed (needs --tag $(KUBEARMOR_VERSION), the v-prefix is mandatory for Docker Hub tags)"; exit 1; }
+	@echo "KubeArmor $(KUBEARMOR_VERSION) installed (BPF-LSM enforcer)."
+	@echo "Verifying the KubeArmor default posture is block (BPF-LSM exec/whitelist enforcement)."
+	@echo "The posture is set via karmor install flags ($(KUBEARMOR_POSTURE_FLAGS)), NOT by editing the config + restarting the agent: KubeArmor v1.7.5 gates the exec allowlist's block-vs-audit on defaultFilePosture (NOT spec.action), so block must be in place before the agent first starts. A post-install config edit + agent rollout-restart is also host-disruptive: on kernel 6.1 a BPF-LSM agent stop can hang in bpf_trampoline teardown and wedge the node's BPF subsystem (see ADR-0007, findings)." \
+		&& KA_NS=$$(kubectl get configmap -A --no-headers 2>/dev/null | awk '$$2=="kubearmor-config"{print $$1; exit}') \
+		&& [ -n "$$KA_NS" ] \
+		&& FP=$$(kubectl -n "$$KA_NS" get configmap kubearmor-config -o jsonpath='{.data.defaultFilePosture}' 2>/dev/null) \
+		&& VP=$$(kubectl -n "$$KA_NS" get configmap kubearmor-config -o jsonpath='{.data.visibility}' 2>/dev/null) \
+		&& echo "   defaultFilePosture=$$FP visibility=$$VP" \
+		&& [ "$$FP" = "block" ] \
+		&& case "$$VP" in *process*) true;; *) echo "process visibility missing"; false;; esac \
 	$(MAKE) proxy-build
-	$(KIND) load docker-image "$(PROXY_IMG)" --name $(KIND_CLUSTER)
+	kind load docker-image $(PROXY_IMG) --name $(KIND_CLUSTER)
+
+		|| { echo "Posture is not block (defaultFilePosture=$$FP): a disallowed exec would be logged but allowed. Check KUBEARMOR_POSTURE_FLAGS."; exit 1; }
 
 .PHONY: kind-smoke
 kind-smoke: ## Rerun D22's evidence: create a bare Sandbox and wait for Ready=True
@@ -149,6 +179,12 @@ crd-drift-check: ## Fail if the vendored agent-sandbox CRD drifts from the relea
 
 .PHONY: setup-test-e2e
 setup-test-e2e: kind-up crd-drift-check ## Set up a Kind cluster for e2e tests (with agent-sandbox installed)
+
+# C6b exec-block e2e: install KubeArmor (pinned) and prove a disallowed exec in
+# the agent container is blocked by the operator's KubeArmorPolicy. Requires the
+# kind cluster + operator (make deploy with --allow-unenforced) already running.
+kubearmor-e2e:
+	@KUBEARMOR_VERSION=$(KUBEARMOR_VERSION) bash test/e2e/kubearmor-exec-block.sh
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
@@ -181,14 +217,6 @@ run: manifests generate fmt vet ## Run a controller from your host.
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t ${IMG} .
-
-# Build the D33/D34 proxy stand-in image. Wired into kind-up so a fresh
-# cluster always has the image loaded. Override PROXY_IMG to build a
-# different tag (e.g. for a specific test run).
-PROXY_IMG ?= coxswain-proxy:standin
-.PHONY: proxy-build
-proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
-	$(CONTAINER_TOOL) build -t $(PROXY_IMG) -f cmd/proxy-standin/Dockerfile .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -233,10 +261,25 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
+# deploy = the base install (fail-closed: no --allow-unenforced). The D30 gate
+# holds the sandbox Suspended until the eBPF engine proves enforcement (the I32
+# relay, not yet wired). This is what a production install (dist/install.yaml)
+# ships.
+#
+# deploy-dev = base + --allow-unenforced, via the config/dev kustomize overlay.
+# For local kind dev only, so Loops run before the enforcement-evidence seam is
+# wired (they run with PolicyEnforced=False reason EnforcementDisabled, loudly).
+# Never use for production.
+
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config (fail-closed; no --allow-unenforced).
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+
+.PHONY: deploy-dev
+deploy-dev: manifests kustomize ## Dev/kind only: deploy the controller with --allow-unenforced (Loops run before the I32 enforcement-evidence relay is wired). Not for production.
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
+	"$(KUSTOMIZE)" build config/dev | "$(KUBECTL)" apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.

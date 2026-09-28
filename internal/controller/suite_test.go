@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -46,6 +47,10 @@ var (
 	testEnv   *envtest.Environment
 	cfg       *rest.Config
 	k8sClient client.Client
+	// loopCache is a cache scoped to Loops only, with the spec.policyRefs
+	// field index registered. Used by the agentPolicyToLoopRequests test to
+	// exercise the indexed path (R15 OK-notes).
+	loopCache cache.Cache
 )
 
 func TestControllers(t *testing.T) {
@@ -95,6 +100,33 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	// Set up a cache scoped to Loops only, with the spec.policyRefs field
+	// index registered (R15 OK-notes: test the indexed path). This cache is
+	// used ONLY by the agentPolicyToLoopRequests test; the k8sClient remains
+	// a plain client for all other specs.
+	loopCacheOpts := cache.Options{
+		Scheme: scheme.Scheme,
+		ByObject: map[client.Object]cache.ByObject{
+			&coxv1alpha1.Loop{}: {},
+		},
+	}
+	loopCache, err = cache.New(cfg, loopCacheOpts)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(loopCache.IndexField(ctx, &coxv1alpha1.Loop{}, loopPolicyRefsFieldIndex,
+		func(obj client.Object) []string {
+			loop, ok := obj.(*coxv1alpha1.Loop)
+			if !ok {
+				return nil
+			}
+			return loop.Spec.PolicyRefs
+		})).To(Succeed())
+	go func() {
+		_ = loopCache.Start(ctx)
+	}()
+	Eventually(func() bool {
+		return loopCache.WaitForCacheSync(ctx)
+	}, "10s").Should(BeTrue())
 })
 
 var _ = AfterSuite(func() {

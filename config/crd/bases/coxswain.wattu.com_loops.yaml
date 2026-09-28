@@ -160,6 +160,15 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+              policyRefs:
+                description: |-
+                  policyRefs is the list of AgentPolicy names (in the Loop's namespace) whose
+                  allows the agent may use. The effective policy is the union of their allows
+                  (ADR-0007 Q2). With no policyRefs the agent runs default-deny (the platform
+                  minimum only). +optional
+                items:
+                  type: string
+                type: array
               suspend:
                 description: suspend, when true, pauses the Loop at its current phase.
                 type: boolean
@@ -381,6 +390,29 @@ spec:
                 - Paused
                 - CleaningUp
                 type: string
+              policy:
+                description: |-
+                  policy is the operator's record of the effective AgentPolicy for the
+                  agent (ADR-0007 Q2): the union of the allows across every AgentPolicy the
+                  Loop references (spec.policyRefs[]). effectiveHash is the SHA-256 of the
+                  canonical effective allows, so the decision audit shows what the agent was
+                  allowed to do (D32); it is set by the operator, never the agent. +optional
+                properties:
+                  blockedCount:
+                    description: |-
+                      blockedCount is the number of actions the engine has blocked for this Loop
+                      (ADR-0007 Q5 / C8). It is derived by the operator from the engine's alert
+                      stream; a relay outage must surface as "unknown", not zero (I32). +optional
+                    format: int64
+                    type: integer
+                  effectiveHash:
+                    description: |-
+                      effectiveHash is the SHA-256 of the canonical effective allows (the union
+                      of the allows across every AgentPolicy the Loop references, with the
+                      platform-minimum endpoints). It lets the decision audit show what the agent
+                      was allowed to do in each iteration (D32). Empty when no policy is applied.
+                    type: string
+                type: object
               verify:
                 description: |-
                   verify carries the operator's record of the last verify run's evidence

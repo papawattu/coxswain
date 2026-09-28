@@ -46,6 +46,14 @@ rules:
 - apiGroups:
   - coxswain.wattu.com
   resources:
+  - agentpolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - coxswain.wattu.com
+  resources:
   - loops
   verbs:
   - create
@@ -73,6 +81,18 @@ rules:
   - networking.k8s.io
   resources:
   - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - security.kubearmor.com
+  resources:
+  - kubearmorpolicies
   verbs:
   - create
   - delete

@@ -23,56 +23,59 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"net"
 	neturl "net/url"
 	"strconv"
+	"net"
 	"strings"
+
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/engine"
+	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// C2 (ADR-0006 item 2): the model proxy contract. The agent holds no model
-// key; it talks to the per-Loop proxy on COX_MODEL_BASE_URL. D33
-// (REVIEW-PHASE1-R13, owner option c) moved the proxy OUT of the sandbox pod
-// into its own operator-owned pod + Service: NetworkPolicy and KubeArmorPolicy
-// are pod-scoped and agent-sandbox allows exactly one pod per Sandbox, so a
-// sidecar can never be split from the agent for egress (D29).
+// C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
+// model key; it talks to the local proxy on COX_MODEL_BASE_URL, which holds the
+// key (mounted only into the proxy) and injects auth.
 const (
-	// proxyPodNameSuffix / proxyServiceNameFmt are the per-Loop proxy pod and
-	// Service names: <loop>-proxy (one each, owner-referenced to the Loop so
-	// both are GC'd with it).
-	proxyPodNameSuffix  = "-proxy"
-	proxyServiceNameFmt = "%s-proxy"
-	// proxySpecHashAnnotation records the hash of the desired proxy pod spec
-	// on the pod itself (P2, R15: operator upgrades change the spec; a bare
-	// Pod's spec is immutable, so the operator deletes and recreates the pod
-	// when the hash mismatches).
-	proxySpecHashAnnotation = "coxswain.io/proxy-spec-hash"
+	// proxyContainerName is the name of the model proxy sidecar container.
 	// modelCredsVolume is the name of the Secret volume that carries the model
-	// API key + base URL (mounted read-only into the proxy pod only).
+	// API key + base URL (mounted read-only into the proxy only).
 	modelCredsVolume = "model-creds"
 	// coxModelBaseURL is the env var the operator sets on the agent so it talks
-	// to the proxy (a Loop cannot override it: COX_* names are rejected at
-	// admission, I34) so the agent cannot be pointed past the proxy.
+	// to the local proxy (a Loop cannot override it: COX_* names are rejected
+	// at admission, I34).
 	coxModelBaseURL = "COX_MODEL_BASE_URL"
-	// proxyPort is where the proxy listens; the per-Loop Service exposes it.
-	proxyPort int32 = 8080
+	// localhostProxyBaseURL is where the proxy listens on the sandbox pod's
+	// loopback interface. The agent reaches it over localhost, not the network.
 	// readOnlyMode is the default file mode for the model-creds Secret volume
 	// (0444: the key is read-only, even in the proxy).
 	readOnlyMode int32 = 0o444
+
+	// The agent's writable mount points. Single source of truth for the pod spec;
+	// the AgentPolicy exec XValidation (api/v1alpha1/agentpolicy_types.go) MUST
+	// stay in sync with this set — a CRD CEL rule cannot reference Go code, so
+	// adding a mount here without updating the XValidation would silently make
+	// the new mount a spoofable exec target.
+	agentWorkspaceMount = "/workspace"
+	agentScratchMount   = "/scratch"
+	agentTmpMount       = "/tmp"
 )
 
 // LoopReconciler reconciles a Loop object.
@@ -84,13 +87,23 @@ type LoopReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// Enforcer is the eBPF engine seam (ADR-0007 Q3/D30). When set, the operator
+	// emits the Loop's effective policy through the engine and gates the sandbox
+	// on positive evidence that enforcement is active (D30). When nil, the
+	// operator treats enforcement as unavailable (PolicyEnforced=False,
+	// reason EngineUnavailable) and holds the sandbox Suspended (fail-closed).
+	Enforcer engine.Enforcer
+	// AllowUnenforced is the off-by-default escape hatch (P1 merge): when true,
+	// Loops run with PolicyEnforced=False reason EnforcementDisabled rather
+	// than being held Suspended. For dev/kind only — never in production.
+	AllowUnenforced bool
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
 
-	// ProxyImage is the model proxy pod image (D33). Defaults to a working
-	// stand-in (golang:1.26, which has POSIX sh/head/sleep); overridable for
-	// the smoke test or when a real proxy binary lands (C2b).
+	// ProxyImage is the model proxy sidecar image (C2). Defaults to a Go dev
+	// stand-in; overridable for the smoke test (e.g. the real proxy image).
 	ProxyImage string
 }
 
@@ -99,12 +112,12 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
-// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy): it
-// creates/updates them, watches them (Owns mapping), and lets GC delete them
-// with the Loop. Only the verbs the controller actually uses.
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
+// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
-// D34: the operator creates per-Loop NetworkPolicies (ensureNetworkPolicy).
+// D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
@@ -115,17 +128,86 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// R17 R18: the require-pair (endpointSecretRef and modelEndpoint must be
-	// set together) is enforced at admission by a CEL rule on AgentConfig
-	// (has(self.endpointSecretRef) == has(self.modelEndpoint)). The controller
-	// check below is a second line of defence (e.g. for Loops created before
-	// the CRD update, or if the CEL budget changes). It runs BEFORE
-	// ensureSandbox so a bad Loop never gets a sandbox pod. The condition
-	// type is ModelConfigValid (not PolicyValid — this is about the model
-	// endpoint configuration, not the AgentPolicy).
+	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
+	// creating the sandbox (defence in depth: the CRD CEL catches the common
+	// case at admission; this catches anything that slips through, including
+	// missing/unreadable policies). If validation fails, set
+	// PolicyValid=False and suspend the sandbox (if running).
+	if polResult := r.validateAgentPolicies(ctx, &loop); !polResult.valid {
+		setCondition(&loop, "PolicyValid", metav1.ConditionFalse, polResult.reason, polResult.message)
+		// Suspend an already-running sandbox (D30-gate pattern): set
+		// operatingMode to 0 so the sandbox pod is scaled down.
+		if err := r.suspendSandboxIfRunning(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Status().Update(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		if polResult.transientReadError {
+			// Requeue: the policy could not be read due to a transient
+			// error. Retry after a short delay.
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+	// Clean pass: set PolicyValid=True (R15 round 3: nothing ever set it
+	// True before, so a fixed path left the old False condition forever).
+	if len(loop.Spec.PolicyRefs) > 0 {
+		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
+	}
+
+	// C6b (ADR-0007 Q3/D30): resolve the effective policy, apply it through the
+	// Enforcer (the gate has something behind it, P1 #2), and record the hash.
+	// The gate applies to EVERY Loop (no policyRefs = the platform minimum,
+	// still translated/emitted/enforced).
+	effective, err := r.effectivePolicy(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if r.Enforcer != nil {
+		if err := r.Enforcer.Apply(ctx, &loop, effective); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// I41: report the lossy translation. A host:PORT network allow that loses
+	// its port in the KubeArmor translation must set PolicyTranslationLossy=True
+	// (the port is dropped; the allow widens to host:*). Once the per-Loop
+	// NetworkPolicy carries the port (D34/I42), the condition becomes False.
+	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
+		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
+			"KubeArmorDroppedPorts",
+			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
+	} else {
+		setCondition(&loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
+			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
+	}
+
+	// D30: record the PolicyEnforced condition. True+Enforcing when the engine is
+	// enforcing; False+reason otherwise. The AllowUnenforced escape hatch lets
+	// the Loop run but is NOT enforced — it records False+EnforcementDisabled
+	// (loudly visible), never True.
+	if enf, rs := r.enforcementStatus(ctx, &loop); enf && rs != engine.ReasonEnforcementDisabled {
+		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
+			"the eBPF engine is enforcing the Loop's effective policy")
+	} else {
+		msg := "engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)"
+		if rs == engine.ReasonEnforcementDisabled {
+			msg = "--allow-unenforced is set: the Loop runs but is NOT enforced (dev escape hatch)"
+		}
+		setCondition(&loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
+	}
+	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
+	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
+	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
+	// gates apply: an invalid policy suspends, and unenforced also suspends.
+
+	// D34 (P1): the endpointSecretRef + modelEndpoint pair is required. A Secret
+	// without an endpoint (or an endpoint without a Secret) is a misconfiguration
+	// that would crash-loop the proxy; reject it early.
 	if loop.Spec.Agent.EndpointSecretRef != "" && loop.Spec.Agent.ModelEndpoint == "" {
-		setCondition(&loop, "ModelConfigValid", "False", "MissingModelEndpoint",
-			"endpointSecretRef is set but modelEndpoint is empty; both must be provided together")
+		setCondition(&loop, "ModelConfigValid", metav1.ConditionFalse, "MissingModelEndpoint",
+			"spec.agent.endpointSecretRef is set but spec.agent.modelEndpoint is empty; the pair is required")
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -137,20 +219,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	// D33: the per-Loop proxy pod + Service exist only when a model endpoint is
-	// configured (P1 parity: no half-configured proxy). Created after the
-	// sandbox so the agent's COX_MODEL_BASE_URL target exists in the same pass.
+	// configured (P1 parity: no half-configured proxy).
+	if err := r.ensureProxyOrCleanup(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// D34: the per-Loop NetworkPolicies exist only when a model endpoint is
+	// configured (the agent needs egress to the proxy + DNS; the proxy needs
+	// egress to the model endpoint + DNS).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
-		if err := r.ensureProxy(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
 		if err := r.ensureNetworkPolicy(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
-	} else {
-		// R15 round 3: if the endpointSecretRef is absent (or was removed),
-		// delete the proxy pod and Service (if they exist). A live, key-holding
-		// proxy must not outlive the Loop's intent to use it.
-		if err := r.cleanupProxy(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -210,8 +288,24 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, coxv1alpha1.LoopPhaseFailed, metav1.ConditionTrue, TamperedVerifyReason,
+			setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
 				"a protected path changed between baseCommit and verifiedCommit; terminal")
+			changed = true
+		}
+	}
+	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
+	// union of the allows across every AgentPolicy the Loop references
+	// (spec.policyRefs[]). The operator computes the hash and stores it in
+	// status.policy.effectiveHash so the decision audit shows what the agent was
+	// allowed to do (D32); the hash is over the union, not stored allows.
+	if effectiveHash, found, err := r.effectivePolicyHash(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	} else if found {
+		if loop.Status.Policy == nil {
+			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+		}
+		if loop.Status.Policy.EffectiveHash != effectiveHash {
+			loop.Status.Policy.EffectiveHash = effectiveHash
 			changed = true
 		}
 	}
@@ -222,6 +316,85 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// effectivePolicyHash computes the canonical hash of the Loop's effective
+// AgentPolicy (C6a): the union of the allows across every AgentPolicy the Loop
+// references (spec.policyRefs[]). It returns the hash and whether any policy
+// was applied (false when policyRefs is empty — the default-deny minimum). A
+// referenced AgentPolicy that does not exist is an error (the operator must not
+// silently run an agent with a narrower policy than the Loop declared).
+func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+	if len(loop.Spec.PolicyRefs) == 0 {
+		return "", false, nil
+	}
+	union := policy.EffectivePolicy{}
+	for _, name := range loop.Spec.PolicyRefs {
+		var ap coxv1alpha1.AgentPolicy
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
+			return "", false, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+		}
+		// P1 (R15): the CEL XValidation can't reject non-canonical paths (CRD CEL
+		// cost budget), so the controller rejects them here before they reach the
+		// effective policy or the eBPF engine. A path with '..' or '//' or a
+		// trailing '/' is non-canonical and could resolve to a writable mount
+		// after normalization.
+		// Non-canonical exec paths are rejected by findNonCanonicalExecPath
+		// before ensureSandbox (R15 round 2: the check runs before the sandbox
+		// is created, and sets a condition rather than an error-requeue).
+		union.Exec = append(union.Exec, ap.Spec.Exec...)
+		union.Network = append(union.Network, ap.Spec.Network...)
+		union.Files = append(union.Files, ap.Spec.Files...)
+	}
+	return policy.EffectiveHash(union), true, nil
+}
+
+// enforcementStatus (D30, ADR-0007) reports whether the eBPF engine is enforcing
+// the Loop's policy. The gate applies to EVERY Loop (no policyRefs = the
+// platform minimum, still enforced); with no Enforcer (engine not installed) it
+// reports EngineUnavailable, so the sandbox is held Suspended (fail-closed).
+func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha1.Loop) (enforced bool, reason string) {
+	if r.Enforcer == nil {
+		if r.AllowUnenforced {
+			return true, engine.ReasonEnforcementDisabled // run, but NOT enforced
+		}
+		return false, engine.ReasonEngineUnavailable
+	}
+	enforcing, reason := r.Enforcer.Enforcing(ctx, loop)
+	if !enforcing && r.AllowUnenforced {
+		return true, engine.ReasonEnforcementDisabled // run anyway, not enforced
+	}
+	return enforcing, reason
+}
+
+// PolicyEnforcedCondition is the non-phase condition type recording whether the
+// eBPF engine is enforcing the Loop's policy (D30).
+const PolicyEnforcedCondition = "PolicyEnforced"
+
+// PolicyTranslationLossyCondition is the Loop condition that reports a lossy
+// KubeArmor translation (I41): a host:PORT network allow that loses its port
+// in the translation. True + reason KubeArmorDroppedPorts lists the widened
+// allows; False + reason NoPortLoss when no port was lost.
+const PolicyTranslationLossyCondition = "PolicyTranslationLossy"
+
+// effectivePolicy resolves the Loop's effective policy: the union of the
+// referenced AgentPolicies, or the platform minimum (empty EffectivePolicy) when
+// there are no policyRefs (D30: the platform minimum is still translated,
+// emitted, and enforced — the gate applies to EVERY Loop). It errors if a
+// referenced AgentPolicy is missing (the operator must not silently run an
+// agent narrower than declared).
+func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.Loop) (policy.EffectivePolicy, error) {
+	union := policy.EffectivePolicy{}
+	for _, name := range loop.Spec.PolicyRefs {
+		var ap coxv1alpha1.AgentPolicy
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
+			return policy.EffectivePolicy{}, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+		}
+		union.Exec = append(union.Exec, ap.Spec.Exec...)
+		union.Network = append(union.Network, ap.Spec.Network...)
+		union.Files = append(union.Files, ap.Spec.Files...)
+	}
+	return union, nil
 }
 
 // ensureSandbox creates the Loop's Sandbox if it does not already exist, and
@@ -253,9 +426,9 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		nonRootUID := int64(65532)
 		nonRootGID := int64(65532)
 		nonRootFSGroup := int64(65532)
-		// C2 (P1): the proxy + model access exist only when a model endpoint is
+		// D33 (P1): the proxy + model access exist only when a model endpoint is
 		// configured. With no endpointSecretRef the agent runs with no model — no
-		// proxy container, no key, no COX_MODEL_BASE_URL (never a half-configured
+		// proxy pod, no key, no COX_MODEL_BASE_URL (never a half-configured
 		// proxy that would make the pod InvalidConfiguration on an empty secret).
 		hasModel := loop.Spec.Agent.EndpointSecretRef != ""
 		falseP := false
@@ -268,23 +441,27 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
 		}
-		// D34: the sandbox pod carries the per-Loop agent label set so the
-		// per-Loop NetworkPolicy can select ONLY this Loop's agent (a
-		// component-only selector would let any agent in the namespace use
-		// any Loop's proxy). agent-sandbox propagates
-		// spec.podTemplate.metadata.labels to the pod (C6b relies on this
-		// for the KubeArmorPolicy selector). Merged, not overwritten, so it
-		// composes with C6b's coxswain.io/loop label when both slices land.
+		// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
+		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
+		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
+		// invalid policy suspends via suspendSandboxIfRunning, and unenforced
+		// also suspends here.
+		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
+			enforced, _ := r.enforcementStatus(ctx, loop)
+			if !enforced {
+				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+			}
+		}
+		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
+		// (KubeArmorPolicy selector) and the D33 agent component label
+		// (NetworkPolicy podSelector). MERGE into the map (maps.Copy) so both
+		// compose — an assignment would clobber whichever was set first.
 		if desired.Spec.PodTemplate.ObjectMeta.Labels == nil {
 			desired.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{}
 		}
+		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, map[string]string{"coxswain.io/loop": loop.Name})
 		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, agentPodLabels(loop.Name))
 		desired.Spec.PodTemplate.Spec.AutomountServiceAccountToken = &falseP
-		// C2 (P2): never share the process namespace. The proxy and agent run as
-		// different UIDs, but a shared PID namespace would let the (untrusted) agent
-		// read /proc/<proxy-pid>/environ and leak the model key. Explicitly false.
-		noShare := false
-		desired.Spec.PodTemplate.Spec.ShareProcessNamespace = &noShare
 		// I35: fsGroup so the /workspace + /scratch emptyDir volumes are owned by
 		// the agent's UID (writable). Set on the pod security context.
 		desired.Spec.PodTemplate.Spec.SecurityContext = &corev1.PodSecurityContext{
@@ -305,12 +482,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// tools that hard-code /tmp.
 		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+2)
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
-		// C2 (ADR-0006 item 2): the agent holds no model key. D33: it talks to the
-		// per-Loop proxy Service (COX_MODEL_BASE_URL), which holds the key and
-		// injects auth. The operator sets this; a Loop cannot override it (COX_*
-		// names are rejected at admission, I34) so the agent cannot be pointed
-		// past the proxy. Only set when a model endpoint exists (P1: no
-		// half-configured proxy).
+		// C2 (ADR-0006 item 2): the agent holds no model key. It talks to the local
+		// proxy sidecar (COX_MODEL_BASE_URL), which holds the key and injects auth.
+		// The operator sets this; a Loop cannot override it (COX_* names are
+		// rejected at admission, I34) so the agent cannot be pointed past the proxy.
+		// Only set when a model endpoint exists (P1: no half-configured proxy).
 		if hasModel {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: proxyServiceURL(loop.Name, loop.Namespace)})
 		}
@@ -351,23 +527,25 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: "workspace", MountPath: "/workspace"},
-				{Name: "scratch", MountPath: "/scratch"},
+				{Name: "workspace", MountPath: agentWorkspaceMount},
+				{Name: "scratch", MountPath: agentScratchMount},
 				// P1 (R13): a writable /tmp so go build / mktemp / any tool that
 				// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
-				{Name: "tmp", MountPath: "/tmp"},
+				{Name: "tmp", MountPath: agentTmpMount},
 			},
 		}
-		// D33: the model proxy is NOT a sidecar container here — it is the
-		// per-Loop proxy pod (ensureProxy). The sandbox pod has exactly one
-		// container (the agent), so the pod-scoped egress policies of D34/D35
-		// split cleanly between the two pods (D29).
-		podContainers := []corev1.Container{agentContainer}
-		desired.Spec.PodTemplate.Spec.Containers = podContainers
+		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{agentContainer}
 		// P3 (R13, I36): the writable emptyDirs carry explicit sizeLimits that sum
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
 		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
 		// rather than filling the node. 500+350+100 = 950Mi < 1Gi.
+		// writableMountPaths is the single source of truth for the agent's writable
+		// mount points; the AgentPolicy exec XValidation hard-codes the same set
+		// (a CRD CEL rule cannot reference Go code), so adding a mount here MUST
+		// also update the XValidation in api/v1alpha1/agentpolicy_types.go or the
+		// new mount would silently become a spoofable exec target.
+		writableMountPaths := []string{agentWorkspaceMount, agentScratchMount, agentTmpMount}
+		_ = writableMountPaths // single source of truth (see comment)
 		desired.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
 			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				SizeLimit: newLimit("500Mi"),
@@ -379,9 +557,8 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				SizeLimit: newLimit("100Mi"),
 			}}},
 		}
-		// D33: the model-creds Secret volume is NOT on the sandbox pod — it is
-		// mounted (read-only) into the per-Loop proxy pod (ensureProxy), the only
-		// place the model key lives (C2/ADR-0006 item 2).
+		// D33: the model-creds Secret is mounted into the per-Loop proxy pod
+		// (ensureProxy), NOT the sandbox pod. The agent holds no key (C2).
 		// Set the controller owner ref here, on the (possibly server-populated)
 		// object. Returns AlreadyOwnedError if a different controller already
 		// owns it (I2: never take over a foreign sandbox).
@@ -413,428 +590,8 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 // sandboxName returns the Loop's Sandbox name: <loop>-sandbox. The Loop name
 // is CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
 // is always a valid DNS-1035 label <= 63 chars and needs no truncation.
-// cleanupProxy deletes the Loop's proxy pod and Service (if they exist).
-// Called when endpointSecretRef is absent (R15 round 3: a live, key-holding
-// proxy must not outlive the Loop's intent to use it). Idempotent: a
-// NotFound on Get is not an error.
-func (r *LoopReconciler) cleanupProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	log := logf.FromContext(ctx)
-	// Delete the proxy pod (only if we control it, I2: never take over a
-	// foreign object).
-	pod := &corev1.Pod{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)
-	if err == nil {
-		if !metav1.IsControlledBy(pod, loop) {
-			log.Info("proxy pod exists but is not controlled by this Loop; not deleting",
-				"proxy", proxyPodName(loop.Name), "loop", loop.Name)
-		} else if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
-			return fmt.Errorf("delete proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), delErr)
-		} else {
-			log.Info("deleted proxy pod (endpointSecretRef absent)", "proxy", proxyPodName(loop.Name), "loop", loop.Name)
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
-	}
-	// Delete the proxy Service (only if we control it).
-	svc := &corev1.Service{}
-	err = r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyServiceName(loop.Name)}, svc)
-	if err == nil {
-		if !metav1.IsControlledBy(svc, loop) {
-			log.Info("proxy Service exists but is not controlled by this Loop; not deleting",
-				"proxy", proxyServiceName(loop.Name), "loop", loop.Name)
-		} else if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
-			return fmt.Errorf("delete proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), delErr)
-		} else {
-			log.Info("deleted proxy Service (endpointSecretRef absent)", "proxy", proxyServiceName(loop.Name), "loop", loop.Name)
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), err)
-	}
-	return nil
-}
-
-// sandboxName returns the Loop's Sandbox name (<loop>-sandbox). The name is
-// CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
-// is always a valid DNS-1035 label <= 63 chars and needs no truncation.
 func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
-}
-
-// proxyPodName / proxyServiceName return the per-Loop proxy pod and Service
-// names: <loop>-proxy. The Loop name is CEL-validated to be a DNS-1035 label of
-// at most 55 chars (D20), so both are valid DNS-1035 labels <= 63 chars.
-func proxyPodName(loopName string) string {
-	return loopName + proxyPodNameSuffix
-}
-func proxyServiceName(loopName string) string {
-	return fmt.Sprintf(proxyServiceNameFmt, loopName)
-}
-
-// proxyServiceURL is the in-cluster Service URL the agent's COX_MODEL_BASE_URL
-// points at (D33): http://<loop>-proxy.<namespace>.svc:8080. The per-Loop
-// Service identity is also what makes the proxy's activity-audit records
-// attributable to the Loop (D35).
-func proxyServiceURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc:%d", proxyServiceName(loopName), namespace, proxyPort)
-}
-
-// dnsPeer is the NetworkPolicy peer for cluster DNS (P1-3, R16 review):
-// port 53 to the kube-dns pods in kube-system ONLY. A port-only rule would
-// allow 53 to any destination (a ready-made exfiltration channel via an
-// attacker-controlled DNS server).
-func dnsPeer() networkingv1.NetworkPolicyPeer {
-	return networkingv1.NetworkPolicyPeer{
-		NamespaceSelector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"kubernetes.io/metadata.name": "kube-system",
-			},
-		},
-		PodSelector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"k8s-app": "kube-dns",
-			},
-		},
-	}
-}
-
-// dnsPorts returns the DNS egress/ingress port set (53 UDP + TCP).
-func dnsPorts() []networkingv1.NetworkPolicyPort {
-	return []networkingv1.NetworkPolicyPort{
-		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
-		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
-	}
-}
-
-// modelPeer is the NetworkPolicy peer for the proxy's model egress (P1-4,
-// R16 review). NetworkPolicy cannot match DNS names, so:
-//   - a bare in-cluster Service name (single-label, same namespace as the
-//     policy): a podSelector over all pods in that namespace — the tightest
-//     selector that resolves the name without needing to watch Services. The
-//     hostname-level precision (only this host, not the whole namespace) is
-//     enforced by the proxy's KubeArmor policy (D35) which CAN match the DNS
-//     query. Recorded as a known limit in ADR-0007 alongside I41.
-//   - a numeric IP: an exact ipBlock /32.
-//   - anything else (external FQDN that does not resolve here): no peer —
-//     the model egress rule is omitted entirely (fail-closed), and the
-//     hostname-level allow belongs to D35's KubeArmor proxy policy.
-func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
-	host := endpoint
-	if strings.Contains(endpoint, "://") {
-		if u, err := neturl.Parse(endpoint); err == nil && u.Host != "" {
-			host = u.Host
-		}
-	}
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		cidr := ip.String() + "/32"
-		return &networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}}
-	}
-	if len(host) > 0 && host[0] != '.' && !strings.Contains(host, ".") {
-		return &networkingv1.NetworkPolicyPeer{
-			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{}},
-		}
-	}
-	return nil
-}
-
-// ensureNetworkPolicy creates the per-Loop NetworkPolicies (D34):
-//  1. Agent pod: ingress deny-all; egress only to THIS Loop's proxy on 8080
-//     and cluster DNS (kube-dns in kube-system, port 53 UDP/TCP).
-//  2. Proxy pod: ingress only from THIS Loop's agent on 8080; egress only to
-//     the model endpoint peer (pod selector or ipBlock) and cluster DNS.
-//
-// Every selector and peer is per-Loop (P1-1, R16 review): the agent pod
-// carries coxswain.io/loop=<loop> + the agent component label (set on the
-// Sandbox pod template by ensureSandbox), the proxy pod carries
-// coxswain.io/proxy-for=<loop> (D33). Two Loops in one namespace therefore
-// get two disjoint policy pairs and no cross-Loop traffic is allowed.
-//
-// Both policies are owner-ref'd to the Loop so they are GC'd with it.
-func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	ns := loop.Namespace
-	loopName := loop.Name
-	agentLabels := agentPodLabels(loopName)
-	proxyL := proxyLabels(loopName)
-	proxyPeer := networkingv1.NetworkPolicyPeer{
-		PodSelector: &metav1.LabelSelector{MatchLabels: proxyL},
-	}
-	agentPeer := networkingv1.NetworkPolicyPeer{
-		PodSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
-	}
-
-	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
-	// none" — the agent pod must be unreachable from every other pod,
-	// including other Loops' agents), egress to this Loop's proxy + DNS.
-	//
-	// P2 (R17 R18): the AgentPolicy `network` allows are NOT translated
-	// into egress rules. The naive port-only approach is rejected (I42,
-	// docs/REVIEW-PHASE1-R14.md): a port-only rule is "any host on that
-	// port," which is the exfiltration path. The hostname-level precision
-	// must come from D35's KubeArmor agent policy (matchDNSQueries). Until
-	// I42 is resolved, agent egress stays proxy + DNS. When C6a merges and
-	// I42 is resolved, the operator should set a NetworkAllowsNotEnforced
-	// condition on the Loop if it has AgentPolicy network allows that are
-	// not yet enforced. The gap is recorded in ADR-0007.
-	agentNP := &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      loopName + "-agent-netpol",
-			Namespace: ns,
-		},
-		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: agentLabels},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-			Ingress:     []networkingv1.NetworkPolicyIngressRule{},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{
-					To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
-					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
-				},
-				{
-					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
-					Ports: dnsPorts(),
-				},
-			},
-		},
-	}
-	if err := controllerutil.SetControllerReference(loop, agentNP, r.Scheme); err != nil {
-		return fmt.Errorf("set owner ref on agent NetworkPolicy: %w", err)
-	}
-	if _, err := r.createOrUpdateNP(ctx, agentNP); err != nil {
-		return fmt.Errorf("create or update agent NetworkPolicy: %w", err)
-	}
-
-	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, egress
-	// to the model endpoint peer + cluster DNS.
-	proxyNP := &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      loopName + "-proxy-netpol",
-			Namespace: ns,
-		},
-		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: proxyL},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{
-				{
-					From:  []networkingv1.NetworkPolicyPeer{agentPeer},
-					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
-				},
-			},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{
-					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
-					Ports: dnsPorts(),
-				},
-			},
-		},
-	}
-	// P2 (R16 review): the model endpoint is a non-secret Loop spec field
-	// (agent.modelEndpoint), not read from the Secret (which would require
-	// cluster-wide secrets RBAC and a cluster-wide Secret informer).
-	if loop.Spec.Agent.ModelEndpoint != "" {
-		if peer := modelPeer(loop.Spec.Agent.ModelEndpoint); peer != nil {
-			port := intstrPtr32(int32(modelEndpointPort(loop.Spec.Agent.ModelEndpoint)))
-			proxyNP.Spec.Egress = append(proxyNP.Spec.Egress, networkingv1.NetworkPolicyEgressRule{
-				To:    []networkingv1.NetworkPolicyPeer{*peer},
-				Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
-			})
-		}
-	}
-	if err := controllerutil.SetControllerReference(loop, proxyNP, r.Scheme); err != nil {
-		return fmt.Errorf("set owner ref on proxy NetworkPolicy: %w", err)
-	}
-	if _, err := r.createOrUpdateNP(ctx, proxyNP); err != nil {
-		return fmt.Errorf("create or update proxy NetworkPolicy: %w", err)
-	}
-
-	return nil
-}
-
-// agentPodLabels is the label set the agent (sandbox) pod carries (D34):
-// the per-Loop identity (coxswain.io/loop) plus the agent component. The
-// per-Loop NetworkPolicy podSelector and the proxy's ingress peer select
-// EXACTLY this set, so policies never leak across Loops in a namespace.
-// C6b's KubeArmorPolicy selector also keys on coxswain.io/loop, so the two
-// slices compose on the same label.
-func agentPodLabels(loopName string) map[string]string {
-	return map[string]string{
-		"coxswain.io/loop":   loopName,
-		netpolComponentLabel: netpolAgentComponent,
-	}
-}
-
-// intstrPtr32 returns a pointer to an intstr.IntOrString with the given int.
-func intstrPtr32(v int32) *intstr.IntOrString {
-	ips := intstr.FromInt32(v)
-	return &ips
-}
-
-// modelEndpointPort extracts the port from a model endpoint (host:port or URL).
-func modelEndpointPort(rawURL string) int {
-	// If it looks like a URL (has a scheme), parse it as such.
-	if strings.Contains(rawURL, "://") {
-		if u, err := neturl.Parse(rawURL); err == nil {
-			if p, err2 := strconv.Atoi(u.Port()); err2 == nil {
-				return p
-			}
-			return 0
-		}
-	}
-	// Otherwise treat it as host:port.
-	if _, p, err := net.SplitHostPort(rawURL); err == nil {
-		if ip, err2 := strconv.Atoi(p); err2 == nil {
-			return ip
-		}
-	}
-	return 0
-}
-
-// createOrUpdateNP creates or updates a NetworkPolicy.
-func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
-	return controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
-		return nil
-	})
-}
-
-// netpolAgentComponent is the app.kubernetes.io/component label value for
-// the agent pod (D34 NetworkPolicy uses this to select the agent pod).
-const (
-	netpolAgentComponent = "agent"
-	netpolComponentLabel = "app.kubernetes.io/component"
-)
-
-// proxyLabels is the label set the per-Loop proxy pod carries and the proxy
-// Service selects on (D33). The Service selects ONLY these labels, so no other
-// pod in the namespace can be reached through <loop>-proxy (D29: this Loop's
-// key is only usable by this Loop's agent; D34's NetworkPolicy enforces the
-// rest).
-func proxyLabels(loopName string) map[string]string {
-	return map[string]string{
-		netpolComponentLabel:    "model-proxy",
-		"coxswain.io/proxy-for": loopName,
-	}
-}
-
-// proxyImage returns the model proxy pod image. It is the reconciler's
-// ProxyImage field (settable in tests and future slices; a manager flag
-// --proxy-image is a candidate for a future C2b), or a working stand-in
-// (the Go reverse proxy) when unset. The stand-in checks the model-creds
-// Secret at startup (D33 acceptance) and forwards to MODEL_ENDPOINT.
-func (r *LoopReconciler) proxyImage() string {
-	if r.ProxyImage != "" {
-		return r.ProxyImage
-	}
-	return "coxswain-proxy:standin"
-}
-
-// modelEndpointValue returns the value of the MODEL_ENDPOINT env var for the
-// proxy pod. It prefers the non-secret Loop spec field (agent.modelEndpoint);
-// when unset it falls back to the Secret's MODEL_BASE_URL (read at reconcile
-// time, not at pod start, so the pod spec does not change if the Secret does).
-func modelEndpointValue(loop *coxv1alpha1.Loop) string {
-	if loop.Spec.Agent.ModelEndpoint != "" {
-		v := loop.Spec.Agent.ModelEndpoint
-		// Ensure it's a URL the Go reverse proxy can parse.
-		if !strings.Contains(v, "://") {
-			v = "http://" + v
-		}
-		return v
-	}
-	return ""
-}
-
-// ensureProxy creates the Loop's per-Loop model-proxy pod + Service (D33,
-// replaces the C2a sidecar). It is idempotent. The model-creds Secret is
-// mounted read-only into the proxy pod ONLY (C2/ADR-0006 item 2); the agent
-// pod never sees the key. Both objects are controller-owned by the Loop so
-// they are garbage-collected with it (a deleted Loop never leaves a live
-// proxy holding a key behind).
-func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	log := logf.FromContext(ctx)
-	ns := loop.Namespace
-	loopName := loop.Name
-
-	// --- proxy Service ---
-	svcDesired := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      proxyServiceName(loopName),
-			Namespace: ns,
-		},
-	}
-	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
-		svcDesired.Labels = proxyLabels(loopName)
-		svcDesired.Spec.Ports = []corev1.ServicePort{{
-			Name:       "http",
-			Port:       proxyPort,
-			TargetPort: intstr.FromInt32(proxyPort),
-			Protocol:   corev1.ProtocolTCP,
-		}}
-		svcDesired.Spec.Selector = proxyLabels(loopName)
-		// ClusterIP (the default): no external exposure; only in-cluster callers
-		// (the agent, via COX_MODEL_BASE_URL) reach it. D34's NetworkPolicy then
-		// restricts who may call it.
-		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
-		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
-	})
-	if err != nil {
-		return fmt.Errorf("ensure proxy service %s/%s: %w", ns, proxyServiceName(loopName), err)
-	}
-
-	// --- proxy pod (R15 fix: Get/create/delete, never Update a Pod spec) ---
-	// Build the desired pod spec first, then hash it. The hash covers the
-	// actual spec (image, command, limits, volumes), so any operator upgrade
-	// that changes the spec produces a different hash.
-	podDesired := buildProxyPod(loop, loopName, ns, r.proxyImage())
-	// Set the Loop as the controller owner (D33: GC with the Loop).
-	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
-		return fmt.Errorf("set owner ref on proxy pod %s/%s: %w", ns, proxyPodName(loopName), ownerErr)
-	}
-	proxySpecHash := proxyPodSpecHash(podDesired)
-	podDesired.Annotations = map[string]string{proxySpecHashAnnotation: proxySpecHash}
-
-	existingPod := &corev1.Pod{}
-	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: proxyPodName(loopName)}, existingPod)
-	if apierrors.IsNotFound(err) {
-		// Pod doesn't exist: create it.
-		if createErr := r.Create(ctx, podDesired); createErr != nil {
-			return fmt.Errorf("create proxy pod %s/%s: %w", ns, proxyPodName(loopName), createErr)
-		}
-		log.Info("ensured loop proxy (created)",
-			"proxy", proxyPodName(loopName), "namespace", ns, "loop", loopName)
-	} else if err != nil {
-		return fmt.Errorf("get proxy pod %s/%s: %w", ns, proxyPodName(loopName), err)
-	} else if existingPod.Annotations[proxySpecHashAnnotation] != proxySpecHash {
-		// Pod exists but the spec hash doesn't match: delete and requeue.
-		// A bare Pod's spec is immutable, so we can't Update it. Deleting
-		// triggers the Owns(Pod) watch, which re-reconciles and creates the
-		// new pod. Only delete if we control it (I2: never take over a
-		// foreign object).
-		if !metav1.IsControlledBy(existingPod, loop) {
-			log.Info("proxy pod spec drift detected but pod is not controlled by this Loop; not deleting",
-				"proxy", proxyPodName(loopName), "loop", loopName)
-		} else {
-			log.Info("proxy pod spec drift detected, deleting for recreation",
-				"proxy", proxyPodName(loopName), "loop", loopName)
-			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
-				return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
-			}
-		}
-		// Requeue so the next pass creates the new pod (the delete is
-		// asynchronous; the pod may not be gone yet).
-		return nil // the Owns(Pod) watch will trigger a re-reconcile
-	}
-	// Pod exists and hash matches: nothing to do.
-	podOp := controllerutil.OperationResultNone
-
-	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
-		log.V(1).Info("ensured loop proxy (no change)",
-			"proxy", proxyPodName(loopName),
-			"namespace", ns,
-			"loop", loopName,
-		)
-	}
-	return nil
 }
 
 // newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit
@@ -941,68 +698,145 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 	return TamperTampered
 }
 
-// setCondition upserts a condition on the Loop's status. The condition's Type
-// is the terminal phase (e.g. "Failed") so each terminal outcome is recorded
-// once with its reason (e.g. TamperedVerify). It is the operator's audit record
-// (ADR-0004); the runner never writes it.
-func setCondition(loop *coxv1alpha1.Loop, condType coxv1alpha1.LoopPhase, status metav1.ConditionStatus, reason, message string) {
-	now := metav1.Now()
-	for i := range loop.Status.Conditions {
-		if loop.Status.Conditions[i].Type == string(condType) {
-			if loop.Status.Conditions[i].Reason == reason &&
-				loop.Status.Conditions[i].Message == message &&
-				loop.Status.Conditions[i].Status == status {
-				return // unchanged
-			}
-			loop.Status.Conditions[i].Status = status
-			loop.Status.Conditions[i].Reason = reason
-			loop.Status.Conditions[i].Message = message
-			loop.Status.Conditions[i].LastTransitionTime = now
-			return
+func (r *LoopReconciler) cleanupProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	// Delete the proxy pod (only if we control it, I2: never take over a
+	// foreign object).
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)
+	if err == nil {
+		if !metav1.IsControlledBy(pod, loop) {
+			log.Info("proxy pod exists but is not controlled by this Loop; not deleting",
+				"proxy", proxyPodName(loop.Name), "loop", loop.Name)
+		} else if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), delErr)
+		} else {
+			log.Info("deleted proxy pod (endpointSecretRef absent)", "proxy", proxyPodName(loop.Name), "loop", loop.Name)
 		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
 	}
-	loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
-		Type:               string(condType),
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: now,
+	// Delete the proxy Service (only if we control it).
+	svc := &corev1.Service{}
+	err = r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyServiceName(loop.Name)}, svc)
+	if err == nil {
+		if !metav1.IsControlledBy(svc, loop) {
+			log.Info("proxy Service exists but is not controlled by this Loop; not deleting",
+				"proxy", proxyServiceName(loop.Name), "loop", loop.Name)
+		} else if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), delErr)
+		} else {
+			log.Info("deleted proxy Service (endpointSecretRef absent)", "proxy", proxyServiceName(loop.Name), "loop", loop.Name)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get proxy Service %s/%s: %w", loop.Namespace, proxyServiceName(loop.Name), err)
+	}
+	return nil
+}
+
+// sandboxName returns the Loop's Sandbox name (<loop>-sandbox). The name is
+// CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
+// is always a valid DNS-1035 label <= 63 chars and needs no truncation.
+
+func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	ns := loop.Namespace
+	loopName := loop.Name
+
+	// --- proxy Service ---
+	svcDesired := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxyServiceName(loopName),
+			Namespace: ns,
+		},
+	}
+	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
+		svcDesired.Labels = proxyLabels(loopName)
+		svcDesired.Spec.Ports = []corev1.ServicePort{{
+			Name:       "http",
+			Port:       proxyPort,
+			TargetPort: intstr.FromInt32(proxyPort),
+			Protocol:   corev1.ProtocolTCP,
+		}}
+		svcDesired.Spec.Selector = proxyLabels(loopName)
+		// ClusterIP (the default): no external exposure; only in-cluster callers
+		// (the agent, via COX_MODEL_BASE_URL) reach it. D34's NetworkPolicy then
+		// restricts who may call it.
+		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
 	})
-}
-
-// sandboxImage returns the configured sandbox image, or a sensible Go dev default.
-func (r *LoopReconciler) sandboxImage() string {
-	if r.SandboxImage != "" {
-		return r.SandboxImage
+	if err != nil {
+		return fmt.Errorf("ensure proxy service %s/%s: %w", ns, proxyServiceName(loopName), err)
 	}
-	return "docker.io/library/golang:1.26"
+
+	// --- proxy pod (R15 fix: Get/create/delete, never Update a Pod spec) ---
+	// Build the desired pod spec first, then hash it. The hash covers the
+	// actual spec (image, command, limits, volumes), so any operator upgrade
+	// that changes the spec produces a different hash.
+	podDesired := buildProxyPod(loop, loopName, ns, r.proxyImage())
+	// Set the Loop as the controller owner (D33: GC with the Loop).
+	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
+		return fmt.Errorf("set owner ref on proxy pod %s/%s: %w", ns, proxyPodName(loopName), ownerErr)
+	}
+	proxySpecHash := proxyPodSpecHash(podDesired)
+	podDesired.Annotations = map[string]string{proxySpecHashAnnotation: proxySpecHash}
+
+	existingPod := &corev1.Pod{}
+	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: proxyPodName(loopName)}, existingPod)
+	if apierrors.IsNotFound(err) {
+		// Pod doesn't exist: create it.
+		if createErr := r.Create(ctx, podDesired); createErr != nil {
+			return fmt.Errorf("create proxy pod %s/%s: %w", ns, proxyPodName(loopName), createErr)
+		}
+		log.Info("ensured loop proxy (created)",
+			"proxy", proxyPodName(loopName), "namespace", ns, "loop", loopName)
+	} else if err != nil {
+		return fmt.Errorf("get proxy pod %s/%s: %w", ns, proxyPodName(loopName), err)
+	} else if existingPod.Annotations[proxySpecHashAnnotation] != proxySpecHash {
+		// Pod exists but the spec hash doesn't match: delete and requeue.
+		// A bare Pod's spec is immutable, so we can't Update it. Deleting
+		// triggers the Owns(Pod) watch, which re-reconciles and creates the
+		// new pod. Only delete if we control it (I2: never take over a
+		// foreign object).
+		if !metav1.IsControlledBy(existingPod, loop) {
+			log.Info("proxy pod spec drift detected but pod is not controlled by this Loop; not deleting",
+				"proxy", proxyPodName(loopName), "loop", loopName)
+		} else {
+			log.Info("proxy pod spec drift detected, deleting for recreation",
+				"proxy", proxyPodName(loopName), "loop", loopName)
+			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
+			}
+		}
+		// Requeue so the next pass creates the new pod (the delete is
+		// asynchronous; the pod may not be gone yet).
+		return nil // the Owns(Pod) watch will trigger a re-reconcile
+	}
+	// Pod exists and hash matches: nothing to do.
+	podOp := controllerutil.OperationResultNone
+
+	if svcOp == controllerutil.OperationResultNone && podOp == controllerutil.OperationResultNone {
+		log.V(1).Info("ensured loop proxy (no change)",
+			"proxy", proxyPodName(loopName),
+			"namespace", ns,
+			"loop", loopName,
+		)
+	}
+	return nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&coxv1alpha1.Loop{}).
-		Owns(&sandboxv1beta1.Sandbox{}).
-		// P2 (R15): watch the per-Loop proxy pod and Service so a
-		// deleted/evicted proxy triggers reconciliation and is recreated.
-		Owns(&corev1.Pod{}).
-		Owns(&corev1.Service{}).
-		Named("loop").
-		Complete(r)
-}
+// newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit
+// fields (I36 P3, R13). It is a two-statement wrapper so golangci-lint's
+// modernize newexpr checker (which flags one-line pointer wrappers) does not
+// flag it, while still giving a named, self-documenting helper.
 
-// buildProxyPod constructs the desired proxy pod for a Loop (D33). The spec
-// is the same hardening as the agent (I36 parity): non-root own UID,
-// read-only rootfs, drop ALL caps, seccomp runtime default, no SA token,
-// limits. The model-creds Secret is mounted read-only into the proxy pod ONLY
-// (C2/ADR-0006 item 2); the agent pod never sees the key.
 func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.Pod {
+	secretMode := readOnlyMode
 	falseP := false
 	trueP := true
 	readOnlyRootfs := true
 	proxyUID := int64(65533)
 	proxyGID := int64(65533)
-	secretMode := readOnlyMode
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1039,13 +873,17 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
-				// The proxy binary checks the model-creds Secret at startup
-				// (D33 acceptance) and forwards to MODEL_ENDPOINT.
-				Env: []corev1.EnvVar{
-					{
-						Name:  "MODEL_ENDPOINT",
-						Value: modelEndpointValue(loop),
-					},
+				// D33 kind-run acceptance: the stand-in must prove at runtime
+				// that it CAN read the 0444 model-creds Secret file.
+				Command: []string{
+					"sh", "-c",
+					"echo 'proxy-stand-in: checking model-creds'; " +
+						"if head -c 64 /model-creds/* >/dev/null 2>&1; then " +
+						"echo 'proxy: model-creds readable (0444 secret file present)'; " +
+						"else " +
+						"echo 'proxy: model-creds NOT readable' && exit 1; " +
+						"fi; " +
+						"exec sleep infinity",
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
@@ -1069,6 +907,7 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 // (R15 fix: hash the actual pod spec, not a literal string). The hash is
 // stored on the pod as the proxySpecHashAnnotation; on a mismatch the operator
 // deletes and recreates the pod (spec.volumes is immutable on a bare Pod).
+
 func proxyPodSpecHash(pod *corev1.Pod) string {
 	// Hash the spec only (not the metadata, which includes the annotation we're
 	// computing — that would be a circular dependency).
@@ -1081,4 +920,522 @@ func proxyPodSpecHash(pod *corev1.Pod) string {
 	h := sha256.New()
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func proxyLabels(loopName string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/component": "model-proxy",
+		"coxswain.io/proxy-for":       loopName,
+	}
+}
+
+// proxyImage returns the model proxy pod image. It is the reconciler's
+// ProxyImage field (settable in tests and future slices; a manager flag
+// --proxy-image is a candidate for a future C2b), or a working stand-in
+// (golang:1.26) when unset. The stand-in has POSIX sh, head, and sleep —
+// enough for the D33 kind-run acceptance (the model-creds read + sleep
+// infinity).
+
+func proxyPodName(loopName string) string {
+	return loopName + proxyPodNameSuffix
+}
+
+func proxyServiceName(loopName string) string {
+	return fmt.Sprintf(proxyServiceNameFmt, loopName)
+}
+
+// proxyServiceURL is the in-cluster Service URL the agent's COX_MODEL_BASE_URL
+// points at (D33): http://<loop>-proxy.<namespace>.svc:8080. The per-Loop
+// Service identity is also what makes the proxy's activity-audit records
+// attributable to the Loop (D35).
+
+func proxyServiceURL(loopName, namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc:%d", proxyServiceName(loopName), namespace, proxyPort)
+}
+
+// proxyLabels is the label set the per-Loop proxy pod carries and the proxy
+// Service selects on (D33). The Service selects ONLY these labels, so no other
+// pod in the namespace can be reached through <loop>-proxy (D29: this Loop's
+// key is only usable by this Loop's agent; D34's NetworkPolicy enforces the
+// rest).
+
+const (
+	// proxyPodNameSuffix / proxyServiceNameFmt are the per-Loop proxy pod and
+	// Service names: <loop>-proxy (one each, owner-referenced to the Loop so
+	// both are GC'd with it).
+	proxyPodNameSuffix  = "-proxy"
+	proxyServiceNameFmt = "%s-proxy"
+	// proxySpecHashAnnotation records the hash of the desired proxy pod spec
+	// on the pod itself (P2, R15: operator upgrades change the spec; a bare
+	// Pod's spec is immutable, so the operator deletes and recreates the pod
+	// when the hash mismatches).
+	proxySpecHashAnnotation       = "coxswain.io/proxy-spec-hash"
+	proxyPort               int32 = 8080
+)
+
+// ensureProxyOrCleanup (D33) creates the per-Loop proxy pod + Service when a
+// model endpoint is configured, and deletes them when it is not.
+func (r *LoopReconciler) ensureProxyOrCleanup(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		return r.ensureProxy(ctx, loop)
+	}
+	return r.cleanupProxy(ctx, loop)
+}
+
+func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	ns := loop.Namespace
+	loopName := loop.Name
+	agentLabels := agentPodLabels(loopName)
+	proxyL := proxyLabels(loopName)
+	proxyPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: proxyL},
+	}
+	agentPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
+	}
+
+	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
+	// none" — the agent pod must be unreachable from every other pod,
+	// including other Loops' agents), egress to this Loop's proxy + DNS.
+	//
+	// P2 (R17 R18): the AgentPolicy `network` allows are NOT translated
+	// into egress rules. The naive port-only approach is rejected (I42,
+	// docs/REVIEW-PHASE1-R14.md): a port-only rule is "any host on that
+	// port," which is the exfiltration path. The hostname-level precision
+	// must come from D35's KubeArmor agent policy (matchDNSQueries). Until
+	// I42 is resolved, agent egress stays proxy + DNS. When C6a merges and
+	// I42 is resolved, the operator should set a NetworkAllowsNotEnforced
+	// condition on the Loop if it has AgentPolicy network allows that are
+	// not yet enforced. The gap is recorded in ADR-0007.
+	agentNP := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      loopName + "-agent-netpol",
+			Namespace: ns,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: agentLabels},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+			Ingress:     []networkingv1.NetworkPolicyIngressRule{},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
+					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+				},
+				{
+					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+					Ports: dnsPorts(),
+				},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(loop, agentNP, r.Scheme); err != nil {
+		return fmt.Errorf("set owner ref on agent NetworkPolicy: %w", err)
+	}
+	if _, err := r.createOrUpdateNP(ctx, agentNP); err != nil {
+		return fmt.Errorf("create or update agent NetworkPolicy: %w", err)
+	}
+
+	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, egress
+	// to the model endpoint peer + cluster DNS.
+	proxyNP := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      loopName + "-proxy-netpol",
+			Namespace: ns,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: proxyL},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+				},
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+					Ports: dnsPorts(),
+				},
+			},
+		},
+	}
+	// P2 (R16 review): the model endpoint is a non-secret Loop spec field
+	// (agent.modelEndpoint), not read from the Secret (which would require
+	// cluster-wide secrets RBAC and a cluster-wide Secret informer).
+	if loop.Spec.Agent.ModelEndpoint != "" {
+		if peer := modelPeer(loop.Spec.Agent.ModelEndpoint); peer != nil {
+			port := intstrPtr32(int32(modelEndpointPort(loop.Spec.Agent.ModelEndpoint)))
+			proxyNP.Spec.Egress = append(proxyNP.Spec.Egress, networkingv1.NetworkPolicyEgressRule{
+				To:    []networkingv1.NetworkPolicyPeer{*peer},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
+			})
+		}
+	}
+	if err := controllerutil.SetControllerReference(loop, proxyNP, r.Scheme); err != nil {
+		return fmt.Errorf("set owner ref on proxy NetworkPolicy: %w", err)
+	}
+	if _, err := r.createOrUpdateNP(ctx, proxyNP); err != nil {
+		return fmt.Errorf("create or update proxy NetworkPolicy: %w", err)
+	}
+
+	return nil
+}
+
+// agentPodLabels is the label set the agent (sandbox) pod carries (D34):
+// the per-Loop identity (coxswain.io/loop) plus the agent component. The
+// per-Loop NetworkPolicy podSelector and the proxy's ingress peer select
+// EXACTLY this set, so policies never leak across Loops in a namespace.
+// C6b's KubeArmorPolicy selector also keys on coxswain.io/loop, so the two
+// slices compose on the same label.
+
+func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, np *networkingv1.NetworkPolicy) (controllerutil.OperationResult, error) {
+	return controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+		return nil
+	})
+}
+
+// netpolAgentComponent is the app.kubernetes.io/component label value for
+// the agent pod (D34 NetworkPolicy uses this to select the agent pod).
+
+func dnsPeer() networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"kubernetes.io/metadata.name": "kube-system",
+			},
+		},
+		PodSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"k8s-app": "kube-dns",
+			},
+		},
+	}
+}
+
+// dnsPorts returns the DNS egress/ingress port set (53 UDP + TCP).
+
+func dnsPorts() []networkingv1.NetworkPolicyPort {
+	return []networkingv1.NetworkPolicyPort{
+		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolUDP)},
+		{Port: intstrPtr32(53), Protocol: new(corev1.ProtocolTCP)},
+	}
+}
+
+// modelPeer is the NetworkPolicy peer for the proxy's model egress (P1-4,
+// R16 review). NetworkPolicy cannot match DNS names, so:
+//   - a bare in-cluster Service name (single-label, same namespace as the
+//     policy): a podSelector over all pods in that namespace — the tightest
+//     selector that resolves the name without needing to watch Services. The
+//     hostname-level precision (only this host, not the whole namespace) is
+//     enforced by the proxy's KubeArmor policy (D35) which CAN match the DNS
+//     query. Recorded as a known limit in ADR-0007 alongside I41.
+//   - a numeric IP: an exact ipBlock /32.
+//   - anything else (external FQDN that does not resolve here): no peer —
+//     the model egress rule is omitted entirely (fail-closed), and the
+//     hostname-level allow belongs to D35's KubeArmor proxy policy.
+
+func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
+	host := endpoint
+	if strings.Contains(endpoint, "://") {
+		if u, err := neturl.Parse(endpoint); err == nil && u.Host != "" {
+			host = u.Host
+		}
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		cidr := ip.String() + "/32"
+		return &networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}}
+	}
+	if len(host) > 0 && host[0] != '.' && !strings.Contains(host, ".") {
+		return &networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{}},
+		}
+	}
+	return nil
+}
+
+// ensureNetworkPolicy creates the per-Loop NetworkPolicies (D34):
+//  1. Agent pod: ingress deny-all; egress only to THIS Loop's proxy on 8080
+//     and cluster DNS (kube-dns in kube-system, port 53 UDP/TCP).
+//  2. Proxy pod: ingress only from THIS Loop's agent on 8080; egress only to
+//     the model endpoint peer (pod selector or ipBlock) and cluster DNS.
+//
+// Every selector and peer is per-Loop (P1-1, R16 review): the agent pod
+// carries coxswain.io/loop=<loop> + the agent component label (set on the
+// Sandbox pod template by ensureSandbox), the proxy pod carries
+// coxswain.io/proxy-for=<loop> (D33). Two Loops in one namespace therefore
+// get two disjoint policy pairs and no cross-Loop traffic is allowed.
+//
+// Both policies are owner-ref'd to the Loop so they are GC'd with it.
+
+func agentPodLabels(loopName string) map[string]string {
+	return map[string]string{
+		"coxswain.io/loop":   loopName,
+		netpolComponentLabel: netpolAgentComponent,
+	}
+}
+
+// intstrPtr32 returns a pointer to an intstr.IntOrString with the given int.
+
+func modelEndpointValue(loop *coxv1alpha1.Loop) string {
+	if loop.Spec.Agent.ModelEndpoint != "" {
+		v := loop.Spec.Agent.ModelEndpoint
+		// Ensure it's a URL the Go reverse proxy can parse.
+		if !strings.Contains(v, "://") {
+			v = "http://" + v
+		}
+		return v
+	}
+	return ""
+}
+
+// ensureProxy creates the Loop's per-Loop model-proxy pod + Service (D33,
+// replaces the C2a sidecar). It is idempotent. The model-creds Secret is
+// mounted read-only into the proxy pod ONLY (C2/ADR-0006 item 2); the agent
+// pod never sees the key. Both objects are controller-owned by the Loop so
+// they are garbage-collected with it (a deleted Loop never leaves a live
+// proxy holding a key behind).
+
+func modelEndpointPort(rawURL string) int {
+	// If it looks like a URL (has a scheme), parse it as such.
+	if strings.Contains(rawURL, "://") {
+		if u, err := neturl.Parse(rawURL); err == nil {
+			if p, err2 := strconv.Atoi(u.Port()); err2 == nil {
+				return p
+			}
+			return 0
+		}
+	}
+	// Otherwise treat it as host:port.
+	if _, p, err := net.SplitHostPort(rawURL); err == nil {
+		if ip, err2 := strconv.Atoi(p); err2 == nil {
+			return ip
+		}
+	}
+	return 0
+}
+
+// createOrUpdateNP creates or updates a NetworkPolicy.
+
+func intstrPtr32(v int32) *intstr.IntOrString {
+	ips := intstr.FromInt32(v)
+	return &ips
+}
+
+// modelEndpointPort extracts the port from a model endpoint (host:port or URL).
+
+const (
+	// netpolAgentComponent is the component label the D34 agent NetworkPolicy
+	// selects on (alongside coxswain.io/loop).
+	netpolAgentComponent = "agent"
+	// netpolComponentLabel is the app.kubernetes.io/component label key.
+	netpolComponentLabel = "app.kubernetes.io/component"
+)
+// setCondition upserts a condition on the Loop's status. The condition's Type
+// is a string (a terminal phase like "Failed", or a non-phase condition type
+// like "PolicyEnforced" or "PolicyValid"). It is the operator's audit record
+// (ADR-0004); the runner never writes it.
+func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
+	now := metav1.Now()
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == condType {
+			if loop.Status.Conditions[i].Reason == reason &&
+				loop.Status.Conditions[i].Message == message &&
+				loop.Status.Conditions[i].Status == status {
+				return // unchanged
+			}
+			loop.Status.Conditions[i].Status = status
+			loop.Status.Conditions[i].Reason = reason
+			loop.Status.Conditions[i].Message = message
+			loop.Status.Conditions[i].LastTransitionTime = now
+			return
+		}
+	}
+	loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+	})
+}
+
+// sandboxImage returns the configured sandbox image, or a sensible Go dev default.
+func (r *LoopReconciler) sandboxImage() string {
+	if r.SandboxImage != "" {
+		return r.SandboxImage
+	}
+	return "docker.io/library/golang:1.26"
+}
+
+// proxyImage returns the model proxy sidecar image. It is the reconciler's
+// ProxyImage field (set from a manager flag in cmd/main.go, like SandboxImage),
+// or a dev stand-in (sleep infinity) when unset. The real proxy binary (auth
+// injection, forward-only-to-endpoint, metering) is C2b.
+func (r *LoopReconciler) proxyImage() string {
+	if r.ProxyImage != "" {
+		return r.ProxyImage
+	}
+	return "docker.io/library/golang:1.26"
+}
+
+// loopPolicyRefsFieldIndex is a field index on Loop.spec.policyRefs, used by
+// the AgentPolicy watch's map function to efficiently find the Loops that
+// reference a given AgentPolicy (R15 round 4 P2).
+const loopPolicyRefsFieldIndex = "spec.policyRefs"
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Field index: Loop.spec.policyRefs (R15 round 4 P2: the AgentPolicy
+	// watch's map function uses this index to find the Loops that reference
+	// a given AgentPolicy, avoiding a namespace-wide list per event).
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &coxv1alpha1.Loop{}, loopPolicyRefsFieldIndex,
+		func(obj client.Object) []string {
+			loop, ok := obj.(*coxv1alpha1.Loop)
+			if !ok {
+				return nil
+			}
+			return loop.Spec.PolicyRefs
+		}); err != nil {
+		return fmt.Errorf("index Loop.spec.policyRefs: %w", err)
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&coxv1alpha1.Loop{}).
+		Owns(&sandboxv1beta1.Sandbox{}).
+		// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
+		Owns(&corev1.Pod{}).
+		Owns(&corev1.Service{}).
+		// Watch AgentPolicy: when a referenced policy is created, edited, or
+		// deleted, re-reconcile the Loops that reference it (R15 round 4 P2:
+		// a policy created after its Loop must not leave the Loop stuck at
+		// PolicyNotFound; a policy edit must refresh the recorded hash).
+		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
+			r.agentPolicyToLoopRequests)).
+		Named("loop").
+		Complete(r)
+}
+
+// agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace
+// whose spec.policyRefs contains its name. Used by the AgentPolicy watch to
+// re-reconcile the affected Loops when the policy changes (R15 round 4 P2).
+// The field index on spec.policyRefs (registered in SetupWithManager and in
+// the envtest suite) makes this an O(1) lookup.
+func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	ap, ok := obj.(*coxv1alpha1.AgentPolicy)
+	if !ok {
+		return nil
+	}
+	loops := &coxv1alpha1.LoopList{}
+	if err := r.List(ctx, loops,
+		client.InNamespace(ap.Namespace),
+		client.MatchingFields{loopPolicyRefsFieldIndex: ap.Name},
+	); err != nil {
+		logf.FromContext(ctx).Error(err, "list Loops by policyRefs index for AgentPolicy watch",
+			"policy", ap.Name, "namespace", ap.Namespace)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(loops.Items))
+	for i := range loops.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: loops.Items[i].Namespace,
+				Name:      loops.Items[i].Name,
+			},
+		})
+	}
+	return requests
+}
+
+// suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it
+// is currently Running. Called when a Loop's AgentPolicy becomes invalid
+// (R15 round 3: an already-running sandbox must be suspended, not left
+// as-is). If the sandbox doesn't exist, this is a no-op.
+func (r *LoopReconciler) suspendSandboxIfRunning(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	sb := &sandboxv1beta1.Sandbox{}
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
+	if err := r.Get(ctx, key, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // no sandbox to suspend
+		}
+		return fmt.Errorf("get sandbox %s: %w", key, err)
+	}
+	if sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
+		return nil // already suspended
+	}
+	sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	if err := r.Update(ctx, sb); err != nil {
+		return fmt.Errorf("suspend sandbox %s: %w", key, err)
+	}
+	logf.FromContext(ctx).Info("suspended sandbox (policy invalid)", "sandbox", sandboxName(loop.Name), "loop", loop.Name)
+	return nil
+}
+
+// policyValidationResult is the outcome of validating a Loop's referenced
+// AgentPolicies before the sandbox is created or the eBPF engine is reached.
+type policyValidationResult struct {
+	// valid is true when all referenced policies exist and have canonical
+	// exec paths.
+	valid bool
+	// reason is the metav1.ConditionReason (NonCanonicalExecPath or
+	// PolicyNotFound) when valid is false.
+	reason string
+	// message is the human-readable explanation.
+	message            string
+	transientReadError bool
+}
+
+// validateAgentPolicies checks that every referenced AgentPolicy exists and
+// has canonical exec paths. Returns a policyValidationResult. The
+// transientReadError field is true when the policy could not be read due to a
+// transient error (not a NotFound), in which case the caller should requeue.
+// R15 round 3: a missing or unreadable referenced policy is treated as
+// not-valid (PolicyNotFound), not ignored (fail-closed).
+// Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
+func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
+	for _, name := range loop.Spec.PolicyRefs {
+		ap := &coxv1alpha1.AgentPolicy{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
+			if apierrors.IsNotFound(err) {
+				return policyValidationResult{valid: false, reason: "PolicyNotFound",
+					message: fmt.Sprintf("AgentPolicy %s/%s not found (referenced by policyRefs)", loop.Namespace, name)}
+			}
+			// Unreadable (transient error): fail closed, requeue.
+			return policyValidationResult{valid: false, reason: "PolicyNotFound",
+				message:            fmt.Sprintf("AgentPolicy %s/%s could not be read: %v", loop.Namespace, name, err),
+				transientReadError: true}
+		}
+		for _, e := range ap.Spec.Exec {
+			if isNonCanonicalPath(e) {
+				return policyValidationResult{valid: false, reason: "NonCanonicalExecPath",
+					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
+			}
+		}
+	}
+	return policyValidationResult{valid: true}
+}
+
+// isNonCanonicalPath returns true if the path is non-canonical: it contains
+// a '.' or '..' segment, a '//' (double slash), or ends with a '/'. The eBPF
+// engine and the filesystem normalize such paths, so a non-canonical path
+// that looks outside the writable mounts could resolve to one (e.g.
+// "/usr/../tmp/git" or "/./tmp/git"). The CRD CEL XValidation catches the
+// common case at admission (with items:MaxLength bounding the string length);
+// the controller is the second line of defence (catches everything).
+func isNonCanonicalPath(p string) bool {
+	if strings.Contains(p, "..") {
+		return true
+	}
+	// Catch '.' segments: "/./tmp/git" resolves to "/tmp/git".
+	if strings.Contains(p, "/./") {
+		return true
+	}
+	if strings.Contains(p, "//") {
+		return true
+	}
+	if len(p) > 1 && strings.HasSuffix(p, "/") {
+		return true
+	}
+	return false
 }

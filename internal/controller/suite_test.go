@@ -75,6 +75,13 @@ var _ = BeforeSuite(func() {
 
 	// +kubebuilder:scaffold:scheme
 
+	// I45: the envtest apiserver must enforce ValidatingAdmissionPolicies for
+	// the I45 spec (pods/ephemeralcontainers denial on coxswain component
+	// pods). The feature gate is required on the apiserver side (the Go API
+	// type ships in k8s 1.34, but the envtest apiserver does not enable the
+	// gate by default). Enabling it here is the "gate" the I43 norm refers
+	// to: remove ValidatingAdmissionPolicy=true from this list and the I45
+	// spec fails (the update is allowed for all pods).
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		// The Loop CRD plus the agent-sandbox Sandbox CRD (vendored under
@@ -85,7 +92,19 @@ var _ = BeforeSuite(func() {
 			filepath.Join("..", "..", "config", "crd", "external"),
 		},
 		ErrorIfCRDPathMissing: true,
+		ControlPlane: envtest.ControlPlane{
+			APIServer: &envtest.APIServer{},
+		},
 	}
+	// I45: enable the ValidatingAdmissionPolicy admission plugin on the envtest
+	// apiserver. The envtest apiserver does NOT run this plugin by default, so
+	// without it the I45 ValidatingAdmissionPolicy + binding are not enforced
+	// and the denied specs would (wrongly) pass. Args is deprecated, so the
+	// flag is appended via the supported Configure() hook after the
+	// Environment struct is built.
+	testEnv.ControlPlane.APIServer.Configure().Append(
+		"--enable-admission-plugins=ValidatingAdmissionPolicy",
+	)
 
 	// Retrieve the first found binary directory to allow running tests from IDEs
 	if getFirstFoundEnvTestBinaryDir() != "" {

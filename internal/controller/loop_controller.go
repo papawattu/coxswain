@@ -2031,8 +2031,10 @@ func intstrPtr32(v int32) *intstr.IntOrString {
 
 const (
 	// netpolAgentComponent is the component label the D34 agent NetworkPolicy
-	// selects on (alongside coxswain.io/loop).
-	netpolAgentComponent = "agent"
+	// selects on (alongside coxswain.io/loop). It aliases the policy package's
+	// component constant (R16 I45: one source of truth for the label value,
+	// shared with the I45 ValidatingAdmissionPolicy pin).
+	netpolAgentComponent = policy.ComponentAgentLabel
 	// netpolEgressProxyComponent is the component label value (and the egress
 	// proxy container name) the I42b egress proxy pod uses. It aliases the
 	// policy package's component constant (R16 I44 item 3: one source of truth

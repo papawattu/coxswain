@@ -1011,6 +1011,25 @@ and, per ADR-0005, gains:
 - `secrets/get` (in the Loop's namespace) — to read
   `spec.workspace.gitCredentialSecret` for go-git ref resolution (D15).
 
+**RBAC guidance — `pods/ephemeralcontainers` (I45, R16):** the operator does
+NOT need `pods/ephemeralcontainers`, and neither does the agent runner. Adding
+an ephemeral container (`kubectl debug`) to a coxswain component pod (agent,
+model-proxy, egress-proxy) runs the debug container OUTSIDE the KubeArmor fence
+and shares the pod's network namespace — so it is denied for those pods by the
+`ValidatingAdmissionPolicy` + binding in
+`config/admission/validating_admission_policy.yaml` (wired into
+`config/default`/`config/dev`). Cluster admins may still grant it elsewhere.
+Loop-namespace Roles should NOT include `pods/ephemeralcontainers` for any
+non-admin principal.
+
+**Relabel note:** the VAP matches by **label**, so a principal who can
+`update`/`patch` pods in a Loop namespace can strip the
+`app.kubernetes.io/component` label and then add an ephemeral container to
+that (now-unlabelled) pod. Restricting `pods` update/patch is therefore
+REQUIRED in Loop namespaces as well — not just the ephemeralcontainers
+subresource. (Relabelling also detaches the pod from its NetworkPolicy and
+KubeArmor selectors, which is independently dangerous.)
+
 
 ## Out of scope for Phase 1
 

@@ -1105,36 +1105,33 @@ func (r *LoopReconciler) operatorProxyEnv(loopName, namespace string) []corev1.E
 	}
 }
 
-// clusterDomain returns the reconciler's cluster domain (default cluster.local
-// when ClusterDomain is unset, R16 I44 item 2).
+// clusterDomain returns the reconciler's cluster domain (default
+// policy.DefaultClusterDomain when ClusterDomain is unset, R16 I44 item 2:
+// one source of truth for the default).
 func (r *LoopReconciler) clusterDomain() string {
 	if r.ClusterDomain != "" {
 		return r.ClusterDomain
 	}
-	return defaultClusterDomain
+	return policy.DefaultClusterDomain
 }
 
-// defaultClusterDomain is the default cluster service DNS domain (R16 I44
-// item 2: the domain is a reconciler field, but the default is a single
-// source of truth).
-const defaultClusterDomain = "cluster.local"
-
-// proxyServiceFQDN returns the per-Loop proxy Service FQDN the agent resolves
+// ProxyServiceFQDN returns the per-Loop proxy Service FQDN the agent resolves
 // via DNS to reach the model proxy (D33: <loop>-proxy.<ns>.svc). Built from
-// proxyServiceName (the controller's name) + the cluster domain — NOT a
-// literal (R16 I44 item 1). It is what policy.Translate puts on the agent's
-// DNS allowlist.
-func (r *LoopReconciler) proxyServiceFQDN(loopName, namespace string) string {
+// proxyServiceName (the controller's name) — NOT a literal (R16 I44 item 1).
+// It is what policy.Translate puts on the agent's DNS allowlist, and is wired
+// into the KubeArmorEnforcer at construction (main.go) so the enforcer cannot
+// build the FQDN from a literal of its own.
+func ProxyServiceFQDN(loopName, namespace string) string {
 	return proxyServiceName(loopName) + "." + namespace + ".svc"
 }
 
-// egressProxyServiceFQDN returns the per-Loop egress proxy Service FQDN the
+// EgressProxyServiceFQDN returns the per-Loop egress proxy Service FQDN the
 // agent resolves via DNS to reach the egress proxy (I42d:
 // <loop>-egress-proxy.<ns>.svc). Built from egressProxyServiceName (the
 // controller's name) — NOT a `-egress-proxy.` literal (R16 I44 item 1). It is
 // what the agent's DNS allowlist carries so a rename cannot desync the
 // allowlist from the URL the agent dials.
-func (r *LoopReconciler) egressProxyServiceFQDN(loopName, namespace string) string {
+func EgressProxyServiceFQDN(loopName, namespace string) string {
 	return egressProxyServiceName(loopName) + "." + namespace + ".svc"
 }
 
@@ -2066,13 +2063,6 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		return err
 	}
 	if r.Enforcer != nil {
-		// R16 I44 item 1+2: wire the reconciler's FQDN naming + cluster domain
-		// into the KubeArmorEnforcer (the enforcer must not build them from a
-		// literal or hard-code the domain). A no-op for fakes (the type assert
-		// fails); idempotent (re-asserts the same values each reconcile).
-		if ka, ok := r.Enforcer.(*engine.KubeArmorEnforcer); ok {
-			ka.SetProxyFQDNs(r.proxyServiceFQDN, r.egressProxyServiceFQDN, r.clusterDomain())
-		}
 		// I42f review P2 (round 1): a foreign KubeArmorPolicy occupying one of
 		// the Loop's policy names is NEVER overwritten (createOrUpdateKapt's
 		// errForeignKapt sentinel). The same pattern as I42c's

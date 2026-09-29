@@ -22,12 +22,15 @@ package controller
 // cluster.local cannot re-sneak back in.
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/engine"
+	"github.com/papawattu/coxswain/internal/policy"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -106,6 +109,18 @@ func TestModelProxyPolicyUsesClusterDomain(t *testing.T) {
 	// would have produced it).
 	if containsStr(domains, i44TestModel+"."+i44TestNS+".svc.cluster.local") {
 		t.Fatalf("model proxy policy must NOT carry the hard-coded cluster.local form when a non-default domain is set, got %v", domains)
+	}
+}
+
+// TestApplyWithoutWiredFQDNsErrors asserts the enforcer's Apply returns an error
+// (not a silent fallback) when the proxy FQDN functions are not wired at
+// construction (R16 I44 item 1 + review #30 P2: deleting the engine's literal
+// fallbacks makes a missing wiring a configuration error).
+func TestApplyWithoutWiredFQDNsErrors(t *testing.T) {
+	e := &engine.KubeArmorEnforcer{Client: nil} // ProxyFQDN/EgressProxyFQDN nil.
+	loop := &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: i44TestLoop, Namespace: i44TestNS}}
+	if err := e.Apply(context.Background(), loop, policy.EffectivePolicy{}); !errors.Is(err, engine.ErrNoProxyFQDNs) {
+		t.Fatalf("Apply with unwired FQDNs must return ErrNoProxyFQDNs, got %v", err)
 	}
 }
 

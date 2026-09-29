@@ -77,7 +77,7 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 		r = &LoopReconciler{
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
-			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient},
+			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN},
 			PodCIDR:          i42bPodCIDR,
 			ServiceCIDR:      i42bServiceCIDR,
 			EgressProxyImage: i42bEgressProxyImg,

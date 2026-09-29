@@ -104,7 +104,7 @@ func EmitEgressProxyKubeArmorPolicy(loopName, namespace string, networkAllows []
 func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint, clusterDomain string) *unstructured.Unstructured {
 	host, _ := modelEndpointHost(modelEndpoint)
 	if clusterDomain == "" {
-		clusterDomain = defaultClusterDomain
+		clusterDomain = policy.DefaultClusterDomain
 	}
 	spec := map[string]any{
 		kaptActionKey: kaptActionValue,

@@ -214,10 +214,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// R16 I44 item 1+2: the KubeArmorEnforcer is configured ONCE at
+	// construction with the proxy Service FQDN functions (built from the
+	// controller's proxyServiceName/egressProxyServiceName naming) and the
+	// cluster domain. The enforcer must not build the FQDNs from a literal or
+	// hard-code the domain, and (review #30 P2) it must not be mutated per
+	// reconcile (a shared-enforcer mutation races if the controller's
+	// concurrency is raised).
+	kaEnforcer := &engine.KubeArmorEnforcer{
+		Client:          mgr.GetClient(),
+		ProxyFQDN:       controller.ProxyServiceFQDN,
+		EgressProxyFQDN: controller.EgressProxyServiceFQDN,
+		ClusterDomain:   clusterDomain,
+	}
 	if err := (&controller.LoopReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
-		Enforcer:        &engine.KubeArmorEnforcer{Client: mgr.GetClient()},
+		Enforcer:        kaEnforcer,
 		AllowUnenforced: allowUnenforced,
 		ClusterDomain:   clusterDomain,
 	}).SetupWithManager(mgr); err != nil {

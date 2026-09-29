@@ -211,6 +211,12 @@ const (
 	ComponentEgressProxyLabel = "egress-proxy"
 )
 
+// DefaultClusterDomain is the default cluster service DNS domain (R16 I44
+// item 2: the domain is a reconciler field defaulting to this; one source of
+// truth shared by the controller and the engine). It is not the only valid
+// value — a non-default-domain cluster sets the operator's --cluster-domain.
+const DefaultClusterDomain = "cluster.local"
+
 // ProxyComponentSelector is the label selector for the operator's Pod and
 // Service cache. It matches the model proxy and the egress proxy — the two
 // operator-owned per-Loop proxy components the operator Gets through the

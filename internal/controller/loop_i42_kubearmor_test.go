@@ -119,7 +119,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			PodCIDR:          i42bPodCIDR,
 			ServiceCIDR:      i42bServiceCIDR,
 			EgressProxyImage: i42bEgressProxyImg,
-			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient},
+			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN},
 		}
 	})
 

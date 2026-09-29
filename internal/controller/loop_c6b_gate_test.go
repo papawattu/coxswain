@@ -180,7 +180,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("owner-refs the KubeArmorPolicy to the Loop (P2)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: &engine.KubeArmorEnforcer{Client: k8sClient}, AllowUnenforced: true}
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN}, AllowUnenforced: true}
 		ns := "c6b-ownerref"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

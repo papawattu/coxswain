@@ -494,15 +494,15 @@ echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${TEST_IP}) rejected b
 cat > "$TMPDIR/probe-rebind.sh" <<EOF
 #!/bin/sh
 echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via HTTPS_PROXY env --"
-code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://${REBIND_NAME}/ 2>&1)
-ec=$?
-echo "curl-exit=$ec http=$code"
-if [ "$code" = "403" ]; then
+code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://${REBIND_NAME}/ 2>&1)
+ec=\$?
+echo "curl-exit=\$ec http=\$code"
+if [ "\$code" = "403" ]; then
   echo "curl got 403 (blocked by resolved-IP carve-out as expected)"
-elif [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+elif [ "\$code" = "200" ] || [ "\$code" = "301" ] || [ "\$code" = "302" ]; then
   echo "curl SUCCEEDED (UNEXPECTED — the proxy should have blocked the private IP)"
 else
-  echo "curl got http=$code exit=$ec"
+  echo "curl got http=\$code exit=\$ec"
 fi
 EOF
 K -n "$NS" cp "$TMPDIR/probe-rebind.sh" "$AGENT_POD:/tmp/probe-rebind.sh" 2>/dev/null || bad "kubectl cp probe-rebind.sh failed"

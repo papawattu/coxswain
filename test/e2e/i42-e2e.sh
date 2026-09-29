@@ -57,6 +57,7 @@ case ":$PATH:" in *":$GOPATH_BIN:"*) ;; *) PATH="$GOPATH_BIN:$PATH"; export PATH
 CTX="${K8S_CONTEXT:-kind-coxswain-dev}"
 CLUSTER="${KIND_CLUSTER_NAME:-coxswain-dev}"
 NS=i42-e2e
+REBIND_NAME="i42-rebind.example.test"
 LOOP=i42-loop
 E2E_NS=coxswain-system
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -178,8 +179,18 @@ echo "   hosts override IP: $OVERRIDE_IP"
 K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
 echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
 COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
-HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${OVERRIDE_IP} }"
-NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
+# Build a proper multi-line hosts block:
+#   hosts {
+#     <OVERRIDE_IP> <REBIND_NAME>
+#     fallthrough
+#   }
+# The entry is IP then name. Bare fallthrough on its own line means
+# "for all other names, fall through to the next plugin."
+HOSTS_BLOCK="    hosts {
+        ${OVERRIDE_IP} ${REBIND_NAME}
+        fallthrough
+      }"
+NEW_COREFILE=$(echo "$COREFILE" | awk -v hblock="$HOSTS_BLOCK" 'NR==1 {print; print hblock; next} {print}')
 if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
   echo "FATAL: could not insert the hosts block into the Corefile"
   exit 2
@@ -188,6 +199,20 @@ echo "   modified Corefile (first 5 lines):"
 echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
 K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
 echo "   coredns ConfigMap updated (no reload needed — pods not yet created)"
+# Verify the hosts block works: from a coredns pod (already running),
+# getent hosts proxy.golang.org must resolve (not NXDOMAIN) while the
+# override is active. If it returns NXDOMAIN, the hosts block is
+# malformed and would break ALL DNS in the cluster.
+COREDNS_POD=$(K -n kube-system get pod -l k8s-app=kube-dns -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$COREDNS_POD" ]; then
+  RESOLVE_TEST=$(K -n kube-system exec "$COREDNS_POD" -- sh -c "getent hosts proxy.golang.org 2>&1" 2>&1 || echo "resolve-failed")
+  if echo "$RESOLVE_TEST" | grep -q "proxy.golang.org"; then
+    echo "   DNS verification: proxy.golang.org resolves correctly with the override active"
+  else
+    echo "   WARNING: proxy.golang.org does NOT resolve with the override active (got: $RESOLVE_TEST)"
+    echo "   The hosts block may be malformed. Check the Corefile."
+  fi
+fi
 
 echo "--- STEP 2: deploy controller (dev overlay: --allow-unenforced) ---"
 make -C "$REPO_ROOT" kustomize >/dev/null 2>&1
@@ -222,7 +247,6 @@ echo "   cluster-internal pod IP for checks 5+7: $TEST_IP"
 
 # The DNS-rebinding name (allowed by the AgentPolicy, resolves to TEST_IP via
 # the CoreDNS hosts override in step 3d).
-REBIND_NAME="i42-rebind.example.test"
 REBIND_ALLOW="${REBIND_NAME}:80"
 
 # ===========================================================================

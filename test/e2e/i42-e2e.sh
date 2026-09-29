@@ -105,6 +105,10 @@ cleanup() {
     sleep 15
     echo "   coredns restored (ConfigMap replaced, waiting for reload)."
   fi
+  # R16 I44 (review #29 P3b): remove the temp kustomize overlay tree
+  if [ -n "$TMP_OVERLAY" ]; then
+    rm -rf "$TMP_OVERLAY" 2>/dev/null || true
+  fi
   # delete the throwaway exec pod
   if [ -n "$THROWAWAY_POD" ]; then
     echo "--- cleaning up throwaway pod $THROWAWAY_POD (kubectl delete) ---"
@@ -217,8 +221,16 @@ fi
 echo "--- STEP 2: deploy controller (dev overlay: --allow-unenforced) ---"
 make -C "$REPO_ROOT" kustomize >/dev/null 2>&1
 KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
-(cd "$REPO_ROOT/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
-(cd "$REPO_ROOT" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) \
+# R16 I44 (review #29 P3b): build the dev overlay from a TEMP COPY of the
+# config tree so `kustomize edit set image` never rewrites the tracked
+# config/manager/kustomization.yaml (it used to dirty the working tree on every
+# run). The temp tree mirrors the whole config/ directory (dev -> default ->
+# {crd,rbac,manager} must all resolve inside it), and the image override is
+# applied to the copy only. trap cleanup removes the temp tree on EXIT.
+TMP_OVERLAY=$(mktemp -d)
+cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
+(cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
+(cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) \
   || { echo "FATAL: controller deploy failed"; exit 2; }
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || { echo "FATAL: controller not ready"; exit 2; }
 RUNNING_IMG_ID=$(K -n "$E2E_NS" get pods -l control-plane=controller-manager -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null)
@@ -555,8 +567,8 @@ K -n "$NS" cp "$TMPDIR/probe-rebind.sh" "$AGENT_POD:/tmp/probe-rebind.sh" 2>/dev
 P7=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-rebind.sh 2>&1)
 echo "$P7"
 case "$P7" in
-  *"SUCCEEDED"*) bad "the rebinding name SUCCEEDED via the proxy (the resolved-IP carve-out failed to block $TEST_IP)" ;;
-  *"403 (blocked by resolved-IP carve-out as expected)"*) ok "the rebinding name was 403'd by the egress proxy (resolved-IP carve-out blocked $TEST_IP)" ;;
+  *"SUCCEEDED"*) bad "the rebinding name SUCCEEDED via the proxy (the resolved-IP carve-out failed to block $OVERRIDE_IP)" ;;
+  *"403 (blocked by resolved-IP carve-out as expected)"*) ok "the rebinding name was 403'd by the egress proxy (resolved-IP carve-out blocked $OVERRIDE_IP)" ;;
   *) bad "unexpected output for rebinding check (output: $P7)" ;;
 esac
 sleep 2

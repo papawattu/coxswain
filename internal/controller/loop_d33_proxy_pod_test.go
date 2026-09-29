@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 )
 
 const (
@@ -155,7 +156,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		agentEnv := envByName(agent)
 		Expect(agentEnv).To(HaveKey(coxModelBaseURL),
 			"the agent must be pointed at the proxy Service via COX_MODEL_BASE_URL (D33)")
-		Expect(agentEnv[coxModelBaseURL].Value).To(Equal(proxyServiceURL(name, ns)),
+		Expect(agentEnv[coxModelBaseURL].Value).To(Equal((&LoopReconciler{}).proxyServiceURL(name, ns)),
 			"COX_MODEL_BASE_URL must be http://<loop>-proxy.<ns>.svc.cluster.local:8080")
 
 		By("creating the proxy Pod, owner-referenced to the Loop")
@@ -409,8 +410,8 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 				Name:      "unowned-loop-proxy",
 				Namespace: ns,
 				Labels: map[string]string{
-					netpolComponentLabel: "model-proxy",
-					netpolProxyForLabel:  "unowned-loop",
+					policy.ComponentLabelKey: policy.ComponentProxyLabel,
+					netpolProxyForLabel:      "unowned-loop",
 				},
 				Annotations: map[string]string{
 					proxySpecHashAnnotation: "stale-hash-000000",

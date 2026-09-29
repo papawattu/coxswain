@@ -220,7 +220,7 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 		// Regression guard: the proxy vars must be APPENDED to the agent env,
 		// not replace it — the pre-existing vars (COX_MODEL_BASE_URL, HOME)
 		// must survive alongside them.
-		Expect(env[coxModelBaseURL]).To(Equal(proxyServiceURL(i42dAllowLoop, ns)),
+		Expect(env[coxModelBaseURL]).To(Equal(r.proxyServiceURL(i42dAllowLoop, ns)),
 			"COX_MODEL_BASE_URL must survive alongside the proxy env vars")
 		Expect(env).To(HaveKeyWithValue("HOME", "/scratch"))
 	})

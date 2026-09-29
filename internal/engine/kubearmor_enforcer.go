@@ -23,12 +23,31 @@ import (
 // sandbox Suspended.
 var ErrForeignKapt = fmt.Errorf("KubeArmorPolicy is controlled by another controller (foreign)")
 
+// ErrNoProxyFQDNs is returned by Apply when the enforcer's proxy FQDN
+// functions were not wired at construction (R16 I44 item 1: the enforcer must
+// not build them from a `-proxy` / `-egress-proxy` literal, so a missing wiring
+// is a configuration error, not a silent fallback).
+var ErrNoProxyFQDNs = fmt.Errorf("KubeArmorEnforcer: proxy FQDN functions are not configured (wire them at construction, R16 I44 item 1)")
+
 // KubeArmorEnforcer is the production Enforcer: it emits the KubeArmorPolicy for
 // the Loop's effective policy (Apply) and reports whether the engine is
 // enforcing (Enforcing). It writes the KubeArmorPolicy as an unstructured
 // object (no KubeArmor Go type dependency) and owner-refs it to the Loop (P2).
 type KubeArmorEnforcer struct {
 	Client client.Client
+	// proxyFQDN / egressProxyFQDN are the per-Loop proxy Service FQDNs the
+	// agent's DNS allowlist carries (built by the controller's reconciler from
+	// proxyServiceName / egressProxyServiceName + the cluster domain; R16 I44
+	// item 1: the enforcer must not build them from a `-proxy` / `-egress-proxy`
+	// literal, and R16 I44 item 2: it must not hard-code the cluster domain).
+	// They are REQUIRED: Apply returns an error when either is nil. Wired ONCE
+	// at construction (cmd/main.go and the envtest suites), never per reconcile.
+	ProxyFQDN       func(loopName, ns string) string
+	EgressProxyFQDN func(loopName, ns string) string
+	// ClusterDomain is the cluster's service DNS domain (default
+	// policy.DefaultClusterDomain when empty) used by the model-proxy policy's
+	// bare-host FQDN expansion (R16 I44 item 2). Set at construction.
+	ClusterDomain string
 }
 
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective
@@ -45,11 +64,17 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// the effective policy has network allows — that is exactly when the egress
 	// proxy exists and the agent's *_PROXY env points at it. With no allows the
 	// agent has no external egress and the name stays out of the allowlist.
+	// The FQDNs are wired at construction by the controller (R16 I44 item 1:
+	// the enforcer must not build them from a `-proxy` / `-egress-proxy`
+	// literal). They are required — a missing wiring is a configuration error.
+	if e.ProxyFQDN == nil || e.EgressProxyFQDN == nil {
+		return ErrNoProxyFQDNs
+	}
 	egressFQDN := ""
 	if len(p.Network) > 0 {
-		egressFQDN = egressProxyServiceFQDN(loop.Name, loop.Namespace)
+		egressFQDN = e.EgressProxyFQDN(loop.Name, loop.Namespace)
 	}
-	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p, proxyServiceFQDN(loop.Name, loop.Namespace), egressFQDN))
+	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p, e.ProxyFQDN(loop.Name, loop.Namespace), egressFQDN))
 	if err := e.createOrUpdateKapt(ctx, loop, obj); err != nil {
 		return err
 	}
@@ -59,7 +84,7 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// branch when the endpoint is removed (same drift rationale as the egress
 	// proxy policy below).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
-		modelObj := EmitModelProxyKubeArmorPolicy(loop.Name, loop.Namespace, loop.Spec.Agent.ModelEndpoint)
+		modelObj := EmitModelProxyKubeArmorPolicy(loop.Name, loop.Namespace, loop.Spec.Agent.ModelEndpoint, e.clusterDomain())
 		if err := e.createOrUpdateKapt(ctx, loop, modelObj); err != nil {
 			return err
 		}
@@ -182,17 +207,12 @@ func (e *KubeArmorEnforcer) Enforcing(_ context.Context, _ *v1alpha1.Loop) (bool
 // KubeArmorGVK is the GroupVersionKind of a KubeArmorPolicy.
 var KubeArmorGVK = schema.GroupVersionKind{Group: kaptGroup, Version: kaptVersion, Kind: kaptKind}
 
-// egressProxyServiceFQDN returns the per-Loop egress proxy Service FQDN that
-// the agent resolves via DNS to reach the egress proxy (I42d):
-// <loop>-egress-proxy.<ns>.svc. Built from the name the controller uses
-// (egressProxyServiceName), not a literal, so a rename cannot desync the
-// allowlist from the URL the agent dials.
-func egressProxyServiceFQDN(loopName, ns string) string {
-	return loopName + "-egress-proxy." + ns + ".svc"
-}
-
-// proxyServiceFQDN returns the per-Loop proxy Service FQDN that the agent
-// resolves via DNS to reach the model proxy (D33: <loop>-proxy.<ns>.svc).
-func proxyServiceFQDN(loopName, ns string) string {
-	return loopName + "-proxy." + ns + ".svc"
+// clusterDomain returns the enforcer's cluster domain, defaulting to
+// policy.DefaultClusterDomain when unset (R16 I44 item 2: one source of truth
+// for the default).
+func (e *KubeArmorEnforcer) clusterDomain() string {
+	if e.ClusterDomain != "" {
+		return e.ClusterDomain
+	}
+	return policy.DefaultClusterDomain
 }

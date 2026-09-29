@@ -128,6 +128,13 @@ type LoopReconciler struct {
 	// egress-proxy NetworkPolicy omits the operator-supplied carve-outs.
 	PodCIDR     string
 	ServiceCIDR string
+
+	// ClusterDomain is the cluster's service DNS domain (default
+	// cluster.local, settable in tests). Used by proxyServiceURL /
+	// egressProxyServiceURL / egressNOProxy (the agent's proxy env URLs) and
+	// by the FQDNs the Enforcer puts on the agent's DNS allowlist, so a
+	// non-default-domain cluster is supported. (R16 I44 item 2.)
+	ClusterDomain string
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -510,7 +517,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// rejected at admission, I34) so the agent cannot be pointed past the proxy.
 		// Only set when a model endpoint exists (P1: no half-configured proxy).
 		if hasModel {
-			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: proxyServiceURL(loop.Name, loop.Namespace)})
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: r.proxyServiceURL(loop.Name, loop.Namespace)})
 		}
 		// I42d: when the egress proxy is expected (network allows present, or the
 		// policy cannot be read — the fail-closed needsEgressProxy gate), the agent
@@ -524,8 +531,8 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		if needsEgressProxy(ctx, r, loop) {
 			// The append must extend agentEnv, NOT replace it: replacing would
 			// drop everything appended before (COX_MODEL_BASE_URL, HOME, ...).
-			noProxy := egressNOProxy(loop)
-			agentEnv = append(agentEnv, operatorProxyEnv(loop.Name, loop.Namespace)...)
+			noProxy := r.egressNOProxy(loop)
+			agentEnv = append(agentEnv, r.operatorProxyEnv(loop.Name, loop.Namespace)...)
 			agentEnv = append(agentEnv,
 				corev1.EnvVar{Name: "NO_PROXY", Value: noProxy},
 				corev1.EnvVar{Name: "no_proxy", Value: noProxy},
@@ -1010,8 +1017,8 @@ func proxyPodSpecHash(pod *corev1.Pod) string {
 
 func proxyLabels(loopName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/component": "model-proxy",
-		"coxswain.io/proxy-for":       loopName,
+		policy.ComponentLabelKey: policy.ComponentProxyLabel,
+		"coxswain.io/proxy-for":  loopName,
 	}
 }
 
@@ -1031,21 +1038,21 @@ func proxyServiceName(loopName string) string {
 }
 
 // proxyServiceURL is the in-cluster Service URL the agent's COX_MODEL_BASE_URL
-// points at (D33): http://<loop>-proxy.<namespace>.svc:8080. The per-Loop
-// Service identity is also what makes the proxy's activity-audit records
-// attributable to the Loop (D35).
-
-func proxyServiceURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", proxyServiceName(loopName), namespace, proxyPort)
+// points at (D33): http://<loop>-proxy.<namespace>.svc.<clusterDomain>:8080.
+// The per-Loop Service identity is also what makes the proxy's activity-audit
+// records attributable to the Loop (D35). The cluster domain is the
+// reconciler's ClusterDomain field (default cluster.local, R16 I44 item 2).
+func (r *LoopReconciler) proxyServiceURL(loopName, namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc.%s:%d", proxyServiceName(loopName), namespace, r.clusterDomain(), proxyPort)
 }
 
 // egressProxyServiceURL is the in-cluster URL the agent's *_PROXY env vars
-// point at (I42d): http://<loop>-egress-proxy.<namespace>.svc:3128. The
-// egress proxy enforces the hostname:port allowlist at the HTTP CONNECT / SNI
+// point at (I42d): http://<loop>-egress-proxy.<namespace>.svc.<clusterDomain>:3128.
+// The egress proxy enforces the hostname:port allowlist at the HTTP CONNECT / SNI
 // / Host layer (ADR-0007); the agent routes external egress through it and
 // model calls bypass it via NO_PROXY.
-func egressProxyServiceURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", egressProxyServiceName(loopName), namespace, egressProxyPort)
+func (r *LoopReconciler) egressProxyServiceURL(loopName, namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc.%s:%d", egressProxyServiceName(loopName), namespace, r.clusterDomain(), egressProxyPort)
 }
 
 // egressNOProxy is the agent's NO_PROXY value (I42d): the model proxy Service
@@ -1053,11 +1060,12 @@ func egressProxyServiceURL(loopName, namespace string) string {
 // proxy's .svc URL — bypass the egress proxy) + localhost/loopback. The model
 // proxy's host matches the COX_MODEL_BASE_URL host, which is what proxy clients
 // match NO_PROXY by.
-func egressNOProxy(loop *coxv1alpha1.Loop) string {
+func (r *LoopReconciler) egressNOProxy(loop *coxv1alpha1.Loop) string {
 	proxySvc := proxyServiceName(loop.Name)
+	domain := r.clusterDomain()
 	return strings.Join([]string{
 		proxySvc + "." + loop.Namespace + ".svc",
-		proxySvc + "." + loop.Namespace + ".svc.cluster.local",
+		proxySvc + "." + loop.Namespace + ".svc." + domain,
 		"localhost",
 		"127.0.0.1",
 	}, ",")
@@ -1087,14 +1095,44 @@ var operatorProxyEnvNames = map[string]struct{}{
 // proxy (I42d): HTTPS_PROXY/https_proxy and HTTP_PROXY/http_proxy point at
 // the egress proxy Service. NO_PROXY/no_proxy are appended by the caller
 // (they carry the per-Loop egressNOProxy value).
-func operatorProxyEnv(loopName, namespace string) []corev1.EnvVar {
-	proxyURL := egressProxyServiceURL(loopName, namespace)
+func (r *LoopReconciler) operatorProxyEnv(loopName, namespace string) []corev1.EnvVar {
+	proxyURL := r.egressProxyServiceURL(loopName, namespace)
 	return []corev1.EnvVar{
 		{Name: "HTTPS_PROXY", Value: proxyURL},
 		{Name: "https_proxy", Value: proxyURL},
 		{Name: "HTTP_PROXY", Value: proxyURL},
 		{Name: "http_proxy", Value: proxyURL},
 	}
+}
+
+// clusterDomain returns the reconciler's cluster domain (default
+// policy.DefaultClusterDomain when ClusterDomain is unset, R16 I44 item 2:
+// one source of truth for the default).
+func (r *LoopReconciler) clusterDomain() string {
+	if r.ClusterDomain != "" {
+		return r.ClusterDomain
+	}
+	return policy.DefaultClusterDomain
+}
+
+// ProxyServiceFQDN returns the per-Loop proxy Service FQDN the agent resolves
+// via DNS to reach the model proxy (D33: <loop>-proxy.<ns>.svc). Built from
+// proxyServiceName (the controller's name) — NOT a literal (R16 I44 item 1).
+// It is what policy.Translate puts on the agent's DNS allowlist, and is wired
+// into the KubeArmorEnforcer at construction (main.go) so the enforcer cannot
+// build the FQDN from a literal of its own.
+func ProxyServiceFQDN(loopName, namespace string) string {
+	return proxyServiceName(loopName) + "." + namespace + ".svc"
+}
+
+// EgressProxyServiceFQDN returns the per-Loop egress proxy Service FQDN the
+// agent resolves via DNS to reach the egress proxy (I42d:
+// <loop>-egress-proxy.<ns>.svc). Built from egressProxyServiceName (the
+// controller's name) — NOT a `-egress-proxy.` literal (R16 I44 item 1). It is
+// what the agent's DNS allowlist carries so a rename cannot desync the
+// allowlist from the URL the agent dials.
+func EgressProxyServiceFQDN(loopName, namespace string) string {
+	return egressProxyServiceName(loopName) + "." + namespace + ".svc"
 }
 
 // isOperatorProxyEnv reports whether name is one of the operator-owned proxy
@@ -1164,7 +1202,7 @@ func egressProxyLabels(loopName string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":       "coxswain-egress-proxy",
 		"app.kubernetes.io/instance":   loopName,
-		"app.kubernetes.io/component":  netpolEgressProxyComponent,
+		policy.ComponentLabelKey:       netpolEgressProxyComponent,
 		"app.kubernetes.io/part-of":    "coxswain",
 		"coxswain.io/egress-proxy-for": loopName,
 	}
@@ -1935,8 +1973,8 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 
 func agentPodLabels(loopName string) map[string]string {
 	return map[string]string{
-		"coxswain.io/loop":   loopName,
-		netpolComponentLabel: netpolAgentComponent,
+		"coxswain.io/loop":       loopName,
+		policy.ComponentLabelKey: netpolAgentComponent,
 	}
 }
 
@@ -1995,17 +2033,14 @@ const (
 	// netpolAgentComponent is the component label the D34 agent NetworkPolicy
 	// selects on (alongside coxswain.io/loop).
 	netpolAgentComponent = "agent"
-	// netpolComponentLabel is the app.kubernetes.io/component label key.
-	netpolComponentLabel = "app.kubernetes.io/component"
-	// netpolProxyComponent is the component label the D34 proxy NetworkPolicy
-	// selects on.
-	netpolProxyComponent = "model-proxy"
+	// netpolEgressProxyComponent is the component label value (and the egress
+	// proxy container name) the I42b egress proxy pod uses. It aliases the
+	// policy package's component constant (R16 I44 item 3: one source of truth
+	// for the label value, so a rename cannot desync the selector from the pod).
+	netpolEgressProxyComponent = policy.ComponentEgressProxyLabel
 	// netpolProxyForLabel is the per-Loop label the D34 proxy NetworkPolicy
 	// uses to scope to a specific Loop.
 	netpolProxyForLabel = "coxswain.io/proxy-for"
-	// netpolEgressProxyComponent is the component label the I42b egress proxy
-	// pod uses.
-	netpolEgressProxyComponent = "egress-proxy"
 )
 
 // isPodReady reports whether a Pod has the PodReady condition set to True

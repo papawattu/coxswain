@@ -97,11 +97,15 @@ func EmitEgressProxyKubeArmorPolicy(loopName, namespace string, networkAllows []
 // configured target in Phase 1): host, host:port, or a URL — only the host
 // matters to a DNS allowlist. The network block allows that host (+ its
 // search-expanded form when it is a bare single-label in-cluster Service name,
-// review P1: the resolver queries <host>.<ns>.svc.cluster.local first) +
+// review P1: the resolver queries <host>.<ns>.svc.<clusterDomain> first) +
 // tcp + the platform DNS allow (udp+tcp, so the proxy can resolve the host
-// under spec.action Block).
-func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint string) *unstructured.Unstructured {
+// under spec.action Block). clusterDomain is the cluster's service DNS domain
+// (default cluster.local, R16 I44 item 2: the enforcer must not hard-code it).
+func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint, clusterDomain string) *unstructured.Unstructured {
 	host, _ := modelEndpointHost(modelEndpoint)
+	if clusterDomain == "" {
+		clusterDomain = policy.DefaultClusterDomain
+	}
 	spec := map[string]any{
 		kaptActionKey: kaptActionValue,
 		KaptSelectorKey: map[string]any{
@@ -118,7 +122,7 @@ func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint string) *u
 		// form too, for the absolute-name query under ndots:1).
 		domains := []string{host}
 		if isSingleLabelName(host) {
-			domains = append(domains, host+"."+namespace+".svc.cluster.local")
+			domains = append(domains, host+"."+namespace+".svc."+clusterDomain)
 		}
 		spec["network"] = map[string]any{
 			kaptActionKey:   kaptAllowAction,

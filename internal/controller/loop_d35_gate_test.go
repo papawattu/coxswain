@@ -6,6 +6,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	cxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -187,8 +188,8 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 				Name:      conflictLoopName + "-proxy",
 				Namespace: ns,
 				Labels: map[string]string{
-					netpolComponentLabel: netpolProxyComponent,
-					netpolProxyForLabel:  conflictLoopName,
+					policy.ComponentLabelKey: policy.ComponentProxyLabel,
+					netpolProxyForLabel:      conflictLoopName,
 				},
 			},
 			Spec: corev1.PodSpec{
@@ -282,8 +283,8 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 				Name:      loopName + "-proxy",
 				Namespace: ns,
 				Labels: map[string]string{
-					netpolComponentLabel: netpolProxyComponent,
-					netpolProxyForLabel:  loopName,
+					policy.ComponentLabelKey: policy.ComponentProxyLabel,
+					netpolProxyForLabel:      loopName,
 				},
 			},
 			Spec: corev1.PodSpec{

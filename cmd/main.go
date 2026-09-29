@@ -91,6 +91,11 @@ func main() {
 	flag.BoolVar(&allowUnenforced, "allow-unenforced", false,
 		"Run Loops even when the eBPF engine is not enforcing (off by default; dev escape hatch). "+
 			"Loops run with PolicyEnforced=False reason EnforcementDisabled.")
+	var clusterDomain string
+	flag.StringVar(&clusterDomain, "cluster-domain", "",
+		"The cluster's service DNS domain (default cluster.local). Used for the proxy Service FQDNs the agent's DNS "+
+			"allowlist carries. R16 I44 item 2: a non-default-domain cluster (a DNS-domain override on the cluster's "+
+			"service CIDR) is supported.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -209,11 +214,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// R16 I44 item 1+2: the KubeArmorEnforcer is configured ONCE at
+	// construction with the proxy Service FQDN functions (built from the
+	// controller's proxyServiceName/egressProxyServiceName naming) and the
+	// cluster domain. The enforcer must not build the FQDNs from a literal or
+	// hard-code the domain, and (review #30 P2) it must not be mutated per
+	// reconcile (a shared-enforcer mutation races if the controller's
+	// concurrency is raised).
+	kaEnforcer := &engine.KubeArmorEnforcer{
+		Client:          mgr.GetClient(),
+		ProxyFQDN:       controller.ProxyServiceFQDN,
+		EgressProxyFQDN: controller.EgressProxyServiceFQDN,
+		ClusterDomain:   clusterDomain,
+	}
 	if err := (&controller.LoopReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
-		Enforcer:        &engine.KubeArmorEnforcer{Client: mgr.GetClient()},
+		Enforcer:        kaEnforcer,
 		AllowUnenforced: allowUnenforced,
+		ClusterDomain:   clusterDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")
 		os.Exit(1)

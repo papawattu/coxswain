@@ -106,7 +106,7 @@ func TestEmitEgressProxyKubeArmorPolicyShape(t *testing.T) {
 // (component + proxy-for); process = only the model proxy binary; network =
 // the model endpoint (the single host the proxy dials).
 func TestEmitModelProxyKubeArmorPolicyShape(t *testing.T) {
-	obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, i42fModelEP)
+	obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, i42fModelEP, "cluster.local")
 	spec := obj.Object["spec"].(map[string]any)
 	if spec["action"] != kaptActionValue {
 		t.Fatalf("spec.action must be Block, got %v", spec["action"])
@@ -169,7 +169,7 @@ func TestEmitProxyPoliciesAllowPlatformDNS(t *testing.T) {
 		}
 	})
 	t.Run("model proxy policy allows udp+tcp", func(t *testing.T) {
-		obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, i42fModelEP)
+		obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, i42fModelEP, "cluster.local")
 		spec := obj.Object["spec"].(map[string]any)
 		protocols := matchProtocolItems(t, spec["network"].(map[string]any)["matchProtocols"])
 		if !slices.Contains(protocols, "udp") || !slices.Contains(protocols, "tcp") {
@@ -184,7 +184,7 @@ func TestEmitProxyPoliciesAllowPlatformDNS(t *testing.T) {
 // expanded form must be on the allowlist too (kept alongside the bare form).
 func TestEmitModelProxyKubeArmorPolicySingleLabelEndpoint(t *testing.T) {
 	// A bare single-label endpoint (host, no port).
-	obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model-svc")
+	obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model-svc", "cluster.local")
 	spec := obj.Object["spec"].(map[string]any)
 	domains := matchDomainItems(t, spec["network"].(map[string]any)["matchDNSQueries"])
 	if !slices.Contains(domains, "model-svc") {
@@ -194,7 +194,7 @@ func TestEmitModelProxyKubeArmorPolicySingleLabelEndpoint(t *testing.T) {
 		t.Fatalf("matchDNSQueries must include the search-expanded form model-svc.%s.svc.cluster.local, got %v", i42fNS, domains)
 	}
 	// A single-label endpoint with an explicit port: same expansion.
-	obj = EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model-svc:8080")
+	obj = EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model-svc:8080", "cluster.local")
 	spec = obj.Object["spec"].(map[string]any)
 	domains = matchDomainItems(t, spec["network"].(map[string]any)["matchDNSQueries"])
 	if !slices.Contains(domains, "model-svc") {
@@ -205,7 +205,7 @@ func TestEmitModelProxyKubeArmorPolicySingleLabelEndpoint(t *testing.T) {
 	}
 	// A multi-label endpoint is NOT expanded (it is already a valid search
 	// candidate; expanding would add a name that never resolves).
-	obj = EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model.other")
+	obj = EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model.other", "cluster.local")
 	spec = obj.Object["spec"].(map[string]any)
 	domains = matchDomainItems(t, spec["network"].(map[string]any)["matchDNSQueries"])
 	if !slices.Contains(domains, "model.other") {

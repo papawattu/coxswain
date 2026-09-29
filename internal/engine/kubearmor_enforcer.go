@@ -7,11 +7,21 @@ import (
 	"github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+// ErrForeignKapt is the sentinel createOrUpdateKapt returns when a
+// KubeArmorPolicy of the desired name exists and is NOT controlled by the
+// Loop (I42f review P2, round 1: the same never-take-over rule as I42c's
+// errForeignNetpol, applied to the three KubeArmorPolicy names — the agent's
+// and the two proxies'). The foreign object is left untouched; the controller
+// maps the sentinel to a KubeArmorPolicyConflict condition and holds the
+// sandbox Suspended.
+var ErrForeignKapt = fmt.Errorf("KubeArmorPolicy is controlled by another controller (foreign)")
 
 // KubeArmorEnforcer is the production Enforcer: it emits the KubeArmorPolicy for
 // the Loop's effective policy (Apply) and reports whether the engine is
@@ -22,7 +32,14 @@ type KubeArmorEnforcer struct {
 }
 
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective
-// policy, owned by the Loop.
+// policy, owned by the Loop, PLUS (I42f, D35 part 2) the proxy policies: the
+// model proxy's KubeArmorPolicy when a model endpoint is configured (the proxy
+// pod is expected) and the egress proxy's KubeArmorPolicy when the effective
+// policy has network allows (the egress proxy pod is expected). Each is
+// owner-ref'd to the Loop (GC'd with it). The proxy policies are the inner
+// fence: the process block allows only the proxy's own binary and the network
+// block carries the exact egress the proxy is supposed to have, so a bug in
+// the proxy's application-level enforcement is still denied.
 func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p policy.EffectivePolicy) error {
 	// I42d: the egress proxy FQDN goes in the agent's DNS allowlist only when
 	// the effective policy has network allows — that is exactly when the egress
@@ -30,28 +47,120 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// agent has no external egress and the name stays out of the allowlist.
 	egressFQDN := ""
 	if len(p.Network) > 0 {
-		egressFQDN = loop.Name + "-egress-proxy." + loop.Namespace + ".svc"
+		egressFQDN = egressProxyServiceFQDN(loop.Name, loop.Namespace)
 	}
 	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p, proxyServiceFQDN(loop.Name, loop.Namespace), egressFQDN))
-	// P2: owner-ref the KubeArmorPolicy to the Loop so it is GC'd when the Loop
-	// is deleted (and a later same-name Loop doesn't inherit a stale policy).
-	if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {
-		return fmt.Errorf("set owner ref on KubeArmorPolicy: %w", err)
+	if err := e.createOrUpdateKapt(ctx, loop, obj); err != nil {
+		return err
 	}
+
+	// I42f: the model proxy policy (created only when the model proxy is
+	// expected, i.e. a model endpoint is configured). Cleaned up in the else
+	// branch when the endpoint is removed (same drift rationale as the egress
+	// proxy policy below).
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		modelObj := EmitModelProxyKubeArmorPolicy(loop.Name, loop.Namespace, loop.Spec.Agent.ModelEndpoint)
+		if err := e.createOrUpdateKapt(ctx, loop, modelObj); err != nil {
+			return err
+		}
+	} else if err := e.cleanupModelProxyKapt(ctx, loop); err != nil {
+		return err
+	}
+
+	// I42f: the egress proxy policy (created only when the egress proxy is
+	// expected, i.e. the effective policy has network allows). Cleaned up in
+	// the else branch when the allows go away (a stale policy would keep
+	// fencing a pod that no longer exists — drift the reconciler must own).
+	if len(p.Network) > 0 {
+		egressObj := EmitEgressProxyKubeArmorPolicy(loop.Name, loop.Namespace, p.Network)
+		return e.createOrUpdateKapt(ctx, loop, egressObj)
+	}
+	return e.cleanupEgressProxyKapt(ctx, loop)
+}
+
+// cleanupEgressProxyKapt deletes the egress proxy KubeArmorPolicy when the
+// egress proxy is no longer expected (the network allows went away). A
+// FOREIGN policy occupying the name is left alone (I2 never-take-over).
+func (e *KubeArmorEnforcer) cleanupEgressProxyKapt(ctx context.Context, loop *v1alpha1.Loop) error {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(kaptGroupVersion.WithKind(kaptKind))
+	err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: "coxswain-" + loop.Name + "-egress-proxy"}, obj)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get egress proxy KubeArmorPolicy: %w", err)
+	}
+	if !metav1.IsControlledBy(obj, loop) {
+		return nil
+	}
+	if err := e.Client.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete egress proxy KubeArmorPolicy: %w", err)
+	}
+	return nil
+}
+
+// cleanupModelProxyKapt deletes the model proxy KubeArmorPolicy when the model
+// proxy is no longer expected (the model endpoint was removed). A FOREIGN
+// policy occupying the name is left alone (I2 never-take-over).
+func (e *KubeArmorEnforcer) cleanupModelProxyKapt(ctx context.Context, loop *v1alpha1.Loop) error {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(kaptGroupVersion.WithKind(kaptKind))
+	err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: "coxswain-" + loop.Name + "-proxy"}, obj)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get model proxy KubeArmorPolicy: %w", err)
+	}
+	if !metav1.IsControlledBy(obj, loop) {
+		return nil
+	}
+	if err := e.Client.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete model proxy KubeArmorPolicy: %w", err)
+	}
+	return nil
+}
+
+// createOrUpdateKapt creates or updates a KubeArmorPolicy object (idempotent
+// Apply: create when absent, update with the live resourceVersion when
+// present). It owner-refs the policy to the Loop so it is GC'd with the Loop
+// (P2: and a later same-name Loop does not inherit a stale policy).
+//
+// I42f review P2 (round 1): a FOREIGN KubeArmorPolicy of the same name is
+// never overwritten (the same never-take-over rule as I42c's
+// createOrUpdateNP, applied to the three KubeArmorPolicy names the Enforcer
+// emits). When the live object exists and is not controlled by the Loop,
+// ErrForeignKapt is returned and the object is left untouched; the controller
+// maps the sentinel to a KubeArmorPolicyConflict condition and holds the
+// sandbox Suspended (fail-closed: a proxy's inner fence must not be someone
+// else's policy).
+func (e *KubeArmorEnforcer) createOrUpdateKapt(ctx context.Context, loop *v1alpha1.Loop, obj *unstructured.Unstructured) error {
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(kaptGroupVersion.WithKind(kaptKind))
 	err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: obj.GetName()}, existing)
 	switch {
 	case errors.IsNotFound(err):
+		if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {
+			return fmt.Errorf("set owner ref on KubeArmorPolicy %s: %w", obj.GetName(), err)
+		}
 		if err := e.Client.Create(ctx, obj); err != nil {
-			return fmt.Errorf("create KubeArmorPolicy: %w", err)
+			return fmt.Errorf("create KubeArmorPolicy %s: %w", obj.GetName(), err)
 		}
 	case err != nil:
-		return fmt.Errorf("get KubeArmorPolicy: %w", err)
+		return fmt.Errorf("get KubeArmorPolicy %s: %w", obj.GetName(), err)
 	default:
+		// A foreign policy occupying the name is left untouched; the caller
+		// maps the sentinel to the KubeArmorPolicyConflict condition.
+		if !metav1.IsControlledBy(existing, loop) {
+			return fmt.Errorf("KubeArmorPolicy %s/%s: %w", loop.Namespace, obj.GetName(), ErrForeignKapt)
+		}
+		if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {
+			return fmt.Errorf("set owner ref on KubeArmorPolicy %s: %w", obj.GetName(), err)
+		}
 		obj.SetResourceVersion(existing.GetResourceVersion())
 		if err := e.Client.Update(ctx, obj); err != nil {
-			return fmt.Errorf("update KubeArmorPolicy: %w", err)
+			return fmt.Errorf("update KubeArmorPolicy %s: %w", obj.GetName(), err)
 		}
 	}
 	return nil
@@ -72,6 +181,15 @@ func (e *KubeArmorEnforcer) Enforcing(_ context.Context, _ *v1alpha1.Loop) (bool
 
 // KubeArmorGVK is the GroupVersionKind of a KubeArmorPolicy.
 var KubeArmorGVK = schema.GroupVersionKind{Group: kaptGroup, Version: kaptVersion, Kind: kaptKind}
+
+// egressProxyServiceFQDN returns the per-Loop egress proxy Service FQDN that
+// the agent resolves via DNS to reach the egress proxy (I42d):
+// <loop>-egress-proxy.<ns>.svc. Built from the name the controller uses
+// (egressProxyServiceName), not a literal, so a rename cannot desync the
+// allowlist from the URL the agent dials.
+func egressProxyServiceFQDN(loopName, ns string) string {
+	return loopName + "-egress-proxy." + ns + ".svc"
+}
 
 // proxyServiceFQDN returns the per-Loop proxy Service FQDN that the agent
 // resolves via DNS to reach the model proxy (D33: <loop>-proxy.<ns>.svc).

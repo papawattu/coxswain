@@ -56,11 +56,19 @@ const Deny = "deny"
 // the user's AgentPolicy (Q6: the model proxy's own egress is platform
 // infrastructure, allowed by the operator).
 const (
+	// DNSAllow is the platform-minimum DNS allow for a sandbox container:
+	// udp+tcp DNS so the container can resolve the proxy Service FQDNs via
+	// kube-dns. (D33: the proxy is a separate pod, not a sidecar — the agent
+	// reaches it via <loop>-proxy.<ns>.svc, which requires DNS resolution.)
+	// C6b's Translate adds it to the agent container, and I42f's proxy
+	// KubeArmorPolicy emitters add it to both proxy policies (the same
+	// constant, so the three cannot drift).
+	DNSAllow = "dns/udp+tcp"
 	// dnsAllow is the platform-minimum DNS allow for the agent: udp+tcp DNS
 	// so the agent can resolve the proxy Service FQDN via kube-dns.
 	// (D33: the proxy is a separate pod, not a sidecar — the agent reaches
 	// it via <loop>-proxy.<ns>.svc, which requires DNS resolution.)
-	dnsAllow = "dns/udp+tcp"
+	dnsAllow = DNSAllow
 	// modelEndpoint is the proxy's always-allowed network target: the model
 	// endpoint (platform infrastructure, not the user's AgentPolicy).
 	modelEndpoint = "model-endpoint"

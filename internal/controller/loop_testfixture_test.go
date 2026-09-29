@@ -98,7 +98,7 @@ func mkUnstructuredLoop(name, ns, repo string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		unstructuredAPI:  loopAPIVersion,
 		unstructuredKind: loopKind,
-		unstructuredMeta: map[string]any{unstructuredName: name, "namespace": ns},
+		unstructuredMeta: map[string]any{unstructuredName: name, unstructuredNs: ns},
 		unstructuredSpec: spec,
 	}}
 }

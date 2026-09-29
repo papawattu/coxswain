@@ -31,7 +31,7 @@ var _ = Describe("I34: spec.agent.env is literal-only, no COX_* names", func() {
 		u := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "coxswain.wattu.com/v1alpha1",
 			"kind":       "Loop",
-			"metadata":   map[string]any{"name": name, "namespace": ns},
+			"metadata":   map[string]any{unstructuredName: name, unstructuredNs: ns},
 			"spec": map[string]any{
 				"goal": "do the thing",
 				"workspace": map[string]any{

@@ -50,19 +50,20 @@ import (
 
 const (
 	// i42b test constants.
-	i42bPolicyName     = "i42b-pol"
-	i42bTestRepo       = "https://github.com/papawattu/coxswain.git"
-	i42bExternalAllow  = i42eExternalHost
-	i42bConfLoopName   = "egconf-loop"
-	i42bPodCIDR        = "10.244.0.0/16"
-	i42bServiceCIDR    = "10.96.0.0/12"
-	i42bEgressProxyImg = "coxswain-egress-proxy:standin"
-	i42bForeignImage   = "docker.io/library/busybox:1.36"
-	i42bForeignName    = "foreign"
-	i42bDriftPodName   = "drift-loop-egress-proxy"
-	i42bDriftLoopName  = "drift-loop"
-	i42bEgressConflict = "EgressProxyConflict"
-	i42bLossyLoopName  = "lossy-loop"
+	i42bPolicyName           = "i42b-pol"
+	i42bTestRepo             = "https://github.com/papawattu/coxswain.git"
+	i42bExternalAllow        = i42eExternalHost
+	i42bConfLoopName         = "egconf-loop"
+	i42bPodCIDR              = "10.244.0.0/16"
+	i42bServiceCIDR          = "10.96.0.0/12"
+	i42bEgressProxyImg       = "coxswain-egress-proxy:standin"
+	i42bForeignImage         = "docker.io/library/busybox:1.36"
+	i42bForeignName          = "foreign"
+	i42bDriftPodName         = "drift-loop-egress-proxy"
+	i42bDriftLoopName        = "drift-loop"
+	i42bEgressConflict       = "EgressProxyConflict"
+	i42bLossyLoopName        = "lossy-loop"
+	i42bEgressProxyComponent = "egress-proxy"
 )
 
 var _ = Describe("I42b: ensureEgressProxy", func() {
@@ -153,7 +154,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			"the egress proxy pod must be created when network allows are present")
 
 		// Verify the pod carries the correct labels (DISJOINT from agent/model proxy).
-		Expect(pod.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "egress-proxy"))
+		Expect(pod.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", i42bEgressProxyComponent))
 		Expect(pod.Labels).To(HaveKeyWithValue("coxswain.io/egress-proxy-for", i42dAllowLoop))
 		Expect(pod.Labels).ToNot(HaveKey("coxswain.io/loop"),
 			"the egress proxy pod must NOT carry coxswain.io/loop (the KubeArmorPolicy selector)")
@@ -163,7 +164,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		// Verify the EGRESS_POLICY_JSON env var.
 		var container corev1.Container
 		for _, c := range pod.Spec.Containers {
-			if c.Name == "egress-proxy" {
+			if c.Name == i42bEgressProxyComponent {
 				container = c
 				break
 			}
@@ -385,7 +386,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(podNew.UID).ToNot(Equal(uid1), "the recreated pod must have a new UID")
 		var container corev1.Container
 		for _, c := range podNew.Spec.Containers {
-			if c.Name == "egress-proxy" {
+			if c.Name == i42bEgressProxyComponent {
 				container = c
 				break
 			}

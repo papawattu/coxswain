@@ -25,6 +25,34 @@ const (
 	kaptActionKey   = "action"
 )
 
+// kaptActionValue is the spec-level default-deny action (KubeArmor defaults to
+// Audit without it; Block is enforced). Shared by the C6b agent policy and the
+// I42f proxy policies.
+const kaptActionValue = "Block"
+
+// KubeArmorPolicy spec-level keys. The policy is emitted as a fully-shaped
+// unstructured object (the API server's structural validation requires the
+// real shape), and the three emitters (the C6b agent policy and the I42f
+// proxy policies) build the same nested keys; constants here so the emitters
+// and the unstructured-map shape cannot drift (and goconst does not flag the
+// shared keys). Exported so the controller's envtest helpers read the
+// policy's spec through the same keys.
+const (
+	KaptSpecKey        = "spec"
+	KaptSelectorKey    = "selector"
+	KaptProcessKey     = "process"
+	KaptMatchLabelsKey = "matchLabels"
+	KaptMatchPathsKey  = "matchPaths"
+	KaptMatchDNSKey    = "matchDNSQueries"
+	KaptMatchProtoKey  = "matchProtocols"
+	kaptAPIVersionKey  = "apiVersion"
+	kaptKindKey        = "kind"
+	kaptMetadataKey    = "metadata"
+	kaptNameKey        = "name"
+	kaptNamespaceKey   = "namespace"
+	KaptFileKey        = "file"
+)
+
 // EmitKubeArmorPolicy translates Coxswain's EnginePolicy (per-container, D29)
 // into a KubeArmorPolicy object (security.kubearmor.com/v1) for the sandbox
 // pod. It returns a fully-shaped unstructured object (apiVersion, kind,
@@ -74,9 +102,9 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 		// Default-deny posture: KubeArmor's spec.action defaults to Audit (log
 		// only, nothing blocked). Set it to Block so disallows are enforced; the
 		// per-rule action: Allow is the carve-out.
-		"action": "Block",
-		"selector": map[string]any{
-			"matchLabels": map[string]any{"coxswain.io/loop": loopName},
+		kaptActionKey: kaptActionValue,
+		KaptSelectorKey: map[string]any{
+			KaptMatchLabelsKey: map[string]any{"coxswain.io/loop": loopName},
 		},
 	}
 	// exec allows -> process.matchPaths items ({path} ONLY), action Allow.
@@ -91,8 +119,8 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 			})
 		}
 		spec["process"] = map[string]any{
-			kaptActionKey: kaptAllowAction,
-			"matchPaths":  items,
+			kaptActionKey:     kaptAllowAction,
+			KaptMatchPathsKey: items,
 		}
 	}
 	// network allows → matchDNSQueries items ({domain}) + matchProtocols items
@@ -102,26 +130,26 @@ func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 		domains, protocols := splitNetworkAllows(network)
 		spec["network"] = map[string]any{
 			kaptActionKey:     kaptAllowAction,
-			"matchDNSQueries": toDomainItems(domains),
-			"matchProtocols":  toProtocolItems(protocols),
+			KaptMatchDNSKey:   toDomainItems(domains),
+			KaptMatchProtoKey: toProtocolItems(protocols),
 		}
 	}
 	// file allows → file.matchPaths items ({path}).
 	if len(files) > 0 {
-		spec["file"] = map[string]any{
-			kaptActionKey: kaptAllowAction,
-			"matchPaths":  toPathItems(files),
+		spec[KaptFileKey] = map[string]any{
+			kaptActionKey:     kaptAllowAction,
+			KaptMatchPathsKey: toPathItems(files),
 		}
 	}
 
 	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": kaptGroup + "/" + kaptVersion,
-		"kind":       kaptKind,
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": namespace,
+		kaptAPIVersionKey: kaptGroup + "/" + kaptVersion,
+		kaptKindKey:       kaptKind,
+		kaptMetadataKey: map[string]any{
+			kaptNameKey:      name,
+			kaptNamespaceKey: namespace,
 		},
-		"spec": spec,
+		KaptSpecKey: spec,
 	}}
 	return obj
 }

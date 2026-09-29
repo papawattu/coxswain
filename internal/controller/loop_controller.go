@@ -43,6 +43,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -441,6 +442,20 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			// (Suspended), consistent with needsEgressProxy.
 			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
 				foreignNetPols(ctx, r, loop) {
+				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+			}
+			// I42f review P2 (round 1): the KubeArmorPolicy gate mirrors the
+			// NetworkPolicy gate above (reviewer: "like NetworkPolicyConflict").
+			// Hold Suspended when any of this Loop's KubeArmorPolicy names exists
+			// and is NOT controlled by the Loop. createOrUpdateKapt refuses to
+			// take over a foreign policy (errForeignKapt) and the
+			// KubeArmorPolicyConflict condition is set by applyEffectivePolicyAndConditions
+			// on the sentinel; this gate is the order-independent hold (it runs
+			// before the Enforcer.Apply of the same reconcile, so it must read
+			// the live objects). Same fail-closed semantics: a real read error
+			// holds Suspended.
+			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
+				foreignKaptPolicies(ctx, r, loop) {
 				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 			}
 		}
@@ -888,6 +903,20 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 // modernize newexpr checker (which flags one-line pointer wrappers) does not
 // flag it, while still giving a named, self-documenting helper.
 
+// proxyNdotsOneDNSConfig returns the pod dnsConfig both operator-owned proxy
+// pods carry (review P1, R16 D39): ndots:1 so the proxy resolvers send
+// absolute names for in-cluster names without search-suffix expansion. With
+// the default ndots:5, the first query for a bare single-label name is the
+// search-expanded <name>.<ns>.svc.cluster.local form; the KubeArmorPolicy
+// allowlist carries the expanded form (EmitModelProxyKubeArmorPolicy) but
+// ndots:1 keeps the resolver's primary candidate on the absolute name.
+func proxyNdotsOneDNSConfig() *corev1.PodDNSConfig {
+	ndotsVal := "1"
+	return &corev1.PodDNSConfig{
+		Options: []corev1.PodDNSConfigOption{{Name: "ndots", Value: &ndotsVal}},
+	}
+}
+
 func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.Pod {
 	secretMode := readOnlyMode
 	falseP := false
@@ -904,6 +933,7 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 		},
 		Spec: corev1.PodSpec{
 			AutomountServiceAccountToken: &falseP,
+			DNSConfig:                    proxyNdotsOneDNSConfig(),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsUser:  &proxyUID,
 				RunAsGroup: &proxyGID,
@@ -1134,7 +1164,7 @@ func egressProxyLabels(loopName string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":       "coxswain-egress-proxy",
 		"app.kubernetes.io/instance":   loopName,
-		"app.kubernetes.io/component":  "egress-proxy",
+		"app.kubernetes.io/component":  netpolEgressProxyComponent,
 		"app.kubernetes.io/part-of":    "coxswain",
 		"coxswain.io/egress-proxy-for": loopName,
 	}
@@ -1202,12 +1232,13 @@ func buildEgressProxyPod(loopName, ns, image string, networkAllows []string, pol
 		},
 		Spec: corev1.PodSpec{
 			AutomountServiceAccountToken: &falseP,
+			DNSConfig:                    proxyNdotsOneDNSConfig(),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsUser:  &uid,
 				RunAsGroup: &gid,
 			},
 			Containers: []corev1.Container{{
-				Name:  "egress-proxy",
+				Name:  netpolEgressProxyComponent,
 				Image: image,
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
@@ -1404,6 +1435,19 @@ func hadEgressConflict(loop *coxv1alpha1.Loop) bool {
 func hadNetpolConflict(loop *coxv1alpha1.Loop) bool {
 	for _, c := range loop.Status.Conditions {
 		if c.Type == "NetworkPolicyConflict" && c.Status == metav1.ConditionTrue && c.Reason == "ForeignNetworkPolicy" {
+			return true
+		}
+	}
+	return false
+}
+
+// hadKaptConflict reports whether the Loop has an active
+// KubeArmorPolicyConflict=True/ForeignKubeArmorPolicy condition (I42f review
+// P2: the clearing after a successful Enforcer.Apply must only fire when a
+// conflict was previously recorded, same hadNetpolConflict pattern).
+func hadKaptConflict(loop *coxv1alpha1.Loop) bool {
+	for _, c := range loop.Status.Conditions {
+		if c.Type == "KubeArmorPolicyConflict" && c.Status == metav1.ConditionTrue && c.Reason == "ForeignKubeArmorPolicy" {
 			return true
 		}
 	}
@@ -1666,6 +1710,32 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		return nil
 	}
 	return nil
+}
+
+// foreignKaptPolicies reports whether any of this Loop's KubeArmorPolicies
+// exists and is NOT controlled by the Loop (I42f review P2: the sandbox gate
+// that holds the sandbox Suspended on a foreign KubeArmorPolicy must be
+// order-independent of Enforcer.Apply, so it reads the live objects itself).
+// It fails CLOSED on a real read error (true: hold Suspended; consistent with
+// foreignNetPols). An ABSENT policy is not a conflict (Enforcer.Apply creates
+// it). The three names are the KubeArmorPolicy names the Enforcer emits for
+// this Loop (C6b agent policy + I42f proxy policies).
+func foreignKaptPolicies(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
+	for _, name := range []string{"coxswain-" + loop.Name, "coxswain-" + loop.Name + "-proxy", "coxswain-" + loop.Name + "-egress-proxy"} {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(engine.KubeArmorGVK)
+		err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, obj)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return true
+		}
+		if !metav1.IsControlledBy(obj, loop) {
+			return true
+		}
+	}
+	return false
 }
 
 // foreignNetPols reports whether any of this Loop's NetworkPolicies exists
@@ -1933,6 +2003,9 @@ const (
 	// netpolProxyForLabel is the per-Loop label the D34 proxy NetworkPolicy
 	// uses to scope to a specific Loop.
 	netpolProxyForLabel = "coxswain.io/proxy-for"
+	// netpolEgressProxyComponent is the component label the I42b egress proxy
+	// pod uses.
+	netpolEgressProxyComponent = "egress-proxy"
 )
 
 // isPodReady reports whether a Pod has the PodReady condition set to True
@@ -1955,8 +2028,31 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		return err
 	}
 	if r.Enforcer != nil {
-		if err := r.Enforcer.Apply(ctx, loop, effective); err != nil {
-			return err
+		// I42f review P2 (round 1): a foreign KubeArmorPolicy occupying one of
+		// the Loop's policy names is NEVER overwritten (createOrUpdateKapt's
+		// errForeignKapt sentinel). The same pattern as I42c's
+		// NetworkPolicyConflict: set KubeArmorPolicyConflict=True/
+		// ForeignKubeArmorPolicy and hold the sandbox Suspended (the
+		// order-independent gate in ensureSandbox reads the live objects).
+		// Reconcile does not error-loop.
+		applyErr := r.Enforcer.Apply(ctx, loop, effective)
+		if applyErr != nil && errors.Is(applyErr, engine.ErrForeignKapt) {
+			setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionTrue, "ForeignKubeArmorPolicy",
+				"a KubeArmorPolicy controlled by another controller occupies a coxswain-<loop> name; left untouched")
+			return r.Status().Update(ctx, loop)
+		}
+		// A conflict was resolved this reconcile (a previously foreign policy
+		// is gone or now Loop-owned): clear it to False/Resolved when it was
+		// previously set (the hadNetpolConflict pattern).
+		if hadKaptConflict(loop) {
+			setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionFalse, "Resolved",
+				"all per-Loop KubeArmorPolicies are controlled by this Loop")
+			if err := r.Status().Update(ctx, loop); err != nil {
+				return fmt.Errorf("update Loop status (KubeArmorPolicyConflict resolved): %w", err)
+			}
+		}
+		if applyErr != nil {
+			return applyErr
 		}
 	}
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {

@@ -296,6 +296,8 @@ for i in $(seq 1 60); do
   sleep 5
 done
 echo "   egress proxy pod Ready after ~$((i*5))s"
+PROXY_IP=$(K -n "$NS" get pod "${LOOP}-egress-proxy" -o jsonpath='{.status.podIP}' 2>/dev/null)
+echo "   egress proxy pod IP: $PROXY_IP"
 
 # ===========================================================================
 # STEP 3d: CoreDNS hosts override for the DNS-rebinding check.
@@ -347,8 +349,8 @@ if [ -n "$AGENT_POD_3D" ]; then
     # Use curl --proxy (not direct URL) for the DNS check: the checks use
     # curl --proxy, which resolves the proxy FQDN via a different code path
     # than direct URL resolution. Poll with the same tool+mode.
-    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "curl -s -o /dev/null --max-time 5 --proxy http://${LOOP}-egress-proxy.${NS}.svc.cluster.local:3128 http://example.com/" 2>/dev/null; then
-      echo "   DNS settled (curl --proxy resolved the proxy FQDN) after ~$((i*3))s"
+    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "curl -s -o /dev/null --max-time 5 --proxy http://${PROXY_IP}:3128 http://example.com/" 2>/dev/null; then
+      echo "   DNS settled (curl --proxy via pod IP reached the proxy) after ~$((i*3))s"
       break
     fi
     sleep 3
@@ -414,7 +416,7 @@ cat > "$TMPDIR/probe-allowed.sh" <<EOF
 #!/bin/sh
 echo "-- HTTP proxy.golang.org (via explicit proxy) --"
 curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
-  --proxy http://${PROXY_FQDN}:3128 http://proxy.golang.org/
+  --proxy http://${PROXY_IP}:3128 http://proxy.golang.org/
 ec=\$?
 echo ""
 echo "curl-exit=\$ec"
@@ -446,7 +448,7 @@ cat > "$TMPDIR/probe-disallowed.sh" <<EOF
 #!/bin/sh
 echo "-- HTTP github.com (NOT in the allows) via explicit proxy --"
 code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
-  --proxy http://${PROXY_FQDN}:3128 http://github.com/ 2>&1)
+  --proxy http://${PROXY_IP}:3128 http://github.com/ 2>&1)
 ec=$?
 echo "curl-exit=$ec http=$code"
 if [ "$code" = "403" ]; then
@@ -548,7 +550,7 @@ cat > "$TMPDIR/probe-rebind.sh" <<EOF
 #!/bin/sh
 echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via explicit proxy --"
 code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
-  --proxy http://${PROXY_FQDN7}:3128 http://${REBIND_NAME}/ 2>&1)
+  --proxy http://${PROXY_IP}:3128 http://${REBIND_NAME}/ 2>&1)
 ec=\$?
 echo "curl-exit=\$ec http=\$code"
 if [ "\$code" = "403" ]; then

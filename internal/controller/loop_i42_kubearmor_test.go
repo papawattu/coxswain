@@ -496,7 +496,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 	// the "pre-rule objects / CRD drift" case the controller must handle. If
 	// the controller does NOT restore the tampered KAPT, that is a real bug
 	// — report it, do not fix it (per the handoff).
-	It("restores a tampered model-proxy KubeArmorPolicy on the same Loop when the endpoint host changes (I43 same-Loop)", func() {
+	It("restores a tampered model-proxy KubeArmorPolicy on the same Loop (I43 same-Loop, drift correction)", func() {
 		r.AllowUnenforced = true
 		ns := setupNS("i43same")
 		const loopName = "i43-kap"

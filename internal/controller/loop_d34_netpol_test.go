@@ -189,7 +189,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		}))
 	})
 
-	It("updates the proxy NetworkPolicy on the same Loop when modelEndpoint changes (I43 same-Loop)", func() {
+	It("adds the egress-proxy peer to the agent NetworkPolicy when the referenced policy gains a network allow (I43 same-Loop)", func() {
 		ns := "d34-i43-same" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -226,23 +226,6 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			return n
 		}
 		Expect(countPeerLabel(agentNP, "agent"+"-x")).To(BeZero()) // sanity: label filter works
-		// The proxy netpol's model egress rule: the IP-literal endpoint
-		// resolves to an exact ipBlock /32 peer, port 9000.
-		np := &networkingv1.NetworkPolicy{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy-netpol"}, np)).To(Succeed())
-		modelPeerRule := func() *networkingv1.NetworkPolicyEgressRule {
-			for i := range np.Spec.Egress {
-				for _, peer := range np.Spec.Egress[i].To {
-					if peer.IPBlock != nil {
-						rule := np.Spec.Egress[i]
-						return &rule
-					}
-				}
-			}
-			return nil
-		}
-		Expect(modelPeerRule()).ToNot(BeNil(), "the initial proxy netpol must carry the model egress rule")
-
 		// EDIT the referenced AgentPolicy: add a network allow. The egress
 		// proxy becomes expected; the EXISTING agent netpol must gain the
 		// egress-proxy peer on the same-Loop reconcile (I43: the I42c P1 bug
@@ -276,23 +259,12 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		Expect(countPeerLabel(agentNP, policy.ComponentEgressProxyLabel)).To(BeNumerically(">=", 1),
 			"the existing agent netpol must GAIN the egress-proxy peer when the referenced policy's network allows are added (same-Loop update path)")
 
-		// The proxy netpol's model rule is still re-asserted in place: the
-		// ipBlock /32 peer and the port 9000.
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy-netpol"}, np)).To(Succeed())
-		rule := modelPeerRule()
-		Expect(rule).ToNot(BeNil(), "the updated proxy netpol must still carry the model egress rule")
-		var sawIPBlock bool
-		for _, peer := range rule.To {
-			if peer.IPBlock != nil && peer.IPBlock.CIDR == "10.0.0.5/32" {
-				sawIPBlock = true
-			}
-		}
-		Expect(sawIPBlock).To(BeTrue(),
-			"the proxy netpol's model egress peer must keep the ipBlock /32 (same-Loop update, not just creation)")
-		Expect(rule.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
-			Protocol: new(corev1.ProtocolTCP),
-			Port:     intstrPtr(9000),
-		}), "the updated rule must carry the endpoint's port")
+		// The proxy netpol's model rule is NOT what this spec exercises: its
+		// inputs (modelEndpoint, the model endpoint port) are CEL-validated
+		// immutable, and the referenced AgentPolicy's network allows feed the
+		// AGENT netpol (the egress-proxy peer), not the proxy netpol. The
+		// proxy netpol's own update path (drift correction) is covered by the
+		// dedicated I43 R3 spec in loop_i43_proxy_netpol_test.go.
 	})
 
 	It("two Loops in one namespace get disjoint NetworkPolicies (P1-1 acceptance)", func() {

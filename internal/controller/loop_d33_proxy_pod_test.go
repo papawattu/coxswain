@@ -50,6 +50,12 @@ const (
 	modelAPIKey         = "MODEL_API_KEY"
 	modelBaseURL        = "MODEL_BASE_URL"
 	cleanLoopProxy      = "clean-loop-proxy"
+	// d33DummyAPIKey is the API key value in the model-creds Secret (goconst:
+	// it recurs across the specs below).
+	d33DummyAPIKey = "dummy-key"
+	// i43D33CredsName is the model-creds Secret name for the I43 drift-
+	// correction spec (goconst: it recurs in the spec below).
+	i43D33CredsName = "i43-creds"
 )
 
 var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)", func() {
@@ -321,7 +327,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "drift-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:  "dummy-key",
+				modelAPIKey:  d33DummyAPIKey,
 				modelBaseURL: "http://fake-endpoint:8000",
 			},
 		}
@@ -365,7 +371,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "clean-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:  "dummy-key",
+				modelAPIKey:  d33DummyAPIKey,
 				modelBaseURL: "http://fake-endpoint:8000",
 			},
 		}
@@ -394,6 +400,82 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 			"the proxy pod must be deleted when endpointSecretRef is removed")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cleanLoopProxy}, &corev1.Service{})).ToNot(Succeed(),
 			"the proxy Service must be deleted when endpointSecretRef is removed")
+	})
+
+	// I43: the model-proxy Service's update path is **drift correction** —
+	// the Service has no per-Loop input that changes (the endpoint and Secret
+	// are immutable), so the reconcile must restore a tampered Service to its
+	// desired state (ports, selector, labels, type, owner ref) and recreate
+	// it if deleted. A create-only controller would pass a creation-only spec
+	// but fail these (the drift is not corrected, the deletion is not
+	// repaired).
+	It("restores a tampered proxy Service and recreates a deleted one on the same Loop (I43 same-Loop)", func() {
+		ns := "i43-d33-same" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: i43D33CredsName, Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:  d33DummyAPIKey,
+				modelBaseURL: "http://" + d34ModelEndpoint,
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		const loopName = "i43-d33"
+		loop := buildLoopWithSecret(loopName, ns, i43D33CredsName)
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcile(loopName, ns)
+
+		// The proxy Service exists in its desired state.
+		svc := &corev1.Service{}
+		svcKey := types.NamespacedName{Namespace: ns, Name: loopName + "-proxy"}
+		Expect(k8sClient.Get(ctx, svcKey, svc)).To(Succeed())
+		originalUID := svc.UID
+		Expect(svc.Spec.Ports).To(HaveLen(1))
+		Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(8080))
+
+		// TAMPER the live Service out-of-band: change the port and the
+		// selector (both are re-asserted by ensureProxy's CreateOrUpdate
+		// mutate; a create-only controller would leave them as-tampered).
+		svc.Spec.Ports[0].Port = 9999
+		svc.Spec.Selector["app.kubernetes.io/component"] = "not-a-proxy"
+		Expect(k8sClient.Update(ctx, svc)).To(Succeed())
+
+		// Reconcile the SAME Loop: the controller must restore the tampered
+		// Service to its desired state (port 8080, selector component=
+		// model-proxy). If it does NOT, that is a real bug — report it, do not
+		// fix it (per the handoff).
+		reconcile(loopName, ns)
+		svc = &corev1.Service{}
+		Expect(k8sClient.Get(ctx, svcKey, svc)).To(Succeed(),
+			"the proxy Service must still exist after the same-Loop reconcile")
+		Expect(svc.Spec.Ports).To(HaveLen(1))
+		Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(8080),
+			"the tampered port must be restored to 8080 on the same-Loop reconcile (drift correction)")
+		Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", policy.ComponentProxyLabel),
+			"the tampered selector must be restored to component=model-proxy on the same-Loop reconcile")
+		Expect(svc.OwnerReferences).To(HaveLen(1))
+		Expect(svc.OwnerReferences[0].Name).To(Equal(loopName),
+			"the restored Service must still be owned by the Loop")
+
+		// DELETE the Service and re-reconcile: the controller must recreate it
+		// (with the same controller ref and desired spec).
+		Expect(k8sClient.Delete(ctx, svc)).To(Succeed())
+		reconcile(loopName, ns)
+		svc = &corev1.Service{}
+		Expect(k8sClient.Get(ctx, svcKey, svc)).To(Succeed(),
+			"the deleted proxy Service must be recreated on the same-Loop reconcile")
+		Expect(svc.UID).ToNot(Equal(originalUID),
+			"the recreated Service must be a new object (not the deleted one)")
+		Expect(svc.Spec.Ports).To(HaveLen(1))
+		Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(8080),
+			"the recreated Service must carry the desired port 8080")
+		Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", policy.ComponentProxyLabel),
+			"the recreated Service must carry the desired selector")
+		Expect(svc.OwnerReferences).To(HaveLen(1))
+		Expect(svc.OwnerReferences[0].Name).To(Equal(loopName),
+			"the recreated Service must be owned by the Loop (controller ref)")
 	})
 
 	It("does not delete an unowned proxy pod (R15 round 4)", func() {

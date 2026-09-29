@@ -132,6 +132,16 @@ make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
 
+### Test norms (R16 I43)
+
+- Every object the controller reconciles gets at least one **same-Loop**
+  envtest spec that changes an input and re-reconciles, asserting the object
+  is **updated** (or deleted) — not just created. (The I42c finding: a
+  no-op mutate froze NetworkPolicy specs at creation and no spec caught it.)
+- Every gate spec must **FAIL when the gate is disabled**: disable the gate in
+  a scratch copy, run the spec, and confirm it fails before claiming a gate
+  is tested. Don't commit the mutation; record the result in the PR.
+
 ## CLI Commands Cheat Sheet
 
 ### Create API (your own types)

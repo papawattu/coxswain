@@ -49,6 +49,12 @@ const (
 	// i42fModelCredsSecret is the model-creds Secret name the I42f fixtures
 	// use (goconst: it recurs across the specs below).
 	i42fModelCredsSecret = "model-creds"
+	// i42fModelAPIKey is the API key value in the model-creds Secret (goconst:
+	// it recurs across the specs below).
+	i42fModelAPIKey = "sk-test"
+	// i42fModelAPIKeyName is the API key field name in the model-creds Secret
+	// (goconst: it recurs across the specs below).
+	i42fModelAPIKeyName = "openai.api_key"
 
 	// unstructuredNs and unstructuredTrue (goconst: they recur across the specs
 	// below).
@@ -228,7 +234,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		ns := setupNS("clean")
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: i42fModelCredsSecret, Namespace: ns},
-			StringData: map[string]string{"openai.api_key": "sk-test"},
+			StringData: map[string]string{i42fModelAPIKeyName: i42fModelAPIKey},
 		})).To(Succeed())
 		loop := buildLoop(i42fLoopClean, ns, nil)
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
@@ -299,7 +305,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		ns := setupNS("ndots")
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: i42fModelCredsSecret, Namespace: ns},
-			StringData: map[string]string{"openai.api_key": "sk-test"},
+			StringData: map[string]string{i42fModelAPIKeyName: i42fModelAPIKey},
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
@@ -466,5 +472,149 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName(i42fLoopForeign)}, sb)).To(Succeed())
 		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
 			"the sandbox must go Running once the foreign policy is deleted and the conflict is resolved")
+	})
+
+	// I43 same-Loop: a same-Loop input change must UPDATE the existing
+	// model-proxy KubeArmorPolicy on re-reconcile (createOrUpdateKapt
+	// re-asserts the desired spec against the live object), not just create
+	// I43 same-Loop: the model-proxy KubeArmorPolicy is built from
+	// spec.agent.modelEndpoint (the DNS allowlist is the endpoint's host),
+	// so a same-Loop endpoint change must UPDATE the EXISTING policy's
+	// matchDNSQueries (createOrUpdateKapt re-asserts the desired spec
+	// against the live object), not just create it. The endpoint host is the
+	// input the KAPT depends on; a create-only enforcer would leave the
+	// stale domain (the old host) on the live policy.
+	//
+	// NOTE: spec.agent.modelEndpoint is CEL-validated immutable (`self ==
+	// oldSelf || self == ''`), and the envtest API server enforces the CRD
+	// CEL rules for ALL clients (typed and unstructured), so a host change
+	// on the same Loop is rejected at admission. This spec exercises the
+	// update path by bypassing the API server: it tampers the live KAPT
+	// object's matchDNSQueries (simulating a "pre-rule object" that does not
+	// match the desired spec) and then re-reconciles the same Loop, asserting
+	// the controller's createOrUpdateKapt restores the desired spec. This is
+	// the "pre-rule objects / CRD drift" case the controller must handle. If
+	// the controller does NOT restore the tampered KAPT, that is a real bug
+	// — report it, do not fix it (per the handoff).
+	It("restores a tampered model-proxy KubeArmorPolicy on the same Loop (I43 same-Loop, drift correction)", func() {
+		r.AllowUnenforced = true
+		ns := setupNS("i43same")
+		const loopName = "i43-kap"
+		const initialHost = "model.test"
+		const tamperedHost = "model2.test"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: i42fModelCredsSecret, Namespace: ns},
+			StringData: map[string]string{i42fModelAPIKeyName: i42fModelAPIKey},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+		loop := buildLoop(loopName, ns, []string{i42fTestPolicyName})
+		loop.Spec.Agent.ModelEndpoint = initialHost + ":8000"
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The model proxy KubeArmorPolicy exists with the initial endpoint's
+		// domain in matchDNSQueries.
+		modelKap := getKapt(ctx, ns, "coxswain-"+loopName+"-proxy")
+		Expect(kaptDNSDomains(modelKap)).To(ContainElement(initialHost),
+			"the initial model-proxy policy must allow the initial endpoint host")
+
+		// TAMPER the live KAPT out-of-band: change matchDNSQueries to the
+		// TAMPERED host's domain (model2.test), simulating a "pre-rule
+		// object" that the controller must re-assert on the next reconcile.
+		// The controller's createOrUpdateKapt must restore the DESIRED spec
+		// (initialHost's domain) — a create-only enforcer would leave the
+		// tampered domain.
+		Expect(unstructured.SetNestedField(modelKap.Object,
+			[]any{map[string]any{"domain": tamperedHost}},
+			"spec", "network", "matchDNSQueries")).To(Succeed())
+		Expect(k8sClient.Update(ctx, modelKap)).To(Succeed())
+
+		// Reconcile the SAME Loop: the controller must restore the tampered
+		// KAPT to its desired state (initialHost's domain in matchDNSQueries).
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The EXISTING model proxy KubeArmorPolicy was RESTORED in place
+		// (I43: the update path ran against the live object — a create-only
+		// enforcer would leave the tampered domain): matchDNSQueries contains
+		// the initial host (the desired state) and NOT the tampered domain,
+		// the policy is still owned by the Loop, and udp+tcp are still
+		// present (the platform DNS allow).
+		modelKap = getKapt(ctx, ns, "coxswain-"+loopName+"-proxy")
+		domains := kaptDNSDomains(modelKap)
+		Expect(domains).To(ContainElement(initialHost),
+			"the restored model-proxy KubeArmorPolicy must contain the DESIRED endpoint host (the controller re-asserted the live object)")
+		Expect(domains).ToNot(ContainElement(tamperedHost),
+			"the restored model-proxy KubeArmorPolicy must NOT contain the tampered domain (the controller corrected the drift)")
+		Expect(kaptSelectorLabels(modelKap)).To(HaveKeyWithValue("coxswain.io/proxy-for", loopName),
+			"the restored policy must still select this Loop's model proxy pod")
+		ownerRefs := modelKap.GetOwnerReferences()
+		Expect(ownerRefs).NotTo(BeEmpty())
+		Expect(ownerRefs[0].Name).To(Equal(loopName))
+		// udp+tcp are still present (the platform DNS allow — the proxy must
+		// be able to resolve the endpoint host under spec.action Block).
+		kaptProtocols := func(obj *unstructured.Unstructured) []string {
+			network, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
+			items, _ := network["matchProtocols"].([]any)
+			out := make([]string, 0, len(items))
+			for _, it := range items {
+				out = append(out, it.(map[string]any)["protocol"].(string))
+			}
+			return out
+		}
+		proto := kaptProtocols(modelKap)
+		Expect(proto).To(ContainElement("udp"), "the platform DNS allow (udp) must still be present")
+		Expect(proto).To(ContainElement("tcp"), "the platform DNS allow (tcp) must still be present")
+	})
+
+	It("updates the egress-proxy KubeArmorPolicy on the same Loop when a network allow is added (I43 same-Loop)", func() {
+		r.AllowUnenforced = true
+		ns := setupNS("i43eg")
+		const loopName = "i43-eg-kap"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: i42fModelCredsSecret, Namespace: ns},
+			StringData: map[string]string{i42fModelAPIKeyName: i42fModelAPIKey},
+		})).To(Succeed())
+		const secondAllow = "second.example"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+		loop := buildLoop(loopName, ns, []string{i42fTestPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The egress proxy KubeArmorPolicy exists with the initial allow's
+		// domain (proxy.golang.org:443 -> domain proxy.golang.org).
+		egressKap := getKapt(ctx, ns, "coxswain-"+loopName+"-egress-proxy")
+		Expect(kaptDNSDomains(egressKap)).To(HaveLen(1),
+			"the initial egress-proxy policy must carry exactly the one allowed domain")
+		Expect(kaptDNSDomains(egressKap)).To(ContainElement("proxy.golang.org"))
+
+		// Add a second network allow to the SAME Loop's referenced
+		// AgentPolicy and re-reconcile.
+		ap := &coxv1alpha1.AgentPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42fTestPolicyName}, ap)).To(Succeed())
+		ap.Spec.Network = append(ap.Spec.Network, secondAllow)
+		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The EXISTING egress-proxy KubeArmorPolicy is updated in place: the
+		// new domain is present alongside the old one (I43: the update path,
+		// not just creation).
+		egressKap = getKapt(ctx, ns, "coxswain-"+loopName+"-egress-proxy")
+		Expect(kaptDNSDomains(egressKap)).To(HaveLen(2),
+			"the existing egress-proxy KubeArmorPolicy must gain the new domain on the same-Loop reconcile")
+		Expect(kaptDNSDomains(egressKap)).To(ContainElement(secondAllow),
+			"the added network allow must be present in the updated policy")
+		ownerRefs := egressKap.GetOwnerReferences()
+		Expect(ownerRefs).NotTo(BeEmpty())
+		Expect(ownerRefs[0].Name).To(Equal(loopName))
 	})
 })

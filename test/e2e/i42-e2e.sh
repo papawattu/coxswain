@@ -151,6 +151,44 @@ for img in "$IMG" "$PROXY_IMG" "$EGRESS_IMG" "$BUSYBOX_IMG" "$AGENT_IMG"; do
 done
 
 echo
+# ===========================================================================
+# STEP 1b: CoreDNS hosts override for the DNS-rebinding check.
+# Applied BEFORE any pods are created (before the controller deploys) so
+# the override is in place when the egress proxy and agent pods start,
+# avoiding the DNS reload disruption that breaks curl's proxy resolution.
+# The trap restores the ConfigMap on exit.
+# Note: TEST_IP is needed here, but it's picked in STEP 3a. We pick a
+# stable pod IP here (coredns pod IP) since the override just needs to
+# map the rebind name to ANY private IP — the specific IP doesn't matter
+# for the carve-out check.
+# ===========================================================================
+echo
+echo "--- STEP 1b: CoreDNS hosts override (${REBIND_NAME} -> private IP) ---"
+# Pick a cluster-internal pod IP for the hosts override. Use the coredns
+# pod IP (stable, always present).
+OVERRIDE_IP=$(K -n kube-system get pod -l k8s-app=kube-dns -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+if [ -z "$OVERRIDE_IP" ]; then
+  OVERRIDE_IP=$(K -n kube-system get pod -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+fi
+if [ -z "$OVERRIDE_IP" ]; then
+  echo "FATAL: could not pick a cluster-internal pod IP for the hosts override"
+  exit 2
+fi
+echo "   hosts override IP: $OVERRIDE_IP"
+K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
+echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
+COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
+HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${OVERRIDE_IP} }"
+NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
+if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
+  echo "FATAL: could not insert the hosts block into the Corefile"
+  exit 2
+fi
+echo "   modified Corefile (first 5 lines):"
+echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
+K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
+echo "   coredns ConfigMap updated (no reload needed — pods not yet created)"
+
 echo "--- STEP 2: deploy controller (dev overlay: --allow-unenforced) ---"
 make -C "$REPO_ROOT" kustomize >/dev/null 2>&1
 KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
@@ -188,29 +226,6 @@ REBIND_NAME="i42-rebind.example.test"
 REBIND_ALLOW="${REBIND_NAME}:80"
 
 # ===========================================================================
-# ===========================================================================
-# STEP 3a-override: CoreDNS hosts override for the DNS-rebinding check.
-# Runs BEFORE the fixture is created so the egress proxy pod (created by
-# the controller when the Loop is applied) gets a fresh DNS connection
-# that knows about the hosts entry. The trap restores the ConfigMap on exit.
-# ===========================================================================
-echo
-echo "--- STEP 3a-override: CoreDNS hosts override (${REBIND_NAME} -> ${TEST_IP}) ---"
-K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
-echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
-COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
-HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${TEST_IP} }"
-NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
-if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
-  echo "FATAL: could not insert the hosts block into the Corefile"
-  exit 2
-fi
-echo "   modified Corefile (first 5 lines):"
-echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
-K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
-echo "   coredns ConfigMap updated, waiting 15s for coredns to reload..."
-sleep 15
-
 # STEP 3b: create the fixture (namespace, AgentPolicy, fake model, Loop).
 #          The AgentPolicy includes the rebinding name so the egress proxy's
 #          allow check passes; the CoreDNS hosts override (step 3d) makes it
@@ -485,17 +500,17 @@ esac
 # CHECK 7: DNS-rebinding allow is rejected by the proxy; resolved IP in
 #          audit detail.
 #          The CoreDNS hosts override (step 3a-override, applied before the
-#          fixture was created) makes $REBIND_NAME resolve to $TEST_IP
+#          fixture was created) makes $REBIND_NAME resolve to $OVERRIDE_IP
 #          (a private pod IP). The AgentPolicy allows $REBIND_NAME:80, so the
 #          allow check passes. But the egress proxy's resolved-IP carve-out
 #          rejects the private IP → 403 + audit blocked with the resolved IP
 #          in the detail.
 # ===========================================================================
 echo
-echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${TEST_IP}) rejected by proxy ---"
+echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${OVERRIDE_IP}) rejected by proxy ---"
 cat > "$TMPDIR/probe-rebind.sh" <<EOF
 #!/bin/sh
-echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via HTTPS_PROXY env --"
+echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${OVERRIDE_IP}) via HTTPS_PROXY env --"
 code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://${REBIND_NAME}/ 2>&1)
 ec=\$?
 echo "curl-exit=\$ec http=\$code"
@@ -530,10 +545,10 @@ else
   fi
   # The detail must carry the resolved IP (the egress proxy's
   # resolved-ip-rejected detail now includes the offending IP).
-  if echo "$REBIND_AUDIT" | grep -q "ip=${TEST_IP}"; then
-    ok "audit detail carries the resolved private IP (ip=${TEST_IP})"
+  if echo "$REBIND_AUDIT" | grep -q "ip=${OVERRIDE_IP}"; then
+    ok "audit detail carries the resolved private IP (ip=${OVERRIDE_IP})"
   else
-    bad "audit detail does NOT carry the resolved private IP (expected ip=${TEST_IP}, got: $REBIND_AUDIT)"
+    bad "audit detail does NOT carry the resolved private IP (expected ip=${OVERRIDE_IP}, got: $REBIND_AUDIT)"
   fi
 fi
 

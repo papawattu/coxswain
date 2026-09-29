@@ -342,20 +342,21 @@ if [ -n "$AGENT_POD_3D" ]; then
     [ "$R" = "True" ] && { echo "   agent pod Ready after ~$((i*3))s"; break; }
     sleep 3
   done
-  echo "   waiting for DNS to settle (curl can reach the proxy)..."
+  echo "   waiting for DNS to settle (curl --proxy can resolve the proxy FQDN)..."
   for i in $(seq 1 20); do
-    # Use curl (not getent) for the DNS check: curl is what actually fails
-    # with exit 5, so poll with the same tool that the checks use.
-    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "curl -s -o /dev/null --max-time 5 http://${LOOP}-egress-proxy.${NS}.svc.cluster.local:3128/" 2>/dev/null; then
-      echo "   DNS settled (curl reached the proxy) after ~$((i*3))s"
+    # Use curl --proxy (not direct URL) for the DNS check: the checks use
+    # curl --proxy, which resolves the proxy FQDN via a different code path
+    # than direct URL resolution. Poll with the same tool+mode.
+    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "curl -s -o /dev/null --max-time 5 --proxy http://${LOOP}-egress-proxy.${NS}.svc.cluster.local:3128 http://example.com/" 2>/dev/null; then
+      echo "   DNS settled (curl --proxy resolved the proxy FQDN) after ~$((i*3))s"
       break
     fi
     sleep 3
   done
   # Extra settle time: the coredns rollout may still be settling DNS
-  # responses for the agent pod's resolver. Wait 30s to be safe.
-  echo "   waiting 30s for DNS to fully settle..."
-  sleep 30
+  # responses. Wait 15s to be safe.
+  echo "   waiting 15s for DNS to fully settle..."
+  sleep 15
 fi
 
 # Verify the override works: the egress proxy pod should now resolve the name.
@@ -414,9 +415,9 @@ cat > "$TMPDIR/probe-allowed.sh" <<EOF
 echo "-- HTTP proxy.golang.org (via explicit proxy) --"
 curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
   --proxy http://${PROXY_FQDN}:3128 http://proxy.golang.org/
-ec=$?
+ec=\$?
 echo ""
-echo "curl-exit=$ec"
+echo "curl-exit=\$ec"
 EOF
 K -n "$NS" cp "$TMPDIR/probe-allowed.sh" "$AGENT_POD:/tmp/probe-allowed.sh" 2>/dev/null || bad "kubectl cp probe-allowed.sh failed"
 P3=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-allowed.sh 2>&1)

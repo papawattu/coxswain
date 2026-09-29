@@ -14,6 +14,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
+// ErrForeignKapt is the sentinel createOrUpdateKapt returns when a
+// KubeArmorPolicy of the desired name exists and is NOT controlled by the
+// Loop (I42f review P2, round 1: the same never-take-over rule as I42c's
+// errForeignNetpol, applied to the three KubeArmorPolicy names — the agent's
+// and the two proxies'). The foreign object is left untouched; the controller
+// maps the sentinel to a KubeArmorPolicyConflict condition and holds the
+// sandbox Suspended.
+var ErrForeignKapt = fmt.Errorf("KubeArmorPolicy is controlled by another controller (foreign)")
+
 // KubeArmorEnforcer is the production Enforcer: it emits the KubeArmorPolicy for
 // the Loop's effective policy (Apply) and reports whether the engine is
 // enforcing (Enforcing). It writes the KubeArmorPolicy as an unstructured
@@ -117,21 +126,38 @@ func (e *KubeArmorEnforcer) cleanupModelProxyKapt(ctx context.Context, loop *v1a
 // Apply: create when absent, update with the live resourceVersion when
 // present). It owner-refs the policy to the Loop so it is GC'd with the Loop
 // (P2: and a later same-name Loop does not inherit a stale policy).
+//
+// I42f review P2 (round 1): a FOREIGN KubeArmorPolicy of the same name is
+// never overwritten (the same never-take-over rule as I42c's
+// createOrUpdateNP, applied to the three KubeArmorPolicy names the Enforcer
+// emits). When the live object exists and is not controlled by the Loop,
+// ErrForeignKapt is returned and the object is left untouched; the controller
+// maps the sentinel to a KubeArmorPolicyConflict condition and holds the
+// sandbox Suspended (fail-closed: a proxy's inner fence must not be someone
+// else's policy).
 func (e *KubeArmorEnforcer) createOrUpdateKapt(ctx context.Context, loop *v1alpha1.Loop, obj *unstructured.Unstructured) error {
-	if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {
-		return fmt.Errorf("set owner ref on KubeArmorPolicy %s: %w", obj.GetName(), err)
-	}
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(kaptGroupVersion.WithKind(kaptKind))
 	err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: obj.GetName()}, existing)
 	switch {
 	case errors.IsNotFound(err):
+		if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {
+			return fmt.Errorf("set owner ref on KubeArmorPolicy %s: %w", obj.GetName(), err)
+		}
 		if err := e.Client.Create(ctx, obj); err != nil {
 			return fmt.Errorf("create KubeArmorPolicy %s: %w", obj.GetName(), err)
 		}
 	case err != nil:
 		return fmt.Errorf("get KubeArmorPolicy %s: %w", obj.GetName(), err)
 	default:
+		// A foreign policy occupying the name is left untouched; the caller
+		// maps the sentinel to the KubeArmorPolicyConflict condition.
+		if !metav1.IsControlledBy(existing, loop) {
+			return fmt.Errorf("KubeArmorPolicy %s/%s: %w", loop.Namespace, obj.GetName(), ErrForeignKapt)
+		}
+		if err := controllerutil.SetControllerReference(loop, obj, e.Client.Scheme()); err != nil {
+			return fmt.Errorf("set owner ref on KubeArmorPolicy %s: %w", obj.GetName(), err)
+		}
 		obj.SetResourceVersion(existing.GetResourceVersion())
 		if err := e.Client.Update(ctx, obj); err != nil {
 			return fmt.Errorf("update KubeArmorPolicy %s: %w", obj.GetName(), err)

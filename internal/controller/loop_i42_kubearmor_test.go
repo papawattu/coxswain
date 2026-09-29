@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -224,5 +225,146 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "coxswain-i42f-cl-proxy"}, obj)
 		Expect(err).To(HaveOccurred(),
 			"the model proxy KubeArmorPolicy must be cleaned up when the model endpoint is gone")
+	})
+
+	// review P1 (PR #28 early review, R16 D39): BOTH proxy policies must carry
+	// the platform DNS allow (udp + tcp in matchProtocols). With spec.action
+	// Block and a tcp-only matchProtocols, the proxies could not resolve any
+	// name under KubeArmor enforcement.
+	It("carries the platform DNS allow (udp+tcp) in both proxy policies' matchProtocols", func() {
+		r.AllowUnenforced = true
+		ns := setupNS("dns")
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+		loop := buildLoop("i42f-dns", ns, []string{i42fTestPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-dns"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		kaptProtocols := func(obj *unstructured.Unstructured) []string {
+			network, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
+			items, _ := network["matchProtocols"].([]any)
+			out := make([]string, 0, len(items))
+			for _, it := range items {
+				out = append(out, it.(map[string]any)["protocol"].(string))
+			}
+			return out
+		}
+
+		modelProtocols := kaptProtocols(getKapt(ctx, ns, "coxswain-i42f-dns-proxy"))
+		Expect(modelProtocols).To(ContainElement("udp"),
+			"the model proxy policy must allow udp (platform DNS); a tcp-only allow blocks the proxy's DNS under spec.action Block: %v", modelProtocols)
+		Expect(modelProtocols).To(ContainElement("tcp"))
+
+		egressProtocols := kaptProtocols(getKapt(ctx, ns, "coxswain-i42f-dns-egress-proxy"))
+		Expect(egressProtocols).To(ContainElement("udp"),
+			"the egress proxy policy must allow udp (platform DNS): %v", egressProtocols)
+		Expect(egressProtocols).To(ContainElement("tcp"))
+	})
+
+	// review P1 (PR #28 early review, D39): both proxy pods must carry
+	// dnsConfig ndots:1 so their resolvers send absolute names for in-cluster
+	// URLs without search-suffix expansion (with the default ndots:5, the
+	// first query for a bare single-label name is the search-expanded form,
+	// which the allowlist must also carry — the emitter handles the expanded
+	// form; ndots:1 makes the absolute name the primary one).
+	It("sets dnsConfig ndots:1 on the egress-proxy and model-proxy pods", func() {
+		r.AllowUnenforced = true
+		ns := setupNS("ndots")
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "model-creds", Namespace: ns},
+			StringData: map[string]string{"openai.api_key": "sk-test"},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+		loop := buildLoop("i42f-nd", ns, []string{i42fTestPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-nd"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		assertNdots := func(podName string) {
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: podName}, pod)).To(Succeed())
+			dnsCfg := pod.Spec.DNSConfig
+			Expect(dnsCfg).ToNot(BeNil(),
+				"the %s pod must carry a dnsConfig (ndots:1) so in-cluster names resolve without search expansion", podName)
+			found := false
+			for _, opt := range dnsCfg.Options {
+				if opt.Name == "ndots" && opt.Value != nil && *opt.Value == "1" {
+					found = true
+				}
+			}
+			Expect(found).To(BeTrue(),
+				"the %s pod dnsConfig must set ndots=1 (search-suffix expansion breaks KubeArmor DNS allowlist matching)", podName)
+		}
+		assertNdots("i42f-nd-egress-proxy")
+		assertNdots("i42f-nd-proxy")
+	})
+
+	// review P2 (PR #28 early review): a FOREIGN KubeArmorPolicy occupying a
+	// coxswain-<loop>[-egress-proxy|-proxy] name is NEVER overwritten
+	// (I42c's createOrUpdateNP never-take-over, applied to the KubeArmorPols).
+	// The reconciler sets KubeArmorPolicyConflict=True/ForeignKubeArmorPolicy,
+	// holds the sandbox Suspended, and does not error-loop.
+	It("does not overwrite a foreign egress-proxy KubeArmorPolicy; sets KubeArmorPolicyConflict and holds the sandbox Suspended", func() {
+		r.AllowUnenforced = true
+		ns := setupNS("foreign")
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+
+		// Pre-create a FOREIGN KubeArmorPolicy occupying the egress proxy's
+		// name (a different owner; the Loop's owner ref is absent).
+		foreign := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "security.kubearmor.com/v1",
+			"kind":       "KubeArmorPolicy",
+			"metadata": map[string]any{
+				"name":      "coxswain-i42f-fx-egress-proxy",
+				"namespace": ns,
+				"labels":    map[string]any{"external": "true"},
+			},
+			"spec": map[string]any{"action": "Audit"},
+		}}
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+
+		loop := buildLoop("i42f-fx", ns, []string{i42fTestPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-fx"}})
+		Expect(err).NotTo(HaveOccurred(),
+			"a foreign KubeArmorPolicy must not error-loop the reconcile (the sandbox is held Suspended instead)")
+
+		// The foreign object is left untouched (spec + label intact, no
+		// owner ref added).
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(engine.KubeArmorGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "coxswain-i42f-fx-egress-proxy"}, got)).To(Succeed())
+		Expect(got.GetOwnerReferences()).To(BeEmpty(),
+			"the foreign KubeArmorPolicy must not be owner-ref'd to the Loop")
+		lbl, _, _ := unstructured.NestedMap(got.Object, "metadata", "labels")
+		Expect(lbl).To(HaveKey("external"),
+			"the foreign KubeArmorPolicy must be left untouched (its labels are intact)")
+
+		// The conflict condition is set (same pattern as NetworkPolicyConflict).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "i42f-fx"}, loop)).To(Succeed())
+		var conflict *metav1.Condition
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == "KubeArmorPolicyConflict" {
+				conflict = &loop.Status.Conditions[i]
+			}
+		}
+		Expect(conflict).ToNot(BeNil(), "KubeArmorPolicyConflict condition must be set")
+		Expect(conflict.Status).To(Equal(metav1.ConditionTrue))
+		Expect(conflict.Reason).To(Equal("ForeignKubeArmorPolicy"))
+
+		// The sandbox is held Suspended (the ensureSandbox gate).
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName("i42f-fx")}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the sandbox must be held Suspended while a foreign KubeArmorPolicy occupies the name")
 	})
 })

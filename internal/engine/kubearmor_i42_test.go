@@ -24,6 +24,12 @@ package engine
 // internal/controller/loop_i42_kubearmor_test.go):
 //   1. Egress proxy KubeArmor policy shape.
 //   2. Model proxy KubeArmor policy shape.
+//   3. Both proxy policies allow platform DNS (udp+tcp) — the R16 D39 fix
+//      (PR #28 early review P1): with spec.action Block and matchProtocols
+//      tcp-only, both proxies would be unable to resolve ANY name.
+//   4. A bare single-label modelEndpoint gets the search-expanded
+//      <host>.<ns>.svc.cluster.local form on the allowlist (kept alongside the
+//      bare form): the proxy's resolver queries the expanded name first.
 //   (edge) a policy with no process/network/file allows emits only the
 //          selector + action Block.
 //   (edge) the emitted selectors never carry coxswain.io/loop (the agent
@@ -144,6 +150,69 @@ func TestEmitEgressProxyKubeArmorPolicyNoNetworkAllows(t *testing.T) {
 	}
 	if _, ok := spec["network"]; ok {
 		t.Fatalf("a proxy with no network allows must not emit a network block, got %v", spec["network"])
+	}
+}
+
+// review P1 (PR #28 early review): the platform DNS allow (the same
+// policy.DNSAllow constant the agent policy gets via policy.Translate,
+// splitNetworkAllows' special case "dns/udp+tcp") must be in BOTH proxy
+// policies' matchProtocols — udp and tcp. Without udp, spec.action Block
+// denies the proxies' DNS lookups and neither proxy can resolve anything
+// (every CONNECT / model call fails).
+func TestEmitProxyPoliciesAllowPlatformDNS(t *testing.T) {
+	t.Run("egress proxy policy allows udp+tcp", func(t *testing.T) {
+		obj := EmitEgressProxyKubeArmorPolicy(i42fLoop, i42fNS, []string{i42fAllow})
+		spec := obj.Object["spec"].(map[string]any)
+		protocols := matchProtocolItems(t, spec["network"].(map[string]any)["matchProtocols"])
+		if !slices.Contains(protocols, "udp") || !slices.Contains(protocols, "tcp") {
+			t.Fatalf("egress proxy matchProtocols must include udp AND tcp (platform DNS), got %v", protocols)
+		}
+	})
+	t.Run("model proxy policy allows udp+tcp", func(t *testing.T) {
+		obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, i42fModelEP)
+		spec := obj.Object["spec"].(map[string]any)
+		protocols := matchProtocolItems(t, spec["network"].(map[string]any)["matchProtocols"])
+		if !slices.Contains(protocols, "udp") || !slices.Contains(protocols, "tcp") {
+			t.Fatalf("model proxy matchProtocols must include udp AND tcp (platform DNS), got %v", protocols)
+		}
+	})
+}
+
+// review P1 (PR #28 early review, D39): modelEndpoint can be a bare in-cluster
+// Service name (single-label, same namespace). The proxy's resolver queries
+// the search-expanded name <host>.<ns>.svc.cluster.local first, so the
+// expanded form must be on the allowlist too (kept alongside the bare form).
+func TestEmitModelProxyKubeArmorPolicySingleLabelEndpoint(t *testing.T) {
+	// A bare single-label endpoint (host, no port).
+	obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model-svc")
+	spec := obj.Object["spec"].(map[string]any)
+	domains := matchDomainItems(t, spec["network"].(map[string]any)["matchDNSQueries"])
+	if !slices.Contains(domains, "model-svc") {
+		t.Fatalf("matchDNSQueries must include the bare single-label host model-svc, got %v", domains)
+	}
+	if !slices.Contains(domains, "model-svc."+i42fNS+".svc.cluster.local") {
+		t.Fatalf("matchDNSQueries must include the search-expanded form model-svc.%s.svc.cluster.local, got %v", i42fNS, domains)
+	}
+	// A single-label endpoint with an explicit port: same expansion.
+	obj = EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model-svc:8080")
+	spec = obj.Object["spec"].(map[string]any)
+	domains = matchDomainItems(t, spec["network"].(map[string]any)["matchDNSQueries"])
+	if !slices.Contains(domains, "model-svc") {
+		t.Fatalf("matchDNSQueries must include the bare single-label host model-svc, got %v", domains)
+	}
+	if !slices.Contains(domains, "model-svc."+i42fNS+".svc.cluster.local") {
+		t.Fatalf("matchDNSQueries must include the search-expanded form model-svc.%s.svc.cluster.local, got %v", i42fNS, domains)
+	}
+	// A multi-label endpoint is NOT expanded (it is already a valid search
+	// candidate; expanding would add a name that never resolves).
+	obj = EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, "model.other")
+	spec = obj.Object["spec"].(map[string]any)
+	domains = matchDomainItems(t, spec["network"].(map[string]any)["matchDNSQueries"])
+	if !slices.Contains(domains, "model.other") {
+		t.Fatalf("matchDNSQueries must include model.other, got %v", domains)
+	}
+	if len(domains) != 1 {
+		t.Fatalf("a multi-label endpoint must not be search-expanded, got %v", domains)
 	}
 }
 

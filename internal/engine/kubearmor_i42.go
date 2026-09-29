@@ -24,10 +24,17 @@ package engine
 // proxy). Everything else is denied by spec.action Block.
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/papawattu/coxswain/internal/policy"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+// KubeArmorPolicy spec-level keys (the same keys EmitKubeArmorPolicy builds;
+// constant here so goconst does not flag the two emitters).
+const (
+	kaptActionValue = "Block"
 )
 
 // egressProxyBinaryPath is the egress proxy binary's absolute path in its
@@ -60,7 +67,7 @@ func EmitEgressProxyKubeArmorPolicy(loopName, namespace string, networkAllows []
 	spec := map[string]any{
 		// Default-deny posture: the same Block semantics as the agent policy
 		// (C6b) — per-rule action Allow is the carve-out.
-		"action": "Block",
+		kaptActionKey: kaptActionValue,
 		"selector": map[string]any{
 			"matchLabels": egressProxyKaptSelector(loopName),
 		},
@@ -90,13 +97,15 @@ func EmitEgressProxyKubeArmorPolicy(loopName, namespace string, networkAllows []
 // (component = model-proxy + coxswain.io/proxy-for). modelEndpoint is the
 // endpoint the proxy dials (spec.agent.modelEndpoint, or the proxy's
 // configured target in Phase 1): host, host:port, or a URL — only the host
-// matters to a DNS allowlist. The network block allows that host + tcp (the
-// proxy dials the model endpoint over TCP; KubeArmor cannot express the port,
-// the proxy's NetworkPolicy carries the precision).
+// matters to a DNS allowlist. The network block allows that host (+ its
+// search-expanded form when it is a bare single-label in-cluster Service name,
+// review P1: the resolver queries <host>.<ns>.svc.cluster.local first) +
+// tcp + the platform DNS allow (udp+tcp, so the proxy can resolve the host
+// under spec.action Block).
 func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint string) *unstructured.Unstructured {
 	host, _ := modelEndpointHost(modelEndpoint)
 	spec := map[string]any{
-		kaptActionKey: "Block",
+		kaptActionKey: kaptActionValue,
 		"selector": map[string]any{
 			"matchLabels": modelProxyKaptSelector(loopName),
 		},
@@ -106,10 +115,20 @@ func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint string) *u
 		},
 	}
 	if host != "" {
+		// A bare single-label host is an in-cluster Service name: the resolver
+		// queries the search-expanded form first, so allowlist both (the bare
+		// form too, for the absolute-name query under ndots:1).
+		domains := []string{host}
+		if isSingleLabelName(host) {
+			domains = append(domains, host+"."+namespace+".svc.cluster.local")
+		}
 		spec["network"] = map[string]any{
 			kaptActionKey:     kaptAllowAction,
-			"matchDNSQueries": toDomainItems([]string{host}),
-			"matchProtocols":  toProtocolItems([]string{"tcp"}),
+			"matchDNSQueries": toDomainItems(dedupe(domains)),
+			// tcp: the proxy dials the model endpoint over TCP. udp+tcp: the
+			// platform DNS allow (review P1: a tcp-only matchProtocols with
+			// spec.action Block denies the proxy's own DNS lookups).
+			"matchProtocols": toProtocolItems(appendDeduped([]string{"tcp"}, dnsAllowProtocols()...)),
 		}
 	}
 
@@ -129,13 +148,50 @@ func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint string) *u
 // action Allow. It reuses splitNetworkAllows so the proxy translation cannot
 // drift from the agent policy's (host:port -> domain + protocol name; the
 // port is lost, as in C6b — the proxy NetworkPolicies carry the precision).
+// The platform DNS allow (policy.DNSAllow's udp+tcp protocols) is ALWAYS
+// present (review P1: a tcp-only matchProtocols with spec.action Block
+// denies the proxy's own DNS lookups — the proxy could not resolve ANY
+// allowed host). The constant flows through splitNetworkAllows' special
+// case, the same translation the agent policy uses.
 func proxyNetworkBlock(networkAllows []string) map[string]any {
-	domains, protocols := splitNetworkAllows(networkAllows)
+	domains, protocols := splitNetworkAllows(append([]string{policy.DNSAllow}, networkAllows...))
 	return map[string]any{
 		kaptActionKey:     kaptAllowAction,
 		"matchDNSQueries": toDomainItems(domains),
 		"matchProtocols":  toProtocolItems(protocols),
 	}
+}
+
+// dnsAllowProtocols returns the protocol names the platform DNS allow
+// (policy.DNSAllow) expands to — ["udp", "tcp"] via splitNetworkAllows' special
+// case. One source of truth: the emitter's model-proxy network block (which
+// does not go through proxyNetworkBlock) reuses it so the two proxy policies
+// and the agent policy cannot drift.
+func dnsAllowProtocols() []string {
+	_, protocols := splitNetworkAllows([]string{policy.DNSAllow})
+	return protocols
+}
+
+// isSingleLabelName reports whether host is a bare single-label name (no dot,
+// no trailing dot) — the form a resolver search-expands to <host>.<ns>.
+// svc.cluster.local. Multi-label names are NOT expanded (the first candidate
+// is the name itself, or an absolute form the user gave).
+func isSingleLabelName(host string) bool {
+	return host != "" && !strings.Contains(host, ".")
+}
+
+// appendDeduped returns in with extra appended, de-duplicated (order preserved
+// for the extra entries; the result is sorted by the caller's toProtocolItems
+// consumers only when dedupe is applied — here the order is stable for tests
+// via slices.Contains, so a plain dedupe suffices).
+func appendDeduped(in []string, extra ...string) []string {
+	out := append([]string{}, in...)
+	for _, e := range extra {
+		if !slices.Contains(out, e) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // modelEndpointHost extracts the host a model endpoint resolves to (for the

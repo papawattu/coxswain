@@ -285,6 +285,11 @@ EOF
 K apply -f "$TMPDIR/agentpolicy.yaml" >/dev/null
 
 echo "   creating throwaway fake-model pod + Service (model endpoint target) ..."
+# Delete any existing fake-model pod first (idempotency: a prior run may
+# have left a pod with a different command, and Pod updates may not
+# change spec.containers[*].command).
+K -n "$NS" delete pod fake-model --ignore-not-found --timeout=30s 2>/dev/null || true
+sleep 2
 cat > "$TMPDIR/fake-model.yaml" <<EOF
 apiVersion: v1
 kind: Pod

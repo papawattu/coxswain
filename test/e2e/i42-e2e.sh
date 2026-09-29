@@ -330,6 +330,10 @@ echo "   coredns ConfigMap updated"
 kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
 kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
 echo "   coredns restarted"
+# Give CoreDNS a moment to settle and the agent's DNS cache a chance to
+# refresh. Without this, the first curl from the agent may fail with
+# "couldn't resolve proxy" (exit 5) if DNS is still warming up.
+sleep 5
 
 # Verify the override works: the egress proxy pod should now resolve the name.
 # (We don't exec into the proxy — it's distroless. Instead we verify via the
@@ -384,7 +388,9 @@ EGRESS_POD="$LOOP-egress-proxy"
 cat > "$TMPDIR/probe-allowed.sh" <<'EOF'
 #!/bin/sh
 echo "-- HTTP proxy.golang.org (via HTTPS_PROXY env) --"
-curl -s -o /dev/null -w "%{http_code}" --max-time 30 http://proxy.golang.org/
+# --retry 2: the first attempt may fail if DNS is still warming up after
+# the coredns restart; retry once more.
+curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://proxy.golang.org/
 ec=$?
 echo ""
 echo "curl-exit=$ec"
@@ -415,7 +421,7 @@ echo "--- CHECK 4: disallowed host gets 403 (audit: blocked) ---"
 cat > "$TMPDIR/probe-disallowed.sh" <<'EOF'
 #!/bin/sh
 echo "-- HTTP github.com (NOT in the allows) via HTTPS_PROXY env --"
-code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 http://github.com/ 2>&1)
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://github.com/ 2>&1)
 ec=$?
 echo "curl-exit=$ec http=$code"
 if [ "$code" = "403" ]; then
@@ -515,7 +521,7 @@ echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${TEST_IP}) rejected b
 cat > "$TMPDIR/probe-rebind.sh" <<EOF
 #!/bin/sh
 echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via HTTPS_PROXY env --"
-code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 http://${REBIND_NAME}/ 2>&1)
+code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://${REBIND_NAME}/ 2>&1)
 ec=\$?
 echo "curl-exit=\$ec http=\$code"
 if [ "\$code" = "403" ]; then

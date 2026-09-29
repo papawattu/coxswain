@@ -697,19 +697,23 @@ fi
 echo
 echo "--- CHECK 11: kubectl debug (ephemeral container) on the egress-proxy pod is DENIED (I45) ---"
 # Confirm the admission policy + binding are present in the cluster.
-if K get validatingadmissionpolicy coxswain-deny-ephemeral-containers >/dev/null 2>&1 \
-   && K get validatingadmissionpolicybinding coxswain-deny-ephemeral-containers >/dev/null 2>&1; then
-  echo "   ValidatingAdmissionPolicy + binding present"
+# The VAP + binding are deployed from config/default which applies a namePrefix
+# (coxswain-), so the cluster-scoped objects are named coxswain-coxswain-deny-
+# ephemeral-containers. Discover the deployed name rather than hardcoding it.
+VAP_NAME=$(K get validatingadmissionpolicy --no-headers 2>/dev/null | awk '{print $1}' | grep 'deny-ephemeral-containers' | head -1)
+VAPB_NAME=$(K get validatingadmissionpolicybinding --no-headers 2>/dev/null | awk '{print $1}' | grep 'deny-ephemeral-containers' | head -1)
+if [ -n "$VAP_NAME" ] && [ -n "$VAPB_NAME" ]; then
+  echo "   ValidatingAdmissionPolicy=$VAP_NAME binding=$VAPB_NAME present"
   # kubectl debug issues a pods/ephemeralcontainers UPDATE (subresource patch).
   DEBUG_OUT=$(K -n "$NS" debug -q "$EGRESS_POD" --image="$BUSYBOX_IMG" -- sh -c 'true' 2>&1 || true)
   echo "   kubectl debug on $EGRESS_POD output: $DEBUG_OUT"
-  if echo "$DEBUG_OUT" | grep -qi "denied\|ephemeral containers.*denied\|adding ephemeral"; then
+  if echo "$DEBUG_OUT" | grep -qi "denied"; then
     ok "kubectl debug (ephemeral container) on the egress-proxy pod was DENIED by the ValidatingAdmissionPolicy"
   else
     bad "kubectl debug (ephemeral container) on the egress-proxy pod was NOT denied (VAP not in effect)"
   fi
 else
-  bad "ValidatingAdmissionPolicy/binding coxswain-deny-ephemeral-containers not found in the cluster (I45)"
+  bad "ValidatingAdmissionPolicy/binding 'deny-ephemeral-containers' not found in the cluster (I45)"
 fi
 
 # ===========================================================================

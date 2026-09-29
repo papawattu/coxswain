@@ -188,6 +188,29 @@ REBIND_NAME="i42-rebind.example.test"
 REBIND_ALLOW="${REBIND_NAME}:80"
 
 # ===========================================================================
+# ===========================================================================
+# STEP 3a-override: CoreDNS hosts override for the DNS-rebinding check.
+# Runs BEFORE the fixture is created so the egress proxy pod (created by
+# the controller when the Loop is applied) gets a fresh DNS connection
+# that knows about the hosts entry. The trap restores the ConfigMap on exit.
+# ===========================================================================
+echo
+echo "--- STEP 3a-override: CoreDNS hosts override (${REBIND_NAME} -> ${TEST_IP}) ---"
+K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
+echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
+COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
+HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${TEST_IP} }"
+NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
+if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
+  echo "FATAL: could not insert the hosts block into the Corefile"
+  exit 2
+fi
+echo "   modified Corefile (first 5 lines):"
+echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
+K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
+echo "   coredns ConfigMap updated, waiting 15s for coredns to reload..."
+sleep 15
+
 # STEP 3b: create the fixture (namespace, AgentPolicy, fake model, Loop).
 #          The AgentPolicy includes the rebinding name so the egress proxy's
 #          allow check passes; the CoreDNS hosts override (step 3d) makes it
@@ -457,37 +480,16 @@ case "$P6" in
   *) bad "unexpected output for raw external TCP (output: $P6)" ;;
 esac
 
-# ===========================================================================
-# CoreDNS hosts override for the DNS-rebinding check (runs LAST, just
-# before check 7, so checks 1-6 run against the original Corefile).
-# The rebind name is already in the AgentPolicy allows from the start.
-# The trap restores the ConfigMap on exit.
-# ===========================================================================
-echo
-echo "--- CoreDNS hosts override (${REBIND_NAME} -> ${TEST_IP}) [before check 7] ---"
-K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
-echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
-COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
-HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${TEST_IP} }"
-NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
-if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
-  echo "FATAL: could not insert the hosts block into the Corefile"
-  exit 2
-fi
-echo "   modified Corefile (first 5 lines):"
-echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
-K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
-echo "   coredns ConfigMap updated, waiting 15s for coredns to reload..."
-sleep 15
 
 # ===========================================================================
 # CHECK 7: DNS-rebinding allow is rejected by the proxy; resolved IP in
 #          audit detail.
-#          The CoreDNS hosts override (above) makes $REBIND_NAME resolve
-#          to $TEST_IP (a private pod IP). The AgentPolicy allows
-#          $REBIND_NAME:80, so the allow check passes. But the egress proxy's
-#          resolved-IP carve-out rejects the private IP → 403 + audit blocked
-#          with the resolved IP in the detail.
+#          The CoreDNS hosts override (step 3a-override, applied before the
+#          fixture was created) makes $REBIND_NAME resolve to $TEST_IP
+#          (a private pod IP). The AgentPolicy allows $REBIND_NAME:80, so the
+#          allow check passes. But the egress proxy's resolved-IP carve-out
+#          rejects the private IP → 403 + audit blocked with the resolved IP
+#          in the detail.
 # ===========================================================================
 echo
 echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${TEST_IP}) rejected by proxy ---"

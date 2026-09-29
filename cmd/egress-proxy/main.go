@@ -203,6 +203,12 @@ func (p *h) handleConnect(w http.ResponseWriter, r *http.Request) {
 			// audited with dns=nxdomain (ADR failure mode), distinct from an
 			// allowlisted name whose resolution lands in a carved-out range.
 			detail = "dns=nxdomain"
+		} else if resolvedIP != nil {
+			// The resolved IP is the offending one (returned by resolveAndCheck
+			// when the carve-out rejects it). Include it in the detail so the
+			// audit record carries the resolved IP (the plan's paragraph
+			// requires this for the DNS-rebinding block).
+			detail = "reason=resolved-ip-rejected, ip=" + resolvedIP.String()
 		}
 		p.audit("connect", r.Host, "blocked", detail+", policy="+p.policyHash)
 		http.Error(w, "host resolves to a disallowed address", http.StatusForbidden)
@@ -316,6 +322,8 @@ func (p *h) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		detail := "reason=resolved-ip-rejected"
 		if resolveErr != nil {
 			detail = "dns=nxdomain"
+		} else if resolvedIP != nil {
+			detail = "reason=resolved-ip-rejected, ip=" + resolvedIP.String()
 		}
 		p.audit("http", r.Host, "blocked", detail+", policy="+p.policyHash)
 		http.Error(w, "host resolves to a disallowed address", http.StatusForbidden)
@@ -420,7 +428,7 @@ func (p *h) resolveAndCheck(ctx context.Context, host string) (net.IP, bool, err
 		if egress.CheckResolvedIPWithCarveOuts(ip, p.extraCIDRs) {
 			return ip, true, nil
 		}
-		return nil, false, nil
+		return ip, false, nil
 	}
 	dnsCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
 	defer cancel()
@@ -430,10 +438,12 @@ func (p *h) resolveAndCheck(ctx context.Context, host string) (net.IP, bool, err
 	}
 	// The ADR says reject if ANY resolved IP is in a carved-out range, so
 	// check all (a name that resolves to a mix of public + private is a
-	// rebind / split-horizon attack).
+	// rebind / split-horizon attack). Return the offending IP so the caller
+	// can include it in the audit detail (the plan's paragraph requires the
+	// blocked record to carry the resolved IP).
 	for _, ip := range ips {
 		if !egress.CheckResolvedIPWithCarveOuts(ip.IP, p.extraCIDRs) {
-			return nil, false, nil
+			return ip.IP, false, nil
 		}
 	}
 	return ips[0].IP, true, nil

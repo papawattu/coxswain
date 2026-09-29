@@ -51,15 +51,22 @@ func (m mockResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 func TestResolveAndCheckRebind(t *testing.T) {
 	res := &mockResolver{ips: []netip.Addr{netip.MustParseAddr("10.244.0.5")}}
 	p := newHandlerWithResolver([]string{"rebind.example:443"}, []string{"10.244.0.0/16"}, "l", "ns", "h", res)
-	if _, ok, _ := p.resolveAndCheck(context.Background(), "rebind.example"); ok {
+	ip, ok, _ := p.resolveAndCheck(context.Background(), "rebind.example")
+	if ok {
 		t.Fatal("a host rebinding to the pod CIDR must be rejected")
+	}
+	// The offending IP must be returned so the caller can include it in the
+	// audit detail (the plan's paragraph requires the blocked record to
+	// carry the resolved IP).
+	if ip == nil || ip.String() != "10.244.0.5" {
+		t.Fatalf("the offending IP must be returned for the audit detail; got %v", ip)
 	}
 	// A public resolution of the same (allowlisted) host is dialable.
 	res2 := &mockResolver{ips: []netip.Addr{netip.MustParseAddr("151.101.0.223")}}
 	p2 := newHandlerWithResolver([]string{"rebind.example:443"}, []string{"10.244.0.0/16"}, "l", "ns", "h", res2)
-	ip, ok, _ := p2.resolveAndCheck(context.Background(), "rebind.example")
-	if !ok || ip.String() != "151.101.0.223" {
-		t.Fatalf("a public rebind must be dialable to the same IP; got (%v, %v)", ip, ok)
+	pubIP, ok, _ := p2.resolveAndCheck(context.Background(), "rebind.example")
+	if !ok || pubIP.String() != "151.101.0.223" {
+		t.Fatalf("a public rebind must be dialable to the same IP; got (%v, %v)", pubIP, ok)
 	}
 }
 

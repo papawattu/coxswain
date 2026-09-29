@@ -101,9 +101,8 @@ cleanup() {
       echo "   (could not read the original Corefile from the backup; check manually)"
     fi
     # restart coredns so it picks up the restored config (NOT KubeArmor)
-    kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
-    kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || true
-    echo "   coredns restored."
+    sleep 15
+    echo "   coredns restored (ConfigMap replaced, waiting for reload)."
   fi
   # delete the throwaway exec pod
   if [ -n "$THROWAWAY_POD" ]; then
@@ -328,10 +327,10 @@ echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
 K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
 echo "   coredns ConfigMap updated"
 
-# Restart coredns so it picks up the new config (this is NOT KubeArmor).
-kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
-kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
-echo "   coredns restarted"
+# Wait for coredns to reload the ConfigMap (CoreDNS watches its ConfigMap
+# and reloads automatically; a restart would disrupt DNS for all pods).
+echo "   waiting 15s for coredns to reload the ConfigMap..."
+sleep 15
 # Wait for the agent pod to be Ready (it was just recreated from the Loop
 # deletion in step 3b). Then wait for DNS to settle: the agent pod's DNS
 # resolver may be stale after the coredns restart. Poll from the agent pod
@@ -447,16 +446,16 @@ echo "--- CHECK 4: disallowed host gets 403 (audit: blocked) ---"
 cat > "$TMPDIR/probe-disallowed.sh" <<EOF
 #!/bin/sh
 echo "-- HTTP github.com (NOT in the allows) via explicit proxy --"
-code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
+code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
   --proxy http://${PROXY_IP}:3128 http://github.com/ 2>&1)
-ec=$?
-echo "curl-exit=$ec http=$code"
-if [ "$code" = "403" ]; then
+ec=\$?
+echo "curl-exit=\$ec http=\$code"
+if [ "\$code" = "403" ]; then
   echo "curl got 403 (blocked as expected)"
-elif [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+elif [ "\$code" = "200" ] || [ "\$code" = "301" ] || [ "\$code" = "302" ]; then
   echo "curl SUCCEEDED (UNEXPECTED for a disallowed host)"
 else
-  echo "curl got http=$code exit=$ec"
+  echo "curl got http=\$code exit=\$ec"
 fi
 EOF
 K -n "$NS" cp "$TMPDIR/probe-disallowed.sh" "$AGENT_POD:/tmp/probe-disallowed.sh" 2>/dev/null || bad "kubectl cp probe-disallowed.sh failed"

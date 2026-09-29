@@ -162,7 +162,7 @@ The reviewer now mutation-tests key gates on each PR.
 
 ### I45. Ephemeral containers (`kubectl debug`) bypass the KubeArmor fence
 
-- [ ] Fixed
+- [x] Fixed in 6e0e7fe (#34)
 
 **Where:** every KubeArmor-fenced pod (agent, egress proxy, model proxy), and
 namespace RBAC for Loop namespaces.

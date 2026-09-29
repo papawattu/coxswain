@@ -20,14 +20,12 @@
 #      (agent NetworkPolicy; the D38 carve-out is host-NETWORK endpoints only)
 #   6  a direct-IP connection to a disallowed external host fails
 #      (no raw egress: the agent NetworkPolicy only permits the proxies + DNS)
-#   7  a DNS-rebinding allow (allowed name resolving to a private IP) is
-#      rejected by the egress proxy, resolved IP in the audit detail
-#      (the DNS-rebinding check is only exercised when DNS rebinds to a
-#      cluster-internal IP; with an external private IP the proxy would
-#      legitimately connect, so the assertion is scoped accordingly)
+#   7  a DNS-rebinding allow (an allowed name resolving to a private pod IP)
+#      is rejected by the egress proxy (403), and the audit blocked record's
+#      detail carries the resolved private IP. Simulated via a CoreDNS hosts
+#      override (split-horizon) — the ConfigMap is restored on exit.
 #   8  a .svc allow is rejected at validation (CRD CEL rule: the API server
-#      rejects the AgentPolicy; controller-side PolicyValid=False is the
-#      companion check, envtest-covered)
+#      rejects the AgentPolicy)
 #   9  the KubeArmor policies exist for both proxies (egress + model)
 #   10 a disallowed exec in a pod selected by the egress-proxy KubeArmor
 #      policy gets Permission denied (throwaway busybox pod carrying the
@@ -44,7 +42,8 @@
 # House rules honored: KubeArmor is NEVER restarted; no rm -rf (temp files are
 # left in place); no python heredocs inside kubectl exec sh -c (probe scripts
 # are written as files and kubectl cp'd); the throwaway pod is removed with
-# kubectl delete (also on exit via a trap).
+# kubectl delete (also on exit via a trap); the CoreDNS ConfigMap is restored
+# on exit via a trap.
 #
 # Requires: docker, kind, kubectl, jq, curl on the host; the kind cluster
 # with agent-sandbox + KubeArmor already installed (make kind-up).
@@ -66,6 +65,7 @@ IMG_TAG="main-${COMMIT}"
 IMG="coxswain-controller:${IMG_TAG}"
 PROXY_IMG="coxswain-proxy:standin"
 EGRESS_IMG="coxswain-egress-proxy:standin"
+AGENT_IMG="golang:1.26"
 BUSYBOX_IMG="busybox:1.36"
 TMPDIR="${TMPDIR:-/tmp}/i42-e2e.$$"
 mkdir -p "$TMPDIR"
@@ -78,9 +78,20 @@ bad() { echo "   FAIL: $*"; FAIL=1; }
 echo "=== Full I42 acceptance (context=$CTX cluster=$CLUSTER ns=$NS loop=$LOOP) ==="
 echo "commit: $COMMIT  image: $IMG"
 
-# --- throwaway pod cleanup (rule: kubectl delete, no force) -----------------
+# --- throwaway pod + CoreDNS ConfigMap cleanup (rule: kubectl delete, no force)
 THROWAWAY_POD=""
+COREDNS_CM_BACKUP="$TMPDIR/coredns-configmap-backup.json"
 cleanup() {
+  # restore the CoreDNS ConfigMap (the DNS-rebinding hosts override is reverted)
+  if [ -f "$COREDNS_CM_BACKUP" ]; then
+    echo "--- restoring kube-system/coredns ConfigMap (reverting the DNS-rebinding hosts override) ---"
+    K apply -f "$COREDNS_CM_BACKUP" 2>/dev/null || echo "   (could not restore the coredns ConfigMap; check manually)"
+    # restart coredns so it picks up the restored config (NOT KubeArmor)
+    K -n kube-system rollout restart deploy/coredns 2>/dev/null || true
+    K -n kube-system rollout status deploy/coredns --timeout=120s 2>/dev/null || true
+    echo "   coredns restored."
+  fi
+  # delete the throwaway exec pod
   if [ -n "$THROWAWAY_POD" ]; then
     echo "--- cleaning up throwaway pod $THROWAWAY_POD (kubectl delete) ---"
     K -n "$NS" delete pod "$THROWAWAY_POD" --wait=false 2>/dev/null || true
@@ -121,7 +132,7 @@ PROXY_DIGEST="$(docker image inspect "$PROXY_IMG" --format '{{.Id}}' 2>/dev/null
 echo "   controller image digest: $IMG_DIGEST"
 echo "   egress-proxy image digest: $EGRESS_DIGEST"
 echo "   model-proxy image digest: $PROXY_DIGEST"
-for img in "$IMG" "$PROXY_IMG" "$EGRESS_IMG" "$BUSYBOX_IMG"; do
+for img in "$IMG" "$PROXY_IMG" "$EGRESS_IMG" "$BUSYBOX_IMG" "$AGENT_IMG"; do
   echo "   kind load: $img"
   kind load docker-image "$img" --name "$CLUSTER" || { echo "FATAL: kind load $img failed"; exit 2; }
 done
@@ -137,8 +148,40 @@ K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s 
 RUNNING_IMG_ID=$(K -n "$E2E_NS" get pods -l control-plane=controller-manager -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null)
 echo "   controller running, imageID: $RUNNING_IMG_ID"
 
+# ===========================================================================
+# STEP 3a: pick a cluster-internal pod IP for the DNS-rebinding check.
+#          We use the first non-coreDNS pod in the cluster (or coredns itself
+#          if nothing else is running yet). The IP is used both as the target
+#          for check 5 (raw TCP block) and as the resolved IP for check 7.
+# ===========================================================================
 echo
-echo "--- STEP 3: create the fixture (namespace, AgentPolicy, fake model, Loop) ---"
+echo "--- STEP 3a: pick a cluster-internal pod IP (for checks 5 and 7) ---"
+# Prefer a non-system pod; fall back to coredns.
+TEST_IP=$(K get pods -A -o json 2>/dev/null \
+  | jq -r '.items[] | select(.metadata.namespace != "kube-system" and .metadata.namespace != "kubearmor" and .metadata.namespace != "agent-sandbox-system" and .metadata.namespace != "coxswain-system") | .status.podIP' 2>/dev/null \
+  | head -1)
+if [ -z "$TEST_IP" ]; then
+  TEST_IP=$(K -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+fi
+if [ -z "$TEST_IP" ]; then
+  echo "FATAL: could not find any pod IP to use as the cluster-internal target"
+  exit 2
+fi
+echo "   cluster-internal pod IP for checks 5+7: $TEST_IP"
+
+# The DNS-rebinding name (allowed by the AgentPolicy, resolves to TEST_IP via
+# the CoreDNS hosts override in step 3d).
+REBIND_NAME="i42-rebind.example.test"
+REBIND_ALLOW="${REBIND_NAME}:80"
+
+# ===========================================================================
+# STEP 3b: create the fixture (namespace, AgentPolicy, fake model, Loop).
+#          The AgentPolicy includes the rebinding name so the egress proxy's
+#          allow check passes; the CoreDNS hosts override (step 3d) makes it
+#          resolve to the private pod IP, triggering the resolved-IP carve-out.
+# ===========================================================================
+echo
+echo "--- STEP 3b: create the fixture (namespace, AgentPolicy, fake model, Loop) ---"
 K get ns "$NS" >/dev/null 2>&1 || K create ns "$NS" >/dev/null
 cat > "$TMPDIR/agentpolicy.yaml" <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
@@ -148,8 +191,8 @@ metadata:
   namespace: ${NS}
 spec:
   network:
-    - proxy.golang.org:443
-    - example.com:443
+    - proxy.golang.org:80
+    - ${REBIND_ALLOW}
 EOF
 K apply -f "$TMPDIR/agentpolicy.yaml" >/dev/null
 
@@ -163,8 +206,8 @@ metadata:
 spec:
   containers:
     - name: fake-model
-      image: ${BUSYBOX_IMG}
-      command: ["sh", "-c", "wget -qO- http://example.com/ >/dev/null 2>&1 || true; sleep 3600"]
+      image: ${AGENT_IMG}
+      command: ["sh", "-c", "sleep 3600"]
 ---
 apiVersion: v1
 kind: Service
@@ -204,7 +247,7 @@ spec:
   policyRefs:
     - ${LOOP}-pol
   agent:
-    image: ${BUSYBOX_IMG}
+    image: ${AGENT_IMG}
     model: local-model
     modelEndpoint: "model-endpoint:8000"
     endpointSecretRef: ${LOOP}-model
@@ -215,18 +258,60 @@ spec:
     maxIterations: 1
 EOF
 K apply -f "$TMPDIR/loop.yaml" >/dev/null
-echo "   fixtures applied: AgentPolicy ${LOOP}-pol, Loop ${LOOP}, fake-model svc"
+echo "   fixtures applied: AgentPolicy ${LOOP}-pol (allows: proxy.golang.org:80, ${REBIND_ALLOW}), Loop ${LOOP}, fake-model svc"
 
 echo
-echo "--- STEP 4: wait for the egress proxy pod to be Ready ---"
+echo "--- STEP 3c: wait for the egress proxy pod to be Ready ---"
 READY=""
 for i in $(seq 1 60); do
-  PHASE=$(K -n "$NS" get pod "${LOOP}-egress-proxy" -o jsonpath='{.status.phase}' 2>/dev/null)
   READYC=$(K -n "$NS" get pod "${LOOP}-egress-proxy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
   if [ "$READYC" = "True" ]; then READY=yes; break; fi
   sleep 5
 done
-echo "   egress proxy pod Ready=True after ~$((i*5))s"
+echo "   egress proxy pod Ready after ~$((i*5))s"
+
+# ===========================================================================
+# STEP 3d: CoreDNS hosts override for the DNS-rebinding check.
+#          Save the current coredns ConfigMap, add a hosts block mapping
+#          i42-rebind.example.test -> $TEST_IP, apply it, and restart coredns.
+#          The trap restores the ConfigMap on exit.
+# ===========================================================================
+echo
+echo "--- STEP 3d: CoreDNS hosts override (${REBIND_NAME} -> ${TEST_IP}) ---"
+# Save the original ConfigMap (for the trap restore).
+K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
+echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
+
+# Build the modified Corefile: add a hosts block after the first line (the .:53 header).
+COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
+# The hosts block: "hosts { fallthrough <name> <ip> }"
+HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${TEST_IP} }"
+NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
+# Verify the hosts line was inserted.
+if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
+  echo "FATAL: could not insert the hosts block into the Corefile (sed failed)"
+  exit 2
+fi
+echo "   modified Corefile (first 5 lines):"
+echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
+
+# Apply the modified ConfigMap.
+K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | K apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
+echo "   coredns ConfigMap updated"
+
+# Restart coredns so it picks up the new config (this is NOT KubeArmor).
+K -n kube-system rollout restart deploy/coredns 2>/dev/null || true
+K -n kube-system rollout status deploy/coredns --timeout=120s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
+echo "   coredns restarted"
+
+# Verify the override works: the egress proxy pod should now resolve the name.
+# (We don't exec into the proxy — it's distroless. Instead we verify via the
+# agent pod, which resolves via the same coredns.)
+AGENT_POD_TMP=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$AGENT_POD_TMP" ]; then
+  RESOLVED=$(K -n "$NS" exec "$AGENT_POD_TMP" -- sh -c "nslookup ${REBIND_NAME} 2>&1 || getent hosts ${REBIND_NAME} 2>&1 || echo 'no-resolver'" 2>&1 || echo "no-exec")
+  echo "   resolution check from agent pod: $(echo "$RESOLVED" | head -3 | tr '\n' ' ')"
+fi
 
 # ===========================================================================
 # CHECK 1: the egress proxy pod is Ready.
@@ -237,7 +322,7 @@ K -n "$NS" get pod "${LOOP}-egress-proxy"
 if [ "$READY" = "yes" ]; then
   ok "egress proxy pod ${LOOP}-egress-proxy is Ready"
 else
-  bad "egress proxy pod ${LOOP}-egress-proxy is NOT Ready (phase=$PHASE)"
+  bad "egress proxy pod ${LOOP}-egress-proxy is NOT Ready"
 fi
 
 # ===========================================================================
@@ -263,23 +348,26 @@ esac
 
 # ===========================================================================
 # CHECK 3: an allowed host via the proxy succeeds; audit records it.
+#          (proxy.golang.org:80 is in the allows; the egress proxy port-matches
+#          so plain HTTP on port 80 is permitted.)
 # ===========================================================================
 echo
 echo "--- CHECK 3: allowed host via the proxy succeeds (audit: allowed) ---"
 EGRESS_POD="$LOOP-egress-proxy"
-AUDIT_MARK3=$(K -n "$NS" get pod "$EGRESS_POD" -o jsonpath='{.metadata.uid}' 2>/dev/null)
-LOGS3_BEFORE=$(K -n "$NS" logs "$EGRESS_POD" 2>/dev/null | wc -l)
 cat > "$TMPDIR/probe-allowed.sh" <<'EOF'
 #!/bin/sh
-echo "-- HTTP https://proxy.golang.org/ (via egress proxy) --"
-wget -q -O /dev/null --timeout=30 http://proxy.golang.org/
-echo "wget-exit=$?"
+echo "-- HTTP proxy.golang.org (via HTTPS_PROXY env) --"
+curl -s -o /dev/null -w "%{http_code}" --max-time 30 http://proxy.golang.org/
+ec=$?
+echo ""
+echo "curl-exit=$ec"
 EOF
 K -n "$NS" cp "$TMPDIR/probe-allowed.sh" "$AGENT_POD:/tmp/probe-allowed.sh" 2>/dev/null || bad "kubectl cp probe-allowed.sh failed"
 P3=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-allowed.sh 2>&1)
 echo "$P3"
 case "$P3" in
-  *"wget-exit=0"*) ok "HTTP proxy.golang.org via the proxy succeeded (wget-exit=0)" ;;
+  *"200"*) ok "HTTP proxy.golang.org via the proxy succeeded (curl HTTP 200)" ;;
+  *"curl-exit=0"*) ok "HTTP proxy.golang.org via the proxy succeeded (curl exit 0)" ;;
   *) bad "HTTP proxy.golang.org via the proxy did NOT succeed (output: $P3)" ;;
 esac
 sleep 2
@@ -293,34 +381,30 @@ fi
 
 # ===========================================================================
 # CHECK 4: a disallowed host gets 403; audit records it as blocked.
+#          (github.com is NOT in the allows.)
 # ===========================================================================
 echo
 echo "--- CHECK 4: disallowed host gets 403 (audit: blocked) ---"
-LOGS4_BEFORE=$(K -n "$NS" logs "$EGRESS_POD" 2>/dev/null | wc -l)
 cat > "$TMPDIR/probe-disallowed.sh" <<'EOF'
 #!/bin/sh
-echo "-- HTTP https://github.com/ (NOT in the allows) via egress proxy --"
-wget -q -O /dev/null --timeout=30 http://github.com/
+echo "-- HTTP github.com (NOT in the allows) via HTTPS_PROXY env --"
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 http://github.com/ 2>&1)
 ec=$?
-echo "wget-exit=$ec"
-# wget: 8 = server issued an error response (403), 4 = network failure, 127 = not found
-case $ec in
-  8) echo "wget got an HTTP error response (likely 403)" ;;
-  0) echo "wget succeeded (UNEXPECTED for a disallowed host)" ;;
-  4|102) echo "wget network failure/timeout" ;;
-  127) echo "wget binary not present" ;;
-  *) echo "wget exit $ec" ;;
-esac
+echo "curl-exit=$ec http=$code"
+if [ "$code" = "403" ]; then
+  echo "curl got 403 (blocked as expected)"
+elif [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+  echo "curl SUCCEEDED (UNEXPECTED for a disallowed host)"
+else
+  echo "curl got http=$code exit=$ec"
+fi
 EOF
 K -n "$NS" cp "$TMPDIR/probe-disallowed.sh" "$AGENT_POD:/tmp/probe-disallowed.sh" 2>/dev/null || bad "kubectl cp probe-disallowed.sh failed"
 P4=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-disallowed.sh 2>&1)
 echo "$P4"
 case "$P4" in
   *"UNEXPECTED"*) bad "disallowed host via the proxy SUCCEEDED (should be 403)" ;;
-  *"HTTP error response"*|*"network failure/timeout"*)
-    ok "disallowed host via the proxy was rejected (403 or blocked)" ;;
-  *"wget binary not present"*)
-    bad "wget not found in the agent container (busybox image missing wget?)" ;;
+  *"403 (blocked as expected)"*) ok "disallowed host via the proxy was 403'd (curl HTTP 403)" ;;
   *) bad "unexpected output for disallowed host (output: $P4)" ;;
 esac
 sleep 2
@@ -336,33 +420,27 @@ fi
 # CHECK 5: raw TCP to a cluster-internal POD IP is blocked (agent netpol).
 # ===========================================================================
 echo
-echo "--- CHECK 5: raw TCP to a cluster-internal pod IP is blocked ---"
-COREDNS_IP=$(K -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
-echo "   target: coredns pod IP $COREDNS_IP:8080"
-cat > "$TMPDIR/probe-internal.sh" <<'EOF'
+echo "--- CHECK 5: raw TCP to cluster-internal pod IP $TEST_IP is blocked ---"
+cat > "$TMPDIR/probe-internal.sh" <<EOF
 #!/bin/sh
-echo "-- raw TCP to internal pod IP $COREDNS_IP:8080 (no proxy) --"
-wget -q -O /dev/null --timeout=12 --no-proxy "http://$COREDNS_IP:8080/"
-ec=$?
-echo "raw-internal-exit=$ec"
-# wget: 4 = network failure (connection refused/timeout), 0 = success
-case $ec in
-  0) echo "raw-internal SUCCEEDED (UNEXPECTED — should be blocked by NetworkPolicy)" ;;
-  4) echo "raw-internal network failure (blocked as expected)" ;;
-  127) echo "wget binary not present" ;;
-  *) echo "raw-internal exit $ec" ;;
+echo "-- raw TCP to internal pod IP $TEST_IP:8080 (no proxy) --"
+curl -s -o /dev/null --max-time 12 --noproxy '*' "http://$TEST_IP:8080/"
+ec=\$?
+echo "raw-internal-exit=\$ec"
+case \$ec in
+  0) echo "raw-internal SUCCEEDED (UNEXPECTED — should be blocked)" ;;
+  127) echo "curl binary not present" ;;
+  *) echo "raw-internal did not connect (exit \$ec, blocked as expected)" ;;
 esac
 EOF
 K -n "$NS" cp "$TMPDIR/probe-internal.sh" "$AGENT_POD:/tmp/probe-internal.sh" 2>/dev/null || bad "kubectl cp probe-internal.sh failed"
 P5=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-internal.sh 2>&1)
 echo "$P5"
 case "$P5" in
-  *"raw-internal SUCCEEDED"*) bad "raw TCP to internal pod IP $COREDNS_IP SUCCEEDED (should be blocked)" ;;
-  *"network failure"*|*"raw-internal-exit=4"*)
-    ok "raw TCP to internal pod IP $COREDNS_IP was blocked (network failure, as expected from the agent NetworkPolicy)" ;;
+  *"SUCCEEDED"*) bad "raw TCP to internal pod IP $TEST_IP SUCCEEDED (should be blocked)" ;;
+  *"did not connect"*) ok "raw TCP to internal pod IP $TEST_IP was blocked (agent NetworkPolicy)" ;;
   *"wget binary not present"*) bad "wget not found in the agent container" ;;
-  *"raw-internal-exit=0"*) bad "raw TCP to internal pod IP $COREDNS_IP SUCCEEDED (should be blocked)" ;;
-  *) ok "raw TCP to internal pod IP $COREDNS_IP did not connect (exit code: $(echo "$P5" | grep -o 'raw-internal-exit=[0-9]*'))" ;;
+  *) bad "unexpected output for raw internal TCP (output: $P5)" ;;
 esac
 
 # ===========================================================================
@@ -372,83 +450,84 @@ echo
 echo "--- CHECK 6: direct-IP to disallowed external host fails (no raw egress) ---"
 GH_IP=$(getent hosts github.com 2>/dev/null | awk '{print $1}' | head -1)
 [ -z "$GH_IP" ] && GH_IP=$(curl -s --max-time 10 https://ipinfo.io/github.com 2>/dev/null | grep -o '"ip_addr":"[0-9.]*"' | cut -d'"' -f4)
-[ -z "$GH_IP" ] && { bad "could not resolve github.com from the host to pick a disallowed external IP"; GH_IP=""; }
+[ -z "$GH_IP" ] && { bad "could not resolve github.com from the host"; GH_IP="1.1.1.1"; }
 echo "   target: github.com -> $GH_IP (direct, no proxy)"
-cat > "$TMPDIR/probe-direct.sh" <<'EOF'
+cat > "$TMPDIR/probe-direct.sh" <<EOF
 #!/bin/sh
 echo "-- raw TCP to disallowed external IP $GH_IP:443 (no proxy) --"
-wget -q -O /dev/null --timeout=12 --no-proxy "https://$GH_IP/"
-ec=$?
-echo "raw-external-exit=$ec"
-case $ec in
+curl -s -o /dev/null --max-time 12 --noproxy '*' -k "https://$GH_IP/"
+ec=\$?
+echo "raw-external-exit=\$ec"
+case \$ec in
   0) echo "raw-external SUCCEEDED (UNEXPECTED — raw egress must be impossible)" ;;
-  4) echo "raw-external network failure (blocked as expected)" ;;
-  127) echo "wget binary not present" ;;
-  *) echo "raw-external exit $ec" ;;
+  127) echo "curl binary not present" ;;
+  *) echo "raw-external did not connect (exit \$ec, blocked as expected)" ;;
 esac
 EOF
 K -n "$NS" cp "$TMPDIR/probe-direct.sh" "$AGENT_POD:/tmp/probe-direct.sh" 2>/dev/null || bad "kubectl cp probe-direct.sh failed"
 P6=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-direct.sh 2>&1)
 echo "$P6"
 case "$P6" in
-  *"raw-external SUCCEEDED"*) bad "direct-IP connection to disallowed external $GH_IP SUCCEEDED (raw egress must be impossible)" ;;
-  *"network failure"*|*"raw-external-exit=4"*)
-    ok "direct-IP connection to disallowed external $GH_IP failed (network failure, as expected)" ;;
+  *"SUCCEEDED"*) bad "direct-IP to disallowed external $GH_IP SUCCEEDED (raw egress must be impossible)" ;;
+  *"did not connect"*) ok "direct-IP to disallowed external $GH_IP failed (no raw egress)" ;;
   *"wget binary not present"*) bad "wget not found in the agent container" ;;
-  *"raw-external-exit=0"*) bad "direct-IP connection to disallowed external $GH_IP SUCCEEDED (raw egress must be impossible)" ;;
-  *) ok "direct-IP connection to disallowed external $GH_IP failed (exit code: $(echo "$P6" | grep -o 'raw-external-exit=[0-9]*'))" ;;
+  *) bad "unexpected output for raw external TCP (output: $P6)" ;;
 esac
 
 # ===========================================================================
 # CHECK 7: DNS-rebinding allow is rejected by the proxy; resolved IP in
-#          audit detail. Scoped: only exercised when the allowed name actually
-#          rebinds to a PRIVATE/cluster-internal IP; with a public IP the
-#          proxy would legitimately connect (documented in the limitation).
+#          audit detail.
+#          The CoreDNS hosts override (step 3d) makes $REBIND_NAME resolve
+#          to $TEST_IP (a private pod IP). The AgentPolicy allows
+#          $REBIND_NAME:80, so the allow check passes. But the egress proxy's
+#          resolved-IP carve-out rejects the private IP → 403 + audit blocked
+#          with the resolved IP in the detail.
 # ===========================================================================
 echo
-echo "--- CHECK 7: DNS-rebinding allow (allowed name -> private IP) is rejected by the proxy ---"
-# An allowed name that we can point (host-side, for the pod's own resolver to
-# inherit... kindnet resolves in-pod via coreDNS, so instead we rely on the
-# proxy's resolved-IP carve-out against a name resolving to a cluster IP):
-# use the node's own address space: an allowed name whose DNS answer is a
-# pod CIDR IP cannot be forced from the host (no split-horizon DNS here).
-# We therefore probe the carve-out DETERMINISTICALLY: send a CONNECT for the
-# allowed name and, if the proxy's own audit shows the resolved IP, verify the
-# carve-out logic by connecting to the node IP via an allowed alias is not
-# possible from here. Instead: assert the property in the narrow, honest form:
-# if the proxy's audit for the allowed attempt (check 3) carries an ip= detail,
-# it must NOT be a private CIDR (the proxy would have blocked it).
-REBIND_SCENARIO="not-forced"   # no split-horizon DNS available on this cluster
-# Honest alternative: craft the rebinding locally using the agent pod's
-# /etc/hosts is not possible (no CAP_SYS_ADMIN write from exec without it).
-# So: assert the carve-out via a CONNECT whose SNI is an allowed name but whose
-# TCP connection... also not possible without DNS control.
-# => Record the property as verified-by-design + unit coverage, and check the
-#    audit detail of check 3's allowed record for a resolved-IP field.
-ALLOWED_DETAIL=$(K -n "$NS" logs "$EGRESS_POD" --tail=20 2>/dev/null | grep -F '"target":"proxy.golang.org' | grep -F '"verdict":"allowed"' | tail -1)
-echo "   last allowed audit record: $ALLOWED_DETAIL"
-if [ -z "$ALLOWED_DETAIL" ]; then
-  bad "could not find the allowed proxy.golang.org audit record to inspect the resolved-IP detail"
+echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${TEST_IP}) rejected by proxy ---"
+cat > "$TMPDIR/probe-rebind.sh" <<EOF
+#!/bin/sh
+echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via HTTPS_PROXY env --"
+code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 http://${REBIND_NAME}/ 2>&1)
+ec=\$?
+echo "curl-exit=\$ec http=\$code"
+if [ "\$code" = "403" ]; then
+  echo "curl got 403 (blocked by resolved-IP carve-out as expected)"
+elif [ "\$code" = "200" ] || [ "\$code" = "301" ] || [ "\$code" = "302" ]; then
+  echo "curl SUCCEEDED (UNEXPECTED — the proxy should have blocked the private IP)"
 else
-  RES_IP=$(echo "$ALLOWED_DETAIL" | grep -o 'ip=[0-9.]*' | head -1 | cut -d= -f2)
-  echo "   resolved IP from audit detail: $RES_IP"
-  IS_PRIV=0
-  case "$RES_IP" in
-    10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*|169.254.*|127.*) IS_PRIV=1 ;;
-    10.244.*|172.21.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*) IS_PRIV=1 ;;
-  esac
-  if [ "$IS_PRIV" = "1" ]; then
-    bad "the proxy allowed a CONNECT whose resolved IP ($RES_IP) is private/cluster-internal — the DNS-rebinding carve-out failed"
+  echo "curl got http=\$code exit=\$ec"
+fi
+EOF
+K -n "$NS" cp "$TMPDIR/probe-rebind.sh" "$AGENT_POD:/tmp/probe-rebind.sh" 2>/dev/null || bad "kubectl cp probe-rebind.sh failed"
+P7=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-rebind.sh 2>&1)
+echo "$P7"
+case "$P7" in
+  *"SUCCEEDED"*) bad "the rebinding name SUCCEEDED via the proxy (the resolved-IP carve-out failed to block $TEST_IP)" ;;
+  *"403 (blocked by resolved-IP carve-out as expected)"*) ok "the rebinding name was 403'd by the egress proxy (resolved-IP carve-out blocked $TEST_IP)" ;;
+  *) bad "unexpected output for rebinding check (output: $P7)" ;;
+esac
+sleep 2
+AUDIT7=$(K -n "$NS" logs "$EGRESS_POD" --tail=10 2>/dev/null)
+echo "$AUDIT7" | tail -4 | sed 's/^/     /'
+REBIND_AUDIT=$(echo "$AUDIT7" | grep -F "\"target\":\"${REBIND_NAME}\"" | tail -1)
+echo "   audit record for ${REBIND_NAME}: $REBIND_AUDIT"
+if [ -z "$REBIND_AUDIT" ]; then
+  bad "audit has no record for the rebinding name ${REBIND_NAME}"
+else
+  if echo "$REBIND_AUDIT" | grep -q '"verdict":"blocked"'; then
+    ok "audit records the rebinding attempt as blocked"
   else
-    ok "the allowed record's resolved IP ($RES_IP) is public — consistent with the resolved-IP carve-out (a private resolve would be blocked)"
+    bad "audit does NOT record the rebinding attempt as blocked (got: $REBIND_AUDIT)"
+  fi
+  # The detail must carry the resolved IP (the egress proxy's
+  # resolved-ip-rejected detail now includes the offending IP).
+  if echo "$REBIND_AUDIT" | grep -q "ip=${TEST_IP}"; then
+    ok "audit detail carries the resolved private IP (ip=${TEST_IP})"
+  else
+    bad "audit detail does NOT carry the resolved private IP (expected ip=${TEST_IP}, got: $REBIND_AUDIT)"
   fi
 fi
-echo
-echo "   KNOWN LIMITATION (check 7 scoping): this cluster has no split-horizon DNS, so a live"
-echo "   DNS-rebinding event (allowed name resolving to a private IP in-flight) cannot be forced"
-echo "   end-to-end here. The proxy's resolved-IP carve-out is unit-covered (I42a) and the audit"
-echo "   detail carries the resolved IP, so the block WOULD be recorded with it. The negative case"
-echo "   (private resolve -> blocked, ip=<private> in detail) is asserted as a code path, not a live event."
 
 # ===========================================================================
 # CHECK 8: a .svc allow is rejected at validation (CRD CEL rule).
@@ -468,10 +547,9 @@ EOF
 )
 echo "   create result: $REJ_OUT"
 if echo "$REJ_OUT" | grep -qi "denied\|Invalid\|rejected"; then
-  ok "the API server rejected the .svc AgentPolicy at validation (CEL rule): $(echo "$REJ_OUT" | head -1)"
+  ok "the API server rejected the .svc AgentPolicy at validation (CEL rule)"
 else
   bad "the .svc AgentPolicy was NOT rejected at validation (output: $REJ_OUT)"
-  # clean up the wrongly-created policy so the cluster is not left dirty
   K -n "$NS" delete agentpolicy "${LOOP}-svc-reject" --ignore-not-found=true 2>/dev/null || true
 fi
 
@@ -492,20 +570,16 @@ done
 
 # ===========================================================================
 # CHECK 10: a disallowed exec in a pod selected by the egress-proxy
-#          KubeArmor policy gets Permission denied.
-#          (The real egress-proxy image is distroless; a throwaway busybox pod
-#           carrying the SAME labels is selected by the same policy.)
+#           KubeArmor policy gets Permission denied.
 # ===========================================================================
 echo
 echo "--- CHECK 10: disallowed exec in a pod selected by the egress-proxy KubeArmor policy ---"
-# The egress-proxy KubeArmorPolicy's selector labels, straight from the object:
 SEL_JSON=$(K -n "$NS" get kubearmorpolicy "coxswain-${LOOP}-egress-proxy" -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null)
 echo "   egress-proxy KubeArmorPolicy selector: $SEL_JSON"
 if [ -z "$SEL_JSON" ]; then
   bad "could not read the egress-proxy KubeArmorPolicy selector"
 else
   THROWAWAY_POD="i42-e2e-exec"
-  K get ns "$NS" >/dev/null 2>&1 || K create ns "$NS" >/dev/null
   SEL_LABELS=$(echo "$SEL_JSON" | jq -r 'to_entries | map(.key + "=" + .value) | join(",")')
   echo "   creating throwaway busybox pod $THROWAWAY_POD with labels: $SEL_LABELS"
   cat > "$TMPDIR/throwaway.yaml" <<EOF
@@ -532,17 +606,12 @@ EOF
   if [ "$READYTW" != "True" ]; then
     bad "throwaway pod $THROWAWAY_POD did not become Ready"
   else
-    # A disallowed binary: /bin/sh is present in busybox and NOT in the
-    # policy's process.matchPaths (only /usr/local/bin/egress-proxy is allowed).
-    # KubeArmor's BPF-LSM block surfaces as EACCES ("permission denied").
-    # The busybox /bin/sh IS present (it's the shell), so a clean run would
-    # print RAN-OK; a block prints "permission denied".
     EXECCMD=$(K -n "$NS" exec "$THROWAWAY_POD" -- /bin/sh -c 'echo RAN-OK' 2>&1 || true)
     echo "   disallowed exec (/bin/sh) output: $EXECCMD"
     if echo "$EXECCMD" | grep -qi "permission denied\|operation not permitted"; then
       ok "the disallowed exec (/bin/sh) was BLOCKED (Permission denied) by the egress-proxy KubeArmorPolicy"
     elif echo "$EXECCMD" | grep -q "RAN-OK"; then
-      bad "the disallowed exec (/bin/sh) RAN ('RAN-OK') — the egress-proxy KubeArmorPolicy did NOT block it (BPF-LSM datapath not enforcing on this node?)"
+      bad "the disallowed exec (/bin/sh) RAN ('RAN-OK') — the egress-proxy KubeArmorPolicy did NOT block it"
     elif [ -z "$EXECCMD" ]; then
       bad "disallowed exec produced no output (could not exec)"
     else
@@ -564,9 +633,6 @@ echo "     not pod->host-network. Check 5 targets a POD IP, which IS blocked."
 echo "  L2: ephemeral kubectl debug containers are NOT policed by KubeArmor, so"
 echo "     check 10 proves the exec block on a dedicated throwaway busybox pod"
 echo "     carrying the egress-proxy labels, not via an ephemeral container."
-echo "  L3 (check 7 scoping): no split-horizon DNS on this cluster, so the"
-echo "     DNS-rebinding block is asserted as the resolved-IP carve-out + audit"
-echo "     detail, with the live private-resolve event unit-covered (I42a)."
 echo "============================================================"
 
 echo

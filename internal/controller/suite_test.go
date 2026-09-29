@@ -97,6 +97,9 @@ var _ = BeforeSuite(func() {
 		// the default-enabled list, but stating it explicitly makes the test
 		// self-documenting: if a future k8s version removes it from defaults
 		// (or the plugin is disabled another way) this line is where to look.
+		// NOTE: in practice the envtest apiserver does NOT run this plugin by
+		// default (it is not in the default-enabled list for the envtest
+		// binary), so this flag is required for the I45 spec to work.
 		ControlPlane: envtest.ControlPlane{
 			APIServer: &envtest.APIServer{
 				Args: []string{

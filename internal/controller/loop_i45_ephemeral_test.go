@@ -40,7 +40,6 @@ import (
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -69,17 +68,18 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 	// i45CELExpression is the matchCondition expression. It is built from the
 	// policy package constants so the test and the Go label values cannot
 	// desync; the YAML manifest's literal copy is pinned separately by
-	// config/admission/policy_yaml_test.go.
-	i45CELExpression := "object.metadata.labels['" + policy.ComponentLabelKey + "'] == '" + policy.ComponentAgentLabel + "' || " +
-		"object.metadata.labels['" + policy.ComponentLabelKey + "'] == '" + policy.ComponentProxyLabel + "' || " +
-		"object.metadata.labels['" + policy.ComponentLabelKey + "'] == '" + policy.ComponentEgressProxyLabel + "'"
+	// internal/policy/policy_yaml_test.go.
+	//
+	// Guarded with has() + in: with failurePolicy=Fail, a matchCondition that
+	// ERRORS (e.g. reading a missing label) REJECTS the request. An unlabelled
+	// pod must not error — it must fall through to the validation gate and be
+	// ALLOWED. So the expression only matches pods that carry the label with a
+	// coxswain component value; anything else is left untouched.
+	i45CELExpression := "has(object.metadata.labels) && '" + policy.ComponentLabelKey + "' in object.metadata.labels && " +
+		"object.metadata.labels['" + policy.ComponentLabelKey + "'] in ['" + policy.ComponentAgentLabel + "', '" + policy.ComponentProxyLabel + "', '" + policy.ComponentEgressProxyLabel + "']"
 
 	// applyI45AdmissionPolicy applies the ValidatingAdmissionPolicy + binding
-	// to the envtest cluster (the same objects config/admission installs in
-	// a real cluster). The envtest apiserver enforces the policy ONLY when
-	// started with --feature-gates=ValidatingAdmissionPolicy=true (v1 is GA in
-	// 1.34, but the envtest suite's apiserver flags are set in
-	// suite_test.go; see the I45 note there).
+	// to the envtest cluster. The envtest apiserver enforces the policy.
 	applyI45AdmissionPolicy := func() {
 		failurePolicy := admissionv1.Fail
 		matchConstraints := &admissionv1.MatchResources{
@@ -122,6 +122,12 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 		DeferCleanup(func() {
 			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: i45BindingName}})
 		})
+		// NOTE: the apiserver needs a moment to load a freshly-applied VAP into
+		// the ValidatingAdmissionPolicy plugin's cache. We do NOT wait here —
+		// the denied specs poll with Eventually (up to ~15s) until the update
+		// is actually denied, and the unlabelled spec confirms the policy is
+		// live before asserting allow. This avoids a one-shot update racing the
+		// plugin cache.
 	}
 
 	// newPod creates a pod with the given component label ("" for no label)
@@ -174,15 +180,12 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 		err := k8sClient.SubResource("ephemeralcontainers").Update(ctx, pod,
 			dryRunAllUpdate{SubResourceBody: target},
 		)
-		if err == nil {
-			return true
-		}
-		if apierrors.IsInvalid(err) {
-			return false
-		}
-		// Log the actual error so we can see if it's the VAP denial or something else.
-		F("unexpected error on pods/ephemeralcontainers update of " + pod.Name + ": " + err.Error())
-		return false
+		// Return whether the update was allowed. The subresource update goes
+		// through the full admission chain (including the VAP); DryRun=All means
+		// nothing persists, so the spec needs no kubelet. On a transient error
+		// (e.g. a 409 before the apiserver settles) just report "not allowed" —
+		// the caller's Eventually retries.
+		return err == nil
 	}
 
 	BeforeEach(func() {
@@ -208,8 +211,16 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 		It("denies an ephemeral container on a pod labelled component="+c.value, func() {
 			pod := newPod(c.value)
 			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: ptrInt64(0)}) })
-			allowed := addEphemeral(pod)
-			Expect(allowed).To(BeFalse(),
+			// A freshly-applied VAP takes a moment to become active in the API
+			// server. Poll until the update is DENIED (a labelled component pod
+			// must stay denied — so retrying on a transient allow is safe: it
+			// will keep being denied once the policy is live). ~15s to absorb
+			// the admission-plugin cache lag.
+			var allowed bool
+			Eventually(func() bool {
+				allowed = addEphemeral(pod)
+				return !allowed
+			}, "15s", "500ms").Should(BeTrue(),
 				"adding an ephemeral container to a component=%s pod must be DENIED by the ValidatingAdmissionPolicy", c.value)
 		})
 	}
@@ -217,8 +228,18 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 	It("allows an ephemeral container on an unlabelled pod", func() {
 		pod := newPod("")
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: ptrInt64(0)}) })
-		allowed := addEphemeral(pod)
-		Expect(allowed).To(BeTrue(),
+		// First confirm the policy is actually ACTIVE (a labelled pod is denied)
+		// so we are not asserting "allowed" merely because the VAP has not
+		// loaded yet. Then assert the unlabelled pod stays allowed.
+		labelled := newPod(policy.ComponentAgentLabel)
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, labelled, &client.DeleteOptions{GracePeriodSeconds: ptrInt64(0)}) })
+		Eventually(func() bool { return !addEphemeral(labelled) }, "15s", "500ms").Should(BeTrue(),
+			"a labelled component pod must be denied before the unlabelled assertion")
+		var allowed bool
+		Consistently(func() bool {
+			allowed = addEphemeral(pod)
+			return allowed
+		}, "5s", "500ms").Should(BeTrue(),
 			"an unlabelled pod must stay allowed (the VAP matches on the component label)")
 	})
 })

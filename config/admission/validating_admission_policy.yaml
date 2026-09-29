@@ -37,9 +37,10 @@ spec:
   matchConditions:
     - name: coxswainComponentPod
       expression: >-
-        object.metadata.labels['app.kubernetes.io/component'] == 'agent'
-        || object.metadata.labels['app.kubernetes.io/component'] == 'model-proxy'
-        || object.metadata.labels['app.kubernetes.io/component'] == 'egress-proxy'
+        has(object.metadata.labels)
+        && 'app.kubernetes.io/component' in object.metadata.labels
+        && object.metadata.labels['app.kubernetes.io/component']
+        in ['agent', 'model-proxy', 'egress-proxy']
   validations:
     - expression: "false"
       message: >-

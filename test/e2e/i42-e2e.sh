@@ -330,13 +330,18 @@ echo "   coredns ConfigMap updated"
 kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
 kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
 echo "   coredns restarted"
-# Wait for DNS to settle: the agent pod's DNS resolver may be stale after the
-# coredns restart. Poll from the agent pod until the proxy FQDN resolves.
-# (We do NOT delete the agent pod — it's a Pod (not a Deployment), and
-# deleting it causes the controller to recreate it, which can race with
-# the checks.)
+# Wait for the agent pod to be Ready (it was just recreated from the Loop
+# deletion in step 3b). Then wait for DNS to settle: the agent pod's DNS
+# resolver may be stale after the coredns restart. Poll from the agent pod
+# until the proxy FQDN resolves.
 AGENT_POD_3D=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -n "$AGENT_POD_3D" ]; then
+  echo "   waiting for agent pod $AGENT_POD_3D to be Ready..."
+  for i in $(seq 1 30); do
+    R=$(K -n "$NS" get pod "$AGENT_POD_3D" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    [ "$R" = "True" ] && { echo "   agent pod Ready after ~$((i*3))s"; break; }
+    sleep 3
+  done
   echo "   waiting for DNS to settle (proxy FQDN resolvable from agent pod)..."
   for i in $(seq 1 20); do
     if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "getent hosts ${LOOP}-egress-proxy.${NS}.svc.cluster.local" 2>/dev/null | grep -q .; then

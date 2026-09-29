@@ -330,24 +330,22 @@ echo "   coredns ConfigMap updated"
 kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
 kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
 echo "   coredns restarted"
-# Restart the agent pod so it picks up the new CoreDNS config. The agent pod
-# was created BEFORE the CoreDNS restart, so its DNS resolver connection is
-# stale. Deleting the pod causes the controller to recreate it with a fresh
-# DNS connection.
+# Wait for DNS to settle: the agent pod's DNS resolver may be stale after the
+# coredns restart. Poll from the agent pod until the proxy FQDN resolves.
+# (We do NOT delete the agent pod — it's a Pod (not a Deployment), and
+# deleting it causes the controller to recreate it, which can race with
+# the checks.)
 AGENT_POD_3D=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -n "$AGENT_POD_3D" ]; then
-  echo "   restarting agent pod $AGENT_POD_3D (fresh DNS connection)"
-  K -n "$NS" delete pod "$AGENT_POD_3D" --wait=false 2>/dev/null || true
-  # Wait for the agent pod to come back.
-  for i in $(seq 1 30); do
-    K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" --no-headers 2>/dev/null | grep -q "1/1" && break
+  echo "   waiting for DNS to settle (proxy FQDN resolvable from agent pod)..."
+  for i in $(seq 1 20); do
+    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "getent hosts ${LOOP}-egress-proxy.${NS}.svc.cluster.local" 2>/dev/null | grep -q .; then
+      echo "   DNS settled after ~$((i*3))s"
+      break
+    fi
     sleep 3
   done
-  AGENT_POD_3D=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-  echo "   agent pod back: $AGENT_POD_3D"
 fi
-# Give CoreDNS a moment to settle.
-sleep 3
 
 # Verify the override works: the egress proxy pod should now resolve the name.
 # (We don't exec into the proxy — it's distroless. Instead we verify via the

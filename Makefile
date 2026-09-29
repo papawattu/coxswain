@@ -126,6 +126,10 @@ egress-proxy-build: ## Build the egress proxy image (coxswain-egress-proxy:stand
 egress-proxy-e2e: ## Run the I42a egress proxy kind e2e (real proxy, TLS + plain HTTP).
 	@bash test/e2e/egress-proxy.sh
 
+.PHONY: i42-e2e
+i42-e2e: ## Run the full I42 acceptance kind e2e (pinned to --context kind-coxswain-dev).
+	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/i42-e2e.sh
+
 
 .PHONY: kind-up
 kind-up: ## Create the kind cluster (if needed) and install agent-sandbox $(AGENT_SANDBOX_VERSION)

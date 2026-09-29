@@ -194,7 +194,7 @@ network namespace and the proxy's view of traffic.
 
 ### I44. Small follow-ups from the I42 series
 
-- [ ] Fixed
+- [x] Fixed in b3ffad9 (#30)
 
 1. `internal/engine/kubearmor_enforcer.go` builds the egress proxy FQDN from
    a `"-egress-proxy."` literal. The #25 envtest pins it against

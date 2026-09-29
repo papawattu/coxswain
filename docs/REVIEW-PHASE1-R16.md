@@ -137,7 +137,7 @@ or keep the reviewer doing it (and fixing the title before merge)?
 
 ### I43. Envtests only ever created objects, so update-path bugs survived for weeks
 
-- [x] Fixed (process) — PR #32 (builder: 2f558ef, 64f69b1, 6254230, round 3): AGENTS.md "Test norms (R16 I43)" added (rule a: same-Loop update specs; rule b: gate specs must fail when disabled, verified by mutation); 6 backfilled same-Loop specs (d33 proxy Service drift correction, d34 agent-netpol same-Loop update, i42f model-proxy KAPT drift correction, agent KAPT same-Loop update, PolicyValid flip, **proxy-netpol drift correction** — R3: the R2 audit row credited i42c spec 6, which updates the AGENT netpol, not the proxy netpol; the new spec tampers the model egress rule and deletes the netpol, asserting the controller restores/recreates it); 7-gate mutation table (all 7 gates verified FAIL-when-disabled in scratch copies). 124/124 specs pass, make lint clean.
+- [x] Fixed in ec607f0 (#32)
 
 **Where:** `internal/controller/*_test.go`, the review checklist.
 

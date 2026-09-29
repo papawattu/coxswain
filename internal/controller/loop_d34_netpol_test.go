@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
@@ -28,6 +29,8 @@ const (
 	d34TestEndpoint   = "http://model-endpoint:8000"
 	d34ModelEndpoint  = "fake-model:8000"
 	d34TestSecretName = "creds"
+	// I43 fixture constant (same-Loop update spec).
+	i43NPPolicyName = "i43-np-pol"
 )
 
 var _ = Describe("D34: per-Loop NetworkPolicy", func() {
@@ -184,6 +187,112 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			Protocol: new(corev1.ProtocolTCP),
 			Port:     intstrPtr(8000),
 		}))
+	})
+
+	It("updates the proxy NetworkPolicy on the same Loop when modelEndpoint changes (I43 same-Loop)", func() {
+		ns := "d34-i43-same" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		makeSecret("i43-np-creds", ns)
+
+		const loopName = "i43-np"
+		// The model endpoint is IMMUTABLE (P2 R15: it changes the proxy
+		// NetworkPolicy and the proxy pod spec). The same-Loop input change
+		// that exercises the proxy netpol's update path is therefore the
+		// referenced AgentPolicy (the effective policy): start with NO network
+		// allows (proxy egress = DNS + model rule only), then ADD one — the
+		// agent's egress rule gains the egress-proxy peer. (The model rule's
+		// peer+port also re-asserted every pass; an IP-literal endpoint gives
+		// it an exact ipBlock /32 peer, port 9000.)
+		loop := buildLoopWithNetPol(loopName, ns, "i43-np-creds", "10.0.0.5:9000")
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcileLoop(loopName, ns)
+
+		// The agent netpol's initial egress: proxy peer + DNS (no egress-proxy
+		// peer yet — no network allows).
+		agentNP := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-agent-netpol"}, agentNP)).To(Succeed())
+		countPeerLabel := func(agentNP *networkingv1.NetworkPolicy, labelVal string) int {
+			n := 0
+			for _, rule := range agentNP.Spec.Egress {
+				for _, peer := range rule.To {
+					if peer.PodSelector != nil {
+						if v, ok := peer.PodSelector.MatchLabels["app.kubernetes.io/component"]; ok && v == labelVal {
+							n++
+						}
+					}
+				}
+			}
+			return n
+		}
+		Expect(countPeerLabel(agentNP, "agent"+"-x")).To(BeZero()) // sanity: label filter works
+		// The proxy netpol's model egress rule: the IP-literal endpoint
+		// resolves to an exact ipBlock /32 peer, port 9000.
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy-netpol"}, np)).To(Succeed())
+		modelPeerRule := func() *networkingv1.NetworkPolicyEgressRule {
+			for i := range np.Spec.Egress {
+				for _, peer := range np.Spec.Egress[i].To {
+					if peer.IPBlock != nil {
+						rule := np.Spec.Egress[i]
+						return &rule
+					}
+				}
+			}
+			return nil
+		}
+		Expect(modelPeerRule()).ToNot(BeNil(), "the initial proxy netpol must carry the model egress rule")
+
+		// EDIT the referenced AgentPolicy: add a network allow. The egress
+		// proxy becomes expected; the EXISTING agent netpol must gain the
+		// egress-proxy peer on the same-Loop reconcile (I43: the I42c P1 bug
+		// froze netpol specs at creation — a re-reconcile must actually apply
+		// the change).
+		Expect(k8sClient.Create(ctx, &cxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i43NPPolicyName, Namespace: ns},
+		})).To(Succeed())
+		loop = &cxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, loop)).To(Succeed())
+		loop.Spec.PolicyRefs = []string{i43NPPolicyName}
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+		reconcileLoop(loopName, ns)
+		agentNP = &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-agent-netpol"}, agentNP)).To(Succeed())
+		// No network allows yet -> no egress-proxy peer.
+		Expect(countPeerLabel(agentNP, policy.ComponentEgressProxyLabel)).To(BeZero(),
+			"no network allows -> the agent netpol must not carry the egress-proxy peer")
+
+		// EDIT the policy: add a network allow.
+		ap := &cxv1alpha1.AgentPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i43NPPolicyName}, ap)).To(Succeed())
+		ap.Spec.Network = []string{i42eExternalHost}
+		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
+		reconcileLoop(loopName, ns)
+
+		// The EXISTING agent netpol gains the egress-proxy peer (a same-Loop
+		// update path assertion, not just creation).
+		agentNP = &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-agent-netpol"}, agentNP)).To(Succeed())
+		Expect(countPeerLabel(agentNP, policy.ComponentEgressProxyLabel)).To(BeNumerically(">=", 1),
+			"the existing agent netpol must GAIN the egress-proxy peer when the referenced policy's network allows are added (same-Loop update path)")
+
+		// The proxy netpol's model rule is still re-asserted in place: the
+		// ipBlock /32 peer and the port 9000.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy-netpol"}, np)).To(Succeed())
+		rule := modelPeerRule()
+		Expect(rule).ToNot(BeNil(), "the updated proxy netpol must still carry the model egress rule")
+		var sawIPBlock bool
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "10.0.0.5/32" {
+				sawIPBlock = true
+			}
+		}
+		Expect(sawIPBlock).To(BeTrue(),
+			"the proxy netpol's model egress peer must keep the ipBlock /32 (same-Loop update, not just creation)")
+		Expect(rule.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+			Protocol: new(corev1.ProtocolTCP),
+			Port:     intstrPtr(9000),
+		}), "the updated rule must carry the endpoint's port")
 	})
 
 	It("two Loops in one namespace get disjoint NetworkPolicies (P1-1 acceptance)", func() {

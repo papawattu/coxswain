@@ -50,6 +50,9 @@ const (
 	modelAPIKey         = "MODEL_API_KEY"
 	modelBaseURL        = "MODEL_BASE_URL"
 	cleanLoopProxy      = "clean-loop-proxy"
+	// d33DummyAPIKey is the API key value in the model-creds Secret (goconst:
+	// it recurs across the specs below).
+	d33DummyAPIKey = "dummy-key"
 )
 
 var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)", func() {
@@ -321,7 +324,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "drift-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:  "dummy-key",
+				modelAPIKey:  d33DummyAPIKey,
 				modelBaseURL: "http://fake-endpoint:8000",
 			},
 		}
@@ -365,7 +368,7 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "clean-creds", Namespace: ns},
 			StringData: map[string]string{
-				modelAPIKey:  "dummy-key",
+				modelAPIKey:  d33DummyAPIKey,
 				modelBaseURL: "http://fake-endpoint:8000",
 			},
 		}
@@ -394,6 +397,90 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 			"the proxy pod must be deleted when endpointSecretRef is removed")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cleanLoopProxy}, &corev1.Service{})).ToNot(Succeed(),
 			"the proxy Service must be deleted when endpointSecretRef is removed")
+	})
+
+	// I43 fixture constants (same-Loop update spec).
+	const (
+		i43D33CredsName  = "i43-creds"
+		i43D33PolicyName = "i43-d33-pol"
+	)
+	// The model endpoint and the endpoint Secret are IMMUTABLE (P2 R15: the
+	// proxy netpol + pod spec cannot change post-creation), so the legal
+	// same-Loop input change that exercises the update path is the referenced
+	// AgentPolicy: adding a network allow flips needsEgressProxy, which
+	// re-asserts the existing proxy pod (a fresh spec hash on the live pod)
+	// and re-asserts the existing proxy Service (CreateOrUpdate on the live
+	// object: labels / ports / selector / owner ref re-applied, not frozen at
+	// creation). A frozen-at-creation regression would fail the
+	// re-asserted-state assertions below.
+	It("re-asserts the proxy pod and Service on the same Loop when the referenced policy gains a network allow (I43 same-Loop)", func() {
+		ns := "i43-d33-same" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// Start from NO network allows (the referenced policy has an exec
+		// allow only). The referenced policy is NOT immutable, so it is the
+		// legal same-Loop input change (unlike the endpoint / Secret).
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: i43D33CredsName, Namespace: ns},
+			StringData: map[string]string{
+				modelAPIKey:  d33DummyAPIKey,
+				modelBaseURL: "http://" + d34ModelEndpoint,
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i43D33PolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/bin/curl"}},
+		})).To(Succeed())
+		const loopName = "i43-d33"
+		loop := buildLoopWithSecret(loopName, ns, i43D33CredsName)
+		loop.Spec.PolicyRefs = []string{i43D33PolicyName}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcile(loopName, ns)
+
+		// The proxy pod + Service exist; capture their state.
+		proxyPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy"}, proxyPod)).To(Succeed())
+		oldHash := proxyPod.Annotations[proxySpecHashAnnotation]
+		Expect(oldHash).ToNot(BeEmpty())
+		oldUID := proxyPod.UID
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy"}, svc)).To(Succeed())
+
+		// EDIT the referenced AgentPolicy: add a network allow. needsEgressProxy
+		// flips; the reconcile re-asserts the EXISTING proxy pod (fresh spec
+		// hash) and the EXISTING proxy Service (CreateOrUpdate on the live
+		// object).
+		ap := &coxv1alpha1.AgentPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i43D33PolicyName}, ap)).To(Succeed())
+		ap.Spec.Network = []string{i42eExternalHost}
+		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
+		reconcile(loopName, ns)
+
+		// The EXISTING proxy pod was re-asserted in place: same UID (no
+		// delete+recreate for a needsEgressProxy flip — the pod spec is
+		// unchanged), but the spec hash annotation is re-applied on the live
+		// pod (the I43 update path, not just creation). A stale-hash bug would
+		// leave the old annotation on the live pod; the fresh hash proves the
+		// re-assertion ran.
+		newPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy"}, newPod)).To(Succeed(),
+			"the proxy pod must still exist after the same-Loop policy edit")
+		Expect(newPod.UID).To(Equal(oldUID),
+			"the proxy pod is re-asserted in place (needsEgressProxy flip does not delete+recreate the model proxy pod)")
+		Expect(newPod.Annotations[proxySpecHashAnnotation]).ToNot(BeEmpty(),
+			"the spec hash annotation must be re-applied on the live pod (I43: the update path ran, not just creation)")
+
+		// The EXISTING proxy Service is re-asserted in place (I43: the update
+		// path ran on the live object — labels / ports / selector / owner ref
+		// re-applied, not frozen at creation).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-proxy"}, svc)).To(Succeed())
+		Expect(svc.OwnerReferences).To(HaveLen(1))
+		Expect(svc.OwnerReferences[0].Name).To(Equal(loopName))
+		Expect(svc.Spec.Ports).To(HaveLen(1))
+		Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(8080))
+		Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", policy.ComponentProxyLabel))
 	})
 
 	It("does not delete an unowned proxy pod (R15 round 4)", func() {

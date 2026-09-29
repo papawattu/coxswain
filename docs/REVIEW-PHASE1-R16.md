@@ -160,6 +160,34 @@ The reviewer now mutation-tests key gates on each PR.
 
 **Acceptance:** the AGENTS.md norm is added, and I42f and later slices show same-Loop update specs.
 
+### I45. Ephemeral containers (`kubectl debug`) bypass the KubeArmor fence
+
+- [ ] Fixed
+
+**Where:** every KubeArmor-fenced pod (agent, egress proxy, model proxy), and
+namespace RBAC for Loop namespaces.
+
+**Problem:** found while verifying I42f on kind (PR #28 review). In a pod
+selected by the egress-proxy policy, exec of a non-allowlisted binary is
+denied (`/bin/busybox: Permission denied`, exit 126). But a busybox
+**ephemeral container** added to `i42d-loop-egress-proxy` with `kubectl debug`
+ran `busybox true` without being blocked: KubeArmor didn't police the
+ephemeral container. Anyone with `pods/ephemeralcontainers` (patch) in a Loop
+namespace can get an unfenced process inside a proxy or agent pod, sharing its
+network namespace and the proxy's view of traffic.
+
+**Fix:**
+- Document that `pods/ephemeralcontainers` must be denied to everyone except
+  cluster admins in Loop namespaces.
+- Consider a ValidatingAdmissionPolicy that rejects ephemeral containers on
+  pods carrying coxswain component labels.
+- Add the case to the I42 e2e as a known limitation until that lands.
+
+**Acceptance:**
+- the RBAC guidance is documented;
+- the admission policy exists (or the owner accepts the documented risk);
+- the e2e prints the limitation.
+
 ---
 
 ## P3

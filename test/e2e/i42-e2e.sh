@@ -295,79 +295,7 @@ for i in $(seq 1 60); do
   sleep 5
 done
 echo "   egress proxy pod Ready after ~$((i*5))s"
-PROXY_IP=$(K -n "$NS" get pod "${LOOP}-egress-proxy" -o jsonpath='{.status.podIP}' 2>/dev/null)
-echo "   egress proxy pod IP: $PROXY_IP"
 
-# ===========================================================================
-# STEP 3d: CoreDNS hosts override for the DNS-rebinding check.
-#          Save the current coredns ConfigMap, add a hosts block mapping
-#          i42-rebind.example.test -> $TEST_IP, apply it, and restart coredns.
-#          The trap restores the ConfigMap on exit.
-# ===========================================================================
-echo
-echo "--- STEP 3d: CoreDNS hosts override (${REBIND_NAME} -> ${TEST_IP}) ---"
-# Save the original ConfigMap (for the trap restore).
-K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
-echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
-
-# Build the modified Corefile: add a hosts block after the first line (the .:53 header).
-COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
-# The hosts block: "hosts { fallthrough <name> <ip> }"
-HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${TEST_IP} }"
-NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
-# Verify the hosts line was inserted.
-if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
-  echo "FATAL: could not insert the hosts block into the Corefile (sed failed)"
-  exit 2
-fi
-echo "   modified Corefile (first 5 lines):"
-echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
-
-# Apply the modified ConfigMap.
-K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
-echo "   coredns ConfigMap updated"
-
-# Wait for coredns to reload the ConfigMap (CoreDNS watches its ConfigMap
-# and reloads automatically; a restart would disrupt DNS for all pods).
-echo "   waiting 15s for coredns to reload the ConfigMap..."
-sleep 15
-# Wait for the agent pod to be Ready (it was just recreated from the Loop
-# deletion in step 3b). Then wait for DNS to settle: the agent pod's DNS
-# resolver may be stale after the coredns restart. Poll from the agent pod
-# until the proxy FQDN resolves.
-AGENT_POD_3D=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-if [ -n "$AGENT_POD_3D" ]; then
-  echo "   waiting for agent pod $AGENT_POD_3D to be Ready..."
-  for i in $(seq 1 30); do
-    R=$(K -n "$NS" get pod "$AGENT_POD_3D" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-    [ "$R" = "True" ] && { echo "   agent pod Ready after ~$((i*3))s"; break; }
-    sleep 3
-  done
-  echo "   waiting for DNS to settle (curl --proxy can resolve the proxy FQDN)..."
-  for i in $(seq 1 20); do
-    # Use curl --proxy (not direct URL) for the DNS check: the checks use
-    # curl --proxy, which resolves the proxy FQDN via a different code path
-    # than direct URL resolution. Poll with the same tool+mode.
-    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "curl -s -o /dev/null --max-time 5 --proxy http://${PROXY_IP}:3128 http://example.com/" 2>/dev/null; then
-      echo "   DNS settled (curl --proxy via pod IP reached the proxy) after ~$((i*3))s"
-      break
-    fi
-    sleep 3
-  done
-  # Extra settle time: the coredns rollout may still be settling DNS
-  # responses. Wait 15s to be safe.
-  echo "   waiting 15s for DNS to fully settle..."
-  sleep 15
-fi
-
-# Verify the override works: the egress proxy pod should now resolve the name.
-# (We don't exec into the proxy — it's distroless. Instead we verify via the
-# agent pod, which resolves via the same coredns.)
-AGENT_POD_TMP=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-if [ -n "$AGENT_POD_TMP" ]; then
-  RESOLVED=$(K -n "$NS" exec "$AGENT_POD_TMP" -- sh -c "getent hosts ${REBIND_NAME} 2>&1 || echo 'no-resolver'" 2>&1 || echo "no-exec")
-  echo "   resolution check from agent pod: $(echo "$RESOLVED" | head -3 | tr '\n' ' ')"
-fi
 
 # ===========================================================================
 # CHECK 1: the egress proxy pod is Ready.
@@ -410,15 +338,12 @@ esac
 echo
 echo "--- CHECK 3: allowed host via the proxy succeeds (audit: allowed) ---"
 EGRESS_POD="$LOOP-egress-proxy"
-PROXY_FQDN="${LOOP}-egress-proxy.${NS}.svc.cluster.local"
-cat > "$TMPDIR/probe-allowed.sh" <<EOF
+cat > "$TMPDIR/probe-allowed.sh" <<'EOF'
 #!/bin/sh
-echo "-- HTTP proxy.golang.org (via explicit proxy) --"
-curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
-  --proxy http://${PROXY_IP}:3128 http://proxy.golang.org/
-ec=\$?
-echo ""
-echo "curl-exit=\$ec"
+echo "-- HTTP proxy.golang.org (via HTTPS_PROXY env) --"
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://proxy.golang.org/ 2>&1)
+ec=$?
+echo "curl-exit=$ec http=$code"
 EOF
 K -n "$NS" cp "$TMPDIR/probe-allowed.sh" "$AGENT_POD:/tmp/probe-allowed.sh" 2>/dev/null || bad "kubectl cp probe-allowed.sh failed"
 P3=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-allowed.sh 2>&1)
@@ -443,19 +368,18 @@ fi
 # ===========================================================================
 echo
 echo "--- CHECK 4: disallowed host gets 403 (audit: blocked) ---"
-cat > "$TMPDIR/probe-disallowed.sh" <<EOF
+cat > "$TMPDIR/probe-disallowed.sh" <<'EOF'
 #!/bin/sh
-echo "-- HTTP github.com (NOT in the allows) via explicit proxy --"
-code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
-  --proxy http://${PROXY_IP}:3128 http://github.com/ 2>&1)
-ec=\$?
-echo "curl-exit=\$ec http=\$code"
-if [ "\$code" = "403" ]; then
+echo "-- HTTP github.com (NOT in the allows) via HTTPS_PROXY env --"
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://github.com/ 2>&1)
+ec=$?
+echo "curl-exit=$ec http=$code"
+if [ "$code" = "403" ]; then
   echo "curl got 403 (blocked as expected)"
-elif [ "\$code" = "200" ] || [ "\$code" = "301" ] || [ "\$code" = "302" ]; then
+elif [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
   echo "curl SUCCEEDED (UNEXPECTED for a disallowed host)"
 else
-  echo "curl got http=\$code exit=\$ec"
+  echo "curl got http=$code exit=$ec"
 fi
 EOF
 K -n "$NS" cp "$TMPDIR/probe-disallowed.sh" "$AGENT_POD:/tmp/probe-disallowed.sh" 2>/dev/null || bad "kubectl cp probe-disallowed.sh failed"
@@ -534,9 +458,32 @@ case "$P6" in
 esac
 
 # ===========================================================================
+# CoreDNS hosts override for the DNS-rebinding check (runs LAST, just
+# before check 7, so checks 1-6 run against the original Corefile).
+# The rebind name is already in the AgentPolicy allows from the start.
+# The trap restores the ConfigMap on exit.
+# ===========================================================================
+echo
+echo "--- CoreDNS hosts override (${REBIND_NAME} -> ${TEST_IP}) [before check 7] ---"
+K -n kube-system get cm coredns -o json > "$COREDNS_CM_BACKUP" || { echo "FATAL: could not read coredns ConfigMap"; exit 2; }
+echo "   saved coredns ConfigMap to $COREDNS_CM_BACKUP"
+COREFILE=$(K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
+HOSTS_LINE="hosts { fallthrough ${REBIND_NAME} ${TEST_IP} }"
+NEW_COREFILE=$(echo "$COREFILE" | awk -v hline="    ${HOSTS_LINE}" 'NR==1 {print; print hline; next} {print}')
+if ! echo "$NEW_COREFILE" | grep -q "$REBIND_NAME"; then
+  echo "FATAL: could not insert the hosts block into the Corefile"
+  exit 2
+fi
+echo "   modified Corefile (first 5 lines):"
+echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
+K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
+echo "   coredns ConfigMap updated, waiting 15s for coredns to reload..."
+sleep 15
+
+# ===========================================================================
 # CHECK 7: DNS-rebinding allow is rejected by the proxy; resolved IP in
 #          audit detail.
-#          The CoreDNS hosts override (step 3d) makes $REBIND_NAME resolve
+#          The CoreDNS hosts override (above) makes $REBIND_NAME resolve
 #          to $TEST_IP (a private pod IP). The AgentPolicy allows
 #          $REBIND_NAME:80, so the allow check passes. But the egress proxy's
 #          resolved-IP carve-out rejects the private IP → 403 + audit blocked
@@ -544,20 +491,18 @@ esac
 # ===========================================================================
 echo
 echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${TEST_IP}) rejected by proxy ---"
-PROXY_FQDN7="${LOOP}-egress-proxy.${NS}.svc.cluster.local"
 cat > "$TMPDIR/probe-rebind.sh" <<EOF
 #!/bin/sh
-echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via explicit proxy --"
-code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
-  --proxy http://${PROXY_IP}:3128 http://${REBIND_NAME}/ 2>&1)
-ec=\$?
-echo "curl-exit=\$ec http=\$code"
-if [ "\$code" = "403" ]; then
+echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via HTTPS_PROXY env --"
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://${REBIND_NAME}/ 2>&1)
+ec=$?
+echo "curl-exit=$ec http=$code"
+if [ "$code" = "403" ]; then
   echo "curl got 403 (blocked by resolved-IP carve-out as expected)"
-elif [ "\$code" = "200" ] || [ "\$code" = "301" ] || [ "\$code" = "302" ]; then
+elif [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
   echo "curl SUCCEEDED (UNEXPECTED — the proxy should have blocked the private IP)"
 else
-  echo "curl got http=\$code exit=\$ec"
+  echo "curl got http=$code exit=$ec"
 fi
 EOF
 K -n "$NS" cp "$TMPDIR/probe-rebind.sh" "$AGENT_POD:/tmp/probe-rebind.sh" 2>/dev/null || bad "kubectl cp probe-rebind.sh failed"

@@ -2047,6 +2047,9 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		if hadKaptConflict(loop) {
 			setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionFalse, "Resolved",
 				"all per-Loop KubeArmorPolicies are controlled by this Loop")
+			if err := r.Status().Update(ctx, loop); err != nil {
+				return fmt.Errorf("update Loop status (KubeArmorPolicyConflict resolved): %w", err)
+			}
 		}
 		if applyErr != nil {
 			return applyErr

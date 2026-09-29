@@ -329,12 +329,21 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		assertNdots(i42fLoopNdots + "-proxy")
 	})
 
-	// review P2 (PR #28 early review): a FOREIGN KubeArmorPolicy occupying a
-	// coxswain-<loop>[-egress-proxy|-proxy] name is NEVER overwritten
+	// review P2 (PR #28 early review, R2): a FOREIGN KubeArmorPolicy occupying
+	// a coxswain-<loop>[-egress-proxy|-proxy] name is NEVER overwritten
 	// (I42c's createOrUpdateNP never-take-over, applied to the KubeArmorPols).
 	// The reconciler sets KubeArmorPolicyConflict=True/ForeignKubeArmorPolicy,
 	// holds the sandbox Suspended, and does not error-loop.
-	It("does not overwrite a foreign egress-proxy KubeArmorPolicy; sets KubeArmorPolicyConflict and holds the sandbox Suspended", func() {
+	//
+	// Round 2 made this spec meaningful (it previously reconciled once with no
+	// Ready proxy pods, so the D35a/I42b gates already held it Suspended
+	// regardless of the KubeArmorPolicy conflict): (1) mark the model-proxy and
+	// egress-proxy pods Ready so the D35a/I42b gates pass and the KubeArmor
+	// gate is the one holding it Suspended; (2) reconcile twice, asserting
+	// Suspended after each; (3) delete the foreign policy, reconcile, and assert
+	// our policy is created with our controller ref, the condition is Resolved,
+	// and the sandbox goes Running.
+	It("does not overwrite a foreign egress-proxy KubeArmorPolicy; holds the sandbox Suspended across reconciles; resolves on deletion", func() {
 		r.AllowUnenforced = true
 		ns := setupNS("foreign")
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
@@ -344,11 +353,12 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 
 		// Pre-create a FOREIGN KubeArmorPolicy occupying the egress proxy's
 		// name (a different owner; the Loop's owner ref is absent).
+		foreignName := "coxswain-" + i42fLoopForeign + "-egress-proxy"
 		foreign := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "security.kubearmor.com/v1",
 			"kind":       "KubeArmorPolicy",
 			"metadata": map[string]any{
-				"name":         "coxswain-i42f-fx-egress-proxy",
+				"name":         foreignName,
 				unstructuredNs: ns,
 				"labels":       map[string]any{"external": unstructuredTrue},
 			},
@@ -358,15 +368,56 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 
 		loop := buildLoop(i42fLoopForeign, ns, []string{i42fTestPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// First reconcile: creates the sandbox + proxies. The D35a/I42b gates
+		// hold it Suspended (the proxy pods are not Ready yet).
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopForeign}})
 		Expect(err).NotTo(HaveOccurred(),
 			"a foreign KubeArmorPolicy must not error-loop the reconcile (the sandbox is held Suspended instead)")
+
+		// Mark the model-proxy and egress-proxy pods Ready so the D35a/I42b
+		// gates pass. With both proxies Ready and no KubeArmor conflict, the
+		// sandbox would be Running; the ONLY thing holding it Suspended is the
+		// order-independent KubeArmorPolicy gate (foreign egress-proxy policy).
+		for _, podName := range []string{i42fLoopForeign + "-proxy", i42fLoopForeign + "-egress-proxy"} {
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: podName}, pod)).To(Succeed(),
+				"proxy pod %s must exist", podName)
+			pod.Status.Conditions = []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed(),
+				"mark %s Ready", podName)
+		}
+
+		// Second reconcile: both proxies are Ready, so the D35a/I42b gates
+		// pass; the KubeArmorPolicy gate must hold it Suspended (fail-closed:
+		// the egress-proxy policy is the foreign one, not the one the operator
+		// built).
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopForeign}})
+		Expect(err).NotTo(HaveOccurred())
+
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName(i42fLoopForeign)}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the sandbox must be Suspended while a foreign KubeArmorPolicy occupies the name, even with both proxy pods Ready")
+
+		// Third reconcile: the gate is order-independent (it reads the live
+		// KubeArmorPolicy objects in ensureSandbox, which runs before
+		// applyEffectivePolicyAndConditions), so a second pass must NOT flip it
+		// back to Running. This is the flap the I42c round-3 fix removed.
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopForeign}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName(i42fLoopForeign)}, sb)).To(Succeed())
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the sandbox must STAY Suspended on the second reconcile (no flap back to Running)")
 
 		// The foreign object is left untouched (spec + label intact, no
 		// owner ref added).
 		got := &unstructured.Unstructured{}
 		got.SetGroupVersionKind(engine.KubeArmorGVK)
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "coxswain-i42f-fx-egress-proxy"}, got)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreignName}, got)).To(Succeed())
 		Expect(got.GetOwnerReferences()).To(BeEmpty(),
 			"the foreign KubeArmorPolicy must not be owner-ref'd to the Loop")
 		lbl, _, _ := unstructured.NestedMap(got.Object, "metadata", "labels")
@@ -385,10 +436,35 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		Expect(conflict.Status).To(Equal(metav1.ConditionTrue))
 		Expect(conflict.Reason).To(Equal("ForeignKubeArmorPolicy"))
 
-		// The sandbox is held Suspended (the ensureSandbox gate).
-		sb := &sandboxv1beta1.Sandbox{}
+		// Delete the foreign policy. The next reconcile creates our egress-proxy
+		// policy (with our controller ref) and clears the condition to Resolved;
+		// with both proxies Ready and no conflict, the sandbox goes Running.
+		Expect(k8sClient.Delete(ctx, foreign)).To(Succeed())
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopForeign}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Our egress-proxy policy now exists with our controller ref.
+		ourKap := getKapt(ctx, ns, foreignName)
+		resolvedLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42fLoopForeign}, resolvedLoop)).To(Succeed())
+		Expect(metav1.IsControlledBy(ourKap, resolvedLoop)).To(BeTrue(),
+			"our egress-proxy KubeArmorPolicy must carry the Loop's controller ref")
+
+		// The condition is Resolved (cleared by the hadKaptConflict path).
+		var resolvedConflict *metav1.Condition
+		for i := range resolvedLoop.Status.Conditions {
+			if resolvedLoop.Status.Conditions[i].Type == "KubeArmorPolicyConflict" {
+				resolvedConflict = &resolvedLoop.Status.Conditions[i]
+			}
+		}
+		Expect(resolvedConflict).ToNot(BeNil(), "KubeArmorPolicyConflict condition must still be present")
+		Expect(resolvedConflict.Status).To(Equal(metav1.ConditionFalse),
+			"KubeArmorPolicyConflict must be cleared to False once the foreign policy is gone")
+		Expect(resolvedConflict.Reason).To(Equal("Resolved"))
+
+		// The sandbox goes Running (both proxies Ready, no conflict).
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName(i42fLoopForeign)}, sb)).To(Succeed())
-		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
-			"the sandbox must be held Suspended while a foreign KubeArmorPolicy occupies the name")
+		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
+			"the sandbox must go Running once the foreign policy is deleted and the conflict is resolved")
 	})
 })

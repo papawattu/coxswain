@@ -352,6 +352,10 @@ if [ -n "$AGENT_POD_3D" ]; then
     fi
     sleep 3
   done
+  # Extra settle time: the coredns rollout may still be settling DNS
+  # responses for the agent pod's resolver. Wait 30s to be safe.
+  echo "   waiting 30s for DNS to fully settle..."
+  sleep 30
 fi
 
 # Verify the override works: the egress proxy pod should now resolve the name.
@@ -404,12 +408,12 @@ esac
 echo
 echo "--- CHECK 3: allowed host via the proxy succeeds (audit: allowed) ---"
 EGRESS_POD="$LOOP-egress-proxy"
-cat > "$TMPDIR/probe-allowed.sh" <<'EOF'
+PROXY_FQDN="${LOOP}-egress-proxy.${NS}.svc.cluster.local"
+cat > "$TMPDIR/probe-allowed.sh" <<EOF
 #!/bin/sh
-echo "-- HTTP proxy.golang.org (via HTTPS_PROXY env) --"
-# --retry 2: the first attempt may fail if DNS is still warming up after
-# the coredns restart; retry once more.
-curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://proxy.golang.org/
+echo "-- HTTP proxy.golang.org (via explicit proxy) --"
+curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
+  --proxy http://${PROXY_FQDN}:3128 http://proxy.golang.org/
 ec=$?
 echo ""
 echo "curl-exit=$ec"
@@ -437,10 +441,11 @@ fi
 # ===========================================================================
 echo
 echo "--- CHECK 4: disallowed host gets 403 (audit: blocked) ---"
-cat > "$TMPDIR/probe-disallowed.sh" <<'EOF'
+cat > "$TMPDIR/probe-disallowed.sh" <<EOF
 #!/bin/sh
-echo "-- HTTP github.com (NOT in the allows) via HTTPS_PROXY env --"
-code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://github.com/ 2>&1)
+echo "-- HTTP github.com (NOT in the allows) via explicit proxy --"
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
+  --proxy http://${PROXY_FQDN}:3128 http://github.com/ 2>&1)
 ec=$?
 echo "curl-exit=$ec http=$code"
 if [ "$code" = "403" ]; then
@@ -537,10 +542,12 @@ esac
 # ===========================================================================
 echo
 echo "--- CHECK 7: DNS-rebinding allow (${REBIND_NAME} -> ${TEST_IP}) rejected by proxy ---"
+PROXY_FQDN7="${LOOP}-egress-proxy.${NS}.svc.cluster.local"
 cat > "$TMPDIR/probe-rebind.sh" <<EOF
 #!/bin/sh
-echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via HTTPS_PROXY env --"
-code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 http://${REBIND_NAME}/ 2>&1)
+echo "-- HTTP ${REBIND_NAME} (allowed name, resolves to private ${TEST_IP}) via explicit proxy --"
+code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-delay 3 \
+  --proxy http://${PROXY_FQDN7}:3128 http://${REBIND_NAME}/ 2>&1)
 ec=\$?
 echo "curl-exit=\$ec http=\$code"
 if [ "\$code" = "403" ]; then

@@ -75,6 +75,13 @@ var _ = BeforeSuite(func() {
 
 	// +kubebuilder:scaffold:scheme
 
+	// I45: the envtest apiserver must enforce ValidatingAdmissionPolicies for
+	// the I45 spec (pods/ephemeralcontainers denial on coxswain component
+	// pods). The feature gate is required on the apiserver side (the Go API
+	// type ships in k8s 1.34, but the envtest apiserver does not enable the
+	// gate by default). Enabling it here is the "gate" the I43 norm refers
+	// to: remove ValidatingAdmissionPolicy=true from this list and the I45
+	// spec fails (the update is allowed for all pods).
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		// The Loop CRD plus the agent-sandbox Sandbox CRD (vendored under
@@ -85,6 +92,18 @@ var _ = BeforeSuite(func() {
 			filepath.Join("..", "..", "config", "crd", "external"),
 		},
 		ErrorIfCRDPathMissing: true,
+		// I45: explicitly enable the ValidatingAdmissionPolicy admission
+		// plugin on the envtest apiserver. On Kubernetes 1.34 the plugin is in
+		// the default-enabled list, but stating it explicitly makes the test
+		// self-documenting: if a future k8s version removes it from defaults
+		// (or the plugin is disabled another way) this line is where to look.
+		ControlPlane: envtest.ControlPlane{
+			APIServer: &envtest.APIServer{
+				Args: []string{
+					"--enable-admission-plugins=ValidatingAdmissionPolicy",
+				},
+			},
+		},
 	}
 
 	// Retrieve the first found binary directory to allow running tests from IDEs

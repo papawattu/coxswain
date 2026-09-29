@@ -194,9 +194,9 @@ func EffectiveHash(p EffectivePolicy) string {
 	return fmt.Sprintf("%x", sum)
 }
 
-// ComponentProxyLabel and ComponentEgressProxyLabel are the values of the
-// app.kubernetes.io/component label on the two operator-owned proxy pods
-// (the model proxy and the egress proxy). The operator's manager scopes its
+// ComponentLabelKey and the Component*Label values are the values of the
+// app.kubernetes.io/component label on the operator-owned component pods
+// (the agent sandbox, the model proxy and the egress proxy). The operator's manager scopes its
 // Pod/Service cache to these label values (cmd/main.go) so it does not cache
 // every Pod and Service in the cluster. The cache MUST include every
 // component the operator Gets through that cache: a component label absent
@@ -207,6 +207,7 @@ func EffectiveHash(p EffectivePolicy) string {
 // Create every reconcile).
 const (
 	ComponentLabelKey         = "app.kubernetes.io/component"
+	ComponentAgentLabel       = "agent"
 	ComponentProxyLabel       = "model-proxy"
 	ComponentEgressProxyLabel = "egress-proxy"
 )
@@ -223,6 +224,12 @@ const DefaultClusterDomain = "cluster.local"
 // cache. It must stay in sync with proxyLabels (internal/controller) and
 // egressProxyLabels (internal/controller); TestProxyComponentSelector pins
 // both.
+//
+// NOTE (I45): the agent component is deliberately EXCLUDED from this
+// selector — the manager's pod cache must stay proxies-only. The I45
+// ValidatingAdmissionPolicy matches all three component values
+// (agent, model-proxy, egress-proxy) for its own label-based denial, but
+// that is a separate concern from the operator's cache scoping.
 func ProxyComponentSelector() labels.Selector {
 	r, _ := labels.NewRequirement(ComponentLabelKey, selection.In, []string{ComponentProxyLabel, ComponentEgressProxyLabel})
 	return labels.NewSelector().Add(*r)

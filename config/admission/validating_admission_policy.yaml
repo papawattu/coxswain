@@ -1,0 +1,56 @@
+# I45 (R16): deny ephemeral containers on the coxswain component pods.
+#
+# An ephemeral container (kubectl debug) added to a pod selected by a
+# KubeArmorPolicy runs OUTSIDE the fence: KubeArmor does not police the
+# ephemeral container, so anyone with `pods/ephemeralcontainers` (patch) in a
+# Loop namespace gets an unfenced process inside the proxy or agent pod,
+# sharing its network namespace. Deny at admission instead.
+#
+# The policy matches pods/ephemeralcontainers UPDATE (adding an ephemeral
+# container is the only mutation of the subresource) and DENIES the update
+# when the target pod carries the app.kubernetes.io/component label with a
+# coxswain component value (agent, model-proxy, egress-proxy). The component
+# values must stay in sync with internal/policy (ComponentLabelKey,
+# ComponentAgentLabel, ComponentProxyLabel, ComponentEgressProxyLabel) —
+# internal/policy/policy_yaml_test.go pins them.
+#
+# Pods without the label (or with a different component value) are untouched.
+#
+# NOTE (R16 I45): admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy
+# shipped in Kubernetes 1.30 with a different schema (spec.validationRules /
+# spec.validationPolicyName). It moved to GA in 1.34 on the CURRENT v1
+# schema (spec.matchConstraints.resourceRules / spec.matchConditions /
+# spec.validations / spec.policyName), which is what this file uses. Apply
+# it with kubectl against a 1.34+ cluster (the kind cluster here is 1.34).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: coxswain-deny-ephemeral-containers
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods/ephemeralcontainers"]
+        operations: ["UPDATE"]
+  matchConditions:
+    - name: coxswainComponentPod
+      expression: >-
+        object.metadata.labels['app.kubernetes.io/component'] == 'agent'
+        || object.metadata.labels['app.kubernetes.io/component'] == 'model-proxy'
+        || object.metadata.labels['app.kubernetes.io/component'] == 'egress-proxy'
+  validations:
+    - expression: "false"
+      message: >-
+        Adding ephemeral containers to coxswain component pods (agent,
+        model-proxy, egress-proxy) is denied: the container would run
+        outside the KubeArmor fence and share the pod's network namespace.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: coxswain-deny-ephemeral-containers
+spec:
+  policyName: coxswain-deny-ephemeral-containers
+  validationActions: ["Deny"]

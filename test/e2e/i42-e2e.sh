@@ -85,10 +85,24 @@ cleanup() {
   # restore the CoreDNS ConfigMap (the DNS-rebinding hosts override is reverted)
   if [ -f "$COREDNS_CM_BACKUP" ]; then
     echo "--- restoring kube-system/coredns ConfigMap (reverting the DNS-rebinding hosts override) ---"
-    K apply -f "$COREDNS_CM_BACKUP" 2>/dev/null || echo "   (could not restore the coredns ConfigMap; check manually)"
+    # Extract the original Corefile from the backup and patch the current object.
+    # (apply/replace fail on resourceVersion conflict; patch only updates the
+    # data field, which is what we changed.)
+    ORIG_COREFILE=$(jq -r '.data.Corefile' "$COREDNS_CM_BACKUP" 2>/dev/null)
+    if [ -n "$ORIG_COREFILE" ]; then
+      if kubectl --context "$CTX" -n kube-system get cm coredns -o json \
+        | jq --arg cf "$ORIG_COREFILE" '.data.Corefile = $cf' \
+        | kubectl --context "$CTX" replace -f - 2>/dev/null; then
+        echo "   ConfigMap restored"
+      else
+        echo "   (could not restore the coredns ConfigMap; check manually)"
+      fi
+    else
+      echo "   (could not read the original Corefile from the backup; check manually)"
+    fi
     # restart coredns so it picks up the restored config (NOT KubeArmor)
-    K -n kube-system rollout restart deploy/coredns 2>/dev/null || true
-    K -n kube-system rollout status deploy/coredns --timeout=120s 2>/dev/null || true
+    kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
+    kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || true
     echo "   coredns restored."
   fi
   # delete the throwaway exec pod
@@ -182,6 +196,19 @@ REBIND_ALLOW="${REBIND_NAME}:80"
 # ===========================================================================
 echo
 echo "--- STEP 3b: create the fixture (namespace, AgentPolicy, fake model, Loop) ---"
+# Clean up any old Loop from a previous run (the controller won't change the
+# pod image in-place; we need a fresh sandbox with the new agent image).
+if K -n "$NS" get loop "$LOOP" >/dev/null 2>&1; then
+  echo "   deleting old Loop $LOOP (will be recreated with the current agent image)"
+  K -n "$NS" delete loop "$LOOP" --wait=false 2>/dev/null || true
+  # Wait for the old pods to go away.
+  for i in $(seq 1 20); do
+    K -n "$NS" get pods -l "app.kubernetes.io/component=agent" --no-headers 2>/dev/null | grep -q . || break
+    sleep 3
+  done
+  K -n "$NS" get pods -l "app.kubernetes.io/component=agent" --no-headers 2>/dev/null | grep -q . && \
+    echo "   (old agent pod still terminating; continuing)"
+fi
 K get ns "$NS" >/dev/null 2>&1 || K create ns "$NS" >/dev/null
 cat > "$TMPDIR/agentpolicy.yaml" <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
@@ -296,12 +323,12 @@ echo "   modified Corefile (first 5 lines):"
 echo "$NEW_COREFILE" | head -5 | sed 's/^/     /'
 
 # Apply the modified ConfigMap.
-K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | K apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
+K -n kube-system get cm coredns -o json | jq --arg corefile "$NEW_COREFILE" '.data.Corefile = $corefile' | kubectl --context "$CTX" apply -f - >/dev/null || { echo "FATAL: could not apply modified coredns ConfigMap"; exit 2; }
 echo "   coredns ConfigMap updated"
 
 # Restart coredns so it picks up the new config (this is NOT KubeArmor).
-K -n kube-system rollout restart deploy/coredns 2>/dev/null || true
-K -n kube-system rollout status deploy/coredns --timeout=120s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
+kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
+kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
 echo "   coredns restarted"
 
 # Verify the override works: the egress proxy pod should now resolve the name.

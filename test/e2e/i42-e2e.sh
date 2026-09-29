@@ -330,17 +330,31 @@ echo "   coredns ConfigMap updated"
 kubectl --context "$CTX" -n kube-system rollout restart deploy/coredns 2>/dev/null || true
 kubectl --context "$CTX" -n kube-system rollout status deploy/coredns --timeout=180s 2>/dev/null || { echo "FATAL: coredns did not become ready after restart"; exit 2; }
 echo "   coredns restarted"
-# Give CoreDNS a moment to settle and the agent's DNS cache a chance to
-# refresh. Without this, the first curl from the agent may fail with
-# "couldn't resolve proxy" (exit 5) if DNS is still warming up.
-sleep 5
+# Restart the agent pod so it picks up the new CoreDNS config. The agent pod
+# was created BEFORE the CoreDNS restart, so its DNS resolver connection is
+# stale. Deleting the pod causes the controller to recreate it with a fresh
+# DNS connection.
+AGENT_POD_3D=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$AGENT_POD_3D" ]; then
+  echo "   restarting agent pod $AGENT_POD_3D (fresh DNS connection)"
+  K -n "$NS" delete pod "$AGENT_POD_3D" --wait=false 2>/dev/null || true
+  # Wait for the agent pod to come back.
+  for i in $(seq 1 30); do
+    K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" --no-headers 2>/dev/null | grep -q "1/1" && break
+    sleep 3
+  done
+  AGENT_POD_3D=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  echo "   agent pod back: $AGENT_POD_3D"
+fi
+# Give CoreDNS a moment to settle.
+sleep 3
 
 # Verify the override works: the egress proxy pod should now resolve the name.
 # (We don't exec into the proxy — it's distroless. Instead we verify via the
 # agent pod, which resolves via the same coredns.)
 AGENT_POD_TMP=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -n "$AGENT_POD_TMP" ]; then
-  RESOLVED=$(K -n "$NS" exec "$AGENT_POD_TMP" -- sh -c "nslookup ${REBIND_NAME} 2>&1 || getent hosts ${REBIND_NAME} 2>&1 || echo 'no-resolver'" 2>&1 || echo "no-exec")
+  RESOLVED=$(K -n "$NS" exec "$AGENT_POD_TMP" -- sh -c "getent hosts ${REBIND_NAME} 2>&1 || echo 'no-resolver'" 2>&1 || echo "no-exec")
   echo "   resolution check from agent pod: $(echo "$RESOLVED" | head -3 | tr '\n' ' ')"
 fi
 

@@ -1022,6 +1022,14 @@ and shares the pod's network namespace — so it is denied for those pods by the
 Loop-namespace Roles should NOT include `pods/ephemeralcontainers` for any
 non-admin principal.
 
+**Relabel note:** the VAP matches by **label**, so a principal who can
+`update`/`patch` pods in a Loop namespace can strip the
+`app.kubernetes.io/component` label and then add an ephemeral container to
+that (now-unlabelled) pod. Restricting `pods` update/patch is therefore
+REQUIRED in Loop namespaces as well — not just the ephemeralcontainers
+subresource. (Relabelling also detaches the pod from its NetworkPolicy and
+KubeArmor selectors, which is independently dangerous.)
+
 
 ## Out of scope for Phase 1
 

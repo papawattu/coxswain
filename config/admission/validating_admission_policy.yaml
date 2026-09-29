@@ -25,7 +25,7 @@
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: coxswain-deny-ephemeral-containers
+  name: deny-ephemeral-containers
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -51,7 +51,7 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: coxswain-deny-ephemeral-containers
+  name: deny-ephemeral-containers
 spec:
-  policyName: coxswain-deny-ephemeral-containers
+  policyName: deny-ephemeral-containers
   validationActions: ["Deny"]

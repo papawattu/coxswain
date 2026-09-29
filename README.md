@@ -96,6 +96,30 @@ The design, most of which is still being built:
 
 The vocabulary is defined in [CONTEXT.md](CONTEXT.md); the design decisions are in [docs/adr/](docs/adr/).
 
+## Security (RBAC guidance for installers)
+
+Coxswain deploys a `ValidatingAdmissionPolicy` + binding (see
+`config/admission/validating_admission_policy.yaml`, wired into
+`config/default`) that **denies adding ephemeral containers**
+(`kubectl debug`) to coxswain component pods (agent, model-proxy,
+egress-proxy). KubeArmor does not police ephemeral containers, so one added
+to a fenced pod would escape the fence and share its network namespace.
+
+**RBAC rules for Loop namespaces:**
+
+- Do **not** grant `pods/ephemeralcontainers` to any non-admin principal in a
+  Loop namespace. The admission policy is a backstop, not a substitute for
+  least-privilege RBAC.
+- **Restrict `pods` update/patch too.** The admission policy matches by
+  label, so a principal who can patch a pod can strip the
+  `app.kubernetes.io/component` label and then add an ephemeral container to
+  the now-unlabelled pod. Restricting `pods` update/patch is required in Loop
+  namespaces as well. (Relabelling also detaches the pod from its
+  NetworkPolicy and KubeArmor selectors, which is independently dangerous.)
+
+See [docs/TDD-PLAN-PHASE1.md](docs/TDD-PLAN-PHASE1.md) §RBAC guidance for the
+full rationale.
+
 ## Development
 
 ```sh

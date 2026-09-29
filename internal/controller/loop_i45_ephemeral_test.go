@@ -22,13 +22,19 @@ package controller
 // config/default) denies the pods/ephemeralcontainers UPDATE.
 //
 // The envtest apiserver enforces ValidatingAdmissionPolicies (GA in k8s 1.34),
-// so this spec applies the policy + binding to the test cluster, creates a
-// pod per coxswain component (carrying the operator's component label) and
-// an unlabelled pod, and asserts the pods/ephemeralcontainers update is
-// DENIED for each component pod and ALLOWED for the unlabelled one. The
-// subresource update is issued with DryRun=All: the admission chain (including
-// the VAP) is evaluated, but no write persists, so the spec needs no
-// kubelet.
+// so this spec loads the SHIPPED YAML (config/admission/
+// validating_admission_policy.yaml) into the test cluster, creates a pod per
+// coxswain component (carrying the operator's component label) and an
+// unlabelled pod, and asserts the pods/ephemeralcontainers update is DENIED
+// for each component pod and ALLOWED for the unlabelled one. The subresource
+// update is issued with DryRun=All: the admission chain (including the VAP)
+// is evaluated, but no write persists, so the spec needs no kubelet.
+//
+// Loading the shipped YAML (not a Go copy) means this spec proves the exact
+// artefact we deploy: dropping the has() guard, changing the CEL expression,
+// or flipping the binding to Warn would all be caught here. The constants pin
+// in internal/policy/policy_yaml_test.go keeps the manifest's literals in sync
+// with the Go label values.
 //
 // I43 gate norm (R16): this spec FAILS when the gate is disabled — remove the
 // applyI45AdmissionPolicy call in the BeforeEach below and the "denied"
@@ -37,26 +43,20 @@ package controller
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/papawattu/coxswain/internal/policy"
-)
-
-const (
-	// i45PolicyName / i45BindingName mirror the object names in
-	// config/admission/validating_admission_policy.yaml. They are the
-	// objects this spec applies to the envtest cluster; the YAML file's
-	// values are pinned against the same policy constants by
-	// config/admission/policy_yaml_test.go.
-	i45PolicyName  = "coxswain-deny-ephemeral-containers"
-	i45BindingName = "coxswain-deny-ephemeral-containers"
 )
 
 var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on component pods", func() {
@@ -65,62 +65,42 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 		ns  string
 	)
 
-	// i45CELExpression is the matchCondition expression. It is built from the
-	// policy package constants so the test and the Go label values cannot
-	// desync; the YAML manifest's literal copy is pinned separately by
-	// internal/policy/policy_yaml_test.go.
-	//
-	// Guarded with has() + in: with failurePolicy=Fail, a matchCondition that
-	// ERRORS (e.g. reading a missing label) REJECTS the request. An unlabelled
-	// pod must not error — it must fall through to the validation gate and be
-	// ALLOWED. So the expression only matches pods that carry the label with a
-	// coxswain component value; anything else is left untouched.
-	i45CELExpression := "has(object.metadata.labels) && '" + policy.ComponentLabelKey + "' in object.metadata.labels && " +
-		"object.metadata.labels['" + policy.ComponentLabelKey + "'] in ['" + policy.ComponentAgentLabel + "', '" + policy.ComponentProxyLabel + "', '" + policy.ComponentEgressProxyLabel + "']"
-
-	// applyI45AdmissionPolicy applies the ValidatingAdmissionPolicy + binding
-	// to the envtest cluster. The envtest apiserver enforces the policy.
+	// applyI45AdmissionPolicy reads the shipped YAML, decodes the two documents
+	// (ValidatingAdmissionPolicy + its binding) with sigs.k8s.io/yaml, and
+	// creates them in the envtest cluster. The envtest apiserver enforces the
+	// policy exactly as the shipped artefact declares it.
 	applyI45AdmissionPolicy := func() {
-		failurePolicy := admissionv1.Fail
-		matchConstraints := &admissionv1.MatchResources{
-			ResourceRules: []admissionv1.NamedRuleWithOperations{{
-				RuleWithOperations: admissionv1.RuleWithOperations{
-					Operations: []admissionv1.OperationType{admissionv1.Update},
-					Rule: admissionv1.Rule{
-						APIGroups:   []string{""},
-						APIVersions: []string{"v1"},
-						Resources:   []string{"pods/ephemeralcontainers"},
-					},
-				},
-			}},
+		data, err := os.ReadFile(filepath.Join("..", "..", "config", "admission", "validating_admission_policy.yaml"))
+		Expect(err).NotTo(HaveOccurred(), "reading the shipped policy YAML")
+
+		var vap *admissionv1.ValidatingAdmissionPolicy
+		var vapb *admissionv1.ValidatingAdmissionPolicyBinding
+		for doc := range strings.SplitSeq(string(data), "\n---") {
+			var untyped struct {
+				Kind string `yaml:"kind"`
+			}
+			if err := yaml.Unmarshal([]byte(doc), &untyped); err != nil {
+				continue
+			}
+			switch untyped.Kind {
+			case "ValidatingAdmissionPolicy":
+				vap = &admissionv1.ValidatingAdmissionPolicy{}
+				Expect(yaml.Unmarshal([]byte(doc), vap)).To(Succeed())
+			case "ValidatingAdmissionPolicyBinding":
+				vapb = &admissionv1.ValidatingAdmissionPolicyBinding{}
+				Expect(yaml.Unmarshal([]byte(doc), vapb)).To(Succeed())
+			}
 		}
-		vap := &admissionv1.ValidatingAdmissionPolicy{
-			ObjectMeta: metav1.ObjectMeta{Name: i45PolicyName},
-			Spec: admissionv1.ValidatingAdmissionPolicySpec{
-				FailurePolicy:    &failurePolicy,
-				MatchConstraints: matchConstraints,
-				MatchConditions:  []admissionv1.MatchCondition{{Name: "coxswainComponentPod", Expression: i45CELExpression}},
-				Validations: []admissionv1.Validation{{
-					Expression: "false",
-					Message:    "adding ephemeral containers to coxswain component pods is denied (KubeArmor fence)",
-				}},
-			},
-		}
+		Expect(vap).NotTo(BeNil(), "shipped YAML has a ValidatingAdmissionPolicy document")
+		Expect(vapb).NotTo(BeNil(), "shipped YAML has a ValidatingAdmissionPolicyBinding document")
+
 		ExpectWithOffset(1, k8sClient.Create(ctx, vap)).To(Succeed())
 		DeferCleanup(func() {
-			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: i45PolicyName}})
+			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: vap.Name}})
 		})
-
-		vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
-			ObjectMeta: metav1.ObjectMeta{Name: i45BindingName},
-			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
-				PolicyName:        i45PolicyName,
-				ValidationActions: []admissionv1.ValidationAction{admissionv1.Deny},
-			},
-		}
 		ExpectWithOffset(1, k8sClient.Create(ctx, vapb)).To(Succeed())
 		DeferCleanup(func() {
-			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: i45BindingName}})
+			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: vapb.Name}})
 		})
 		// NOTE: the apiserver needs a moment to load a freshly-applied VAP into
 		// the ValidatingAdmissionPolicy plugin's cache. We do NOT wait here —

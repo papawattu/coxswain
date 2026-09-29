@@ -342,10 +342,12 @@ if [ -n "$AGENT_POD_3D" ]; then
     [ "$R" = "True" ] && { echo "   agent pod Ready after ~$((i*3))s"; break; }
     sleep 3
   done
-  echo "   waiting for DNS to settle (proxy FQDN resolvable from agent pod)..."
+  echo "   waiting for DNS to settle (curl can reach the proxy)..."
   for i in $(seq 1 20); do
-    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "getent hosts ${LOOP}-egress-proxy.${NS}.svc.cluster.local" 2>/dev/null | grep -q .; then
-      echo "   DNS settled after ~$((i*3))s"
+    # Use curl (not getent) for the DNS check: curl is what actually fails
+    # with exit 5, so poll with the same tool that the checks use.
+    if K -n "$NS" exec "$AGENT_POD_3D" -- sh -c "curl -s -o /dev/null --max-time 5 http://${LOOP}-egress-proxy.${NS}.svc.cluster.local:3128/" 2>/dev/null; then
+      echo "   DNS settled (curl reached the proxy) after ~$((i*3))s"
       break
     fi
     sleep 3

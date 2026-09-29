@@ -31,11 +31,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// KubeArmorPolicy spec-level keys (the same keys EmitKubeArmorPolicy builds;
-// constant here so goconst does not flag the two emitters).
-const (
-	kaptActionValue = "Block"
-)
+// KubeArmorPolicy spec-level keys (the same keys EmitKubeArmorPolicy builds,
+// now the package constants in kubearmor.go: the two emitters and the
+// unstructured-map shape share one source of truth).
 
 // egressProxyBinaryPath is the egress proxy binary's absolute path in its
 // image (cmd/egress-proxy/Dockerfile: COPY to /usr/local/bin/egress-proxy,
@@ -68,12 +66,12 @@ func EmitEgressProxyKubeArmorPolicy(loopName, namespace string, networkAllows []
 		// Default-deny posture: the same Block semantics as the agent policy
 		// (C6b) — per-rule action Allow is the carve-out.
 		kaptActionKey: kaptActionValue,
-		"selector": map[string]any{
-			"matchLabels": egressProxyKaptSelector(loopName),
+		KaptSelectorKey: map[string]any{
+			KaptMatchLabelsKey: egressProxyKaptSelector(loopName),
 		},
-		"process": map[string]any{
-			kaptActionKey: kaptAllowAction,
-			"matchPaths":  toPathItems([]string{egressProxyBinaryPath}),
+		KaptProcessKey: map[string]any{
+			kaptActionKey:     kaptAllowAction,
+			KaptMatchPathsKey: toPathItems([]string{egressProxyBinaryPath}),
 		},
 	}
 	if len(networkAllows) > 0 {
@@ -81,13 +79,13 @@ func EmitEgressProxyKubeArmorPolicy(loopName, namespace string, networkAllows []
 	}
 
 	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": kaptGroup + "/" + kaptVersion,
-		"kind":       kaptKind,
-		"metadata": map[string]any{
-			"name":      "coxswain-" + loopName + "-egress-proxy",
-			"namespace": namespace,
+		kaptAPIVersionKey: kaptGroup + "/" + kaptVersion,
+		kaptKindKey:       kaptKind,
+		kaptMetadataKey: map[string]any{
+			kaptNameKey:      "coxswain-" + loopName + "-egress-proxy",
+			kaptNamespaceKey: namespace,
 		},
-		"spec": spec,
+		KaptSpecKey: spec,
 	}}
 }
 
@@ -106,12 +104,12 @@ func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint string) *u
 	host, _ := modelEndpointHost(modelEndpoint)
 	spec := map[string]any{
 		kaptActionKey: kaptActionValue,
-		"selector": map[string]any{
-			"matchLabels": modelProxyKaptSelector(loopName),
+		KaptSelectorKey: map[string]any{
+			KaptMatchLabelsKey: modelProxyKaptSelector(loopName),
 		},
-		"process": map[string]any{
-			kaptActionKey: kaptAllowAction,
-			"matchPaths":  toPathItems([]string{modelProxyBinaryPath}),
+		KaptProcessKey: map[string]any{
+			kaptActionKey:     kaptAllowAction,
+			KaptMatchPathsKey: toPathItems([]string{modelProxyBinaryPath}),
 		},
 	}
 	if host != "" {
@@ -123,23 +121,23 @@ func EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint string) *u
 			domains = append(domains, host+"."+namespace+".svc.cluster.local")
 		}
 		spec["network"] = map[string]any{
-			kaptActionKey:     kaptAllowAction,
-			"matchDNSQueries": toDomainItems(dedupe(domains)),
+			kaptActionKey:   kaptAllowAction,
+			KaptMatchDNSKey: toDomainItems(dedupe(domains)),
 			// tcp: the proxy dials the model endpoint over TCP. udp+tcp: the
 			// platform DNS allow (review P1: a tcp-only matchProtocols with
 			// spec.action Block denies the proxy's own DNS lookups).
-			"matchProtocols": toProtocolItems(appendDeduped([]string{"tcp"}, dnsAllowProtocols()...)),
+			KaptMatchProtoKey: toProtocolItems(appendDeduped([]string{"tcp"}, dnsAllowProtocols()...)),
 		}
 	}
 
 	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": kaptGroup + "/" + kaptVersion,
-		"kind":       kaptKind,
-		"metadata": map[string]any{
-			"name":      "coxswain-" + loopName + "-proxy",
-			"namespace": namespace,
+		kaptAPIVersionKey: kaptGroup + "/" + kaptVersion,
+		kaptKindKey:       kaptKind,
+		kaptMetadataKey: map[string]any{
+			kaptNameKey:      "coxswain-" + loopName + "-proxy",
+			kaptNamespaceKey: namespace,
 		},
-		"spec": spec,
+		KaptSpecKey: spec,
 	}}
 }
 
@@ -157,8 +155,8 @@ func proxyNetworkBlock(networkAllows []string) map[string]any {
 	domains, protocols := splitNetworkAllows(append([]string{policy.DNSAllow}, networkAllows...))
 	return map[string]any{
 		kaptActionKey:     kaptAllowAction,
-		"matchDNSQueries": toDomainItems(domains),
-		"matchProtocols":  toProtocolItems(protocols),
+		KaptMatchDNSKey:   toDomainItems(domains),
+		KaptMatchProtoKey: toProtocolItems(protocols),
 	}
 }
 

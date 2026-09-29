@@ -37,6 +37,23 @@ import (
 const (
 	i42fTestPolicyName = "i42f-pol"
 	i42fModelEndpoint  = "model.test:8443" // host:port form (the CRD rejects a URL)
+
+	// i42f loop names (goconst: they recur across the specs below).
+	i42fLoopBoth    = "i42f-loop"
+	i42fLoopNoAllow = "i42f-nol"
+	i42fLoopClean   = "i42f-cl"
+	i42fLoopDNS     = "i42f-dns"
+	i42fLoopNdots   = "i42f-nd"
+	i42fLoopForeign = "i42f-fx"
+
+	// i42fModelCredsSecret is the model-creds Secret name the I42f fixtures
+	// use (goconst: it recurs across the specs below).
+	i42fModelCredsSecret = "model-creds"
+
+	// unstructuredNs and unstructuredTrue (goconst: they recur across the specs
+	// below).
+	unstructuredNs   = "namespace"
+	unstructuredTrue = "true"
 )
 
 // getKapt fetches a KubeArmorPolicy by name, unstructured.
@@ -48,10 +65,17 @@ func getKapt(ctx context.Context, ns, name string) *unstructured.Unstructured {
 	return obj
 }
 
+// kaptSpec returns the policy's spec block (nested under spec in the
+// unstructured object; the engine package's shared KubeArmorPolicy keys).
+func kaptSpec(obj *unstructured.Unstructured) map[string]any {
+	spec, _, _ := unstructured.NestedMap(obj.Object, engine.KaptSpecKey)
+	return spec
+}
+
 // kaptDNSDomains returns the policy's network.matchDNSQueries domains.
 func kaptDNSDomains(obj *unstructured.Unstructured) []string {
-	network, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
-	items, _ := network["matchDNSQueries"].([]any)
+	network, _, _ := unstructured.NestedMap(kaptSpec(obj), "network")
+	items, _ := network[engine.KaptMatchDNSKey].([]any)
 	domains := make([]string, 0, len(items))
 	for _, it := range items {
 		domains = append(domains, it.(map[string]any)["domain"].(string))
@@ -61,8 +85,8 @@ func kaptDNSDomains(obj *unstructured.Unstructured) []string {
 
 // kaptSelectorLabels returns the policy's selector.matchLabels.
 func kaptSelectorLabels(obj *unstructured.Unstructured) map[string]string {
-	sel, _, _ := unstructured.NestedMap(obj.Object, "spec", "selector")
-	raw, _ := sel["matchLabels"].(map[string]any)
+	sel, _, _ := unstructured.NestedMap(kaptSpec(obj), engine.KaptSelectorKey)
+	raw, _ := sel[engine.KaptMatchLabelsKey].(map[string]any)
 	out := make(map[string]string, len(raw))
 	for k, v := range raw {
 		out[k] = v.(string)
@@ -72,8 +96,8 @@ func kaptSelectorLabels(obj *unstructured.Unstructured) map[string]string {
 
 // kaptProcessPaths returns the policy's process.matchPaths paths.
 func kaptProcessPaths(obj *unstructured.Unstructured) []string {
-	proc, _, _ := unstructured.NestedMap(obj.Object, "spec", "process")
-	items, _ := proc["matchPaths"].([]any)
+	proc, _, _ := unstructured.NestedMap(kaptSpec(obj), engine.KaptProcessKey)
+	items, _ := proc[engine.KaptMatchPathsKey].([]any)
 	paths := make([]string, 0, len(items))
 	for _, it := range items {
 		paths = append(paths, it.(map[string]any)["path"].(string))
@@ -109,7 +133,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 				Agent: coxv1alpha1.AgentConfig{
 					Image:             runnerImage,
 					Model:             testModel,
-					EndpointSecretRef: "model-creds",
+					EndpointSecretRef: i42fModelCredsSecret,
 					ModelEndpoint:     i42fModelEndpoint,
 				},
 			},
@@ -134,16 +158,16 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
 			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
 		})).To(Succeed())
-		loop := buildLoop("i42f-loop", ns, []string{i42fTestPolicyName})
+		loop := buildLoop(i42fLoopBoth, ns, []string{i42fTestPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-loop"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopBoth}})
 		Expect(err).NotTo(HaveOccurred())
 
 		// Model proxy policy.
 		modelKap := getKapt(ctx, ns, "coxswain-i42f-loop-proxy")
 		Expect(kaptSelectorLabels(modelKap)).To(Equal(map[string]string{
 			"app.kubernetes.io/component": "model-proxy",
-			"coxswain.io/proxy-for":       "i42f-loop",
+			"coxswain.io/proxy-for":       i42fLoopBoth,
 		}))
 		Expect(kaptProcessPaths(modelKap)).To(Equal([]string{"/usr/local/bin/proxy"}))
 		Expect(kaptDNSDomains(modelKap)).To(ContainElement("model.test"))
@@ -152,7 +176,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		egressKap := getKapt(ctx, ns, "coxswain-i42f-loop-egress-proxy")
 		Expect(kaptSelectorLabels(egressKap)).To(Equal(map[string]string{
 			"app.kubernetes.io/component":  "egress-proxy",
-			"coxswain.io/egress-proxy-for": "i42f-loop",
+			"coxswain.io/egress-proxy-for": i42fLoopBoth,
 		}))
 		Expect(kaptProcessPaths(egressKap)).To(Equal([]string{"/usr/local/bin/egress-proxy"}))
 		Expect(kaptDNSDomains(egressKap)).To(ContainElement("proxy.golang.org"))
@@ -161,14 +185,14 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		for _, kap := range []*unstructured.Unstructured{modelKap, egressKap} {
 			ownerRefs := kap.GetOwnerReferences()
 			Expect(ownerRefs).NotTo(BeEmpty(), "KubeArmorPolicy %s must be owner-ref'd to the Loop", kap.GetName())
-			Expect(ownerRefs[0].Name).To(Equal("i42f-loop"))
+			Expect(ownerRefs[0].Name).To(Equal(i42fLoopBoth))
 			Expect(ownerRefs[0].Kind).To(Equal("Loop"))
 		}
 
 		// The agent's C6b policy is unchanged: the coxswain-<loop> policy still
 		// exists with its own selector (coxswain.io/loop), NOT a proxy label.
 		agentKap := getKapt(ctx, ns, "coxswain-i42f-loop")
-		Expect(kaptSelectorLabels(agentKap)).To(HaveKeyWithValue("coxswain.io/loop", "i42f-loop"))
+		Expect(kaptSelectorLabels(agentKap)).To(HaveKeyWithValue("coxswain.io/loop", i42fLoopBoth))
 	})
 
 	// plan envtest 4: a Loop with no network allows -> no egress proxy
@@ -181,9 +205,9 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
 			Spec:       coxv1alpha1.AgentPolicySpec{}, // no network allows
 		})).To(Succeed())
-		loop := buildLoop("i42f-nol", ns, []string{i42fTestPolicyName})
+		loop := buildLoop(i42fLoopNoAllow, ns, []string{i42fTestPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-nol"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopNoAllow}})
 		Expect(err).NotTo(HaveOccurred())
 
 		obj := &unstructured.Unstructured{}
@@ -193,7 +217,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			"the egress proxy KubeArmorPolicy must NOT exist with no network allows")
 
 		modelKap := getKapt(ctx, ns, "coxswain-i42f-nol-proxy")
-		Expect(kaptSelectorLabels(modelKap)).To(HaveKeyWithValue("coxswain.io/proxy-for", "i42f-nol"))
+		Expect(kaptSelectorLabels(modelKap)).To(HaveKeyWithValue("coxswain.io/proxy-for", i42fLoopNoAllow))
 	})
 
 	// cleanup: a Loop that LOST its model endpoint (EndpointSecretRef removed)
@@ -203,21 +227,21 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		r.AllowUnenforced = true
 		ns := setupNS("clean")
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "model-creds", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: i42fModelCredsSecret, Namespace: ns},
 			StringData: map[string]string{"openai.api_key": "sk-test"},
 		})).To(Succeed())
-		loop := buildLoop("i42f-cl", ns, nil)
+		loop := buildLoop(i42fLoopClean, ns, nil)
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-cl"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopClean}})
 		Expect(err).NotTo(HaveOccurred())
 		getKapt(ctx, ns, "coxswain-i42f-cl-proxy")
 
 		// Remove the model endpoint: the proxy is no longer expected.
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "i42f-cl"}, loop)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42fLoopClean}, loop)).To(Succeed())
 		loop.Spec.Agent.EndpointSecretRef = ""
 		loop.Spec.Agent.ModelEndpoint = ""
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
-		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-cl"}})
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopClean}})
 		Expect(err).NotTo(HaveOccurred())
 
 		obj := &unstructured.Unstructured{}
@@ -238,9 +262,9 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
 			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
 		})).To(Succeed())
-		loop := buildLoop("i42f-dns", ns, []string{i42fTestPolicyName})
+		loop := buildLoop(i42fLoopDNS, ns, []string{i42fTestPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-dns"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopDNS}})
 		Expect(err).NotTo(HaveOccurred())
 
 		kaptProtocols := func(obj *unstructured.Unstructured) []string {
@@ -274,16 +298,16 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 		r.AllowUnenforced = true
 		ns := setupNS("ndots")
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "model-creds", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: i42fModelCredsSecret, Namespace: ns},
 			StringData: map[string]string{"openai.api_key": "sk-test"},
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: i42fTestPolicyName, Namespace: ns},
 			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
 		})).To(Succeed())
-		loop := buildLoop("i42f-nd", ns, []string{i42fTestPolicyName})
+		loop := buildLoop(i42fLoopNdots, ns, []string{i42fTestPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-nd"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopNdots}})
 		Expect(err).NotTo(HaveOccurred())
 
 		assertNdots := func(podName string) {
@@ -301,8 +325,8 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			Expect(found).To(BeTrue(),
 				"the %s pod dnsConfig must set ndots=1 (search-suffix expansion breaks KubeArmor DNS allowlist matching)", podName)
 		}
-		assertNdots("i42f-nd-egress-proxy")
-		assertNdots("i42f-nd-proxy")
+		assertNdots(i42fLoopNdots + "-egress-proxy")
+		assertNdots(i42fLoopNdots + "-proxy")
 	})
 
 	// review P2 (PR #28 early review): a FOREIGN KubeArmorPolicy occupying a
@@ -324,17 +348,17 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			"apiVersion": "security.kubearmor.com/v1",
 			"kind":       "KubeArmorPolicy",
 			"metadata": map[string]any{
-				"name":      "coxswain-i42f-fx-egress-proxy",
-				"namespace": ns,
-				"labels":    map[string]any{"external": "true"},
+				"name":         "coxswain-i42f-fx-egress-proxy",
+				unstructuredNs: ns,
+				"labels":       map[string]any{"external": unstructuredTrue},
 			},
 			"spec": map[string]any{"action": "Audit"},
 		}}
 		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
 
-		loop := buildLoop("i42f-fx", ns, []string{i42fTestPolicyName})
+		loop := buildLoop(i42fLoopForeign, ns, []string{i42fTestPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "i42f-fx"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i42fLoopForeign}})
 		Expect(err).NotTo(HaveOccurred(),
 			"a foreign KubeArmorPolicy must not error-loop the reconcile (the sandbox is held Suspended instead)")
 
@@ -350,7 +374,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			"the foreign KubeArmorPolicy must be left untouched (its labels are intact)")
 
 		// The conflict condition is set (same pattern as NetworkPolicyConflict).
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "i42f-fx"}, loop)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42fLoopForeign}, loop)).To(Succeed())
 		var conflict *metav1.Condition
 		for i := range loop.Status.Conditions {
 			if loop.Status.Conditions[i].Type == "KubeArmorPolicyConflict" {
@@ -363,7 +387,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 
 		// The sandbox is held Suspended (the ensureSandbox gate).
 		sb := &sandboxv1beta1.Sandbox{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName("i42f-fx")}, sb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName(i42fLoopForeign)}, sb)).To(Succeed())
 		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
 			"the sandbox must be held Suspended while a foreign KubeArmorPolicy occupies the name")
 	})

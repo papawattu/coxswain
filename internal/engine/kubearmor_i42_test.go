@@ -63,7 +63,7 @@ func TestEmitEgressProxyKubeArmorPolicyShape(t *testing.T) {
 		t.Fatalf("metadata wrong: %s/%s", obj.GetNamespace(), obj.GetName())
 	}
 	spec := obj.Object["spec"].(map[string]any)
-	if spec["action"] != "Block" {
+	if spec["action"] != kaptActionValue {
 		t.Fatalf("spec.action must be Block (default-deny), got %v", spec["action"])
 	}
 
@@ -78,7 +78,7 @@ func TestEmitEgressProxyKubeArmorPolicyShape(t *testing.T) {
 
 	// process.matchPaths: exactly one path-only item for the egress binary.
 	proc := spec["process"].(map[string]any)
-	if proc["action"] != "Allow" {
+	if proc["action"] != kaptAllowAction {
 		t.Fatalf("process action must be Allow, got %v", proc["action"])
 	}
 	paths := matchPathItems(t, proc["matchPaths"])
@@ -88,7 +88,7 @@ func TestEmitEgressProxyKubeArmorPolicyShape(t *testing.T) {
 
 	// network: the effective allows -> DNS domain + tcp protocol.
 	net := spec["network"].(map[string]any)
-	if net["action"] != "Allow" {
+	if net["action"] != kaptAllowAction {
 		t.Fatalf("network action must be Allow, got %v", net["action"])
 	}
 	if !slices.Contains(matchDomainItems(t, net["matchDNSQueries"]), "proxy.golang.org") {
@@ -108,7 +108,7 @@ func TestEmitEgressProxyKubeArmorPolicyShape(t *testing.T) {
 func TestEmitModelProxyKubeArmorPolicyShape(t *testing.T) {
 	obj := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, i42fModelEP)
 	spec := obj.Object["spec"].(map[string]any)
-	if spec["action"] != "Block" {
+	if spec["action"] != kaptActionValue {
 		t.Fatalf("spec.action must be Block, got %v", spec["action"])
 	}
 
@@ -142,7 +142,7 @@ func TestEmitModelProxyKubeArmorPolicyShape(t *testing.T) {
 func TestEmitEgressProxyKubeArmorPolicyNoNetworkAllows(t *testing.T) {
 	obj := EmitEgressProxyKubeArmorPolicy(i42fLoop, i42fNS, nil)
 	spec := obj.Object["spec"].(map[string]any)
-	if spec["action"] != "Block" {
+	if spec["action"] != kaptActionValue {
 		t.Fatalf("spec.action must be Block, got %v", spec["action"])
 	}
 	if _, ok := spec["process"]; !ok {

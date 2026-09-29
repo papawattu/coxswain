@@ -1164,7 +1164,7 @@ func egressProxyLabels(loopName string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":       "coxswain-egress-proxy",
 		"app.kubernetes.io/instance":   loopName,
-		"app.kubernetes.io/component":  "egress-proxy",
+		"app.kubernetes.io/component":  netpolEgressProxyComponent,
 		"app.kubernetes.io/part-of":    "coxswain",
 		"coxswain.io/egress-proxy-for": loopName,
 	}
@@ -1238,7 +1238,7 @@ func buildEgressProxyPod(loopName, ns, image string, networkAllows []string, pol
 				RunAsGroup: &gid,
 			},
 			Containers: []corev1.Container{{
-				Name:  "egress-proxy",
+				Name:  netpolEgressProxyComponent,
 				Image: image,
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
@@ -2003,6 +2003,9 @@ const (
 	// netpolProxyForLabel is the per-Loop label the D34 proxy NetworkPolicy
 	// uses to scope to a specific Loop.
 	netpolProxyForLabel = "coxswain.io/proxy-for"
+	// netpolEgressProxyComponent is the component label the I42b egress proxy
+	// pod uses.
+	netpolEgressProxyComponent = "egress-proxy"
 )
 
 // isPodReady reports whether a Pod has the PodReady condition set to True

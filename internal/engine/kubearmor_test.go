@@ -85,7 +85,7 @@ func TestEmitKubeArmorPolicyTopLevelActionIsBlock(t *testing.T) {
 		Exec: []string{"go"},
 	}, "l1-proxy.ns.svc", ""))
 	spec := obj.Object["spec"].(map[string]any)
-	if spec["action"] != "Block" {
+	if spec["action"] != kaptActionValue {
 		t.Fatalf("spec.action must be Block (default-deny), got %v (KubeArmor defaults to Audit without it)", spec["action"])
 	}
 }
@@ -97,7 +97,7 @@ func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 	if !ok {
 		t.Fatal("process block must exist for exec allows")
 	}
-	if proc["action"] != "Allow" {
+	if proc["action"] != kaptAllowAction {
 		t.Fatalf("process action must be Allow, got %v", proc["action"])
 	}
 	items, _ := proc["matchPaths"].([]any)

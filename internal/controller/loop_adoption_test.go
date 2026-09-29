@@ -83,7 +83,7 @@ var _ = Describe("Loop existing-sandbox adoption", func() {
 		var list sandboxv1beta1.SandboxList
 		Expect(k8sClient.List(ctx, &list, client.InNamespace(ns))).To(Succeed())
 		Expect(list.Items).To(HaveLen(1), "must not create a second sandbox")
-		Expect(list.Items[0].Labels).To(HaveKeyWithValue("pre-existing", "true"),
+		Expect(list.Items[0].Labels).To(HaveKeyWithValue("pre-existing", unstructuredTrue),
 			"the pre-existing sandbox should be adopted, not replaced")
 
 		// I2: adopting a sandbox must give it the Loop as controller owner,

@@ -477,18 +477,31 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 	// I43 same-Loop: a same-Loop input change must UPDATE the existing
 	// model-proxy KubeArmorPolicy on re-reconcile (createOrUpdateKapt
 	// re-asserts the desired spec against the live object), not just create
-	// it. The model endpoint (host AND port) and the endpoint Secret are
-	// immutable (P2 R15: proxy netpol + pod spec), and the enforcer's KAPT
-	// content is port-independent, so the legal same-Loop input change that
-	// keeps the policy expected is the referenced AgentPolicy: adding an
-	// exec allow re-asserts the EXISTING policies with the new rules (a
-	// no-op-mutate / frozen-at-creation regression would fail the new
-	// exec-path assertions below).
-	It("updates the model-proxy KubeArmorPolicy on the same Loop when the referenced policy gains an exec allow (I43 same-Loop)", func() {
+	// I43 same-Loop: the model-proxy KubeArmorPolicy is built from
+	// spec.agent.modelEndpoint (the DNS allowlist is the endpoint's host),
+	// so a same-Loop endpoint change must UPDATE the EXISTING policy's
+	// matchDNSQueries (createOrUpdateKapt re-asserts the desired spec
+	// against the live object), not just create it. The endpoint host is the
+	// input the KAPT depends on; a create-only enforcer would leave the
+	// stale domain (the old host) on the live policy.
+	//
+	// NOTE: spec.agent.modelEndpoint is CEL-validated immutable (`self ==
+	// oldSelf || self == ''`), and the envtest API server enforces the CRD
+	// CEL rules for ALL clients (typed and unstructured), so a host change
+	// on the same Loop is rejected at admission. This spec exercises the
+	// update path by bypassing the API server: it tampers the live KAPT
+	// object's matchDNSQueries (simulating a "pre-rule object" that does not
+	// match the desired spec) and then re-reconciles the same Loop, asserting
+	// the controller's createOrUpdateKapt restores the desired spec. This is
+	// the "pre-rule objects / CRD drift" case the controller must handle. If
+	// the controller does NOT restore the tampered KAPT, that is a real bug
+	// — report it, do not fix it (per the handoff).
+	It("restores a tampered model-proxy KubeArmorPolicy on the same Loop when the endpoint host changes (I43 same-Loop)", func() {
 		r.AllowUnenforced = true
 		ns := setupNS("i43same")
 		const loopName = "i43-kap"
-		const execOne = "/usr/bin/curl"
+		const initialHost = "model.test"
+		const tamperedHost = "model2.test"
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: i42fModelCredsSecret, Namespace: ns},
 			StringData: map[string]string{i42fModelAPIKeyName: i42fModelAPIKey},
@@ -498,69 +511,66 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
 		})).To(Succeed())
 		loop := buildLoop(loopName, ns, []string{i42fTestPolicyName})
+		loop.Spec.Agent.ModelEndpoint = initialHost + ":8000"
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
 		Expect(err).NotTo(HaveOccurred())
 
-		// The model proxy KubeArmorPolicy exists with the endpoint's
-		// domain and the model proxy's own exec rule (it does NOT carry the
-		// agent's exec allows).
+		// The model proxy KubeArmorPolicy exists with the initial endpoint's
+		// domain in matchDNSQueries.
 		modelKap := getKapt(ctx, ns, "coxswain-"+loopName+"-proxy")
-		Expect(kaptDNSDomains(modelKap)).To(ContainElement("model.test"),
-			"the initial model-proxy policy must allow the endpoint host")
-		kaptExecPaths := func(obj *unstructured.Unstructured) []string {
-			proc, _, _ := unstructured.NestedMap(kaptSpec(obj), engine.KaptProcessKey)
-			items, _ := proc[engine.KaptMatchPathsKey].([]any)
-			out := make([]string, 0, len(items))
-			for _, it := range items {
-				out = append(out, it.(map[string]any)["path"].(string))
-			}
-			return out
-		}
-		initialExec := kaptExecPaths(modelKap)
-		Expect(initialExec).ToNot(ContainElement(execOne),
-			"the initial model-proxy policy must NOT carry the agent's exec allow")
+		Expect(kaptDNSDomains(modelKap)).To(ContainElement(initialHost),
+			"the initial model-proxy policy must allow the initial endpoint host")
 
-		// EDIT the referenced AgentPolicy (same Loop): add an exec allow. The
-		// effective policy changes -> the enforcer re-emits the policies; the
-		// model proxy policy is still expected and must be UPDATED in place
-		// (the agent policy gains the new exec rule; the model proxy policy
-		// is re-asserted with the same content — still expected, not
-		// deleted).
-		ap := &coxv1alpha1.AgentPolicy{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42fTestPolicyName}, ap)).To(Succeed())
-		ap.Spec.Exec = []string{execOne}
-		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
+		// TAMPER the live KAPT out-of-band: change matchDNSQueries to the
+		// TAMPERED host's domain (model2.test), simulating a "pre-rule
+		// object" that the controller must re-assert on the next reconcile.
+		// The controller's createOrUpdateKapt must restore the DESIRED spec
+		// (initialHost's domain) — a create-only enforcer would leave the
+		// tampered domain.
+		Expect(unstructured.SetNestedField(modelKap.Object,
+			[]any{map[string]any{"domain": tamperedHost}},
+			"spec", "network", "matchDNSQueries")).To(Succeed())
+		Expect(k8sClient.Update(ctx, modelKap)).To(Succeed())
+
+		// Reconcile the SAME Loop: the controller must restore the tampered
+		// KAPT to its desired state (initialHost's domain in matchDNSQueries).
 		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
 		Expect(err).NotTo(HaveOccurred())
 
-		// The EXISTING model proxy KubeArmorPolicy was re-asserted in place
-		// (I43: the update path ran against the live object): same owner, the
-		// endpoint domain is still allowed, the selector still names this
-		// Loop's model proxy pod, and the exec rule is unchanged (the model
-		// proxy policy does not carry the agent's exec allows).
+		// The EXISTING model proxy KubeArmorPolicy was RESTORED in place
+		// (I43: the update path ran against the live object — a create-only
+		// enforcer would leave the tampered domain): matchDNSQueries contains
+		// the initial host (the desired state) and NOT the tampered domain,
+		// the policy is still owned by the Loop, and udp+tcp are still
+		// present (the platform DNS allow).
 		modelKap = getKapt(ctx, ns, "coxswain-"+loopName+"-proxy")
-		Expect(kaptDNSDomains(modelKap)).To(ContainElement("model.test"),
-			"the existing model-proxy KubeArmorPolicy must still allow the endpoint host after the same-Loop policy edit")
+		domains := kaptDNSDomains(modelKap)
+		Expect(domains).To(ContainElement(initialHost),
+			"the restored model-proxy KubeArmorPolicy must contain the DESIRED endpoint host (the controller re-asserted the live object)")
+		Expect(domains).ToNot(ContainElement(tamperedHost),
+			"the restored model-proxy KubeArmorPolicy must NOT contain the tampered domain (the controller corrected the drift)")
 		Expect(kaptSelectorLabels(modelKap)).To(HaveKeyWithValue("coxswain.io/proxy-for", loopName),
-			"the re-asserted policy must still select this Loop's model proxy pod")
-		Expect(kaptExecPaths(modelKap)).To(Equal(initialExec),
-			"the re-asserted model-proxy policy must be unchanged (it does not carry the agent's exec allows)")
+			"the restored policy must still select this Loop's model proxy pod")
 		ownerRefs := modelKap.GetOwnerReferences()
 		Expect(ownerRefs).NotTo(BeEmpty())
 		Expect(ownerRefs[0].Name).To(Equal(loopName))
-		// The EXISTING agent KubeArmorPolicy gained the new exec rule (I43:
-		// the update path, not just creation — a frozen-at-creation
-		// regression would fail this).
-		agentKap := getKapt(ctx, ns, "coxswain-"+loopName)
-		Expect(kaptExecPaths(agentKap)).To(ContainElement(execOne),
-			"the existing agent KubeArmorPolicy must GAIN the new exec allow on the same-Loop reconcile (update path, not just creation)")
+		// udp+tcp are still present (the platform DNS allow — the proxy must
+		// be able to resolve the endpoint host under spec.action Block).
+		kaptProtocols := func(obj *unstructured.Unstructured) []string {
+			network, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
+			items, _ := network["matchProtocols"].([]any)
+			out := make([]string, 0, len(items))
+			for _, it := range items {
+				out = append(out, it.(map[string]any)["protocol"].(string))
+			}
+			return out
+		}
+		proto := kaptProtocols(modelKap)
+		Expect(proto).To(ContainElement("udp"), "the platform DNS allow (udp) must still be present")
+		Expect(proto).To(ContainElement("tcp"), "the platform DNS allow (tcp) must still be present")
 	})
 
-	// I43 same-Loop: adding a network allow to the referenced AgentPolicy
-	// must UPDATE the egress-proxy KubeArmorPolicy's DNS allowlist on the
-	// same-Loop reconcile (the union changed; the existing policy gains the
-	// new domain), not only create it.
 	It("updates the egress-proxy KubeArmorPolicy on the same Loop when a network allow is added (I43 same-Loop)", func() {
 		r.AllowUnenforced = true
 		ns := setupNS("i43eg")

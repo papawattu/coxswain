@@ -92,22 +92,19 @@ var _ = BeforeSuite(func() {
 			filepath.Join("..", "..", "config", "crd", "external"),
 		},
 		ErrorIfCRDPathMissing: true,
-		// I45: explicitly enable the ValidatingAdmissionPolicy admission
-		// plugin on the envtest apiserver. On Kubernetes 1.34 the plugin is in
-		// the default-enabled list, but stating it explicitly makes the test
-		// self-documenting: if a future k8s version removes it from defaults
-		// (or the plugin is disabled another way) this line is where to look.
-		// NOTE: in practice the envtest apiserver does NOT run this plugin by
-		// default (it is not in the default-enabled list for the envtest
-		// binary), so this flag is required for the I45 spec to work.
 		ControlPlane: envtest.ControlPlane{
-			APIServer: &envtest.APIServer{
-				Args: []string{
-					"--enable-admission-plugins=ValidatingAdmissionPolicy",
-				},
-			},
+			APIServer: &envtest.APIServer{},
 		},
 	}
+	// I45: enable the ValidatingAdmissionPolicy admission plugin on the envtest
+	// apiserver. The envtest apiserver does NOT run this plugin by default, so
+	// without it the I45 ValidatingAdmissionPolicy + binding are not enforced
+	// and the denied specs would (wrongly) pass. Args is deprecated, so the
+	// flag is appended via the supported Configure() hook after the
+	// Environment struct is built.
+	testEnv.ControlPlane.APIServer.Configure().Append(
+		"--enable-admission-plugins=ValidatingAdmissionPolicy",
+	)
 
 	// Retrieve the first found binary directory to allow running tests from IDEs
 	if getFirstFoundEnvTestBinaryDir() != "" {

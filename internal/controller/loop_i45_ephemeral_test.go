@@ -172,7 +172,7 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 					EphemeralContainerCommon: corev1.EphemeralContainerCommon{
 						Name:    "dbg",
 						Image:   "busybox:1.36",
-						Command: []string{"sh", "-c", "true"},
+						Command: []string{"sh", "-c", unstructuredTrue},
 					},
 				}},
 			},
@@ -207,10 +207,9 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 	}
 
 	for _, c := range components {
-		c := c
 		It("denies an ephemeral container on a pod labelled component="+c.value, func() {
 			pod := newPod(c.value)
-			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: ptrInt64(0)}) })
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: new(int64)}) })
 			// A freshly-applied VAP takes a moment to become active in the API
 			// server. Poll until the update is DENIED (a labelled component pod
 			// must stay denied — so retrying on a transient allow is safe: it
@@ -227,12 +226,12 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 
 	It("allows an ephemeral container on an unlabelled pod", func() {
 		pod := newPod("")
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: ptrInt64(0)}) })
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod, &client.DeleteOptions{GracePeriodSeconds: new(int64)}) })
 		// First confirm the policy is actually ACTIVE (a labelled pod is denied)
 		// so we are not asserting "allowed" merely because the VAP has not
 		// loaded yet. Then assert the unlabelled pod stays allowed.
 		labelled := newPod(policy.ComponentAgentLabel)
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, labelled, &client.DeleteOptions{GracePeriodSeconds: ptrInt64(0)}) })
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, labelled, &client.DeleteOptions{GracePeriodSeconds: new(int64)}) })
 		Eventually(func() bool { return !addEphemeral(labelled) }, "15s", "500ms").Should(BeTrue(),
 			"a labelled component pod must be denied before the unlabelled assertion")
 		var allowed bool
@@ -244,8 +243,6 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 	})
 })
 
-func ptrInt64(v int64) *int64 { return &v }
-
 // dryRunAllUpdate is a SubResourceUpdateOption that sets DryRun=All and the
 // subresource body (the ephemeral-container-bearing pod spec) in one option.
 type dryRunAllUpdate struct {
@@ -253,6 +250,6 @@ type dryRunAllUpdate struct {
 }
 
 func (o dryRunAllUpdate) ApplyToSubResourceUpdate(dst *client.SubResourceUpdateOptions) {
-	dst.UpdateOptions.DryRun = []string{"All"}
+	dst.DryRun = []string{"All"}
 	dst.SubResourceBody = o.SubResourceBody
 }

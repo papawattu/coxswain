@@ -1,0 +1,5 @@
+# [I45] ValidatingAdmissionPolicy + binding: deny ephemeral containers
+# (kubectl debug) on coxswain component pods. KubeArmor does not police
+# ephemeral containers, so this admission gate closes the escape hatch.
+resources:
+- validating_admission_policy.yaml

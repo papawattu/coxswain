@@ -70,7 +70,7 @@ func loadVAPSpec(t *testing.T) vapSpec {
 	}
 	// The file is multi-doc (ValidatingAdmissionPolicy + its binding).
 	// Split on the document separator and parse each doc individually.
-	for _, doc := range strings.Split(string(data), "\n---") {
+	for doc := range strings.SplitSeq(string(data), "\n---") {
 		var m struct {
 			Kind string  `yaml:"kind"`
 			Spec vapSpec `yaml:"spec"`

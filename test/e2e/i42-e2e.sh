@@ -35,9 +35,11 @@
 #   L1  on kindnet the apiserver/kubelet HOST-NETWORK endpoints are reachable
 #       from the agent pod (D38 / R16); only pod-IP and external-IP egress is
 #       policed by the NetworkPolicy.
-#   L2  ephemeral kubectl debug containers are not policed by KubeArmor, so
-#       the exec block is proven on a dedicated throwaway pod with the
-#       egress-proxy labels, not via an ephemeral container.
+#   L2  KubeArmor does not police ephemeral kubectl debug containers, so
+#       check 11 asserts the admission-policy DENY on a real egress-proxy pod
+#       (I45) instead of relying on the fence; check 10's exec block still uses
+#       a dedicated throwaway pod carrying the egress-proxy labels because
+#       KubeArmor DOES police normal (non-ephemeral) exec.
 #
 # House rules honored: KubeArmor is NEVER restarted; no rm -rf (temp files are
 # left in place); no python heredocs inside kubectl exec sh -c (probe scripts
@@ -685,6 +687,32 @@ EOF
 fi
 
 # ===========================================================================
+# CHECK 11 (I45): a kubectl debug (ephemeral container) on the egress-proxy
+#           pod is DENIED by the ValidatingAdmissionPolicy, not just
+#           un-policed. This is the real I45 check: adding an ephemeral
+#           container to a coxswain component pod shares its network namespace
+#           OUTSIDE the KubeArmor fence, so it is denied at admission.
+# ===========================================================================
+
+echo
+echo "--- CHECK 11: kubectl debug (ephemeral container) on the egress-proxy pod is DENIED (I45) ---"
+# Confirm the admission policy + binding are present in the cluster.
+if K get validatingadmissionpolicy coxswain-deny-ephemeral-containers >/dev/null 2>&1 \
+   && K get validatingadmissionpolicybinding coxswain-deny-ephemeral-containers >/dev/null 2>&1; then
+  echo "   ValidatingAdmissionPolicy + binding present"
+  # kubectl debug issues a pods/ephemeralcontainers UPDATE (subresource patch).
+  DEBUG_OUT=$(K -n "$NS" debug -q "$EGRESS_POD" --image="$BUSYBOX_IMG" -- sh -c 'true' 2>&1 || true)
+  echo "   kubectl debug on $EGRESS_POD output: $DEBUG_OUT"
+  if echo "$DEBUG_OUT" | grep -qi "denied\|ephemeral containers.*denied\|adding ephemeral"; then
+    ok "kubectl debug (ephemeral container) on the egress-proxy pod was DENIED by the ValidatingAdmissionPolicy"
+  else
+    bad "kubectl debug (ephemeral container) on the egress-proxy pod was NOT denied (VAP not in effect)"
+  fi
+else
+  bad "ValidatingAdmissionPolicy/binding coxswain-deny-ephemeral-containers not found in the cluster (I45)"
+fi
+
+# ===========================================================================
 # KNOWN LIMITATIONS (printed, not passed)
 # ===========================================================================
 echo
@@ -694,9 +722,12 @@ echo "  L1 (D38 / R16): on kindnet the apiserver/kubelet HOST-NETWORK endpoints"
 echo "     (kube-apiserver svc 10.96.0.1:443, node :6443/:10250) ARE reachable from"
 echo "     the agent pod; the agent NetworkPolicy polices pod-IP + external-IP egress,"
 echo "     not pod->host-network. Check 5 targets a POD IP, which IS blocked."
-echo "  L2: ephemeral kubectl debug containers are NOT policed by KubeArmor, so"
-echo "     check 10 proves the exec block on a dedicated throwaway busybox pod"
-echo "     carrying the egress-proxy labels, not via an ephemeral container."
+echo "  L2 (R16 I45): KubeArmor itself does NOT police ephemeral kubectl debug"
+echo "     containers — that is why check 11 asserts the admission-policy DENY on"
+echo "     a real component pod rather than relying on the fence. The exec block in"
+echo "     check 10 still uses a dedicated throwaway busybox pod carrying the"
+echo "     egress-proxy labels, because KubeArmor does police normal (non-ephemeral)"
+echo "     exec."
 echo "============================================================"
 
 echo

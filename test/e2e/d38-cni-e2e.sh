@@ -207,28 +207,40 @@ echo "   disallowed external IP for check 5: $GH_IP (github.com)"
 # endpoint means the connect was dropped/refused/timed out. Using the connect
 # layer (not the HTTP response code) avoids the ambiguity where a reachable
 # apiserver with a cert-name mismatch returns curl exit 60 / HTTP 000.
-cat > "$TMPDIR/probe.sh" <<'PROBE_EOF'
+# The one probe. It runs INSIDE the real agent pod (golang:1.26 ships
+# python3). Each endpoint is tested with a raw TCP socket connect - the
+# exact layer the CNI polices. A successful connect means the CNI let the
+# egress through (REACHABLE); a timeout / connection-refused means the CNI
+# dropped it (BLOCKED). Unlike curl, a dropped connection is unambiguous:
+# curl can report a blocked connect as exit 56 (empty reply) which looks
+# like a successful-but-empty HTTP exchange, or a reachable-but-mismatched
+# TLS handshake as exit 60 - neither is a reliable blocked/allowed signal.
+# We write the python probe and a thin sh launcher (the rest of this suite
+# expects `sh /tmp/d38-probe.sh`), passing the IPs in via the environment.
+cat > "$TMPDIR/probe.py" <<'PYEOF'
+import os, socket
+def probe(label, host, port, timeout=4):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        print("RESULT %s REACHABLE" % label)
+    except Exception as exc:
+        print("RESULT %s BLOCKED(%s)" % (label, type(exc).__name__))
+    finally:
+        s.close()
+probe("APISERVER_SVC",  os.environ["APISERVER_SVC_IP"], 443)
+probe("APISERVER_NODE", os.environ["NODE_IP"], 6443)
+probe("KUBELET_NODE",   os.environ["NODE_IP"], 10250)
+probe("INTERNAL_POD",   os.environ["TEST_IP"], 8080)
+probe("EXTERNAL",       os.environ["GH_IP"], 443)
+PYEOF
+cat > "$TMPDIR/probe.sh" <<EOF
 #!/bin/sh
-# tcp_probe <label> <host> <port>
-tcp_probe() {
-  ec=$(curl -s -o /dev/null --connect-timeout 3 --max-time 5 "http://$2:$3/" 2>/dev/null)
-  ec=$?
-  if [ "$ec" = "0" ]; then
-    echo "RESULT $1 REACHABLE"
-  else
-    echo "RESULT $1 BLOCKED(curl_exit=$ec)"
-  fi
-}
-tcp_probe APISERVER_SVC   __APISERVER_SVC_IP__ 443
-tcp_probe APISERVER_NODE  __NODE_IP__ 6443
-tcp_probe KUBELET_NODE    __NODE_IP__ 10250
-tcp_probe INTERNAL_POD    __TEST_IP__ 8080
-tcp_probe EXTERNAL        __GH_IP__ 443
-PROBE_EOF
-# Substitute the real IPs (the heredoc above is single-quoted so the values
-# are inserted here, not at write time).
-sed -i   -e "s/__APISERVER_SVC_IP__/${APISERVER_SVC_IP}/"   -e "s/__NODE_IP__/${NODE_IP}/g"   -e "s/__TEST_IP__/${TEST_IP}/"   -e "s/__GH_IP__/${GH_IP}/" \
-  "$TMPDIR/probe.sh"
+export APISERVER_SVC_IP=${APISERVER_SVC_IP} NODE_IP=${NODE_IP} TEST_IP=${TEST_IP} GH_IP=${GH_IP}
+exec python3 /tmp/d38-probe.py
+EOF
+K -n "$NS" cp "$TMPDIR/probe.py" "$AGENT_POD:/tmp/d38-probe.py" 2>/dev/null || { echo "FATAL: kubectl cp probe.py failed"; exit 2; }
 K -n "$NS" cp "$TMPDIR/probe.sh" "$AGENT_POD:/tmp/d38-probe.sh" 2>/dev/null || { echo "FATAL: kubectl cp probe.sh failed"; exit 2; }
 
 # ===========================================================================
@@ -243,23 +255,16 @@ blocked_line() { # $1 = label
   echo "$PROBE_OUT" | grep "^RESULT $1 " || echo "RESULT $1 MISSING"
 }
 assert_blocked() { # $1 = label, $2 = human description
+  # The probe emits either "RESULT <label> REACHABLE" (the TCP connect
+  # succeeded — the CNI let the egress through = a FAIL) or
+  # "RESULT <label> BLOCKED(curl_exit=<n>)" (the connect was dropped/refused/
+  # timed out — the CNI blocked it = a PASS).
   line=$(blocked_line "$1")
   case "$line" in
     *"MISSING"*) bad "$2: probe line missing from output" ;;
-    *"HTTP_CODE="*)
-      code=$(echo "$line" | grep -o 'HTTP_CODE=[0-9]*' | cut -d= -f2)
-      # curl with -w "%{http_code}" prints "000" whenever it did NOT complete
-      # a request: connection refused (exit 7), timeout (28), DNS failure (6),
-      # TLS error (60), or a TCP RST from a firewall DROP. All of these mean
-      # the endpoint was NOT reachable, so 000 counts as blocked. A real HTTP
-      # response (100-599) means the CNI failed to block the egress.
-      if [ "$code" = "000" ]; then
-        ok "$2 (endpoint unreachable)"
-      else
-        bad "$2: REACHABLE (HTTP $code) — the enforcing CNI failed to block it"
-      fi
-      ;;
-    *) ok "$2 (blocked: $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'))" ;;
+    *"REACHABLE"*) bad "$2: REACHABLE — the enforcing CNI failed to block it" ;;
+    *"BLOCKED"*) ok "$2 (blocked: $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'))" ;;
+    *) bad "$2: unrecognised probe result: $line" ;;
   esac
 }
 echo "  (C1) apiserver service IP $APISERVER_SVC_IP:443"

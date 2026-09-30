@@ -148,6 +148,10 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
 	}
+	@INOT_INST=$$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)
+	@INOT_WATCH=$$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null || echo 0)
+	@echo "   preflight: fs.inotify.max_user_instances=$$INOT_INST (need >=512)  fs.inotify.max_user_watches=$$INOT_WATCH (need >=524288)"
+	@[ "$$INOT_INST" -ge 512 ] && [ "$$INOT_WATCH" -ge 524288 ] || { echo "FATAL: host fs.inotify limits too low for a second kind cluster (instances=$$INOT_INST, watches=$$INOT_WATCH). Run: sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=524288 (persist in /etc/sysctl.d/99-kind-inotify.conf)"; exit 1; }
 	@echo "=== D38 enforcing-CNI profile: cluster $(CALICO_CLUSTER), Calico $(CALICO_VERSION), pool $(CALICO_IP_POOL) ==="
 	@echo "NOTE: KubeArmor is deliberately NOT installed on $(CALICO_CLUSTER) (ADR-0007 F2: a second BPF-LSM agent on this host's kernel risks wedging the BPF subsystem; coxswain-dev already carries the BPF-LSM load). coxswain-dev is never touched."
 	@case "$$($(KIND) get clusters)" in \
@@ -175,18 +179,19 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 	done
 	@kubectl --context kind-$(CALICO_CLUSTER) -n kube-system get pod -l k8s-app=calico-node || { echo "FATAL: calico-node not Ready after 150s"; exit 1; }
 	@echo "Creating the Calico IP pool with CIDR $(CALICO_IP_POOL) (matches config/dev POD_CIDR so the dev overlay\'s carve-outs stay correct)..."
-	@echo "   applying: name=coxswain-pool cidr=$(CALICO_IP_POOL) blockSize=26 encapsulation=IPIP natOutgoing=true"
-	@kubectl --context kind-$(CALICO_CLUSTER) apply -f - <<'YAML'
-apiVersion: projectcalico.org/v3
-kind: IPPool
-metadata:
-  name: coxswain-pool
-spec:
-  cidr: $(CALICO_IP_POOL)
-  blockSize: 26
-  encapsulation: IPIP
-  natOutgoing: true
-		YAML
+	@CALICO_POOL_YAML=$$(mktemp);
+	@printf '%%s\n' \
+		"apiVersion: projectcalico.org/v3" \
+		"kind: IPPool" \
+		"metadata:" \
+		"  name: coxswain-pool" \
+		"spec:" \
+		"  cidr: $(CALICO_IP_POOL)" \
+		"  blockSize: 26" \
+		"  encapsulation: IPIP" \
+		"  natOutgoing: true" > "$$CALICO_POOL_YAML"
+	@kubectl --context kind-$(CALICO_CLUSTER) apply -f "$$CALICO_POOL_YAML"
+	@rm -f "$$CALICO_POOL_YAML"
 	@echo "Installing agent-sandbox $(AGENT_SANDBOX_VERSION) from the release manifest..."
 	@curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
 	@echo "Waiting for the agent-sandbox controller to be ready..."

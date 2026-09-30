@@ -1,0 +1,29 @@
+# D38 (R16): a second kind cluster profile with an ENFORCING CNI (Calico).
+#
+# Why: kind's default CNI (kindnet) does not police pod -> host-network
+# egress, so on coxswain-dev the agent pod can reach the apiserver/kubelet
+# via host-network destinations even though its allowlist NetworkPolicy
+# blocks pod-IP and external-IP egress (docs/REVIEW-PHASE1-R16.md, D38).
+# This profile exists so that gap is actually TESTED (make d38-cni-e2e), not
+# just documented.
+#
+# - networking.disableDefaultCNI: true  -> kindnet is NOT installed; Calico
+#   becomes the only CNI, so every pod (including kube-proxy's eBPF-less
+#   iptables rules) flows through it.
+# - The Calico IP pool is created by test/e2e/d38-cni-e2e.sh with CIDR
+#   10.244.0.0/16 to match config/dev's POD_CIDR (kind's own default is
+#   also 10.244.0.0/16); kind's default service CIDR 10.96.0.0/12 is left
+#   as-is, so the dev overlay's CIDRs still match.
+#
+# Everything in this profile is pinned; the only host-level requirement is
+# the same kindest/node image the dev cluster uses (see the Makefile's
+# KIND_NODE_IMAGE). This cluster NEVER runs KubeArmor (ADR-0007 F2: a
+# second BPF-LSM agent on the host's kernel risks wedging the BPF
+# subsystem; coxswain-dev already carries the BPF-LSM load).
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+nodes:
+  - role: control-plane

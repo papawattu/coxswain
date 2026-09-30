@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/coxswain.wattu.com_loops.yaml
+- bases/coxswain.wattu.com_agentpolicies.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

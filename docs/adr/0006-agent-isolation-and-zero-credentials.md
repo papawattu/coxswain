@@ -146,6 +146,24 @@ Per the review, two choices were the owner's. Status at round 8:
   credential boundary (CONTEXT.md budgets/metering notes updated).
 - The `spec.agent` CRD fields and the `coxswain-agent-defaults` ConfigMap are
   new Phase 1 surfaces (the README sample gets an `agent:` block).
+- **CNI requirement (D38, round 16):** the item-3 NetworkPolicy is an
+  allowlist, but a NetworkPolicy spec leaves host-network destinations to the
+  CNI's implementation. kind's default CNI (kindnet) does **not** police
+  pod → host-network egress: on `kind-coxswain-dev` the agent pod can reach
+  the apiserver service IP (10.96.0.1:443), the node's :6443, and the
+  kubelet's :10250, while pod-IP and external-IP egress is denied (review
+  docs/REVIEW-PHASE1-R16.md, D38). The mitigations above (no token mounted,
+  403 for anonymous requests, 401 on the kubelet) make the residual
+  attack surface credential-gated, but the design assumed the control plane
+  was unreachable. Consequence: **kindnet is dev-only, and a production
+  cluster must run a CNI that enforces NetworkPolicy egress against
+  host-network and node destinations — Calico or Cilium** (both do). This is
+  stated in the README Security section, and it is tested, not just
+  documented: `make kind-calico-up` builds a second kind cluster whose CNI
+  is Calico (kindnet disabled), and `make d38-cni-e2e` asserts the
+  apiserver/kubelet endpoints are blocked from an agent-labelled pod on it
+  (a second BPF-LSM agent is deliberately NOT installed there — ADR-0007 F2;
+  the KubeArmor-dependent checks are printed as SKIPPED).
 - **Agent image stand-in (I37, round 10):** when `spec.agent.image` is omitted the
   sandbox runs `docker.io/library/golang:1.26` + `sleep infinity` as a Phase 0
   stand-in. It is hardened (zero credentials, no token automount, read-only

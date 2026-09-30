@@ -120,6 +120,21 @@ to a fenced pod would escape the fence and share its network namespace.
 See [docs/TDD-PLAN-PHASE1.md](docs/TDD-PLAN-PHASE1.md) §RBAC guidance for the
 full rationale.
 
+**CNI requirement (production):** the agent's allowlist NetworkPolicy leaves
+host-network destinations to the CNI's implementation, and not every CNI
+polices pod → host-network egress. **kindnet (kind's default CNI) does not**
+— on kindnet the agent pod can reach the apiserver service IP (10.96.0.1:443),
+the node's :6443, and the kubelet's :10250 even though pod-IP and external-IP
+egress is denied (docs/REVIEW-PHASE1-R16.md, D38; also the known-limitation
+line L1 printed by `make i42-e2e`). kindnet is therefore **dev-only**: it
+hides the control plane behind authentication (no token is mounted into the
+agent) rather than blocking it. **Production clusters must run a CNI that
+enforces NetworkPolicy egress against host-network and node destinations —
+Calico or Cilium** (see [docs/adr/0006-agent-isolation-and-zero-credentials.md](docs/adr/0006-agent-isolation-and-zero-credentials.md)).
+The property is tested, not just documented: `make kind-calico-up` +
+`make d38-cni-e2e` run the blocked-endpoint checks for real on a second kind
+cluster whose Calico CNI enforces them.
+
 ## Development
 
 ```sh

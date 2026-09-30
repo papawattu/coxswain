@@ -41,6 +41,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1764,6 +1765,13 @@ func foreignKaptPolicies(ctx context.Context, r *LoopReconciler, loop *coxv1alph
 		obj.SetGroupVersionKind(engine.KubeArmorGVK)
 		err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, obj)
 		if apierrors.IsNotFound(err) {
+			continue
+		}
+		// KubeArmor CRD absent: not a conflict only under --allow-unenforced
+		// (D38). In production a missing KubeArmor CRD is a real read error
+		// that fails closed (holds Suspended) so a misinstall does not
+		// silently disable the inner fence (reviewer P1 on b25f77e).
+		if meta.IsNoMatchError(err) && r.AllowUnenforced {
 			continue
 		}
 		if err != nil {

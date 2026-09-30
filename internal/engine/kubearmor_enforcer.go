@@ -7,6 +7,7 @@ import (
 	"github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -113,6 +114,11 @@ func (e *KubeArmorEnforcer) cleanupEgressProxyKapt(ctx context.Context, loop *v1
 	if errors.IsNotFound(err) {
 		return nil
 	}
+	// KubeArmor CRD absent (D38 enforcing-CNI cluster, no KubeArmor —
+	// ADR-0007 F2): nothing to clean up.
+	if meta.IsNoMatchError(err) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("get egress proxy KubeArmorPolicy: %w", err)
 	}
@@ -133,6 +139,11 @@ func (e *KubeArmorEnforcer) cleanupModelProxyKapt(ctx context.Context, loop *v1a
 	obj.SetGroupVersionKind(kaptGroupVersion.WithKind(kaptKind))
 	err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: "coxswain-" + loop.Name + "-proxy"}, obj)
 	if errors.IsNotFound(err) {
+		return nil
+	}
+	// KubeArmor CRD absent (D38 enforcing-CNI cluster, no KubeArmor —
+	// ADR-0007 F2): nothing to clean up.
+	if meta.IsNoMatchError(err) {
 		return nil
 	}
 	if err != nil {
@@ -170,8 +181,22 @@ func (e *KubeArmorEnforcer) createOrUpdateKapt(ctx context.Context, loop *v1alph
 			return fmt.Errorf("set owner ref on KubeArmorPolicy %s: %w", obj.GetName(), err)
 		}
 		if err := e.Client.Create(ctx, obj); err != nil {
+			// The KubeArmor CRD is absent (e.g. the D38 enforcing-CNI kind
+			// cluster deliberately has no KubeArmor — ADR-0007 F2). A failed
+			// create with no CRD is a no-op, not an error: the sandbox is
+			// still created and the CNI polices the egress (the KubeArmor
+			// fence is an extra defence-in-depth layer, absent here).
+			if meta.IsNoMatchError(err) {
+				return nil
+			}
 			return fmt.Errorf("create KubeArmorPolicy %s: %w", obj.GetName(), err)
 		}
+	case meta.IsNoMatchError(err):
+		// The KubeArmor CRD is not installed on this cluster (the D38
+		// enforcing-CNI kind cluster deliberately runs no KubeArmor —
+		// ADR-0007 F2). Treat the absent CRD as a no-op: the sandbox is
+		// still created and the enforcing CNI (Calico) polices the egress.
+		return nil
 	case err != nil:
 		return fmt.Errorf("get KubeArmorPolicy %s: %w", obj.GetName(), err)
 	default:

@@ -41,6 +41,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1764,6 +1765,12 @@ func foreignKaptPolicies(ctx context.Context, r *LoopReconciler, loop *coxv1alph
 		obj.SetGroupVersionKind(engine.KubeArmorGVK)
 		err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, obj)
 		if apierrors.IsNotFound(err) {
+			continue
+		}
+		// The KubeArmor CRD is absent (the D38 enforcing-CNI kind cluster
+		// runs no KubeArmor — ADR-0007 F2): not a conflict, so the sandbox
+		// is not held Suspended. Only a real read error fails closed.
+		if meta.IsNoMatchError(err) {
 			continue
 		}
 		if err != nil {

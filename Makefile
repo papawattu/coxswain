@@ -148,20 +148,16 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
 	}
-	@INOT_INST=$$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)
-	@INOT_WATCH=$$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null || echo 0)
-	@echo "   preflight: fs.inotify.max_user_instances=$$INOT_INST (need >=512)  fs.inotify.max_user_watches=$$INOT_WATCH (need >=524288)"
-	@[ "$$INOT_INST" -ge 512 ] && [ "$$INOT_WATCH" -ge 524288 ] || { echo "FATAL: host fs.inotify limits too low for a second kind cluster (instances=$$INOT_INST, watches=$$INOT_WATCH). Run: sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=524288 (persist in /etc/sysctl.d/99-kind-inotify.conf)"; exit 1; }
+	@INOT_INST=$$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0); INOT_WATCH=$$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null || echo 0); echo "   preflight: fs.inotify.max_user_instances=$$INOT_INST (need >=512)  fs.inotify.max_user_watches=$$INOT_WATCH (need >=524288)"; [ "$$INOT_INST" -ge 512 ] && [ "$$INOT_WATCH" -ge 524288 ] || { echo "FATAL: host fs.inotify limits too low for a second kind cluster (instances=$$INOT_INST, watches=$$INOT_WATCH). Run: sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=524288 (persist in /etc/sysctl.d/99-kind-inotify.conf)"; exit 1; }
 	@echo "=== D38 enforcing-CNI profile: cluster $(CALICO_CLUSTER), Calico $(CALICO_VERSION), pool $(CALICO_IP_POOL) ==="
 	@echo "NOTE: KubeArmor is deliberately NOT installed on $(CALICO_CLUSTER) (ADR-0007 F2: a second BPF-LSM agent on this host's kernel risks wedging the BPF subsystem; coxswain-dev already carries the BPF-LSM load). coxswain-dev is never touched."
-	@case "$$($(KIND) get clusters)" in \
-		*"$(CALICO_CLUSTER)*") \
-			echo "Kind cluster '$(CALICO_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
+	@if $(KIND) get clusters | grep -qxF "$(CALICO_CLUSTER)"; then \
+		echo "Kind cluster '$(CALICO_CLUSTER)' already exists. Skipping creation."; \
+		else \
 			echo "Creating Kind cluster '$(CALICO_CLUSTER)' on $(KIND_NODE_IMAGE) with hack/kind-calico.yaml (kindnet disabled)..."; \
 			$(KIND) create cluster --name $(CALICO_CLUSTER) --image $(KIND_NODE_IMAGE) --config hack/kind-calico.yaml || \
-			{ echo "FATAL: cluster creation failed (partial state left; delete with: kind delete cluster --name $(CALICO_CLUSTER))"; exit 1; } ;; \
-		esac
+			{ echo "FATAL: cluster creation failed (partial state left; delete with: kind delete cluster --name $(CALICO_CLUSTER))"; exit 1; }; \
+		fi
 	@CTX=kind-$(CALICO_CLUSTER); \
 		if kubectl --context $$CTX get nodes >/dev/null 2>&1; then \
 			KINDNET=$$(kubectl --context $$CTX -n kube-system get pod -l k8s-app=kindnet --no-headers 2>/dev/null | wc -l | tr -d ' '); \
@@ -178,13 +174,24 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		sleep 5; \
 	done
 	@kubectl --context kind-$(CALICO_CLUSTER) -n kube-system get pod -l k8s-app=calico-node || { echo "FATAL: calico-node not Ready after 150s"; exit 1; }
-	@echo "Creating the Calico IP pool with CIDR $(CALICO_IP_POOL) (matches config/dev POD_CIDR so the dev overlay\'s carve-outs stay correct)..."
-	@{ printf 'apiVersion: projectcalico.org/v3\n'; printf 'kind: IPPool\n'; printf 'metadata:\n'; printf '  name: coxswain-pool\n'; printf 'spec:\n'; printf '  cidr: $(CALICO_IP_POOL)\n'; printf '  blockSize: 26\n'; printf '  encapsulation: IPIP\n'; printf '  natOutgoing: true\n'; } | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
+	@echo "Verifying the Calico IP pool CIDR matches config/dev POD_CIDR ($(CALICO_IP_POOL))..."
+	@POOL_CIDR=$$(kubectl --context kind-$(CALICO_CLUSTER) get ippool -o json 2>/dev/null | python3 -c "import sys,yaml,json; d=json.load(sys.stdin); print(d['items'][0]['spec']['cidr'])" 2>/dev/null); \
+		echo "   default-ipv4-ippool CIDR=$$POOL_CIDR (expected prefix $(CALICO_IP_POOL))"; \
+		case "$$POOL_CIDR" in $(CALICO_IP_POOL)*) : ;; *) echo "WARNING: pool CIDR $$POOL_CIDR does not match $(CALICO_IP_POOL); the dev overlay's POD_CIDR carve-outs may not match. (Calico auto-creates default-ipv4-ippool at 10.244.0.0/16 by default, which is what config/dev expects.)";; esac
 	@echo "Installing agent-sandbox $(AGENT_SANDBOX_VERSION) from the release manifest..."
 	@curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
 	@echo "Waiting for the agent-sandbox controller to be ready..."
 	@kubectl --context kind-$(CALICO_CLUSTER) rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=180s
 	@echo "Deploying the operator (dev overlay: --allow-unenforced) on $(CALICO_CLUSTER)..."
+	@echo "   Building the controller image coxswain-controller:d38 and the egress/proxy stand-ins..."
+	@$(CONTAINER_TOOL) build -t coxswain-controller:d38 -f Dockerfile . || { echo "FATAL: controller docker-build failed"; exit 1; }
+	@$(MAKE) egress-proxy-build
+	@$(MAKE) proxy-build
+	@echo "   Loading images into the kind node $(CALICO_CLUSTER)..."
+	@for img in coxswain-controller:d38 $(EGRESS_IMG) $(PROXY_IMG) golang:1.26 busybox:1.36; do \
+		echo "     kind load: $$img"; \
+		$(KIND) load docker-image "$$img" --name $(CALICO_CLUSTER) || { echo "FATAL: kind load $$img failed"; exit 1; }; \
+	done
 	@CTX=kind-$(CALICO_CLUSTER); \
 		$(MAKE) kustomize >/dev/null 2>&1; \
 		TMP_OVERLAY=$$(mktemp -d); \
@@ -192,7 +199,7 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		(cd "$$TMP_OVERLAY/config/manager" && "$(LOCALBIN)/kustomize" edit set image controller=coxswain-controller:d38); \
 		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/dev | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }
 	@rm -rf "$${TMP_OVERLAY:-}"
-	@echo "kind-calico-up complete (cluster ready; make d38-cni-e2e builds/loads its own images and redeploys the operator from the current commit)."
+	@echo "kind-calico-up complete (cluster ready, images loaded; make d38-cni-e2e runs the assertions)."
 
 
 .PHONY: kind-up

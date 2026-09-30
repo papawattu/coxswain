@@ -226,6 +226,9 @@ func main() {
 		ProxyFQDN:       controller.ProxyServiceFQDN,
 		EgressProxyFQDN: controller.EgressProxyServiceFQDN,
 		ClusterDomain:   clusterDomain,
+		// A missing KubeArmor CRD is a loud error in production; tolerated
+		// (no-op) only under the --allow-unenforced dev escape hatch (D38).
+		AllowUnenforced: allowUnenforced,
 	}
 	if err := (&controller.LoopReconciler{
 		Client:          mgr.GetClient(),

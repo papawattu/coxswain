@@ -49,6 +49,13 @@ type KubeArmorEnforcer struct {
 	// policy.DefaultClusterDomain when empty) used by the model-proxy policy's
 	// bare-host FQDN expansion (R16 I44 item 2). Set at construction.
 	ClusterDomain string
+	// AllowUnenforced mirrors the manager's --allow-unenforced flag (the D30
+	// dev escape hatch). When true, an ABSENT KubeArmor CRD is tolerated (the
+	// no-match is a no-op): the D38 enforcing-CNI kind cluster deliberately
+	// runs no KubeArmor (ADR-0007 F2) and the CNI polices the egress. When
+	// false (production), a missing KubeArmor CRD is a loud error, not a
+	// silent no-op — a misinstall must not silently disable the inner fence.
+	AllowUnenforced bool
 }
 
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective
@@ -114,9 +121,10 @@ func (e *KubeArmorEnforcer) cleanupEgressProxyKapt(ctx context.Context, loop *v1
 	if errors.IsNotFound(err) {
 		return nil
 	}
-	// KubeArmor CRD absent (D38 enforcing-CNI cluster, no KubeArmor —
-	// ADR-0007 F2): nothing to clean up.
-	if meta.IsNoMatchError(err) {
+	// KubeArmor CRD absent: tolerated only under the --allow-unenforced dev
+	// escape hatch (D38). In production a missing KubeArmor CRD is a loud
+	// error, not a silent no-op (reviewer P1 on b25f77e).
+	if meta.IsNoMatchError(err) && e.AllowUnenforced {
 		return nil
 	}
 	if err != nil {
@@ -141,9 +149,9 @@ func (e *KubeArmorEnforcer) cleanupModelProxyKapt(ctx context.Context, loop *v1a
 	if errors.IsNotFound(err) {
 		return nil
 	}
-	// KubeArmor CRD absent (D38 enforcing-CNI cluster, no KubeArmor —
-	// ADR-0007 F2): nothing to clean up.
-	if meta.IsNoMatchError(err) {
+	// KubeArmor CRD absent: tolerated only under --allow-unenforced (D38);
+	// a loud error in production (reviewer P1 on b25f77e).
+	if meta.IsNoMatchError(err) && e.AllowUnenforced {
 		return nil
 	}
 	if err != nil {
@@ -181,22 +189,22 @@ func (e *KubeArmorEnforcer) createOrUpdateKapt(ctx context.Context, loop *v1alph
 			return fmt.Errorf("set owner ref on KubeArmorPolicy %s: %w", obj.GetName(), err)
 		}
 		if err := e.Client.Create(ctx, obj); err != nil {
-			// The KubeArmor CRD is absent (e.g. the D38 enforcing-CNI kind
-			// cluster deliberately has no KubeArmor — ADR-0007 F2). A failed
-			// create with no CRD is a no-op, not an error: the sandbox is
-			// still created and the CNI polices the egress (the KubeArmor
-			// fence is an extra defence-in-depth layer, absent here).
-			if meta.IsNoMatchError(err) {
+			// KubeArmor CRD absent: a no-op only under --allow-unenforced
+			// (D38); a loud create error in production (reviewer P1 on
+			// b25f77e).
+			if meta.IsNoMatchError(err) && e.AllowUnenforced {
 				return nil
 			}
 			return fmt.Errorf("create KubeArmorPolicy %s: %w", obj.GetName(), err)
 		}
 	case meta.IsNoMatchError(err):
-		// The KubeArmor CRD is not installed on this cluster (the D38
-		// enforcing-CNI kind cluster deliberately runs no KubeArmor —
-		// ADR-0007 F2). Treat the absent CRD as a no-op: the sandbox is
-		// still created and the enforcing CNI (Calico) polices the egress.
-		return nil
+		// KubeArmor CRD absent: no-op only under --allow-unenforced (D38);
+		// in production the missing CRD is a loud error so a misinstall does
+		// not silently disable the inner fence (reviewer P1 on b25f77e).
+		if e.AllowUnenforced {
+			return nil
+		}
+		return fmt.Errorf("get KubeArmorPolicy %s: KubeArmor CRD not installed (and --allow-unenforced is not set): %w", obj.GetName(), err)
 	case err != nil:
 		return fmt.Errorf("get KubeArmorPolicy %s: %w", obj.GetName(), err)
 	default:

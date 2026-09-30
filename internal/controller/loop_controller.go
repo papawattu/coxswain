@@ -1767,10 +1767,11 @@ func foreignKaptPolicies(ctx context.Context, r *LoopReconciler, loop *coxv1alph
 		if apierrors.IsNotFound(err) {
 			continue
 		}
-		// The KubeArmor CRD is absent (the D38 enforcing-CNI kind cluster
-		// runs no KubeArmor — ADR-0007 F2): not a conflict, so the sandbox
-		// is not held Suspended. Only a real read error fails closed.
-		if meta.IsNoMatchError(err) {
+		// KubeArmor CRD absent: not a conflict only under --allow-unenforced
+		// (D38). In production a missing KubeArmor CRD is a real read error
+		// that fails closed (holds Suspended) so a misinstall does not
+		// silently disable the inner fence (reviewer P1 on b25f77e).
+		if meta.IsNoMatchError(err) && r.AllowUnenforced {
 			continue
 		}
 		if err != nil {

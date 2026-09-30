@@ -98,6 +98,14 @@ KIND_NODE_IMAGE ?= kindest/node:v1.34.0
 # place, and the release manifest is derived from it.
 AGENT_SANDBOX_VERSION ?= v1.0.4
 KUBEARMOR_VERSION ?= v1.7.5
+# D38: the enforcing-CNI profile. Calico is pinned; the cluster and pool
+# CIDRs must keep matching config/dev (POD_CIDR 10.244.0.0/16, service CIDR
+# 10.96.0.0/12 — kind's default, left as-is). The Calico manifest URL is
+# derived from the version, exactly like AGENT_SANDBOX_MANIFEST.
+CALICO_VERSION ?= v3.30.1
+CALICO_MANIFEST ?= https://raw.githubusercontent.com/projectcalico/calico/$(CALICO_VERSION)/manifests/calico.yaml
+CALICO_CLUSTER ?= coxswain-calico
+CALICO_IP_POOL ?= 10.244.0.0/16
 # KubeArmor install posture flags: block for file/network/capabilities (the exec
 # allowlist's block-vs-audit is gated on defaultFilePosture, NOT spec.action) +
 # process visibility (needed for the process rules to be visible/evaluated).
@@ -129,6 +137,69 @@ egress-proxy-e2e: ## Run the I42a egress proxy kind e2e (real proxy, TLS + plain
 .PHONY: i42-e2e
 i42-e2e: ## Run the full I42 acceptance kind e2e (pinned to --context kind-coxswain-dev).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/i42-e2e.sh
+
+.PHONY: d38-cni-e2e
+d38-cni-e2e: kind-calico-up ## D38: run the enforcing-CNI network e2e (pinned to --context kind-coxswain-calico).
+	@K8S_CONTEXT=kind-coxswain-calico KIND_CLUSTER_NAME=$(CALICO_CLUSTER) CALICO_IP_POOL=$(CALICO_IP_POOL) bash test/e2e/d38-cni-e2e.sh
+
+.PHONY: kind-calico-up
+kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO_VERSION) as the enforcing CNI, kindnet disabled), install agent-sandbox + the operator (dev overlay). Idempotent. NEVER installs KubeArmor here (ADR-0007 F2).
+	@command -v $(KIND) >/dev/null 2>&1 || { \
+		echo "Kind is not installed. Please install Kind manually."; \
+		exit 1; \
+	}
+	@echo "=== D38 enforcing-CNI profile: cluster $(CALICO_CLUSTER), Calico $(CALICO_VERSION), pool $(CALICO_IP_POOL) ==="
+	@echo "NOTE: KubeArmor is deliberately NOT installed on $(CALICO_CLUSTER) (ADR-0007 F2: a second BPF-LSM agent on this host's kernel risks wedging the BPF subsystem; coxswain-dev already carries the BPF-LSM load). coxswain-dev is never touched."
+	@case "$$($(KIND) get clusters)" in \
+		*"$(CALICO_CLUSTER)*") \
+			echo "Kind cluster '$(CALICO_CLUSTER)' already exists. Skipping creation." ;; \
+		*) \
+			echo "Creating Kind cluster '$(CALICO_CLUSTER)' on $(KIND_NODE_IMAGE) with hack/kind-calico.yaml (kindnet disabled)..."; \
+			$(KIND) create cluster --name $(CALICO_CLUSTER) --image $(KIND_NODE_IMAGE) --config hack/kind-calico.yaml || \
+			{ echo "FATAL: cluster creation failed (partial state left; delete with: kind delete cluster --name $(CALICO_CLUSTER))"; exit 1; } ;; \
+		esac
+	@CTX=kind-$(CALICO_CLUSTER); \
+		if kubectl --context $$CTX get nodes >/dev/null 2>&1; then \
+			KINDNET=$$(kubectl --context $$CTX -n kube-system get pod -l k8s-app=kindnet --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+			if [ "$$KINDNET" != "0" ]; then echo "FATAL: cluster $(CALICO_CLUSTER) is running kindnet — it is NOT the enforcing-CNI profile (disableDefaultCNI). Delete it (kind delete cluster --name $(CALICO_CLUSTER)) and rerun with the hack/kind-calico.yaml profile."; exit 1; fi; \
+			echo "   profile verified (no kindnet pods; kindnet is disabled via networking.disableDefaultCNI)."; \
+		fi
+	@echo "Installing Calico $(CALICO_VERSION) (enforcing CNI; kindnet is disabled so Calico is the only CNI)"
+	@curl -fsSL "$(CALICO_MANIFEST)" -o /tmp/calico-$(CALICO_VERSION).yaml
+	@kubectl --context kind-$(CALICO_CLUSTER) apply -f /tmp/calico-$(CALICO_VERSION).yaml
+	@echo "Waiting for the Calico nodes (calico-node) to be Ready..."
+	@for i in $$(seq 1 30); do \
+		n=$$(kubectl --context kind-$(CALICO_CLUSTER) -n kube-system get pod -l k8s-app=calico-node --no-headers 2>/dev/null | grep -c ' 1/1 ' || true); \
+		[ "$$n" -ge 1 ] && break; \
+		sleep 5; \
+	done
+	@kubectl --context kind-$(CALICO_CLUSTER) -n kube-system get pod -l k8s-app=calico-node || { echo "FATAL: calico-node not Ready after 150s"; exit 1; }
+	@echo "Creating the Calico IP pool with CIDR $(CALICO_IP_POOL) (matches config/dev POD_CIDR so the dev overlay\'s carve-outs stay correct)..."
+	@echo "   applying: name=coxswain-pool cidr=$(CALICO_IP_POOL) blockSize=26 encapsulation=IPIP natOutgoing=true"
+	@kubectl --context kind-$(CALICO_CLUSTER) apply -f - <<'YAML'
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: coxswain-pool
+spec:
+  cidr: $(CALICO_IP_POOL)
+  blockSize: 26
+  encapsulation: IPIP
+  natOutgoing: true
+		YAML
+	@echo "Installing agent-sandbox $(AGENT_SANDBOX_VERSION) from the release manifest..."
+	@curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
+	@echo "Waiting for the agent-sandbox controller to be ready..."
+	@kubectl --context kind-$(CALICO_CLUSTER) rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=180s
+	@echo "Deploying the operator (dev overlay: --allow-unenforced) on $(CALICO_CLUSTER)..."
+	@CTX=kind-$(CALICO_CLUSTER); \
+		$(MAKE) kustomize >/dev/null 2>&1; \
+		TMP_OVERLAY=$$(mktemp -d); \
+		cp -r config "$$TMP_OVERLAY/config"; \
+		(cd "$$TMP_OVERLAY/config/manager" && "$(LOCALBIN)/kustomize" edit set image controller=coxswain-controller:d38); \
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/dev | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }
+	@rm -rf "$${TMP_OVERLAY:-}"
+	@echo "kind-calico-up complete (cluster ready; make d38-cni-e2e builds/loads its own images and redeploys the operator from the current commit)."
 
 
 .PHONY: kind-up

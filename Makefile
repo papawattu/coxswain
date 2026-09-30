@@ -179,19 +179,7 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 	done
 	@kubectl --context kind-$(CALICO_CLUSTER) -n kube-system get pod -l k8s-app=calico-node || { echo "FATAL: calico-node not Ready after 150s"; exit 1; }
 	@echo "Creating the Calico IP pool with CIDR $(CALICO_IP_POOL) (matches config/dev POD_CIDR so the dev overlay\'s carve-outs stay correct)..."
-	@CALICO_POOL_YAML=$$(mktemp);
-	@printf '%%s\n' \
-		"apiVersion: projectcalico.org/v3" \
-		"kind: IPPool" \
-		"metadata:" \
-		"  name: coxswain-pool" \
-		"spec:" \
-		"  cidr: $(CALICO_IP_POOL)" \
-		"  blockSize: 26" \
-		"  encapsulation: IPIP" \
-		"  natOutgoing: true" > "$$CALICO_POOL_YAML"
-	@kubectl --context kind-$(CALICO_CLUSTER) apply -f "$$CALICO_POOL_YAML"
-	@rm -f "$$CALICO_POOL_YAML"
+	@{ printf 'apiVersion: projectcalico.org/v3\n'; printf 'kind: IPPool\n'; printf 'metadata:\n'; printf '  name: coxswain-pool\n'; printf 'spec:\n'; printf '  cidr: $(CALICO_IP_POOL)\n'; printf '  blockSize: 26\n'; printf '  encapsulation: IPIP\n'; printf '  natOutgoing: true\n'; } | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
 	@echo "Installing agent-sandbox $(AGENT_SANDBOX_VERSION) from the release manifest..."
 	@curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
 	@echo "Waiting for the agent-sandbox controller to be ready..."

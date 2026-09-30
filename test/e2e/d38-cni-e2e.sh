@@ -200,29 +200,35 @@ GH_IP=$(getent hosts github.com 2>/dev/null | awk '{print $1}' | head -1)
 [ -z "$GH_IP" ] && GH_IP="1.1.1.1"
 echo "   disallowed external IP for check 5: $GH_IP (github.com)"
 
-# The one probe script: it tests every endpoint from inside the agent
-# container and prints a machine-parseable line per result.
-cat > "$TMPDIR/probe.sh" <<EOF
+# The one probe script. It tests every endpoint from inside the agent
+# container. Each probe is a pure TCP-CONNECT test (the layer the CNI actually
+# polices): a REACHABLE endpoint means the TCP connect succeeded (the CNI let
+# the egress through, even if a later TLS/HTTP layer then failed); a BLOCKED
+# endpoint means the connect was dropped/refused/timed out. Using the connect
+# layer (not the HTTP response code) avoids the ambiguity where a reachable
+# apiserver with a cert-name mismatch returns curl exit 60 / HTTP 000.
+cat > "$TMPDIR/probe.sh" <<'PROBE_EOF'
 #!/bin/sh
-probe() {
-  # probe <label> <url-or-ip:port>
-  out=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 12 --noproxy '*' "\$2" 2>&1)
-  ec=\$?
-  case \$ec in
-    0)  echo "RESULT \$1 HTTP_CODE=\$out" ;;
-    6)  echo "RESULT \$1 DNS_FAIL" ;;
-    28) echo "RESULT \$1 TIMEOUT" ;;
-    56) echo "RESULT \$1 NO_DATA" ;;
-    7)  echo "RESULT \$1 REFUSED" ;;
-    *)  echo "RESULT \$1 CURL_EXIT=\$ec" ;;
-  esac
+# tcp_probe <label> <host> <port>
+tcp_probe() {
+  ec=$(curl -s -o /dev/null --connect-timeout 3 --max-time 5 "http://$2:$3/" 2>/dev/null)
+  ec=$?
+  if [ "$ec" = "0" ]; then
+    echo "RESULT $1 REACHABLE"
+  else
+    echo "RESULT $1 BLOCKED(curl_exit=$ec)"
+  fi
 }
-probe APISERVER_SVC   "https://${APISERVER_SVC_IP}:443/version"
-probe APISERVER_NODE  "https://${NODE_IP}:6443/version"
-probe KUBELET_NODE    "https://${NODE_IP}:10250"
-probe INTERNAL_POD    "http://${TEST_IP}:8080/"
-probe EXTERNAL        "https://${GH_IP}/"
-EOF
+tcp_probe APISERVER_SVC   __APISERVER_SVC_IP__ 443
+tcp_probe APISERVER_NODE  __NODE_IP__ 6443
+tcp_probe KUBELET_NODE    __NODE_IP__ 10250
+tcp_probe INTERNAL_POD    __TEST_IP__ 8080
+tcp_probe EXTERNAL        __GH_IP__ 443
+PROBE_EOF
+# Substitute the real IPs (the heredoc above is single-quoted so the values
+# are inserted here, not at write time).
+sed -i   -e "s/__APISERVER_SVC_IP__/${APISERVER_SVC_IP}/"   -e "s/__NODE_IP__/${NODE_IP}/g"   -e "s/__TEST_IP__/${TEST_IP}/"   -e "s/__GH_IP__/${GH_IP}/" \
+  "$TMPDIR/probe.sh"
 K -n "$NS" cp "$TMPDIR/probe.sh" "$AGENT_POD:/tmp/d38-probe.sh" 2>/dev/null || { echo "FATAL: kubectl cp probe.sh failed"; exit 2; }
 
 # ===========================================================================
@@ -242,8 +248,11 @@ assert_blocked() { # $1 = label, $2 = human description
     *"MISSING"*) bad "$2: probe line missing from output" ;;
     *"HTTP_CODE="*)
       code=$(echo "$line" | grep -o 'HTTP_CODE=[0-9]*' | cut -d= -f2)
-      # 000 means curl connected-but-no-response; anything that is a real
-      # HTTP response or a clean exit 0 means the endpoint was REACHABLE.
+      # curl with -w "%{http_code}" prints "000" whenever it did NOT complete
+      # a request: connection refused (exit 7), timeout (28), DNS failure (6),
+      # TLS error (60), or a TCP RST from a firewall DROP. All of these mean
+      # the endpoint was NOT reachable, so 000 counts as blocked. A real HTTP
+      # response (100-599) means the CNI failed to block the egress.
       if [ "$code" = "000" ]; then
         ok "$2 (endpoint unreachable)"
       else

@@ -19,6 +19,13 @@ kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/downl
 kubectl rollout status deploy/agent-sandbox-controller -n agent-sandbox-system
 ```
 
+> **CNI preflight (production):** before installing coxswain on a production
+> cluster, run `K8S_CONTEXT=<your-ctx> make verify-cni` to confirm the cluster's
+> CNI polices pod-to-host-network egress (the D38 requirement). kindnet
+> (kind's default) does not — see the [Security](#security-rbac-guidance-for-installers)
+> section for details. This step is not needed for a local kind dev cluster
+> (kindnet is dev-only).
+
 ### 2. Build and deploy the operator
 
 ```sh
@@ -122,18 +129,39 @@ full rationale.
 
 **CNI requirement (production):** the agent's allowlist NetworkPolicy leaves
 host-network destinations to the CNI's implementation, and not every CNI
-polices pod → host-network egress. **kindnet (kind's default CNI) does not**
-— on kindnet the agent pod can reach the apiserver service IP (10.96.0.1:443),
-the node's :6443, and the kubelet's :10250 even though pod-IP and external-IP
-egress is denied (docs/REVIEW-PHASE1-R16.md, D38; also the known-limitation
-line L1 printed by `make i42-e2e`). kindnet is therefore **dev-only**: it
-hides the control plane behind authentication (no token is mounted into the
-agent) rather than blocking it. **Production clusters must run a CNI that
-enforces NetworkPolicy egress against host-network and node destinations —
-Calico or Cilium** (see [docs/adr/0006-agent-isolation-and-zero-credentials.md](docs/adr/0006-agent-isolation-and-zero-credentials.md)).
-The property is tested, not just documented: `make kind-calico-up` +
-`make d38-cni-e2e` run the blocked-endpoint checks for real on a second kind
-cluster whose Calico CNI enforces them.
+polices pod → host-network egress. **Production requires a CNI that polices
+pod-to-host-network egress** — i.e. a CNI that blocks pod egress to the
+apiserver service IP, the node's `:6443` and `:10250`, pod IPs in other
+namespaces, and external IPs when a NetworkPolicy allows only DNS to
+kube-dns. This is a property, not a vendor list:
+
+| CNI | Status |
+|-----|--------|
+| Calico v3.30.1 | **Verified** — `make d38-cni-e2e` (kind cluster with Calico as the enforcing CNI; `make verify-cni` also passes) |
+| Cilium | To be confirmed — run `make verify-cni` on your cluster |
+| GKE Dataplane V2 | To be confirmed — run `make verify-cni` on your cluster |
+| EKS VPC CNI (with network policy) | To be confirmed — run `make verify-cni` on your cluster |
+| AKS (Azure CNI) | To be confirmed — run `make verify-cni` on your cluster |
+| kindnet (kind's default CNI) | **Dev-only** — does NOT police pod → host-network egress (see below) |
+
+kindnet (kind's default CNI) does **not** police pod → host-network egress:
+on kindnet the agent pod can reach the apiserver service IP (10.96.0.1:443),
+the node's `:6443`, and the kubelet's `:10250` even though pod-IP and
+external-IP egress is denied (docs/REVIEW-PHASE1-R16.md, D38; also the
+known-limitation line L1 printed by `make i42-e2e`). kindnet is therefore
+**dev-only**: it hides the control plane behind authentication (no token is
+mounted into the agent) rather than blocking it.
+
+**Preflight check:** `make verify-cni` (optionally `K8S_CONTEXT=<ctx>`)
+creates a temp namespace with a NetworkPolicy shaped like the agent's and a
+probe pod, then TCP-connects to the apiserver service IP, each node's
+`:6443`/`:10250`, a kube-dns pod IP, and `1.1.1.1:443` from the probe. Every
+target must be BLOCKED for PASS. It works on any cluster where kubectl is
+pointed (no coxswain install required) and always cleans up. Run it on your
+production cluster before installing coxswain.
+
+See [docs/adr/0006-agent-isolation-and-zero-credentials.md](docs/adr/0006-agent-isolation-and-zero-credentials.md)
+for the full rationale.
 
 ## Development
 

@@ -73,7 +73,7 @@ if ! K get nodes >/dev/null 2>&1; then
 fi
 APISERVER_SVC_IP=$(K -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}')
 [ -z "$APISERVER_SVC_IP" ] && { echo "FATAL: could not read the default/kubernetes service ClusterIP"; exit 2; }
-NODE_IPS=$(K get nodes -o json 2>/dev/null | jsonpath "import sys,json; print(' '.join(a[1] for n in json.load(sys.stdin)['items'] for a in n['status']['addresses'] if a[0]=='InternalIP'))" 'InternalIP')
+NODE_IPS=$(K get nodes -o json 2>/dev/null | jsonpath "import sys,json; print(' '.join(a['address'] for n in json.load(sys.stdin)['items'] for a in n['status']['addresses'] if a['type']=='InternalIP'))" 'InternalIP')
 [ -z "$NODE_IPS" ] && { echo "FATAL: could not read node InternalIPs"; exit 2; }
 DNS_POD_IP=$(K -n kube-system get pod -l k8s-app=kube-dns -o json 2>/dev/null | jsonpath "import sys,json; print(json.load(sys.stdin)['items'][0]['status']['podIP'])" 'podIP')
 [ -z "$DNS_POD_IP" ] && { echo "FATAL: no kube-dns pod IP found (the probe's allowed target and the cross-namespace test endpoint)"; exit 2; }
@@ -120,9 +120,19 @@ spec:
           port: 53
 EOF
 K -n "$NS" apply -f "$TMPDIR/netpol.yaml" >/dev/null
-# Probe pod: busybox, matching the policy's podSelector, no kind-load
-# assumption (pulled normally by the node). kubectl exec + the python3
-# interpreter give the deterministic 4s TCP-connect probes below.
+# Probe pod: golang:1.26 (the agent stand-in image the D38 e2e already uses),
+# matching the policy's podSelector (app.kubernetes.io/component=agent), no
+# kind-load assumption (pulled normally by the node). It ships python3,
+# which gives a deterministic 4s TCP-connect probe (unlike busybox's /dev/tcp,
+# which requires bash and is not available in the Debian golang image's dash).
+# The probe runs via kubectl exec; it is written as a file and kubectl cp'd
+# (no python heredocs inside kubectl exec sh -c, per the i42-e2e house rule).
+# The layer under test is the CNI's egress rules: the D38 property is "a pod
+# carrying the agent's allowlist NetworkPolicy must not be able to reach
+# host-network destinations". On kindnet that property FAILS (the L1, review
+# docs/REVIEW-PHASE1-R16.md): the apiserver service IP, the node's :6443, and
+# the kubelet's :10250 are all REACHABLE, while pod-IP and external-IP egress
+# is blocked. On Calico all five targets are BLOCKED.
 cat > "$TMPDIR/probe.yaml" <<EOF
 apiVersion: v1
 kind: Pod
@@ -133,13 +143,14 @@ metadata:
     app.kubernetes.io/component: agent
 spec:
   automountServiceAccountToken: false
+  restartPolicy: Never
   containers:
     - name: probe
-      image: busybox:1.36
-      command: ["sh", "-c", "sleep infinity"]
+      image: golang:1.26
+      command: ["sleep", "infinity"]
 EOF
 K -n "$NS" apply -f "$TMPDIR/probe.yaml" >/dev/null
-echo "   applying NetworkPolicy + probe pod (busybox:1.36, pulled from the registry)..."
+echo "   applying NetworkPolicy + probe pod (golang:1.26, pulled from the registry)..."
 READY=""
 for i in $(seq 1 60); do
   PHASE=$(K -n "$NS" get pod "$PROBE_POD" -o jsonpath='{.status.phase}' 2>/dev/null)
@@ -152,23 +163,22 @@ done
 echo "   probe pod Ready"
 
 echo
-echo "--- STEP 2: TCP-connect probes from the probe pod (4s timeout each) ---"
-# The probe is raw TCP-CONNECT — the exact layer the CNI polices. A
-# completed connect means the CNI let the egress through (REACHABLE); a
-# timeout/refused connect means it was dropped (BLOCKED). busybox ships
-# python3 (the kubernetes busybox build does), so we use it for a
-# deterministic 4s-connect test; nc would work as a fallback, but
-# python3's result is unambiguous.
+echo "--- STEP 2: TCP-connect probes from the probe pod ---"
+# The probe is a raw TCP-CONNECT test — the exact layer the CNI polices.
+# A completed connect means the CNI let the egress through (REACHABLE);
+# a timeout/refused connect means it was dropped (BLOCKED). golang:1.26
+# ships python3, so the probe uses a 4s socket timeout per target (the same
+# approach as d38-cni-e2e.sh's probe.py). This is the D38 property under
+# test: on kindnet the apiserver service IP, the node's :6443, and the
+# kubelet's :10250 are REACHABLE (the L1, review docs/REVIEW-PHASE1-R16.md);
+# on Calico all five targets are BLOCKED. The CROSS_NS_POD target uses
+# port 8080 on the kube-dns pod IP (not 53) because the policy ALLOWS DNS
+# on 53; the L1 test used :8080 on the coredns pod IP to verify pod-to-pod
+# egress blocking.
 NODE_IPS_ENV=$(echo $NODE_IPS | tr ' ' '\n' | sort -u | tr '\n' ' ')
 cat > "$TMPDIR/probe.py" <<PYEOF
 import os, socket
-TARGETS = [("APISERVER_SVC", os.environ["APISERVER_SVC_IP"], 443)]
-for ip in os.environ["NODE_IPS"].split():
-    TARGETS.append(("APISERVER_NODE(%s)" % ip, ip, 6443))
-    TARGETS.append(("KUBELET_NODE(%s)" % ip, ip, 10250))
-TARGETS.append(("CROSS_NS_POD(kube-dns)", os.environ["DNS_POD_IP"], 53))
-TARGETS.append(("EXTERNAL", os.environ["EXTERNAL_IP"], 443))
-for label, host, port in TARGETS:
+def probe(label, host, port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(4)
     try:
@@ -178,10 +188,17 @@ for label, host, port in TARGETS:
         print("RESULT %s BLOCKED(%s)" % (label, type(exc).__name__))
     finally:
         s.close()
+probe("APISERVER_SVC",  os.environ["APISERVER_SVC_IP"], 443)
+for ip in os.environ["NODE_IPS"].split():
+    probe("APISERVER_NODE(%s)" % ip, ip, 6443)
+    probe("KUBELET_NODE(%s)" % ip, ip, 10250)
+probe("CROSS_NS_POD(kube-dns)", os.environ["DNS_POD_IP"], 8080)
+probe("EXTERNAL", os.environ["EXTERNAL_IP"], 443)
 PYEOF
 K -n "$NS" cp "$TMPDIR/probe.py" "$PROBE_POD:/tmp/verify-cni-probe.py" >/dev/null 2>&1 || { echo "FATAL: kubectl cp probe.py failed"; exit 2; }
 K -n "$NS" exec "$PROBE_POD" -- sh -c "APISERVER_SVC_IP=${APISERVER_SVC_IP} NODE_IPS='${NODE_IPS_ENV}' DNS_POD_IP=${DNS_POD_IP} EXTERNAL_IP=${EXTERNAL_IP} python3 /tmp/verify-cni-probe.py" > "$TMPDIR/results.txt" 2>&1
 cat "$TMPDIR/results.txt"
+[ -s "$TMPDIR/results.txt" ] || { echo "FATAL: the probe produced no output (check the pod: kubectl --context $CTX -n $NS logs $PROBE_POD)"; exit 2; }
 
 echo
 echo "--- RESULT ---"
@@ -198,7 +215,7 @@ while read -r line; do
   case "$line" in
     RESULT\ *)
       label=$(echo "$line" | awk '{print $2}' | cut -d'(' -f1)
-      total=$((TOTAL + 1))
+      TOTAL=$((TOTAL + 1))
       case "$line" in
         *REACHABLE*)
           status="REACHABLE  <-- CNI LET IT THROUGH"
@@ -221,7 +238,8 @@ if [ "$TOTAL_FAIL" -eq 0 ]; then
   echo "PASS: every probe was BLOCKED by the NetworkPolicy, including the host-network"
   echo "     targets (apiserver svc IP, node :6443/:10250). This CNI ($CNI_NOTE) polices"
   echo "     pod -> host-network egress: it satisfies the D38 production requirement."
-  echo "     (The DNS connection to kube-dns on 53 was allowed by the policy, as expected.)"
+  echo "     The D38 property (a pod under the agent's allowlist NetworkPolicy cannot reach"
+  echo "     host-network destinations) HOLDS on this cluster."
   exit 0
 else
   echo "FAIL: $TOTAL_FAIL of $TOTAL probe targets were REACHABLE despite the NetworkPolicy"

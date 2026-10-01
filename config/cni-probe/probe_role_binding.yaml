@@ -1,0 +1,22 @@
+# D38: bind the operator's ServiceAccount (coxswain-system, named by the
+# default kustomize overlay) to the in-namespace probe Role. The kustomize
+# namePrefix applies to the coxswain-system resources only; the
+# coxswain-cni-probe resources in this kustomization keep their literal
+# names (they are cluster-wide-named and must match the operator's
+# --cni-probe-namespace default).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coxswain-cni-probe-operator
+  namespace: coxswain-cni-probe
+  labels:
+    app.kubernetes.io/name: coxswain-cni-probe
+    app.kubernetes.io/part-of: coxswain
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coxswain-cni-probe-operator
+subjects:
+- kind: ServiceAccount
+  name: coxswain-controller-manager
+  namespace: coxswain-system

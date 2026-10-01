@@ -145,6 +145,7 @@ func (p *ProbeRunnable) probeOnce(ctx context.Context) error {
 	}
 	old, changed := Holder().Set(newResult)
 	if changed {
+		SetNetworkEnforcedMetric(newResult)
 		p.retage(rctx, old, newResult)
 	}
 	return nil
@@ -152,10 +153,15 @@ func (p *ProbeRunnable) probeOnce(ctx context.Context) error {
 
 // retage emits a re-gate Event on every Loop and sends a GenericEvent for
 // each on the channel (design point 3a). The reconcile itself reads the new
-// result from the holder — it never runs the probe.
+// result from the holder — it never runs the probe. A nil Client (unit tests)
+// skips the Event and the channel send: the re-gate is a no-op and the result
+// is still stored in the holder (the metric is updated by the caller).
 func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 	log := ctrl.Log.WithName("cni-prober")
 	log.Info("CNI probe result changed", "old", string(old.Reason), "new", string(new.Reason))
+	if p.Client == nil {
+		return
+	}
 	var loops coxv1alpha1.LoopList
 	if err := p.Client.List(ctx, &loops); err != nil {
 		log.Error(err, "Could not list Loops for the CNI re-gate")

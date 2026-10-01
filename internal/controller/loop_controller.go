@@ -49,6 +49,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -133,6 +134,10 @@ type LoopReconciler struct {
 	// each reconcile anyway).
 	CNIRegateSource source.TypedSource[reconcile.Request]
 
+	// Recorder emits the Kubernetes Event on a NetworkEnforced condition
+	// change (D38 design point 3). nil (most envtests) = no Event.
+	Recorder record.EventRecorder
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
@@ -176,6 +181,10 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
 // D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// D38: the operator emits a Kubernetes Event on every Loop when its
+// NetworkEnforced condition changes (the probe Runnable's re-gate Event lives
+// in internal/cni; this is the condition-change Event the reconcile side emits).
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -413,6 +422,37 @@ func (r *LoopReconciler) cniNetworkStatus() (run bool, reason cni.Reason, status
 	default: // CNIUnenforced
 		return false, cni.ReasonCNIUnenforced, metav1.ConditionFalse, "the CNI does not police pod -> host-network egress; sandbox held Suspended. " + res.Describe()
 	}
+}
+
+// networkEnforcedChanged reports whether the NetworkEnforced condition the
+// given status/reason/message would produce differs from the one the Loop
+// currently carries (D38 design point 3: an Event is emitted on each
+// CHANGE — not on every reconcile).
+func (r *LoopReconciler) networkEnforcedChanged(loop *coxv1alpha1.Loop, status metav1.ConditionStatus, reason, message string) bool {
+	for i := range loop.Status.Conditions {
+		c := loop.Status.Conditions[i]
+		if c.Type != cni.NetworkEnforcedCondition {
+			continue
+		}
+		return c.Status != status || c.Reason != reason || c.Message != message
+	}
+	return true // the condition is not present yet
+}
+
+// emitNetworkEnforcedEvent emits the Kubernetes Event on a NetworkEnforced
+// condition change (D38 design point 3). Best-effort: a failed Event never
+// blocks the reconcile. A nil Recorder (most envtests) skips it.
+func (r *LoopReconciler) emitNetworkEnforcedEvent(loop *coxv1alpha1.Loop, status metav1.ConditionStatus, reason, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	var typ string
+	if status == metav1.ConditionTrue {
+		typ = corev1.EventTypeNormal
+	} else {
+		typ = corev1.EventTypeWarning
+	}
+	r.Recorder.Eventf(loop, typ, "NetworkEnforced", "NetworkEnforced=%s reason=%s: %s", status, reason, message)
 }
 
 // PolicyEnforcedCondition is the non-phase condition type recording whether the
@@ -2214,9 +2254,13 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	}
 	// D38: the NetworkEnforced condition (network layer, analogous to
 	// PolicyEnforced). The escape hatch is AllowUnenforcedNetwork (separate
-	// from AllowUnenforced — the two flags are independent).
+	// from AllowUnenforced — the two flags are independent). A condition
+	// change emits a Kubernetes Event (design point 3).
 	if _, reason, status, msg := r.cniNetworkStatus(); status != "" {
-		setCondition(loop, cni.NetworkEnforcedCondition, status, string(reason), msg)
+		if r.networkEnforcedChanged(loop, status, string(reason), msg) {
+			setCondition(loop, cni.NetworkEnforcedCondition, status, string(reason), msg)
+			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)
+		}
 	}
 	return nil
 }

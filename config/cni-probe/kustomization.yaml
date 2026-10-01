@@ -1,0 +1,18 @@
+# D38: the fixed namespace the operator's CNI self-test probe pod + probe
+# NetworkPolicy live in.
+#
+# - Created at install (added to config/default). A Role cannot pre-exist in a
+#   namespace created at runtime, so the namespace is install-time state and
+#   the operator never creates/deletes namespaces (no cluster-scoped RBAC for
+#   that; D38 plan design point 1).
+# - The operator's probe NetworkPolicy matches ONLY the probe pod
+#   (coxswain.io/probe=cni-probe) — never the operator or any agent.
+# - The probe namespace must never be selected by the agent KubeArmor fences
+#   (selector: coxswain.io/loop) or by the per-Loop agent/proxy NetworkPolicies
+#   (app.kubernetes.io/component labels); the probe pod carries only
+#   coxswain.io/probe, so both selectors structurally miss it.
+resources:
+- namespace.yaml
+- service_account.yaml
+- probe_role.yaml
+- probe_role_binding.yaml

@@ -1,5 +1,7 @@
-# Dev/kind only: the base install (config/default) plus --allow-unenforced.
-# Never use for production — Loops run with PolicyEnforced=False (EnforcementDisabled).
+# Dev/kind only: the base install (config/default) plus --allow-unenforced
+# AND --allow-unenforced-network. Never use for production — Loops run with
+# PolicyEnforced=False (EnforcementDisabled) and, on non-enforcing CNIs
+# (kindnet), with NetworkEnforced=False (EnforcementDisabled).
 #
 # I42c review P2: the egress-proxy NetworkPolicy carve-outs and the I42e
 # in-cluster-allow CIDR check need the cluster's pod/service CIDRs. The base
@@ -19,6 +21,14 @@ patches:
     - op: add
       path: /spec/template/spec/containers/0/args/-
       value: --allow-unenforced
+    # D38: kindnet does not police pod -> host-network egress (the D38
+    # property); the escape hatch lets the Loops run on kindnet dev clusters
+    # (NetworkEnforced=False reason EnforcementDisabled). The enforcing-CNI
+    # profile (make kind-calico-up) deploys WITHOUT this flag (the base
+    # config/default), so the D38 gate is proven there on Calico.
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --allow-unenforced-network
     - op: add
       path: /spec/template/spec/containers/0/env
       value:

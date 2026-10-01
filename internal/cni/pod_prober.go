@@ -69,37 +69,61 @@ const (
 	expectedResultLen = 4
 )
 
-// probeCommand is the agent-shaped probe, run as the pod's own command. It
-// writes RESULT lines to stdout (captured to the termination message via
-// terminationMessagePolicy: FallbackToLogsOnError) and exits 0. The targets are
-// the D38 property's three (the apiserver service, the kubelet node port, and
-// an external host). The netpol only allows dns 53/tcp to the node's coredns
-// and the four targets' IPs — anything the probe reaches beyond the allow
-// list means the CNI is not enforcing.
+// knownProbeLabels is the strict set of RESULT labels the probe emits (design
+// point 4: an unknown label is a validation error, never a false pass).
+var knownProbeLabels = map[string]bool{
+	"APISERVER_SVC": true,
+	"KUBELET_NODE":  true,
+	"EXTERNAL":      true,
+	"BLOCK_ONLY":    true,
+}
+
+// probeCommand is the agent-shaped probe, run as the pod's own command (the
+// image is python:3-alpine by default — it ships python3 and neither bash nor
+// /dev/tcp, so the probe is a Python socket connect, exactly like
+// verify-cni.sh's probe). It writes one RESULT line per target to stdout
+// (captured to the termination message via
+// terminationMessagePolicy: FallbackToLogsOnError) and exits 0.
+//
+// The targets are the D38 property's (design point 2): the apiserver
+// service IP (pod -> ServiceClusterIP -> host network), the node's kubelet
+// :10250 (host network, node-local), an external IP (pod -> node egress to
+// the outside), and 99.99.99.99:80 — a bare IP the NetworkPolicy must
+// block (a "should never be allowed" control: a CNI that fails open lets
+// it through; a CNI that enforces blocks it). The netpol allows only DNS
+// 53 to the node's coredns, so every one of these four targets must be
+// BLOCKED for the CNI to count as enforcing.
 func (p *PodProber) probeCommand() []string {
 	apiserverSVC := "kubernetes.default.svc." + p.cfg.ClusterDomain
-	return []string{"sh", "-c", `
-set -u
-probe() {
-  local label=$1 host=$2 port=$3
-  if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
-    echo "RESULT $label REACHABLE"
-  else
-    echo "RESULT $label BLOCKED"
-  fi
-}
-# Target 1: the apiserver service (pod -> ServiceClusterIP -> host-network).
-probe APISERVER_SVC ` + apiserverSVC + ` 443
-# Target 2: the node's kubelet read-only port (host network, node-local).
-NODE_IP=$(hostname -i | awk '{print $1}')
-probe KUBELET_NODE $NODE_IP 10255
-# Target 3: an external host (pod -> node egress to the outside).
-probe EXTERNAL 1.1.1.1 443
-# Target 4: an unreachable target (a bare IP the netpol must block — the
-# "should never be allowed" control, design point 2: a netpol that blocks the
-# right traffic rather than one that fails open).
-probe BLOCK_ONLY 99.99.99.99 80
-echo DONE
+	return []string{"python3", "-c", `
+import os, socket, socket as _s
+
+TARGETS = [
+    ("APISERVER_SVC", "` + apiserverSVC + `", 443),
+    ("KUBELET_NODE", os.environ.get("HOSTNAME") or _s.gethostname(), 10250),
+    ("EXTERNAL", "1.1.1.1", 443),
+    ("BLOCK_ONLY", "99.99.99.99", 80),
+]
+
+def probe(label, host, port):
+    try:
+        host = socket.gethostbyname(host)
+    except Exception:
+        print("RESULT %s REACHABLE" % label)  # unresolvable -> not a CNI failure
+        return
+    s = socket.socket(_s.AF_INET, _s.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect((host, port))
+        print("RESULT %s REACHABLE" % label)
+    except Exception:
+        print("RESULT %s BLOCKED" % label)
+    finally:
+        s.close()
+
+for label, host, port in TARGETS:
+    probe(label, host, port)
+print("DONE")
 ` + "\n",
 	}
 }
@@ -227,7 +251,9 @@ func (p *PodProber) buildPod() *corev1.Pod {
 					Command: p.probeCommand(),
 					// terminationMessagePolicy FallbackToLogsOnError: the probe's
 					// RESULT lines go to stdout, captured into the container's
-					// terminationMessage (design point 2).
+					// terminationMessage (design point 2). The output (4 RESULT
+					// lines + DONE) is far under the 4 KB termination-message
+					// limit.
 					TerminationMessagePath:   "/dev/termination-log",
 					TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 					SecurityContext: &corev1.SecurityContext{
@@ -239,6 +265,10 @@ func (p *PodProber) buildPod() *corev1.Pod {
 					},
 				},
 			},
+			// The probe needs no K8s API access (the operator reads the
+			// termination message off the pod object). Disabling the token
+			// mount keeps the probe pod zero-credential (ADR-0006).
+			AutomountServiceAccountToken: new(bool),
 		},
 	}
 }
@@ -307,6 +337,9 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 		label, verdict := fields[1], fields[2]
 		if verdict != "REACHABLE" && verdict != "BLOCKED" {
 			return unavailable("unrecognised verdict: " + label + " " + verdict), nil
+		}
+		if !knownProbeLabels[label] {
+			return unavailable("unknown probe target label: " + label), nil
 		}
 		seen++
 		if verdict == "REACHABLE" {

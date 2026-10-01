@@ -201,7 +201,13 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		TMP_OVERLAY=$$(mktemp -d); \
 		cp -r config "$$TMP_OVERLAY/config"; \
 		(cd "$$TMP_OVERLAY/config/manager" && "$(LOCALBIN)/kustomize" edit set image controller=coxswain-controller:d38); \
-		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/dev | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }
+		# D38: the enforcing-CNI profile deploys the BASE install (config/default): \
+		# NO --allow-unenforced and NO --allow-unenforced-network. Calico is the \
+		# enforcing CNI, so the D38 CNI self-test gate is expected to PASS \
+		# WITHOUT the escape hatch (NetworkEnforced=True). (A dev overlay here \
+		# would make the network gate pass-via-flag and prove nothing about \
+		# the CNI.) \
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/default | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }
 	@rm -rf "$${TMP_OVERLAY:-}"
 	@echo "kind-calico-up complete (cluster ready, images loaded; make d38-cni-e2e runs the assertions)."
 

@@ -1,0 +1,25 @@
+# D38: the operator's in-namespace RBAC for the CNI probe (design point 1).
+# Namespaced, in coxswain-cni-probe only: the operator (the
+# coxswain-controller-manager ServiceAccount in coxswain-system) needs only
+# pods create/get/delete and networkpolicies create/delete here — plus the
+# existing cluster-wide read access the operator already has for pods (it
+# reads the termination message off the pod object; the pod object, not the
+# log stream, is the result carrier — terminationMessagePolicy is
+# FallbackToLogsOnError).
+#
+# NO pods/exec, NO kubectl cp: the probe runs as the pod's own command.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coxswain-cni-probe-operator
+  namespace: coxswain-cni-probe
+  labels:
+    app.kubernetes.io/name: coxswain-cni-probe
+    app.kubernetes.io/part-of: coxswain
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [create, get, delete]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [create, delete]

@@ -281,6 +281,10 @@ func main() {
 		CNIProber:              cniProber,
 		CNIRegateSource:        cniRegateSrc,
 		ClusterDomain:          clusterDomain,
+		// D38: the NetworkEnforced condition-change Event (the manager's
+		// recorder posts it as a Kubernetes Event; the re-gate Event lives
+		// in the probe Runnable).
+		Recorder: mgr.GetEventRecorderFor("loop-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")
 		os.Exit(1)

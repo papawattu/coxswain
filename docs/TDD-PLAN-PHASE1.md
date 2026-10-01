@@ -1073,3 +1073,152 @@ NetworkPolicy-only model.
 **Infra:** `make kind-up` gains a step to install the eBPF engine (version
 pinned once, like agent-sandbox) and a smoke that proves a disallowed `exec` is
 blocked on kind (ADR-0007 Q3).
+
+---
+
+## D38 next: operator-side CNI self-test (D30-style, network layer)
+
+**Status:** planned (docs-only, for review). Implementation is the next
+slice after the D38 hardening docs + preflight land.
+
+**Context:** `make verify-cni` is the preflight check installers run before
+deploying. But the preflight is a one-shot, human-triggered check. The
+longer-term target (D38 Q1, owner decision PR #37) is an operator-side CNI
+self-test that runs continuously and gates Loop execution: if the CNI stops
+policing pod → host-network egress (or the probe can't run), Loops are held
+Suspended (fail-closed), not run.
+
+### Design points
+
+1. **Where the probe runs.** The operator runs the verify-cni probe in its
+   own namespace (the coxswain-system namespace), creating a temp namespace
+   `coxswain-cni-selftest-<hash>` with a NetworkPolicy shaped like the
+   agent's and a probe pod (configurable image, default
+   `python:3-alpine`). The operator needs a **namespaced Role** in the temp
+   namespace only: create/delete pods + networkpolicies. No new cluster-wide
+   RBAC beyond what `make manifests` regenerates and is minimal. The probe
+   image is configurable via an operator flag
+   (`--cni-probe-image`), defaulting to `python:3-alpine`.
+
+2. **When it runs.** At operator startup (before the first reconcile loop
+   begins) and periodically (every 10 minutes by default, configurable via
+   `--cni-check-interval`). The probe is a short-lived pod that runs once and
+   exits; the operator reads its result and deletes it. The probe logic is
+   the same as `verify-cni.sh`: TCP-connect to the apiserver service IP, each
+   node's `:6443`/`:10250`, a kube-dns pod IP, and `1.1.1.1:443`. Every
+   target must be BLOCKED for PASS.
+
+3. **Result surface.** The result surfaces as:
+   - A **`NetworkEnforced` condition** on every Loop (type
+     `NetworkEnforced`, status `True`/`False`, reason `CNIEnforcing` /
+     `CNIUnenforced` / `ProbeUnavailable`). This is analogous to the
+     existing `PolicyEnforced` condition (D30) but for the network layer.
+   - A **Kubernetes Event** on each Loop when the condition changes.
+   - A **metric** (`coxswain_network_enforced` gauge, 1.0 when enforced,
+     0.0 when not) exposed via the operator's metrics endpoint.
+
+4. **Gate: Loops held Suspended when not enforced.** When `NetworkEnforced`
+   is `False` (CNI does not police pod → host-network egress, **or** the
+   probe can't run — FAIL-CLOSED, never pass), Loops are held Suspended
+   (D30-style: set `OperatingMode = Suspended`, set the condition, emit an
+   Event) unless `--allow-unenforced-network` is set. This is a **separate**
+   flag from the existing `--allow-unenforced` (which gates the eBPF/KubeArmor
+   engine). The two flags are independent: a cluster might have a working
+   KubeArmor but a non-enforcing CNI, or vice versa.
+   **FAIL-CLOSED:** if the probe can't run (pod doesn't become Ready, exec
+   fails, no output, wrong line count), the result is `ProbeUnavailable` and
+   the gate treats it as not enforced (Suspended), not as a pass.
+
+5. **Config profiles.**
+   - `config/dev` (kindnet, `make deploy-dev`): must set
+     `--allow-unenforced-network`, because coxswain-dev runs kindnet and the
+     i42-e2e must keep passing there (kindnet does not police pod →
+     host-network egress; the Loops must run in dev).
+   - `kind-calico-up` (Calico, `make kind-calico-up`): must **NOT** set
+     `--allow-unenforced-network`, so the D38 profile proves the gate passes
+     on Calico (the CNI enforces, the probe passes, Loops run without the
+     escape hatch).
+   - `config/default` (production, `make deploy`): must **NOT** set
+     `--allow-unenforced-network`. Production is fail-closed.
+
+6. **Tests (envtest-first, I43 mutation checks).**
+   - **Envtest: gate passes.** With a fake `CNIProber` that reports
+     `enforced=true`, a Loop reaches OperatingMode Running and
+     `NetworkEnforced=True`. Mutation: disable the gate in a scratch copy →
+     the spec fails.
+   - **Envtest: gate blocks.** With a fake `CNIProber` that reports
+     `enforced=false` (CNIUnenforced), the Loop stays Suspended and
+     `NetworkEnforced=False`. With `--allow-unenforced-network`, the Loop
+     runs and `NetworkEnforced=False` reason `EnforcementDisabled`.
+   - **Envtest: fail-closed.** With a fake `CNIProber` that reports
+     `ProbeUnavailable`, the Loop stays Suspended (not Failed, not Running)
+     and `NetworkEnforced=False` reason `ProbeUnavailable`.
+   - **Envtest: condition/event.** Assert the `NetworkEnforced` condition is
+     set on the Loop, an Event is emitted when it changes, and the metric is
+     exposed.
+   - **Envtest: independent flags.** `--allow-unenforced` (eBPF) does not
+     bypass the network gate; `--allow-unenforced-network` does not bypass
+     the eBPF gate. They are independent.
+
+7. **Kind acceptance.**
+   - **Calico** (`kind-coxswain-calico`): Loops run (probe passes, gate
+     passes, no escape hatch needed). `NetworkEnforced=True` on all Loops.
+   - **kindnet without flag** (`kind-coxswain-dev`, `make deploy`): Loops
+     held Suspended with `NetworkEnforced=False` reason `CNIUnenforced`.
+     The i42-e2e does **not** run on this profile (it requires
+     `--allow-unenforced-network`).
+   - **kindnet with flag** (`kind-coxswain-dev`, `make deploy-dev`): Loops
+     run with `NetworkEnforced=False` reason `EnforcementDisabled`. The
+     i42-e2e passes (it already runs on this profile today).
+
+8. **Seam: the `CNIProber` interface.** Analogous to the existing
+   `Enforcer` interface (D30): a `CNIProber` interface with
+   `Probe(ctx) (enforced bool, reason string, err error)`. The operator
+   holds a `CNIProber` (nil = probe unavailable = fail-closed, like the
+   existing `Enforcer` nil handling). The real implementation creates the
+   temp namespace + probe pod, runs the probe, reads the result, and cleans
+   up. The fake in envtests is a struct that returns a configurable result.
+   The probe runs in a goroutine (non-blocking) and caches the last result;
+   the reconcile loop reads the cached result.
+
+### Slice breakdown (for the implementation PR)
+
+- **D38s1** — `CNIProber` interface + fake + `NetworkEnforced` condition
+  type + `--allow-unenforced-network` flag + `--cni-check-interval` flag +
+  `--cni-probe-image` flag. Envtest: gate passes (fake enforced=true), gate
+  blocks (fake enforced=false), fail-closed (fake ProbeUnavailable),
+  condition/event/metric. Mutation checks.
+- **D38s2** — Real `CNIProber` implementation (temp namespace + probe pod +
+  NetworkPolicy + probe script + result parsing + cleanup). The probe logic
+  is the same as `verify-cni.sh`. Reuses the probe script from
+  `test/e2e/verify-cni.sh` (extracted into a shared location, or inlined in
+  the Go code). Envtest: the real probe is not run (fake is used); the
+  implementation is verified by the kind acceptance.
+- **D38s3** — Kind acceptance: `make kind-calico-up` (Calico, no escape
+  hatch, Loops run, `NetworkEnforced=True`); `kind-coxswain-dev` with
+  `make deploy` (kindnet, no escape hatch, Loops Suspended,
+  `NetworkEnforced=False`); `kind-coxswain-dev` with `make deploy-dev`
+  (kindnet, `--allow-unenforced-network`, Loops run, i42-e2e passes).
+
+### What exists vs. what's missing
+
+**Exists today:**
+- The D30 gate pattern (`Enforcer` interface, `PolicyEnforced` condition,
+  `--allow-unenforced` flag, Suspended logic in `ensureSandbox`).
+- The `verify-cni.sh` probe script (the logic the `CNIProber` will run).
+- The `config/dev` kustomize overlay (sets `--allow-unenforced`; will also
+  need `--allow-unenforced-network`).
+- The `kind-calico-up` Makefile target (Calico profile; will need to verify
+  it does NOT set the escape hatch).
+
+**Missing (to build):**
+- The `CNIProber` interface + implementation.
+- The `NetworkEnforced` condition type + event + metric.
+- The `--allow-unenforced-network` flag (separate from `--allow-unenforced`).
+- The `--cni-check-interval` and `--cni-probe-image` flags.
+- The probe goroutine + result cache in the operator.
+- The temp-namespace creation + probe pod + NetworkPolicy + cleanup in the
+  operator (RBAC: namespaced Role in the temp namespace).
+- Envtests with mutation checks.
+- Kind acceptance runs on all three profiles.
+- `config/dev` updated to set `--allow-unenforced-network`.

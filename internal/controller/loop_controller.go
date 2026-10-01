@@ -135,7 +135,9 @@ type LoopReconciler struct {
 	CNIRegateSource source.TypedSource[reconcile.Request]
 
 	// Recorder emits the Kubernetes Event on a NetworkEnforced condition
-	// change (D38 design point 3). nil (most envtests) = no Event.
+	// change (D38 design point 3). nil (most envtests) = no Event. Typed with
+	// client-go's record.EventRecorder so the manager's GetEventRecorderFor and
+	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev

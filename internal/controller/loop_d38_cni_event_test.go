@@ -60,7 +60,7 @@ var _ = Describe("D38 NetworkEnforced condition-change Event", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "ev1", Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      "g",
-				Workspace: coxv1alpha1.Workspace{Repo: "https://example.com/x.git"},
+				Workspace: testWorkspace(),
 				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
 			},
 		}
@@ -69,6 +69,26 @@ var _ = Describe("D38 NetworkEnforced condition-change Event", func() {
 	reconcileLoop := func(r *LoopReconciler, ns, name string) {
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		Expect(err).NotTo(HaveOccurred())
+	}
+
+	// drainEvents drains the FakeRecorder's event CHANNEL into a slice so it
+	// can be asserted with ContainElement. (Gomega's ContainElement only works
+	// on slices/arrays/maps, not channels.)
+	drainEvents := func() []string {
+		var out []string
+	Loop:
+		for {
+			select {
+			case e, ok := <-recorder.Events:
+				if !ok {
+					break Loop
+				}
+				out = append(out, e)
+			default:
+				break Loop
+			}
+		}
+		return out
 	}
 
 	It("emits an Event on the initial condition and on a reason flip, and not on an unchanged result", func() {
@@ -85,7 +105,7 @@ var _ = Describe("D38 NetworkEnforced condition-change Event", func() {
 
 		// Initial Unknown condition is a change from nothing: an Event.
 		reconcileLoop(r, ns, "ev1")
-		Eventually(recorder.Events).Should(
+		Eventually(drainEvents, "5s", "100ms").Should(
 			ContainElement(ContainSubstring("NetworkEnforced=Unknown reason=Unknown")),
 			"the initial fail-closed Unknown condition must emit an Event")
 
@@ -93,15 +113,15 @@ var _ = Describe("D38 NetworkEnforced condition-change Event", func() {
 		// second Event with the new reason is emitted.
 		prober.SetResult(cni.CNIProbeResult{Reason: cni.ReasonCNIUnenforced, Detail: "EXTERNAL"})
 		reconcileLoop(r, ns, "ev1")
-		Eventually(recorder.Events).Should(
+		Eventually(drainEvents, "5s", "100ms").Should(
 			ContainElement(ContainSubstring("reason=CNIUnenforced")),
 			"a reason flip must emit an Event")
 
 		// An unchanged result emits no further NetworkEnforced Event
-		// (change-only semantics).
-		count := len(recorder.Events)
+		// (change-only semantics): the channel receives nothing while we
+		// re-reconcile and for a beat afterwards.
 		reconcileLoop(r, ns, "ev1")
-		Consistently(func() int { return len(recorder.Events) }, "2s").
-			Should(Equal(count), "an unchanged result must not re-emit the Event")
+		Consistently(drainEvents, "2s", "100ms").Should(BeEmpty(),
+			"an unchanged result must not re-emit the Event")
 	})
 })

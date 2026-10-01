@@ -57,7 +57,7 @@ var _ = Describe("D38 CNI self-test gate (D38s1)", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "l1", Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      "g",
-				Workspace: coxv1alpha1.Workspace{Repo: "https://example.com/x.git"},
+				Workspace: testWorkspace(),
 				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
 			},
 		}

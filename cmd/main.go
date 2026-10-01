@@ -284,7 +284,12 @@ func main() {
 		// D38: the NetworkEnforced condition-change Event (the manager's
 		// recorder posts it as a Kubernetes Event; the re-gate Event lives
 		// in the probe Runnable).
-		Recorder: mgr.GetEventRecorderFor("loop-controller"),
+		// GetEventRecorderFor is deprecated in controller-runtime v0.25 in favour
+		// of GetEventRecorder (new events.k8s.io/v1 API) — but that returns the
+		// new events.EventRecorder (AnnotatedEventf) whose method set differs
+		// from LoopReconciler.Recorder (client-go record.EventRecorder). Keep the
+		// old (v1 Event, still fully supported) API until the recorder is ported.
+		Recorder: mgr.GetEventRecorderFor("loop-controller"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")
 		os.Exit(1)

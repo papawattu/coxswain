@@ -44,6 +44,7 @@ CTX="${K8S_CONTEXT:-$(kubectl config current-context 2>/dev/null)}"
 [ -n "$CTX" ] || { echo "FATAL: no kubectl context (set K8S_CONTEXT or kubectl config current-context)"; exit 2; }
 NS="coxswain-verify-cni-$$-$RANDOM"
 PROBE_POD="cni-probe"
+PROBE_IMAGE="${PROBE_IMAGE:-python:3-alpine}"
 TMPDIR="${TMPDIR:-/tmp}/verify-cni.$$"
 mkdir -p "$TMPDIR"
 
@@ -60,6 +61,49 @@ fail_jsonpath() { python3 -c "$1" 2>/dev/null || grep "$2" 2>/dev/null; }
 jsonpath() { # $1 = python expr over sys.stdin json, $2 = grep -oE fallback
   python3 -c "$1" 2>/dev/null || grep "$2" 2>/dev/null
 }
+
+# ---------------------------------------------------------------------------
+# Self-test: prove the result-validation logic rejects a broken probe
+# (exit 2) rather than false-passing (exit 0). This runs the same parsing
+# code path the main script uses, but against a synthetic results.txt that
+# simulates a probe that produced no output (e.g. image without python3).
+# ---------------------------------------------------------------------------
+self_test_broken_probe() {
+  local ST_DIR="$1"
+  local ST_RESULTS="$ST_DIR/self-test-results.txt"
+  local ST_EXPECTED=5
+  # Simulate: probe ran but produced a stderr line and no RESULT lines
+  # (e.g. "sh: python3: not found" with an empty result set).
+  printf 'sh: python3: not found\n' > "$ST_RESULTS"
+  local TOTAL=0 TOTAL_FAIL=0 PROBE_ERROR=0 SEEN_LABELS=""
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      RESULT\ *)
+        TOTAL=$((TOTAL + 1))
+        ;;
+      "")
+        ;;
+      *)
+        PROBE_ERROR=1
+        ;;
+    esac
+  done < "$ST_RESULTS"
+  if [ "$PROBE_ERROR" -eq 1 ] || [ "$TOTAL" -ne "$ST_EXPECTED" ]; then
+    return 0  # correct: rejected
+  else
+    return 1  # bug: would have false-passed
+  fi
+}
+
+# Run the self-test before the main flow.
+SELF_TEST_DIR=$(mktemp -d)
+if ! self_test_broken_probe "$SELF_TEST_DIR"; then
+  echo "FATAL: self-test failed — the result-validation logic would FALSE-PASS on a broken probe."
+  rm -rf "$SELF_TEST_DIR" 2>/dev/null || true
+  exit 2
+fi
+rm -rf "$SELF_TEST_DIR" 2>/dev/null || true
 
 echo "=== D38 CNI preflight: verify-cni ==="
 echo "kubectl context: $CTX (K8S_CONTEXT=${K8S_CONTEXT:-<current context>})"
@@ -82,6 +126,7 @@ echo "   apiserver svc IP:   $APISERVER_SVC_IP:443"
 for ip in $NODE_IPS; do echo "   node InternalIP:      $ip:6443, $ip:10250"; done
 echo "   kube-dns pod IP:    $DNS_POD_IP (allowed, DNS only)"
 echo "   external:           $EXTERNAL_IP:443"
+echo "   probe image:        $PROBE_IMAGE"
 
 echo
 echo "--- STEP 1: temp namespace + agent-shaped NetworkPolicy + probe pod ---"
@@ -120,19 +165,10 @@ spec:
           port: 53
 EOF
 K -n "$NS" apply -f "$TMPDIR/netpol.yaml" >/dev/null
-# Probe pod: golang:1.26 (the agent stand-in image the D38 e2e already uses),
-# matching the policy's podSelector (app.kubernetes.io/component=agent), no
-# kind-load assumption (pulled normally by the node). It ships python3,
-# which gives a deterministic 4s TCP-connect probe (unlike busybox's /dev/tcp,
-# which requires bash and is not available in the Debian golang image's dash).
-# The probe runs via kubectl exec; it is written as a file and kubectl cp'd
-# (no python heredocs inside kubectl exec sh -c, per the i42-e2e house rule).
-# The layer under test is the CNI's egress rules: the D38 property is "a pod
-# carrying the agent's allowlist NetworkPolicy must not be able to reach
-# host-network destinations". On kindnet that property FAILS (the L1, review
-# docs/REVIEW-PHASE1-R16.md): the apiserver service IP, the node's :6443, and
-# the kubelet's :10250 are all REACHABLE, while pod-IP and external-IP egress
-# is blocked. On Calico all five targets are BLOCKED.
+# Probe pod: $PROBE_IMAGE (default python:3-alpine), matching the
+# policy's podSelector (app.kubernetes.io/component=agent), no kind-load
+# assumption (pulled normally by the node). It ships python3, which gives
+# a deterministic 4s TCP-connect probe. Overridable via PROBE_IMAGE env var.
 cat > "$TMPDIR/probe.yaml" <<EOF
 apiVersion: v1
 kind: Pod
@@ -146,11 +182,11 @@ spec:
   restartPolicy: Never
   containers:
     - name: probe
-      image: golang:1.26
-      command: ["sleep", "infinity"]
+      image: ${PROBE_IMAGE}
+      command: ["python3", "-c", "import time; time.sleep(999999)"]
 EOF
 K -n "$NS" apply -f "$TMPDIR/probe.yaml" >/dev/null
-echo "   applying NetworkPolicy + probe pod (golang:1.26, pulled from the registry)..."
+echo "   applying NetworkPolicy + probe pod ($PROBE_IMAGE, pulled from the registry)..."
 READY=""
 for i in $(seq 1 60); do
   PHASE=$(K -n "$NS" get pod "$PROBE_POD" -o jsonpath='{.status.phase}' 2>/dev/null)
@@ -166,15 +202,15 @@ echo
 echo "--- STEP 2: TCP-connect probes from the probe pod ---"
 # The probe is a raw TCP-CONNECT test — the exact layer the CNI polices.
 # A completed connect means the CNI let the egress through (REACHABLE);
-# a timeout/refused connect means it was dropped (BLOCKED). golang:1.26
-# ships python3, so the probe uses a 4s socket timeout per target (the same
-# approach as d38-cni-e2e.sh's probe.py). This is the D38 property under
-# test: on kindnet the apiserver service IP, the node's :6443, and the
-# kubelet's :10250 are REACHABLE (the L1, review docs/REVIEW-PHASE1-R16.md);
-# on Calico all five targets are BLOCKED. The CROSS_NS_POD target uses
-# port 8080 on the kube-dns pod IP (not 53) because the policy ALLOWS DNS
-# on 53; the L1 test used :8080 on the coredns pod IP to verify pod-to-pod
-# egress blocking.
+# a timeout/refused connect means it was dropped (BLOCKED). The probe image
+# (default python:3-alpine) ships python3, so the probe uses a 4s socket
+# timeout per target (the same approach as d38-cni-e2e.sh's probe.py).
+# This is the D38 property under test: on kindnet the apiserver service IP,
+# the node's :6443, and the kubelet's :10250 are REACHABLE (the L1, review
+# docs/REVIEW-PHASE1-R16.md); on Calico all five targets are BLOCKED.
+# The CROSS_NS_POD target uses port 8080 on the kube-dns pod IP (not 53)
+# because the policy ALLOWS DNS on 53; the L1 test used :8080 on the coredns
+# pod IP to verify pod-to-pod egress blocking.
 NODE_IPS_ENV=$(echo $NODE_IPS | tr ' ' '\n' | sort -u | tr '\n' ' ')
 cat > "$TMPDIR/probe.py" <<PYEOF
 import os, socket
@@ -197,6 +233,14 @@ probe("EXTERNAL", os.environ["EXTERNAL_IP"], 443)
 PYEOF
 K -n "$NS" cp "$TMPDIR/probe.py" "$PROBE_POD:/tmp/verify-cni-probe.py" >/dev/null 2>&1 || { echo "FATAL: kubectl cp probe.py failed"; exit 2; }
 K -n "$NS" exec "$PROBE_POD" -- sh -c "APISERVER_SVC_IP=${APISERVER_SVC_IP} NODE_IPS='${NODE_IPS_ENV}' DNS_POD_IP=${DNS_POD_IP} EXTERNAL_IP=${EXTERNAL_IP} python3 /tmp/verify-cni-probe.py" > "$TMPDIR/results.txt" 2>&1
+EXEC_RC=$?
+if [ $EXEC_RC -ne 0 ]; then
+  echo "FATAL: the probe exec exited with rc=$EXEC_RC — the probe could not run."
+  echo "      (Check the probe image: $PROBE_IMAGE must ship python3.)"
+  echo "      --- raw probe output ---"
+  cat "$TMPDIR/results.txt"
+  exit 2
+fi
 cat "$TMPDIR/results.txt"
 [ -s "$TMPDIR/results.txt" ] || { echo "FATAL: the probe produced no output (check the pod: kubectl --context $CTX -n $NS logs $PROBE_POD)"; exit 2; }
 
@@ -208,14 +252,25 @@ echo "-------------------------------------------------------------"
 # D38 "polices pod -> host-network egress" property; the pod-IP and
 # external rows are included for completeness (most CNIs already police
 # those).
+# Expected label count: 1 (APISERVER_SVC) + 2*node_count (APISERVER_NODE +
+# KUBELET_NODE per node) + 1 (CROSS_NS_POD) + 1 (EXTERNAL) = 3 + 2*node_count
+EXPECTED_TOTAL=$((3 + 2 * $(echo $NODE_IPS | wc -w)))
 HOSTNET_FAIL=0
 TOTAL_FAIL=0
 TOTAL=0
+SEEN_LABELS=""
+PROBE_ERROR=0
 while read -r line; do
   case "$line" in
     RESULT\ *)
       label=$(echo "$line" | awk '{print $2}' | cut -d'(' -f1)
       TOTAL=$((TOTAL + 1))
+      # Check for duplicate labels (each must appear exactly once)
+      if echo "$SEEN_LABELS" | grep -qxF "$label"; then
+        echo "ERROR: duplicate label $label in probe output" >&2
+        PROBE_ERROR=1
+      fi
+      SEEN_LABELS="$SEEN_LABELS$label\n"
       case "$line" in
         *REACHABLE*)
           status="REACHABLE  <-- CNI LET IT THROUGH"
@@ -229,8 +284,25 @@ while read -r line; do
       esac
       printf '%-45s %s\n' "$label" "$status"
       ;;
+    "")
+      ;; # skip blank lines
+    *)
+      # Any non-RESULT line is an error (probe crashed, stderr leaked, etc.)
+      echo "ERROR: non-RESULT line in probe output: $line" >&2
+      PROBE_ERROR=1
+      ;;
   esac
 done < "$TMPDIR/results.txt"
+
+# Strict validation: TOTAL must equal EXPECTED_TOTAL, and there must be no
+# probe errors. This prevents a FALSE-PASS when the probe can't run
+# (e.g. image without python3 → empty results.txt → TOTAL=0 → PASS).
+if [ "$PROBE_ERROR" -eq 1 ] || [ "$TOTAL" -ne "$EXPECTED_TOTAL" ]; then
+  echo "FATAL: probe output validation failed (TOTAL=$TOTAL, EXPECTED=$EXPECTED_TOTAL, PROBE_ERROR=$PROBE_ERROR)."
+  echo "      --- raw probe output ---"
+  cat "$TMPDIR/results.txt"
+  exit 2
+fi
 
 echo
 if [ "$TOTAL_FAIL" -eq 0 ]; then

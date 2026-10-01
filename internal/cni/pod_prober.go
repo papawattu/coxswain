@@ -423,9 +423,11 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 	} else {
 		res.Reason = ReasonCNIEnforced
 	}
-	// Record the result in the holder (the reconcile loop reads it via
-	// LatestResult).
-	Holder().Set(res)
+	// Record the result in the holder — no: probeOnce (the Runnable) is the
+	// ONLY writer to the holder. If parse() wrote it here, probeOnce's
+	// Holder().Set(newResult) would read changed=false (the value is already
+	// set) and skip retage (no log, no metric, no re-gate GenericEvent), so
+	// Loops would never be re-reconciled on the new result.
 	return res, nil
 }
 

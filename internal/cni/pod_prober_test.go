@@ -244,3 +244,31 @@ func TestPodProberGetReader(t *testing.T) {
 		t.Errorf("getReader() should fall back to the Client when Reader is nil, got %T (want %T)", got2, fakeClient)
 	}
 }
+
+// D38s3 (Calico run): the holder must be written ONLY by probeOnce (the
+// Runnable). parse() must NOT call Holder().Set — if it did, probeOnce's own
+// Holder().Set(newResult) would read changed=false and skip the re-gate
+// (no log, no metric, no GenericEvent), so Loops would keep the stale Unknown
+// condition forever. This test drives parse() directly and asserts the holder
+// is untouched (still Unknown, the pre-parse state).
+func TestParseDoesNotWriteTheHolder(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	// The holder starts at Unknown.
+	if got := Holder().Result().Reason; got != ReasonUnknown {
+		t.Fatalf("precondition: holder should start at Unknown, got %v", got)
+	}
+
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
+	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE"
+	// parse() returns CNIEnforced for all-BLOCKED — but it must NOT write the
+	// holder. probeOnce (the Runnable) is the only writer.
+	if _, err := p.parse(allBlocked, pod(allBlocked, 0)); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// The holder must STILL be Unknown: parse() must not have written it.
+	if got := Holder().Result().Reason; got != ReasonUnknown {
+		t.Fatalf("parse() wrote the holder (reason=%v); the holder must only be written by probeOnce (the Runnable)", got)
+	}
+}

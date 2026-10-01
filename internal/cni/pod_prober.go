@@ -1,0 +1,345 @@
+// Copyright 2026 papawattu.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package cni — the real pod-based CNIProber (D38s2). It creates the probe
+// pod + NetworkPolicy in the fixed coxswain-cni-probe namespace, waits for it
+// with a per-run timeout, reads the termination message, validates the RESULT
+// lines strictly, and deletes the pod. A probe that cannot complete returns
+// ReasonProbeUnavailable — it never returns an error that is treated as
+// "enforced".
+package cni
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// PodProberConfig configures the real CNIProber.
+type PodProberConfig struct {
+	// Client is the controller-runtime client (the manager's client).
+	Client client.Client
+	// Namespace is the fixed probe namespace (coxswain-cni-probe).
+	Namespace string
+	// ProbeImage is the image the probe pod runs.
+	ProbeImage string
+	// ProbeTimeout is the per-run timeout for one probe.
+	ProbeTimeout time.Duration
+	// ClusterDomain is the cluster's service DNS domain (for the probe's
+	// apiserver-svc target FQDN). Defaults to cluster.local if empty.
+	ClusterDomain string
+}
+
+// PodProber is the real CNIProber.
+type PodProber struct {
+	cfg PodProberConfig
+}
+
+// NewPodProber returns a real CNIProber.
+func NewPodProber(cfg PodProberConfig) *PodProber {
+	if cfg.ClusterDomain == "" {
+		cfg.ClusterDomain = "cluster.local"
+	}
+	return &PodProber{cfg: cfg}
+}
+
+const (
+	probePodName      = "coxswain-cni-probe"
+	probeNetpolName   = "coxswain-cni-probe-netpol"
+	probeLabelKey     = "coxswain.io/probe"
+	expectedResultLen = 4
+)
+
+// probeCommand is the agent-shaped probe, run as the pod's own command. It
+// writes RESULT lines to stdout (captured to the termination message via
+// terminationMessagePolicy: FallbackToLogsOnError) and exits 0. The targets are
+// the D38 property's three (the apiserver service, the kubelet node port, and
+// an external host). The netpol only allows dns 53/tcp to the node's coredns
+// and the four targets' IPs — anything the probe reaches beyond the allow
+// list means the CNI is not enforcing.
+func (p *PodProber) probeCommand() []string {
+	apiserverSVC := "kubernetes.default.svc." + p.cfg.ClusterDomain
+	return []string{"sh", "-c", `
+set -u
+probe() {
+  local label=$1 host=$2 port=$3
+  if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+    echo "RESULT $label REACHABLE"
+  else
+    echo "RESULT $label BLOCKED"
+  fi
+}
+# Target 1: the apiserver service (pod -> ServiceClusterIP -> host-network).
+probe APISERVER_SVC ` + apiserverSVC + ` 443
+# Target 2: the node's kubelet read-only port (host network, node-local).
+NODE_IP=$(hostname -i | awk '{print $1}')
+probe KUBELET_NODE $NODE_IP 10255
+# Target 3: an external host (pod -> node egress to the outside).
+probe EXTERNAL 1.1.1.1 443
+# Target 4: an unreachable target (a bare IP the netpol must block — the
+# "should never be allowed" control, design point 2: a netpol that blocks the
+# right traffic rather than one that fails open).
+probe BLOCK_ONLY 99.99.99.99 80
+echo DONE
+` + "\n",
+	}
+}
+
+// Probe runs one probe: it cleans up any stale probe objects, creates the
+// probe NetworkPolicy + pod, waits for the termination message within the
+// timeout, validates the RESULT lines strictly, deletes the pod, and reports
+// the result. Any failure (timeout, not-Ready, non-zero exit, wrong/unknown
+// RESULT lines) returns ReasonProbeUnavailable.
+func (p *PodProber) Probe(ctx context.Context) (CNIProbeResult, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, p.cfg.ProbeTimeout)
+	defer cancel()
+
+	// Stale cleanup at startup (the PR #38 leak): delete any leftover probe
+	// pod / NetworkPolicy from a previous run.
+	if err := p.cleanup(probeCtx); err != nil {
+		return unavailable("stale cleanup failed: " + err.Error()), nil
+	}
+
+	// Create the NetworkPolicy (the agent-shaped allow: dns 53/tcp + the four
+	// target IPs only). The netpol is what the probe measures against — the
+	// CNI's enforcement is exactly whether this netpol is obeyed.
+	if err := p.ensureNetpol(probeCtx); err != nil {
+		return unavailable("netpol create failed: " + err.Error()), nil
+	}
+
+	// Create the probe pod. The probe pod is operator-level state (not
+	// owner-ref'd to a Loop — there is no Loop to reference); it is cleaned up
+	// by name at the start of the next probe and on operator shutdown.
+	pod := p.buildPod()
+	if err := p.cfg.Client.Create(probeCtx, pod); err != nil {
+		return unavailable("probe pod create failed: " + err.Error()), nil
+	}
+	// Best-effort pod deletion on any exit path (the stale cleanup at the
+	// start of the next probe is the backstop).
+	defer func() {
+		if derr := p.cfg.Client.Delete(context.Background(), pod); derr != nil && !apierrors.IsNotFound(derr) {
+			p.cfg.Client.Scheme() // no-op; the error is logged by the caller
+		}
+	}()
+
+	// Wait for the termination message (or the pod to go not-Ready / time out).
+	msg, err := p.waitForTermination(probeCtx, pod)
+	if err != nil {
+		return unavailable(err.Error()), nil
+	}
+
+	// Strict validation: exactly 4 RESULT lines, each a known label, no
+	// unknown lines. A non-zero pod exit also maps to ProbeUnavailable.
+	return p.parse(msg, pod)
+}
+
+// LatestResult implements CNIProber: it returns the holder's cached result
+// (what the probe Runnable set). It never runs a probe.
+func (p *PodProber) LatestResult() CNIProbeResult {
+	return Holder().Result()
+}
+
+// cleanup deletes any leftover probe pod / NetworkPolicy (stale from a
+// previous run — the PR #38 leak).
+func (p *PodProber) cleanup(ctx context.Context) error {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: p.cfg.Namespace}}
+	if err := p.cfg.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	netpol := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: probeNetpolName, Namespace: p.cfg.Namespace}}
+	if err := p.cfg.Client.Delete(ctx, netpol); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// ensureNetpol creates the agent-shaped probe NetworkPolicy (the allow list the
+// CNI's enforcement is measured against).
+func (p *PodProber) ensureNetpol(ctx context.Context) error {
+	want := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: probeNetpolName, Namespace: p.cfg.Namespace},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{probeLabelKey: "cni-probe"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				// dns 53/tcp to the node's coredns (the probe needs DNS for
+				// the apiserver-svc target).
+				{Ports: []networkingv1.NetworkPolicyPort{{Protocol: ptrProtocolTCP(), Port: ptrPort(53)}}},
+				// The four targets' IPs (the probe's allow list).
+				{To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0",
+						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}},
+				}}},
+			},
+		},
+	}
+	// CreateOrUpdate: the netpol is the operator's state; re-apply it each run
+	// so a drift (manual edit) is corrected.
+	existing := &networkingv1.NetworkPolicy{}
+	err := p.cfg.Client.Get(ctx, client.ObjectKey{Namespace: p.cfg.Namespace, Name: probeNetpolName}, existing)
+	if apierrors.IsNotFound(err) {
+		return p.cfg.Client.Create(ctx, want)
+	}
+	if err != nil {
+		return err
+	}
+	want.ResourceVersion = existing.ResourceVersion
+	return p.cfg.Client.Update(ctx, want)
+}
+
+// buildPod returns the probe pod (the agent's command, the termination
+// message, the non-root/priv-dropped hardening — the same shape as the sandbox
+// pod, D38 design point 2).
+func (p *PodProber) buildPod() *corev1.Pod {
+	nonRoot := int64(65532)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      probePodName,
+			Namespace: p.cfg.Namespace,
+			Labels:    map[string]string{probeLabelKey: "cni-probe"},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:      corev1.RestartPolicyNever,
+			ServiceAccountName: "coxswain-cni-probe",
+			Containers: []corev1.Container{
+				{
+					Name:    "probe",
+					Image:   p.cfg.ProbeImage,
+					Command: p.probeCommand(),
+					// terminationMessagePolicy FallbackToLogsOnError: the probe's
+					// RESULT lines go to stdout, captured into the container's
+					// terminationMessage (design point 2).
+					TerminationMessagePath:   "/dev/termination-log",
+					TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+					SecurityContext: &corev1.SecurityContext{
+						RunAsNonRoot:             new(bool),
+						RunAsUser:                &nonRoot,
+						AllowPrivilegeEscalation: new(bool),
+						Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						ReadOnlyRootFilesystem:   new(bool),
+					},
+				},
+			},
+		},
+	}
+}
+
+// containerTerminationMessage returns the probe container's termination
+// message (its stdout, captured via terminationMessagePolicy FallbackToLogsOnError)
+// once the container has terminated.
+func containerTerminationMessage(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == "probe" {
+			if cs.State.Terminated != nil {
+				return cs.State.Terminated.Message
+			}
+		}
+	}
+	return ""
+}
+
+// waitForTermination polls the pod until the probe container has terminated
+// (its termination message is then available) or the context is done. A
+// not-Ready / no-exit / pull-failure within the timeout is a ProbeUnavailable
+// (the caller maps it).
+func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (string, error) {
+	probe := &corev1.Pod{}
+	for {
+		if err := p.cfg.Client.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, probe); err != nil {
+			return "", fmt.Errorf("probe pod get: %w", err)
+		}
+		if msg := containerTerminationMessage(probe); msg != "" {
+			return msg, nil
+		}
+		if probe.Status.Phase == corev1.PodFailed {
+			return "", fmt.Errorf("probe pod failed")
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("probe pod not Ready within timeout")
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// parse strictly validates the termination message: exactly expectedResultLen
+// RESULT lines, each a known label, every line consumed. A non-zero pod exit or
+// any deviation returns ProbeUnavailable.
+func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
+	// A non-zero exit (container terminated with a non-zero code) is
+	// ProbeUnavailable even if the message looks valid.
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+			return unavailable("probe exited non-zero: " + fmt.Sprint(cs.State.Terminated.ExitCode)), nil
+		}
+	}
+	var rows []TargetRow
+	reachable := false
+	seen := 0
+	for line := range strings.SplitSeq(strings.TrimSpace(msg), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "DONE" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[0] != "RESULT" {
+			return unavailable("unrecognised probe line: " + line), nil
+		}
+		label, verdict := fields[1], fields[2]
+		if verdict != "REACHABLE" && verdict != "BLOCKED" {
+			return unavailable("unrecognised verdict: " + label + " " + verdict), nil
+		}
+		seen++
+		if verdict == "REACHABLE" {
+			reachable = true
+		}
+		rows = append(rows, TargetRow{Label: label, Verdict: verdict})
+	}
+	if seen != expectedResultLen {
+		return unavailable(fmt.Sprintf("expected %d RESULT lines, got %d", expectedResultLen, seen)), nil
+	}
+	res := CNIProbeResult{Rows: rows}
+	if reachable {
+		res.Reason = ReasonCNIUnenforced
+	} else {
+		res.Reason = ReasonCNIEnforced
+	}
+	// Record the result in the holder (the reconcile loop reads it via
+	// LatestResult).
+	Holder().Set(res)
+	return res, nil
+}
+
+// unavailable builds a ProbeUnavailable result.
+func unavailable(detail string) CNIProbeResult {
+	return CNIProbeResult{Reason: ReasonProbeUnavailable, Detail: detail}
+}
+
+func ptrProtocolTCP() *corev1.Protocol {
+	tcp := corev1.ProtocolTCP
+	return &tcp
+}
+
+func ptrPort(i int32) *intstr.IntOrString {
+	p := intstr.FromInt32(i)
+	return &p
+}

@@ -54,6 +54,14 @@ func (f *FakeProber) SetResult(r CNIProbeResult) {
 	f.NextResult = r
 }
 
+// LatestResult implements CNIProber: the fake returns its configured result
+// (what the specs drive), never runs a probe.
+func (f *FakeProber) LatestResult() CNIProbeResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.NextResult
+}
+
 // CallsCount returns how many times Probe was called.
 func (f *FakeProber) CallsCount() int {
 	f.mu.Lock()

@@ -34,6 +34,7 @@ import (
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/cni"
 	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
@@ -55,6 +56,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
@@ -106,6 +108,30 @@ type LoopReconciler struct {
 	// Loops run with PolicyEnforced=False reason EnforcementDisabled rather
 	// than being held Suspended. For dev/kind only — never in production.
 	AllowUnenforced bool
+
+	// CNIProber is the network-layer seam the operator uses (D38), analogous to
+	// Enforcer (D30). When set, the operator gates the sandbox on the CNI probe
+	// result (NetworkEnforced condition): a CNI that does not police pod ->
+	// host-network egress — or an unavailable probe — holds the sandbox
+	// Suspended (fail-closed) unless AllowUnenforcedNetwork is set.
+	// When nil, the gate applies from the shared holder (cni.Holder()), which
+	// starts Unknown — and Unknown holds the sandbox Suspended. The probe
+	// itself runs in the leader-elected Runnable (internal/cni); the reconcile
+	// only reads the current result via LatestResult().
+	CNIProber cni.CNIProber
+	// AllowUnenforcedNetwork is the off-by-default network escape hatch (D38),
+	// separate from AllowUnenforced (the eBPF gate): when true, Loops run with
+	// NetworkEnforced=False reason EnforcementDisabled rather than being held
+	// Suspended. For dev/kind only — never in production.
+	AllowUnenforcedNetwork bool
+
+	// CNIRegateSource is the source the Loop controller watches for CNI probe
+	// re-gate requests (D38, design point 3a). When set, SetupWithManager adds
+	// a WatchesRawSource on it; a result change enqueues every Loop so it
+	// re-reads the cached probe result and re-gates. When nil (envtest) the
+	// controller only re-gates on its normal watch (the probe result is read on
+	// each reconcile anyway).
+	CNIRegateSource source.TypedSource[reconcile.Request]
 
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
@@ -186,6 +212,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if len(loop.Spec.PolicyRefs) > 0 {
 		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
 	}
+
+	// D38: capture the condition set before applyEffectivePolicyAndConditions so
+	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
+	// probe result change) still triggers a status update. Without this, the
+	// "re-gate on flip" spec would never persist the new condition.
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
 
 	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
@@ -289,7 +322,9 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			changed = true
 		}
 	}
-	if changed {
+	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
+
+	if changed || conditionsChanged {
 		if err := r.Status().Update(ctx, &loop); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -331,6 +366,53 @@ func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha
 		return true, engine.ReasonEnforcementDisabled // run anyway, not enforced
 	}
 	return enforcing, reason
+}
+
+// cniNetworkStatus (D38) reports whether the cluster's CNI polices pod ->
+// host-network egress, from the cached probe result (the probe itself runs in
+// the leader-elected Runnable — internal/cni; the reconcile only reads the
+// cache). With AllowUnenforcedNetwork set it reports "run anyway" (the
+// condition records EnforcementDisabled). The holder starts Unknown and
+// Unknown holds the sandbox Suspended: the operator is fail-closed from
+// startup, not just from the first probe failure.
+func (r *LoopReconciler) cniNetworkStatus() (run bool, reason cni.Reason, status metav1.ConditionStatus, message string) {
+	// No prober wired: the CNI gate does not apply (the operator is not
+	// configured to probe the CNI). This is the envtest path for specs that
+	// don't set a fake prober, and a no-op in production before the probe
+	// Runnable is registered. The gate is active only when a prober is wired
+	// (D38 production path), in which case the holder starts Unknown and
+	// Unknown holds the sandbox Suspended (fail-closed from startup).
+	if r.CNIProber == nil {
+		return true, cni.ReasonUnknown, metav1.ConditionUnknown, "CNI probe not configured; gate not active"
+	}
+	// The reconcile loop reads the CURRENT result from the prober (the real
+	// implementation's LatestResult returns the holder's cached result; the
+	// fake returns its configured result). It NEVER runs the probe (design
+	// point 3a).
+	res := r.CNIProber.LatestResult()
+	// The escape hatch is AllowUnenforcedNetwork (separate from AllowUnenforced
+	// — the two flags are independent). When set, the Loop runs with the
+	// condition recording EnforcementDisabled, regardless of the result.
+	if r.AllowUnenforcedNetwork && res.Reason != cni.ReasonCNIEnforced {
+		return true, cni.ReasonEnforcementDisabled, metav1.ConditionFalse,
+			"--allow-unenforced-network is set: the Loop runs but the CNI does NOT police pod -> host-network egress (dev escape hatch)"
+	}
+	if !res.HoldsSuspended() {
+		// CNIEnforced (True) or EnforcementDisabled (escape hatch set).
+		if res.Reason == cni.ReasonCNIEnforced {
+			return true, res.Reason, metav1.ConditionTrue, res.Describe()
+		}
+		return true, cni.ReasonEnforcementDisabled, metav1.ConditionFalse,
+			"--allow-unenforced-network is set: the Loop runs but the CNI does NOT police pod -> host-network egress (dev escape hatch)"
+	}
+	switch res.Reason {
+	case cni.ReasonUnknown:
+		return false, cni.ReasonUnknown, metav1.ConditionUnknown, "no CNI probe result yet; sandbox held Suspended (fail-closed)"
+	case cni.ReasonProbeUnavailable:
+		return false, cni.ReasonProbeUnavailable, metav1.ConditionFalse, "the CNI probe could not run; sandbox held Suspended (fail-closed): " + res.Detail
+	default: // CNIUnenforced
+		return false, cni.ReasonCNIUnenforced, metav1.ConditionFalse, "the CNI does not police pod -> host-network egress; sandbox held Suspended. " + res.Describe()
+	}
 }
 
 // PolicyEnforcedCondition is the non-phase condition type recording whether the
@@ -465,6 +547,18 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
 				foreignKaptPolicies(ctx, r, loop) {
 				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+			}
+			// D38: the CNI self-test gate (network layer, analogous to the D30
+			// eBPF gate above). Unknown (no probe result yet), CNIUnenforced,
+			// and ProbeUnavailable all hold the sandbox Suspended (fail-closed)
+			// unless AllowUnenforcedNetwork is set. The condition is set in
+			// applyEffectivePolicyAndConditions (order-independent, like the
+			// PolicyEnforced condition).
+			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
+				run, _, _, _ := r.cniNetworkStatus()
+				if !run {
+					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+				}
 			}
 		}
 		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
@@ -2118,6 +2212,12 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		}
 		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
 	}
+	// D38: the NetworkEnforced condition (network layer, analogous to
+	// PolicyEnforced). The escape hatch is AllowUnenforcedNetwork (separate
+	// from AllowUnenforced — the two flags are independent).
+	if _, reason, status, msg := r.cniNetworkStatus(); status != "" {
+		setCondition(loop, cni.NetworkEnforcedCondition, status, string(reason), msg)
+	}
 	return nil
 }
 
@@ -2257,7 +2357,7 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}); err != nil {
 		return fmt.Errorf("index Loop.spec.policyRefs: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&coxv1alpha1.Loop{}).
 		Owns(&sandboxv1beta1.Sandbox{}).
 		// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
@@ -2268,8 +2368,17 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// a policy created after its Loop must not leave the Loop stuck at
 		// PolicyNotFound; a policy edit must refresh the recorded hash).
 		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
-			r.agentPolicyToLoopRequests)).
-		Named("loop").
+			r.agentPolicyToLoopRequests))
+	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
+	// change enqueues every Loop so it re-reads the cached result and re-gates.
+	// Skipped when nil (envtest: the result is read on each reconcile anyway).
+	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
+	// change enqueues every Loop so it re-reads the cached result and re-gates.
+	// Skipped when nil (envtest: the result is read on each reconcile anyway).
+	if r.CNIRegateSource != nil {
+		b = b.WatchesRawSource(r.CNIRegateSource)
+	}
+	return b.Named("loop").
 		Complete(r)
 }
 

@@ -40,12 +40,26 @@ type resultHolder struct {
 	result CNIProbeResult
 }
 
-var holder = &resultHolder{result: CNIProbeResult{Reason: ReasonUnknown}}
-
-// Holder returns the shared result holder. Its initial state is Unknown
+// probeHolder is the shared holder. Its initial state is Unknown
 // (fail-closed: the gate holds Loops Suspended until the first probe result
 // lands, design point 3).
-func Holder() *resultHolder { return holder }
+var probeHolder = &resultHolder{result: CNIProbeResult{Reason: ReasonUnknown}}
+
+// testMux guards test-only holder resets.
+var testMux sync.Mutex
+
+// Holder returns the shared result holder.
+func Holder() *resultHolder { return probeHolder }
+
+// ResetForTest resets the holder to its initial Unknown state. TEST-ONLY:
+// specs reset it in BeforeEach/DeferCleanup so they are self-contained.
+// (The eBPF gate has no equivalent: the fake enforcer is per-spec, but the
+// probe result is shared operator state, so tests must own it explicitly.)
+func ResetForTest() {
+	testMux.Lock()
+	defer testMux.Unlock()
+	*probeHolder = resultHolder{result: CNIProbeResult{Reason: ReasonUnknown}}
+}
 
 // Result returns the latest probe result.
 func (h *resultHolder) Result() CNIProbeResult {
@@ -159,7 +173,7 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 				UID:        loop.UID,
 			},
 			Reason:  string(new.Reason),
-			Message: "NetworkEnforced: " + string(new.Reason) + " (" + new.describeResult() + ")",
+			Message: "NetworkEnforced: " + string(new.Reason) + " (" + new.Describe() + ")",
 			Source:  corev1.EventSource{Component: "coxswain-cni-prober"},
 		}
 		if err := p.Client.Create(ctx, ev); err != nil {

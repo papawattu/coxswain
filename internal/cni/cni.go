@@ -72,23 +72,18 @@ type TargetRow struct {
 // PolicyEnforced (D30) but for the network layer.
 const NetworkEnforcedCondition = "NetworkEnforced"
 
-// holdsSuspended reports whether a NetworkEnforced result holds Loops
+// HoldsSuspended reports whether a NetworkEnforced result holds Loops
 // Suspended. Every reason holds Suspended EXCEPT CNIEnforced (it's True) and
 // EnforcementDisabled (the escape hatch was set on purpose, so Loops run
 // anyway). Unknown and ProbeUnavailable hold Suspended: the operator is
 // fail-closed, including before the first probe result.
-func (r CNIProbeResult) holdsSuspended() bool {
+func (r CNIProbeResult) HoldsSuspended() bool {
 	switch r.Reason {
 	case ReasonCNIEnforced, ReasonEnforcementDisabled:
 		return false
 	default:
 		return true
 	}
-}
-
-// conditionStatus maps a result to the condition (status, reason).
-func (r CNIProbeResult) conditionStatus() (bool, Reason) {
-	return r.Reason == ReasonCNIEnforced, r.Reason
 }
 
 // CNIProber is the network-layer seam the operator uses (D38), analogous to
@@ -101,15 +96,26 @@ func (r CNIProbeResult) conditionStatus() (bool, Reason) {
 // a probe that cannot complete (timeout, pod not Ready, pull failure) must
 // return ReasonProbeUnavailable — never an error that is treated as
 // "enforced".
+//
+// The reconcile loop reads the CURRENT result through LatestResult() — the
+// real implementation's LatestResult returns the holder's cached result (the
+// probe itself runs in the leader-elected Runnable); the fake returns its
+// configured result, which is what the envtest specs drive. This keeps the
+// reconcile loop free of any probe execution (the probe runs in the
+// Runnable, never in the reconcile loop, design point 3a).
 type CNIProber interface {
 	// Probe runs one probe and reports the result. It is called by the
 	// leader-elected probe Runnable, not by the reconcile loop.
 	Probe(ctx context.Context) (CNIProbeResult, error)
+	// LatestResult returns the current result the reconcile loop should read
+	// (the cached result, or the fake's configured result). It must never
+	// run a probe.
+	LatestResult() CNIProbeResult
 }
 
-// describeResult renders a short message for the NetworkEnforced condition
+// Describe renders a short message for the NetworkEnforced condition
 // and the K8s Event.
-func (r CNIProbeResult) describeResult() string {
+func (r CNIProbeResult) Describe() string {
 	if r.Reason == ReasonProbeUnavailable && r.Detail != "" {
 		return fmt.Sprintf("probe unavailable: %s", r.Detail)
 	}

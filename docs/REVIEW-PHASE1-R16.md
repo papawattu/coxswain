@@ -14,7 +14,7 @@ envtest. That is itself the main lesson (see I43).
 ### D38. The agent can reach the control plane on CNIs that don't police pod→host-network egress
 
 - [x] Owner decision (2026-10-01): production CNI requirement (question 1 below): **a requirement on the property, plus a preflight check**
-- [ ] Owner decision: CNI-independent defence in depth (question 2 below)
+- [x] Owner decision (2026-10-01): CNI-independent defence in depth (question 2 below): **accept the residual risk on verified CNIs, with documented hardening, now; an operator-side CNI self-test next**
 - [ ] Planned as slices
 
 **Where:** the per-Loop agent NetworkPolicy (D34, I42c) on kind's default CNI,
@@ -74,6 +74,22 @@ assumed was closed.
 
    The reviewer suggests (c) plus documenting (b) now, and (a) if KubeArmor
    supports it.
+
+   **Owner decision (2026-10-01):**
+   - **Now (option b + hardening):** accept the residual risk on clusters
+     whose CNI passes `make verify-cni`. Document the residual risk, plus a
+     cluster-hardening checklist in the install docs: apiserver anonymous auth
+     disabled or restricted, the kubelet read-only port 10255 off, kubelet
+     authn/authz webhook on. Extend `verify-cni` with **WARN** (not FAIL) checks
+     for an open kubelet :10255 and for anonymous apiserver access.
+   - **Next (planned slice):** an operator-side **CNI self-test**. The operator
+     runs the verify-cni probe at startup (and periodically) and holds Loops
+     Suspended with a condition when the CNI doesn't police pod→host-network
+     egress, D30-style, overridable for dev (e.g. `--allow-unenforced-network`).
+     To be planned in docs/TDD-PLAN-PHASE1.md before it's built.
+   - **Not now:** an in-pod iptables init container (NET_ADMIN; the strongest
+     CNI-independent layer, which would need an ADR), and a KubeArmor IP/CIDR
+     rule (needs confirming that KubeArmor supports IP matching).
 
 **Fix direction:** add the CNI requirement to the docs/ADR. Add a kind profile
 with an enforcing CNI for the I42 e2e. The full I42 e2e records kindnet's

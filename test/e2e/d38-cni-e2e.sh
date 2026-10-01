@@ -239,6 +239,44 @@ esac
 # Loop Suspended, which the NetworkEnforced check above already catches).
 PROBE_NS=coxswain-cni-probe
 if K get ns "$PROBE_NS" >/dev/null 2>&1; then
+  # The probe pod's termination message (captured while the pod is live):
+  # the expected-BLOCKED targets (APISERVER_SVC, NODE_API, KUBELET_NODE) must
+  # be BLOCKED and the EXTERNAL positive control must be REACHABLE — the
+  # operator's own result, not just its condition.
+  PROBE_POD_LIVE=$(K -n "$PROBE_NS" get pods -l "coxswain.io/probe=cni-probe" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "$PROBE_POD_LIVE" ]; then
+    PROBE_MSG=$(K -n "$PROBE_NS" logs "$PROBE_POD_LIVE" 2>/dev/null)
+    echo "   live probe pod $PROBE_POD_LIVE termination message:"
+    echo "$PROBE_MSG" | sed 's/^/     /'
+    for LBL in APISERVER_SVC NODE_API KUBELET_NODE; do
+      if echo "$PROBE_MSG" | grep -q "RESULT $LBL REACHABLE"; then
+        bad "probe reports $LBL REACHABLE (the CNI must block it; the gate should not be CNIEnforced)"
+      elif echo "$PROBE_MSG" | grep -q "RESULT $LBL BLOCKED"; then
+        ok "probe reports $LBL BLOCKED"
+      fi
+    done
+    if echo "$PROBE_MSG" | grep -q "RESULT EXTERNAL REACHABLE"; then
+      ok "probe reports EXTERNAL REACHABLE (positive control: the probe has network egress)"
+    elif echo "$PROBE_MSG" | grep -q "RESULT EXTERNAL BLOCKED"; then
+      bad "probe reports EXTERNAL BLOCKED (the positive control failed: the probe has no network -> ProbeUnavailable)"
+    fi
+  else
+    echo "   (no live probe pod to read a termination message from — the operator deletes it after each run)"
+  fi
+  # NetworkPolicy shape: the probe netpol must be the verify-cni.sh shape
+  # (DNS-only egress to kube-system kube-dns), NOT the old agent-shaped
+  # 0.0.0.0/0-minus-RFC1918 allow list that let the external targets through.
+  PROBE_NETPOL=$(K -n "$PROBE_NS" get netpol coxswain-cni-probe-netpol -o json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['spec']['egress'][0], sort_keys=True))" 2>/dev/null)
+  echo "   probe netpol egress[0]: $PROBE_NETPOL"
+  case "$PROBE_NETPOL" in
+    *"kube-system"*"kube-dns"*)
+      if echo "$PROBE_NETPOL" | grep -q '"ipBlock"'; then
+        bad "probe netpol still carries an IPBlock (the old agent-shaped 0.0.0.0/0-minus-RFC1918 allow list — external targets are ALLOWED under it, so a REACHABLE external target is not a CNI failure)"
+      else
+        ok "probe netpol is the verify-cni.sh shape (DNS 53 UDP+TCP to kube-system kube-dns only; no IPBlock)"
+      fi ;;
+    *) bad "probe netpol is not the verify-cni.sh shape (missing the kube-system kube-dns peer): $PROBE_NETPOL" ;;
+  esac
   PROBE_PODS=$(K -n "$PROBE_NS" get pods --no-headers 2>/dev/null)
   echo "   probe namespace $PROBE_NS pods:"
   if [ -n "$PROBE_PODS" ]; then

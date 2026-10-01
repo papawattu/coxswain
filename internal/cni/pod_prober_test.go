@@ -56,8 +56,8 @@ func TestProbeCommandShape(t *testing.T) {
 	script := cmd[2]
 	for _, want := range []string{
 		"RESULT %s REACHABLE", "RESULT %s BLOCKED", "DONE",
-		"kubernetes.default.svc.cluster.local", "10250", "1.1.1.1", "99.99.99.99",
-		"settimeout",
+		"kubernetes.default.svc.cluster.local", "10250", "6443", "1.1.1.1",
+		"settimeout", "status.hostIP",
 		// The RESULT lines must be written to the termination message from
 		// the script itself (a clean exit leaves /dev/termination-log empty
 		// unless the script writes it; FallbackToLogsOnError only substitutes
@@ -68,11 +68,16 @@ func TestProbeCommandShape(t *testing.T) {
 			t.Errorf("probe script missing %q", want)
 		}
 	}
-	// The four target labels the parse() validator expects.
-	for _, label := range []string{"APISERVER_SVC", "KUBELET_NODE", "EXTERNAL", "BLOCK_ONLY"} {
+	// The four target labels the parse() validator expects. The node IP must
+	// come from the downward API (status.hostIP env NODE_IP) — the pod's own
+	// HOSTNAME resolves to the pod's own IP, never the node's.
+	for _, label := range []string{"APISERVER_SVC", "NODE_API", "KUBELET_NODE", "EXTERNAL"} {
 		if !strings.Contains(script, label) {
 			t.Errorf("probe script missing target label %q", label)
 		}
+	}
+	if strings.Contains(script, "99.99.99.99") || strings.Contains(script, "BLOCK_ONLY") {
+		t.Errorf("probe script still references the removed BLOCK_ONLY/99.99.99.99 target (allowed by the netpol — not a CNI check)")
 	}
 }
 
@@ -81,39 +86,57 @@ func TestProbeCommandShape(t *testing.T) {
 // ProbeUnavailable — never a false pass.
 func TestProbeParseStrictValidation(t *testing.T) {
 	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
-	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE"
+	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE"
 	res, err := p.parse(allBlocked, pod(allBlocked, 0))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	if res.Reason != ReasonCNIEnforced {
-		t.Fatalf("all BLOCKED -> CNIEnforced, got %v", res)
+		t.Fatalf("all expected-BLOCKED targets BLOCKED + control REACHABLE -> CNIEnforced, got %v", res)
 	}
 
-	oneReachable := "RESULT APISERVER_SVC REACHABLE\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE"
+	oneReachable := "RESULT APISERVER_SVC REACHABLE\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE"
 	res, err = p.parse(oneReachable, pod(oneReachable, 0))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	if res.Reason != ReasonCNIUnenforced {
-		t.Fatalf("one REACHABLE -> CNIUnenforced, got %v", res)
+		t.Fatalf("one expected-BLOCKED target REACHABLE -> CNIUnenforced, got %v", res)
+	}
+	// The Event/condition message renders "REACHABLE targets: " + Detail, so
+	// Detail must carry the reachable expected-BLOCKED label (otherwise the
+	// message reads "REACHABLE targets: " with nothing after it).
+	if res.Detail != "APISERVER_SVC" {
+		t.Fatalf("CNIUnenforced Detail must list the reachable expected-BLOCKED labels, got %q", res.Detail)
 	}
 
-	cases := map[string]struct {
-		msg  string
-		exit int32
+	for _, tc := range []struct {
+		name, msg string
+		exit      int32
 	}{
-		"missing RESULT line": {"RESULT APISERVER_SVC BLOCKED\nDONE", 0},
-		"unknown label":       {"RESULT APISERVER_SVC BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT WHATEVER BLOCKED\nDONE", 0},
-		"unknown verdict":     {"RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE", 0},
-		"non-zero exit":       {allBlocked, 1},
-		"empty message":       {"", 0},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
+		// EXTERNAL is the positive control: a BLOCKED control means the probe
+		// has no network -> ProbeUnavailable, never CNIEnforced on an
+		// unproven fence.
+		{"BLOCKED control -> ProbeUnavailable", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nDONE", 0},
+		// EXTERNAL REACHABLE with the expected-BLOCKED targets BLOCKED is the
+		// normal PASS case, not a control failure.
+		{"EXTERNAL REACHABLE is not a control failure", allBlocked, 0},
+		{"missing RESULT line", "RESULT APISERVER_SVC BLOCKED\nDONE", 0},
+		{"unknown label", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT WHATEVER BLOCKED\nDONE", 0},
+		{"unknown verdict", "RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE", 0},
+		{"non-zero exit", allBlocked, 1},
+		{"empty message", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			res, err := p.parse(tc.msg, pod(tc.msg, tc.exit))
 			if err != nil {
 				t.Fatalf("parse: %v", err)
+			}
+			if tc.name == "EXTERNAL REACHABLE is not a control failure" {
+				if res.Reason != ReasonCNIEnforced {
+					t.Fatalf("want CNIEnforced, got %v (detail=%q)", res.Reason, res.Detail)
+				}
+				return
 			}
 			if res.Reason != ReasonProbeUnavailable {
 				t.Fatalf("want ProbeUnavailable, got %v (detail=%q)", res.Reason, res.Detail)
@@ -261,7 +284,7 @@ func TestParseDoesNotWriteTheHolder(t *testing.T) {
 	}
 
 	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
-	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE"
+	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE"
 	// parse() returns CNIEnforced for all-BLOCKED — but it must NOT write the
 	// holder. probeOnce (the Runnable) is the only writer.
 	if _, err := p.parse(allBlocked, pod(allBlocked, 0)); err != nil {

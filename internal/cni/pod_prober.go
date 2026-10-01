@@ -76,32 +76,51 @@ const (
 	probeNetpolName   = "coxswain-cni-probe-netpol"
 	probeLabelKey     = "coxswain.io/probe"
 	expectedResultLen = 4
+	verdictReachable  = "REACHABLE"
+	verdictBlocked    = "BLOCKED"
 )
 
 // knownProbeLabels is the strict set of RESULT labels the probe emits (design
 // point 4: an unknown label is a validation error, never a false pass).
 var knownProbeLabels = map[string]bool{
 	"APISERVER_SVC": true,
+	"NODE_API":      true,
 	"KUBELET_NODE":  true,
 	"EXTERNAL":      true,
-	"BLOCK_ONLY":    true,
 }
 
-// probeCommand is the agent-shaped probe, run as the pod's own command (the
+// expectedBlockedLabels are the RESULT labels that must be BLOCKED for the
+// CNI to count as enforcing (the D38 property: a pod under the agent's
+// allowlist NetworkPolicy cannot reach host-network destinations). They match
+// test/e2e/verify-cni.sh's expected-BLOCKED targets: the apiserver Service
+// ClusterIP :443 and the node's IP (downward API status.hostIP) on :6443
+// and :10250. EXTERNAL is a positive CONTROL, not an expected-blocked target:
+// the probe NetworkPolicy allows egress to the outside (everything except the
+// RFC1918 ranges, like the agent's NetworkPolicy), so REACHABLE is the
+// CORRECT outcome there. If the control comes back BLOCKED, the probe has no
+// network and the result is ProbeUnavailable -- not CNIEnforced on an
+// unproven fence and not CNIUnenforced on a healthy CNI.
+var expectedBlockedLabels = map[string]bool{
+	"APISERVER_SVC": true,
+	"NODE_API":      true,
+	"KUBELET_NODE":  true,
+}
+
+// probeCommand is the probe, run as the pod's own command (the
 // image is python:3-alpine by default — it ships python3 and neither bash nor
 // /dev/tcp, so the probe is a Python socket connect, exactly like
 // verify-cni.sh's probe). It writes one RESULT line per target to stdout
 // (captured to the termination message via
 // terminationMessagePolicy: FallbackToLogsOnError) and exits 0.
 //
-// The targets are the D38 property's (design point 2): the apiserver
-// service IP (pod -> ServiceClusterIP -> host network), the node's kubelet
-// :10250 (host network, node-local), an external IP (pod -> node egress to
-// the outside), and 99.99.99.99:80 — a bare IP the NetworkPolicy must
-// block (a "should never be allowed" control: a CNI that fails open lets
-// it through; a CNI that enforces blocks it). The netpol allows only DNS
-// 53 to the node's coredns, so every one of these four targets must be
-// BLOCKED for the CNI to count as enforcing.
+// The targets match verify-cni.sh's expected-BLOCKED set: the apiserver
+// Service ClusterIP :443 (pod -> ServiceClusterIP -> host network), the
+// node's IP on :6443 and :10250 (host network; the node IP comes from the
+// downward API status.hostIP — the pod's own HOSTNAME resolves to the pod's
+// own IP, not the node's, so it must NOT be used), plus EXTERNAL 1.1.1.1:443
+// as a positive CONTROL: REACHABLE is the correct outcome there, and a
+// BLOCKED control makes the result ProbeUnavailable (the probe has no
+// network).
 
 // podTerminated reports whether the named container's state is Terminated
 // (read from its ContainerStatus; Status.Phase alone lags the container
@@ -134,11 +153,24 @@ func (p *PodProber) probeCommand() []string {
 	return []string{"python3", "-c", `
 import os, socket, socket as _s, sys
 
+# NODE_IP is the node's IP from the downward API (status.hostIP), injected on
+# the probe pod's container. The pod's own HOSTNAME resolves to the pod's OWN
+# IP, never the node's, so it must not be used as the node target; verify-
+# cni.sh uses each node's InternalIP.
+node_ip = os.environ.get("NODE_IP")
+if not node_ip:
+    sys.stderr.write("FATAL: NODE_IP not set (downward API status.hostIP missing)\n")
+    sys.exit(3)
+
 TARGETS = [
-    ("APISERVER_SVC", "` + apiserverSVC + `", 443),
-    ("KUBELET_NODE", os.environ.get("HOSTNAME") or _s.gethostname(), 10250),
+    ("APISERVER_SVC", ` + apiserverSVC + `", 443),
+    ("NODE_API", node_ip, 6443),
+    ("KUBELET_NODE", node_ip, 10250),
+    # Positive CONTROL: the probe NetworkPolicy allows egress to the outside
+    # (everything except the RFC1918 ranges, like the agent's netpol), so
+    # this must come back REACHABLE. A BLOCKED control means the probe has no
+    # network, not that the CNI is enforcing the fence.
     ("EXTERNAL", "1.1.1.1", 443),
-    ("BLOCK_ONLY", "99.99.99.99", 80),
 ]
 
 lines = []
@@ -248,8 +280,16 @@ func (p *PodProber) cleanup(ctx context.Context) error {
 	return nil
 }
 
-// ensureNetpol creates the agent-shaped probe NetworkPolicy (the allow list the
-// CNI's enforcement is measured against).
+// ensureNetpol creates the probe NetworkPolicy (the allow list the CNI's
+// enforcement is measured against). It is a 1:1 shape copy of
+// test/e2e/verify-cni.sh's probe NetworkPolicy: egress allowed ONLY to the
+// cluster's kube-dns (53 UDP+TCP), so the expected-BLOCKED targets
+// (apiserver svc ClusterIP :443, node :6443, node :10250) are NOT in the
+// allow list and a CNI that enforces NetworkPolicy drops them. The earlier
+// agent-shaped variant allowed egress to 0.0.0.0/0 minus RFC1918 — under
+// THAT policy the external targets are ALLOWED, so reporting REACHABLE for
+// them as CNIUnenforced was a false positive: the policy allowed the
+// traffic, not the CNI failing to enforce.
 func (p *PodProber) ensureNetpol(ctx context.Context) error {
 	want := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: probeNetpolName, Namespace: p.cfg.Namespace},
@@ -257,14 +297,19 @@ func (p *PodProber) ensureNetpol(ctx context.Context) error {
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{probeLabelKey: "cni-probe"}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
 			Egress: []networkingv1.NetworkPolicyEgressRule{
-				// dns 53/tcp to the node's coredns (the probe needs DNS for
-				// the apiserver-svc target).
-				{Ports: []networkingv1.NetworkPolicyPort{{Protocol: ptrProtocolTCP(), Port: ptrPort(53)}}},
-				// The four targets' IPs (the probe's allow list).
-				{To: []networkingv1.NetworkPolicyPeer{{
-					IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0",
-						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}},
-				}}},
+				// DNS 53 (UDP+TCP) to the cluster's kube-dns only — the exact
+				// shape of the per-Loop agent NetworkPolicy and of
+				// verify-cni.sh's probe netpol.
+				{
+					To: []networkingv1.NetworkPolicyPeer{{
+						NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": "kube-system"}},
+						PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"k8s-app": "kube-dns"}},
+					}},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: ptrProtocolUDP(), Port: ptrPort(53)},
+						{Protocol: ptrProtocolTCP(), Port: ptrPort(53)},
+					},
+				},
 			},
 		},
 	}
@@ -307,6 +352,16 @@ func (p *PodProber) buildPod() *corev1.Pod {
 					// terminationMessage (design point 2). The output (4 RESULT
 					// lines + DONE) is far under the 4 KB termination-message
 					// limit.
+					// The node's IP (downward API status.hostIP) is the NODE_API /
+					// KUBELET_NODE target — the same source verify-cni.sh uses for
+					// each node's InternalIP. The pod's own HOSTNAME is the pod's
+					// own IP, not the node's.
+					Env: []corev1.EnvVar{{
+						Name: "NODE_IP",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.hostIP"},
+						},
+					}},
 					TerminationMessagePath:   "/dev/termination-log",
 					TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 					SecurityContext: &corev1.SecurityContext{
@@ -380,7 +435,11 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 
 // parse strictly validates the termination message: exactly expectedResultLen
 // RESULT lines, each a known label, every line consumed. A non-zero pod exit or
-// any deviation returns ProbeUnavailable.
+// any deviation returns ProbeUnavailable. CNIUnenforced = any expected-BLOCKED
+// target (apiserver svc, node :6443, node :10250) REACHABLE; the EXTERNAL
+// control is NOT expected-blocked — a BLOCKED control means the probe has no
+// network and the result is ProbeUnavailable (never CNIEnforced on an
+// unproven fence, never CNIUnenforced on a healthy CNI).
 func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 	// A non-zero exit (container terminated with a non-zero code) is
 	// ProbeUnavailable even if the message looks valid.
@@ -390,7 +449,7 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 		}
 	}
 	var rows []TargetRow
-	reachable := false
+	var reachable []string
 	seen := 0
 	for line := range strings.SplitSeq(strings.TrimSpace(msg), "\n") {
 		line = strings.TrimSpace(line)
@@ -402,24 +461,48 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 			return unavailable("unrecognised probe line: " + line), nil
 		}
 		label, verdict := fields[1], fields[2]
-		if verdict != "REACHABLE" && verdict != "BLOCKED" {
+		if verdict != verdictReachable && verdict != verdictBlocked {
 			return unavailable("unrecognised verdict: " + label + " " + verdict), nil
 		}
 		if !knownProbeLabels[label] {
 			return unavailable("unknown probe target label: " + label), nil
 		}
 		seen++
-		if verdict == "REACHABLE" {
-			reachable = true
-		}
 		rows = append(rows, TargetRow{Label: label, Verdict: verdict})
+		if verdict == verdictReachable {
+			reachable = append(reachable, label)
+		}
 	}
 	if seen != expectedResultLen {
 		return unavailable(fmt.Sprintf("expected %d RESULT lines, got %d", expectedResultLen, seen)), nil
 	}
+	// The positive control (EXTERNAL) must be REACHABLE: the probe
+	// NetworkPolicy allows egress to the outside. A BLOCKED control means the
+	// probe has no network at all (e.g. the node's own CNI is down) — the
+	// fence is unproven, so the result is ProbeUnavailable.
+	controlOK := false
+	for _, row := range rows {
+		if row.Label == "EXTERNAL" && row.Verdict == verdictReachable {
+			controlOK = true
+		}
+	}
+	if !controlOK {
+		return unavailable("EXTERNAL control not REACHABLE: the probe has no network; the fence is unproven"), nil
+	}
+	var unenforced []string
+	for _, label := range reachable {
+		if expectedBlockedLabels[label] {
+			unenforced = append(unenforced, label)
+		}
+	}
 	res := CNIProbeResult{Rows: rows}
-	if reachable {
+	if len(unenforced) > 0 {
 		res.Reason = ReasonCNIUnenforced
+		// The Event/condition message renders "REACHABLE targets: " + Detail,
+		// so Detail carries the reachable expected-BLOCKED labels (a
+		// CNIUnenforced result without them reads "REACHABLE targets: " with
+		// nothing after it).
+		res.Detail = strings.Join(unenforced, ", ")
 	} else {
 		res.Reason = ReasonCNIEnforced
 	}
@@ -439,6 +522,11 @@ func unavailable(detail string) CNIProbeResult {
 func ptrProtocolTCP() *corev1.Protocol {
 	tcp := corev1.ProtocolTCP
 	return &tcp
+}
+
+func ptrProtocolUDP() *corev1.Protocol {
+	udp := corev1.ProtocolUDP
+	return &udp
 }
 
 func ptrPort(i int32) *intstr.IntOrString {

@@ -194,6 +194,18 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 // re-gate requests (design points 2+3a). The source is a source.Channel that
 // the probe writes GenericEvents (one per Loop) to; the controller's
 // Watches maps each to its own reconcile request.
+//
+// The handler is EnqueueRequestForObject, NOT EnqueueRequestForOwner:
+// retage sends one GenericEvent per Loop whose Object is the Loop itself
+// (not an object that owns/is owned by a Loop). EnqueueRequestForOwner(
+// OnlyControllerOwner) looks for a controller owner reference ON the event
+// object and filters to the Loop kind — a Loop has no Loop controller owner,
+// so no request is ever enqueued and the re-gate never reconciles any Loop
+// (the live failure: the operator logged "CNI probe result changed" and
+// emitted the per-Loop Events, but no reconcile followed and the Loops kept
+// their stale NetworkEnforced conditions). loop_d38_cni_regate_source_test.go
+// drives the real source.Channel with both handlers and FAILS while the
+// source uses EnqueueRequestForOwner.
 func AddProbeRunnable(mgr manager.Manager, prober CNIProber, interval, timeout time.Duration) (source.Source, error) {
 	ch := make(chan event.TypedGenericEvent[client.Object], 128)
 	r := &ProbeRunnable{
@@ -208,8 +220,6 @@ func AddProbeRunnable(mgr manager.Manager, prober CNIProber, interval, timeout t
 	if err := mgr.Add(r); err != nil {
 		return nil, err
 	}
-	return source.Channel(ch, handler.EnqueueRequestForOwner(
-		mgr.GetScheme(), mgr.GetRESTMapper(), &coxv1alpha1.Loop{},
-		handler.OnlyControllerOwner(),
-	)), nil
+	var enqueueObject handler.EnqueueRequestForObject
+	return source.Channel(ch, &enqueueObject), nil
 }

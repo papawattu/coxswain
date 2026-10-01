@@ -155,15 +155,22 @@ Per the review, two choices were the owner's. Status at round 8:
   docs/REVIEW-PHASE1-R16.md, D38). The mitigations above (no token mounted,
   403 for anonymous requests, 401 on the kubelet) make the residual
   attack surface credential-gated, but the design assumed the control plane
-  was unreachable. Consequence: **kindnet is dev-only, and a production
-  cluster must run a CNI that enforces NetworkPolicy egress against
-  host-network and node destinations — Calico or Cilium** (both do). This is
-  stated in the README Security section, and it is tested, not just
-  documented: `make kind-calico-up` builds a second kind cluster whose CNI
-  is Calico (kindnet disabled), and `make d38-cni-e2e` asserts the
-  apiserver/kubelet endpoints are blocked from an agent-labelled pod on it
-  (a second BPF-LSM agent is deliberately NOT installed there — ADR-0007 F2;
-  the KubeArmor-dependent checks are printed as SKIPPED).
+  was unreachable. **Production requires a CNI that polices
+  pod-to-host-network egress** — stated as a property, not a vendor list.
+  Verified with: Calico v3.30.1 (`make d38-cni-e2e`, `make verify-cni`).
+  To be confirmed (run `make verify-cni`): Cilium, GKE Dataplane V2, EKS
+  VPC CNI (with network policy), AKS. kindnet is **dev-only**.
+  `make verify-cni` is the preflight check the install docs point at:
+  it creates a temp namespace with an agent-shaped NetworkPolicy and a
+  probe pod, then TCP-connects to the apiserver service IP, each node's
+  :6443/:10250, a kube-dns pod IP, and 1.1.1.1:443; every target must be
+  BLOCKED for PASS. It works on any cluster where kubectl is pointed (no
+  coxswain install required) and always cleans up. `make kind-calico-up`
+  builds a second kind cluster whose CNI is Calico (kindnet disabled), and
+  `make d38-cni-e2e` asserts the apiserver/kubelet endpoints are blocked
+  from an agent-labelled pod on it (a second BPF-LSM agent is deliberately
+  NOT installed there — ADR-0007 F2; the KubeArmor-dependent checks are
+  printed as SKIPPED).
 - **Agent image stand-in (I37, round 10):** when `spec.agent.image` is omitted the
   sandbox runs `docker.io/library/golang:1.26` + `sleep infinity` as a Phase 0
   stand-in. It is hardened (zero credentials, no token automount, read-only

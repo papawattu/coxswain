@@ -28,31 +28,32 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/cni"
 )
 
-// D38s3 regression (Bug C): the re-gate source must enqueue the Loop it
-// receives, not the Loop's controller owner. The probe (ProbeRunnable.retage)
-// sends one GenericEvent per Loop — the Loop itself, not an owned object — so
-// the source.Channel handler must be EnqueueRequestForObject. The buggy
-// EnqueueRequestForOwner(OnlyControllerOwner) looks for a controller owner
-// reference ON the event object and filters to the Loop kind: a Loop has no
-// Loop controller owner, so no request is ever enqueued and the re-gate never
-// reconciles any Loop. Verified live: the operator logged "CNI probe result
-// changed" and emitted the per-Loop Events, but no reconcile followed and the
-// Loops kept their stale NetworkEnforced conditions.
+// D38s3 regression (Bug C) + R16 I43 gate norm: the re-gate source must
+// enqueue the Loop it receives, not the Loop's controller owner. The probe
+// (ProbeRunnable.retage) sends one GenericEvent per Loop — the Loop itself,
+// not an owned object — so cni.RegateSource must wrap the channel in
+// EnqueueRequestForObject. The buggy EnqueueRequestForOwner(OnlyControllerOwner)
+// looks for a controller owner reference ON the event object and filters to
+// the Loop kind: a Loop has no Loop controller owner, so no request is ever
+// enqueued and the re-gate never reconciles any Loop. Verified live: the
+// operator logged "CNI probe result changed" and emitted the per-Loop Events,
+// but no reconcile followed and the Loops kept their stale NetworkEnforced
+// conditions.
 //
-// This spec drives the REAL source.Channel with a GenericEvent for a Loop and
-// asserts the handler behavior directly (RED while the source is built with
-// EnqueueRequestForOwner): the ForOwner handler produces no request for a
-// Loop, while the fixed ForObject handler produces exactly one request for
-// that Loop. The controller-side half (request -> reconcile -> condition
-// update) is the ordinary reconcile path already covered by
-// loop_d38_cni_gate_test.go; this spec is the wiring regression the live run
-// exposed.
-var _ = Describe("D38 CNI re-gate source (real source.Channel)", func() {
+// This spec drives cni.RegateSource — the exact construction AddProbeRunnable
+// returns — with a GenericEvent for a Loop and asserts the handler behavior
+// directly. It fails when RegateSource regresses to
+// EnqueueRequestForOwner(OnlyControllerOwner) (I43: a spec that built its own
+// handler would still pass while the operator regressed). The
+// controller-side half (request -> reconcile -> condition update) is the
+// ordinary reconcile path already covered by loop_d38_cni_gate_test.go; this
+// spec is the wiring regression the live run exposed.
+var _ = Describe("D38 CNI re-gate source (cni.RegateSource)", func() {
 	var (
 		scheme *runtime.Scheme
 		loop   *coxv1alpha1.Loop
@@ -87,11 +88,13 @@ var _ = Describe("D38 CNI re-gate source (real source.Channel)", func() {
 		return n
 	}
 
-	It("the buggy EnqueueRequestForOwner(OnlyControllerOwner) handler enqueues NO request for a Loop", func() {
-		// The exact construction AddProbeRunnable used (the bug): the handler
-		// resolves the controller owner of the event object, filtered to Loop.
+	It("EnqueueRequestForOwner(OnlyControllerOwner) enqueues NO request for a Loop (the bug RegateSource must not use)", func() {
+		// Characterizes the bug: the ForOwner handler resolves the controller
+		// owner of the event object, filtered to Loop, and a Loop has no Loop
+		// controller owner — so the re-gate never reconciles. This pins the
+		// bug shape so the second spec's contrast stays meaningful.
 		ch := make(chan event.TypedGenericEvent[client.Object], 4)
-		src := source.Channel(ch, handler.EnqueueRequestForOwner(
+		src := cni.Channel(ch, handler.EnqueueRequestForOwner(
 			scheme, nil, &coxv1alpha1.Loop{}, handler.OnlyControllerOwner(),
 		))
 		Expect(src).NotTo(BeNil())
@@ -103,17 +106,21 @@ var _ = Describe("D38 CNI re-gate source (real source.Channel)", func() {
 		// retage sends a GenericEvent whose Object is the Loop.
 		ch <- event.GenericEvent{Object: loop}
 
-		// RED: no request is ever produced (the Loop has no controller
+		// No request is ever produced (the Loop has no controller
 		// owner). This is the live failure: the re-gate Events fired, but no
 		// reconcile followed.
 		Consistently(func() int { return drained() }, 300*time.Millisecond).Should(BeZero(),
 			"EnqueueRequestForOwner(OnlyControllerOwner) must produce no request for a Loop — the re-gate bug")
 	})
 
-	It("the fixed EnqueueRequestForObject handler enqueues the Loop itself", func() {
+	It("cni.RegateSource enqueues the Loop itself", func() {
+		// I43: drive the exact construction AddProbeRunnable returns, not a
+		// hand-built copy. RED when RegateSource uses
+		// EnqueueRequestForOwner(OnlyControllerOwner) instead of
+		// EnqueueRequestForObject (mutation-check: reverted RegateSource to the
+		// buggy handler -> this spec failed -> reverted back).
 		ch := make(chan event.TypedGenericEvent[client.Object], 4)
-		var forObject handler.EnqueueRequestForObject
-		src := source.Channel(ch, &forObject)
+		src := cni.RegateSource(ch)
 		Expect(src).NotTo(BeNil())
 
 		ctx, cancel := context.WithCancel(context.Background())

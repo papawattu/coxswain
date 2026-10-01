@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -189,11 +190,17 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 	}
 }
 
-// AddProbeRunnable registers the leader-elected, non-blocking probe Runnable
-// with the manager and returns the source the Loop controller must watch for
-// re-gate requests (design points 2+3a). The source is a source.Channel that
-// the probe writes GenericEvents (one per Loop) to; the controller's
-// Watches maps each to its own reconcile request.
+// Channel wraps a re-gate channel in a source.Channel with the given handler.
+// It exists so the regression spec can characterize the buggy handler (see
+// RegateSource) without importing controller-runtime's source package here.
+func Channel(ch <-chan event.TypedGenericEvent[client.Object], hdl handler.TypedEventHandler[client.Object, reconcile.Request]) source.Source {
+	return source.Channel(ch, hdl)
+}
+
+// RegateSource builds the source the Loop controller must watch for re-gate
+// requests (design points 2+3a): a source.Channel over ch that the probe
+// writes GenericEvents (one per Loop) to; the controller's Watches maps each
+// to its own reconcile request.
 //
 // The handler is EnqueueRequestForObject, NOT EnqueueRequestForOwner:
 // retage sends one GenericEvent per Loop whose Object is the Loop itself
@@ -204,8 +211,18 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 // (the live failure: the operator logged "CNI probe result changed" and
 // emitted the per-Loop Events, but no reconcile followed and the Loops kept
 // their stale NetworkEnforced conditions). loop_d38_cni_regate_source_test.go
-// drives the real source.Channel with both handlers and FAILS while the
-// source uses EnqueueRequestForOwner.
+// drives this function directly and FAILS while it uses
+// EnqueueRequestForOwner (R16 I43 gate norm: the spec must fail when the
+// gate is disabled — a spec that builds the handler itself would still pass
+// if this function regressed).
+func RegateSource(ch <-chan event.TypedGenericEvent[client.Object]) source.Source {
+	var enqueueObject handler.EnqueueRequestForObject
+	return Channel(ch, &enqueueObject)
+}
+
+// AddProbeRunnable registers the leader-elected, non-blocking probe Runnable
+// with the manager and returns the re-gate source (RegateSource) the Loop
+// controller must watch (design points 2+3a).
 func AddProbeRunnable(mgr manager.Manager, prober CNIProber, interval, timeout time.Duration) (source.Source, error) {
 	ch := make(chan event.TypedGenericEvent[client.Object], 128)
 	r := &ProbeRunnable{
@@ -220,6 +237,5 @@ func AddProbeRunnable(mgr manager.Manager, prober CNIProber, interval, timeout t
 	if err := mgr.Add(r); err != nil {
 		return nil, err
 	}
-	var enqueueObject handler.EnqueueRequestForObject
-	return source.Channel(ch, &enqueueObject), nil
+	return RegateSource(ch), nil
 }

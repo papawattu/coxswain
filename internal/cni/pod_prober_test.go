@@ -7,7 +7,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on the "AS IS" BASIS,
+// distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
@@ -15,9 +15,13 @@
 package cni
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -54,6 +58,11 @@ func TestProbeCommandShape(t *testing.T) {
 		"RESULT %s REACHABLE", "RESULT %s BLOCKED", "DONE",
 		"kubernetes.default.svc.cluster.local", "10250", "1.1.1.1", "99.99.99.99",
 		"settimeout",
+		// The RESULT lines must be written to the termination message from
+		// the script itself (a clean exit leaves /dev/termination-log empty
+		// unless the script writes it; FallbackToLogsOnError only substitutes
+		// the logs on a non-zero exit).
+		"/dev/termination-log",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("probe script missing %q", want)
@@ -96,7 +105,7 @@ func TestProbeParseStrictValidation(t *testing.T) {
 	}{
 		"missing RESULT line": {"RESULT APISERVER_SVC BLOCKED\nDONE", 0},
 		"unknown label":       {"RESULT APISERVER_SVC BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT WHATEVER BLOCKED\nDONE", 0},
-		"unknown verdict":     {"RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE", 0},
+		"unknown verdict":     {"RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE", 0},
 		"non-zero exit":       {allBlocked, 1},
 		"empty message":       {"", 0},
 	}
@@ -110,6 +119,94 @@ func TestProbeParseStrictValidation(t *testing.T) {
 				t.Fatalf("want ProbeUnavailable, got %v (detail=%q)", res.Reason, res.Detail)
 			}
 		})
+	}
+}
+
+// terminatedProbePod builds a probe pod whose container has Terminated with the
+// given exit code and message.
+func terminatedProbePod(exit int32, message string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "probe",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: exit,
+						Reason:   "Completed",
+						Message:  message,
+					},
+				},
+			}},
+		},
+	}
+}
+
+// D38s3 (Calico run): the probe pod exits CLEAN with its RESULT lines on
+// stdout — and FallbackToLogsOnError does NOT substitute the logs on a clean
+// exit, so /dev/termination-log is the message source, and if it is empty the
+// operator must NOT spin to the 60s timeout. A Terminated probe container
+// with an empty message is a hard failure (-> ProbeUnavailable), returned
+// immediately (not after the timeout).
+func TestWaitForTerminationEmptyMessageIsFailure(t *testing.T) {
+	// The reader returns the terminated probe pod with an EMPTY message: the
+	// classic "stdout-only, clean exit" shape FallbackToLogsOnError does not
+	// save (the script now writes /dev/termination-log itself, but a pod whose
+	// message is empty must still fail fast, not spin to the timeout).
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	terminatedEmpty := terminatedProbePod(0, "")
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(terminatedEmpty).Build()
+	p := NewPodProber(PodProberConfig{
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
+		Client:     cl,
+		Reader:     cl, // the direct reader is the same fake (test)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	msg, err := p.waitForTermination(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName},
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("waitForTermination: expected an error on a Terminated container with an empty message, got msg=%q", msg)
+	}
+	if !strings.Contains(err.Error(), "empty termination message") {
+		t.Fatalf("want an 'empty termination message' error (fail-closed, not a timeout), got: %v", err)
+	}
+	// A hard failure must be returned promptly — not after the per-run timeout.
+	if elapsed > 4*time.Second {
+		t.Fatalf("an empty termination message must fail immediately, not spin to the timeout (took %s)", elapsed)
+	}
+}
+
+// D38s3 control: a Terminated container WITH a termination message returns it
+// (the normal success path).
+func TestWaitForTerminationReturnsMessageOnTermination(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	msg := "RESULT APISERVER_SVC BLOCKED\nDONE"
+	terminatedWithMsg := terminatedProbePod(0, msg)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(terminatedWithMsg).Build()
+	p := NewPodProber(PodProberConfig{
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
+		Client:     cl,
+		Reader:     cl,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	got, err := p.waitForTermination(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName},
+	})
+	if err != nil {
+		t.Fatalf("waitForTermination: %v", err)
+	}
+	if got != msg {
+		t.Fatalf("want the termination message %q, got %q", msg, got)
 	}
 }
 

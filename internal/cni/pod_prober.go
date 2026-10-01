@@ -103,6 +103,18 @@ var knownProbeLabels = map[string]bool{
 // 53 to the node's coredns, so every one of these four targets must be
 // BLOCKED for the CNI to count as enforcing.
 
+// podTerminated reports whether the named container's state is Terminated
+// (read from its ContainerStatus; Status.Phase alone lags the container
+// state, and an empty status (freshly created pod) means not terminated).
+func podTerminated(pod *corev1.Pod, container string) bool {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == container && cs.State.Terminated != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // getReader returns the direct API reader for Gets. The manager's cached
 // client has a cache scoped to the controller's selectors
 // (policy.ProxyComponentSelector); the probe pod carries only
@@ -120,7 +132,7 @@ func (p *PodProber) getReader() client.Reader {
 func (p *PodProber) probeCommand() []string {
 	apiserverSVC := "kubernetes.default.svc." + p.cfg.ClusterDomain
 	return []string{"python3", "-c", `
-import os, socket, socket as _s
+import os, socket, socket as _s, sys
 
 TARGETS = [
     ("APISERVER_SVC", "` + apiserverSVC + `", 443),
@@ -129,25 +141,41 @@ TARGETS = [
     ("BLOCK_ONLY", "99.99.99.99", 80),
 ]
 
+lines = []
+def out(line):
+    lines.append(line)
+    print(line)
+
 def probe(label, host, port):
     try:
         host = socket.gethostbyname(host)
     except Exception:
-        print("RESULT %s REACHABLE" % label)  # unresolvable -> not a CNI failure
+        out("RESULT %s REACHABLE" % label)  # unresolvable -> not a CNI failure
         return
     s = socket.socket(_s.AF_INET, _s.SOCK_STREAM)
     s.settimeout(5)
     try:
         s.connect((host, port))
-        print("RESULT %s REACHABLE" % label)
+        out("RESULT %s REACHABLE" % label)
     except Exception:
-        print("RESULT %s BLOCKED" % label)
+        out("RESULT %s BLOCKED" % label)
     finally:
         s.close()
 
 for label, host, port in TARGETS:
     probe(label, host, port)
-print("DONE")
+out("DONE")
+
+# The operator reads the RESULT lines from the container's termination
+# message. FallbackToLogsOnError substitutes the logs only when the
+# container exits non-zero; on a clean exit the message comes from
+# /dev/termination-log, so the script must write it there itself (the
+# lines are far under the 4 KB termination-message limit).
+try:
+    with open("/dev/termination-log", "w") as f:
+        f.write("\n".join(lines) + "\n")
+except Exception as exc:
+    sys.stderr.write("could not write /dev/termination-log: %s\n" % exc)
 ` + "\n",
 	}
 }
@@ -299,8 +327,9 @@ func (p *PodProber) buildPod() *corev1.Pod {
 }
 
 // containerTerminationMessage returns the probe container's termination
-// message (its stdout, captured via terminationMessagePolicy FallbackToLogsOnError)
-// once the container has terminated.
+// message once the container has terminated. The probe script writes its
+// RESULT lines to /dev/termination-log itself (see probeCommand); Fallback
+// to logs on error covers a FAILED exit.
 func containerTerminationMessage(pod *corev1.Pod) string {
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.Name == "probe" {
@@ -316,6 +345,14 @@ func containerTerminationMessage(pod *corev1.Pod) string {
 // (its termination message is then available) or the context is done. A
 // not-Ready / no-exit / pull-failure within the timeout is a ProbeUnavailable
 // (the caller maps it).
+//
+// Once the container has Terminated the message is read — even if it is
+// EMPTY. An empty message is a hard failure ("empty termination message" →
+// ProbeUnavailable), not a "keep waiting" state: on a non-zero exit
+// FallbackToLogsOnError substitutes the logs, and on a clean exit the script
+// itself writes /dev/termination-log. A Terminated container with an empty
+// message from either path will never produce one — spinning to the timeout
+// (60s per run) would just delay the same fail-closed result.
 func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (string, error) {
 	probe := &corev1.Pod{}
 	reader := p.getReader()
@@ -323,7 +360,11 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 		if err := reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, probe); err != nil {
 			return "", fmt.Errorf("probe pod get: %w", err)
 		}
-		if msg := containerTerminationMessage(probe); msg != "" {
+		if podTerminated(probe, "probe") {
+			msg := containerTerminationMessage(probe)
+			if msg == "" {
+				return "", fmt.Errorf("empty termination message (probe container terminated with no output)")
+			}
 			return msg, nil
 		}
 		if probe.Status.Phase == corev1.PodFailed {

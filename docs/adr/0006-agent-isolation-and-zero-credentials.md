@@ -171,6 +171,44 @@ Per the review, two choices were the owner's. Status at round 8:
   from an agent-labelled pod on it (a second BPF-LSM agent is deliberately
   NOT installed there — ADR-0007 F2; the KubeArmor-dependent checks are
   printed as SKIPPED).
+- **Residual risk on non-enforcing CNIs (D38 Q2, 2026-10-01):** on a CNI
+  that does not police pod → host-network egress, the agent pod **can**
+  reach the apiserver service IP, the node's :6443, and the kubelet's
+  :10250. The remaining mitigations are: no SA token mounted
+  (`automountServiceAccountToken: false`), the apiserver returns 403 for
+  anonymous requests (except public-info endpoints), and the kubelet
+  requires authentication (401 without credentials). The owner accepts this
+  residual risk on clusters where the CNI has been verified to police
+  pod → host-network egress, and requires the cluster-hardening checklist
+  below on clusters where it has not.
+  **Cluster-hardening checklist** (recommended for all clusters; required
+  when the CNI does not police pod → host-network egress):
+  1. Disable or restrict apiserver anonymous authentication
+     (`--anonymous-auth=false`, or an `AuthenticationConfiguration` with
+     `anonymous: deny`). Without this, any pod that reaches the apiserver can
+     make unauthenticated requests to public-info endpoints.
+  2. Turn off the kubelet read-only port (`readOnlyPort: 0`). The read-only
+     port (10255) serves `/metrics` and some stats without authentication.
+  3. Enable kubelet authentication and authorization webhooks
+     (`authenticationTokenWebhook: true`, `authorizationMode: Webhook`, not
+     `AlwaysAllow`). This ensures a pod that reaches the kubelet's
+     authenticated port cannot act without valid credentials and an
+     authorized RBAC binding.
+  4. No service-account token automount for agents. Coxswain already sets
+     `automountServiceAccountToken: false` on the agent pod spec; verify that
+     no other mechanism (a mutating webhook, a ClusterRoleBinding, etc.)
+     grants the agent a token.
+  `make verify-cni` now includes a **hardening section** (WARN-only, never
+  changes the CNI PASS/FAIL verdict) that checks items 2 and 1 from a second
+  probe pod with no NetworkPolicy: whether the kubelet read-only port (10255)
+  is open (WARN if reachable), and what the apiserver returns for an
+  unauthenticated request (401 = anonymous disabled, 403 = anonymous enabled
+  but unauthorized, 200 = WARN). These checks measure the cluster, not the
+  CNI, and never affect the exit code.
+  The next step (D38 next, planned in TDD-PLAN-PHASE1) is an operator-side
+  CNI self-test that runs the verify-cni probe at startup and periodically,
+  sets a cluster-level condition, and holds Loops Suspended (D30-style) when
+  pod-to-host-network egress is not policed.
 - **Agent image stand-in (I37, round 10):** when `spec.agent.image` is omitted the
   sandbox runs `docker.io/library/golang:1.26` + `sleep infinity` as a Phase 0
   stand-in. It is hardened (zero credentials, no token automount, read-only

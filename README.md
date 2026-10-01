@@ -156,9 +156,46 @@ mounted into the agent) rather than blocking it.
 creates a temp namespace with a NetworkPolicy shaped like the agent's and a
 probe pod, then TCP-connects to the apiserver service IP, each node's
 `:6443`/`:10250`, a kube-dns pod IP, and `1.1.1.1:443` from the probe. Every
-target must be BLOCKED for PASS. It works on any cluster where kubectl is
-pointed (no coxswain install required) and always cleans up. Run it on your
-production cluster before installing coxswain.
+target must be BLOCKED for PASS. It also runs a **hardening section**
+(WARN-only, never changes PASS/FAIL) from a second probe pod with no
+NetworkPolicy: checks whether the kubelet read-only port (10255) is open and
+what the apiserver returns for an unauthenticated request. It works on any
+cluster where kubectl is pointed (no coxswain install required) and always
+cleans up. Run it on your production cluster before installing coxswain.
+
+**Residual risk on CNIs that don't police pod → host-network egress:**
+if your CNI does not pass `make verify-cni`, the agent pod **can** reach the
+apiserver service IP, the node's `:6443`, and the kubelet's `:10250`.
+The mitigations that remain are:
+- the agent pod has `automountServiceAccountToken: false` — no SA token is mounted;
+- the apiserver returns 403 for anonymous requests (except public-info endpoints like `/version`);
+- the kubelet requires authentication (401 without credentials).
+
+This means the agent can *reach* the control plane but cannot *act* on it
+without credentials. It is an unauthenticated attack surface that the design
+assumed was closed. To close it, apply the cluster-hardening checklist below.
+
+**Cluster-hardening checklist (recommended for all clusters, required when the CNI does not police pod → host-network egress):**
+
+1. **Disable or restrict apiserver anonymous authentication.**
+   Set `--anonymous-auth=false` on the apiserver, or use an
+   `AuthenticationConfiguration` with `anonymous: deny`. Without this,
+   any pod that can reach the apiserver can make unauthenticated requests to
+   public-info endpoints and enumerate some cluster metadata.
+2. **Turn off the kubelet read-only port.**
+   Set `readOnlyPort: 0` in the kubelet config. The read-only port (10255)
+   serves `/metrics` and some stats without authentication. With the port off,
+   a pod that reaches the node must go through the authenticated kubelet port
+   (10250), which requires a token.
+3. **Enable kubelet authentication and authorization webhooks.**
+   Set `authenticationTokenWebhook: true` and `authorizationMode: Webhook`
+   (not `AlwaysAllow`) in the kubelet config. This ensures that even a pod
+   that reaches the kubelet's authenticated port cannot act without valid
+   credentials and an authorized RBAC binding.
+4. **No service-account token automount for agents.**
+   Coxswain already sets `automountServiceAccountToken: false` on the agent
+   pod spec. Verify that no other mechanism (a mutating webhook, a
+   ClusterRoleBinding, etc.) grants the agent a token.
 
 See [docs/adr/0006-agent-isolation-and-zero-credentials.md](docs/adr/0006-agent-isolation-and-zero-credentials.md)
 for the full rationale.

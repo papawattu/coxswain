@@ -304,6 +304,151 @@ if [ "$PROBE_ERROR" -eq 1 ] || [ "$TOTAL" -ne "$EXPECTED_TOTAL" ]; then
   exit 2
 fi
 
+# ---------------------------------------------------------------------------
+# HARDENING section (WARN-only, never changes PASS/FAIL or the exit code).
+#
+# Runs from a SECOND probe pod in the temp namespace that has NO
+# NetworkPolicy applied, so it measures the cluster's own hardening,
+# not the CNI's enforcement. Checks:
+#   (a) TCP connect to each node InternalIP:10255 — if reachable, WARN
+#       "kubelet read-only port open".
+#   (b) Unauthenticated HTTPS GET to https://<apiserver svc IP>/api (no
+#       token, -k): 401 = OK (anonymous disabled), 403 = INFO (anonymous
+#       enabled but unauthorized), 200 = WARN.
+#
+# If the hardening probe can't run, print WARN "hardening check could not
+# run" — never silently OK.
+# ---------------------------------------------------------------------------
+echo
+echo "--- HARDENING (WARN-only; does not affect the CNI PASS/FAIL verdict) ---"
+HARDENING_POD="hardening-probe"
+HARDENING_IMAGE="${HARDENING_IMAGE:-python:3-alpine}"
+
+# Create the hardening probe pod (NO NetworkPolicy — it measures the cluster,
+# not the CNI). It must be in the same temp namespace so it's cleaned up by
+# the same trap.
+cat > "$TMPDIR/hardening-probe.yaml" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${HARDENING_POD}
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/component: hardening-probe
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: ${HARDENING_IMAGE}
+      command: ["python3", "-c", "import time; time.sleep(999999)"]
+EOF
+K -n "$NS" apply -f "$TMPDIR/hardening-probe.yaml" >/dev/null 2>&1
+
+HARDENING_READY=""
+for i in $(seq 1 30); do
+  PHASE=$(K -n "$NS" get pod "$HARDENING_POD" -o jsonpath='{.status.phase}' 2>/dev/null)
+  READYC=$(K -n "$NS" get pod "$HARDENING_POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+  if [ "$PHASE" = "Running" ] && [ "$READYC" = "True" ]; then HARDENING_READY=yes; break; fi
+  [ "$PHASE" = "Failed" ] && break
+  sleep 2
+done
+
+if [ "$HARDENING_READY" != "yes" ]; then
+  echo "WARN: hardening check could not run (probe pod did not become Ready)."
+  echo "      This does NOT mean the cluster is hardened — it means we could"
+  echo "      not verify items 2 and 1 of the cluster-hardening checklist."
+else
+  # Hardening probe script: (a) TCP connect to node:10255, (b) unauthenticated
+  # HTTPS GET to apiserver /api.
+  cat > "$TMPDIR/hardening-probe.py" <<PYEOF
+import os, socket, ssl, urllib.request, urllib.error
+
+# (a) kubelet read-only port check
+for ip in os.environ["NODE_IPS"].split():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(4)
+    try:
+        s.connect((ip, 10255))
+        print("HARDENING KUBELET_READONLY(%s) OPEN" % ip)
+    except Exception:
+        print("HARDENING KUBELET_READONLY(%s) CLOSED" % ip)
+    finally:
+        s.close()
+
+# (b) unauthenticated apiserver /api check
+import http.client
+try:
+    conn = http.client.HTTPSConnection(os.environ["APISERVER_SVC_IP"], 443, timeout=4, context=ssl._create_unverified_context())
+    conn.request("GET", "/api")
+    resp = conn.getresponse()
+    code = resp.status
+    resp.read()
+    conn.close()
+    if code == 401:
+        print("HARDENING APISERVER_ANON 401 (anonymous auth disabled or restricted)")
+    elif code == 403:
+        print("HARDENING APISERVER_ANON 403 (anonymous enabled but unauthorized)")
+    elif code == 200:
+        print("HARDENING APISERVER_ANON 200 (anonymous auth ENABLED — WARN)")
+    else:
+        print("HARDENING APISERVER_ANON %d (unexpected)" % code)
+except Exception as exc:
+    print("HARDENING APISERVER_ANON ERROR(%s)" % type(exc).__name__)
+PYEOF
+
+  K -n "$NS" cp "$TMPDIR/hardening-probe.py" "$HARDENING_POD:/tmp/hardening-probe.py" >/dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    echo "WARN: hardening check could not run (kubectl cp failed)."
+  else
+    K -n "$NS" exec "$HARDENING_POD" -- sh -c \
+      "NODE_IPS='${NODE_IPS_ENV}' APISERVER_SVC_IP=${APISERVER_SVC_IP} python3 /tmp/hardening-probe.py" > "$TMPDIR/hardening-results.txt" 2>&1
+    cat "$TMPDIR/hardening-results.txt"
+
+    # Interpret the hardening results
+    while IFS= read -r line; do
+      case "$line" in
+        "HARDENING KUBELET_READONLY(*) OPEN")
+          ip=$(echo "$line" | sed -n 's/.*KUBELET_READONLY(\([^)]*\))/\1/p')
+          echo "WARN: kubelet read-only port (10255) open on node $ip."
+          echo "      Fix: set readOnlyPort: 0 in the kubelet config (checklist item 2)."
+          ;;
+        "HARDENING APISERVER_ANON 200*")
+          echo "WARN: apiserver returned 200 for an unauthenticated request to /api."
+          echo "      Anonymous authentication is ENABLED. Fix: set --anonymous-auth=false"
+          echo "      or an AuthenticationConfiguration with anonymous: deny (checklist item 1)."
+          ;;
+        "HARDENING APISERVER_ANON 403*")
+          echo "INFO: apiserver returned 403 for an unauthenticated request to /api."
+          echo "      Anonymous auth is enabled but unauthorized — the control plane is"
+          echo "      reachable but cannot act without credentials."
+          ;;
+        "HARDENING APISERVER_ANON 401*")
+          echo "OK: apiserver returned 401 for an unauthenticated request to /api."
+          echo "     Anonymous auth is disabled or restricted."
+          ;;
+        "HARDENING APISERVER_ANON ERROR*")
+          echo "WARN: could not reach the apiserver for the anonymous-auth check."
+          echo "      This does NOT mean the cluster is hardened — verify manually."
+          ;;
+        HARDENING\ *)
+          # Already printed by cat above; skip re-printing.
+          # Any unhandled HARDENING line is informational (already shown).
+          ;;
+      esac
+    done < "$TMPDIR/hardening-results.txt"
+
+    # Check if any hardening probe line is missing (probe didn't produce all expected lines)
+    # Expected: one KUBELET_READONLY line per node + one APISERVER_ANON line = node_count + 1
+    EXPECTED_HARDENING=$((1 + $(echo $NODE_IPS | wc -w)))
+    ACTUAL_HARDENING=$(grep -c '^HARDENING ' "$TMPDIR/hardening-results.txt" 2>/dev/null || echo 0)
+    if [ "$ACTUAL_HARDENING" -ne "$EXPECTED_HARDENING" ]; then
+      echo "WARN: hardening probe produced $ACTUAL_HARDENING of $EXPECTED_HARDENING expected lines."
+      echo "      Some checks may not have run — verify manually."
+    fi
+  fi
+fi
+
 echo
 if [ "$TOTAL_FAIL" -eq 0 ]; then
   CNI_NOTE=$(K -n kube-system get pod -o json 2>/dev/null | python3 -c "import sys,json; names={p['spec']['containers'][0]['name'] for p in json.load(sys.stdin)['items']}; print('likely ' + ', '.join(sorted(n for n in names if 'calico' in n or 'cilium' in n or 'flannel' in n or 'kindnet' in n or 'weave' in n)))" 2>/dev/null)

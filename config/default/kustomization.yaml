@@ -22,9 +22,10 @@ resources:
 # the KubeArmor fence does not police ephemeral containers.
 - ../admission
 # D38: the fixed namespace + namespaced RBAC for the operator's CNI self-test
-# probe pod (the operator creates the probe pod + its NetworkPolicy there; the
-# probe pod is matched by no agent KubeArmor fence or Loop NetworkPolicy).
-- ../cni-probe
+# probe pod is in config/cni-probe (a standalone kustomization, applied
+# SEPARATELY — see config/cni-probe/kustomization.yaml for why it is not
+# added here: config/default's namespace/namePrefix transforms would rename
+# the Namespace to coxswain-system and prefix the SA/Role/RoleBinding names).
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 #- ../webhook

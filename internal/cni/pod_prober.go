@@ -36,8 +36,17 @@ import (
 
 // PodProberConfig configures the real CNIProber.
 type PodProberConfig struct {
-	// Client is the controller-runtime client (the manager's client).
+	// Client is the controller-runtime client (the manager's cached client).
+	// Used for Create/Delete of the probe pod + NetworkPolicy.
 	Client client.Client
+	// Reader is the direct API reader (mgr.GetAPIReader()) for Gets. The
+	// manager's cached client has a cache scoped to the controller's
+	// selectors (policy.ProxyComponentSelector); the probe pod carries only
+	// coxswain.io/probe=cni-probe, so a cached Get on it reads NotFound.
+	// Every Get (probe pod + NetworkPolicy) goes through the direct reader;
+	// the cached client is used only for Create/Delete.
+	// If Reader is nil, Client is used for Gets too (tests, envtest).
+	Reader client.Reader
 	// Namespace is the fixed probe namespace (coxswain-cni-probe).
 	Namespace string
 	// ProbeImage is the image the probe pod runs.
@@ -93,6 +102,21 @@ var knownProbeLabels = map[string]bool{
 // it through; a CNI that enforces blocks it). The netpol allows only DNS
 // 53 to the node's coredns, so every one of these four targets must be
 // BLOCKED for the CNI to count as enforcing.
+
+// getReader returns the direct API reader for Gets. The manager's cached
+// client has a cache scoped to the controller's selectors
+// (policy.ProxyComponentSelector); the probe pod carries only
+// coxswain.io/probe=cni-probe, so a cached Get on it reads NotFound. Every
+// Get goes through the direct reader (mgr.GetAPIReader()); the cached client
+// is used only for Create/Delete. If Reader is nil (tests, envtest), the
+// cached client is used for Gets too.
+func (p *PodProber) getReader() client.Reader {
+	if p.cfg.Reader != nil {
+		return p.cfg.Reader
+	}
+	return p.cfg.Client
+}
+
 func (p *PodProber) probeCommand() []string {
 	apiserverSVC := "kubernetes.default.svc." + p.cfg.ClusterDomain
 	return []string{"python3", "-c", `
@@ -219,7 +243,8 @@ func (p *PodProber) ensureNetpol(ctx context.Context) error {
 	// CreateOrUpdate: the netpol is the operator's state; re-apply it each run
 	// so a drift (manual edit) is corrected.
 	existing := &networkingv1.NetworkPolicy{}
-	err := p.cfg.Client.Get(ctx, client.ObjectKey{Namespace: p.cfg.Namespace, Name: probeNetpolName}, existing)
+	reader := p.getReader()
+	err := reader.Get(ctx, client.ObjectKey{Namespace: p.cfg.Namespace, Name: probeNetpolName}, existing)
 	if apierrors.IsNotFound(err) {
 		return p.cfg.Client.Create(ctx, want)
 	}
@@ -293,8 +318,9 @@ func containerTerminationMessage(pod *corev1.Pod) string {
 // (the caller maps it).
 func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (string, error) {
 	probe := &corev1.Pod{}
+	reader := p.getReader()
 	for {
-		if err := p.cfg.Client.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, probe); err != nil {
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, probe); err != nil {
 			return "", fmt.Errorf("probe pod get: %w", err)
 		}
 		if msg := containerTerminationMessage(probe); msg != "" {

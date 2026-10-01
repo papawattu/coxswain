@@ -257,6 +257,7 @@ func main() {
 	// the cached result via LatestResult (never runs the probe).
 	cniProber := cni.NewPodProber(cni.PodProberConfig{
 		Client:        mgr.GetClient(),
+		Reader:        mgr.GetAPIReader(),
 		Namespace:     cniProbeNamespace,
 		ProbeImage:    cniProbeImage,
 		ProbeTimeout:  cniProbeTimeout,

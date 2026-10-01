@@ -17,7 +17,23 @@ package cni
 import (
 	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+// fakeReader is a client.Reader backed by an empty fake client (the reader and
+// the writer differ: the reader is a direct API reader, the writer is the
+// cached client). getReader() must return this, not the writer.
+type fakeReader struct{ client.Reader }
+
+// fakeClient is a client.Client backed by an empty fake client.
+type fakeClient struct{ client.Client }
+
+// probeTestImage is the probe image used in unit tests (python:3-alpine — the
+// default --cni-probe-image; no bash, no /dev/tcp).
+const probeTestImage = "python:3-alpine"
 
 // D38s2: the probe pod is the D38 property measured from inside a pod with an
 // agent-shaped allow (DNS only). The probe must be runnable on the default
@@ -26,8 +42,8 @@ import (
 // message), and must target the D38 property's endpoints.
 func TestProbeCommandShape(t *testing.T) {
 	p := NewPodProber(PodProberConfig{
-		Namespace:  "coxswain-cni-probe",
-		ProbeImage: "python:3-alpine",
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
 	})
 	cmd := p.probeCommand()
 	if len(cmd) != 3 || cmd[0] != "python3" || cmd[1] != "-c" {
@@ -55,7 +71,7 @@ func TestProbeCommandShape(t *testing.T) {
 // line count, an unknown label, an unknown verdict, or a non-zero pod exit is
 // ProbeUnavailable — never a false pass.
 func TestProbeParseStrictValidation(t *testing.T) {
-	p := NewPodProber(PodProberConfig{Namespace: "coxswain-cni-probe", ProbeImage: "python:3-alpine"})
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
 	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT BLOCK_ONLY BLOCKED\nDONE"
 	res, err := p.parse(allBlocked, pod(allBlocked, 0))
 	if err != nil {
@@ -94,5 +110,40 @@ func TestProbeParseStrictValidation(t *testing.T) {
 				t.Fatalf("want ProbeUnavailable, got %v (detail=%q)", res.Reason, res.Detail)
 			}
 		})
+	}
+}
+
+// D38 R16 P1: the manager's cached client has a cache scoped to the
+// controller's selectors (policy.ProxyComponentSelector); the probe pod
+// carries only coxswain.io/probe=cni-probe, so a cached Get on it reads
+// NotFound. The PodProber must use a direct API reader (mgr.GetAPIReader())
+// for Gets so the probe pod is found. This test verifies that getReader()
+// returns the Reader when it is set (the reader and the writer differ), and
+// falls back to the Client when Reader is nil (tests, envtest).
+func TestPodProberGetReader(t *testing.T) {
+	// When Reader is set, getReader() returns it (not the Client).
+	fakeReader := &fakeReader{Reader: fake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build()}
+	fakeClient := &fakeClient{Client: fake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build()}
+	p := NewPodProber(PodProberConfig{
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
+		Client:     fakeClient,
+		Reader:     fakeReader,
+	})
+	got := p.getReader()
+	if got != any(fakeReader) {
+		t.Errorf("getReader() should return the Reader when set, got %T (want %T)", got, fakeReader)
+	}
+
+	// When Reader is nil, getReader() falls back to the Client.
+	p2 := NewPodProber(PodProberConfig{
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
+		Client:     fakeClient,
+		// Reader nil
+	})
+	got2 := p2.getReader()
+	if got2 != any(fakeClient) {
+		t.Errorf("getReader() should fall back to the Client when Reader is nil, got %T (want %T)", got2, fakeClient)
 	}
 }

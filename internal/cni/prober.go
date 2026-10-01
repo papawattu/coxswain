@@ -20,7 +20,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -94,6 +94,11 @@ type ProbeRunnable struct {
 	Prober CNIProber
 	// Client lists Loops and writes the re-gate Events.
 	Client client.Client
+	// Recorder is the manager's EventRecorder for the re-gate Events (it
+	// sets the Event's name via generateName, so the API accepts it; a
+	// hand-built corev1.Event with no name is rejected by the API).
+	// If nil, no Event is emitted (the channel re-gate still fires).
+	Recorder record.EventRecorder
 	// Interval is the probe period (default 10m; --cni-check-interval).
 	Interval time.Duration
 	// Timeout is the per-run probe timeout (default 60s; --cni-probe-timeout).
@@ -169,23 +174,9 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 	}
 	for i := range loops.Items {
 		loop := &loops.Items[i]
-		ev := &corev1.Event{
-			ObjectMeta: metav1.ObjectMeta{Namespace: loop.Namespace},
-			InvolvedObject: corev1.ObjectReference{
-				APIVersion: loop.APIVersion,
-				Kind:       loop.Kind,
-				Namespace:  loop.Namespace,
-				Name:       loop.Name,
-				UID:        loop.UID,
-			},
-			Reason:  string(new.Reason),
-			Message: "NetworkEnforced: " + string(new.Reason) + " (" + new.Describe() + ")",
-			Source:  corev1.EventSource{Component: "coxswain-cni-prober"},
-		}
-		if err := p.Client.Create(ctx, ev); err != nil {
-			// Events are best-effort (duplicate names are fine; a failed
-			// Event never blocks the re-gate or the gate itself).
-			log.Error(err, "Could not create re-gate Event", "loop", loop.Name)
+		if p.Recorder != nil {
+			p.Recorder.Eventf(loop, corev1.EventTypeWarning, string(new.Reason),
+				"NetworkEnforced: %s (%s)", new.Reason, new.Describe())
 		}
 		if p.Ch != nil {
 			select {
@@ -206,8 +197,10 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 func AddProbeRunnable(mgr manager.Manager, prober CNIProber, interval, timeout time.Duration) (source.Source, error) {
 	ch := make(chan event.TypedGenericEvent[client.Object], 128)
 	r := &ProbeRunnable{
-		Prober:   prober,
-		Client:   mgr.GetClient(),
+		Prober: prober,
+		Client: mgr.GetClient(),
+		//nolint:staticcheck // SA1019: GetEventRecorderFor (old events API) is deprecated; the new GetEventRecorder returns a different interface (events.EventRecorder) whose method set doesn't match record.EventRecorder. Port to the new API in a follow-on; the old API is still supported.
+		Recorder: mgr.GetEventRecorderFor("coxswain-cni-prober"),
 		Interval: interval,
 		Timeout:  timeout,
 		Ch:       ch,

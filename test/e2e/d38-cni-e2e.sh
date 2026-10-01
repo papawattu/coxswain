@@ -113,21 +113,25 @@ for img in "$IMG" "$PROXY_IMG" "$EGRESS_IMG" "$AGENT_IMG" "$PROBE_IMG"; do
 done
 
 echo
-echo "--- STEP 2: deploy controller (BASE install: NO --allow-unenforced, NO --allow-unenforced-network) ---"
+echo "--- STEP 2: deploy controller (config/calico: --allow-unenforced ONLY, NO --allow-unenforced-network) ---"
 make -C "$REPO_ROOT" kustomize >/dev/null 2>&1
 KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
-# Build the BASE install (config/default) from a TEMP COPY of the config tree
-# (R16 I44 norm: never let `kustomize edit set image` rewrite the tracked
-# kustomization.yaml). The enforcing-CNI profile (D38 design point 5) deploys
-# WITHOUT the escape hatches: Calico enforces, so the operator's own CNI
-# self-test (D38 gate) must pass on its own — with --allow-unenforced-network
-# the gate would pass-via-flag and prove nothing about the CNI.
+# Build the calico/enforcing-CNI profile (config/calico) from a TEMP COPY of
+# the config tree (R16 I44 norm: never let `kustomize edit set image` rewrite
+# the tracked kustomization.yaml). config/calico = config/default +
+# --allow-unenforced (bypasses the D30 KubeArmor gate — KubeArmor is absent
+# by design on the enforcing-CNI cluster, ADR-0007 F2) but NOT
+# --allow-unenforced-network (the D38 network gate stays LIVE). Calico
+# enforces the D38 property, so the operator's own CNI self-test probe passes
+# and Loops run with NetworkEnforced=True (CNIEnforced). On a non-enforcing
+# CNI (kindnet), this same overlay would hold Loops Suspended with
+# NetworkEnforced=False (CNIUnenforced).
 TMP_OVERLAY=$(mktemp -d)
 cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
-(cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/default | K apply -f -) \
+(cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/calico | K apply -f -) \
   || { echo "FATAL: controller deploy failed"; exit 2; }
-# D38: the cni-probe kustomization is standalone (not in config/default — see
+# D38: the cni-probe kustomization is standalone (not in config/calico — see
 # config/cni-probe/kustomization.yaml); apply it separately so the operator's
 # CNI self-test probe namespace + namespaced RBAC exist before the operator's
 # first probe run.
@@ -217,11 +221,15 @@ CONTROLLER_ARGS=$(K -n "$E2E_NS" get deploy coxswain-controller-manager -o jsonp
 echo "   controller args: $CONTROLLER_ARGS"
 case "$CONTROLLER_ARGS" in
   *"--allow-unenforced-network"*) bad "controller runs WITH --allow-unenforced-network — the gate would pass-via-flag and prove nothing about the CNI" ;;
-  *) ok "controller runs WITHOUT --allow-unenforced-network (base install; the gate is real)" ;;
+  *) ok "controller runs WITHOUT --allow-unenforced-network (the D38 gate is real)" ;;
 esac
+# --allow-unenforced IS expected on the calico profile: it bypasses the D30
+# KubeArmor gate (KubeArmor is absent by design, ADR-0007 F2) so the D38
+# network gate is the only gate under test. We assert it IS present (the
+# calico overlay sets it) and that it is the ONLY escape hatch.
 case "$CONTROLLER_ARGS" in
-  *"--allow-unenforced"*) bad "controller runs WITH --allow-unenforced (eBPF escape hatch; not expected on the base install)" ;;
-  *) ok "controller runs WITHOUT --allow-unenforced" ;;
+  *"--allow-unenforced"*) ok "controller runs WITH --allow-unenforced (expected on the calico profile: bypasses the D30 KubeArmor gate; the D38 network gate is the one under test)" ;;
+  *) bad "controller runs WITHOUT --allow-unenforced — the D30 KubeArmor gate would hold Loops (KubeArmor is absent on this cluster); the calico overlay should set it" ;;
 esac
 
 # The probe pod: the operator creates + deletes it per probe run, so it is

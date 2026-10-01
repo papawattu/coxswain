@@ -1,0 +1,27 @@
+# Calico/enforcing-CNI profile: the base install (config/default) plus
+# --allow-unenforced ONLY (NOT --allow-unenforced-network).
+#
+# --allow-unenforced bypasses the D30 KubeArmor gate: on an enforcing-CNI
+# cluster without KubeArmor (ADR-0007 F2 keep-off), the operator must not
+# hold Loops on the KubeArmor policy — the CNI is the enforcement mechanism
+# being tested. Loops run with PolicyEnforced=False (EnforcementDisabled).
+#
+# --allow-unenforced-network is NOT set: the D38 network gate is LIVE. Calico
+# enforces the D38 property (pod -> host-network egress blocked), so the
+# operator's CNI self-test probe passes and Loops run with
+# NetworkEnforced=True (CNIEnforced). On a non-enforcing CNI (kindnet), this
+# same overlay would hold Loops Suspended with NetworkEnforced=False
+# (CNIUnenforced).
+#
+# This is the D38s3 "Calico profile" — the primary assertion that the
+# operator's CNI self-test detects an enforcing CNI and lets Loops run.
+resources:
+- ../default
+patches:
+- target:
+    kind: Deployment
+    name: coxswain-controller-manager
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --allow-unenforced

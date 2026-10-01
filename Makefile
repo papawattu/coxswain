@@ -138,6 +138,10 @@ egress-proxy-e2e: ## Run the I42a egress proxy kind e2e (real proxy, TLS + plain
 i42-e2e: ## Run the full I42 acceptance kind e2e (pinned to --context kind-coxswain-dev).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/i42-e2e.sh
 
+.PHONY: verify-cni
+verify-cni: ## D38 preflight: check the CURRENT cluster's CNI polices pod -> host-network egress (K8S_CONTEXT=<ctx> to target another context; default = current kubectl context). Works on a cluster WITHOUT coxswain installed; creates only a temp namespace + NetworkPolicy + probe pod and always deletes them. Exits non-zero on FAIL.
+	@bash test/e2e/verify-cni.sh
+
 .PHONY: d38-cni-e2e
 d38-cni-e2e: kind-calico-up ## D38: run the enforcing-CNI network e2e (pinned to --context kind-coxswain-calico).
 	@K8S_CONTEXT=kind-coxswain-calico KIND_CLUSTER_NAME=$(CALICO_CLUSTER) CALICO_IP_POOL=$(CALICO_IP_POOL) bash test/e2e/d38-cni-e2e.sh

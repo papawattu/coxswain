@@ -1090,44 +1090,98 @@ Suspended (fail-closed), not run.
 
 ### Design points
 
-1. **Where the probe runs.** The operator runs the verify-cni probe in its
-   own namespace (the coxswain-system namespace), creating a temp namespace
-   `coxswain-cni-selftest-<hash>` with a NetworkPolicy shaped like the
-   agent's and a probe pod (configurable image, default
-   `python:3-alpine`). The operator needs a **namespaced Role** in the temp
-   namespace only: create/delete pods + networkpolicies. No new cluster-wide
-   RBAC beyond what `make manifests` regenerates and is minimal. The probe
-   image is configurable via an operator flag
-   (`--cni-probe-image`), defaulting to `python:3-alpine`.
+1. **Where the probe runs.** The probe runs in a **fixed probe namespace**
+   `coxswain-cni-probe`, created at install by kustomize (a new
+   `config/cni-probe` kustomization, added to `config/default`, with a
+   **namespaced Role** there). No temp namespace is created at runtime: a
+   Role cannot pre-exist in a namespace that's created at runtime, and
+   creating/deleting namespaces would need cluster-scoped RBAC this feature
+   does not need. The operator's probe NetworkPolicy in that namespace has a
+   `podSelector` that matches **only the probe pod**, never the operator or
+   any agent. No `pods/exec`, no `kubectl cp`: the probe script is inline in
+   the pod's `command`, and the probe writes its `RESULT` lines to the pod's
+   **termination message** (`terminationMessagePath`) and returns. The
+   operator needs only, in `coxswain-cni-probe`: `pods` create/get/delete
+   and `networkpolicies` create/delete, plus `pods/log` get (it reads the
+   termination message via the pod object and the log as a fallback). No new
+   cluster-wide RBAC beyond what `make manifests` regenerates. The probe
+   image is configurable via an operator flag (`--cni-probe-image`),
+   defaulting to `python:3-alpine`. At startup the operator **deletes any
+   leftover probe pod / probe NetworkPolicy** in that namespace from a
+   previously crashed run before starting a fresh probe (the leak seen in
+   PR #38).
 
-2. **When it runs.** At operator startup (before the first reconcile loop
-   begins) and periodically (every 10 minutes by default, configurable via
+2. **When it runs.** As a **manager `Runnable`** that is **leader-elected
+   only** (so replicas don't all probe) and **non-blocking** (an image pull
+   or a slow scheduler must never hang manager start). It runs once at start
+   and then periodically (every 10 minutes by default, configurable via
    `--cni-check-interval`). The probe is a short-lived pod that runs once and
-   exits; the operator reads its result and deletes it. The probe logic is
-   the same as `verify-cni.sh`: TCP-connect to the apiserver service IP, each
-   node's `:6443`/`:10250`, a kube-dns pod IP, and `1.1.1.1:443`. Every
-   target must be BLOCKED for PASS.
+   exits; the operator reads its termination message and deletes it. There
+   is a **per-run timeout** (e.g. `--cni-probe-timeout`, default 60s): a
+   pod that isn't Ready within the timeout, a probe that doesn't exit in
+   time, or an image pull failure all mean `ProbeUnavailable`. The probe
+   logic is the same as `verify-cni.sh`: TCP-connect to the apiserver
+   service IP, each node's `:6443`/`:10250`, a kube-dns pod IP, and
+   `1.1.1.1:443`. Every target must be BLOCKED for PASS.
 
 3. **Result surface.** The result surfaces as:
    - A **`NetworkEnforced` condition** on every Loop (type
-     `NetworkEnforced`, status `True`/`False`, reason `CNIEnforcing` /
-     `CNIUnenforced` / `ProbeUnavailable`). This is analogous to the
-     existing `PolicyEnforced` condition (D30) but for the network layer.
+     `NetworkEnforced`, status `True`/`False`/`Unknown`). Condition
+     **reasons, listed explicitly:**
+       * `CNIEnforced` — probe ran, every target BLOCKED, CNI enforces
+         (status `True`).
+       * `CNIUnenforced` — probe ran, some target REACHABLE (status
+         `False`).
+       * `ProbeUnavailable` — the probe could not run (no pod Ready in the
+         timeout, no output, unknown/wrong-count lines, pull failure)
+         (status `False`, fail-closed).
+       * `EnforcementDisabled` — not enforced, but the operator runs with
+         `--allow-unenforced-network`, so Loops run anyway (status `False`).
+       * `Unknown` — **initial state before the first probe result**; the
+         gate treats it as not enforced (Suspended), so the manager is
+         fail-closed from startup, not just from the first probe failure.
+     (Status `True` only for `CNIEnforced`; every other reason is
+     `False`/`Unknown`, and every reason **except `CNIEnforced` and
+     `EnforcementDisabled`** holds Loops Suspended. `EnforcementDisabled`
+     is the only non-enforcing reason that does NOT hold Suspended — it
+     means the escape hatch was set on purpose.)
    - A **Kubernetes Event** on each Loop when the condition changes.
    - A **metric** (`coxswain_network_enforced` gauge, 1.0 when enforced,
-     0.0 when not) exposed via the operator's metrics endpoint.
+     0.0 when not — including `Unknown` and `ProbeUnavailable`, which makes
+     the resulting Suspended state **alertable**; the docs must say so).
+
+3a. **Re-gating on result change.** When the probe result flips (e.g.
+   `CNIEnforced` ↔ `CNIUnenforced`/`ProbeUnavailable`), **every Loop must
+   be re-reconciled** so its OperatingMode and condition update. Mechanism:
+   the probe Runnable pushes the new result into a **thread-safe result
+   holder** (mutex-guarded, since `MaxConcurrentReconciles > 1` is coming —
+   see R17 D42) and sends a `source.Channel` **`GenericEvent` for every
+   Loop**, which the Loop controller handles (no-op if the result is
+   unchanged). The reconcile loop reads the cached result from the holder
+   — it never runs the probe itself.
 
 4. **Gate: Loops held Suspended when not enforced.** When `NetworkEnforced`
-   is `False` (CNI does not police pod → host-network egress, **or** the
-   probe can't run — FAIL-CLOSED, never pass), Loops are held Suspended
+   is not `True` (i.e. `CNIUnenforced`, `ProbeUnavailable`, or `Unknown` —
+   CNI does not police pod → host-network egress, the probe can't run, or
+   no result yet — FAIL-CLOSED, never pass), Loops are held Suspended
    (D30-style: set `OperatingMode = Suspended`, set the condition, emit an
    Event) unless `--allow-unenforced-network` is set. This is a **separate**
    flag from the existing `--allow-unenforced` (which gates the eBPF/KubeArmor
    engine). The two flags are independent: a cluster might have a working
    KubeArmor but a non-enforcing CNI, or vice versa.
-   **FAIL-CLOSED:** if the probe can't run (pod doesn't become Ready, exec
-   fails, no output, wrong line count), the result is `ProbeUnavailable` and
-   the gate treats it as not enforced (Suspended), not as a pass.
+   **FAIL-CLOSED:** if the probe can't run (pod not Ready in the timeout,
+   no output, unknown or wrong-count lines, image pull failure), the result
+   is `ProbeUnavailable` and the gate treats it as not enforced
+   (Suspended), not as a pass. Keep the **strict validation from
+   verify-cni**: the expected line count, unknown lines are an error, a
+   non-zero pod exit means `ProbeUnavailable` — never a false pass.
+
+4a. **Scope limitation (documented).** One probe pod tests **one node's**
+   CNI path. Mixed node pools could enforce differently, and this design
+   would not detect that. This is a **known limitation** of the first
+   implementation; a per-node probe is left for later (it would need the
+   cluster-scoped access to schedule on specific nodes, or per-node
+   DaemonSet-style probes).
 
 5. **Config profiles.**
    - `config/dev` (kindnet, `make deploy-dev`): must set
@@ -1173,27 +1227,44 @@ Suspended (fail-closed), not run.
 
 8. **Seam: the `CNIProber` interface.** Analogous to the existing
    `Enforcer` interface (D30): a `CNIProber` interface with
-   `Probe(ctx) (enforced bool, reason string, err error)`. The operator
-   holds a `CNIProber` (nil = probe unavailable = fail-closed, like the
-   existing `Enforcer` nil handling). The real implementation creates the
-   temp namespace + probe pod, runs the probe, reads the result, and cleans
-   up. The fake in envtests is a struct that returns a configurable result.
-   The probe runs in a goroutine (non-blocking) and caches the last result;
-   the reconcile loop reads the cached result.
+   `Probe(ctx) (result CNIProbeResult, err error)` where
+   `CNIProbeResult` carries the reason (`CNIEnforced` / `CNIUnenforced` /
+   `ProbeUnavailable`) and the parsed target rows. The operator holds a
+   `CNIProber` (nil = probe unavailable = fail-closed, like the existing
+   `Enforcer` nil handling). The real implementation creates the probe pod
+   + NetworkPolicy in the **fixed `coxswain-cni-probe` namespace**, waits
+   for it with the per-run timeout, reads the termination message, validates
+   the `RESULT` lines strictly (count + unknown-line check, same as
+   verify-cni), and deletes the pod. The fake in envtests is a struct that
+   returns a configurable result. The probe runs in the leader-elected
+   manager Runnable (non-blocking) and caches the last result in a
+   thread-safe holder; the reconcile loop reads the cached result (design
+   point 3a).
 
 ### Slice breakdown (for the implementation PR)
 
-- **D38s1** — `CNIProber` interface + fake + `NetworkEnforced` condition
-  type + `--allow-unenforced-network` flag + `--cni-check-interval` flag +
-  `--cni-probe-image` flag. Envtest: gate passes (fake enforced=true), gate
-  blocks (fake enforced=false), fail-closed (fake ProbeUnavailable),
-  condition/event/metric. Mutation checks.
-- **D38s2** — Real `CNIProber` implementation (temp namespace + probe pod +
-  NetworkPolicy + probe script + result parsing + cleanup). The probe logic
-  is the same as `verify-cni.sh`. Reuses the probe script from
-  `test/e2e/verify-cni.sh` (extracted into a shared location, or inlined in
-  the Go code). Envtest: the real probe is not run (fake is used); the
-  implementation is verified by the kind acceptance.
+- **D38s1** — `CNIProber` interface + `CNIProbeResult` + fake +
+  `NetworkEnforced` condition type with the five explicit reasons
+  (`CNIEnforced`, `CNIUnenforced`, `ProbeUnavailable`, `EnforcementDisabled`,
+  `Unknown` — which hold Suspended) + `--allow-unenforced-network` flag +
+  `--cni-check-interval` flag + `--cni-probe-image` flag + `--cni-probe-timeout`
+  flag. The leader-elected, non-blocking probe Runnable with the initial
+  `Unknown` (fail-closed) state and the thread-safe result holder; the
+  `source.Channel`/`GenericEvent` re-gating for all Loops. Envtest: gate
+  passes (fake enforced=true), gate blocks (fake enforced=false),
+  fail-closed (fake ProbeUnavailable), initial-Unknown holds Suspended until
+  the first result, condition/event/metric, re-gate on result flip.
+  Mutation checks.
+- **D38s2** — Real `CNIProber` implementation (fixed `coxswain-cni-probe`
+  namespace + kustomize `config/cni-probe` + namespaced Role + probe pod
+  with inline command writing RESULT lines to the termination message +
+  NetworkPolicy + per-run timeout + stale-probe cleanup at startup + strict
+  result parsing + pod cleanup). The probe logic is the same as
+  `verify-cni.sh` (same targets, same strict validation); the script is
+  shared, extracted from `test/e2e/verify-cni.sh` into a location both the
+  e2e and the Go code read. Envtest: the real probe is not run (fake is
+  used); the implementation is verified by the kind acceptance. The
+  single-node scope limitation is documented (design point 4a).
 - **D38s3** — Kind acceptance: `make kind-calico-up` (Calico, no escape
   hatch, Loops run, `NetworkEnforced=True`); `kind-coxswain-dev` with
   `make deploy` (kindnet, no escape hatch, Loops Suspended,
@@ -1212,13 +1283,21 @@ Suspended (fail-closed), not run.
   it does NOT set the escape hatch).
 
 **Missing (to build):**
-- The `CNIProber` interface + implementation.
-- The `NetworkEnforced` condition type + event + metric.
+- The `CNIProber` interface + `CNIProbeResult` + implementation.
+- The `NetworkEnforced` condition type (five explicit reasons) + event +
+  metric.
 - The `--allow-unenforced-network` flag (separate from `--allow-unenforced`).
-- The `--cni-check-interval` and `--cni-probe-image` flags.
-- The probe goroutine + result cache in the operator.
-- The temp-namespace creation + probe pod + NetworkPolicy + cleanup in the
-  operator (RBAC: namespaced Role in the temp namespace).
+- The `--cni-check-interval`, `--cni-probe-image`, and `--cni-probe-timeout`
+  flags.
+- The leader-elected, non-blocking probe Runnable + thread-safe result
+  holder + initial `Unknown` (fail-closed) state.
+- The `source.Channel`/`GenericEvent` re-gating of all Loops on a result
+  change.
+- The fixed `coxswain-cni-probe` namespace (kustomize) + namespaced Role +
+  probe pod (inline command, termination message) + NetworkPolicy + per-run
+  timeout + stale-probe cleanup at startup.
+- The shared probe script (extracted from `test/e2e/verify-cni.sh`).
+- The single-node scope limitation documented.
 - Envtests with mutation checks.
 - Kind acceptance runs on all three profiles.
 - `config/dev` updated to set `--allow-unenforced-network`.

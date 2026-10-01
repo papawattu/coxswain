@@ -105,6 +105,54 @@ if ! self_test_broken_probe "$SELF_TEST_DIR"; then
 fi
 
 # ---------------------------------------------------------------------------
+# interpret_hardening_line: the ONE interpreter for hardening probe lines.
+# Both the real HARDENING section and self_test_hardening_interpreter call
+# it, so the self-test exercises the code the run uses (I45, PR #40 P2).
+# ---------------------------------------------------------------------------
+interpret_hardening_line() {
+  local line="$1"
+  case "$line" in
+    HARDENING\ KUBELET_READONLY\(*\)\ OPEN)
+      local ip
+      ip=$(echo "$line" | sed -n 's/.*KUBELET_READONLY(\([^)]*\))/\1/p')
+      echo "WARN: kubelet read-only port (10255) open on node $ip."
+      echo "     Fix: set readOnlyPort: 0 in the kubelet config (checklist item 2)."
+      ;;
+    HARDENING\ APISERVER_ANON\ 200*)
+      echo "WARN: apiserver returned 200 for an unauthenticated request to /api."
+      echo "     Anonymous authentication is ENABLED. Fix: set --anonymous-auth=false"
+      echo "     or an AuthenticationConfiguration with anonymous: deny (checklist item 1)."
+      ;;
+    HARDENING\ APISERVER_ANON\ 403*)
+      echo "INFO: apiserver returned 403 for an unauthenticated request to /api."
+      echo "     Anonymous auth is enabled but unauthorized — the control plane is"
+      echo "     reachable but cannot act without credentials."
+      ;;
+    HARDENING\ APISERVER_ANON\ 401*)
+      echo "OK: apiserver returned 401 for an unauthenticated request to /api."
+      echo "    Anonymous auth is disabled or restricted."
+      ;;
+    HARDENING\ APISERVER_ANON\ ERROR*)
+      echo "WARN: could not reach the apiserver for the anonymous-auth check."
+      echo "     This does NOT mean the cluster is hardened — verify manually."
+      ;;
+    HARDENING\ KUBELET_READONLY\(*\)\ CLOSED)
+      # Expected: port is closed. No action needed.
+      ;;
+    HARDENING\ *)
+      echo "WARN: unrecognised hardening line: $line"
+      echo "     This does NOT mean the cluster is hardened — verify manually."
+      ;;
+    "")
+      ;; # skip blank lines
+    *)
+      echo "WARN: non-HARDENING line in hardening probe output: $line"
+      echo "     This does NOT mean the cluster is hardened — verify manually."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Self-test 2: prove the hardening interpreter fires WARN/INFO/OK for the
 # right lines. Synthetic lines cover every case pattern.
 # ---------------------------------------------------------------------------
@@ -131,34 +179,7 @@ EOF
 
   local output
   output=$(while IFS= read -r line; do
-    case "$line" in
-      HARDENING\ KUBELET_READONLY\(*\)\ OPEN)
-        ip=$(echo "$line" | sed -n 's/.*KUBELET_READONLY(\([^)]*\))/\1/p')
-        echo "WARN: kubelet read-only port (10255) open on node $ip."
-        ;;
-      HARDENING\ APISERVER_ANON\ 200*)
-        echo "WARN: apiserver returned 200 for an unauthenticated request to /api."
-        ;;
-      HARDENING\ APISERVER_ANON\ 403*)
-        echo "INFO: apiserver returned 403 for an unauthenticated request to /api."
-        ;;
-      HARDENING\ APISERVER_ANON\ 401*)
-        echo "OK: apiserver returned 401 for an unauthenticated request to /api."
-        ;;
-      HARDENING\ APISERVER_ANON\ ERROR*)
-        echo "WARN: could not reach the apiserver for the anonymous-auth check."
-        ;;
-      HARDENING\ KUBELET_READONLY\(*\)\ CLOSED)
-        ;;
-      HARDENING\ *)
-        echo "WARN: unrecognised hardening line: $line"
-        ;;
-      "")
-        ;;
-      *)
-        echo "WARN: non-HARDENING line in hardening probe output: $line"
-        ;;
-    esac
+    interpret_hardening_line "$line"
   done < "$ST_RESULTS")
 
   # Verify each expected output is present
@@ -482,47 +503,10 @@ PYEOF
       "NODE_IPS='${NODE_IPS_ENV}' APISERVER_SVC_IP=${APISERVER_SVC_IP} python3 /tmp/hardening-probe.py" > "$TMPDIR/hardening-results.txt" 2>&1
     cat "$TMPDIR/hardening-results.txt"
 
-    # Interpret the hardening results. Case patterns use escaped parens
-    # so `*` and `(` match as patterns, not literals or subshell groups.
+    # Interpret the hardening results via the shared interpret_hardening_line
+    # function (the same code the self-test exercises).
     while IFS= read -r line; do
-      case "$line" in
-        HARDENING\ KUBELET_READONLY\(*\)\ OPEN)
-          ip=$(echo "$line" | sed -n 's/.*KUBELET_READONLY(\([^)]*\))/\1/p')
-          echo "WARN: kubelet read-only port (10255) open on node $ip."
-          echo "      Fix: set readOnlyPort: 0 in the kubelet config (checklist item 2)."
-          ;;
-        HARDENING\ APISERVER_ANON\ 200*)
-          echo "WARN: apiserver returned 200 for an unauthenticated request to /api."
-          echo "      Anonymous authentication is ENABLED. Fix: set --anonymous-auth=false"
-          echo "      or an AuthenticationConfiguration with anonymous: deny (checklist item 1)."
-          ;;
-        HARDENING\ APISERVER_ANON\ 403*)
-          echo "INFO: apiserver returned 403 for an unauthenticated request to /api."
-          echo "      Anonymous auth is enabled but unauthorized — the control plane is"
-          echo "      reachable but cannot act without credentials."
-          ;;
-        HARDENING\ APISERVER_ANON\ 401*)
-          echo "OK: apiserver returned 401 for an unauthenticated request to /api."
-          echo "     Anonymous auth is disabled or restricted."
-          ;;
-        HARDENING\ APISERVER_ANON\ ERROR*)
-          echo "WARN: could not reach the apiserver for the anonymous-auth check."
-          echo "      This does NOT mean the cluster is hardened — verify manually."
-          ;;
-        HARDENING\ KUBELET_READONLY\(*\)\ CLOSED)
-          # Expected: port is closed. No action needed.
-          ;;
-        HARDENING\ *)
-          echo "WARN: unrecognised hardening line: $line"
-          echo "      This does NOT mean the cluster is hardened — verify manually."
-          ;;
-        "")
-          ;; # skip blank lines
-        *)
-          echo "WARN: non-HARDENING line in hardening probe output: $line"
-          echo "      This does NOT mean the cluster is hardened — verify manually."
-          ;;
-      esac
+      interpret_hardening_line "$line"
     done < "$TMPDIR/hardening-results.txt"
 
     # Check if any hardening probe line is missing (probe didn't produce all expected lines)

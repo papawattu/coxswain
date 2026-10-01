@@ -15,7 +15,9 @@
 package cni
 
 import (
+	"bytes"
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -266,6 +268,49 @@ func TestPodProberGetReader(t *testing.T) {
 	if got2 != any(fakeClient) {
 		t.Errorf("getReader() should fall back to the Client when Reader is nil, got %T (want %T)", got2, fakeClient)
 	}
+}
+
+// D38 (R16): the probe command is a python3 -c '<script>' whose script is a Go
+// raw string with one in-string + apiserverSVC + splice. A missing quote around
+// that splice (the original "unrecognised probe line: File \"<string>\", line 14"
+// failure) produces a Python SyntaxError that only surfaces at pod runtime —
+// the operator then sees the pod exit non-zero and reports ProbeUnavailable,
+// which looks like the CNI is missing, not that the probe itself was broken.
+// This test compiles the generated script with the host's python3 so a
+// quoting regression is caught in `make test`, not on a kind cluster.
+func TestProbeCommandIsValidPython(t *testing.T) {
+	python3, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH; skipping probe-script compile check")
+	}
+	// Default cluster domain ("" -> "cluster.local").
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
+	cmd := p.probeCommand()
+	if len(cmd) != 3 || cmd[0] != "python3" || cmd[1] != "-c" {
+		t.Fatalf("probeCommand() = %v; want [python3 -c <script>], got %d args", cmd, len(cmd))
+	}
+	script := cmd[2]
+
+	// python3 -c 'import sys; compile(sys.stdin.read(), "probe", "exec")'
+	// reads the script on stdin and compile()s it; a SyntaxError exits 1.
+	cmdExec := exec.Command(python3, "-c", "import sys; compile(sys.stdin.read(), 'probe', 'exec')")
+	cmdExec.Stdin = bytes.NewBufferString(script)
+	var eout bytes.Buffer
+	cmdExec.Stderr = &eout
+	if err := cmdExec.Run(); err != nil {
+		t.Fatalf("generated probe script is not valid Python (python3 %v): %v\nstderr:\n%s\nscript (around the splice):\n%s",
+			cmdExec.ProcessState, err, eout.String(), aroundSplice(script))
+	}
+}
+
+// aroundSplice returns the region of the script from TARGETS onward so a
+// failure message shows the exact splice line that is broken.
+func aroundSplice(script string) string {
+	i := strings.Index(script, "TARGETS")
+	if i == -1 {
+		return script
+	}
+	return script[i:min(i+160, len(script))]
 }
 
 // D38s3 (Calico run): the holder must be written ONLY by probeOnce (the

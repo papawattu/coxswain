@@ -163,7 +163,7 @@ if not node_ip:
     sys.exit(3)
 
 TARGETS = [
-    ("APISERVER_SVC", ` + apiserverSVC + `", 443),
+    ("APISERVER_SVC", "` + apiserverSVC + `", 443),
     ("NODE_API", node_ip, 6443),
     ("KUBELET_NODE", node_ip, 10250),
     # Positive CONTROL: the probe NetworkPolicy allows egress to the outside

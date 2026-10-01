@@ -13,7 +13,7 @@ envtest. That is itself the main lesson (see I43).
 
 ### D38. The agent can reach the control plane on CNIs that don't police pod→host-network egress
 
-- [ ] Owner decision: production CNI requirement (question 1 below)
+- [x] Owner decision (2026-10-01): production CNI requirement (question 1 below): **a requirement on the property, plus a preflight check**
 - [ ] Owner decision: CNI-independent defence in depth (question 2 below)
 - [ ] Planned as slices
 
@@ -52,6 +52,18 @@ assumed was closed.
    production needs a CNI that polices pod→host-network egress (Calico and
    Cilium both do), and treat kindnet as dev-only? Should `make deploy-dev`
    warn when it detects kindnet?
+
+   **Owner decision (2026-10-01): a property requirement with a preflight
+   check (not a vendor list, and not operator-enforced for now).**
+   - Production requires a CNI that **polices pod→host-network egress**. The
+     docs state the property, with a "verified with" list (Calico v3.30.1
+     verified by `make d38-cni-e2e`; others to be confirmed). kindnet is
+     dev-only.
+   - The D38 probe ships as a **preflight check** anyone can run against a
+     target cluster before installing (e.g. `make verify-cni`). The install
+     docs reference it.
+   - An operator-side self-test that holds Loops Suspended (D30-style) is the
+     longer-term target. It's folded into the Q2 work, not done now.
 2. **Defence in depth that doesn't depend on the CNI.** Options:
    - (a) a KubeArmor network rule on the agent that denies the node CIDR and
      apiserver endpoints (KubeArmor network rules are protocol-level today, so

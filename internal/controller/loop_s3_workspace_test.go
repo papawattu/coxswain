@@ -58,6 +58,18 @@ const (
 	s3OtherImg      = "example.com/some-agent:1"
 )
 
+// s3RunnerCommand is the agent container Command the operator emits for a
+// runner agent (asserted by the specs): the entrypoint + the -extra-body
+// tuning flag (the local Qwen vLLM is a thinking model; without
+// chat_template_kwargs.enable_thinking=false the model's tool calls land in
+// the reasoning output and the loop cannot make progress — S3 acceptance,
+// 2026-10-02).
+var s3RunnerCommand = []string{
+	"/usr/local/bin/runner",
+	"-extra-body",
+	`{"chat_template_kwargs":{"enable_thinking":false}}`,
+}
+
 var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func() {
 	ctx := context.Background()
 
@@ -342,7 +354,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name1 + "-sandbox", Namespace: ns}, sb1)).To(Succeed())
 		agent1 := s3Agent(sb1)
 		By("running the runner entrypoint when the agent image is the runner (empty image + runner flag)")
-		Expect(agent1.Command).To(Equal([]string{"/usr/local/bin/runner"}), "the runner image must run its entrypoint, not sleep infinity")
+		Expect(agent1.Command).To(Equal(s3RunnerCommand), "the runner image must run its entrypoint (with the -extra-body tuning flag), not sleep infinity")
 		Expect(s3Env(agent1, coxGoal)).To(Equal(loopGoal), "COX_GOAL must equal spec.goal")
 
 		// (2) a non-runner image + runner flag set -> 'sleep infinity' (opt-out).
@@ -370,7 +382,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name3 + "-sandbox", Namespace: ns}, sb3)).To(Succeed())
 		agent3 := s3Agent(sb3)
 		By("running the runner entrypoint when spec.agent.image equals the runner flag")
-		Expect(agent3.Command).To(Equal([]string{"/usr/local/bin/runner"}))
+		Expect(agent3.Command).To(Equal(s3RunnerCommand))
 
 		// (4) runner flag UNSET (no runner configured) -> 'sleep infinity' even
 		//     for an empty image (no Loop is run as the runner).

@@ -52,6 +52,7 @@ spec:
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
   policyRefs:
     - pylib-task-1
 ```
@@ -116,6 +117,7 @@ spec:
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
   policyRefs:
     - pylib-task-2
 ```

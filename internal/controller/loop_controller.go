@@ -665,7 +665,20 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	}
 	agentCommand := []string{"sh", "-c", "sleep infinity"}
 	if isRunner {
-		agentCommand = []string{"/usr/local/bin/runner"}
+		// The runner's flags (S3 acceptance, 2026-10-02):
+		//   -extra-body: the local Qwen vLLM serves a thinking model; without
+		//     chat_template_kwargs.enable_thinking=false the model's tool calls
+		//     land in the reasoning output and the model loop cannot make
+		//     progress (verified: a runner without the flag burns all 25 steps
+		//     in reasoning and blocks). It is a server-tuning knob merged into
+		//     every chat-completions request body (runner.ExtraBody) — not
+		//     part of the standard OpenAI schema.
+		// max-steps is left at the runner's default (25).
+		agentCommand = []string{
+			"/usr/local/bin/runner",
+			"-extra-body",
+			`{"chat_template_kwargs":{"enable_thinking":false}}`,
+		}
 	}
 	agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+3)
 	agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})

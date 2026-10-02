@@ -4,6 +4,7 @@
 package testhelper
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -44,6 +45,35 @@ type FakeModel struct {
 	Responses []ModelResponse
 	mu        sync.Mutex
 	Requests  []Received
+	// customHandler, when non-nil, replaces the default handler (tests use it
+	// to observe raw request bodies).
+	customHandler http.HandlerFunc
+}
+
+// SetHandler installs a custom request handler (nil restores the default).
+func (fm *FakeModel) SetHandler(h http.HandlerFunc) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	fm.customHandler = h
+}
+
+// RecordHandler wraps the default ordered-responses handler so every raw
+// request body is appended to bodies before the normal handling. It is
+// concurrency-safe (all calls are serialized by the runner's sequential
+// model calls).
+func (fm *FakeModel) RecordHandler(bodies *[][]byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+			return
+		}
+		fm.mu.Lock()
+		*bodies = append(*bodies, append([]byte(nil), body...))
+		fm.mu.Unlock()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		fm.handle(w, r)
+	}
 }
 
 // ModelResponse is a single chat-completions response the fake will emit.
@@ -77,8 +107,30 @@ type ToolCall struct {
 // a default final answer "done" forever after.
 func New(responses ...ModelResponse) *FakeModel {
 	fm := &FakeModel{Responses: responses}
-	fm.Server = httptest.NewServer(http.HandlerFunc(fm.handle))
+	fm.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fm.handler()(w, r)
+	}))
 	return fm
+}
+
+// handler returns the current request handler. Default is the ordered-
+// responses handler (fm.handle); a test may install a wrapper that records
+// the raw body and then calls fm.handle.
+func (fm *FakeModel) handler() http.HandlerFunc {
+	fm.mu.Lock()
+	h := fm.customHandler
+	fm.mu.Unlock()
+	if h != nil {
+		return h
+	}
+	return fm.handle
+}
+
+// DefaultHandler returns the fake's default ordered-responses handler, so
+// tests can wrap it (e.g. to 404 every path but /v1/chat/completions) and
+// delegate to it. Concurrency-safe.
+func (fm *FakeModel) DefaultHandler() http.HandlerFunc {
+	return fm.handle
 }
 
 func (fm *FakeModel) handle(w http.ResponseWriter, r *http.Request) {

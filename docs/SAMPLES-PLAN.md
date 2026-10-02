@@ -234,6 +234,20 @@ pass through plan approval" — not "an SDLC that ships a PR."
   proxy Service URL (`ensureSandbox`, `loop_controller.go:653`); a Loop
   cannot override it (`COX_*` names rejected, I34). The agent talks to
   `http://<loop>-proxy.<ns>.svc:8080`; the key never reaches the agent.
+  **Path convention (S3, 2026-10-02):** the base URL carries the **bare**
+  `http://<proxy>:8080` (no `/v1`), and the runner appends
+  `/v1/chat/completions` itself (`runner/runner.go`, pinned by
+  `TestRunnerPostsV1ChatCompletionsPath`). vLLM serves its OpenAI-compatible
+  API under `/v1`; the stand-in proxy is a transparent reverse proxy that
+  does NOT rewrite the path, so the full path must reach the proxy — posting
+  to `<base>/chat/completions` 404s on vLLM. The model name
+  (`spec.agent.model`, sent as the request's `model`) must be one the
+  upstream actually serves: `qwen3.8-27b` on the local vLLM
+  (`curl http://192.168.1.20:8000/v1/models`). The local Qwen vLLM serves a
+  thinking model: the runner sends
+  `chat_template_kwargs: {"enable_thinking": false}` (via the runner's
+  `-extra-body` flag) or the model's tool calls land in the reasoning output
+  and the loop cannot make progress.
 - **NetworkPolicy reachability to `192.168.1.20:8000` — yes, it is allowed,
   and it is an ipBlock rule (verified).** `ensureNetworkPolicy`
   (`loop_controller.go:1669`) builds the proxy netpol egress as

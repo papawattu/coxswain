@@ -16,6 +16,7 @@ package cni
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,12 +24,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
+
+const testLoopName = "d38-loop" // shared by both prober specs (goconst)
 
 // D38s3 (Calico run): probeOnce must be the ONLY writer to the result holder,
 // and it must re-gate (send a GenericEvent for every Loop + update the metric)
@@ -62,7 +66,7 @@ func TestProbeOnceReGatesOnResultChange(t *testing.T) {
 	_ = coxv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	loop := &coxv1alpha1.Loop{
-		ObjectMeta: metav1.ObjectMeta{Name: "d38-loop", Namespace: "d38-e2e"},
+		ObjectMeta: metav1.ObjectMeta{Name: testLoopName, Namespace: "d38-e2e"},
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
 
@@ -130,10 +134,57 @@ func TestProbeOnceReGatesOnResultChange(t *testing.T) {
 		if !ok {
 			t.Fatalf("re-gate GenericEvent is not a *Loop, got %T", evt.Object)
 		}
-		if l.Name != "d38-loop" {
+		if l.Name != testLoopName {
 			t.Fatalf("re-gate GenericEvent Loop name = %q, want d38-loop", l.Name)
 		}
 	default:
 		t.Fatal("the re-gate GenericEvent was not sent on the channel: the holder was written by parse(), not by probeOnce (changed=false -> retage skipped)")
+	}
+}
+
+// D38 P3 note (PR #42): the re-gate Event's type must track the RESULT, not
+// the fact of a change. A transition to an enforcing state (CNIEnforced) or
+// an intentional escape hatch (EnforcementDisabled) emits a Normal Event (the
+// healthy outcome); any non-enforcing result (CNIUnenforced, ProbeUnavailable,
+// Unknown) emits a Warning. The FakeRecorder renders each event as
+// "<type> <reason> <message> ", so the prefix identifies the type.
+func TestRetageEventTracksResult(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = coxv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: testLoopName, Namespace: "d38-e2e"},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
+
+	cases := []struct {
+		reason Reason
+		want   string
+	}{
+		{ReasonCNIEnforced, corev1.EventTypeNormal + " "},
+		{ReasonEnforcementDisabled, corev1.EventTypeNormal + " "},
+		{ReasonCNIUnenforced, corev1.EventTypeWarning + " "},
+		{ReasonProbeUnavailable, corev1.EventTypeWarning + " "},
+		{ReasonUnknown, corev1.EventTypeWarning + " "},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.reason), func(t *testing.T) {
+			recorder := record.NewFakeRecorder(16)
+			p := &ProbeRunnable{Prober: nil, Client: cl, Recorder: recorder}
+			p.retage(context.Background(),
+				CNIProbeResult{Reason: ReasonUnknown},
+				CNIProbeResult{Reason: tc.reason})
+			got, ok := <-recorder.Events
+			if !ok {
+				t.Fatalf("no Event emitted for reason %s", tc.reason)
+			}
+			if len(got) < len(tc.want) || got[:len(tc.want)] != tc.want {
+				t.Fatalf("Event type for %s = %q, want prefix %q", tc.reason, got, tc.want)
+			}
+			// The reason must ride on the Event (operator grep-ability).
+			if !strings.Contains(got, " "+string(tc.reason)+" ") {
+				t.Fatalf("Event does not carry the reason: %q", got)
+			}
+		})
 	}
 }

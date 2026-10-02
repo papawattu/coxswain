@@ -658,6 +658,11 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// explicit opt-out for debugging pods / non-runner images). No runner
 	// detection by image name beyond this exact match / empty.
 	isRunner := r.RunnerImage != "" && (loop.Spec.Agent.Image == "" || loop.Spec.Agent.Image == r.RunnerImage)
+	// When spec.agent.image is empty and isRunner, the agent image is the
+	// runner (not the generic sandbox default) so /usr/local/bin/runner exists.
+	if isRunner && loop.Spec.Agent.Image == "" {
+		agentImage = r.RunnerImage
+	}
 	agentCommand := []string{"sh", "-c", "sleep infinity"}
 	if isRunner {
 		agentCommand = []string{"/usr/local/bin/runner"}

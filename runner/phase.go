@@ -214,8 +214,9 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		// blocked with the value echoed in observedPhase (the operator sees
 		// the claim and acts). Do NOT loop forever on it.
 		res = Result{
-			Status:        statusBlocked,
-			Summary:       fmt.Sprintf("unknown desired-phase %q; the runner executes only %s or %s", phase, PhasePlanning, PhaseImplementing),
+			Status: statusBlocked,
+			Summary: fmt.Sprintf("unknown desired-phase %q; the runner executes only %s or %s",
+				phase, PhasePlanning, PhaseImplementing),
 			ObservedPhase: phase,
 		}
 	}
@@ -224,7 +225,9 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// state is the runner's working memory (not a claim); a failed write is
 	// non-fatal (the next run simply starts without the prior conversation).
 	if len(res.toolConversation) > 0 {
-		_ = writeConversationState(filepath.Join(cfg.Workspace, resultDirName, conversationFileName), res.toolConversation, curIter)
+		_ = writeConversationState(
+			filepath.Join(cfg.Workspace, resultDirName, conversationFileName), res.toolConversation, curIter,
+		)
 	}
 	// The claim channel: result.json (the full ADR-0004 file) + the strict
 	// termination-log object (the operator's read-back). A write failure is
@@ -260,7 +263,8 @@ func awaitDesiredPhase(workspace string, poll time.Duration, stop <-chan any) (s
 // conversation history), runs the optional onAnswer hook (the phase's
 // post-processing, e.g. the PLAN.md write), and returns the phase's Result
 // (with the observedPhase set and the conversation captured for A4).
-func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMessage, onAnswer ...func(string)) Result {
+func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMessage,
+	onAnswer ...func(string)) Result {
 	modelTimeout := cfg.ModelTimeout
 	if modelTimeout <= 0 {
 		modelTimeout = defaultModelTimeout
@@ -277,7 +281,8 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 	// A4: the conversation (the previous phase's messages) is the starting
 	// history. A fresh system prompt is prepended (the system prompt is
 	// stable across phases; the conversation carries the phase context).
-	messages := []chatMessage{{Role: jsonRoleSystem, Content: systemPrompt}}
+	messages := make([]chatMessage, 0, 1+len(conversation)+1)
+	messages = append(messages, chatMessage{Role: jsonRoleSystem, Content: systemPrompt})
 	messages = append(messages, conversation...)
 	messages = append(messages, chatMessage{Role: jsonRoleUser, Content: prompt})
 
@@ -386,7 +391,8 @@ func readDesiredPhase(workspace string) (string, bool) {
 func planningPrompt(goal string, planCap int) string {
 	return "You are in the PLANNING phase. Produce a concise plan (under " +
 		fmt.Sprintf("%d bytes", planCap) +
-		") to accomplish the goal below. The plan must be a summary of the steps you will take, not the implementation itself. End your reply with the plan text (it will be written to PLAN.md).\n\nGOAL:\n" +
+		") to accomplish the goal below. The plan must be a summary of the steps you will take, " +
+		"not the implementation itself. End your reply with the plan text (it will be written to PLAN.md).\n\nGOAL:\n" +
 		goal
 }
 
@@ -399,10 +405,11 @@ func planningPrompt(goal string, planCap int) string {
 func implementingPrompt(workspace, goal string) string {
 	plan := ""
 	if data, err := os.ReadFile(filepath.Join(workspace, resultDirName, planFileName)); err == nil {
-		plan = string(cutRunePrefix(string(data), planMaxBytes))
+		plan = cutRunePrefix(string(data), planMaxBytes)
 	}
 	p := "You are in the IMPLEMENTING phase. Use your shell tool to make the goal's changes in the workspace. " +
-		"Run the acceptance checks to confirm your work. End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
+		"Run the acceptance checks to confirm your work. " +
+		"End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
 		goal
 	if plan != "" {
 		p += "\n\nPLAN (from PLAN.md):\n" + plan

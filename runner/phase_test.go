@@ -44,7 +44,8 @@ func writeDesiredPhase(t *testing.T, workspace, phase string) {
 	if err := os.MkdirAll(filepath.Join(workspace, resultDirName), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workspace, resultDirName, desiredPhaseFileName), []byte(phase), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, resultDirName, desiredPhaseFileName),
+		[]byte(phase), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -73,7 +74,8 @@ func TestPhaseRunPlanningWritesPlanAndClaim(t *testing.T) {
 	writeDesiredPhase(t, ws, PhasePlanning)
 	stop := make(chan any) // never closed (the phase is present immediately)
 
-	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
 
 	if res.Status != statusSuccess {
 		t.Fatalf("Planning phase: status = %q, want %q (notes: %s)", res.Status, statusSuccess, res.VerificationNotes)
@@ -128,7 +130,8 @@ func TestPhaseRunImplementingReportsImplementing(t *testing.T) {
 	writeDesiredPhase(t, ws, PhaseImplementing)
 	stop := make(chan any)
 
-	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
 
 	if res.Status != statusSuccess {
 		t.Fatalf("Implementing phase: status = %q, want %q (notes: %s)", res.Status, statusSuccess, res.VerificationNotes)
@@ -159,7 +162,8 @@ func TestPhaseRunUnknownPhaseBlockedWithEcho(t *testing.T) {
 	writeDesiredPhase(t, ws, "Verifying")
 	stop := make(chan any)
 
-	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
 
 	if res.Status != statusBlocked {
 		t.Fatalf("unknown phase: status = %q, want %q", res.Status, statusBlocked)
@@ -195,7 +199,8 @@ func TestPhaseRunModelFailureBlocked(t *testing.T) {
 	writeDesiredPhase(t, ws, PhasePlanning)
 	stop := make(chan any)
 
-	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
 
 	if res.Status != statusBlocked {
 		t.Fatalf("model failure: status = %q, want %q", res.Status, statusBlocked)
@@ -225,7 +230,8 @@ func TestPhaseRunNoDesiredPhaseBeforeStop(t *testing.T) {
 	stop := make(chan any)
 	go func() { time.Sleep(20 * time.Millisecond); close(stop) }()
 
-	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
 
 	if res.ObservedPhase != "" {
 		t.Fatalf("no desired phase before stop: observedPhase = %q, want empty", res.ObservedPhase)
@@ -251,7 +257,8 @@ func TestPhaseRunPlanCapTruncatesByBytes(t *testing.T) {
 	writeDesiredPhase(t, ws, PhasePlanning)
 	stop := make(chan any)
 
-	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
 
 	if res.Status != statusSuccess {
 		t.Fatalf("status = %q, want %q (notes: %s)", res.Status, statusSuccess, res.VerificationNotes)
@@ -287,7 +294,9 @@ func TestPhaseRunIterationChangeDiscardsConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeDesiredPhase(t, ws, PhasePlanning)
-	PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	cfg := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}
+	PhaseRun(cfg, stop)
 
 	// The operator advances the iteration (a new iteration): the conversation
 	// written under iteration "1" must be discarded.
@@ -298,7 +307,9 @@ func TestPhaseRunIterationChangeDiscardsConversation(t *testing.T) {
 	// Run 2: Planning under iteration "2". Its first request must NOT carry
 	// run 1's assistant turn (the conversation was discarded).
 	writeDesiredPhase(t, ws, PhasePlanning)
-	PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m", PollInterval: 5 * time.Millisecond}, stop)
+	cfg2 := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}
+	PhaseRun(cfg2, stop)
 
 	if len(fake.Requests) < 2 {
 		t.Fatalf("the two runs must each drive the model (%d requests)", len(fake.Requests))
@@ -306,7 +317,8 @@ func TestPhaseRunIterationChangeDiscardsConversation(t *testing.T) {
 	last := fake.Requests[len(fake.Requests)-1]
 	for _, m := range last.Messages {
 		if m.Role == "assistant" && strings.Contains(m.Content, "PLAN-A") {
-			t.Fatalf("A4: a changed iteration must discard the prior conversation; run 2 carried run 1's assistant turn: %+v", last.Messages)
+			t.Fatalf("A4: a changed iteration must discard the prior conversation; run 2 carried run 1's assistant turn: %+v",
+				last.Messages)
 		}
 	}
 }

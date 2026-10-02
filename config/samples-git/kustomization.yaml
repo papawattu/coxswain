@@ -1,0 +1,25 @@
+# S2 (samples plan §2): the in-cluster git server for the sample apps.
+#
+# Standalone kustomization (like config/cni-probe): applied with
+# `make samples-up` ONLY to the kind cluster coxswain-dev (the Makefile pins
+# --context kind-coxswain-dev). It is NOT part of config/default, so a
+# production install never ships a Gitea.
+#
+# Layout:
+#   namespace samples/
+#     Secret samples-git-cred   basic-auth credential for user 'samples'
+#                               (gitCredentialSecret for the sample Loops)
+#     Secret gitea-admin        admin credential (the admin user is created
+#                               post-boot by the seed step via 'gitea admin
+#                               user create' — the 1.24 image has no admin
+#                               auto-init, that arrived in 1.25)
+#     Deployment gitea         gitea/gitea 1.24, HTTP only on :3000,
+#                              emptyDir storage (disposable), self-installs
+#                              (INSTALL_LOCK=true + sqlite3)
+#     Service gitea            ClusterIP on :3000
+namespace: samples
+resources:
+- namespace.yaml
+- secret.yaml
+- deployment.yaml
+- service.yaml

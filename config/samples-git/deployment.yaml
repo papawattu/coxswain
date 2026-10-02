@@ -1,0 +1,83 @@
+# S2 (samples plan §2): the in-cluster git server (disposable, dev-only).
+#
+# gitea/gitea 1.24, HTTP only on :3000. Storage is an emptyDir — no PVC,
+# the sample repos are disposable and re-seeded by `make samples-seed`.
+#
+# Self-install on first boot: GITEA__security__INSTALL_LOCK=true +
+# GITEA__database__DB_TYPE=sqlite3 make the image skip the web installer
+# and open the sqlite DB directly (the 1.24 image has no admin auto-init,
+# that arrived in 1.25). The admin account is then created by
+# `make samples-seed` (hack/samples-seed.sh) via
+# `kubectl exec deploy/gitea -- su git -c "gitea admin user create ..."` —
+# no separate init Job, no PVC, the Deployment stays a single pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitea
+  labels:
+    app.kubernetes.io/name: gitea
+    app.kubernetes.io/instance: samples
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gitea
+      app.kubernetes.io/instance: samples
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gitea
+        app.kubernetes.io/instance: samples
+    spec:
+      securityContext:
+        # The Gitea image runs its s6 supervisor as root (uid 0); the gitea
+        # process itself drops to the git user internally. With runAsUser
+        # 19999 s6 cannot write /data ('unable to open .s6-svscan/lock:
+        # Permission denied'); with 1000 it cannot own /data/ssh. This is a
+        # disposable dev server (coxswain-dev only), so the supervisor runs
+        # as root, matching the image's own default (no securityContext).
+        runAsUser: 0
+        fsGroup: 1000
+      containers:
+      - name: gitea
+        image: gitea/gitea:1.24
+        ports:
+        - name: http
+          containerPort: 3000
+        env:
+        # Gitea's env-config syntax: GITEA__<section>__<key>.
+        # INSTALL_LOCK + sqlite3 = self-install on the emptyDir (no web
+        # installer, no install Job). The admin user is created post-boot
+        # by the seed step (gitea admin user create via kubectl exec).
+        - name: GITEA__security__INSTALL_LOCK
+          value: "true"
+        - name: GITEA__database__DB_TYPE
+          value: sqlite3
+        - name: GITEA__server__DISABLE_SSH_SERVER
+          value: "true"
+        - name: GITEA__server__ROOT_URL
+          value: "http://gitea.samples.svc:3000/"
+        # Signups are closed: the only users are the ones the seed step
+        # creates through the CLI/admin API.
+        - name: GITEA__service__DISABLE_REGISTRATION
+          value: "true"
+        - name: GITEA__service__REQUIRE_SIGNIN_VIEW
+          value: "true"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        readinessProbe:
+          httpGet:
+            path: /api/healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: data
+        emptyDir: {}

@@ -1,0 +1,20 @@
+# S2 (samples plan §2): ClusterIP for the in-cluster Gitea.
+# The sample Loops' workspace.repo points at
+# http://gitea.samples.svc:3000/<user>/<app>.git (samples plan §2 — the
+# in-cluster repos are the only remotes the Loops can see; nothing here
+# names coxswain's GitHub remote).
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitea
+  labels:
+    app.kubernetes.io/name: gitea
+    app.kubernetes.io/instance: samples
+spec:
+  selector:
+    app.kubernetes.io/name: gitea
+    app.kubernetes.io/instance: samples
+  ports:
+  - name: http
+    port: 3000
+    targetPort: http

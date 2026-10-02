@@ -2680,7 +2680,15 @@ git config --global user.email coxswain@localhost
 		Name:         workspaceInitContainerName,
 		Image:        gitImage,
 		Command:      []string{"/bin/sh", "-c", script},
-		Env:          []corev1.EnvVar{{Name: "HOME", Value: "/tmp"}},
+		// HOME points at /workspace (the writable emptyDir mount, owned by the
+		// agent's UID via the pod fsGroup): the credential.helper 'store'
+		// script does `git config --global ...`, which writes to
+		// $HOME/.gitconfig — /tmp is NOT a writable mount for the init
+		// container (writableMountPaths is the agent's set; the init container
+		// mounts only /workspace + the read-only credential), so a read-only
+		// /tmp (readOnlyRootfs) makes `git config --global` fail with
+		// "could not lock config file: Read-only file system".
+		Env:          []corev1.EnvVar{{Name: "HOME", Value: agentWorkspaceMount}},
 		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: &falseP,

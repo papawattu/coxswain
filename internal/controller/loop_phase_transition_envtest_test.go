@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -62,28 +63,34 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 			Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 	}
-	// ensureSandbox recreates the sandbox the bootstrap recycle deleted (the
-	// S4 option-B bootstrap, Pending -> Planning, deletes the just-created
-	// sandbox so the phase-init container re-writes the desired phase on the
-	// recreated pod — one container run per phase). The same pattern every
-	// other spec in this file uses to stand in for the operator's recycle.
-	ensureSandbox := func(ns, name string) {
-		_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns}})
+	// ensureSandboxObject creates the sandbox object if it does not exist
+	// (the operator's annotation-based recycle deletes it on a phase advance;
+	// recreating it is the stand-in for the operator's own ensureSandbox on
+	// the next reconcile).
+	ensureSandboxObject := func(ns, name string) {
+		sb := &sandboxv1beta1.Sandbox{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb); apierrors.IsNotFound(err) {
+			_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+			})
+		}
 	}
 
 	// reportPhase simulates the runner reporting that it finished <reported>
 	// (the phase it was executing) by setting status.observedPhase, then
-	// reconciles. The operator advances status.phase iff reported is the
-	// immediate-next phase after the current one (nextPhase).
+	// reconciling. The operator advances status.phase iff reported is the
+	// immediate-next phase after the current one (nextPhase). The annotation-
+	// based recycle may delete the sandbox on an advance; recreate it if so
+	// (the stand-in for the operator's own ensureSandbox on the next reconcile).
 	reportPhase := func(ns, name string, reported coxv1alpha1.LoopPhase) {
 		nn := types.NamespacedName{Name: name, Namespace: ns}
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		loop.Status.ObservedPhase = reported
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		ensureSandbox(ns, name)
 		ensureClaimPod(ns, name)
 		reconcileLoop(ns, name)
+		ensureSandboxObject(ns, name)
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 	}
 
@@ -99,10 +106,9 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 			Spec:       coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		// Prime: the S4 bootstrap moves a fresh Loop to Planning (option B) and
-		// recycles the sandbox; ensure the stand-in sandbox + claim pod the live
-		// reader reads (see reportPhase).
-		ensureSandbox(ns, name)
+		// Prime: the S4 bootstrap moves a fresh Loop to Planning (option B).
+		// ensureClaimPod creates the stand-in claim pod the live reader reads
+		// (see reportPhase).
 		ensureClaimPod(ns, name)
 		reconcileLoop(ns, name)
 		return nn

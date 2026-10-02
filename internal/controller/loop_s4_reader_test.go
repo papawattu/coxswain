@@ -27,6 +27,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -56,14 +57,6 @@ import (
 
 var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	ctx := context.Background()
-
-	// ensureSandbox creates the sandbox object the operator's recycle deletes
-	// (the bootstrap's Pending -> Planning recycle, and the advance's
-	// post-advance recycle both delete it — recreating it before the run is
-	// the stand-in for the operator's own ensureSandbox on the next reconcile).
-	ensureSandbox := func(ns, name string) {
-		_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns}})
-	}
 
 	// s4LoopSpec builds the spec the reader specs use: the fixture repo (no
 	// model config, so the D35 proxy gate does not hold the sandbox).
@@ -146,8 +139,18 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	// reconcile. createStandinPod also creates the sandbox (the recycle
 	// deleted it); withStatus writes the terminated status (false = skip it,
 	// for a run the reader has not yet observed).
+	// ensureSandboxObject creates the sandbox object if it does not exist
+	// (the operator's annotation-based recycle deletes it on a phase advance).
+	ensureSandboxObject := func(ns, name string) {
+		sb := &sandboxv1beta1.Sandbox{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb); apierrors.IsNotFound(err) {
+			_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+			})
+		}
+	}
+
 	oneShotRun := func(r *LoopReconciler, nn types.NamespacedName, claimed coxv1alpha1.LoopPhase, withStatus bool) *coxv1alpha1.Loop {
-		ensureSandbox(nn.Namespace, nn.Name)
 		createStandinPod(nn.Namespace, nn.Name)
 		if withStatus {
 			writeAgentTermination(nn.Namespace, nn.Name, fmt.Sprintf(
@@ -155,6 +158,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
+		ensureSandboxObject(nn.Namespace, nn.Name)
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		return loop
@@ -190,7 +194,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		r := s4Reconciler(recorder)
 		_, nn := primeReconcile(r, ns, "bigloop")
 
-		ensureSandbox(ns, "bigloop")
+		ensureSandboxObject(ns, "bigloop")
 		createStandinPod(ns, "bigloop")
 		// A claim over the reader's cap (s4ClaimMaxBytes): the strict JSON
 		// object is padded with a long blockedReason (the reader must reject
@@ -227,7 +231,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		}
 		for msg, label := range malformed {
 			By(fmt.Sprintf("case: %s", label))
-			ensureSandbox(ns, "mloop")
+			ensureSandboxObject(ns, "mloop")
 			createStandinPod(ns, "mloop")
 			writeAgentTermination(ns, "mloop", msg)
 
@@ -302,7 +306,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		r := s4Reconciler(recorder)
 		_, nn := primeReconcile(r, ns, "blocklp")
 
-		ensureSandbox(ns, "blocklp")
+		ensureSandboxObject(ns, "blocklp")
 		createStandinPod(ns, "blocklp")
 		// The runner ended PLANNING blocked: it reports the phase it was IN
 		// (Planning == the current phase), never a completed step. The pure
@@ -335,7 +339,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		// container (pinning baseCommit via the S3 read) and the terminated
 		// agent (the claim carrying iteration 3). The progress record must
 		// carry the claim's iteration AND the operator's pins.
-		ensureSandbox(ns, "pinslp")
+		ensureSandboxObject(ns, "pinslp")
 		createStandinPod(ns, "pinslp")
 		pod := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "pinslp-sandbox", Namespace: ns}, pod)).To(Succeed())

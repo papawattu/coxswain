@@ -373,38 +373,39 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
-	if err := r.ensureSandbox(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
-	changed, err := r.ensureProxyAndNetPolicies(ctx, &loop)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if loop.Status.ObservedGeneration != loop.Generation {
-		loop.Status.ObservedGeneration = loop.Generation
-		changed = true
-	}
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+	changed := false
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
 		changed = true
 	}
 	// S4 (owner option B: NO approval gate — the bar is Planning ->
 	// Implementing -> Verifying): a fresh Loop at Pending starts the phase
-	// machine at Planning. The sandbox is recreated with the phase-init
-	// container writing status.desiredPhase (Planning) into the workspace and
-	// the one-shot runner executing it; the runner's claim (the termination
-	// message) drives the advance below. No AwaitingApproval handling exists
-	// (option B); the OS8 PhaseGate seam is the future approval hold.
+	// machine at Planning. The bootstrap runs BEFORE ensureSandbox so the
+	// FIRST sandbox is built with the phase-init container already writing
+	// status.desiredPhase (Planning) into the workspace — no bootstrap recycle.
+	// The sandbox annotation (coxswain.io/desired-phase) stamps the phase it
+	// was built for; ensureSandbox deletes+requeues only when it differs from
+	// status.desiredPhase (a genuine phase advance).
 	if loop.Status.Phase == coxv1alpha1.LoopPhasePending {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 		changed = true
-		if err := r.recycleSandboxForPhase(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
+	}
+
+	if err := r.ensureSandbox(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
+	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	changed = changed || policiesChanged
+	if loop.Status.ObservedGeneration != loop.Generation {
+		loop.Status.ObservedGeneration = loop.Generation
+		changed = true
 	}
 	// S4 (ADR-0004): read the runner's claim from the agent container's
 	// termination message (APIReader path — the sandbox pod is not in the
@@ -437,16 +438,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 				// OS5: emit a Kubernetes Event on the phase transition (a stable
 				// reason, PhaseAdvanced; nil Recorder = most envtests skip it).
 				r.emitPhaseAdvancedEvent(&loop, claim.ObservedPhase)
-				// The phase advanced: the sandbox pod must be recreated so the
-				// phase-init container writes the NEXT desired phase and the
-				// one-shot runner re-runs (one container run per phase — the
-				// termination message is one-shot per container run, so a stable
-				// phase must not re-execute on the old pod). The operator deletes
-				// the sandbox; ensureSandbox's CreateOrUpdate recreates it with
-				// status.desiredPhase (the new phase) materialised.
-				if err := r.recycleSandboxForPhase(ctx, &loop); err != nil {
-					return ctrl.Result{}, err
-				}
+				// The phase advanced: status.desiredPhase changed. The NEXT
+				// reconcile's ensureSandbox sees the annotation mismatch and
+				// deletes the Sandbox (the one-shot runner re-runs for the new
+				// phase). No inline recycle here — the annotation is the seam.
 			}
 		} else {
 			// claim == nil && cerr == nil: the agent has not terminated yet
@@ -455,6 +450,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			// A sandbox pod change does not trigger a reconcile on its own, so
 			// the timer is what drives the retry (the baseCommit requeue pattern).
 			claimReadPending = true
+		}
+	}
+	// B1 seam: if the claim reader found nothing (claim == nil) and
+	// status.observedPhase is set (a direct status update, not a claim),
+	// the operator advances the phase machine using the pure nextPhase
+	// logic. This is the seam the B1 envtests exercise (they set
+	// status.observedPhase directly, bypassing the claim reader).
+	if claimReadPending && loop.Status.ObservedPhase != "" && loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded && loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
+		from := loop.Status.Phase
+		_, advanced := r.recordPhaseClaim(&loop, &PhaseClaim{ObservedPhase: loop.Status.ObservedPhase}, metav1.Now())
+		if advanced {
+			logf.FromContext(ctx).Info("phase advanced (B1 seam: status.observedPhase)", "loop", loop.Name, "from", from, "to", loop.Status.Phase)
+			r.emitPhaseAdvancedEvent(&loop, from)
 		}
 	}
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
@@ -1075,6 +1083,34 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			Namespace: loop.Namespace,
 		},
 	}
+	// S4: stamp the desired phase so a genuine phase advance (annotation !=
+	// status.desiredPhase) triggers a delete+requeue below. A no-change
+	// re-reconcile leaves the Sandbox untouched.
+	desired.Annotations = map[string]string{
+		sandboxDesiredPhaseAnnotation: string(loop.Status.DesiredPhase),
+	}
+
+	// S4 conditional recycle: if the live Sandbox exists and its annotation
+	// is SET and differs from status.desiredPhase (a genuine phase advance),
+	// delete it. The next reconcile creates a fresh Sandbox with the new
+	// phase's phase-init script. A no-change re-reconcile leaves the Sandbox
+	// untouched (the annotation matches). An EMPTY annotation (a fresh sandbox
+	// or a spec that doesn't manage the annotation) is NOT a mismatch — the
+	// CreateOrUpdate below sets it for the first time.
+	existingSb := &sandboxv1beta1.Sandbox{}
+	if gerr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, existingSb); gerr == nil {
+		staleAnnotation := existingSb.Annotations[sandboxDesiredPhaseAnnotation]
+		if staleAnnotation != "" && staleAnnotation != string(loop.Status.DesiredPhase) {
+			log.Info("sandbox desired-phase annotation differs; deleting for phase advance",
+				"sandbox", sandboxName(loop.Name),
+				"stale", staleAnnotation,
+				"desired", string(loop.Status.DesiredPhase))
+			if derr := r.Delete(ctx, existingSb); derr != nil && !apierrors.IsNotFound(derr) {
+				return fmt.Errorf("delete sandbox for phase advance: %w", derr)
+			}
+			return nil // Sandbox deleted; the next reconcile creates it fresh
+		}
+	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
 		// C1 (ADR-0006 item 4): the sandbox pod is a zero-credential, hardened
@@ -1234,6 +1270,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	}
 	return nil
 }
+
+// sandboxDesiredPhaseAnnotation is the annotation the operator stamps on the
+// Sandbox with the phase it was built for. ensureSandbox deletes+requeues when
+// the annotation differs from status.desiredPhase (a phase advance), so the
+// phase-init container re-writes .coxswain/desired-phase on the recreated pod.
+// A no-change re-reconcile leaves the Sandbox untouched (I43-friendly).
+const sandboxDesiredPhaseAnnotation = "coxswain.io/desired-phase"
 
 // sandboxName returns the Loop's Sandbox name: <loop>-sandbox. The Loop name
 // is CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this

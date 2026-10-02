@@ -2599,16 +2599,6 @@ func (r *LoopReconciler) workspaceGitImage() string {
 }
 
 // workspaceInitContainer builds the sandbox pod's workspace init container
-// (S3a). It clones spec.workspace.repo @ ref into the 'workspace' volume (a
-// single directory at agentWorkspaceMount) and writes the resolved commit SHA
-// to baseCommitFile (the same volume), which the operator reads back and pins
-// to status.baseCommit. The init container runs as the same non-root UID as
-// the agent (65532, with the pod's fsGroup) so the files it leaves in the
-// emptyDir volume are writable by the agent. When a credential Secret is
-// mounted (gitCredsMount), the script configures git credential.helper 'store'
-// to read it; the script is built here (not baked into the image) so the
-// operator's --workspace-git-image need only carry git + sh.
-// workspaceInitContainer builds the sandbox pod's workspace init container
 // (S3a, GAP 1). It runs the operator's --workspace-git-image (default
 // alpine/git — trusted, never the Loop's image), clones spec.workspace.repo @
 // ref into the 'workspace' volume, and writes the resolved commit SHA to
@@ -2617,9 +2607,16 @@ func (r *LoopReconciler) workspaceGitImage() string {
 //
 // ADR-0006 (zero credentials in the agent): the git credential Secret
 // (spec.workspace.gitCredentialSecret) is mounted read-only into THIS
-// container ONLY, at /workspace-creds, and the script uses
-// credential.helper 'store' to read it. The agent container never mounts it
-// (asserted by the S3a envtest spec).
+// container ONLY, at /workspace-creds. The credential is passed to git PER
+// COMMAND (-c credential.helper='store --file=/workspace-creds') — NOTHING is
+// written to a global/user .gitconfig and the store helper's file is pinned
+// to the read-only mount, so after a successful authenticated fetch the
+// credential is NOT persisted into the agent's workspace (a HOME=/workspace +
+// `git config --global credential.helper store` would have git's store helper
+// READ AND WRITE $HOME/.git-credentials = /workspace/.git-credentials, leaking
+// the credential into the agent's workspace — the reviewer's P1 credential-leak
+// finding). The agent container never mounts the credential volume (asserted
+// by the S3a envtest spec).
 func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.Container {
 	gitImage := r.workspaceGitImage()
 	var initMounts []corev1.VolumeMount
@@ -2640,55 +2637,56 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	if ref == "" {
 		ref = "HEAD"
 	}
+	// The credential is detected from the SPEC, not from the mount count
+	// (the len(mounts) == 2 check was fragile: any second mount would
+	// silently switch the credential on). When a gitCredentialSecret is
+	// declared, git is given the credential per command (-c
+	// credential.helper='store --file=/workspace-creds') — nothing is
+	// persisted to a .gitconfig, and the store helper's file is the
+	// read-only mount (it cannot write a credential back into the workspace).
+	credOpt := ""
+	if loop.Spec.Workspace.GitCredentialSecret != "" {
+		credOpt = " -c credential.helper='store --file=/workspace-creds'"
+	}
+	// GIT_TERMINAL_PROMPT=0: never prompt (the init container has no TTY; a
+	// missing credential must fail the clone, not hang).
 	script := `#!/bin/sh
 set -eu
+export GIT_TERMINAL_PROMPT=0
 DEST=/workspace
 REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
+# No ` + "`rm -rf ${DEST}`" + `: ${DEST} is a MOUNT POINT (the emptyDir volume) and cannot be removed.
+# The emptyDir starts empty, so ` + "`git init ${DEST}`" + ` works on the existing empty dir.
 if [ -d "${DEST}/.git" ]; then
   # Idempotent: the pod is recreated per Loop (fresh emptyDir), but tolerate a
   # re-run on the same volume without re-cloning.
   cd "${DEST}"
   git rev-parse --verify HEAD >/dev/null 2>&1 || git checkout "${REF}"
 else
-  rm -rf "${DEST}"
   git init "${DEST}"
   git -C "${DEST}" remote add origin "${REPO}"
-  git -C "${DEST}" fetch origin "${REF}"
+  git -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + credOpt + ` fetch origin "${REF}"
   git -C "${DEST}" checkout --detach FETCH_HEAD
 fi
 mkdir -p "${DEST}/.coxswain"
 git -C "${DEST}" rev-parse HEAD > "${DEST}/.coxswain/base-commit"
 echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
 `
-	if len(mounts) > 0 && len(mounts) == 2 {
-		// A credential mount is present: configure credential.helper store to
-		// read /workspace-creds (the mounted .git-credentials file).
-		script = `git config --global credential.helper store
-git config --global user.name coxswain
-git config --global user.email coxswain@localhost
-` + script
-	}
-	script = `export GIT_TERMINAL_PROMPT=0
-` + script
 	nonRootUID := int64(65532)
 	nonRootGID := int64(65532)
 	falseP := false
 	trueP := true
 	readOnlyRootfs := true
 	return corev1.Container{
-		Name:         workspaceInitContainerName,
-		Image:        gitImage,
-		Command:      []string{"/bin/sh", "-c", script},
-		// HOME points at /workspace (the writable emptyDir mount, owned by the
-		// agent's UID via the pod fsGroup): the credential.helper 'store'
-		// script does `git config --global ...`, which writes to
-		// $HOME/.gitconfig — /tmp is NOT a writable mount for the init
-		// container (writableMountPaths is the agent's set; the init container
-		// mounts only /workspace + the read-only credential), so a read-only
-		// /tmp (readOnlyRootfs) makes `git config --global` fail with
-		// "could not lock config file: Read-only file system".
-		Env:          []corev1.EnvVar{{Name: "HOME", Value: agentWorkspaceMount}},
+		Name:    workspaceInitContainerName,
+		Image:   gitImage,
+		Command: []string{"/bin/sh", "-c", script},
+		// No HOME env: the per-command -c flags need no HOME, and the init
+		// container has no writable home mount (readOnlyRootfs, /workspace is
+		// the workspace). (A HOME=/workspace + git config --global would
+		// persist a credential into the agent's workspace — see the P1 leak
+		// note above.)
 		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: &falseP,

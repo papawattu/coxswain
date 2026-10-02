@@ -192,6 +192,22 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 			agentEnvNames[e.Name] = true
 		}
 		Expect(agentEnvNames["GIT_CREDENTIALS"]).To(BeFalse(), "the agent must not carry the git credential as an env var")
+
+		By("passing the credential to git per command (no global .gitconfig, no credential leak into /workspace)")
+		// The P1 credential-leak check: a HOME=/workspace + `git config --global
+		// credential.helper store` would make git's store helper READ AND WRITE
+		// /workspace/.git-credentials (the agent's workspace) after an
+		// authenticated fetch. The fix passes the credential PER COMMAND (-c
+		// credential.helper='store --file=/workspace-creds') and sets no HOME
+		// into the workspace, so nothing is persisted into /workspace.
+		Expect(cmd).NotTo(ContainSubstring("git config --global"),
+			"the init script must not use git config --global (a global .gitconfig in /workspace would persist the credential into the agent's workspace)")
+		Expect(cmd).To(ContainSubstring("-c credential.helper='store --file=/workspace-creds'"),
+			"the init script must pass the credential per command, pinned to the read-only /workspace-creds mount")
+		for _, e := range init.Env {
+			Expect(e.Value).NotTo(Equal(agentWorkspaceMount),
+				"the init container must not set HOME (or any env) to the agent workspace (a credential could be persisted there)")
+		}
 	})
 
 	It("mounts no credential volume when gitCredentialSecret is unset (a)", func() {
@@ -209,7 +225,12 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)).To(Succeed())
 
 		By("still building the init container (a public clone needs no creds)")
-		Expect(s3Init(sb)).NotTo(BeNil())
+		init := s3Init(sb)
+		Expect(init).NotTo(BeNil())
+		// No credential flag when no gitCredentialSecret is declared (detected
+		// from the spec, not the mount count).
+		Expect(strings.Join(init.Command, " ")).NotTo(ContainSubstring("credential.helper"),
+			"the init script must not reference a credential helper when no gitCredentialSecret is set")
 		By("adding no credential volume to the pod")
 		found := false
 		for i := range sb.Spec.PodTemplate.Spec.Volumes {

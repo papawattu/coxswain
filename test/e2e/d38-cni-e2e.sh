@@ -137,8 +137,15 @@ cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 # first probe run.
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/cni-probe | K apply -f -) \
   || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 2; }
+# Force a short CNI probe interval (30s) so the probe re-runs quickly after the
+# Loop is created (the default 10m interval would make the e2e wait up to 10
+# minutes for the NetworkEnforced condition). This is a test-only override; the
+# production default remains 10m. The patch appends --cni-check-interval=30s to
+# the existing args (the calico overlay sets --allow-unenforced; this adds the
+# short interval on top).
+K -n "$E2E_NS" patch deploy coxswain-controller-manager --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","args":["--metrics-bind-address=:8443","--leader-elect","--health-probe-bind-address=:8081","--allow-unenforced","--cni-check-interval=30s"]}]}}}}' >/dev/null 2>&1 || true
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || { echo "FATAL: controller not ready"; exit 2; }
-echo "   controller running (base install: no escape hatches)"
+echo "   controller running (base install: no escape hatches, 30s probe interval)"
 echo "   cni-probe ns + RBAC applied"
 
 # ===========================================================================
@@ -209,7 +216,21 @@ echo "   egress proxy Ready"
 # ===========================================================================
 echo
 echo "--- STEP 3c: D38 gate assertions (NetworkEnforced=True reason=CNIEnforced, no escape hatch) ---"
-NE_COND=$(K -n "$NS" get loop "$LOOP" -o jsonpath='{.status.conditions[?(@.type=="NetworkEnforced")].status} {.status.conditions[?(@.type=="NetworkEnforced")].reason}' 2>/dev/null)
+# The operator probes at startup (and every --cni-check-interval, default 10m).
+# When the Loop is (re)created AFTER the controller started, the reconcile that
+# sets NetworkEnforced runs on the next probe-completion retage (or the next
+# reconcile trigger). Poll for up to ~2 minutes for the condition to become
+# True CNIEnforced (the probe runs at startup, takes ~10-20s, then the retage
+# + reconcile sets the condition on every Loop).
+NE_COND=""
+for i in $(seq 1 24); do
+  NE_COND=$(K -n "$NS" get loop "$LOOP" -o jsonpath='{.status.conditions[?(@.type=="NetworkEnforced")].status} {.status.conditions[?(@.type=="NetworkEnforced")].reason}' 2>/dev/null)
+  case "$NE_COND" in
+    "True CNIEnforced") break ;;
+    "False "*) break ;; # a definitive False (CNIUnenforced/ProbeUnavailable) is stable — don't wait for it to flip
+  esac
+  sleep 5
+done
 echo "   NetworkEnforced condition: $NE_COND"
 case "$NE_COND" in
   "True CNIEnforced") ok "NetworkEnforced=True reason=CNIEnforced (the operator's CNI self-test passed; no escape hatch)" ;;
@@ -240,25 +261,25 @@ esac
 PROBE_NS=coxswain-cni-probe
 if K get ns "$PROBE_NS" >/dev/null 2>&1; then
   # The probe pod's termination message (captured while the pod is live):
-  # the expected-BLOCKED targets (APISERVER_SVC, NODE_API, KUBELET_NODE) must
-  # be BLOCKED and the EXTERNAL positive control must be REACHABLE — the
-  # operator's own result, not just its condition.
+  # the expected-BLOCKED targets (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL)
+  # must be BLOCKED and the positive control (DNS_POSITIVE) must be REACHABLE
+  # — the operator's own result, not just its condition.
   PROBE_POD_LIVE=$(K -n "$PROBE_NS" get pods -l "coxswain.io/probe=cni-probe" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
   if [ -n "$PROBE_POD_LIVE" ]; then
     PROBE_MSG=$(K -n "$PROBE_NS" logs "$PROBE_POD_LIVE" 2>/dev/null)
     echo "   live probe pod $PROBE_POD_LIVE termination message:"
     echo "$PROBE_MSG" | sed 's/^/     /'
-    for LBL in APISERVER_SVC NODE_API KUBELET_NODE; do
+    for LBL in APISERVER_SVC NODE_API KUBELET_NODE EXTERNAL; do
       if echo "$PROBE_MSG" | grep -q "RESULT $LBL REACHABLE"; then
         bad "probe reports $LBL REACHABLE (the CNI must block it; the gate should not be CNIEnforced)"
       elif echo "$PROBE_MSG" | grep -q "RESULT $LBL BLOCKED"; then
         ok "probe reports $LBL BLOCKED"
       fi
     done
-    if echo "$PROBE_MSG" | grep -q "RESULT EXTERNAL REACHABLE"; then
-      ok "probe reports EXTERNAL REACHABLE (positive control: the probe has network egress)"
-    elif echo "$PROBE_MSG" | grep -q "RESULT EXTERNAL BLOCKED"; then
-      bad "probe reports EXTERNAL BLOCKED (the positive control failed: the probe has no network -> ProbeUnavailable)"
+    if echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE REACHABLE"; then
+      ok "probe reports DNS_POSITIVE REACHABLE (positive control: the probe has network egress to the allowed kube-dns)"
+    elif echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE BLOCKED"; then
+      bad "probe reports DNS_POSITIVE BLOCKED (the positive control failed: the probe has no network -> ProbeUnavailable)"
     fi
   else
     echo "   (no live probe pod to read a termination message from — the operator deletes it after each run)"

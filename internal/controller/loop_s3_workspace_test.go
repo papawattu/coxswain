@@ -225,7 +225,23 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 			if strings.HasPrefix(trimmed, "#") { // skip sh comments
 				continue
 			}
-			if strings.Contains(line, " git ") || strings.HasSuffix(trimmed, "git") {
+			// A line is a git invocation when 'git' appears as a whole word at
+			// or after a leading space (the script's git commands start at
+			// column 0, e.g. 'git -C ...' — a Contains(" git ") match misses
+			// column-0 invocations).
+			isGit := false
+			for i := 0; i+3 < len(line); i++ {
+				if !strings.EqualFold(line[i:i+3], "git") {
+					continue
+				}
+				before := i == 0 || line[i-1] == ' '
+				after := line[i+3] == ' '
+				if before && after {
+					isGit = true
+					break
+				}
+			}
+			if isGit {
 				gitLines++
 				Expect(line).To(ContainSubstring("-c safe.directory=/workspace"),
 					"every git invocation must pass -c safe.directory=/workspace: "+line)
@@ -292,8 +308,8 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 			"the init script must not use git config --global (a global .gitconfig in /workspace would persist the credential into the agent's workspace)")
 		Expect(cmd).NotTo(ContainSubstring("credential.helper"),
 			"the init script must not use any git credential helper ('store' refuses the read-only mount; the inline form is not parsed by busybox ash)")
-		Expect(cmd).NotTo(ContainSubstring("store"),
-			"the init script must not use git's 'store' helper (it writes a lock and erases the entry on success — a read-only mount refuses both)")
+		Expect(cmd).NotTo(ContainSubstring("-c credential.helper"),
+			"the init script must not set the credential helper (-c form; 'store' writes a lock and erases the entry on success — a read-only mount refuses both)")
 		Expect(cmd).To(ContainSubstring("http.extraHeader"),
 			"the init script must pass the Basic-auth header to the fetch via -c http.extraHeader")
 		Expect(cmd).To(ContainSubstring("Authorization: Basic $AUTH"),
@@ -340,6 +356,71 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		}
 		Expect(found).To(BeFalse(), "no gitCredentialSecret -> no credential volume")
 	})
+
+	// S4 review P1 (R18, ADR-0006): once status.baseCommit is pinned (immutable,
+	// ADR-0005 D10) the sandbox pod must carry NO workspace-creds volume and
+	// NO init-workspace container — the credential is never present next to the
+	// agent-controlled /workspace/.git (agent-planted hooks or git config could
+	// not run while the credential is mounted), and nothing needs git anymore
+	// (the PVC holds the repo; readBaseCommit is skipped once baseCommit is set).
+	It("builds the later-phase sandbox with no credential volume and no init-workspace once baseCommit is pinned (a)", func() {
+		ns := "s3-pinned-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "pinnedloop"
+		Expect(k8sClient.Create(ctx, s3Loop(name, ns, true))).To(Succeed())
+
+		// Pin the baseCommit BEFORE the sandbox is built (the first reconcile
+		// would normally read it from the init's termination message; the pin is
+		// what the later-phase pods see).
+		pinned := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, pinned)).To(Succeed())
+		pinned.Status.BaseCommit = s3BaseCommitSHA
+		Expect(k8sClient.Status().Update(ctx, pinned)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)).To(Succeed())
+
+		By("adding no workspace-creds volume to the pod")
+		foundVol := false
+		for i := range sb.Spec.PodTemplate.Spec.Volumes {
+			if sb.Spec.PodTemplate.Spec.Volumes[i].Name == workspaceCredsVolume {
+				foundVol = true
+			}
+		}
+		Expect(foundVol).To(BeFalse(), "baseCommit pinned -> no credential volume on the pod")
+
+		By("adding no init-workspace container")
+		foundInit := false
+		for i := range sb.Spec.PodTemplate.Spec.InitContainers {
+			if sb.Spec.PodTemplate.Spec.InitContainers[i].Name == workspaceInitContainerName {
+				foundInit = true
+			}
+		}
+		Expect(foundInit).To(BeFalse(), "baseCommit pinned -> no init-workspace container")
+
+		By("mounting the credential in NO container")
+		allContainers := make([]corev1.Container, 0, len(sb.Spec.PodTemplate.Spec.Containers)+len(sb.Spec.PodTemplate.Spec.InitContainers))
+		allContainers = append(allContainers, sb.Spec.PodTemplate.Spec.Containers...)
+		allContainers = append(allContainers, sb.Spec.PodTemplate.Spec.InitContainers...)
+		for i := range allContainers {
+			Expect(s3HasMount(&allContainers[i], workspaceCredsVolume)).To(BeFalse(),
+				"no container may mount the credential volume once baseCommit is pinned (ADR-0006): %s", allContainers[i].Name)
+		}
+	})
+
+	// I43 mutation for the previous spec (recorded, not committed): the guard
+	// '&& loop.Status.BaseCommit == ""' was removed from BOTH the init-container
+	// and the credential-volume branches of agentPodSpec (always including
+	// them). The spec failed with: 'baseCommit pinned -> no credential volume
+	// on the pod' (a volumes entry workspace-creds was present) and
+	// 'baseCommit pinned -> no init-workspace container'. The first-clone spec
+	// above (no baseCommit) still passes, so the pair is the mutation check.
 
 	It("lets the sandbox pod reach the repo host (not general egress) (a)", func() {
 		ns := "s3-netpol-" + nowSuffix()

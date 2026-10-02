@@ -924,7 +924,18 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// spec.workspace.repo is set; the credential Secret is mounted into it
 	// ONLY (ADR-0006 — zero credentials in the agent).
 	var initContainers []corev1.Container
-	if loop.Spec.Workspace.Repo != "" {
+	// S4 review P1 (R18, ADR-0006): the workspace init container (git clone
+	// with the credential mounted) runs ONLY on the first clone (baseCommit
+	// empty). Once status.baseCommit is pinned (immutable, ADR-0005 D10), the
+	// PVC already holds the repo and nothing needs git or the credential:
+	// later phases build the sandbox with NO init-workspace and NO
+	// workspace-creds volume, so the credential is never present next to the
+	// agent-controlled /workspace/.git (agent-planted hooks or git config
+	// could not run while the credential is mounted). readBaseCommit is
+	// skipped once baseCommit is set. If the spec flips between first and
+	// later phases, the desired-phase annotation recycle already replaces the
+	// pod.
+	if loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" {
 		initContainers = append(initContainers, r.workspaceInitContainer(loop))
 	}
 	// S4 (ADR-0004): the phase-init container materialises the operator's
@@ -988,7 +999,12 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// with a SubPath that names a missing key makes the kubelet mount an empty
 	// DIRECTORY — the items form names the keys explicitly and fails loud at
 	// pod start instead.)
-	if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" {
+	if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" && loop.Status.BaseCommit == "" {
+		// S4 review P1 (R18, ADR-0006): the credential volume exists ONLY for
+		// the first clone (baseCommit empty, init-workspace present). Once the
+		// base SHA is pinned it is omitted — the credential must not sit on the
+		// pod while the agent-controlled .git is present (no init-workspace to
+		// run git against it anymore).
 		volumes = append(volumes, corev1.Volume{
 			Name: workspaceCredsVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
@@ -3107,40 +3123,29 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	// refuses the repo with 'detected dubious ownership' (no config-file write
 	// needed — the per-command -c is honoured on every invocation).
 	safeDir := "-c safe.directory=/workspace"
+	// S4 review P1 (R18): this script runs ONLY the first clone (baseCommit
+	// empty), on a FRESH per-Loop PVC — the idempotent re-run branch is gone
+	// because later phases build the pod with no init-workspace and no
+	// credential volume. The clone fails loud (set -eu) so the operator's
+	// read-back rejects a non-SHA termination message.
 	script := `#!/bin/sh
 set -eu
 export GIT_TERMINAL_PROMPT=0
 DEST=/workspace
 REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
-# S4 review P1 (R17): /workspace is a MOUNT POINT (the per-Loop PVC volume)
-# and PERSISTS across the per-phase pod recycle (the emptyDir it replaced
-# did not). The init is IDEMPOTENT on it: when a cloned repo is already
-# present, SKIP the clone (no re-fetch, no wipe — PLAN.md and the
-# Implementing edits must survive) and still write the pinned base SHA to the
-# termination log (the operator reads the init's termination message and
-# validates it as a 40-hex SHA; status.baseCommit is immutable once set, so
-# the re-emitted value cannot move the pin). The success marker (.git +
-# base-commit file) is the existing idempotency test, kept: a .git without
-# the marker means the previous run failed mid-clone and is re-cloned.
-if [ -d "${DEST}/.git" ] && [ -f "${DEST}/.coxswain/base-commit" ]; then
-  # Already initialised on this volume (a later phase's pod): skip the clone.
-  cd "${DEST}"
-  git ` + safeDir + ` rev-parse --verify HEAD >/dev/null 2>&1 || git ` + safeDir + ` checkout "${REF}"
-else
-  # The volume is a MOUNT POINT (cannot be rm -rf'd). If a previous run left a
-  # half-cloned repo (.git present but no success marker), wipe its contents
-  # (never the mount point itself) so the clone starts clean. rm -rf is
-  # scoped to the .git dir, not ${DEST}.
-  if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
-  rm -rf "${DEST}/.coxswain"
-  mkdir -p "${DEST}"
+# The volume is a MOUNT POINT (cannot be rm -rf'd). If a previous run left a
+# half-cloned repo (.git present but no success marker), wipe its contents
+# (never the mount point itself) so the clone starts clean. rm -rf is scoped
+# to the .git dir, not ${DEST}.
+if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
+rm -rf "${DEST}/.coxswain"
+mkdir -p "${DEST}"
 
-  git ` + safeDir + ` init "${DEST}"
-  git -C "${DEST}" ` + safeDir + ` remote add origin "${REPO}"
+git ` + safeDir + ` init "${DEST}"
+git -C "${DEST}" ` + safeDir + ` remote add origin "${REPO}"
 ` + authLine + `  git ` + safeDir + ` -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + fetchCred + ` fetch origin "${REF}"
-  git -C "${DEST}" ` + safeDir + ` checkout --detach FETCH_HEAD
-fi
+git -C "${DEST}" ` + safeDir + ` checkout --detach FETCH_HEAD
 mkdir -p "${DEST}/.coxswain"
 SHA=$(git -C "${DEST}" ` + safeDir + ` rev-parse HEAD)
 # Write the resolved SHA to the base-commit file AND to the termination log.

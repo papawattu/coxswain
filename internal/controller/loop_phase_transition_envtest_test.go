@@ -137,7 +137,7 @@ var _ = Describe("B1 phase transitions via Reconcile (claim seam)", func() {
 		return nn, r
 	}
 
-	It("records a report of the bootstrap phase (Planning) without advancing (S4 bootstrap already moved Pending -> Planning)", func() {
+	It("records the bootstrap phase's report (Planning) and advances to Implementing (a completed phase completes the phase)", func() {
 		ns := "b1-plan-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
@@ -148,12 +148,12 @@ var _ = Describe("B1 phase transitions via Reconcile (claim seam)", func() {
 
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
-			"the bootstrap left the Loop at Planning; a completed Planning claim must not advance again (nextPhase(Planning, Planning) == Planning)")
-		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"the S4 bootstrap moved Pending -> Planning, so a COMPLETED Planning claim completes that phase: the machine advances to its successor (claimPhaseForAdvance + nextPhase)")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
 		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhasePlanning),
 			"status.observedPhase records the claimed phase (the B1 field)")
-		Expect(loop.Status.Progress).NotTo(BeNil(), "the claim is recorded into progress (OS1) even when it does not advance")
+		Expect(loop.Status.Progress).NotTo(BeNil(), "the claim is recorded into progress (OS1)")
 		Expect(loop.Status.Progress.LastResultStatus).To(Equal("success"))
 	})
 
@@ -260,7 +260,8 @@ var _ = Describe("B1 phase transitions via Reconcile (claim seam)", func() {
 		Expect(loop.Status.Progress.LastResultStatus).To(Equal("success"),
 			"the running phase must not blank the last result status")
 		Expect(loop.Status.Progress.LastActivityTime).NotTo(BeNil())
-		Expect(loop.Status.Progress.LastActivityTime.Equal(activity),
+		Expect(activity).NotTo(BeNil())
+		Expect(loop.Status.Progress.LastActivityTime.Unix()).To(Equal(activity.Unix()),
 			"the lastActivityTime of a STABLE claim must not be rewritten on a poll (it is 'last activity', not 'last poll')")
 		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhasePlanning),
 			"status.observedPhase stays at the claimed phase while the next phase runs")

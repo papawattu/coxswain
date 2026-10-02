@@ -77,6 +77,22 @@ runner-test: ## Run the runner module's tests (separate go.mod).
 samples-check: ## S1: seed checks fail, reference patches pass
 	bash hack/samples-check.sh
 
+# S2 (samples plan §2/§7): the in-cluster git server for the sample apps, on
+# coxswain-dev ONLY. The driver script (hack/samples-git.sh) pins the kubectl
+# context to kind-coxswain-dev — these targets never touch any other cluster.
+# Never deletes clusters, never touches KubeArmor or the operator.
+.PHONY: samples-up
+samples-up: ## S2: apply config/samples-git (Gitea) to coxswain-dev and wait for Ready
+	@bash hack/samples-git.sh up
+
+.PHONY: samples-seed
+samples-seed: ## S2: create the 3 sample repos on the in-cluster Gitea (one 'initial' commit each, from examples/<app>)
+	@bash hack/samples-git.sh seed
+
+.PHONY: samples-accept
+samples-accept: ## S2: acceptance — a throwaway pod clones each seeded repo with the samples credential and asserts the 'initial' commit + no github.com remote
+	@bash hack/samples-git.sh accept
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

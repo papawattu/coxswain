@@ -1,0 +1,81 @@
+# S2 (samples plan §2): the in-cluster git server (disposable, dev-only).
+#
+# gitea/gitea 1.24, HTTP only on :3000. Storage is an emptyDir — no PVC,
+# the sample repos are disposable and re-seeded by `make samples-seed`.
+#
+# The 1.24 image has no admin auto-init (that arrived in 1.25), so the
+# one-shot gitea-init Job (job.yaml) performs the web install (creating the
+# admin user from the gitea-admin Secret) on the first boot. The Job gates
+# on the gitea service's /api/healthz, so it is safe to re-run: on a fresh
+# cluster the Job installs, on a surviving emptyDir the healthz check passes
+# and the Job is a no-op. INSTALL_LOCK is NOT set here — it is set by the
+# installer (the init Job) once the admin account exists.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitea
+  labels:
+    app.kubernetes.io/name: gitea
+    app.kubernetes.io/instance: samples
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gitea
+      app.kubernetes.io/instance: samples
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gitea
+        app.kubernetes.io/instance: samples
+    spec:
+      securityContext:
+        # The Gitea image runs its s6 supervisor as root (uid 0); the gitea
+        # process itself drops to the git user internally. With runAsUser
+        # 19999 s6 cannot write /data ('unable to open .s6-svscan/lock:
+        # Permission denied'); with 1000 it cannot own /data/ssh. This is a
+        # disposable dev server (coxswain-dev only), so the supervisor runs
+        # as root, matching the image's own default (no securityContext).
+        runAsUser: 0
+        fsGroup: 1000
+      containers:
+      - name: gitea
+        image: gitea/gitea:1.24
+        ports:
+        - name: http
+          containerPort: 3000
+        env:
+        # Gitea's env-config syntax: GITEA__<section>__<key>. (The init Job
+        # runs the installer which writes these into app.ini; the env vars
+        # here keep a re-boot consistent with the install.)
+        - name: GITEA__server__DISABLE_SSH_SERVER
+          value: "true"
+        - name: GITEA__server__ROOT_URL
+          value: "http://gitea.samples.svc:3000/"
+        - name: GITEA__database__DB_TYPE
+          value: sqlite3
+        # Signups are closed: the only users are the ones the seed step
+        # creates through the admin API (the installer itself sets
+        # DISABLE_REGISTRATION=true).
+        - name: GITEA__service__DISABLE_REGISTRATION
+          value: "true"
+        - name: GITEA__service__REQUIRE_SIGNIN_VIEW
+          value: "true"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        readinessProbe:
+          httpGet:
+            path: /api/healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: data
+        emptyDir: {}

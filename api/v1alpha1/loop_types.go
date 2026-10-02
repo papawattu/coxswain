@@ -61,7 +61,11 @@ type Workspace struct {
 	Ref string `json:"ref,omitempty"`
 
 	// gitCredentialSecret is the name of a Secret in the Loop's namespace
-	// holding git credentials for pushing the Loop's branch.
+	// holding git credentials. It MUST be a standard kubernetes.io/basic-auth
+	// Secret carrying the keys 'username' and 'password' (the same shape as the
+	// samples 'samples-git-cred'); the workspace init container mounts ONLY
+	// those two keys and passes them to the fetch as a Basic-auth
+	// http.extraHeader (nothing is written or persisted).
 	// +optional
 	GitCredentialSecret string `json:"gitCredentialSecret,omitempty"`
 }

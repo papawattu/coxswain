@@ -227,14 +227,15 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		credVol := s3Vol(sb, workspaceCredsVolume)
 		Expect(credVol.Secret).NotTo(BeNil(), "the credential volume must be a Secret volume")
 		Expect(credVol.Secret.SecretName).To(Equal("samples-git-cred"), "the credential Secret name must be the Loop's gitCredentialSecret")
-		// The items mapping pins the mount to the single key '.git-credentials'
-		// at /workspace-creds/.git-credentials. Without it, a SubPath mount of
-		// a missing Secret key makes the kubelet mount an empty DIRECTORY (the
-		// live 'unable to open /workspace-creds: Is a directory' failure), and
-		// without the items list a Secret with OTHER keys would mount them too.
+		// The items mapping pins the mount to the two basic-auth keys at
+		// /workspace-creds/username and /workspace-creds/password. Without it,
+		// a SubPath mount of a missing Secret key makes the kubelet mount an
+		// empty DIRECTORY, and without the items list a Secret with OTHER keys
+		// would mount them too.
 		Expect(credVol.Secret.Items).To(Equal([]corev1.KeyToPath{
-			{Key: ".git-credentials", Path: ".git-credentials"},
-		}), "the credential volume must mount ONLY the '.git-credentials' key at /workspace-creds/.git-credentials")
+			{Key: "username", Path: "username"},
+			{Key: "password", Path: "password"},
+		}), "the credential volume must mount ONLY the basic-auth 'username' and 'password' keys")
 		// The init container mounts the volume directory (the items mapping
 		// already restricts it); a SubPath on top would re-enter the same key
 		// and, for a missing key, mount an empty directory.
@@ -257,17 +258,30 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		}
 		Expect(agentEnvNames["GIT_CREDENTIALS"]).To(BeFalse(), "the agent must not carry the git credential as an env var")
 
-		By("passing the credential to git per command (no global .gitconfig, no credential leak into /workspace)")
+		By("passing the credential to git via http.extraHeader (no credential helper, no store, no global .gitconfig)")
 		// The P1 credential-leak check: a HOME=/workspace + `git config --global
 		// credential.helper store` would make git's store helper READ AND WRITE
 		// /workspace/.git-credentials (the agent's workspace) after an
-		// authenticated fetch. The fix passes the credential PER COMMAND (-c
-		// credential.helper='store --file=/workspace-creds/.git-credentials') and sets no HOME
-		// into the workspace, so nothing is persisted into /workspace.
+		// authenticated fetch. The credential helpers are not usable on the
+		// read-only mount ('store' writes a lock and erases the entry on
+		// success — the live 'unable to get credential storage lock: Read-only
+		// file system' failure; the inline '!sh -c' helper form is not parsed
+		// by busybox ash), so the script builds a Basic-auth header from the
+		// mounted files and passes it to THAT ONE fetch invocation via
+		// -c http.extraHeader — nothing is written or persisted (a -c flag
+		// lives only for that one command).
 		Expect(cmd).NotTo(ContainSubstring("git config --global"),
 			"the init script must not use git config --global (a global .gitconfig in /workspace would persist the credential into the agent's workspace)")
-		Expect(cmd).To(ContainSubstring("-c credential.helper='store --file=/workspace-creds/.git-credentials'"),
-			"the init script must pass the credential per command, pinned to the read-only /workspace-creds/.git-credentials file")
+		Expect(cmd).NotTo(ContainSubstring("credential.helper"),
+			"the init script must not use any git credential helper ('store' refuses the read-only mount; the inline form is not parsed by busybox ash)")
+		Expect(cmd).NotTo(ContainSubstring("store"),
+			"the init script must not use git's 'store' helper (it writes a lock and erases the entry on success — a read-only mount refuses both)")
+		Expect(cmd).To(ContainSubstring("http.extraHeader"),
+			"the init script must pass the Basic-auth header to the fetch via -c http.extraHeader")
+		Expect(cmd).To(ContainSubstring("Authorization: Basic $AUTH"),
+			"the fetch's http.extraHeader must be the Authorization: Basic header built from the mounted credential files")
+		Expect(cmd).To(ContainSubstring("/workspace-creds/username"))
+		Expect(cmd).To(ContainSubstring("/workspace-creds/password"))
 		for _, e := range init.Env {
 			Expect(e.Value).NotTo(Equal(agentWorkspaceMount),
 				"the init container must not set HOME (or any env) to the agent workspace (a credential could be persisted there)")
@@ -293,8 +307,8 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(init).NotTo(BeNil())
 		// No credential flag when no gitCredentialSecret is declared (detected
 		// from the spec, not the mount count).
-		Expect(strings.Join(init.Command, " ")).NotTo(ContainSubstring("credential.helper"),
-			"the init script must not reference a credential helper when no gitCredentialSecret is set")
+		Expect(strings.Join(init.Command, " ")).NotTo(ContainSubstring("http.extraHeader"),
+			"the init script must not reference the credential header when no gitCredentialSecret is set")
 		By("adding no credential volume to the pod")
 		found := false
 		for i := range sb.Spec.PodTemplate.Spec.Volumes {

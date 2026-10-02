@@ -83,11 +83,15 @@ const (
 	// init container (S3a). It clones spec.workspace.repo @ ref into the
 	// 'workspace' volume and writes the resolved SHA to baseCommitFile.
 	workspaceInitContainerName = "init-workspace"
-	// workspaceGitCredentialsKey is the REQUIRED key in the
-	// spec.workspace.gitCredentialSecret Secret (content: http://<user>:
-	// <pass>@<git host>). See the volume items mapping in agentPodSpec and
-	// the init container's credential.helper 'store --file'.
-	workspaceGitCredentialsKey = ".git-credentials"
+	// workspaceCredsUsernameKey / workspaceCredsPasswordKey are the keys the
+	// spec.workspace.gitCredentialSecret Secret MUST carry: a standard
+	// kubernetes.io/basic-auth Secret (the same shape as the samples
+	// 'samples-git-cred'), mounted by items at /workspace-creds/username and
+	// /workspace-creds/password. The init container's inline credential helper
+	// reads them per git invocation — nothing is ever written (see
+	// buildWorkspaceInitContainer).
+	workspaceCredsUsernameKey = "username"
+	workspaceCredsPasswordKey = "password"
 
 	// workspaceCredsVolume is the Secret volume carrying the git credential
 	// (S3a, ADR-0006). It is mounted into the init container ONLY — the agent
@@ -800,21 +804,24 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	}
 	// S3a (ADR-0006): the git credential Secret is a volume on the sandbox
 	// pod ONLY to reach the init container; the agent has no such mount
-	// (zero credentials in the agent). Mounted with the default 0644 mode
-	// so the init container's git credential.helper 'store' can read it.
-	// The Secret MUST carry a key named '.git-credentials' (content:
-	// http://<user>:<pass>@<git host>); the items mapping mounts ONLY that
-	// key as /workspace-creds/.git-credentials. (A plain mount with a
-	// SubPath that names a missing key makes the kubelet mount an empty
-	// DIRECTORY, which git's store helper rejects with 'unable to open
-	// /workspace-creds: Is a directory' — the items form names the key
-	// explicitly and fails loud at pod start instead.)
+	// (zero credentials in the agent). Mounted read-only with the default 0644
+	// mode so the init container's inline credential helper can read it. The
+	// Secret MUST be a standard kubernetes.io/basic-auth Secret carrying the
+	// keys 'username' and 'password' (the same shape as the samples
+	// 'samples-git-cred'); the items mapping mounts ONLY those two keys as
+	// /workspace-creds/username and /workspace-creds/password. (A plain mount
+	// with a SubPath that names a missing key makes the kubelet mount an empty
+	// DIRECTORY — the items form names the keys explicitly and fails loud at
+	// pod start instead.)
 	if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" {
 		volumes = append(volumes, corev1.Volume{
 			Name: workspaceCredsVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 				SecretName: loop.Spec.Workspace.GitCredentialSecret,
-				Items:      []corev1.KeyToPath{{Key: workspaceGitCredentialsKey, Path: workspaceGitCredentialsKey}},
+				Items: []corev1.KeyToPath{
+					{Key: workspaceCredsUsernameKey, Path: workspaceCredsUsernameKey},
+					{Key: workspaceCredsPasswordKey, Path: workspaceCredsPasswordKey},
+				},
 			}},
 		})
 	}
@@ -2649,17 +2656,20 @@ func (r *LoopReconciler) workspaceGitImage() string {
 // status.baseCommit, immutable once set, ADR-0005 D10).
 //
 // ADR-0006 (zero credentials in the agent): the git credential Secret
-// (spec.workspace.gitCredentialSecret) is mounted read-only into THIS
-// container ONLY, at /workspace-creds. The credential is passed to git PER
-// COMMAND (-c credential.helper='store --file=/workspace-creds') — NOTHING is
-// written to a global/user .gitconfig and the store helper's file is pinned
-// to the read-only mount, so after a successful authenticated fetch the
-// credential is NOT persisted into the agent's workspace (a HOME=/workspace +
-// `git config --global credential.helper store` would have git's store helper
-// READ AND WRITE $HOME/.git-credentials = /workspace/.git-credentials, leaking
-// the credential into the agent's workspace — the reviewer's P1 credential-leak
-// finding). The agent container never mounts the credential volume (asserted
-// by the S3a envtest spec).
+// (spec.workspace.gitCredentialSecret — a standard kubernetes.io/basic-auth
+// Secret with keys 'username' and 'password', the same shape as the samples
+// 'samples-git-cred') is mounted read-only into THIS container ONLY, at
+// /workspace-creds/. Only the fetch needs it: the script builds a Basic-auth
+// header from the mounted files and passes it to that ONE git invocation as
+// -c http.extraHeader="Authorization: Basic $AUTH". Nothing is written and
+// nothing is persisted — a -c flag lives only for that one command (git's
+// credential helpers were not usable here: the 'store' helper writes a lock
+// and erases the entry on success, which a read-only mount refuses with
+// 'unable to get credential storage lock', and an inline '!sh -c' helper is
+// not parsed by busybox ash). The header is visible in that one process's
+// argv inside the init container only (known limitation, noted in the PR);
+// the agent's workspace carries no credential and the agent container never
+// mounts the credential volume (asserted by the S3a envtest spec).
 func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.Container {
 	gitImage := r.workspaceGitImage()
 	var initMounts []corev1.VolumeMount
@@ -2667,8 +2677,8 @@ func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.C
 		initMounts = []corev1.VolumeMount{
 			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
 			// The volume's items mapping (agentPodSpec) already restricts the
-			// mount to the single key '.git-credentials' at
-			// /workspace-creds/.git-credentials; no SubPath (a SubPath naming
+			// mount to the keys 'username' and 'password' at
+			// /workspace-creds/{username,password}; no SubPath (a SubPath naming
 			// a missing key would mount an empty directory).
 			{Name: workspaceCredsVolume, MountPath: "/workspace-creds", ReadOnly: true},
 		}
@@ -2687,14 +2697,18 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	// The credential is detected from the SPEC, not from the mount count
 	// (the len(mounts) == 2 check was fragile: any second mount would
 	// silently switch the credential on). When a gitCredentialSecret is
-	// declared, git is given the credential per command (-c
-	// credential.helper='store --file=/workspace-creds/.git-credentials') —
-	// nothing is persisted to a .gitconfig, and the store helper's file is
-	// the read-only mount (it cannot write a credential back into the
-	// workspace).
-	credOpt := ""
+	// declared, the fetch gets a Basic-auth header built by the script from
+	// the mounted files (authLine, below): only the fetch invocation carries
+	// it. A -c flag lives only for that one command — nothing is written and
+	// nothing is persisted (the credential helpers were not usable: 'store'
+	// writes a lock and erases the entry on success, a read-only mount
+	// refuses that; an inline '!sh -c' helper is not parsed by busybox ash).
+	authLine := ""
+	fetchCred := ""
 	if loop.Spec.Workspace.GitCredentialSecret != "" {
-		credOpt = " -c credential.helper='store --file=/workspace-creds/" + workspaceGitCredentialsKey + "'"
+		authLine = `AUTH=$(printf '%s:%s' "$(cat /workspace-creds/` + workspaceCredsUsernameKey + `)" "$(cat /workspace-creds/` + workspaceCredsPasswordKey + `)" | base64 | tr -d '\\n')
+`
+		fetchCred = ` -c http.extraHeader="Authorization: Basic $AUTH"`
 	}
 	// GIT_TERMINAL_PROMPT=0: never prompt (the init container has no TTY; a
 	// missing credential must fail the clone, not hang).
@@ -2729,7 +2743,7 @@ else
 
   git ` + safeDir + ` init "${DEST}"
   git -C "${DEST}" ` + safeDir + ` remote add origin "${REPO}"
-  git -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + credOpt + ` ` + safeDir + ` fetch origin "${REF}"
+` + authLine + `  git ` + safeDir + ` -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + fetchCred + ` fetch origin "${REF}"
   git -C "${DEST}" ` + safeDir + ` checkout --detach FETCH_HEAD
 fi
 mkdir -p "${DEST}/.coxswain"

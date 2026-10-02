@@ -639,6 +639,14 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		createStandinPod(ns, "os1lp")
 		writeAgentTermination(ns, "os1lp", `{"observedPhase":"Planning","status":"success","blockedReason":""}`)
 
+		// S4 review P2 (R18): the OS1 no-churn spec needs the two reconciles
+		// more than 1s apart (metav1.Time marshals at 1-second precision: in
+		// the same second the forced rewrite is byte-identical and the
+		// resourceVersion is unchanged, so the spec could never fail). The
+		// operator's clock (r.now) is advanced by 2s before reconcile 2.
+		fakeNow := metav1.Now()
+		r.now = func() metav1.Time { return fakeNow }
+
 		By("reconcile 1: the claim is recorded and the phase advances")
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
@@ -650,6 +658,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		rvBefore := loop.ResourceVersion
 
 		By("reconcile 2: the SAME claim is re-read — progress must be byte-identical, no status write")
+		fakeNow = metav1.NewTime(fakeNow.Add(2 * time.Second)) // > 1s so the timestamps would differ if written
 		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
 		loop = &coxv1alpha1.Loop{}
@@ -660,6 +669,16 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		Expect(loop.ResourceVersion).To(Equal(rvBefore),
 			"a re-read of an identical claim must make no status write (resourceVersion unchanged)")
 	})
+
+	// I43 mutation for the OS1 no-churn spec (recorded, not committed): the
+	// guard in recordPhaseClaim (if loop.Status.Progress == nil ||
+	// !progressEqual(...)) was replaced with 'if true {'. With the injected
+	// clock advanced 2s before reconcile 2, the spec FAILED at the final
+	// assertions ('a re-read of an identical claim must leave status.progress
+	// byte-identical (lastActivityTime included)' — lastActivityTime moved
+	// 2s — and 'must make no status write (resourceVersion unchanged)'):
+	// without the guard the forced rewrite would rewrite lastActivityTime at
+	// the advanced clock time and the apiserver would bump the resourceVersion.
 
 	// P2 (review item 4): the live reader falls back to
 	// LastTerminationState.Terminated when the current State is not Terminated

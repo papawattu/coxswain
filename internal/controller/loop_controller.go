@@ -226,6 +226,13 @@ type LoopReconciler struct {
 	// so a bare test reconciler keeps the existing advance behaviour.
 	phaseGate PhaseGate
 
+	// now is the clock the operator uses to stamp status (S4 review P2, R18):
+	// recordPhaseClaim's caller stamps LastActivityTime from it. It defaults
+	// to metav1.Now at each call site; a test may override it to advance time
+	// deterministically (metav1.Time marshals at 1-second precision, so a
+	// no-churn spec must prove the two reconciles land more than 1s apart).
+	now func() metav1.Time
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string

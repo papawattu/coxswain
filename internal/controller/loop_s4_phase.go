@@ -429,7 +429,16 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			"loop", loop.Name)
 		claimReadPending = true
 	} else if claim != nil {
-		now := metav1.Now()
+		// S4 review P2 (R18): the clock is injected (r.now, defaulting to
+		// metav1.Now) so a test can advance it more than 1s between reconciles
+		// (metav1.Time marshals at 1-second precision: two same-second
+		// reconciles are byte-identical and the no-churn spec cannot fail).
+		var now metav1.Time
+		if r.now != nil {
+			now = r.now()
+		} else {
+			now = metav1.Now()
+		}
 		fromPhase := loop.Status.Phase
 		c, advanced := r.recordPhaseClaim(loop, claim, now)
 		changed = changed || c

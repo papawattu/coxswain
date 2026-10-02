@@ -12,6 +12,17 @@ Stdlib only — no `pip install`, no network. The `verify.preset` is `none`
 (the `go` preset would protect Go files, which pylib has none of); the test
 files are named explicitly in `protectedPaths`.
 
+**Git credential:** each spec's `workspace.gitCredentialSecret` names a standard
+`kubernetes.io/basic-auth` Secret with keys `username` and `password`
+(the same shape as the seeded Gitea's `samples-git-cred`). The operator mounts
+ONLY those two keys (`items: [{key: 'username', ...}, {key: 'password', ...}]`)
+at `/workspace-creds/` (read-only); the init container's `fetch` passes them
+to git as a Basic-auth `http.extraHeader` built from the files (a `-c` flag
+for that one command only — nothing is written or persisted; the git
+credential helpers refuse the read-only mount). A Secret missing either key
+makes the init container fail loud at pod start. See docs/SAMPLES-PLAN.md S3
+for the rationale.
+
 ## Task 1 — implement `Median`
 
 **Goal (issue-style):**
@@ -52,6 +63,7 @@ spec:
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
   policyRefs:
     - pylib-task-1
 ```
@@ -116,6 +128,7 @@ spec:
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
   policyRefs:
     - pylib-task-2
 ```

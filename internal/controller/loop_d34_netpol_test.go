@@ -346,7 +346,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 					Image:             runnerImage,
 					Model:             testModel,
 					EndpointSecretRef: d34TestSecretName,
-					ModelEndpoint:     "vllm:8000",
+					ModelEndpoint:     s3ModelEndpoint,
 				},
 			},
 		}

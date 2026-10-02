@@ -144,6 +144,10 @@ AGENT_SANDBOX_CONTROLLER_IMAGE ?= registry.k8s.io/agent-sandbox/agent-sandbox-co
 
 PROXY_IMG ?= coxswain-proxy:standin
 EGRESS_IMG ?= coxswain-egress-proxy:standin
+# S3b (GAP 1): the runner agent image (golang:1.26 + compiled runner + git +
+# python3). The operator selects it via --runner-image; when spec.agent.image
+# is empty or equals it, the agent container runs the runner's entrypoint.
+RUNNER_IMG ?= coxswain-runner:dev
 
 .PHONY: proxy-build
 proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
@@ -152,6 +156,14 @@ proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
 .PHONY: egress-proxy-build
 egress-proxy-build: ## Build the egress proxy image (coxswain-egress-proxy:standin).
 	$(CONTAINER_TOOL) build -t $(EGRESS_IMG) -f cmd/egress-proxy/Dockerfile .
+
+.PHONY: runner-build
+runner-build: ## S3: build the runner agent image ($(RUNNER_IMG)) from cmd/runner/Dockerfile.
+	$(CONTAINER_TOOL) build -t $(RUNNER_IMG) -f cmd/runner/Dockerfile .
+
+.PHONY: runner-load
+runner-load: ## S3: load $(RUNNER_IMG) into the kind node $(KIND_CLUSTER) (dev/kind only).
+	$(KIND) load docker-image "$(RUNNER_IMG)" --name $(KIND_CLUSTER)
 
 .PHONY: egress-proxy-e2e
 egress-proxy-e2e: ## Run the I42a egress proxy kind e2e (real proxy, TLS + plain HTTP).

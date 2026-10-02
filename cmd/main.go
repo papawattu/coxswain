@@ -116,6 +116,22 @@ func main() {
 		"The cluster's service DNS domain (default cluster.local). Used for the proxy Service FQDNs the agent's DNS "+
 			"allowlist carries. R16 I44 item 2: a non-default-domain cluster (a DNS-domain override on the cluster's "+
 			"service CIDR) is supported.")
+	// S3a (GAP 1): the trusted image the workspace init container runs to clone
+	// spec.workspace.repo (it must carry git + sh). The operator selects it so
+	// the agent's image never controls the clone.
+	var workspaceGitImage string
+	flag.StringVar(&workspaceGitImage, "workspace-git-image", "docker.io/alpine/git:v2.54.0",
+		"The image the sandbox pod's workspace init container runs to clone the Loop's workspace repo. "+
+			"Must carry git and sh. Default: docker.io/alpine/git:v2.54.0 (pinned release — the init "+
+			"container handles the git credential, so a moving :latest tag is not acceptable).")
+	// S3b (GAP 1): the image the operator recognises as the runner. When
+	// spec.agent.image is empty or equals this, the agent container's Command is
+	// the runner's entrypoint; any other image keeps 'sleep infinity'.
+	var runnerImage string
+	flag.StringVar(&runnerImage, "runner-image", "",
+		"The image the operator runs as the runner (its entrypoint). When spec.agent.image is empty or equals this, "+
+			"the agent container runs the runner; any other image keeps the 'sleep infinity' stand-in. "+
+			"Default: empty (no Loop is run as the runner).")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -282,6 +298,8 @@ func main() {
 		CNIProber:              cniProber,
 		CNIRegateSource:        cniRegateSrc,
 		ClusterDomain:          clusterDomain,
+		WorkspaceGitImage:      workspaceGitImage,
+		RunnerImage:            runnerImage,
 		// D38: the NetworkEnforced condition-change Event (the manager's
 		// recorder posts it as a Kubernetes Event; the re-gate Event lives
 		// in the probe Runnable).

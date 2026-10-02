@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -76,6 +77,11 @@ type runConfig struct {
 	BaseURL   string
 	APIKey    string
 	Model     string
+	// ExtraBody is merged into every chat-completions request body. Server
+	// tuning knobs that are not part of the standard OpenAI schema (e.g. the
+	// vLLM/Qwen chat_template_kwargs that disable the reasoning pass) ride
+	// here; they are additive and do not touch the wire types.
+	ExtraBody map[string]any
 	// MaxSteps caps the number of model rounds (tool-call loops). I5: was a
 	// hard const of 5; now configurable. Zero uses defaultMaxSteps.
 	MaxSteps int
@@ -160,9 +166,15 @@ type assistantMessage struct {
 	ToolCalls []toolCall `json:"tool_calls,omitempty"`
 }
 
-// toolCall is a model-requested function call.
+// toolCall is a model-requested function call. Type is the OpenAI wire
+// "type": "function" (required by vLLM/Pydantic on the REQUEST side when the
+// assistant's tool_calls are echoed back into history; the response decode
+// tolerates its absence). fnCall.Arguments stays a raw JSON *string* per the
+// OpenAI schema — the model returns it as a string and the request must carry
+// it back as a string.
 type toolCall struct {
 	ID       string `json:"id"`
+	Type     string `json:"type"`
 	Function fnCall `json:"function"`
 }
 
@@ -191,6 +203,20 @@ func shellToolSchema() []toolDef {
 			},
 		},
 	}
+}
+
+// RunConfig is the exported input to Run (S3): the environment the runner reads
+// in main.go maps onto this. It is the same shape as runConfig (the unexported
+// seam the tests use) so Run is a thin adapter: the exported entrypoint for the
+// agent image, the unexported run for the test suite.
+type RunConfig = runConfig
+
+// Run is the exported entrypoint the runner image's main calls (S3). It drives
+// the model and writes result.json in the workspace. The phase-driver contract
+// (desired-phase, observedPhase) is the S4 slice; until then Run reports a
+// single-phase run (the existing Phase 0 schema).
+func Run(cfg RunConfig) Result {
+	return run(cfg)
 }
 
 // run drives the model and writes the result file. It returns the result it
@@ -223,7 +249,7 @@ func run(cfg runConfig) Result {
 
 	answer, trace, modelErr := driveModel(
 		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
-		messages, maxSteps, shellTimeout, modelTimeout,
+		messages, maxSteps, shellTimeout, modelTimeout, cfg.ExtraBody,
 	)
 
 	res := Result{
@@ -248,6 +274,7 @@ func run(cfg runConfig) Result {
 // tools (I1) so a real model can emit a shell tool call.
 func callModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []chatMessage,
+	extraBody map[string]any,
 ) (assistantMessage, error) {
 	body := chatRequest{
 		Model:    model,
@@ -258,8 +285,29 @@ func callModel(
 	if err != nil {
 		return assistantMessage{}, err
 	}
+	// Server tuning knobs (cfg.ExtraBody, e.g. Qwen's
+	// chat_template_kwargs.enable_thinking) are not part of the standard
+	// OpenAI schema, so they are merged into the marshaled body. Standard
+	// fields (model/messages/tools) never appear in extraBody, so the merge
+	// cannot silently change them.
+	if len(extraBody) > 0 {
+		var m map[string]any
+		if err := json.Unmarshal(reqBody, &m); err != nil {
+			return assistantMessage{}, err
+		}
+		maps.Copy(m, extraBody)
+		reqBody, err = json.Marshal(m)
+		if err != nil {
+			return assistantMessage{}, err
+		}
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(reqBody))
+	// S3: the OpenAI-compatible path is /v1/chat/completions (vLLM serves its
+	// API under /v1; the model proxy is a transparent reverse proxy and does
+	// NOT rewrite the path). COX_MODEL_BASE_URL carries the bare
+	// http://<proxy>:8080 base and the runner appends /v1/chat/completions —
+	// one convention, pinned by TestRunnerPostsV1ChatCompletionsPath.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
 		return assistantMessage{}, err
 	}
@@ -414,7 +462,7 @@ var knownTools = map[string]bool{toolNameShell: true}
 // truncated before being fed back.
 func driveModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string,
-	messages []chatMessage, maxSteps int, shellTimeout, modelTimeout time.Duration,
+	messages []chatMessage, maxSteps int, shellTimeout, modelTimeout time.Duration, extraBody map[string]any,
 ) (string, []string, string) {
 	known := knownTools
 	trace := []string{}
@@ -423,7 +471,7 @@ func driveModel(
 		// I11: bound each model request with modelTimeout, derived from the
 		// caller's ctx so a run deadline can still cancel it.
 		reqCtx, cancel := context.WithTimeout(ctx, modelTimeout)
-		msg, err := callModel(reqCtx, client, baseURL, apiKey, model, messages)
+		msg, err := callModel(reqCtx, client, baseURL, apiKey, model, messages, extraBody)
 		cancel()
 		if err != nil {
 			return "", append(trace, "call model: "+err.Error()), err.Error()
@@ -435,11 +483,19 @@ func driveModel(
 		}
 
 		// Record the assistant turn (with its tool calls) for the next request.
-		messages = append(messages, chatMessage{
+		// The OpenAI/vLLM request schema requires each echoed tool_call to carry
+		// "type": "function" (the response decode does not see it, so it is set
+		// here at echo time, not at parse time — vLLM 400s the second request
+		// without it).
+		assistant := chatMessage{
 			Role:      jsonRoleAssistant,
 			Content:   msg.Content,
 			ToolCalls: msg.ToolCalls,
-		})
+		}
+		for i := range assistant.ToolCalls {
+			assistant.ToolCalls[i].Type = jsonToolFunction
+		}
+		messages = append(messages, assistant)
 		for _, tc := range msg.ToolCalls {
 			if !known[tc.Function.Name] {
 				// I5: reject an unknown tool instead of executing it as a shell

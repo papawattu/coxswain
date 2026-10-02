@@ -29,6 +29,15 @@ patches:
     - op: add
       path: /spec/template/spec/containers/0/args/-
       value: --allow-unenforced-network
+    # S3 (GAP 1): the runner image the operator selects the one-shot runner
+    # entrypoint for. When spec.agent.image is empty or equals this value, the
+    # operator runs the real runner agent (cmd/runner) instead of the
+    # 'sleep infinity' stand-in. Dev/kind only (the runner image is built by
+    # make runner-build + kind load); production selects the runner a different
+    # way (the S4 phase driver).
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --runner-image=coxswain-runner:dev
     - op: add
       path: /spec/template/spec/containers/0/env
       value:

@@ -181,7 +181,7 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 	// The VAP denies by label VALUE, so each of the three component values
 	// gets its own pod. The unlabelled pod must stay ALLOWED.
 	components := []struct{ name, value string }{
-		{"agent", policy.ComponentAgentLabel},
+		{agentContainerName, policy.ComponentAgentLabel},
 		{"model-proxy", policy.ComponentProxyLabel},
 		{"egress-proxy", policy.ComponentEgressProxyLabel},
 	}

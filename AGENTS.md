@@ -15,6 +15,12 @@ pull requests; design is reviewed in review docs.**
   a kind run for anything that changes the sandbox pod).
 - **Mark it ready for review** when CI (`make test`, `make lint`, and the
   kind e2e once it exists) is green and the slice's acceptance is met.
+  (D40: the builder marks PRs ready via the GraphQL API —
+  `gh api graphql -f query="mutation{markPullRequestReadyForReview(input:{pullRequestId:\"$ID\"}){pullRequest{isDraft}}}"`
+  where `ID=$(gh api repos/<owner>/<repo>/pulls/<n> --jq .node_id)`. The
+  `gh pr ready` CLI command requires the `workflow` scope which the
+  harness-injected token lacks; the GraphQL mutation works with the
+  stored fine-grained PAT.)
 - **The reviewer reviews on the PR with comment reviews, not approvals.** The
   builder, reviewer and owner all act through the same GitHub account, and GitHub
   does not let an account approve its own PR — so a required approval could never

@@ -45,12 +45,14 @@ const (
 // authenticated. The sandbox clones repo at ref on start and works on a
 // single branch per Loop (docs/CONTEXT.md: "Workspace").
 type Workspace struct {
-	// repo is the git URL to clone. Accepts HTTPS (`https://…`), SSH
-	// (`ssh://…`), and scp-style (`user@host:path`) remotes — go-git handles
-	// all three. Must be non-empty and match the pattern.
+	// repo is the git URL to clone. Accepts HTTPS (`https://…`), plain HTTP
+	// (`http://…`, for in-cluster git servers such as a kind Gitea dev
+	// fixture), SSH (`ssh://…`), and scp-style (`user@host:path`) remotes —
+	// the init container's git client handles all four. Must be non-empty and
+	// match the pattern.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:Pattern=`^(https://|ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:).+`
+	// +kubebuilder:validation:Pattern=`^(https://|http://|ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:).+`
 	Repo string `json:"repo"`
 
 	// ref is the branch, tag, or commit to check out. Defaults to the repo's
@@ -59,7 +61,11 @@ type Workspace struct {
 	Ref string `json:"ref,omitempty"`
 
 	// gitCredentialSecret is the name of a Secret in the Loop's namespace
-	// holding git credentials for pushing the Loop's branch.
+	// holding git credentials. It MUST be a standard kubernetes.io/basic-auth
+	// Secret carrying the keys 'username' and 'password' (the same shape as the
+	// samples 'samples-git-cred'); the workspace init container mounts ONLY
+	// those two keys and passes them to the fetch as a Basic-auth
+	// http.extraHeader (nothing is written or persisted).
 	// +optional
 	GitCredentialSecret string `json:"gitCredentialSecret,omitempty"`
 }
@@ -383,6 +389,16 @@ type LoopStatus struct {
 // (dots/digits/253 chars allowed), so this is enforced at admission rather
 // than left to a later Service-create failure.
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$') && size(self.metadata.name) <= 55",message="Loop name must be a DNS-1035 label of at most 55 characters (it names the Sandbox, and its Service if one is enabled)"
+// S3 (review P1): a plain http:// repo URL may only point at an in-cluster
+// host. Plain http sends any git credentials in cleartext (a
+// spec.workspace.gitCredentialSecret would leak over the wire), so an
+// http://host not ending in the in-cluster service suffixes is rejected at
+// admission. https:// and ssh:// are unrestricted. The host is the first
+// segment of the path after "http://", up to the first "/"; a port suffix is
+// stripped. The in-cluster suffixes are ".svc" (the cluster-internal
+// service-domain short form) and ".svc.cluster.local" (the FQDN form); a
+// custom clusterDomain would use the latter shape.
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.workspace.repo) || !self.spec.workspace.repo.startsWith('http://') || (self.spec.workspace.repo.split('http://')[1].split('/')[0].split(':')[0].endsWith('.svc') || self.spec.workspace.repo.split('http://')[1].split('/')[0].split(':')[0].endsWith('.svc.cluster.local'))",message="workspace.repo: plain http:// is only allowed for in-cluster hosts (ending in .svc or .svc.cluster.local); use https:// for external hosts (git credentials would be sent in cleartext)"
 
 // Loop is the Schema for the loops API.
 type Loop struct {

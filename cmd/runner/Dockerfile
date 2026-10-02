@@ -10,7 +10,7 @@
 # runner/go.mod — the root module does not build it). The agent runs as the
 # platform non-root UID (65532, set by the operator's securityContext), so the
 # binary must be readable/executable by that UID (it is: 0755 root-owned).
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM golang:1.26 AS build
 WORKDIR /src
 # The runner is a separate module (runner/go.mod); the root go.mod does not
 # cover it. Copy the sources and build hermetically (GOFLAGS=-mod=mod so a

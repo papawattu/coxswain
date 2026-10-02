@@ -230,11 +230,13 @@ spec:
                     type: string
                   repo:
                     description: |-
-                      repo is the git URL to clone. Accepts HTTPS (`https://…`), SSH
-                      (`ssh://…`), and scp-style (`user@host:path`) remotes — go-git handles
-                      all three. Must be non-empty and match the pattern.
+                      repo is the git URL to clone. Accepts HTTPS (`https://…`), plain HTTP
+                      (`http://…`, for in-cluster git servers such as a kind Gitea dev
+                      fixture), SSH (`ssh://…`), and scp-style (`user@host:path`) remotes —
+                      the init container's git client handles all four. Must be non-empty and
+                      match the pattern.
                     minLength: 1
-                    pattern: ^(https://|ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:).+
+                    pattern: ^(https://|http://|ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:).+
                     type: string
                 required:
                 - repo
@@ -465,6 +467,12 @@ spec:
             names the Sandbox, and its Service if one is enabled)
           rule: self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$') && size(self.metadata.name)
             <= 55
+        - message: 'workspace.repo: plain http:// is only allowed for in-cluster hosts
+            (ending in .svc or .svc.cluster.local); use https:// for external hosts
+            (git credentials would be sent in cleartext)'
+          rule: '!has(self.spec.workspace.repo) || !self.spec.workspace.repo.startsWith(''http://'')
+            || (self.spec.workspace.repo.split(''http://'')[1].split(''/'')[0].split('':'')[0].endsWith(''.svc'')
+            || self.spec.workspace.repo.split(''http://'')[1].split(''/'')[0].split('':'')[0].endsWith(''.svc.cluster.local''))'
     served: true
     storage: true
     subresources:

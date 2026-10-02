@@ -385,3 +385,58 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(loop.Status.BaseCommit).To(Equal(s3BaseCommitSHA), "baseCommit is immutable once set (the Loop's base is pinned for its life)")
 	})
 })
+
+// S3 (review P1): plain http:// repo URLs are only allowed for in-cluster
+// hosts. A git credential Secret over plain http would leak in cleartext, so
+// the CRD XValidation rejects http://host that does not end in ".svc" or
+// ".svc.cluster.local". https:// and ssh:// are unrestricted.
+var _ = Describe("S3 workspace.repo http restriction (CRD admission)", func() {
+	ctx := context.Background()
+	// s3HTTPLoop builds a minimal Loop with only workspace.repo set (no model
+	// config, so no netpol expectation) — the shape the CRD XValidation sees.
+	s3HTTPLoop := func(name, ns, repo string) *coxv1alpha1.Loop {
+		return &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: repo},
+			},
+		}
+	}
+
+	It("rejects a plain http:// repo URL to an external host", func() {
+		ns := "s3-http-rej-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		l := s3HTTPLoop("httprej", ns, "http://evil.example.com/repo.git")
+		err := k8sClient.Create(ctx, l)
+		Expect(err).To(MatchError(ContainSubstring(".svc")))
+	})
+
+	It("accepts a plain http:// repo URL to an in-cluster host (.svc)", func() {
+		ns := "s3-http-ok-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		l := s3HTTPLoop("httpok", ns, "http://gitea.samples.svc:3000/samples/gocli.git")
+		Expect(k8sClient.Create(ctx, l)).To(Succeed())
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "httpok", Namespace: ns}, got)).To(Succeed())
+		Expect(got.Spec.Workspace.Repo).To(Equal("http://gitea.samples.svc:3000/samples/gocli.git"))
+	})
+
+	It("accepts a plain http:// repo URL to an in-cluster host (.svc.cluster.local)", func() {
+		ns := "s3-http-ok2-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		l := s3HTTPLoop("httpok2", ns, "http://gitea.samples.svc.cluster.local:3000/samples/gocli.git")
+		Expect(k8sClient.Create(ctx, l)).To(Succeed())
+	})
+
+	It("still accepts an https:// repo URL to an external host (unrestricted)", func() {
+		ns := "s3-http-https-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		l := s3HTTPLoop("httpsok", ns, "https://github.com/example/repo.git")
+		Expect(k8sClient.Create(ctx, l)).To(Succeed())
+	})
+})

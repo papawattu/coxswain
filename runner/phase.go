@@ -75,6 +75,12 @@ const (
 	PhasePlanning = "Planning"
 	// PhaseImplementing is the implementing phase (A3: model + shell loop).
 	PhaseImplementing = "Implementing"
+	// PhaseVerifying is the verifying phase — the runner never executes it
+	// (ADR-0005): verify evidence comes from the operator's isolated Job
+	// (B3). It is a desired-phase value the operator may write (the phase
+	// machine lands the Loop here); the runner recognizes it and idles until
+	// SIGTERM instead of exiting blocked (see PhaseRun).
+	PhaseVerifying = "Verifying"
 )
 
 // A1: the .coxswain filenames. Single source of truth for the operator
@@ -123,6 +129,13 @@ var claimWritePath = terminationLogPath
 // poll is a safety net for a slow init / a manual pod).
 const defaultPollInterval = 5 * time.Second
 
+// defaultIdleTimeout bounds the Verifying idle (PhaseRun blocks until SIGTERM
+// with a Verifying desired phase; this is only a safety net so a mis-set
+// desired phase cannot hold the container forever — the operator recreates
+// the sandbox from the Job's evidence and SIGTERMs the pod, and the pod has
+// no liveness probe that would kill a healthy idler).
+const defaultIdleTimeout = 24 * time.Hour
+
 // PhaseConfig is the input to PhaseRun. The model-loop fields mirror
 // runConfig (BaseURL/APIKey/Model/ExtraBody/MaxSteps/ShellTimeout/
 // ModelTimeout); the phase-driver fields are the workspace, the goal (the
@@ -148,6 +161,12 @@ type PhaseConfig struct {
 	// PollInterval is the desired-phase poll interval. Zero uses
 	// defaultPollInterval.
 	PollInterval time.Duration
+	// IdleTimeout bounds how long PhaseRun blocks when the desired phase is
+	// one the runner does not execute (Verifying is operator-owned, B3): a
+	// defensive bound so a mis-set desired phase cannot hold the container
+	// forever. The S3 production pod never hits it (SIGTERM arrives when the
+	// operator recreates the sandbox). Zero uses defaultIdleTimeout.
+	IdleTimeout time.Duration
 }
 
 // PhaseRun is the one-shot phase driver (S4). It waits for the operator's
@@ -188,6 +207,27 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		// or the operator never set one. No claim (a zero Result means
 		// "no phase executed"; cmd/main.go exits 0 on a stop with no phase —
 		// a deleted pod must not look like a blocked run).
+		return Result{}
+	}
+
+	// Verifying is operator-owned (ADR-0005): the verify evidence comes from
+	// the operator's isolated Job (B3, S5), never from the runner. With a
+	// Verifying desired phase the runner does NOT exit blocked (an exit would
+	// restart the one-shot container in a crash loop under restartPolicy
+	// Always, churning the pod and the operator's progress record): it logs
+	// once, makes no model call, and blocks until SIGTERM (bounded by
+	// IdleTimeout as a safety net) so the sandbox pod stays Running until the
+	// operator recreates it from the Job's evidence.
+	if phase == PhaseVerifying {
+		log.Printf("runner: desired-phase %q is operator-owned (B3); idling until the operator recreates the pod", phase)
+		idle := cfg.IdleTimeout
+		if idle <= 0 {
+			idle = defaultIdleTimeout
+		}
+		select {
+		case <-stop:
+		case <-time.After(idle):
+		}
 		return Result{}
 	}
 

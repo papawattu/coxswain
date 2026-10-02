@@ -386,6 +386,18 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded || loop.Status.Phase == coxv1alpha1.LoopPhaseFailed {
 		return false, false
 	}
+	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
+		// Verifying is evidence-gated (B3, S5): the runner does NOT execute
+		// Verifying (ADR-0005 — verify evidence comes from the operator's
+		// isolated Job, never the runner), so there is no runner claim to read
+		// at this phase. Hold here until the verify Job's evidence drives the
+		// transition (Verifying -> Succeeded | Implementing | Failed). Without
+		// this hold the reader would see the pod's crash-loop churn: the runner
+		// exits 1 with a blocked claim on every restart because desired-phase
+		// is Verifying, and the OS1 progress record would flap on every 5s
+		// requeue (a churn the kind run observed live).
+		return false, false
+	}
 	claim, cerr := r.resolvePhaseClaim(ctx, loop)
 	if cerr != nil {
 		// A malformed claim (the agent terminated without a valid

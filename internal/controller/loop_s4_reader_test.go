@@ -287,6 +287,26 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		primed, nn := primeReconcile(r, ns, "happylp")
 		Expect(primed.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning), "the bootstrap must leave the fresh Loop at Planning")
 
+		// Pin the baseCommit directly (the S3 init-container read-back is
+		// stubbed here; the spec asserts on the operator's pins in progress,
+		// not on the S3 read-back itself). The sandbox exists now (prime
+		// created it) but the stand-in pod is created by the spec — the pod
+		// must exist before its status is written.
+		ensureSandboxObject(ns, "happylp")
+		createStandinPod(ns, "happylp")
+		pinsLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, pinsLoop)).To(Succeed())
+		pinsLoop.Status.BaseCommit = s3BaseCommitSHA
+		Expect(k8sClient.Status().Update(ctx, pinsLoop)).To(Succeed())
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "happylp-sandbox", Namespace: ns}, pod)).To(Succeed())
+		terminated := int32(0)
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: terminated, Message: s3BaseCommitSHA}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
 		By("claim 1: the runner executed Planning (the claim names the CURRENT phase, status=success) — the completed phase advances one step")
 		loop := oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
@@ -478,5 +498,70 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		Expect(loop.Status.Progress.Iteration).To(Equal(3), "the claim's iteration rides into progress (OS1)")
 		Expect(loop.Status.Progress.ObservedGeneration).To(Equal(loop.Generation), "the generation pin is the operator's")
 		Expect(loop.Status.Progress.BaseCommit).To(Equal(s3BaseCommitSHA), "the baseCommit pin is the operator's (D10), never the claim's")
+	})
+
+	It("holds at Verifying: a runner claim (even {Verifying, success}) never changes phase or progress (Verifying is operator-owned, B3)", func() {
+		ns := "s4-verify-hold-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "vhlp")
+
+		// Pin the baseCommit directly (the S3 init-container read-back is
+		// stubbed here; without it the S3 requeue would mask the hold's
+		// zero-requeue assertion below). The sandbox exists now (prime
+		// created it) but the stand-in pod is created by the spec — the pod
+		// must exist before its status is written.
+		ensureSandboxObject(ns, "vhlp")
+		createStandinPod(ns, "vhlp")
+		pinsLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, pinsLoop)).To(Succeed())
+		pinsLoop.Status.BaseCommit = s3BaseCommitSHA
+		Expect(k8sClient.Status().Update(ctx, pinsLoop)).To(Succeed())
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "vhlp-sandbox", Namespace: ns}, pod)).To(Succeed())
+		terminated := int32(0)
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: terminated, Message: s3BaseCommitSHA}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// Drive the machine to Verifying: two one-shot success runs
+		// (Planning -> Implementing -> Verifying).
+		loop := oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		loop = oneShotRun(r, nn, coxv1alpha1.LoopPhaseImplementing, true)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "the machine must land at Verifying before the hold is asserted")
+		progressAtVerifying := loop.Status.Progress.DeepCopy()
+
+		// The stand-in claim: the live runner idles at a Verifying desired
+		// phase (no model call, no claim, exit on SIGTERM), but this spec
+		// proves the OPERATOR'S hold is independent of the runner's behavior —
+		// even a claim the operator would parse (a success claim naming
+		// Verifying, the shape a stale/mis-set pod could present) must not
+		// move the phase or rewrite progress.
+		ensureSandboxObject(ns, "vhlp")
+		createStandinPod(ns, "vhlp")
+		writeAgentTermination(ns, "vhlp", `{"observedPhase":"Verifying","status":"success","blockedReason":""}`)
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"at Verifying no runner claim advances the phase (the exit is evidence-gated, B3; S5)")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"a claim at Verifying must not touch status.observedPhase (the hold returns before any claim handling)")
+		Expect(loop.Status.Progress).To(Equal(progressAtVerifying),
+			"a claim at Verifying must not rewrite progress (no churn from the runner's crash-loop or a stale claim)")
+		Expect(res.RequeueAfter).To(BeZero(), "the Verifying hold must not requeue on a claim (the requeue belongs to the B3 verify Job)")
+		events := drainEvents(recorder)
+		Expect(events).NotTo(ContainElement(ContainSubstring(phaseAdvancedReason)), "no advance at Verifying -> no PhaseAdvanced Event")
 	})
 })

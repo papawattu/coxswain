@@ -149,41 +149,52 @@ func TestPhaseRunImplementingReportsImplementing(t *testing.T) {
 	}
 }
 
-func TestPhaseRunUnknownPhaseBlockedWithEcho(t *testing.T) {
+func TestPhaseRunVerifyingIdlesUntilStop(t *testing.T) {
 	fake := s4FakeModel()
 	defer fake.Close()
 	claimPath, cleanup := s4ClaimPath(t)
 	defer cleanup()
 
 	ws := t.TempDir()
-	// Verifying is operator-owned (ADR-0005): a desired-phase of Verifying is
-	// reported as blocked with the value ECHOED in observedPhase — a claim the
-	// operator can see, not a phase the runner executes.
+	// Verifying is operator-owned (ADR-0005 / B3): the runner must NOT exit
+	// blocked with it (an exit would crash-loop the one-shot container under
+	// restartPolicy Always). It logs, makes no model call, writes no claim,
+	// and blocks until stop (SIGTERM).
 	writeDesiredPhase(t, ws, "Verifying")
-	stop := make(chan any)
+	stop := make(chan any, 1)
 
-	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
-		PollInterval: 5 * time.Millisecond}, stop)
+	done := make(chan Result, 1)
+	go func() {
+		res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+			PollInterval: 5 * time.Millisecond, IdleTimeout: time.Hour}, stop)
+		done <- res
+	}()
 
-	if res.Status != statusBlocked {
-		t.Fatalf("unknown phase: status = %q, want %q", res.Status, statusBlocked)
+	select {
+	case <-done:
+		t.Fatal("PhaseRun returned before stop with a Verifying desired phase (it must idle until SIGTERM)")
+	case <-time.After(200 * time.Millisecond):
 	}
-	if res.ObservedPhase != "Verifying" {
-		t.Fatalf("unknown phase: observedPhase = %q, want the value echoed (\"Verifying\")", res.ObservedPhase)
+	stop <- struct{}{}
+
+	select {
+	case res := <-done:
+		if res.Status != "" {
+			t.Fatalf("idler returned a claim (status=%q); want a zero Result (no phase executed)", res.Status)
+		}
+		if res.ObservedPhase != "" {
+			t.Fatalf("idler returned observedPhase=%q; want empty (no claim)", res.ObservedPhase)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PhaseRun did not return after stop (SIGTERM must break the idle)")
 	}
-	if !strings.Contains(res.Summary, "Verifying") {
-		t.Fatalf("unknown phase: summary = %q, want it to name the unknown phase (result.json's reason)", res.Summary)
-	}
-	claim := parseClaim(t, claimPath)
-	if claim["observedPhase"] != "Verifying" {
-		t.Fatalf("claim observedPhase = %v, want the value echoed", claim["observedPhase"])
-	}
-	if claim["status"] != statusBlocked {
-		t.Fatalf("claim status = %v, want %q", claim["status"], statusBlocked)
-	}
-	// No model call (the runner does not execute an unknown phase).
+	// No model call and no claim (the operator owns Verifying; the Job, not
+	// the runner, produces the verify evidence).
 	if len(fake.Requests) != 0 {
-		t.Fatalf("an unknown phase must not drive the model (%d requests)", len(fake.Requests))
+		t.Fatalf("a Verifying desired phase must not drive the model (%d requests)", len(fake.Requests))
+	}
+	if _, err := os.Stat(claimPath); !os.IsNotExist(err) {
+		t.Fatalf("the idler must not write a claim (claim path %s, stat err %v)", claimPath, err)
 	}
 }
 

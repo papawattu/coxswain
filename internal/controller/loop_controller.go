@@ -196,7 +196,8 @@ type LoopReconciler struct {
 	// WorkspaceGitImage is the trusted image the workspace init container runs
 	// (S3a, GAP 1): it must carry git. The operator selects it via
 	// --workspace-git-image so the operator (not the agent's image) controls
-	// the clone. Defaults to alpine/git.
+	// the clone. Defaults to a PINNED alpine/git release (this container
+	// handles the credential, so a moving :latest tag is not acceptable).
 	WorkspaceGitImage string
 	// RunnerImage is the image the operator recognises as the runner (S3b).
 	// When spec.agent.image is EMPTY or equals RunnerImage, the agent
@@ -2595,7 +2596,7 @@ func (r *LoopReconciler) workspaceGitImage() string {
 	if r.WorkspaceGitImage != "" {
 		return r.WorkspaceGitImage
 	}
-	return "docker.io/library/alpine/git"
+	return "docker.io/alpine/git:v2.54.0"
 }
 
 // workspaceInitContainer builds the sandbox pod's workspace init container
@@ -2650,6 +2651,11 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	}
 	// GIT_TERMINAL_PROMPT=0: never prompt (the init container has no TTY; a
 	// missing credential must fail the clone, not hang).
+	// safe.directory=/workspace: the emptyDir volume is owned by root (or an
+	// arbitrary uid) while the init container runs as 65532; without this git
+	// refuses the repo with 'detected dubious ownership' (no config-file write
+	// needed — the per-command -c is honoured on every invocation).
+	safeDir := "-c safe.directory=/workspace"
 	script := `#!/bin/sh
 set -eu
 export GIT_TERMINAL_PROMPT=0
@@ -2662,15 +2668,15 @@ if [ -d "${DEST}/.git" ]; then
   # Idempotent: the pod is recreated per Loop (fresh emptyDir), but tolerate a
   # re-run on the same volume without re-cloning.
   cd "${DEST}"
-  git rev-parse --verify HEAD >/dev/null 2>&1 || git checkout "${REF}"
+  git ` + safeDir + ` rev-parse --verify HEAD >/dev/null 2>&1 || git ` + safeDir + ` checkout "${REF}"
 else
-  git init "${DEST}"
-  git -C "${DEST}" remote add origin "${REPO}"
-  git -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + credOpt + ` fetch origin "${REF}"
-  git -C "${DEST}" checkout --detach FETCH_HEAD
+  git ` + safeDir + ` init "${DEST}"
+  git -C "${DEST}" ` + safeDir + ` remote add origin "${REPO}"
+  git -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + credOpt + ` ` + safeDir + ` fetch origin "${REF}"
+  git -C "${DEST}" ` + safeDir + ` checkout --detach FETCH_HEAD
 fi
 mkdir -p "${DEST}/.coxswain"
-git -C "${DEST}" rev-parse HEAD > "${DEST}/.coxswain/base-commit"
+git -C "${DEST}" ` + safeDir + ` rev-parse HEAD > "${DEST}/.coxswain/base-commit"
 echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
 `
 	nonRootUID := int64(65532)

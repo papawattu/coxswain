@@ -120,9 +120,10 @@ func main() {
 	// spec.workspace.repo (it must carry git + sh). The operator selects it so
 	// the agent's image never controls the clone.
 	var workspaceGitImage string
-	flag.StringVar(&workspaceGitImage, "workspace-git-image", "docker.io/library/alpine/git",
+	flag.StringVar(&workspaceGitImage, "workspace-git-image", "docker.io/alpine/git:v2.54.0",
 		"The image the sandbox pod's workspace init container runs to clone the Loop's workspace repo. "+
-			"Must carry git and sh. Default: docker.io/library/alpine/git.")
+			"Must carry git and sh. Default: docker.io/alpine/git:v2.54.0 (pinned release — the init "+
+			"container handles the git credential, so a moving :latest tag is not acceptable).")
 	// S3b (GAP 1): the image the operator recognises as the runner. When
 	// spec.agent.image is empty or equals this, the agent container's Command is
 	// the runner's entrypoint; any other image keeps 'sleep infinity'.

@@ -170,12 +170,40 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 
 		By("building a workspace init container on the trusted git image")
 		init := s3Init(sb)
-		Expect(init.Image).To(Equal("docker.io/library/alpine/git"), "the init container must run the operator's --workspace-git-image default")
+		// The default is a PINNED release, not :latest: this container handles
+		// the git credential, so the operator's default must not move out from
+		// under a deployed cluster.
+		Expect(init.Image).To(Equal("docker.io/alpine/git:v2.54.0"), "the init container must run the operator's pinned --workspace-git-image default")
 		// The init container clones and writes baseCommitFile: its command must
 		// reference the repo and the base-commit file (the mutation-check target).
 		cmd := strings.Join(init.Command, " ")
 		Expect(cmd).To(ContainSubstring("base-commit"), "the init container must write baseCommitFile")
 		Expect(cmd).To(ContainSubstring("git"), "the init container must run git")
+
+		By("guarding every git invocation with safe.directory=/workspace (dubious ownership)")
+		// The emptyDir volume's owner can differ from the init container's UID
+		// (65532); without safe.directory git aborts with 'detected dubious
+		// ownership in repository'. The flag is passed per command (no config
+		// file write) and must precede EVERY git invocation in the script.
+		// The sh script is init.Command[2]; scan its lines only (not the whole
+		// command join) so test/source text cannot match the pattern.
+		Expect(init.Command).To(HaveLen(3), "the init container must run /bin/sh -c <script>")
+		script := init.Command[2]
+		gitLines := 0
+		for line := range strings.SplitSeq(script, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "#") { // skip sh comments
+				continue
+			}
+			if strings.Contains(line, " git ") || strings.HasSuffix(trimmed, "git") {
+				gitLines++
+				Expect(line).To(ContainSubstring("-c safe.directory=/workspace"),
+					"every git invocation must pass -c safe.directory=/workspace: "+line)
+			}
+		}
+		// Fresh-clone path: init, remote add, fetch, checkout + the trailing
+		// rev-parse (the idempotent re-run path adds one more rev-parse/checkout).
+		Expect(gitLines).To(BeNumerically(">=", 5), "the init script's git invocations (init, remote add, fetch, checkout, rev-parse) are all guarded")
 
 		By("mounting the credential Secret into the init container ONLY (ADR-0006)")
 		Expect(s3HasMount(init, workspaceCredsVolume)).To(BeTrue(), "the init container must mount the git credential Secret")

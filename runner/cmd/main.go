@@ -45,7 +45,8 @@ import (
 
 func main() {
 	maxSteps := flag.Int("max-steps", 0, "cap on model rounds (0 = the runner default)")
-	extraBody := flag.String("extra-body", "", "JSON object merged into every chat-completions request body (server tuning knobs, e.g. Qwen's chat_template_kwargs)")
+	extraBody := flag.String("extra-body", "",
+		"JSON object merged into every chat-completions request body (server tuning knobs)")
 	flag.Parse()
 
 	var extra map[string]any

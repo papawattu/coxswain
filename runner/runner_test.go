@@ -34,7 +34,7 @@ func TestRunnerWritesSuccessResult(t *testing.T) {
 		Model:     fakeModelName,
 	})
 
-	if res.Status != "success" {
+	if res.Status != statusSuccess {
 		t.Fatalf("status = %q, want success", res.Status)
 	}
 	if res.Summary == "" {
@@ -74,7 +74,7 @@ func TestRunnerExtraBodyMergedIntoRequests(t *testing.T) {
 			"max_tokens":           200,
 		},
 	})
-	if res.Status != "success" {
+	if res.Status != statusSuccess {
 		t.Fatalf("status = %q, want success", res.Status)
 	}
 
@@ -87,7 +87,7 @@ func TestRunnerExtraBodyMergedIntoRequests(t *testing.T) {
 			t.Fatalf("request %d: bad JSON: %v", i, err)
 		}
 		if m["model"] != fakeModelName {
-			t.Fatalf("request %d: model = %v, want %q (ExtraBody must not clobber standard fields)", i, m["model"], fakeModelName)
+			t.Fatalf("request %d: model = %v, want %q (ExtraBody must not clobber standard)", i, m["model"], fakeModelName)
 		}
 		if _, ok := m["messages"]; !ok {
 			t.Fatalf("request %d: messages missing", i)
@@ -134,8 +134,9 @@ func TestRunnerPostsV1ChatCompletionsPath(t *testing.T) {
 		BaseURL:   fake.URL,
 		Model:     fakeModelName,
 	})
-	if res.Status != "success" {
-		t.Fatalf("status = %q (verificationNotes: %s), want success — the runner must POST /v1/chat/completions", res.Status, res.VerificationNotes)
+	if res.Status != statusSuccess {
+		t.Fatalf("status = %q (verificationNotes: %s), want success — "+
+			"the runner must POST /v1/chat/completions", res.Status, res.VerificationNotes)
 	}
 	if res.Summary == "" {
 		t.Fatalf("summary empty, want non-empty")

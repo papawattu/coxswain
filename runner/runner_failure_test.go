@@ -30,7 +30,7 @@ func TestRunnerWritesBlockedResultOnModelFailure(t *testing.T) {
 	if err := json.Unmarshal(data, &res); err != nil {
 		t.Fatalf("result.json malformed: %v", err)
 	}
-	if res.Status == "success" {
+	if res.Status == statusSuccess {
 		t.Fatalf("status = success after the model was unreachable; want blocked. trace=%v", res.ToolTrace)
 	}
 	if res.Status != "blocked" {

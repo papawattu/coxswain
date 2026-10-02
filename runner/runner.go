@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -294,15 +295,12 @@ func callModel(
 		if err := json.Unmarshal(reqBody, &m); err != nil {
 			return assistantMessage{}, err
 		}
-		for k, v := range extraBody {
-			m[k] = v
-		}
+		maps.Copy(m, extraBody)
 		reqBody, err = json.Marshal(m)
 		if err != nil {
 			return assistantMessage{}, err
 		}
 	}
-
 
 	// S3: the OpenAI-compatible path is /v1/chat/completions (vLLM serves its
 	// API under /v1; the model proxy is a transparent reverse proxy and does

@@ -13,6 +13,8 @@ import (
 // 2026-10-02). This pins the round-trip shape the runner marshals: a parsed
 // assistant tool call echoed back into history must carry type=function, and
 // the tool result message must carry role=tool + tool_call_id.
+const testToolCallID = "call_abc123"
+
 func TestToolCallRoundTripMarshalsTypeFunction(t *testing.T) {
 	// (1) the response decode: a vLLM/OpenAI tool-call response with NO type
 	// field on the tool call (the response schema does not require it).
@@ -44,8 +46,8 @@ func TestToolCallRoundTripMarshalsTypeFunction(t *testing.T) {
 	}
 	msg := parsed.Choices[0].Message
 	tc := msg.ToolCalls[0]
-	if tc.ID != "call_abc123" {
-		t.Fatalf("tool call id = %q, want call_abc123", tc.ID)
+	if tc.ID != testToolCallID {
+		t.Fatalf("tool call id = %q, want %s", tc.ID, testToolCallID)
 	}
 	if tc.Function.Name != toolNameShell {
 		t.Fatalf("tool call name = %q, want %q", tc.Function.Name, toolNameShell)
@@ -80,7 +82,7 @@ func TestToolCallRoundTripMarshalsTypeFunction(t *testing.T) {
 	if tm["type"] != "function" {
 		t.Fatalf("tool_calls[0].type = %v, want \"function\" (vLLM 400s without it); raw=%s", tm["type"], raw)
 	}
-	if tm["id"] != "call_abc123" {
+	if tm["id"] != testToolCallID {
 		t.Fatalf("tool_calls[0].id = %v", tm["id"])
 	}
 	fn, _ := tm["function"].(map[string]any)
@@ -105,7 +107,7 @@ func TestToolCallRoundTripMarshalsTypeFunction(t *testing.T) {
 	if rm["role"] != "tool" {
 		t.Fatalf("result role = %v, want tool", rm["role"])
 	}
-	if rm["tool_call_id"] != "call_abc123" {
-		t.Fatalf("result tool_call_id = %v, want call_abc123", rm["tool_call_id"])
+	if rm["tool_call_id"] != testToolCallID {
+		t.Fatalf("result tool_call_id = %v, want %s", rm["tool_call_id"], testToolCallID)
 	}
 }

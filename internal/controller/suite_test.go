@@ -116,8 +116,9 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
 
-	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	k8sClientRaw, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
+	k8sClient = NewReadfileClient(k8sClientRaw)
 	Expect(k8sClient).NotTo(BeNil())
 
 	// Set up a cache scoped to Loops only, with the spec.policyRefs field

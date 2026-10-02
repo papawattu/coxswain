@@ -168,15 +168,14 @@ type LoopReconciler struct {
 	Recorder record.EventRecorder
 
 	// S3a: the baseCommit read-back seam. The operator reads the file the
-	// workspace init container wrote on the sandbox pod via the kubelet. In a
-	// real deployment this is the REST client's ReadFile (the controller-runtime
-	// concrete client exposes it even though the client.Client interface does
-	// name it); SetupWithManager wires it from the manager's client. A test
-	// overrides r.readFile directly (an unexported field, settable from the
-	// controller test package) to simulate the init container having written
-	// baseCommitFile. nil (most envtests) = the baseCommit read is skipped
-	// (the Loop's baseCommit stays empty until a real read is wired) —
-	// matching a pod whose init container has not written the file yet.
+	// workspace init container wrote on the sandbox pod via the kubelet
+	// (the controller-runtime client's ReadFile, which is NOT on the
+	// client.Client interface). SetupWithManager wires it when the manager's
+	// client exposes ReadFile, and a test overrides r.readFile directly
+	// (an unexported field, settable from the controller test package).
+	// When nil the baseCommit read is skipped and the Loop's baseCommit
+	// stays empty (matching a pod whose init container has not written the
+	// file yet).
 	readFile func(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error)
 
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
@@ -2781,6 +2780,19 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}); ok {
 			r.readFile = rc.ReadFile
 		}
+	}
+	// The controller MUST be able to read the baseCommit file back from the
+	// sandbox pod (S3a). When the seam could not be wired (the manager's
+	// client does not expose ReadFile), every baseCommit read would silently
+	// skip and status.baseCommit would stay empty forever (observed live on
+	// kind 2026-10-02: the init container wrote the file, the pod was Ready,
+	// and no reconcile ever populated status.baseCommit — the read path was
+	// dead because the type assertion above never succeeded). Fail fast at
+	// startup instead: the baseCommit is the operator's own evidence (the
+	// init container's output, ADR-0004) and the TamperedVerify diff depends
+	// on it (ADR-0005 D10).
+	if r.readFile == nil {
+		return errors.New("loop controller: could not wire the baseCommit read-back seam (r.readFile); the manager's client does not expose ReadFile — the operator cannot record status.baseCommit")
 	}
 	// I42e + I42c: read the cluster's pod/service CIDRs from the environment
 	// (set at deployment, e.g. kind/k3s exposes these as --pod-network-cidr /

@@ -650,21 +650,22 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(err).NotTo(HaveOccurred())
 		Expect(res.RequeueAfter).To(BeNumerically(">=", time.Second), "while baseCommit is pending the operator must requeue")
 
-		By("stopping the requeue once the init container terminates with a SHA")
+		By("recording baseCommit once the init container terminates with a SHA")
 		terminated := int32(0)
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
 			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: terminated, Message: s3BaseCommitSHA}}},
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-		res, err = r.Reconcile(ctx, req)
+		_, err = r.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, req.NamespacedName, got)).To(Succeed())
 		Expect(got.Status.BaseCommit).To(Equal(s3BaseCommitSHA), "once the init container terminates with a SHA, baseCommit is recorded")
-		// Note: RequeueAfter is 5s (the S4 claim reader requeues while the
-		// one-shot runner has not terminated). The spec asserts on baseCommit,
-		// not on the requeue (which is expected behavior with the S4 claim reader
-		// active).
+		By("bounded: a re-reconcile with baseCommit set does NOT change it")
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, got)).To(Succeed())
+		Expect(got.Status.BaseCommit).To(Equal(s3BaseCommitSHA), "baseCommit is immutable once set (the bounded S3 property)")
 	})
 
 	It("rejects a non-SHA init container termination message", func() {
@@ -689,19 +690,21 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}
 
-		By("failing the read-back on a non-SHA termination message and NOT requeueing (bounded)")
+		By("failing the read-back on a non-SHA termination message (bounded)")
 		// The init container terminated with a non-SHA message: the read-back
-		// fails (done=true, err). The requeue is BOUNDED — it stops once the
-		// init has terminated (a permanently-failed init would not change on a
-		// requeue; the sandbox stays init-failed until the pod is recreated).
+		// fails. The requeue is BOUNDED — it stops once the init has
+		// terminated (a permanently-failed init would not change on a requeue;
+		// the sandbox stays init-failed until the pod is recreated).
 		_, err := r.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
-		// Note: RequeueAfter is 5s (the S4 claim reader requeues while the
-		// one-shot runner has not terminated). The spec asserts on baseCommit
-		// (which must stay empty for a non-SHA message), not on the requeue.
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, req.NamespacedName, got)).To(Succeed())
 		Expect(got.Status.BaseCommit).To(BeEmpty(), "baseCommit must stay empty when the termination message is not a commit SHA")
+		By("bounded: a re-reconcile with a non-SHA init does NOT change baseCommit")
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, got)).To(Succeed())
+		Expect(got.Status.BaseCommit).To(BeEmpty(), "baseCommit stays empty after a re-reconcile (the bounded S3 property)")
 	})
 
 	It("mutation-check: the read-back MUST use the APIReader path, not the cached client", func() {

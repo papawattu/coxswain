@@ -84,7 +84,9 @@ var _ = Describe("S4: claim reader mutation checks (I43)", func() {
 	It("mutation-check: a cached-client read (the pod is NOT in the manager's Pod cache) must leave the claim unread", func() {
 		ns := "s4-mut-cache-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		// The mutation under test: the reader resolves the pod through the
 		// manager's CACHED client. In a live deployment the sandbox pod is NOT
@@ -127,7 +129,9 @@ var _ = Describe("S4: claim reader mutation checks (I43)", func() {
 	It("mutation-check: a denying PhaseGate must hold the advance (recorded, not acted on)", func() {
 		ns := "s4-mut-gate-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		// The mutation under test: the OS8 gate DENIES the advance (a future
 		// approval hold plugs in here). The live build ships autoApprovePhaseGate

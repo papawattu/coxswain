@@ -281,10 +281,6 @@ type LoopReconciler struct {
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
-// S4 (ADR-0004): the operator reads the agent container's termination message
-// (the runner's claim) via the pod's status — pods/status needs only 'get' on
-// the pod resource (already granted above), so NO new RBAC rule is required.
-// +kubebuilder:rbac:groups="",resources=pods/status,verbs=get
 // D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // D38: the operator emits a Kubernetes Event on every Loop when its
@@ -418,99 +414,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// observability only. The iterate/terminal branches (Verifying ->
 	// Implementing / Failed) are completed by B3 (verify outcome) and B4
 	// (iteration count). See internal/controller/loop_s4_phase.go.
-	claimReadPending := false
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded && loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
-		claim, cerr := r.resolvePhaseClaim(ctx, &loop)
-		if cerr != nil {
-			// A malformed claim (the agent terminated without a valid
-			// termination message): log and requeue. ADR-0005 fail-closed — a
-			// malformed claim is NOT a phase completion and never gates. The
-			// container stays Terminated so the retry is cheap and the message is
-			// stable until the pod is recreated.
-			logf.FromContext(ctx).Error(cerr, "phase claim read failed; requeueing",
-				"loop", loop.Name)
-			claimReadPending = true
-		} else if claim != nil {
-			now := metav1.Now()
-			fromPhase := loop.Status.Phase
-			c, advanced := r.recordPhaseClaim(&loop, claim, now)
-			changed = changed || c
-			if advanced {
-				// OS5: emit a Kubernetes Event on the phase transition (a stable
-				// reason, PhaseAdvanced; nil Recorder = most envtests skip it).
-				// Pass the OLD phase (before the advance) so the event message
-				// reads "phase advanced Implementing -> Verifying".
-				r.emitPhaseAdvancedEvent(&loop, fromPhase)
-				// The phase advanced: status.desiredPhase changed. The NEXT
-				// reconcile's ensureSandbox sees the annotation mismatch and
-				// deletes the Sandbox (the one-shot runner re-runs for the new
-				// phase). No inline recycle here — the annotation is the seam.
-			}
-		} else {
-			// claim == nil && cerr == nil: the agent has not terminated yet
-			// (the phase is still executing, or the pod/agent has no status yet):
-			// requeue so the operator re-reads once the one-shot runner exits.
-			// A sandbox pod change does not trigger a reconcile on its own, so
-			// the timer is what drives the retry (the baseCommit requeue pattern).
-			claimReadPending = true
-		}
-	}
-	// B1 seam: if the claim reader found nothing (claim == nil) and
-	// status.observedPhase is set (a direct status update, not a claim),
-	// the operator advances the phase machine using the pure nextPhase
-	// logic. This is the seam the B1 envtests exercise (they set
-	// status.observedPhase directly, bypassing the claim reader). When the
-	// B1 seam handles the advance (or the non-advance), it clears
-	// claimReadPending so the operator does NOT requeue for a claim that
-	// was never expected (the B1 seam is a direct status update, not a
-	// one-shot runner termination message).
-	if claimReadPending && loop.Status.ObservedPhase != "" && loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded && loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
-		fromPhase := loop.Status.Phase
-		c, advanced := r.recordPhaseClaim(&loop, &PhaseClaim{ObservedPhase: loop.Status.ObservedPhase}, metav1.Now())
-		changed = changed || c
-		if advanced {
-			logf.FromContext(ctx).Info("phase advanced (B1 seam: status.observedPhase)", "loop", loop.Name, "from", fromPhase, "to", loop.Status.Phase)
-			r.emitPhaseAdvancedEvent(&loop, fromPhase)
-		}
-	}
+	claimReadPending, s4Changed := r.advancePhaseFromClaim(ctx, &loop)
+	changed = changed || s4Changed
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
-	// gate.
-	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
-	// gate. tamperVerdict is a tri-state over the operator's evidence (a pointer
-	// to the terminated tamper init container's exit code + the verifiedCommit
-	// it names), and never reads the runner's result.json claim:
-	//   - TamperTampered -> Failed:TamperedVerify, TERMINAL, before any check
-	//     runs (the anti-gaming property: a runner that edited a protected file
-	//     and reported success still ends Failed).
-	//   - TamperClean    -> not a B2 decision; B3's check containers decide the
-	//     outcome from there.
-	//   - TamperUnknown  -> no evidence (nil, or stale for a different
-	//     verifiedCommit/Job); NEVER treated as clean (D24 fail-closed), so the
-	//     Loop stays in Verifying and B3 cannot reach Succeeded on it.
-	// In envtest the B-slice tests set status.verify.* directly (no Job
-	// controller); in a real cluster B3 reads the tamper exit code from the
-	// verify Job pod's initContainerStatuses.
-	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying && loop.Status.Verify != nil {
-		// The operator's CURRENT verified commit is the one it pinned on entering
-		// Verifying (status.currentVerify.verifiedCommit, D11) — never the
-		// evidence's own commit (D27: passing the evidence's commit as both args
-		// made the stale guard a no-op in prod). The evidence's verifiedCommit
-		// (status.verify.verifiedCommit) is what the evidence NAMES. A mismatch
-		// between the two, or an empty pin, makes tamperVerdict return Unknown
-		// (fail-closed), so leftover evidence from a previous iteration's Job or a
-		// force-pushed branch cannot be reused to reach Succeeded.
-		v := loop.Status.Verify
-		var currentCommit string
-		if loop.Status.CurrentVerify != nil {
-			currentCommit = loop.Status.CurrentVerify.VerifiedCommit
-		}
-		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
-			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
-				"a protected path changed between baseCommit and verifiedCommit; terminal")
-			changed = true
-		}
-	}
+	// gate (see applyTamperGate for the tri-state logic).
+	changed = changed || r.applyTamperGate(&loop)
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references
 	// (spec.policyRefs[]). The operator computes the hash and stores it in
@@ -689,6 +597,48 @@ func isCommitSHA(s string) bool {
 // was applied (false when policyRefs is empty — the default-deny minimum). A
 // referenced AgentPolicy that does not exist is an error (the operator must not
 // silently run an agent with a narrower policy than the Loop declared).
+// applyTamperGate (B2, D10/D24) applies the tamper-evidence gate at Verifying.
+// tamperVerdict is a tri-state over the operator's evidence (a pointer to the
+// terminated tamper init container's exit code + the verifiedCommit it names),
+// and never reads the runner's result.json claim:
+//   - TamperTampered -> Failed:TamperedVerify, TERMINAL, before any check
+//     runs (the anti-gaming property: a runner that edited a protected file
+//     and reported success still ends Failed).
+//   - TamperClean    -> not a B2 decision; B3's check containers decide the
+//     outcome from there.
+//   - TamperUnknown  -> no evidence (nil, or stale for a different
+//     verifiedCommit/Job); NEVER treated as clean (D24 fail-closed), so the
+//     Loop stays in Verifying and B3 cannot reach Succeeded on it.
+//
+// In envtest the B-slice tests set status.verify.* directly (no Job
+// controller); in a real cluster B3 reads the tamper exit code from the
+// verify Job pod's initContainerStatuses.
+func (r *LoopReconciler) applyTamperGate(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loop.Status.Verify == nil {
+		return false
+	}
+	// The operator's CURRENT verified commit is the one it pinned on entering
+	// Verifying (status.currentVerify.verifiedCommit, D11) — never the
+	// evidence's own commit (D27: passing the evidence's commit as both args
+	// made the stale guard a no-op in prod). The evidence's verifiedCommit
+	// (status.verify.verifiedCommit) is what the evidence NAMES. A mismatch
+	// between the two, or an empty pin, makes tamperVerdict return Unknown
+	// (fail-closed), so leftover evidence from a previous iteration's Job or a
+	// force-pushed branch cannot be reused to reach Succeeded.
+	v := loop.Status.Verify
+	var currentCommit string
+	if loop.Status.CurrentVerify != nil {
+		currentCommit = loop.Status.CurrentVerify.VerifiedCommit
+	}
+	if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
+			"a protected path changed between baseCommit and verifiedCommit; terminal")
+		return true
+	}
+	return false
+}
+
 func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
 	if len(loop.Spec.PolicyRefs) == 0 {
 		return "", false, nil

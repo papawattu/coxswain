@@ -70,6 +70,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // agentContainerNameS4 is the sandbox pod's agent container name (the claim
@@ -342,4 +343,55 @@ func progressEqual(a, b *coxv1alpha1.ProgressStatus) bool {
 		return false
 	}
 	return a.ObservedGeneration == b.ObservedGeneration && a.BaseCommit == b.BaseCommit
+}
+
+// advancePhaseFromClaim (S4) reads the runner's ADR-0004 claim from the
+// sandbox pod's termination message (or the B1 seam's status.observedPhase)
+// and advances the phase machine. Returns (claimReadPending, changed):
+// claimReadPending is true when the operator must requeue (the claim reader
+// found nothing or a malformed claim); changed is true when the Loop's status
+// was mutated (progress record or phase advance).
+func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
+	claimReadPending := false
+	changed := false
+	if loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded || loop.Status.Phase == coxv1alpha1.LoopPhaseFailed {
+		return false, false
+	}
+	claim, cerr := r.resolvePhaseClaim(ctx, loop)
+	if cerr != nil {
+		// A malformed claim (the agent terminated without a valid
+		// termination message): log and requeue. ADR-0005 fail-closed — a
+		// malformed claim is NOT a phase completion and never gates.
+		logf.FromContext(ctx).Error(cerr, "phase claim read failed; requeueing",
+			"loop", loop.Name)
+		claimReadPending = true
+	} else if claim != nil {
+		now := metav1.Now()
+		fromPhase := loop.Status.Phase
+		c, advanced := r.recordPhaseClaim(loop, claim, now)
+		changed = changed || c
+		if advanced {
+			r.emitPhaseAdvancedEvent(loop, fromPhase)
+		}
+	} else {
+		// claim == nil && cerr == nil: the agent has not terminated yet.
+		claimReadPending = true
+	}
+	// B1 seam: if the claim reader found nothing and status.observedPhase is
+	// set (a direct status update, not a claim), the operator advances the
+	// phase machine using the pure nextPhase logic. This is the seam the B1
+	// envtests exercise (they set status.observedPhase directly, bypassing the
+	// claim reader).
+	if claimReadPending && loop.Status.ObservedPhase != "" &&
+		loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded && loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
+		fromPhase := loop.Status.Phase
+		c, advanced := r.recordPhaseClaim(loop, &PhaseClaim{ObservedPhase: loop.Status.ObservedPhase}, metav1.Now())
+		changed = changed || c
+		if advanced {
+			logf.FromContext(ctx).Info("phase advanced (B1 seam: status.observedPhase)",
+				"loop", loop.Name, "from", fromPhase, "to", loop.Status.Phase)
+			r.emitPhaseAdvancedEvent(loop, fromPhase)
+		}
+	}
+	return claimReadPending, changed
 }

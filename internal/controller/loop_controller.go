@@ -23,10 +23,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net"
-	"net/http"
 	netip "net/netip"
 	neturl "net/url"
 	"os"
@@ -51,7 +49,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -97,12 +94,6 @@ const (
 	// (S3a, ADR-0006). It is mounted into the init container ONLY — the agent
 	// never sees git credentials (zero credentials in the agent).
 	workspaceCredsVolume = "workspace-creds"
-	// baseCommitFile is where the init container writes the resolved commit
-	// SHA (S3a): a file on the 'workspace' emptyDir the operator reads back
-	// (k8sClient.ReadFile) and pins to status.baseCommit (immutable once set,
-	// ADR-0005 D10). The file lives under /workspace/.coxswain so it is
-	// separated from the repo contents the agent sees.
-	baseCommitFile = "/workspace/.coxswain/base-commit"
 	// workspaceVolumeName is the name of the sandbox pod's 'workspace'
 	// emptyDir volume (S3a): shared by the agent and the workspace init
 	// container, which clones spec.workspace.repo into it. One constant so the
@@ -138,6 +129,15 @@ const (
 type LoopReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// apiReader is the operator's non-cached client (mgr.GetAPIReader()), used
+	// for the baseCommit read-back (S3a): the sandbox pod is not in the
+	// manager's Pod cache (the cache is scoped to ProxyComponentSelector), so
+	// a cached Get returns NotFound and the read-back silently skips. The
+	// APIReader hits the API server directly, so the pod's init container
+	// termination message is always readable. nil (a bare test reconciler
+	// without SetupWithManager) falls back to the cached client for the Get.
+	apiReader client.Reader
 
 	// Enforcer is the eBPF engine seam (ADR-0007 Q3/D30). When set, the operator
 	// emits the Loop's effective policy through the engine and gates the sandbox
@@ -180,16 +180,17 @@ type LoopReconciler struct {
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
-	// S3a: the baseCommit read-back seam. The operator reads the file the
-	// workspace init container wrote on the sandbox pod via the kubelet
-	// (the controller-runtime client's ReadFile, which is NOT on the
-	// client.Client interface). SetupWithManager wires it when the manager's
-	// client exposes ReadFile, and a test overrides r.readFile directly
-	// (an unexported field, settable from the controller test package).
-	// When nil the baseCommit read is skipped and the Loop's baseCommit
-	// stays empty (matching a pod whose init container has not written the
-	// file yet).
-	readFile func(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error)
+	// readBaseCommit is the baseCommit read-back seam (S3a). The default
+	// (nil) reads the sandbox pod's init container termination message via
+	// the operator's APIReader path (a real, non-cached client) and validates
+	// it as a 40-hex commit SHA. The S3a envtest suite overrides the field
+	// directly to simulate a pod. When the field is non-nil, the caller
+	// invokes the field; when nil, it invokes the method (the real APIReader
+	// path). A non-SHA message (or absent pod/init) is NOT an error — the
+	// init container may not have terminated yet, so return ("", false, nil)
+	// and let the caller requeue. A real read failure (e.g. the pod vanished
+	// mid-reconcile) IS an error (the caller logs and requeues).
+	readBaseCommit func(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error)
 
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
@@ -420,25 +421,50 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
-	// container writes the resolved commit SHA to baseCommitFile on the sandbox
-	// pod's 'workspace' volume; the operator reads it back through the kubelet
-	// (r.readFile, wired in SetupWithManager) and pins it to status.baseCommit.
-	// This is the
-	// operator's OWN evidence (a file written by a trusted init container it
-	// configured, read back by the operator) — not a runner claim (ADR-0004),
-	// and it feeds the TamperedVerify diff (ADR-0005 D10). Immutable once set
-	// (the Loop's base is pinned for its life): only set when empty. Only when
-	// the Loop declares a repo (a repo-less Loop has no clone, hence no base).
-	// A read failure is logged and retried on the next reconcile — it never
-	// fails the whole reconcile (a transient kubelet read error must not wedge
-	// the Loop), and baseCommit simply stays empty until the clone lands.
+	// container's termination message (read via the operator's own APIReader
+	// path — NOT a cached client, NOT a kubelet ReadFile) carries the resolved
+	// commit SHA; a non-SHA message (e.g. 'no base commit') means the clone
+	// failed and the read-back must fail. The reconciler reads the pod and
+	// validates the SHA.
+	//
+	// baseCommitPending drives the RequeueAfter: spec.workspace.repo != '' and
+	// baseCommit is empty and the init has not yet terminated. Once set
+	// (immutable, ADR-0005 D10) or the init failed (terminated) the timer
+	// stops. The requeue is applied in the FINAL return (below the
+	// Status().Update), so a pending baseCommit never skips persisting other
+	// status changes from this reconcile (e.g. the I42b EgressProxyConflict
+	// condition set earlier in ensureProxyAndNetPolicies).
+	//
+	// (The reviewer's MVP fix: no exec/kubelet/new RBAC; readBaseCommit reads
+	// pod.status.initContainerStatuses and validates a 40-hex SHA.)
+	baseCommitPending := false
 	if loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" {
-		if sha, found, err := r.readBaseCommit(ctx, &loop); err != nil {
-			logf.FromContext(ctx).V(1).Info("workspace baseCommit not yet readable",
+		sha, done, err := r.resolveBaseCommit(ctx, &loop)
+		if err != nil && done {
+			// The init container terminated with a non-SHA message (the clone
+			// failed). Log it. The requeue is BOUNDED: it only fires while the
+			// init has NOT terminated (done=false); a permanently-failed init
+			// would not change on a requeue (the sandbox stays init-failed until
+			// the pod is recreated), so once done we stop requeueing for
+			// baseCommit.
+			logf.FromContext(ctx).V(1).Info("workspace baseCommit read failed",
 				"loop", loop.Name, "err", err)
-		} else if found && sha != "" {
+		} else if done && sha != "" {
+			// The init terminated with a valid SHA: record it (immutable, D10).
 			loop.Status.BaseCommit = sha
 			changed = true
+		} else if !done {
+			// The clone is still running (init not terminated yet, or the pod /
+			// init is not yet registered, or a transient read error). Mark the
+			// baseCommit pending so the final return requeues (a sandbox pod
+			// change does not trigger a reconcile on its own, so the timer is
+			// what drives the retry). Do NOT return here — the other status
+			// changes from this reconcile must still be persisted below.
+			if err != nil {
+				logf.FromContext(ctx).V(1).Info("workspace baseCommit not yet readable",
+					"loop", loop.Name, "err", err)
+			}
+			baseCommitPending = true
 		}
 	}
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
@@ -449,43 +475,93 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	if baseCommitPending {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
-// readBaseCommit reads the resolved commit SHA the workspace init container
-// wrote to baseCommitFile on the sandbox pod's 'workspace' volume, via the
-// kubelet (k8sClient.ReadFile) (S3a). It returns the SHA (trimmed) and
-// whether the file was present; an absent pod or absent file is not an error
-// (the init container may not have run yet) — it returns "", false, nil so the
-// caller retries on the next reconcile. A real read failure is returned as an
-// error (the caller logs it and retries). The file is the init container's
-// output — the operator's own evidence, never a runner claim (ADR-0004).
-func (r *LoopReconciler) readBaseCommit(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+// resolveBaseCommit dispatches to the test seam (readBaseCommit field) when it
+// is set, otherwise to the default APIReader-based read. It returns the SHA,
+// whether the init container has terminated (done), and any error. done=false
+// means the clone is still running (the caller requeues); done=true with a valid
+// SHA means record it; done=true with an error means the init terminated with a
+// non-SHA message (a permanent failure — the caller logs and does NOT requeue
+// for baseCommit, since the sandbox stays init-failed and a requeue would not
+// change anything until the pod is recreated). The S3a envtest suite overrides
+// the field to simulate a pod; a live deployment leaves it nil and the default
+// path reads the sandbox pod's init container termination message.
+func (r *LoopReconciler) resolveBaseCommit(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+	if r.readBaseCommit != nil {
+		return r.readBaseCommit(ctx, loop)
+	}
+	return r.readBaseCommitFromTerminationMessage(ctx, loop)
+}
+
+// readBaseCommitFromTerminationMessage (S3a, the reviewer's MVP fix) reads the
+// sandbox pod's init container termination message — the clone's resolved
+// commit SHA — via the operator's APIReader path (a real, non-cached client),
+// and validates it as a 40-hex commit SHA. A non-SHA message (e.g. 'no base
+// commit') means the clone failed and the read-back returns an error (the
+// caller logs and requeues). An absent pod or an init container that has not
+// terminated yet is NOT an error — it returns ("", false, nil) so the caller
+// requeues. No exec/kubelet/ReadFile access and no new RBAC are needed (the
+// pod's status is already readable by the operator).
+func (r *LoopReconciler) readBaseCommitFromTerminationMessage(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+	reader := r.apiReader
+	if reader == nil {
+		// No APIReader wired (e.g. the test constructs a bare LoopReconciler
+		// without SetupWithManager). Fall back to the cached client for the
+		// pod Get; in a live deployment SetupWithManager always wires the
+		// APIReader. (The mutation-check spec asserts the cache path is not
+		// silently used when the APIReader is available.)
+		reader = r
+	}
 	pod := &corev1.Pod{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, pod); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, pod); err != nil {
 		if apierrors.IsNotFound(err) {
 			return "", false, nil
 		}
 		return "", false, fmt.Errorf("read sandbox pod for baseCommit: %w", err)
 	}
-	// Only read from a pod the operator owns and that has run its init
-	// container (the baseCommit file is written at the END of the init
-	// container). A pod still in its init containers has no file yet.
+	// Find the init container by name. done=false means the clone is still
+	// running (or the pod is absent): the caller requeues. done=true means the
+	// init has terminated (valid SHA -> record; non-SHA -> permanent failure,
+	// log, do NOT requeue).
 	for i := range pod.Status.InitContainerStatuses {
-		ics := pod.Status.InitContainerStatuses[i]
-		if ics.Name == workspaceInitContainerName && ics.State.Terminated == nil {
+		ics := &pod.Status.InitContainerStatuses[i]
+		if ics.Name != workspaceInitContainerName {
+			continue
+		}
+		if ics.State.Terminated == nil {
+			// Pending: the clone has not finished — requeue (bounded: this only
+			// fires while the init is still running; once it terminates the
+			// message is read and the requeue stops).
 			return "", false, nil
 		}
+		if !isCommitSHA(ics.State.Terminated.Message) {
+			return "", true, fmt.Errorf("init container termination message is not a commit SHA: %q", ics.State.Terminated.Message)
+		}
+		return strings.TrimSpace(ics.State.Terminated.Message), true, nil
 	}
-	data, err := r.readFile(ctx, pod, baseCommitFile)
-	if err != nil {
-		return "", false, err
+	return "", false, nil // no init container registered yet (pod created, init not run)
+}
+
+// isCommitSHA reports whether s is a 40-character lowercase hex string — the
+// shape of a git commit SHA. Trailing whitespace (e.g. a trailing newline from
+// the termination-log redirect) is tolerated and trimmed.
+func isCommitSHA(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 40 {
+		return false
 	}
-	sha := strings.TrimSpace(string(data))
-	if sha == "" {
-		return "", false, nil
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
 	}
-	return sha, true, nil
+	return true
 }
 
 // effectivePolicyHash computes the canonical hash of the Loop's effective
@@ -2746,7 +2822,16 @@ else
   git -C "${DEST}" ` + safeDir + ` checkout --detach FETCH_HEAD
 fi
 mkdir -p "${DEST}/.coxswain"
+SHA=$(git -C "${DEST}" ` + safeDir + ` rev-parse HEAD)
+# Write the resolved SHA to the base-commit file AND to the termination log.
+# The termination log is the operator's PRIMARY read-back: the operator reads
+# pod.status.initContainerStatuses[name=init-workspace].state.terminated.message
+# via its APIReader path (no exec/kubelet/new RBAC needed — D38 pattern).
+# The .coxswain/base-commit file is kept as a debugging aid (the same value).
+# A clone failure exits non-zero (set -eu) and the termination message is the
+# last output line (e.g. a git error), which the operator rejects (not a SHA).
 git -C "${DEST}" ` + safeDir + ` rev-parse HEAD > "${DEST}/.coxswain/base-commit"
+git -C "${DEST}" ` + safeDir + ` rev-parse HEAD > /dev/termination-log
 echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
 `
 	nonRootUID := int64(65532)
@@ -2803,35 +2888,15 @@ const loopPolicyRefsFieldIndex = "spec.policyRefs"
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// S3a: wire the baseCommit read-back seam to the kubelet ReadFile. The
-	// controller-runtime concrete client (client.New / the manager's client)
-	// exposes ReadFile even though the client.Client interface does not name
-	// it, so cast the manager's client to the sub-interface. (In envtest the
-	// suite builds the client with client.New, which has ReadFile; a test that
-	// needs to assert baseCommit overrides r.readFile directly.)
-	if r.readFile == nil {
-		if rc, ok := mgr.GetClient().(interface {
-			ReadFile(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error)
-		}); ok {
-			r.readFile = rc.ReadFile
-		} else if mgr.GetClient() != nil {
-			// The manager hands out the concrete REST client as a
-			// client.Client interface value; ReadFile is not on that
-			// interface, so recover it from the client's own REST transport.
-			r.readFile = newReadFileViaREST(mgr.GetConfig())
-		}
-	}
-	// The controller MUST be able to read the baseCommit file back from the
-	// sandbox pod (S3a). When the seam could not be wired, every baseCommit
-	// read would silently skip and status.baseCommit would stay empty
-	// forever (observed live on kind 2026-10-02: the init container wrote
-	// the file, the pod was Ready, and no reconcile ever populated
-	// status.baseCommit — the read path was dead). Fail fast at startup
-	// instead: the baseCommit is the operator's own evidence (the init
-	// container's output, ADR-0004) and the TamperedVerify diff depends on
-	// it (ADR-0005 D10).
-	if r.readFile == nil {
-		return errors.New("loop controller: could not wire the baseCommit read-back seam (r.readFile); the operator cannot record status.baseCommit")
+	// S3a: wire the baseCommit read-back to the operator's non-cached client
+	// (APIReader). The sandbox pod is NOT in the manager's Pod cache (the
+	// cache is scoped to ProxyComponentSelector), so a cached Get returns
+	// NotFound and the read-back silently skips. The APIReader hits the API
+	// server directly, so the pod's init container termination message (the
+	// clone's resolved commit SHA) is always readable. This is the same
+	// pattern the D38 CNI probe uses (no exec/kubelet/new RBAC needed).
+	if r.apiReader == nil {
+		r.apiReader = mgr.GetAPIReader()
 	}
 	// I42e + I42c: read the cluster's pod/service CIDRs from the environment
 	// (set at deployment, e.g. kind/k3s exposes these as --pod-network-cidr /
@@ -2903,47 +2968,6 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return b.Named("loop").
 		Complete(r)
-}
-
-// newReadFileViaREST builds a readFile func that issues the kubelet-backed
-// Pod read subresource (GET /api/v1/namespaces/<ns>/pods/<name> with the
-// container + file query params) using a REST client built from cfg. It is
-// the fallback when the manager's client does not expose ReadFile directly
-// (ReadFile is not on the client.Client interface). The request is the same
-// one controller-runtime's concrete client makes; this is a minimal
-// re-implementation so the seam is always wired in a live deployment.
-func newReadFileViaREST(cfg *restclient.Config) func(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error) {
-	return func(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error) {
-		// The kubelet Pod read subresource is served at:
-		// /api/v1/namespaces/<ns>/pods/<name> (proxied to the kubelet).
-		// The controller-runtime concrete client uses the same path; the
-		// container and file are passed as query params. The container param
-		// is required (the pod has an init container too); without container
-		// and path the API server serves the pod object, not the file, and
-		// baseCommit stays empty forever (observed live on kind 2026-10-02).
-		u := neturl.URL{Path: fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", pod.Namespace, pod.Name)}
-		q := u.Query()
-		q.Set("container", "agent")
-		q.Set("path", path)
-		u.RawQuery = q.Encode()
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.Host+u.String(), nil)
-		if err != nil {
-			return nil, fmt.Errorf("build http request for baseCommit read: %w", err)
-		}
-		if cfg.BearerToken != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
-		}
-		httpResp, err := cfg.Transport.RoundTrip(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("kubelet read subrequest for baseCommit: %w", err)
-		}
-		defer func() { _ = httpResp.Body.Close() }()
-		if httpResp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(httpResp.Body)
-			return nil, fmt.Errorf("kubelet read for %s: HTTP %d: %s", path, httpResp.StatusCode, string(body))
-		}
-		return io.ReadAll(httpResp.Body)
-	}
 }
 
 // agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace

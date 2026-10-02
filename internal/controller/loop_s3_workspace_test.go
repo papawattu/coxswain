@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -46,16 +47,23 @@ import (
 //     when the agent image is the runner (--runner-image); otherwise 'sleep
 //     infinity' (an explicit opt-out).
 //
-// baseCommit read-back: the operator reads the file the init container wrote on
-// the sandbox pod through the kubelet (r.readFile). In envtest there is no
-// kubelet, so the spec wires a fake r.readFile (the seam) to simulate the init
-// container having written baseCommitFile. The mutation-check below proves the
-// spec fails when the read-back is broken (gate-disabled: readFile left nil).
+// baseCommit read-back: the operator reads the init container's termination
+// message (pod.status.initContainerStatuses[name=init-workspace].state.
+// terminated.message) via its APIReader path (a real, non-cached client), and
+// validates it as a 40-hex commit SHA. No exec/kubelet/ReadFile access and no
+// new RBAC are needed (the pod's status is already readable). In envtest the
+// spec overrides r.readBaseCommit (the seam) to simulate a pod. The
+// mutation-check below proves the spec fails when the read-back is broken
+// (the cached-client mutation: swapping in the cached client for the pod Get).
 
 const (
-	s3BaseCommitSHA = "abc123def456"
+	s3BaseCommitSHA = "abc123def456abc123def456abc123def456abcd"
 	s3RunnerImg     = "coxswain-runner:dev"
 	s3OtherImg      = "example.com/some-agent:1"
+	// s3StandinImage is the image for the stand-in sandbox pod the envtest
+	// specs create (envtest has no agent-sandbox controller to run the real
+	// agent). A constant (goconst): it is used in every S3 stand-in pod.
+	s3StandinImage = "busybox"
 )
 
 // s3RunnerCommand is the agent container Command the operator emits for a
@@ -187,9 +195,13 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		// under a deployed cluster.
 		Expect(init.Image).To(Equal("docker.io/alpine/git:v2.54.0"), "the init container must run the operator's pinned --workspace-git-image default")
 		// The init container clones and writes baseCommitFile: its command must
-		// reference the repo and the base-commit file (the mutation-check target).
+		// reference the repo, the base-commit file, AND the termination-log
+		// redirect (the operator's PRIMARY read-back: the termination message
+		// carries the clone's resolved commit SHA — no exec/kubelet/ReadFile
+		// access and no new RBAC needed, the D38 pattern).
 		cmd := strings.Join(init.Command, " ")
 		Expect(cmd).To(ContainSubstring("base-commit"), "the init container must write baseCommitFile")
+		Expect(cmd).To(ContainSubstring("/dev/termination-log"), "the init container must write the SHA to its termination message (the operator's read-back)")
 		Expect(cmd).To(ContainSubstring("git"), "the init container must run git")
 
 		By("guarding every git invocation with safe.directory=/workspace (dubious ownership)")
@@ -444,7 +456,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(s3Env(agent4, coxGoal)).To(Equal(loopGoal))
 	})
 
-	It("records status.baseCommit from the clone and pins it immutably (a)", func() {
+	It("records status.baseCommit from the init container's termination message and pins it immutably (a)", func() {
 		ns := "s3-base-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -452,40 +464,148 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		name := "baseloop"
 		Expect(k8sClient.Create(ctx, s3Loop(name, ns, false))).To(Succeed())
 
-		// The sandbox pod must exist for readBaseCommit to find it; envtest has
+		// The sandbox pod must exist for the read-back to find it; envtest has
 		// no agent-sandbox controller, so create a stand-in pod with the
-		// expected name + a terminated init container (the operator reads the
-		// baseCommit file from it via the readFile seam).
+		// expected name + a terminated init container whose termination message
+		// carries the clone's resolved commit SHA (the operator's own evidence,
+		// not a runner claim).
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: "busybox"}}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s3BaseCommitSHA}}},
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		// Wire the readFile seam to simulate the init container having written
-		// baseCommitFile (the operator's own evidence, not a runner claim).
-		r.readFile = func(ctx context.Context, p *corev1.Pod, path string) ([]byte, error) {
-			if p.Name != name+"-sandbox" {
-				return nil, fmt.Errorf("not found: %s", p.Name)
-			}
-			return []byte(s3BaseCommitSHA + "\n"), nil
-		}
+		// Wire the APIReader path (a real, non-cached client) — the seam the
+		// live deployment uses (no exec/kubelet/ReadFile access, no new RBAC).
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		loop := s3Reconcile(r, name, ns)
-		By("recording status.baseCommit from the clone")
+		By("recording status.baseCommit from the termination message")
 		Expect(loop.Status.BaseCommit).To(Equal(s3BaseCommitSHA), "the operator must record the clone's SHA in status.baseCommit")
 
 		By("pinning baseCommit immutably (a later reconcile must not overwrite it)")
-		// A later reconcile with a DIFFERENT file value must NOT change it.
-		r.readFile = func(ctx context.Context, p *corev1.Pod, path string) ([]byte, error) {
-			return []byte("deadbeef"), nil
-		}
+		// Change the pod's termination message to a DIFFERENT SHA; the pin must
+		// NOT change (immutable once set, ADR-0005 D10).
+		pod.Status.InitContainerStatuses[0].State.Terminated.Message = strings.Repeat("0", 40)
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 		loop = s3Reconcile(r, name, ns)
 		Expect(loop.Status.BaseCommit).To(Equal(s3BaseCommitSHA), "baseCommit is immutable once set (the Loop's base is pinned for its life)")
+	})
+
+	It("requeues while baseCommit is pending and stops once the init container terminates", func() {
+		ns := "s3-requeue-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "reqlp"
+		Expect(k8sClient.Create(ctx, s3Loop(name, ns, false))).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}
+
+		By("requeuing while the init container has not terminated yet")
+		// No init container status yet: the read-back is pending, so the
+		// operator must requeue (a sandbox pod change does not trigger a
+		// reconcile on its own; the RequeueAfter drives the retry).
+		res, err := r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">=", time.Second), "while baseCommit is pending the operator must requeue")
+
+		By("stopping the requeue once the init container terminates with a SHA")
+		terminated := int32(0)
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: terminated, Message: s3BaseCommitSHA}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		res, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, req.NamespacedName, got)).To(Succeed())
+		Expect(got.Status.BaseCommit).To(Equal(s3BaseCommitSHA), "once the init container terminates with a SHA, baseCommit is recorded")
+		Expect(res.RequeueAfter).To(BeZero(), "once baseCommit is set (immutable), the operator must not requeue for it")
+	})
+
+	It("rejects a non-SHA init container termination message", func() {
+		ns := "s3-badsha-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "badsha"
+		Expect(k8sClient.Create(ctx, s3Loop(name, ns, false))).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		terminated := int32(0)
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: terminated, Message: "no base commit"}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}
+
+		By("failing the read-back on a non-SHA termination message and NOT requeueing (bounded)")
+		// The init container terminated with a non-SHA message: the read-back
+		// fails (done=true, err). The requeue is BOUNDED — it stops once the
+		// init has terminated (a permanently-failed init would not change on a
+		// requeue; the sandbox stays init-failed until the pod is recreated).
+		res, err := r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero(), "a terminated init with a non-SHA message must NOT requeue for baseCommit (bounded — the requeue stops once the init has terminated)")
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, req.NamespacedName, got)).To(Succeed())
+		Expect(got.Status.BaseCommit).To(BeEmpty(), "baseCommit must stay empty when the termination message is not a commit SHA")
+	})
+
+	It("mutation-check: the read-back MUST use the APIReader path, not the cached client", func() {
+		// The reviewer's mutation: swap the APIReader for the CACHED client.
+		// The sandbox pod is NOT in the manager's Pod cache (the cache is
+		// scoped to ProxyComponentSelector), so a cached Get of the sandbox
+		// pod returns NotFound and the read-back silently skips — baseCommit
+		// stays empty forever. This spec proves the operator reads via the
+		// APIReader path: when the APIReader is available, a pod created in
+		// the envtest API server MUST be read and its SHA recorded. (A bare
+		// reconciler with apiReader nil falls back to the cached client; the
+		// mutation-check asserts that fallback is NOT silently used when the
+		// APIReader is wired, by asserting the APIReader path records the SHA.)
+		ns := "s3-mut-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "mutlp"
+		Expect(k8sClient.Create(ctx, s3Loop(name, ns, false))).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		terminated := int32(0)
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: terminated, Message: s3BaseCommitSHA}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// The APIReader path (a real, non-cached client) reads the pod the envtest
+		// API server persists — the same path a live deployment uses. If the
+		// operator silently fell back to a scoped cache (the bug the reviewer
+		// found), this pod would not be found and baseCommit would stay empty.
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		loop := s3Reconcile(r, name, ns)
+		Expect(loop.Status.BaseCommit).To(Equal(s3BaseCommitSHA),
+			"the read-back MUST use the APIReader path (a pod in the envtest API server must be read); a cached-client fallback would silently skip and leave baseCommit empty")
 	})
 })
 

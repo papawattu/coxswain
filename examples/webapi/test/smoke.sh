@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # smoke.sh — acceptance smoke test for the webapi sample (SAMPLES-PLAN §1).
 #
-# Starts the server on a free port, curls /healthz and /api/v1/ping, and
-# (task 2) POSTs to /api/v1/echo. Exits non-zero if any check fails.
+# Starts the server on a free port and curls /healthz plus the requested
+# route. With no argument it checks all routes (ping + echo). With an
+# argument it checks only that route: `bash test/smoke.sh ping` or
+# `bash test/smoke.sh echo`. Exits non-zero if a checked route fails.
 #
 # The seed state is red: /api/v1/ping returns 404 until task 1 lands;
 # /api/v1/echo returns 404 until task 2 lands. The script reports one line
 # per check so a failing Loop can see which one.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+ROUTE="${1:-all}"
+case "$ROUTE" in
+  all|ping|echo) ;;
+  *) echo "usage: smoke.sh [all|ping|echo]"; exit 2 ;;
+esac
 
 PORT=$(python3 - <<'PY' 2>/dev/null || echo 0
 import socket
@@ -49,6 +57,7 @@ echo "healthz: PASS"
 FAIL=0
 
 # Task 1: /api/v1/ping returns 200 with body "pong".
+if [ "$ROUTE" = all ] || [ "$ROUTE" = ping ]; then
 body=$(curl -sf "http://127.0.0.1:$PORT/api/v1/ping" 2>/dev/null || true)
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/ping" 2>/dev/null || echo 000)
 if [ "$code" = "200" ] && [ "$body" = "pong" ]; then
@@ -57,8 +66,21 @@ else
   echo "ping: FAIL (code=$code body=${body:-<empty>})"
   FAIL=1
 fi
+fi
 
 # Task 2: /api/v1/echo mirrors the request body back as JSON.
-# The seed state has no echo route; the check is added to this script by
-# tasks/2.patch together with the route itself.
+# The seed state has no echo route, so this minimal probe fails (404). Task 2's
+# reference fix (tasks/2.patch) replaces this block with the full assertion.
+if [ "$ROUTE" = all ] || [ "$ROUTE" = echo ]; then
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json' -d '{}' \
+  "http://127.0.0.1:$PORT/api/v1/echo" 2>/dev/null || echo 000)
+if [ "$code" = "200" ]; then
+  echo "echo: PASS"
+else
+  echo "echo: FAIL (code=$code)"
+  FAIL=1
+fi
+fi
+
 exit "$FAIL"

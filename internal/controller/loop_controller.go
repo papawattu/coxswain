@@ -281,6 +281,7 @@ type LoopReconciler struct {
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
 // D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // D38: the operator emits a Kubernetes Event on every Loop when its
@@ -389,6 +390,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		changed = true
 	}
 
+	// S4 review P1 (R17): the workspace must survive the per-phase pod
+	// recycle — a fresh emptyDir per phase wiped PLAN.md and the
+	// Implementing edits. The step is a small helper (Reconcile complexity,
+	// gocyclo 31).
+	if err := r.ensureLoopArtifacts(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -458,36 +467,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	//
 	// (The reviewer's MVP fix: no exec/kubelet/new RBAC; readBaseCommit reads
 	// pod.status.initContainerStatuses and validates a 40-hex SHA.)
-	baseCommitPending := false
-	if loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" {
-		sha, done, err := r.resolveBaseCommit(ctx, &loop)
-		if err != nil && done {
-			// The init container terminated with a non-SHA message (the clone
-			// failed). Log it. The requeue is BOUNDED: it only fires while the
-			// init has NOT terminated (done=false); a permanently-failed init
-			// would not change on a requeue (the sandbox stays init-failed until
-			// the pod is recreated), so once done we stop requeueing for
-			// baseCommit.
-			logf.FromContext(ctx).V(1).Info("workspace baseCommit read failed",
-				"loop", loop.Name, "err", err)
-		} else if done && sha != "" {
-			// The init terminated with a valid SHA: record it (immutable, D10).
-			loop.Status.BaseCommit = sha
-			changed = true
-		} else if !done {
-			// The clone is still running (init not terminated yet, or the pod /
-			// init is not yet registered, or a transient read error). Mark the
-			// baseCommit pending so the final return requeues (a sandbox pod
-			// change does not trigger a reconcile on its own, so the timer is
-			// what drives the retry). Do NOT return here — the other status
-			// changes from this reconcile must still be persisted below.
-			if err != nil {
-				logf.FromContext(ctx).V(1).Info("workspace baseCommit not yet readable",
-					"loop", loop.Name, "err", err)
-			}
-			baseCommitPending = true
-		}
-	}
+	baseCommitPending, baseCommitChanged := r.recordBaseCommitFromInit(ctx, &loop)
+	changed = changed || baseCommitChanged
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
 	if changed || conditionsChanged {
@@ -975,8 +956,16 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		},
 	})
 	volumes := []corev1.Volume{
-		{Name: workspaceVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-			SizeLimit: newLimit("500Mi"),
+		// S4 review P1 (R17): the workspace volume is backed by the per-Loop
+		// PVC (<loop>-workspace, ensureWorkspacePVC) so it SURVIVES the
+		// per-phase pod recycle — a fresh emptyDir per phase wiped PLAN.md and
+		// every Implementing edit (the phase machine ran, but the SDLC it
+		// drives saw the untouched base commit at every phase boundary). The
+		// PVC is controller-owned by the Loop (GC'd with it); init-workspace is
+		// idempotent on it (clone only when /workspace/.git is absent).
+		// scratch + tmp stay emptyDir (ephemeral, per-pod).
+		{Name: workspaceVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: workspacePVCName(loop.Name),
 		}}},
 		{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 			SizeLimit: newLimit("350Mi"),
@@ -1221,6 +1210,133 @@ const sandboxDesiredPhaseAnnotation = "coxswain.io/desired-phase"
 // is always a valid DNS-1035 label <= 63 chars and needs no truncation.
 func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
+}
+
+// workspacePVCName returns the Loop's workspace PVC name: <loop>-workspace.
+// One per-Loop RWO volume backs the sandbox's 'workspace' mount so the
+// workspace SURVIVES the per-phase pod recycle (the S4 review P1: a fresh
+// emptyDir per phase wiped PLAN.md and the Implementing edits, so each phase
+// started from the untouched base). The Loop is the controller owner, so the
+// PVC is garbage-collected with the Loop.
+func workspacePVCName(loopName string) string {
+	return loopName + "-workspace"
+}
+
+// workspacePVCSpec returns the Loop's workspace PVC: RWO (one sandbox at a
+// time per Loop), 1Gi (the workspace clone + phase artifacts; bounded),
+// default StorageClass (nil = the cluster default; in kind the local-path
+// provisioner, WaitForFirstConsumer). The operator creates it idempotently
+// before the sandbox is built.
+func workspacePVCSpec(loop *coxv1alpha1.Loop) *corev1.PersistentVolumeClaim {
+	oneGi := resource.MustParse("1Gi")
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workspacePVCName(loop.Name),
+			Namespace: loop.Namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: oneGi,
+				},
+			},
+		},
+	}
+}
+
+// ensureWorkspacePVC creates the Loop's workspace PVC if it does not exist
+// (idempotent: an existing PVC is left BYTE-IDENTICAL — no spec rewrite, no
+// resourceVersion churn on a no-change reconcile; a phase recycle must NOT
+// replace it, I43). The controller owner ref is set inside the mutate func
+// (the same I2 pattern as the sandbox) so the PVC is GC'd with the Loop.
+// A foreign (non-Loop) owner is never taken over: SetControllerReference
+// returns AlreadyOwnedError and the error is surfaced (the sandbox's I2
+// behaviour). Returns an error only on a real read failure or a foreign owner.
+func (r *LoopReconciler) ensureWorkspacePVC(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workspacePVCName(loop.Name),
+			Namespace: loop.Namespace,
+		},
+	}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
+	if apierrors.IsNotFound(err) {
+		pvc.Spec = workspacePVCSpec(loop).Spec
+		if cerr := controllerutil.SetControllerReference(loop, pvc, r.Scheme); cerr != nil {
+			return fmt.Errorf("set owner on new workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), cerr)
+		}
+		if cerr := r.Create(ctx, pvc); cerr != nil {
+			return fmt.Errorf("create workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), cerr)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), err)
+	}
+	// An existing PVC is left untouched EXCEPT the controller owner ref (the
+	// CreateOrUpdate-style re-assert). The update fires ONLY when the ref is
+	// not already the Loop's (an ownerless PVC after a manual owner-ref strip,
+	// say) — a no-change reconcile writes nothing (no resourceVersion churn),
+	// so a phase recycle never rewrites the PVC (I43).
+	if metav1.IsControlledBy(pvc, loop) {
+		return nil
+	}
+	if err := controllerutil.SetControllerReference(loop, pvc, r.Scheme); err != nil {
+		return fmt.Errorf("set owner on workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), err)
+	}
+	if err := r.Update(ctx, pvc); err != nil {
+		return fmt.Errorf("update workspace PVC owner %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), err)
+	}
+	return nil
+}
+
+// ensureLoopArtifacts ensures the per-Loop resources the sandbox needs before
+// it is built. Currently just the workspace PVC (S4 review P1, R17): a fresh
+// emptyDir per phase wiped PLAN.md and the Implementing edits, so the workspace
+// is a per-Loop RWO PVC (<loop>-workspace, ensureWorkspacePVC) that survives
+// the per-phase pod recycle; the sandbox's 'workspace' volume references it.
+// Kept as a helper because Reconcile was at gocyclo 31.
+func (r *LoopReconciler) ensureLoopArtifacts(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	return r.ensureWorkspacePVC(ctx, loop)
+}
+
+// recordBaseCommitFromInit records status.baseCommit from the workspace clone's
+// init container termination message (the S3 baseCommit pattern; ADR-0005 D10
+// immutable once set). It returns (pending, changed): pending is true when the
+// clone is still running (the final return requeues on it) and changed is true
+// when the SHA was recorded this reconcile. Extracted from Reconcile for
+// gocyclo; the semantics (bounded requeue, log-only on a failed clone, no early
+// return) are unchanged.
+func (r *LoopReconciler) recordBaseCommitFromInit(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
+	if loop.Spec.Workspace.Repo == "" || loop.Status.BaseCommit != "" {
+		return false, false
+	}
+	sha, done, err := r.resolveBaseCommit(ctx, loop)
+	switch {
+	case err != nil && done:
+		// The init container terminated with a non-SHA message (the clone
+		// failed). Log it; the requeue is bounded (it only fires while the init
+		// has NOT terminated; a permanently-failed init would not change on a
+		// requeue, so once done we stop requeueing for baseCommit).
+		logf.FromContext(ctx).V(1).Info("workspace baseCommit read failed",
+			"loop", loop.Name, "err", err)
+		return false, false
+	case done && sha != "":
+		// The init terminated with a valid SHA: record it (immutable, D10).
+		loop.Status.BaseCommit = sha
+		return false, true
+	default:
+		// The clone is still running (init not terminated yet, or the pod /
+		// init is not yet registered, or a transient read error). Do NOT return
+		// here — the other status changes from this reconcile must still be
+		// persisted by the caller.
+		if err != nil {
+			logf.FromContext(ctx).V(1).Info("workspace baseCommit not yet readable",
+				"loop", loop.Name, "err", err)
+		}
+		return true, false
+	}
 }
 
 // newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit
@@ -2994,13 +3110,18 @@ export GIT_TERMINAL_PROMPT=0
 DEST=/workspace
 REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
-# No ` + "`rm -rf ${DEST}`" + `: ${DEST} is a MOUNT POINT (the emptyDir volume) and cannot be removed.
-# The emptyDir starts empty, so ` + "`git init ${DEST}`" + ` works on the existing empty dir.
+# S4 review P1 (R17): /workspace is a MOUNT POINT (the per-Loop PVC volume)
+# and PERSISTS across the per-phase pod recycle (the emptyDir it replaced
+# did not). The init is IDEMPOTENT on it: when a cloned repo is already
+# present, SKIP the clone (no re-fetch, no wipe — PLAN.md and the
+# Implementing edits must survive) and still write the pinned base SHA to the
+# termination log (the operator reads the init's termination message and
+# validates it as a 40-hex SHA; status.baseCommit is immutable once set, so
+# the re-emitted value cannot move the pin). The success marker (.git +
+# base-commit file) is the existing idempotency test, kept: a .git without
+# the marker means the previous run failed mid-clone and is re-cloned.
 if [ -d "${DEST}/.git" ] && [ -f "${DEST}/.coxswain/base-commit" ]; then
-  # Idempotent: the pod is recreated per Loop (fresh emptyDir), but tolerate a
-  # re-run on the same volume without re-cloning. The base-commit file is the
-  # success marker; a .git without it means the previous run failed mid-clone
-  # (fetch or checkout) and the local repo has no objects — re-run the clone.
+  # Already initialised on this volume (a later phase's pod): skip the clone.
   cd "${DEST}"
   git ` + safeDir + ` rev-parse --verify HEAD >/dev/null 2>&1 || git ` + safeDir + ` checkout "${REF}"
 else

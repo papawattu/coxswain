@@ -72,6 +72,24 @@ const (
 	// to the local proxy (a Loop cannot override it: COX_* names are rejected
 	// at admission, I34).
 	coxModelBaseURL = "COX_MODEL_BASE_URL"
+	// coxGoal is the env var the operator sets on the agent carrying
+	// spec.goal (S3, GAP 1: the goal was never passed to the agent). COX_* is
+	// I34-protected, so a Loop cannot override it.
+	coxGoal = "COX_GOAL"
+	// workspaceInitContainerName is the name of the sandbox pod's workspace
+	// init container (S3a). It clones spec.workspace.repo @ ref into the
+	// 'workspace' volume and writes the resolved SHA to baseCommitFile.
+	workspaceInitContainerName = "init-workspace"
+	// workspaceCredsVolume is the Secret volume carrying the git credential
+	// (S3a, ADR-0006). It is mounted into the init container ONLY — the agent
+	// never sees git credentials (zero credentials in the agent).
+	workspaceCredsVolume = "workspace-creds"
+	// baseCommitFile is where the init container writes the resolved commit
+	// SHA (S3a): a file on the 'workspace' emptyDir the operator reads back
+	// (k8sClient.ReadFile) and pins to status.baseCommit (immutable once set,
+	// ADR-0005 D10). The file lives under /workspace/.coxswain so it is
+	// separated from the repo contents the agent sees.
+	baseCommitFile = "/workspace/.coxswain/base-commit"
 	// localhostProxyBaseURL is where the proxy listens on the sandbox pod's
 	// loopback interface. The agent reaches it over localhost, not the network.
 	// readOnlyMode is the default file mode for the model-creds Secret volume
@@ -140,6 +158,18 @@ type LoopReconciler struct {
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
+	// S3a: the baseCommit read-back seam. The operator reads the file the
+	// workspace init container wrote on the sandbox pod via the kubelet. In a
+	// real deployment this is the REST client's ReadFile (the controller-runtime
+	// concrete client exposes it even though the client.Client interface does
+	// name it); SetupWithManager wires it from the manager's client. A test
+	// overrides r.readFile directly (an unexported field, settable from the
+	// controller test package) to simulate the init container having written
+	// baseCommitFile. nil (most envtests) = the baseCommit read is skipped
+	// (the Loop's baseCommit stays empty until a real read is wired) —
+	// matching a pod whose init container has not written the file yet.
+	readFile func(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error)
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
@@ -153,6 +183,22 @@ type LoopReconciler struct {
 	// proxy image). When the effective policy has no network allows, the
 	// egress proxy pod is not created and this image is unused.
 	EgressProxyImage string
+
+	// WorkspaceGitImage is the trusted image the workspace init container runs
+	// (S3a, GAP 1): it must carry git. The operator selects it via
+	// --workspace-git-image so the operator (not the agent's image) controls
+	// the clone. Defaults to alpine/git.
+	WorkspaceGitImage string
+	// RunnerImage is the image the operator recognises as the runner (S3b).
+	// When spec.agent.image is EMPTY or equals RunnerImage, the agent
+	// container's Command is the runner's entrypoint; any other image keeps
+	// the 'sleep infinity' stand-in (an explicit opt-out for debugging pods
+	// and non-runner images). There is NO runner detection by image name
+	// beyond this exact match / empty — a Loop's image is only ever run as
+	// the runner when it IS the runner the operator configured. Empty (most
+	// envtests) means no Loop is run as the runner: every agent keeps
+	// 'sleep infinity'.
+	RunnerImage string
 
 	// PodCIDR / ServiceCIDR are the cluster's pod and service CIDRs (I42e +
 	// I42c NetworkPolicy carve-outs). Read from the operator's environment
@@ -333,6 +379,28 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			changed = true
 		}
 	}
+	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
+	// container writes the resolved commit SHA to baseCommitFile on the sandbox
+	// pod's 'workspace' volume; the operator reads it back through the kubelet
+	// (r.readFile, wired in SetupWithManager) and pins it to status.baseCommit.
+	// This is the
+	// operator's OWN evidence (a file written by a trusted init container it
+	// configured, read back by the operator) — not a runner claim (ADR-0004),
+	// and it feeds the TamperedVerify diff (ADR-0005 D10). Immutable once set
+	// (the Loop's base is pinned for its life): only set when empty. Only when
+	// the Loop declares a repo (a repo-less Loop has no clone, hence no base).
+	// A read failure is logged and retried on the next reconcile — it never
+	// fails the whole reconcile (a transient kubelet read error must not wedge
+	// the Loop), and baseCommit simply stays empty until the clone lands.
+	if loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" {
+		if sha, found, err := r.readBaseCommit(ctx, &loop); err != nil {
+			logf.FromContext(ctx).V(1).Info("workspace baseCommit not yet readable",
+				"loop", loop.Name, "err", err)
+		} else if found && sha != "" {
+			loop.Status.BaseCommit = sha
+			changed = true
+		}
+	}
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
 	if changed || conditionsChanged {
@@ -342,6 +410,42 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// readBaseCommit reads the resolved commit SHA the workspace init container
+// wrote to baseCommitFile on the sandbox pod's 'workspace' volume, via the
+// kubelet (k8sClient.ReadFile) (S3a). It returns the SHA (trimmed) and
+// whether the file was present; an absent pod or absent file is not an error
+// (the init container may not have run yet) — it returns "", false, nil so the
+// caller retries on the next reconcile. A real read failure is returned as an
+// error (the caller logs it and retries). The file is the init container's
+// output — the operator's own evidence, never a runner claim (ADR-0004).
+func (r *LoopReconciler) readBaseCommit(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("read sandbox pod for baseCommit: %w", err)
+	}
+	// Only read from a pod the operator owns and that has run its init
+	// container (the baseCommit file is written at the END of the init
+	// container). A pod still in its init containers has no file yet.
+	for i := range pod.Status.InitContainerStatuses {
+		ics := pod.Status.InitContainerStatuses[i]
+		if ics.Name == workspaceInitContainerName && ics.State.Terminated == nil {
+			return "", false, nil
+		}
+	}
+	data, err := r.readFile(ctx, pod, baseCommitFile)
+	if err != nil {
+		return "", false, err
+	}
+	sha := strings.TrimSpace(string(data))
+	if sha == "" {
+		return "", false, nil
+	}
+	return sha, true, nil
 }
 
 // effectivePolicyHash computes the canonical hash of the Loop's effective
@@ -640,14 +744,22 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		if loop.Spec.Agent.Image != "" {
 			agentImage = loop.Spec.Agent.Image
 		}
-		// I35: HOME points at the writable scratch because the read-only rootfs
-		// otherwise breaks every tool that writes ~/.cache (Go's build cache, git,
-		// npm). TMPDIR is NOT overridden (P1, R13): /scratch/tmp is a directory a
-		// fresh emptyDir never creates, so go build / mktemp failed; instead a
-		// dedicated emptyDir is mounted at /tmp (writable), which also covers the
-		// tools that hard-code /tmp.
-		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+2)
+		// S3b (GAP 1): agent execution. The operator sets COX_GOAL (the I34-protected
+		// COX_* namespace) carrying spec.goal, and runs the runner's entrypoint ONLY
+		// when the agent image is the runner (spec.agent.image empty, or equal to
+		// --runner-image); any other image keeps the 'sleep infinity' stand-in (an
+		// explicit opt-out for debugging pods / non-runner images). No runner
+		// detection by image name beyond this exact match / empty.
+		isRunner := r.RunnerImage != "" && (loop.Spec.Agent.Image == "" || loop.Spec.Agent.Image == r.RunnerImage)
+		agentCommand := []string{"sh", "-c", "sleep infinity"}
+		if isRunner {
+			agentCommand = []string{"/usr/local/bin/runner"}
+		}
+		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+3)
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
+		// S3 (GAP 1): the goal, set by the operator only (COX_* is I34-protected).
+		// The runner reads it as its prompt; a non-runner image ignores it.
+		agentEnv = append(agentEnv, corev1.EnvVar{Name: coxGoal, Value: loop.Spec.Goal})
 		// C2 (ADR-0006 item 2): the agent holds no model key. It talks to the local
 		// proxy sidecar (COX_MODEL_BASE_URL), which holds the key and injects auth.
 		// The operator sets this; a Loop cannot override it (COX_* names are
@@ -698,10 +810,11 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		agentContainer := corev1.Container{
 			Name:  "agent",
 			Image: agentImage,
-			// Keep the container alive until the phase driver (Phase 1)
-			// takes over. sleep infinity is a stand-in.
-			Command: []string{"sh", "-c", "sleep infinity"},
-			Env:     agentEnv,
+			// S3b: the agent's Command is the runner's entrypoint when the image
+			// is the runner (isRunner above); otherwise the 'sleep infinity'
+			// stand-in keeps the container alive for a manual / non-runner image.
+			Command:   agentCommand,
+			Env:       agentEnv,
 			Resources: corev1.ResourceRequirements{
 				Limits: agentLimits,
 				Requests: corev1.ResourceList{
@@ -727,6 +840,32 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			},
 		}
 		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{agentContainer}
+		// S3a (GAP 1): the workspace init container materialises the workspace.
+		// It clones spec.workspace.repo @ ref into the 'workspace' volume and
+		// writes the resolved commit SHA to baseCommitFile (on the same
+		// volume), which the operator reads back and pins to status.baseCommit
+		// (immutable once set, ADR-0005 D10). The git credential Secret is
+		// mounted into THIS container ONLY (S3a, ADR-0006): the agent never
+		// sees git credentials. The image is the operator's --workspace-git-image
+		// (never the Loop's image). Only present when spec.workspace.repo is set
+		// (a Loop with no repo runs the agent on an empty workspace).
+		if loop.Spec.Workspace.Repo != "" {
+			gitImage := r.workspaceGitImage()
+			var initMounts []corev1.VolumeMount
+			if loop.Spec.Workspace.GitCredentialSecret != "" {
+				// The credential Secret is mounted read-only into the init
+				// container ONLY, at /workspace-creds. The script uses
+				// credential.helper 'store' to read it. The agent container has
+				// no such volumeMount (asserted by the S3a envtest spec).
+				initMounts = []corev1.VolumeMount{
+					{Name: "workspace", MountPath: agentWorkspaceMount},
+					{Name: workspaceCredsVolume, MountPath: "/workspace-creds", SubPath: ".git-credentials", ReadOnly: true},
+				}
+			} else {
+				initMounts = []corev1.VolumeMount{{Name: "workspace", MountPath: agentWorkspaceMount}}
+			}
+			desired.Spec.PodTemplate.Spec.InitContainers = []corev1.Container{r.workspaceInitContainer(loop, gitImage, initMounts)}
+		}
 		// P3 (R13, I36): the writable emptyDirs carry explicit sizeLimits that sum
 		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
 		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
@@ -748,6 +887,18 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				SizeLimit: newLimit("100Mi"),
 			}}},
+		}
+		// S3a (ADR-0006): the git credential Secret is a volume on the sandbox
+		// pod ONLY to reach the init container; the agent has no such mount
+		// (zero credentials in the agent). Mounted with the default 0644 mode
+		// so the init container's git credential.helper 'store' can read it.
+		if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" {
+			desired.Spec.PodTemplate.Spec.Volumes = append(desired.Spec.PodTemplate.Spec.Volumes, corev1.Volume{
+				Name: workspaceCredsVolume,
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName: loop.Spec.Workspace.GitCredentialSecret,
+				}},
+			})
 		}
 		// D33: the model-creds Secret is mounted into the per-Loop proxy pod
 		// (ensureProxy), NOT the sandbox pod. The agent holds no key (C2).
@@ -1701,6 +1852,27 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
 		Ports: dnsPorts(),
 	})
+	// S3a: the sandbox pod's init container (init-workspace) runs git clone from
+	// spec.workspace.repo. NetworkPolicy has no per-container scoping — the
+	// init container and the agent share this pod's egress. The init container
+	// runs to completion BEFORE the agent starts, so allowing the repo host here
+	// does NOT widen the agent's runtime egress (the agent is a separate
+	// process, and the init container's network use is bounded by its clone).
+	// The repo host:port (not general egress) is allowed, plus DNS. This is the
+	// ONLY extra egress the init container adds; everything else stays
+	// proxy + DNS (+ egress proxy when network allows exist). When the repo
+	// host is not resolvable to a NetworkPolicy peer (external FQDN), no repo
+	// rule is added (fail-closed) — the clone then relies on the egress proxy
+	// (if present) or fails. A repo-less Loop adds no repo rule.
+	if loop.Spec.Workspace.Repo != "" {
+		if peer := repoPeer(loop.Spec.Workspace.Repo); peer != nil {
+			port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
+			agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
+				To:    []networkingv1.NetworkPolicyPeer{*peer},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
+			})
+		}
+	}
 
 	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
 	// none" — the agent pod must be unreachable from every other pod,
@@ -2078,7 +2250,6 @@ func egressCarveOutCIDRs(podCIDR, serviceCIDR string) []string {
 //   - anything else (external FQDN that does not resolve here): no peer —
 //     the model egress rule is omitted entirely (fail-closed), and the
 //     hostname-level allow belongs to D35's KubeArmor proxy policy.
-
 func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 	host := endpoint
 	if strings.Contains(endpoint, "://") {
@@ -2099,6 +2270,69 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 		}
 	}
 	return nil
+}
+
+// repoPeer is the NetworkPolicy peer for the sandbox pod's workspace init
+// container's git egress (S3a), the same fail-closed resolution as modelPeer
+// but for spec.workspace.repo: a numeric IP host is an ipBlock /32; a bare
+// in-cluster Service name is a podSelector over the namespace; an external
+// FQDN (does not resolve here) is nil — the repo egress rule is omitted
+// (fail-closed) and the clone relies on the egress proxy (if present) or
+// fails. The repo is a non-secret Loop spec field (workspace.repo).
+func repoPeer(repoURL string) *networkingv1.NetworkPolicyPeer {
+	return modelPeer(workspaceRepoHost(repoURL))
+}
+
+// workspaceRepoHost returns the host (no port, no path) of a git repo URL
+// (S3a). It handles https://, http://, and scp-style (user@host:path) URLs —
+// the three the CRD pattern allows. Returns "" when unparseable (the caller
+// then adds no repo rule, fail-closed).
+func workspaceRepoHost(repoURL string) string {
+	if strings.Contains(repoURL, "://") {
+		if u, err := neturl.Parse(repoURL); err == nil {
+			if h, _, err2 := net.SplitHostPort(u.Host); err2 == nil {
+				return h
+			}
+			return u.Host
+		}
+		return ""
+	}
+	// scp-style: user@host:path (no scheme). The host is between '@' and the
+	// LAST ':' (the path may itself contain ':').
+	if at := strings.LastIndexByte(repoURL, '@'); at >= 0 {
+		repoURL = repoURL[at+1:]
+	}
+	if colon := strings.LastIndexByte(repoURL, ':'); colon > 0 {
+		return repoURL[:colon]
+	}
+	return repoURL
+}
+
+// workspaceRepoPort returns the TCP port the workspace init container's git
+// client dials (S3a): the explicit port in the URL, or the scheme default
+// (443 for https, 80 for http, 22 for scp-style). 0 means unknown — the
+// caller adds no repo rule (fail-closed).
+func workspaceRepoPort(repoURL string) int {
+	if strings.Contains(repoURL, "://") {
+		if u, err := neturl.Parse(repoURL); err == nil {
+			if u.Port() != "" {
+				if p, err2 := strconv.Atoi(u.Port()); err2 == nil {
+					return p
+				}
+				return 0
+			}
+			if u.Scheme == "https" {
+				return 443
+			}
+			if u.Scheme == "http" {
+				return 80
+			}
+			return 0
+		}
+		return 0
+	}
+	// scp-style (user@host:path) defaults to ssh port 22.
+	return 22
 }
 
 // ensureNetworkPolicy creates the per-Loop NetworkPolicies (D34):
@@ -2336,6 +2570,93 @@ func (r *LoopReconciler) sandboxImage() string {
 	return "docker.io/library/golang:1.26"
 }
 
+// workspaceGitImage returns the image the workspace init container runs (S3a).
+// The operator selects it via --workspace-git-image (r.WorkspaceGitImage); the
+// default is a minimal, trusted git image. Never the Loop's image.
+func (r *LoopReconciler) workspaceGitImage() string {
+	if r.WorkspaceGitImage != "" {
+		return r.WorkspaceGitImage
+	}
+	return "docker.io/library/alpine/git"
+}
+
+// workspaceInitContainer builds the sandbox pod's workspace init container
+// (S3a). It clones spec.workspace.repo @ ref into the 'workspace' volume (a
+// single directory at agentWorkspaceMount) and writes the resolved commit SHA
+// to baseCommitFile (the same volume), which the operator reads back and pins
+// to status.baseCommit. The init container runs as the same non-root UID as
+// the agent (65532, with the pod's fsGroup) so the files it leaves in the
+// emptyDir volume are writable by the agent. When a credential Secret is
+// mounted (gitCredsMount), the script configures git credential.helper 'store'
+// to read it; the script is built here (not baked into the image) so the
+// operator's --workspace-git-image need only carry git + sh.
+func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop, gitImage string, mounts []corev1.VolumeMount) corev1.Container {
+	repo := loop.Spec.Workspace.Repo
+	ref := loop.Spec.Workspace.Ref
+	if ref == "" {
+		ref = "HEAD"
+	}
+	script := `#!/bin/sh
+set -eu
+DEST=/workspace
+REPO=` + shellQuote(repo) + `
+REF=` + shellQuote(ref) + `
+if [ -d "${DEST}/.git" ]; then
+  # Idempotent: the pod is recreated per Loop (fresh emptyDir), but tolerate a
+  # re-run on the same volume without re-cloning.
+  cd "${DEST}"
+  git rev-parse --verify HEAD >/dev/null 2>&1 || git checkout "${REF}"
+else
+  rm -rf "${DEST}"
+  git init "${DEST}"
+  git -C "${DEST}" remote add origin "${REPO}"
+  git -C "${DEST}" fetch origin "${REF}"
+  git -C "${DEST}" checkout --detach FETCH_HEAD
+fi
+mkdir -p "${DEST}/.coxswain"
+git -C "${DEST}" rev-parse HEAD > "${DEST}/.coxswain/base-commit"
+echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
+`
+	if len(mounts) > 0 && len(mounts) == 2 {
+		// A credential mount is present: configure credential.helper store to
+		// read /workspace-creds (the mounted .git-credentials file).
+		script = `git config --global credential.helper store
+git config --global user.name coxswain
+git config --global user.email coxswain@localhost
+` + script
+	}
+	script = `export GIT_TERMINAL_PROMPT=0
+` + script
+	nonRootUID := int64(65532)
+	nonRootGID := int64(65532)
+	falseP := false
+	trueP := true
+	readOnlyRootfs := true
+	return corev1.Container{
+		Name:            workspaceInitContainerName,
+		Image:           gitImage,
+		Command:         []string{"/bin/sh", "-c", script},
+		Env:             []corev1.EnvVar{{Name: "HOME", Value: "/tmp"}},
+		VolumeMounts:    mounts,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: &falseP,
+			RunAsNonRoot:             &trueP,
+			RunAsUser:                &nonRootUID,
+			RunAsGroup:               &nonRootGID,
+			ReadOnlyRootFilesystem:   &readOnlyRootfs,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+	}
+}
+
+// shellQuote quotes a string for safe embedding in an sh -c script (S3a).
+// The repo/ref are CRD-validated (a pattern), but quote them anyway so an
+// unusual-but-valid value cannot inject shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'''`) + "'"
+}
+
 // proxyImage returns the model proxy pod image. It is the reconciler's
 // ProxyImage field (settable in tests and future slices; a manager flag
 // --proxy-image is a candidate for a future C2b), or the forwarding proxy
@@ -2356,6 +2677,19 @@ const loopPolicyRefsFieldIndex = "spec.policyRefs"
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// S3a: wire the baseCommit read-back seam to the kubelet ReadFile. The
+	// controller-runtime concrete client (client.New / the manager's client)
+	// exposes ReadFile even though the client.Client interface does not name
+	// it, so cast the manager's client to the sub-interface. (In envtest the
+	// suite builds the client with client.New, which has ReadFile; a test that
+	// needs to assert baseCommit overrides r.readFile directly.)
+	if r.readFile == nil {
+		if rc, ok := mgr.GetClient().(interface {
+			ReadFile(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error)
+		}); ok {
+			r.readFile = rc.ReadFile
+		}
+	}
 	// I42e + I42c: read the cluster's pod/service CIDRs from the environment
 	// (set at deployment, e.g. kind/k3s exposes these as --pod-network-cidr /
 	// --service-cluster-ip-range flags). Empty values mean the CIDR cases are

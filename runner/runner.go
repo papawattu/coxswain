@@ -193,6 +193,20 @@ func shellToolSchema() []toolDef {
 	}
 }
 
+// RunConfig is the exported input to Run (S3): the environment the runner reads
+// in main.go maps onto this. It is the same shape as runConfig (the unexported
+// seam the tests use) so Run is a thin adapter: the exported entrypoint for the
+// agent image, the unexported run for the test suite.
+type RunConfig = runConfig
+
+// Run is the exported entrypoint the runner image's main calls (S3). It drives
+// the model and writes result.json in the workspace. The phase-driver contract
+// (desired-phase, observedPhase) is the S4 slice; until then Run reports a
+// single-phase run (the existing Phase 0 schema).
+func Run(cfg RunConfig) Result {
+	return run(cfg)
+}
+
 // run drives the model and writes the result file. It returns the result it
 // wrote. This is the seam the tests observe.
 func run(cfg runConfig) Result {

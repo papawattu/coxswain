@@ -105,6 +105,13 @@ type Result struct {
 	NextIterationPlan string   `json:"nextIterationPlan,omitempty"`
 	Lessons           []string `json:"lessons,omitempty"`
 	ToolTrace         []string `json:"toolTrace,omitempty"`
+	// S4 (TDD-PLAN A1): the phase the runner reports having executed — the
+	// ADR-0004 claim channel. It is the phase read from desired-phase (the
+	// operator is the phase authority; the runner reports it back, never
+	// chooses it). ADR-0005: the operator treats it as an untrusted claim —
+	// size-limited, strict-parsed, and never a gate input. Empty for the
+	// legacy single-phase run (Run).
+	ObservedPhase string `json:"observedPhase,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

@@ -59,6 +59,7 @@ func TestProbeCommandShape(t *testing.T) {
 	for _, want := range []string{
 		"RESULT %s REACHABLE", "RESULT %s BLOCKED", "DONE",
 		"kubernetes.default.svc.cluster.local", "10250", "6443", "1.1.1.1",
+		"kube-dns.kube-system.svc.cluster.local",
 		"settimeout", "status.hostIP",
 		// The RESULT lines must be written to the termination message from
 		// the script itself (a clean exit leaves /dev/termination-log empty
@@ -70,10 +71,10 @@ func TestProbeCommandShape(t *testing.T) {
 			t.Errorf("probe script missing %q", want)
 		}
 	}
-	// The four target labels the parse() validator expects. The node IP must
+	// The five target labels the parse() validator expects. The node IP must
 	// come from the downward API (status.hostIP env NODE_IP) — the pod's own
 	// HOSTNAME resolves to the pod's own IP, never the node's.
-	for _, label := range []string{"APISERVER_SVC", "NODE_API", "KUBELET_NODE", "EXTERNAL"} {
+	for _, label := range []string{"APISERVER_SVC", "NODE_API", "KUBELET_NODE", "EXTERNAL", "DNS_POSITIVE"} {
 		if !strings.Contains(script, label) {
 			t.Errorf("probe script missing target label %q", label)
 		}
@@ -88,7 +89,10 @@ func TestProbeCommandShape(t *testing.T) {
 // ProbeUnavailable — never a false pass.
 func TestProbeParseStrictValidation(t *testing.T) {
 	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
-	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE"
+	// The normal PASS case: all four expected-BLOCKED targets BLOCKED
+	// (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL) and the positive
+	// control (DNS_POSITIVE) REACHABLE -> CNIEnforced.
+	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
 	res, err := p.parse(allBlocked, pod(allBlocked, 0))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -97,7 +101,7 @@ func TestProbeParseStrictValidation(t *testing.T) {
 		t.Fatalf("all expected-BLOCKED targets BLOCKED + control REACHABLE -> CNIEnforced, got %v", res)
 	}
 
-	oneReachable := "RESULT APISERVER_SVC REACHABLE\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE"
+	oneReachable := "RESULT APISERVER_SVC REACHABLE\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
 	res, err = p.parse(oneReachable, pod(oneReachable, 0))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -116,16 +120,17 @@ func TestProbeParseStrictValidation(t *testing.T) {
 		name, msg string
 		exit      int32
 	}{
-		// EXTERNAL is the positive control: a BLOCKED control means the probe
-		// has no network -> ProbeUnavailable, never CNIEnforced on an
-		// unproven fence.
-		{"BLOCKED control -> ProbeUnavailable", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nDONE", 0},
-		// EXTERNAL REACHABLE with the expected-BLOCKED targets BLOCKED is the
-		// normal PASS case, not a control failure.
-		{"EXTERNAL REACHABLE is not a control failure", allBlocked, 0},
+		// The positive control (DNS_POSITIVE) is what the probe netpol
+		// ALLOWS (kube-dns :53). A BLOCKED control means the probe has no
+		// network -> ProbeUnavailable, never CNIEnforced on an unproven fence.
+		{"BLOCKED control -> ProbeUnavailable", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE BLOCKED\nDONE", 0},
+		// EXTERNAL is now an expected-BLOCKED target (not in the DNS-only
+		// allow list). EXTERNAL REACHABLE (e.g. on a non-enforcing CNI like
+		// kindnet) -> CNIUnenforced, NOT a control failure.
+		{"EXTERNAL REACHABLE -> CNIUnenforced", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nRESULT DNS_POSITIVE REACHABLE\nDONE", 0},
 		{"missing RESULT line", "RESULT APISERVER_SVC BLOCKED\nDONE", 0},
-		{"unknown label", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT WHATEVER BLOCKED\nDONE", 0},
-		{"unknown verdict", "RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE", 0},
+		{"unknown label", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT WHATEVER BLOCKED\nDONE", 0},
+		{"unknown verdict", "RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nRESULT DNS_POSITIVE REACHABLE\nDONE", 0},
 		{"non-zero exit", allBlocked, 1},
 		{"empty message", "", 0},
 	} {
@@ -134,9 +139,9 @@ func TestProbeParseStrictValidation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
-			if tc.name == "EXTERNAL REACHABLE is not a control failure" {
-				if res.Reason != ReasonCNIEnforced {
-					t.Fatalf("want CNIEnforced, got %v (detail=%q)", res.Reason, res.Detail)
+			if tc.name == "EXTERNAL REACHABLE -> CNIUnenforced" {
+				if res.Reason != ReasonCNIUnenforced {
+					t.Fatalf("want CNIUnenforced, got %v (detail=%q)", res.Reason, res.Detail)
 				}
 				return
 			}
@@ -146,9 +151,6 @@ func TestProbeParseStrictValidation(t *testing.T) {
 		})
 	}
 }
-
-// terminatedProbePod builds a probe pod whose container has Terminated with the
-// given exit code and message.
 func terminatedProbePod(exit int32, message string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName},
@@ -168,12 +170,6 @@ func terminatedProbePod(exit int32, message string) *corev1.Pod {
 	}
 }
 
-// D38s3 (Calico run): the probe pod exits CLEAN with its RESULT lines on
-// stdout — and FallbackToLogsOnError does NOT substitute the logs on a clean
-// exit, so /dev/termination-log is the message source, and if it is empty the
-// operator must NOT spin to the 60s timeout. A Terminated probe container
-// with an empty message is a hard failure (-> ProbeUnavailable), returned
-// immediately (not after the timeout).
 func TestWaitForTerminationEmptyMessageIsFailure(t *testing.T) {
 	// The reader returns the terminated probe pod with an EMPTY message: the
 	// classic "stdout-only, clean exit" shape FallbackToLogsOnError does not

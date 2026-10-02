@@ -75,7 +75,7 @@ const (
 	probePodName      = "coxswain-cni-probe"
 	probeNetpolName   = "coxswain-cni-probe-netpol"
 	probeLabelKey     = "coxswain.io/probe"
-	expectedResultLen = 4
+	expectedResultLen = 5 // 4 expected-BLOCKED (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL) + 1 positive control (DNS_POSITIVE)
 	verdictReachable  = "REACHABLE"
 	verdictBlocked    = "BLOCKED"
 )
@@ -87,24 +87,32 @@ var knownProbeLabels = map[string]bool{
 	"NODE_API":      true,
 	"KUBELET_NODE":  true,
 	"EXTERNAL":      true,
+	"DNS_POSITIVE":  true,
 }
 
 // expectedBlockedLabels are the RESULT labels that must be BLOCKED for the
 // CNI to count as enforcing (the D38 property: a pod under the agent's
-// allowlist NetworkPolicy cannot reach host-network destinations). They match
-// test/e2e/verify-cni.sh's expected-BLOCKED targets: the apiserver Service
-// ClusterIP :443 and the node's IP (downward API status.hostIP) on :6443
-// and :10250. EXTERNAL is a positive CONTROL, not an expected-blocked target:
-// the probe NetworkPolicy allows egress to the outside (everything except the
-// RFC1918 ranges, like the agent's NetworkPolicy), so REACHABLE is the
-// CORRECT outcome there. If the control comes back BLOCKED, the probe has no
-// network and the result is ProbeUnavailable -- not CNIEnforced on an
-// unproven fence and not CNIUnenforced on a healthy CNI.
+// allowlist NetworkPolicy cannot reach host-network destinations, or the
+// outside). The probe NetworkPolicy is a 1:1 copy of the per-Loop agent
+// NetworkPolicy (egress allowed ONLY to the cluster's kube-dns on 53), so the
+// expected-BLOCKED targets are: the apiserver Service ClusterIP :443 and the
+// node's IP (downward API status.hostIP) on :6443 and :10250 (host network),
+// plus EXTERNAL 1.1.1.1:443 (the outside — not in the DNS-only allow list).
+// On a non-enforcing CNI (kindnet) EXTERNAL is REACHABLE, which is itself
+// evidence of unenforcement.
 var expectedBlockedLabels = map[string]bool{
 	"APISERVER_SVC": true,
 	"NODE_API":      true,
 	"KUBELET_NODE":  true,
+	"EXTERNAL":      true,
 }
+
+// positiveControlLabel is the RESULT label that must be REACHABLE for the
+// probe to prove it has a working network path under the allow list: the
+// cluster's kube-dns Service :53 (allowed by the probe NetworkPolicy). A
+// BLOCKED positive control means the probe has no network at all (the fence
+// is unproven) and the result is ProbeUnavailable.
+const positiveControlLabel = "DNS_POSITIVE"
 
 // probeCommand is the probe, run as the pod's own command (the
 // image is python:3-alpine by default — it ships python3 and neither bash nor
@@ -113,14 +121,18 @@ var expectedBlockedLabels = map[string]bool{
 // (captured to the termination message via
 // terminationMessagePolicy: FallbackToLogsOnError) and exits 0.
 //
-// The targets match verify-cni.sh's expected-BLOCKED set: the apiserver
-// Service ClusterIP :443 (pod -> ServiceClusterIP -> host network), the
-// node's IP on :6443 and :10250 (host network; the node IP comes from the
-// downward API status.hostIP — the pod's own HOSTNAME resolves to the pod's
-// own IP, not the node's, so it must NOT be used), plus EXTERNAL 1.1.1.1:443
-// as a positive CONTROL: REACHABLE is the correct outcome there, and a
-// BLOCKED control makes the result ProbeUnavailable (the probe has no
-// network).
+// The targets: the expected-BLOCKED set (the D38 property — a pod under the
+// agent's allowlist NetworkPolicy cannot reach these): the apiserver Service
+// ClusterIP :443 (pod -> ServiceClusterIP -> host network), the node's IP on
+// :6443 and :10250 (host network; the node IP comes from the downward API
+// status.hostIP — the pod's own HOSTNAME resolves to the pod's own IP, not the
+// node's, so it must NOT be used), and EXTERNAL 1.1.1.1:443 (the outside —
+// not in the DNS-only allow list; REACHABLE on a non-enforcing CNI is itself
+// evidence of unenforcement). Plus the positive CONTROL, DNS_POSITIVE: a TCP
+// connect to the cluster's kube-dns Service :53 (allowed by the probe
+// NetworkPolicy) — it must come back REACHABLE to prove the probe has a
+// working network path; a BLOCKED control means the probe has no network and
+// the result is ProbeUnavailable.
 
 // podTerminated reports whether the named container's state is Terminated
 // (read from its ContainerStatus; Status.Phase alone lags the container
@@ -150,6 +162,7 @@ func (p *PodProber) getReader() client.Reader {
 
 func (p *PodProber) probeCommand() []string {
 	apiserverSVC := "kubernetes.default.svc." + p.cfg.ClusterDomain
+	kubeDNS := "kube-dns.kube-system.svc." + p.cfg.ClusterDomain
 	return []string{"python3", "-c", `
 import os, socket, socket as _s, sys
 
@@ -166,11 +179,18 @@ TARGETS = [
     ("APISERVER_SVC", "` + apiserverSVC + `", 443),
     ("NODE_API", node_ip, 6443),
     ("KUBELET_NODE", node_ip, 10250),
-    # Positive CONTROL: the probe NetworkPolicy allows egress to the outside
-    # (everything except the RFC1918 ranges, like the agent's netpol), so
-    # this must come back REACHABLE. A BLOCKED control means the probe has no
-    # network, not that the CNI is enforcing the fence.
+    # EXTERNAL is an expected-BLOCKED target: the probe NetworkPolicy allows
+    # egress ONLY to the cluster's kube-dns (53), so the outside is NOT
+    # allowed. A CNI that enforces the fence drops it (BLOCKED); a CNI that
+    # does not (kindnet) lets it through (REACHABLE), which is itself
+    # evidence of unenforcement.
     ("EXTERNAL", "1.1.1.1", 443),
+    # Positive CONTROL: the probe NetworkPolicy ALLOWS egress to the
+    # cluster's kube-dns on 53, so this must come back REACHABLE. A BLOCKED
+    # control means the probe has no network at all (the node's own CNI is
+    # down) -- the fence is unproven, not that the CNI is enforcing. DNS
+    # resolution of the service name is itself allowed by the netpol.
+    ("DNS_POSITIVE", "` + kubeDNS + `", 53),
 ]
 
 lines = []
@@ -436,10 +456,11 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 // parse strictly validates the termination message: exactly expectedResultLen
 // RESULT lines, each a known label, every line consumed. A non-zero pod exit or
 // any deviation returns ProbeUnavailable. CNIUnenforced = any expected-BLOCKED
-// target (apiserver svc, node :6443, node :10250) REACHABLE; the EXTERNAL
-// control is NOT expected-blocked — a BLOCKED control means the probe has no
-// network and the result is ProbeUnavailable (never CNIEnforced on an
-// unproven fence, never CNIUnenforced on a healthy CNI).
+// target (apiserver svc, node :6443, node :10250, EXTERNAL 1.1.1.1:443)
+// REACHABLE; the positive control (DNS_POSITIVE, the cluster's kube-dns :53)
+// is NOT expected-blocked — a BLOCKED control means the probe has no network
+// and the result is ProbeUnavailable (never CNIEnforced on an unproven fence,
+// never CNIUnenforced on a healthy CNI).
 func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 	// A non-zero exit (container terminated with a non-zero code) is
 	// ProbeUnavailable even if the message looks valid.
@@ -476,18 +497,18 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 	if seen != expectedResultLen {
 		return unavailable(fmt.Sprintf("expected %d RESULT lines, got %d", expectedResultLen, seen)), nil
 	}
-	// The positive control (EXTERNAL) must be REACHABLE: the probe
-	// NetworkPolicy allows egress to the outside. A BLOCKED control means the
-	// probe has no network at all (e.g. the node's own CNI is down) — the
-	// fence is unproven, so the result is ProbeUnavailable.
+	// The positive control (DNS_POSITIVE) must be REACHABLE: the probe
+	// NetworkPolicy allows egress to the cluster's kube-dns on 53. A BLOCKED
+	// control means the probe has no network at all (e.g. the node's own CNI
+	// is down) — the fence is unproven, so the result is ProbeUnavailable.
 	controlOK := false
 	for _, row := range rows {
-		if row.Label == "EXTERNAL" && row.Verdict == verdictReachable {
+		if row.Label == positiveControlLabel && row.Verdict == verdictReachable {
 			controlOK = true
 		}
 	}
 	if !controlOK {
-		return unavailable("EXTERNAL control not REACHABLE: the probe has no network; the fence is unproven"), nil
+		return unavailable(positiveControlLabel + " control not REACHABLE: the probe has no network; the fence is unproven"), nil
 	}
 	var unenforced []string
 	for _, label := range reachable {

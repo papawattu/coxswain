@@ -89,16 +89,6 @@ const agentContainerNameS4 = "agent"
 // runner itself bounds.
 const s4ClaimMaxBytes = 4096
 
-// s4ClaimStatusSuccess / s4ClaimStatusBlocked are the claim's status values
-// (the runner's PhaseRun writes these into result.json's status; the
-// termination-message claim mirrors the field). The operator treats them as
-// opaque strings (OS1 progress) — the phase machine NEVER branches on them
-// (ADR-0005: never a gate input).
-const (
-	s4ClaimStatusSuccess = "success"
-	s4ClaimStatusBlocked = "blocked"
-)
-
 // PhaseClaim is the operator's parsed view of the runner's ADR-0004 claim
 // (the agent container's termination message, strict JSON).
 type PhaseClaim struct {

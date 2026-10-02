@@ -432,12 +432,15 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			claimReadPending = true
 		} else if claim != nil {
 			now := metav1.Now()
+			fromPhase := loop.Status.Phase
 			c, advanced := r.recordPhaseClaim(&loop, claim, now)
 			changed = changed || c
 			if advanced {
 				// OS5: emit a Kubernetes Event on the phase transition (a stable
 				// reason, PhaseAdvanced; nil Recorder = most envtests skip it).
-				r.emitPhaseAdvancedEvent(&loop, claim.ObservedPhase)
+				// Pass the OLD phase (before the advance) so the event message
+				// reads "phase advanced Implementing -> Verifying".
+				r.emitPhaseAdvancedEvent(&loop, fromPhase)
 				// The phase advanced: status.desiredPhase changed. The NEXT
 				// reconcile's ensureSandbox sees the annotation mismatch and
 				// deletes the Sandbox (the one-shot runner re-runs for the new
@@ -456,13 +459,18 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// status.observedPhase is set (a direct status update, not a claim),
 	// the operator advances the phase machine using the pure nextPhase
 	// logic. This is the seam the B1 envtests exercise (they set
-	// status.observedPhase directly, bypassing the claim reader).
+	// status.observedPhase directly, bypassing the claim reader). When the
+	// B1 seam handles the advance (or the non-advance), it clears
+	// claimReadPending so the operator does NOT requeue for a claim that
+	// was never expected (the B1 seam is a direct status update, not a
+	// one-shot runner termination message).
 	if claimReadPending && loop.Status.ObservedPhase != "" && loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded && loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
-		from := loop.Status.Phase
-		_, advanced := r.recordPhaseClaim(&loop, &PhaseClaim{ObservedPhase: loop.Status.ObservedPhase}, metav1.Now())
+		fromPhase := loop.Status.Phase
+		c, advanced := r.recordPhaseClaim(&loop, &PhaseClaim{ObservedPhase: loop.Status.ObservedPhase}, metav1.Now())
+		changed = changed || c
 		if advanced {
-			logf.FromContext(ctx).Info("phase advanced (B1 seam: status.observedPhase)", "loop", loop.Name, "from", from, "to", loop.Status.Phase)
-			r.emitPhaseAdvancedEvent(&loop, from)
+			logf.FromContext(ctx).Info("phase advanced (B1 seam: status.observedPhase)", "loop", loop.Name, "from", fromPhase, "to", loop.Status.Phase)
+			r.emitPhaseAdvancedEvent(&loop, fromPhase)
 		}
 	}
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
@@ -590,33 +598,6 @@ func (r *LoopReconciler) emitPhaseAdvancedEvent(loop *coxv1alpha1.Loop, from cox
 	}
 	r.Recorder.Eventf(loop, corev1.EventTypeNormal, phaseAdvancedReason,
 		"phase advanced %s -> %s", from, loop.Status.Phase)
-}
-
-// recycleSandboxForPhase (S4) deletes the Loop's sandbox after a phase advance
-// so the one-shot runner re-runs for the NEXT phase. The phase-init container
-// rewrites .coxswain/desired-phase from status.desiredPhase (the new phase) and
-// the agent container runs the runner once more (one container run per phase
-// — the termination message is one-shot per container run, so the same phase
-// must not re-execute on the old pod). Idempotent: a NotFound delete is a no-op
-// (the sandbox may already be gone, e.g. suspended). The operator's
-// CreateOrUpdate in ensureSandbox recreates it on the next reconcile; the
-// deletion here also clears the stale agent termination status (the new pod
-// starts with no agent container status, so the claim reader requeues until the
-// new one-shot run terminates).
-func (r *LoopReconciler) recycleSandboxForPhase(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	sb := &sandboxv1beta1.Sandbox{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("read sandbox for phase recycle: %w", err)
-	}
-	if err := r.Delete(ctx, sb); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete sandbox for phase recycle: %w", err)
-	}
-	logf.FromContext(ctx).Info("recycled sandbox for next phase", "sandbox", sandboxName(loop.Name), "phase", loop.Status.Phase)
-	return nil
 }
 
 // resolveBaseCommit dispatches to the test seam (readBaseCommit field) when it

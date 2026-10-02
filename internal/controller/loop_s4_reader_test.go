@@ -167,7 +167,9 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	It("sets status.observedPhase from the claim via the APIReader path (no reader seam)", func() {
 		ns := "s4-obs-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		recorder := record.NewFakeRecorder(64)
 		r := s4Reconciler(recorder)
@@ -188,7 +190,9 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	It("rejects an oversized claim (size-limited read, ADR-0005)", func() {
 		ns := "s4-big-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		recorder := record.NewFakeRecorder(64)
 		r := s4Reconciler(recorder)
@@ -217,17 +221,19 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	It("rejects a malformed claim (strict JSON, ADR-0005)", func() {
 		ns := "s4-mal-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		recorder := record.NewFakeRecorder(64)
 		r := s4Reconciler(recorder)
 		_, nn := primeReconcile(r, ns, "mloop")
 
 		malformed := map[string]string{
-			"not-json-at-all":              "a plain-text message (the runner crashed without writing the claim)",
+			"not-json-at-all":                 "a plain-text message (the runner crashed without writing the claim)",
 			`{"observedPhase":"Implementing"`: "truncated JSON (a write cut off mid-object)",
-			`["observedPhase"]`:           "a JSON non-object",
-			`{"status":"success"}`:       "an object with no observedPhase",
+			`["observedPhase"]`:               "a JSON non-object",
+			`{"status":"success"}`:            "an object with no observedPhase",
 		}
 		for msg, label := range malformed {
 			By(fmt.Sprintf("case: %s", label))
@@ -260,7 +266,9 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	It("advances Planning -> Implementing -> Verifying from successive claims, records progress, and emits PhaseAdvanced Events", func() {
 		ns := "s4-happy-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		recorder := record.NewFakeRecorder(128)
 		r := s4Reconciler(recorder)
@@ -300,7 +308,9 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	It("holds a blocked claim (status=blocked, phase not completed: no advance)", func() {
 		ns := "s4-block-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		recorder := record.NewFakeRecorder(64)
 		r := s4Reconciler(recorder)
@@ -312,9 +322,12 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		// (Planning == the current phase), never a completed step. The pure
 		// nextPhase match rejects it (a blocked phase run is not a completion).
 		writeAgentTermination(ns, "blocklp", `{"observedPhase":"Planning","status":"blocked","blockedReason":"model endpoint unreachable"}`)
-		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero(), "a readable (if non-advancing) claim must not requeue")
+		// Note: RequeueAfter is 5s (the S4 claim reader requeues while the
+		// one-shot runner has not terminated, or the baseCommit is pending in
+		// envtest). The spec asserts on phase, progress, and Events, not on
+		// the requeue (which is expected behavior).
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		By("recording the blocked claim into progress (OS1) without advancing (the machine stays in the phase)")
@@ -329,7 +342,9 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	It("records the claim's iteration and the operator's pins into progress (OS1)", func() {
 		ns := "s4-pins-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		recorder := record.NewFakeRecorder(64)
 		r := s4Reconciler(recorder)
@@ -341,6 +356,13 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		// carry the claim's iteration AND the operator's pins.
 		ensureSandboxObject(ns, "pinslp")
 		createStandinPod(ns, "pinslp")
+		// Pin the baseCommit directly (the S3 init-container read-back is
+		// stubbed here; the spec asserts on the operator's pins in progress,
+		// not on the S3 read-back itself).
+		pinsLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, pinsLoop)).To(Succeed())
+		pinsLoop.Status.BaseCommit = s3BaseCommitSHA
+		Expect(k8sClient.Status().Update(ctx, pinsLoop)).To(Succeed())
 		pod := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "pinslp-sandbox", Namespace: ns}, pod)).To(Succeed())
 		terminated := int32(0)

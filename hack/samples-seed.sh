@@ -60,6 +60,16 @@ GIT_PASS=$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.data.passw
 
 log "ctx=$CTX ns=$NS user=$GIT_USER apps=${APPS[*]}"
 
+# Create the admin account (idempotent). The 1.24 image self-installs
+# (INSTALL_LOCK=true + sqlite3) but has no admin auto-init, so the account
+# is created here via the in-pod CLI. A fresh emptyDir has an empty user
+# table, so the first 'admin user create' makes the admin; on a surviving
+# emptyDir the user already exists and the CLI's error is ignored.
+log "ensuring the Gitea admin account '$ADMIN_USER' (kubectl exec) ..."
+"${KUBECTL[@]}" exec deploy/gitea -- sh -c \
+	"su -s /bin/sh git -c '/usr/local/bin/gitea admin user create --username $ADMIN_USER --password $ADMIN_PASS --email ${ADMIN_USER}@samples.local --admin --must-change-password=false' 2>&1 | tail -2" \
+	|| die "gitea admin user create failed (is the gitea pod Ready? kubectl --context $CTX -n $NS get pod)"
+
 # The Gitea API is reached host-side through a kubectl port-forward (no pod
 # scheduling needed; faster than an in-cluster client for a handful of API
 # calls). Port-forward to an ephemeral host port.

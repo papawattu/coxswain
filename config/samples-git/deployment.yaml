@@ -3,13 +3,13 @@
 # gitea/gitea 1.24, HTTP only on :3000. Storage is an emptyDir — no PVC,
 # the sample repos are disposable and re-seeded by `make samples-seed`.
 #
-# The 1.24 image has no admin auto-init (that arrived in 1.25), so the
-# one-shot gitea-init Job (job.yaml) performs the web install (creating the
-# admin user from the gitea-admin Secret) on the first boot. The Job gates
-# on the gitea service's /api/healthz, so it is safe to re-run: on a fresh
-# cluster the Job installs, on a surviving emptyDir the healthz check passes
-# and the Job is a no-op. INSTALL_LOCK is NOT set here — it is set by the
-# installer (the init Job) once the admin account exists.
+# Self-install on first boot: GITEA__security__INSTALL_LOCK=true +
+# GITEA__database__DB_TYPE=sqlite3 make the image skip the web installer
+# and open the sqlite DB directly (the 1.24 image has no admin auto-init,
+# that arrived in 1.25). The admin account is then created by
+# `make samples-seed` (hack/samples-seed.sh) via
+# `kubectl exec deploy/gitea -- su git -c "gitea admin user create ..."` —
+# no separate init Job, no PVC, the Deployment stays a single pod.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -45,18 +45,20 @@ spec:
         - name: http
           containerPort: 3000
         env:
-        # Gitea's env-config syntax: GITEA__<section>__<key>. (The init Job
-        # runs the installer which writes these into app.ini; the env vars
-        # here keep a re-boot consistent with the install.)
+        # Gitea's env-config syntax: GITEA__<section>__<key>.
+        # INSTALL_LOCK + sqlite3 = self-install on the emptyDir (no web
+        # installer, no install Job). The admin user is created post-boot
+        # by the seed step (gitea admin user create via kubectl exec).
+        - name: GITEA__security__INSTALL_LOCK
+          value: "true"
+        - name: GITEA__database__DB_TYPE
+          value: sqlite3
         - name: GITEA__server__DISABLE_SSH_SERVER
           value: "true"
         - name: GITEA__server__ROOT_URL
           value: "http://gitea.samples.svc:3000/"
-        - name: GITEA__database__DB_TYPE
-          value: sqlite3
         # Signups are closed: the only users are the ones the seed step
-        # creates through the admin API (the installer itself sets
-        # DISABLE_REGISTRATION=true).
+        # creates through the CLI/admin API.
         - name: GITEA__service__DISABLE_REGISTRATION
           value: "true"
         - name: GITEA__service__REQUIRE_SIGNIN_VIEW

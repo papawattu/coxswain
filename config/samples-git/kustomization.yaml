@@ -10,18 +10,16 @@
 #     Secret samples-git-cred   basic-auth credential for user 'samples'
 #                               (gitCredentialSecret for the sample Loops)
 #     Secret gitea-admin        admin credential (the admin user is created
-#                               by the gitea-init Job, which runs the web
-#                               installer on first boot — the 1.24 image has
-#                               no admin auto-init, that arrived in 1.25)
+#                               post-boot by the seed step via 'gitea admin
+#                               user create' — the 1.24 image has no admin
+#                               auto-init, that arrived in 1.25)
 #     Deployment gitea         gitea/gitea 1.24, HTTP only on :3000,
-#                              emptyDir storage (disposable)
+#                              emptyDir storage (disposable), self-installs
+#                              (INSTALL_LOCK=true + sqlite3)
 #     Service gitea            ClusterIP on :3000
-#     Job gitea-init           one-shot: performs the web install (creates
-#                              the admin user), idempotent
 namespace: samples
 resources:
 - namespace.yaml
 - secret.yaml
 - deployment.yaml
 - service.yaml
-- job.yaml

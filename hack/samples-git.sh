@@ -51,17 +51,6 @@ up)
 		}
 		sleep 5
 	done
-	# The gitea-init Job performs the web install (creates the admin user; the
-	# 1.24 image has no admin auto-init). It gates on the service healthz, so
-	# by the time the Deployment is Ready the Job may already be done — wait
-	# for its completion condition either way.
-	log "waiting for the gitea-init Job (web install + admin user) to complete ..."
-	if ! kubectl --context "$CTX" -n "$NS" wait --for=condition=complete job/gitea-init --timeout=180s >/dev/null 2>&1; then
-		kubectl --context "$CTX" -n "$NS" get job gitea-init
-		kubectl --context "$CTX" -n "$NS" logs job/gitea-init --tail=15 || true
-		die "gitea-init Job did not complete in 180s (see the job logs above)"
-	fi
-	kubectl --context "$CTX" -n "$NS" get job gitea-init
 	kubectl --context "$CTX" -n "$NS" get pod -l app.kubernetes.io/name=gitea
 	kubectl --context "$CTX" -n "$NS" get svc gitea
 	log "samples-up complete: Gitea Ready at http://gitea.${NS}.svc:3000"

@@ -23,8 +23,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
+	"net/http"
 	netip "net/netip"
 	neturl "net/url"
 	"os"
@@ -49,6 +51,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -2779,20 +2782,24 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			ReadFile(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error)
 		}); ok {
 			r.readFile = rc.ReadFile
+		} else if mgr.GetClient() != nil {
+			// The manager hands out the concrete REST client as a
+			// client.Client interface value; ReadFile is not on that
+			// interface, so recover it from the client's own REST transport.
+			r.readFile = newReadFileViaREST(mgr.GetConfig())
 		}
 	}
 	// The controller MUST be able to read the baseCommit file back from the
-	// sandbox pod (S3a). When the seam could not be wired (the manager's
-	// client does not expose ReadFile), every baseCommit read would silently
-	// skip and status.baseCommit would stay empty forever (observed live on
-	// kind 2026-10-02: the init container wrote the file, the pod was Ready,
-	// and no reconcile ever populated status.baseCommit — the read path was
-	// dead because the type assertion above never succeeded). Fail fast at
-	// startup instead: the baseCommit is the operator's own evidence (the
-	// init container's output, ADR-0004) and the TamperedVerify diff depends
-	// on it (ADR-0005 D10).
+	// sandbox pod (S3a). When the seam could not be wired, every baseCommit
+	// read would silently skip and status.baseCommit would stay empty
+	// forever (observed live on kind 2026-10-02: the init container wrote
+	// the file, the pod was Ready, and no reconcile ever populated
+	// status.baseCommit — the read path was dead). Fail fast at startup
+	// instead: the baseCommit is the operator's own evidence (the init
+	// container's output, ADR-0004) and the TamperedVerify diff depends on
+	// it (ADR-0005 D10).
 	if r.readFile == nil {
-		return errors.New("loop controller: could not wire the baseCommit read-back seam (r.readFile); the manager's client does not expose ReadFile — the operator cannot record status.baseCommit")
+		return errors.New("loop controller: could not wire the baseCommit read-back seam (r.readFile); the operator cannot record status.baseCommit")
 	}
 	// I42e + I42c: read the cluster's pod/service CIDRs from the environment
 	// (set at deployment, e.g. kind/k3s exposes these as --pod-network-cidr /
@@ -2864,6 +2871,40 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return b.Named("loop").
 		Complete(r)
+}
+
+// newReadFileViaREST builds a readFile func that issues the kubelet-backed
+// Pod read subresource (GET /api/v1/namespaces/<ns>/pods/<name> with the
+// container + file query params) using a REST client built from cfg. It is
+// the fallback when the manager's client does not expose ReadFile directly
+// (ReadFile is not on the client.Client interface). The request is the same
+// one controller-runtime's concrete client makes; this is a minimal
+// re-implementation so the seam is always wired in a live deployment.
+func newReadFileViaREST(cfg *restclient.Config) func(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error) {
+	return func(ctx context.Context, pod *corev1.Pod, path string) ([]byte, error) {
+		// The kubelet Pod read subresource is served at:
+		// /api/v1/namespaces/<ns>/pods/<name> (proxied to the kubelet).
+		// The controller-runtime concrete client uses the same path; the
+		// container and file are passed as query params.
+		url := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", pod.Namespace, pod.Name)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.Host+url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build http request for baseCommit read: %w", err)
+		}
+		if cfg.BearerToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+		}
+		httpResp, err := cfg.Transport.RoundTrip(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("kubelet read subrequest for baseCommit: %w", err)
+		}
+		defer func() { _ = httpResp.Body.Close() }()
+		if httpResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(httpResp.Body)
+			return nil, fmt.Errorf("kubelet read for %s: HTTP %d: %s", path, httpResp.StatusCode, string(body))
+		}
+		return io.ReadAll(httpResp.Body)
+	}
 }
 
 // agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace

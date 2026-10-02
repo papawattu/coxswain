@@ -1,0 +1,26 @@
+diff --git a/main.go b/main.go
+index 38cf674..6a7520c 100644
+--- a/main.go
++++ b/main.go
+@@ -13,6 +13,7 @@ import (
+ func main() {
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/healthz", healthz)
++	mux.HandleFunc("/api/v1/ping", ping)
+ 
+ 	port := os.Getenv("PORT")
+ 	if port == "" {
+@@ -34,3 +35,9 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
+ 	w.WriteHeader(http.StatusOK)
+ 	fmt.Fprint(w, "ok")
+ }
++
++
++func ping(w http.ResponseWriter, _ *http.Request) {
++	w.WriteHeader(http.StatusOK)
++	fmt.Fprint(w, "pong")
++}
+diff --git a/webapi b/webapi
+deleted file mode 100755
+index 41a5bc1..0000000
+Binary files a/webapi and /dev/null differ

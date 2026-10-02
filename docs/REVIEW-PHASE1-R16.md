@@ -14,7 +14,7 @@ envtest. That is itself the main lesson (see I43).
 ### D38. The agent can reach the control plane on CNIs that don't police pod→host-network egress
 
 - [x] Owner decision (2026-10-01): production CNI requirement (question 1 below): **a requirement on the property, plus a preflight check**
-- [ ] Owner decision: CNI-independent defence in depth (question 2 below)
+- [x] Owner decision: CNI-independent defence in depth (question 2 below) — decided, see R18
 - [ ] Planned as slices
 
 **Where:** the per-Loop agent NetworkPolicy (D34, I42c) on kind's default CNI,
@@ -88,7 +88,7 @@ host-network gap as a **known limitation**, not a pass.
 ### D39. Every operator-injected hostname must resolve under the agent's KubeArmor DNS allowlist
 
 - [x] Fixed for the model proxy and egress proxy in I42d (#25, `bcffd86`)
-- [ ] Rule adopted for future slices (I42f and later); owner confirmation requested
+- [x] Rule adopted for future slices (I42f and later); owner confirmed in R18
 
 **Where:** `policy.Translate` (the agent KubeArmorPolicy `matchDNSQueries`),
 the agent pod's DNS config, and every URL the operator puts in the agent's
@@ -131,7 +131,7 @@ The full I42 e2e must run with enforcement **on**. Dev runs with
 
 ### D40. Marking PRs ready: the builder's token can't do it
 
-- [ ] Owner decision
+- [x] Owner decision — (a), see R18
 
 **Problem:** pi reported that its token can't mark a draft PR ready
 (`gh pr ready`). On #25 the reviewer marked it ready. That left the PR title

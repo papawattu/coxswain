@@ -31,7 +31,7 @@ all of them:
 ### D41. Authenticated tool proxies with allowlisted egress
 
 - [x] Owner direction (2026-10-01): tool proxies use allowlisted egress
-- [ ] Owner decision: questions below
+- [x] Owner decision: questions below — answered in R18
 - [ ] ADR written (generalises ADR-0006's zero-credential rule to tools)
 - [ ] Planned as slices
 
@@ -93,7 +93,7 @@ Putting a token in the agent breaks ADR-0006's zero-credential property.
 
 ### D42. Fan-out: many Loops from one request
 
-- [ ] Owner decision: questions below
+- [x] Owner decision: questions below — answered in R18
 - [ ] Planned as slices
 
 **Where:** a new parent resource over Loops; the model and tool proxies; the
@@ -159,7 +159,7 @@ approved by hand, and nothing bounds concurrency, cost or upstream rate limits.
 
 ### D43. Multi-tenancy
 
-- [ ] Owner decision: questions below
+- [x] Owner decision: questions below — answered in R18
 - [ ] Planned as slices
 
 **Where:** namespaces/RBAC, a new cluster-scoped tenant policy, admission,

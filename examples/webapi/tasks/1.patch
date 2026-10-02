@@ -20,7 +20,3 @@ index 38cf674..6a7520c 100644
 +	w.WriteHeader(http.StatusOK)
 +	fmt.Fprint(w, "pong")
 +}
-diff --git a/webapi b/webapi
-deleted file mode 100755
-index 41a5bc1..0000000
-Binary files a/webapi and /dev/null differ

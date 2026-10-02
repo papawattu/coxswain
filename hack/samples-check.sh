@@ -27,48 +27,26 @@ fail() { say "FAIL: $*"; FAILURES=$((FAILURES + 1)); }
 pass() { say "PASS: $*"; }
 
 # --- acceptance checks per app (the ONLY gate to Succeeded, SAMPLES-PLAN §1) ---
-# Each returns 0 when its assertions hold, 1 otherwise.
-#
-# NOTE: `local` resets $?, so we capture rc on a separate line after the
-# command-substitution assignment, and declare locals on their own line.
+# Each returns 0 when the acceptance checks pass (green), 1 when they fail
+# (red). The caller asserts the red state involves this task's own tests via
+# the RED_HINT global (set by check_app before calling).
 
 checks_gocli() {
-  local d="$1" out rc
-  d="$1"
-  out=$(cd "$d" && { go build ./... && go vet ./... && go test ./...; } 2>&1)
-  rc=$?
-  if [ "$rc" -eq 0 ]; then return 0; fi
-  case "$CUR_APP-$CUR_TASK" in
-    gocli-1) printf '%s' "$out" | grep -q 'TestRound' ;;
-    gocli-2) printf '%s' "$out" | grep -q 'TestMainJSON' ;;
-    *) return 1 ;;
-  esac
+  (cd "$1" && go build ./... && go vet ./... && go test ./...)
 }
 
 checks_pylib() {
-  local d="$1" out rc
-  d="$1"
-  out=$(cd "$d" && { python3 -m compileall -q . && python3 -m unittest discover -s tests; } 2>&1)
-  rc=$?
-  if [ "$rc" -eq 0 ]; then return 0; fi
-  case "$CUR_APP-$CUR_TASK" in
-    pylib-1) printf '%s' "$out" | grep -q 'Median\|test_median' ;;
-    pylib-2) printf '%s' "$out" | grep -q 'Clamp\|test_clamp' ;;
-    *) return 1 ;;
-  esac
+  (cd "$1" && python3 -m compileall -q . && python3 -m unittest discover -s tests)
 }
 
 checks_webapi() {
-  local d="$1" out rc
-  d="$1"
-  out=$(cd "$d" && { go build ./... && bash test/smoke.sh; } 2>&1)
-  rc=$?
-  if [ "$rc" -eq 0 ]; then return 0; fi
-  case "$CUR_APP-$CUR_TASK" in
-    webapi-1) printf '%s' "$out" | grep -q 'ping: FAIL' ;;
-    webapi-2) printf '%s' "$out" | grep -q 'echo: FAIL' ;;
-    *) return 1 ;;
-  esac
+  (cd "$1" && go build ./... && bash test/smoke.sh)
+}
+
+# red_hint PATTERN — returns 0 if PATTERN is found in the most recent check
+# output. Called with the runner's captured output on stdout.
+red_hint_ok() {
+  grep -q "$RED_HINT"
 }
 
 task_count() {
@@ -80,10 +58,24 @@ commit_state() {
     git -c user.email=samples@coxswain.local -c user.name=samples commit -qm "state" || true)
 }
 
+# red_hint_for APP TASK — the grep pattern that identifies the task's own
+# failing test in the check output.
+red_hint_for() {
+  case "$1-$2" in
+    gocli-1)    echo 'TestRound' ;;
+    gocli-2)    echo 'TestMainJSON' ;;
+    pylib-1)    echo 'Median' ;;
+    pylib-2)    echo 'Clamp' ;;
+    webapi-1)   echo 'ping: FAIL' ;;
+    webapi-2)   echo 'echo: FAIL' ;;
+    *)          echo "task$2" ;;
+  esac
+}
+
 check_app() {
   local app="$1"
   local seed="$ROOT/examples/$app"
-  local n work runner t
+  local n work runner t out rc hint
   n=$(task_count "$app")
   say "== $app: $n task(s) =="
   if [ "$n" -eq 0 ]; then
@@ -98,29 +90,55 @@ check_app() {
   (cd "$work" && git init -q && git add -A && \
     git -c user.email=samples@coxswain.local -c user.name=samples commit -qm seed)
 
-  CUR_APP="$app"
   runner="checks_$app"
   for t in $(seq 1 "$n"); do
-    CUR_TASK=$t
+    hint=$(red_hint_for "$app" "$t")
 
-    # Seed-state assertion: the suite must be red in a way that involves
-    # this task's own tests.
-    if "$runner" "$work"; then
+    # Seed-state assertion: the suite must be red on the seed state.
+    out=$("$runner" "$work" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
       fail "$app task $t: acceptance checks PASS on seed state (expected FAIL)"
     else
       pass "$app task $t: acceptance checks fail on seed state"
     fi
+
+    # Reference-patch assertion: applying task $t's patch to the seed turns
+    # the suite green. (Each task's patch is cumulative: it carries all
+    # prior tasks' changes, so it makes the full check suite pass when
+    # applied to the seed state.)
+    if ! (cd "$work" && git apply --check "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
+      fail "$app task $t: reference patch does not apply to seed"
+    elif ! (cd "$work" && git apply "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
+      fail "$app task $t: reference patch failed to apply"
+    else
+      out=$("$runner" "$work" 2>&1)
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        pass "$app task $t: acceptance checks pass after reference patch"
+      else
+        fail "$app task $t: acceptance checks still fail after reference patch"
+        printf '%s\n' "$out" | tail -15
+      fi
+    fi
+
+    # Reset the temp dir to the seed state for the next task.
+    (cd "$work" && git checkout -q -- . && git clean -qfd)
 
     # Reference-patch assertion: applying task $t turns the suite green.
     if ! (cd "$work" && git apply --check "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
       fail "$app task $t: reference patch does not apply"
     elif ! (cd "$work" && git apply "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
       fail "$app task $t: reference patch failed to apply"
-    elif "$runner" "$work"; then
-      pass "$app task $t: acceptance checks pass after reference patch"
     else
-      fail "$app task $t: acceptance checks still fail after reference patch"
-      "$runner" "$work" 2>&1 | tail -15 || true
+      out=$("$runner" "$work" 2>&1)
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        pass "$app task $t: acceptance checks pass after reference patch"
+      else
+        fail "$app task $t: acceptance checks still fail after reference patch"
+        printf '%s\n' "$out" | tail -15
+      fi
     fi
 
     commit_state "$work"

@@ -39,6 +39,7 @@ die() { printf '\033[1;31m[samples-seed FATAL]\033[0m %s\n' "$*" >&2; exit 1; }
 command -v kubectl >/dev/null || die "kubectl is not on PATH"
 command -v jq >/dev/null || die "jq is not on PATH (required for the Gitea API calls)"
 command -v git >/dev/null || die "git is not on PATH"
+command -v tar >/dev/null || die "tar is not on PATH (required to unpack the git archive)"
 kubectl --context "$CTX" get nodes >/dev/null 2>&1 \
 	|| die "cannot reach cluster context '$CTX' (is the coxswain-dev kind cluster up?)"
 
@@ -59,6 +60,15 @@ GIT_PASS=$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.data.passw
 	|| die "secret samples-git-cred missing/empty in ns $NS (run 'make samples-up' first)"
 
 log "ctx=$CTX ns=$NS user=$GIT_USER apps=${APPS[*]}"
+
+# The seed source is the COMMITTED tree (HEAD:examples/<app>), not the
+# working tree. The working tree can carry untracked build artefacts (a
+# compiled examples/gocli/gocli binary, .DS_Store, etc.) that would otherwise
+# leak into the seeded repo. 'git archive' materialises only tracked content
+# at HEAD into a tar stream.
+#   git -C "$ROOT" archive HEAD:examples/$app
+# is piped straight into tar -x (no temp tar file), so nothing is written to
+# the repo between the archive and the unpack.
 
 # Create the admin account (idempotent). The 1.24 image self-installs
 # (INSTALL_LOCK=true + sqlite3) but has no admin auto-init, so the account
@@ -159,8 +169,23 @@ for app in "${APPS[@]}"; do
 
 	# 2. Temp git copy of examples/<app> — never the coxswain repo (S2
 	#    requirement: nothing ever points at github.com).
+	#    The seed source is the COMMITTED tree (HEAD:examples/<app>), filtered by git
+	#    pathspec and materialised with 'git archive' into a tar stream that is
+	#    unpacked here. The ':(exclude)tasks' / ':(exclude)tasks.md' pathspecs drop
+	#    the S1 reference answers, which live in the coxswain repo under
+	#    examples/<app>/ but must NOT be in the seeded repo — the Loops are
+	#    expected to produce them, so shipping them would leak the answers.
+	#    (A plain 'git archive HEAD:examples/<app>' keeps them because they are
+	#    tracked; the pathspec excludes are what actually drop them. Excluding via
+	#    git — rather than tar --exclude — avoids the tar path-prefix gotcha: git
+	#    archive emits member paths without a './' prefix, so a tar --exclude
+	#    pattern written with './' never matches.)
+	#    'git archive' also drops the untracked working-tree files (a compiled
+	#    examples/gocli/gocli binary, .DS_Store, editor swap files) that a 'cp -a'
+	#    of the working tree would otherwise copy in.
 	workdir=$(mktemp -d)
-	cp -a "$ROOT/examples/$app/." "$workdir/"
+	git -C "$ROOT" archive "HEAD:examples/$app" \
+		-- . ':(exclude)tasks' ':(exclude)tasks.md' | tar -x -C "$workdir"
 	rm -rf "$workdir/.git" 2>/dev/null || true
 	(
 		cd "$workdir"

@@ -87,6 +87,24 @@ $logline"
 $remotes"
 	fi
 	log "   $app remotes: $(printf '%s' "$remotes" | head -1)"
+	# git ls-files: the seed must contain ONLY the app's own files — no
+	# reference answers. The S1 reference answers (tasks/*.patch, tasks.md)
+	# live in the coxswain repo under examples/<app>/ but must NOT be in the
+	# seeded repo: the Loops are expected to produce them, so shipping them
+	# leaks the answers. 'git archive HEAD:examples/<app>' materialises the
+	# committed tree; the tar --exclude filters in samples-seed.sh drop
+	# tasks/ and tasks.md. A *.patch anywhere (top-level or nested) is also
+	# a leak (the answers are all .patch files). The set must be non-empty
+	# (the app files themselves are present), so an empty ls-files is not a
+	# vacuous pass.
+	lsfiles=$("${KUBECTL[@]}" exec "$POD" -- sh -c "cd /tmp/$app && git ls-files" 2>&1)
+	if printf '%s\n' "$lsfiles" | grep -qE '^tasks/|^tasks\.md$|\.patch$'; then
+		die "samples/$app seeded tree contains reference-answer files (tasks/, tasks.md, or *.patch):
+$lsfiles"
+	fi
+	nfiles=$(printf '%s\n' "$lsfiles" | grep -c . || true)
+	[ "$nfiles" -gt 0 ] || die "samples/$app git ls-files is empty (the app files are missing)"
+	log "   $app ls-files: $nfiles file(s), no tasks/ or tasks.md or *.patch"
 done
 
-log "S2 acceptance PASSED for: ${APPS[*]} (clone + single 'initial' commit + no github.com remote, all from a throwaway pod in ns $NS)"
+log "S2 acceptance PASSED for: ${APPS[*]} (clone + single 'initial' commit + no github.com remote + no reference-answer files, all from a throwaway pod in ns $NS)"

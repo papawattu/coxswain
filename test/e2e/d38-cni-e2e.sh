@@ -103,24 +103,50 @@ echo "   building $PROXY_IMG ..."
 (cd "$REPO_ROOT" && docker build -q -t "$PROXY_IMG" -f cmd/proxy-standin/Dockerfile .) || { echo "FATAL: proxy build failed"; exit 2; }
 echo "   building $EGRESS_IMG ..."
 (cd "$REPO_ROOT" && docker build -q -t "$EGRESS_IMG" -f cmd/egress-proxy/Dockerfile .) || { echo "FATAL: egress-proxy build failed"; exit 2; }
-for img in "$IMG" "$PROXY_IMG" "$EGRESS_IMG" "$AGENT_IMG"; do
+# PROBE_IMG = the operator's CNI self-test probe image (the --cni-probe-image
+# default). The operator creates the probe pod by image name, so it must be
+# loadable by the kind node (pre-loaded here for offline hosts).
+PROBE_IMG="python:3-alpine"
+for img in "$IMG" "$PROXY_IMG" "$EGRESS_IMG" "$AGENT_IMG" "$PROBE_IMG"; do
   echo "   kind load: $img"
   kind load docker-image "$img" --name "$CLUSTER" || { echo "FATAL: kind load $img failed"; exit 2; }
 done
 
 echo
-echo "--- STEP 2: deploy controller (dev overlay: --allow-unenforced) ---"
+echo "--- STEP 2: deploy controller (config/calico: --allow-unenforced ONLY, NO --allow-unenforced-network) ---"
 make -C "$REPO_ROOT" kustomize >/dev/null 2>&1
 KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
-# Build the dev overlay from a TEMP COPY of the config tree (R16 I44 norm:
-# never let `kustomize edit set image` rewrite the tracked kustomization.yaml).
+# Build the calico/enforcing-CNI profile (config/calico) from a TEMP COPY of
+# the config tree (R16 I44 norm: never let `kustomize edit set image` rewrite
+# the tracked kustomization.yaml). config/calico = config/default +
+# --allow-unenforced (bypasses the D30 KubeArmor gate — KubeArmor is absent
+# by design on the enforcing-CNI cluster, ADR-0007 F2) but NOT
+# --allow-unenforced-network (the D38 network gate stays LIVE). Calico
+# enforces the D38 property, so the operator's own CNI self-test probe passes
+# and Loops run with NetworkEnforced=True (CNIEnforced). On a non-enforcing
+# CNI (kindnet), this same overlay would hold Loops Suspended with
+# NetworkEnforced=False (CNIUnenforced).
 TMP_OVERLAY=$(mktemp -d)
 cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
-(cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) \
+(cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/calico | K apply -f -) \
   || { echo "FATAL: controller deploy failed"; exit 2; }
+# D38: the cni-probe kustomization is standalone (not in config/calico — see
+# config/cni-probe/kustomization.yaml); apply it separately so the operator's
+# CNI self-test probe namespace + namespaced RBAC exist before the operator's
+# first probe run.
+(cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/cni-probe | K apply -f -) \
+  || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 2; }
+# Force a short CNI probe interval (30s) so the probe re-runs quickly after the
+# Loop is created (the default 10m interval would make the e2e wait up to 10
+# minutes for the NetworkEnforced condition). This is a test-only override; the
+# production default remains 10m. The patch appends --cni-check-interval=30s to
+# the existing args (the calico overlay sets --allow-unenforced; this adds the
+# short interval on top).
+K -n "$E2E_NS" patch deploy coxswain-controller-manager --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","args":["--metrics-bind-address=:8443","--leader-elect","--health-probe-bind-address=:8081","--allow-unenforced","--cni-check-interval=30s"]}]}}}}' >/dev/null 2>&1 || true
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || { echo "FATAL: controller not ready"; exit 2; }
-echo "   controller running"
+echo "   controller running (base install: no escape hatches, 30s probe interval)"
+echo "   cni-probe ns + RBAC applied"
 
 # ===========================================================================
 # STEP 3: create the fixture (namespace, AgentPolicy, Loop).
@@ -179,6 +205,114 @@ for i in $(seq 1 60); do
 done
 [ "$READY" = "yes" ] || { echo "FATAL: egress proxy pod did not become Ready"; exit 2; }
 echo "   egress proxy Ready"
+
+# ===========================================================================
+# STEP 3c: the D38 operator CNI self-test gate (D38s3 acceptance, design
+# point 7 Calico bullet): the operator's own probe (the coxswain-cni-probe
+# pod in the fixed coxswain-cni-probe namespace) must have run and PASSED,
+# and the Loop must carry NetworkEnforced=True reason=CNIEnforced — with NO
+# escape hatch set (base install). This is what makes the C1-C5 blocks
+# below a property of the CNI, not just of the operator's NetworkPolicy.
+# ===========================================================================
+echo
+echo "--- STEP 3c: D38 gate assertions (NetworkEnforced=True reason=CNIEnforced, no escape hatch) ---"
+# The operator probes at startup (and every --cni-check-interval, default 10m).
+# When the Loop is (re)created AFTER the controller started, the reconcile that
+# sets NetworkEnforced runs on the next probe-completion retage (or the next
+# reconcile trigger). Poll for up to ~2 minutes for the condition to become
+# True CNIEnforced (the probe runs at startup, takes ~10-20s, then the retage
+# + reconcile sets the condition on every Loop).
+NE_COND=""
+for i in $(seq 1 24); do
+  NE_COND=$(K -n "$NS" get loop "$LOOP" -o jsonpath='{.status.conditions[?(@.type=="NetworkEnforced")].status} {.status.conditions[?(@.type=="NetworkEnforced")].reason}' 2>/dev/null)
+  case "$NE_COND" in
+    "True CNIEnforced") break ;;
+    "False "*) break ;; # a definitive False (CNIUnenforced/ProbeUnavailable) is stable — don't wait for it to flip
+  esac
+  sleep 5
+done
+echo "   NetworkEnforced condition: $NE_COND"
+case "$NE_COND" in
+  "True CNIEnforced") ok "NetworkEnforced=True reason=CNIEnforced (the operator's CNI self-test passed; no escape hatch)" ;;
+  *) bad "NetworkEnforced is not (True CNIEnforced): got '$NE_COND' (expected the operator's probe to pass on Calico)" ;;
+esac
+
+# The operator must be running WITHOUT the escape hatches (base install).
+CONTROLLER_ARGS=$(K -n "$E2E_NS" get deploy coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null)
+echo "   controller args: $CONTROLLER_ARGS"
+case "$CONTROLLER_ARGS" in
+  *"--allow-unenforced-network"*) bad "controller runs WITH --allow-unenforced-network — the gate would pass-via-flag and prove nothing about the CNI" ;;
+  *) ok "controller runs WITHOUT --allow-unenforced-network (the D38 gate is real)" ;;
+esac
+# --allow-unenforced IS expected on the calico profile: it bypasses the D30
+# KubeArmor gate (KubeArmor is absent by design, ADR-0007 F2) so the D38
+# network gate is the only gate under test. We assert it IS present (the
+# calico overlay sets it) and that it is the ONLY escape hatch.
+case "$CONTROLLER_ARGS" in
+  *"--allow-unenforced"*) ok "controller runs WITH --allow-unenforced (expected on the calico profile: bypasses the D30 KubeArmor gate; the D38 network gate is the one under test)" ;;
+  *) bad "controller runs WITHOUT --allow-unenforced — the D30 KubeArmor gate would hold Loops (KubeArmor is absent on this cluster); the calico overlay should set it" ;;
+esac
+
+# The probe pod: the operator creates + deletes it per probe run, so it is
+# normally absent at the moment we look (the run just finished and the pod
+# was cleaned up). If one is live, it must be progressing toward Succeeded —
+# a stuck pod is the ProbeUnavailable path (the gate would then hold the
+# Loop Suspended, which the NetworkEnforced check above already catches).
+PROBE_NS=coxswain-cni-probe
+if K get ns "$PROBE_NS" >/dev/null 2>&1; then
+  # The probe pod's termination message (captured while the pod is live):
+  # the expected-BLOCKED targets (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL)
+  # must be BLOCKED and the positive control (DNS_POSITIVE) must be REACHABLE
+  # — the operator's own result, not just its condition.
+  PROBE_POD_LIVE=$(K -n "$PROBE_NS" get pods -l "coxswain.io/probe=cni-probe" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "$PROBE_POD_LIVE" ]; then
+    PROBE_MSG=$(K -n "$PROBE_NS" logs "$PROBE_POD_LIVE" 2>/dev/null)
+    echo "   live probe pod $PROBE_POD_LIVE termination message:"
+    echo "$PROBE_MSG" | sed 's/^/     /'
+    for LBL in APISERVER_SVC NODE_API KUBELET_NODE EXTERNAL; do
+      if echo "$PROBE_MSG" | grep -q "RESULT $LBL REACHABLE"; then
+        bad "probe reports $LBL REACHABLE (the CNI must block it; the gate should not be CNIEnforced)"
+      elif echo "$PROBE_MSG" | grep -q "RESULT $LBL BLOCKED"; then
+        ok "probe reports $LBL BLOCKED"
+      fi
+    done
+    if echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE REACHABLE"; then
+      ok "probe reports DNS_POSITIVE REACHABLE (positive control: the probe has network egress to the allowed kube-dns)"
+    elif echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE BLOCKED"; then
+      bad "probe reports DNS_POSITIVE BLOCKED (the positive control failed: the probe has no network -> ProbeUnavailable)"
+    fi
+  else
+    echo "   (no live probe pod to read a termination message from — the operator deletes it after each run)"
+  fi
+  # NetworkPolicy shape: the probe netpol must be the verify-cni.sh shape
+  # (DNS-only egress to kube-system kube-dns), NOT the old agent-shaped
+  # 0.0.0.0/0-minus-RFC1918 allow list that let the external targets through.
+  PROBE_NETPOL=$(K -n "$PROBE_NS" get netpol coxswain-cni-probe-netpol -o json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['spec']['egress'][0], sort_keys=True))" 2>/dev/null)
+  echo "   probe netpol egress[0]: $PROBE_NETPOL"
+  case "$PROBE_NETPOL" in
+    *"kube-system"*"kube-dns"*)
+      if echo "$PROBE_NETPOL" | grep -q '"ipBlock"'; then
+        bad "probe netpol still carries an IPBlock (the old agent-shaped 0.0.0.0/0-minus-RFC1918 allow list — external targets are ALLOWED under it, so a REACHABLE external target is not a CNI failure)"
+      else
+        ok "probe netpol is the verify-cni.sh shape (DNS 53 UDP+TCP to kube-system kube-dns only; no IPBlock)"
+      fi ;;
+    *) bad "probe netpol is not the verify-cni.sh shape (missing the kube-system kube-dns peer): $PROBE_NETPOL" ;;
+  esac
+  PROBE_PODS=$(K -n "$PROBE_NS" get pods --no-headers 2>/dev/null)
+  echo "   probe namespace $PROBE_NS pods:"
+  if [ -n "$PROBE_PODS" ]; then
+    echo "$PROBE_PODS" | sed 's/^/     /'
+    if echo "$PROBE_PODS" | grep -qE "(Error|ImagePullBackOff|ErrImagePull|CrashLoopBackOff|InvalidImageName)"; then
+      bad "a probe pod is in a bad state (ProbeUnavailable path)"
+    else
+      ok "probe pod present and progressing (the operator deletes it after reading the result)"
+    fi
+  else
+    ok "no live probe pod (expected: the operator deletes the probe pod after each run)"
+  fi
+else
+  bad "probe namespace $PROBE_NS does not exist — the operator cannot run its CNI self-test (config/cni-probe not installed?)"
+fi
 
 AGENT_POD=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 [ -z "$AGENT_POD" ] && { echo "FATAL: no agent pod found"; exit 2; }
@@ -278,6 +412,22 @@ assert_blocked INTERNAL_POD "cluster-internal pod IP $TEST_IP:8080"
 echo "  (C5) disallowed external $GH_IP:443"
 assert_blocked EXTERNAL "disallowed external $GH_IP:443"
 
+# C8: the operator's OWN CNI self-test (D38 design point 3: the
+# NetworkEnforced condition on the Loop) must agree with what the e2e
+# just proved directly from the agent pod. If the direct agent-pod probes
+# (C1-C5) show the CNI is blocking but the operator's condition says
+# CNIUnenforced/ProbeUnavailable, the operator's probe is broken even if
+# the CNI itself is fine. The NetworkEnforced=True assertion in STEP 3c
+# already covers the happy path; this is a redundant double-check that the
+# condition is still True right now (it can't have flipped — the probe
+# result is only re-read on the 10-minute interval or a re-gate event).
+NE_COND_NOW=$(K -n "$NS" get loop "$LOOP" -o jsonpath='{.status.conditions[?(@.type=="NetworkEnforced")].status} {.status.conditions[?(@.type=="NetworkEnforced")].reason}' 2>/dev/null)
+if [ "$NE_COND_NOW" = "True CNIEnforced" ]; then
+  ok "(C8) NetworkEnforced still True CNIEnforced after the direct probes (the operator's probe and the e2e agree)"
+else
+  bad "(C8) NetworkEnforced flipped to '$NE_COND_NOW' after the direct probes (expected True CNIEnforced)"
+fi
+
 # ===========================================================================
 # CHECKS 6-7: the egress proxy still works (allowed 200 / disallowed 403).
 # ===========================================================================
@@ -341,6 +491,7 @@ echo "  C2 apiserver node ($NODE_IP:6443)           — asserted BLOCKED"
 echo "  C3 kubelet node ($NODE_IP:10250)            — asserted BLOCKED"
 echo "  C4 cluster-internal pod IP ($TEST_IP:8080)  — asserted BLOCKED"
 echo "  C5 disallowed external ($GH_IP:443)         — asserted BLOCKED"
+echo "  C8 operator's NetworkEnforced condition     — asserted True CNIEnforced (STEP 3c + C8)"
 echo "  C6 allowed host via egress proxy            — asserted 200"
 echo "  C7 disallowed host via egress proxy         — asserted 403"
 echo "  KubeArmor-dependent checks (I42 9/10/11, I42 7) — SKIPPED (no KubeArmor here; ADR-0007 F2)"

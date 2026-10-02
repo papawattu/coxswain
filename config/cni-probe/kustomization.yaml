@@ -1,0 +1,35 @@
+# D38: the fixed namespace the operator's CNI self-test probe pod + probe
+# NetworkPolicy live in.
+#
+# - Created at install. A Role cannot pre-exist in a namespace created at
+#   runtime, so the namespace is install-time state and the operator never
+#   creates/deletes namespaces (no cluster-scoped RBAC for that; D38 plan
+#   design point 1).
+# - The operator creates the probe pod + probe NetworkPolicy in this
+#   namespace using the `coxswain-cni-probe` ServiceAccount (created here).
+#   The probe pod needs no RBAC itself (it just runs the probe command and
+#   exits); the ServiceAccount exists so the pod has an identity.
+# - The operator's probe NetworkPolicy matches ONLY the probe pod
+#   (coxswain.io/probe=cni-probe) — never the operator or any agent.
+# - The probe namespace must never be selected by the agent KubeArmor fences
+#   (selector: coxswain.io/loop) or by the per-Loop agent/proxy NetworkPolicies
+#   (app.kubernetes.io/component labels); the probe pod carries only
+#   coxswain.io/probe, so both selectors structurally miss it.
+#
+# Standalone kustomization: this kustomization is NOT added to config/default.
+# config/default applies `namespace: coxswain-system` and `namePrefix:
+# coxswain-`, which would rename the Namespace to coxswain-system (ID
+# collision with config/default's own Namespace) and prefix the
+# ServiceAccount/Role/RoleBinding names. The probe resources are therefore
+# built and applied SEPARATELY (the Makefile's `deploy`/`kind-calico-up`/
+# `kind-up` targets and test/e2e/d38-cni-e2e.sh apply `kustomize build
+# config/default` and then `kustomize build config/cni-probe`). The resources
+# are declared with their FINAL literal names (coxswain-cni-probe, etc.) and
+# live in the fixed coxswain-cni-probe namespace, matching the operator's
+# --cni-probe-namespace default and the ServiceAccount/Role/RoleBinding names
+# hard-wired in internal/cni/pod_prober.go and cmd/main.go.
+resources:
+- namespace.yaml
+- service_account.yaml
+- probe_role.yaml
+- probe_role_binding.yaml

@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -40,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/cni"
 	"github.com/papawattu/coxswain/internal/controller"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
@@ -91,6 +93,24 @@ func main() {
 	flag.BoolVar(&allowUnenforced, "allow-unenforced", false,
 		"Run Loops even when the eBPF engine is not enforcing (off by default; dev escape hatch). "+
 			"Loops run with PolicyEnforced=False reason EnforcementDisabled.")
+	// D38: the network escape hatch (separate from allow-unenforced — the two
+	// are independent) and the probe configuration.
+	var allowUnenforcedNetwork bool
+	flag.BoolVar(&allowUnenforcedNetwork, "allow-unenforced-network", false,
+		"Run Loops even when the CNI does not police pod -> host-network egress (off by default; dev escape hatch). "+
+			"Loops run with NetworkEnforced=False reason EnforcementDisabled.")
+	var cniCheckInterval time.Duration
+	flag.DurationVar(&cniCheckInterval, "cni-check-interval", 10*time.Minute,
+		"How often the leader-elected probe Runnable re-probes the CNI self-test (D38).")
+	var cniProbeTimeout time.Duration
+	flag.DurationVar(&cniProbeTimeout, "cni-probe-timeout", 60*time.Second,
+		"Per-run timeout for one CNI probe; not-Ready / no exit / pull failure within it = ProbeUnavailable (D38).")
+	var cniProbeImage string
+	flag.StringVar(&cniProbeImage, "cni-probe-image", "python:3-alpine",
+		"The image the CNI probe pod runs (D38). Must be pullable by the probe node.")
+	var cniProbeNamespace string
+	flag.StringVar(&cniProbeNamespace, "cni-probe-namespace", "coxswain-cni-probe",
+		"The fixed namespace the CNI probe pod + NetworkPolicy live in (D38; created at install).")
 	var clusterDomain string
 	flag.StringVar(&clusterDomain, "cluster-domain", "",
 		"The cluster's service DNS domain (default cluster.local). Used for the proxy Service FQDNs the agent's DNS "+
@@ -230,12 +250,47 @@ func main() {
 		// (no-op) only under the --allow-unenforced dev escape hatch (D38).
 		AllowUnenforced: allowUnenforced,
 	}
+	// D38: the operator-side CNI self-test prober. It runs the probe pod in the
+	// fixed coxswain-cni-probe namespace, reads the termination message, and
+	// caches the result in the shared holder. The leader-elected probe Runnable
+	// (registered below) calls Probe on an interval; the reconcile loop reads
+	// the cached result via LatestResult (never runs the probe).
+	cniProber := cni.NewPodProber(cni.PodProberConfig{
+		Client:        mgr.GetClient(),
+		Reader:        mgr.GetAPIReader(),
+		Namespace:     cniProbeNamespace,
+		ProbeImage:    cniProbeImage,
+		ProbeTimeout:  cniProbeTimeout,
+		ClusterDomain: clusterDomain,
+	})
+	// D38: the leader-elected probe Runnable (first probe at startup, then
+	// every cniCheckInterval). It re-gates every Loop (via a K8s Event + a
+	// source.Channel GenericEvent) when the result changes. The returned source
+	// is wired into the Loop controller (below) via the CNIRegateSource field
+	// so a result change enqueues every Loop.
+	cniRegateSrc, err := cni.AddProbeRunnable(mgr, cniProber, cniCheckInterval, cniProbeTimeout)
+	if err != nil {
+		setupLog.Error(err, "Failed to register the CNI probe Runnable")
+		os.Exit(1)
+	}
 	if err := (&controller.LoopReconciler{
-		Client:          mgr.GetClient(),
-		Scheme:          mgr.GetScheme(),
-		Enforcer:        kaEnforcer,
-		AllowUnenforced: allowUnenforced,
-		ClusterDomain:   clusterDomain,
+		Client:                 mgr.GetClient(),
+		Scheme:                 mgr.GetScheme(),
+		Enforcer:               kaEnforcer,
+		AllowUnenforced:        allowUnenforced,
+		AllowUnenforcedNetwork: allowUnenforcedNetwork,
+		CNIProber:              cniProber,
+		CNIRegateSource:        cniRegateSrc,
+		ClusterDomain:          clusterDomain,
+		// D38: the NetworkEnforced condition-change Event (the manager's
+		// recorder posts it as a Kubernetes Event; the re-gate Event lives
+		// in the probe Runnable).
+		// GetEventRecorderFor is deprecated in controller-runtime v0.25 in favour
+		// of GetEventRecorder (new events.k8s.io/v1 API) — but that returns the
+		// new events.EventRecorder (AnnotatedEventf) whose method set differs
+		// from LoopReconciler.Recorder (client-go record.EventRecorder). Keep the
+		// old (v1 Event, still fully supported) API until the recorder is ported.
+		Recorder: mgr.GetEventRecorderFor("loop-controller"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")
 		os.Exit(1)

@@ -57,8 +57,8 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "l1", Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:       "g",
-				Workspace:  coxv1alpha1.Workspace{Repo: "https://example.com/x.git"},
-				Verify:     coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{"go test ./..."}},
+				Workspace:  testWorkspace(),
+				Verify:     coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
 				PolicyRefs: policyRefs,
 			},
 		}

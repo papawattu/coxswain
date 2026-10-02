@@ -186,13 +186,17 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 	@curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
 	@echo "Waiting for the agent-sandbox controller to be ready..."
 	@kubectl --context kind-$(CALICO_CLUSTER) rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=180s
-	@echo "Deploying the operator (dev overlay: --allow-unenforced) on $(CALICO_CLUSTER)..."
+	@echo "Deploying the operator (BASE install: NO --allow-unenforced, NO --allow-unenforced-network) on $(CALICO_CLUSTER)..."
 	@echo "   Building the controller image coxswain-controller:d38 and the egress/proxy stand-ins..."
 	@$(CONTAINER_TOOL) build -t coxswain-controller:d38 -f Dockerfile . || { echo "FATAL: controller docker-build failed"; exit 1; }
 	@$(MAKE) egress-proxy-build
 	@$(MAKE) proxy-build
 	@echo "   Loading images into the kind node $(CALICO_CLUSTER)..."
-	@for img in coxswain-controller:d38 $(EGRESS_IMG) $(PROXY_IMG) golang:1.26 busybox:1.36; do \
+	# golang:1.26 = the e2e agent image; busybox:1.36 = the i42-e2e throwaway
+	# pod; python:3-alpine = the operator's CNI self-test probe pod
+	# (--cni-probe-image default; the operator pulls it by name, so it must be
+	# pre-loaded for offline hosts).
+	@for img in coxswain-controller:d38 $(EGRESS_IMG) $(PROXY_IMG) golang:1.26 busybox:1.36 python:3-alpine; do \
 		echo "     kind load: $$img"; \
 		$(KIND) load docker-image "$$img" --name $(CALICO_CLUSTER) || { echo "FATAL: kind load $$img failed"; exit 1; }; \
 	done
@@ -201,7 +205,13 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		TMP_OVERLAY=$$(mktemp -d); \
 		cp -r config "$$TMP_OVERLAY/config"; \
 		(cd "$$TMP_OVERLAY/config/manager" && "$(LOCALBIN)/kustomize" edit set image controller=coxswain-controller:d38); \
-		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/dev | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }
+		# D38: the enforcing-CNI profile deploys the BASE install (config/default): \
+		# NO --allow-unenforced and NO --allow-unenforced-network. Calico is the \
+		# enforcing CNI, so the D38 CNI self-test gate is expected to PASS \
+		# WITHOUT the escape hatch (NetworkEnforced=True). (A dev overlay here \
+		# would make the network gate pass-via-flag and prove nothing about \
+		# the CNI.) \
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/default | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }
 	@rm -rf "$${TMP_OVERLAY:-}"
 	@echo "kind-calico-up complete (cluster ready, images loaded; make d38-cni-e2e runs the assertions)."
 
@@ -335,6 +345,7 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	mkdir -p dist
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+	"$(KUSTOMIZE)" build config/cni-probe >> dist/install.yaml
 
 ##@ Deployment
 
@@ -366,15 +377,18 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config (fail-closed; no --allow-unenforced).
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" apply -f -
 
 .PHONY: deploy-dev
 deploy-dev: manifests kustomize ## Dev/kind only: deploy the controller with --allow-unenforced (Loops run before the I32 enforcement-evidence relay is wired). Not for production.
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/dev | "$(KUBECTL)" apply -f -
+	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Dependencies
 

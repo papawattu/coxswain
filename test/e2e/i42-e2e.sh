@@ -234,6 +234,11 @@ cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) \
   || { echo "FATAL: controller deploy failed"; exit 2; }
+# D38: the cni-probe kustomization is standalone (not in config/dev — see
+# config/cni-probe/kustomization.yaml); apply it separately so the operator's
+# CNI self-test probe namespace + namespaced RBAC exist.
+(cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/cni-probe | K apply -f -) \
+  || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 2; }
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || { echo "FATAL: controller not ready"; exit 2; }
 RUNNING_IMG_ID=$(K -n "$E2E_NS" get pods -l control-plane=controller-manager -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null)
 echo "   controller running, imageID: $RUNNING_IMG_ID"

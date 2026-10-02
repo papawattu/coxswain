@@ -2706,8 +2706,7 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	authLine := ""
 	fetchCred := ""
 	if loop.Spec.Workspace.GitCredentialSecret != "" {
-		authLine = `AUTH=$(printf '%s:%s' "$(cat /workspace-creds/` + workspaceCredsUsernameKey + `)" "$(cat /workspace-creds/` + workspaceCredsPasswordKey + `)" | base64 | tr -d '\\n')
-`
+		authLine = "AUTH=$(printf '%s:%s' \"$(cat /workspace-creds/" + workspaceCredsUsernameKey + ")\" \"$(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n"
 		fetchCred = ` -c http.extraHeader="Authorization: Basic $AUTH"`
 	}
 	// GIT_TERMINAL_PROMPT=0: never prompt (the init container has no TTY; a

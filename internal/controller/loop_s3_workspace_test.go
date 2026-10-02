@@ -280,6 +280,10 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 			"the init script must pass the Basic-auth header to the fetch via -c http.extraHeader")
 		Expect(cmd).To(ContainSubstring("Authorization: Basic $AUTH"),
 			"the fetch's http.extraHeader must be the Authorization: Basic header built from the mounted credential files")
+		Expect(cmd).To(ContainSubstring("base64 -w 0"),
+			"the script must base64 the credential on one line via 'base64 -w 0' (busybox and GNU base64 both support -w; no tr, which would corrupt the base64 output)")
+		Expect(cmd).NotTo(ContainSubstring("tr -d"),
+			"the script must not use tr on the base64 output (a raw-string tr -d argument corrupts the encoding: it would delete backslashes and every 'n'")
 		Expect(cmd).To(ContainSubstring("/workspace-creds/username"))
 		Expect(cmd).To(ContainSubstring("/workspace-creds/password"))
 		for _, e := range init.Env {

@@ -90,6 +90,15 @@ const (
 	// ADR-0005 D10). The file lives under /workspace/.coxswain so it is
 	// separated from the repo contents the agent sees.
 	baseCommitFile = "/workspace/.coxswain/base-commit"
+	// workspaceVolumeName is the name of the sandbox pod's 'workspace'
+	// emptyDir volume (S3a): shared by the agent and the workspace init
+	// container, which clones spec.workspace.repo into it. One constant so the
+	// agent container, init container, and pod volume spec cannot drift
+	// (goconst: the literal recurs in three places).
+	workspaceVolumeName = "workspace"
+	// httpPortName is the named port on the proxy/egress-proxy containers (the
+	// port is the constant below; the name is what services reference).
+	httpPortName = "http"
 	// localhostProxyBaseURL is where the proxy listens on the sandbox pod's
 	// loopback interface. The agent reaches it over localhost, not the network.
 	// readOnlyMode is the default file mode for the model-creds Secret volume
@@ -234,6 +243,48 @@ type LoopReconciler struct {
 // in internal/cni; this is the condition-change Event the reconcile side emits).
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
+// agentPoliciesValid runs the C6a AgentPolicy validation gate: when the
+// referenced AgentPolicies are invalid it sets PolicyValid=False and suspends
+// the sandbox (D30-gate pattern: operatingMode 0 scales the sandbox pod down),
+// persisting the condition. It returns false when the Loop is held (invalid
+// or transient read error) — Reconcile stops then so no further ensure* runs
+// against a policy-invalid Loop.
+func (r *LoopReconciler) agentPoliciesValid(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	polResult := r.validateAgentPolicies(ctx, loop)
+	if polResult.valid {
+		// Clean pass: set PolicyValid=True (R15 round 3: nothing ever set it
+		// True before, so a fixed path left the old False condition forever).
+		if len(loop.Spec.PolicyRefs) > 0 {
+			setCondition(loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
+		}
+		return true
+	}
+	setCondition(loop, "PolicyValid", metav1.ConditionFalse, polResult.reason, polResult.message)
+	if err := r.suspendSandboxIfRunning(ctx, loop); err != nil {
+		return false
+	}
+	if err := r.Status().Update(ctx, loop); err != nil {
+		return false
+	}
+	return false
+}
+
+// modelConfigInvalid enforces the D34 P1 require-pair (endpointSecretRef and
+// modelEndpoint set together): a Secret without an endpoint (or an endpoint
+// without a Secret) is a misconfiguration that would crash-loop the proxy, so
+// it is rejected early with ModelConfigValid=False (the caller requeues).
+func (r *LoopReconciler) modelConfigInvalid(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if loop.Spec.Agent.EndpointSecretRef == "" || loop.Spec.Agent.ModelEndpoint != "" {
+		return false
+	}
+	setCondition(loop, "ModelConfigValid", metav1.ConditionFalse, "MissingModelEndpoint",
+		"spec.agent.endpointSecretRef is set but spec.agent.modelEndpoint is empty; the pair is required")
+	if err := r.Status().Update(ctx, loop); err != nil {
+		return true // still invalid; the error is the caller's
+	}
+	return true
+}
+
 // Reconcile moves the cluster state closer to the Loop's desired state.
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var loop coxv1alpha1.Loop
@@ -247,27 +298,15 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// case at admission; this catches anything that slips through, including
 	// missing/unreadable policies). If validation fails, set
 	// PolicyValid=False and suspend the sandbox (if running).
-	if polResult := r.validateAgentPolicies(ctx, &loop); !polResult.valid {
-		setCondition(&loop, "PolicyValid", metav1.ConditionFalse, polResult.reason, polResult.message)
-		// Suspend an already-running sandbox (D30-gate pattern): set
-		// operatingMode to 0 so the sandbox pod is scaled down.
-		if err := r.suspendSandboxIfRunning(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.Status().Update(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
-		if polResult.transientReadError {
-			// Requeue: the policy could not be read due to a transient
-			// error. Retry after a short delay.
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-		return ctrl.Result{}, nil
+	if !r.agentPoliciesValid(ctx, &loop) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	// Clean pass: set PolicyValid=True (R15 round 3: nothing ever set it
-	// True before, so a fixed path left the old False condition forever).
-	if len(loop.Spec.PolicyRefs) > 0 {
-		setCondition(&loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
+
+	// D34 (P1): the endpointSecretRef + modelEndpoint pair is required. A Secret
+	// without an endpoint (or an endpoint without a Secret) is a misconfiguration
+	// that would crash-loop the proxy; reject it early.
+	if r.modelConfigInvalid(ctx, &loop) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	// D38: capture the condition set before applyEffectivePolicyAndConditions so
@@ -284,18 +323,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
 	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
-
-	// D34 (P1): the endpointSecretRef + modelEndpoint pair is required. A Secret
-	// without an endpoint (or an endpoint without a Secret) is a misconfiguration
-	// that would crash-loop the proxy; reject it early.
-	if loop.Spec.Agent.EndpointSecretRef != "" && loop.Spec.Agent.ModelEndpoint == "" {
-		setCondition(&loop, "ModelConfigValid", metav1.ConditionFalse, "MissingModelEndpoint",
-			"spec.agent.endpointSecretRef is set but spec.agent.modelEndpoint is empty; the pair is required")
-		if err := r.Status().Update(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
 
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
@@ -601,6 +628,156 @@ func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.
 // sandbox, which orphans it (no GC, no Owns mapping). For a sandbox owned by
 // a *different* controller, SetControllerReference returns AlreadyOwnedError,
 // so we never silently take it over.
+// agentPodSpec builds the sandbox pod's container set (the agent container +
+// the workspace init container when spec.workspace.repo is set) and the pod's
+// volume set (S3a, GAP 1). Extracted from ensureSandbox for readability and
+// cyclomatic-complexity budget: the agent's zero-credential hardening (C1,
+// ADR-0006), the COX_* operator env (COX_GOAL, COX_MODEL_BASE_URL, the I42d
+// egress-proxy names), the S3a init container (workspace clone; the git
+// credential Secret is mounted into IT ONLY), and the bounded emptyDir volumes
+// (I36 sizeLimits) all live here, not in ensureSandbox's CreateOrUpdate
+// closure.
+//
+// hasModel mirrors ensureSandbox's P1 gate: COX_MODEL_BASE_URL is set only when
+// a model endpoint is configured (no half-configured proxy).
+func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop, hasModel bool) ([]corev1.Container, []corev1.Container, []corev1.Volume) {
+	nonRootUID := int64(65532)
+	nonRootGID := int64(65532)
+	falseP := false
+	trueP := true
+	readOnlyRootfs := true
+	agentImage := r.sandboxImage()
+	if loop.Spec.Agent.Image != "" {
+		agentImage = loop.Spec.Agent.Image
+	}
+	// S3b (GAP 1): agent execution. The operator sets COX_GOAL (the I34-protected
+	// COX_* namespace) carrying spec.goal, and runs the runner's entrypoint ONLY
+	// when the agent image is the runner (spec.agent.image empty, or equal to
+	// --runner-image); any other image keeps the 'sleep infinity' stand-in (an
+	// explicit opt-out for debugging pods / non-runner images). No runner
+	// detection by image name beyond this exact match / empty.
+	isRunner := r.RunnerImage != "" && (loop.Spec.Agent.Image == "" || loop.Spec.Agent.Image == r.RunnerImage)
+	agentCommand := []string{"sh", "-c", "sleep infinity"}
+	if isRunner {
+		agentCommand = []string{"/usr/local/bin/runner"}
+	}
+	agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+3)
+	agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
+	// S3 (GAP 1): the goal, set by the operator only (COX_* is I34-protected).
+	// The runner reads it as its prompt; a non-runner image ignores it.
+	agentEnv = append(agentEnv, corev1.EnvVar{Name: coxGoal, Value: loop.Spec.Goal})
+	// C2 (ADR-0006 item 2): the agent holds no model key. It talks to the local
+	// proxy sidecar (COX_MODEL_BASE_URL), which holds the key and injects auth.
+	// The operator sets this; a Loop cannot override it (COX_* names are
+	// rejected at admission, I34) so the agent cannot be pointed past the proxy.
+	// Only set when a model endpoint exists (P1: no half-configured proxy).
+	if hasModel {
+		agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: r.proxyServiceURL(loop.Name, loop.Namespace)})
+	}
+	// I42d: when the egress proxy is expected (network allows present, or the
+	// policy cannot be read — the fail-closed needsEgressProxy gate), the agent
+	// routes external HTTP egress through the operator's egress proxy and model
+	// calls bypass it. Standard (unprefixed) names so any HTTP client picks
+	// them up. The COX_MODEL_BASE_URL host is in NO_PROXY so model calls go
+	// straight to the model proxy. A user spec.agent.env var that collides
+	// with one of these operator names is DROPPED: the operator value wins
+	// (an agent that could re-route its own egress away from the egress proxy
+	// would defeat the network allowlist).
+	if needsEgressProxy(ctx, r, loop) {
+		noProxy := r.egressNOProxy(loop)
+		agentEnv = append(agentEnv, r.operatorProxyEnv(loop.Name, loop.Namespace)...)
+		agentEnv = append(agentEnv,
+			corev1.EnvVar{Name: "NO_PROXY", Value: noProxy},
+			corev1.EnvVar{Name: "no_proxy", Value: noProxy},
+		)
+	}
+	for _, e := range loop.Spec.Agent.Env {
+		if isOperatorProxyEnv(e.Name) {
+			// A user spec.agent.env var colliding with the operator-owned proxy
+			// names is dropped (I42d): the operator value wins so the agent
+			// cannot re-route its egress away from the egress proxy. A non-
+			// colliding name falls through and is preserved.
+			continue
+		}
+		agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
+	}
+	// I36 (R10): ADR-0006 item 4 requires CPU/memory limits (one agent must not
+	// starve the node) + an ephemeral-storage limit (/workspace + /scratch are
+	// emptyDir; an agent can fill the node's disk). Platform defaults here; a
+	// per-Loop override bounded by a cluster maximum is a follow-on (I36) once
+	// the coxswain-agent-defaults ConfigMap exists.
+	agentLimits := corev1.ResourceList{
+		corev1.ResourceCPU:              resource.MustParse("500m"),
+		corev1.ResourceMemory:           resource.MustParse("512Mi"),
+		corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+	}
+	agentContainer := corev1.Container{
+		Name:  "agent",
+		Image: agentImage,
+		// S3b: the agent's Command is the runner's entrypoint when the image
+		// is the runner (isRunner above); otherwise the 'sleep infinity'
+		// stand-in keeps the container alive for a manual / non-runner image.
+		Command: agentCommand,
+		Env:     agentEnv,
+		Resources: corev1.ResourceRequirements{
+			Limits: agentLimits,
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: &falseP,
+			RunAsNonRoot:             &trueP,
+			RunAsUser:                &nonRootUID,
+			RunAsGroup:               &nonRootGID,
+			ReadOnlyRootFilesystem:   &readOnlyRootfs,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
+			{Name: "scratch", MountPath: agentScratchMount},
+			// P1 (R13): a writable /tmp so go build / mktemp / any tool that
+			// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
+			{Name: "tmp", MountPath: agentTmpMount},
+		},
+	}
+	// S3a (GAP 1): the workspace init container materialises the workspace
+	// (clones spec.workspace.repo @ ref into the 'workspace' volume and
+	// writes the resolved SHA to baseCommitFile). Only present when
+	// spec.workspace.repo is set; the credential Secret is mounted into it
+	// ONLY (ADR-0006 — zero credentials in the agent).
+	var initContainers []corev1.Container
+	if loop.Spec.Workspace.Repo != "" {
+		initContainers = []corev1.Container{r.workspaceInitContainer(loop)}
+	}
+	volumes := []corev1.Volume{
+		{Name: workspaceVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: newLimit("500Mi"),
+		}}},
+		{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: newLimit("350Mi"),
+		}}},
+		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: newLimit("100Mi"),
+		}}},
+	}
+	// S3a (ADR-0006): the git credential Secret is a volume on the sandbox
+	// pod ONLY to reach the init container; the agent has no such mount
+	// (zero credentials in the agent). Mounted with the default 0644 mode
+	// so the init container's git credential.helper 'store' can read it.
+	if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: workspaceCredsVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: loop.Spec.Workspace.GitCredentialSecret,
+			}},
+		})
+	}
+	return []corev1.Container{agentContainer}, initContainers, volumes
+}
+
 func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
@@ -616,18 +793,16 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// C1 (ADR-0006 item 4): the sandbox pod is a zero-credential, hardened
 		// boundary. No SA token automount; the agent is non-root, drops all caps,
 		// cannot escalate privilege, is seccomp-constrained, and runs a read-only
-		// rootfs with only /workspace + scratch writable.
-		nonRootUID := int64(65532)
-		nonRootGID := int64(65532)
+		// rootfs with only /workspace + scratch writable. The agent container's
+		// own hardening lives in agentPodSpec; here the pod-level pieces (no SA
+		// token, fsGroup ownership of the writable emptyDirs) are set.
 		nonRootFSGroup := int64(65532)
+		falseP := false
 		// D33 (P1): the proxy + model access exist only when a model endpoint is
 		// configured. With no endpointSecretRef the agent runs with no model — no
 		// proxy pod, no key, no COX_MODEL_BASE_URL (never a half-configured
 		// proxy that would make the pod InvalidConfiguration on an empty secret).
 		hasModel := loop.Spec.Agent.EndpointSecretRef != ""
-		falseP := false
-		trueP := true
-		readOnlyRootfs := true
 		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
 		// (S1). Running is the default for a normal Loop.
 		if loop.Spec.Suspend {
@@ -737,169 +912,12 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		desired.Spec.PodTemplate.Spec.SecurityContext = &corev1.PodSecurityContext{
 			FSGroup: &nonRootFSGroup,
 		}
-		// The agent container: spec.agent.image when set, else the dev default
-		// (C1). It holds no credentials (ADR-0006) — the model key lives only in
-		// the proxy sidecar (C2), mounted there in a later slice.
-		agentImage := r.sandboxImage()
-		if loop.Spec.Agent.Image != "" {
-			agentImage = loop.Spec.Agent.Image
-		}
-		// S3b (GAP 1): agent execution. The operator sets COX_GOAL (the I34-protected
-		// COX_* namespace) carrying spec.goal, and runs the runner's entrypoint ONLY
-		// when the agent image is the runner (spec.agent.image empty, or equal to
-		// --runner-image); any other image keeps the 'sleep infinity' stand-in (an
-		// explicit opt-out for debugging pods / non-runner images). No runner
-		// detection by image name beyond this exact match / empty.
-		isRunner := r.RunnerImage != "" && (loop.Spec.Agent.Image == "" || loop.Spec.Agent.Image == r.RunnerImage)
-		agentCommand := []string{"sh", "-c", "sleep infinity"}
-		if isRunner {
-			agentCommand = []string{"/usr/local/bin/runner"}
-		}
-		agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+3)
-		agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
-		// S3 (GAP 1): the goal, set by the operator only (COX_* is I34-protected).
-		// The runner reads it as its prompt; a non-runner image ignores it.
-		agentEnv = append(agentEnv, corev1.EnvVar{Name: coxGoal, Value: loop.Spec.Goal})
-		// C2 (ADR-0006 item 2): the agent holds no model key. It talks to the local
-		// proxy sidecar (COX_MODEL_BASE_URL), which holds the key and injects auth.
-		// The operator sets this; a Loop cannot override it (COX_* names are
-		// rejected at admission, I34) so the agent cannot be pointed past the proxy.
-		// Only set when a model endpoint exists (P1: no half-configured proxy).
-		if hasModel {
-			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: r.proxyServiceURL(loop.Name, loop.Namespace)})
-		}
-		// I42d: when the egress proxy is expected (network allows present, or the
-		// policy cannot be read — the fail-closed needsEgressProxy gate), the agent
-		// routes external HTTP egress through the operator's egress proxy and model
-		// calls bypass it. Standard (unprefixed) names so any HTTP client picks
-		// them up. The COX_MODEL_BASE_URL host is in NO_PROXY so model calls go
-		// straight to the model proxy. A user spec.agent.env var that collides
-		// with one of these operator names is DROPPED: the operator value wins
-		// (an agent that could re-route its own egress away from the egress proxy
-		// would defeat the network allowlist).
-		if needsEgressProxy(ctx, r, loop) {
-			// The append must extend agentEnv, NOT replace it: replacing would
-			// drop everything appended before (COX_MODEL_BASE_URL, HOME, ...).
-			noProxy := r.egressNOProxy(loop)
-			agentEnv = append(agentEnv, r.operatorProxyEnv(loop.Name, loop.Namespace)...)
-			agentEnv = append(agentEnv,
-				corev1.EnvVar{Name: "NO_PROXY", Value: noProxy},
-				corev1.EnvVar{Name: "no_proxy", Value: noProxy},
-			)
-		}
-		for _, e := range loop.Spec.Agent.Env {
-			if isOperatorProxyEnv(e.Name) {
-				// A user spec.agent.env var colliding with the operator-owned proxy
-				// names is dropped (I42d): the operator value wins so the agent
-				// cannot re-route its egress away from the egress proxy. A non-
-				// colliding name falls through and is preserved.
-				continue
-			}
-			agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
-		}
-		// I36 (R10): ADR-0006 item 4 requires CPU/memory limits (one agent must not
-		// starve the node) + an ephemeral-storage limit (/workspace + /scratch are
-		// emptyDir; an agent can fill the node's disk). Platform defaults here; a
-		// per-Loop override bounded by a cluster maximum is a follow-on (I36) once
-		// the coxswain-agent-defaults ConfigMap exists.
-		agentLimits := corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("500m"),
-			corev1.ResourceMemory:           resource.MustParse("512Mi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-		}
-		agentContainer := corev1.Container{
-			Name:  "agent",
-			Image: agentImage,
-			// S3b: the agent's Command is the runner's entrypoint when the image
-			// is the runner (isRunner above); otherwise the 'sleep infinity'
-			// stand-in keeps the container alive for a manual / non-runner image.
-			Command:   agentCommand,
-			Env:       agentEnv,
-			Resources: corev1.ResourceRequirements{
-				Limits: agentLimits,
-				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("100m"),
-					corev1.ResourceMemory: resource.MustParse("128Mi"),
-				},
-			},
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: &falseP,
-				RunAsNonRoot:             &trueP,
-				RunAsUser:                &nonRootUID,
-				RunAsGroup:               &nonRootGID,
-				ReadOnlyRootFilesystem:   &readOnlyRootfs,
-				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
-				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-			},
-			VolumeMounts: []corev1.VolumeMount{
-				{Name: "workspace", MountPath: agentWorkspaceMount},
-				{Name: "scratch", MountPath: agentScratchMount},
-				// P1 (R13): a writable /tmp so go build / mktemp / any tool that
-				// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
-				{Name: "tmp", MountPath: agentTmpMount},
-			},
-		}
-		desired.Spec.PodTemplate.Spec.Containers = []corev1.Container{agentContainer}
-		// S3a (GAP 1): the workspace init container materialises the workspace.
-		// It clones spec.workspace.repo @ ref into the 'workspace' volume and
-		// writes the resolved commit SHA to baseCommitFile (on the same
-		// volume), which the operator reads back and pins to status.baseCommit
-		// (immutable once set, ADR-0005 D10). The git credential Secret is
-		// mounted into THIS container ONLY (S3a, ADR-0006): the agent never
-		// sees git credentials. The image is the operator's --workspace-git-image
-		// (never the Loop's image). Only present when spec.workspace.repo is set
-		// (a Loop with no repo runs the agent on an empty workspace).
-		if loop.Spec.Workspace.Repo != "" {
-			gitImage := r.workspaceGitImage()
-			var initMounts []corev1.VolumeMount
-			if loop.Spec.Workspace.GitCredentialSecret != "" {
-				// The credential Secret is mounted read-only into the init
-				// container ONLY, at /workspace-creds. The script uses
-				// credential.helper 'store' to read it. The agent container has
-				// no such volumeMount (asserted by the S3a envtest spec).
-				initMounts = []corev1.VolumeMount{
-					{Name: "workspace", MountPath: agentWorkspaceMount},
-					{Name: workspaceCredsVolume, MountPath: "/workspace-creds", SubPath: ".git-credentials", ReadOnly: true},
-				}
-			} else {
-				initMounts = []corev1.VolumeMount{{Name: "workspace", MountPath: agentWorkspaceMount}}
-			}
-			desired.Spec.PodTemplate.Spec.InitContainers = []corev1.Container{r.workspaceInitContainer(loop, gitImage, initMounts)}
-		}
-		// P3 (R13, I36): the writable emptyDirs carry explicit sizeLimits that sum
-		// under the container's 1Gi ephemeral limit, so a full workspace/scratch/tmp
-		// surfaces as a bounded pod eviction (and, after I36, a budget-aware signal)
-		// rather than filling the node. 500+350+100 = 950Mi < 1Gi.
-		// writableMountPaths is the single source of truth for the agent's writable
-		// mount points; the AgentPolicy exec XValidation hard-codes the same set
-		// (a CRD CEL rule cannot reference Go code), so adding a mount here MUST
-		// also update the XValidation in api/v1alpha1/agentpolicy_types.go or the
-		// new mount would silently become a spoofable exec target.
-		writableMountPaths := []string{agentWorkspaceMount, agentScratchMount, agentTmpMount}
-		_ = writableMountPaths // single source of truth (see comment)
-		desired.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
-			{Name: "workspace", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-				SizeLimit: newLimit("500Mi"),
-			}}},
-			{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-				SizeLimit: newLimit("350Mi"),
-			}}},
-			{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-				SizeLimit: newLimit("100Mi"),
-			}}},
-		}
-		// S3a (ADR-0006): the git credential Secret is a volume on the sandbox
-		// pod ONLY to reach the init container; the agent has no such mount
-		// (zero credentials in the agent). Mounted with the default 0644 mode
-		// so the init container's git credential.helper 'store' can read it.
-		if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" {
-			desired.Spec.PodTemplate.Spec.Volumes = append(desired.Spec.PodTemplate.Spec.Volumes, corev1.Volume{
-				Name: workspaceCredsVolume,
-				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-					SecretName: loop.Spec.Workspace.GitCredentialSecret,
-				}},
-			})
-		}
+		// The agent container + workspace init container + pod volumes (S3a: the
+		// init container mounts the git credential ONLY; the agent never does).
+		containers, initContainers, volumes := agentPodSpec(ctx, r, loop, hasModel)
+		desired.Spec.PodTemplate.Spec.Containers = containers
+		desired.Spec.PodTemplate.Spec.InitContainers = initContainers
+		desired.Spec.PodTemplate.Spec.Volumes = volumes
 		// D33: the model-creds Secret is mounted into the per-Loop proxy pod
 		// (ensureProxy), NOT the sandbox pod. The agent holds no key (C2).
 		// Set the controller owner ref here, on the (possibly server-populated)
@@ -1097,7 +1115,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
 		svcDesired.Labels = proxyLabels(loopName)
 		svcDesired.Spec.Ports = []corev1.ServicePort{{
-			Name:       "http",
+			Name:       httpPortName,
 			Port:       proxyPort,
 			TargetPort: intstr.FromInt32(proxyPort),
 			Protocol:   corev1.ProtocolTCP,
@@ -1668,7 +1686,7 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
 		svcDesired.Labels = egressProxyLabels(loopName)
 		svcDesired.Spec.Ports = []corev1.ServicePort{{
-			Name:       "http",
+			Name:       httpPortName,
 			Port:       egressProxyPort,
 			TargetPort: intstr.FromInt32(egressProxyPort),
 			Protocol:   corev1.ProtocolTCP,
@@ -2590,7 +2608,33 @@ func (r *LoopReconciler) workspaceGitImage() string {
 // mounted (gitCredsMount), the script configures git credential.helper 'store'
 // to read it; the script is built here (not baked into the image) so the
 // operator's --workspace-git-image need only carry git + sh.
-func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop, gitImage string, mounts []corev1.VolumeMount) corev1.Container {
+// workspaceInitContainer builds the sandbox pod's workspace init container
+// (S3a, GAP 1). It runs the operator's --workspace-git-image (default
+// alpine/git — trusted, never the Loop's image), clones spec.workspace.repo @
+// ref into the 'workspace' volume, and writes the resolved commit SHA to
+// baseCommitFile on that volume (which the operator reads back and pins to
+// status.baseCommit, immutable once set, ADR-0005 D10).
+//
+// ADR-0006 (zero credentials in the agent): the git credential Secret
+// (spec.workspace.gitCredentialSecret) is mounted read-only into THIS
+// container ONLY, at /workspace-creds, and the script uses
+// credential.helper 'store' to read it. The agent container never mounts it
+// (asserted by the S3a envtest spec).
+func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.Container {
+	gitImage := r.workspaceGitImage()
+	var initMounts []corev1.VolumeMount
+	if loop.Spec.Workspace.GitCredentialSecret != "" {
+		initMounts = []corev1.VolumeMount{
+			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
+			{Name: workspaceCredsVolume, MountPath: "/workspace-creds", SubPath: ".git-credentials", ReadOnly: true},
+		}
+	} else {
+		initMounts = []corev1.VolumeMount{{Name: workspaceVolumeName, MountPath: agentWorkspaceMount}}
+	}
+	return r.buildWorkspaceInitContainer(loop, gitImage, initMounts)
+}
+
+func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, gitImage string, mounts []corev1.VolumeMount) corev1.Container {
 	repo := loop.Spec.Workspace.Repo
 	ref := loop.Spec.Workspace.Ref
 	if ref == "" {
@@ -2633,11 +2677,11 @@ git config --global user.email coxswain@localhost
 	trueP := true
 	readOnlyRootfs := true
 	return corev1.Container{
-		Name:            workspaceInitContainerName,
-		Image:           gitImage,
-		Command:         []string{"/bin/sh", "-c", script},
-		Env:             []corev1.EnvVar{{Name: "HOME", Value: "/tmp"}},
-		VolumeMounts:    mounts,
+		Name:         workspaceInitContainerName,
+		Image:        gitImage,
+		Command:      []string{"/bin/sh", "-c", script},
+		Env:          []corev1.EnvVar{{Name: "HOME", Value: "/tmp"}},
+		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: &falseP,
 			RunAsNonRoot:             &trueP,

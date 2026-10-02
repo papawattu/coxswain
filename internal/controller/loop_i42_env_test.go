@@ -147,7 +147,7 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 
 		agentEnv := map[string]string{}
 		for _, c := range sb.Spec.PodTemplate.Spec.Containers {
-			if c.Name != "agent" {
+			if c.Name != agentContainerName {
 				continue
 			}
 			for _, e := range c.Env {

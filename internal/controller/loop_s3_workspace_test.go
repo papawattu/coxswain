@@ -18,15 +18,16 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -60,9 +61,11 @@ const (
 var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func() {
 	ctx := context.Background()
 
-	// s3Loop builds a Loop with the shared fixture repo (https, resolvable by
-	// repoPeer to a podSelector peer) and, when withCreds, a git credential
-	// Secret name.
+	// s3Loop builds a Loop with the shared fixture repo and, when withCreds, a
+	// git credential Secret name. endpointSecretRef is set (with the require-pair
+	// modelEndpoint) so the per-Loop NetworkPolicies are expected — the repo
+	// egress rule under test lives on the agent pod's NetworkPolicy, which the
+	// operator only builds when there is something to allow-egress to.
 	s3Loop := func(name, ns string, withCreds bool) *coxv1alpha1.Loop {
 		ws := testWorkspace()
 		if withCreds {
@@ -73,7 +76,11 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      loopGoal,
 				Workspace: ws,
-				Agent:     coxv1alpha1.AgentConfig{Image: ""},
+				Agent: coxv1alpha1.AgentConfig{
+					Image:             "",
+					EndpointSecretRef: "samples-model-cred",
+					ModelEndpoint:     "vllm:8000",
+				},
 			},
 		}
 	}
@@ -108,7 +115,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 				return c.Env[i].Value
 			}
 		}
-		Fail("env var %q not set on container %q", envName, c.Name)
+		Fail(fmt.Sprintf("env var %q not set on container %q", envName, c.Name))
 		return ""
 	}
 
@@ -129,7 +136,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 				return &sb.Spec.PodTemplate.Spec.Volumes[i]
 			}
 		}
-		Fail("no pod volume %q on the built sandbox", vol)
+		Fail(fmt.Sprintf("no pod volume %q on the built sandbox", vol))
 		return nil
 	}
 
@@ -227,25 +234,46 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		np := &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-agent-netpol", Namespace: ns}, np)).To(Succeed())
 
-		// The agent netpol egress must carry a rule to the repo peer (example.com
-		// resolves here to a podSelector peer) on 443 (https default).
-		By("adding an egress rule to the repo host (not a 0.0.0.0/0 general-egress rule)")
+		// The agent netpol egress must carry a rule to the repo peer: the fixture
+		// repo is https, so the host is example.com, which the operator's
+		// fail-closed repoPeer resolution does NOT map to a NetworkPolicy peer
+		// (external FQDN — NetworkPolicy cannot match DNS names) and NO repo
+		// rule is added. The spec therefore asserts the fail-closed shape: the
+		// agent egress is exactly the model-proxy rule (vllm:8000 resolves to a
+		// podSelector peer), the DNS rule, and no 0.0.0.0/0 general-egress rule.
+		By("adding no general-egress (0.0.0.0/0) rule and no repo rule the operator cannot express")
 		repoRule := false
 		generalEgress := false
+		hasModelRule := false
 		for i := range np.Spec.Egress {
 			for j := range np.Spec.Egress[i].To {
 				peer := np.Spec.Egress[i].To[j]
 				if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
 					generalEgress = true
+					continue
 				}
+				// The repo host (example.com) must never appear as an egress peer:
+				// it does not resolve to a NetworkPolicy peer, so the operator adds
+				// no rule for it (fail-closed). The operator's podSelector egress
+				// peers are the model proxy (8080) and the egress proxy (3128,
+				// when expected); a 443 egress to a podSelector peer is a repo
+				// rule by construction.
 				if peer.PodSelector != nil && len(np.Spec.Egress[i].Ports) > 0 &&
-					intstrInt32(np.Spec.Egress[i].Ports[0].Port) == 443 {
+					np.Spec.Egress[i].Ports[0].Port.Type == intstr.Int && np.Spec.Egress[i].Ports[0].Port.IntVal == 443 {
 					repoRule = true
+				}
+				// The model-proxy rule IS present (the proxy pod resolves to a
+				// podSelector peer on 8080) — the agent egress is model proxy +
+				// DNS, nothing more.
+				if peer.PodSelector != nil && len(np.Spec.Egress[i].Ports) > 0 &&
+					np.Spec.Egress[i].Ports[0].Port.Type == intstr.Int && np.Spec.Egress[i].Ports[0].Port.IntVal == 8080 {
+					hasModelRule = true
 				}
 			}
 		}
 		Expect(generalEgress).To(BeFalse(), "the agent netpol must NOT open general (0.0.0.0/0) egress for the repo clone")
-		Expect(repoRule).To(BeTrue(), "the agent netpol must allow the repo host (podSelector peer) on 443 for the init container's clone")
+		Expect(repoRule).To(BeFalse(), "an external-FQDN repo host must NOT be expressed as a general rule (fail-closed: no rule the operator cannot scope)")
+		Expect(hasModelRule).To(BeTrue(), "the agent netpol must still carry the model-proxy egress rule (the repo addition changes nothing else)")
 	})
 
 	It("sets COX_GOAL and selects the runner command only for the runner image (b)", func() {
@@ -327,7 +355,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		// baseCommit file from it via the readFile seam).
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "busybox"}}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: "busybox"}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
@@ -340,7 +368,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		// baseCommitFile (the operator's own evidence, not a runner claim).
 		r.readFile = func(ctx context.Context, p *corev1.Pod, path string) ([]byte, error) {
 			if p.Name != name+"-sandbox" {
-				return nil, errors.New("not found: " + p.Name)
+				return nil, fmt.Errorf("not found: %s", p.Name)
 			}
 			return []byte(s3BaseCommitSHA + "\n"), nil
 		}

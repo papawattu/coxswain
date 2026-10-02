@@ -572,4 +572,48 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		events := drainEvents(recorder)
 		Expect(events).NotTo(ContainElement(ContainSubstring(phaseAdvancedReason)), "no advance at Verifying -> no PhaseAdvanced Event")
 	})
+
+	It("records a stable claim exactly once: repeated reconciles leave progress untouched (no status write)", func() {
+		// R17 P1 acceptance (OS1): two reconciles on the SAME terminated claim
+		// must leave status.progress byte-identical (including lastActivityTime)
+		// and the second must make NO status write (resourceVersion unchanged).
+		// progressEqual compares only the claim-derived fields; the operator
+		// stamps LastActivityTime/ObservedGeneration/BaseCommit only on a
+		// change. The mutation (restoring the timestamp comparison into
+		// progressEqual) makes the second write happen and fails this spec.
+		ns := "s4-os1-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "os1lp")
+
+		ensureSandboxObject(ns, "os1lp")
+		createStandinPod(ns, "os1lp")
+		writeAgentTermination(ns, "os1lp", `{"observedPhase":"Planning","status":"success","blockedReason":""}`)
+
+		By("reconcile 1: the claim is recorded and the phase advances")
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(loop.Status.Progress).NotTo(BeNil())
+		progressBefore := loop.Status.Progress.DeepCopy()
+		rvBefore := loop.ResourceVersion
+
+		By("reconcile 2: the SAME claim is re-read — progress must be byte-identical, no status write")
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Progress).NotTo(BeNil())
+		Expect(loop.Status.Progress).To(Equal(progressBefore),
+			"a re-read of an identical claim must leave status.progress byte-identical (lastActivityTime included)")
+		Expect(loop.ResourceVersion).To(Equal(rvBefore),
+			"a re-read of an identical claim must make no status write (resourceVersion unchanged)")
+	})
 })

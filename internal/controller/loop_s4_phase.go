@@ -354,29 +354,30 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 	return changed, advanced
 }
 
-// progressEqual reports whether two progress records are equal (the advance
-// path only writes progress when it changed, to avoid a status churn on every
-// reconcile while a claim is stable).
+// progressEqual reports whether two progress records carry the same
+// CLAIM-DERIVED content (the advance path only writes progress when those
+// fields changed, to avoid a status churn on every reconcile while a claim is
+// stable). It compares ONLY the claim-derived fields (Phase,
+// LastResultStatus, BlockedReason, Iteration). The operator-stamped fields
+// (LastActivityTime, ObservedGeneration, BaseCommit) are EXCLUDED on purpose:
+// the candidate record always gets a fresh LastActivityTime and does not yet
+// carry the operator's pins, so comparing them would make the function report
+// a change on every reconcile (the R17 P1 churn: ~20 status writes/min during
+// a running phase on kind). The caller stamps those fields only when the
+// claim-derived fields actually change.
 func progressEqual(a, b *coxv1alpha1.ProgressStatus) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	if a.Phase != b.Phase || a.LastResultStatus != b.LastResultStatus ||
-		a.BlockedReason != b.BlockedReason || a.Iteration != b.Iteration {
-		return false
-	}
-	if (a.LastActivityTime == nil) != (b.LastActivityTime == nil) {
-		return false
-	}
-	if a.LastActivityTime != nil && !a.LastActivityTime.Equal(b.LastActivityTime) {
-		return false
-	}
-	return a.ObservedGeneration == b.ObservedGeneration && a.BaseCommit == b.BaseCommit
+	return a.Phase == b.Phase && a.LastResultStatus == b.LastResultStatus &&
+		a.BlockedReason == b.BlockedReason && a.Iteration == b.Iteration
 }
 
 // advancePhaseFromClaim (S4) reads the runner's ADR-0004 claim from the
-// sandbox pod's termination message (or the B1 seam's status.observedPhase)
-// and advances the phase machine. Returns (claimReadPending, changed):
+// sandbox pod's termination message and advances the phase machine. The claim
+// reader is the ONLY claim source (the legacy B1 seam that fell back to
+// status.observedPhase was deleted in R17 — it clobbered progress while a
+// phase was running). Returns (claimReadPending, changed):
 // claimReadPending is true when the operator must requeue (the claim reader
 // found nothing or a malformed claim); changed is true when the Loop's status
 // was mutated (progress record or phase advance).
@@ -418,21 +419,15 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// claim == nil && cerr == nil: the agent has not terminated yet.
 		claimReadPending = true
 	}
-	// B1 seam: if the claim reader found nothing and status.observedPhase is
-	// set (a direct status update, not a claim), the operator advances the
-	// phase machine using the pure nextPhase logic. This is the seam the B1
-	// envtests exercise (they set status.observedPhase directly, bypassing the
-	// claim reader).
-	if claimReadPending && loop.Status.ObservedPhase != "" &&
-		loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded && loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
-		fromPhase := loop.Status.Phase
-		c, advanced := r.recordPhaseClaim(loop, &PhaseClaim{ObservedPhase: loop.Status.ObservedPhase}, metav1.Now())
-		changed = changed || c
-		if advanced {
-			logf.FromContext(ctx).Info("phase advanced (B1 seam: status.observedPhase)",
-				"loop", loop.Name, "from", fromPhase, "to", loop.Status.Phase)
-			r.emitPhaseAdvancedEvent(loop, fromPhase)
-		}
-	}
+	// B1 seam (R17, 2026-10-03): DELETED. The seam re-applied recordPhaseClaim
+	// with {ObservedPhase: status.observedPhase} whenever the claim reader
+	// found nothing, so while a phase was RUNNING (no terminated claim yet) it
+	// rewrote progress on every reconcile with the PREVIOUS phase and an empty
+	// status — OS1's progress was wrong for the whole duration of the running
+	// phase. The seam existed only so the legacy B1 envtests could drive the
+	// machine by writing status.observedPhase directly; those specs are now
+	// ported to inject claims through the readPhaseClaim test seam instead
+	// (loop_phase_transition_envtest_test.go). The claim reader is the ONLY
+	// claim source: if it found nothing, the operator records nothing.
 	return claimReadPending, changed
 }

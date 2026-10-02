@@ -59,4 +59,12 @@ func main() {
 		Model:  model,
 	})
 	fmt.Fprintf(os.Stderr, "runner: status=%s summary=%q\n", res.Status, res.Summary)
+	if res.VerificationNotes != "" {
+		log.Printf("runner: verification: %s", res.VerificationNotes)
+	}
+	// S3: the runner is one-shot. After writing result.json it must NOT exit
+	// (restartPolicy=Always would loop it forever, hammering the model). Block
+	// until the operator kills the pod (S4 makes it a phase driver that watches
+	// .coxswain/desired-phase and exits when told to).
+	select {}
 }

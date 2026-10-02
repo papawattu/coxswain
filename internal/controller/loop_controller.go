@@ -679,6 +679,14 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// Only set when a model endpoint exists (P1: no half-configured proxy).
 	if hasModel {
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelBaseURL, Value: r.proxyServiceURL(loop.Name, loop.Namespace)})
+		// COX_MODEL: the model name the runner sends in /chat/completions.
+		// Set from spec.agent.model (the operator's choice, not the Loop's
+		// — a Loop cannot set COX_* names, I34). Empty = the runner's default
+		// ("local-model"); vLLM ignores the model field but a strict server
+		// would reject an unknown model name.
+		if loop.Spec.Agent.Model != "" {
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: "COX_MODEL", Value: loop.Spec.Agent.Model})
+		}
 	}
 	// I42d: when the egress proxy is expected (network allows present, or the
 	// policy cannot be read — the fail-closed needsEgressProxy gate), the agent

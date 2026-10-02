@@ -110,6 +110,14 @@ const terminationLogPath = "/dev/termination-log"
 // JSON object is never truncated mid-field by the kubelet's cap).
 const claimMaxBytes = 4096
 
+// claimWritePath is the file the ADR-0004 claim is written to (the
+// /dev/termination-log the operator reads back from the container status).
+// A variable (not a const) so the unit tests can redirect the write to a
+// temp file (/dev/termination-log is a kernel-managed path the runner only
+// has inside its container; the unit tests exercise the same writeClaim code
+// against a writable path).
+var claimWritePath = terminationLogPath
+
 // defaultPollInterval is how long PhaseRun waits for the operator to write a
 // desired-phase (a fresh pod's phase-init writes it almost immediately; the
 // poll is a safety net for a slow init / a manual pod).
@@ -227,7 +235,7 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		res.Status = statusBlocked
 		res.VerificationNotes = fmt.Sprintf("write result: %v", err)
 	}
-	writeClaim(terminationLogPath, res)
+	writeClaim(claimWritePath, res)
 	return res
 }
 

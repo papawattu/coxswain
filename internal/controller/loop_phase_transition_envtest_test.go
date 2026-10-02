@@ -24,19 +24,52 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
-// B1 (cluster seam): the controller applies the transition when the runner
-// reports a finished phase. Each It is self-contained with its own namespace
-// (envtest gotcha: a shared namespace lets one It's sandbox/status leak into
-// the next). The operator is the sole writer of Loop status (ADR-0004) — in
-// the test we set ObservedPhase directly to stand in for the runner's
-// result.json report, then reconcile and assert the operator advanced the phase.
+// B1 (cluster seam, legacy status-path): the controller applies the
+// transition when the runner reports a finished phase. Each It is
+// self-contained with its own namespace (envtest gotcha: a shared namespace
+// lets one It's sandbox/status leak into the next). The operator is the sole
+// writer of Loop status (ADR-0004) — in the test we set ObservedPhase
+// directly to stand in for the runner's report, then reconcile and assert the
+// operator advanced the phase. S4 (ADR-0004): this file keeps the pure
+// nextPhase contract as a seam-level spec; the live claim reader (the agent
+// termination message via the APIReader path) is covered by
+// loop_s4_reader_test.go. The S4 bootstrap moves a fresh Loop Pending ->
+// Planning on its first reconcile, so the effective transition under test is
+// the step PAST the bootstrap (a report of Implementing advances
+// Planning -> Implementing, and so on).
 var _ = Describe("B1 phase transitions via Reconcile", func() {
 	ctx := context.Background()
+
+	// ensureClaimPod creates the stand-in sandbox pod the S4 live claim reader
+	// reads. A bare reconciler (no APIReader) falls back to the cached client;
+	// a stand-in pod with NO terminated agent status yields (nil, nil) — the
+	// reader requeues and records nothing, and no sandbox recycle deletes a
+	// claim the spec sets by hand.
+	ensureClaimPod := func(ns, name string) {
+		_ = k8sClient.Create(ctx, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+		})
+	}
+	reconcileLoop := func(ns, name string) {
+		_, err := (&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}).
+			Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+	}
+	// ensureSandbox recreates the sandbox the bootstrap recycle deleted (the
+	// S4 option-B bootstrap, Pending -> Planning, deletes the just-created
+	// sandbox so the phase-init container re-writes the desired phase on the
+	// recreated pod — one container run per phase). The same pattern every
+	// other spec in this file uses to stand in for the operator's recycle.
+	ensureSandbox := func(ns, name string) {
+		_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns}})
+	}
 
 	// reportPhase simulates the runner reporting that it finished <reported>
 	// (the phase it was executing) by setting status.observedPhase, then
@@ -48,9 +81,9 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		loop.Status.ObservedPhase = reported
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
-		Expect(err).NotTo(HaveOccurred())
+		ensureSandbox(ns, name)
+		ensureClaimPod(ns, name)
+		reconcileLoop(ns, name)
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 	}
 
@@ -66,14 +99,16 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 			Spec:       coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		// Prime: a fresh Loop reconciles to Pending with the sandbox ensured.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
-		Expect(err).NotTo(HaveOccurred())
+		// Prime: the S4 bootstrap moves a fresh Loop to Planning (option B) and
+		// recycles the sandbox; ensure the stand-in sandbox + claim pod the live
+		// reader reads (see reportPhase).
+		ensureSandbox(ns, name)
+		ensureClaimPod(ns, name)
+		reconcileLoop(ns, name)
 		return nn
 	}
 
-	It("advances Pending -> Planning when the runner reports Planning done", func() {
+	It("records a report of the bootstrap phase (Planning) without advancing (S4 bootstrap already moved Pending -> Planning)", func() {
 		ns := "b1-plan-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
@@ -85,11 +120,11 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
-			"the operator should advance to Planning once the runner reports it done")
+			"the bootstrap left the Loop at Planning; a report of the CURRENT phase (Planning) must not advance again")
 		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 	})
 
-	It("advances Pending -> Planning -> Implementing -> Verifying, and stops there (D23)", func() {
+	It("advances Planning -> Implementing -> Verifying from successive reports, and stops there (D23)", func() {
 		ns := "b1-happy-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
@@ -97,12 +132,11 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 
 		nn := makeLoop(ns, "b1-happy")
 
-		// Prime left Phase=Pending. Drive the claim-driven path as far as it
-		// goes: Pending -> Planning -> Implementing -> Verifying. The exit from
+		// The S4 bootstrap left Phase=Planning. Drive the claim-driven path as
+		// far as it goes: Planning -> Implementing -> Verifying. The exit from
 		// Verifying to Succeeded is evidence-gated (verify Job, B3) and must NOT
 		// be driven by a runner report, so the happy-path-to-Succeeded test lives
 		// in B3, not here.
-		reportPhase(ns, "b1-happy", coxv1alpha1.LoopPhasePlanning)
 		reportPhase(ns, "b1-happy", coxv1alpha1.LoopPhaseImplementing)
 		reportPhase(ns, "b1-happy", coxv1alpha1.LoopPhaseVerifying)
 
@@ -119,8 +153,7 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
 		nn := makeLoop(ns, "b1-nogate")
-		// Drive to Verifying first.
-		reportPhase(ns, "b1-nogate", coxv1alpha1.LoopPhasePlanning)
+		// Drive to Verifying first (the S4 bootstrap left Phase=Planning).
 		reportPhase(ns, "b1-nogate", coxv1alpha1.LoopPhaseImplementing)
 		reportPhase(ns, "b1-nogate", coxv1alpha1.LoopPhaseVerifying)
 
@@ -141,18 +174,18 @@ var _ = Describe("B1 phase transitions via Reconcile", func() {
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
 		nn := makeLoop(ns, "b1-stay")
-		// Prime left Phase=Pending. A report of Succeeded skips ahead of the
-		// only valid step (Planning), so the operator must stay in Pending.
+		// The S4 bootstrap left Phase=Planning. A report of Succeeded skips
+		// ahead of the only valid step (Implementing), so the operator must
+		// stay in Planning.
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		loop.Status.ObservedPhase = coxv1alpha1.LoopPhaseSucceeded
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
-		Expect(err).NotTo(HaveOccurred())
+		ensureClaimPod(ns, "b1-stay")
+		reconcileLoop(ns, "b1-stay")
 
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePending),
-			"a skip-ahead report must not advance the machine")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"a skip-ahead report must not advance the machine (the bootstrap's Planning is the current phase)")
 	})
 })

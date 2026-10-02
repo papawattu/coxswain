@@ -69,6 +69,14 @@ O2's diagnoses have been seen in practice.
 
 ## P1: Seams to build now (not parked)
 
+**Owner direction (2026-10-02, follow-up): MVP alpha first. Get a working,
+feature-complete version before anything else.** The seams therefore split in
+two:
+- **Build now (part of the slice anyway, near-zero cost): OS1, OS5, OS8.**
+- **Deferred: OS2, OS3, OS4, OS6, OS7, OS9, OS10.** Add one only if it is
+  genuinely free while touching that code (a field or a constant). Never let it
+  delay a slice; otherwise build it with D45.
+
 Each seam below is added by the slice that is **already building that area**,
 as a stub, a reserved field or an interface with a no-op default. No observer
 behaviour ships. The reviewer checks each seam as part of the named slice's
@@ -92,5 +100,4 @@ acceptance.
 - Size-limited and untrusted. Everything the worker emits (OS1, OS2, OS4) is a claim: bounded, schema-validated, never a gate input.
 - Tested as plumbing only. Each seam has a unit or envtest proving the field, file or interface exists and is wired; no observer behaviour is tested because none exists.
 
-**Acceptance:** each listed slice's PR states which seams it adds, and the
-reviewer checks them as part of that slice's verdict.
+**Acceptance:** S4 delivers OS1, OS5 (phase transitions) and OS8; S5 delivers OS5 (verify). The reviewer checks only these. The deferred seams are not acceptance criteria.

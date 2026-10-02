@@ -1,0 +1,36 @@
+diff --git a/numutils/__init__.py b/numutils/__init__.py
+index c80237f..bd50a70 100644
+--- a/numutils/__init__.py
++++ b/numutils/__init__.py
+@@ -1,5 +1,5 @@
+ """The numutils sample package (seed state: Median is missing — tasks.md task 1)."""
+ 
+-from numutils.stats import mean, mode
++from numutils.stats import mean, mode, median, Median
+ 
+-__all__ = ["mean", "mode"]
++__all__ = ["mean", "mode", "Median"]
+diff --git a/numutils/stats.py b/numutils/stats.py
+index 3fb7be2..82c8105 100644
+--- a/numutils/stats.py
++++ b/numutils/stats.py
+@@ -18,3 +18,19 @@ def mode(values):
+         if c > best_count:
+             best, best_count = v, c
+     return best
++
++
++def median(values):
++    """Median; averages the middle pair for even length; does not mutate input."""
++    if not values:
++        raise ValueError("median of empty sequence")
++    data = sorted(values)
++    n = len(data)
++    mid = n // 2
++    if n % 2:
++        return data[mid]
++    return (data[mid - 1] + data[mid]) / 2
++
++
++# Median is the public name the acceptance tests import.
++Median = median

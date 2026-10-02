@@ -1,0 +1,84 @@
+--- a/main.go	2026-10-02 01:34:55.969956476 +0000
++++ b/main.go	2026-10-02 01:35:21.981725193 +0000
+@@ -12,12 +12,23 @@
+ func main() {
+ 	value := flag.Float64("value", 0, "the value to round")
+ 	places := flag.Int("places", 0, "decimal places to round to")
++	jsonOut := flag.Bool("json", false, "print the result as a single-line JSON object")
+ 	flag.Parse()
+ 
+-	if *value == 0 && *places == 0 {
+-		fmt.Fprintln(os.Stderr, "usage: gocli -value <v> [-places <n>]")
++	if *value == 0 && *places == 0 && !*jsonOut {
++		fmt.Fprintln(os.Stderr, "usage: gocli -value <v> [-places <n>] [-json]")
+ 		os.Exit(2)
+ 	}
+ 
++	if *jsonOut {
++		out, err := roundJSON(*value, *places)
++		if err != nil {
++			fmt.Fprintln(os.Stderr, err)
++			os.Exit(1)
++		}
++		fmt.Println(out)
++		return
++	}
++
+ 	fmt.Printf("%g\n", Round(*value, *places))
+ }
+--- a/json.go	2026-09-27 18:52:28.748000000 +0000
++++ b/json.go	2026-10-02 01:35:21.981725193 +0000
+@@ -0,0 +1,20 @@
++package main
++
++import (
++	"encoding/json"
++	"fmt"
++)
++
++// roundJSON renders the task 2 -json output: a single-line JSON object with
++// the input value, the requested places, and the rounded result.
++func roundJSON(value float64, places int) (string, error) {
++	b, err := json.Marshal(map[string]any{
++		"value":   value,
++		"places":  places,
++		"rounded": Round(value, places),
++	})
++	if err != nil {
++		return "", err
++	}
++	return fmt.Sprintf("%s", b), nil
++}
+--- a/main_test.go	2026-09-27 18:52:28.748000000 +0000
++++ b/main_test.go	2026-10-02 01:35:21.985725157 +0000
+@@ -0,0 +1,30 @@
++package main
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++// TestMainJSON covers the task 2 -json flag: the rounded result is emitted as
++// a single-line JSON object with the input, places and rounded fields.
++func TestMainJSON(t *testing.T) {
++	got, err := roundJSON(3.145, 2)
++	if err != nil {
++		t.Fatalf("roundJSON: %v", err)
++	}
++	var obj struct {
++		Value   float64 `json:"value"`
++		Places  int     `json:"places"`
++		Rounded float64 `json:"rounded"`
++	}
++	if err := json.Unmarshal([]byte(got), &obj); err != nil {
++		t.Fatalf("output %q is not valid JSON: %v", got, err)
++	}
++	if obj.Value != 3.145 || obj.Places != 2 || obj.Rounded != 3.15 {
++		t.Errorf("json object = %+v, want value=3.145 places=2 rounded=3.15", obj)
++	}
++	if strings.Contains(got, "\n") {
++		t.Errorf("json output is not single-line: %q", got)
++	}
++}

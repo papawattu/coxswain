@@ -1,0 +1,11 @@
+--- a/round.go	2026-10-02 01:35:06.241864901 +0000
++++ b/round.go	2026-10-02 01:35:12.477809461 +0000
+@@ -7,7 +7,6 @@
+ 
+ // Round rounds v to n decimal places. n=0 rounds to the nearest integer.
+ func Round(v float64, n int) float64 {
+-	// BUG (seed): truncates instead of rounding.
+ 	scale := math.Pow(10, float64(n))
+-	return math.Trunc(v * scale) / scale
++	return math.Round(v*scale) / scale
+ }

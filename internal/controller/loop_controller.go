@@ -2014,7 +2014,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// bounded by its own network use, but the rule itself cannot be scoped to
 	// a single container. Accepted for the MVP; see the PR's Known limitations.
 	if loop.Spec.Workspace.Repo != "" {
-		if peer := repoPeer(loop.Spec.Workspace.Repo); peer != nil {
+		if peer := repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost); peer != nil {
 			port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
 			agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
 				To:    []networkingv1.NetworkPolicyPeer{*peer},
@@ -2435,13 +2435,13 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 // "every pod in this namespace" would open git egress to the whole
 // namespace instead of the named Service's namespace. The repo is a
 // non-secret Loop spec field (workspace.repo).
-func repoPeer(repoURL string) *networkingv1.NetworkPolicyPeer {
+func repoPeer(repoURL string, nsFromHost func(string) (string, bool)) *networkingv1.NetworkPolicyPeer {
 	host := workspaceRepoHost(repoURL)
 	if ip := net.ParseIP(host); ip != nil {
 		cidr := ip.String() + "/32"
 		return &networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}}
 	}
-	if ns, ok := serviceNamespaceFromHost(host); ok {
+	if ns, ok := nsFromHost(host); ok {
 		return &networkingv1.NetworkPolicyPeer{
 			NamespaceSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"kubernetes.io/metadata.name": ns},
@@ -2456,12 +2456,17 @@ func repoPeer(repoURL string) *networkingv1.NetworkPolicyPeer {
 // Service's pods live in (the CRD only allows these hosts over http://, so
 // the operator can always express the egress rule on an enforcing CNI). The
 // namespace is the last label of the host with the ".svc" (and any
-// cluster-domain) suffix stripped. ok=false for any other host.
-func serviceNamespaceFromHost(host string) (string, bool) {
+// cluster-domain) suffix stripped. ok=false for any other host. The FQDN
+// suffix is the OPERATOR's cluster domain (not a hard-coded cluster.local,
+// review #50 P3): the CRD only allows ".svc" / ".svc.cluster.local" forms
+// over plain http, so a custom-domain cluster only ever carries the ".svc"
+// short form and the match below degrades gracefully.
+func (r *LoopReconciler) serviceNamespaceFromHost(host string) (string, bool) {
+	cd := r.clusterDomain()
 	var labels string
 	switch {
-	case strings.HasSuffix(host, ".svc.cluster.local"):
-		labels = strings.TrimSuffix(host, ".svc.cluster.local")
+	case strings.HasSuffix(host, ".svc."+cd):
+		labels = strings.TrimSuffix(host, ".svc."+cd)
 	case strings.HasSuffix(host, ".svc"):
 		labels = strings.TrimSuffix(host, ".svc")
 	default:

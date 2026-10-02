@@ -64,6 +64,12 @@ const (
 	// specs create (envtest has no agent-sandbox controller to run the real
 	// agent). A constant (goconst): it is used in every S3 stand-in pod.
 	s3StandinImage = "busybox"
+	// s3ModelEndpoint is the shared model endpoint across the S3 envtest
+	// fixture Loops (goconst: the endpoint literal repeats per fixture).
+	s3ModelEndpoint = "vllm:8000"
+	// s3DNSSvcNs is the namespaceSelector label of the cluster-DNS peer
+	// (dnsPeer), shared by the repo-peer specs that must skip it (goconst).
+	s3DNSSvcNs = "kube-system"
 )
 
 // s3RunnerCommand is the agent container Command the operator emits for a
@@ -99,7 +105,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 				Agent: coxv1alpha1.AgentConfig{
 					Image:             "",
 					EndpointSecretRef: "samples-model-cred",
-					ModelEndpoint:     "vllm:8000",
+					ModelEndpoint:     s3ModelEndpoint,
 				},
 			},
 		}
@@ -389,6 +395,130 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		Expect(generalEgress).To(BeFalse(), "the agent netpol must NOT open general (0.0.0.0/0) egress for the repo clone")
 		Expect(repoRule).To(BeFalse(), "an external-FQDN repo host must NOT be expressed as a general rule (fail-closed: no rule the operator cannot scope)")
 		Expect(hasModelRule).To(BeTrue(), "the agent netpol must still carry the model-proxy egress rule (the repo addition changes nothing else)")
+	})
+
+	// s3SvcRepoLoop is like s3Loop but with an in-cluster Service repo host
+	// (S3 review P1: repoPeer must emit a namespaceSelector peer for
+	// "<svc>.<ns>.svc[.cluster.local]" so the clone works on an enforcing
+	// CNI — the CRD allows http:// only for exactly these hosts).
+	s3SvcRepoLoop := func(name, ns, repo string) *coxv1alpha1.Loop {
+		return &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: repo},
+				Agent: coxv1alpha1.AgentConfig{
+					Image:             "",
+					EndpointSecretRef: "samples-model-cred",
+					ModelEndpoint:     s3ModelEndpoint,
+				},
+			},
+		}
+	}
+
+	It("emits a namespaceSelector repo egress rule for an in-cluster .svc repo (S3 review P1)", func() {
+		ns := "s3-svcrepo-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "svcreploop"
+		Expect(k8sClient.Create(ctx, s3SvcRepoLoop(name, ns, "http://gitea.samples.svc:3000/samples/gocli.git"))).To(Succeed())
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		s3Reconcile(r, name, ns)
+
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-agent-netpol", Namespace: ns}, np)).To(Succeed())
+
+		// Exactly one egress rule carries the repo peer: a namespaceSelector on
+		// kubernetes.io/metadata.name=samples on port 3000/TCP (the URL port).
+		repoRules := 0
+		for i := range np.Spec.Egress {
+			for j := range np.Spec.Egress[i].To {
+				peer := np.Spec.Egress[i].To[j]
+				if peer.NamespaceSelector == nil {
+					continue
+				}
+				if peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == s3DNSSvcNs && peer.PodSelector != nil {
+					continue // the cluster-DNS peer (dnsPeer), not a repo rule
+				}
+				repoRules++
+				Expect(peer.NamespaceSelector.MatchLabels).To(Equal(map[string]string{"kubernetes.io/metadata.name": "samples"}),
+					"the .svc repo peer must be a namespaceSelector over the Service's namespace (samples)")
+				Expect(peer.PodSelector).To(BeNil(), "a .svc repo peer must not ALSO be a podSelector")
+				Expect(peer.IPBlock).To(BeNil(), "a .svc repo peer must not be an ipBlock")
+				Expect(np.Spec.Egress[i].Ports).To(HaveLen(1))
+				Expect(np.Spec.Egress[i].Ports[0].Port.IntVal).To(Equal(int32(3000)), "the .svc repo rule must use the repo URL port")
+				Expect(np.Spec.Egress[i].Ports[0].Protocol).To(HaveValue(BeEquivalentTo(corev1.ProtocolTCP)))
+				Expect(np.Spec.Egress[i].To).To(HaveLen(1), "the repo rule must target only the namespace peer")
+			}
+		}
+		Expect(repoRules).To(Equal(1), "exactly one namespaceSelector repo egress rule for a .svc repo")
+	})
+
+	It("emits the namespaceSelector repo rule for a .svc.cluster.local repo (S3 review P1)", func() {
+		ns := "s3-svcrepo2-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "svcrep2loop"
+		Expect(k8sClient.Create(ctx, s3SvcRepoLoop(name, ns, "http://gitea.samples.svc.cluster.local:3000/samples/gocli.git"))).To(Succeed())
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		s3Reconcile(r, name, ns)
+
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-agent-netpol", Namespace: ns}, np)).To(Succeed())
+
+		repoRules := 0
+		for i := range np.Spec.Egress {
+			for j := range np.Spec.Egress[i].To {
+				peer := np.Spec.Egress[i].To[j]
+				if peer.NamespaceSelector == nil {
+					continue
+				}
+				if peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == s3DNSSvcNs && peer.PodSelector != nil {
+					continue // the cluster-DNS peer (dnsPeer), not a repo rule
+				}
+				repoRules++
+				Expect(peer.NamespaceSelector.MatchLabels).To(Equal(map[string]string{"kubernetes.io/metadata.name": "samples"}),
+					"the .svc.cluster.local repo peer must strip the cluster-domain suffix (namespace is still samples)")
+				Expect(np.Spec.Egress[i].Ports).To(HaveLen(1))
+				Expect(np.Spec.Egress[i].Ports[0].Port.IntVal).To(Equal(int32(3000)))
+			}
+		}
+		Expect(repoRules).To(Equal(1), "exactly one namespaceSelector repo egress rule for a .svc.cluster.local repo")
+	})
+
+	It("adds no repo egress rule for an external-FQDN repo (fail-closed, S3 review P1)", func() {
+		// The existing 'lets the sandbox pod reach the repo host' spec already
+		// asserts no repo rule for https://example.com (no podSelector/443 rule
+		// and no 0.0.0.0/0). This spec closes the remaining gap: an external
+		// host must produce NO namespaceSelector peer either (a namespace
+		// selector for an external host would be both wrong and a general-
+		// egress hole).
+		ns := "s3-extrepo-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "extreloop"
+		Expect(k8sClient.Create(ctx, s3SvcRepoLoop(name, ns, "https://github.com/example/repo.git"))).To(Succeed())
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		s3Reconcile(r, name, ns)
+
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-agent-netpol", Namespace: ns}, np)).To(Succeed())
+
+		for i := range np.Spec.Egress {
+			for j := range np.Spec.Egress[i].To {
+				peer := np.Spec.Egress[i].To[j]
+				if peer.NamespaceSelector != nil &&
+					peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == s3DNSSvcNs &&
+					peer.PodSelector != nil {
+					continue // the cluster-DNS peer (dnsPeer) is expected; not a repo rule
+				}
+				Expect(peer.NamespaceSelector).To(BeNil(),
+					"an external-FQDN repo host must not produce a namespaceSelector peer (fail-closed)")
+			}
+		}
 	})
 
 	It("sets COX_GOAL and selects the runner command only for the runner image (b)", func() {

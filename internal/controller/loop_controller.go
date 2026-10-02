@@ -2008,6 +2008,11 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// host is not resolvable to a NetworkPolicy peer (external FQDN), no repo
 	// rule is added (fail-closed) — the clone then relies on the egress proxy
 	// (if present) or fails. A repo-less Loop adds no repo rule.
+	// P3 (known limitation, MVP): the repo rule is pod-wide (NetworkPolicy has
+	// no per-container scoping), so the AGENT container can also reach the repo
+	// host (anonymous read of every repo there). The init container's clone is
+	// bounded by its own network use, but the rule itself cannot be scoped to
+	// a single container. Accepted for the MVP; see the PR's Known limitations.
 	if loop.Spec.Workspace.Repo != "" {
 		if peer := repoPeer(loop.Spec.Workspace.Repo); peer != nil {
 			port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
@@ -2417,14 +2422,58 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 }
 
 // repoPeer is the NetworkPolicy peer for the sandbox pod's workspace init
-// container's git egress (S3a), the same fail-closed resolution as modelPeer
-// but for spec.workspace.repo: a numeric IP host is an ipBlock /32; a bare
-// in-cluster Service name is a podSelector over the namespace; an external
-// FQDN (does not resolve here) is nil — the repo egress rule is omitted
-// (fail-closed) and the clone relies on the egress proxy (if present) or
-// fails. The repo is a non-secret Loop spec field (workspace.repo).
+// container's git egress (S3a), fail-closed: a numeric IP host is an ipBlock
+// /32; an in-cluster Service FQDN (host ending ".svc" or
+// ".svc.cluster.local", the only hosts the CRD allows over plain http://) is
+// a namespaceSelector over the Service's namespace (matchLabels
+// kubernetes.io/metadata.name — set by the API server on every namespace) on
+// the repo port; anything else (external FQDN, a bare single-label name)
+// is nil — the repo egress rule is omitted (fail-closed) and the clone
+// relies on the egress proxy (if present) or fails. A bare single-label
+// name is deliberately NOT mapped (unlike modelPeer's same-namespace
+// podSelector): the repo URL names an explicit host, and widening it to
+// "every pod in this namespace" would open git egress to the whole
+// namespace instead of the named Service's namespace. The repo is a
+// non-secret Loop spec field (workspace.repo).
 func repoPeer(repoURL string) *networkingv1.NetworkPolicyPeer {
-	return modelPeer(workspaceRepoHost(repoURL))
+	host := workspaceRepoHost(repoURL)
+	if ip := net.ParseIP(host); ip != nil {
+		cidr := ip.String() + "/32"
+		return &networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}}
+	}
+	if ns, ok := serviceNamespaceFromHost(host); ok {
+		return &networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"kubernetes.io/metadata.name": ns},
+			},
+		}
+	}
+	return nil
+}
+
+// serviceNamespaceFromHost maps an in-cluster Service hostname
+// "<svc>.<ns>.svc" or "<svc>.<ns>.svc.<clusterDomain>" to the namespace the
+// Service's pods live in (the CRD only allows these hosts over http://, so
+// the operator can always express the egress rule on an enforcing CNI). The
+// namespace is the last label of the host with the ".svc" (and any
+// cluster-domain) suffix stripped. ok=false for any other host.
+func serviceNamespaceFromHost(host string) (string, bool) {
+	var labels string
+	switch {
+	case strings.HasSuffix(host, ".svc.cluster.local"):
+		labels = strings.TrimSuffix(host, ".svc.cluster.local")
+	case strings.HasSuffix(host, ".svc"):
+		labels = strings.TrimSuffix(host, ".svc")
+	default:
+		return "", false
+	}
+	// labels is now "<svc>.<ns>" (dots in the Service name are illegal, so
+	// the namespace is everything after the first '.').
+	i := strings.IndexByte(labels, '.')
+	if i <= 0 || i == len(labels)-1 {
+		return "", false
+	}
+	return labels[i+1:], true
 }
 
 // workspaceRepoHost returns the host (no port, no path) of a git repo URL

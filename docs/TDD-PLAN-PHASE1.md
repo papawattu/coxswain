@@ -972,7 +972,7 @@ stops at Verifying; a runner report of Succeeded does not exit Verifying).
   the agent image + model + the secret ref holding the base URL + API key
   (mounted into the **proxy sidecar**, never the agent). Defaults from a
   `coxswain-agent-defaults` ConfigMap so the README sample stays short.
-- `workspace.gitCredentialSecret` (string, optional) — secret with the git token
+- `workspace.gitCredentialSecret` (string, optional) — secret with the git token. The Secret MUST carry a key named `.git-credentials` (content: `http://<user>:<pass>@<git host>`); the operator mounts ONLY that key (`items` mapping) at `/workspace-creds/.git-credentials` and passes it to git per command (S3, docs/SAMPLES-PLAN.md)
 - `verify.protectedPaths[]` (optional, **globs**) + `verify.preset` (enum, default `go`; ADR-0005 round-6 D16) + `verify.protectedPathsOverride` (bool, default false) — the protected paths for the TamperedVerify glob diff. The content-free operator can't detect the repo's language, so the preset is **explicit**: `preset: go` expands to the Go glob set (`**/*_test.go`, `**/testdata/**`, `go.mod`, `go.sum`); `protectedPaths[]` **adds** to it; `protectedPathsOverride: true` (or `preset: none`) **replaces** it. Drop the "files a check references" heuristic; document that a check calling `make` should list `Makefile` in `protectedPaths`. Protecting `go.mod`/`go.sum` means the agent can't add dependencies (documented). (The plan's `acceptanceChecks[]` commands stay as-is.)
 - `loop.phaseTimeout` (metav1.Duration, default 30m) — Phase 1 adds the field;
   the timeout *enforcement* (restart from checkpoint) is Phase 3, so Phase 1

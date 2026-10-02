@@ -227,6 +227,30 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		credVol := s3Vol(sb, workspaceCredsVolume)
 		Expect(credVol.Secret).NotTo(BeNil(), "the credential volume must be a Secret volume")
 		Expect(credVol.Secret.SecretName).To(Equal("samples-git-cred"), "the credential Secret name must be the Loop's gitCredentialSecret")
+		// The items mapping pins the mount to the single key '.git-credentials'
+		// at /workspace-creds/.git-credentials. Without it, a SubPath mount of
+		// a missing Secret key makes the kubelet mount an empty DIRECTORY (the
+		// live 'unable to open /workspace-creds: Is a directory' failure), and
+		// without the items list a Secret with OTHER keys would mount them too.
+		Expect(credVol.Secret.Items).To(Equal([]corev1.KeyToPath{
+			{Key: ".git-credentials", Path: ".git-credentials"},
+		}), "the credential volume must mount ONLY the '.git-credentials' key at /workspace-creds/.git-credentials")
+		// The init container mounts the volume directory (the items mapping
+		// already restricts it); a SubPath on top would re-enter the same key
+		// and, for a missing key, mount an empty directory.
+		initCredMount := &corev1.VolumeMount{}
+		foundCredMount := false
+		for _, m := range init.VolumeMounts {
+			if m.Name == workspaceCredsVolume {
+				initCredMount = &m
+				foundCredMount = true
+			}
+		}
+		Expect(foundCredMount).To(BeTrue(), "the init container must mount /workspace-creds (the items mapping provides the file)")
+		Expect(initCredMount.MountPath).To(Equal("/workspace-creds"), "the init container must mount the /workspace-creds directory")
+		Expect(initCredMount.ReadOnly).To(BeTrue(), "the credential mount must be read-only")
+		Expect(initCredMount.SubPath).To(BeEmpty(),
+			"the init container must not add a SubPath on top of the items-mapped volume (a SubPath on a missing key mounts an empty directory)")
 		agentEnvNames := map[string]bool{}
 		for _, e := range agent.Env {
 			agentEnvNames[e.Name] = true
@@ -238,12 +262,12 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		// credential.helper store` would make git's store helper READ AND WRITE
 		// /workspace/.git-credentials (the agent's workspace) after an
 		// authenticated fetch. The fix passes the credential PER COMMAND (-c
-		// credential.helper='store --file=/workspace-creds') and sets no HOME
+		// credential.helper='store --file=/workspace-creds/.git-credentials') and sets no HOME
 		// into the workspace, so nothing is persisted into /workspace.
 		Expect(cmd).NotTo(ContainSubstring("git config --global"),
 			"the init script must not use git config --global (a global .gitconfig in /workspace would persist the credential into the agent's workspace)")
-		Expect(cmd).To(ContainSubstring("-c credential.helper='store --file=/workspace-creds'"),
-			"the init script must pass the credential per command, pinned to the read-only /workspace-creds mount")
+		Expect(cmd).To(ContainSubstring("-c credential.helper='store --file=/workspace-creds/.git-credentials'"),
+			"the init script must pass the credential per command, pinned to the read-only /workspace-creds/.git-credentials file")
 		for _, e := range init.Env {
 			Expect(e.Value).NotTo(Equal(agentWorkspaceMount),
 				"the init container must not set HOME (or any env) to the agent workspace (a credential could be persisted there)")

@@ -83,6 +83,12 @@ const (
 	// init container (S3a). It clones spec.workspace.repo @ ref into the
 	// 'workspace' volume and writes the resolved SHA to baseCommitFile.
 	workspaceInitContainerName = "init-workspace"
+	// workspaceGitCredentialsKey is the REQUIRED key in the
+	// spec.workspace.gitCredentialSecret Secret (content: http://<user>:
+	// <pass>@<git host>). See the volume items mapping in agentPodSpec and
+	// the init container's credential.helper 'store --file'.
+	workspaceGitCredentialsKey = ".git-credentials"
+
 	// workspaceCredsVolume is the Secret volume carrying the git credential
 	// (S3a, ADR-0006). It is mounted into the init container ONLY — the agent
 	// never sees git credentials (zero credentials in the agent).
@@ -796,11 +802,19 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// pod ONLY to reach the init container; the agent has no such mount
 	// (zero credentials in the agent). Mounted with the default 0644 mode
 	// so the init container's git credential.helper 'store' can read it.
+	// The Secret MUST carry a key named '.git-credentials' (content:
+	// http://<user>:<pass>@<git host>); the items mapping mounts ONLY that
+	// key as /workspace-creds/.git-credentials. (A plain mount with a
+	// SubPath that names a missing key makes the kubelet mount an empty
+	// DIRECTORY, which git's store helper rejects with 'unable to open
+	// /workspace-creds: Is a directory' — the items form names the key
+	// explicitly and fails loud at pod start instead.)
 	if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" {
 		volumes = append(volumes, corev1.Volume{
 			Name: workspaceCredsVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 				SecretName: loop.Spec.Workspace.GitCredentialSecret,
+				Items:      []corev1.KeyToPath{{Key: workspaceGitCredentialsKey, Path: workspaceGitCredentialsKey}},
 			}},
 		})
 	}
@@ -2652,7 +2666,11 @@ func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.C
 	if loop.Spec.Workspace.GitCredentialSecret != "" {
 		initMounts = []corev1.VolumeMount{
 			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
-			{Name: workspaceCredsVolume, MountPath: "/workspace-creds", SubPath: ".git-credentials", ReadOnly: true},
+			// The volume's items mapping (agentPodSpec) already restricts the
+			// mount to the single key '.git-credentials' at
+			// /workspace-creds/.git-credentials; no SubPath (a SubPath naming
+			// a missing key would mount an empty directory).
+			{Name: workspaceCredsVolume, MountPath: "/workspace-creds", ReadOnly: true},
 		}
 	} else {
 		initMounts = []corev1.VolumeMount{{Name: workspaceVolumeName, MountPath: agentWorkspaceMount}}
@@ -2670,12 +2688,13 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	// (the len(mounts) == 2 check was fragile: any second mount would
 	// silently switch the credential on). When a gitCredentialSecret is
 	// declared, git is given the credential per command (-c
-	// credential.helper='store --file=/workspace-creds') — nothing is
-	// persisted to a .gitconfig, and the store helper's file is the
-	// read-only mount (it cannot write a credential back into the workspace).
+	// credential.helper='store --file=/workspace-creds/.git-credentials') —
+	// nothing is persisted to a .gitconfig, and the store helper's file is
+	// the read-only mount (it cannot write a credential back into the
+	// workspace).
 	credOpt := ""
 	if loop.Spec.Workspace.GitCredentialSecret != "" {
-		credOpt = " -c credential.helper='store --file=/workspace-creds'"
+		credOpt = " -c credential.helper='store --file=/workspace-creds/" + workspaceGitCredentialsKey + "'"
 	}
 	// GIT_TERMINAL_PROMPT=0: never prompt (the init container has no TTY; a
 	// missing credential must fail the clone, not hang).

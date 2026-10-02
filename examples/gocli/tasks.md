@@ -10,6 +10,15 @@ Stdlib only — no `go get`, no network. The `go` preset protects `*.go` files;
 the test files below are additionally named in `protectedPaths` to make the
 "do not cheat" boundary explicit.
 
+**Git credential:** each spec's `workspace.gitCredentialSecret` names a Secret
+that MUST carry a key named `.git-credentials` with content
+`http://<user>:<pass>@<git host>` (for the seeded Gitea:
+`http://samples:password@gitea.samples.svc:3000`). The operator mounts ONLY that
+key (`items: [{key: '.git-credentials', path: '.git-credentials'}]`) and passes
+it to git per command; a Secret without that key makes the init container fail
+loud at pod start (empty-directory mount, 'unable to open /workspace-creds:
+Is a directory'). See docs/SAMPLES-PLAN.md S3 for the rationale.
+
 ## Task 1 — make the tests pass
 
 **Goal (issue-style):**

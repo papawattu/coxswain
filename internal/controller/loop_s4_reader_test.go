@@ -326,13 +326,15 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 			"status.observedPhase records the phase the claim NAMES (the phase executed), not the phase the machine advanced to")
 		Expect(loop.Status.Progress.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "the progress record follows the latest claim")
 
-		By("claim 3: a success claim naming Verifying (a phase the runner does not execute) — no advance (the machine holds at Verifying; the exit is evidence-gated, B3)")
+		By("claim 3: a success claim naming Verifying (a phase the runner does not execute) — the operator holds at Verifying and ignores the claim entirely")
+		progressBefore := loop.Status.Progress.DeepCopy()
 		loop = oneShotRun(r, nn, coxv1alpha1.LoopPhaseVerifying, true)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
-			"a claim naming Verifying has no successor mapping and is not the current phase (the runner stops at Implementing; Verifying is operator-owned, ADR-0005) — the machine holds")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
-		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
-		Expect(loop.Status.Progress.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"a claim at Verifying is ignored: the operator never records a claim for a phase it holds (Verifying is operator-owned, ADR-0005)")
+		Expect(loop.Status.Progress).To(BeEquivalentTo(progressBefore),
+			"a claim at Verifying must not touch the progress record")
 
 		By("emitting a PhaseAdvanced Event on every advance (OS5, stable reason)")
 		events := drainEvents(recorder)
@@ -547,6 +549,12 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		// move the phase or rewrite progress.
 		ensureSandboxObject(ns, "vhlp")
 		createStandinPod(ns, "vhlp")
+		// Drain the PhaseAdvanced Events the setup advances emitted
+		// (Planning -> Implementing, Implementing -> Verifying) so the
+		// post-Verifying-reconcile assertion only sees what the Verifying
+		// reconcile itself emitted (nothing — the hold returns before any
+		// claim handling, hence no advance and no Event).
+		drainEvents(recorder)
 		writeAgentTermination(ns, "vhlp", `{"observedPhase":"Verifying","status":"success","blockedReason":""}`)
 		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())

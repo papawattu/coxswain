@@ -2664,12 +2664,22 @@ REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
 # No ` + "`rm -rf ${DEST}`" + `: ${DEST} is a MOUNT POINT (the emptyDir volume) and cannot be removed.
 # The emptyDir starts empty, so ` + "`git init ${DEST}`" + ` works on the existing empty dir.
-if [ -d "${DEST}/.git" ]; then
+if [ -d "${DEST}/.git" ] && [ -f "${DEST}/.coxswain/base-commit" ]; then
   # Idempotent: the pod is recreated per Loop (fresh emptyDir), but tolerate a
-  # re-run on the same volume without re-cloning.
+  # re-run on the same volume without re-cloning. The base-commit file is the
+  # success marker; a .git without it means the previous run failed mid-clone
+  # (fetch or checkout) and the local repo has no objects — re-run the clone.
   cd "${DEST}"
   git ` + safeDir + ` rev-parse --verify HEAD >/dev/null 2>&1 || git ` + safeDir + ` checkout "${REF}"
 else
+  # The volume is a MOUNT POINT (cannot be rm -rf'd). If a previous run left a
+  # half-cloned repo (.git present but no success marker), wipe its contents
+  # (never the mount point itself) so the clone starts clean. rm -rf is
+  # scoped to the .git dir, not ${DEST}.
+  if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
+  rm -rf "${DEST}/.coxswain"
+  mkdir -p "${DEST}"
+
   git ` + safeDir + ` init "${DEST}"
   git -C "${DEST}" ` + safeDir + ` remote add origin "${REPO}"
   git -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + credOpt + ` ` + safeDir + ` fetch origin "${REF}"

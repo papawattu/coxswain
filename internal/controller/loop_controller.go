@@ -2917,9 +2917,16 @@ func newReadFileViaREST(cfg *restclient.Config) func(ctx context.Context, pod *c
 		// The kubelet Pod read subresource is served at:
 		// /api/v1/namespaces/<ns>/pods/<name> (proxied to the kubelet).
 		// The controller-runtime concrete client uses the same path; the
-		// container and file are passed as query params.
-		url := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", pod.Namespace, pod.Name)
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.Host+url, nil)
+		// container and file are passed as query params. The container param
+		// is required (the pod has an init container too); without container
+		// and path the API server serves the pod object, not the file, and
+		// baseCommit stays empty forever (observed live on kind 2026-10-02).
+		u := neturl.URL{Path: fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", pod.Namespace, pod.Name)}
+		q := u.Query()
+		q.Set("container", "agent")
+		q.Set("path", path)
+		u.RawQuery = q.Encode()
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.Host+u.String(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("build http request for baseCommit read: %w", err)
 		}

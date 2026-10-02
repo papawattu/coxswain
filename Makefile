@@ -186,7 +186,7 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 	@curl -fsSL "$(AGENT_SANDBOX_MANIFEST)" | kubectl --context kind-$(CALICO_CLUSTER) apply -f -
 	@echo "Waiting for the agent-sandbox controller to be ready..."
 	@kubectl --context kind-$(CALICO_CLUSTER) rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --timeout=180s
-	@echo "Deploying the operator (BASE install: NO --allow-unenforced, NO --allow-unenforced-network) on $(CALICO_CLUSTER)..."
+	@echo "Deploying the operator (config/calico profile: --allow-unenforced ONLY; the D38 gate is LIVE, no --allow-unenforced-network) plus the config/cni-probe ns+RBAC on $(CALICO_CLUSTER)..."
 	@echo "   Building the controller image coxswain-controller:d38 and the egress/proxy stand-ins..."
 	@$(CONTAINER_TOOL) build -t coxswain-controller:d38 -f Dockerfile . || { echo "FATAL: controller docker-build failed"; exit 1; }
 	@$(MAKE) egress-proxy-build
@@ -205,13 +205,17 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		TMP_OVERLAY=$$(mktemp -d); \
 		cp -r config "$$TMP_OVERLAY/config"; \
 		(cd "$$TMP_OVERLAY/config/manager" && "$(LOCALBIN)/kustomize" edit set image controller=coxswain-controller:d38); \
-		# D38: the enforcing-CNI profile deploys the BASE install (config/default): \
-		# NO --allow-unenforced and NO --allow-unenforced-network. Calico is the \
-		# enforcing CNI, so the D38 CNI self-test gate is expected to PASS \
-		# WITHOUT the escape hatch (NetworkEnforced=True). (A dev overlay here \
-		# would make the network gate pass-via-flag and prove nothing about \
-		# the CNI.) \
-		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/default | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }
+		# D38: the enforcing-CNI profile deploys the config/calico overlay \
+		# (config/default + --allow-unenforced ONLY; the D38 network gate is \
+		# LIVE — no --allow-unenforced-network). --allow-unenforced bypasses \
+		# the D30 KubeArmor gate, which on this cluster (Calico, no KubeArmor, \
+		# ADR-0007 F2) would otherwise hold every Loop Suspended regardless of \
+		# D38 (Loops run with PolicyEnforced=False/EnforcementDisabled). The \
+		# config/cni-probe ns+RBAC is standalone (see \
+		# config/cni-probe/kustomization.yaml) and must be applied separately \
+		# so the operator's CNI self-test probe can run. \
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/calico | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }; \
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/cni-probe | kubectl --context $$CTX apply -f -) || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 1; }
 	@rm -rf "$${TMP_OVERLAY:-}"
 	@echo "kind-calico-up complete (cluster ready, images loaded; make d38-cni-e2e runs the assertions)."
 

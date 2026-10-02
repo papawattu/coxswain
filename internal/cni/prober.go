@@ -176,7 +176,18 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 	for i := range loops.Items {
 		loop := &loops.Items[i]
 		if p.Recorder != nil {
-			p.Recorder.Eventf(loop, corev1.EventTypeWarning, string(new.Reason),
+			// The Event type tracks the RESULT, not the fact of a change: a
+			// transition to an enforcing state (CNIEnforced) or an intentional
+			// escape hatch (EnforcementDisabled) is Normal (the healthy
+			// outcome), while a non-enforcing result (CNIUnenforced,
+			// ProbeUnavailable, Unknown) stays Warning. (PR #42 P3 note: the
+			// healthy CNIEnforced outcome previously showed up as a Warning on
+			// every Loop.)
+			et := corev1.EventTypeWarning
+			if new.Reason == ReasonCNIEnforced || new.Reason == ReasonEnforcementDisabled {
+				et = corev1.EventTypeNormal
+			}
+			p.Recorder.Eventf(loop, et, string(new.Reason),
 				"NetworkEnforced: %s (%s)", new.Reason, new.Describe())
 		}
 		if p.Ch != nil {

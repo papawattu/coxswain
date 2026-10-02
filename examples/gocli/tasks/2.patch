@@ -1,0 +1,56 @@
+diff --git a/json.go b/json.go
+new file mode 100644
+index 0000000..0307913
+--- /dev/null
++++ b/json.go
+@@ -0,0 +1,20 @@
++package main
++
++import (
++	"encoding/json"
++	"fmt"
++)
++
++// roundJSON renders the task 2 -json output: a single-line JSON object with
++// the input value, the requested places, and the rounded result.
++func roundJSON(value float64, places int) (string, error) {
++	b, err := json.Marshal(map[string]any{
++		"value":   value,
++		"places":  places,
++		"rounded": Round(value, places),
++	})
++	if err != nil {
++		return "", err
++	}
++	return fmt.Sprintf("%s", b), nil
++}
+diff --git a/main.go b/main.go
+index 8f94872..5980d9e 100644
+--- a/main.go
++++ b/main.go
+@@ -12,12 +12,23 @@ import (
+ func main() {
+ 	value := flag.Float64("value", 0, "the value to round")
+ 	places := flag.Int("places", 0, "decimal places to round to")
++	jsonOut := flag.Bool("json", false, "print the result as a single-line JSON object")
+ 	flag.Parse()
+ 
+-	if *value == 0 && *places == 0 {
+-		fmt.Fprintln(os.Stderr, "usage: gocli -value <v> [-places <n>]")
++	if *value == 0 && *places == 0 && !*jsonOut {
++		fmt.Fprintln(os.Stderr, "usage: gocli -value <v> [-places <n>] [-json]")
+ 		os.Exit(2)
+ 	}
+ 
++	if *jsonOut {
++		out, err := roundJSON(*value, *places)
++		if err != nil {
++			fmt.Fprintln(os.Stderr, err)
++			os.Exit(1)
++		}
++		fmt.Println(out)
++		return
++	}
++
+ 	fmt.Printf("%g\n", Round(*value, *places))
+ }

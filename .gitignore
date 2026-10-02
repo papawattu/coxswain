@@ -32,3 +32,4 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 /egress-proxy
+/examples/gocli/gocli

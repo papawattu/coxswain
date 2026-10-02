@@ -1,0 +1,65 @@
+diff --git a/main.go b/main.go
+index 38cf674..662066d 100644
+--- a/main.go
++++ b/main.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"os"
+ 	"strconv"
+@@ -13,6 +14,8 @@ import (
+ func main() {
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/healthz", healthz)
++	mux.HandleFunc("/api/v1/ping", ping)
++	mux.HandleFunc("/api/v1/echo", echo)
+ 
+ 	port := os.Getenv("PORT")
+ 	if port == "" {
+@@ -34,3 +37,19 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
+ 	w.WriteHeader(http.StatusOK)
+ 	fmt.Fprint(w, "ok")
+ }
++
++
++func ping(w http.ResponseWriter, _ *http.Request) {
++	w.WriteHeader(http.StatusOK)
++	fmt.Fprint(w, "pong")
++}
++
++func echo(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	w.WriteHeader(http.StatusOK)
++	w.Header().Set("Content-Type", "application/json")
++	io.Copy(w, r.Body)
++}
+diff --git a/test/smoke.sh b/test/smoke.sh
+index f1277da..88285ce 100644
+--- a/test/smoke.sh
++++ b/test/smoke.sh
+@@ -72,13 +72,16 @@ fi
+ # The seed state has no echo route, so this minimal probe fails (404). Task 2's
+ # reference fix (tasks/2.patch) replaces this block with the full assertion.
+ if [ "$ROUTE" = all ] || [ "$ROUTE" = echo ]; then
++resp=$(curl -sf -X POST -H 'Content-Type: application/json' \
++  -d '{"hello":"world"}' \
++  "http://127.0.0.1:$PORT/api/v1/echo" 2>/dev/null || true)
+ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+-  -H 'Content-Type: application/json' -d '{}' \
++  -H 'Content-Type: application/json' -d '{"hello":"world"}' \
+   "http://127.0.0.1:$PORT/api/v1/echo" 2>/dev/null || echo 000)
+-if [ "$code" = "200" ]; then
++if [ "$code" = "200" ] && printf '%s' "$resp" | grep -q '"hello":"world"'; then
+   echo "echo: PASS"
+ else
+-  echo "echo: FAIL (code=$code)"
++  echo "echo: FAIL (code=$code body=${resp:-<empty>})"
+   FAIL=1
+ fi
+ fi

@@ -70,6 +70,13 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 runner-test: ## Run the runner module's tests (separate go.mod).
 	cd runner && go vet ./... && go test ./... -coverprofile cover-runner.out
 
+# S1: the sample apps are separate Go/Python modules (examples/<app>); the root
+# `go test ./...` and golangci-lint skip them. Verify each app's scoped checks
+# fail on the seed and pass after the reference patch. No cluster needed.
+.PHONY: samples-check
+samples-check: ## S1: seed checks fail, reference patches pass
+	bash hack/samples-check.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

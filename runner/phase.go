@@ -1,16 +1,30 @@
-// S4 (TDD-PLAN A. "Runner as phase driver", A1–A4): the runner as a phase
-// driver. It watches <workspace>/.coxswain/desired-phase (written by the
-// OPERATOR — the runner never drives the phase machine itself, ADR-0004),
-// does the work for that phase, and writes result.json carrying the reported
-// observedPhase (the ADR-0004 claim channel; ADR-0005: a claim, never
-// evidence).
+// S4 (TDD-PLAN A. "Runner as phase driver", A1–A4): the runner as a ONE-SHOT
+// phase driver.
+//
+// One container run per phase (the S4 design choice, documented in
+// internal/controller/loop_s4_phase.go): the operator writes the desired
+// phase to <workspace>/.coxswain/desired-phase (the phase-init container),
+// the runner reads it, does THAT phase's work, writes the claim (result.json
+// + /dev/termination-log), and EXITS. The operator reads the claim from the
+// agent container's termination message (the APIReader path — ADR-0004),
+// advances status.phase one step, and recreates the sandbox pod; the new
+// pod's phase-init writes the NEXT phase and the runner runs again. The
+// termination message is one-shot per container run, so a stable phase must
+// not re-execute on the old pod — the pod recycle is the re-run mechanism.
 //
 // Channel (ADR-0004, precisely):
 //   - Operator -> runner: the desired phase at <workspace>/.coxswain/
 //     desired-phase (the operator's hint; status.desiredPhase is the only
-//     truth).
-//   - Runner -> operator: result.json with status/summary/... + the
-//     observedPhase the phase was executed as.
+//     truth; the operator is the sole writer of the phase).
+//   - Runner -> operator: the CLAIM — result.json with status/summary/... +
+//     the observedPhase the phase was executed as, mirrored (size-limited,
+//     strict JSON) into /dev/termination-log (the kubelet-capped 40-char
+//     termination message: a strict {"observedPhase","status",
+//     "blockedReason"} object, no iteration field — the iteration rides in
+//     result.json only). Exit code 0 = the phase completed the operator's
+//     ask; exit code 1 = the phase ended blocked. The operator never trusts
+//     the claim (ADR-0005): size-limited, strict-parsed, and never a gate
+//     input — the only thing it does with it is the pure nextPhase match.
 //
 // Phase work:
 //   - Planning: the model is driven with a planning prompt and its final
@@ -20,16 +34,22 @@
 //     reports observedPhase=Implementing.
 //   - Verifying is DROPPED from the runner (ADR-0005): verify evidence comes
 //     from the operator's isolated Job, never the runner. A desired-phase of
-//     Verifying (or any unknown value) is reported as status=blocked with
-//     the value echoed in observedPhase — a claim the operator can see, not
-//     a phase the runner executes.
+//     Verifying (or any unknown value) is reported as status=blocked with the
+//     value echoed in observedPhase — a claim the operator can see, not a
+//     phase the runner executes.
 //
 // A4 (model context continuity): within ONE iteration the Planning and
 // Implementing phase runs share the SAME conversation — the messages
 // accumulated in Planning are carried into Implementing's model calls, not
 // reset. The iteration is identified by <workspace>/.coxswain/iteration
 // (operator-written, the .coxswain convention): the conversation is
-// discarded when the iteration changes.
+// discarded when the iteration changes. (A phase advance RECYCLES the pod
+// (fresh emptyDir), so the conversation file is discarded on a phase
+// boundary by the pod, and the reference runner re-plans/re-implements from
+// the repo — the plan survives as PLAN.md in the workspace. The continuity
+// matters when a single runner process executes consecutive phases WITHOUT
+// a pod recycle (the test seam, and a future multi-phase single-pod design):
+// the conversation file is the seam that carries it.)
 package runner
 
 import (
@@ -79,8 +99,20 @@ const maxDesiredPhaseBytes = 512
 // must not fill the emptyDir.
 const maxConversationBytes = 256 * 1024
 
-// defaultPollInterval is how often the runner polls for a desired-phase
-// change.
+// terminationLogPath is the kernel-managed file the kubelet caps at 4096
+// bytes and surfaces as the container's termination message (the ADR-0004
+// claim channel to the operator). The runner writes the STRICT claim JSON
+// here (see writeClaim) — a size-limited, strict object, no free text.
+const terminationLogPath = "/dev/termination-log"
+
+// claimMaxBytes bounds the claim the runner writes to /dev/termination-log
+// (the kubelet cap is 4096; the runner keeps well under it so the strict
+// JSON object is never truncated mid-field by the kubelet's cap).
+const claimMaxBytes = 4096
+
+// defaultPollInterval is how long PhaseRun waits for the operator to write a
+// desired-phase (a fresh pod's phase-init writes it almost immediately; the
+// poll is a safety net for a slow init / a manual pod).
 const defaultPollInterval = 5 * time.Second
 
 // PhaseConfig is the input to PhaseRun. The model-loop fields mirror
@@ -94,7 +126,7 @@ type PhaseConfig struct {
 	APIKey    string
 	Model     string
 	ExtraBody map[string]any
-	// MaxSteps caps the number of model rounds WITHIN A PHASE (tool-call
+	// MaxSteps caps the number of model rounds WITHIN the phase (tool-call
 	// loops). Zero uses defaultMaxSteps.
 	MaxSteps int
 	// ShellTimeout bounds a single shell tool call. Zero uses
@@ -108,47 +140,31 @@ type PhaseConfig struct {
 	// PollInterval is the desired-phase poll interval. Zero uses
 	// defaultPollInterval.
 	PollInterval time.Duration
-	// MaxIterations caps the number of PHASE RUNS the runner executes before
-	// exiting blocked (a safety valve against a misbehaving operator that
-	// writes the same phase forever, or advances back and forth). Each
-	// distinct observedPhase the runner writes to result.json counts as one
-	// run. Zero = no cap.
-	MaxIterations int
 }
 
-// PhaseRun drives the phase loop: it polls <workspace>/.coxswain/
-// desired-phase, does the work for each NEW phase the operator writes, and
-// writes result.json after each phase carrying the reported observedPhase.
+// PhaseRun is the one-shot phase driver (S4). It waits for the operator's
+// desired-phase at <workspace>/.coxswain/desired-phase (bounded by wait
+// or the absence of the file), executes THAT phase exactly once, writes
+// result.json AND the strict claim to /dev/termination-log, and returns
+// the Result (the caller in cmd/main.go exits 0 for success, 1 for blocked).
 //
-// The model conversation persists ACROSS phases within an iteration (A4):
-// the messages accumulated in the previous phase are the starting history
-// for the next. The iteration is read from .coxswain/iteration (operator-
-// written); a change discards the conversation (a new iteration starts
-// fresh).
+// The model conversation (A4) is read from <workspace>/.coxswain/
+// conversation.json (the previous phase run's state, when the pod was not
+// recycled) and written back after the phase, so a single runner process
+// that executes consecutive phases carries the context forward. A pod
+// recycle (a phase advance) discards the file (fresh emptyDir) and the
+// conversation starts fresh from the repo.
 //
-// The loop exits when:
-//   - stop is closed (the operator's SIGTERM; the runner is being deleted),
-//   - the desired phase is unknown (result.json carries status=blocked with
-//     the value echoed in observedPhase — a claim the operator can see; the
-//     loop exits so a typo does not burn the model budget),
-//   - MaxIterations is reached (status=blocked), or
-//   - a phase's model loop fails (status=blocked for that phase; the loop
-//     continues waiting for the operator to advance).
-//
-// A STABLE phase is not re-executed: the runner records the phase it last
-// executed (from the previous result.json) and only re-runs the work when
-// the operator writes a different desired-phase. (The operator advances by
-// writing a new desired-phase; it does not re-request the same phase.)
-//
-// The returned Result is the LAST result.json written (zero Result if no
-// phase was ever executed). It is the seam the tests observe alongside the
-// result file and the workspace files (ADR-0004: the runner's only output
-// channel is the result file).
-func PhaseRun(cfg PhaseConfig, stop <-chan struct{}) Result {
-	var last Result
-	var conversation []chatMessage
-	iteration := ""
-
+// It exits (returns) when:
+//   - the desired phase is read and the phase's model loop completes (the
+//     normal path: one phase, one exit),
+//   - the desired phase is unknown (a typo, or a phase the runner does not
+//     execute, e.g. Verifying is operator-owned per ADR-0005): result.json
+//     carries status=blocked with the value echoed in observedPhase — a
+//     claim the operator can see, not a phase the runner executes (exit 1),
+//   - stop is closed before a desired phase appears (SIGTERM: the pod is
+//     being deleted; no claim is written).
+func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	planCap := cfg.PlanMaxBytes
 	if planCap <= 0 {
 		planCap = planMaxBytes
@@ -157,112 +173,86 @@ func PhaseRun(cfg PhaseConfig, stop <-chan struct{}) Result {
 	if poll <= 0 {
 		poll = defaultPollInterval
 	}
-	client := &http.Client{}
 
+	phase, ok := awaitDesiredPhase(cfg.Workspace, poll, stop)
+	if !ok {
+		// No desired phase before stop: the pod is being deleted (SIGTERM)
+		// or the operator never set one. No claim (a zero Result means
+		// "no phase executed"; cmd/main.go exits 0 on a stop with no phase —
+		// a deleted pod must not look like a blocked run).
+		return Result{}
+	}
+
+	// A4: the conversation (the previous phase's messages, when the pod was
+	// not recycled) is the starting history. A new iteration (the
+	// operator-written .coxswain/iteration changed since the conversation
+	// was written) discards it.
+	conversation, convIter := readConversation(filepath.Join(cfg.Workspace, resultDirName, conversationFileName))
+	curIter := readIteration(cfg.Workspace)
+	if curIter != "" && curIter != convIter {
+		conversation = nil
+	}
+
+	var res Result
+	switch phase {
+	case PhasePlanning:
+		res = drivePhaseOnce(cfg, planningPrompt(cfg.Goal, planCap), phase, conversation,
+			func(answer string) { writePlan(cfg.Workspace, answer, planCap) })
+	case PhaseImplementing:
+		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation)
+	default:
+		// Unknown phase (a typo, or a phase the runner does not execute,
+		// e.g. Verifying is operator-owned per ADR-0005). Report it as
+		// blocked with the value echoed in observedPhase (the operator sees
+		// the claim and acts). Do NOT loop forever on it.
+		res = Result{
+			Status:        statusBlocked,
+			Summary:       fmt.Sprintf("unknown desired-phase %q; the runner executes only %s or %s", phase, PhasePlanning, PhaseImplementing),
+			ObservedPhase: phase,
+		}
+	}
+	// A4: persist the conversation for a next phase run WITHOUT a pod
+	// recycle (the test seam / a future multi-phase single-pod design). The
+	// state is the runner's working memory (not a claim); a failed write is
+	// non-fatal (the next run simply starts without the prior conversation).
+	if len(res.toolConversation) > 0 {
+		_ = writeConversationState(filepath.Join(cfg.Workspace, resultDirName, conversationFileName), res.toolConversation, curIter)
+	}
+	// The claim channel: result.json (the full ADR-0004 file) + the strict
+	// termination-log object (the operator's read-back). A write failure is
+	// recorded (the claim is the runner's ONLY output channel; a failed
+	// write is a blocked run the operator must see).
+	res.Iteration = claimIteration(curIter)
+	if err := writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res); err != nil {
+		res.Status = statusBlocked
+		res.VerificationNotes = fmt.Sprintf("write result: %v", err)
+	}
+	writeClaim(terminationLogPath, res)
+	return res
+}
+
+// awaitDesiredPhase polls <workspace>/.coxswain/desired-phase until it is
+// present (ok=true) or stop is closed (ok=false). The phase-init container
+// writes it almost immediately on a fresh pod; the poll is a safety net for
+// a slow init / a manual pod.
+func awaitDesiredPhase(workspace string, poll time.Duration, stop <-chan any) (string, bool) {
 	for {
-		phase, ok := readDesiredPhase(cfg.Workspace)
-		if !ok {
-			select {
-			case <-stop:
-				return last
-			case <-time.After(poll):
-				continue
-			}
+		if phase, ok := readDesiredPhase(workspace); ok {
+			return phase, true
 		}
-
-		// A4: a new iteration discards the conversation.
-		curIter := readIteration(cfg.Workspace)
-		if curIter != "" && curIter != iteration {
-			conversation = nil
-			iteration = curIter
-		}
-
-		// A stable phase is not re-executed: if the runner already executed
-		// this exact phase (the previous result.json names it), wait for the
-		// operator to advance. A different phase (or no previous result)
-		// runs the work.
-		if prev := lastObservedPhase(cfg.Workspace); prev == phase {
-			select {
-			case <-stop:
-				return last
-			case <-time.After(poll):
-				continue
-			}
-		}
-
-		switch phase {
-		case PhasePlanning:
-			res, conv := drivePhase(cfg, client, planningPrompt(cfg.Goal, planCap), PhasePlanning, conversation,
-				func(answer string) { writePlan(cfg.Workspace, answer, planCap) })
-			last = res
-			conversation = conv
-		case PhaseImplementing:
-			res, conv := drivePhase(cfg, client, implementingPrompt(cfg.Workspace, cfg.Goal), PhaseImplementing, conversation, nil)
-			last = res
-			conversation = conv
-		default:
-			// Unknown phase (a typo, or a phase the runner does not execute,
-			// e.g. Verifying is operator-owned per ADR-0005). Report it as
-			// blocked with the value echoed in observedPhase (the operator
-			// sees the claim and acts). Do NOT loop forever on it.
-			res := Result{
-				Status:        statusBlocked,
-				Summary:       fmt.Sprintf("unknown desired-phase %q; the runner executes only %s or %s", phase, PhasePlanning, PhaseImplementing),
-				ObservedPhase: phase,
-			}
-			if err := writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res); err != nil {
-				res.VerificationNotes = fmt.Sprintf("write result: %v", err)
-			}
-			log.Printf("runner: exiting on unknown desired-phase %q", phase)
-			return res
-		}
-
-		// MaxIterations: the runner has executed a phase. Count it.
-		if cfg.MaxIterations > 0 && countPhaseRuns(cfg.Workspace) >= cfg.MaxIterations {
-			log.Printf("runner: max iterations (%d) reached; exiting", cfg.MaxIterations)
-			last.Status = statusBlocked
-			last.Summary = fmt.Sprintf("max iterations (%d) reached", cfg.MaxIterations)
-			_ = writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), last)
-			return last
-		}
-
-		// Wait for the operator to advance (write a new desired-phase).
 		select {
 		case <-stop:
-			return last
+			return "", false
 		case <-time.After(poll):
 		}
 	}
 }
 
-// phasePrompt returns the phase-specific prompt. The goal is the seed; the
-// phase instructions tell the model what to do in this phase.
-func planningPrompt(goal string, planCap int) string {
-	return "You are in the PLANNING phase. Produce a concise plan (under " +
-		fmt.Sprintf("%d bytes", planCap) +
-		") to accomplish the goal below. The plan must be a summary of the steps you will take, not the implementation itself. End your reply with the plan text (it will be written to PLAN.md).\n\nGOAL:\n" +
-		goal
-}
-
-func implementingPrompt(workspace, goal string) string {
-	plan := ""
-	if data, err := os.ReadFile(filepath.Join(workspace, resultDirName, planFileName)); err == nil {
-		plan = string(cutRunePrefix(string(data), planMaxBytes))
-	}
-	p := "You are in the IMPLEMENTING phase. Use your shell tool to make the goal's changes in the workspace. " +
-		"Run the acceptance checks to confirm your work. End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
-		goal
-	if plan != "" {
-		p += "\n\nPLAN (from PLAN.md):\n" + plan
-	}
-	return p
-}
-
-// drivePhase is the shared model loop for a phase. It drives the model
-// (starting from conversation, A4), runs the optional onAnswer hook (the
-// phase's post-processing, e.g. the PLAN.md write), and returns the phase's
-// Result + the conversation AFTER the phase (for the next phase, A4).
-func drivePhase(cfg PhaseConfig, client *http.Client, prompt, phase string, conversation []chatMessage, onAnswer func(string)) (Result, []chatMessage) {
+// drivePhaseOnce drives the model for ONE phase (starting from the A4
+// conversation history), runs the optional onAnswer hook (the phase's
+// post-processing, e.g. the PLAN.md write), and returns the phase's Result
+// (with the observedPhase set and the conversation captured for A4).
+func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMessage, onAnswer ...func(string)) Result {
 	modelTimeout := cfg.ModelTimeout
 	if modelTimeout <= 0 {
 		modelTimeout = defaultModelTimeout
@@ -283,6 +273,7 @@ func drivePhase(cfg PhaseConfig, client *http.Client, prompt, phase string, conv
 	messages = append(messages, conversation...)
 	messages = append(messages, chatMessage{Role: jsonRoleUser, Content: prompt})
 
+	client := &http.Client{}
 	answer, trace, modelErr := driveModel(
 		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
 		messages, maxSteps, shellTimeout, modelTimeout, cfg.ExtraBody,
@@ -294,30 +285,25 @@ func drivePhase(cfg PhaseConfig, client *http.Client, prompt, phase string, conv
 		ToolTrace:     trace,
 		ObservedPhase: phase,
 	}
+	res.toolConversation = messages
 	if modelErr != "" {
 		res.Status = statusBlocked
 		res.VerificationNotes = modelErr
 	}
-	if onAnswer != nil {
-		onAnswer(answer)
+	if len(onAnswer) > 0 && onAnswer[0] != nil {
+		onAnswer[0](answer)
 	}
-	// A4: persist the conversation for the next phase. The state is the
-	// runner's working memory (not a claim); a failed write is non-fatal
-	// (the next phase simply starts without the prior conversation).
-	if len(messages) > 0 {
-		_ = writeConversation(filepath.Join(cfg.Workspace, resultDirName, conversationFileName), messages)
-	}
-	return res, messages
+	return res
 }
 
 // writePlan (A2) writes the model's plan answer to <workspace>/.coxswain/
-// PLAN.md, truncated to the cap. The runner (not the model) writes the
-// file: the ADR-0004 channel is the result file, and the PLAN.md is an
-// operator-readable artifact (the make sample-run approval step surfaces
-// it). A write failure is non-fatal (the plan is in result.json's summary
-// regardless).
+// PLAN.md, truncated to the cap (by BYTES, not runes — the ADR-0004 contract
+// is a <=4KB file). The runner (not the model) writes the file: the ADR-0004
+// channel is the result file, and the PLAN.md is an operator-readable
+// artifact (the make sample-run approval step surfaces it). A write failure
+// is non-fatal (the plan is in result.json's summary regardless).
 func writePlan(workspace, answer string, capBytes int) {
-	plan := cutRunePrefix(answer, capBytes)
+	plan := cutBytePrefix(answer, capBytes)
 	planPath := filepath.Join(workspace, resultDirName, planFileName)
 	if err := os.MkdirAll(filepath.Dir(planPath), 0o755); err != nil {
 		log.Printf("runner: PLAN.md mkdir: %v", err)
@@ -325,6 +311,45 @@ func writePlan(workspace, answer string, capBytes int) {
 	}
 	if err := os.WriteFile(planPath, []byte(plan), 0o644); err != nil {
 		log.Printf("runner: PLAN.md write: %v", err)
+	}
+}
+
+// writeClaim writes the ADR-0004 claim to path (the /dev/termination-log the
+// operator reads back from the container status). It is a STRICT, size-
+// limited JSON object — {"observedPhase","status","blockedReason"} (no
+// iteration: the iteration rides in result.json only, and the claim must fit
+// the kubelet's 4096-byte termination-message cap with room for the strict
+// JSON overhead). A write failure is LOGGED, not fatal: the result.json is
+// the full ADR-0004 file and the operator's read-back is the termination
+// message — if that write fails, the operator sees no claim (a requeue) and
+// the result.json remains on the workspace volume for debugging. The claim
+// is size-limited to claimMaxBytes (well under the kubelet cap) so a long
+// blockedReason cannot truncate the object mid-field.
+func writeClaim(path string, res Result) {
+	type claim struct {
+		ObservedPhase string `json:"observedPhase"`
+		Status        string `json:"status"`
+		BlockedReason string `json:"blockedReason,omitempty"`
+	}
+	c := claim{ObservedPhase: res.ObservedPhase, Status: res.Status, BlockedReason: res.VerificationNotes}
+	data, err := json.Marshal(c)
+	if err != nil {
+		log.Printf("runner: claim marshal: %v", err)
+		return
+	}
+	if len(data) > claimMaxBytes {
+		// A blockedReason that long must not truncate the strict object:
+		// truncate the reason (the observedPhase + status are the gate
+		// inputs; the reason is OS1-only context).
+		c.BlockedReason = cutBytePrefix(c.BlockedReason, claimMaxBytes-len(data)+len(c.BlockedReason))
+		data, err = json.Marshal(c)
+		if err != nil {
+			log.Printf("runner: claim re-marshal: %v", err)
+			return
+		}
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		log.Printf("runner: claim write to %s: %v", path, err)
 	}
 }
 
@@ -346,6 +371,37 @@ func readDesiredPhase(workspace string) (string, bool) {
 	return phase, phase != ""
 }
 
+// planningPrompt (A2) returns the PLANNING phase prompt: it seeds the model
+// with the goal and asks for a concise plan summary (not the implementation
+// itself) that the runner writes to PLAN.md. The plan cap is stated so the
+// model's answer fits the ADR-0004 <=4KB file.
+func planningPrompt(goal string, planCap int) string {
+	return "You are in the PLANNING phase. Produce a concise plan (under " +
+		fmt.Sprintf("%d bytes", planCap) +
+		") to accomplish the goal below. The plan must be a summary of the steps you will take, not the implementation itself. End your reply with the plan text (it will be written to PLAN.md).\n\nGOAL:\n" +
+		goal
+}
+
+// implementingPrompt (A3) returns the IMPLEMENTING phase prompt: it seeds the
+// model with the goal + the plan (PLAN.md, when present) and asks it to use
+// its shell tool to make the workspace changes and run the acceptance
+// checks. The plan is carried so the model does not re-derive it (the A4
+// conversation is the primary continuity; the plan file is the durable
+// artifact).
+func implementingPrompt(workspace, goal string) string {
+	plan := ""
+	if data, err := os.ReadFile(filepath.Join(workspace, resultDirName, planFileName)); err == nil {
+		plan = string(cutRunePrefix(string(data), planMaxBytes))
+	}
+	p := "You are in the IMPLEMENTING phase. Use your shell tool to make the goal's changes in the workspace. " +
+		"Run the acceptance checks to confirm your work. End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
+		goal
+	if plan != "" {
+		p += "\n\nPLAN (from PLAN.md):\n" + plan
+	}
+	return p
+}
+
 // readIteration reads <workspace>/.coxswain/iteration (operator-written, the
 // .coxswain convention). Empty/missing = no iteration marker (the runner
 // treats the whole run as one iteration).
@@ -357,62 +413,108 @@ func readIteration(workspace string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// lastObservedPhase returns the observedPhase the previous result.json
-// named (the phase the runner last executed), for the stable-phase check.
-// A missing/malformed result.json is "" (no previous phase).
-func lastObservedPhase(workspace string) string {
-	data, err := os.ReadFile(filepath.Join(workspace, resultDirName, resultFileName))
-	if err != nil {
-		return ""
+// claimIteration converts the .coxswain/iteration string (the operator's
+// iteration marker) to the int the claim/result carry (0 when unset — the
+// OS1 progress iteration defaults to 0, the Loop's status.iteration is the
+// authoritative count).
+func claimIteration(iter string) int {
+	if iter == "" {
+		return 0
 	}
-	var res Result
-	if err := json.Unmarshal(data, &res); err != nil {
-		return ""
+	n := 0
+	for _, r := range iter {
+		if r < '0' || r > '9' {
+			return 0 // not a pure integer marker: report 0 (the marker is
+			// informational; the claim must not parse garbage).
+		}
+		n = n*10 + int(r-'0')
 	}
-	return res.ObservedPhase
+	return n
 }
 
-// countPhaseRuns counts the phase runs for the MaxIterations cap. A single
-// result.json cannot carry history (it is rewritten each phase), so the
-// count is 1 if the current result.json names a phase the runner executes
-// (Planning/Implementing) and 0 otherwise. (The cap is a safety valve
-// against a misbehaving operator, not a precise meter; the runner exits
-// after MaxIterations DISTINCT phase executions, which is the conservative
-// reading of "iterations".)
-func countPhaseRuns(workspace string) int {
-	if lastObservedPhase(workspace) == PhasePlanning || lastObservedPhase(workspace) == PhaseImplementing {
-		return 1
-	}
-	return 0
+// conversationState is the persisted A4 conversation (the runner's working
+// memory, not a claim): the messages + the iteration they were written under
+// (a different iteration on the next run discards them).
+type conversationState struct {
+	Iteration string        `json:"iteration"`
+	Messages  []chatMessage `json:"messages"`
 }
 
-// writeConversation persists the conversation (A4) to path as JSON. The
-// state is the runner's working memory (not a claim); a failed write is
-// non-fatal (the next phase simply starts without the prior conversation).
-// A conversation whose marshaled JSON exceeds maxConversationBytes is
-// truncated to its most recent half of messages (the recent context is the
-// useful part for the next phase).
-func writeConversation(path string, conv []chatMessage) error {
-	data, err := json.Marshal(conv)
+// readConversation reads the persisted A4 conversation state from path. A
+// missing/corrupt/oversized file is (nil, "") (no conversation — the safe
+// default: the phase starts fresh from the repo).
+func readConversation(path string) ([]chatMessage, string) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > maxConversationBytes {
+		return nil, ""
+	}
+	var st conversationState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, ""
+	}
+	return st.Messages, st.Iteration
+}
+
+// writeConversationState persists the A4 conversation state to path (the
+// runner's working memory, not a claim). A state whose marshaled JSON
+// exceeds maxConversationBytes is truncated to its most recent half of
+// messages (the recent context is the useful part for the next phase); if
+// even that is too large, an empty list is written (a missing/empty
+// conversation is the safe default for the next run).
+func writeConversationState(path string, conv []chatMessage, iteration string) error {
+	st := conversationState{Iteration: iteration, Messages: conv}
+	data, err := json.Marshal(st)
 	if err != nil {
 		return err
 	}
 	if len(data) > maxConversationBytes {
 		if len(conv) > 2 {
-			data, err = json.Marshal(conv[len(conv)/2:])
+			st.Messages = conv[len(conv)/2:]
+			data, err = json.Marshal(st)
 			if err != nil {
 				return err
 			}
 		}
 		if len(data) > maxConversationBytes {
 			// Even the truncated conversation is too large: write an empty
-			// list (a missing file is treated as "no conversation" by the
-			// reader, which is the safe default).
-			data = []byte("[]")
+			// list (the reader treats it as "no conversation", the safe
+			// default).
+			st.Messages = nil
+			data = mustMarshal(tinyConversation())
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, 0o644)
+}
+
+func tinyConversation() conversationState {
+	return conversationState{Iteration: "", Messages: []chatMessage{}}
+}
+
+func mustMarshal(v any) []byte {
+	data, _ := json.Marshal(v)
+	return data
+}
+
+// cutBytePrefix returns s truncated to at most n BYTES (a prefix that never
+// splits a UTF-8 rune). The ADR-0004 PLAN.md cap is a byte cap (<=4KB file),
+// so the truncation is by bytes, not runes.
+func cutBytePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	// Back up to a rune boundary so the prefix is valid UTF-8.
+	i := n
+	for i > 0 && !utf8RuneStart(s[i]) {
+		i--
+	}
+	return s[:i]
+}
+
+// utf8RuneStart reports whether byte b is the first byte of a UTF-8 rune
+// (not a continuation byte 10xxxxxx).
+func utf8RuneStart(b byte) bool {
+	return b&0xC0 != 0x80
 }

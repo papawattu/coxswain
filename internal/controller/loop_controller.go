@@ -80,6 +80,16 @@ const (
 	// init container (S3a). It clones spec.workspace.repo @ ref into the
 	// 'workspace' volume and writes the resolved SHA to baseCommitFile.
 	workspaceInitContainerName = "init-workspace"
+	// phaseInitContainerName is the name of the sandbox pod's phase-init
+	// container (S4, ADR-0004). It materialises the operator's
+	// status.desiredPhase into <workspace>/.coxswain/desired-phase (the
+	// runner's read channel; the operator is the sole writer of the phase).
+	phaseInitContainerName = "init-phase"
+	// coxDesiredPhaseFile is the .coxswain filename the phase-init container
+	// writes (the operator's desired-phase hint to the one-shot runner) and the
+	// runner reads. Single source of truth for the operator and the runner
+	// (the runner's own constant mirrors this; both read/write the same name).
+	coxDesiredPhaseFile = "desired-phase"
 	// workspaceCredsUsernameKey / workspaceCredsPasswordKey are the keys the
 	// spec.workspace.gitCredentialSecret Secret MUST carry: a standard
 	// kubernetes.io/basic-auth Secret (the same shape as the samples
@@ -192,6 +202,27 @@ type LoopReconciler struct {
 	// mid-reconcile) IS an error (the caller logs and requeues).
 	readBaseCommit func(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error)
 
+	// readPhaseClaim is the ADR-0004 claim read seam (S4). The default (nil)
+	// reads the sandbox pod's AGENT container termination message via the
+	// operator's APIReader path (a real, non-cached client): the one-shot
+	// runner writes its claim to /dev/termination-log and exits 0 (or 1 when
+	// blocked), and the kubelet keeps the container Terminated (no restart —
+	// restartPolicy Never), so the message is stable until the operator
+	// recreates the pod. The envtest suite overrides the field to simulate a
+	// pod; when nil, the real APIReader path runs. A nil claim (no agent
+	// status yet / still running / no message) is NOT an error — the caller
+	// requeues. (ADR-0005: the message is a CLAIM — size-limited, strict-
+	// parsed, and never a gate input; the reader rejects it and logs.)
+	readPhaseClaim func(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error)
+
+	// phaseGate is the OS8 phase-gate seam: it decides whether the phase
+	// machine may advance from current to next (an approval hold, or a future
+	// observer-proposed hold). The S4 build ships exactly one implementation,
+	// autoApprovePhaseGate (option B: NO approval gate — the owner's bar is
+	// Planning -> Implementing -> Verifying); nil is treated as auto-approve
+	// so a bare test reconciler keeps the existing advance behaviour.
+	phaseGate PhaseGate
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
@@ -250,6 +281,10 @@ type LoopReconciler struct {
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
+// S4 (ADR-0004): the operator reads the agent container's termination message
+// (the runner's claim) via the pod's status — pods/status needs only 'get' on
+// the pod resource (already granted above), so NO new RBAC rule is required.
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=get
 // D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // D38: the operator emits a Kubernetes Event on every Loop when its
@@ -356,18 +391,74 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
 		changed = true
 	}
-	// B1: advance the phase machine when the runner reports a valid forward step.
-	// nextPhase(phase, observedPhase) returns the next phase when observedPhase
-	// is the immediate-next phase after the operator's current phase, and leaves
-	// it unchanged otherwise (terminal phases, missing/garbled reports). The
-	// operator never interprets runner output beyond this pure match
-	// (ADR-0004). The iterate/terminal branches (Verifying -> Implementing /
-	// Failed) are completed by B3 (verify outcome) and B4 (iteration count).
-	if next := nextPhase(loop.Status.Phase, loop.Status.ObservedPhase); next != loop.Status.Phase {
-		loop.Status.Phase = next
-		loop.Status.DesiredPhase = next
+	// S4 (owner option B: NO approval gate — the bar is Planning ->
+	// Implementing -> Verifying): a fresh Loop at Pending starts the phase
+	// machine at Planning. The sandbox is recreated with the phase-init
+	// container writing status.desiredPhase (Planning) into the workspace and
+	// the one-shot runner executing it; the runner's claim (the termination
+	// message) drives the advance below. No AwaitingApproval handling exists
+	// (option B); the OS8 PhaseGate seam is the future approval hold.
+	if loop.Status.Phase == coxv1alpha1.LoopPhasePending {
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 		changed = true
+		if err := r.recycleSandboxForPhase(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
+	// S4 (ADR-0004): read the runner's claim from the agent container's
+	// termination message (APIReader path — the sandbox pod is not in the
+	// manager's Pod cache, so the non-cached client is required; the S3 baseCommit
+	// pattern) and advance the phase machine when the claim names the
+	// immediate-next phase (the existing nextPhase table, unchanged, gated by
+	// the OS8 PhaseGate — option B: auto-approve). The claim is size-limited,
+	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
+	// logged and requeued, never acted on; the OS1 progress record is
+	// observability only. The iterate/terminal branches (Verifying ->
+	// Implementing / Failed) are completed by B3 (verify outcome) and B4
+	// (iteration count). See internal/controller/loop_s4_phase.go.
+	claimReadPending := false
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded && loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
+		claim, cerr := r.resolvePhaseClaim(ctx, &loop)
+		if cerr != nil {
+			// A malformed claim (the agent terminated without a valid
+			// termination message): log and requeue. ADR-0005 fail-closed — a
+			// malformed claim is NOT a phase completion and never gates. The
+			// container stays Terminated so the retry is cheap and the message is
+			// stable until the pod is recreated.
+			logf.FromContext(ctx).Error(cerr, "phase claim read failed; requeueing",
+				"loop", loop.Name)
+			claimReadPending = true
+		} else if claim != nil {
+			now := metav1.Now()
+			c, advanced := r.recordPhaseClaim(&loop, claim, now)
+			changed = changed || c
+			if advanced {
+				// OS5: emit a Kubernetes Event on the phase transition (a stable
+				// reason, PhaseAdvanced; nil Recorder = most envtests skip it).
+				r.emitPhaseAdvancedEvent(&loop, claim.ObservedPhase)
+				// The phase advanced: the sandbox pod must be recreated so the
+				// phase-init container writes the NEXT desired phase and the
+				// one-shot runner re-runs (one container run per phase — the
+				// termination message is one-shot per container run, so a stable
+				// phase must not re-execute on the old pod). The operator deletes
+				// the sandbox; ensureSandbox's CreateOrUpdate recreates it with
+				// status.desiredPhase (the new phase) materialised.
+				if err := r.recycleSandboxForPhase(ctx, &loop); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+		} else {
+			// claim == nil && cerr == nil: the agent has not terminated yet
+			// (the phase is still executing, or the pod/agent has no status yet):
+			// requeue so the operator re-reads once the one-shot runner exits.
+			// A sandbox pod change does not trigger a reconcile on its own, so
+			// the timer is what drives the retry (the baseCommit requeue pattern).
+			claimReadPending = true
+		}
+	}
+	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
+	// gate.
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
 	// gate. tamperVerdict is a tri-state over the operator's evidence (a pointer
 	// to the terminated tamper init container's exit code + the verifiedCommit
@@ -475,10 +566,49 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	if baseCommitPending {
+	if baseCommitPending || claimReadPending {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// emitPhaseAdvancedEvent (OS5, S4) emits the Kubernetes Event on a phase
+// transition (stable reason PhaseAdvanced). Best-effort: a failed Event never
+// blocks the reconcile; a nil Recorder (most envtests) skips it. The message
+// carries the from/to phases (the reason is a fixed, documented string).
+func (r *LoopReconciler) emitPhaseAdvancedEvent(loop *coxv1alpha1.Loop, from coxv1alpha1.LoopPhase) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(loop, corev1.EventTypeNormal, phaseAdvancedReason,
+		"phase advanced %s -> %s", from, loop.Status.Phase)
+}
+
+// recycleSandboxForPhase (S4) deletes the Loop's sandbox after a phase advance
+// so the one-shot runner re-runs for the NEXT phase. The phase-init container
+// rewrites .coxswain/desired-phase from status.desiredPhase (the new phase) and
+// the agent container runs the runner once more (one container run per phase
+// — the termination message is one-shot per container run, so the same phase
+// must not re-execute on the old pod). Idempotent: a NotFound delete is a no-op
+// (the sandbox may already be gone, e.g. suspended). The operator's
+// CreateOrUpdate in ensureSandbox recreates it on the next reconcile; the
+// deletion here also clears the stale agent termination status (the new pod
+// starts with no agent container status, so the claim reader requeues until the
+// new one-shot run terminates).
+func (r *LoopReconciler) recycleSandboxForPhase(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	sb := &sandboxv1beta1.Sandbox{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read sandbox for phase recycle: %w", err)
+	}
+	if err := r.Delete(ctx, sb); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete sandbox for phase recycle: %w", err)
+	}
+	logf.FromContext(ctx).Info("recycled sandbox for next phase", "sandbox", sandboxName(loop.Name), "phase", loop.Status.Phase)
+	return nil
 }
 
 // resolveBaseCommit dispatches to the test seam (readBaseCommit field) when it
@@ -865,8 +995,39 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// ONLY (ADR-0006 — zero credentials in the agent).
 	var initContainers []corev1.Container
 	if loop.Spec.Workspace.Repo != "" {
-		initContainers = []corev1.Container{r.workspaceInitContainer(loop)}
+		initContainers = append(initContainers, r.workspaceInitContainer(loop))
 	}
+	// S4 (ADR-0004): the phase-init container materialises the operator's
+	// status.desiredPhase into <workspace>/.coxswain/desired-phase (the
+	// runner's read channel; the operator is the sole writer of the phase —
+	// ADR-0004). The runner is one-shot per phase: it reads the desired
+	// phase, does that phase's work, and exits with the claim in its
+	// termination message. It is ALWAYS present (the phase machine is core,
+	// not workspace-gated) and runs AFTER the workspace init so the
+	// .coxswain dir exists (the workspace init creates it; a fresh emptyDir
+	// has none). A fresh phase-init per pod recreation is the mechanism that
+	// re-writes the desired phase after a phase advance (recycleSandboxForPhase
+	// deletes the sandbox; this init re-runs on the new pod). The phase value
+	// is a fixed enum (CRD-validated on status.desiredPhase), but it is
+	// shell-quoted anyway (the init script is sh -c; an unusual-but-valid
+	// value must not inject).
+	initContainers = append(initContainers, corev1.Container{
+		Name:    phaseInitContainerName,
+		Image:   r.workspaceGitImage(),
+		Command: []string{"/bin/sh", "-c", phaseInitScript(loop.Status.DesiredPhase)},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: &falseP,
+			RunAsNonRoot:             &trueP,
+			RunAsUser:                &nonRootUID,
+			RunAsGroup:               &nonRootGID,
+			ReadOnlyRootFilesystem:   &readOnlyRootfs,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+	})
 	volumes := []corev1.Volume{
 		{Name: workspaceVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 			SizeLimit: newLimit("500Mi"),
@@ -2920,6 +3081,35 @@ echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
 // unusual-but-valid value cannot inject shell.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'''`) + "'"
+}
+
+// phaseInitScript (S4, ADR-0004) returns the sh script the phase-init container
+// runs: it materialises the operator's status.desiredPhase into
+// <workspace>/.coxswain/desired-phase (the one-shot runner's read channel).
+// The operator is the sole writer of the phase (ADR-0004) — the runner reads
+// it, does the phase's work, and exits with the claim; it never chooses the
+// phase itself. The value is a CRD-validated enum (status.desiredPhase), but
+// it is shell-quoted anyway (the script is sh -c; an unusual-but-valid value
+// must not inject). An EMPTY desired phase writes nothing (the runner waits
+// for the operator to set one; the operator's first reconcile sets
+// status.desiredPhase = Planning for a fresh Loop — see the S4 advance path).
+func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase) string {
+	if desiredPhase == "" {
+		return `#!/bin/sh
+set -eu
+# No desired phase set yet: the operator has not advanced this Loop past
+# Pending (a fresh Loop's first reconcile sets status.desiredPhase =
+# Planning). Write nothing so the one-shot runner waits (it exits 0 with no
+# claim until a desired phase appears) instead of erroring.
+exit 0
+`
+	}
+	return `#!/bin/sh
+set -eu
+DEST=/workspace
+mkdir -p "${DEST}/.coxswain"
+printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"
+`
 }
 
 // proxyImage returns the model proxy pod image. It is the reconciler's

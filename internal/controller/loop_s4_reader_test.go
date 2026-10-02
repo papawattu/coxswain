@@ -153,6 +153,11 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	oneShotRun := func(r *LoopReconciler, nn types.NamespacedName, claimed coxv1alpha1.LoopPhase, withStatus bool) *coxv1alpha1.Loop {
 		createStandinPod(nn.Namespace, nn.Name)
 		if withStatus {
+			// The runner's REAL claim shape (ADR-0004): the phase the runner
+			// EXECUTED (the current phase — the runner never reports the next
+			// phase), the status of that execution, and an empty
+			// blockedReason on success. This is the exact strict-JSON object
+			// the live runner writes to /dev/termination-log.
 			writeAgentTermination(nn.Namespace, nn.Name, fmt.Sprintf(
 				`{"observedPhase":"%s","status":"success","blockedReason":""}`, claimed))
 		}
@@ -178,13 +183,20 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 
-		By("standing in for the one-shot runner: a pod whose agent terminated with the claim")
-		loop = oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
-		By("recording status.observedPhase from the claim (the B1 field), without advancing (the claim names the CURRENT phase)")
+		By("standing in for the one-shot runner: a pod whose agent terminated with a BLOCKED claim (the phase did not complete: no advance, but status.observedPhase IS recorded)")
+		ensureSandboxObject(ns, "obsloop")
+		createStandinPod(ns, "obsloop")
+		writeAgentTermination(ns, "obsloop", `{"observedPhase":"Planning","status":"blocked","blockedReason":"model endpoint unreachable"}`)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		ensureSandboxObject(ns, "obsloop")
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		By("recording status.observedPhase from the claim (the B1 field) via the live APIReader path, without advancing (a blocked claim is not a completion)")
 		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhasePlanning),
 			"the live APIReader path must read the agent termination message and record the claimed phase")
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
-			"the pure nextPhase match on a claim naming the current phase is a no-op")
+			"a blocked claim (status=blocked) must never advance the phase")
 	})
 
 	It("rejects an oversized claim (size-limited read, ADR-0005)", func() {
@@ -275,25 +287,29 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		primed, nn := primeReconcile(r, ns, "happylp")
 		Expect(primed.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning), "the bootstrap must leave the fresh Loop at Planning")
 
-		By("claim 1: the runner executed Planning — the claim names the CURRENT phase (no advance, progress recorded)")
+		By("claim 1: the runner executed Planning (the claim names the CURRENT phase, status=success) — the completed phase advances one step")
 		loop := oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"a success claim for the current phase completes that phase (Planning -> Implementing)")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
 		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 		Expect(loop.Status.Progress).NotTo(BeNil(), "the OS1 progress record must be populated from the claim")
 		Expect(loop.Status.Progress.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 		Expect(loop.Status.Progress.LastResultStatus).To(Equal("success"))
 		Expect(loop.Status.Progress.LastActivityTime).NotTo(BeNil(), "the operator must record WHEN the claim arrived (the pin is the operator's, not the claim's)")
 
-		By("claim 2: the runner executed Implementing — advance to Implementing")
+		By("claim 2: the runner executed Implementing (success claim for the current phase) — completes Implementing and advances to Verifying")
 		loop = oneShotRun(r, nn, coxv1alpha1.LoopPhaseImplementing, true)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "a claim naming the immediate-next phase must advance one step")
-		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
-		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "a success claim for the current phase completes that phase (Implementing -> Verifying)")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"status.observedPhase records the phase the claim NAMES (the phase executed), not the phase the machine advanced to")
 		Expect(loop.Status.Progress.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "the progress record follows the latest claim")
 
-		By("claim 3: the runner executed Verifying — advance to Verifying and STOP (B3 evidence gates the exit)")
+		By("claim 3: a success claim naming Verifying (a phase the runner does not execute) — no advance (the machine holds at Verifying; the exit is evidence-gated, B3)")
 		loop = oneShotRun(r, nn, coxv1alpha1.LoopPhaseVerifying, true)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "the claim-driven path stops at Verifying (the exit is evidence-gated, B3)")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"a claim naming Verifying has no successor mapping and is not the current phase (the runner stops at Implementing; Verifying is operator-owned, ADR-0005) — the machine holds")
 		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 		Expect(loop.Status.Progress.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
@@ -337,6 +353,84 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		Expect(loop.Status.Progress.BlockedReason).To(Equal("model endpoint unreachable"))
 		events := drainEvents(recorder)
 		Expect(events).NotTo(ContainElement(ContainSubstring(phaseAdvancedReason)), "no advance -> no PhaseAdvanced Event")
+	})
+
+	It("advances from the runner's REAL claim shape: {Planning, success} -> Implementing", func() {
+		ns := "s4-real-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "reallp")
+
+		// The EXACT strict JSON the live runner writes for a completed
+		// Planning phase (observedPhase == the phase executed, never the
+		// next phase; status=success; empty blockedReason).
+		ensureSandboxObject(ns, "reallp")
+		createStandinPod(ns, "reallp")
+		writeAgentTermination(ns, "reallp", `{"observedPhase":"Planning","status":"success","blockedReason":""}`)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		ensureSandboxObject(ns, "reallp")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		By("completing Planning (success claim for the current phase) and advancing one step")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"{observedPhase:Planning,status:success} must advance Planning -> Implementing")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		events := drainEvents(recorder)
+		Expect(events).To(ContainElement(ContainSubstring("Planning -> Implementing")))
+	})
+
+	It("advances from the runner's REAL claim shape: {Implementing, success} -> Verifying", func() {
+		ns := "s4-real2-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "real2lp")
+
+		// Drive the Loop to Implementing first (the completed-Planning
+		// advance), then stand in for the completed Implementing run.
+		loop := oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "claim 1 must advance to Implementing first")
+		loop = oneShotRun(r, nn, coxv1alpha1.LoopPhaseImplementing, true)
+		By("completing Implementing (success claim for the current phase) and advancing to Verifying")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"{observedPhase:Implementing,status:success} must advance Implementing -> Verifying (B3 then gates the exit)")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+	})
+
+	It("holds a blocked claim for the current phase (no successor mapping on failure)", func() {
+		ns := "s4-real3-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "real3lp")
+
+		ensureSandboxObject(ns, "real3lp")
+		createStandinPod(ns, "real3lp")
+		writeAgentTermination(ns, "real3lp", `{"observedPhase":"Planning","status":"blocked","blockedReason":"model HTTP 400"}`)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		By("holding the phase (a blocked claim never advances, even though it names the current phase)")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"{observedPhase:Planning,status:blocked} must NOT advance")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		events := drainEvents(recorder)
+		Expect(events).NotTo(ContainElement(ContainSubstring(phaseAdvancedReason)))
 	})
 
 	It("records the claim's iteration and the operator's pins into progress (OS1)", func() {

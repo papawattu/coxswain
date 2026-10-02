@@ -265,6 +265,35 @@ func (autoApprovePhaseGate) Allow(_ *coxv1alpha1.Loop, _, _ coxv1alpha1.LoopPhas
 // from/to phases.
 const phaseAdvancedReason = "PhaseAdvanced"
 
+// claimPhaseForAdvance maps the runner's claim (ADR-0004) to the phase the
+// B1 nextPhase match compares against. The runner reports the phase it
+// EXECUTED (the current phase), never the next phase: a success claim for the
+// current phase COMPLETES that phase, so the match runs against its
+// successor (Planning -> Implementing, Implementing -> Verifying). A blocked
+// claim (the phase did not complete) has NO successor mapping — it is the
+// current phase, and nextPhase(current, current) == current (no advance).
+// A success claim naming a phase that is not the current phase is returned
+// unchanged (the pure B1 match: it names the immediate-next phase directly,
+// or a no-op value).
+func claimPhaseForAdvance(c *PhaseClaim) coxv1alpha1.LoopPhase {
+	if c == nil || c.Status != claimSuccess {
+		return c.ObservedPhase
+	}
+	switch c.ObservedPhase {
+	case coxv1alpha1.LoopPhasePlanning:
+		return coxv1alpha1.LoopPhaseImplementing
+	case coxv1alpha1.LoopPhaseImplementing:
+		return coxv1alpha1.LoopPhaseVerifying
+	}
+	return c.ObservedPhase
+}
+
+// claimSuccess is the runner's result status for a completed phase (the
+// ADR-0004 claim's "status" field; the runner's statusSuccess constant —
+// the runner cannot import the operator's types, so the string value is the
+// contract, mirrored here).
+const claimSuccess = "success"
+
 // recordPhaseClaim runs the S4 advance: it advances status.phase/
 // status.desiredPhase one step when the claim names the immediate-next phase
 // (the existing nextPhase table, unchanged, gated by the OS8 PhaseGate), and
@@ -302,7 +331,7 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 	}
 	// B1 + OS8: advance one step when the claim names the immediate-next
 	// phase AND the gate allows it (option B: the gate always allows).
-	next := nextPhase(loop.Status.Phase, claim.ObservedPhase)
+	next := nextPhase(loop.Status.Phase, claimPhaseForAdvance(claim))
 	if next != loop.Status.Phase {
 		gate := r.phaseGate
 		if gate == nil {

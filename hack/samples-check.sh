@@ -1,166 +1,107 @@
 #!/usr/bin/env bash
 # samples-check.sh — verify the SDLC sample apps (docs/SAMPLES-PLAN.md, S1).
 #
-# For each app in examples/ that has tasks, and each task in
-# tasks/<n>.patch:
-#   1. Copy the seed state to a temp dir, git-init it, run the app's
-#      acceptance checks — they must FAIL on the seed state.
-#   2. Apply the task's reference patch, re-run the checks — they must PASS.
+# For each app in examples/ and each task in examples/<app>/tasks/<n>.patch:
+#   1. Copy the seed state into a fresh temp dir (a git repo so git apply
+#      works), run the task's scoped checks — they must FAIL on the seed.
+#   2. Apply the task's reference patch (against the seed), re-run the
+#      checks — they must all PASS.
+#   3. Assert tasks.md's acceptanceChecks for this task equal <n>.checks.
 #
-# Multi-task apps are cumulative: task N's checks run in the state where
-# tasks 1..N-1 are applied, so each reference patch is validated against the
-# state the Loop would actually see. The per-app check functions assert RED
-# only on this task's own tests (a suite red on a different task's tests is
-# not a valid seed state for this task).
-#
-# No cluster needed. The repo tree is never touched: every run happens in a
-# fresh mktemp copy (removed on exit).
+# Each task runs against a FRESH seed copy, so the checks are scoped to
+# that task's own tests only (no cumulative state). No cluster needed.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILURES=0
-CUR_APP=""
-CUR_TASK=0
 
-say()  { printf '%s\n' "$*"; }
-fail() { say "FAIL: $*"; FAILURES=$((FAILURES + 1)); }
-pass() { say "PASS: $*"; }
+say()    { printf '%s\n' "$*"; }
+pass()   { say "PASS: $*"; }
+fail()   { say "FAIL: $*"; FAILURES=$((FAILURES + 1)); }
 
-# --- acceptance checks per app (the ONLY gate to Succeeded, SAMPLES-PLAN §1) ---
-# Each returns 0 when the acceptance checks pass (green), 1 when they fail
-# (red). The caller asserts the red state involves this task's own tests via
-# the RED_HINT global (set by check_app before calling).
-
-checks_gocli() {
-  (cd "$1" && go build ./... && go vet ./... && go test ./...)
-}
-
-checks_pylib() {
-  (cd "$1" && python3 -m compileall -q . && python3 -m unittest discover -s tests)
-}
-
-checks_webapi() {
-  (cd "$1" && go build ./... && bash test/smoke.sh)
-}
-
-# red_hint PATTERN — returns 0 if PATTERN is found in the most recent check
-# output. Called with the runner's captured output on stdout.
-red_hint_ok() {
-  grep -q "$RED_HINT"
-}
-
-task_count() {
-  ls "$ROOT/examples/$1/tasks/"*.patch 2>/dev/null | wc -l | tr -d ' '
-}
-
-commit_state() {
-  (cd "$1" && git add -A && \
-    git -c user.email=samples@coxswain.local -c user.name=samples commit -qm "state" || true)
-}
-
-# red_hint_for APP TASK — the grep pattern that identifies the task's own
-# failing test in the check output.
-red_hint_for() {
-  case "$1-$2" in
-    gocli-1)    echo 'TestRound' ;;
-    gocli-2)    echo 'TestMainJSON' ;;
-    pylib-1)    echo 'Median' ;;
-    pylib-2)    echo 'Clamp' ;;
-    webapi-1)   echo 'ping: FAIL' ;;
-    webapi-2)   echo 'echo: FAIL' ;;
-    *)          echo "task$2" ;;
-  esac
-}
-
-check_app() {
-  local app="$1"
-  local seed="$ROOT/examples/$app"
-  local n work runner t out rc hint
-  n=$(task_count "$app")
-  say "== $app: $n task(s) =="
-  if [ "$n" -eq 0 ]; then
-    fail "$app: no tasks/*.patch found"
-    return
-  fi
-
-  work=$(mktemp -d)
-  rm -rf "$work"; mkdir -p "$work"
-  cp -r "$seed/." "$work/"
-  find "$work" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null
-  (cd "$work" && git init -q && git add -A && \
-    git -c user.email=samples@coxswain.local -c user.name=samples commit -qm seed)
-
-  runner="checks_$app"
-  for t in $(seq 1 "$n"); do
-    hint=$(red_hint_for "$app" "$t")
-
-    # Seed-state assertion: the suite must be red on the seed state.
-    out=$("$runner" "$work" 2>&1)
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      fail "$app task $t: acceptance checks PASS on seed state (expected FAIL)"
-    else
-      pass "$app task $t: acceptance checks fail on seed state"
+# run_checks DIR — run each line of DIR/.checks (one shell command per line,
+# scoped to this task's tests). Stop at the first failure. Exit 0 if all pass.
+run_checks() {
+  local dir="$1" line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if ! (cd "$dir" && eval "$line") >/dev/null 2>&1; then
+      return 1
     fi
-
-    # Reference-patch assertion: applying task $t's patch to the seed turns
-    # the suite green. (Each task's patch is cumulative: it carries all
-    # prior tasks' changes, so it makes the full check suite pass when
-    # applied to the seed state.)
-    if ! (cd "$work" && git apply --check "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
-      fail "$app task $t: reference patch does not apply to seed"
-    elif ! (cd "$work" && git apply "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
-      fail "$app task $t: reference patch failed to apply"
-    else
-      out=$("$runner" "$work" 2>&1)
-      rc=$?
-      if [ "$rc" -eq 0 ]; then
-        pass "$app task $t: acceptance checks pass after reference patch"
-      else
-        fail "$app task $t: acceptance checks still fail after reference patch"
-        printf '%s\n' "$out" | tail -15
-      fi
-    fi
-
-    # Reset the temp dir to the seed state for the next task.
-    (cd "$work" && git checkout -q -- . && git clean -qfd)
-
-    # Reference-patch assertion: applying task $t turns the suite green.
-    if ! (cd "$work" && git apply --check "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
-      fail "$app task $t: reference patch does not apply"
-    elif ! (cd "$work" && git apply "$ROOT/examples/$app/tasks/$t.patch" 2>/dev/null); then
-      fail "$app task $t: reference patch failed to apply"
-    else
-      out=$("$runner" "$work" 2>&1)
-      rc=$?
-      if [ "$rc" -eq 0 ]; then
-        pass "$app task $t: acceptance checks pass after reference patch"
-      else
-        fail "$app task $t: acceptance checks still fail after reference patch"
-        printf '%s\n' "$out" | tail -15
-      fi
-    fi
-
-    commit_state "$work"
-  done
+  done < "$dir/.checks"
+  return 0
 }
 
-main() {
-  local app
-  for app in gocli pylib webapi; do
-    if [ ! -d "$ROOT/examples/$app" ]; then
-      say "== $app: not present, skipping"
+# md_checks APP TASK — print the acceptanceChecks list from tasks.md for this
+# task (the YAML block between 'acceptanceChecks:' and the next non-list key).
+md_checks() {
+  local app="$1" task="$2"
+  awk -v n="$task" '
+    /^## Task [0-9]+/ { in_task = (index($0, "Task " n) > 0) }
+    in_task && /acceptanceChecks:/ { grab = 1; next }
+    grab && /^      - / { sub(/^      - /, ""); print; next }
+    grab { grab = 0 }
+  ' "$ROOT/examples/$app/tasks.md"
+}
+
+for app in gocli pylib webapi; do
+  seed="$ROOT/examples/$app"
+  say "== $app =="
+  for patch in "$seed"/tasks/*.patch; do
+    task=$(basename "$patch" .patch)
+    checks="$seed/tasks/${task}.checks"
+    if [ ! -f "$checks" ]; then
+      fail "$app task $task: missing $checks"
       continue
     fi
-    check_app "$app"
-  done
-  say
-  if [ "$FAILURES" -eq 0 ]; then
-    say "samples-check: OK"
-  else
-    say "samples-check: $FAILURES failure(s)"
-    exit 1
-  fi
-}
 
-main "$@"
+    # Copy the seed into a fresh git repo so git apply works.
+    work=$(mktemp -d)
+    cp -r "$seed"/* "$work"/
+    (cd "$work" && git init -q && git add -A && \
+     git -c user.email=samples@coxswain.local -c user.name=samples \
+     commit -qm seed || true)
+
+    # Install the scoped checks for this task.
+    cp "$checks" "$work/.checks"
+
+    # 1. Seed state: the task's scoped checks must FAIL.
+    if ! run_checks "$work"; then
+      pass "$app task $task: seed FAILS (expected)"
+    else
+      fail "$app task $task: seed PASSES (expected FAIL)"
+    fi
+
+    # 2. Apply the reference patch (against the seed), checks must PASS.
+    if ! (cd "$work" && git apply -- "$seed/tasks/${task}.patch" 2>/dev/null); then
+      fail "$app task $task: reference patch does not apply to the seed"
+    elif run_checks "$work"; then
+      pass "$app task $task: reference patch PASSES"
+    else
+      fail "$app task $task: reference patch does not pass the checks"
+    fi
+
+    # 3. tasks.md acceptanceChecks for this task must equal <n>.checks.
+    md_list=$(md_checks "$app" "$task")
+    checks_list=$(sed '/^$/d' "$checks")
+    if [ -z "$md_list" ]; then
+      fail "$app task $task: tasks.md has no acceptanceChecks"
+    elif [ "$md_list" = "$checks_list" ]; then
+      pass "$app task $task: tasks.md acceptanceChecks match <n>.checks"
+    else
+      fail "$app task $task: tasks.md acceptanceChecks differ from <n>.checks"
+      say "  tasks.md:    $md_list"
+      say "  <n>.checks:  $checks_list"
+    fi
+
+    rm -rf "$work"
+  done
+done
+
+if [ "$FAILURES" -eq 0 ]; then
+  say "samples-check: OK"
+  exit 0
+else
+  say "samples-check: $FAILURES failure(s)"
+  exit 1
+fi

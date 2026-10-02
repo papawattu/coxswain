@@ -34,7 +34,7 @@ spec:
   verify:
     acceptanceChecks:
       - go build ./...
-      - bash test/smoke.sh
+      - bash test/smoke.sh ping
     preset: go
     protectedPaths:
       - test/smoke.sh
@@ -95,7 +95,7 @@ spec:
   verify:
     acceptanceChecks:
       - go build ./...
-      - bash test/smoke.sh
+      - bash test/smoke.sh echo
     preset: go
     protectedPaths:
       - test/smoke.sh

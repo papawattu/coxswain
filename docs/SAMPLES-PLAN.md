@@ -16,11 +16,12 @@ Owner decisions (2026-10-02):
    completion (no auth header sent — the server does not require one; we still
    mount a dummy key, §4).
 4. **The bar (owner acceptance for the samples build):** at least **one task
-   end to end on kind with the real vLLM: Planning → plan approval →
-   Implementing → Verifying, with evidence**. Consequence: the operator-side
-   gaps that block that bar (§3, GAP 1–5) are **in scope** for the build
-   slices (§7, S3–S5); only delivery (branch push + PR to the in-cluster
-   Gitea) stays a follow-up.
+   end to end on kind with the real vLLM: Planning → Implementing →
+   Verifying, with evidence** (owner option B: no approval gate — the runner
+   drives the phases; the B3 verify Job is the evidence). Consequence: the
+   operator-side gaps that block that bar (§3, GAP 1–5) are **in scope** for
+   the build slices (§7, S3–S5); only delivery (branch push + PR to the
+   in-cluster Gitea) stays a follow-up.
 
 Everything below is **verified against the code at `d6774cf` (origin/main,
 2026-10-02)** unless marked **GAP**. File/function citations are for that
@@ -204,12 +205,12 @@ samples build must close to meet the owner's bar:
 **Implication for the sample demo, after the build (stated plainly):** the
 build closes GAP 1–4, so a sample run proves (a) the sandbox+proxy+netpol+
 policy plumbing comes up correctly around a *real* agent run against the
-*real* local model, (b) the phase machine moves **Planning → plan approval →
-Implementing → Verifying** with the runner as driver and the B3 verify Job as
-evidence, and (c) the acceptance checks pass on the final state. It does
-**not** prove delivery (GAP 5 stays: no push, no PR) — the demo is framed
-accordingly: "a Loop on a sample repo, real model, isolated network, checks
-pass through plan approval" — not "an SDLC that ships a PR."
+*real* local model, (b) the phase machine moves **Planning → Implementing →
+Verifying** with the runner as driver (owner option B: no approval gate) and
+the B3 verify Job as evidence, and (c) the acceptance checks pass on the
+final state. It does **not** prove delivery (GAP 5 stays: no push, no PR) —
+the demo is framed accordingly: "a Loop on a sample repo, real model,
+isolated network, checks pass" — not "an SDLC that ships a PR."
 
 ## 4. Model wiring (verified)
 

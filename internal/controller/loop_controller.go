@@ -206,13 +206,16 @@ type LoopReconciler struct {
 	// reads the sandbox pod's AGENT container termination message via the
 	// operator's APIReader path (a real, non-cached client): the one-shot
 	// runner writes its claim to /dev/termination-log and exits 0 (or 1 when
-	// blocked), and the kubelet keeps the container Terminated (no restart —
-	// restartPolicy Never), so the message is stable until the operator
-	// recreates the pod. The envtest suite overrides the field to simulate a
-	// pod; when nil, the real APIReader path runs. A nil claim (no agent
-	// status yet / still running / no message) is NOT an error — the caller
-	// requeues. (ADR-0005: the message is a CLAIM — size-limited, strict-
-	// parsed, and never a gate input; the reader rejects it and logs.)
+	// blocked), and the kubelet keeps the container Terminated (no in-place
+	// restart of the one-shot runner under the sandbox pod's restartPolicy;
+	// a restarted container's last claim is carried in LastTerminationState,
+	// which the live reader falls back to), so the message is stable until
+	// the operator recreates the pod (the per-phase recycle). The envtest
+	// suite overrides the field to simulate a pod; when nil, the real
+	// APIReader path runs. A nil claim (no agent status yet / still running /
+	// no message) is NOT an error — the caller requeues. (ADR-0005: the
+	// message is a CLAIM — size-limited, strict-parsed, and never a gate
+	// input; the reader rejects it and logs.)
 	readPhaseClaim func(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error)
 
 	// phaseGate is the OS8 phase-gate seam: it decides whether the phase

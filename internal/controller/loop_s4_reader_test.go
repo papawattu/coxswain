@@ -275,6 +275,50 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		}
 	})
 
+	It("rejects a claim with an invalid observedPhase (not Planning/Implementing/Verifying)", func() {
+		// P3 (review item 5): a claim naming a phase the runner cannot claim
+		// (a typo, a future phase, an out-of-set string) is rejected at the
+		// parse boundary — it must requeue (not silently fall through the
+		// nextPhase default) and must not advance or be recorded.
+		ns := "s4-badphase-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "badplp")
+
+		invalid := map[string]string{
+			`{"observedPhase":"Reviewing","status":"success"}`: "an out-of-set phase (a typo / future phase)",
+			`{"observedPhase":"planning","status":"success"}`:  "a lower-cased phase (case-sensitive mismatch)",
+			`{"observedPhase":"","status":"success"}`:          "an empty phase (no observedPhase)",
+		}
+		for msg, label := range invalid {
+			By(fmt.Sprintf("case: %s", label))
+			ensureSandboxObject(ns, "badplp")
+			createStandinPod(ns, "badplp")
+			writeAgentTermination(ns, "badplp", msg)
+
+			res, rerr := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+			Expect(rerr).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", time.Second),
+				fmt.Sprintf("an invalid-observedPhase claim (%s) must requeue, never advance", label))
+
+			loop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+				fmt.Sprintf("an invalid-observedPhase claim (%s) must not advance the phase", label))
+			Expect(loop.Status.ObservedPhase).To(BeEmpty(),
+				fmt.Sprintf("an invalid-observedPhase claim (%s) must not be recorded", label))
+
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "badplp-sandbox", Namespace: ns}, pod)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+		}
+	})
+
 	It("advances Planning -> Implementing -> Verifying from successive claims, records progress, and emits PhaseAdvanced Events", func() {
 		ns := "s4-happy-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
@@ -615,5 +659,47 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 			"a re-read of an identical claim must leave status.progress byte-identical (lastActivityTime included)")
 		Expect(loop.ResourceVersion).To(Equal(rvBefore),
 			"a re-read of an identical claim must make no status write (resourceVersion unchanged)")
+	})
+
+	// P2 (review item 4): the live reader falls back to
+	// LastTerminationState.Terminated when the current State is not Terminated
+	// (a restarted agent container carries its last claim there). The spec
+	// writes a pod whose agent container's CURRENT state is Running (no
+	// claim) but whose LastTerminationState carries the claim: the live
+	// reader (apiReader: k8sClient, no seam) must read the fallback and
+	// advance.
+	It("falls back to LastTerminationState when the agent's current state is not Terminated (P2)", func() {
+		ns := "s4-fallback-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "falllp")
+
+		ensureSandboxObject(ns, "falllp")
+		createStandinPod(ns, "falllp")
+		// The agent container's CURRENT state is Running (the pod was
+		// restarted, or the runner is mid-phase) — no claim in State — but the
+		// LAST termination carries the completed Planning claim.
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "falllp-sandbox", Namespace: ns}, pod)).To(Succeed())
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+			{Name: agentContainerName,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 0, Message: `{"observedPhase":"Planning","status":"success","blockedReason":""}`}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"the claim must be read from LastTerminationState when the current state is not Terminated (the fallback is the stable read-back)")
+		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 	})
 })

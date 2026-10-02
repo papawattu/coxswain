@@ -28,10 +28,13 @@ limitations under the License.
 //	{"observedPhase":"Implementing","status":"success","blockedReason":""}
 //
 // Exit code 0 = the phase completed the operator's ask; exit code 1 = the
-// phase ended blocked (the message still carries status:"blocked"). The
-// sandbox pod runs restartPolicy Never, so the kubelet leaves the agent
-// container Terminated (no restart, no message churn) and the message stays
-// readable until the operator recreates the pod.
+// phase ended blocked (the message still carries status:"blocked"). The agent
+// container runs with the sandbox pod's restartPolicy (the agent-sandbox CR
+// default), so the kubelet leaves the agent container Terminated when it
+// exits (no in-place restart of the one-shot runner; a restarted container's
+// last claim is carried in LastTerminationState, which the live reader falls
+// back to) and the message stays readable until the operator recreates the
+// pod (the per-phase recycle).
 //
 // Why one container run per phase (the handoff question): the termination
 // message is ONE-SHOT per container run (it is written at exit, and a
@@ -151,8 +154,15 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 		claim.Iteration = it
 	}
 	claim.ObservedPhase = coxv1alpha1.LoopPhase(op)
-	if claim.ObservedPhase == "" {
-		return nil, fmt.Errorf("claim has no observedPhase")
+	// Review P3: the claimed phase must be one the runner can claim
+	// (Planning / Implementing / Verifying). nextPhase maps (phase, claim) ->
+	// next for every in-set pair, so an out-of-set claim would otherwise fall
+	// through the default case and be silently ignored (a typo'd phase would
+	// never surface as an error). Reject it at the parse boundary instead.
+	switch claim.ObservedPhase {
+	case coxv1alpha1.LoopPhasePlanning, coxv1alpha1.LoopPhaseImplementing, coxv1alpha1.LoopPhaseVerifying:
+	default:
+		return nil, fmt.Errorf("claim names an invalid observedPhase %q (must be Planning, Implementing, or Verifying)", op)
 	}
 	return &claim, nil
 }
@@ -210,13 +220,24 @@ func (r *LoopReconciler) readPhaseClaimFromTerminationMessage(ctx context.Contex
 		if cs.Name != agentContainerNameS4 {
 			continue
 		}
-		if cs.State.Terminated == nil {
+		// The claim lives in the agent's termination message. The live
+		// state is the current one (the kubelet restarts the agent at most
+		// N times under the RestartPolicy the agent-sandbox CR defaults to;
+		// the reviewer's P2: fall back to the LAST termination state when the
+		// current state is not Terminated — a container that was replaced by a
+		// restart carries its last claim in LastTerminationState, and the
+		// message is the stable read-back the S3 baseCommit pattern relies on).
+		terminated := cs.State.Terminated
+		if terminated == nil {
+			terminated = cs.LastTerminationState.Terminated
+		}
+		if terminated == nil {
 			// The agent is still running the phase (or has no status yet):
 			// no claim yet. Requeue (the phase-init container has written the
 			// desired phase and the runner is doing the work).
 			return nil, nil
 		}
-		claim, err := parsePhaseClaim(cs.State.Terminated.Message)
+		claim, err := parsePhaseClaim(terminated.Message)
 		if err != nil {
 			// The agent terminated but wrote a malformed/empty claim (it
 			// crashed, or the termination log was truncated/overwritten).

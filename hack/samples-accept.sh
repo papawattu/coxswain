@@ -25,7 +25,7 @@ APPS=("$@")
 
 KUBECTL=(kubectl --context "$CTX" -n "$NS")
 POD="s2-acceptance-$$"
-IMAGE="${S2_ACCEPT_IMAGE:-golang:1.26}"
+IMAGE="${S2_ACCEPT_IMAGE:-gitea/gitea:1.24}"
 
 log() { printf '\033[1;36m[samples-accept]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[samples-accept FATAL]\033[0m %s\n' "$*" >&2; exit 1; }

@@ -66,9 +66,16 @@ log "ctx=$CTX ns=$NS user=$GIT_USER apps=${APPS[*]}"
 # table, so the first 'admin user create' makes the admin; on a surviving
 # emptyDir the user already exists and the CLI's error is ignored.
 log "ensuring the Gitea admin account '$ADMIN_USER' (kubectl exec) ..."
-"${KUBECTL[@]}" exec deploy/gitea -- sh -c \
+# Idempotent: a surviving emptyDir has the admin already, so 'already
+# exists' is the success case. Any other error (pod not Ready, DB missing)
+# is a real failure.
+ADMIN_OUT=$("${KUBECTL[@]}" exec deploy/gitea -- sh -c \
 	"su -s /bin/sh git -c '/usr/local/bin/gitea admin user create --username $ADMIN_USER --password $ADMIN_PASS --email ${ADMIN_USER}@samples.local --admin --must-change-password=false' 2>&1 | tail -2" \
-	|| die "gitea admin user create failed (is the gitea pod Ready? kubectl --context $CTX -n $NS get pod)"
+	2>&1) || true
+if ! printf '%s' "$ADMIN_OUT" | grep -qE 'successfully created|already exists'; then
+	die "gitea admin user create failed: $ADMIN_OUT (is the gitea pod Ready? kubectl --context $CTX -n $NS get pod)"
+fi
+log "   admin account '$ADMIN_USER' ready: $ADMIN_OUT"
 
 # The Gitea API is reached host-side through a kubectl port-forward (no pod
 # scheduling needed; faster than an in-cluster client for a handful of API
@@ -125,7 +132,7 @@ if [ -n "$EXISTING" ]; then
 	# Reset the password so the in-cluster Secret and the Gitea account
 	# never drift (idempotent seed: safe to re-run after a password change).
 	gitea_api PATCH "/api/v1/admin/users/$GIT_USER" \
-		"$(jq -nc --arg p "$GIT_PASS" '{password: $p}')" >/dev/null
+		"$(jq -nc --arg u "$GIT_USER" --arg p "$GIT_PASS" '{login_name: $u, password: $p}')" >/dev/null
 	log "   user '$GIT_USER' already existed; password reset to match the Secret"
 else
 	gitea_api POST /api/v1/admin/users \
@@ -139,14 +146,16 @@ fi
 for app in "${APPS[@]}"; do
 	log "seeding repo '$app' from examples/$app ..."
 
-	# 1. A fresh repo every run: delete a stale one (idempotent). The admin
-	#    account is the repo owner at creation, so DELETE works.
-	curl -fsS -m 30 -X DELETE -u "$API_AUTH" \
+	# 1. A fresh repo every run: delete a stale one (idempotent). The repo
+	#    is owned by $GIT_USER (created with that user's basic-auth), so
+	#    DELETE with the same credential works.
+	curl -fsS -m 30 -X DELETE -u "$GIT_USER:$GIT_PASS" \
 		"$API/api/v1/repos/$GIT_USER/$app" >/dev/null 2>&1 || true
 
-	gitea_api POST /api/v1/user/repos \
-		"$(jq -nc --arg n "$app" '{name: $n, auto_init: false, private: false, default_branch: "initial"}')" >/dev/null
-	log "   created repo $GIT_USER/$app"
+	curl -fsS -m 30 -X POST -u "$GIT_USER:$GIT_PASS" -H 'Content-Type: application/json' \
+		-d "$(jq -nc --arg n "$app" '{name: $n, auto_init: false, private: false, default_branch: "initial"}')" \
+		"$API/api/v1/user/repos" >/dev/null
+	log "   created repo $GIT_USER/$app (owned by $GIT_USER)"
 
 	# 2. Temp git copy of examples/<app> — never the coxswain repo (S2
 	#    requirement: nothing ever points at github.com).

@@ -165,9 +165,15 @@ type assistantMessage struct {
 	ToolCalls []toolCall `json:"tool_calls,omitempty"`
 }
 
-// toolCall is a model-requested function call.
+// toolCall is a model-requested function call. Type is the OpenAI wire
+// "type": "function" (required by vLLM/Pydantic on the REQUEST side when the
+// assistant's tool_calls are echoed back into history; the response decode
+// tolerates its absence). fnCall.Arguments stays a raw JSON *string* per the
+// OpenAI schema — the model returns it as a string and the request must carry
+// it back as a string.
 type toolCall struct {
 	ID       string `json:"id"`
+	Type     string `json:"type"`
 	Function fnCall `json:"function"`
 }
 
@@ -479,11 +485,19 @@ func driveModel(
 		}
 
 		// Record the assistant turn (with its tool calls) for the next request.
-		messages = append(messages, chatMessage{
+		// The OpenAI/vLLM request schema requires each echoed tool_call to carry
+		// "type": "function" (the response decode does not see it, so it is set
+		// here at echo time, not at parse time — vLLM 400s the second request
+		// without it).
+		assistant := chatMessage{
 			Role:      jsonRoleAssistant,
 			Content:   msg.Content,
 			ToolCalls: msg.ToolCalls,
-		})
+		}
+		for i := range assistant.ToolCalls {
+			assistant.ToolCalls[i].Type = jsonToolFunction
+		}
+		messages = append(messages, assistant)
 		for _, tc := range msg.ToolCalls {
 			if !known[tc.Function.Name] {
 				// I5: reject an unknown tool instead of executing it as a shell

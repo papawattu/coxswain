@@ -1,13 +1,17 @@
-// The Coxswain runner's agent entrypoint (S3b, GAP 1). When the operator runs
-// the agent image as the runner (--runner-image), the sandbox pod's agent
-// container Command is /usr/local/bin/runner; this main reads the operator-set
-// environment (the I34-protected COX_* namespace a Loop cannot override) and
-// drives the model against the workspace.
+// The Coxswain runner's agent entrypoint (S3b, GAP 1 -> S4 phase driver).
 //
-// It is deliberately minimal in S3: it takes the goal (COX_GOAL) as its
-// prompt and runs the existing runner model loop. The phase-driver contract
-// (reading .coxswain/desired-phase, writing result.json.observedPhase) is the
-// S4 slice; until then the runner reports a single-phase run.
+// S4 (TDD-PLAN A. "Runner as phase driver", A1–A4): the runner is a ONE-SHOT
+// phase driver. It waits for the operator's desired phase
+// (.coxswain/desired-phase, written by the phase-init container), does THAT
+// phase's work (Planning -> PLAN.md A2; Implementing -> model+shell A3; A4
+// keeps the model conversation across phases within an iteration), writes the
+// claim (result.json + the termination log), and EXITS. The operator reads
+// the claim from the agent container's termination message (ADR-0004,
+// APIReader path), advances the phase machine one step, and recreates the
+// sandbox pod (one container run per phase — the termination message is
+// one-shot per container run). A blocked phase (unknown desired-phase, or a
+// failed model loop) exits 1 (the operator sees the claim and requeues); a
+// completed phase exits 0.
 //
 // Environment (all operator-set; a Loop cannot set COX_* names, I34):
 //   - COX_GOAL: the goal / prompt (spec.goal).
@@ -29,6 +33,12 @@
 //     chat_template_kwargs.enable_thinking=false the runner's tool calls land
 //     in the reasoning output and the model loop cannot make progress (S3
 //     acceptance, 2026-10-02).
+//   - -termination-log: the path the runner writes its ADR-0004 claim to
+//     (default /dev/termination-log, the kubelet-capped file the operator
+//     reads back from the container status). Overridable in tests / a manual
+//     pod where /dev/termination-log does not exist (the write is best-effort
+//     — a failure is logged; the result.json on the workspace is the full
+//     ADR-0004 file).
 package main
 
 import (
@@ -75,30 +85,42 @@ func main() {
 		model = "local-model"
 	}
 	log.Printf("runner: goal=%q model=%s workspace=%s", goal, model, workspace)
-	res := runner.Run(runner.RunConfig{
-		Prompt:    goal,
+
+	// The one-shot phase driver: wait for the desired phase, do the phase's
+	// work, write the claim, and exit (0 = the phase completed the operator's
+	// ask; 1 = the phase ended blocked — the operator sees the claim and
+	// requeues). A SIGTERM (pod deletion) returns a zero Result (no phase
+	// executed) before the claim write — a deleted pod must not look like a
+	// blocked run.
+	stopCh := make(chan os.Signal, 1)
+	signal.Notify(stopCh, syscall.SIGTERM, os.Interrupt)
+	stop := make(chan any)
+	go func() {
+		s, ok := <-stopCh
+		if ok {
+			stop <- s
+		}
+		close(stop)
+	}()
+	res := runner.PhaseRun(runner.PhaseConfig{
 		Workspace: workspace,
+		Goal:      goal,
 		BaseURL:   baseURL,
 		// ADR-0006: the agent holds no model key; the proxy injects auth. The
-		// runner sends no API key (the proxy does not require one from the agent).
+		// runner sends no API key (the proxy does not require one from the
+		// agent).
 		APIKey:    "",
 		Model:     model,
 		MaxSteps:  *maxSteps,
 		ExtraBody: extra,
-	})
-	fmt.Fprintf(os.Stderr, "runner: status=%s summary=%q\n", res.Status, res.Summary)
+	}, stop)
+	code := 0
+	if res.Status == "blocked" {
+		code = 1
+	}
+	fmt.Fprintf(os.Stderr, "runner: status=%s observedPhase=%s summary=%q\n", res.Status, res.ObservedPhase, res.Summary)
 	if res.VerificationNotes != "" {
 		log.Printf("runner: verification: %s", res.VerificationNotes)
 	}
-	// S3: the runner is one-shot. After writing result.json it must NOT exit
-	// (restartPolicy=Always would loop it forever, hammering the model). Block
-	// on a termination signal (S4 makes it a phase driver that watches
-	// .coxswain/desired-phase and exits when told to). A bare 'select {}' with
-	// no other live goroutines aborts with 'fatal error: all goroutines are
-	// asleep - deadlock!' — the runner must have a live wait (verified in kind
-	// 2026-10-02: CrashLoopBackOff). Exiting on SIGTERM keeps the pod deletion
-	// clean.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
-	<-sig
+	os.Exit(code)
 }

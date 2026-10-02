@@ -80,6 +80,16 @@ const (
 	// init container (S3a). It clones spec.workspace.repo @ ref into the
 	// 'workspace' volume and writes the resolved SHA to baseCommitFile.
 	workspaceInitContainerName = "init-workspace"
+	// phaseInitContainerName is the name of the sandbox pod's phase-init
+	// container (S4, ADR-0004). It materialises the operator's
+	// status.desiredPhase into <workspace>/.coxswain/desired-phase (the
+	// runner's read channel; the operator is the sole writer of the phase).
+	phaseInitContainerName = "init-phase"
+	// coxDesiredPhaseFile is the .coxswain filename the phase-init container
+	// writes (the operator's desired-phase hint to the one-shot runner) and the
+	// runner reads. Single source of truth for the operator and the runner
+	// (the runner's own constant mirrors this; both read/write the same name).
+	coxDesiredPhaseFile = "desired-phase"
 	// workspaceCredsUsernameKey / workspaceCredsPasswordKey are the keys the
 	// spec.workspace.gitCredentialSecret Secret MUST carry: a standard
 	// kubernetes.io/basic-auth Secret (the same shape as the samples
@@ -192,6 +202,37 @@ type LoopReconciler struct {
 	// mid-reconcile) IS an error (the caller logs and requeues).
 	readBaseCommit func(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error)
 
+	// readPhaseClaim is the ADR-0004 claim read seam (S4). The default (nil)
+	// reads the sandbox pod's AGENT container termination message via the
+	// operator's APIReader path (a real, non-cached client): the one-shot
+	// runner writes its claim to /dev/termination-log and exits 0 (or 1 when
+	// blocked), and the kubelet keeps the container Terminated (no in-place
+	// restart of the one-shot runner under the sandbox pod's restartPolicy;
+	// a restarted container's last claim is carried in LastTerminationState,
+	// which the live reader falls back to), so the message is stable until
+	// the operator recreates the pod (the per-phase recycle). The envtest
+	// suite overrides the field to simulate a pod; when nil, the real
+	// APIReader path runs. A nil claim (no agent status yet / still running /
+	// no message) is NOT an error — the caller requeues. (ADR-0005: the
+	// message is a CLAIM — size-limited, strict-parsed, and never a gate
+	// input; the reader rejects it and logs.)
+	readPhaseClaim func(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error)
+
+	// phaseGate is the OS8 phase-gate seam: it decides whether the phase
+	// machine may advance from current to next (an approval hold, or a future
+	// observer-proposed hold). The S4 build ships exactly one implementation,
+	// autoApprovePhaseGate (option B: NO approval gate — the owner's bar is
+	// Planning -> Implementing -> Verifying); nil is treated as auto-approve
+	// so a bare test reconciler keeps the existing advance behaviour.
+	phaseGate PhaseGate
+
+	// now is the clock the operator uses to stamp status (S4 review P2, R18):
+	// recordPhaseClaim's caller stamps LastActivityTime from it. It defaults
+	// to metav1.Now at each call site; a test may override it to advance time
+	// deterministically (metav1.Time marshals at 1-second precision, so a
+	// no-churn spec must prove the two reconciles land more than 1s apart).
+	now func() metav1.Time
+
 	// SandboxImage is the image the sandbox pod runs. Defaults to a Go dev
 	// image; overridable for the smoke test (e.g. the runner image).
 	SandboxImage string
@@ -250,6 +291,7 @@ type LoopReconciler struct {
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
 // D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // D38: the operator emits a Kubernetes Event on every Loop when its
@@ -338,71 +380,69 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
+	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+	changed := false
+	if loop.Status.Phase == "" {
+		loop.Status.Phase = coxv1alpha1.LoopPhasePending
+		changed = true
+	}
+	// S4 (owner option B: NO approval gate — the bar is Planning ->
+	// Implementing -> Verifying): a fresh Loop at Pending starts the phase
+	// machine at Planning. The bootstrap runs BEFORE ensureSandbox so the
+	// FIRST sandbox is built with the phase-init container already writing
+	// status.desiredPhase (Planning) into the workspace — no bootstrap recycle.
+	// The sandbox annotation (coxswain.io/desired-phase) stamps the phase it
+	// was built for; ensureSandbox deletes+requeues only when it differs from
+	// status.desiredPhase (a genuine phase advance).
+	if loop.Status.Phase == coxv1alpha1.LoopPhasePending {
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		changed = true
+	}
+
+	// S4 review P1 (R17): the workspace must survive the per-phase pod
+	// recycle — a fresh emptyDir per phase wiped PLAN.md and the
+	// Implementing edits. The step is a small helper (Reconcile complexity,
+	// gocyclo 31).
+	if err := r.ensureLoopArtifacts(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.ensureSandbox(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
-	changed, err := r.ensureProxyAndNetPolicies(ctx, &loop)
+	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	changed = changed || policiesChanged
 	if loop.Status.ObservedGeneration != loop.Generation {
 		loop.Status.ObservedGeneration = loop.Generation
 		changed = true
 	}
-	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
-	if loop.Status.Phase == "" {
-		loop.Status.Phase = coxv1alpha1.LoopPhasePending
-		changed = true
-	}
-	// B1: advance the phase machine when the runner reports a valid forward step.
-	// nextPhase(phase, observedPhase) returns the next phase when observedPhase
-	// is the immediate-next phase after the operator's current phase, and leaves
-	// it unchanged otherwise (terminal phases, missing/garbled reports). The
-	// operator never interprets runner output beyond this pure match
-	// (ADR-0004). The iterate/terminal branches (Verifying -> Implementing /
-	// Failed) are completed by B3 (verify outcome) and B4 (iteration count).
-	if next := nextPhase(loop.Status.Phase, loop.Status.ObservedPhase); next != loop.Status.Phase {
-		loop.Status.Phase = next
-		loop.Status.DesiredPhase = next
-		changed = true
-	}
+	// S4 (ADR-0004): read the runner's claim from the agent container's
+	// termination message (APIReader path — the sandbox pod is not in the
+	// manager's Pod cache, so the non-cached client is required; the S3 baseCommit
+	// pattern) and advance the phase machine when the claim names the
+	// immediate-next phase (the existing nextPhase table, unchanged, gated by
+	// the OS8 PhaseGate — option B: auto-approve). The claim is size-limited,
+	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
+	// logged and requeued, never acted on; the OS1 progress record is
+	// observability only. The iterate/terminal branches (Verifying ->
+	// Implementing / Failed) are completed by B3 (verify outcome) and B4
+	// (iteration count). See internal/controller/loop_s4_phase.go.
+	claimReadPending, s4Changed := r.advancePhaseFromClaim(ctx, &loop)
+	changed = changed || s4Changed
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
-	// gate. tamperVerdict is a tri-state over the operator's evidence (a pointer
-	// to the terminated tamper init container's exit code + the verifiedCommit
-	// it names), and never reads the runner's result.json claim:
-	//   - TamperTampered -> Failed:TamperedVerify, TERMINAL, before any check
-	//     runs (the anti-gaming property: a runner that edited a protected file
-	//     and reported success still ends Failed).
-	//   - TamperClean    -> not a B2 decision; B3's check containers decide the
-	//     outcome from there.
-	//   - TamperUnknown  -> no evidence (nil, or stale for a different
-	//     verifiedCommit/Job); NEVER treated as clean (D24 fail-closed), so the
-	//     Loop stays in Verifying and B3 cannot reach Succeeded on it.
-	// In envtest the B-slice tests set status.verify.* directly (no Job
-	// controller); in a real cluster B3 reads the tamper exit code from the
-	// verify Job pod's initContainerStatuses.
-	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying && loop.Status.Verify != nil {
-		// The operator's CURRENT verified commit is the one it pinned on entering
-		// Verifying (status.currentVerify.verifiedCommit, D11) — never the
-		// evidence's own commit (D27: passing the evidence's commit as both args
-		// made the stale guard a no-op in prod). The evidence's verifiedCommit
-		// (status.verify.verifiedCommit) is what the evidence NAMES. A mismatch
-		// between the two, or an empty pin, makes tamperVerdict return Unknown
-		// (fail-closed), so leftover evidence from a previous iteration's Job or a
-		// force-pushed branch cannot be reused to reach Succeeded.
-		v := loop.Status.Verify
-		var currentCommit string
-		if loop.Status.CurrentVerify != nil {
-			currentCommit = loop.Status.CurrentVerify.VerifiedCommit
-		}
-		if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
-			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
-				"a protected path changed between baseCommit and verifiedCommit; terminal")
-			changed = true
-		}
+	// gate (see applyTamperGate for the tri-state logic). The gate must run
+	// every reconcile — calling it into a local and only then OR-ing into
+	// changed (changed = changed || r.applyTamperGate(...)) would short-circuit
+	// the call whenever changed was already true this reconcile, skipping the
+	// security gate (the red B2 tamper spec).
+	if r.applyTamperGate(&loop) {
+		changed = true
 	}
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references
@@ -437,36 +477,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	//
 	// (The reviewer's MVP fix: no exec/kubelet/new RBAC; readBaseCommit reads
 	// pod.status.initContainerStatuses and validates a 40-hex SHA.)
-	baseCommitPending := false
-	if loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" {
-		sha, done, err := r.resolveBaseCommit(ctx, &loop)
-		if err != nil && done {
-			// The init container terminated with a non-SHA message (the clone
-			// failed). Log it. The requeue is BOUNDED: it only fires while the
-			// init has NOT terminated (done=false); a permanently-failed init
-			// would not change on a requeue (the sandbox stays init-failed until
-			// the pod is recreated), so once done we stop requeueing for
-			// baseCommit.
-			logf.FromContext(ctx).V(1).Info("workspace baseCommit read failed",
-				"loop", loop.Name, "err", err)
-		} else if done && sha != "" {
-			// The init terminated with a valid SHA: record it (immutable, D10).
-			loop.Status.BaseCommit = sha
-			changed = true
-		} else if !done {
-			// The clone is still running (init not terminated yet, or the pod /
-			// init is not yet registered, or a transient read error). Mark the
-			// baseCommit pending so the final return requeues (a sandbox pod
-			// change does not trigger a reconcile on its own, so the timer is
-			// what drives the retry). Do NOT return here — the other status
-			// changes from this reconcile must still be persisted below.
-			if err != nil {
-				logf.FromContext(ctx).V(1).Info("workspace baseCommit not yet readable",
-					"loop", loop.Name, "err", err)
-			}
-			baseCommitPending = true
-		}
-	}
+	baseCommitPending, baseCommitChanged := r.recordBaseCommitFromInit(ctx, &loop)
+	changed = changed || baseCommitChanged
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
 	if changed || conditionsChanged {
@@ -475,10 +487,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	if baseCommitPending {
+	if baseCommitPending || claimReadPending {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// emitPhaseAdvancedEvent (OS5, S4) emits the Kubernetes Event on a phase
+// transition (stable reason PhaseAdvanced). Best-effort: a failed Event never
+// blocks the reconcile; a nil Recorder (most envtests) skips it. The message
+// carries the from/to phases (the reason is a fixed, documented string).
+func (r *LoopReconciler) emitPhaseAdvancedEvent(loop *coxv1alpha1.Loop, from coxv1alpha1.LoopPhase) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(loop, corev1.EventTypeNormal, phaseAdvancedReason,
+		"phase advanced %s -> %s", from, loop.Status.Phase)
 }
 
 // resolveBaseCommit dispatches to the test seam (readBaseCommit field) when it
@@ -570,6 +594,49 @@ func isCommitSHA(s string) bool {
 // was applied (false when policyRefs is empty — the default-deny minimum). A
 // referenced AgentPolicy that does not exist is an error (the operator must not
 // silently run an agent with a narrower policy than the Loop declared).
+
+// applyTamperGate (B2, D10/D24) applies the tamper-evidence gate at Verifying.
+// tamperVerdict is a tri-state over the operator's evidence (a pointer to the
+// terminated tamper init container's exit code + the verifiedCommit it names),
+// and never reads the runner's result.json claim:
+//   - TamperTampered -> Failed:TamperedVerify, TERMINAL, before any check
+//     runs (the anti-gaming property: a runner that edited a protected file
+//     and reported success still ends Failed).
+//   - TamperClean    -> not a B2 decision; B3's check containers decide the
+//     outcome from there.
+//   - TamperUnknown  -> no evidence (nil, or stale for a different
+//     verifiedCommit/Job); NEVER treated as clean (D24 fail-closed), so the
+//     Loop stays in Verifying and B3 cannot reach Succeeded on it.
+//
+// In envtest the B-slice tests set status.verify.* directly (no Job
+// controller); in a real cluster B3 reads the tamper exit code from the
+// verify Job pod's initContainerStatuses.
+func (r *LoopReconciler) applyTamperGate(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loop.Status.Verify == nil {
+		return false
+	}
+	// The operator's CURRENT verified commit is the one it pinned on entering
+	// Verifying (status.currentVerify.verifiedCommit, D11) — never the
+	// evidence's own commit (D27: passing the evidence's commit as both args
+	// made the stale guard a no-op in prod). The evidence's verifiedCommit
+	// (status.verify.verifiedCommit) is what the evidence NAMES. A mismatch
+	// between the two, or an empty pin, makes tamperVerdict return Unknown
+	// (fail-closed), so leftover evidence from a previous iteration's Job or a
+	// force-pushed branch cannot be reused to reach Succeeded.
+	v := loop.Status.Verify
+	var currentCommit string
+	if loop.Status.CurrentVerify != nil {
+		currentCommit = loop.Status.CurrentVerify.VerifiedCommit
+	}
+	if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
+			"a protected path changed between baseCommit and verifiedCommit; terminal")
+		return true
+	}
+	return false
+}
+
 func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
 	if len(loop.Spec.PolicyRefs) == 0 {
 		return "", false, nil
@@ -864,12 +931,62 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// spec.workspace.repo is set; the credential Secret is mounted into it
 	// ONLY (ADR-0006 — zero credentials in the agent).
 	var initContainers []corev1.Container
-	if loop.Spec.Workspace.Repo != "" {
-		initContainers = []corev1.Container{r.workspaceInitContainer(loop)}
+	// S4 review P1 (R18, ADR-0006): the workspace init container (git clone
+	// with the credential mounted) runs ONLY on the first clone (baseCommit
+	// empty). Once status.baseCommit is pinned (immutable, ADR-0005 D10), the
+	// PVC already holds the repo and nothing needs git or the credential:
+	// later phases build the sandbox with NO init-workspace and NO
+	// workspace-creds volume, so the credential is never present next to the
+	// agent-controlled /workspace/.git (agent-planted hooks or git config
+	// could not run while the credential is mounted). readBaseCommit is
+	// skipped once baseCommit is set. If the spec flips between first and
+	// later phases, the desired-phase annotation recycle already replaces the
+	// pod.
+	if loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" {
+		initContainers = append(initContainers, r.workspaceInitContainer(loop))
 	}
+	// S4 (ADR-0004): the phase-init container materialises the operator's
+	// status.desiredPhase into <workspace>/.coxswain/desired-phase (the
+	// runner's read channel; the operator is the sole writer of the phase —
+	// ADR-0004). The runner is one-shot per phase: it reads the desired
+	// phase, does that phase's work, and exits with the claim in its
+	// termination message. It is ALWAYS present (the phase machine is core,
+	// not workspace-gated) and runs AFTER the workspace init so the
+	// .coxswain dir exists (the workspace init creates it; a fresh emptyDir
+	// has none). A fresh phase-init per pod recreation is the mechanism that
+	// re-writes the desired phase after a phase advance (recycleSandboxForPhase
+	// deletes the sandbox; this init re-runs on the new pod). The phase value
+	// is a fixed enum (CRD-validated on status.desiredPhase), but it is
+	// shell-quoted anyway (the init script is sh -c; an unusual-but-valid
+	// value must not inject).
+	initContainers = append(initContainers, corev1.Container{
+		Name:    phaseInitContainerName,
+		Image:   r.workspaceGitImage(),
+		Command: []string{"/bin/sh", "-c", phaseInitScript(loop.Status.DesiredPhase)},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: &falseP,
+			RunAsNonRoot:             &trueP,
+			RunAsUser:                &nonRootUID,
+			RunAsGroup:               &nonRootGID,
+			ReadOnlyRootFilesystem:   &readOnlyRootfs,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+	})
 	volumes := []corev1.Volume{
-		{Name: workspaceVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-			SizeLimit: newLimit("500Mi"),
+		// S4 review P1 (R17): the workspace volume is backed by the per-Loop
+		// PVC (<loop>-workspace, ensureWorkspacePVC) so it SURVIVES the
+		// per-phase pod recycle — a fresh emptyDir per phase wiped PLAN.md and
+		// every Implementing edit (the phase machine ran, but the SDLC it
+		// drives saw the untouched base commit at every phase boundary). The
+		// PVC is controller-owned by the Loop (GC'd with it); init-workspace is
+		// idempotent on it (clone only when /workspace/.git is absent).
+		// scratch + tmp stay emptyDir (ephemeral, per-pod).
+		{Name: workspaceVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: workspacePVCName(loop.Name),
 		}}},
 		{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 			SizeLimit: newLimit("350Mi"),
@@ -889,7 +1006,12 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// with a SubPath that names a missing key makes the kubelet mount an empty
 	// DIRECTORY — the items form names the keys explicitly and fails loud at
 	// pod start instead.)
-	if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" {
+	if loop.Spec.Workspace.Repo != "" && loop.Spec.Workspace.GitCredentialSecret != "" && loop.Status.BaseCommit == "" {
+		// S4 review P1 (R18, ADR-0006): the credential volume exists ONLY for
+		// the first clone (baseCommit empty, init-workspace present). Once the
+		// base SHA is pinned it is omitted — the credential must not sit on the
+		// pod while the agent-controlled .git is present (no init-workspace to
+		// run git against it anymore).
 		volumes = append(volumes, corev1.Volume{
 			Name: workspaceCredsVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
@@ -913,6 +1035,34 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			Name:      sandboxName(loop.Name),
 			Namespace: loop.Namespace,
 		},
+	}
+	// S4: stamp the desired phase so a genuine phase advance (annotation !=
+	// status.desiredPhase) triggers a delete+requeue below. A no-change
+	// re-reconcile leaves the Sandbox untouched.
+	desired.Annotations = map[string]string{
+		sandboxDesiredPhaseAnnotation: string(loop.Status.DesiredPhase),
+	}
+
+	// S4 conditional recycle: if the live Sandbox exists and its annotation
+	// is SET and differs from status.desiredPhase (a genuine phase advance),
+	// delete it. The next reconcile creates a fresh Sandbox with the new
+	// phase's phase-init script. A no-change re-reconcile leaves the Sandbox
+	// untouched (the annotation matches). An EMPTY annotation (a fresh sandbox
+	// or a spec that doesn't manage the annotation) is NOT a mismatch — the
+	// CreateOrUpdate below sets it for the first time.
+	existingSb := &sandboxv1beta1.Sandbox{}
+	if gerr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, existingSb); gerr == nil {
+		staleAnnotation := existingSb.Annotations[sandboxDesiredPhaseAnnotation]
+		if staleAnnotation != "" && staleAnnotation != string(loop.Status.DesiredPhase) {
+			log.Info("sandbox desired-phase annotation differs; deleting for phase advance",
+				"sandbox", sandboxName(loop.Name),
+				"stale", staleAnnotation,
+				"desired", string(loop.Status.DesiredPhase))
+			if derr := r.Delete(ctx, existingSb); derr != nil && !apierrors.IsNotFound(derr) {
+				return fmt.Errorf("delete sandbox for phase advance: %w", derr)
+			}
+			return nil // Sandbox deleted; the next reconcile creates it fresh
+		}
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
@@ -1074,11 +1224,145 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	return nil
 }
 
+// sandboxDesiredPhaseAnnotation is the annotation the operator stamps on the
+// Sandbox with the phase it was built for. ensureSandbox deletes+requeues when
+// the annotation differs from status.desiredPhase (a phase advance), so the
+// phase-init container re-writes .coxswain/desired-phase on the recreated pod.
+// A no-change re-reconcile leaves the Sandbox untouched (I43-friendly).
+const sandboxDesiredPhaseAnnotation = "coxswain.io/desired-phase"
+
 // sandboxName returns the Loop's Sandbox name: <loop>-sandbox. The Loop name
 // is CEL-validated to be a DNS-1035 label of at most 55 chars (D20), so this
 // is always a valid DNS-1035 label <= 63 chars and needs no truncation.
 func sandboxName(loopName string) string {
 	return loopName + "-sandbox"
+}
+
+// workspacePVCName returns the Loop's workspace PVC name: <loop>-workspace.
+// One per-Loop RWO volume backs the sandbox's 'workspace' mount so the
+// workspace SURVIVES the per-phase pod recycle (the S4 review P1: a fresh
+// emptyDir per phase wiped PLAN.md and the Implementing edits, so each phase
+// started from the untouched base). The Loop is the controller owner, so the
+// PVC is garbage-collected with the Loop.
+func workspacePVCName(loopName string) string {
+	return loopName + "-workspace"
+}
+
+// workspacePVCSpec returns the Loop's workspace PVC: RWO (one sandbox at a
+// time per Loop), 1Gi (the workspace clone + phase artifacts; bounded),
+// default StorageClass (nil = the cluster default; in kind the local-path
+// provisioner, WaitForFirstConsumer). The operator creates it idempotently
+// before the sandbox is built.
+func workspacePVCSpec(loop *coxv1alpha1.Loop) *corev1.PersistentVolumeClaim {
+	oneGi := resource.MustParse("1Gi")
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workspacePVCName(loop.Name),
+			Namespace: loop.Namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: oneGi,
+				},
+			},
+		},
+	}
+}
+
+// ensureWorkspacePVC creates the Loop's workspace PVC if it does not exist
+// (idempotent: an existing PVC is left BYTE-IDENTICAL — no spec rewrite, no
+// resourceVersion churn on a no-change reconcile; a phase recycle must NOT
+// replace it, I43). The controller owner ref is set inside the mutate func
+// (the same I2 pattern as the sandbox) so the PVC is GC'd with the Loop.
+// A foreign (non-Loop) owner is never taken over: SetControllerReference
+// returns AlreadyOwnedError and the error is surfaced (the sandbox's I2
+// behaviour). Returns an error only on a real read failure or a foreign owner.
+func (r *LoopReconciler) ensureWorkspacePVC(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workspacePVCName(loop.Name),
+			Namespace: loop.Namespace,
+		},
+	}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
+	if apierrors.IsNotFound(err) {
+		pvc.Spec = workspacePVCSpec(loop).Spec
+		if cerr := controllerutil.SetControllerReference(loop, pvc, r.Scheme); cerr != nil {
+			return fmt.Errorf("set owner on new workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), cerr)
+		}
+		if cerr := r.Create(ctx, pvc); cerr != nil {
+			return fmt.Errorf("create workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), cerr)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), err)
+	}
+	// An existing PVC is left untouched EXCEPT the controller owner ref (the
+	// CreateOrUpdate-style re-assert). The update fires ONLY when the ref is
+	// not already the Loop's (an ownerless PVC after a manual owner-ref strip,
+	// say) — a no-change reconcile writes nothing (no resourceVersion churn),
+	// so a phase recycle never rewrites the PVC (I43).
+	if metav1.IsControlledBy(pvc, loop) {
+		return nil
+	}
+	if err := controllerutil.SetControllerReference(loop, pvc, r.Scheme); err != nil {
+		return fmt.Errorf("set owner on workspace PVC %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), err)
+	}
+	if err := r.Update(ctx, pvc); err != nil {
+		return fmt.Errorf("update workspace PVC owner %s/%s: %w", loop.Namespace, workspacePVCName(loop.Name), err)
+	}
+	return nil
+}
+
+// ensureLoopArtifacts ensures the per-Loop resources the sandbox needs before
+// it is built. Currently just the workspace PVC (S4 review P1, R17): a fresh
+// emptyDir per phase wiped PLAN.md and the Implementing edits, so the workspace
+// is a per-Loop RWO PVC (<loop>-workspace, ensureWorkspacePVC) that survives
+// the per-phase pod recycle; the sandbox's 'workspace' volume references it.
+// Kept as a helper because Reconcile was at gocyclo 31.
+func (r *LoopReconciler) ensureLoopArtifacts(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	return r.ensureWorkspacePVC(ctx, loop)
+}
+
+// recordBaseCommitFromInit records status.baseCommit from the workspace clone's
+// init container termination message (the S3 baseCommit pattern; ADR-0005 D10
+// immutable once set). It returns (pending, changed): pending is true when the
+// clone is still running (the final return requeues on it) and changed is true
+// when the SHA was recorded this reconcile. Extracted from Reconcile for
+// gocyclo; the semantics (bounded requeue, log-only on a failed clone, no early
+// return) are unchanged.
+func (r *LoopReconciler) recordBaseCommitFromInit(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
+	if loop.Spec.Workspace.Repo == "" || loop.Status.BaseCommit != "" {
+		return false, false
+	}
+	sha, done, err := r.resolveBaseCommit(ctx, loop)
+	switch {
+	case err != nil && done:
+		// The init container terminated with a non-SHA message (the clone
+		// failed). Log it; the requeue is bounded (it only fires while the init
+		// has NOT terminated; a permanently-failed init would not change on a
+		// requeue, so once done we stop requeueing for baseCommit).
+		logf.FromContext(ctx).V(1).Info("workspace baseCommit read failed",
+			"loop", loop.Name, "err", err)
+		return false, false
+	case done && sha != "":
+		// The init terminated with a valid SHA: record it (immutable, D10).
+		loop.Status.BaseCommit = sha
+		return false, true
+	default:
+		// The clone is still running (init not terminated yet, or the pod /
+		// init is not yet registered, or a transient read error). Do NOT return
+		// here — the other status changes from this reconcile must still be
+		// persisted by the caller.
+		if err != nil {
+			logf.FromContext(ctx).V(1).Info("workspace baseCommit not yet readable",
+				"loop", loop.Name, "err", err)
+		}
+		return true, false
+	}
 }
 
 // newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit
@@ -2014,7 +2298,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// bounded by its own network use, but the rule itself cannot be scoped to
 	// a single container. Accepted for the MVP; see the PR's Known limitations.
 	if loop.Spec.Workspace.Repo != "" {
-		if peer := repoPeer(loop.Spec.Workspace.Repo); peer != nil {
+		if peer := repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost); peer != nil {
 			port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
 			agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
 				To:    []networkingv1.NetworkPolicyPeer{*peer},
@@ -2435,13 +2719,13 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 // "every pod in this namespace" would open git egress to the whole
 // namespace instead of the named Service's namespace. The repo is a
 // non-secret Loop spec field (workspace.repo).
-func repoPeer(repoURL string) *networkingv1.NetworkPolicyPeer {
+func repoPeer(repoURL string, nsFromHost func(string) (string, bool)) *networkingv1.NetworkPolicyPeer {
 	host := workspaceRepoHost(repoURL)
 	if ip := net.ParseIP(host); ip != nil {
 		cidr := ip.String() + "/32"
 		return &networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}}
 	}
-	if ns, ok := serviceNamespaceFromHost(host); ok {
+	if ns, ok := nsFromHost(host); ok {
 		return &networkingv1.NetworkPolicyPeer{
 			NamespaceSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"kubernetes.io/metadata.name": ns},
@@ -2456,12 +2740,17 @@ func repoPeer(repoURL string) *networkingv1.NetworkPolicyPeer {
 // Service's pods live in (the CRD only allows these hosts over http://, so
 // the operator can always express the egress rule on an enforcing CNI). The
 // namespace is the last label of the host with the ".svc" (and any
-// cluster-domain) suffix stripped. ok=false for any other host.
-func serviceNamespaceFromHost(host string) (string, bool) {
+// cluster-domain) suffix stripped. ok=false for any other host. The FQDN
+// suffix is the OPERATOR's cluster domain (not a hard-coded cluster.local,
+// review #50 P3): the CRD only allows ".svc" / ".svc.cluster.local" forms
+// over plain http, so a custom-domain cluster only ever carries the ".svc"
+// short form and the match below degrades gracefully.
+func (r *LoopReconciler) serviceNamespaceFromHost(host string) (string, bool) {
+	cd := r.clusterDomain()
 	var labels string
 	switch {
-	case strings.HasSuffix(host, ".svc.cluster.local"):
-		labels = strings.TrimSuffix(host, ".svc.cluster.local")
+	case strings.HasSuffix(host, ".svc."+cd):
+		labels = strings.TrimSuffix(host, ".svc."+cd)
 	case strings.HasSuffix(host, ".svc"):
 		labels = strings.TrimSuffix(host, ".svc")
 	default:
@@ -2841,35 +3130,29 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	// refuses the repo with 'detected dubious ownership' (no config-file write
 	// needed — the per-command -c is honoured on every invocation).
 	safeDir := "-c safe.directory=/workspace"
+	// S4 review P1 (R18): this script runs ONLY the first clone (baseCommit
+	// empty), on a FRESH per-Loop PVC — the idempotent re-run branch is gone
+	// because later phases build the pod with no init-workspace and no
+	// credential volume. The clone fails loud (set -eu) so the operator's
+	// read-back rejects a non-SHA termination message.
 	script := `#!/bin/sh
 set -eu
 export GIT_TERMINAL_PROMPT=0
 DEST=/workspace
 REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
-# No ` + "`rm -rf ${DEST}`" + `: ${DEST} is a MOUNT POINT (the emptyDir volume) and cannot be removed.
-# The emptyDir starts empty, so ` + "`git init ${DEST}`" + ` works on the existing empty dir.
-if [ -d "${DEST}/.git" ] && [ -f "${DEST}/.coxswain/base-commit" ]; then
-  # Idempotent: the pod is recreated per Loop (fresh emptyDir), but tolerate a
-  # re-run on the same volume without re-cloning. The base-commit file is the
-  # success marker; a .git without it means the previous run failed mid-clone
-  # (fetch or checkout) and the local repo has no objects — re-run the clone.
-  cd "${DEST}"
-  git ` + safeDir + ` rev-parse --verify HEAD >/dev/null 2>&1 || git ` + safeDir + ` checkout "${REF}"
-else
-  # The volume is a MOUNT POINT (cannot be rm -rf'd). If a previous run left a
-  # half-cloned repo (.git present but no success marker), wipe its contents
-  # (never the mount point itself) so the clone starts clean. rm -rf is
-  # scoped to the .git dir, not ${DEST}.
-  if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
-  rm -rf "${DEST}/.coxswain"
-  mkdir -p "${DEST}"
+# The volume is a MOUNT POINT (cannot be rm -rf'd). If a previous run left a
+# half-cloned repo (.git present but no success marker), wipe its contents
+# (never the mount point itself) so the clone starts clean. rm -rf is scoped
+# to the .git dir, not ${DEST}.
+if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
+rm -rf "${DEST}/.coxswain"
+mkdir -p "${DEST}"
 
-  git ` + safeDir + ` init "${DEST}"
-  git -C "${DEST}" ` + safeDir + ` remote add origin "${REPO}"
+git ` + safeDir + ` init "${DEST}"
+git -C "${DEST}" ` + safeDir + ` remote add origin "${REPO}"
 ` + authLine + `  git ` + safeDir + ` -C "${DEST}" -c user.name=coxswain -c user.email=coxswain@localhost` + fetchCred + ` fetch origin "${REF}"
-  git -C "${DEST}" ` + safeDir + ` checkout --detach FETCH_HEAD
-fi
+git -C "${DEST}" ` + safeDir + ` checkout --detach FETCH_HEAD
 mkdir -p "${DEST}/.coxswain"
 SHA=$(git -C "${DEST}" ` + safeDir + ` rev-parse HEAD)
 # Write the resolved SHA to the base-commit file AND to the termination log.
@@ -2915,6 +3198,35 @@ echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
 // unusual-but-valid value cannot inject shell.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'''`) + "'"
+}
+
+// phaseInitScript (S4, ADR-0004) returns the sh script the phase-init container
+// runs: it materialises the operator's status.desiredPhase into
+// <workspace>/.coxswain/desired-phase (the one-shot runner's read channel).
+// The operator is the sole writer of the phase (ADR-0004) — the runner reads
+// it, does the phase's work, and exits with the claim; it never chooses the
+// phase itself. The value is a CRD-validated enum (status.desiredPhase), but
+// it is shell-quoted anyway (the script is sh -c; an unusual-but-valid value
+// must not inject). An EMPTY desired phase writes nothing (the runner waits
+// for the operator to set one; the operator's first reconcile sets
+// status.desiredPhase = Planning for a fresh Loop — see the S4 advance path).
+func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase) string {
+	if desiredPhase == "" {
+		return `#!/bin/sh
+set -eu
+# No desired phase set yet: the operator has not advanced this Loop past
+# Pending (a fresh Loop's first reconcile sets status.desiredPhase =
+# Planning). Write nothing so the one-shot runner waits (it exits 0 with no
+# claim until a desired phase appears) instead of erroring.
+exit 0
+`
+	}
+	return `#!/bin/sh
+set -eu
+DEST=/workspace
+mkdir -p "${DEST}/.coxswain"
+printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"
+`
 }
 
 // proxyImage returns the model proxy pod image. It is the reconciler's

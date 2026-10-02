@@ -419,6 +419,66 @@ spec:
                       was allowed to do in each iteration (D32). Empty when no policy is applied.
                     type: string
                 type: object
+              progress:
+                description: |-
+                  progress is the operator's structured progress record (R19 OS1),
+                  populated from the runner's ADR-0004 claim (the agent container's
+                  termination message) plus the operator's own pin. It is a CLAIM, not a
+                  gate input (ADR-0005): size-limited and strict-parsed on read, and no
+                  gate reads it. Written only when the operator has actually read a claim;
+                  nil before the first claim. +optional
+                properties:
+                  baseCommit:
+                    description: |-
+                      baseCommit is the commit pin the operator read the claim against (the
+                      status.baseCommit pin, D10 — the claim cannot set it for itself).
+                    type: string
+                  blockedReason:
+                    description: |-
+                      blockedReason is the claim's reason when lastResultStatus is blocked
+                      (size-limited on read).
+                    type: string
+                  iteration:
+                    description: |-
+                      iteration is the iteration the claim named (the runner's record of the
+                      .coxswain/iteration it read; the operator's own status.iteration is the
+                      authoritative count).
+                    type: integer
+                  lastActivityTime:
+                    description: |-
+                      lastActivityTime is the operator's record of when the last claim arrived
+                      (the agent container's finish time, kubelet-recorded — not the runner's
+                      clock).
+                    format: date-time
+                    type: string
+                  lastResultStatus:
+                    description: |-
+                      lastResultStatus is the claim's status (success/blocked) for the last
+                      phase run.
+                    type: string
+                  observedGeneration:
+                    description: |-
+                      observedGeneration is the spec generation the pin the operator read the
+                      claim against (the operator's pin, not the claim's — a claim can never
+                      name a generation for itself).
+                    format: int64
+                    type: integer
+                  phase:
+                    description: |-
+                      phase is the phase the claim named (the runner's reported
+                      observedPhase, validated against the operator's enum).
+                    enum:
+                    - Pending
+                    - Planning
+                    - AwaitingApproval
+                    - Implementing
+                    - Verifying
+                    - Succeeded
+                    - Failed
+                    - Paused
+                    - CleaningUp
+                    type: string
+                type: object
               verify:
                 description: |-
                   verify carries the operator's record of the last verify run's evidence

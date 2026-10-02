@@ -91,6 +91,18 @@ var _ = Describe("Loop Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
+			// S4 (ADR-0004): the option-B bootstrap (Pending -> Planning) recycles
+			// the just-created sandbox so the phase-init container writes the NEW
+			// desired phase on the recreated pod (one container run per phase).
+			// Recreate the sandbox here — the same way every other spec in this
+			// file drives the claim — and re-reconcile so the operator re-ensures
+			// it before the assertions.
+			_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: resourceName + "-sandbox", Namespace: resourceNamespace}})
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
 			By("checking the Loop got a Sandbox")
 			sandbox := &sandboxv1beta1.Sandbox{}
 			sandboxName := types.NamespacedName{
@@ -101,9 +113,10 @@ var _ = Describe("Loop Controller", func() {
 			Expect(sandbox.OwnerReferences).To(HaveLen(1))
 			Expect(sandbox.OwnerReferences[0].Name).To(Equal(resourceName))
 
-			By("checking the Loop phase advanced to Pending")
+			By("checking the Loop phase advanced to Planning (the S4 option-B bootstrap: a fresh Loop starts at Planning)")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, loop)).To(Succeed())
-			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePending))
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning), "S4 (option B): a fresh Loop starts the phase machine at Planning")
+			Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 			Expect(loop.Status.ObservedGeneration).To(Equal(loop.Generation))
 
 			By("reconciling again is idempotent (no second sandbox)")

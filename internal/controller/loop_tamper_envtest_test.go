@@ -20,8 +20,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -49,20 +51,42 @@ const b2Commit = "deadbeef"
 var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func() {
 	ctx := context.Background()
 
-	// driveToVerifying drives a fresh Loop through the B1 claim path to Verifying.
+	// ensureB2Sandbox creates the sandbox object if the recycle (or a previous
+	// advance) deleted it (the specs' stand-in for the operator's own
+	// ensureSandbox on the next reconcile; envtest has no agent-sandbox
+	// controller to run the real one). Declared before driveToVerifying so the
+	// closure captures it.
+	ensureB2Sandbox := func(nn types.NamespacedName) {
+		sb := &sandboxv1beta1.Sandbox{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: nn.Name + "-sandbox", Namespace: nn.Namespace}, sb); apierrors.IsNotFound(err) {
+			_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: nn.Name + "-sandbox", Namespace: nn.Namespace},
+			})
+		}
+	}
+
+	// driveToVerifying drives a fresh Loop through the B1 claim path to
+	// Verifying. R17 (2026-10-03): the claims are injected via the readPhaseClaim
+	// seam (the legacy drive-by-status.observedPhase was deleted with the B1
+	// production seam): the runner's claim for the phase it EXECUTED (the current
+	// phase, status success) completes that phase and advances the machine one
+	// step (claimPhaseForAdvance + nextPhase). The bootstrap moved Pending ->
+	// Planning on the first reconcile, so the effective steps are the two
+	// completed-phase claims (Planning, then Implementing).
 	driveToVerifying := func(nn types.NamespacedName) {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		for _, reported := range []coxv1alpha1.LoopPhase{
+		ensureB2Sandbox(nn)
+		for _, executed := range []coxv1alpha1.LoopPhase{
 			coxv1alpha1.LoopPhasePlanning,
 			coxv1alpha1.LoopPhaseImplementing,
-			coxv1alpha1.LoopPhaseVerifying,
 		} {
-			loop := &coxv1alpha1.Loop{}
-			Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-			loop.Status.ObservedPhase = reported
-			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return &PhaseClaim{ObservedPhase: executed, Status: claimSuccess}, nil
+			}
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 			Expect(err).NotTo(HaveOccurred())
+			r.readPhaseClaim = nil
+			ensureB2Sandbox(nn) // the advance recycles the sandbox; recreate it for the next claim
 		}
 	}
 

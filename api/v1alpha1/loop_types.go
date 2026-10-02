@@ -373,6 +373,58 @@ type LoopStatus struct {
 	// canonical effective allows, so the decision audit shows what the agent was
 	// allowed to do (D32); it is set by the operator, never the agent. +optional
 	Policy *PolicyStatus `json:"policy,omitempty"`
+
+	// progress is the operator's structured progress record (R19 OS1),
+	// populated from the runner's ADR-0004 claim (the agent container's
+	// termination message) plus the operator's own pin. It is a CLAIM, not a
+	// gate input (ADR-0005): size-limited and strict-parsed on read, and no
+	// gate reads it. Written only when the operator has actually read a claim;
+	// nil before the first claim. +optional
+	Progress *ProgressStatus `json:"progress,omitempty"`
+}
+
+// ProgressStatus is the operator's structured progress record (R19 OS1). The
+// fields the runner CANNOT set for itself (lastActivityTime, the generation/
+// commit pins) are the operator's own; the rest are copied from the claim
+// unchanged (size-limited, strict-parsed, never a gate input — ADR-0005).
+type ProgressStatus struct {
+	// phase is the phase the claim named (the runner's reported
+	// observedPhase, validated against the operator's enum).
+	// +optional
+	Phase LoopPhase `json:"phase,omitempty"`
+
+	// lastActivityTime is the operator's record of when the last claim arrived
+	// (the agent container's finish time, kubelet-recorded — not the runner's
+	// clock).
+	// +optional
+	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
+
+	// iteration is the iteration the claim named (the runner's record of the
+	// .coxswain/iteration it read; the operator's own status.iteration is the
+	// authoritative count).
+	// +optional
+	Iteration int `json:"iteration,omitempty"`
+
+	// lastResultStatus is the claim's status (success/blocked) for the last
+	// phase run.
+	// +optional
+	LastResultStatus string `json:"lastResultStatus,omitempty"`
+
+	// blockedReason is the claim's reason when lastResultStatus is blocked
+	// (size-limited on read).
+	// +optional
+	BlockedReason string `json:"blockedReason,omitempty"`
+
+	// observedGeneration is the spec generation the pin the operator read the
+	// claim against (the operator's pin, not the claim's — a claim can never
+	// name a generation for itself).
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// baseCommit is the commit pin the operator read the claim against (the
+	// status.baseCommit pin, D10 — the claim cannot set it for itself).
+	// +optional
+	BaseCommit string `json:"baseCommit,omitempty"`
 }
 
 // +kubebuilder:object:root=true

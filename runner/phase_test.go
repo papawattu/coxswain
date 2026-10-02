@@ -305,7 +305,14 @@ func TestPhaseRunIterationChangeDiscardsConversation(t *testing.T) {
 	}
 
 	// Run 2: Planning under iteration "2". Its first request must NOT carry
-	// run 1's assistant turn (the conversation was discarded).
+	// run 1's assistant turn (the conversation was discarded). The prior
+	// result (run 1's COMPLETED claim, same desired phase) is deleted so the
+	// restart-safety re-emit does not short-circuit the phase run (in a live
+	// pod a phase change recycles the pod — fresh emptyDir, fresh result.json
+	// — and the conversation file is discarded on a phase boundary by the pod).
+	if err := os.Remove(filepath.Join(ws, resultDirName, resultFileName)); err != nil {
+		t.Fatal(err)
+	}
 	writeDesiredPhase(t, ws, PhasePlanning)
 	cfg2 := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
 		PollInterval: 5 * time.Millisecond}
@@ -316,9 +323,171 @@ func TestPhaseRunIterationChangeDiscardsConversation(t *testing.T) {
 	}
 	last := fake.Requests[len(fake.Requests)-1]
 	for _, m := range last.Messages {
-		if m.Role == "assistant" && strings.Contains(m.Content, "PLAN-A") {
+		if m.Role == jsonRoleAssistant && strings.Contains(m.Content, "PLAN-A") {
 			t.Fatalf("A4: a changed iteration must discard the prior conversation; run 2 carried run 1's assistant turn: %+v",
 				last.Messages)
 		}
+	}
+}
+
+// TestPhaseRunLoadedConversationDropsSystemMessage (reviewer root cause 1):
+// a persisted A4 conversation that contains a system message (the previous
+// run's res.toolConversation includes the fresh system prompt at index 0)
+// must NOT produce a second system message in the next run's model request.
+// vLLM with the qwen chat template rejects a second system message with
+// HTTP 400 "System message must be at the beginning." — the claim ended
+// blocked and the sandbox CrashLooped on the live run. The loader filters
+// role=system so the request carries exactly one system message, at 0.
+func TestPhaseRunLoadedConversationDropsSystemMessage(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{Content: "plan-drops"},
+		testhelper.ModelResponse{Content: "plan: two"})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	// Seed the workspace as if a prior run under iteration "1" left a
+	// conversation that INCLUDES a system message (the real shape of
+	// res.toolConversation: system prompt at index 0).
+	if err := os.MkdirAll(filepath.Join(ws, resultDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := conversationState{Iteration: "1", Messages: []chatMessage{
+		{Role: jsonRoleSystem, Content: "a stale system message from the prior run"},
+		{Role: jsonRoleUser, Content: "earlier question"},
+		{Role: jsonRoleAssistant, Content: "earlier answer"},
+	}}
+	data, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, resultDirName, conversationFileName), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, resultDirName, iterationFileName), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A blocked prior result (same phase) is NOT re-emitted (it may retry)
+	// — but here there is no prior result at all, which is the normal
+	// fresh-pod shape for the second phase.
+	writeDesiredPhase(t, ws, PhasePlanning)
+	stop := make(chan any)
+	cfg := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}
+	res := PhaseRun(cfg, stop)
+	if res.Status != statusSuccess {
+		t.Fatalf("phase status = %q, want %q (notes: %s)", res.Status, statusSuccess, res.VerificationNotes)
+	}
+	if len(fake.Requests) != 1 {
+		t.Fatalf("got %d model requests, want exactly 1", len(fake.Requests))
+	}
+	msgs := fake.Requests[0].Messages
+	var systemIdx []int
+	for i, m := range msgs {
+		if m.Role == jsonRoleSystem {
+			systemIdx = append(systemIdx, i)
+		}
+	}
+	if len(systemIdx) != 1 || systemIdx[0] != 0 {
+		t.Fatalf("request must carry exactly ONE system message at index 0; got %d system messages at %v",
+			len(systemIdx), systemIdx)
+	}
+	// The stale system message content must not appear anywhere.
+	for _, m := range msgs {
+		if strings.Contains(m.Content, "stale system message") {
+			t.Fatalf("request carried the prior run's system message content: %q", m.Content)
+		}
+	}
+	// The non-system history must be carried (user/assistant survive the filter).
+	foundUser, foundAssistant := false, false
+	for _, m := range msgs {
+		if m.Role == jsonRoleUser && m.Content == "earlier question" {
+			foundUser = true
+		}
+		if m.Role == jsonRoleAssistant && m.Content == "earlier answer" {
+			foundAssistant = true
+		}
+	}
+	if !foundUser || !foundAssistant {
+		t.Fatalf("loaded conversation must carry the user/assistant turns (user=%v assistant=%v): %+v",
+			foundUser, foundAssistant, msgs)
+	}
+	if _, err := os.Stat(claimPath); err != nil {
+		t.Fatalf("claim must be written: %v", err)
+	}
+}
+
+// TestPhaseRunReEmitsCompletedClaimWithoutModelCall (reviewer root cause 3):
+// the sandbox pod's restartPolicy is Always, so a one-shot exit restarts the
+// agent container. When result.json already holds a COMPLETED claim for the
+// current desired phase (status=success, observedPhase == phase), the
+// restart must NOT call the model — it re-emits the prior claim to the
+// termination log and exits. A BLOCKED prior claim may retry (it is NOT
+// re-emitted).
+func TestPhaseRunReEmitsCompletedClaimWithoutModelCall(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{Content: "plan-reemit"})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhasePlanning)
+	stop := make(chan any)
+	cfg := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}
+	first := PhaseRun(cfg, stop)
+	if first.Status != statusSuccess {
+		t.Fatalf("first run status = %q, want %q (notes: %s)", first.Status, statusSuccess, first.VerificationNotes)
+	}
+	if len(fake.Requests) != 1 {
+		t.Fatalf("first run: got %d model requests, want 1", len(fake.Requests))
+	}
+	// The kubelet would now restart the agent container (the pod is still
+	// there; result.json + conversation.json are on the workspace volume).
+	// The fresh process must re-emit the completed claim WITHOUT a model call.
+	// Clear the claim file so the test asserts the RE-EMIT wrote it.
+	if err := os.Remove(claimPath); err != nil {
+		t.Fatal(err)
+	}
+	restart := PhaseRun(cfg, stop)
+	if restart.Status != statusSuccess {
+		t.Fatalf("restart status = %q, want %q (re-emit must carry the prior claim)", restart.Status, statusSuccess)
+	}
+	if len(fake.Requests) != 1 {
+		t.Fatalf("restart: got %d model requests, want 1 (no new model call on a completed prior claim)", len(fake.Requests))
+	}
+	claim := parseClaim(t, claimPath)
+	if claim["observedPhase"] != PhasePlanning || claim["status"] != statusSuccess {
+		t.Fatalf("re-emitted claim = %v, want observedPhase=Planning status=success", claim)
+	}
+}
+
+// TestPhaseRunBlockedClaimRetries (the companion case): a prior BLOCKED claim
+// for the same desired phase is NOT re-emitted — the phase retries (the model
+// failure was likely transient; the kubelet's restart back-off caps the rate).
+func TestPhaseRunBlockedClaimRetries(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{Content: "plan-blocked"})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhasePlanning)
+	stop := make(chan any)
+	cfg := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}
+	// Plant a BLOCKED prior result for the current phase (as if a prior run
+	// ended blocked and the container restarted).
+	blocked := Result{Status: statusBlocked, ObservedPhase: PhasePlanning, VerificationNotes: "model timeout"}
+	if err := writeResult(filepath.Join(ws, resultDirName, resultFileName), blocked); err != nil {
+		t.Fatal(err)
+	}
+	PhaseRun(cfg, stop)
+	if len(fake.Requests) != 1 {
+		t.Fatalf("blocked prior claim must retry the phase: got %d model requests, want 1", len(fake.Requests))
+	}
+	claim := parseClaim(t, claimPath)
+	if claim["status"] != statusSuccess {
+		t.Fatalf("after the retry, the claim must be success (the retry drove the model): %v", claim)
 	}
 }

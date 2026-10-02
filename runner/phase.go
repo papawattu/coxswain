@@ -191,6 +191,19 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		return Result{}
 	}
 
+	// Restart-safety: the sandbox pod's restartPolicy is Always, so a
+	// one-shot exit RESTARTS the agent container and re-runs the phase.
+	// If result.json already holds a COMPLETED claim for the current
+	// desired phase (status=success, observedPhase == phase), this restart
+	// must NOT call the model again — it re-emits the prior claim to the
+	// termination log (exit 0) and stops. A BLOCKED claim is NOT re-emitted:
+	// it may retry (the model failure was likely transient), and the
+	// kubelet's back-off caps the retry rate.
+	if res, done := priorCompletedResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), phase); done {
+		writeClaim(claimWritePath, res)
+		return res
+	}
+
 	// A4: the conversation (the previous phase's messages, when the pod was
 	// not recycled) is the starting history. A new iteration (the
 	// operator-written .coxswain/iteration changed since the conversation
@@ -240,6 +253,30 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	}
 	writeClaim(claimWritePath, res)
 	return res
+}
+
+// priorCompletedResult reads result.json and, when it holds a COMPLETED claim
+// for the given desired phase (status=success AND observedPhase == phase),
+// returns that Result (re-emitted to the termination log WITHOUT a model
+// call — the restart-safety path). It returns (Result{}, false) when there is
+// no prior result, or the prior result is for a DIFFERENT phase (a stale
+// result from before a phase advance: the fresh pod's phase-init has written
+// the new desired phase, and the phase must run), or the prior result is
+// BLOCKED (a blocked phase may retry — the model failure was likely
+// transient — and the kubelet's restart back-off caps the retry rate).
+func priorCompletedResult(resultPath, phase string) (Result, bool) {
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		return Result{}, false
+	}
+	var res Result
+	if err := json.Unmarshal(data, &res); err != nil {
+		return Result{}, false
+	}
+	if res.Status != statusSuccess || res.ObservedPhase != phase {
+		return Result{}, false
+	}
+	return res, true
 }
 
 // awaitDesiredPhase polls <workspace>/.coxswain/desired-phase until it is
@@ -458,6 +495,14 @@ type conversationState struct {
 // readConversation reads the persisted A4 conversation state from path. A
 // missing/corrupt/oversized file is (nil, "") (no conversation — the safe
 // default: the phase starts fresh from the repo).
+//
+// System messages are DROPPED from the loaded conversation: drivePhaseOnce
+// prepends a fresh system prompt (jsonRoleSystem) at index 0, and the model
+// endpoint (vLLM with the qwen chat template) rejects a request that carries
+// a second system message ("System message must be at the beginning."). A
+// persisted conversation may contain the previous run's system prompt
+// (res.toolConversation includes it), so the load must filter it — the
+// loaded history carries only user/assistant/tool turns.
 func readConversation(path string) ([]chatMessage, string) {
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) > maxConversationBytes {
@@ -467,7 +512,14 @@ func readConversation(path string) ([]chatMessage, string) {
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, ""
 	}
-	return st.Messages, st.Iteration
+	msgs := make([]chatMessage, 0, len(st.Messages))
+	for _, m := range st.Messages {
+		if m.Role == jsonRoleSystem {
+			continue
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, st.Iteration
 }
 
 // writeConversationState persists the A4 conversation state to path (the

@@ -36,11 +36,11 @@ spec:
   verify:
     acceptanceChecks:
       - go build ./...
-      - go vet ./...
       - go test -run 'TestRound' ./...
     preset: go
     protectedPaths:
       - round_test.go
+      - main_test.go
   agent:
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
@@ -76,8 +76,9 @@ untouched (tamper check 0).
 > `gocli` prints a bare number. Add a `-json` flag: with `-json`, print the
 > result as JSON `{"value": <in>, "places": <n>, "rounded": <r>}` on one
 > line instead of the bare number. The existing plain output and the
-> existing tests must keep working unchanged; add a `TestMainJSON` to
-> `main_test.go` covering the flag.
+> existing tests must keep working unchanged; the `TestMainJSON` test in
+> `main_test.go` (a protected path) is already in the tree and must pass on
+> the tests as written.
 
 **Loop spec:**
 
@@ -94,13 +95,13 @@ spec:
     gitCredentialSecret: gitea-clone
   verify:
     acceptanceChecks:
-      - test -f main_test.go
       - go build ./...
-      - go vet ./...
-      - go test -run 'TestMainJSON' ./...
+      - go vet -tags task2 ./...
+      - go test -tags task2 -run 'TestMainJSON' ./...
     preset: go
     protectedPaths:
       - round_test.go
+      - main_test.go
   agent:
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
@@ -112,5 +113,6 @@ spec:
 **AgentPolicy:** same as task 1 (`gocli-task-2`, same spec).
 
 **Expected evidence:** plain run still prints the bare number; `-json`
-prints the JSON object; `TestMainJSON` green; reference fix `tasks/2.patch`.
-(Applied on top of task 1's state, so `Round` is already fixed.)
+prints the JSON object; `TestMainJSON` green (the protected `main_test.go` is
+untouched); reference fix `tasks/2.patch` adds `json.go` and the `-json`
+branch in `main.go` only (implementation-only).

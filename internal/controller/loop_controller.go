@@ -417,8 +417,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	claimReadPending, s4Changed := r.advancePhaseFromClaim(ctx, &loop)
 	changed = changed || s4Changed
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
-	// gate (see applyTamperGate for the tri-state logic).
-	changed = changed || r.applyTamperGate(&loop)
+	// gate (see applyTamperGate for the tri-state logic). The gate must run
+	// every reconcile — calling it into a local and only then OR-ing into
+	// changed (changed = changed || r.applyTamperGate(...)) would short-circuit
+	// the call whenever changed was already true this reconcile, skipping the
+	// security gate (the red B2 tamper spec).
+	if r.applyTamperGate(&loop) {
+		changed = true
+	}
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references
 	// (spec.policyRefs[]). The operator computes the hash and stores it in
@@ -597,6 +603,7 @@ func isCommitSHA(s string) bool {
 // was applied (false when policyRefs is empty — the default-deny minimum). A
 // referenced AgentPolicy that does not exist is an error (the operator must not
 // silently run an agent with a narrower policy than the Loop declared).
+
 // applyTamperGate (B2, D10/D24) applies the tamper-evidence gate at Verifying.
 // tamperVerdict is a tri-state over the operator's evidence (a pointer to the
 // terminated tamper init container's exit code + the verifiedCommit it names),

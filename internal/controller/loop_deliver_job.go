@@ -653,7 +653,10 @@ if [ -n "${EXISTING}" ]; then
 else
   PAYLOAD=$(printf '{"title":"coxswain: %s","head":"%s","base":"%s","body":"Delivered by coxswain from verified commit %s.","draft":%s}' \
     "${BRANCH}" "${BRANCH}" "${BASE}" "${PINNED}" "${DRAFT}")
-  PR_NUM=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+  # Gitea's PR create can reject a non-existent base branch; the push above
+  # already pushed the delivery branch, and the base branch exists on the
+  # remote (clone-base fetched it) — a failed create is a hard failure.
+  PR_NUM=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p') || { echo "deliver push: PR create failed (see API response)"; exit 1; }
 fi
 [ -n "${PR_NUM}" ] || { echo "deliver push: no PR number returned (API unreachable or refused)"; exit 1; }
 # Write the result to the termination log (the operator reads it via the

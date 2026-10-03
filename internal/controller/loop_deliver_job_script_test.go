@@ -73,8 +73,9 @@ func TestDeliverCloneImportScriptsInSequence(t *testing.T) {
 	loop := &coxv1alpha1.Loop{
 		Spec: coxv1alpha1.LoopSpec{
 			Workspace: coxv1alpha1.Workspace{
-				Repo: agentRepo + "/.git",
-				Ref:  baseBranch,
+				Repo:                agentRepo + "/.git",
+				Ref:                 baseBranch,
+				GitCredentialSecret: testCredSecretName,
 			},
 		},
 		Status: coxv1alpha1.LoopStatus{
@@ -118,6 +119,28 @@ func TestDeliverCloneImportScriptsInSequence(t *testing.T) {
 	if out, err := exec.Command("git", "-C", scratch, "diff", "--quiet", verifySHA).CombinedOutput(); err != nil {
 		t.Fatalf("working tree differs from the pinned commit after import-agent: %v (output: %s)", err, string(out))
 	}
+
+	// Push script credential ordering (kind-run s6b finding): the git push
+	// line uses $AUTH via -c http.extraHeader, so the AUTH assignment must
+	// come BEFORE the push in the script. A push line preceding the AUTH
+	// definition dies under set -u ('AUTH: parameter not set') before
+	// anything is pushed. The envtests never execute the scripts — this is
+	// the cheap static check that catches the ordering.
+	pushScript := deliverContainerScript(t, r.deliverPushContainer(loop, verifySHA, "coxswain/task", "main"))
+	if !strings.Contains(pushScript, "$AUTH") {
+		t.Fatal("push script does not reference $AUTH; the credential ordering check is vacuous (did the push script shape change?)")
+	}
+	authIdx := strings.Index(pushScript, "AUTH=$(printf")
+	if authIdx < 0 {
+		t.Fatal("push script (cred mode) is missing the AUTH assignment line")
+	}
+	pushIdx := strings.Index(pushScript, "push origin")
+	if pushIdx < 0 {
+		t.Fatal("push script is missing the 'push origin' line")
+	}
+	if pushIdx < authIdx {
+		t.Fatalf("push script references $AUTH (push at offset %d) before the AUTH assignment (offset %d); set -u kills the push with 'AUTH: parameter not set'", pushIdx, authIdx)
+	}
 }
 
 // deliverContainerScript extracts the shell script from a container built as
@@ -134,9 +157,10 @@ func deliverContainerScript(t *testing.T, c corev1.Container) string {
 
 // rewriteDeliverScriptPaths rewrites the pod paths in a deliver script to
 // the test's local stand-ins: /deliver -> the scratch dir, /agent-src ->
-// the agent repo, /workspace-creds -> a scratch credentials dir (the test
-// Loops declare no gitCredentialSecret, so the credential lines are absent
-// and only the path constants are rewritten).
+// the agent repo, /workspace-creds -> a scratch credentials dir. The clone
+// and import scripts never reference the credential mount (the test's
+// import check does not need the credential files; clone-base's origin
+// fetch is a local file:// fetch that needs no auth).
 func rewriteDeliverScriptPaths(script, scratch, agentRepo string) string {
 	script = strings.ReplaceAll(script, deliverScratchPath, scratch)
 	script = strings.ReplaceAll(script, deliverAgentSrc, agentRepo)

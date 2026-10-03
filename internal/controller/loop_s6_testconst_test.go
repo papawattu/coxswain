@@ -28,6 +28,10 @@ const (
 	defaultNamespace = "default"
 	baseBranch       = "main"
 
+	// testCredSecretName is the git-credential Secret name the deliver
+	// script test fixture references (goconst: 3+ occurrences).
+	testCredSecretName = "test-cred"
+
 	// corePodsResource is the core Pods RBAC resource name (goconst).
 	corePodsResource = "pods"
 )

@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"strings"
 
+	networkingv1 "k8s.io/api/networking/v1"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
@@ -254,6 +256,43 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Expect(*sc.ReadOnlyRootFilesystem).To(BeTrue())
 			Expect(*sc.AllowPrivilegeEscalation).To(BeFalse())
 		}
+
+		By("clone-base fetches baseCommit from origin, NOT verifiedCommit (fix a)")
+		cloneCmd := inits[0].Command[2]
+		Expect(cloneCmd).To(ContainSubstring(s5aBaseCommit),
+			"clone-base must reference the pinned baseCommit")
+		Expect(cloneCmd).NotTo(ContainSubstring(s5aHeadCommit),
+			"clone-base must NOT reference verifiedCommit (it's not on origin)")
+
+		By("import-agent uses git fetch from file:///agent-src/.git, NOT tar (fix c)")
+		importCmd := inits[1].Command[2]
+		Expect(importCmd).NotTo(ContainSubstring("tar"),
+			"import-agent must NOT use tar (working-tree copy is the tamper bypass)")
+		Expect(importCmd).To(ContainSubstring("file:///agent-src/.git"),
+			"import-agent must fetch from the agent's .git via file://")
+		Expect(importCmd).To(ContainSubstring("core.hooksPath=/dev/null"),
+			"import-agent must disable hooks (the agent's hooks must not run)")
+		Expect(importCmd).To(ContainSubstring(s5aHeadCommit),
+			"import-agent must fetch the verifiedCommit")
+
+		By("import-agent sets safe.directory via GIT_CONFIG_COUNT env (fix c)")
+		hasSafeDir := false
+		for _, env := range inits[1].Env {
+			if env.Name == "GIT_CONFIG_VALUE_0" && env.Value == "/agent-src/.git" {
+				hasSafeDir = true
+			}
+		}
+		Expect(hasSafeDir).To(BeTrue(),
+			"import-agent must set safe.directory=/agent-src/.git via env (different-owner repo)")
+
+		By("import-agent mounts the PVC read-only with no creds (fix c)")
+		for _, vm := range inits[1].VolumeMounts {
+			if vm.Name == "agent-workspace" {
+				Expect(vm.ReadOnly).To(BeTrue())
+			}
+			Expect(vm.Name).NotTo(Equal("git-cred"),
+				"import-agent must not mount the git credential")
+		}
 	})
 
 	It("does NOT advance to Verifying on a malformed headCommit (strict 40-hex, ADR-0005)", func() {
@@ -474,5 +513,117 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// The reconcile requeues (the verify reader's no-evidence requeue).
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("clone-base uses the S3a printf-based basic-auth header when a credential secret is declared (fix b)", func() {
+		ns := "s5a-cred-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "credloop"
+		ws := testWorkspace()
+		ws.GitCredentialSecret = "samples-git-cred"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: ws,
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+			},
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		jobName := fmt.Sprintf("%s-verify-1", name)
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)).To(Succeed())
+
+		cloneCt := job.Spec.Template.Spec.InitContainers[0]
+		Expect(cloneCt.Name).To(Equal(s5aCloneBase))
+		cloneCmd := cloneCt.Command[2]
+		// The auth header uses the printf '%s:%s' pattern with BOTH username and password.
+		Expect(cloneCmd).To(ContainSubstring("printf '%s:%s'"),
+			"the auth header must use the S3a printf pattern (username:password)")
+		Expect(cloneCmd).To(ContainSubstring("/git-cred/username"),
+			"the auth header must read the username from the secret mount")
+		Expect(cloneCmd).To(ContainSubstring("/git-cred/password"),
+			"the auth header must read the PASSWORD from the secret mount (fix b)")
+		// clone-base fetches baseCommit, not verifiedCommit.
+		Expect(cloneCmd).To(ContainSubstring(s5aBaseCommit))
+		Expect(cloneCmd).NotTo(ContainSubstring(s5aHeadCommit))
+		// The credential mount is present.
+		hasCredMount := false
+		for _, vm := range cloneCt.VolumeMounts {
+			if vm.Name == "git-cred" && vm.ReadOnly {
+				hasCredMount = true
+			}
+		}
+		Expect(hasCredMount).To(BeTrue(), "clone-base must mount the git-cred secret read-only")
+	})
+
+	It("updates the verify NetworkPolicy when the repo port changes (I42c pattern, fix d)", func() {
+		ns := "s5a-netpol-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "netpolloop"
+		// First, create the Loop with a repo on port 3000.
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{"username": []byte("u"), "password": []byte("p")},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: "http://gitea.coxswain-ns.svc:3000/org/repo.git", GitCredentialSecret: "test-cred"},
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+			},
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		npolName := name + "-verify-netpol"
+		npol := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: npolName, Namespace: ns}, npol)).To(Succeed())
+		// The initial port is 3000.
+		var portBefore int32
+		for _, rule := range npol.Spec.Egress {
+			for _, p := range rule.Ports {
+				if p.Port.IntValue() != 53 { // skip DNS
+					portBefore = p.Port.IntVal
+				}
+			}
+		}
+		Expect(portBefore).To(Equal(int32(3000)))
+
+		// Change the repo to a different port (8080) and reconcile again.
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Spec.Workspace.Repo = "http://gitea.coxswain-ns.svc:8080/org/repo.git"
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+
+		// Reconcile: the NetworkPolicy must be UPDATED (I42c — not frozen).
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: npolName, Namespace: ns}, npol)).To(Succeed())
+		var portAfter int32
+		for _, rule := range npol.Spec.Egress {
+			for _, p := range rule.Ports {
+				if p.Port.IntValue() != 53 {
+					portAfter = p.Port.IntVal
+				}
+			}
+		}
+		Expect(portAfter).To(Equal(int32(8080)),
+			"the verify NetworkPolicy must be UPDATED when the repo port changes (I42c)")
 	})
 })

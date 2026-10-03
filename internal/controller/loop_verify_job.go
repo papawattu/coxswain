@@ -208,16 +208,16 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		loop.Spec.Verify.ProtectedPaths, loop.Spec.Verify.ProtectedPathsOverride)
 	globArgs := strings.Join(globs, "\n")
 
-	// The trusted clone-base init: a FRESH clone of the repo at the pinned
-	// SHA into /verify (emptyDir). It is the ONLY container that touches
-	// credentials — and only the git basic-auth secret (if the Loop declares
-	// one), mounted into this container ALONE. It fetches both baseCommit and
-	// verifiedCommit (the tamper diff needs both SHAs reachable; a single-SHA
-	// shallow fetch would leave baseCommit absent).
+	// The trusted clone-base init: fetches baseCommit from origin into /verify
+	// (emptyDir). It is the ONLY container that touches credentials — and
+	// only the git basic-auth secret (if the Loop declares one), mounted into
+	// this container ALONE. It fetches ONLY baseCommit (the verifiedCommit
+	// was committed locally by the agent and is not on origin; import-agent
+	// fetches it from the workspace PVC).
 	cloneCt := corev1.Container{
 		Name:            "clone-base",
 		Image:           baseImage,
-		Command:         []string{verifySh, "-c", cloneScript(repo, verifyCommit, baseCommit)},
+		Command:         []string{verifySh, "-c", cloneScript(repo, baseCommit)},
 		SecurityContext: trustedContainerSecurityContext(),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: verifyVol, MountPath: verifyScratchPath},
@@ -234,32 +234,33 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		cloneCt.VolumeMounts = append(cloneCt.VolumeMounts, corev1.VolumeMount{
 			Name: "git-cred", MountPath: "/git-cred", ReadOnly: true,
 		})
-		cloneCt.Command = []string{verifySh, "-c", cloneCredScript(repo, verifyCommit, baseCommit)}
+		cloneCt.Command = []string{verifySh, "-c", cloneCredScript(repo, baseCommit)}
 	}
 
-	// The import-agent init: copies the agent's committed tree from the
-	// Loop's workspace PVC (READ-ONLY) into the fresh clone at /verify. It
-	// carries NO credentials and NO agent data mounts besides the read-only
-	// workspace. It overwrites the clone's tree with the agent's files (the
-	// tamper check then diffs baseCommit..verifiedCommit, where verifiedCommit
-	// is the agent's committed head — the import makes the agent's tree the
-	// checked-out tree).
-	// The tamper check diffs SHAs (not the working tree), so the import does
-	// not affect the gate; it exists so the acceptance checks run against the
-	// agent's actual tree. The agent's .coxswain result dir is excluded (the
-	// operator's result files must not leak into the verified tree).
-	importScript := `set -e
-# Copy the agent's committed tree (read-only PVC at /agent-src) into the
-# fresh clone at /verify, preserving the clone's .git (tar excludes it).
+	// The import-agent init: fetches the agent's verifiedCommit from the
+	// workspace PVC (READ-ONLY) via a local file:// fetch into the fresh
+	// clone at /verify. It carries NO credentials and NO agent data mounts
+	// besides the read-only workspace. This is the ONLY place agent data
+	// enters the Job, and it imports the verified COMMIT (not the working
+	// tree) — so the tamper check and the acceptance checks operate on the
+	// SAME tree (the checked-out verifiedCommit), closing the tamper bypass.
+	importScript := fmt.Sprintf(`
+set -e
 cd /verify
-tar -cf - -C /agent-src --exclude=.git --exclude=.coxswain . 2>/dev/null | tar -xf - -C /verify || true
+git -c core.hooksPath=/dev/null -c protocol.file.allow=always fetch --no-tags file:///agent-src/.git %s
+git -c core.hooksPath=/dev/null checkout --detach %s
 echo "import-agent ok"
-`
+`, shellQuote(verifyCommit), shellQuote(verifyCommit))
 	importCt := corev1.Container{
 		Name:            "import-agent",
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", importScript},
 		SecurityContext: trustedContainerSecurityContext(),
+		Env: []corev1.EnvVar{
+			{Name: "GIT_CONFIG_COUNT", Value: "1"},
+			{Name: "GIT_CONFIG_KEY_0", Value: "safe.directory"},
+			{Name: "GIT_CONFIG_VALUE_0", Value: "/agent-src/.git"},
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: verifyVol, MountPath: verifyScratchPath},
 			// The agent's workspace PVC, READ-ONLY. This is the only place
@@ -395,10 +396,11 @@ func init() {
 	*verifyFalsePtr = false
 }
 
-// cloneScript is the credential-less clone-base script: a fresh clone at the
-// pinned SHA that also fetches the base SHA (the tamper diff needs both
-// reachable).
-func cloneScript(repo, verifyCommit, baseCommit string) string {
+// cloneScript builds the clone-base init container script. It fetches ONLY
+// baseCommit from origin (the agent's verifiedCommit is local and never
+// pushed, so fetching it from origin would fail). The import-agent container
+// later fetches verifiedCommit from file:///agent-src/.git.
+func cloneScript(repo, baseCommit string) string {
 	return fmt.Sprintf(`
 set -e
 rm -rf /verify
@@ -407,43 +409,39 @@ cd /verify
 git init -q
 git remote add origin %s
 git fetch -q --depth=1 origin %s
-git checkout -q --detach %s
-# Fetch the base SHA too if the shallow clone lacks it (the diff needs both).
-git cat-file -e %s 2>/dev/null || git fetch -q origin %s
+git checkout -q --detach FETCH_HEAD
 echo "clone-base ok: %s"
-`, shellQuote(repo), shellQuote(verifyCommit), shellQuote(verifyCommit),
-		shellQuote(baseCommit), shellQuote(baseCommit), shellQuote(verifyCommit))
+`, shellQuote(repo), shellQuote(baseCommit), shellQuote(baseCommit))
 }
 
 // cloneCredScript is the clone-base script when a git basic-auth secret is
-// present: it reads username + password from /git-cred and passes them to the
-// fetch as a basic-auth http.extraHeader (the S3a init-workspace pattern —
-// nothing is written or persisted; the header is in the process's argv only,
-// a known PR-noted limitation).
-func cloneCredScript(repo, verifyCommit, baseCommit string) string {
+// present: it reads username + password from /git-cred and builds the
+// Basic-auth header (S3a pattern: printf '%s:%s' username password |
+// base64 -w 0). Fetches ONLY baseCommit from origin.
+func cloneCredScript(repo, baseCommit string) string {
 	return fmt.Sprintf(`
 set -e
-# Build the basic-auth header from the two mounted secret files (S3a
-# pattern: nothing is written or persisted).
-AUTH="Authorization: Basic $(echo -n "$(cat /git-cred/username)" | base64 -w0)"
+# Build the basic-auth header from the two mounted secret files (S3a pattern).
+AUTH="Authorization: Basic $(printf '%%s:%%s' "$(cat /git-cred/username)" "$(cat /git-cred/password)" | base64 -w 0)"
 rm -rf /verify
 mkdir -p /verify
 cd /verify
 git init -q
 git remote add origin %s
 git -c http.extraHeader="$AUTH" fetch -q --depth=1 origin %s
-git checkout -q --detach %s
-git cat-file -e %s 2>/dev/null || git -c http.extraHeader="$AUTH" fetch -q origin
+git checkout -q --detach FETCH_HEAD
 echo "clone-base ok"
-`, shellQuote(repo), shellQuote(verifyCommit), shellQuote(verifyCommit),
-		shellQuote(baseCommit))
+`, shellQuote(repo), shellQuote(baseCommit))
 }
 
-// ensureVerifyNetworkPolicy creates (idempotently) the verify Job's
-// NetworkPolicy: egress only to the git repo peer (for the clone-base fetch)
-// + DNS. The verify pod has NO model/egress access — it is a trusted,
-// isolated check runner, not an agent. The podSelector is the verify-for
-// label (the Job's pod carries it).
+// ensureVerifyNetworkPolicy creates or updates the verify Job's NetworkPolicy:
+// egress only to the git repo peer (for the clone-base fetch) + DNS. The
+// verify pod has NO model/egress access — it is a trusted, isolated check
+// runner, not an agent. The podSelector is the verify-for label (the Job's
+// pod carries it).
+//
+// I42c pattern (createOrUpdateNP): the spec is set in the mutate func so that
+// input changes (e.g. the repo port) propagate to an existing policy.
 func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return nil
@@ -452,14 +450,6 @@ func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *co
 		return nil
 	}
 	name := loop.Name + "-verify-netpol"
-	existing := &networkingv1.NetworkPolicy{}
-	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
-	if err == nil {
-		return nil // already exists; leave untouched (idempotency)
-	}
-	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get verify netpol %s: %w", name, err)
-	}
 	egress := []networkingv1.NetworkPolicyEgressRule{
 		{To: []networkingv1.NetworkPolicyPeer{dnsPeer()}, Ports: dnsPorts()},
 	}

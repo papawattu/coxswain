@@ -22,13 +22,13 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/papawattu/coxswain/internal/policy"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"github.com/papawattu/coxswain/internal/policy"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -73,7 +73,7 @@ import (
 
 // s6 commit SHAs (40-hex; distinct from the S5a fixture commits).
 const (
-	s6HeadCommit = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+	s6HeadCommit  = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 	s6OtherCommit = "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5"
 )
 
@@ -412,7 +412,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		Expect(pushScript).To(ContainSubstring(`[ "${BRANCH}" = "master" ]`))
 
 		By("pinning the push to the verifiedCommit (the import's assert, never a claim)")
-		Expect(pushScript).To(ContainSubstring("PINNED=" + shellQuote(s6HeadCommit)),
+		Expect(pushScript).To(ContainSubstring("PINNED="+shellQuote(s6HeadCommit)),
 			"the push container must push the pinned verifiedCommit (not the claim's headCommit)")
 	})
 

@@ -97,7 +97,7 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	// provider API + PR URL derive from its host; the git push uses the
 	// origin remote, which we point at the local bare repo).
 	const loopName = "pushtask1"
-	repoURL := "http://gitea.example:3000/samples/gocli.git"
+	repoURL := testGiteaExampleRepoURL
 	loop := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: loopName},
 		Spec: coxv1alpha1.LoopSpec{
@@ -322,9 +322,21 @@ type fakeGiteaAPICall struct {
 // prURL and the operator's strict parser validates it exactly. It returns
 // the API base (rewritten into the script's API_BASE) and the recorded
 // PR-create POSTs. The test inspects `posts` AFTER the script runs, so it
-// is returned by pointer.
+// is returned by pointer. When repoGETStatus is non-zero, GET /repos/{o}/{r}
+// returns that status (the fail-closed default-branch lookup test);
+// when defaultBranch is "", the repo GET returns JSON with no
+// default_branch field (also fail-closed).
 func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host, defaultBranch string) (apiBase string, posts *[]fakeGiteaAPICall) {
 	t.Helper()
+	return newFakeGiteaAPIWithRepoGET(t, owner, repoName, scheme, host, defaultBranch, 0)
+}
+
+// newFakeGiteaAPIWithRepoGET is newFakeGiteaAPI with control over the
+// /repos/{owner}/{repo} GET (the default-branch lookup): repoGETStatus
+// non-zero makes that endpoint return the given status (a 500 — the
+// fail-closed lookup test); defaultBranch "" makes it return JSON with no
+// default_branch field (an empty lookup — also fail-closed).
+func newFakeGiteaAPIWithRepoGET(t *testing.T, owner, repoName, scheme, host, defaultBranch string, repoGETStatus int) (apiBase string, posts *[]fakeGiteaAPICall) {
 	var mu sync.Mutex
 	var postList []fakeGiteaAPICall
 	var openPR int // 0 = no open PR yet
@@ -334,8 +346,16 @@ func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host, defaultBranch 
 		path := r.URL.Path
 		// GET /repos/{owner}/{repo} — the default-branch lookup.
 		if r.Method == http.MethodGet && path == repoPath {
+			if repoGETStatus != 0 {
+				w.WriteHeader(repoGETStatus)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"name":"%s","default_branch":"%s"}`, repoName, defaultBranch)
+			if defaultBranch == "" {
+				_, _ = fmt.Fprintf(w, `{"name":"%s"}`, repoName)
+			} else {
+				_, _ = fmt.Fprintf(w, `{"name":"%s","default_branch":"%s"}`, repoName, defaultBranch)
+			}
 			return
 		}
 		// GET /repos/{owner}/{repo}/pulls — the idempotency lookup.
@@ -471,13 +491,13 @@ func TestDeliverPushScriptRefusesDefaultBranch(t *testing.T) {
 	// branch; the script must refuse it via the API read, not the
 	// main/master check).
 	const loopName = "trunktask1"
-	repoURL := "http://gitea.example:3000/samples/gocli.git"
+	repoURL := testGiteaExampleRepoURL
 	loop := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: loopName},
 		Spec: coxv1alpha1.LoopSpec{
 			Workspace: coxv1alpha1.Workspace{
 				Repo:                repoURL,
-				Ref:                 "initial",
+				Ref:                 testInitialBranch,
 				GitCredentialSecret: testCredSecretName,
 			},
 			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
@@ -539,4 +559,114 @@ func TestDeliverPushScriptRefusesDefaultBranch(t *testing.T) {
 	if out2, err := exec.Command("git", "-C", remoteGit, "rev-parse", "refs/heads/trunk").CombinedOutput(); err == nil {
 		t.Fatalf("the delivery branch must not exist on the remote after a default-branch refusal; it is at %s", strings.TrimSpace(string(out2)))
 	}
+}
+
+// TestDeliverPushScriptRefusesWhenDefaultBranchLookupFails (S6 review P2:
+// fail CLOSED when the default-branch lookup fails) runs the REAL push
+// script end-to-end with the fake Gitea API's repo GET (the
+// default-branch lookup) failing two ways: a 500 and an empty body (no
+// default_branch field). The script must refuse (exit non-zero) in BOTH
+// cases and create NO ref on the bare remote. It must FAIL on 5e3f28f
+// (the fail-open line: the lookup failure was swallowed into an empty
+// DEFAULT_BRANCH, the guard skipped the refusal, and the push proceeded).
+func TestDeliverPushScriptRefusesWhenDefaultBranchLookupFails(t *testing.T) {
+	r := &LoopReconciler{}
+
+	// The remote (the deliver Job's origin stand-in): a local bare repo
+	// with a base branch (initial — NOT main/master, so the script's
+	// main/master check does not fire; only the default-branch lookup can
+	// catch this delivery).
+	remoteDir := t.TempDir()
+	remoteGit := filepath.Join(remoteDir, "remote.git")
+	mustGit(t, remoteDir, "init", "-q", "-b", "initial", "--bare", remoteGit)
+
+	// The agent repo: a base commit + one agent commit (the pinned
+	// verifiedCommit).
+	agentRepo := t.TempDir()
+	mustGit(t, agentRepo, "init", "-q", "-b", "initial")
+	mustGit(t, agentRepo, "config", "user.email", "agent@coxswain.test")
+	mustGit(t, agentRepo, "config", "user.name", "Agent")
+	writeFile(t, agentRepo, "round.go", "package main\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "base")
+	mustGit(t, agentRepo, "remote", "add", "origin", remoteGit)
+	mustGit(t, agentRepo, "push", "-q", "origin", "initial")
+	writeFile(t, agentRepo, "round.go", "package main\nfunc F() int { return 1 }\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "agent: change")
+	verifySHA := gitSHA(t, agentRepo)
+
+	// The Loop: a Gitea-compatible repo. The delivery branch is a normal
+	// name (neither main nor master, not equal to the base 'initial'), so
+	// ONLY the default-branch lookup can refuse the push.
+	const loopName = "lookupfail1"
+	repoURL := testGiteaExampleRepoURL
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: loopName},
+		Spec: coxv1alpha1.LoopSpec{
+			Workspace: coxv1alpha1.Workspace{
+				Repo:                repoURL,
+				Ref:                 testInitialBranch,
+				GitCredentialSecret: testCredSecretName,
+			},
+			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{
+			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
+		},
+	}
+	branch := deliverBranchName(deliverBranchPrefix(loop), loopName)
+
+	// The credential files.
+	credsDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsUsernameKey), []byte("samples"))
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsPasswordKey), []byte("s3cret-pw"))
+
+	// The scratch dir: set up as clone-base + import-agent would.
+	scratch := t.TempDir()
+	mustGit(t, scratch, "clone", "-q", remoteGit, ".")
+	mustGit(t, scratch, "-c", "protocol.file.allow=always", "-c", "core.hooksPath=/dev/null",
+		"fetch", "file://"+agentRepo+"/.git", verifySHA)
+	mustGit(t, scratch, "checkout", "-q", "--detach", verifySHA)
+	mustGit(t, scratch, "remote", "set-url", "origin", remoteGit)
+
+	runCase := func(label string, repoGETStatus int, emptyDefaultBranch bool) {
+		t.Helper()
+		defaultBranch := "initial"
+		if emptyDefaultBranch {
+			defaultBranch = ""
+		}
+		apiBase, _ := newFakeGiteaAPIWithRepoGET(t, "samples", "gocli", "http", "gitea.example:3000", defaultBranch, repoGETStatus)
+
+		pushScript := deliverContainerScript(t, r.deliverPushContainer(loop, verifySHA, branch, "initial"))
+		termFile := filepath.Join(t.TempDir(), "termination-log")
+		pushScript = strings.ReplaceAll(pushScript, deliverScratchPath, scratch)
+		pushScript = strings.ReplaceAll(pushScript, "/workspace-creds", credsDir)
+		pushScript = strings.ReplaceAll(pushScript, "/dev/termination-log", termFile)
+		wantAPIBase := "'" + deliverAPIBase(repoURL, deliverProviderGitea) + "'"
+		if !strings.Contains(pushScript, wantAPIBase) {
+			t.Fatalf("[%s] push script does not carry the expected API_BASE %q", label, wantAPIBase)
+		}
+		pushScript = strings.ReplaceAll(pushScript, wantAPIBase, "'"+apiBase+"'")
+		pushPath := filepath.Join(t.TempDir(), "push.sh")
+		mustWriteFile(t, pushPath, []byte(pushScript))
+
+		// The repo GET fails (status) or returns no default_branch: the
+		// script must REFUSE (fail closed) — it must not treat an
+		// undetermined default branch as "no refusal needed".
+		out, err := exec.Command("sh", pushPath).CombinedOutput()
+		if err == nil {
+			t.Fatalf("[%s] the push script must refuse (exit non-zero) when the default-branch lookup fails; it exited 0. Output: %s", label, string(out))
+		}
+		if !strings.Contains(string(out), "cannot determine the default branch") {
+			t.Fatalf("[%s] the refusal must name the failed default-branch lookup; output: %s", label, string(out))
+		}
+		// No ref on the bare remote.
+		if out2, err := exec.Command("git", "-C", remoteGit, "rev-parse", "refs/heads/"+branch).CombinedOutput(); err == nil {
+			t.Fatalf("[%s] the delivery branch must not exist on the remote after a failed default-branch lookup; it is at %s", label, strings.TrimSpace(string(out2)))
+		}
+	}
+
+	runCase("repo GET 500", 500, false)
+	runCase("repo GET empty default_branch", 0, true)
 }

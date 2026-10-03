@@ -690,8 +690,18 @@ if [ "${BRANCH}" = "${BASE}" ] || [ "${BRANCH}" = "main" ] || [ "${BRANCH}" = "m
   echo "deliver push: refusing to push branch ${BRANCH} (equals the base branch or a default branch)"
   exit 1
 fi
-DEFAULT_BRANCH=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}" | sed -n 's/.*"default_branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || DEFAULT_BRANCH=""
-if [ -n "${DEFAULT_BRANCH}" ] && [ "${BRANCH}" = "${DEFAULT_BRANCH}" ]; then
+# The repo's ACTUAL default branch: read from GET /repos/{owner}/{repo}
+# (same API + auth as the PR calls). This lookup FAILS CLOSED: if the API
+# call errors or returns no default_branch, the push is refused — a
+# missing or unreadable default branch must NOT be treated as "no default
+# branch to refuse" (that would let a regression that breaks the lookup
+# deliver straight onto the repo's mainline).
+DEFAULT_BRANCH=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}" | sed -n 's/.*"default_branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || { echo "deliver push: cannot determine the default branch (repo GET failed); refusing"; exit 1; }
+if [ -z "${DEFAULT_BRANCH}" ]; then
+  echo "deliver push: cannot determine the default branch (repo GET returned no default_branch); refusing"
+  exit 1
+fi
+if [ "${BRANCH}" = "${DEFAULT_BRANCH}" ]; then
   echo "deliver push: refusing to push branch ${BRANCH} (equals the repo's default branch ${DEFAULT_BRANCH})"
   exit 1
 fi

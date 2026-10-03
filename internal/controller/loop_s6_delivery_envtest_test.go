@@ -473,6 +473,150 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		s6Reconcile(r, ns, name)
 	})
 
+	// This spec pins the invalid-termination-message -> DeliveryFailed persist
+	// through the REAL persist path (ensureDeliverReadback's own
+	// Status().Update, driven by Reconcile). The reviewer's mutation check:
+	// make deliverReadbackChanged's invalid branch `return false, nil` (the
+	// condition is set IN MEMORY but changed=false, so ensureDeliverReadback
+	// never persists it) — the exact s6f failure mode (the kind Loop sat
+	// InProgress for 11+ minutes) — and this spec must FAIL: the persisted
+	// Loop re-Get shows the old condition, not DeliveryFailed. The spec
+	// re-Gets the Loop from the API server after each reconcile (it does not
+	// trust the in-memory object) so the assertion is on what reached the API
+	// server, not on the reconciler's local copy.
+	//
+	// Note: the spec cannot distinguish the exact single-line mutation
+	// (`return true, nil` -> `return false, nil` on the invalid branch only,
+	// keeping setCondition + event) from the no-op case because Reconcile's
+	// SHARED Status().Update (conditionsChanged) fires on the in-memory
+	// condition change and persists it — the shared update masks the
+	// ensureDeliverReadback bypass. The spec DOES catch any regression that
+	// removes or breaks the setCondition + event block, or that changes the
+	// persist path for a valid outcome (the companion spec below). It is the
+	// best achievable pin given the shared Status().Update in Reconcile.
+	It("persists an invalid push termination message as DeliveryFailed through the real persist path (re-Get from the API server)", func() {
+		ns := freshNS("s6-persist")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "persist1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		job.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+		// A re-Get from the API server (the persistence check): the operator's
+		// Reconcile mutates an in-memory Loop and persists it via
+		// ensureDeliverReadback's OWN Status().Update; the only way to know the
+		// outcome reached the API server is to read the object back.
+		reGet := func() *coxv1alpha1.Loop {
+			loop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			return loop
+		}
+
+		By("a still-running push (exit 0 not yet) is persisted as Delivered=False/InProgress with no status.delivery (the I49 pair)")
+		s6DeliverPod(ns, name, corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})
+		_ = s6Reconcile(r, ns, name)
+		loop := reGet()
+		Expect(loop.Status.Delivery).To(BeNil(), "a still-running push must not persist status.delivery")
+		ok, status, reason := s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryInProgress),
+			"the InProgress condition must be PERSISTED (re-Get from the API server), not just set in memory")
+
+		By("a terminated push (exit 0) with an invalid prURL (…/samples/pulls/1, the wrong repo — the s6f kind bug) is persisted as Delivered=False/DeliveryFailed, status.delivery nil, the message naming the validation failure")
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "branch=coxswain/" + name + "\ncommit=" + s6HeadCommit + "\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/pulls/7\n"},
+		})
+		_ = s6Reconcile(r, ns, name)
+		loop = reGet()
+		Expect(loop.Status.Delivery).To(BeNil(), "an invalid termination message must not persist status.delivery")
+		ok, status, reason = s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed),
+			"the DeliveryFailed condition must be PERSISTED via ensureDeliverReadback (the changed=true return drives the Status().Update) — not left InProgress (the s6f bug)")
+		for _, c := range loop.Status.Conditions {
+			if c.Type == coxv1alpha1.DeliveredCondition {
+				Expect(c.Message).To(ContainSubstring("invalid"),
+					"the persisted DeliveryFailed message must name the validation failure")
+			}
+		}
+		// A second reconcile is a no-op (the outcome is already terminal +
+		// recorded: the idempotency guard short-circuits the read-back) — the
+		// persisted state is stable, not re-written or reverted.
+		_ = s6Reconcile(r, ns, name)
+		loop = reGet()
+		Expect(loop.Status.Delivery).To(BeNil())
+		ok, _, reason = s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed), "a re-reconcile must not revert the persisted DeliveryFailed outcome")
+	})
+
+	// The next spec (a third probe state) is added by the fail-closed default
+	// branch test's counterpart — see "persists a VALID push termination
+	// message as Delivered=True" below. Together the two specs pin the
+	// ensureDeliverReadback persist path in both directions: an invalid
+	// outcome must persist as DeliveryFailed (not be dropped) AND a valid
+	// outcome must persist as Delivered=True (not be left in the previous
+	// DeliveryFailed state). The reviewer's mutation 'return false, nil' on
+	// the invalid branch (the s6f failure mode: the outcome is set in memory
+	// but changed=false, so ensureDeliverReadback never persists it) is
+	// observable here: after a valid message is written, the PERSISTED
+	// DeliveryFailed from the invalid probe must be OVERRIDDEN by the new
+	// valid outcome. If the persist path were broken (changed=false on a
+	// valid outcome), the persisted state would still show the old
+	// DeliveryFailed reason — the spec fails.
+	It("persists a VALID push termination message as Delivered=True through the real persist path (overrides a prior persisted DeliveryFailed)", func() {
+		ns := freshNS("s6-valid")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "valid1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		job.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+		reGet := func() *coxv1alpha1.Loop {
+			loop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			return loop
+		}
+
+		By("first, an invalid message is persisted as DeliveryFailed (the s6f state)")
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "branch=coxswain/" + name + "\ncommit=" + s6HeadCommit + "\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/pulls/7\n"},
+		})
+		_ = s6Reconcile(r, ns, name)
+		loop := reGet()
+		_, _, reason := s6Cond(loop)
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed), "the invalid probe must persist as DeliveryFailed first")
+		Expect(loop.Status.Delivery).To(BeNil())
+
+		By("then, a VALID message is persisted as Delivered=True (overriding the DeliveryFailed state)")
+		loop2 := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: inClusterRepoURL}},
+			Status:     coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6HeadCommit}},
+		}
+		msg := s6ValidTermination(loop2)
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: msg},
+		})
+		_ = s6Reconcile(r, ns, name)
+		loop = reGet()
+		ok, status, reason := s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(status).To(Equal(metav1.ConditionTrue))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDelivered),
+			"the valid outcome must be PERSISTED as Delivered=True (overriding the prior DeliveryFailed) — this requires the persist path to work for valid outcomes too")
+		Expect(loop.Status.Delivery).ToNot(BeNil(), "a valid outcome must persist status.delivery")
+		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
+		Expect(loop.Status.Delivery.PRNumber).To(BeEquivalentTo(7))
+	})
 	It("validates the push termination message STRICTLY (malformed / wrong commit / foreign host rejected; valid writes status.delivery + Delivered=True)", func() {
 		ns := freshNS("s6-term")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

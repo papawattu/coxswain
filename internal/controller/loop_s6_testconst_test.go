@@ -38,6 +38,14 @@ const (
 
 	// corePodsResource is the core Pods RBAC resource name (goconst).
 	corePodsResource = "pods"
+
+	// testGiteaExampleRepoURL is the Gitea-compatible repo URL the push-script
+	// execution tests target (goconst: 3+ occurrences across the test file).
+	testGiteaExampleRepoURL = "http://gitea.example:3000/samples/gocli.git"
+
+	// testInitialBranch is the base-branch name the push-script execution
+	// tests use for the agent repo (goconst: 3+ occurrences).
+	testInitialBranch = "initial"
 )
 
 // s6SampleLoopObjMeta is the shared fixture ObjectMeta for a unit-level S6

@@ -772,7 +772,11 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 					to.PodSelector.MatchLabels[policy.ComponentLabelKey] == netpolEgressProxyComponent {
 					foundProxy = true
 				}
-				if to.NamespaceSelector != nil {
+				// A repo peer is a namespaceSelector WITHOUT a pod selector
+				// (the repo's namespace). The egress proxy rule and the
+				// kube-dns rule both carry a pod selector (the egress proxy
+				// pod, the kube-dns pod) — they are not repo peers.
+				if to.NamespaceSelector != nil && to.PodSelector == nil {
 					foundRepoPeer = true
 				}
 			}

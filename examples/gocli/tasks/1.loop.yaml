@@ -7,9 +7,13 @@
 # no spec.verify.preset enum issue, but workspace.gitCredentialSecret and
 # verify.image must match the cluster state the driver ensures).
 #
-# spec.agent.image is a sensible default; hack/sample-run.sh substitutes
-# the env var RUNNER_IMG over it when set (see the script's RUNNER_IMG
-# section) so a local build can be demoed without editing this file.
+# spec.agent.image is deliberately ABSENT: the operator uses its own
+# --runner-image flag for the sandbox entrypoint (isRunner is true when the
+# image is empty), so the demo does not pin a local build tag into the
+# manifest. hack/sample-run.sh preflights that the controller deployment is
+# Available with a non-empty --runner-image. The env var RUNNER_IMG (see the
+# script's RUNNER_IMG section) then only matters for building and loading
+# the image into kind before the run.
 #
 # Option B (owner): no approval gate — the bar is
 # Planning -> Implementing -> Verifying -> Succeeded.
@@ -38,7 +42,8 @@ spec:
       - main_test.go
     image: docker.io/library/golang:1.26
   agent:
-    image: coxswain-runner:s5b1
+    # image intentionally omitted — the operator's --runner-image flag
+    # supplies it (see the header note).
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b

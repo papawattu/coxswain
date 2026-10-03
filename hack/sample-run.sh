@@ -11,8 +11,11 @@
 #      masked output) and the model Secret (vllm-no-auth),
 #   3. apply the AgentPolicy and Loop manifests for the task
 #      (examples/<app>/tasks/<n>.agentpolicy.yaml, <n>.loop.yaml),
-#      deleting a prior Loop first. When RUNNER_IMG is set, it is
-#      substituted over spec.agent.image in the rendered manifest,
+#      deleting a prior Loop first. spec.agent.image is left empty in the
+#      manifest: the operator's --runner-image flag supplies the runner
+#      entrypoint, and the driver preflights that the controller runs with
+#      a non-empty --runner-image (and that it agrees with RUNNER_IMG if
+#      set) so the demo fails fast instead of wedging in Planning,
 #   4. watch status.phase until Succeeded/Failed or TIMEOUT (default 30m),
 #   5. write operator-side evidence to .samples/<app>-<n>/EVIDENCE.md.
 #
@@ -80,24 +83,17 @@ POLICY_YAML="$ROOT/examples/$APP/tasks/$TASK.agentpolicy.yaml"
 POLICY_NAMES=$(awk '/^  policyRefs:/ {f=1; next} /^  [a-z]/ {f=0} f && /- / {print $2}' "$LOOP_YAML")
 
 # ---------------------------------------------------------------------------
-# dry-run: render + validate against the live API server, create nothing.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# RUNNER_IMG override (S5b): the manifest pins a sensible default in
-# spec.agent.image. If RUNNER_IMG is set in the environment, the driver
-# substitutes that image into the rendered manifest instead — so a local
-# build (e.g. coxswain-runner:s5b1 from 'make runner-build IMG=...') or a
-# registry image can be demoed without editing the checked-in file.
+# RUNNER_IMG override (S5b): the manifest leaves spec.agent.image empty so
+# the operator's --runner-image flag supplies the runner entrypoint. The env
+# var RUNNER_IMG then only matters for building and loading the image into
+# kind before the run; the preflight below checks the controller flag and
+# RUNNER_IMG agree so the sandbox actually runs the runner.
 # ---------------------------------------------------------------------------
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 LOOP_RENDER="$TMPDIR/loop.$TASK.rendered.yaml"
-if [ -n "${RUNNER_IMG:-}" ]; then
-	log "substituting RUNNER_IMG=$RUNNER_IMG into the Loop manifest"
-	sed "s|image: .*|image: $RUNNER_IMG|" "$LOOP_YAML" > "$LOOP_RENDER"
-else
-	cp "$LOOP_YAML" "$LOOP_RENDER"
-fi
+cp "$LOOP_YAML" "$LOOP_RENDER"
+RUNNER_IMG="${RUNNER_IMG:-}"
 
 if [ "$MODE" = "dry-run" ]; then
 	log "dry-run: validating the task $TASK manifests against --context $CTX (ns $NS)"
@@ -113,6 +109,29 @@ fi
 
 mkdir -p "$OUTDIR"
 log "evidence dir: $OUTDIR"
+
+# ---------------------------------------------------------------------------
+# 0. Preflight: the controller deployment must be Available and must run
+#    with a non-empty --runner-image, or the sandbox falls back to
+#    'sleep infinity' (isRunner only matches the empty image or the
+#    flag's value) and the Loop wedges in Planning. Fail fast with a
+#    clear message instead.
+# ---------------------------------------------------------------------------
+CONTROLLER_NS="coxswain-system"
+CONTROLLER_DEPLOY="coxswain-controller-manager"
+RUNNER_FLAG=$(kubectl --context "$CTX" -n "$CONTROLLER_NS" get deploy "$CONTROLLER_DEPLOY" \
+	-o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null \
+	| tr ' ' '\n' | grep '^--runner-image=' || true)
+if [ -z "$RUNNER_FLAG" ]; then
+	die "controller deploy $CONTROLLER_NS/$CONTROLLER_DEPLOY has no --runner-image flag (deployment not Available or args missing); the demo needs a real runner entrypoint. 'make deploy-dev' (or 'make deploy' with the image tag set) and retry."
+fi
+RUNNER_IMAGE=${RUNNER_FLAG#--runner-image=}
+[ -n "$RUNNER_IMAGE" ] \
+	|| die "controller $CONTROLLER_NS/$CONTROLLER_DEPLOY has an empty --runner-image; the sandbox would run 'sleep infinity'. 'make deploy-dev' (or set the image tag and 'make deploy') and retry."
+log "controller preflight OK: --runner-image=$RUNNER_IMAGE"
+if [ -n "${RUNNER_IMG:-}" ] && [ "$RUNNER_IMG" != "$RUNNER_IMAGE" ]; then
+	die "RUNNER_IMG=$RUNNER_IMG does not match the controller's --runner-image=$RUNNER_IMAGE; the sandbox would run 'sleep infinity'. Build and load the image the controller expects (or redeploy the controller with the flag set to $RUNNER_IMG) and retry."
+fi
 
 # ---------------------------------------------------------------------------
 # 1. samples-up: Gitea up + seeded (idempotent; pinned to coxswain-dev by

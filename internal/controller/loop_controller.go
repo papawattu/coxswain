@@ -495,10 +495,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// S4 read-backs) and written to status.delivery + the Delivered
 	// condition (ensureDeliverReadback).
 	deliverRequeue := false
-	if requeue, err := r.ensureDeliverJob(ctx, &loop); err != nil {
+	if ok, err := r.ensureDeliverJob(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
-	} else {
-		deliverRequeue = requeue
+	} else if ok {
+		// The deliver step made a durable change (created the Job, or deleted
+		// the stale Job) and needs another reconcile to observe the result —
+		// map it like the verify stale guard: a 5s RequeueAfter (no retry
+		// loop, no controller error).
+		deliverRequeue = true
 	}
 	if err := r.ensureDeliverNetPolicies(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
@@ -2146,10 +2150,9 @@ func egressProxyPodSpecHash(pod *corev1.Pod) string {
 // in-cluster repo (repoPeer non-nil) uses the direct repo-peer rule and
 // never the proxy; a Loop past the first clone (baseCommit pinned) has no
 // init container and no git egress.
-func workspaceInitNeedsProxy(loop *coxv1alpha1.Loop) bool {
+func (r *LoopReconciler) workspaceInitNeedsProxy(loop *coxv1alpha1.Loop) bool {
 	return loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" &&
-		namespaceFromHostForProxy(workspaceRepoHost(loop.Spec.Workspace.Repo)) == "" &&
-		!isRepoHostIP(loop.Spec.Workspace.Repo)
+		repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost) == nil
 }
 
 // workspaceInitProxyHost is the repo host to add to the egress proxy's SNI
@@ -2159,7 +2162,7 @@ func workspaceInitNeedsProxy(loop *coxv1alpha1.Loop) bool {
 // the AgentPolicy network allows) is emitted so the proxy matches the port
 // the git client dials (workspaceRepoPort).
 func (r *LoopReconciler) workspaceInitProxyHost(ctx context.Context, loop *coxv1alpha1.Loop) string {
-	if !workspaceInitNeedsProxy(loop) {
+	if !r.workspaceInitNeedsProxy(loop) {
 		return ""
 	}
 	host := workspaceRepoHost(loop.Spec.Workspace.Repo)
@@ -2444,7 +2447,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 				To:    []networkingv1.NetworkPolicyPeer{*peer},
 				Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
 			})
-		} else if workspaceInitNeedsProxy(loop) {
+		} else if r.workspaceInitNeedsProxy(loop) {
 			// S6: an EXTERNAL repo host (repoPeer nil) has no expressible
 			// repo rule (NetworkPolicy cannot name hostnames) — the first
 			// clone must traverse the egress proxy. The proxy's SNI
@@ -3271,7 +3274,7 @@ func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.C
 	// Proxy). The standard proxy env vars (both cases) cover git + busybox
 	// curl (the git image's busybox honors lowercase). In-cluster repos
 	// (repoPeer non-nil) keep the direct path — no proxy env.
-	if workspaceInitNeedsProxy(loop) {
+	if r.workspaceInitNeedsProxy(loop) {
 		proxyURL := r.egressProxyServiceURL(loop.Name, loop.Namespace)
 		c.Env = append(c.Env,
 			corev1.EnvVar{Name: "HTTPS_PROXY", Value: proxyURL},

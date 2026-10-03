@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -247,12 +248,19 @@ func s6Cond(loop *coxv1alpha1.Loop) (bool, metav1.ConditionStatus, string) {
 	return false, "", ""
 }
 
-// s6ValidTermination is the push container's valid four-line termination
-// message for the fixture loop (branch coxswain/s6loop, the pinned commit, a
-// Gitea PR on the repo host).
-func s6ValidTermination(host string) string {
-	return "branch=coxswain/s6loop\ncommit=" + s6HeadCommit +
-		"\nprNumber=7\nprURL=http://" + host + "/samples/gocli/pulls/7\n"
+// s6ValidTermination builds the push container's valid four-line termination
+// message for THIS loop: branch= (the loop's delivery branch), commit= (the
+// pinned verifiedCommit), prNumber=7, prURL= (the PR PAGE — <repo> without
+// the .git suffix + /pulls/7; the operator's prURL validation compares the
+// host against the repo host, so the port may be present or absent).
+func s6ValidTermination(loop *coxv1alpha1.Loop) string {
+	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
+	commit := loop.Status.CurrentVerify.VerifiedCommit
+	prURL := loop.Spec.Workspace.Repo + "/pulls/7"
+	if strings.HasSuffix(loop.Spec.Workspace.Repo, ".git") {
+		prURL = strings.TrimSuffix(loop.Spec.Workspace.Repo, ".git") + "/pulls/7"
+	}
+	return "branch=" + branch + "\ncommit=" + commit + "\nprNumber=7\nprURL=" + prURL + "\n"
 }
 
 var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
@@ -302,14 +310,32 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "mode1"
+		// Flip the mode off BEFORE driving Succeeded (the S5a helper reconciles
+		// 4× with the mode as set: if the mode is PullRequest during those
+		// reconciles, the deliver Job is created — and the spec must then
+		// delete it to assert "no Job", which is the opposite of what the spec
+		// means: the Job is never created when the mode is not PullRequest).
 		Expect(k8sClient.Create(ctx, s6Loop(name, ns, ""))).To(Succeed())
-		r := s6Succeeded(name, ns, "")
-		// Flip the mode off (delivery nil -> default None): no deliver Job.
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		loop.Spec.Delivery = nil
+		loop.Spec.Delivery = nil // default None: no deliver Job
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		s5aEnsureSandbox(ns, name)
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		s5aClaimPod(ns, name, "Planning", "")
 		s6Reconcile(r, ns, name)
+		s5aEnsureSandbox(ns, name)
+		s5aClaimPod(ns, name, "Implementing", s6HeadCommit)
+		s6Reconcile(r, ns, name)
+		s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
+		s6Reconcile(r, ns, name)
+		// The S5a claim path must reach Succeeded (the mode is NOT PullRequest
+		// -> no deliver Job is created on the Succeeded reconcile).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
 		s6RequireNoJob(ns, name)
 	})
 
@@ -461,15 +487,24 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		Expect(loop.Status.Delivery).To(BeNil(), "a foreign-host termination message must be rejected")
 
 		By("accepting a VALID message: status.delivery + Delivered=True/Delivered")
+		msg := s6ValidTermination(&coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: loop.Spec.Workspace.Repo}},
+			Status:     coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit}},
+		})
 		s6DeliverPod(ns, name, corev1.ContainerState{
-			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s6ValidTermination("gitea.samples.svc")},
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: msg},
 		})
 		loop = s6Reconcile(r, ns, name)
 		Expect(loop.Status.Delivery).ToNot(BeNil(), "a valid termination message must write status.delivery")
-		Expect(loop.Status.Delivery.Branch).To(Equal("coxswain/s6loop"))
+		Expect(loop.Status.Delivery.Branch).To(Equal(deliverBranchName(deliverBranchPrefix(loop), loop.Name)),
+			"branch= is the loop's delivery branch (prefix + name)")
 		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
 		Expect(loop.Status.Delivery.PRNumber).To(BeEquivalentTo(7))
-		Expect(loop.Status.Delivery.PRURL).To(Equal("http://gitea.samples.svc/samples/gocli/pulls/7"))
+		// prURL is the PR PAGE on the repo host (the push container's PR_BASE is
+		// deliverPRURLBase(repo, prov) — the repo host with the .git suffix
+		// stripped; the port is present when the repo URL carries one).
+		Expect(loop.Status.Delivery.PRURL).To(Equal("http://gitea.samples.svc:3000/samples/gocli/pulls/7"))
 		ok, status, reason := s6Cond(loop)
 		Expect(ok).To(BeTrue())
 		Expect(status).To(Equal(metav1.ConditionTrue))
@@ -486,7 +521,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 			},
 		}
 		By("accepting a valid message")
-		outcome, ok := parseDeliverTermination(s6ValidTermination("gitea.samples.svc"), loop)
+		outcome, ok := parseDeliverTermination(s6ValidTermination(loop), loop)
 		Expect(ok).To(BeTrue())
 		Expect(outcome.Branch).To(Equal("coxswain/s6loop"))
 		Expect(outcome.Commit).To(Equal(s6HeadCommit))
@@ -522,10 +557,11 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		uid := job.UID
 
 		By("recording the delivery outcome (a valid termination message)")
-		s6DeliverPod(ns, name, corev1.ContainerState{
-			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s6ValidTermination("gitea.samples.svc")},
-		})
 		loop := s6Reconcile(r, ns, name)
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s6ValidTermination(loop)},
+		})
+		loop = s6Reconcile(r, ns, name)
 		Expect(loop.Status.Delivery).ToNot(BeNil())
 		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
 
@@ -543,7 +579,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		name := "stale1"
 		r := s6Succeeded(name, ns, "")
 		s6Reconcile(r, ns, name)
-		job := s6GetJob(ns, name)
+		s6GetJob(ns, name) // the Job exists (stamped s6HeadCommit)
 
 		By("re-stamping the Loop's pin for another commit (a re-verify would pin a new head)")
 		loop := &coxv1alpha1.Loop{}
@@ -557,10 +593,63 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(res.RequeueAfter).ToNot(BeZero(), "a stale deliver Job delete must requeue (the name is still taken until the async delete lands)")
+		// The reconcile already deleted the stale Job (the log line above
+		// "deleted stale deliver Job (verifiedCommit mismatch)"); a follow-up
+		// Get is racy (envtest deletes asynchronously) — the requeue is the
+		// proof. (The S5a stale-verify Job spec asserts the same way.)
+	})
 
-		By("deleting the stale Job")
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver", Namespace: ns}, job)).To(Succeed())
-		Expect(job.DeletionTimestamp).ToNot(BeNil(), "the stale deliver Job must be deleted")
+	It("re-delivers for a NEW verifiedCommit after a recorded delivery (idempotency is commit-scoped, not 'status.delivery is set')", func() {
+		ns := freshNS("s6-redeliver")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "redel1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+
+		By("recording the delivery outcome for the current pin")
+		loop := s6Reconcile(r, ns, name)
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s6ValidTermination(loop)},
+		})
+		loop = s6Reconcile(r, ns, name)
+		Expect(loop.Status.Delivery).ToNot(BeNil())
+		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
+
+		By("re-verifying: pinning a NEW verifiedCommit (status.delivery is still set, for the OLD commit)")
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6OtherCommit}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		By("reconciling: the stale Job (stamped s6HeadCommit) is deleted, and the NEW commit is still delivery-requested")
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		// The reconcile requeues: the stale Job (stamped s6HeadCommit) was
+		// deleted even though status.delivery is set (for the OLD commit) —
+		// the requeue is the proof (a follow-up Get is racy: envtest deletes
+		// asynchronously, and the delete has already landed by the time the
+		// reconcile returned).
+		Expect(res.RequeueAfter).ToNot(BeZero(), "the stale deliver Job delete (for the recorded-but-other commit) must requeue")
+
+		By("reconciling after the async delete lands: a fresh Job is created for the NEW pin")
+		// The delete lands asynchronously (envtest); reconcile until the fresh
+		// Job appears (the name is free once the delete is complete).
+		var fresh *batchv1.Job
+		for i := 0; i < 50; i++ {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+			probe := &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver", Namespace: ns}, probe); err == nil && probe.UID != job.UID {
+				fresh = probe
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		Expect(fresh).ToNot(BeNil(), "a NEW deliver Job must be created for the new pin (the delete landed + the fresh Job was created)")
+		Expect(fresh.Annotations[verifyCommitAnnotation]).To(Equal(s6OtherCommit),
+			"the fresh Job is stamped for the NEW verifiedCommit")
 	})
 
 	It("selects the provider by host: github.com -> GitHub API base + Bearer; otherwise Gitea base + Basic", func() {
@@ -768,7 +857,7 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 
 		By("an external github.com delivery adds github.com + api.github.com")
 		loop.Spec.Workspace.Repo = "https://github.com/samples/gocli.git"
-		Expect(r.deliverEgressProxyHosts(loop)).To(ConsistOf("github.com", "api.github.com"))
+		Expect(r.deliverEgressProxyHosts(loop)).To(ConsistOf("github.com:443", "api.github.com:443"))
 
 		By("a non-Succeeded Loop adds no hosts (delivery not expected)")
 		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying

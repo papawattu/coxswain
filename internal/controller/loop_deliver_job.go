@@ -173,9 +173,16 @@ func deliverDraft(loop *coxv1alpha1.Loop) bool {
 // deliveryRequested reports whether this Loop wants delivery and has not
 // recorded it yet: phase Succeeded (terminal; no re-tasking) + mode
 // PullRequest + a pinned verifiedCommit (delivery is bound to the commit
-// the operator verified) + no recorded status.delivery (one Job per
-// verifiedCommit; a recorded outcome is terminal until the operator clears
-// it).
+// the operator verified) + no recorded delivery FOR THIS COMMIT (one Job
+// per verifiedCommit; a recorded outcome for another commit is stale
+// evidence, not idempotency).
+//
+// Idempotency is commit-scoped (status.delivery.commit == the pinned
+// verifiedCommit -> skip), not "status.delivery != nil -> skip": a Loop
+// that re-verifies after a recorded delivery pins a NEW verifiedCommit and
+// MUST re-deliver (the stale guard deletes the old Job); the old recorded
+// outcome must not suppress the new one. The operator clears
+// status.delivery + the condition to re-run delivery for the SAME commit.
 func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded {
 		return false, "phase is not Succeeded"
@@ -183,14 +190,14 @@ func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
 	if loop.Spec.Delivery == nil || loop.Spec.Delivery.Mode != coxv1alpha1.DeliveryModePullRequest {
 		return false, "delivery mode is not PullRequest"
 	}
-	if loop.Status.Delivery != nil {
-		return false, "delivery already recorded (status.delivery is set)"
-	}
 	if loop.Status.CurrentVerify == nil || loop.Status.CurrentVerify.VerifiedCommit == "" {
 		return false, "no verifiedCommit pinned (status.currentVerify)"
 	}
 	if loop.Spec.Workspace.Repo == "" {
 		return false, "spec.workspace.repo is empty"
+	}
+	if loop.Status.Delivery != nil && loop.Status.Delivery.Commit == loop.Status.CurrentVerify.VerifiedCommit {
+		return false, "delivery already recorded for this verifiedCommit (status.delivery.commit)"
 	}
 	return true, ""
 }
@@ -530,6 +537,7 @@ func (r *LoopReconciler) deliverPushContainer(loop *coxv1alpha1.Loop, verified, 
 	creds := loop.Spec.Workspace.GitCredentialSecret != ""
 	prov, _ := deliverProviderForRepo(repo)
 	apiBase := deliverAPIBase(repo, prov)
+	prBase := deliverPRURLBase(repo, prov)
 	draft := deliverDraft(loop)
 
 	mounts := []corev1.VolumeMount{
@@ -562,6 +570,7 @@ BRANCH=` + shellQuote(branch) + `
 BASE=` + shellQuote(base) + `
 PINNED=` + shellQuote(verified) + `
 API_BASE=` + shellQuote(apiBase) + `
+PR_BASE=` + shellQuote(prBase) + `
 DRAFT=` + strconv.FormatBool(draft) + `
 ` + apiAuthLine + `
 # --- refusal: the delivery branch must NOT equal the base branch or a
@@ -597,12 +606,14 @@ else
 fi
 [ -n "${PR_NUM}" ] || { echo "deliver push: no PR number returned (API unreachable or refused)"; exit 1; }
 # Write the result to the termination log (the operator reads it via the
-# APIReader — kubelet-recorded, not a claim).
+# APIReader — kubelet-recorded, not a claim). prURL is the PR PAGE (not the
+# API base): the operator validates it strictly against the repo host
+# (github.com for a GitHub delivery) + the /pulls/<n> path.
 {
   echo "branch=${BRANCH}"
   echo "commit=${PINNED}"
   echo "prNumber=${PR_NUM}"
-  echo "prURL=${API_BASE}/${OWNER}/${REPO_NAME}/pulls/${PR_NUM}"
+  echo "prURL=${PR_BASE}/pulls/${PR_NUM}"
 } > /dev/termination-log
 `
 	return corev1.Container{
@@ -636,6 +647,30 @@ func deliverAPIBase(repo string, prov deliverProvider) string {
 		return ""
 	}
 	return u.Scheme + "://" + u.Host + "/api/v1/repos"
+}
+
+// deliverPRURLBase is the PR page base (NOT the API base): for GitHub, the
+// repo's github.com page (https://github.com/<owner>/<repo> — the PR page
+// is /<owner>/<repo>/pulls/<n>; the API host api.github.com carries no PR
+// pages); for a Gitea-compatible provider, the repo host's page
+// (<scheme>://<host>/<owner>/<repo>).
+func deliverPRURLBase(repo string, prov deliverProvider) string {
+	u, err := url.Parse(repo)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	path := strings.TrimSuffix(u.Path, "/")
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		path = path[:i]
+	}
+	if strings.HasSuffix(path, ".git") {
+		path = strings.TrimSuffix(path, ".git")
+	}
+	host := u.Host
+	if prov == deliverProviderGitHub {
+		host = "github.com"
+	}
+	return u.Scheme + "://" + host + path
 }
 
 // deliverNonRootUID / deliverTrue / deliverFalse are the hardened profile
@@ -811,6 +846,13 @@ func (r *LoopReconciler) cleanupDeliverNetpol(ctx context.Context, loop *coxv1al
 // repo host, and the proxy must allowlist BOTH hosts. A nil (no external
 // repo) or in-cluster repo returns no hosts (the direct repo-peer rule
 // covers it, no proxy hop).
+// deliverProxyHost is the egress-proxy SNI allowlist entry (the I42
+// host:port allow form, like the AgentPolicy network allows) for a single
+// host:443 (the deliver Job's git push + the provider API both dial 443).
+func deliverProxyHost(host string) string {
+	return host + ":443"
+}
+
 func (r *LoopReconciler) deliverEgressProxyHosts(loop *coxv1alpha1.Loop) []string {
 	if !deliveryExpected(loop) {
 		return nil
@@ -823,29 +865,33 @@ func (r *LoopReconciler) deliverEgressProxyHosts(loop *coxv1alpha1.Loop) []strin
 	if host == "" {
 		return nil
 	}
-	hosts := []string{host}
+	hosts := []string{deliverProxyHost(host)}
 	if prov == deliverProviderGitHub {
-		hosts = append(hosts, "api.github.com")
+		hosts = append(hosts, deliverProxyHost("api.github.com"))
 	}
 	return hosts
 }
 
-// ensureDeliverReadback reads the deliver Job pod's push container
-// termination message via the APIReader (pod-blind, like the S3/S4
-// read-backs), validates it (parseDeliverTermination), and — on a valid
-// message — writes status.delivery + the Delivered=True condition. It is
-// the operator's delivery read-back; the push container is the Job's MAIN
-// container, so its termination message rides in containerStatuses[push].
+// deliverReadbackChanged is the shared "read the deliver pod's push state via
+// the APIReader" step (pod-blind, like the S3/S4 read-backs). It returns
+// (changed, error): changed is true when this call set a condition or wrote
+// status.delivery (the caller's shared Status().Update persists it); error is
+// non-nil only for an unexpected read state (multiple deliver pods).
 //
-// The read is a NO-OP when: delivery is not expected, there is no Job, the
-// Job has not succeeded, or the push container has not terminated. A
-// malformed or foreign message is rejected (no status write; the next
-// re-read requeues — the pod may be mid-write). A terminated non-zero push
-// (or a failed init) is Delivered=False reason DeliveryFailed (terminal —
-// the Job is not retried).
-func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if !deliveryExpected(loop) || loop.Status.Delivery != nil {
-		return nil
+// The read is a no-op when there is no pod yet, the push container has not
+// terminated, or the outcome for this commit is already recorded. A non-zero
+// push (or a failed init) is Delivered=False reason DeliveryFailed (terminal —
+// the Job is not retried). A malformed or foreign termination message is
+// rejected (no status write; the next re-read requeues — the pod may be
+// mid-write).
+func (r *LoopReconciler) deliverReadbackChanged(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	if !deliveryExpected(loop) {
+		return false, nil
+	}
+	// Idempotent: a recorded delivery FOR THIS COMMIT is terminal (the read
+	// is done; a new commit re-delivers via the stale guard).
+	if loop.Status.Delivery != nil && loop.Status.Delivery.Commit == loop.Status.CurrentVerify.VerifiedCommit {
+		return false, nil
 	}
 	// Find the deliver Job's pod (pod-blind: list by the deliver-for label).
 	reader := r.apiReader
@@ -856,13 +902,13 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 	if err := reader.List(ctx, list,
 		client.InNamespace(loop.Namespace),
 		client.MatchingLabels{deliverForLabel: loop.Name}); err != nil {
-		return fmt.Errorf("list deliver pods for %s: %w", loop.Name, err)
+		return false, fmt.Errorf("list deliver pods for %s: %w", loop.Name, err)
 	}
 	if len(list.Items) == 0 {
-		return nil // no pod yet (the Job was just created)
+		return false, nil // no pod yet (the Job was just created)
 	}
 	if len(list.Items) > 1 {
-		return fmt.Errorf("multiple deliver pods for %s (got %d); refusing to read", loop.Name, len(list.Items))
+		return false, fmt.Errorf("multiple deliver pods for %s (got %d); refusing to read", loop.Name, len(list.Items))
 	}
 	pod := list.Items[0]
 	// The push container is the MAIN container: its state rides in
@@ -875,7 +921,7 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 		}
 	}
 	if push == nil || push.State.Terminated == nil {
-		return nil // push has not terminated yet
+		return false, nil // push has not terminated yet
 	}
 	terminated := push.State.Terminated
 	if terminated.ExitCode != 0 {
@@ -886,7 +932,7 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 			coxv1alpha1.ReasonDeliveryFailed,
 			fmt.Sprintf("deliver push container exited %d: %s (no retry; clear status.delivery + the condition to re-run delivery)",
 				terminated.ExitCode, strings.TrimSpace(terminated.Reason)))
-		return nil
+		return true, nil
 	}
 	// Validate the termination message STRICTLY.
 	outcome, ok := parseDeliverTermination(terminated.Message, loop)
@@ -897,7 +943,7 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 		// inspect the pod's logs).
 		logf.FromContext(ctx).Info("deliver termination message rejected (malformed or foreign)",
 			"loop", loop.Name, "bytes", len(terminated.Message))
-		return nil
+		return false, nil
 	}
 	// Write status.delivery + the Delivered=True condition.
 	loop.Status.Delivery = &coxv1alpha1.DeliverStatus{
@@ -912,6 +958,26 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 	if r.Recorder != nil {
 		r.Recorder.Eventf(loop, corev1.EventTypeNormal, "Delivered",
 			"delivered %s to branch %s (PR %d)", outcome.Commit, outcome.Branch, outcome.PRNumber)
+	}
+	return true, nil
+}
+
+// ensureDeliverReadback reads the deliver pod's push termination message
+// (deliverReadbackChanged) and persists the outcome via its OWN
+// Status().Update (not the Reconcile's shared Update: a delivery outcome
+// must never be skipped by an unrelated status write — a commit-scoped
+// status.delivery + Delivered=True condition that is lost leaves the Loop
+// InProgress with a pushed branch and an unrecorded PR).
+func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	changed, err := r.deliverReadbackChanged(ctx, loop)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if err := r.Status().Update(ctx, loop); err != nil {
+		return fmt.Errorf("persist delivery outcome for %s: %w", loop.Name, err)
 	}
 	return nil
 }

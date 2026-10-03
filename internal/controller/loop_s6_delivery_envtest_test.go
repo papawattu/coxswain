@@ -264,13 +264,21 @@ func s6Cond(loop *coxv1alpha1.Loop) (bool, metav1.ConditionStatus, string) {
 
 // s6ValidTermination builds the push container's valid four-line termination
 // message for THIS loop: branch= (the loop's delivery branch), commit= (the
-// pinned verifiedCommit), prNumber=7, prURL= (the PR PAGE — <repo> without
-// the .git suffix + /pulls/7; the operator's prURL validation compares the
-// host against the repo host, so the port may be present or absent).
+// pinned verifiedCommit), prNumber=7, prURL= (the provider's own html_url —
+// the PR page on the allowed host at the provider's exact path for this repo:
+// <repo-without-.git>/pulls/7 for a Gitea repo, https://github.com/<o>/<r>/
+// pull/7 for a GitHub delivery; the operator validates it exactly).
 func s6ValidTermination(loop *coxv1alpha1.Loop) string {
 	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
 	commit := loop.Status.CurrentVerify.VerifiedCommit
-	prURL := strings.TrimSuffix(loop.Spec.Workspace.Repo, ".git") + "/pulls/7"
+	prov, _ := deliverProviderForRepo(loop.Spec.Workspace.Repo)
+	var prURL string
+	if prov == deliverProviderGitHub {
+		o, n := deliverRepoOwnerName(loop.Spec.Workspace.Repo)
+		prURL = "https://github.com/" + o + "/" + n + "/pull/7"
+	} else {
+		prURL = strings.TrimSuffix(loop.Spec.Workspace.Repo, ".git") + "/pulls/7"
+	}
 	return "branch=" + branch + "\ncommit=" + commit + "\nprNumber=7\nprURL=" + prURL + "\n"
 }
 
@@ -546,15 +554,36 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://evil.example.com/samples/gocli/pulls/7\n", loop)
 		Expect(ok).To(BeFalse(), "a foreign-host prURL must be rejected")
 
+		By("rejecting a message with the WRONG prURL path (a foreign repo, or the wrong per-provider segment)")
+		// The loop's repo is the in-cluster Gitea <owner>/<repo>; a prURL that
+		// names a different repo (the kind-recorded .../samples/pulls/7 shape)
+		// or the issues path must be rejected.
+		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/pulls/7\n", loop)
+		Expect(ok).To(BeFalse(), "a prURL that drops the repo name (wrong repo) must be rejected")
+
 		By("rejecting an over-sized message")
 		_, ok = parseDeliverTermination(strings.Repeat("x", deliverTermMsgMaxBytes+1), loop)
 		Expect(ok).To(BeFalse())
 
-		By("requiring a positive prNumber and a /pulls/<n> path suffix")
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=0\nprURL=http://gitea.samples.svc/samples/gocli/pulls/0\n", loop)
+		By("requiring a positive prNumber and the exact per-provider PR path for this repo")
+		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=0\nprURL=http://gitea.samples.svc:3000/samples/gocli/pulls/0\n", loop)
 		Expect(ok).To(BeFalse(), "prNumber must be positive")
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc/samples/gocli/issues/7\n", loop)
-		Expect(ok).To(BeFalse(), "the prURL path must end in /pulls/<prNumber>")
+		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/gocli/issues/7\n", loop)
+		Expect(ok).To(BeFalse(), "the prURL path must be exactly the provider's PR path for this repo")
+
+		By("accepting the GitHub per-provider path (/pull/<n>) for a github.com delivery")
+		ghLoop := &coxv1alpha1.Loop{
+			ObjectMeta: s6SampleLoopObjMeta(),
+			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/samples/gocli.git"}},
+			Status: coxv1alpha1.LoopStatus{
+				Phase:         coxv1alpha1.LoopPhaseSucceeded,
+				CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6HeadCommit},
+			},
+		}
+		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://github.com/samples/gocli/pull/7\n", ghLoop)
+		Expect(ok).To(BeTrue(), "GitHub's /pull/<n> PR page must be accepted for a github.com delivery")
+		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://github.com/samples/gocli/pulls/7\n", ghLoop)
+		Expect(ok).To(BeFalse(), "a github.com prURL with /pulls/<n> must be rejected (wrong segment)")
 	})
 
 	It("is idempotent: no new deliver Job once status.delivery.commit == the pinned verifiedCommit", func() {

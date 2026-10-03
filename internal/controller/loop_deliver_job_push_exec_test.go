@@ -16,6 +16,7 @@ package controller
 
 import (
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -116,7 +117,9 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	// The fake Gitea API: GET /pulls (idempotency lookup) -> empty list;
 	// POST /pulls (create) -> draft PR number 42. Records every POST so the
 	// test can assert exactly one POST with the credential's Basic header.
-	apiBase, posts := newFakeGiteaAPI(t)
+	// The html_url the fake returns names the REAL repo (samples/gocli) —
+	// the push script records it verbatim as prURL.
+	apiBase, posts := newFakeGiteaAPI(t, "samples", "gocli", "http", "gitea.example:3000")
 
 	// The credential files (the /workspace-creds mount stand-in).
 	credsDir := t.TempDir()
@@ -206,9 +209,82 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	if outcome.PRNumber != 42 {
 		t.Fatalf("termination prNumber %d; want 42 (the fake API's draft PR number)", outcome.PRNumber)
 	}
-	if !strings.Contains(outcome.PRURL, "/pulls/42") {
-		t.Fatalf("termination prURL %s; want a /pulls/42 path on the repo host", outcome.PRURL)
+	// prURL is the provider's own html_url (the script no longer assembles it):
+	// the PR page of THIS repo (samples/gocli), not a base that drops the
+	// repo name (the old deliverPRURLBase produced .../samples/pulls/42 —
+	// the strict parser rejects that path now, which is the regression this
+	// check guards).
+	wantPRURL := "http://gitea.example:3000/samples/gocli/pulls/42"
+	if outcome.PRURL != wantPRURL {
+		t.Fatalf("termination prURL %s; want the provider html_url %s (the PR page of THIS repo)", outcome.PRURL, wantPRURL)
 	}
+}
+
+// TestDeliverTerminationPRURLStrict (S6 review P1) pins the strict
+// prURL validation the operator applies to the push container's html_url:
+// an EXACT per-provider path match for the repo spec.workspace.repo names.
+// The two "real" URLs (the kind Gitea repo and a GitHub repo) FAIL on the
+// old code: the old validator's /pulls/<n> suffix accepted the GitHub
+// /pull/<n> shape, and the old push-script PR_BASE builder dropped the repo
+// name (deliverPRURLBase -> .../samples/pulls/1, the kind-recorded prURL).
+func TestDeliverTerminationPRURLStrict(t *testing.T) {
+	// The kind Gitea repo (the real kind-run URL).
+	giteaLoop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "urltask1"},
+		Spec: coxv1alpha1.LoopSpec{
+			Workspace: coxv1alpha1.Workspace{Repo: "http://gitea.samples.svc:3000/samples/gocli.git"},
+			Delivery:  &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "1111111111111111111111111111111111111111"}},
+	}
+	branch := deliverBranchName(deliverBranchPrefix(giteaLoop), giteaLoop.Name)
+
+	t.Run("Gitea: the kind repo's own PR page is accepted", func(t *testing.T) {
+		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=1\nprURL=http://gitea.samples.svc:3000/samples/gocli/pulls/1\n"
+		if _, ok := parseDeliverTermination(msg, giteaLoop); !ok {
+			t.Fatal("the kind Gitea repo's own PR page URL (its html_url) must be accepted")
+		}
+	})
+
+	t.Run("Gitea: the kind-recorded wrong-repo URL is rejected", func(t *testing.T) {
+		// The s6e kind run recorded this (deliverPRURLBase dropped the repo
+		// name). It names a different repo: rejected.
+		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=1\nprURL=http://gitea.samples.svc:3000/samples/pulls/1\n"
+		if _, ok := parseDeliverTermination(msg, giteaLoop); ok {
+			t.Fatal("a prURL that drops the repo name (.../samples/pulls/1) must be rejected (it names a different repo)")
+		}
+	})
+
+	// A GitHub delivery.
+	ghLoop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "urltask1"},
+		Spec: coxv1alpha1.LoopSpec{
+			Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/samples/gocli.git"},
+			Delivery:  &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "1111111111111111111111111111111111111111"}},
+	}
+
+	t.Run("GitHub: the /pull/<n> page is accepted", func(t *testing.T) {
+		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=7\nprURL=https://github.com/samples/gocli/pull/7\n"
+		if _, ok := parseDeliverTermination(msg, ghLoop); !ok {
+			t.Fatal("GitHub's /pull/<n> PR page (its html_url) must be accepted")
+		}
+	})
+
+	t.Run("GitHub: the /pulls/<n> path is rejected (wrong segment)", func(t *testing.T) {
+		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=7\nprURL=https://github.com/samples/gocli/pulls/7\n"
+		if _, ok := parseDeliverTermination(msg, ghLoop); ok {
+			t.Fatal("a github.com prURL with /pulls/<n> must be rejected (GitHub's PR page is /pull/<n>)")
+		}
+	})
+
+	t.Run("Gitea: a path that names a different repo is rejected", func(t *testing.T) {
+		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=1\nprURL=http://gitea.samples.svc:3000/samples/other-repo/pulls/1\n"
+		if _, ok := parseDeliverTermination(msg, giteaLoop); ok {
+			t.Fatal("a prURL naming a different repo than spec.workspace.repo must be rejected")
+		}
+	})
 }
 
 // fakeGiteaAPICall records one PR-create POST the fake Gitea API saw.
@@ -218,28 +294,42 @@ type fakeGiteaAPICall struct {
 }
 
 // newFakeGiteaAPI stands up a Gitea-compatible provider API: GET /pulls
-// (idempotency lookup) -> [] (no open PR yet, so the create path runs); POST
-// /pulls (create) -> a draft PR with number 42. It returns the API base
-// (rewritten into the script's API_BASE) and the recorded PR-create POSTs.
-// The test inspects `posts` AFTER the script runs, so it is returned by
-// pointer.
-func newFakeGiteaAPI(t *testing.T) (apiBase string, posts *[]fakeGiteaAPICall) {
+// (idempotency lookup) -> the single open PR when one exists (the script
+// reuses it — idempotent), else []; POST /pulls (create) -> a draft PR with
+// number 42. Every response carries the provider's OWN html_url (the
+// PR page: <host>/<owner>/<repo>/pulls/<n>) — the push script records it as
+// prURL and the operator's strict parser validates it exactly. It returns
+// the API base (rewritten into the script's API_BASE) and the recorded
+// PR-create POSTs. The test inspects `posts` AFTER the script runs, so it
+// is returned by pointer.
+func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host string) (apiBase string, posts *[]fakeGiteaAPICall) {
 	t.Helper()
 	var mu sync.Mutex
 	var postList []fakeGiteaAPICall
+	var openPR int // 0 = no open PR yet
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			// No open PR yet: the create path runs.
+			// The open-PR lookup: [] until a create POST has run.
+			mu.Lock()
+			n := openPR
+			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte("[]"))
+			if n == 0 {
+				_, _ = w.Write([]byte("[]"))
+				return
+			}
+			_, _ = fmt.Fprintf(w, `[{"number":%d,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/%d"}]`,
+				n, scheme, host, owner, repoName, n)
 		case http.MethodPost:
 			mu.Lock()
 			postList = append(postList, fakeGiteaAPICall{method: r.Method, auth: r.Header.Get("Authorization")})
+			openPR = 42
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"number":42,"state":"open","draft":true,"url":"http://gitea.example:3000/samples/gocli/pulls/42"}`))
+			_, _ = fmt.Fprintf(w, `{"number":42,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/42"}`,
+				scheme, host, owner, repoName)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}

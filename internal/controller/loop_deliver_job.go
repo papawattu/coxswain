@@ -130,6 +130,12 @@ const (
 	deliverProviderGitea
 )
 
+// draftTitlePrefix is the PR-title prefix for a draft delivery. Gitea's PR
+// API ignores the "draft" field (Gitea has no draft PRs), so a Gitea draft
+// delivery is marked in the PR title instead ("WIP: "); GitHub honours the
+// field and the prefix stays empty.
+var draftTitlePrefix = ""
+
 func deliverProviderForRepo(repo string) (deliverProvider, string) {
 	u, err := url.Parse(repo)
 	if err != nil || u.Host == "" {
@@ -140,6 +146,25 @@ func deliverProviderForRepo(repo string) (deliverProvider, string) {
 		return deliverProviderGitHub, host
 	}
 	return deliverProviderGitea, host
+}
+
+// deliverRepoOwnerName returns the owner and repo name a spec.workspace.repo
+// URL names: the last two path segments (<owner>/<repo>), with a .git suffix
+// stripped from the name. The provider API paths (/repos/<owner>/<name>) and
+// the PR page paths (/<owner>/<name>/pull[s]/<n>) are derived from it. A repo
+// URL without exactly those two segments returns empty values.
+func deliverRepoOwnerName(repo string) (owner, name string) {
+	u, err := url.Parse(repo)
+	if err != nil {
+		return "", ""
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(segs) < 2 {
+		return "", ""
+	}
+	name = strings.TrimSuffix(segs[len(segs)-1], ".git")
+	owner = segs[len(segs)-2]
+	return owner, name
 }
 
 // deliverJobName is the deliver Job's name: <loop>-deliver.
@@ -601,8 +626,10 @@ func (r *LoopReconciler) deliverPushContainer(loop *coxv1alpha1.Loop, verified, 
 	creds := loop.Spec.Workspace.GitCredentialSecret != ""
 	prov, _ := deliverProviderForRepo(repo)
 	apiBase := deliverAPIBase(repo, prov)
-	prBase := deliverPRURLBase(repo, prov)
 	draft := deliverDraft(loop)
+	if draft && prov == deliverProviderGitea {
+		draftTitlePrefix = "WIP: "
+	}
 
 	mounts := []corev1.VolumeMount{
 		{Name: deliverScratchVol, MountPath: deliverScratchPath},
@@ -626,8 +653,8 @@ BRANCH=` + shellQuote(branch) + `
 BASE=` + shellQuote(base) + `
 PINNED=` + shellQuote(verified) + `
 API_BASE=` + shellQuote(apiBase) + `
-PR_BASE=` + shellQuote(prBase) + `
 DRAFT=` + strconv.FormatBool(draft) + `
+TITLE_PREFIX=` + shellQuote(draftTitlePrefix) + `
 # --- refusal: the delivery branch must NOT equal the base branch or a
 # default branch (main/master). Pushing onto a default branch would deliver
 # the agent's code straight to the operator's mainline — the PR gate is the
@@ -660,27 +687,35 @@ case "${REPO_NAME}" in
   *.git) REPO_NAME=${REPO_NAME%.git} ;;
 esac
 # Look for an existing open PR for the branch (reuse it — idempotent).
-EXISTING=$(curl -sfS -H "$API_AUTH" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls?state=open&head=${OWNER}:${BRANCH}" | tr -d '\n' | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -1) || EXISTING=""
-if [ -n "${EXISTING}" ]; then
-  PR_NUM=${EXISTING}
+# The lookup and the create both return the PR's html_url: the operator's
+# trust boundary is the provider's OWN URL (never one the script assembles).
+EXISTING=$(curl -sfS -H "$API_AUTH" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls?state=open&head=${OWNER}:${BRANCH}") || EXISTING=""
+PR_NUM=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+PR_URL=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's/.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+if [ -n "${PR_NUM}" ]; then
+  # An open PR for the branch: reuse it (idempotent).
+  [ -n "${PR_URL}" ] || { echo "deliver push: existing PR ${PR_NUM} has no html_url"; exit 1; }
 else
-  PAYLOAD=$(printf '{"title":"coxswain: %s","head":"%s","base":"%s","body":"Delivered by coxswain from verified commit %s.","draft":%s}' \
-    "${BRANCH}" "${BRANCH}" "${BASE}" "${PINNED}" "${DRAFT}")
+  PAYLOAD=$(printf '{"title":"%scoxswain: %s","head":"%s","base":"%s","body":"Delivered by coxswain from verified commit %s.","draft":%s}' \
+    "${TITLE_PREFIX}" "${BRANCH}" "${BRANCH}" "${BASE}" "${PINNED}" "${DRAFT}")
   # Gitea's PR create can reject a non-existent base branch; the push above
   # already pushed the delivery branch, and the base branch exists on the
   # remote (clone-base fetched it) — a failed create is a hard failure.
-  PR_NUM=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p') || { echo "deliver push: PR create failed (see API response)"; exit 1; }
+  CREATED=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls") || { echo "deliver push: PR create failed (see API response)"; exit 1; }
+  PR_NUM=$(printf '%s' "${CREATED}" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+  PR_URL=$(printf '%s' "${CREATED}" | sed -n 's/.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 fi
 [ -n "${PR_NUM}" ] || { echo "deliver push: no PR number returned (API unreachable or refused)"; exit 1; }
+[ -n "${PR_URL}" ] || { echo "deliver push: no PR html_url returned"; exit 1; }
 # Write the result to the termination log (the operator reads it via the
-# APIReader — kubelet-recorded, not a claim). prURL is the PR PAGE (not the
-# API base): the operator validates it strictly against the repo host
-# (github.com for a GitHub delivery) + the /pulls/<n> path.
+# APIReader — kubelet-recorded, not a claim). prURL is the PR PAGE the
+# provider returned (html_url, not the API base): the operator validates it
+# strictly (allowed host + the exact per-provider PR path for THIS repo).
 {
   echo "branch=${BRANCH}"
   echo "commit=${PINNED}"
   echo "prNumber=${PR_NUM}"
-  echo "prURL=${PR_BASE}/pulls/${PR_NUM}"
+  echo "prURL=${PR_URL}"
 } > /dev/termination-log
 `
 	return corev1.Container{
@@ -717,26 +752,14 @@ func deliverAPIBase(repo string, prov deliverProvider) string {
 	return u.Scheme + "://" + u.Host + "/api/v1/repos"
 }
 
-// deliverPRURLBase is the PR page base (NOT the API base): for GitHub, the
-// repo's github.com page (https://github.com/<owner>/<repo> — the PR page
-// is /<owner>/<repo>/pulls/<n>; the API host api.github.com carries no PR
-// pages); for a Gitea-compatible provider, the repo host's page
-// (<scheme>://<host>/<owner>/<repo>).
-func deliverPRURLBase(repo string, prov deliverProvider) string {
-	u, err := url.Parse(repo)
-	if err != nil || u.Host == "" {
-		return ""
-	}
-	path := strings.TrimSuffix(u.Path, "/")
-	if i := strings.LastIndexByte(path, '/'); i >= 0 {
-		path = path[:i]
-	}
-	path = strings.TrimSuffix(path, ".git")
-	host := u.Host
+// deliverPRPathSegment is the PR page path segment per provider: GitHub
+// pages PRs at /<owner>/<repo>/pull/<n> (singular) and Gitea at
+// /<owner>/<repo>/pulls/<n> (plural).
+func deliverPRPathSegment(prov deliverProvider) string {
 	if prov == deliverProviderGitHub {
-		host = githubHost
+		return "pull"
 	}
-	return u.Scheme + "://" + host + path
+	return "pulls"
 }
 
 // deliverNonRootUID / deliverTrue / deliverFalse are the hardened profile
@@ -760,9 +783,13 @@ var (
 //     any other commit is rejected: the deliver Job pushes ONLY the
 //     verified commit).
 //   - prNumber is a positive integer.
-//   - prURL is a well-formed URL whose host is the repo host (or, for a
-//     GitHub delivery, github.com — the PR URL's host is github.com, not
-//     api.github.com) and whose path ends in /pulls/<prNumber>.
+//   - prURL is a well-formed URL whose host is allowed (the repo host, or
+//     github.com for a GitHub delivery) and whose path is EXACTLY the
+//     provider's PR page path for this repo: /<owner>/<repo>/pulls/<n>
+//     (Gitea) or /<owner>/<repo>/pull/<n> (GitHub), with owner/repo derived
+//     from spec.workspace.repo. The PR page comes from the provider's own
+//     html_url (never assembled by the push script): a URL that names any
+//     other repo, or the wrong path segment, is rejected.
 //
 // A malformed or foreign message is rejected (ok=false, no error): the
 // operator re-reads (the pod may be in the middle of writing) and requeues.
@@ -801,8 +828,8 @@ func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome
 	if err != nil || prNum <= 0 {
 		return deliverOutcome{}, false
 	}
-	// prURL MUST be well-formed, sized, on an allowed host, with a path
-	// ending in /pulls/<prNumber>.
+	// prURL MUST be well-formed, sized, on an allowed host, and its path
+	// MUST be exactly the provider's PR page path for THIS repo.
 	if len(prURL) > deliverPRURLMaxBytes {
 		return deliverOutcome{}, false
 	}
@@ -818,7 +845,16 @@ func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome
 	} else if host != repoHost {
 		return deliverOutcome{}, false
 	}
-	if !strings.HasSuffix(u.Path, fmt.Sprintf("/pulls/%d", prNum)) {
+	// The path is EXACTLY /<owner>/<repo>/pull[s]/<prNumber> for this repo
+	// (owner/repo from spec.workspace.repo; the segment per provider —
+	// GitHub /pull/<n>, Gitea /pulls/<n>): a URL that names any other repo
+	// or the wrong segment is rejected.
+	owner, repoName := deliverRepoOwnerName(loop.Spec.Workspace.Repo)
+	if owner == "" || repoName == "" {
+		return deliverOutcome{}, false
+	}
+	wantPath := "/" + owner + "/" + repoName + "/" + deliverPRPathSegment(prov) + "/" + prNumStr
+	if u.Path != wantPath {
 		return deliverOutcome{}, false
 	}
 	return deliverOutcome{Branch: branch, Commit: commit, PRNumber: prNum, PRURL: prURL}, true

@@ -58,9 +58,9 @@ func TestClusterDomainFlowsThroughProxyURLs(t *testing.T) {
 		t.Fatalf("proxyServiceURL with a non-default domain: got %q, want %q", got, want)
 	}
 
-	// *_PROXY host: <loop>-egress.<ns>.svc.<domain>.
+	// *_PROXY host: <loop>-egress-proxy.<ns>.svc.<domain>.
 	if got, want := r.egressProxyServiceURL(loop, ns),
-		"http://"+loop+"-egress."+ns+".svc."+i44AltDomain+":3128"; got != want {
+		"http://"+loop+"-egress-proxy."+ns+".svc."+i44AltDomain+":3128"; got != want {
 		t.Fatalf("egressProxyServiceURL with a non-default domain: got %q, want %q", got, want)
 	}
 
@@ -85,7 +85,7 @@ func TestClusterDomainDefaultsToClusterLocal(t *testing.T) {
 	if got := r.proxyServiceURL(loop, ns); got != "http://"+loop+"-proxy."+ns+".svc.cluster.local:8080" {
 		t.Fatalf("proxyServiceURL default: got %q", got)
 	}
-	if got := r.egressProxyServiceURL(loop, ns); got != "http://"+loop+"-egress."+ns+".svc.cluster.local:3128" {
+	if got := r.egressProxyServiceURL(loop, ns); got != "http://"+loop+"-egress-proxy."+ns+".svc.cluster.local:3128" {
 		t.Fatalf("egressProxyServiceURL default: got %q", got)
 	}
 }

@@ -125,12 +125,12 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// No egress proxy pod.
 		pod := &corev1.Pod{}
-		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "noallow-loop-egress"}, pod)
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "noallow-loop-egress-proxy"}, pod)
 		Expect(err).To(HaveOccurred(), "no egress proxy pod when there are no network allows")
 
 		// No egress proxy Service.
 		svc := &corev1.Service{}
-		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "noallow-loop-egress"}, svc)
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "noallow-loop-egress-proxy"}, svc)
 		Expect(err).To(HaveOccurred(), "no egress proxy Service when there are no network allows")
 	})
 
@@ -155,7 +155,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// Egress proxy pod exists.
 		pod := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop + "-egress"}, pod)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop + "-egress-proxy"}, pod)).To(Succeed(),
 			"the egress proxy pod must be created when network allows are present")
 
 		// Verify the pod carries the correct labels (DISJOINT from agent/model proxy).
@@ -230,7 +230,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// Egress proxy Service exists.
 		svc := &corev1.Service{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop + "-egress"}, svc)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i42dAllowLoop + "-egress-proxy"}, svc)).To(Succeed(),
 			"the egress proxy Service must be created")
 		Expect(svc.Spec.Ports).To(HaveLen(1))
 		Expect(svc.Spec.Ports[0].Port).To(BeEquivalentTo(3128))
@@ -267,7 +267,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// Mark the egress proxy pod as Ready.
 		pod := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "ready-loop-egress"}, pod)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "ready-loop-egress-proxy"}, pod)).To(Succeed())
 		pod.Status.Conditions = []corev1.PodCondition{{
 			Type:   corev1.PodReady,
 			Status: corev1.ConditionTrue,
@@ -301,7 +301,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		// Pre-create a FOREIGN pod with the egress proxy name (not owned by the Loop).
 		foreignPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "conflict-loop-egress",
+				Name:      "conflict-loop-egress-proxy",
 				Namespace: ns,
 			},
 			Spec: corev1.PodSpec{
@@ -318,7 +318,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// The foreign pod must still exist (not deleted — I2 never-take-over).
 		gotForeign := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "conflict-loop-egress"}, gotForeign)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "conflict-loop-egress-proxy"}, gotForeign)).To(Succeed(),
 			"the foreign egress proxy pod must NOT be deleted (I2 never-take-over)")
 
 		// The Loop must have an EgressProxyConflict condition (P2 review: the
@@ -431,7 +431,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		pod := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "disjoint-loop-egress"}, pod)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "disjoint-loop-egress-proxy"}, pod)).To(Succeed())
 
 		// The agent KubeArmorPolicy (C6b) selects on coxswain.io/loop.
 		// The egress proxy pod must NOT have that label, or the agent's exec
@@ -486,7 +486,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		// Pre-create a FOREIGN pod with the egress proxy name (not owned by the Loop).
 		foreignPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      loopName + "-egress",
+				Name:      loopName + "-egress-proxy",
 				Namespace: ns,
 			},
 			Spec: corev1.PodSpec{
@@ -566,7 +566,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		// Pre-create a FOREIGN pod with the egress proxy name.
 		foreignPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      loopName + "-egress",
+				Name:      loopName + "-egress-proxy",
 				Namespace: ns,
 			},
 			Spec: corev1.PodSpec{
@@ -618,7 +618,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 
 		// The foreign pod must still exist (I2 never-take-over, even on cleanup).
 		gotForeign := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-egress"}, gotForeign)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-egress-proxy"}, gotForeign)).To(Succeed(),
 			"the foreign pod must NOT be deleted by the cleanup path either")
 	})
 

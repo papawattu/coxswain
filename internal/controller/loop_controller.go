@@ -494,20 +494,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// termination message is read via the APIReader (pod-blind, like the S3/
 	// S4 read-backs) and written to status.delivery + the Delivered
 	// condition (ensureDeliverReadback).
-	deliverRequeue := false
-	if ok, err := r.ensureDeliverJob(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
-	} else if ok {
-		// The deliver step made a durable change (created the Job, or deleted
-		// the stale Job) and needs another reconcile to observe the result —
-		// map it like the verify stale guard: a 5s RequeueAfter (no retry
-		// loop, no controller error).
-		deliverRequeue = true
-	}
-	if err := r.ensureDeliverNetPolicies(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.ensureDeliverReadback(ctx, &loop); err != nil {
+	deliverRequeue, err := r.ensureDeliver(ctx, &loop)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
@@ -524,16 +512,12 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// (spec.policyRefs[]). The operator computes the hash and stores it in
 	// status.policy.effectiveHash so the decision audit shows what the agent was
 	// allowed to do (D32); the hash is over the union, not stored allows.
-	if effectiveHash, found, err := r.effectivePolicyHash(ctx, &loop); err != nil {
+	hashChanged, err := r.recordEffectivePolicyHash(ctx, &loop)
+	if err != nil {
 		return ctrl.Result{}, err
-	} else if found {
-		if loop.Status.Policy == nil {
-			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
-		}
-		if loop.Status.Policy.EffectiveHash != effectiveHash {
-			loop.Status.Policy.EffectiveHash = effectiveHash
-			changed = true
-		}
+	}
+	if hashChanged {
+		changed = true
 	}
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
 	// container's termination message (read via the operator's own APIReader
@@ -721,6 +705,27 @@ func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alp
 		return "", false, err
 	}
 	return policy.EffectiveHash(union), true, nil
+}
+
+// recordEffectivePolicyHash records the effective AgentPolicy hash (C6a,
+// ADR-0007 Q2) into status.policy.effectiveHash. Returns (changed, error):
+// changed is true when the hash was written and differs from the stored value
+// (the caller ORs it into its changed flag for the shared Status().Update).
+// Extracted from Reconcile so the top-level reconcile stays within the
+// gocyclo budget.
+func (r *LoopReconciler) recordEffectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	effectiveHash, found, err := r.effectivePolicyHash(ctx, loop)
+	if err != nil || !found {
+		return false, err
+	}
+	if loop.Status.Policy == nil {
+		loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+	}
+	if loop.Status.Policy.EffectiveHash == effectiveHash {
+		return false, nil
+	}
+	loop.Status.Policy.EffectiveHash = effectiveHash
+	return true, nil
 }
 
 // enforcementStatus (D30, ADR-0007) reports whether the eBPF engine is enforcing
@@ -944,8 +949,8 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		noProxy := r.egressNOProxy(loop)
 		agentEnv = append(agentEnv, r.operatorProxyEnv(loop.Name, loop.Namespace)...)
 		agentEnv = append(agentEnv,
-			corev1.EnvVar{Name: "NO_PROXY", Value: noProxy},
-			corev1.EnvVar{Name: "no_proxy", Value: noProxy},
+			corev1.EnvVar{Name: envNoProxy, Value: noProxy},
+			corev1.EnvVar{Name: envNoProxyLower, Value: noProxy},
 		)
 	}
 	for _, e := range loop.Spec.Agent.Env {
@@ -1043,7 +1048,7 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	initContainers = append(initContainers, corev1.Container{
 		Name:    phaseInitContainerName,
 		Image:   r.workspaceGitImage(),
-		Command: []string{"/bin/sh", "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration)},
+		Command: []string{verifySh, "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration)},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
 		},
@@ -1878,15 +1883,29 @@ func (r *LoopReconciler) egressNOProxy(loop *coxv1alpha1.Loop) string {
 // reserved (not emitted): it would catch model traffic, which must bypass the
 // egress proxy via NO_PROXY.
 var operatorProxyEnvNames = map[string]struct{}{
-	"HTTPS_PROXY": {},
-	"https_proxy": {},
-	"HTTP_PROXY":  {},
-	"http_proxy":  {},
-	"NO_PROXY":    {},
-	"no_proxy":    {},
-	"ALL_PROXY":   {},
-	"all_proxy":   {},
+	envHTTPSProxy:    {},
+	envHttpsProxy:    {},
+	envHTTPProxy:     {},
+	envHttpProxy:     {},
+	envNoProxy:       {},
+	envNoProxyLower:  {},
+	envAllProxy:      {},
+	envAllProxyLower: {},
 }
+
+// Proxy env-var names (the operator's, emitted on the agent + model-proxy +
+// workspace-init pods so their HTTP(S) egress routes through the egress proxy
+// and the model proxy). goconst: each name appears in several builders.
+const (
+	envHTTPSProxy    = "HTTPS_PROXY"
+	envHttpsProxy    = "https_proxy"
+	envHTTPProxy     = "HTTP_PROXY"
+	envHttpProxy     = "http_proxy"
+	envNoProxy       = "NO_PROXY"
+	envNoProxyLower  = "no_proxy"
+	envAllProxy      = "ALL_PROXY"
+	envAllProxyLower = "all_proxy"
+)
 
 // operatorProxyEnv returns the operator-owned proxy env vars for the egress
 // proxy (I42d): HTTPS_PROXY/https_proxy and HTTP_PROXY/http_proxy point at
@@ -1895,10 +1914,10 @@ var operatorProxyEnvNames = map[string]struct{}{
 func (r *LoopReconciler) operatorProxyEnv(loopName, namespace string) []corev1.EnvVar {
 	proxyURL := r.egressProxyServiceURL(loopName, namespace)
 	return []corev1.EnvVar{
-		{Name: "HTTPS_PROXY", Value: proxyURL},
-		{Name: "https_proxy", Value: proxyURL},
-		{Name: "HTTP_PROXY", Value: proxyURL},
-		{Name: "http_proxy", Value: proxyURL},
+		{Name: envHTTPSProxy, Value: proxyURL},
+		{Name: envHttpsProxy, Value: proxyURL},
+		{Name: envHTTPProxy, Value: proxyURL},
+		{Name: envHttpProxy, Value: proxyURL},
 	}
 }
 
@@ -1983,17 +2002,46 @@ func (r *LoopReconciler) ensureProxyOrCleanup(ctx context.Context, loop *coxv1al
 // HTTP CONNECT proxy port).
 const egressProxyPort int32 = 3128
 
-// egressProxyPodNameSuffix is the egress proxy pod + Service name suffix
-// (D20: short enough that the name fits the 63-char DNS-1035 budget even for
-// a 55-char (the max valid) Loop name: 55 + 7 + 14 = 76... no — 55 +
-// len("-egress") = 62 ≤ 63).
-const egressProxyPodNameSuffix = "-egress"
+// derivedNameFits is the DNS-1035 metadata.name budget a derived object name
+// must fit under (Kubernetes rejects anything longer).
+const derivedNameBudget = 63
 
-// egressProxyPodName returns the egress proxy pod name for a Loop.
-func egressProxyPodName(loopName string) string { return loopName + egressProxyPodNameSuffix }
+// derivedName returns a DNS-1035 object name for a derived object: the loop
+// name plus the given suffix, UNCHANGED when the full name fits the
+// derivedNameBudget (every Loop except near-max names — the upgrade must not
+// orphan the existing '<loop>-egress-proxy' Deployment/Service/netpol by
+// renaming it). Only when the full name would EXCEED the budget (a 55-char
+// Loop name + "-egress-proxy" = 69) is the loop name truncated to
+// budget-len(suffix)-len(hash)-2 and a 9-char hash of the full loop+suffix
+// string appended, so '<prefix>-<hash><suffix>' stays <= 63 and is stable
+// (deterministic) across reconciles. The truncation keeps the leading part
+// of the name human-readable and the hash makes it unique per Loop.
+func derivedName(loopName, suffix string) string {
+	if full := loopName + suffix; len(full) <= derivedNameBudget {
+		return full
+	}
+	// Truncate the loop name to leave room for the hash + suffix + the two
+	// separators: budget - len(suffix) - 9 (hash) - 1 (the hash's leading -).
+	prefixLen := derivedNameBudget - len(suffix) - 9 - 1
+	hash := shortHash(loopName + suffix)
+	return loopName[:prefixLen] + "-" + hash + suffix
+}
+
+// shortHash returns a 9-char lowercase hex SHA-256 prefix of s — stable
+// (deterministic) across reconciles and long enough to keep per-Loop names
+// unique after truncation.
+func shortHash(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])[:9]
+}
+
+// egressProxyPodName returns the egress proxy pod name for a Loop (D20:
+// '<loop>-egress-proxy', truncated+hashed only for the near-max names that
+// would exceed the 63-char DNS-1035 budget).
+func egressProxyPodName(loopName string) string { return derivedName(loopName, "-egress-proxy") }
 
 // egressProxyServiceName returns the egress proxy Service name for a Loop.
-func egressProxyServiceName(loopName string) string { return loopName + egressProxyPodNameSuffix }
+func egressProxyServiceName(loopName string) string { return derivedName(loopName, "-egress-proxy") }
 
 // egressProxyLabels returns the egress proxy pod + Service labels. These are
 // DISJOINT from the model proxy labels (D33) and from the agent pod labels
@@ -2006,7 +2054,7 @@ func egressProxyLabels(loopName string) map[string]string {
 		"app.kubernetes.io/name":       "coxswain-egress-proxy",
 		"app.kubernetes.io/instance":   loopName,
 		policy.ComponentLabelKey:       netpolEgressProxyComponent,
-		"app.kubernetes.io/part-of":    "coxswain",
+		"app.kubernetes.io/part-of":    partOfCoxswain,
 		"coxswain.io/egress-proxy-for": loopName,
 	}
 }
@@ -2167,7 +2215,7 @@ func (r *LoopReconciler) workspaceInitNeedsProxy(loop *coxv1alpha1.Loop) bool {
 // A port-carrying allow (the egress proxy's allow form is host:port, like
 // the AgentPolicy network allows) is emitted so the proxy matches the port
 // the git client dials (workspaceRepoPort).
-func (r *LoopReconciler) workspaceInitProxyHost(ctx context.Context, loop *coxv1alpha1.Loop) string {
+func (r *LoopReconciler) workspaceInitProxyHost(loop *coxv1alpha1.Loop) string {
 	if !r.workspaceInitNeedsProxy(loop) {
 		return ""
 	}
@@ -2180,12 +2228,6 @@ func (r *LoopReconciler) workspaceInitProxyHost(ctx context.Context, loop *coxv1
 		return fmt.Sprintf("%s:%d", host, port)
 	}
 	return host
-}
-
-// isRepoHostIP reports whether the repo URL's host is a numeric IP (an
-// ipBlock peer — expressible without the proxy, like repoPeer's /32 rule).
-func isRepoHostIP(repoURL string) bool {
-	return net.ParseIP(workspaceRepoHost(repoURL)) != nil
 }
 
 func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
@@ -2203,7 +2245,7 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 	// allowlist even when the AgentPolicy declares no network allows. An
 	// in-cluster repo (repoPeer non-nil) keeps the direct repo-peer rule and
 	// adds no host.
-	if host := r.workspaceInitProxyHost(ctx, loop); host != "" {
+	if host := r.workspaceInitProxyHost(loop); host != "" {
 		networkAllows = append(networkAllows, host)
 		hasAllows = true
 	}
@@ -2903,21 +2945,6 @@ func repoPeer(repoURL string, nsFromHost func(string) (string, bool)) *networkin
 // "<svc>.<ns>.svc" or "<svc>.<ns>.svc.<clusterDomain>" to the namespace the
 // Service's pods live in (the CRD only allows these hosts over http://, so
 // the operator can always express the egress rule on an enforcing CNI). The
-// namespace is the last label of the host with the ".svc" (and any
-// cluster-domain) suffix stripped. ok=false for any other host. The FQDN
-// suffix is the OPERATOR's cluster domain (not a hard-coded cluster.local,
-// review #50 P3): the CRD only allows ".svc" / ".svc.cluster.local" forms
-// over plain http, so a custom-domain cluster only ever carries the ".svc"
-// short form and the match below degrades gracefully.
-func namespaceFromHostForProxy(host string) string {
-	host = strings.TrimSuffix(host, ".svc.cluster.local")
-	host = strings.TrimSuffix(host, ".svc")
-	if !strings.Contains(host, ".") {
-		return ""
-	}
-	return host
-}
-
 func (r *LoopReconciler) serviceNamespaceFromHost(host string) (string, bool) {
 	cd := r.clusterDomain()
 	var labels string
@@ -3267,7 +3294,7 @@ func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.C
 			// mount to the keys 'username' and 'password' at
 			// /workspace-creds/{username,password}; no SubPath (a SubPath naming
 			// a missing key would mount an empty directory).
-			{Name: workspaceCredsVolume, MountPath: "/workspace-creds", ReadOnly: true},
+			{Name: workspaceCredsVolume, MountPath: workspaceCredsMount, ReadOnly: true},
 		}
 	} else {
 		initMounts = []corev1.VolumeMount{{Name: workspaceVolumeName, MountPath: agentWorkspaceMount}}
@@ -3285,10 +3312,10 @@ func (r *LoopReconciler) workspaceInitContainer(loop *coxv1alpha1.Loop) corev1.C
 	if r.workspaceInitNeedsProxy(loop) {
 		proxyURL := r.egressProxyServiceURL(loop.Name, loop.Namespace)
 		c.Env = append(c.Env,
-			corev1.EnvVar{Name: "HTTPS_PROXY", Value: proxyURL},
-			corev1.EnvVar{Name: "https_proxy", Value: proxyURL},
-			corev1.EnvVar{Name: "HTTP_PROXY", Value: proxyURL},
-			corev1.EnvVar{Name: "http_proxy", Value: proxyURL},
+			corev1.EnvVar{Name: envHTTPSProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHttpsProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHTTPProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHttpProxy, Value: proxyURL},
 		)
 	}
 	return c
@@ -3312,8 +3339,8 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	authLine := ""
 	fetchCred := ""
 	if loop.Spec.Workspace.GitCredentialSecret != "" {
-		authLine = "AUTH=$(printf '%s:%s' \"$(cat /workspace-creds/" + workspaceCredsUsernameKey + ")\" \"$(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n"
-		fetchCred = ` -c http.extraHeader="Authorization: Basic $AUTH"`
+		authLine = "AUTH=$(printf '%s:%s' \"$(cat " + workspaceCredsMount + "/" + workspaceCredsUsernameKey + ")\" \"$(cat " + workspaceCredsMount + "/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n"
+		fetchCred = gitBasicAuthHeader
 	}
 	// GIT_TERMINAL_PROMPT=0: never prompt (the init container has no TTY; a
 	// missing credential must fail the clone, not hang).
@@ -3366,7 +3393,7 @@ echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
 	return corev1.Container{
 		Name:    workspaceInitContainerName,
 		Image:   gitImage,
-		Command: []string{"/bin/sh", "-c", script},
+		Command: []string{verifySh, "-c", script},
 		// No HOME env: the per-command -c flags need no HOME, and the init
 		// container has no writable home mount (readOnlyRootfs, /workspace is
 		// the workspace). (A HOME=/workspace + git config --global would

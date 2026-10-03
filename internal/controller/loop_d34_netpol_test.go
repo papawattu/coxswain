@@ -150,7 +150,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		Expect(repoEgress.To).To(HaveLen(1))
 		Expect(repoEgress.To[0].NamespaceSelector).ToNot(BeNil())
 		Expect(repoEgress.To[0].NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
-			"kubernetes.io/metadata.name", "samples",
+			"kubernetes.io/metadata.name", nsSamples,
 		), "the repo peer must be the repo .svc Service's namespace")
 		Expect(repoEgress.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
 			Protocol: new(corev1.ProtocolTCP),

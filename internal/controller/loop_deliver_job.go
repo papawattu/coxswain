@@ -89,8 +89,6 @@ import (
 
 // deliver Job name/label constants.
 const (
-	deliverJobSuffix = "-deliver"
-
 	deliverComponent = "deliver"
 
 	// deliverForLabel is the deliver pod's selector label: the Loop the
@@ -138,19 +136,46 @@ func deliverProviderForRepo(repo string) (deliverProvider, string) {
 		return deliverProviderGitea, ""
 	}
 	host := strings.ToLower(u.Hostname())
-	if host == "github.com" {
+	if host == githubHost {
 		return deliverProviderGitHub, host
 	}
 	return deliverProviderGitea, host
 }
 
 // deliverJobName is the deliver Job's name: <loop>-deliver.
-func deliverJobName(loopName string) string { return loopName + deliverJobSuffix }
+// deliverJobName returns the deliver Job name for a Loop (D20: shared
+// derivedName helper — '<loop>-deliver', truncated+hashed only for the
+// near-max names that would exceed the 63-char DNS-1035 budget).
+func deliverJobName(loopName string) string { return derivedName(loopName, "-deliver") }
+
+// ensureDeliver runs the S6 deliver step for one reconcile: ensure the deliver
+// Job (create or stale-delete), ensure the deliver pod's NetworkPolicy, and
+// read the push container's termination message back into status.delivery. It
+// returns (requeue, error): requeue is true when the stale-Job guard deleted a
+// Job this reconcile and another reconcile is needed to observe the result —
+// the caller maps it to a 5s RequeueAfter (like the verify stale guard), no
+// retry loop, no controller error. Extracted from Reconcile so the top-level
+// reconcile stays within the gocyclo budget.
+func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	requeue := false
+	if ok, err := r.ensureDeliverJob(ctx, loop); err != nil {
+		return false, err
+	} else if ok {
+		requeue = true
+	}
+	if err := r.ensureDeliverNetPolicies(ctx, loop); err != nil {
+		return false, err
+	}
+	if err := r.ensureDeliverReadback(ctx, loop); err != nil {
+		return false, err
+	}
+	return requeue, nil
+}
 
 // deliverNetpolName is the deliver Job pod's NetworkPolicy name: <loop>-
 // deliver-np (D20: the short suffix keeps the name within the 63-char
 // DNS-1035 budget for a 55-char (the max valid) Loop name).
-func deliverNetpolName(loopName string) string { return loopName + "-deliver-np" }
+func deliverNetpolName(loopName string) string { return derivedName(loopName, "-deliver-np") }
 
 // deliverBranchName is the delivery branch: <prefix><loop-name>.
 func deliverBranchName(prefix, loopName string) string { return prefix + loopName }
@@ -338,7 +363,7 @@ func (r *LoopReconciler) buildDeliverJob(loop *coxv1alpha1.Loop) *batchv1.Job {
 // NetworkPolicy selects on this; the Job stamps it on the pod template).
 func deliverJobLabels(loopName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/managed-by": "coxswain",
+		"app.kubernetes.io/managed-by": partOfCoxswain,
 		"app.kubernetes.io/component":  deliverComponent,
 		deliverForLabel:                loopName,
 	}
@@ -416,7 +441,7 @@ func deliverCredLines(creds bool) (string, string) {
 		return "", ""
 	}
 	authLine := "AUTH=$(printf '%s:%s' \"$(cat /workspace-creds/" + workspaceCredsUsernameKey + ")\" \"$(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n"
-	fetchCred := ` -c http.extraHeader="Authorization: Basic $AUTH"`
+	fetchCred := gitBasicAuthHeader
 	return authLine, fetchCred
 }
 
@@ -463,7 +488,7 @@ echo "deliver clone-base: base ${BASE} at $(git -C "${DEST}" ` + deliverSafeDir(
 	return corev1.Container{
 		Name:         deliverCloneBase,
 		Image:        r.workspaceGitImage(),
-		Command:      []string{"/bin/sh", "-c", script},
+		Command:      []string{verifySh, "-c", script},
 		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                &[]int64{deliverNonRootUID}[0],
@@ -516,7 +541,7 @@ echo "deliver import-agent: imported ${PINNED} from the agent workspace PVC"
 	return corev1.Container{
 		Name:    deliverImport,
 		Image:   r.workspaceGitImage(),
-		Command: []string{"/bin/sh", "-c", script},
+		Command: []string{verifySh, "-c", script},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: deliverScratchVol, MountPath: deliverScratchPath},
 			// The agent workspace PVC read-only (the exact bytes the verify
@@ -572,7 +597,7 @@ func (r *LoopReconciler) deliverPushContainer(loop *coxv1alpha1.Loop, verified, 
 	}
 	gitCredFlag := ""
 	if creds {
-		gitCredFlag = ` -c http.extraHeader="Authorization: Basic $AUTH"`
+		gitCredFlag = gitBasicAuthHeader
 	}
 
 	script := `#!/bin/sh
@@ -638,7 +663,7 @@ fi
 	return corev1.Container{
 		Name:         deliverPush,
 		Image:        r.workspaceGitImage(),
-		Command:      []string{"/bin/sh", "-c", script},
+		Command:      []string{verifySh, "-c", script},
 		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                &[]int64{deliverNonRootUID}[0],
@@ -682,12 +707,10 @@ func deliverPRURLBase(repo string, prov deliverProvider) string {
 	if i := strings.LastIndexByte(path, '/'); i >= 0 {
 		path = path[:i]
 	}
-	if strings.HasSuffix(path, ".git") {
-		path = strings.TrimSuffix(path, ".git")
-	}
+	path = strings.TrimSuffix(path, ".git")
 	host := u.Host
 	if prov == deliverProviderGitHub {
-		host = "github.com"
+		host = githubHost
 	}
 	return u.Scheme + "://" + host + path
 }
@@ -728,7 +751,7 @@ func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome
 	prov, repoHost := deliverProviderForRepo(loop.Spec.Workspace.Repo)
 
 	fields := map[string]string{}
-	for _, line := range strings.Split(msg, "\n") {
+	for line := range strings.SplitSeq(msg, "\n") {
 		line = strings.TrimSpace(line)
 		if i := strings.IndexByte(line, '='); i > 0 {
 			fields[strings.TrimSpace(line[:i])] = strings.TrimSpace(line[i+1:])
@@ -765,7 +788,7 @@ func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome
 	}
 	host := strings.ToLower(u.Hostname())
 	if prov == deliverProviderGitHub {
-		if host != "github.com" {
+		if host != githubHost {
 			return deliverOutcome{}, false
 		}
 	} else if host != repoHost {

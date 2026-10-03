@@ -82,9 +82,6 @@ const (
 	s6OtherCommit = "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5"
 )
 
-// s6 delivery branch for the fixture loop name.
-const s6Branch = "coxswain/s6loop"
-
 // s6Reconcile runs one Reconcile and returns the fresh Loop.
 func s6Reconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 	_, err := r.Reconcile(context.Background(),
@@ -138,16 +135,16 @@ func s6Succeeded(name, ns string, repo string) *LoopReconciler {
 // mode PullRequest.
 func s6Loop(name, ns, repo string) *coxv1alpha1.Loop {
 	if repo == "" {
-		repo = "http://gitea.samples.svc:3000/samples/gocli.git"
+		repo = inClusterRepoURL
 	}
 	return &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: coxv1alpha1.LoopSpec{
 			Goal:      loopGoal,
-			Workspace: coxv1alpha1.Workspace{Repo: repo, GitCredentialSecret: "samples-git-cred"},
+			Workspace: coxv1alpha1.Workspace{Repo: repo, GitCredentialSecret: samplesGitCredSecret},
 			Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
 			Agent: coxv1alpha1.AgentConfig{
-				EndpointSecretRef: "samples-model-cred",
+				EndpointSecretRef: samplesModelCredSecret,
 				ModelEndpoint:     s3ModelEndpoint,
 			},
 			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
@@ -261,10 +258,7 @@ func s6Cond(loop *coxv1alpha1.Loop) (bool, metav1.ConditionStatus, string) {
 func s6ValidTermination(loop *coxv1alpha1.Loop) string {
 	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
 	commit := loop.Status.CurrentVerify.VerifiedCommit
-	prURL := loop.Spec.Workspace.Repo + "/pulls/7"
-	if strings.HasSuffix(loop.Spec.Workspace.Repo, ".git") {
-		prURL = strings.TrimSuffix(loop.Spec.Workspace.Repo, ".git") + "/pulls/7"
-	}
+	prURL := strings.TrimSuffix(loop.Spec.Workspace.Repo, ".git") + "/pulls/7"
 	return "branch=" + branch + "\ncommit=" + commit + "\nprNumber=7\nprURL=" + prURL + "\n"
 }
 
@@ -518,8 +512,8 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 	It("parses the deliver termination message strictly (parseDeliverTermination)", func() {
 		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "s6loop", Namespace: "default"},
-			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: "http://gitea.samples.svc:3000/samples/gocli.git"}},
+			ObjectMeta: s6SampleLoopObjMeta(),
+			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: inClusterRepoURL}},
 			Status: coxv1alpha1.LoopStatus{
 				Phase:         coxv1alpha1.LoopPhaseSucceeded,
 				CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6HeadCommit},
@@ -642,7 +636,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		// The delete lands asynchronously (envtest); reconcile until the fresh
 		// Job appears (the name is free once the delete is complete).
 		var fresh *batchv1.Job
-		for i := 0; i < 50; i++ {
+		for range 50 {
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 			Expect(err).NotTo(HaveOccurred())
 			probe := &batchv1.Job{}
@@ -665,10 +659,10 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		Expect(deliverAPIBase("https://github.com/owner/repo.git", prov)).To(Equal("https://api.github.com/repos"))
 
 		By("provider + API base for a Gitea-compatible repo")
-		prov, host = deliverProviderForRepo("http://gitea.samples.svc:3000/samples/gocli.git")
+		prov, host = deliverProviderForRepo(inClusterRepoURL)
 		Expect(prov).To(Equal(deliverProviderGitea))
 		Expect(host).To(Equal("gitea.samples.svc"))
-		Expect(deliverAPIBase("http://gitea.samples.svc:3000/samples/gocli.git", prov)).To(Equal("http://gitea.samples.svc:3000/api/v1/repos"))
+		Expect(deliverAPIBase(inClusterRepoURL, prov)).To(Equal("http://gitea.samples.svc:3000/api/v1/repos"))
 	})
 
 	It("builds the deliver Job for a github.com delivery: the push uses the GitHub API + Bearer token", func() {
@@ -726,7 +720,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 					to.PodSelector.MatchLabels[policy.ComponentLabelKey] == netpolEgressProxyComponent {
 					foundProxy = true
 					for _, p := range rule.Ports {
-						Expect(int(p.Port.IntValue())).To(BeEquivalentTo(egressProxyPort))
+						Expect(p.Port.IntValue()).To(BeEquivalentTo(egressProxyPort))
 					}
 				}
 			}
@@ -746,10 +740,10 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		foundPeer := false
 		for _, rule := range np.Spec.Egress {
 			for _, to := range rule.To {
-				if to.NamespaceSelector != nil && to.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == "samples" {
+				if to.NamespaceSelector != nil && to.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == nsSamples {
 					foundPeer = true
 					for _, p := range rule.Ports {
-						Expect(int(p.Port.IntValue())).To(BeEquivalentTo(3000))
+						Expect(p.Port.IntValue()).To(BeEquivalentTo(3000))
 					}
 				}
 			}
@@ -799,7 +793,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 			}
 		}
 		Expect(init).ToNot(BeNil(), "the first clone must carry the workspace init container")
-		proxyURL := "http://" + name + "-egress." + ns + ".svc.cluster.local:3128"
+		proxyURL := "http://" + name + "-egress-proxy." + ns + ".svc.cluster.local:3128"
 		for _, e := range init.Env {
 			if e.Name == "HTTPS_PROXY" || e.Name == "https_proxy" {
 				Expect(e.Value).To(Equal(proxyURL), "the init container's git fetch must traverse the egress proxy")
@@ -813,7 +807,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "initin1"
-		Expect(k8sClient.Create(ctx, s6Loop(name, ns, "http://gitea.samples.svc:3000/samples/gocli.git"))).To(Succeed())
+		Expect(k8sClient.Create(ctx, s6Loop(name, ns, inClusterRepoURL))).To(Succeed())
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -824,7 +818,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		foundRepoPeer, foundProxy := false, false
 		for _, rule := range np.Spec.Egress {
 			for _, to := range rule.To {
-				if to.NamespaceSelector != nil && to.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == "samples" {
+				if to.NamespaceSelector != nil && to.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == nsSamples {
 					foundRepoPeer = true
 				}
 				if to.PodSelector != nil && to.PodSelector.MatchLabels["app.kubernetes.io/instance"] == name &&
@@ -850,12 +844,11 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 var _ = Describe("S6: egress proxy hosts (unit)", func() {
 	It("returns the deliver hosts for an external github.com delivery and none otherwise", func() {
-		ctx := context.Background()
 		r := &LoopReconciler{}
 		By("an in-cluster Succeeded delivery adds no proxy hosts")
 		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "s6loop", Namespace: "default"},
-			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: "http://gitea.samples.svc:3000/samples/gocli.git"}},
+			ObjectMeta: s6SampleLoopObjMeta(),
+			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: inClusterRepoURL}},
 			Status: coxv1alpha1.LoopStatus{
 				Phase:         coxv1alpha1.LoopPhaseSucceeded,
 				CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6HeadCommit},
@@ -874,12 +867,12 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 
 		By("the workspace init host: an external repo adds the repo host; an in-cluster repo adds none")
 		initLoop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "s6loop", Namespace: "default"},
+			ObjectMeta: s6SampleLoopObjMeta(),
 			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/samples/gocli.git"}},
 		}
-		Expect(r.workspaceInitProxyHost(ctx, initLoop)).To(Equal("github.com:443"))
-		initLoop.Spec.Workspace.Repo = "http://gitea.samples.svc:3000/samples/gocli.git"
-		Expect(r.workspaceInitProxyHost(ctx, initLoop)).To(BeEmpty())
+		Expect(r.workspaceInitProxyHost(initLoop)).To(Equal("github.com:443"))
+		initLoop.Spec.Workspace.Repo = inClusterRepoURL
+		Expect(r.workspaceInitProxyHost(initLoop)).To(BeEmpty())
 	})
 
 	// Fake-GitHub provider test (S6 TODO 4): validates the GitHub PR-creation
@@ -968,7 +961,7 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 			Head  string `json:"head"`
 			Base  string `json:"base"`
 			Draft bool   `json:"draft"`
-		}{Title: "S6 delivery", Head: "coxswain/s6loop", Base: "main", Draft: true}
+		}{Title: "S6 delivery", Head: "coxswain/s6loop", Base: baseBranch, Draft: true}
 		prBytes, _ := json.Marshal(prBody)
 		postReq, err := http.NewRequest("POST", ts.URL+"/samples/gocli/pulls", bytes.NewReader(prBytes))
 		Expect(err).NotTo(HaveOccurred())

@@ -110,7 +110,16 @@ func (denyingPhaseGate) Allow(_ *coxv1alpha1.Loop, _, _ coxv1alpha1.LoopPhase) (
 var _ = Describe("S4: claim reader mutation checks (I43, real code)", func() {
 	ctx := context.Background()
 
-	s4LoopSpec := coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()}
+	// s4LoopSpec uses an IN-CLUSTER .svc repo: the S4 spec exercises the
+	// claim-read path (the pod-blind Client vs the real apiReader) and must
+	// NOT create an egress proxy — an external repo's unpinned workspace-init
+	// clone would (S6) create one and hold the sandbox Suspended (the I42b
+	// gate), so the phase advance under test would never fire. The .svc repo
+	// keeps the direct repo-peer rule (no proxy hop) and leaves the claim path
+	// as the only thing under test.
+	s4LoopSpec := coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: coxv1alpha1.Workspace{
+		Repo: inClusterRepoURL,
+	}}
 
 	// standinClaimPod creates the stand-in sandbox pod with a terminated agent
 	// carrying a valid claim naming phase (the runner's real claim shape: the

@@ -102,7 +102,7 @@ func TestRBACCoverage(t *testing.T) {
 		{group: "agents.x-k8s.io", resource: "sandboxes/status",
 			minVerbs: []string{verbGet}},
 		// Owns(&Pod{}) — the controller creates and owns proxy Pods.
-		{group: "", resource: "pods",
+		{group: "", resource: corePodsResource,
 			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbUpdate}},
 		// Owns(&Service{}) — the controller creates and owns proxy Services.
 		{group: "", resource: "services",

@@ -59,6 +59,29 @@ GIT_PASS=$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.data.passw
 [ -n "$GIT_USER" ] && [ -n "$GIT_PASS" ] \
 	|| die "secret samples-git-cred missing/empty in ns $NS (run 'make samples-up' first)"
 
+# Secret types are IMMUTABLE: an early S2 seed applied a bare 'BasicAuth'
+# type (the operator's workspace init container requires
+# kubernetes.io/basic-auth). A wrong-type secret must be delete + re-created
+# with the same data — the values are the committed dev-only manifest values
+# (never read from masked output). The data here is only read to verify the
+# recreation keeps the SAME credential; it is never printed.
+if [ "$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.type}')" != "kubernetes.io/basic-auth" ]; then
+	log "samples-git-cred has the wrong Secret type (immutable); recreating as kubernetes.io/basic-auth with the same data..."
+	"${KUBECTL[@]}" get secret samples-git-cred -o json > /tmp/.s5b-seed-gitcred.json
+	python3 - /tmp/.s5b-seed-gitcred.json > /tmp/.s5b-seed-gitcred-out.json <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["type"] = "kubernetes.io/basic-auth"
+for k in ("namespace", "uid", "resourceVersion", "creationTimestamp", "annotations", "managedFields"):
+    d["metadata"].pop(k, None)
+print(json.dumps(d))
+PYEOF
+	"${KUBECTL[@]}" delete secret samples-git-cred --wait=true
+	kubectl --context "$CTX" -n "$NS" apply -f /tmp/.s5b-seed-gitcred-out.json >/dev/null
+	rm -f /tmp/.s5b-seed-gitcred.json /tmp/.s5b-seed-gitcred-out.json
+	log "   samples-git-cred recreated as kubernetes.io/basic-auth (same username/password)"
+fi
+
 log "ctx=$CTX ns=$NS user=$GIT_USER apps=${APPS[*]}"
 
 # The seed source is the COMMITTED tree (HEAD:examples/<app>), not the

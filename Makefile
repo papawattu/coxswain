@@ -93,6 +93,18 @@ samples-seed: ## S2: create the 3 sample repos on the in-cluster Gitea (one 'ini
 samples-accept: ## S2: acceptance — a throwaway pod clones each seeded repo with the samples credential and asserts the 'initial' commit + no github.com remote
 	@bash hack/samples-git.sh accept
 
+# S5b (samples plan section 6): the end-to-end sample driver. APP=gocli
+# TASK=1 (default). TIMEOUT=1800s default. The evidence lands in
+# .samples/<app>-<n>/ (gitignored). --dry-run validates the manifests
+# against the live API server without creating anything.
+.PHONY: sample-run
+sample-run: ## S5b: run examples/<app> task <n> on coxswain-dev and write .samples/<app>-<n>/EVIDENCE.md
+	@APP="$(APP)" TASK="$(TASK)" TIMEOUT="$(or $(TIMEOUT),1800)" bash hack/sample-run.sh $(SAMPLE_RUN_FLAGS)
+
+.PHONY: sample-run-dry-run
+sample-run-dry-run: ## S5b: validate the task manifests server-side without creating anything
+	@APP="$(APP)" TASK="$(TASK)" bash hack/sample-run.sh --dry-run
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

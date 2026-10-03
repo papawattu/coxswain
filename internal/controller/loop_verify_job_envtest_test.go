@@ -69,6 +69,8 @@ const (
 	s5aCloneBase    = "clone-base"
 	s5aTamper       = "tamper"
 	s5aCheck0       = "check-0"
+	s5aCheck1       = "check-1"
+	s5aCheckPassCmd = "echo pass0"
 )
 
 // s5aLoopSpec is a Loop with acceptance checks (so the verify Job's check
@@ -446,7 +448,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// Two checks so the event text can assert the FIRST failing check's
 		// name + code (check-0 passes, check-1 fails with exit 3).
 		spec := s5aLoopSpec()
-		spec.Verify.AcceptanceChecks = []string{"echo pass0", "echo fail1; exit 3"}
+		spec.Verify.AcceptanceChecks = []string{s5aCheckPassCmd, "echo fail1; exit 3"}
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       spec,
@@ -645,6 +647,90 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			"clean tamper + all checks 0 -> Succeeded (the B3 gate to Succeeded)")
 	})
 
+	It("takes NO decision while a check is still in progress (not a failure, S5a regression)", func() {
+		ns := "s5a-pending-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		// Two checks: (a) check-0 Running, (b) check-0=0 with check-1 Waiting.
+		// The S5a bug: a check-* init whose State.Terminated is nil (still
+		// Running or Waiting when the operator polls) fell into the
+		// 'prior init failed' branch and counted as check-0 failed (exit 0)
+		// — the kind run passed every step yet iterated to Failed:
+		// MaxIterationsExceeded. A non-terminated check is PENDING, like a
+		// non-terminated tamper: no decision, requeue, phase stays Verifying.
+		// Two checks so case (a)'s pending check-0 is check-0 of two, and
+		// case (b) can put check-0 clean with check-1 in progress (mirroring
+		// the kind run, where check-0 finished while check-1 was still
+		// starting — the operator read the pending state as check-0 failing).
+		spec := s5aLoopSpec()
+		spec.Verify.AcceptanceChecks = []string{s5aCheckPassCmd, "echo pass1"}
+		runCase := func(name string, c0 corev1.ContainerState, c1 *corev1.ContainerState) {
+			Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec:       spec,
+			})).To(Succeed())
+			r := s5aDriveToVerifying(ns, name)
+			jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name + "-verify-pod",
+					Namespace: ns,
+					Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			inits := []corev1.ContainerStatus{
+				{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				{Name: s5aCheck0, State: c0},
+			}
+			if c1 != nil {
+				inits = append(inits, corev1.ContainerStatus{Name: s5aCheck1, State: *c1})
+			} else {
+				// case (a) leaves check-1 clean so the only in-progress check
+				// is check-0.
+				inits = append(inits, corev1.ContainerStatus{Name: s5aCheck1, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}})
+			}
+			pod.Status.InitContainerStatuses = inits
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+			// Reconcile: the outcome must be no-decision, phase stays Verifying.
+			fresh := s5aReconcile(r, ns, name)
+			Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+				"%s: an in-progress check is PENDING, never a failure (phase must stay Verifying)", name)
+			Expect(fresh.Status.Iteration).To(BeZero(),
+				"%s: no decision must not bump the iteration", name)
+			if fresh.Status.Progress != nil {
+				Expect(fresh.Status.Progress.LastResultStatus).NotTo(ContainSubstring("check-failed"),
+					"%s: no iterate evidence may be recorded for an in-progress check", name)
+			}
+
+			// Now terminate every check cleanly: the Loop must Succeed (the
+			// pending outcome was not a failure, it was a wait).
+			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+				{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+				{Name: "check-1", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+			fresh = s5aReconcile(r, ns, name)
+			Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
+				"%s: once the checks finish clean the Loop must Succeed (it was waiting, not failing)", name)
+		}
+		// The annotation-based phase recycle deletes the Sandbox on an
+		// advance, and a terminal phase deletes the verify Job — each case
+		// drives its own fresh Loop.
+		runCase("pendloop-a", corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, nil)
+		runCase("pendloop-b", corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}, &corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}})
+	})
+
 	It("reports the FIRST failing check's name and exit code in progress (P2, not a fixed index)", func() {
 		ns := "s5a-failidx-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
@@ -658,7 +744,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// check-1 exited 1) — the failure mapping must report the first
 		// check-* container with a non-zero exit, with ITS name and code.
 		spec := s5aLoopSpec()
-		spec.Verify.AcceptanceChecks = []string{"echo pass0", "echo fail1; exit 1"}
+		spec.Verify.AcceptanceChecks = []string{s5aCheckPassCmd, "echo fail1; exit 1"}
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       spec,

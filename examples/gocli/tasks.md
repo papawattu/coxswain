@@ -31,7 +31,8 @@ for the rationale.
 > the tests — `round_test.go` is protected; the acceptance checks must pass
 > on the tests as written.
 
-**Loop spec (paste into the Loop manifest):**
+**Loop spec** (the checked-in manifest is `tasks/1.loop.yaml`, applied by
+`make sample-run APP=gocli TASK=1`):
 
 ```yaml
 spec:
@@ -41,9 +42,12 @@ spec:
     or weaken any test file. Make `go test ./...` pass on the tests as
     written.
   workspace:
-    repo: http://gitea.samples.svc:3000/gocli.git
+    # The seeded repo lives under the 'samples' Gitea user (hack/samples-seed.sh
+    # owns it); the git credential Secret is the seeded samples-git-cred in
+    # the Loop's namespace (S5b copies it there from config/samples-git).
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...
@@ -52,16 +56,38 @@ spec:
     protectedPaths:
       - round_test.go
       - main_test.go
+    # The check-* containers run the user commands and need a Go toolchain
+    # (S5a); the trusted git containers (clone-base/import-agent/tamper) use
+    # the operator's git image regardless.
+    image: docker.io/library/golang:1.26
   agent:
+    # The operator's --runner-image flag (set by the dev overlay) selects the
+    # real runner entrypoint; image is the stand-in value the flag compares
+    # against.
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
-  policyRefs:
-    - gocli-task-1
+  # No policyRefs on purpose (S5b): see the AgentPolicy note below — the
+  # exec allow-list can't cover an agent shell yet (D41), so the demo
+  # runs the default-deny minimum.
+  loop:
+    maxIterations: 3
 ```
 
-**AgentPolicy (the fenced tools the task needs):**
+Option B (owner decision): no approval gate — the bar is
+Planning -> Implementing -> Verifying -> Succeeded.
+
+**AgentPolicy (the fenced tools the task needs — EXAMPLE, not referenced
+by the checked-in Loop):**
+
+> Not in `spec.policyRefs` yet: `AgentPolicy.exec` entries are exact
+> absolute paths, but the runner's shell tool calls spawn an open-ended set
+> of binaries (sh, the go toolchain's compile/link helpers). Under an
+> enforcing KubeArmor Block policy the agent's shell cannot exec and the
+> Loop wedges with no output. Exec fencing for an agent shell is D41 work;
+> until then the demo runs the default-deny minimum (no AgentPolicy
+> reference).
 
 ```yaml
 apiVersion: coxswain.wattu.com/v1alpha1
@@ -102,9 +128,9 @@ spec:
     <r>} instead of the bare number. Plain output without -json is unchanged.
     Add TestMainJSON to main_test.go covering the flag.
   workspace:
-    repo: http://gitea.samples.svc:3000/gocli.git
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...
@@ -119,11 +145,12 @@ spec:
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
-  policyRefs:
-    - gocli-task-2
+  # Same no-policyRefs note as task 1 (exec fencing for an agent shell is
+  # D41 work).
 ```
 
-**AgentPolicy:** same as task 1 (`gocli-task-2`, same spec).
+**AgentPolicy:** same as task 1 (`gocli-task-2`, same spec; example only,
+not referenced until D41).
 
 **Expected evidence:** plain run still prints the bare number; `-json`
 prints the JSON object; `TestMainJSON` green (the protected `main_test.go` is

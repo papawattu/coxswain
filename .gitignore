@@ -33,3 +33,6 @@ go.work
 *.kubeconfig
 /egress-proxy
 /examples/gocli/gocli
+
+# S5b sample-run evidence (machine-generated, per-run)
+/.samples/

@@ -1,0 +1,58 @@
+# Task 1 (docs/SAMPLES-PLAN.md, examples/gocli/tasks.md): make the tests pass.
+#
+# Checked-in Loop manifest for `make sample-run APP=gocli TASK=1`
+# (S5b). Applied by hack/sample-run.sh into the samples namespace on
+# kind-coxswain-dev. Field names are the real schema (api/v1alpha1/
+# loop_types.go); tasks.md's original snippet is stale in places (there is
+# no spec.verify.preset enum issue, but workspace.gitCredentialSecret and
+# verify.image must match the cluster state the driver ensures).
+#
+# spec.agent.image is deliberately ABSENT: the operator uses its own
+# --runner-image flag for the sandbox entrypoint (isRunner is true when the
+# image is empty), so the demo does not pin a local build tag into the
+# manifest. hack/sample-run.sh preflights that the controller deployment is
+# Available with a non-empty --runner-image. The env var RUNNER_IMG (see the
+# script's RUNNER_IMG section) then only matters for building and loading
+# the image into kind before the run.
+#
+# Option B (owner): no approval gate — the bar is
+# Planning -> Implementing -> Verifying -> Succeeded.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: gocli-task1
+  namespace: samples
+spec:
+  goal: >-
+    Fix Round in round.go so it rounds half away from zero. The test suite
+    (round_test.go) is currently red and is a protected path: do not change
+    or weaken any test file. Make `go test ./...` pass on the tests as
+    written.
+  workspace:
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
+  verify:
+    acceptanceChecks:
+      - go build ./...
+      - go test -run 'TestRound' ./...
+    preset: go
+    protectedPaths:
+      - round_test.go
+      - main_test.go
+    image: docker.io/library/golang:1.26
+  agent:
+    # image intentionally omitted — the operator's --runner-image flag
+    # supplies it (see the header note).
+    endpointSecretRef: vllm-no-auth
+    modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
+  # No policyRefs on purpose (S5b demo): the exec allow-list in
+  # 1.agentpolicy.yaml covers the Go toolchain and git only, but the
+  # runner's shell tool calls spawn an open-ended set of binaries (sh,
+  # shell built-ins, the go toolchain's compile/link helpers). Under an
+  # enforcing KubeArmor policy the agent's shell cannot exec and the Loop
+  # wedges. Exec fencing for an agent shell is D41 work; until then the
+  # demo runs the default-deny minimum (no AgentPolicy reference).
+  loop:
+    maxIterations: 3

@@ -235,12 +235,41 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// Restart-safety: the sandbox pod's restartPolicy is Always, so a
 	// one-shot exit RESTARTS the agent container and re-runs the phase.
 	// If result.json already holds a COMPLETED claim for the current
-	// desired phase (status=success, observedPhase == phase), this restart
-	// must NOT call the model again — it re-emits the prior claim to the
-	// termination log (exit 0) and stops. A BLOCKED claim is NOT re-emitted:
-	// it may retry (the model failure was likely transient), and the
-	// kubelet's back-off caps the retry rate.
-	if res, done := priorCompletedResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), phase); done {
+	// desired phase (status=success, observedPhase == phase, iteration ==
+	// current .coxswain/iteration), this restart must NOT call the model
+	// again — it re-emits the prior claim to the termination log (exit 0)
+	// and stops. For Implementing, a stored success WITHOUT a headCommit
+	// triggers a re-commit (cheap, no model call) before re-emitting: the
+	// first run's commit may have failed transiently, and the claim must
+	// never carry an Implementing success without a valid 40-hex headCommit.
+	// A BLOCKED claim is NOT re-emitted: it may retry (the model failure was
+	// likely transient), and the kubelet's back-off caps the retry rate.
+	// A stale-iteration result (the operator sent the Loop back to the same
+	// phase for a new iteration) is NOT reused: the phase must run again
+	// with fresh model work.
+	curIterForPrior := readIteration(cfg.Workspace)
+	if res, done := priorCompletedResult(
+		filepath.Join(cfg.Workspace, resultDirName, resultFileName), phase, claimIteration(curIterForPrior),
+	); done {
+		// S5a (B3): an Implementing success without a headCommit re-commits
+		// (the first run's commit may have failed; the workspace is on the
+		// PVC so the work is still there). Never emit an Implementing success
+		// claim without a valid 40-hex headCommit: if the re-commit also
+		// fails, the claim is blocked (the operator holds the advance).
+		if phase == PhaseImplementing && res.HeadCommit == "" {
+			if sha := commitWorkspace(cfg.Workspace); sha != "" {
+				res.HeadCommit = sha
+				log.Printf("runner: headCommit=%s (re-committed on restart)", sha)
+				// Persist the fixed result so future restarts see it.
+				_ = writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res)
+			} else {
+				log.Printf("runner: commitWorkspace failed on restart; emitting blocked claim")
+				res.Status = statusBlocked
+				res.VerificationNotes = "commit failed: re-commit on restart returned empty headCommit"
+				writeClaim(claimWritePath, res)
+				return res
+			}
+		}
 		writeClaim(claimWritePath, res)
 		return res
 	}
@@ -271,7 +300,19 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		// work is not committed (nothing succeeded) and the claim carries no
 		// headCommit (no evidence to pin).
 		if res.Status == statusSuccess {
-			res.HeadCommit = commitWorkspace(cfg.Workspace)
+			sha := commitWorkspace(cfg.Workspace)
+			if sha != "" {
+				res.HeadCommit = sha
+				log.Printf("runner: headCommit=%s", sha)
+			} else {
+				// A failed commit leaves the field empty and the operator holds
+				// the advance (ADR-0005 fail-closed). Log explicitly so the
+				// evidence survives (the first run's commit failure was lost
+				// because there was no log; the restart-safety path would then
+				// re-emit the same headCommit-less claim forever).
+				log.Printf("runner: commitWorkspace returned empty headCommit; " +
+					"emitting success claim without headCommit (operator will hold the advance)")
+			}
 		}
 	default:
 		// Unknown phase (a typo, or a phase the runner does not execute,
@@ -308,15 +349,18 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 }
 
 // priorCompletedResult reads result.json and, when it holds a COMPLETED claim
-// for the given desired phase (status=success AND observedPhase == phase),
-// returns that Result (re-emitted to the termination log WITHOUT a model
-// call — the restart-safety path). It returns (Result{}, false) when there is
-// no prior result, or the prior result is for a DIFFERENT phase (a stale
-// result from before a phase advance: the fresh pod's phase-init has written
-// the new desired phase, and the phase must run), or the prior result is
-// BLOCKED (a blocked phase may retry — the model failure was likely
-// transient — and the kubelet's restart back-off caps the retry rate).
-func priorCompletedResult(resultPath, phase string) (Result, bool) {
+// for the given desired phase (status=success, observedPhase == phase,
+// iteration == currentIteration), returns that Result (re-emitted to the
+// termination log WITHOUT a model call — the restart-safety path). It returns
+// (Result{}, false) when there is no prior result, the prior result is for a
+// DIFFERENT phase (a stale result from before a phase advance), the prior
+// result is BLOCKED (a blocked phase may retry), or the prior result is for a
+// STALE iteration (the operator sent the Loop back to this phase for a new
+// iteration: the phase must run again with fresh model work, not re-emit the
+// old success). The iteration check is the ADR-0005 D11 guard: after a failed
+// verify sends the Loop back to Implementing (iteration+1), the runner must
+// NOT re-emit the old success claim without new model work.
+func priorCompletedResult(resultPath, phase string, currentIteration int) (Result, bool) {
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
 		return Result{}, false
@@ -326,6 +370,11 @@ func priorCompletedResult(resultPath, phase string) (Result, bool) {
 		return Result{}, false
 	}
 	if res.Status != statusSuccess || res.ObservedPhase != phase {
+		return Result{}, false
+	}
+	// Stale-iteration guard: a result from a previous iteration is not
+	// reusable for the current iteration (the phase must run fresh).
+	if res.Iteration != currentIteration {
 		return Result{}, false
 	}
 	return res, true

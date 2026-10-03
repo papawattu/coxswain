@@ -237,3 +237,121 @@ func TestPhaseRunImplementingBlockedCarriesNoHeadCommit(t *testing.T) {
 		t.Fatalf("blocked claim must not carry headCommit: %s", got)
 	}
 }
+
+// TestRestartReEmitsImplementingSuccessTriggersRecommit (S5a, reviewer fix 1):
+// a stored Implementing success WITHOUT a headCommit triggers a re-commit on
+// restart (cheap, no model call). The re-commit writes the headCommit into
+// the claim. This is the fix for the live kind run where the first run's
+// commitWorkspace returned ” (its log was lost) and every restart re-emitted
+// the same headCommit-less claim forever.
+func TestRestartReEmitsImplementingSuccessTriggersRecommit(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{Content: "implement-done"})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	// Write the operator's iteration marker (the claim's iteration field
+	// must match for the re-emit to fire).
+	if err := os.WriteFile(filepath.Join(ws, resultDirName, iterationFileName), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan any)
+	cfg := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}
+	// First run: the model completes but commitWorkspace is made to fail
+	// (simulated by making the repo read-only so git add fails). The claim
+	// carries no headCommit.
+	// To simulate the first run's commit failure, we pre-write the result
+	// as if the first run succeeded but the commit failed: status=success,
+	// observedPhase=Implementing, headCommit="", iteration=1.
+	firstRes := Result{
+		Status:        statusSuccess,
+		ObservedPhase: PhaseImplementing,
+		Iteration:     1,
+	}
+	if err := writeResult(filepath.Join(ws, resultDirName, resultFileName), firstRes); err != nil {
+		t.Fatal(err)
+	}
+	// Restart: the re-emit path fires (status=success, observedPhase matches,
+	// iteration matches). Because headCommit is empty, it re-commits.
+	restart := PhaseRun(cfg, stop)
+	// The re-commit must have succeeded (the repo is writable in the test):
+	// the claim now carries a valid 40-hex headCommit.
+	if restart.Status != statusSuccess {
+		t.Fatalf("restart status = %q, want %q (re-commit must succeed)", restart.Status, statusSuccess)
+	}
+	if len(fake.Requests) != 0 {
+		t.Fatalf("restart: got %d model requests, want 0 (no model call on a completed prior claim)", len(fake.Requests))
+	}
+	if !isHex40(restart.HeadCommit) {
+		t.Fatalf("re-emitted claim headCommit = %q, want a 40-hex SHA (re-commit must fill it)", restart.HeadCommit)
+	}
+	claim := parseClaim(t, claimPath)
+	if hc, ok := claim["headCommit"].(string); !ok || !isHex40(hc) {
+		t.Fatalf("claim headCommit = %v, want a 40-hex SHA", claim["headCommit"])
+	}
+}
+
+// TestRestartStaleIterationResultNotReused (S5a, reviewer fix 3): a stored
+// Implementing success from a PREVIOUS iteration is NOT re-emitted on a new
+// iteration — the phase must run again with fresh model work. This is the
+// ADR-0005 D11 guard: after a failed verify sends the Loop back to
+// Implementing (iteration+1), the runner must NOT re-emit the old success
+// claim.
+func TestRestartStaleIterationResultNotReused(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{Content: "implement-iter2"})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	// The operator sent the Loop back to Implementing for iteration 2: the
+	// .coxswain/iteration is now "2".
+	if err := os.WriteFile(filepath.Join(ws, resultDirName, iterationFileName), []byte("2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a stored result from iteration 1 (a prior Implementing success
+	// with a valid headCommit): it must NOT be re-emitted for iteration 2.
+	oldRes := Result{
+		Status:        statusSuccess,
+		ObservedPhase: PhaseImplementing,
+		Iteration:     1,
+		HeadCommit:    strings.Repeat("a", 40),
+	}
+	if err := writeResult(filepath.Join(ws, resultDirName, resultFileName), oldRes); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan any)
+	cfg := PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}
+	res := PhaseRun(cfg, stop)
+	// The stale-iteration result must NOT have been re-emitted: the phase
+	// ran again (a model call was made).
+	if len(fake.Requests) != 1 {
+		t.Fatalf("stale-iteration result must NOT be re-emitted: "+
+			"got %d model requests, want 1 (phase must run again)", len(fake.Requests))
+	}
+	// The new result is for iteration 2 (the current .coxswain/iteration).
+	if res.Iteration != 2 {
+		t.Fatalf("new result iteration = %d, want 2 (the current .coxswain/iteration)", res.Iteration)
+	}
+	_ = claimPath
+}
+
+// isHex40 reports whether s is a 40-character lowercase-hex string.
+func isHex40(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}

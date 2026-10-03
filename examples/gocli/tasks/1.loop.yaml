@@ -34,7 +34,7 @@ spec:
       - main_test.go
     image: docker.io/library/golang:1.26
   agent:
-    image: coxswain-runner:latest
+    image: coxswain-runner:s5b1
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b

@@ -660,12 +660,36 @@ PINNED=` + shellQuote(verified) + `
 API_BASE=` + shellQuote(apiBase) + `
 DRAFT=` + strconv.FormatBool(draft) + `
 TITLE_PREFIX=` + shellQuote(draftTitlePrefix) + `
+PATH_PART=${REPO#*://}
+REMAIN=${PATH_PART#*/}
+OWNER=${REMAIN%%/*}
+REPO_NAME=${REMAIN#*/}
+case "${REPO_NAME}" in
+  *.git) REPO_NAME=${REPO_NAME%.git} ;;
+esac
+# --- the credential (basic pair as base64 — the git push and the provider
+# API both use it: the API auth is set up HERE, before any reference to it;
+# the s6b/s6c kind runs proved a reference above the assignment dies under
+# set -u with 'AUTH: parameter not set').
+` + (func() string {
+		if creds {
+			return "AUTH=$(printf '%s:%s' \"$(cat /workspace-creds/" + workspaceCredsUsernameKey + ")\" \"$(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n"
+		}
+		return ""
+	})() + apiAuthExpr + `
 # --- refusal: the delivery branch must NOT equal the base branch or a
-# default branch (main/master). Pushing onto a default branch would deliver
-# the agent's code straight to the operator's mainline — the PR gate is the
-# point of delivery.
+# default branch (main/master, or the repo's ACTUAL default branch — read
+# from GET /repos/{owner}/{repo}, the same API + auth as the PR calls).
+# Pushing onto a default branch would deliver the agent's code straight to
+# the operator's mainline — the PR gate is the point of delivery. The
+# main/master check is belt-and-suspenders (works without the API).
 if [ "${BRANCH}" = "${BASE}" ] || [ "${BRANCH}" = "main" ] || [ "${BRANCH}" = "master" ]; then
   echo "deliver push: refusing to push branch ${BRANCH} (equals the base branch or a default branch)"
+  exit 1
+fi
+DEFAULT_BRANCH=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}" | sed -n 's/.*"default_branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || DEFAULT_BRANCH=""
+if [ -n "${DEFAULT_BRANCH}" ] && [ "${BRANCH}" = "${DEFAULT_BRANCH}" ]; then
+  echo "deliver push: refusing to push branch ${BRANCH} (equals the repo's default branch ${DEFAULT_BRANCH})"
   exit 1
 fi
 # --- the push pushes the PINNED verifiedCommit, not whatever HEAD happens
@@ -678,33 +702,12 @@ if [ "${HEAD_SHA}" != "${PINNED}" ]; then
   echo "deliver push: refusing to push (HEAD ${HEAD_SHA} != the pinned verifiedCommit ${PINNED})"
   exit 1
 fi
-# --- the API auth (GitHub: the Secret's PASSWORD as a Bearer token — the
-# Secret is basic auth with username "x-access-token" and password = the
-# token; Gitea-compatible: the same basic pair as a Basic header).
-` + (func() string {
-		if creds {
-			return "AUTH=$(printf '%s:%s' \"$(cat /workspace-creds/" + workspaceCredsUsernameKey + ")\" \"$(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n"
-		}
-		return ""
-	})() + `
 git -C "${SRC}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null` + gitCredFlag + ` push origin "${PINNED}:refs/heads/${BRANCH}"
 # --- create the PR (idempotent: reuse an open PR for the branch).
-# owner/name come from the repo URL (<host>/<owner>/<name>[.git]).
-# The API auth is set up HERE, after the push: a set -u script dies on the
-# first reference to $AUTH before its assignment (the s6b kind run's push
-# failure: the API_AUTH line referenced $AUTH above the AUTH assignment).
-` + apiAuthExpr + `
-PATH_PART=${REPO#*://}
-REMAIN=${PATH_PART#*/}
-OWNER=${REMAIN%%/*}
-REPO_NAME=${REMAIN#*/}
-case "${REPO_NAME}" in
-  *.git) REPO_NAME=${REPO_NAME%.git} ;;
-esac
 # Look for an existing open PR for the branch (reuse it — idempotent).
 # The lookup and the create both return the PR's html_url: the operator's
 # trust boundary is the provider's OWN URL (never one the script assembles).
-EXISTING=$(curl -sfS -H "$API_AUTH" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls?state=open&head=${OWNER}:${BRANCH}") || EXISTING=""
+EXISTING=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}/pulls?state=open&head=${OWNER}:${BRANCH}") || EXISTING=""
 PR_NUM=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
 PR_URL=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's/.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
 if [ -n "${PR_NUM}" ]; then
@@ -716,7 +719,7 @@ else
   # Gitea's PR create can reject a non-existent base branch; the push above
   # already pushed the delivery branch, and the base branch exists on the
   # remote (clone-base fetched it) — a failed create is a hard failure.
-  CREATED=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/${OWNER}/${REPO_NAME}/pulls") || { echo "deliver push: PR create failed (see API response)"; exit 1; }
+  CREATED=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/repos/${OWNER}/${REPO_NAME}/pulls") || { echo "deliver push: PR create failed (see API response)"; exit 1; }
   PR_NUM=$(printf '%s' "${CREATED}" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
   PR_URL=$(printf '%s' "${CREATED}" | sed -n 's/.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 fi
@@ -752,19 +755,20 @@ fi
 }
 
 // deliverAPIBase is the provider API base: for GitHub, the GitHub REST API
-// (https://api.github.com/repos — the PR create is POST
-// /repos/<owner>/<repo>/pulls); for a Gitea-compatible provider, the repo
-// host's Gitea API (<scheme>://<host>/api/v1/repos — the Gitea PR REST is
-// the same shape, /repos/<owner>/<repo>/pulls).
+// (https://api.github.com — the PR create is POST
+// /repos/<owner>/<repo>/pulls, the repo is GET /repos/<owner>/<repo>);
+// for a Gitea-compatible provider, the repo host's Gitea API
+// (<scheme>://<host>/api/v1 — the Gitea PR REST is the same shape,
+// /repos/<owner>/<repo>/pulls; the repo is GET /repos/<owner>/<repo>).
 func deliverAPIBase(repo string, prov deliverProvider) string {
 	if prov == deliverProviderGitHub {
-		return "https://api.github.com/repos"
+		return "https://api.github.com"
 	}
 	u, err := url.Parse(repo)
 	if err != nil || u.Host == "" {
 		return ""
 	}
-	return u.Scheme + "://" + u.Host + "/api/v1/repos"
+	return u.Scheme + "://" + u.Host + "/api/v1"
 }
 
 // deliverPRPathSegment is the PR page path segment per provider: GitHub

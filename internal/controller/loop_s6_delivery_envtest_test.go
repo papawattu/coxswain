@@ -700,13 +700,13 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		prov, host := deliverProviderForRepo("https://github.com/owner/repo.git")
 		Expect(prov).To(Equal(deliverProviderGitHub))
 		Expect(host).To(Equal("github.com"))
-		Expect(deliverAPIBase("https://github.com/owner/repo.git", prov)).To(Equal("https://api.github.com/repos"))
+		Expect(deliverAPIBase("https://github.com/owner/repo.git", prov)).To(Equal("https://api.github.com"))
 
 		By("provider + API base for a Gitea-compatible repo")
 		prov, host = deliverProviderForRepo(inClusterRepoURL)
 		Expect(prov).To(Equal(deliverProviderGitea))
 		Expect(host).To(Equal("gitea.samples.svc"))
-		Expect(deliverAPIBase(inClusterRepoURL, prov)).To(Equal("http://gitea.samples.svc:3000/api/v1/repos"))
+		Expect(deliverAPIBase(inClusterRepoURL, prov)).To(Equal("http://gitea.samples.svc:3000/api/v1"))
 	})
 
 	It("builds the deliver Job for a github.com delivery: the push uses the GitHub API + Bearer token", func() {
@@ -719,7 +719,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		job := s6GetJob(ns, name)
 		_, push := s6JobContainers(job)
 		script := push.Command[2]
-		Expect(script).To(ContainSubstring("https://api.github.com/repos"),
+		Expect(script).To(ContainSubstring("https://api.github.com"),
 			"a github.com delivery must create the PR on the GitHub API")
 		Expect(script).To(ContainSubstring("Authorization: Bearer"),
 			"a github.com delivery must send the Secret's password as a Bearer token")

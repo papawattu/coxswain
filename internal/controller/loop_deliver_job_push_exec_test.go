@@ -119,7 +119,7 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	// test can assert exactly one POST with the credential's Basic header.
 	// The html_url the fake returns names the REAL repo (samples/gocli) —
 	// the push script records it verbatim as prURL.
-	apiBase, posts := newFakeGiteaAPI(t, "samples", "gocli", "http", "gitea.example:3000")
+	apiBase, posts := newFakeGiteaAPI(t, "samples", "gocli", "http", "gitea.example:3000", baseBranch)
 
 	// The credential files (the /workspace-creds mount stand-in).
 	credsDir := t.TempDir()
@@ -313,7 +313,8 @@ type fakeGiteaAPICall struct {
 	auth   string
 }
 
-// newFakeGiteaAPI stands up a Gitea-compatible provider API: GET /pulls
+// newFakeGiteaAPI stands up a Gitea-compatible provider API: GET /repos/{o}/{r}
+// (default branch lookup) -> {"default_branch": ...}; GET /pulls
 // (idempotency lookup) -> the single open PR when one exists (the script
 // reuses it — idempotent), else []; POST /pulls (create) -> a draft PR with
 // number 42. Every response carries the provider's OWN html_url (the
@@ -322,16 +323,23 @@ type fakeGiteaAPICall struct {
 // the API base (rewritten into the script's API_BASE) and the recorded
 // PR-create POSTs. The test inspects `posts` AFTER the script runs, so it
 // is returned by pointer.
-func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host string) (apiBase string, posts *[]fakeGiteaAPICall) {
+func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host, defaultBranch string) (apiBase string, posts *[]fakeGiteaAPICall) {
 	t.Helper()
 	var mu sync.Mutex
 	var postList []fakeGiteaAPICall
 	var openPR int // 0 = no open PR yet
+	repoPath := "/repos/" + owner + "/" + repoName
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			// The open-PR lookup: [] until a create POST has run.
+		path := r.URL.Path
+		// GET /repos/{owner}/{repo} — the default-branch lookup.
+		if r.Method == http.MethodGet && path == repoPath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"name":"%s","default_branch":"%s"}`, repoName, defaultBranch)
+			return
+		}
+		// GET /repos/{owner}/{repo}/pulls — the idempotency lookup.
+		if r.Method == http.MethodGet && strings.HasSuffix(path, "/pulls") {
 			mu.Lock()
 			n := openPR
 			mu.Unlock()
@@ -342,7 +350,10 @@ func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host string) (apiBas
 			}
 			_, _ = fmt.Fprintf(w, `[{"number":%d,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/%d"}]`,
 				n, scheme, host, owner, repoName, n)
-		case http.MethodPost:
+			return
+		}
+		// POST /repos/{owner}/{repo}/pulls — the create.
+		if r.Method == http.MethodPost && strings.HasSuffix(path, "/pulls") {
 			mu.Lock()
 			postList = append(postList, fakeGiteaAPICall{method: r.Method, auth: r.Header.Get("Authorization")})
 			openPR = 42
@@ -350,13 +361,13 @@ func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host string) (apiBas
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"number":42,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/42"}`,
 				scheme, host, owner, repoName)
-		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
-	apiBase = ts.URL + "/api/v1/repos"
+	apiBase = ts.URL
 	return apiBase, &postList
 }
 
@@ -369,4 +380,116 @@ func gitRemoteRef(t *testing.T, repo, ref string) string {
 		t.Fatalf("git rev-parse %s in %s: %v", ref, repo, err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// TestDeliverPushScriptRefusesDefaultBranch (S6 review P2: refuse the repo's
+// actual default branch) runs the REAL push script end-to-end with the fake
+// Gitea API reporting default_branch=trunk and BRANCH=trunk: the script must
+// exit non-zero (the default-branch refusal fires) and NO ref must be created
+// on the bare remote. The script's main/master check is belt-and-suspenders;
+// this case exercises the API read of default_branch (a branch name that is
+// neither main nor master).
+func TestDeliverPushScriptRefusesDefaultBranch(t *testing.T) {
+	r := &LoopReconciler{}
+
+	// The remote (the deliver Job's origin stand-in): a local bare repo with
+	// a base branch (initial — NOT main/master, so the script's main/master
+	// check does not fire; the default-branch refusal must catch trunk).
+	remoteDir := t.TempDir()
+	remoteGit := filepath.Join(remoteDir, "remote.git")
+	mustGit(t, remoteDir, "init", "-q", "-b", "initial", "--bare", remoteGit)
+
+	// The agent repo: a base commit (the remote's initial branch) + one agent
+	// commit (the pinned verifiedCommit).
+	agentRepo := t.TempDir()
+	mustGit(t, agentRepo, "init", "-q", "-b", "initial")
+	mustGit(t, agentRepo, "config", "user.email", "agent@coxswain.test")
+	mustGit(t, agentRepo, "config", "user.name", "Agent")
+	writeFile(t, agentRepo, "round.go", "package main\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "base")
+	baseSHA := gitSHA(t, agentRepo)
+	mustGit(t, agentRepo, "remote", "add", "origin", remoteGit)
+	mustGit(t, agentRepo, "push", "-q", "origin", "initial")
+	writeFile(t, agentRepo, "round.go", "package main\nfunc F() int { return 1 }\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "agent: change")
+	verifySHA := gitSHA(t, agentRepo)
+	if verifySHA == baseSHA {
+		t.Fatal("the agent commit must differ from the base commit")
+	}
+
+	// The Loop: a Gitea-compatible repo. The delivery branch is passed
+	// explicitly to deliverPushContainer ("trunk" — the repo's actual default
+	// branch; the script must refuse it via the API read, not the
+	// main/master check).
+	const loopName = "trunktask1"
+	repoURL := "http://gitea.example:3000/samples/gocli.git"
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: loopName},
+		Spec: coxv1alpha1.LoopSpec{
+			Workspace: coxv1alpha1.Workspace{
+				Repo:                repoURL,
+				Ref:                 "initial",
+				GitCredentialSecret: testCredSecretName,
+			},
+			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{
+			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
+		},
+	}
+	// The delivery branch is 'trunk' (passed explicitly — the repo's actual
+	// default branch, which is neither main nor master, so the script's
+	// main/master check does not fire; the API read of default_branch must
+	// catch it).
+	branch := "trunk"
+
+	// The fake Gitea API: default_branch=trunk (the delivery branch IS the
+	// default branch — the script must refuse). The repo is samples/gocli.
+	apiBase, _ := newFakeGiteaAPI(t, "samples", "gocli", "http", "gitea.example:3000", "trunk")
+
+	// The credential files.
+	credsDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsUsernameKey), []byte("samples"))
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsPasswordKey), []byte("s3cret-pw"))
+
+	// The scratch dir: set up as clone-base + import-agent would.
+	scratch := t.TempDir()
+	mustGit(t, scratch, "clone", "-q", remoteGit, ".")
+	mustGit(t, scratch, "-c", "protocol.file.allow=always", "-c", "core.hooksPath=/dev/null",
+		"fetch", "file://"+agentRepo+"/.git", verifySHA)
+	mustGit(t, scratch, "checkout", "-q", "--detach", verifySHA)
+	mustGit(t, scratch, "remote", "set-url", "origin", remoteGit)
+
+	// Extract the REAL push script and rewrite the pod paths.
+	// Note: the script's BASE is the loop's workspace ref (\"initial\"), but
+	// the delivery branch is 'trunk'. The script's BASE refusal check
+	// (BRANCH != BASE) passes because trunk != initial. The default-branch
+	// refusal (BRANCH == default_branch) must fire.
+	pushScript := deliverContainerScript(t, r.deliverPushContainer(loop, verifySHA, branch, "initial"))
+	termFile := filepath.Join(t.TempDir(), "termination-log")
+	pushScript = strings.ReplaceAll(pushScript, deliverScratchPath, scratch)
+	pushScript = strings.ReplaceAll(pushScript, "/workspace-creds", credsDir)
+	pushScript = strings.ReplaceAll(pushScript, "/dev/termination-log", termFile)
+	wantAPIBase := "'" + deliverAPIBase(repoURL, deliverProviderGitea) + "'"
+	if !strings.Contains(pushScript, wantAPIBase) {
+		t.Fatalf("push script does not carry the expected API_BASE %q", wantAPIBase)
+	}
+	pushScript = strings.ReplaceAll(pushScript, wantAPIBase, "'"+apiBase+"'")
+
+	pushPath := filepath.Join(t.TempDir(), "push.sh")
+	mustWriteFile(t, pushPath, []byte(pushScript))
+
+	// Run: the script must refuse (BRANCH=trunk == default_branch=trunk).
+	// The script's main/master check does NOT fire (trunk is neither main nor
+	// master); only the API read of default_branch catches it.
+	out, err := exec.Command("sh", pushPath).CombinedOutput()
+	if err == nil {
+		t.Fatalf("the push script must refuse (exit non-zero) when BRANCH equals the repo's default branch (trunk); it exited 0. Output: %s", string(out))
+	}
+	// No ref on the bare remote.
+	if out2, err := exec.Command("git", "-C", remoteGit, "rev-parse", "refs/heads/trunk").CombinedOutput(); err == nil {
+		t.Fatalf("the delivery branch must not exist on the remote after a default-branch refusal; it is at %s", strings.TrimSpace(string(out2)))
+	}
 }

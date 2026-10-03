@@ -832,7 +832,31 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 	if tamperStatus.State.Terminated.ExitCode != 0 {
 		return verifyTampered, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
 	}
-	// Tamper clean: read the check inits (check-0 .. check-<checkCount-1>).
+	// The I47 artifact check (the operator-side filter) runs BEFORE the
+	// checks: it is the gate to the acceptance checks, exactly like tamper is
+	// the gate to artifact (evidence order: tamper -> artifact -> checks).
+	// A non-zero artifact exit is an ITERATE with the container's own name
+	// ('artifact') and exit code. In progress (Terminated == nil) it is
+	// PENDING — no decision, requeue (the S5a pending-regression class).
+	// Checking it before the checks matters: when the artifact fails the
+	// checks never ran (the kubelet stops on the first non-zero init), so a
+	// check-0 status is ABSENT — reading the checks first would take the
+	// 'check not found' branch (noDecision) and never reach the artifact gate.
+	for j := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[j]
+		if ics.Name != verifyArtifactInit {
+			continue
+		}
+		if ics.State.Terminated == nil {
+			return verifyNoDecision, true, "", 0
+		}
+		if ics.State.Terminated.ExitCode != 0 {
+			return verifyIterate, false, verifyArtifactInit, ics.State.Terminated.ExitCode
+		}
+		break
+	}
+	// Tamper clean + artifact clean: read the check inits (check-0 ..
+	// check-<checkCount-1>).
 	for i := range checkCount {
 		name := fmt.Sprintf("check-%d", i)
 		found := false
@@ -865,26 +889,6 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 		if code != 0 {
 			return verifyIterate, false, name, code
 		}
-	}
-	// The I47 artifact check (the operator-side filter): it sits in the
-	// evidence order AFTER tamper and BEFORE the checks (the checks must not
-	// run on a commit that carries a build artifact — artifact is the gate
-	// to the acceptance checks, like tamper is the gate to artifact). A
-	// non-zero artifact exit is an ITERATE with the container's own name
-	// ('artifact') and exit code. In progress (Terminated == nil) it is
-	// PENDING — no decision, requeue (the S5a pending-regression class).
-	for j := range pod.Status.InitContainerStatuses {
-		ics := &pod.Status.InitContainerStatuses[j]
-		if ics.Name != verifyArtifactInit {
-			continue
-		}
-		if ics.State.Terminated == nil {
-			return verifyNoDecision, true, "", 0
-		}
-		if ics.State.Terminated.ExitCode != 0 {
-			return verifyIterate, false, verifyArtifactInit, ics.State.Terminated.ExitCode
-		}
-		break
 	}
 	return verifySucceeded, false, "", 0
 }

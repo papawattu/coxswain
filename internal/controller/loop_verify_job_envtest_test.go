@@ -303,12 +303,13 @@ func s5aVerifyPod(ctx context.Context, ns, name, jobName string, checkExit int32
 // spec's single construction point so the specs read as "the artifact
 // container did X" instead of a 6-element literal each time.
 func s5aVerifyInitStatuses(artifact corev1.ContainerState, checkExits []int32) []corev1.ContainerStatus {
-	inits := []corev1.ContainerStatus{
-		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aArtifact, State: artifact},
-	}
+	inits := make([]corev1.ContainerStatus, 0, 4+len(checkExits))
+	inits = append(inits,
+		corev1.ContainerStatus{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		corev1.ContainerStatus{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		corev1.ContainerStatus{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		corev1.ContainerStatus{Name: s5aArtifact, State: artifact},
+	)
 	for i, code := range checkExits {
 		inits = append(inits, corev1.ContainerStatus{
 			Name:  fmt.Sprintf("check-%d", i),

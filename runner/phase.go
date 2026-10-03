@@ -53,9 +53,11 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -257,15 +259,20 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		// claim without a valid 40-hex headCommit: if the re-commit also
 		// fails, the claim is blocked (the operator holds the advance).
 		if phase == PhaseImplementing && res.HeadCommit == "" {
-			if sha := commitWorkspace(cfg.Workspace); sha != "" {
+			if sha, staged, commitErr := commitWorkspace(cfg.Workspace); sha != "" {
 				res.HeadCommit = sha
+				res.Summary = stagedClaimSummary(res.Summary, staged)
 				log.Printf("runner: headCommit=%s (re-committed on restart)", sha)
 				// Persist the fixed result so future restarts see it.
 				_ = writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res)
 			} else {
 				log.Printf("runner: commitWorkspace failed on restart; emitting blocked claim")
 				res.Status = statusBlocked
-				res.VerificationNotes = "commit failed: re-commit on restart returned empty headCommit"
+				if commitErr != "" {
+					res.VerificationNotes = "commit failed: re-commit on restart: " + commitErr
+				} else {
+					res.VerificationNotes = "commit failed: re-commit on restart returned empty headCommit"
+				}
 				writeClaim(claimWritePath, res)
 				return res
 			}
@@ -299,19 +306,31 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		// empty (the operator then blocks the advance). On a BLOCKED run the
 		// work is not committed (nothing succeeded) and the claim carries no
 		// headCommit (no evidence to pin).
+		// I47: the staged paths ride into the claim summary (evidence: what the
+		// verified commit contains), and a refused commit (an oversized or
+		// binary new file) BLOCKS the claim with the reason — no headCommit,
+		// the operator holds the Verifying advance.
 		if res.Status == statusSuccess {
-			sha := commitWorkspace(cfg.Workspace)
+			sha, staged, commitErr := commitWorkspace(cfg.Workspace)
 			if sha != "" {
 				res.HeadCommit = sha
-				log.Printf("runner: headCommit=%s", sha)
+				res.Summary = stagedClaimSummary(res.Summary, staged)
+				log.Printf("runner: headCommit=%s staged=%d", sha, len(staged))
 			} else {
-				// A failed commit leaves the field empty and the operator holds
-				// the advance (ADR-0005 fail-closed). Log explicitly so the
-				// evidence survives (the first run's commit failure was lost
-				// because there was no log; the restart-safety path would then
-				// re-emit the same headCommit-less claim forever).
-				log.Printf("runner: commitWorkspace returned empty headCommit; " +
-					"emitting success claim without headCommit (operator will hold the advance)")
+				// The commit failed (I47 rejection or git failure): the work is
+				// not safe to verify (a build artifact would ride into the
+				// verified commit, or the commit itself failed). The claim is
+				// BLOCKED with the reason — the operator sees it in progress
+				// and the advance is held (ADR-0005 fail-closed: no evidence,
+				// no advance).
+				res.Status = statusBlocked
+				if commitErr != "" {
+					res.VerificationNotes = "commit failed: " + commitErr
+				} else {
+					res.VerificationNotes = "commit failed: commitWorkspace returned empty headCommit"
+				}
+				res.Summary = res.Summary + "; " + res.VerificationNotes
+				log.Printf("runner: %s; emitting blocked claim (operator will hold the advance)", res.VerificationNotes)
 			}
 		}
 	default:
@@ -510,52 +529,293 @@ func writeClaim(path string, res Result) {
 	}
 }
 
-// commitWorkspace (S5a, B3) commits the workspace repo's uncommitted work
-// (everything except the operator-owned .coxswain result dir) and returns the
-// new head commit's 40-hex SHA. The commit identity is fixed (the agent's
-// commit, never an operator or a system identity): git -c user.name=coxswain
-// agent -c user.email=agent@localhost. A no-op commit (nothing to commit)
-// returns the EXISTING head SHA — the verification target is still the repo
-// head, even when the agent's changes were already committed during the
-// phase run. It returns "" on any failure (a non-git workspace, a failed
-// add/commit, a short/uppercase SHA): the caller leaves the claim's
-// headCommit empty and the operator blocks the Verifying advance
+// commitWorkspace (S5a, B3; I47) commits the workspace repo's uncommitted
+// SOURCE work and returns (headSHA, stagedPaths, refuseReason). The commit
+// identity is fixed (the agent's commit, never an operator or a system
+// identity): git -c user.name=coxswain-agent -c user.email=agent@localhost.
+// A no-op commit (nothing to commit) returns the EXISTING head SHA — the
+// verification target is still the repo head, even when the agent's changes
+// were already committed during the phase run.
+//
+// I47 (REVIEW-PHASE1-R20): everything the agent leaves in the workspace must
+// not ride into the verified commit. The flow:
+//   - reset the index to HEAD (the agent's own `git add` calls during the
+//     phase run leave a dirty index — an artifact the agent added is NOT
+//     trusted; the verified commit is the OPERATOR's evidence and is built
+//     from the refusal-filtered set below, never from the agent's index),
+//   - refuse (refuseReason set, headSHA "") any NEW file over
+//     commitFileMaxBytes (1 MiB) or any binary (a NUL byte in the first 8
+//     KiB): an agent edit to an existing large tracked file is still
+//     committed (the agent's own source work), a large or binary NEW file
+//     is not — the claim is blocked with the reason and the operator holds
+//     the Verifying advance (ADR-0005 fail-closed),
+//   - stage ONLY the listed, non-refused paths (a per-path `git add`, never
+//     `git add -A`): an IGNORED path (a .gitignore'd build output) is
+//     silently skipped by the add and never enters the commit,
+//   - record the staged paths (returned; the caller lists them in the claim
+//     summary — I47 evidence of what the verified commit contains).
+//
+// On any git failure (a non-git workspace, a failed add/commit, a
+// short/uppercase SHA) it returns ("", paths, "") and the caller leaves the
+// claim's headCommit empty and the operator blocks the Verifying advance
 // (ADR-0005 fail-closed — no evidence, no advance). The .coxswain exclusion
 // is a pathspec so the operator's result files (result.json, PLAN.md,
 // desired-phase, the conversation state) never enter the verified commit.
-func commitWorkspace(workspace string) string {
+const (
+	// commitFileMaxBytes is the I47 per-new-file size cap: a single new file
+	// over this is a build artifact (the gocli binary is 2.5 MB), never
+	// source. The verified commit must not carry artifacts (S6 delivery
+	// pushes it to the repo).
+	commitFileMaxBytes = 1 * 1024 * 1024
+	// commitBinaryScanBytes is the I47 binary-detection window: a NUL byte
+	// in the first 8 KiB of a new file marks it binary.
+	commitBinaryScanBytes = 8 * 1024
+)
+
+func gitC(workspace string, args ...string) (string, error) {
 	// safe.directory: the PVC mount /workspace is root-owned (the init
 	// container runs as root) while the runner runs as uid 65532. Without
 	// this git refuses to operate on the repo ('dubious ownership') and all
-	// three calls fail, leaving headCommit empty and the Verifying advance
-	// blocked. The per-command -c avoids writing a config file (the
+	// git calls fail. The per-command -c avoids writing a config file (the
 	// workspace is shared with the agent and the PVC is the operator's
 	// evidence store — the runner must not leave a .gitconfig behind).
-	safe := []string{"-c", "safe.directory=" + workspace}
-	// git add -A (the whole workspace, .coxswain excluded via a pathspec
-	// negation: `:(exclude).coxswain`). A failure (not a git repo) is the
-	// "" path.
-	addArgs := append([]string{"-C", workspace}, append(safe,
-		"add", "-A", "--", ":(exclude).coxswain")...)
-	if out, err := exec.Command("git", addArgs...).CombinedOutput(); err != nil {
-		log.Printf("runner: workspace commit add: %v: %s", err, string(out))
-		return ""
+	full := append([]string{"-C", workspace, "-c", "safe.directory=" + workspace}, args...)
+	out, err := exec.Command("git", full...).CombinedOutput()
+	return string(out), err
+}
+
+// isHex40 reports whether s is a 40-character hex string (a commit SHA).
+func isHex40(s string) bool {
+	if len(s) != 40 {
+		return false
 	}
-	commitArgs := append([]string{"-C", workspace}, append(safe,
-		"-c", "user.name=coxswain-agent", "-c", "user.email=agent@localhost",
-		"commit", "-m", "coxswain: implement")...)
-	if out, err := exec.Command("git", commitArgs...).CombinedOutput(); err != nil {
-		// A 'nothing to commit' (exit 1, no new commit) is NOT a failure:
-		// the head SHA is still the verification target.
-		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", err, string(out))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
 	}
-	revArgs := append([]string{"-C", workspace}, append(safe, "rev-parse", "HEAD")...)
-	out, err := exec.Command("git", revArgs...).CombinedOutput()
+	return true
+}
+
+// gitRevParseHead returns the workspace repo's HEAD as a 40-hex SHA, or ""
+// when the repo is broken (not a git repo, an empty repo, a git failure).
+func gitRevParseHead(workspace string) string {
+	out, err := gitC(workspace, "rev-parse", "HEAD")
 	if err != nil {
-		log.Printf("runner: workspace rev-parse: %v: %s", err, string(out))
+		log.Printf("runner: workspace rev-parse: %v: %s", err, out)
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	sha := strings.TrimSpace(out)
+	if !isHex40(sha) {
+		return ""
+	}
+	return sha
+}
+
+// isTrackedPath reports whether the path is tracked in the workspace repo
+// (I47: the size/binary refusal applies to NEW files only — an agent edit to
+// a large existing tracked file is source work and is committed as-is).
+// It consults HEAD (not the index): a file the AGENT staged during the phase
+// run is not yet in HEAD and must be treated as new (the agent's index is
+// not trusted — commitWorkspace resets it).
+func isTrackedPath(workspace, path string) bool {
+	_, err := gitC(workspace, "cat-file", "-e", "HEAD:"+path)
+	return err == nil
+}
+
+// isBinaryFile reports whether the file at path carries a NUL byte in its
+// first scanLimit bytes (the I47 binary heuristic: build outputs and other
+// non-source files are refused; a NUL in the first 8 KiB is a reliable
+// marker without reading a multi-MiB file into memory).
+func isBinaryFile(path string, scanLimit int) bool {
+	rc, err := os.Open(path)
+	if err != nil {
+		return false // unreadable: the size cap and the git-failure paths still apply
+	}
+	buf := make([]byte, scanLimit)
+	n, _ := io.ReadFull(rc, buf)
+	_ = rc.Close()
+	return bytes.IndexByte(buf[:n], 0) >= 0
+}
+
+// stagedClaimSummary appends the I47 staged-paths list to the claim summary
+// (the claim summary is the runner's one-line status note; the path list is
+// capped so a runaway workspace cannot blow the termination-log claim size
+// budget — the claim must stay well under claimMaxBytes).
+func stagedClaimSummary(summary string, staged []string) string {
+	if len(staged) == 0 {
+		return summary
+	}
+	const maxListed = 8
+	listed := staged
+	suffix := ""
+	if len(staged) > maxListed {
+		listed = staged[:maxListed]
+		suffix = fmt.Sprintf(" (+%d more)", len(staged)-maxListed)
+	}
+	line := fmt.Sprintf("\n[staged: %d file(s): %s%s]", len(staged), strings.Join(listed, ", "), suffix)
+	// The whole claim (summary + blockedReason ride into the claim; the
+	// operator strict-parses it) must stay under claimMaxBytes; cap the
+	// appended list so it cannot push the claim over (the paths are also in
+	// result.json's tool trace and in the commit itself).
+	if len(summary)+len(line) > claimMaxBytes-256 {
+		return summary
+	}
+	return summary + line
+}
+
+func commitWorkspace(workspace string) (string, []string, string) {
+	head := gitRevParseHead(workspace)
+	if head == "" {
+		// Not a git repo (or git failed): no evidence, the caller blocks.
+		return "", nil, ""
+	}
+
+	// I47: the agent's own `git add` calls during the phase run leave a
+	// dirty index (an artifact the agent added). The verified commit is the
+	// OPERATOR's evidence and is built from the refusal-filtered set below —
+	// reset the index first so a pre-staged artifact cannot ride in (the
+	// plain `git add -A` mutation, run against the workspace, is undone here
+	// before the runner's own staging).
+	if out, err := gitC(workspace, "reset", "-q"); err != nil {
+		log.Printf("runner: workspace commit reset: %v: %s", err, out)
+		return "", nil, ""
+	}
+
+	// The paths the agent left (porcelain -z: NUL-separated so a path with a
+	// newline or quote round-trips; --untracked-files=all lists every
+	// untracked file, not a collapsed directory; the .coxswain pathspec
+	// exclusion keeps the operator's result files out of the list even on a
+	// .gitignore-less workspace).
+	status, err := gitC(workspace, "-c", "core.quotepath=false",
+		"status", "--porcelain=v1", "-z", "--untracked-files=all",
+		"--", ":(exclude).coxswain")
+	if err != nil {
+		log.Printf("runner: workspace commit status: %v: %s", err, status)
+		return "", nil, ""
+	}
+	if strings.TrimSpace(status) == "" {
+		// No changes: the head SHA is still the verification target (the
+		// agent's work was already committed during the phase run).
+		return head, nil, ""
+	}
+
+	// The refusal set is EVERY path the worktree differs on (modified,
+	// deleted, renamed — the records with a status prefix) PLUS every
+	// untracked file (the "?? PATH" records). A rename's new path is the
+	// worktree file (refused as new when it is a binary/oversized); its old
+	// path is a deletion (always allowed — it removes, it does not add).
+	var paths []string
+	for rec := range strings.SplitSeq(status, "\x00") {
+		if len(rec) < 4 {
+			continue
+		}
+		path := rec[3:]
+		if path == resultDirName || strings.HasPrefix(path, resultDirName+"/") {
+			continue // defensive: the pathspec above already excludes it
+		}
+		if rec[0] == 'R' || rec[0] == 'C' {
+			// Rename/copy: the NEW path (rec[3:]) is the worktree file; the
+			// next record is the OLD (prefix-free) path — skip both as
+			// refusal candidates (the new path is added below as untracked
+			// via the ?? entry git emits for the destination when the source
+			// was untracked; a tracked-source rename is source work).
+			continue
+		}
+		if rec[:2] == "??" {
+			if info, statErr := os.Stat(filepath.Join(workspace, path)); statErr == nil && info.IsDir() {
+				continue // a dir entry is not a stageable file
+			}
+			paths = append(paths, path) // untracked: new — refuse-eligible
+			continue
+		}
+		// A worktree-differing tracked file (M/D/R/C/A): source work —
+		// allowed (a modification/deletion is never a build artifact).
+		if rec[1] != ' ' {
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) == 0 {
+		return head, nil, ""
+	}
+
+	// I47: refuse a NEW file (not in HEAD) that is over the size cap or is
+	// binary. isTrackedPath consults HEAD (the index was reset above): an
+	// agent-edit to a tracked file passes, a new artifact is refused. A
+	// refused file UNSTAGES nothing (the index is already HEAD) and the
+	// whole commit is blocked — the claim carries no headCommit (ADR-0005
+	// fail-closed) and the reason names the artifact.
+	for _, p := range paths {
+		if isTrackedPath(workspace, p) {
+			continue
+		}
+		info, statErr := os.Lstat(filepath.Join(workspace, p))
+		if statErr != nil {
+			continue // deleted / gone: nothing to refuse
+		}
+		if info.Size() > commitFileMaxBytes {
+			return "", paths, fmt.Sprintf(
+				"new file %s is %d bytes (cap %d); build artifacts must be gitignored "+
+					"(add a .gitignore entry) or removed before re-running",
+				p, info.Size(), commitFileMaxBytes)
+		}
+		if isBinaryFile(filepath.Join(workspace, p), commitBinaryScanBytes) {
+			return "", paths, fmt.Sprintf(
+				"new file %s is binary (NUL byte in the first %d KiB); build "+
+					"artifacts must be gitignored or removed before re-running",
+				p, commitBinaryScanBytes/1024)
+		}
+	}
+
+	// Stage ONLY the listed paths (never `git add -A`: an unignored build
+	// output would stage and the refusal above would have caught it; an
+	// IGNORED path — a .gitignore'd build output — is silently skipped by
+	// the add and never enters the verified commit even though it is on
+	// disk). The paths are argv elements (exec.Command, no shell), so a
+	// path with a space or quote reaches git verbatim. A deletion stages as
+	// a removal (git add -- <deleted-path> records the delete since git
+	// 2.0; the reset above made the worktree the sole source of truth).
+	args := append([]string{"add", "-A", "--"}, paths...)
+	if out, addErr := gitC(workspace, args...); addErr != nil {
+		log.Printf("runner: workspace commit add: %v: %s", addErr, out)
+		return "", paths, ""
+	}
+
+	// The actual staged set (NUL-separated, core.quotepath=false so
+	// non-ASCII and odd-named paths round-trip verbatim): the claim summary
+	// lists what the commit will carry (I47 evidence).
+	stagedOut, err := gitC(workspace, "-c", "core.quotepath=false",
+		"diff", "--cached", "-z", "--name-only")
+	if err != nil {
+		log.Printf("runner: workspace commit staged list: %v: %s", err, stagedOut)
+		return "", paths, ""
+	}
+	var stagedPaths []string
+	for p := range strings.SplitSeq(stagedOut, "\x00") {
+		if p != "" {
+			stagedPaths = append(stagedPaths, p)
+		}
+	}
+	if len(stagedPaths) == 0 {
+		// Nothing actually staged (a pure delete set whose path was also
+		// gone, or every path was ignored): the head is unchanged and the
+		// commit is a no-op.
+		return head, nil, ""
+	}
+
+	commitArgs := []string{"-c", "user.name=coxswain-agent", "-c", "user.email=agent@localhost",
+		"commit", "-m", "coxswain: implement"}
+	if out, commitErr := gitC(workspace, commitArgs...); commitErr != nil {
+		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", commitErr, out)
+		return "", stagedPaths, ""
+	}
+
+	newHead := gitRevParseHead(workspace)
+	if newHead == "" {
+		return "", stagedPaths, ""
+	}
+	return newHead, stagedPaths, ""
 }
 
 // readDesiredPhase reads <workspace>/.coxswain/desired-phase and returns the

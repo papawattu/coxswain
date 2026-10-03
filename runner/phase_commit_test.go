@@ -65,7 +65,10 @@ func TestCommitWorkspaceCommitsAndReturnsHeadSHA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	head := commitWorkspace(ws)
+	head, staged, refuse := commitWorkspace(ws)
+	if refuse != "" {
+		t.Fatalf("no refusal expected, got %q", refuse)
+	}
 	if head == "" {
 		t.Fatal("commitWorkspace returned an empty SHA")
 	}
@@ -94,6 +97,10 @@ func TestCommitWorkspaceCommitsAndReturnsHeadSHA(t *testing.T) {
 	if got := gitIn(t, ws, "show", "HEAD:main.go"); got == "" {
 		t.Fatal("the committed tree is empty")
 	}
+	// I47: the staged paths list the files the commit carries (evidence).
+	if len(staged) != 1 || staged[0] != "newfile.go" {
+		t.Fatalf("staged = %v, want [newfile.go]", staged)
+	}
 }
 
 func TestCommitWorkspaceNoChangesReturnsExistingHead(t *testing.T) {
@@ -101,7 +108,10 @@ func TestCommitWorkspaceNoChangesReturnsExistingHead(t *testing.T) {
 	initTestRepo(t, ws)
 	base := gitIn(t, ws, "rev-parse", "HEAD")
 
-	head := commitWorkspace(ws)
+	head, _, refuse := commitWorkspace(ws)
+	if refuse != "" {
+		t.Fatalf("no refusal expected, got %q", refuse)
+	}
 	if head != base {
 		t.Fatalf("no changes: head = %q, want the existing head %q", head, base)
 	}
@@ -112,7 +122,8 @@ func TestCommitWorkspaceNotAGitRepoReturnsEmpty(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ws, "f.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := commitWorkspace(ws); got != "" {
+	got, _, _ := commitWorkspace(ws)
+	if got != "" {
 		t.Fatalf("non-repo workspace: commitWorkspace = %q, want empty (ADR-0005 fail-closed)", got)
 	}
 }
@@ -127,6 +138,11 @@ func TestCommitWorkspaceNotAGitRepoReturnsEmpty(t *testing.T) {
 func TestCommitWorkspaceUsesSafeDirectory(t *testing.T) {
 	ws := t.TempDir()
 	initTestRepo(t, ws)
+	// I47: leave uncommitted agent work so the commit path (add, commit)
+	// runs (the no-change path would only rev-parse).
+	if err := os.WriteFile(filepath.Join(ws, "work.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Build a git shim: a shell script that appends its args to a log file
 	// then execs the real git with the same args.
@@ -146,7 +162,7 @@ func TestCommitWorkspaceUsesSafeDirectory(t *testing.T) {
 	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+oldPath)
 	// t.Setenv registers a cleanup that restores PATH automatically.
 
-	head := commitWorkspace(ws)
+	head, _, _ := commitWorkspace(ws)
 	if head == "" {
 		t.Fatal("commitWorkspace returned an empty SHA (shim may have broken git)")
 	}
@@ -341,17 +357,4 @@ func TestRestartStaleIterationResultNotReused(t *testing.T) {
 		t.Fatalf("new result iteration = %d, want 2 (the current .coxswain/iteration)", res.Iteration)
 	}
 	_ = claimPath
-}
-
-// isHex40 reports whether s is a 40-character lowercase-hex string.
-func isHex40(s string) bool {
-	if len(s) != 40 {
-		return false
-	}
-	for _, c := range s {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
 }

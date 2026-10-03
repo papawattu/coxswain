@@ -372,8 +372,16 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 	}
 	// B1 + OS8: advance one step when the claim names the immediate-next
 	// phase AND the gate allows it (option B: the gate always allows).
+	// S5a hot-loop guard: the advance requires the claim's ObservedPhase to
+	// match the CURRENT phase (loop.Status.Phase). A stale claim from a
+	// previous phase (e.g., an Implementing claim left on the pod after a
+	// verify-iterate back to Implementing) must NOT re-advance: the runner
+	// has not re-run that phase, so the claim is evidence for a phase that
+	// is no longer current. Without this guard, the one-shot claim is
+	// re-consumed forever (the kind hot-loop: verify-2..verify-9 flooding).
+	claimPhaseIsCurrent := claim.ObservedPhase == loop.Status.Phase
 	next := nextPhase(loop.Status.Phase, claimPhaseForAdvance(claim))
-	if next != loop.Status.Phase {
+	if next != loop.Status.Phase && claimPhaseIsCurrent {
 		// S5a (B3, ADR-0005): the Implementing -> Verifying advance pins the
 		// runner's committed head to status.currentVerify.verifiedCommit. The
 		// pin requires a VALID headCommit in the claim (40-hex, strict-parsed
@@ -479,6 +487,10 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// metav1.Now) so a test can advance it more than 1s between reconciles
 		// (metav1.Time marshals at 1-second precision: two same-second
 		// reconciles are byte-identical and the no-churn spec cannot fail).
+		logf.FromContext(ctx).Info("DEBUG advancePhaseFromClaim",
+			"claimObservedPhase", claim.ObservedPhase,
+			"currentPhase", loop.Status.Phase,
+			"claimPhaseIsCurrent", claim.ObservedPhase == loop.Status.Phase)
 		var now metav1.Time
 		if r.now != nil {
 			now = r.now()

@@ -103,6 +103,19 @@ type VerifyConfig struct {
 	// only protectedPaths (ADR-0005 D16). Equivalent to preset: none.
 	// +optional
 	ProtectedPathsOverride bool `json:"protectedPathsOverride,omitempty"`
+
+	// image is the container image the check-* acceptance-check containers
+	// run (S5a: the acceptance checks are user commands that may need a
+	// toolchain — `go test` needs a Go image, not the operator's git image).
+	// It is separate from the trusted git image the clone-base / import-agent /
+	// tamper containers run, which never runs user commands. The image MUST
+	// carry a POSIX shell (the checks run via /bin/sh -c), safe.directory
+	// support is carried by env, not the image. When empty, the operator uses
+	// its default check image (the controller's --verify-image flag when set,
+	// else a built-in Go image so `go build` / `go test` checks work out of
+	// the box).
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 // VerifyStatus is the operator's record of the last verify run's evidence

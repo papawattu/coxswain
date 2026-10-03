@@ -28,7 +28,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"time"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -199,6 +201,29 @@ func s5aDriveToVerifying(ns, name string) *LoopReconciler {
 	s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
 	s5aReconcile(r, ns, name)
 	return r
+}
+
+// s5aVerifyPod creates the stand-in verify Job pod with the given init
+// exit codes (envtest has no Job controller; the operator reads the
+// initContainerStatuses from this pod). checkExit 0/absent = all checks
+// pass; a non-zero checkExit makes check-0 fail.
+func s5aVerifyPod(ctx context.Context, ns, name, jobName string, checkExit int32) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + "-verify-pod",
+			Namespace: ns,
+			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: checkExit}}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
 var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
@@ -734,5 +759,188 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// The new Job exists with the new pin's annotation.
 		Expect(newJob.Annotations["coxswain.io/verified-commit"]).To(Equal("abcdefabcdefabcdefabcdefabcdefabcdefabcd"),
 			"the recreated Job must carry the NEW pin's annotation")
+	})
+
+	It("runs the check-* containers on spec.verify.image (NOT the trusted git image)", func() {
+		ns := "s5a-img-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "imgloop"
+		spec := s5aLoopSpec()
+		spec.Verify.Image = "docker.io/library/golang:1.26"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       spec,
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
+		inits := job.Spec.Template.Spec.InitContainers
+		// check-0 uses the Loop's verify.image...
+		Expect(inits[3].Name).To(Equal("check-0"))
+		Expect(inits[3].Image).To(Equal("docker.io/library/golang:1.26"),
+			"check-* containers must run on spec.verify.image (they may need a Go toolchain)")
+		// ...while the trusted inits stay on the git image (they never run user commands).
+		for _, n := range []string{"clone-base", "import-agent", "tamper"} {
+			for i := range inits {
+				if inits[i].Name == n {
+					Expect(inits[i].Image).NotTo(Equal("docker.io/library/golang:1.26"),
+						"the trusted init %s must stay on the git image", n)
+				}
+			}
+		}
+	})
+
+	It("uses the built-in Go default when no verify.image is declared (check containers, not the git image)", func() {
+		ns := "s5a-defimg-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "defimgloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(), // no Verify.Image
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
+		inits := job.Spec.Template.Spec.InitContainers
+		Expect(inits[3].Image).To(Equal(verifyDefaultCheckImage),
+			"without spec.verify.image the checks run on the built-in Go default (go: not found fix)")
+		Expect(inits[3].Image).NotTo(Equal("docker.io/alpine/git:v2.54.0"),
+			"the git image has no Go toolchain — the S5a check-0 exit 127 root cause")
+	})
+
+	It("iterates a failing check back to Implementing WITHOUT creating a new verify Job", func() {
+		ns := "s5a-noregen-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "noregenloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name) // verify-1 created
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPod(ctx, ns, name, jobName, 1) // check-0 fails
+
+		// Reconcile until the phase is Implementing (the apiserver may lag
+		// the shared status update on the first reconcile after the check
+		// failure). The hot-loop guard ensures we never see Verifying again
+		// after a failed check (the claim phase-match guard blocks the stale
+		// Implementing claim from re-advancing).
+		var loop *coxv1alpha1.Loop
+		for i := 0; i < 10; i++ {
+			loop = s5aReconcile(r, ns, name)
+			GinkgoWriter.Printf("DEBUG reconcile %d: phase=%s desiredPhase=%s iter=%d curVerify=%v\n",
+				i, loop.Status.Phase, loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.CurrentVerify)
+			if loop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"a failing check -> back to Implementing (no new model work is skipped)")
+		Expect(loop.Status.Iteration).To(Equal(2))
+		Expect(loop.Status.CurrentVerify).To(BeNil(), "the pin clears (a fresh pin at the next advance creates the fresh Job)")
+		// No second Job: the name for iteration 2 does not exist, and no Job at
+		// all is created while the pin is nil.
+		By("NOT creating verify-2 or any other Job (the hot-loop guard)")
+		for _, candidate := range []string{name + "-verify-2", name + "-verify-3"} {
+			job := &batchv1.Job{}
+			getErr := k8sClient.Get(ctx, types.NamespacedName{Name: candidate, Namespace: ns}, job)
+			Expect(apierrors.IsNotFound(getErr)).To(BeTrue(), "no Job %s after the iterate", candidate)
+		}
+		// The failing check rides into progress (the next Implementing prompt
+		// can include it).
+		Expect(loop.Status.Progress).NotTo(BeNil())
+		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("check-0"))
+		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("exit 1"))
+
+		// Reconcile again (still Implementing, no claim): NOTHING new is
+		// created — no Job flood (the kind root cause: verify-2..verify-9
+		// every ~10s while stuck in Verifying).
+		loop = s5aReconcile(r, ns, name)
+		GinkgoWriter.Printf("DEBUG second reconcile: phase=%s desiredPhase=%s iter=%d\n",
+			loop.Status.Phase, loop.Status.DesiredPhase, loop.Status.Iteration)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		jobs := &batchv1.JobList{}
+		Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1), "only the original verify-1 Job exists after the iterate")
+		Expect(jobs.Items[0].Name).To(Equal(name + "-verify-1"))
+	})
+
+	It("fails a Loop at the maxIterations cap instead of iterating forever (hot-loop guard)", func() {
+		ns := "s5a-cap-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "caploop"
+		spec := s5aLoopSpec()
+		spec.Loop.MaxIterations = 3 // the handoff's MVP cap
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       spec,
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		// Drive the Loop to iteration 3 at Verifying (under the cap of 3) by
+		// setting the status directly (the cap logic is in applyVerifyOutcome,
+		// which doesn't depend on the sandbox recycle).
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying
+		loop.Status.Iteration = 3
+		loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// Reconcile to create the verify-3 Job (the new pin's annotation
+		// differs from the old pin, so the stale-Job guard deletes verify-1
+		// and creates verify-3).
+		loop = s5aReconcile(r, ns, name)
+		// The verify-3 Job exists (the stale-Job guard deleted verify-1 and
+		// created a fresh Job for the new pin).
+		job3 := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-3", Namespace: ns}, job3)).To(Succeed())
+
+		// Create a failing check pod for verify-3 and reconcile -> Failed.
+		s5aVerifyPod(ctx, ns, name, name+"-verify-3", 1)
+		loop = s5aReconcile(r, ns, name)
+
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"the cap (3) is hit on the failing iteration 4 -> Failed (not another iterate)")
+		found := false
+		for _, c := range loop.Status.Conditions {
+			if c.Type == string(coxv1alpha1.LoopPhaseFailed) && c.Reason == MaxIterationsExceededReason && c.Status == metav1.ConditionTrue {
+				found = true
+				Expect(c.Message).To(ContainSubstring("check-0"))
+			}
+		}
+		Expect(found).To(BeTrue(), "the Failed condition carries the MaxIterationsExceeded reason")
+		// No verify-4 Job (the iterate is capped).
+		job4 := &batchv1.Job{}
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-4", Namespace: ns}, job4))).To(BeTrue())
 	})
 })

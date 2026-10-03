@@ -260,10 +260,19 @@ type LoopReconciler struct {
 	// the 'sleep infinity' stand-in (an explicit opt-out for debugging pods
 	// and non-runner images). There is NO runner detection by image name
 	// beyond this exact match / empty — a Loop's image is only ever run as
-	// the runner when it IS the runner the operator configured. Empty (most
-	// envtests) means no Loop is run as the runner: every agent keeps
-	// 'sleep infinity'.
+	// the runner when it IS the runner the operator configured.
+	// Empty (most envtests) means no Loop is run as the runner: every agent
+	// keeps 'sleep infinity'.
 	RunnerImage string
+
+	// VerifyImage is the DEFAULT image the verify Job's check-* containers
+	// run when a Loop declares acceptance checks WITHOUT spec.verify.image
+	// (S5a). The checks are user commands that may need a toolchain (`go
+	// test` needs a Go image), so the default is a Go image; the trusted
+	// git image (WorkspaceGitImage) is NOT usable here (it has no Go).
+	// Settable via --verify-image so the operator (not the Loop) can pick a
+	// different default. spec.verify.image always wins over this flag.
+	VerifyImage string
 
 	// PodCIDR / ServiceCIDR are the cluster's pod and service CIDRs (I42e +
 	// I42c NetworkPolicy carve-outs). Read from the operator's environment
@@ -984,21 +993,27 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// S4 (ADR-0004): the phase-init container materialises the operator's
 	// status.desiredPhase into <workspace>/.coxswain/desired-phase (the
 	// runner's read channel; the operator is the sole writer of the phase —
-	// ADR-0004). The runner is one-shot per phase: it reads the desired
-	// phase, does that phase's work, and exits with the claim in its
-	// termination message. It is ALWAYS present (the phase machine is core,
-	// not workspace-gated) and runs AFTER the workspace init so the
-	// .coxswain dir exists (the workspace init creates it; a fresh emptyDir
-	// has none). A fresh phase-init per pod recreation is the mechanism that
-	// re-writes the desired phase after a phase advance (recycleSandboxForPhase
-	// deletes the sandbox; this init re-runs on the new pod). The phase value
-	// is a fixed enum (CRD-validated on status.desiredPhase), but it is
-	// shell-quoted anyway (the init script is sh -c; an unusual-but-valid
-	// value must not inject).
+	// ADR-0004) AND status.iteration into <workspace>/.coxswain/iteration
+	// (the runner's iteration marker). The runner is one-shot per phase: it
+	// reads the desired phase, does that phase's work, and exits with the
+	// claim in its termination message. It is ALWAYS present (the phase
+	// machine is core, not workspace-gated) and runs AFTER the workspace init
+	// so the .coxswain dir exists (the workspace init creates it; a fresh
+	// emptyDir has none). A fresh phase-init per pod recreation is the
+	// mechanism that re-writes the desired phase after a phase advance
+	// (recycleSandboxForPhase deletes the sandbox; this init re-runs on the
+	// new pod). The phase value is a fixed enum (CRD-validated on
+	// status.desiredPhase), but it is shell-quoted anyway (the init script is
+	// sh -c; an unusual-but-valid value must not inject). The iteration value
+	// is the authoritative iteration count (CRD-validated integer): a verify
+	// iterate (failed check -> Implementing, iteration+1) writes a NEW value,
+	// so the runner's stale-iteration guard (ADR-0005 D11) discards the prior
+	// success result.json and does fresh model work against the failing
+	// check instead of re-emitting the old claim.
 	initContainers = append(initContainers, corev1.Container{
 		Name:    phaseInitContainerName,
 		Image:   r.workspaceGitImage(),
-		Command: []string{"/bin/sh", "-c", phaseInitScript(loop.Status.DesiredPhase)},
+		Command: []string{"/bin/sh", "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration)},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
 		},
@@ -3246,7 +3261,7 @@ func shellQuote(s string) string {
 // must not inject). An EMPTY desired phase writes nothing (the runner waits
 // for the operator to set one; the operator's first reconcile sets
 // status.desiredPhase = Planning for a fresh Loop — see the S4 advance path).
-func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase) string {
+func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase, iteration int) string {
 	if desiredPhase == "" {
 		return `#!/bin/sh
 set -eu
@@ -3262,6 +3277,10 @@ set -eu
 DEST=/workspace
 mkdir -p "${DEST}/.coxswain"
 printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"
+# The iteration marker (S5a: the verify iterate bumps status.iteration and
+# recycles the pod; the runner's stale-iteration guard uses this file to
+# discard the prior success result and do fresh model work).
+printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswain/iteration"
 `
 }
 

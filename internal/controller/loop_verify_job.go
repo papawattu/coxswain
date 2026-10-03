@@ -98,17 +98,41 @@ const (
 	verifySafeDirectory = "safe.directory"
 )
 
-// verifyJobImage is the image the verify Job's init containers run (the
-// operator's pinned, trusted git+sh image). It is the SAME image the
+// verifyJobImage is the image the verify Job's trusted init containers run
+// (the operator's pinned, trusted git+sh image). It is the SAME image the
 // workspace init container uses (r.WorkspaceGitImage) so the operator has one
-// trusted image for all git work (the clone-base + import-agent + tamper +
-// check containers are all operator-owned; the agent's image never runs in
-// the Job).
+// trusted image for all git work. The check-* containers do NOT use it: they
+// run USER commands (the acceptance checks) and need a toolchain — see
+// verifyCheckImage. The agent's image never runs in the Job.
 func (r *LoopReconciler) verifyJobImage() string {
 	if r.WorkspaceGitImage != "" {
 		return r.WorkspaceGitImage
 	}
 	return "docker.io/alpine/git:v2.54.0"
+}
+
+// verifyDefaultCheckImage is the built-in default for the check-* containers
+// when neither spec.verify.image nor the --verify-image flag supplies one
+// (the flag always supplies one in a live deployment; this covers bare
+// reconcilers constructed in tests). A Go image so `go build` / `go test`
+// checks work out of the box — the trusted git image has no Go toolchain
+// (the S5a kind root cause: check-0 exited 127 'go: not found' on alpine/git).
+const verifyDefaultCheckImage = "docker.io/library/golang:1.26"
+
+// verifyCheckImage returns the image the verify Job's check-* acceptance-check
+// containers run (S5a): the Loop's spec.verify.image when set, else the
+// operator's --verify-image default, else the built-in Go image. The checks
+// are user commands (ADR: the only gate to Succeeded) and may need a
+// toolchain, so this image is separate from the trusted git image the
+// clone-base / import-agent / tamper containers run.
+func (r *LoopReconciler) verifyCheckImage(loop *coxv1alpha1.Loop) string {
+	if loop.Spec.Verify.Image != "" {
+		return loop.Spec.Verify.Image
+	}
+	if r.VerifyImage != "" {
+		return r.VerifyImage
+	}
+	return verifyDefaultCheckImage
 }
 
 // errVerifyStaleDeleted is the sentinel error ensureVerifyJob returns when
@@ -391,12 +415,17 @@ exit 0
 	// ran — because a prior init failed — has no terminated status, which the
 	// operator distinguishes from a ran-and-failed check).
 	checks := loop.Spec.Verify.AcceptanceChecks
+	// S5a: the checks run USER commands (they are the only gate to Succeeded
+	// and may need a toolchain — `go test` needs Go), so they run on the
+	// verify CHECK image (spec.verify.image / --verify-image / built-in Go
+	// default), NOT on the trusted git image (which has no Go).
+	checkImage := r.verifyCheckImage(loop)
 	checkCts := make([]corev1.Container, 0, len(checks))
 	for i, cmd := range checks {
 		c := cmd
 		ct := corev1.Container{
 			Name:            fmt.Sprintf("check-%d", i),
-			Image:           baseImage,
+			Image:           checkImage,
 			Command:         []string{verifySh, "-c", c},
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
@@ -631,10 +660,13 @@ const (
 	verifyTampered
 )
 
-// verifyOutcome reads the pod's init statuses and returns the outcome.
-func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool) {
+// verifyOutcome reads the pod's init statuses and returns the outcome. A
+// verifyIterate carries the failing check's name and exit code (the
+// operator records them into status.progress so the next Implementing
+// prompt can include the failure).
+func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 	if pod == nil {
-		return verifyNoDecision, true
+		return verifyNoDecision, true, "", 0
 	}
 	// Find the tamper init.
 	tamperIdx := -1
@@ -645,14 +677,14 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool) {
 		}
 	}
 	if tamperIdx < 0 {
-		return verifyNoDecision, true
+		return verifyNoDecision, true, "", 0
 	}
 	tamperStatus := pod.Status.InitContainerStatuses[tamperIdx]
 	if tamperStatus.State.Terminated == nil {
-		return verifyNoDecision, true
+		return verifyNoDecision, true, "", 0
 	}
 	if tamperStatus.State.Terminated.ExitCode != 0 {
-		return verifyTampered, false
+		return verifyTampered, false, "tamper", tamperStatus.State.Terminated.ExitCode
 	}
 	// Tamper clean: read the check inits (check-0 .. check-<checkCount-1>).
 	for i := range checkCount {
@@ -671,26 +703,50 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool) {
 				// Not terminated: a prior init failed, so this check did not
 				// run (I14 NotRun). The first non-terminated check after a
 				// clean tamper is the failure point.
-				return verifyIterate, false
+				return verifyIterate, false, name, 0
 			}
 			break
 		}
 		if !found {
 			// The check init is not in the pod status at all (the Job pod has
 			// fewer inits than expected — a malformed Job). No evidence.
-			return verifyNoDecision, true
+			return verifyNoDecision, true, "", 0
 		}
 		if code != 0 {
-			return verifyIterate, false
+			return verifyIterate, false, name, code
 		}
 	}
-	return verifySucceeded, false
+	return verifySucceeded, false, "", 0
 }
+
+// MaxIterationsExceededReason is the Failed condition reason recorded when
+// the iteration cap (spec.loop.maxIterations, default 3 when unset) is hit:
+// a verify check failed on the last allowed iteration, so the Loop is Failed
+// instead of iterating again (S5a hot-loop guard — without a cap a failing
+// check would re-enter Implementing and re-verify forever).
+const MaxIterationsExceededReason = "MaxIterationsExceeded"
+
+// defaultMaxIterations is the cap when spec.loop.maxIterations is unset
+// (the CRD default is 10; this constant covers bare reconcilers/Loops that
+// were constructed without the CRD defaulting, and documents the S5a MVP
+// cap the handoff specifies: 3 cycles).
+const defaultMaxIterations = 3
 
 // applyVerifyOutcome maps a verifyOutcome to a phase transition (B3). It
 // returns changed (the Loop's status was mutated). The caller runs it every
 // reconcile at Verifying (the B2 tamper gate ALSO runs every reconcile; this
 // is the check/iterate/Succeeded path).
+//
+// A non-zero check (verifyIterate) sends the Loop BACK to Implementing with
+// the iteration incremented (the runner's iteration scoping then does new
+// model work against the failing check). It does NOT create a new verify
+// Job: a new Job is created only when a NEW verifiedCommit is pinned at the
+// next Implementing -> Verifying advance (the pin is cleared here, so
+// ensureVerifyJob holds until the re-advance). The failing check's name and
+// exit code are recorded into status.progress (the runner's implementing
+// prompt can include them in the next iteration's model work). The
+// maxIterations cap bounds the iterate: when the increment would exceed it,
+// the Loop is Failed:MaxIterationsExceeded instead of iterating.
 func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return false, false
@@ -703,7 +759,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		return true, true
 	}
 	checkCount := len(loop.Spec.Verify.AcceptanceChecks)
-	outcome, requeue := verifyOutcome(pod, checkCount)
+	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount)
 	if requeue {
 		return false, true
 	}
@@ -713,17 +769,43 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		return true, false
 	case verifyIterate:
-		// Back to Implementing, iteration+1 (B4: the cap is the caller's
-		// decision — if iteration+1 exceeds the cap, the caller flips to
-		// Failed; for S5a the default cap is high, so iterate). The first
-		// cycle is iteration 1 (status.iteration is 0-based at the first
-		// Verifying), so the iterate moves to at least 2 (the next cycle).
+		// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
+		// is created only for a fresh pin at the next advance). The failing
+		// check rides into status.progress so the next Implementing run can
+		// target it.
 		nextIter := max(loop.Status.Iteration+1, 2)
+		cap := loop.Spec.Loop.MaxIterations
+		if cap <= 0 {
+			cap = defaultMaxIterations
+		}
+		if nextIter > cap {
+			// The cap is hit: the last allowed iteration's check failed. Fail
+			// the Loop (terminal) instead of iterating again — this is the
+			// hot-loop guard (a failing check without a cap would create
+			// verify-N jobs in a tight loop).
+			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+				MaxIterationsExceededReason,
+				fmt.Sprintf("acceptance check %s failed (exit %d) on iteration %d; the maxIterations cap (%d) is reached",
+					failedCheck, checkExitCode, loop.Status.Iteration, cap))
+			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+			return true, false
+		}
 		loop.Status.Iteration = nextIter
 		loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
+		// OS1: record the failing check into progress (the next Implementing
+		// run can target it). The progress block is the operator's structured
+		// record; this is the operator's own evidence (the verify Job pod's
+		// exit codes), not a runner claim.
+		if loop.Status.Progress == nil {
+			loop.Status.Progress = &coxv1alpha1.ProgressStatus{}
+		}
+		loop.Status.Progress.LastResultStatus = fmt.Sprintf("check-failed: %s (exit %d)", failedCheck, checkExitCode)
+		loop.Status.Progress.Iteration = loop.Status.Iteration
 		// Clear the current pin: the next Implementing run will produce a new
-		// headCommit and re-pin on the next advance.
+		// headCommit and re-pin on the next advance (the fresh Job is created
+		// for THAT pin only).
 		loop.Status.CurrentVerify = nil
 		return true, false
 	case verifyTampered:

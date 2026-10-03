@@ -132,6 +132,14 @@ func main() {
 		"The image the operator runs as the runner (its entrypoint). When spec.agent.image is empty or equals this, "+
 			"the agent container runs the runner; any other image keeps the 'sleep infinity' stand-in. "+
 			"Default: empty (no Loop is run as the runner).")
+	// S5a (B3): the DEFAULT image the verify Job's check-* containers run when
+	// a Loop declares acceptance checks without spec.verify.image. A Go image
+	// by default so `go build` / `go test` checks work out of the box.
+	var verifyImage string
+	flag.StringVar(&verifyImage, "verify-image", "docker.io/library/golang:1.26",
+		"The image the verify Job's check-* acceptance-check containers run when a Loop does not set spec.verify.image. "+
+			"Must carry a POSIX shell. Default: docker.io/library/golang:1.26 (the acceptance checks may be Go commands, "+
+			"and the trusted git image has no Go toolchain).")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -300,6 +308,7 @@ func main() {
 		ClusterDomain:          clusterDomain,
 		WorkspaceGitImage:      workspaceGitImage,
 		RunnerImage:            runnerImage,
+		VerifyImage:            verifyImage,
 		// D38: the NetworkEnforced condition-change Event (the manager's
 		// recorder posts it as a Kubernetes Event; the re-gate Event lives
 		// in the probe Runnable).

@@ -80,8 +80,15 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 			coxv1alpha1.LoopPhasePlanning,
 			coxv1alpha1.LoopPhaseImplementing,
 		} {
+			// S5a (B3 MVP gate): the Implementing claim carries the 40-hex headCommit
+			// (the post-S5a runner always commits + reports the head on a successful
+			// Implementing), so the operator advances to Verifying and pins it.
 			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
-				return &PhaseClaim{ObservedPhase: executed, Status: claimSuccess}, nil
+				c := &PhaseClaim{ObservedPhase: executed, Status: claimSuccess}
+				if executed == coxv1alpha1.LoopPhaseImplementing {
+					c.HeadCommit = "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5" // 40-hex
+				}
+				return c, nil
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 			Expect(err).NotTo(HaveOccurred())

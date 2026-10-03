@@ -67,6 +67,25 @@ import (
 	"github.com/papawattu/coxswain/internal/tamper"
 )
 
+// Verify Job label / path / image constants.
+const (
+	// verifyLoopLabel is the Job's object label: the owning Loop.
+	verifyLoopLabel = "coxswain.io/loop"
+	// verifyForLabel is the verify Pod's selector label: the Loop the verify
+	// Job runs for (also the Job's name).
+	verifyForLabel = "coxswain.io/verify-for"
+	// verifyScratchPath is the per-container writable scratch.
+	verifyScratchPath = "/verify"
+	// verifyBusybox is the verify Job's container image (alpine, has git).
+	verifyBusybox = "busybox"
+	// verifySh is the shell command for the verify init containers.
+	verifySh = "/bin/sh"
+	// verifyVol is the verify Job's emptyDir volume name.
+	verifyVol = "verify"
+	// verifyNoopContainer is the no-op main container's name.
+	verifyNoopContainer = "noop"
+)
+
 // verifyJobImage is the image the verify Job's init containers run (the
 // operator's pinned, trusted git+sh image). It is the SAME image the
 // workspace init container uses (r.WorkspaceGitImage) so the operator has one
@@ -99,8 +118,8 @@ func verifyJobName(loop *coxv1alpha1.Loop) string {
 func verifyJobLabels(loopName string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/part-of":    "coxswain",
-		"coxswain.io/loop":             loopName,
-		"coxswain.io/verify-for":       loopName,
+		verifyLoopLabel:                loopName,
+		verifyForLabel:                 loopName,
 		"app.kubernetes.io/managed-by": "coxswain-controller",
 	}
 }
@@ -157,7 +176,7 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 			Namespace: loop.Namespace,
 			Labels:    verifyJobLabels(loop.Name),
 		},
-		Spec: r.buildVerifyJobSpec(ctx, loop),
+		Spec: r.buildVerifyJobSpec(loop),
 	}
 	if err := client.IgnoreNotFound(r.Create(ctx, job)); err != nil {
 		return fmt.Errorf("create verify job %s: %w", name, err)
@@ -176,7 +195,7 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 // buildVerifyJobSpec builds the verify Job's spec: the init containers in
 // evidence order + the no-op main container + restartPolicy Never +
 // backoffLimit 0 (B3b: exactly one run).
-func (r *LoopReconciler) buildVerifyJobSpec(ctx context.Context, loop *coxv1alpha1.Loop) batchv1.JobSpec {
+func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobSpec {
 	baseImage := r.verifyJobImage()
 	verifyCommit := loop.Status.CurrentVerify.VerifiedCommit
 	baseCommit := loop.Status.BaseCommit
@@ -198,10 +217,10 @@ func (r *LoopReconciler) buildVerifyJobSpec(ctx context.Context, loop *coxv1alph
 	cloneCt := corev1.Container{
 		Name:            "clone-base",
 		Image:           baseImage,
-		Command:         []string{"/bin/sh", "-c", cloneScript(repo, verifyCommit, baseCommit)},
+		Command:         []string{verifySh, "-c", cloneScript(repo, verifyCommit, baseCommit)},
 		SecurityContext: trustedContainerSecurityContext(),
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "verify", MountPath: "/verify"},
+			{Name: verifyVol, MountPath: verifyScratchPath},
 		},
 	}
 
@@ -215,7 +234,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(ctx context.Context, loop *coxv1alph
 		cloneCt.VolumeMounts = append(cloneCt.VolumeMounts, corev1.VolumeMount{
 			Name: "git-cred", MountPath: "/git-cred", ReadOnly: true,
 		})
-		cloneCt.Command = []string{"/bin/sh", "-c", cloneCredScript(repo, verifyCommit, baseCommit)}
+		cloneCt.Command = []string{verifySh, "-c", cloneCredScript(repo, verifyCommit, baseCommit)}
 	}
 
 	// The import-agent init: copies the agent's committed tree from the
@@ -239,10 +258,10 @@ echo "import-agent ok"
 	importCt := corev1.Container{
 		Name:            "import-agent",
 		Image:           baseImage,
-		Command:         []string{"/bin/sh", "-c", importScript},
+		Command:         []string{verifySh, "-c", importScript},
 		SecurityContext: trustedContainerSecurityContext(),
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "verify", MountPath: "/verify"},
+			{Name: verifyVol, MountPath: verifyScratchPath},
 			// The agent's workspace PVC, READ-ONLY. This is the only place
 			// agent data enters the Job.
 			{Name: "agent-workspace", MountPath: "/agent-src", ReadOnly: true},
@@ -271,9 +290,9 @@ exit 0
 	tamperCt := corev1.Container{
 		Name:            "tamper",
 		Image:           baseImage,
-		Command:         []string{"/bin/sh", "-c", tamperScript},
+		Command:         []string{verifySh, "-c", tamperScript},
 		SecurityContext: trustedContainerSecurityContext(),
-		VolumeMounts:    []corev1.VolumeMount{{Name: "verify", MountPath: "/verify"}},
+		VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
 	}
 
 	// The acceptance-check inits: one per spec.acceptanceChecks, in order.
@@ -289,10 +308,10 @@ exit 0
 		ct := corev1.Container{
 			Name:            fmt.Sprintf("check-%d", i),
 			Image:           baseImage,
-			Command:         []string{"/bin/sh", "-c", c},
+			Command:         []string{verifySh, "-c", c},
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
-			VolumeMounts:    []corev1.VolumeMount{{Name: "verify", MountPath: "/verify"}},
+			VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
 		}
 		checkCts = append(checkCts, ct)
 	}
@@ -354,9 +373,9 @@ func trustedContainerSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		RunAsUser:                &runAs,
 		RunAsGroup:               &runAs,
-		RunAsNonRoot:             newBoolPtr(true),
+		RunAsNonRoot:             verifyTruePtr,
 		AllowPrivilegeEscalation: &allowPriv,
-		ReadOnlyRootFilesystem:   newBoolPtr(true),
+		ReadOnlyRootFilesystem:   verifyTruePtr,
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{"ALL"},
 		},
@@ -364,8 +383,16 @@ func trustedContainerSecurityContext() *corev1.SecurityContext {
 	}
 }
 
-func newBoolPtr(b bool) *bool {
-	return &b
+// verifyTruePtr/verifyFalsePtr are package-level bool pointers for the Job
+// spec's bool fields.
+var (
+	verifyTruePtr  = new(bool)
+	verifyFalsePtr = new(bool)
+)
+
+func init() {
+	*verifyTruePtr = true
+	*verifyFalsePtr = false
 }
 
 // cloneScript is the credential-less clone-base script: a fresh clone at the
@@ -447,11 +474,11 @@ func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *co
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: loop.Namespace,
-			Labels:    map[string]string{"coxswain.io/verify-for": loop.Name},
+			Labels:    map[string]string{verifyForLabel: loop.Name},
 		},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{"coxswain.io/verify-for": loop.Name},
+				MatchLabels: map[string]string{verifyForLabel: loop.Name},
 			},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress:     []networkingv1.NetworkPolicyIngressRule{},
@@ -480,7 +507,7 @@ func (r *LoopReconciler) readVerifyJobPod(ctx context.Context, loop *coxv1alpha1
 	list := &corev1.PodList{}
 	if err := reader.List(ctx, list,
 		client.InNamespace(loop.Namespace),
-		client.MatchingLabels{"coxswain.io/verify-for": loop.Name}); err != nil {
+		client.MatchingLabels{verifyForLabel: loop.Name}); err != nil {
 		return nil, fmt.Errorf("list verify pods: %w", err)
 	}
 	// Filter to the current iteration's Job pod (the Job name is on the pod's
@@ -541,15 +568,15 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool) {
 	if tamperIdx < 0 {
 		return verifyNoDecision, true
 	}
-	tamper := pod.Status.InitContainerStatuses[tamperIdx]
-	if tamper.State.Terminated == nil {
+	tamperStatus := pod.Status.InitContainerStatuses[tamperIdx]
+	if tamperStatus.State.Terminated == nil {
 		return verifyNoDecision, true
 	}
-	if tamper.State.Terminated.ExitCode != 0 {
+	if tamperStatus.State.Terminated.ExitCode != 0 {
 		return verifyTampered, false
 	}
 	// Tamper clean: read the check inits (check-0 .. check-<checkCount-1>).
-	for i := 0; i < checkCount; i++ {
+	for i := range checkCount {
 		name := fmt.Sprintf("check-%d", i)
 		found := false
 		var code int32
@@ -609,8 +636,11 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	case verifyIterate:
 		// Back to Implementing, iteration+1 (B4: the cap is the caller's
 		// decision — if iteration+1 exceeds the cap, the caller flips to
-		// Failed; for S5a the default cap is high, so iterate).
-		loop.Status.Iteration++
+		// Failed; for S5a the default cap is high, so iterate). The first
+		// cycle is iteration 1 (status.iteration is 0-based at the first
+		// Verifying), so the iterate moves to at least 2 (the next cycle).
+		nextIter := max(loop.Status.Iteration+1, 2)
+		loop.Status.Iteration = nextIter
 		loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
 		// Clear the current pin: the next Implementing run will produce a new

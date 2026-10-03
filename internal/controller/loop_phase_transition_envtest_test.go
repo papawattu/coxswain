@@ -76,8 +76,17 @@ var _ = Describe("B1 phase transitions via Reconcile (claim seam)", func() {
 	// claim is the runner's claim shape: the phase it EXECUTED (the current
 	// phase, never the next) with status success — the completed-phase form
 	// the advance path maps through claimPhaseForAdvance.
+	// S5a (B3 MVP gate): a success Implementing claim MUST carry the 40-hex
+	// headCommit (the runner's committed head) or the operator will NOT advance
+	// to Verifying. The B1 spec models the post-S5a runner (a successful
+	// Implementing always commits and reports the head).
+	const headCommit = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" // 40-hex
 	claim := func(phase coxv1alpha1.LoopPhase) *PhaseClaim {
-		return &PhaseClaim{ObservedPhase: phase, Status: "success"}
+		c := &PhaseClaim{ObservedPhase: phase, Status: "success"}
+		if phase == coxv1alpha1.LoopPhaseImplementing {
+			c.HeadCommit = headCommit
+		}
+		return c
 	}
 
 	reconcileLoop := func(r *LoopReconciler, ns, name string) {

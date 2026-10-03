@@ -26,7 +26,9 @@ var sha40Hex = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // environment is a test error, not a code error).
 func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	out, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=test", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"}, args...)...).CombinedOutput()
+	base := []string{"-C", dir, "-c", "user.name=test", "-c", "user.email=t@t",
+		"-c", "commit.gpgsign=false"}
+	out, err := exec.Command("git", append(base, args...)...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
 	}
@@ -80,7 +82,7 @@ func TestCommitWorkspaceCommitsAndReturnsHeadSHA(t *testing.T) {
 	// .coxswain must NOT be tracked (the operator's dir stays out of the
 	// verified commit).
 	ls := gitIn(t, ws, "ls-files")
-	for _, line := range strings.Split(ls, "\n") {
+	for line := range strings.SplitSeq(ls, "\n") {
 		if filepath.FromSlash(line) == filepath.Join(resultDirName, resultFileName) ||
 			filepath.FromSlash(line) == resultDirName ||
 			len(line) > len(resultDirName) && line[:len(resultDirName)] == resultDirName {
@@ -147,7 +149,8 @@ func TestPhaseRunImplementingWritesHeadCommitClaim(t *testing.T) {
 		t.Fatalf("claim is not JSON: %v", err)
 	}
 	if claim.HeadCommit != res.HeadCommit {
-		t.Fatalf("claim headCommit = %q, want %q (the SHA must ride through the strict claim)", claim.HeadCommit, res.HeadCommit)
+		t.Fatalf("claim headCommit = %q, want %q (must ride through the claim)",
+			claim.HeadCommit, res.HeadCommit)
 	}
 }
 

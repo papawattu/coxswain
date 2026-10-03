@@ -27,7 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -52,6 +51,19 @@ import (
 
 const s5aHeadCommit = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" // 40-hex
 
+// s5aBaseCommit is the pinned base SHA (the clone the agent started from);
+// distinct from the head commit so the tamper diff has two distinct SHAs.
+const s5aBaseCommit = "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" // 40-hex
+
+// verify pod label + container name constants (goconst).
+const (
+	s5aJobNameLabel = "job-name"
+	s5aImportAgent  = "import-agent"
+	s5aCloneBase    = "clone-base"
+	s5aTamper       = "tamper"
+	s5aCheck0       = "check-0"
+)
+
 // s5aLoopSpec is a Loop with acceptance checks (so the verify Job's check
 // inits are non-empty) + a workspace repo (so baseCommit/clone shape apply).
 func s5aLoopSpec() coxv1alpha1.LoopSpec {
@@ -74,91 +86,92 @@ func s5aReconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 	return loop
 }
 
+// s5aEnsureSandbox creates the stand-in Sandbox object (envtest has no
+// agent-sandbox controller). The Sandbox CRD requires a non-empty podTemplate
+// spec, so the stand-in carries a minimal agent container.
+func s5aEnsureSandbox(ns, name string) {
+	ctx := context.Background()
+	sb := &sandboxv1beta1.Sandbox{}
+	if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)) {
+		Expect(k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+			Spec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Name: agentContainerName, Image: s3StandinImage},
+							},
+						},
+					},
+				},
+			},
+		})).To(Succeed())
+	}
+}
+
+// s5aClaimPod writes a claim to the stand-in sandbox pod's agent container
+// (delete-then-create, so the pod is fresh each call — the S4 oneShotRun
+// idiom). The message is the runner's real claim shape (the phase it
+// EXECUTED + status + optional headCommit).
+func s5aClaimPod(ns, name, phase, head string) {
+	ctx := context.Background()
+	nn := types.NamespacedName{Name: name + "-sandbox", Namespace: ns}
+	existing := &corev1.Pod{}
+	if !apierrors.IsNotFound(k8sClient.Get(ctx, nn, existing)) {
+		Expect(k8sClient.Delete(ctx, existing)).To(Succeed())
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":""`
+	if head != "" {
+		msg += `,"headCommit":"` + head + `"`
+	}
+	msg += `}`
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: agentContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0, Message: msg}}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
 // s5aDriveToVerifying drives a fresh Loop (ns/name already created) through
 // the claim path to Verifying: a Planning claim, then an Implementing claim
-// carrying the 40-hex headCommit (the operator pins it on the advance).
-// Returns the reconciler (with the readPhaseClaim seam reset to nil).
-func s5aDriveToVerifying(ns, name, headCommit string) *LoopReconciler {
+// s5aDriveToVerifying drives a fresh Loop from Planning to Verifying: a
+// Planning success claim advances to Implementing, then an Implementing
+// success claim carrying the 40-hex headCommit pins status.currentVerify and
+// advances to Verifying. It re-ensures the stand-in Sandbox between reconciles
+// (the annotation-based phase recycle deletes it on an advance).
+func s5aDriveToVerifying(ns, name string) *LoopReconciler {
 	ctx := context.Background()
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	// A stand-in sandbox object (envtest has no agent-sandbox controller).
-	ensure := func() {
-		sb := &sandboxv1beta1.Sandbox{}
-		if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)) {
-			_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-			})
-		}
-	}
+	ensure := func() { s5aEnsureSandbox(ns, name) }
 	ensure()
 	// Bootstrap: Pending -> Planning on the first reconcile.
 	s5aReconcile(r, ns, name)
-	// Stand-in sandbox pod whose agent container carries the claim (the S4
-	// claim-reader path reads the agent termination message via the
-	// APIReader).
-	claimPod := func(phase, head string) {
-		pod := &corev1.Pod{}
-		exists := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, pod)
-		if !apierrors.IsNotFound(exists) {
-			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
-		}
-		pod = &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
-		}
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":""`
-		if head != "" {
-			msg += `,"headCommit":"` + head + `"`
-		}
-		msg += `}`
-		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
-			{Name: agentContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-				ExitCode: 0, Message: msg}}},
-		}
-		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-	}
+	// Pin status.baseCommit (the tamper diff needs it; the verify Job's
+	// clone-base fetches both baseCommit and verifiedCommit). The envtest
+	// sandbox pod has no terminated init container, so the operator's own
+	// read-back never runs — the spec sets it directly (a 40-hex SHA).
+	loop := &coxv1alpha1.Loop{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+	loop.Status.BaseCommit = s5aBaseCommit
+	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 	// Planning claim (the runner executed Planning).
-	claimPod("Planning", "")
+	s5aClaimPod(ns, name, "Planning", "")
 	s5aReconcile(r, ns, name)
 	// The operator's annotation-based recycle deleted the Sandbox on the
 	// advance; re-ensure it before the next claim.
 	ensure()
 	// Implementing claim WITH the headCommit (the operator pins it on the
 	// Implementing -> Verifying advance).
-	claimPod("Implementing", headCommit)
+	s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
 	s5aReconcile(r, ns, name)
 	return r
-}
-
-// s5aFindVerifyPod finds the verify Job's pod by its job-name label.
-func s5aFindVerifyPod(ns, loopName string) *corev1.Pod {
-	ctx := context.Background()
-	list := &corev1.PodList{}
-	Expect(k8sClient.List(ctx, list,
-		client.InNamespace(ns),
-		client.MatchingLabels{"job-name": verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: loopName, Namespace: ns}})})).To(Succeed())
-	Expect(list.Items).To(HaveLen(1))
-	return &list.Items[0]
-}
-
-// s5aSetInitExit sets the named init container's terminated exit code on the
-// verify pod's status (the envtest stand-in for the kubelet).
-func s5aSetInitExit(pod *corev1.Pod, name string, code int32) {
-	ctx := context.Background()
-	var ics *corev1.ContainerStatus
-	for i := range pod.Status.InitContainerStatuses {
-		if pod.Status.InitContainerStatuses[i].Name == name {
-			ics = &pod.Status.InitContainerStatuses[i]
-		}
-	}
-	if ics == nil {
-		pod.Status.InitContainerStatuses = append(pod.Status.InitContainerStatuses,
-			corev1.ContainerStatus{Name: name})
-		ics = &pod.Status.InitContainerStatuses[len(pod.Status.InitContainerStatuses)-1]
-	}
-	ics.State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}}
-	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
 var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
@@ -177,7 +190,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := s5aDriveToVerifying(ns, name, s5aHeadCommit)
+		r := s5aDriveToVerifying(ns, name)
 		loop := s5aReconcile(r, ns, name)
 
 		By("pinning the current verified commit from the claim's headCommit (D11)")
@@ -211,7 +224,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		By("mounting NO credentials into import-agent (only clone-base may carry the git secret)")
 		for i := range inits {
-			if inits[i].Name == "import-agent" {
+			if inits[i].Name == s5aImportAgent {
 				for _, vm := range inits[i].VolumeMounts {
 					Expect(vm.Name).NotTo(Equal("git-cred"), "import-agent must never mount the credential")
 				}
@@ -261,39 +274,15 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		_ = r
 		// Bootstrap + Planning claim.
-		ensureSB := func() {
-			sb := &sandboxv1beta1.Sandbox{}
-			if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)) {
-				_ = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
-					ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-				})
-			}
-		}
+		ensureSB := func() { s5aEnsureSandbox(ns, name) }
 		ensureSB()
 		s5aReconcile(r, ns, name)
-		claimPod := func(phase, head string) {
-			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
-			}
-			_ = k8sClient.Create(ctx, pod)
-			msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":""`
-			if head != "" {
-				msg += `,"headCommit":"` + head + `"`
-			}
-			msg += `}`
-			pod.Status.ContainerStatuses = []corev1.ContainerStatus{
-				{Name: agentContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-					ExitCode: 0, Message: msg}}},
-			}
-			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-		}
-		claimPod("Planning", "")
+		s5aClaimPod(ns, name, "Planning", "")
 		s5aReconcile(r, ns, name)
 		ensureSB()
 		// Malformed headCommit (uppercase + 41 chars): the strict parser
 		// rejects the claim, so the advance is never taken.
-		claimPod("Implementing", strings.ToUpper(s5aHeadCommit)+"0")
+		s5aClaimPod(ns, name, "Implementing", strings.ToUpper(s5aHeadCommit)+"0")
 		loop := s5aReconcile(r, ns, name)
 
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
@@ -315,39 +304,12 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		})).To(Succeed())
 
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
-		sb := &sandboxv1beta1.Sandbox{}
-		if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)) {
-			Expect(k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-			})).To(Succeed())
-		}
+		s5aEnsureSandbox(ns, name)
 		s5aReconcile(r, ns, name)
-		claimPod := func(phase, head string) {
-			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
-			}
-			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-			msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":""`
-			if head != "" {
-				msg += `,"headCommit":"` + head + `"`
-			}
-			msg += `}`
-			pod.Status.ContainerStatuses = []corev1.ContainerStatus{
-				{Name: agentContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-					ExitCode: 0, Message: msg}}},
-			}
-			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-		}
-		claimPod("Planning", "")
+		s5aClaimPod(ns, name, "Planning", "")
 		s5aReconcile(r, ns, name)
-		sb = &sandboxv1beta1.Sandbox{}
-		if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)) {
-			Expect(k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
-				ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
-			})).To(Succeed())
-		}
-		claimPod("Implementing", "") // success, NO headCommit
+		s5aEnsureSandbox(ns, name)
+		s5aClaimPod(ns, name, "Implementing", "") // success, NO headCommit
 		loop := s5aReconcile(r, ns, name)
 
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
@@ -368,7 +330,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := s5aDriveToVerifying(ns, name, s5aHeadCommit)
+		r := s5aDriveToVerifying(ns, name)
 		loop := s5aReconcile(r, ns, name)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 
@@ -379,17 +341,17 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
-				Labels:    map[string]string{"job-name": jobName, "coxswain.io/verify-for": name},
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "noop", Image: "busybox"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		// Tamper clean (0) + check-0 pass (0).
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-			{Name: "clone-base", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "import-agent", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "tamper", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "check-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
@@ -411,7 +373,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := s5aDriveToVerifying(ns, name, s5aHeadCommit)
+		r := s5aDriveToVerifying(ns, name)
 		loop := s5aReconcile(r, ns, name)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 
@@ -420,16 +382,16 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
-				Labels:    map[string]string{"job-name": jobName, "coxswain.io/verify-for": name},
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "noop", Image: "busybox"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-			{Name: "clone-base", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "import-agent", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "tamper", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "check-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
@@ -453,7 +415,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := s5aDriveToVerifying(ns, name, s5aHeadCommit)
+		r := s5aDriveToVerifying(ns, name)
 		loop := s5aReconcile(r, ns, name)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 
@@ -462,18 +424,18 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
-				Labels:    map[string]string{"job-name": jobName, "coxswain.io/verify-for": name},
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "noop", Image: "busybox"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		// Tamper non-zero (a protected path changed); check-0 is 0 (clean, but
 		// the tamper gate is terminal BEFORE any check).
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-			{Name: "clone-base", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "import-agent", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "tamper", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
-			{Name: "check-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
+			{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
@@ -502,7 +464,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := s5aDriveToVerifying(ns, name, s5aHeadCommit)
+		r := s5aDriveToVerifying(ns, name)
 		// The Job is created (the pin exists); the verify pod is NOT created
 		// (envtest has no Job controller) -> no evidence -> hold + requeue.
 		loop := s5aReconcile(r, ns, name)

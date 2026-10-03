@@ -434,7 +434,12 @@ func writeClaim(path string, res Result) {
 		BlockedReason string `json:"blockedReason,omitempty"`
 		HeadCommit    string `json:"headCommit,omitempty"`
 	}
-	c := claim{ObservedPhase: res.ObservedPhase, Status: res.Status, BlockedReason: res.VerificationNotes, HeadCommit: res.HeadCommit}
+	c := claim{
+		ObservedPhase: res.ObservedPhase,
+		Status:        res.Status,
+		BlockedReason: res.VerificationNotes,
+		HeadCommit:    res.HeadCommit,
+	}
 	data, err := json.Marshal(c)
 	if err != nil {
 		log.Printf("runner: claim marshal: %v", err)

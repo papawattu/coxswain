@@ -60,7 +60,7 @@
 // re-runs delivery by clearing status.delivery + the condition.
 //
 // Network: the deliver Job's pod gets its OWN NetworkPolicy
-// (<loop>-deliver-netpol): DNS + the egress proxy (I42) when the repo host
+// (<loop>-deliver-np, deliverNetpolName): DNS + the egress proxy (I42) when the repo host
 // is external (the push + the provider API traverse the proxy —
 // NetworkPolicy cannot name hostnames; the proxy's SNI allowlist carries
 // the repo host and, for GitHub, api.github.com). An in-cluster repo keeps
@@ -90,9 +90,18 @@ import (
 // deliver Job name/label constants.
 const (
 	deliverJobSuffix = "-deliver"
-	deliverForLabel  = "coxswain.io/loop"
 
 	deliverComponent = "deliver"
+
+	// deliverForLabel is the deliver pod's selector label: the Loop the
+	// deliver Job was built for. A DISTINCT key from coxswain.io/loop, which
+	// the AGENT pod template also carries: a pod-blind client that falls
+	// back to r.Client.List would otherwise see the sandbox pod too and
+	// refuse the read as "multiple deliver pods" (the S4 mutation spec's
+	// failure mode — the S6 read must stay pod-blind). The Job stamps it on
+	// the pod template (deliverJobLabels); the deliver pod NetworkPolicy
+	// selects on it (deliverJobPodSelector).
+	deliverForLabel = "coxswain.io/deliver-for"
 
 	// deliver container names (kubelet records every exit code; the push
 	// container is the MAIN container, so its termination message rides in
@@ -137,6 +146,11 @@ func deliverProviderForRepo(repo string) (deliverProvider, string) {
 
 // deliverJobName is the deliver Job's name: <loop>-deliver.
 func deliverJobName(loopName string) string { return loopName + deliverJobSuffix }
+
+// deliverNetpolName is the deliver Job pod's NetworkPolicy name: <loop>-
+// deliver-np (D20: the short suffix keeps the name within the 63-char
+// DNS-1035 budget for a 55-char (the max valid) Loop name).
+func deliverNetpolName(loopName string) string { return loopName + "-deliver-np" }
 
 // deliverBranchName is the delivery branch: <prefix><loop-name>.
 func deliverBranchName(prefix, loopName string) string { return prefix + loopName }
@@ -779,7 +793,7 @@ func (r *LoopReconciler) ensureDeliverNetPolicies(ctx context.Context, loop *cox
 	if !deliveryExpected(loop) {
 		return r.cleanupDeliverNetpol(ctx, loop)
 	}
-	name := loop.Name + "-deliver-netpol"
+	name := deliverNetpolName(loop.Name)
 	egress := []networkingv1.NetworkPolicyEgressRule{
 		{To: []networkingv1.NetworkPolicyPeer{dnsPeer()}, Ports: dnsPorts()},
 	}
@@ -828,7 +842,7 @@ func (r *LoopReconciler) ensureDeliverNetPolicies(ctx context.Context, loop *cox
 // expected (I42c: a foreign netpol of the same name is left alone).
 func (r *LoopReconciler) cleanupDeliverNetpol(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	np := &networkingv1.NetworkPolicy{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: loop.Name + "-deliver-netpol"}, np)
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: deliverNetpolName(loop.Name)}, np)
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -846,10 +860,11 @@ func (r *LoopReconciler) cleanupDeliverNetpol(ctx context.Context, loop *coxv1al
 
 // deliverEgressProxyHosts returns the repo host (+ api.github.com for a
 // GitHub delivery) for the egress proxy's SNI allowlist (I42): the deliver
-// Job's git push + the provider API call traverse the proxy for an external
-// repo host, and the proxy must allowlist BOTH hosts. A nil (no external
-// repo) or in-cluster repo returns no hosts (the direct repo-peer rule
-// covers it, no proxy hop).
+// Job's git push + the provider API call traverse the proxy for a repo with
+// no expressible NetworkPolicy repo rule (deliverNeedsProxyHosts: repoPeer
+// nil), and the proxy must allowlist BOTH hosts. A nil (no delivery) or an
+// in-cluster repo returns no hosts (the direct repo-peer rule covers it, no
+// proxy hop).
 // deliverProxyHost is the egress-proxy SNI allowlist entry (the I42
 // host:port allow form, like the AgentPolicy network allows) for a single
 // host:443 (the deliver Job's git push + the provider API both dial 443).
@@ -858,22 +873,32 @@ func deliverProxyHost(host string) string {
 }
 
 func (r *LoopReconciler) deliverEgressProxyHosts(loop *coxv1alpha1.Loop) []string {
-	if !deliveryExpected(loop) {
-		return nil
-	}
-	prov, host := deliverProviderForRepo(loop.Spec.Workspace.Repo)
-	if peer := repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost); peer != nil {
-		// In-cluster: no proxy hop.
-		return nil
-	}
+	host := r.deliverNeedsProxyHosts(loop)
 	if host == "" {
 		return nil
 	}
+	prov, _ := deliverProviderForRepo(loop.Spec.Workspace.Repo)
 	hosts := []string{deliverProxyHost(host)}
 	if prov == deliverProviderGitHub {
 		hosts = append(hosts, deliverProxyHost("api.github.com"))
 	}
 	return hosts
+}
+
+// deliverNeedsProxyHosts is the repo host (no port) whose git push + provider
+// API traverse the egress proxy when the deliver Job runs: "" when delivery
+// is not expected, the repo is empty, or the in-cluster repoPeer rule covers
+// the push (no proxy hop). The caller wraps it into the host:port allow form
+// (deliverProxyHost, port 443 — the deliver Job dials 443).
+func (r *LoopReconciler) deliverNeedsProxyHosts(loop *coxv1alpha1.Loop) string {
+	if !deliveryExpected(loop) {
+		return ""
+	}
+	if repo := loop.Spec.Workspace.Repo; repo != "" &&
+		repoPeer(repo, r.serviceNamespaceFromHost) == nil {
+		return workspaceRepoHost(repo)
+	}
+	return ""
 }
 
 // deliverReadbackChanged is the shared "read the deliver pod's push state via

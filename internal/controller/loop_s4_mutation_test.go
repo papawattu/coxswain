@@ -88,6 +88,16 @@ func (p podBlindClient) Get(ctx context.Context, key client.ObjectKey, obj clien
 	return p.Client.Get(ctx, key, obj, opts...)
 }
 
+// List is pod-blind the same way Get is: a *corev1.PodList is NotFound (the
+// scoped cache has no pods — the S6 deliver read-back's list path), every
+// other list is served from the wrapped real client.
+func (p podBlindClient) List(ctx context.Context, obj client.ObjectList, opts ...client.ListOption) error {
+	if _, isPodList := obj.(*corev1.PodList); isPodList {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
+	}
+	return p.Client.List(ctx, obj, opts...)
+}
+
 // denyingPhaseGate is the gate mutation: it denies every advance (a future
 // approval hold plugs in here).
 type denyingPhaseGate struct{}

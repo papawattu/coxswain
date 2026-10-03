@@ -24,7 +24,13 @@ func intstrPtr(v int32) *intstr.IntOrString {
 }
 
 const (
-	d34TestRepo       = "https://github.com/papawattu/coxswain.git"
+	// d34TestRepo is an IN-CLUSTER .svc repo: the D34 specs pin the agent
+	// NetworkPolicy's exact egress shape (proxy + DNS) and the egress-proxy
+	// peer's appearance/disappearance with the AgentPolicy network allows.
+	// An external repo's workspace init clone would (S6) add its own
+	// egress-proxy rule + allowlist host and hide the input they exercise; the
+	// .svc host keeps the direct repo-peer rule (no proxy hop).
+	d34TestRepo       = "http://gitea.samples.svc:3000/samples/gocli.git"
 	d34TestKey        = "key"
 	d34TestEndpoint   = "http://model-endpoint:8000"
 	d34ModelEndpoint  = "fake-model:8000"
@@ -104,7 +110,11 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			"the agent NetworkPolicy must have zero ingress rules (deny-all)")
 
 		// Egress rule 0: to this Loop's proxy on 8080 (per-Loop peer, P1-1).
-		Expect(np.Spec.Egress).To(HaveLen(2))
+		// Egress rule 1: DNS to kube-dns in kube-system (P1-3).
+		// Egress rule 2: the in-cluster repo's direct repo-peer rule (S3a/S6:
+		// a .svc host gets a namespaceSelector over the Service's namespace on
+		// the URL port; no egress proxy hop).
+		Expect(np.Spec.Egress).To(HaveLen(3))
 		proxyEgress := np.Spec.Egress[0]
 		Expect(proxyEgress.To).To(HaveLen(1))
 		Expect(proxyEgress.To[0].PodSelector).ToNot(BeNil())
@@ -131,6 +141,20 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		Expect(dnsEgress.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
 			Protocol: new(corev1.ProtocolUDP),
 			Port:     intstrPtr(53),
+		}))
+
+		// Egress rule 2: the in-cluster repo's direct repo-peer rule (S3a/S6:
+		// a .svc host gets a namespaceSelector over the Service's namespace on
+		// the URL port; no egress proxy hop).
+		repoEgress := np.Spec.Egress[2]
+		Expect(repoEgress.To).To(HaveLen(1))
+		Expect(repoEgress.To[0].NamespaceSelector).ToNot(BeNil())
+		Expect(repoEgress.To[0].NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+			"kubernetes.io/metadata.name", "samples",
+		), "the repo peer must be the repo .svc Service's namespace")
+		Expect(repoEgress.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+			Protocol: new(corev1.ProtocolTCP),
+			Port:     intstrPtr(3000),
 		}))
 	})
 

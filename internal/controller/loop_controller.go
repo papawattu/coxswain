@@ -1983,11 +1983,17 @@ func (r *LoopReconciler) ensureProxyOrCleanup(ctx context.Context, loop *coxv1al
 // HTTP CONNECT proxy port).
 const egressProxyPort int32 = 3128
 
+// egressProxyPodNameSuffix is the egress proxy pod + Service name suffix
+// (D20: short enough that the name fits the 63-char DNS-1035 budget even for
+// a 55-char (the max valid) Loop name: 55 + 7 + 14 = 76... no — 55 +
+// len("-egress") = 62 ≤ 63).
+const egressProxyPodNameSuffix = "-egress"
+
 // egressProxyPodName returns the egress proxy pod name for a Loop.
-func egressProxyPodName(loopName string) string { return loopName + "-egress-proxy" }
+func egressProxyPodName(loopName string) string { return loopName + egressProxyPodNameSuffix }
 
 // egressProxyServiceName returns the egress proxy Service name for a Loop.
-func egressProxyServiceName(loopName string) string { return loopName + "-egress-proxy" }
+func egressProxyServiceName(loopName string) string { return loopName + egressProxyPodNameSuffix }
 
 // egressProxyLabels returns the egress proxy pod + Service labels. These are
 // DISJOINT from the model proxy labels (D33) and from the agent pod labels
@@ -2218,7 +2224,9 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		// P3: clear a stale EgressProxyConflict here too — if a foreign pod once
 		// held the name and the allows are later removed, the D35b clear below
 		// is unreachable on this early return, so the condition would report a
-		// conflict that no longer applies.
+		// conflict that no longer applies. S6 caveat: a pinned baseCommit with
+		// an external repo (no init clone) and no delivery keeps the repo
+		// host out of the allowlist, so the proxy is cleaned up here.
 		if hadEgressConflict(loop) {
 			setCondition(loop, "EgressProxyConflict", metav1.ConditionFalse, "Resolved",
 				"the egress proxy is no longer required (no network allows)")

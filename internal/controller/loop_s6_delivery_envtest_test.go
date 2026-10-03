@@ -714,7 +714,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		By("giving the deliver netpol the egress proxy egress rule (the in-cluster repo keeps the direct repo-peer rule)")
 		np := &networkingv1.NetworkPolicy{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver-netpol", Namespace: ns}, np)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver-np", Namespace: ns}, np)).To(Succeed(),
 			"the deliver netpol must exist for a Succeeded delivery Loop")
 		Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(deliverForLabel, name))
 		// The egress rules: DNS + the egress proxy (an external repo host).
@@ -742,7 +742,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		r := s6Succeeded(name, ns, "")
 		s6Reconcile(r, ns, name)
 		np := &networkingv1.NetworkPolicy{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver-netpol", Namespace: ns}, np)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver-np", Namespace: ns}, np)).To(Succeed())
 		foundPeer := false
 		for _, rule := range np.Spec.Egress {
 			for _, to := range rule.To {
@@ -799,7 +799,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 			}
 		}
 		Expect(init).ToNot(BeNil(), "the first clone must carry the workspace init container")
-		proxyURL := "http://" + name + "-egress-proxy." + ns + ".svc.cluster.local:3128"
+		proxyURL := "http://" + name + "-egress." + ns + ".svc.cluster.local:3128"
 		for _, e := range init.Env {
 			if e.Name == "HTTPS_PROXY" || e.Name == "https_proxy" {
 				Expect(e.Value).To(Equal(proxyURL), "the init container's git fetch must traverse the egress proxy")

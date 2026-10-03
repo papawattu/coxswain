@@ -566,7 +566,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		}
 		By("accepting a valid message")
 		outcome, ok, err := parseDeliverTermination(s6ValidTermination(loop), loop)
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 		Expect(ok).To(BeTrue())
 		Expect(outcome.Branch).To(Equal("coxswain/s6loop"))
 		Expect(outcome.Commit).To(Equal(s6HeadCommit))

@@ -68,6 +68,7 @@ const (
 	s5aImportAgent  = "import-agent"
 	s5aCloneBase    = "clone-base"
 	s5aTamper       = "tamper"
+	s5aArtifact     = "artifact"
 	s5aCheck0       = "check-0"
 	s5aCheck1       = "check-1"
 	s5aCheckPassCmd = "echo pass0"
@@ -176,11 +177,12 @@ func s5aClaimPodWithIteration(ns, name, phase, head string, iteration int) {
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
-// s5aVerifyPodMultiCheck is s5aVerifyPod with N checks: trusted inits all 0,
-// tamper 0, check-<k> non-zero for each k in failing (exit code exitCode) and
-// 0 otherwise. It exercises the verify-outcome mapping with a FAILING check
-// that is NOT check-0 (P2: the failing-check name/code must come from the
-// first check-* container with a non-zero exit, never a fixed index).
+// s5aVerifyPodMultiCheck is s5aVerifyPod with N checks: trusted inits all 0
+// (clone + import + tamper + artifact), check-<k> non-zero for each k in
+// failing (exit code exitCode) and 0 otherwise. It exercises the
+// verify-outcome mapping with a FAILING check that is NOT check-0 (P2: the
+// failing-check name/code must come from the first check-* container with
+// a non-zero exit, never a fixed index).
 func s5aVerifyPodMultiCheck(ctx context.Context, ns, name, jobName string, checkCount int, failing map[int]int32) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -191,11 +193,12 @@ func s5aVerifyPodMultiCheck(ctx context.Context, ns, name, jobName string, check
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-	inits := make([]corev1.ContainerStatus, 0, 3+checkCount)
+	inits := make([]corev1.ContainerStatus, 0, 4+checkCount)
 	inits = append(inits,
 		corev1.ContainerStatus{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 		corev1.ContainerStatus{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 		corev1.ContainerStatus{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		corev1.ContainerStatus{Name: s5aArtifact, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 	)
 	for i := range checkCount {
 		code := int32(0)
@@ -293,6 +296,28 @@ func s5aVerifyPod(ctx context.Context, ns, name, jobName string, checkExit int32
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
+// s5aVerifyInitStatuses returns the standard I47 init status list (trusted
+// inits 0, tamper 0, artifact per the given state, checks per the given
+// exit codes by index — a nil entry = the check is absent from the pod
+// status, an empty-state entry = in progress). The helper is the I47
+// spec's single construction point so the specs read as "the artifact
+// container did X" instead of a 6-element literal each time.
+func s5aVerifyInitStatuses(artifact corev1.ContainerState, checkExits []int32) []corev1.ContainerStatus {
+	inits := []corev1.ContainerStatus{
+		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aArtifact, State: artifact},
+	}
+	for i, code := range checkExits {
+		inits = append(inits, corev1.ContainerStatus{
+			Name:  fmt.Sprintf("check-%d", i),
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}},
+		})
+	}
+	return inits
+}
+
 var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 	ctx := context.Background()
 
@@ -335,13 +360,14 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(job.Spec.BackoffLimit).NotTo(BeNil())
 		Expect(*job.Spec.BackoffLimit).To(Equal(int32(0)))
 
-		By("ordering the init containers: clone-base, import-agent, tamper, then the checks")
+		By("ordering the init containers: clone-base, import-agent, tamper, artifact, then the checks")
 		inits := job.Spec.Template.Spec.InitContainers
-		Expect(inits).To(HaveLen(4), "clone + import + tamper + 1 check")
+		Expect(inits).To(HaveLen(5), "clone + import + tamper + artifact + 1 check")
 		Expect(inits[0].Name).To(Equal("clone-base"))
 		Expect(inits[1].Name).To(Equal("import-agent"))
 		Expect(inits[2].Name).To(Equal("tamper"))
-		Expect(inits[3].Name).To(Equal("check-0"))
+		Expect(inits[3].Name).To(Equal("artifact"))
+		Expect(inits[4].Name).To(Equal("check-0"))
 		Expect(job.Spec.Template.Spec.Containers).To(HaveLen(1))
 		Expect(job.Spec.Template.Spec.Containers[0].Name).To(Equal("noop"))
 
@@ -863,6 +889,187 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(found).To(BeTrue(), "the Failed condition carries the TamperedVerify reason")
 	})
 
+	// I47 (REVIEW-PHASE1-R20, PR #55 review): the operator-side build-artifact
+	// check — the trust-boundary backstop for the runner's commitWorkspace
+	// filter. The runner runs in the AGENT's container and reads the
+	// agent-writable .coxswain/base-commit: an agent that runs 'git commit'
+	// itself during the phase run is never re-filtered (commitWorkspace only
+	// sees UNCOMMITTED changes), so a self-committed binary rides into the
+	// verified commit. The check runs on the operator's trusted clone in
+	// /verify (next to tamper) and maps to an iterate, not a terminal fail.
+	It("adds the I47 artifact init container (after tamper, before the checks, no creds, safe.directory env)", func() {
+		ns := "s5a-artifact-shape-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "artloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		loop := s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)).To(Succeed())
+		inits := job.Spec.Template.Spec.InitContainers
+		Expect(inits).To(HaveLen(5), "clone + import + tamper + artifact + 1 check")
+		Expect(inits[2].Name).To(Equal("tamper"))
+		Expect(inits[3].Name).To(Equal("artifact"), "the artifact check sits AFTER tamper, BEFORE the checks")
+		Expect(inits[4].Name).To(Equal("check-0"))
+
+		By("the artifact container is a trusted git container: base image, safe.directory env, hardened profile, NO credential mount")
+		art := inits[3]
+		Expect(art.Image).To(Equal(r.verifyJobImage()), "the artifact check runs on the operator's trusted git image")
+		requireVerifyGitSafeEnv(art, "artifact")
+		Expect(art.SecurityContext).NotTo(BeNil())
+		Expect(*art.SecurityContext.RunAsUser).To(Equal(int64(65532)))
+		Expect(*art.SecurityContext.ReadOnlyRootFilesystem).To(BeTrue())
+		for _, vm := range art.VolumeMounts {
+			Expect(vm.Name).NotTo(Equal("git-cred"), "the artifact check must never mount the git credential")
+		}
+
+		By("the artifact script diffs the pinned base..verified for ADDED files only, with hooks disabled")
+		script := art.Command[2]
+		Expect(script).To(ContainSubstring("diff --diff-filter=A -z --name-only"), "ADDED files only (an edit to a tracked file is source work)")
+		Expect(script).To(ContainSubstring("core.hooksPath=/dev/null"), "no hook in the trusted clone may run")
+		Expect(script).To(ContainSubstring(s5aBaseCommit), "the diff starts at the pinned baseCommit")
+		Expect(script).To(ContainSubstring(s5aHeadCommit), "the diff ends at the pinned verifiedCommit")
+	})
+
+	It("maps a non-zero artifact exit to iterate (build artifact committed, not a terminal fail)", func() {
+		ns := "s5a-artifact-fail-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "artfailloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		// NOTE: no 'verify-1 created' reconcile here. The passing pending and
+		// multi-check specs drive the pod in the SAME reconcile that creates
+		// the Job (one reconcile after s5aDriveToVerifying). An extra
+		// reconcile in between would set up the stale-pod delete+recreate
+		// cycle (the operator deletes the orphaned envtest pod by label and
+		// the Job never re-creates it in envtest — no Job controller), which
+		// would keep the outcome noDecision forever.
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name + "-verify-pod",
+				Namespace: ns,
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		// Artifact exited 1 (a self-committed build artifact, e.g. the agent
+		// 'git commit'ed a binary). The checks never ran (kubelet stops on
+		// the first non-zero init): no check-0 status. The pod's terminated
+		// message carries the offending path (the operator's evidence).
+		pod.Status.InitContainerStatuses = s5aVerifyInitStatuses(
+			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1,
+				Message:  "artifact: build artifact committed in base..verified:\nartifact: gocli is binary (NUL byte in the first 8 KiB)"}},
+			nil) // no checks ran
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// The iterate is decided in THIS reconcile — exactly like the
+		// multi-check spec (one reconcile after the pod + statuses appear, no
+		// extra 'verify-1 created' reconcile in between that would set up the
+		// stale-pod delete+recreate cycle the operator runs on the orphaned
+		// envtest pod).
+		loop := s5aReconcile(r, ns, name)
+		if loop.Status.Phase != coxv1alpha1.LoopPhaseImplementing {
+			// The Job was created in this reconcile (the pod's statuses were
+			// set before it); the NEXT reconcile reads them and iterates.
+			loop = s5aReconcile(r, ns, name)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"a non-zero artifact exit is an ITERATE (back to Implementing), never a terminal fail (ADR-0005 fail-closed hold, not Failed)")
+		Expect(loop.Status.Iteration).To(Equal(2), "the iteration increments on the iterate")
+		Expect(loop.Status.CurrentVerify).To(BeNil(), "the pin clears on the iterate (the next run re-pins)")
+		Expect(loop.Status.Progress).NotTo(BeNil())
+		// The progress records the failing container by its own name and
+		// exit code ('check-failed: artifact (exit 1)' — the stable
+		// progress form; the offending paths are in the pod's terminated
+		// message, the operator's evidence).
+		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("artifact"),
+			"the iterate progress must name the artifact check: %q", loop.Status.Progress.LastResultStatus)
+		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("exit 1"),
+			"the iterate progress must carry the artifact exit code: %q", loop.Status.Progress.LastResultStatus)
+	})
+
+	It("takes NO decision while the artifact check is in progress (not a failure)", func() {
+		ns := "s5a-artifact-pend-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "artpendloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		// No extra 'verify-1 created' reconcile (see the iterate spec): the
+		// pod + statuses are driven in the SAME reconcile that creates the
+		// Job, exactly like the passing pending check spec.
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name + "-verify-pod",
+				Namespace: ns,
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		// Artifact still Running (Terminated == nil): PENDING, never a
+		// failure (the S5a pending-regression class: a non-terminated init
+		// is a wait, not an iterate).
+		pod.Status.InitContainerStatuses = s5aVerifyInitStatuses(
+			corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			[]int32{0})
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// The pending decision: one reconcile (the Job is created in this
+		// reconcile and reads the pod's statuses: artifact Running ->
+		// noDecision -> phase stays Verifying).
+		fresh := s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"in-progress artifact check is PENDING, never a failure (phase must stay Verifying)")
+		Expect(fresh.Status.Iteration).To(BeZero(), "no decision must not bump the iteration")
+		if fresh.Status.Progress != nil {
+			Expect(fresh.Status.Progress.LastResultStatus).NotTo(ContainSubstring("artifact"),
+				"no iterate evidence may be recorded for an in-progress artifact check")
+		}
+
+		// Now terminate the artifact cleanly (0) + check-0 clean: the Loop
+		// must Succeed (the pending outcome was a wait, not a failure).
+		pod.Status.InitContainerStatuses = s5aVerifyInitStatuses(
+			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+			[]int32{0})
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		fresh = s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
+			"once the artifact check finishes clean and the checks pass the Loop must Succeed")
+	})
+
 	It("holds in Verifying (requeue) when the verify Job has no pod yet (no evidence)", func() {
 		ns := "s5a-hold-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
@@ -1088,12 +1295,15 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
 		inits := job.Spec.Template.Spec.InitContainers
-		// check-0 uses the Loop's verify.image...
-		Expect(inits[3].Name).To(Equal("check-0"))
-		Expect(inits[3].Image).To(Equal(verifyDefaultCheckImage),
+		// check-0 uses the Loop's verify.image... (it sits AFTER the artifact
+		// check — clone + import + tamper + artifact are the trusted inits).
+		Expect(inits[4].Name).To(Equal("check-0"))
+		Expect(inits[4].Image).To(Equal(verifyDefaultCheckImage),
 			"check-* containers must run on spec.verify.image (they may need a Go toolchain)")
-		// ...while the trusted inits stay on the git image (they never run user commands).
-		for _, n := range []string{"clone-base", "import-agent", "tamper"} {
+		// ...while the trusted inits stay on the git image (they never run
+		// user commands — the I47 artifact check is one of them: it runs the
+		// operator's own script on the trusted clone, never user code).
+		for _, n := range []string{"clone-base", "import-agent", "tamper", "artifact"} {
 			for i := range inits {
 				if inits[i].Name == n {
 					Expect(inits[i].Image).NotTo(Equal(verifyDefaultCheckImage),
@@ -1122,9 +1332,12 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
 		inits := job.Spec.Template.Spec.InitContainers
-		Expect(inits[3].Image).To(Equal(verifyDefaultCheckImage),
+		// check-0 sits after the I47 artifact check (clone + import + tamper
+		// + artifact = indices 0-3).
+		Expect(inits[4].Name).To(Equal("check-0"))
+		Expect(inits[4].Image).To(Equal(verifyDefaultCheckImage),
 			"without spec.verify.image the checks run on the built-in Go default (go: not found fix)")
-		Expect(inits[3].Image).NotTo(Equal("docker.io/alpine/git:v2.54.0"),
+		Expect(inits[4].Image).NotTo(Equal("docker.io/alpine/git:v2.54.0"),
 			"the git image has no Go toolchain — the S5a check-0 exit 127 root cause")
 	})
 

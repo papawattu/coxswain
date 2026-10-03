@@ -28,6 +28,11 @@
 # live API server with kubectl apply --dry-run=server (CRDs must be
 # installed) without creating anything.
 #
+# --evidence-only mode: regenerate EVIDENCE.md from an EXISTING Loop (the
+# run must have reached Succeeded or Failed) without re-running anything —
+# no Gitea seed, no apply, no watch. Used to re-collect evidence after the
+# generator itself is fixed (the run is too expensive to redo).
+#
 # Evidence is operator-side only (kubectl): phase events, the per-iteration
 # verify Jobs (init-container exit codes + check logs), the tamper result,
 # final conditions (including the honest PolicyEnforced/NetworkEnforced
@@ -54,11 +59,12 @@ die() { printf '\033[1;31m[sample-run FATAL]\033[0m %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--dry-run) MODE="dry-run" ;;
+	--evidence-only) MODE="evidence-only" ;;
 	-h|--help)
 		grep '^#' "$0" | sed -n '2,20p'
 		exit 0
 		;;
-	*) die "unknown flag '$1' (supported: --dry-run)" ;;
+	*) die "unknown flag '$1' (supported: --dry-run, --evidence-only)" ;;
 	esac
 	shift
 done
@@ -110,6 +116,7 @@ fi
 mkdir -p "$OUTDIR"
 log "evidence dir: $OUTDIR"
 
+if [ "$MODE" != "evidence-only" ]; then
 # ---------------------------------------------------------------------------
 # 0. Preflight: the controller deployment must be Available and must run
 #    with a non-empty --runner-image, or the sandbox falls back to
@@ -253,11 +260,29 @@ while :; do
 	sleep 10
 done
 log "final phase: $PHASE"
+fi
+
 # The sandbox pod keeps restarting after a terminal phase (the runner
 # refuses unknown desired-phases and the operator restarts it), which
 # clutters the event stream; the evidence below filters to the run's own
 # events, but clear the old ones anyway so later re-runs start clean.
-kubectl --context "$CTX" -n "$NS" delete events --field-selector "involvedObject.name=$LOOP" --now=true 2>/dev/null || true
+if [ "$MODE" != "evidence-only" ]; then
+	# Run modes only: evidence-only must see the run's own events.
+	kubectl --context "$CTX" -n "$NS" delete events --field-selector "involvedObject.name=$LOOP" --now=true 2>/dev/null || true
+fi
+
+# evidence-only mode: the phase comes from the existing Loop (the run modes
+# set $PHASE from the watch loop above).
+if [ "$MODE" = "evidence-only" ]; then
+	LOOP_JSON_EO=$(kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json) \
+		|| die "evidence-only: cannot read Loop $NS/$LOOP (deleted or unreachable)"
+	PHASE=$(python3 -c 'import json,sys; print((json.loads(sys.argv[1]).get("status") or {}).get("phase") or "Pending")' "$LOOP_JSON_EO")
+	case "$PHASE" in
+	Succeeded|Failed) ;;
+	*) die "evidence-only: Loop $NS/$LOOP is not in a final phase (phase: $PHASE)" ;;
+	esac
+	log "evidence-only: Loop $NS/$LOOP is $PHASE; regenerating the evidence"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Evidence (operator-side only).
@@ -274,25 +299,28 @@ kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json > "$EV_LOOP_JSON"
 	printf -- '- loop: %s\n' "$LOOP"
 	printf -- '- runner image flag: %s\n' \
 		"$(kubectl --context "$CTX" -n coxswain-system get deploy coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ' ' '\n' | grep runner-image || echo '<not found>')"
-	printf -- '- model endpoint: %s (real vLLM, no fake model)\n' "$VLLM_HOST_PORT"
+	printf -- '- model endpoint: %s (real vLLM, no fake model)\n' "${VLLM_HOST_PORT:-$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML" 2>/dev/null || echo '<unknown>')}"
 	printf '\n'
 	printf '## Phases (PhaseAdvanced / PhaseIterated events)\n\n'
 	printf '```\n'
-	# custom-columns needs <header>:<json-path-expr> pairs (the bare
-	# name=expr form is rejected by kubectl), and --field-selector does
-	# not support namespace (k8s only supports involvedObject.name there),
-	# so filter the loop's events client-side by involvedObject.name
-	# (the events are in $NS anyway; the name is unique per namespace).
-	kubectl --context "$CTX" -n "$NS" get events --sort-by=.lastTimestamp -o json 2>/dev/null \
-		| python3 -c '
+	# The PhaseAdvanced/PhaseIterated events are the operator's records of
+	# the phase machine. Try the field selector first (server-side); if it
+	# returns nothing, fall back to a client-side filter on
+	# involvedObject.name (the name is unique per namespace).
+	PHASE_EVENTS=$({ kubectl --context "$CTX" -n "$NS" get events \
+		--field-selector "involvedObject.name=$LOOP" --sort-by=.lastTimestamp -o json 2>/dev/null \
+		|| kubectl --context "$CTX" -n "$NS" get events --sort-by=.lastTimestamp -o json 2>/dev/null; })
+	printf '%s\n' "$PHASE_EVENTS" | python3 -c '
 import json, sys
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
 for e in d.get("items", []):
     if e["involvedObject"].get("name") != sys.argv[1]:
         continue
     ts = e.get("lastTimestamp") or ""
-    print("%s  %s  %s" % (ts, e.get("reason", ""), e.get("message", "")))' "$LOOP" \
-		|| true
+    print("%s  %s  %s" % (ts, e.get("reason", ""), e.get("message", "")))' "$LOOP" || true
 	printf '```\n\n'
 	printf '## Final phase, conditions, pins\n\n'
 	printf '```\n'
@@ -343,6 +371,96 @@ for c in d["spec"]["initContainers"]:
 	# the full API group in -o name, so strip that first).
 	kubectl --context "$CTX" -n "$NS" get netpol -o name 2>/dev/null | sed 's|^networkpolicy.networking.k8s.io/||' | grep "^$LOOP-" \
 		| while read -r np; do kubectl --context "$CTX" -n "$NS" get netpol "$np" -o yaml; done || true
+	printf '```\n\n'
+
+	# ----------------------------------------------------------------------
+	# What the agent changed: a READ-ONLY peek at the workspace PVC (the
+	# sandbox pod is gone after a terminal phase). The peek pod is
+	# alpine/git, runAsUser 65532 (the workspace repo is owned by the
+	# runner's UID), core.hooksPath=/dev/null (never run agent-planted
+	# hooks), safe.directory (the ownership mismatch), read-only mount,
+	# no network. Deleted afterwards. Only the diff stat is collected —
+	# this is operator-side evidence of what base..verified covers.
+	# ----------------------------------------------------------------------
+	printf '## What the agent changed (git diff --stat base..verified)\n\n'
+	printf 'The diff is read from the Loop%s workspace PVC by a short-lived, read-only peek pod (alpine/git, runAsUser 65532, read-only mount, no network, deleted afterwards). It shows what the verified commit contains relative to the pinned base commit.\n\n' "$LOOP"
+	printf '```\n'
+	BASE_COMMIT=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("status") or {}).get("baseCommit") or "")' "$EV_LOOP_JSON")
+	VERIFIED_COMMIT=$(python3 -c 'import json,sys; print(((json.load(open(sys.argv[1])).get("status") or {}).get("currentVerify") or {}).get("verifiedCommit") or "")' "$EV_LOOP_JSON")
+	PVC_NAME="$LOOP-workspace"
+	PEEK_POD="${LOOP}-evidence-peek"
+	# A prior evidence collection may have left the peek pod behind (it has a
+	# one-shot command and is deleted after use, but a failed collection can
+	# orphan it). An existing pod with the same name is not a collision to
+	# fail on: delete it and create a fresh one.
+	kubectl --context "$CTX" -n "$NS" delete pod "$PEEK_POD" --wait=false >/dev/null 2>&1 || true
+	if [ -n "$BASE_COMMIT" ] && [ -n "$VERIFIED_COMMIT" ] && kubectl --context "$CTX" -n "$NS" get pvc "$PVC_NAME" >/dev/null 2>&1; then
+		cat <<PEOFEOF | kubectl --context "$CTX" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $PEEK_POD
+  namespace: $NS
+  labels:
+    coxswain.io/evidence-peek: "$LOOP"
+spec:
+  restartPolicy: Never
+  securityContext:
+    fsGroup: 65532
+  containers:
+  - name: git
+    image: alpine/git
+    command:
+    - /bin/sh
+    - -c
+    - |
+      set -eu
+      export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
+      export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
+      git -C /workspace diff --stat $BASE_COMMIT $VERIFIED_COMMIT
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      runAsUser: 65532
+      runAsNonRoot: true
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+      readOnly: true
+  volumes:
+  - name: workspace
+    persistentVolumeClaim:
+      claimName: $PVC_NAME
+PEOFEOF
+		# The one-shot command writes the diff to the container log and the
+		# container terminates. Poll for the log: a command pod may never
+		# report Ready before it terminates, so wait for the log or a
+		# terminated container state (120s total).
+		PEEK_LOG=""
+		for i in $(seq 1 24); do
+			PEEK_LOG=$(kubectl --context "$CTX" -n "$NS" logs "$PEEK_POD" 2>/dev/null || true)
+			if [ -n "$PEEK_LOG" ]; then
+				break
+			fi
+			TERMINATED=$(kubectl --context "$CTX" -n "$NS" get pod "$PEEK_POD" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null || true)
+			if [ -n "$TERMINATED" ]; then
+				PEEK_LOG=$(kubectl --context "$CTX" -n "$NS" logs "$PEEK_POD" 2>/dev/null || true)
+				[ -n "$PEEK_LOG" ] && break
+			fi
+			sleep 5
+		done
+		if [ -n "$PEEK_LOG" ]; then
+			printf '%s\n' "$PEEK_LOG"
+		else
+			kubectl --context "$CTX" -n "$NS" describe pod "$PEEK_POD" 2>/dev/null | tail -8 || true
+			printf '\n[peek pod produced no log in 120s]\n'
+		fi
+		kubectl --context "$CTX" -n "$NS" delete pod "$PEEK_POD" --wait=false >/dev/null 2>&1 || true
+	else
+		printf 'n/a (baseCommit=%s, verifiedCommit=%s, pvc=%s present=%s)\n' \
+		"$BASE_COMMIT" "$VERIFIED_COMMIT" "$PVC_NAME" "$(kubectl --context "$CTX" -n "$NS" get pvc "$PVC_NAME" >/dev/null 2>&1 && echo yes || echo no)"
+	fi
 	printf '```\n\n'
 
 	printf '## Agent claim (CONTEXT ONLY — never the evidence)\n\n'

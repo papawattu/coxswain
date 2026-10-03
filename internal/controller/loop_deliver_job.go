@@ -130,11 +130,16 @@ const (
 	deliverProviderGitea
 )
 
-// draftTitlePrefix is the PR-title prefix for a draft delivery. Gitea's PR
-// API ignores the "draft" field (Gitea has no draft PRs), so a Gitea draft
-// delivery is marked in the PR title instead ("WIP: "); GitHub honours the
-// field and the prefix stays empty.
-var draftTitlePrefix = ""
+// draftTitlePrefixFor returns the PR-title prefix for a draft delivery:
+// Gitea's PR API ignores the "draft" field (Gitea has no draft PRs), so a
+// Gitea draft delivery is marked in the PR title instead ("WIP: "); GitHub
+// honours the field and the prefix is empty.
+func draftTitlePrefixFor(draft bool, prov deliverProvider) string {
+	if draft && prov == deliverProviderGitea {
+		return "WIP: "
+	}
+	return ""
+}
 
 func deliverProviderForRepo(repo string) (deliverProvider, string) {
 	u, err := url.Parse(repo)
@@ -632,9 +637,7 @@ func (r *LoopReconciler) deliverPushContainer(loop *coxv1alpha1.Loop, verified, 
 	prov, _ := deliverProviderForRepo(repo)
 	apiBase := deliverAPIBase(repo, prov)
 	draft := deliverDraft(loop)
-	if draft && prov == deliverProviderGitea {
-		draftTitlePrefix = "WIP: "
-	}
+	draftTitlePrefix := draftTitlePrefixFor(draft, prov)
 
 	mounts := []corev1.VolumeMount{
 		{Name: deliverScratchVol, MountPath: deliverScratchPath},

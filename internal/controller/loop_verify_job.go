@@ -406,7 +406,7 @@ func init() {
 func cloneScript(repo, baseCommit string) string {
 	return fmt.Sprintf(`
 set -e
-rm -rf /verify
+rm -rf /verify/*
 mkdir -p /verify
 cd /verify
 git init -q
@@ -426,7 +426,7 @@ func cloneCredScript(repo, baseCommit string) string {
 set -e
 # Build the basic-auth header from the two mounted secret files (S3a pattern).
 AUTH="Authorization: Basic $(printf '%%s:%%s' "$(cat /git-cred/username)" "$(cat /git-cred/password)" | base64 -w 0)"
-rm -rf /verify
+rm -rf /verify/*
 mkdir -p /verify
 cd /verify
 git init -q

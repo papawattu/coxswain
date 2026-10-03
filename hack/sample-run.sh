@@ -57,7 +57,8 @@ done
 KUBECTL=(kubectl --context "$CTX" -n "$NS")
 
 command -v kubectl >/dev/null || die "kubectl is not on PATH"
-command -v jq >/dev/null || die "jq is not on PATH"
+command -v python3 >/dev/null || die "python3 is not on PATH (PyYAML required)"
+python3 -c 'import yaml' >/dev/null 2>&1 || die "python3-yaml (PyYAML) not importable"
 kubectl --context "$CTX" get nodes >/dev/null 2>&1 \
 	|| die "cannot reach cluster context '$CTX' (is the coxswain-dev kind cluster running?)"
 
@@ -103,15 +104,46 @@ log "Gitea ready"
 # 2. Secrets the Loop needs in its namespace (idempotent; values come from
 #    the cluster, never from masked output).
 # ---------------------------------------------------------------------------
-GIT_CRED_SECRET=$(jq -r '.spec.workspace.gitCredentialSecret // "samples-git-cred"' "$LOOP_YAML")
-MODEL_SECRET=$(jq -r '.spec.agent.endpointSecretRef // "vllm-no-auth"' "$LOOP_YAML")
+GIT_CRED_SECRET=$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["workspace"].get("gitCredentialSecret") or "samples-git-cred")' "$LOOP_YAML")
+MODEL_SECRET=$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"].get("endpointSecretRef") or "vllm-no-auth")' "$LOOP_YAML")
 
 if ! kubectl --context "$CTX" -n "$NS" get secret "$GIT_CRED_SECRET" >/dev/null 2>&1; then
 	log "copying git credential secret '$GIT_CRED_SECRET' from the seeded samples ns (ns $NS)..."
-	kubectl --context "$CTX" -n "$NS" get secret samples-git-cred -o yaml \
-		| jq 'del(.metadata.name, .metadata.namespace, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations)' \
-		| jq --arg n "$GIT_CRED_SECRET" '.metadata.name = $n' \
-		| kubectl --context "$CTX" -n "$NS" apply -f - >/dev/null
+	kubectl --context "$CTX" -n "$NS" get secret samples-git-cred -o json > /tmp/.s5b-gitcred.json
+	python3 - "$GIT_CRED_SECRET" /tmp/.s5b-gitcred.json > /tmp/.s5b-gitcred-out.json <<'PYEOF'
+import json, sys
+name, path = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+d["metadata"]["name"] = name
+# The type is fixed here (not copied): a wrong/non-standard type would fail
+# the check below, and Secret types are immutable — a type-only edit is
+# impossible in place.
+d["type"] = "kubernetes.io/basic-auth"
+for k in ("namespace", "uid", "resourceVersion", "creationTimestamp", "annotations", "managedFields"):
+    d["metadata"].pop(k, None)
+print(json.dumps(d))
+PYEOF
+	kubectl --context "$CTX" -n "$NS" apply -f /tmp/.s5b-gitcred-out.json >/dev/null
+	rm -f /tmp/.s5b-gitcred.json /tmp/.s5b-gitcred-out.json
+elif [ "$(kubectl --context "$CTX" -n "$NS" get secret "$GIT_CRED_SECRET" -o jsonpath='{.type}')" != "kubernetes.io/basic-auth" ]; then
+	# Secret types are IMMUTABLE: an existing secret with a wrong (e.g. bare
+	# 'BasicAuth') type cannot be edited in place. Recreate it with the same
+	# data (never printed) under the required type.
+	log "secret '$GIT_CRED_SECRET' has the wrong type; recreating as kubernetes.io/basic-auth (same data)..."
+	kubectl --context "$CTX" -n "$NS" get secret "$GIT_CRED_SECRET" -o json > /tmp/.s5b-gitcred.json
+	python3 - "$GIT_CRED_SECRET" /tmp/.s5b-gitcred.json > /tmp/.s5b-gitcred-out.json <<'PYEOF'
+import json, sys
+name, path = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+d["metadata"]["name"] = name
+d["type"] = "kubernetes.io/basic-auth"
+for k in ("namespace", "uid", "resourceVersion", "creationTimestamp", "annotations", "managedFields"):
+    d["metadata"].pop(k, None)
+print(json.dumps(d))
+PYEOF
+	kubectl --context "$CTX" -n "$NS" delete secret "$GIT_CRED_SECRET" --wait=true
+	kubectl --context "$CTX" -n "$NS" apply -f /tmp/.s5b-gitcred-out.json >/dev/null
+	rm -f /tmp/.s5b-gitcred.json /tmp/.s5b-gitcred-out.json
 fi
 [ "$(kubectl --context "$CTX" -n "$NS" get secret "$GIT_CRED_SECRET" -o jsonpath='{.type}')" = "kubernetes.io/basic-auth" ] \
 	|| die "secret $GIT_CRED_SECRET is not kubernetes.io/basic-auth"
@@ -119,13 +151,20 @@ fi
 if ! kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" >/dev/null 2>&1; then
 	# The model Secret (a no-auth vLLM endpoint: the API key is a dummy).
 	# This is dev-only configuration for the local vLLM at the Loop's
-	# modelEndpoint; the value is fixed and non-secret.
+	# modelEndpoint; the value is fixed and non-secret. The proxy stand-in
+	# only checks that the mounted files exist and are non-empty.
 	log "creating model secret '$MODEL_SECRET' (no-auth vLLM) in ns $NS..."
-	printf 'api.key: none\nmodel.name: qwen3.8-27b\n' | kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
-		--from-file=api.key=- --from-file=model.name=- >/dev/null
+	# kubectl create secret rejects dots in --from-literal keys (it would
+	# read the key as a file path); use temp files instead.
+	KEYF="$OUTDIR/.mkmodel-apikey"; NAMEF="$OUTDIR/.mkmodel-modelname"
+	printf 'none\n' > "$KEYF"; printf 'qwen3.8-27b\n' > "$NAMEF"
+	kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
+		--from-file="api.key=$KEYF" \
+		--from-file="model.name=$NAMEF" >/dev/null
+	rm -f "$KEYF" "$NAMEF"
 fi
 # The vLLM endpoint must be reachable from the operator node.
-VLLM_HOST_PORT=$(jq -r '.spec.agent.modelEndpoint' "$LOOP_YAML")
+VLLM_HOST_PORT=$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")
 log "vLLM endpoint: $VLLM_HOST_PORT (must be reachable from the kind node)"
 
 # ---------------------------------------------------------------------------
@@ -154,7 +193,7 @@ LAST_PHASE=""
 while :; do
 	[ $(date +%s) -lt "$DEADLINE" ] || die "timeout after ${TIMEOUT}s; last phase: ${LAST_PHASE:-<none>}"
 	STATE=$(kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json 2>/dev/null \
-		| jq -r '"\(.status.phase // "Pending") \(.status.iteration // 0)"' 2>/dev/null || echo "")
+		| python3 -c 'import json,sys; s=json.load(sys.stdin).get("status") or {}; print((s.get("phase") or "Pending"), s.get("iteration") or 0)' 2>/dev/null || echo "")
 	PHASE="${STATE%% *}"
 	if [ "$PHASE" != "$LAST_PHASE" ]; then
 		log "phase: $PHASE (iteration ${STATE#* })"
@@ -191,9 +230,11 @@ kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json > "$EV_LOOP_JSON"
 	printf '```\n\n'
 	printf '## Final phase, conditions, pins\n\n'
 	printf '```\n'
-	jq -r '.status | {phase, iteration, observedPhase, desiredPhase, baseCommit, currentVerify, verify, progress, policy}' "$EV_LOOP_JSON"
+	jq -r '.status | {phase, iteration, observedPhase, desiredPhase, baseCommit, currentVerify, verify, progress, policy}' "$EV_LOOP_JSON" 2>/dev/null \
+		|| python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("status") or {}, indent=2))' "$EV_LOOP_JSON"
 	printf '\nconditions:\n'
-	jq -r '.status.conditions[] | "- \(.type)=\(.status) reason=\(.reason): \(.message)"' "$EV_LOOP_JSON"
+	jq -r '.status.conditions[] | "- \(.type)=\(.status) reason=\(.reason): \(.message)"' "$EV_LOOP_JSON" 2>/dev/null \
+		|| python3 -c 'import json,sys; [print("- %s=%s reason=%s: %s" % (c["type"], c["status"], c.get("reason",""), c.get("message","")) for c in (json.load(open(sys.argv[1])).get("status") or {}).get("conditions", [])]' "$EV_LOOP_JSON"
 	printf '```\n\n'
 
 	printf '## Verify Jobs (per iteration: init exit codes + check logs)\n\n'
@@ -205,9 +246,9 @@ kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json > "$EV_LOOP_JSON"
 		if [ -n "${pod:-}" ]; then
 			printf 'init container exit codes (kubelet-recorded):\n\n```\n'
 			kubectl --context "$CTX" -n "$NS" get pod "$pod" -o json \
-				| jq -r '.status.initContainerStatuses[]? | "- \(.name): exit=\(.state.terminated.exitCode // "n/a") (\(.state.terminated.reason // "?"))"'
+				| python3 -c 'import json,sys; [print("- %s: exit=%s (%s)" % (s["name"], ((s.get("state") or {}).get("terminated") or {}).get("exitCode","n/a"), ((s.get("state") or {}).get("terminated") or {}).get("reason","?"))) for s in json.load(sys.stdin)["status"].get("initContainerStatuses", [])]'
 			printf '```\n\n'
-			for c in $(kubectl --context "$CTX" -n "$NS" get pod "$pod" -o json | jq -r '.status.initContainerStatuses[]? | select(.name|startswith("check-")) | .name'); do
+			for c in $(kubectl --context "$CTX" -n "$NS" get pod "$pod" -o json | python3 -c 'import json,sys; [print(s["name"]) for s in json.load(sys.stdin)["status"].get("initContainerStatuses", []) if s["name"].startswith("check-")]'); do
 				printf 'check log (%s, tail 15):\n\n```\n' "$c"
 				kubectl --context "$CTX" -n "$NS" logs "$pod" -c "$c" --tail=15 2>&1 || true
 				printf '```\n\n'
@@ -230,7 +271,8 @@ kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json > "$EV_LOOP_JSON"
 
 	printf '## Agent claim (CONTEXT ONLY — never the evidence)\n\n'
 	printf 'The runner claim (status.progress / observedPhase) is an agent statement; the evidence above (verify Job exit codes, tamper, checks) is the B3 contract.\n\n```\n'
-	jq -r '.status | {observedPhase, progress}' "$EV_LOOP_JSON"
+	jq -r '.status | {observedPhase, progress}' "$EV_LOOP_JSON" 2>/dev/null \
+		|| python3 -c 'import json,sys; s=json.load(open(sys.argv[1])).get("status") or {}; print(json.dumps({"observedPhase": s.get("observedPhase"), "progress": s.get("progress")}, indent=2))' "$EV_LOOP_JSON"
 	printf '```\n\n'
 
 	printf '## No external pushes\n\n'

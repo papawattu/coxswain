@@ -209,6 +209,10 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(job.OwnerReferences[0].Name).To(Equal(name))
 		Expect(job.OwnerReferences[0].Kind).To(Equal("Loop"))
 
+		By("stamping the Job with the verifiedCommit it was built for (D27)")
+		Expect(job.Annotations["coxswain.io/verified-commit"]).To(Equal(s5aHeadCommit),
+			"the verify Job must carry the verifiedCommit annotation (stale-evidence guard)")
+
 		By("shaping the Job per B3 (restartPolicy Never, backoffLimit 0)")
 		Expect(job.Spec.Template.Spec.RestartPolicy).To(Equal(corev1.RestartPolicyNever))
 		Expect(job.Spec.BackoffLimit).NotTo(BeNil())
@@ -625,5 +629,56 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		}
 		Expect(portAfter).To(Equal(int32(8080)),
 			"the verify NetworkPolicy must be UPDATED when the repo port changes (I42c)")
+	})
+
+	It("deletes a stale verify Job whose annotation does not match the current pin (D27)", func() {
+		ns := "s5a-stale-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "staleloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		_ = s5aReconcile(r, ns, name)
+
+		// The Job was created with the original pin (s5aHeadCommit).
+		jobName := fmt.Sprintf("%s-verify-1", name)
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)).To(Succeed())
+
+		// Simulate a new iteration: the pin changes to a different commit.
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.CurrentVerify.VerifiedCommit = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// Reconcile 1: the stale Job must be deleted (D27).
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The old Job is gone (deleted by the stale-evidence guard).
+		staleJob := &batchv1.Job{}
+		Eventually(func() bool {
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, staleJob)
+			return apierrors.IsNotFound(err)
+		}, "5s", "100ms").Should(BeTrue(),
+			"the stale verify Job must be deleted when the pin changes (D27)")
+
+		// Reconcile 2: a fresh Job is created for the new pin.
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The new Job exists with the new pin's annotation.
+		newJob := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, newJob)).To(Succeed())
+		Expect(newJob.Annotations["coxswain.io/verified-commit"]).To(Equal("abcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+			"the recreated Job must carry the NEW pin's annotation")
 	})
 })

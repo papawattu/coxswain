@@ -87,6 +87,10 @@ const (
 	verifyAgentVol = "agent-workspace"
 	// verifyNoopContainer is the no-op main container's name.
 	verifyNoopContainer = "noop"
+	// verifyCommitAnnotation is the annotation the verify Job carries naming
+	// the verifiedCommit it was built for (D27 stale-evidence guard: the
+	// operator ignores/deletes a Job whose annotation != the current pin).
+	verifyCommitAnnotation = "coxswain.io/verified-commit"
 )
 
 // verifyJobImage is the image the verify Job's init containers run (the
@@ -166,9 +170,27 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 	job := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, job)
 	if err == nil {
-		// Already exists: leave it untouched (idempotency, B3b — the operator
-		// never mutates a running Job; a re-run is a NEW Job).
-		return nil
+		// Already exists: check the D27 stale-evidence guard. A Job stamped
+		// with a different verifiedCommit is stale (another iteration's
+		// evidence) — delete it so a fresh Job is created for the current
+		// pin. Never reuse another commit's evidence.
+		if job.Annotations[verifyCommitAnnotation] != loop.Status.CurrentVerify.VerifiedCommit {
+			logf.FromContext(ctx).Info("verify Job is stale (annotation mismatch); deleting",
+				"job", name, "job-commit", job.Annotations[verifyCommitAnnotation],
+				"loop-commit", loop.Status.CurrentVerify.VerifiedCommit)
+			if err := r.Delete(ctx, job); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete stale verify job %s: %w", name, err)
+			}
+			// D27: never reuse another commit's evidence. The stale Job is
+			// deleted; the Owns(&batchv1.Job{}) watch triggers a re-reconcile
+			// (or the 5s requeue) which creates a fresh Job for the current pin.
+			return nil
+		} else {
+			// Already exists and matches: leave it untouched (idempotency,
+			// B3b — the operator never mutates a running Job; a re-run is
+			// a NEW Job).
+			return nil
+		}
 	}
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get verify job %s: %w", name, err)
@@ -178,19 +200,17 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 			Name:      name,
 			Namespace: loop.Namespace,
 			Labels:    verifyJobLabels(loop.Name),
+			Annotations: map[string]string{
+				verifyCommitAnnotation: loop.Status.CurrentVerify.VerifiedCommit,
+			},
 		},
 		Spec: r.buildVerifyJobSpec(loop),
-	}
-	if err := client.IgnoreNotFound(r.Create(ctx, job)); err != nil {
-		return fmt.Errorf("create verify job %s: %w", name, err)
 	}
 	if err := ctrl.SetControllerReference(loop, job, r.Scheme); err != nil {
 		return fmt.Errorf("set owner on verify job %s: %w", name, err)
 	}
-	// SetControllerReference mutates the in-memory object; persist the owner
-	// ref (Create did not carry it — the Job was built without it).
-	if err := r.Update(ctx, job); err != nil {
-		return fmt.Errorf("set owner ref on verify job %s: %w", name, err)
+	if err := client.IgnoreNotFound(r.Create(ctx, job)); err != nil {
+		return fmt.Errorf("create verify job %s: %w", name, err)
 	}
 	return nil
 }

@@ -39,6 +39,7 @@ import (
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -3332,6 +3333,8 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
+		// B3: the operator owns the per-Loop verify Job (ensureVerifyJob).
+		Owns(&batchv1.Job{}).
 		// Watch AgentPolicy: when a referenced policy is created, edited, or
 		// deleted, re-reconcile the Loops that reference it (R15 round 4 P2:
 		// a policy created after its Loop must not leave the Loop stuck at

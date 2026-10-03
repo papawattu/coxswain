@@ -1,7 +1,19 @@
-# Task 1 AgentPolicy (examples/gocli/tasks.md): the fenced tools the task
-# needs. The agent (golang:1.26 base) needs the Go toolchain and git; no
-# external network egress (stdlib only — the model goes through the
-# model-proxy, not the agent's own egress).
+# EXAMPLE AgentPolicy — NOT referenced by 1.loop.yaml (as of S5b).
+#
+# This is the fenced-tools spec for Task 1, but 1.loop.yaml does not list it
+# in spec.policyRefs yet: an AgentPolicy.exec entry is an exact absolute path,
+# and the runner's shell tool calls spawn an open-ended set of binaries (sh,
+# the shell's external commands, the go toolchain's compile/link helpers).
+# Under an enforcing KubeArmor Block policy the agent cannot exec any of
+# them and the Loop wedges with no output. Making exec fencing work for an
+# agent shell is D41 work. Until then this file documents the intended
+# fence for reference only; the demo runs the default-deny minimum (no
+# AgentPolicy reference), so nothing user-declared is narrower than the
+# runtime fence.
+#
+# Intended fence (examples/gocli/tasks.md): the agent (golang:1.26 base)
+# needs the Go toolchain and git; no external network egress (stdlib only —
+# the model goes through the model-proxy, not the agent's own egress).
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: AgentPolicy
 metadata:

@@ -38,7 +38,12 @@ spec:
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
-  policyRefs:
-    - gocli-task-1
+  # No policyRefs on purpose (S5b demo): the exec allow-list in
+  # 1.agentpolicy.yaml covers the Go toolchain and git only, but the
+  # runner's shell tool calls spawn an open-ended set of binaries (sh,
+  # shell built-ins, the go toolchain's compile/link helpers). Under an
+  # enforcing KubeArmor policy the agent's shell cannot exec and the Loop
+  # wedges. Exec fencing for an agent shell is D41 work; until then the
+  # demo runs the default-deny minimum (no AgentPolicy reference).
   loop:
     maxIterations: 3

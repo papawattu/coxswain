@@ -500,9 +500,9 @@ git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" checkout 
 echo "deliver import-agent: imported ${PINNED} from the agent workspace PVC"
 `
 	return corev1.Container{
-		Name: deliverImport,
-		Image: r.workspaceGitImage(),
-		Command:      []string{"/bin/sh", "-c", script},
+		Name:    deliverImport,
+		Image:   r.workspaceGitImage(),
+		Command: []string{"/bin/sh", "-c", script},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: deliverScratchVol, MountPath: deliverScratchPath},
 			// The agent workspace PVC read-only (the exact bytes the verify
@@ -584,7 +584,12 @@ fi
 # --- the API auth (GitHub: the Secret's PASSWORD as a Bearer token — the
 # Secret is basic auth with username "x-access-token" and password = the
 # token; Gitea-compatible: the same basic pair as a Basic header).
-` + (func() string { if creds { return "AUTH=$(printf '%s:%s' \"$(cat /workspace-creds/" + workspaceCredsUsernameKey + ")\" \"$(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n" }; return "" })() + `
+` + (func() string {
+		if creds {
+			return "AUTH=$(printf '%s:%s' \"$(cat /workspace-creds/" + workspaceCredsUsernameKey + ")\" \"$(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\" | base64 -w 0)\n"
+		}
+		return ""
+	})() + `
 git -C "${SRC}" ` + deliverSafeDir() + `` + gitCredFlag + ` push origin "HEAD:refs/heads/${BRANCH}"
 # --- create the PR (idempotent: reuse an open PR for the branch).
 # owner/name come from the repo URL (<host>/<owner>/<name>[.git]).
@@ -838,7 +843,6 @@ func (r *LoopReconciler) cleanupDeliverNetpol(ctx context.Context, loop *coxv1al
 	}
 	return nil
 }
-
 
 // deliverEgressProxyHosts returns the repo host (+ api.github.com for a
 // GitHub delivery) for the egress proxy's SNI allowlist (I42): the deliver

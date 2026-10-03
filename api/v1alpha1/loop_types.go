@@ -41,10 +41,10 @@ const (
 	// is the product; with spec.delivery.mode PullRequest, the deliver Job
 	// then pushes the verified commit and opens the PR (S6) and records it in
 	// status.delivery + the Delivered condition.
-	LoopPhaseSucceeded        LoopPhase = "Succeeded"
-	LoopPhaseFailed           LoopPhase = "Failed"
-	LoopPhasePaused           LoopPhase = "Paused"
-	LoopPhaseCleaningUp       LoopPhase = "CleaningUp"
+	LoopPhaseSucceeded  LoopPhase = "Succeeded"
+	LoopPhaseFailed     LoopPhase = "Failed"
+	LoopPhasePaused     LoopPhase = "Paused"
+	LoopPhaseCleaningUp LoopPhase = "CleaningUp"
 )
 
 // DeliveredCondition is the S6 delivery condition type (phase Succeeded +

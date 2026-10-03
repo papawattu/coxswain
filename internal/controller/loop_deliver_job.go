@@ -567,6 +567,22 @@ echo "deliver import-agent: imported ${PINNED} from the agent workspace PVC"
 	}
 }
 
+// deliverPushAPIAuthExpr is the API auth setup line(s) for the push script's
+// PR-call section (emitted AFTER the git push — the only place $AUTH may be
+// referenced is after its assignment; see the script's comment). GitHub:
+// the Secret's PASSWORD as a Bearer token (read directly — no $AUTH); Gitea:
+// the basic pair as a Basic header ($AUTH, assigned before the push).
+func deliverPushAPIAuthExpr(creds bool, prov deliverProvider) string {
+	switch {
+	case creds && prov == deliverProviderGitHub:
+		return "API_AUTH=\"Authorization: Bearer $(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\"\n"
+	case creds:
+		return "API_AUTH=\"Authorization: Basic $AUTH\"\n"
+	default:
+		return "API_AUTH=\"\"\n"
+	}
+}
+
 // deliverPushContainer pushes the imported commit to the delivery branch
 // (NEVER --force; refusing a push whose target ref equals baseBranch or a
 // default branch — main/master) and creates the pull request via the
@@ -592,20 +608,11 @@ func (r *LoopReconciler) deliverPushContainer(loop *coxv1alpha1.Loop, verified, 
 	if creds {
 		mounts = append(mounts, corev1.VolumeMount{Name: workspaceCredsVolume, MountPath: "/workspace-creds", ReadOnly: true})
 	}
-
-	var apiAuthLine string
-	switch {
-	case creds && prov == deliverProviderGitHub:
-		apiAuthLine = "API_AUTH=\"Authorization: Bearer $(cat /workspace-creds/" + workspaceCredsPasswordKey + ")\""
-	case creds:
-		apiAuthLine = "API_AUTH=\"Authorization: Basic $AUTH\""
-	default:
-		apiAuthLine = "API_AUTH=\"\""
-	}
 	gitCredFlag := ""
 	if creds {
 		gitCredFlag = gitBasicAuthHeader
 	}
+	apiAuthExpr := deliverPushAPIAuthExpr(creds, prov)
 
 	script := `#!/bin/sh
 set -eu
@@ -618,7 +625,6 @@ PINNED=` + shellQuote(verified) + `
 API_BASE=` + shellQuote(apiBase) + `
 PR_BASE=` + shellQuote(prBase) + `
 DRAFT=` + strconv.FormatBool(draft) + `
-` + apiAuthLine + `
 # --- refusal: the delivery branch must NOT equal the base branch or a
 # default branch (main/master). Pushing onto a default branch would deliver
 # the agent's code straight to the operator's mainline — the PR gate is the
@@ -639,6 +645,10 @@ fi
 git -C "${SRC}" ` + deliverSafeDir() + `` + gitCredFlag + ` push origin "HEAD:refs/heads/${BRANCH}"
 # --- create the PR (idempotent: reuse an open PR for the branch).
 # owner/name come from the repo URL (<host>/<owner>/<name>[.git]).
+# The API auth is set up HERE, after the push: a set -u script dies on the
+# first reference to $AUTH before its assignment (the s6b kind run's push
+# failure: the API_AUTH line referenced $AUTH above the AUTH assignment).
+` + apiAuthExpr + `
 PATH_PART=${REPO#*://}
 REMAIN=${PATH_PART#*/}
 OWNER=${REMAIN%%/*}

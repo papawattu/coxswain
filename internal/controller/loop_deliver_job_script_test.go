@@ -141,6 +141,14 @@ func TestDeliverCloneImportScriptsInSequence(t *testing.T) {
 	if pushIdx < authIdx {
 		t.Fatalf("push script references $AUTH (push at offset %d) before the AUTH assignment (offset %d); set -u kills the push with 'AUTH: parameter not set'", pushIdx, authIdx)
 	}
+	// NO reference to $AUTH anywhere before its assignment: the API auth
+	// header line (API_AUTH=... $AUTH) is a second use the s6b kind run
+	// proved kills the container under set -u. The push-line check above
+	// would pass while the API_AUTH line still precedes the assignment.
+	before := pushScript[:authIdx]
+	if refIdx := strings.Index(before, "$AUTH"); refIdx >= 0 {
+		t.Fatalf("push script references $AUTH (offset %d) before the AUTH assignment (offset %d); set -u kills the container before anything runs", refIdx, authIdx)
+	}
 }
 
 // deliverContainerScript extracts the shell script from a container built as

@@ -228,6 +228,9 @@ type deliverOutcome struct {
 // verifiedCommit is deleted (Background propagation) and the reconcile
 // requeues (D27 stale guard, like the verify Job's errVerifyStaleDeleted).
 func (r *LoopReconciler) ensureDeliverJob(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	if ok, _ := deliveryRequested(loop); !ok {
+		return false, nil
+	}
 	jobName := deliverJobName(loop.Name)
 	verified := loop.Status.CurrentVerify.VerifiedCommit
 

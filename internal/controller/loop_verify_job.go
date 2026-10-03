@@ -760,6 +760,14 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 	return verifySucceeded, false, "", 0
 }
 
+// verifyIteratedReason is the stable Event reason the operator emits when a
+// failing acceptance check sends the Loop back to Implementing (the
+// Verifying -> Implementing iterate). It is distinct from phaseAdvancedReason
+// (PhaseAdvanced) so the event stream reads correctly: an iterate is not a
+// forward advance. The message carries the from/to phases + the failing
+// check and its exit code.
+const verifyIteratedReason = "PhaseIterated"
+
 // MaxIterationsExceededReason is the Failed condition reason recorded when
 // the iteration cap (spec.loop.maxIterations, default 3 when unset) is hit:
 // a verify check failed on the last allowed iteration, so the Loop is Failed
@@ -833,6 +841,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			return true, false
 		}
 		loop.Status.Iteration = nextIter
+		from := loop.Status.Phase // Verifying — the ACTUAL previous phase (OS5)
 		loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
 		// OS1: record the failing check into progress (the next Implementing
@@ -848,6 +857,10 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// headCommit and re-pin on the next advance (the fresh Job is created
 		// for THAT pin only).
 		loop.Status.CurrentVerify = nil
+		// OS5: the iterate is a distinct Event with the correct from-phase
+		// (Verifying -> Implementing, never the stale phase a leftover claim
+		// would imply). The failing check + exit code ride in the message.
+		r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
 		return true, false
 	case verifyTampered:
 		// The B2 tamper gate is the authority (it runs every reconcile and
@@ -862,4 +875,19 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		}
 	}
 	return false, false
+}
+
+// emitVerifyIteratedEvent (OS5, S5a) emits the distinct Event for a verify
+// iterate (Verifying -> Implementing). It is emitted at the moment of the
+// transition — before status.phase is mutated — so the message carries the
+// ACTUAL previous phase (Verifying), never a stale phase. Best-effort like
+// emitPhaseAdvancedEvent: a nil Recorder (most envtests) skips it; a failed
+// Event never blocks the reconcile.
+func (r *LoopReconciler) emitVerifyIteratedEvent(loop *coxv1alpha1.Loop, from coxv1alpha1.LoopPhase, failedCheck string, checkExitCode int32, nextIter int) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(loop, corev1.EventTypeNormal, verifyIteratedReason,
+		"phase advanced %s -> %s (iteration %d, %s exit %d)",
+		from, loop.Status.Phase, nextIter, failedCheck, checkExitCode)
 }

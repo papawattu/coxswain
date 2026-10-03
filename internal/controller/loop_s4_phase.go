@@ -300,10 +300,12 @@ func (autoApprovePhaseGate) Allow(_ *coxv1alpha1.Loop, _, _ coxv1alpha1.LoopPhas
 	return true, ""
 }
 
-// phaseAdvancedReason is the stable Event reason the operator emits on every
-// phase transition (OS5, R19: "stable reasons, e.g. PhaseAdvanced"). The
-// reason is a fixed string (documented as an API); the message carries the
-// from/to phases.
+// phaseAdvancedReason is the stable Event reason the operator emits on a
+// FORWARD phase transition (OS5, R19: "stable reasons, e.g. PhaseAdvanced").
+// The reason is a fixed string (documented as an API); the message carries
+// the from/to phases. The verify ITERATE (Verifying -> Implementing) is
+// distinct: it emits verifyIteratedReason (PhaseIterated, loop_verify_job.go)
+// — an iterate is not a forward advance.
 const phaseAdvancedReason = "PhaseAdvanced"
 
 // claimPhaseForAdvance maps the runner's claim (ADR-0004) to the phase the
@@ -502,6 +504,35 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("stale claim from a previous iteration ignored",
 				"claimIteration", claim.Iteration,
 				"statusIteration", loop.Status.Iteration)
+			return false, false
+		}
+		// S5a (OS5 P3): a CONSUMED claim is discarded, not re-consumed.
+		// advancePhaseFromClaim runs every reconcile while the phase is not
+		// terminal, and the operator never acknowledges a claim — so without
+		// this guard a success claim is re-read on EVERY reconcile until the
+		// pod is recycled. Two wrong behaviors follow: recordPhaseClaim
+		// re-stamps progress with the same-second claim data (a 5s status
+		// churn while a phase runs), and the advance path would RE-emit the
+		// PhaseAdvanced Event with a WRONG from-phase (the kind event stream
+		// showed a spurious 'Planning -> Implementing' at the verify iterate:
+		// the prior cycle's Implementing success claim, still on the pod, was
+		// re-consumed against the phase the Loop was in when that reconcile
+		// ran, never the phase the claim had actually advanced). The guard:
+		// a SUCCESS claim whose observedPhase no longer matches the CURRENT
+		// phase has already been consumed (its advance happened in an earlier
+		// reconcile and moved the phase away; the pod has not been recycled
+		// yet) — log and discard: no progress write, no advance, no event.
+		// A claim whose observedPhase matches the current phase is the one
+		// this reconcile consumes; its advance (if any) moves the phase AWAY
+		// from the claimed phase, so the same pod's claim is discarded on the
+		// very next reconcile. A BLOCKED claim still rides into progress (OS1
+		// observability of the runner's last word is unchanged) — a blocked
+		// claim never advances, so re-stamping it is idempotent and it is the
+		// runner's status, not a stale advance.
+		if claim.Status == claimSuccess && claim.ObservedPhase != loop.Status.Phase {
+			logf.FromContext(ctx).Info("claim already consumed (observedPhase no longer matches the current phase); discarding",
+				"observedPhase", claim.ObservedPhase,
+				"currentPhase", loop.Status.Phase)
 			return false, false
 		}
 		// S4 review P2 (R18): the clock is injected (r.now, defaulting to

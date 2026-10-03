@@ -31,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -173,6 +174,41 @@ func s5aClaimPodWithIteration(ns, name, phase, head string, iteration int) {
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
+// s5aVerifyPodMultiCheck is s5aVerifyPod with N checks: trusted inits all 0,
+// tamper 0, check-<k> non-zero for each k in failing (exit code exitCode) and
+// 0 otherwise. It exercises the verify-outcome mapping with a FAILING check
+// that is NOT check-0 (P2: the failing-check name/code must come from the
+// first check-* container with a non-zero exit, never a fixed index).
+func s5aVerifyPodMultiCheck(ctx context.Context, ns, name, jobName string, checkCount int, failing map[int]int32) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + "-verify-pod",
+			Namespace: ns,
+			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	inits := make([]corev1.ContainerStatus, 0, 3+checkCount)
+	inits = append(inits,
+		corev1.ContainerStatus{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		corev1.ContainerStatus{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		corev1.ContainerStatus{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+	)
+	for i := range checkCount {
+		code := int32(0)
+		if c, ok := failing[i]; ok {
+			code = c
+		}
+		inits = append(inits, corev1.ContainerStatus{
+			Name:  fmt.Sprintf("check-%d", i),
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}},
+		})
+	}
+	pod.Status.InitContainerStatuses = inits
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
 // requireVerifyGitSafeEnv asserts the container's env carries
 // safe.directory=/verify via the GIT_CONFIG_COUNT form: (KEY_0, VALUE_0)
 // == (safe.directory, /verify). Mutation: drop the env from a container and
@@ -198,8 +234,6 @@ func envValue(env []corev1.EnvVar, name string) (string, bool) {
 	return "", false
 }
 
-// s5aDriveToVerifying drives a fresh Loop (ns/name already created) through
-// the claim path to Verifying: a Planning claim, then an Implementing claim
 // s5aDriveToVerifying drives a fresh Loop from Planning to Verifying: a
 // Planning success claim advances to Implementing, then an Implementing
 // success claim carrying the 40-hex headCommit pins status.currentVerify and
@@ -383,6 +417,14 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			}
 		}
 
+		// The user-authored check containers carry it too (covers arbitrary
+		// check commands; env-form, not argv).
+		for i := range inits {
+			if strings.HasPrefix(inits[i].Name, "check-") {
+				requireVerifyGitSafeEnv(inits[i], "check container "+inits[i].Name)
+			}
+		}
+
 		By("import-agent mounts the PVC read-only with no creds (fix c)")
 		for _, vm := range inits[1].VolumeMounts {
 			if vm.Name == verifyAgentVol {
@@ -391,6 +433,112 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Expect(vm.Name).NotTo(Equal("git-cred"),
 				"import-agent must not mount the git credential")
 		}
+	})
+
+	It("emits the PhaseIterated Event with the correct from-phase and failing check on a verify iterate (P3)", func() {
+		ns := "s5a-event-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "eventloop"
+		// Two checks so the event text can assert the FIRST failing check's
+		// name + code (check-0 passes, check-1 fails with exit 3).
+		spec := s5aLoopSpec()
+		spec.Verify.AcceptanceChecks = []string{"echo pass0", "echo fail1; exit 3"}
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       spec,
+		})).To(Succeed())
+
+		// A FakeRecorder so the Event text is assertable (the s5aDriveToVerifying
+		// helper builds its own reconciler without one).
+		recorder := record.NewFakeRecorder(64)
+		ctx2 := context.Background()
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		s5aEnsureSandbox(ns, name)
+		s5aReconcile(r, ns, name) // bootstrap Pending -> Planning
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx2, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(ctx2, loop)).To(Succeed())
+		s5aClaimPod(ns, name, "Planning", "")
+		s5aReconcile(r, ns, name)
+		s5aEnsureSandbox(ns, name)
+		s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
+		loop = s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		s5aReconcile(r, ns, name) // verify-1 created
+
+		// The verify evidence: check-0=0, check-1=3.
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPodMultiCheck(ctx2, ns, name, jobName, 2, map[int]int32{1: 3})
+
+		// Drive to the iterate. The Event fires in this reconcile.
+		var iterLoop *coxv1alpha1.Loop
+		for range 10 {
+			iterLoop = s5aReconcile(r, ns, name)
+			if iterLoop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		Expect(iterLoop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(iterLoop.Status.Iteration).To(Equal(2))
+
+		// P3 (mutation: emit nothing on the iterate / wrong from-phase): the
+		// event stream must carry a PhaseIterated event whose message is
+		// 'Verifying -> Implementing (iteration 2, check-1 exit 3)'.
+		var events []string
+	Loop:
+		for {
+			select {
+			case e, ok := <-recorder.Events:
+				if !ok {
+					break Loop
+				}
+				if e != "" {
+					events = append(events, e)
+				}
+			default:
+				break Loop
+			}
+		}
+		var iterEvent string
+		for _, e := range events {
+			if strings.Contains(e, "PhaseIterated") {
+				iterEvent = e
+				break
+			}
+		}
+		Expect(iterEvent).NotTo(BeEmpty(), "the verify iterate must emit a PhaseIterated Event")
+		Expect(iterEvent).To(ContainSubstring("Verifying -> Implementing"),
+			"the iterate event's from-phase must be Verifying (the ACTUAL previous phase)")
+		Expect(iterEvent).To(ContainSubstring("iteration 2"))
+		Expect(iterEvent).To(ContainSubstring("check-1 exit 3"),
+			"the iterate event must name the failing check and its exit code")
+
+		// P3 (mutation: re-consume the stale claim / wrong from-phase): the
+		// event stream must NOT carry a bogus PhaseAdvanced whose from-phase
+		// is the phase the consumed Implementing claim no longer is (the kind
+		// evidence showed 'Planning -> Implementing' at the iterate). The only
+		// forward advances on this run are Planning -> Implementing and
+		// Implementing -> Verifying, each emitted ONCE.
+		for _, e := range events {
+			if strings.Contains(e, "PhaseAdvanced") && strings.Contains(e, "-> ") {
+				Expect(e).NotTo(ContainSubstring("Verifying -> "),
+					"the iterate must NOT be reported as a PhaseAdvanced forward")
+			}
+		}
+		advancedCount := 0
+		for _, e := range events {
+			if strings.Contains(e, "PhaseAdvanced") {
+				advancedCount++
+			}
+		}
+		Expect(advancedCount).To(BeNumerically("<=", 2),
+			"the stale Implementing claim must not be re-consumed into extra PhaseAdvanced events (the kind event stream showed a spurious 'Planning -> Implementing')")
 	})
 
 	It("does NOT advance to Verifying on a malformed headCommit (strict 40-hex, ADR-0005)", func() {
@@ -495,6 +643,47 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		loop = s5aReconcile(r, ns, name)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
 			"clean tamper + all checks 0 -> Succeeded (the B3 gate to Succeeded)")
+	})
+
+	It("reports the FIRST failing check's name and exit code in progress (P2, not a fixed index)", func() {
+		ns := "s5a-failidx-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "failidxloop"
+		// Two checks: check-0 passes, check-1 fails with exit 1. The kind
+		// evidence hit this exact shape ('check-failed: check-0 (exit 0)' when
+		// check-1 exited 1) — the failure mapping must report the first
+		// check-* container with a non-zero exit, with ITS name and code.
+		spec := s5aLoopSpec()
+		spec.Verify.AcceptanceChecks = []string{"echo pass0", "echo fail1; exit 1"}
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       spec,
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name) // verify-1 created
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPodMultiCheck(ctx, ns, name, jobName, 2, map[int]int32{1: 1}) // check-0=0, check-1=1
+
+		var loop *coxv1alpha1.Loop
+		for range 10 {
+			loop = s5aReconcile(r, ns, name)
+			if loop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(loop.Status.Progress).NotTo(BeNil())
+		// P2 (mutation: report a fixed index / the first check's code):
+		// progress must name check-1 with ITS exit code, never check-0.
+		Expect(loop.Status.Progress.LastResultStatus).To(Equal("check-failed: check-1 (exit 1)"),
+			"the iterate progress must name the FIRST non-zero check-* container with its own exit code (kind evidence: 'check-0 (exit 0)' was wrong)")
 	})
 
 	It("maps a non-zero check to iterate (back to Implementing, iteration+1)", func() {

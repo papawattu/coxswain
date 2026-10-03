@@ -119,11 +119,13 @@ log "evidence dir: $OUTDIR"
 # ---------------------------------------------------------------------------
 CONTROLLER_NS="coxswain-system"
 CONTROLLER_DEPLOY="coxswain-controller-manager"
-RUNNER_FLAG=$(kubectl --context "$CTX" -n "$CONTROLLER_NS" get deploy "$CONTROLLER_DEPLOY" \
-	-o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null \
-	| tr ' ' '\n' | grep '^--runner-image=' || true)
+CONTROLLER_ARGS_JSON=$(kubectl --context "$CTX" -n "$CONTROLLER_NS" get deploy "$CONTROLLER_DEPLOY" \
+	-o jsonpath='{.spec.template.spec.containers[0].args}') \
+	|| die "cannot read args of controller deploy $CONTROLLER_NS/$CONTROLLER_DEPLOY on --context $CTX (deployment missing or cluster unreachable); 'make deploy-dev' and retry."
+CONTROLLER_ARGS=$(python3 -c 'import json,sys; [print(a) for a in json.loads(sys.argv[1])]' "$CONTROLLER_ARGS_JSON")
+RUNNER_FLAG=$(grep '^--runner-image=' <<< "$CONTROLLER_ARGS" || true)
 if [ -z "$RUNNER_FLAG" ]; then
-	die "controller deploy $CONTROLLER_NS/$CONTROLLER_DEPLOY has no --runner-image flag (deployment not Available or args missing); the demo needs a real runner entrypoint. 'make deploy-dev' (or 'make deploy' with the image tag set) and retry."
+	die "controller deploy $CONTROLLER_NS/$CONTROLLER_DEPLOY has no --runner-image flag; the sandbox would run 'sleep infinity'. 'make deploy-dev' (or set the image tag and 'make deploy') and retry."
 fi
 RUNNER_IMAGE=${RUNNER_FLAG#--runner-image=}
 [ -n "$RUNNER_IMAGE" ] \
@@ -221,6 +223,10 @@ if kubectl --context "$CTX" -n "$NS" get loop "$LOOP" >/dev/null 2>&1; then
 	kubectl --context "$CTX" -n "$NS" delete loop "$LOOP" --wait=true --timeout=120s \
 		|| kubectl --context "$CTX" -n "$NS" delete loop "$LOOP" --wait=false
 	sleep 5
+	# The terminal-phase sandbox pod can keep restarting briefly (the runner
+	# refuses a non-executable desired phase); wait out its deletion so the
+	# fresh run's events and Jobs start clean.
+	kubectl --context "$CTX" -n "$NS" wait --for=delete "pod/${LOOP}-sandbox" --timeout=120s 2>/dev/null || true
 fi
 log "applying the Loop manifest ($LOOP_RENDER${RUNNER_IMG:+, RUNNER_IMG substituted})"
 kubectl --context "$CTX" apply -f "$LOOP_RENDER"
@@ -247,6 +253,11 @@ while :; do
 	sleep 10
 done
 log "final phase: $PHASE"
+# The sandbox pod keeps restarting after a terminal phase (the runner
+# refuses unknown desired-phases and the operator restarts it), which
+# clutters the event stream; the evidence below filters to the run's own
+# events, but clear the old ones anyway so later re-runs start clean.
+kubectl --context "$CTX" -n "$NS" delete events --field-selector "involvedObject.name=$LOOP" --now=true 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 5. Evidence (operator-side only).
@@ -267,8 +278,21 @@ kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json > "$EV_LOOP_JSON"
 	printf '\n'
 	printf '## Phases (PhaseAdvanced / PhaseIterated events)\n\n'
 	printf '```\n'
-	kubectl --context "$CTX" -n "$NS" get events --field-selector "involvedObject.name=$LOOP" --sort-by=.lastTimestamp \
-		-o custom-columns=TIME=.lastTimestamp,REASON=.reason,MESSAGE=.message --no-headers || true
+	# custom-columns needs <header>:<json-path-expr> pairs (the bare
+	# name=expr form is rejected by kubectl), and --field-selector does
+	# not support namespace (k8s only supports involvedObject.name there),
+	# so filter the loop's events client-side by involvedObject.name
+	# (the events are in $NS anyway; the name is unique per namespace).
+	kubectl --context "$CTX" -n "$NS" get events --sort-by=.lastTimestamp -o json 2>/dev/null \
+		| python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for e in d.get("items", []):
+    if e["involvedObject"].get("name") != sys.argv[1]:
+        continue
+    ts = e.get("lastTimestamp") or ""
+    print("%s  %s  %s" % (ts, e.get("reason", ""), e.get("message", "")))' "$LOOP" \
+		|| true
 	printf '```\n\n'
 	printf '## Final phase, conditions, pins\n\n'
 	printf '```\n'
@@ -288,16 +312,23 @@ kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json > "$EV_LOOP_JSON"
 		if [ -n "${pod:-}" ]; then
 			printf 'init container exit codes (kubelet-recorded):\n\n```\n'
 			kubectl --context "$CTX" -n "$NS" get pod "$pod" -o json \
-				| python3 -c 'import json,sys; [print("- %s: exit=%s (%s)" % (s["name"], ((s.get("state") or {}).get("terminated") or {}).get("exitCode","n/a"), ((s.get("state") or {}).get("terminated") or {}).get("reason","?"))) for s in json.load(sys.stdin)["status"].get("initContainerStatuses", [])]'
+				| python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+stat = {c["name"]: c for c in d["status"].get("initContainerStatuses", [])}
+for c in d["spec"]["initContainers"]:
+    s = stat.get(c["name"], {}).get("state") or {}
+    k = list(s.keys())[0] if s else "never-started"
+    t = s.get(k) or {}
+    print("- %s: exit=%s (%s)" % (c["name"], t.get("exitCode", "n/a"), t.get("reason", k)))'
 			printf '```\n\n'
-			for c in $(kubectl --context "$CTX" -n "$NS" get pod "$pod" -o json | python3 -c 'import json,sys; [print(s["name"]) for s in json.load(sys.stdin)["status"].get("initContainerStatuses", []) if s["name"].startswith("check-")]'); do
-				printf 'check log (%s, tail 15):\n\n```\n' "$c"
+			CHECK_NAMES=$(kubectl --context "$CTX" -n "$NS" get pod "$pod" -o json \
+				| python3 -c 'import json,sys; [print(c["name"]) for c in json.load(sys.stdin)["spec"]["initContainers"] if c["name"].startswith(("check-", "tamper"))]')
+			for c in $CHECK_NAMES; do
+				printf '%s log (tail 15):\n\n```\n' "$c"
 				kubectl --context "$CTX" -n "$NS" logs "$pod" -c "$c" --tail=15 2>&1 || true
 				printf '```\n\n'
 			done
-			printf 'tamper log (tail 5):\n\n```\n'
-			kubectl --context "$CTX" -n "$NS" logs "$pod" -c tamper --tail=5 2>&1 || true
-			printf '```\n\n'
 		fi
 	done
 
@@ -307,8 +338,11 @@ kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json > "$EV_LOOP_JSON"
 	printf '```\n\n'
 
 	printf '## NetworkPolicies\n\n```\n'
-	kubectl --context "$CTX" -n "$NS" get netpol -l "coxswain.io/loop=$LOOP" -o name 2>/dev/null || kubectl --context "$CTX" -n "$NS" get netpol -o name | grep "$LOOP" || true
-	kubectl --context "$CTX" -n "$NS" get netpol -o yaml 2>/dev/null | grep -A 40 "name: $LOOP" || true
+	# The verify netpol is labeled coxswain.io/verify-for, not loop, so the
+	# label selector misses it; filter by name prefix instead (kubectl prints
+	# the full API group in -o name, so strip that first).
+	kubectl --context "$CTX" -n "$NS" get netpol -o name 2>/dev/null | sed 's|^networkpolicy.networking.k8s.io/||' | grep "^$LOOP-" \
+		| while read -r np; do kubectl --context "$CTX" -n "$NS" get netpol "$np" -o yaml; done || true
 	printf '```\n\n'
 
 	printf '## Agent claim (CONTEXT ONLY — never the evidence)\n\n'

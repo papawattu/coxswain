@@ -741,10 +741,14 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 			if ics.State.Terminated != nil {
 				code = ics.State.Terminated.ExitCode
 			} else {
-				// Not terminated: a prior init failed, so this check did not
-				// run (I14 NotRun). The first non-terminated check after a
-				// clean tamper is the failure point.
-				return verifyIterate, false, name, 0
+				// Not terminated: the check is still running or waiting
+				// (kubelet has not advanced it yet). That is PENDING, not a
+				// failure — exactly like a non-terminated tamper: take no
+				// decision and requeue. Treating it as a failure (the S5a
+				// regression) iterated a passing run to Failed:
+				// MaxIterationsExceeded with the misleading text 'check-0
+				// failed (exit 0)'.
+				return verifyNoDecision, true, "", 0
 			}
 			break
 		}

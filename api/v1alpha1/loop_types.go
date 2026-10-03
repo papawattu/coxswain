@@ -35,10 +35,39 @@ const (
 	LoopPhaseAwaitingApproval LoopPhase = "AwaitingApproval"
 	LoopPhaseImplementing     LoopPhase = "Implementing"
 	LoopPhaseVerifying        LoopPhase = "Verifying"
-	LoopPhaseSucceeded        LoopPhase = "Succeeded"
-	LoopPhaseFailed           LoopPhase = "Failed"
-	LoopPhasePaused           LoopPhase = "Paused"
-	LoopPhaseCleaningUp       LoopPhase = "CleaningUp"
+	// LoopPhaseSucceeded is the terminal success phase: a Verify result of
+	// "pass". No more phase-machine work happens for this Loop (the one-shot
+	// fork is done; no re-tasking - ADR-0003). The agent's workspace artifact
+	// is the product; with spec.delivery.mode PullRequest, the deliver Job
+	// then pushes the verified commit and opens the PR (S6) and records it in
+	// status.delivery + the Delivered condition.
+	LoopPhaseSucceeded  LoopPhase = "Succeeded"
+	LoopPhaseFailed     LoopPhase = "Failed"
+	LoopPhasePaused     LoopPhase = "Paused"
+	LoopPhaseCleaningUp LoopPhase = "CleaningUp"
+)
+
+// DeliveredCondition is the S6 delivery condition type (phase Succeeded +
+// spec.delivery.mode == PullRequest only). True + reason Delivered = the
+// verified commit is pushed and the PR is open (see
+// status.delivery). False + reason DeliveryFailed = the deliver Job
+// definitively failed (init/push container failed); the deliver Job is not
+// retried (one Job per verifiedCommit, backoffLimit 0) - the operator
+// re-runs delivery by clearing status.delivery + the condition. False +
+// reason InProgress = the deliver Job has not terminated yet. No condition
+// (absent) = delivery not requested (mode None / unset).
+const DeliveredCondition = "Delivered"
+
+// Delivery condition reasons.
+const (
+	// ReasonDelivered: the verified commit is pushed and the PR is open.
+	ReasonDelivered = "Delivered"
+	// ReasonDeliveryInProgress: the deliver Job has not terminated yet.
+	ReasonDeliveryInProgress = "InProgress"
+	// ReasonDeliveryFailed: the deliver Job definitively failed (an init or
+	// the push container exited non-zero, or the push container reported a
+	// rejection such as "refusing to push to the base branch").
+	ReasonDeliveryFailed = "DeliveryFailed"
 )
 
 // Workspace defines where a Loop's code comes from and how it is
@@ -303,6 +332,14 @@ type LoopSpec struct {
 	// +optional
 	Agent AgentConfig `json:"agent,omitempty"`
 
+	// Delivery configures what happens to a SUCCESSFUL, VERIFIED Loop
+	// (phase Succeeded): mode None (default) leaves the verified commit on
+	// the agent's workspace PVC; mode PullRequest pushes the verified commit
+	// to spec.workspace.repo on branch <branchPrefix><loop-name> and opens a
+	// pull request (draft by default). S6.
+	// +optional
+	Delivery *DeliveryConfig `json:"delivery,omitempty"`
+
 	// policyRefs is the list of AgentPolicy names (in the Loop's namespace) whose
 	// allows the agent may use. The effective policy is the union of their allows
 	// (ADR-0007 Q2). With no policyRefs the agent runs default-deny (the platform
@@ -367,6 +404,16 @@ type LoopStatus struct {
 	// force-pushed branch) and must be treated as no evidence (D27 fail-closed).
 	// +optional
 	CurrentVerify *CurrentVerifyStatus `json:"currentVerify,omitempty"`
+
+	// Delivery records the delivery outcome (S6) once the deliver Job
+	// completes: the branch, the pushed commit (== the verifiedCommit), and
+	// the opened PR's number and URL. nil until delivery has run. Set for
+	// phase Succeeded Loops with spec.delivery.mode == PullRequest (one
+	// deliver Job per verifiedCommit; the operator re-reads the push
+	// container's termination message each reconcile until it is valid or
+	// the Job definitively failed). Written by the operator only.
+	// +optional
+	Delivery *DeliverStatus `json:"delivery,omitempty"`
 
 	// conditions represent the current state of the Loop resource.
 	// Each condition has a unique type and reflects the status of a specific

@@ -88,6 +88,16 @@ func (p podBlindClient) Get(ctx context.Context, key client.ObjectKey, obj clien
 	return p.Client.Get(ctx, key, obj, opts...)
 }
 
+// List is pod-blind the same way Get is: a *corev1.PodList is NotFound (the
+// scoped cache has no pods — the S6 deliver read-back's list path), every
+// other list is served from the wrapped real client.
+func (p podBlindClient) List(ctx context.Context, obj client.ObjectList, opts ...client.ListOption) error {
+	if _, isPodList := obj.(*corev1.PodList); isPodList {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
+	}
+	return p.Client.List(ctx, obj, opts...)
+}
+
 // denyingPhaseGate is the gate mutation: it denies every advance (a future
 // approval hold plugs in here).
 type denyingPhaseGate struct{}
@@ -100,7 +110,16 @@ func (denyingPhaseGate) Allow(_ *coxv1alpha1.Loop, _, _ coxv1alpha1.LoopPhase) (
 var _ = Describe("S4: claim reader mutation checks (I43, real code)", func() {
 	ctx := context.Background()
 
-	s4LoopSpec := coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()}
+	// s4LoopSpec uses an IN-CLUSTER .svc repo: the S4 spec exercises the
+	// claim-read path (the pod-blind Client vs the real apiReader) and must
+	// NOT create an egress proxy — an external repo's unpinned workspace-init
+	// clone would (S6) create one and hold the sandbox Suspended (the I42b
+	// gate), so the phase advance under test would never fire. The .svc repo
+	// keeps the direct repo-peer rule (no proxy hop) and leaves the claim path
+	// as the only thing under test.
+	s4LoopSpec := coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: coxv1alpha1.Workspace{
+		Repo: inClusterRepoURL,
+	}}
 
 	// standinClaimPod creates the stand-in sandbox pod with a terminated agent
 	// carrying a valid claim naming phase (the runner's real claim shape: the

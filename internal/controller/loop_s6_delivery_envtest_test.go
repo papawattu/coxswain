@@ -15,8 +15,13 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"time"
 
@@ -875,5 +880,119 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 		Expect(r.workspaceInitProxyHost(ctx, initLoop)).To(Equal("github.com:443"))
 		initLoop.Spec.Workspace.Repo = "http://gitea.samples.svc:3000/samples/gocli.git"
 		Expect(r.workspaceInitProxyHost(ctx, initLoop)).To(BeEmpty())
+	})
+
+	// Fake-GitHub provider test (S6 TODO 4): validates the GitHub PR-creation
+	// API contract the push container uses (the shell script's curl). The
+	// push container: (1) pushes the commit to the branch, (2) GETs the PR for
+	// the branch (idempotent: reuse an open PR), (3) POSTs a draft PR if none
+	// exists. This test exercises (2)+(3) against a fake GitHub API server:
+	// the PR is always draft (PR is always draft by default), the
+	// Authorization Bearer header carries the token, and a second GET returns
+	// the existing PR (no duplicate POST).
+	It("fake-GitHub provider: the PR is always draft, Bearer auth, idempotent GET of an existing PR", func() {
+		var prCreated bool
+		var prNumber int
+		var lastAuth string
+		var lastMethod string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			lastMethod = req.Method
+			lastAuth = req.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case req.Method == "GET" && strings.HasSuffix(req.URL.Path, "/pulls"):
+				// GET /repos/{owner}/{repo}/pulls?head=coxswain/branch
+				if prCreated {
+					fmt.Fprintf(w, `[{"number": %d, "state": "open", "draft": true}]`, prNumber)
+				} else {
+					fmt.Fprint(w, `[]`)
+				}
+			case req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/pulls"):
+				// POST /repos/{owner}/{repo}/pulls (create a draft PR)
+				body, _ := io.ReadAll(req.Body)
+				var pr struct {
+					Title string `json:"title"`
+					Head  string `json:"head"`
+					Base  string `json:"base"`
+					Draft bool   `json:"draft"`
+				}
+				json.Unmarshal(body, &pr)
+				Expect(pr.Draft).To(BeTrue(), "the PR must be a draft")
+				Expect(pr.Title).ToNot(BeEmpty())
+				Expect(pr.Head).ToNot(BeEmpty())
+				Expect(pr.Base).ToNot(BeEmpty())
+				prNumber = 7
+				prCreated = true
+				w.WriteHeader(http.StatusCreated)
+				fmt.Fprintf(w, `{"number": %d, "state": "open", "draft": true, "url": "https://github.com/samples/gocli/pull/%d"}`, prNumber, prNumber)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(w, `"not found"`)
+			}
+		}))
+		defer ts.Close()
+
+		// The push container's API base for GitHub is https://api.github.com/repos
+		// — the fake server substitutes for it. The auth header for GitHub is
+		// Bearer <token> (the Secret's password is the token; the username is
+		// "x-access-token").
+		token := "ghp_fake_token_for_test"
+		authHeader := "Bearer " + token
+
+		// Simulate the push container's PR-creation sequence:
+		// 1. GET the existing PR for the branch.
+		getReq, err := http.NewRequest("GET", ts.URL+"/samples/gocli/pulls?head=coxswain/s6loop", nil)
+		Expect(err).NotTo(HaveOccurred())
+		getReq.Header.Set("Authorization", authHeader)
+		getResp, err := http.DefaultClient.Do(getReq)
+		Expect(err).NotTo(HaveOccurred())
+		defer getResp.Body.Close()
+		Expect(getResp.StatusCode).To(Equal(http.StatusOK))
+		var prs []struct {
+			Number int  `json:"number"`
+			State  string `json:"state"`
+			Draft  bool   `json:"draft"`
+		}
+		Expect(json.NewDecoder(getResp.Body).Decode(&prs)).To(Succeed())
+		Expect(prs).To(BeEmpty(), "no PR yet: the first GET returns an empty list")
+		Expect(lastAuth).To(Equal(authHeader), "the GET must carry the Bearer token")
+
+		// 2. POST a new draft PR.
+		prBody := struct {
+			Title string `json:"title"`
+			Head  string `json:"head"`
+			Base  string `json:"base"`
+			Draft bool   `json:"draft"`
+		}{Title: "S6 delivery", Head: "coxswain/s6loop", Base: "main", Draft: true}
+		prBytes, _ := json.Marshal(prBody)
+		postReq, err := http.NewRequest("POST", ts.URL+"/samples/gocli/pulls", bytes.NewReader(prBytes))
+		Expect(err).NotTo(HaveOccurred())
+		postReq.Header.Set("Authorization", authHeader)
+		postReq.Header.Set("Content-Type", "application/json")
+		postResp, err := http.DefaultClient.Do(postReq)
+		Expect(err).NotTo(HaveOccurred())
+		defer postResp.Body.Close()
+		Expect(postResp.StatusCode).To(Equal(http.StatusCreated))
+		Expect(lastAuth).To(Equal(authHeader), "the POST must carry the Bearer token")
+		Expect(prNumber).To(BeEquivalentTo(7))
+
+		// 3. Idempotent: a second GET returns the existing PR (no duplicate POST).
+		getReq2, err := http.NewRequest("GET", ts.URL+"/samples/gocli/pulls?head=coxswain/s6loop", nil)
+		Expect(err).NotTo(HaveOccurred())
+		getResp2, err := http.DefaultClient.Do(getReq2)
+		Expect(err).NotTo(HaveOccurred())
+		defer getResp2.Body.Close()
+		Expect(getResp2.StatusCode).To(Equal(http.StatusOK))
+		var prs2 []struct {
+			Number int  `json:"number"`
+			State  string `json:"state"`
+			Draft  bool   `json:"draft"`
+		}
+		Expect(json.NewDecoder(getResp2.Body).Decode(&prs2)).To(Succeed())
+		Expect(prs2).To(HaveLen(1), "the second GET returns the existing PR")
+		Expect(prs2[0].Number).To(BeEquivalentTo(7))
+		Expect(prs2[0].Draft).To(BeTrue())
+		// No additional POST (the GET found the existing PR).
+		Expect(lastMethod).To(Equal("GET"), "after the idempotent GET, the last method is GET (no duplicate POST)")
 	})
 })

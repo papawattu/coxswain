@@ -89,7 +89,7 @@ type DeliveryConfig struct {
 	// command requires the workflow scope the token lacks).
 	// +kubebuilder:default=true
 	// +optional
-	Draft bool `json:"draft,omitempty"`
+	Draft *bool `json:"draft,omitempty"`
 }
 
 // DeliverStatus records the operator's delivery outcome (S6). Written by

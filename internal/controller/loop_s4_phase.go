@@ -110,6 +110,13 @@ type PhaseClaim struct {
 	// Iteration is the .coxswain/iteration the runner read (the operator's
 	// iteration marker file). OS1 only.
 	Iteration int `json:"iteration,omitempty"`
+	// S5a (B3): the runner's committed-head SHA (40-hex) for a completed
+	// Implementing run. The operator strictly validates the shape on the
+	// advance path and pins it to status.currentVerify.verifiedCommit on the
+	// Implementing -> Verifying advance (the verify Job checks out exactly
+	// this SHA, D11). A missing/malformed headCommit blocks the advance
+	// (ADR-0005: no evidence, no advance).
+	HeadCommit string `json:"headCommit,omitempty"`
 }
 
 // parsePhaseClaim strict-parses a termination message into a PhaseClaim
@@ -152,6 +159,19 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 			return nil, fmt.Errorf("claim.iteration is not an integer: %w", err)
 		}
 		claim.Iteration = it
+	}
+	// S5a (B3): headCommit, when present, must be a strict 40-hex commit SHA
+	// (the operator pins it to status.currentVerify.verifiedCommit on the
+	// Implementing -> Verifying advance; a malformed value is a malformed
+	// claim, not a pin). An absent headCommit is valid (pre-S5a runners and
+	// non-Implementing phases carry none).
+	if v, ok := raw["headCommit"]; ok {
+		if err := json.Unmarshal(v, &claim.HeadCommit); err != nil {
+			return nil, fmt.Errorf("claim.headCommit is not a string: %w", err)
+		}
+		if claim.HeadCommit != "" && !isCommitSHA(claim.HeadCommit) {
+			return nil, fmt.Errorf("claim.headCommit %q is not a 40-hex commit SHA", claim.HeadCommit)
+		}
 	}
 	claim.ObservedPhase = coxv1alpha1.LoopPhase(op)
 	// Review P3: the claimed phase must be one the runner can claim
@@ -354,6 +374,21 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 	// phase AND the gate allows it (option B: the gate always allows).
 	next := nextPhase(loop.Status.Phase, claimPhaseForAdvance(claim))
 	if next != loop.Status.Phase {
+		// S5a (B3, ADR-0005): the Implementing -> Verifying advance pins the
+		// runner's committed head to status.currentVerify.verifiedCommit. The
+		// pin requires a VALID headCommit in the claim (40-hex, strict-parsed
+		// by parsePhaseClaim); a success claim without one is NOT a valid
+		// Implementing completion (no evidence to verify) — the advance is
+		// held (the claim is still recorded into progress, OS1) and the Loop
+		// stays in Implementing. A blocked claim never advances (nextPhase
+		// returns the current phase for a non-success status).
+		if next == coxv1alpha1.LoopPhaseVerifying && claim.HeadCommit == "" {
+			if loop.Status.ObservedPhase != claim.ObservedPhase {
+				loop.Status.ObservedPhase = claim.ObservedPhase
+				changed = true
+			}
+			return changed, false
+		}
 		gate := r.phaseGate
 		if gate == nil {
 			gate = autoApprovePhaseGate{}
@@ -362,6 +397,17 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 		if allow {
 			loop.Status.Phase = next
 			loop.Status.DesiredPhase = next
+			if next == coxv1alpha1.LoopPhaseVerifying {
+				// Pin the CURRENT iteration's verified commit (D11): the
+				// verify Job (ensureVerifyJob) checks out exactly this SHA and
+				// the tamper check diffs baseCommit..this SHA. The pin is the
+				// operator's (written from the claim, never by the runner);
+				// a verify Job naming a different commit is stale evidence
+				// (D24 fail-closed).
+				loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{
+					VerifiedCommit: claim.HeadCommit,
+				}
+			}
 			advanced = true
 			changed = true
 		}

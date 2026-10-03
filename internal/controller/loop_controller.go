@@ -298,6 +298,10 @@ type LoopReconciler struct {
 // NetworkEnforced condition changes (the probe Runnable's re-gate Event lives
 // in internal/cni; this is the condition-change Event the reconcile side emits).
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// S5a (B3): the operator owns the per-Loop verify Job (ensureVerifyJob + the
+// exit-code reader; the Job runs the operator's trusted check containers, not
+// agent code).
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch;delete
 
 // agentPoliciesValid runs the C6a AgentPolicy validation gate: when the
 // referenced AgentPolicies are invalid it sets PolicyValid=False and suspends
@@ -435,6 +439,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// (iteration count). See internal/controller/loop_s4_phase.go.
 	claimReadPending, s4Changed := r.advancePhaseFromClaim(ctx, &loop)
 	changed = changed || s4Changed
+	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
+	// isolated evidence path). The Job is created when the current pin exists
+	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
+	// Verifying advance) and its init containers' exit codes drive the
+	// Verifying outcome (Succeeded | iterate | TamperedVerify). The
+	// applyVerifyOutcome reader runs every reconcile at Verifying (the B2
+	// tamper gate ALSO runs every reconcile below — order-independent, D38
+	// pattern).
+	if err := r.ensureVerifyJob(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureVerifyNetworkPolicy(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+	verifyChanged, verifyRequeue := r.applyVerifyOutcome(ctx, &loop)
+	changed = changed || verifyChanged
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
 	// gate (see applyTamperGate for the tri-state logic). The gate must run
 	// every reconcile — calling it into a local and only then OR-ing into
@@ -487,7 +507,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	if baseCommitPending || claimReadPending {
+	if baseCommitPending || claimReadPending || verifyRequeue {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil

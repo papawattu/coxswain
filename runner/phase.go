@@ -59,6 +59,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -261,6 +262,17 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 			func(answer string) { writePlan(cfg.Workspace, answer, planCap) })
 	case PhaseImplementing:
 		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation)
+		// S5a (B3): at the end of a successful Implementing, commit the work in
+		// the workspace repo (excluding the operator-owned .coxswain dir) and
+		// record the head SHA in the claim. A CLAIM (ADR-0005): the operator
+		// strictly validates the 40-hex shape before pinning it to
+		// status.currentVerify.verifiedCommit; a failed commit leaves the field
+		// empty (the operator then blocks the advance). On a BLOCKED run the
+		// work is not committed (nothing succeeded) and the claim carries no
+		// headCommit (no evidence to pin).
+		if res.Status == statusSuccess {
+			res.HeadCommit = commitWorkspace(cfg.Workspace)
+		}
 	default:
 		// Unknown phase (a typo, or a phase the runner does not execute,
 		// e.g. Verifying is operator-owned per ADR-0005). Report it as
@@ -420,8 +432,9 @@ func writeClaim(path string, res Result) {
 		ObservedPhase string `json:"observedPhase"`
 		Status        string `json:"status"`
 		BlockedReason string `json:"blockedReason,omitempty"`
+		HeadCommit    string `json:"headCommit,omitempty"`
 	}
-	c := claim{ObservedPhase: res.ObservedPhase, Status: res.Status, BlockedReason: res.VerificationNotes}
+	c := claim{ObservedPhase: res.ObservedPhase, Status: res.Status, BlockedReason: res.VerificationNotes, HeadCommit: res.HeadCommit}
 	data, err := json.Marshal(c)
 	if err != nil {
 		log.Printf("runner: claim marshal: %v", err)
@@ -441,6 +454,44 @@ func writeClaim(path string, res Result) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		log.Printf("runner: claim write to %s: %v", path, err)
 	}
+}
+
+// commitWorkspace (S5a, B3) commits the workspace repo's uncommitted work
+// (everything except the operator-owned .coxswain result dir) and returns the
+// new head commit's 40-hex SHA. The commit identity is fixed (the agent's
+// commit, never an operator or a system identity): git -c user.name=coxswain
+// agent -c user.email=agent@localhost. A no-op commit (nothing to commit)
+// returns the EXISTING head SHA — the verification target is still the repo
+// head, even when the agent's changes were already committed during the
+// phase run. It returns "" on any failure (a non-git workspace, a failed
+// add/commit, a short/uppercase SHA): the caller leaves the claim's
+// headCommit empty and the operator blocks the Verifying advance
+// (ADR-0005 fail-closed — no evidence, no advance). The .coxswain exclusion
+// is a pathspec so the operator's result files (result.json, PLAN.md,
+// desired-phase, the conversation state) never enter the verified commit.
+func commitWorkspace(workspace string) string {
+	// git add -A (the whole workspace, .coxswain excluded via a pathspec
+	// negation: `:(exclude).coxswain`). A failure (not a git repo) is the
+	// "" path.
+	add := exec.Command("git", "-C", workspace, "add", "-A", "--", ":(exclude).coxswain")
+	if out, err := add.CombinedOutput(); err != nil {
+		log.Printf("runner: workspace commit add: %v: %s", err, string(out))
+		return ""
+	}
+	commit := exec.Command("git", "-C", workspace,
+		"-c", "user.name=coxswain-agent", "-c", "user.email=agent@localhost",
+		"commit", "-m", "coxswain: implement")
+	if out, err := commit.CombinedOutput(); err != nil {
+		// A 'nothing to commit' (exit 1, no new commit) is NOT a failure: the
+		// head SHA is still the verification target.
+		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", err, string(out))
+	}
+	out, err := exec.Command("git", "-C", workspace, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		log.Printf("runner: workspace rev-parse: %v: %s", err, string(out))
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // readDesiredPhase reads <workspace>/.coxswain/desired-phase and returns the

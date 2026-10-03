@@ -38,6 +38,7 @@ import (
 	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -259,10 +260,19 @@ type LoopReconciler struct {
 	// the 'sleep infinity' stand-in (an explicit opt-out for debugging pods
 	// and non-runner images). There is NO runner detection by image name
 	// beyond this exact match / empty — a Loop's image is only ever run as
-	// the runner when it IS the runner the operator configured. Empty (most
-	// envtests) means no Loop is run as the runner: every agent keeps
-	// 'sleep infinity'.
+	// the runner when it IS the runner the operator configured.
+	// Empty (most envtests) means no Loop is run as the runner: every agent
+	// keeps 'sleep infinity'.
 	RunnerImage string
+
+	// VerifyImage is the DEFAULT image the verify Job's check-* containers
+	// run when a Loop declares acceptance checks WITHOUT spec.verify.image
+	// (S5a). The checks are user commands that may need a toolchain (`go
+	// test` needs a Go image), so the default is a Go image; the trusted
+	// git image (WorkspaceGitImage) is NOT usable here (it has no Go).
+	// Settable via --verify-image so the operator (not the Loop) can pick a
+	// different default. spec.verify.image always wins over this flag.
+	VerifyImage string
 
 	// PodCIDR / ServiceCIDR are the cluster's pod and service CIDRs (I42e +
 	// I42c NetworkPolicy carve-outs). Read from the operator's environment
@@ -298,6 +308,10 @@ type LoopReconciler struct {
 // NetworkEnforced condition changes (the probe Runnable's re-gate Event lives
 // in internal/cni; this is the condition-change Event the reconcile side emits).
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// S5a (B3): the operator owns the per-Loop verify Job (ensureVerifyJob + the
+// exit-code reader; the Job runs the operator's trusted check containers, not
+// agent code).
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch;delete
 
 // agentPoliciesValid runs the C6a AgentPolicy validation gate: when the
 // referenced AgentPolicies are invalid it sets PolicyValid=False and suspends
@@ -435,6 +449,37 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// (iteration count). See internal/controller/loop_s4_phase.go.
 	claimReadPending, s4Changed := r.advancePhaseFromClaim(ctx, &loop)
 	changed = changed || s4Changed
+	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
+	// isolated evidence path). The Job is created when the current pin exists
+	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
+	// Verifying advance) and its init containers' exit codes drive the
+	// Verifying outcome (Succeeded | iterate | TamperedVerify). The
+	// applyVerifyOutcome reader runs every reconcile at Verifying (the B2
+	// tamper gate ALSO runs every reconcile below — order-independent, D38
+	// pattern).
+	//
+	// The stale-Job guard (D27) returns verifyStaleDeleted when it has just
+	// deleted a Job stamped for a different pin. The caller maps it to a
+	// clean requeue (the 5s RequeueAfter in the FINAL return, AFTER the
+	// shared Status().Update) — never a controller error, and never an
+	// in-same-reconcile create of the fresh Job (the name is still taken;
+	// the apiserver deletes async, so a Create here would hit AlreadyExists
+	// and the new pin would be left un-built). The requeue creates the fresh
+	// Job on the next reconcile.
+	verifyRequeue := false
+	if err := r.ensureVerifyJob(ctx, &loop); err != nil {
+		if errors.Is(err, errVerifyStaleDeleted) {
+			verifyRequeue = true
+		} else {
+			return ctrl.Result{}, err
+		}
+	}
+	if err := r.ensureVerifyNetworkPolicy(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
+	changed = changed || verifyChanged
+	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
 	// gate (see applyTamperGate for the tri-state logic). The gate must run
 	// every reconcile — calling it into a local and only then OR-ing into
@@ -487,7 +532,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	if baseCommitPending || claimReadPending {
+	if baseCommitPending || claimReadPending || verifyRequeue {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
@@ -948,21 +993,27 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// S4 (ADR-0004): the phase-init container materialises the operator's
 	// status.desiredPhase into <workspace>/.coxswain/desired-phase (the
 	// runner's read channel; the operator is the sole writer of the phase —
-	// ADR-0004). The runner is one-shot per phase: it reads the desired
-	// phase, does that phase's work, and exits with the claim in its
-	// termination message. It is ALWAYS present (the phase machine is core,
-	// not workspace-gated) and runs AFTER the workspace init so the
-	// .coxswain dir exists (the workspace init creates it; a fresh emptyDir
-	// has none). A fresh phase-init per pod recreation is the mechanism that
-	// re-writes the desired phase after a phase advance (recycleSandboxForPhase
-	// deletes the sandbox; this init re-runs on the new pod). The phase value
-	// is a fixed enum (CRD-validated on status.desiredPhase), but it is
-	// shell-quoted anyway (the init script is sh -c; an unusual-but-valid
-	// value must not inject).
+	// ADR-0004) AND status.iteration into <workspace>/.coxswain/iteration
+	// (the runner's iteration marker). The runner is one-shot per phase: it
+	// reads the desired phase, does that phase's work, and exits with the
+	// claim in its termination message. It is ALWAYS present (the phase
+	// machine is core, not workspace-gated) and runs AFTER the workspace init
+	// so the .coxswain dir exists (the workspace init creates it; a fresh
+	// emptyDir has none). A fresh phase-init per pod recreation is the
+	// mechanism that re-writes the desired phase after a phase advance
+	// (recycleSandboxForPhase deletes the sandbox; this init re-runs on the
+	// new pod). The phase value is a fixed enum (CRD-validated on
+	// status.desiredPhase), but it is shell-quoted anyway (the init script is
+	// sh -c; an unusual-but-valid value must not inject). The iteration value
+	// is the authoritative iteration count (CRD-validated integer): a verify
+	// iterate (failed check -> Implementing, iteration+1) writes a NEW value,
+	// so the runner's stale-iteration guard (ADR-0005 D11) discards the prior
+	// success result.json and does fresh model work against the failing
+	// check instead of re-emitting the old claim.
 	initContainers = append(initContainers, corev1.Container{
 		Name:    phaseInitContainerName,
 		Image:   r.workspaceGitImage(),
-		Command: []string{"/bin/sh", "-c", phaseInitScript(loop.Status.DesiredPhase)},
+		Command: []string{"/bin/sh", "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration)},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
 		},
@@ -3210,7 +3261,7 @@ func shellQuote(s string) string {
 // must not inject). An EMPTY desired phase writes nothing (the runner waits
 // for the operator to set one; the operator's first reconcile sets
 // status.desiredPhase = Planning for a fresh Loop — see the S4 advance path).
-func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase) string {
+func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase, iteration int) string {
 	if desiredPhase == "" {
 		return `#!/bin/sh
 set -eu
@@ -3226,6 +3277,10 @@ set -eu
 DEST=/workspace
 mkdir -p "${DEST}/.coxswain"
 printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"
+# The iteration marker (S5a: the verify iterate bumps status.iteration and
+# recycles the pod; the runner's stale-iteration guard uses this file to
+# discard the prior success result and do fresh model work).
+printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswain/iteration"
 `
 }
 
@@ -3312,6 +3367,8 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
+		// B3: the operator owns the per-Loop verify Job (ensureVerifyJob).
+		Owns(&batchv1.Job{}).
 		// Watch AgentPolicy: when a referenced policy is created, edited, or
 		// deleted, re-reconcile the Loops that reference it (R15 round 4 P2:
 		// a policy created after its Loop must not leave the Loop stuck at

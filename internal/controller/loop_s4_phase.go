@@ -110,6 +110,13 @@ type PhaseClaim struct {
 	// Iteration is the .coxswain/iteration the runner read (the operator's
 	// iteration marker file). OS1 only.
 	Iteration int `json:"iteration,omitempty"`
+	// S5a (B3): the runner's committed-head SHA (40-hex) for a completed
+	// Implementing run. The operator strictly validates the shape on the
+	// advance path and pins it to status.currentVerify.verifiedCommit on the
+	// Implementing -> Verifying advance (the verify Job checks out exactly
+	// this SHA, D11). A missing/malformed headCommit blocks the advance
+	// (ADR-0005: no evidence, no advance).
+	HeadCommit string `json:"headCommit,omitempty"`
 }
 
 // parsePhaseClaim strict-parses a termination message into a PhaseClaim
@@ -152,6 +159,19 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 			return nil, fmt.Errorf("claim.iteration is not an integer: %w", err)
 		}
 		claim.Iteration = it
+	}
+	// S5a (B3): headCommit, when present, must be a strict 40-hex commit SHA
+	// (the operator pins it to status.currentVerify.verifiedCommit on the
+	// Implementing -> Verifying advance; a malformed value is a malformed
+	// claim, not a pin). An absent headCommit is valid (pre-S5a runners and
+	// non-Implementing phases carry none).
+	if v, ok := raw["headCommit"]; ok {
+		if err := json.Unmarshal(v, &claim.HeadCommit); err != nil {
+			return nil, fmt.Errorf("claim.headCommit is not a string: %w", err)
+		}
+		if claim.HeadCommit != "" && !isCommitSHA(claim.HeadCommit) {
+			return nil, fmt.Errorf("claim.headCommit %q is not a 40-hex commit SHA", claim.HeadCommit)
+		}
 	}
 	claim.ObservedPhase = coxv1alpha1.LoopPhase(op)
 	// Review P3: the claimed phase must be one the runner can claim
@@ -280,10 +300,12 @@ func (autoApprovePhaseGate) Allow(_ *coxv1alpha1.Loop, _, _ coxv1alpha1.LoopPhas
 	return true, ""
 }
 
-// phaseAdvancedReason is the stable Event reason the operator emits on every
-// phase transition (OS5, R19: "stable reasons, e.g. PhaseAdvanced"). The
-// reason is a fixed string (documented as an API); the message carries the
-// from/to phases.
+// phaseAdvancedReason is the stable Event reason the operator emits on a
+// FORWARD phase transition (OS5, R19: "stable reasons, e.g. PhaseAdvanced").
+// The reason is a fixed string (documented as an API); the message carries
+// the from/to phases. The verify ITERATE (Verifying -> Implementing) is
+// distinct: it emits verifyIteratedReason (PhaseIterated, loop_verify_job.go)
+// — an iterate is not a forward advance.
 const phaseAdvancedReason = "PhaseAdvanced"
 
 // claimPhaseForAdvance maps the runner's claim (ADR-0004) to the phase the
@@ -352,8 +374,31 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 	}
 	// B1 + OS8: advance one step when the claim names the immediate-next
 	// phase AND the gate allows it (option B: the gate always allows).
+	// S5a hot-loop guard: the advance requires the claim's ObservedPhase to
+	// match the CURRENT phase (loop.Status.Phase). A stale claim from a
+	// previous phase (e.g., an Implementing claim left on the pod after a
+	// verify-iterate back to Implementing) must NOT re-advance: the runner
+	// has not re-run that phase, so the claim is evidence for a phase that
+	// is no longer current. Without this guard, the one-shot claim is
+	// re-consumed forever (the kind hot-loop: verify-2..verify-9 flooding).
+	claimPhaseIsCurrent := claim.ObservedPhase == loop.Status.Phase
 	next := nextPhase(loop.Status.Phase, claimPhaseForAdvance(claim))
-	if next != loop.Status.Phase {
+	if next != loop.Status.Phase && claimPhaseIsCurrent {
+		// S5a (B3, ADR-0005): the Implementing -> Verifying advance pins the
+		// runner's committed head to status.currentVerify.verifiedCommit. The
+		// pin requires a VALID headCommit in the claim (40-hex, strict-parsed
+		// by parsePhaseClaim); a success claim without one is NOT a valid
+		// Implementing completion (no evidence to verify) — the advance is
+		// held (the claim is still recorded into progress, OS1) and the Loop
+		// stays in Implementing. A blocked claim never advances (nextPhase
+		// returns the current phase for a non-success status).
+		if next == coxv1alpha1.LoopPhaseVerifying && claim.HeadCommit == "" {
+			if loop.Status.ObservedPhase != claim.ObservedPhase {
+				loop.Status.ObservedPhase = claim.ObservedPhase
+				changed = true
+			}
+			return changed, false
+		}
 		gate := r.phaseGate
 		if gate == nil {
 			gate = autoApprovePhaseGate{}
@@ -362,6 +407,17 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 		if allow {
 			loop.Status.Phase = next
 			loop.Status.DesiredPhase = next
+			if next == coxv1alpha1.LoopPhaseVerifying {
+				// Pin the CURRENT iteration's verified commit (D11): the
+				// verify Job (ensureVerifyJob) checks out exactly this SHA and
+				// the tamper check diffs baseCommit..this SHA. The pin is the
+				// operator's (written from the claim, never by the runner);
+				// a verify Job naming a different commit is stale evidence
+				// (D24 fail-closed).
+				loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{
+					VerifiedCommit: claim.HeadCommit,
+				}
+			}
 			advanced = true
 			changed = true
 		}
@@ -429,6 +485,56 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			"loop", loop.Name)
 		claimReadPending = true
 	} else if claim != nil {
+		// S5a stale-iteration guard (ADR-0005 D11): a claim from an EARLIER
+		// iteration is ignored — no advance, no progress write. The claim
+		// carries the .coxswain/iteration the operator's phase-init wrote when
+		// the pod was created (the runner reads it and echoes it into the
+		// claim); loop.Status.Iteration is the operator's authoritative count.
+		// After a verify iterate (a failed check -> Implementing,
+		// iteration+1) the OLD pod — still holding the prior iteration's
+		// success claim — is the one being reconciled until the desired-phase
+		// recycle replaces it. Without this guard, the stale claim (observed
+		// phase matches the current phase) would re-advance with the SAME old
+		// headCommit, pinning a stale verify and hot-looping. A claim whose
+		// iteration equals the current status iteration (or an empty marker,
+		// claim.Iteration == 0, which phase-init never writes) is CURRENT:
+		// the first-cycle claims (status.iteration 0) and every post-recycle
+		// claim (phase-init writes the current iteration each recycle) pass.
+		if claim.Iteration > 0 && claim.Iteration != loop.Status.Iteration {
+			logf.FromContext(ctx).Info("stale claim from a previous iteration ignored",
+				"claimIteration", claim.Iteration,
+				"statusIteration", loop.Status.Iteration)
+			return false, false
+		}
+		// S5a (OS5 P3): a CONSUMED claim is discarded, not re-consumed.
+		// advancePhaseFromClaim runs every reconcile while the phase is not
+		// terminal, and the operator never acknowledges a claim — so without
+		// this guard a success claim is re-read on EVERY reconcile until the
+		// pod is recycled. Two wrong behaviors follow: recordPhaseClaim
+		// re-stamps progress with the same-second claim data (a 5s status
+		// churn while a phase runs), and the advance path would RE-emit the
+		// PhaseAdvanced Event with a WRONG from-phase (the kind event stream
+		// showed a spurious 'Planning -> Implementing' at the verify iterate:
+		// the prior cycle's Implementing success claim, still on the pod, was
+		// re-consumed against the phase the Loop was in when that reconcile
+		// ran, never the phase the claim had actually advanced). The guard:
+		// a SUCCESS claim whose observedPhase no longer matches the CURRENT
+		// phase has already been consumed (its advance happened in an earlier
+		// reconcile and moved the phase away; the pod has not been recycled
+		// yet) — log and discard: no progress write, no advance, no event.
+		// A claim whose observedPhase matches the current phase is the one
+		// this reconcile consumes; its advance (if any) moves the phase AWAY
+		// from the claimed phase, so the same pod's claim is discarded on the
+		// very next reconcile. A BLOCKED claim still rides into progress (OS1
+		// observability of the runner's last word is unchanged) — a blocked
+		// claim never advances, so re-stamping it is idempotent and it is the
+		// runner's status, not a stale advance.
+		if claim.Status == claimSuccess && claim.ObservedPhase != loop.Status.Phase {
+			logf.FromContext(ctx).Info("claim already consumed (observedPhase no longer matches the current phase); discarding",
+				"observedPhase", claim.ObservedPhase,
+				"currentPhase", loop.Status.Phase)
+			return false, false
+		}
 		// S4 review P2 (R18): the clock is injected (r.now, defaulting to
 		// metav1.Now) so a test can advance it more than 1s between reconciles
 		// (metav1.Time marshals at 1-second precision: two same-second

@@ -267,8 +267,8 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		// empty DIRECTORY, and without the items list a Secret with OTHER keys
 		// would mount them too.
 		Expect(credVol.Secret.Items).To(Equal([]corev1.KeyToPath{
-			{Key: "username", Path: "username"},
-			{Key: "password", Path: "password"},
+			{Key: workspaceCredsUsernameKey, Path: workspaceCredsUsernameKey},
+			{Key: workspaceCredsPasswordKey, Path: workspaceCredsPasswordKey},
 		}), "the credential volume must mount ONLY the basic-auth 'username' and 'password' keys")
 		// The init container mounts the volume directory (the items mapping
 		// already restricts it); a SubPath on top would re-enter the same key

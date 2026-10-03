@@ -133,6 +133,10 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		return loop, nn
 	}
 
+	// b1HeadCommit is a 40-hex SHA the post-S5a runner reports on a successful
+	// Implementing claim (the B3 MVP gate: no headCommit, no advance to Verifying).
+	const b1HeadCommit = "e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6" // 40-hex
+
 	// oneShotRun stands in for ONE one-shot runner run of the CURRENT phase:
 	// recreate the stand-in sandbox + pod (the operator's recycle deleted
 	// them), write the agent's terminated status with the claim, and
@@ -158,8 +162,15 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 			// phase), the status of that execution, and an empty
 			// blockedReason on success. This is the exact strict-JSON object
 			// the live runner writes to /dev/termination-log.
-			writeAgentTermination(nn.Namespace, nn.Name, fmt.Sprintf(
-				`{"observedPhase":"%s","status":"success","blockedReason":""}`, claimed))
+			msg := fmt.Sprintf(`{"observedPhase":"%s","status":"success","blockedReason":""`, claimed)
+			if claimed == coxv1alpha1.LoopPhaseImplementing {
+				// S5a (B3 MVP gate): a success Implementing claim carries the
+				// 40-hex headCommit (the post-S5a runner always commits + reports
+				// the head), or the operator will not advance to Verifying.
+				msg += `,"headCommit":"` + b1HeadCommit + `"`
+			}
+			msg += `}`
+			writeAgentTermination(nn.Namespace, nn.Name, msg)
 		}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
@@ -518,10 +529,15 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		createStandinPod(ns, "pinslp")
 		// Pin the baseCommit directly (the S3 init-container read-back is
 		// stubbed here; the spec asserts on the operator's pins in progress,
-		// not on the S3 read-back itself).
+		// not on the S3 read-back itself). S5a stale-iteration guard: the
+		// claim below carries iteration 3 (the .coxswain/iteration the runner
+		// read); for the guard to treat it as CURRENT, status.iteration must
+		// equal 3 (the operator's authoritative count — the pod's phase-init
+		// wrote the same value when it was created).
 		pinsLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, pinsLoop)).To(Succeed())
 		pinsLoop.Status.BaseCommit = s3BaseCommitSHA
+		pinsLoop.Status.Iteration = 3
 		Expect(k8sClient.Status().Update(ctx, pinsLoop)).To(Succeed())
 		pod := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "pinslp-sandbox", Namespace: ns}, pod)).To(Succeed())
@@ -612,7 +628,12 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 			"a claim at Verifying must not touch status.observedPhase (the hold returns before any claim handling)")
 		Expect(loop.Status.Progress).To(Equal(progressAtVerifying),
 			"a claim at Verifying must not rewrite progress (no churn from the runner's crash-loop or a stale claim)")
-		Expect(res.RequeueAfter).To(BeZero(), "the Verifying hold must not requeue on a claim (the requeue belongs to the B3 verify Job)")
+		// S5a (B3): at Verifying the requeue is driven by the verify Job's pod
+		// read (no pod yet -> requeue until the evidence lands), NOT by the
+		// runner claim. The operator still ignores the claim (no advance, no
+		// progress rewrite) — only the requeue source moved to the verify Job.
+		Expect(res.RequeueAfter).ToNot(BeZero(),
+			"at Verifying the requeue comes from the verify Job's pod read (no pod yet), not from the runner claim")
 		events := drainEvents(recorder)
 		Expect(events).NotTo(ContainElement(ContainSubstring(phaseAdvancedReason)), "no advance at Verifying -> no PhaseAdvanced Event")
 	})

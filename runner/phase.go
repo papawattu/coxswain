@@ -59,6 +59,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -234,12 +235,41 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// Restart-safety: the sandbox pod's restartPolicy is Always, so a
 	// one-shot exit RESTARTS the agent container and re-runs the phase.
 	// If result.json already holds a COMPLETED claim for the current
-	// desired phase (status=success, observedPhase == phase), this restart
-	// must NOT call the model again — it re-emits the prior claim to the
-	// termination log (exit 0) and stops. A BLOCKED claim is NOT re-emitted:
-	// it may retry (the model failure was likely transient), and the
-	// kubelet's back-off caps the retry rate.
-	if res, done := priorCompletedResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), phase); done {
+	// desired phase (status=success, observedPhase == phase, iteration ==
+	// current .coxswain/iteration), this restart must NOT call the model
+	// again — it re-emits the prior claim to the termination log (exit 0)
+	// and stops. For Implementing, a stored success WITHOUT a headCommit
+	// triggers a re-commit (cheap, no model call) before re-emitting: the
+	// first run's commit may have failed transiently, and the claim must
+	// never carry an Implementing success without a valid 40-hex headCommit.
+	// A BLOCKED claim is NOT re-emitted: it may retry (the model failure was
+	// likely transient), and the kubelet's back-off caps the retry rate.
+	// A stale-iteration result (the operator sent the Loop back to the same
+	// phase for a new iteration) is NOT reused: the phase must run again
+	// with fresh model work.
+	curIterForPrior := readIteration(cfg.Workspace)
+	if res, done := priorCompletedResult(
+		filepath.Join(cfg.Workspace, resultDirName, resultFileName), phase, claimIteration(curIterForPrior),
+	); done {
+		// S5a (B3): an Implementing success without a headCommit re-commits
+		// (the first run's commit may have failed; the workspace is on the
+		// PVC so the work is still there). Never emit an Implementing success
+		// claim without a valid 40-hex headCommit: if the re-commit also
+		// fails, the claim is blocked (the operator holds the advance).
+		if phase == PhaseImplementing && res.HeadCommit == "" {
+			if sha := commitWorkspace(cfg.Workspace); sha != "" {
+				res.HeadCommit = sha
+				log.Printf("runner: headCommit=%s (re-committed on restart)", sha)
+				// Persist the fixed result so future restarts see it.
+				_ = writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res)
+			} else {
+				log.Printf("runner: commitWorkspace failed on restart; emitting blocked claim")
+				res.Status = statusBlocked
+				res.VerificationNotes = "commit failed: re-commit on restart returned empty headCommit"
+				writeClaim(claimWritePath, res)
+				return res
+			}
+		}
 		writeClaim(claimWritePath, res)
 		return res
 	}
@@ -261,6 +291,29 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 			func(answer string) { writePlan(cfg.Workspace, answer, planCap) })
 	case PhaseImplementing:
 		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation)
+		// S5a (B3): at the end of a successful Implementing, commit the work in
+		// the workspace repo (excluding the operator-owned .coxswain dir) and
+		// record the head SHA in the claim. A CLAIM (ADR-0005): the operator
+		// strictly validates the 40-hex shape before pinning it to
+		// status.currentVerify.verifiedCommit; a failed commit leaves the field
+		// empty (the operator then blocks the advance). On a BLOCKED run the
+		// work is not committed (nothing succeeded) and the claim carries no
+		// headCommit (no evidence to pin).
+		if res.Status == statusSuccess {
+			sha := commitWorkspace(cfg.Workspace)
+			if sha != "" {
+				res.HeadCommit = sha
+				log.Printf("runner: headCommit=%s", sha)
+			} else {
+				// A failed commit leaves the field empty and the operator holds
+				// the advance (ADR-0005 fail-closed). Log explicitly so the
+				// evidence survives (the first run's commit failure was lost
+				// because there was no log; the restart-safety path would then
+				// re-emit the same headCommit-less claim forever).
+				log.Printf("runner: commitWorkspace returned empty headCommit; " +
+					"emitting success claim without headCommit (operator will hold the advance)")
+			}
+		}
 	default:
 		// Unknown phase (a typo, or a phase the runner does not execute,
 		// e.g. Verifying is operator-owned per ADR-0005). Report it as
@@ -296,15 +349,18 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 }
 
 // priorCompletedResult reads result.json and, when it holds a COMPLETED claim
-// for the given desired phase (status=success AND observedPhase == phase),
-// returns that Result (re-emitted to the termination log WITHOUT a model
-// call — the restart-safety path). It returns (Result{}, false) when there is
-// no prior result, or the prior result is for a DIFFERENT phase (a stale
-// result from before a phase advance: the fresh pod's phase-init has written
-// the new desired phase, and the phase must run), or the prior result is
-// BLOCKED (a blocked phase may retry — the model failure was likely
-// transient — and the kubelet's restart back-off caps the retry rate).
-func priorCompletedResult(resultPath, phase string) (Result, bool) {
+// for the given desired phase (status=success, observedPhase == phase,
+// iteration == currentIteration), returns that Result (re-emitted to the
+// termination log WITHOUT a model call — the restart-safety path). It returns
+// (Result{}, false) when there is no prior result, the prior result is for a
+// DIFFERENT phase (a stale result from before a phase advance), the prior
+// result is BLOCKED (a blocked phase may retry), or the prior result is for a
+// STALE iteration (the operator sent the Loop back to this phase for a new
+// iteration: the phase must run again with fresh model work, not re-emit the
+// old success). The iteration check is the ADR-0005 D11 guard: after a failed
+// verify sends the Loop back to Implementing (iteration+1), the runner must
+// NOT re-emit the old success claim without new model work.
+func priorCompletedResult(resultPath, phase string, currentIteration int) (Result, bool) {
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
 		return Result{}, false
@@ -314,6 +370,11 @@ func priorCompletedResult(resultPath, phase string) (Result, bool) {
 		return Result{}, false
 	}
 	if res.Status != statusSuccess || res.ObservedPhase != phase {
+		return Result{}, false
+	}
+	// Stale-iteration guard: a result from a previous iteration is not
+	// reusable for the current iteration (the phase must run fresh).
+	if res.Iteration != currentIteration {
 		return Result{}, false
 	}
 	return res, true
@@ -420,8 +481,14 @@ func writeClaim(path string, res Result) {
 		ObservedPhase string `json:"observedPhase"`
 		Status        string `json:"status"`
 		BlockedReason string `json:"blockedReason,omitempty"`
+		HeadCommit    string `json:"headCommit,omitempty"`
 	}
-	c := claim{ObservedPhase: res.ObservedPhase, Status: res.Status, BlockedReason: res.VerificationNotes}
+	c := claim{
+		ObservedPhase: res.ObservedPhase,
+		Status:        res.Status,
+		BlockedReason: res.VerificationNotes,
+		HeadCommit:    res.HeadCommit,
+	}
 	data, err := json.Marshal(c)
 	if err != nil {
 		log.Printf("runner: claim marshal: %v", err)
@@ -441,6 +508,54 @@ func writeClaim(path string, res Result) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		log.Printf("runner: claim write to %s: %v", path, err)
 	}
+}
+
+// commitWorkspace (S5a, B3) commits the workspace repo's uncommitted work
+// (everything except the operator-owned .coxswain result dir) and returns the
+// new head commit's 40-hex SHA. The commit identity is fixed (the agent's
+// commit, never an operator or a system identity): git -c user.name=coxswain
+// agent -c user.email=agent@localhost. A no-op commit (nothing to commit)
+// returns the EXISTING head SHA — the verification target is still the repo
+// head, even when the agent's changes were already committed during the
+// phase run. It returns "" on any failure (a non-git workspace, a failed
+// add/commit, a short/uppercase SHA): the caller leaves the claim's
+// headCommit empty and the operator blocks the Verifying advance
+// (ADR-0005 fail-closed — no evidence, no advance). The .coxswain exclusion
+// is a pathspec so the operator's result files (result.json, PLAN.md,
+// desired-phase, the conversation state) never enter the verified commit.
+func commitWorkspace(workspace string) string {
+	// safe.directory: the PVC mount /workspace is root-owned (the init
+	// container runs as root) while the runner runs as uid 65532. Without
+	// this git refuses to operate on the repo ('dubious ownership') and all
+	// three calls fail, leaving headCommit empty and the Verifying advance
+	// blocked. The per-command -c avoids writing a config file (the
+	// workspace is shared with the agent and the PVC is the operator's
+	// evidence store — the runner must not leave a .gitconfig behind).
+	safe := []string{"-c", "safe.directory=" + workspace}
+	// git add -A (the whole workspace, .coxswain excluded via a pathspec
+	// negation: `:(exclude).coxswain`). A failure (not a git repo) is the
+	// "" path.
+	addArgs := append([]string{"-C", workspace}, append(safe,
+		"add", "-A", "--", ":(exclude).coxswain")...)
+	if out, err := exec.Command("git", addArgs...).CombinedOutput(); err != nil {
+		log.Printf("runner: workspace commit add: %v: %s", err, string(out))
+		return ""
+	}
+	commitArgs := append([]string{"-C", workspace}, append(safe,
+		"-c", "user.name=coxswain-agent", "-c", "user.email=agent@localhost",
+		"commit", "-m", "coxswain: implement")...)
+	if out, err := exec.Command("git", commitArgs...).CombinedOutput(); err != nil {
+		// A 'nothing to commit' (exit 1, no new commit) is NOT a failure:
+		// the head SHA is still the verification target.
+		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", err, string(out))
+	}
+	revArgs := append([]string{"-C", workspace}, append(safe, "rev-parse", "HEAD")...)
+	out, err := exec.Command("git", revArgs...).CombinedOutput()
+	if err != nil {
+		log.Printf("runner: workspace rev-parse: %v: %s", err, string(out))
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // readDesiredPhase reads <workspace>/.coxswain/desired-phase and returns the

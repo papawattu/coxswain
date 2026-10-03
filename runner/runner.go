@@ -118,6 +118,15 @@ type Result struct {
 	// status.iteration is the authoritative count, never the claim's).
 	Iteration int `json:"iteration,omitempty"`
 
+	// S5a (B3): the 40-hex head commit SHA the runner committed to at the end
+	// of a successful Implementing run (committed in the workspace repo with
+	// the agent's committed work). It rides into the ADR-0004 claim and the
+	// operator pins it to status.currentVerify.verifiedCommit on the
+	// Implementing -> Verifying advance (the verify Job checks out exactly
+	// this SHA, D11). A CLAIM (ADR-0005): the operator strictly validates the
+	// 40-hex shape before acting on it and never advances without it.
+	HeadCommit string `json:"headCommit,omitempty"`
+
 	// toolConversation is the A4 conversation state (the messages after this
 	// phase run, for the next phase WITHOUT a pod recycle). It is unexported
 	// (not part of the result.json schema — the conversation is the

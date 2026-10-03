@@ -50,6 +50,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -91,6 +92,10 @@ const (
 	// the verifiedCommit it was built for (D27 stale-evidence guard: the
 	// operator ignores/deletes a Job whose annotation != the current pin).
 	verifyCommitAnnotation = "coxswain.io/verified-commit"
+	// verifySafeDirectory is the git safe.directory config key (the
+	// GIT_CONFIG_KEY_0/1 value). A constant so goconst does not flag the
+	// repeated literal.
+	verifySafeDirectory = "safe.directory"
 )
 
 // verifyJobImage is the image the verify Job's init containers run (the
@@ -105,6 +110,14 @@ func (r *LoopReconciler) verifyJobImage() string {
 	}
 	return "docker.io/alpine/git:v2.54.0"
 }
+
+// errVerifyStaleDeleted is the sentinel error ensureVerifyJob returns when
+// the D27 stale-Job guard has just deleted a Job stamped for a different
+// pin. The caller (Reconcile) maps it to a clean requeue (5s RequeueAfter in
+// the FINAL return, after the shared Status().Update) — never a controller
+// error, and never an in-same-reconcile create of the fresh Job (the name is
+// still taken; the apiserver deletes async).
+var errVerifyStaleDeleted = errors.New("stale verify Job deleted")
 
 // verifyJobName returns the verify Job name: <loop>-verify-<iteration>. The
 // iteration is the Loop's current 1-based iteration count (the pin in
@@ -178,13 +191,28 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 			logf.FromContext(ctx).Info("verify Job is stale (annotation mismatch); deleting",
 				"job", name, "job-commit", job.Annotations[verifyCommitAnnotation],
 				"loop-commit", loop.Status.CurrentVerify.VerifiedCommit)
-			if err := r.Delete(ctx, job); err != nil && !apierrors.IsNotFound(err) {
+			// batch/v1 Jobs default to ORPHAN deletion propagation: the
+			// apiserver adds the "orphan" finalizer and waits for the garbage
+			// collector, which leaves the stale Job (and its pods) in place in
+			// any environment without a GC (envtest) and orphans the old Job's
+			// pods even on a real cluster. Background propagation deletes the
+			// Job's pods with it.
+			if err := r.Delete(ctx, job,
+				client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("delete stale verify job %s: %w", name, err)
 			}
 			// D27: never reuse another commit's evidence. The stale Job is
-			// deleted; the Owns(&batchv1.Job{}) watch triggers a re-reconcile
-			// (or the 5s requeue) which creates a fresh Job for the current pin.
-			return nil
+			// deleted; requeue WITHOUT creating in this reconcile — the name
+			// is still taken until the Job object goes away (a Create now would
+			// hit AlreadyExists on a real cluster and be silently ignored by
+			// IgnoreNotFound, leaving the new pin un-built). The Owns
+			// (&batchv1.Job{}) watch (deletion) plus the requeue create a fresh
+			// Job for the current pin on the next reconcile. Return the
+			// sentinel: the caller maps it to a clean requeue (5s RequeueAfter
+			// in the FINAL return, after the shared Status().Update) — never
+			// a controller error, and never an in-same-reconcile create of the
+			// fresh Job (the name is still taken; the apiserver deletes async).
+			return errVerifyStaleDeleted
 		} else {
 			// Already exists and matches: leave it untouched (idempotency,
 			// B3b — the operator never mutates a running Job; a re-run is
@@ -195,6 +223,10 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get verify job %s: %w", name, err)
 	}
+	// Create the fresh Job. If the name is still taken (a stale Job from a
+	// prior reconcile's deletion has not gone away yet), the Create returns
+	// AlreadyExists: requeue and retry, never silently skip (the new pin
+	// must be built).
 	job = &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -209,10 +241,35 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 	if err := ctrl.SetControllerReference(loop, job, r.Scheme); err != nil {
 		return fmt.Errorf("set owner on verify job %s: %w", name, err)
 	}
-	if err := client.IgnoreNotFound(r.Create(ctx, job)); err != nil {
+	if err := r.Create(ctx, job); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// The name is still taken (a stale Job from a prior reconcile's
+			// deletion has not gone away yet). Requeue and retry — never
+			// silently skip (the new pin must be built), and never Ignore
+			// the error (that would leave the old pin's Job in place).
+			logf.FromContext(ctx).Info("verify Job name still taken; requeueing", "job", name)
+			return nil
+		}
 		return fmt.Errorf("create verify job %s: %w", name, err)
 	}
 	return nil
+}
+
+// verifyGitSafeEnv returns the safe.directory env for the /verify scratch
+// (the emptyDir mount point, root-owned while the containers run non-root —
+// the same class of bug as the runner's /workspace dubious-ownership fix).
+// Without it every git call in a verify container fails with
+// 'fatal: detected dubious ownership in repository at /verify'. The
+// env-based form (GIT_CONFIG_COUNT/KEY/VALUE) covers USER-AUTHORED
+// acceptance checks too — they run /verify as their working dir with no
+// operator control over their argv. import-agent carries a SECOND entry
+// for the source repo /agent-src/.git (different-owner, see its container).
+func verifyGitSafeEnv() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: "GIT_CONFIG_COUNT", Value: "1"},
+		{Name: "GIT_CONFIG_KEY_0", Value: verifySafeDirectory},
+		{Name: "GIT_CONFIG_VALUE_0", Value: verifyScratchPath},
+	}
 }
 
 // buildVerifyJobSpec builds the verify Job's spec: the init containers in
@@ -242,6 +299,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", cloneScript(repo, baseCommit)},
 		SecurityContext: trustedContainerSecurityContext(),
+		Env:             verifyGitSafeEnv(),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: verifyVol, MountPath: verifyScratchPath},
 		},
@@ -280,9 +338,15 @@ echo "import-agent ok"
 		Command:         []string{verifySh, "-c", importScript},
 		SecurityContext: trustedContainerSecurityContext(),
 		Env: []corev1.EnvVar{
-			{Name: "GIT_CONFIG_COUNT", Value: "1"},
-			{Name: "GIT_CONFIG_KEY_0", Value: "safe.directory"},
-			{Name: "GIT_CONFIG_VALUE_0", Value: "/agent-src/.git"},
+			// Two safe.directory entries: the scratch (/verify, where the
+			// clone lives) and the SOURCE repo on the read-only PVC
+			// (/agent-src/.git, owned by the agent's git user — a
+			// different-ownership repo). Scoped to this container alone.
+			{Name: "GIT_CONFIG_COUNT", Value: "2"},
+			{Name: "GIT_CONFIG_KEY_0", Value: verifySafeDirectory},
+			{Name: "GIT_CONFIG_VALUE_0", Value: verifyScratchPath},
+			{Name: "GIT_CONFIG_KEY_1", Value: verifySafeDirectory},
+			{Name: "GIT_CONFIG_VALUE_1", Value: "/agent-src/.git"},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: verifyVol, MountPath: verifyScratchPath},
@@ -316,6 +380,7 @@ exit 0
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", tamperScript},
 		SecurityContext: trustedContainerSecurityContext(),
+		Env:             verifyGitSafeEnv(),
 		VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
 	}
 
@@ -335,6 +400,7 @@ exit 0
 			Command:         []string{verifySh, "-c", c},
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
+			Env:             verifyGitSafeEnv(),
 			VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
 		}
 		checkCts = append(checkCts, ct)

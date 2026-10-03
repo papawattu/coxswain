@@ -38,8 +38,8 @@ import (
 	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
-	corev1 "k8s.io/api/core/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -448,14 +448,29 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// applyVerifyOutcome reader runs every reconcile at Verifying (the B2
 	// tamper gate ALSO runs every reconcile below — order-independent, D38
 	// pattern).
+	//
+	// The stale-Job guard (D27) returns verifyStaleDeleted when it has just
+	// deleted a Job stamped for a different pin. The caller maps it to a
+	// clean requeue (the 5s RequeueAfter in the FINAL return, AFTER the
+	// shared Status().Update) — never a controller error, and never an
+	// in-same-reconcile create of the fresh Job (the name is still taken;
+	// the apiserver deletes async, so a Create here would hit AlreadyExists
+	// and the new pin would be left un-built). The requeue creates the fresh
+	// Job on the next reconcile.
+	verifyRequeue := false
 	if err := r.ensureVerifyJob(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
+		if errors.Is(err, errVerifyStaleDeleted) {
+			verifyRequeue = true
+		} else {
+			return ctrl.Result{}, err
+		}
 	}
 	if err := r.ensureVerifyNetworkPolicy(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
-	verifyChanged, verifyRequeue := r.applyVerifyOutcome(ctx, &loop)
+	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
+	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
 	// gate (see applyTamperGate for the tri-state logic). The gate must run
 	// every reconcile — calling it into a local and only then OR-ing into

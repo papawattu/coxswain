@@ -140,6 +140,31 @@ func s5aClaimPod(ns, name, phase, head string) {
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
+// requireVerifyGitSafeEnv asserts the container's env carries
+// safe.directory=/verify via the GIT_CONFIG_COUNT form: (KEY_0, VALUE_0)
+// == (safe.directory, /verify). Mutation: drop the env from a container and
+// this assertion fails. import-agent carries a SECOND entry (KEY_1/VALUE_1
+// for /agent-src/.git) — the helper only checks the /verify entry (KEY_0/
+// VALUE_0), so it works for every container including import-agent.
+func requireVerifyGitSafeEnv(c corev1.Container, msg string) {
+	key, ok := envValue(c.Env, "GIT_CONFIG_KEY_0")
+	Expect(ok).To(BeTrue(), msg+" must set GIT_CONFIG_KEY_0")
+	Expect(key).To(Equal("safe.directory"), msg)
+	val, ok := envValue(c.Env, "GIT_CONFIG_VALUE_0")
+	Expect(ok).To(BeTrue(), msg+" must set GIT_CONFIG_VALUE_0")
+	Expect(val).To(Equal(verifyScratchPath), msg+" must set safe.directory=/verify")
+}
+
+// envValue reads a single env var by name from a container's Env list.
+func envValue(env []corev1.EnvVar, name string) (string, bool) {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value, true
+		}
+	}
+	return "", false
+}
+
 // s5aDriveToVerifying drives a fresh Loop (ns/name already created) through
 // the claim path to Verifying: a Planning claim, then an Implementing claim
 // s5aDriveToVerifying drives a fresh Loop from Planning to Verifying: a
@@ -280,14 +305,27 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			"import-agent must fetch the verifiedCommit")
 
 		By("import-agent sets safe.directory via GIT_CONFIG_COUNT env (fix c)")
-		hasSafeDir := false
+		requireVerifyGitSafeEnv(inits[1], "import-agent")
+		hasAgentSrcSafe := false
 		for _, env := range inits[1].Env {
-			if env.Name == "GIT_CONFIG_VALUE_0" && env.Value == "/agent-src/.git" {
-				hasSafeDir = true
+			if env.Name == "GIT_CONFIG_VALUE_1" && env.Value == "/agent-src/.git" {
+				hasAgentSrcSafe = true
 			}
 		}
-		Expect(hasSafeDir).To(BeTrue(),
-			"import-agent must set safe.directory=/agent-src/.git via env (different-owner repo)")
+		Expect(hasAgentSrcSafe).To(BeTrue(),
+			"import-agent must also allow the different-owner SOURCE repo /agent-src/.git")
+
+		By("carrying safe.directory=/verify on EVERY verify container (the emptyDir is root-owned)")
+		for i := range inits {
+			requireVerifyGitSafeEnv(inits[i], "container "+inits[i].Name)
+		}
+		// The user-authored check containers carry it too (covers arbitrary
+		// check commands; env-form, not argv).
+		for i := range inits {
+			if strings.HasPrefix(inits[i].Name, "check-") {
+				requireVerifyGitSafeEnv(inits[i], "check container "+inits[i].Name)
+			}
+		}
 
 		By("import-agent mounts the PVC read-only with no creds (fix c)")
 		for _, vm := range inits[1].VolumeMounts {
@@ -659,7 +697,13 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
-		// Reconcile 1: the stale Job must be deleted (D27).
+		// Reconcile 1: the stale Job must be deleted (D27). The guard deletes
+		// the Job with Background propagation (the apiserver's default ORPHAN
+		// propagation would add an "orphan" finalizer and wait for a GC that
+		// envtest does not run, leaving the Job in place). The delete is
+		// async (the apiserver removes the object in a separate step), so the
+		// spec drives the requeue loop: each reconcile either deletes (first
+		// pass) or creates the fresh Job (once the name is free).
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -668,16 +712,26 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Eventually(func() bool {
 			err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, staleJob)
 			return apierrors.IsNotFound(err)
-		}, "5s", "100ms").Should(BeTrue(),
+		}, "10s", "100ms").Should(BeTrue(),
 			"the stale verify Job must be deleted when the pin changes (D27)")
 
-		// Reconcile 2: a fresh Job is created for the new pin.
-		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
-		Expect(err).NotTo(HaveOccurred())
+		// The fresh Job is created for the new pin on a subsequent reconcile
+		// (the name is free once the stale Job is gone). Drive the requeue
+		// loop until it appears.
+		newJob := &batchv1.Job{}
+		var newJobErr error
+		Eventually(func() bool {
+			_, newJobErr = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			if newJobErr != nil {
+				return false
+			}
+			newJobErr = k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, newJob)
+			return !apierrors.IsNotFound(newJobErr)
+		}, "10s", "100ms").Should(BeTrue(),
+			"a fresh verify Job must be created for the new pin once the stale Job is gone")
+		Expect(newJobErr).NotTo(HaveOccurred())
 
 		// The new Job exists with the new pin's annotation.
-		newJob := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, newJob)).To(Succeed())
 		Expect(newJob.Annotations["coxswain.io/verified-commit"]).To(Equal("abcdefabcdefabcdefabcdefabcdefabcdefabcd"),
 			"the recreated Job must carry the NEW pin's annotation")
 	})

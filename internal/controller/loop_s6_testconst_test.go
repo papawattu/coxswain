@@ -22,6 +22,10 @@ const (
 	// (the .svc Service's namespace for the namespaceSelector repo-peer rule).
 	nsSamples = "samples"
 
+	// githubRepoURL is the GitHub sample-app repo URL (S6 tests: the
+	// github.com delivery provider + the fake-GitHub API specs).
+	githubRepoURL = "https://github.com/samples/gocli.git"
+
 	// defaultNamespace / baseBranch are the default namespace the unit
 	// fixtures target and the base-branch name (the push target). goconst:
 	// each appears 3+ times across the controller test files.

@@ -279,7 +279,7 @@ func TestDeliverTerminationPRURLStrict(t *testing.T) {
 	ghLoop := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: "urltask1"},
 		Spec: coxv1alpha1.LoopSpec{
-			Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/samples/gocli.git"},
+			Workspace: coxv1alpha1.Workspace{Repo: githubRepoURL},
 			Delivery:  &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
 		},
 		Status: coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "1111111111111111111111111111111111111111"}},
@@ -409,7 +409,7 @@ func TestDeliverDraftTitlePrefix(t *testing.T) {
 	loop.Spec.Delivery.Draft = &noDraft
 	c = r.deliverPushContainer(loop, "0000000000000000000000000000000000000000", "coxswain/drafttest", "main")
 	script = deliverContainerScript(t, c)
-	if !strings.Contains(script, "TITLE_PREFIX=''" ) {
+	if !strings.Contains(script, "TITLE_PREFIX=''") {
 		t.Fatal("a Gitea non-draft delivery must have an empty TITLE_PREFIX")
 	}
 
@@ -417,14 +417,14 @@ func TestDeliverDraftTitlePrefix(t *testing.T) {
 	ghLoop := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: "drafttest"},
 		Spec: coxv1alpha1.LoopSpec{
-			Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/samples/gocli.git"},
+			Workspace: coxv1alpha1.Workspace{Repo: githubRepoURL},
 			Delivery:  &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
 		},
 		Status: coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "0000000000000000000000000000000000000000"}},
 	}
 	c = r.deliverPushContainer(ghLoop, "0000000000000000000000000000000000000000", "coxswain/drafttest", "main")
 	script = deliverContainerScript(t, c)
-	if !strings.Contains(script, "TITLE_PREFIX=''" ) {
+	if !strings.Contains(script, "TITLE_PREFIX=''") {
 		t.Fatal("a GitHub draft delivery must have an empty TITLE_PREFIX (GitHub honours the draft API field)")
 	}
 }

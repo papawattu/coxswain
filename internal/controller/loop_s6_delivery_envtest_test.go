@@ -577,7 +577,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		By("accepting the GitHub per-provider path (/pull/<n>) for a github.com delivery")
 		ghLoop := &coxv1alpha1.Loop{
 			ObjectMeta: s6SampleLoopObjMeta(),
-			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/samples/gocli.git"}},
+			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: githubRepoURL}},
 			Status: coxv1alpha1.LoopStatus{
 				Phase:         coxv1alpha1.LoopPhaseSucceeded,
 				CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6HeadCommit},
@@ -714,7 +714,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "gh1"
-		r := s6Succeeded(name, ns, "https://github.com/samples/gocli.git")
+		r := s6Succeeded(name, ns, githubRepoURL)
 		s6Reconcile(r, ns, name)
 		job := s6GetJob(ns, name)
 		_, push := s6JobContainers(job)
@@ -730,7 +730,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "netpol1"
-		r := s6Succeeded(name, ns, "https://github.com/samples/gocli.git")
+		r := s6Succeeded(name, ns, githubRepoURL)
 		s6Reconcile(r, ns, name)
 
 		By("allowlisting exactly {github.com, api.github.com} on the egress proxy")
@@ -800,7 +800,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "delivext1"
-		r := s6Succeeded(name, ns, "https://github.com/samples/gocli.git")
+		r := s6Succeeded(name, ns, githubRepoURL)
 		s6Reconcile(r, ns, name)
 		_, push := s6JobContainers(s6GetJob(ns, name))
 
@@ -862,7 +862,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "init1"
-		Expect(k8sClient.Create(ctx, s6Loop(name, ns, "https://github.com/samples/gocli.git"))).To(Succeed())
+		Expect(k8sClient.Create(ctx, s6Loop(name, ns, githubRepoURL))).To(Succeed())
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -964,7 +964,7 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 		Expect(r.deliverEgressProxyHosts(loop)).To(BeEmpty(), "an in-cluster repo uses the direct repo-peer rule (no proxy hop)")
 
 		By("an external github.com delivery adds github.com + api.github.com")
-		loop.Spec.Workspace.Repo = "https://github.com/samples/gocli.git"
+		loop.Spec.Workspace.Repo = githubRepoURL
 		Expect(r.deliverEgressProxyHosts(loop)).To(ConsistOf("github.com:443", "api.github.com:443"))
 
 		By("a non-Succeeded Loop adds no hosts (delivery not expected)")
@@ -974,7 +974,7 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 		By("the workspace init host: an external repo adds the repo host; an in-cluster repo adds none")
 		initLoop := &coxv1alpha1.Loop{
 			ObjectMeta: s6SampleLoopObjMeta(),
-			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/samples/gocli.git"}},
+			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: githubRepoURL}},
 		}
 		Expect(r.workspaceInitProxyHost(initLoop)).To(Equal("github.com:443"))
 		initLoop.Spec.Workspace.Repo = inClusterRepoURL

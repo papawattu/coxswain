@@ -47,6 +47,11 @@ spec:
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
+  delivery:
+    # S6: deliver the verified commit as a draft PR. baseBranch omitted ->
+    # defaults to spec.workspace.ref ("initial", the Gitea repo's default
+    # branch). branchPrefix default "coxswain/" -> branch coxswain/gocli-task1.
+    mode: PullRequest
   # No policyRefs on purpose (S5b demo): the exec allow-list in
   # 1.agentpolicy.yaml covers the Go toolchain and git only, but the
   # runner's shell tool calls spawn an open-ended set of binaries (sh,

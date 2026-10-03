@@ -200,14 +200,26 @@ func s6CredMount(c corev1.Container, want bool, label string) {
 }
 
 // s6GitLines returns the script lines (comments stripped) of a /bin/sh -c
-// container's command (the deliver containers' scripts).
+// container's command (the deliver containers' scripts). Lines inside an
+// `if [ ... ]` guard are stripped too: they are precondition checks, not
+// git calls (a git call cannot be a compound one-liner in these scripts).
 func s6GitLines(c corev1.Container) []string {
 	Expect(c.Command).To(HaveLen(3), "container %s must run /bin/sh -c <script>", c.Name)
 	script := c.Command[2]
 	var lines []string
+	inGuard := false
 	for line := range strings.SplitSeq(script, "\n") {
 		t := strings.TrimSpace(line)
 		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		if strings.HasPrefix(t, "if [") {
+			inGuard = true
+		}
+		if inGuard {
+			if strings.HasSuffix(t, "fi") {
+				inGuard = false
+			}
 			continue
 		}
 		lines = append(lines, line)

@@ -503,12 +503,17 @@ echo "deliver clone-base: base ${BASE} at $(git -C "${DEST}" ` + deliverSafeDir(
 }
 
 // deliverImportAgentContainer fetches the pinned verifiedCommit from the
-// agent's workspace PVC (read-only) into the scratch volume. NO credential,
-// NO network (file:// fetch), hooks disabled (core.hooksPath=/dev/null —
-// the agent's repo could carry hooks the operator must never run), and the
-// resolved commit is ASSERTED == the pinned verifiedCommit (a mismatch
-// fails the Job — D27 evidence integrity: the deliver Job pushes ONLY the
-// commit the operator verified).
+// agent's workspace PVC (read-only) into the scratch volume's EXISTING base
+// clone (the clone-base init left /deliver checked out at the base). NO
+// credential, NO network (file:// fetch), hooks disabled (core.hooksPath=
+// /dev/null — the agent's repo could carry hooks the operator must never
+// run), and the resolved commit is ASSERTED == the pinned verifiedCommit (a
+// mismatch fails the Job — D27 evidence integrity: the deliver Job pushes
+// ONLY the commit the operator verified). The fetch also imports the agent
+// commit's parent chain (base..pinned), so the push container's PR has the
+// base's objects. (The S6 first-pass script wiped + re-inited the scratch
+// .git here, leaving clone-base's checked-out files as untracked — the
+// pinned checkout aborted on them; kind run gocli-task1, 2026-10-03.)
 func (r *LoopReconciler) deliverImportAgentContainer(loop *coxv1alpha1.Loop) corev1.Container {
 	verified := loop.Status.CurrentVerify.VerifiedCommit
 	script := `#!/bin/sh
@@ -517,16 +522,18 @@ export GIT_TERMINAL_PROMPT=0
 SRC=` + deliverAgentSrc + `
 DEST=` + deliverScratchPath + `
 PINNED=` + shellQuote(verified) + `
-# Wipe the scratch (the volume is a mount point: wipe the .git contents,
-# keep the dir).
-if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
-mkdir -p "${DEST}"
-# Fetch the pinned commit from the agent's .git over the file protocol.
-# protocol.file.allow=always is REQUIRED (modern git refuses file:// by
-# default); core.hooksPath=/dev/null disables any hook in the imported repo;
-# GIT_TERMINAL_PROMPT=0 is belt-and-suspenders (no credential, no network —
-# a prompt would hang).
-git -c protocol.file.allow=always -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` init "${DEST}"
+# The base clone (clone-base's work) must exist: import into it, never wipe
+# or re-init (wiping .git leaves the checked-out base files untracked and
+# the pinned checkout aborts on them).
+if [ ! -d "${DEST}/.git" ]; then
+  echo "deliver import-agent: ${DEST} is not a git repo (clone-base must run first); refusing"
+  exit 1
+fi
+# Fetch the pinned commit from the agent's .git over the file protocol INTO
+# the existing base clone. protocol.file.allow=always is REQUIRED (modern
+# git refuses file:// by default); core.hooksPath=/dev/null disables any
+# hook in the imported repo; GIT_TERMINAL_PROMPT=0 is belt-and-suspenders
+# (no credential, no network — a prompt would hang).
 git -c protocol.file.allow=always -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" fetch "file://${SRC}/.git" "${PINNED}"
 # Assert the fetched commit == the pinned commit (a mismatch means the
 # evidence is stale or the agent's .git moved — fail the Job, never push).
@@ -535,7 +542,7 @@ if [ "$GOT" != "${PINNED}" ]; then
   echo "deliver import-agent: pinned ${PINNED} != fetched ${GOT}; refusing"
   exit 1
 fi
-git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" checkout --detach "${PINNED}"
+git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" checkout -q --detach "${PINNED}"
 echo "deliver import-agent: imported ${PINNED} from the agent workspace PVC"
 `
 	return corev1.Container{

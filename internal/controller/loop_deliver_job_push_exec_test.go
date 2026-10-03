@@ -216,9 +216,9 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the termination log: %v", err)
 	}
-	outcome, ok := parseDeliverTermination(string(termBytes), loop)
+	outcome, ok, parseErr := parseDeliverTermination(string(termBytes), loop)
 	if !ok {
-		t.Fatalf("the termination message did not parse (the operator would reject it): %q", string(termBytes))
+		t.Fatalf("the termination message did not parse (the operator would reject it): %v; message: %q", parseErr, string(termBytes))
 	}
 	if outcome.Commit != verifySHA {
 		t.Fatalf("termination commit %s; want the pinned verified commit %s", outcome.Commit, verifySHA)
@@ -261,7 +261,7 @@ func TestDeliverTerminationPRURLStrict(t *testing.T) {
 
 	t.Run("Gitea: the kind repo's own PR page is accepted", func(t *testing.T) {
 		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=1\nprURL=http://gitea.samples.svc:3000/samples/gocli/pulls/1\n"
-		if _, ok := parseDeliverTermination(msg, giteaLoop); !ok {
+		if _, ok, _ := parseDeliverTermination(msg, giteaLoop); !ok {
 			t.Fatal("the kind Gitea repo's own PR page URL (its html_url) must be accepted")
 		}
 	})
@@ -270,7 +270,7 @@ func TestDeliverTerminationPRURLStrict(t *testing.T) {
 		// The s6e kind run recorded this (deliverPRURLBase dropped the repo
 		// name). It names a different repo: rejected.
 		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=1\nprURL=http://gitea.samples.svc:3000/samples/pulls/1\n"
-		if _, ok := parseDeliverTermination(msg, giteaLoop); ok {
+		if _, ok, _ := parseDeliverTermination(msg, giteaLoop); ok {
 			t.Fatal("a prURL that drops the repo name (.../samples/pulls/1) must be rejected (it names a different repo)")
 		}
 	})
@@ -287,21 +287,21 @@ func TestDeliverTerminationPRURLStrict(t *testing.T) {
 
 	t.Run("GitHub: the /pull/<n> page is accepted", func(t *testing.T) {
 		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=7\nprURL=https://github.com/samples/gocli/pull/7\n"
-		if _, ok := parseDeliverTermination(msg, ghLoop); !ok {
+		if _, ok, _ := parseDeliverTermination(msg, ghLoop); !ok {
 			t.Fatal("GitHub's /pull/<n> PR page (its html_url) must be accepted")
 		}
 	})
 
 	t.Run("GitHub: the /pulls/<n> path is rejected (wrong segment)", func(t *testing.T) {
 		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=7\nprURL=https://github.com/samples/gocli/pulls/7\n"
-		if _, ok := parseDeliverTermination(msg, ghLoop); ok {
+		if _, ok, _ := parseDeliverTermination(msg, ghLoop); ok {
 			t.Fatal("a github.com prURL with /pulls/<n> must be rejected (GitHub's PR page is /pull/<n>)")
 		}
 	})
 
 	t.Run("Gitea: a path that names a different repo is rejected", func(t *testing.T) {
 		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=1\nprURL=http://gitea.samples.svc:3000/samples/other-repo/pulls/1\n"
-		if _, ok := parseDeliverTermination(msg, giteaLoop); ok {
+		if _, ok, _ := parseDeliverTermination(msg, giteaLoop); ok {
 			t.Fatal("a prURL naming a different repo than spec.workspace.repo must be rejected")
 		}
 	})

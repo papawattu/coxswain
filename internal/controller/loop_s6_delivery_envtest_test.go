@@ -484,29 +484,51 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		job.Status.Succeeded = 1
 		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 
-		By("rejecting a MALFORMED message (missing fields)")
+		By("rejecting a MALFORMED message (missing fields) -> Delivered=False/DeliveryFailed (terminal: the Job is not retried)")
 		s6DeliverPod(ns, name, corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "branch=coxswain/s6loop\ncommit=" + s6HeadCommit + "\n"},
 		})
 		loop := s6Reconcile(r, ns, name)
-		Expect(loop.Status.Delivery).To(BeNil(), "a malformed termination message must be rejected (no status write)")
-		ok, _, _ := s6Cond(loop)
+		Expect(loop.Status.Delivery).To(BeNil(), "a malformed termination message must not write status.delivery")
+		ok, status, reason := s6Cond(loop)
 		Expect(ok).To(BeTrue())
-		Expect(loop.Status.Delivery).To(BeNil())
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed), "a terminated push with an invalid message is terminal DeliveryFailed")
 
-		By("rejecting a message naming the WRONG commit (D27 evidence integrity: the deliver Job pushes ONLY the verified commit)")
+		By("rejecting a message naming the WRONG commit (D27 evidence integrity) -> Delivered=False/DeliveryFailed")
 		s6DeliverPod(ns, name, corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "branch=coxswain/s6loop\ncommit=" + s6OtherCommit + "\nprNumber=7\nprURL=http://gitea.samples.svc/samples/gocli/pulls/7\n"},
 		})
 		loop = s6Reconcile(r, ns, name)
-		Expect(loop.Status.Delivery).To(BeNil(), "a wrong-commit termination message must be rejected")
+		Expect(loop.Status.Delivery).To(BeNil(), "a wrong-commit termination message must not write status.delivery")
+		ok, status, reason = s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed))
 
-		By("rejecting a message naming a FOREIGN host")
+		By("rejecting a message naming a FOREIGN host -> Delivered=False/DeliveryFailed")
 		s6DeliverPod(ns, name, corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "branch=coxswain/s6loop\ncommit=" + s6HeadCommit + "\nprNumber=7\nprURL=https://evil.example.com/samples/gocli/pulls/7\n"},
 		})
 		loop = s6Reconcile(r, ns, name)
-		Expect(loop.Status.Delivery).To(BeNil(), "a foreign-host termination message must be rejected")
+		Expect(loop.Status.Delivery).To(BeNil(), "a foreign-host termination message must not write status.delivery")
+		ok, status, reason = s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed))
+
+		By("rejecting a prURL with the WRONG PATH (drops the repo name) -> Delivered=False/DeliveryFailed (the s6f kind bug)")
+		badPRURL := "branch=coxswain/s6loop\ncommit=" + s6HeadCommit + "\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/pulls/7\n"
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: badPRURL},
+		})
+		loop = s6Reconcile(r, ns, name)
+		Expect(loop.Status.Delivery).To(BeNil(), "a wrong-path prURL must not write status.delivery")
+		ok, status, reason = s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed),
+			"a terminated push with a wrong-path prURL is terminal DeliveryFailed (not InProgress forever)")
 
 		By("accepting a VALID message: status.delivery + Delivered=True/Delivered")
 		msg := s6ValidTermination(&coxv1alpha1.Loop{
@@ -527,7 +549,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		// deliverPRURLBase(repo, prov) — the repo host with the .git suffix
 		// stripped; the port is present when the repo URL carries one).
 		Expect(loop.Status.Delivery.PRURL).To(Equal("http://gitea.samples.svc:3000/samples/gocli/pulls/7"))
-		ok, status, reason := s6Cond(loop)
+		ok, status, reason = s6Cond(loop)
 		Expect(ok).To(BeTrue())
 		Expect(status).To(Equal(metav1.ConditionTrue))
 		Expect(reason).To(Equal(coxv1alpha1.ReasonDelivered))
@@ -543,35 +565,36 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 			},
 		}
 		By("accepting a valid message")
-		outcome, ok := parseDeliverTermination(s6ValidTermination(loop), loop)
+		outcome, ok, err := parseDeliverTermination(s6ValidTermination(loop), loop)
+		Expect(err).To(BeNil())
 		Expect(ok).To(BeTrue())
 		Expect(outcome.Branch).To(Equal("coxswain/s6loop"))
 		Expect(outcome.Commit).To(Equal(s6HeadCommit))
 		Expect(outcome.PRNumber).To(BeEquivalentTo(7))
 
 		By("rejecting a wrong commit")
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6OtherCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc/samples/gocli/pulls/7\n", loop)
+		_, ok, _ = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6OtherCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc/samples/gocli/pulls/7\n", loop)
 		Expect(ok).To(BeFalse(), "a termination message naming another commit must be rejected")
 
 		By("rejecting a foreign host")
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://evil.example.com/samples/gocli/pulls/7\n", loop)
+		_, ok, _ = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://evil.example.com/samples/gocli/pulls/7\n", loop)
 		Expect(ok).To(BeFalse(), "a foreign-host prURL must be rejected")
 
 		By("rejecting a message with the WRONG prURL path (a foreign repo, or the wrong per-provider segment)")
 		// The loop's repo is the in-cluster Gitea <owner>/<repo>; a prURL that
 		// names a different repo (the kind-recorded .../samples/pulls/7 shape)
 		// or the issues path must be rejected.
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/pulls/7\n", loop)
+		_, ok, _ = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/pulls/7\n", loop)
 		Expect(ok).To(BeFalse(), "a prURL that drops the repo name (wrong repo) must be rejected")
 
 		By("rejecting an over-sized message")
-		_, ok = parseDeliverTermination(strings.Repeat("x", deliverTermMsgMaxBytes+1), loop)
+		_, ok, _ = parseDeliverTermination(strings.Repeat("x", deliverTermMsgMaxBytes+1), loop)
 		Expect(ok).To(BeFalse())
 
 		By("requiring a positive prNumber and the exact per-provider PR path for this repo")
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=0\nprURL=http://gitea.samples.svc:3000/samples/gocli/pulls/0\n", loop)
+		_, ok, _ = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=0\nprURL=http://gitea.samples.svc:3000/samples/gocli/pulls/0\n", loop)
 		Expect(ok).To(BeFalse(), "prNumber must be positive")
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/gocli/issues/7\n", loop)
+		_, ok, _ = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=http://gitea.samples.svc:3000/samples/gocli/issues/7\n", loop)
 		Expect(ok).To(BeFalse(), "the prURL path must be exactly the provider's PR path for this repo")
 
 		By("accepting the GitHub per-provider path (/pull/<n>) for a github.com delivery")
@@ -583,9 +606,9 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 				CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6HeadCommit},
 			},
 		}
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://github.com/samples/gocli/pull/7\n", ghLoop)
+		_, ok, _ = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://github.com/samples/gocli/pull/7\n", ghLoop)
 		Expect(ok).To(BeTrue(), "GitHub's /pull/<n> PR page must be accepted for a github.com delivery")
-		_, ok = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://github.com/samples/gocli/pulls/7\n", ghLoop)
+		_, ok, _ = parseDeliverTermination("branch=coxswain/s6loop\ncommit="+s6HeadCommit+"\nprNumber=7\nprURL=https://github.com/samples/gocli/pulls/7\n", ghLoop)
 		Expect(ok).To(BeFalse(), "a github.com prURL with /pulls/<n> must be rejected (wrong segment)")
 	})
 

@@ -712,7 +712,7 @@ git -C "${SRC}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null` + gitCredF
 # trust boundary is the provider's OWN URL (never one the script assembles).
 EXISTING=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}/pulls?state=open&head=${OWNER}:${BRANCH}") || EXISTING=""
 PR_NUM=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
-PR_URL=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's/.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+PR_URL=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's|.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*/pull[s]*/[0-9][^"]*\)".*|\1|p' | head -1)
 if [ -n "${PR_NUM}" ]; then
   # An open PR for the branch: reuse it (idempotent).
   [ -n "${PR_URL}" ] || { echo "deliver push: existing PR ${PR_NUM} has no html_url"; exit 1; }
@@ -724,7 +724,7 @@ else
   # remote (clone-base fetched it) — a failed create is a hard failure.
   CREATED=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/repos/${OWNER}/${REPO_NAME}/pulls") || { echo "deliver push: PR create failed (see API response)"; exit 1; }
   PR_NUM=$(printf '%s' "${CREATED}" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
-  PR_URL=$(printf '%s' "${CREATED}" | sed -n 's/.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  PR_URL=$(printf '%s' "${CREATED}" | sed -n 's|.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*/pull[s]*/[0-9][^"]*\)".*|\1|p')
 fi
 [ -n "${PR_NUM}" ] || { echo "deliver push: no PR number returned (API unreachable or refused)"; exit 1; }
 [ -n "${PR_URL}" ] || { echo "deliver push: no PR html_url returned"; exit 1; }
@@ -813,11 +813,13 @@ var (
 //     html_url (never assembled by the push script): a URL that names any
 //     other repo, or the wrong path segment, is rejected.
 //
-// A malformed or foreign message is rejected (ok=false, no error): the
-// operator re-reads (the pod may be in the middle of writing) and requeues.
-func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome, bool) {
+// A malformed or foreign message is rejected (ok=false, non-nil error with
+// the specific validation failure). The operator treats a terminated push
+// container with an invalid message as a terminal DeliveryFailed (the Job
+// is not retried; backoffLimit 0).
+func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome, bool, error) {
 	if len(msg) > deliverTermMsgMaxBytes {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("termination message too large (%d bytes; max %d)", len(msg), deliverTermMsgMaxBytes)
 	}
 	verified := loop.Status.CurrentVerify.VerifiedCommit
 	wantBranch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
@@ -835,37 +837,37 @@ func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome
 	prNumStr := fields["prNumber"]
 	prURL := fields["prURL"]
 	if branch == "" || commit == "" || prNumStr == "" || prURL == "" {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("missing required field(s) in termination message")
 	}
 	// commit MUST be the pinned verifiedCommit (D27 evidence integrity).
 	if commit != verified {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("commit %q does not match verified commit %q", commit, verified)
 	}
 	// branch MUST be the delivery branch.
 	if branch != wantBranch {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("branch %q does not match delivery branch %q", branch, wantBranch)
 	}
 	// prNumber MUST be a positive integer.
 	prNum, err := strconv.ParseInt(prNumStr, 10, 64)
 	if err != nil || prNum <= 0 {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("prNumber %q is not a positive integer", prNumStr)
 	}
 	// prURL MUST be well-formed, sized, on an allowed host, and its path
 	// MUST be exactly the provider's PR page path for THIS repo.
 	if len(prURL) > deliverPRURLMaxBytes {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("prURL too large (%d bytes; max %d)", len(prURL), deliverPRURLMaxBytes)
 	}
 	u, err := url.Parse(prURL)
 	if err != nil || u.Host == "" {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("prURL %q is not a well-formed URL", prURL)
 	}
 	host := strings.ToLower(u.Hostname())
 	if prov == deliverProviderGitHub {
 		if host != githubHost {
-			return deliverOutcome{}, false
+			return deliverOutcome{}, false, fmt.Errorf("prURL host %q is not %s (GitHub delivery)", host, githubHost)
 		}
 	} else if host != repoHost {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("prURL host %q is not the repo host %q", host, repoHost)
 	}
 	// The path is EXACTLY /<owner>/<repo>/pull[s]/<prNumber> for this repo
 	// (owner/repo from spec.workspace.repo; the segment per provider —
@@ -873,13 +875,13 @@ func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome
 	// or the wrong segment is rejected.
 	owner, repoName := deliverRepoOwnerName(loop.Spec.Workspace.Repo)
 	if owner == "" || repoName == "" {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("could not parse owner/repo from spec.workspace.repo")
 	}
 	wantPath := "/" + owner + "/" + repoName + "/" + deliverPRPathSegment(prov) + "/" + prNumStr
 	if u.Path != wantPath {
-		return deliverOutcome{}, false
+		return deliverOutcome{}, false, fmt.Errorf("prURL path %q does not match the provider's PR page path %q", u.Path, wantPath)
 	}
-	return deliverOutcome{Branch: branch, Commit: commit, PRNumber: prNum, PRURL: prURL}, true
+	return deliverOutcome{Branch: branch, Commit: commit, PRNumber: prNum, PRURL: prURL}, true, nil
 }
 
 // deliverJobPodSelector is the label selector the deliver pod NetworkPolicy
@@ -1051,10 +1053,12 @@ func (r *LoopReconciler) deliverProxyEnv(loop *coxv1alpha1.Loop) []corev1.EnvVar
 //
 // The read is a no-op when there is no pod yet, the push container has not
 // terminated, or the outcome for this commit is already recorded. A non-zero
-// push (or a failed init) is Delivered=False reason DeliveryFailed (terminal —
-// the Job is not retried). A malformed or foreign termination message is
-// rejected (no status write; the next re-read requeues — the pod may be
-// mid-write).
+// push (or a failed init) is Delivered=False reason DeliveryFailed (terminal
+// — the Job is not retried). A terminated push (exit 0) with a malformed or
+// foreign termination message is ALSO terminal: Delivered=False
+// reason DeliveryFailed with the validation failure in the message (the Job
+// is not retried; backoffLimit 0). Never writes status.delivery for an
+// invalid result.
 func (r *LoopReconciler) deliverReadbackChanged(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	if !deliveryExpected(loop) {
 		return false, nil
@@ -1106,15 +1110,22 @@ func (r *LoopReconciler) deliverReadbackChanged(ctx context.Context, loop *coxv1
 		return true, nil
 	}
 	// Validate the termination message STRICTLY.
-	outcome, ok := parseDeliverTermination(terminated.Message, loop)
-	if !ok {
-		// Malformed or foreign message: reject (no status write). The next
-		// reconcile re-reads (the pod may be mid-write); a persistently
-		// malformed message leaves the Loop InProgress (the operator can
-		// inspect the pod's logs).
-		logf.FromContext(ctx).Info("deliver termination message rejected (malformed or foreign)",
-			"loop", loop.Name, "bytes", len(terminated.Message))
-		return false, nil
+	outcome, _, err := parseDeliverTermination(terminated.Message, loop)
+	if err != nil {
+		// The push container has terminated (exit 0) with an unparseable or
+		// foreign termination message. The Job is terminal (backoffLimit 0):
+		// there is no retry, no mid-write scenario for a terminated container.
+		// Make the delivery terminal: Delivered=False/DeliveryFailed with the
+		// validation failure in the message. Never write status.delivery
+		// (the result is invalid).
+		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
+			coxv1alpha1.ReasonDeliveryFailed,
+			fmt.Sprintf("deliver termination message invalid: %s (no retry; clear status.delivery + the condition to re-run delivery)", err.Error()))
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "DeliveryFailed",
+				"deliver termination message invalid: %s", err.Error())
+		}
+		return true, nil
 	}
 	// Write status.delivery + the Delivered=True condition.
 	loop.Status.Delivery = &coxv1alpha1.DeliverStatus{

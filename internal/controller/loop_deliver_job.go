@@ -505,11 +505,11 @@ BASE=` + shellQuote(base) + `
 # The volume is a MOUNT POINT (cannot be rm -rf'd); wipe its contents.
 if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
 mkdir -p "${DEST}"
-git ` + deliverSafeDir() + ` init "${DEST}"
-git -C "${DEST}" ` + deliverSafeDir() + ` remote add origin "${REPO}"
-` + authLine + `  git ` + deliverSafeDir() + ` -C "${DEST}"` + fetchCred + ` fetch origin "${BASE}"
-git -C "${DEST}" ` + deliverSafeDir() + ` checkout --detach FETCH_HEAD
-echo "deliver clone-base: base ${BASE} at $(git -C "${DEST}" ` + deliverSafeDir() + ` rev-parse HEAD)"
+git ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null init "${DEST}"
+git -C "${DEST}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null remote add origin "${REPO}"
+` + authLine + `  git ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null -C "${DEST}"` + fetchCred + ` fetch origin "${BASE}"
+git -C "${DEST}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+echo "deliver clone-base: base ${BASE} at $(git -C "${DEST}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null rev-parse HEAD)"
 `
 	return corev1.Container{
 		Name:         deliverCloneBase,
@@ -612,9 +612,14 @@ func deliverPushAPIAuthExpr(creds bool, prov deliverProvider) string {
 
 // deliverPushContainer pushes the imported commit to the delivery branch
 // (NEVER --force; refusing a push whose target ref equals baseBranch or a
-// default branch — main/master) and creates the pull request via the
-// provider API (idempotent: an open PR for the branch is reused). Writes
-// {branch, commit, prNumber, prURL} to /dev/termination-log. Carries the
+// default branch — main/master, or the repo's default branch) and creates
+// the pull request via the provider API (idempotent: an open PR for the
+// branch is reused). Asserts the scratch clone's HEAD == the pinned
+// verifiedCommit and pushes the pinned SHA explicitly (never "HEAD" — a
+// regression that leaves HEAD elsewhere is refused, not silently
+// delivered). Writes
+// {branch, commit, prNumber, prURL} to /dev/termination-log (prURL is the
+// provider's own html_url). Carries the
 // credential; does NOT mount the agent PVC.
 //
 // The API auth: for a GitHub delivery the Secret's PASSWORD is the Bearer
@@ -663,6 +668,16 @@ if [ "${BRANCH}" = "${BASE}" ] || [ "${BRANCH}" = "main" ] || [ "${BRANCH}" = "m
   echo "deliver push: refusing to push branch ${BRANCH} (equals the base branch or a default branch)"
   exit 1
 fi
+# --- the push pushes the PINNED verifiedCommit, not whatever HEAD happens
+# to be (a regression that leaves HEAD elsewhere must not deliver another
+# commit): assert the scratch clone's HEAD == the pinned commit, then push
+# the pinned SHA explicitly (core.hooksPath=/dev/null — the operator's own
+# import, never the agent's repo's hooks).
+HEAD_SHA=$(git -C "${SRC}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null rev-parse HEAD)
+if [ "${HEAD_SHA}" != "${PINNED}" ]; then
+  echo "deliver push: refusing to push (HEAD ${HEAD_SHA} != the pinned verifiedCommit ${PINNED})"
+  exit 1
+fi
 # --- the API auth (GitHub: the Secret's PASSWORD as a Bearer token — the
 # Secret is basic auth with username "x-access-token" and password = the
 # token; Gitea-compatible: the same basic pair as a Basic header).
@@ -672,7 +687,7 @@ fi
 		}
 		return ""
 	})() + `
-git -C "${SRC}" ` + deliverSafeDir() + `` + gitCredFlag + ` push origin "HEAD:refs/heads/${BRANCH}"
+git -C "${SRC}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null` + gitCredFlag + ` push origin "${PINNED}:refs/heads/${BRANCH}"
 # --- create the PR (idempotent: reuse an open PR for the branch).
 # owner/name come from the repo URL (<host>/<owner>/<name>[.git]).
 # The API auth is set up HERE, after the push: a set -u script dies on the

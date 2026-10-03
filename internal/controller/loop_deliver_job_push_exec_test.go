@@ -146,16 +146,16 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	// Extract the REAL push script and rewrite the pod paths to the test
 	// stand-ins: /deliver -> scratch, /workspace-creds -> credsDir,
 	// /dev/termination-log -> a local file, and API_BASE -> the fake API.
-	// REPO (the Gitea URL) is left as-is: it drives owner/name + the PR URL
-	// base (the termination message's prURL must parse against the repo
-	// host), and the git push uses the origin remote, not $REPO.
+	// REPO (the Gitea URL) is left as-is: it drives owner/name (the script
+	// assembles them for the API calls) — the termination message's prURL is
+	// the provider's own html_url, which the script records verbatim.
 	pushScript := deliverContainerScript(t, r.deliverPushContainer(loop, verifySHA, branch, baseBranch))
 	termFile := filepath.Join(t.TempDir(), "termination-log")
 	pushScript = strings.ReplaceAll(pushScript, deliverScratchPath, scratch)
 	pushScript = strings.ReplaceAll(pushScript, "/workspace-creds", credsDir)
 	pushScript = strings.ReplaceAll(pushScript, "/dev/termination-log", termFile)
-	// Override ONLY the API base (the curl calls). PR_BASE stays the Gitea
-	// PR URL so the termination message's prURL parses against the repo host.
+	// Override ONLY the API base (the curl calls): the script records the
+	// fake API's html_url as prURL.
 	wantAPIBase := "'" + deliverAPIBase(repoURL, deliverProviderGitea) + "'"
 	if !strings.Contains(pushScript, wantAPIBase) {
 		t.Fatalf("push script does not carry the expected API_BASE %q (did the shape change?)", wantAPIBase)
@@ -165,8 +165,28 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	pushPath := filepath.Join(t.TempDir(), "push.sh")
 	mustWriteFile(t, pushPath, []byte(pushScript))
 
-	// Run the push script with sh (dash — POSIX-sh; the container's busybox
-	// ash is the same dialect). A non-zero exit is a failure.
+	// Run 1 (refusal): the script's HEAD assert must REFUSE before anything
+	// is pushed when the scratch clone's HEAD is NOT the pinned commit (the
+	// regression the assert exists for: a stale or moved HEAD must never be
+	// delivered as the verifiedCommit). Move HEAD off the pinned commit and
+	// run: the script must exit non-zero and the delivery branch must not
+	// exist on the remote. (This must FAIL on the pre-fix script, which
+	// pushed "HEAD:refs/heads/<branch>" and would deliver the moved commit.)
+	mustGit(t, scratch, "-c", "protocol.file.allow=always", "-c", "core.hooksPath=/dev/null",
+		"fetch", "file://"+agentRepo+"/.git", baseSHA)
+	mustGit(t, scratch, "checkout", "-q", "--detach", baseSHA)
+	if out, err := exec.Command("sh", pushPath).CombinedOutput(); err == nil {
+		t.Fatalf("with HEAD moved off the pinned commit, the push script must refuse (exit non-zero); it exited 0: %s", out)
+	}
+	if out, err := exec.Command("git", "-C", remoteGit, "rev-parse", "refs/heads/"+branch).CombinedOutput(); err == nil {
+		t.Fatalf("with HEAD moved off the pinned commit, the delivery branch must not exist on the remote, but it is at %s", strings.TrimSpace(string(out)))
+	}
+	// Restore HEAD to the pinned commit (the normal state: import-agent left
+	// it here) for the successful run below.
+	mustGit(t, scratch, "checkout", "-q", "--detach", verifySHA)
+
+	// Run 2 (success): the full end-to-end push with HEAD == the pinned
+	// commit.
 	if out, err := exec.Command("sh", pushPath).CombinedOutput(); err != nil {
 		t.Fatalf("push script failed (the kind-run failure mode); want 0. err: %v, output: %s", err, string(out))
 	}

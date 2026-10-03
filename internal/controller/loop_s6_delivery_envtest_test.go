@@ -386,25 +386,24 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 				"the push container must NOT mount the agent workspace PVC")
 		}
 
-		By("disabling hooks (core.hooksPath=/dev/null) on EVERY git call in the trusted containers")
+		By("disabling hooks (core.hooksPath=/dev/null) on EVERY git call in the deliver containers")
 		for _, c := range []corev1.Container{inits[deliverCloneBase], inits[deliverImport], push} {
 			for _, line := range s6GitLines(c) {
 				if !strings.Contains(line, "git ") && !strings.HasPrefix(strings.TrimSpace(line), "git") {
 					continue
 				}
-				if strings.Contains(line, "hooksPath") && !strings.Contains(line, "core.hooksPath=/dev/null") {
+				if !strings.Contains(line, "git ") && !strings.HasPrefix(strings.TrimSpace(line), "git ") {
 					continue
 				}
-				// Every git invocation in the push container's script is a
-				// plain push (no hooks path — the scratch is the operator's
-				// own import; the import's repo hooks were already disabled
-				// on import). The TRUSTED containers (clone-base,
-				// import-agent) must disable hooks on every git call: the
-				// agent's repo could carry hooks the operator must never run.
-				if c.Name == deliverImport && strings.Contains(line, "git ") {
-					Expect(line).To(ContainSubstring("core.hooksPath=/dev/null"),
-						"import-agent's git call must disable hooks: %q", line)
-				}
+				// Every git invocation in the deliver containers (clone-base,
+				// import-agent, push) disables hooks: the scratch is the
+				// operator's own import, but the clone-base's remote fetch and
+				// the push's push run in a clone that could carry hooks
+				// (the agent's repo's hooks were already disabled on import,
+				// and the remote's hooks are never run — but the local hooks
+				// in the scratch clone, if any, must not run).
+				Expect(line).To(ContainSubstring("core.hooksPath=/dev/null"),
+					"%s's git call must disable hooks: %q", c.Name, line)
 			}
 		}
 		// clone-base + import-agent: count the git invocations and assert
@@ -430,9 +429,13 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		Expect(pushScript).To(ContainSubstring(`[ "${BRANCH}" = "main" ]`))
 		Expect(pushScript).To(ContainSubstring(`[ "${BRANCH}" = "master" ]`))
 
-		By("pinning the push to the verifiedCommit (the import's assert, never a claim)")
+		By("pinning the push to the verifiedCommit (the push's HEAD assert, never a claim)")
 		Expect(pushScript).To(ContainSubstring("PINNED="+shellQuote(s6HeadCommit)),
 			"the push container must push the pinned verifiedCommit (not the claim's headCommit)")
+		Expect(pushScript).To(ContainSubstring(`"${PINNED}:refs/heads/${BRANCH}"`),
+			"the push must push the PINNED SHA explicitly (not HEAD — a stale HEAD must not be delivered)")
+		Expect(pushScript).To(ContainSubstring("rev-parse HEAD"),
+			"the push must assert its clone's HEAD before pushing")
 	})
 
 	It("maps the deliver Job's outcome: in progress -> no decision; failed -> DeliveryFailed", func() {

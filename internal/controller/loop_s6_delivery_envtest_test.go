@@ -763,6 +763,68 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		Expect(foundPeer).To(BeTrue(), "an in-cluster deliver netpol must egress to the repo peer (the .svc Service's namespace)")
 	})
 
+	It("routes the deliver Job's git + PR API of an external (github.com) repo through the egress proxy env", func() {
+		ns := freshNS("s6-delivext")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "delivext1"
+		r := s6Succeeded(name, ns, "https://github.com/samples/gocli.git")
+		s6Reconcile(r, ns, name)
+		_, push := s6JobContainers(s6GetJob(ns, name))
+
+		By("pointing clone-base + push at the Loop's egress proxy (the same URL the workspace init clone uses)")
+		proxyURL := "http://" + name + "-egress-proxy." + ns + ".svc.cluster.local:3128"
+		// The six operator proxy-env names the deliver Job must set for an
+		// external repo (both cases). Referenced as the shared constants so
+		// a rename cannot desync the test.
+		required := []string{envHTTPSProxy, envHttpsProxy, envHTTPProxy, envHttpProxy, envNoProxy, envNoProxyLower}
+		assertProxyEnv := func(c corev1.Container, where string) {
+			seen := map[string]bool{}
+			for _, e := range c.Env {
+				seen[e.Name] = true
+				switch e.Name {
+				case envHTTPSProxy, envHttpsProxy, envHTTPProxy, envHttpProxy:
+					Expect(e.Value).To(Equal(proxyURL), "%s: %s must point at the egress proxy", where, e.Name)
+				case envNoProxy, envNoProxyLower:
+					Expect(e.Value).To(ContainSubstring("-egress-proxy."+ns+".svc"),
+						"%s: %s must cover the in-cluster egress proxy Service (no self-proxy)", where, e.Name)
+				}
+			}
+			for _, n := range required {
+				Expect(seen[n]).To(BeTrue(), "%s: must set %s", where, n)
+			}
+		}
+		job := s6GetJob(ns, name)
+		var cloneBase corev1.Container
+		for i := range job.Spec.Template.Spec.InitContainers {
+			if job.Spec.Template.Spec.InitContainers[i].Name == deliverCloneBase {
+				cloneBase = job.Spec.Template.Spec.InitContainers[i]
+			}
+		}
+		assertProxyEnv(cloneBase, "deliver clone-base")
+		assertProxyEnv(push, "deliver push")
+	})
+
+	It("keeps the deliver Job of an in-cluster (Gitea) repo on the direct path (no proxy env)", func() {
+		ns := freshNS("s6-delivinc")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "delivinc1"
+		r := s6Succeeded(name, ns, inClusterRepoURL)
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		_, push := s6JobContainers(job)
+
+		By("setting no proxy env on clone-base + push (the repo-peer rule covers the push)")
+		for i := range job.Spec.Template.Spec.InitContainers {
+			if job.Spec.Template.Spec.InitContainers[i].Name == deliverCloneBase {
+				Expect(job.Spec.Template.Spec.InitContainers[i].Env).To(BeEmpty(),
+					"an in-cluster deliver clone-base runs on the direct path (no proxy env)")
+			}
+		}
+		Expect(push.Env).To(BeEmpty(), "an in-cluster deliver push runs on the direct path (no proxy env)")
+	})
+
 	It("routes the workspace init clone of an external (github.com) repo through the egress proxy", func() {
 		ns := freshNS("s6-init")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

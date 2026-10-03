@@ -470,6 +470,7 @@ func (r *LoopReconciler) deliverCloneBaseContainer(loop *coxv1alpha1.Loop) corev
 		mounts = append(mounts, corev1.VolumeMount{Name: workspaceCredsVolume, MountPath: "/workspace-creds", ReadOnly: true})
 	}
 	authLine, fetchCred := deliverCredLines(creds)
+	env := r.deliverProxyEnv(loop)
 	script := `#!/bin/sh
 set -eu
 export GIT_TERMINAL_PROMPT=0
@@ -488,6 +489,7 @@ echo "deliver clone-base: base ${BASE} at $(git -C "${DEST}" ` + deliverSafeDir(
 	return corev1.Container{
 		Name:         deliverCloneBase,
 		Image:        r.workspaceGitImage(),
+		Env:          env,
 		Command:      []string{verifySh, "-c", script},
 		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{
@@ -613,6 +615,7 @@ func (r *LoopReconciler) deliverPushContainer(loop *coxv1alpha1.Loop, verified, 
 		gitCredFlag = gitBasicAuthHeader
 	}
 	apiAuthExpr := deliverPushAPIAuthExpr(creds, prov)
+	env := r.deliverProxyEnv(loop)
 
 	script := `#!/bin/sh
 set -eu
@@ -683,6 +686,7 @@ fi
 	return corev1.Container{
 		Name:         deliverPush,
 		Image:        r.deliverPushImage(),
+		Env:          env,
 		Command:      []string{verifySh, "-c", script},
 		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{
@@ -942,6 +946,43 @@ func (r *LoopReconciler) deliverNeedsProxyHosts(loop *coxv1alpha1.Loop) string {
 		return workspaceRepoHost(repo)
 	}
 	return ""
+}
+
+// deliverProxyEnv returns the egress-proxy env vars the deliver Job's
+// clone-base + push containers need to reach an EXTERNAL repo host: HTTPS_PROXY
+// /https_proxy and HTTP_PROXY/http_proxy point at the Loop's egress-proxy
+// Service (the same URL the workspace init clone uses), and NO_PROXY/no_proxy
+// carry the in-cluster Service suffixes so the in-cluster repo-peer path (a
+// Gitea <svc>.<ns>.svc clone/push) never traverses the proxy. An in-cluster
+// repo (repoPeer non-nil) returns nil — no proxy env, the direct repo-peer
+// rule covers it. This mirrors the workspace init container's I42d proxy env
+// so the deliver Job's git + the provider API route identically.
+func (r *LoopReconciler) deliverProxyEnv(loop *coxv1alpha1.Loop) []corev1.EnvVar {
+	if r.deliverNeedsProxyHosts(loop) == "" {
+		return nil // in-cluster repo or no delivery: direct path, no proxy
+	}
+	proxyURL := r.egressProxyServiceURL(loop.Name, loop.Namespace)
+	// NO_PROXY covers the in-cluster Service suffixes: the deliver Job must
+	// not send in-cluster egress (e.g. a Gitea repo peer, the agent workspace
+	// PVC, or the model proxy) through the egress proxy. The egress proxy
+	// Service's own host is covered too (a client must not proxy to the proxy
+	// itself). The model proxy Service (egressNOProxy) is appended for
+	// symmetry with the agent's env.
+	noProxy := strings.Join([]string{
+		EgressProxyServiceFQDN(loop.Name, loop.Namespace),
+		EgressProxyServiceFQDN(loop.Name, loop.Namespace) + "." + r.clusterDomain(),
+		proxyServiceName(loop.Name) + "." + loop.Namespace + ".svc",
+		"localhost",
+		"127.0.0.1",
+	}, ",")
+	return []corev1.EnvVar{
+		{Name: envHTTPSProxy, Value: proxyURL},
+		{Name: envHttpsProxy, Value: proxyURL},
+		{Name: envHTTPProxy, Value: proxyURL},
+		{Name: envHttpProxy, Value: proxyURL},
+		{Name: envNoProxy, Value: noProxy},
+		{Name: envNoProxyLower, Value: noProxy},
+	}
 }
 
 // deliverReadbackChanged is the shared "read the deliver pod's push state via

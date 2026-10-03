@@ -7,6 +7,10 @@
 # no spec.verify.preset enum issue, but workspace.gitCredentialSecret and
 # verify.image must match the cluster state the driver ensures).
 #
+# spec.agent.image is a sensible default; hack/sample-run.sh substitutes
+# the env var RUNNER_IMG over it when set (see the script's RUNNER_IMG
+# section) so a local build can be demoed without editing this file.
+#
 # Option B (owner): no approval gate — the bar is
 # Planning -> Implementing -> Verifying -> Succeeded.
 apiVersion: coxswain.wattu.com/v1alpha1

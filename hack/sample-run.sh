@@ -11,9 +11,15 @@
 #      masked output) and the model Secret (vllm-no-auth),
 #   3. apply the AgentPolicy and Loop manifests for the task
 #      (examples/<app>/tasks/<n>.agentpolicy.yaml, <n>.loop.yaml),
-#      deleting a prior Loop first,
+#      deleting a prior Loop first. When RUNNER_IMG is set, it is
+#      substituted over spec.agent.image in the rendered manifest,
 #   4. watch status.phase until Succeeded/Failed or TIMEOUT (default 30m),
 #   5. write operator-side evidence to .samples/<app>-<n>/EVIDENCE.md.
+#
+# RUNNER_IMG override: set RUNNER_IMG=<image> in the environment to
+# substitute spec.agent.image in the rendered Loop manifest (the checked-in
+# manifest keeps a sensible default; this is how a local runner build is
+# demoed without editing it).
 #
 # --dry-run mode: render the task manifests and validate them against the
 # live API server with kubectl apply --dry-run=server (CRDs must be
@@ -76,13 +82,30 @@ POLICY_NAMES=$(awk '/^  policyRefs:/ {f=1; next} /^  [a-z]/ {f=0} f && /- / {pri
 # ---------------------------------------------------------------------------
 # dry-run: render + validate against the live API server, create nothing.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# RUNNER_IMG override (S5b): the manifest pins a sensible default in
+# spec.agent.image. If RUNNER_IMG is set in the environment, the driver
+# substitutes that image into the rendered manifest instead — so a local
+# build (e.g. coxswain-runner:s5b1 from 'make runner-build IMG=...') or a
+# registry image can be demoed without editing the checked-in file.
+# ---------------------------------------------------------------------------
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+LOOP_RENDER="$TMPDIR/loop.$TASK.rendered.yaml"
+if [ -n "${RUNNER_IMG:-}" ]; then
+	log "substituting RUNNER_IMG=$RUNNER_IMG into the Loop manifest"
+	sed "s|image: .*|image: $RUNNER_IMG|" "$LOOP_YAML" > "$LOOP_RENDER"
+else
+	cp "$LOOP_YAML" "$LOOP_RENDER"
+fi
+
 if [ "$MODE" = "dry-run" ]; then
 	log "dry-run: validating the task $TASK manifests against --context $CTX (ns $NS)"
 	# The Loop manifest carries its own namespace; apply validation still
 	# targets the pinned ctx. The namespace must exist for server-side
 	# validation of the Secret reference (it is not — the ref is a name
 	# only, so a plain dry-run=server is enough).
-	kubectl --context "$CTX" apply -f "$POLICY_YAML" -f "$LOOP_YAML" --dry-run=server \
+	kubectl --context "$CTX" apply -f "$POLICY_YAML" -f "$LOOP_RENDER" --dry-run=server \
 		|| die "server-side validation failed (are the coxswain CRDs installed? 'make install' / config/crd)"
 	log "dry-run OK: manifests validate (CRDs accept the shapes; nothing created)"
 	exit 0
@@ -180,8 +203,8 @@ if kubectl --context "$CTX" -n "$NS" get loop "$LOOP" >/dev/null 2>&1; then
 		|| kubectl --context "$CTX" -n "$NS" delete loop "$LOOP" --wait=false
 	sleep 5
 fi
-log "applying the Loop manifest ($LOOP_YAML)..."
-kubectl --context "$CTX" apply -f "$LOOP_YAML"
+log "applying the Loop manifest ($LOOP_RENDER${RUNNER_IMG:+, RUNNER_IMG substituted})"
+kubectl --context "$CTX" apply -f "$LOOP_RENDER"
 kubectl --context "$CTX" -n "$NS" get loop "$LOOP"
 
 # ---------------------------------------------------------------------------

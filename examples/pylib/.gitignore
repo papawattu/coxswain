@@ -1,0 +1,14 @@
+# I47 (REVIEW-PHASE1-R20): the agent's build outputs must not ride into the
+# verified commit (the commit is pushed to the repo by S6 delivery). The
+# runner's commitWorkspace refuses any NEW file over 1 MiB or binary — but
+# the SEED repo should carry its own .gitignore so build/test artifacts
+# are ignored at staging time (the runner's guard is the backstop for a
+# .gitignore-less workspace). This file is committed into the seeded repo
+# (hack/samples-seed.sh seeds from the committed tree), so the pylib Loop's
+# workspace has it from the base commit.
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/

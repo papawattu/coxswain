@@ -127,6 +127,7 @@ func TestPhaseRunImplementingReportsImplementing(t *testing.T) {
 	defer cleanup()
 
 	ws := t.TempDir()
+	initTestRepo(t, ws) // I47: the Implementing commit step needs a git repo
 	writeDesiredPhase(t, ws, PhaseImplementing)
 	stop := make(chan any)
 

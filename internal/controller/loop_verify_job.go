@@ -25,8 +25,13 @@
 //     mounts besides the read-only workspace),
 //  3. runs the tamper check (baseCommit..verifiedCommit over the protected
 //     globs) as an exit code,
-//  4. runs each acceptance check as its own init container (exit 0 = pass),
-//  5. exits — the Job pod's initContainerStatuses[].state.terminated.exitCode
+//  4. runs the I47 build-artifact check (baseCommit..verifiedCommit, ADDED
+//     files only: any new file over 1 MiB or a binary => non-zero exit,
+//     listing the paths) as an exit code — the operator-side backstop for
+//     the runner's commitWorkspace filter (the runner is the agent's
+//     container and cannot re-filter a commit the agent made itself),
+//  5. runs each acceptance check as its own init container (exit 0 = pass),
+//  6. exits — the Job pod's initContainerStatuses[].state.terminated.exitCode
 //     IS the evidence (kubelet-recorded, never a result.json claim).
 //
 // The Job NEVER executes agent-controlled git state (it operates on a fresh
@@ -94,6 +99,18 @@ const (
 	verifyNoopContainer = "noop"
 	// verifyTamperInit is the tamper-check init container's name (B2 gate).
 	verifyTamperInit = "tamper"
+	// verifyArtifactInit is the I47 build-artifact check init container's
+	// name (the operator-side filter for ADDED files in the verified
+	// commit).
+	verifyArtifactInit = "artifact"
+	// verifyArtifactMaxBytes is the I47 size cap for a file ADDED in
+	// baseCommit..verifiedCommit (1 MiB — the same cap the runner's
+	// commitWorkspace refuses against on the agent side).
+	verifyArtifactMaxBytes = int64(1 << 20)
+	// verifyArtifactScanBytes is the I47 binary-detection window: a NUL
+	// byte in the first 8 KiB of the object marks it binary (the same
+	// heuristic the runner's commitWorkspace uses).
+	verifyArtifactScanBytes = 8192
 	// verifyCommitAnnotation is the annotation the verify Job carries naming
 	// the verifiedCommit it was built for (D27 stale-evidence guard: the
 	// operator ignores/deletes a Job whose annotation != the current pin).
@@ -309,6 +326,69 @@ func verifyCheckEnv() []corev1.EnvVar {
 	)
 }
 
+// artifactScript is the I47 build-artifact check's script. Over the files
+// ADDED in baseCommit..verifiedCommit (git -c core.hooksPath=/dev/null diff
+// --diff-filter=A -z --name-only, piped NUL-delimited into the loop), it
+// exits non-zero — listing the offending paths on stderr — if any is over
+// the size cap (git cat-file -s, 1 MiB) or is a binary (a NUL byte in the
+// first 8 KiB of git cat-file -p; the same heuristic the runner's
+// commitWorkspace refuses against). Only ADDED files are considered: an
+// edit to an existing tracked file is source work (a build artifact cannot
+// ride in without being a new file). The script is POSIX sh (busybox +
+// alpine/git both run it):
+//
+//   - the NUL-delimited path list is piped DIRECTLY (git diff ... | while
+//     read -d ”): busybox ash's here-doc + read -d ” mis-parses a
+//     NUL-delimited body (verified: even plain-text lines are lost), and
+//     command substitution mangles the NULs (trailing NUL drops out). The
+//     raw pipe round-trips every path, including odd names.
+//   - the loop runs in a pipe SUBSHELL, so any shell variable it sets is
+//     lost when the pipe ends. The offenders are therefore accumulated in a
+//     FILE (TMPDIR=/verify is set above — the /verify scratch, writable by
+//     the non-root container) and the final [ -s "$BADF" ] guard is the
+//     single decision path. Each offender is ALSO echoed to stderr as it is
+//     found (the operator's evidence in the pod logs).
+//
+// NUL detection is a hex-word count over the od dump restricted to the
+// window (head -c 8192 on the object): od -An -v -t x1 emits the object as
+// space-separated hex words and a NUL byte is the only way the exact word
+// ' 00' appears (a real byte 0x100+ is ' 01 00' — two separate words, never
+// ' 00'), so grep -o ' 00' | wc -l is a NUL count and non-zero is binary.
+func artifactScript(baseCommit, verifyCommit string) string {
+	return fmt.Sprintf(`
+set -e
+export TMPDIR=/verify
+cd /verify
+BADF=$(mktemp)
+trap 'rm -f "$BADF"' EXIT
+git -c core.hooksPath=/dev/null diff --diff-filter=A -z --name-only %s %s | while IFS= read -r -d '' p; do
+  [ -n "$p" ] || continue
+  sz=$(git cat-file -s %s:"$p" 2>/dev/null) || { echo "artifact: $p is not a readable object" >&2; echo "$p" >> "$BADF"; continue; }
+  if [ "$sz" -gt %d ]; then
+    echo "artifact: $p is $sz bytes (cap %d)" >&2
+    echo "$p" >> "$BADF"
+    continue
+  fi
+  # A NUL byte in the first %d bytes of the object => binary (od hex words,
+  # the window kept exact by head -c on the object itself).
+  if [ "$(git cat-file -p %s:"$p" | head -c %d | od -An -v -t x1 | grep -o ' 00' | wc -l)" -gt 0 ]; then
+    echo "artifact: $p is binary (NUL byte in the first %d KiB)" >&2
+    echo "$p" >> "$BADF"
+    continue
+  fi
+done
+if [ -s "$BADF" ]; then
+  echo "artifact: build artifact committed in base..verified:" >&2
+  cat "$BADF" >&2
+  exit 1
+fi
+echo "artifact: clean"
+exit 0
+`, shellQuote(baseCommit), shellQuote(verifyCommit), shellQuote(verifyCommit),
+		verifyArtifactMaxBytes, verifyArtifactMaxBytes,
+		verifyArtifactScanBytes, shellQuote(verifyCommit), verifyArtifactScanBytes, verifyArtifactScanBytes/1024)
+}
+
 // verifyGitSafeEnv returns the safe.directory env for the /verify scratch
 // (the emptyDir mount point, root-owned while the containers run non-root —
 // the same class of bug as the runner's /workspace dubious-ownership fix).
@@ -410,6 +490,27 @@ echo "import-agent ok"
 		},
 	}
 
+	// The I47 artifact init (see the package doc): the operator-side
+	// build-artifact filter over the files ADDED in baseCommit..
+	// verifiedCommit. It is the trust-boundary backstop for the runner's
+	// commitWorkspace filter — which is in the AGENT's container and cannot
+	// see a commit the agent made itself (a 'git commit' during the phase
+	// run leaves no uncommitted artifact for the runner to filter). The
+	// check runs on the operator's trusted clone in /verify and exits
+	// non-zero listing the offending paths (the operator maps it to an
+	// iterate: 'check-failed: artifact (exit 1)' in progress, the path list
+	// in the pod's terminated message). No credentials, no hooks
+	// (core.hooksPath=/dev/null), safe.directory env, the hardened
+	// trusted-container profile like every other trusted init.
+	artifactCt := corev1.Container{
+		Name:            verifyArtifactInit,
+		Image:           baseImage,
+		Command:         []string{verifySh, "-c", artifactScript(baseCommit, verifyCommit)},
+		SecurityContext: trustedContainerSecurityContext(),
+		Env:             verifyGitSafeEnv(),
+		VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
+	}
+
 	// The tamper init: runs the tamper check and exits with its result. A
 	// non-zero exit means a protected path changed (TamperedVerify, B2). The
 	// check is a single git diff over the protected globs; the exit code is
@@ -484,7 +585,7 @@ exit 0
 		SecurityContext: trustedContainerSecurityContext(),
 	}
 
-	inits := append([]corev1.Container{cloneCt, importCt, tamperCt}, checkCts...)
+	inits := append([]corev1.Container{cloneCt, importCt, tamperCt, artifactCt}, checkCts...)
 
 	// The volumes: the verify emptyDir (the fresh clone) + the check-tmp
 	// emptyDir (writable /tmp scratch for the check containers) + the
@@ -702,9 +803,13 @@ const (
 )
 
 // verifyOutcome reads the pod's init statuses and returns the outcome. A
-// verifyIterate carries the failing check's name and exit code (the
+// verifyIterate carries the failing container's name and exit code (the
 // operator records them into status.progress so the next Implementing
-// prompt can include the failure).
+// prompt can include the failure): the failing acceptance check ('check-k')
+// or, when the I47 artifact check fires (an ADDED file in the verified
+// commit is a build artifact), 'artifact' itself (the progress then reads
+// 'check-failed: artifact (exit 1)'; the offending paths are in the pod's
+// terminated message — the operator's evidence).
 func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 	if pod == nil {
 		return verifyNoDecision, true, "", 0
@@ -727,7 +832,31 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 	if tamperStatus.State.Terminated.ExitCode != 0 {
 		return verifyTampered, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
 	}
-	// Tamper clean: read the check inits (check-0 .. check-<checkCount-1>).
+	// The I47 artifact check (the operator-side filter) runs BEFORE the
+	// checks: it is the gate to the acceptance checks, exactly like tamper is
+	// the gate to artifact (evidence order: tamper -> artifact -> checks).
+	// A non-zero artifact exit is an ITERATE with the container's own name
+	// ('artifact') and exit code. In progress (Terminated == nil) it is
+	// PENDING — no decision, requeue (the S5a pending-regression class).
+	// Checking it before the checks matters: when the artifact fails the
+	// checks never ran (the kubelet stops on the first non-zero init), so a
+	// check-0 status is ABSENT — reading the checks first would take the
+	// 'check not found' branch (noDecision) and never reach the artifact gate.
+	for j := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[j]
+		if ics.Name != verifyArtifactInit {
+			continue
+		}
+		if ics.State.Terminated == nil {
+			return verifyNoDecision, true, "", 0
+		}
+		if ics.State.Terminated.ExitCode != 0 {
+			return verifyIterate, false, verifyArtifactInit, ics.State.Terminated.ExitCode
+		}
+		break
+	}
+	// Tamper clean + artifact clean: read the check inits (check-0 ..
+	// check-<checkCount-1>).
 	for i := range checkCount {
 		name := fmt.Sprintf("check-%d", i)
 		found := false

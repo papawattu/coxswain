@@ -82,6 +82,9 @@ const (
 	verifySh = "/bin/sh"
 	// verifyVol is the verify Job's emptyDir volume name.
 	verifyVol = "verify"
+	// verifyAgentVol is the agent-workspace PVC volume name (read-only,
+	// the only agent-data entry point into the Job).
+	verifyAgentVol = "agent-workspace"
 	// verifyNoopContainer is the no-op main container's name.
 	verifyNoopContainer = "noop"
 )
@@ -265,7 +268,7 @@ echo "import-agent ok"
 			{Name: verifyVol, MountPath: verifyScratchPath},
 			// The agent's workspace PVC, READ-ONLY. This is the only place
 			// agent data enters the Job.
-			{Name: "agent-workspace", MountPath: "/agent-src", ReadOnly: true},
+			{Name: verifyAgentVol, MountPath: "/agent-src", ReadOnly: true},
 		},
 	}
 
@@ -334,7 +337,7 @@ exit 0
 	// when present).
 	volumes := []corev1.Volume{
 		{Name: "verify", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: "agent-workspace", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+		{Name: verifyAgentVol, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: workspacePVCName(loop.Name), ReadOnly: true,
 		}}},
 	}

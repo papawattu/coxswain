@@ -235,13 +235,13 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		By("mounting the agent's workspace PVC read-only into import-agent (B3c)")
 		for _, vm := range inits[1].VolumeMounts {
-			if vm.Name == "agent-workspace" {
+			if vm.Name == verifyAgentVol {
 				Expect(vm.ReadOnly).To(BeTrue(), "the agent workspace must be read-only in the verify Job")
 			}
 		}
 		foundPVC := false
 		for _, v := range job.Spec.Template.Spec.Volumes {
-			if v.Name == "agent-workspace" && v.PersistentVolumeClaim != nil {
+			if v.Name == verifyAgentVol && v.PersistentVolumeClaim != nil {
 				foundPVC = true
 				Expect(v.PersistentVolumeClaim.ReadOnly).To(BeTrue())
 			}
@@ -287,7 +287,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		By("import-agent mounts the PVC read-only with no creds (fix c)")
 		for _, vm := range inits[1].VolumeMounts {
-			if vm.Name == "agent-workspace" {
+			if vm.Name == verifyAgentVol {
 				Expect(vm.ReadOnly).To(BeTrue())
 			}
 			Expect(vm.Name).NotTo(Equal("git-cred"),
@@ -576,7 +576,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
 			Type:       corev1.SecretTypeBasicAuth,
-			Data:       map[string][]byte{"username": []byte("u"), "password": []byte("p")},
+			Data:       map[string][]byte{workspaceCredsUsernameKey: []byte("u"), workspaceCredsPasswordKey: []byte("p")},
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},

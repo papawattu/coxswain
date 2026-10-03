@@ -475,23 +475,33 @@ func writeClaim(path string, res Result) {
 // is a pathspec so the operator's result files (result.json, PLAN.md,
 // desired-phase, the conversation state) never enter the verified commit.
 func commitWorkspace(workspace string) string {
+	// safe.directory: the PVC mount /workspace is root-owned (the init
+	// container runs as root) while the runner runs as uid 65532. Without
+	// this git refuses to operate on the repo ('dubious ownership') and all
+	// three calls fail, leaving headCommit empty and the Verifying advance
+	// blocked. The per-command -c avoids writing a config file (the
+	// workspace is shared with the agent and the PVC is the operator's
+	// evidence store — the runner must not leave a .gitconfig behind).
+	safe := []string{"-c", "safe.directory=" + workspace}
 	// git add -A (the whole workspace, .coxswain excluded via a pathspec
 	// negation: `:(exclude).coxswain`). A failure (not a git repo) is the
 	// "" path.
-	add := exec.Command("git", "-C", workspace, "add", "-A", "--", ":(exclude).coxswain")
-	if out, err := add.CombinedOutput(); err != nil {
+	addArgs := append([]string{"-C", workspace}, append(safe,
+		"add", "-A", "--", ":(exclude).coxswain")...)
+	if out, err := exec.Command("git", addArgs...).CombinedOutput(); err != nil {
 		log.Printf("runner: workspace commit add: %v: %s", err, string(out))
 		return ""
 	}
-	commit := exec.Command("git", "-C", workspace,
+	commitArgs := append([]string{"-C", workspace}, append(safe,
 		"-c", "user.name=coxswain-agent", "-c", "user.email=agent@localhost",
-		"commit", "-m", "coxswain: implement")
-	if out, err := commit.CombinedOutput(); err != nil {
-		// A 'nothing to commit' (exit 1, no new commit) is NOT a failure: the
-		// head SHA is still the verification target.
+		"commit", "-m", "coxswain: implement")...)
+	if out, err := exec.Command("git", commitArgs...).CombinedOutput(); err != nil {
+		// A 'nothing to commit' (exit 1, no new commit) is NOT a failure:
+		// the head SHA is still the verification target.
 		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", err, string(out))
 	}
-	out, err := exec.Command("git", "-C", workspace, "rev-parse", "HEAD").CombinedOutput()
+	revArgs := append([]string{"-C", workspace}, append(safe, "rev-parse", "HEAD")...)
+	out, err := exec.Command("git", revArgs...).CombinedOutput()
 	if err != nil {
 		log.Printf("runner: workspace rev-parse: %v: %s", err, string(out))
 		return ""

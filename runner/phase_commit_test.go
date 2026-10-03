@@ -7,6 +7,7 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,6 +114,60 @@ func TestCommitWorkspaceNotAGitRepoReturnsEmpty(t *testing.T) {
 	}
 	if got := commitWorkspace(ws); got != "" {
 		t.Fatalf("non-repo workspace: commitWorkspace = %q, want empty (ADR-0005 fail-closed)", got)
+	}
+}
+
+// TestCommitWorkspaceUsesSafeDirectory verifies that commitWorkspace passes
+// -c safe.directory=<workspace> to all git calls. The PVC mount /workspace
+// is root-owned (init container runs as root) while the runner runs as
+// uid 65532; without safe.directory git fails with 'dubious ownership' and
+// headCommit is empty (the Verifying advance is blocked). The test uses a
+// git shim (a shell script in PATH) that records its arguments and
+// delegates to the real git.
+func TestCommitWorkspaceUsesSafeDirectory(t *testing.T) {
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+
+	// Build a git shim: a shell script that appends its args to a log file
+	// then execs the real git with the same args.
+	binDir := t.TempDir()
+	gitLog := filepath.Join(binDir, "git-args.log")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("real git not found: %v", err)
+	}
+	shim := filepath.Join(binDir, "git")
+	shimSrc := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %q\nexec %q \"$@\"\n", gitLog, realGit)
+	if err := os.WriteFile(shim, []byte(shimSrc), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+oldPath)
+	// t.Setenv registers a cleanup that restores PATH automatically.
+
+	head := commitWorkspace(ws)
+	if head == "" {
+		t.Fatal("commitWorkspace returned an empty SHA (shim may have broken git)")
+	}
+	if !sha40Hex.MatchString(head) {
+		t.Fatalf("commitWorkspace returned %q, want a 40-hex SHA", head)
+	}
+
+	// Verify all git invocations carried -c safe.directory=<ws>.
+	data, err := os.ReadFile(gitLog)
+	if err != nil {
+		t.Fatalf("git shim log not written: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected at least 3 git invocations (add, commit, rev-parse), got %d", len(lines))
+	}
+	for i, line := range lines {
+		want := fmt.Sprintf("-c safe.directory=%s", ws)
+		if !strings.Contains(line, want) {
+			t.Errorf("git invocation %d: missing %q\n  got: %s", i+1, want, line)
+		}
 	}
 }
 

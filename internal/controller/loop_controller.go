@@ -3262,6 +3262,26 @@ func (r *LoopReconciler) workspaceGitImage() string {
 	return "docker.io/alpine/git:v2.54.0"
 }
 
+// deliverPushImage returns the image the deliver Job's push container runs
+// (S6). The push must both `git push` AND create the pull request via the
+// provider's HTTPS API (curl). It therefore needs an image with git + curl +
+// ca-certificates — the runner image (--runner-image, golang-based with
+// git, curl, and ca-certificates) is the operator-configured, trustworthy
+// choice. It deliberately does NOT reuse workspaceGitImage(): the default
+// alpine/git is git-only (no curl, and its BusyBox wget does not tunnel
+// HTTPS via an http proxy — verified: a CONNECT proxy logged zero requests
+// while wget reached api.github.com directly), so it cannot do the GitHub
+// PR-create hop through the egress proxy. When the operator has not set
+// --runner-image (envtests / minimal setups), fall back to the git image so
+// the Job still builds; such a delivery's PR-create would fail at runtime
+// (curl: not found), which the operator reads back as DeliveryFailed.
+func (r *LoopReconciler) deliverPushImage() string {
+	if r.RunnerImage != "" {
+		return r.RunnerImage
+	}
+	return r.workspaceGitImage()
+}
+
 // workspaceInitContainer builds the sandbox pod's workspace init container
 // (S3a, GAP 1). It runs the operator's --workspace-git-image (default
 // alpine/git — trusted, never the Loop's image), clones spec.workspace.repo @

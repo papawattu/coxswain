@@ -682,7 +682,7 @@ fi
 `
 	return corev1.Container{
 		Name:         deliverPush,
-		Image:        r.workspaceGitImage(),
+		Image:        r.deliverPushImage(),
 		Command:      []string{verifySh, "-c", script},
 		VolumeMounts: mounts,
 		SecurityContext: &corev1.SecurityContext{

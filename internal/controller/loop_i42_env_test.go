@@ -280,10 +280,10 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 	It("drops user spec.agent.env vars that collide with the operator proxy names", func() {
 		loopName := "userconflict-loop"
 		ns := setup(loopName, []string{i42dAllowHost}, []coxv1alpha1.AgentEnvVar{
-			{Name: "HTTP_PROXY", Value: i42dUserProxy},
-			{Name: "http_proxy", Value: i42dUserProxy},
-			{Name: "NO_PROXY", Value: i42dUserNOProxy},
-			{Name: "no_proxy", Value: i42dUserNOProxy},
+			{Name: envHTTPProxy, Value: i42dUserProxy},
+			{Name: envHttpProxy, Value: i42dUserProxy},
+			{Name: envNoProxy, Value: i42dUserNOProxy},
+			{Name: envNoProxyLower, Value: i42dUserNOProxy},
 			// all_proxy is reserved (not emitted): a user setting it must be
 			// dropped too, or it would route traffic the egress proxy is not
 			// meant to handle.

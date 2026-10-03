@@ -50,8 +50,13 @@ import (
 
 const (
 	// i42b test constants.
-	i42bPolicyName           = "i42b-pol"
-	i42bTestRepo             = "https://github.com/papawattu/coxswain.git"
+	i42bPolicyName = "i42b-pol"
+	// i42bTestRepo is an IN-CLUSTER .svc repo: these specs are about the
+	// AgentPolicy network allows, and an external repo's workspace init clone
+	// would (S6) add its own allowlist host and create the egress proxy even
+	// with no network allows. The .svc host keeps the direct repo-peer rule
+	// (no proxy hop), so the proxy exists only when the allows say so.
+	i42bTestRepo             = "http://gitea.samples.svc:3000/samples/gocli.git"
 	i42bExternalAllow        = i42eExternalHost
 	i42bConfLoopName         = "egconf-loop"
 	i42bPodCIDR              = "10.244.0.0/16"

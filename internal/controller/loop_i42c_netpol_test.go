@@ -46,8 +46,14 @@ import (
 )
 
 const (
-	i42cPolicyName     = "i42c-pol"
-	i42cTestRepo       = "https://github.com/papawattu/coxswain.git"
+	i42cPolicyName = "i42c-pol"
+	// i42cTestRepo is an IN-CLUSTER .svc repo: these specs are about the
+	// AgentPolicy network allows, and an external repo's workspace init clone
+	// would (S6) add its own egress-proxy rule + allowlist host and hide the
+	// input they exercise. The .svc host gets the direct repo-peer rule (no
+	// proxy hop), so the egress-proxy rule appears only when the network
+	// allows say so.
+	i42cTestRepo       = "http://gitea.samples.svc:3000/samples/gocli.git"
 	i42cExternalAllow  = i42eExternalHost
 	i42cPodCIDR        = "10.244.0.0/16"
 	i42cServiceCIDR    = "10.96.0.0/12"
@@ -195,10 +201,11 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		np := &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "agent-allow-agent-netpol"}, np)).To(Succeed())
 
-		// Exactly 4 egress rules: model proxy:8080, egress proxy:3128, kube-dns.
-		// (kube-dns is a single rule carrying both 53/UDP and 53/TCP, so the
-		// total is 3 distinct To-peers: proxy, egress-proxy, dns.)
-		Expect(np.Spec.Egress).To(HaveLen(3), "agent egress must be model-proxy + egress-proxy + dns")
+		// Exactly 4 egress rules: model proxy:8080, the in-cluster repo's
+		// direct repo-peer rule (i42cTestRepo is a .svc repo — S3a, no proxy
+		// hop), egress proxy:3128 (the network allow), and kube-dns (the
+		// single rule carrying both 53/UDP and 53/TCP).
+		Expect(np.Spec.Egress).To(HaveLen(4), "agent egress must be model-proxy + repo-peer + egress-proxy + dns")
 
 		// The egress-proxy rule: disjoint selector + port 3128/TCP.
 		egressRule := egressProxyPeerRule(np, "agent-allow")
@@ -237,8 +244,9 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 				}
 			}
 		}
-		// model-proxy + DNS only (2 rules, matching D34).
-		Expect(np.Spec.Egress).To(HaveLen(2), "agent egress must be model-proxy + dns only")
+		// model-proxy + DNS + the in-cluster repo's direct repo-peer rule (3
+		// rules — i42cTestRepo is a .svc repo, S3a, no proxy hop).
+		Expect(np.Spec.Egress).To(HaveLen(3), "agent egress must be model-proxy + dns + repo-peer")
 	})
 
 	// spec 3: egress proxy netpol created (network allows). Assert PolicyTypes,

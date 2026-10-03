@@ -146,6 +146,52 @@ spec:
                 - message: endpointSecretRef and modelEndpoint must be set together
                     (a Loop with a model Secret must also name the model endpoint)
                   rule: has(self.endpointSecretRef) == has(self.modelEndpoint)
+              delivery:
+                description: |-
+                  Delivery configures what happens to a SUCCESSFUL, VERIFIED Loop
+                  (phase Succeeded): mode None (default) leaves the verified commit on
+                  the agent's workspace PVC; mode PullRequest pushes the verified commit
+                  to spec.workspace.repo on branch <branchPrefix><loop-name> and opens a
+                  pull request (draft by default). S6.
+                properties:
+                  baseBranch:
+                    description: |-
+                      BaseBranch is the PR base branch (the branch the delivery branch is
+                      compared against when the PR is opened). Default: spec.workspace.ref
+                      (the ref the workspace clone started from), so a Loop with no
+                      baseBranch override opens its PR against the ref it cloned.
+                    pattern: ^[A-Za-z0-9._/-]+$
+                    type: string
+                  branchPrefix:
+                    default: coxswain/
+                    description: |-
+                      BranchPrefix is prepended to the Loop name to form the delivery
+                      branch name (<prefix><loop-name>). The operator sets the prefix that
+                      identifies the Loop's branches; the name part is derived from the
+                      Loop. Must be a git branch prefix made of [A-Za-z0-9._/-]; the
+                      result must not collide with baseBranch or a default branch (the
+                      deliver Job refuses to push on those — see DeliverStatus).
+                    pattern: ^[A-Za-z0-9._/-]+$
+                    type: string
+                  draft:
+                    default: true
+                    description: |-
+                      Draft controls whether the opened PR is a draft. Default true: the
+                      builder marks it ready explicitly (via the GraphQL
+                      markPullRequestReadyForReview path, since the gh CLI `pr ready`
+                      command requires the workflow scope the token lacks).
+                    type: boolean
+                  mode:
+                    default: None
+                    description: |-
+                      Mode selects the delivery path. Default None (a successful Loop
+                      without delivery config is exactly today's behavior: the verified
+                      commit lives on the agent's workspace PVC).
+                    enum:
+                    - None
+                    - PullRequest
+                    type: string
+                type: object
               goal:
                 description: goal is the natural-language objective for this Loop.
                 minLength: 1
@@ -350,6 +396,42 @@ spec:
                       at Verifying start and pinned for this iteration (D11). The verify Job
                       checks out exactly this SHA, and the evidence's verifiedCommit must equal
                       it for the evidence to count.
+                    type: string
+                type: object
+              delivery:
+                description: |-
+                  Delivery records the delivery outcome (S6) once the deliver Job
+                  completes: the branch, the pushed commit (== the verifiedCommit), and
+                  the opened PR's number and URL. nil until delivery has run. Set for
+                  phase Succeeded Loops with spec.delivery.mode == PullRequest (one
+                  deliver Job per verifiedCommit; the operator re-reads the push
+                  container's termination message each reconcile until it is valid or
+                  the Job definitively failed). Written by the operator only.
+                properties:
+                  branch:
+                    description: |-
+                      Branch is the delivery branch the verified commit was pushed to
+                      (== deliveryBranchName: <spec.delivery.branchPrefix><loop-name>).
+                    type: string
+                  commit:
+                    description: |-
+                      Commit is the commit the branch points at. Must equal
+                      status.currentVerify.verifiedCommit — the operator asserts this
+                      before writing the status (a termination message that reports any
+                      other commit is rejected).
+                    pattern: ^[0-9a-f]{40}$
+                    type: string
+                  prNumber:
+                    description: PRNumber is the pull request number the provider
+                      assigned.
+                    format: int64
+                    type: integer
+                  prURL:
+                    description: |-
+                      PRURL is the pull request URL. The operator validates its host
+                      before recording it: it must be the workspace repo's host (or, for a
+                      GitHub delivery, github.com) — a termination message that reports a
+                      PR on a foreign host is rejected.
                     type: string
                 type: object
               desiredPhase:

@@ -903,8 +903,10 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 			case req.Method == "GET" && strings.HasSuffix(req.URL.Path, "/pulls"):
 				// GET /repos/{owner}/{repo}/pulls?head=coxswain/branch
 				if prCreated {
+					//nolint:errcheck
 					fmt.Fprintf(w, `[{"number": %d, "state": "open", "draft": true}]`, prNumber)
 				} else {
+					//nolint:errcheck
 					fmt.Fprint(w, `[]`)
 				}
 			case req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/pulls"):
@@ -916,7 +918,7 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 					Base  string `json:"base"`
 					Draft bool   `json:"draft"`
 				}
-				json.Unmarshal(body, &pr)
+				_ = json.Unmarshal(body, &pr)
 				Expect(pr.Draft).To(BeTrue(), "the PR must be a draft")
 				Expect(pr.Title).ToNot(BeEmpty())
 				Expect(pr.Head).ToNot(BeEmpty())
@@ -924,9 +926,11 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 				prNumber = 7
 				prCreated = true
 				w.WriteHeader(http.StatusCreated)
+				//nolint:errcheck
 				fmt.Fprintf(w, `{"number": %d, "state": "open", "draft": true, "url": "https://github.com/samples/gocli/pull/%d"}`, prNumber, prNumber)
 			default:
 				w.WriteHeader(http.StatusNotFound)
+				//nolint:errcheck
 				fmt.Fprint(w, `"not found"`)
 			}
 		}))
@@ -946,10 +950,11 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 		getReq.Header.Set("Authorization", authHeader)
 		getResp, err := http.DefaultClient.Do(getReq)
 		Expect(err).NotTo(HaveOccurred())
+		//nolint:errcheck
 		defer getResp.Body.Close()
 		Expect(getResp.StatusCode).To(Equal(http.StatusOK))
 		var prs []struct {
-			Number int  `json:"number"`
+			Number int    `json:"number"`
 			State  string `json:"state"`
 			Draft  bool   `json:"draft"`
 		}
@@ -971,6 +976,7 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 		postReq.Header.Set("Content-Type", "application/json")
 		postResp, err := http.DefaultClient.Do(postReq)
 		Expect(err).NotTo(HaveOccurred())
+		//nolint:errcheck
 		defer postResp.Body.Close()
 		Expect(postResp.StatusCode).To(Equal(http.StatusCreated))
 		Expect(lastAuth).To(Equal(authHeader), "the POST must carry the Bearer token")
@@ -981,10 +987,11 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		getResp2, err := http.DefaultClient.Do(getReq2)
 		Expect(err).NotTo(HaveOccurred())
+		//nolint:errcheck
 		defer getResp2.Body.Close()
 		Expect(getResp2.StatusCode).To(Equal(http.StatusOK))
 		var prs2 []struct {
-			Number int  `json:"number"`
+			Number int    `json:"number"`
 			State  string `json:"state"`
 			Draft  bool   `json:"draft"`
 		}

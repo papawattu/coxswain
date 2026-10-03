@@ -853,6 +853,93 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			"the git image has no Go toolchain — the S5a check-0 exit 127 root cause")
 	})
 
+	It("gives every check-* container a writable /tmp (check-tmp emptyDir) and the toolchain env", func() {
+		ns := "s5a-tmp-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "tmploop"
+		spec := s5aLoopSpec()
+		spec.Verify.AcceptanceChecks = []string{"echo c0", "echo c1"} // two checks: both must carry the mount
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       spec,
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
+		podSpec := job.Spec.Template.Spec
+
+		// The check-tmp emptyDir volume exists on the pod.
+		var hasCheckTmpVol bool
+		for _, v := range podSpec.Volumes {
+			if v.Name == verifyCheckTmpVol && v.EmptyDir != nil {
+				hasCheckTmpVol = true
+			}
+		}
+		Expect(hasCheckTmpVol).To(BeTrue(), "the pod must declare the check-tmp emptyDir volume")
+
+		// Every check-* container mounts it at /tmp and carries the env.
+		var checkCount int
+		for _, ic := range podSpec.InitContainers {
+			if !strings.HasPrefix(ic.Name, "check-") {
+				continue
+			}
+			checkCount++
+			var tmpMount bool
+			for _, m := range ic.VolumeMounts {
+				if m.Name == verifyCheckTmpVol && m.MountPath == agentTmpMount {
+					tmpMount = true
+				}
+			}
+			Expect(tmpMount).To(BeTrue(),
+				"check %s must mount check-tmp at /tmp (go build needs a writable scratch)", ic.Name)
+			envMap := map[string]string{}
+			for _, e := range ic.Env {
+				envMap[e.Name] = e.Value
+			}
+			for k, want := range map[string]string{
+				"HOME": agentTmpMount, "TMPDIR": agentTmpMount, "GOCACHE": "/tmp/gocache",
+				"GOPATH": "/tmp/gopath", "XDG_CACHE_HOME": "/tmp/.cache",
+			} {
+				Expect(envMap[k]).To(Equal(want),
+					"check %s must set %s=%s so toolchain caches land on the writable emptyDir", ic.Name, k, want)
+			}
+			// safe.directory=/verify must still be there (user checks may git there).
+			var safeDir bool
+			for i, e := range ic.Env {
+				if e.Name == "GIT_CONFIG_VALUE_0" && e.Value == verifyScratchPath &&
+					i > 0 && ic.Env[i-1].Name == "GIT_CONFIG_KEY_0" && ic.Env[i-1].Value == "safe.directory" {
+					safeDir = true
+				}
+			}
+			Expect(safeDir).To(BeTrue(), "check %s must keep safe.directory=/verify", ic.Name)
+		}
+		Expect(checkCount).To(Equal(2))
+
+		// The trusted inits and the main container do NOT get the /tmp mount
+		// (their tooling is pinned; only user checks need the scratch).
+		for _, name := range []string{"clone-base", "import-agent", "tamper", verifyNoopContainer} {
+			for i := range podSpec.InitContainers {
+				if podSpec.InitContainers[i].Name != name {
+					continue
+				}
+				for _, m := range podSpec.InitContainers[i].VolumeMounts {
+					Expect(m.Name).NotTo(Equal(verifyCheckTmpVol),
+						"%s must not mount check-tmp", name)
+				}
+			}
+		}
+		for _, m := range podSpec.Containers[0].VolumeMounts {
+			Expect(m.Name).NotTo(Equal(verifyCheckTmpVol), "the no-op main must not mount check-tmp")
+		}
+	})
+
 	It("iterates a failing check back to Implementing WITHOUT creating a new verify Job", func() {
 		ns := "s5a-noregen-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

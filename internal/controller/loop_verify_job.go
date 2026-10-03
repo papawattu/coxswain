@@ -285,6 +285,30 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 	return nil
 }
 
+// verifyCheckTmpVol is the name of the emptyDir mounted at /tmp in each
+// check-* container (the writable scratch area for user check commands
+// running with readOnlyRootFilesystem — the S5a kind root cause: check-0
+// (golang:1.26) failed with 'go: creating work dir: mkdir /tmp/go-build...
+// read-only file system').
+const verifyCheckTmpVol = "check-tmp"
+
+// verifyCheckEnv returns the env for the check-* containers: the
+// safe.directory entry for /verify (user-authored checks may call git
+// there) PLUS the writable-scratch env (HOME/TMPDIR/GOCACHE/GOPATH/
+// XDG_CACHE_HOME all under /tmp) so toolchain caches land on the check-tmp
+// emptyDir instead of the read-only root. Generic across toolchains, not
+// Go-specific.
+func verifyCheckEnv() []corev1.EnvVar {
+	env := verifyGitSafeEnv()
+	return append(env,
+		corev1.EnvVar{Name: "HOME", Value: agentTmpMount},
+		corev1.EnvVar{Name: "TMPDIR", Value: agentTmpMount},
+		corev1.EnvVar{Name: "GOCACHE", Value: "/tmp/gocache"},
+		corev1.EnvVar{Name: "GOPATH", Value: "/tmp/gopath"},
+		corev1.EnvVar{Name: "XDG_CACHE_HOME", Value: "/tmp/.cache"},
+	)
+}
+
 // verifyGitSafeEnv returns the safe.directory env for the /verify scratch
 // (the emptyDir mount point, root-owned while the containers run non-root —
 // the same class of bug as the runner's /workspace dubious-ownership fix).
@@ -435,8 +459,17 @@ exit 0
 			Command:         []string{verifySh, "-c", c},
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
-			Env:             verifyGitSafeEnv(),
-			VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
+			Env:             verifyCheckEnv(),
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: verifyVol, MountPath: verifyScratchPath},
+				// The check containers run with readOnlyRootFilesystem and
+				// the user's command needs a writable scratch area (go build
+				// writes to GOCACHE / a work dir under /tmp). The small
+				// check-tmp emptyDir at /tmp is that scratch — generic enough
+				// for toolchains other than Go too (the env below points
+				// the common cache/home paths there).
+				{Name: verifyCheckTmpVol, MountPath: agentTmpMount},
+			},
 		}
 		checkCts = append(checkCts, ct)
 	}
@@ -453,11 +486,13 @@ exit 0
 
 	inits := append([]corev1.Container{cloneCt, importCt, tamperCt}, checkCts...)
 
-	// The volumes: the verify emptyDir (the fresh clone) + the agent's
-	// workspace PVC (read-only, for the import) + the git credential (only
-	// when present).
+	// The volumes: the verify emptyDir (the fresh clone) + the check-tmp
+	// emptyDir (writable /tmp scratch for the check containers) + the
+	// agent's workspace PVC (read-only, for the import) + the git
+	// credential (only when present).
 	volumes := []corev1.Volume{
-		{Name: "verify", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: verifyVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: verifyCheckTmpVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		{Name: verifyAgentVol, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: workspacePVCName(loop.Name), ReadOnly: true,
 		}}},

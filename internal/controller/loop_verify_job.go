@@ -81,6 +81,10 @@ const (
 	verifyBusybox = "busybox"
 	// verifySh is the shell command for the verify init containers.
 	verifySh = "/bin/sh"
+	// verifyCloneBaseInit is the base-commit clone init container's name.
+	verifyCloneBaseInit = "clone-base"
+	// verifyImportAgentInit is the agent-workspace import init container's name.
+	verifyImportAgentInit = "import-agent"
 	// verifyVol is the verify Job's emptyDir volume name.
 	verifyVol = "verify"
 	// verifyAgentVol is the agent-workspace PVC volume name (read-only,
@@ -88,6 +92,8 @@ const (
 	verifyAgentVol = "agent-workspace"
 	// verifyNoopContainer is the no-op main container's name.
 	verifyNoopContainer = "noop"
+	// verifyTamperInit is the tamper-check init container's name (B2 gate).
+	verifyTamperInit = "tamper"
 	// verifyCommitAnnotation is the annotation the verify Job carries naming
 	// the verifiedCommit it was built for (D27 stale-evidence guard: the
 	// operator ignores/deletes a Job whose annotation != the current pin).
@@ -319,7 +325,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	// was committed locally by the agent and is not on origin; import-agent
 	// fetches it from the workspace PVC).
 	cloneCt := corev1.Container{
-		Name:            "clone-base",
+		Name:            verifyCloneBaseInit,
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", cloneScript(repo, baseCommit)},
 		SecurityContext: trustedContainerSecurityContext(),
@@ -357,7 +363,7 @@ git -c core.hooksPath=/dev/null checkout --detach %s
 echo "import-agent ok"
 `, shellQuote(verifyCommit), shellQuote(verifyCommit))
 	importCt := corev1.Container{
-		Name:            "import-agent",
+		Name:            verifyImportAgentInit,
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", importScript},
 		SecurityContext: trustedContainerSecurityContext(),
@@ -400,7 +406,7 @@ echo "tamper: clean"
 exit 0
 `, shellQuote(baseCommit), shellQuote(verifyCommit), shellQuote(globArgs))
 	tamperCt := corev1.Container{
-		Name:            "tamper",
+		Name:            verifyTamperInit,
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", tamperScript},
 		SecurityContext: trustedContainerSecurityContext(),
@@ -439,7 +445,7 @@ exit 0
 	// immediately so the Job "succeeds" in the batch/v1 sense once all inits
 	// pass; the EVIDENCE is the inits' exit codes, not the main.
 	mainCt := corev1.Container{
-		Name:            "noop",
+		Name:            verifyNoopContainer,
 		Image:           baseImage,
 		Command:         []string{"/bin/true"},
 		SecurityContext: trustedContainerSecurityContext(),
@@ -671,7 +677,7 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 	// Find the tamper init.
 	tamperIdx := -1
 	for i := range pod.Status.InitContainerStatuses {
-		if pod.Status.InitContainerStatuses[i].Name == "tamper" {
+		if pod.Status.InitContainerStatuses[i].Name == verifyTamperInit {
 			tamperIdx = i
 			break
 		}
@@ -684,7 +690,7 @@ func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
 		return verifyNoDecision, true, "", 0
 	}
 	if tamperStatus.State.Terminated.ExitCode != 0 {
-		return verifyTampered, false, "tamper", tamperStatus.State.Terminated.ExitCode
+		return verifyTampered, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
 	}
 	// Tamper clean: read the check inits (check-0 .. check-<checkCount-1>).
 	for i := range checkCount {

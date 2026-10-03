@@ -17,9 +17,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	networkingv1 "k8s.io/api/networking/v1"
+
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -28,7 +31,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"time"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -131,6 +133,35 @@ func s5aClaimPod(ns, name, phase, head string) {
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 	msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":""`
+	if head != "" {
+		msg += `,"headCommit":"` + head + `"`
+	}
+	msg += `}`
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: agentContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0, Message: msg}}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// s5aClaimPodWithIteration is s5aClaimPod with an explicit iteration marker
+// in the claim (the .coxswain/iteration the operator's phase-init wrote when
+// the pod was created; the runner echoes it into the claim). Used to plant a
+// STALE claim (iteration > loop.Status.Iteration) to exercise the S5a
+// stale-iteration guard.
+func s5aClaimPodWithIteration(ns, name, phase, head string, iteration int) {
+	ctx := context.Background()
+	nn := types.NamespacedName{Name: name + "-sandbox", Namespace: ns}
+	existing := &corev1.Pod{}
+	if !apierrors.IsNotFound(k8sClient.Get(ctx, nn, existing)) {
+		Expect(k8sClient.Delete(ctx, existing)).To(Succeed())
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":"","iteration":` + strconv.Itoa(iteration)
 	if head != "" {
 		msg += `,"headCommit":"` + head + `"`
 	}
@@ -770,7 +801,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		name := "imgloop"
 		spec := s5aLoopSpec()
-		spec.Verify.Image = "docker.io/library/golang:1.26"
+		spec.Verify.Image = verifyDefaultCheckImage
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       spec,
@@ -784,13 +815,13 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		inits := job.Spec.Template.Spec.InitContainers
 		// check-0 uses the Loop's verify.image...
 		Expect(inits[3].Name).To(Equal("check-0"))
-		Expect(inits[3].Image).To(Equal("docker.io/library/golang:1.26"),
+		Expect(inits[3].Image).To(Equal(verifyDefaultCheckImage),
 			"check-* containers must run on spec.verify.image (they may need a Go toolchain)")
 		// ...while the trusted inits stay on the git image (they never run user commands).
 		for _, n := range []string{"clone-base", "import-agent", "tamper"} {
 			for i := range inits {
 				if inits[i].Name == n {
-					Expect(inits[i].Image).NotTo(Equal("docker.io/library/golang:1.26"),
+					Expect(inits[i].Image).NotTo(Equal(verifyDefaultCheckImage),
 						"the trusted init %s must stay on the git image", n)
 				}
 			}
@@ -847,7 +878,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// after a failed check (the claim phase-match guard blocks the stale
 		// Implementing claim from re-advancing).
 		var loop *coxv1alpha1.Loop
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			loop = s5aReconcile(r, ns, name)
 			GinkgoWriter.Printf("DEBUG reconcile %d: phase=%s desiredPhase=%s iter=%d curVerify=%v\n",
 				i, loop.Status.Phase, loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.CurrentVerify)
@@ -874,6 +905,30 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("check-0"))
 		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("exit 1"))
 
+		// S5a stale-iteration guard, mutation-checked. The pod still holds the
+		// Implementing claim from the pre-iterate run. Re-seed it with an
+		// explicit iteration:1 marker (the operator's phase-init wrote the
+		// iteration-1 value into .coxswain/iteration when the pod was
+		// created; the runner echoes it into the claim). Status is now
+		// iteration 2, so this claim is STALE: the guard must NOT re-advance
+		// (no Implementing -> Verifying with the same old headCommit, no pin,
+		// no Job flood) and must not clobber the check-failure progress record.
+		// Mutation M4: drop the iteration guard in advancePhaseFromClaim ->
+		// this spec FAILS (the stale claim re-advances, pins CurrentVerify,
+		// and the second s5aReconcile leaves the phase in Verifying).
+		s5aClaimPodWithIteration(ns, name, "Implementing", s5aHeadCommit, 1)
+		loop = s5aReconcile(r, ns, name)
+		GinkgoWriter.Printf("DEBUG stale-claim reconcile: phase=%s desiredPhase=%s iter=%d curVerify=%v\n",
+			loop.Status.Phase, loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.CurrentVerify)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"the stale iteration-1 claim must NOT re-advance (iteration 2 is current)")
+		Expect(loop.Status.CurrentVerify).To(BeNil(),
+			"the stale claim must not re-pin the commit")
+		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("check-0"),
+			"the stale claim must not clobber the verify check-failure progress record")
+		Expect(loop.Status.Progress.Iteration).To(Equal(2),
+			"the operator's own progress record is intact — the stale claim wrote nothing")
+
 		// Reconcile again (still Implementing, no claim): NOTHING new is
 		// created — no Job flood (the kind root cause: verify-2..verify-9
 		// every ~10s while stuck in Verifying).
@@ -881,6 +936,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		GinkgoWriter.Printf("DEBUG second reconcile: phase=%s desiredPhase=%s iter=%d\n",
 			loop.Status.Phase, loop.Status.DesiredPhase, loop.Status.Iteration)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(loop.Status.CurrentVerify).To(BeNil())
 		jobs := &batchv1.JobList{}
 		Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns))).To(Succeed())
 		Expect(jobs.Items).To(HaveLen(1), "only the original verify-1 Job exists after the iterate")
@@ -918,8 +974,8 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		// Reconcile to create the verify-3 Job (the new pin's annotation
 		// differs from the old pin, so the stale-Job guard deletes verify-1
-		// and creates verify-3).
-		loop = s5aReconcile(r, ns, name)
+		// and creates verify-3). s5aReconcile returns the reconciled Loop.
+		_ = s5aReconcile(r, ns, name)
 		// The verify-3 Job exists (the stale-Job guard deleted verify-1 and
 		// created a fresh Job for the new pin).
 		job3 := &batchv1.Job{}
@@ -927,12 +983,14 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		// Create a failing check pod for verify-3 and reconcile -> Failed.
 		s5aVerifyPod(ctx, ns, name, name+"-verify-3", 1)
-		loop = s5aReconcile(r, ns, name)
-
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+		// The reconciled Loop's status is read back fresh (s5aReconcile returns
+		// the live object; the assignment below feeds the phase/condition
+		// assertions, so staticcheck sees the loop variable used).
+		capLoop := s5aReconcile(r, ns, name)
+		Expect(capLoop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
 			"the cap (3) is hit on the failing iteration 4 -> Failed (not another iterate)")
 		found := false
-		for _, c := range loop.Status.Conditions {
+		for _, c := range capLoop.Status.Conditions {
 			if c.Type == string(coxv1alpha1.LoopPhaseFailed) && c.Reason == MaxIterationsExceededReason && c.Status == metav1.ConditionTrue {
 				found = true
 				Expect(c.Message).To(ContainSubstring("check-0"))

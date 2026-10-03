@@ -483,14 +483,31 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			"loop", loop.Name)
 		claimReadPending = true
 	} else if claim != nil {
+		// S5a stale-iteration guard (ADR-0005 D11): a claim from an EARLIER
+		// iteration is ignored — no advance, no progress write. The claim
+		// carries the .coxswain/iteration the operator's phase-init wrote when
+		// the pod was created (the runner reads it and echoes it into the
+		// claim); loop.Status.Iteration is the operator's authoritative count.
+		// After a verify iterate (a failed check -> Implementing,
+		// iteration+1) the OLD pod — still holding the prior iteration's
+		// success claim — is the one being reconciled until the desired-phase
+		// recycle replaces it. Without this guard, the stale claim (observed
+		// phase matches the current phase) would re-advance with the SAME old
+		// headCommit, pinning a stale verify and hot-looping. A claim whose
+		// iteration equals the current status iteration (or an empty marker,
+		// claim.Iteration == 0, which phase-init never writes) is CURRENT:
+		// the first-cycle claims (status.iteration 0) and every post-recycle
+		// claim (phase-init writes the current iteration each recycle) pass.
+		if claim.Iteration > 0 && claim.Iteration != loop.Status.Iteration {
+			logf.FromContext(ctx).Info("stale claim from a previous iteration ignored",
+				"claimIteration", claim.Iteration,
+				"statusIteration", loop.Status.Iteration)
+			return false, false
+		}
 		// S4 review P2 (R18): the clock is injected (r.now, defaulting to
 		// metav1.Now) so a test can advance it more than 1s between reconciles
 		// (metav1.Time marshals at 1-second precision: two same-second
 		// reconciles are byte-identical and the no-churn spec cannot fail).
-		logf.FromContext(ctx).Info("DEBUG advancePhaseFromClaim",
-			"claimObservedPhase", claim.ObservedPhase,
-			"currentPhase", loop.Status.Phase,
-			"claimPhaseIsCurrent", claim.ObservedPhase == loop.Status.Phase)
 		var now metav1.Time
 		if r.now != nil {
 			now = r.now()

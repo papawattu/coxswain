@@ -529,10 +529,15 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		createStandinPod(ns, "pinslp")
 		// Pin the baseCommit directly (the S3 init-container read-back is
 		// stubbed here; the spec asserts on the operator's pins in progress,
-		// not on the S3 read-back itself).
+		// not on the S3 read-back itself). S5a stale-iteration guard: the
+		// claim below carries iteration 3 (the .coxswain/iteration the runner
+		// read); for the guard to treat it as CURRENT, status.iteration must
+		// equal 3 (the operator's authoritative count — the pod's phase-init
+		// wrote the same value when it was created).
 		pinsLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, pinsLoop)).To(Succeed())
 		pinsLoop.Status.BaseCommit = s3BaseCommitSHA
+		pinsLoop.Status.Iteration = 3
 		Expect(k8sClient.Status().Update(ctx, pinsLoop)).To(Succeed())
 		pod := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "pinslp-sandbox", Namespace: ns}, pod)).To(Succeed())

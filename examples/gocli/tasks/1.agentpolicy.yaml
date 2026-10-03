@@ -1,0 +1,14 @@
+# Task 1 AgentPolicy (examples/gocli/tasks.md): the fenced tools the task
+# needs. The agent (golang:1.26 base) needs the Go toolchain and git; no
+# external network egress (stdlib only — the model goes through the
+# model-proxy, not the agent's own egress).
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: gocli-task-1
+  namespace: samples
+spec:
+  exec:
+    - /usr/local/go/bin/go
+    - /usr/bin/git
+  network: []

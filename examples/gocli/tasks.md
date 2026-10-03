@@ -31,7 +31,8 @@ for the rationale.
 > the tests — `round_test.go` is protected; the acceptance checks must pass
 > on the tests as written.
 
-**Loop spec (paste into the Loop manifest):**
+**Loop spec** (the checked-in manifest is `tasks/1.loop.yaml`, applied by
+`make sample-run APP=gocli TASK=1`):
 
 ```yaml
 spec:
@@ -41,9 +42,12 @@ spec:
     or weaken any test file. Make `go test ./...` pass on the tests as
     written.
   workspace:
-    repo: http://gitea.samples.svc:3000/gocli.git
+    # The seeded repo lives under the 'samples' Gitea user (hack/samples-seed.sh
+    # owns it); the git credential Secret is the seeded samples-git-cred in
+    # the Loop's namespace (S5b copies it there from config/samples-git).
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...
@@ -52,14 +56,26 @@ spec:
     protectedPaths:
       - round_test.go
       - main_test.go
+    # The check-* containers run the user commands and need a Go toolchain
+    # (S5a); the trusted git containers (clone-base/import-agent/tamper) use
+    # the operator's git image regardless.
+    image: docker.io/library/golang:1.26
   agent:
+    # The operator's --runner-image flag (set by the dev overlay) selects the
+    # real runner entrypoint; image is the stand-in value the flag compares
+    # against.
     image: coxswain-runner:latest
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
   policyRefs:
     - gocli-task-1
+  loop:
+    maxIterations: 3
 ```
+
+Option B (owner decision): no approval gate — the bar is
+Planning -> Implementing -> Verifying -> Succeeded.
 
 **AgentPolicy (the fenced tools the task needs):**
 
@@ -102,9 +118,9 @@ spec:
     <r>} instead of the bare number. Plain output without -json is unchanged.
     Add TestMainJSON to main_test.go covering the flag.
   workspace:
-    repo: http://gitea.samples.svc:3000/gocli.git
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...

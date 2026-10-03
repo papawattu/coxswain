@@ -1,0 +1,44 @@
+# Task 1 (docs/SAMPLES-PLAN.md, examples/gocli/tasks.md): make the tests pass.
+#
+# Checked-in Loop manifest for `make sample-run APP=gocli TASK=1`
+# (S5b). Applied by hack/sample-run.sh into the samples namespace on
+# kind-coxswain-dev. Field names are the real schema (api/v1alpha1/
+# loop_types.go); tasks.md's original snippet is stale in places (there is
+# no spec.verify.preset enum issue, but workspace.gitCredentialSecret and
+# verify.image must match the cluster state the driver ensures).
+#
+# Option B (owner): no approval gate — the bar is
+# Planning -> Implementing -> Verifying -> Succeeded.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: gocli-task1
+  namespace: samples
+spec:
+  goal: >-
+    Fix Round in round.go so it rounds half away from zero. The test suite
+    (round_test.go) is currently red and is a protected path: do not change
+    or weaken any test file. Make `go test ./...` pass on the tests as
+    written.
+  workspace:
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
+  verify:
+    acceptanceChecks:
+      - go build ./...
+      - go test -run 'TestRound' ./...
+    preset: go
+    protectedPaths:
+      - round_test.go
+      - main_test.go
+    image: docker.io/library/golang:1.26
+  agent:
+    image: coxswain-runner:latest
+    endpointSecretRef: vllm-no-auth
+    modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
+  policyRefs:
+    - gocli-task-1
+  loop:
+    maxIterations: 3

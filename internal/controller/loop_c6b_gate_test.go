@@ -66,7 +66,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 	createPolicy := func(ns string) {
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{agentPolicyExecGit}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{agentPolicyExecGit, runnerShellPath}},
 		})).To(Succeed())
 	}
 	getLoop := func(ns, name string) *coxv1alpha1.Loop {

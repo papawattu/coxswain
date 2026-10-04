@@ -3729,6 +3729,7 @@ func (r *LoopReconciler) findInClusterNetworkAllow(allows []string) (string, boo
 // Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
 func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
 	unionNetwork := make([]string, 0)
+	unionExec := make([]string, 0)
 	for _, name := range loop.Spec.PolicyRefs {
 		ap := &coxv1alpha1.AgentPolicy{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
@@ -3747,8 +3748,18 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
 			}
 		}
+		unionExec = append(unionExec, ap.Spec.Exec...)
 		unionNetwork = append(unionNetwork, ap.Spec.Network...)
 	}
+	// D46 (owner decision (c)): exec fencing does not apply to the agent in
+	// the MVP (the runner's shell tool calls spawn an open-ended set of
+	// binaries, so an exact-path allow-list cannot describe an agent shell —
+	// see ADR-0007's D46 section). A referenced exec list that omits the
+	// runner's shell is a wedging misconfiguration (observed: 30 minutes of
+	// no output under an enforcing Block policy), so it fails fast here
+	// instead: the sandbox is never started. The check is over the UNION of
+	// the referenced policies' exec lists — the same list the KubeArmor
+	// translation allows.
 	// I42e: reject in-cluster network allows. The CRD CEL rule handles the
 	// .svc / .svc.cluster.local / localhost / 127.0.0.1 name cases at
 	// admission; the controller catches the same name cases (mirrored, so pre-
@@ -3758,6 +3769,13 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 	if offending, ok := r.findInClusterNetworkAllow(unionNetwork); ok {
 		return policyValidationResult{valid: false, reason: "InClusterAllow",
 			message: fmt.Sprintf("AgentPolicy network allow %q names an in-cluster target (.svc / .svc.cluster.local / cluster.local, localhost, a loopback / unspecified / link-local IP, or an IP in the pod or service CIDR); the agent's external egress is enforced by the egress proxy and an in-cluster target is an SSRF path", offending)}
+	}
+	// D46: the runner executes every tool call via "/bin/sh -c" (the non-runner
+	// stand-in command is "sh -c sleep infinity"), so any referenced exec list
+	// must include the runner's shell or the agent cannot run at all.
+	if missingShellInExecList(unionExec) {
+		return policyValidationResult{valid: false, reason: "ExecListMissingShell",
+			message: fmt.Sprintf("D46: an agent exec list (%q) does not include the runner's shell %q (the runner runs every tool call via %q -c); exec fencing does not apply to the agent in the MVP — drop the agent exec list or add the shell. Exec fencing stays for the operator-owned proxies; per-tool agent proxies (no general shell) are the D41 follow-on", unionExec, runnerShellPath, runnerShellBase)}
 	}
 	return policyValidationResult{valid: true}
 }

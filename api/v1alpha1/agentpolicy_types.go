@@ -27,6 +27,22 @@ type AgentPolicySpec struct {
 	// "/usr/bin/git", "/usr/local/go/bin/go"). An empty list means the agent may
 	// run no commands beyond the platform minimum (its own entrypoint).
 	//
+	// D46 (R20, owner decision (c), 2026-10-03): exec fencing applies to the
+	// OPERATOR-OWNED PROXIES (model proxy, egress proxy), NOT to the agent
+	// container, in the MVP. The agent's runner executes every tool call via
+	// "/bin/sh -c", and a shell command spawns an open-ended set of binaries
+	// (the shell's external commands, the Go toolchain's compile/link helpers),
+	// so an exact-path allow-list cannot describe an agent shell — a restrictive
+	// agent exec list wedges the Loop under an enforcing Block policy. What
+	// protects the system instead: the network fence (egress proxy +
+	// NetworkPolicy), credential isolation (ADR-0006) and the verify Job
+	// (ADR-0005); exec inside the agent sandbox is deliberately unrestricted.
+	// A referenced exec list that omits the runner's shell (/bin/sh) is
+	// rejected by the controller (PolicyValid=False, reason
+	// ExecListMissingShell) before the sandbox is created — the Loop fails fast
+	// instead of wedging. Per-tool agent proxies (no general shell) are the
+	// D41 follow-on that makes agent exec fencing meaningful again.
+	//
 	// Absolute paths are required (P1, ADR-0007 Q3): the agent has three writable
 	// mounts (/workspace, /scratch, /tmp), so a bare command name ("git") is
 	// spoofable — the agent could write its own /tmp/git that does anything and

@@ -61,6 +61,7 @@ const (
 	testModel      = "local-model"
 	loopCheckCmd   = "go test ./..."
 	sleepInfinity  = "sleep infinity"
+	httpMethodGet  = "GET"
 
 	// agentContainerName is the name of the Loop's agent container in the
 	// Sandbox pod spec (goconst: it appears in several test files).

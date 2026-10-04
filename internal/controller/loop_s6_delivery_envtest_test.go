@@ -1487,7 +1487,7 @@ var _ = Describe("S6: egress proxy hosts (unit)", func() {
 			lastAuth = req.Header.Get("Authorization")
 			w.Header().Set("Content-Type", "application/json")
 			switch {
-			case req.Method == "GET" && strings.HasSuffix(req.URL.Path, "/pulls"):
+			case req.Method == httpMethodGet && strings.HasSuffix(req.URL.Path, "/pulls"):
 				// GET /repos/{owner}/{repo}/pulls?head=coxswain/branch
 				if prCreated {
 					//nolint:errcheck

@@ -234,6 +234,31 @@ kubectl --context "$CTX" apply -f "$LOOP_RENDER"
 kubectl --context "$CTX" -n "$NS" get loop "$LOOP"
 
 # ---------------------------------------------------------------------------
+# 3b. I50: snapshot vLLM request_success_total BEFORE the run starts, read
+#     from EACH backend directly. 192.168.1.20:8000 is an nginx LB over TWO
+#     vLLM backends, so the summed per-backend delta is the true total
+#     served (and an upper bound for this run: other traffic may share the
+#     backends). Sum request_success_total over all finished_reason labels.
+#     Written to a file so the evidence block can read it later.
+# ---------------------------------------------------------------------------
+VLLM_BACKENDS="192.168.1.36:8000 192.168.1.37:8000"
+VLLM_BEFORE_FILE="$OUTDIR/.vllm-before"
+vllm_snapshot() {
+	# $1: file to write the summed request_success_total to
+	local sum=0 b v
+	for b in $VLLM_BACKENDS; do
+		v=$(curl -s --max-time 10 "http://$b/metrics" 2>/dev/null \
+			| awk '/^vllm:request_success_total/{s+=$2} END{print s+0}')
+		[ -n "$v" ] && sum=$((sum + ${v%%.*}))
+	done
+	printf '%s' "$sum" > "$1"
+}
+log "snapshotting vLLM request_success_total before the run (backends: $VLLM_BACKENDS)..."
+vllm_snapshot "$VLLM_BEFORE_FILE" || log "WARNING: vLLM before-snapshot failed; the delta will be reported as unavailable"
+VLLM_BEFORE=$(cat "$VLLM_BEFORE_FILE" 2>/dev/null || echo "")
+log "vLLM request_success_total before: ${VLLM_BEFORE:-unavailable}"
+
+# ---------------------------------------------------------------------------
 # 4. Watch the phase.
 # ---------------------------------------------------------------------------
 log "watching phase (timeout ${TIMEOUT}s)..."
@@ -356,9 +381,54 @@ for c in d["spec"]["initContainers"]:
 	done
 
 	printf '## Model proxy\n\n'
-	printf 'forwarded-request line(s) from the proxy pod log (dev stand-in: one line per pod start, not per request):\n\n```\n'
-	kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" --tail=20 2>&1 || true
+	# The dev stand-in logs ONE structured line per forwarded request
+	# (method, path, status, duration_ms; no bodies, no headers, no auth).
+	# Count those lines for this run's proxy pod. Do NOT swallow kubectl
+	# errors: capture stderr so a zero count is never silent.
+	PROXY_LOG=$(kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" 2>&1)
+	PROXY_RC=$?
+	# The Go stdlib log package prefixes each line with a timestamp, so the
+	# forwarded line is '<date> <time> proxy: forwarded ...' — match the
+	# message substring, not a line anchor.
+	FORWARDED_COUNT=$(printf '%s\n' "$PROXY_LOG" | grep -c 'proxy: forwarded ' || true)
+	# Sample vLLM request_success_total AFTER the run from each backend.
+	VLLM_BACKENDS="192.168.1.36:8000 192.168.1.37:8000"
+	vllm_sum_after() {
+		local sum=0 b v
+		for b in $VLLM_BACKENDS; do
+			v=$(curl -s --max-time 10 "http://$b/metrics" 2>/dev/null \
+				| awk '/^vllm:request_success_total/{s+=$2} END{print s+0}')
+			[ -n "$v" ] && sum=$((sum + ${v%%.*}))
+		done
+		printf '%s' "$sum"
+	}
+	VLLM_AFTER=$(vllm_sum_after 2>/dev/null || echo "")
+	VLLM_DELTA=""
+	if [ -n "$VLLM_AFTER" ] && [ -n "${VLLM_BEFORE:-}" ]; then
+		VLLM_DELTA=$((VLLM_AFTER - VLLM_BEFORE))
+	fi
+	printf 'forwarded-request count (one structured log line per forwarded request, no bodies/headers): %s\n\n' "$FORWARDED_COUNT"
+	# A Succeeded Loop with zero forwarded requests means the agent never
+	# called the model (or the log fetch failed). A silent zero would fail
+	# the I50 acceptance invisibly, so warn loudly.
+	if [ "$PHASE" = "Succeeded" ] && { [ -z "${FORWARDED_COUNT:-}" ] || [ "$FORWARDED_COUNT" -eq 0 ] 2>/dev/null; }; then
+		printf '**WARNING: the Loop Succeeded but the proxy forwarded %s request(s). Either the agent never called the model, or the proxy log fetch failed.**\n\n' "${FORWARDED_COUNT:-0}"
+	fi
+	if [ "$PROXY_RC" -ne 0 ]; then
+		printf 'proxy log fetch failed (rc=%s); the count above may be wrong. Raw kubectl output:\n\n' "$PROXY_RC"
+		printf '%s\n' "$PROXY_LOG"
+		printf '\n'
+	fi
+	printf 'forwarded-request log lines:\n\n```\n'
+	printf '%s\n' "$PROXY_LOG" | grep 'proxy: forwarded ' || true
 	printf '```\n\n'
+	printf 'vLLM request_success_total delta over the run (summed over both backends %s; read from each backend directly, not via the 192.168.1.20 LB): ' "$VLLM_BACKENDS"
+	if [ -n "$VLLM_DELTA" ]; then
+		printf '%s\n' "$VLLM_DELTA"
+	else
+		printf 'unavailable (before=%s, after=%s)\n' "${VLLM_BEFORE:-?}" "${VLLM_AFTER:-?}"
+	fi
+	printf 'Note: the vLLM backends serve other traffic too, so this delta is an upper bound for this run. The forwarded count above is the operator-side ground truth for what the proxy of this Loop forwarded.\n\n'
 
 	printf '## NetworkPolicies\n\n```\n'
 	# The verify netpol is labeled coxswain.io/verify-for, not loop, so the

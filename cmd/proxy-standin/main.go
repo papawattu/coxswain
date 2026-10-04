@@ -12,7 +12,10 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"time"
 )
+
+const listenAddr = ":8080"
 
 func main() {
 	// D33 acceptance: prove the proxy can read a REAL key file from the
@@ -59,9 +62,42 @@ func main() {
 	if err != nil {
 		log.Fatalf("bad MODEL_ENDPOINT %q: %v", target, err)
 	}
-	proxy := httputil.NewSingleHostReverseProxy(u)
+
+	// One structured line per forwarded request (method, path, status,
+	// duration_ms). No bodies, no headers, no auth material.
+	h := newForwardingHandler(u)
+
 	if _, err := fmt.Fprintf(os.Stdout, "proxy-stand-in: forwarding to %s\n", target); err != nil {
 		log.Printf("proxy: cannot write to stdout: %v", err)
 	}
-	log.Fatal(http.ListenAndServe(":8080", proxy))
+	if err := http.ListenAndServe(listenAddr, h); err != nil {
+		log.Printf("proxy: %v", err)
+		os.Exit(1)
+	}
+}
+
+// newForwardingHandler builds the reverse proxy to target and wraps it with
+// the per-request structured log line. It takes the already-parsed target so
+// a unit test can hand it an httptest server URL directly.
+func newForwardingHandler(target *url.URL) http.Handler {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		proxy.ServeHTTP(sw, r)
+		log.Printf("proxy: forwarded method=%s path=%q status=%d duration_ms=%d",
+			r.Method, r.URL.Path, sw.status, time.Since(start).Milliseconds())
+	})
+}
+
+// statusWriter records the response status code the reverse proxy wrote,
+// so the per-request log line can report it.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }

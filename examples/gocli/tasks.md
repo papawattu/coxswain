@@ -68,9 +68,10 @@ spec:
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
-  # No policyRefs on purpose (S5b): see the AgentPolicy note below — the
-  # exec allow-list can't cover an agent shell yet (D41), so the demo
-  # runs the default-deny minimum.
+  # No policyRefs (D46, owner decision (c), 2026-10-03): exec fencing
+  # applies to the operator-owned proxies, not the agent — the runner's
+  # shell tool calls spawn an open-ended set of binaries. The demo runs
+  # the default-deny minimum (no AgentPolicy reference).
   loop:
     maxIterations: 3
 ```
@@ -78,28 +79,19 @@ spec:
 Option B (owner decision): no approval gate — the bar is
 Planning -> Implementing -> Verifying -> Succeeded.
 
-**AgentPolicy (the fenced tools the task needs — EXAMPLE, not referenced
-by the checked-in Loop):**
-
-> Not in `spec.policyRefs` yet: `AgentPolicy.exec` entries are exact
-> absolute paths, but the runner's shell tool calls spawn an open-ended set
-> of binaries (sh, the go toolchain's compile/link helpers). Under an
-> enforcing KubeArmor Block policy the agent's shell cannot exec and the
-> Loop wedges with no output. Exec fencing for an agent shell is D41 work;
-> until then the demo runs the default-deny minimum (no AgentPolicy
-> reference).
-
-```yaml
-apiVersion: coxswain.wattu.com/v1alpha1
-kind: AgentPolicy
-metadata:
-  name: gocli-task-1
-spec:
-  exec:
-    - /usr/local/go/bin/go        # golang:1.26 base image path
-    - /usr/bin/git
-  network: []                     # no external egress; stdlib only
-```
+**AgentPolicy: none (D46, owner decision (c), 2026-10-03).** The task-1
+example policy (`tasks/1.agentpolicy.yaml`, `exec: [go, git]`) was DELETED:
+exec fencing does not apply to the agent in the MVP. The runner runs every
+tool call via `/bin/sh -c`, and a shell command spawns an open-ended set of
+binaries (the shell's external commands, the Go toolchain's compile/link
+helpers), so an exact-path exec allow-list cannot describe an agent shell —
+under an enforcing KubeArmor Block policy the agent's shell cannot exec and
+the Loop wedges with no output (observed in the S5b demo run). What protects
+the system instead: the network fence (egress proxy + NetworkPolicy),
+credential isolation (ADR-0006) and the verify Job (ADR-0005). Exec fencing
+stays for the operator-owned proxies; per-tool agent proxies (no general
+shell) are the D41 follow-on. A Loop whose policyRefs carry an exec list
+without the runner's shell (`/bin/sh`) is rejected fail-fast (`PolicyValid=False` reason `ExecListMissingShell`) before the sandbox is created.
 
 **Expected evidence:** `go build`/`go vet`/`go test` exit 0; the only change
 is `round.go` (the reference fix is `tasks/1.patch`); `round_test.go`
@@ -145,12 +137,11 @@ spec:
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
-  # Same no-policyRefs note as task 1 (exec fencing for an agent shell is
-  # D41 work).
+  # No policyRefs (D46, owner decision (c)): exec fencing applies to the
+  # proxies, not the agent — see the task-1 AgentPolicy note.
 ```
 
-**AgentPolicy:** same as task 1 (`gocli-task-2`, same spec; example only,
-not referenced until D41).
+**AgentPolicy:** none (D46, same decision as task 1).
 
 **Expected evidence:** plain run still prints the bare number; `-json`
 prints the JSON object; `TestMainJSON` green (the protected `main_test.go` is

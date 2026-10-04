@@ -64,23 +64,16 @@ spec:
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
-  policyRefs:
-    - pylib-task-1
+  # No policyRefs (D46, owner decision (c), 2026-10-03): exec fencing
+  # applies to the operator-owned proxies, not the agent — an agent exec
+  # list that omits the runner's shell (/bin/sh) fails fast (reason
+  # ExecListMissingShell); without a list exec is unrestricted.
 ```
 
-**AgentPolicy (the fenced tools the task needs):**
-
-```yaml
-apiVersion: coxswain.wattu.com/v1alpha1
-kind: AgentPolicy
-metadata:
-  name: pylib-task-1
-spec:
-  exec:
-    - /usr/bin/python3        # the runner image carries python3
-    - /usr/bin/git
-  network: []                     # no external egress; stdlib only
-```
+**AgentPolicy: none (D46, owner decision (c)): exec fencing does not apply
+ to the agent in the MVP (see the no-policyRefs note above); the network
+ fence, credential isolation (ADR-0006) and the verify Job protect the
+ system.
 
 **Expected evidence:** `python3 -m compileall` exits 0;
 `python3 -m unittest tests.test_median` reports all 5 tests passing; the
@@ -129,11 +122,10 @@ spec:
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
-  policyRefs:
-    - pylib-task-2
+  # No policyRefs (D46, as task 1).
 ```
 
-**AgentPolicy:** same as task 1 (`pylib-task-2`, same spec).
+**AgentPolicy:** none (D46, same as task 1).
 
 **Expected evidence:** `python3 -m compileall` exits 0;
 `python3 -m unittest tests.test_clamp` reports all 4 tests passing; the

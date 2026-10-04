@@ -22,4 +22,31 @@ const (
 	// githubHost is the GitHub delivery host (the deliver provider + the
 	// egress-proxy SNI allowlist + api.github.com all key off it).
 	githubHost = "github.com"
+
+	// runnerShellPath is the ABSOLUTE path of the runner's shell: the runner
+	// executes every tool call via exec.Command("sh", "-c", …) (runner/runner.go)
+	// and the PATH in the sandbox image resolves "sh" to /bin/sh (the verify
+	// scripts use #!/bin/sh; verifySh in loop_verify_job.go). D46 gate input.
+	runnerShellPath = "/bin/sh"
+
+	// runnerShellBase is the shell's binary name (for messages: "via sh -c").
+	runnerShellBase = "sh"
 )
+
+// missingShellInExecList (D46) reports whether a NON-EMPTY union of referenced
+// AgentPolicy exec lists omits the runner's shell (runnerShellPath). An empty
+// list is a clean pass: with no exec allows the KubeArmor policy carries no
+// process rule, so exec is unrestricted (the default-deny minimum the demo
+// runs). A list that exists but cannot run the runner's tool calls wedges the
+// Loop under an enforcing Block policy, so it is the rejection case.
+func missingShellInExecList(exec []string) bool {
+	if len(exec) == 0 {
+		return false
+	}
+	for _, e := range exec {
+		if e == runnerShellPath {
+			return false
+		}
+	}
+	return true
+}

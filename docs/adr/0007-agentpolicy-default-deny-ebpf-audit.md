@@ -194,6 +194,46 @@ containers, per D29). It does **not** cover:
   so the decision audit shows what the agent was allowed to do in each
   iteration.
 
+## Exec fencing does not cover an agent shell (D46, owner decision (c), 2026-10-03)
+
+**Recorded:** docs/REVIEW-PHASE1-R20.md D46, owner decision 2026-10-03.
+
+**Finding (S5b demo run, observed, not a code bug):** the task's `AgentPolicy`
+(`exec: [/usr/local/go/bin/go, /usr/bin/git]`) translated to a KubeArmor
+`action: Block` policy that allows only those two paths. KubeArmor enforced
+it: `kubectl exec … sh` returned `exec /usr/bin/sh: permission denied`. The
+runner runs **every tool call through `/bin/sh -c`**
+(`runner/runner.go`, `exec.CommandContext(ctx, "sh", "-c", …)`), and `go build`
+spawns `compile`, `link` and `asm`. The agent wedged: 30 minutes of wall time,
+no model request.
+
+**Consequence for the threat model:** an exact-path allow-list cannot describe
+an agent shell — the set of binaries a shell command spawns is open-ended.
+Owner decision (c): **no exec fencing for agents in the MVP.** Exec inside the
+agent sandbox is **deliberately unrestricted**; what protects the system
+instead is (1) the **network fence** (the operator's egress proxy + the
+per-Loop NetworkPolicy — the agent's only path off the pod is the allowlist),
+(2) **credential isolation** (ADR-0006: the agent holds no model key, no git
+credential — the Secrets are mounted into the model proxy / init containers
+only), and (3) the **verify Job** (ADR-0005: the operator's trusted check
+containers, run outside the agent's sandbox, decide the result). A Loop that
+references an `AgentPolicy` whose `exec` list omits the runner's shell
+(`/bin/sh`) is **rejected fail-fast** by the controller (`PolicyValid=False`
+reason `ExecListMissingShell`, sandbox never started) instead of wedging —
+the gate exists so the documented no-agent-exec-fencing posture cannot be
+accidentally reversed by a policy that looks authoritative. Exec fencing
+continues to apply to the **operator-owned proxies** (model proxy, egress
+proxy: each may exec only its own binary). D41 per-tool proxies — the agent
+gets no general shell, tools are proxied — will make agent exec fencing
+meaningful again when it lands; until then this ADR's exec-allowlist section
+applies to proxies only.
+
+**Where it is recorded:** the `spec.exec` field comment in
+`api/v1alpha1/agentpolicy_types.go` (carried into the CRD by `make manifests`),
+the controller gate `validateAgentPolicies` (reason `ExecListMissingShell`),
+and the gocli task-1 example (the fenced `1.agentpolicy.yaml` was deleted with
+the reason documented in `examples/gocli/tasks.md`).
+
 ## Consequences
 
 - New CRD `AgentPolicy` (+ optional `ClusterAgentPolicy`) and a

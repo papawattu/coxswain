@@ -115,7 +115,7 @@ var _ = Describe("I43: agent KubeArmorPolicy same-Loop update", func() {
 		// network allows (no egress proxy expected).
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: i43AgentKaptPolicy, Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{i43ExecOne}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{i43ExecOne, "/bin/sh"}},
 		})).To(Succeed())
 
 		const loopName = "i43-kapt"
@@ -142,7 +142,7 @@ var _ = Describe("I43: agent KubeArmorPolicy same-Loop update", func() {
 		// allow and a network allow (the egress proxy now becomes expected).
 		ap := &coxv1alpha1.AgentPolicy{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: i43AgentKaptPolicy}, ap)).To(Succeed())
-		ap.Spec.Exec = []string{i43ExecOne, i43ExecTwo}
+		ap.Spec.Exec = []string{i43ExecOne, i43ExecTwo, "/bin/sh"}
 		ap.Spec.Network = []string{i43NetAllow}
 		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
 		reconcileLoop(loopName, ns)

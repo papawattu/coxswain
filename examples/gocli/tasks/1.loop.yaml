@@ -52,12 +52,12 @@ spec:
     # defaults to spec.workspace.ref ("initial", the Gitea repo's default
     # branch). branchPrefix default "coxswain/" -> branch coxswain/gocli-task1.
     mode: PullRequest
-  # No policyRefs on purpose (S5b demo): the exec allow-list in
-  # 1.agentpolicy.yaml covers the Go toolchain and git only, but the
-  # runner's shell tool calls spawn an open-ended set of binaries (sh,
-  # shell built-ins, the go toolchain's compile/link helpers). Under an
-  # enforcing KubeArmor policy the agent's shell cannot exec and the Loop
-  # wedges. Exec fencing for an agent shell is D41 work; until then the
-  # demo runs the default-deny minimum (no AgentPolicy reference).
+  # No policyRefs (D46, owner decision (c), 2026-10-03): exec fencing
+  # applies to the operator-owned proxies, not the agent — the former
+  # 1.agentpolicy.yaml exec allow-list (go, git) cannot cover the
+  # runner's shell tool calls (sh -c spawns an open-ended set of binaries)
+  # and wedged the Loop under an enforcing Block policy, so the file was
+  # deleted. The demo runs the default-deny minimum; the network fence,
+  # credential isolation (ADR-0006) and the verify Job protect the system.
   loop:
     maxIterations: 3

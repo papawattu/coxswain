@@ -1108,6 +1108,177 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 	})
 })
 
+var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
+	ctx := context.Background()
+
+	freshNS := func(prefix string) string {
+		ns := prefix + "-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		return ns
+	}
+
+	// s6DriveToFailedDelivery drives a Loop to Succeeded, creates the deliver
+	// Job, then drives it to a FAILED state: a failed deliver Job (Status.
+	// Failed=1) + the Delivered condition False/DeliveryFailed + the
+	// annotation present. It returns the reconciler and the fresh Loop.
+	s6DriveToFailedDelivery := func(name, ns, repo string) *LoopReconciler {
+		r := s6Succeeded(name, ns, repo)
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		// Mark the Job as failed (the deliver Job's Status.Failed counter).
+		job.Status.Failed = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+		// Reconcile so the operator maps the failed Job -> Delivered=False/DeliveryFailed.
+		s6Reconcile(r, ns, name)
+		// Add the redeliver annotation to the Loop.
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		if loop.Annotations == nil {
+			loop.Annotations = map[string]string{}
+		}
+		loop.Annotations[redeliverAnnotation] = "1"
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+		return r
+	}
+
+	// s6AddRedeliverAnnotation sets the redeliver annotation on the Loop.
+	s6AddRedeliverAnnotation := func(name, ns string) {
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		if loop.Annotations == nil {
+			loop.Annotations = map[string]string{}
+		}
+		loop.Annotations[redeliverAnnotation] = "1"
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+	}
+
+	It("re-delivers a FAILED delivery: deletes the failed Job, clears the Delivered condition, removes the annotation, and creates a fresh Job for the same verifiedCommit", func() {
+		ns := freshNS("i52-redel")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "redel1"
+		r := s6DriveToFailedDelivery(name, ns, "")
+
+		By("capturing the old failed Job's UID before re-delivery")
+		oldJob := s6GetJob(ns, name)
+		oldUID := oldJob.UID
+		Expect(oldJob.Status.Failed).To(BeNumerically(">", 0), "the Job must be in a failed state")
+
+		By("reconciling: the operator sees the annotation + the failed Job and triggers re-delivery")
+		// The reconcile: ensureDeliverRedeliver deletes the failed Job + clears
+		// the Delivered condition + removes the annotation; ensureDeliverJob
+		// then creates a fresh Job (the name is still taken until the async
+		// delete lands, so the fresh Job is created on a subsequent reconcile
+		// — the requeue is the proof the operator triggered re-delivery).
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).ToNot(BeZero(), "a redeliver trigger must requeue (the failed Job delete is async; the fresh Job is created on the next pass)")
+
+		By("reconciling until the fresh Job appears (the async delete landed + the fresh Job was created)")
+		var fresh *batchv1.Job
+		for range 50 {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+			probe := &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver", Namespace: ns}, probe); err == nil && probe.UID != oldUID {
+				fresh = probe
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		Expect(fresh).ToNot(BeNil(), "a fresh deliver Job must be created after the failed Job delete lands")
+		Expect(fresh.UID).ToNot(Equal(oldUID), "the fresh Job must be a DIFFERENT object (a new Job, not the old one)")
+		Expect(fresh.Annotations[verifyCommitAnnotation]).To(Equal(s6HeadCommit),
+			"the fresh Job is stamped for the SAME pinned verifiedCommit (re-delivery is for the same commit)")
+		Expect(fresh.Status.Failed).To(BeZero(), "the fresh Job starts with no failures")
+
+		By("re-reading the Loop from the API server: the annotation is removed and the Delivered condition is InProgress")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		_, annVal := loop.Annotations[redeliverAnnotation]
+		Expect(annVal).To(BeEmpty(), "the redeliver annotation must be REMOVED after triggering re-delivery (re-read from the API server)")
+		ok, status, reason := s6Cond(loop)
+		Expect(ok).To(BeTrue(), "the Delivered condition must be present after re-delivery")
+		Expect(status).To(Equal(metav1.ConditionFalse), "a fresh deliver Job is InProgress (not yet delivered)")
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryInProgress),
+			"the Delivered condition must be InProgress after the re-delivery trigger (not DeliveryFailed)")
+	})
+
+	It("does NOT re-deliver an already-delivered Loop: removes the annotation and changes nothing else", func() {
+		ns := freshNS("i52-dlv")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "dlv1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		uid := job.UID
+
+		By("recording the delivery outcome (a valid termination message)")
+		loop := s6Reconcile(r, ns, name)
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s6ValidTermination(loop)},
+		})
+		loop = s6Reconcile(r, ns, name)
+		Expect(loop.Status.Delivery).ToNot(BeNil(), "the delivery must be recorded first")
+		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
+
+		By("adding the redeliver annotation to an already-delivered Loop")
+		s6AddRedeliverAnnotation(name, ns)
+
+		By("reconciling: the operator removes the annotation and does NOT re-deliver")
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("re-reading the Loop from the API server: the annotation is removed and the delivery is unchanged")
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		_, annVal := loop.Annotations[redeliverAnnotation]
+		Expect(annVal).To(BeEmpty(), "the redeliver annotation must be REMOVED (re-read from the API server)")
+		// The delivery is unchanged: still Delivered=True, same commit.
+		Expect(loop.Status.Delivery).ToNot(BeNil(), "the delivery must be unchanged (still recorded)")
+		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit), "the delivery commit must be unchanged")
+		ok, status, reason := s6Cond(loop)
+		Expect(ok).To(BeTrue())
+		Expect(status).To(Equal(metav1.ConditionTrue), "the Delivered condition must still be True (not re-delivered)")
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDelivered))
+		// The Job is unchanged: same UID (not deleted/recreated).
+		fresh := s6GetJob(ns, name)
+		Expect(fresh.UID).To(Equal(uid), "an already-delivered Loop must NOT delete/recreate its deliver Job")
+	})
+
+	It("keeps the annotation and does nothing while a deliver Job is still in progress (I49 in-progress case)", func() {
+		ns := freshNS("i52-inprog")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "inprog1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		uid := job.UID
+
+		By("the deliver Job is in progress (Status.Failed=0, Status.Succeeded=0)")
+		Expect(job.Status.Failed).To(BeZero())
+		Expect(job.Status.Succeeded).To(BeZero())
+
+		By("adding the redeliver annotation while the Job is in progress")
+		s6AddRedeliverAnnotation(name, ns)
+
+		By("reconciling: the operator keeps the annotation (the Job is in progress — I49 in-progress case)")
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("re-reading the Loop from the API server: the annotation is KEPT and the Job is unchanged")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		_, annVal := loop.Annotations[redeliverAnnotation]
+		Expect(annVal).ToNot(BeEmpty(), "the redeliver annotation must be KEPT while the Job is in progress (I49 in-progress case)")
+		// The Job is unchanged: same UID (not deleted/recreated).
+		fresh := s6GetJob(ns, name)
+		Expect(fresh.UID).To(Equal(uid), "an in-progress deliver Job must NOT be deleted/recreated by the annotation")
+	})
+})
+
 var _ = Describe("S6: egress proxy hosts (unit)", func() {
 	It("returns the deliver hosts for an external github.com delivery and none otherwise", func() {
 		r := &LoopReconciler{}

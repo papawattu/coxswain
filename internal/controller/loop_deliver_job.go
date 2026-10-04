@@ -56,8 +56,28 @@
 // with path /pulls/<prNumber>). A valid message is written to
 // status.delivery + the Delivered=True condition; a failed init/push
 // container is Delivered=False reason DeliveryFailed — the Job is NOT
-// retried (backoffLimit 0, one Job per verifiedCommit); the operator
-// re-runs delivery by clearing status.delivery + the condition.
+// retried (backoffLimit 0, one Job per verifiedCommit). A failed delivery
+// is re-run by the supported trigger: the coxswain.io/redeliver annotation
+// (any value) — see ensureDeliverRedeliver. Never re-deliver a Loop whose
+// status.delivery is already recorded for its current verifiedCommit;
+// re-delivery stays idempotent (the existing open PR is reused by the push
+// container).
+//
+// Re-delivery (I52): a failed delivery is terminal (backoffLimit 0) — the
+// operator's supported way back is the coxswain.io/redeliver annotation
+// (any value) on a Succeeded Loop whose Delivered condition is
+// False/DeliveryFailed. The operator then (ensureDeliverRedeliver, BEFORE
+// the Job ensure): deletes the failed deliver Job (Background propagation),
+// clears the Delivered condition (status.delivery is already nil for a
+// failed delivery), and REMOVES the annotation, so the next reconcile
+// creates a fresh deliver Job for the SAME pinned verifiedCommit. An
+// annotation on a Loop whose status.delivery is already set for its
+// current verifiedCommit is just removed (nothing else changes — never
+// re-deliver an already-delivered commit). While a deliver Job is still
+// running (in progress, no outcome yet) the annotation is LEFT ALONE: the
+// Job is allowed to finish (succeeding records the delivery and the
+// read-back clears the annotation; failing leaves the annotation in place
+// so the operator can trigger a re-delivery once the Job has failed).
 //
 // Network: the deliver Job's pod gets its OWN NetworkPolicy
 // (<loop>-deliver-np, deliverNetpolName): DNS + the egress proxy (I42) when the repo host
@@ -188,6 +208,9 @@ func deliverJobName(loopName string) string { return derivedName(loopName, "-del
 // reconcile stays within the gocyclo budget.
 func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	requeue := false
+	if err := r.ensureDeliverRedeliver(ctx, loop); err != nil {
+		return false, err
+	}
 	if ok, err := r.ensureDeliverJob(ctx, loop); err != nil {
 		return false, err
 	} else if ok {
@@ -239,6 +262,135 @@ func deliverDraft(loop *coxv1alpha1.Loop) bool {
 	return true
 }
 
+// redeliverAnnotation is the operator's supported re-delivery trigger
+// (I52): any value (typically set by a future `kubectl cox redeliver`) on a
+// Loop whose delivery failed restarts delivery for the SAME pinned
+// verifiedCommit (the fresh Job reuses the open PR — re-delivery stays
+// idempotent).
+const redeliverAnnotation = "coxswain.io/redeliver"
+
+// redeliverEligible reports whether the Loop is a valid re-delivery target
+// for the redeliverAnnotation: Succeeded + mode PullRequest + a pinned
+// verifiedCommit + repo (deliveryExpected) and NO recorded delivery for the
+// current verifiedCommit (status.delivery nil or another commit — status.
+// delivery is nil for a failed delivery; a delivery already recorded for
+// this commit must NEVER be re-delivered: the annotation is just removed).
+func redeliverEligible(loop *coxv1alpha1.Loop) bool {
+	if !deliveryExpected(loop) {
+		return false
+	}
+	// redeliverEligible is the SINGLE guard for re-delivery: it returns false
+	// when the Loop is already delivered for its current verifiedCommit
+	// (status.delivery set + commit matches) or when delivery is not expected
+	// (not Succeeded / mode off / no pin / no repo). A single guard so a
+	// mutation can target it (I52 acceptance: the "already delivered" check
+	// must be mutated to make the second spec FAIL).
+	return loop.Status.Delivery == nil ||
+		loop.Status.Delivery.Commit != loop.Status.CurrentVerify.VerifiedCommit
+}
+
+// removeDeliverAnnotation clears the redeliver annotation. It returns
+// changed (true when the object was actually updated) and error; an
+// already-absent annotation is a no-op. The annotation is considered PRESENT
+// when the key exists (even with an empty value), so `coxswain.io/redeliver=`
+// (set with no value) also triggers re-delivery.
+func (r *LoopReconciler) removeDeliverAnnotation(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	if _, ok := loop.Annotations[redeliverAnnotation]; !ok {
+		return false, nil
+	}
+	updated := loop.DeepCopy()
+	delete(updated.Annotations, redeliverAnnotation)
+	if err := r.Patch(ctx, updated, client.MergeFrom(loop)); err != nil {
+		return false, fmt.Errorf("remove %s annotation from %s: %w", redeliverAnnotation, loop.Name, err)
+	}
+	return true, nil
+}
+
+// ensureDeliverRedeliver handles the coxswain.io/redeliver annotation (I52,
+// the supported re-delivery trigger for a FAILED delivery): a Succeeded
+// Loop whose Delivered condition is False/DeliveryFailed with the annotation
+// gets the failed deliver Job deleted (Background propagation), the
+// Delivered condition cleared, and the annotation removed — the SAME
+// reconcile then creates a fresh deliver Job for the same pinned
+// verifiedCommit (the push container reuses the existing open PR, so
+// re-delivery stays idempotent). A Loop whose status.delivery is already
+// set for its current verifiedCommit (already delivered — including the
+// in-progress case of a running deliver Job) keeps nothing else touched: the
+// annotation is just removed. The annotation on a Loop whose deliver Job is
+// still in progress (no outcome recorded yet, no job failure) is left alone
+// (documented behaviour — I49 in-progress case): the Job is allowed to
+// finish; on success the read-back clears the annotation, on failure the
+// annotation stays so the operator can re-trigger once the Job has failed.
+func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	// The annotation is PRESENT when the key exists (even with an empty
+	// value): `coxswain.io/redeliver=` (set with no value) must trigger.
+	if _, ok := loop.Annotations[redeliverAnnotation]; !ok {
+		return nil
+	}
+	// Only a Succeeded Loop with delivery expected + a pinned commit can be
+	// re-delivered; anything else (not Succeeded, mode off, no pin) just
+	// gets the annotation removed. The single guard (redeliverEligible) also
+	// covers the "already delivered for this verifiedCommit" case — never
+	// re-deliver a Loop whose status.delivery is already set for its current
+	// verifiedCommit (I52 acceptance: the "already Delivered" spec must FAIL
+	// if this guard is mutated to ignore the already-delivered case).
+	if !redeliverEligible(loop) {
+		if _, err := r.removeDeliverAnnotation(ctx, loop); err != nil {
+			return err
+		}
+		logf.FromContext(ctx).Info("Removed redeliver annotation (delivery not eligible for re-delivery)", "loop", loop.Name)
+		return nil
+	}
+	// A deliver Job that is still running (no outcome recorded yet) is left
+	// alone: the Job is allowed to finish (succeeding records the delivery
+	// and clears the annotation via the read-back; failing leaves the
+	// annotation so the operator can re-trigger). Only a FAILED deliver Job
+	// is a re-delivery target.
+	jobName := deliverJobName(loop.Name)
+	existing := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: loop.Namespace}, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		// No Job (never created, or already deleted): a fresh Job is
+		// created by ensureDeliverJob in this reconcile; just remove the
+		// annotation (and clear the stale Delivered condition if present).
+	case err != nil:
+		return fmt.Errorf("get deliver Job %s for redeliver: %w", jobName, err)
+	case existing.Status.Failed == 0:
+		// In progress (or just created): leave the annotation in place (the
+		// documented in-progress behaviour).
+		logf.FromContext(ctx).Info("Redeliver annotation kept: deliver Job still in progress (I49 in-progress case)",
+			"loop", loop.Name, "job", jobName)
+		return nil
+	}
+	// A failed Job (or none): delete it (Background propagation), clear the
+	// Delivered condition, and remove the annotation — the fresh Job for
+	// the same pinned verifiedCommit is created by ensureDeliverJob below.
+	if existing.UID != "" {
+		prop := metav1.DeletePropagationBackground
+		if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &prop}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete failed deliver Job %s for redeliver: %w", jobName, err)
+		}
+		logf.FromContext(ctx).Info("Deleted failed deliver Job for redeliver (Background propagation)",
+			"job", jobName, "loop", loop.Name)
+	}
+	// Clear the Delivered condition (status.delivery is already nil for a
+	// failed delivery): the next ensureDeliverJob pass sets it back to
+	// InProgress for the fresh Job.
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == coxv1alpha1.DeliveredCondition {
+			loop.Status.Conditions = append(loop.Status.Conditions[:i], loop.Status.Conditions[i+1:]...)
+			break
+		}
+	}
+	if _, err := r.removeDeliverAnnotation(ctx, loop); err != nil {
+		return err
+	}
+	logf.FromContext(ctx).Info("Redeliver triggered: cleared the Delivered condition and removed the annotation; creating a fresh deliver Job for the same verifiedCommit",
+		"loop", loop.Name, "verifiedCommit", loop.Status.CurrentVerify.VerifiedCommit)
+	return nil
+}
+
 // deliveryRequested reports whether this Loop wants delivery and has not
 // recorded it yet: phase Succeeded (terminal; no re-tasking) + mode
 // PullRequest + a pinned verifiedCommit (delivery is bound to the commit
@@ -250,8 +402,9 @@ func deliverDraft(loop *coxv1alpha1.Loop) bool {
 // verifiedCommit -> skip), not "status.delivery != nil -> skip": a Loop
 // that re-verifies after a recorded delivery pins a NEW verifiedCommit and
 // MUST re-deliver (the stale guard deletes the old Job); the old recorded
-// outcome must not suppress the new one. The operator clears
-// status.delivery + the condition to re-run delivery for the SAME commit.
+// outcome must not suppress the new one. A failed delivery for the SAME
+// commit is re-run by the operator's redeliverAnnotation (I52,
+// ensureDeliverRedeliver).
 func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded {
 		return false, "phase is not Succeeded"
@@ -351,7 +504,7 @@ func (r *LoopReconciler) ensureDeliverJob(ctx context.Context, loop *coxv1alpha1
 // (the termination message is read + validated on the next pass); failed ->
 // Delivered=False reason DeliveryFailed + requeue (terminal: the Job is NOT
 // retried — backoffLimit 0, one Job per verifiedCommit; the operator
-// re-runs delivery by clearing status.delivery + the condition).
+// re-runs delivery with the coxswain.io/redeliver annotation — I52).
 func (r *LoopReconciler) deliverJobOutcome(loop *coxv1alpha1.Loop, job *batchv1.Job) (bool, error) {
 	switch {
 	case job.Status.Succeeded > 0:
@@ -361,7 +514,7 @@ func (r *LoopReconciler) deliverJobOutcome(loop *coxv1alpha1.Loop, job *batchv1.
 	case job.Status.Failed > 0:
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryFailed,
-			fmt.Sprintf("deliver Job %s failed (no retry: one Job per verifiedCommit; clear status.delivery + the condition to re-run delivery)",
+			fmt.Sprintf("deliver Job %s failed (no retry: one Job per verifiedCommit; re-run delivery with the coxswain.io/redeliver annotation — I52)",
 				deliverJobName(loop.Name)))
 		return true, nil
 	default:
@@ -1147,7 +1300,7 @@ func (r *LoopReconciler) deliverReadbackChanged(ctx context.Context, loop *coxv1
 		// verifiedCommit, backoffLimit 0).
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryFailed,
-			fmt.Sprintf("deliver push container exited %d: %s (no retry; clear status.delivery + the condition to re-run delivery)",
+			fmt.Sprintf("deliver push container exited %d: %s (no retry; re-run delivery with the coxswain.io/redeliver annotation — I52)",
 				terminated.ExitCode, strings.TrimSpace(terminated.Reason)))
 		return true, nil
 	}
@@ -1162,7 +1315,7 @@ func (r *LoopReconciler) deliverReadbackChanged(ctx context.Context, loop *coxv1
 		// (the result is invalid).
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryFailed,
-			fmt.Sprintf("deliver termination message invalid: %s (no retry; clear status.delivery + the condition to re-run delivery)", err.Error()))
+			fmt.Sprintf("deliver termination message invalid: %s (no retry; re-run delivery with the coxswain.io/redeliver annotation — I52)", err.Error()))
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "DeliveryFailed",
 				"deliver termination message invalid: %s", err.Error())

@@ -66,9 +66,17 @@ var _ = Describe("S5a: consumed-claim discard (OS5 P3)", func() {
 	It("discards a consumed success claim (observedPhase != current phase): no progress, no advance, no event", func() {
 		// The prior cycle has JUST iterated back: status is Implementing
 		// (iteration 2, pin cleared), and the pod still holds the prior
-		// PLANNING success claim (iteration 0 — phase-init had not
-		// re-written .coxswain/iteration yet, so the stale-iteration guard
-		// does not fire: this is the exact shape the kind event stream hit).
+		// PLANNING success claim. This spec isolates the CONSUMED-claim
+		// discard guard (S5a OS5 P3): the claim's iteration matches the
+		// current status iteration (2 == 2 — post-S5a, phase-init writes the
+		// CURRENT iteration into .coxswain/iteration on the recycle, so the
+		// new-cycle claim carries iteration 2), so the stale-iteration guard
+		// does NOT fire and the discard guard is the only line that catches
+		// the re-consumption. (The exact kind shape — an iteration-0 claim at
+		// status iteration 2 — is caught by the stale-iteration guard
+		// instead; I48 extended it to cover iteration-0 claims once
+		// status.iteration > 0, and the iteration-0 spec lives in
+		// loop_verify_job_envtest_test.go.)
 		// Without the discard guard, the claim is re-consumed:
 		// claimPhaseForAdvance(Planning success) == Implementing, so the B1
 		// match nextPhase(Implementing, Implementing) == Verifying ADVANCES
@@ -84,7 +92,7 @@ var _ = Describe("S5a: consumed-claim discard (OS5 P3)", func() {
 				BaseCommit:   s5aBaseCommit,
 			},
 		}
-		swapClaim(&PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhasePlanning, Status: claimSuccess})
+		swapClaim(&PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhasePlanning, Status: claimSuccess, Iteration: 2})
 
 		// Reconcile 1: the consumed claim is discarded (observedPhase
 		// Planning != current phase Implementing). No progress write, no
@@ -109,8 +117,9 @@ var _ = Describe("S5a: consumed-claim discard (OS5 P3)", func() {
 		// A blocked claim naming the CURRENT phase is STILL consumed and
 		// recorded (OS1: the runner's last word is observability; a blocked
 		// claim never advances, so re-stamping it is idempotent and correct).
-		// The discard guard applies to SUCCESS claims only.
-		swapClaim(&PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "blocked", BlockedReason: "model timeout"})
+		// The discard guard applies to SUCCESS claims only. Iteration 2
+		// matches the current status iteration (the same-cycle marker).
+		swapClaim(&PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "blocked", BlockedReason: "model timeout", Iteration: 2})
 		pending, changed = r.advancePhaseFromClaim(ctx, loop)
 		Expect(pending).To(BeFalse())
 		Expect(changed).To(BeTrue(), "a BLOCKED claim on the current phase is still recorded into progress (OS1)")

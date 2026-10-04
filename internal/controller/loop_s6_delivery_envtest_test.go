@@ -1285,11 +1285,17 @@ var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
 		By("the Job SUCCEEDS: the read-back records the delivery, clears the keep marker, and removes the annotation")
 		job.Status.Succeeded = 1
 		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
-		loop := s6Reconcile(r, ns, name) // the read-back sees the Job succeeded; reads the pod's termination message
+		// Create the pod with a VALID termination message BEFORE the next
+		// reconcile: the read-back reads the pod (pod-blind: list by the
+		// deliver-for label) and records the delivery. If the pod does not
+		// exist yet, the read-back returns "no pod yet" and the condition
+		// stays InProgress — the annotation would NOT be removed in that
+		// pass (the keep marker is still set from the in-progress reconcile).
+		loop := s6Reconcile(r, ns, name) // drive the read-back to the "no pod yet" state (no outcome)
 		s6DeliverPod(ns, name, corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s6ValidTermination(loop)},
 		})
-		loop = s6Reconcile(r, ns, name) // the read-back records the delivery + clears the keep marker + removes the annotation
+		loop = s6Reconcile(r, ns, name) // the read-back reads the pod's termination message + records the delivery + clears the keep marker + removes the annotation
 
 		By("re-reading the Loop from the API server: the delivery is recorded and the annotation is REMOVED")
 		Expect(loop.Status.Delivery).ToNot(BeNil(), "a successful read-back must record the delivery")
@@ -1302,6 +1308,80 @@ var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
 		Expect(ok).To(BeTrue())
 		Expect(status).To(Equal(metav1.ConditionTrue))
 		Expect(reason).To(Equal(coxv1alpha1.ReasonDelivered))
+	})
+
+	It("re-delivers a COMPLETED deliver Job whose result was rejected (Succeeded=1, Delivered=False/DeliveryFailed): deletes the Job, clears the condition, removes the annotation, and creates a fresh Job for the same verifiedCommit", func() {
+		ns := freshNS("i52-done")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "done1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+
+		By("the deliver Job COMPLETES (Status.Succeeded=1, Status.Failed=0) but its result is REJECTED (invalid termination message -> Delivered=False/DeliveryFailed)")
+		job.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+		_ = s6Reconcile(r, ns, name) // the read-back sees the Job succeeded; no pod yet -> no outcome
+		// Create the pod with an INVALID termination message (missing the prURL field) -> the read-back rejects it -> Delivered=False/DeliveryFailed.
+		s6DeliverPod(ns, name, corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "branch=coxswain/" + name + "\ncommit=" + s6HeadCommit + "\nprNumber=7\n"},
+		})
+		loop := s6Reconcile(r, ns, name)
+		_, status, reason := s6Cond(loop)
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed),
+			"a completed Job with an invalid termination message must be DeliveryFailed")
+		Expect(loop.Status.Delivery).To(BeNil(), "an invalid termination message must NOT record a delivery")
+
+		oldUID := job.UID
+
+		By("deleting the rejected pod (the Job's async delete removes it in-cluster; envtest has no pod garbage collector, so the spec deletes it explicitly)")
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name + "-deliver-pod", Namespace: ns}})).To(Succeed())
+
+		By("adding the redeliver annotation to the DeliveryFailed Loop")
+		s6AddRedeliverAnnotation(name, ns)
+
+		By("reconciling: the operator sees the annotation + the COMPLETED Job on a DeliveryFailed Loop and re-delivers")
+		// The reconcile: ensureDeliverRedeliver deletes the COMPLETED Job (a
+		// completed Job on a DeliveryFailed Loop is NOT in progress — it is
+		// re-run like a failed one) + clears the Delivered condition;
+		// Reconcile removes the annotation at the END (after the trailing
+		// status write); ensureDeliverJob then creates a fresh Job (the name
+		// is still taken until the async delete lands, so the fresh Job is
+		// created on a subsequent reconcile).
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("reconciling until a fresh Job exists (the async delete landed), then reconciling once more (the fresh Job's outcome pass sets the Delivered condition to InProgress)")
+		var fresh *batchv1.Job
+		for range 50 {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+			probe := &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver", Namespace: ns}, probe); err == nil && probe.UID != oldUID {
+				fresh = probe
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		Expect(fresh).ToNot(BeNil(), "a COMPLETED Job on a DeliveryFailed Loop must be deleted and re-run when the annotation is present")
+		Expect(fresh.UID).ToNot(Equal(oldUID), "the fresh Job must be a DIFFERENT object (a new Job, not the old one)")
+		Expect(fresh.Annotations[verifyCommitAnnotation]).To(Equal(s6HeadCommit),
+			"the fresh Job is stamped for the SAME pinned verifiedCommit (re-delivery is for the same commit)")
+		Expect(fresh.Status.Failed).To(BeZero(), "the fresh Job starts with no failures")
+		// One more reconcile: the fresh Job's outcome pass sets the Delivered
+		// condition to InProgress (the create pass does not set it).
+		loop = s6Reconcile(r, ns, name)
+
+		By("re-reading the Loop from the API server: the annotation is removed and the Delivered condition is InProgress")
+		_, annOk := loop.Annotations[redeliverAnnotation]
+		Expect(annOk).To(BeFalse(), "the redeliver annotation must be REMOVED after triggering re-delivery (re-read from the API server)")
+		ok, status, reason := s6Cond(loop)
+		Expect(ok).To(BeTrue(), "the Delivered condition must be present after re-delivery")
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryInProgress),
+			"a fresh deliver Job is InProgress (not DeliveryFailed); got reason=%q", reason)
 	})
 
 	It("treats an empty-value annotation (coxswain.io/redeliver=) as PRESENT and re-delivers a FAILED delivery", func() {

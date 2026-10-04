@@ -358,10 +358,14 @@ func (r *LoopReconciler) removeDeliverAnnotation(ctx context.Context, loop *coxv
 // set for its current verifiedCommit (already delivered — including the
 // in-progress case of a running deliver Job) keeps nothing else touched: the
 // annotation is just removed. The annotation on a Loop whose deliver Job is
-// still in progress (no outcome recorded yet, no job failure) is left alone
-// (documented behaviour — I49 in-progress case): the Job is allowed to
-// finish; on success the read-back clears the annotation, on failure the
-// annotation stays so the operator can re-trigger once the Job has failed.
+// still in progress (no outcome recorded yet: Failed=0 AND Succeeded=0) is
+// left alone (documented behaviour — I49 in-progress case): the Job is
+// allowed to finish; on success the read-back clears the annotation, on
+// failure the annotation stays so the operator can re-trigger once the Job
+// has failed. A COMPLETED Job (Succeeded=1, Failed=0) is NOT in progress —
+// it is deleted and re-run like a failed one when the annotation is present
+// (a completed Job whose result was rejected, e.g. an invalid termination
+// message, must not be stuck as in progress forever).
 func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	// The in-progress keep marker is an IN-MEMORY-only signal set by this
 	// pass's earlier call: removeDeliverAnnotation skips the patch when it
@@ -405,11 +409,16 @@ func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1
 		// annotation (and clear the stale Delivered condition if present).
 	case err != nil:
 		return fmt.Errorf("get deliver Job %s for redeliver: %w", jobName, err)
-	case existing.Status.Failed == 0:
+	case existing.Status.Failed == 0 && existing.Status.Succeeded == 0:
 		// In progress (or just created): leave the annotation in place (the
-		// documented in-progress behaviour). The reconcile's END-of-pass
-		// removeDeliverAnnotation would otherwise remove it (its fresh re-read
-		// sees the key still present), so set the keep marker first:
+		// documented in-progress behaviour). A COMPLETED Job (Succeeded=1,
+		// Failed=0) is NOT in progress — it fell through to the delete path
+		// below (a completed Job whose result was rejected — e.g. an invalid
+		// termination message — is re-run like a failed one: the fresh Job
+		// re-pushes + re-reads the termination message). The reconcile's
+		// END-of-pass removeDeliverAnnotation would otherwise remove the
+		// annotation for a still-running Job (its fresh re-read sees the key
+		// still present), so set the keep marker first:
 		// removeDeliverAnnotation skips the patch when it sees it.
 		if loop.Annotations == nil {
 			loop.Annotations = map[string]string{}
@@ -423,15 +432,17 @@ func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1
 			"loop", loop.Name, "job", jobName)
 		return nil
 	}
-	// A failed Job (or none): delete it (Background propagation) and clear
-	// the Delivered condition — the annotation is removed by Reconcile at
-	// the END of this pass (removeDeliverAnnotation, after the trailing
-	// status write), and the fresh Job for the same pinned verifiedCommit is
-	// created by ensureDeliverJob below (in this pass when the Job was
-	// already gone; on the next pass after the async delete of a live failed
-	// Job lands). The condition clear rides the Reconcile's own trailing
-	// Status().Update (the in-memory change is detected via DeepEqual
-	// against condsBefore). Idempotent either way.
+	// A failed Job (or a COMPLETED Job whose result was rejected — Succeeded=1
+	// with Delivered=False/DeliveryFailed, e.g. an invalid termination
+	// message), or none: delete it (Background propagation) and clear the
+	// Delivered condition — the annotation is removed by Reconcile at the END
+	// of this pass (removeDeliverAnnotation, after the trailing status write),
+	// and the fresh Job for the same pinned verifiedCommit is created by
+	// ensureDeliverJob below (in this pass when the Job was already gone; on
+	// the next pass after the async delete of a live Job lands). The condition
+	// clear rides the Reconcile's own trailing Status().Update (the in-memory
+	// change is detected via DeepEqual against condsBefore). Idempotent either
+	// way.
 	if existing.UID != "" {
 		prop := metav1.DeletePropagationBackground
 		if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &prop}); err != nil && !apierrors.IsNotFound(err) {
@@ -1430,11 +1441,11 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 	// read-back: clear the in-memory keep marker (set by
 	// ensureDeliverRedeliver for an in-progress Job) so the reconcile's
 	// END-of-pass removeDeliverAnnotation can remove the annotation — the
-	// Job is no longer in progress, so the documented keep behaviour no
-	// longer applies (a successful read-back records the delivery and the
-	// operator's trigger is done; a failed read-back makes the Job terminal,
-	// and the operator re-triggers explicitly once the DeliveryFailed
-	// condition is visible).
+	// Job is no longer in progress (Failed=0 AND Succeeded=0), so the
+	// documented keep behaviour no longer applies (a successful read-back
+	// records the delivery and the operator's trigger is done; a failed
+	// read-back makes the Job terminal, and the operator re-triggers
+	// explicitly once the DeliveryFailed condition is visible).
 	if loop.Annotations != nil {
 		delete(loop.Annotations, redeliverKeepSignal)
 	}

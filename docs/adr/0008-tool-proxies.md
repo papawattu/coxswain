@@ -56,7 +56,9 @@ reaches the tool through the proxy and never holds the credential.
 tools:
   - name: github
     upstream: https://api.github.com
-    credentialSecretRef: my-github-cred   # Secret in the policy's namespace
+    credentialSecretRef:
+      name: my-github-cred   # Secret in the policy's namespace
+      key: token
     rules:
       - methods: [GET]
         paths: ["/repos/acme/*"]
@@ -65,13 +67,18 @@ tools:
 - `name` (required): DNS-1035 label; unique within the effective policy
   union; forms the proxy pod/Service name (`<loop>-tool-<name>`).
 - `upstream` (required): a base URL (`scheme://host[:port][/prefix]`). The
-  proxy dials only this host. `https://` requires the proxy to dial a TLS
-  tunnel (CONNECT); `http://` is plain HTTP.
-- `credentialSecretRef` (optional): a Secret key (`{key}` form as used for
-  model creds, e.g. `token`) mounted read-only into the proxy pod **only**.
-  The proxy injects it into requests (header form is the typed extension's
-  job; the Phase 1 generic proxy uses one `Authorization: Bearer <value>`
-  header). A tool entry without it is a credential-less passthrough.
+  proxy dials only this host, as the **origin** of its own request: it is a
+  **reverse proxy**, not a forward proxy (see the binary section — the
+  opaque-TLS argument). `https://` means the proxy originates its own TLS
+  connection to the upstream and verifies its certificate; `http://` is
+  plain.
+- `credentialSecretRef` (optional): a `{name, key}` pair — the Secret and
+  the key within it — mounted read-only into the proxy pod **only**.
+  The proxy injects the value into requests (header form is the typed
+  extension's job; the Phase 1 generic proxy uses one
+  `Authorization: Bearer <value>` header, replacing any agent-supplied
+  `Authorization` / `Proxy-Authorization`). A tool entry without it is a
+  credential-less passthrough.
 - `rules[]` (required, ≥1): each rule is a set of allowed HTTP **methods**
   (GET/POST/PATCH/PUT/DELETE) plus allowed **path prefixes** (matched
   against the request path *after* the upstream's base prefix). Anything
@@ -92,25 +99,49 @@ forwarding with credential injection":
 - Listens on `:8080` (env `TOOL_PROXY_PORT`, default 8080). Reads rules +
   upstream + policy hash from a mounted file (`TOOL_POLICY_JSON`) or env
   (Phase 1 simplification, as in I42a).
-- Forwards HTTP/HTTPS requests (absolute-form or `CONNECT`) to the upstream
-  **only**. The request path is checked against the rules:
-  - method + path prefix match a rule → inject the credential (read from
-    the mounted Secret file at startup; **never logged, never echoed into
-    an audit record, never returned to the agent**), forward to the
-    resolved upstream IP (same resolved-IP carve-outs as I42a: a tool
-    upstream must not resolve into the cluster — the check applies before
-    dialing, and the dial is to the resolved IP with no re-resolution);
+- **Reverse proxy, not a forward proxy.** A forward proxy's `CONNECT` tunnel
+  to an `https://` upstream is opaque TLS: the proxy cannot see the method
+  or path and cannot inject the credential, so the request rules and the
+  credential boundary would not exist for the common case. Instead the
+  agent speaks **plain HTTP, origin-form** in-cluster to
+  `COX_TOOL_<NAME>_URL + path` (no `Host` override of the upstream, no
+  absolute-form, no `CONNECT`); the proxy rule-checks, strips
+  agent-supplied `Authorization` / `Proxy-Authorization`, injects the
+  credential (read from the mounted Secret file; **never logged, never
+  echoed into an audit record, never returned to the agent**), and
+  **originates its own request** to the fixed upstream — TLS with the
+  upstream's certificate **verified** for `https://` (a MITM of the
+  upstream is the attacker's goal, not the proxy's). The upstream is fixed
+  by config: there is no per-request authority to validate, so the rules
+  engine sees the real method and path of every upstream request.
+  - `CONNECT` and absolute-form requests → `405 Method Not Allowed`, no
+    upstream dial (they would bypass the rules or redirect the dial).
+  - The path is **normalised before matching** (rejects/`400`s `..`,
+    `%2e%2e`, `%2F`, `//`, backslash and NUL encodings) and matched by
+    **segment prefix** — `/repos/acme/` covers `/repos/acme/x` but not
+    `/repos/acmer` — so no encoding trick can route a request past a rule.
+  - method + path match a rule → forward to the resolved upstream IP
+    (same resolved-IP carve-outs as I42a: a tool upstream must not resolve
+    into the cluster — the check applies before dialing, and the dial is to
+    the resolved IP with no re-resolution);
   - no match → `403 Forbidden`, no upstream dial.
-- **Audit on stdout, one JSON line per request (allowed and blocked)**,
+- **No redirect following.** A `3xx` response from the upstream is returned
+  to the agent **as-is**; the proxy does not re-resolve, re-check or dial
+  the `Location` target. (A redirect to another server is that server's
+  problem to receive *nothing*: the agent holds no credential and its own
+  egress is fenced, but the proxy itself never dials a second host.)
+- **Audit on stdout, one JSON line per request (allowed and blocked)**, with
+  the `405` and `400` (normalisation) rejections audited like 403s,
   the Q4 envelope fields: `{time, loop, namespace, source:
   "tool-proxy", action: "request", tool: <name>, method, path, status,
   policy: <hash>}`. The credential is **redacted** (absent from the record
   by construction — the proxy logs method/path/status only, never
   headers or the credential).
-- No TLS termination / no MITM of the upstream (same as the egress proxy:
-  it tunnels or forwards, it does not decrypt). No secrets other than the
-  one tool credential. No SA token. Read-only rootfs. UID 65535 (distinct
-  from agent 65532, model proxy 65533, egress proxy 65534).
+- The proxy is the **TLS client** to the upstream (it originates and
+  verifies; it never terminates or MITM the upstream's cipher). No secrets
+  other than the one tool credential. No SA token. Read-only rootfs.
+  UID 65535 (distinct from agent 65532, model proxy 65533, egress proxy
+  65534).
 
 ### Two-layer allowlisted egress (per I42, per tool proxy)
 

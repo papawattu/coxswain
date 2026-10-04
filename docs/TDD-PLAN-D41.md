@@ -48,21 +48,40 @@ Existing seams the slices reuse (verified against `main`):
 
 **Scope:** a new Go binary (`cmd/tool-proxy/` + `internal/toolproxy/`) that
 forwards HTTP requests to a single upstream, gated by request rules, with
-credential injection. It is the model proxy generalised from "forward all to
-one endpoint" to "rule-check, then forward, injecting the credential".
+credential injection. It is a **reverse proxy** — the agent speaks plain
+HTTP, origin-form, in-cluster to the proxy; the proxy rule-checks, strips
+agent-supplied auth, injects the credential, and **originates its own
+request** (TLS, verified) to the fixed upstream — not a forward proxy:
+`CONNECT` to an `https://` upstream is opaque TLS, so a forward proxy could
+neither rule-check nor inject (R19 P1).
 
 - Listens on `:8080` (env `TOOL_PROXY_PORT`, default 8080).
 - Config via env (Phase 1, as in I42a): `TOOL_NAME`, `TOOL_UPSTREAM`
   (base URL), `TOOL_RULES_JSON` (array of `{methods: [...], paths: [...]}`),
   `TOOL_CREDENTIAL_FILE` (path to the mounted Secret key file; optional),
   `TOOL_POLICY_HASH`, `LOOP_NAME`, `LOOP_NAMESPACE`, `POD_CIDR`, `SERVICE_CIDR`.
-- **Request handling:** plain-HTTP absolute-form requests and `CONNECT`
-  tunnels are the only accepted shapes. The authority must be the upstream's
-  host (any other host → 403 + audit). The request path (relative to the
-  upstream's base prefix) is checked against the rules:
-  - **match** (method in the rule's methods AND path prefix in the rule's
-    prefixes) → credential injection (if configured: `Authorization: Bearer
-    <file contents>`), forward to the resolved upstream IP.
+- **Request handling (reverse proxy):** the only accepted shape is a
+  plain-HTTP, **origin-form** request (relative path, no `CONNECT`, no
+  absolute-form URI — those would redirect the dial or bypass the rules):
+  - `CONNECT` or absolute-form → **`405 Method Not Allowed`**, no upstream
+    dial, audited.
+  - the path is **normalised before matching**: `..`, `%2e%2e`, `%2F`, `//`,
+    backslash and NUL encodings are rejected (`400`, audited, no dial) or
+    cleaned to canonical form, so an encoding cannot route a request past a
+    rule;
+  - matching is **segment prefix**: rule prefix `/repos/acme/` covers
+    `/repos/acme/x/y` but **not** `/repos/acmer` (a segment, not a byte
+    string, is the unit); stated in the package doc and pinned by the
+    tests below;
+  - **match** (method in the rule's methods AND normalised segment prefix in
+    the rule's prefixes) → strip agent-supplied `Authorization` /
+    `Proxy-Authorization`, inject the credential (if configured:
+    `Authorization: Bearer <file contents>`), and originate the request to
+    the resolved upstream IP (TLS with the upstream's certificate
+    **verified** for `https://`; `http://` plain). **No redirect
+    following**: a `3xx` is returned to the agent as-is; the proxy never
+    re-resolves or dials a `Location` target. The dial is to the same
+    resolved IP, no re-resolution;
   - **no match** → `403 Forbidden`, JSON audit record, no upstream dial.
 - **Resolved-IP carve-outs (I42a backstop):** the proxy resolves the upstream
   host itself, rejects (403 + audit) if **any** resolved IP is in the
@@ -82,10 +101,32 @@ one endpoint" to "rule-check, then forward, injecting the credential".
 
 **Unit tests (written first, `internal/toolproxy/`):**
 - **Rule engine (table-driven):** allowed method+prefix → forwarded; allowed
-  prefix wrong method → 403; disallowed prefix → 403; path-prefix semantics
-  (`/repos/acme/*` matches `/repos/acme/x/y` but not `/repos/acmer`); a
-  request whose authority is not the upstream host → 403; empty rule set →
-  everything 403.
+  prefix wrong method → 403; disallowed prefix → 403; **segment-prefix
+  semantics** (`/repos/acme/` matches `/repos/acme/x/y` but not
+  `/repos/acmer`); empty rule set → everything 403.
+- **Reverse-proxy shape (R19 P1):** a `CONNECT` request → **405 with no
+  upstream dial** (the test upstream's request log stays empty) and an
+  absolute-form request (`GET http://host/path`) → 405, no dial. An allowed
+  origin-form request to an **`https://` test upstream** (an `httptest` TLS
+  server whose CA the test trusts) **arrives at the upstream with the
+  credential header** — proving the proxy originates a verified TLS
+  connection and can see what a tunnel cannot.
+- **Rule-bypass cases (R19 P2):**
+  - **Path normalisation:** `..` (`/repos/../secrets`), percent-encoded
+    (`%2e%2e`, `%2F`), `//`, a backslash (`/repos/\..\x`) and a NUL byte →
+    rejected (`400`) or cleaned to the canonical path **before** matching,
+    so the table-driven cases `/repos/acme/../../etc` and
+    `/repos/acme%2f..%2fetc` land on the same verdict as their canonical
+    forms and never on an allowed rule's prefix by accident. No dial in
+    either outcome.
+  - **No redirect following:** the test upstream returns a `302` with
+    `Location:` to a second test server → the agent gets the 302 as-is and
+    **the second server sees no request** (its request log is empty).
+  - **Agent-supplied auth stripped:** a request carrying
+    `Authorization: Bearer agent-forged` (and
+    `Proxy-Authorization`) with credential configured → the upstream
+    sees the configured credential, not the agent's; the audit line
+    contains neither value.
 - **Credential injection:** with a credential file, the upstream request
   (captured by a test server) carries `Authorization: Bearer <value>`; without
   one, no such header. **Redaction:** the audit line for a credentialed
@@ -102,9 +143,13 @@ one endpoint" to "rule-check, then forward, injecting the credential".
 `make test`; the image is buildable (Dockerfile mirroring `cmd/egress-proxy`'s,
 COPY to `/usr/local/bin/tool-proxy`) so D41c can reference it.
 
-**Gate mutation (I49 norm):** disabling the rule check (forward everything)
-in a scratch worktree must make the rule-engine spec FAIL (the 403 cases get
-forwarded).
+**Gate mutations (I49 norm):** in a scratch worktree, each applied exactly
+as named and must make its spec FAIL:
+- disabling the rule check (forward everything) → the rule-engine spec FAILS
+  (the 403 cases get forwarded);
+- removing the path normaliser (match the raw request path) → the
+  rule-bypass/normalisation spec FAILS (`/repos/acme/../../etc`-style
+  encodings reach the matcher uncleaned);
 
 **Dependencies:** none (leaf binary; the same position in the graph as I42a).
 
@@ -116,7 +161,9 @@ forwarded).
 No controller behaviour in this slice (D41c consumes it).
 
 - **Shape:** `AgentPolicySpec.Tools []ToolSpec`, `ToolSpec{Name string,
-  Upstream string, CredentialSecretRef string, Rules []ToolRule}`,
+  Upstream string, CredentialSecretRef CredentialSecretRef, Rules
+  []ToolRule}`, `CredentialSecretRef{Name string, Key string}` (a `{name,
+  key}` pair: the Secret and the key within it),
   `ToolRule{Methods []string, Paths []string}`. JSON tags omitempty;
   `tools` omitempty (policies without tools are unchanged).
 - **CEL validation (on AgentPolicy, the I42e pattern):**
@@ -194,10 +241,11 @@ Service per tool in the effective union. This is `ensureProxy`/
   - env: `TOOL_NAME`, `TOOL_UPSTREAM`, `TOOL_RULES_JSON`,
     `TOOL_POLICY_HASH` (the `status.policy.effectiveHash`), `LOOP_NAME`,
     `LOOP_NAMESPACE`, `POD_CIDR`, `SERVICE_CIDR`;
-  - credential: when `credentialSecretRef` is set, the Secret is mounted
-    **read-only into this container only** (`/tool-cred`, mode 0444) with
-    `TOOL_CREDENTIAL_FILE=/tool-cred/<key>`; **never into the sandbox pod**
-    (asserted);
+  - credential: when `credentialSecretRef` (a `{name, key}` pair) is set,
+    the Secret is mounted **read-only into this container only**
+    (`/tool-cred/<name>`, mode 0444) with
+    `TOOL_CREDENTIAL_FILE=/tool-cred/<name>/<key>`; **never into the sandbox
+    pod** (asserted);
   - liveness/readiness TCP 8080; resources parity (limits 100m/128Mi,
     requests 10m/32Mi); `automountServiceAccountToken: false`.
 - **Labels (disjoint, like egressProxyLabels):**
@@ -234,8 +282,10 @@ Service per tool in the effective union. This is `ensureProxy`/
    `TOOL_UPSTREAM`/`TOOL_RULES_JSON`/`TOOL_POLICY_HASH`, liveness TCP 8080),
    Service exists (port 8080, matching selector), sandbox Suspended
    (pod not Ready yet).
-3. **Credential mount.** Same with `credentialSecretRef: gh-cred` → the pod's
-   volumes contain the Secret (mode 0444) mounted at `/tool-cred`, and the
+3. **Credential mount.** Same with `credentialSecretRef: {name: gh-cred,
+   key: token}` → the pod's
+   volumes contain the Secret `gh-cred` (mode 0444) mounted at
+   `/tool-cred/gh-cred`, and the
    **sandbox pod spec has no volume referencing that Secret** (the
    zero-credential property, envtest-provable half).
 4. **Owned+Ready gate: not Ready → Suspended.** Tool proxy pod present, not

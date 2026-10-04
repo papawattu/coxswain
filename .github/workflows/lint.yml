@@ -11,7 +11,11 @@ jobs:
     permissions:
       contents: read
     name: lint
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'coxswain-runners' }}
+    # D44: lint runs on GitHub-hosted runners (the self-hosted
+    # coxswain-runners label has 0 runners, so these runs sat 'queued'
+    # forever). The repo is public, so hosted minutes are free. The kind
+    # e2e (test-e2e.yml) stays local per D44.
+    runs-on: ubuntu-latest
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -22,6 +26,7 @@ jobs:
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          # Go's built-in module and build caches.
 
       - name: Check linter configuration
         run: make lint-config

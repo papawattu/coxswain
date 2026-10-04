@@ -224,7 +224,10 @@ const (
 	// cred is the default configured credential.
 	cred = "cred"
 	// upstreamHost is the hostname a resolver-backed proxy resolves.
-	upstreamHost      = "upstream.test"
+	upstreamHost = "upstream.test"
+	// tlsUpstreamHost is the hostname the verified-TLS test upstream uses
+	// (the certificate is issued for it; SNI + verification target).
+	tlsUpstreamHost   = "example.test"
 	upstreamBaseHTTP  = "http://" + upstreamHost
 	upstreamBaseHTTPS = "https://" + upstreamHost
 

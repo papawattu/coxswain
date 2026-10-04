@@ -87,23 +87,18 @@ func TestAbsoluteForm405NoDial(t *testing.T) {
 // the certificate against that hostname (not the IP).
 func TestAllowedRequestTLSCredential(t *testing.T) {
 	log := &requestLog{}
-	srv, ca := newTLSTestServer(t, log, "example.test")
-	// The TLS server's certificate is for example.test. The upstream base
-	// is https://example.test:443 (the configured hostname); the resolver
-	// maps example.test to publicIP (carve-out clean) and the dial seam
-	// maps publicIP back to the loopback where the server listens. The
-	// proxy dials the resolved IP with SNI = the upstream HOSTNAME
-	// (example.test) and verifies the certificate against it (not the
-	// dial IP).
+	srv, ca := newTLSTestServer(t, log, tlsUpstreamHost)
+	// The TLS server's certificate is issued for example.test. The upstream
+	// base is https://example.test:443 (the configured hostname); the
+	// resolver maps example.test to publicIP (carve-out clean) and the dial
+	// seam maps publicIP back to the loopback where the server listens.
+	// The proxy dials the RESOLVED IP with SNI = the upstream HOSTNAME
+	// (example.test) and verifies the certificate against that hostname
+	// (not the dial IP) — proving it originates a verified TLS connection
+	// and can see what a tunnel cannot.
 	port := loopbackPort(t, srv.URL)
-	resolver := &mockResolver{hosts: map[string][]string{"example.test": {publicIP}}, calls: map[string]int{}}
+	resolver := &mockResolver{hosts: map[string][]string{tlsUpstreamHost: {publicIP}}, calls: map[string]int{}}
 	var sink stringsBuilder
-	// The upstream base is the configured hostname (example.test), not the
-	// loopback: the resolver maps it to publicIP (carve-out clean) and the
-	// dial seam maps publicIP back to the loopback where the server
-	// listens. The proxy dials the resolved IP with SNI = the upstream
-	// HOSTNAME (example.test) and verifies the certificate against it (not
-	// the dial IP). The certificate is issued for example.test.
 	p, err := newProxy(Config{
 		ToolName:     toolName,
 		UpstreamBase: "https://example.test:443",
@@ -118,13 +113,17 @@ func TestAllowedRequestTLSCredential(t *testing.T) {
 		t.Fatalf("newProxy: %v", err)
 	}
 	p.SetAuditSink(&sink)
-	// Trust the test CA (the proxy verifies the upstream's certificate).
+	// The transport's TLS client config sends SNI (ServerName) = the
+	// upstream hostname and verifies the certificate against it.
 	tr, ok := p.client().Transport.(*http.Transport)
 	if !ok {
 		t.Fatal("transport is not *http.Transport")
 	}
 	if tr.TLSClientConfig == nil {
 		t.Fatal("https upstream must have a TLS client config (SNI + verification)")
+	}
+	if tr.TLSClientConfig.ServerName != tlsUpstreamHost {
+		t.Fatalf("TLS ServerName = %q, want the upstream hostname (SNI), not the dial IP", tr.TLSClientConfig.ServerName)
 	}
 	tr.TLSClientConfig.RootCAs = ca
 
@@ -147,8 +146,53 @@ func TestAllowedRequestTLSCredential(t *testing.T) {
 		t.Fatalf("audit line must not contain the credential: %s", sink.String())
 	}
 	// Exactly one lookup (no re-resolution).
-	if n := resolver.count("example.test"); n != 1 {
+	if n := resolver.count(tlsUpstreamHost); n != 1 {
 		t.Fatalf("upstream host looked up %d times, want exactly 1", n)
+	}
+}
+
+// The SNI/verification is REAL: an upstream certificate that does NOT cover
+// the hostname the proxy dials must be REJECTED (502, no upstream request
+// seen), not accepted. This proves the proxy verifies the certificate
+// against the upstream hostname rather than trusting any peer cert — a
+// tunnel would have no certificate to verify at all.
+func TestTLSCertNotForDialHostRejected(t *testing.T) {
+	log := &requestLog{}
+	// The upstream base is example.test:443, but the certificate the test
+	// server presents is issued for a DIFFERENT hostname (wrong.test), so
+	// verification against example.test must fail.
+	srv, _ := newTLSTestServer(t, log, "wrong.test")
+	port := loopbackPort(t, srv.URL)
+	resolver := &mockResolver{hosts: map[string][]string{tlsUpstreamHost: {publicIP}}, calls: map[string]int{}}
+	var sink stringsBuilder
+	p, err := newProxy(Config{
+		ToolName:     toolName,
+		UpstreamBase: "https://example.test:443",
+		Rules:        rulesGET(),
+		Credential:   "cred-secret",
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		Resolver:     resolver,
+	}, dialToPublic(port))
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	p.SetAuditSink(&sink)
+	// No CA trust (and even with trust, the cert is for wrong.test, not
+	// example.test, so verification against the SNI hostname fails).
+	req := httptest.NewRequest(methodGET, toolPath, nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	// A certificate that does not cover the dial host is rejected: 502
+	// (upstream TLS error), and the upstream server saw no completed
+	// request (the handshake failed before any HTTP exchange).
+	if rec.Code != 502 {
+		t.Fatalf("status = %d, want 502 (certificate for %q must not verify against the dial host)", rec.Code, "wrong.test")
+	}
+	if n := log.len(); n != 0 {
+		t.Fatalf("upstream saw %d requests; a failed TLS handshake must not complete an HTTP request", n)
 	}
 }
 

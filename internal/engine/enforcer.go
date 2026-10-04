@@ -55,4 +55,11 @@ const (
 	ReasonPolicyRejected      = "PolicyRejected"
 	ReasonAuditOnly           = "AuditOnly"
 	ReasonEnforcementDisabled = "EnforcementDisabled" // P1 merge: --allow-unenforced escape hatch (off by default)
+	// ReasonEnforcementUnverified (I46): the operator has no Enforcer (no engine
+	// probe) and cannot observe whether the engine is enforcing. The Loop runs
+	// because --allow-unenforced is set; the condition says so, and names the
+	// flag as the reason it runs. Distinct from EnforcementDisabled (an
+	// Enforcer that reports not-enforcing) so the condition describes the
+	// cluster, not the flag.
+	ReasonEnforcementUnverified = "EnforcementUnverified"
 )

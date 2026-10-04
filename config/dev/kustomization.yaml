@@ -1,6 +1,6 @@
 # Dev/kind only: the base install (config/default) plus --allow-unenforced
 # AND --allow-unenforced-network. Never use for production — Loops run with
-# PolicyEnforced=False (EnforcementDisabled) and, on non-enforcing CNIs
+# PolicyEnforced=Unknown (EnforcementUnverified) and, on non-enforcing CNIs
 # (kindnet), with NetworkEnforced=False (EnforcementDisabled).
 #
 # I42c review P2: the egress-proxy NetworkPolicy carve-outs and the I42e

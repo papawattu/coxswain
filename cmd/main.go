@@ -92,7 +92,9 @@ func main() {
 	var allowUnenforced bool
 	flag.BoolVar(&allowUnenforced, "allow-unenforced", false,
 		"Run Loops even when the eBPF engine is not enforcing (off by default; dev escape hatch). "+
-			"Loops run with PolicyEnforced=False reason EnforcementDisabled.")
+			"The PolicyEnforced condition reports what was OBSERVED (the Enforcer's own reason, "+
+			"or Unknown/EnforcementUnverified when there is no Enforcer); the flag is named in "+
+			"the message as the reason the Loop runs (I46).")
 	// D38: the network escape hatch (separate from allow-unenforced — the two
 	// are independent) and the probe configuration.
 	var allowUnenforcedNetwork bool

@@ -201,9 +201,9 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		Expect(ownerRefs[0].UID).NotTo(BeEmpty(), "the owner ref must carry the Loop's UID")
 	})
 
-	It("runs with PolicyEnforced=False (EnforcementDisabled) when AllowUnenforced is set (P1 merge)", func() {
+	It("reports Unknown/EnforcementUnverified when the Enforcer is nil and AllowUnenforced is set (I46)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), AllowUnenforced: true}
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), AllowUnenforced: true} // no Enforcer
 		ns := "c6b-unenforced"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -212,16 +212,101 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
 		Expect(err).NotTo(HaveOccurred())
 
-		// The Loop runs (not held Suspended) because AllowUnenforced is set,
-		// but the condition records EnforcementDisabled (NOT enforced).
+		// The Loop runs (not held Suspended) because AllowUnenforced is set, but
+		// with no Enforcer the operator has OBSERVED nothing: the condition must
+		// be Unknown/EnforcementUnverified naming --allow-unenforced, never
+		// False/EnforcementDisabled (I46: the condition describes the cluster,
+		// not the flag).
 		Eventually(func() bool {
 			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeRunning
 		}, "10s").Should(BeTrue(), "AllowUnenforced lets the Loop run")
 		loop := getLoop(ns, "l1")
 		c := policyEnforcedCondition(loop.Status.Conditions)
 		Expect(c).NotTo(BeNil(), "the PolicyEnforced condition must exist")
-		Expect(string(c.Status)).To(Equal("False"), "AllowUnenforced runs the Loop but it is NOT enforced")
-		Expect(c.Reason).To(Equal("EnforcementDisabled"), "reason must be EnforcementDisabled (loudly visible)")
+		Expect(string(c.Status)).To(Equal("Unknown"), "no Enforcer -> unknown, not asserted False")
+		Expect(c.Reason).To(Equal("EnforcementUnverified"), "reason must be EnforcementUnverified (no engine probe)")
+		Expect(c.Message).To(ContainSubstring("--allow-unenforced"), "the message must name the escape hatch as the reason the Loop runs")
+	})
+
+	It("reports Unknown/EnforcementUnverified (held without the flag, runs with it) when the Enforcer says EnforcementUnverified (I46 / I32 stub)", func() {
+		// The real KubeArmorEnforcer stub (until the I32 relay is wired) reports
+		// (false, ReasonEnforcementUnverified). The condition must be
+		// Unknown/EnforcementUnverified in BOTH cases — it asserts nothing about
+		// the cluster and names the flag as the only reason the Loop runs — and
+		// the gate is still fail-closed: without the flag the sandbox is held
+		// Suspended.
+		enf := &fakeEnforcer{enforcing: false, reason: engine.ReasonEnforcementUnverified}
+
+		// Without the flag: held Suspended (fail-closed unchanged), Unknown condition.
+		ctx = context.Background()
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: enf} // no AllowUnenforced
+		ns := "c6b-unverified-noflag"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		createPolicy(ns)
+		Expect(k8sClient.Create(ctx, buildLoop(ns, "p1"))).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func() bool {
+			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeSuspended
+		}, "10s").Should(BeTrue(), "no flag -> the unverified engine holds the sandbox Suspended (fail-closed unchanged)")
+		c := policyEnforcedCondition(getLoop(ns, "l1").Status.Conditions)
+		Expect(c).NotTo(BeNil(), "the PolicyEnforced condition must exist")
+		Expect(string(c.Status)).To(Equal("Unknown"), "unverified (no probe) -> Unknown, never False or True")
+		Expect(c.Reason).To(Equal("EnforcementUnverified"), "reason must be EnforcementUnverified")
+
+		// With the flag: runs, same Unknown condition (the flag is named in the message).
+		ctx = context.Background()
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: enf, AllowUnenforced: true}
+		ns = "c6b-unverified-flag"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		createPolicy(ns)
+		Expect(k8sClient.Create(ctx, buildLoop(ns, "p1"))).To(Succeed())
+
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func() bool {
+			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeRunning
+		}, "10s").Should(BeTrue(), "AllowUnenforced lets the Loop run")
+		c = policyEnforcedCondition(getLoop(ns, "l1").Status.Conditions)
+		Expect(c).NotTo(BeNil(), "the PolicyEnforced condition must exist")
+		Expect(string(c.Status)).To(Equal("Unknown"), "the flag does not flip Unknown to False/True (I46)")
+		Expect(c.Reason).To(Equal("EnforcementUnverified"), "reason must be EnforcementUnverified")
+		Expect(c.Message).To(ContainSubstring("--allow-unenforced"), "the message must name the escape hatch as the reason the Loop runs")
+	})
+
+	It("reports False/NodeNotEnforcing (the Enforcer's own reason) when the Enforcer says not-enforcing and AllowUnenforced is set (I46)", func() {
+		ctx = context.Background()
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+			Enforcer:        &fakeEnforcer{enforcing: false, reason: engine.ReasonNodeNotEnforcing},
+			AllowUnenforced: true}
+		ns := "c6b-notenforced-allow"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		createPolicy(ns)
+		Expect(k8sClient.Create(ctx, buildLoop(ns, "p1"))).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "l1"}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The Loop runs because AllowUnenforced is set, but the OBSERVED result
+		// (the Enforcer's own reason) is kept: False/NodeNotEnforcing, never
+		// False/EnforcementDisabled (I46). The message keeps the Enforcer's
+		// reason AND names the escape hatch.
+		Eventually(func() bool {
+			return getSandboxMode(ns, "l1-sandbox") == sandboxv1beta1.SandboxOperatingModeRunning
+		}, "10s").Should(BeTrue(), "AllowUnenforced lets the Loop run")
+		loop := getLoop(ns, "l1")
+		c := policyEnforcedCondition(loop.Status.Conditions)
+		Expect(c).NotTo(BeNil(), "the PolicyEnforced condition must exist")
+		Expect(string(c.Status)).To(Equal("False"), "observed not-enforcing -> False")
+		Expect(c.Reason).To(Equal("NodeNotEnforcing"), "reason must be the Enforcer's own reason, not EnforcementDisabled")
+		Expect(c.Message).To(ContainSubstring("NodeNotEnforcing"), "the Enforcer's reason must be in the message")
+		Expect(c.Message).To(ContainSubstring("--allow-unenforced"), "the message must name the escape hatch as the reason the Loop runs")
 	})
 
 	It("sets PolicyTranslationLossy=True when a host:PORT network allow loses its port (I41)", func() {

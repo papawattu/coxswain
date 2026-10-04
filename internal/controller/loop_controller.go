@@ -540,32 +540,38 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	changed = changed || baseCommitChanged
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
-	if changed || conditionsChanged {
-		// The trailing status write can 409 against a concurrent metadata
-		// patch on the same object in this reconcile (the I52 redeliver pass
-		// removes the redeliver annotation, and the patch lands before or
-		// after this Update). On conflict: re-read fresh, overlay this
-		// reconcile's status, and retry once. The annotation patch has its
-		// own retry, so neither write errors.
-		if err := r.Status().Update(ctx, &loop); err != nil {
-			if !apierrors.IsConflict(err) {
-				return ctrl.Result{}, err
-			}
-			fresh := &coxv1alpha1.Loop{}
-			if getErr := r.Get(ctx, req.NamespacedName, fresh); getErr != nil {
-				return ctrl.Result{}, getErr
-			}
-			fresh.Status = loop.Status
-			if uErr := r.Status().Update(ctx, fresh); uErr != nil {
-				return ctrl.Result{}, uErr
-			}
-		}
+	// I52: the trailing status write + the end-of-reconcile annotation PATCH
+	// (AFTER it, so the two Loop writes never race) are extracted to
+	// finalizeLoopStatus to keep the top-level reconcile within the gocyclo
+	// budget.
+	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// finalizeLoopStatus persists the reconcile's status changes (the trailing
+// Status().Update) and, AFTER it, removes the coxswain.io/redeliver
+// annotation (I52) — the two Loop writes in one reconcile never race (the
+// patch reads a fresh copy whose resourceVersion already includes the status
+// write). A genuine conflict surfaces as a reconcile error and the next
+// reconcile recomputes from a fresh read — no IsConflict overlay-retry:
+// re-reading a fresh Loop and re-writing this reconcile's status would
+// defeat optimistic concurrency (it can silently overwrite status another
+// writer just set). Extracted so the top-level reconcile stays within the
+// gocyclo budget.
+func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged bool) error {
+	if changed || conditionsChanged {
+		if err := r.Status().Update(ctx, loop); err != nil {
+			return err
+		}
+	}
+	_, err := r.removeDeliverAnnotation(ctx, loop)
+	return err
 }
 
 // emitPhaseAdvancedEvent (OS5, S4) emits the Kubernetes Event on a phase

@@ -696,7 +696,11 @@ fi
 # missing or unreadable default branch must NOT be treated as "no default
 # branch to refuse" (that would let a regression that breaks the lookup
 # deliver straight onto the repo's mainline).
-DEFAULT_BRANCH=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}" | sed -n 's/.*"default_branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || { echo "deliver push: cannot determine the default branch (repo GET failed); refusing"; exit 1; }
+# JSON is parsed with python3 (the push image has it; no jq) reading ONLY the
+# top-level key — a greedy sed picks the LAST match anywhere in the body, so
+# a nested repository object (GitHub's parent/template_repository) with its
+# own default_branch would win (I53).
+DEFAULT_BRANCH=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}" | python3 -c 'import json,sys; v=json.load(sys.stdin).get("default_branch"); print(v if isinstance(v,str) else "")') || { echo "deliver push: cannot determine the default branch (repo GET failed); refusing"; exit 1; }
 if [ -z "${DEFAULT_BRANCH}" ]; then
   echo "deliver push: cannot determine the default branch (repo GET returned no default_branch); refusing"
   exit 1
@@ -721,8 +725,24 @@ git -C "${SRC}" ` + deliverSafeDir() + ` -c core.hooksPath=/dev/null` + gitCredF
 # The lookup and the create both return the PR's html_url: the operator's
 # trust boundary is the provider's OWN URL (never one the script assembles).
 EXISTING=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}/pulls?state=open&head=${OWNER}:${BRANCH}") || EXISTING=""
-PR_NUM=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
-PR_URL=$(printf '%s' "${EXISTING}" | tr -d '\n' | sed -n 's|.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*/pull[s]*/[0-9][^"]*\)".*|\1|p' | head -1)
+# Top-level JSON fields via python3 (no jq in the push image): number and
+# html_url come from the PR OBJECT ITSELF — a nested object (head/parent
+# repos, etc.) with its own number/html_url must not be picked (I53).
+PR_NUM=$(printf '%s' "${EXISTING}" | tr -d '\n' | python3 -c 'import json,sys
+try:
+    a=json.load(sys.stdin)
+    pr=a[0] if isinstance(a,list) and a else a
+    print(int(pr["number"]))
+except Exception:
+    pass')
+PR_URL=$(printf '%s' "${EXISTING}" | tr -d '\n' | python3 -c 'import json,sys
+try:
+    a=json.load(sys.stdin)
+    pr=a[0] if isinstance(a,list) and a else a
+    u=pr.get("html_url")
+    print(u if isinstance(u,str) and "/pull" in u else "")
+except Exception:
+    pass')
 if [ -n "${PR_NUM}" ]; then
   # An open PR for the branch: reuse it (idempotent).
   [ -n "${PR_URL}" ] || { echo "deliver push: existing PR ${PR_NUM} has no html_url"; exit 1; }
@@ -733,8 +753,20 @@ else
   # already pushed the delivery branch, and the base branch exists on the
   # remote (clone-base fetched it) — a failed create is a hard failure.
   CREATED=$(curl -sfS -X POST -H "$API_AUTH" -H "Content-Type: application/json" -d "${PAYLOAD}" "${API_BASE}/repos/${OWNER}/${REPO_NAME}/pulls") || { echo "deliver push: PR create failed (see API response)"; exit 1; }
-  PR_NUM=$(printf '%s' "${CREATED}" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
-  PR_URL=$(printf '%s' "${CREATED}" | sed -n 's|.*"html_url"[[:space:]]*:[[:space:]]*"\([^"]*/pull[s]*/[0-9][^"]*\)".*|\1|p')
+  # Same top-level-only parse as the lookup above (I53).
+  PR_NUM=$(printf '%s' "${CREATED}" | tr -d '\n' | python3 -c 'import json,sys
+try:
+    p=json.load(sys.stdin)
+    print(int(p["number"]))
+except Exception:
+    pass')
+  PR_URL=$(printf '%s' "${CREATED}" | tr -d '\n' | python3 -c 'import json,sys
+try:
+    p=json.load(sys.stdin)
+    u=p.get("html_url")
+    print(u if isinstance(u,str) and "/pull" in u else "")
+except Exception:
+    pass')
 fi
 [ -n "${PR_NUM}" ] || { echo "deliver push: no PR number returned (API unreachable or refused)"; exit 1; }
 [ -n "${PR_URL}" ] || { echo "deliver push: no PR html_url returned"; exit 1; }

@@ -86,7 +86,12 @@ type DeliveryConfig struct {
 	// Draft controls whether the opened PR is a draft. Default true: the
 	// builder marks it ready explicitly (via the GraphQL
 	// markPullRequestReadyForReview path, since the gh CLI `pr ready`
-	// command requires the workflow scope the token lacks).
+	// command requires the workflow scope the token lacks). How draft is
+	// represented is provider-specific: on GitHub the PR is opened as a
+	// real draft PR; on Gitea the create-PR API ignores the draft flag, so
+	// the draft is marked by prefixing the PR title with "WIP: " (Gitea's
+	// draft convention) — the PR is NOT draft in the API's own state, the
+	// title prefix is the only marker.
 	// +kubebuilder:default=true
 	// +optional
 	Draft *bool `json:"draft,omitempty"`

@@ -210,6 +210,7 @@ const (
 	ComponentAgentLabel       = "agent"
 	ComponentProxyLabel       = "model-proxy"
 	ComponentEgressProxyLabel = "egress-proxy"
+	ComponentToolProxyLabel   = "tool-proxy"
 )
 
 // DefaultClusterDomain is the default cluster service DNS domain (R16 I44
@@ -219,18 +220,19 @@ const (
 const DefaultClusterDomain = "cluster.local"
 
 // ProxyComponentSelector is the label selector for the operator's Pod and
-// Service cache. It matches the model proxy and the egress proxy — the two
-// operator-owned per-Loop proxy components the operator Gets through the
-// cache. It must stay in sync with proxyLabels (internal/controller) and
-// egressProxyLabels (internal/controller); TestProxyComponentSelector pins
-// both.
+// Service cache. It matches the model proxy, the egress proxy and the
+// tool proxies — the operator-owned per-Loop proxy components the operator
+// Gets through the cache. It must stay in sync with proxyLabels,
+// egressProxyLabels and toolProxyLabels (internal/controller);
+// TestProxyComponentSelectorMatchesBothProxies pins all three label sets.
 //
 // NOTE (I45): the agent component is deliberately EXCLUDED from this
 // selector — the manager's pod cache must stay proxies-only. The I45
-// ValidatingAdmissionPolicy matches all three component values
-// (agent, model-proxy, egress-proxy) for its own label-based denial, but
-// that is a separate concern from the operator's cache scoping.
+// ValidatingAdmissionPolicy matches all four component values
+// (agent, model-proxy, egress-proxy, tool-proxy) for its own label-based
+// denial, but that is a separate concern from the operator's cache scoping.
 func ProxyComponentSelector() labels.Selector {
-	r, _ := labels.NewRequirement(ComponentLabelKey, selection.In, []string{ComponentProxyLabel, ComponentEgressProxyLabel})
+	r, _ := labels.NewRequirement(ComponentLabelKey, selection.In,
+		[]string{ComponentProxyLabel, ComponentEgressProxyLabel, ComponentToolProxyLabel})
 	return labels.NewSelector().Add(*r)
 }

@@ -187,7 +187,7 @@ type ToolSpec struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Pattern=`^https?://`
 	// +kubebuilder:validation:MaxLength=2048
-	// +kubebuilder:validation:XValidation:rule="!(self.contains('.svc:') || self.contains('.svc/') || self.endsWith('.svc') || self.contains('.svc.cluster.local:') || self.contains('.svc.cluster.local/') || self.endsWith('.svc.cluster.local') || self.contains('.cluster.local:') || self.contains('.cluster.local/') || self.endsWith('.cluster.local') || self.contains('://localhost') || self.contains('://127.0.0.1'))",message="tool upstream must not name an in-cluster target (.svc / .svc.cluster.local / .cluster.local / localhost / 127.0.0.1): an in-cluster tool upstream is an SSRF path"
+	// +kubebuilder:validation:XValidation:rule="self.find('@') == -1",message="tool upstream must not carry userinfo (https://user:pass@host): the embedded credential bypasses the tool proxy's credential boundary (ADR-0008)"
 	Upstream string `json:"upstream"`
 
 	// credentialSecretRef is the {name, key} pair of the Secret and the key

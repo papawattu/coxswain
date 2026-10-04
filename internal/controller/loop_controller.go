@@ -3716,6 +3716,78 @@ func (r *LoopReconciler) findInClusterNetworkAllow(allows []string) (string, boo
 	return policy.FindInClusterNetworkAllow(allows, r.PodCIDR, r.ServiceCIDR)
 }
 
+// findInClusterToolUpstream (D41, ADR-0008) catches an in-cluster tool
+// upstream. The upstream is a base URL (scheme://host[:port][/prefix]); the
+// check extracts the host and runs the same in-cluster logic as
+// FindInClusterNetworkAllow (in-cluster name, loopback / unspecified /
+// link-local IP, IP-in-pod/service-CIDR). Returns the offending upstream URL
+// and true when any tool upstream is in-cluster.
+func (r *LoopReconciler) findInClusterToolUpstream(tools []coxv1alpha1.ToolSpec) (string, bool) {
+	for _, t := range tools {
+		if t.Upstream == "" {
+			continue // the CEL rule requires upstream to be non-empty
+		}
+		host := toolUpstreamHost(t.Upstream)
+		if host == "" {
+			continue // malformed URL; the proxy rejects it at dial time
+		}
+		// Reuse the same in-cluster check as network allows. The host is a
+		// bare hostname (no port), so I can check it directly against the
+		// in-cluster hostname / IP ranges.
+		if policy.IsInClusterHostname(host) {
+			return t.Upstream, true
+		}
+		// IP literal inside the operator's pod/service CIDR (the only case
+		// that needs operator config). The standard-range check above already
+		// covers the RFC1918 / loopback / link-local / CGNAT ranges.
+		if ip := net.ParseIP(host); ip != nil {
+			for _, cidr := range []string{r.PodCIDR, r.ServiceCIDR} {
+				if cidr == "" {
+					continue
+				}
+				if _, ipnet, err := net.ParseCIDR(cidr); err == nil && ipnet.Contains(ip) {
+					return t.Upstream, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// toolUpstreamHost extracts the host part of a tool upstream URL
+// (scheme://host[:port][/prefix]). Returns "" when the URL is malformed
+// (no scheme, no host). The host is lowercased and trailing-dot-trimmed
+// (matching the network allow host extraction).
+func toolUpstreamHost(upstream string) string {
+	// Strip the scheme (https:// or http://).
+	rest := upstream
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	} else {
+		return "" // no scheme; the CEL rule requires https?://
+	}
+	// Strip the path (everything after the first /).
+	if i := strings.Index(rest, "/"); i >= 0 {
+		rest = rest[:i]
+	}
+	// Strip the port (everything after the first :). IPv6 hosts are
+	// bracketed ([::1]:8080), so I handle the bracket case.
+	if strings.HasPrefix(rest, "[") {
+		if i := strings.Index(rest, "]"); i >= 0 {
+			rest = rest[:i+1]
+		}
+	} else if i := strings.Index(rest, ":"); i >= 0 {
+		rest = rest[:i]
+	}
+	// Trim brackets and trailing dot; lowercase.
+	rest = strings.Trim(rest, "[]")
+	rest = strings.TrimSuffix(rest, ".")
+	if rest == "" {
+		return ""
+	}
+	return strings.ToLower(rest)
+}
+
 // validateAgentPolicies checks that every referenced AgentPolicy exists and
 // has canonical exec paths and no in-cluster network allows (I42e).
 // Returns a policyValidationResult. The
@@ -3730,6 +3802,7 @@ func (r *LoopReconciler) findInClusterNetworkAllow(allows []string) (string, boo
 func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
 	unionNetwork := make([]string, 0)
 	unionExec := make([]string, 0)
+	unionTools := make([]coxv1alpha1.ToolSpec, 0)
 	for _, name := range loop.Spec.PolicyRefs {
 		ap := &coxv1alpha1.AgentPolicy{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
@@ -3750,6 +3823,7 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 		}
 		unionExec = append(unionExec, ap.Spec.Exec...)
 		unionNetwork = append(unionNetwork, ap.Spec.Network...)
+		unionTools = append(unionTools, ap.Spec.Tools...)
 	}
 	// D46 (owner decision (c)): exec fencing does not apply to the agent in
 	// the MVP (the runner's shell tool calls spawn an open-ended set of
@@ -3769,6 +3843,16 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 	if offending, ok := r.findInClusterNetworkAllow(unionNetwork); ok {
 		return policyValidationResult{valid: false, reason: "InClusterAllow",
 			message: fmt.Sprintf("AgentPolicy network allow %q names an in-cluster target (.svc / .svc.cluster.local / cluster.local, localhost, a loopback / unspecified / link-local IP, or an IP in the pod or service CIDR); the agent's external egress is enforced by the egress proxy and an in-cluster target is an SSRF path", offending)}
+	}
+	// D41 (ADR-0008): reject in-cluster tool upstreams. The CRD CEL rule
+	// handles the .svc / .svc.cluster.local / localhost / 127.0.0.1 name
+	// cases at admission; the controller catches the same name cases
+	// (mirrored, so pre-rule objects and future CRD drift are caught), the
+	// other loopback / unspecified / link-local forms, and the
+	// IP-in-pod/service-CIDR cases (which need the operator's CIDR config).
+	if offending, ok := r.findInClusterToolUpstream(unionTools); ok {
+		return policyValidationResult{valid: false, reason: "ToolUpstreamInCluster",
+			message: fmt.Sprintf("AgentPolicy tool upstream %q names an in-cluster target (.svc / .svc.cluster.local / cluster.local, localhost, a loopback / unspecified / link-local IP, or an IP in the pod or service CIDR); an in-cluster tool upstream is an SSRF path", offending)}
 	}
 	// D46: the runner executes every tool call via "/bin/sh -c" (the non-runner
 	// stand-in command is "sh -c sleep infinity"), so any referenced exec list

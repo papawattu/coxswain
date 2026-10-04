@@ -108,6 +108,146 @@ type AgentPolicySpec struct {
 	// own workspace is always accessible; a path here grants access elsewhere.
 	// +optional
 	Files []string `json:"files,omitempty"`
+
+	// tools is the credentialed external tools the agent may use through
+	// operator-owned tool proxies (ADR-0008, D41). Each tool declares an
+	// upstream base URL, an optional credential Secret, and a set of allowed
+	// HTTP methods + path prefixes. The operator provisions one proxy pod +
+	// Service per tool per Loop (D41c); the agent reaches the tool through
+	// the proxy and never holds the credential.
+	//
+	// An empty or absent tools list means the agent has no tools (unchanged
+	// behaviour). Tools are additive to the other allows; a Loop's effective
+	// tool set is the union of the tools across every AgentPolicy it
+	// references (spec.policyRefs[]), same as network/exec/files.
+	//
+	// CEL validation (I42e pattern, first layer at admission):
+	//   - name: DNS-1035 (^[a-z0-9]([-a-z0-9]*[a-z0-9])?$); unique within the
+	//     list. Forms the derived proxy name <loop>-tool-<name> (D41c).
+	//   - upstream: must start with https:// or http:// (the controller does
+	//     the host-level in-cluster checks; the CRD cannot see cluster CIDRs).
+	//   - upstream host: must NOT be an in-cluster target. The cheap, suffix-
+	//     based CEL layer rejects hosts ending in .svc / .svc.cluster.local /
+	//     .cluster.local, and the literal localhost / 127.0.0.1. The
+	//     controller-side check (ToolUpstreamInCluster) is the authoritative
+	//     first layer (catches IP literals in the operator's pod/service
+	//     CIDR, 127/8, 169.254/16, 0.0.0.0, full loopback forms — the cases
+	//     the CRD cannot see without cluster config).
+	//   - rules: at least one rule per tool; each rule's methods entries are
+	//     one of GET/POST/PATCH/PUT/DELETE (case-sensitive).
+	//
+	// The CEL rules are per-field on ToolSpec / ToolRule (name, upstream,
+	// rules.methods) plus a cross-field uniqueness rule on the tools list
+	// (names unique within the list). The in-cluster upstream check is the
+	// cheap suffix-based layer (like I42e's network rule); the controller is
+	// the authoritative first layer.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:XValidation:rule="self.all(t, self.filter(o, o.name == t.name).size() == 1)",message="tool names must be unique within the tools list"
+	Tools []ToolSpec `json:"tools,omitempty"`
+}
+
+// ToolSpec is one credentialed external tool the agent may use through an
+// operator-owned tool proxy (ADR-0008, D41). A tool is declared on an
+// AgentPolicy; the operator (D41c) provisions one proxy pod + Service per
+// tool per Loop. The agent reaches the tool through the proxy and never
+// holds the credential (the proxy injects it from the mounted Secret).
+//
+// The proxy is a reverse proxy (not a forward proxy): it originates its own
+// request to the fixed upstream (TLS with the upstream's certificate
+// verified for https://), so the rules engine sees the real method and path
+// of every upstream request.
+type ToolSpec struct {
+	// name is a DNS-1035 label that forms the derived proxy pod/Service name
+	// <loop>-tool-<name> (D41c). It must be unique within the tools list
+	// (enforced by the CEL rule on AgentPolicy.spec.tools). Max 24 chars so
+	// the derived name fits the 63-char DNS-1035 budget even with a long
+	// loop name (derivedName truncates + hashes near-max names, but a short
+	// tool name keeps the derived name human-readable).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=24
+	Name string `json:"name"`
+
+	// upstream is the base URL the proxy dials (scheme://host[:port][/prefix]).
+	// Must start with https:// or http://. The proxy dials only this host as
+	// the origin of its own request (reverse proxy, not forward proxy).
+	// https:// means the proxy originates its own TLS connection to the
+	// upstream and verifies its certificate; http:// is plain.
+	//
+	// In-cluster upstream rejection (first layer, I42e pattern):
+	//   - CRD CEL (admission): the host must NOT end in .svc / .svc.cluster.local /
+	//     .cluster.local, and must NOT be localhost / 127.0.0.1 (the cheap
+	//     suffix-based layer; the CRD cannot see cluster CIDRs).
+	//   - Controller (authoritative first layer): the host must NOT be an IP
+	//     literal in the operator's POD_CIDR / SERVICE_CIDR, 127/8, 169.254/16,
+	//     0.0.0.0, or a full loopback form. Failure: PolicyValid=False reason
+	//     ToolUpstreamInCluster, fail-closed, no sandbox, no reconcile-error loop.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^https?://`
+	// +kubebuilder:validation:MaxLength=2048
+	// +kubebuilder:validation:XValidation:rule="!(self.contains('.svc:') || self.contains('.svc/') || self.endsWith('.svc') || self.contains('.svc.cluster.local:') || self.contains('.svc.cluster.local/') || self.endsWith('.svc.cluster.local') || self.contains('.cluster.local:') || self.contains('.cluster.local/') || self.endsWith('.cluster.local') || self.contains('://localhost') || self.contains('://127.0.0.1'))",message="tool upstream must not name an in-cluster target (.svc / .svc.cluster.local / .cluster.local / localhost / 127.0.0.1): an in-cluster tool upstream is an SSRF path"
+	Upstream string `json:"upstream"`
+
+	// credentialSecretRef is the {name, key} pair of the Secret and the key
+	// within it that holds the tool credential. The Secret must be in the
+	// same namespace as the AgentPolicy. The operator (D41c) mounts it
+	// read-only into the tool proxy pod only; the proxy injects the value
+	// into requests (Authorization: Bearer <value> in the Phase 1 generic
+	// proxy, replacing any agent-supplied Authorization / Proxy-Authorization
+	// header). A tool entry without it is a credential-less passthrough.
+	// +optional
+	CredentialSecretRef CredentialSecretRef `json:"credentialSecretRef,omitempty"`
+
+	// rules is the set of allowed HTTP methods + path prefixes for this
+	// tool. At least one rule is required. Each rule is a set of allowed
+	// methods (GET/POST/PATCH/PUT/DELETE, case-sensitive) plus allowed path
+	// prefixes (matched against the request path after the upstream's base
+	// prefix). Anything matching no rule → 403 + an audit record (D41c).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	Rules []ToolRule `json:"rules"`
+}
+
+// CredentialSecretRef is a {name, key} pair identifying the Secret (by name,
+// in the same namespace as the AgentPolicy) and the key within it that holds
+// the tool credential. The operator (D41c) mounts the Secret read-only into
+// the tool proxy pod only; the proxy reads the value at the given key and
+// injects it into upstream requests.
+type CredentialSecretRef struct {
+	// name is the name of the Secret in the AgentPolicy's namespace.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// key is the key within the Secret that holds the credential value.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=253
+	Key string `json:"key"`
+}
+
+// ToolRule is one allowed method+path-prefix pair for a tool. The proxy (D41c)
+// matches the incoming request's method and path (after the upstream's base
+// prefix) against the rules; anything matching no rule gets a 403 + an audit
+// record. Methods are case-sensitive (uppercase HTTP method tokens).
+type ToolRule struct {
+	// methods is the set of allowed HTTP methods (GET/POST/PATCH/PUT/DELETE,
+	// case-sensitive). At least one method is required per rule.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:Pattern=`^(GET|POST|PATCH|PUT|DELETE)$`
+	Methods []string `json:"methods"`
+
+	// paths is the set of allowed path prefixes (matched against the request
+	// path after the upstream's base prefix). An empty or absent paths list
+	// means no path restriction (any path is allowed for the listed methods).
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=2048
+	Paths []string `json:"paths,omitempty"`
 }
 
 // AgentPolicyStatus defines the observed state of an AgentPolicy.

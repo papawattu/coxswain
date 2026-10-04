@@ -4,7 +4,9 @@
 # --allow-unenforced bypasses the D30 KubeArmor gate: on an enforcing-CNI
 # cluster without KubeArmor (ADR-0007 F2 keep-off), the operator must not
 # hold Loops on the KubeArmor policy — the CNI is the enforcement mechanism
-# being tested. Loops run with PolicyEnforced=False (EnforcementDisabled).
+# being tested. Loops run with PolicyEnforced=False (NodeNotEnforcing — the
+# Enforcer reports not-enforcing until the I32 relay lands) and the condition
+# names --allow-unenforced as the reason the Loop runs (I46).
 #
 # --allow-unenforced-network is NOT set: the D38 network gate is LIVE. Calico
 # enforces the D38 property (pod -> host-network egress blocked), so the

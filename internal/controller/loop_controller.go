@@ -750,22 +750,30 @@ func (r *LoopReconciler) recordEffectivePolicyHash(ctx context.Context, loop *co
 	return true, nil
 }
 
-// enforcementStatus (D30, ADR-0007) reports whether the eBPF engine is enforcing
-// the Loop's policy. The gate applies to EVERY Loop (no policyRefs = the
-// platform minimum, still enforced); with no Enforcer (engine not installed) it
-// reports EngineUnavailable, so the sandbox is held Suspended (fail-closed).
+// enforcementStatus (D30, ADR-0007) reports whether the eBPF engine is
+// enforcing the Loop's policy, and separates WHAT WAS OBSERVED from WHAT WAS
+// ALLOWED (I46). The gate applies to EVERY Loop (no policyRefs = the platform
+// minimum, still enforced).
+//
+// What was observed (always from the Enforcer, never from the flag):
+//   - Enforcer reports enforcing -> (true, Enforcing): the flag is irrelevant.
+//   - Enforcer reports not-enforcing -> (false, the Enforcer's own reason):
+//     e.g. NodeNotEnforcing, with its reason kept in the condition message.
+//   - Enforcer is nil (no engine probe) -> (false, EnforcementUnverified):
+//     the operator cannot observe the engine; the Loop only runs because
+//     --allow-unenforced is set, and the condition says so.
+//
+// What was allowed: with AllowUnenforced set, a not-enforcing (false) result
+// does not hold the sandbox Suspended; it runs, and the condition records the
+// observed result (never "NOT enforced" from the flag alone).
 func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha1.Loop) (enforced bool, reason string) {
 	if r.Enforcer == nil {
 		if r.AllowUnenforced {
-			return true, engine.ReasonEnforcementDisabled // run, but NOT enforced
+			return false, engine.ReasonEnforcementUnverified // run, but the engine is unverified
 		}
 		return false, engine.ReasonEngineUnavailable
 	}
-	enforcing, reason := r.Enforcer.Enforcing(ctx, loop)
-	if !enforcing && r.AllowUnenforced {
-		return true, engine.ReasonEnforcementDisabled // run anyway, not enforced
-	}
-	return enforcing, reason
+	return r.Enforcer.Enforcing(ctx, loop)
 }
 
 // cniNetworkStatus (D38) reports whether the cluster's CNI polices pod ->
@@ -1198,10 +1206,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
 		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
 		// invalid policy suspends via suspendSandboxIfRunning, and unenforced
-		// also suspends here.
+		// also suspends here. I46: the gate reads the OBSERVED result (the
+		// Enforcer's, or EnforcementUnverified when there is no Enforcer), never
+		// the flag; the escape hatch is applied here, so a flag-set but
+		// unenforced (or unverifiable) engine still lets the sandbox run while
+		// the condition records what was observed.
 		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
-			enforced, _ := r.enforcementStatus(ctx, loop)
-			if !enforced {
+			if observed, _ := r.enforcementStatus(ctx, loop); !observed && !r.AllowUnenforced {
 				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 			}
 			// D35a: the proxy pod must be Ready and owned by the Loop.
@@ -3182,15 +3193,31 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
 			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
 	}
-	if enf, rs := r.enforcementStatus(ctx, loop); enf && rs != engine.ReasonEnforcementDisabled {
+	if enf, rs := r.enforcementStatus(ctx, loop); enf {
 		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
 			"the eBPF engine is enforcing the Loop's effective policy")
 	} else {
-		msg := "engine not enforcing the Loop policy; sandbox held Suspended (D30 fail-closed)"
-		if rs == engine.ReasonEnforcementDisabled {
-			msg = "--allow-unenforced is set: the Loop runs but is NOT enforced (dev escape hatch)"
+		// I46: the condition describes what was OBSERVED, not the flag. The
+		// observed reason (the Enforcer's own, or EnforcementUnverified) is
+		// kept; the escape hatch, when set, is named as the reason the Loop
+		// runs despite the observation.
+		var msg string
+		switch rs {
+		case engine.ReasonEnforcementUnverified:
+			msg = "no engine probe (no Enforcer wired); the Loop runs because --allow-unenforced is set (dev escape hatch)"
+		case engine.ReasonEngineUnavailable:
+			msg = "no engine (Enforcer not installed); sandbox held Suspended (D30 fail-closed)"
+		default:
+			msg = "engine not enforcing the Loop policy (" + rs + "); sandbox held Suspended (D30 fail-closed)"
 		}
-		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, rs, msg)
+		if r.AllowUnenforced && rs != engine.ReasonEnforcementUnverified {
+			msg += "; the Loop runs because --allow-unenforced is set (dev escape hatch)"
+		}
+		status := metav1.ConditionFalse
+		if rs == engine.ReasonEnforcementUnverified && r.AllowUnenforced {
+			status = metav1.ConditionUnknown
+		}
+		setCondition(loop, string(PolicyEnforcedCondition), status, rs, msg)
 	}
 	// D38: the NetworkEnforced condition (network layer, analogous to
 	// PolicyEnforced). The escape hatch is AllowUnenforcedNetwork (separate

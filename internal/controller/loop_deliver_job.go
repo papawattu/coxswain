@@ -100,6 +100,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -293,17 +294,39 @@ func redeliverEligible(loop *coxv1alpha1.Loop) bool {
 // changed (true when the object was actually updated) and error; an
 // already-absent annotation is a no-op. The annotation is considered PRESENT
 // when the key exists (even with an empty value), so `coxswain.io/redeliver=`
-// (set with no value) also triggers re-delivery.
+// (set with no value) also triggers re-delivery. It writes via a metadata
+// patch (NOT Status().Patch): a status patch only persists the status
+// subresource, so the annotation would never land — and a metadata
+// Patch/MergeFrom rewrites the whole object from the caller's cached copy,
+// racing the Reconcile's own trailing Status().Update when the two touch the
+// same Loop in one reconcile (the I52 re-delivery pass clears the Delivered
+// condition AND removes the annotation, so both write the Loop in one
+// reconcile). The metadata patch is retry-on-409 (re-read, re-check presence,
+// re-patch) so that race self-heals without a controller error.
 func (r *LoopReconciler) removeDeliverAnnotation(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	if _, ok := loop.Annotations[redeliverAnnotation]; !ok {
 		return false, nil
 	}
-	updated := loop.DeepCopy()
-	delete(updated.Annotations, redeliverAnnotation)
-	if err := r.Patch(ctx, updated, client.MergeFrom(loop)); err != nil {
+	var changed bool
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		fresh := &coxv1alpha1.Loop{}
+		if err := r.Get(ctx, types.NamespacedName{Name: loop.Name, Namespace: loop.Namespace}, fresh); err != nil {
+			return err
+		}
+		if _, ok := fresh.Annotations[redeliverAnnotation]; !ok {
+			return nil // already removed (another reconcile or the test)
+		}
+		updated := fresh.DeepCopy()
+		delete(updated.Annotations, redeliverAnnotation)
+		if err := r.Patch(ctx, updated, client.MergeFrom(fresh)); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	}); err != nil {
 		return false, fmt.Errorf("remove %s annotation from %s: %w", redeliverAnnotation, loop.Name, err)
 	}
-	return true, nil
+	return changed, nil
 }
 
 // ensureDeliverRedeliver handles the coxswain.io/redeliver annotation (I52,
@@ -365,7 +388,18 @@ func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1
 	}
 	// A failed Job (or none): delete it (Background propagation), clear the
 	// Delivered condition, and remove the annotation — the fresh Job for
-	// the same pinned verifiedCommit is created by ensureDeliverJob below.
+	// the same pinned verifiedCommit is created by ensureDeliverJob below
+	// (in this pass when the Job was already gone; on the next pass after
+	// the async delete of a live failed Job lands). The condition clear
+	// rides the Reconcile's own trailing Status().Update (the in-memory
+	// change is detected via DeepEqual against condsBefore). The annotation
+	// patch is the only write that can race that Update in one reconcile:
+	// whichever lands second bumps the resourceVersion the other was based
+	// on. The patch retries on that 409 (self-healing); the trailing Update
+	// does not, so if it errors, the next event (the deleted Job, or the
+	// annotation patch itself) re-drives this pass on a fresh read — the
+	// annotation is already gone, so the pass is a no-op. Idempotent either
+	// way.
 	if existing.UID != "" {
 		prop := metav1.DeletePropagationBackground
 		if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &prop}); err != nil && !apierrors.IsNotFound(err) {
@@ -377,18 +411,28 @@ func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1
 	// Clear the Delivered condition (status.delivery is already nil for a
 	// failed delivery): the next ensureDeliverJob pass sets it back to
 	// InProgress for the fresh Job.
-	for i := range loop.Status.Conditions {
-		if loop.Status.Conditions[i].Type == coxv1alpha1.DeliveredCondition {
-			loop.Status.Conditions = append(loop.Status.Conditions[:i], loop.Status.Conditions[i+1:]...)
-			break
-		}
-	}
+	loop.Status.Conditions = r.deliverClearDeliveredCondition(loop)
 	if _, err := r.removeDeliverAnnotation(ctx, loop); err != nil {
 		return err
 	}
-	logf.FromContext(ctx).Info("Redeliver triggered: cleared the Delivered condition and removed the annotation; creating a fresh deliver Job for the same verifiedCommit",
+	logf.FromContext(ctx).Info("Redeliver triggered: cleared the Delivered condition and removed the annotation; the fresh deliver Job is created in this pass (no Job) or on the next pass (failed Job delete async)",
 		"loop", loop.Name, "verifiedCommit", loop.Status.CurrentVerify.VerifiedCommit)
 	return nil
+}
+
+// deliverClearDeliveredCondition returns the Loop's conditions with the
+// Delivered condition removed (status.delivery is already nil for a failed
+// delivery; the next ensureDeliverJob pass sets the condition back to
+// InProgress for the fresh Job).
+func (r *LoopReconciler) deliverClearDeliveredCondition(loop *coxv1alpha1.Loop) []metav1.Condition {
+	conds := make([]metav1.Condition, 0, len(loop.Status.Conditions))
+	for _, c := range loop.Status.Conditions {
+		if c.Type == coxv1alpha1.DeliveredCondition {
+			continue
+		}
+		conds = append(conds, c)
+	}
+	return conds
 }
 
 // deliveryRequested reports whether this Loop wants delivery and has not
@@ -474,7 +518,7 @@ func (r *LoopReconciler) ensureDeliverJob(ctx context.Context, loop *coxv1alpha1
 		if err := r.Create(ctx, job); err != nil {
 			return false, fmt.Errorf("create deliver Job %s: %w", jobName, err)
 		}
-		logf.FromContext(ctx).Info("created deliver Job", "job", jobName, "loop", loop.Name,
+		logf.FromContext(ctx).Info("Created deliver Job", "job", jobName, "loop", loop.Name,
 			"verifiedCommit", verified, "branch", deliverBranchName(deliverBranchPrefix(loop), loop.Name))
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryInProgress, "deliver Job in progress")
@@ -491,7 +535,7 @@ func (r *LoopReconciler) ensureDeliverJob(ctx context.Context, loop *coxv1alpha1
 			if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &prop}); err != nil && !apierrors.IsNotFound(err) {
 				return false, fmt.Errorf("delete stale deliver Job %s: %w", jobName, err)
 			}
-			logf.FromContext(ctx).Info("deleted stale deliver Job (verifiedCommit mismatch)",
+			logf.FromContext(ctx).Info("Deleted stale deliver Job (verifiedCommit mismatch)",
 				"job", jobName, "stamped", existing.Annotations[verifyCommitAnnotation], "current", verified)
 			return true, nil
 		}

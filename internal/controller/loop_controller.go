@@ -541,8 +541,24 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
 	if changed || conditionsChanged {
+		// The trailing status write can 409 against a concurrent metadata
+		// patch on the same object in this reconcile (the I52 redeliver pass
+		// removes the redeliver annotation, and the patch lands before or
+		// after this Update). On conflict: re-read fresh, overlay this
+		// reconcile's status, and retry once. The annotation patch has its
+		// own retry, so neither write errors.
 		if err := r.Status().Update(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
+			if !apierrors.IsConflict(err) {
+				return ctrl.Result{}, err
+			}
+			fresh := &coxv1alpha1.Loop{}
+			if getErr := r.Get(ctx, req.NamespacedName, fresh); getErr != nil {
+				return ctrl.Result{}, getErr
+			}
+			fresh.Status = loop.Status
+			if uErr := r.Status().Update(ctx, fresh); uErr != nil {
+				return ctrl.Result{}, uErr
+			}
 		}
 	}
 

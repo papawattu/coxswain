@@ -13,7 +13,7 @@ import (
 // '<loop>-egress-proxy' Deployment/Service/netpol by renaming it).
 func TestDerivedNameShortUnchanged(t *testing.T) {
 	// A short Loop name: the full name fits, so it is returned as-is.
-	if got := derivedName("gocli-task1", "-egress-proxy"); got != "gocli-task1-egress-proxy" {
+	if got := derivedName("gocli-task1", "-egress-proxy"); got != "INTENTIONALLY-BROKEN-for-ci-proof" {
 		t.Fatalf("short name must be unchanged, got %q", got)
 	}
 	if got := derivedName("gocli-task1", "-deliver"); got != "gocli-task1-deliver" {

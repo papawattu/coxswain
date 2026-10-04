@@ -54,10 +54,12 @@ ADMIN_USER=$("${KUBECTL[@]}" get secret gitea-admin -o jsonpath='{.data.username
 ADMIN_PASS=$("${KUBECTL[@]}" get secret gitea-admin -o jsonpath='{.data.password}' | base64 -d)
 GIT_USER=$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.data.username}' | base64 -d)
 GIT_PASS=$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.data.password}' | base64 -d)
-[ -n "$ADMIN_USER" ] && [ -n "$ADMIN_PASS" ] \
-	|| die "secret gitea-admin missing/empty in ns $NS (run 'make samples-up' first)"
-[ -n "$GIT_USER" ] && [ -n "$GIT_PASS" ] \
-	|| die "secret samples-git-cred missing/empty in ns $NS (run 'make samples-up' first)"
+if [ -z "$ADMIN_USER" ] || [ -z "$ADMIN_PASS" ]; then
+		die "secret gitea-admin missing/empty in ns $NS (run 'make samples-up' first)"
+	fi
+if [ -z "$GIT_USER" ] || [ -z "$GIT_PASS" ]; then
+		die "secret samples-git-cred missing/empty in ns $NS (run 'make samples-up' first)"
+	fi
 
 # Secret types are IMMUTABLE: an early S2 seed applied a bare 'BasicAuth'
 # type (the operator's workspace init container requires

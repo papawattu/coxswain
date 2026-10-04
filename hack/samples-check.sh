@@ -60,7 +60,7 @@ for app in gocli pylib webapi; do
     cp -r "$seed"/* "$work"/
     (cd "$work" && git init -q && git add -A && \
      git -c user.email=samples@coxswain.local -c user.name=samples \
-     commit -qm seed || true)
+     commit -qm seed) || true
 
     # Install the scoped checks for this task.
     cp "$checks" "$work/.checks"

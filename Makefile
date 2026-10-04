@@ -1,5 +1,7 @@
-# Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+# I51 (R20): no default for IMG — the deploy targets call hack/require-img.sh
+# and refuse to deploy without an explicit tag (a fallback of
+# controller:latest does not exist in kind and strands the rollout).
+# docker-build / docker-push take the tag via IMG=<img> as well.
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -109,6 +111,10 @@ sample-run-dry-run: ## S5b: validate the task manifests server-side without crea
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run
 	cd runner && "$(GOLANGCI_LINT)" run
+	@# I51: shellcheck the hack scripts (shellcheck is preinstalled on
+	@# ubuntu-latest; fail clearly if it is missing elsewhere).
+	@command -v shellcheck >/dev/null 2>&1 || { echo "Error: shellcheck is not installed (apt install shellcheck)"; exit 1; }
+	@for f in hack/*.sh; do echo "shellcheck $$f"; shellcheck "$$f"; done
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
@@ -368,10 +374,12 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # make docker-build IMG=<img> BASE_IMAGE=docker.io/library/golang:1.26
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
+	@IMG="$(IMG)" TARGET=docker-build hack/require-img.sh
 	$(CONTAINER_TOOL) build $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
+	@IMG="$(IMG)" TARGET=docker-push hack/require-img.sh
 	$(CONTAINER_TOOL) push ${IMG}
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
@@ -393,6 +401,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+	IMG="$(IMG)" TARGET=build-installer hack/require-img.sh
 	mkdir -p dist
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
@@ -426,12 +435,15 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config (fail-closed; no --allow-unenforced).
+	@IMG="$(IMG)" TARGET=deploy hack/require-img.sh
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
 	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" apply -f -
 
 .PHONY: deploy-dev
 deploy-dev: manifests kustomize ## Dev/kind only: deploy the controller with --allow-unenforced (Loops run before the I32 enforcement-evidence relay is wired). Not for production.
+	@# I51 (R20): refuse to deploy without an explicit image tag.
+	@IMG="$(IMG)" TARGET=deploy-dev hack/require-img.sh
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/dev | "$(KUBECTL)" apply -f -
 	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" apply -f -

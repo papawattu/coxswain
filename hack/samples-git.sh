@@ -44,7 +44,7 @@ up)
 		ready=$(kubectl --context "$CTX" -n "$NS" get deploy gitea \
 			-o jsonpath='{.status.readyReplicas}' 2>/dev/null | tr -d ' ')
 		[ "$ready" = "1" ] && break
-		[ $i -eq 36 ] && {
+		[ "$i" -eq 36 ] && {
 			kubectl --context "$CTX" -n "$NS" get pod -l app.kubernetes.io/name=gitea
 			kubectl --context "$CTX" -n "$NS" logs deploy/gitea --tail=15
 			die "gitea did not reach ready in 180s (see the pod logs above)"

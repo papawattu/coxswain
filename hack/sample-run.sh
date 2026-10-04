@@ -69,8 +69,6 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-KUBECTL=(kubectl --context "$CTX" -n "$NS")
-
 command -v kubectl >/dev/null || die "kubectl is not on PATH"
 command -v python3 >/dev/null || die "python3 is not on PATH (PyYAML required)"
 python3 -c 'import yaml' >/dev/null 2>&1 || die "python3-yaml (PyYAML) not importable"
@@ -83,10 +81,6 @@ POLICY_YAML="$ROOT/examples/$APP/tasks/$TASK.agentpolicy.yaml"
 [ -f "$LOOP_YAML" ] || die "manifest $LOOP_YAML not found (task $TASK not defined)"
 [ -f "$POLICY_YAML" ] || die "manifest $POLICY_YAML not found (task $TASK not defined)"
 
-# The policy names referenced by the manifest are applied from the same
-# tasks dir; extract them from the manifest so the driver never drifts from
-# the checked-in spec.
-POLICY_NAMES=$(awk '/^  policyRefs:/ {f=1; next} /^  [a-z]/ {f=0} f && /- / {print $2}' "$LOOP_YAML")
 
 # ---------------------------------------------------------------------------
 # RUNNER_IMG override (S5b): the manifest leaves spec.agent.image empty so
@@ -246,7 +240,8 @@ log "watching phase (timeout ${TIMEOUT}s)..."
 DEADLINE=$(( $(date +%s) + TIMEOUT ))
 LAST_PHASE=""
 while :; do
-	[ $(date +%s) -lt "$DEADLINE" ] || die "timeout after ${TIMEOUT}s; last phase: ${LAST_PHASE:-<none>}"
+	NOW=$(date +%s)
+	[ "$NOW" -lt "$DEADLINE" ] || die "timeout after ${TIMEOUT}s; last phase: ${LAST_PHASE:-<none>}"
 	STATE=$(kubectl --context "$CTX" -n "$NS" get loop "$LOOP" -o json 2>/dev/null \
 		| python3 -c 'import json,sys; s=json.load(sys.stdin).get("status") or {}; print((s.get("phase") or "Pending"), s.get("iteration") or 0)' 2>/dev/null || echo "")
 	PHASE="${STATE%% *}"
@@ -438,7 +433,7 @@ PEOFEOF
 		# report Ready before it terminates, so wait for the log or a
 		# terminated container state (120s total).
 		PEEK_LOG=""
-		for i in $(seq 1 24); do
+		for _ in $(seq 1 24); do
 			PEEK_LOG=$(kubectl --context "$CTX" -n "$NS" logs "$PEEK_POD" 2>/dev/null || true)
 			if [ -n "$PEEK_LOG" ]; then
 				break

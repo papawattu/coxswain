@@ -120,6 +120,9 @@ forwarding with credential injection":
     `%2e%2e`, `%2F`, `//`, backslash and NUL encodings) and matched by
     **segment prefix** — `/repos/acme/` covers `/repos/acme/x` but not
     `/repos/acmer` — so no encoding trick can route a request past a rule.
+    A rule prefix without a trailing `/` matches only the **exact** path
+    (e.g. `/repos/acme` matches only `/repos/acme`, not `/repos/acme/x`);
+    use a trailing `/` for prefix semantics.
   - method + path match a rule → forward to the resolved upstream IP
     (same resolved-IP carve-outs as I42a: a tool upstream must not resolve
     into the cluster — the check applies before dialing, and the dial is to

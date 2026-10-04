@@ -53,7 +53,7 @@ HTTP, origin-form, in-cluster to the proxy; the proxy rule-checks, strips
 agent-supplied auth, injects the credential, and **originates its own
 request** (TLS, verified) to the fixed upstream — not a forward proxy:
 `CONNECT` to an `https://` upstream is opaque TLS, so a forward proxy could
-neither rule-check nor inject (R19 P1).
+neither rule-check nor inject (I70-1).
 
 - Listens on `:8080` (env `TOOL_PROXY_PORT`, default 8080).
 - Config via env (Phase 1, as in I42a): `TOOL_NAME`, `TOOL_UPSTREAM`
@@ -71,8 +71,10 @@ neither rule-check nor inject (R19 P1).
     rule;
   - matching is **segment prefix**: rule prefix `/repos/acme/` covers
     `/repos/acme/x/y` but **not** `/repos/acmer` (a segment, not a byte
-    string, is the unit); stated in the package doc and pinned by the
-    tests below;
+    string, is the unit). A prefix without a trailing `/` matches only
+    the **exact** path (e.g. `/repos/acme` matches only `/repos/acme`,
+    not `/repos/acme/x`); use a trailing `/` for prefix semantics. Stated
+    in the ADR and the package doc, pinned by the tests below;
   - **match** (method in the rule's methods AND normalised segment prefix in
     the rule's prefixes) → strip agent-supplied `Authorization` /
     `Proxy-Authorization`, inject the credential (if configured:
@@ -96,22 +98,24 @@ neither rule-check nor inject (R19 P1).
 - **Pod hardening:** no SA token, read-only rootfs, UID 65535 (distinct from
   agent 65532, model proxy 65533, egress proxy 65534), no capabilities,
   seccomp RuntimeDefault.
-- **No TLS termination / no MITM** of the upstream (tunnel or forward, never
-  decrypt).
+- **No TLS termination / no MITM** of the upstream: the proxy is the TLS
+  **client** — it originates its own verified connection (SNI +
+  certificate verification against the upstream hostname), never a tunnel
+  and never a MITM (it never decrypts a client-to-upstream stream).
 
 **Unit tests (written first, `internal/toolproxy/`):**
 - **Rule engine (table-driven):** allowed method+prefix → forwarded; allowed
   prefix wrong method → 403; disallowed prefix → 403; **segment-prefix
   semantics** (`/repos/acme/` matches `/repos/acme/x/y` but not
   `/repos/acmer`); empty rule set → everything 403.
-- **Reverse-proxy shape (R19 P1):** a `CONNECT` request → **405 with no
+- **Reverse-proxy shape (I70-1):** a `CONNECT` request → **405 with no
   upstream dial** (the test upstream's request log stays empty) and an
   absolute-form request (`GET http://host/path`) → 405, no dial. An allowed
   origin-form request to an **`https://` test upstream** (an `httptest` TLS
   server whose CA the test trusts) **arrives at the upstream with the
   credential header** — proving the proxy originates a verified TLS
   connection and can see what a tunnel cannot.
-- **Rule-bypass cases (R19 P2):**
+- **Rule-bypass cases (I70-2):**
   - **Path normalisation:** `..` (`/repos/../secrets`), percent-encoded
     (`%2e%2e`, `%2F`), `//`, a backslash (`/repos/\..\x`) and a NUL byte →
     rejected (`400`) or cleaned to the canonical path **before** matching,

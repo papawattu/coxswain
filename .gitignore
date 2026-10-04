@@ -22,6 +22,12 @@ go.work
 # Proxy stand-in build output (go build ./cmd/proxy-standin)
 /proxy-standin
 
+# Tool proxy build output (go build ./cmd/tool-proxy)
+/tool-proxy
+
+# Egress proxy build output (go build ./cmd/egress-proxy)
+/egress-proxy
+
 # editor and IDE paraphernalia
 .idea
 .vscode
@@ -31,7 +37,6 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
-/egress-proxy
 /examples/gocli/gocli
 
 # S5b sample-run evidence (machine-generated, per-run)

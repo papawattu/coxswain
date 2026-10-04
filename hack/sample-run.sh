@@ -403,8 +403,15 @@ for c in d["spec"]["initContainers"]:
 		printf '%s' "$sum"
 	}
 	VLLM_AFTER=$(vllm_sum_after 2>/dev/null || echo "")
+	# Read the before-snapshot from the file the run mode wrote, so the delta
+	# survives --evidence-only re-generation (the before-sample is not re-taken
+	# in evidence-only mode; the file from the original run is authoritative).
+	# In evidence-only mode the before-snapshot block (which defines
+	# VLLM_BEFORE_FILE) is skipped, so fall back to the known path.
+	VLLM_BEFORE_FILE="${VLLM_BEFORE_FILE:-$OUTDIR/.vllm-before}"
+	VLLM_BEFORE=$(cat "$VLLM_BEFORE_FILE" 2>/dev/null || echo "")
 	VLLM_DELTA=""
-	if [ -n "$VLLM_AFTER" ] && [ -n "${VLLM_BEFORE:-}" ]; then
+	if [ -n "$VLLM_AFTER" ] && [ -n "$VLLM_BEFORE" ]; then
 		VLLM_DELTA=$((VLLM_AFTER - VLLM_BEFORE))
 	fi
 	printf 'forwarded-request count (one structured log line per forwarded request, no bodies/headers): %s\n\n' "$FORWARDED_COUNT"

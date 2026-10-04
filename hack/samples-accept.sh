@@ -48,7 +48,9 @@ sleep 2  # give the shell loop a beat for the container to be fully up
 
 GIT_USER=$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.data.username}' | base64 -d)
 GIT_PASS=$("${KUBECTL[@]}" get secret samples-git-cred -o jsonpath='{.data.password}' | base64 -d)
-[ -n "$GIT_USER" ] && [ -n "$GIT_PASS" ] || die "secret samples-git-cred missing in ns $NS"
+if [ -z "$GIT_USER" ] || [ -z "$GIT_PASS" ]; then
+		die "secret samples-git-cred missing in ns $NS"
+	fi
 
 # One exec per app (keeps each check's evidence line clean and makes a
 # failure attributable to a specific repo).
@@ -69,6 +71,7 @@ for app in "${APPS[@]}"; do
 		die "clone of samples/$app failed (rc=$rc):
 $out"
 	fi
+	FAIL=$((FAIL + 1))
 	# git log --oneline: exactly one commit, the seed's 'initial'.
 	logline=$("${KUBECTL[@]}" exec "$POD" -- sh -c "cd /tmp/$app && git log --oneline" 2>&1)
 	ncommits=$(printf '%s\n' "$logline" | grep -c . || true)
@@ -106,5 +109,11 @@ $lsfiles"
 	[ "$nfiles" -gt 0 ] || die "samples/$app git ls-files is empty (the app files are missing)"
 	log "   $app ls-files: $nfiles file(s), no tasks/ or tasks.md or *.patch"
 done
+
+# FAIL counts the apps verified above. Every check dies before the loop ends,
+# so reaching here means all apps passed — but keep the counter live (I51) so
+# a future change that degrades die to a warning cannot produce a vacuous pass.
+[ "$FAIL" -eq "${#APPS[@]}" ] \
+	|| die "internal: only $FAIL/${#APPS[@]} apps verified before the success line"
 
 log "S2 acceptance PASSED for: ${APPS[*]} (clone + single 'initial' commit + no github.com remote + no reference-answer files, all from a throwaway pod in ns $NS)"

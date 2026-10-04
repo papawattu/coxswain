@@ -209,6 +209,37 @@ func dialToPublic(port string) func(net.IP) string {
 // carved out of the dialable range).
 const publicIP = "198.19.0.1"
 
+// Shared test fixtures (a single rule set + a fixed audit identity) so the
+// tests don't repeat the literals (goconst).
+const (
+	// toolPath is the canonical allowed request path.
+	toolPath = "/repos/acme/repo"
+	// toolPrefix is the canonical rule prefix.
+	toolPrefix = "/repos/acme/"
+	// toolName / loopName / nsName / policy are the fixed audit identity.
+	toolName = "tool-x"
+	loopName = "loop-x"
+	nsName   = "ns-x"
+	policy   = "pol-abc"
+	// cred is the default configured credential.
+	cred = "cred"
+	// upstreamHost is the hostname a resolver-backed proxy resolves.
+	upstreamHost      = "upstream.test"
+	upstreamBaseHTTP  = "http://" + upstreamHost
+	upstreamBaseHTTPS = "https://" + upstreamHost
+
+	// HTTP methods (shared across rule + behaviour tests).
+	methodGET    = "GET"
+	methodPOST   = "POST"
+	methodDELETE = "DELETE"
+	// Traversal / segment-boundary paths (shared across normalisation +
+	// rule tests).
+	traversalDotDot = "/repos/acme/../../etc"
+	traversalPCT    = "/repos/acme%2f..%2fetc"
+	segmentBoundary = "/repos/acmer"
+	prefixRepos     = "/repos"
+)
+
 func hostOf(t *testing.T, urlStr string) string {
 	t.Helper()
 	u, err := url.Parse(urlStr)
@@ -218,38 +249,28 @@ func hostOf(t *testing.T, urlStr string) string {
 	return u.Hostname()
 }
 
-func rulesGET(prefix string) []Rule {
-	return []Rule{{Methods: []string{"GET"}, Paths: []string{prefix}}}
+// rulesGET is the canonical rule set (GET on the canonical prefix).
+func rulesGET() []Rule {
+	return []Rule{{Methods: []string{methodGET}, Paths: []string{toolPrefix}}}
 }
 
 // testProxy builds a proxy pointed at the given upstream (loopback test
-// server) with the credential + audit sink. The resolver answers publicIP
-// for the upstream host (carve-out clean) and the dial seam maps it to the
-// loopback.
-func testProxy(t *testing.T, upstream *httptest.Server, rules []Rule, cred string, resolver *mockResolver, sink *stringsBuilder) *Proxy {
+// server) with the credential + audit sink. The upstream base is the
+// configured loopback host:port (a literal IP checked directly against the
+// carve-outs WITHOUT a lookup — a literal-IP upstream is not subject to the
+// rebind defence, which exists for DNS resolution of a HOSTNAME).
+func testProxy(t *testing.T, upstream *httptest.Server, rules []Rule, cred string, sink *stringsBuilder) *Proxy {
 	t.Helper()
-	lp := loopbackHostPort(t, upstream.URL)
-	host := hostOf(t, upstream.URL)
-	if resolver == nil {
-		resolver = &mockResolver{hosts: map[string][]string{}, calls: map[string]int{}}
-	}
-	if resolver.hosts == nil {
-		resolver.hosts = map[string][]string{}
-	}
-	if resolver.calls == nil {
-		resolver.calls = map[string]int{}
-	}
-	resolver.hosts[host] = []string{publicIP}
 	p, err := newProxy(Config{
-		ToolName:     "tool-x",
+		ToolName:     toolName,
 		UpstreamBase: upstream.URL,
 		Rules:        rules,
 		Credential:   cred,
-		LoopName:     "loop-x",
-		Namespace:    "ns-x",
-		PolicyHash:   "pol-abc",
-		Resolver:     resolver,
-	}, dialToPublic(lp))
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		Resolver:     &mockResolver{hosts: map[string][]string{}, calls: map[string]int{}},
+	}, nil)
 	if err != nil {
 		t.Fatalf("newProxy: %v", err)
 	}
@@ -279,7 +300,7 @@ func (s *stringsBuilder) String() string {
 func auditLines(t *testing.T, sb *stringsBuilder) []map[string]any {
 	t.Helper()
 	var out []map[string]any
-	for _, line := range strings.Split(strings.TrimSpace(sb.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(sb.String()), "\n") {
 		if line == "" {
 			continue
 		}

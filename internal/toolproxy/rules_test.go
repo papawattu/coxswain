@@ -10,25 +10,25 @@ import (
 // rule's prefixes.
 func TestRuleMatch(t *testing.T) {
 	rules := []Rule{
-		{Methods: []string{"GET"}, Paths: []string{"/repos/acme/"}},
-		{Methods: []string{"GET", "POST"}, Paths: []string{"/repos"}},
+		{Methods: []string{methodGET}, Paths: []string{toolPrefix}},
+		{Methods: []string{methodGET, methodPOST}, Paths: []string{prefixRepos}},
 	}
 	cases := []struct {
-		name    string
-		method  string
-		path    string
-		want    bool
+		name   string
+		method string
+		path   string
+		want   bool
 	}{
-		{"allowed method+prefix", "GET", "/repos/acme/repo", true},
-		{"allowed prefix subpath", "GET", "/repos/acme/x/y", true},
-		{"exact prefix is a match", "GET", "/repos/acme/", true},
-		{"wrong method", "DELETE", "/repos/acme/repo", false},
-		{"disallowed prefix", "GET", "/orgs/acme/repo", false},
-		{"segment boundary: /repos/acme/ does NOT cover /repos/acmer", "GET", "/repos/acmer", false},
-		{"exact /repos is covered by its own rule", "GET", "/repos", true},
-		{"exact /repos does not cover /repos2", "GET", "/repos2", false},
-		{"POST is allowed for /repos", "POST", "/repos", true},
-		{"method case-insensitive (lowercase get)", "get", "/repos/acme/repo", true},
+		{"allowed method+prefix", methodGET, toolPath, true},
+		{"allowed prefix subpath", methodGET, "/repos/acme/x/y", true},
+		{"exact prefix is a match", methodGET, toolPrefix, true},
+		{"wrong method", methodDELETE, toolPath, false},
+		{"disallowed prefix", methodGET, "/orgs/acme/repo", false},
+		{"segment boundary: /repos/acme/ does NOT cover /repos/acmer", methodGET, segmentBoundary, false},
+		{"exact /repos is covered by its own rule", methodGET, prefixRepos, true},
+		{"exact /repos does not cover /repos2", methodGET, "/repos2", false},
+		{"POST is allowed for /repos", methodPOST, prefixRepos, true},
+		{"method case-insensitive (lowercase get)", "get", toolPath, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,20 +41,20 @@ func TestRuleMatch(t *testing.T) {
 
 // Empty rule set → everything is 403 (default-deny).
 func TestEmptyRulesDenyAll(t *testing.T) {
-	if ruleMatch(nil, "GET", "/repos/acme/repo") {
+	if ruleMatch(nil, methodGET, toolPath) {
 		t.Fatal("empty rule set must not allow anything")
 	}
-	if ruleMatch([]Rule{}, "GET", "/") {
+	if ruleMatch([]Rule{}, methodGET, "/") {
 		t.Fatal("empty rule set must not allow anything")
 	}
 }
 
 // Segment-prefix semantics stated in the package doc, pinned here.
 func TestSegmentPrefixSemantics(t *testing.T) {
-	if !matchSegmentPrefix("/repos/acme/", "/repos/acme/x/y") {
+	if !matchSegmentPrefix(toolPrefix, "/repos/acme/x/y") {
 		t.Fatal("/repos/acme/ must cover /repos/acme/x/y")
 	}
-	if matchSegmentPrefix("/repos/acme/", "/repos/acmer") {
+	if matchSegmentPrefix(toolPrefix, segmentBoundary) {
 		t.Fatal("/repos/acme/ must NOT cover /repos/acmer (a different segment)")
 	}
 }
@@ -64,7 +64,7 @@ func TestParseRules(t *testing.T) {
 	if len(rules) != 2 {
 		t.Fatalf("got %d rules, want 2", len(rules))
 	}
-	if !reflect.DeepEqual(rules[0], Rule{Methods: []string{"GET"}, Paths: []string{"/a/"}}) {
+	if !reflect.DeepEqual(rules[0], Rule{Methods: []string{methodGET}, Paths: []string{"/a/"}}) {
 		t.Fatalf("bad rule 0: %+v", rules[0])
 	}
 	// A bad/empty value yields an empty (default-deny) rule set.
@@ -86,16 +86,16 @@ func TestNormalisePath(t *testing.T) {
 		want string
 		err  bool
 	}{
-		{"plain", "/repos/acme/repo", "/repos/acme/repo", false},
+		{"plain", toolPath, toolPath, false},
 		{"single slash collapse", "/a//b///c", "/a/b/c", false},
 		{"trailing slash cleaned", "/a/b/", "/a/b", false},
 		{"root stays root", "/", "/", false},
 		{"dot segment dropped", "/a/./b", "/a/b", false},
 		{"non-escaping dotdot rejected", "/repos/acme/../repo", "", true},
-		{"percent-encoded dotdot rejected", "/repos/acme%2f..%2fetc", "", true},
+		{"percent-encoded dotdot rejected", traversalPCT, "", true},
 		{"percent-encoded slash decoded", "/repos/%2fetc", "/repos/etc", false},
 		{"bare path gets leading slash", "repos/acme", "/repos/acme", false},
-		{"root traversal rejected", "/repos/acme/../../etc", "", true},
+		{"root traversal rejected", traversalDotDot, "", true},
 		{"top-level dotdot rejected", "/../etc", "", true},
 		{"encoded root traversal rejected", "/repos/acme%2f..%2f..%2fetc", "", true},
 		{"backslash rejected", "/repos/\\../x", "", true},
@@ -127,33 +127,33 @@ func TestNormalisePath(t *testing.T) {
 // prefix by accident. The rule here allows /repos/acme/; the canonical
 // forms of these bypass attempts are /etc (a 403, no dial).
 func TestNormalisedBeforeMatching(t *testing.T) {
-	rules := []Rule{{Methods: []string{"GET"}, Paths: []string{"/repos/acme/"}}}
+	rules := []Rule{{Methods: []string{methodGET}, Paths: []string{toolPrefix}}}
 	bypass := []struct {
 		raw  string
 		want bool
 	}{
-		{"/repos/acme/../../etc", false},
-		{"/repos/acme%2f..%2fetc", false},
+		{traversalDotDot, false},
+		{traversalPCT, false},
 		{"/repos/acme//../../etc", false},
 		{"/repos/acme/repo/../../../../etc", false},
-		{"/repos/acmer", false},
+		{segmentBoundary, false},
 	}
 	for _, tc := range bypass {
 		norm, err := normalisePath(tc.raw)
 		if err != nil {
 			// Rejected (400) is also a non-match: both outcomes keep the
 			// request off the allowed prefix.
-			if ruleMatch(rules, "GET", norm) {
+			if ruleMatch(rules, methodGET, norm) {
 				t.Fatalf("rejected path %q must not match", tc.raw)
 			}
 			continue
 		}
-		if got := ruleMatch(rules, "GET", norm); got != tc.want {
+		if got := ruleMatch(rules, methodGET, norm); got != tc.want {
 			t.Fatalf("ruleMatch on normalised(%q)=%q = %v, want %v", tc.raw, norm, got, tc.want)
 		}
 	}
 	// A canonical allowed path still matches after normalisation.
-	if !ruleMatch(rules, "GET", mustNormalise(t, "/repos/acme/repo")) {
+	if !ruleMatch(rules, methodGET, mustNormalise(t, toolPath)) {
 		t.Fatal("/repos/acme/repo must match /repos/acme/")
 	}
 }

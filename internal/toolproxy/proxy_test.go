@@ -20,7 +20,7 @@ func TestConnect405NoDial(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", nil, &sink)
+	p := testProxy(t, up, rulesGET(), cred, &sink)
 
 	req := httptest.NewRequest(http.MethodConnect, hostOf(t, up.URL), nil)
 	rec := httptest.NewRecorder()
@@ -44,16 +44,16 @@ func TestAbsoluteForm405NoDial(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", nil, &sink)
+	p := testProxy(t, up, rulesGET(), cred, &sink)
 
 	// An absolute-form request: the URL is absolute and RequestURI carries
 	// the full URI, as a real forward-proxy client sends it.
-	u, err := url.Parse(up.URL + "/repos/acme/repo")
+	u, err := url.Parse(up.URL + toolPath)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	req := &http.Request{
-		Method:     "GET",
+		Method:     methodGET,
 		URL:        u,
 		Host:       u.Host,
 		Header:     http.Header{},
@@ -95,7 +95,7 @@ func TestAllowedRequestTLSCredential(t *testing.T) {
 	// proxy dials the resolved IP with SNI = the upstream HOSTNAME
 	// (example.test) and verifies the certificate against it (not the
 	// dial IP).
-	lp := loopbackHostPort(t, srv.URL)
+	port := loopbackPort(t, srv.URL)
 	resolver := &mockResolver{hosts: map[string][]string{"example.test": {publicIP}}, calls: map[string]int{}}
 	var sink stringsBuilder
 	// The upstream base is the configured hostname (example.test), not the
@@ -105,15 +105,15 @@ func TestAllowedRequestTLSCredential(t *testing.T) {
 	// HOSTNAME (example.test) and verifies the certificate against it (not
 	// the dial IP). The certificate is issued for example.test.
 	p, err := newProxy(Config{
-		ToolName:     "tool-x",
+		ToolName:     toolName,
 		UpstreamBase: "https://example.test:443",
-		Rules:        rulesGET("/repos/acme/"),
+		Rules:        rulesGET(),
 		Credential:   "cred-secret",
-		LoopName:     "loop-x",
-		Namespace:    "ns-x",
-		PolicyHash:   "pol-abc",
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
 		Resolver:     resolver,
-	}, dialToPublic(lp))
+	}, dialToPublic(port))
 	if err != nil {
 		t.Fatalf("newProxy: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestAllowedRequestTLSCredential(t *testing.T) {
 	}
 	tr.TLSClientConfig.RootCAs = ca
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
@@ -163,11 +163,11 @@ func TestNormalisationRejectsOrCleans(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", nil, &sink)
+	p := testProxy(t, up, rulesGET(), cred, &sink)
 
 	bypassPaths := []struct{ name, raw string }{
-		{"dotdot", "/repos/acme/../../etc"},
-		{"percent-encoded", "/repos/acme%2f..%2fetc"},
+		{"dotdot", traversalDotDot},
+		{"percent-encoded", traversalPCT},
 		{"double-slash traversal", "/repos/acme//../../etc"},
 		{"deep dotdot", "/repos/acme/repo/../../../../etc"},
 		{"backslash", "/repos/\\../x"},
@@ -179,7 +179,7 @@ func TestNormalisationRejectsOrCleans(t *testing.T) {
 			// encoding, exactly as the agent sent it.
 			u := &url.URL{Path: tc.raw}
 			req := &http.Request{
-				Method:     "GET",
+				Method:     methodGET,
 				URL:        u,
 				Host:       hostOf(t, up.URL),
 				Header:     http.Header{},
@@ -228,21 +228,21 @@ func TestNoRedirectFollowing(t *testing.T) {
 	// answer to FIRST's loopback (the proxy only dials the configured
 	// upstream).
 	p, err := newProxy(Config{
-		ToolName:     "tool-x",
+		ToolName:     toolName,
 		UpstreamBase: first.URL,
-		Rules:        rulesGET("/repos/acme/"),
-		Credential:   "cred",
-		LoopName:     "loop-x",
-		Namespace:    "ns-x",
-		PolicyHash:   "pol-abc",
+		Rules:        rulesGET(),
+		Credential:   cred,
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
 		Resolver:     resolver,
-	}, dialToPublic(loopbackHostPort(t, first.URL)))
+	}, dialToPublic(loopbackPort(t, first.URL)))
 	if err != nil {
 		t.Fatalf("newProxy: %v", err)
 	}
 	p.SetAuditSink(&sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
@@ -264,9 +264,9 @@ func TestAgentAuthStripped(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "server-cred", nil, &sink)
+	p := testProxy(t, up, rulesGET(), "server-cred", &sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	req.Header.Set("Authorization", "Bearer agent-forged")
 	req.Header.Set("Proxy-Authorization", "Basic dXNlcjpwYXNz")
 	rec := httptest.NewRecorder()
@@ -298,9 +298,9 @@ func TestNoCredentialNoHeader(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "", nil, &sink)
+	p := testProxy(t, up, rulesGET(), "", &sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
@@ -321,15 +321,30 @@ func TestNoCredentialNoHeader(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // A resolver returning a carved-out IP (pod CIDR 10/8) → 403 + audit, no
-// dial.
+// dial. The upstream base is a HOSTNAME (not a literal IP) so the resolver
+// is consulted and the carve-out check runs.
 func TestResolvedIPCarveOutNoDial(t *testing.T) {
 	log := &requestLog{}
-	up := newTestServer(t, log, 200, "")
-	resolver := &mockResolver{hosts: map[string][]string{hostOf(t, up.URL): {"10.99.0.5"}}, calls: map[string]int{}}
+	_ = log
+	upBase := upstreamBaseHTTPS // a hostname; the resolver answers 10.99.0.5
+	resolver := &mockResolver{hosts: map[string][]string{upstreamHost: {"10.99.0.5"}}, calls: map[string]int{}}
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", resolver, &sink)
+	p, err := newProxy(Config{
+		ToolName:     toolName,
+		UpstreamBase: upBase,
+		Rules:        rulesGET(),
+		Credential:   cred,
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		Resolver:     resolver,
+	}, nil)
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	p.SetAuditSink(&sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
@@ -348,12 +363,26 @@ func TestResolvedIPCarveOutNoDial(t *testing.T) {
 // A resolver that fails (NXDOMAIN) → 403, no dial.
 func TestResolvedIPNXDOMAIN(t *testing.T) {
 	log := &requestLog{}
-	up := newTestServer(t, log, 200, "")
-	resolver := &mockResolver{hosts: map[string][]string{}, errs: map[string]error{hostOf(t, up.URL): fmt.Errorf("no such host")}, calls: map[string]int{}}
+	_ = log
+	upBase := upstreamBaseHTTPS
+	resolver := &mockResolver{hosts: map[string][]string{}, errs: map[string]error{upstreamHost: fmt.Errorf("no such host")}, calls: map[string]int{}}
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", resolver, &sink)
+	p, err := newProxy(Config{
+		ToolName:     toolName,
+		UpstreamBase: upBase,
+		Rules:        rulesGET(),
+		Credential:   cred,
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		Resolver:     resolver,
+	}, nil)
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	p.SetAuditSink(&sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
@@ -369,12 +398,26 @@ func TestResolvedIPNXDOMAIN(t *testing.T) {
 // split-horizon answer) → 403, no dial.
 func TestResolvedIPMixedPublicPrivate(t *testing.T) {
 	log := &requestLog{}
-	up := newTestServer(t, log, 200, "")
-	resolver := &mockResolver{hosts: map[string][]string{hostOf(t, up.URL): {publicIP, "192.168.1.5"}}, calls: map[string]int{}}
+	_ = log
+	upBase := upstreamBaseHTTPS
+	resolver := &mockResolver{hosts: map[string][]string{upstreamHost: {publicIP, "192.168.1.5"}}, calls: map[string]int{}}
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", resolver, &sink)
+	p, err := newProxy(Config{
+		ToolName:     toolName,
+		UpstreamBase: upBase,
+		Rules:        rulesGET(),
+		Credential:   cred,
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		Resolver:     resolver,
+	}, nil)
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	p.SetAuditSink(&sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
@@ -392,18 +435,38 @@ func TestResolvedIPMixedPublicPrivate(t *testing.T) {
 func TestNoReResolution(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
-	resolver := &mockResolver{hosts: map[string][]string{}, calls: map[string]int{}}
+	// A hostname upstream so the resolver is consulted; it answers the
+	// loopback (carve-out clean? no — 127.0.0.1 is carved out; so answer a
+	// public IP and dial-seam it back to the loopback).
+	upBase := upstreamBaseHTTP // http (the test server is plain HTTP); the
+	// resolver answers publicIP (carve-out clean) and the dial seam maps it
+	// back to the loopback.
+	port := loopbackPort(t, up.URL)
+	resolver := &mockResolver{hosts: map[string][]string{upstreamHost: {publicIP}}, calls: map[string]int{}}
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", resolver, &sink)
+	p, err := newProxy(Config{
+		ToolName:     toolName,
+		UpstreamBase: upBase,
+		Rules:        rulesGET(),
+		Credential:   cred,
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		Resolver:     resolver,
+	}, dialToPublic(port))
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	p.SetAuditSink(&sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if n := resolver.count(hostOf(t, up.URL)); n != 1 {
+	if n := resolver.count(upstreamHost); n != 1 {
 		t.Fatalf("upstream host looked up %d times, want exactly 1 (no re-resolution: the dial uses the first answer)", n)
 	}
 }
@@ -416,17 +479,17 @@ func TestAuditLineAllowedAndBlocked(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 418, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", nil, &sink)
+	p := testProxy(t, up, rulesGET(), cred, &sink)
 
 	// Allowed: the upstream's 418 status is carried through and audited.
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	if rec.Code != 418 {
 		t.Fatalf("status = %d, want 418 (the upstream's status as-is)", rec.Code)
 	}
 	// Blocked: no match.
-	req2 := httptest.NewRequest("GET", "/not-allowed", nil)
+	req2 := httptest.NewRequest(methodGET, "/not-allowed", nil)
 	rec2 := httptest.NewRecorder()
 	p.ServeHTTP(rec2, req2)
 	if rec2.Code != 403 {
@@ -441,10 +504,10 @@ func TestAuditLineAllowedAndBlocked(t *testing.T) {
 	if lines[0]["status"] != float64(418) {
 		t.Fatalf("allowed audit status = %v, want 418 (the upstream's status)", lines[0]["status"])
 	}
-	if lines[0]["method"] != "GET" || lines[0]["path"] != "/repos/acme/repo" {
+	if lines[0]["method"] != methodGET || lines[0]["path"] != toolPath {
 		t.Fatalf("allowed audit method/path = %v %v", lines[0]["method"], lines[0]["path"])
 	}
-	if lines[0]["policy"] != "pol-abc" {
+	if lines[0]["policy"] != policy {
 		t.Fatalf("audit must carry the policy hash, got %v", lines[0]["policy"])
 	}
 	if lines[0]["source"] != Source {
@@ -454,10 +517,10 @@ func TestAuditLineAllowedAndBlocked(t *testing.T) {
 	if lines[1]["status"] != float64(403) {
 		t.Fatalf("blocked audit status = %v, want 403", lines[1]["status"])
 	}
-	if lines[1]["method"] != "GET" || lines[1]["path"] != "/not-allowed" {
+	if lines[1]["method"] != methodGET || lines[1]["path"] != "/not-allowed" {
 		t.Fatalf("blocked audit method/path = %v %v", lines[1]["method"], lines[1]["path"])
 	}
-	if lines[1]["policy"] != "pol-abc" {
+	if lines[1]["policy"] != policy {
 		t.Fatalf("blocked audit must carry the policy hash, got %v", lines[1]["policy"])
 	}
 }
@@ -468,9 +531,9 @@ func TestAuditRedaction(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "s3cr3t-value", nil, &sink)
+	p := testProxy(t, up, rulesGET(), "s3cr3t-value", &sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -489,7 +552,7 @@ func TestRuleVerdicts(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, rulesGET("/repos/acme/"), "cred", nil, &sink)
+	p := testProxy(t, up, rulesGET(), cred, &sink)
 
 	cases := []struct {
 		name   string
@@ -497,10 +560,10 @@ func TestRuleVerdicts(t *testing.T) {
 		path   string
 		status int
 	}{
-		{"allowed", "GET", "/repos/acme/repo", 200},
-		{"wrong method → 403", "DELETE", "/repos/acme/repo", 403},
-		{"disallowed prefix → 403", "GET", "/orgs/acme/repo", 403},
-		{"segment boundary → 403", "GET", "/repos/acmer", 403},
+		{"allowed", methodGET, toolPath, 200},
+		{"wrong method → 403", methodDELETE, toolPath, 403},
+		{"disallowed prefix → 403", methodGET, "/orgs/acme/repo", 403},
+		{"segment boundary → 403", methodGET, segmentBoundary, 403},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -527,9 +590,9 @@ func TestEmptyRulesDenyAllAtHandler(t *testing.T) {
 	log := &requestLog{}
 	up := newTestServer(t, log, 200, "")
 	var sink stringsBuilder
-	p := testProxy(t, up, nil, "cred", nil, &sink)
+	p := testProxy(t, up, nil, cred, &sink)
 
-	req := httptest.NewRequest("GET", "/repos/acme/repo", nil)
+	req := httptest.NewRequest(methodGET, toolPath, nil)
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	if rec.Code != 403 {

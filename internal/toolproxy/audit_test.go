@@ -9,7 +9,7 @@ import (
 // consumes. It carries NO credential value and NO headers (method, path,
 // status and the policy hash only).
 func TestAuditRecordShape(t *testing.T) {
-	rec := NewAuditRecord("tool-x", "loop-x", "ns-x", "GET", "/repos/acme/repo", 200, "pol-abc")
+	rec := NewAuditRecord(toolName, loopName, nsName, methodGET, toolPath, 200, policy)
 	data, err := json.Marshal(rec)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -30,13 +30,13 @@ func TestAuditRecordShape(t *testing.T) {
 	if m["action"] != "request" {
 		t.Fatalf("action must be request, got %v", m["action"])
 	}
-	if m["tool"] != "tool-x" {
+	if m["tool"] != toolName {
 		t.Fatalf("tool must be tool-x, got %v", m["tool"])
 	}
 	if m["status"] != float64(200) {
 		t.Fatalf("status must be 200, got %v", m["status"])
 	}
-	if m["policy"] != "pol-abc" {
+	if m["policy"] != policy {
 		t.Fatalf("policy must be pol-abc, got %v", m["policy"])
 	}
 	// The credential is structurally never in the record: no headers, no
@@ -49,14 +49,14 @@ func TestAuditRecordShape(t *testing.T) {
 }
 
 func TestAuditRecordBlocked(t *testing.T) {
-	rec := NewAuditRecord("tool-x", "loop-x", "ns-x", "DELETE", "/repos/acme/repo", 403, "pol-abc")
+	rec := NewAuditRecord(toolName, loopName, nsName, methodDELETE, toolPath, 403, policy)
 	data, _ := json.Marshal(rec)
 	var m map[string]any
 	_ = json.Unmarshal(data, &m)
 	if m["status"] != float64(403) {
 		t.Fatalf("blocked record status must be 403, got %v", m["status"])
 	}
-	if m["method"] != "DELETE" || m["path"] != "/repos/acme/repo" {
+	if m["method"] != methodDELETE || m["path"] != toolPath {
 		t.Fatalf("blocked record must carry method/path, got %v %v", m["method"], m["path"])
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -51,12 +50,12 @@ type Proxy struct {
 	// request (no concurrent access in the tests).
 	auditSink io.Writer
 	// auditMu guards the captured audit lines in tests.
-	// httpUpstream / tlsUpstream are the fixed upstream endpoints, built in
-	// New from UpstreamBase.
-	httpUpstream string
-	tlsUpstream  bool
-	upHost       string
-	upPort       int
+	// tlsUpstream is true for an https upstream (the TLS SNI + verification
+	// target). upHost/upPort is the fixed upstream host:port built in New
+	// from UpstreamBase.
+	tlsUpstream bool
+	upHost      string
+	upPort      int
 	// dialTo maps the resolved upstream IP to the dial address (nil in
 	// production: dial the resolved IP literally; a test maps its
 	// public-looking resolver answer back to the loopback where the test
@@ -135,9 +134,9 @@ func parseUpstreamBase(raw string) (upstreamURL, error) {
 }
 
 type upstreamURL struct {
-	Scheme   string
-	Host     string
-	Port     int
+	Scheme string
+	Host   string
+	Port   int
 }
 
 func (u upstreamURL) Hostname() string { return u.Host }
@@ -219,13 +218,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Originate the request to the upstream (credential injected, agent auth
 	// stripped), copy the response verbatim (no redirect following: a 3xx
 	// goes back to the agent as-is).
-	upReq, err := p.buildUpstreamRequest(r, path, resolvedIP)
-	if err != nil {
-		p.audit(r.Method, path, http.StatusBadGateway)
-		http.Error(w, "bad upstream request: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	resp, err := p.client_.Do(upReq)
+	upReq := p.buildUpstreamRequest(r, path, resolvedIP)
+	resp, err := p.client().Do(upReq)
 	if err != nil {
 		p.audit(r.Method, path, http.StatusBadGateway)
 		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
@@ -243,11 +237,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // production; the Host header carries the upstream hostname for virtual
 // hosting), agent Authorization / Proxy-Authorization are stripped, and the
 // credential is injected (if configured).
-func (p *Proxy) buildUpstreamRequest(r *http.Request, path string, resolvedIP net.IP) (*http.Request, error) {
+func (p *Proxy) buildUpstreamRequest(r *http.Request, path string, resolvedIP net.IP) *http.Request {
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	out.URL.Scheme = p.upstreamScheme()
-	out.URL.Host = p.dialHost(p.dialAddr(resolvedIP), p.upPort)
+	out.URL.Host = p.dialAddr(resolvedIP) // host:port literal; the client dials it directly (no re-resolution)
 	out.URL.Path = path
 	out.URL.RawPath = ""
 	out.URL.RawQuery = r.URL.RawQuery
@@ -257,31 +251,22 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, path string, resolvedIP ne
 	if p.HaveCred {
 		out.Header.Set("Authorization", "Bearer "+p.Credential)
 	}
-	return out, nil
+	return out
 }
 
-// dialHost formats the dial host:port for an outgoing URL. A literal IP
-// with a non-default port is joined as "[ip]:port" (a plain "ip:port" is
-// parsed by net/url as a HOSTNAME, not an IP-with-port, and the client
-// would re-resolve it); otherwise plain host:port.
-func (p *Proxy) dialHost(dialAddr string, port int) string {
-	if ip := net.ParseIP(dialAddr); ip != nil && port != 80 {
-		return net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port))
-	}
-	return net.JoinHostPort(dialAddr, fmt.Sprintf("%d", port))
-}
-
-// dialAddr returns the address the proxy dials for the resolved IP: the IP
-// itself in production (no re-resolution), or the test-mapped address (a
-// test server listens on loopback, which is carved out of the dialable
-// range — the resolver's public-looking answer is mapped back to it).
+// dialAddr returns the dial "host:port" for the resolved IP: in production
+// the resolved IP joined with the upstream port (a literal the http client
+// dials directly, no re-resolution); in a test, the mapped loopback
+// host:port (the test server listens on loopback, which is carved out of the
+// dialable range — the resolver's public-looking answer is mapped back to
+// it).
 func (p *Proxy) dialAddr(resolvedIP net.IP) string {
 	if p.dialTo != nil {
 		if a := p.dialTo(resolvedIP); a != "" {
 			return a
 		}
 	}
-	return resolvedIP.String()
+	return net.JoinHostPort(resolvedIP.String(), fmt.Sprintf("%d", p.upPort))
 }
 
 // upstreamScheme returns the scheme for the originated upstream request.
@@ -303,12 +288,14 @@ func (p *Proxy) upstreamScheme() string {
 // in-cluster upstream and is not subject to the rebind defence (the backstop
 // exists for DNS resolution of a HOSTNAME, not for an explicit IP).
 func (p *Proxy) resolveAndCheck(ctx context.Context) (net.IP, bool, error) {
-	// A literal-IP upstream is checked directly (no lookup).
-	if addr, perr := netip.ParseAddr(p.upHost); perr == nil {
-		ip := addr.AsSlice()
-		if IPInCarveOuts(ip, p.ExtraCIDRs) {
-			return ip, false, nil
-		}
+	if p.Resolver == nil {
+		p.Resolver = defaultResolver{}
+	}
+	// A literal-IP upstream is checked directly (no lookup): it is an
+	// operator-chosen test / in-cluster upstream and is not subject to the
+	// rebind defence (the backstop exists for DNS resolution of a HOSTNAME,
+	// not for an explicit IP).
+	if ip := net.ParseIP(p.upHost); ip != nil {
 		return ip, true, nil
 	}
 	dnsCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
@@ -329,22 +316,36 @@ func (p *Proxy) resolveAndCheck(ctx context.Context) (net.IP, bool, error) {
 // with the custom DialContext (dial to the resolved IP literal — no
 // re-resolution) and, for an https upstream, a TLS config that sends SNI and
 // verifies the certificate against the upstream HOSTNAME (not the dial IP).
-func (p *Proxy) client() *http.Client {
-	if p.client_ != nil {
-		return p.client_
-	}
+// transport builds the upstream http.Transport: a custom DialContext (dial to
+// the address the client gives, which is the resolved-IP literal — no
+// re-resolution) and, for an https upstream, a TLS config that sends SNI and
+// verifies the certificate against the upstream HOSTNAME (not the dial IP).
+func (p *Proxy) transport() *http.Transport {
 	t := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, addr)
 		},
 		ResponseHeaderTimeout: 30 * time.Second,
-		IdleConnTimeout:     90 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
 	}
 	if p.tlsUpstream {
 		t.TLSClientConfig = &tls.Config{ServerName: p.upHost}
 	}
-	p.client_ = &http.Client{Transport: t, Timeout: requestTimeout}
+	return t
+}
+
+func (p *Proxy) client() *http.Client {
+	if p.client_ != nil {
+		return p.client_
+	}
+	// CheckRedirect: a non-nil func that NEVER follows — the redirect's
+	// status + Location are returned verbatim (no re-issue of the upstream
+	// request), so a 3xx goes back to the agent as-is.
+	p.client_ = &http.Client{Transport: p.transport(), Timeout: requestTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
 	return p.client_
 }
 

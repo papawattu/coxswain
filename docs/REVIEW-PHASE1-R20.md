@@ -70,7 +70,7 @@ include the runner's shell.
 
 ### I46. `PolicyEnforced` says "NOT enforced" while KubeArmor is enforcing
 
-- [ ] Open
+- [x] Fixed in 9ce0ec0 (merge of #62)
 
 **Where:** `internal/controller/loop_controller.go`, `enforcementStatus`
 (~L700), and the condition text from the `--allow-unenforced` escape hatch.
@@ -108,7 +108,7 @@ A probe mismatch?
 
 ### I47. The runner commits build artifacts into the verified commit
 
-- [ ] Open
+- [x] Fixed in b8cac37 (merge of #55)
 
 **Where:** `runner/phase.go` `commitWorkspace` (`git add -A -- ':(exclude).coxswain'`);
 the gocli seed (`examples/gocli`, no `.gitignore` entry for the binary).
@@ -133,7 +133,7 @@ gocli task 1 shows `round.go` only.
 
 ### I49. Test-norm additions (from the S5a regression and the builder's mutation hygiene)
 
-- [ ] Open (AGENTS.md "Test norms")
+- [x] Fixed in ca6efb1 (merge of #61)
 
 **Where:** AGENTS.md "Test norms (R16 I43)"; `internal/controller/loop_verify_job.go`
 `verifyOutcome` (fixed in #53).
@@ -171,7 +171,7 @@ a pending-state spec, or this item lists the exceptions.
 
 ### I48. The stale-iteration claim guard exempts iteration-0 claims
 
-- [ ] Open
+- [x] Fixed in 3f90cf5 (merge of #63)
 
 **Where:** `internal/controller/loop_s4_phase.go` (~L503): `if claim.Iteration > 0
 && claim.Iteration != loop.Status.Iteration`.
@@ -192,7 +192,7 @@ drop the guard → FAIL.
 
 ### I50. Demo evidence has no model-request count
 
-- [ ] Open
+- [x] Fixed in a473449 (merge of #65)
 
 **Where:** the model-proxy dev stand-in (`cmd/proxy-standin`), and
 `hack/sample-run.sh` (the EVIDENCE.md "Model proxy" section).
@@ -209,7 +209,7 @@ run.
 
 ### I51. Deploy hygiene: a dev deploy without an image tag strands the rollout
 
-- [ ] Open
+- [x] Fixed in 95d89a8 (merge of #64)
 
 **Where:** `make deploy-dev` / `config/dev`, and `hack/sample-run.sh`.
 

@@ -58,7 +58,7 @@ Implemented in S6 (#56). The live GitHub test is I54.
 
 ### I52. A failed delivery can only be retried by hand
 
-- [ ] Open
+- [x] Fixed in 70ee2cd (merge of #60)
 
 **Where:** `internal/controller/loop_deliver_job.go`
 (`deliverReadbackChanged`, `deliveryRequested`); the deliver Job has
@@ -102,7 +102,7 @@ reused. Later, `kubectl cox redeliver` sets the annotation.
 
 ### I53. The push script parses JSON with `sed`
 
-- [ ] Open
+- [x] Fixed in f861679 (merge of #59)
 
 **Where:** `internal/controller/loop_deliver_job.go`, the push container
 script. It reads `html_url`, `number` and `default_branch` with
@@ -165,7 +165,7 @@ from `main`.
 
 ### I55. Test norms: execute embedded scripts; mutations must be exact
 
-- [ ] Open (AGENTS.md "Test norms", extends I49)
+- [x] Fixed in ca6efb1 (merge of #61)
 
 **Problem:**
 
@@ -198,7 +198,7 @@ from `main`.
 
 ### I56. Gitea ignores the API draft flag
 
-- [ ] Open
+- [x] Fixed in 5f1a50c (merge of #66)
 
 **Where:** the push script's create-PR call for the Gitea provider (49f61da).
 
@@ -215,15 +215,10 @@ regenerates the CRD description).
 
 ### I57. Housekeeping from R20 and S6
 
-- [ ] Open
-
-- Tick R20's I47 box with b8cac37. PR #55 merged, but the box is still open.
-- Builder tree: pi's checkout is still on the deleted branch
-  `slice/s6-delivery` (ca1f756). Switch to `main` and pull before the next
-  slice.
-- Stale scratch worktrees: `/tmp/cox-s6-rev` (5e3f28f) and
-  `/tmp/cox-s4-mut` (6a3b22e). Remove them with `git worktree remove`; both
-  are scratch.
+- [x] Done in this PR (ticks the closed R18/R20/R21 boxes in the review
+  docs). The R20 I47 box is ticked here; the builder tree is on `main` and
+  the stale scratch worktrees (`/tmp/cox-s6-rev`, `/tmp/cox-s4-mut`) are
+  removed — `git worktree list` shows only the main tree.
 
 **Acceptance:** the R20 tick commit, plus `git worktree list` showing only
 the main tree.

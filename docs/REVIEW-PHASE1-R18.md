@@ -36,7 +36,7 @@ decision and what it changes for the builder.
 
 ### D44. CI: hosted runners for unit tests and lint
 
-- [ ] Planned (after the samples build, S5)
+- [x] Implemented in 6ab1c62 (merge of #58)
 
 **Decision:** move `make test` and `make lint` to **GitHub-hosted runners**
 (cache the envtest binaries). The kind e2e runs (KubeArmor, Calico,

@@ -134,7 +134,7 @@ var _ = Describe("I43: PolicyValid same-Loop flip", func() {
 		// gates apply — no model endpoint, no network allows).
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: i43PolicyValidPolicy, Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, "/bin/sh"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}},
 		})).To(Succeed())
 		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: i43PolicyValidLoop}})
 		Expect(err).NotTo(HaveOccurred())

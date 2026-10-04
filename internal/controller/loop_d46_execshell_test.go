@@ -56,9 +56,9 @@ const (
 
 // d46Condition returns the Loop's PolicyValid condition re-read from the API
 // server, or nil when the condition is absent.
-func d46Condition(ctx context.Context, ns, loopName string) *metav1.Condition {
+func d46Condition(ctx context.Context, ns string) *metav1.Condition {
 	loop := &coxv1alpha1.Loop{}
-	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName}, loop)).To(Succeed())
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: d46LoopName}, loop)).To(Succeed())
 	for i := range loop.Status.Conditions {
 		if loop.Status.Conditions[i].Type == policyValidType {
 			return &loop.Status.Conditions[i]
@@ -123,14 +123,14 @@ var _ = Describe("D46: agent exec list without the runner's shell fails fast", f
 		// the controller is the gate that must catch it.
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: d46PolicyName, Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/local/go/bin/go", "/usr/bin/git"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/local/go/bin/go", c6aGitBin}},
 		})).To(Succeed())
 
 		Expect(k8sClient.Create(ctx, buildD46Loop())).To(Succeed())
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: d46LoopName}})
 		Expect(err).NotTo(HaveOccurred())
 
-		pv := d46Condition(ctx, ns, d46LoopName)
+		pv := d46Condition(ctx, ns)
 		Expect(pv).ToNot(BeNil(), "the Loop must have a PolicyValid condition")
 		Expect(pv.Status).To(Equal(metav1.ConditionFalse))
 		Expect(pv.Reason).To(Equal(d46Reason),
@@ -159,7 +159,7 @@ var _ = Describe("D46: agent exec list without the runner's shell fails fast", f
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: d46LoopName}})
 		Expect(err).NotTo(HaveOccurred())
 
-		pv := d46Condition(ctx, ns, d46LoopName)
+		pv := d46Condition(ctx, ns)
 		Expect(pv).ToNot(BeNil())
 		Expect(pv.Status).To(Equal(metav1.ConditionFalse))
 		Expect(pv.Reason).To(Equal(d46Reason))
@@ -171,12 +171,12 @@ var _ = Describe("D46: agent exec list without the runner's shell fails fast", f
 		// the API server inside Reconcile).
 		ap := &coxv1alpha1.AgentPolicy{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: d46PolicyName}, ap)).To(Succeed())
-		ap.Spec.Exec = []string{"/bin/sh", "/usr/bin/git"}
+		ap.Spec.Exec = []string{runnerShellPath, c6aGitBin}
 		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
 		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: d46LoopName}})
 		Expect(err).NotTo(HaveOccurred())
 
-		pv = d46Condition(ctx, ns, d46LoopName)
+		pv = d46Condition(ctx, ns)
 		Expect(pv).ToNot(BeNil())
 		Expect(pv.Status).To(Equal(metav1.ConditionTrue),
 			"step 2: the SAME Loop must flip PolicyValid=True once the exec list includes /bin/sh (update path, not just creation)")
@@ -198,7 +198,7 @@ var _ = Describe("D46: agent exec list without the runner's shell fails fast", f
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: d46LoopName}})
 		Expect(err).NotTo(HaveOccurred())
 
-		pv := d46Condition(ctx, ns, d46LoopName)
+		pv := d46Condition(ctx, ns)
 		Expect(pv).ToNot(BeNil())
 		Expect(pv.Status).To(Equal(metav1.ConditionTrue),
 			"an empty exec list is the default-deny minimum, not a shell-less wedge")

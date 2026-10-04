@@ -1,5 +1,7 @@
 package controller
 
+import "slices"
+
 // Shared production string constants (goconst): values that repeat across the
 // controller builders (agent / verify / deliver / egress-proxy) and would
 // otherwise trip goconst's min-occurrences threshold. Kept out of the
@@ -43,10 +45,5 @@ func missingShellInExecList(exec []string) bool {
 	if len(exec) == 0 {
 		return false
 	}
-	for _, e := range exec {
-		if e == runnerShellPath {
-			return false
-		}
-	}
-	return true
+	return !slices.Contains(exec, runnerShellPath)
 }

@@ -33,6 +33,7 @@ import (
 // absolute-path CEL rule). Shared so goconst doesn't flag the repeated literal.
 const (
 	c6aGitBin        = "/usr/bin/git"
+	c6aGoBin         = "/usr/local/go/bin/go"
 	c6aTestRepo      = "https://github.com/papawattu/coxswain.git"
 	nonCanonLoopName = "noncanon-loop"
 	policyValidType  = "PolicyValid"
@@ -70,11 +71,11 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, "/bin/sh"}, Network: []string{i42eExternalHost}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}, Network: []string{i42eExternalHost}},
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "p2", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{"/usr/local/go/bin/go"}, Files: []string{"/data"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGoBin}, Files: []string{"/data"}},
 		})).To(Succeed())
 
 		loop := buildLoop("loop-c6a-union", ns, "make it pass", "https://github.com/papawattu/coxswain.git")
@@ -87,7 +88,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 
 		// The expected union hash: exec={c6aGitBin,/usr/local/go/bin/go}, network={proxy.golang.org:443}, files={/data}.
 		want := policy.EffectiveHash(policy.EffectivePolicy{
-			Exec:    []string{c6aGitBin, "/usr/local/go/bin/go", "/bin/sh"},
+			Exec:    []string{c6aGitBin, c6aGoBin, runnerShellPath},
 			Network: []string{i42eExternalHost},
 			Files:   []string{"/data"},
 		})
@@ -127,7 +128,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 		// A valid absolute path outside the writable mounts is accepted.
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "ok", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, "/bin/sh"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}},
 		})).To(Succeed(), "a real binary path outside the writable mounts must be allowed")
 
 		// A bare command name (no leading /) is rejected — it is spoofable.
@@ -178,7 +179,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 		// A canonical path is accepted.
 		ap3 := &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "canon", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, "/bin/sh"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}},
 		}
 		Expect(k8sClient.Create(ctx, ap3)).To(Succeed(),
 			"the CRD must accept a canonical path")
@@ -242,7 +243,7 @@ var _ = Describe("C6a (R15 round 3): fail-closed policy validation", func() {
 		ap := &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "clean-pol", Namespace: ns},
 			Spec: coxv1alpha1.AgentPolicySpec{
-				Exec: []string{"/usr/bin/git", "/bin/sh"},
+				Exec: []string{c6aGitBin, runnerShellPath},
 			},
 		}
 		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
@@ -332,7 +333,7 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 		// Now create the AgentPolicy.
 		ap := &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "late-policy", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, "/bin/sh"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}},
 		}
 		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
 
@@ -383,7 +384,7 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 		// Create the AgentPolicy.
 		ap := &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-policy", Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, "/bin/sh"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}},
 		}
 		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
 
@@ -420,7 +421,7 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 		// Create the AgentPolicy with one exec allow.
 		ap := &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: editPolicyName, Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, "/bin/sh"}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}},
 		}
 		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
 

@@ -138,7 +138,7 @@ make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
 
-### Test norms (R16 I43)
+### Test norms (R16 I43; R20 I49; R21 I55)
 
 - Every object the controller reconciles gets at least one **same-Loop**
   envtest spec that changes an input and re-reconciles, asserting the object
@@ -147,6 +147,21 @@ make test       # Run unit tests
 - Every gate spec must **FAIL when the gate is disabled**: disable the gate in
   a scratch copy, run the spec, and confirm it fails before claiming a gate
   is tested. Don't commit the mutation; record the result in the PR.
+- Every decision that reads pod, container, or Job status gets a spec for
+  **each in-progress state** (Waiting, Running, a Job with neither Failed nor
+  Succeeded) as well as each terminal state, asserting **no decision** while
+  in progress (the I49/S5a finding: `verifyOutcome` mapped a still-running
+  check to "iterate").
+- Mutations run in a **scratch worktree** (`git worktree add`), never in the
+  working tree. Record the result; delete the worktree.
+- Kind-run logs and generated evidence are **never discarded or redirected to
+  `/dev/null`**.
+- Any shell script embedded in Go (Job or init-container scripts) has an
+  **execution test**: it runs the real generated script with only path or host
+  constants substituted, before any kind run.
+- When a reviewer names a mutation, the builder applies **exactly** that diff
+  in a scratch worktree and records the result. A broader mutation doesn't
+  count.
 
 ## CLI Commands Cheat Sheet
 

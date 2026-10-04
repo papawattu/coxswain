@@ -16,6 +16,7 @@ package controller
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -337,6 +338,17 @@ func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host, defaultBranch 
 // fail-closed lookup test); defaultBranch "" makes it return JSON with no
 // default_branch field (an empty lookup — also fail-closed).
 func newFakeGiteaAPIWithRepoGET(t *testing.T, owner, repoName, scheme, host, defaultBranch string, repoGETStatus int) (apiBase string, posts *[]fakeGiteaAPICall) {
+	t.Helper()
+	return newFakeGiteaAPIWithNested(t, owner, repoName, scheme, host, defaultBranch, repoGETStatus, "", "")
+}
+
+// newFakeGiteaAPIWithNested is newFakeGiteaAPIWithRepoGET with control over
+// the nested JSON the responses carry (I53): nestedRepo is appended INSIDE
+// the top-level object of the repo-GET body (after its top-level
+// default_branch), and nestedPR is appended inside the top-level PR object
+// of the lookup and create bodies (after their top-level number/html_url).
+// Empty suffixes give the plain fake (the existing tests).
+func newFakeGiteaAPIWithNested(t *testing.T, owner, repoName, scheme, host, defaultBranch string, repoGETStatus int, nestedRepo, nestedPR string) (apiBase string, posts *[]fakeGiteaAPICall) {
 	var mu sync.Mutex
 	var postList []fakeGiteaAPICall
 	var openPR int // 0 = no open PR yet
@@ -352,9 +364,9 @@ func newFakeGiteaAPIWithRepoGET(t *testing.T, owner, repoName, scheme, host, def
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if defaultBranch == "" {
-				_, _ = fmt.Fprintf(w, `{"name":"%s"}`, repoName)
+				_, _ = fmt.Fprintf(w, `{"name":"%s"%s}`, repoName, nestedRepo)
 			} else {
-				_, _ = fmt.Fprintf(w, `{"name":"%s","default_branch":"%s"}`, repoName, defaultBranch)
+				_, _ = fmt.Fprintf(w, `{"name":"%s","default_branch":"%s"%s}`, repoName, defaultBranch, nestedRepo)
 			}
 			return
 		}
@@ -368,8 +380,8 @@ func newFakeGiteaAPIWithRepoGET(t *testing.T, owner, repoName, scheme, host, def
 				_, _ = w.Write([]byte("[]"))
 				return
 			}
-			_, _ = fmt.Fprintf(w, `[{"number":%d,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/%d"}]`,
-				n, scheme, host, owner, repoName, n)
+			_, _ = fmt.Fprintf(w, `[{"number":%d,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/%d"%s}]`,
+				n, scheme, host, owner, repoName, n, nestedPR)
 			return
 		}
 		// POST /repos/{owner}/{repo}/pulls — the create.
@@ -379,8 +391,8 @@ func newFakeGiteaAPIWithRepoGET(t *testing.T, owner, repoName, scheme, host, def
 			openPR = 42
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"number":42,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/42"}`,
-				scheme, host, owner, repoName)
+			_, _ = fmt.Fprintf(w, `{"number":42,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/42"%s}`,
+				scheme, host, owner, repoName, nestedPR)
 			return
 		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -669,4 +681,198 @@ func TestDeliverPushScriptRefusesWhenDefaultBranchLookupFails(t *testing.T) {
 
 	runCase("repo GET 500", 500, false)
 	runCase("repo GET empty default_branch", 0, true)
+}
+
+// TestDeliverPushScriptRecordsTopLevelJSONFields (I53) runs the REAL push
+// script end-to-end against a fake provider API whose response bodies carry
+// NESTED objects with their own html_url, number and default_branch AFTER
+// the top-level fields:
+//
+//   - the repo GET (default-branch lookup) nests a repository object
+//     (GitHub's parent / template_repository shape) whose default_branch
+//     differs from the top-level one — a greedy sed would record the
+//     NESTED branch, and if the delivery branch equals it the script would
+//     refuse a legitimate delivery;
+//   - the PR lookup and the PR create nest a repository object (head/base
+//     repos) whose html_url and number differ from the PR's own — a greedy
+//     sed picks the LAST match (the s6f kind run recorded the repo's
+//     html_url as the PR URL, which the operator's strict parser then
+//     rejected).
+//
+// The termination message the script writes must carry the TOP-LEVEL values
+// (prNumber 42, the PR page's html_url). It must FAIL on a5cec25 (the
+// sed-based parser).
+func TestDeliverPushScriptRecordsTopLevelJSONFields(t *testing.T) {
+	r := &LoopReconciler{}
+
+	// The remote (the deliver Job's origin stand-in): a local bare repo.
+	remoteDir := t.TempDir()
+	remoteGit := filepath.Join(remoteDir, "remote.git")
+	mustGit(t, remoteDir, "init", "-q", "-b", baseBranch, "--bare", remoteGit)
+
+	// The agent repo: a base commit + one agent commit (the pinned
+	// verifiedCommit).
+	agentRepo := t.TempDir()
+	mustGit(t, agentRepo, "init", "-q", "-b", baseBranch)
+	mustGit(t, agentRepo, "config", "user.email", "agent@coxswain.test")
+	mustGit(t, agentRepo, "config", "user.name", "Agent")
+	writeFile(t, agentRepo, "round.go", "package main\n\nfunc Round(x float64) int { return int(x) }\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "base")
+	baseSHA := gitSHA(t, agentRepo)
+	mustGit(t, agentRepo, "remote", "add", "origin", remoteGit)
+	mustGit(t, agentRepo, "push", "-q", "origin", baseBranch)
+	writeFile(t, agentRepo, "round.go", "package main\n\nfunc Round(x float64) int { return int(x + 0.5) }\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "agent: fix rounding")
+	verifySHA := gitSHA(t, agentRepo)
+	if verifySHA == baseSHA {
+		t.Fatal("the agent commit must differ from the base commit")
+	}
+
+	const loopName = "nesttask1"
+	repoURL := testGiteaExampleRepoURL
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: loopName},
+		Spec: coxv1alpha1.LoopSpec{
+			Workspace: coxv1alpha1.Workspace{
+				Repo:                repoURL,
+				Ref:                 baseBranch,
+				GitCredentialSecret: testCredSecretName,
+			},
+			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{
+			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
+		},
+	}
+	branch := deliverBranchName(deliverBranchPrefix(loop), loopName)
+
+	// The nested objects: each response body carries, AFTER the top-level
+	// fields, a nested repo object with its own (different) default_branch,
+	// html_url and number — exactly the shape a greedy last-match parser
+	// would record.
+	//
+	// repo GET body (default-branch lookup): the TOP-LEVEL default_branch is
+	// the delivery branch ITSELF — so a parser that reads the TOP-LEVEL field
+	// refuses the push (the correct behaviour: delivering onto the repo's
+	// default branch). The NESTED parent object's default_branch is a
+	// DIFFERENT name: a greedy last-match sed reads the NESTED value and
+	// (wrongly) lets the push through.
+	nestedRepo := `,
+  "parent": {"name": "other","default_branch": "other-default","html_url": "http://gitea.example:3000/samples/other"}`
+
+	//
+	// PR bodies (lookup + create): top-level number 42 / the PR page's
+	// html_url. The NESTED object carries number 99 and a DIFFERENT repo's
+	// PR-page html_url (…/samples/other/pulls/99) — the shape a greedy
+	// last-match sed picks (the s6f kind failure mode: the WRONG repo's PR
+	// URL recorded; the operator's strict parser then rejects a prURL that
+	// names a different repo than spec.workspace.repo).
+	nestedPR := `,
+  "head": {"name": "other","number": 99,"html_url": "http://gitea.example:3000/samples/other/pulls/99"}`
+
+	// The fake API: the repo GET's TOP-LEVEL default_branch is the delivery
+	// branch itself (so a top-level parser refuses), and the NESTED objects
+	// carry the decoy values a greedy last-match parser would record.
+	apiBase, _ := newFakeGiteaAPIWithNested(t, "samples", "gocli", "http", "gitea.example:3000", branch, 0, nestedRepo, nestedPR)
+	// Guard: the fake's repo-GET body must parse as valid JSON (the fake
+	// stands in for the provider API, whose responses are JSON).
+	if body, err := exec.Command("curl", "-sfS", apiBase+"/repos/samples/gocli").Output(); err != nil {
+		t.Fatalf("fake repo GET: %v", err)
+	} else if !json.Valid(body) {
+		t.Fatalf("fake repo GET body is not valid JSON: %s", body)
+	}
+
+	// The credential files.
+	credsDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsUsernameKey), []byte("samples"))
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsPasswordKey), []byte("s3cret-pw"))
+
+	// The scratch dir: set up as clone-base + import-agent would.
+	scratch := t.TempDir()
+	mustGit(t, scratch, "clone", "-q", remoteGit, ".")
+	mustGit(t, scratch, "-c", "protocol.file.allow=always", "-c", "core.hooksPath=/dev/null",
+		"fetch", "file://"+agentRepo+"/.git", verifySHA)
+	mustGit(t, scratch, "checkout", "-q", "--detach", verifySHA)
+	mustGit(t, scratch, "remote", "set-url", "origin", remoteGit)
+
+	// Extract the REAL push script and rewrite the pod paths to the test
+	// stand-ins (the other execution tests do the same).
+	pushScript := deliverContainerScript(t, r.deliverPushContainer(loop, verifySHA, branch, baseBranch))
+	termFile := filepath.Join(t.TempDir(), "termination-log")
+	pushScript = strings.ReplaceAll(pushScript, deliverScratchPath, scratch)
+	pushScript = strings.ReplaceAll(pushScript, "/workspace-creds", credsDir)
+	pushScript = strings.ReplaceAll(pushScript, "/dev/termination-log", termFile)
+	wantAPIBase := "'" + deliverAPIBase(repoURL, deliverProviderGitea) + "'"
+	if !strings.Contains(pushScript, wantAPIBase) {
+		t.Fatalf("push script does not carry the expected API_BASE %q (did the shape change?)", wantAPIBase)
+	}
+	pushScript = strings.ReplaceAll(pushScript, wantAPIBase, "'"+apiBase+"'")
+	pushPath := filepath.Join(t.TempDir(), "push.sh")
+	mustWriteFile(t, pushPath, []byte(pushScript))
+
+	// Run A (default-branch refusal on the TOP-LEVEL field): the repo GET's
+	// top-level default_branch IS the delivery branch, so a top-level parser
+	// refuses the push. A greedy last-match parser reads the NESTED
+	// parent's default_branch ("other-default" != the delivery branch) and
+	// wrongly pushes — so a sed-based script FAILS this case.
+	out, err := exec.Command("sh", pushPath).CombinedOutput()
+	if err == nil {
+		t.Fatalf("the push must REFUSE (exit non-zero): the top-level default_branch equals the delivery branch %s; it exited 0. Output: %s", branch, string(out))
+	}
+	if !strings.Contains(string(out), "default branch") {
+		t.Fatalf("the refusal must name the default branch; output: %s", string(out))
+	}
+	// No ref on the bare remote.
+	if out2, err := exec.Command("git", "-C", remoteGit, "rev-parse", "refs/heads/"+branch).CombinedOutput(); err == nil {
+		t.Fatalf("the delivery branch must not exist on the remote after a default-branch refusal; it is at %s", strings.TrimSpace(string(out2)))
+	}
+
+	// Run B (top-level PR fields recorded): a fresh remote + scratch with the
+	// repo GET's top-level default_branch NOT the delivery branch (baseBranch),
+	// so the push succeeds and the PR is created. The PR bodies carry the
+	// nested head object (number 99, …/samples/other/pulls/99). The recorded
+	// prNumber/prURL must be the TOP-LEVEL ones (42, …/gocli/pulls/42) — a
+	// greedy last-match parser records the nested ones, which the operator's
+	// strict parser rejects (a prURL naming a different repo).
+	remoteDir2 := t.TempDir()
+	remoteGit2 := filepath.Join(remoteDir2, "remote2.git")
+	mustGit(t, remoteDir2, "init", "-q", "-b", baseBranch, "--bare", remoteGit2)
+	scratch2 := t.TempDir()
+	mustGit(t, scratch2, "clone", "-q", "file://"+agentRepo+"/.git", ".")
+	mustGit(t, scratch2, "-c", "protocol.file.allow=always", "-c", "core.hooksPath=/dev/null",
+		"fetch", "file://"+agentRepo+"/.git", verifySHA)
+	mustGit(t, scratch2, "checkout", "-q", "--detach", verifySHA)
+	mustGit(t, scratch2, "remote", "set-url", "origin", "file://"+agentRepo+"/.git")
+
+	apiBase2, _ := newFakeGiteaAPIWithNested(t, "samples", "gocli", "http", "gitea.example:3000", baseBranch, 0, nestedRepo, nestedPR)
+	pushScript2 := deliverContainerScript(t, r.deliverPushContainer(loop, verifySHA, branch, baseBranch))
+	termFile2 := filepath.Join(t.TempDir(), "termination-log")
+	pushScript2 = strings.ReplaceAll(pushScript2, deliverScratchPath, scratch2)
+	pushScript2 = strings.ReplaceAll(pushScript2, "/workspace-creds", credsDir)
+	pushScript2 = strings.ReplaceAll(pushScript2, "/dev/termination-log", termFile2)
+	pushScript2 = strings.ReplaceAll(pushScript2, wantAPIBase, "'"+apiBase2+"'")
+	pushPath2 := filepath.Join(t.TempDir(), "push2.sh")
+	mustWriteFile(t, pushPath2, []byte(pushScript2))
+
+	out, err = exec.Command("sh", pushPath2).CombinedOutput()
+	if err != nil {
+		t.Fatalf("push script failed (run B); want 0. err: %v, output: %s", err, string(out))
+	}
+	termBytes, rerr := os.ReadFile(termFile2)
+	if rerr != nil {
+		t.Fatalf("read the termination log (run B): %v", rerr)
+	}
+	outcome, ok, parseErr := parseDeliverTermination(string(termBytes), loop)
+	if !ok {
+		t.Fatalf("the termination message did not parse (run B): %v; message: %q", parseErr, string(termBytes))
+	}
+	if outcome.PRNumber != 42 {
+		t.Fatalf("termination prNumber %d; want the TOP-LEVEL 42 (the nested head's number 99 must not be recorded)", outcome.PRNumber)
+	}
+	wantPRURL := "http://gitea.example:3000/samples/gocli/pulls/42"
+	if outcome.PRURL != wantPRURL {
+		t.Fatalf("termination prURL %s; want the TOP-LEVEL PR page html_url %s (the nested head's html_url must not be recorded)", outcome.PRURL, wantPRURL)
+	}
 }

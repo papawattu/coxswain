@@ -313,11 +313,26 @@ func (p *Proxy) resolveAndCheck(ctx context.Context) (net.IP, bool, error) {
 }
 
 // client returns the shared upstream http.Client: one transport per process
-// with the custom DialContext (dial to the resolved IP literal — no
-// re-resolution) and, for an https upstream, a TLS config that sends SNI and
-// verifies the certificate against the upstream HOSTNAME (not the dial IP).
-// transport builds the upstream http.Transport: a custom DialContext (dial to
-// the address the client gives, which is the resolved-IP literal — no
+// with a custom DialContext (dial to the resolved-IP literal — no
+// re-resolution), an https TLS config that sends SNI and verifies the
+// certificate against the upstream HOSTNAME (not the dial IP), and a
+// CheckRedirect that NEVER follows (a 3xx goes back to the agent as-is).
+func (p *Proxy) client() *http.Client {
+	if p.client_ != nil {
+		return p.client_
+	}
+	p.client_ = &http.Client{
+		Transport: p.transport(),
+		Timeout:   requestTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return p.client_
+}
+
+// transport builds the upstream http.Transport: a custom DialContext (dial
+// to the address the client gives, which is the resolved-IP literal — no
 // re-resolution) and, for an https upstream, a TLS config that sends SNI and
 // verifies the certificate against the upstream HOSTNAME (not the dial IP).
 func (p *Proxy) transport() *http.Transport {
@@ -333,20 +348,6 @@ func (p *Proxy) transport() *http.Transport {
 		t.TLSClientConfig = &tls.Config{ServerName: p.upHost}
 	}
 	return t
-}
-
-func (p *Proxy) client() *http.Client {
-	if p.client_ != nil {
-		return p.client_
-	}
-	// CheckRedirect: a non-nil func that NEVER follows — the redirect's
-	// status + Location are returned verbatim (no re-issue of the upstream
-	// request), so a 3xx goes back to the agent as-is.
-	p.client_ = &http.Client{Transport: p.transport(), Timeout: requestTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}}
-	return p.client_
 }
 
 // audit emits one JSON line on stdout. The credential is never in the

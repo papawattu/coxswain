@@ -3204,7 +3204,17 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		var msg string
 		switch rs {
 		case engine.ReasonEnforcementUnverified:
-			msg = "no engine probe (no Enforcer wired); the Loop runs because --allow-unenforced is set (dev escape hatch)"
+			// I46: two shapes share this reason. Enforcer nil (envtest / engine
+			// not wired at all): "no engine probe". Real KubeArmor Enforcer with
+			// the I32 relay not yet wired: the engine IS installed, the probe is
+			// missing. The condition is Unknown either way — it asserts nothing
+			// about the cluster and names the flag as the only reason the Loop
+			// runs.
+			if r.Enforcer == nil {
+				msg = "no engine probe (no Enforcer wired); the Loop runs because --allow-unenforced is set (dev escape hatch)"
+			} else {
+				msg = "engine installed, no enforcement probe yet (I32); the Loop runs only because --allow-unenforced is set (dev escape hatch)"
+			}
 		case engine.ReasonEngineUnavailable:
 			msg = "no engine (Enforcer not installed); sandbox held Suspended (D30 fail-closed)"
 		default:
@@ -3214,7 +3224,10 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			msg += "; the Loop runs because --allow-unenforced is set (dev escape hatch)"
 		}
 		status := metav1.ConditionFalse
-		if rs == engine.ReasonEnforcementUnverified && r.AllowUnenforced {
+		// I46: an unverified engine (no probe) is Unknown — it asserts nothing
+		// about the cluster — regardless of the flag (the flag is named in the
+		// message; without it the sandbox is still held Suspended by the gate).
+		if rs == engine.ReasonEnforcementUnverified {
 			status = metav1.ConditionUnknown
 		}
 		setCondition(loop, string(PolicyEnforcedCondition), status, rs, msg)

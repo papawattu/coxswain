@@ -226,15 +226,18 @@ func (e *KubeArmorEnforcer) createOrUpdateKapt(ctx context.Context, loop *v1alph
 
 // Enforcing reports whether the KubeArmor engine is enforcing the Loop's policy.
 // The KubeArmorPolicy CRD has no enforcement status, so the evidence comes from
-// the engine's telemetry/alert stream (the I32 relay). Until the relay is
-// wired this fails closed (not enforcing) — the sandbox is held Suspended.
-// P1 (merge): this hard-coded false means no Loop can run; the escape hatch is
-// the off-by-default --allow-unenforced manager flag (EnforcementDisabled), and
-// real evidence (DaemonSet ready + node BPF-LSM + policy exists) is the fix.
+// the engine's telemetry/alert stream (the I32 relay). Until the relay is wired
+// (I32) the operator has OBSERVED nothing: this returns (false,
+// ReasonEnforcementUnverified) so the PolicyEnforced condition is
+// Unknown/EnforcementUnverified — it names the missing probe rather than
+// claiming the engine is not enforcing (I46: the condition must describe the
+// cluster, not the flag). The gate is still fail-closed: without
+// --allow-unenforced the sandbox is held Suspended on the false result; the
+// flag only lets it run while the condition says so.
 func (e *KubeArmorEnforcer) Enforcing(_ context.Context, _ *v1alpha1.Loop) (bool, string) {
 	// TODO(I32): consume the KubeArmor relay alert stream for positive evidence.
-	// Until then, fail closed.
-	return false, ReasonNodeNotEnforcing
+	// Until then, report that no enforcement probe exists (I46).
+	return false, ReasonEnforcementUnverified
 }
 
 // KubeArmorGVK is the GroupVersionKind of a KubeArmorPolicy.

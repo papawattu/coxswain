@@ -742,4 +742,65 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 			"the claim must be read from LastTerminationState when the current state is not Terminated (the fallback is the stable read-back)")
 		Expect(loop.Status.ObservedPhase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 	})
+
+	// I49 in-progress norm (R20 #61 exception E1): every decision that reads
+	// pod/container status needs a spec for each in-progress state. This is
+	// the readPhaseClaim (loop_s4_phase.go) exception: the agent container is
+	// STILL RUNNING (State is Running, no LastTerminationState) — the reader
+	// must return (nil, nil) (no claim read) and the operator must make NO
+	// status write from the claim path (no progress record, no observedPhase,
+	// no phase move; the resourceVersion is untouched by the reconcile). A
+	// mutation making the reader treat a Running agent as terminated — or a
+	// nil-claim path that re-stamps progress with an empty claim — would
+	// write status here and fail the spec.
+	It("reads no claim and writes no status while the agent container is still running (I49 in-progress norm)", func() {
+		ns := "s4-running-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "runlp")
+
+		ensureSandboxObject(ns, "runlp")
+		createStandinPod(ns, "runlp")
+		// The agent container is still RUNNING the phase: State is Running and
+		// there is NO LastTerminationState (the first run — nothing terminated
+		// before it). No claim exists to read.
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "runlp-sandbox", Namespace: ns}, pod)).To(Succeed())
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+			{Name: agentContainerName, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// The reader's own contract: still running, no last termination ->
+		// (nil, nil), no claim, no error.
+		claim, err := r.readPhaseClaimFromTerminationMessage(ctx, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: "runlp", Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred(), "a running agent is the normal in-progress path, not an error")
+		Expect(claim).To(BeNil(), "no claim is read while the agent container is still running (no LastTerminationState)")
+
+		// And the operator's reconcile must not write status from the claim
+		// path: no phase move (the bootstrap already set Planning), no
+		// observedPhase stamp, no progress record. The result is the gate
+		// effect: a nil-claim (agent still running) drives claimReadPending,
+		// which requeues after 5s — a reader that returned a claim (a
+		// mutation treating a Running agent as terminated) would leave the
+		// requeue driven by other sources or zero it.
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically("==", 5*time.Second),
+			"a running agent (no claim read) must requeue on the claim-pending path, not advance")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"a running agent must not move the phase")
+		Expect(loop.Status.ObservedPhase).To(BeEmpty(),
+			"a running agent must not stamp status.observedPhase (no claim was read)")
+		Expect(loop.Status.Progress).To(BeNil(),
+			"a running agent must not write a progress record (no claim was read)")
+		drainEvents(recorder)
+	})
 })

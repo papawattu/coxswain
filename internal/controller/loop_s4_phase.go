@@ -496,11 +496,19 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// recycle replaces it. Without this guard, the stale claim (observed
 		// phase matches the current phase) would re-advance with the SAME old
 		// headCommit, pinning a stale verify and hot-looping. A claim whose
-		// iteration equals the current status iteration (or an empty marker,
-		// claim.Iteration == 0, which phase-init never writes) is CURRENT:
-		// the first-cycle claims (status.iteration 0) and every post-recycle
-		// claim (phase-init writes the current iteration each recycle) pass.
-		if claim.Iteration > 0 && claim.Iteration != loop.Status.Iteration {
+		// iteration equals the current status iteration is CURRENT. An EMPTY
+		// marker (claim.Iteration == 0, which phase-init never writes) is
+		// current only while the Loop itself is on its first cycle
+		// (status.iteration 0): the runner reads the missing marker as 0 and
+		// echoes it into first-cycle claims. I48: once the first verify
+		// iterate has bumped status.iteration (0 -> 2), an iteration-0 claim
+		// left on the old pod is STALE and must be ignored like any other
+		// prior-iteration claim. (The alternative fix — starting the phase-
+		// init marker at 1 — was rejected: it would change the written
+		// .coxswain/iteration value, the runner's read-back, and the
+		// verifyJobName <=0 fallback for no behavioural gain.)
+		if claim.Iteration != loop.Status.Iteration &&
+			(claim.Iteration != 0 || loop.Status.Iteration != 0) {
 			logf.FromContext(ctx).Info("stale claim from a previous iteration ignored",
 				"claimIteration", claim.Iteration,
 				"statusIteration", loop.Status.Iteration)

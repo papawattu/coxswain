@@ -1577,4 +1577,78 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		job4 := &batchv1.Job{}
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-4", Namespace: ns}, job4))).To(BeTrue())
 	})
+
+	It("ignores a stale iteration-0 Implementing claim after the first iterate (I48)", func() {
+		// I48 (R20): the S5a stale-iteration guard previously exempted
+		// iteration-0 claims (claim.Iteration > 0 && ...). After the FIRST
+		// verify iterate (status.iteration 0 -> 2), a first-cycle success
+		// claim left on the old pod must be ignored like any prior-iteration
+		// claim: no re-advance to Verifying, no re-pin of the old headCommit,
+		// no second verify Job. The envtest stand-in for the first-cycle claim
+		// carries the real iteration-0 shape: the pre-S5a runner read a
+		// missing .coxswain/iteration marker as 0, and the strict parser
+		// leaves an ABSENT iteration field at 0 — the same claim the guard
+		// used to let through.
+		// Gate mutation (scratch worktree, recorded not committed): restoring
+		// the 'claim.Iteration > 0 &&' exemption makes this spec FAIL (the
+		// stale claim re-advances to Verifying and re-pins s5aHeadCommit).
+		ns := "i48-iter0-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "i48loop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name) // verify-1 created (pinned at status.iteration 0)
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPod(ctx, ns, name, jobName, 1) // check-0 fails
+
+		var loop *coxv1alpha1.Loop
+		for range 10 {
+			loop = s5aReconcile(r, ns, name)
+			if loop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"a failing check -> back to Implementing")
+		Expect(loop.Status.Iteration).To(Equal(2), "the first iterate bumped status.iteration 0 -> 2")
+		Expect(loop.Status.CurrentVerify).To(BeNil())
+
+		// Plant the STALE first-cycle claim: an Implementing success with the
+		// pre-S5a (iteration-0) shape — no iteration field, so the claim's
+		// iteration is 0 while status.iteration is 2.
+		s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
+		loop = s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"the stale iteration-0 claim must NOT re-advance to Verifying (status.iteration is 2)")
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(loop.Status.CurrentVerify).To(BeNil(),
+			"the stale iteration-0 claim must not re-pin the old headCommit")
+		Expect(loop.Status.Progress.LastResultStatus).To(ContainSubstring("check-0"),
+			"the stale iteration-0 claim must not clobber the verify check-failure progress record")
+		Expect(loop.Status.Progress.Iteration).To(Equal(2),
+			"the operator's own progress record is intact — the stale claim wrote nothing")
+
+		// No NEW verify Job: the pin is nil, so ensureVerifyJob holds (no Job
+		// create for the cleared pin; a re-pin would create verify-2). The
+		// original verify-1 is not garbage-collected in envtest (no Job
+		// controller / GC), so the guard is: exactly the original verify-1
+		// remains and no verify-2 exists.
+		jobs := &batchv1.JobList{}
+		Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1), "the stale iteration-0 claim created no new verify Job")
+		Expect(jobs.Items[0].Name).To(Equal(name + "-verify-1"))
+		job2 := &batchv1.Job{}
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-2", Namespace: ns}, job2))).To(BeTrue(),
+			"no verify-2: a re-pin from the stale claim would create it")
+	})
 })

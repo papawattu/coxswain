@@ -52,10 +52,12 @@ type Proxy struct {
 	// auditMu guards the captured audit lines in tests.
 	// tlsUpstream is true for an https upstream (the TLS SNI + verification
 	// target). upHost/upPort is the fixed upstream host:port built in New
-	// from UpstreamBase.
+	// from UpstreamBase. basePrefix is the cleaned base path prefix (trailing
+	// slash trimmed; empty for none), forwarded in front of the agent path.
 	tlsUpstream bool
 	upHost      string
 	upPort      int
+	basePrefix  string // e.g. "/api/v3" or ""
 	// dialTo maps the resolved upstream IP to the dial address (nil in
 	// production: dial the resolved IP literally; a test maps its
 	// public-looking resolver answer back to the loopback where the test
@@ -101,11 +103,14 @@ func newProxy(cfg Config, dial func(net.IP) string) (*Proxy, error) {
 	p.upHost = u.Hostname()
 	p.upPort = u.PortNumber()
 	p.tlsUpstream = u.Scheme == "https"
+	p.basePrefix = u.BasePrefix
 	return p, nil
 }
 
 // parseUpstreamBase parses the fixed upstream base URL using net/url (the
-// host is the URL host; the port defaults per scheme when absent).
+// host is the URL host; the port defaults per scheme when absent). The base
+// path prefix (e.g. "/api/v3") is kept on the returned upstreamURL with its
+// trailing slash trimmed; an empty or "/"-only path yields an empty prefix.
 func parseUpstreamBase(raw string) (upstreamURL, error) {
 	s := strings.TrimSpace(raw)
 	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
@@ -130,13 +135,19 @@ func parseUpstreamBase(raw string) (upstreamURL, error) {
 	if err != nil {
 		return upstreamURL{}, err
 	}
-	return upstreamURL{Scheme: scheme, Host: u.Hostname(), Port: portNum}, nil
+	// Clean the base path prefix: trim trailing slash; "/" → "".
+	prefix := strings.TrimSuffix(u.Path, "/")
+	if prefix == "/" {
+		prefix = ""
+	}
+	return upstreamURL{Scheme: scheme, Host: u.Hostname(), Port: portNum, BasePrefix: prefix}, nil
 }
 
 type upstreamURL struct {
-	Scheme string
-	Host   string
-	Port   int
+	Scheme     string
+	Host       string
+	Port       int
+	BasePrefix string // cleaned base path prefix (trailing slash trimmed; empty for none)
 }
 
 func (u upstreamURL) Hostname() string { return u.Host }
@@ -221,8 +232,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upReq := p.buildUpstreamRequest(r, path, resolvedIP)
 	resp, err := p.client().Do(upReq)
 	if err != nil {
+		// Keep the detail in the audit/stderr, not in the response body.
+		log.Printf("tool-proxy: upstream error: %v", err)
 		p.audit(r.Method, path, http.StatusBadGateway)
-		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -242,7 +255,7 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, path string, resolvedIP ne
 	out.RequestURI = ""
 	out.URL.Scheme = p.upstreamScheme()
 	out.URL.Host = p.dialAddr(resolvedIP) // host:port literal; the client dials it directly (no re-resolution)
-	out.URL.Path = path
+	out.URL.Path = p.basePrefix + path
 	out.URL.RawPath = ""
 	out.URL.RawQuery = r.URL.RawQuery
 	out.Host = fmt.Sprintf("%s:%d", p.upHost, p.upPort)

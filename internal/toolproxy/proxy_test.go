@@ -629,6 +629,91 @@ func TestRuleVerdicts(t *testing.T) {
 	}
 }
 
+// The upstream base prefix (e.g. https://host/api/v3) is forwarded in
+// front of the agent path: an allowed GET /repos/acme/x arrives at the
+// upstream at /api/v3/repos/acme/x, while a disallowed path still 403s
+// with no dial.
+//
+// This test FAILS on 870944a where parseUpstreamBase drops u.Path and
+// buildUpstreamRequest forwards only the agent path (no prefix).
+func TestBasePrefixForwarded(t *testing.T) {
+	log := &requestLog{}
+	// Upstream base is http://upstream.test/api/v3 (a literal-IP is not
+	// available here; the resolver maps upstream.test to loopback via dialTo
+	// nil, so the base host is a hostname resolved through the mock).
+	// We use a non-IP hostname so the resolver is exercised.
+	up := newTestServer(t, log, 200, "")
+	// The test server listens on 127.0.0.1:port; the base prefix is
+	// /api/v3. We configure the upstream base as the test URL with the
+	// prefix appended, and dialTo nil (literal-IP check, no lookup).
+	baseWithPrefix := up.URL + "/api/v3"
+
+	var sink stringsBuilder
+	p, err := newProxy(Config{
+		ToolName:     toolName,
+		UpstreamBase: baseWithPrefix,
+		Rules:        rulesGET(),
+		Credential:   cred,
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		// mockResolver: the base host is 127.0.0.1 (literal-IP, checked
+		// directly against carve-outs, no lookup needed).
+		Resolver: &mockResolver{hosts: map[string][]string{}, calls: map[string]int{}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	p.SetAuditSink(&sink)
+
+	// Allowed request: GET /repos/acme/repo → should arrive at /api/v3/repos/acme/repo
+	req := httptest.NewRequest(methodGET, toolPath, nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("allowed request status = %d, want 200", rec.Code)
+	}
+	entries := log.entriesList()
+	if len(entries) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(entries))
+	}
+	wantPath := "/api/v3" + toolPath
+	if entries[0].path != wantPath {
+		t.Fatalf("upstream path = %q, want %q (base prefix must be forwarded)", entries[0].path, wantPath)
+	}
+
+	// Disallowed path: still 403, no dial.
+	log2 := &requestLog{}
+	up2 := newTestServer(t, log2, 200, "")
+	base2 := up2.URL + "/api/v3"
+	var sink2 stringsBuilder
+	p2, err := newProxy(Config{
+		ToolName:     toolName,
+		UpstreamBase: base2,
+		Rules:        rulesGET(), // only allows /repos/acme/
+		Credential:   cred,
+		LoopName:     loopName,
+		Namespace:    nsName,
+		PolicyHash:   policy,
+		Resolver:     &mockResolver{hosts: map[string][]string{}, calls: map[string]int{}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	p2.SetAuditSink(&sink2)
+
+	req2 := httptest.NewRequest(methodGET, "/etc/passwd", nil)
+	rec2 := httptest.NewRecorder()
+	p2.ServeHTTP(rec2, req2)
+	if rec2.Code != 403 {
+		t.Fatalf("disallowed request status = %d, want 403", rec2.Code)
+	}
+	if log2.len() != 0 {
+		t.Fatalf("disallowed request must not dial the upstream; saw %d", log2.len())
+	}
+}
+
 // Empty rule set → everything 403.
 func TestEmptyRulesDenyAllAtHandler(t *testing.T) {
 	log := &requestLog{}

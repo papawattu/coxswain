@@ -71,8 +71,10 @@ neither rule-check nor inject (I70-1).
     rule;
   - matching is **segment prefix**: rule prefix `/repos/acme/` covers
     `/repos/acme/x/y` but **not** `/repos/acmer` (a segment, not a byte
-    string, is the unit); stated in the package doc and pinned by the
-    tests below;
+    string, is the unit). A prefix without a trailing `/` matches only
+    the **exact** path (e.g. `/repos/acme` matches only `/repos/acme`,
+    not `/repos/acme/x`); use a trailing `/` for prefix semantics. Stated
+    in the ADR and the package doc, pinned by the tests below;
   - **match** (method in the rule's methods AND normalised segment prefix in
     the rule's prefixes) → strip agent-supplied `Authorization` /
     `Proxy-Authorization`, inject the credential (if configured:

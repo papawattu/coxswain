@@ -2028,26 +2028,6 @@ func (r *LoopReconciler) toolProxyFQDN(loopName, ns, toolName string) string {
 	return fmt.Sprintf("%s.%s.svc", toolProxyServiceName(loopName, toolName), ns)
 }
 
-// toolProxyNetpolPeers returns the agent sandbox NetworkPolicy's egress
-// peers for the tool proxies (D41d): one egress rule per tool (port 8080 TCP,
-// to the tool proxy's disjoint label set). No tools -> nil. (The other egress
-// rules — model proxy, egress proxy, workspace, DNS — are built elsewhere in
-// the agent sandbox netpol builder.)
-func toolProxyNetpolPeers(loopName string, tools []coxv1alpha1.ToolSpec) []networkingv1.NetworkPolicyPeer {
-	if len(tools) == 0 {
-		return nil
-	}
-	peers := make([]networkingv1.NetworkPolicyPeer, 0, len(tools))
-	for _, t := range tools {
-		peers = append(peers, networkingv1.NetworkPolicyPeer{
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: toolProxyLabels(loopName, t.Name),
-			},
-		})
-	}
-	return peers
-}
-
 // toolProxyNetpolPeer returns the agent sandbox NetworkPolicy's egress peer
 // for one tool proxy (D41d): a podSelector matching the tool proxy's disjoint
 // label set (the tool proxy is a sibling of the agent, not a child of the

@@ -65,6 +65,21 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        # P2b (ADR-0009): the operator's own namespace, injected via the
+        # downward API. The --operator-namespace flag defaults to this when
+        # unset (cmd/main.go); it drives the <loop>-proxy NetworkPolicy's
+        # usage-port (9090) ingress (allowed ONLY from the operator namespace /
+        # controller-manager) and the operator's usage reader. (The dev overlay
+        # REPLACES the manager container env — the base manifest carried no env
+        # before P2b — so POD_NAMESPACE is ALSO added in config/dev's patch; see
+        # that file. Without it, the operator's OperatorNamespace is empty and
+        # the usage netpol is omitted fail-closed — the operator cannot read the
+        # usage endpoint.)
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
         ports:
         - containerPort: 8081
           name: health

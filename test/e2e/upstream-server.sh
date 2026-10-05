@@ -1,13 +1,15 @@
 #!/bin/sh
 # The D41e kind-acceptance tool upstream listener (upstream-server.sh): a
 # fixed-path HTTP server on 0.0.0.0:80 inside a hostNetwork busybox pod on
-# the kind node (the pod gets the node's IP 172.21.0.2 — OUTSIDE the
-# operator's pod 10.244.0.0/16 / service 10.96.0.0/12 CIDRs and outside the
-# RFC1918/loopback/link-local ranges the controller's ToolUpstreamInCluster
-# check rejects). The tool upstream URL is http://172.21.0.2:80 — the
-# controller check passes (the IP is a public /24, treated as external) and
-# the tool-proxy netpol's external carve-out (0.0.0.0/0 except pod/service
-# CIDRs) permits the dial.
+# the kind node. The pod listens on every interface, including the node's
+# loopback, where the script has added 198.18.0.10/32 (RFC 2544
+# benchmarking range — in NO carve-out: not 10/8, 172.16/12, 192.168/16,
+# 169.254/16, 127/8, 100.64/10, 0/8, 224/4, 240/4, or any IPv6 local
+# range). The tool upstream URL is http://198.18.0.10:80 — the controller's
+# ToolUpstreamInCluster check passes (the IP is in no carve-out) and the
+# tool-proxy netpol's external carve-out + the tool-proxy's resolved-IP
+# backstop permit the dial. The correct product behaviour, not a carve-out
+# change.
 #
 # GET /ok → 200 "ok" + a log line naming the request's Authorization header
 # (the upstream has no auth of its own — the injected header is what makes

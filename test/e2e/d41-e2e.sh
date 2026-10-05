@@ -6,16 +6,20 @@
 # credential Secret the script creates — a dummy test token, never a real
 # credential), and asserts EVERY property in that section.
 #
-# The in-kind "external" upstream is a busybox pod that rides the kind
-# NODE's IP (hostNetwork: true — the pod gets the node's IP 172.21.0.2,
-# OUTSIDE the operator's pod 10.244.0.0/16 / service 10.96.0.0/12 CIDRs and
-# outside the RFC1918/loopback/link-local ranges the controller's
-# ToolUpstreamInCluster check rejects): the controller check passes for it
-# and the tool-proxy netpol's external carve-out (0.0.0.0/0 except pod/
-# service CIDRs) permits the dial. It has no auth of its own; a fixed-path
-# listener (upstream-server.sh, kubectl cp'd) answers GET /ok → 200 and
-# everything else 404, logging each request's Authorization header (the
-# injected header is what makes the call identifiable).
+# The in-kind "external" upstream is a hostNetwork busybox pod on the kind
+# node that listens on 0.0.0.0:80, dialed at a loopback address in the RFC
+# 2544 benchmarking range (198.18.0.0/15) that the script adds to the node's
+# loopback interface (docker exec ip addr add 198.18.0.10/32 dev lo,
+# idempotent; removed in the EXIT trap). 198.18.0.10 is OUTSIDE every
+# carve-out the product enforces (the tool-proxy netpol's except list and
+# the tool-proxy's resolved-IP backstop both carve out 10/8, 172.16/12,
+# 192.168/16, 169.254/16, 127/8, 100.64/10, 0/8, 224/4, 240/4 and the IPv6
+# local ranges — 198.18/15 is in none of them), so the dial is permitted at
+# both layers: the correct product behaviour, not a carve-out change. The
+# upstream has no auth of its own; a fixed-path listener
+# (upstream-server.sh, kubectl cp'd) answers GET /ok → 200 and everything
+# else 404, logging each request's Authorization header (the injected
+# header is what makes the call identifiable).
 #
 # Pinned by the caller: K8S_CONTEXT=kind-coxswain-dev (and CLUSTER=coxswain-dev
 # for the kind load). The operator runs the DEV overlay so Loops actually run;
@@ -80,9 +84,10 @@
 #
 # Requires: docker, kind, kubectl, jq, curl on the host; the kind cluster
 # with agent-sandbox + KubeArmor already installed (make kind-up). The
-# upstream pod is a hostNetwork pod that binds 0.0.0.0:80 on the kind node
-# (the node must have no :80 service — a kind cluster node, verified by the
-# preflight).
+# upstream pod is a hostNetwork pod that binds 0.0.0.0:80 on the kind node;
+# the script adds 198.18.0.10/32 to the node's loopback (RFC 2544
+# benchmarking range — in no carve-out) and removes it in the EXIT trap.
+# Every run is tee'd to .samples/d41e/run-<timestamp>.log.
 
 set -uo pipefail
 
@@ -106,18 +111,18 @@ UPSTREAM_POD="d41-upstream"
 # The dummy test token. NEVER a real credential; the script must never read
 # or print a real token — this value is created by the script in a Secret.
 TEST_TOKEN="d41e-test-token-8f3a2b1c"
-# The upstream listener script (copied into the upstream pod; the file is
-# written by the caller to $UPSTREAM_SCRIPT before the run, or the script
-# writes it here from an embedded copy).
+# The upstream listener script (copied into the upstream pod).
 UPSTREAM_SCRIPT="$REPO_ROOT/test/e2e/upstream-server.sh"
-# The tool upstream URL host: the kind NODE's IP (172.21.0.2) — the
-# upstream pod is a hostNetwork pod, so it listens on 0.0.0.0:80 on the
-# node (the node's IP is OUTSIDE the operator's pod 10.244.0.0/16 / service
-# 10.96.0.0/12 CIDRs and outside the RFC1918/loopback/link-local ranges the
-# controller's ToolUpstreamInCluster check rejects, so the check passes and
-# the tool-proxy netpol's external carve-out permits the dial). The literal-
-# IP upstream is checked directly (no rebind defence).
-UPSTREAM_NODE_IP="172.21.0.2"
+# The tool upstream host: a loopback address in the RFC 2544 benchmarking
+# range (198.18.0.0/15) that the script adds to the kind node's lo
+# interface (docker exec ip addr add 198.18.0.10/32 dev lo; removed in the
+# EXIT trap). 198.18/15 is in NO carve-out (not 10/8, 172.16/12,
+# 192.168/16, 169.254/16, 127/8, 100.64/10, 0/8, 224/4, 240/4, or any IPv6
+# local range), so the controller's ToolUpstreamInCluster check passes AND
+# the tool-proxy netpol external carve-out + the tool-proxy's resolved-IP
+# backstop permit the dial — the correct product behaviour, not a
+# carve-out change.
+UPSTREAM_NODE_IP="198.18.0.10"
 UPSTREAM_URL="http://${UPSTREAM_NODE_IP}:80"
 # The model endpoint is a DUMMY (never dialed by the agent in this test): the
 # model-proxy sidecar dials it, but the D41e assertions exercise the tool
@@ -125,10 +130,19 @@ UPSTREAM_URL="http://${UPSTREAM_NODE_IP}:80"
 # the AgentPolicy CRD CEL rule (no .svc/.cluster.local) and the controller's
 # in-cluster check — a literal external IP outside the pod/service CIDRs is
 # safe (the model proxy will fail to dial it, which is fine; the test does
-# not assert the model path). Use the same node IP as the tool upstream.
+# not assert the model path). Use the same node lo IP as the tool upstream.
 MODEL_ENDPOINT="${UPSTREAM_NODE_IP}:80"
 TMPDIR="${TMPDIR:-/tmp}/d41-e2e.$$"
 mkdir -p "$TMPDIR"
+# Tee the whole run to .samples/d41e/run-<timestamp>.log (evidence the kind
+# run happened; never /tmp — the log must survive the session). The node lo
+# container (coxswain-dev-control-plane) is named after the cluster.
+NODE_CONTAINER="${CLUSTER}-control-plane"
+RUN_STAMP=$(date +%Y%m%d-%H%M%S)
+SAMPLE_DIR="$REPO_ROOT/.samples/d41e"
+mkdir -p "$SAMPLE_DIR"
+RUN_LOG="$SAMPLE_DIR/run-${RUN_STAMP}.log"
+exec > >(tee "$RUN_LOG") 2>&1
 
 K() { kubectl --context "$CTX" "$@"; }
 FAIL=0
@@ -143,7 +157,15 @@ cleanup() {
   if [ -n "$TMP_OVERLAY" ]; then
     rm -rf "$TMP_OVERLAY" 2>/dev/null || true
   fi
+  # Remove the RFC 2544 loopback address from the node's lo (added in
+  # STEP 3). Idempotent: ip addr del fails silently if the address is
+  # already gone (e.g. the script added it in a prior run that crashed
+  # before the trap fired, or this run added it and a later run removed
+  # it).
+  docker exec "$NODE_CONTAINER" sh -c "ip addr del ${UPSTREAM_NODE_IP}/32 dev lo 2>/dev/null || true" 2>/dev/null || true
+  echo "   (node lo ${UPSTREAM_NODE_IP}/32 removed)"
   echo "--- cleaning up tool upstream pod $UPSTREAM_POD (kubectl delete) ---"
+  K -n "$NS" delete pod d41-probe --ignore-not-found --wait=false 2>/dev/null || true
   K -n "$NS" delete pod "$UPSTREAM_POD" --wait=false 2>/dev/null || true
   for i in $(seq 1 12); do
     K -n "$NS" get pod "$UPSTREAM_POD" >/dev/null 2>&1 || return 0
@@ -152,6 +174,7 @@ cleanup() {
   echo "   (upstream pod $UPSTREAM_POD still terminating; left for the cluster to finish)"
 }
 trap cleanup EXIT
+echo "run log: $RUN_LOG"
 
 echo
 echo "--- STEP 0: preflight (cluster + KubeArmor present; NOT touching KubeArmor) ---"
@@ -191,6 +214,30 @@ KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
 TMP_OVERLAY=$(mktemp -d)
 cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
+# The tool proxy pod image: the manager has NO --tool-proxy-image flag yet
+# (D41c's toolProxyImage() defaults to the golang:1.26 stand-in when
+# ToolProxyImage is unset — a Go stand-in, not the cmd/tool-proxy binary),
+# and the ToolProxyImage field is never set from a flag in cmd/main.go
+# (the reconciler struct literal omits it). The e2e needs the REAL
+# tool-proxy binary (the rule engine, credential injection, audit) — the
+# golang stand-in just sleeps, so the tool proxy pod never becomes Ready.
+#
+# Rather than patch the running deployment (which would require a
+# --tool-proxy-image flag that doesn't exist yet — a future-slice change
+# out of scope for D41e), the e2e patches the tool-proxy POD directly after
+# the controller creates it: a kubectl patch that replaces the container
+# image from golang:1.26 to the real tool-proxy image. The pod's env
+# (TOOL_NAME, TOOL_UPSTREAM, TOOL_RULES_JSON, etc.) is already set by the
+# controller; only the image needs replacing. This is a TEST-ONLY
+# workaround (the production path is the --tool-proxy-image flag, a future
+# slice). The patch is idempotent: it only fires if the image is still the
+# golang stand-in.
+# (The kustomize patch file approach was tried first but the target
+# Deployment is the manager's OWN deployment (the controller-manager), not
+# the tool-proxy pod — the tool-proxy pod is a separate object created by
+# the controller per Loop, so a kustomize patch on the manager deployment
+# cannot set the tool-proxy pod's image. The kubectl patch on the pod is
+# the correct test-side workaround.)
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) \
   || { echo "FATAL: controller deploy failed"; exit 2; }
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/cni-probe | K apply -f -) \
@@ -201,13 +248,14 @@ echo "   controller running, imageID: $RUNNING_IMG_ID"
 
 # ===========================================================================
 # STEP 3: the tool upstream pod + credential Secret + AgentPolicy + Loop.
-# The upstream pod is a hostNetwork busybox pod (it rides the kind node's IP
-# 172.21.0.2, outside the operator's pod/service CIDRs); the fixed-path
-# listener (upstream-server.sh) is kubectl cp'd in and nohup'd. The tool
-# upstream URL is the node IP 172.21.0.2:80 — OUTSIDE the operator's pod/
-# service CIDRs and outside the RFC1918/loopback/link-local ranges, so the
-# controller's ToolUpstreamInCluster check passes and the tool-proxy netpol's
-# external carve-out permits the dial.
+# The upstream pod is a hostNetwork busybox pod on the kind node (it binds
+# 0.0.0.0:80, including the node's loopback, where the script adds
+# 198.18.0.10/32 — RFC 2544 benchmarking range, in NO carve-out); the
+# fixed-path listener (upstream-server.sh) is kubectl cp'd in and nohup'd.
+# The tool upstream URL is 198.18.0.10:80 — the controller's
+# ToolUpstreamInCluster check passes AND the tool-proxy netpol external
+# carve-out + the tool-proxy's resolved-IP backstop permit the dial (the
+# correct product behaviour, not a carve-out change).
 # ===========================================================================
 echo
 echo "--- STEP 3: create the fixture (namespace, upstream pod, Secret, AgentPolicy, Loop) ---"
@@ -220,18 +268,18 @@ if K -n "$NS" get loop "$LOOP" >/dev/null 2>&1; then
   done
 fi
 K get ns "$NS" >/dev/null 2>&1 || K create ns "$NS" >/dev/null
+# Add the RFC 2544 loopback address to the node's lo (idempotent: check
+# first). 198.18.0.10/32 is in NO carve-out (not 10/8, 172.16/12,
+# 192.168/16, 169.254/16, 127/8, 100.64/10, 0/8, 224/4, 240/4, or any IPv6
+# local range), so the tool proxy can dial it. The EXIT trap removes it.
+docker exec "$NODE_CONTAINER" sh -c "ip -4 addr show dev lo | grep -q ${UPSTREAM_NODE_IP} || ip addr add ${UPSTREAM_NODE_IP}/32 dev lo" 2>/dev/null \
+  || { echo "FATAL: could not add ${UPSTREAM_NODE_IP}/32 to the node's lo"; exit 2; }
+docker exec "$NODE_CONTAINER" ip -4 addr show dev lo 2>/dev/null | grep -q "${UPSTREAM_NODE_IP}/32" \
+  || { echo "FATAL: ${UPSTREAM_NODE_IP}/32 is not on the node's lo after the add"; exit 2; }
+echo "   node lo has ${UPSTREAM_NODE_IP}/32 (RFC 2544 — in no carve-out; removed in the EXIT trap)"
 # Recreate the upstream pod (idempotency: a prior run may have left it).
 K -n "$NS" delete pod "$UPSTREAM_POD" --ignore-not-found --timeout=30s 2>/dev/null || true
 sleep 2
-# kubectl cp the listener in BEFORE creating the pod: the pod's entrypoint
-# is the listener (sh /tmp/upstream-server.sh), so the file must exist when
-# the container starts (a kubectl cp after start would race the entrypoint).
-# A fresh pod starts empty, so the cp-before-create is a no-op on the file
-# itself; instead, the listener script is baked into the pod via an init
-# container is overkill — the simplest reliable pattern: create the pod with
-# a sleep entrypoint, cp the script, then start the listener with nohup
-# (the original pattern). Keep sleep + nohup (the listener is a background
-# loop, not the pod entrypoint).
 cat > "$TMPDIR/upstream.yaml" <<EOF
 apiVersion: v1
 kind: Pod
@@ -241,8 +289,12 @@ metadata:
 spec:
   hostNetwork: true
   # The node must have no :80 service (a kind cluster node — verified by the
-  # preflight). hostNetwork lets the listener bind 0.0.0.0:80 on the node's
-  # IP (172.21.0.2), outside the operator's pod/service CIDRs.
+  # preflight). hostNetwork lets the listener bind 0.0.0.0:80 on the node
+  # (the pod rides the node's network namespace, including the lo address
+  # 198.18.0.10 the script just added). The probe pod is a PLAIN pod (not
+  # hostNetwork) so it can reach 198.18.0.10 via the node's lo (the pod's
+  # egress goes through the node's network namespace, which has the lo
+  # address).
   containers:
     - name: upstream
       image: ${BUSYBOX_IMG}
@@ -265,7 +317,7 @@ if [ -z "$UPSTREAM_POD_IP" ]; then
   echo "FATAL: the tool upstream pod has no IP yet"
   exit 2
 fi
-echo "   tool upstream pod $UPSTREAM_POD Running (hostNetwork: nodeIP=$UPSTREAM_NODE_IP, podIP=$UPSTREAM_POD_IP)"
+echo "   tool upstream pod $UPSTREAM_POD Running (hostNetwork: nodeIP=$UPSTREAM_POD_IP, dialed at ${UPSTREAM_NODE_IP})"
 # kubectl cp the listener + start it (nohup). The listener is a file (not a
 # heredoc inside sh -c), per the house rules.
 [ -f "$UPSTREAM_SCRIPT" ] || { echo "FATAL: $UPSTREAM_SCRIPT not found (the upstream listener script)"; exit 2; }
@@ -274,7 +326,44 @@ K -n "$NS" exec "$UPSTREAM_POD" -- sh -c 'chmod +x /tmp/upstream-server.sh && : 
   || { echo "FATAL: could not start the upstream listener"; exit 2; }
 sleep 1
 UPSTREAM_LOG_START=$(K -n "$NS" exec "$UPSTREAM_POD" -- sh -c 'wc -l < /tmp/upstream.log 2>/dev/null || echo 0' 2>/dev/null | tr -d ' ')
-echo "   upstream listener started (log lines so far: $UPSTREAM_LOG_START)"
+echo "   upstream listener started (log lines so far: ${UPSTREAM_LOG_START:-0})"
+# Verify from a PLAIN pod (not the upstream, not the tool proxy) that
+# 198.18.0.10:80 answers BEFORE the assertions. The probe pod is a hostNetwork
+# busybox pod (it shares the node's network namespace, so it can reach the
+# lo address 198.18.0.10 directly; a plain pod would route 198.18.0.10 via
+# the node's egress, which does NOT have the lo address in its scope).
+cat > "$TMPDIR/probe-pod.yaml" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: d41-probe
+  namespace: ${NS}
+spec:
+  hostNetwork: true
+  containers:
+    - name: probe
+      image: ${BUSYBOX_IMG}
+      command: ["sh", "-c", "sleep 3600"]
+  restartPolicy: Never
+EOF
+K apply -f "$TMPDIR/probe-pod.yaml" >/dev/null 2>&1 || { echo "   (probe pod: a prior run may have left d41-probe; deleting and retrying)"; }
+K -n "$NS" delete pod d41-probe --ignore-not-found --timeout=15s 2>/dev/null || true
+sleep 1
+K apply -f "$TMPDIR/probe-pod.yaml" >/dev/null || { echo "FATAL: probe pod apply failed"; exit 2; }
+for i in $(seq 1 30); do
+  PPH=$(K -n "$NS" get pod d41-probe -o jsonpath='{.status.phase}' 2>/dev/null)
+  [ "$PPH" = "Running" ] && break
+  sleep 2
+done
+# curl the upstream from the probe pod (busybox curl). A 200 means the
+# listener answers at the RFC 2544 address; anything else is a FATAL
+# (the upstream is not reachable — the assertions would be meaningless).
+PROBE_OUT=$(K -n "$NS" exec d41-probe -- sh -c "wget -q -O /dev/null --timeout=5 http://${UPSTREAM_NODE_IP}:80/ok && echo 200 || echo FAIL" 2>&1)
+echo "   probe pod wget http://${UPSTREAM_NODE_IP}:80/ok -> $PROBE_OUT"
+case "$PROBE_OUT" in
+  200) ok "preflight: the upstream answers 200 at ${UPSTREAM_NODE_IP}:80 from a hostNetwork pod (before the assertions)" ;;
+  *) bad "preflight: the upstream does NOT answer 200 at ${UPSTREAM_NODE_IP}:80 from a hostNetwork pod (got: $PROBE_OUT) — the listener is not reachable" ;;
+esac
 
 cat > "$TMPDIR/tool-secret.yaml" <<EOF
 apiVersion: v1
@@ -329,7 +418,7 @@ spec:
     maxIterations: 1
 EOF
 K apply -f "$TMPDIR/loop.yaml" >/dev/null
-echo "   fixtures applied: tool upstream $UPSTREAM_POD (hostNetwork nodeIP=$UPSTREAM_NODE_IP, listener on ${UPSTREAM_NODE_IP}:80), Secret ${LOOP}-tool-gh (dummy test token), AgentPolicy ${LOOP}-pol (tool gh -> ${UPSTREAM_URL}), Loop ${LOOP}"
+echo "   fixtures applied: tool upstream $UPSTREAM_POD (hostNetwork node, dialed at ${UPSTREAM_NODE_IP}:80), Secret ${LOOP}-tool-gh (dummy test token), AgentPolicy ${LOOP}-pol (tool gh -> ${UPSTREAM_URL}), Loop ${LOOP}"
 
 # ===========================================================================
 # STEP 4: the tool proxy pod + the D41c owned+Ready sandbox gate (assertion 5).
@@ -339,6 +428,27 @@ echo "   fixtures applied: tool upstream $UPSTREAM_POD (hostNetwork nodeIP=$UPST
 echo
 echo "--- STEP 4: sandbox gating (D41c owned+Ready tool-proxy gate, live) ---"
 TOOL_POD="${LOOP}-tool-gh"
+# Patch the tool-proxy pod's image from the golang:1.26 stand-in to the REAL
+# tool-proxy image (TEST-ONLY workaround: the manager has no --tool-proxy-image
+# flag yet, so the controller creates the tool-proxy pod with the golang
+# stand-in image. The e2e needs the real tool-proxy binary — the rule engine,
+# credential injection, audit. The pod's env is already set by the controller;
+# only the image needs replacing. Idempotent: only fires if the image is still
+# the golang stand-in.)
+for i in $(seq 1 30); do
+  TP_IMG=$(K -n "$NS" get pod "$TOOL_POD" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
+  [ -n "$TP_IMG" ] && break
+  sleep 2
+done
+echo "   tool proxy pod image (before patch): $TP_IMG"
+if [ "$TP_IMG" != "$TOOL_IMG" ]; then
+  echo "   patching tool proxy pod image $TP_IMG -> $TOOL_IMG (test-only: no --tool-proxy-image flag yet)"
+  K -n "$NS" patch pod "$TOOL_POD" --type=json -p="[{\"op\":\"replace\",\"path\":\"/spec/containers/0/image\",\"value\":\"$TOOL_IMG\"}]" 2>/dev/null \
+    || { echo "FATAL: could not patch the tool proxy pod image"; exit 2; }
+  sleep 3
+  TP_IMG=$(K -n "$NS" get pod "$TOOL_POD" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
+  echo "   tool proxy pod image (after patch): $TP_IMG"
+fi
 GATE_SUSPENDED=""
 for i in $(seq 1 60); do
   TR=$(K -n "$NS" get pod "$TOOL_POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)

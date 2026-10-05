@@ -47,8 +47,14 @@ import (
 
 // P2c fixture values (goconst: they recur across the specs).
 const (
-	p2cGoal     = "P2c budget and stall API"
-	p2cLoopRepo = "https://example.com/repo.git"
+	p2cGoal         = "P2c budget and stall API"
+	p2cLoopRepo     = "https://example.com/repo.git"
+	p2cAdditiveName = "p2c-additive"
+	p2cRTName       = "p2c-rt"
+	p2cBadEnumName  = "p2c-badenum"
+	p2cBadStallName = "p2c-badstallafter"
+	p2cBadCostName  = "p2c-badcost"
+	p2cBadPriceName = "p2c-badprice"
 )
 
 var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
@@ -64,13 +70,13 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 	// so the specs set exactly the field under test.
 	baseLoop := func(name, ns string) *unstructured.Unstructured {
 		return &unstructured.Unstructured{Object: map[string]any{
-			"apiVersion": "coxswain.wattu.com/v1alpha1",
-			"kind":       "Loop",
-			"metadata":   map[string]any{"name": name, "namespace": ns},
-			"spec": map[string]any{
-				"goal":      p2cGoal,
-				"workspace": map[string]any{"repo": p2cLoopRepo},
-				"verify":    map[string]any{"acceptanceChecks": []any{"go test ./..."}},
+			unstructuredAPI:  loopAPIVersion,
+			unstructuredKind: loopKind,
+			unstructuredMeta: map[string]any{unstructuredName: name, unstructuredNs: ns},
+			unstructuredSpec: map[string]any{
+				unstructuredGoal: p2cGoal,
+				unstructuredWs:   map[string]any{unstructuredRepo: p2cLoopRepo},
+				unstructuredVer:  map[string]any{unstructuredAcck: []any{loopCheckCmd}},
 			},
 		}}
 	}
@@ -82,11 +88,11 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 		}()
 
 		// A Loop with no spec.budget and no spec.loop.stall* is admitted.
-		u := baseLoop("p2c-defaults", ns)
+		u := baseLoop(p2cRTName, ns)
 		Expect(k8sClient.Create(ctx, u)).To(Succeed())
 
 		got := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "p2c-defaults"}, got)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p2cRTName}, got)).To(Succeed())
 
 		// The CRD defaulting: spec.loop is present ({} default) with
 		// stallAction defaulted to Fail; stallAfter is absent (the operator
@@ -143,7 +149,7 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
 
-		u := baseLoop("p2c-badenum", ns)
+		u := baseLoop(p2cBadEnumName, ns)
 		Expect(unstructured.SetNestedField(u.Object, "Mangle", "spec", "loop", "stallAction")).To(Succeed())
 		err := k8sClient.Create(ctx, u)
 		Expect(err).To(HaveOccurred(), "stallAction Mangle must be rejected by the enum validation")
@@ -155,7 +161,7 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
 
-		u := baseLoop("p2c-badstallafter", ns)
+		u := baseLoop(p2cBadStallName, ns)
 		Expect(unstructured.SetNestedField(u.Object, int64(0), "spec", "loop", "stallAfter")).To(Succeed())
 		err := k8sClient.Create(ctx, u)
 		Expect(err).To(HaveOccurred(), "stallAfter 0 must be rejected by the minimum-1 validation")
@@ -167,13 +173,13 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
 
-		u := baseLoop("p2c-badcost", ns)
+		u := baseLoop(p2cBadCostName, ns)
 		Expect(unstructured.SetNestedField(u.Object, "abc", "spec", "budget", "maxCostUsd")).To(Succeed())
 		err := k8sClient.Create(ctx, u)
 		Expect(err).To(HaveOccurred(), "maxCostUsd abc must be rejected by the decimal-string pattern")
 
 		// The modelPrices values are pattern-checked too.
-		u2 := baseLoop("p2c-badprice", ns)
+		u2 := baseLoop(p2cBadPriceName, ns)
 		Expect(unstructured.SetNestedField(u2.Object, "1.2.3", "spec", "budget", "modelPrices", "promptUsdPerMtok")).To(Succeed())
 		err = k8sClient.Create(ctx, u2)
 		Expect(err).To(HaveOccurred(), "a malformed promptUsdPerMtok must be rejected by the decimal-string pattern")
@@ -190,7 +196,7 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 		// does NOT enter Paused (that is P2f), and nothing about the new
 		// fields affects the decision.
 		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "p2c-additive", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: p2cAdditiveName, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      p2cGoal,
 				Workspace: coxv1alpha1.Workspace{Repo: p2cLoopRepo},
@@ -199,12 +205,12 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "p2c-additive"}})
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p2cAdditiveName}})
 		Expect(err).ToNot(HaveOccurred(), "a pre-P2c Loop must reconcile without error")
 
 		// The sandbox is suspended (the S1 behaviour, unchanged).
 		sbx := &sandboxv1beta1.Sandbox{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "p2c-additive-sandbox"}, sbx)).To(Succeed(),
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p2cAdditiveName + "-sandbox"}, sbx)).To(Succeed(),
 			"the sandbox <loop>-sandbox must exist")
 		Expect(sbx.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
 			"the existing suspend behaviour must be unchanged")
@@ -233,12 +239,12 @@ var _ = Describe("P2c: status field round-trip", func() {
 		}()
 
 		u := &unstructured.Unstructured{Object: map[string]any{
-			"apiVersion": "coxswain.wattu.com/v1alpha1",
-			"kind":       "Loop",
-			"metadata":   map[string]any{"name": "p2c-rt", "namespace": ns},
-			"spec": map[string]any{
-				"goal":      p2cGoal,
-				"workspace": map[string]any{"repo": p2cLoopRepo},
+			unstructuredAPI:  loopAPIVersion,
+			unstructuredKind: loopKind,
+			unstructuredMeta: map[string]any{unstructuredName: p2cRTName, unstructuredNs: ns},
+			unstructuredSpec: map[string]any{
+				unstructuredGoal: p2cGoal,
+				unstructuredWs:   map[string]any{unstructuredRepo: p2cLoopRepo},
 			},
 			"status": map[string]any{
 				"phase":        "Implementing",
@@ -267,7 +273,7 @@ var _ = Describe("P2c: status field round-trip", func() {
 						"jobName":              "p2c-rt-verify-2",
 						"hash":                 "9f86d081884c7d65",
 						"normalisationVersion": "v1",
-						"check":                "go test ./...",
+						"check":                loopCheckCmd,
 						"at":                   "2026-10-04T11:59:00Z",
 					},
 				},
@@ -279,10 +285,10 @@ var _ = Describe("P2c: status field round-trip", func() {
 		Expect(k8sClient.Create(ctx, u)).To(Succeed())
 
 		stored := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "p2c-rt"}, stored)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p2cRTName}, stored)).To(Succeed())
 
 		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: "p2c-rt", Namespace: ns, ResourceVersion: stored.ResourceVersion},
+			ObjectMeta: metav1.ObjectMeta{Name: p2cRTName, Namespace: ns, ResourceVersion: stored.ResourceVersion},
 			Spec:       coxv1alpha1.LoopSpec{Goal: p2cGoal, Workspace: coxv1alpha1.Workspace{Repo: p2cLoopRepo}},
 			Status: coxv1alpha1.LoopStatus{
 				Phase:        coxv1alpha1.LoopPhaseImplementing,
@@ -319,7 +325,7 @@ var _ = Describe("P2c: status field round-trip", func() {
 			"the status subresource must accept the P2c status fields")
 
 		got := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "p2c-rt"}, got)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p2cRTName}, got)).To(Succeed())
 
 		b := got.Status.Budget
 		Expect(b).ToNot(BeNil(), "status.budget must survive the round-trip")

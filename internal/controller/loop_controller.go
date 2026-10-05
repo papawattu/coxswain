@@ -411,6 +411,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
 	copy(condsBefore, loop.Status.Conditions)
 
+	// P2f: the Paused phase entry (spec.suspend=true on a non-terminal phase,
+	// upgraded from S1) and the resume mechanics (suspend=false resumes only a
+	// Suspend pause; the coxswain.io/resume annotation resumes a Stall/Budget
+	// pause). Runs BEFORE the S4 bootstrap and ensureSandbox so the sandbox is
+	// built with the post-pause/resume phase + OperatingMode in the same pass.
+	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, &loop)
+	changed := pauseChanged
 	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -420,7 +427,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
-	changed := false
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
 		changed = true
@@ -447,7 +453,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	if err := r.ensureSandbox(ctx, &loop); err != nil {
+	if err := r.ensureSandbox(ctx, &loop, pauseBlocked); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -473,8 +479,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Implementing / Failed) are completed by B3 (verify outcome) and B4
 	// (iteration count). See internal/controller/loop_s4_phase.go.
 	claimReadPending, s4Changed := r.advancePhaseFromClaim(ctx, &loop)
-	changed = changed || s4Changed
-	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
+	changed = changed || s4Changed // S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
 	// isolated evidence path). The Job is created when the current pin exists
 	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
 	// Verifying advance) and its init containers' exit codes drive the
@@ -491,12 +496,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// the apiserver deletes async, so a Create here would hit AlreadyExists
 	// and the new pin would be left un-built). The requeue creates the fresh
 	// Job on the next reconcile.
+	// P2f: no Jobs run while paused — the verify Job's ensure is gated on
+	// phase != Paused (a paused Loop has no in-flight verify; a Job that was
+	// running at pause time is left to terminate, and its termination produces
+	// no iterate/stall/budget decision because the phase is Paused, not
+	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
 	verifyRequeue := false
-	if err := r.ensureVerifyJob(ctx, &loop); err != nil {
-		if errors.Is(err, errVerifyStaleDeleted) {
-			verifyRequeue = true
-		} else {
-			return ctrl.Result{}, err
+	if !loopPaused(&loop) {
+		if err := r.ensureVerifyJob(ctx, &loop); err != nil {
+			if errors.Is(err, errVerifyStaleDeleted) {
+				verifyRequeue = true
+			} else {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 	if err := r.ensureVerifyNetworkPolicy(ctx, &loop); err != nil {
@@ -569,7 +581,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// (AFTER it, so the two Loop writes never race) are extracted to
 	// finalizeLoopStatus to keep the top-level reconcile within the gocyclo
 	// budget.
-	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged); err != nil {
+	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -589,9 +601,17 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // defeat optimistic concurrency (it can silently overwrite status another
 // writer just set). Extracted so the top-level reconcile stays within the
 // gocyclo budget.
-func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged bool) error {
+func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared bool) error {
 	if changed || conditionsChanged {
 		if err := r.Status().Update(ctx, loop); err != nil {
+			return err
+		}
+	}
+	// P2f: after a valid resume, patch the coxswain.io/resume annotation off
+	// (AFTER the status write so the two Loop writes never race — the I52
+	// pattern). A refused resume never clears it.
+	if resumeCleared {
+		if err := r.removeResumeAnnotation(ctx, loop); err != nil {
 			return err
 		}
 	}
@@ -1202,7 +1222,12 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	return []corev1.Container{agentContainer}, initContainers, volumes
 }
 
-func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop) error {
+// ensureSandbox creates or updates the Loop's Sandbox. pauseBlocked (P2f
+// item F) is the refuse-while-delivering flag: when true, the sandbox is
+// kept Running even though spec.suspend=true (a Succeeded Loop's deliver Job
+// is in flight — suspending would strand a half-pushed PR, so the operator
+// refuses the pause and lets delivery complete).
+func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) error {
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
 	log := logf.FromContext(ctx)
@@ -1255,9 +1280,14 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// proxy pod, no key, no COX_MODEL_BASE_URL (never a half-configured
 		// proxy that would make the pod InvalidConfiguration on an empty secret).
 		hasModel := loop.Spec.Agent.EndpointSecretRef != ""
-		// Honor spec.suspend: a suspended Loop must not run a Running sandbox
-		// (S1). Running is the default for a normal Loop.
-		if loop.Spec.Suspend {
+		// Honor spec.suspend and the Paused phase (P2f): a suspended OR a
+		// Paused Loop must not run a Running sandbox. The suspension gate is
+		// the core of P2f: desired OperatingMode = Suspended iff
+		// spec.suspend || phase==Paused (a budget- or stall-paused Loop has
+		// spec.suspend=false — the gate still suspends it). pauseBlocked (the
+		// item-F refusal) keeps the sandbox Running so the in-flight delivery
+		// completes. The D30/D35a/etc gates still apply on top — additive.
+		if loop.Spec.Suspend && !pauseBlocked || loopPaused(loop) {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 		} else {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning

@@ -297,6 +297,15 @@ if [ -z "$UPSTREAM_NODE_IP" ]; then
   exit 2
 fi
 echo "   upstream container $UPSTREAM_CONT running at $UPSTREAM_NODE_IP (RFC 2544 bridge)"
+# The tool upstream URL is the bridge container IP:80 (RFC 2544 — in no
+# carve-out, so the controller's ToolUpstreamInCluster check passes AND the
+# tool-proxy netpol external carve-out + the tool-proxy's resolved-IP
+# backstop permit the dial — the correct product behaviour, not a carve-out
+# change). The model endpoint is a DUMMY (never dialed by the agent in this
+# test: the D41e assertions exercise the tool proxy path, not the model
+# path); it must pass the AgentPolicy CRD CEL rule (no .svc/.cluster.local).
+UPSTREAM_URL="http://${UPSTREAM_NODE_IP}:80"
+MODEL_ENDPOINT="${UPSTREAM_NODE_IP}:80"
 # Wait for the listener to bind :80 (poll from the host via docker exec into
 # the upstream container).
 for i in $(seq 1 30); do

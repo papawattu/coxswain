@@ -23,6 +23,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -44,6 +45,21 @@ import (
 const (
 	p2fModelSecret   = "p2f-model-creds"
 	p2fModelEndpoint = "10.0.0.9:9200" // IP-literal: the D35a proxy gate peer is an ipBlock
+)
+
+// p2fHeadCommit is the 40-hex head commit for the P2f specs (the runner's
+// committed head; the B1 spec models a successful Implementing claim that
+// always commits and reports the head).
+const p2fHeadCommit = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" // 40-hex
+
+// p2fInt64Ptr returns a *int64 pointing to v (the P2f budget cap values).
+//
+//nolint:modernize // newexpr: the linter wants new(x), but new(x) returns a zero value, not a pointer to x.
+func p2fInt64Ptr(v int64) *int64 { return &v }
+
+var (
+	p2fMaxTokens200 = p2fInt64Ptr(200)
+	p2fMaxTokens500 = p2fInt64Ptr(500)
 )
 
 var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, resume", func() {
@@ -258,7 +274,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		l := getLoop(ns, "p2f-s3")
 		l.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 		l.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying
-		l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"}
+		l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: p2fHeadCommit}
 		l.Status.BaseCommit = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
 		reconcile(r, ns, "p2f-s3")
@@ -310,8 +326,8 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return &PhaseClaim{
 				ObservedPhase: coxv1alpha1.LoopPhaseImplementing,
-				Status:        "success",
-				HeadCommit:    "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+				Status:        claimSuccess,
+				HeadCommit:    p2fHeadCommit,
 			}, nil
 		}
 		reconcile(r, ns, "p2f-s4")
@@ -409,7 +425,11 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		l.Status.DesiredPhase = coxv1alpha1.LoopPhasePaused
 		l.Status.PausedFrom = coxv1alpha1.LoopPhaseVerifying
 		l.Status.PausedReason = coxv1alpha1.PausedReasonBudget
-		l.Annotations = map[string]string{resumeAnnotation: "true"}
+		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+		// The annotation is a metadata change: a separate Update (the status
+		// subresource does not carry annotations).
+		l = getLoop(ns, "p2f-s7")
+		l.Annotations = map[string]string{resumeAnnotation: unstructuredTrue}
 		Expect(k8sClient.Update(ctx, l)).To(Succeed())
 		reconcile(r, ns, "p2f-s7")
 
@@ -427,7 +447,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 
 		By("a leftover annotation on a NON-paused Loop is ignored (no side effect)")
 		got = getLoop(ns, "p2f-s7")
-		got.Annotations = map[string]string{resumeAnnotation: "true"}
+		got.Annotations = map[string]string{resumeAnnotation: unstructuredTrue}
 		Expect(k8sClient.Update(ctx, got)).To(Succeed())
 		reconcile(r, ns, "p2f-s7")
 		got = getLoop(ns, "p2f-s7")
@@ -442,7 +462,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s8", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
-				MaxTokens:  ptrInt64(200),
+				MaxTokens:  p2fMaxTokens200,
 				OnExceeded: coxv1alpha1.BudgetExceededActionPause,
 			}
 		})
@@ -462,11 +482,14 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 			ExceededReason:   coxv1alpha1.BudgetExceededTokens,
 		}
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+		// The phase advance (Planning->Paused) is a real operator action: the
+		// sandbox is deleted for re-creation. A second reconcile re-creates it.
+		reconcile(r, ns, "p2f-s8")
 		reconcile(r, ns, "p2f-s8")
 
 		By("(a) caps not raised: resume via the annotation is REFUSED (P3)")
 		l = getLoop(ns, "p2f-s8")
-		l.Annotations = map[string]string{resumeAnnotation: "true"}
+		l.Annotations = map[string]string{resumeAnnotation: unstructuredTrue}
 		Expect(k8sClient.Update(ctx, l)).To(Succeed())
 		modeBefore := sandboxMode(ns, "p2f-s8")
 		reconcile(r, ns, "p2f-s8")
@@ -484,7 +507,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 
 		By("(b) caps raised (an I43 same-Loop update): resume clears the exceedance")
 		got = getLoop(ns, "p2f-s8")
-		got.Spec.Budget.MaxTokens = ptrInt64(500)
+		got.Spec.Budget.MaxTokens = p2fMaxTokens500
 		Expect(k8sClient.Update(ctx, got)).To(Succeed())
 		reconcile(r, ns, "p2f-s8")
 		got = getLoop(ns, "p2f-s8")
@@ -551,7 +574,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		reconcile(r, ns, "p2f-s9c")
 		setPhase(getLoop(ns, "p2f-s9c"), coxv1alpha1.LoopPhaseSucceeded)
 		lc := getLoop(ns, "p2f-s9c")
-		lc.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"}
+		lc.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: p2fHeadCommit}
 		Expect(k8sClient.Status().Update(ctx, lc)).To(Succeed())
 		reconcile(r, ns, "p2f-s9c")
 		By("setting suspend=true on the in-flight Succeeded Loop")
@@ -567,7 +590,8 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		deliverJob := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: deliverJobName("p2f-s9c")}, deliverJob)).To(Succeed(),
 			"the deliver Job must exist (delivery is in flight)")
-		Expect(deliverJob.Spec.Suspend).To(BeNil(), "the deliver Job is not suspended")
+		Expect(deliverJob.Spec.Suspend).NotTo(HaveValue(BeTrue()),
+			"the deliver Job is not suspended (item F: delivery is in flight)")
 		// The sandbox is left running so delivery completes.
 		Expect(sandboxMode(ns, "p2f-s9c")).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
 			"the sandbox is left running so the in-flight delivery completes")
@@ -598,8 +622,8 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return &PhaseClaim{
 				ObservedPhase: coxv1alpha1.LoopPhaseImplementing,
-				Status:        "success",
-				HeadCommit:    "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+				Status:        claimSuccess,
+				HeadCommit:    p2fHeadCommit,
 			}, nil
 		}
 		reconcile(r, ns, "p2f-s10")
@@ -653,7 +677,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		l.Status.PausedFrom = coxv1alpha1.LoopPhaseVerifying
 		l.Status.PausedReason = coxv1alpha1.PausedReasonSuspend
 		l.Spec.Suspend = true
-		l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"}
+		l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: p2fHeadCommit}
 		l.Status.BaseCommit = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 		l.Status.Iteration = 2
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
@@ -682,7 +706,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		l2.Status.Iteration = 3
 		Expect(k8sClient.Status().Update(ctx, l2)).To(Succeed())
 		l2 = getLoop(ns, "p2f-s12b")
-		l2.Annotations = map[string]string{resumeAnnotation: "true"}
+		l2.Annotations = map[string]string{resumeAnnotation: unstructuredTrue}
 		Expect(k8sClient.Update(ctx, l2)).To(Succeed())
 		reconcile(r, ns, "p2f-s12b")
 		g2 := getLoop(ns, "p2f-s12b")
@@ -700,11 +724,18 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 			coxv1alpha1.LoopPhaseAwaitingApproval,
 		} {
 			By("the Loop is at " + string(tc))
-			name := "p2f-s13-" + string(tc)
+			// The Loop name must be DNS-1123 (lowercase); the phase names are
+			// uppercase, so use a lowercase suffix.
+			name := "p2f-s13-" + strings.ToLower(string(tc))
 			loop := createLoop(ns, name, nil)
 			primeProxy(r, loop)
 			reconcile(r, ns, name)
 			setPhase(getLoop(ns, name), tc)
+			// A real phase advance (Planning->AwaitingApproval) deletes the
+			// sandbox for re-creation; a second reconcile re-creates it. The
+			// Planning->Planning case is a no-op (the bootstrap already advanced
+			// to Planning), so the second reconcile is a no-op there too.
+			reconcile(r, ns, name)
 			reconcile(r, ns, name)
 			Expect(sandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
 				"the sandbox is Running at %s before the pause", tc)
@@ -759,22 +790,21 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		Expect(got.Status.Budget.Exceeded).To(BeTrue())
 		Expect(got.Status.Budget.ExceededReason).To(Equal(coxv1alpha1.BudgetExceededWallClock))
 
-		By("resume re-evaluates the wall clock (item 5): the counts no longer exceed the cap, so it proceeds")
-		// The activeSeconds accumulation stopped during the pause; with the
-		// cap at 1h (3600s) and the counts at 4000s, the wall clock IS still
-		// hit — but the plan's spec 14 sub-case is "the cap may no longer be
-		// hit" (the counts stopped accumulating). We model the NOT-hit case:
-		// lower the counts under the cap.
+		By("a SECOND cap hit while already Paused does not double-write; the first pause's reason is preserved (item 9)")
+		// The Loop is already paused (reason Suspend). A wall-clock cap hit
+		// while paused would, without the "first pause wins" rule, overwrite
+		// the pausedReason to Budget. The rule: the pausedReason is set only
+		// on the FIRST entry (the PausedFrom nil-check). The budget exceedance
+		// is recorded in status.budget.exceeded (by P2d's accumulation step)
+		// but the pausedReason stays Suspend.
 		got = getLoop(ns, "p2f-s14")
-		got.Status.Budget = &coxv1alpha1.BudgetStatus{ActiveSeconds: 1800, Exceeded: true, ExceededReason: coxv1alpha1.BudgetExceededWallClock}
+		got.Status.Budget = &coxv1alpha1.BudgetStatus{ActiveSeconds: 4000, Exceeded: true, ExceededReason: coxv1alpha1.BudgetExceededWallClock}
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
-		got = getLoop(ns, "p2f-s14")
-		got.Spec.Suspend = false
-		Expect(k8sClient.Update(ctx, got)).To(Succeed())
 		reconcile(r, ns, "p2f-s14")
 		got = getLoop(ns, "p2f-s14")
-		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
-			"the wall clock is re-evaluated on resume; the cap is no longer hit (1800s < 3600s)")
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
+		Expect(got.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonSuspend), "the first pause wins (item 9)")
+		Expect(got.Status.PausedFrom).To(Equal(coxv1alpha1.LoopPhaseImplementing))
 	})
 
 	It("spec 15: a long pause does not leak into activeSeconds (item E)", func() {
@@ -807,7 +837,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
 
 		By("advance the clock 2h (a long pause): the stamp is frozen until resume (P2c owns the activeSeconds accumulation)")
-		*nowPtr = metav1.NewTime(nowPtr.Time.Add(2 * time.Hour))
+		*nowPtr = metav1.NewTime(nowPtr.Time.Add(2 * time.Hour)) //nolint:staticcheck // QF1008: metav1.Time embeds time.Time; .Time is the promoted field
 		reconcile(r, ns, "p2f-s15")
 		got = getLoop(ns, "p2f-s15")
 		Expect(got.Status.Budget).NotTo(BeNil())
@@ -835,9 +865,6 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 })
 
 // p2f test helpers (package-level; the specs above reference them).
-
-// ptrInt64 is a *int64 helper for the P2f budget caps.
-func ptrInt64(v int64) *int64 { return &v }
 
 // deleteNS deletes a namespace (the specs' deferred teardown).
 func deleteNS(ctx context.Context, ns string) {

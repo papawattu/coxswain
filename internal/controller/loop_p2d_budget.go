@@ -94,7 +94,7 @@ func (p *modelPrices) hasAny() bool {
 // or already hit) and an error only for transient budget-status persistence
 // failures (a read failure is NOT an error — status.budget is left unchanged
 // and the decision waits for the next successful read).
-func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop) (time.Duration, error) {
+func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop) time.Duration {
 	now := r.operatorNow()
 
 	// --- wall clock (item 10 / item E) ---
@@ -109,10 +109,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 		if !loopPaused(loop) {
 			b := loop.Status.Budget
 			if b != nil && b.LastActiveStamp != nil {
-				added = int64(now.Sub(b.LastActiveStamp.Time) / time.Second)
-				if added < 0 {
-					added = 0
-				}
+				added = max(0, int64(now.Sub(b.LastActiveStamp.Time)/time.Second))
 			}
 			// Set/refresh the stamp on every non-paused reconcile (item E).
 			st := now
@@ -123,9 +120,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 			current = loop.Status.Budget.ActiveSeconds
 		}
 		current += added
-		if err := r.ensureBudgetStatus(loop, current, stamp); err != nil {
-			return 0, err
-		}
+		r.ensureBudgetStatus(loop, current, stamp)
 		// The RequeueAfter for a quiet wall-clock Loop (item 10): when the cap
 		// is set and not yet hit, re-reconcile at the remaining time.
 		if d, err := coxv1alpha1.ParseMaxWallClock(loop.Spec.Budget.MaxWallClock); err == nil && d > 0 {
@@ -144,9 +139,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// decision is on the last SUCCESSFUL read, never an estimate).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
 		if reading, err := r.resolveProxyUsageRead(ctx, loop); err == nil && reading != nil {
-			if err := r.applyUsageReading(ctx, loop, *reading); err != nil {
-				return 0, err
-			}
+			r.applyUsageReading(ctx, loop, *reading)
 		}
 	}
 
@@ -166,7 +159,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 		r.applyBudgetDecision(ctx, loop)
 	}
 
-	return budgetRequeue, nil
+	return budgetRequeue
 }
 
 // resolveProxyUsageRead dispatches to the readProxyUsage test seam when it is
@@ -193,7 +186,7 @@ func (r *LoopReconciler) resolveProxyUsageRead(ctx context.Context, loop *coxv1a
 // status-write failure (the caller's Status().Update handles the actual write;
 // this only mutates the in-memory object — so this method never returns an
 // error except for programmer errors, kept for signature symmetry).
-func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSeconds int64, stamp *metav1.Time) error {
+func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSeconds int64, stamp *metav1.Time) {
 	if loop.Status.Budget == nil {
 		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
 	}
@@ -201,7 +194,6 @@ func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSecond
 	if stamp != nil {
 		loop.Status.Budget.LastActiveStamp = stamp
 	}
-	return nil
 }
 
 // readProxyUsageDefault is the DEFAULT readProxyUsage (the readBaseCommit
@@ -242,7 +234,7 @@ func (r *LoopReconciler) readProxyUsageDefault(ctx context.Context, loop *coxv1a
 		// does not guess; the decision waits for the next successful read).
 		return proxy.Reading{}, fmt.Errorf("usage read %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return proxy.Reading{}, fmt.Errorf("usage read %s: status %d", url, resp.StatusCode)
 	}
@@ -277,7 +269,7 @@ func (r *LoopReconciler) readProxyUsageDefault(ctx context.Context, loop *coxv1a
 //     add NOTHING (no negative tokens; the drop is not re-added on the next
 //     read). This is NOT a bootIDChanged rebase (that is reserved for a
 //     genuine new boot).
-func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha1.Loop, reading proxy.Reading) error {
+func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha1.Loop, reading proxy.Reading) {
 	if loop.Status.Budget == nil {
 		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
 	}
@@ -290,7 +282,7 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 		b.LastCompletionTokens = reading.CompletionTokens
 		b.LastRequests = reading.Requests
 		b.LastUnmeteredRequests = reading.UnmeteredRequests
-		return nil
+		return
 	}
 
 	// Rule 3: a different bootID — a pod recreate (the emptyDir wiped).
@@ -307,7 +299,7 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 				"proxy boot ID changed %s -> %s: the pod's usage counters were wiped (a fresh boot); the accumulated count is a delta from 0",
 				prior, reading.BootID)
 		}
-		return nil
+		return
 	}
 
 	// Rules 1 + 4: same bootID.
@@ -335,7 +327,7 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 		b.LastCompletionTokens = reading.CompletionTokens
 		b.LastRequests = reading.Requests
 		b.LastUnmeteredRequests = reading.UnmeteredRequests
-		return nil
+		return
 	}
 
 	// Rule 1: same bootID, no drop — add the deltas (floored at 0 per counter).
@@ -358,7 +350,6 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 	} else {
 		b.CostUsd = ""
 	}
-	return nil
 }
 
 // modelPricesForLoop resolves the price pair for a Loop's cost derivation:

@@ -48,9 +48,14 @@ import (
 
 // p2d fixture constants.
 const (
-	p2dModelSecret   = "p2d-model-creds"
-	p2dModelEndpoint = "10.0.0.9:9200"                            // IP-literal: the D35a proxy gate peer is an ipBlock
-	p2dHeadCommit    = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3" // 40-hex head commit
+	p2dModelSecret         = "p2d-model-creds"
+	p2dModelEndpoint       = "10.0.0.9:9200"                            // IP-literal: the D35a proxy gate peer is an ipBlock
+	p2dHeadCommit          = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3" // 40-hex head commit
+	p2dProxyComponent      = "proxy"
+	p2dModelProxyComponent = "model-proxy"
+	p2dSandboxSHA          = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	p2dSystemNS            = "coxswain-system"
+	p2dCostCap             = "0.01"
 )
 
 var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceeded)", func() {
@@ -78,7 +83,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			Recorder:        recorder,
 			readPhaseClaim:  func(context.Context, *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil },
 			readBaseCommit: func(context.Context, *coxv1alpha1.Loop) (string, bool, error) {
-				return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, nil
+				return p2dSandboxSHA, true, nil
 			},
 		}
 		if nowPtr != nil {
@@ -117,7 +122,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 		l := getLoopP2d(ns, name)
-		l.Status.BaseCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		l.Status.BaseCommit = p2dSandboxSHA
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed(), "seed status.baseCommit")
 		return l
 	}
@@ -138,7 +143,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 		l := getLoopP2d(ns, name)
-		l.Status.BaseCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		l.Status.BaseCommit = p2dSandboxSHA
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
 		return l
 	}
@@ -149,7 +154,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 	// ServiceIP from the shared pool — the gate + the read seam do not use
 	// it). The injected readProxyUsage seam stands in for the pod's :9090
 	// endpoint (envtest has no kubelet serving it).
-	primeP2dProxy := func(r *LoopReconciler, loop *coxv1alpha1.Loop) {
+	primeP2dProxy := func(loop *coxv1alpha1.Loop) {
 		_ = k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: p2dModelSecret, Namespace: loop.Namespace},
 			StringData: map[string]string{modelAPIKey: "p2d-dummy", modelBaseURL: p2dModelEndpoint},
@@ -167,11 +172,11 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 				Labels: map[string]string{
 					"app.kubernetes.io/managed-by": "coxswain",
 					"app.kubernetes.io/loop":       loop.Name,
-					"app.kubernetes.io/component":  "model-proxy",
+					kaptComponentLabel:             p2dModelProxyComponent,
 				},
 			},
 			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: "proxy", Image: "proxy"}},
+				Containers: []corev1.Container{{Name: p2dProxyComponent, Image: p2dProxyComponent}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
@@ -239,7 +244,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		recorder := record.NewFakeRecorder(64)
 		r := newP2dReconciler(recorder, nil)
 		loop := createP2dLoop(ns, "p2d-s1", nil)
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B1", PromptTokens: 120, CompletionTokens: 30, Requests: 7}, nil
 		}
@@ -270,7 +275,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 200
 		})
 		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		reconcileP2d(r, ns, "p2d-s2") // bootstrap (the seam is unset: the default read fails -> no reading, no decision)
 		// Two reads: the first adopts the baseline (0, no delta, no decision),
 		// the second adds the same-boot delta (250-0=250) -> the accumulated
@@ -312,7 +317,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionPause}
 			*l.Spec.Budget.MaxTokens = 200
 		})
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		// Drive the phase to Implementing so pausedFrom has a meaningful value
 		// (the D35a gate is satisfied; the claim reader is no-op so the phase
 		// is seeded directly — the P2f fixture shape).
@@ -425,10 +430,10 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		// namespace defaults to coxswain-system; create it + the ConfigMap).
 		// The coxswain-system namespace may already exist (created by spec 6):
 		// tolerate the already-exists error (the namespace is shared).
-		nsErr := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "coxswain-system"}})
+		nsErr := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: p2dSystemNS}})
 		Expect(apierrors.IsAlreadyExists(nsErr) || nsErr == nil).To(BeTrue(), "the coxswain-system namespace exists or was created")
 		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "coxswain-model-prices", Namespace: "coxswain-system"},
+			ObjectMeta: metav1.ObjectMeta{Name: "coxswain-model-prices", Namespace: p2dSystemNS},
 			Data:       map[string]string{"prompt": "0.30", "completion": "1.20"},
 		}
 		_ = k8sClient.Create(ctx, cm)
@@ -438,13 +443,13 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		loop := createP2dLoop(ns, "p2d-s6", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
 				MaxTokens:  new(int64),
-				MaxCostUsd: "0.01",
+				MaxCostUsd: p2dCostCap,
 				OnExceeded: coxv1alpha1.BudgetExceededActionFail,
 			}
 			*l.Spec.Budget.MaxTokens = 10_000_000 // a token cap far above the reading
 		})
 		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		// Two reads: the first adopts the baseline (no delta, no cost, no
 		// decision), the second adds the same-boot delta (10_000 prompt +
 		// 10_000 completion) and re-derives the cost:
@@ -481,13 +486,13 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		loop2 := createP2dLoop(ns2, "p2d-s6b", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
 				MaxTokens:  new(int64),
-				MaxCostUsd: "0.01",
+				MaxCostUsd: p2dCostCap,
 				OnExceeded: coxv1alpha1.BudgetExceededActionFail,
 			}
 			*l.Spec.Budget.MaxTokens = 10_000_000
 		})
 		setPhaseP2d(loop2, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r2, loop2)
+		primeP2dProxy(loop2)
 		// Two reads: baseline (adopt) + a same-boot delta (the cost is
 		// re-derived on the delta — it must stay empty without a price
 		// source, and the cost cap must stay inert).
@@ -515,7 +520,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 200
 		})
 		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		// The exact-at shape: a baseline reading of 0 (adopted, no delta),
 		// then a reading whose SAME-BOOT delta sums the accumulated tokens
 		// EXACTLY to the cap (200). The one-below shape (199) is a separate
@@ -545,7 +550,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 200
 		})
 		setPhaseP2d(loop2, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r2, loop2)
+		primeP2dProxy(loop2)
 		r2.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
 		}
@@ -573,7 +578,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionPause}
 			*l.Spec.Budget.MaxTokens = 200
 		})
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		reconcileP2d(r, ns, "p2d-s8a") // bootstrap (seam unset: no reading)
 		setPhaseP2d(getLoopP2d(ns, "p2d-s8a"), coxv1alpha1.LoopPhaseImplementing)
 		// Baseline 0 (adopt, no delta), then a delta reading of 250 prompt
@@ -617,7 +622,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionPause}
 			*l.Spec.Budget.MaxTokens = 200
 		})
-		primeP2dProxy(r2, loop2)
+		primeP2dProxy(loop2)
 		reconcileP2d(r2, ns2, "p2d-s8b") // bootstrap (seam unset)
 		setPhaseP2d(getLoopP2d(ns2, "p2d-s8b"), coxv1alpha1.LoopPhaseImplementing)
 		var reads8b int
@@ -656,7 +661,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		recorder := record.NewFakeRecorder(64)
 		r := newP2dReconciler(recorder, nil)
 		loop := createP2dNoModelLoop(ns, "p2d-s9", func(l *coxv1alpha1.Loop) {
-			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), MaxCostUsd: "0.01", OnExceeded: coxv1alpha1.BudgetExceededActionFail}
+			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), MaxCostUsd: p2dCostCap, OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 10
 		})
 		// No model: no proxy pod is ever created, no read is ever attempted.
@@ -701,7 +706,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 10_000 // far above the readings: no decision on this path
 		})
 		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		// Seed the stored state: lastBootID B1, lastPromptTokens 100,
 		// accumulated 100.
 		seedBudget(getLoopP2d(ns, "p2d-s10"), func(b *coxv1alpha1.BudgetStatus) {
@@ -748,7 +753,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 10_000
 		})
 		setPhaseP2d(loop2, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r2, loop2)
+		primeP2dProxy(loop2)
 		seedBudget(getLoopP2d(ns2, "p2d-s10b"), func(b *coxv1alpha1.BudgetStatus) {
 			b.LastBootID = "B1"
 			b.LastPromptTokens = 100
@@ -778,7 +783,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 10_000
 		})
 		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		seedBudget(getLoopP2d(ns, "p2d-s11"), func(b *coxv1alpha1.BudgetStatus) {
 			b.LastBootID = "B1"
 			b.LastPromptTokens = 200
@@ -812,7 +817,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 200
 		})
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		reconcileP2d(r, ns, "p2d-s12") // bootstrap (the seam is unset: the default read of a pod with no IP fails -> no reading)
 
 		l := getLoopP2d(ns, "p2d-s12")
@@ -850,7 +855,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 500
 		})
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		// lastBootID empty (the first reconcile after the proxy started):
 		// the reading B1/400 adopts the baseline — the accumulated count is
 		// 0 (NOT 400; the pre-reading count is unknown, not zero) and no
@@ -888,7 +893,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionPause}
 			*l.Spec.Budget.MaxTokens = 200
 		})
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		reconcileP2d(r, ns, "p2d-s14") // bootstrap (seam unset)
 		setPhaseP2d(getLoopP2d(ns, "p2d-s14"), coxv1alpha1.LoopPhaseImplementing)
 		var reads14 int
@@ -927,10 +932,10 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		// ConfigMap's.
 		// The coxswain-system namespace may already exist (created by spec 6):
 		// tolerate the already-exists error (the namespace is shared).
-		nsErr := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "coxswain-system"}})
+		nsErr := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: p2dSystemNS}})
 		Expect(apierrors.IsAlreadyExists(nsErr) || nsErr == nil).To(BeTrue(), "the coxswain-system namespace exists or was created")
 		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "coxswain-model-prices", Namespace: "coxswain-system"},
+			ObjectMeta: metav1.ObjectMeta{Name: "coxswain-model-prices", Namespace: p2dSystemNS},
 			Data:       map[string]string{"prompt": "0.30", "completion": "1.20"},
 		}
 		_ = k8sClient.Create(ctx, cm)
@@ -938,7 +943,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		loop := createP2dLoop(ns, "p2d-s15", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
 				MaxTokens:  new(int64),
-				MaxCostUsd: "0.01",
+				MaxCostUsd: p2dCostCap,
 				OnExceeded: coxv1alpha1.BudgetExceededActionFail,
 				ModelPrices: &coxv1alpha1.ModelPrices{
 					PromptUsdPerMtok:     "0.0000001",
@@ -948,7 +953,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 10_000_000
 		})
 		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		// Two reads: the first adopts the baseline (the cost is derived from
 		// the CUMULATIVE reading: 10_000 prompt + 10_000 completion at the
 		// override prices -> ~2e-12, far below the 0.01 cap), the second
@@ -1002,7 +1007,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		setPhaseP2d(loop, coxv1alpha1.LoopPhaseFailed)
 		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, "Stalled",
 			"acceptance check failed on 3 identical failures (stall)")
-		primeP2dProxy(r, loop)
+		primeP2dProxy(loop)
 		reconcileP2d(r, ns, "p2d-s16") // bootstrap (the phase is Failed: the sandbox is created in the Failed phase)
 		l := getLoopP2d(ns, "p2d-s16")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed), "the phase is Failed (the stall decision's terminal state)")

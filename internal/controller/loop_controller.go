@@ -398,45 +398,11 @@ func (r *LoopReconciler) modelConfigInvalid(ctx context.Context, loop *coxv1alph
 }
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
-func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var loop coxv1alpha1.Loop
-	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
-		// Deleted or never existed: nothing to do.
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
-	// creating the sandbox (defence in depth: the CRD CEL catches the common
-	// case at admission; this catches anything that slips through, including
-	// missing/unreadable policies). If validation fails, set
-	// PolicyValid=False and suspend the sandbox (if running).
-	if !r.agentPoliciesValid(ctx, &loop) {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// D34 (P1): the endpointSecretRef + modelEndpoint pair is required. A Secret
-	// without an endpoint (or an endpoint without a Secret) is a misconfiguration
-	// that would crash-loop the proxy; reject it early.
-	if r.modelConfigInvalid(ctx, &loop) {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// D38: capture the condition set before applyEffectivePolicyAndConditions so
-	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
-	// probe result change) still triggers a status update. Without this, the
-	// "re-gate on flip" spec would never persist the new condition.
-	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
-	copy(condsBefore, loop.Status.Conditions)
-
-	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
-	}
-	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
-	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
-	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
-	// gates apply: an invalid policy suspends, and unenforced also suspends.
-
-	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+// phaseBootstrap is the Phase-0 + S4 bootstrap + P2f pause mechanics +
+// ensureSandbox step extracted from Reconcile to keep the top-level
+// reconcile within the gocyclo budget. It returns (changed, pauseBlocked,
+// resumeCleared, err).
+func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
 	changed := false
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
@@ -460,8 +426,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// recycle — a fresh emptyDir per phase wiped PLAN.md and the
 	// Implementing edits. The step is a small helper (Reconcile complexity,
 	// gocyclo 31).
-	if err := r.ensureLoopArtifacts(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
+	if err := r.ensureLoopArtifacts(ctx, loop); err != nil {
+		return false, false, err
 	}
 
 	// P2f: the Paused phase entry (spec.suspend=true on a non-terminal phase,
@@ -471,10 +437,89 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// at Planning, not the empty phase) and BEFORE ensureSandbox so the
 	// sandbox is built with the post-pause/resume phase + OperatingMode in the
 	// same pass.
-	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, &loop)
+	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, loop)
 	changed = changed || pauseChanged
 
-	if err := r.ensureSandbox(ctx, &loop, pauseBlocked); err != nil {
+	if err := r.ensureSandbox(ctx, loop, pauseBlocked); err != nil {
+		return false, false, err
+	}
+	return changed, resumeCleared, nil
+}
+
+// validateStep is the C6a + D34 validation step extracted from Reconcile
+// to keep the top-level reconcile within the gocyclo budget. It returns
+// (result, true) when the validation fails (the caller returns the result),
+// or (zero, false) when the validation passes (the caller continues).
+func (r *LoopReconciler) validateStep(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, bool) {
+	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
+	// creating the sandbox (defence in depth: the CRD CEL catches the common
+	// case at admission; this catches anything that slips through, including
+	// missing/unreadable policies). If validation fails, set
+	// PolicyValid=False and suspend the sandbox (if running).
+	if !r.agentPoliciesValid(ctx, loop) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	}
+	// D34 (P1): the endpointSecretRef + modelEndpoint pair is required. A
+	// Secret without an endpoint (or an endpoint without a Secret) is a
+	// misconfiguration that would crash-loop the proxy; reject it early.
+	if r.modelConfigInvalid(ctx, loop) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	}
+	return ctrl.Result{}, false
+}
+
+// applyBudgetStep is the P2d budget step extracted from Reconcile to keep
+// the top-level reconcile within the gocyclo budget. It snapshots the
+// budget before the applyBudget call (a COPY of the struct, not a pointer
+// — the DeepEqual must compare the pointed-to structs, not the pointer
+// values) and returns the RequeueAfter (the quiet wall-clock rule) and
+// whether the budget was mutated.
+func (r *LoopReconciler) applyBudgetStep(ctx context.Context, loop *coxv1alpha1.Loop) (time.Duration, bool) {
+	var budgetBefore *coxv1alpha1.BudgetStatus
+	if loop.Status.Budget != nil {
+		b := *loop.Status.Budget
+		budgetBefore = &b
+	}
+	budgetRequeue := r.applyBudget(ctx, loop)
+	budgetChanged := !equality.Semantic.DeepEqual(budgetBefore, loop.Status.Budget)
+	return budgetRequeue, budgetChanged
+}
+
+func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var loop coxv1alpha1.Loop
+	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
+		// Deleted or never existed: nothing to do.
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// C6a + D34: validate the referenced AgentPolicies and the
+	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
+	// the Reconcile within the gocyclo budget).
+	if res, done := r.validateStep(ctx, &loop); done {
+		return res, nil
+	}
+
+	// D38: capture the condition set before applyEffectivePolicyAndConditions so
+	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
+	// probe result change) still triggers a status update. Without this, the
+	// "re-gate on flip" spec would never persist the new condition.
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
+
+	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
+	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
+	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
+	// gates apply: an invalid policy suspends, and unenforced also suspends.
+
+	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
+	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
+	// budget).
+	changed, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -605,25 +650,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// resume) and gated on the verify/stall decisions (stall wins, item 8).
 	// It runs every reconcile, including Paused, so a wall-clock hit WHILE
 	// paused still records exceeded (P2f spec 14) without re-firing the
-	// onExceeded action.
-	// The budget step mutates loop.Status.Budget (the in-memory object) but
-	// does not set the changed flag (it returns (time.Duration, error)).
-	// Snapshot the budget BEFORE the step (a COPY of the struct, not a
-	// pointer — the DeepEqual must compare the pointed-to structs, not the
-	// pointer values) and compare after: if the budget was mutated, set
-	// changed so the finalizeLoopStatus writes the status.
-	var budgetBefore *coxv1alpha1.BudgetStatus
-	if loop.Status.Budget != nil {
-		b := *loop.Status.Budget
-		budgetBefore = &b
-	}
-	budgetRequeue, err := r.applyBudget(ctx, &loop)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !equality.Semantic.DeepEqual(budgetBefore, loop.Status.Budget) {
-		changed = true
-	}
+	// onExceeded action. The helper returns the RequeueAfter (the quiet
+	// wall-clock rule) and whether the budget was mutated (the changed flag).
+	budgetRequeue, budgetChanged := r.applyBudgetStep(ctx, &loop)
+	changed = changed || budgetChanged
 
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
 	// (AFTER it, so the two Loop writes never race) are extracted to
@@ -1861,7 +1891,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 			// fresh boot (the loss is still bounded by the previous successful
 			// read, or is the full boot if there was none).
 			if fr, rerr := r.resolveProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
-				_ = r.applyUsageReading(ctx, loop, *fr)
+				r.applyUsageReading(ctx, loop, *fr)
 			}
 			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
 				return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)

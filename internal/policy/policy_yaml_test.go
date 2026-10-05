@@ -122,6 +122,7 @@ func TestPolicyYAMLPinnedAgainstConstants(t *testing.T) {
 		ComponentAgentLabel,
 		ComponentProxyLabel,
 		ComponentEgressProxyLabel,
+		ComponentToolProxyLabel,
 	} {
 		if !strings.Contains(expr, "'"+c+"'") {
 			t.Errorf("matchCondition expression does not reference constant %q (as a quoted literal):\n%s", c, expr)

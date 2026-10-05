@@ -52,14 +52,32 @@ func egressProxyLabelsMirror(loopName string) map[string]string {
 	}
 }
 
+// toolProxyLabelsMirror mirrors internal/controller.toolProxyLabels (the tool
+// proxy pod/Service label set, D41c, ADR-0008). It is DISJOINT from the model
+// proxy, the egress proxy and the agent (no coxswain.io/loop).
+func toolProxyLabelsMirror(loopName, toolName string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":     "coxswain-tool-proxy",
+		"app.kubernetes.io/instance": loopName,
+		ComponentLabelKey:            ComponentToolProxyLabel,
+		"app.kubernetes.io/part-of":  "coxswain",
+		"coxswain.io/tool-proxy-for": loopName,
+		"coxswain.io/tool":           toolName,
+	}
+}
+
 // TestProxyComponentSelectorMatchesBothProxies asserts the selector matches
-// both the model proxy and the egress proxy label sets.
+// all three operator-owned proxy label sets (model proxy, egress proxy,
+// tool proxy — the I44 pin, widened for D41c so a new operator-owned
+// component without a selector entry is a test failure: the spurious
+// AlreadyExists create loop the I42b kind acceptance found).
 func TestProxyComponentSelectorMatchesBothProxies(t *testing.T) {
 	sel := ProxyComponentSelector()
 
 	for name, lset := range map[string]map[string]string{
 		"model-proxy":  modelProxyLabels("some-loop"),
 		"egress-proxy": egressProxyLabelsMirror("some-loop"),
+		"tool-proxy":   toolProxyLabelsMirror("some-loop", "gh"),
 	} {
 		if !sel.Matches(labelsSet(lset)) {
 			t.Errorf("ProxyComponentSelector does not match %s label set %v", name, lset)

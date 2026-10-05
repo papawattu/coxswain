@@ -9,9 +9,10 @@
 # The policy matches pods/ephemeralcontainers UPDATE (adding an ephemeral
 # container is the only mutation of the subresource) and DENIES the update
 # when the target pod carries the app.kubernetes.io/component label with a
-# coxswain component value (agent, model-proxy, egress-proxy). The component
-# values must stay in sync with internal/policy (ComponentLabelKey,
-# ComponentAgentLabel, ComponentProxyLabel, ComponentEgressProxyLabel) —
+# coxswain component value (agent, model-proxy, egress-proxy, tool-proxy).
+# The component values must stay in sync with internal/policy
+# (ComponentLabelKey, ComponentAgentLabel, ComponentProxyLabel,
+# ComponentEgressProxyLabel, ComponentToolProxyLabel) —
 # internal/policy/policy_yaml_test.go pins them.
 #
 # Pods without the label (or with a different component value) are untouched.
@@ -40,12 +41,12 @@ spec:
         has(object.metadata.labels)
         && 'app.kubernetes.io/component' in object.metadata.labels
         && object.metadata.labels['app.kubernetes.io/component']
-        in ['agent', 'model-proxy', 'egress-proxy']
+        in ['agent', 'model-proxy', 'egress-proxy', 'tool-proxy']
   validations:
     - expression: "false"
       message: >-
         Adding ephemeral containers to coxswain component pods (agent,
-        model-proxy, egress-proxy) is denied: the container would run
+        model-proxy, egress-proxy, tool-proxy) is denied: the container would run
         outside the KubeArmor fence and share the pod's network namespace.
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -184,6 +184,7 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 		{agentContainerName, policy.ComponentAgentLabel},
 		{"model-proxy", policy.ComponentProxyLabel},
 		{"egress-proxy", policy.ComponentEgressProxyLabel},
+		{"tool-proxy", policy.ComponentToolProxyLabel},
 	}
 
 	for _, c := range components {

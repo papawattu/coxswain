@@ -305,6 +305,10 @@ spec:
                       pattern: ^https?://
                       type: string
                       x-kubernetes-validations:
+                      - message: 'tool upstream must not carry userinfo (https://user:pass@host):
+                          the embedded credential bypasses the tool proxy''s credential
+                          boundary (ADR-0008)'
+                        rule: '!self.contains(''@'')'
                       - message: 'tool upstream must not name an in-cluster target
                           (.svc / .svc.cluster.local / .cluster.local / localhost
                           / 127.0.0.1): an in-cluster tool upstream is an SSRF path'

@@ -28,6 +28,8 @@ import (
 	netip "net/netip"
 	neturl "net/url"
 	"os"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -247,6 +249,12 @@ type LoopReconciler struct {
 	// proxy image). When the effective policy has no network allows, the
 	// egress proxy pod is not created and this image is unused.
 	EgressProxyImage string
+
+	// ToolProxyImage is the tool proxy pod image (D41c, ADR-0008). Defaults to
+	// a Go dev stand-in; overridable for the smoke test (e.g. the real tool
+	// proxy image). When the effective policy has no tools, no tool proxy pod
+	// is created and this image is unused.
+	ToolProxyImage string
 
 	// WorkspaceGitImage is the trusted image the workspace init container runs
 	// (S3a, GAP 1): it must carry git. The operator selects it via
@@ -1238,6 +1246,14 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 				}
 			}
+			// D41c: the tool proxies must all be Ready and owned by the Loop
+			// when the effective policy has ≥1 tool (the owned+Ready gate,
+			// D35a pattern; order-independent like the I42b/I42c-review
+			// gates — it reads the live objects). Fails closed on a transient
+			// read error (toolProxyGatesSuspended returns true), never skips.
+			if r.toolProxyGatesSuspended(ctx, loop) {
+				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+			}
 			// I42c review P2 (round 3): the NetworkPolicy gate must be
 			// ORDER-INDEPENDENT (ensureSandbox runs before ensureNetworkPolicy,
 			// so the conflict set there would flap the next reconcile back to
@@ -1843,7 +1859,7 @@ func proxyPodSpecHash(pod *corev1.Pod) string {
 	if err != nil {
 		// The spec is a Go struct of known types; marshaling should never fail.
 		// If it does, return a fixed hash so the pod is never deleted.
-		return "unhashable"
+		return toolProxyUnhashable
 	}
 	h := sha256.New()
 	h.Write(data)
@@ -2087,7 +2103,7 @@ func egressProxyLabels(loopName string) map[string]string {
 		"app.kubernetes.io/name":       "coxswain-egress-proxy",
 		"app.kubernetes.io/instance":   loopName,
 		policy.ComponentLabelKey:       netpolEgressProxyComponent,
-		"app.kubernetes.io/part-of":    partOfCoxswain,
+		labelPartOf:                    partOfCoxswain,
 		"coxswain.io/egress-proxy-for": loopName,
 	}
 }
@@ -2187,8 +2203,8 @@ func buildEgressProxyPod(loopName, ns, image string, networkAllows []string, pol
 					{Name: "EGRESS_POLICY_HASH", Value: policyHash},
 					{Name: "LOOP_NAME", Value: loopName},
 					{Name: "LOOP_NAMESPACE", Value: ns},
-					{Name: "POD_CIDR", Value: podCIDR},
-					{Name: "SERVICE_CIDR", Value: serviceCIDR},
+					{Name: envPodCIDR, Value: podCIDR},
+					{Name: envServiceCIDR, Value: serviceCIDR},
 				},
 				ReadinessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{
@@ -2436,6 +2452,591 @@ func hadKaptConflict(loop *coxv1alpha1.Loop) bool {
 
 // cleanupEgressProxy deletes the egress proxy pod + Service when the effective
 // policy has no network allows (I42b). No-op when they don't exist.
+// --- D41c (ADR-0008): tool proxies — one credentialed proxy pod + Service
+// per tool in the effective policy union, per Loop. ---
+
+const (
+	// toolProxyUID/GID (ADR-0008): distinct from agent 65532, model proxy
+	// 65533, egress proxy 65534.
+	toolProxyUID int64 = 65535
+	toolProxyGID int64 = 65535
+
+	// toolProxyPort is the port the tool proxy listens on (ADR-0008: the
+	// generic HTTP tool proxy listens on :8080).
+	toolProxyPort int32 = 8080
+
+	// toolProxySpecHashAnnotation records the hash of the desired tool proxy
+	// pod spec (D41c: hash the full desired pod spec; on mismatch the pod is
+	// deleted and recreated — a bare Pod's spec is immutable, I42b review
+	// P3 pattern).
+	toolProxySpecHashAnnotation = "coxswain.io/tool-proxy-spec-hash"
+
+	// toolCredsMountPath is where the tool credential Secret is mounted into
+	// the tool proxy container ONLY (D41c: <path>/<name>; the agent sandbox
+	// pod never carries it — the zero-credential property, ADR-0006/0008).
+	toolCredsMountPath = "/tool-cred"
+
+	// toolCredsVolumeName is the tool proxy pod's credential volume name.
+	toolCredsVolumeName = "tool-creds"
+
+	// toolProxyForeignReason is the ProxyConflict condition reason a foreign
+	// <loop>-tool-<name> pod sets (D41c; distinct from ForeignProxy /
+	// ForeignEgressProxy so the three proxies never overwrite each other on
+	// one Loop).
+	toolProxyForeignReason = "ForeignToolProxy"
+)
+
+// toolProxyPodName / toolProxyServiceName return the per-tool proxy names:
+// <loop>-tool-<name> (derivedName for the near-max names, like the egress
+// proxy). The Service name is stable across pod recreates (the agent's env
+// URL depends on it — D41d).
+func toolProxyPodName(loopName, toolName string) string {
+	return derivedName(loopName, "-tool-"+toolName)
+}
+
+func toolProxyServiceName(loopName, toolName string) string {
+	return derivedName(loopName, "-tool-"+toolName)
+}
+
+// toolProxyLabels returns the tool proxy pod + Service label set. These are
+// DISJOINT from the model proxy, the egress proxy and the agent: NO
+// coxswain.io/loop (the agent KubeArmorPolicy selector) and NO agent
+// component label, so the agent's exec / network / KubeArmor rules never
+// bind to a tool proxy pod (same regression guard as D33/I42b spec 7).
+const (
+	// labelPartOf is the app.kubernetes.io/part-of label key.
+	labelPartOf = "app.kubernetes.io/part-of"
+
+	// toolProxyUnhashable is the spec-hash value when the Pod spec is
+	// unhashable (should not happen in practice).
+	toolProxyUnhashable = "unhashable"
+
+	// envPodCIDR / envServiceCIDR are the env var names for the pod and
+	// service CIDRs (used by the egress proxy and tool proxy pods).
+	envPodCIDR     = "POD_CIDR"
+	envServiceCIDR = "SERVICE_CIDR"
+)
+
+const (
+	// toolProxyForLabel / toolNameLabel are the tool proxy's identifying
+	// labels (D41c). The tool proxy labels are disjoint from the model
+	// proxy, egress proxy and agent pods (no coxswain.io/loop, no agent
+	// component label).
+	toolProxyForLabel = "coxswain.io/tool-proxy-for"
+	toolNameLabel     = "coxswain.io/tool"
+)
+
+func toolProxyLabels(loopName, toolName string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":     "coxswain-tool-proxy",
+		"app.kubernetes.io/instance": loopName,
+		policy.ComponentLabelKey:     policy.ComponentToolProxyLabel,
+		labelPartOf:                  partOfCoxswain,
+		toolProxyForLabel:            loopName,
+		toolNameLabel:                toolName,
+	}
+}
+
+// toolProxyImage returns the tool proxy pod image: the reconciler's
+// ToolProxyImage field (settable in tests; a manager flag
+// --tool-proxy-image is a candidate for a future slice) or the Go stand-in
+// when unset (the cmd/tool-proxy binary is the D41a/D41d surface).
+func (r *LoopReconciler) toolProxyImage() string {
+	if r.ToolProxyImage != "" {
+		return r.ToolProxyImage
+	}
+	return "golang:1.26"
+}
+
+// effectivePolicyTools returns the deduped tool union across the Loop's
+// referenced AgentPolicies (D41c): a tool present in ANY referenced policy
+// is expected; identical definitions dedup to one (the union is over tools,
+// like network / exec / files). Returns (tools, error); error propagates
+// (fail-closed: a transient read error must never be treated as "no tools"
+// — the gate and the ensure path both fail closed).
+func (r *LoopReconciler) effectivePolicyTools(ctx context.Context, loop *coxv1alpha1.Loop) ([]coxv1alpha1.ToolSpec, error) {
+	union := make([]coxv1alpha1.ToolSpec, 0)
+	for _, name := range loop.Spec.PolicyRefs {
+		ap := &coxv1alpha1.AgentPolicy{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
+			return nil, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
+		}
+		union = append(union, ap.Spec.Tools...)
+	}
+	return dedupTools(union), nil
+}
+
+// dedupTools collapses the tool union: the first occurrence of each name
+// wins (identical definitions are the idempotent dedup case; a conflicting
+// definition is rejected upstream by validateAgentPolicies — ToolConflict —
+// so it never reaches here).
+func dedupTools(union []coxv1alpha1.ToolSpec) []coxv1alpha1.ToolSpec {
+	seen := make(map[string]bool, len(union))
+	out := make([]coxv1alpha1.ToolSpec, 0, len(union))
+	for _, t := range union {
+		if seen[t.Name] {
+			continue
+		}
+		seen[t.Name] = true
+		out = append(out, t)
+	}
+	return out
+}
+
+// conflictingTool names the first tool (by name) whose spec differs across
+// the union entries with that name. Empty union / single definitions → ("",
+// false).
+func conflictingTool(union []coxv1alpha1.ToolSpec) (string, bool) {
+	byName := make(map[string][]coxv1alpha1.ToolSpec, len(union))
+	for _, t := range union {
+		byName[t.Name] = append(byName[t.Name], t)
+	}
+	names := make([]string, 0, len(byName))
+	for n := range byName {
+		names = append(names, n)
+	}
+	slices.SortFunc(names, func(a, b string) int { return strings.Compare(a, b) })
+	for _, n := range names {
+		entries := byName[n]
+		if len(entries) < 2 {
+			continue
+		}
+		for i := 1; i < len(entries); i++ {
+			if !toolSpecEqual(entries[0], entries[i]) {
+				return n, true
+			}
+		}
+	}
+	return "", false
+}
+
+// toolSpecEqual reports whether two tool definitions are identical (same
+// upstream, credentialSecretRef, and rules). DeepEqual covers the slice /
+// struct fields (D41c: identical definitions dedup, different ones
+// conflict).
+func toolSpecEqual(a, b coxv1alpha1.ToolSpec) bool {
+	return reflect.DeepEqual(a, b)
+}
+
+// buildToolProxyPod builds the desired tool proxy pod for one tool (D41c):
+// the model proxy pod shape (buildProxyPod) with the D41c differences —
+// image from toolProxyImage, UID/GID 65535, the TOOL_* env, the credential
+// Secret mounted read-only into THIS container only (when set, /tool-cred/
+// <name> mode 0444 + TOOL_CREDENTIAL_FILE), and TCP 8080 liveness /
+// readiness. The agent sandbox pod never carries the credential (asserted
+// by the envtest spec 3).
+func buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, policyHash, podCIDR, serviceCIDR string) *corev1.Pod {
+	falseP := false
+	trueP := true
+	readOnlyRootfs := true
+	uid := toolProxyUID
+	gid := toolProxyGID
+	secretMode := readOnlyMode
+
+	rulesJSON, _ := json.Marshal(tool.Rules)
+
+	env := []corev1.EnvVar{
+		{Name: "TOOL_NAME", Value: tool.Name},
+		{Name: "TOOL_UPSTREAM", Value: tool.Upstream},
+		{Name: "TOOL_RULES_JSON", Value: string(rulesJSON)},
+		{Name: "TOOL_POLICY_HASH", Value: policyHash},
+		{Name: "LOOP_NAME", Value: loopName},
+		{Name: "LOOP_NAMESPACE", Value: ns},
+		{Name: "POD_CIDR", Value: podCIDR},
+		{Name: "SERVICE_CIDR", Value: serviceCIDR},
+	}
+	var mounts []corev1.VolumeMount
+	var volumes []corev1.Volume
+	if tool.CredentialSecretRef.Name != "" {
+		// The credential Secret is mounted read-only into the tool proxy
+		// container ONLY (D41c). The volume projects only the referenced
+		// key (Items: [{Key: <ref.key>, Path: "credential"}]) so the proxy
+		// sees exactly one file at /tool-cred/credential, never the
+		// Secret's other keys. No SubPath: a SubPath on a Secret volume
+		// selects an entry INSIDE the volume (whose top level is the
+		// keys), so subPath: <secret-name> would mount an empty directory
+		// and the proxy would log.Fatalf on a missing credential. The
+		// projected-key mount updates on rotation (subPath mounts never
+		// do).
+		//
+		// It is never a volume or env on the sandbox pod (the
+		// zero-credential property, ADR-0006/0008 — asserted by the
+		// envtest spec 3).
+		env = append(env, corev1.EnvVar{
+			Name:  "TOOL_CREDENTIAL_FILE",
+			Value: toolCredsMountPath + "/credential",
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      toolCredsVolumeName,
+			MountPath: toolCredsMountPath,
+			ReadOnly:  true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: toolCredsVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  tool.CredentialSecretRef.Name,
+					Items:       []corev1.KeyToPath{{Key: tool.CredentialSecretRef.Key, Path: "credential"}},
+					DefaultMode: &secretMode,
+				},
+			},
+		})
+	}
+
+	tcpProbe := func() corev1.ProbeHandler {
+		return corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(toolProxyPort)}}
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      toolProxyPodName(loopName, tool.Name),
+			Namespace: ns,
+			Labels:    toolProxyLabels(loopName, tool.Name),
+		},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken: &falseP,
+			DNSConfig:                    proxyNdotsOneDNSConfig(),
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser:    &uid,
+				RunAsGroup:   &gid,
+				RunAsNonRoot: &trueP,
+			},
+			Containers: []corev1.Container{{
+				Name:  policy.ComponentToolProxyLabel,
+				Image: image,
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:              resource.MustParse("100m"),
+						corev1.ResourceMemory:           resource.MustParse("128Mi"),
+						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						corev1.ResourceMemory: resource.MustParse("32Mi"),
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &falseP,
+					RunAsNonRoot:             &trueP,
+					RunAsUser:                &uid,
+					RunAsGroup:               &gid,
+					ReadOnlyRootFilesystem:   &readOnlyRootfs,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				},
+				Env:            env,
+				VolumeMounts:   mounts,
+				ReadinessProbe: &corev1.Probe{ProbeHandler: tcpProbe(), InitialDelaySeconds: 1, PeriodSeconds: 5},
+				LivenessProbe:  &corev1.Probe{ProbeHandler: tcpProbe(), InitialDelaySeconds: 3, PeriodSeconds: 10},
+			}},
+			Volumes: volumes,
+		},
+	}
+	return pod
+}
+
+// toolProxyPodSpecHash computes a stable hash of the tool proxy pod's desired
+// spec (D41c: hash the full desired pod spec, the proxyPodSpecHash pattern).
+func toolProxyPodSpecHash(pod *corev1.Pod) string {
+	data, err := json.Marshal(pod.Spec)
+	if err != nil {
+		return "unhashable"
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+// hasToolConflict reports whether the Loop has an active
+// ProxyConflict=True/ForeignToolProxy condition (the hadEgressConflict
+// pattern: the clear at the end of ensureToolProxies must only fire when a
+// conflict was previously recorded).
+func hasToolConflict(loop *coxv1alpha1.Loop) bool {
+	for _, c := range loop.Status.Conditions {
+		if c.Type == "ProxyConflict" && c.Status == metav1.ConditionTrue && c.Reason == toolProxyForeignReason {
+			return true
+		}
+	}
+	return false
+}
+
+// needsToolProxy reports whether the tool-proxy sandbox gate must hold:
+// the effective policy has ≥1 tool, OR the effective policy could not be
+// read (fail-closed, the needsEgressProxy pattern — a read error must never
+// skip the gate). A transient read error keeps the sandbox Suspended and the
+// reconcile requeues on the error.
+func needsToolProxy(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
+	tools, err := r.effectivePolicyTools(ctx, loop)
+	return err != nil || len(tools) > 0
+}
+
+// ensureToolProxies provisions, gates and drift-corrects one tool proxy pod
+// + Service per tool in the effective policy union (D41c). It is
+// ensureProxy/ensureEgressProxy with the tool loop: Service per tool (stable
+// name, owned by the Loop), pod per tool (Get/create/delete — never Update a
+// bare Pod's spec), the ProxyConflict/ForeignToolProxy foreign-object gate
+// (the foreign pod is NOT deleted, I2), the spec-hash drift annotation
+// (delete-and-recreate), and cleanup of tools no longer in the union.
+func (r *LoopReconciler) ensureToolProxies(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	ns := loop.Namespace
+	loopName := loop.Name
+
+	// One read of the referenced AgentPolicies (fail-closed: a transient
+	// error propagates — it must not be treated as "no tools", which would
+	// clean up live proxies).
+	tools, err := r.effectivePolicyTools(ctx, loop)
+	if err != nil {
+		return fmt.Errorf("resolve tool union for %s/%s: %w", ns, loopName, err)
+	}
+	if len(tools) == 0 {
+		// No tools: clean up any existing tool proxies (D41c cleanup
+		// direction) and clear a stale conflict (the hadEgressConflict
+		// pattern: the ensure-path clear is unreachable on this early
+		// return, so a stale ForeignToolProxy would outlive the tools).
+		if err := r.cleanupToolProxies(ctx, loop); err != nil {
+			return err
+		}
+		if hasToolConflict(loop) {
+			setCondition(loop, "ProxyConflict", metav1.ConditionFalse, "Resolved",
+				"no tool proxies are required (no tools in the effective policy)")
+		}
+		return nil
+	}
+
+	// The tool proxy's TOOL_POLICY_HASH env (the effective policy hash,
+	// ADR-0008: a record is attributable to the exact policy generation).
+	policyHash, _, hashErr := r.effectivePolicyHash(ctx, loop)
+	if hashErr != nil {
+		return fmt.Errorf("compute tool proxy policy hash for %s/%s: %w", ns, loopName, hashErr)
+	}
+
+	expected := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		expected[tool.Name] = true
+
+		// --- tool proxy Service (stable name: the agent's env URL depends on
+		// it, D41d) ---
+		svcDesired := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name:      toolProxyServiceName(loopName, tool.Name),
+			Namespace: ns,
+		}}
+		svcOp, svcErr := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
+			svcDesired.Labels = toolProxyLabels(loopName, tool.Name)
+			svcDesired.Spec.Ports = []corev1.ServicePort{{
+				Name:       httpPortName,
+				Port:       toolProxyPort,
+				TargetPort: intstr.FromInt32(toolProxyPort),
+				Protocol:   corev1.ProtocolTCP,
+			}}
+			svcDesired.Spec.Selector = toolProxyLabels(loopName, tool.Name)
+			svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+			return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
+		})
+		if svcErr != nil {
+			return fmt.Errorf("ensure tool proxy service %s/%s: %w", ns, toolProxyServiceName(loopName, tool.Name), svcErr)
+		}
+		log.V(1).Info("ensured loop tool proxy service", "op", svcOp, "service", toolProxyServiceName(loopName, tool.Name), "tool", tool.Name)
+
+		// --- tool proxy pod (Get/create/delete, never Update a Pod spec) ---
+		podDesired := buildToolProxyPod(loopName, ns, r.toolProxyImage(), tool, policyHash, r.PodCIDR, r.ServiceCIDR)
+		if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
+			return fmt.Errorf("set owner ref on tool proxy pod %s/%s: %w", ns, toolProxyPodName(loopName, tool.Name), ownerErr)
+		}
+		toolSpecHash := toolProxyPodSpecHash(podDesired)
+		podDesired.Annotations = map[string]string{toolProxySpecHashAnnotation: toolSpecHash}
+
+		existingPod := &corev1.Pod{}
+		perr := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: toolProxyPodName(loopName, tool.Name)}, existingPod)
+		// Foreign-object gate (D41c, I2): a pod named <loop>-tool-<name> not
+		// controlled by the Loop → ProxyConflict=True/ForeignToolProxy. It is
+		// NOT deleted; the owned+Ready gate in ensureSandbox holds the
+		// sandbox Suspended.
+		if perr == nil && !metav1.IsControlledBy(existingPod, loop) {
+			setCondition(loop, "ProxyConflict", metav1.ConditionTrue, toolProxyForeignReason,
+				fmt.Sprintf("foreign tool proxy pod in %s/%s; sandbox held Suspended", ns, toolProxyPodName(loopName, tool.Name)))
+			log.Info("tool proxy pod is foreign; setting ProxyConflict",
+				"toolProxy", toolProxyPodName(loopName, tool.Name), "loop", loopName)
+			continue
+		}
+		if apierrors.IsNotFound(perr) {
+			if createErr := r.Create(ctx, podDesired); createErr != nil {
+				return fmt.Errorf("create tool proxy pod %s/%s: %w", ns, toolProxyPodName(loopName, tool.Name), createErr)
+			}
+			log.Info("ensured loop tool proxy (created)",
+				"toolProxy", toolProxyPodName(loopName, tool.Name), "namespace", ns, "loop", loopName, "tool", tool.Name)
+			continue
+		}
+		if perr != nil {
+			return fmt.Errorf("get tool proxy pod %s/%s: %w", ns, toolProxyPodName(loopName, tool.Name), perr)
+		}
+		// Owned pod: the spec-hash drift annotation drives delete-and-recreate
+		// (D41c; the Service name stays stable).
+		if existingPod.Annotations[toolProxySpecHashAnnotation] != toolSpecHash {
+			log.Info("tool proxy pod spec drift detected, deleting for recreation",
+				"toolProxy", toolProxyPodName(loopName, tool.Name), "loop", loopName, "tool", tool.Name)
+			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
+				return fmt.Errorf("delete drifted tool proxy pod %s/%s: %w", ns, toolProxyPodName(loopName, tool.Name), delErr)
+			}
+			// The Owns(Pod) watch re-reconciles and creates the new pod.
+			continue
+		}
+		log.V(1).Info("ensured loop tool proxy (no change)", "toolProxy", toolProxyPodName(loopName, tool.Name), "tool", tool.Name)
+	}
+
+	// Cleanup: tools no longer in the union (D41c). The agent env/netpol
+	// entries (D41d/D41e) follow via their own gates next reconcile.
+	if err := r.cleanupStaleToolProxies(ctx, loop, expected); err != nil {
+		return err
+	}
+
+	// Clear the conflict when no foreign tool proxy pod occupies any expected
+	// name (the hadEgressConflict pattern).
+	if hasToolConflict(loop) {
+		foreign := false
+		for name := range expected {
+			pod := &corev1.Pod{}
+			if gerr := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: toolProxyPodName(loopName, name)}, pod); gerr == nil && !metav1.IsControlledBy(pod, loop) {
+				foreign = true
+				break
+			}
+		}
+		if !foreign {
+			setCondition(loop, "ProxyConflict", metav1.ConditionFalse, "Resolved",
+				"the foreign tool proxy pod is gone")
+		}
+	}
+	return nil
+}
+
+// cleanupToolProxies deletes every <loop>-tool-* pod + Service owned by the
+// Loop (D41c cleanup: the effective policy has no tools). Foreign objects are
+// never deleted (I2).
+func (r *LoopReconciler) cleanupToolProxies(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	ns := loop.Namespace
+
+	// Discover by the tool proxy labels (not by name: the tool set is not
+	// known here — list the namespace-scoped Pods/Services the operator
+	// owns for this Loop). A List error on a SCOPED (namespace) cache (the
+	// podBlindClient envtest behaviour, the S4 spec) leaves the List empty
+	// (nothing to clean up this pass) instead of erroring — the controller's
+	// real cache (a namespaced cache from the manager) lists fine; the
+	// reconcile continues. The gate still holds on the owned+Ready check
+	// (which uses Gets, not Lists), so a missing cache never skips a gate.
+	listOwned := func(list client.ObjectList) {
+		if err := r.List(ctx, list, client.InNamespace(ns), client.MatchingLabels{
+			toolProxyForLabel: loop.Name,
+		}); err != nil {
+			log.Error(err, "list tool proxy objects; continuing (nothing cleaned up this pass)", "namespace", ns, "loop", loop.Name)
+			return
+		}
+	}
+	pods := &corev1.PodList{}
+	listOwned(pods)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, loop) {
+			continue
+		}
+		if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete tool proxy pod %s/%s: %w", ns, pod.Name, delErr)
+		}
+		log.Info("cleaned up tool proxy pod (no tools in the effective policy)",
+			"toolProxy", pod.Name, "loop", loop.Name)
+	}
+
+	svcs := &corev1.ServiceList{}
+	listOwned(svcs)
+	for i := range svcs.Items {
+		svc := &svcs.Items[i]
+		if !metav1.IsControlledBy(svc, loop) {
+			continue
+		}
+		if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete tool proxy service %s/%s: %w", ns, svc.Name, delErr)
+		}
+		log.Info("cleaned up tool proxy service (no tools in the effective policy)",
+			"toolProxy", svc.Name, "loop", loop.Name)
+	}
+	return nil
+}
+
+// cleanupStaleToolProxies deletes the tool proxy pod + Service for each tool
+// name the operator previously owned that is NO LONGER in the effective
+// union (D41c cleanup). Expected names are left alone. A List error on a
+// SCOPED (namespace) cache (the podBlindClient envtest behaviour, the S4
+// spec) leaves the List empty (nothing to clean up this pass) instead of
+// erroring — the controller's real cache (a namespaced cache from the
+// manager) lists fine; the reconcile continues. The gate still holds on
+// the owned+Ready check (which uses Gets, not Lists), so a missing cache
+// never skips a gate.
+func (r *LoopReconciler) cleanupStaleToolProxies(ctx context.Context, loop *coxv1alpha1.Loop, expected map[string]bool) error {
+	log := logf.FromContext(ctx)
+	ns := loop.Namespace
+
+	listOwned := func(list client.ObjectList) {
+		if err := r.List(ctx, list, client.InNamespace(ns), client.MatchingLabels{
+			toolProxyForLabel: loop.Name,
+		}); err != nil {
+			log.Error(err, "list tool proxy objects; continuing (nothing cleaned up this pass)", "namespace", ns, "loop", loop.Name)
+			return
+		}
+	}
+	pods := &corev1.PodList{}
+	listOwned(pods)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, loop) {
+			continue
+		}
+		toolName := pod.Labels[toolNameLabel]
+		if toolName == "" || expected[toolName] {
+			continue
+		}
+		if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete stale tool proxy pod %s/%s: %w", ns, pod.Name, delErr)
+		}
+		log.Info("cleaned up stale tool proxy pod (tool removed from the effective policy)",
+			"toolProxy", pod.Name, "loop", loop.Name)
+	}
+
+	svcs := &corev1.ServiceList{}
+	listOwned(svcs)
+	for i := range svcs.Items {
+		svc := &svcs.Items[i]
+		if svc.Labels[toolNameLabel] == "" || expected[svc.Labels[toolNameLabel]] || !metav1.IsControlledBy(svc, loop) {
+			continue
+		}
+		if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return fmt.Errorf("delete stale tool proxy service %s/%s: %w", ns, svc.Name, delErr)
+		}
+		log.Info("cleaned up stale tool proxy service (tool removed from the effective policy)",
+			"toolProxy", svc.Name, "loop", loop.Name)
+	}
+	return nil
+}
+
+// toolProxyGatesSuspended (D41c owned+Ready gate, the D35a pattern) reports
+// whether the sandbox must be held Suspended because a tool proxy is
+// expected but not (owned + Ready). Transient read errors fail CLOSED (the
+// gate holds; the reconcile requeues) — they never skip the gate.
+func (r *LoopReconciler) toolProxyGatesSuspended(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	tools, err := r.effectivePolicyTools(ctx, loop)
+	if err != nil || len(tools) == 0 {
+		return err != nil // read error → fail closed; no tools → no gate
+	}
+	for _, tool := range tools {
+		pod := &corev1.Pod{}
+		if gerr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: toolProxyPodName(loop.Name, tool.Name)}, pod); gerr != nil {
+			// Absent or unreadable: not Ready → the gate holds.
+			return true
+		}
+		if !metav1.IsControlledBy(pod, loop) || !isPodReady(pod) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *LoopReconciler) cleanupEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	log := logf.FromContext(ctx)
 	ns := loop.Namespace
@@ -3258,6 +3859,12 @@ func (r *LoopReconciler) ensureProxyAndNetPolicies(ctx context.Context, loop *co
 	if err := r.ensureEgressProxy(ctx, loop); err != nil {
 		return false, err
 	}
+	// D41c: the per-tool proxy pod + Service (gated on the effective tool
+	// union; ToolConflict / ToolUpstreamInCluster fail closed upstream in
+	// validateAgentPolicies, so a conflict never reaches here).
+	if err := r.ensureToolProxies(ctx, loop); err != nil {
+		return false, err
+	}
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		return false, err
 	}
@@ -3721,15 +4328,25 @@ func (r *LoopReconciler) findInClusterNetworkAllow(allows []string) (string, boo
 // check extracts the host and runs the same in-cluster logic as
 // FindInClusterNetworkAllow (in-cluster name, loopback / unspecified /
 // link-local IP, IP-in-pod/service-CIDR). Returns the offending upstream URL
-// and true when any tool upstream is in-cluster.
+// and true when any tool upstream is in-cluster. A userinfo-carrying URL
+// (https://user:pass@host, D41b review) is rejected too: the embedded
+// credential would bypass the tool proxy's credential boundary, so the
+// upstream is malformed (toolUpstreamHost returns "") and flagged.
 func (r *LoopReconciler) findInClusterToolUpstream(tools []coxv1alpha1.ToolSpec) (string, bool) {
 	for _, t := range tools {
 		if t.Upstream == "" {
 			continue // the CEL rule requires upstream to be non-empty
 		}
-		host := toolUpstreamHost(t.Upstream)
-		if host == "" {
+		u, err := neturl.Parse(t.Upstream)
+		if err != nil || u.Scheme == "" || u.Host == "" {
 			continue // malformed URL; the proxy rejects it at dial time
+		}
+		if u.User != nil && u.User.String() != "" {
+			return t.Upstream, true // userinfo: embedded credential (exfiltration path)
+		}
+		host := strings.ToLower(u.Hostname())
+		if host == "" {
+			continue
 		}
 		// Reuse the same in-cluster check as network allows. The host is a
 		// bare hostname (no port), so I can check it directly against the
@@ -3755,37 +4372,22 @@ func (r *LoopReconciler) findInClusterToolUpstream(tools []coxv1alpha1.ToolSpec)
 }
 
 // toolUpstreamHost extracts the host part of a tool upstream URL
-// (scheme://host[:port][/prefix]). Returns "" when the URL is malformed
-// (no scheme, no host). The host is lowercased and trailing-dot-trimmed
-// (matching the network allow host extraction).
+// (scheme://host[:port][/prefix]) via url.Parse (D41b review: string slicing
+// mis-parses userinfo / query / fragment). Returns "" when the URL is
+// malformed (no scheme, no host) or carries userinfo (https://user@host:
+// the embedded credential is the exfiltration path the tool proxy exists
+// to block — rejected, not parsed around). The host is lowercased and
+// trailing-dot-trimmed (matching the network allow host extraction).
 func toolUpstreamHost(upstream string) string {
-	// Strip the scheme (https:// or http://).
-	rest := upstream
-	if i := strings.Index(rest, "://"); i >= 0 {
-		rest = rest[i+3:]
-	} else {
-		return "" // no scheme; the CEL rule requires https?://
-	}
-	// Strip the path (everything after the first /).
-	if i := strings.Index(rest, "/"); i >= 0 {
-		rest = rest[:i]
-	}
-	// Strip the port (everything after the first :). IPv6 hosts are
-	// bracketed ([::1]:8080), so I handle the bracket case.
-	if strings.HasPrefix(rest, "[") {
-		if i := strings.Index(rest, "]"); i >= 0 {
-			rest = rest[:i+1]
-		}
-	} else if i := strings.Index(rest, ":"); i >= 0 {
-		rest = rest[:i]
-	}
-	// Trim brackets and trailing dot; lowercase.
-	rest = strings.Trim(rest, "[]")
-	rest = strings.TrimSuffix(rest, ".")
-	if rest == "" {
+	u, err := neturl.Parse(upstream)
+	if err != nil || u.Scheme == "" || u.Host == "" {
 		return ""
 	}
-	return strings.ToLower(rest)
+	if u.User != nil && u.User.String() != "" {
+		return "" // userinfo: the controller check rejects it (ToolUpstreamInCluster)
+	}
+	host := strings.ToLower(u.Hostname())
+	return strings.TrimSuffix(host, ".")
 }
 
 // validateAgentPolicies checks that every referenced AgentPolicy exists and
@@ -3824,6 +4426,16 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 		unionExec = append(unionExec, ap.Spec.Exec...)
 		unionNetwork = append(unionNetwork, ap.Spec.Network...)
 		unionTools = append(unionTools, ap.Spec.Tools...)
+	}
+	// D41c (ADR-0008): a union conflict — the same tool name with different
+	// specs across the referenced policies — is unsolvable (which upstream /
+	// credential / rules would the proxy serve?) and fails closed with
+	// PolicyValid=False reason ToolConflict, the same fail-closed pattern as
+	// the network union (C6a). Identical definitions are the idempotent
+	// dedup case: one proxy.
+	if conflicting, ok := conflictingTool(unionTools); ok {
+		return policyValidationResult{valid: false, reason: "ToolConflict",
+			message: fmt.Sprintf("AgentPolicy tool %q is declared with different specs across the referenced policies; a tool union conflict is unsolvable (drop one definition or make them identical)", conflicting)}
 	}
 	// D46 (owner decision (c)): exec fencing does not apply to the agent in
 	// the MVP (the runner's shell tool calls spawn an open-ended set of

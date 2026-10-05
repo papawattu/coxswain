@@ -317,13 +317,17 @@ sleep 2
 # (docker exec, python3 — python:3-alpine has no wget; the node's python3 is
 # used, a host-side check of the hostNetwork pod's listen socket) — a probe
 # pod would add scheduling latency.
+# The node's python3 is the dial (a host-side check of the hostNetwork
+# pod's listen socket; python:3-alpine has no wget, so the node's own
+# python3 is used).
+NODE_DIAL="python3 -c 'import urllib.request,sys; urllib.request.urlopen(sys.argv[1], timeout=3).read()' http://${UPSTREAM_NODE_IP}:80/ok"
 for i in $(seq 1 30); do
-  if docker exec "$NODE_CONTAINER" sh -c "python3 -c 'import urllib.request; urllib.request.urlopen("http://${UPSTREAM_NODE_IP}:80/ok", timeout=3).read()' 2>/dev/null"; then
+  if docker exec "$NODE_CONTAINER" sh -c "$NODE_DIAL" 2>/dev/null; then
     break
   fi
   sleep 1
 done
-if ! docker exec "$NODE_CONTAINER" sh -c "python3 -c 'import urllib.request; urllib.request.urlopen("http://${UPSTREAM_NODE_IP}:80/ok", timeout=3).read()'" 2>/dev/null; then
+if ! docker exec "$NODE_CONTAINER" sh -c "$NODE_DIAL" 2>/dev/null; then
   echo "FATAL: the upstream listener is not answering at ${UPSTREAM_NODE_IP}:80 (node-side check)"
   exit 2
 fi

@@ -314,15 +314,19 @@ K -n "$NS" exec "$UPSTREAM_POD" -- sh -c ': > /tmp/upstream.log && nohup python3
 sleep 2
 # Wait for the listener to bind :80 on the node (the pod is hostNetwork, so
 # the listen socket is on the node's namespace). Poll from the node directly
-# (docker exec) — a probe pod would add scheduling latency.
+# (docker exec, python3 — python:3-alpine has no wget; the node's python3 is
+# used, a host-side check of the hostNetwork pod's listen socket) — a probe
+# pod would add scheduling latency.
 for i in $(seq 1 30); do
-  if docker exec "$NODE_CONTAINER" sh -c "wget -q -O /dev/null --timeout=2 http://${UPSTREAM_NODE_IP}:80/ok" 2>/dev/null; then
+  if docker exec "$NODE_CONTAINER" sh -c "python3 -c 'import urllib.request; urllib.request.urlopen("http://${UPSTREAM_NODE_IP}:80/ok", timeout=3).read()' 2>/dev/null"; then
     break
   fi
   sleep 1
 done
-docker exec "$NODE_CONTAINER" sh -c "wget -q -O /dev/null --timeout=3 http://${UPSTREAM_NODE_IP}:80/ok" 2>/dev/null \
-  || { echo "FATAL: the upstream listener is not answering at ${UPSTREAM_NODE_IP}:80 (node-side check)"; exit 2; }
+if ! docker exec "$NODE_CONTAINER" sh -c "python3 -c 'import urllib.request; urllib.request.urlopen("http://${UPSTREAM_NODE_IP}:80/ok", timeout=3).read()'" 2>/dev/null; then
+  echo "FATAL: the upstream listener is not answering at ${UPSTREAM_NODE_IP}:80 (node-side check)"
+  exit 2
+fi
 echo "   upstream listener answering at ${UPSTREAM_NODE_IP}:80 (node-side check)"
 # Verify from a hostNetwork busybox pod (a PLAIN pod would route 172.21.0.x
 # via the node's egress, which does NOT have the kind-bridge address in its

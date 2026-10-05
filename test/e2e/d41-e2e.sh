@@ -103,6 +103,12 @@ IMG="coxswain-controller:${IMG_TAG}"
 # this slice) is set to this via the temp dev overlay; the e2e builds and
 # kind-loads it (the i42-e2e stand-in image pattern).
 TOOL_IMG="coxswain-tool-proxy:standin"
+# The D41e 4c connect-probe image: a tiny static Go net.DialTimeout probe
+# built to /usr/local/bin/tool-proxy on distroless (UID 65535, matching the
+# real tool-proxy), so the tool proxy's KubeArmorPolicy process allowlist
+# (which permits ONLY /usr/local/bin/tool-proxy) permits the labeled fence pod
+# to run it. It is NOT the real tool-proxy.
+PROBE_IMG="coxswain-tool-proxy:probe"
 BUSYBOX_IMG="busybox:1.36"
 AGENT_IMG="golang:1.26"
 UPSTREAM_IMG="python:3-alpine"
@@ -197,11 +203,13 @@ echo "   building controller image $IMG ..."
 (cd "$REPO_ROOT" && docker build -q -t "$IMG" -f Dockerfile .) || { echo "FATAL: controller build failed"; exit 2; }
 echo "   building tool-proxy image $TOOL_IMG ..."
 (cd "$REPO_ROOT" && docker build -q -t "$TOOL_IMG" -f cmd/tool-proxy/Dockerfile .) || { echo "FATAL: tool-proxy build failed"; exit 2; }
+echo "   building 4c connect-probe image $PROBE_IMG ..."
+(cd "$REPO_ROOT/test/e2e/probe" && docker build -q -t "$PROBE_IMG" .) || { echo "FATAL: probe build failed"; exit 2; }
 IMG_DIGEST="$(docker image inspect "$IMG" --format '{{.Id}}' 2>/dev/null)"
 TOOL_DIGEST="$(docker image inspect "$TOOL_IMG" --format '{{.Id}}' 2>/dev/null)"
 echo "   controller image digest: $IMG_DIGEST"
   echo "   tool-proxy image digest: $TOOL_DIGEST"
-for img in "$IMG" "$TOOL_IMG" "$BUSYBOX_IMG"; do
+for img in "$IMG" "$TOOL_IMG" "$PROBE_IMG" "$BUSYBOX_IMG"; do
   echo "   kind load: $img"
   kind load docker-image "$img" --name "$CLUSTER" || { echo "FATAL: kind load $img failed"; exit 2; }
 done
@@ -761,13 +769,28 @@ for i in $(seq 1 10); do
   NETPOL_SELECTOR_JSON=$(K -n "$NS" get netpol "$NETPOL" -o jsonpath='{.spec.podSelector.matchLabels}' 2>/dev/null)
   sleep 2
 done
-FENCE_POD="d41-fence"
-# The fence pod carries the tool proxy's labels (the same podSelector the
-# tool proxy netpol matches), so the netpol selects it. The postStart hook
-# attempts a raw connect to the agent pod IP and to the upstream on a
-# non-upstream port (busybox nc -w 3, timeout 5); the exit codes are
-# written to /tmp/fence.out (a non-zero exit means the connect was
-# refused / timed out — the expected outcome).
+# 4c (reviewer R23 note 5): a LIVE blocked connect from the tool proxy's
+# network position, using a faithful connect-probe. The tool proxy's
+# KubeArmorPolicy process allowlist permits ONLY /usr/local/bin/tool-proxy, so
+# a labeled stand-in "fence" pod can run only that binary. The probe
+# ($PROBE_IMG) is a tiny static Go net.DialTimeout connect-probe built to that
+# exact path (distroless, UID 65535 — matching the real tool-proxy), so the
+# allowlist permits it. The fence pod carries the tool proxy's FULL label set
+# (the netpol's podSelector), image $PROBE_IMG, and command
+# ["/usr/local/bin/tool-proxy", <host>, <port>]. The probe dials host:port and
+# prints "connected" (exit 0) or an error (exit 1).
+#
+# Four checks, each a separate fence pod (the probe exits after one dial):
+#   (a) agent pod IP:8080            -> FAIL  (the netpol pod-CIDR carve-out refuses it)
+#   (b) upstream IP:81 (non-upstream) -> FAIL  (the netpol allows the external IP, but the upstream container only listens on :80, so :81 is refused)
+#   (c) a DNS name to a non-upstream external host -> FAIL (the connect to an unroutable / non-upstream external host fails at the network layer)
+#   (d) upstream IP:80 (control)      -> SUCCEED (the upstream is live on :80; proves the probe works, so the failures mean something)
+#
+# A check is NEVER reported as PASS if the probe did not run (the fence pod
+# never produced output) — it is reported as NOT RUN.
+FENCE_BASE="d41-fence"
+# Build the fence pod's label YAML from the netpol's podSelector matchLabels
+# (the tool proxy's FULL label set, so the netpol's podSelector matches).
 LABELS_YAML=""
 if [ -n "$NETPOL_SELECTOR_JSON" ]; then
   LABELS_YAML=$(echo "$NETPOL_SELECTOR_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join("    %s: %s" % (k,v) for k,v in d.items()))' 2>/dev/null)
@@ -776,73 +799,96 @@ if [ -z "$LABELS_YAML" ]; then
   echo "FATAL: could not read the tool proxy netpol podSelector (the fence pod cannot be labelled)"
   exit 2
 fi
-cat > "$TMPDIR/fence-pod.yaml" <<EOF
+probe_connect() {
+  # probe_connect <name> <host> <port> -> sets PROBE_RESULT="connected"|"error: ..." and PROBE_RC
+  local name="$1" host="$2" port="$3"
+  local pod="${FENCE_BASE}-${name}"
+  local apply_err=""
+  PROBE_RESULT=""
+  PROBE_RC=""
+  K -n "$NS" delete pod "$pod" --ignore-not-found --timeout=15s 2>/dev/null || true
+  sleep 1
+  cat > "$TMPDIR/fence-${name}.yaml" <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: ${FENCE_POD}
+  name: ${pod}
   namespace: ${NS}
   labels:
 ${LABELS_YAML}
 spec:
   containers:
     - name: fence
-      image: ${BUSYBOX_IMG}
-      # The main command (not a postStart hook) does the blocked-connect check
-      # and writes the result, then sleeps. A postStart hook is fragile here: it
-      # races the main process and the pod can complete before the hook writes
-      # its output. Running the check as the main command keeps the pod Running
-      # (so /tmp/fence.out is readable via exec) until the e2e reads it.
+      image: ${PROBE_IMG}
       command:
-        - sh
-        - -c
-        - |
-          nc -w 3 ${AGENT_POD_IP} 9999 >/dev/null 2>&1
-          echo "fence-agent-exit=$?" > /tmp/fence.out
-          sleep 3600
+        - /usr/local/bin/tool-proxy
+        - "${host}"
+        - "${port}"
   restartPolicy: Never
 EOF
-K -n "$NS" delete pod "$FENCE_POD" --ignore-not-found --timeout=15s 2>/dev/null || true
-sleep 1
-K apply -f "$TMPDIR/fence-pod.yaml" >/dev/null || echo "   (fence pod apply failed; the 4c live check is skipped)"
-for i in $(seq 1 30); do
-  FP=$(K -n "$NS" get pod "$FENCE_POD" -o jsonpath='{.status.phase}' 2>/dev/null)
-  [ "$FP" = "Running" ] && break
-  sleep 2
-done
-# Wait for the postStart hook to complete (writes /tmp/fence.out).
-FENCE_OUT=""
-for i in $(seq 1 10); do
-  FENCE_OUT=$(K -n "$NS" exec "$FENCE_POD" -- sh -c 'cat /tmp/fence.out 2>/dev/null' 2>/dev/null || true)
-  [ -n "$FENCE_OUT" ] && break
-  sleep 1
-done
-echo "   fence pod output: $FENCE_OUT"
-if [ -n "$FENCE_OUT" ]; then
-  if echo "$FENCE_OUT" | grep -q 'fence-agent-exit=0'; then
-    bad "assertion 4c: a raw connect from the tool proxy's network position to the agent pod IP ($AGENT_POD_IP) SUCCEEDED (the netpol must refuse it)"
-  else
-    ok "assertion 4c: a raw connect from the tool proxy's network position to the agent pod IP ($AGENT_POD_IP) was refused / timed out (the netpol pod-CIDR carve-out blocks it)"
+  apply_err=$(K apply -f "$TMPDIR/fence-${name}.yaml" 2>&1 >/dev/null)
+  if [ -n "$apply_err" ]; then
+    echo "   (fence pod ${name} apply failed: $apply_err)"
+    return 1
   fi
-  # The upstream (${UPSTREAM_NODE_IP}, 198.18/15 RFC 2544) is EXTERNAL (in
-  # no carve-out), so the netpol permits connects to it on ALL ports (the
-  # tool-proxy external egress has no port restriction — the request
-  # restriction is at the application layer). The live blocked-connect proof
-  # is the in-cluster agent pod IP (carved out by podCIDR) above.
+  # The probe exits after the single dial (connected -> 0, refused -> 1). Wait
+  # for the pod to reach a terminal phase (Succeeded/Failed).
+  local phase=""
+  for i in $(seq 1 20); do
+    phase=$(K -n "$NS" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null)
+    if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then break; fi
+    sleep 2
+  done
+  PROBE_RESULT=$(K -n "$NS" logs "$pod" 2>/dev/null || true)
+  PROBE_RC=$(K -n "$NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null)
+  K -n "$NS" delete pod "$pod" --ignore-not-found --wait=false 2>/dev/null || true
+  echo "   probe ${name}: host=${host} port=${port} phase=${phase} rc=${PROBE_RC} result=[$PROBE_RESULT]"
+  return 0
+}
+# (a) agent pod IP:8080 must FAIL (netpol pod-CIDR carve-out)
+probe_connect a "$AGENT_POD_IP" 8080
+if [ -z "$PROBE_RESULT" ]; then
+  echo "   NOT RUN: assertion 4c(a): the probe produced no output (the live blocked-connect could not run)"
 else
-  # The fence pod (carrying the tool proxy's labels, so the netpol's
-  # podSelector matches) is also selected by the tool proxy's KubeArmorPolicy,
-  # whose process allowlist permits ONLY /usr/local/bin/tool-proxy. Every other
-  # process (sh, nc, the kubectl exec) is denied, so the stand-in pod cannot run
-  # the live blocked-connect check nor be exec'd into. The netpol's egress
-  # shape (assertion 4a: the ipBlock carve-out with the pod-CIDR except-list)
-  # is the authoritative network-layer proof that a connect to the agent pod IP
-  # is refused; the 4c live check is supplementary / best-effort and is noted
-  # (not gated) when the KubeArmorPolicy's process allowlist blocks it.
-  ok "assertion 4c (supplementary, noted not gated): the live blocked-connect could not run — the tool proxy KubeArmorPolicy's process allowlist (only /usr/local/bin/tool-proxy) blocks the stand-in pod's sh/nc/exec. The netpol egress shape (4a, the ipBlock carve-out + pod-CIDR except-list) is the authoritative proof the agent pod IP is refused."
+  if echo "$PROBE_RESULT" | grep -q '^connected$'; then
+    bad "assertion 4c(a): a connect from the tool proxy's network position to the agent pod IP ($AGENT_POD_IP):8080 SUCCEEDED (the netpol pod-CIDR carve-out must refuse it)"
+  else
+    ok "assertion 4c(a): a connect from the tool proxy's network position to the agent pod IP ($AGENT_POD_IP):8080 was refused (the netpol pod-CIDR carve-out blocks it): $PROBE_RESULT"
+  fi
 fi
-K -n "$NS" delete pod "$FENCE_POD" --ignore-not-found --wait=false 2>/dev/null || true
-K -n "$NS" delete pod "$FENCE_POD" --ignore-not-found --wait=false 2>/dev/null || true
+# (b) upstream IP:81 (non-upstream port) must FAIL (the upstream only listens on :80)
+probe_connect b "$UPSTREAM_NODE_IP" 81
+if [ -z "$PROBE_RESULT" ]; then
+  echo "   NOT RUN: assertion 4c(b): the probe produced no output (the live blocked-connect could not run)"
+else
+  if echo "$PROBE_RESULT" | grep -q '^connected$'; then
+    bad "assertion 4c(b): a connect from the tool proxy's network position to the upstream IP ($UPSTREAM_NODE_IP):81 SUCCEEDED (the upstream only serves :80; a non-upstream port must be refused)"
+  else
+    ok "assertion 4c(b): a connect from the tool proxy's network position to the upstream IP ($UPSTREAM_NODE_IP):81 (a non-upstream port) was refused: $PROBE_RESULT"
+  fi
+fi
+# (c) a DNS name to a non-upstream external host must FAIL (network-layer refusal / unroutable)
+probe_connect c "non-upstream-external.invalid" 80
+if [ -z "$PROBE_RESULT" ]; then
+  echo "   NOT RUN: assertion 4c(c): the probe produced no output (the live blocked-connect could not run)"
+else
+  if echo "$PROBE_RESULT" | grep -q '^connected$'; then
+    bad "assertion 4c(c): a connect from the tool proxy's network position to a non-upstream external host SUCCEEDED (a non-upstream external host must not be reachable)"
+  else
+    ok "assertion 4c(c): a connect from the tool proxy's network position to a non-upstream external host (non-upstream-external.invalid:80) was refused / failed: $PROBE_RESULT"
+  fi
+fi
+# (d) control: upstream IP:80 must SUCCEED (the upstream is live on :80; proves the probe works)
+probe_connect d "$UPSTREAM_NODE_IP" 80
+if [ -z "$PROBE_RESULT" ]; then
+  echo "   NOT RUN: assertion 4c(d): the probe produced no output (the control connect could not run) — the 4c(a-c) failures are UNVERIFIED"
+else
+  if echo "$PROBE_RESULT" | grep -q '^connected$'; then
+    ok "assertion 4c(d): control — a connect from the tool proxy's network position to the upstream IP ($UPSTREAM_NODE_IP):80 SUCCEEDED (the upstream is live; the probe works, so the 4c(a-c) refusals are meaningful)"
+  else
+    bad "assertion 4c(d): control FAILED — a connect to the upstream IP ($UPSTREAM_NODE_IP):80 did NOT succeed (the upstream is not live, or the probe is broken; the 4c(a-c) failures are UNVERIFIED): $PROBE_RESULT"
+  fi
+fi
 
 # Each 4a/4b/4c attempt must NOT have left a successful upstream-side log line
 # for a disallowed / in-cluster request.

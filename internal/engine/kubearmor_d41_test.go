@@ -169,23 +169,3 @@ func TestAgentKaptNoToolProxyFQDNWhenNoTools(t *testing.T) {
 		}
 	}
 }
-
-// Spec 9: the tool proxy policy is CREATED by the enforcer when the effective
-// policy has tools, and CLEANED UP when the tools go away.
-func TestEnforcerCreatesAndCleansUpToolKapt(t *testing.T) {
-	// The full enforcer create/cleanup test requires the Kapt CRD in the
-	// fake client (not trivially set up). The emitter-level tests above
-	// (specs 1-8) verify the policy shape; the create/cleanup behaviour is
-	// covered by the envtest suite.
-}
-
-// Spec 10: a FOREIGN tool proxy KubeArmorPolicy occupying the name is NEVER
-// overwritten (the same I2 never-take-over rule as the egress proxy Kapt).
-func TestEnforcerDoesNotTakeOverForeignToolKapt(t *testing.T) {
-	// The foreign-object test requires the full enforcer + fake client with
-	// the Kapt CRD. The emitter-level tests verify the policy shape; the
-	// foreign-object behaviour is covered by the envtest suite (the D41c
-	// specs already test the foreign pod gate; the Kapt foreign-object gate
-	// uses the same createOrUpdateKapt code path as the egress proxy Kapt,
-	// which is already tested in kubearmor_i42_test.go).
-}

@@ -139,17 +139,16 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// --- the read + delta (item 2, P1-B) ---
 	// No model -> no proxy pod -> no read; the token/cost caps are inert (the
 	// wall clock still applies, spec 9).
+	// The token/cost caps are inert without a model (no proxy pod, no read —
+	// spec 9); the wall clock (above) still applies. A read failure (the
+	// proxy pod not Ready, the dial refused, the pod absent) leaves
+	// status.budget UNCHANGED (no reset, no delta — the operator does not
+	// guess; the decision is on the last SUCCESSFUL read, never an estimate).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
-		reading, err := r.resolveProxyUsageRead(ctx, loop)
-		if err != nil || reading == nil {
-			// A read failure (the proxy pod not Ready, the dial refused, the
-			// pod absent): status.budget is UNCHANGED (no reset, no delta — the
-			// operator does not guess; the decision is on the last SUCCESSFUL
-			// read, never an estimate).
-			return budgetRequeue, nil
-		}
-		if err := r.applyUsageReading(ctx, loop, *reading); err != nil {
-			return 0, err
+		if reading, err := r.resolveProxyUsageRead(ctx, loop); err == nil && reading != nil {
+			if err := r.applyUsageReading(ctx, loop, *reading); err != nil {
+				return 0, err
+			}
 		}
 	}
 

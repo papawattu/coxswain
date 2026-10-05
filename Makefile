@@ -195,6 +195,10 @@ i42-e2e: ## Run the full I42 acceptance kind e2e (pinned to --context kind-coxsw
 d41-e2e: ## Run the full D41e kind acceptance (per-tool proxies) kind e2e (pinned to --context kind-coxswain-dev).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/d41-e2e.sh
 
+.PHONY: p2b-e2e
+p2b-e2e: ## Run the P2b kind acceptance (the metering model proxy: dial success/blocks, usage endpoint, netpol, image digests) kind e2e (pinned to --context kind-coxswain-dev). Logs to .samples/p2b/.
+	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/p2b-e2e.sh
+
 .PHONY: verify-cni
 verify-cni: ## D38 preflight: check the CURRENT cluster's CNI polices pod -> host-network egress (K8S_CONTEXT=<ctx> to target another context; default = current kubectl context). Works on a cluster WITHOUT coxswain installed; creates only a temp namespace + NetworkPolicy + probe pod and always deletes them. Exits non-zero on FAIL.
 	@bash test/e2e/verify-cni.sh

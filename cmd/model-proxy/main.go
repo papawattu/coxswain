@@ -41,6 +41,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -75,39 +76,33 @@ func main() {
 	}
 
 	modelCredFile := os.Getenv("MODEL_CRED_FILE")
-	credDir := ""
-	if modelCredFile == "" {
-		// Default: the mounted Secret directory (the proxy-standin convention).
-		credDir = "/model-creds"
-	} else {
-		// The file may be a direct file or inside a Secret mount directory.
-		// ReadModelCreds reads every regular file under a dir; if MODEL_CRED_FILE
-		// points at a file, its parent is the dir. If the parent is the Secret
-		// mount (..data is skipped), the key is under a subdir.
-		credDir = modelCredFile
-		if isDir(credDir) {
-			// Treat as a directory to scan.
+	var credential string
+	var credErr error
+	if modelCredFile != "" {
+		// The operator sets MODEL_CRED_FILE to the exact key file in the mounted
+		// model-creds Secret (e.g. /model-creds/.data/model-key — the Kubernetes
+		// atomic Secret-mount dir). Read that file directly; the credential is
+		// never part of any other path. This honours the operator's proxy-creds
+		// contract (the stand-in instead scanned /model-creds for any regular
+		// file; the metering proxy reads the named key).
+		credBytes, err := os.ReadFile(modelCredFile)
+		if err != nil {
+			credErr = err
 		} else {
-			// A file path: scan its parent (the Secret mount) for the key.
-			idx := len(credDir)
-			for i := len(credDir) - 1; i >= 0; i-- {
-				if credDir[i] == '/' {
-					idx = i
-					break
-				}
-			}
-			credDir = credDir[:idx]
-			if credDir == "" {
-				credDir = "/"
+			credential = strings.TrimRight(string(credBytes), "\n")
+			if credential == "" {
+				credErr = errString("model-creds key file is empty")
 			}
 		}
+	} else {
+		// Default: the mounted Secret directory (the proxy-standin convention).
+		credential, credErr = proxy.ReadModelCreds("/model-creds")
 	}
-	credential, err := proxy.ReadModelCreds(credDir)
-	if err != nil {
+	if credErr != nil {
 		// A missing/unreadable model-creds Secret: the proxy CANNOT run (it has
 		// no credential) and MUST exit 1 (D33: the agent would be left
 		// un-credentialed). The operator recreates the pod on a Secret change.
-		log.Fatalf("model-creds Secret not found at %s (exit 1): %v", credDir, err)
+		log.Fatalf("model-creds Secret not found at %s (exit 1): %v", modelCredFile, credErr)
 	}
 
 	// --- the meter (the cumulative counters + bootID, persisted atomically) ---
@@ -178,9 +173,8 @@ func main() {
 	_ = usageSrv.Shutdown(shutdownCtx)
 }
 
-// isDir reports whether path is a directory (the MODEL_CRED_FILE may be a file
-// or a directory to scan for the key).
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
-}
+// errString is a tiny error type so the metering proxy's cred-read error is
+// distinct from a sentinel (the log.Fatalf message names the path it tried).
+type errString string
+
+func (e errString) Error() string { return string(e) }

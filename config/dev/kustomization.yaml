@@ -45,3 +45,14 @@ patches:
           value: "10.244.0.0/16"
         - name: SERVICE_CIDR
           value: "10.96.0.0/12"
+        # P2b (ADR-0009): the operator's own namespace, injected via the
+        # downward API. The --operator-namespace flag defaults to this when
+        # unset (cmd/main.go); it drives the <loop>-proxy NetworkPolicy's
+        # usage-port (9090) ingress (allowed ONLY from the operator namespace /
+        # controller-manager) and the operator's usage reader. (The dev overlay
+        # REPLACES the manager container env — the base manifest carries no env
+        # — so POD_NAMESPACE must be added here, not in config/manager.)
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace

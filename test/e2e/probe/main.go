@@ -39,6 +39,10 @@ func main() {
 		fmt.Printf("error: %v\n", err)
 		os.Exit(1)
 	}
-	conn.Close()
+	// The dial is the point; a close error after a successful dial is not a
+	// connection failure. Checked to satisfy errcheck.
+	if cerr := conn.Close(); cerr != nil {
+		fmt.Fprintf(os.Stderr, "close: %v\n", cerr)
+	}
 	fmt.Println("connected")
 }

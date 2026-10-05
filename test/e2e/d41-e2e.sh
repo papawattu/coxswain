@@ -280,13 +280,14 @@ docker network connect "$UPSTREAM_NET" "$NODE_CONTAINER" 2>/dev/null   || { echo
 # reaches it at the bridge IP via the attached control-plane container.
 UPSTREAM_CONT="d41-upstream-cont"
 docker rm -f "$UPSTREAM_CONT" >/dev/null 2>&1 || true
+# Run the upstream container (python:3-alpine) on the bridge with a sleep
+# entrypoint (the listener is docker cp'd in after start and nohup'd).
 docker run -d --name "$UPSTREAM_CONT" --network "$UPSTREAM_NET" \
-  --entrypoint sh python:3-alpine -c "
-    cp /dev/stdin /usr/local/bin/upstream-server.py 2>/dev/null || true
-  " < "$UPSTREAM_SCRIPT" >/dev/null 2>&1 || { echo "FATAL: could not start the upstream container"; exit 2; }
-# Write the listener into the container (docker cp), then start it.
+  --entrypoint sh python:3-alpine -c "sleep 3600" >/dev/null 2>&1 \
+  || { echo "FATAL: could not start the upstream container"; exit 2; }
+sleep 1
+# Write the listener into the container (docker cp), then start it (nohup).
 docker cp "$UPSTREAM_SCRIPT" "$UPSTREAM_CONT:/usr/local/bin/upstream-server.py" 2>/dev/null   || { echo "FATAL: could not docker cp the upstream listener"; exit 2; }
-# Start the listener inside the container (docker exec, nohup).
 docker exec "$UPSTREAM_CONT" sh -c ': > /tmp/upstream.log && nohup python3 /usr/local/bin/upstream-server.py > /tmp/upstream.log 2>&1 & echo started' 2>/dev/null   || { echo "FATAL: could not start the upstream listener"; exit 2; }
 # The upstream IP is the container's bridge address.
 UPSTREAM_NODE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$UPSTREAM_CONT" 2>/dev/null | grep -E '^[0-9.]+' | head -1)

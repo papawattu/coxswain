@@ -41,3 +41,6 @@ go.work
 
 # S5b sample-run evidence (machine-generated, per-run)
 /.samples/
+
+# Project knowledge index (local/dev-box state; never committed)
+/.gnosis/

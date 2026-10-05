@@ -806,8 +806,8 @@ done
 #
 # Four checks, each a separate fence pod (the probe exits after one dial):
 #   (a) agent pod IP:8080            -> FAIL  (the netpol pod-CIDR carve-out refuses it)
-#   (b) upstream IP:81 (non-upstream) -> FAIL  (the netpol allows the external IP, but the upstream container only listens on :80, so :81 is refused)
-#   (c) a DNS name to a non-upstream external host -> FAIL (the connect to an unroutable / non-upstream external host fails at the network layer)
+#   (b) upstream IP:81 (non-upstream) -> FAIL  (the upstream host has no listener on :81 — it serves only :80 — so the dial is refused; the netpol permits the external IP)
+#   (c) real external host example.com:80 -> FAIL (the netpol ipBlock carve-out blocks a connect to a non-upstream external host; example.com is a real, resolvable public name, so a successful connect would prove the fence is broken)
 #   (d) upstream IP:80 (control)      -> SUCCEED (the upstream is live on :80; proves the probe works, so the failures mean something)
 #
 # A check is NEVER reported as PASS if the probe did not run (the fence pod
@@ -888,18 +888,24 @@ else
   if echo "$PROBE_RESULT" | grep -q '^connected$'; then
     bad "assertion 4c(b): a connect from the tool proxy's network position to the upstream IP ($UPSTREAM_NODE_IP):81 SUCCEEDED (the upstream only serves :80; a non-upstream port must be refused)"
   else
-    ok "assertion 4c(b): a connect from the tool proxy's network position to the upstream IP ($UPSTREAM_NODE_IP):81 (a non-upstream port) was refused: $PROBE_RESULT"
+    ok "assertion 4c(b): a connect from the tool proxy's network position to the upstream IP ($UPSTREAM_NODE_IP):81 (a non-upstream port) was refused — the upstream host has no listener on :81 (it serves only :80), so the dial fails: $PROBE_RESULT"
   fi
 fi
-# (c) a DNS name to a non-upstream external host must FAIL (network-layer refusal / unroutable)
-probe_connect c "non-upstream-external.invalid" 80
+# (c) a real, resolvable public name (example.com:80) must be DENIED from the
+# tool proxy's network position. The tool proxy's netpol egress is ipBlock-
+# scoped to the upstream carve-out (plus platform DNS); a connect to any other
+# external host — even a real, resolvable public name — must be refused at the
+# network layer. (An .invalid name is NOT a faithful check: it fails at DNS
+# resolution, not at the network fence. example.com resolves, so a successful
+# connect would prove the fence is broken.)
+probe_connect c "example.com" 80
 if [ -z "$PROBE_RESULT" ]; then
   echo "   NOT RUN: assertion 4c(c): the probe produced no output (the live blocked-connect could not run)"
 else
   if echo "$PROBE_RESULT" | grep -q '^connected$'; then
-    bad "assertion 4c(c): a connect from the tool proxy's network position to a non-upstream external host SUCCEEDED (a non-upstream external host must not be reachable)"
+    bad "assertion 4c(c): a connect from the tool proxy's network position to the real external host example.com:80 SUCCEEDED (the tool proxy can reach a non-upstream external host — the netpol fence is broken)"
   else
-    ok "assertion 4c(c): a connect from the tool proxy's network position to a non-upstream external host (non-upstream-external.invalid:80) was refused / failed: $PROBE_RESULT"
+    ok "assertion 4c(c): a connect from the tool proxy's network position to the real external host example.com:80 was DENIED (a non-upstream external host must not be reachable; the netpol ipBlock carve-out blocks it): $PROBE_RESULT"
   fi
 fi
 # (d) control: upstream IP:80 must SUCCEED (the upstream is live on :80; proves the probe works)

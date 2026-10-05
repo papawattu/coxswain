@@ -823,7 +823,10 @@ var _ = Describe("D41 tool proxy image", func() {
 	})
 
 	It("honours the ToolProxyImage override", func() {
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), ToolProxyImage: "coxswain-tool-proxy:standin"}
-		Expect(r.toolProxyImage()).To(Equal("coxswain-tool-proxy:standin"))
+		// A DISTINCT value from the default (coxswain-tool-proxy:standin) so
+		// the spec actually proves the override is honoured (not just that the
+		// default is returned regardless of the field).
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), ToolProxyImage: "example.invalid/tool-proxy:override"}
+		Expect(r.toolProxyImage()).To(Equal("example.invalid/tool-proxy:override"))
 	})
 })

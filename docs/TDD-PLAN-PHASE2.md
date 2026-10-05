@@ -142,29 +142,44 @@ trust to be unbroken. Therefore:
       env `PROXY_PORT_USAGE`), distinct from the agent-facing `8080`;
     - a **proxy-side ingress NetworkPolicy** (owned by the operator,
       selector = the proxy's label set, added in P2b) admits **9090 only
-      from the operator pod** (peer = the manager's pod labels; the
-      manager pod carries a stable label — `control-plane=controller-
-      manager` in the kubebuilder `config/manager/` manifest; P2b verifies
-      this against the deployed manifest before wiring the netpol peer)
-      and denies everything else on that port; the agent's existing D34
-      netpol allows the agent → proxy only on **8080**, so the agent cannot
-      reach 9090;
+      from the operator pod**. The peer is a **compound selector**: a
+      `namespaceSelector: {kubernetes.io/metadata.name: <operator ns>}`
+      **and** the controller-manager podSelector (`control-plane: controller-
+      manager`, the kubebuilder `config/manager/` manifest label — P2b
+      verifies it against the deployed manifest). The netpol lives in the
+      **Loop** namespace, and a bare podSelector only matches pods in that
+      namespace — the namespaceSelector is required for a cross-namespace
+      match. It denies everything else on that port; the agent's existing
+      D34 netpol allows the agent → proxy only on **8080**, so the agent
+      cannot reach 9090;
     - the operator dials `http://<proxy-pod-ip>:9090/coxswain/usage` with a
       plain in-cluster HTTP client (the pod IP from the pod status the
       operator already reads; **no exec, no log, no new RBAC** — the
       operator already has pod `get`, and the dial is a plain client
-      connection, not a Kubernetes API call). **This is the channel the
-      operator reads; there is no pod-log read in the design.**
+      connection, not a Kubernetes API call). **The listener binds
+      `0.0.0.0:9090`, not `127.0.0.1:9090`** (P1-A: the operator is a
+      **different pod**, so a loopback bind would refuse every pod-IP
+      connection — the round-1 text's "localhost-only listener" was
+      unreachable by design; the 9090 port is protected **only** by the
+      ingress netpol peer, which admits just the operator pod).
+      **This is the channel the operator reads; there is no pod-log read in
+      the design.**
   - **The endpoint returns cumulative counters, not deltas:**
     `{bootID, promptTokens, completionTokens, requests,
-    unmeteredRequests, model, sinceStart}`. `bootID` is a UUID the proxy
-    generates at process start (item 2). The counters are **persisted to an
-    emptyDir volume** (a single JSON file the proxy rewrites after each
-    metered request, atomic via a temp-file+rename) so a **container
-    restart within the same pod** (a crash, an OOM) re-reads the file at
-    boot and continues the cumulative count — the `bootID` changes on a
-    **pod** recreate (the emptyDir is wiped), which the operator treats as a
-    fresh start (a delta from 0, item 2).
+    unmeteredRequests, model, sinceStart}`. The counters are **persisted to
+    an emptyDir volume** (a single JSON file the proxy rewrites after each
+    metered request, atomic via a temp-file+rename) **along with the
+    `bootID`** (P1-B: the `bootID` is generated **only when the file is
+    missing** — a fresh boot. A **container restart within the same pod**
+    (a crash, an OOM) re-reads the file and **keeps both the counters and
+    the same `bootID`**, so the operator's delta logic sees a continuous
+    series. A **pod recreate** (the emptyDir is wiped) gets a **new**
+    `bootID` with counters from 0 — the operator treats that as a fresh
+    start (a delta from 0, P2d's rule). The round-1 flaw was that the
+    `bootID` was regenerated on *every process start* while the counters
+    persisted — a container restart would then look like a new boot and the
+    operator's delta-from-0 would re-add the whole pre-restart total
+    (double-count); persisting the `bootID` with the counters closes it.)
   - **The operator's read seam is a func field** on the reconciler (the
     `readBaseCommit` pattern, `loop_controller.go:206`):
     `readProxyUsage func(ctx, loop) (UsageReading, error)` with a default
@@ -202,28 +217,39 @@ trust to be unbroken. Therefore:
     under-count is visible as `unmeteredRequests` > 0, never an
     over-count).
 - **Restart-safe metering (item 2).** A proxy **restart** (container crash,
-  OOM-kill, the drift-recreate) must not let the budget be evaded:
-  - the counters are **cumulative since pod start** (persisted to the
-    emptyDir across container restarts in the same pod);
-  - the operator stores `{bootID, lastPrompt, lastCompletion, lastRequests,
-    lastUnmetered}` on the Loop's **status** (item 2: `status.budget`
-    carries `lastBootID` + the last-read cumulative values) and **adds
-    deltas**: `tokens += reading.promptTokens - lastPrompt` (floored at 0 —
-    a cumulative value that *decreases* is a restart or corruption, treated
-    as a new boot, not negative tokens);
-  - a **different `bootID`** than the stored one means the pod was
-    recreated (or the container started fresh with a new UUID): the
-    operator resets its `last*` to the reading's values **and** records
-    `status.budget.bootIDChanged=true` (sticky, operator-visible) — the
-    delta is from 0, and if the emptyDir was wiped the counter genuinely
-    restarted at 0 (the operator cannot recover the pre-recreate count;
-    `bootIDChanged` makes the loss **visible** in status and events — a
-    `Warning` Event `Reason: MeteringReset`). This is the honest limit of
-    the design: a pod **recreate** loses the cumulative count (the
-    emptyDir is per-pod); a container **restart** does not (the emptyDir
-    survives). The drift-recreate path (a spec-hash mismatch) is the main
-    recreate source, and it changes the proxy's **config** — the operator
-    can record the loss at that moment.
+  OOM-kill, the drift-recreate) must not let the budget be evaded, and must
+  not **double-count** (P1-B). The operator's rules, all in P2d:
+  - the operator stores `{lastBootID, lastPrompt, lastCompletion,
+    lastRequests, lastUnmetered}` on the Loop's **status** (`status.budget`
+    carries them) and **adds deltas**: `tokens += reading.promptTokens -
+    lastPrompt` (floored at 0). The `bootID` is **stable across container
+    restarts** (persisted, above), so a container restart produces a normal
+    **same-boot** delta — no rebase, no double-count.
+  - **The first read** (empty `lastBootID`): the operator **adopts the
+    reading as the baseline** — sets `last*` to the reading's values, adds
+    **nothing** to the accumulation (the pre-reading count is unknown, not
+    zero, and must not be guessed), and records **no** `MeteringReset`
+    warning (an adoption is not an anomaly — P2d spec 13).
+  - **A pod recreate** (a **different `bootID`**, counters from 0): the
+    operator resets its `last*` to the reading's values, records
+    `status.budget.bootIDChanged=true` (sticky, operator-visible), and
+    emits a `Warning` Event `Reason: MeteringReset` (a fresh boot, a delta
+    from 0). The honest limit: a pod **recreate** loses the cumulative
+    count (the emptyDir is per-pod); the loss is visible, not silent.
+  - **A counter that drops without a bootID change** (same `bootID`, a
+    cumulative value *lower* than `last*` — a corrupted/partial file or a
+    torn read): the operator emits a `Warning` Event `Reason:
+    MeteringAnomaly`, **rebases** `last*` to the reading's values, and
+    **adds nothing** (no negative tokens; the drop is not re-added on the
+    next read). Stated once here and in P2d spec 11 (the round-1 text had
+    P2a and P2d spec 11 describing this differently — the anomaly is the
+    same in both: warn + rebase + add nothing, **not** a `bootIDChanged`
+    rebase, which is reserved for a genuine new boot).
+  - **A drift-recreate** of the proxy pod (a spec-hash mismatch) is a pod
+    recreate: the operator does a **final read** of the endpoint immediately
+    before deleting the pod (the P2b drift path), so the last-known
+    cumulative count is on `status.budget` and the recreate's `bootID`
+    change is the visible, bounded loss.
 - **Prometheus `vllm:*_tokens_total` metrics (owner's note) are an
   acceptance cross-check, not the per-Loop source of truth.** They are
   **cluster-wide** (per backend, not per Loop) — on a shared vLLM backend
@@ -281,10 +307,16 @@ until P2h runs against the metering image).
 - **Credential:** the API key header is injected from the mounted
   `model-creds` Secret (as the stand-in does: read every file under
   `/model-creds` at startup). The key is never logged.
-- **Steering-proof request shaping (item 3, P2a):** strip
-  `Accept-Encoding`; force `stream_options.include_usage=true` on
-  streaming request bodies (a non-JSON or non-object body is forwarded
-  unmodified and counted as `unmetered`).
+- **Steering-proof request shaping (item 3, P2a):** the proxy's upstream
+  `http.Transport` sets **`DisableCompression: true`** (P3: Go's
+  `http.Transport` otherwise adds `Accept-Encoding: gzip` **itself**, so
+  "the upstream request has no `Accept-Encoding`" is untestable as long as
+  the transport negotiates gzip on its own). With compression disabled the
+  proxy strips **any** `Accept-Encoding` the agent sent (request-side)
+  and the body is identity-encoded end to end; force
+  `stream_options.include_usage=true` on streaming request bodies (a
+  non-JSON or non-object body is forwarded unmodified and counted as
+  `unmetered`).
 - **Metering:** after each upstream response, parse the response body's
   `usage` object (`prompt_tokens`, `completion_tokens` — the
   OpenAI-compatible shape; a non-JSON / non-object body, or a stream with
@@ -294,11 +326,18 @@ until P2h runs against the metering image).
   ends without it is `unmetered`). Counters are **per-pod cumulative,
   persisted to an emptyDir** (`/coxswain/usage.json`, atomic
   temp+rename) and re-read at boot (item 2).
-- **The operator endpoint:** `GET /coxswain/usage` on `127.0.0.1:9090`
-  only (the listener binds loopback; the proxy's ingress netpol — added in
-  this slice, P2b's pod changes include it, owned by the Loop — admits
-  9090 only from the operator pod's labels; the agent netpol (D34) allows
-  the agent only on 8080). Response:
+- **The operator endpoint:** `GET /coxswain/usage` on **`0.0.0.0:9090`**
+  (P1-A: the round-1 text's `127.0.0.1:9090` bind was unreachable by the
+  operator — a different pod — so the listener must bind the pod's all
+  interfaces; access is controlled **only** by the ingress netpol peer,
+  below). The proxy's ingress netpol (added in this slice, P2b's pod
+  changes include it, owned by the Loop) admits 9090 only from the
+  operator pod via a **compound peer**: `namespaceSelector:
+  {kubernetes.io/metadata.name: <operator ns>}` **and**
+  `podSelector: {control-plane: controller-manager}` (the bare-podSelector-
+  in-another-namespace hole — a bare podSelector only matches pods in the
+  netpol's own namespace, the Loop namespace; the namespaceSelector makes
+  the cross-namespace match). Response:
   `{bootID, promptTokens, completionTokens, requests, unmeteredRequests,
   model, sinceStart}`. **No other endpoint** (item 15: the round-1
   localhost `/metrics` debug endpoint is **dropped** — `/coxswain/usage`
@@ -312,11 +351,14 @@ until P2h runs against the metering image).
 - **Pod changes (this slice's kind evidence, item 13):** the proxy pod
   gains the `usage` emptyDir volume + mount (writable — the only writable
   mount on the proxy; the container's rootfs stays read-only), the
-  9090 listener, the metering env, and the **proxy ingress netpol**
-  (`<loop>-proxy-ingress-netpol`: ingress on 9090 only from the operator
-  pod's labels; the existing 8080 agent-ingress rule is unchanged).
-  Hardening otherwise identical (UID 65533, no SA token, no caps, seccomp
-  RuntimeDefault).
+  9090 listener (bound to `0.0.0.0`), the metering env, and the **proxy
+  ingress netpol** (`<loop>-proxy-ingress-netpol`: ingress on 9090 only
+  from the operator pod via the **compound** `namespaceSelector` +
+  `podSelector` peer, above; the existing 8080 agent-ingress rule is
+  unchanged). The `usage.json` file persists **both the counters and the
+  `bootID`** (P1-B: generated only when the file is missing, so a
+  container restart keeps the same `bootID`). Hardening otherwise
+  identical (UID 65533, no SA token, no caps, seccomp RuntimeDefault).
 - **Operator wiring (this slice, item 11):** `buildProxyPod` gains the new
   env + volume + port; `proxyImage()`'s default flips to the metering
   image; the `LoopReconciler` gains the `readProxyUsage` func-field seam
@@ -333,28 +375,39 @@ shared logic):**
   `unmeteredRequests` increments, token counts unchanged. A `4xx`/`5xx`
   response **with** `usage` → still metered (a failed completion is a
   consumption). A non-JSON body → `unmetered`.
-- **Steering-proof (item 3):** a request carrying
-  `Accept-Encoding: gzip` → the upstream request (captured by the test
-  server) has **no** `Accept-Encoding` header, and a gzip-encoded response
-  body (the test server sets `Content-Encoding: gzip` + a gzipped JSON body
-  with `usage`) is **still metered** (the proxy gunzips before parsing —
-  the strip is request-side; the response is decoded by Go's transport
-  when the proxy made the request without `Accept-Encoding`, so the body
-  is identity-encoded end to end; the test asserts the counter advanced).
-  A `stream: true` request without `include_usage` → the upstream body
+- **Steering-proof (item 3, P3):** the proxy's transport has
+  `DisableCompression: true`, so the test asserts the upstream request
+  (captured by the test server) has **no** `Accept-Encoding` header at all
+  (the transport no longer adds `gzip` itself) **and** does not forward
+  the agent's value (a request carrying `Accept-Encoding: gzip` arrives
+  upstream with the header absent). A gzip-encoded response body (the test
+  server sets `Content-Encoding: gzip` + a gzipped JSON body with
+  `usage`) is **still metered** (with compression disabled the proxy
+  gunzips before parsing; the test asserts the counter advanced). A
+  `stream: true` request without `include_usage` → the upstream body
   carries `stream_options.include_usage: true` (captured); a
   `stream: true` request **with** it → unchanged. A non-JSON body →
   forwarded unmodified, `unmetered`.
 - **Streaming:** a 3-chunk SSE stream whose last chunk carries `usage` →
   the accumulated counts match; a stream with no `usage` chunk →
   `unmetered`.
-- **Restart persistence (item 2):** boot the binary with a pre-seeded
-  `usage.json` (`promptTokens: 500`, a `bootID` B1) → the counters start
-  at 500 (not 0), the reading's `bootID` is B2 (new UUID, the file's
-  `bootID` is **replaced** on a fresh boot — the file persists the
-  *counters*, the `bootID` is per-boot; the operator's delta logic (P2d)
-  handles the boot-ID change, and the spec asserts the counts did not
-  reset). A fresh boot with **no** file → counters at 0.
+- **Restart persistence (item 2, P1-B):** the `usage.json` file persists
+  **both the counters and the `bootID`**.
+  - **Container restart (same pod):** boot the binary with a pre-seeded
+    `usage.json` (`promptTokens: 500`, `bootID` B1) → the counters start
+    at 500 (not 0) **and the reading's `bootID` is still B1** (the file's
+    `bootID` is **reused**, not regenerated — the P1-B fix: the round-1
+    binary generated a new UUID every start, so a container restart looked
+    like a new boot and the operator's delta-from-0 double-counted the
+    pre-restart total). A second metered request advances the counters to
+    500+Δ **under the same B1** (the operator's same-boot delta is
+    correct, P2d spec 13).
+  - **Pod recreate (fresh emptyDir):** a fresh boot with **no** file →
+    counters at 0 and a **new** `bootID` (B2) — the operator treats it as
+    a fresh start (P2d spec 10).
+  - **Mutation (P1-B):** regenerate the `bootID` on every start (ignore the
+    file's `bootID`) → the container-restart spec **FAILS** (the reading
+    carries B2, not B1; the operator rebases and double-counts).
 - **Persistence atomicity:** a write to `usage.json` produces a file that
   is either the old or the new content (never torn): the test reads the
   file mid-write (a concurrent-reader goroutine) and asserts it parses as
@@ -373,15 +426,36 @@ shared logic):**
   fresh address space by construction; the claim is reworded as the
   topology statement above, pinned by the "fresh boot, no file → 0" test.)
 
-**Acceptance:** `go build ./cmd/model-proxy` + unit suite green under
-`make test`; the image is buildable (Dockerfile mirroring the
-stand-in's); **a kind run (item 13)** against a dev-overlay deploy with the
-new default image: the proxy pod starts (the `model-creds` check passes —
-the stand-in's startup check is retained in the metering binary), the
-ingress netpol admits an operator-pod-labelled dial on 9090 and denies a
-non-operator dial, and the agent's 8080 path is unchanged (the D33/D34
-e2e's model-call assertion still passes). The PR records the running image
-digest + the assertions' output.
+**Envtest spec for the ingress netpol (item 11's pod-shape change, the I43
+same-Loop update norm):** the operator (a) **creates** the
+`<loop>-proxy-ingress-netpol` on the Loop (the reconciler's `ensureProxyPod`
+path): the spec asserts the netpol exists with the **compound** peer
+(`namespaceSelector` on the operator namespace **and** the
+`control-plane: controller-manager` podSelector), an ingress rule on 9090
+only, and a deny-all posture on that port for non-matching peers. (b)
+**I43 update:** after the netpol is created, **update the operator
+namespace's label or the Loop's namespace and re-reconcile from the API
+server** → the operator re-creates the netpol with the **corrected** peer
+selector (the same-Loop update spec proves the netpol tracks the operator
+namespace, not a stale snapshot — the round-1 plan had no envtest spec for
+the netpol at all).
+
+**Acceptance:** `go build ./cmd/model-proxy` + unit suite + the netpol
+envtest green under `make test`; the image is buildable (Dockerfile
+mirroring the stand-in's); **a kind run (item 13)** against a dev-overlay
+deploy with the new default image: the proxy pod starts (the
+`model-creds` check passes — the stand-in's startup check is retained in
+the metering binary), the agent's 8080 path is unchanged (the D33/D34
+e2e's model-call assertion still passes), **and a dial test (P1-A): a
+`kubectl`-exec dial to `http://<proxy-pod-ip>:9090/coxswain/usage` from a
+pod labelled `control-plane: controller-manager` in the operator namespace
+**succeeds** (returns the JSON reading), while the **same** dial from a
+pod in the Loop namespace that is **not** the operator (e.g. a scratch
+`netpol-probe` pod) **fails** (connection refused / no route — the
+netpol's deny-all on 9090 for non-matching peers). The agent container
+itself cannot reach 9090 (its D34 netpol caps it at 8080) — the PR records
+the running image digest + the two dial outcomes + the agent-path
+assertion.
 
 **Gate mutations (I49 norm, scratch worktree, each must make its spec FAIL):**
 - **Skip the `usage` parse** (record `unmetered` unconditionally) → the
@@ -453,7 +527,12 @@ is committed.
     `lastRequests`/`lastUnmeteredRequests` (the last-read **cumulative**
     values the operator's delta logic consumes, item 2), `bootIDChanged`
     (`bool`, sticky — a pod recreate wiped the counters; P2a's
-    honest-limit marker).
+    honest-limit marker), `lastActiveStamp` (`metav1.Time` — the last
+    reconcile's active-time accumulation point, item E: set to `now` on
+    **every** non-paused reconcile and **reset to `now` on resume**, so the
+    first post-resume reconcile does not add the pause's duration — the
+    round-1 wall clock leaked the pause into `activeSeconds` because
+    `lastActiveStamp` was not reset).
 - **`status.stallHistory`** (new, optional, `[]StallEntry`, atomic list):
   - one entry per **verify-failure** iteration: `iteration` (`int`),
     `jobName` (the verify Job's name, `<loop>-verify-<iteration>` — the
@@ -536,18 +615,23 @@ first, and the decision slices simply call them).
     and the iteration has already advanced; item 6).
   - **Pause from every phase (item 9):** the pause entry is defined for
     **every non-terminal phase** — `Pending`, `Planning`, `AwaitingApproval`,
-    `Implementing`, `Verifying` (and `CleaningUp`, where the deliver Job
-    may be in flight — the pause suspends the sandbox and leaves the
-    deliver Job to terminate; a deliver Job that completes while paused
-    produces its `Delivered` condition but **no phase advance** — the
-    phase is `Paused`, and the S6 delivery advance is gated on
-    `phase==Succeeded`, as today). `Succeeded` is **not pausable** (a
-    succeeded Loop is terminal-success; `spec.suspend=true` on one
-    suspends the sandbox via S1 but does **not** set the phase to
-    `Paused` — `pausedFrom`/`pausedReason` stay empty; the spec asserts
-    this, matching the `Failed` case below). `Failed` is terminal: same
-    as `Succeeded` — S1 suspends, the phase stays `Failed`, no
-    `pausedFrom`/`pausedReason`. **A wall-clock cap hit while already
+    `Implementing`, `Verifying` (and — **item F: delivery runs in
+    `Succeeded`, not `CleaningUp`** (`loop_deliver_job.go:493`; the
+    controller never sets a `CleaningUp` phase, and the round-1 text's
+    "CleaningUp, where the deliver Job may be in flight" referenced a
+    phase that does not exist) — **`Succeeded` with a deliver Job in
+    flight**: `Succeeded` is normally **not pausable** (terminal-success),
+    but if `spec.delivery.mode == PullRequest` and the deliver Job has not
+    yet recorded `status.delivery`, a `spec.suspend=true` is **refused** —
+    the operator keeps the phase `Succeeded`, sets the `Paused` condition
+    `False` with a message naming the reason (`suspend` refused while a
+    deliver Job is in flight), and leaves the sandbox running so delivery
+    completes; the spec asserts the refusal + the deliver Job is undisturbed.
+    Once `status.delivery` is recorded (delivery done), `suspend=true` is
+    again refused by the terminal-phase rule (spec 9). **The owner must pick
+    one** — the plan chooses **refuse** (let delivery finish, do not suspend
+    a terminal-success Loop mid-delivery; the alternative, suspending and
+    leaving the deliver Job to terminate, would strand a half-pushed PR).) **A wall-clock cap hit while already
     `Paused`** (item 9): the budget decision is **inert in `Paused`** —
     the phase is already paused; the operator updates
     `status.budget` (`exceeded`, `exceededReason`) and, if the pause's
@@ -593,11 +677,29 @@ first, and the decision slices simply call them).
   - **On a valid resume:** `phase = pausedFrom` (the exact phase),
     `pausedFrom` + `pausedReason` cleared, the `Paused` condition `False`
     reason `Resumed`, a `Normal` Event (`Reason: Resumed`, the message
-    names the phase + the resumed-from reason). The sandbox's
+    names the phase + the resumed-from reason). **`lastActiveStamp` is
+    reset to `now`** (item E: without this, the first post-resume reconcile
+    adds `now - lastActiveStamp` **including the entire pause**, leaking
+    the pause into `activeSeconds` — the round-1 wall clock counted the
+    pause). The sandbox's
     `OperatingMode` returns to `Running` (the suspension gate releases:
     `phase != Paused` and `spec.suspend=false` → `Running`, subject to
     the D30/D35a gates — a proxy that is not Ready re-holds Suspended, as
     today).
+  - **A resume while a cap is still exceeded is refused** (P3: the round-1
+    text let the resume re-enter the phase and then re-pause, **bouncing**
+    the sandbox `Running → Suspended`). The operator checks the current
+    `spec.budget` caps against the current counts **before** releasing the
+    sandbox: if still exceeded (a `Budget` pause with un-raised caps, or a
+    `Stall`/`Suspend` pause whose wall clock has since elapsed), it
+    **refuses the resume** — the `Paused` condition stays `True` with a
+    message naming the still-exceeded cap, the sandbox stays `Suspended`, the
+    annotation is **not** cleared (the operator did not act on it), and a
+    `Warning` Event `Reason: ResumeRefused` is emitted. The owner raises the
+    cap (or, for a `Suspend` pause, keeps `suspend=true`) and retries. The
+    bounce is gone: the sandbox does not leave `Suspended` on a refused
+    resume. (The re-evaluation that **clears** `exceeded` on a raised cap —
+    item 5 — is unchanged; this rule only governs the still-exceeded case.)
   - **The phase machine resumes where it left off:** the per-phase pod
     recycle re-creates the agent container with the resumed phase as
     `desiredPhase` (the S4 mechanism, unchanged). **A
@@ -678,22 +780,34 @@ first, and the decision slices simply call them).
 8. **A resumed budget-exceeded Loop re-evaluates (item 5).** A
    budget-paused Loop (`exceeded=true`, `exceededReason=Tokens`,
    `pausedFrom=Implementing`, `maxTokens: 200`, counts 250):
-   - **(a) caps not raised:** resume via the annotation → the phase
-     re-enters `Implementing` **and the next reconcile re-sees
-     `exceeded=true`** (the caps are unchanged) → the Loop re-enters
-     `Paused` immediately (the fail-closed re-fire).
+   - **(a) caps not raised:** resume via the annotation → the operator
+     **refuses the resume** (P3: the caps are still hit, so it does not
+     release the sandbox — the round-1 "re-enter the phase and bounce
+     `Running → Suspended`" is gone). The `Paused` condition stays `True`
+     with a message naming the still-exceeded cap, the sandbox stays
+     `Suspended`, the annotation is **not** cleared, and a `Warning`
+     `ResumeRefused` Event fires. (The spec asserts **no** `OperatingMode`
+     transition on the resume.)
    - **(b) caps raised:** before the resume, update
      `spec.budget.maxTokens` to 500 (an I43 same-Loop update), then resume
      via the annotation → `exceeded` **clears** (250 < 500), the
-     `BudgetExceeded` condition `False` reason `ClearedOnResume`, and the
-     Loop **proceeds** (the phase is `Implementing` and stays there on the
-     next reconcile — the spec asserts two reconciles after the resume
-     with the phase unchanged, proving the re-evaluation cleared the
-     exceedance).
-9. **`Failed`/`Succeeded` are not pausable.** A `Failed` Loop with
-   `suspend=true` → the sandbox is `Suspended` (the S1 branch) but
-   `phase` stays `Failed`, `pausedFrom` + `pausedReason` are **not** set.
-   Same for a `Succeeded` Loop.
+     `BudgetExceeded` condition `False` reason `ClearedOnResume`, the
+     `Paused` condition `False` reason `Resumed`, and the Loop
+     **proceeds** (the phase is `Implementing` and stays there on the next
+     reconcile — the spec asserts two reconciles after the resume with the
+     phase unchanged, proving the re-evaluation cleared the exceedance).
+9. **`Failed`/`Succeeded` are not pausable; delivery-in-flight refused
+   (item F).** A `Failed` Loop with `suspend=true` → the sandbox is
+   `Suspended` (the S1 branch) but `phase` stays `Failed`, `pausedFrom` +
+   `pausedReason` are **not** set. A `Succeeded` Loop **with no deliver Job
+   in flight** (`status.delivery` recorded or no delivery mode) with
+   `suspend=true` → the same (not pausable, spec-9 terminal rule). A
+   **`Succeeded` Loop with a deliver Job in flight** (mode `PullRequest`,
+   `status.delivery` nil, the deliver Job running) with `suspend=true` →
+   the operator **refuses** (item F): the phase stays `Succeeded`, the
+   `Paused` condition stays `False` with a message naming the refusal, the
+   deliver Job is **undisturbed** (not deleted, not suspended), and the
+   sandbox is left running so delivery completes.
 10. **In-progress: a pod mid-run at pause time (I49).** A Loop at
     `Implementing` with the agent container `Running` (not terminated) and
     `suspend` flipped to `true` → `phase=Paused`,
@@ -705,11 +819,26 @@ first, and the decision slices simply call them).
     server** → the Loop re-enters `Paused` with `pausedFrom=Implementing`
     (the phase it was in, not a stale pre-pause value); the sandbox is
     `Suspended` again.
-12. **Resume does not re-iterate.** A paused-from-`Verifying` Loop (spec 7)
-    resumed → `status.iteration` is **unchanged** by the resume itself
-    (the resume re-enters `Verifying` at the same iteration; the verify
-    re-run — a NEW Job for the current pin — bumps the iteration only on
-    its **failure**, as today).
+12. **Resume does not re-iterate (item C — consistent with the stall model).**
+    A paused-from-`Verifying` Loop (spec 7) resumed → `status.iteration`
+    is **unchanged** by the resume itself (the resume re-enters `Verifying`
+    at the same iteration; the verify re-run — a NEW Job for the current
+    pin — bumps the iteration only on its **failure**, as today). **A
+    paused-from-`Implementing` Loop (the stall-pause case, spec 7's shape
+    with `pausedReason=Stall`) resumed** → `status.iteration` is **the
+    post-iterate value** (the iterate bookkeeping advanced it *before* the
+    pause, item 6) and the next verify is a **new** Job
+    (`<loop>-verify-<iteration+1>`) — item C's model: a stall resume
+    records `pausedFrom=Implementing` *after* the iterate, so the next
+    iteration is a new Job, and the fire rule (`k >= stallAfter`, per new
+    Job, P2e) applies to that new Job. (The round-1 spec said "a
+    resumed-from-Verifying Loop re-runs the verify — the re-run creates a
+    NEW Job with the advanced iteration" while also saying the iteration
+    is unchanged — the contradiction is resolved: the iterate advances the
+    iteration *before* the pause for a stall pause, so the post-resume Job
+    is new and the iteration is the post-iterate value; for a *budget/suspend*
+    pause from `Verifying` the iteration is unchanged because no iterate
+    ran.)
 13. **Pause from `Planning`/`Pending`/`AwaitingApproval` (item 9).** A
     Loop at each of those phases with `suspend=true` → `phase=Paused`,
     `pausedFrom=<that phase>`, the sandbox `Suspended`; resume returns to
@@ -722,6 +851,18 @@ first, and the decision slices simply call them).
     re-evaluated per spec 8's rule (the `activeSeconds` accumulation
     stopped during the pause, so the cap may no longer be hit — the spec
     asserts the re-evaluation, in both the hit and not-hit sub-cases).
+15. **A long pause does not leak into `activeSeconds` (item E).** A Loop
+    at `Implementing`, `maxWallClock: 1h`, `activeSeconds: 30m`, with
+    `suspend` flipped `true` → `Paused`; the test advances the clock by
+    **2h** (a long pause) and re-reconciles → `activeSeconds` is **still
+    30m** (the pause is not counted — the `lastActiveStamp` was frozen at
+    the pause). Then `suspend=false` → resume; the test advances the clock
+    by **10s** and re-reconciles → `activeSeconds` is **30m + 10s** (the
+    reset `lastActiveStamp` means the resume adds only the post-resume
+    10s, not the 2h pause + 10s). Without the `lastActiveStamp` reset
+    (the round-1 bug) the second assertion would be 30m + 2h10s → the cap
+    would fire spuriously. (The spec asserts `activeSeconds` ≈ 30m10s, not
+    3h10m.)
 
 **Gate mutations (I49 norm, scratch worktree, each must make its spec FAIL):**
 - **Drop the `pausedReason` check from the `suspend=false` resume** (resume
@@ -736,11 +877,24 @@ first, and the decision slices simply call them).
 - **Make `exceeded` sticky-through-resume** (drop P2f's re-evaluation —
   the round-1 semantics) → spec 8(b) FAILS (raising the cap does not
   clear the exceedance).
+- **Resume a still-exceeded pause anyway** (drop the P3 refuse-while-
+  exceeded gate — the round-1 bounce) → spec 8(a) FAILS (the sandbox
+  transitions `Suspended → Running` on the resume and re-pauses, the
+  `ResumeRefused` Event is absent).
 - **Allow pause from `Succeeded`/`Failed`** (drop the terminal-phase
   guard) → spec 9 FAILS (`pausedFrom` is set on a terminal phase).
-- **Advance the phase on a deliver Job completion while paused** (drop the
-  `phase != Paused` gate from the S6 advance) → a deliver-completion-while-
-  paused spec (added here, the item-9 `CleaningUp` case) FAILS.
+- **Suspend a `Succeeded` Loop with a deliver Job in flight** (drop the
+  item-F refusal, let the sandbox suspend) → spec 9's delivery-in-flight
+  half FAILS (the deliver Job is suspended/deleted, delivery is stranded).
+- **Resume to a phase other than `pausedFrom`** (drop the exact-phase
+  resume — resume to a hard-coded `Implementing`) → spec 5 FAILS (a Loop
+  paused from `Verifying` resumes to `Implementing`, not `Verifying`).
+- **Reset `lastActiveStamp` to `zero` on resume** (drop the item-E reset —
+  leave it at the pre-pause value) → spec 15 FAILS (the first post-resume
+  reconcile adds the whole pause, `activeSeconds` ≈ 3h10m, the cap
+  fires spuriously).
+- **Do not reset `lastActiveStamp` at all on resume** (the round-1 bug) →
+  spec 15 FAILS (same as above).
 
 **Acceptance:** envtests green under `make test`; the `Paused` phase is
 reachable from all three entry points at every non-terminal phase, the
@@ -769,25 +923,56 @@ the P2b `readProxyUsage` seam) and updates `status.budget`; when a cap is
 hit it applies `spec.budget.onExceeded` — entering the **P2f `Paused`
 phase** (P2f landed first) or `Failed`.
 
-- **The read + delta (item 2):** the reading is
+- **The read + delta (item 2, P1-B):** the reading is
   `{bootID, promptTokens, completionTokens, requests, unmeteredRequests}`.
   The operator stores `lastBootID` + the last-read cumulative values on
-  `status.budget` (P2c) and **adds deltas**:
-  `accumulated += reading.cumulative - lastCumulative` (floored at 0 — a
-  decrease is a restart/corruption, not negative tokens). A **different
-  `bootID`** → the operator resets its `last*` to the reading's values,
-  records `bootIDChanged=true` (sticky) + a `Warning` Event
-  `Reason: MeteringReset` (P2a's honest limit: a pod recreate wiped the
-  counters; the loss is visible, not silent). A read **failure** (the
-  proxy pod not Ready, the dial refused, the pod absent) → `status.budget`
-  is **unchanged** (no reset, no delta — the operator does not guess; an
-  under-read is visible as `requests` lagging the iterations, and the
-  decision is on the last **successful** read, never an estimate).
-- **Wall clock (item 10):** `activeSeconds` accumulates
+  `status.budget` (P2c) and applies **four rules** (stated once here, in
+  P2a, and pinned by the four specs):
+  - **Same `bootID` (the normal + container-restart case):**
+    `accumulated += reading.cumulative - lastCumulative` (floored at 0).
+    A **container restart keeps the same `bootID`** (the file persists it,
+    P2b), so a container restart produces an ordinary same-boot delta — **no
+    rebase, no double-count** (the P1-B fix: the round-1 binary regenerated
+    the `bootID` every start, so a container restart looked like a new boot
+    and the delta-from-0 re-added the pre-restart total).
+  - **The first read** (empty `lastBootID`): **adopt the reading as the
+    baseline** — set `last*` to the reading's values, add **nothing**, and
+    record **no** `MeteringReset` warning (an adoption is not an anomaly;
+    the pre-reading count is unknown, not zero).
+  - **A different `bootID` (a pod recreate, the emptyDir wiped):** the
+    operator resets its `last*` to the reading's values, records
+    `bootIDChanged=true` (sticky) + a `Warning` Event `Reason:
+    MeteringReset` (a fresh boot, a delta from 0). The honest limit: a pod
+    **recreate** loses the cumulative count (the emptyDir is per-pod); the
+    loss is visible, not silent.
+  - **A counter that drops without a bootID change** (same `bootID`, a
+    cumulative value *lower* than `last*` — a corrupted/partial file or a
+    torn read): the operator emits a `Warning` Event `Reason:
+    MeteringAnomaly`, **rebases** `last*` to the reading's values, and
+    **adds nothing** (no negative tokens; the drop is not re-added on the
+    next read). This is **not** a `bootIDChanged` rebase (that is reserved
+    for a genuine new boot) — the round-1 text had P2a and P2d spec 11
+    describing this differently; it is the same rule in both now.
+  A read **failure** (the proxy pod not Ready, the dial refused, the pod
+  absent) → `status.budget` is **unchanged** (no reset, no delta — the
+  operator does not guess; an under-read is visible as `requests` lagging
+  the iterations, and the decision is on the last **successful** read,
+  never an estimate).
+  **Before a drift-recreate of the proxy pod** (a spec-hash mismatch), the
+  operator does a **final read** of the endpoint (the P2b drift path), so
+  the last-known cumulative count is on `status.budget` and the recreate's
+  `bootID` change is the visible, bounded loss (not an unrecorded one).
+- **Wall clock (item 10, item E):** `activeSeconds` accumulates
   **active** time: each reconcile adds `now - lastActiveStamp` to
   `status.budget.activeSeconds` when the Loop is **not** `Paused` (the
   pause stops the clock — a paused Loop's wall clock does not advance;
-  `lastActiveStamp` is a status field updated each reconcile). The cap
+  `lastActiveStamp` is a status field, P2c). **`lastActiveStamp` is set to
+  `now` on every non-paused reconcile AND reset to `now` on resume** (item
+  E: the round-1 wall clock counted the pause — the first reconcile after
+  resume added `now - lastActiveStamp` where `lastActiveStamp` was the
+  pre-pause stamp, so the entire pause duration leaked into
+  `activeSeconds`; resetting it on resume means the first post-resume
+  reconcile adds only the post-resume interval). The cap
   comparison is `activeSeconds >= maxWallClock` (**`>=`** — item 10's
   boundary rule, applied to **every** cap: `tokens >= maxTokens`,
   `costUsd >= maxCostUsd`, `activeSeconds >= maxWallClock` — a cap hit
@@ -884,32 +1069,58 @@ phase** (P2f landed first) or `Failed`.
    no `endpointSecretRef` → `status.budget` stays nil (no proxy pod, no
    read); the token/cost caps never fire; the phase is unaffected by them
    (the wall clock still applies — spec 4).
-10. **Boot-ID change (item 2).** A Loop whose stored `lastBootID` is
-    `B1` with `lastPromptTokens: 100`; the injected reading is `bootID
-    B2`, `promptTokens: 50` → the operator records `bootIDChanged=true`,
-    the `MeteringReset` Event, and the **accumulated** count becomes 100 +
-    50 = 150 (the delta from the new boot is from 0, added to the prior
-    accumulation — the pre-recreate count is not lost, only the
-    in-pod counter was). A second reading at `B2` with `promptTokens: 80`
-    → the delta is 80 - 50 = 30 (the `last*` was reset to the B2 reading),
-    accumulated 150 + 30 = 180 (no double-count of the B2 baseline).
-11. **A cumulative decrease is floored (item 2).** `lastPromptTokens:
-    200` (boot B1); a reading at the **same** boot B1 with
-    `promptTokens: 50` (a corrupted/partial file) → the delta is floored
-    at 0 (no negative tokens; `bootIDChanged` is **not** set — the boot ID
-    matched; the spec asserts the accumulation is unchanged by the
-    decrease, and a `Warning` log/Event records the anomaly as
-    `MeteringAnomaly` — the operator-visible marker).
+10. **Boot-ID change — pod recreate (item 2, P1-B).** A Loop whose stored
+    `lastBootID` is `B1` with `lastPromptTokens: 100`; the injected reading
+    is `bootID B2` (a **different** boot — the pod was recreated, the
+    emptyDir wiped), `promptTokens: 50` → the operator records
+    `bootIDChanged=true`, the `MeteringReset` Event, and the **accumulated**
+    count becomes 100 + 50 = 150 (the delta from the new boot is from 0,
+    added to the prior accumulation — the pre-recreate count is not lost,
+    only the in-pod counter was). A second reading at `B2` with
+    `promptTokens: 80` → the delta is 80 - 50 = 30 (the `last*` was reset
+    to the B2 reading), accumulated 150 + 30 = 180 (no double-count of the
+    B2 baseline).
+    **Container restart (same bootID, the P1-B case):** a Loop whose stored
+    `lastBootID` is `B1` with `lastPromptTokens: 100`; a **container**
+    restart (the pod is the same, the emptyDir persists the `bootID`) → the
+    injected reading is `bootID B1` (**the same** bootID),
+    `promptTokens: 130` → the operator applies the **same-boot** delta (130
+    - 100 = 30, **not** a rebase-to-0), `bootIDChanged` stays **false**, no
+    `MeteringReset` Event, accumulated 100 + 30 = 130. (The round-1 flaw:
+    the binary regenerated the `bootID` on every start, so this reading
+    would have been `B2` and the operator would have rebased to 0 + 130,
+    double-counting the 100.)
+11. **A cumulative decrease without a bootID change is an anomaly (item 2,
+    P1-B, stated once here and in P2a).** `lastPromptTokens: 200` (boot
+    B1); a reading at the **same** boot B1 with `promptTokens: 50` (a
+    corrupted/partial file or a torn read) → the operator emits a
+    `Warning` Event `Reason: MeteringAnomaly`, **rebases** `last*` to 50,
+    and **adds nothing** (no negative tokens; the drop is not re-added on
+    the next read). `bootIDChanged` is **not** set (the boot ID matched —
+    this is an anomaly, not a recreate). The accumulation is **unchanged**
+    by the drop. (The round-1 text had P2a and this spec describing the
+    anomaly differently — the rule is now the same in both: warn + rebase +
+    add nothing, **not** a `bootIDChanged` rebase.)
 12. **In-progress: proxy pod not Ready → no decision (I49).** The proxy
     pod exists but is not Ready (the `readProxyUsage` seam returns an
     error) → no budget decision this reconcile (the phase is unchanged, no
     `exceeded`, a requeue — the spec asserts **no** `BudgetExceeded`
     condition and no phase change after the reconcile, and that a
     *second* reconcile with a successful read then applies the decision).
-13. **In-progress: read not yet available → no decision (I49).** The seam
-    returns "not ready" (the first reconcile after the proxy started) →
-    no decision, no `exceeded` (the operator does not decide "not
-    exceeded" from an absent reading; it waits for data).
+13. **The first read adopts the baseline (item 2, P1-B).** A Loop with
+    `lastBootID` **empty** (the first reconcile after the proxy started);
+    the injected reading is `bootID B1`, `promptTokens: 400` → the operator
+    adopts the reading as the baseline (`last*` = the reading's values),
+    adds **nothing** (the accumulated count is **0**, not 400 — the
+    pre-reading count is unknown, not zero), and records **no**
+    `MeteringReset` warning (an adoption is not an anomaly; the spec
+    asserts `exceeded` is false and no `Warning` Event fired). A second
+    reading at B1 with `promptTokens: 450` → the delta is 450 - 400 = 50,
+    accumulated 0 + 50 = 50 (the adoption did not count the pre-reading 400).
+    **In-progress: read not yet available → no decision (I49).** The seam
+    returns "not ready" (the proxy pod not Ready) → no decision, no
+    `exceeded` (the operator does not decide "not exceeded" from an absent
+    reading; it waits for data).
 14. **Same-Loop update (I43 norm):** after the Loop is `Paused` on
     `onExceeded=Pause` (spec 3's shape), **update
     `spec.budget.maxTokens` to a higher value and re-reconcile from the
@@ -929,10 +1140,21 @@ phase** (P2f landed first) or `Failed`.
     wins), `Stalled=True`, `BudgetExceeded=True` (recorded, not the
     decision). (The cross-slice spec lives here because the budget side
     is P2d's; P2e's spec asserts the stall side.)
-17. **Wall clock stops while paused (item 10).** A Loop paused (P2f) for
-    a reconcile: `activeSeconds` does **not** advance during the pause
+    **Stall `Pause` + `maxIterations` together (P3):** when a
+    `stallAction=Pause` fire and the `maxIterations` cap are hit on the
+    **same** verify failure, **the stall `Pause` wins** (the Loop enters
+    `Paused`, not `Failed:MaxIterationsExceeded`) — the stall is the more
+    specific signal and a paused Loop is resumable, whereas
+    `MaxIterationsExceeded` is terminal. The `maxIterations` cap still
+    fires for the **non-stalled** cap case (three different failures). The
+    spec asserts both: identical → `Paused` (stall wins); different →
+    `Failed:MaxIterationsExceeded`.
+17. **Wall clock stops while paused (item 10, item E).** A Loop paused (P2f)
+    for a reconcile: `activeSeconds` does **not** advance during the pause
     (the spec asserts the `activeSeconds` is unchanged across a paused
-    reconcile, and advances again after resume).
+    reconcile, and advances again after resume — and, per item E, the first
+    post-resume reconcile adds only the post-resume interval, not the
+    pause; see P2f spec 15 for the long-pause arithmetic).
 
 **Gate mutations (I49 norm, scratch worktree, each must make its spec FAIL):**
 - **Skip the `exceeded` → phase transition** (set the condition but leave
@@ -960,6 +1182,17 @@ phase** (P2f landed first) or `Failed`.
   spec 15 FAILS (the cost uses the ConfigMap, not the override).
 - **Wall clock counts paused time** (drop the `activeSeconds` pause-stop)
   → spec 17 FAILS (`activeSeconds` advances during the pause).
+- **Do not reset `lastActiveStamp` on resume** (drop the item-E reset) →
+  spec 17 / P2f spec 15 FAIL (the first post-resume reconcile adds the whole
+  pause, the cap fires spuriously).
+- **Wall clock never fires** (skip the `activeSeconds >= maxWallClock`
+  comparison — item G's missing mutation) → spec 4 FAILS (the
+  `maxWallClock` Loop is never `exceeded`, `exceededReason=WallClock` is
+  absent).
+- **Adopt the first read as a baseline of 0 and add the reading** (drop
+  the P1-B first-read adoption — count the pre-reading 400 as tokens) →
+  spec 13 FAILS (the accumulated count is 400 + 50 = 450, not 50;
+  `exceeded` may fire spuriously).
 
 **Acceptance:** envtests green under `make test`; the read goes through
 the `readProxyUsage` seam (the `readBaseCommit` pattern — a func field with
@@ -993,16 +1226,36 @@ function with golden-file unit tests), (2) the **operator's stall gate**
   check-* container's output for the **single failing check** (the
   iterate branch already names `failedCheck`; the normaliser sees that
   check's output only, so a different check failing produces a different
-  hash — the stall is on *the same* check). **The source is the verify
-  Job's check container termination output / the Job's pod status**
-  (kubelet-recorded — the same evidence channel as `lastCheckResults`'
-  exit codes; the check container's **termination message** carries a
-  bounded output tail, and the full check output is written by the check
-  script to the workspace's artifact path the operator already collects —
-  the S5a artifact seam — so the normaliser's input is
-  operator-collected, **not** a pod-log read (item 1's correction applies
-  here too: the round-1 plan said "the APIReader log path"; the real
-  channel is the termination message + the S5a artifact).
+  hash — the stall is on *the same* check). **The source (item D — the
+  round-1 text's "S5a artifact seam" does not exist: `artifact` in
+  `loop_verify_job.go` is the I47 build-artifact *init container* check, and
+  the check-* containers are `Command`-driven with **no**
+  `TerminationMessagePath`, so they write no termination message today):**
+  the operator adds a **`TerminationMessagePath`** (e.g.
+  `/tmp/check-out.txt`) to each check-* container's
+  `TerminationMessage` field, with the check script wrapper
+  (`verifySh -c <cmd> > /tmp/check-out.txt 2>&1; exit $?`) redirecting the
+  check's stdout+stderr there. Kubernetes then writes the **last 4 KB** of
+  the container's output to that file on termination (the
+  `terminationMessagePath` + `terminationMessagePolicy: File` shape; the
+  file lives on the check-tmp emptyDir the check containers already mount
+  at `/tmp`), and the operator reads it from the pod's
+  `status.initContainerStatuses[].lastState.terminated.terminationMessage`
+  (kubelet-recorded — the **same** evidence channel as `lastCheckResults`'
+  exit codes; **no pod-log read** — the round-1 text's "APIReader log
+  path" was never implementable, item 1's correction applies here too).
+  The normaliser's input is the 4 KB termination-message tail (a check
+  that writes more than 4 KB loses the head — acceptable: the stall is on
+  the *repetition* of a bounded failure signature, not the full transcript;
+  a check that needs more signal can write its failing summary to the
+  **last** lines, which the termination message captures). A **read seam**
+  for envtest: a func field `readCheckOutput func(ctx, loop, jobName,
+  checkIdx) (string, error)` on the reconciler (the `readProxyUsage`
+  pattern), defaulted to the pod-status read; envtest specs inject a fake.
+  The **script execution test** (the test norms' requirement for any shell
+  embedded in Go) runs the real generated wrapper against a scratch check
+  command and asserts the termination message carries the expected output
+  tail (and the 4 KB truncation on a >4 KB output).
 - **Rules (versioned; `normalisationVersion = "v1"` — the constant
   `stall.NormalisationVersionV1`). Seven rules** (item 7: the round-1
   plan listed six and said "five" — the count is corrected and two
@@ -1079,19 +1332,38 @@ function with golden-file unit tests), (2) the **operator's stall gate**
   - `no-noise.txt` — input with none of the noise types → byte-identical
     output (the normaliser is a no-op on clean input; guards against
     over-eager stripping).
-  - `rule-order.txt` — a **valid** malformed-timestamp input (item 7's
-    L525 correction: the round-1 input `2026-07-03T0x12:00:00Z` is not a
-    valid timestamp and did not actually exercise rule 1 before rule 2;
-    the corrected input is a **valid RFC3339 timestamp that contains a
-    ≥4-digit `0x` hex substring AFTER its position in the line** — e.g.
-    `2026-07-03T12:00:00Z panic at 0xdeadbeef` — so rule 1 strips the
-    timestamp and rule 2 then strips the surviving `0xdeadbeef`; the
-    golden pins the order: a swap (rule 2 first) produces a different
-    output because the hex inside the timestamp is removed before the
-    timestamp rule sees the line... precisely: the test asserts the
-    **output** of rules-as-ordered, and a **mutation spec** (swap the
-    order of rules 1 and 2) FAILS on this input — the order is pinned by a
-    mutation, not just a golden).
+  - `rule-order.txt` — an input where the **order of rules 1 and 2
+    genuinely matters** (item H: the round-1 input had no hex inside the
+    timestamp, so swapping the rules could not change the output and the
+    mutation could not fail). The input is a **single line** whose
+    timestamp field itself contains a `0x` hex token:
+    `2026-07-03T0xde:00:00Z crash` — the `T0xde:` is the start of the
+    RFC3339 time (the `0xde` is a 2-hex-digit hour, which is invalid time
+    but a valid *string* the rule-1 timestamp regex matches on the
+    `T[0-9]{2}` shape... precisely, the input is crafted so **rule 1's
+    timestamp regex matches a span that includes `0xde`**: the line is
+    `2026-07-03T0xde:00:00Z`, and rule 1's regex
+    `\d{4}-\d{2}-\d{2}T[0-9]{2}:[0-9]{2}:` matches `2026-07-03T0d` (the
+    `0d` where `d` is matched by a relaxed `[0-9a-f]` hour pattern the
+    test pins) — **no**, the honest statement: the input is
+    `2026-07-03T0x1e:00:00Z` and the **test asserts the output of the
+    rules-as-ordered** and a **mutation spec (swap rules 1 and 2)**
+    produces a **different** output. The mechanism: rule 1 (timestamps,
+    first) matches the whole `2026-07-03T0x1e:00:00Z` token (the test's
+    rule-1 regex is deliberately permissive enough to swallow a hex hour,
+    which is the point — a real timestamp parser would reject it, but the
+    normaliser's rule is a *regex strip*, not a parse) and removes it
+    entirely, so the `0x1e` hex is gone and rule 2 has nothing to strip.
+    If rule 2 runs **first** (the swapped order), it strips the `0x1e` →
+    `0xADDR` **before** rule 1 sees the line, leaving
+    `2026-07-03T0xADDR:00:00Z`, which rule 1 then does **not** match
+    (the `0xADDR` breaks the timestamp shape) — so the line **survives**
+    with the `0xADDR` placeholder. The two orderings produce **different
+    outputs** (one empty, one `2026-07-03T0xADDR:00:00Z`), so the golden
+    pins the order and the swap mutation **fails** on this input. (The
+    round-1 input `2026-07-03T12:00:00Z panic at 0xdeadbeef` had the hex
+    *after* the timestamp on a separate word, so both orders stripped both
+    and produced the same output — the mutation could not fail.)
 - **Version pin:** the `NormalisationVersionV1` constant's value is
   asserted (`"v1"`); a test that constructs a v1 hash and asserts the
   `StallEntry` carries `"v1"`.
@@ -1135,19 +1407,31 @@ removal that affects their inputs):**
     history — the dedup guarantees it — so a consecutive run is a run of
     *distinct Jobs* with the same hash; the `k` count is the trailing
     run's length).
-  - **`k < stallAfter` → no decision** (the Loop iterates as today; the
-    `Stalled` condition is `False`/absent).
-  - **`k == stallAfter` (and not already decided for this run) → fire**
-    (the decision is **per-run**: a fired run is marked by the
-    `Stalled=True` condition + the phase action; if the Loop later
-    produces a **different** output (the run resets) and then the same
-    output again to `k`, the stall **re-fires** — the detector is not
-    exhausted by one fire, matching P2f's stall-pause resume semantics).
-    Apply `stallAction`:
+  - **The fire rule (item C — one consistent model, replacing the
+    round-1 "k == stallAfter and not already decided" which contradicted
+    spec 3's re-fire at k=4 and spec 11's per-run-sticky mutation):**
+    **`k >= stallAfter`, evaluated once per new verify Job.** The `k`
+    count is the trailing run's length (consecutive distinct-Job entries
+    with the same hash + same `normalisationVersion`). When a **new**
+    `StallEntry` is appended (a **new** verify Job — the dedup guarantees a
+    Job name appears at most once, so a new entry is always a new Job), the
+    operator evaluates the fire **once for that Job**: if `k >=
+    stallAfter`, fire; if `k < stallAfter`, no fire. The key is **per new
+    Job, not per run**: a run of 3 with `stallAfter=3` fires on the 3rd
+    Job; if the Loop is paused and resumes and the agent produces the same
+    output on a **4th** new Job, `k` is 4 (≥3) and the stall **re-fires on
+    the 4th Job** (spec 3) — the detector is not exhausted by one fire, but
+    it does not fire *within* a single Job (one entry per Job, so there is
+    nothing to re-evaluate until the next Job). The round-1 "not already
+    decided for this run" is dropped: it implied the detector fired once
+    per *run* and was then exhausted, which contradicted both spec 3 (re-fire
+    at k=4) and the per-run-sticky mutation (spec 11) — the model is now
+    *per Job*, which makes all three consistent. Apply `stallAction`:
     - **`Fail`** → `phase=Failed`, `Failed` condition `True` reason
       `Stalled`, `Stalled=True`, the existing `Failed` cleanup, a
       `Warning` Event (`Reason: Stalled`, the message names the check +
-      N).
+      N). (A terminal `Failed` Loop has no further Jobs — the per-run-sticky
+      property is trivial: there is no 4th Job to re-fire on.)
     - **`Pause`** → the **P2f pause entry** with `pausedReason=Stall`,
       **entered AFTER the iterate bookkeeping** (item 6): the operator
       first does the iterate's normal work (advance
@@ -1157,11 +1441,15 @@ removal that affects their inputs):**
       would have set), the iteration has **already advanced**, and the
       consecutive run is **kept** (not reset — the `Stalled=True`
       condition + the history entries are intact). The resume (P2f, via
-      the annotation) re-enters `Implementing` with the run kept: the
-      next verify failure appends a **new** `StallEntry` (a new Job name,
-      a new hash) — if the output is **identical**, the run extends to
-      `k+1` and the stall **re-fires** (spec 3 below); if the output
-      **changed**, the run resets to 1 (spec 4).
+      the annotation) re-enters `Implementing` with the run kept; the
+      iterate bookkeeping advancing the iteration means the **next**
+      verify is a **new** Job (`<loop>-verify-<iteration+1>`) — item C's
+      model: a stall resume records `pausedFrom=Implementing` *after* the
+      iterate, so the next iteration is a new Job, and the fire rule is
+      `k >= stallAfter` evaluated on that new Job. If the agent produces
+      the **same** output, the new Job appends a `StallEntry`, `k` extends
+      to 4 (≥3) and the stall **re-fires** on the new Job (spec 3); if the
+      output **changed**, the run resets to 1 and no fire (spec 4).
     - **`Continue`** → `Stalled=True` + a `Warning` Event, **the phase is
       unchanged** (the Loop iterates on; the condition records the state
       — PLAN.md's "warn and keep going").
@@ -1244,10 +1532,19 @@ removal that affects their inputs):**
    `StallEntry`, no fire, a requeue (`stallHistory` + phase unchanged).
 10. **In-progress: verify Job Waiting (init not started) → no decision
     (I49).** Same as spec 9 with the init containers not terminated.
-11. **Per-run sticky (no re-fire without a reset).** After a fire (spec
-    1's shape, `Failed`), the operator re-reconciles with the same
-    evidence → no re-fire (the condition is already `True`, the phase
-    already `Failed`; the spec asserts no second Event, no phase change).
+11. **Per-Job sticky (no re-fire within a Job; item C's consistent model).**
+    A `stallAction=Fail` fire (spec 1's shape, `Failed`) → a re-reconcile
+    with the **same** evidence (the same Job, no new entry) → no re-fire
+    (the condition is already `True`, the phase already `Failed`, and the
+    per-Job rule means there is no *new* Job to evaluate → the spec
+    asserts no second Event, no phase change). For a `stallAction=Pause`
+    fire, the same holds until the resume produces a **new** Job (spec 3):
+    the operator re-reconciles a paused Loop with the **same** Job → no
+    re-fire (the phase is `Paused`, the decision is inert in `Paused` —
+    P2f's gate). (The round-1 "per-run sticky" wording is replaced by the
+    **per-Job** rule, item C: the detector fires once *per new Job*, so
+    "no re-fire without a reset" is really "no re-fire without a **new
+    Job**" — and a terminal `Failed` Loop simply has no new Job.)
 12. **ConfigMap override.** A `coxswain-stall-defaults` ConfigMap with
     `stallAfter: 2`; a Loop with **no** `spec.loop.stallAfter` → fires at
     2 consecutive (the ConfigMap's value, not the built-in 3). A Loop
@@ -1283,8 +1580,14 @@ removal that affects their inputs):**
   `Running`).
 - **Ignore the ConfigMap** (always the built-in default) → spec 12's
   "ConfigMap override" half FAILS (the fire is at 3, not 2).
-- **Re-fire on re-reconcile without a run reset** (drop the per-run sticky
-  gate) → spec 11 FAILS (a second Event).
+- **Re-fire within the same Job** (drop the per-Job rule — item C: fire
+  whenever `k >= stallAfter` on **any** reconcile, not only on a **new**
+  Job) → spec 11 FAILS (the paused/failed Loop re-fires on every reconcile
+  with the same evidence — a second Event, a phase bounce).
+- **Fire only when `k == stallAfter` exactly** (drop the `>=` — a run of 4
+  with `stallAfter=3` does not fire) → spec 3 FAILS (after resume, `k` is
+  4, the exact-`==` rule never fires, the identical output does not
+  re-fire).
 - **Evaluate the budget before the stall** (item 8) → specs 15 (and P2d
   16) FAIL (the phase is `Failed:BudgetExceeded`).
 - **Reset the consecutive run on a stall pause** (drop the "run kept"
@@ -1423,22 +1726,35 @@ produces a new commit** (the verify Job re-runs, the iteration advances,
 and the failing check's output is **identical every iteration** — the
 check is `test -f /nonexistent`, which fails with the same message
 regardless of the commit). The stub returns a fixed
-`usage: {prompt_tokens: 100, completion_tokens: 100}` per request and
-`stream: false` (non-streaming — the reference runner's shape; the
-steering-proof measures are not exercised here, they are P2b's unit
-coverage). Loops:
+`usage: {prompt_tokens: 100, completion_tokens: 100}` **per request**
+(**200 tokens total per request** — item I's arithmetic fix: the round-1
+text said "100 tokens per request" but the `usage` is 100 prompt + 100
+completion = **200**; the cap math below uses 200) and `stream: false`
+(non-streaming — the reference runner's shape; the steering-proof measures
+are not exercised here, they are P2b's unit coverage). **Cross-check Loop
+(item I):** the fixture runs **one additional Loop** whose `modelEndpoint`
+is the **real vLLM LB** (`192.168.1.20:8000`, the homelab backend), so the
+cross-check in assertion 3 reads **that Loop's** per-Loop `status.budget`
+counts against the real vLLM delta — the other Loops point at the stub and
+are **not** part of the cross-check (the round-1 text pointed all Loops at
+the stub, so the real-vLLM delta could never see their tokens — the check
+was vacuous). Loops:
 - **the stall Loop:** `stallAfter: 3`, `stallAction: Fail`, `maxIterations`
   high (10) — so the stall (at 3) stops it, not the cap.
-- **the budget Loop:** `maxTokens: 250` (so the cap is hit on the 3rd
-  request: 300 tokens ≥ 250 — the assertion is **`>= cap`**, item 14: the
-  runner may make ≥1 request per iteration, so the exact total is not
-  pinned; `onExceeded: Fail`, `stallAction: Continue` (so the stall does
-  not fire first — the budget fires first: 300 ≥ 250 on the 3rd request,
-  while the stall run is 3 on the 3rd *failure* — the budget is on the
-  **request**, the stall on the **failure**, so the budget can fire on
-  request 3 before the 3rd verify failure; the spec asserts the reason is
-  `BudgetExceeded` and `status.budget.promptTokens + completionTokens >=
-  250`).
+- **the budget Loop:** `maxTokens: 300` (so the cap is hit on the 2nd
+  request: **400 tokens ≥ 300** — the arithmetic uses **200 tokens per
+  request**, item I: request 1 → 200 (< 300, no fire), request 2 → 400
+  (≥ 300, fire). The round-1 text said `maxTokens: 250` hit on the 3rd
+  request at 300 tokens, which assumed 100/request — with the correct
+  200/request, 250 would fire on request 2 at 400; the cap is set to 300
+  so the fire is unambiguous at request 2. The assertion is **`>= cap`**,
+  item 14: the runner may make ≥1 request per iteration, so the exact total
+  is not pinned; `onExceeded: Fail`, `stallAction: Continue` (so the stall
+  does not fire first — the budget fires first on request 2, while the stall
+  run is only 1–2 on the 1st–2nd *failure*; the budget is on the **request**,
+  the stall on the **failure**, so the budget can fire before the 3rd verify
+  failure; the spec asserts the reason is `BudgetExceeded` and
+  `status.budget.promptTokens + completionTokens >= 300`).
 - **the control Loop:** `stallAfter: 10`, `maxIterations: 5`, the same
   failing check — it spins to 5 (the cap) without a stall, proving the
   stall Loop stopped **because of the detector**, not the cap.
@@ -1459,20 +1775,25 @@ Assertions (script + recorded output in the PR):
 2. **The `BudgetExceeded` path.** The budget Loop → `phase=Failed`, the
    `Failed` condition reason `BudgetExceeded`, `status.budget.exceeded=
    true`, `exceededReason=Tokens`, the Event; **the token total is
-   `>= 250`** (the `>= cap` assertion, item 14 — not an exact 600).
-3. **The real-backend cross-check (P2a / item 14).** The kind cluster's
-   model endpoint is a **real vLLM backend** (the homelab pi6/pi8, the
-   dev overlay's `modelEndpoint`), so the cross-check reads the **real**
-   `vllm:prompt_tokens_total` / `vllm:generation_tokens_total` deltas from
-   the **homelab Prometheus** (`--context default`, read-only) over the
-   stall + budget Loops' wall-clock window: the **sum of the per-Loop**
-   `status.budget` token counts is **consistent with** (≤, given the other
-   Loops' concurrent tokens + the pi6+pi8 sum) the backend delta. A
-   stub-emitted counter is **not** used (item 14: it would be circular —
-   the stub would be both the meter's input and the cross-check's oracle).
-   (If the homelab Prometheus is unreachable from the kind runner, the
-   cross-check is **dropped** with a note — it is a consistency check,
-   not a gate; the per-Loop counts are the source of truth.)
+   `>= 300`** (the `>= cap` assertion, item 14 — with 200 tokens per request,
+   the total is 200 after request 1 and 400 after request 2, so `>= 300`
+   is satisfied at request 2; not an exact number).
+3. **The real-backend cross-check (P2a / item I).** The **cross-check
+   Loop** (the one Loop pointed at the real vLLM LB, `192.168.1.20:8000`,
+   item I: the other Loops point at the stub and cannot be cross-checked
+   against the real vLLM delta — the round-1 text pointed *all* Loops at the
+   stub, so the assertion was vacuous) has its per-Loop `status.budget`
+   token counts read against the **real** `vllm:prompt_tokens_total` /
+   `vllm:generation_tokens_total` deltas from the **homelab Prometheus**
+   (`--context default`, read-only) over that Loop's wall-clock window:
+   the **cross-check Loop's** per-Loop `status.budget` count is
+   **consistent with** (≤, given the other Loops' concurrent tokens on the
+   shared backend) the pi6+pi8 backend delta. A stub-emitted counter is
+   **not** used (item 14: it would be circular — the stub would be both the
+   meter's input and the cross-check's oracle). (If the homelab Prometheus
+   is unreachable from the kind runner, the cross-check is **dropped** with a
+   note — it is a consistency check, not a gate; the per-Loop counts are the
+   source of truth.)
 4. **The paused-Loop resume.** The resume Loop: `suspend` flipped
    `false → true` **while `phase == Implementing`** (the script **waits
    on the phase** — `kubectl wait`/a poll on `status.phase`, item 14's

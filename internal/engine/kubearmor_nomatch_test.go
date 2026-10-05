@@ -138,12 +138,16 @@ func TestPinNoKaptFixtureYieldsNoMatchError(t *testing.T) {
 func TestApplyNoKaptCRDGatedOnAllowUnenforced(t *testing.T) {
 	fqdn := func(loopName, ns string) string { return "coxswain-" + loopName + "-proxy." + ns + ".svc" }
 	egressFqdn := func(loopName, ns string) string { return "coxswain-" + loopName + "-egress-proxy." + ns + ".svc" }
+	toolFqdn := func(loopName, ns, toolName string) string {
+		return "coxswain-" + loopName + "-tool-" + toolName + "." + ns + ".svc"
+	}
 
 	t.Run("AllowUnenforced=false: missing KubeArmor CRD is a loud error", func(t *testing.T) {
 		e := &KubeArmorEnforcer{
 			Client:          newNoKaptClient(t),
 			ProxyFQDN:       fqdn,
 			EgressProxyFQDN: egressFqdn,
+			ToolProxyFQDN:   toolFqdn,
 			AllowUnenforced: false,
 		}
 		loop := noKaptTestLoop()
@@ -161,6 +165,7 @@ func TestApplyNoKaptCRDGatedOnAllowUnenforced(t *testing.T) {
 			Client:          newNoKaptClient(t),
 			ProxyFQDN:       fqdn,
 			EgressProxyFQDN: egressFqdn,
+			ToolProxyFQDN:   toolFqdn,
 			AllowUnenforced: true,
 		}
 		loop := noKaptTestLoop()

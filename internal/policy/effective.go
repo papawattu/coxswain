@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/papawattu/coxswain/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 )
@@ -111,6 +112,11 @@ type EffectivePolicy struct {
 	Network []string
 	// Files is the paths the agent may access (the union across policies).
 	Files []string
+	// Tools is the credentialed tools the agent may use through operator-owned
+	// tool proxies (D41, ADR-0008; the union across policies, same semantics
+	// as the other allows). The enforcer emits one KubeArmorPolicy per tool
+	// and adds the tool proxy Service FQDNs to the agent's DNS allowlist.
+	Tools []v1alpha1.ToolSpec
 }
 
 // Translate turns a Loop's effective allows into the engine policy (C6a). It is

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
@@ -45,6 +46,12 @@ type KubeArmorEnforcer struct {
 	// at construction (cmd/main.go and the envtest suites), never per reconcile.
 	ProxyFQDN       func(loopName, ns string) string
 	EgressProxyFQDN func(loopName, ns string) string
+	// ToolProxyFQDN is the per-Loop tool proxy Service FQDN (D41d, ADR-0008):
+	// built by the controller from toolProxyServiceName + the cluster domain.
+	// The FQDN (not FQDN:port) is what KubeArmor matchDNSQueries compares
+	// against. REQUIRED: Apply returns an error when it is nil (same rule as
+	// ProxyFQDN/EgressProxyFQDN).
+	ToolProxyFQDN func(loopName, ns, toolName string) string
 	// ClusterDomain is the cluster's service DNS domain (default
 	// policy.DefaultClusterDomain when empty) used by the model-proxy policy's
 	// bare-host FQDN expansion (R16 I44 item 2). Set at construction.
@@ -75,7 +82,7 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// The FQDNs are wired at construction by the controller (R16 I44 item 1:
 	// the enforcer must not build them from a `-proxy` / `-egress-proxy`
 	// literal). They are required — a missing wiring is a configuration error.
-	if e.ProxyFQDN == nil || e.EgressProxyFQDN == nil {
+	if e.ProxyFQDN == nil || e.EgressProxyFQDN == nil || e.ToolProxyFQDN == nil {
 		return ErrNoProxyFQDNs
 	}
 	egressFQDN := ""
@@ -106,9 +113,88 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// fencing a pod that no longer exists — drift the reconciler must own).
 	if len(p.Network) > 0 {
 		egressObj := EmitEgressProxyKubeArmorPolicy(loop.Name, loop.Namespace, p.Network)
-		return e.createOrUpdateKapt(ctx, loop, egressObj)
+		if err := e.createOrUpdateKapt(ctx, loop, egressObj); err != nil {
+			return err
+		}
+	} else if err := e.cleanupEgressProxyKapt(ctx, loop); err != nil {
+		return err
 	}
-	return e.cleanupEgressProxyKapt(ctx, loop)
+
+	// D41d: the tool proxy policies (one per tool in the effective policy).
+	// Created when the tool is in the union, cleaned up when it is not (the
+	// egress proxy policy's drift rationale: a stale policy would keep fencing
+	// a pod that no longer exists).
+	expected := make(map[string]bool, len(p.Tools))
+	for _, t := range p.Tools {
+		expected[t.Name] = true
+		toolObj := EmitToolProxyKubeArmorPolicy(loop.Name, loop.Namespace, t.Name, t.Upstream)
+		if err := e.createOrUpdateKapt(ctx, loop, toolObj); err != nil {
+			return err
+		}
+	}
+	return e.cleanupStaleToolKapt(ctx, loop, expected)
+}
+
+// cleanupStaleToolKapt deletes the tool proxy KubeArmorPolicies for each tool
+// name the enforcer previously owned that is NO LONGER in the effective union
+// (D41d cleanup; the egress proxy policy's drift rationale). A FOREIGN policy
+// occupying the name is left alone (I2 never-take-over).
+func (e *KubeArmorEnforcer) cleanupStaleToolKapt(ctx context.Context, loop *v1alpha1.Loop, expected map[string]bool) error {
+	for name := range e.listToolKaptNames(ctx, loop) {
+		// The lister returns the full policy names; the tool name is the part
+		// after "coxswain-<loop>-tool-" (the expected map is keyed by tool
+		// name).
+		toolName := strings.TrimPrefix(name, "coxswain-"+loop.Name+"-tool-")
+		if expected[toolName] {
+			continue
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(kaptGroupVersion.WithKind(kaptKind))
+		if err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, obj); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			if meta.IsNoMatchError(err) && e.AllowUnenforced {
+				continue
+			}
+			return fmt.Errorf("get tool proxy KubeArmorPolicy %s: %w", name, err)
+		}
+		if !metav1.IsControlledBy(obj, loop) {
+			// Foreign object: leave it alone (I2 never-take-over).
+			continue
+		}
+		if err := e.Client.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete tool proxy KubeArmorPolicy %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// listToolKaptNames returns the names of the tool proxy KubeArmorPolicies the
+// enforcer sees for the Loop (discovered by the tool proxy's DISJOINT label
+// set on the policy's spec.selector.matchLabels — the emitter stamps them,
+// mirroring the pod/Service label set). A List error (e.g. a missing scoped
+// cache, the podBlindClient envtest behaviour) leaves the set empty (nothing
+// cleaned up this pass) — never a reconcile error.
+func (e *KubeArmorEnforcer) listToolKaptNames(ctx context.Context, loop *v1alpha1.Loop) map[string]struct{} {
+	names := make(map[string]struct{})
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(kaptGroupVersion.WithKind("KubeArmorPolicyList"))
+	if err := e.Client.List(ctx, list, client.InNamespace(loop.Namespace)); err != nil {
+		return names
+	}
+	for i := range list.Items {
+		item := &list.Items[i]
+		sel, _, _ := unstructured.NestedMap(item.Object, KaptSpecKey, KaptSelectorKey)
+		raw, _ := sel[KaptMatchLabelsKey].(map[string]any)
+		if raw[policy.ComponentLabelKey] != policy.ComponentToolProxyLabel || raw["coxswain.io/tool-proxy-for"] != loop.Name {
+			continue
+		}
+		if tool, ok := raw["coxswain.io/tool"].(string); ok && tool != "" {
+			names[item.GetName()] = struct{}{}
+		}
+	}
+	return names
 }
 
 // cleanupEgressProxyKapt deletes the egress proxy KubeArmorPolicy when the

@@ -888,8 +888,33 @@ func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.
 		union.Exec = append(union.Exec, ap.Spec.Exec...)
 		union.Network = append(union.Network, ap.Spec.Network...)
 		union.Files = append(union.Files, ap.Spec.Files...)
+		union.Tools = append(union.Tools, ap.Spec.Tools...)
 	}
+	union.Tools = dedupToolsBySpec(union.Tools)
 	return union, nil
+}
+
+// dedupToolsBySpec removes duplicate ToolSpecs from the union by full struct
+// equality (name + upstream + credentialSecretRef). Tools are a SET — a
+// duplicate across policies is deduped (D41, ADR-0008; the union semantics
+// mirror the other allows). This is the union-side dedup; the conflictingTool
+// + dedupTools pair (D41a) handles name-level conflict detection and first-
+// occurrence-wins dedup for the tool proxy plumbing. Both are needed: the
+// union dedup (this) ensures the KubeArmor enforcer sees each tool exactly
+// once (one policy per tool); the conflictingTool check (D41a) ensures a
+// name collision with differing specs is rejected before the union is built.
+func dedupToolsBySpec(tools []coxv1alpha1.ToolSpec) []coxv1alpha1.ToolSpec {
+	seen := make(map[string]struct{}, len(tools))
+	out := make([]coxv1alpha1.ToolSpec, 0, len(tools))
+	for _, t := range tools {
+		key := t.Name + "\x00" + t.Upstream + "\x00" + t.CredentialSecretRef.Name + "\x00" + t.CredentialSecretRef.Key
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }
 
 // ensureSandbox creates the Loop's Sandbox if it does not already exist, and
@@ -984,19 +1009,29 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// (an agent that could re-route its own egress away from the egress proxy
 	// would defeat the network allowlist).
 	if needsEgressProxy(ctx, r, loop) {
-		noProxy := r.egressNOProxy(loop)
+		noProxy := r.egressNOProxy(ctx, loop)
 		agentEnv = append(agentEnv, r.operatorProxyEnv(loop.Name, loop.Namespace)...)
 		agentEnv = append(agentEnv,
 			corev1.EnvVar{Name: envNoProxy, Value: noProxy},
 			corev1.EnvVar{Name: envNoProxyLower, Value: noProxy},
 		)
 	}
+	// D41d: the COX_TOOL_<NAME>_URL env per tool in the effective policy.
+	// The tool proxy Service FQDN (the agent reaches the tool proxy directly,
+	// not through the egress proxy — the tool proxy host is in NO_PROXY).
+	if ep, err := r.effectivePolicy(ctx, loop); err == nil && len(ep.Tools) > 0 {
+		for _, t := range ep.Tools {
+			agentEnv = append(agentEnv, r.toolEnv(loop.Name, loop.Namespace, t))
+		}
+	}
 	for _, e := range loop.Spec.Agent.Env {
-		if isOperatorProxyEnv(e.Name) {
+		if isOperatorProxyEnv(e.Name) || isToolEnv(e.Name) {
 			// A user spec.agent.env var colliding with the operator-owned proxy
 			// names is dropped (I42d): the operator value wins so the agent
-			// cannot re-route its egress away from the egress proxy. A non-
-			// colliding name falls through and is preserved.
+			// cannot re-route its egress away from the egress proxy. A
+			// COX_TOOL_<NAME>_URL var is also reserved (D41d): the agent cannot
+			// re-route a tool URL away from the tool proxy. A non-colliding name
+			// falls through and is preserved.
 			continue
 		}
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
@@ -1910,16 +1945,28 @@ func (r *LoopReconciler) egressProxyServiceURL(loopName, namespace string) strin
 // (short + FQDN form, so model calls — which hit COX_MODEL_BASE_URL, the model
 // proxy's .svc URL — bypass the egress proxy) + localhost/loopback. The model
 // proxy's host matches the COX_MODEL_BASE_URL host, which is what proxy clients
-// match NO_PROXY by.
-func (r *LoopReconciler) egressNOProxy(loop *coxv1alpha1.Loop) string {
+// match NO_PROXY by. D41d: the tool proxy FQDNs are also in NO_PROXY when tools
+// are present (the agent talks to the tool proxy directly, not through the
+// egress proxy — the tool proxy FQDNs are COX_TOOL_<NAME>_URL hosts).
+func (r *LoopReconciler) egressNOProxy(ctx context.Context, loop *coxv1alpha1.Loop) string {
 	proxySvc := proxyServiceName(loop.Name)
 	domain := r.clusterDomain()
-	return strings.Join([]string{
+	noProxy := []string{
 		proxySvc + "." + loop.Namespace + ".svc",
 		proxySvc + "." + loop.Namespace + ".svc." + domain,
 		"localhost",
 		"127.0.0.1",
-	}, ",")
+	}
+	// D41d: the tool proxy FQDNs (the agent reaches the tool proxy directly).
+	// The effectivePolicy call is idempotent; a nil err means no policy refs or
+	// all policies absent (default-deny), which means no tools.
+	if ep, err := r.effectivePolicy(ctx, loop); err == nil {
+		for _, t := range ep.Tools {
+			fqdn := r.toolProxyFQDN(loop.Name, loop.Namespace, t.Name)
+			noProxy = append(noProxy, fqdn)
+		}
+	}
+	return strings.Join(noProxy, ",")
 }
 
 // operatorProxyEnvNames are the agent env var names the operator owns for the
@@ -1940,6 +1987,57 @@ var operatorProxyEnvNames = map[string]struct{}{
 	envNoProxyLower:  {},
 	envAllProxy:      {},
 	envAllProxyLower: {},
+}
+
+// isToolEnv reports whether a spec.agent.env var name is a reserved
+// COX_TOOL_<NAME>_URL name (D41d: the agent cannot re-route a tool URL away
+// from the tool proxy — the operator sets it, not the agent). The reserved
+// prefix is COX_TOOL_ and the suffix is _URL; a name that does not match that
+// shape is not a tool env (it falls through and is preserved).
+func isToolEnv(name string) bool {
+	return strings.HasPrefix(name, "COX_TOOL_") && strings.HasSuffix(name, "_URL") && len(name) > len("COX_TOOL_")+len("_URL")
+}
+
+// toolEnv is the COX_TOOL_<NAME>_URL env var for one tool in the effective
+// policy (D41d, ADR-0008): the tool proxy's Service FQDN, built from
+// toolProxyServiceName + the cluster domain (the agent talks to the tool
+// proxy directly, not through the egress proxy — the tool proxy host is in
+// NO_PROXY via egressNOProxy which includes the tool proxy FQDNs when tools
+// are present).
+func (r *LoopReconciler) toolEnv(loopName, ns string, t coxv1alpha1.ToolSpec) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name:  "COX_TOOL_" + strings.ToUpper(t.Name) + "_URL",
+		Value: r.toolProxyServiceURL(loopName, ns, t.Name),
+	}
+}
+
+// toolProxyServiceURL is the tool proxy's Service FQDN as a URL (D41d):
+// http://<loop>-tool-<name>.<ns>.svc.<domain>:8080. The agent uses this as
+// COX_TOOL_<NAME>_URL — the tool proxy is the agent's only route to the
+// tool's upstream (the credential never reaches the agent, ADR-0006/D41).
+func (r *LoopReconciler) toolProxyServiceURL(loopName, ns, toolName string) string {
+	return fmt.Sprintf("http://%s.%s.svc.%s:%d", toolProxyServiceName(loopName, toolName), ns, r.clusterDomain(), toolProxyPort)
+}
+
+// toolProxyFQDN returns the tool proxy's Service FQDN (D41d, for the agent's
+// KubeArmor DNS allowlist): <loop>-tool-<name>.<ns>.svc. The FQDN (not
+// FQDN:port) is what KubeArmor matchDNSQueries compares against. Wired into
+// the KubeArmor enforcer at construction (R16 I44 item 1: the enforcer does
+// not build it from a literal).
+func (r *LoopReconciler) toolProxyFQDN(loopName, ns, toolName string) string {
+	return fmt.Sprintf("%s.%s.svc", toolProxyServiceName(loopName, toolName), ns)
+}
+
+// toolProxyNetpolPeer returns the agent sandbox NetworkPolicy's egress peer
+// for one tool proxy (D41d): a podSelector matching the tool proxy's disjoint
+// label set (the tool proxy is a sibling of the agent, not a child of the
+// model proxy / egress proxy).
+func toolProxyNetpolPeer(loopName, toolName string) networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{
+			MatchLabels: toolProxyLabels(loopName, toolName),
+		},
+	}
 }
 
 // Proxy env-var names (the operator's, emitted on the agent + model-proxy +
@@ -1998,6 +2096,16 @@ func ProxyServiceFQDN(loopName, namespace string) string {
 // allowlist from the URL the agent dials.
 func EgressProxyServiceFQDN(loopName, namespace string) string {
 	return egressProxyServiceName(loopName) + "." + namespace + ".svc"
+}
+
+// ToolProxyServiceFQDN returns the per-Loop tool proxy Service FQDN the agent
+// resolves via DNS to reach the tool proxy (D41d: <loop>-tool-<name>.<ns>.svc).
+// Built from toolProxyServiceName (the controller's name) — NOT a
+// `-tool-` literal (R16 I44 item 1, D41d). It is what the agent's DNS
+// allowlist carries so a rename cannot desync the allowlist from the URL the
+// agent dials (COX_TOOL_<NAME>_URL).
+func ToolProxyServiceFQDN(loopName, namespace, toolName string) string {
+	return toolProxyServiceName(loopName, toolName) + "." + namespace + ".svc"
 }
 
 // isOperatorProxyEnv reports whether name is one of the operator-owned proxy
@@ -3147,6 +3255,18 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		}
 	}
 
+	// D41d: the agent's egress to the tool proxies (one egress rule per tool
+	// in the effective policy, port 8080 TCP to the tool proxy's disjoint
+	// label set). No tools -> no extra egress rule.
+	if ep, err := r.effectivePolicy(ctx, loop); err == nil && len(ep.Tools) > 0 {
+		for _, t := range ep.Tools {
+			agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
+				To:    []networkingv1.NetworkPolicyPeer{toolProxyNetpolPeer(loop.Name, t.Name)},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(toolProxyPort), Protocol: new(corev1.ProtocolTCP)}},
+			})
+		}
+	}
+
 	// Agent pod NetworkPolicy: ingress deny-all (P1-2: R13 says "Ingress:
 	// none" — the agent pod must be unreachable from every other pod,
 	// including other Loops' agents), egress to this Loop's proxy + DNS.
@@ -3314,6 +3434,80 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		}
 	}
 
+	// D41d: the tool proxy NetworkPolicies (one per tool in the effective
+	// policy). Ingress: only from this Loop's agent on 8080. Egress: external
+	// with carve-outs (the tool proxy dials the upstream's port only — the
+	// application layer enforces the request rules) + DNS. No tools -> no
+	// tool netpols (and cleanup of stale ones).
+	if tools, err := r.effectivePolicyTools(ctx, loop); err == nil {
+		expected := make(map[string]bool, len(tools))
+		for _, t := range tools {
+			expected[t.Name] = true
+			toolNP := &networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      toolProxyNetpolName(loopName, t.Name),
+					Namespace: ns,
+					// The identifying label (disjoint from the agent's
+					// coxswain.io/loop) the cleanup List and the foreign gate
+					// key on. Without it, cleanupStaleToolProxyNetpols's
+					// LabelSelector finds nothing and stale netpols leak.
+					Labels: map[string]string{toolProxyForLabel: loopName, toolNameLabel: t.Name},
+				},
+				Spec: networkingv1.NetworkPolicySpec{
+					PodSelector: metav1.LabelSelector{MatchLabels: toolProxyLabels(loopName, t.Name)},
+					PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+					Ingress: []networkingv1.NetworkPolicyIngressRule{
+						{
+							From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+							Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(toolProxyPort), Protocol: new(corev1.ProtocolTCP)}},
+						},
+					},
+					Egress: []networkingv1.NetworkPolicyEgressRule{
+						{
+							// Egress rule 1: external v4 with carve-outs (no port
+							// restriction). The tool proxy dials the upstream's port
+							// only; the application layer enforces the request rules.
+							To: []networkingv1.NetworkPolicyPeer{
+								{
+									IPBlock: &networkingv1.IPBlock{
+										CIDR:   "0.0.0.0/0",
+										Except: egressCarveOutCIDRs(r.PodCIDR, r.ServiceCIDR),
+									},
+								},
+							},
+						},
+						{
+							// Egress rule 1b: the v6 mirror (dual-stack).
+							To: []networkingv1.NetworkPolicyPeer{
+								{
+									IPBlock: &networkingv1.IPBlock{
+										CIDR:   "::/0",
+										Except: egress.CarveOutCIDRsV6(),
+									},
+								},
+							},
+						},
+						{
+							To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+							Ports: dnsPorts(),
+						},
+					},
+				},
+			}
+			if _, err := r.createOrUpdateNP(ctx, loop, toolNP); err != nil {
+				if merr := mapForeign(toolNP.Name, err); merr != nil {
+					return merr
+				}
+			}
+		}
+		// Cleanup runs on EVERY reconcile (not only when the tool set is
+		// empty): a tool removed from a multi-tool set must have its netpol
+		// deleted while the others' remain (the cleanupStaleToolKapt pattern).
+		if merr := r.cleanupStaleToolProxyNetpols(ctx, loop, expected); merr != nil {
+			return merr
+		}
+	}
+
 	// I42c review P2 (round 3): the conflict is resolved once no createOrUpdateNP
 	// hit a foreign netpol this reconcile. Clear NetworkPolicyConflict to
 	// False/Resolved when it was previously True and no conflict ran (the
@@ -3341,7 +3535,15 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 // it). The three names are the KubeArmorPolicy names the Enforcer emits for
 // this Loop (C6b agent policy + I42f proxy policies).
 func foreignKaptPolicies(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
-	for _, name := range []string{"coxswain-" + loop.Name, "coxswain-" + loop.Name + "-proxy", "coxswain-" + loop.Name + "-egress-proxy"} {
+	names := []string{"coxswain-" + loop.Name, "coxswain-" + loop.Name + "-proxy", "coxswain-" + loop.Name + "-egress-proxy"}
+	// D41d: the tool proxy kapt names (one per tool in the effective policy).
+	// A foreign tool proxy kapt holds the sandbox Suspended.
+	if tools, err := r.effectivePolicyTools(ctx, loop); err == nil {
+		for _, t := range tools {
+			names = append(names, "coxswain-"+loop.Name+"-tool-"+t.Name)
+		}
+	}
+	for _, name := range names {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(engine.KubeArmorGVK)
 		err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, obj)
@@ -3365,6 +3567,47 @@ func foreignKaptPolicies(ctx context.Context, r *LoopReconciler, loop *coxv1alph
 	return false
 }
 
+// toolProxyNetpolName returns the tool proxy NetworkPolicy name (D41d):
+// <loop>-tool-<name>-netpol.
+func toolProxyNetpolName(loopName, toolName string) string {
+	return derivedName(loopName, "-tool-"+toolName+"-netpol")
+}
+
+// cleanupStaleToolProxyNetpols deletes the tool proxy NetworkPolicies for each
+// tool this Loop previously owned that is NO LONGER in the current tool set
+// (D41d cleanup, the cleanupStaleToolKapt pattern). It runs on EVERY reconcile
+// — not only when the tool set is empty — so removing one of several tools
+// deletes that tool's netpol while the others' remain. A FOREIGN netpol
+// occupying the name is left alone (I2 never-take-over).
+func (r *LoopReconciler) cleanupStaleToolProxyNetpols(ctx context.Context, loop *coxv1alpha1.Loop, expected map[string]bool) error {
+	list := &networkingv1.NetworkPolicyList{}
+	if err := r.List(ctx, list, client.InNamespace(loop.Namespace), client.MatchingLabels{"coxswain.io/tool-proxy-for": loop.Name}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("list tool proxy netpols: %w", err)
+	}
+	for i := range list.Items {
+		np := &list.Items[i]
+		// The netpol name is <loop>-tool-<name>-netpol; the tool name is the
+		// part between "-tool-" and "-netpol" (the expected map is keyed by
+		// tool name, mirroring cleanupStaleToolKapt).
+		toolName := strings.TrimSuffix(np.Name, "-netpol")
+		toolName = strings.TrimPrefix(toolName, loop.Name+"-tool-")
+		if expected[toolName] {
+			continue
+		}
+		if !metav1.IsControlledBy(np, loop) {
+			// Foreign object: leave it alone (never take over, I2/I42b).
+			continue
+		}
+		if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete tool proxy netpol %s/%s: %w", loop.Namespace, np.Name, err)
+		}
+	}
+	return nil
+}
+
 // foreignNetPols reports whether any of this Loop's NetworkPolicies exists
 // and is NOT controlled by the Loop (I42c review P2 round 3: the sandbox
 // gate that holds the sandbox Suspended on a foreign netpol must be
@@ -3374,7 +3617,15 @@ func foreignKaptPolicies(ctx context.Context, r *LoopReconciler, loop *coxv1alph
 // error, so a transient failure is not terminal. An ABSENT netpol is not a
 // conflict (ensureNetworkPolicy creates it).
 func foreignNetPols(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
-	for _, name := range []string{loop.Name + "-agent-netpol", loop.Name + "-proxy-netpol", loop.Name + "-egress-proxy-netpol"} {
+	names := []string{loop.Name + "-agent-netpol", loop.Name + "-proxy-netpol", loop.Name + "-egress-proxy-netpol"}
+	// D41d: the tool proxy netpol names (one per tool in the effective
+	// policy). A foreign tool proxy netpol holds the sandbox Suspended.
+	if tools, err := r.effectivePolicyTools(ctx, loop); err == nil {
+		for _, t := range tools {
+			names = append(names, toolProxyNetpolName(loop.Name, t.Name))
+		}
+	}
+	for _, name := range names {
 		np := &networkingv1.NetworkPolicy{}
 		err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, np)
 		if apierrors.IsNotFound(err) {

@@ -1,0 +1,75 @@
+Image digest: sha256:c2544572d03ff631e86325d2dc5de3f1a8fe96a03d0fc55c722d4e740f15010d
+=== Namespace: p2f-kind-1791221141 ===
+namespace/p2f-kind-1791221141 created
+error: resource mapping not found for name: "p2f-kind" namespace: "p2f-kind-1791221141" from "STDIN": no matches for kind "Loop" in version "coxswain.io/v1alpha1"
+ensure CRDs are installed first
+Error from server (BadRequest): error when creating "STDIN": Loop in version "v1alpha1" cannot be handled as a Loop: strict decoding error: unknown field "spec.runner"
+loop.coxswain.wattu.com/p2f-kind created
+=== Phase after creation (15s) ===
+Planning Planning
+=== SET suspend=true ===
+loop.coxswain.wattu.com/p2f-kind patched
+=== Phase after suspend=true (10s) ===
+Planning pausedFrom= pausedReason=
+NAME               READY   REASON             AGE
+p2f-kind-sandbox   False   SandboxSuspended   59s
+status:
+  baseCommit: 445c60f47bd81b73cb7a73e678daa4aee206c89e
+  conditions:
+  - lastTransitionTime: "2026-10-05T17:26:21Z"
+    message: all network allows are expressible at full precision by the KubeArmor
+      translation
+--
+    status: "False"
+    type: PolicyTranslationLossy
+  - lastTransitionTime: "2026-10-05T17:26:21Z"
+=== Phase after RBAC fix (10s) ===
+phase=Planning pausedFrom= pausedReason=
+NAME               READY   REASON             AGE
+p2f-kind-sandbox   False   SandboxSuspended   5m57s
+=== Phase after RBAC fix (15s) ===
+phase=Planning pausedFrom= pausedReason=
+NAME               READY   REASON             AGE
+p2f-kind-sandbox   False   SandboxSuspended   7m55s
+loop.coxswain.wattu.com/p2f-kind annotated
+=== Phase after trigger (15s) ===
+phase=Paused pausedFrom= pausedReason=
+=== Un-pause (suspend=false) ===
+loop.coxswain.wattu.com/p2f-kind patched
+=== Phase after un-pause ===
+phase=Paused pausedFrom= pausedReason=
+loop.coxswain.wattu.com/p2f-kind patched (no change)
+phase=Paused
+loop.coxswain.wattu.com "p2f-kind" deleted
+=== Recreate Loop ===
+loop.coxswain.wattu.com/p2f-kind created
+=== Phase after recreate (15s) ===
+phase=Planning
+=== SET suspend=true ===
+loop.coxswain.wattu.com/p2f-kind patched
+=== Phase after suspend=true (15s) ===
+phase=Paused pausedFrom=Planning pausedReason=Suspend
+NAME               READY   REASON             AGE
+p2f-kind-sandbox   False   SandboxSuspended   40s
+=== SET suspend=false (resume) ===
+loop.coxswain.wattu.com/p2f-kind patched
+=== Phase after suspend=false (15s) ===
+phase=Planning pausedFrom= pausedReason=
+NAME               READY   REASON                 AGE
+p2f-kind-sandbox   False   DependenciesNotReady   59s
+=== Sandbox after 30s more ===
+NAME               READY   REASON              AGE
+p2f-kind-sandbox   True    DependenciesReady   92s
+
+=== PASS/FAIL checks ===
+PASS: phase=Paused, pausedFrom=Planning, pausedReason=Suspend
+PASS: sandbox SandboxSuspended while paused
+PASS: phase=Planning (back to pausedFrom) after suspend=false
+PASS: pausedFrom/pausedReason cleared on resume
+PASS: sandbox DependenciesReady (waking up) after resume
+
+=== Notes ===
+Image digest: sha256:c2544572d03ff631e86325d2dc5de3f1a8fe96a03d0fc55c722d4e740f15010d
+Operator image: coxswain-controller:main-f6e50b0-rbac
+RBAC fix: added delete to services ClusterRole (pre-existing gap)
+CRD fix: applied regenerated CRD with pausedFrom/pausedReason fields

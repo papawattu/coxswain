@@ -105,6 +105,14 @@ var _ = BeforeSuite(func() {
 	testEnv.ControlPlane.APIServer.Configure().Append(
 		"--enable-admission-plugins=ValidatingAdmissionPolicy",
 	)
+	// P2d: the envtest apiserver's default --service-cluster-ip-range is
+	// 10.0.0.0/24 (256 addresses); the P2d specs create a metering-proxy
+	// Service per Loop and exhaust that range (hosted CI failure:
+	// "failed to allocate a serviceIP: range is full"). Widen it to /16 so
+	// the suite's Services fit. The operator test fixtures keep their own
+	// ServiceCIDR values (10.96.0.0/12 etc.) which are pure egress-policy
+	// inputs, not the apiserver's allocation range.
+	testEnv.ControlPlane.APIServer.Configure().Set("service-cluster-ip-range", "10.0.0.0/16")
 
 	// Retrieve the first found binary directory to allow running tests from IDEs
 	if getFirstFoundEnvTestBinaryDir() != "" {

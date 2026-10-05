@@ -192,44 +192,64 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 	// comma-less multi-part forms (1h30m, 2h45m10s) and reject the comma
 	// form (1h,30m — time.ParseDuration rejects it), signed values and bare
 	// numbers. Every admitted example must also parse at the operator seam.
-	It("5: maxWallClock — Go duration forms admitted, comma/signed/bare rejected", func() {
-		admitted := []string{"1h30m", "2h45m10s", "90s", "1.5h"}
-		It("accepts every Go duration form", func() {
-			for _, d := range admitted {
-				ns := newNamespace()
-				defer func(ns string) {
-					_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
-				}(ns)
-				name := "p2cwc" + d[:2]
-				u := baseLoop(name, ns)
-				Expect(unstructured.SetNestedField(u.Object, d, "spec", "budget", "maxWallClock")).To(Succeed())
-				Expect(k8sClient.Create(ctx, u)).To(Succeed(),
-					"maxWallClock %q is a valid Go duration and must be admitted", d)
+	// (Flat sibling specs — Ginkgo forbids nested It nodes.)
 
-				// The operator seam must parse it without error.
-				_, err := coxv1alpha1.ParseMaxWallClock(d)
-				Expect(err).ToNot(HaveOccurred(), "ParseMaxWallClock must accept %q", d)
-			}
-		})
+	// p2cWCFixture creates a Loop with the given maxWallClock in its own
+	// namespace and returns the created/unstructured Loop + namespace for
+	// cleanup.
+	p2cWCFixture := func(name, ns, d string) *unstructured.Unstructured {
+		u := baseLoop(name, ns)
+		Expect(unstructured.SetNestedField(u.Object, d, "spec", "budget", "maxWallClock")).To(Succeed())
+		return u
+	}
 
-		rejected := map[string]string{
-			p2cWCCommaName: "1h,30m",
-			p2cWCNegName:   "-5m",
-			p2cWCBareName:  "10",
+	It("5a: maxWallClock — every admitted Go duration form is created and parses", func() {
+		for _, d := range []string{"1h30m", "2h45m10s", "90s", "1.5h"} {
+			ns := newNamespace()
+			defer func(ns string) {
+				_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+			}(ns)
+			u := p2cWCFixture("p2cwc", ns, d)
+			Expect(k8sClient.Create(ctx, u)).To(Succeed(),
+				"maxWallClock %q is a valid Go duration and must be admitted", d)
+
+			// The operator seam must parse it without error.
+			_, err := coxv1alpha1.ParseMaxWallClock(d)
+			Expect(err).ToNot(HaveOccurred(), "ParseMaxWallClock must accept %q", d)
 		}
-		for name, d := range rejected {
-			It("rejects "+d, func() {
-				ns := newNamespace()
-				defer func() {
-					_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
-				}()
-				u := baseLoop(name, ns)
-				Expect(unstructured.SetNestedField(u.Object, d, "spec", "budget", "maxWallClock")).To(Succeed())
-				err := k8sClient.Create(ctx, u)
-				Expect(err).To(HaveOccurred(),
-					"maxWallClock %q must be rejected (the Go duration pattern admits no commas, signs or bare numbers)", d)
-			})
-		}
+	})
+
+	It("5b: maxWallClock '1h,30m' is rejected (the comma form ParseDuration rejects)", func() {
+		ns := newNamespace()
+		defer func(ns string) {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}(ns)
+		u := p2cWCFixture(p2cWCCommaName, ns, "1h,30m")
+		err := k8sClient.Create(ctx, u)
+		Expect(err).To(HaveOccurred(),
+			"maxWallClock 1h,30m must be rejected (the Go duration pattern admits no commas)")
+	})
+
+	It("5c: maxWallClock '-5m' is rejected (no signs)", func() {
+		ns := newNamespace()
+		defer func(ns string) {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}(ns)
+		u := p2cWCFixture(p2cWCNegName, ns, "-5m")
+		err := k8sClient.Create(ctx, u)
+		Expect(err).To(HaveOccurred(),
+			"maxWallClock -5m must be rejected (the Go duration pattern admits no signs)")
+	})
+
+	It("5d: maxWallClock '10' is rejected (no bare numbers)", func() {
+		ns := newNamespace()
+		defer func(ns string) {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}(ns)
+		u := p2cWCFixture(p2cWCBareName, ns, "10")
+		err := k8sClient.Create(ctx, u)
+		Expect(err).To(HaveOccurred(),
+			"maxWallClock 10 must be rejected (a bare number is not a Go duration string)")
 	})
 
 	It("5: no budget/stall fields — an existing Loop reconciles exactly as before", func() {

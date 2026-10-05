@@ -137,7 +137,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	}
 
 	// --- the read + delta (item 2, P1-B) ---
-		// No model -> no proxy pod -> no read; the token/cost caps are inert
+	// No model -> no proxy pod -> no read; the token/cost caps are inert
 	// (the wall clock still applies, spec 9). A read failure (the proxy pod
 	// not Ready, the dial refused, the pod absent) leaves status.budget
 	// UNCHANGED (no reset, no delta — the operator does not guess; the
@@ -168,7 +168,6 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 
 	return budgetRequeue, nil
 }
-
 
 // resolveProxyUsageRead dispatches to the readProxyUsage test seam when it is
 // set, otherwise to the default (the readBaseCommit pattern). It returns
@@ -449,9 +448,9 @@ func (r *LoopReconciler) applyBudgetDecision(ctx context.Context, loop *coxv1alp
 		return false
 	}
 	var (
-		tokens    int64
-		active    int64
-		costUsd   string
+		tokens  int64
+		active  int64
+		costUsd string
 	)
 	if b := loop.Status.Budget; b != nil {
 		tokens = b.PromptTokens + b.CompletionTokens

@@ -34,11 +34,11 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-		"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -49,7 +49,7 @@ import (
 // p2d fixture constants.
 const (
 	p2dModelSecret   = "p2d-model-creds"
-	p2dModelEndpoint = "10.0.0.9:9200" // IP-literal: the D35a proxy gate peer is an ipBlock
+	p2dModelEndpoint = "10.0.0.9:9200"                            // IP-literal: the D35a proxy gate peer is an ipBlock
 	p2dHeadCommit    = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3" // 40-hex head commit
 )
 
@@ -77,7 +77,9 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			CNIProber:       cni.NewFakeProber(),
 			Recorder:        recorder,
 			readPhaseClaim:  func(context.Context, *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil },
-			readBaseCommit:  func(context.Context, *coxv1alpha1.Loop) (string, bool, error) { return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, nil },
+			readBaseCommit: func(context.Context, *coxv1alpha1.Loop) (string, bool, error) {
+				return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, nil
+			},
 		}
 		if nowPtr != nil {
 			*nowPtr = new(metav1.Time)
@@ -128,7 +130,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      "P2d no-model budget spec",
 				Workspace: testWorkspace(),
-				Agent: coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+				Agent:     coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
 			},
 		}
 		if mutate != nil {
@@ -1071,4 +1073,3 @@ Loop:
 	}
 	return out
 }
-

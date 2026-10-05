@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/http"
 	netip "net/netip"
 	neturl "net/url"
 	"os"
@@ -40,6 +41,7 @@ import (
 	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
+	"github.com/papawattu/coxswain/internal/proxy"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -306,14 +308,22 @@ type LoopReconciler struct {
 	// POD_NAMESPACE from env).
 	OperatorNamespace string
 
-	// readProxyUsage is the P3 seam (ADR-0009 item 12): the operator's usage
-	// reader. It is nil until P3 (P2b injects it as a no-op / nil so the
-	// operator does NOT yet consume the usage — the operator reads the usage
-	// via HTTP in P3). When set, it is called with the proxy's Service URL
-	// (the usage endpoint) so P3 can wire the HTTP GET /coxswain/usage. Keeping
-	// it a field (not a call from the reconciler) means P2b is verifiable
-	// without the gate's consumption.
-	readProxyUsage func(ctx context.Context, usageURL string)
+	// readProxyUsage is the operator's proxy-usage read seam (P2a item 12,
+	// P2d). It reads the proxy's cumulative usage reading from the proxy pod's
+	// /coxswain/usage endpoint. The default (nil) resolves the proxy pod's IP
+	// from the pod status the operator already reads (no new RBAC — the operator
+	// already has pod get) and performs a plain HTTP GET to
+	// http://<pod-ip>:9090/coxswain/usage. Every envtest spec injects a fake
+	// via this field (envtest has neither a proxy pod that serves HTTP nor a
+	// kubelet). An error means NO reading this reconcile: status.budget is
+	// left unchanged (no reset, no delta — the operator does not guess).
+	readProxyUsage func(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error)
+
+	// usageHTTPClient is the http.Client the default readProxyUsage uses. Set
+	// in tests to shorten the read timeout; the production default is a 2s
+	// timeout (a proxy that does not answer is not worth blocking the
+	// reconcile for longer).
+	usageHTTPClient *http.Client
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -581,6 +591,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	changed = changed || baseCommitChanged
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
+	// P2d: the budget decision — the operator reads the proxy's usage endpoint
+	// (the readProxyUsage seam), folds the reading into status.budget (the
+	// boot-ID delta rules), accumulates the wall clock, and applies the caps
+	// + onExceeded. It is inert in Paused (P2f: the decision re-evaluates on
+	// resume) and gated on the verify/stall decisions (stall wins, item 8).
+	// It runs every reconcile, including Paused, so a wall-clock hit WHILE
+	// paused still records exceeded (P2f spec 14) without re-firing the
+	// onExceeded action.
+	budgetRequeue, err := r.applyBudget(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
 	// (AFTER it, so the two Loop writes never race) are extracted to
 	// finalizeLoopStatus to keep the top-level reconcile within the gocyclo
@@ -589,8 +612,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// P2d item 10: the wall-clock RequeueAfter (the quiet-Loop rule) is the
+	// ONLY timer this reconcile sets: when spec.budget.maxWallClock is set and
+	// not yet hit, a Loop with no other activity (no baseCommit/claim/verify/
+	// deliver requeue) re-reconciles at the remaining time so the wall clock
+	// still trips. The pending flags are 5s timers; the wall clock is exact.
 	if baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if budgetRequeue > 0 {
+		return ctrl.Result{RequeueAfter: budgetRequeue}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -1801,6 +1832,16 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		} else {
 			log.Info("proxy pod spec drift detected, deleting for recreation",
 				"proxy", proxyPodName(loopName), "loop", loopName)
+			// P2d: a final read of the endpoint BEFORE the recreate (the P2b
+			// drift path): the last-known cumulative count lands on
+			// status.budget, so the recreate's bootID change is the visible,
+			// bounded loss — not an unrecorded one. A read failure here is not
+			// fatal: the recreate proceeds and the next reconcile reads the
+			// fresh boot (the loss is still bounded by the previous successful
+			// read, or is the full boot if there was none).
+			if fr, rerr := r.resolveProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+				_ = r.applyUsageReading(ctx, loop, *fr)
+			}
 			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
 				return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
 			}
@@ -1835,24 +1876,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 				"no foreign proxy pod detected")
 		}
 	}
-	// P2b (ADR-0009, seam item 12): the operator's usage reader seam. It is
-	// nil until P3 (which wires the HTTP GET /coxswain/usage); P2b exposes it
-	// so the operator's usage consumption is a seam, not hard-coded. When set,
-	// it is called with the proxy's usage Service URL.
-	if r.readProxyUsage != nil {
-		usageURL := r.proxyUsageURL(loopName, ns)
-		r.readProxyUsage(ctx, usageURL)
-	}
 	return nil
-}
-
-// proxyUsageURL is the operator's in-cluster URL for the proxy's usage
-// endpoint (P2b, ADR-0009): http://<loop>-proxy.<ns>.svc.<domain>:9090/coxswain/usage.
-// The operator reads the cumulative usage from this URL (the <loop>-proxy
-// netpol allows the operator namespace / controller-manager on 9090, never
-// the agent).
-func (r *LoopReconciler) proxyUsageURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc.%s:%d/coxswain/usage", proxyServiceName(loopName), namespace, r.clusterDomain(), proxyUsagePort)
 }
 
 // newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit

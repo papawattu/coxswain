@@ -461,6 +461,12 @@ func progressEqual(a, b *coxv1alpha1.ProgressStatus) bool {
 func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
 	claimReadPending := false
 	changed := false
+	// P2f: the claim reader is INERT while paused (the agent container is
+	// stopped; a claim that does arrive while paused — e.g. from a pod mid-run
+	// at pause time — is ignored: the nextPhase gate is phase != Paused).
+	if loop.Status.Phase == coxv1alpha1.LoopPhasePaused {
+		return false, false
+	}
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded || loop.Status.Phase == coxv1alpha1.LoopPhaseFailed {
 		return false, false
 	}

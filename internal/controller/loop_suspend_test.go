@@ -44,7 +44,7 @@ var _ = Describe("Loop suspend handling", func() {
 		_ = k8sClient.Delete(ctx, nsObj)
 	})
 
-	It("creates a Suspended sandbox for a suspended Loop", func() {
+	It("creates a Suspended sandbox for a suspended Loop and sets phase=Paused (P2f, upgraded from S1)", func() {
 		By("creating a Loop with spec.suspend=true")
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -66,5 +66,12 @@ var _ = Describe("Loop suspend handling", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)).To(Succeed())
 		Expect(sb.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
 			"a suspended Loop must not run a Running sandbox")
+
+		By("asserting the phase is Paused (P2f: spec.suspend=true on a non-terminal phase is a Paused transition). The S4 bootstrap advanced Pending->Planning in the same reconcile, so the pause sees Planning.)")
+		l := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, l)).To(Succeed())
+		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
+		Expect(l.Status.PausedFrom).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		Expect(l.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonSuspend))
 	})
 })

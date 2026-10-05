@@ -366,10 +366,18 @@ UNMETERED=$(echo "$USAGE" | python3 -c 'import json,sys; print(json.load(sys.std
 [ "$UNMETERED" = "0" ] && ok "the success dial was not counted unmetered (unmeteredRequests=0)" || bad "success dial counted unmetered ($UNMETERED)"
 
 # 4e-netpol. REAL pod-network dials of the usage-port netpol (the plan's netpol
-# assertion). Enforcing CNI only: on kindnet these are NOT RUN (never FAIL) —
-# kindnet does not police pod->pod, so a blocked dial cannot be observed (and an
-# allowed dial proves nothing). The netpol SPEC is asserted in 4b (the property
-# kindnet does prove).
+# assertion). The probe pods dial the proxy pod IP:9090 directly (a live
+# pod-network dial, not port-forward). On an enforcing CNI (Calico), the netpol
+# is enforced and the dials are BLOCKED (PASS). On a non-enforcing CNI
+# (kindnet), the netpol is NOT enforced and the dials SUCCEED (NOT RUN — the
+# enforcement cannot be tested on this CNI; the netpol SPEC is asserted in 4b).
+# The label reflects the RESULT of the dial: PASS = blocked (the netpol is
+# enforced), FAIL = not blocked on an enforcing CNI (the netpol is broken),
+# NOT RUN = not blocked on a non-enforcing CNI (the enforcement cannot be
+# tested). The netpol SPEC (the 9090 operator ingress + the deny-by-default) is
+# asserted in 4b regardless of the CNI.
+echo "   CNI: $CNI_NAME; enforcing netpol: $ENFORCING_CNI"
+echo "   proxy pod IP: $PROXY_POD_IP"
 dial_usage() { # dial_usage <ns> <pod>
   K -n "$1" exec "$2" -- python -c "
 import urllib.request,socket
@@ -381,11 +389,11 @@ except Exception as e:
     print('BLOCKED:'+str(e),end='')
 " 2>/dev/null || echo "DIAL_FAILED:exec"
 }
-if [ "$ENFORCING_CNI" = "1" ]; then
-  # (b) the agent (a pod with the Loop agent labels in the Loop namespace) dials
-  # the usage endpoint -> BLOCKED (the agent has no SA token; the netpol only
-  # allows the operator's controller-manager).
-  K apply -f - >/dev/null <<EOF
+
+# (b) the agent (a pod with the Loop agent labels in the Loop namespace) dials
+# the usage endpoint -> BLOCKED (the agent has no SA token; the netpol only
+# allows the operator's controller-manager).
+K apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -399,18 +407,24 @@ spec:
     imagePullPolicy: IfNotPresent
     command: ["python","-c","import time; time.sleep(600)"]
 EOF
-  K -n "$NS" wait --for=condition=Ready pod/p2b-agent-probe --timeout=120s 2>/dev/null || true
-  sleep 2
-  AGENT_DIAL=$(dial_usage "$NS" p2b-agent-probe)
-  if echo "$AGENT_DIAL" | grep -q "^OK"; then
-    bad "netpol: the agent pod COULD read the usage endpoint ($AGENT_DIAL) — should be BLOCKED"
+K -n "$NS" wait --for=condition=Ready pod/p2b-agent-probe --timeout=120s 2>/dev/null || true
+sleep 2
+AGENT_DIAL=$(dial_usage "$NS" p2b-agent-probe)
+echo "   agent-probe dial: $AGENT_DIAL"
+if echo "$AGENT_DIAL" | grep -q "^OK"; then
+  if [ "$ENFORCING_CNI" = "1" ]; then
+    bad "netpol: the agent pod COULD read the usage endpoint ($AGENT_DIAL) — should be BLOCKED (the netpol is broken?)"
   else
-    ok "netpol: the agent pod is BLOCKED from the usage endpoint ($AGENT_DIAL)"
+    echo "   [NOT RUN] netpol dial (b agent blocked): the agent pod COULD read the usage endpoint ($AGENT_DIAL) — the CNI ($CNI_NAME) does not police pod->pod, so the netpol is NOT enforced on this CNI (the netpol SPEC is asserted in 4b)"
   fi
-  # (c) a pod in the operator namespace WITHOUT the controller-manager labels
-  # dials the usage endpoint -> BLOCKED (proves the podSelector half: the
-  # namespaceSelector alone is not enough; the control-plane label is required).
-  K apply -f - >/dev/null <<EOF
+else
+  ok "netpol: the agent pod is BLOCKED from the usage endpoint ($AGENT_DIAL) — the netpol is enforced"
+fi
+
+# (c) a pod in the operator namespace WITHOUT the controller-manager labels
+# dials the usage endpoint -> BLOCKED (proves the podSelector half: the
+# namespaceSelector alone is not enough; the control-plane label is required).
+K apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -424,18 +438,18 @@ spec:
     imagePullPolicy: IfNotPresent
     command: ["python","-c","import time; time.sleep(600)"]
 EOF
-  K -n "$E2E_NS" wait --for=condition=Ready pod/p2b-nolabel-probe --timeout=120s 2>/dev/null || true
-  sleep 2
-  NOLEBEL_DIAL=$(dial_usage "$E2E_NS" p2b-nolabel-probe)
-  if echo "$NOLEBEL_DIAL" | grep -q "^OK"; then
-    bad "netpol: a non-controller-manager pod in the operator namespace COULD read the usage endpoint ($NOLEBEL_DIAL) — should be BLOCKED (podSelector half)"
+K -n "$E2E_NS" wait --for=condition=Ready pod/p2b-nolabel-probe --timeout=120s 2>/dev/null || true
+sleep 2
+NOLEBEL_DIAL=$(dial_usage "$E2E_NS" p2b-nolabel-probe)
+echo "   nolabel-probe dial: $NOLEBEL_DIAL"
+if echo "$NOLEBEL_DIAL" | grep -q "^OK"; then
+  if [ "$ENFORCING_CNI" = "1" ]; then
+    bad "netpol: a non-controller-manager pod in the operator namespace COULD read the usage endpoint ($NOLEBEL_DIAL) — should be BLOCKED (podSelector half; the netpol is broken?)"
   else
-    ok "netpol: a non-controller-manager pod in the operator namespace is BLOCKED ($NOLEBEL_DIAL) — the podSelector half is enforced"
+    echo "   [NOT RUN] netpol dial (c podSelector): a non-controller-manager pod in the operator namespace COULD read the usage endpoint ($NOLEBEL_DIAL) — the CNI ($CNI_NAME) does not police pod->pod, so the netpol is NOT enforced on this CNI (the netpol SPEC is asserted in 4b)"
   fi
 else
-  echo "   [NOT RUN] netpol dial checks (b agent blocked / c podSelector) — the CNI ($CNI_NAME) does not police pod->pod; the netpol SPEC is asserted in 4b instead (kindnet cannot prove enforcement)"
-  K -n "$NS" delete pod p2b-agent-probe --ignore-not-found >/dev/null 2>&1 || true
-  K -n "$E2E_NS" delete pod p2b-nolabel-probe --ignore-not-found >/dev/null 2>&1 || true
+  ok "netpol: a non-controller-manager pod in the operator namespace is BLOCKED ($NOLEBEL_DIAL) — the podSelector half is enforced"
 fi
 
 # 4f. The metering proxy's audit log (one JSON line per metered request) was

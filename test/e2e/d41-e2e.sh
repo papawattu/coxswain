@@ -153,14 +153,26 @@ cleanup() {
   if [ -n "$TMP_OVERLAY" ]; then
     rm -rf "$TMP_OVERLAY" 2>/dev/null || true
   fi
-  echo "--- cleaning up tool upstream pod $UPSTREAM_POD (kubectl delete) ---"
+  echo "--- cleaning up tool upstream (docker container + bridge) ---"
   K -n "$NS" delete pod d41-probe --ignore-not-found --wait=false 2>/dev/null || true
-  K -n "$NS" delete pod "$UPSTREAM_POD" --wait=false 2>/dev/null || true
-  for i in $(seq 1 12); do
-    K -n "$NS" get pod "$UPSTREAM_POD" >/dev/null 2>&1 || return 0
-    sleep 2
-  done
-  echo "   (upstream pod $UPSTREAM_POD still terminating; left for the cluster to finish)"
+  docker rm -f "$UPSTREAM_CONT" >/dev/null 2>&1 || true
+  docker network disconnect -f "$UPSTREAM_NET" "$NODE_CONTAINER" 2>/dev/null || true
+  docker network rm "$UPSTREAM_NET" >/dev/null 2>&1 || true
+  echo "   (upstream container $UPSTREAM_CONT + bridge $UPSTREAM_NET removed)"
+  # Verify the cleanup: no $UPSTREAM_NET network, and the kind node lists
+  # only the 'kind' network. (Don't touch any other docker network or
+  # container — the owner's pixme-dev, gitea, sweep must be untouched.)
+  if docker network ls --format '{{.Name}}' 2>/dev/null | grep -qx "$UPSTREAM_NET"; then
+    echo "   WARNING: $UPSTREAM_NET still present after cleanup" >&2
+  else
+    echo "   (cleanup verified: $UPSTREAM_NET is gone)"
+  fi
+  NODE_NETS=$(docker inspect -f '{{json .NetworkSettings.Networks}}' "$NODE_CONTAINER" 2>/dev/null)
+  if [ "$NODE_NETS" = "null" ] || ! echo "$NODE_NETS" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if list(d.keys())==['kind'] else 1)" 2>/dev/null; then
+    echo "   WARNING: the kind node $NODE_CONTAINER lists unexpected networks: $NODE_NETS" >&2
+  else
+    echo "   (cleanup verified: the kind node lists only 'kind')"
+  fi
 }
 trap cleanup EXIT
 echo "run log: $RUN_LOG"
@@ -203,11 +215,6 @@ KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
 TMP_OVERLAY=$(mktemp -d)
 cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
-# Set the --tool-proxy-image flag on the manager deployment (the flag was
-# added in this slice; the reconciler default is a golang:1.26 dev stand-in).
-# A JSON patch appended to the TEMP copy of the dev overlay's manager
-# kustomization (the tracked kustomization.yaml files are never edited).
-jq '.patches = (.patches // []) + [{patch: "- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: --tool-proxy-image=' + "'"$TOOL_IMG"'" + '", target: {kind: "Deployment", name: "coxswain-controller-manager"}}]'   "$TMP_OVERLAY/config/manager/kustomization.yaml" > "$TMP_OVERLAY/config/manager/kustomization.yaml.new"   && mv "$TMP_OVERLAY/config/manager/kustomization.yaml.new" "$TMP_OVERLAY/config/manager/kustomization.yaml"
 # The tool proxy pod image is coxswain-tool-proxy:standin (toolProxyImage's
 # default, the real cmd/tool-proxy binary — the rule engine, credential
 # injection, audit); STEP 1 built and kind-loaded it under that tag. No
@@ -243,98 +250,77 @@ if K -n "$NS" get loop "$LOOP" >/dev/null 2>&1; then
   done
 fi
 K get ns "$NS" >/dev/null 2>&1 || K create ns "$NS" >/dev/null
-# Pick the kind node's kind-network IP (172.21.0.x on the default kind
-# bridge subnet). It is OUTSIDE every carve-out the product enforces (the
-# tool-proxy netpol's except list and the tool-proxy's resolved-IP backstop
-# carve out 10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, 100.64/10,
-# 0/8, 224/4, 240/4 and the IPv6 local ranges — 172.21.0.0/16 is in none of
-# them), so the controller's ToolUpstreamInCluster check passes AND the
-# tool-proxy netpol external carve-out + the resolved-IP backstop permit
-# the dial — the correct product behaviour, not a carve-out change.
-UPSTREAM_NODE_IP=$(docker exec "$NODE_CONTAINER" ip -4 addr show eth0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+# The tool upstream must be reachable at an address OUTSIDE every
+# product-defined carve-out (the 172.16/12 RFC1918 range, 10/8,
+# 192.168/16, 169.254/16, 127/8, 100.64/10, 0/8, 224/4, 240/4 — the
+# tool-proxy netpol except-list + the tool-proxy's resolved-IP backstop).
+# No private/LAN address can be used (they are all carved out), so the
+# upstream lives on a temporary DEDICATED docker bridge in the RFC 2544
+# benchmarking range 198.18.0.0/15 (in no carve-out, never routed to a
+# real host). The kind control-plane container is attached to this bridge,
+# and a dedicated upstream container (hostNetwork-equivalent: it runs the
+# python listener and is reachable at its bridge IP from the kind cluster)
+# serves :80. The bridge + containers are torn down in the EXIT trap.
+UPSTREAM_NET="d41-upstream-net"
+UPSTREAM_SUBNET="198.18.0.0/24"
+# Create the docker bridge (idempotent: disconnect the kind node from a prior
+# one first, then remove it — a network rm FAILS while the kind node is still
+# attached, so the disconnect must precede the rm).
+if docker network inspect "$UPSTREAM_NET" >/dev/null 2>&1; then
+  docker network disconnect -f "$UPSTREAM_NET" "$NODE_CONTAINER" 2>/dev/null || true
+  docker network rm "$UPSTREAM_NET" >/dev/null 2>&1 || true
+fi
+docker network create --subnet "$UPSTREAM_SUBNET" "$UPSTREAM_NET" >/dev/null   || { echo "FATAL: could not create the docker bridge $UPSTREAM_NET ($UPSTREAM_SUBNET)"; exit 2; }
+echo "   created docker bridge $UPSTREAM_NET ($UPSTREAM_SUBNET, RFC 2544 — in no carve-out)"
+# Attach the kind control-plane container to the bridge so a pod on the kind
+# cluster can reach the upstream container's bridge IP.
+docker network connect "$UPSTREAM_NET" "$NODE_CONTAINER" 2>/dev/null   || { echo "FATAL: could not attach $NODE_CONTAINER to $UPSTREAM_NET"; exit 2; }
+# A dedicated upstream container on the bridge (the python:3-alpine listener
+# on :80). It is the "hostNetwork-equivalent": a pod on the kind cluster
+# reaches it at the bridge IP via the attached control-plane container.
+UPSTREAM_CONT="d41-upstream-cont"
+docker rm -f "$UPSTREAM_CONT" >/dev/null 2>&1 || true
+docker run -d --name "$UPSTREAM_CONT" --network "$UPSTREAM_NET" \
+  --entrypoint sh python:3-alpine -c "
+    cp /dev/stdin /usr/local/bin/upstream-server.py 2>/dev/null || true
+  " < "$UPSTREAM_SCRIPT" >/dev/null 2>&1 || { echo "FATAL: could not start the upstream container"; exit 2; }
+# Write the listener into the container (docker cp), then start it.
+docker cp "$UPSTREAM_SCRIPT" "$UPSTREAM_CONT:/usr/local/bin/upstream-server.py" 2>/dev/null   || { echo "FATAL: could not docker cp the upstream listener"; exit 2; }
+# Start the listener inside the container (docker exec, nohup).
+docker exec "$UPSTREAM_CONT" sh -c ': > /tmp/upstream.log && nohup python3 /usr/local/bin/upstream-server.py > /tmp/upstream.log 2>&1 & echo started' 2>/dev/null   || { echo "FATAL: could not start the upstream listener"; exit 2; }
+# The upstream IP is the container's bridge address.
+UPSTREAM_NODE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$UPSTREAM_CONT" 2>/dev/null | grep -E '^[0-9.]+' | head -1)
+# The bridge's gateway is 198.18.0.1; the container gets 198.18.0.2+.
 if [ -z "$UPSTREAM_NODE_IP" ]; then
-  echo "FATAL: could not read the kind node's kind-network IP (eth0)"
+  echo "FATAL: could not read the upstream container's bridge IP"
   exit 2
 fi
-UPSTREAM_URL="http://${UPSTREAM_NODE_IP}:80"
-# The model endpoint is a DUMMY (never dialed by the agent in this test): the
-# model-proxy sidecar dials it, but the D41e assertions exercise the tool
-# proxy path (COX_TOOL_GH_URL), not the model path. The dummy name must pass
-# the AgentPolicy CRD CEL rule (no .svc/.cluster.local) and the controller's
-# in-cluster check — the node's kind-network IP literal is the same external
-# IP as the tool upstream.
-MODEL_ENDPOINT="${UPSTREAM_NODE_IP}:80"
-echo "   tool upstream host: ${UPSTREAM_NODE_IP} (node kind-network eth0; in no carve-out)"
-# Recreate the upstream pod (idempotency: a prior run may have left it).
-K -n "$NS" delete pod "$UPSTREAM_POD" --ignore-not-found --timeout=30s 2>/dev/null || true
-sleep 2
-cat > "$TMPDIR/upstream.yaml" <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${UPSTREAM_POD}
-  namespace: ${NS}
-spec:
-  hostNetwork: true
-  # The node must have no :80 service (a kind cluster node — verified by the
-  # preflight). hostNetwork lets the listener bind 0.0.0.0:80 on the node
-  # (the pod rides the node's network namespace, including the kind-network
-  # eth0 address the dial targets).
-  containers:
-    - name: upstream
-      image: ${UPSTREAM_IMG}
-      imagePullPolicy: IfNotPresent
-      # The pod entrypoint is a sleep (the listener is kubectl cp'd in
-      # after start and nohup'd — the cp-before-start pattern would race the
-      # entrypoint).
-      command: ["sh", "-c", "sleep 3600"]
-      ports:
-        - containerPort: 80
-          protocol: TCP
-EOF
-K apply -f "$TMPDIR/upstream.yaml" >/dev/null || { echo "FATAL: upstream fixture apply failed"; exit 2; }
+echo "   upstream container $UPSTREAM_CONT running at $UPSTREAM_NODE_IP (RFC 2544 bridge)"
+# Wait for the listener to bind :80 (poll from the host via docker exec into
+# the upstream container).
 for i in $(seq 1 30); do
-  PH=$(K -n "$NS" get pod "$UPSTREAM_POD" -o jsonpath='{.status.phase}' 2>/dev/null)
-  [ "$PH" = "Running" ] && break
-  sleep 2
-done
-UPSTREAM_POD_IP=$(K -n "$NS" get pod "$UPSTREAM_POD" -o jsonpath='{.status.podIP}' 2>/dev/null)
-if [ -z "$UPSTREAM_POD_IP" ]; then
-  echo "FATAL: the tool upstream pod has no IP yet"
-  exit 2
-fi
-echo "   tool upstream pod $UPSTREAM_POD Running (hostNetwork: nodeIP=$UPSTREAM_POD_IP, dialed at ${UPSTREAM_NODE_IP})"
-# kubectl cp the listener + run it (nohup, logs to stdout captured to
-# /tmp/upstream.log). The listener is a file (not a heredoc inside sh -c),
-# per the house rules.
-[ -f "$UPSTREAM_SCRIPT" ] || { echo "FATAL: $UPSTREAM_SCRIPT not found (the upstream listener script)"; exit 2; }
-K -n "$NS" cp "$UPSTREAM_SCRIPT" "$UPSTREAM_POD:/tmp/upstream-server.py" 2>/dev/null || { echo "FATAL: kubectl cp upstream-server.py failed"; exit 2; }
-K -n "$NS" exec "$UPSTREAM_POD" -- sh -c ': > /tmp/upstream.log && nohup python3 /tmp/upstream-server.py > /tmp/upstream.log 2>&1 & echo started' 2>/dev/null \
-  || { echo "FATAL: could not start the upstream listener"; exit 2; }
-sleep 2
-# Wait for the listener to bind :80 on the node (the pod is hostNetwork, so
-# the listen socket is on the node's namespace). Poll from the node directly
-# (docker exec, python3 — python:3-alpine has no wget; the node's python3 is
-# used, a host-side check of the hostNetwork pod's listen socket) — a probe
-# pod would add scheduling latency.
-# The node's python3 is the dial (a host-side check of the hostNetwork
-# pod's listen socket; python:3-alpine has no wget, so the node's own
-# python3 is used).
-NODE_DIAL="python3 -c 'import urllib.request,sys; urllib.request.urlopen(sys.argv[1], timeout=3).read()' http://${UPSTREAM_NODE_IP}:80/ok"
-for i in $(seq 1 30); do
-  if docker exec "$NODE_CONTAINER" sh -c "$NODE_DIAL" 2>/dev/null; then
+  if docker exec "$UPSTREAM_CONT" python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:80/ok', timeout=3).read()" 2>/dev/null; then
     break
   fi
   sleep 1
 done
-if ! docker exec "$NODE_CONTAINER" sh -c "$NODE_DIAL" 2>/dev/null; then
-  echo "FATAL: the upstream listener is not answering at ${UPSTREAM_NODE_IP}:80 (node-side check)"
+if ! docker exec "$UPSTREAM_CONT" python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:80/ok', timeout=3).read()" 2>/dev/null; then
+  echo "FATAL: the upstream listener is not answering on the bridge container (node-side check)"
   exit 2
 fi
-echo "   upstream listener answering at ${UPSTREAM_NODE_IP}:80 (node-side check)"
-# Verify from a hostNetwork busybox pod (a PLAIN pod would route 172.21.0.x
-# via the node's egress, which does NOT have the kind-bridge address in its
-# scope — the hostNetwork pod rides the node's network namespace directly).
+echo "   upstream listener answering (container-side check)"
+# Verify from the HOST that the bridge IP is reachable (the pod will reach it
+# via the attached control-plane container).
+if ! docker exec "$NODE_CONTAINER" python3 -c "import urllib.request; urllib.request.urlopen('http://${UPSTREAM_NODE_IP}:80/ok', timeout=3).read()" 2>/dev/null; then
+  echo "FATAL: the upstream listener is not reachable at ${UPSTREAM_NODE_IP}:80 from the kind control-plane container (the bridge is not routable to the cluster)"
+  exit 2
+fi
+echo "   upstream listener reachable at ${UPSTREAM_NODE_IP}:80 from the kind control-plane container"
+# The upstream is now the docker-bridge container (not a k8s pod). The probe
+# preflight: a plain busybox pod (no tool-proxy labels) on the kind cluster
+# dials the bridge IP. A 200 means the bridge is routable to the cluster and
+# the listener answers; anything else is a FATAL (the assertions would be
+# meaningless).
 cat > "$TMPDIR/probe-pod.yaml" <<EOF
 apiVersion: v1
 kind: Pod
@@ -342,7 +328,6 @@ metadata:
   name: d41-probe
   namespace: ${NS}
 spec:
-  hostNetwork: true
   containers:
     - name: probe
       image: ${BUSYBOX_IMG}
@@ -357,14 +342,11 @@ for i in $(seq 1 30); do
   [ "$PPH" = "Running" ] && break
   sleep 2
 done
-# curl the upstream from the probe pod (busybox wget). A 200 means the
-# listener answers at the node kind-network IP; anything else is a FATAL
-# (the upstream is not reachable — the assertions would be meaningless).
 PROBE_OUT=$(K -n "$NS" exec d41-probe -- sh -c "wget -q -O /dev/null --timeout=5 http://${UPSTREAM_NODE_IP}:80/ok && echo 200 || echo FAIL" 2>&1)
 echo "   probe pod wget http://${UPSTREAM_NODE_IP}:80/ok -> $PROBE_OUT"
 case "$PROBE_OUT" in
-  200) ok "preflight: the upstream answers 200 at ${UPSTREAM_NODE_IP}:80 from a hostNetwork pod (before the assertions)" ;;
-  *) bad "preflight: the upstream does NOT answer 200 at ${UPSTREAM_NODE_IP}:80 from a hostNetwork pod (got: $PROBE_OUT) — the listener is not reachable" ;;
+  200) ok "preflight: the upstream answers 200 at ${UPSTREAM_NODE_IP}:80 from a plain pod (before the assertions)" ;;
+  *) bad "preflight: the upstream does NOT answer 200 at ${UPSTREAM_NODE_IP}:80 from a plain pod (got: $PROBE_OUT) — the bridge is not routable to the cluster" ;;
 esac
 
 cat > "$TMPDIR/tool-secret.yaml" <<EOF
@@ -573,7 +555,7 @@ else
   fi
 fi
 # The upstream log must NOT show a /delete request (the proxy never dialed).
-UP_LOG=$(K -n "$NS" exec "$UPSTREAM_POD" -- sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
+UP_LOG=$(docker exec "$UPSTREAM_CONT" sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
 if echo "$UP_LOG" | grep -F 'path=/delete' >/dev/null; then
   bad "assertion 2d: the upstream log shows a /delete request — the proxy dialed a non-allowed path"
 else
@@ -586,7 +568,7 @@ fi
 echo
 echo "--- CHECK 3: credential injected by the proxy, absent from the agent ---"
 sleep 2
-UP_LOG=$(K -n "$NS" exec "$UPSTREAM_POD" -- sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
+UP_LOG=$(docker exec "$UPSTREAM_CONT" sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
 if echo "$UP_LOG" | grep -F "auth=present authValue=Bearer $TEST_TOKEN" >/dev/null; then
   ok "assertion 3a: the upstream log shows the request carried Authorization: Bearer <test-token> (the proxy injected the credential)"
 else
@@ -703,7 +685,7 @@ metadata:
 spec:
   tools:
     - name: internal
-      upstream: "http://${UPSTREAM_POD_IP}:80"
+      upstream: "http://${AGENT_POD_IP}:80"
       rules:
         - methods: ["GET"]
           paths: ["/ok"]
@@ -795,8 +777,6 @@ spec:
               - |
                 timeout 5 nc -w 3 ${AGENT_POD_IP} 9999 >/dev/null 2>&1
                 echo "fence-agent-exit=$?" > /tmp/fence.out
-                timeout 5 nc -w 3 ${UPSTREAM_NODE_IP} 9998 >/dev/null 2>&1
-                echo "fence-upstream-exit=$?" >> /tmp/fence.out
   restartPolicy: Never
 EOF
 K -n "$NS" delete pod "$FENCE_POD" --ignore-not-found --timeout=15s 2>/dev/null || true
@@ -821,11 +801,11 @@ if [ -n "$FENCE_OUT" ]; then
   else
     ok "assertion 4c: a raw connect from the tool proxy's network position to the agent pod IP ($AGENT_POD_IP) was refused / timed out (the netpol pod-CIDR carve-out blocks it)"
   fi
-  if echo "$FENCE_OUT" | grep -q 'fence-upstream-exit=0'; then
-    bad "assertion 4c: a raw connect from the tool proxy's network position to the upstream on a non-upstream port (${UPSTREAM_NODE_IP}:9998) SUCCEEDED (the netpol must refuse it)"
-  else
-    ok "assertion 4c: a raw connect from the tool proxy's network position to the upstream on a non-upstream port (${UPSTREAM_NODE_IP}:9998) was refused / timed out (the netpol only permits the upstream port)"
-  fi
+  # The upstream (${UPSTREAM_NODE_IP}, 198.18/15 RFC 2544) is EXTERNAL (in
+  # no carve-out), so the netpol permits connects to it on ALL ports (the
+  # tool-proxy external egress has no port restriction — the request
+  # restriction is at the application layer). The live blocked-connect proof
+  # is the in-cluster agent pod IP (carved out by podCIDR) above.
 else
   bad "assertion 4c: the fence pod did not produce /tmp/fence.out (the live blocked-connect check could not run)"
 fi
@@ -834,7 +814,7 @@ K -n "$NS" delete pod "$FENCE_POD" --ignore-not-found --wait=false 2>/dev/null |
 
 # Each 4a/4b/4c attempt must NOT have left a successful upstream-side log line
 # for a disallowed / in-cluster request.
-UP_LOG=$(K -n "$NS" exec "$UPSTREAM_POD" -- sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
+UP_LOG=$(docker exec "$UPSTREAM_CONT" sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
 if echo "$UP_LOG" | grep -F 'path=/delete' >/dev/null; then
   bad "assertion 4c: a disallowed / in-cluster request left a successful upstream-side log line"
 else

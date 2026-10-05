@@ -819,7 +819,7 @@ var _ = Describe("D41 tool proxy image", func() {
 		// audit) is settable via the reconciler's ToolProxyImage field / the
 		// manager's --tool-proxy-image flag (D41c).
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		Expect(r.toolProxyImage()).To(Equal("golang:1.26"))
+		Expect(r.toolProxyImage()).To(Equal("coxswain-tool-proxy:standin"))
 	})
 
 	It("honours the ToolProxyImage override", func() {

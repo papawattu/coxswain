@@ -150,8 +150,8 @@ func main() {
 	var toolProxyImage string
 	flag.StringVar(&toolProxyImage, "tool-proxy-image", "",
 		"The image the tool proxy pods run (one per tool per Loop, D41c/ADR-0008). "+
-			"Default: empty (the reconciler's golang:1.26 dev stand-in; a real tool proxy image "+
-			"such as coxswain-tool-proxy:standin must be kind-loaded / pre-pulled).")
+			"Default: empty (the reconciler's coxswain-tool-proxy:standin dev stand-in; a real tool proxy image "+
+			"may be kind-loaded / pre-pulled and passed here).")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{

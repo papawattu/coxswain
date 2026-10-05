@@ -2651,11 +2651,17 @@ func toolProxyLabels(loopName, toolName string) map[string]string {
 // stand-in (golang:1.26) when unset (the cmd/tool-proxy binary is the
 // D41a/D41d surface; the D41e kind e2e kind-loads an image under a
 // ToolProxyImage override).
+// toolProxyImage returns the tool proxy pod image: the reconciler's
+// ToolProxyImage field when set, else the local dev stand-in (the same
+// pattern as egressProxyImage / proxyImage — the stand-in image is built +
+// kind-loaded by the e2e scripts under that tag). The stand-in runs the real
+// cmd/tool-proxy binary (rule engine, credential injection, audit), so the
+// e2e exercises the real rule engine without a published image.
 func (r *LoopReconciler) toolProxyImage() string {
 	if r.ToolProxyImage != "" {
 		return r.ToolProxyImage
 	}
-	return "golang:1.26"
+	return "coxswain-tool-proxy:standin"
 }
 
 // effectivePolicyTools returns the deduped tool union across the Loop's

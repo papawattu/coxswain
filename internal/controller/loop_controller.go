@@ -316,19 +316,19 @@ type LoopReconciler struct {
 	readProxyUsage func(ctx context.Context, usageURL string)
 }
 
-// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;delete;patch;delete
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops/finalizers,verbs=update
-// +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;delete;patch;delete
+// +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
-// +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;delete;patch;delete
+// +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
 // D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;delete;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // D38: the operator emits a Kubernetes Event on every Loop when its
 // NetworkEnforced condition changes (the probe Runnable's re-gate Event lives
 // in internal/cni; this is the condition-change Event the reconcile side emits).

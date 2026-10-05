@@ -104,7 +104,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 IMG_TAG="main-${COMMIT}"
 IMG="coxswain-controller:${IMG_TAG}"
-TOOL_IMG="coxswain-tool-proxy:${IMG_TAG}"
+# The tool proxy pod image: toolProxyImage() defaults to
+# coxswain-tool-proxy:standin (the real cmd/tool-proxy binary), so the e2e
+# builds and loads the image under that tag — no --tool-proxy-image flag or
+# pod patch needed (the i42-e2e stand-in image pattern).
+TOOL_IMG="coxswain-tool-proxy:standin"
 BUSYBOX_IMG="busybox:1.36"
 AGENT_IMG="golang:1.26"
 UPSTREAM_POD="d41-upstream"
@@ -214,30 +218,11 @@ KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
 TMP_OVERLAY=$(mktemp -d)
 cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$IMG")
-# The tool proxy pod image: the manager has NO --tool-proxy-image flag yet
-# (D41c's toolProxyImage() defaults to the golang:1.26 stand-in when
-# ToolProxyImage is unset — a Go stand-in, not the cmd/tool-proxy binary),
-# and the ToolProxyImage field is never set from a flag in cmd/main.go
-# (the reconciler struct literal omits it). The e2e needs the REAL
-# tool-proxy binary (the rule engine, credential injection, audit) — the
-# golang stand-in just sleeps, so the tool proxy pod never becomes Ready.
-#
-# Rather than patch the running deployment (which would require a
-# --tool-proxy-image flag that doesn't exist yet — a future-slice change
-# out of scope for D41e), the e2e patches the tool-proxy POD directly after
-# the controller creates it: a kubectl patch that replaces the container
-# image from golang:1.26 to the real tool-proxy image. The pod's env
-# (TOOL_NAME, TOOL_UPSTREAM, TOOL_RULES_JSON, etc.) is already set by the
-# controller; only the image needs replacing. This is a TEST-ONLY
-# workaround (the production path is the --tool-proxy-image flag, a future
-# slice). The patch is idempotent: it only fires if the image is still the
-# golang stand-in.
-# (The kustomize patch file approach was tried first but the target
-# Deployment is the manager's OWN deployment (the controller-manager), not
-# the tool-proxy pod — the tool-proxy pod is a separate object created by
-# the controller per Loop, so a kustomize patch on the manager deployment
-# cannot set the tool-proxy pod's image. The kubectl patch on the pod is
-# the correct test-side workaround.)
+# The tool proxy pod image is coxswain-tool-proxy:standin (toolProxyImage's
+# default, the real cmd/tool-proxy binary — the rule engine, credential
+# injection, audit); STEP 1 built and kind-loaded it under that tag. No
+# --tool-proxy-image flag or pod patch is needed (the i42-e2e stand-in
+# image pattern).
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) \
   || { echo "FATAL: controller deploy failed"; exit 2; }
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/cni-probe | K apply -f -) \
@@ -424,35 +409,27 @@ echo "   fixtures applied: tool upstream $UPSTREAM_POD (hostNetwork node, dialed
 # STEP 4: the tool proxy pod + the D41c owned+Ready sandbox gate (assertion 5).
 # The sandbox MUST be Suspended before the tool proxy pod is Ready, and
 # Running after.
+# The tool proxy pod runs coxswain-tool-proxy:standin (toolProxyImage's
+# default, built + kind-loaded in STEP 1) — no pod patch needed.
 # ===========================================================================
 echo
 echo "--- STEP 4: sandbox gating (D41c owned+Ready tool-proxy gate, live) ---"
 TOOL_POD="${LOOP}-tool-gh"
-# Patch the tool-proxy pod's image from the golang:1.26 stand-in to the REAL
-# tool-proxy image (TEST-ONLY workaround: the manager has no --tool-proxy-image
-# flag yet, so the controller creates the tool-proxy pod with the golang
-# stand-in image. The e2e needs the real tool-proxy binary — the rule engine,
-# credential injection, audit. The pod's env is already set by the controller;
-# only the image needs replacing. Idempotent: only fires if the image is still
-# the golang stand-in.)
 for i in $(seq 1 30); do
   TP_IMG=$(K -n "$NS" get pod "$TOOL_POD" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
   [ -n "$TP_IMG" ] && break
   sleep 2
 done
-echo "   tool proxy pod image (before patch): $TP_IMG"
-if [ "$TP_IMG" != "$TOOL_IMG" ]; then
-  echo "   patching tool proxy pod image $TP_IMG -> $TOOL_IMG (test-only: no --tool-proxy-image flag yet)"
-  K -n "$NS" patch pod "$TOOL_POD" --type=json -p="[{\"op\":\"replace\",\"path\":\"/spec/containers/0/image\",\"value\":\"$TOOL_IMG\"}]" 2>/dev/null \
-    || { echo "FATAL: could not patch the tool proxy pod image"; exit 2; }
-  sleep 3
-  TP_IMG=$(K -n "$NS" get pod "$TOOL_POD" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
-  echo "   tool proxy pod image (after patch): $TP_IMG"
+echo "   tool proxy pod image: $TP_IMG"
+if [ -n "$TP_IMG" ] && [ "$TP_IMG" != "$TOOL_IMG" ]; then
+  echo "FATAL: the tool proxy pod image is $TP_IMG, expected $TOOL_IMG (toolProxyImage default or ToolProxyImage override)"
+  exit 2
 fi
 GATE_SUSPENDED=""
 for i in $(seq 1 60); do
   TR=$(K -n "$NS" get pod "$TOOL_POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-  MODE=$(K -n "$NS" get sandbox "$LOOP" -o jsonpath='{.spec.operatingMode}' 2>/dev/null)
+  # The Sandbox CR is named <loop>-sandbox (agent-sandbox CRD).
+  MODE=$(K -n "$NS" get sandbox "${LOOP}-sandbox" -o jsonpath='{.spec.operatingMode}' 2>/dev/null)
   if [ -n "$MODE" ] && [ "$MODE" = "Suspended" ] && [ "$TR" != "True" ]; then
     GATE_SUSPENDED=yes
     break
@@ -480,7 +457,7 @@ fi
 ok "tool proxy pod ${TOOL_POD} is Ready"
 MODE=""
 for i in $(seq 1 60); do
-  MODE=$(K -n "$NS" get sandbox "$LOOP" -o jsonpath='{.spec.operatingMode}' 2>/dev/null)
+  MODE=$(K -n "$NS" get sandbox "${LOOP}-sandbox" -o jsonpath='{.spec.operatingMode}' 2>/dev/null)
   [ "$MODE" = "Running" ] && break
   sleep 3
 done
@@ -515,8 +492,8 @@ else
   echo "allowed-path got http=$code (UNEXPECTED for an allowed path)"
 fi
 EOF
-K -n "$NS" cp "$TMPDIR/probe-allowed.sh" "$AGENT_POD:/tmp/probe-allowed.sh" 2>/dev/null || bad "kubectl cp probe-allowed.sh failed"
-P1=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-allowed.sh 2>&1)
+K -n "$NS" cp "$TMPDIR/probe-allowed.sh" "$AGENT_POD:/tmp/probe-allowed.sh" -c agent 2>/dev/null || bad "kubectl cp probe-allowed.sh failed"
+P1=$(K -n "$NS" exec "$AGENT_POD" -c agent -- sh /tmp/probe-allowed.sh 2>&1)
 echo "$P1" | sed 's/^/     /'
 case "$P1" in
   *"allowed-path 2xx"*) ok "assertion 1: allowed path (GET /ok) returned 2xx from the upstream" ;;
@@ -541,8 +518,8 @@ else
   echo "disallowed-path got http=$code"
 fi
 EOF
-K -n "$NS" cp "$TMPDIR/probe-disallowed.sh" "$AGENT_POD:/tmp/probe-disallowed.sh" 2>/dev/null || bad "kubectl cp probe-disallowed.sh failed"
-P2=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-disallowed.sh 2>&1)
+K -n "$NS" cp "$TMPDIR/probe-disallowed.sh" "$AGENT_POD:/tmp/probe-disallowed.sh" -c agent 2>/dev/null || bad "kubectl cp probe-disallowed.sh failed"
+P2=$(K -n "$NS" exec "$AGENT_POD" -c agent -- sh /tmp/probe-disallowed.sh 2>&1)
 echo "$P2" | sed 's/^/     /'
 case "$P2" in
   *"REACHED THE UPSTREAM"*) bad "assertion 2: the disallowed path /delete reached the upstream (the rule engine did not 403 it)" ;;
@@ -573,7 +550,7 @@ else
 fi
 # The upstream log must NOT show a /delete request (the proxy never dialed).
 UP_LOG=$(K -n "$NS" exec "$UPSTREAM_POD" -- sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
-if echo "$UP_LOG" | grep -q 'path=/delete'; then
+if echo "$UP_LOG" | grep -F 'req GET /delete' >/dev/null; then
   bad "assertion 2d: the upstream log shows a /delete request — the proxy dialed a non-allowed path"
 else
   ok "assertion 2d: no /delete request reached the upstream"
@@ -602,13 +579,13 @@ if echo "$AGENT_YAML" | grep -qF "$TEST_TOKEN"; then
 else
   ok "assertion 3c: no agent pod field (spec: volumes, env, volumeMounts) contains the token value"
 fi
-ENV_GREP=$(K -n "$NS" exec "$AGENT_POD" -- sh -c "env | grep -i ${TEST_TOKEN}" 2>/dev/null || true)
+ENV_GREP=$(K -n "$NS" exec "$AGENT_POD" -c agent -- sh -c "env | grep -i ${TEST_TOKEN}" 2>/dev/null || true)
 if [ -z "$ENV_GREP" ]; then
   ok "assertion 3d: 'env | grep -i <token>' in the agent is empty"
 else
   bad "assertion 3d: 'env | grep -i <token>' in the agent is NOT empty: $ENV_GREP"
 fi
-LS_OUT=$(K -n "$NS" exec "$AGENT_POD" -- sh -c 'ls /tool-cred 2>&1' 2>&1 || true)
+LS_OUT=$(K -n "$NS" exec "$AGENT_POD" -c agent -- sh -c 'ls /tool-cred 2>&1' 2>&1 || true)
 echo "   ls /tool-cred in the agent: $LS_OUT"
 case "$LS_OUT" in
   *"No such file or directory"*) ok "assertion 3e: /tool-cred does not exist in the agent" ;;
@@ -734,7 +711,7 @@ K -n "$NS" delete agentpolicy "${SCRATCH_LOOP}-pol" --ignore-not-found 2>/dev/nu
 # Each 4a/4b attempt must NOT have left a successful upstream-side log line
 # for a disallowed / in-cluster request.
 UP_LOG=$(K -n "$NS" exec "$UPSTREAM_POD" -- sh -c 'cat /tmp/upstream.log 2>/dev/null' 2>/dev/null)
-if echo "$UP_LOG" | grep -qE 'path=/delete'; then
+if echo "$UP_LOG" | grep -F 'req GET /delete' >/dev/null; then
   bad "assertion 4c: a disallowed / in-cluster request left a successful upstream-side log line"
 else
   ok "assertion 4c: no disallowed / in-cluster request reached the upstream"

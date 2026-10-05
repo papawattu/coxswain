@@ -15,18 +15,18 @@
 # (the upstream has no auth of its own — the injected header is what makes
 # the call identifiable); everything else → 404 + a log line.
 #
-# Each connection is answered by a SINGLE busybox nc process that:
-#   1. reads the request on fd 0 (the client socket, set up by
-#      `nc -l -p 80 -s 0.0.0.0 -c sh -c '...'` — the accepted socket is
-#      stdin/stdout of the -c command), logging the request line + the
-#      Authorization header to /tmp/upstream.log;
-#   2. writes the HTTP response on fd 1 (the same client socket).
+# Each connection is answered by the `nc -lk -p 80 -s 0.0.0.0 -e sh`
+# listener (one busybox nc, persistent). For EVERY connection:
+#   1. read the request on fd 0 (the accepted client socket) with a SHORT
+#      SLEEP as the "client done sending" heuristic (the tool proxy sends
+#      the request in one burst and waits for the response — the sleep is
+#      shorter than the proxy's read timeout), logging the request line +
+#      the Authorization header to /tmp/upstream.log;
+#   2. write the HTTP response on fd 1 (the same client socket).
 #
-# The request is read with a SHORT SLEEP as the "client done sending"
-# heuristic (the tool proxy sends the request in one burst and waits for
-# the response — the sleep is shorter than the proxy's read timeout). The
-# log line in /tmp/upstream.log is what the script asserts (which requests
-# reached the upstream + the Authorization header carried).
+# (The earlier variant used `nc -l -c sh -c '...'`, which busybox nc does
+# NOT support — `nc -c` is not a flag; the listener never bound and every
+# preflight dial was refused. `nc -lk -e sh` is the busybox form.)
 #
 # The listener binds to 0.0.0.0:80 on the NODE (hostNetwork): this is a
 # DEV-ONLY kind acceptance fixture. In a production cluster a hostNetwork
@@ -36,34 +36,31 @@
 set -e
 LOG=/tmp/upstream.log
 : > "$LOG"
-# A loop that handles one connection per iteration (the tool proxy opens a
-# new connection per HTTP request; the listener re-listens for the next).
-while :; do
-  timeout 5 nc -l -p 80 -s 0.0.0.0 -c sh -c '
-    # One connection (busybox nc -c runs this sh with the client socket on
-    # fd 0/1). The proxy sends the request in one burst; a short sleep lets
-    # the burst land on fd 0 before we drain it. The request is small
-    # (request line + a few headers + no body).
-    sleep 0.3
-    REQ=""
-    AUTH=none
-    { read -r REQ; while IFS= read -r L && [ -n "$L" ]; do
-        case "$L" in
-          [Aa]*uthorization:*) AUTH=$(printf "%s" "$L" | cut -d" " -f2- | tr -d "\r") ;;
-        esac
-      done; } 2>/dev/null
-    [ -n "$AUTH" ] || AUTH=none
-    REQ=$(printf "%s" "$REQ" | tr -d "\r")
-    case "$REQ" in
-      "GET /ok HTTP/1.1")
-        echo "GET /ok auth=$AUTH" >> /tmp/upstream.log
-        printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-        ;;
-      *)
-        echo "req ${REQ:-<empty>} auth=$AUTH" >> /tmp/upstream.log
-        printf "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found"
-        ;;
-    esac
-  ' 2>/dev/null || true
-  sleep 0.05
-done
+# One persistent nc listener; each accepted connection runs the inline
+# handler with the client socket on fd 0/1 (busybox nc -e runs PROG after
+# the connect, on the client socket).
+nc -lk -p 80 -s 0.0.0.0 -e sh -c '
+  # One connection. The proxy sends the request in one burst; a short
+  # sleep lets the burst land on fd 0 before we drain it. The request is
+  # small (request line + a few headers + no body).
+  sleep 0.3
+  REQ=""
+  AUTH=none
+  { read -r REQ; while IFS= read -r L && [ -n "$L" ]; do
+      case "$L" in
+        [Aa]*uthorization:*) AUTH=$(printf "%s" "$L" | cut -d" " -f2- | tr -d "\r") ;;
+      esac
+    done; } 2>/dev/null
+  [ -n "$AUTH" ] || AUTH=none
+  REQ=$(printf "%s" "$REQ" | tr -d "\r")
+  case "$REQ" in
+    "GET /ok HTTP/1.1")
+      echo "path=/ok auth=$AUTH" >> /tmp/upstream.log
+      printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+      ;;
+    *)
+      echo "req ${REQ:-<empty>} auth=$AUTH" >> /tmp/upstream.log
+      printf "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found"
+      ;;
+  esac
+' 2>/dev/null

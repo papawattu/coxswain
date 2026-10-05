@@ -251,9 +251,9 @@ type LoopReconciler struct {
 	EgressProxyImage string
 
 	// ToolProxyImage is the tool proxy pod image (D41c, ADR-0008). Defaults to
-	// a Go dev stand-in; overridable for the smoke test (e.g. the real tool
-	// proxy image). When the effective policy has no tools, no tool proxy pod
-	// is created and this image is unused.
+	// the Go dev stand-in (golang:1.26); overridable via the manager's
+	// --tool-proxy-image flag. When the effective policy has no tools, no
+	// tool proxy pod is created and this image is unused.
 	ToolProxyImage string
 
 	// WorkspaceGitImage is the trusted image the workspace init container runs
@@ -2647,8 +2647,10 @@ func toolProxyLabels(loopName, toolName string) map[string]string {
 
 // toolProxyImage returns the tool proxy pod image: the reconciler's
 // ToolProxyImage field (settable in tests; a manager flag
-// --tool-proxy-image is a candidate for a future slice) or the Go stand-in
-// when unset (the cmd/tool-proxy binary is the D41a/D41d surface).
+// --tool-proxy-image is a candidate for a future slice) or the Go dev
+// stand-in (golang:1.26) when unset (the cmd/tool-proxy binary is the
+// D41a/D41d surface; the D41e kind e2e kind-loads an image under a
+// ToolProxyImage override).
 func (r *LoopReconciler) toolProxyImage() string {
 	if r.ToolProxyImage != "" {
 		return r.ToolProxyImage

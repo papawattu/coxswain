@@ -1859,7 +1859,7 @@ func proxyPodSpecHash(pod *corev1.Pod) string {
 	if err != nil {
 		// The spec is a Go struct of known types; marshaling should never fail.
 		// If it does, return a fixed hash so the pod is never deleted.
-		return "unhashable"
+		return toolProxyUnhashable
 	}
 	h := sha256.New()
 	h.Write(data)
@@ -2103,7 +2103,7 @@ func egressProxyLabels(loopName string) map[string]string {
 		"app.kubernetes.io/name":       "coxswain-egress-proxy",
 		"app.kubernetes.io/instance":   loopName,
 		policy.ComponentLabelKey:       netpolEgressProxyComponent,
-		"app.kubernetes.io/part-of":    partOfCoxswain,
+		labelPartOf:                    partOfCoxswain,
 		"coxswain.io/egress-proxy-for": loopName,
 	}
 }
@@ -2203,8 +2203,8 @@ func buildEgressProxyPod(loopName, ns, image string, networkAllows []string, pol
 					{Name: "EGRESS_POLICY_HASH", Value: policyHash},
 					{Name: "LOOP_NAME", Value: loopName},
 					{Name: "LOOP_NAMESPACE", Value: ns},
-					{Name: "POD_CIDR", Value: podCIDR},
-					{Name: "SERVICE_CIDR", Value: serviceCIDR},
+					{Name: envPodCIDR, Value: podCIDR},
+					{Name: envServiceCIDR, Value: serviceCIDR},
 				},
 				ReadinessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{
@@ -2504,6 +2504,20 @@ func toolProxyServiceName(loopName, toolName string) string {
 // component label, so the agent's exec / network / KubeArmor rules never
 // bind to a tool proxy pod (same regression guard as D33/I42b spec 7).
 const (
+	// labelPartOf is the app.kubernetes.io/part-of label key.
+	labelPartOf = "app.kubernetes.io/part-of"
+
+	// toolProxyUnhashable is the spec-hash value when the Pod spec is
+	// unhashable (should not happen in practice).
+	toolProxyUnhashable = "unhashable"
+
+	// envPodCIDR / envServiceCIDR are the env var names for the pod and
+	// service CIDRs (used by the egress proxy and tool proxy pods).
+	envPodCIDR     = "POD_CIDR"
+	envServiceCIDR = "SERVICE_CIDR"
+)
+
+const (
 	// toolProxyForLabel / toolNameLabel are the tool proxy's identifying
 	// labels (D41c). The tool proxy labels are disjoint from the model
 	// proxy, egress proxy and agent pods (no coxswain.io/loop, no agent
@@ -2517,7 +2531,7 @@ func toolProxyLabels(loopName, toolName string) map[string]string {
 		"app.kubernetes.io/name":     "coxswain-tool-proxy",
 		"app.kubernetes.io/instance": loopName,
 		policy.ComponentLabelKey:     policy.ComponentToolProxyLabel,
-		"app.kubernetes.io/part-of":  partOfCoxswain,
+		labelPartOf:                  partOfCoxswain,
 		toolProxyForLabel:            loopName,
 		toolNameLabel:                toolName,
 	}

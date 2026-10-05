@@ -2649,17 +2649,26 @@ func buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, po
 	var volumes []corev1.Volume
 	if tool.CredentialSecretRef.Name != "" {
 		// The credential Secret is mounted read-only into the tool proxy
-		// container ONLY (D41c: <path>/<name>, mode 0444). It is never a
-		// volume or env on the sandbox pod (the zero-credential property,
-		// ADR-0006/0008 — asserted by the envtest spec 3).
+		// container ONLY (D41c). The volume projects only the referenced
+		// key (Items: [{Key: <ref.key>, Path: "credential"}]) so the proxy
+		// sees exactly one file at /tool-cred/credential, never the
+		// Secret's other keys. No SubPath: a SubPath on a Secret volume
+		// selects an entry INSIDE the volume (whose top level is the
+		// keys), so subPath: <secret-name> would mount an empty directory
+		// and the proxy would log.Fatalf on a missing credential. The
+		// projected-key mount updates on rotation (subPath mounts never
+		// do).
+		//
+		// It is never a volume or env on the sandbox pod (the
+		// zero-credential property, ADR-0006/0008 — asserted by the
+		// envtest spec 3).
 		env = append(env, corev1.EnvVar{
 			Name:  "TOOL_CREDENTIAL_FILE",
-			Value: fmt.Sprintf("%s/%s/%s", toolCredsMountPath, tool.CredentialSecretRef.Name, tool.CredentialSecretRef.Key),
+			Value: toolCredsMountPath + "/credential",
 		})
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      toolCredsVolumeName,
 			MountPath: toolCredsMountPath,
-			SubPath:   tool.CredentialSecretRef.Name,
 			ReadOnly:  true,
 		})
 		volumes = append(volumes, corev1.Volume{
@@ -2667,6 +2676,7 @@ func buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, po
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName:  tool.CredentialSecretRef.Name,
+					Items:       []corev1.KeyToPath{{Key: tool.CredentialSecretRef.Key, Path: "credential"}},
 					DefaultMode: &secretMode,
 				},
 			},
@@ -2687,8 +2697,9 @@ func buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, po
 			AutomountServiceAccountToken: &falseP,
 			DNSConfig:                    proxyNdotsOneDNSConfig(),
 			SecurityContext: &corev1.PodSecurityContext{
-				RunAsUser:  &uid,
-				RunAsGroup: &gid,
+				RunAsUser:    &uid,
+				RunAsGroup:   &gid,
+				RunAsNonRoot: &trueP,
 			},
 			Containers: []corev1.Container{{
 				Name:  policy.ComponentToolProxyLabel,

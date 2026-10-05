@@ -231,7 +231,7 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		}
 		Expect(envs["TOOL_NAME"]).To(Equal(d41cToolName))
 		Expect(envs[d41cToolUpstreamEnv]).To(Equal(d41cUpstreamA))
-		Expect(envs["TOOL_CREDENTIAL_FILE"]).To(Equal("/tool-cred/" + d41cCredSecret + "/" + d41cCredKey))
+		Expect(envs["TOOL_CREDENTIAL_FILE"]).To(Equal("/tool-cred/credential"))
 		Expect(envs["LOOP_NAME"]).To(Equal("tool1-loop"))
 		Expect(envs["LOOP_NAMESPACE"]).To(Equal(ns))
 		Expect(envs["POD_CIDR"]).To(Equal(d41cPodCIDR))
@@ -298,7 +298,14 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		Expect(found).To(BeTrue(), "the tool proxy pod must carry a Secret volume for "+d41cCredSecret)
 		Expect(vol.Secret.DefaultMode).ToNot(BeNil())
 		Expect(*vol.Secret.DefaultMode).To(BeEquivalentTo(0o444), "the credential Secret mounts mode 0444")
-		// Mounted at /tool-cred/<name> (SubPath), read-only.
+		// The volume projects only the referenced key (Items):
+		// /tool-cred/credential, never the Secret's other keys.
+		Expect(vol.Secret.Items).To(HaveLen(1), "the Secret volume must project exactly one key")
+		Expect(vol.Secret.Items[0].Key).To(Equal(d41cCredKey),
+			"the projected key must be the CredentialSecretRef.Key")
+		Expect(vol.Secret.Items[0].Path).To(Equal("credential"),
+			"the projected path must be 'credential'")
+		// Mounted at /tool-cred, read-only, NO SubPath.
 		var mount corev1.VolumeMount
 		mountFound := false
 		for _, c := range pod.Spec.Containers {
@@ -311,10 +318,20 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		}
 		Expect(mountFound).To(BeTrue(), "the credential volume must be mounted into the tool proxy container")
 		Expect(mount.MountPath).To(Equal("/tool-cred"),
-			"the credential mounts at /tool-cred with the Secret name as SubPath")
-		Expect(mount.SubPath).To(Equal(d41cCredSecret),
-			"the SubPath is the Secret name: the file lands at /tool-cred/gh-cred/token")
+			"the credential mounts at /tool-cred")
+		Expect(mount.SubPath).To(BeEmpty(),
+			"no SubPath: the projected key lands at /tool-cred/credential")
 		Expect(mount.ReadOnly).To(BeTrue())
+		// TOOL_CREDENTIAL_FILE must point to the actual mount path.
+		var credEnv *corev1.EnvVar
+		for i := range pod.Spec.Containers[0].Env {
+			if pod.Spec.Containers[0].Env[i].Name == "TOOL_CREDENTIAL_FILE" {
+				credEnv = &pod.Spec.Containers[0].Env[i]
+			}
+		}
+		Expect(credEnv).ToNot(BeNil(), "TOOL_CREDENTIAL_FILE must be set")
+		Expect(credEnv.Value).To(Equal(mount.MountPath+"/"+vol.Secret.Items[0].Path),
+			"TOOL_CREDENTIAL_FILE must be mount.MountPath + '/' + items[0].Path")
 
 		// The zero-credential property (the envtest-provable half): the
 		// sandbox pod spec carries NO volume referencing the credential

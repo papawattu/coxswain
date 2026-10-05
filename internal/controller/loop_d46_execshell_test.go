@@ -92,7 +92,7 @@ var _ = Describe("D46: agent exec list without the runner's shell fails fast", f
 		r = &LoopReconciler{
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
-			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN},
+			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN},
 			PodCIDR:          i42bPodCIDR,
 			ServiceCIDR:      i42bServiceCIDR,
 			EgressProxyImage: i42bEgressProxyImg,

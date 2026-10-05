@@ -4,35 +4,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	)
+)
+
+// d41EngineUpstreamA is the upstream host used in the D41 engine Kapt tests.
+const d41EngineUpstreamA = "api.github.com"
 
 // D41d: the tool proxy KubeArmorPolicy (the per-tool inner fence) and the
 // tool proxy FQDNs in the agent's DNS allowlist.
-
-// toolProxyKaptTestLoop returns a Loop for the tool proxy Kapt tests.
-func toolProxyKaptTestLoop() *v1alpha1.Loop {
-	return &v1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: "lp", Namespace: "ns1", UID: "lp-uid"}}
-}
-
-// toolProxyKaptTestPolicy returns a policy with one tool (gh, api.github.com)
-// and no network allows (so the egress proxy policy is not created — isolates
-// the tool proxy policy from the egress proxy policy).
-func toolProxyKaptTestPolicy() policy.EffectivePolicy {
-	return policy.EffectivePolicy{
-		Tools: []v1alpha1.ToolSpec{
-			{
-				Name:                "gh",
-				Upstream:            "https://api.github.com",
-				CredentialSecretRef: v1alpha1.CredentialSecretRef{Name: "gh-cred"},
-			},
-		},
-	}
-}
-
 
 // Spec 1: the tool proxy KubeArmorPolicy has spec.action Block (default-deny)
 // and the selector is the tool proxy's DISJOINT label set (component=tool-proxy
@@ -72,7 +52,7 @@ func TestToolProxyKaptProcessAllowsOnlyOwnBinary(t *testing.T) {
 	if action != "Allow" {
 		t.Fatalf("spec.process.action = %q, want Allow", action)
 	}
-	items, _ := proc["matchPaths"].([]interface{})
+	items, _ := proc["matchPaths"].([]any)
 	if len(items) != 1 {
 		t.Fatalf("process.matchPaths = %d items, want 1", len(items))
 	}
@@ -88,12 +68,12 @@ func TestToolProxyKaptNetworkAllowsUpstream(t *testing.T) {
 	obj := EmitToolProxyKubeArmorPolicy("lp", "ns1", "gh", "https://api.github.com")
 
 	net, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
-	dnsItems, _ := net["matchDNSQueries"].([]interface{})
+	dnsItems, _ := net["matchDNSQueries"].([]any)
 	foundUpstream := false
 	for _, item := range dnsItems {
 		m, _ := item.(map[string]any)
 		domain, _ := m["domain"].(string)
-		if domain == "api.github.com" {
+		if domain == d41EngineUpstreamA {
 			foundUpstream = true
 		}
 	}
@@ -107,7 +87,7 @@ func TestToolProxyKaptNetworkExcludesOtherHosts(t *testing.T) {
 	obj := EmitToolProxyKubeArmorPolicy("lp", "ns1", "gh", "https://api.github.com")
 
 	net, _, _ := unstructured.NestedMap(obj.Object, "spec", "network")
-	dnsItems, _ := net["matchDNSQueries"].([]interface{})
+	dnsItems, _ := net["matchDNSQueries"].([]any)
 	for _, item := range dnsItems {
 		m, _ := item.(map[string]any)
 		domain, _ := m["domain"].(string)
@@ -139,7 +119,7 @@ func TestAgentKaptIncludesToolProxyFQDNWhenToolsPresent(t *testing.T) {
 	ep := policy.EnginePolicy{}
 	ep.Containers = append(ep.Containers, policy.ContainerPolicy{
 		Container: policy.ContainerAgent,
-		Allows:    []policy.Allow{policy.Allow{Type: policy.AllowNetwork, Match: "api.github.com"}},
+		Allows:    []policy.Allow{{Type: policy.AllowNetwork, Match: "api.github.com"}},
 	})
 	obj := EmitKubeArmorPolicyWithToolFQDNs("lp", "ns1", ep, []string{"coxswain-lp-tool-gh.ns1.svc"})
 
@@ -152,7 +132,7 @@ func TestAgentKaptIncludesToolProxyFQDNWhenToolsPresent(t *testing.T) {
 	// Check both matchDomains and matchDNSQueries for the FQDN.
 	found := false
 	for _, key := range []string{"matchDomains", "matchDNSQueries"} {
-		items, _ := net[key].([]interface{})
+		items, _ := net[key].([]any)
 		for _, item := range items {
 			m, _ := item.(map[string]any)
 			if str, _ := m["domain"].(string); str == "coxswain-lp-tool-gh.ns1.svc" {
@@ -171,7 +151,7 @@ func TestAgentKaptNoToolProxyFQDNWhenNoTools(t *testing.T) {
 	ep := policy.EnginePolicy{}
 	ep.Containers = append(ep.Containers, policy.ContainerPolicy{
 		Container: policy.ContainerAgent,
-		Allows:    []policy.Allow{policy.Allow{Type: policy.AllowNetwork, Match: "api.github.com"}},
+		Allows:    []policy.Allow{{Type: policy.AllowNetwork, Match: "api.github.com"}},
 	})
 	obj := EmitKubeArmorPolicyWithToolFQDNs("lp", "ns1", ep, nil)
 
@@ -180,7 +160,7 @@ func TestAgentKaptNoToolProxyFQDNWhenNoTools(t *testing.T) {
 		return // no network block is fine when there are no allows
 	}
 	for _, key := range []string{"matchDomains", "matchDNSQueries"} {
-		items, _ := net[key].([]interface{})
+		items, _ := net[key].([]any)
 		for _, item := range items {
 			m, _ := item.(map[string]any)
 			if str, _ := m["domain"].(string); strings.Contains(str, "-tool-") {

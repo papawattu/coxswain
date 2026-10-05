@@ -80,7 +80,7 @@ func TestClusterDomainDefaultsToClusterLocal(t *testing.T) {
 
 	r := &LoopReconciler{} // ClusterDomain unset.
 
-	if got := r.clusterDomain(); got != "cluster.local" {
+	if got := r.clusterDomain(); got != policy.DefaultClusterDomain {
 		t.Fatalf("unset ClusterDomain must default to cluster.local, got %q", got)
 	}
 	if got := r.proxyServiceURL(loop, ns); got != "http://"+loop+"-proxy."+ns+".svc.cluster.local:8080" {

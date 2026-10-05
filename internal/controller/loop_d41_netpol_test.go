@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -17,11 +18,11 @@ import (
 // effective policy. The URL is the tool proxy's Service FQDN (the agent
 // reaches the tool proxy directly, not through the egress proxy).
 func TestD41AgentEnvCOXTOOLURL(t *testing.T) {
-	r := &LoopReconciler{ClusterDomain: "cluster.local"}
+	r := &LoopReconciler{ClusterDomain: policy.DefaultClusterDomain}
 	tools := []coxv1alpha1.ToolSpec{
 		{
 			Name:                "gh",
-			Upstream:            "https://api.github.com",
+			Upstream:            d41cUpstreamA,
 			CredentialSecretRef: coxv1alpha1.CredentialSecretRef{Name: "gh-cred"},
 		},
 	}
@@ -47,7 +48,7 @@ func TestD41AgentEnvCOXTOOLURL(t *testing.T) {
 // are present. The agent talks to the tool proxy directly (not through the
 // egress proxy), so the tool proxy FQDNs must be in NO_PROXY.
 func TestD41AgentNOProxyIncludesToolProxyFQDNs(t *testing.T) {
-	r := &LoopReconciler{ClusterDomain: "cluster.local"}
+	r := &LoopReconciler{ClusterDomain: policy.DefaultClusterDomain}
 	// egressNOProxy reads the effective policy; with no policy refs the
 	// effective policy is empty (no tools) and the tool FQDNs are absent.
 	noProxy := r.egressNOProxy(context.Background(), &coxv1alpha1.Loop{

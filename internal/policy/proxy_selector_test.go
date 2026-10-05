@@ -57,12 +57,12 @@ func egressProxyLabelsMirror(loopName string) map[string]string {
 // proxy, the egress proxy and the agent (no coxswain.io/loop).
 func toolProxyLabelsMirror(loopName, toolName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       "coxswain-tool-proxy",
-		"app.kubernetes.io/instance":   loopName,
-		ComponentLabelKey:              ComponentToolProxyLabel,
-		"app.kubernetes.io/part-of":    "coxswain",
-		"coxswain.io/tool-proxy-for":   loopName,
-		"coxswain.io/tool":             toolName,
+		"app.kubernetes.io/name":     "coxswain-tool-proxy",
+		"app.kubernetes.io/instance": loopName,
+		ComponentLabelKey:            ComponentToolProxyLabel,
+		"app.kubernetes.io/part-of":  "coxswain",
+		"coxswain.io/tool-proxy-for": loopName,
+		"coxswain.io/tool":           toolName,
 	}
 }
 

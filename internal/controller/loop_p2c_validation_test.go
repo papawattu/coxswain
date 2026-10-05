@@ -259,9 +259,12 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 		}()
 
 		// A pre-P2c-shaped Loop (no new fields) with suspend=true reconciles
-		// exactly as the S1 specs do: the sandbox is suspended, the phase
-		// does NOT enter Paused (that is P2f), and nothing about the new
-		// fields affects the decision.
+		// as P2f's upgraded S1: the sandbox is suspended AND the phase enters
+		// Paused (pausedFrom=Planning — the S4 bootstrap advanced Pending->
+		// Planning in the same reconcile; pausedReason=Suspend). The BUDGET
+		// and STALL fields remain absent (additive): the Suspend pause is not
+		// a Budget or Stall pause, so status.budget and status.stallHistory
+		// are never touched.
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: p2cAdditiveName, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
@@ -284,11 +287,15 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "p2c-additive"}, got)).To(Succeed())
-		// The new status fields are simply absent (nil) — additive.
+		// The budget and stall fields are simply absent (nil) — additive: a
+		// Suspend pause is not a Budget or Stall pause, so neither field is
+		// written. (P2f: pausedFrom/pausedReason ARE set — the S1-only "phase
+		// does not enter Paused" behaviour is superseded by P2f.)
 		Expect(got.Status.Budget).To(BeNil())
 		Expect(got.Status.StallHistory).To(BeEmpty())
-		Expect(got.Status.PausedReason).To(BeEmpty())
-		Expect(got.Status.PausedFrom).To(BeEmpty())
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused), "P2f: suspend=true enters Paused")
+		Expect(got.Status.PausedFrom).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		Expect(got.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonSuspend))
 	})
 })
 

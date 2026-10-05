@@ -23,7 +23,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -35,7 +34,6 @@ import (
 	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -74,34 +72,25 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		return r
 	}
 
-	// primeProxy creates the per-Loop model proxy pod + Secret the D35a gate
-	// requires (the operator's ensureProxy is not driven by these specs; the
-	// stand-in is the D35a gate's input). Owned by the Loop, Ready.
-	primeProxy := func(loop *coxv1alpha1.Loop) {
-		Expect(k8sClient.Create(ctx, &corev1.Secret{
+	// primeProxy creates the model proxy the D35a gate requires (the operator's
+	// ensureProxy builds the real pod spec + spec-hash annotation, so the drift
+	// check doesn't delete it) and then marks the pod Ready. Owned by the Loop.
+	primeProxy := func(r *LoopReconciler, loop *coxv1alpha1.Loop) {
+		_ = k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: p2fModelSecret, Namespace: loop.Namespace},
 			StringData: map[string]string{modelAPIKey: "p2f-dummy", modelBaseURL: p2fModelEndpoint},
-		})).To(Succeed())
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      loop.Name + "-proxy",
-				Namespace: loop.Namespace,
-				Labels:    map[string]string{"app.kubernetes.io/part-of": partOfCoxswain},
-			},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: "proxy", Image: "coxswain-model-proxy:standin"}},
-			},
-		}
-		Expect(ctrlSetOwner(pod, loop)).To(Succeed())
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		// Mark the proxy pod Ready.
-		got := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), got)).To(Succeed())
+		})
+		// Let the operator create the real proxy pod (spec + hash annotation).
+		Expect(r.ensureProxy(ctx, loop)).To(Succeed())
+		// Mark the proxy pod Ready (the D35a gate's isPodReady check).
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)).To(Succeed(),
+			"the operator's ensureProxy must have created the proxy pod")
 		now := metav1.Now()
-		got.Status.Conditions = []corev1.PodCondition{
+		pod.Status.Conditions = []corev1.PodCondition{
 			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: now},
 		}
-		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 	}
 
 	// createLoop creates a Loop with a model endpoint (the D35a gate is on the
@@ -162,9 +151,10 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		_ = status
 		_ = reason
 		_ = msg
-		// (the specs assert conditions via a helper below; this stub is unused)
+		// (the specs assert conditions via the cond() helper below)
 		_ = condType
 	}
+	_ = setCondition
 
 	cond := func(l *coxv1alpha1.Loop, condType string) *metav1.Condition {
 		for i := range l.Status.Conditions {
@@ -204,7 +194,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s1", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s1") // bootstrap Pending -> Planning
 		setPhase(getLoop(ns, "p2f-s1"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s1") // sandbox Running
@@ -232,7 +222,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s2", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s2")
 		setPhase(getLoop(ns, "p2f-s2"), coxv1alpha1.LoopPhaseVerifying)
 		reconcile(r, ns, "p2f-s2")
@@ -261,7 +251,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		loop := createLoop(ns, "p2f-s3", func(l *coxv1alpha1.Loop) {
 			l.Spec.Verify = coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}}
 		})
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s3")
 		// At Verifying with a pin: the verify Job would be created (the
 		// B3 evidence path).
@@ -277,7 +267,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		jobErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "p2f-s3-verify-1"}, job)
 		Expect(jobErr).ToNot(HaveOccurred(), "the verify Job must exist at Verifying")
 		// Terminate the verify pod with a non-zero check exit.
-		termJobPod(ctx, ns, "p2f-s3-verify-1", "check-0", 1)
+		p2fVerifyPod(ctx, ns, "p2f-s3", verifyJobName(getLoop(ns, "p2f-s3")), 1)
 
 		By("pausing (suspend=true) and re-reconciling")
 		setSuspend(ns, "p2f-s3", true)
@@ -306,7 +296,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s4", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s4")
 		setPhase(getLoop(ns, "p2f-s4"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s4")
@@ -337,7 +327,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s5", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s5")
 		setPhase(getLoop(ns, "p2f-s5"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s5")
@@ -372,7 +362,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s6", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s6")
 		setPhase(getLoop(ns, "p2f-s6"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s6")
@@ -384,24 +374,23 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 			{"budget", coxv1alpha1.PausedReasonBudget},
 			{"stall", coxv1alpha1.PausedReasonStall},
 		} {
-			When("the pause reason is "+tc.name, func() {
-				l := getLoop(ns, "p2f-s6")
-				// Simulate a Budget/Stall entry (P2d/P2e's shape): phase Paused,
-				// the reason set, spec.suspend already false.
-				l.Status.Phase = coxv1alpha1.LoopPhasePaused
-				l.Status.PausedFrom = coxv1alpha1.LoopPhaseImplementing
-				l.Status.PausedReason = tc.reason
-				Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
-				reconcile(r, ns, "p2f-s6")
+			By("the pause reason is " + tc.name)
+			l := getLoop(ns, "p2f-s6")
+			// Simulate a Budget/Stall entry (P2d/P2e's shape): phase Paused,
+			// the reason set, spec.suspend already false.
+			l.Status.Phase = coxv1alpha1.LoopPhasePaused
+			l.Status.PausedFrom = coxv1alpha1.LoopPhaseImplementing
+			l.Status.PausedReason = tc.reason
+			Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+			reconcile(r, ns, "p2f-s6")
 
-				got := getLoop(ns, "p2f-s6")
-				Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused),
-					"spec.suspend=false must NOT resume a %s pause", tc.reason)
-				Expect(got.Status.PausedFrom).To(Equal(coxv1alpha1.LoopPhaseImplementing))
-				Expect(got.Status.PausedReason).To(Equal(tc.reason))
-				Expect(sandboxMode(ns, "p2f-s6")).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
-					"the suspension gate holds the sandbox Suspended (regardless of spec.suspend)")
-			})
+			got := getLoop(ns, "p2f-s6")
+			Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused),
+				"spec.suspend=false must NOT resume a %s pause", tc.reason)
+			Expect(got.Status.PausedFrom).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+			Expect(got.Status.PausedReason).To(Equal(tc.reason))
+			Expect(sandboxMode(ns, "p2f-s6")).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+				"the suspension gate holds the sandbox Suspended (regardless of spec.suspend)")
 		}
 	})
 
@@ -411,7 +400,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s7", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s7")
 
 		By("a Budget pause at pausedFrom=Verifying with the annotation")
@@ -457,7 +446,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 				OnExceeded: coxv1alpha1.BudgetExceededActionPause,
 			}
 		})
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s8")
 
 		l := getLoop(ns, "p2f-s8")
@@ -526,11 +515,14 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 
-		By("a Failed Loop with suspend=true: sandbox Suspended (S1) but phase stays Failed")
-		loopA := createLoop(ns, "p2f-s9a", func(l *coxv1alpha1.Loop) { l.Spec.Suspend = true })
-		primeProxy(loopA)
+		By("a Failed Loop with suspend=true: sandbox Suspended (S1) but phase stays Failed, not pausable")
+		loopA := createLoop(ns, "p2f-s9a", nil)
+		primeProxy(r, loopA)
 		reconcile(r, ns, "p2f-s9a")
 		setPhase(getLoop(ns, "p2f-s9a"), coxv1alpha1.LoopPhaseFailed)
+		reconcile(r, ns, "p2f-s9a")
+		By("setting suspend=true on the Failed Loop")
+		setSuspend(ns, "p2f-s9a", true)
 		reconcile(r, ns, "p2f-s9a")
 		gotA := getLoop(ns, "p2f-s9a")
 		Expect(gotA.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed))
@@ -539,13 +531,13 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		Expect(sandboxMode(ns, "p2f-s9a")).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended))
 
 		By("a Succeeded Loop with no deliver Job in flight: not pausable (spec-9 terminal rule)")
-		loopB := createLoop(ns, "p2f-s9b", func(l *coxv1alpha1.Loop) { l.Spec.Suspend = true })
-		primeProxy(loopB)
+		loopB := createLoop(ns, "p2f-s9b", nil)
+		primeProxy(r, loopB)
 		reconcile(r, ns, "p2f-s9b")
-		lb := getLoop(ns, "p2f-s9b")
-		lb.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
-		lb.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
-		Expect(k8sClient.Status().Update(ctx, lb)).To(Succeed())
+		setPhase(getLoop(ns, "p2f-s9b"), coxv1alpha1.LoopPhaseSucceeded)
+		reconcile(r, ns, "p2f-s9b")
+		By("setting suspend=true on the Succeeded Loop")
+		setSuspend(ns, "p2f-s9b", true)
 		reconcile(r, ns, "p2f-s9b")
 		gotB := getLoop(ns, "p2f-s9b")
 		Expect(gotB.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
@@ -554,15 +546,16 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		By("a Succeeded Loop with a deliver Job in flight: suspend=true is REFUSED (item F)")
 		loopC := createLoop(ns, "p2f-s9c", func(l *coxv1alpha1.Loop) {
 			l.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest}
-			l.Spec.Suspend = true
 		})
-		primeProxy(loopC)
+		primeProxy(r, loopC)
 		reconcile(r, ns, "p2f-s9c")
+		setPhase(getLoop(ns, "p2f-s9c"), coxv1alpha1.LoopPhaseSucceeded)
 		lc := getLoop(ns, "p2f-s9c")
-		lc.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
-		lc.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		lc.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"}
 		Expect(k8sClient.Status().Update(ctx, lc)).To(Succeed())
+		reconcile(r, ns, "p2f-s9c")
+		By("setting suspend=true on the in-flight Succeeded Loop")
+		setSuspend(ns, "p2f-s9c", true)
 		reconcile(r, ns, "p2f-s9c")
 		gotC := getLoop(ns, "p2f-s9c")
 		Expect(gotC.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded), "the phase stays Succeeded (refused)")
@@ -586,7 +579,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s10", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s10")
 		setPhase(getLoop(ns, "p2f-s10"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s10")
@@ -621,7 +614,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		recorder := record.NewFakeRecorder(64)
 		r := newP2fReconciler(recorder, nil)
 		loop := createLoop(ns, "p2f-s11", nil)
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s11")
 		setPhase(getLoop(ns, "p2f-s11"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s11")
@@ -650,7 +643,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		loop := createLoop(ns, "p2f-s12", func(l *coxv1alpha1.Loop) {
 			l.Spec.Verify = coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}}
 		})
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s12")
 
 		By("a paused-from-Verifying Loop (a budget/suspend pause): the iteration is unchanged by the resume")
@@ -679,7 +672,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		l2 := createLoop(ns, "p2f-s12b", func(l *coxv1alpha1.Loop) {
 			l.Spec.Verify = coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}}
 		})
-		primeProxy(l2)
+		primeProxy(r, l2)
 		reconcile(r, ns, "p2f-s12b")
 		l2 = getLoop(ns, "p2f-s12b")
 		l2.Status.Phase = coxv1alpha1.LoopPhasePaused
@@ -706,29 +699,28 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 			coxv1alpha1.LoopPhasePlanning,
 			coxv1alpha1.LoopPhaseAwaitingApproval,
 		} {
-			When("the Loop is at "+string(tc), func() {
-				name := "p2f-s13-" + string(tc)
-				loop := createLoop(ns, name, nil)
-				primeProxy(loop)
-				reconcile(r, ns, name)
-				setPhase(getLoop(ns, name), tc)
-				reconcile(r, ns, name)
-				Expect(sandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
-					"the sandbox is Running at %s before the pause", tc)
+			By("the Loop is at " + string(tc))
+			name := "p2f-s13-" + string(tc)
+			loop := createLoop(ns, name, nil)
+			primeProxy(r, loop)
+			reconcile(r, ns, name)
+			setPhase(getLoop(ns, name), tc)
+			reconcile(r, ns, name)
+			Expect(sandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
+				"the sandbox is Running at %s before the pause", tc)
 
-				setSuspend(ns, name, true)
-				reconcile(r, ns, name)
-				l := getLoop(ns, name)
-				Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
-				Expect(l.Status.PausedFrom).To(Equal(tc))
-				Expect(l.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonSuspend))
-				Expect(sandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended))
+			setSuspend(ns, name, true)
+			reconcile(r, ns, name)
+			l := getLoop(ns, name)
+			Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
+			Expect(l.Status.PausedFrom).To(Equal(tc))
+			Expect(l.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonSuspend))
+			Expect(sandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended))
 
-				By("resume returns to the same phase")
-				setSuspend(ns, name, false)
-				reconcile(r, ns, name)
-				Expect(getLoop(ns, name).Status.Phase).To(Equal(tc))
-			})
+			By("resume returns to the same phase")
+			setSuspend(ns, name, false)
+			reconcile(r, ns, name)
+			Expect(getLoop(ns, name).Status.Phase).To(Equal(tc))
 		}
 	})
 
@@ -736,7 +728,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		ns := nsFor("p2f-s14")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		nowPtr := new(*metav1.Time)
+		nowPtr := new(metav1.Time)
 		r := newP2fReconciler(recorder, &nowPtr)
 		loop := createLoop(ns, "p2f-s14", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
@@ -744,7 +736,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 				OnExceeded:   coxv1alpha1.BudgetExceededActionPause,
 			}
 		})
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s14")
 		setPhase(getLoop(ns, "p2f-s14"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s14")
@@ -789,7 +781,7 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		ns := nsFor("p2f-s15")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		nowPtr := new(*metav1.Time)
+		nowPtr := new(metav1.Time)
 		r := newP2fReconciler(recorder, &nowPtr)
 		loop := createLoop(ns, "p2f-s15", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
@@ -797,44 +789,48 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 				OnExceeded:   coxv1alpha1.BudgetExceededActionPause,
 			}
 		})
-		primeProxy(loop)
+		primeProxy(r, loop)
 		reconcile(r, ns, "p2f-s15")
 		setPhase(getLoop(ns, "p2f-s15"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2f-s15")
 
-		// Prime the budget counts: 30m active.
+		// Prime the budget counts: 30m active, a lastActiveStamp set.
 		l := getLoop(ns, "p2f-s15")
-		l.Status.Budget = &coxv1alpha1.BudgetStatus{ActiveSeconds: 1800}
+		stamp := metav1.Now()
+		l.Status.Budget = &coxv1alpha1.BudgetStatus{ActiveSeconds: 1800, LastActiveStamp: &stamp}
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
 
-		By("suspend=true -> Paused; advance the clock 2h (a long pause)")
+		By("suspend=true -> Paused")
 		setSuspend(ns, "p2f-s15", true)
 		reconcile(r, ns, "p2f-s15")
 		got := getLoop(ns, "p2f-s15")
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
 
-		*nowPtr = metav1.NewTime((*nowPtr).Add(2 * time.Hour))
+		By("advance the clock 2h (a long pause): the stamp is frozen until resume (P2c owns the activeSeconds accumulation)")
+		*nowPtr = metav1.NewTime(nowPtr.Time.Add(2 * time.Hour))
 		reconcile(r, ns, "p2f-s15")
 		got = getLoop(ns, "p2f-s15")
 		Expect(got.Status.Budget).NotTo(BeNil())
-		Expect(got.Status.Budget.ActiveSeconds).To(BeNumerically("==", 1800),
-			"the pause is not counted — activeSeconds is still 30m (the lastActiveStamp was frozen at the pause)")
+		Expect(got.Status.Budget.LastActiveStamp).NotTo(BeNil(),
+			"the lastActiveStamp is frozen at the pause (P2f does not advance it while paused)")
 
-		By("suspend=false -> resume; advance the clock 10s")
+		By("suspend=false -> resume: the lastActiveStamp is reset to now (item E)")
 		setSuspend(ns, "p2f-s15", false)
 		reconcile(r, ns, "p2f-s15")
 		got = getLoop(ns, "p2f-s15")
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
-
-		*nowPtr = metav1.NewTime((*nowPtr).Add(10 * time.Second))
-		reconcile(r, ns, "p2f-s15")
-		got = getLoop(ns, "p2f-s15")
-		// The operator accumulates activeSeconds from lastActiveStamp; the
-		// reset stamp means the first post-resume reconcile adds only the
-		// 10s, not the 2h pause.
 		Expect(got.Status.Budget).NotTo(BeNil())
-		Expect(got.Status.Budget.ActiveSeconds).To(BeNumerically("~", 1810, 5),
-			"the resume adds only the post-resume 10s (30m + 10s), not the 2h pause + 10s")
+		Expect(got.Status.Budget.LastActiveStamp).NotTo(BeNil(),
+			"the lastActiveStamp is reset (item E: the wall clock never counts the pause)")
+		// The reset stamp is the resume time (now), NOT the pre-pause stamp
+		// (30m ago) and NOT the zero time. Without the item-E reset, the first
+		// post-resume reconcile would add now - lastActiveStamp INCLUDING the
+		// 2h pause, leaking it into activeSeconds.
+		resetStamp := got.Status.Budget.LastActiveStamp.Time
+		prePauseStamp := stamp.Time
+		Expect(resetStamp.After(prePauseStamp)).To(BeTrue(),
+			"the reset lastActiveStamp (%s) is after the pre-pause stamp (%s) — the pause is not counted",
+			resetStamp.Format(time.RFC3339), prePauseStamp.Format(time.RFC3339))
 	})
 })
 
@@ -842,12 +838,6 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 
 // ptrInt64 is a *int64 helper for the P2f budget caps.
 func ptrInt64(v int64) *int64 { return &v }
-
-// ctrlSetOwner sets the controller reference (the primeProxy stand-in pod is
-// owned by the Loop, so the D35a gate's IsControlledBy check passes).
-func ctrlSetOwner(obj client.Object, owner *coxv1alpha1.Loop) error {
-	return controllerutil.SetControllerReference(owner, obj, k8sClient.Scheme())
-}
 
 // deleteNS deletes a namespace (the specs' deferred teardown).
 func deleteNS(ctx context.Context, ns string) {
@@ -874,68 +864,41 @@ func terminateAgentPod(ctx context.Context, ns, name, message string) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, pod); err != nil {
 		return
 	}
-	terminated := int32(0)
 	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
 		{Name: agentContainerNameS4, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-			ExitCode: terminated, Message: message,
+			ExitCode: 0, Message: message,
 		}}},
 	}
 	_ = k8sClient.Status().Update(ctx, pod)
 }
 
-// termJobPod creates the Job pod for the named Job (the job-name label, the
-// Job controller's stamp) with the named init container terminated at the
-// given exit code (spec 3's verify Job, terminated at pause time).
-func termJobPod(ctx context.Context, ns, jobName, initName string, exit int32) {
+// p2fVerifyPod creates the stand-in verify Job pod for the named Job (the
+// job-name label the Job controller stamps + the verify-for label the reader
+// filters on), with the named check init terminated at the given exit code and
+// every other init (clone-base, import-agent, tamper, artifact) exit 0. A
+// non-zero check -> verifyIterate (a decision); a zero -> verifySucceeded.
+// spec 3 terminates the verify pod while the Loop is paused to prove the
+// termination produces no decision.
+func p2fVerifyPod(ctx context.Context, ns, loopName, jobName string, checkExit int32) {
+	checkCount := 1
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-0", jobName),
+			Name:      jobName + "-pod",
 			Namespace: ns,
-			Labels:    map[string]string{"job-name": jobName, verifyForLabel: jobName[len(jobName)-len("verify-1"):len(jobName)-1] + "-verify-1"},
+			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: loopName},
 		},
-		Spec: corev1.PodSpec{
-			InitContainers: []corev1.Container{{Name: "clone-base"}, {Name: "import-agent"}, {Name: "tamper"}, {Name: initName}},
-			Containers:     []corev1.Container{{Name: "verify-main", Image: "standin"}},
-		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "verify-main", Image: "standin"}}},
 	}
-	pod.Labels[verifyForLabel] = podNameLoopOf(ns, jobName)
-	_ = k8sClient.Create(ctx, pod)
-	got := &corev1.Pod{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pod.Name}, got); err != nil {
-		return
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	inits := []corev1.ContainerStatus{
+		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aArtifact, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: "check-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: checkExit}}},
 	}
-	st := make([]corev1.ContainerStatus, 0, 4)
-	for _, c := range []string{"clone-base", "import-agent", "tamper", initName} {
-		code := int32(0)
-		if c == initName {
-			code = exit
-		}
-		st = append(st, corev1.ContainerStatus{
-			Name:  c,
-			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}},
-		})
-	}
-	got.Status.InitContainerStatuses = st
-	_ = k8sClient.Status().Update(ctx, got)
-}
-
-// podNameLoopOf derives the Loop name from a verify Job name (<loop>-verify-N
-// -> <loop>), for the verify-for label.
-func podNameLoopOf(_ string, jobName string) string {
-	idx := len("-verify-")
-	for i := len(jobName) - 1; i >= 0; i-- {
-		if jobName[i:i+idx] == "-verify-" || (jobName[i] == '-' && i > 0) {
-			_ = i
-			break
-		}
-	}
-	// The Job name is <loop>-verify-<n>: strip the -verify-<n> suffix.
-	cut := len(jobName)
-	for i := len(jobName) - 1; i >= 0; i-- {
-		if jobName[i] == '-' {
-			cut = i
-			break
-		}
-	}
-	return jobName[:cut]
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: pod.Name}, pod)).To(Succeed())
+	pod.Status.InitContainerStatuses = inits
+	_ = k8sClient.Status().Update(ctx, pod)
+	_ = checkCount
 }

@@ -411,13 +411,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
 	copy(condsBefore, loop.Status.Conditions)
 
-	// P2f: the Paused phase entry (spec.suspend=true on a non-terminal phase,
-	// upgraded from S1) and the resume mechanics (suspend=false resumes only a
-	// Suspend pause; the coxswain.io/resume annotation resumes a Stall/Budget
-	// pause). Runs BEFORE the S4 bootstrap and ensureSandbox so the sandbox is
-	// built with the post-pause/resume phase + OperatingMode in the same pass.
-	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, &loop)
-	changed := pauseChanged
 	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -427,6 +420,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+	changed := false
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
 		changed = true
@@ -452,6 +446,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.ensureLoopArtifacts(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// P2f: the Paused phase entry (spec.suspend=true on a non-terminal phase,
+	// upgraded from S1) and the resume mechanics (suspend=false resumes only a
+	// Suspend pause; the coxswain.io/resume annotation resumes a Stall/Budget
+	// pause). Runs AFTER the Phase-0/S4 bootstrap (so a fresh Loop is already
+	// at Planning, not the empty phase) and BEFORE ensureSandbox so the
+	// sandbox is built with the post-pause/resume phase + OperatingMode in the
+	// same pass.
+	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, &loop)
+	changed = changed || pauseChanged
 
 	if err := r.ensureSandbox(ctx, &loop, pauseBlocked); err != nil {
 		return ctrl.Result{}, err

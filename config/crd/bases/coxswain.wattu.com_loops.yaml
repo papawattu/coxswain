@@ -146,6 +146,67 @@ spec:
                 - message: endpointSecretRef and modelEndpoint must be set together
                     (a Loop with a model Secret must also name the model endpoint)
                   rule: has(self.endpointSecretRef) == has(self.modelEndpoint)
+              budget:
+                description: |-
+                  budget caps the Loop's token, active-time and derived-cost totals
+                  (P2c); P2d applies onExceeded when any cap is hit. nil means no
+                  budget caps.
+                properties:
+                  maxCostUsd:
+                    description: |-
+                      maxCostUsd is the derived-cost cap in USD as a decimal string (e.g.
+                      "0.50"). The cost is derived (P2d) from the token counts and the
+                      prices, not measured. nil means no cost cap.
+                    minLength: 1
+                    pattern: ^\d+(\.\d+)?$
+                    type: string
+                  maxTokens:
+                    description: |-
+                      maxTokens is the total prompt + completion tokens across the Loop's
+                      life. nil means no token cap.
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  maxWallClock:
+                    description: |-
+                      maxWallClock is the accumulated ACTIVE time cap as a Go duration
+                      string (e.g. "1h30m"). It does not count time spent Paused (the
+                      budget clock stops while the Loop is paused; see P2d's
+                      status.budget.activeSeconds accumulation). nil means no wall-clock
+                      cap. The pattern admits only Go duration parts (no commas, no signs,
+                      no bare numbers — the operator seam's ParseMaxWallClock is the final
+                      gate and rejects sub-second caps).
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                    type: string
+                  modelPrices:
+                    description: |-
+                      modelPrices is the per-Loop override of the cluster-wide
+                      coxswain-model-prices ConfigMap (item 11). Precedence: this field
+                      > the ConfigMap > (no prices → the cost cap is inert, fail-closed).
+                    properties:
+                      completionUsdPerMtok:
+                        description: |-
+                          completionUsdPerMtok is the completion price in USD per million tokens
+                          (decimal string, e.g. "1.20").
+                        minLength: 1
+                        pattern: ^\d+(\.\d+)?$
+                        type: string
+                      promptUsdPerMtok:
+                        description: |-
+                          promptUsdPerMtok is the prompt price in USD per million tokens
+                          (decimal string, e.g. "0.30").
+                        minLength: 1
+                        pattern: ^\d+(\.\d+)?$
+                        type: string
+                    type: object
+                  onExceeded:
+                    default: Pause
+                    description: onExceeded is the action when ANY cap is hit.
+                    enum:
+                    - Pause
+                    - Fail
+                    type: string
+                type: object
               delivery:
                 description: |-
                   Delivery configures what happens to a SUCCESSFUL, VERIFIED Loop
@@ -208,6 +269,24 @@ spec:
                   maxIterations:
                     default: 10
                     description: maxIterations caps the plan→implement→verify cycles.
+                    minimum: 1
+                    type: integer
+                  stallAction:
+                    default: Fail
+                    description: stallAction is the action taken when the stall detector
+                      fires.
+                    enum:
+                    - Fail
+                    - Pause
+                    - Continue
+                    type: string
+                  stallAfter:
+                    description: |-
+                      stallAfter is the number of CONSECUTIVE verify-failure iterations (with
+                      identical normalised failing output, P2e) before the stall detector
+                      fires. nil or 0 reads as the PLAN.md default of 3 (the CRD does not
+                      default it; the operator's effectiveStallConfig does — P2c).
+                    format: int32
                     minimum: 1
                     type: integer
                 type: object
@@ -323,6 +402,108 @@ spec:
                   pinned SHAs the TamperedVerify glob diff compares; the agent has no write
                   path to it. Immutable once set.
                 type: string
+              budget:
+                description: |-
+                  budget is the operator's record of the Loop's accumulated budget
+                  consumption (P2c; P2d accumulates it from the model proxy endpoint).
+                  nil until the first read.
+                properties:
+                  activeSeconds:
+                    description: |-
+                      activeSeconds is the accumulated ACTIVE time in seconds (item 10).
+                      Time spent Paused is not counted: the accumulation stops while the
+                      Loop is paused (P2d) and lastActiveStamp is reset to now on resume
+                      (P2f) so the first post-resume reconcile does not add the pause's
+                      duration.
+                    format: int64
+                    type: integer
+                  bootIDChanged:
+                    description: |-
+                      bootIDChanged is true (sticky) when a proxy pod recreate wiped the
+                      counters between reads (the honest-limit marker, P2a): the
+                      accumulated totals jumped back relative to the last-read values.
+                    type: boolean
+                  completionTokens:
+                    description: |-
+                      completionTokens is the accumulated completion-token total across
+                      boot-ID changes.
+                    format: int64
+                    type: integer
+                  costUsd:
+                    description: |-
+                      costUsd is the derived cost in USD as a decimal string (P2d: derived
+                      from the token counts and the prices, never measured).
+                    type: string
+                  exceeded:
+                    description: |-
+                      exceeded is true when any spec.budget cap is hit. It is sticky until
+                      re-evaluated on resume (item 5 — P2f's resume re-evaluates the
+                      current caps against the current counts; raising a cap clears it).
+                    type: boolean
+                  exceededReason:
+                    description: |-
+                      exceededReason names the cap that was hit (Tokens|WallClock|Cost);
+                      empty until exceeded is true.
+                    enum:
+                    - Tokens
+                    - WallClock
+                    - Cost
+                    type: string
+                  lastActiveStamp:
+                    description: |-
+                      lastActiveStamp is the last reconcile's active-time accumulation point
+                      (item E). The operator sets it to now on every non-paused reconcile
+                      and resets it to now on resume (P2f), so the first post-resume
+                      reconcile does not add the pause's duration to activeSeconds.
+                    format: date-time
+                    type: string
+                  lastBootID:
+                    description: |-
+                      lastBootID is the proxy bootID the last-read counters came from
+                      (item 2). Empty before the first read.
+                    type: string
+                  lastCompletionTokens:
+                    description: |-
+                      lastCompletionTokens is the last-READ CUMULATIVE completion-token
+                      counter from the proxy (item 2).
+                    format: int64
+                    type: integer
+                  lastPromptTokens:
+                    description: |-
+                      lastPromptTokens is the last-READ CUMULATIVE prompt-token counter
+                      from the proxy (item 2) — the operator's delta logic consumes it.
+                    format: int64
+                    type: integer
+                  lastRequests:
+                    description: |-
+                      lastRequests is the last-READ CUMULATIVE metered-request counter from
+                      the proxy (item 2).
+                    format: int64
+                    type: integer
+                  lastUnmeteredRequests:
+                    description: |-
+                      lastUnmeteredRequests is the last-READ CUMULATIVE unmetered-request
+                      counter from the proxy (item 2).
+                    format: int64
+                    type: integer
+                  promptTokens:
+                    description: |-
+                      promptTokens is the accumulated prompt-token total across boot-ID
+                      changes.
+                    format: int64
+                    type: integer
+                  requests:
+                    description: requests is the accumulated number of metered model
+                      requests.
+                    format: int64
+                    type: integer
+                  unmeteredRequests:
+                    description: |-
+                      unmeteredRequests is the CUMULATIVE count of requests the proxy could
+                      not meter (item 3: a count, not a last-request flag).
+                    format: int64
+                    type: integer
+                type: object
               conditions:
                 description: |-
                   conditions represent the current state of the Loop resource.
@@ -482,6 +663,31 @@ spec:
                 - Paused
                 - CleaningUp
                 type: string
+              pausedFrom:
+                description: |-
+                  pausedFrom is the phase the Loop left on entering Paused (P2f);
+                  cleared on resume.
+                enum:
+                - Pending
+                - Planning
+                - AwaitingApproval
+                - Implementing
+                - Verifying
+                - Succeeded
+                - Failed
+                - Paused
+                - CleaningUp
+                type: string
+              pausedReason:
+                description: |-
+                  pausedReason is WHY the Loop is paused (P2c, item 4): spec.suspend
+                  resumes only a Suspend pause; a Stall or Budget pause resumes via the
+                  coxswain.io/resume annotation (P2f). Cleared on resume.
+                enum:
+                - Suspend
+                - Stall
+                - Budget
+                type: string
               phase:
                 default: Pending
                 description: phase is the current phase of the state machine.
@@ -579,6 +785,55 @@ spec:
                     - CleaningUp
                     type: string
                 type: object
+              stallHistory:
+                description: |-
+                  stallHistory is the ring of the last 10 verify-failure iterations
+                  (one StallEntry per failed verify Job, atomic list, P2c/P2e). The
+                  stall detector (P2e) needs only the recent consecutive run.
+                items:
+                  description: |-
+                    StallEntry is one verify-failure iteration's record in status.stallHistory
+                    (P2c/P2e). jobName is the dedup key (item 6): a re-read of the same verify
+                    Job appends no entry.
+                  properties:
+                    at:
+                      description: at is the verify Job pod's finish time (kubelet-recorded).
+                      format: date-time
+                      type: string
+                    check:
+                      description: check is the failing check's name.
+                      type: string
+                    hash:
+                      description: hash is the SHA-256 hex of the normalised failing
+                        output (P2e).
+                      type: string
+                    iteration:
+                      description: iteration is the 1-based iteration number of the
+                        failing verify run.
+                      type: integer
+                    jobName:
+                      description: |-
+                        jobName is the verify Job's name (<loop>-verify-<iteration>) — the
+                        dedup key (item 6).
+                      minLength: 1
+                      type: string
+                    normalisationVersion:
+                      description: |-
+                        normalisationVersion is the version of the normalisation the hash was
+                        computed with (the P2e constant). A change resets the consecutive run
+                        (a v1 and a v2 hash of the same output must not be conflated).
+                      minLength: 1
+                      type: string
+                  required:
+                  - at
+                  - check
+                  - hash
+                  - iteration
+                  - jobName
+                  - normalisationVersion
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
               verify:
                 description: |-
                   verify carries the operator's record of the last verify run's evidence

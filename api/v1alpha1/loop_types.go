@@ -225,6 +225,114 @@ type LoopSettings struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=10
 	MaxIterations int `json:"maxIterations,omitempty"`
+
+	// stallAfter is the number of CONSECUTIVE verify-failure iterations (with
+	// identical normalised failing output, P2e) before the stall detector
+	// fires. nil or 0 reads as the PLAN.md default of 3 (the CRD does not
+	// default it; the operator's effectiveStallConfig does — P2c).
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	StallAfter *int32 `json:"stallAfter,omitempty"`
+
+	// stallAction is the action taken when the stall detector fires.
+	// +kubebuilder:validation:Enum=Fail;Pause;Continue
+	// +kubebuilder:default=Fail
+	// +optional
+	StallAction StallAction `json:"stallAction,omitempty"`
+}
+
+// StallAction is the action the stall detector takes when it fires (P2c/P2e).
+// +kubebuilder:validation:Enum=Fail;Pause;Continue
+type StallAction string
+
+const (
+	// StallActionFail fails the Loop (phase Failed, reason Stalled).
+	StallActionFail StallAction = "Fail"
+	// StallActionPause pauses the Loop (phase Paused, pausedReason Stall).
+	StallActionPause StallAction = "Pause"
+	// StallActionContinue keeps the Loop running (the Stalled condition is
+	// True, the phase is unchanged).
+	StallActionContinue StallAction = "Continue"
+)
+
+// BudgetExceededAction is the action taken when any spec.budget cap is hit
+// (P2c/P2d).
+// +kubebuilder:validation:Enum=Pause;Fail
+type BudgetExceededAction string
+
+const (
+	// BudgetExceededActionPause pauses the Loop (phase Paused,
+	// pausedReason Budget).
+	BudgetExceededActionPause BudgetExceededAction = "Pause"
+	// BudgetExceededActionFail fails the Loop (phase Failed, reason
+	// BudgetExceeded).
+	BudgetExceededActionFail BudgetExceededAction = "Fail"
+)
+
+// DecimalString is a decimal number as a string (e.g. "0.0021"), used for
+// budget money and price values where a float would lose or add precision.
+type DecimalString string
+
+// ModelPrices is the per-Loop override of the cluster-wide model prices
+// (P2c, item 11). Precedence for the cost derivation (P2d): the Loop's
+// modelPrices > the coxswain-model-prices ConfigMap > (no prices → the cost
+// cap is inert, fail-closed).
+type ModelPrices struct {
+	// promptUsdPerMtok is the prompt price in USD per million tokens
+	// (decimal string, e.g. "0.30").
+	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	PromptUsdPerMtok DecimalString `json:"promptUsdPerMtok,omitempty"`
+
+	// completionUsdPerMtok is the completion price in USD per million tokens
+	// (decimal string, e.g. "1.20").
+	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	CompletionUsdPerMtok DecimalString `json:"completionUsdPerMtok,omitempty"`
+}
+
+// BudgetConfig is the Loop's token/time/cost budget (P2c). All caps are
+// optional; the operator's budget decision (P2d) only evaluates caps that
+// are set.
+type BudgetConfig struct {
+	// maxTokens is the total prompt + completion tokens across the Loop's
+	// life. nil means no token cap.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxTokens *int64 `json:"maxTokens,omitempty"`
+
+	// maxWallClock is the accumulated ACTIVE time cap as a Go duration
+	// string (e.g. "1h30m"). It does not count time spent Paused (the
+	// budget clock stops while the Loop is paused; see P2d's
+	// status.budget.activeSeconds accumulation). nil means no wall-clock
+	// cap. The pattern admits only Go duration parts (no commas, no signs,
+	// no bare numbers — the operator seam's ParseMaxWallClock is the final
+	// gate and rejects sub-second caps).
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
+	// +optional
+	MaxWallClock string `json:"maxWallClock,omitempty"`
+
+	// maxCostUsd is the derived-cost cap in USD as a decimal string (e.g.
+	// "0.50"). The cost is derived (P2d) from the token counts and the
+	// prices, not measured. nil means no cost cap.
+	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	MaxCostUsd DecimalString `json:"maxCostUsd,omitempty"`
+
+	// onExceeded is the action when ANY cap is hit.
+	// +kubebuilder:validation:Enum=Pause;Fail
+	// +kubebuilder:default=Pause
+	// +optional
+	OnExceeded BudgetExceededAction `json:"onExceeded,omitempty"`
+
+	// modelPrices is the per-Loop override of the cluster-wide
+	// coxswain-model-prices ConfigMap (item 11). Precedence: this field
+	// > the ConfigMap > (no prices → the cost cap is inert, fail-closed).
+	// +optional
+	ModelPrices *ModelPrices `json:"modelPrices,omitempty"`
 }
 
 // LoopSpec defines the desired state of a Loop.
@@ -354,6 +462,12 @@ type LoopSpec struct {
 	// suspend, when true, pauses the Loop at its current phase.
 	// +optional
 	Suspend bool `json:"suspend,omitempty"`
+
+	// budget caps the Loop's token, active-time and derived-cost totals
+	// (P2c); P2d applies onExceeded when any cap is hit. nil means no
+	// budget caps.
+	// +optional
+	Budget *BudgetConfig `json:"budget,omitempty"`
 }
 
 // LoopStatus defines the observed state of a Loop.
@@ -434,6 +548,30 @@ type LoopStatus struct {
 	// allowed to do (D32); it is set by the operator, never the agent. +optional
 	Policy *PolicyStatus `json:"policy,omitempty"`
 
+	// budget is the operator's record of the Loop's accumulated budget
+	// consumption (P2c; P2d accumulates it from the model proxy endpoint).
+	// nil until the first read.
+	// +optional
+	Budget *BudgetStatus `json:"budget,omitempty"`
+
+	// stallHistory is the ring of the last 10 verify-failure iterations
+	// (one StallEntry per failed verify Job, atomic list, P2c/P2e). The
+	// stall detector (P2e) needs only the recent consecutive run.
+	// +listType=atomic
+	// +optional
+	StallHistory []StallEntry `json:"stallHistory,omitempty"`
+
+	// pausedFrom is the phase the Loop left on entering Paused (P2f);
+	// cleared on resume.
+	// +optional
+	PausedFrom LoopPhase `json:"pausedFrom,omitempty"`
+
+	// pausedReason is WHY the Loop is paused (P2c, item 4): spec.suspend
+	// resumes only a Suspend pause; a Stall or Budget pause resumes via the
+	// coxswain.io/resume annotation (P2f). Cleared on resume.
+	// +optional
+	PausedReason PausedReason `json:"pausedReason,omitempty"`
+
 	// progress is the operator's structured progress record (R19 OS1),
 	// populated from the runner's ADR-0004 claim (the agent container's
 	// termination message) plus the operator's own pin. It is a CLAIM, not a
@@ -486,6 +624,164 @@ type ProgressStatus struct {
 	// +optional
 	BaseCommit string `json:"baseCommit,omitempty"`
 }
+
+// BudgetExceededReason names the cap that was hit (P2c/P2d); empty until
+// status.budget.exceeded is true.
+// +kubebuilder:validation:Enum=Tokens;WallClock;Cost
+type BudgetExceededReason string
+
+const (
+	// BudgetExceededTokens: the maxTokens cap was hit.
+	BudgetExceededTokens BudgetExceededReason = "Tokens"
+	// BudgetExceededWallClock: the maxWallClock cap was hit.
+	BudgetExceededWallClock BudgetExceededReason = "WallClock"
+	// BudgetExceededCost: the maxCostUsd cap was hit.
+	BudgetExceededCost BudgetExceededReason = "Cost"
+)
+
+// PausedReason is WHY a Loop is paused (P2c, item 4). It makes resume
+// well-defined: spec.suspend=false resumes ONLY a Suspend pause; a Stall or
+// Budget pause resumes via the coxswain.io/resume annotation (P2f). The
+// owner's escape for an un-raisable budget is a fork (ADR-0003).
+// +kubebuilder:validation:Enum=Suspend;Stall;Budget
+type PausedReason string
+
+const (
+	// PausedReasonSuspend: the operator set spec.suspend=true.
+	PausedReasonSuspend PausedReason = "Suspend"
+	// PausedReasonStall: the stall detector fired with stallAction=Pause.
+	PausedReasonStall PausedReason = "Stall"
+	// PausedReasonBudget: a budget cap was hit with onExceeded=Pause.
+	PausedReasonBudget PausedReason = "Budget"
+)
+
+// BudgetStatus is the operator's record of the Loop's accumulated budget
+// consumption (P2c; the counts are accumulated by P2d from the model proxy
+// endpoint, ADR-0009). The last* fields carry the last-READ CUMULATIVE
+// counter values the operator's delta logic consumes (item 2): when the
+// proxy pod is recreated the counters reset, and bootIDChanged flags it.
+type BudgetStatus struct {
+	// promptTokens is the accumulated prompt-token total across boot-ID
+	// changes.
+	// +optional
+	PromptTokens int64 `json:"promptTokens,omitempty"`
+
+	// completionTokens is the accumulated completion-token total across
+	// boot-ID changes.
+	// +optional
+	CompletionTokens int64 `json:"completionTokens,omitempty"`
+
+	// requests is the accumulated number of metered model requests.
+	// +optional
+	Requests int64 `json:"requests,omitempty"`
+
+	// unmeteredRequests is the CUMULATIVE count of requests the proxy could
+	// not meter (item 3: a count, not a last-request flag).
+	// +optional
+	UnmeteredRequests int64 `json:"unmeteredRequests,omitempty"`
+
+	// costUsd is the derived cost in USD as a decimal string (P2d: derived
+	// from the token counts and the prices, never measured).
+	// +optional
+	CostUsd string `json:"costUsd,omitempty"`
+
+	// activeSeconds is the accumulated ACTIVE time in seconds (item 10).
+	// Time spent Paused is not counted: the accumulation stops while the
+	// Loop is paused (P2d) and lastActiveStamp is reset to now on resume
+	// (P2f) so the first post-resume reconcile does not add the pause's
+	// duration.
+	// +optional
+	ActiveSeconds int64 `json:"activeSeconds,omitempty"`
+
+	// exceeded is true when any spec.budget cap is hit. It is sticky until
+	// re-evaluated on resume (item 5 — P2f's resume re-evaluates the
+	// current caps against the current counts; raising a cap clears it).
+	// +optional
+	Exceeded bool `json:"exceeded,omitempty"`
+
+	// exceededReason names the cap that was hit (Tokens|WallClock|Cost);
+	// empty until exceeded is true.
+	// +optional
+	ExceededReason BudgetExceededReason `json:"exceededReason,omitempty"`
+
+	// lastBootID is the proxy bootID the last-read counters came from
+	// (item 2). Empty before the first read.
+	// +optional
+	LastBootID string `json:"lastBootID,omitempty"`
+
+	// lastPromptTokens is the last-READ CUMULATIVE prompt-token counter
+	// from the proxy (item 2) — the operator's delta logic consumes it.
+	// +optional
+	LastPromptTokens int64 `json:"lastPromptTokens,omitempty"`
+
+	// lastCompletionTokens is the last-READ CUMULATIVE completion-token
+	// counter from the proxy (item 2).
+	// +optional
+	LastCompletionTokens int64 `json:"lastCompletionTokens,omitempty"`
+
+	// lastRequests is the last-READ CUMULATIVE metered-request counter from
+	// the proxy (item 2).
+	// +optional
+	LastRequests int64 `json:"lastRequests,omitempty"`
+
+	// lastUnmeteredRequests is the last-READ CUMULATIVE unmetered-request
+	// counter from the proxy (item 2).
+	// +optional
+	LastUnmeteredRequests int64 `json:"lastUnmeteredRequests,omitempty"`
+
+	// bootIDChanged is true (sticky) when a proxy pod recreate wiped the
+	// counters between reads (the honest-limit marker, P2a): the
+	// accumulated totals jumped back relative to the last-read values.
+	// +optional
+	BootIDChanged bool `json:"bootIDChanged,omitempty"`
+
+	// lastActiveStamp is the last reconcile's active-time accumulation point
+	// (item E). The operator sets it to now on every non-paused reconcile
+	// and resets it to now on resume (P2f), so the first post-resume
+	// reconcile does not add the pause's duration to activeSeconds.
+	// +optional
+	LastActiveStamp *metav1.Time `json:"lastActiveStamp,omitempty"`
+}
+
+// StallEntry is one verify-failure iteration's record in status.stallHistory
+// (P2c/P2e). jobName is the dedup key (item 6): a re-read of the same verify
+// Job appends no entry.
+type StallEntry struct {
+	// iteration is the 1-based iteration number of the failing verify run.
+	Iteration int `json:"iteration"`
+
+	// jobName is the verify Job's name (<loop>-verify-<iteration>) — the
+	// dedup key (item 6).
+	// +kubebuilder:validation:MinLength=1
+	JobName string `json:"jobName"`
+
+	// hash is the SHA-256 hex of the normalised failing output (P2e).
+	Hash string `json:"hash"`
+
+	// normalisationVersion is the version of the normalisation the hash was
+	// computed with (the P2e constant). A change resets the consecutive run
+	// (a v1 and a v2 hash of the same output must not be conflated).
+	// +kubebuilder:validation:MinLength=1
+	NormalisationVersion string `json:"normalisationVersion"`
+
+	// check is the failing check's name.
+	Check string `json:"check"`
+
+	// at is the verify Job pod's finish time (kubelet-recorded).
+	At metav1.Time `json:"at"`
+}
+
+// Loop condition types (the DeliveredCondition pattern).
+const (
+	// StalledCondition is True when the stall detector has fired (P2e).
+	StalledCondition = "Stalled"
+	// BudgetExceededCondition is True when status.budget.exceeded is true
+	// (P2d).
+	BudgetExceededCondition = "BudgetExceeded"
+	// PausedCondition is True while the phase is Paused; the message names
+	// the pausedReason (P2f).
+	PausedCondition = "Paused"
+)
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

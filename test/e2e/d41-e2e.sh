@@ -102,7 +102,7 @@ IMG="coxswain-controller:${IMG_TAG}"
 # The tool proxy pod image: the manager's --tool-proxy-image flag (added in
 # this slice) is set to this via the temp dev overlay; the e2e builds and
 # kind-loads it (the i42-e2e stand-in image pattern).
-TOOL_IMG="coxswain-tool-proxy:standin"
+TOOL_IMG="${TOOL_PROXY_IMAGE:-coxswain-tool-proxy:standin}"
 # The D41e 4c connect-probe image: a tiny static Go net.DialTimeout probe
 # built to /usr/local/bin/tool-proxy on distroless (UID 65535, matching the
 # real tool-proxy), so the tool proxy's KubeArmorPolicy process allowlist
@@ -201,8 +201,18 @@ echo
 echo "--- STEP 1: build + load images ---"
 echo "   building controller image $IMG ..."
 (cd "$REPO_ROOT" && docker build -q -t "$IMG" -f Dockerfile .) || { echo "FATAL: controller build failed"; exit 2; }
-echo "   building tool-proxy image $TOOL_IMG ..."
-(cd "$REPO_ROOT" && docker build -q -t "$TOOL_IMG" -f cmd/tool-proxy/Dockerfile .) || { echo "FATAL: tool-proxy build failed"; exit 2; }
+# The tool proxy image: built from the repo UNLESS TOOL_PROXY_IMAGE_PREBUILT=1
+# (a mutation run pre-builds a scratch-tagged tool-proxy image from a scratch
+# worktree and wants the e2e to use it as-is, not rebuild the real one).
+if [ "${TOOL_PROXY_IMAGE_PREBUILT:-0}" = "1" ]; then
+  echo "   using pre-built tool-proxy image $TOOL_IMG (TOOL_PROXY_IMAGE_PREBUILT=1; not rebuilding)"
+  if ! docker image inspect "$TOOL_IMG" >/dev/null 2>&1; then
+    echo "FATAL: TOOL_PROXY_IMAGE_PREBUILT=1 but $TOOL_IMG is not present"; exit 2
+  fi
+else
+  echo "   building tool-proxy image $TOOL_IMG ..."
+  (cd "$REPO_ROOT" && docker build -q -t "$TOOL_IMG" -f cmd/tool-proxy/Dockerfile .) || { echo "FATAL: tool-proxy build failed"; exit 2; }
+fi
 echo "   building 4c connect-probe image $PROBE_IMG ..."
 (cd "$REPO_ROOT/test/e2e/probe" && docker build -q -t "$PROBE_IMG" .) || { echo "FATAL: probe build failed"; exit 2; }
 IMG_DIGEST="$(docker image inspect "$IMG" --format '{{.Id}}' 2>/dev/null)"
@@ -233,6 +243,20 @@ cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/cni-probe | K apply -f -) \
   || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 2; }
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || { echo "FATAL: controller not ready"; exit 2; }
+# If a non-default tool-proxy image is requested (a mutation run), patch the
+# controller deployment's args to pass --tool-proxy-image=$TOOL_IMG so the
+# controller deploys the tool proxy pod with that image (the controller's
+# default is coxswain-tool-proxy:standin). Only applied when TOOL_IMG differs
+# from the default.
+if [ -n "${TOOL_PROXY_IMAGE:-}" ] && [ "$TOOL_IMG" != "coxswain-tool-proxy:standin" ]; then
+  echo "   patching controller to add --tool-proxy-image=$TOOL_IMG (mutation / non-default tool-proxy image)"
+  # Append the flag to the controller's existing args (do NOT replace the list,
+  # which carries --metrics-bind-address, --leader-elect, --health-probe-bind-address,
+  # --allow-unenforced, --allow-unenforced-network, --runner-image).
+  K -n "$E2E_NS" patch deploy coxswain-controller-manager --type=json -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--tool-proxy-image=$TOOL_IMG\"}]" 2>/dev/null \
+    || echo "   (warning: could not append --tool-proxy-image; the tool proxy pod may run the default image)"
+  K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=120s || echo "   (rollout after --tool-proxy-image patch may be pending)"
+fi
 RUNNING_IMG_ID=$(K -n "$E2E_NS" get pods -l control-plane=controller-manager -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null)
 echo "   controller running, imageID: $RUNNING_IMG_ID"
 

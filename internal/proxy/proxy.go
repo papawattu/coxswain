@@ -57,9 +57,9 @@ type Config struct {
 // (httputil.NewSingleHostReverseProxy) wrapped with steering-proof request
 // shaping and post-response usage metering.
 type Proxy struct {
-	cfg     Config
+	cfg      Config
 	upstream *url.URL
-	rp      *httputil.ReverseProxy
+	rp       *httputil.ReverseProxy
 	// dials is a counter of upstream dials (for the no-retry test: a single
 	// request must dial exactly once).
 	dials atomic.Int64
@@ -191,9 +191,9 @@ func NewMetered(cfg Config) (*Proxy, error) {
 	}
 	base := p.rp.Transport
 	p.rp.Transport = &meteringRoundTripper{
-		base:    base,
-		cfg:     cfg,
-		proxy:   p,
+		base:  base,
+		cfg:   cfg,
+		proxy: p,
 	}
 	return p, nil
 }
@@ -202,9 +202,9 @@ func NewMetered(cfg Config) (*Proxy, error) {
 // response body (tee) so the proxy can parse the usage object and write the
 // audit line. The body is forwarded to the agent unchanged.
 type meteringRoundTripper struct {
-	base    http.RoundTripper
-	cfg     Config
-	proxy   *Proxy
+	base  http.RoundTripper
+	cfg   Config
+	proxy *Proxy
 }
 
 func (m *meteringRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -218,7 +218,7 @@ func (m *meteringRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	var captured []byte
 	if resp.Body != nil {
 		captured = drain(resp.Body, maxBody)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(captured))
 	}
 	if m.cfg.Meter != nil {
@@ -250,16 +250,16 @@ func (m *meteringRoundTripper) audit(req *http.Request, resp *http.Response, bod
 		prompt, completion, _ = parseUsage(body)
 	}
 	line := map[string]any{
-		"time":           time.Now().UTC().Format(time.RFC3339),
-		"loop":          m.cfg.LoopName,
-		"namespace":     m.cfg.Namespace,
-		"source":        "model-proxy",
-		"action":        "usage",
-		"model":         m.cfg.Model,
-		"promptTokens":  prompt,
+		"time":             time.Now().UTC().Format(time.RFC3339),
+		"loop":             m.cfg.LoopName,
+		"namespace":        m.cfg.Namespace,
+		"source":           "model-proxy",
+		"action":           "usage",
+		"model":            m.cfg.Model,
+		"promptTokens":     prompt,
 		"completionTokens": completion,
-		"status":        resp.StatusCode,
-		"usagePresent":  prompt > 0 || completion > 0,
+		"status":           resp.StatusCode,
+		"usagePresent":     prompt > 0 || completion > 0,
 	}
 	enc, _ := json.Marshal(line)
 	_, _ = m.cfg.Audit.Write(append(enc, '\n'))
@@ -356,4 +356,3 @@ func ReadModelCreds(dir string) (string, error) {
 	}
 	return "", &errString{"no readable model-creds Secret file found"}
 }
-

@@ -115,9 +115,30 @@ func main() {
 		"The fixed namespace the CNI probe pod + NetworkPolicy live in (D38; created at install).")
 	var clusterDomain string
 	flag.StringVar(&clusterDomain, "cluster-domain", "",
+
 		"The cluster's service DNS domain (default cluster.local). Used for the proxy Service FQDNs the agent's DNS "+
 			"allowlist carries. R16 I44 item 2: a non-default-domain cluster (a DNS-domain override on the cluster's "+
 			"service CIDR) is supported.")
+	// P2b (ADR-0009): the metering model proxy image (the D33/D34 proxy shape
+	// + per-Loop usage metering + the operator-only /coxswain/usage endpoint).
+	// The reconciler default is coxswain-proxy:metering (the metering proxy); a
+	// dev stand-in image may be kind-loaded / pre-pulled and passed here.
+	var proxyImage string
+	flag.StringVar(&proxyImage, "proxy-image", "",
+		"The image the model proxy pods run (one per Loop, D33/P2b/ADR-0009). "+
+			"Default: empty (the reconciler's coxswain-proxy:metering metering proxy; a stand-in image may be "+
+			"kind-loaded / pre-pulled and passed here).")
+	// P2b (ADR-0009): the operator's namespace — the source of the proxy pod's
+	// usage-port ingress (the <loop>-proxy netpol allows the operator namespace
+	// / controller-manager on the usage port, never the agent). Default:
+	// $POD_NAMESPACE (the operator runs where it is deployed).
+	var operatorNamespace string
+	if v, ok := os.LookupEnv("POD_NAMESPACE"); ok && v != "" {
+		operatorNamespace = v
+	}
+	flag.StringVar(&operatorNamespace, "operator-namespace", operatorNamespace,
+		"The operator's namespace (P2b, ADR-0009): the source of the proxy pod's usage-port "+
+			"ingress. Default: $POD_NAMESPACE.")
 	// S3a (GAP 1): the trusted image the workspace init container runs to clone
 	// spec.workspace.repo (it must carry git + sh). The operator selects it so
 	// the agent's image never controls the clone.
@@ -323,6 +344,11 @@ func main() {
 		RunnerImage:            runnerImage,
 		VerifyImage:            verifyImage,
 		ToolProxyImage:         toolProxyImage,
+		// P2b (ADR-0009): the metering model proxy image (default empty -> the
+		// reconciler's coxswain-proxy:metering) and the operator's namespace (the
+		// proxy pod's usage-port ingress source).
+		ProxyImage:        proxyImage,
+		OperatorNamespace: operatorNamespace,
 		// D38: the NetworkEnforced condition-change Event (the manager's
 		// recorder posts it as a Kubernetes Event; the re-gate Event lives
 		// in the probe Runnable).

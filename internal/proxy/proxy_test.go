@@ -16,23 +16,19 @@ import (
 // startFakeUpstream returns a test server that records the last request it saw
 // (headers + body) and responds with the given handler. It is used to prove
 // what the proxy actually sent upstream (steering-proof assertions).
-func startFakeUpstream(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *recordedReq) {
+func startFakeUpstream(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	rec := &recordedReq{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		hdrs := http.Header{}
-		for k, v := range r.Header {
-			hdrs[k] = v
-		}
 		rec.mu.Lock()
-		rec.last = &reqSeen{headers: hdrs, body: body, path: r.URL.Path, method: r.Method}
+		rec.last = &reqSeen{headers: r.Header.Clone(), body: body, path: r.URL.Path, method: r.Method}
 		rec.n++
 		rec.mu.Unlock()
 		handler(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	return srv, rec
+	return srv
 }
 
 type reqSeen struct {
@@ -48,18 +44,6 @@ type recordedReq struct {
 	n    int
 }
 
-func (r *recordedReq) lastReq() *reqSeen {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.last
-}
-
-func (r *recordedReq) count() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.n
-}
-
 func mustURL(t *testing.T, s string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(s)
@@ -73,7 +57,7 @@ func TestRejectsAbsoluteURLOrCONNECT(t *testing.T) {
 	// CONNECT and absolute-form (steering attempts) -> 405, and the upstream is
 	// never dialed.
 	seen := 0
-	up, _ := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { seen++ })
+	up := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { seen++ })
 	p, err := New(Config{Upstream: mustURL(t, up.URL)})
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +94,7 @@ func TestNoRetrySingleDial(t *testing.T) {
 	// client sees the same 4xx.
 	var count int
 	mu := sync.Mutex{}
-	up, _ := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+	up := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		count++
 		mu.Unlock()
@@ -141,11 +125,11 @@ func TestNoRetrySingleDialSuccess(t *testing.T) {
 	// A 2xx also dials exactly once (the success path is not retried either).
 	var count int
 	mu := sync.Mutex{}
-	up, _ := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+	up := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		count++
 		mu.Unlock()
-		w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 	})
 	p, err := NewMetered(Config{Upstream: mustURL(t, up.URL)})
 	if err != nil {
@@ -170,17 +154,17 @@ func TestAuditLinePerMeteredRequest(t *testing.T) {
 	// A metered request produces one JSON audit line carrying the token counts
 	// and the model. The audit channel (stdout) is the observability-only path.
 	var audit bytes.Buffer
-	up, _ := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"usage":{"prompt_tokens":11,"completion_tokens":5}}`))
+	up := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":11,"completion_tokens":5}}`))
 	})
 	m := newTestMeter(t, "test-model", time.Now())
 	p, err := NewMetered(Config{
-		Upstream:   mustURL(t, up.URL),
-		Model:      "test-model",
-		LoopName:   "loop-a",
-		Namespace:  "ns",
-		Audit:      &audit,
-		Meter:      m,
+		Upstream:  mustURL(t, up.URL),
+		Model:     "test-model",
+		LoopName:  "loop-a",
+		Namespace: "ns",
+		Audit:     &audit,
+		Meter:     m,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -221,11 +205,11 @@ func TestOriginRequestHasNoAcceptEncoding(t *testing.T) {
 	// The agent sent one (simulating its client), but the proxy stripped it
 	// before dialing. This is the P3 steering-proof assertion.
 	var sawAcceptEncoding bool
-	up, _ := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+	up := startFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept-Encoding") != "" {
 			sawAcceptEncoding = true
 		}
-		w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 	})
 	p, err := NewMetered(Config{Upstream: mustURL(t, up.URL)})
 	if err != nil {

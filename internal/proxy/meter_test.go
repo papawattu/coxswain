@@ -21,9 +21,9 @@ func newTestMeter(t *testing.T, model string, since time.Time) *Meter {
 }
 
 // meterWithFile builds a Meter over a specific path (for the restart test).
-func meterWithFile(t *testing.T, path, model string, since time.Time) *Meter {
+func meterWithFile(t *testing.T, path string, since time.Time) *Meter {
 	t.Helper()
-	m, err := NewMeter(path, model, since)
+	m, err := NewMeter(path, "test-model", since)
 	if err != nil {
 		t.Fatalf("NewMeter(%s): %v", path, err)
 	}
@@ -66,8 +66,8 @@ func TestMeteringUnmetered(t *testing.T) {
 	// A response without usage -> unmeteredRequests increments, tokens unchanged.
 	for _, body := range []string{
 		`{"choices":[],"id":"x"}`, // no usage object
-		`not-json-at-all`,          // non-JSON
-		``,                          // empty
+		`not-json-at-all`,         // non-JSON
+		``,                        // empty
 	} {
 		p, c, ok := parseUsage([]byte(body))
 		if ok {
@@ -112,7 +112,7 @@ func TestRestartPersistenceSamePod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := meterWithFile(t, path, "test-model", time.Now())
+	m := meterWithFile(t, path, time.Now())
 	r := m.Reading()
 	if r.PromptTokens != 500 {
 		t.Fatalf("after restart the counters start at %d, want 500 (the file's value, not 0)", r.PromptTokens)
@@ -144,7 +144,7 @@ func TestFreshBootNewBootID(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("precondition: %s must not exist (fresh boot)", path)
 	}
-	m := meterWithFile(t, path, "test-model", time.Now())
+	m := meterWithFile(t, path, time.Now())
 	r := m.Reading()
 	if r.PromptTokens != 0 || r.CompletionTokens != 0 {
 		t.Fatalf("fresh boot counters = (%d,%d), want (0,0)", r.PromptTokens, r.CompletionTokens)
@@ -167,7 +167,7 @@ func TestRestartPersistenceBootIDReused(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m := meterWithFile(t, path, "test-model", time.Now())
+	m := meterWithFile(t, path, time.Now())
 	if got := m.Reading().BootID; got != b1 {
 		t.Fatalf("container restart regenerated the bootID (%q != %q) — the operator would rebase and double-count", got, b1)
 	}
@@ -179,13 +179,11 @@ func TestPersistenceAtomicity(t *testing.T) {
 	// repeatedly during a write burst and asserts it always parses as valid
 	// JSON.
 	path := filepath.Join(t.TempDir(), "usage.json")
-	m := meterWithFile(t, path, "test-model", time.Now())
+	m := meterWithFile(t, path, time.Now())
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -202,10 +200,10 @@ func TestPersistenceAtomicity(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	// Write burst: each Add rewrites the file (temp + rename).
-	for i := 0; i < 500; i++ {
+	for range 500 {
 		m.Add(1, 1)
 	}
 	close(stop)
@@ -326,4 +324,3 @@ func TestStreamUsageNoIncludeUsageUnmetered(t *testing.T) {
 		t.Fatalf("a stream without a usage chunk (the include_usage-not-forced case) must be unmetered")
 	}
 }
-

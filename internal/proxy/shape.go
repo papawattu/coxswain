@@ -34,7 +34,7 @@ func parseUsage(body []byte) (prompt, completion int64, ok bool) {
 // JSON and is skipped.
 func parseStreamUsage(raw []byte) (prompt, completion int64, ok bool) {
 	seen := false
-	for _, line := range bytes.Split(raw, []byte("\n")) {
+	for line := range bytes.SplitSeq(raw, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
@@ -79,7 +79,6 @@ func shapeRequest(body []byte) (newBody []byte, isObject bool) {
 	if err := json.Unmarshal(trimmed, &req); err != nil {
 		return body, false
 	}
-	isObject = true
 	var streamVal bool
 	if raw, ok := req["stream"]; ok {
 		_ = json.Unmarshal(raw, &streamVal)

@@ -297,6 +297,23 @@ type LoopReconciler struct {
 	// by the FQDNs the Enforcer puts on the agent's DNS allowlist, so a
 	// non-default-domain cluster is supported. (R16 I44 item 2.)
 	ClusterDomain string
+
+	// OperatorNamespace is the namespace the operator (controller-manager)
+	// runs in (P2b, ADR-0009). It is the source of the proxy pod's usage-port
+	// ingress (the <loop>-proxy netpol allows the operator namespace /
+	// controller-manager on the usage port, never the agent). Settable in
+	// tests; the manager default is the coxswain-system namespace (or the
+	// POD_NAMESPACE from env).
+	OperatorNamespace string
+
+	// readProxyUsage is the P3 seam (ADR-0009 item 12): the operator's usage
+	// reader. It is nil until P3 (P2b injects it as a no-op / nil so the
+	// operator does NOT yet consume the usage — the operator reads the usage
+	// via HTTP in P3). When set, it is called with the proxy's Service URL
+	// (the usage endpoint) so P3 can wire the HTTP GET /coxswain/usage. Keeping
+	// it a field (not a call from the reconciler) means P2b is verifiable
+	// without the gate's consumption.
+	readProxyUsage func(ctx context.Context, usageURL string)
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -1788,7 +1805,24 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 				"no foreign proxy pod detected")
 		}
 	}
+	// P2b (ADR-0009, seam item 12): the operator's usage reader seam. It is
+	// nil until P3 (which wires the HTTP GET /coxswain/usage); P2b exposes it
+	// so the operator's usage consumption is a seam, not hard-coded. When set,
+	// it is called with the proxy's usage Service URL.
+	if r.readProxyUsage != nil {
+		usageURL := r.proxyUsageURL(loopName, ns)
+		r.readProxyUsage(ctx, usageURL)
+	}
 	return nil
+}
+
+// proxyUsageURL is the operator's in-cluster URL for the proxy's usage
+// endpoint (P2b, ADR-0009): http://<loop>-proxy.<ns>.svc.<domain>:9090/coxswain/usage.
+// The operator reads the cumulative usage from this URL (the <loop>-proxy
+// netpol allows the operator namespace / controller-manager on 9090, never
+// the agent).
+func (r *LoopReconciler) proxyUsageURL(loopName, namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc.%s:%d/coxswain/usage", proxyServiceName(loopName), namespace, r.clusterDomain(), proxyUsagePort)
 }
 
 // newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit
@@ -1854,29 +1888,67 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
 					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 				},
-				// (D33 acceptance) and forwards to MODEL_ENDPOINT. The Go stand-in
-				// reads the 0444 model-creds Secret at startup and exits 1 if no
-				// readable key file is found (the ..data atomic-mount entry is
-				// skipped).
+				// (D33 acceptance) and forwards to MODEL_ENDPOINT. The metering proxy
+				// (P2b, ADR-0009) reads the 0444 model-creds Secret at startup and
+				// exits 1 if no readable key file is found (the ..data atomic-mount
+				// entry is skipped), then forwards to MODEL_ENDPOINT, metering the
+				// usage into the proxy-usage emptyDir file and serving it on the usage
+				// port (9090).
 				Env: []corev1.EnvVar{
 					{
 						Name:  "MODEL_ENDPOINT",
 						Value: modelEndpointValue(loop),
 					},
+					{
+						Name:  "MODEL_CRED_FILE",
+						Value: "/model-creds/.data/model-key",
+					},
+					{
+						Name:  "PROXY_PORT_USAGE",
+						Value: "9090",
+					},
+					{
+						Name:  "PROXY_USAGE_FILE",
+						Value: proxyUsageFile,
+					},
+					{
+						Name:  envLoopName,
+						Value: loopName,
+					},
+					{
+						Name:  envLoopNS,
+						Value: ns,
+					},
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: modelCredsVolume, MountPath: "/model-creds", ReadOnly: true},
+					// The cumulative usage counter lives here (emptyDir, per-pod);
+					// the proxy writes atomically (temp + rename) so a read never
+					// sees a torn file. It does NOT carry the credential.
+					{Name: proxyUsageVolume, MountPath: "/var/lib/proxy-usage"},
 				},
 			}},
-			Volumes: []corev1.Volume{{
-				Name: modelCredsVolume,
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  loop.Spec.Agent.EndpointSecretRef,
-						DefaultMode: &secretMode,
+			Volumes: []corev1.Volume{
+				{
+					Name: modelCredsVolume,
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName:  loop.Spec.Agent.EndpointSecretRef,
+							DefaultMode: &secretMode,
+						},
 					},
 				},
-			}},
+				// The cumulative usage counter (P2b, ADR-0009): an emptyDir the proxy
+				// writes atomically (temp + rename). Per-pod (a pod recreation
+				// starts a fresh boot — the operator treats a new bootID as a fresh
+				// start).
+				{
+					Name: proxyUsageVolume,
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			},
 		},
 	}
 	return pod
@@ -2144,6 +2216,21 @@ const (
 	// when the hash mismatches).
 	proxySpecHashAnnotation       = "coxswain.io/proxy-spec-hash"
 	proxyPort               int32 = 8080
+	// proxyUsagePort is the port the metering proxy's operator-only usage
+	// endpoint listens on (P2b, ADR-0009). The operator (the controller-manager
+	// pod in the operator namespace) reads the cumulative usage from this
+	// port; the proxy pod's usage-port ingress is allowed ONLY from the
+	// operator namespace / controller-manager (never the agent, which has no
+	// SA token).
+	proxyUsagePort   int32 = 9090
+	proxyUsageVolume       = "proxy-usage"
+	proxyUsageFile         = "/var/lib/proxy-usage/usage.json"
+	// env name + label constants (goconst: they recur across the proxy pod env,
+	// the usage-port netpol ingress, and the operator's usage reader).
+	envLoopName        = "LOOP_NAME"
+	envLoopNS          = "LOOP_NAMESPACE"
+	kubeNSLabelKey     = "kubernetes.io/metadata.name"
+	controllerMgrLabel = "controller-manager"
 )
 
 // ensureProxyOrCleanup (D33) creates the per-Loop proxy pod + Service when a
@@ -3324,8 +3411,13 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		}
 	}
 
-	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, egress
-	// to the model endpoint peer + cluster DNS.
+	// Proxy pod NetworkPolicy: ingress from this Loop's agent on 8080, PLUS the
+	// operator (controller-manager in the operator namespace) on the usage port
+	// (9090, P2b, ADR-0009), egress to the model endpoint peer + cluster DNS.
+	// The usage-port ingress is allowed ONLY from the operator namespace /
+	// controller-manager — NEVER the agent (which has no SA token). If the
+	// operator namespace is unset (tests) the usage ingress rule is omitted
+	// (fail-closed: the usage endpoint is unreachable rather than wide-open).
 	proxyNP := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      loopName + "-proxy-netpol",
@@ -3347,6 +3439,25 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 				},
 			},
 		},
+	}
+	// P2b (ADR-0009): the operator reads the cumulative usage from the proxy's
+	// usage port. The source is the operator namespace + the controller-manager
+	// pod (label control-plane=controller-manager). Fail-closed: with no
+	// operator namespace the rule is omitted (the usage endpoint stays
+	// unreachable rather than wide-open).
+	if r.OperatorNamespace != "" {
+		operatorPeer := networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{kubeNSLabelKey: r.OperatorNamespace},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"control-plane": controllerMgrLabel},
+			},
+		}
+		proxyNP.Spec.Ingress = append(proxyNP.Spec.Ingress, networkingv1.NetworkPolicyIngressRule{
+			From:  []networkingv1.NetworkPolicyPeer{operatorPeer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(proxyUsagePort), Protocol: new(corev1.ProtocolTCP)}},
+		})
 	}
 	// P2 (R16 review): the model endpoint is a non-secret Loop spec field
 	// (agent.modelEndpoint), not read from the Secret (which would require
@@ -4402,15 +4513,16 @@ printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswai
 
 // proxyImage returns the model proxy pod image. It is the reconciler's
 // ProxyImage field (settable in tests and future slices; a manager flag
-// --proxy-image is a candidate for a future C2b), or the forwarding proxy
-// stand-in (coxswain-proxy:standin) when unset. The stand-in is a Go reverse
-// proxy that reads the model-creds Secret at startup and forwards to
-// MODEL_ENDPOINT.
+// --proxy-image is a candidate for a future C2b), or the metering model proxy
+// (coxswain-proxy:metering) when unset. The metering proxy (P2b, ADR-0009) is
+// a Go reverse proxy that reads the model-creds Secret at startup, forwards to
+// MODEL_ENDPOINT, meters the usage into the proxy-usage emptyDir, and serves
+// the operator-only /coxswain/usage endpoint on 9090.
 func (r *LoopReconciler) proxyImage() string {
 	if r.ProxyImage != "" {
 		return r.ProxyImage
 	}
-	return "coxswain-proxy:standin"
+	return "coxswain-proxy:metering"
 }
 
 // loopPolicyRefsFieldIndex is a field index on Loop.spec.policyRefs, used by

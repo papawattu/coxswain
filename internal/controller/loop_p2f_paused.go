@@ -33,12 +33,14 @@ package controller
 // activeSeconds (item E).
 import (
 	"context"
+	"slices"
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -89,12 +91,17 @@ var pausedPhases = []coxv1alpha1.LoopPhase{
 // isPausablePhase reports whether a phase the pause entry may be taken from
 // (every non-terminal phase; Succeeded/Failed are terminal and not pausable).
 func isPausablePhase(p coxv1alpha1.LoopPhase) bool {
-	for _, ph := range pausedPhases {
-		if p == ph {
-			return true
-		}
+	return slices.Contains(pausedPhases, p)
+}
+
+// resumeTriggered reports whether a Paused Loop has a resume trigger active:
+// spec.suspend=false on a Suspend pause, or the coxswain.io/resume annotation
+// on a Stall/Budget pause.
+func (r *LoopReconciler) resumeTriggered(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.PausedReason == coxv1alpha1.PausedReasonSuspend {
+		return !loop.Spec.Suspend
 	}
-	return false
+	return loop.Annotations[resumeAnnotation] == "true"
 }
 
 // pausedLoopInDeliveryFlight reports whether a Succeeded Loop has a deliver
@@ -117,6 +124,18 @@ func pausedLoopInDeliveryFlight(loop *coxv1alpha1.Loop) bool {
 // gate's input: a Paused sandbox is Suspended regardless of spec.suspend).
 func loopPaused(loop *coxv1alpha1.Loop) bool {
 	return loop.Status.Phase == coxv1alpha1.LoopPhasePaused
+}
+
+// sandboxOperatingMode is the P2f suspension gate: desired OperatingMode =
+// Suspended iff spec.suspend || phase==Paused (a budget- or stall-paused Loop
+// has spec.suspend=false — the gate still suspends it). pauseBlocked (the
+// item-F refusal) keeps the sandbox Running so the in-flight delivery
+// completes.
+func (r *LoopReconciler) sandboxOperatingMode(loop *coxv1alpha1.Loop, pauseBlocked bool) sandboxv1beta1.SandboxOperatingMode {
+	if loop.Spec.Suspend && !pauseBlocked || loopPaused(loop) {
+		return sandboxv1beta1.SandboxOperatingModeSuspended
+	}
+	return sandboxv1beta1.SandboxOperatingModeRunning
 }
 
 // operatorNow returns the operator's clock (r.now when set — the tests
@@ -208,20 +227,17 @@ func (r *LoopReconciler) handleSuspendEntry(loop *coxv1alpha1.Loop) (pauseBlocke
 // Loop is already paused, so the suspension gate holds it regardless of
 // spec.suspend); resumeCleared is true only on a valid resume (the caller
 // patches the annotation off then).
-func (r *LoopReconciler) handlePausedLoop(ctx context.Context, loop *coxv1alpha1.Loop) (pauseBlocked, changed, resumeCleared bool) {
+func (r *LoopReconciler) handlePausedLoop(_ context.Context, loop *coxv1alpha1.Loop) (pauseBlocked, changed, resumeCleared bool) {
 	// No resume trigger: the Loop stays paused. Nothing mutates (the
 	// conditions are already set by the entry point).
-	suspendResume := loop.Spec.Suspend == false &&
-		loop.Status.PausedReason == coxv1alpha1.PausedReasonSuspend
-	annotationResume := loop.Annotations[resumeAnnotation] == "true"
-	if !suspendResume && !annotationResume {
+	if !r.resumeTriggered(loop) {
 		return false, false, false
 	}
 
 	// A Budget pause re-evaluates the current caps against the current counts
 	// (item 5): raising a cap clears the exceedance.
 	if loop.Status.PausedReason == coxv1alpha1.PausedReasonBudget {
-		changed = r.reEvaluateBudgetOnResume(loop) || changed
+		r.reEvaluateBudgetOnResume(loop)
 	}
 
 	// P3: a resume while a cap is still exceeded is REFUSED — the sandbox
@@ -232,7 +248,7 @@ func (r *LoopReconciler) handlePausedLoop(ctx context.Context, loop *coxv1alpha1
 	if r.budgetStillExceeded(loop) {
 		setCondition(loop, coxv1alpha1.PausedCondition, metav1.ConditionTrue,
 			pausedCondReasonPaused,
-			"resume refused: budget cap still exceeded ("+string(r.exceededCapName(loop.Spec.Budget, loop.Status.Budget))+")")
+			"resume refused: budget cap still exceeded ("+r.exceededCapName(loop.Spec.Budget, loop.Status.Budget)+")")
 		r.emitResumeRefusedEvent(loop)
 		return false, true, false
 	}

@@ -1290,12 +1290,8 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// spec.suspend || phase==Paused (a budget- or stall-paused Loop has
 		// spec.suspend=false — the gate still suspends it). pauseBlocked (the
 		// item-F refusal) keeps the sandbox Running so the in-flight delivery
-		// completes. The D30/D35a/etc gates still apply on top — additive.
-		if loop.Spec.Suspend && !pauseBlocked || loopPaused(loop) {
-			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-		} else {
-			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
-		}
+		// completes.
+		desired.Spec.OperatingMode = r.sandboxOperatingMode(loop, pauseBlocked)
 		// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
 		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
 		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an

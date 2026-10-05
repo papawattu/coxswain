@@ -61,27 +61,28 @@ const (
 	// about the effective tool union; an external repo's workspace init
 	// clone would (S6) add its own egress-proxy allowlist host and create the
 	// egress proxy even with no network allows.
-	d41cTestRepo      = "http://gitea.samples.svc:3000/samples/gocli.git"
-	d41cPolicyName    = "d41c-pol"
-	d41cPodCIDR       = "10.244.0.0/16"
-	d41cServiceCIDR   = "10.96.0.0/12"
-	d41cToolProxyImg  = "coxswain-tool-proxy:standin"
-	d41cCredSecret    = "gh-cred"
-	d41cCredKey       = "token"
-	d41cToolName      = "gh"
-	d41cUpstreamA     = "https://api.github.com"
-	d41cUpstreamB     = "https://api.github.example"
-	d41cConflict      = "ProxyConflict"
-	d41cForeignReason = "ForeignToolProxy"
+	d41cTestRepo         = "http://gitea.samples.svc:3000/samples/gocli.git"
+	d41cPolicyName       = "d41c-pol"
+	d41cPodCIDR          = "10.244.0.0/16"
+	d41cServiceCIDR      = "10.96.0.0/12"
+	d41cToolProxyImg     = "coxswain-tool-proxy:standin"
+	d41cCredSecret       = "gh-cred"
+	d41cCredKey          = "token"
+	d41cToolName         = "gh"
+	d41cUpstreamA        = "https://api.github.com"
+	d41cUpstreamB        = "https://api.github.example"
+	d41cConflict         = "ProxyConflict"
+	d41cForeignReason    = "ForeignToolProxy"
+	d41cForeignContainer = "foreign"
 )
 
 func newD41cReconciler() *LoopReconciler {
 	return &LoopReconciler{
-		Client:           k8sClient,
-		Scheme:           k8sClient.Scheme(),
-		PodCIDR:          d41cPodCIDR,
-		ServiceCIDR:      d41cServiceCIDR,
-		ToolProxyImage:   d41cToolProxyImg,
+		Client:         k8sClient,
+		Scheme:         k8sClient.Scheme(),
+		PodCIDR:        d41cPodCIDR,
+		ServiceCIDR:    d41cServiceCIDR,
+		ToolProxyImage: d41cToolProxyImg,
 		// AllowUnenforced: the tool-proxy gate is independent of the D30
 		// enforcement gate. In envtest the Enforcer is nil, so D30 would
 		// hold the sandbox Suspended. AllowUnenforced=true isolates the
@@ -153,6 +154,12 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		return pod
 	}
 
+	const (
+		d41cContainersReady = "ContainersReady"
+		d41cConfigMapKind   = "ConfigMap"
+		d41cToolUpstreamEnv = "TOOL_UPSTREAM"
+	)
+
 	getSandbox := func(ns, loopName string) *sandboxv1beta1.Sandbox {
 		sb := &sandboxv1beta1.Sandbox{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loopName + "-sandbox"}, sb)).To(Succeed())
@@ -163,7 +170,7 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
 			Type:   corev1.PodReady,
 			Status: corev1.ConditionTrue,
-			Reason: "ContainersReady",
+			Reason: d41cContainersReady,
 		})
 		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
 			Name:  policy.ComponentToolProxyLabel,
@@ -172,6 +179,7 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 	}
 
+	const d41cConflictLoop = "conflict-loop"
 	toolProxyPod := func(loopName string) string { return loopName + "-tool-" + d41cToolName }
 
 	// spec 1: no tools → nothing created.
@@ -222,7 +230,7 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 			envs[e.Name] = e.Value
 		}
 		Expect(envs["TOOL_NAME"]).To(Equal(d41cToolName))
-		Expect(envs["TOOL_UPSTREAM"]).To(Equal(d41cUpstreamA))
+		Expect(envs[d41cToolUpstreamEnv]).To(Equal(d41cUpstreamA))
 		Expect(envs["TOOL_CREDENTIAL_FILE"]).To(Equal("/tool-cred/" + d41cCredSecret + "/" + d41cCredKey))
 		Expect(envs["LOOP_NAME"]).To(Equal("tool1-loop"))
 		Expect(envs["LOOP_NAMESPACE"]).To(Equal(ns))
@@ -387,13 +395,13 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 				Namespace: ns,
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: "v1",
-					Kind:       "ConfigMap",
+					Kind:       d41cConfigMapKind,
 					Name:       loaner,
 					UID:        "00000000-0000-0000-0000-000000000000",
 					Controller: func() *bool { b := true; return &b }(),
 				}},
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "foreign", Image: "docker.io/library/busybox:1.36"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: d41cForeignContainer, Image: i42bForeignImage}}},
 		})).To(Succeed())
 
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
@@ -407,7 +415,7 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 
 		// The foreign pod must still exist (NOT deleted — I2 never-take-over).
 		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: toolProxyPod("foreign-loop")}, &corev1.Pod{})
-		Expect(err).ToNot(HaveOccurred(), "the foreign tool proxy pod must NOT be deleted (I2)")		// ProxyConflict=True/ForeignToolProxy.
+		Expect(err).ToNot(HaveOccurred(), "the foreign tool proxy pod must NOT be deleted (I2)") // ProxyConflict=True/ForeignToolProxy.
 		gotLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "foreign-loop"}, gotLoop)).To(Succeed())
 		var conflict *metav1.Condition
@@ -443,13 +451,12 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		oldUpstream := oldPod.Spec.Containers[0].Env
 		var oldUp *corev1.EnvVar
 		for i := range oldUpstream {
-			if oldUpstream[i].Name == "TOOL_UPSTREAM" {
+			if oldUpstream[i].Name == d41cToolUpstreamEnv {
 				oldUp = &oldUpstream[i]
 			}
 		}
 		Expect(oldUp).ToNot(BeNil())
 		Expect(oldUp.Value).To(Equal(d41cUpstreamA))
-		oldRV := oldPod.ResourceVersion
 
 		// Change the tool's upstream (same policy generation → new hash via a
 		// new AgentPolicy update, as in I42b spec 6).
@@ -457,29 +464,23 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
 
 		// Reconcile from the API server: the spec-hash mismatches → the old
-		// pod is deleted and the Owns(Pod) watch re-creates it.
+		// pod is deleted. Recreation happens on the NEXT reconcile (the
+		// delete+recreate pattern, I42b spec 6): the envtest has no kubelet,
+		// so the Owns(Pod) watch that would fire the recreate on deletion is
+		// not active; a third Reconcile creates the new pod.
 		reconcileLoop("drift-loop", ns)
-		Eventually(func() *corev1.EnvVar {
-			p := getPod(ns, toolProxyPod("drift-loop"))
-			if p.ResourceVersion == oldRV {
-				return nil // the old (not yet deleted) pod
-			}
-			for i := range p.Spec.Containers[0].Env {
-				if p.Spec.Containers[0].Env[i].Name == "TOOL_UPSTREAM" {
-					return &p.Spec.Containers[0].Env[i]
-				}
-			}
-			return nil
-		}, "10s", "200ms").ShouldNot(BeNil(), "the recreated pod must carry the updated TOOL_UPSTREAM")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: toolProxyPod("drift-loop")}, &corev1.Pod{})).
+			To(HaveOccurred(), "the drifted pod must be deleted after the first reconcile")
+		reconcileLoop("drift-loop", ns)
 		newPod := getPod(ns, toolProxyPod("drift-loop"))
-		Expect(newPod.ResourceVersion).ToNot(Equal(oldRV), "the pod must be RECREATED (new resourceVersion), not updated in place")
 		var newUp *corev1.EnvVar
 		for i := range newPod.Spec.Containers[0].Env {
-			if newPod.Spec.Containers[0].Env[i].Name == "TOOL_UPSTREAM" {
+			if newPod.Spec.Containers[0].Env[i].Name == d41cToolUpstreamEnv {
 				newUp = &newPod.Spec.Containers[0].Env[i]
 			}
 		}
-		Expect(newUp.Value).To(Equal(d41cUpstreamB))
+		Expect(newUp).ToNot(BeNil())
+		Expect(newUp.Value).To(Equal(d41cUpstreamB), "the recreated pod must carry the updated TOOL_UPSTREAM")
 
 		// The Service name is stable across the recreate (the agent's env URL
 		// depends on it).
@@ -532,12 +533,12 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 			Spec:       coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{d41cToolGH(d41cUpstreamB)}},
 		})).To(Succeed())
 
-		loop := buildLoop("conflict-loop", ns, []string{"d41c-conflict-a", "d41c-conflict-b"})
+		loop := buildLoop(d41cConflictLoop, ns, []string{"d41c-conflict-a", "d41c-conflict-b"})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		reconcileLoop("conflict-loop", ns)
+		reconcileLoop(d41cConflictLoop, ns)
 
 		gotLoop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "conflict-loop"}, gotLoop)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: d41cConflictLoop}, gotLoop)).To(Succeed())
 		var policyValid *metav1.Condition
 		for i := range gotLoop.Status.Conditions {
 			if gotLoop.Status.Conditions[i].Type == "PolicyValid" {
@@ -552,7 +553,7 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 
 		// No tool proxy pod created (validation fails before ensure*).
 		pod := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: toolProxyPod("conflict-loop")}, pod)).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: toolProxyPod(d41cConflictLoop)}, pod)).
 			To(HaveOccurred(), "no tool proxy may be created for a ToolConflict Loop")
 
 		// Identical definitions → one proxy (union dedup).
@@ -569,7 +570,7 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 		Expect(k8sClient.Create(ctx, loop2)).To(Succeed())
 		reconcileLoop("ident-loop", ns2)
 		pod2 := getPod(ns2, toolProxyPod("ident-loop"))
-		Expect(pod2.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "TOOL_UPSTREAM", Value: d41cUpstreamA}),
+		Expect(pod2.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: d41cToolUpstreamEnv, Value: d41cUpstreamA}),
 			"identical tool definitions across policies must dedup to one proxy")
 	})
 
@@ -597,25 +598,27 @@ var _ = Describe("D41c: ensureToolProxies", func() {
 			"the sandbox must reach Running before the update step (I43: update, not just create)")
 
 		// (b) Update the tool spec (new upstream) and re-reconcile from the
-		// API server → the pod is updated (spec-hash recreate, new
-		// TOOL_UPSTREAM env).
+		// API server → the old pod is deleted (spec-hash mismatch). Recreation
+		// happens on the NEXT reconcile (the delete+recreate pattern, I42b
+		// spec 6): the envtest has no kubelet, so a third Reconcile creates
+		// the new pod.
 		ap.Spec.Tools = []coxv1alpha1.ToolSpec{d41cToolGH(d41cUpstreamB)}
 		Expect(k8sClient.Update(ctx, ap)).To(Succeed())
 		oldRV := getPod(ns, toolProxyPod("updel-loop")).ResourceVersion
 		reconcileLoop("updel-loop", ns)
-		Eventually(func() string {
-			p := getPod(ns, toolProxyPod("updel-loop"))
-			if p.ResourceVersion == oldRV {
-				return "" // the old (not yet recreated) pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: toolProxyPod("updel-loop")}, &corev1.Pod{})).
+			To(HaveOccurred(), "the drifted pod must be deleted after the first reconcile (I43: updated, not just created)")
+		reconcileLoop("updel-loop", ns)
+		newPod := getPod(ns, toolProxyPod("updel-loop"))
+		Expect(newPod.ResourceVersion).ToNot(Equal(oldRV), "the pod must be RECREATED (new resourceVersion), not updated in place (I43)")
+		var updatedUp *corev1.EnvVar
+		for i := range newPod.Spec.Containers[0].Env {
+			if newPod.Spec.Containers[0].Env[i].Name == d41cToolUpstreamEnv {
+				updatedUp = &newPod.Spec.Containers[0].Env[i]
 			}
-			for _, e := range p.Spec.Containers[0].Env {
-				if e.Name == "TOOL_UPSTREAM" {
-					return e.Value
-				}
-			}
-			return ""
-		}, "10s", "200ms").Should(Equal(d41cUpstreamB),
-			"the updated tool spec must recreate the pod with the new TOOL_UPSTREAM (I43)")
+		}
+		Expect(updatedUp).ToNot(BeNil())
+		Expect(updatedUp.Value).To(Equal(d41cUpstreamB), "the recreated pod must carry the new TOOL_UPSTREAM (I43)")
 
 		// (c) Delete the tool from the policy and re-reconcile from the API
 		// server → the pod + Service are deleted (cleanup) and the sandbox
@@ -669,7 +672,7 @@ var _ = Describe("D41c: toolProxyGatesSuspended fail-closed", func() {
 		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
 		Expect(k8sClient.Create(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "fc-loop-tool-" + d41cToolName, Namespace: ns},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "t", Image: "busybox"}}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "t", Image: "busybox"}}},
 		})).To(Succeed())
 
 		Expect(r.toolProxyGatesSuspended(ctx, loop)).To(BeTrue(),

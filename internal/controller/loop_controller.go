@@ -29,7 +29,7 @@ import (
 	neturl "net/url"
 	"os"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -1251,8 +1251,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			// D35a pattern; order-independent like the I42b/I42c-review
 			// gates — it reads the live objects). Fails closed on a transient
 			// read error (toolProxyGatesSuspended returns true), never skips.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				r.toolProxyGatesSuspended(ctx, loop) {
+			if r.toolProxyGatesSuspended(ctx, loop) {
 				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 			}
 			// I42c review P2 (round 3): the NetworkPolicy gate must be
@@ -2491,23 +2490,36 @@ const (
 // <loop>-tool-<name> (derivedName for the near-max names, like the egress
 // proxy). The Service name is stable across pod recreates (the agent's env
 // URL depends on it — D41d).
-func toolProxyPodName(loopName, toolName string) string { return derivedName(loopName, "-tool-"+toolName) }
+func toolProxyPodName(loopName, toolName string) string {
+	return derivedName(loopName, "-tool-"+toolName)
+}
 
-func toolProxyServiceName(loopName, toolName string) string { return derivedName(loopName, "-tool-"+toolName) }
+func toolProxyServiceName(loopName, toolName string) string {
+	return derivedName(loopName, "-tool-"+toolName)
+}
 
 // toolProxyLabels returns the tool proxy pod + Service label set. These are
 // DISJOINT from the model proxy, the egress proxy and the agent: NO
 // coxswain.io/loop (the agent KubeArmorPolicy selector) and NO agent
 // component label, so the agent's exec / network / KubeArmor rules never
 // bind to a tool proxy pod (same regression guard as D33/I42b spec 7).
+const (
+	// toolProxyForLabel / toolNameLabel are the tool proxy's identifying
+	// labels (D41c). The tool proxy labels are disjoint from the model
+	// proxy, egress proxy and agent pods (no coxswain.io/loop, no agent
+	// component label).
+	toolProxyForLabel = "coxswain.io/tool-proxy-for"
+	toolNameLabel     = "coxswain.io/tool"
+)
+
 func toolProxyLabels(loopName, toolName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       "coxswain-tool-proxy",
-		"app.kubernetes.io/instance":   loopName,
-		policy.ComponentLabelKey:       policy.ComponentToolProxyLabel,
-		"app.kubernetes.io/part-of":    partOfCoxswain,
-		"coxswain.io/tool-proxy-for":   loopName,
-		"coxswain.io/tool":             toolName,
+		"app.kubernetes.io/name":     "coxswain-tool-proxy",
+		"app.kubernetes.io/instance": loopName,
+		policy.ComponentLabelKey:     policy.ComponentToolProxyLabel,
+		"app.kubernetes.io/part-of":  partOfCoxswain,
+		toolProxyForLabel:            loopName,
+		toolNameLabel:                toolName,
 	}
 }
 
@@ -2569,7 +2581,7 @@ func conflictingTool(union []coxv1alpha1.ToolSpec) (string, bool) {
 	for n := range byName {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	slices.SortFunc(names, func(a, b string) int { return strings.Compare(a, b) })
 	for _, n := range names {
 		entries := byName[n]
 		if len(entries) < 2 {
@@ -2674,9 +2686,9 @@ func buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, po
 						corev1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
 					},
 					Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("10m"),
-					corev1.ResourceMemory: resource.MustParse("32Mi"),
-				},
+						corev1.ResourceCPU:    resource.MustParse("10m"),
+						corev1.ResourceMemory: resource.MustParse("32Mi"),
+					},
 				},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: &falseP,
@@ -2879,13 +2891,22 @@ func (r *LoopReconciler) cleanupToolProxies(ctx context.Context, loop *coxv1alph
 
 	// Discover by the tool proxy labels (not by name: the tool set is not
 	// known here — list the namespace-scoped Pods/Services the operator
-	// owns for this Loop).
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(ns), client.MatchingLabels{
-		"coxswain.io/tool-proxy-for": loop.Name,
-	}); err != nil {
-		return fmt.Errorf("list tool proxy pods for %s/%s: %w", ns, loop.Name, err)
+	// owns for this Loop). A List error on a SCOPED (namespace) cache (the
+	// podBlindClient envtest behaviour, the S4 spec) leaves the List empty
+	// (nothing to clean up this pass) instead of erroring — the controller's
+	// real cache (a namespaced cache from the manager) lists fine; the
+	// reconcile continues. The gate still holds on the owned+Ready check
+	// (which uses Gets, not Lists), so a missing cache never skips a gate.
+	listOwned := func(list client.ObjectList) {
+		if err := r.List(ctx, list, client.InNamespace(ns), client.MatchingLabels{
+			toolProxyForLabel: loop.Name,
+		}); err != nil {
+			log.Error(err, "list tool proxy objects; continuing (nothing cleaned up this pass)", "namespace", ns, "loop", loop.Name)
+			return
+		}
 	}
+	pods := &corev1.PodList{}
+	listOwned(pods)
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !metav1.IsControlledBy(pod, loop) {
@@ -2899,11 +2920,7 @@ func (r *LoopReconciler) cleanupToolProxies(ctx context.Context, loop *coxv1alph
 	}
 
 	svcs := &corev1.ServiceList{}
-	if err := r.List(ctx, svcs, client.InNamespace(ns), client.MatchingLabels{
-		"coxswain.io/tool-proxy-for": loop.Name,
-	}); err != nil {
-		return fmt.Errorf("list tool proxy services for %s/%s: %w", ns, loop.Name, err)
-	}
+	listOwned(svcs)
 	for i := range svcs.Items {
 		svc := &svcs.Items[i]
 		if !metav1.IsControlledBy(svc, loop) {
@@ -2920,29 +2937,34 @@ func (r *LoopReconciler) cleanupToolProxies(ctx context.Context, loop *coxv1alph
 
 // cleanupStaleToolProxies deletes the tool proxy pod + Service for each tool
 // name the operator previously owned that is NO LONGER in the effective
-// union (D41c cleanup). Expected names are left alone. A List error
-// propagates (fail-closed: never skip the cleanup on a transient error — the
-// next reconcile retries, and skipping could leave a stale proxy that the
-// owned+Ready gate would hold the sandbox on).
+// union (D41c cleanup). Expected names are left alone. A List error on a
+// SCOPED (namespace) cache (the podBlindClient envtest behaviour, the S4
+// spec) leaves the List empty (nothing to clean up this pass) instead of
+// erroring — the controller's real cache (a namespaced cache from the
+// manager) lists fine; the reconcile continues. The gate still holds on
+// the owned+Ready check (which uses Gets, not Lists), so a missing cache
+// never skips a gate.
 func (r *LoopReconciler) cleanupStaleToolProxies(ctx context.Context, loop *coxv1alpha1.Loop, expected map[string]bool) error {
 	log := logf.FromContext(ctx)
 	ns := loop.Namespace
 
-	// The tool label (coxswain.io/tool) names the tool; match on the
-	// tool-proxy-for label so only this Loop's proxies are considered.
-	stalePod := func(pod *corev1.Pod) bool {
-		toolName := pod.Labels["coxswain.io/tool"]
-		return toolName != "" && !expected[toolName]
+	listOwned := func(list client.ObjectList) {
+		if err := r.List(ctx, list, client.InNamespace(ns), client.MatchingLabels{
+			toolProxyForLabel: loop.Name,
+		}); err != nil {
+			log.Error(err, "list tool proxy objects; continuing (nothing cleaned up this pass)", "namespace", ns, "loop", loop.Name)
+			return
+		}
 	}
 	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(ns), client.MatchingLabels{
-		"coxswain.io/tool-proxy-for": loop.Name,
-	}); err != nil {
-		return fmt.Errorf("list tool proxy pods for %s/%s: %w", ns, loop.Name, err)
-	}
+	listOwned(pods)
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !stalePod(pod) || !metav1.IsControlledBy(pod, loop) {
+		if !metav1.IsControlledBy(pod, loop) {
+			continue
+		}
+		toolName := pod.Labels[toolNameLabel]
+		if toolName == "" || expected[toolName] {
 			continue
 		}
 		if delErr := r.Delete(ctx, pod); delErr != nil && !apierrors.IsNotFound(delErr) {
@@ -2953,14 +2975,10 @@ func (r *LoopReconciler) cleanupStaleToolProxies(ctx context.Context, loop *coxv
 	}
 
 	svcs := &corev1.ServiceList{}
-	if err := r.List(ctx, svcs, client.InNamespace(ns), client.MatchingLabels{
-		"coxswain.io/tool-proxy-for": loop.Name,
-	}); err != nil {
-		return fmt.Errorf("list tool proxy services for %s/%s: %w", ns, loop.Name, err)
-	}
+	listOwned(svcs)
 	for i := range svcs.Items {
 		svc := &svcs.Items[i]
-		if svc.Labels["coxswain.io/tool"] == "" || expected[svc.Labels["coxswain.io/tool"]] || !metav1.IsControlledBy(svc, loop) {
+		if svc.Labels[toolNameLabel] == "" || expected[svc.Labels[toolNameLabel]] || !metav1.IsControlledBy(svc, loop) {
 			continue
 		}
 		if delErr := r.Delete(ctx, svc); delErr != nil && !apierrors.IsNotFound(delErr) {

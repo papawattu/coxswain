@@ -9,11 +9,13 @@ import (
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // D41d netpol test constants.
@@ -23,6 +25,7 @@ const (
 	d41dAgentNetpol     = "lp-agent-netpol"
 	d41dToolNetpolGH    = "lp-tool-gh-netpol"
 	d41dToolNetpolOther = "lp-tool-other-netpol"
+	d41dOtherTool       = "other"
 )
 
 // D41d: the agent's COX_TOOL_<NAME>_URL env, the tool proxy netpol rule,
@@ -196,40 +199,111 @@ func TestD41AgentEnvCOXTOOLURLReserved(t *testing.T) {
 	}
 }
 
-// D41d spec 6: the tool proxy's owned+Ready gate. If the tool proxy pod is not
-// Ready, the sandbox stays Suspended.
+// D41d spec 6: the tool proxy's owned+Ready gate. toolProxyGatesSuspended holds
+// the sandbox Suspended while any expected tool proxy pod is not owned+Ready by
+// the Loop, and releases once every expected pod is owned and Ready.
 func TestD41ToolProxyOwnedReadyGate(t *testing.T) {
-	// The gate is tested by the existing D41c specs (loop_d41_proxy_test.go)
-	// which verify that ensureToolProxies returns a gate error when the tool
-	// proxy pod is not owned+Ready.
-	_ = true
+	ctx := context.Background()
+	cl := newD41NetpolFakeClient(t)
+	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
+	loop := newD41NetpolLoop()
+	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
+	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}}
+	if err := cl.Create(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, ap); err != nil {
+		t.Fatal(err)
+	}
+
+	// No tool proxy pod yet: the gate holds (fail-closed).
+	if !r.toolProxyGatesSuspended(ctx, loop) {
+		t.Fatal("the gate must hold while the tool proxy pod is absent (fail-closed)")
+	}
+
+	// An owned but NOT Ready pod: the gate still holds.
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "lp-tool-gh", Namespace: d41dNetpolNS}}
+	if err := controllerutil.SetControllerReference(loop, pod, cl.Scheme()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if !r.toolProxyGatesSuspended(ctx, loop) {
+		t.Fatal("the gate must hold while the tool proxy pod is owned but not Ready")
+	}
+
+	// A Ready pod: the gate releases.
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: d41dNetpolNS, Name: "lp-tool-gh"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := cl.Status().Update(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if r.toolProxyGatesSuspended(ctx, loop) {
+		t.Fatal("the gate must release once the tool proxy pod is owned and Ready")
+	}
 }
 
-// D41d spec 7: a FOREIGN tool proxy KubeArmorPolicy occupying the name is
-// NEVER overwritten.
-func TestD41ForeignToolKaptNotOverwritten(t *testing.T) {
-	// The foreign-object gate is tested by the enforcer's createOrUpdateKapt
-	// (kubearmur_enforcer.go) which returns errForeignKapt when the existing
-	// object is not controlled by the Loop.
-	_ = true
-}
+// D41d spec 9: I43 update/remove (netpol half). Removing one tool from a
+// multi-tool set deletes that tool's netpol on the SAME-Loop re-reconcile while
+// the other tool's netpol remains (cleanupStaleToolProxyNetpols runs every
+// reconcile, not only when the tool set is empty).
+func TestD41ToolProxyNetpolRemovedWhenToolRemoved(t *testing.T) {
+	ctx := context.Background()
+	cl := newD41NetpolFakeClient(t)
+	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
+	loop := newD41NetpolLoop()
+	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
+	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{
+		{Name: "gh", Upstream: d41cUpstreamA},
+		{Name: d41dOtherTool, Upstream: d41cUpstreamB},
+	}}
+	if err := cl.Create(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, ap); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ensureNetworkPolicy(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
 
-// D41d spec 8: the agent's KubeArmor DNS allowlist includes the tool proxy
-// FQDN when tools are present.
-func TestD41AgentKaptIncludesToolProxyFQDN(t *testing.T) {
-	// Covered by TestAgentKaptIncludesToolProxyFQDNWhenToolsPresent in
-	// kubearmor_d41_test.go.
-	_ = true
-}
+	// Both tool netpols exist.
+	for _, name := range []string{"lp-tool-gh-netpol", "lp-tool-other-netpol"} {
+		np := &networkingv1.NetworkPolicy{}
+		if err := cl.Get(ctx, client.ObjectKey{Namespace: d41dNetpolNS, Name: name}, np); err != nil {
+			t.Fatalf("expected tool netpol %s to exist: %v", name, err)
+		}
+	}
 
-// D41d spec 9: I43 update/remove — when a tool is REMOVED, the tool proxy
-// Kapt and netpol are cleaned up.
-func TestD41ToolProxyUpdateAndRemove(t *testing.T) {
-	// The update/remove behaviour is tested by the existing D41c specs
-	// (ensureToolProxies handles the drift). The Kapt cleanup is in the
-	// enforcer (cleanupStaleToolKapt). The netpol cleanup is in
-	// cleanupToolProxyNetpols.
-	_ = true
+	// Remove the "other" tool from the effective policy.
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: d41dNetpolNS, Name: d41dNetpolPolicyRef}, ap); err != nil {
+		t.Fatal(err)
+	}
+	ap.Spec.Tools = []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}
+	if err := cl.Update(ctx, ap); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ensureNetworkPolicy(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+
+	// The removed tool's netpol is deleted...
+	removed := &networkingv1.NetworkPolicy{}
+	err := cl.Get(ctx, client.ObjectKey{Namespace: d41dNetpolNS, Name: "lp-tool-other-netpol"}, removed)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("the removed tool's netpol must be deleted; got err=%v", err)
+	}
+	// ...and the remaining tool's netpol is untouched.
+	kept := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: d41dNetpolNS, Name: "lp-tool-gh-netpol"}, kept); err != nil {
+		t.Fatalf("the remaining tool's netpol must be untouched: %v", err)
+	}
+	if !metav1.IsControlledBy(kept, loop) {
+		t.Fatal("the remaining tool's netpol must still be controller-owned by the Loop")
+	}
 }
 
 // D41d spec 1: the tool proxy netpol is created with the right shape

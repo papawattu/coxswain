@@ -3440,65 +3440,71 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// application layer enforces the request rules) + DNS. No tools -> no
 	// tool netpols (and cleanup of stale ones).
 	if tools, err := r.effectivePolicyTools(ctx, loop); err == nil {
-		if len(tools) > 0 {
-			for _, t := range tools {
-				toolNP := &networkingv1.NetworkPolicy{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      toolProxyNetpolName(loopName, t.Name),
-						Namespace: ns,
-					},
-					Spec: networkingv1.NetworkPolicySpec{
-						PodSelector: metav1.LabelSelector{MatchLabels: toolProxyLabels(loopName, t.Name)},
-						PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-						Ingress: []networkingv1.NetworkPolicyIngressRule{
-							{
-								From:  []networkingv1.NetworkPolicyPeer{agentPeer},
-								Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(toolProxyPort), Protocol: new(corev1.ProtocolTCP)}},
-							},
+		expected := make(map[string]bool, len(tools))
+		for _, t := range tools {
+			expected[t.Name] = true
+			toolNP := &networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      toolProxyNetpolName(loopName, t.Name),
+					Namespace: ns,
+					// The identifying label (disjoint from the agent's
+					// coxswain.io/loop) the cleanup List and the foreign gate
+					// key on. Without it, cleanupStaleToolProxyNetpols's
+					// LabelSelector finds nothing and stale netpols leak.
+					Labels: map[string]string{toolProxyForLabel: loopName, toolNameLabel: t.Name},
+				},
+				Spec: networkingv1.NetworkPolicySpec{
+					PodSelector: metav1.LabelSelector{MatchLabels: toolProxyLabels(loopName, t.Name)},
+					PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+					Ingress: []networkingv1.NetworkPolicyIngressRule{
+						{
+							From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+							Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(toolProxyPort), Protocol: new(corev1.ProtocolTCP)}},
 						},
-						Egress: []networkingv1.NetworkPolicyEgressRule{
-							{
-								// Egress rule 1: external v4 with carve-outs (no port
-								// restriction). The tool proxy dials the upstream's port
-								// only; the application layer enforces the request rules.
-								To: []networkingv1.NetworkPolicyPeer{
-									{
-										IPBlock: &networkingv1.IPBlock{
-											CIDR:   "0.0.0.0/0",
-											Except: egressCarveOutCIDRs(r.PodCIDR, r.ServiceCIDR),
-										},
+					},
+					Egress: []networkingv1.NetworkPolicyEgressRule{
+						{
+							// Egress rule 1: external v4 with carve-outs (no port
+							// restriction). The tool proxy dials the upstream's port
+							// only; the application layer enforces the request rules.
+							To: []networkingv1.NetworkPolicyPeer{
+								{
+									IPBlock: &networkingv1.IPBlock{
+										CIDR:   "0.0.0.0/0",
+										Except: egressCarveOutCIDRs(r.PodCIDR, r.ServiceCIDR),
 									},
 								},
 							},
-							{
-								// Egress rule 1b: the v6 mirror (dual-stack).
-								To: []networkingv1.NetworkPolicyPeer{
-									{
-										IPBlock: &networkingv1.IPBlock{
-											CIDR:   "::/0",
-											Except: egress.CarveOutCIDRsV6(),
-										},
+						},
+						{
+							// Egress rule 1b: the v6 mirror (dual-stack).
+							To: []networkingv1.NetworkPolicyPeer{
+								{
+									IPBlock: &networkingv1.IPBlock{
+										CIDR:   "::/0",
+										Except: egress.CarveOutCIDRsV6(),
 									},
 								},
 							},
-							{
-								To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
-								Ports: dnsPorts(),
-							},
+						},
+						{
+							To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+							Ports: dnsPorts(),
 						},
 					},
-				}
-				if _, err := r.createOrUpdateNP(ctx, loop, toolNP); err != nil {
-					if merr := mapForeign(toolNP.Name, err); merr != nil {
-						return merr
-					}
+				},
+			}
+			if _, err := r.createOrUpdateNP(ctx, loop, toolNP); err != nil {
+				if merr := mapForeign(toolNP.Name, err); merr != nil {
+					return merr
 				}
 			}
-		} else {
-			// No tools: clean up any existing tool proxy netpols.
-			if merr := r.cleanupToolProxyNetpols(ctx, loop); merr != nil {
-				return merr
-			}
+		}
+		// Cleanup runs on EVERY reconcile (not only when the tool set is
+		// empty): a tool removed from a multi-tool set must have its netpol
+		// deleted while the others' remain (the cleanupStaleToolKapt pattern).
+		if merr := r.cleanupStaleToolProxyNetpols(ctx, loop, expected); merr != nil {
+			return merr
 		}
 	}
 
@@ -3567,20 +3573,32 @@ func toolProxyNetpolName(loopName, toolName string) string {
 	return derivedName(loopName, "-tool-"+toolName+"-netpol")
 }
 
-// cleanupToolProxyNetpols deletes the tool proxy NetworkPolicies that exist
-// but are no longer expected (no tools in the effective policy, D41d cleanup).
-// A foreign netpol is left alone (I2 never-take-over).
-func (r *LoopReconciler) cleanupToolProxyNetpols(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	npList := &networkingv1.NetworkPolicyList{}
-	if err := r.List(ctx, npList, client.InNamespace(loop.Namespace), client.MatchingLabels{"coxswain.io/tool-proxy-for": loop.Name}); err != nil {
+// cleanupStaleToolProxyNetpols deletes the tool proxy NetworkPolicies for each
+// tool this Loop previously owned that is NO LONGER in the current tool set
+// (D41d cleanup, the cleanupStaleToolKapt pattern). It runs on EVERY reconcile
+// — not only when the tool set is empty — so removing one of several tools
+// deletes that tool's netpol while the others' remain. A FOREIGN netpol
+// occupying the name is left alone (I2 never-take-over).
+func (r *LoopReconciler) cleanupStaleToolProxyNetpols(ctx context.Context, loop *coxv1alpha1.Loop, expected map[string]bool) error {
+	list := &networkingv1.NetworkPolicyList{}
+	if err := r.List(ctx, list, client.InNamespace(loop.Namespace), client.MatchingLabels{"coxswain.io/tool-proxy-for": loop.Name}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("list tool proxy netpols: %w", err)
 	}
-	for i := range npList.Items {
-		np := &npList.Items[i]
+	for i := range list.Items {
+		np := &list.Items[i]
+		// The netpol name is <loop>-tool-<name>-netpol; the tool name is the
+		// part between "-tool-" and "-netpol" (the expected map is keyed by
+		// tool name, mirroring cleanupStaleToolKapt).
+		toolName := strings.TrimSuffix(np.Name, "-netpol")
+		toolName = strings.TrimPrefix(toolName, loop.Name+"-tool-")
+		if expected[toolName] {
+			continue
+		}
 		if !metav1.IsControlledBy(np, loop) {
+			// Foreign object: leave it alone (never take over, I2/I42b).
 			continue
 		}
 		if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {

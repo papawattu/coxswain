@@ -137,13 +137,11 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	}
 
 	// --- the read + delta (item 2, P1-B) ---
-	// No model -> no proxy pod -> no read; the token/cost caps are inert (the
-	// wall clock still applies, spec 9).
-	// The token/cost caps are inert without a model (no proxy pod, no read —
-	// spec 9); the wall clock (above) still applies. A read failure (the
-	// proxy pod not Ready, the dial refused, the pod absent) leaves
-	// status.budget UNCHANGED (no reset, no delta — the operator does not
-	// guess; the decision is on the last SUCCESSFUL read, never an estimate).
+		// No model -> no proxy pod -> no read; the token/cost caps are inert
+	// (the wall clock still applies, spec 9). A read failure (the proxy pod
+	// not Ready, the dial refused, the pod absent) leaves status.budget
+	// UNCHANGED (no reset, no delta — the operator does not guess; the
+	// decision is on the last SUCCESSFUL read, never an estimate).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
 		if reading, err := r.resolveProxyUsageRead(ctx, loop); err == nil && reading != nil {
 			if err := r.applyUsageReading(ctx, loop, *reading); err != nil {
@@ -155,15 +153,22 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// --- the decision (pure function of status.budget + spec.budget) ---
 	// Gated on phase != Paused (P2f: the budget decision is inert in Paused —
 	// a wall-clock hit while paused records exceeded but does not change the
-	// phase/reason; re-evaluated on resume). It runs AFTER the verify/stall
-	// decisions (item 8: a phase already Failed/Paused by the stall decision is
-	// seen here and the budget decision is inert).
-	if !loopPaused(loop) {
+	// phase/reason; re-evaluated on resume) and on every terminal phase
+	// (item 8: a budget entry on a terminal phase would overwrite the
+	// terminal record — a Succeeded Loop must not flip to Paused/Failed on a
+	// cap hit, and a Failed Loop's stall record must not be clobbered by a
+	// budget Fail; the reading is still folded into status.budget above, so
+	// the BudgetExceeded CONDITION may still be recorded, but the onExceeded
+	// phase action does not fire). The decision runs AFTER the verify/stall
+	// decisions (item 8: a phase already changed by the stall decision is seen
+	// here and the budget decision is inert).
+	if !loopPaused(loop) && isPausablePhase(loop.Status.Phase) {
 		r.applyBudgetDecision(ctx, loop)
 	}
 
 	return budgetRequeue, nil
 }
+
 
 // resolveProxyUsageRead dispatches to the readProxyUsage test seam when it is
 // set, otherwise to the default (the readBaseCommit pattern). It returns

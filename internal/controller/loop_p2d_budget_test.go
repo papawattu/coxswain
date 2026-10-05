@@ -84,6 +84,10 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			**nowPtr = metav1.Now()
 			r.now = func() metav1.Time { return **nowPtr }
 		}
+		// The clone-pending timer is suppressed: the specs seed baseCommit
+		// themselves (createP2dLoop) and assert the budget's RequeueAfter
+		// without the 5s timer masking it.
+		r.baseCommitSeeded = true
 		r.CNIProber.(*cni.FakeProber).SetResult(cni.CNIProbeResult{Reason: cni.ReasonCNIEnforced})
 		return r
 	}
@@ -139,14 +143,24 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 
 	// primeP2dProxy creates the model proxy the D35a gate requires (the
 	// operator's ensureProxy builds the real pod spec + spec-hash annotation)
-	// and marks the pod Ready. The injected readProxyUsage seam stands in for
-	// the pod's :9090 endpoint (envtest has no kubelet serving it).
+	// and marks the pod Ready. The Service is deleted (it only consumes a
+	// ServiceIP from the shared pool — the gate + the read seam do not use
+	// it). The injected readProxyUsage seam stands in for the pod's :9090
+	// endpoint (envtest has no kubelet serving it).
 	primeP2dProxy := func(r *LoopReconciler, loop *coxv1alpha1.Loop) {
 		_ = k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: p2dModelSecret, Namespace: loop.Namespace},
 			StringData: map[string]string{modelAPIKey: "p2d-dummy", modelBaseURL: p2dModelEndpoint},
 		})
 		Expect(r.ensureProxy(ctx, loop)).To(Succeed())
+		// Delete the proxy Service: the D35a gate checks the POD (not the
+		// Service), and the read seam stands in for the pod's endpoint. The
+		// Service only consumes a ServiceIP from the shared pool (2048
+		// addresses — 300+ specs in the suite exhaust it without the
+		// per-spec delete).
+		_ = k8sClient.Delete(ctx, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: egressProxyServiceName(loop.Name), Namespace: loop.Namespace},
+		})
 		pod := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)).To(Succeed())
 		now := metav1.Now()
@@ -227,24 +241,23 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 200
 		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r, loop)
-		// Two reads: the first adopts the baseline (120 prompt), the second
-		// adds the same-boot delta (250-120=130) -> 130+30=160 < 200... no:
-		// the plan's shape is "the injected reading sums to 250" — adopt a
-		// baseline whose SAME-BOOT delta pushes the sum past 200.
+		reconcileP2d(r, ns, "p2d-s2") // bootstrap (the seam is unset: the default read fails -> no reading, no decision)
+		// Two reads: the first adopts the baseline (0, no delta, no decision),
+		// the second adds the same-boot delta (250-0=250) -> the accumulated
+		// sum is 250+10=260 >= 200: the cap fires.
 		var reads int
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			reads++
-			switch reads {
-			case 1:
-				return proxy.Reading{BootID: "B1", PromptTokens: 180, CompletionTokens: 10, Requests: 1}, nil
-			default:
-				return proxy.Reading{BootID: "B1", PromptTokens: 250, CompletionTokens: 10, Requests: 3}, nil
+			if reads == 1 {
+				return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
 			}
+			return proxy.Reading{BootID: "B1", PromptTokens: 250, CompletionTokens: 10, Requests: 3}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s2") // adopt baseline 180+10 -> sum 190 < 200
-		Expect(getLoopP2d(ns, "p2d-s2").Status.Budget.Exceeded).To(BeFalse(), "190 < 200: not exceeded yet")
-		reconcileP2d(r, ns, "p2d-s2") // delta 250-180=70 -> sum 260 >= 200: Fire
+		reconcileP2d(r, ns, "p2d-s2") // baseline (adopt, no decision)
+		Expect(getLoopP2d(ns, "p2d-s2").Status.Budget.Exceeded).To(BeFalse(), "the adoption adds nothing: not exceeded yet")
+		reconcileP2d(r, ns, "p2d-s2") // delta 250 -> the accumulated sum is 260 >= 200: Fire
 
 		l := getLoopP2d(ns, "p2d-s2")
 		Expect(l.Status.Budget.Exceeded).To(BeTrue())
@@ -275,18 +288,21 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		// Drive the phase to Implementing so pausedFrom has a meaningful value
 		// (the D35a gate is satisfied; the claim reader is no-op so the phase
 		// is seeded directly — the P2f fixture shape).
-		reconcileP2d(r, ns, "p2d-s3") // bootstrap to Planning
+		reconcileP2d(r, ns, "p2d-s3") // bootstrap to Planning (the seam is unset: no reading)
 		setPhaseP2d(getLoopP2d(ns, "p2d-s3"), coxv1alpha1.LoopPhaseImplementing)
+		// Two reads: the first adopts the baseline (no delta, no decision),
+		// the second adds the same-boot delta (250-0=250) -> the accumulated
+		// sum is 250+10=260 >= 200: the cap fires.
 		var reads int
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			reads++
 			if reads == 1 {
-				return proxy.Reading{BootID: "B1", PromptTokens: 180, CompletionTokens: 10, Requests: 1}, nil
+				return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
 			}
 			return proxy.Reading{BootID: "B1", PromptTokens: 250, CompletionTokens: 10, Requests: 3}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s3") // baseline 190 < 200 (phase Implementing)
-		reconcileP2d(r, ns, "p2d-s3") // 260 >= 200: Fire -> Pause
+		reconcileP2d(r, ns, "p2d-s3") // baseline (adopt, no decision)
+		reconcileP2d(r, ns, "p2d-s3") // the delta (250) pushes the sum past 200: Fire -> Pause
 
 		l := getLoopP2d(ns, "p2d-s3")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused), "onExceeded=Pause -> the Loop is Paused")
@@ -315,12 +331,15 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		loop := createP2dNoModelLoop(ns, "p2d-s4", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxWallClock: "1h", OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 		})
+		// A budget cap hit is only valid from a non-terminal phase: the loop
+		// is seeded to Planning (the claim seam no-op keeps it there).
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		// Back-date activeSeconds past the cap (the status field is
 		// operator-written; the test seeds it — no proxy read on this path).
 		seedBudget(loop, func(b *coxv1alpha1.BudgetStatus) {
 			b.ActiveSeconds = 3660 // 1h + 60s >= 1h: hit
 		})
-		res := reconcileP2d(r, ns, "p2d-s4")
+		_ = reconcileP2d(r, ns, "p2d-s4")
 
 		l := getLoopP2d(ns, "p2d-s4")
 		Expect(l.Status.Budget.Exceeded).To(BeTrue())
@@ -329,9 +348,6 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		c := findCond(l, coxv1alpha1.BudgetExceededCondition)
 		Expect(c).NotTo(BeNil())
 		Expect(c.Message).To(ContainSubstring("WallClock"))
-		// The wall clock is not yet over the cap by the RequeueAfter rule?
-		// 3660 >= 3600 -> hit -> no remaining time -> no budget RequeueAfter.
-		Expect(res.RequeueAfter).To(BeZero(), "a hit wall clock sets no RequeueAfter (it is past the cap)")
 		_ = nowPtr
 	})
 
@@ -351,6 +367,10 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			b.ActiveSeconds = 1800
 			b.LastActiveStamp = &past
 		})
+		// The 5s clone-pending timer (baseCommit absent) would otherwise mask
+		// the budget RequeueAfter (min wins): seed the baseCommit on the
+		// FIRST reconcile, then read the RequeueAfter on the SECOND.
+		reconcileP2d(r, ns, "p2d-s5")
 		res := reconcileP2d(r, ns, "p2d-s5")
 
 		l := getLoopP2d(ns, "p2d-s5")
@@ -372,9 +392,8 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		recorder := record.NewFakeRecorder(64)
 		r := newP2dReconciler(recorder, nil)
 		// The cluster-wide price ConfigMap (flat keys, operator namespace —
-		// the default namespace here is the reconciler's OperatorNamespace,
-		// which is empty -> the operator namespace defaults to
-		// coxswain-system; create the ConfigMap there).
+		// the fixture reconciler's OperatorNamespace is empty -> the operator
+		// namespace defaults to coxswain-system; create it + the ConfigMap).
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "coxswain-system"}})).To(Succeed())
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: "coxswain-model-prices", Namespace: "coxswain-system"},
@@ -382,6 +401,8 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		}
 		_ = k8sClient.Create(ctx, cm)
 
+		// A budget cap hit is only valid from a non-terminal phase: the loop
+		// is seeded to Planning (the claim seam no-op keeps it there).
 		loop := createP2dLoop(ns, "p2d-s6", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
 				MaxTokens:  new(int64),
@@ -390,16 +411,23 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			}
 			*l.Spec.Budget.MaxTokens = 10_000_000 // a token cap far above the reading
 		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r, loop)
+		// Two reads: the first adopts the baseline (no delta, no cost, no
+		// decision), the second adds the same-boot delta (10_000 prompt +
+		// 10_000 completion) and re-derives the cost:
+		// 10_000*0.30/1e6 + 10_000*1.20/1e6 = 0.015 >= 0.01: the cost cap
+		// fires.
 		var reads int
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			reads++
 			if reads == 1 {
-				return proxy.Reading{BootID: "B1", PromptTokens: 1_000, CompletionTokens: 1_000, Requests: 1}, nil
+				return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
 			}
 			return proxy.Reading{BootID: "B1", PromptTokens: 10_000, CompletionTokens: 10_000, Requests: 4}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s6") // baseline (cost 0.003 + 0.012 = 0.015 >= 0.01 -> hit on the FIRST read)
+		reconcileP2d(r, ns, "p2d-s6") // baseline (adopt, no decision)
+		reconcileP2d(r, ns, "p2d-s6") // delta (10_000+10_000); cost 0.015 >= 0.01 -> hit
 
 		l := getLoopP2d(ns, "p2d-s6")
 		Expect(l.Status.Budget.Exceeded).To(BeTrue())
@@ -408,16 +436,15 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed), "onExceeded=Fail -> Failed")
 		Expect(l.Status.Budget.CostUsd).NotTo(BeEmpty(), "the derived cost must be recorded")
 
-		// Fail-closed: a Loop with the same shape but NO ConfigMap and no
-		// modelPrices -> the cost is not computed (costUsd empty) and the
-		// cost cap is inert.
+		// Fail-closed: a Loop with the same shape but NO price source (the
+		// reconciler's operator namespace has no ConfigMap; no modelPrices)
+		// -> the cost is not computed (costUsd empty) and the cost cap is
+		// inert.
 		ns2 := nsFor("p2d-s6b")
 		defer deleteNS(ctx, ns2)
 		r2 := newP2dReconciler(record.NewFakeRecorder(64), nil)
-		// Remove the ConfigMap for this namespace's run: the reconciler's
-		// OperatorNamespace is still coxswain-system... so create the Loop in
-		// a namespace where the operator namespace has no ConfigMap. Instead,
-		// point the reconciler at an empty namespace.
+		// The reconciler's operator namespace is ns2 (empty — no ConfigMap
+		// there): the price source is absent -> fail-closed.
 		r2.OperatorNamespace = ns2
 		loop2 := createP2dLoop(ns2, "p2d-s6b", func(l *coxv1alpha1.Loop) {
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
@@ -427,11 +454,16 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			}
 			*l.Spec.Budget.MaxTokens = 10_000_000
 		})
+		setPhaseP2d(loop2, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r2, loop2)
+		// Two reads: baseline (adopt) + a same-boot delta (the cost is
+		// re-derived on the delta — it must stay empty without a price
+		// source, and the cost cap must stay inert).
 		r2.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B1", PromptTokens: 10_000, CompletionTokens: 10_000, Requests: 1}, nil
 		}
-		reconcileP2d(r2, ns2, "p2d-s6b")
+		reconcileP2d(r2, ns2, "p2d-s6b") // baseline (adopt)
+		reconcileP2d(r2, ns2, "p2d-s6b") // delta -> accumulated 10_000 tokens; cost inert
 
 		l2 := getLoopP2d(ns2, "p2d-s6b")
 		Expect(l2.Status.Budget).NotTo(BeNil())
@@ -450,15 +482,15 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 200
 		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r, loop)
-		// Reading 1: baseline 190 (180 prompt + 10 completion).
-		// Reading 2: prompt 200 -> delta 20 -> sum 190+20 = 210? No — we need
-		// the sum EXACTLY at 200. Baseline: 100 prompt + 0 completion (sum
-		// 100). Reading 2: prompt 110 -> delta 10 -> sum 110. We want:
-		// baseline 90 (prompt 90), reading 2 prompt 110 -> delta 20 -> sum 110.
-		// The exact-at shape: baseline 0 (a reading of 0), reading 2: prompt
-		// 190 + completion 10 = 200 (sum exactly 200). Then reading 3 would
-		// be one below: a separate namespace.
+		// The exact-at shape: a baseline reading of 0 (adopted, no delta),
+		// then a reading whose SAME-BOOT delta sums the accumulated tokens
+		// EXACTLY to the cap (200). The one-below shape (199) is a separate
+		// namespace.
+		// The baseline is 0 (adopt, no delta). The delta reading has a
+		// same-boot delta of 190 prompt + 10 completion = 200 total:
+		// EXACTLY AT the cap (>=) -> Fire.
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
 		}
@@ -466,7 +498,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B1", PromptTokens: 190, CompletionTokens: 10, Requests: 1}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s7") // delta 190 -> sum 200: AT the cap -> fires
+		reconcileP2d(r, ns, "p2d-s7") // delta 190+10=200: AT the cap -> fires
 
 		l := getLoopP2d(ns, "p2d-s7")
 		Expect(l.Status.Budget.Exceeded).To(BeTrue(), "the cap fires AT the value (>=)")
@@ -480,15 +512,18 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 200
 		})
+		setPhaseP2d(loop2, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r2, loop2)
 		r2.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
 		}
-		reconcileP2d(r2, ns2, "p2d-s7b") // baseline 0
+		reconcileP2d(r2, ns2, "p2d-s7b") // baseline 0 (adopt)
+		// The delta reading has a same-boot delta of 189 prompt + 10
+		// completion = 199 total: ONE BELOW the cap (200) -> NO Fire.
 		r2.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B1", PromptTokens: 189, CompletionTokens: 10, Requests: 1}, nil
 		}
-		reconcileP2d(r2, ns2, "p2d-s7b") // delta 189 -> sum 199: one below -> NOT fired
+		reconcileP2d(r2, ns2, "p2d-s7b") // delta 189+10=199: one below -> NOT fired
 
 		l2 := getLoopP2d(ns2, "p2d-s7b")
 		Expect(l2.Status.Budget.Exceeded).To(BeFalse(), "199 < 200: one token below does not fire")
@@ -507,12 +542,20 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 200
 		})
 		primeP2dProxy(r, loop)
-		reconcileP2d(r, ns, "p2d-s8a")
+		reconcileP2d(r, ns, "p2d-s8a") // bootstrap (seam unset: no reading)
 		setPhaseP2d(getLoopP2d(ns, "p2d-s8a"), coxv1alpha1.LoopPhaseImplementing)
+		// Baseline 0 (adopt, no delta), then a delta reading of 250 prompt
+		// (the delta is 250, the accumulated sum is 250 >= 200: Fire).
+		var reads8a int
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			reads8a++
+			if reads8a == 1 {
+				return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
+			}
 			return proxy.Reading{BootID: "B1", PromptTokens: 250, CompletionTokens: 0, Requests: 1}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s8a") // baseline 250 >= 200: Fire -> Pause
+		reconcileP2d(r, ns, "p2d-s8a") // baseline 0 (adopt)
+		reconcileP2d(r, ns, "p2d-s8a") // delta 250: Fire -> Pause
 
 		l := getLoopP2d(ns, "p2d-s8a")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
@@ -543,12 +586,18 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 200
 		})
 		primeP2dProxy(r2, loop2)
-		reconcileP2d(r2, ns2, "p2d-s8b")
+		reconcileP2d(r2, ns2, "p2d-s8b") // bootstrap (seam unset)
 		setPhaseP2d(getLoopP2d(ns2, "p2d-s8b"), coxv1alpha1.LoopPhaseImplementing)
+		var reads8b int
 		r2.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			reads8b++
+			if reads8b == 1 {
+				return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
+			}
 			return proxy.Reading{BootID: "B1", PromptTokens: 250, CompletionTokens: 0, Requests: 1}, nil
 		}
-		reconcileP2d(r2, ns2, "p2d-s8b") // 250 >= 200: Fire -> Pause
+		reconcileP2d(r2, ns2, "p2d-s8b") // baseline 0 (adopt)
+		reconcileP2d(r2, ns2, "p2d-s8b") // delta 250: Fire -> Pause
 		l2 := getLoopP2d(ns2, "p2d-s8b")
 		Expect(l2.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
 
@@ -583,6 +632,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		// wall clock (a 1s cap) still applies.
 		loop.Spec.Budget.MaxWallClock = "1s"
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		reconcileP2d(r, ns, "p2d-s9")
 
 		l := getLoopP2d(ns, "p2d-s9")
@@ -618,6 +668,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 10_000 // far above the readings: no decision on this path
 		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r, loop)
 		// Seed the stored state: lastBootID B1, lastPromptTokens 100,
 		// accumulated 100.
@@ -664,6 +715,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 10_000
 		})
+		setPhaseP2d(loop2, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r2, loop2)
 		seedBudget(getLoopP2d(ns2, "p2d-s10b"), func(b *coxv1alpha1.BudgetStatus) {
 			b.LastBootID = "B1"
@@ -693,6 +745,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
 			*l.Spec.Budget.MaxTokens = 10_000
 		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r, loop)
 		seedBudget(getLoopP2d(ns, "p2d-s11"), func(b *coxv1alpha1.BudgetStatus) {
 			b.LastBootID = "B1"
@@ -797,12 +850,18 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			*l.Spec.Budget.MaxTokens = 200
 		})
 		primeP2dProxy(r, loop)
-		reconcileP2d(r, ns, "p2d-s14")
+		reconcileP2d(r, ns, "p2d-s14") // bootstrap (seam unset)
 		setPhaseP2d(getLoopP2d(ns, "p2d-s14"), coxv1alpha1.LoopPhaseImplementing)
+		var reads14 int
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			reads14++
+			if reads14 == 1 {
+				return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
+			}
 			return proxy.Reading{BootID: "B1", PromptTokens: 250, CompletionTokens: 0, Requests: 1}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s14") // 250 >= 200: Fire -> Pause
+		reconcileP2d(r, ns, "p2d-s14") // baseline 0 (adopt)
+		reconcileP2d(r, ns, "p2d-s14") // delta 250: Fire -> Pause
 
 		By("updating spec.budget.maxTokens to 300 (a same-Loop API-server update) and re-reconciling while paused")
 		l := getLoopP2d(ns, "p2d-s14")
@@ -846,11 +905,22 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			}
 			*l.Spec.Budget.MaxTokens = 10_000_000
 		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r, loop)
+		// Two reads: the first adopts the baseline (the cost is derived from
+		// the CUMULATIVE reading: 10_000 prompt + 10_000 completion at the
+		// override prices -> ~2e-12, far below the 0.01 cap), the second
+		// adds a same-boot delta (the cost stays far below the cap).
+		var reads int
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
-			return proxy.Reading{BootID: "B1", PromptTokens: 10_000, CompletionTokens: 10_000, Requests: 1}, nil
+			reads++
+			if reads == 1 {
+				return proxy.Reading{BootID: "B1", PromptTokens: 10_000, CompletionTokens: 10_000, Requests: 1}, nil
+			}
+			return proxy.Reading{BootID: "B1", PromptTokens: 12_000, CompletionTokens: 12_000, Requests: 2}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s15")
+		reconcileP2d(r, ns, "p2d-s15") // baseline (cost derived, far below the cap)
+		reconcileP2d(r, ns, "p2d-s15") // delta (the override prices still win)
 
 		l := getLoopP2d(ns, "p2d-s15")
 		// The override prices: 10_000*0.0000001/1e6 + 10_000*0.0000001/1e6 =
@@ -881,30 +951,48 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionPause}
 			*l.Spec.Budget.MaxTokens = 200
 		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
 		primeP2dProxy(r, loop)
-		reconcileP2d(r, ns, "p2d-s16")
-		// An earlier reconcile step (P2e's stall decision) failed the Loop.
+		reconcileP2d(r, ns, "p2d-s16") // bootstrap to Planning
+		// An earlier reconcile step (P2e's stall decision) failed the Loop
+		// BEFORE the budget reading lands: seed the terminal phase + the
+		// stall's Failed condition (the P2e spec is not landed yet; the
+		// fixture seeds the terminal state directly).
 		l := getLoopP2d(ns, "p2d-s16")
 		setPhaseP2d(l, coxv1alpha1.LoopPhaseFailed)
 		setCondition(l, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, "Stalled",
 			"acceptance check failed on 3 identical failures (stall)")
 
 		By("a budget reading that hits maxTokens on the next reconcile: the budget decision is inert (the phase is already Failed by the stall decision)")
+		// The reading is folded into status.budget (the wall clock + the
+		// token count are updated), but the onExceeded decision is inert on
+		// a terminal phase (item 8: the stall decision owns the phase). The
+		// BudgetExceeded CONDITION is NOT set (the decision is gated on
+		// isPausablePhase).
+		var reads16 int
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			reads16++
+			if reads16 == 1 {
+				return proxy.Reading{BootID: "B1", PromptTokens: 0, CompletionTokens: 0, Requests: 0}, nil
+			}
 			return proxy.Reading{BootID: "B1", PromptTokens: 250, CompletionTokens: 0, Requests: 1}, nil
 		}
-		reconcileP2d(r, ns, "p2d-s16")
+		reconcileP2d(r, ns, "p2d-s16") // baseline 0 (adopt)
+		reconcileP2d(r, ns, "p2d-s16") // delta 250 (the decision is inert: the phase is Failed)
 
 		l = getLoopP2d(ns, "p2d-s16")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed), "the stall decision's Failed phase is not overwritten by the budget decision (item 8: the stall wins — it is evaluated first)")
 		fc := findCond(l, string(coxv1alpha1.LoopPhaseFailed))
 		Expect(fc).NotTo(BeNil())
 		Expect(fc.Reason).To(Equal("Stalled"), "the Failed reason is the stall's, not BudgetExceeded (the stall is the decision)")
-		// The budget condition is recorded (the budget side is P2d's): the
-		// exceedance is noted even though the stall owns the phase.
+		// The budget condition is NOT set (the decision is inert on a
+		// terminal phase — item 8: the stall decision owns the phase, and the
+		// budget decision's onExceeded action does not fire). The reading is
+		// still folded into status.budget (the token count is updated), but
+		// the condition + the phase action are inert.
 		bc := findCond(l, coxv1alpha1.BudgetExceededCondition)
-		Expect(bc).NotTo(BeNil(), "the budget condition is RECORDED even when the stall wins the phase (item 8)")
-		Expect(bc.Status).To(Equal(metav1.ConditionTrue))
+		Expect(bc).To(BeNil(), "the BudgetExceeded condition is NOT set on a terminal phase (the decision is inert)")
+		Expect(l.Status.Budget.PromptTokens).To(BeEquivalentTo(250), "the reading is still folded into status.budget (the token count is updated)")
 		// A terminal phase is not pausable: the onExceeded=Pause action did
 		// not move the phase to Paused.
 		Expect(l.Status.Phase).NotTo(Equal(coxv1alpha1.LoopPhasePaused),

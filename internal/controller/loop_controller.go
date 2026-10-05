@@ -223,6 +223,13 @@ type LoopReconciler struct {
 	// input; the reader rejects it and logs.)
 	readPhaseClaim func(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error)
 
+	// baseCommitSeeded is a test seam for the clone-pending timer: when
+	// set, the 5s clone-pending RequeueAfter is suppressed (a spec that
+	// seeds status.baseCommit itself, or that asserts the budget
+	// RequeueAfter, can read the budget value without the 5s timer masking
+	// it. The timer's own spec (B1) does not set the seam).
+	baseCommitSeeded bool
+
 	// phaseGate is the OS8 phase-gate seam: it decides whether the phase
 	// machine may advance from current to next (an approval hold, or a future
 	// observer-proposed hold). The S4 build ships exactly one implementation,
@@ -599,9 +606,23 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// It runs every reconcile, including Paused, so a wall-clock hit WHILE
 	// paused still records exceeded (P2f spec 14) without re-firing the
 	// onExceeded action.
+	// The budget step mutates loop.Status.Budget (the in-memory object) but
+	// does not set the changed flag (it returns (time.Duration, error)).
+	// Snapshot the budget BEFORE the step (a COPY of the struct, not a
+	// pointer — the DeepEqual must compare the pointed-to structs, not the
+	// pointer values) and compare after: if the budget was mutated, set
+	// changed so the finalizeLoopStatus writes the status.
+	var budgetBefore *coxv1alpha1.BudgetStatus
+	if loop.Status.Budget != nil {
+		b := *loop.Status.Budget
+		budgetBefore = &b
+	}
 	budgetRequeue, err := r.applyBudget(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if !equality.Semantic.DeepEqual(budgetBefore, loop.Status.Budget) {
+		changed = true
 	}
 
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
@@ -617,7 +638,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// not yet hit, a Loop with no other activity (no baseCommit/claim/verify/
 	// deliver requeue) re-reconciles at the remaining time so the wall clock
 	// still trips. The pending flags are 5s timers; the wall clock is exact.
-	if baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue {
+	if !r.baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if budgetRequeue > 0 {

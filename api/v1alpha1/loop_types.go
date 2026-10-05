@@ -307,8 +307,10 @@ type BudgetConfig struct {
 	// string (e.g. "1h30m"). It does not count time spent Paused (the
 	// budget clock stops while the Loop is paused; see P2d's
 	// status.budget.activeSeconds accumulation). nil means no wall-clock
-	// cap.
-	// +kubebuilder:validation:Pattern=`^[0-9]+(ns|us|µs|ms|s|m|h)(,[0-9]+(ns|us|µs|ms|s|m|h))*$`
+	// cap. The pattern admits only Go duration parts (no commas, no signs,
+	// no bare numbers — the operator seam's ParseMaxWallClock is the final
+	// gate and rejects sub-second caps).
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
 	// +optional
 	MaxWallClock string `json:"maxWallClock,omitempty"`
 

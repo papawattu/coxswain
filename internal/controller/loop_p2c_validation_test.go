@@ -55,6 +55,9 @@ const (
 	p2cBadStallName = "p2c-badstallafter"
 	p2cBadCostName  = "p2c-badcost"
 	p2cBadPriceName = "p2c-badprice"
+	p2cWCCommaName  = "p2c-wccomma"
+	p2cWCNegName    = "p2c-wcneg"
+	p2cWCBareName   = "p2c-wcbare"
 )
 
 var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
@@ -183,6 +186,50 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 		Expect(unstructured.SetNestedField(u2.Object, "1.2.3", "spec", "budget", "modelPrices", "promptUsdPerMtok")).To(Succeed())
 		err = k8sClient.Create(ctx, u2)
 		Expect(err).To(HaveOccurred(), "a malformed promptUsdPerMtok must be rejected by the decimal-string pattern")
+	})
+
+	// maxWallClock is a Go duration string: the CRD pattern must admit the
+	// comma-less multi-part forms (1h30m, 2h45m10s) and reject the comma
+	// form (1h,30m — time.ParseDuration rejects it), signed values and bare
+	// numbers. Every admitted example must also parse at the operator seam.
+	It("5: maxWallClock — Go duration forms admitted, comma/signed/bare rejected", func() {
+		admitted := []string{"1h30m", "2h45m10s", "90s", "1.5h"}
+		It("accepts every Go duration form", func() {
+			for _, d := range admitted {
+				ns := newNamespace()
+				defer func(ns string) {
+					_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+				}(ns)
+				name := "p2cwc" + d[:2]
+				u := baseLoop(name, ns)
+				Expect(unstructured.SetNestedField(u.Object, d, "spec", "budget", "maxWallClock")).To(Succeed())
+				Expect(k8sClient.Create(ctx, u)).To(Succeed(),
+					"maxWallClock %q is a valid Go duration and must be admitted", d)
+
+				// The operator seam must parse it without error.
+				_, err := coxv1alpha1.ParseMaxWallClock(d)
+				Expect(err).ToNot(HaveOccurred(), "ParseMaxWallClock must accept %q", d)
+			}
+		})
+
+		rejected := map[string]string{
+			p2cWCCommaName: "1h,30m",
+			p2cWCNegName:   "-5m",
+			p2cWCBareName:  "10",
+		}
+		for name, d := range rejected {
+			It("rejects "+d, func() {
+				ns := newNamespace()
+				defer func() {
+					_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+				}()
+				u := baseLoop(name, ns)
+				Expect(unstructured.SetNestedField(u.Object, d, "spec", "budget", "maxWallClock")).To(Succeed())
+				err := k8sClient.Create(ctx, u)
+				Expect(err).To(HaveOccurred(),
+					"maxWallClock %q must be rejected (the Go duration pattern admits no commas, signs or bare numbers)", d)
+			})
+		}
 	})
 
 	It("5: no budget/stall fields — an existing Loop reconciles exactly as before", func() {

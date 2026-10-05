@@ -811,3 +811,22 @@ var _ = Describe("D41c: tool union helpers", func() {
 		Expect(len(name)).To(BeNumerically("<=", 63))
 	})
 })
+
+var _ = Describe("D41 tool proxy image", func() {
+	It("defaults to the Go dev stand-in when ToolProxyImage is unset", func() {
+		// Same pattern as proxyImage / egressProxyImage: a dev stand-in when
+		// unset; a real tool proxy image (rule engine, credential injection,
+		// audit) is settable via the reconciler's ToolProxyImage field / the
+		// manager's --tool-proxy-image flag (D41c).
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(r.toolProxyImage()).To(Equal("coxswain-tool-proxy:standin"))
+	})
+
+	It("honours the ToolProxyImage override", func() {
+		// A DISTINCT value from the default (coxswain-tool-proxy:standin) so
+		// the spec actually proves the override is honoured (not just that the
+		// default is returned regardless of the field).
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), ToolProxyImage: "example.invalid/tool-proxy:override"}
+		Expect(r.toolProxyImage()).To(Equal("example.invalid/tool-proxy:override"))
+	})
+})

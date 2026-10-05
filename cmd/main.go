@@ -142,6 +142,16 @@ func main() {
 		"The image the verify Job's check-* acceptance-check containers run when a Loop does not set spec.verify.image. "+
 			"Must carry a POSIX shell. Default: docker.io/library/golang:1.26 (the acceptance checks may be Go commands, "+
 			"and the trusted git image has no Go toolchain).")
+	// D41c (ADR-0008): the image the per-tool tool proxy pods run. The
+	// reconciler default is a Go dev stand-in; an e2e or operator that wants
+	// the real cmd/tool-proxy binary (the rule engine, credential injection,
+	// audit) sets this (e.g. the D41e kind e2e kind-loads
+	// coxswain-tool-proxy:standin and passes it here).
+	var toolProxyImage string
+	flag.StringVar(&toolProxyImage, "tool-proxy-image", "",
+		"The image the tool proxy pods run (one per tool per Loop, D41c/ADR-0008). "+
+			"Default: empty (the reconciler's coxswain-tool-proxy:standin dev stand-in; a real tool proxy image "+
+			"may be kind-loaded / pre-pulled and passed here).")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -312,6 +322,7 @@ func main() {
 		WorkspaceGitImage:      workspaceGitImage,
 		RunnerImage:            runnerImage,
 		VerifyImage:            verifyImage,
+		ToolProxyImage:         toolProxyImage,
 		// D38: the NetworkEnforced condition-change Event (the manager's
 		// recorder posts it as a Kubernetes Event; the re-gate Event lives
 		// in the probe Runnable).

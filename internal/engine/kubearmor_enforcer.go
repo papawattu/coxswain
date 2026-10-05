@@ -89,7 +89,14 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	if len(p.Network) > 0 {
 		egressFQDN = e.EgressProxyFQDN(loop.Name, loop.Namespace)
 	}
-	obj := EmitKubeArmorPolicy(loop.Name, loop.Namespace, policy.Translate(p, e.ProxyFQDN(loop.Name, loop.Namespace), egressFQDN))
+	// D41d: the agent reaches each tool proxy via its Service FQDN; the
+	// per-tool FQDNs are added to the agent's DNS allowlist so the resolver
+	// (the pod-level policy's spec.action Block) does not block the queries.
+	var toolFQDNs []string
+	for _, t := range p.Tools {
+		toolFQDNs = append(toolFQDNs, e.ToolProxyFQDN(loop.Name, loop.Namespace, t.Name))
+	}
+	obj := EmitKubeArmorPolicyWithToolFQDNs(loop.Name, loop.Namespace, policy.Translate(p, e.ProxyFQDN(loop.Name, loop.Namespace), egressFQDN), toolFQDNs)
 	if err := e.createOrUpdateKapt(ctx, loop, obj); err != nil {
 		return err
 	}

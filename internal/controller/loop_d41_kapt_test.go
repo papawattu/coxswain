@@ -141,6 +141,35 @@ var _ = Describe("D41d: tool proxy KubeArmorPolicies (enforcer)", func() {
 		Expect(ownerRefs[0].Kind).To(Equal(loopKind))
 	})
 
+	// (A): the APPLIED agent KubeArmorPolicy (read back from the API server)
+	// carries the per-tool proxy Service FQDN in its network DNS allowlist,
+	// so the agent can resolve <loop>-tool-<name>.<ns>.svc and reach the tool
+	// proxy (D41d: EmitKubeArmorPolicyWithToolFQDNs wired into the enforcer's
+	// agent-policy path). This FAILS if the enforcer calls EmitKubeArmorPolicy
+	// (without tool FQDNs) instead of EmitKubeArmorPolicyWithToolFQDNs — the
+	// reviewer's mutation of removing the wiring drops the FQDN from the
+	// applied object.
+	It("(A) the applied agent KubeArmorPolicy carries the tool proxy Service FQDN in its DNS allowlist", func() {
+		ns := setupNS("agent-fqdn")
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: d41kaptPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{d41cToolGH(d41kaptUpstreamA)}},
+		})).To(Succeed())
+
+		loop := buildLoop(d41kaptLoopCreated, ns, []string{d41kaptPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcileLoop(d41kaptLoopCreated, ns)
+
+		// Read back the AGENT KubeArmorPolicy (coxswain-<loop>) from the API
+		// server and assert the tool proxy Service FQDN is in its network DNS
+		// allowlist.
+		agentKapt := getKapt(ctx, ns, "coxswain-"+d41kaptLoopCreated)
+		toolFQDN := ToolProxyServiceFQDN(d41kaptLoopCreated, ns, d41kaptToolName)
+		domains := kaptDNSDomains(agentKapt)
+		Expect(domains).To(ContainElement(toolFQDN),
+			"the applied agent KubeArmorPolicy must carry the tool proxy Service FQDN %q (domains: %v)", toolFQDN, domains)
+	})
+
 	// (b): a FOREIGN KubeArmorPolicy occupying the tool proxy's name is NEVER
 	// overwritten (I2 never-take-over). The KubeArmorPolicyConflict condition is
 	// set and the sandbox is held Suspended (the order-independent gate reads

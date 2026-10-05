@@ -135,8 +135,13 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	newBody, isObject := shapeRequest(body)
 	// The request body is identity-encoded; the caller's transport has
-	// DisableCompression, so there is no Accept-Encoding negotiation.
+	// DisableCompression, so there is no Accept-Encoding negotiation. The
+	// body is rewritten (include_usage for streams); the ContentLength MUST
+	// match the new body (Go's http.Transport checks ContentLength against
+	// the actual body and fails with "ContentLength=X with Body length Y"
+	// otherwise — the 502).
 	r.Body = io.NopCloser(bytes.NewReader(newBody))
+	r.ContentLength = int64(len(newBody))
 	// Strip the agent's Accept-Encoding (steering-proof).
 	r.Header.Del("Accept-Encoding")
 	// Mark the request as streaming (the round-tripper reads this from the

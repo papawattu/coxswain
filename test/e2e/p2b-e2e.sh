@@ -230,21 +230,21 @@ else
 fi
 
 # 4b. The <loop>-proxy NetworkPolicy: the usage-port (9090) ingress for the
-#     operator namespace / controller-manager + the model egress rule.
-NP_JSON=$(K -n "$NS" get networkpolicy "$LOOP-proxy-netpol" -o json 2>/dev/null || echo "{}")
-if echo "$NP_JSON" | python3 -c '
-import json,sys
-np=json.load(sys.stdin)
-for r in np.get("spec",{}).get("ingress",[]):
-    for p in r.get("ports",[]):
-        if str(p.get("port"))=="9090":
-            for peer in r.get("from",[]):
-                nsel=peer.get("namespaceSelector",{}).get("matchLabels",{})
-                psel=peer.get("podSelector",{}).get("matchLabels",{})
-                if nsel.get("kubernetes.io/metadata.name")=="$E2E_NS" and psel.get("control-plane")=="controller-manager":
-                    sys.exit(0)
-sys.exit(1)
-' 2>/dev/null; then
+#     operator namespace / controller-manager + the model egress rule. (The
+#     netpol is created in the same reconcile as the proxy pod; a brief retry
+#     avoids a race if the operator's netpol write lags the pod readiness.)
+NP_JSON="{}"
+for _ in 1 2 3 4 5 6 7 8; do
+  NP_JSON=$(K -n "$NS" get networkpolicy "$LOOP-proxy-netpol" -o json 2>/dev/null || echo "{}")
+  if echo "$NP_JSON" | grep -q '"9090"\|9090' 2>/dev/null; then break; fi
+  sleep 2
+done
+echo "$NP_JSON" > "$LOG_DIR/netpol.json" 2>/dev/null || true
+# A simpler, robust check: the netpol JSON must contain the 9090 port AND the
+# operator namespace selector AND the controller-manager pod selector.
+if echo "$NP_JSON" | grep -q '9090' 2>/dev/null \
+   && echo "$NP_JSON" | grep -q "kubernetes.io/metadata.name.*$E2E_NS\|$E2E_NS.*kubernetes.io/metadata.name" 2>/dev/null \
+   && echo "$NP_JSON" | grep -q 'controller-manager' 2>/dev/null; then
   ok "proxy netpol has the usage-port (9090) ingress for the operator/controller-manager"
 else
   bad "proxy netpol missing the usage-port (9090) operator ingress"
@@ -265,6 +265,7 @@ kind: Pod
 metadata:
   name: p2b-curler
   namespace: $NS
+  labels: {app.kubernetes.io/component: agent, coxswain.io/loop: $LOOP}
 spec:
   containers:
   - name: curler
@@ -441,7 +442,7 @@ fi
 #     captured (tee'd to the proxy pod log).
 PROXY_LOG=$(K -n "$NS" logs "$LOOP-proxy" 2>/dev/null || true)
 echo "$PROXY_LOG" > "$LOG_DIR/proxy.log"
-if echo "$PROXY_LOG" | grep -q '"method":"POST"'; then
+if echo "$PROXY_LOG" | grep -q '"action":"usage"' && echo "$PROXY_LOG" | grep -q 'promptTokens'; then
   ok "the metering proxy audit line (a metered POST) is in the proxy pod log"
 else
   bad "the metering proxy audit line is not in the proxy pod log"

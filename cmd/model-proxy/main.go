@@ -32,7 +32,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -40,6 +39,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"syscall"
@@ -79,18 +79,36 @@ func main() {
 	var credential string
 	var credErr error
 	if modelCredFile != "" {
-		// The operator sets MODEL_CRED_FILE to the exact key file in the mounted
+		// The operator sets MODEL_CRED_FILE to the key file in the mounted
 		// model-creds Secret (e.g. /model-creds/.data/model-key — the Kubernetes
-		// atomic Secret-mount dir). Read that file directly; the credential is
-		// never part of any other path. This honours the operator's proxy-creds
-		// contract (the stand-in instead scanned /model-creds for any regular
-		// file; the metering proxy reads the named key).
+		// atomic Secret-mount dir, per the D33 convention). Depending on the
+		// kubelet/containerd version, the Secret is mounted as a plain dir with
+		// the keys at /model-creds/<key> (the ..data symlink is the atomic-mount
+		// mechanism, sometimes materialized, sometimes not). Resolve the key
+		// flexibly: the exact path first, then the key name in the Secret mount
+		// dir. The credential is never part of any other path.
 		credBytes, err := os.ReadFile(modelCredFile)
 		if err != nil {
-			credErr = err
-		} else {
+			// Fallback: the key name in the Secret mount dir (the ..data dir is
+			// the atomic mount; the key sits next to it, or in it, per the
+			// kubelet version).
+			key := path.Base(modelCredFile)
+			for _, candidate := range []string{
+				path.Join(path.Dir(modelCredFile), "..", key), // the ..data sibling
+				"/model-creds/" + key,                         // the plain Secret mount
+				path.Dir(modelCredFile) + "/" + key,           // the ..data dir itself
+			} {
+				if b, e := os.ReadFile(candidate); e == nil && len(b) > 0 {
+					credBytes, err = b, nil
+					break
+				}
+			}
+		}
+		if err == nil && len(credBytes) > 0 {
 			credential = strings.TrimRight(string(credBytes), "\n")
-			if credential == "" {
+		} else {
+			credErr = err
+			if credential == "" && err == nil {
 				credErr = errString("model-creds key file is empty")
 			}
 		}
@@ -115,7 +133,10 @@ func main() {
 	}
 
 	// --- the audit channel (stdout; observability only) ---
-	auditWriter := bufio.NewWriter(os.Stdout)
+	// os.Stdout directly (unbuffered): a bufio.NewWriter(os.Stdout) that is
+	// never flushed loses the audit lines (the proxy pod's log would show only
+	// the log.Printf startup lines, not the audit JSON). The audit line is
+	// written per-request by the metering RoundTripper (proxy.go: audit).
 
 	// --- the metering proxy (the agent's 8080 listener) ---
 	cfg := proxy.Config{
@@ -125,7 +146,7 @@ func main() {
 		Namespace:  os.Getenv("LOOP_NAMESPACE"),
 		Credential: credential,
 		Meter:      meter,
-		Audit:      auditWriter,
+		Audit:      os.Stdout, // unbuffered (a bufio.NewWriter never flushed loses the audit lines)
 		Since:      since,
 	}
 	proxyInst, err := proxy.NewMetered(cfg)

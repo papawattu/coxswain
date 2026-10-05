@@ -531,9 +531,10 @@ func isOwnedByLoop(obj metav1.Object, loopName string) bool {
 }
 
 var _ = Describe("D33 proxy image", func() {
-	It("defaults to the working stand-in when ProxyImage is unset", func() {
+	It("defaults to the metering model proxy when ProxyImage is unset (P2b, ADR-0009)", func() {
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		Expect(r.proxyImage()).To(Equal("coxswain-proxy:standin"))
+		Expect(r.proxyImage()).To(Equal("coxswain-proxy:metering"),
+			"P2b: the proxy image default flips from the stand-in to the metering model proxy")
 	})
 
 	It("honours the ProxyImage override", func() {

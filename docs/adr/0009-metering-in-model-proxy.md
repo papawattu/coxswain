@@ -1,7 +1,10 @@
 # ADR-0009: Metering in the model proxy — report-only, operator-read
 
-**Status:** Proposed (records the Phase 2 plan's P2a design point,
-`docs/TDD-PLAN-PHASE2.md`; to be reviewed before any P2b code)
+**Status:** Accepted (P2b — the metering model proxy is implemented: the
+`cmd/model-proxy` binary + the operator wiring (the proxy pod's usage env,
+emptyDir, metering image, the `<loop>-proxy` usage-port netpol ingress, the
+`readProxyUsage` seam). The operator's usage CONSUMPTION (the P3 gate
+consumption) is the remaining follow-on, not the metering itself.)
 **Date:** 2026-10-04
 **Supersedes:** —
 **Extends:** ADR-0006 (the zero-credential rule), ADR-0007 (two-layer

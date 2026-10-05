@@ -293,7 +293,7 @@ func modelProxyKaptSelector(loopName string) map[string]any {
 // coxswain.io/loop (D41d: the same disjoint-label guard as the other proxies).
 func toolProxyKaptSelector(loopName, toolName string) map[string]any {
 	return map[string]any{
-		policy.ComponentLabelKey:       policy.ComponentToolProxyLabel,
+		policy.ComponentLabelKey:     policy.ComponentToolProxyLabel,
 		"coxswain.io/tool-proxy-for": loopName,
 		"coxswain.io/tool":           toolName,
 	}

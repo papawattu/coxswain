@@ -35,15 +35,22 @@ import (
 // now the package constants in kubearmor.go: the two emitters and the
 // unstructured-map shape share one source of truth).
 
-// egressProxyBinaryPath is the egress proxy binary's absolute path in its
-// image (cmd/egress-proxy/Dockerfile: COPY to /usr/local/bin/egress-proxy,
-// ENTRYPOINT the same). The process fence allows ONLY this path.
-const egressProxyBinaryPath = "/usr/local/bin/egress-proxy"
+const (
+	// egressProxyBinaryPath is the egress proxy binary's absolute path in its
+	// image (cmd/egress-proxy/Dockerfile: COPY to /usr/local/bin/egress-proxy,
+	// ENTRYPOINT the same). The process fence allows ONLY this path.
+	egressProxyBinaryPath = "/usr/local/bin/egress-proxy"
 
-// modelProxyBinaryPath is the model proxy binary's absolute path in its image
-// (cmd/proxy-standin/Dockerfile: COPY to /usr/local/bin/proxy). The process
-// fence allows ONLY this path.
-const modelProxyBinaryPath = "/usr/local/bin/proxy"
+	// modelProxyBinaryPath is the model proxy binary's absolute path in its image
+	// (cmd/proxy-standin/Dockerfile: COPY to /usr/local/bin/proxy). The process
+	// fence allows ONLY this path.
+	modelProxyBinaryPath = "/usr/local/bin/proxy"
+
+	// toolProxyBinaryPath is the tool proxy binary's absolute path in its image
+	// (cmd/tool-proxy: the generic HTTP tool proxy, D41a). The process fence
+	// allows ONLY this path (D41d).
+	toolProxyBinaryPath = "/usr/local/bin/tool-proxy"
+)
 
 // EmitEgressProxyKubeArmorPolicy emits the KubeArmorPolicy for a Loop's egress
 // proxy pod. The selector is the egress proxy's DISJOINT label set (component
@@ -208,6 +215,56 @@ func modelEndpointHost(endpoint string) (string, string) {
 	return splitHostPort(e)
 }
 
+// toolProxyUpstreamHost extracts the host a tool upstream resolves to (for the
+// tool proxy's DNS allowlist, D41d): "host" from scheme://host[:port][/prefix]
+// (the upstream is always a URL per the ToolSpec CEL rule). KubeArmor matches
+// by DNS query name, not port — the port is dropped here (the tool proxy
+// dials it at the application layer).
+func toolProxyUpstreamHost(upstream string) string {
+	host, _ := modelEndpointHost(upstream)
+	return host
+}
+
+// EmitToolProxyKubeArmorPolicy emits the KubeArmorPolicy for a Loop's tool
+// proxy pod (D41d: the per-tool inner fence, the I42f shape). The selector is
+// the tool proxy's DISJOINT label set (component = tool-proxy +
+// coxswain.io/tool-proxy-for + coxswain.io/tool, via toolProxyKaptSelector —
+// never coxswain.io/loop, the agent policy's selector key). The process block
+// allows only the tool proxy's own binary (a process that compromised it
+// cannot exec anything else); the network block is the tool proxy's exact
+// egress — the upstream host in matchDNSQueries + the platform DNS allow
+// (udp+tcp so the proxy can resolve the upstream under spec.action Block) —
+// everything else denied by the spec-level Block (the I42f default-deny
+// posture).
+func EmitToolProxyKubeArmorPolicy(loopName, namespace, toolName, upstream string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		kaptAPIVersionKey: kaptGroup + "/" + kaptVersion,
+		kaptKindKey:       kaptKind,
+		kaptMetadataKey: map[string]any{
+			kaptNameKey:      "coxswain-" + loopName + "-tool-" + toolName,
+			kaptNamespaceKey: namespace,
+		},
+		KaptSpecKey: map[string]any{
+			kaptActionKey: kaptActionValue,
+			KaptSelectorKey: map[string]any{
+				KaptMatchLabelsKey: toolProxyKaptSelector(loopName, toolName),
+			},
+			KaptProcessKey: map[string]any{
+				kaptActionKey:     kaptAllowAction,
+				KaptMatchPathsKey: toPathItems([]string{toolProxyBinaryPath}),
+			},
+			"network": map[string]any{
+				kaptActionKey:   kaptAllowAction,
+				KaptMatchDNSKey: toDomainItems(dedupe([]string{toolProxyUpstreamHost(upstream)})),
+				// udp+tcp: the platform DNS allow (review P1: a tcp-only
+				// matchProtocols with spec.action Block denies the proxy's own
+				// DNS lookups). The tool proxy dials the upstream over TCP.
+				KaptMatchProtoKey: toProtocolItems(appendDeduped([]string{"tcp"}, dnsAllowProtocols()...)),
+			},
+		},
+	}}
+}
+
 // egressProxyKaptSelector returns the label selector for a Loop's egress
 // proxy pod: the proxy's disjoint label set (via the policy package's label
 // constants — component = egress-proxy + coxswain.io/egress-proxy-for).
@@ -227,5 +284,17 @@ func modelProxyKaptSelector(loopName string) map[string]any {
 	return map[string]any{
 		policy.ComponentLabelKey: policy.ComponentProxyLabel,
 		"coxswain.io/proxy-for":  loopName,
+	}
+}
+
+// toolProxyKaptSelector returns the label selector for a Loop's tool proxy pod
+// (via toolProxyLabels in internal/controller: component = tool-proxy +
+// coxswain.io/tool-proxy-for + coxswain.io/tool). The selector NEVER carries
+// coxswain.io/loop (D41d: the same disjoint-label guard as the other proxies).
+func toolProxyKaptSelector(loopName, toolName string) map[string]any {
+	return map[string]any{
+		policy.ComponentLabelKey:       policy.ComponentToolProxyLabel,
+		"coxswain.io/tool-proxy-for": loopName,
+		"coxswain.io/tool":           toolName,
 	}
 }

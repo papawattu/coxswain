@@ -65,7 +65,8 @@ func TestClusterDomainFlowsThroughProxyURLs(t *testing.T) {
 	}
 
 	// egressNOProxy: the model proxy Service's FQDN form carries the domain.
-	noProxy := r.egressNOProxy(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: loop, Namespace: ns}})
+	ctx := context.Background()
+	noProxy := r.egressNOProxy(ctx, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: loop, Namespace: ns}})
 	if !strings.Contains(noProxy, loop+"-proxy."+ns+".svc."+i44AltDomain) {
 		t.Fatalf("egressNOProxy must carry the model proxy FQDN form with the non-default domain (%s), got %q", i44AltDomain, noProxy)
 	}

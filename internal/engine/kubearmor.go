@@ -68,6 +68,47 @@ const (
 // UNION of the agent and proxy allows. The agent=localhost / proxy=model-endpoint
 // split is enforced elsewhere (see D29 / C3).
 func EmitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *unstructured.Unstructured {
+	return emitKubeArmorPolicy(loopName, namespace, ep)
+}
+
+// EmitKubeArmorPolicyWithToolFQDNs is EmitKubeArmorPolicy with the per-tool
+// proxy Service FQDNs added to the agent's network allows before translation
+// (D41d: the agent reaches each tool proxy via its Service FQDN, which the
+// resolver queries under the pod-level policy's spec.action Block). toolFQDNs
+// are the FQDNs <loop>-tool-<name>.<ns>.svc (built by the controller from
+// toolProxyServiceName — the enforcer never builds them from a literal, R16
+// I44 item 1); they are wired at enforcer construction like ProxyFQDN /
+// EgressProxyFQDN. An empty set emits the same policy as EmitKubeArmorPolicy.
+func EmitKubeArmorPolicyWithToolFQDNs(loopName, namespace string, ep policy.EnginePolicy, toolFQDNs []string) *unstructured.Unstructured {
+	if len(toolFQDNs) == 0 {
+		return EmitKubeArmorPolicy(loopName, namespace, ep)
+	}
+	for i := range ep.Containers {
+		cp := &ep.Containers[i]
+		if cp.Container != policy.ContainerAgent {
+			continue
+		}
+		cp.Allows = append(cp.Allows, toolNetworkAllows(toolFQDNs)...)
+	}
+	return emitKubeArmorPolicy(loopName, namespace, ep)
+}
+
+// toolNetworkAllows is the network allows the tool proxy Service FQDNs add to
+// the agent container: one network allow per FQDN. (The FQDNs are appended to
+// the agent container's allows only — the proxy container's model-endpoint
+// allow is untouched.)
+func toolNetworkAllows(toolFQDNs []string) []policy.Allow {
+	allows := make([]policy.Allow, 0, len(toolFQDNs))
+	for _, f := range toolFQDNs {
+		allows = append(allows, policy.Allow{Type: policy.AllowNetwork, Match: f})
+	}
+	return allows
+}
+
+// emitKubeArmorPolicy is the shared body of EmitKubeArmorPolicy /
+// EmitKubeArmorPolicyWithToolFQDNs (the translation from an EnginePolicy to a
+// fully-shaped unstructured KubeArmorPolicy object).
+func emitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *unstructured.Unstructured {
 	name := "coxswain-" + loopName
 
 	// Union the allows across containers (pod-level policy).

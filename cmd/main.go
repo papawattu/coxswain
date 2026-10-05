@@ -271,6 +271,7 @@ func main() {
 		Client:          mgr.GetClient(),
 		ProxyFQDN:       controller.ProxyServiceFQDN,
 		EgressProxyFQDN: controller.EgressProxyServiceFQDN,
+		ToolProxyFQDN:   controller.ToolProxyServiceFQDN,
 		ClusterDomain:   clusterDomain,
 		// A missing KubeArmor CRD is a loud error in production; tolerated
 		// (no-op) only under the --allow-unenforced dev escape hatch (D38).

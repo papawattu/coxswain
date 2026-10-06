@@ -98,7 +98,15 @@ LOG_PATH = os.environ.get("STUB_LOG", "/tmp/stub-requests.jsonl")
 # sleep on the first model call, Implementing lasts >= 30s and the flip
 # (polled every 2s) lands inside it deterministically.
 SLOW_MODEL = "p2h-stub-slow"
-SLOW_DELAY_S = float(os.environ.get("SLOW_DELAY_S", "30"))
+# 90s (the A4 race fix, run-20261006211120): the resume Loop's suspend flip
+# must land INSIDE an Implementing. The script polls the phase every 2s, so
+# the Implementing window needs headroom far beyond the single model call:
+# at 30s the flip window (the 2s poll + the pause landing) raced the
+# Implementing->Verifying transition twice (run-20261006200606:
+# pausedFrom=Verifying, iteration advanced; run-20261006211120:
+# pausedFrom=Verifying again). 90s gives 3x headroom; the pinned stub
+# behaviour (sleep BEFORE answering, usage unchanged) is preserved.
+SLOW_DELAY_S = float(os.environ.get("SLOW_DELAY_S", "90"))
 
 # The fixed implement-instruction (item 14). Appends ONE newline to
 # README.md (a non-protected path — the "go" preset protects **/*_test.go,

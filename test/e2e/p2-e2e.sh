@@ -1376,20 +1376,10 @@ for i in $(seq 1 10); do
   [ "$(lfield ${p2h_budgetpause3} '.status.pausedReason')/$(lfield ${p2h_budgetpause3} '.status.budget.exceeded')" = "Budget/true" ] && break
   sleep 2
 done
-# 1) Raise the cap (NO annotation). The cap is raised to the BOUNDARY (400,
-#    the current total — the token cap's boundary rule is >=: a cap hit AT the
-#    value fires, so 400/400 still fires the pause). The raise is the G3-
-#    distinguishable part: under the mutation the suspend flip alone would
-#    resume it (the pausedReason check is dropped), but the raise to the
-#    boundary is what lets the annotation-resume path clear the exceedance
-#    (the item-5 re-evaluation: exceededCapName is strictly >, so 400 < 400
-#    is false -> the exceedance is cleared -> the refuse-while-exceeded guard
-#    does not refuse the annotation resume). A LARGER raise (e.g. 8000) would
-#    ALSO clear the exceedance, but the boundary is the exact value the
-#    boundary rule pins (the P2d token cap's >= fires AT the value; the
-#    resume re-evaluation's > clears STRICTLY under it, so 400 is the cap that
-#    both fires the pause AND clears on re-evaluation).
-K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"budget":{"maxTokens":400}}}' --type=merge >/dev/null 2>&1 || die "cap-raise patch (sub-case c) failed"
+# 1) Raise the cap (NO annotation). The cap is no longer exceeded — the only
+#    thing that must keep it Paused is the operator's rule that a Budget
+#    pause resumes ONLY via the annotation (a Suspend flip may not).
+K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"budget":{"maxTokens":8000}}}' --type=merge >/dev/null 2>&1 || die "cap-raise patch (sub-case c) failed"
 # 2) Flip suspend true -> false (NO annotation): the G3 mutation makes this a
 #    resume trigger; the real operator must ignore it for a Budget pause.
 K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"suspend":true}}' --type=merge >/dev/null 2>&1 || die "suspend=true patch (sub-case c) failed"

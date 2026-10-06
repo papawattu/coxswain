@@ -6,11 +6,11 @@
 # serves the reference runner. Its behaviour is PINNED by the P2h plan:
 #
 #   1. Every completion response contains a fixed IMPLEMENT-INSTRUCTION the
-#      reference runner's shell tool executes — a one-liner that commits a
-#      one-character change to a NON-PROTECTED file (append a newline to
-#      README.md) every time, so every Implementing iteration produces a NEW
-#      commit (the verify Job re-runs, the iteration advances). A stub that
-#      writes no code may never produce a new commit (item 14).
+#      reference runner's shell tool executes — a one-liner that appends a
+#      newline to a NON-PROTECTED file (README.md), so every Implementing
+#      iteration produces a NEW commit (the verify Job re-runs, the
+#      iteration advances). A stub that writes no code may never produce a
+#      new commit (item 14).
 #
 #   2. Every response carries a FIXED usage {prompt_tokens: 100,
 #      completion_tokens: 100} = 200 tokens per request (item I's arithmetic
@@ -26,17 +26,40 @@
 #
 #   5. The stub BOUNDS the request count itself (the P2h plan does NOT pin a
 #      runner -max-steps cap — the runner runs with the operator's default
-#      25): the stub answers the FIRST model call of a phase run (the
-#      messages-list length 1 = the seed only) with the fixed shell tool
-#      call and EVERY LATER request (length >= 2) with a plain "done" answer
+#      25): the stub answers a request whose LAST message is NOT a tool
+#      result with the fixed shell tool call, and a request whose LAST
+#      message IS a tool result (role "tool") with a plain "done" answer
 #      (no tool call), so the runner's model loop ends by itself after the
 #      tool call — exactly 2 model requests per phase run (the tool call +
 #      the "done"), and the token math (200/request) holds without an
-#      operator cap. The runner's loop (runner.go run): the first model call
-#      returns the tool call (the loop executes the shell tool and re-calls
-#      the model); the second returns the plain answer (the loop exits with
-#      the "done" content). No max-steps pressure: the runner exits the loop
-#      on the no-tool-call answer, never reaching the 25-step cap.
+#      operator cap.
+#
+#      The decision keys on the LAST message's role, NOT the messages-list
+#      length. The reference runner ALWAYS sends at least a system prompt +
+#      the user seed (its first Implementing call is length 2: system +
+#      user), so a length-based pin (the original fixture assumed a
+#      length-1 seed-only first call and sent the tool call only when
+#      len(messages) == 1) never fired in-kind: every Implementing run got
+#      the plain "done" answer on its first call, the shell tool never ran,
+#      README.md never changed, and the verify Job kept cloning the
+#      unchanging base commit (the P2h kind-run stall). Keying on the last
+#      message makes the pin independent of the runner's message framing:
+#      a fresh phase run's first call ends with the user seed -> the tool
+#      call; the re-call after the tool ran ends with the tool result ->
+#      "done". A blocked run's re-call (the tool result is a non-zero
+#      failure) still ends with a tool result -> "done" (the run is blocked
+#      and the operator requeues, as intended).
+#
+#      The command itself is a bare `echo >> README.md`: the runner's shell
+#      tool runs with cmd.Dir = the workspace (runner.go execShell) and the
+#      runner commits the work itself at the end of a successful
+#      Implementing (commitWorkspace, phase.go — it stages only
+#      non-protected SOURCE paths, never the operator-owned .coxswain dir).
+#      No cd (COX_WORKSPACE is NOT an agent env — a `cd "$COX_WORKSPACE"`
+#      under set -e aborts on the empty word before the echo), no git
+#      add/commit (the runner's commitWorkspace owns the commit; a
+#      tool-side `git add -A` would stage the operator-owned .coxswain dir
+#      into the verified commit).
 #
 #   6. GET /ok answers 200 (liveness; the script polls it).
 #
@@ -63,19 +86,18 @@ PORT = int(os.environ.get("PORT", "8444"))
 # this file).
 LOG_PATH = os.environ.get("STUB_LOG", "/tmp/stub-requests.jsonl")
 
-# The fixed implement-instruction (item 14): the runner's shell tool executes
-# it. Appends ONE newline to README.md (a non-protected path — the "go"
-# preset protects **/*_test.go, **/testdata/**, go.mod, go.sum; README.md is
-# none of those), so EVERY Implementing run produces a NEW commit and the
-# verify Job re-runs. The command is a bare `echo >> README.md`: the runner's
-# shell tool already runs with the workspace as its working directory
-# (runner.go execShell sets cmd.Dir = workspace) and the runner commits the
-# work itself at the end of a successful Implementing (commitWorkspace,
-# phase.go — it stages only non-protected SOURCE paths, never .coxswain).
-# No cd (COX_WORKSPACE is NOT an agent env — a `cd "$COX_WORKSPACE"` under
-# `set -e` aborts on the empty word before the echo), no git add/commit
-# (the runner's commitWorkspace owns the commit; a tool-side `git add -A`
-# would stage the operator-owned .coxswain dir into the verified commit).
+# The fixed implement-instruction (item 14). Appends ONE newline to
+# README.md (a non-protected path — the "go" preset protects **/*_test.go,
+# **/testdata/**, go.mod, go.sum; README.md is none of those). It is a bare
+# `echo >> README.md`: the runner's shell tool runs it with the workspace as
+# its working directory (runner.go execShell sets cmd.Dir = workspace) and
+# the runner commits the work itself at the end of a successful Implementing
+# (commitWorkspace, phase.go — it stages only non-protected SOURCE paths,
+# never the operator-owned .coxswain dir). No cd (COX_WORKSPACE is NOT an
+# agent env — a `cd "$COX_WORKSPACE"` under set -e aborts on the empty word
+# before the echo), no git add/commit (the runner's commitWorkspace owns the
+# commit; a tool-side `git add -A` would stage the operator-owned .coxswain
+# dir into the verified commit).
 IMPLEMENT_CMD = "echo >> README.md"
 
 # The assistant turn with the fixed tool call (the OpenAI/vLLM wire shape the
@@ -92,49 +114,28 @@ DONE_CONTENT = (
 )
 
 
-def count_messages(req):
-    # The stub's request log (item 14) counts by the messages-list length.
-    # The FIRST model call of a fresh run has ONLY the seed message
-    # (length 1); the second has seed + assistant + tool result (length 3).
-    # The in-kind per-phase pod starts a fresh conversation, so the
-    # phase's first call is length 1 (the tool call) and the second is
-    # length 3 (the plain answer). A LATER request (length >= 4, the
-    # re-run of the phase within the same pod — rare; the operator
-    # re-creates the pod per phase run, so this is a defensive case) is
-    # the plain answer (the loop has already exited; a tool call here
-    # would be a second commit, which the plan does not require).
-    return len(req.get("messages", []))
+def choice_kind(req):
+    # The stub's pinned choice (item 5): a request whose LAST message is a
+    # tool result (role "tool" — the re-call after the runner executed the
+    # shell tool) -> the plain "done" answer (no tool call, the loop exits).
+    # ANY other last message (a fresh phase run's first call ends with the
+    # user seed) -> the fixed shell tool call. Keying on the LAST message's
+    # role — NOT the messages-list length — makes the pin independent of the
+    # runner's message framing: the reference runner always sends at least a
+    # system prompt + the user seed (its first call is length 2), so a
+    # length-based pin never fired in-kind (the P2h kind-run stall: every
+    # Implementing run got "done" on its first call, the shell tool never
+    # ran, and README.md never changed). A blocked run's re-call (the tool
+    # result carries a non-zero failure) still ends with a tool result ->
+    # "done" (the run is blocked and the operator requeues, as intended).
+    msgs = req.get("messages") or []
+    if msgs and isinstance(msgs[-1], dict) and msgs[-1].get("role") == "tool":
+        return "done"
+    return "tool_call"
 
 
-def build_choice(index, req_index):
-    # The runner's model loop is bounded by the operator's -max-steps 2: the
-    # FIRST model call of a phase run is the fixed shell tool call; the
-    # SECOND is a plain "done" answer (no tool call -> the loop exits). The
-    # stub's request log (the meter's input, item 14) counts by the
-    # messages-list length, so the FIRST model call of a run (index 0 = the
-    # seed message only) -> the tool call; the SECOND (index 2 = the seed +
-    # the tool result) -> the plain answer. The P2h plan's "every
-    # Implementing iteration produces a new commit" is satisfied by the
-    # Implementing run's first tool call; the runner's second ("done") call
-    # exits the loop without a second commit, and the verify Job already ran
-    # against the first run's commit (the iteration's advance is driven by
-    # the verify Job's failure, not by the runner's second call). A NEW
-    # sandbox pod (the operator re-creates the pod per phase run) starts a
-    # NEW conversation at index 0, so the phase's first call in each pod is
-    # again the tool call (a new commit, if the phase is Implementing and
-    # the work is not already done — the idempotent git add -A; the commit
-    # of an unchanged README.md is a no-op the runner feeds back, not a
-    # failure).
-    # The phase's first model call of a FRESH run is the messages-list
-    # length 1 (the seed only); the second is length 3 (seed + assistant +
-    # tool result). The tool call is for length 1 ONLY; length >= 3 is the
-    # plain "done" answer (the loop exits after the tool call). This is the
-    # pin the P2h e2e's execstub test asserts (request 0 = the seed-only
-    # call, request 1 = the length-3 call). The in-kind pod's conversation
-    # starts fresh per phase run (the operator re-creates the sandbox pod
-    # per phase — the S4 phase-driver semantics: one container run per
-    # phase), so the phase's first model call is always length 1.
-    if req_index == 1:
+def build_choice(index, kind):
+    if kind == "tool_call":
         return {
             "index": index,
             "message": {
@@ -184,12 +185,12 @@ class StubHandler(BaseHTTPRequestHandler):
             return
         # The stub is NON-streaming regardless of the request's stream flag
         # (the reference runner's shape; the plan pins stream:false).
-        req_index = count_messages(req)
+        kind = choice_kind(req)
         body = {
-            "id": "stub-p2h-%d" % req_index,
+            "id": "stub-p2h-%d" % len(req.get("messages") or []),
             "object": "chat.completion",
             "model": req.get("model") or "p2h-stub",
-            "choices": [build_choice(0, req_index)],
+            "choices": [build_choice(0, kind)],
             "usage": {"prompt_tokens": 100, "completion_tokens": 100,
                       "total_tokens": 200},
         }
@@ -198,10 +199,11 @@ class StubHandler(BaseHTTPRequestHandler):
         # the source of truth, cross-checked against the REAL vLLM backend
         # delta, never against this file).
         rec = {
-            "n": req_index,
+            "n": len(req.get("messages") or []),
             "model": req.get("model"),
             "tools": len(req.get("tools") or []),
             "stream": bool(req.get("stream")),
+            "choice": kind,
         }
         sys.stdout.write(json.dumps(rec) + "\n")
         sys.stdout.flush()

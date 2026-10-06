@@ -1410,7 +1410,26 @@ fi
 #    not refuse it). A STEP 4+ re-run re-applies the annotation: the operator
 #    clears it on the resume (a no-op once resumed — the end state holds).
 K -n "$NS" annotate loop ${p2h_budgetpause3} coxswain.io/resume="$(date -u +%s)" --overwrite >/dev/null 2>&1 || die "sub-case (c) annotate failed"
-if wait_phase ${p2h_budgetpause3} Implementing 240; then
+# G3 diagnosis (run-20261006202101: the annotation did NOT resume
+# budgetpause3 within 240s, though envtest spec 16 — the same sequence —
+# passes): record the state AFTER the annotate (spec.suspend, annotation,
+# pausedFrom/Reason, exceeded) and then dump evidence every 30s of the
+# 240s wait (full status + the Loop's Events + the operator log lines for
+# this Loop) to $LOG_DIR/diag-budgetpause3-<n>.{status,events,operator}.txt.
+K -n "$NS" get loop ${p2h_budgetpause3} -o json > "$LOG_DIR/diag-budgetpause3-after-annotate.json" 2>/dev/null || true
+ANN_TS=$(date -u +%s)
+DIAG_N=0
+while :; do
+  ph="$(lphase ${p2h_budgetpause3})"
+  if [ "$ph" = "Implementing" ]; then break; fi
+  [ $(( ( $(date -u +%s) - ANN_TS) )) -ge 240 ] && break
+  DIAG_N=$((DIAG_N + 1))
+  K -n "$NS" get loop ${p2h_budgetpause3} -o yaml > "$LOG_DIR/diag-budgetpause3-${DIAG_N}.status.yaml" 2>/dev/null || true
+  K -n "$NS" get events --field-selector involvedObject.name=${p2h_budgetpause3} -o yaml > "$LOG_DIR/diag-budgetpause3-${DIAG_N}.events.yaml" 2>/dev/null || true
+  K -n "$E2E_NS" logs -l control-plane=controller-manager --tail=2000 2>/dev/null | grep -i "budgetpause3" | tail -40 > "$LOG_DIR/diag-budgetpause3-${DIAG_N}.operator.log" || true
+  sleep 30
+done
+if wait_phase ${p2h_budgetpause3} Implementing 10; then
   pass "budgetpause3 Loop: the annotation (coxswain.io/resume) resumed it — phase=Implementing, pausedFrom cleared"
 else
   fail "budgetpause3 Loop: the annotation did NOT resume it within 240s (phase=$(lphase ${p2h_budgetpause3})) — the annotation is the Budget pause's legal resume trigger"

@@ -1316,11 +1316,38 @@ if [ "$B2_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceede
 else
   fail "budget-Pause control Loop (un-raised): phase=$(lphase ${p2h_budgetpause2}) exceeded=$(lfield ${p2h_budgetpause2} '.status.budget.exceeded') (expected Paused + exceeded=true; refused-event=$B2_REJECTED)"
 fi
-# assertion 5 accounting: pass iff the entry point + both sub-cases held and
-# NO new fail fired in-section (a STEP 4+ re-run that re-applies the
+# Sub-case (c): the plan's G3 gate — a `spec.suspend` flip must NOT resume a
+# Budget pause (only the coxswain.io/resume annotation may). On the un-raised
+# control Loop (already Paused, pausedReason=Budget, exceeded=true): flip
+# suspend true -> false (NO annotation) and assert it STAYS Paused
+# (pausedReason=Budget, exceeded=true) for at least 30s (>=15 reconciles).
+# Idempotent for a STEP 4+ re-run: on the unmutated operator the flips are
+# no-ops (a Suspend flip never resumes a Budget pause) and the end state is
+# re-asserted.
+B3_OK=0
+K -n "$NS" patch loop ${p2h_budgetpause2} -p '{"spec":{"suspend":true}}' --type=merge >/dev/null 2>&1 || die "suspend=true patch (sub-case c) failed"
+K -n "$NS" patch loop ${p2h_budgetpause2} -p '{"spec":{"suspend":false}}' --type=merge >/dev/null 2>&1 || die "suspend=false patch (sub-case c) failed"
+SUSP_FLIP_TS=$(date -u +%s)
+for i in $(seq 1 16); do
+  ph="$(lphase ${p2h_budgetpause2})"
+  pr="$(lfield ${p2h_budgetpause2} '.status.pausedReason')"
+  ex="$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')"
+  if [ "$ph" != "Paused" ] || [ "$pr" != "Budget" ] || [ "$ex" != "true" ]; then break; fi
+  sleep 2
+done
+NOW_TS=$(date -u +%s)
+HOLD_S=$((NOW_TS - SUSP_FLIP_TS))
+if [ "$ph" = "Paused" ] && [ "$pr" = "Budget" ] && [ "$ex" = "true" ] && [ "$HOLD_S" -ge 30 ]; then
+  B3_OK=1
+  pass "budget-Pause control Loop (un-raised): a suspend flip (true -> false, no annotation) did NOT resume it — stayed Paused (pausedReason=Budget, exceeded=true) for ${HOLD_S}s"
+else
+  fail "budget-Pause control Loop (un-raised): the suspend flip WRONGLY resumed it — phase=$ph pausedReason=$pr exceeded=$ex (expected Paused/Budget/true for >=30s; held ${HOLD_S}s)"
+fi
+# assertion 5 accounting: pass iff the entry point + all three sub-cases held
+# and NO new fail fired in-section (a STEP 4+ re-run that re-applies the
 # idempotent patch/annotation against an already-resolved Loop counts the
 # end state; a fail that fires in-section wins over it).
-if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
+if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$B3_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
   assert_done 5 pass
 else
   assert_done 5 fail

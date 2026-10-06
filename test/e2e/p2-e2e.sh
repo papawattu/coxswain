@@ -382,8 +382,27 @@ create_loop_wait_pvc() { # create_loop_wait_pvc <loop-name>; stdin: Loop YAML
   local loop="$1" yaml
   yaml="$(cat)"
   K -n "$NS" delete loop "$loop" --wait=false --ignore-not-found >/dev/null 2>&1 || true
+  # A deleted Loop with the finalizer still on it (an interrupted/forced
+  # delete) must NOT leave the Loop object (a non-zero refCount) — the next
+  # apply would 409 with 'already exists' while the old finalizer holder
+  # (a rolled-away operator pod) is gone. Remove the finalizer on a
+  # still-present Loop (the deletionTimestamp is set, so the object is a
+  # tombstone the API server would otherwise keep).
+  if [ "$(K -n "$NS" get loop "$loop" -o jsonpath='{.metadata.finalizers}' 2>/dev/null)" != "" ]; then
+    K -n "$NS" patch loop "$loop" -p '{"metadata":{"finalizers":null}}' --type=merge >/dev/null 2>&1 || true
+  fi
   K -n "$NS" delete jobs -l "coxswain.io/loop=$loop" --wait=false --ignore-not-found >/dev/null 2>&1 || true
   K -n "$NS" delete pvc "$loop-workspace" --ignore-not-found >/dev/null 2>&1 || true
+  # Wait for the tombstone to clear (the finalizer removal above is what
+  # lets the API server actually delete it).
+  for i in $(seq 1 30); do
+    [ -z "$(K -n "$NS" get loop "$loop" 2>/dev/null)" ] && break
+    sleep 2
+  done
+  [ -z "$(K -n "$NS" get loop "$loop" 2>/dev/null)" ] || {
+    K -n "$NS" get loop "$loop" -o jsonpath='{.metadata.finalizers} {.metadata.deletionTimestamp}' 2>/dev/null
+    die "Loop $loop tombstone not cleared (finalizer stuck?)"
+  }
   sleep 2
   echo "$yaml" | K -n "$NS" apply -f - >/dev/null || die "apply Loop $loop failed"
   for i in $(seq 1 120); do
@@ -835,9 +854,9 @@ if [ "$PROM_OK" = "1" ]; then
   # The closest-sample value of a metric at a timestamp (query_range over a
   # +/-5s window, step 1s — /api/v1/query with 'at <ts>' is not valid PromQL).
   QR() { # QR <metric> <ts> ; echoes the value at the closest sample, or empty
-    curl -s --max-time 30 -G "http://127.0.0.1:19099/api/v1/query_range" \
-      --data-urlencode "query=$1" \
-      --data-urlencode "start=$((2-5))" --data-urlencode "end=$((2+5))" --data-urlencode "step=1" 2>/dev/null
+    # (The earlier version had a stray curl line that ran for every call with
+    # literal '$((2-5))' (unexpanded — 2 is not assigned) and dumped its JSON
+    # body into the command substitution, clobbering the python3 output.)
     python3 - "$1" "$2" <<'PYEOF'
 import json, sys, urllib.parse, urllib.request
 metric, ts = sys.argv[1], int(sys.argv[2])
@@ -934,7 +953,7 @@ K -n "$NS" patch loop p2h-resume -p '{"spec":{"suspend":false}}' --type=merge >/
 if wait_phase p2h-resume Implementing 180; then
   ok "resume Loop -> Implementing (suspend=false)"
 else
-  bad "resume Loop did not return to Implementing (phase=$(lphase p2h-resume))"
+  fail "resume Loop did not return to Implementing after suspend=false (phase=$(lphase p2h-resume)) — assertion 4: the resumed Loop must continue from the phase it was paused at"
 fi
 RP_FROM2="$(lfield p2h-resume '.status.pausedFrom')"
 RP_REASON2="$(lfield p2h-resume '.status.pausedReason')"

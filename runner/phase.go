@@ -501,12 +501,23 @@ func writeClaim(path string, res Result) {
 		Status        string `json:"status"`
 		BlockedReason string `json:"blockedReason,omitempty"`
 		HeadCommit    string `json:"headCommit,omitempty"`
+		// S4 (R19 OS1): the .coxswain/iteration the runner read. It MUST ride
+		// the claim (not just result.json): the operator's stale-iteration
+		// guard compares claim.Iteration against loop.Status.Iteration and
+		// discards a mismatched claim — and a missing "iteration" key
+		// parses as 0, so an omitted field reads as a STALE claim from
+		// iteration 0 (the P2h kind-run stall: the Implementing-iteration-2
+		// claim was ignored as {"observedPhase":"Implementing","status":
+		// "success","headCommit":"…"} — no iteration — and the Loop could
+		// never advance past Verifying -> Stalled).
+		Iteration int `json:"iteration"`
 	}
 	c := claim{
 		ObservedPhase: res.ObservedPhase,
 		Status:        res.Status,
 		BlockedReason: res.VerificationNotes,
 		HeadCommit:    res.HeadCommit,
+		Iteration:     res.Iteration,
 	}
 	data, err := json.Marshal(c)
 	if err != nil {

@@ -862,6 +862,79 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 			"the reset lastActiveStamp (%s) is after the pre-pause stamp (%s) — the pause is not counted",
 			resetStamp.Format(time.RFC3339), prePauseStamp.Format(time.RFC3339))
 	})
+
+	It("spec 16: a budget-paused Loop whose cap is raised stays Paused on a suspend flip and resumes on the annotation (the P2h sub-case (c) sequence)", func() {
+		ns := nsFor("p2f-s16")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		r := newP2fReconciler(recorder, nil)
+		loop := createLoop(ns, "p2f-s16", func(l *coxv1alpha1.Loop) {
+			l.Spec.Budget = &coxv1alpha1.BudgetConfig{
+				MaxTokens:  p2fMaxTokens200,
+				OnExceeded: coxv1alpha1.BudgetExceededActionPause,
+			}
+		})
+		primeProxy(r, loop)
+		reconcile(r, ns, "p2f-s16")
+
+		By("a Budget pause at pausedFrom=Implementing (exceeded, 200/200)")
+		l := getLoop(ns, "p2f-s16")
+		l.Status.Phase = coxv1alpha1.LoopPhasePaused
+		l.Status.DesiredPhase = coxv1alpha1.LoopPhasePaused
+		l.Status.PausedFrom = coxv1alpha1.LoopPhaseImplementing
+		l.Status.PausedReason = coxv1alpha1.PausedReasonBudget
+		l.Status.Budget = &coxv1alpha1.BudgetStatus{
+			PromptTokens:     100,
+			CompletionTokens: 100,
+			Requests:         2,
+			Exceeded:         true,
+			ExceededReason:   "Tokens",
+		}
+		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+
+		By("the cap is raised (no annotation): the Loop STAYS Paused, still exceeded (the item-5 re-evaluation belongs to a RESUME trigger — a spec change alone does not clear the sticky exceeded flag; the decision is inert in Paused)")
+		l = getLoop(ns, "p2f-s16")
+		l.Spec.Budget.MaxTokens = p2fMaxTokens500
+		Expect(k8sClient.Update(ctx, l)).To(Succeed())
+		reconcile(r, ns, "p2f-s16")
+		got := getLoop(ns, "p2f-s16")
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused),
+			"a Budget pause is NOT resumed by a cap raise (no resume trigger fired)")
+		Expect(got.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonBudget))
+		if got.Status.Budget != nil {
+			Expect(got.Status.Budget.Exceeded).To(BeTrue(),
+				"the sticky exceeded flag is not cleared without a resume trigger (the item-5 re-evaluation is gated on resumeTriggered)")
+		}
+
+		By("the suspend flip (true -> false, no annotation): it must NOT resume a Budget pause (spec 6)")
+		setSuspend(ns, "p2f-s16", true)
+		reconcile(r, ns, "p2f-s16")
+		setSuspend(ns, "p2f-s16", false)
+		reconcile(r, ns, "p2f-s16")
+		got = getLoop(ns, "p2f-s16")
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused),
+			"a spec.suspend flip must not resume a Budget pause (only the annotation may)")
+		Expect(got.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonBudget))
+
+		By("the annotation (coxswain.io/resume): it MUST resume to the exact pausedFrom phase (the cap was raised, so the item-5 re-evaluation clears exceeded and the refuse-while-exceeded guard does not refuse)")
+		got = getLoop(ns, "p2f-s16")
+		got.Annotations = map[string]string{resumeAnnotation: unstructuredTrue}
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+		reconcile(r, ns, "p2f-s16")
+		got = getLoop(ns, "p2f-s16")
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"the annotation resumes a Budget pause to the exact pausedFrom phase (the P2h sub-case (c) annotation-resume check) — the in-kind run-20261006202101 left it Paused")
+		Expect(got.Status.Budget).NotTo(BeNil())
+		Expect(got.Status.Budget.Exceeded).To(BeFalse(),
+			"the item-5 re-evaluation clears the exceedance on the annotation resume (200 < 500)")
+		Expect(got.Status.PausedFrom).To(BeEmpty())
+		Expect(got.Status.PausedReason).To(BeEmpty())
+		c := cond(got, coxv1alpha1.PausedCondition)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c.Reason).To(Equal("Resumed"))
+		Expect(got.Annotations).NotTo(HaveKey(resumeAnnotation), "the annotation is cleared on a valid resume")
+	})
 })
 
 // p2f test helpers (package-level; the specs above reference them).

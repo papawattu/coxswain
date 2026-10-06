@@ -163,11 +163,14 @@ func resolveStallAfter(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1
 // a deterministic output without a real verify Job (the spec's readCheckOutput
 // seam).
 //
-// It returns ("", false) when neither the current nor the last terminated
-// record carries a message — a check that never ran, or a check that ran but
-// wrote nothing (an empty output). The operator treats ("", false) as INERT
-// (no StallEntry, the caller proceeds to the iterate): an empty read is the
-// absence of evidence, not an identical failure.
+// It returns ("", false) ONLY when the check has no terminated record at all
+// (the check never ran). A check that RAN and terminated with an EMPTY message
+// — a silently-failing check, e.g. `test -f /nonexistent` (the P2h acceptance
+// check), which writes no output — returns ("", true): the check ran and
+// failed, the empty output is the evidence the stall detector hashes. The
+// operator treats ("", false) as INERT (no StallEntry, the caller proceeds to
+// the iterate): no terminated record is the absence of evidence, not an
+// identical failure.
 func (r *LoopReconciler) defaultReadCheckOutput(pod *corev1.Pod, checkName string) (string, bool) {
 	if pod == nil {
 		return "", false
@@ -179,22 +182,18 @@ func (r *LoopReconciler) defaultReadCheckOutput(pod *corev1.Pod, checkName strin
 		}
 		// The CURRENT terminated state first: a non-restarted check init
 		// (restartCount 0, the real production path) carries its
-		// terminationMessage here.
+		// terminationMessage here. An EMPTY message still counts: a
+		// silently-failing check (test -f /nonexistent) terminated, and the
+		// empty output is the stall detector's evidence.
 		if ics.State.Terminated != nil {
-			if msg := ics.State.Terminated.Message; msg != "" {
-				return msg, true
-			}
+			return ics.State.Terminated.Message, true
 		}
 		// Fall back to the LAST terminated state: a restarted container
 		// (restartCount > 0) carries its previous incarnation's message there.
 		if ics.LastTerminationState.Terminated != nil {
-			if msg := ics.LastTerminationState.Terminated.Message; msg != "" {
-				return msg, true
-			}
+			return ics.LastTerminationState.Terminated.Message, true
 		}
-		// A terminated record exists (current or last) but carried no message:
-		// a check that ran but wrote nothing -> ("", false) (INERT), matching
-		// the "no message -> inert" contract the envtest spec pins.
+		// No terminated record at all: the check never ran -> INERT.
 		return "", false
 	}
 	return "", false // no terminated record at all: the check never ran

@@ -154,11 +154,27 @@ XCHK_P0=""; XCHK_P1=""; XCHK_G0=""; XCHK_G1=""
 XCHK_T0=""; XCHK_T1=""
 XCHK_S0=""; XCHK_S1=""   # the scrape-interval timestamps of the start/end samples
 
-# prom_instant <metric>: the current value of a metric from the homelab
-# Prometheus (read-only: a short-lived port-forward + curl + instant query).
-# Echoes "value <sample-ts>", or nothing if unreachable or the series is
-# absent. Used for the cross-check start/end counter captures.
-prom_instant() { # prom_instant <metric>; echoes "value ts" or ""
+# xchk_parse <out> <varsum> <vardetail> <vartimestamp>: sets the three vars
+# from a prom_sum_instant "sum detail... ts" line (sum=first field, ts=last
+# field, detail=everything in between; detail may be empty).
+xchk_parse() {
+  local out="$1" sum ts det
+  [ -z "$out" ] && { eval "$2='' $3='' $4=''"; return 1; }
+  sum="${out%% *}"
+  local rest="${out#* }"
+  ts="${rest##* }"
+  det="$rest"
+  if [ "${rest#* }" != "$rest" ]; then det="${rest% *}"; fi
+  eval "$2='$sum' $3='$det' $4='$ts'"
+}
+# prom_sum_instant <metric>: the CURRENT value of a vllm token metric summed
+# across ALL backends (pi6 + pi8) from the homelab Prometheus (read-only: a
+# short-lived port-forward + curl + instant query). The nginx LB spreads a
+# cross-check Loop's requests over BOTH vLLM backends, so the backend delta is
+# the SUM over nodes, not a single series. Echoes "sum <per-node: ts>", or
+# nothing if unreachable or the series is absent. The per-node values are
+# logged for the record (the reviewer's ask).
+prom_sum_instant() { # prom_sum_instant <metric>; echoes "sum pernode-ts" or ""
   local metric="$1" pflog out pfpid
   pflog="$(mktemp)"
   kubectl --context "$HOMELAB_CTX" -n prometheus port-forward svc/prometheus 19099:9090 --address 127.0.0.1 >"$pflog" 2>&1 &
@@ -170,7 +186,16 @@ d=json.load(sys.stdin)
 r=(d.get('data') or {}).get('result') or []
 if not r:
     sys.exit(1)
-print(r[0]['value'][1], int(r[0]['value'][0]))
+total=0
+parts=[]
+tss=[]
+for row in r:
+    v=int(row['value'][1]); ts=int(row['value'][0])
+    total+=v; tss.append(ts)
+    inst=row['metric'].get('node') or row['metric'].get('instance') or '?'
+    parts.append(f'{inst}={v}')
+tss.sort()
+print(total, ' '.join(parts), tss[0])
 " 2>/dev/null)" || out=""
   kill "$pfpid" 2>/dev/null || true
   wait "$pfpid" 2>/dev/null || true
@@ -718,16 +743,14 @@ EOF
 # inside [start, end]. If Prometheus is unreachable or the series is absent
 # the cross-check is DROPPED with a note (the plan allows it; it is a
 # consistency check, not a gate).
-S_PROM="$(prom_instant vllm:prompt_tokens_total)"
-S_GEN="$(prom_instant vllm:generation_tokens_total)"
+S_PROM="$(prom_sum_instant vllm:prompt_tokens_total)"
+S_GEN="$(prom_sum_instant vllm:generation_tokens_total)"
 XCHK_T0="$(date -u +%s)"
-if [ -n "$S_PROM" ] && [ -n "$S_GEN" ]; then
-  XCHK_P0="${S_PROM% *}"
-  XCHK_S0="${S_PROM#* }"
-  XCHK_G0="${S_GEN% *}"
-  XCHK_S1="${S_GEN#* }"
+xchk_parse "$S_PROM" XCHK_P0 XCHK_PD0 XCHK_S0
+xchk_parse "$S_GEN" XCHK_G0 XCHK_GD0 XCHK_S1
+if [ -n "$XCHK_P0" ] && [ -n "$XCHK_G0" ]; then
   XCHK_PROM_OK=1
-  echo "   cross-check start counters (BEFORE creating ${p2h_real}): prompt=$XCHK_P0 (sample ts=$XCHK_S0) generation=$XCHK_G0 (sample ts=$XCHK_S1) at $XCHK_T0"
+  echo "   cross-check start counters (BEFORE creating ${p2h_real}): prompt sum=$XCHK_P0 [per-node: $XCHK_PD0] generation sum=$XCHK_G0 [per-node: $XCHK_GD0] at $XCHK_T0"
 else
   XCHK_PROM_OK=""
   echo "   cross-check start counters UNAVAILABLE (no vllm token series or Prometheus unreachable; the cross-check will be DROPPED with a note)"
@@ -848,12 +871,12 @@ if [ "$XCHK_PROM_OK" = "1" ]; then
     sleep "$SCRAPE_LAG"
   fi
   XCHK_T1="$(date -u +%s)"
-  E_PROM="$(prom_instant vllm:prompt_tokens_total)"
-  E_GEN="$(prom_instant vllm:generation_tokens_total)"
-  if [ -n "$E_PROM" ] && [ -n "$E_GEN" ]; then
-    XCHK_P1="${E_PROM% *}"; XCHK_S0_END="${E_PROM#* }"
-    XCHK_G1="${E_GEN% *}"; XCHK_S1_END="${E_GEN#* }"
-    echo "   cross-check end counters (AFTER ${p2h_real} Succeeded + scrape lag): prompt=$XCHK_P1 (sample ts=$XCHK_S0_END) generation=$XCHK_G1 (sample ts=$XCHK_S1_END) at $XCHK_T1"
+  E_PROM="$(prom_sum_instant vllm:prompt_tokens_total)"
+  E_GEN="$(prom_sum_instant vllm:generation_tokens_total)"
+  xchk_parse "$E_PROM" XCHK_P1 XCHK_PD1 XCHK_S0_END
+  xchk_parse "$E_GEN" XCHK_G1 XCHK_GD1 XCHK_S1_END
+  if [ -n "$XCHK_P1" ] && [ -n "$XCHK_G1" ]; then
+    echo "   cross-check end counters (AFTER ${p2h_real} Succeeded + scrape lag): prompt sum=$XCHK_P1 [per-node: $XCHK_PD1] generation sum=$XCHK_G1 [per-node: $XCHK_GD1] at $XCHK_T1"
   else
     XCHK_PROM_OK=""
     echo "   cross-check end counters UNAVAILABLE (the cross-check will be DROPPED with a note)"
@@ -981,16 +1004,16 @@ if [ -z "$XCHK_P0" ] && [ -z "$XCHK_P1" ]; then
   echo "   STEP 4+ re-run: no start/end captures this invocation; re-deriving"
   PODY_START="$(K -n "$NS" get pod ${p2h_real}-proxy -o jsonpath='{.status.startTime}' 2>/dev/null || true)"
   XCHK_T0="$(date -u -d "$PODY_START" +%s 2>/dev/null || echo "$REAL_T0")"
-  S_PROM="$(prom_instant vllm:prompt_tokens_total)"
-  S_GEN="$(prom_instant vllm:generation_tokens_total)"
-  E_PROM="$(prom_instant vllm:prompt_tokens_total)"
-  E_GEN="$(prom_instant vllm:generation_tokens_total)"
-  [ -n "$S_PROM" ] && { XCHK_P0="${S_PROM% *}"; XCHK_S0="${S_PROM#* }"; }
-  [ -n "$S_GEN" ] && { XCHK_G0="${S_GEN% *}"; XCHK_S1="${S_GEN#* }"; }
-  [ -n "$E_PROM" ] && { XCHK_P1="${E_PROM% *}"; XCHK_S0_END="${E_PROM#* }"; }
-  [ -n "$E_GEN" ] && { XCHK_G1="${E_GEN% *}"; XCHK_S1_END="${E_GEN#* }"; }
+  S_PROM="$(prom_sum_instant vllm:prompt_tokens_total)"
+  S_GEN="$(prom_sum_instant vllm:generation_tokens_total)"
+  E_PROM="$(prom_sum_instant vllm:prompt_tokens_total)"
+  E_GEN="$(prom_sum_instant vllm:generation_tokens_total)"
+  xchk_parse "$S_PROM" XCHK_P0 XCHK_PD0 XCHK_S0
+  xchk_parse "$S_GEN" XCHK_G0 XCHK_GD0 XCHK_S1
+  xchk_parse "$E_PROM" XCHK_P1 XCHK_PD1 XCHK_S0_END
+  xchk_parse "$E_GEN" XCHK_G1 XCHK_GD1 XCHK_S1_END
   XCHK_T1="$(date -u +%s)"
-  echo "   re-derived: window=[$XCHK_T0,$XCHK_T1] prompt[$XCHK_P0->$XCHK_P1] generation[$XCHK_G0->$XCHK_G1]"
+  echo "   re-derived: window=[$XCHK_T0,$XCHK_T1] prompt sum[$XCHK_P0->$XCHK_P1] generation sum[$XCHK_G0->$XCHK_G1] (per-node start: $XCHK_PD0/$XCHK_GD0 end: $XCHK_PD1/$XCHK_GD1)"
 fi
 XCHECK="not-run"
 if [ -n "$XCHK_P0" ] && [ -n "$XCHK_P1" ] && [ -n "$XCHK_G0" ] && [ -n "$XCHK_G1" ]; then
@@ -1001,7 +1024,8 @@ d=json.loads('''$REAL_BUDGET''') if '$REAL_BUDGET' else {}
 print((d.get('promptTokens',0) or 0)+(d.get('completionTokens',0) or 0))
 " 2>/dev/null || echo 0)"
   backendDelta=$((dP + dG))
-  echo "   prometheus vllm: prompt [$XCHK_P0 (sample ts=$XCHK_S0) -> $XCHK_P1 (sample ts=$XCHK_S0_END)] generation [$XCHK_G0 (sample ts=$XCHK_S1) -> $XCHK_G1 (sample ts=$XCHK_S1_END)] over window [$REAL_T0,$REAL_T1]" >> "$LOG_DIR/crosscheck.txt"
+  echo "   prometheus vllm (SUM over pi6+pi8): prompt sum[$XCHK_P0 (sample ts=$XCHK_S0) -> $XCHK_P1 (sample ts=$XCHK_S0_END)] generation sum[$XCHK_G0 (sample ts=$XCHK_S1) -> $XCHK_G1 (sample ts=$XCHK_S1_END)] over window [$REAL_T0,$REAL_T1]" >> "$LOG_DIR/crosscheck.txt"
+  echo "   per-node prompt: start[$XCHK_PD0] end[$XCHK_PD1]; per-node generation: start[$XCHK_GD0] end[$XCHK_GD1]" >> "$LOG_DIR/crosscheck.txt"
   echo "   per-Loop status.budget total: $perLoopTok; backend delta: $backendDelta (prompt $dP + generation $dG)" >> "$LOG_DIR/crosscheck.txt"
   echo "   cross-check: prompt [$XCHK_P0 -> $XCHK_P1] generation [$XCHK_G0 -> $XCHK_G1] window [$REAL_T0,$REAL_T1]; per-Loop=$perLoopTok backendDelta=$backendDelta"
   if [ "$perLoopTok" -le "$backendDelta" ] && [ "$perLoopTok" -gt 0 ]; then

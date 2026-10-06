@@ -1,0 +1,2 @@
+git diff --stat COMMIT
+verify: check failed on commit COMMIT

@@ -1,0 +1,5 @@
+ FAIL: build failed
+--- FAIL: TestBuild (DURATIONs)
+    build_test.go:LINE: expected exit 0, got 2
+output written to TMPDIR/PATH_PLACEHOLDER
+FAIL

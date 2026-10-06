@@ -1,0 +1,5 @@
+2026-07-03T12:00:00Z panic: nil pointer dereference
+[signal SIGSEGV: segmentation violation code=1 addr=0xdeadbeef pc=0x4a1f00]
+goroutine 1 [running]:
+main.go:123:4
+	0x1048b2c

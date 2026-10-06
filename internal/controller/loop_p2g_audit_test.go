@@ -26,22 +26,29 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/cni"
 	"github.com/papawattu/coxswain/internal/proxy"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
 const (
@@ -59,8 +66,33 @@ const (
 	stallDetectedEvent = "StallDetected"
 )
 
+// P2gDebug is the per-spec debug sink the P2g specs print on failure (the
+// reconcile's V(1) log lines, which are otherwise invisible in the test
+// output).
+type P2gDebug struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func newP2gDebug() *P2gDebug { return &P2gDebug{} }
+
+func (d *P2gDebug) Printf(format string, args ...any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	fmt.Fprintf(&d.buf, format, args...)
+}
+
+func (d *P2gDebug) String() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.buf.String()
+}
+
 var _ = Describe("P2g: conditions + events for every P2 transition (the auditability sweep)", func() {
 	ctx := context.Background()
+	// p2gDebug is the per-spec debug sink (temporary while the stall drive is
+	// being debugged; the specs print it on failure).
+	p2gDebug := newP2gDebug()
 
 	// newP2gReconciler builds a reconciler whose gates are all satisfied (the
 	// P2d/P2f fixture shape) so the full Reconcile drives the transition the
@@ -105,6 +137,9 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 					EndpointSecretRef: p2gModelSecret,
 					ModelEndpoint:     p2gModelEndpoint,
 				},
+				Verify: coxv1alpha1.VerifyConfig{
+					AcceptanceChecks: []string{"p2g-check-0"},
+				},
 			},
 		}
 		if mutate != nil {
@@ -137,6 +172,10 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 		pod.Status.PodIP = "127.0.0.1"
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 	}
+
+	// p2gDebugLog appends to the per-spec debug sink (temporary while the
+	// stall drive is being debugged).
+	p2gDebugLog := func(format string, args ...any) { p2gDebug.Printf(format, args...) }
 
 	seedPhase := func(l *coxv1alpha1.Loop, phase coxv1alpha1.LoopPhase) {
 		l.Status.Phase = phase
@@ -192,10 +231,11 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 
 	// runStallFailures drives the FULL Reconcile at Verifying for iterations
 	// [1..n]: each iteration a fresh verify pod (job-name <loop>-verify-<i>)
-	// with check-0 failed (exit 1), re-seeded phase Verifying + iteration i,
-	// and one reconcile. applyVerifyOutcome reads the pod (the real read path)
-	// and the stall gate fires on the Nth identical failure. It returns the
-	// post-fire phase ("" when the gate never fired).
+	// with check-0 failed (exit 1, the check output teed into the
+	// terminationMessage — the default read path), re-seeded phase Verifying
+	// + iteration i, and one reconcile. applyVerifyOutcome reads the pod (the
+	// real read path) and the stall gate fires on the Nth identical failure.
+	// It returns the post-fire phase ("" when the gate never fired).
 	runStallFailures := func(r *LoopReconciler, ns string, n int, loopName string) string {
 		var phase coxv1alpha1.LoopPhase
 		for iter := 1; iter <= n; iter++ {
@@ -224,11 +264,13 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 					InitContainerStatuses: []corev1.ContainerStatus{
 						{Name: verifyTamperInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 						{Name: verifyArtifactInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-						{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, FinishedAt: fin}}},
+						{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, FinishedAt: fin, Message: p2gOutputRepeated}}},
 					},
 				},
 			}
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			By(fmt.Sprintf("debug: created verify pod %s", jobName))
+			p2gDebugLog("iter %d: phase=%s before reconcile\n", iter, getLoop(ns, loopName).Status.Phase)
 			// Re-seed the phase + iteration (the previous reconcile may have
 			// moved the phase: the Continue action iterates back to
 			// Implementing).
@@ -236,9 +278,58 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 			loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.Iteration = iter
+			// The pin must name the current iteration's Job (the read path
+			// looks up <loop>-verify-<iteration>); the base commit is already
+			// set by createP2gLoop.
+			loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: p2gHeadCommit}
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-			reconcile(r, ns, loopName)
-			phase = getLoop(ns, loopName).Status.Phase
+			// The bootstrap reconcile (Planning) left the sandbox with a
+			// stale annotation; the next reconcile's phaseBootstrap deletes it
+			// and RETURNS before the verify outcome step runs. Patch the
+			// annotation to the current desired phase BEFORE the reconcile so
+			// no recycle is pending and ONE reconcile runs the full pass
+			// (the D38 pattern — the advance is never skipped).
+			sb := &sandboxv1beta1.Sandbox{}
+			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: sandboxName(loopName)}, sb); err == nil {
+				if sb.Annotations == nil {
+					sb.Annotations = map[string]string{}
+				}
+				sb.Annotations[sandboxDesiredPhaseAnnotation] = string(coxv1alpha1.LoopPhaseVerifying)
+				Expect(k8sClient.Update(ctx, sb)).To(Succeed())
+			}
+			// Create the verify Job (the S5a envtest shape: envtest has no
+			// Job controller, so the operator's ensureVerifyJob is the Job's
+			// only path — the pod is then read from it via the verify-for
+			// label + job-name label, as the S5a specs do).
+			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: jobName}, &batchv1.Job{}); apierrors.IsNotFound(err) {
+				job := &batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      jobName,
+						Namespace: ns,
+						Labels:    verifyJobLabels(loopName),
+					},
+					Spec: batchv1.JobSpec{
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Labels: map[string]string{
+									verifyForLabel: loopName,
+									"job-name":     jobName,
+								},
+							},
+							Spec: corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers:    []corev1.Container{{Name: verifyNoopContainer, Image: "busybox"}},
+							},
+						},
+					},
+					}
+					Expect(controllerutil.SetControllerReference(getLoop(ns, loopName), job, k8sClient.Scheme())).To(Succeed())
+					Expect(k8sClient.Create(ctx, job)).To(Succeed())
+				}
+				reconcile(r, ns, loopName) // ensureVerifyJob sees the Job; the pod is read from it
+				l := getLoop(ns, loopName)
+				p2gDebugLog("iter %d: phase=%s stallHistory=%d\n", iter, l.Status.Phase, len(l.Status.StallHistory))
+				phase = l.Status.Phase
 		}
 		return string(phase)
 	}
@@ -302,7 +393,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 		})
 		reconcile(r, ns, "p2g-stall") // bootstrap (creates the controller's proxy pod)
 		phase := runStallFailures(r, ns, 3, "p2g-stall")
-		Expect(phase).To(Equal(string(coxv1alpha1.LoopPhasePaused)), "stallAction=Pause fires at N=3: %v", phase)
+		Expect(phase).To(Equal(string(coxv1alpha1.LoopPhasePaused)), "stallAction=Pause fires at N=3: %v\n%v", phase, p2gDebug.String())
 
 		l := getLoop(ns, "p2g-stall")
 		Expect(l.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonStall))
@@ -409,7 +500,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 		primeP2gProxy(loop)
 		reconcile(r, ns, "p2g-stall") // bootstrap (creates the controller's proxy pod)
 		phase := runStallFailures(r, ns, 3, "p2g-stall")
-		Expect(phase).To(Equal(string(coxv1alpha1.LoopPhaseFailed)), "stallAction=Fail fires at N=3: %v", phase)
+		Expect(phase).To(Equal(string(coxv1alpha1.LoopPhaseFailed)), "stallAction=Fail fires at N=3: %v\n%v", phase, p2gDebug.String())
 
 		l := getLoop(ns, "p2g-stall")
 		fc := condition(l, string(coxv1alpha1.LoopPhaseFailed))
@@ -475,7 +566,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 		primeP2gProxy(loop)
 		reconcile(r, ns, "p2g-stall") // bootstrap (creates the controller's proxy pod)
 		phase := runStallFailures(r, ns, 3, "p2g-stall")
-		Expect(phase).ToNot(Equal(string(coxv1alpha1.LoopPhaseFailed)), "stallAction=Continue keeps the loop (no phase change): %v", phase)
+		Expect(phase).ToNot(Equal(string(coxv1alpha1.LoopPhaseFailed)), "stallAction=Continue keeps the loop (no phase change): %v\n%v", phase, p2gDebug.String())
 		Expect(phase).ToNot(Equal(string(coxv1alpha1.LoopPhasePaused)))
 		l := getLoop(ns, "p2g-stall")
 		sc := condition(l, string(coxv1alpha1.StalledCondition))

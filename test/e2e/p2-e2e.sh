@@ -147,6 +147,19 @@ exec > >(tee "$LOG") 2>&1
 echo "=== P2h kind acceptance $(date -u) commit=$COMMIT ==="
 echo "    context=$CTX cluster=$CLUSTER ns=$NS operator=$CTRL_IMG"
 K get nodes >/dev/null 2>&1 || die "cannot reach cluster $CTX"
+# one run at a time: the script mutates the shared dev overlay (the
+# --runner-image flag + the operator image) and the shared Gitea seeds;
+# concurrent runs fight over both. (The 2026-10-06 10:49/10:56/11:05
+# runs raced on this exact state and left three processes polling.")
+LOCK_FILE="/tmp/p2h-e2e.lock"
+if [ -e "$LOCK_FILE" ]; then
+  OLD_PID=$(head -1 "$LOCK_FILE" 2>/dev/null || true)
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    die "another p2h run is active (PID $OLD_PID, $LOCK_FILE); kill it first or delete the lock"
+  fi
+  echo "   stale lock (PID $OLD_PID is dead); removing"
+fi
+echo $$ > "$LOCK_FILE"
 
 # ===========================================================================
 # STEP 0: images. Build the operator (THIS tree) unless P2H_OPERATOR_IMAGE is
@@ -186,7 +199,7 @@ echo "--- STEP 1: deploy the operator (dev overlay) + roll + digest-verify ---"
 make -C "$REPO_ROOT" kustomize >/dev/null 2>&1 || die "make kustomize failed"
 KUSTOMIZE_BIN="$REPO_ROOT/bin/kustomize"
 TMP_OVERLAY=$(mktemp -d)
-trap 'rm -rf "$TMP_OVERLAY"; echo; echo "=== P2h run log: $LOG ==="; exit $FAILED' EXIT
+trap 'rm -rf "$TMP_OVERLAY"; rm -f "$LOCK_FILE"; echo; echo "=== P2h run log: $LOG ==="; exit $FAILED' EXIT
 cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$CTRL_IMG") || die "kustomize set image failed"
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) || die "controller deploy failed"
@@ -196,7 +209,7 @@ K -n "$E2E_NS" set image deploy/coxswain-controller-manager manager="$CTRL_IMG" 
 # $RUNNER_IMG or the agents run 'sleep infinity' (isRunner is true only when
 # spec.agent.image == RunnerImage). The script adds the flag to the dev
 # overlay's args (the operator's own knob; a Loop cannot set it) and rolls.
-K -n "$E2E_NS" set args deploy/coxswain-controller-manager --containers=manager -- "--runner-image=$RUNNER_IMG" >/dev/null || die "set --runner-image arg failed"
+K -n "$E2E_NS" set args deploy/coxswain-controller-manager "--runner-image=$RUNNER_IMG" >/dev/null || die "set --runner-image arg failed"
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || die "controller not ready"
 RUNNING_IMAGEID=""
 for i in $(seq 1 60); do

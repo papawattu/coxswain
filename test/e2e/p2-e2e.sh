@@ -549,15 +549,15 @@ spec:
     preset: go
     image: $CHECK_IMG
     acceptanceChecks:
-    - "$PASS_CHECK"
+    - "$FAIL_CHECK"
   agent:
     image: $RUNNER_IMG
     model: p2h-stub
     endpointSecretRef: p2h-model-creds
     modelEndpoint: $MODEL_ENDPOINT
   loop:
-    maxIterations: 10
-    stallAfter: 3
+    maxIterations: 100
+    stallAfter: 50
     stallAction: Fail
 EOF
 
@@ -826,7 +826,7 @@ echo "   per-Loop status.budget: $REAL_BUDGET" >> "$LOG_DIR/crosscheck.txt"
 # a gate).
 XCHECK="not-run"
 PF_LOG="$LOG_DIR/prometheus-portforward.log"
-timeout 90 kubectl --context "$HOMELAB_CTX" port-forward -n prometheus svc/prometheus 127.0.0.1:19099:9090 > "$PF_LOG" 2>&1 &
+timeout 90 kubectl --context "$HOMELAB_CTX" -n prometheus port-forward svc/prometheus 19099:9090 --address 127.0.0.1 > "$PF_LOG" 2>&1 &
 PF_PID=$!
 sleep 5
 PROM_OK=0
@@ -893,27 +893,16 @@ echo
 echo "--- assertion 4: the paused-Loop resume (the resume Loop) ---"
 # Wait on the phase FIRST (item 14's racy-"suspend at Implementing" fix): the
 # script flips suspend only when phase == Implementing.
-if [ "$(lphase p2h-resume)" = "Implementing" ]; then
+# The flip must happen AT Implementing (the plan's racy-fix, item 14): a
+# resume Loop not at Implementing by the flip window (e.g. it already
+# Succeeded) cannot demonstrate the pause/resume cycle — assertion 4 FAILS
+# (a 'flipping anyway' on a terminal Loop is an invalid assertion).
+RESUME_RUN=0
+if [ "$(lphase p2h-resume)" = "Implementing" ] || wait_phase p2h-resume Implementing 600; then
   ok "resume Loop at Implementing (suspend flipped now)"
   RESUME_RUN=1
-elif wait_phase p2h-resume Implementing 600; then
-  ok "resume Loop at Implementing (suspend flipped now)"
-  RESUME_RUN=1
-else
-  if [ "$(lphase p2h-resume)" = "Succeeded" ]; then
-    # A re-run of STEP 4+ (P2H_STEPS=4,5,6) against a live fixture whose
-    # resume Loop already finished before the flip (it Succeeded on the
-    # passing check): the flip never happened. The assertion is recorded as
-    # SKIPPED (not a failure) — the pause/resume evidence was captured in
-    # the full run.
-    echo "   [SKIP] assertion 4: the resume Loop already Succeeded (phase=$(lphase p2h-resume)) before the flip window; the pause/resume cycle was not exercised in this run"
-    RESUME_RUN=0
-  else
-    bad "resume Loop never reached Implementing before the flip (phase=$(lphase p2h-resume)); flipping anyway (the assertion still holds: pausedFrom names the phase)"
-    RESUME_RUN=1
-  fi
 fi
-if [ "${RESUME_RUN:-1}" = "1" ]; then
+if [ "$RESUME_RUN" = "1" ]; then
 # Record the pre-pause state (the consistency assertion compares against it).
 PRE_ITER="$(lfield p2h-resume '.status.iteration')"
 PRE_VERIFY="$(lfield p2h-resume '.status.currentVerify.verifiedCommit')"
@@ -997,7 +986,8 @@ else
   fail "budget-Pause Loop: pausedFrom=$B1_FROM pausedReason=$B1_REASON exceeded=$B1_EXC (expected Implementing-or-Verifying/Budget/true)"
 fi
 # Sub-case (a): the raised-cap resume. Raise maxTokens (I43 live update) +
-# resume via the coxswain.io/resume annotation.
+# resume via the coxswain.io/resume annotation. (Idempotent for a STEP 4+
+# re-run: the patch + the annotation are no-ops once applied.)
 K -n "$NS" patch loop p2h-budgetpause -p '{"spec":{"budget":{"maxTokens":100000}}}' --type=merge >/dev/null 2>&1 || die "raise maxTokens failed"
 K -n "$NS" annotate loop p2h-budgetpause coxswain.io/resume="true" >/dev/null 2>&1 || die "resume annotation failed"
 # Two reconciles after the resume with phase != Paused and exceeded=false.
@@ -1014,6 +1004,10 @@ else
 fi
 # Sub-case (b): the un-raised re-pause (the fail-closed re-fire). The control
 # Loop's caps are NOT raised; the annotation resume must re-pause immediately.
+# A STEP 4+ re-run finds the Loop already in its post-resume state (Paused,
+# exceeded=true, the ResumeRefused event already fired) — the re-fire was
+# exercised in the full run; the re-run re-asserts the end state (the
+# annotate is an idempotent no-op once the operator cleared it).
 K -n "$NS" annotate loop p2h-budgetpause2 coxswain.io/resume="true" >/dev/null 2>&1 || die "resume annotation (control) failed"
 # A valid resume clears the annotation; a REFUSED one keeps it. The re-fire
 # is: phase returns to Paused (or stays) + the ResumeRefused Event. Give the
@@ -1022,6 +1016,22 @@ B2_OK=0
 for i in $(seq 1 60); do
   ph="$(lphase p2h-budgetpause2)"
   if [ "$ph" = "Paused" ]; then B2_OK=1; break; fi
+  sleep 2
+done
+# A fresh re-pause (the annotation was applied in THIS run): the operator's
+# ResumeRefused event must be present. On a STEP 4+ re-run of an already-
+# re-paused Loop the annotation is a no-op and the operator did not re-fire —
+# the sub-case is re-asserted from the end state + the full run's event (the
+# end state IS the fail-closed re-fire's evidence: Paused + exceeded=true).
+B2_REJECT_NOW=0
+for i in $(seq 1 30); do
+  B2_REJECT_NOW="$(K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause2 --type Warning -o json 2>/dev/null | python3 -c "
+import json,sys
+evs=json.load(sys.stdin).get('items',[])
+newest=max((e.get('lastTimestamp') or e.get('eventTime') or '') for e in evs) if evs else ''
+print('yes' if newest else 'no')
+" 2>/dev/null || echo no)"
+  [ "$B2_REJECT_NOW" = "yes" ] && break
   sleep 2
 done
 B2_REJECTED="$(K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause2 -o json 2>/dev/null | python3 -c "

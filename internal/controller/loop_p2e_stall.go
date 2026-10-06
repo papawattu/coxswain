@@ -31,6 +31,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"time"
@@ -39,6 +40,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/stall"
@@ -62,11 +64,29 @@ const stallHistoryCap = 10
 //     reflects it: one entry, N=1 → N+ = 1 consecutive → fire).
 //   - The version must match the CURRENT version (a stale-version run does
 //     not count toward the current detector — a version change resets).
+//   - Per-Job (item C's consistent model): the detector evaluates the fire
+//     ONCE per NEW verify Job. A re-read of the SAME Job (a requeue, a stale
+//     read after a phase recycle that did not advance the iteration) is not
+//     a new evaluation — the history's trailing entry already carries the
+//     just-appended entry's jobName, and the detector must not re-fire on it
+//     (spec 11: a terminal Failed fire does not re-fire on a re-reconcile
+//     with the same evidence; a paused Loop's decision is inert in Paused
+//     but a re-read in Verifying must not re-evaluate either). The dedup
+//     (appendStallEntry) already guarantees a Job name appears at most once
+//     in the history, so a trailing entry with the same jobName IS a re-read.
 //
 // It returns (fired bool, consecutive int): consecutive is the length of the
 // trailing run of identical (hash, version) entries including the just-
 // appended one (the operator records it into the Stalled condition message).
 func stallDecision(history []coxv1alpha1.StallEntry, newEntry coxv1alpha1.StallEntry, stallAfter int32) (bool, int) {
+	if len(history) > 0 {
+		last := history[len(history)-1]
+		if last.JobName != "" && last.JobName == newEntry.JobName {
+			// A re-read of the SAME verify Job (not a new Job): the detector
+			// does not re-evaluate. No fire — the per-Job rule (item C).
+			return false, 0
+		}
+	}
 	if stallAfter <= 0 {
 		// stallAfter is a pointer; the caller passes the resolved value
 		// (CRD default 3 when nil). A resolved value of 0 is malformed —
@@ -92,14 +112,38 @@ func stallDecision(history []coxv1alpha1.StallEntry, newEntry coxv1alpha1.StallE
 	return run >= int(stallAfter), run
 }
 
-// resolveStallAfter reads spec.loop.stallAfter (a pointer, CRD-default 3 when
-// nil). The API pointer is *int32; when nil the CRD defaulting sets 3, but a
-// bare reconcile (no defaulting) gets nil → the code default 3.
-func resolveStallAfter(spec *coxv1alpha1.LoopSpec) int32 {
-	if spec == nil || spec.Loop.StallAfter == nil {
-		return 3
+// stallDefaultsConfigMap is the cluster-wide stall-default ConfigMap (plan
+// P2e "Effective config": the operator namespace, keys stallAfter /
+// stallAction) — the FALLBACK when the Loop's spec.loop.stallAfter is
+// unset: precedence Loop field > ConfigMap > built-in (3 / Fail). A
+// missing/malformed ConfigMap falls back to the built-in default — the
+// stall detector is NOT fail-closed on a missing ConfigMap (an undetected
+// stall is worse than a default — the opposite of the budget's fail-closed
+// prices, deliberate, documented in the field comment).
+const stallDefaultsConfigMap = "coxswain-stall-defaults"
+
+// resolveStallAfter reads the effective stallAfter: spec.loop.stallAfter
+// (a pointer, CRD-default 3 when nil) > the cluster-wide
+// coxswain-stall-defaults ConfigMap (operator namespace) > the built-in
+// default 3. The API pointer is *int32; when nil the CRD defaulting sets 3
+// on a real object, but a bare reconcile (no defaulting) gets nil → the
+// ConfigMap, then the built-in 3.
+func resolveStallAfter(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) int32 {
+	if loop.Spec.Loop.StallAfter != nil {
+		return *loop.Spec.Loop.StallAfter
 	}
-	return *spec.Loop.StallAfter
+	if r != nil {
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Namespace: r.OperatorNamespace,
+			Name:      stallDefaultsConfigMap,
+		}, cm); err == nil {
+			if v, err := strconv.Atoi(cm.Data["stallAfter"]); err == nil && v >= 1 {
+				return int32(v)
+			}
+		}
+	}
+	return 3
 }
 
 // readCheckOutput is the default (live) check-output read: the failing
@@ -142,7 +186,13 @@ func (r *LoopReconciler) defaultReadCheckOutput(pod *corev1.Pod, checkName strin
 // the stall decision). The entry is NOT appended if an entry with the same
 // jobName already exists (item 6: a re-read of the same verify Job appends
 // no entry — the dedup key).
-func appendStallEntry(loop *coxv1alpha1.Loop, jobName, hash, check, at string) coxv1alpha1.StallEntry {
+// The At is the kubelet-recorded finish time (stallEntryAt): a real kubelet
+// always sets a finish time on a terminated container, so a real entry's At
+// is always set (the CRD's +kubebuilder:validation:Required on
+// status.stallHistory[].at is then satisfied). The envtest fixture's pods
+// carry no finish time, so stallEntryAt falls back to now() (an envtest-only
+// artifact — see stallEntryAt's comment).
+func appendStallEntry(loop *coxv1alpha1.Loop, jobName, hash, check string, at *metav1.Time) coxv1alpha1.StallEntry {
 	// Dedup by jobName (item 6).
 	for i := range loop.Status.StallHistory {
 		if loop.Status.StallHistory[i].JobName == jobName {
@@ -156,9 +206,7 @@ func appendStallEntry(loop *coxv1alpha1.Loop, jobName, hash, check, at string) c
 		Hash:                 hash,
 		NormalisationVersion: stall.NormalisationVersionV1,
 		Check:                check,
-	}
-	if t, err := parseStallTime(at); err == nil {
-		entry.At = *t
+		At:                   *at,
 	}
 	loop.Status.StallHistory = append(loop.Status.StallHistory, entry)
 	// Cap the ring at the last stallHistoryCap (evict the oldest).
@@ -166,19 +214,6 @@ func appendStallEntry(loop *coxv1alpha1.Loop, jobName, hash, check, at string) c
 		loop.Status.StallHistory = loop.Status.StallHistory[len(loop.Status.StallHistory)-stallHistoryCap:]
 	}
 	return entry
-}
-
-// parseStallTime parses an RFC3339 finish time into a *metav1.Time (the
-// entry's At; a parse failure leaves the zero Time — the ring is still
-// recorded, the At is just absent).
-func parseStallTime(at string) (*metav1.Time, error) {
-	t, err := time.Parse(time.RFC3339, at)
-	if err != nil {
-		return nil, err
-	}
-	mt := metav1.Time{}
-	mt.Time = t
-	return &mt, nil
 }
 
 // verifyJobName returns the verify Job's name for the current iteration
@@ -222,8 +257,28 @@ func normalizeCheckOutput(raw string) (string, string) {
 //
 // Inert in Paused (the Paused phase owns the decision; the gate only runs at
 // a Verifying verify-failure, and a Paused loop is not Verifying — P2f).
-func (r *LoopReconciler) applyStallGate(loop *coxv1alpha1.Loop, pod *corev1.Pod, failedCheck string) bool {
+func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod, failedCheck string) bool {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+		return false
+	}
+	// The terminal gate (I49, spec 9/10): the stall decision reads the
+	// verify Job's pod/container status (the exit codes + the
+	// operator-collected output). A check container that has not TERMINATED
+	// (a check still Running, or a Job pod whose inits have not started) is
+	// in-progress evidence — no decision, no StallEntry, no fire (a requeue
+	// is the caller's concern: applyVerifyOutcome returns requeue=true for
+	// an in-progress verify). The StallEntry is appended ONLY on a terminal
+	// verify failure (a check-* container Terminated non-zero, the existing
+	// B3 evidence). Mutation: dropping this gate (append a StallEntry on a
+	// non-terminal verify) must make spec 9 FAIL (an entry appears while the
+	// check is Running).
+	if checkNotTerminated(pod, failedCheck) {
+		// A non-terminated check is in-progress evidence: the stall gate is
+		// inert (no decision, no entry, no fire). The CALLER (applyVerify
+		// Outcome) still requeues (it already does for a not-terminated
+		// check — the I49 terminal gate) and the verify Job is re-read on
+		// the next reconcile, at which point the check is terminated and
+		// the gate decides (the S5a pattern).
 		return false
 	}
 	raw, ok := r.readCheckOutputSeam(pod, failedCheck)
@@ -243,12 +298,10 @@ func (r *LoopReconciler) applyStallGate(loop *coxv1alpha1.Loop, pod *corev1.Pod,
 	}
 	_, hash := normalizeCheckOutput(raw)
 	jobName := r.verifyJobName(loop)
-	at := ""
-	if pod != nil {
-		at = podFinishTime(pod, failedCheck)
-	}
+	at := stallEntryAt(pod, failedCheck)
+	historyBefore := loop.Status.StallHistory // the history BEFORE this entry (the dedup key: the last entry's jobName, a pre-existing one)
 	entry := appendStallEntry(loop, jobName, hash, failedCheck, at)
-	fired, run := stallDecision(loop.Status.StallHistory, entry, resolveStallAfter(&loop.Spec))
+	fired, run := stallDecision(historyBefore, entry, resolveStallAfter(ctx, r, loop))
 	if !fired {
 		return false
 	}
@@ -258,24 +311,117 @@ func (r *LoopReconciler) applyStallGate(loop *coxv1alpha1.Loop, pod *corev1.Pod,
 	}
 	switch action {
 	case coxv1alpha1.StallActionPause:
+		// Item 6: the Pause is entered AFTER the iterate bookkeeping. The
+		// iterate's bookkeeping runs BEFORE the fire is applied (the caller's
+		// ordering: applyStallGate is evaluated at a verify failure, and on a
+		// fire the loop's phase/iteration/condition are updated as ONE unit
+		// with the Pause). The iterate's bookkeeping (the phase advance
+		// Verifying->Implementing + the iteration increment) is applied FIRST,
+		// then the Pause overrides the phase to Paused (the iterate would have
+		// set Implementing; the Pause keeps that as pausedFrom). The iteration
+		// has ALREADY advanced (3 -> 4) when the Paused is set — the iterate
+		// ran first. Mutation: setting pausedFrom=Verifying (the phase BEFORE
+		// the iterate) must make spec 3 FAIL (the resume returns to Verifying,
+		// not Implementing).
+		loop.Status.PausedFrom = coxv1alpha1.LoopPhaseImplementing // the phase the iterate would have set
 		loop.Status.Phase = coxv1alpha1.LoopPhasePaused
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePaused
 		loop.Status.PausedReason = coxv1alpha1.PausedReasonStall
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
 			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run))
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run)
+		}
 	case coxv1alpha1.StallActionContinue:
 		// Keep iterating: the Stalled condition is set, the phase stays
 		// Verifying->Implementing (the caller proceeds to the iterate).
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
 			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Continue, keeping the loop)", run))
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Continue, keeping the loop)", run)
+		}
 		return false // keep iterating
 	default: // StallActionFail
 		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
 			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run))
+		// The Stalled condition is set (the stall's decision): the stall gate's
+		// Fail action sets BOTH the Failed condition (the phase outcome, reason
+		// Stalled) AND the Stalled condition (the detector's record). Item 8's
+		// precedence: the stall's outcome wins over the budget's (Failed:
+		// Stalled, not Failed:BudgetExceeded).
+		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
+			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run))
 		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run)
+		}
 	}
 	return true
+}
+
+// checkNotTerminated reports whether the named check container has not yet
+// TERMINATED (in-progress evidence — the terminal gate, spec 9/10): a check
+// still Running, a check not started, or a check whose status is absent from
+// the pod (a malformed Job). When the pod is nil (a gate-level call with no
+// pod) the gate is inert for the same reason (no terminal evidence).
+//
+// The container status (the exit codes + the operator-collected output) is
+// the terminal evidence the stall decision reads (the S5a pattern). A check
+// that is NOT terminated yet is in-progress: no decision. A check that has
+// terminated is terminal evidence: the gate decides.
+func checkNotTerminated(pod *corev1.Pod, checkName string) bool {
+	if pod == nil {
+		return true
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[i]
+		if ics.Name != checkName {
+			continue
+		}
+		// A terminated check (any exit code — the caller already knows it is
+		// a failure) is terminal evidence: NOT in-progress (either its current
+		// State is Terminated or its LastTerminationState is set). A check that
+		// has not terminated yet is in-progress.
+		if ics.State.Terminated != nil || ics.LastTerminationState.Terminated != nil {
+			return false
+		}
+		return true
+	}
+	// The check is not in the pod status at all (a malformed Job, or a pod
+	// with fewer inits than expected): no terminal evidence.
+	return true
+}
+
+// stallEntryAt is the StallEntry's At (the kubelet-recorded finish time,
+// RFC3339): the check container's State.Terminated.FinishedAt, then
+// LastTerminationState.Terminated.FinishedAt, then the pod's
+// LastTransitionTime. An empty (zero) time means the kubelet has not yet
+// recorded a finish — the envtest fixture's pods carry no finish time,
+// which would otherwise make the entry's At zero and the CRD's
+// +kubebuilder:validation:Required on status.stallHistory[].at would reject
+// the status update (an envtest-only artifact: a real kubelet always sets a
+// finish time on a terminated container).
+func stallEntryAt(pod *corev1.Pod, checkName string) *metav1.Time {
+	if pod == nil {
+		return nil
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[i]
+		if ics.Name != checkName {
+			continue
+		}
+		if t := ics.State.Terminated; t != nil && !t.FinishedAt.IsZero() {
+			mt := metav1.Time{Time: t.FinishedAt.Time}
+			return &mt
+		}
+		if t := ics.LastTerminationState.Terminated; t != nil && !t.FinishedAt.IsZero() {
+			mt := metav1.Time{Time: t.FinishedAt.Time}
+			return &mt
+		}
+	}
+	now := metav1.Now()
+	return &now
 }
 
 // podFinishTime returns the check container's pod finish time (RFC3339) for

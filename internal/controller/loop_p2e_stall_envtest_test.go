@@ -152,7 +152,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 			loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.Iteration = iter
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-			fired = r.applyStallGate(loop, aFailingPod(), s5aCheck0)
+			fired = r.applyStallGate(ctx, loop, aFailingPod(), s5aCheck0)
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		}
 		return fired
@@ -221,7 +221,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 			loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.Iteration = i + 1
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-			fired := r.applyStallGate(loop, aFailingPod(), s5aCheck0)
+			fired := r.applyStallGate(ctx, loop, aFailingPod(), s5aCheck0)
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 			Expect(fired).To(BeFalse(), "output %d (A/B alternating) must not fire", i)
 		}
@@ -242,7 +242,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 			loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.Iteration = iter
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-			fired = r.applyStallGate(loop, aFailingPod(), s5aCheck0)
+			fired = r.applyStallGate(ctx, loop, aFailingPod(), s5aCheck0)
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		}
 		Expect(fired).To(BeFalse(), "N=999 never fires")
@@ -264,10 +264,10 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		loop.Status.Iteration = 1
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		// Two reads of the SAME verify Job (same jobName) → one entry.
-		r.applyStallGate(loop, aFailingPod(), s5aCheck0)
+		r.applyStallGate(ctx, loop, aFailingPod(), s5aCheck0)
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		loop = getLoop(ns, "stalllp")
-		r.applyStallGate(loop, aFailingPod(), s5aCheck0)
+		r.applyStallGate(ctx, loop, aFailingPod(), s5aCheck0)
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		loop = getLoop(ns, "stalllp")
 		Expect(loop.Status.StallHistory).To(HaveLen(1), "a re-read of the same jobName appends no entry")
@@ -291,7 +291,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 		loop.Status.Iteration = 1
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		fired := r.applyStallGate(loop, aFailingPod(), s5aCheck0)
+		fired := r.applyStallGate(ctx, loop, aFailingPod(), s5aCheck0)
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		Expect(fired).To(BeTrue(), "the stall gate fires before the budget cap (stall wins)")
 		loop = getLoop(ns, "stalllp")

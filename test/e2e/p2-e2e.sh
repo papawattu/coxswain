@@ -212,9 +212,9 @@ K -n "$E2E_NS" set image deploy/coxswain-controller-manager manager="$CTRL_IMG" 
 # the dev overlay sets --runner-image as the LAST arg; replace it in place
 # (this kubectl has no `kubectl set args` — `set` only has image/env/
 # resources/selector/serviceaccount/subject): patch the arg list directly.
-K -n "$E2E_NS" patch deploy/coxswain-controller-manager --type=json \
-  -p "[\"op\",\"replace\",\"/spec/template/spec/containers/0/args/-\",\"--runner-image=$RUNNER_IMG\"]" >/dev/null \
-  || die "set --runner-image arg failed"
+PATCH='{"spec":{"template":{"spec":{"containers":[{"name":"manager","args":["--metrics-bind-address=:8443","--leader-elect","--health-probe-bind-address=:8081","--allow-unenforced","--allow-unenforced-network","--runner-image=coxswain-runner:dev"]}]}}}}'
+PATCH=$(printf '%s' "$PATCH" | sed "s#--runner-image=coxswain-runner:dev#--runner-image=$RUNNER_IMG#")
+K -n "$E2E_NS" patch deploy/coxswain-controller-manager -p "$PATCH" >/dev/null || die "set --runner-image arg failed"
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || die "controller not ready"
 RUNNING_IMAGEID=""
 for i in $(seq 1 60); do

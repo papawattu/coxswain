@@ -274,27 +274,29 @@ seed_repo() { # seed_repo <repo-name>; echoes the seed commit SHA
   # enabled for users; the API is the operator's S1 pattern). The seed is a
   # plain git repo (README.md only — the implement-instruction's target,
   # non-protected). The API call is signed in with the basic-auth cred (the
-  # same samples:samples-git-password the git-cred secret holds). The curl -d
-  # body is single-quoted (the JSON braces are literal); the repo name is
-  # interpolated into the single-quoted -d body by the outer sh -c (the $R is
-  # expanded by the OUTER shell, not the inner curl — the inner shell sees a
-  # literal {"name":"p2h-stall",...} body).
+  # same samples:samples-git-password the git-cred secret holds). The -d body
+  # is built by the inner shell (printf) so the JSON braces are literal — the
+  # outer single-quoted sh -c body cannot contain the inner single-quotes
+  # (the API 422'd on a malformed body when the braces were escaped by the
+  # outer shell). The 409 (already exists) is fine: the push -f re-seeds.
   K -n "$GITEA_NS" exec deploy/gitea -- sh -c '
     set -e
     R="$1"
+    BODY=$(printf "{\"name\":\"%s\",\"auto_init\":false,\"private\":false}" "$R")
     CODE=$(curl -s -o /tmp/create-$R.json -w "%{http_code}" -u samples:samples-git-password \
       -X POST "http://gitea.samples.svc:3000/api/v1/user/repos" \
       -H "Content-Type: application/json" \
-      -d "{\"name\":\"$R\",\"auto_init\":false,\"private\":false}")
+      -d "$BODY")
     case "$CODE" in
-      201|409|422) ;;  # created / already exists / the API hiccup (the push -f re-seeds)
+      201|409) ;;  # created / already exists (the push -f re-seeds)
       *) echo "Gitea API create failed: http $CODE $(cat /tmp/create-$R.json)"; exit 1 ;;
     esac
-    rm -rf /tmp/seed; mkdir -p /tmp/seed; cd /tmp/seed
-    if ! git clone -q http://samples:samples-git-password@gitea.samples.svc:3000/samples/$R.git work 2>/dev/null; then
-      mkdir work; cd work; git init -q -b initial
-      git remote add origin http://samples:samples-git-password@gitea.samples.svc:3000/samples/$R.git
-    fi
+    rm -rf /tmp/seed /tmp/seedwork; mkdir -p /tmp/seed; cd /tmp/seed
+    # Clone the API-created repo (empty on the first run; the clone warns but
+    # succeeds — the work dir is the clone target). Then commit the seed
+    # README.md + push -f (the force push creates the initial branch on the
+    # empty repo; no push-to-create needed because the API created the repo).
+    git clone -q http://samples:samples-git-password@gitea.samples.svc:3000/samples/$R.git work 2>/dev/null || { mkdir work; cd work; git init -q -b initial; git remote add origin http://samples:samples-git-password@gitea.samples.svc:3000/samples/$R.git; }
     cd /tmp/seed/work
     git config user.email p2h@example.com; git config user.name p2h
     git checkout -B initial 2>/dev/null || git checkout -q -b initial

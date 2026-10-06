@@ -158,19 +158,42 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 	// pod would lack and which would leave the sandbox held Suspended by the
 	// D35a gate); this then marks it Ready (the gate's remaining input) and
 	// creates the secret.
-	primeP2gProxy := func(loop *coxv1alpha1.Loop) {
+	primeP2gProxy := func(r *LoopReconciler, loop *coxv1alpha1.Loop) {
 		_ = k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: p2gModelSecret, Namespace: loop.Namespace},
 			StringData: map[string]string{modelAPIKey: "p2g-dummy", modelBaseURL: p2gModelEndpoint},
 		})
-		pod := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod)).To(Succeed())
+		// Create the proxy Pod DIRECTLY (the P2d fixture shape): the operator's
+		// ensureProxy would also create a ClusterIP Service and exhaust the
+		// envtest ServiceIP pool; the D35a gate checks the pod, and the
+		// readProxyUsage seam stands in for the pod's :9090 endpoint.
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      proxyPodName(loop.Name),
+				Namespace: loop.Namespace,
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "coxswain",
+					"app.kubernetes.io/loop":       loop.Name,
+					"app.kubernetes.io/component":  "model-proxy",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "proxy", Image: "proxy"}},
+			},
+		}
+		if ownerErr := controllerutil.SetControllerReference(loop, pod, k8sClient.Scheme()); ownerErr != nil {
+			Expect(ownerErr).NotTo(HaveOccurred())
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		// Mark the pod Ready (the D35a gate checks the pod's conditions).
+		got := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, got)).To(Succeed())
 		now := metav1.Now()
-		pod.Status.Conditions = []corev1.PodCondition{
+		got.Status.Conditions = []corev1.PodCondition{
 			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: now},
 		}
-		pod.Status.PodIP = "127.0.0.1"
-		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		got.Status.PodIP = "127.0.0.1"
+		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
 	}
 
 	// p2gDebugLog appends to the per-spec debug sink (temporary while the
@@ -268,7 +291,16 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 					},
 				},
 			}
+			// The API server drops status on create: create the pod, then set
+			// its status via the status subresource (the
+			// loop_p2e_stall_plan_test.go shape — without this the pod has no
+			// initContainerStatuses and verifyOutcome returns no-decision, so
+			// the stall gate never fires).
+			st := pod.Status
+			pod.Status = corev1.PodStatus{}
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status = st
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 			By(fmt.Sprintf("debug: created verify pod %s", jobName))
 			p2gDebugLog("iter %d: phase=%s before reconcile\n", iter, getLoop(ns, loopName).Status.Phase)
 			// Re-seed the phase + iteration (the previous reconcile may have
@@ -424,7 +456,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 			}
 		})
 		seedPhase(loop, coxv1alpha1.LoopPhaseImplementing)
-		primeP2gProxy(loop)
+		primeP2gProxy(r, loop)
 		// Back the token count up to the cap (a same-boot delta would do the
 		// same, but the seed is the deterministic P2d fixture shape): the
 		// reading confirms the count, and the decision fires on this
@@ -457,7 +489,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 		recorder := record.NewFakeRecorder(64)
 		r := newP2gReconciler(recorder)
 		loop := createP2gLoop(ns, "p2g-s4", nil)
-		primeP2gProxy(loop)
+		primeP2gProxy(r, loop)
 		reconcile(r, ns, "p2g-s4") // bootstrap
 		seedPhase(getLoop(ns, "p2g-s4"), coxv1alpha1.LoopPhaseImplementing)
 		reconcile(r, ns, "p2g-s4")
@@ -497,7 +529,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				StallAction: coxv1alpha1.StallActionFail,
 			}
 		})
-		primeP2gProxy(loop)
+		primeP2gProxy(r, loop)
 		reconcile(r, ns, "p2g-stall") // bootstrap (creates the controller's proxy pod)
 		phase := runStallFailures(r, ns, 3, "p2g-stall")
 		Expect(phase).To(Equal(string(coxv1alpha1.LoopPhaseFailed)), "stallAction=Fail fires at N=3: %v\n%v", phase, p2gDebug.String())
@@ -530,7 +562,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 			}
 		})
 		seedPhase(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2gProxy(loop)
+		primeP2gProxy(r, loop)
 		seedBudgetP2g(getLoop(ns, "p2g-s6"), func(b *coxv1alpha1.BudgetStatus) {
 			b.PromptTokens = 250
 		})
@@ -563,7 +595,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				StallAction: coxv1alpha1.StallActionContinue,
 			}
 		})
-		primeP2gProxy(loop)
+		primeP2gProxy(r, loop)
 		reconcile(r, ns, "p2g-stall") // bootstrap (creates the controller's proxy pod)
 		phase := runStallFailures(r, ns, 3, "p2g-stall")
 		Expect(phase).ToNot(Equal(string(coxv1alpha1.LoopPhaseFailed)), "stallAction=Continue keeps the loop (no phase change): %v\n%v", phase, p2gDebug.String())
@@ -590,7 +622,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				OnExceeded: coxv1alpha1.BudgetExceededActionPause,
 			}
 		})
-		primeP2gProxy(loop)
+		primeP2gProxy(r, loop)
 		reconcile(r, ns, "p2g-s8") // bootstrap
 
 		// Simulate a Budget pause (the P2f fixture shape): phase Paused,
@@ -643,7 +675,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 			}
 		})
 		seedPhase(loop, coxv1alpha1.LoopPhasePlanning)
-		primeP2gProxy(loop)
+		primeP2gProxy(r, loop)
 		// Seed the stored state (the P2d spec 10 shape): lastBootID B1.
 		seedBudgetP2g(getLoop(ns, "p2g-s9"), func(b *coxv1alpha1.BudgetStatus) {
 			b.LastBootID = "B1"
@@ -688,7 +720,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 
 		driveSuspendPause := func(ns string, r *LoopReconciler, _ *record.FakeRecorder) {
 			createP2gLoop(ns, "p2g-s10", nil)
-			primeP2gProxy(getLoop(ns, "p2g-s10"))
+			primeP2gProxy(r, getLoop(ns, "p2g-s10"))
 			reconcile(r, ns, "p2g-s10")
 			seedPhase(getLoop(ns, "p2g-s10"), coxv1alpha1.LoopPhaseImplementing)
 			reconcile(r, ns, "p2g-s10")
@@ -704,7 +736,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 					StallAction: action,
 				}
 			})
-			primeP2gProxy(getLoop(ns, "p2g-stall"))
+			primeP2gProxy(r, getLoop(ns, "p2g-stall"))
 			reconcile(r, ns, "p2g-stall")
 			runStallFailures(r, ns, 3, "p2g-stall")
 		}
@@ -718,7 +750,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				}
 			})
 			seedPhase(getLoop(ns, "p2g-s10"), coxv1alpha1.LoopPhaseImplementing)
-			primeP2gProxy(getLoop(ns, "p2g-s10"))
+			primeP2gProxy(r, getLoop(ns, "p2g-s10"))
 			seedBudgetP2g(getLoop(ns, "p2g-s10"), func(b *coxv1alpha1.BudgetStatus) {
 				b.PromptTokens = 250
 			})
@@ -733,7 +765,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 					OnExceeded: coxv1alpha1.BudgetExceededActionPause,
 				}
 			})
-			primeP2gProxy(getLoop(ns, "p2g-s10"))
+			primeP2gProxy(r, getLoop(ns, "p2g-s10"))
 			reconcile(r, ns, "p2g-s10") // bootstrap
 
 			l := getLoop(ns, "p2g-s10")
@@ -774,7 +806,7 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				}
 			})
 			seedPhase(getLoop(ns, "p2g-s10"), coxv1alpha1.LoopPhasePlanning)
-			primeP2gProxy(getLoop(ns, "p2g-s10"))
+			primeP2gProxy(r, getLoop(ns, "p2g-s10"))
 			seedBudgetP2g(getLoop(ns, "p2g-s10"), func(b *coxv1alpha1.BudgetStatus) {
 				b.LastBootID = "B1"
 				b.LastPromptTokens = 100
@@ -876,7 +908,13 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 			}
 			// (a) the condition with the right type/status/reason and a
 			// NON-EMPTY message.
-			loop := getLoop(ns, "p2g-s10")
+			// The stall drives use the p2g-stall loop name (the stall fixture's
+			// shape); every other drive uses p2g-s10.
+			loopName := "p2g-s10"
+			if strings.Contains(tc.name, "stall") || strings.Contains(tc.name, "Stalled") {
+				loopName = "p2g-stall"
+			}
+			loop := getLoop(ns, loopName)
 			c := condition(loop, tc.condType)
 			Expect(c).NotTo(BeNil(), "%s: the %s condition must be set", tc.name, tc.condType)
 			Expect(c.Status).To(Equal(tc.condStatus), "%s: the %s condition status must be %s", tc.name, tc.condType, tc.condStatus)

@@ -29,7 +29,19 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
-const p2eStallNS = "ns-a"
+const (
+	p2eStallNS = "ns-a"
+	// The seam's fixed check output (the stall gate's hash source in the
+	// gate-level unit tests — the envtest specs use the real
+	// terminationMessage; these pin the arithmetic in isolation with a stable
+	// raw value so the normalised hash is deterministic).
+	p2eStallSeamOutput = "out"
+	// Seeded history JobNames for the gate-level unit tests (a DIFFERENT-Job
+	// entry that makes the just-appended verify Job a NEW Job — the per-Job
+	// sticky rule fires only on a different-JobName trailing entry).
+	p2eStallSeededJob0 = "lp-verify-0"
+	p2eStallSeededJob1 = "lp-verify-1"
+)
 
 // TestStallDecisionFiresAfterNConsecutive: N consecutive identical hashes
 // (same version) fire; N-1 do not. The run counts the just-appended entry +
@@ -122,6 +134,12 @@ func TestAppendStallEntryCapsRing(t *testing.T) {
 // read) — the detector must not re-evaluate on it (no fire, no second
 // Event). Mutation: firing whenever k >= stallAfter on ANY reconcile (drop
 // the per-Job rule) must make spec 11 FAIL (a re-fire on a re-reconcile).
+//
+// The reviewer-strengthened case (M6): call stallDecision TWICE with the SAME
+// JobName where BOTH calls have k >= stallAfter. The first (a new Job at the
+// threshold) fires; the second (a re-read of that same Job, k still >=
+// stallAfter) must return false (no re-fire). Dropping the per-Job sticky
+// makes the second call fire — the mutation FAILS this test.
 func TestStallDecisionPerJobSticky(t *testing.T) {
 	mkEntry := func(jobName, h, v string) coxv1alpha1.StallEntry {
 		return coxv1alpha1.StallEntry{JobName: jobName, Hash: h, NormalisationVersion: v}
@@ -147,6 +165,22 @@ func TestStallDecisionPerJobSticky(t *testing.T) {
 		mkEntry("lp-verify-1", "h", "v1"), 1); fired {
 		t.Fatalf("a re-read of the SAME Job on a fired run must not re-fire (per-Job rule)")
 	}
+	// M6 (reviewer): two calls, SAME JobName, k >= stallAfter BOTH times.
+	// Call 1: a NEW Job (lp-verify-2) after one identical entry (lp-verify-1),
+	// k=2, N=2 → fires (k >= stallAfter).
+	if fired, _ := stallDecision(
+		[]coxv1alpha1.StallEntry{mkEntry("lp-verify-1", "h", "v1")},
+		mkEntry("lp-verify-2", "h", "v1"), 2); !fired {
+		t.Fatalf("M6 call 1: a new Job at k=2 (N=2) must fire (k >= stallAfter)")
+	}
+	// Call 2: a RE-READ of that same Job (the trailing history entry is now
+	// lp-verify-2, the same JobName as the just-appended entry), k=2, N=2 —
+	// k is STILL >= stallAfter, but it is not a NEW Job → must NOT fire.
+	if fired, _ := stallDecision(
+		[]coxv1alpha1.StallEntry{mkEntry("lp-verify-1", "h", "v1"), mkEntry("lp-verify-2", "h", "v1")},
+		mkEntry("lp-verify-2", "h", "v1"), 2); fired {
+		t.Fatalf("M6 call 2: a re-read of the SAME Job (k still >= stallAfter) must NOT re-fire (per-Job rule)")
+	}
 }
 
 // TestResolveStallAfterConfigMap: the effective stallAfter resolution
@@ -167,69 +201,37 @@ func TestResolveStallAfterConfigMap(t *testing.T) {
 	}
 }
 
-// TestApplyStallGateInertWhenCheckNotTerminated: the gate is INERT when the
-// failing check's container has not TERMINATED (spec 9/10's terminal gate,
-// at the gate level — the I49 in-progress evidence). A check that is
-// Running (not Terminated) is in-progress evidence: no StallEntry, no fire,
-// no Stalled condition. Mutation: dropping the terminal gate (append a
-// StallEntry on a non-terminal verify) must make spec 9 FAIL (an entry
-// appears while the check is Running).
-func TestApplyStallGateInertWhenCheckNotTerminated(t *testing.T) {
-	// The terminal gate (I49, spec 9/10): a check that has not terminated yet
-	// is in-progress evidence — the stall gate is inert (no decision, no
-	// entry, no fire). The check container's TERMINATION is the terminal
-	// evidence; a check that is still Running (not terminated) is NOT
-	// terminal evidence, so the gate must not append a StallEntry or fire.
-	//
-	// Mutation: dropping the terminal gate (append a StallEntry on a
-	// non-terminal verify) must make spec 9 FAIL (an entry appears while the
-	// check is Running).
-	loop := &coxv1alpha1.Loop{}
-	loop.Name = "lp"
-	loop.Namespace = p2eStallNS
-	loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
-	loop.Status.Iteration = 1
-	n := int32(1)
-	loop.Spec.Loop.StallAfter = &n
-	loop.Spec.Loop.StallAction = coxv1alpha1.StallActionFail
-
-	runningState := corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
-	pod := &corev1.Pod{
-		Status: corev1.PodStatus{
-			InitContainerStatuses: []corev1.ContainerStatus{
-				{Name: s5aCheck0, State: runningState},
-			},
-		},
-	}
-	r := &LoopReconciler{readCheckOutput: func(*corev1.Pod, string) (string, bool) { return "out", true }}
-	if fired := r.applyStallGate(context.Background(), loop, pod, s5aCheck0); fired {
-		t.Fatalf("a non-terminated check must not fire the stall gate (the terminal gate)")
-	}
-	if len(loop.Status.StallHistory) != 0 {
-		t.Fatalf("a non-terminated check must append NO StallEntry, got %d", len(loop.Status.StallHistory))
-	}
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
-		t.Fatalf("a non-terminated check must not change the phase, got %s", loop.Status.Phase)
-	}
-	if len(loop.Status.Conditions) != 0 {
-		t.Fatalf("a non-terminated check must not set the Stalled condition, got %v", loop.Status.Conditions)
-	}
-
-	// A terminated check (the terminal evidence) still works (the gate is not
-	// disabled for all evidence — only for in-progress evidence). The check
-	// container's State is Terminated (exit 1, a failure): the gate decides.
+// TestApplyStallGateDecidesOnTerminalFailure: the stall gate DECIDES on a
+// terminal verify failure (a check container Terminated non-zero — the B3
+// evidence). The terminal gate that keeps an IN-PROGRESS check (still
+// Running) from reaching this gate is the CALLER's: verifyOutcome returns
+// (verifyNoDecision, requeue=true) for a non-terminated check, and
+// applyVerifyOutcome requeues before it reaches the verifyIterate branch that
+// calls this gate (M4: the redundant inner checkNotTerminated was removed —
+// the caller's in-progress requeue is the real terminal gate, so a Running
+// check never reaches this gate; the gate is reached only on a terminal
+// failure). This test pins the supported contract at the gate level:
+//   - below the threshold (k < N) the gate decides but does NOT fire and
+//     appends the terminal-failure StallEntry (the B3 evidence — the gate
+//     records the failure even when it does not yet fire), leaving the phase
+//     unchanged;
+//   - at the threshold (k == N, a NEW Job after one or more identical
+//     entries) the gate fires; stallAction=Fail → the phase is Failed and
+//     the Stalled condition is set.
+//
+// A fresh loop (empty history, or a same-JobName trailing entry) does NOT
+// fire at the threshold — that is the per-Job sticky rule (a re-read of the
+// same Job is not a new Job), not a gate bug. Seeding a DIFFERENT-JobName
+// trailing entry makes the just-appended entry a NEW Job that can fire.
+func TestApplyStallGateDecidesOnTerminalFailure(t *testing.T) {
+	// The check output's normalised hash (the seam returns "out").
+	_, h := normalizeCheckOutput(p2eStallSeamOutput)
+	r := &LoopReconciler{readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
 	terminatedState := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 		ExitCode:   1,
 		FinishedAt: metav1.Now(),
 	}}
-	loop2 := &coxv1alpha1.Loop{}
-	loop2.Name = "lp"
-	loop2.Namespace = p2eStallNS
-	loop2.Status.Phase = coxv1alpha1.LoopPhaseVerifying
-	loop2.Status.Iteration = 1
-	loop2.Spec.Loop.StallAfter = &n
-	loop2.Spec.Loop.StallAction = coxv1alpha1.StallActionFail
-	pod2 := &corev1.Pod{
+	pod := &corev1.Pod{
 		Status: corev1.PodStatus{
 			InitContainerStatuses: []corev1.ContainerStatus{
 				{Name: s5aCheck0, State: terminatedState,
@@ -241,8 +243,146 @@ func TestApplyStallGateInertWhenCheckNotTerminated(t *testing.T) {
 			},
 		},
 	}
-	if !r.applyStallGate(context.Background(), loop2, pod2, s5aCheck0) {
-		t.Fatalf("a terminated check (N=1) must fire the stall gate")
+
+	// Below the threshold: seed ONE different-Job entry (the 1st identical
+	// failure), the just-appended entry is a NEW Job at k=2, N=3 → no fire.
+	{
+		n := int32(3)
+		loop := &coxv1alpha1.Loop{}
+		loop.Name = "lp"
+		loop.Namespace = p2eStallNS
+		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+		loop.Status.Iteration = 1
+		loop.Spec.Loop.StallAfter = &n
+		loop.Spec.Loop.StallAction = coxv1alpha1.StallActionFail
+		loop.Status.StallHistory = append(loop.Status.StallHistory,
+			coxv1alpha1.StallEntry{JobName: p2eStallSeededJob0, Hash: h, NormalisationVersion: "v1"})
+		if r.applyStallGate(context.Background(), loop, pod, s5aCheck0) {
+			t.Fatalf("k=2 < N=3 must NOT fire (the gate decides but does not fire below the threshold)")
+		}
+		// The terminal-failure StallEntry is appended (B3 evidence): the ring
+		// holds the seeded verify-0 + the just-appended verify-1.
+		if len(loop.Status.StallHistory) != 2 {
+			t.Fatalf("a terminal verify failure must append a StallEntry (B3 evidence), got %d entries", len(loop.Status.StallHistory))
+		}
+		if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+			t.Fatalf("a non-fire must not change the phase, got %s", loop.Status.Phase)
+		}
+	}
+
+	// At the threshold: seed TWO different-Job entries (the 1st + 2nd
+	// identical failures), the just-appended entry is a NEW Job at k=3 ==
+	// N=3 → fires (stallAction=Fail → Failed + Stalled).
+	{
+		n := int32(3)
+		loop := &coxv1alpha1.Loop{}
+		loop.Name = "lp"
+		loop.Namespace = p2eStallNS
+		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+		loop.Status.Iteration = 2
+		loop.Spec.Loop.StallAfter = &n
+		loop.Spec.Loop.StallAction = coxv1alpha1.StallActionFail
+		loop.Status.StallHistory = append(loop.Status.StallHistory,
+			coxv1alpha1.StallEntry{JobName: p2eStallSeededJob0, Hash: h, NormalisationVersion: "v1"},
+			coxv1alpha1.StallEntry{JobName: p2eStallSeededJob1, Hash: h, NormalisationVersion: "v1"})
+		if !r.applyStallGate(context.Background(), loop, pod, s5aCheck0) {
+			t.Fatalf("a new Job at k=N (N=3) must fire the stall gate")
+		}
+		if loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
+			t.Fatalf("stallAction=Fail must set the phase to Failed, got %s", loop.Status.Phase)
+		}
+		stalled := false
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == string(coxv1alpha1.StalledCondition) {
+				stalled = loop.Status.Conditions[i].Status == metav1.ConditionTrue
+				break
+			}
+		}
+		if !stalled {
+			t.Fatalf("stallAction=Fail must set the Stalled condition to True, got %v", loop.Status.Conditions)
+		}
+	}
+}
+
+// TestApplyStallGateContinueLeavesPhaseUnchanged: a stallAction=Continue fire
+// (M11) must NOT change the phase — the gate sets the Stalled condition and
+// returns false (keep iterating); the CALLER proceeds to the iterate, which
+// is what sets the phase to Implementing. This is the gate-level contract the
+// envtest spec 5 cannot isolate (spec 5 reads the FINAL phase, which the
+// caller's iterate sets regardless of what the gate does). Calling the gate
+// DIRECTLY at the threshold pins it: the phase the gate LEAVES is the phase
+// it was given (Verifying — unchanged), NOT Paused.
+//
+// The loop is seeded with a pre-existing DIFFERENT-JobName entry (the real
+// "Nth consecutive identical failure" state): the per-Job sticky rule fires
+// only when the trailing history entry's JobName differs from the just-
+// appended one, so a fresh loop (empty history, or a same-JobName trailing
+// entry) does NOT fire at the threshold — that is the per-Job rule, not a
+// gate bug. Seeding a different JobName (verify-0) makes the new verify-1
+// job the kth consecutive failure that fires.
+//
+// Mutation: a Continue fire that sets the phase to Paused (M11) must FAIL this
+// test (the phase is no longer Verifying/unchanged).
+func TestApplyStallGateContinueLeavesPhaseUnchanged(t *testing.T) {
+	n := int32(2) // threshold: a new Job after one identical entry fires
+	// The check output's normalised hash (the seam returns "out").
+	_, h := normalizeCheckOutput(p2eStallSeamOutput)
+	r := &LoopReconciler{readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
+
+	terminatedState := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+		ExitCode:   1,
+		FinishedAt: metav1.Now(),
+	}}
+	loop := &coxv1alpha1.Loop{}
+	loop.Name = "lp"
+	loop.Namespace = p2eStallNS
+	loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying // the phase the gate is given
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying
+	loop.Status.Iteration = 1
+	loop.Spec.Loop.StallAfter = &n
+	loop.Spec.Loop.StallAction = coxv1alpha1.StallActionContinue
+	// Seed the history with a DIFFERENT JobName (verify-0) carrying the same
+	// hash — the 1st consecutive identical failure. The just-appended entry is
+	// verify-1 (a NEW Job), k=2 == N=2 → fires.
+	loop.Status.StallHistory = append(loop.Status.StallHistory,
+		coxv1alpha1.StallEntry{JobName: p2eStallSeededJob0, Hash: h, NormalisationVersion: "v1"})
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{Name: s5aCheck0, State: terminatedState,
+					LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+						ExitCode:   1,
+						Message:    "out",
+						FinishedAt: metav1.Now(),
+					}}},
+			},
+		},
+	}
+	// A new Job at k=N fires (stallAction=Continue). The gate returns false
+	// for a Continue fire (keep iterating — the caller proceeds to the iterate
+	// which sets the phase to Implementing); it returns true ONLY for a
+	// terminal outcome (Fail/Pause). So the fire is detected by the Stalled
+	// condition being set, NOT by the return value.
+	_ = r.applyStallGate(context.Background(), loop, pod, s5aCheck0)
+	// The gate LEAVES the phase unchanged (Verifying — the phase it was
+	// given). A Continue fire does NOT set Paused (that is the caller's
+	// iterate, which the gate defers to by returning false).
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+		t.Fatalf("a Continue fire must leave the phase unchanged (Verifying), got %s (M11: must not set Paused)", loop.Status.Phase)
+	}
+	if loop.Status.DesiredPhase != coxv1alpha1.LoopPhaseVerifying {
+		t.Fatalf("a Continue fire must leave the desired phase unchanged, got %s", loop.Status.DesiredPhase)
+	}
+	// The Stalled condition IS set (the detector's record of the fire).
+	stalled := false
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == string(coxv1alpha1.StalledCondition) {
+			stalled = loop.Status.Conditions[i].Status == metav1.ConditionTrue
+			break
+		}
+	}
+	if !stalled {
+		t.Fatalf("a Continue fire must set the Stalled condition to True, got %v", loop.Status.Conditions)
 	}
 }
 

@@ -43,13 +43,17 @@ const NormalisationVersionV1 = "v1"
 //	optional .frac + Z/offset), the Go log format (SLASH-separated date +
 //	space + HH:MM:SS), or a LEADING epoch integer.
 //	rule1HexHourTimestamps: an RFC3339-form token whose HOUR field is a
-//	0x-prefixed hex pair (the rule-order golden: 2026-07-03T0xff:00:00Z —
-//	a real timestamp parser would reject the 0xff hour; the normaliser's
+//	0x-prefixed hex quad (the rule-order golden: 2026-07-03T0x1e00:00:00Z —
+//	a real timestamp parser would reject the 0x1e00 hour; the normaliser's
 //	permissive swallow is what makes the rule-1/rule-2 ORDER observable:
-//	rule 1 (first) consumes the 0xff, so rule 2 never sees it as a hex
-//	token. The decimal pass runs first in the line loop so the decimal
-//	timestamp (date + T + HH:MM:SS) is stripped whole, and the hex-hour
-//	pass is a no-op there).
+//	rule 1 (first) consumes the whole date+T+0x1e00 token, so rule 2 never
+//	sees it as a hex address. The 4 hex digits are deliberate: they are
+//	EXACTLY at rule 2's minimum (≥4), so under a rule-2-FIRST swap rule 2
+//	reaches in and replaces the 0x1e00 mid-token (leaving the date), while
+//	the ordered pass (rule 1 first) strips the whole token — the two orders
+//	then differ and the rule-order golden pins the order. The decimal pass
+//	runs first in the line loop so the decimal timestamp (date + T +
+//	HH:MM:SS) is stripped whole, and the hex-hour pass is a no-op there).
 //
 // Go's RE2 is not backtracking, so the decimal form CANNOT carry an
 // optional tail after a class that could match the hex-hour digits (the
@@ -59,20 +63,22 @@ var (
 	rule1DecimalTimestamps = regexp.MustCompile(
 		`\d{4}-\d{2}-\d{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?|` +
 			`\d{4}/\d{2}/\d{2} [0-9]{2}:[0-9]{2}:[0-9]{2}|^[0-9]{9,12}`)
-	rule1HexHourTimestamps = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T0x[0-9a-fA-F]{2}`)
+	rule1HexHourTimestamps = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T0x[0-9a-fA-F]{4}`)
 )
 
 // rule2HexAddresses strips a 0x-prefixed hex of ≥4 digits (pointers, PC
-// addresses) → a fixed 0xADDR placeholder. The leading \b word boundary: a
-// hex token embedded in a longer alphanumeric run (the rule-order golden's
-// 0xff after the date) is not a standalone pointer/PC address and is never
-// replaced — this is what makes the swap mutation's rule-2-first path a
-// no-op on the golden (the 0xff is consumed by rule 1 in the ordered pass;
-// under the swap, rule 2 sees the raw 0xff embedded in the timestamp, the
-// \b does not hold, and rule 2 does nothing — the swap output equals the
-// ordered one, and a rule 2 that MATCHED the embedded 0xff (e.g. >=2 hex
-// without the \b) would produce a DIFFERENT output and fail the golden).
-var rule2HexAddresses = regexp.MustCompile(`\b0x[0-9a-fA-F]{4,}`)
+// addresses) → a fixed 0xADDR placeholder. The regex is a BARE 0x + ≥4 hex
+// (no \b word boundary): a hex token embedded in a longer alphanumeric run —
+// the rule-order golden's 0x1e00 HOUR inside the date+T+0x1e00 timestamp —
+// IS replaced. That is exactly what makes the rule-1/rule-2 ORDER
+// observable (the rule-order golden pins it): the ordered pass (rule 1
+// first) strips the whole date+T+0x1e00 token, so rule 2 never sees the
+// 0x1e00; the swap (rule 2 first) reaches in and replaces the embedded
+// 0x1e00 mid-token, leaving the date — the two orders differ, so the swap
+// mutation makes the golden FAIL. (A \b boundary would make the swap a no-op
+// on the embedded token and hide the order — hence it is deliberately
+// absent; a standalone 0xhex≥4 pointer/PC still matches identically.)
+var rule2HexAddresses = regexp.MustCompile(`0x[0-9a-fA-F]{4,}`)
 
 // rule3TempPaths strips a temp path: a (backslash-free) path containing
 // /tmp/ or /var/tmp/ → the fixed TMPDIR/PATH_PLACEHOLDER. The trailing
@@ -98,9 +104,9 @@ var rule5CommitSHAs = regexp.MustCompile(`\b[0-9a-f]{40}\b`)
 // VERIFYJOB placeholder.
 var rule6VerifyJobNames = regexp.MustCompile(`[\w.-]+-verify-\d+`)
 
-// Normalize applies the seven rules IN ORDER (the order matters — the
-// rule-order golden pins rule 1 before rule 2) and returns the normalised
-// output.
+// Normalize applies the seven rules IN ORDER (rule 1 first, then rules
+// 2–6; the rule-order golden pins that rule 1 runs before rule 2) and
+// returns the normalised output.
 func Normalize(raw string) string {
 	// Rule 1 (two passes per line; the decimal pass first so a full
 	// decimal timestamp is stripped whole, then the hex-hour pass for the

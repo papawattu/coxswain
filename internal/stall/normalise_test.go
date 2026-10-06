@@ -232,15 +232,18 @@ func TestNoNoiseIsNoOp(t *testing.T) {
 }
 
 func TestRuleOrderMatters(t *testing.T) {
-	// rule-order.txt pins rule 1's permissive timestamp swallow: the raw line
-	// 2026-07-03T0x1e:00:00Z carries a 2-digit hex HOUR inside the timestamp
-	// token. Rule 1 (first) swallows the whole token (the golden is just
-	// 'crash'), and rule 2 (\b + ≥4 hex) never fires on the embedded 0x1e —
-	// so the ORDER is pinned by the golden itself: a rule-1 regex that
-	// required a decimal hour would leave 0x1e:00:00Z behind, and a rule-2
-	// without the \b boundary would replace the 0x1e mid-token in BOTH
-	// orders (the swap mutation would then produce the same output and
-	// could not fail — the boundary is what makes the swap observable).
+	// rule-order pins rule 1 running BEFORE rule 2: the raw line
+	// 2026-07-03T0x1e00:00:00Z carries a 4-digit hex HOUR inside the
+	// timestamp token. Rule 1 (first) swallows the whole date+T+0x1e00
+	// token (the golden is just ':00:00Z crash'), so rule 2 never sees the
+	// 0x1e00. The ORDER is what the golden pins: the 4 hex digits are
+	// EXACTLY at rule 2's minimum (≥4), so a rule-2-FIRST swap reaches in
+	// and replaces the embedded 0x1e00 mid-token (leaving the date,
+	// '2026-07-03T0xADDR:00:00Z crash') — a DIFFERENT output that fails the
+	// golden. A rule-1 regex that only matched a decimal hour would leave
+	// 0x1e00:00:00Z behind (also a mismatch). The bare-0x rule 2 (no \b)
+	// is what lets the swap reach the embedded token — with a \b the swap
+	// would be a no-op and could not fail.
 	raw, expected := loadPair(t, "rule-order")
 	got := Normalize(raw)
 	if got != expected {

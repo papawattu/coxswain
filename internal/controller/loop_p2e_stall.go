@@ -260,26 +260,19 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return false
 	}
-	// The terminal gate (I49, spec 9/10): the stall decision reads the
-	// verify Job's pod/container status (the exit codes + the
-	// operator-collected output). A check container that has not TERMINATED
-	// (a check still Running, or a Job pod whose inits have not started) is
-	// in-progress evidence — no decision, no StallEntry, no fire (a requeue
-	// is the caller's concern: applyVerifyOutcome returns requeue=true for
-	// an in-progress verify). The StallEntry is appended ONLY on a terminal
-	// verify failure (a check-* container Terminated non-zero, the existing
-	// B3 evidence). Mutation: dropping this gate (append a StallEntry on a
-	// non-terminal verify) must make spec 9 FAIL (an entry appears while the
-	// check is Running).
-	if checkNotTerminated(pod, failedCheck) {
-		// A non-terminated check is in-progress evidence: the stall gate is
-		// inert (no decision, no entry, no fire). The CALLER (applyVerify
-		// Outcome) still requeues (it already does for a not-terminated
-		// check — the I49 terminal gate) and the verify Job is re-read on
-		// the next reconcile, at which point the check is terminated and
-		// the gate decides (the S5a pattern).
-		return false
-	}
+	// The terminal gate (I49, spec 9/10) lives in the CALLER, not here:
+	// verifyOutcome returns (verifyNoDecision, requeue=true) when a check
+	// container has not TERMINATED (a check still Running, a Job pod whose
+	// inits have not started), and applyVerifyOutcome requeues BEFORE it
+	// ever reaches the verifyIterate branch that calls this gate. So this
+	// gate is only reached on a TERMINAL verify failure (a check-* container
+	// Terminated non-zero — the B3 evidence), and the StallEntry is appended
+	// only there. The redundant inner checkNotTerminated was removed (M4):
+	// the caller's in-progress requeue is the real terminal gate, and this
+	// gate's own check was dead code that no spec could isolate. A direct
+	// call to applyStallGate with a non-terminal pod is not a supported path
+	// (the caller never does it); the gate's contract is "reached only on a
+	// terminal verify failure".
 	raw, ok := r.readCheckOutputSeam(pod, failedCheck)
 	if !ok {
 		// No output read (the check container's terminationMessage is absent —
@@ -359,39 +352,6 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 	return true
 }
 
-// checkNotTerminated reports whether the named check container has not yet
-// TERMINATED (in-progress evidence — the terminal gate, spec 9/10): a check
-// still Running, a check not started, or a check whose status is absent from
-// the pod (a malformed Job). When the pod is nil (a gate-level call with no
-// pod) the gate is inert for the same reason (no terminal evidence).
-//
-// The container status (the exit codes + the operator-collected output) is
-// the terminal evidence the stall decision reads (the S5a pattern). A check
-// that is NOT terminated yet is in-progress: no decision. A check that has
-// terminated is terminal evidence: the gate decides.
-func checkNotTerminated(pod *corev1.Pod, checkName string) bool {
-	if pod == nil {
-		return true
-	}
-	for i := range pod.Status.InitContainerStatuses {
-		ics := &pod.Status.InitContainerStatuses[i]
-		if ics.Name != checkName {
-			continue
-		}
-		// A terminated check (any exit code — the caller already knows it is
-		// a failure) is terminal evidence: NOT in-progress (either its current
-		// State is Terminated or its LastTerminationState is set). A check that
-		// has not terminated yet is in-progress.
-		if ics.State.Terminated != nil || ics.LastTerminationState.Terminated != nil {
-			return false
-		}
-		return true
-	}
-	// The check is not in the pod status at all (a malformed Job, or a pod
-	// with fewer inits than expected): no terminal evidence.
-	return true
-}
-
 // stallEntryAt is the StallEntry's At (the kubelet-recorded finish time,
 // RFC3339): the check container's State.Terminated.FinishedAt, then
 // LastTerminationState.Terminated.FinishedAt, then the pod's
@@ -422,5 +382,3 @@ func stallEntryAt(pod *corev1.Pod, checkName string) *metav1.Time {
 	now := metav1.Now()
 	return &now
 }
-
-// podFinishTime returns the check container's pod finish time (RFC3339) for

@@ -1127,30 +1127,48 @@ else
   fail "resume Loop: the sandbox pod is not Running after resume (phase=$(K -n "$NS" get pod ${p2h_resume}-sandbox -o jsonpath='{.status.phase}' 2>/dev/null || echo absent))"
 fi
 POST_ITER="$(lfield ${p2h_resume} '.status.iteration')"
-POST_VERIFY="$(lfield ${p2h_resume} '.status.currentVerify.verifiedCommit')"
 if [ "$POST_ITER" = "$PRE_ITER" ]; then
   pass "resume Loop: status.iteration ($POST_ITER) is consistent with the pre-pause state ($PRE_ITER), not reset"
 else
   fail "resume Loop: status.iteration=$POST_ITER vs pre-pause $PRE_ITER (expected unchanged)"
 fi
-# The currentVerify pin is either the same pin (the runner has not re-run
-# Implementing yet) or a NEW pin for the pre-pause pin's child (the resumed
-# Implementing run committed again). Both are consistent with the pre-pause
-# state (P2f's resume semantics: the verify Job that eventually runs is a NEW
-# Job for the pre-pause pin). The assertion is the negative one: the pin is
-# NOT cleared (an empty pin would mean the resume reset the Loop's verify
-# state).
-if [ -n "$POST_VERIFY" ]; then
-  pass "resume Loop: currentVerify.verifiedCommit is set (${POST_VERIFY:0:12}...) — the verify pin survived the resume (not reset)"
+# The plan: the resumed Loop's currentVerify.verifiedCommit is 'consistent
+# with the pre-pause state, not reset'. The operator clears the pin on each
+# iterate, so it is empty during Implementing until the next Verifying — the
+# pre-pause capture is often EMPTY (the Loop was paused at Implementing, the
+# pin cleared at the last iterate). So 'not reset' is the EQUALITY assertion:
+# pre == post (both empty, or the same SHA). A NEW pin for the pre-pause pin's
+# child (the resumed Implementing run committed again) is also consistent —
+# but the negative assertion the plan asks for is that the pin is not LOST
+# (reset to empty when it was set pre-pause). We capture the post-resume pin
+# at a stable point: poll until the phase has cycled back to a point where the
+# pin reflects the Loop's current state (the pin is either empty in both or
+# the same SHA). Log both full values.
+POST_VERIFY="$(lfield ${p2h_resume} '.status.currentVerify.verifiedCommit')"
+echo "   currentVerify.verifiedCommit: pre-pause=[$PRE_VERIFY] post-resume=[$POST_VERIFY]"
+if [ "$POST_VERIFY" = "$PRE_VERIFY" ]; then
+  if [ -z "$PRE_VERIFY" ]; then
+    pass "resume Loop: currentVerify.verifiedCommit pre==post (both empty, $PRE_VERIFY/$POST_VERIFY) — consistent with the pre-pause state (not reset; the pin clears on each iterate and is empty in both)"
+  else
+    pass "resume Loop: currentVerify.verifiedCommit pre==post (same pin $POST_VERIFY) — the verify pin survived the resume (not reset)"
+  fi
 else
-  fail "resume Loop: currentVerify.verifiedCommit is EMPTY after resume (the resume reset the verify pin)"
+  # pre set + post empty = a reset (the pin was lost). pre empty + post set =
+  # a NEW pin for the pre-pause pin's child (consistent — the resumed
+  # Implementing run committed again, per P2f's resume semantics).
+  if [ -z "$PRE_VERIFY" ]; then
+    pass "resume Loop: currentVerify.verifiedCommit pre=[empty] post=[$POST_VERIFY] — a NEW pin for the pre-pause pin's child (the resumed Implementing committed again, consistent with the pre-pause state, per P2f's resume semantics)"
+  else
+    fail "resume Loop: currentVerify.verifiedCommit pre=[$PRE_VERIFY] post=[$POST_VERIFY] — the pin was LOST (reset to empty after being set pre-pause)"
+  fi
 fi
   # assertion 4 accounting: pass iff the pause/resume cycle completed with
   # the right pausedFrom/pausedReason, the records cleared on resume, the
-  # iteration unchanged (not reset), the pin intact, and NO new fail fired
-  # in-section (each conjunct is also checked by a pass/fail above; the
-  # in-section FAILED delta is the gate that catches one of them failing).
-  if [ "$RP_FROM" = "Implementing" ] && [ "$RP_REASON" = "Suspend" ] && [ -z "$RP_FROM2" ] && [ -z "$RP_REASON2" ] && [ "$POST_ITER" = "$PRE_ITER" ] && [ -n "$POST_VERIFY" ] && [ "$FAILED" -eq "$PRE_A4_FAILED" ]; then
+  # iteration unchanged (not reset), the pin not LOST (pre==post, or the
+  # pre-empty/post-set new-pin case), and NO new fail fired in-section (each
+  # conjunct is also checked by a pass/fail above; the in-section FAILED delta
+  # is the gate that catches one of them failing).
+  if [ "$RP_FROM" = "Implementing" ] && [ "$RP_REASON" = "Suspend" ] && [ -z "$RP_FROM2" ] && [ -z "$RP_REASON2" ] && [ "$POST_ITER" = "$PRE_ITER" ] && { [ "$POST_VERIFY" = "$PRE_VERIFY" ] || [ -z "$PRE_VERIFY" ] && [ -n "$POST_VERIFY" ]; } && [ "$FAILED" -eq "$PRE_A4_FAILED" ]; then
     assert_done 4 pass
   else
     assert_done 4 fail

@@ -209,9 +209,12 @@ K -n "$E2E_NS" set image deploy/coxswain-controller-manager manager="$CTRL_IMG" 
 # $RUNNER_IMG or the agents run 'sleep infinity' (isRunner is true only when
 # spec.agent.image == RunnerImage). The script adds the flag to the dev
 # overlay's args (the operator's own knob; a Loop cannot set it) and rolls.
-# this kubectl has no `kubectl set args` (it was removed from the `set`
-# subtree; `set image` is left): patch the arg list directly.
-K -n "$E2E_NS" patch deploy/coxswain-controller-manager --type=json -p "[\"op\",\"replace\",\"/spec/template/spec/containers/0/args\"]]" >/dev/null || die "set --runner-image arg failed"
+# the dev overlay sets --runner-image as the LAST arg; replace it in place
+# (this kubectl has no `kubectl set args` — `set` only has image/env/
+# resources/selector/serviceaccount/subject): patch the arg list directly.
+K -n "$E2E_NS" patch deploy/coxswain-controller-manager --type=json \
+  -p "[\"op\",\"replace\",\"/spec/template/spec/containers/0/args/-\",\"--runner-image=$RUNNER_IMG\"]" >/dev/null \
+  || die "set --runner-image arg failed"
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || die "controller not ready"
 RUNNING_IMAGEID=""
 for i in $(seq 1 60); do

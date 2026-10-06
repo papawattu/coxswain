@@ -890,14 +890,14 @@ if [ "$XCHK_PROM_OK" = "1" ]; then
   fi
 fi
 echo "   waiting: ${p2h_stall} -> Failed (Stalled at iteration 3)"
-wait_for ${p2h_stall} Failed 900 || bad "${p2h_stall} did not reach Failed in 900s (phase=$(lphase ${p2h_stall}))"
+wait_for ${p2h_stall} Failed 300 || bad "${p2h_stall} did not reach Failed in 300s (phase=$(lphase ${p2h_stall}))"
 echo "   waiting: ${p2h_budget} -> Failed (BudgetExceeded at request 2)"
-wait_for ${p2h_budget} Failed 900 || bad "${p2h_budget} did not reach Failed in 900s (phase=$(lphase ${p2h_budget}))"
+wait_for ${p2h_budget} Failed 300 || bad "${p2h_budget} did not reach Failed in 300s (phase=$(lphase ${p2h_budget}))"
 echo "   waiting: ${p2h_ctrl} -> Failed (the maxIterations cap at 5)"
-wait_for ${p2h_ctrl} Failed 900 || bad "${p2h_ctrl} did not reach Failed in 900s (phase=$(lphase ${p2h_ctrl}))"
+wait_for ${p2h_ctrl} Failed 300 || bad "${p2h_ctrl} did not reach Failed in 300s (phase=$(lphase ${p2h_ctrl}))"
 echo "   waiting: ${p2h_budgetpause} + ${p2h_budgetpause2} -> Paused (budget at 400)"
-wait_for ${p2h_budgetpause} Paused 900 || bad "${p2h_budgetpause} did not reach Paused in 900s (phase=$(lphase ${p2h_budgetpause}))"
-wait_for ${p2h_budgetpause2} Paused 900 || bad "${p2h_budgetpause2} did not reach Paused in 900s (phase=$(lphase ${p2h_budgetpause2}))"
+wait_for ${p2h_budgetpause} Paused 300 || bad "${p2h_budgetpause} did not reach Paused in 300s (phase=$(lphase ${p2h_budgetpause}))"
+wait_for ${p2h_budgetpause2} Paused 300 || bad "${p2h_budgetpause2} did not reach Paused in 300s (phase=$(lphase ${p2h_budgetpause2}))"
 fi
 
 # --- assertion 1: the Stalled path ---

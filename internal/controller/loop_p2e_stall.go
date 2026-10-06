@@ -34,7 +34,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"time"
 
 	"slices"
 
@@ -425,24 +424,3 @@ func stallEntryAt(pod *corev1.Pod, checkName string) *metav1.Time {
 }
 
 // podFinishTime returns the check container's pod finish time (RFC3339) for
-// the StallEntry's At (the kubelet-recorded finish; empty when the container
-// has no finish time — the entry's At is then zero).
-func podFinishTime(pod *corev1.Pod, checkName string) string {
-	if pod == nil {
-		return ""
-	}
-	for i := range pod.Status.InitContainerStatuses {
-		ics := &pod.Status.InitContainerStatuses[i]
-		if ics.Name != checkName {
-			continue
-		}
-		if ics.State.Terminated != nil && !ics.State.Terminated.FinishedAt.IsZero() {
-			return ics.State.Terminated.FinishedAt.Format(time.RFC3339)
-		}
-		if ics.LastTerminationState.Terminated != nil && !ics.LastTerminationState.Terminated.FinishedAt.IsZero() {
-			return ics.LastTerminationState.Terminated.FinishedAt.Format(time.RFC3339)
-		}
-		return ""
-	}
-	return ""
-}

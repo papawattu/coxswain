@@ -29,6 +29,8 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
+const p2eStallNS = "ns-a"
+
 // TestStallDecisionFiresAfterNConsecutive: N consecutive identical hashes
 // (same version) fire; N-1 do not. The run counts the just-appended entry +
 // the matching trailing history.
@@ -156,7 +158,7 @@ func TestStallDecisionPerJobSticky(t *testing.T) {
 func TestResolveStallAfterConfigMap(t *testing.T) {
 	ctx := context.Background()
 	loop := &coxv1alpha1.Loop{}
-	loop.Namespace = "ns-a"
+	loop.Namespace = p2eStallNS
 
 	// No spec field, no ConfigMap (nil client — the read is skipped): the
 	// built-in default 3.
@@ -184,7 +186,7 @@ func TestApplyStallGateInertWhenCheckNotTerminated(t *testing.T) {
 	// check is Running).
 	loop := &coxv1alpha1.Loop{}
 	loop.Name = "lp"
-	loop.Namespace = "ns-a"
+	loop.Namespace = p2eStallNS
 	loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 	loop.Status.Iteration = 1
 	n := int32(1)
@@ -222,7 +224,7 @@ func TestApplyStallGateInertWhenCheckNotTerminated(t *testing.T) {
 	}}
 	loop2 := &coxv1alpha1.Loop{}
 	loop2.Name = "lp"
-	loop2.Namespace = "ns-a"
+	loop2.Namespace = p2eStallNS
 	loop2.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 	loop2.Status.Iteration = 1
 	loop2.Spec.Loop.StallAfter = &n

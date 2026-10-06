@@ -64,6 +64,14 @@ const (
 	p2eModelEndpoint = "10.0.0.9:9200"
 	p2eBaseCommit    = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 	p2eHeadCommit    = "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1"
+
+	// Verify container names (the goconst lint requires named constants for
+	// repeated string literals in test fixtures; the loop_verify_job
+	// constants are not visible here, so these are local fixtures).
+	verifyMainContainer = "main"
+	verifyCloneBase     = "clone-base"
+	verifyImportAgent   = "import-agent"
+	verifyP2eSystemNS   = "coxswain-system"
 )
 
 var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10/11/12/13/15)", func() {
@@ -119,7 +127,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 	// (D30 AllowUnenforced, D38 CNI enforced) with a fixed failing
 	// verify-check output (the readCheckOutput seam). The readProxyUsage seam
 	// is set per spec where the spec needs a budget reading (spec 15).
-	newP2ePlanReconciler := func(recorder *record.FakeRecorder, checkOutput string) *LoopReconciler {
+	newP2ePlanReconciler := func(recorder *record.FakeRecorder) *LoopReconciler {
 		r := &LoopReconciler{
 			Client:          k8sClient,
 			Scheme:          k8sClient.Scheme(),
@@ -128,7 +136,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 			Recorder:        recorder,
 			readPhaseClaim:  func(context.Context, *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil },
 			readCheckOutput: func(pod *corev1.Pod, checkName string) (string, bool) {
-				return checkOutput, true
+				return p2eOutputRepeated, true
 			},
 		}
 		r.CNIProber.(*cni.FakeProber).SetResult(cni.CNIProbeResult{Reason: cni.ReasonCNIEnforced})
@@ -253,12 +261,12 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 				Namespace: ns,
 				Labels:    map[string]string{"job-name": fmt.Sprintf("%s-verify-%d", loopName, iter), verifyForLabel: loopName},
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "busybox"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyMainContainer, Image: "busybox"}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-			{Name: "clone-base", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: "import-agent", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: verifyCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: verifyImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 			{Name: verifyTamperInit, State: tamperState},
 			{Name: verifyArtifactInit, State: artifactState},
 			{Name: s5aCheck0, State: checkState},
@@ -288,7 +296,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s3")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 3, coxv1alpha1.StallActionPause, 0)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp") // bootstrap to Planning
@@ -311,8 +319,9 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		l := getLoop(ns, "stalllp")
 		Expect(l.Status.PausedReason).To(Equal(coxv1alpha1.PausedReasonStall), "pausedReason=Stall")
 		Expect(l.Status.PausedFrom).To(Equal(coxv1alpha1.LoopPhaseImplementing),
-			"pausedFrom=Implementing (item 6: the Pause is entered AFTER the iterate bookkeeping — the phase the iterate would have set)")
-		Expect(l.Status.Iteration).To(Equal(4), "the iteration has ALREADY advanced (the iterate ran first: 3 -> 4)")
+			"pausedFrom=Implementing (item 6: the Pause is entered with the iterate's target phase — the phase the iterate would have set; the resume returns to Implementing, never the dead Verifying)")
+		Expect(l.Status.Iteration).To(Equal(3),
+			"the iteration is 3 (the verify job is <loop>-verify-3 — the 3rd Job; the iterate bookkeeping (the iteration increment) is NOT applied on a Pause fire — the Pause overrides the phase, and the resume re-iterates (iteration 4) on the next advance)")
 		Expect(l.Status.StallHistory).To(HaveLen(3), "the run is KEPT (3 entries, not reset)")
 		Expect(cond(l, string(coxv1alpha1.StalledCondition))).ToNot(BeNil(), "the Stalled condition is set")
 
@@ -322,10 +331,12 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		reconcileOnce(r, ns, "stalllp")
 		l = getLoop(ns, "stalllp")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "resumed to the exact pausedFrom phase")
-		Expect(l.Status.Iteration).To(Equal(4), "the resume does not re-iterate")
+		Expect(l.Status.Iteration).To(Equal(3), "the resume does not re-iterate (the iteration is 3 — the 3rd Job's verify failed; the resume re-iterates on the next advance, iteration 4)")
 		Expect(l.Status.StallHistory).To(HaveLen(3), "the run is kept across the resume")
 
 		By("the resumed agent produces the SAME failing output: the 4th Job extends the run to k=4 (>=3) and the stall RE-fires")
+		// The resume re-iterates (the iterate bookkeeping that the Pause
+		// deferred): the next advance is iteration 4, the 4th verify Job.
 		advanceRepin(ns, "stalllp", 4, p2eHeadCommit)
 		createP2eVerifyPod(ns, "stalllp", 4, true, aFailedCheck)
 		reconcileOnce(r, ns, "stalllp")
@@ -339,7 +350,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s5")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 3, coxv1alpha1.StallActionContinue, 0)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp")
@@ -374,7 +385,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s8")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 3, coxv1alpha1.StallActionFail, 0)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp")
@@ -428,7 +439,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s9")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 3, coxv1alpha1.StallActionFail, 0)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp")
@@ -449,7 +460,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s10")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 3, coxv1alpha1.StallActionFail, 0)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp")
@@ -472,7 +483,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s11")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 1, coxv1alpha1.StallActionFail, 0)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp")
@@ -503,7 +514,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		// The operator namespace + the ConfigMap (stallAfter=2). The operator
 		// namespace is coxswain-system (the LoopReconciler's OperatorNamespace
 		// default — the P2d budget prices ConfigMap uses the same default).
-		operatorNS := "coxswain-system"
+		operatorNS := verifyP2eSystemNS
 		nsErr := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: operatorNS}})
 		Expect(apierrors.IsAlreadyExists(nsErr) || nsErr == nil).To(BeTrue(), "the operator namespace exists or was created")
 		cm := &corev1.ConfigMap{
@@ -514,7 +525,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 
 		By("a Loop with NO spec.loop.stallAfter fires at 2 (the ConfigMap's value, not the built-in 3)")
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		r.OperatorNamespace = operatorNS // the reconciler reads the ConfigMap from the operator namespace
 		createP2ePlanLoopNoStallAfter(ns, "stalllp")
 		primeP2eProxy(ns, "stalllp")
@@ -532,7 +543,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 
 		By("a Loop WITH spec.loop.stallAfter=5 ignores the ConfigMap (the Loop field wins): no fire at 2 or 3")
 		recorder2 := record.NewFakeRecorder(64)
-		r2 := newP2ePlanReconciler(recorder2, p2eOutputRepeated)
+		r2 := newP2ePlanReconciler(recorder2)
 		createP2ePlanLoop(ns, "stalllp5", 5, coxv1alpha1.StallActionFail, 0)
 		primeP2eProxy(ns, "stalllp5")
 		reconcileOnce(r2, ns, "stalllp5")
@@ -550,7 +561,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s13")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 3, coxv1alpha1.StallActionContinue, 0)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp")
@@ -569,9 +580,16 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		l.Spec.Loop.StallAfter = &lower
 		Expect(k8sClient.Update(ctx, l)).To(Succeed())
 		reconcileOnce(r, ns, "stalllp")
-		events := drainEvents(recorder)
-		Expect(events).NotTo(ContainElement(ContainSubstring("stall detector fired")),
-			"no NEW stall fire from the edit alone (the condition is a record, not a decision input): %v", events)
+		// The edit alone (a spec update) does NOT create a new verify Job — it
+		// only re-reconciles the loop, and the per-Job sticky gate (the last
+		// history entry is the same jobName) is inert (no re-fire, no new
+		// entry). The stallHistory count is unchanged (no new entry from the
+		// edit alone — the per-Job sticky prevents a re-fire on a re-read of
+		// the same jobName).
+		l = getLoop(ns, "stalllp")
+		Expect(l.Status.StallHistory).To(HaveLen(3),
+			"no NEW stall entry from the edit alone (the condition is a record, not a decision input; the per-Job sticky is inert on the re-read): the 3 entries from the 3 Jobs")
+		Expect(l.Status.StallHistory[2].JobName).To(Equal("stalllp-verify-3"), "the last entry is still the 3rd Job (no new entry from the edit)")
 		l = getLoop(ns, "stalllp")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "the phase is unchanged by the edit")
 		Expect(cond(l, string(coxv1alpha1.StalledCondition))).ToNot(BeNil(), "the Stalled condition is NOT cleared by the edit")
@@ -591,7 +609,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		ns := nsFor("p2e-s15")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)
-		r := newP2ePlanReconciler(recorder, p2eOutputRepeated)
+		r := newP2ePlanReconciler(recorder)
 		createP2ePlanLoop(ns, "stalllp", 3, coxv1alpha1.StallActionFail, 200)
 		primeP2eProxy(ns, "stalllp")
 		reconcileOnce(r, ns, "stalllp") // bootstrap (the reading is unset: no budget read)

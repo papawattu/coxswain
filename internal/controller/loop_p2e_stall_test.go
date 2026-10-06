@@ -49,7 +49,6 @@ func TestStallDecisionFiresAfterNConsecutive(t *testing.T) {
 		{"run does not cross a different hash", []coxv1alpha1.StallEntry{mkEntry("g", "v1"), mkEntry("h", "v1")}, mkEntry("h", "v1"), 2, true, 2},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			fired, run := stallDecision(tc.history, tc.newEntry, tc.stallAfter)
 			if fired != tc.wantFire {
@@ -77,14 +76,14 @@ func TestStallDecisionZeroStallAfterDefaultsToThree(t *testing.T) {
 func TestAppendStallEntryDedupsByJobName(t *testing.T) {
 	loop := &coxv1alpha1.Loop{}
 	loop.Status.Iteration = 1
-	appendStallEntry(loop, "lp-verify-1", "h1", "v1", "check-0", "")
-	appendStallEntry(loop, "lp-verify-1", "h1", "v1", "check-0", "") // dedup
+	appendStallEntry(loop, "lp-verify-1", "h1", "check-0", "")
+	appendStallEntry(loop, "lp-verify-1", "h1", "check-0", "") // dedup
 	if len(loop.Status.StallHistory) != 1 {
 		t.Fatalf("history len = %d, want 1 (dedup by jobName)", len(loop.Status.StallHistory))
 	}
 	// A NEW iteration (new jobName) appends.
 	loop.Status.Iteration = 2
-	appendStallEntry(loop, "lp-verify-2", "h1", "v1", "check-0", "")
+	appendStallEntry(loop, "lp-verify-2", "h1", "check-0", "")
 	if len(loop.Status.StallHistory) != 2 {
 		t.Fatalf("history len = %d, want 2", len(loop.Status.StallHistory))
 	}
@@ -96,7 +95,7 @@ func TestAppendStallEntryCapsRing(t *testing.T) {
 	loop := &coxv1alpha1.Loop{}
 	for i := 1; i <= 12; i++ {
 		loop.Status.Iteration = i
-		appendStallEntry(loop, "lp-verify-"+itoa(i), "h"+itoa(i), "v1", "check-0", "")
+		appendStallEntry(loop, "lp-verify-"+itoa(i), "h"+itoa(i), "check-0", "")
 	}
 	if len(loop.Status.StallHistory) != 10 {
 		t.Fatalf("history len = %d, want 10 (ring cap)", len(loop.Status.StallHistory))

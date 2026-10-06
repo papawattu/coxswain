@@ -81,7 +81,7 @@ func TestNormalisationVersionV1Value(t *testing.T) {
 
 func TestGoldenFiles(t *testing.T) {
 	for _, n := range []string{"panic-go", "test-fail", "commit-sha", "verify-job-name", "blank-run", "no-noise", "rule-order", "empty"} {
-		n, p := n, func() [2]string { raw, expected := loadPair(t, n); return [2]string{raw, expected} }()
+		p := func() [2]string { raw, expected := loadPair(t, n); return [2]string{raw, expected} }()
 		t.Run(n, func(t *testing.T) {
 			got := Normalize(p[0])
 			if got != p[1] {
@@ -127,7 +127,6 @@ func TestTwoIdenticalAfterNormalise(t *testing.T) {
 		{"two-identical-after-normalise-a", "two-identical-after-normalise-b"},
 		{"two-identical-after-normalise-c", "two-identical-after-normalise-d"},
 	} {
-		pair := pair
 		t.Run(pair.a+"+"+pair.b, func(t *testing.T) {
 			rawA, _ := loadPair(t, pair.a)
 			rawB, _ := loadPair(t, pair.b)

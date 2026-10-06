@@ -31,10 +31,11 @@
 package controller
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"time"
+
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,17 +75,16 @@ func stallDecision(history []coxv1alpha1.StallEntry, newEntry coxv1alpha1.StallE
 		stallAfter = 3
 	}
 	// The consecutive run is the trailing run of entries equal to newEntry's
-	// (hash, normalisationVersion), INCLUDING newEntry itself. Build the
-	// run: newEntry + the trailing history entries matching it.
+	// (hash, normalisationVersion), INCLUDING newEntry itself. Find the first
+	// entry from the end that does NOT match newEntry; the run is everything
+	// after it (including newEntry). A mismatch (or the head) stops the run.
 	run := 1
-	for i := len(history) - 1; i >= 0; i-- {
-		e := history[i]
+	for _, e := range slices.Backward(history) {
 		if e.Hash != newEntry.Hash || e.NormalisationVersion != newEntry.NormalisationVersion {
 			break
 		}
 		run++
-	}
-	// Fire when the run reaches N (the spec's "N consecutive" — the plan
+	} // Fire when the run reaches N (the spec's "N consecutive" — the plan
 	// says "N consecutive identical hashes" fires; the CRD default N=3 means
 	// 3 consecutive failures). The run counts newEntry + the matching
 	// trailing history, so a run of N means N consecutive identical
@@ -142,7 +142,7 @@ func (r *LoopReconciler) defaultReadCheckOutput(pod *corev1.Pod, checkName strin
 // the stall decision). The entry is NOT appended if an entry with the same
 // jobName already exists (item 6: a re-read of the same verify Job appends
 // no entry — the dedup key).
-func appendStallEntry(loop *coxv1alpha1.Loop, jobName string, hash, version, check string, at string) coxv1alpha1.StallEntry {
+func appendStallEntry(loop *coxv1alpha1.Loop, jobName, hash, check, at string) coxv1alpha1.StallEntry {
 	// Dedup by jobName (item 6).
 	for i := range loop.Status.StallHistory {
 		if loop.Status.StallHistory[i].JobName == jobName {
@@ -154,7 +154,7 @@ func appendStallEntry(loop *coxv1alpha1.Loop, jobName string, hash, version, che
 		Iteration:            iteration,
 		JobName:              jobName,
 		Hash:                 hash,
-		NormalisationVersion: version,
+		NormalisationVersion: stall.NormalisationVersionV1,
 		Check:                check,
 	}
 	if t, err := parseStallTime(at); err == nil {
@@ -184,7 +184,7 @@ func parseStallTime(at string) (*metav1.Time, error) {
 // verifyJobName returns the verify Job's name for the current iteration
 // (the StallEntry dedup key, item 6): <loop>-verify-<iteration>.
 func (r *LoopReconciler) verifyJobName(loop *coxv1alpha1.Loop) string {
-	return loop.Name + "-verify-" + strconv.Itoa(int(loop.Status.Iteration))
+	return loop.Name + "-verify-" + strconv.Itoa(loop.Status.Iteration)
 }
 
 // readCheckOutputSeam reads the failing check's raw output via the seam
@@ -222,7 +222,7 @@ func normalizeCheckOutput(raw string) (string, string) {
 //
 // Inert in Paused (the Paused phase owns the decision; the gate only runs at
 // a Verifying verify-failure, and a Paused loop is not Verifying — P2f).
-func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod, failedCheck string) bool {
+func (r *LoopReconciler) applyStallGate(loop *coxv1alpha1.Loop, pod *corev1.Pod, failedCheck string) bool {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return false
 	}
@@ -247,7 +247,7 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 	if pod != nil {
 		at = podFinishTime(pod, failedCheck)
 	}
-	entry := appendStallEntry(loop, jobName, hash, stall.NormalisationVersionV1, failedCheck, at)
+	entry := appendStallEntry(loop, jobName, hash, failedCheck, at)
 	fired, run := stallDecision(loop.Status.StallHistory, entry, resolveStallAfter(&loop.Spec))
 	if !fired {
 		return false
@@ -291,10 +291,10 @@ func podFinishTime(pod *corev1.Pod, checkName string) string {
 			continue
 		}
 		if ics.State.Terminated != nil && !ics.State.Terminated.FinishedAt.IsZero() {
-			return ics.State.Terminated.FinishedAt.Time.Format(time.RFC3339)
+			return ics.State.Terminated.FinishedAt.Format(time.RFC3339)
 		}
 		if ics.LastTerminationState.Terminated != nil && !ics.LastTerminationState.Terminated.FinishedAt.IsZero() {
-			return ics.LastTerminationState.Terminated.FinishedAt.Time.Format(time.RFC3339)
+			return ics.LastTerminationState.Terminated.FinishedAt.Format(time.RFC3339)
 		}
 		return ""
 	}

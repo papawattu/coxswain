@@ -122,14 +122,14 @@ func Normalize(raw string) string {
 		// file.go:123:4 → file.go:LINE:COL; file.go:123 → file.go:LINE.
 		// The filename ends at the first colon (a Go filename has no colons);
 		// everything from that colon onward is line(:col) noise.
-		ci := strings.IndexByte(m, ':')
-		if ci < 0 {
+		filename, _, found := strings.Cut(m, ":")
+		if !found {
 			return m
 		}
 		if strings.Count(m, ":") > 1 {
-			return m[:ci] + ":LINE:COL"
+			return filename + ":LINE:COL"
 		}
-		return m[:ci] + ":LINE"
+		return filename + ":LINE"
 	})
 	out = rule5CommitSHAs.ReplaceAllString(out, "COMMIT")
 	out = rule6VerifyJobNames.ReplaceAllString(out, "VERIFYJOB")

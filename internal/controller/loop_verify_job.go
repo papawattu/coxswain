@@ -987,7 +987,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// it, append the StallEntry (dedup'd by jobName), and evaluate the
 		// stall decision. A fire applies the stall action (Fail / Pause /
 		// Continue); a non-fire falls through to the iterate below.
-		if r.applyStallGate(ctx, loop, pod, failedCheck) {
+		if r.applyStallGate(loop, pod, failedCheck) {
 			return true, false
 		}
 		// Back to Implementing, iteration+1 — NOT a new verify Job (the Job

@@ -46,8 +46,8 @@ import (
 // single raw output repeated across iterations (the "N consecutive identical"
 // specs): its normalised hash is stable (the internal/stall normaliser).
 const (
-	p2eOutputA       = "FAIL: TestBuild\nmain.go:10: assertion failed (got 1, want 2)\n"
-	p2eOutputB       = "FAIL: TestDeploy\nkube.go:99: connection refused\n"
+	p2eOutputA        = "FAIL: TestBuild\nmain.go:10: assertion failed (got 1, want 2)\n"
+	p2eOutputB        = "FAIL: TestDeploy\nkube.go:99: connection refused\n"
 	p2eOutputRepeated = "FAIL: TestBuild\nmain.go:10: assertion failed (got 1, want 2)\n"
 )
 
@@ -75,7 +75,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 
 	// aVerifyingLoop returns a Loop at Verifying with the given iteration and
 	// stallAfter / stallAction.
-	aVerifyingLoop := func(iter int, stallAfter int32, action coxv1alpha1.StallAction) *coxv1alpha1.Loop {
+	aVerifyingLoop := func(stallAfter int32, action coxv1alpha1.StallAction) *coxv1alpha1.Loop {
 		return &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: "stalllp", Namespace: ""},
 			Spec: coxv1alpha1.LoopSpec{
@@ -88,7 +88,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 			},
 			Status: coxv1alpha1.LoopStatus{
 				Phase:     coxv1alpha1.LoopPhaseVerifying,
-				Iteration: iter,
+				Iteration: 1,
 			},
 		}
 	}
@@ -103,7 +103,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 				InitContainerStatuses: []corev1.ContainerStatus{
 					{Name: verifyTamperInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
 					{Name: verifyArtifactInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-					{Name: "check-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, FinishedAt: fin}}},
+					{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, FinishedAt: fin}}},
 				},
 			},
 		}
@@ -152,7 +152,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 			loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.Iteration = iter
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-			fired = r.applyStallGate(ctx, loop, aFailingPod(), "check-0")
+			fired = r.applyStallGate(loop, aFailingPod(), s5aCheck0)
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		}
 		return fired
@@ -162,7 +162,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		ns := p2eNs("p2e-s1")
 		defer deleteNS(ctx, ns)
 		r := newP2eReconciler(p2eOutputRepeated)
-		spec := aVerifyingLoop(1, 3, coxv1alpha1.StallActionFail).Spec
+		spec := aVerifyingLoop(3, coxv1alpha1.StallActionFail).Spec
 		createStallLoop(ns, spec)
 
 		fired := runFailures(r, ns, 3)
@@ -179,7 +179,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		ns := p2eNs("p2e-s2")
 		defer deleteNS(ctx, ns)
 		r := newP2eReconciler(p2eOutputRepeated)
-		spec := aVerifyingLoop(1, 3, coxv1alpha1.StallActionPause).Spec
+		spec := aVerifyingLoop(3, coxv1alpha1.StallActionPause).Spec
 		createStallLoop(ns, spec)
 
 		fired := runFailures(r, ns, 3)
@@ -195,7 +195,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		ns := p2eNs("p2e-s3")
 		defer deleteNS(ctx, ns)
 		r := newP2eReconciler(p2eOutputRepeated)
-		spec := aVerifyingLoop(1, 3, coxv1alpha1.StallActionContinue).Spec
+		spec := aVerifyingLoop(3, coxv1alpha1.StallActionContinue).Spec
 		createStallLoop(ns, spec)
 
 		fired := runFailures(r, ns, 3)
@@ -212,7 +212,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		// Alternate A, B, A, B, A: the run never reaches N=3 (each output
 		// resets the consecutive run to 1).
 		outputs := []string{p2eOutputA, p2eOutputB, p2eOutputA, p2eOutputB, p2eOutputA}
-		spec := aVerifyingLoop(1, 3, coxv1alpha1.StallActionFail).Spec
+		spec := aVerifyingLoop(3, coxv1alpha1.StallActionFail).Spec
 		createStallLoop(ns, spec)
 
 		for i, out := range outputs {
@@ -221,7 +221,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 			loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.Iteration = i + 1
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-			fired := r.applyStallGate(ctx, loop, aFailingPod(), "check-0")
+			fired := r.applyStallGate(loop, aFailingPod(), s5aCheck0)
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 			Expect(fired).To(BeFalse(), "output %d (A/B alternating) must not fire", i)
 		}
@@ -233,7 +233,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		ns := p2eNs("p2e-s5")
 		defer deleteNS(ctx, ns)
 		r := newP2eReconciler(p2eOutputRepeated)
-		spec := aVerifyingLoop(1, 999, coxv1alpha1.StallActionFail).Spec // a high N so it never fires
+		spec := aVerifyingLoop(999, coxv1alpha1.StallActionFail).Spec // a high N so it never fires
 		createStallLoop(ns, spec)
 
 		var fired bool
@@ -242,7 +242,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 			loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 			loop.Status.Iteration = iter
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-			fired = r.applyStallGate(ctx, loop, aFailingPod(), "check-0")
+			fired = r.applyStallGate(loop, aFailingPod(), s5aCheck0)
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		}
 		Expect(fired).To(BeFalse(), "N=999 never fires")
@@ -256,7 +256,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		ns := p2eNs("p2e-s6")
 		defer deleteNS(ctx, ns)
 		r := newP2eReconciler(p2eOutputRepeated)
-		spec := aVerifyingLoop(1, 999, coxv1alpha1.StallActionFail).Spec
+		spec := aVerifyingLoop(999, coxv1alpha1.StallActionFail).Spec
 		createStallLoop(ns, spec)
 
 		loop := getLoop(ns, "stalllp")
@@ -264,10 +264,10 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		loop.Status.Iteration = 1
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		// Two reads of the SAME verify Job (same jobName) → one entry.
-		r.applyStallGate(ctx, loop, aFailingPod(), "check-0")
+		r.applyStallGate(loop, aFailingPod(), s5aCheck0)
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		loop = getLoop(ns, "stalllp")
-		r.applyStallGate(ctx, loop, aFailingPod(), "check-0")
+		r.applyStallGate(loop, aFailingPod(), s5aCheck0)
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		loop = getLoop(ns, "stalllp")
 		Expect(loop.Status.StallHistory).To(HaveLen(1), "a re-read of the same jobName appends no entry")
@@ -282,8 +282,8 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		defer deleteNS(ctx, ns)
 		r := newP2eReconciler(p2eOutputRepeated)
 		stallAfter := int32(1) // N=1: a single failure fires the stall gate
-		maxIter := int(1)     // the cap is ALSO reached at iteration 1
-		base := aVerifyingLoop(1, stallAfter, coxv1alpha1.StallActionFail).Spec
+		maxIter := int(1)      // the cap is ALSO reached at iteration 1
+		base := aVerifyingLoop(stallAfter, coxv1alpha1.StallActionFail).Spec
 		base.Loop.MaxIterations = maxIter
 		createStallLoop(ns, base)
 
@@ -291,7 +291,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 		loop.Status.Iteration = 1
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		fired := r.applyStallGate(ctx, loop, aFailingPod(), "check-0")
+		fired := r.applyStallGate(loop, aFailingPod(), s5aCheck0)
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		Expect(fired).To(BeTrue(), "the stall gate fires before the budget cap (stall wins)")
 		loop = getLoop(ns, "stalllp")
@@ -309,7 +309,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		pod := aFailingPod()
 		for i := range pod.Status.InitContainerStatuses {
 			ics := &pod.Status.InitContainerStatuses[i]
-			if ics.Name == "check-0" {
+			if ics.Name == s5aCheck0 {
 				ics.LastTerminationState = corev1.ContainerState{
 					Terminated: &corev1.ContainerStateTerminated{
 						ExitCode: 1,
@@ -318,14 +318,14 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 				}
 			}
 		}
-		raw, ok := r.defaultReadCheckOutput(pod, "check-0")
+		raw, ok := r.defaultReadCheckOutput(pod, s5aCheck0)
 		Expect(ok).To(BeTrue())
 		Expect(raw).To(Equal(p2eOutputA))
 
 		// A pod with no termination message returns ("", false) — an empty
 		// raw (the normaliser of "" is ""; a no-output hot loop still stalls).
 		podNoMsg := aFailingPod()
-		raw2, ok2 := r.defaultReadCheckOutput(podNoMsg, "check-0")
+		raw2, ok2 := r.defaultReadCheckOutput(podNoMsg, s5aCheck0)
 		Expect(ok2).To(BeFalse())
 		Expect(raw2).To(BeEmpty())
 	})

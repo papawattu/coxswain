@@ -107,7 +107,7 @@ func TestPhaseRunPlanningWritesPlanAndClaim(t *testing.T) {
 		t.Fatalf("result.json observedPhase = %v, want %q", result["observedPhase"], PhasePlanning)
 	}
 	// The claim (the termination message the operator reads back) is the
-	// STRICT {"observedPhase","status","blockedReason"} object.
+	// STRICT {"observedPhase","status","blockedReason","iteration"} object.
 	claim := parseClaim(t, claimPath)
 	if claim["observedPhase"] != PhasePlanning {
 		t.Fatalf("claim observedPhase = %v, want %q", claim["observedPhase"], PhasePlanning)
@@ -115,8 +115,16 @@ func TestPhaseRunPlanningWritesPlanAndClaim(t *testing.T) {
 	if claim["status"] != statusSuccess {
 		t.Fatalf("claim status = %v, want %q", claim["status"], statusSuccess)
 	}
-	if _, ok := claim["iteration"]; ok {
-		t.Fatalf("the claim must NOT carry iteration (it rides in result.json only): %v", claim)
+	// The claim MUST carry iteration (the operator's stale-iteration guard
+	// reads claim.Iteration; a missing "iteration" key parses as 0, so an
+	// omitted field reads as a STALE claim from iteration 0 — the P2h
+	// kind-run stall: the Implementing-iteration-2 claim was ignored as
+	// {"observedPhase","status","headCommit"} with no iteration, and the
+	// Loop could never advance past Verifying -> Stalled). No .coxswain/
+	// iteration marker here -> the claim carries 0, which is accepted when
+	// the Loop's status.iteration is also 0.
+	if v, ok := claim["iteration"]; !ok || v != float64(0) {
+		t.Fatalf("the claim must carry iteration=0 (no .coxswain/iteration marker): %v", claim)
 	}
 }
 

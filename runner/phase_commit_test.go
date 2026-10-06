@@ -358,3 +358,87 @@ func TestRestartStaleIterationResultNotReused(t *testing.T) {
 	}
 	_ = claimPath
 }
+
+// TestPhaseRunImplementingClaimCarriesCurrentIteration (S5a, the P2h
+// kind-run stall): the claim written to the termination log MUST carry the
+// .coxswain/iteration the runner read — the operator's stale-iteration
+// guard compares claim.Iteration against loop.Status.Iteration and
+// discards a mismatched claim, and a missing "iteration" key parses as 0,
+// so an omitted field reads as a STALE claim from iteration 0. This is the
+// P2h root cause: the Implementing-iteration-2 claim was written as
+// {"observedPhase":"Implementing","status":"success","headCommit":"…"}
+// (no iteration — writeClaim's claim struct omitted the field), the
+// operator ignored it as stale (claimIteration=0, statusIteration=2), and
+// the Loop could never advance past Verifying -> Stalled.
+func TestPhaseRunImplementingClaimCarriesCurrentIteration(t *testing.T) {
+	fake := s4FakeModel()
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	// The operator's phase-init wrote the CURRENT iteration marker: 2.
+	if err := os.WriteFile(filepath.Join(ws, resultDirName, iterationFileName), []byte("2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan any)
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
+	if res.Status != statusSuccess {
+		t.Fatalf("Implementing phase: status = %q (notes: %s)", res.Status, res.VerificationNotes)
+	}
+	data, err := os.ReadFile(claimPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim struct {
+		Iteration int `json:"iteration"`
+	}
+	if err := json.Unmarshal(data, &claim); err != nil {
+		t.Fatalf("claim is not JSON: %v", err)
+	}
+	if claim.Iteration != 2 {
+		t.Fatalf("claim iteration = %d, want 2 (the current .coxswain/iteration — a missing key parses as 0, which the operator's stale-iteration guard discards when status.iteration is 2; the P2h kind-run stall): %s", claim.Iteration, data)
+	}
+}
+
+// TestWriteClaimCarriesIteration (S5a, the P2h kind-run stall): writeClaim's
+// JSON (the /dev/termination-log the operator parses) MUST carry
+// iteration == res.Iteration. The operator's stale-iteration guard reads
+// claim.Iteration and a missing "iteration" key parses as 0 — so an
+// omitted field reads as a STALE claim from iteration 0, and every Loop
+// would stall at its first iterate (the P2h root cause: writeClaim's claim
+// struct omitted the field, so the Implementing-iteration-2 claim was
+// written as {"observedPhase","status","headCommit"} with no iteration,
+// and the operator ignored it as stale).
+func TestWriteClaimCarriesIteration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claim.json")
+	res := Result{Status: statusSuccess, ObservedPhase: PhaseImplementing,
+		HeadCommit: "abc", Iteration: 2}
+	writeClaim(path, res)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim struct {
+		ObservedPhase string `json:"observedPhase"`
+		Status        string `json:"status"`
+		HeadCommit    string `json:"headCommit"`
+		Iteration     *int   `json:"iteration"`
+	}
+	if err := json.Unmarshal(data, &claim); err != nil {
+		t.Fatalf("claim is not JSON: %v (%s)", err, data)
+	}
+	if claim.ObservedPhase != PhaseImplementing || claim.Status != statusSuccess {
+		t.Fatalf("claim observedPhase/status = %q/%q, want Implementing/success: %s", claim.ObservedPhase, claim.Status, data)
+	}
+	if claim.Iteration == nil {
+		t.Fatalf("the claim MUST carry the iteration key (a missing key parses as 0 at the operator, which the stale-iteration guard discards when status.iteration is 2): %s", data)
+	}
+	if *claim.Iteration != res.Iteration {
+		t.Fatalf("claim iteration = %d, want %d (res.Iteration): %s", *claim.Iteration, res.Iteration, data)
+	}
+}

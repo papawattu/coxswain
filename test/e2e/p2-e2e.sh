@@ -141,6 +141,24 @@ pass() { echo "   [PASS] $*"; }
 fail() { echo "   [FAIL] $*" >&2; FAILED=1; }
 die() { echo "FATAL: $*" >&2; exit 2; }
 
+# Per-assertion completion accounting (the reviewer's finding: a script bug
+# that skips an assertion section must FAIL the RESULT, not PASS it). Each
+# assertion section marks itself at the end (assert_done <n> <state>, state:
+# pass | dropped | fail). The summary FAILS unless every one of the five
+# assertions RAN, and 1/2/4/5 each have at least one PASS (3 may instead be
+# a justified DROPPED — the plan's cross-check is a consistency check, not a
+# gate). A section that never ran (a bug skipped it) is 'missing' -> FAIL.
+ASSERT_STATE=""   # space-separated "1:pass 2:fail 3:dropped ..."
+assert_done() {
+  local n="$1" state="$2"
+  case "$ASSERT_STATE" in *" $n:"*|"${n}:"*) ASSERT_STATE="$ASSERT_STATE";; *) ASSERT_STATE="$ASSERT_STATE $n";; esac
+  ASSERT_STATE="$(echo "$ASSERT_STATE" | tr ' ' '\n' | grep -v "^$n" | tr '\n' ' ')$n:$state"
+  echo "   [assert $n] state=$state"
+}
+assert_missing() { # assert_missing <n>; called from the summary for each n
+  case "$ASSERT_STATE" in *" $1:"*) return 1 ;; *" $1:run"*) return 0 ;; *) return 0 ;; esac
+}
+
 trap 'echo; echo "=== P2h run log: $LOG ==="; exit $FAILED' EXIT
 exec > >(tee "$LOG") 2>&1
 
@@ -761,6 +779,7 @@ fi
 # --- assertion 1: the Stalled path ---
 echo
 echo "--- assertion 1: the Stalled path (stall Loop + the control contrast) ---"
+PRE_A1_FAILED=$FAILED
 ST_PHASE="$(lphase p2h-stall)"
 ST_FAILED_REASON="$(lfield p2h-stall '.status.conditions[?(@.type=="Failed")].reason')"
 ST_STALLED_COND="$(lfield p2h-stall '.status.conditions[?(@.type=="Stalled")].status')"
@@ -797,10 +816,18 @@ if [ "$CT_PHASE" = "Failed" ] && [ "$CT_ITER" = "5" ]; then
 else
   fail "control Loop: phase=$CT_PHASE iteration=$CT_ITER failed-reason=$CT_FAILED_REASON (expected Failed at 5)"
 fi
+# assertion 1 accounting: pass iff the stall stop + the contrast both held
+# and NO new fail fired in-section (the event check is an audit record).
+if [ "$ST_PHASE" = "Failed" ] && [ "$ST_FAILED_REASON" = "Stalled" ] && [ "$ST_STALLED_COND" = "True" ] && [ "$ST_ITER" = "3" ] && [ "$CT_PHASE" = "Failed" ] && [ "$CT_ITER" = "5" ] && [ "$FAILED" -eq "$PRE_A1_FAILED" ]; then
+  assert_done 1 pass
+else
+  assert_done 1 fail
+fi
 
 # --- assertion 2: the BudgetExceeded path ---
 echo
 echo "--- assertion 2: the BudgetExceeded path (budget Loop) ---"
+PRE_A2_FAILED=$FAILED
 BD_PHASE="$(lphase p2h-budget)"
 BD_FAILED_REASON="$(lfield p2h-budget '.status.conditions[?(@.type=="Failed")].reason')"
 BD_EXCEEDED="$(lfield p2h-budget '.status.budget.exceeded')"
@@ -829,6 +856,14 @@ sys.exit(0 if any('BudgetExceeded' in (e.get('reason') or '') for e in evs) else
   pass "budget Loop: a BudgetExceeded Event is present"
 else
   fail "budget Loop: no BudgetExceeded Event (events in $LOG_DIR/events-budget.json)"
+fi
+# assertion 2 accounting: pass iff the Failed:BudgetExceeded stop + the
+# >= cap total both held and NO new fail fired in-section (the event is an
+# audit record).
+if [ "$BD_PHASE" = "Failed" ] && [ "$BD_FAILED_REASON" = "BudgetExceeded" ] && [ "$BD_EXCEEDED" = "true" ] && [ "$BD_REASON" = "Tokens" ] && [ "$BD_TOK" -ge 300 ] 2>/dev/null && [ "$FAILED" -eq "$PRE_A2_FAILED" ]; then
+  assert_done 2 pass
+else
+  assert_done 2 fail
 fi
 
 # --- assertion 3: the real-backend cross-check ---
@@ -905,7 +940,10 @@ else
   kill $PF_PID 2>/dev/null || true
   echo "   [DROPPED] the homelab Prometheus ($HOMELAB_CTX, ns prometheus) was unreachable from this runner (port-forward log: $PF_LOG); the cross-check is dropped with a note (the plan allows it)" | tee -a "$LOG_DIR/crosscheck.txt"
 fi
-[ "$XCHECK" = "pass" ] || true   # dropped is not a failure (the plan: a consistency check, not a gate)
+if [ "$XCHECK" = "pass" ]; then assert_done 3 pass
+elif [ "$XCHECK" = "dropped" ]; then assert_done 3 dropped
+else fail "cross-check: XCHECK=$XCHECK (not pass or dropped)"; assert_done 3 fail
+fi
 
 # --- assertion 4: the paused-Loop resume ---
 echo
@@ -920,8 +958,12 @@ RESUME_RUN=0
 if [ "$(lphase p2h-resume)" = "Implementing" ] || wait_phase p2h-resume Implementing 600; then
   ok "resume Loop at Implementing (suspend flipped now)"
   RESUME_RUN=1
+else
+  fail "assertion 4: the resume Loop was never at Implementing in the flip window (phase=$(lphase p2h-resume)); the pause/resume cycle was not exercised"
+  assert_done 4 fail
 fi
 if [ "$RESUME_RUN" = "1" ]; then
+PRE_A4_FAILED=$FAILED
 # Record the pre-pause state (the consistency assertion compares against it).
 PRE_ITER="$(lfield p2h-resume '.status.iteration')"
 PRE_VERIFY="$(lfield p2h-resume '.status.currentVerify.verifiedCommit')"
@@ -986,12 +1028,23 @@ if [ -n "$POST_VERIFY" ]; then
 else
   fail "resume Loop: currentVerify.verifiedCommit is EMPTY after resume (the resume reset the verify pin)"
 fi
+  # assertion 4 accounting: pass iff the pause/resume cycle completed with
+  # the right pausedFrom/pausedReason, the records cleared on resume, the
+  # iteration unchanged (not reset), the pin intact, and NO new fail fired
+  # in-section (each conjunct is also checked by a pass/fail above; the
+  # in-section FAILED delta is the gate that catches one of them failing).
+  if [ "$RP_FROM" = "Implementing" ] && [ "$RP_REASON" = "Suspend" ] && [ -z "$RP_FROM2" ] && [ -z "$RP_REASON2" ] && [ "$POST_ITER" = "$PRE_ITER" ] && [ -n "$POST_VERIFY" ] && [ "$FAILED" -eq "$PRE_A4_FAILED" ]; then
+    assert_done 4 pass
+  else
+    assert_done 4 fail
+  fi
 fi
 
 
 # --- assertion 5: the budget-Pause + raised-cap resume ---
 echo
 echo "--- assertion 5: the budget-Pause + raised-cap resume (both sub-cases) ---"
+PRE_A5_FAILED=$FAILED
 # The entry point: the budget fire happens at Verifying (the applyBudgetStep
 # runs every reconcile; the exceedance is recorded at the 2nd Implementing's
 # 400 tokens). pausedFrom names the phase the Loop left (Implementing or
@@ -1062,6 +1115,15 @@ if [ "$B2_OK" = "1" ] && [ "$(lfield p2h-budgetpause2 '.status.budget.exceeded')
   pass "budget-Pause control Loop (un-raised): re-pauses immediately on the annotation resume (the fail-closed re-fire; exceeded still true)"
 else
   fail "budget-Pause control Loop (un-raised): phase=$(lphase p2h-budgetpause2) exceeded=$(lfield p2h-budgetpause2 '.status.budget.exceeded') (expected Paused + exceeded=true; refused-event=$B2_REJECTED)"
+fi
+# assertion 5 accounting: pass iff the entry point + both sub-cases held and
+# NO new fail fired in-section (a STEP 4+ re-run that re-applies the
+# idempotent patch/annotation against an already-resolved Loop counts the
+# end state; a fail that fires in-section wins over it).
+if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$(lfield p2h-budgetpause2 '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
+  assert_done 5 pass
+else
+  assert_done 5 fail
 fi
 
 fi
@@ -1135,6 +1197,22 @@ echo "operator image:   $CTRL_IMG"
 echo "operator digest:  $RUNNING_IMAGEID"
 echo "cross-check:      $XCHECK"
 echo "log:              $LOG"
+# The reviewer's gate: the RESULT fails unless all FIVE assertion sections
+# ran (a section a script bug skipped is 'missing' — not a pass) and 1/2/4/5
+# each reached 'pass' (3 may be 'dropped' — the plan's justified drop).
+MISSING=""
+for n in 1 2 3 4 5; do
+  case "$ASSERT_STATE" in
+    *" $n:"*) ;;
+    *) MISSING="$MISSING $n";;
+  esac
+done
+[ -z "$MISSING" ] || fail "assertion accounting: section(s)$MISSING did not run (a script bug skipped them — the RESULT cannot be PASS)"
+for n in 1 2 4 5; do
+  case "$ASSERT_STATE" in *" $n:pass"*) ;; *) fail "assertion accounting: assertion $n did not reach pass (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep "^$n:" || echo missing))" ;; esac
+done
+case "$ASSERT_STATE" in *" 3:pass"*|*" 3:dropped"*) ;; *) fail "assertion accounting: assertion 3 is neither pass nor a justified dropped (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep '^3:' || echo missing))" ;; esac
+echo "   assertion states: $ASSERT_STATE"
 if [ "$FAILED" -ne 0 ]; then echo "RESULT: FAIL"; else echo "RESULT: PASS"; fi
 
 fi

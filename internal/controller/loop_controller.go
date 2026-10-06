@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/http"
 	netip "net/netip"
 	neturl "net/url"
 	"os"
@@ -40,6 +41,7 @@ import (
 	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
+	"github.com/papawattu/coxswain/internal/proxy"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -221,6 +223,13 @@ type LoopReconciler struct {
 	// input; the reader rejects it and logs.)
 	readPhaseClaim func(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error)
 
+	// baseCommitSeeded is a test seam for the clone-pending timer: when
+	// set, the 5s clone-pending RequeueAfter is suppressed (a spec that
+	// seeds status.baseCommit itself, or that asserts the budget
+	// RequeueAfter, can read the budget value without the 5s timer masking
+	// it. The timer's own spec (B1) does not set the seam).
+	baseCommitSeeded bool
+
 	// phaseGate is the OS8 phase-gate seam: it decides whether the phase
 	// machine may advance from current to next (an approval hold, or a future
 	// observer-proposed hold). The S4 build ships exactly one implementation,
@@ -306,14 +315,22 @@ type LoopReconciler struct {
 	// POD_NAMESPACE from env).
 	OperatorNamespace string
 
-	// readProxyUsage is the P3 seam (ADR-0009 item 12): the operator's usage
-	// reader. It is nil until P3 (P2b injects it as a no-op / nil so the
-	// operator does NOT yet consume the usage — the operator reads the usage
-	// via HTTP in P3). When set, it is called with the proxy's Service URL
-	// (the usage endpoint) so P3 can wire the HTTP GET /coxswain/usage. Keeping
-	// it a field (not a call from the reconciler) means P2b is verifiable
-	// without the gate's consumption.
-	readProxyUsage func(ctx context.Context, usageURL string)
+	// readProxyUsage is the operator's proxy-usage read seam (P2a item 12,
+	// P2d). It reads the proxy's cumulative usage reading from the proxy pod's
+	// /coxswain/usage endpoint. The default (nil) resolves the proxy pod's IP
+	// from the pod status the operator already reads (no new RBAC — the operator
+	// already has pod get) and performs a plain HTTP GET to
+	// http://<pod-ip>:9090/coxswain/usage. Every envtest spec injects a fake
+	// via this field (envtest has neither a proxy pod that serves HTTP nor a
+	// kubelet). An error means NO reading this reconcile: status.budget is
+	// left unchanged (no reset, no delta — the operator does not guess).
+	readProxyUsage func(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error)
+
+	// usageHTTPClient is the http.Client the default readProxyUsage uses. Set
+	// in tests to shorten the read timeout; the production default is a 2s
+	// timeout (a proxy that does not answer is not worth blocking the
+	// reconcile for longer).
+	usageHTTPClient *http.Client
 }
 
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=loops,verbs=get;list;watch;create;update;patch;delete
@@ -381,45 +398,11 @@ func (r *LoopReconciler) modelConfigInvalid(ctx context.Context, loop *coxv1alph
 }
 
 // Reconcile moves the cluster state closer to the Loop's desired state.
-func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var loop coxv1alpha1.Loop
-	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
-		// Deleted or never existed: nothing to do.
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
-	// creating the sandbox (defence in depth: the CRD CEL catches the common
-	// case at admission; this catches anything that slips through, including
-	// missing/unreadable policies). If validation fails, set
-	// PolicyValid=False and suspend the sandbox (if running).
-	if !r.agentPoliciesValid(ctx, &loop) {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// D34 (P1): the endpointSecretRef + modelEndpoint pair is required. A Secret
-	// without an endpoint (or an endpoint without a Secret) is a misconfiguration
-	// that would crash-loop the proxy; reject it early.
-	if r.modelConfigInvalid(ctx, &loop) {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// D38: capture the condition set before applyEffectivePolicyAndConditions so
-	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
-	// probe result change) still triggers a status update. Without this, the
-	// "re-gate on flip" spec would never persist the new condition.
-	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
-	copy(condsBefore, loop.Status.Conditions)
-
-	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
-	}
-	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
-	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
-	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
-	// gates apply: an invalid policy suspends, and unenforced also suspends.
-
-	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+// phaseBootstrap is the Phase-0 + S4 bootstrap + P2f pause mechanics +
+// ensureSandbox step extracted from Reconcile to keep the top-level
+// reconcile within the gocyclo budget. It returns (changed, pauseBlocked,
+// resumeCleared, err).
+func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
 	changed := false
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
@@ -443,8 +426,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// recycle — a fresh emptyDir per phase wiped PLAN.md and the
 	// Implementing edits. The step is a small helper (Reconcile complexity,
 	// gocyclo 31).
-	if err := r.ensureLoopArtifacts(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
+	if err := r.ensureLoopArtifacts(ctx, loop); err != nil {
+		return false, false, err
 	}
 
 	// P2f: the Paused phase entry (spec.suspend=true on a non-terminal phase,
@@ -454,10 +437,89 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// at Planning, not the empty phase) and BEFORE ensureSandbox so the
 	// sandbox is built with the post-pause/resume phase + OperatingMode in the
 	// same pass.
-	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, &loop)
+	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, loop)
 	changed = changed || pauseChanged
 
-	if err := r.ensureSandbox(ctx, &loop, pauseBlocked); err != nil {
+	if err := r.ensureSandbox(ctx, loop, pauseBlocked); err != nil {
+		return false, false, err
+	}
+	return changed, resumeCleared, nil
+}
+
+// validateStep is the C6a + D34 validation step extracted from Reconcile
+// to keep the top-level reconcile within the gocyclo budget. It returns
+// (result, true) when the validation fails (the caller returns the result),
+// or (zero, false) when the validation passes (the caller continues).
+func (r *LoopReconciler) validateStep(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, bool) {
+	// C6a (R15 round 3): validate the referenced AgentPolicies BEFORE
+	// creating the sandbox (defence in depth: the CRD CEL catches the common
+	// case at admission; this catches anything that slips through, including
+	// missing/unreadable policies). If validation fails, set
+	// PolicyValid=False and suspend the sandbox (if running).
+	if !r.agentPoliciesValid(ctx, loop) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	}
+	// D34 (P1): the endpointSecretRef + modelEndpoint pair is required. A
+	// Secret without an endpoint (or an endpoint without a Secret) is a
+	// misconfiguration that would crash-loop the proxy; reject it early.
+	if r.modelConfigInvalid(ctx, loop) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	}
+	return ctrl.Result{}, false
+}
+
+// applyBudgetStep is the P2d budget step extracted from Reconcile to keep
+// the top-level reconcile within the gocyclo budget. It snapshots the
+// budget before the applyBudget call (a COPY of the struct, not a pointer
+// — the DeepEqual must compare the pointed-to structs, not the pointer
+// values) and returns the RequeueAfter (the quiet wall-clock rule) and
+// whether the budget was mutated.
+func (r *LoopReconciler) applyBudgetStep(ctx context.Context, loop *coxv1alpha1.Loop) (time.Duration, bool) {
+	var budgetBefore *coxv1alpha1.BudgetStatus
+	if loop.Status.Budget != nil {
+		b := *loop.Status.Budget
+		budgetBefore = &b
+	}
+	budgetRequeue := r.applyBudget(ctx, loop)
+	budgetChanged := !equality.Semantic.DeepEqual(budgetBefore, loop.Status.Budget)
+	return budgetRequeue, budgetChanged
+}
+
+func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var loop coxv1alpha1.Loop
+	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
+		// Deleted or never existed: nothing to do.
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// C6a + D34: validate the referenced AgentPolicies and the
+	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
+	// the Reconcile within the gocyclo budget).
+	if res, done := r.validateStep(ctx, &loop); done {
+		return res, nil
+	}
+
+	// D38: capture the condition set before applyEffectivePolicyAndConditions so
+	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
+	// probe result change) still triggers a status update. Without this, the
+	// "re-gate on flip" spec would never persist the new condition.
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
+
+	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
+	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
+	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
+	// gates apply: an invalid policy suspends, and unenforced also suspends.
+
+	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
+	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
+	// budget).
+	changed, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -581,6 +643,18 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	changed = changed || baseCommitChanged
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
+	// P2d: the budget decision — the operator reads the proxy's usage endpoint
+	// (the readProxyUsage seam), folds the reading into status.budget (the
+	// boot-ID delta rules), accumulates the wall clock, and applies the caps
+	// + onExceeded. It is inert in Paused (P2f: the decision re-evaluates on
+	// resume) and gated on the verify/stall decisions (stall wins, item 8).
+	// It runs every reconcile, including Paused, so a wall-clock hit WHILE
+	// paused still records exceeded (P2f spec 14) without re-firing the
+	// onExceeded action. The helper returns the RequeueAfter (the quiet
+	// wall-clock rule) and whether the budget was mutated (the changed flag).
+	budgetRequeue, budgetChanged := r.applyBudgetStep(ctx, &loop)
+	changed = changed || budgetChanged
+
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
 	// (AFTER it, so the two Loop writes never race) are extracted to
 	// finalizeLoopStatus to keep the top-level reconcile within the gocyclo
@@ -589,8 +663,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	if baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue {
+	// P2d item 10: the wall-clock RequeueAfter (the quiet-Loop rule) is the
+	// ONLY timer this reconcile sets: when spec.budget.maxWallClock is set and
+	// not yet hit, a Loop with no other activity (no baseCommit/claim/verify/
+	// deliver requeue) re-reconciles at the remaining time so the wall clock
+	// still trips. The pending flags are 5s timers; the wall clock is exact.
+	if !r.baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if budgetRequeue > 0 {
+		return ctrl.Result{RequeueAfter: budgetRequeue}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -1801,6 +1883,16 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		} else {
 			log.Info("proxy pod spec drift detected, deleting for recreation",
 				"proxy", proxyPodName(loopName), "loop", loopName)
+			// P2d: a final read of the endpoint BEFORE the recreate (the P2b
+			// drift path): the last-known cumulative count lands on
+			// status.budget, so the recreate's bootID change is the visible,
+			// bounded loss — not an unrecorded one. A read failure here is not
+			// fatal: the recreate proceeds and the next reconcile reads the
+			// fresh boot (the loss is still bounded by the previous successful
+			// read, or is the full boot if there was none).
+			if fr, rerr := r.resolveProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+				r.applyUsageReading(ctx, loop, *fr)
+			}
 			if delErr := r.Delete(ctx, existingPod); delErr != nil && !apierrors.IsNotFound(delErr) {
 				return fmt.Errorf("delete drifted proxy pod %s/%s: %w", ns, proxyPodName(loopName), delErr)
 			}
@@ -1835,24 +1927,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 				"no foreign proxy pod detected")
 		}
 	}
-	// P2b (ADR-0009, seam item 12): the operator's usage reader seam. It is
-	// nil until P3 (which wires the HTTP GET /coxswain/usage); P2b exposes it
-	// so the operator's usage consumption is a seam, not hard-coded. When set,
-	// it is called with the proxy's usage Service URL.
-	if r.readProxyUsage != nil {
-		usageURL := r.proxyUsageURL(loopName, ns)
-		r.readProxyUsage(ctx, usageURL)
-	}
 	return nil
-}
-
-// proxyUsageURL is the operator's in-cluster URL for the proxy's usage
-// endpoint (P2b, ADR-0009): http://<loop>-proxy.<ns>.svc.<domain>:9090/coxswain/usage.
-// The operator reads the cumulative usage from this URL (the <loop>-proxy
-// netpol allows the operator namespace / controller-manager on 9090, never
-// the agent).
-func (r *LoopReconciler) proxyUsageURL(loopName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc.%s:%d/coxswain/usage", proxyServiceName(loopName), namespace, r.clusterDomain(), proxyUsagePort)
 }
 
 // newLimit returns a pointer to the parsed quantity, for the emptyDir sizeLimit

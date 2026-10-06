@@ -231,11 +231,13 @@ trust to be unbroken. Therefore:
     zero, and must not be guessed), and records **no** `MeteringReset`
     warning (an adoption is not an anomaly — P2d spec 13).
   - **A pod recreate** (a **different `bootID`**, counters from 0): the
-    operator resets its `last*` to the reading's values, records
-    `status.budget.bootIDChanged=true` (sticky, operator-visible), and
-    emits a `Warning` Event `Reason: MeteringReset` (a fresh boot, a delta
-    from 0). The honest limit: a pod **recreate** loses the cumulative
-    count (the emptyDir is per-pod); the loss is visible, not silent.
+    operator **adds the new boot's reading in full** to the accumulation
+    (a fresh boot is a **delta from 0**), then resets its `last*` to the
+    reading's values, records `status.budget.bootIDChanged=true` (sticky,
+    operator-visible), and emits a `Warning` Event `Reason: MeteringReset`
+    (a fresh boot, a delta from 0). The honest limit: a pod **recreate**
+    loses the old pod's usage since the last read (the emptyDir is
+    per-pod); the loss is visible, not silent.
   - **A counter that drops without a bootID change** (same `bootID`, a
     cumulative value *lower* than `last*` — a corrupted/partial file or a
     torn read): the operator emits a `Warning` Event `Reason:

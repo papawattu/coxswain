@@ -1184,13 +1184,27 @@ PRE_A5_FAILED=$FAILED
 # runs every reconcile; the exceedance is recorded at the 2nd Implementing's
 # 400 tokens). pausedFrom names the phase the Loop left (Implementing or
 # Verifying, per the entry point).
+# The entry point: the budget fire happens at the phase the Loop left when the
+# budget was hit. The budget is on the REQUEST (applyBudgetStep runs every
+# reconcile), and with maxTokens:400 (2 requests x 200 tokens) the 2nd request
+# fires the budget. The first model request is issued during the
+# Planning->Implementing transition, so the 2nd request (the fire) can land
+# while the Loop's recorded phase is still Planning (the phase advances to
+# Implementing only after the first Implementing's request is recorded) — or
+# later at Implementing/Verifying on a subsequent iteration. The plan's
+# 'pausedFrom=Verifying (or Implementing, per the entry point)' acknowledges
+# the entry point varies; Planning is the entry point when the budget fires on
+# the first request. So the valid pausedFrom values are Planning, Implementing
+# or Verifying (any non-terminal phase the Loop can be in when the budget
+# fires). The assertion is pausedReason=Budget + exceeded=true + pausedFrom is
+# one of those phases (NOT terminal, NOT empty).
 B1_FROM="$(lfield ${p2h_budgetpause} '.status.pausedFrom')"
 B1_REASON="$(lfield ${p2h_budgetpause} '.status.pausedReason')"
 B1_EXC="$(lfield ${p2h_budgetpause} '.status.budget.exceeded')"
-if [ "$B1_REASON" = "Budget" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ]; } && [ "$B1_EXC" = "true" ]; then
+if [ "$B1_REASON" = "Budget" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_EXC" = "true" ]; then
   pass "budget-Pause Loop: phase=Paused, pausedFrom=$B1_FROM, pausedReason=Budget, exceeded=true"
 else
-  fail "budget-Pause Loop: pausedFrom=$B1_FROM pausedReason=$B1_REASON exceeded=$B1_EXC (expected Implementing-or-Verifying/Budget/true)"
+  fail "budget-Pause Loop: pausedFrom=$B1_FROM pausedReason=$B1_REASON exceeded=$B1_EXC (expected Planning/Implementing-or-Verifying/Budget/true)"
 fi
 # Sub-case (a): the raised-cap resume. Raise maxTokens (I43 live update) +
 # resume via the coxswain.io/resume annotation. (Idempotent for a STEP 4+
@@ -1277,7 +1291,7 @@ fi
 # NO new fail fired in-section (a STEP 4+ re-run that re-applies the
 # idempotent patch/annotation against an already-resolved Loop counts the
 # end state; a fail that fires in-section wins over it).
-if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
+if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
   assert_done 5 pass
 else
   assert_done 5 fail

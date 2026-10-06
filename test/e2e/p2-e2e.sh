@@ -289,13 +289,16 @@ seed_repo() { # seed_repo <repo-name>; echoes the seed commit SHA
       -d "$BODY")
     case "$CODE" in
       201|409) ;;  # created / already exists (the push -f re-seeds)
-      *) echo "Gitea API create failed: http $CODE $(cat /tmp/create-$R.json)"; exit 1 ;;
+      *) echo "Gitea API create failed: http $CODE body=$(cat /tmp/create-$R.json 2>/dev/null | head -c 300)"; exit 1 ;;
     esac
-    rm -rf /tmp/seed /tmp/seedwork; mkdir -p /tmp/seed; cd /tmp/seed
+    # The API create is done; verify the repo is actually there (the 422 "Name
+    # Required" seen in a prior run was the body not reaching the API — the
+    rm -rf /tmp/seed; mkdir -p /tmp/seed; cd /tmp/seed
     # Clone the API-created repo (empty on the first run; the clone warns but
-    # succeeds — the work dir is the clone target). Then commit the seed
-    # README.md + push -f (the force push creates the initial branch on the
-    # empty repo; no push-to-create needed because the API created the repo).
+    # succeeds — the work dir is the clone target). A 404 clone means the API
+    # create did not actually create the repo (a transient Gitea
+    # inconsistency) — the || fallback (init + remote add) is the
+    # belt-and-suspenders.
     git clone -q http://samples:samples-git-password@gitea.samples.svc:3000/samples/$R.git work 2>/dev/null || { mkdir work; cd work; git init -q -b initial; git remote add origin http://samples:samples-git-password@gitea.samples.svc:3000/samples/$R.git; }
     cd /tmp/seed/work
     git config user.email p2h@example.com; git config user.name p2h

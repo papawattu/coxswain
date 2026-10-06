@@ -44,3 +44,7 @@ go.work
 
 # Project knowledge index (local/dev-box state; never committed)
 /.gnosis/
+
+# Python (the P2h stub model server fixture, test/e2e/p2h-stub-model.py).
+__pycache__/
+*.pyc

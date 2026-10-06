@@ -195,6 +195,14 @@ i42-e2e: ## Run the full I42 acceptance kind e2e (pinned to --context kind-coxsw
 d41-e2e: ## Run the full D41e kind acceptance (per-tool proxies) kind e2e (pinned to --context kind-coxswain-dev).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/d41-e2e.sh
 
+.PHONY: p2-e2e
+p2-e2e: ## Run the P2h kind acceptance (the Phase 2 "Done when": the stalled/budget-exceeded stop + the paused-Loop resume) kind e2e (pinned to --context kind-coxswain-dev). Builds the operator + runner; P2H_OPERATOR_IMAGE overrides the operator image (the gate mutations).
+	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/p2-e2e.sh
+
+.PHONY: p2h-execstub-test
+p2h-execstub-test: ## P2h I55 execution test: the p2h-stub-model.py file is executed with only path/host constants substituted (PORT env + /ok + one chat request), before any kind run.
+	@bash test/e2e/p2h-execstub-test.sh
+
 .PHONY: p2b-e2e
 p2b-e2e: ## Run the P2b kind acceptance (the metering model proxy: dial success/blocks, usage endpoint, netpol, image digests) kind e2e (pinned to --context kind-coxswain-dev). Logs to .samples/p2b/.
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/p2b-e2e.sh

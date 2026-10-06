@@ -1003,6 +1003,7 @@ echo "   per-Loop status.budget: $REAL_BUDGET" >> "$LOG_DIR/crosscheck.txt"
 # clone-base-failed verify Job never advances), assertion 3 FAILS with the
 # Loop's phase in the log (it cannot be cross-checked: no budget record,
 # no Succeeded). The run still proceeds to assertions 1/2/4/5.
+XCHECK="pending"   # set to fail/pass/dropped in the cross-check computation below
 if [ "$REAL_PHASE" != "Succeeded" ]; then
   XCHECK="fail"
   fail "cross-check: ${p2h_real} never reached Succeeded (phase=$REAL_PHASE — a transient DNS flake left the clone-base verify Job failed; the operator's pre-existing gap)"

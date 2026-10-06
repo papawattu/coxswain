@@ -144,16 +144,23 @@ func (r *LoopReconciler) verifyJobImage() string {
 // checkTeed wraps a check command so its stdout+stderr are ALSO written to
 // the terminationMessagePath (P2e): the stall detector reads the failing
 // check's raw output from the terminationMessage (no pod-log read). The
-// wrapper runs the user command and tees its output to the log file, then
-// EXITS WITH THE USER COMMAND'S EXIT CODE (the exit code is the verify
-// evidence — the tee must not mask a non-zero check). POSIX sh (busybox +
-// alpine both run it): `set -o pipefail` so the exit code is the command's
-// (not the tee's), the output teed to the path, and the code captured.
+// wrapper runs the user command, tees its output to the log file (the
+// operator constant verifyTerminationLogPath), then EXITS WITH THE USER
+// COMMAND'S EXIT CODE (the exit code is the verify evidence — the tee must
+// not mask a non-zero check).
+//
+// POSIX sh only (the container's /bin/sh is dash on alpine and busybox sh on
+// other bases — bash-only features like ${PIPESTATUS[0]} are a bad
+// substitution under sh and exit 2). The command is shell-quoted EXACTLY
+// once (shellQuote); it is NOT additionally wrapped in %q (double-quoting
+// makes the inner sh -c run the whole command as a single word — exit 127).
+// The log path is the operator constant verifyTerminationLogPath (no user
+// input), so it is unquoted. The exit code is captured into rc BEFORE the
+// cat (which resets $?), and the cat echoes the log back to stdout so the
+// 4 KB tail the kubelet records as the terminationMessage is the check's
+// stdout+stderr.
 func checkTeed(cmd, logPath string) string {
-	return fmt.Sprintf(`
-set -o pipefail 2>/dev/null || true
-sh -c %q 2>&1 | tee %q; exit ${PIPESTATUS[0]:-$?}
-`, shellQuote(cmd), shellQuote(logPath))
+	return fmt.Sprintf("%s -c %s > %s 2>&1; rc=$?; cat %s; exit $rc", verifySh, shellQuote(cmd), logPath, logPath)
 }
 
 // verifyDefaultCheckImage is the built-in default for the check-* containers

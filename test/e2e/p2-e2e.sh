@@ -1238,6 +1238,7 @@ fi
   # pre-empty/post-set new-pin case), and NO new fail fired in-section (each
   # conjunct is also checked by a pass/fail above; the in-section FAILED delta
   # is the gate that catches one of them failing).
+  echo "   DEBUG a4: RP_FROM=$RP_FROM RP_REASON=$RP_REASON RP_FROM2=[$RP_FROM2] RP_REASON2=[$RP_REASON2] POST_ITER=$POST_ITER PRE_ITER=$PRE_ITER POST_VERIFY=[$POST_VERIFY] PRE_VERIFY=[$PRE_VERIFY] FAILED=$FAILED PRE_A4_FAILED=$PRE_A4_FAILED" >&2
   if [ "$RP_FROM" = "Implementing" ] && [ "$RP_REASON" = "Suspend" ] && [ -z "$RP_FROM2" ] && [ -z "$RP_REASON2" ] && [ "$POST_ITER" = "$PRE_ITER" ] && { [ "$POST_VERIFY" = "$PRE_VERIFY" ] || [ -z "$PRE_VERIFY" ] && [ -n "$POST_VERIFY" ]; } && [ "$FAILED" -eq "$PRE_A4_FAILED" ]; then
     assert_done 4 pass
   else

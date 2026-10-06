@@ -716,12 +716,10 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 			b.PromptTokens = 100
 		})
 		// A reading at B2 (a DIFFERENT boot — the pod was recreated, the
-		// emptyDir wiped): the operator resets last* to the reading and
-		// records bootIDChanged + the MeteringReset Event. The plan's spec-10
-		// arithmetic: "the accumulated count becomes 100 + 50 = 150 (the
-		// delta from the new boot is from 0, added to the prior
-		// accumulation)". The implementation adds the new boot's baseline
-		// once (a delta-from-0 for a fresh boot): 100 + 50 = 150.
+		// emptyDir wiped): a fresh boot's counters started at 0, so the
+		// reading is a delta from 0 and is ADDED in full to the prior
+		// accumulation (100 + 50 = 150); the operator then resets last* to
+		// the reading and records bootIDChanged + the MeteringReset Event.
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B2", PromptTokens: 50, Requests: 1}, nil
 		}
@@ -731,18 +729,18 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		Expect(l.Status.Budget.BootIDChanged).To(BeTrue(), "a genuine new boot is sticky bootIDChanged")
 		Expect(l.Status.Budget.LastBootID).To(Equal("B2"))
 		Expect(l.Status.Budget.LastPromptTokens).To(BeEquivalentTo(50), "last* is reset to the new reading")
-		Expect(l.Status.Budget.PromptTokens).To(BeEquivalentTo(100), "the prior accumulation is kept (the new boot's baseline is NOT added on the rebase — the delta from the new boot is from 0, added on the NEXT same-boot delta)")
+		Expect(l.Status.Budget.PromptTokens).To(BeEquivalentTo(150), "the new boot's reading is a delta from 0 and is added in full to the prior accumulation (100 + 50)")
 		events := drainEvents(recorder)
 		Expect(events).To(ContainElement(ContainSubstring(meteringResetReason)),
 			"a Warning MeteringReset Event must fire on a boot-ID change: %v", events)
 
-		By("a second reading at B2 with promptTokens 80 -> the delta is 80-50=30 (the last* was reset to the B2 reading), accumulated 100+30=130")
+		By("a second reading at B2 with promptTokens 80 -> the delta is 80-50=30 (the last* was reset to the B2 reading), accumulated 150+30=180")
 		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
 			return proxy.Reading{BootID: "B2", PromptTokens: 80, Requests: 2}, nil
 		}
 		reconcileP2d(r, ns, "p2d-s10")
 		l = getLoopP2d(ns, "p2d-s10")
-		Expect(l.Status.Budget.PromptTokens).To(BeEquivalentTo(130), "no double-count of the B2 baseline (100+30, not 100+80)")
+		Expect(l.Status.Budget.PromptTokens).To(BeEquivalentTo(180), "no double-count of the B2 baseline (150+30, not 150+80)")
 		Expect(l.Status.Budget.LastPromptTokens).To(BeEquivalentTo(80))
 
 		By("a container restart (the SAME bootID B1, the P1-B case): the same-boot delta applies — no rebase, no double-count")

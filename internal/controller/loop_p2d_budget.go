@@ -259,10 +259,11 @@ func (r *LoopReconciler) readProxyUsageDefault(ctx context.Context, loop *coxv1a
 //     set last* to the reading's values, add NOTHING (the pre-reading count is
 //     unknown, not zero), and record NO MeteringReset warning (an adoption is
 //     not an anomaly).
-//  3. A different bootID (a pod recreate, the emptyDir wiped): reset last* to
-//     the reading's values, record bootIDChanged=true (sticky) + a Warning
-//     Event MeteringReset (a fresh boot, a delta from 0). The loss is
-//     visible, not silent.
+//  3. A different bootID (a pod recreate, the emptyDir wiped): ADD the
+//     reading's counters in full to the accumulated totals (a fresh boot is
+//     a delta from 0), then set last* to the reading's values, record
+//     bootIDChanged=true (sticky) + a Warning Event MeteringReset. The loss
+//     is visible, not silent.
 //  4. A cumulative counter drops WITHOUT a bootID change (same bootID, a lower
 //     cumulative value — a corrupted/partial file or a torn read): emit a
 //     Warning Event MeteringAnomaly, rebase last* to the reading's values, and
@@ -289,6 +290,12 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 	if b.LastBootID != reading.BootID {
 		prior := b.LastBootID
 		b.BootIDChanged = true // sticky
+		// A fresh boot's counters started at 0: the reading IS the delta from
+		// 0, so add it in full before rebasing last*.
+		b.PromptTokens += reading.PromptTokens
+		b.CompletionTokens += reading.CompletionTokens
+		b.Requests += reading.Requests
+		b.UnmeteredRequests += reading.UnmeteredRequests
 		b.LastBootID = reading.BootID
 		b.LastPromptTokens = reading.PromptTokens
 		b.LastCompletionTokens = reading.CompletionTokens

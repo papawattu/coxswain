@@ -127,6 +127,41 @@ MODEL_ENDPOINT=""   # the node-IP stub endpoint (filled in STEP 2; read from the
 REAL_VLLM="192.168.1.20:8000"   # the REAL vLLM LB (the cross-check Loop)
 HOMELAB_CTX="default"            # the homelab Prometheus context (read-only)
 
+# Cross-check (assertion 3) window: the reviewer's fix — the START counters are
+# the instant values of the homelab Prometheus vllm token series captured BEFORE
+# p2h-real is created (its early requests fall inside the window), and the END
+# counters are read AFTER p2h-real reached Succeeded + at least 75s (2+ scrape
+# intervals — the Prometheus scrape lag). The rule stays 0 < per-Loop <= delta
+# (other traffic on the shared backend only makes the delta larger).
+XCHK_PROM_OK=""
+XCHK_P0=""; XCHK_P1=""; XCHK_G0=""; XCHK_G1=""
+XCHK_T0=""; XCHK_T1=""
+XCHK_S0=""; XCHK_S1=""   # the scrape-interval timestamps of the start/end samples
+
+# prom_instant <metric>: the current value of a metric from the homelab
+# Prometheus (read-only: a short-lived port-forward + curl + instant query).
+# Echoes "value <sample-ts>", or nothing if unreachable or the series is
+# absent. Used for the cross-check start/end counter captures.
+prom_instant() { # prom_instant <metric>; echoes "value ts" or ""
+  local metric="$1" pflog out pfpid
+  pflog="$(mktemp)"
+  kubectl --context "$HOMELAB_CTX" -n prometheus port-forward svc/prometheus 19099:9090 --address 127.0.0.1 >"$pflog" 2>&1 &
+  pfpid=$!
+  sleep 4
+  out="$(curl -s --max-time 10 "http://127.0.0.1:19099/api/v1/query?query=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$metric")" 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+r=(d.get('data') or {}).get('result') or []
+if not r:
+    sys.exit(1)
+print(r[0]['value'][1], int(r[0]['value'][0]))
+" 2>/dev/null)" || out=""
+  kill "$pfpid" 2>/dev/null || true
+  wait "$pfpid" 2>/dev/null || true
+  rm -f "$pflog" 2>/dev/null || true
+  echo "$out"
+}
+
 LOG_DIR="$REPO_ROOT/.samples/p2h"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/run-${TIMESTAMP}.log"
@@ -661,6 +696,27 @@ spec:
     onExceeded: Pause
 EOF
 
+# Cross-check start counters (the reviewer's A3 fix): the instant values of
+# the homelab Prometheus vllm token series captured BEFORE p2h-real exists —
+# its early requests (the goal request fires right after creation) fall
+# inside [start, end]. If Prometheus is unreachable or the series is absent
+# the cross-check is DROPPED with a note (the plan allows it; it is a
+# consistency check, not a gate).
+S_PROM="$(prom_instant vllm:prompt_tokens_total)"
+S_GEN="$(prom_instant vllm:generation_tokens_total)"
+XCHK_T0="$(date -u +%s)"
+if [ -n "$S_PROM" ] && [ -n "$S_GEN" ]; then
+  XCHK_P0="${S_PROM% *}"
+  XCHK_S0="${S_PROM#* }"
+  XCHK_G0="${S_GEN% *}"
+  XCHK_S1="${S_GEN#* }"
+  XCHK_PROM_OK=1
+  echo "   cross-check start counters (BEFORE creating p2h-real): prompt=$XCHK_P0 (sample ts=$XCHK_S0) generation=$XCHK_G0 (sample ts=$XCHK_S1) at $XCHK_T0"
+else
+  XCHK_PROM_OK=""
+  echo "   cross-check start counters UNAVAILABLE (no vllm token series or Prometheus unreachable; the cross-check will be DROPPED with a note)"
+fi
+
 echo "   creating the cross-check Loop (the REAL vLLM LB 192.168.1.20:8000, passing check)"
 create_loop_wait_pvc p2h-real <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
@@ -764,6 +820,29 @@ wait_for() {
 if in_steps 4; then
 wait_for p2h-real Succeeded 900 || bad "p2h-real did not reach Succeeded in 900s (phase=$(lphase p2h-real))"
 REAL_T1="$(date -u +%s)"
+# Cross-check end counters (the reviewer's A3 fix): wait at least 75s (2+ the
+# 30s Prometheus scrape interval) after Succeeded so the last samples are in,
+# then read the instant values — the scrape lag means a read right at
+# Succeeded would undercount the tail of p2h-real's requests.
+if [ "$XCHK_PROM_OK" = "1" ]; then
+  SCRAPE_LAG=75
+  ELAPSED=$(( $(date -u +%s) - REAL_T1 ))
+  if [ "$ELAPSED" -lt "$SCRAPE_LAG" ]; then
+    echo "   waiting ${SCRAPE_LAG}s for the Prometheus scrape lag before reading the end counters"
+    sleep "$SCRAPE_LAG"
+  fi
+  XCHK_T1="$(date -u +%s)"
+  E_PROM="$(prom_instant vllm:prompt_tokens_total)"
+  E_GEN="$(prom_instant vllm:generation_tokens_total)"
+  if [ -n "$E_PROM" ] && [ -n "$E_GEN" ]; then
+    XCHK_P1="${E_PROM% *}"; XCHK_S0_END="${E_PROM#* }"
+    XCHK_G1="${E_GEN% *}"; XCHK_S1_END="${E_GEN#* }"
+    echo "   cross-check end counters (AFTER p2h-real Succeeded + scrape lag): prompt=$XCHK_P1 (sample ts=$XCHK_S0_END) generation=$XCHK_G1 (sample ts=$XCHK_S1_END) at $XCHK_T1"
+  else
+    XCHK_PROM_OK=""
+    echo "   cross-check end counters UNAVAILABLE (the cross-check will be DROPPED with a note)"
+  fi
+fi
 echo "   waiting: p2h-stall -> Failed (Stalled at iteration 3)"
 wait_for p2h-stall Failed 900 || bad "p2h-stall did not reach Failed in 900s (phase=$(lphase p2h-stall))"
 echo "   waiting: p2h-budget -> Failed (BudgetExceeded at request 2)"
@@ -873,71 +952,52 @@ REAL_BUDGET="$(K -n "$NS" get loop p2h-real -o jsonpath='{.status.budget}' 2>/de
 echo "   cross-check Loop: phase=$REAL_PHASE window=[$REAL_T0,$REAL_T1] status.budget=$REAL_BUDGET"
 echo "   window: $REAL_T0..$REAL_T1" > "$LOG_DIR/crosscheck.txt"
 echo "   per-Loop status.budget: $REAL_BUDGET" >> "$LOG_DIR/crosscheck.txt"
-# The homelab Prometheus (READ-ONLY: port-forward + curl). Query the vllm
-# prompt + generation token deltas over the window. If unreachable or no
-# series: DROPPED with a note (the plan allows it — a consistency check, not
-# a gate).
+# The counter pair (the reviewer's A3 fix): the START values were captured as
+# instant Prometheus reads BEFORE p2h-real was created (its early requests
+# fall inside the window), and the END values were read AFTER it reached
+# Succeeded + the 75s scrape-lag wait. For a STEP 4+ re-run (no start capture
+# in this invocation) the start is re-derived from the proxy pod's start
+# timestamp and the end re-read as the instant value now (the Loop already
+# Succeeded, so the tail is long in the past; the delta is conservative —
+# only the proxy's first scrape-gap of requests can fall before the
+# re-derived start, and per-Loop <= delta still holds).
+if [ -z "$XCHK_P0" ] && [ -z "$XCHK_P1" ]; then
+  echo "   STEP 4+ re-run: no start/end captures this invocation; re-deriving"
+  PODY_START="$(K -n "$NS" get pod p2h-real-proxy -o jsonpath='{.status.startTime}' 2>/dev/null || true)"
+  XCHK_T0="$(date -u -d "$PODY_START" +%s 2>/dev/null || echo "$REAL_T0")"
+  S_PROM="$(prom_instant vllm:prompt_tokens_total)"
+  S_GEN="$(prom_instant vllm:generation_tokens_total)"
+  E_PROM="$(prom_instant vllm:prompt_tokens_total)"
+  E_GEN="$(prom_instant vllm:generation_tokens_total)"
+  [ -n "$S_PROM" ] && { XCHK_P0="${S_PROM% *}"; XCHK_S0="${S_PROM#* }"; }
+  [ -n "$S_GEN" ] && { XCHK_G0="${S_GEN% *}"; XCHK_S1="${S_GEN#* }"; }
+  [ -n "$E_PROM" ] && { XCHK_P1="${E_PROM% *}"; XCHK_S0_END="${E_PROM#* }"; }
+  [ -n "$E_GEN" ] && { XCHK_G1="${E_GEN% *}"; XCHK_S1_END="${E_GEN#* }"; }
+  XCHK_T1="$(date -u +%s)"
+  echo "   re-derived: window=[$XCHK_T0,$XCHK_T1] prompt[$XCHK_P0->$XCHK_P1] generation[$XCHK_G0->$XCHK_G1]"
+fi
 XCHECK="not-run"
-PF_LOG="$LOG_DIR/prometheus-portforward.log"
-timeout 90 kubectl --context "$HOMELAB_CTX" -n prometheus port-forward svc/prometheus 19099:9090 --address 127.0.0.1 > "$PF_LOG" 2>&1 &
-PF_PID=$!
-sleep 5
-PROM_OK=0
-if curl -s --max-time 10 "http://127.0.0.1:19099/api/v1/query?query=up" >/dev/null 2>&1; then PROM_OK=1; fi
-if [ "$PROM_OK" = "1" ]; then
-  # The closest-sample value of a metric at a timestamp (query_range over a
-  # +/-5s window, step 1s — /api/v1/query with 'at <ts>' is not valid PromQL).
-  QR() { # QR <metric> <ts> ; echoes the value at the closest sample, or empty
-    # (The earlier version had a stray curl line that ran for every call with
-    # literal '$((2-5))' (unexpanded — 2 is not assigned) and dumped its JSON
-    # body into the command substitution, clobbering the python3 output.)
-    python3 - "$1" "$2" <<'PYEOF'
-import json, sys, urllib.parse, urllib.request
-metric, ts = sys.argv[1], int(sys.argv[2])
-qs = urllib.parse.urlencode({"query": metric, "start": ts-5, "end": ts+5, "step": 1})
-r = urllib.request.urlopen("http://127.0.0.1:19099/api/v1/query_range?"+qs, timeout=30)
-d = json.load(r)
-res = (d.get("data") or {}).get("result") or []
-allv = []
-for row in res:
-    for t, v in row.get("values", []):
-        allv.append((abs(t-ts), float(v)))
-if not allv:
-    sys.exit(1)
-allv.sort()
-print(int(allv[0][1]))
-PYEOF
-  }
-  P0="$(QR vllm:prompt_tokens_total $REAL_T0)"
-  P1="$(QR vllm:prompt_tokens_total $REAL_T1)"
-  G0="$(QR vllm:generation_tokens_total $REAL_T0)"
-  G1="$(QR vllm:generation_tokens_total $REAL_T1)"
-  kill $PF_PID 2>/dev/null || true
-  echo "   prometheus vllm: prompt [$P0 -> $P1] generation [$G0 -> $G1] over the window" >> "$LOG_DIR/crosscheck.txt"
-  if [ -n "$P0" ] && [ -n "$P1" ] && [ -n "$G0" ] && [ -n "$G1" ]; then
-    dP=$((P1 - P0)); dG=$((G1 - G0))
-    perLoopTok="$(python3 -c "
+if [ -n "$XCHK_P0" ] && [ -n "$XCHK_P1" ] && [ -n "$XCHK_G0" ] && [ -n "$XCHK_G1" ]; then
+  dP=$((XCHK_P1 - XCHK_P0)); dG=$((XCHK_G1 - XCHK_G0))
+  perLoopTok="$(python3 -c "
 import json
 d=json.loads('''$REAL_BUDGET''') if '$REAL_BUDGET' else {}
 print((d.get('promptTokens',0) or 0)+(d.get('completionTokens',0) or 0))
 " 2>/dev/null || echo 0)"
-    backendDelta=$((dP + dG))
-    echo "   per-Loop status.budget total: $perLoopTok; backend (pi6+pi8) delta: $backendDelta (prompt $dP + generation $dG)" >> "$LOG_DIR/crosscheck.txt"
-    if [ "$perLoopTok" -le "$backendDelta" ] && [ "$perLoopTok" -gt 0 ]; then
-      XCHECK="pass"
-      pass "cross-check: per-Loop count ($perLoopTok) <= the real vLLM backend delta ($backendDelta) over the window (consistent, item 14)"
-    else
-      XCHECK="fail"
-      fail "cross-check: per-Loop count ($perLoopTok) NOT consistent with the backend delta ($backendDelta) (expected 0 < per-Loop <= delta)"
-    fi
+  backendDelta=$((dP + dG))
+  echo "   prometheus vllm: prompt [$XCHK_P0 (sample ts=$XCHK_S0) -> $XCHK_P1 (sample ts=$XCHK_S0_END)] generation [$XCHK_G0 (sample ts=$XCHK_S1) -> $XCHK_G1 (sample ts=$XCHK_S1_END)] over window [$REAL_T0,$REAL_T1]" >> "$LOG_DIR/crosscheck.txt"
+  echo "   per-Loop status.budget total: $perLoopTok; backend delta: $backendDelta (prompt $dP + generation $dG)" >> "$LOG_DIR/crosscheck.txt"
+  echo "   cross-check: prompt [$XCHK_P0 -> $XCHK_P1] generation [$XCHK_G0 -> $XCHK_G1] window [$REAL_T0,$REAL_T1]; per-Loop=$perLoopTok backendDelta=$backendDelta"
+  if [ "$perLoopTok" -le "$backendDelta" ] && [ "$perLoopTok" -gt 0 ]; then
+    XCHECK="pass"
+    pass "cross-check: per-Loop count ($perLoopTok) <= the real vLLM backend delta ($backendDelta) over the window (consistent, item 14)"
   else
-    XCHECK="dropped"
-    echo "   [DROPPED] the homelab Prometheus had no vllm token series at the window timestamps (P0=$P0 P1=$P1 G0=$G0 G1=$G1); the cross-check is a consistency check, not a gate (the plan allows dropping it with a note)" | tee -a "$LOG_DIR/crosscheck.txt"
+    XCHECK="fail"
+    fail "cross-check: per-Loop count ($perLoopTok) NOT consistent with the backend delta ($backendDelta) (expected 0 < per-Loop <= delta)"
   fi
 else
   XCHECK="dropped"
-  kill $PF_PID 2>/dev/null || true
-  echo "   [DROPPED] the homelab Prometheus ($HOMELAB_CTX, ns prometheus) was unreachable from this runner (port-forward log: $PF_LOG); the cross-check is dropped with a note (the plan allows it)" | tee -a "$LOG_DIR/crosscheck.txt"
+  echo "   [DROPPED] the homelab Prometheus ($HOMELAB_CTX, ns prometheus) had no vllm token series or was unreachable (start=$XCHK_P0/$XCHK_G0 end=$XCHK_P1/$XCHK_G1); the cross-check is a consistency check, not a gate (the plan allows dropping it with a note)" | tee -a "$LOG_DIR/crosscheck.txt"
 fi
 if [ "$XCHECK" = "pass" ]; then assert_done 3 pass
 elif [ "$XCHECK" = "dropped" ]; then assert_done 3 dropped
@@ -1079,17 +1139,39 @@ fi
 # re-run: the patch + the annotation are no-ops once applied.)
 K -n "$NS" patch loop p2h-budgetpause -p '{"spec":{"budget":{"maxTokens":100000}}}' --type=merge >/dev/null 2>&1 || die "raise maxTokens failed"
 K -n "$NS" annotate loop p2h-budgetpause coxswain.io/resume="true" >/dev/null 2>&1 || die "resume annotation failed"
-# Two reconciles after the resume with phase != Paused and exceeded=false.
+# The reviewer's A5 fix: the post-resume phase is NOT pinned to Implementing
+# (the Loop may be mid-iteration in Implementing or Verifying when the
+# re-evaluation lands — Verifying is a valid post-resume phase). Assert:
+# phase != Paused, status.budget.exceeded is false or empty (the
+# re-evaluation cleared it; an empty read is the field being absent =
+# cleared), pausedReason cleared, and the ClearedOnResume/Resumed events
+# are present.
 B1_OK=0
+B1_RESUMED_EVENT=0
 for i in $(seq 1 60); do
-  ph="$(lphase p2h-budgetpause)"; ex="$(lfield p2h-budgetpause '.status.budget.exceeded')"
-  if [ "$ph" != "Paused" ] && [ "$ex" = "false" ]; then B1_OK=1; break; fi
+  ph="$(lphase p2h-budgetpause)"; ex="$(lfield p2h-budgetpause '.status.budget.exceeded')"; pr="$(lfield p2h-budgetpause '.status.pausedReason')"
+  if [ "$ph" != "Paused" ] && { [ "$ex" = "false" ] || [ -z "$ex" ]; } && [ -z "$pr" ]; then B1_OK=1; break; fi
+  # The Resumed/ClearedOnResume event: the operator's audit record for the
+  # annotation resume (present once the resume is processed).
+  if [ "$B1_RESUMED_EVENT" = "0" ]; then
+    B1_RESUMED_EVENT="$(K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause -o json 2>/dev/null | python3 -c "
+import json,sys
+evs=json.load(sys.stdin).get('items',[])
+print('yes' if any('Resumed' in (e.get('reason') or '') or 'ClearedOnResume' in (e.get('reason') or '') or 'ClearedOnResume' in (e.get('message') or '') or 'Resumed' in (e.get('message') or '') for e in evs) else 'no')
+" 2>/dev/null || echo no)"
+  fi
   sleep 2
 done
-if [ "$B1_OK" = "1" ]; then
-  pass "budget-Pause Loop (raised cap): resumed and proceeds — phase != Paused and exceeded=false (the re-evaluation cleared the exceedance)"
+K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause -o json > "$LOG_DIR/events-budgetpause.json" 2>/dev/null || true
+B1_RESUMED_FINAL="$(python3 -c "
+import json,sys
+evs=json.load(open('$LOG_DIR/events-budgetpause.json')).get('items',[])
+sys.exit(0 if any('Resumed' in (e.get('reason') or '') or 'ClearedOnResume' in (e.get('reason') or '') or 'ClearedOnResume' in (e.get('message') or '') or 'Resumed' in (e.get('message') or '') for e in evs) else 1)
+" 2>/dev/null && echo yes || echo no)"
+if [ "$B1_OK" = "1" ] && [ "$B1_RESUMED_FINAL" = "yes" ]; then
+  pass "budget-Pause Loop (raised cap): resumed and proceeds — phase != Paused, exceeded cleared, pausedReason cleared, the ClearedOnResume/Resumed event is present"
 else
-  fail "budget-Pause Loop (raised cap): still phase=$(lphase p2h-budgetpause) exceeded=$(lfield p2h-budgetpause '.status.budget.exceeded') after the raised-cap resume"
+  fail "budget-Pause Loop (raised cap): phase=$(lphase p2h-budgetpause) exceeded=$(lfield p2h-budgetpause '.status.budget.exceeded') pausedReason=$(lfield p2h-budgetpause '.status.pausedReason') resumed-event=$B1_RESUMED_FINAL (expected phase != Paused, exceeded=false/empty, pausedReason cleared, Resumed/ClearedOnResume event)"
 fi
 # Sub-case (b): the un-raised re-pause (the fail-closed re-fire). The control
 # Loop's caps are NOT raised; the annotation resume must re-pause immediately.

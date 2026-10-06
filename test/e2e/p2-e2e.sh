@@ -270,9 +270,26 @@ echo "--- STEP 3: Gitea bare repos + the six Loops ---"
 # `test -f /nonexistent` (no go tooling) and the tamper check only diffs
 # protected globs — so the seed is a plain git repo, not a Go module.
 seed_repo() { # seed_repo <repo-name>; echoes the seed commit SHA
+  # The Gitea bare repo is created via the Gitea API (push-to-create is not
+  # enabled for users; the API is the operator's S1 pattern). The seed is a
+  # plain git repo (README.md only — the implement-instruction's target,
+  # non-protected). The API call is signed in with the basic-auth cred (the
+  # same samples:samples-git-password the git-cred secret holds). The curl -d
+  # body is single-quoted (the JSON braces are literal); the repo name is
+  # interpolated into the single-quoted -d body by the outer sh -c (the $R is
+  # expanded by the OUTER shell, not the inner curl — the inner shell sees a
+  # literal {"name":"p2h-stall",...} body).
   K -n "$GITEA_NS" exec deploy/gitea -- sh -c '
     set -e
     R="$1"
+    CODE=$(curl -s -o /tmp/create-$R.json -w "%{http_code}" -u samples:samples-git-password \
+      -X POST "http://gitea.samples.svc:3000/api/v1/user/repos" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$R\",\"auto_init\":false,\"private\":false}")
+    case "$CODE" in
+      201|409|422) ;;  # created / already exists / the API hiccup (the push -f re-seeds)
+      *) echo "Gitea API create failed: http $CODE $(cat /tmp/create-$R.json)"; exit 1 ;;
+    esac
     rm -rf /tmp/seed; mkdir -p /tmp/seed; cd /tmp/seed
     if ! git clone -q http://samples:samples-git-password@gitea.samples.svc:3000/samples/$R.git work 2>/dev/null; then
       mkdir work; cd work; git init -q -b initial

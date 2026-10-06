@@ -401,7 +401,10 @@ func TestPhaseRunImplementingClaimCarriesCurrentIteration(t *testing.T) {
 		t.Fatalf("claim is not JSON: %v", err)
 	}
 	if claim.Iteration != 2 {
-		t.Fatalf("claim iteration = %d, want 2 (the current .coxswain/iteration — a missing key parses as 0, which the operator's stale-iteration guard discards when status.iteration is 2; the P2h kind-run stall): %s", claim.Iteration, data)
+		t.Fatalf("claim iteration = %d, want 2 (the current .coxswain/iteration — a "+
+			"missing key parses as 0, which the operator's stale-iteration guard "+
+			"discards when status.iteration is 2; the P2h kind-run stall): %s",
+			claim.Iteration, data)
 	}
 }
 
@@ -436,7 +439,9 @@ func TestWriteClaimCarriesIteration(t *testing.T) {
 		t.Fatalf("claim observedPhase/status = %q/%q, want Implementing/success: %s", claim.ObservedPhase, claim.Status, data)
 	}
 	if claim.Iteration == nil {
-		t.Fatalf("the claim MUST carry the iteration key (a missing key parses as 0 at the operator, which the stale-iteration guard discards when status.iteration is 2): %s", data)
+		t.Fatalf("the claim MUST carry the iteration key (a missing key parses as 0 "+
+			"at the operator, which the stale-iteration guard discards when "+
+			"status.iteration is 2): %s", data)
 	}
 	if *claim.Iteration != res.Iteration {
 		t.Fatalf("claim iteration = %d, want %d (res.Iteration): %s", *claim.Iteration, res.Iteration, data)

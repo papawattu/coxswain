@@ -302,29 +302,36 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 
 	It("reads the check output from the terminationMessage (defaultReadCheckOutput, no pod-log read)", func() {
 		// A bare reconciler (no seam) uses defaultReadCheckOutput: the check
-		// container's LastTerminationState.Terminated.Message (the
-		// terminationMessage). The spec drives a pod whose check-0 carries a
-		// terminationMessage.
+		// container's State.Terminated.Message (the terminationMessage). The
+		// spec drives a pod whose check-0 carries a terminationMessage. The
+		// message is set in the CURRENT terminated state (a non-restarted
+		// check init, the real production path); aFailingPod's check-0 also
+		// terminates with an empty message there, so the current-state read
+		// (P2h: a terminated record counts even with an empty message) wins
+		// over lastState. The restarted-container lastState path is pinned by
+		// TestDefaultReadCheckOutput case (b).
 		r := &LoopReconciler{}
 		pod := aFailingPod()
 		for i := range pod.Status.InitContainerStatuses {
 			ics := &pod.Status.InitContainerStatuses[i]
 			if ics.Name == s5aCheck0 {
-				ics.LastTerminationState = corev1.ContainerState{
-					Terminated: &corev1.ContainerStateTerminated{
-						ExitCode: 1,
-						Message:  p2eOutputA,
-					},
-				}
+				ics.State.Terminated.Message = p2eOutputA
 			}
 		}
 		raw, ok := r.defaultReadCheckOutput(pod, s5aCheck0)
 		Expect(ok).To(BeTrue())
 		Expect(raw).To(Equal(p2eOutputA))
 
-		// A pod with no termination message returns ("", false) — an empty
-		// raw (the normaliser of "" is ""; a no-output hot loop still stalls).
+		// A pod with no termination record at all returns ("", false) — an
+		// empty raw (the normaliser of "" is ""; a no-output hot loop still
+		// stalls via TestDefaultReadCheckOutput case (d)).
 		podNoMsg := aFailingPod()
+		for i := range podNoMsg.Status.InitContainerStatuses {
+			ics := &podNoMsg.Status.InitContainerStatuses[i]
+			if ics.Name == s5aCheck0 {
+				ics.State.Terminated = nil // the check never ran -> no terminated record
+			}
+		}
 		raw2, ok2 := r.defaultReadCheckOutput(podNoMsg, s5aCheck0)
 		Expect(ok2).To(BeFalse())
 		Expect(raw2).To(BeEmpty())

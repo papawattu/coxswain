@@ -1,0 +1,2 @@
+build of /tmp/aa11bb22-3/main.go:12:3 failed
+panic: timeout waiting for the proxy at 0xdeadbeef

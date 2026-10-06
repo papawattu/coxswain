@@ -86,6 +86,13 @@ const (
 	verifyBusybox = "busybox"
 	// verifySh is the shell command for the verify init containers.
 	verifySh = "/bin/sh"
+	// verifyTerminationLogPath is the check container's terminationMessagePath
+	// (P2e): the check's stdout+stderr are teed here so the kubelet records
+	// the failure output (the 4 KB tail) in the terminationMessage the
+	// operator reads for the stall normaliser — NO pod-log read. It lives on
+	// the /tmp check-tmp emptyDir (writable, the readOnlyRootFilesystem
+	// exception).
+	verifyTerminationLogPath = "/tmp/termination.log"
 	// verifyCloneBaseInit is the base-commit clone init container's name.
 	verifyCloneBaseInit = "clone-base"
 	// verifyImportAgentInit is the agent-workspace import init container's name.
@@ -132,6 +139,30 @@ func (r *LoopReconciler) verifyJobImage() string {
 		return r.WorkspaceGitImage
 	}
 	return "docker.io/alpine/git:v2.54.0"
+}
+
+// checkTeed wraps a check command so its stdout+stderr are ALSO written to
+// the terminationMessagePath (P2e): the stall detector reads the failing
+// check's raw output from the terminationMessage (no pod-log read). The
+// wrapper runs the user command, tees its output to the log file (the
+// operator constant verifyTerminationLogPath), then EXITS WITH THE USER
+// COMMAND'S EXIT CODE (the exit code is the verify evidence — the tee must
+// not mask a non-zero check).
+//
+// POSIX sh only (the container's /bin/sh is dash on alpine and busybox sh on
+// other bases — bash-only features like ${PIPESTATUS[0]} are a bad
+// substitution under sh and exit 2). The command is shell-quoted EXACTLY
+// once (shellQuote); it is NOT additionally wrapped in %q (double-quoting
+// makes the inner sh -c run the whole command as a single word — exit 127).
+// The log path is the operator constant verifyTerminationLogPath (no user
+// input), so it is unquoted. The exit code is captured into rc BEFORE the
+// cat (which resets $?), and the cat echoes the log back to stdout so the
+// 4 KB tail the kubelet records as the terminationMessage is the check's
+// stdout+stderr.
+//
+//nolint:unparam // logPath is the operator's termination-log constant (verifyTerminationLogPath, the only production value); it is parameterised so the wrapper is pure and the execution test can substitute a temp path — the path is operator-supplied, not hard-coded.
+func checkTeed(cmd, logPath string) string {
+	return fmt.Sprintf("%s -c %s > %s 2>&1; rc=$?; cat %s; exit $rc", verifySh, shellQuote(cmd), logPath, logPath)
 }
 
 // verifyDefaultCheckImage is the built-in default for the check-* containers
@@ -557,10 +588,17 @@ exit 0
 		ct := corev1.Container{
 			Name:            fmt.Sprintf("check-%d", i),
 			Image:           checkImage,
-			Command:         []string{verifySh, "-c", c},
+			Command:         []string{verifySh, "-c", checkTeed(c, verifyTerminationLogPath)},
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
 			Env:             verifyCheckEnv(),
+			// P2e: the check carries a terminationMessagePath so the operator
+			// can read the failing check's raw output from the
+			// terminationMessage (NO pod-log read — the stall detector's
+			// normaliser input). The command is teed to the path (see
+			// checkTeed) so the 4 KB tail the kubelet records is the check's
+			// stdout+stderr (the failure output the normaliser hashes).
+			TerminationMessagePath: verifyTerminationLogPath,
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: verifyVol, MountPath: verifyScratchPath},
 				// The check containers run with readOnlyRootFilesystem and
@@ -951,6 +989,16 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		return true, false
 	case verifyIterate:
+		// P2e stall gate (evaluated BEFORE the budget/maxIterations cap —
+		// stall wins: a capped loop that is ALSO stalled is Failed:Stalled,
+		// not Failed:MaxIterationsExceeded). Read the failing check's raw
+		// output (the readCheckOutput seam / terminationMessage), normalise
+		// it, append the StallEntry (dedup'd by jobName), and evaluate the
+		// stall decision. A fire applies the stall action (Fail / Pause /
+		// Continue); a non-fire falls through to the iterate below.
+		if r.applyStallGate(ctx, loop, pod, failedCheck) {
+			return true, false
+		}
 		// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
 		// is created only for a fresh pin at the next advance). The failing
 		// check rides into status.progress so the next Implementing run can

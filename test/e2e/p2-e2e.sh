@@ -685,9 +685,8 @@ spec:
     endpointSecretRef: p2h-model-creds
     modelEndpoint: $REAL_VLLM
   loop:
-    maxIterations: 3
-    stallAfter: 3
-    stallAction: Fail
+    maxIterations: 100
+    stallAfter: 100
 EOF
 
 fi
@@ -955,11 +954,29 @@ echo "--- assertion 4: the paused-Loop resume (the resume Loop) ---"
 # Succeeded) cannot demonstrate the pause/resume cycle — assertion 4 FAILS
 # (a 'flipping anyway' on a terminal Loop is an invalid assertion).
 RESUME_RUN=0
-if [ "$(lphase p2h-resume)" = "Implementing" ] || wait_phase p2h-resume Implementing 600; then
+FLIP_DEADLINE=$(( $(date -u +%s) + 600 ))
+FLIP_AT=""
+while [ "$(date -u +%s)" -lt "$FLIP_DEADLINE" ]; do
+  ph="$(lphase p2h-resume)"
+  # The Implementing window is short (the runner finishes a phase run and the
+  # operator advances to Verifying within a reconcile); the flip must land
+  # while the phase reads Implementing, so the script polls every 2s and
+  # patches in the SAME shell iteration the read returned Implementing (no
+  # sleep between the read and the patch — the narrow window is the point).
+  if [ "$ph" = "Implementing" ]; then
+    FLIP_AT="$ph"
+    break
+  fi
+  if [ "$ph" = "Succeeded" ] || [ "$ph" = "Failed" ]; then
+    break   # terminal: the flip can never happen
+  fi
+  sleep 2
+done
+if [ -n "$FLIP_AT" ]; then
   ok "resume Loop at Implementing (suspend flipped now)"
   RESUME_RUN=1
 else
-  fail "assertion 4: the resume Loop was never at Implementing in the flip window (phase=$(lphase p2h-resume)); the pause/resume cycle was not exercised"
+  fail "assertion 4: the resume Loop was never at Implementing in the flip window (last phase=$(lphase p2h-resume)); the pause/resume cycle was not exercised"
   assert_done 4 fail
 fi
 if [ "$RESUME_RUN" = "1" ]; then

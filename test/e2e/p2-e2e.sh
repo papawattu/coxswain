@@ -1380,6 +1380,17 @@ done
 #    thing that must keep it Paused is the operator's rule that a Budget
 #    pause resumes ONLY via the annotation (a Suspend flip may not).
 K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"budget":{"maxTokens":8000}}}' --type=merge >/dev/null 2>&1 || die "cap-raise patch (sub-case c) failed"
+# Read-back check: a cap-raise that didn't take effect leaves the Loop at the
+# original cap and the refuse-while-exceeded guard masks the G3 path (the
+# run-20261006211120 evidence: spec.budget.maxTokens read back as 400 after
+# the patch — the raise never took effect, so the operator still saw cap 400
+# and refused the annotation resume). A loud FAIL here prevents the silent
+# mask.
+RAISED_TOKENS="$(lfield ${p2h_budgetpause3} '.spec.budget.maxTokens')"
+if [ "$RAISED_TOKENS" != "8000" ]; then
+  fail "budgetpause3 Loop (sub-case c): the cap raise did not take effect — spec.budget.maxTokens=$RAISED_TOKENS (expected 8000); the refuse-while-exceeded guard would mask the G3 path (the run-20261006211120 failure)"
+fi
+echo "   sub-case (c): cap raised to $RAISED_TOKENS (read-back confirmed)"
 # 2) Flip suspend true -> false (NO annotation): the G3 mutation makes this a
 #    resume trigger; the real operator must ignore it for a Budget pause.
 K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"suspend":true}}' --type=merge >/dev/null 2>&1 || die "suspend=true patch (sub-case c) failed"
@@ -1409,7 +1420,7 @@ fi
 #    the cap was raised in step 1, so the refuse-while-exceeded guard does
 #    not refuse it). A STEP 4+ re-run re-applies the annotation: the operator
 #    clears it on the resume (a no-op once resumed — the end state holds).
-K -n "$NS" annotate loop ${p2h_budgetpause3} coxswain.io/resume="$(date -u +%s)" --overwrite >/dev/null 2>&1 || die "sub-case (c) annotate failed"
+K -n "$NS" annotate loop ${p2h_budgetpause3} coxswain.io/resume="true" --overwrite >/dev/null 2>&1 || die "sub-case (c) annotate failed"
 # G3 diagnosis (run-20261006202101: the annotation did NOT resume
 # budgetpause3 within 240s, though envtest spec 16 — the same sequence —
 # passes): record the state AFTER the annotate (spec.suspend, annotation,
@@ -1417,6 +1428,7 @@ K -n "$NS" annotate loop ${p2h_budgetpause3} coxswain.io/resume="$(date -u +%s)"
 # 240s wait (full status + the Loop's Events + the operator log lines for
 # this Loop) to $LOG_DIR/diag-budgetpause3-<n>.{status,events,operator}.txt.
 K -n "$NS" get loop ${p2h_budgetpause3} -o json > "$LOG_DIR/diag-budgetpause3-after-annotate.json" 2>/dev/null || true
+K -n "$NS" get loop ${p2h_budgetpause3} -o jsonpath='{.spec.budget}' > "$LOG_DIR/diag-budgetpause3-after-annotate.specbudget.txt" 2>/dev/null || true
 ANN_TS=$(date -u +%s)
 DIAG_N=0
 while :; do

@@ -211,10 +211,12 @@ K() { kubectl --context "$CTX" "$@"; }
 KH() { kubectl --context "$HOMELAB_CTX" "$@"; }
 
 FAILED=0
+FAIL_COUNT=0
+PASS_COUNT=0
 ok()  { echo "   ok: $*"; }
-bad() { echo "   BAD: $*" >&2; FAILED=1; }
-pass() { echo "   [PASS] $*"; }
-fail() { echo "   [FAIL] $*" >&2; FAILED=1; }
+bad() { echo "   BAD: $*" >&2; FAILED=1; FAIL_COUNT=$((FAIL_COUNT+1)); }
+pass() { echo "   [PASS] $*"; PASS_COUNT=$((PASS_COUNT+1)); }
+fail() { echo "   [FAIL] $*" >&2; FAILED=1; FAIL_COUNT=$((FAIL_COUNT+1)); }
 die() { echo "FATAL: $*" >&2; exit 2; }
 
 # Per-assertion completion accounting (the reviewer's finding: a script bug
@@ -944,7 +946,7 @@ fi
 # --- assertion 1: the Stalled path ---
 echo
 echo "--- assertion 1: the Stalled path (stall Loop + the control contrast) ---"
-PRE_A1_FAILED=$FAILED
+PRE_A1_FAIL=$FAIL_COUNT; PRE_A1_PASS=$PASS_COUNT
 ST_PHASE="$(lphase ${p2h_stall})"
 ST_FAILED_REASON="$(lfield ${p2h_stall} '.status.conditions[?(@.type=="Failed")].reason')"
 ST_STALLED_COND="$(lfield ${p2h_stall} '.status.conditions[?(@.type=="Stalled")].status')"
@@ -983,7 +985,7 @@ else
 fi
 # assertion 1 accounting: pass iff the stall stop + the contrast both held
 # and NO new fail fired in-section (the event check is an audit record).
-if [ "$ST_PHASE" = "Failed" ] && [ "$ST_FAILED_REASON" = "Stalled" ] && [ "$ST_STALLED_COND" = "True" ] && [ "$ST_ITER" = "3" ] && [ "$CT_PHASE" = "Failed" ] && [ "$CT_ITER" = "5" ] && [ "$FAILED" -eq "$PRE_A1_FAILED" ]; then
+if [ "$ST_PHASE" = "Failed" ] && [ "$ST_FAILED_REASON" = "Stalled" ] && [ "$ST_STALLED_COND" = "True" ] && [ "$ST_ITER" = "3" ] && [ "$CT_PHASE" = "Failed" ] && [ "$CT_ITER" = "5" ] && [ "$FAIL_COUNT" -eq "$PRE_A1_FAIL" ] && [ "$PASS_COUNT" -gt "$PRE_A1_PASS" ]; then
   assert_done 1 pass
 else
   assert_done 1 fail
@@ -992,7 +994,7 @@ fi
 # --- assertion 2: the BudgetExceeded path ---
 echo
 echo "--- assertion 2: the BudgetExceeded path (budget Loop) ---"
-PRE_A2_FAILED=$FAILED
+PRE_A2_FAIL=$FAIL_COUNT; PRE_A2_PASS=$PASS_COUNT
 BD_PHASE="$(lphase ${p2h_budget})"
 BD_FAILED_REASON="$(lfield ${p2h_budget} '.status.conditions[?(@.type=="Failed")].reason')"
 BD_EXCEEDED="$(lfield ${p2h_budget} '.status.budget.exceeded')"
@@ -1025,7 +1027,7 @@ fi
 # assertion 2 accounting: pass iff the Failed:BudgetExceeded stop + the
 # >= cap total both held and NO new fail fired in-section (the event is an
 # audit record).
-if [ "$BD_PHASE" = "Failed" ] && [ "$BD_FAILED_REASON" = "BudgetExceeded" ] && [ "$BD_EXCEEDED" = "true" ] && [ "$BD_REASON" = "Tokens" ] && [ "$BD_TOK" -ge 300 ] 2>/dev/null && [ "$FAILED" -eq "$PRE_A2_FAILED" ]; then
+if [ "$BD_PHASE" = "Failed" ] && [ "$BD_FAILED_REASON" = "BudgetExceeded" ] && [ "$BD_EXCEEDED" = "true" ] && [ "$BD_REASON" = "Tokens" ] && [ "$BD_TOK" -ge 300 ] 2>/dev/null && [ "$FAIL_COUNT" -eq "$PRE_A2_FAIL" ] && [ "$PASS_COUNT" -gt "$PRE_A2_PASS" ]; then
   assert_done 2 pass
 else
   assert_done 2 fail
@@ -1034,6 +1036,7 @@ fi
 # --- assertion 3: the real-backend cross-check ---
 echo
 echo "--- assertion 3: the real-backend cross-check (the cross-check Loop vs the homelab Prometheus) ---"
+PRE_A3_FAIL=$FAIL_COUNT; PRE_A3_PASS=$PASS_COUNT
 REAL_PHASE="$(lphase ${p2h_real})"
 REAL_BUDGET="$(K -n "$NS" get loop ${p2h_real} -o jsonpath='{.status.budget}' 2>/dev/null || true)"
 echo "   cross-check Loop: phase=$REAL_PHASE window=[$REAL_T0,$REAL_T1] status.budget=$REAL_BUDGET"
@@ -1145,12 +1148,12 @@ if [ "$RESUME_RUN" = "0" ]; then
   # The baseline must be captured BEFORE the fail so the in-section delta
   # (a fail that fired in-section wins) is measured correctly: the flip
   # miss is recorded as fail, and assert_done 4 fail is the section's state.
-  PRE_A4_FAILED=$FAILED
+  PRE_A4_FAIL=$FAIL_COUNT; PRE_A4_PASS=$PASS_COUNT
   fail "assertion 4: the resume Loop was never at Implementing in the flip window (last phase=$(lphase ${p2h_resume})); the pause/resume cycle was not exercised"
   assert_done 4 fail
 fi
 if [ "$RESUME_RUN" = "1" ]; then
-PRE_A4_FAILED=$FAILED
+PRE_A4_FAIL=$FAIL_COUNT; PRE_A4_PASS=$PASS_COUNT
 # Record the pre-pause state (the consistency assertion compares against it).
 PRE_ITER="$(lfield ${p2h_resume} '.status.iteration')"
 PRE_VERIFY="$(lfield ${p2h_resume} '.status.currentVerify.verifiedCommit')"
@@ -1238,13 +1241,13 @@ fi
   # pre-empty/post-set new-pin case), and NO new fail fired in-section (each
   # conjunct is also checked by a pass/fail above; the in-section FAILED delta
   # is the gate that catches one of them failing).
-  echo "   DEBUG a4: RP_FROM=$RP_FROM RP_REASON=$RP_REASON RP_FROM2=[$RP_FROM2] RP_REASON2=[$RP_REASON2] POST_ITER=$POST_ITER PRE_ITER=$PRE_ITER POST_VERIFY=[$POST_VERIFY] PRE_VERIFY=[$PRE_VERIFY] FAILED=$FAILED PRE_A4_FAILED=$PRE_A4_FAILED" >&2
   # assertion 4 accounting: the individual pass/fail calls above already
   # check each conjunct (pausedFrom/pausedReason, records cleared, iteration
-  # unchanged, pin not lost). The in-section FAILED delta is the gate that
-  # catches any of them failing. A fail in-section sets FAILED=1; if FAILED
-  # was already 1 from a previous assertion, the delta is 0 (no NEW fail).
-  if [ "$FAILED" -eq "$PRE_A4_FAILED" ]; then
+  # unchanged, pin not lost). The in-section FAIL_COUNT delta is the gate
+  # that catches any of them failing; PASS_COUNT > PRE confirms at least one
+  # pass ran in the section.
+  echo "   DEBUG a4: RP_FROM=$RP_FROM RP_REASON=$RP_REASON RP_FROM2=[$RP_FROM2] RP_REASON2=[$RP_REASON2] POST_ITER=$POST_ITER PRE_ITER=$PRE_ITER POST_VERIFY=[$POST_VERIFY] PRE_VERIFY=[$PRE_VERIFY] FAIL_COUNT=$FAIL_COUNT PRE_A4_FAIL=$PRE_A4_FAIL PASS_COUNT=$PASS_COUNT PRE_A4_PASS=$PRE_A4_PASS" >&2
+  if [ "$FAIL_COUNT" -eq "$PRE_A4_FAIL" ] && [ "$PASS_COUNT" -gt "$PRE_A4_PASS" ]; then
     assert_done 4 pass
   else
     assert_done 4 fail
@@ -1255,7 +1258,7 @@ fi
 # --- assertion 5: the budget-Pause + raised-cap resume ---
 echo
 echo "--- assertion 5: the budget-Pause + raised-cap resume (both sub-cases) ---"
-PRE_A5_FAILED=$FAILED
+PRE_A5_FAIL=$FAIL_COUNT; PRE_A5_PASS=$PASS_COUNT
 # The entry point: the budget fire happens at Verifying (the applyBudgetStep
 # runs every reconcile; the exceedance is recorded at the 2nd Implementing's
 # 400 tokens). pausedFrom names the phase the Loop left (Implementing or
@@ -1456,7 +1459,7 @@ fi
 # and NO new fail fired in-section (a STEP 4+ re-run that re-applies the
 # idempotent patch/annotation against an already-resolved Loop counts the
 # end state; a fail that fires in-section wins over it).
-if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$B3_OK" = "1" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
+if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$B3_OK" = "1" ] && [ "$FAIL_COUNT" -eq "$PRE_A5_FAIL" ] && [ "$PASS_COUNT" -gt "$PRE_A5_PASS" ]; then
   assert_done 5 pass
 else
   assert_done 5 fail

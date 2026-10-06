@@ -336,13 +336,21 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 		// ran first. Mutation: setting pausedFrom=Verifying (the phase BEFORE
 		// the iterate) must make spec 3 FAIL (the resume returns to Verifying,
 		// not Implementing).
+		// P2g (the auditability sweep): the Paused condition + the Normal
+		// Paused Event are emitted HERE (the stall entry point), not via the
+		// P2f suspend path (the stall's source is named in both).
 		loop.Status.PausedFrom = coxv1alpha1.LoopPhaseImplementing // the phase the iterate would have set
 		loop.Status.Phase = coxv1alpha1.LoopPhasePaused
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePaused
 		loop.Status.PausedReason = coxv1alpha1.PausedReasonStall
+		setCondition(loop, coxv1alpha1.PausedCondition, metav1.ConditionTrue,
+			pausedCondReasonPaused,
+			"paused (stall): stall detector fired after "+fmt.Sprintf("%d", run)+" consecutive identical verify failures")
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
 			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run))
 		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeNormal, pauseEventReason,
+				"paused: source stall, from phase %s (stall detector fired)", loop.Status.PausedFrom)
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run)
 		}
 	case coxv1alpha1.StallActionContinue:

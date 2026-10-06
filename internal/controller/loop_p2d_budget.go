@@ -506,6 +506,14 @@ func (r *LoopReconciler) fireBudgetExceeded(ctx context.Context, loop *coxv1alph
 
 	switch spec.OnExceeded {
 	case coxv1alpha1.BudgetExceededActionFail:
+		// P2g (the auditability sweep): the BudgetExceeded Event fires for the
+		// Fail path too (the condition is set above; the Event is the audit
+		// record of the exceedance itself, the Failed-phase outcome is the
+		// onExceeded action).
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeNormal, budgetExceededEventReason,
+				"budget cap %s exceeded: %s (onExceeded=Fail)", capName, value)
+		}
 		// Fail: terminal Failed, reason BudgetExceeded. The Failed-phase
 		// cleanup (sandbox suspension via the spec.suspend/S1 path is not
 		// automatic; the Loop is terminal and the next reconcile's gates hold

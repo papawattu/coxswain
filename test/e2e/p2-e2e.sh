@@ -857,7 +857,14 @@ wait_for() {
   wait_phase "$loop" "$want" "$deadline"
 }
 if in_steps 4; then
-wait_for ${p2h_real} Succeeded 900 || bad "${p2h_real} did not reach Succeeded in 900s (phase=$(lphase ${p2h_real}))"
+# wait_for p2h-real Succeeded 600 (10 min): the reviewer's fix — a DNS flake
+# (gitea.samples.svc transiently unreachable) can leave the cross-check
+# Loop in Verifying forever (the operator's pre-existing gap: a
+# clone-base-failed verify Job with tamper/artifact/check still
+# PodInitializing never advances — verifyOutcome never decides). Without
+# a timeout the run hangs; with one, assertion 3 FAILS with the Loop's
+# phase in the log so a wedged run never blocks the rest.
+wait_for ${p2h_real} Succeeded 600 || { bad "${p2h_real} did not reach Succeeded in 600s (phase=$(lphase ${p2h_real}))"; }
 REAL_T1="$(date -u +%s)"
 # Cross-check end counters (the reviewer's A3 fix): wait at least 75s (2+ the
 # 30s Prometheus scrape interval) after Succeeded so the last samples are in,
@@ -991,6 +998,19 @@ REAL_BUDGET="$(K -n "$NS" get loop ${p2h_real} -o jsonpath='{.status.budget}' 2>
 echo "   cross-check Loop: phase=$REAL_PHASE window=[$REAL_T0,$REAL_T1] status.budget=$REAL_BUDGET"
 echo "   window: $REAL_T0..$REAL_T1" > "$LOG_DIR/crosscheck.txt"
 echo "   per-Loop status.budget: $REAL_BUDGET" >> "$LOG_DIR/crosscheck.txt"
+# The reviewer's fix: if the cross-check Loop never reached Succeeded (a
+# DNS flake left it in Verifying — the operator's pre-existing gap: a
+# clone-base-failed verify Job never advances), assertion 3 FAILS with the
+# Loop's phase in the log (it cannot be cross-checked: no budget record,
+# no Succeeded). The run still proceeds to assertions 1/2/4/5.
+if [ "$REAL_PHASE" != "Succeeded" ]; then
+  XCHECK="fail"
+  fail "cross-check: ${p2h_real} never reached Succeeded (phase=$REAL_PHASE — a transient DNS flake left the clone-base verify Job failed; the operator's pre-existing gap)"
+  assert_done 3 fail
+  echo "   (assertion 3 failed; proceeding to assertions 1/2/4/5)"
+  # skip the rest of assertion 3's cross-check computation
+fi
+if [ "$XCHECK" != "fail" ]; then
 # The counter pair (the reviewer's A3 fix): the START values were captured as
 # instant Prometheus reads BEFORE ${p2h_real} was created (its early requests
 # fall inside the window), and the END values were read AFTER it reached
@@ -1043,6 +1063,7 @@ if [ "$XCHECK" = "pass" ]; then assert_done 3 pass
 elif [ "$XCHECK" = "dropped" ]; then assert_done 3 dropped
 else fail "cross-check: XCHECK=$XCHECK (not pass or dropped)"; assert_done 3 fail
 fi
+fi   # end the assertion-3 cross-check computation (the XCHECK=fail early-exit)
 
 # --- assertion 4: the paused-Loop resume ---
 echo

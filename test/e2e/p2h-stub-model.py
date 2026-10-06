@@ -67,10 +67,17 @@ LOG_PATH = os.environ.get("STUB_LOG", "/tmp/stub-requests.jsonl")
 # it. Appends ONE newline to README.md (a non-protected path — the "go"
 # preset protects **/*_test.go, **/testdata/**, go.mod, go.sum; README.md is
 # none of those) and commits it, so EVERY Implementing run produces a NEW
-# commit and the verify Job re-runs. set -e so a failure (e.g. not a repo)
-# surfaces as a non-zero exit the runner feeds back.
+# commit and the verify Job re-runs. The workspace PVC is root-owned (the
+# seed / init containers run as root) while the runner's shell runs as uid
+# 65532: git refuses the repo without safe.directory (the runner's own gitC
+# carries the flag per-command, but the tool's shell does not) — the command
+# sets GIT_CONFIG_GLOBAL=/dev/null (no HOME git config needed, and nothing is
+# left on the workspace) + safe.directory. set -e so a failure (e.g. not a
+# repo) surfaces as a non-zero exit the runner feeds back.
 IMPLEMENT_CMD = (
-    "set -e; cd \"$COX_WORKSPACE\"; "
+    "set -e; export GIT_CONFIG_GLOBAL=/dev/null; "
+    "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=\"$COX_WORKSPACE\"; "
+    "cd \"$COX_WORKSPACE\"; "
     "git add -A; "
     "echo >> README.md; "
     "git add README.md; "

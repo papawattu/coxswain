@@ -70,6 +70,15 @@ if not fails:
         cmd = json.loads(tcs[0]["function"]["arguments"]).get("command", "")
         if "echo >> README.md" not in cmd or "git" not in cmd:
             fails.append("request 0: the implement-instruction is not the README.md one-liner: %r" % cmd)
+        # The workspace PVC is root-owned (the seed / init containers run as
+        # root) while the runner's shell runs as uid 65532: git refuses the
+        # repo without safe.directory ('dubious ownership'). The tool's shell
+        # does NOT carry the runner's per-command -c flags, so the
+        # instruction itself must set safe.directory via the GIT_CONFIG env
+        # (GIT_CONFIG_GLOBAL=/dev/null + the counted KEY/VALUE pairs — a
+        # HOME-less, workspace-clean way).
+        if "safe.directory" not in cmd or "GIT_CONFIG_GLOBAL=/dev/null" not in cmd:
+            fails.append("request 0: the implement-instruction lacks git's safe.directory env (root-owned workspace + uid-65532 shell = 'dubious ownership' otherwise): %r" % cmd)
     u0 = r0.get("usage", {})
     if (u0.get("prompt_tokens"), u0.get("completion_tokens")) != (100, 100):
         fails.append("request 0: usage %r (expected prompt=100 completion=100)" % u0)

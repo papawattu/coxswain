@@ -398,6 +398,11 @@ func TestApplyStallGateContinueLeavesPhaseUnchanged(t *testing.T) {
 //	(a) state.terminated.message set, NO lastState -> returns (message, true).
 //	(b) restarted container: ONLY lastState.terminated.message -> returns (message, true).
 //	(c) no terminated record at all -> returns ("", false).
+//	(d) terminated with an EMPTY message (a silently-failing check, e.g.
+//	    test -f /nonexistent — the P2h acceptance check) -> returns ("", true):
+//	    the check ran and failed; the empty output is the stall detector's
+//	    evidence, NOT inert (the P2h finding: the old ("", false) made a
+//	    silently-failing check un-stallable, so stallHistory stayed null).
 func TestDefaultReadCheckOutput(t *testing.T) {
 	r := &LoopReconciler{}
 	const check = "check-0"
@@ -426,6 +431,25 @@ func TestDefaultReadCheckOutput(t *testing.T) {
 	}}}
 	if got, ok := r.defaultReadCheckOutput(podC, check); ok || got != "" {
 		t.Fatalf("(c) no terminated record must be (\"\", false): got (%q, %v)", got, ok)
+	}
+
+	// (d) a terminated check with an EMPTY message (a silently-failing
+	// check, test -f /nonexistent) -> ("", true): the check ran, and the
+	// empty output is the stall detector's evidence (NOT inert).
+	podD0 := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+		{Name: check, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: ""}}},
+	}}}
+	if got, ok := r.defaultReadCheckOutput(podD0, check); !ok || got != "" {
+		t.Fatalf("(d) a terminated check with an empty message must be (\"\", true): got (%q, %v)", got, ok)
+	}
+
+	// (d2) the same case via lastState (a restarted container whose previous
+	// incarnation terminated with an empty message).
+	podD1 := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+		{Name: check, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: ""}}},
+	}}}
+	if got, ok := r.defaultReadCheckOutput(podD1, check); !ok || got != "" {
+		t.Fatalf("(d2) a restarted check's lastState with an empty message must be (\"\", true): got (%q, %v)", got, ok)
 	}
 
 	// state takes precedence over lastState when BOTH are set (a restarted

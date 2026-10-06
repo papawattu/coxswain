@@ -165,6 +165,14 @@ type LoopReconciler struct {
 	// than being held Suspended. For dev/kind only — never in production.
 	AllowUnenforced bool
 
+	// readCheckOutput is the P2e seam for reading a failing verify check's
+	// raw output (the terminationMessage of the check container — NO pod-log
+	// read). When set, the stall gate uses it; when nil it falls back to
+	// defaultReadCheckOutput (the live read). The envtest specs drive it for
+	// a deterministic output without a real verify Job (the spec's
+	// readCheckOutput seam, P2e item 2).
+	readCheckOutput func(pod *corev1.Pod, checkName string) (string, bool)
+
 	// CNIProber is the network-layer seam the operator uses (D38), analogous to
 	// Enforcer (D30). When set, the operator gates the sandbox on the CNI probe
 	// result (NetworkEnforced condition): a CNI that does not police pod ->

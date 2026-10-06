@@ -167,6 +167,15 @@ for img in "$CTRL_IMG" "$RUNNER_IMG" "$STUB_IMG" "$GIT_IMG" "$CHECK_IMG"; do
   echo "   kind load: $img"
   kind load docker-image "$img" --name "$CLUSTER" || die "kind load $img failed"
 done
+# The dev overlay pins --runner-image=coxswain-runner:dev (the operator's
+# RunnerImage; isRunner is true only when spec.agent.image == RunnerImage).
+# The P2h Loops' spec.agent.image is $RUNNER_IMG, so the operator's
+# --runner-image must ALSO be $RUNNER_IMG or the agents run 'sleep infinity'
+# (isRunner false). The dev overlay REPLACES the manager container env (the
+# base manifest carried no env before P2b), so the --runner-image flag is
+# added to the overlay's args patch: the script re-applies the dev overlay
+# with the flag set to $RUNNER_IMG (the operator's own knob; a Loop cannot
+# set it).
 
 # ===========================================================================
 # STEP 1: deploy the operator (dev overlay) + roll to the built image + verify
@@ -182,6 +191,12 @@ cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$CTRL_IMG") || die "kustomize set image failed"
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) || die "controller deploy failed"
 K -n "$E2E_NS" set image deploy/coxswain-controller-manager manager="$CTRL_IMG" >/dev/null || die "set image failed"
+# The P2h Loops' spec.agent.image is $RUNNER_IMG; the dev overlay's
+# --runner-image=coxswain-runner:dev (the operator's RunnerImage) must ALSO be
+# $RUNNER_IMG or the agents run 'sleep infinity' (isRunner is true only when
+# spec.agent.image == RunnerImage). The script adds the flag to the dev
+# overlay's args (the operator's own knob; a Loop cannot set it) and rolls.
+K -n "$E2E_NS" set args deploy/coxswain-controller-manager --containers=manager -- "--runner-image=$RUNNER_IMG" >/dev/null || die "set --runner-image arg failed"
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || die "controller not ready"
 RUNNING_IMAGEID=""
 for i in $(seq 1 60); do

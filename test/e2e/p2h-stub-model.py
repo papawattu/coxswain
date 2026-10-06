@@ -75,6 +75,7 @@ import json
 import os
 import socket
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "8444"))
@@ -85,6 +86,19 @@ PORT = int(os.environ.get("PORT", "8444"))
 # truth, cross-checked against the REAL vLLM backend delta, never against
 # this file).
 LOG_PATH = os.environ.get("STUB_LOG", "/tmp/stub-requests.jsonl")
+
+# The SLOW model (the P2h A4 determinism fix): a request whose model name is
+# "p2h-stub-slow" is answered AFTER a SLOW_DELAY_S sleep. The P2h resume Loop
+# uses it so its Implementing phase lasts long enough for the acceptance
+# script's suspend-flip window to land INSIDE an Implementing (the flip had
+# to race the phase transition — the stub's default 2-request Implementing
+# finishes in seconds, and the pause can land with the Loop already at
+# Verifying, where the pause's pausedFrom reads Verifying and the iteration
+# advances between the pre-pause read and the pause landing). With a 30s
+# sleep on the first model call, Implementing lasts >= 30s and the flip
+# (polled every 2s) lands inside it deterministically.
+SLOW_MODEL = "p2h-stub-slow"
+SLOW_DELAY_S = float(os.environ.get("SLOW_DELAY_S", "30"))
 
 # The fixed implement-instruction (item 14). Appends ONE newline to
 # README.md (a non-protected path — the "go" preset protects **/*_test.go,
@@ -183,13 +197,19 @@ class StubHandler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": "bad request: %s" % e}).encode(),
                        "application/json")
             return
+        # The SLOW model's sleep (the A4 determinism fix): the sleep is
+        # BEFORE the audit log + response, so the request's wall clock
+        # includes the delay. Only the resume Loop sends this model.
+        model = req.get("model") or "p2h-stub"
+        if model == SLOW_MODEL:
+            time.sleep(SLOW_DELAY_S)
         # The stub is NON-streaming regardless of the request's stream flag
         # (the reference runner's shape; the plan pins stream:false).
         kind = choice_kind(req)
         body = {
             "id": "stub-p2h-%d" % len(req.get("messages") or []),
             "object": "chat.completion",
-            "model": req.get("model") or "p2h-stub",
+            "model": model,
             "choices": [build_choice(0, kind)],
             "usage": {"prompt_tokens": 100, "completion_tokens": 100,
                       "total_tokens": 200},
@@ -200,7 +220,7 @@ class StubHandler(BaseHTTPRequestHandler):
         # delta, never against this file).
         rec = {
             "n": len(req.get("messages") or []),
-            "model": req.get("model"),
+            "model": model,
             "tools": len(req.get("tools") or []),
             "stream": bool(req.get("stream")),
             "choice": kind,

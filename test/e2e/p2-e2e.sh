@@ -134,7 +134,7 @@ TS="$TIMESTAMP"
 # run-unique name p2h-<base>-${TS}). Using a per-run name makes the proxy pod
 # (and its emptyDir meter), the sandbox PVC, the Gitea repo and every pod name
 # unique per run, so a re-run never reuses a prior run's proxy emptyDir.
-p2h_stall="p2h-stall-${TS}"; p2h_budget="p2h-budget-${TS}"; p2h_ctrl="p2h-ctrl-${TS}"; p2h_resume="p2h-resume-${TS}"; p2h_budgetpause="p2h-budgetpause-${TS}"; p2h_budgetpause2="p2h-budgetpause2-${TS}"; p2h_real="p2h-real-${TS}"
+p2h_stall="p2h-stall-${TS}"; p2h_budget="p2h-budget-${TS}"; p2h_ctrl="p2h-ctrl-${TS}"; p2h_resume="p2h-resume-${TS}"; p2h_budgetpause="p2h-budgetpause-${TS}"; p2h_budgetpause2="p2h-budgetpause2-${TS}"; p2h_budgetpause3="p2h-budgetpause3-${TS}"; p2h_real="p2h-real-${TS}"
 # P2H_OPERATOR_IMAGE overrides the built image (the gate mutations).
 CTRL_IMG="${P2H_OPERATOR_IMAGE:-coxswain-controller:main-${COMMIT:0:7}-${TIMESTAMP}}"
 RUNNER_IMG="coxswain-runner:main-${COMMIT:0:7}-${TIMESTAMP}"
@@ -399,7 +399,7 @@ fi
 # ===========================================================================
 if in_steps 3; then
 echo
-echo "--- STEP 3: Gitea bare repos + the six Loops ---"
+echo "--- STEP 3: Gitea bare repos + the eight Loops ---"
 # Seed a per-Loop bare repo on Gitea. The seed: a minimal go.mod-only module
 # + README.md (the implement-instruction's target, non-protected). The check
 # image for the go preset would need a go.mod, but the acceptance check is
@@ -460,14 +460,15 @@ REPO_CTRL="$(seed_repo ${p2h_ctrl})"
 REPO_RESUME="$(seed_repo ${p2h_resume})"
 REPO_BPAUSE="$(seed_repo ${p2h_budgetpause})"
 REPO_BPAUSE2="$(seed_repo ${p2h_budgetpause2})"
+REPO_BPAUSE3="$(seed_repo ${p2h_budgetpause3})"
 REPO_REAL="$(seed_repo ${p2h_real})"
 # A seed failure aborts the run (the loops would fail with 'couldn't find
 # remote ref initial' if a seed SHA is empty — the sandboxes' clone-base
 # would 404; aborting here is the fail-loudly the R21 I55 norms demand).
-for s in "$REPO_STALL" "$REPO_BUDGET" "$REPO_CTRL" "$REPO_RESUME" "$REPO_BPAUSE" "$REPO_BPAUSE2" "$REPO_REAL"; do
+for s in "$REPO_STALL" "$REPO_BUDGET" "$REPO_CTRL" "$REPO_RESUME" "$REPO_BPAUSE" "$REPO_BPAUSE2" "$REPO_BPAUSE3" "$REPO_REAL"; do
   [ -n "$s" ] || die "a seed Gitea repo SHA is empty (a seed_repo call failed); the run aborts before creating any Loop"
 done
-echo "   seed commits: stall=$REPO_STALL budget=$REPO_BUDGET ctrl=$REPO_CTRL resume=$REPO_RESUME bpause=$REPO_BPAUSE bpause2=$REPO_BPAUSE2 real=$REPO_REAL"
+echo "   seed commits: stall=$REPO_STALL budget=$REPO_BUDGET ctrl=$REPO_CTRL resume=$REPO_RESUME bpause=$REPO_BPAUSE bpause2=$REPO_BPAUSE2 bpause3=$REPO_BPAUSE3 real=$REPO_REAL"
 
 # create a Loop + wait for the operator to create + bind the workspace PVC
 # (the operator OWNS the PVC — never pre-created, the P2e lesson). The Loop
@@ -551,7 +552,7 @@ K -n "$NS" create secret generic p2h-model-creds \
   --from-literal=MODEL_BASE_URL="http://$REAL_VLLM" \
   --dry-run=client -o yaml | K apply -f - >/dev/null
 
-# --- the six Loops ---
+# --- the eight Loops ---
 FAIL_CHECK='test -f /nonexistent'
 PASS_CHECK='sleep 0.1'
 
@@ -665,7 +666,7 @@ spec:
     - "$FAIL_CHECK"
   agent:
     image: $RUNNER_IMG
-    model: p2h-stub
+    model: p2h-stub-slow
     endpointSecretRef: p2h-model-creds
     modelEndpoint: $MODEL_ENDPOINT
   loop:
@@ -716,6 +717,45 @@ spec:
   goal: P2h budget-pause control loop (un-raised re-pause)
   workspace:
     repo: $GITEA_URL/${p2h_budgetpause2}.git
+    ref: initial
+    gitCredentialSecret: git-credentials
+  verify:
+    preset: go
+    image: $CHECK_IMG
+    acceptanceChecks:
+    - "$FAIL_CHECK"
+  agent:
+    image: $RUNNER_IMG
+    model: p2h-stub
+    endpointSecretRef: p2h-model-creds
+    modelEndpoint: $MODEL_ENDPOINT
+  loop:
+    maxIterations: 10
+    stallAfter: 3
+    stallAction: Continue
+  budget:
+    maxTokens: 400
+    onExceeded: Pause
+EOF
+
+# The THIRD budget-Pause Loop (sub-case (c), the plan's G3 gate): a budget
+# pause whose cap HAS been raised but which is NOT annotated. Correctly it
+# STAYS Paused (only the coxswain.io/resume annotation may resume a Budget
+# pause — a spec.suspend flip may not); under the G3 mutation (the
+# pausedReason check dropped) a spec.suspend=false would wrongly resume it.
+# assertion 5's sub-case (c) raises the cap, flips suspend true->false (no
+# annotation), asserts it stays Paused >=45s, THEN annotates and asserts it
+# resumes.
+create_loop_wait_pvc ${p2h_budgetpause3} <<EOF
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: ${p2h_budgetpause3}
+  namespace: $NS
+spec:
+  goal: P2h budget-pause sub-case-c loop (raised cap, no annotation; a suspend flip must NOT resume it)
+  workspace:
+    repo: $GITEA_URL/${p2h_budgetpause3}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -845,7 +885,7 @@ if ! in_steps 2; then
   [ -n "$PODY_DONE" ] && REAL_T1="$(date -u -d "$PODY_DONE" +%s 2>/dev/null || echo '')"
 fi
 
-# --- wait for all six Loops to reach their terminal / assertion states ---
+# --- wait for all eight Loops to reach their terminal / assertion states ---
 # (parallel; the script waits each in turn with a generous deadline)
 echo "   waiting: ${p2h_real} -> Succeeded (real vLLM, trivial goal)"
 # wait_for <loop> <phase> <deadline-s>: a STEP 4+ re-run (P2H_STEPS=4,5,6)
@@ -895,9 +935,10 @@ echo "   waiting: ${p2h_budget} -> Failed (BudgetExceeded at request 2)"
 wait_for ${p2h_budget} Failed 300 || bad "${p2h_budget} did not reach Failed in 300s (phase=$(lphase ${p2h_budget}))"
 echo "   waiting: ${p2h_ctrl} -> Failed (the maxIterations cap at 5)"
 wait_for ${p2h_ctrl} Failed 300 || bad "${p2h_ctrl} did not reach Failed in 300s (phase=$(lphase ${p2h_ctrl}))"
-echo "   waiting: ${p2h_budgetpause} + ${p2h_budgetpause2} -> Paused (budget at 400)"
+echo "   waiting: ${p2h_budgetpause} + ${p2h_budgetpause2} + ${p2h_budgetpause3} -> Paused (budget at 400)"
 wait_for ${p2h_budgetpause} Paused 300 || bad "${p2h_budgetpause} did not reach Paused in 300s (phase=$(lphase ${p2h_budgetpause}))"
 wait_for ${p2h_budgetpause2} Paused 300 || bad "${p2h_budgetpause2} did not reach Paused in 300s (phase=$(lphase ${p2h_budgetpause2}))"
+wait_for ${p2h_budgetpause3} Paused 300 || bad "${p2h_budgetpause3} did not reach Paused in 300s (phase=$(lphase ${p2h_budgetpause3}))"
 fi
 
 # --- assertion 1: the Stalled path ---
@@ -1316,38 +1357,69 @@ if [ "$B2_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceede
 else
   fail "budget-Pause control Loop (un-raised): phase=$(lphase ${p2h_budgetpause2}) exceeded=$(lfield ${p2h_budgetpause2} '.status.budget.exceeded') (expected Paused + exceeded=true; refused-event=$B2_REJECTED)"
 fi
-# Sub-case (c): the plan's G3 gate — a `spec.suspend` flip must NOT resume a
-# Budget pause (only the coxswain.io/resume annotation may). On the un-raised
-# control Loop (already Paused, pausedReason=Budget, exceeded=true): flip
-# suspend true -> false (NO annotation) and assert it STAYS Paused
-# (pausedReason=Budget, exceeded=true) for at least 30s (>=15 reconciles).
-# Idempotent for a STEP 4+ re-run: on the unmutated operator the flips are
-# no-ops (a Suspend flip never resumes a Budget pause) and the end state is
-# re-asserted.
+# Sub-case (c) (the G3 gate, the reviewer's rewrite): a budget pause whose
+# cap HAS been raised but which is NOT annotated must STAY Paused — only the
+# coxswain.io/resume annotation may resume a Budget pause. A spec.suspend
+# flip (true -> false, no annotation) must NOT resume it. Under the G3
+# mutation (the pausedReason check dropped from resumeTriggered), the
+# suspend flip WOULD wrongly resume it (a budget pause no longer refuses on
+# the suspend flip once the cap is raised) -> this sub-case FAILS. A
+# SEPARATE budget-Pause Loop (${p2h_budgetpause3}) so sub-case (a) and the
+# control (sub-case b) are untouched. Idempotent for a STEP 4+ re-run: the
+# cap-raise patch is a no-op once raised, the suspend flip is a no-op, and
+# the annotation resume fires once (the end state is re-asserted).
 B3_OK=0
-K -n "$NS" patch loop ${p2h_budgetpause2} -p '{"spec":{"suspend":true}}' --type=merge >/dev/null 2>&1 || die "suspend=true patch (sub-case c) failed"
-K -n "$NS" patch loop ${p2h_budgetpause2} -p '{"spec":{"suspend":false}}' --type=merge >/dev/null 2>&1 || die "suspend=false patch (sub-case c) failed"
+echo "   sub-case (c): the budgetpause3 Loop (budget-paused, cap raised, NO annotation) must STAY Paused on a suspend flip"
+# Pre-condition: budgetpause3 is Paused (budget, exceeded=true) — the STEP 4
+# wait already confirmed it. (Re-check in case a re-run raced the cleanup.)
+for i in $(seq 1 10); do
+  [ "$(lfield ${p2h_budgetpause3} '.status.pausedReason')/$(lfield ${p2h_budgetpause3} '.status.budget.exceeded')" = "Budget/true" ] && break
+  sleep 2
+done
+# 1) Raise the cap (NO annotation). The cap is no longer exceeded — the only
+#    thing that must keep it Paused is the operator's rule that a Budget
+#    pause resumes ONLY via the annotation (a Suspend flip may not).
+K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"budget":{"maxTokens":8000}}}' --type=merge >/dev/null 2>&1 || die "cap-raise patch (sub-case c) failed"
+# 2) Flip suspend true -> false (NO annotation): the G3 mutation makes this a
+#    resume trigger; the real operator must ignore it for a Budget pause.
+K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"suspend":true}}' --type=merge >/dev/null 2>&1 || die "suspend=true patch (sub-case c) failed"
+sleep 5
+K -n "$NS" patch loop ${p2h_budgetpause3} -p '{"spec":{"suspend":false}}' --type=merge >/dev/null 2>&1 || die "suspend=false patch (sub-case c) failed"
 SUSP_FLIP_TS=$(date -u +%s)
-for i in $(seq 1 16); do
-  ph="$(lphase ${p2h_budgetpause2})"
-  pr="$(lfield ${p2h_budgetpause2} '.status.pausedReason')"
-  ex="$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')"
-  if [ "$ph" != "Paused" ] || [ "$pr" != "Budget" ] || [ "$ex" != "true" ]; then break; fi
+# Poll for >= 45s (23 x 2s); the first NON-paused/Budget reading ends the
+# hold early (a resume just fired) and fails the sub-case.
+for i in $(seq 1 23); do
+  ph="$(lphase ${p2h_budgetpause3})"
+  pr="$(lfield ${p2h_budgetpause3} '.status.pausedReason')"
+  ex="$(lfield ${p2h_budgetpause3} '.status.budget.exceeded')"
+  if [ "$ph" != "Paused" ] || [ "$pr" != "Budget" ]; then break; fi
   sleep 2
 done
 NOW_TS=$(date -u +%s)
 HOLD_S=$((NOW_TS - SUSP_FLIP_TS))
-if [ "$ph" = "Paused" ] && [ "$pr" = "Budget" ] && [ "$ex" = "true" ] && [ "$HOLD_S" -ge 30 ]; then
+ph="$(lphase ${p2h_budgetpause3})"; pr="$(lfield ${p2h_budgetpause3} '.status.pausedReason')"; ex="$(lfield ${p2h_budgetpause3} '.status.budget.exceeded')"
+if [ "$ph" = "Paused" ] && [ "$pr" = "Budget" ] && [ "$HOLD_S" -ge 45 ]; then
   B3_OK=1
-  pass "budget-Pause control Loop (un-raised): a suspend flip (true -> false, no annotation) did NOT resume it — stayed Paused (pausedReason=Budget, exceeded=true) for ${HOLD_S}s"
+  pass "budgetpause3 Loop (raised cap, no annotation): a suspend flip (true -> false) did NOT resume it — stayed Paused (pausedReason=Budget) for ${HOLD_S}s"
 else
-  fail "budget-Pause control Loop (un-raised): the suspend flip WRONGLY resumed it — phase=$ph pausedReason=$pr exceeded=$ex (expected Paused/Budget/true for >=30s; held ${HOLD_S}s)"
+  fail "budgetpause3 Loop (raised cap, no annotation): the suspend flip WRONGLY resumed it (or it left Paused) — phase=$ph pausedReason=$pr exceeded=$ex (expected Paused/Budget for >=45s; held ${HOLD_S}s)"
+fi
+# 3) THEN annotate (the legal resume trigger): it must resume even though
+#    suspend is already false (the annotation is the Budget pause's trigger;
+#    the cap was raised in step 1, so the refuse-while-exceeded guard does
+#    not refuse it). A STEP 4+ re-run re-applies the annotation: the operator
+#    clears it on the resume (a no-op once resumed — the end state holds).
+K -n "$NS" annotate loop ${p2h_budgetpause3} coxswain.io/resume="$(date -u +%s)" --overwrite >/dev/null 2>&1 || die "sub-case (c) annotate failed"
+if wait_phase ${p2h_budgetpause3} Implementing 240; then
+  pass "budgetpause3 Loop: the annotation (coxswain.io/resume) resumed it — phase=Implementing, pausedFrom cleared"
+else
+  fail "budgetpause3 Loop: the annotation did NOT resume it within 240s (phase=$(lphase ${p2h_budgetpause3})) — the annotation is the Budget pause's legal resume trigger"
 fi
 # assertion 5 accounting: pass iff the entry point + all three sub-cases held
 # and NO new fail fired in-section (a STEP 4+ re-run that re-applies the
 # idempotent patch/annotation against an already-resolved Loop counts the
 # end state; a fail that fires in-section wins over it).
-if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$B3_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
+if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ] || [ "$B1_FROM" = "Planning" ]; } && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$B3_OK" = "1" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
   assert_done 5 pass
 else
   assert_done 5 fail
@@ -1366,7 +1438,7 @@ echo "--- STEP 5: the per-Loop stub audit (status.budget vs the stub's request l
 STUB_LOG_RAW="$(K -n "$NS" exec "$STUB_POD" -- cat /tmp/stub-requests.jsonl 2>/dev/null || true)"
 STUB_N_REQ="$(echo "$STUB_LOG_RAW" | grep -c '"n":' || true)"
 echo "   stub request log: $STUB_N_REQ total requests (all Loops; the per-Loop split is by the proxy, not the stub — the per-Loop status.budget is the source of truth)"
-for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2}; do
+for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2} ${p2h_budgetpause3}; do
   T="$(K -n "$NS" get loop "$L" -o jsonpath='{.status.budget}' 2>/dev/null | python3 -c "
 import json,sys
 s=sys.stdin.read().strip()
@@ -1391,7 +1463,7 @@ echo "--- STEP 6: evidence dump (before cleanup) ---"
   echo
   echo "--- kubectl get loop (all) ---"
   K -n "$NS" get loop 2>/dev/null
-  for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2} ${p2h_real}; do
+  for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2} ${p2h_budgetpause3} ${p2h_real}; do
     echo
     echo "--- loop $L status ---"
     K -n "$NS" get loop "$L" -o json 2>/dev/null | python3 -c "
@@ -1450,7 +1522,7 @@ fi
 # ===========================================================================
 if in_steps 6; then
 echo "--- cleanup: deleting the Loops in $NS (not the cluster, not the homelab) ---"
-for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2} ${p2h_real}; do
+for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2} ${p2h_budgetpause3} ${p2h_real}; do
   K -n "$NS" delete loop "$L" --wait=false --ignore-not-found >/dev/null 2>&1 || true
 done
 echo "   (Loops deleted; the stub pod + Gitea repos remain for inspection)"

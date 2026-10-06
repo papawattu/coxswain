@@ -283,10 +283,11 @@ seed_repo() { # seed_repo <repo-name>; echoes the seed commit SHA
     set -e
     R="$1"
     BODY=$(printf "{\"name\":\"%s\",\"auto_init\":false,\"private\":false}" "$R")
+    printf "%s" "$BODY" > "/tmp/seed-body-$R.json"
     CODE=$(curl -s -o /tmp/create-$R.json -w "%{http_code}" -u samples:samples-git-password \
       -X POST "http://gitea.samples.svc:3000/api/v1/user/repos" \
       -H "Content-Type: application/json" \
-      -d "$BODY")
+      --data "@/tmp/seed-body-$R.json")
     case "$CODE" in
       201|409) ;;  # created / already exists (the push -f re-seeds)
       *) echo "Gitea API create failed: http $CODE body=$(cat /tmp/create-$R.json 2>/dev/null | head -c 300)"; exit 1 ;;

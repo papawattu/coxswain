@@ -23,19 +23,19 @@
 #
 # Loops (all point at the stub EXCEPT the cross-check Loop, which points at
 # the REAL vLLM LB 192.168.1.20:8000 — item I):
-#   1. the stall Loop (p2h-stall): stallAfter: 3, stallAction: Fail,
+#   1. the stall Loop (${p2h_stall}): stallAfter: 3, stallAction: Fail,
 #      maxIterations 10 — the stall (at the 3rd identical failure) stops it,
 #      not the cap.
-#   2. the budget Loop (p2h-budget): maxTokens: 300, onExceeded: Fail,
+#   2. the budget Loop (${p2h_budget}): maxTokens: 300, onExceeded: Fail,
 #      stallAction: Continue — the cap fires on request 2 (400 >= 300),
 #      BEFORE the 3rd verify failure (the budget is on the REQUEST, the
 #      stall on the FAILURE).
-#   3. the control Loop (p2h-ctrl): stallAfter: 10, maxIterations: 5 — spins
+#   3. the control Loop (${p2h_ctrl}): stallAfter: 10, maxIterations: 5 — spins
 #      to the cap WITHOUT a stall (the contrast that proves the stall Loop
 #      stopped because of the detector).
-#   4. the resume Loop (p2h-resume): spec.suspend driven false -> true ->
+#   4. the resume Loop (${p2h_resume}): spec.suspend driven false -> true ->
 #      false at Implementing.
-#   5. the budget-Pause Loops (p2h-budgetpause + p2h-budgetpause2):
+#   5. the budget-Pause Loops (${p2h_budgetpause} + ${p2h_budgetpause2}):
 #      onExceeded: Pause, maxTokens small (400) — paused at the 2nd
 #      Implementing (400 tokens >= 400; a 3rd request would need a 3rd
 #      verify failure that never comes). The FIRST has spec.budget.maxTokens
@@ -43,7 +43,7 @@
 #      annotation -> proceeds (the re-evaluation clears exceeded). The
 #      SECOND (control, caps NOT raised) -> re-pauses immediately (the
 #      fail-closed re-fire).
-#   6. the cross-check Loop (p2h-real): modelEndpoint 192.168.1.20:8000
+#   6. the cross-check Loop (${p2h_real}): modelEndpoint 192.168.1.20:8000
 #      (the REAL vLLM LB), a trivially PASSING check (sleep 0.1) so it
 #      reaches Succeeded in one iteration; its per-Loop status.budget token
 #      counts are cross-checked against the real vllm:prompt_tokens_total /
@@ -74,9 +74,9 @@
 #      -> Implementing, pausedFrom/pausedReason cleared, the sandbox pod
 #      re-created and Running, and the iteration + currentVerify consistent
 #      with the pre-pause state (not reset).
-#   5. Budget-Pause + raised-cap resume: p2h-budgetpause (raised cap +
+#   5. Budget-Pause + raised-cap resume: ${p2h_budgetpause} (raised cap +
 #      annotation resume) proceeds (two reconciles after resume with
-#      phase != Paused and exceeded=false); p2h-budgetpause2 (un-raised,
+#      phase != Paused and exceeded=false); ${p2h_budgetpause2} (un-raised,
 #      annotation resume) re-pauses immediately (the fail-closed re-fire).
 #
 # The workspace: each Loop's repo is a per-Loop bare repo on the in-kind
@@ -119,6 +119,22 @@ GIT_IMG="alpine/git:v2.54.0"
 CHECK_IMG="golang:1.26"
 COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+# The Loop-name suffix (unique per run): the Loop names p2h-<base> expand to
+# p2h-<base>-${TS} (bash parameter expansion on the p2h-<base> variable) so
+# the pod/PVC/proxy-emptyDir/Gitea-repo names are unique per run. The proxy
+# meter's emptyDir is per-POD and the operator reuses a same-named proxy pod
+# across Loop recreations in the same namespace (only the pod SPEC is hashed,
+# so an old proxy pod with a prior run's accumulated counters would survive
+# a delete-and-recreate and poison the per-Loop status.budget vs the backend
+# delta — the cross-check would see the stale counters). A unique name makes
+# the proxy pod (and its emptyDir) fresh each run.
+TS="$TIMESTAMP"
+# The seven Loop base names (the fixture's Loops; expand as p2h-<base>).
+# The seven Loop base names (the fixture's Loops; the variable holds the FULL
+# run-unique name p2h-<base>-${TS}). Using a per-run name makes the proxy pod
+# (and its emptyDir meter), the sandbox PVC, the Gitea repo and every pod name
+# unique per run, so a re-run never reuses a prior run's proxy emptyDir.
+p2h_stall="p2h-stall-${TS}"; p2h_budget="p2h-budget-${TS}"; p2h_ctrl="p2h-ctrl-${TS}"; p2h_resume="p2h-resume-${TS}"; p2h_budgetpause="p2h-budgetpause-${TS}"; p2h_budgetpause2="p2h-budgetpause2-${TS}"; p2h_real="p2h-real-${TS}"
 # P2H_OPERATOR_IMAGE overrides the built image (the gate mutations).
 CTRL_IMG="${P2H_OPERATOR_IMAGE:-coxswain-controller:main-${COMMIT:0:7}-${TIMESTAMP}}"
 RUNNER_IMG="coxswain-runner:main-${COMMIT:0:7}-${TIMESTAMP}"
@@ -129,8 +145,8 @@ HOMELAB_CTX="default"            # the homelab Prometheus context (read-only)
 
 # Cross-check (assertion 3) window: the reviewer's fix — the START counters are
 # the instant values of the homelab Prometheus vllm token series captured BEFORE
-# p2h-real is created (its early requests fall inside the window), and the END
-# counters are read AFTER p2h-real reached Succeeded + at least 75s (2+ scrape
+# ${p2h_real} is created (its early requests fall inside the window), and the END
+# counters are read AFTER ${p2h_real} reached Succeeded + at least 75s (2+ scrape
 # intervals — the Prometheus scrape lag). The rule stays 0 < per-Loop <= delta
 # (other traffic on the shared backend only makes the delta larger).
 XCHK_PROM_OK=""
@@ -413,13 +429,13 @@ seed_repo() { # seed_repo <repo-name>; echoes the seed commit SHA
   [ -n "$sha" ] || die "seed Gitea repo $repo: the SEED SHA was not echoed (the push failed; seed log: $(cat "$LOG_DIR/seed-$repo.txt"))"
   echo "$sha"
 }
-REPO_STALL="$(seed_repo p2h-stall)"
-REPO_BUDGET="$(seed_repo p2h-budget)"
-REPO_CTRL="$(seed_repo p2h-ctrl)"
-REPO_RESUME="$(seed_repo p2h-resume)"
-REPO_BPAUSE="$(seed_repo p2h-budgetpause)"
-REPO_BPAUSE2="$(seed_repo p2h-budgetpause2)"
-REPO_REAL="$(seed_repo p2h-real)"
+REPO_STALL="$(seed_repo ${p2h_stall})"
+REPO_BUDGET="$(seed_repo ${p2h_budget})"
+REPO_CTRL="$(seed_repo ${p2h_ctrl})"
+REPO_RESUME="$(seed_repo ${p2h_resume})"
+REPO_BPAUSE="$(seed_repo ${p2h_budgetpause})"
+REPO_BPAUSE2="$(seed_repo ${p2h_budgetpause2})"
+REPO_REAL="$(seed_repo ${p2h_real})"
 # A seed failure aborts the run (the loops would fail with 'couldn't find
 # remote ref initial' if a seed SHA is empty — the sandboxes' clone-base
 # would 404; aborting here is the fail-loudly the R21 I55 norms demand).
@@ -515,16 +531,16 @@ FAIL_CHECK='test -f /nonexistent'
 PASS_CHECK='sleep 0.1'
 
 echo "   creating the stall Loop (stallAfter:3, stallAction:Fail, maxIterations:10)"
-create_loop_wait_pvc p2h-stall <<EOF
+create_loop_wait_pvc ${p2h_stall} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
-  name: p2h-stall
+  name: ${p2h_stall}
   namespace: $NS
 spec:
   goal: P2h stall loop (impossible goal)
   workspace:
-    repo: $GITEA_URL/p2h-stall.git
+    repo: $GITEA_URL/${p2h_stall}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -544,16 +560,16 @@ spec:
 EOF
 
 echo "   creating the budget Loop (maxTokens:300, onExceeded:Fail, stallAction:Continue)"
-create_loop_wait_pvc p2h-budget <<EOF
+create_loop_wait_pvc ${p2h_budget} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
-  name: p2h-budget
+  name: ${p2h_budget}
   namespace: $NS
 spec:
   goal: P2h budget loop (impossible goal)
   workspace:
-    repo: $GITEA_URL/p2h-budget.git
+    repo: $GITEA_URL/${p2h_budget}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -576,16 +592,16 @@ spec:
 EOF
 
 echo "   creating the control Loop (stallAfter:10, maxIterations:5)"
-create_loop_wait_pvc p2h-ctrl <<EOF
+create_loop_wait_pvc ${p2h_ctrl} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
-  name: p2h-ctrl
+  name: ${p2h_ctrl}
   namespace: $NS
 spec:
   goal: P2h control loop (the stall contrast)
   workspace:
-    repo: $GITEA_URL/p2h-ctrl.git
+    repo: $GITEA_URL/${p2h_ctrl}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -605,16 +621,16 @@ spec:
 EOF
 
 echo "   creating the resume Loop (suspend driven at Implementing)"
-create_loop_wait_pvc p2h-resume <<EOF
+create_loop_wait_pvc ${p2h_resume} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
-  name: p2h-resume
+  name: ${p2h_resume}
   namespace: $NS
 spec:
   goal: P2h resume loop (pause + resume at Implementing)
   workspace:
-    repo: $GITEA_URL/p2h-resume.git
+    repo: $GITEA_URL/${p2h_resume}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -634,16 +650,16 @@ spec:
 EOF
 
 echo "   creating the two budget-Pause Loops (maxTokens:400, onExceeded:Pause)"
-create_loop_wait_pvc p2h-budgetpause <<EOF
+create_loop_wait_pvc ${p2h_budgetpause} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
-  name: p2h-budgetpause
+  name: ${p2h_budgetpause}
   namespace: $NS
 spec:
   goal: P2h budget-pause loop (raised-cap resume)
   workspace:
-    repo: $GITEA_URL/p2h-budgetpause.git
+    repo: $GITEA_URL/${p2h_budgetpause}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -665,16 +681,16 @@ spec:
     onExceeded: Pause
 EOF
 
-create_loop_wait_pvc p2h-budgetpause2 <<EOF
+create_loop_wait_pvc ${p2h_budgetpause2} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
-  name: p2h-budgetpause2
+  name: ${p2h_budgetpause2}
   namespace: $NS
 spec:
   goal: P2h budget-pause control loop (un-raised re-pause)
   workspace:
-    repo: $GITEA_URL/p2h-budgetpause2.git
+    repo: $GITEA_URL/${p2h_budgetpause2}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -697,7 +713,7 @@ spec:
 EOF
 
 # Cross-check start counters (the reviewer's A3 fix): the instant values of
-# the homelab Prometheus vllm token series captured BEFORE p2h-real exists —
+# the homelab Prometheus vllm token series captured BEFORE ${p2h_real} exists —
 # its early requests (the goal request fires right after creation) fall
 # inside [start, end]. If Prometheus is unreachable or the series is absent
 # the cross-check is DROPPED with a note (the plan allows it; it is a
@@ -711,23 +727,23 @@ if [ -n "$S_PROM" ] && [ -n "$S_GEN" ]; then
   XCHK_G0="${S_GEN% *}"
   XCHK_S1="${S_GEN#* }"
   XCHK_PROM_OK=1
-  echo "   cross-check start counters (BEFORE creating p2h-real): prompt=$XCHK_P0 (sample ts=$XCHK_S0) generation=$XCHK_G0 (sample ts=$XCHK_S1) at $XCHK_T0"
+  echo "   cross-check start counters (BEFORE creating ${p2h_real}): prompt=$XCHK_P0 (sample ts=$XCHK_S0) generation=$XCHK_G0 (sample ts=$XCHK_S1) at $XCHK_T0"
 else
   XCHK_PROM_OK=""
   echo "   cross-check start counters UNAVAILABLE (no vllm token series or Prometheus unreachable; the cross-check will be DROPPED with a note)"
 fi
 
 echo "   creating the cross-check Loop (the REAL vLLM LB 192.168.1.20:8000, passing check)"
-create_loop_wait_pvc p2h-real <<EOF
+create_loop_wait_pvc ${p2h_real} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
-  name: p2h-real
+  name: ${p2h_real}
   namespace: $NS
 spec:
   goal: P2h cross-check loop (real vLLM, trivial goal)
   workspace:
-    repo: $GITEA_URL/p2h-real.git
+    repo: $GITEA_URL/${p2h_real}.git
     ref: initial
     gitCredentialSecret: git-credentials
   verify:
@@ -750,7 +766,7 @@ fi
 # MODEL_ENDPOINT is carried in every Loop's spec.agent.modelEndpoint (a
 # STEP 4+ re-run skips STEP 2's node-IP discovery).
 if ! in_steps 2; then
-  MODEL_ENDPOINT="$(K -n "$NS" get loop p2h-stall -o jsonpath='{.spec.agent.modelEndpoint}' 2>/dev/null || true)"
+  MODEL_ENDPOINT="$(K -n "$NS" get loop ${p2h_stall} -o jsonpath='{.spec.agent.modelEndpoint}' 2>/dev/null || true)"
   [ -n "$MODEL_ENDPOINT" ] || die "could not read the live Loops' model endpoint (STEP 4+ with no fixture?)"
   RUNNING_IMAGEID="$(K -n "$E2E_NS" get pods -l control-plane=controller-manager -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="manager")].imageID}{end}' 2>/dev/null || true)"
   echo "   STEP 4+ re-run: model endpoint=$MODEL_ENDPOINT running imageID=$RUNNING_IMAGEID"
@@ -800,15 +816,15 @@ if ! in_steps 2; then
   # start..end is its wall clock) — derive the window from the pod timestamps
   # (the full run's log carries the authoritative window; this keeps the
   # re-run's cross-check note self-consistent).
-  PODY_START="$(K -n "$NS" get pod p2h-real-proxy -o jsonpath='{.status.startTime}' 2>/dev/null || true)"
-  PODY_DONE="$(K -n "$NS" get pod p2h-real-proxy -o jsonpath='{.status.containerStatuses[0].state.terminated.finishedAt}' 2>/dev/null || true)"
+  PODY_START="$(K -n "$NS" get pod ${p2h_real}-proxy -o jsonpath='{.status.startTime}' 2>/dev/null || true)"
+  PODY_DONE="$(K -n "$NS" get pod ${p2h_real}-proxy -o jsonpath='{.status.containerStatuses[0].state.terminated.finishedAt}' 2>/dev/null || true)"
   [ -n "$PODY_START" ] && REAL_T0="$(date -u -d "$PODY_START" +%s 2>/dev/null || echo "$REAL_T0")"
   [ -n "$PODY_DONE" ] && REAL_T1="$(date -u -d "$PODY_DONE" +%s 2>/dev/null || echo '')"
 fi
 
 # --- wait for all six Loops to reach their terminal / assertion states ---
 # (parallel; the script waits each in turn with a generous deadline)
-echo "   waiting: p2h-real -> Succeeded (real vLLM, trivial goal)"
+echo "   waiting: ${p2h_real} -> Succeeded (real vLLM, trivial goal)"
 # wait_for <loop> <phase> <deadline-s>: a STEP 4+ re-run (P2H_STEPS=4,5,6)
 # finds the Loop already in its assertion state — wait 0s in that case (the
 # wait is for a Loop still progressing, not a re-run of a finished fixture).
@@ -818,12 +834,12 @@ wait_for() {
   wait_phase "$loop" "$want" "$deadline"
 }
 if in_steps 4; then
-wait_for p2h-real Succeeded 900 || bad "p2h-real did not reach Succeeded in 900s (phase=$(lphase p2h-real))"
+wait_for ${p2h_real} Succeeded 900 || bad "${p2h_real} did not reach Succeeded in 900s (phase=$(lphase ${p2h_real}))"
 REAL_T1="$(date -u +%s)"
 # Cross-check end counters (the reviewer's A3 fix): wait at least 75s (2+ the
 # 30s Prometheus scrape interval) after Succeeded so the last samples are in,
 # then read the instant values — the scrape lag means a read right at
-# Succeeded would undercount the tail of p2h-real's requests.
+# Succeeded would undercount the tail of ${p2h_real}'s requests.
 if [ "$XCHK_PROM_OK" = "1" ]; then
   SCRAPE_LAG=75
   ELAPSED=$(( $(date -u +%s) - REAL_T1 ))
@@ -837,31 +853,31 @@ if [ "$XCHK_PROM_OK" = "1" ]; then
   if [ -n "$E_PROM" ] && [ -n "$E_GEN" ]; then
     XCHK_P1="${E_PROM% *}"; XCHK_S0_END="${E_PROM#* }"
     XCHK_G1="${E_GEN% *}"; XCHK_S1_END="${E_GEN#* }"
-    echo "   cross-check end counters (AFTER p2h-real Succeeded + scrape lag): prompt=$XCHK_P1 (sample ts=$XCHK_S0_END) generation=$XCHK_G1 (sample ts=$XCHK_S1_END) at $XCHK_T1"
+    echo "   cross-check end counters (AFTER ${p2h_real} Succeeded + scrape lag): prompt=$XCHK_P1 (sample ts=$XCHK_S0_END) generation=$XCHK_G1 (sample ts=$XCHK_S1_END) at $XCHK_T1"
   else
     XCHK_PROM_OK=""
     echo "   cross-check end counters UNAVAILABLE (the cross-check will be DROPPED with a note)"
   fi
 fi
-echo "   waiting: p2h-stall -> Failed (Stalled at iteration 3)"
-wait_for p2h-stall Failed 900 || bad "p2h-stall did not reach Failed in 900s (phase=$(lphase p2h-stall))"
-echo "   waiting: p2h-budget -> Failed (BudgetExceeded at request 2)"
-wait_for p2h-budget Failed 900 || bad "p2h-budget did not reach Failed in 900s (phase=$(lphase p2h-budget))"
-echo "   waiting: p2h-ctrl -> Failed (the maxIterations cap at 5)"
-wait_for p2h-ctrl Failed 900 || bad "p2h-ctrl did not reach Failed in 900s (phase=$(lphase p2h-ctrl))"
-echo "   waiting: p2h-budgetpause + p2h-budgetpause2 -> Paused (budget at 400)"
-wait_for p2h-budgetpause Paused 900 || bad "p2h-budgetpause did not reach Paused in 900s (phase=$(lphase p2h-budgetpause))"
-wait_for p2h-budgetpause2 Paused 900 || bad "p2h-budgetpause2 did not reach Paused in 900s (phase=$(lphase p2h-budgetpause2))"
+echo "   waiting: ${p2h_stall} -> Failed (Stalled at iteration 3)"
+wait_for ${p2h_stall} Failed 900 || bad "${p2h_stall} did not reach Failed in 900s (phase=$(lphase ${p2h_stall}))"
+echo "   waiting: ${p2h_budget} -> Failed (BudgetExceeded at request 2)"
+wait_for ${p2h_budget} Failed 900 || bad "${p2h_budget} did not reach Failed in 900s (phase=$(lphase ${p2h_budget}))"
+echo "   waiting: ${p2h_ctrl} -> Failed (the maxIterations cap at 5)"
+wait_for ${p2h_ctrl} Failed 900 || bad "${p2h_ctrl} did not reach Failed in 900s (phase=$(lphase ${p2h_ctrl}))"
+echo "   waiting: ${p2h_budgetpause} + ${p2h_budgetpause2} -> Paused (budget at 400)"
+wait_for ${p2h_budgetpause} Paused 900 || bad "${p2h_budgetpause} did not reach Paused in 900s (phase=$(lphase ${p2h_budgetpause}))"
+wait_for ${p2h_budgetpause2} Paused 900 || bad "${p2h_budgetpause2} did not reach Paused in 900s (phase=$(lphase ${p2h_budgetpause2}))"
 fi
 
 # --- assertion 1: the Stalled path ---
 echo
 echo "--- assertion 1: the Stalled path (stall Loop + the control contrast) ---"
 PRE_A1_FAILED=$FAILED
-ST_PHASE="$(lphase p2h-stall)"
-ST_FAILED_REASON="$(lfield p2h-stall '.status.conditions[?(@.type=="Failed")].reason')"
-ST_STALLED_COND="$(lfield p2h-stall '.status.conditions[?(@.type=="Stalled")].status')"
-ST_ITER="$(lfield p2h-stall '.status.iteration')"
+ST_PHASE="$(lphase ${p2h_stall})"
+ST_FAILED_REASON="$(lfield ${p2h_stall} '.status.conditions[?(@.type=="Failed")].reason')"
+ST_STALLED_COND="$(lfield ${p2h_stall} '.status.conditions[?(@.type=="Stalled")].status')"
+ST_ITER="$(lfield ${p2h_stall} '.status.iteration')"
 if [ "$ST_PHASE" = "Failed" ] && [ "$ST_FAILED_REASON" = "Stalled" ] && [ "$ST_STALLED_COND" = "True" ]; then
   pass "stall Loop: phase=Failed, the Failed condition reason=Stalled, the Stalled condition True"
 else
@@ -872,7 +888,7 @@ if [ "$ST_ITER" = "3" ]; then
 else
   fail "stall Loop: status.iteration=$ST_ITER (expected 3)"
 fi
-K -n "$NS" get events --field-selector involvedObject.name=p2h-stall -o json > "$LOG_DIR/events-stall.json" 2>/dev/null || true
+K -n "$NS" get events --field-selector involvedObject.name=${p2h_stall} -o json > "$LOG_DIR/events-stall.json" 2>/dev/null || true
 # The stall gate emits the WARNING event 'StallDetected' (reason) + the
 # 'Stalled' condition (the two are the detector's record; the Failed
 # CONDITION carries reason Stalled — the condition was asserted above).
@@ -886,9 +902,9 @@ else
   fail "stall Loop: no Stall event (events in $LOG_DIR/events-stall.json)"
 fi
 # The control contrast.
-CT_PHASE="$(lphase p2h-ctrl)"
-CT_ITER="$(lfield p2h-ctrl '.status.iteration')"
-CT_FAILED_REASON="$(lfield p2h-ctrl '.status.conditions[?(@.type=="Failed")].reason')"
+CT_PHASE="$(lphase ${p2h_ctrl})"
+CT_ITER="$(lfield ${p2h_ctrl} '.status.iteration')"
+CT_FAILED_REASON="$(lfield ${p2h_ctrl} '.status.conditions[?(@.type=="Failed")].reason')"
 if [ "$CT_PHASE" = "Failed" ] && [ "$CT_ITER" = "5" ]; then
   pass "control Loop: phase=Failed at status.iteration == 5 (the maxIterations cap) — the contrast"
 else
@@ -906,13 +922,13 @@ fi
 echo
 echo "--- assertion 2: the BudgetExceeded path (budget Loop) ---"
 PRE_A2_FAILED=$FAILED
-BD_PHASE="$(lphase p2h-budget)"
-BD_FAILED_REASON="$(lfield p2h-budget '.status.conditions[?(@.type=="Failed")].reason')"
-BD_EXCEEDED="$(lfield p2h-budget '.status.budget.exceeded')"
-BD_REASON="$(lfield p2h-budget '.status.budget.exceededReason')"
+BD_PHASE="$(lphase ${p2h_budget})"
+BD_FAILED_REASON="$(lfield ${p2h_budget} '.status.conditions[?(@.type=="Failed")].reason')"
+BD_EXCEEDED="$(lfield ${p2h_budget} '.status.budget.exceeded')"
+BD_REASON="$(lfield ${p2h_budget} '.status.budget.exceededReason')"
 BD_TOK="$(python3 -c "
 import json,subprocess
-d=json.loads(subprocess.run(['kubectl','--context','$CTX','-n','$NS','get','loop','p2h-budget','-o','json'],capture_output=True,text=True).stdout).get('status',{}).get('budget',{}) or {}
+d=json.loads(subprocess.run(['kubectl','--context','$CTX','-n','$NS','get','loop','${p2h_budget}','-o','json'],capture_output=True,text=True).stdout).get('status',{}).get('budget',{}) or {}
 print((d.get('promptTokens',0) or 0)+(d.get('completionTokens',0) or 0))
 " 2>/dev/null || echo 0)"
 if [ "$BD_PHASE" = "Failed" ] && [ "$BD_FAILED_REASON" = "BudgetExceeded" ] && [ "$BD_EXCEEDED" = "true" ] && [ "$BD_REASON" = "Tokens" ]; then
@@ -925,7 +941,7 @@ if [ "$BD_TOK" -ge 300 ] 2>/dev/null; then
 else
   fail "budget Loop: status.budget token total ${BD_TOK:-0} (expected >= 300)"
 fi
-K -n "$NS" get events --field-selector involvedObject.name=p2h-budget -o json > "$LOG_DIR/events-budget.json" 2>/dev/null || true
+K -n "$NS" get events --field-selector involvedObject.name=${p2h_budget} -o json > "$LOG_DIR/events-budget.json" 2>/dev/null || true
 if python3 -c "
 import json,sys
 evs=json.load(open('$LOG_DIR/events-budget.json')).get('items',[])
@@ -947,13 +963,13 @@ fi
 # --- assertion 3: the real-backend cross-check ---
 echo
 echo "--- assertion 3: the real-backend cross-check (the cross-check Loop vs the homelab Prometheus) ---"
-REAL_PHASE="$(lphase p2h-real)"
-REAL_BUDGET="$(K -n "$NS" get loop p2h-real -o jsonpath='{.status.budget}' 2>/dev/null || true)"
+REAL_PHASE="$(lphase ${p2h_real})"
+REAL_BUDGET="$(K -n "$NS" get loop ${p2h_real} -o jsonpath='{.status.budget}' 2>/dev/null || true)"
 echo "   cross-check Loop: phase=$REAL_PHASE window=[$REAL_T0,$REAL_T1] status.budget=$REAL_BUDGET"
 echo "   window: $REAL_T0..$REAL_T1" > "$LOG_DIR/crosscheck.txt"
 echo "   per-Loop status.budget: $REAL_BUDGET" >> "$LOG_DIR/crosscheck.txt"
 # The counter pair (the reviewer's A3 fix): the START values were captured as
-# instant Prometheus reads BEFORE p2h-real was created (its early requests
+# instant Prometheus reads BEFORE ${p2h_real} was created (its early requests
 # fall inside the window), and the END values were read AFTER it reached
 # Succeeded + the 75s scrape-lag wait. For a STEP 4+ re-run (no start capture
 # in this invocation) the start is re-derived from the proxy pod's start
@@ -963,7 +979,7 @@ echo "   per-Loop status.budget: $REAL_BUDGET" >> "$LOG_DIR/crosscheck.txt"
 # re-derived start, and per-Loop <= delta still holds).
 if [ -z "$XCHK_P0" ] && [ -z "$XCHK_P1" ]; then
   echo "   STEP 4+ re-run: no start/end captures this invocation; re-deriving"
-  PODY_START="$(K -n "$NS" get pod p2h-real-proxy -o jsonpath='{.status.startTime}' 2>/dev/null || true)"
+  PODY_START="$(K -n "$NS" get pod ${p2h_real}-proxy -o jsonpath='{.status.startTime}' 2>/dev/null || true)"
   XCHK_T0="$(date -u -d "$PODY_START" +%s 2>/dev/null || echo "$REAL_T0")"
   S_PROM="$(prom_instant vllm:prompt_tokens_total)"
   S_GEN="$(prom_instant vllm:generation_tokens_total)"
@@ -1017,7 +1033,7 @@ RESUME_RUN=0
 FLIP_DEADLINE=$(( $(date -u +%s) + 600 ))
 FLIP_AT=""
 while [ "$(date -u +%s)" -lt "$FLIP_DEADLINE" ]; do
-  ph="$(lphase p2h-resume)"
+  ph="$(lphase ${p2h_resume})"
   # The Implementing window is short (the runner finishes a phase run and the
   # operator advances to Verifying within a reconcile); the flip must land
   # while the phase reads Implementing, so the script polls every 2s and
@@ -1036,24 +1052,24 @@ if [ -n "$FLIP_AT" ]; then
   ok "resume Loop at Implementing (suspend flipped now)"
   RESUME_RUN=1
 else
-  fail "assertion 4: the resume Loop was never at Implementing in the flip window (last phase=$(lphase p2h-resume)); the pause/resume cycle was not exercised"
+  fail "assertion 4: the resume Loop was never at Implementing in the flip window (last phase=$(lphase ${p2h_resume})); the pause/resume cycle was not exercised"
   assert_done 4 fail
 fi
 if [ "$RESUME_RUN" = "1" ]; then
 PRE_A4_FAILED=$FAILED
 # Record the pre-pause state (the consistency assertion compares against it).
-PRE_ITER="$(lfield p2h-resume '.status.iteration')"
-PRE_VERIFY="$(lfield p2h-resume '.status.currentVerify.verifiedCommit')"
+PRE_ITER="$(lfield ${p2h_resume} '.status.iteration')"
+PRE_VERIFY="$(lfield ${p2h_resume} '.status.currentVerify.verifiedCommit')"
 echo "   pre-pause: iteration=$PRE_ITER currentVerify.verifiedCommit=${PRE_VERIFY:0:12}..."
-K -n "$NS" patch loop p2h-resume -p '{"spec":{"suspend":true}}' --type=merge >/dev/null 2>&1 || die "suspend=true patch failed"
+K -n "$NS" patch loop ${p2h_resume} -p '{"spec":{"suspend":true}}' --type=merge >/dev/null 2>&1 || die "suspend=true patch failed"
 # Wait for Paused + the pausedFrom/pausedReason record.
-if wait_phase p2h-resume Paused 180; then
+if wait_phase ${p2h_resume} Paused 180; then
   ok "resume Loop -> Paused (suspend=true)"
 else
-  bad "resume Loop did not reach Paused (phase=$(lphase p2h-resume))"
+  bad "resume Loop did not reach Paused (phase=$(lphase ${p2h_resume}))"
 fi
-RP_FROM="$(lfield p2h-resume '.status.pausedFrom')"
-RP_REASON="$(lfield p2h-resume '.status.pausedReason')"
+RP_FROM="$(lfield ${p2h_resume} '.status.pausedFrom')"
+RP_REASON="$(lfield ${p2h_resume} '.status.pausedReason')"
 if [ "$RP_FROM" = "Implementing" ] && [ "$RP_REASON" = "Suspend" ]; then
   pass "resume Loop: pausedFrom=Implementing, pausedReason=Suspend"
 else
@@ -1061,33 +1077,33 @@ else
 fi
 # The sandbox pod is terminated while paused (the suspension gate: OperatingMode
 # Suspended -> the agent-sandbox controller deletes the pod).
-if wait_sandbox p2h-resume 0 180; then
+if wait_sandbox ${p2h_resume} 0 180; then
   pass "resume Loop: the sandbox pod is terminated while paused"
 else
-  fail "resume Loop: the sandbox pod is still present/Running while paused (phase=$(K -n "$NS" get pod p2h-resume-sandbox -o jsonpath='{.status.phase}' 2>/dev/null || echo gone))"
+  fail "resume Loop: the sandbox pod is still present/Running while paused (phase=$(K -n "$NS" get pod ${p2h_resume}-sandbox -o jsonpath='{.status.phase}' 2>/dev/null || echo gone))"
 fi
 # Resume: suspend=false (a Suspend pause resumes ONLY via spec.suspend=false,
 # P2f — the annotation is for a Stall/Budget pause).
-K -n "$NS" patch loop p2h-resume -p '{"spec":{"suspend":false}}' --type=merge >/dev/null 2>&1 || die "suspend=false patch failed"
-if wait_phase p2h-resume Implementing 180; then
+K -n "$NS" patch loop ${p2h_resume} -p '{"spec":{"suspend":false}}' --type=merge >/dev/null 2>&1 || die "suspend=false patch failed"
+if wait_phase ${p2h_resume} Implementing 180; then
   ok "resume Loop -> Implementing (suspend=false)"
 else
-  fail "resume Loop did not return to Implementing after suspend=false (phase=$(lphase p2h-resume)) — assertion 4: the resumed Loop must continue from the phase it was paused at"
+  fail "resume Loop did not return to Implementing after suspend=false (phase=$(lphase ${p2h_resume})) — assertion 4: the resumed Loop must continue from the phase it was paused at"
 fi
-RP_FROM2="$(lfield p2h-resume '.status.pausedFrom')"
-RP_REASON2="$(lfield p2h-resume '.status.pausedReason')"
+RP_FROM2="$(lfield ${p2h_resume} '.status.pausedFrom')"
+RP_REASON2="$(lfield ${p2h_resume} '.status.pausedReason')"
 if [ -z "$RP_FROM2" ] && [ -z "$RP_REASON2" ]; then
   pass "resume Loop: pausedFrom + pausedReason cleared on resume"
 else
   fail "resume Loop: pausedFrom=$RP_FROM2 pausedReason=$RP_REASON2 (expected cleared)"
 fi
-if wait_sandbox p2h-resume 1 180; then
+if wait_sandbox ${p2h_resume} 1 180; then
   pass "resume Loop: the sandbox pod is re-created and Running after resume"
 else
-  fail "resume Loop: the sandbox pod is not Running after resume (phase=$(K -n "$NS" get pod p2h-resume-sandbox -o jsonpath='{.status.phase}' 2>/dev/null || echo absent))"
+  fail "resume Loop: the sandbox pod is not Running after resume (phase=$(K -n "$NS" get pod ${p2h_resume}-sandbox -o jsonpath='{.status.phase}' 2>/dev/null || echo absent))"
 fi
-POST_ITER="$(lfield p2h-resume '.status.iteration')"
-POST_VERIFY="$(lfield p2h-resume '.status.currentVerify.verifiedCommit')"
+POST_ITER="$(lfield ${p2h_resume} '.status.iteration')"
+POST_VERIFY="$(lfield ${p2h_resume} '.status.currentVerify.verifiedCommit')"
 if [ "$POST_ITER" = "$PRE_ITER" ]; then
   pass "resume Loop: status.iteration ($POST_ITER) is consistent with the pre-pause state ($PRE_ITER), not reset"
 else
@@ -1126,9 +1142,9 @@ PRE_A5_FAILED=$FAILED
 # runs every reconcile; the exceedance is recorded at the 2nd Implementing's
 # 400 tokens). pausedFrom names the phase the Loop left (Implementing or
 # Verifying, per the entry point).
-B1_FROM="$(lfield p2h-budgetpause '.status.pausedFrom')"
-B1_REASON="$(lfield p2h-budgetpause '.status.pausedReason')"
-B1_EXC="$(lfield p2h-budgetpause '.status.budget.exceeded')"
+B1_FROM="$(lfield ${p2h_budgetpause} '.status.pausedFrom')"
+B1_REASON="$(lfield ${p2h_budgetpause} '.status.pausedReason')"
+B1_EXC="$(lfield ${p2h_budgetpause} '.status.budget.exceeded')"
 if [ "$B1_REASON" = "Budget" ] && { [ "$B1_FROM" = "Implementing" ] || [ "$B1_FROM" = "Verifying" ]; } && [ "$B1_EXC" = "true" ]; then
   pass "budget-Pause Loop: phase=Paused, pausedFrom=$B1_FROM, pausedReason=Budget, exceeded=true"
 else
@@ -1137,8 +1153,8 @@ fi
 # Sub-case (a): the raised-cap resume. Raise maxTokens (I43 live update) +
 # resume via the coxswain.io/resume annotation. (Idempotent for a STEP 4+
 # re-run: the patch + the annotation are no-ops once applied.)
-K -n "$NS" patch loop p2h-budgetpause -p '{"spec":{"budget":{"maxTokens":100000}}}' --type=merge >/dev/null 2>&1 || die "raise maxTokens failed"
-K -n "$NS" annotate loop p2h-budgetpause coxswain.io/resume="true" >/dev/null 2>&1 || die "resume annotation failed"
+K -n "$NS" patch loop ${p2h_budgetpause} -p '{"spec":{"budget":{"maxTokens":100000}}}' --type=merge >/dev/null 2>&1 || die "raise maxTokens failed"
+K -n "$NS" annotate loop ${p2h_budgetpause} coxswain.io/resume="true" >/dev/null 2>&1 || die "resume annotation failed"
 # The reviewer's A5 fix: the post-resume phase is NOT pinned to Implementing
 # (the Loop may be mid-iteration in Implementing or Verifying when the
 # re-evaluation lands — Verifying is a valid post-resume phase). Assert:
@@ -1149,12 +1165,12 @@ K -n "$NS" annotate loop p2h-budgetpause coxswain.io/resume="true" >/dev/null 2>
 B1_OK=0
 B1_RESUMED_EVENT=0
 for i in $(seq 1 60); do
-  ph="$(lphase p2h-budgetpause)"; ex="$(lfield p2h-budgetpause '.status.budget.exceeded')"; pr="$(lfield p2h-budgetpause '.status.pausedReason')"
+  ph="$(lphase ${p2h_budgetpause})"; ex="$(lfield ${p2h_budgetpause} '.status.budget.exceeded')"; pr="$(lfield ${p2h_budgetpause} '.status.pausedReason')"
   if [ "$ph" != "Paused" ] && { [ "$ex" = "false" ] || [ -z "$ex" ]; } && [ -z "$pr" ]; then B1_OK=1; break; fi
   # The Resumed/ClearedOnResume event: the operator's audit record for the
   # annotation resume (present once the resume is processed).
   if [ "$B1_RESUMED_EVENT" = "0" ]; then
-    B1_RESUMED_EVENT="$(K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause -o json 2>/dev/null | python3 -c "
+    B1_RESUMED_EVENT="$(K -n "$NS" get events --field-selector involvedObject.name=${p2h_budgetpause} -o json 2>/dev/null | python3 -c "
 import json,sys
 evs=json.load(sys.stdin).get('items',[])
 print('yes' if any('Resumed' in (e.get('reason') or '') or 'ClearedOnResume' in (e.get('reason') or '') or 'ClearedOnResume' in (e.get('message') or '') or 'Resumed' in (e.get('message') or '') for e in evs) else 'no')
@@ -1162,7 +1178,7 @@ print('yes' if any('Resumed' in (e.get('reason') or '') or 'ClearedOnResume' in 
   fi
   sleep 2
 done
-K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause -o json > "$LOG_DIR/events-budgetpause.json" 2>/dev/null || true
+K -n "$NS" get events --field-selector involvedObject.name=${p2h_budgetpause} -o json > "$LOG_DIR/events-budgetpause.json" 2>/dev/null || true
 B1_RESUMED_FINAL="$(python3 -c "
 import json,sys
 evs=json.load(open('$LOG_DIR/events-budgetpause.json')).get('items',[])
@@ -1171,7 +1187,7 @@ sys.exit(0 if any('Resumed' in (e.get('reason') or '') or 'ClearedOnResume' in (
 if [ "$B1_OK" = "1" ] && [ "$B1_RESUMED_FINAL" = "yes" ]; then
   pass "budget-Pause Loop (raised cap): resumed and proceeds — phase != Paused, exceeded cleared, pausedReason cleared, the ClearedOnResume/Resumed event is present"
 else
-  fail "budget-Pause Loop (raised cap): phase=$(lphase p2h-budgetpause) exceeded=$(lfield p2h-budgetpause '.status.budget.exceeded') pausedReason=$(lfield p2h-budgetpause '.status.pausedReason') resumed-event=$B1_RESUMED_FINAL (expected phase != Paused, exceeded=false/empty, pausedReason cleared, Resumed/ClearedOnResume event)"
+  fail "budget-Pause Loop (raised cap): phase=$(lphase ${p2h_budgetpause}) exceeded=$(lfield ${p2h_budgetpause} '.status.budget.exceeded') pausedReason=$(lfield ${p2h_budgetpause} '.status.pausedReason') resumed-event=$B1_RESUMED_FINAL (expected phase != Paused, exceeded=false/empty, pausedReason cleared, Resumed/ClearedOnResume event)"
 fi
 # Sub-case (b): the un-raised re-pause (the fail-closed re-fire). The control
 # Loop's caps are NOT raised; the annotation resume must re-pause immediately.
@@ -1179,13 +1195,13 @@ fi
 # exceeded=true, the ResumeRefused event already fired) — the re-fire was
 # exercised in the full run; the re-run re-asserts the end state (the
 # annotate is an idempotent no-op once the operator cleared it).
-K -n "$NS" annotate loop p2h-budgetpause2 coxswain.io/resume="true" >/dev/null 2>&1 || die "resume annotation (control) failed"
+K -n "$NS" annotate loop ${p2h_budgetpause2} coxswain.io/resume="true" >/dev/null 2>&1 || die "resume annotation (control) failed"
 # A valid resume clears the annotation; a REFUSED one keeps it. The re-fire
 # is: phase returns to Paused (or stays) + the ResumeRefused Event. Give the
 # operator a few reconciles.
 B2_OK=0
 for i in $(seq 1 60); do
-  ph="$(lphase p2h-budgetpause2)"
+  ph="$(lphase ${p2h_budgetpause2})"
   if [ "$ph" = "Paused" ]; then B2_OK=1; break; fi
   sleep 2
 done
@@ -1196,7 +1212,7 @@ done
 # end state IS the fail-closed re-fire's evidence: Paused + exceeded=true).
 B2_REJECT_NOW=0
 for i in $(seq 1 30); do
-  B2_REJECT_NOW="$(K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause2 --type Warning -o json 2>/dev/null | python3 -c "
+  B2_REJECT_NOW="$(K -n "$NS" get events --field-selector involvedObject.name=${p2h_budgetpause2} --type Warning -o json 2>/dev/null | python3 -c "
 import json,sys
 evs=json.load(sys.stdin).get('items',[])
 newest=max((e.get('lastTimestamp') or e.get('eventTime') or '') for e in evs) if evs else ''
@@ -1205,21 +1221,21 @@ print('yes' if newest else 'no')
   [ "$B2_REJECT_NOW" = "yes" ] && break
   sleep 2
 done
-B2_REJECTED="$(K -n "$NS" get events --field-selector involvedObject.name=p2h-budgetpause2 -o json 2>/dev/null | python3 -c "
+B2_REJECTED="$(K -n "$NS" get events --field-selector involvedObject.name=${p2h_budgetpause2} -o json 2>/dev/null | python3 -c "
 import json,sys
 evs=json.load(sys.stdin).get('items',[])
 print('yes' if any('Refused' in (e.get('reason') or '') or 'Refused' in (e.get('message') or '') for e in evs) else 'no')
 " 2>/dev/null || echo no)"
-if [ "$B2_OK" = "1" ] && [ "$(lfield p2h-budgetpause2 '.status.budget.exceeded')" = "true" ]; then
+if [ "$B2_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')" = "true" ]; then
   pass "budget-Pause control Loop (un-raised): re-pauses immediately on the annotation resume (the fail-closed re-fire; exceeded still true)"
 else
-  fail "budget-Pause control Loop (un-raised): phase=$(lphase p2h-budgetpause2) exceeded=$(lfield p2h-budgetpause2 '.status.budget.exceeded') (expected Paused + exceeded=true; refused-event=$B2_REJECTED)"
+  fail "budget-Pause control Loop (un-raised): phase=$(lphase ${p2h_budgetpause2}) exceeded=$(lfield ${p2h_budgetpause2} '.status.budget.exceeded') (expected Paused + exceeded=true; refused-event=$B2_REJECTED)"
 fi
 # assertion 5 accounting: pass iff the entry point + both sub-cases held and
 # NO new fail fired in-section (a STEP 4+ re-run that re-applies the
 # idempotent patch/annotation against an already-resolved Loop counts the
 # end state; a fail that fires in-section wins over it).
-if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$(lfield p2h-budgetpause2 '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
+if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && [ "$B1_OK" = "1" ] && [ "$B2_OK" = "1" ] && [ "$(lfield ${p2h_budgetpause2} '.status.budget.exceeded')" = "true" ] && [ "$FAILED" -eq "$PRE_A5_FAILED" ]; then
   assert_done 5 pass
 else
   assert_done 5 fail
@@ -1238,7 +1254,7 @@ echo "--- STEP 5: the per-Loop stub audit (status.budget vs the stub's request l
 STUB_LOG_RAW="$(K -n "$NS" exec "$STUB_POD" -- cat /tmp/stub-requests.jsonl 2>/dev/null || true)"
 STUB_N_REQ="$(echo "$STUB_LOG_RAW" | grep -c '"n":' || true)"
 echo "   stub request log: $STUB_N_REQ total requests (all Loops; the per-Loop split is by the proxy, not the stub — the per-Loop status.budget is the source of truth)"
-for L in p2h-stall p2h-budget p2h-ctrl p2h-resume p2h-budgetpause p2h-budgetpause2; do
+for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2}; do
   T="$(K -n "$NS" get loop "$L" -o jsonpath='{.status.budget}' 2>/dev/null | python3 -c "
 import json,sys
 s=sys.stdin.read().strip()
@@ -1263,7 +1279,7 @@ echo "--- STEP 6: evidence dump (before cleanup) ---"
   echo
   echo "--- kubectl get loop (all) ---"
   K -n "$NS" get loop 2>/dev/null
-  for L in p2h-stall p2h-budget p2h-ctrl p2h-resume p2h-budgetpause p2h-budgetpause2 p2h-real; do
+  for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2} ${p2h_real}; do
     echo
     echo "--- loop $L status ---"
     K -n "$NS" get loop "$L" -o json 2>/dev/null | python3 -c "
@@ -1322,7 +1338,7 @@ fi
 # ===========================================================================
 if in_steps 6; then
 echo "--- cleanup: deleting the Loops in $NS (not the cluster, not the homelab) ---"
-for L in p2h-stall p2h-budget p2h-ctrl p2h-resume p2h-budgetpause p2h-budgetpause2 p2h-real; do
+for L in ${p2h_stall} ${p2h_budget} ${p2h_ctrl} ${p2h_resume} ${p2h_budgetpause} ${p2h_budgetpause2} ${p2h_real}; do
   K -n "$NS" delete loop "$L" --wait=false --ignore-not-found >/dev/null 2>&1 || true
 done
 echo "   (Loops deleted; the stub pod + Gitea repos remain for inspection)"

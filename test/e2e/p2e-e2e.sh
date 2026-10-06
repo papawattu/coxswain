@@ -71,18 +71,28 @@ K get nodes >/dev/null 2>&1 || fail "cannot reach cluster $CTX"
 # ===========================================================================
 # STEP 0: build + kind-load the operator image (THIS branch = the P2e changes)
 # ===========================================================================
+# Tag the build UNIQUELY (main-<shortsha>-<timestamp>): the build includes
+# UNCOMMITTED working-tree changes (the fix is uncommitted until the very end),
+# so the digest must be read from the BUILT image and the running pod verified
+# against it. A unique tag avoids a stale cached image masquerading as the new
+# build (the run-064348 root cause: the operator kept running main-519b6ff from
+# a previous build because the Deployment was never actually rolled to the new
+# image).
+TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+CTRL_IMG="coxswain-controller:main-${COMMIT:0:7}-${TIMESTAMP}"
 echo "--- STEP 0: build + kind-load the operator image ---"
 (cd "$REPO_ROOT" && docker build -q -t "$CTRL_IMG" -f Dockerfile .) || fail "controller build failed"
 IMG_DIGEST="$(docker image inspect "$CTRL_IMG" --format '{{.Id}}' 2>/dev/null)"
 echo "   operator image: $CTRL_IMG"
-echo "   operator digest: $IMG_DIGEST" | tee "$LOG_DIR/operator-digest.txt"
+echo "   built image digest: $IMG_DIGEST" | tee "$LOG_DIR/built-digest.txt"
 for img in "$CTRL_IMG" "$BUSYBOX_IMG" "$AGENT_IMG" "$BASE_IMG"; do
   echo "   kind load: $img"
   kind load docker-image "$img" --name "$CLUSTER" || fail "kind load $img failed"
 done
 
 # ===========================================================================
-# STEP 1: deploy the operator (dev overlay)
+# STEP 1: deploy the operator (dev overlay) + ROLL the Deployment to the new
+# image + verify the RUNNING pod's imageID equals the built digest
 # ===========================================================================
 echo
 echo "--- STEP 1: deploy the operator (dev overlay) ---"
@@ -92,10 +102,34 @@ TMP_OVERLAY=$(mktemp -d)
 cp -r "$REPO_ROOT/config" "$TMP_OVERLAY/config"
 (cd "$TMP_OVERLAY/config/manager" && "$KUSTOMIZE_BIN" edit set image controller="$CTRL_IMG")
 (cd "$TMP_OVERLAY" && "$KUSTOMIZE_BIN" build config/dev | K apply -f -) || fail "controller deploy failed"
+# Explicitly roll the Deployment to the freshly built image (the kustomize
+# apply above sets the image, but a stale cached image or a pending old replica
+# can leave the running pod on an older build -- `set image` forces the
+# update). Then wait for the rollout.
+K -n "$E2E_NS" set image deploy/coxswain-controller-manager manager="$CTRL_IMG" >/dev/null || fail "set image failed"
 K -n "$E2E_NS" rollout status deploy/coxswain-controller-manager --timeout=180s || fail "controller not ready"
-K -n "$E2E_NS" get pods -l control-plane=controller-manager \
-  -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' > "$LOG_DIR/operator-imageID.txt" 2>/dev/null || true
-echo "   operator imageID: $(cat "$LOG_DIR/operator-imageID.txt")"
+# Read the RUNNING pod's imageID (NOT the local image's digest) and FAIL unless
+# it equals the built digest. This is the operator digest that the run actually
+# exercised. During the rollout there may be TWO pods matching the label (the
+# old one pending termination + the new one) -- poll until a pod whose imageID
+# matches the built digest is present (the new pod), rather than reading the
+# first pod (which may be the old one). This is the operator digest the run
+# actually exercised.
+BUILT_SHA="${IMG_DIGEST##*sha256:}"
+RUNNING_IMAGEID=""
+for i in $(seq 1 60); do
+  # Find a pod (new RS) whose imageID matches the built digest.
+  RUNNING_IMAGEID="$(K -n "$E2E_NS" get pods -l control-plane=controller-manager -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' 2>/dev/null || true)"
+  RUNNING_IMAGEID=$(echo "$RUNNING_IMAGEID" | grep "sha256:$BUILT_SHA$" | head -1)
+  [ -n "$RUNNING_IMAGEID" ] && break
+  sleep 2
+done
+if [ -z "$RUNNING_IMAGEID" ]; then
+  K -n "$E2E_NS" get pods -l control-plane=controller-manager -o wide 2>/dev/null | tee -a "$LOG"
+  fail "no running pod carries the built digest ($IMG_DIGEST) -- the operator was NOT rolled to this build"
+fi
+echo "   running pod imageID: $RUNNING_IMAGEID" | tee "$LOG_DIR/operator-digest.txt"
+echo "   operator digest (verified against the running pod): $RUNNING_IMAGEID" | tee -a "$LOG_DIR/operator-digest.txt"
 
 # ===========================================================================
 # STEP 2: the Gitea repo with a base commit + the git-cred secret
@@ -189,8 +223,8 @@ spec:
       claimName: $loop-workspace
 EOF
   for i in $(seq 1 90); do
-    ph=$(K -n "$NS" get pod "$pop_pod" -o jsonpath='{.status.phase}' 2>/dev/null)
-    ready=$(K -n "$NS" get pod "$pop_pod" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)
+    ph=$(K -n "$NS" get pod "$pop_pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    ready=$(K -n "$NS" get pod "$pop_pod" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
     [ "$ph" = "Running" ] && [ "$ready" = "true" ] && break; sleep 2
   done
   [ "$(K -n "$NS" get pod "$pop_pod" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ] || {
@@ -263,9 +297,11 @@ $checks
     stallAction: Fail
 EOF
   # Wait for the operator to create + bind the workspace PVC (the operator owns
-  # it — we must never pre-create it).
+  # it — we must never pre-create it). `|| true` guards a transient kind-API
+  # error inside the loop so set -e keeps polling instead of dying on one
+  # flaky get (an empty result is treated as "not Bound yet", keep waiting).
   for i in $(seq 1 90); do
-    st=$(K -n "$NS" get pvc "$loop-workspace" -o jsonpath='{.status.phase}' 2>/dev/null)
+    st=$(K -n "$NS" get pvc "$loop-workspace" -o jsonpath='{.status.phase}' 2>/dev/null || true)
     [ "$st" = "Bound" ] && break; sleep 2
   done
   [ "$(K -n "$NS" get pvc "$loop-workspace" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Bound" ] || {
@@ -292,7 +328,7 @@ wait_for_phase() {
   local loop="$1" want="$2" deadline="${3:-240}"
   for i in $(seq 1 "$deadline"); do
     local ph
-    ph=$(K -n "$NS" get loop "$loop" -o jsonpath='{.status.phase}' 2>/dev/null)
+    ph=$(K -n "$NS" get loop "$loop" -o jsonpath='{.status.phase}' 2>/dev/null || true)
     if [ "$ph" = "$want" ]; then return 0; fi
     sleep 2
   done
@@ -321,27 +357,80 @@ FAIL_LOOP="p2e-fail"
 create_loop_wait_pvc "$FAIL_LOOP" "      - \"echo 'p2e-failing-check-output'; echo 'p2e-failing-stderr' >&2; exit 1\""
 FAIL_VERIFY="$(populate_workspace "$FAIL_LOOP")"
 seed_status_verifying "$FAIL_LOOP" "$FAIL_VERIFY"
+# Dump the verify pod's initContainerStatuses (terminated.message) + the
+# Loop's status.stallHistory into the log + evidence file. Called on the
+# FAILED path (and at the end) so the evidence SURVIVES even if a later step
+# fails -- the reviewer's requirement: the log must show the check's output in
+# terminated.message plus a StallEntry with a hash BEFORE any cleanup.
+dump_verify_evidence() {
+  local loop="$1" pod="$2" tag="${3:-final}"
+  local out="$LOG_DIR/evidence-$loop-$tag.txt"
+  {
+    echo "=== P2e verify evidence ($tag): loop=$loop pod=$pod ==="
+    echo "operator digest: $IMG_DIGEST"
+    if [ -n "$pod" ]; then
+      echo "--- verify pod $pod initContainerStatuses (name / exitCode / terminated.message) ---"
+      K -n "$NS" get pod "$pod" -o json 2>/dev/null | python3 -c "
+import json,sys
+try:
+    pod=json.load(sys.stdin)
+except Exception as e:
+    print('  (no pod JSON:', e, ')'); raise SystemExit
+for ic in pod.get('status',{}).get('initContainerStatuses',[]):
+    t=ic.get('state',{}).get('terminated',{})
+    print('  ', ic.get('name'), '-> exit', t.get('exitCode'), t.get('reason'))
+    if t.get('message'):
+        print('       terminated.message:', repr(t.get('message')))
+" || echo "  (pod $pod gone or unreadable)"
+    fi
+    echo "--- Loop $loop status (phase/iteration/currentVerify/stallHistory) ---"
+    K -n "$NS" get loop "$loop" -o json 2>/dev/null | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin).get('status',{})
+except Exception as e:
+    print('  (no loop JSON:', e, ')'); raise SystemExit
+print('  phase:', d.get('phase'), 'iteration:', d.get('iteration'))
+print('  currentVerify:', json.dumps(d.get('currentVerify')))
+sh=d.get('stallHistory') or []
+print('  stallHistory ('+str(len(sh))+' entries):')
+for e in sh:
+    print('   ', json.dumps(e))
+print('  Stalled condition:', json.dumps([c for c in d.get('conditions',[]) if c.get('type')=='Stalled']))
+" || echo "  (loop $loop gone or unreadable)"
+    echo "=== end P2e verify evidence ($tag) ==="
+  } | tee "$out"
+}
+
 # Wait for the verify Job to be created + its check init container to run.
 # The verify pod is in Init:Error (the check init container failed) when the
-# check fails, so find it by name (the <loop>-verify-<iter> pattern), not by
-# phase (Init:Error pods are phase Pending). `|| true` guards the no-match
-# (grep exits 1) so set -e does not kill the script on a still-empty listing.
+# check fails, so find it by NAME (the <loop>-verify-<iter> pattern), not by
+# phase (Init:Error pods are phase Pending). The jsonpath is ONE NAME PER LINE
+# ({range .items[*]}{.metadata.name}{"\n"}{end}) so grep -E "^$FAIL_LOOP-verify"
+# can match; {.items[*].metadata.name} prints all names on ONE line and the
+# anchored grep never matches. `|| true` guards the no-match (grep exits 1) so
+# set -e does not kill the script on a still-empty listing.
 JOB_POD=""
 for i in $(seq 1 120); do
-  JOB_POD=$( { K -n "$NS" get pods -l "coxswain.io/loop=$FAIL_LOOP" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | grep -E "^$FAIL_LOOP-verify" || true; } | head -1 )
+  JOB_POD=$( { K -n "$NS" get pods -l "coxswain.io/loop=$FAIL_LOOP" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -E "^$FAIL_LOOP-verify" || true; } | head -1 )
   [ -n "$JOB_POD" ] && break; sleep 2
 done
 # Give the check init container a moment to run + fail (the Job starts, the
 # check-0 init runs, exits 1, the pod goes Init:Error).
 sleep 10
-[ -n "$JOB_POD" ] || { K -n "$NS" get pods -l "coxswain.io/loop=$FAIL_LOOP" 2>/dev/null; bad "no verify pod to inspect"; }
+# Give the operator a moment to read the verify outcome + append the StallEntry.
+sleep 10
+if [ -z "$JOB_POD" ]; then
+  dump_verify_evidence "$FAIL_LOOP" "" "failed-no-pod"
+  bad "no verify pod to inspect"
+fi
 echo "   verify pod: $JOB_POD"
 # The failing check's init container terminationMessage. The kubelet records
 # the last 4 KB of the terminationMessagePath (/tmp/termination.log) in the
 # container status terminated.message (NOT .terminationMessage -- that field is
 # for the kubelet's own termination message, the user-set path is .message).
 TERM_MSG=$(K -n "$NS" get pod "$JOB_POD" \
-  -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{"\t"}{.state.terminated.message}{"\n"}{end}' 2>/dev/null | head -8)
+  -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{"\t"}{.state.terminated.message}{"\n"}{end}' 2>/dev/null | head -8 || true)
 echo "   --- terminated init containers (name / terminated.message) ---"
 echo "$TERM_MSG" | tee "$LOG_DIR/failing-pod-terminated.txt"
 echo "   ----------------------------------------------------------"
@@ -356,24 +445,42 @@ else
   bad "terminationMessage is MISSING the check's stderr"
 fi
 
-# The operator records a StallEntry in the NORMAL flow (the agent loop drives
-# Verifying with a fully-populated currentVerify). In this ISOLATED run we
-# pre-seed to Verifying, which bypasses the operator's verify-start path, so
-# currentVerify.checks + the StallEntry may not be recorded here. That is a
-# known limitation of the isolation; P2h (the full agent loop) exercises the
-# stall-entry recording. We note the operator's reaction without hard-failing
-# on the absence of a StallEntry.
-sleep 8
-K -n "$NS" get loop "$FAIL_LOOP" -o json 2>/dev/null | python3 -c "
-import json,sys
-d=json.load(sys.stdin).get('status',{})
-print('phase=',d.get('phase'),'iteration=',d.get('iteration'))
-print('stallHistory:', json.dumps(d.get('stallHistory')))
-" | tee "$LOG_DIR/failing-loop-status.txt"
-echo "   (NOTE: in this isolated pre-seeded run the operator may not record a"
-echo "    StallEntry -- pre-seeding bypasses the normal verify-start path."
-echo "    The verify JOB POD works: the check ran and its raw output is in its"
-echo "    termination message. P2h exercises the stall-entry recording.)"
+# The operator reads the verify outcome (applyVerifyOutcome -> verifyOutcome ->
+# verifyIterate) and applyStallGate APPENDS a StallEntry on every TERMINAL
+# verify failure (a check-* container Terminated non-zero) -- the entry is
+# appended BEFORE the stallDecision fire check, so a single failure yields ONE
+# entry (with a hash) even when the stall does not yet fire (stallAfter=3).
+# The check's raw output (the termination message) is the normaliser input; the
+# entry's hash is the SHA-256 of the normalised output.
+# The operator's reconcile that reads the terminated check-0 + appends the
+# entry + persists the status happens asynchronously AFTER the check fails,
+# so POLL for the entry (the operator requeues on the verify Job's status
+# change and re-reconciles within seconds). A single read races that reconcile.
+STALL_JSON=""
+for i in $(seq 1 30); do
+  STALL_JSON="$(K -n "$NS" get loop "$FAIL_LOOP" -o jsonpath='{.status.stallHistory}' 2>/dev/null || true)"
+  # Present = a non-empty, non-null JSON array.
+  if [ -n "$STALL_JSON" ] && [ "$STALL_JSON" != "" ] && [ "$STALL_JSON" != "null" ]; then
+    break
+  fi
+  sleep 2
+done
+if [ -n "$STALL_JSON" ] && [ "$STALL_JSON" != "" ] && [ "$STALL_JSON" != "null" ]; then
+  # A StallEntry with a 64-hex hash (the SHA-256 of the normalised check output).
+  if echo "$STALL_JSON" | grep -qE '"hash"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"'; then
+    ok "a StallEntry with a hash was recorded (the check's output reached the stall detector)"
+  else
+    bad "the StallEntry has NO 64-hex hash: $STALL_JSON"
+  fi
+else
+  bad "NO StallEntry recorded on the failing check (expected one on a terminal verify failure)"
+fi
+echo "   stallHistory: $STALL_JSON"
+
+# Dump the full verify evidence (the check's terminated.message + the Loop's
+# stallHistory) to the log + evidence file BEFORE any cleanup, so it survives
+# even if a later step fails. This is the reviewer's required evidence.
+dump_verify_evidence "$FAIL_LOOP" "$JOB_POD" "final"
 
 # Capture operator + pod evidence
 K -n "$E2E_NS" logs deploy/coxswain-controller-manager --tail=300 > "$LOG_DIR/operator.log" 2>&1 || true

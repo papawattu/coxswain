@@ -386,6 +386,61 @@ func TestApplyStallGateContinueLeavesPhaseUnchanged(t *testing.T) {
 	}
 }
 
+// TestDefaultReadCheckOutput pins the check-output read's field order: a
+// non-restarted check init (restartCount 0, the real production path) carries
+// its terminationMessage in state.terminated.message, NOT lastState -- a real
+// kubelet only populates lastState for a RESTARTED container. The original
+// code read ONLY lastState, so it found nothing for a non-restarted check and
+// the stall gate went inert (no StallEntry in production -- the P2e kind run
+// exposed this). Reading state.terminated.message FIRST (falling back to
+// lastState) is the fix. Cases:
+//
+//	(a) state.terminated.message set, NO lastState -> returns (message, true).
+//	(b) restarted container: ONLY lastState.terminated.message -> returns (message, true).
+//	(c) no terminated record at all -> returns ("", false).
+func TestDefaultReadCheckOutput(t *testing.T) {
+	r := &LoopReconciler{}
+	const check = "check-0"
+
+	// (a) the production path: a non-restarted check that just terminated.
+	// The message is in state.terminated.message; lastState is EMPTY.
+	podA := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+		{Name: check, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "real-output"}}},
+	}}}
+	if got, ok := r.defaultReadCheckOutput(podA, check); !ok || got != "real-output" {
+		t.Fatalf("(a) a non-restarted check's state.terminated.message must be read: got (%q, %v)", got, ok)
+	}
+
+	// (b) a restarted container: ONLY lastState.terminated.message is set
+	// (state.terminated is empty because the container restarted).
+	podB := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+		{Name: check, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "last-output"}}},
+	}}}
+	if got, ok := r.defaultReadCheckOutput(podB, check); !ok || got != "last-output" {
+		t.Fatalf("(b) a restarted check's lastState.terminated.message must be read: got (%q, %v)", got, ok)
+	}
+
+	// (c) no terminated record at all (the check never ran) -> ("", false).
+	podC := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+		{Name: check},
+	}}}
+	if got, ok := r.defaultReadCheckOutput(podC, check); ok || got != "" {
+		t.Fatalf("(c) no terminated record must be (\"\", false): got (%q, %v)", got, ok)
+	}
+
+	// state takes precedence over lastState when BOTH are set (a restarted
+	// container whose CURRENT state also terminated with a message).
+	podD := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+		{Name: check,
+			State:                corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "current"}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "last"}},
+		},
+	}}}
+	if got, _ := r.defaultReadCheckOutput(podD, check); got != "current" {
+		t.Fatalf("state.terminated.message must take precedence over lastState: got %q", got)
+	}
+}
+
 func itoa(i int) string {
 	if i == 0 {
 		return "0"

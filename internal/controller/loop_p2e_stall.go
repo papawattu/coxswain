@@ -146,19 +146,28 @@ func resolveStallAfter(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1
 }
 
 // readCheckOutput is the default (live) check-output read: the failing
-// check container's terminationMessage (the 4 KB tail Kubernetes records in
-// status.initContainerStatuses[].lastState.terminated.terminationMessage,
-// which is set because the check containers carry a terminationMessagePath,
-// item 2). It is a SEAM on the LoopReconciler (readCheckOutput func(...)
-// field) so the envtest specs drive a deterministic output without a real
-// verify Job (the spec's readCheckOutput seam).
+// check container's terminationMessage. A check container that just ran and
+// terminated (restartCount 0) carries the kubelet's 4 KB tail in
+// status.initContainerStatuses[].state.terminated.message (the CURRENT state)
+// — this is the field a real (non-restarted) init container populates. A
+// RESTARTED container (restartCount > 0) instead carries its previous
+// incarnation's message in lastState.terminated.message. So read the CURRENT
+// state.terminated.message FIRST (the real production path: a verify check
+// init container runs once and terminates, restartCount 0) and fall back to
+// lastState for a restarted container. Reading ONLY lastState (the original
+// bug, exposed by the P2e kind run) found nothing for a non-restarted check
+// and the stall gate went inert — no StallEntry was ever recorded in
+// production. The check containers carry a terminationMessagePath (item 2), so
+// the message is set when the check ran and wrote output. It is a SEAM on the
+// LoopReconciler (readCheckOutput func(...) field) so the envtest specs drive
+// a deterministic output without a real verify Job (the spec's readCheckOutput
+// seam).
 //
-// It returns ("", false) when the check container's lastState has no
-// terminated record with a terminationMessage (a check that never ran, or a
-// check whose terminationMessagePath was never written — a no-output
-// failure). The operator treats a no-output failure as an EMPTY raw (the
-// normaliser of "" is "", all such failures hash equal — a no-output hot
-// loop IS a stall, correctly detected).
+// It returns ("", false) when neither the current nor the last terminated
+// record carries a message — a check that never ran, or a check that ran but
+// wrote nothing (an empty output). The operator treats ("", false) as INERT
+// (no StallEntry, the caller proceeds to the iterate): an empty read is the
+// absence of evidence, not an identical failure.
 func (r *LoopReconciler) defaultReadCheckOutput(pod *corev1.Pod, checkName string) (string, bool) {
 	if pod == nil {
 		return "", false
@@ -168,15 +177,27 @@ func (r *LoopReconciler) defaultReadCheckOutput(pod *corev1.Pod, checkName strin
 		if ics.Name != checkName {
 			continue
 		}
+		// The CURRENT terminated state first: a non-restarted check init
+		// (restartCount 0, the real production path) carries its
+		// terminationMessage here.
+		if ics.State.Terminated != nil {
+			if msg := ics.State.Terminated.Message; msg != "" {
+				return msg, true
+			}
+		}
+		// Fall back to the LAST terminated state: a restarted container
+		// (restartCount > 0) carries its previous incarnation's message there.
 		if ics.LastTerminationState.Terminated != nil {
 			if msg := ics.LastTerminationState.Terminated.Message; msg != "" {
 				return msg, true
 			}
-			return "", false
 		}
+		// A terminated record exists (current or last) but carried no message:
+		// a check that ran but wrote nothing -> ("", false) (INERT), matching
+		// the "no message -> inert" contract the envtest spec pins.
 		return "", false
 	}
-	return "", false
+	return "", false // no terminated record at all: the check never ran
 }
 
 // appendStallEntry records the failing check's normalised output into

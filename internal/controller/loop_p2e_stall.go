@@ -345,7 +345,7 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 		loop.Status.PausedReason = coxv1alpha1.PausedReasonStall
 		setCondition(loop, coxv1alpha1.PausedCondition, metav1.ConditionTrue,
 			pausedCondReasonPaused,
-				"paused (stall): stall detector fired after "+fmt.Sprintf("%d", run)+" consecutive identical verify failures")
+			"paused (stall): stall detector fired after "+fmt.Sprintf("%d", run)+" consecutive identical verify failures")
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
 			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run))
 		if r.Recorder != nil {

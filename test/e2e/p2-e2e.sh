@@ -1076,6 +1076,13 @@ if [ -n "$FLIP_AT" ]; then
   ok "resume Loop at Implementing (suspend flipped now)"
   RESUME_RUN=1
 else
+  RESUME_RUN=0
+fi
+if [ "$RESUME_RUN" = "0" ]; then
+  # The baseline must be captured BEFORE the fail so the in-section delta
+  # (a fail that fired in-section wins) is measured correctly: the flip
+  # miss is recorded as fail, and assert_done 4 fail is the section's state.
+  PRE_A4_FAILED=$FAILED
   fail "assertion 4: the resume Loop was never at Implementing in the flip window (last phase=$(lphase ${p2h_resume})); the pause/resume cycle was not exercised"
   assert_done 4 fail
 fi

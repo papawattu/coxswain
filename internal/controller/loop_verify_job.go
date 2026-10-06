@@ -159,6 +159,8 @@ func (r *LoopReconciler) verifyJobImage() string {
 // cat (which resets $?), and the cat echoes the log back to stdout so the
 // 4 KB tail the kubelet records as the terminationMessage is the check's
 // stdout+stderr.
+//
+//nolint:unparam // logPath is the operator's termination-log constant (verifyTerminationLogPath, the only production value); it is parameterised so the wrapper is pure and the execution test can substitute a temp path — the path is operator-supplied, not hard-coded.
 func checkTeed(cmd, logPath string) string {
 	return fmt.Sprintf("%s -c %s > %s 2>&1; rc=$?; cat %s; exit $rc", verifySh, shellQuote(cmd), logPath, logPath)
 }

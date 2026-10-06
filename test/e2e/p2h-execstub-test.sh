@@ -99,6 +99,29 @@ else
   FAILS=1
 fi
 
+# The sh -c positional-argument case (the seed_repo's R="$1" pattern): the
+# first argument after the script is $0, NOT $1 — the repo name must be
+# passed with a placeholder for $0 (sh -c '<script>' _ "$1"). This case
+# asserts the name ARRIVES as $1 (the prior run's 422 "Name Required" was
+# the $0/$1 shift: R="$1" was empty because the repo name was $0).
+SH_C_POS="$(sh -c 'echo "$1"' _ p2h-positional-test)"
+if [ "$SH_C_POS" = "p2h-positional-test" ]; then
+  echo "   ok: the sh -c positional case — sh -c '<script>' _ <name> passes the name as \$1 (the seed_repo's R=\"\$1\" pattern)"
+else
+  echo "   [FAIL] the sh -c positional case: sh -c 'echo \"\$1\"' _ p2h-positional-test printed [${SH_C_POS}] (expected [p2h-positional-test]) — the R=\"\$1\" pattern would be empty" >&2
+  FAILS=1
+fi
+# The NEGATIVE case (the prior run's bug): WITHOUT the placeholder, the
+# repo name is $0 and $1 is EMPTY (the R="$1" would be empty -> the API
+# 422s with "Name Required").
+SH_C_NOPOS="$(sh -c 'echo "[$1]"' p2h-no-positional-test)"
+if [ "$SH_C_NOPOS" = "[]" ]; then
+  echo "   ok: the sh -c NEGATIVE case — without the placeholder, \$1 is empty (the prior run's 422 root cause)"
+else
+  echo "   [FAIL] the sh -c NEGATIVE case: sh -c 'echo \"[\$1]\"' p2h-no-positional-test printed [${SH_C_NOPOS}] (expected [[]] — the empty \$1)" >&2
+  FAILS=1
+fi
+
 if [ "$FAILS" -ne 0 ]; then
   echo "=== p2h-stub-model.py execution test FAILED (port $PORT) ==="
   echo "--- server log ---"

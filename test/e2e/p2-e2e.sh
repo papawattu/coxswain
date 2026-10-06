@@ -274,11 +274,14 @@ seed_repo() { # seed_repo <repo-name>; echoes the seed commit SHA
   # enabled for users; the API is the operator's S1 pattern). The seed is a
   # plain git repo (README.md only — the implement-instruction's target,
   # non-protected). The API call is signed in with the basic-auth cred (the
-  # same samples:samples-git-password the git-cred secret holds). The -d body
-  # is built by the inner shell (printf) so the JSON braces are literal — the
-  # outer single-quoted sh -c body cannot contain the inner single-quotes
-  # (the API 422'd on a malformed body when the braces were escaped by the
-  # outer shell). The 409 (already exists) is fine: the push -f re-seeds.
+  # the same samples:samples-git-password the git-cred secret holds). The -d
+  # body is written to a file by the inner shell (curl --data @file) so the
+  # JSON braces are literal and there is NO shell quoting across the kubectl
+  # exec boundary. The sh -c takes a placeholder for $0 (the first argument
+  # after the script is $0, NOT $1 — the repo name is $1, the placeholder
+  # _ is $0; without it R="$1" would be empty and the API would 422 with
+  # "Name: Required"). The 409 (already exists) is fine: the push -f re-seeds.
+  local repo="$1"
   K -n "$GITEA_NS" exec deploy/gitea -- sh -c '
     set -e
     R="$1"
@@ -309,8 +312,11 @@ seed_repo() { # seed_repo <repo-name>; echoes the seed commit SHA
     if ! git diff --cached --quiet; then git commit -q -m "p2h seed"; fi
     git push -q -f origin initial
     echo "SEED=$(git rev-parse HEAD)"
-  ' "$1" > "$LOG_DIR/seed-$1.txt" 2>&1 || die "could not seed Gitea repo $1: $(cat "$LOG_DIR/seed-$1.txt")"
-  grep -oE 'SEED=[0-9a-f]+' "$LOG_DIR/seed-$1.txt" | cut -d= -f2 | tail -1
+  ' _ "$repo" > "$LOG_DIR/seed-$repo.txt" 2>&1 || die "could not seed Gitea repo $repo: $(cat "$LOG_DIR/seed-$repo.txt")"
+  local sha
+  sha="$(grep -oE 'SEED=[0-9a-f]+' "$LOG_DIR/seed-$repo.txt" | cut -d= -f2 | tail -1)"
+  [ -n "$sha" ] || die "seed Gitea repo $repo: the SEED SHA was not echoed (the push failed; seed log: $(cat "$LOG_DIR/seed-$repo.txt"))"
+  echo "$sha"
 }
 REPO_STALL="$(seed_repo p2h-stall)"
 REPO_BUDGET="$(seed_repo p2h-budget)"
@@ -319,6 +325,12 @@ REPO_RESUME="$(seed_repo p2h-resume)"
 REPO_BPAUSE="$(seed_repo p2h-budgetpause)"
 REPO_BPAUSE2="$(seed_repo p2h-budgetpause2)"
 REPO_REAL="$(seed_repo p2h-real)"
+# A seed failure aborts the run (the loops would fail with 'couldn't find
+# remote ref initial' if a seed SHA is empty — the sandboxes' clone-base
+# would 404; aborting here is the fail-loudly the R21 I55 norms demand).
+for s in "$REPO_STALL" "$REPO_BUDGET" "$REPO_CTRL" "$REPO_RESUME" "$REPO_BPAUSE" "$REPO_BPAUSE2" "$REPO_REAL"; do
+  [ -n "$s" ] || die "a seed Gitea repo SHA is empty (a seed_repo call failed); the run aborts before creating any Loop"
+done
 echo "   seed commits: stall=$REPO_STALL budget=$REPO_BUDGET ctrl=$REPO_CTRL resume=$REPO_RESUME bpause=$REPO_BPAUSE bpause2=$REPO_BPAUSE2 real=$REPO_REAL"
 
 # create a Loop + wait for the operator to create + bind the workspace PVC

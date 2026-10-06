@@ -1,0 +1,5 @@
+2026/07/03 15:04:05 FAIL: build failed
+--- FAIL: TestBuild (0.42s)
+    build_test.go:42: expected exit 0, got 2
+output written to /tmp/TestBuild1234567890/out.log
+FAIL

@@ -1,0 +1,5 @@
+ panic: nil pointer dereference
+[signal SIGSEGV: segmentation violation code=1 addr=0xADDR pc=0xADDR]
+goroutine 1 [running]:
+main.go:LINE:COL
+	0xADDR

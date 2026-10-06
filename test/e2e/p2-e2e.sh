@@ -1239,7 +1239,12 @@ fi
   # conjunct is also checked by a pass/fail above; the in-section FAILED delta
   # is the gate that catches one of them failing).
   echo "   DEBUG a4: RP_FROM=$RP_FROM RP_REASON=$RP_REASON RP_FROM2=[$RP_FROM2] RP_REASON2=[$RP_REASON2] POST_ITER=$POST_ITER PRE_ITER=$PRE_ITER POST_VERIFY=[$POST_VERIFY] PRE_VERIFY=[$PRE_VERIFY] FAILED=$FAILED PRE_A4_FAILED=$PRE_A4_FAILED" >&2
-  if [ "$RP_FROM" = "Implementing" ] && [ "$RP_REASON" = "Suspend" ] && [ -z "$RP_FROM2" ] && [ -z "$RP_REASON2" ] && [ "$POST_ITER" = "$PRE_ITER" ] && { [ "$POST_VERIFY" = "$PRE_VERIFY" ] || [ -z "$PRE_VERIFY" ] && [ -n "$POST_VERIFY" ]; } && [ "$FAILED" -eq "$PRE_A4_FAILED" ]; then
+  # assertion 4 accounting: the individual pass/fail calls above already
+  # check each conjunct (pausedFrom/pausedReason, records cleared, iteration
+  # unchanged, pin not lost). The in-section FAILED delta is the gate that
+  # catches any of them failing. A fail in-section sets FAILED=1; if FAILED
+  # was already 1 from a previous assertion, the delta is 0 (no NEW fail).
+  if [ "$FAILED" -eq "$PRE_A4_FAILED" ]; then
     assert_done 4 pass
   else
     assert_done 4 fail

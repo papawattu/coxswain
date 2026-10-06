@@ -29,6 +29,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -846,6 +847,46 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed), "onExceeded=Fail -> Failed")
 	})
 
+	It("spec 12b: a FAILED usage read leaves status.budget UNCHANGED (no reset, no guess)", func() {
+		// The mutation 4 (a failed read zeroes the counts) is caught by this
+		// spec: a Loop that ALREADY has status.budget (promptTokens=10,
+		// requests=2) and a FAILED read leaves the counts UNCHANGED (the
+		// reading is not folded in, so the counts stay at the previous
+		// value). With the mutation, the failed read zeroes the counts, so
+		// the assertion FAILS.
+		ns := nsFor("p2d-s12prev")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		r := newP2dReconciler(recorder, nil)
+		loop := createP2dLoop(ns, "p2d-s12prev", func(l *coxv1alpha1.Loop) {
+			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionPause}
+			*l.Spec.Budget.MaxTokens = 200
+		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhaseImplementing)
+		// Seed the Loop with an existing budget (promptTokens=10, requests=2).
+		l := getLoopP2d(ns, "p2d-s12prev")
+		l.Status.Budget = &coxv1alpha1.BudgetStatus{
+			PromptTokens:     10,
+			CompletionTokens: 0,
+			Requests:         2,
+		}
+		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+		primeP2dProxy(loop)
+		// A FAILED read: the counts are NOT folded in, so the budget is
+		// UNCHANGED (promptTokens stays at 10).
+		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return proxy.Reading{}, fmt.Errorf("read failed")
+		}
+		reconcileP2d(r, ns, "p2d-s12prev")
+
+		l = getLoopP2d(ns, "p2d-s12prev")
+		Expect(l.Status.Budget).NotTo(BeNil())
+		Expect(l.Status.Budget.PromptTokens).To(BeEquivalentTo(10),
+			"a failed read leaves the accumulated count UNCHANGED (no reset, no guess)")
+		Expect(l.Status.Budget.Requests).To(BeEquivalentTo(2),
+			"a failed read leaves the request count UNCHANGED")
+	})
+
 	It("spec 13: the first read adopts the baseline (adds nothing, no MeteringReset warning)", func() {
 		ns := nsFor("p2d-s13")
 		defer deleteNS(ctx, ns)
@@ -920,7 +961,7 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		Expect(l.Status.Budget.Exceeded).To(BeTrue(), "exceeded stays true while paused (sticky; re-evaluated on the resume)")
 	})
 
-	It("spec 15: per-Loop price override (spec.budget.modelPrices wins over the ConfigMap)", func() {
+	It("spec 15: per-Loop price override (spec.budget.modelPrices wins over the ConfigMap; exact derived costUsd)", func() {
 		ns := nsFor("p2d-s15")
 		defer deleteNS(ctx, ns)
 		recorder := record.NewFakeRecorder(64)

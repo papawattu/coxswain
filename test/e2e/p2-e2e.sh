@@ -698,9 +698,21 @@ wait_sandbox() {
 }
 
 # The cross-check Loop's wall-clock window (assertion 3): recorded here,
-# before its model work starts in earnest, and re-read after Succeeded.
+# before its model work starts in earnest, and re-read after Succeeded. A
+# STEP 4+ re-run (the Loop already Succeeded) derives it from the proxy
+# pod's start/completion timestamps (the model work's wall clock).
 REAL_T0="$(date -u +%s)"
 echo "   cross-check window start: $REAL_T0 ($(date -u))"
+if ! in_steps 2; then
+  # A STEP 4+ re-run: the Loop's model work already happened (the proxy pod's
+  # start..end is its wall clock) — derive the window from the pod timestamps
+  # (the full run's log carries the authoritative window; this keeps the
+  # re-run's cross-check note self-consistent).
+  PODY_START="$(K -n "$NS" get pod p2h-real-proxy -o jsonpath='{.status.startTime}' 2>/dev/null || true)"
+  PODY_DONE="$(K -n "$NS" get pod p2h-real-proxy -o jsonpath='{.status.containerStatuses[0].state.terminated.finishedAt}' 2>/dev/null || true)"
+  [ -n "$PODY_START" ] && REAL_T0="$(date -u -d "$PODY_START" +%s 2>/dev/null || echo "$REAL_T0")"
+  [ -n "$PODY_DONE" ] && REAL_T1="$(date -u -d "$PODY_DONE" +%s 2>/dev/null || echo '')"
+fi
 
 # --- wait for all six Loops to reach their terminal / assertion states ---
 # (parallel; the script waits each in turn with a generous deadline)
@@ -745,14 +757,17 @@ else
   fail "stall Loop: status.iteration=$ST_ITER (expected 3)"
 fi
 K -n "$NS" get events --field-selector involvedObject.name=p2h-stall -o json > "$LOG_DIR/events-stall.json" 2>/dev/null || true
+# The stall gate emits the WARNING event 'StallDetected' (reason) + the
+# 'Stalled' condition (the two are the detector's record; the Failed
+# CONDITION carries reason Stalled — the condition was asserted above).
 if python3 -c "
 import json,sys
 evs=json.load(open('$LOG_DIR/events-stall.json')).get('items',[])
-sys.exit(0 if any('Stalled' in (e.get('reason') or '') for e in evs) else 1)
+sys.exit(0 if any('Stall' in (e.get('reason') or '') for e in evs) else 1)
 " 2>/dev/null; then
-  pass "stall Loop: a Stalled Event is present"
+  pass "stall Loop: a Stall event is present (the stall detector's audit record)"
 else
-  fail "stall Loop: no Stalled Event (events in $LOG_DIR/events-stall.json)"
+  fail "stall Loop: no Stall event (events in $LOG_DIR/events-stall.json)"
 fi
 # The control contrast.
 CT_PHASE="$(lphase p2h-ctrl)"

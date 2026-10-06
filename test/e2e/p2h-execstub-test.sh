@@ -68,17 +68,22 @@ if not fails:
         fails.append("request 0: no single shell tool call: %r" % tcs)
     else:
         cmd = json.loads(tcs[0]["function"]["arguments"]).get("command", "")
-        if "echo >> README.md" not in cmd or "git" not in cmd:
-            fails.append("request 0: the implement-instruction is not the README.md one-liner: %r" % cmd)
-        # The workspace PVC is root-owned (the seed / init containers run as
-        # root) while the runner's shell runs as uid 65532: git refuses the
-        # repo without safe.directory ('dubious ownership'). The tool's shell
-        # does NOT carry the runner's per-command -c flags, so the
-        # instruction itself must set safe.directory via the GIT_CONFIG env
-        # (GIT_CONFIG_GLOBAL=/dev/null + the counted KEY/VALUE pairs — a
-        # HOME-less, workspace-clean way).
-        if "safe.directory" not in cmd or "GIT_CONFIG_GLOBAL=/dev/null" not in cmd:
-            fails.append("request 0: the implement-instruction lacks git's safe.directory env (root-owned workspace + uid-65532 shell = 'dubious ownership' otherwise): %r" % cmd)
+        if cmd != "echo >> README.md":
+            fails.append("request 0: the implement-instruction is not the bare README.md one-liner: %r" % cmd)
+        # The command must NOT reference COX_WORKSPACE: the runner's shell tool
+        # runs with cmd.Dir = the workspace (runner.go execShell) and the agent
+        # container has no COX_WORKSPACE env — a `cd \"$COX_WORKSPACE\"` under
+        # set -e aborts on the empty word (the P2h kind-run stall: every
+        # tool call exited 2, so no Implementing run ever changed README.md
+        # and the verify Job cloned an unchanging base commit).
+        if "COX_WORKSPACE" in cmd:
+            fails.append("request 0: the implement-instruction references COX_WORKSPACE (unset in the agent — the cd aborts under set -e): %r" % cmd)
+        # The command must NOT stage/commit itself: the runner's commitWorkspace
+        # owns the commit and stages only non-protected source paths (a
+        # tool-side `git add -A` would pull the operator-owned .coxswain dir
+        # into the verified commit).
+        if "git add" in cmd or "git commit" in cmd:
+            fails.append("request 0: the implement-instruction must not git add/commit (commitWorkspace owns the commit): %r" % cmd)
     u0 = r0.get("usage", {})
     if (u0.get("prompt_tokens"), u0.get("completion_tokens")) != (100, 100):
         fails.append("request 0: usage %r (expected prompt=100 completion=100)" % u0)
@@ -107,6 +112,32 @@ else
   echo "   [FAIL] the stub's request log recorded $CHAT_REQS chat requests (expected 2: n=1, n=3)" >&2
   FAILS=1
 fi
+
+# The I55 execution test for IMPLEMENT_CMD itself: run the EXACT command the
+# stub serves (request 0's tool call) in a temp git repo with COX_WORKSPACE
+# UNSET (the agent container has no COX_WORKSPACE env — this is the shape of
+# the kind stall: a `cd "$COX_WORKSPACE"` under set -e aborts on the empty
+# word before the echo, so README.md never grew and the verify Job cloned an
+# unchanging base commit). The runner's shell tool runs the command with
+# cmd.Dir = the workspace (runner.go execShell), so the temp repo stands in
+# for /workspace. Assert README.md GREW after the command.
+CMD_FROM_STUB="$(python3 -c "import importlib.util,sys; spec=importlib.util.spec_from_file_location('stub','$STUB'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); print(m.IMPLEMENT_CMD)")"
+WORKTREE="$(mktemp -d /tmp/p2h-execstub-worktree.XXXXXX)"
+( cd "$WORKTREE" && git init -q && git config user.name stub && git config user.email stub@local && echo seed > README.md && git add README.md && git commit -qm seed )
+BEFORE_LEN="$(wc -l < "$WORKTREE/README.md")"
+if ( cd "$WORKTREE" && env -u COX_WORKSPACE sh -c "$CMD_FROM_STUB" ); then
+  AFTER_LEN="$(wc -l < "$WORKTREE/README.md")"
+  if [ "$AFTER_LEN" -gt "$BEFORE_LEN" ]; then
+    echo "   ok: the implement-instruction ran in a git repo with COX_WORKSPACE unset and grew README.md ($BEFORE_LEN -> $AFTER_LEN lines)"
+  else
+    echo "   [FAIL] the implement-instruction ran but README.md did not grow (still $AFTER_LEN lines)" >&2
+    FAILS=1
+  fi
+else
+  echo "   [FAIL] the implement-instruction exited non-zero with COX_WORKSPACE unset (the kind-stall shape: cd \"\$COX_WORKSPACE\" aborts under set -e): %s" "$CMD_FROM_STUB" >&2
+  FAILS=1
+fi
+rm -rf "$WORKTREE"
 
 # The sh -c positional-argument case (the seed_repo's R="$1" pattern): the
 # first argument after the script is $0, NOT $1 — the repo name must be

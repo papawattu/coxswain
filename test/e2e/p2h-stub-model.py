@@ -66,24 +66,17 @@ LOG_PATH = os.environ.get("STUB_LOG", "/tmp/stub-requests.jsonl")
 # The fixed implement-instruction (item 14): the runner's shell tool executes
 # it. Appends ONE newline to README.md (a non-protected path — the "go"
 # preset protects **/*_test.go, **/testdata/**, go.mod, go.sum; README.md is
-# none of those) and commits it, so EVERY Implementing run produces a NEW
-# commit and the verify Job re-runs. The workspace PVC is root-owned (the
-# seed / init containers run as root) while the runner's shell runs as uid
-# 65532: git refuses the repo without safe.directory (the runner's own gitC
-# carries the flag per-command, but the tool's shell does not) — the command
-# sets GIT_CONFIG_GLOBAL=/dev/null (no HOME git config needed, and nothing is
-# left on the workspace) + safe.directory. set -e so a failure (e.g. not a
-# repo) surfaces as a non-zero exit the runner feeds back.
-IMPLEMENT_CMD = (
-    "set -e; export GIT_CONFIG_GLOBAL=/dev/null; "
-    "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=\"$COX_WORKSPACE\"; "
-    "cd \"$COX_WORKSPACE\"; "
-    "git add -A; "
-    "echo >> README.md; "
-    "git add README.md; "
-    "git -c user.name=p2h-stub -c user.email=p2h-stub@local "
-    "commit -m 'stub: append a newline to README.md'"
-)
+# none of those), so EVERY Implementing run produces a NEW commit and the
+# verify Job re-runs. The command is a bare `echo >> README.md`: the runner's
+# shell tool already runs with the workspace as its working directory
+# (runner.go execShell sets cmd.Dir = workspace) and the runner commits the
+# work itself at the end of a successful Implementing (commitWorkspace,
+# phase.go — it stages only non-protected SOURCE paths, never .coxswain).
+# No cd (COX_WORKSPACE is NOT an agent env — a `cd "$COX_WORKSPACE"` under
+# `set -e` aborts on the empty word before the echo), no git add/commit
+# (the runner's commitWorkspace owns the commit; a tool-side `git add -A`
+# would stage the operator-owned .coxswain dir into the verified commit).
+IMPLEMENT_CMD = "echo >> README.md"
 
 # The assistant turn with the fixed tool call (the OpenAI/vLLM wire shape the
 # runner parses: id + function-name/type + arguments as a JSON string).

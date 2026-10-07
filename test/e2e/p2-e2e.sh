@@ -279,6 +279,12 @@ for img in "$CTRL_IMG" "$RUNNER_IMG" "$STUB_IMG" "$GIT_IMG" "$CHECK_IMG"; do
   echo "   kind load: $img"
   kind load docker-image "$img" --name "$CLUSTER" || die "kind load $img failed"
 done
+# I71: prune dangling images to reduce host memory pressure (P2h's seven
+# Loops plus image builds took the devbox to ~250 MB free; a prune between
+# builds keeps the host headroom). Dangling images only — the pinned
+# P2H_OPERATOR_IMAGE and the just-loaded images are NOT dangling.
+echo "--- STEP 0c: docker image prune (dangling only) ---"
+docker image prune -f >/dev/null 2>&1 || echo "   (prune failed; continuing)"
 # The dev overlay pins --runner-image=coxswain-runner:dev (the operator's
 # RunnerImage; isRunner is true only when spec.agent.image == RunnerImage).
 # The P2h Loops' spec.agent.image is $RUNNER_IMG, so the operator's
@@ -554,9 +560,17 @@ K -n "$NS" create secret generic p2h-model-creds \
   --from-literal=MODEL_BASE_URL="http://$REAL_VLLM" \
   --dry-run=client -o yaml | K apply -f - >/dev/null
 
-# --- the eight Loops ---
+# --- the Loops ---
 FAIL_CHECK='test -f /nonexistent'
 PASS_CHECK='sleep 0.1'
+
+# I71: P2H_LOOP_COUNT controls how many Loops are created (default 8). The
+# first 4 are the assertion Loops (stall, budget, ctrl, resume); the last 4
+# are the budgetpause Loops + the real cross-check. Setting P2H_LOOP_COUNT=4
+# skips the 4 non-assertion Loops (reduces host memory pressure from 7+
+# concurrent agent pods + verify Jobs).
+P2H_LOOP_COUNT="${P2H_LOOP_COUNT:-8}"
+echo "   P2H_LOOP_COUNT=$P2H_LOOP_COUNT"
 
 echo "   creating the stall Loop (stallAfter:3, stallAction:Fail, maxIterations:10)"
 create_loop_wait_pvc ${p2h_stall} <<EOF
@@ -677,6 +691,7 @@ spec:
     stallAction: Fail
 EOF
 
+if [ "$P2H_LOOP_COUNT" -ge 8 ]; then
 echo "   creating the two budget-Pause Loops (maxTokens:400, onExceeded:Pause)"
 create_loop_wait_pvc ${p2h_budgetpause} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
@@ -842,6 +857,8 @@ fi
 # ===========================================================================
 if in_steps 4; then
 echo
+
+fi
 echo "--- STEP 4: wait + assert (the plan's five numbered assertions) ---"
 
 # loop phase / field readers (one value per call).

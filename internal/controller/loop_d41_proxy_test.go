@@ -689,7 +689,7 @@ var _ = Describe("D41c: toolProxyGatesSuspended fail-closed", func() {
 		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
 		Expect(k8sClient.Create(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "fc-loop-tool-" + d41cToolName, Namespace: ns},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "t", Image: "busybox"}}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "t", Image: verifyBusybox}}},
 		})).To(Succeed())
 
 		Expect(r.toolProxyGatesSuspended(ctx, loop)).To(BeTrue(),

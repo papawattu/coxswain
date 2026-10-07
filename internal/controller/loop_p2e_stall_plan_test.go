@@ -46,6 +46,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -244,11 +245,44 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 	// the given init statuses (tamper + artifact terminated exit 0 when
 	// initDone; the check-0 state is checkState). A new iteration's pod is a
 	// NEW object (the real operator's Job owns the pod; the envtest fixture
-	// plants it directly, the S5a pattern).
+	// plants it directly, the S5a pattern). I65 P1-A: the fixture Job must
+	// exist (else readVerifyJobPod's UID filter skips the pod) with the
+	// CURRENT pin's annotation (the D27 guard's shape), and the pod's
+	// ownerReference must carry the Job's UID (the batch-controller shape).
 	createP2eVerifyPod := func(ns, loopName string, iter int, initDone bool, checkState corev1.ContainerState) {
 		_ = k8sClient.Delete(ctx, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-verify-pod-%d", loopName, iter), Namespace: ns},
 		})
+		// Create the fixture Job (the operator's ensureVerifyJob creates it in
+		// the S5a happy path, but P2e drives its own verify Job directly).
+		jobName := fmt.Sprintf("%s-verify-%d", loopName, iter)
+		job := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+			// Use the CURRENT pin's commit (the D27 guard requires it to match
+			// the CURRENT pin's annotation, else the Job is deleted).
+			l := getLoop(ns, loopName)
+			pin := ""
+			if l.Status.CurrentVerify != nil {
+				pin = l.Status.CurrentVerify.VerifiedCommit
+			}
+			job = &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        jobName,
+					Namespace:   ns,
+					Labels:      verifyJobLabels(loopName),
+					Annotations: map[string]string{verifyCommitAnnotation: pin},
+				},
+				Spec: batchv1.JobSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							RestartPolicy: corev1.RestartPolicyNever,
+							Containers:    []corev1.Container{{Name: verifyMainContainer, Image: verifyBusybox}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
 		tamperState := corev1.ContainerState{}
 		artifactState := corev1.ContainerState{}
 		if initDone {
@@ -259,9 +293,15 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("%s-verify-pod-%d", loopName, iter),
 				Namespace: ns,
-				Labels:    map[string]string{"job-name": fmt.Sprintf("%s-verify-%d", loopName, iter), verifyForLabel: loopName},
+				Labels:    map[string]string{"job-name": jobName, verifyForLabel: loopName},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyMainContainer, Image: "busybox"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyMainContainer, Image: verifyBusybox}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{

@@ -184,11 +184,34 @@ func s5aClaimPodWithIteration(ns, name, phase, head string, iteration int) {
 // failing-check name/code must come from the first check-* container with
 // a non-zero exit, never a fixed index).
 func s5aVerifyPodMultiCheck(ctx context.Context, ns, name, jobName string, checkCount int, failing map[int]int32) {
+	// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID filter
+	// skips the pod — the operator's ensureVerifyJob creates it in the S5a
+	// happy path, but S6 drives its own verify Job directly). Create it with
+	// the CURRENT pin's annotation (the D27 guard's shape) and set the pod's
+	// ownerReference to carry the Job's UID (the batch-controller shape on a
+	// real cluster).
+	job := &batchv1.Job{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+		job = &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      jobName,
+				Namespace: ns,
+				Labels:    verifyJobLabels(name),
+			},
+		}
+		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name + "-verify-pod",
 			Namespace: ns,
 			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(),
+				Kind:       i65JobKind,
+				Name:       jobName,
+				UID:        job.UID,
+			}},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 	}
@@ -278,11 +301,34 @@ func s5aDriveToVerifying(ns, name string) *LoopReconciler {
 // initContainerStatuses from this pod). checkExit 0/absent = all checks
 // pass; a non-zero checkExit makes check-0 fail.
 func s5aVerifyPod(ctx context.Context, ns, name, jobName string, checkExit int32) {
+	// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+	// filter skips the pod — the operator's ensureVerifyJob creates it in the
+	// S5a happy path, but S6 drives its own verify Job directly). Create it
+	// with the CURRENT pin's annotation (the D27 guard's shape) and set the
+	// pod's ownerReference to carry the Job's UID (the batch-controller
+	// shape on a real cluster).
+	job := &batchv1.Job{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+		job = &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      jobName,
+				Namespace: ns,
+				Labels:    verifyJobLabels(name),
+			},
+		}
+		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name + "-verify-pod",
 			Namespace: ns,
 			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(),
+				Kind:       i65JobKind,
+				Name:       jobName,
+				UID:        job.UID,
+			}},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 	}
@@ -651,11 +697,25 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// The verify Job pod (envtest stand-in: no Job controller, so the spec
 		// creates the pod the Job WOULD create, labelled job-name).
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+		// filter skips the pod — the operator's ensureVerifyJob creates it in
+		// the S5a happy path, but the spec drives its own verify Job directly).
+		job := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}
@@ -701,11 +761,25 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			})).To(Succeed())
 			r := s5aDriveToVerifying(ns, name)
 			jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+			// filter skips the pod — the operator's ensureVerifyJob creates it in
+			// the S5a happy path, but the spec drives its own verify Job directly).
+			job := &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+				job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+				Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			}
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      name + "-verify-pod",
 					Namespace: ns,
 					Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: batchv1.SchemeGroupVersion.String(),
+						Kind:       i65JobKind,
+						Name:       jobName,
+						UID:        job.UID,
+					}},
 				},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 			}
@@ -817,11 +891,25 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+		// filter skips the pod — the operator's ensureVerifyJob creates it in
+		// the S5a happy path, but the spec drives its own verify Job directly).
+		job := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}
@@ -859,11 +947,25 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+		// filter skips the pod — the operator's ensureVerifyJob creates it in
+		// the S5a happy path, but the spec drives its own verify Job directly).
+		job := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}
@@ -966,11 +1068,25 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// would keep the outcome noDecision forever.
 
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+		// filter skips the pod — the operator's ensureVerifyJob creates it in
+		// the S5a happy path, but the spec drives its own verify Job directly).
+		job := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}
@@ -1031,11 +1147,25 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// Job, exactly like the passing pending check spec.
 
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+		// filter skips the pod — the operator's ensureVerifyJob creates it in
+		// the S5a happy path, but the spec drives its own verify Job directly).
+		job := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-verify-pod",
 				Namespace: ns,
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 		}

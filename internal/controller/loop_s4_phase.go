@@ -417,6 +417,21 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 				loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{
 					VerifiedCommit: claim.HeadCommit,
 				}
+				// I65 P1-B: a new pin resets the per-verified-commit verify
+				// status fields (the attempt count and the counted-Job-UID
+				// guard). infraAttempts is a per-verified-commit attempt count
+				// (exactly like tamperExitCode and lastCheckResults): a new
+				// pin is a new verifiedCommit, and the old pin's infra flakes
+				// must not accumulate into the new pin's bound (three transient
+				// flakes spread over a long Loop, in different iterations, must
+				// not fail it as VerifyInfraFailed). The reset is the operator's
+				// (the pin advance is the operator's decision, not the agent's),
+				// and it clears both the counter and the UID guard (a new pin
+				// means a new Job, so the old UID is stale).
+				if loop.Status.Verify != nil {
+					loop.Status.Verify.InfraAttempts = 0
+					loop.Status.Verify.InfraJobUID = ""
+				}
 			}
 			advanced = true
 			changed = true

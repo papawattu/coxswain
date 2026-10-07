@@ -98,7 +98,7 @@ its KubeArmorPolicy (`EmitKubeArmorPolicyWithToolFQDNs`).
 
 ### I65. A verify Job that fails before the checks wedges the Loop in Verifying
 
-- [ ] Open (operator bug)
+- [x] Fixed in d92ef45 (PR #86)
 
 **Where:** `internal/controller/loop_verify_job.go` `verifyOutcome` /
 `applyVerifyOutcome`.

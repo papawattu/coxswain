@@ -74,6 +74,13 @@ pull requests; design is reviewed in review docs.**
   from a plan, ADR, or review doc, grep it to confirm it exists, and cite the
   file and line (e.g. `docs/TDD-PLAN-PHASE2.md:1245`). Don't justify an
   out-of-scope change with a plan line that doesn't exist.
+- **Use only your own credentials; never search for, read or print other
+  credentials** (I58, D48). That covers tokens, PATs, env and secret files,
+  and credential stores. Never run `gh auth token` (it prints the session's
+  GitHub token in full). If a push is rejected (e.g. a workflow scope
+  limitation), report it and stop — do not go looking for other credentials
+  to retry. `.github/workflows` edits are an owner push: the builder stops
+  and reports, and the owner pushes that commit.
 
 ## Project Structure
 

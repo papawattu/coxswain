@@ -67,6 +67,20 @@ pull requests; design is reviewed in review docs.**
   <explicit files>` so a commit contains only what the builder changed. Don't
   rewrite history to fix an accidental sweep — note it and use explicit paths
   from then on.
+- **Never commit evidence or knowledge dirs** (I68). `.samples/` and `.gnosis/`
+  are never committed. Never `git add -f` under them. If a file under either
+  path is tracked, `make lint` fails (the guard below).
+- **Quote plan/ADR text only after grepping it** (I68). Before citing a line
+  from a plan, ADR, or review doc, grep it to confirm it exists, and cite the
+  file and line (e.g. `docs/TDD-PLAN-PHASE2.md:1245`). Don't justify an
+  out-of-scope change with a plan line that doesn't exist.
+- **Use only your own credentials; never search for, read or print other
+  credentials** (I58, D48). That covers tokens, PATs, env and secret files,
+  and credential stores. Never run `gh auth token` (it prints the session's
+  GitHub token in full). If a push is rejected (e.g. a workflow scope
+  limitation), report it and stop — do not go looking for other credentials
+  to retry. `.github/workflows` edits are an owner push: the builder stops
+  and reports, and the owner pushes that commit.
 
 ## Project Structure
 

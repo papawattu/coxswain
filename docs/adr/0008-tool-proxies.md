@@ -202,6 +202,19 @@ forwarding with credential injection":
 - `PolicyTranslationLossy` is **not** set on the grounds of tool upstreams
   (the proxy enforces host at DNS + application layer, as in I42d/I41).
 
+### Limitation: DNS fence unenforced on clusters without BPF-LSM (D50, I64)
+
+The KubeArmor `matchDNSQueries` fence (the inner egress fence for the tool
+proxy) is **not enforced on clusters without BPF-LSM** (e.g. kind on certain
+kernels). On such clusters, the only thing keeping the tool proxy's egress
+on the configured upstream is the proxy's own code (it dials the fixed
+upstream host only; there is no per-request authority to validate). This is
+an accepted limitation (D50 = (a), R23 I64): the tool proxy's NetworkPolicy
+allows any external IP by design (the upstream's IP isn't known in advance),
+so where the DNS fence is unenforced, the application layer is the sole
+egress control. Clusters with BPF-LSM (the production target) enforce the
+fence; the limitation is documented here and in the install notes.
+
 ### Audit
 
 Tool proxy audit records are streamed to the proxy pod's stdout like the

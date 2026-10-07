@@ -109,6 +109,12 @@ sample-run-dry-run: ## S5b: validate the task manifests server-side without crea
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
+	@# I68: fail when any path under .samples/ or .gnosis/ is tracked (evidence
+	@# and knowledge dirs are never committed; git add -f under them is a
+	@# mistake). Check with git ls-files (a tracked file under either path is
+	@# an error, even if it was force-added).
+	@tracked_samples=$$(git ls-files '.samples/' 2>/dev/null); if [ -n "$$tracked_samples" ]; then echo "Error: .samples/ files are tracked (I68: evidence dirs are never committed):"; echo "$$tracked_samples"; exit 1; fi
+	@tracked_gnosis=$$(git ls-files '.gnosis/' 2>/dev/null); if [ -n "$$tracked_gnosis" ]; then echo "Error: .gnosis/ files are tracked (I68: knowledge dirs are never committed):"; echo "$$tracked_gnosis"; exit 1; fi
 	"$(GOLANGCI_LINT)" run
 	cd runner && "$(GOLANGCI_LINT)" run
 	@# I51: shellcheck the hack scripts (shellcheck is preinstalled on

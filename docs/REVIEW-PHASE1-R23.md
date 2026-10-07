@@ -68,6 +68,13 @@ settled before Loops run against real tools or for long unattended stretches.
 
 - [ ] Open (**owner decision**)
 
+**Owner decision (2026-10-07), D50 = (a):** accept the gap and document it as a
+limitation of clusters without BPF-LSM. No fail-closed hold and no IP pinning
+for now. Remaining builder work: document the limitation where operators will
+see it (the D41 tool-proxy docs/ADR-0008 and the install/README notes). Say
+plainly that on such clusters only the tool proxy's own code keeps its egress
+on the configured upstream. Then tick this box with that commit.
+
 **Where:** the D41 tool proxy (`<loop>-tool-<name>`), its NetworkPolicy and
 its KubeArmorPolicy (`EmitKubeArmorPolicyWithToolFQDNs`).
 

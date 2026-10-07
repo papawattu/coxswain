@@ -37,7 +37,6 @@ import (
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -273,6 +272,16 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 		var phase coxv1alpha1.LoopPhase
 		for iter := 1; iter <= n; iter++ {
 			jobName := loopName + "-verify-" + strconv.Itoa(iter)
+			// I65 P1-A: model the batch controller — the fixture's verify Job
+			// carries the CURRENT pin's annotation (else ensureVerifyJob's D27
+			// stale-evidence guard deletes it and this reconcile's verify read
+			// is skipped — the stall gate never fires), and the Job's pod's
+			// ownerReferences carry the Job's UID (the batch controller sets
+			// that; the operator's readVerifyJobPod filters to the current
+			// Job's UID, so a pod without the ownerReference is not read). The
+			// annotation is read AFTER the Loop re-seed below (it must equal
+			// the CURRENT pin).
+			_ = k8sClient.Delete(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns}})
 			// Replace this iteration's verify pod (fresh name: the read path
 			// filters to the current iteration's Job pod).
 			oldPod := &corev1.Pod{}
@@ -338,16 +347,24 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				sb.Annotations[sandboxDesiredPhaseAnnotation] = string(coxv1alpha1.LoopPhaseVerifying)
 				Expect(k8sClient.Update(ctx, sb)).To(Succeed())
 			}
-			// Create the verify Job (the S5a envtest shape: envtest has no
-			// Job controller, so the operator's ensureVerifyJob is the Job's
-			// only path — the pod is then read from it via the verify-for
-			// label + job-name label, as the S5a specs do).
-			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: jobName}, &batchv1.Job{}); apierrors.IsNotFound(err) {
-				job := &batchv1.Job{
+			// I65 P1-A: model the batch controller — the fixture's Job (a
+			// fresh one each iteration: the operator's ensureVerifyJob deletes
+			// it on an infra failure or a stale-evidence mismatch and recreates
+			// it next reconcile) is stamped with the CURRENT pin's annotation
+			// (else the D27 guard deletes it and this reconcile's verify read
+			// is skipped), and the Job's pod's ownerReferences carry the Job's
+			// UID (the batch controller sets that; the operator's
+			// readVerifyJobPod now filters to the current Job's UID, so a pod
+			// without the ownerReference is not read).
+			job := &batchv1.Job{}
+			_ = k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: jobName}, job)
+			if job.UID == "" {
+				job = &batchv1.Job{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      jobName,
-						Namespace: ns,
-						Labels:    verifyJobLabels(loopName),
+						Name:        jobName,
+						Namespace:   ns,
+						Labels:      verifyJobLabels(loopName),
+						Annotations: map[string]string{verifyCommitAnnotation: p2gHeadCommit},
 					},
 					Spec: batchv1.JobSpec{
 						Template: corev1.PodTemplateSpec{
@@ -366,7 +383,28 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				}
 				Expect(controllerutil.SetControllerReference(getLoop(ns, loopName), job, k8sClient.Scheme())).To(Succeed())
 				Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			} else {
+				// The Job exists (from a prior iteration of this Loop, or the
+				// operator's create): stamp the CURRENT pin so the D27 guard
+				// accepts it (a mismatched annotation would be deleted and
+				// this reconcile's verify read skipped — the stall gate would
+				// never fire).
+				if job.Annotations == nil {
+					job.Annotations = map[string]string{}
+				}
+				job.Annotations[verifyCommitAnnotation] = p2gHeadCommit
+				Expect(k8sClient.Update(ctx, job)).To(Succeed())
 			}
+			// The pod's ownerReference carries the Job's UID (readVerifyJobPod
+			//'s I65 UID filter requires it — a pod from a prior Job's UID, or
+			// without an ownerReference, is a stale pod and is not read).
+			pod.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(),
+				Kind:       "Job",
+				Name:       jobName,
+				UID:        job.UID,
+			}}
+			Expect(k8sClient.Update(ctx, pod)).To(Succeed())
 			reconcile(r, ns, loopName) // ensureVerifyJob sees the Job; the pod is read from it
 			l := getLoop(ns, loopName)
 			p2gDebugLog("iter %d: phase=%s stallHistory=%d\n", iter, l.Status.Phase, len(l.Status.StallHistory))

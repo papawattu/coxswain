@@ -790,6 +790,26 @@ func (r *LoopReconciler) readVerifyJobPod(ctx context.Context, loop *coxv1alpha1
 	if reader == nil {
 		reader = r
 	}
+	// I65: match the pod to the CURRENT Job's UID, not just its name. The
+	// operator's infra-retry deletes the failed Job (background propagation)
+	// and recreates it with the SAME NAME on the next reconcile; on a real
+	// cluster the old Job's pod lingers until garbage collection removes it,
+	// and a name-only match would read that stale failed pod again and burn
+	// another infra attempt (one flake burning every retry). The batch Job
+	// controller stamps the owning Job's UID on each pod's
+	// ownerReferences, so matching the current Job's UID selects only the
+	// pod the current Job created (a recreated Job has a new UID; its pod is
+	// not created yet, so the read returns nil and the hold/recreate is
+	// clean).
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: loop.Namespace}, job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get verify job %s: %w", jobName, err)
+	}
+	jobUID := job.UID
+
 	// Find the Job's pod by the verify-for label (the Job stamps it on the
 	// pod template).
 	list := &corev1.PodList{}
@@ -798,13 +818,31 @@ func (r *LoopReconciler) readVerifyJobPod(ctx context.Context, loop *coxv1alpha1
 		client.MatchingLabels{verifyForLabel: loop.Name}); err != nil {
 		return nil, fmt.Errorf("list verify pods: %w", err)
 	}
-	// Filter to the current iteration's Job pod (the Job name is on the pod's
-	// label controller-uid, but the simplest reliable match is the Job name in
-	// the pod's labels — the Job controller sets the "job-name" label).
+	// Filter to the current Job's pod: the pod's ownerReferences must name
+	// the current Job's UID (the batch controller sets this), AND the pod
+	// must not be terminating (a pod with a deletionTimestamp is being
+	// removed by the GC and its status is stale — I65: skipping it keeps a
+	// delete-in-flight from being misread as a live failure). The job-name
+	// label is checked for good measure (it equals jobName for the current
+	// Job's pod) but the UID is the authoritative match.
 	var pods []corev1.Pod
 	for i := range list.Items {
-		if list.Items[i].Labels["job-name"] == jobName {
-			pods = append(pods, list.Items[i])
+		p := &list.Items[i]
+		if p.Labels["job-name"] != jobName {
+			continue
+		}
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		ownedByCurrentJob := false
+		for _, ref := range p.OwnerReferences {
+			if ref.UID == jobUID && ref.Kind == "Job" {
+				ownedByCurrentJob = true
+				break
+			}
+		}
+		if ownedByCurrentJob {
+			pods = append(pods, *p)
 		}
 	}
 	if len(pods) == 0 {
@@ -1256,7 +1294,50 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 	if loop.Status.Verify == nil {
 		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 	}
-	loop.Status.Verify.InfraAttempts++
+	// I65 P1-A: count at most ONE infra attempt per Job UID. The operator's
+	// infra-retry deletes the failed Job (background propagation) and recreates
+	// it with the SAME NAME on the next reconcile; on a real cluster the old
+	// Job's pod lingers until the GC removes it, and readVerifyJobPod now
+	// filters to the current Job's UID — but a re-read of the SAME failing Job
+	// (the reconcile re-running before the delete completes, or the stale pod
+	// still owned by the old Job) must not burn another attempt. The guard is
+	// the Job UID: increment infraAttempts only when the failing Job's UID
+	// differs from the one already recorded (infraJobUID). A recreated Job has
+	// a new UID, so its first infra-failure IS counted (the retry), while a
+	// re-read of the same failing Job is not. When job is nil (the Job is
+	// already gone — deleted externally or GC'd), the failure is the stale
+	// pod of a Job that no longer exists; it is still counted once (the UID is
+	// the Loop's last-seen Job, recorded on the increment) so the bound is
+	// not skipped, but it is NOT counted again on a re-read (the UID is now
+	// recorded).
+	var jobUID types.UID
+	if job != nil {
+		jobUID = job.UID
+	} else {
+		// The Job is gone: use the recorded UID if present (a re-read of a
+		// failure whose Job was already deleted — do not double-count), or
+		// fall back to a sentinel that is never equal to a real UID (a fresh
+		// failure with no Job to read — count it once). The empty-string
+		// sentinel is safe: a real Job UID is a non-empty UUID, so an empty
+		// recorded UID means "count the next failure" and a non-empty one
+		// means "already counted this Job".
+		jobUID = types.UID(loop.Status.Verify.InfraJobUID)
+	}
+	alreadyCounted := string(jobUID) == loop.Status.Verify.InfraJobUID && loop.Status.Verify.InfraJobUID != ""
+	if !alreadyCounted {
+		loop.Status.Verify.InfraAttempts++
+		if job != nil {
+			loop.Status.Verify.InfraJobUID = string(job.UID)
+		} else if loop.Status.Verify.InfraJobUID == "" {
+			// No Job to read (already gone): record a sentinel so a re-read of
+			// the same failure is not counted again. Use the job name as the
+			// sentinel (a recreated Job has a different... name is the same, but
+			// the UID is new, so the next real failure gets a fresh count). In
+			// practice job is non-nil on the infra-failure path (the Job is
+			// present and failing); this branch is the defensive stale-pod case.
+			loop.Status.Verify.InfraJobUID = "(job-gone)"
+		}
+	}
 	attempt := loop.Status.Verify.InfraAttempts
 	msg := verifyInfraFailureMessage(failedCheck, checkExitCode)
 	if attempt > verifyInfraRetries {

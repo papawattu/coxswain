@@ -853,9 +853,30 @@ spec:
                       maxIterations cycle). The operator recreates the Job a bounded number of
                       times (the verifyInfraRetries cap, the controller's constant) and fails
                       the Loop with the VerifyInfraFailed reason once the bound is exhausted.
+
+                      I65 P1-A: it counts at most ONE attempt per Job UID (see infraJobUID).
+                      The operator's infra-retry deletes the failed Job (background
+                      propagation) and recreates it with the SAME NAME on the next reconcile;
+                      on a real cluster the old Job's pod lingers until the GC removes it,
+                      and without the UID guard every reconcile would re-read that stale
+                      failed pod and burn another attempt (one flake burning every retry
+                      before a single retried Job runs).
                     format: int32
                     minimum: 0
                     type: integer
+                  infraJobUID:
+                    description: |-
+                      infraJobUID is the UID of the verify Job whose infra-failure was most
+                      recently counted into infraAttempts (I65 P1-A). It is the "one attempt
+                      per Job UID" guard: the operator increments infraAttempts only when the
+                      failing Job's UID differs from the one already recorded here. A
+                      recreated Job has a new UID (the operator's infra-retry deletes the
+                      failed Job and ensureVerifyJob creates a fresh one), so the first
+                      infra-failure on the new Job is counted (the stale pod of the old Job
+                      does not re-count), while a re-read of the SAME failing Job (the pod
+                      lingering, the reconcile re-running) does not double-count. An empty
+                      value means no attempt has been counted yet.
+                    type: string
                   jobName:
                     description: |-
                       jobName is the verify Job the evidence came from (D24). Recording it (and

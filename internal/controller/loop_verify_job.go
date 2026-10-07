@@ -1316,12 +1316,25 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 	if string(jobUID) == loop.Status.Verify.InfraJobUID && loop.Status.Verify.InfraJobUID != "" {
 		// A re-read of the same failing Job (the reconcile re-ran before the
 		// delete completed, or the GC has not yet removed the Job): the attempt
-		// is already counted. Return early — requeue (the Job is still there and
-		// will be deleted on the next reconcile), no Event, no re-delete (the
-		// Job is already Terminating or the GC is removing it; a re-delete is a
-		// no-op at best and a transient API error at worst).
+		// is already counted. No Event, no double-count. If the Job is still
+		// present and NOT yet Terminating (a transient Delete failure left it
+		// in place — a finalizer or an apiserver hiccup), re-issue the
+		// background delete so the retry can proceed. If the Job is gone or
+		// already Terminating, the GC is handling it — just requeue.
+		if job != nil && job.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+				// A delete failure is transient: the attempt count is already
+				// persisted, so the next reconcile sees the same failed Job
+				// and the same count and retries the delete (never a controller
+				// error, never a wedge).
+				logf.FromContext(ctx).Error(err, "failed to re-delete verify Job for recreate; requeueing", "job", job.Name)
+				return false, true
+			}
+			logf.FromContext(ctx).Info("verify Job re-read (same UID); re-issued delete (was not Terminating)", "loop", loop.Name, "job", job.Name, "attempt", loop.Status.Verify.InfraAttempts)
+			return true, true
+		}
 		logf.FromContext(ctx).Info("verify Job re-read (same UID); skipping (already counted)", "loop", loop.Name, "jobUID", jobUID, "attempt", loop.Status.Verify.InfraAttempts)
-		return true, true
+		return false, true
 	}
 	loop.Status.Verify.InfraAttempts++
 	if job != nil {

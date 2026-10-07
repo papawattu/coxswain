@@ -43,15 +43,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -281,15 +283,15 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 			again := s5aReconcile(r, ns, name)
 			Expect(again.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 				"re-read %d: the Terminating Job must not burn another attempt (phase stays Verifying)", i+1)
-			if again.Status.Verify != nil {
-				Expect(again.Status.Verify.InfraAttempts).To(Equal(int32(1)),
-					"re-read %d: infraAttempts stays 1 (the per-UID guard)", i+1)
-				Expect(again.Status.Verify.InfraJobUID).To(Equal(string(firstJob.UID)),
-					"re-read %d: infraJobUID is unchanged (the same Job UID)", i+1)
-			}
+			Expect(again.Status.Verify).NotTo(BeNil(),
+				"re-read %d: status.Verify is present", i+1)
+			Expect(again.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+				"re-read %d: infraAttempts stays 1 (the per-UID guard)", i+1)
+			Expect(again.Status.Verify.InfraJobUID).To(Equal(string(firstJob.UID)),
+				"re-read %d: infraJobUID is unchanged (the same Job UID)", i+1)
 		}
 
-		By("removing the finalizer: the Job is now GC'd and the retried Job is created")
+		By("removing the finalizer: the Job is now GC'd and the retried Job is created (with a new UID)")
 		// Remove the finalizer so the Job can be deleted.
 		finalJob := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, finalJob)).To(Succeed())
@@ -306,6 +308,11 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 		fresh = s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"the retried Job is created (the phase stays Verifying)")
+		retryJob := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, retryJob)).To(Succeed(),
+			"the retried Job exists")
+		Expect(string(retryJob.UID)).NotTo(Equal(string(firstJob.UID)),
+			"the retried Job has a new UID (a NEW Job, not a mutation of the failed one)")
 	})
 })
 
@@ -388,3 +395,51 @@ func i65ansJobFailed(ns, jobName string) {
 	}}
 	Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 }
+
+// failJobDeleteOnce is a client wrapper that fails the first Job Delete once,
+// then delegates to the real client. Used by the reviewer's scratch spec to
+// model a transient Delete failure (the I65 wedge: the alreadyCounted early
+// return skips the Delete, so a transient failure leaves the Job in place and
+// the Loop sits in Verifying forever).
+type failJobDeleteOnce struct {
+	client.Client
+	failed bool
+}
+
+func (c *failJobDeleteOnce) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*batchv1.Job); ok && !c.failed {
+		c.failed = true
+		return errors.New("reviewer: transient delete failure")
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+var _ = Describe("REVIEWER: a transient Job delete failure must not wedge the infra retry", func() {
+	It("retries the delete on a later reconcile", func() {
+		ns := i65ansNs("rv-wedge")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		name := "rvwedge"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: s5aLoopSpec()})).To(Succeed())
+		fc := &failJobDeleteOnce{Client: k8sClient}
+		r := &LoopReconciler{Client: fc, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
+		i65ansDrive(r, ns, name)
+		s5aReconcile(r, ns, name)
+		jobName := name + "-verify-1"
+		first := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, first)).To(Succeed())
+		i65ansPlantPod(ns, name, jobName, first, []corev1.ContainerStatus{
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: i65ContainerErrReason}}},
+		})
+		i65ansJobFailed(ns, jobName)
+		s5aReconcile(r, ns, name) // counts attempt 1; the delete fails
+		Expect(fc.failed).To(BeTrue())
+		for range 4 {
+			s5aReconcile(r, ns, name)
+		}
+		cur := &batchv1.Job{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, cur)
+		if err == nil {
+			Expect(cur.UID).NotTo(Equal(first.UID), "the failed Job was never deleted: the Loop is wedged")
+		}
+	})
+})

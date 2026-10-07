@@ -234,7 +234,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 		Expect(fresh.Status.Verify).NotTo(BeNil())
 		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
 			"the attempt count is recorded in status (1: the original attempt)")
-		Expect(string(fresh.Status.Verify.InfraJobUID)).To(Equal(string(firstJob.UID)),
+		Expect(fresh.Status.Verify.InfraJobUID).To(Equal(string(firstJob.UID)),
 			"P1-A: the counted Job UID is recorded (the one-attempt-per-UID guard)")
 		jobGone := i65GetJob(ns, jobName)
 		Expect(jobGone).To(BeNil(), "the failed Job is deleted within the bound (a fresh one is created next reconcile)")

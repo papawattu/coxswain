@@ -186,6 +186,20 @@ type VerifyStatus struct {
 	// +listType=atomic
 	// +optional
 	LastCheckResults []*int32 `json:"lastCheckResults,omitempty"`
+
+	// infraAttempts is the number of verify Job attempts the operator has made
+	// for this verifiedCommit after a verify INFRASTRUCTURE failure (I65):
+	// a trusted init (clone-base / import-agent) terminated non-zero, or the
+	// Job went Failed with no check ever running. It is a per-verified-commit
+	// attempt count, exactly like tamperExitCode and lastCheckResults: it
+	// rides the pin's evidence record and is NOT an iteration (an infra failure
+	// says nothing about the agent's work and must not burn a
+	// maxIterations cycle). The operator recreates the Job a bounded number of
+	// times (the verifyInfraRetries cap, the controller's constant) and fails
+	// the Loop with the VerifyInfraFailed reason once the bound is exhausted.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	InfraAttempts int32 `json:"infraAttempts,omitempty"`
 }
 
 // CurrentVerifyStatus is the operator's pin of the current iteration's verified

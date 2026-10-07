@@ -838,6 +838,17 @@ const (
 	verifySucceeded
 	verifyIterate
 	verifyTampered
+	// verifyInfraFailed: the verify Job died BEFORE the evidence inits ran —
+	// the Job condition is Failed with no check container ever terminating, or
+	// a trusted init (clone-base / import-agent) terminated non-zero. A Failed
+	// Job otherwise wedges the Loop in Verifying forever (I65: the Job goes
+	// Failed at the backoffLimit, nothing decides, the Loop never leaves
+	// Verifying). It is an INFRA failure (a DNS flake, a missing PVC, a broken
+	// fetch — the P2h G2 run: clone-base exit 128 on a transient kind DNS
+	// timeout), not the agent's work: the caller recreates the Job a bounded
+	// number of times (status.verifyInfraAttempts), then fails the Loop with
+	// the distinct VerifyInfraFailed reason.
+	verifyInfraFailed
 )
 
 // verifyOutcome reads the pod's init statuses and returns the outcome. A
@@ -848,9 +859,46 @@ const (
 // commit is a build artifact), 'artifact' itself (the progress then reads
 // 'check-failed: artifact (exit 1)'; the offending paths are in the pod's
 // terminated message — the operator's evidence).
-func verifyOutcome(pod *corev1.Pod, checkCount int) (int, bool, string, int32) {
+//
+// I65: a trusted init (clone-base / import-agent) that TERMINATED non-zero is
+// an infra failure (verifyInfraFailed, naming the failed container) — the
+// checks never ran, so the failure says nothing about the agent's work. A
+// trusted init that is still Running or Waiting is NOT a failure (the I49
+// norm): no decision, requeue. A Job that went Failed (batch condition) with
+// no check ever terminating is an infra failure too (the caller decides the
+// bounded retry), even when the pod's statuses alone do not explain the
+// failure (e.g. the pod was evicted or OOM-killed between the init and the
+// evidence).
+func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool) (int, bool, string, int32) {
 	if pod == nil {
+		// No pod at all: no decision yet unless the Job itself is Failed
+		// (a failed Job whose pod is gone — evicted, garbage-collected — is
+		// still a decision: the evidence was never produced).
+		if jobFailed {
+			return verifyInfraFailed, false, "", 0
+		}
 		return verifyNoDecision, true, "", 0
+	}
+	// I65: the trusted inits (clone-base, import-agent) run BEFORE the evidence
+	// inits. A terminated non-zero trusted init is an infra failure naming the
+	// failed container — the checks never ran. A trusted init still Running or
+	// Waiting is PENDING (no decision, requeue — the I49 norm: in-progress is
+	// never a failure).
+	for j := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[j]
+		if ics.Name != verifyCloneBaseInit && ics.Name != verifyImportAgentInit {
+			continue
+		}
+		if ics.State.Terminated != nil && ics.State.Terminated.ExitCode != 0 {
+			return verifyInfraFailed, false, ics.Name, ics.State.Terminated.ExitCode
+		}
+		if ics.State.Terminated == nil {
+			// Still Running or Waiting: the evidence inits cannot have started.
+			// No decision, requeue — even if the Job condition is already Failed
+			// (a backoff-retry is in flight for a Never-restart Job the pod is
+			// still settling; the next poll decides).
+			return verifyNoDecision, true, "", 0
+		}
 	}
 	// Find the tamper init.
 	tamperIdx := -1
@@ -978,8 +1026,21 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		logf.FromContext(ctx).Error(err, "verify pod read failed; requeueing", "loop", loop.Name)
 		return true, true
 	}
+	// I65: the Job's batch condition is the Job-level failure evidence the pod
+	// statuses alone may not carry (a Failed Job can have a pod whose init
+	// statuses do not explain the failure — evicted, OOM-killed between the
+	// init and the evidence, or the pod is already gone). A Failed Job with
+	// no check evidence is an infra failure, not the agent's work.
+	job, jobFailed, jobErr := r.getVerifyJob(ctx, loop)
+	if jobErr != nil {
+		// A Job read failure is a transient read problem, not a decision:
+		// requeue (the readVerifyJobPod pattern — a failed pod read logs and
+		// requeues, never a controller error and never a phase change).
+		logf.FromContext(ctx).Error(jobErr, "verify Job read failed; requeueing", "loop", loop.Name)
+		return true, true
+	}
 	checkCount := len(loop.Spec.Verify.AcceptanceChecks)
-	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount)
+	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount, jobFailed)
 	if requeue {
 		return false, true
 	}
@@ -988,6 +1049,18 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		return true, false
+	case verifyInfraFailed:
+		// I65: the verify infrastructure failed (a trusted init died, or the
+		// Job went Failed with no check evidence) BEFORE the evidence ran. The
+		// failure says nothing about the agent's work, so it must not burn an
+		// iteration (no Verifying -> Implementing iterate). The operator
+		// recreates the Job a bounded number of times (status.verify
+		// .infraAttempts, the verifyInfraRetries cap — the retry is a NEW Job
+		// with a fresh name, the B3b pattern: the operator never mutates a
+		// running Job); when the bound is exhausted the Loop is Failed with the
+		// distinct VerifyInfraFailed reason (a Warning Event on the final
+		// failure and per retry, so the wedge that I65 fixes is observable).
+		return r.applyVerifyInfraFailure(ctx, loop, job, failedCheck, checkExitCode)
 	case verifyIterate:
 		// P2e stall gate (evaluated BEFORE the budget/maxIterations cap —
 		// stall wins: a capped loop that is ALSO stalled is Failed:Stalled,
@@ -1071,4 +1144,163 @@ func (r *LoopReconciler) emitVerifyIteratedEvent(loop *coxv1alpha1.Loop, from co
 	r.Recorder.Eventf(loop, corev1.EventTypeNormal, verifyIteratedReason,
 		"phase advanced %s -> %s (iteration %d, %s exit %d)",
 		from, loop.Status.Phase, nextIter, failedCheck, checkExitCode)
+}
+
+// I65: the bounded verify-infrastructure retry. A verify Job that failed
+// BEFORE the evidence inits (a trusted init non-zero, or a Failed Job with no
+// check run) is an infra failure — a transient kind DNS flake is the P2h G2
+// example (clone-base exit 128), not the agent's work. The operator retries
+// by recreating the Job a bounded number of times (the retry is a NEW Job
+// with a fresh name, the B3b pattern: the operator never mutates a running
+// Job); an exhausted bound fails the Loop with the distinct
+// VerifyInfraFailed reason. The attempt count rides status.verify.infraAttempts
+// (it survives the pin clear — it is per-verified-commit evidence binding,
+// exactly like tamperExitCode and lastCheckResults), and a Warning Event is
+// emitted per retry and on the final failure, so the wedge I65 fixes is
+// observable.
+const (
+	// verifyInfraRetries is the bounded retry count for a verify infra
+	// failure: 1 original attempt + 2 recreations = 3 total runs before the
+	// Loop is Failed:VerifyInfraFailed. The bound keeps a persistently broken
+	// clone (an unreachable repo, a bad baseCommit) from recreating the Job
+	// forever, and the recreate does not burn a maxIterations iteration
+	// (an infra failure says nothing about the agent's work).
+	verifyInfraRetries = 2
+	// verifyInfraFailedReason is the Failed condition reason when the verify
+	// infrastructure retries are exhausted (I65): distinct from
+	// MaxIterationsExceeded (the agent's checks failed) and
+	// TamperedVerify (a protected path changed) — an infra failure is none of
+	// those.
+	verifyInfraFailedReason = "VerifyInfraFailed"
+	// verifyInfraRetryEventReason / verifyInfraFinalEventReason are the stable
+	// Warning Event reasons for the infra retry and the final failure (P2g
+	// auditability: every state change has an Event).
+	verifyInfraRetryEventReason = "VerifyInfraRetry"
+	verifyInfraFinalEventReason = "VerifyInfraFailed"
+)
+
+// getVerifyJob reads the Loop's verify Job for the current iteration and
+// reports whether the Job's batch conditions say it has Failed (the
+// Job-level failure evidence the pod statuses alone may not carry — I65).
+// A NotFound Job is NOT an error: it simply means no Job yet (no pod, no
+// evidence — the operator recreates it next reconcile via ensureVerifyJob).
+func (r *LoopReconciler) getVerifyJob(ctx context.Context, loop *coxv1alpha1.Loop) (*batchv1.Job, bool, error) {
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: verifyJobName(loop), Namespace: loop.Namespace}, job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	failed := false
+	if c := jobCondition(job, batchv1.JobFailed); c != nil && c.Status == corev1.ConditionTrue {
+		failed = true
+	}
+	return job, failed, nil
+}
+
+// jobCondition returns the Job's batch condition of the given type (nil when
+// absent). The Job conditions are the batch controller's Job-level evidence
+// (JobFailed is the condition that fires when the backoffLimit is hit) — the
+// pod statuses alone do not always explain a failed Job (the pod may be
+// evicted or gone between the failure and the operator's read).
+func jobCondition(job *batchv1.Job, t batchv1.JobConditionType) *batchv1.JobCondition {
+	for i := range job.Status.Conditions {
+		if job.Status.Conditions[i].Type == t {
+			return &job.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// verifyInfraFailureMessage builds the human-readable failure message for the
+// VerifyInfraFailed condition / Events: it names the failed container and its
+// exit code when the pod statuses carry them, and falls back to the Job-level
+// failure (no container named) when the pod is gone or its statuses do not
+// explain the failure (a Failed Job with no terminated init — the
+// no-check-ran case).
+func verifyInfraFailureMessage(failedCheck string, checkExitCode int32) string {
+	if failedCheck == "" {
+		return "the verify Job failed before the acceptance checks ran (no check init terminated; the Job condition is Failed) — the verify infrastructure failed, not the agent's work"
+	}
+	return fmt.Sprintf("trusted verify init %s failed (exit %d) before the acceptance checks ran — the verify infrastructure failed, not the agent's work", failedCheck, checkExitCode)
+}
+
+// applyVerifyInfraFailure is the I65 bounded-retry decision for a verify
+// infra failure. It is reached from applyVerifyOutcome when verifyOutcome
+// returns verifyInfraFailed (a trusted init terminated non-zero, or the Job
+// is Failed with no check evidence). It:
+//
+//  1. increments status.verify.infraAttempts (the per-verified-commit
+//     attempt count — it survives the pin clear because the pin is cleared
+//     only at an ITERATE, which never runs for an infra failure),
+//  2. emits a Warning Event naming the failure (per retry, and the final
+//     failure carries the same Event with the exhaustion noted),
+//  3. while the attempt count is within the bound (verifyInfraRetries
+//     recreations), deletes the failed Job so ensureVerifyJob recreates a
+//     fresh one (a NEW Job with a fresh name — the operator never mutates a
+//     running Job) and requeues; and
+//  4. once exhausted, fails the Loop with the distinct
+//     VerifyInfraFailed reason (the Failed condition, phase Failed, the
+//     Warning Event).
+//
+// It returns (changed, requeue) like applyVerifyOutcome's other branches. A
+// failed delete is returned as an error so the reconcile retries (the attempt
+// count is already persisted in status by the caller's shared Status
+// Update, so a re-reconcile does not double-count — the next poll of the
+// same failed Job sees the incremented count and proceeds to the next
+// decision). It receives the verify Job already fetched by the caller
+// (applyVerifyOutcome — nil when it was NotFound; nothing to delete, the
+// recreate is the next reconcile's ensureVerifyJob).
+func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv1alpha1.Loop, job *batchv1.Job, failedCheck string, checkExitCode int32) (bool, bool) {
+	if loop.Status.Verify == nil {
+		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
+	}
+	loop.Status.Verify.InfraAttempts++
+	attempt := loop.Status.Verify.InfraAttempts
+	msg := verifyInfraFailureMessage(failedCheck, checkExitCode)
+	if attempt > verifyInfraRetries {
+		// Exhausted: fail the Loop with the distinct reason. The bound is
+		// verifyInfraRetries RECREATIONS (the original attempt is attempt 1),
+		// so attempt verifyInfraRetries+1 is the last allowed run — a failure
+		// on it (or beyond, a re-read of a Job that outlived its bound) is the
+		// final failure.
+		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+			verifyInfraFailedReason,
+			fmt.Sprintf("verify infrastructure failed after %d attempts (%s)", attempt, msg))
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, verifyInfraFinalEventReason,
+				"verify infrastructure failed after %d attempts: %s", attempt, msg)
+		}
+		return true, false
+	}
+	// Within the bound: recreate the Job (a NEW Job, fresh name) and requeue.
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, verifyInfraRetryEventReason,
+			"verify infrastructure failed (attempt %d of %d); recreating the verify Job: %s",
+			attempt, verifyInfraRetries+1, msg)
+	}
+	jobName := verifyJobName(loop)
+	if job == nil {
+		// The Job is already gone (deleted externally or garbage-collected):
+		// ensureVerifyJob recreates it next reconcile — nothing to delete.
+		return true, true
+	}
+	// Background propagation deletes the Job's pods with it (the D27 pattern:
+	// the apiserver's default ORPHAN propagation leaves the stale Job's pods
+	// in place without a GC, and the pod would carry the failed init statuses
+	// into the new Job's read-back). The fresh Job is created on the next
+	// reconcile (the name is still taken until the apiserver deletes async —
+	// the same requeue dance the D27 stale-guard uses).
+	if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		// A delete failure is transient: the attempt count is already persisted,
+		// so the next reconcile sees the same failed Job and the same count and
+		// retries the delete (never a controller error, never a wedge).
+		logf.FromContext(ctx).Error(err, "failed to delete verify Job for recreate; requeueing", "job", jobName)
+		return true, true
+	}
+	logf.FromContext(ctx).Info("verify Job failed before the checks; recreating", "loop", loop.Name, "job", jobName, "attempt", attempt)
+	return true, true
 }

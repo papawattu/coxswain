@@ -1304,39 +1304,28 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 	// the Job UID: increment infraAttempts only when the failing Job's UID
 	// differs from the one already recorded (infraJobUID). A recreated Job has
 	// a new UID, so its first infra-failure IS counted (the retry), while a
-	// re-read of the same failing Job is not. When job is nil (the Job is
-	// already gone — deleted externally or GC'd), the failure is the stale
-	// pod of a Job that no longer exists; it is still counted once (the UID is
-	// the Loop's last-seen Job, recorded on the increment) so the bound is
-	// not skipped, but it is NOT counted again on a re-read (the UID is now
-	// recorded).
+	// re-read of the same failing Job is not.
 	var jobUID types.UID
 	if job != nil {
 		jobUID = job.UID
 	} else {
 		// The Job is gone: use the recorded UID if present (a re-read of a
-		// failure whose Job was already deleted — do not double-count), or
-		// fall back to a sentinel that is never equal to a real UID (a fresh
-		// failure with no Job to read — count it once). The empty-string
-		// sentinel is safe: a real Job UID is a non-empty UUID, so an empty
-		// recorded UID means "count the next failure" and a non-empty one
-		// means "already counted this Job".
+		// failure whose Job was already deleted — do not double-count).
 		jobUID = types.UID(loop.Status.Verify.InfraJobUID)
 	}
-	alreadyCounted := string(jobUID) == loop.Status.Verify.InfraJobUID && loop.Status.Verify.InfraJobUID != ""
-	if !alreadyCounted {
-		loop.Status.Verify.InfraAttempts++
-		if job != nil {
-			loop.Status.Verify.InfraJobUID = string(job.UID)
-		} else if loop.Status.Verify.InfraJobUID == "" {
-			// No Job to read (already gone): record a sentinel so a re-read of
-			// the same failure is not counted again. Use the job name as the
-			// sentinel (a recreated Job has a different... name is the same, but
-			// the UID is new, so the next real failure gets a fresh count). In
-			// practice job is non-nil on the infra-failure path (the Job is
-			// present and failing); this branch is the defensive stale-pod case.
-			loop.Status.Verify.InfraJobUID = "(job-gone)"
-		}
+	if string(jobUID) == loop.Status.Verify.InfraJobUID && loop.Status.Verify.InfraJobUID != "" {
+		// A re-read of the same failing Job (the reconcile re-ran before the
+		// delete completed, or the GC has not yet removed the Job): the attempt
+		// is already counted. Return early — requeue (the Job is still there and
+		// will be deleted on the next reconcile), no Event, no re-delete (the
+		// Job is already Terminating or the GC is removing it; a re-delete is a
+		// no-op at best and a transient API error at worst).
+		logf.FromContext(ctx).Info("verify Job re-read (same UID); skipping (already counted)", "loop", loop.Name, "jobUID", jobUID, "attempt", loop.Status.Verify.InfraAttempts)
+		return true, true
+	}
+	loop.Status.Verify.InfraAttempts++
+	if job != nil {
+		loop.Status.Verify.InfraJobUID = string(job.UID)
 	}
 	attempt := loop.Status.Verify.InfraAttempts
 	msg := verifyInfraFailureMessage(failedCheck, checkExitCode)

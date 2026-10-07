@@ -276,7 +276,7 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							RestartPolicy: corev1.RestartPolicyNever,
-							Containers:    []corev1.Container{{Name: verifyMainContainer, Image: "busybox"}},
+							Containers:    []corev1.Container{{Name: verifyMainContainer, Image: verifyBusybox}},
 						},
 					},
 				},
@@ -296,12 +296,12 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 				Labels:    map[string]string{"job-name": jobName, verifyForLabel: loopName},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName,
 					UID:        job.UID,
 				}},
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyMainContainer, Image: "busybox"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyMainContainer, Image: verifyBusybox}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{

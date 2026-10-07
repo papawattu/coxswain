@@ -208,7 +208,7 @@ func s5aVerifyPodMultiCheck(ctx context.Context, ns, name, jobName string, check
 			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: batchv1.SchemeGroupVersion.String(),
-				Kind:       "Job",
+				Kind:       i65JobKind,
 				Name:       jobName,
 				UID:        job.UID,
 			}},
@@ -325,7 +325,7 @@ func s5aVerifyPod(ctx context.Context, ns, name, jobName string, checkExit int32
 			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: batchv1.SchemeGroupVersion.String(),
-				Kind:       "Job",
+				Kind:       i65JobKind,
 				Name:       jobName,
 				UID:        job.UID,
 			}},
@@ -712,7 +712,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName,
 					UID:        job.UID,
 				}},
@@ -776,7 +776,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 					Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 					OwnerReferences: []metav1.OwnerReference{{
 						APIVersion: batchv1.SchemeGroupVersion.String(),
-						Kind:       "Job",
+						Kind:       i65JobKind,
 						Name:       jobName,
 						UID:        job.UID,
 					}},
@@ -906,7 +906,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName,
 					UID:        job.UID,
 				}},
@@ -962,7 +962,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName,
 					UID:        job.UID,
 				}},
@@ -1083,7 +1083,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName,
 					UID:        job.UID,
 				}},
@@ -1162,7 +1162,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName,
 					UID:        job.UID,
 				}},

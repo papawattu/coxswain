@@ -395,12 +395,12 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 				job.Annotations[verifyCommitAnnotation] = p2gHeadCommit
 				Expect(k8sClient.Update(ctx, job)).To(Succeed())
 			}
-			// The pod's ownerReference carries the Job's UID (readVerifyJobPod
-			//'s I65 UID filter requires it — a pod from a prior Job's UID, or
+			// The pod's ownerReference carries the Job's UID (readVerifyJobPod's
+			// I65 UID filter requires it — a pod from a prior Job's UID, or
 			// without an ownerReference, is a stale pod and is not read).
 			pod.OwnerReferences = []metav1.OwnerReference{{
 				APIVersion: batchv1.SchemeGroupVersion.String(),
-				Kind:       "Job",
+				Kind:       i65JobKind,
 				Name:       jobName,
 				UID:        job.UID,
 			}}

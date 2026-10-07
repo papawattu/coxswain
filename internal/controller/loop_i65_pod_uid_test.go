@@ -50,10 +50,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/record"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
+
+// i65FinalizerSpec is the finalizer used by the per-UID-guard spec (keeps the
+// Job Terminating so the operator's delete does not remove it immediately).
+const i65FinalizerSpec = "i65.test/finalizer"
 
 var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID (P1-A)", func() {
 	ctx := context.Background()
@@ -132,7 +137,7 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName + "-prior",
 					UID:        priorJob.UID,
 				}},
@@ -141,7 +146,7 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: "Error"}}},
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: i65ContainerErrReason}}},
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
@@ -178,7 +183,7 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 
 		By("failing clone-base (exit 128, the DNS-flake shape) and marking the Job Failed")
 		i65ansPlantPod(ns, name, jobName, firstJob, []corev1.ContainerStatus{
-			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: "Error"}}},
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: i65ContainerErrReason}}},
 		})
 		i65ansJobFailed(ns, jobName)
 
@@ -201,7 +206,7 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 		// Job were re-read (the reconcile re-running before the delete
 		// completes), applyVerifyInfraFailure's UID guard counts at most one
 		// attempt per Job UID.
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			again := s5aReconcile(r, ns, name)
 			Expect(again.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 				"re-read %d: the stale failed pod must not burn another attempt (phase stays Verifying)", i+1)
@@ -210,8 +215,8 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 					// The read path (readVerifyJobPod's UID filter) excludes the stale
 					// pod (its Job is gone), so no infra failure is read and the
 					// count cannot move. (The defensive UID guard inside
-						// applyVerifyInfraFailure covers the re-read BEFORE the delete
-						// completes; the read-path filter is what runs here.)
+					// applyVerifyInfraFailure covers the re-read BEFORE the delete
+					// completes; the read-path filter is what runs here.)
 					"re-read %d: infraAttempts stays 1 (the stale pod is not read)", i+1)
 			}
 		}
@@ -226,6 +231,81 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 		// delete+recreate necessarily produces a new UID).
 		Expect(string(retryJob.UID)).NotTo(Equal(string(firstJob.UID)),
 			"the retried Job has a new UID (a NEW Job, not a mutation of the failed one)")
+	})
+
+	It("the per-UID guard counts at most ONE attempt even when the Job is still Terminating (the GC has not removed it)", func() {
+		ns := i65ansNs("i65ans-term")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "i65ansterm"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		recorder := record.NewFakeRecorder(64)
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		i65ansDrive(r, ns, name)
+		s5aReconcile(r, ns, name)
+		jobName := name + "-verify-1"
+		firstJob := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, firstJob)).To(Succeed())
+
+		// Add a finalizer to the Job so the operator's delete leaves it
+		// Terminating (the GC has not removed it yet). The UID is unchanged
+		// (a finalizer does not change the UID).
+		firstJob.Finalizers = append(firstJob.Finalizers, i65FinalizerSpec)
+		Expect(k8sClient.Update(ctx, firstJob)).To(Succeed())
+
+		By("failing clone-base (exit 128, the DNS-flake shape) and marking the Job Failed")
+		i65ansPlantPod(ns, name, jobName, firstJob, []corev1.ContainerStatus{
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: i65ContainerErrReason}}},
+		})
+		i65ansJobFailed(ns, jobName)
+
+		By("reconciling: the operator deletes the failed Job (it stays Terminating due to the finalizer) and counts attempt 1")
+		fresh := s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"a within-bound infra failure is a retry, never a fail (phase stays Verifying)")
+		Expect(fresh.Status.Verify).NotTo(BeNil())
+		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+			"the attempt count is 1 (the original attempt)")
+		Expect(fresh.Status.Verify.InfraJobUID).To(Equal(string(firstJob.UID)),
+			"the counted Job's UID is recorded (the one-attempt-per-UID guard)")
+
+		By("reconciling 3 more times with the SAME Job still present (Terminating, same UID): NO second attempt is counted")
+		// The Job is still there (the finalizer keeps it Terminating). The
+		// operator's UID guard (the early return when alreadyCounted) must
+		// prevent a second count.
+		for i := range 3 {
+			again := s5aReconcile(r, ns, name)
+			Expect(again.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+				"re-read %d: the Terminating Job must not burn another attempt (phase stays Verifying)", i+1)
+			if again.Status.Verify != nil {
+				Expect(again.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+					"re-read %d: infraAttempts stays 1 (the per-UID guard)", i+1)
+				Expect(again.Status.Verify.InfraJobUID).To(Equal(string(firstJob.UID)),
+					"re-read %d: infraJobUID is unchanged (the same Job UID)", i+1)
+			}
+		}
+
+		By("removing the finalizer: the Job is now GC'd and the retried Job is created")
+		// Remove the finalizer so the Job can be deleted.
+		finalJob := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, finalJob)).To(Succeed())
+		finalJob.Finalizers = nil
+		Expect(k8sClient.Update(ctx, finalJob)).To(Succeed())
+		// Delete the Job (the operator already tried; the finalizer removed
+		// the block). The Job may already be gone (the operator deleted it
+		// earlier, and the finalizer was removed), so a "not found" error is
+		// acceptable.
+		err := k8sClient.Delete(ctx, finalJob)
+		Expect(err == nil || apierrors.IsNotFound(err)).To(BeTrue(),
+			"the Job is deleted (or already gone)")
+		// Reconcile to trigger the recreate.
+		fresh = s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"the retried Job is created (the phase stays Verifying)")
 	})
 })
 
@@ -273,7 +353,7 @@ func i65ansPlantPod(ns, name, jobName string, job *batchv1.Job, inits []corev1.C
 			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: batchv1.SchemeGroupVersion.String(),
-				Kind:       "Job",
+				Kind:       i65JobKind,
 				Name:       jobName,
 				UID:        job.UID,
 			}},

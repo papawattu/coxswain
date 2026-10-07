@@ -75,6 +75,9 @@ import (
 const (
 	i65JobFailedReason    = "BackoffLimitExceeded"
 	i65ContainerErrReason = "Error"
+	// i65JobKind is the OwnerReference.Kind for the verify Job's pods (the
+	// batch Job controller stamps the owning Job's Kind + UID on each pod).
+	i65JobKind = "Job"
 )
 
 var _ = Describe("I65: a verify Job that fails before the checks no longer wedges the Loop", func() {
@@ -132,7 +135,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       "Job",
+					Kind:       i65JobKind,
 					Name:       jobName,
 					UID:        job.UID,
 				}},
@@ -247,7 +250,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 		// the stale-pod re-read). The operator's ensureVerifyJob creates a
 		// fresh Job (a new UID); readVerifyJobPod filters to the new Job's
 		// UID, so the stale pod (the first Job's UID) is not re-read.
-		for i := 0; i < 4; i++ {
+		for range 4 {
 			again := s5aReconcile(r, ns, name)
 			Expect(again.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 				"P1-A: the stale pod must not re-count an attempt (phase stays Verifying, no failure)")
@@ -509,7 +512,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 			// The Job is not created yet (the name is taken by pin A's deleted
 			// Job, or the reconcile has not run ensureVerifyJob). Reconcile to
 			// trigger the create.
-			fresh = s5aReconcile(r, ns, name)
+			_ = s5aReconcile(r, ns, name)
 			jobB = i65GetJob(ns, jobName2)
 		}
 		Expect(jobB).NotTo(BeNil(), "pin B's verify Job exists (a fresh one for the new pin)")

@@ -457,7 +457,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		By("a failed push (exit 1) is Delivered=False reason DeliveryFailed (terminal: no retry)")
 		s6DeliverPod(ns, name, corev1.ContainerState{
-			Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: i65ContainerErrReason},
 		})
 		loop = s6Reconcile(r, ns, name)
 		Expect(loop.Status.Delivery).To(BeNil(), "a failed deliver must record no status.delivery")

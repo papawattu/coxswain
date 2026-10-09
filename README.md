@@ -207,6 +207,16 @@ assumed was closed. To close it, apply the cluster-hardening checklist below.
    Coxswain already sets `automountServiceAccountToken: false` on the agent
    pod spec. Verify that no other mechanism (a mutating webhook, a
    ClusterRoleBinding, etc.) grants the agent a token.
+5. **KubeArmor BPF-LSM for the DNS fence (tool proxies).**
+   The tool proxy's KubeArmor `matchDNSQueries` fence (the inner egress fence
+   that restricts the proxy's DNS to the upstream host + platform DNS)
+   can only be enforced on clusters with BPF-LSM active (the
+   `SOCKET_SENDMSG` hook) — not yet verified on such a cluster. On clusters
+   without BPF-LSM (e.g. kind on certain kernels), the fence is **not
+   enforced**, and the only thing keeping the tool proxy's egress on the
+   configured upstream is the proxy's own code (it dials the fixed upstream
+   host only). This is an accepted limitation (D50, R23 I64);
+   see [docs/adr/0008-tool-proxies.md](docs/adr/0008-tool-proxies.md).
 
 See [docs/adr/0006-agent-isolation-and-zero-credentials.md](docs/adr/0006-agent-isolation-and-zero-credentials.md)
 for the full rationale.

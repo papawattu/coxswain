@@ -22,6 +22,51 @@ removals are cleaned up correctly.
 
 ## The one-time fix
 
+**Precondition:** the upgraded operator must have reconciled every Loop at
+least once, so that every **live** tool netpol has been labelled in place
+by `createOrUpdateNP` (`internal/controller/loop_controller.go:3946`).
+Verify this before running the delete:
+
+```bash
+# For each Loop in the namespace: confirm its live tool netpols carry the
+# coxswain.io/tool-proxy-for label. A live tool netpol WITHOUT the label
+# means the operator has not yet reconciled that Loop (or the tool was just
+# added post-upgrade) — do NOT delete anything until every live tool netpol
+# is labelled.
+NS=<ns>
+kubectl -n $NS get networkpolicy \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.coxswain\.io/tool-proxy-for}{"\n"}{end}' \
+  | awk '{print $1}' \
+  | grep -E '\-tool\-.*\-netpol$' \
+  | while read np; do
+      loop=$(kubectl -n $NS get networkpolicy "$np" -o jsonpath='{.metadata.labels.coxswain.io/tool-proxy-for}')
+      tool=$(echo "$np" | sed 's/.*-tool-//; s/-netpol//')
+      # Check if this tool is in the Loop's effective policy:
+      in_policy=$(kubectl -n $NS get agentpolicy -o json 2>/dev/null | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+found=False
+for ap in data.get('items',[]):
+  for t in ap.get('spec',{}).get('tools',[]):
+    if t.get('name')=='$tool': found=True
+print('yes' if found else 'no')
+" 2>/dev/null || echo "unknown")
+      if [ -z "$loop" ] && [ "$in_policy" = "yes" ]; then
+        echo "  [WARN] $np: tool '$tool' is in the policy but the netpol is UNLABELLED — the operator has not reconciled this Loop yet. DO NOT run the delete until this is labelled."
+      elif [ -z "$loop" ]; then
+        echo "  [OK] $np: tool '$tool' is NOT in the policy (leaked, safe to delete)"
+      else
+        echo "  [OK] $np: labelled (loop=$loop)"
+      fi
+    done
+```
+
+**Do not run the delete until the precondition above passes** (every live
+tool netpol is labelled; any unlabelled tool netpol is for a tool no
+longer in the policy). If the precondition does not pass, trigger a
+reconcile (e.g. `kubectl -n $NS get loop <loop> -o json | kubectl
+apply -f -`) and re-check.
+
 Delete the pre-D41d tool netpols for tools that are no longer in the
 policy. A tool netpol is safe to delete **only if** its tool is absent from
 the Loop's effective policy (the union of `spec.policyRefs[].spec.tools`):

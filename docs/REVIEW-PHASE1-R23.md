@@ -66,7 +66,7 @@ settled before Loops run against real tools or for long unattended stretches.
 
 ### I64. Tool-proxy egress is not fenced by DNS on clusters without BPF-LSM
 
-- [ ] Open (**owner decision**)
+- [x] Open (**owner decision**) — fixed in PR #90 (commit `c2d357c`): ADR-0008 and README softened to "expected, not yet verified" on BPF-LSM clusters
 
 **Owner decision (2026-10-07), D50 = (a):** accept the gap and document it as a
 limitation of clusters without BPF-LSM. No fail-closed hold and no IP pinning
@@ -157,7 +157,7 @@ to a project scope that excludes coxswain), then restarts pi.
 
 ### I67. TDD-PLAN-PHASE2 corrections found on kind
 
-- [ ] Open (docs)
+- [x] Open (docs) — fixed in `73c2c5d` (PR #91, merged)
 
 **Where:** `docs/TDD-PLAN-PHASE2.md` (P2e "The normaliser" input; P2h fixture).
 
@@ -207,7 +207,7 @@ the hard way on kind.
 
 ### I69. Re-run P2h's G1/G2 gate mutations on the final script
 
-- [ ] Open (evidence)
+- [x] Open (evidence) — fixed in PR #94 (closed): G1 `1:fail` (digest `25979d90…`), G2 `2:fail` + `5:fail` cascade (digest `33a43223…`), both from `456a209`'s script. Assertion 4 passes under G2 (suspend pause/resume is a separate code path from the budget gate).
 
 **Where:** `.samples/p2h/mutations.md`; `test/e2e/p2-e2e.sh`.
 
@@ -228,7 +228,7 @@ digests, in the record.
 
 ### I70. Upgrade note: tool netpols created before D41d aren't cleaned up
 
-- [ ] Open (docs)
+- [x] Open (docs) — fixed in PR #92 (commit `d9abfaa`): UPGRADE.md rewritten with the correct mechanism (label-in-place, not recreate) + a safe per-netpol classifier command, shown working on kind
 
 **Where:** `internal/controller/loop_controller.go` (`toolProxyForLabel`, the
 label-based stale cleanup).
@@ -245,7 +245,7 @@ one-time adoption by name.
 
 ### I71. Housekeeping
 
-- [ ] Open (filler)
+- [x] Open (filler) — fixed in PR #93 (commit `6a37595`): stale `.gnosis` inbox note deleted, `docker image prune` + `P2H_LOOP_COUNT` knob added, if/fi nesting fixed, NOT RUN for reduced runs
 
 - **A stale `.gnosis` inbox note:**
   `.gnosis/inbox/d38-external-positive-control-broken.md` asks how to fix

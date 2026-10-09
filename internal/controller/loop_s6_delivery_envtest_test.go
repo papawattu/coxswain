@@ -159,6 +159,42 @@ func s6GetJob(ns, name string) *batchv1.Job {
 	return job
 }
 
+// s6ReadyEgressProxy drives reconcile until the operator's egress proxy pod
+// is stable (no spec drift) and owned by the Loop, then marks it Ready
+// (envtest has no kubelet). The I72 gate (the deliver Job is held until the
+// egress proxy is Ready when delivery traverses the proxy) needs this for
+// any spec that asserts on the deliver Job for an external (github.com)
+// delivery. In-cluster (Gitea .svc) deliveries are not gated (the direct
+// repo-peer path) and do not need this.
+func s6ReadyEgressProxy(r *LoopReconciler, ns, name string) {
+	ctx := context.Background()
+	var podUID types.UID
+	for range 30 {
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		pod := &corev1.Pod{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: egressProxyPodName(name), Namespace: ns}, pod); err == nil &&
+			metav1.IsControlledBy(pod, loop) {
+			if podUID != "" && pod.UID == podUID {
+				break // stable across two reconciles
+			}
+			podUID = pod.UID
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	Expect(podUID).ToNot(Equal(types.UID("")),
+		"the operator's egress proxy pod must exist and be owned by the Loop")
+	pod := &corev1.Pod{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: egressProxyPodName(name), Namespace: ns}, pod)).To(Succeed())
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionTrue,
+	}}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
 // s6RequireNoJob asserts the deliver Job is absent.
 func s6RequireNoJob(ns, name string) {
 	job := &batchv1.Job{}
@@ -875,6 +911,10 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		name := "gh1"
 		r := s6Succeeded(name, ns, githubRepoURL)
+		// I72: the deliver Job is held until the egress proxy is Ready when
+		// delivery traverses the proxy (github.com is external). Mark the
+		// operator's egress proxy pod Ready so the Job is created.
+		s6ReadyEgressProxy(r, ns, name)
 		s6Reconcile(r, ns, name)
 		job := s6GetJob(ns, name)
 		_, push := s6JobContainers(job)
@@ -961,6 +1001,10 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		name := "delivext1"
 		r := s6Succeeded(name, ns, githubRepoURL)
+		// I72: the deliver Job is held until the egress proxy is Ready when
+		// delivery traverses the proxy (github.com is external). Mark the
+		// operator's egress proxy pod Ready so the Job is created.
+		s6ReadyEgressProxy(r, ns, name)
 		s6Reconcile(r, ns, name)
 		_, push := s6JobContainers(s6GetJob(ns, name))
 

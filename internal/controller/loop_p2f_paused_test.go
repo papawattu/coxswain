@@ -570,12 +570,30 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		loopC := createLoop(ns, "p2f-s9c", func(l *coxv1alpha1.Loop) {
 			l.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest}
 		})
+		// I72: the deliver Job is held until the egress proxy is Ready when
+		// delivery traverses the proxy (testWorkspace's repo is external). The
+		// in-flight deliver Job is what item-F's refusal keys on, so the spec
+		// must get one: create an AgentPolicy with a network allow (the egress
+		// proxy is only needed when the effective policy has network allows,
+		// I42b), reference it, and mark the operator's egress proxy pod Ready
+		// (s6ReadyEgressProxy, shared with the S6 specs).
+		ap := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "p2f-s9c-policy", Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{"example.com:443"}},
+		}
+		Expect(k8sClient.Create(ctx, ap)).To(Succeed())
+		loopC.Spec.PolicyRefs = []string{"p2f-s9c-policy"}
+		Expect(k8sClient.Update(ctx, loopC)).To(Succeed())
 		primeProxy(r, loopC)
 		reconcile(r, ns, "p2f-s9c")
 		setPhase(getLoop(ns, "p2f-s9c"), coxv1alpha1.LoopPhaseSucceeded)
 		lc := getLoop(ns, "p2f-s9c")
 		lc.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: p2fHeadCommit}
 		Expect(k8sClient.Status().Update(ctx, lc)).To(Succeed())
+		reconcile(r, ns, "p2f-s9c")
+		// I72: mark the egress proxy Ready so the deliver Job is created
+		// (in flight) before the suspend refusal is asserted.
+		s6ReadyEgressProxy(r, ns, "p2f-s9c")
 		reconcile(r, ns, "p2f-s9c")
 		By("setting suspend=true on the in-flight Succeeded Loop")
 		setSuspend(ns, "p2f-s9c", true)

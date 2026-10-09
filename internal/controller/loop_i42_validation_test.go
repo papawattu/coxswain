@@ -52,6 +52,10 @@ const (
 	i42eLocalhostAllow     = "localhost:8080"
 	i42ePodCIDRIPAllow     = "10.244.0.5:8080"
 	i42eServiceCIDRIPAllow = "10.96.0.1:443"
+	// i42eGitHubHost is the GitHub API's host:port (the external network allow
+	// the I72 egress-proxy gate tests use). Shared with the I72 specs so a
+	// rename cannot desync them (and the goconst threshold is not hit).
+	i42eGitHubHost = "api.github.com:443"
 )
 
 var _ = Describe("I42e: reject in-cluster network allows", func() {
@@ -305,7 +309,7 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 	})
 
 	It("allows legitimate external hosts and IPs", func() {
-		for _, a := range []string{i42eExternalHost, "8.8.8.8:443", "1.1.1.1:53", "servicewarehouse.example.com:443", "api.github.com:443"} {
+		for _, a := range []string{i42eExternalHost, "8.8.8.8:443", "1.1.1.1:53", "servicewarehouse.example.com:443", i42eGitHubHost} {
 			_, ok := r.findInClusterNetworkAllow([]string{a})
 			Expect(ok).To(BeFalse(), "%s must NOT be flagged as in-cluster", a)
 		}

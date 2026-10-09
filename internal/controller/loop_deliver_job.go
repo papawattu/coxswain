@@ -205,10 +205,11 @@ func deliverJobName(loopName string) string { return derivedName(loopName, "-del
 // Job (create or stale-delete), ensure the deliver pod's NetworkPolicy, and
 // read the push container's termination message back into status.delivery. It
 // returns (requeue, error): requeue is true when the stale-Job guard deleted a
-// Job this reconcile and another reconcile is needed to observe the result —
-// the caller maps it to a 5s RequeueAfter (like the verify stale guard), no
-// retry loop, no controller error. Extracted from Reconcile so the top-level
-// reconcile stays within the gocyclo budget.
+// Job this reconcile, or when the I72 egress-proxy gate held the Job (no Job,
+// no failure — the next reconcile retries the hold), and another reconcile is
+// needed to observe the result — the caller maps it to a 5s RequeueAfter
+// (like the verify stale guard), no retry loop, no controller error. Extracted
+// from Reconcile so the top-level reconcile stays within the gocyclo budget.
 func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	requeue := false
 	if err := r.ensureDeliverRedeliver(ctx, loop); err != nil {
@@ -543,6 +544,28 @@ type deliverOutcome struct {
 func (r *LoopReconciler) ensureDeliverJob(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	if ok, _ := deliveryRequested(loop); !ok {
 		return false, nil
+	}
+	// I72: hold the deliver Job until the egress proxy is Ready when delivery
+	// traverses the proxy. The clone-base container fetches the base ref's
+	// commit over the network (through the egress proxy for an external repo
+	// host); if the proxy pod is not Ready yet, clone-base fails in
+	// milliseconds and delivery goes terminally Delivered=False/
+	// DeliveryFailed (backoffLimit 0, one Job per verifiedCommit — the
+	// operator does not retry). Same gate pattern as the sandbox's I42b gate
+	// (loop_controller.go: the egress proxy pod must be owned by the Loop and
+	// Ready). An in-cluster repo (repoPeer covers the push) keeps the direct
+	// path and needs no proxy, so the gate applies only when the deliver Job
+	// routes through the proxy (deliverNeedsProxyHosts non-empty).
+	if r.deliverNeedsProxyHosts(loop) != "" {
+		egressPod := &corev1.Pod{}
+		errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egressPod)
+		egReady := errE == nil && metav1.IsControlledBy(egressPod, loop) && isPodReady(egressPod)
+		if !egReady {
+			setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
+				coxv1alpha1.ReasonDeliveryInProgress,
+				"deliver Job held: the egress proxy pod is not Ready (clone-base would fail before the proxy is listening)")
+			return true, nil
+		}
 	}
 	jobName := deliverJobName(loop.Name)
 	verified := loop.Status.CurrentVerify.VerifiedCommit

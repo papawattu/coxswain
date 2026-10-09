@@ -66,7 +66,7 @@ settled before Loops run against real tools or for long unattended stretches.
 
 ### I64. Tool-proxy egress is not fenced by DNS on clusters without BPF-LSM
 
-- [x] Open (**owner decision**) — fixed in PR #90 (commit `c2d357c`): ADR-0008 and README softened to "expected, not yet verified" on BPF-LSM clusters
+- [x] Open (**owner decision**) — fixed in PR #90 (squash `0df223f`): ADR-0008 and README softened to "expected, not yet verified" on BPF-LSM clusters
 
 **Owner decision (2026-10-07), D50 = (a):** accept the gap and document it as a
 limitation of clusters without BPF-LSM. No fail-closed hold and no IP pinning
@@ -228,7 +228,7 @@ digests, in the record.
 
 ### I70. Upgrade note: tool netpols created before D41d aren't cleaned up
 
-- [x] Open (docs) — fixed in PR #92 (commit `d9abfaa`): UPGRADE.md rewritten with the correct mechanism (label-in-place, not recreate) + a safe per-netpol classifier command, shown working on kind
+- [x] Open (docs) — fixed in PR #92 (commit `2a87b22`, pending merge): UPGRADE.md rewritten with the correct mechanism (label-in-place, not recreate) + a safe per-netpol classifier command, shown working on kind. The I70 P1 review (jsonpath escaping + label misalignment) is fixed in `2a87b22` (read each netpol's label by name with an escaped jsonpath; kind-verified).
 
 **Where:** `internal/controller/loop_controller.go` (`toolProxyForLabel`, the
 label-based stale cleanup).
@@ -245,7 +245,7 @@ one-time adoption by name.
 
 ### I71. Housekeeping
 
-- [x] Open (filler) — fixed in PR #93 (commit `6a37595`): stale `.gnosis` inbox note deleted, `docker image prune` + `P2H_LOOP_COUNT` knob added, if/fi nesting fixed, NOT RUN for reduced runs
+- [x] Open (filler) — fixed in PR #93 (squash `152a9f8`): stale `.gnosis` inbox note deleted, `docker image prune` + `P2H_LOOP_COUNT` knob added, if/fi nesting fixed, NOT RUN for reduced runs
 
 - **A stale `.gnosis` inbox note:**
   `.gnosis/inbox/d38-external-positive-control-broken.md` asks how to fix

@@ -1242,7 +1242,11 @@ function with golden-file unit tests), (2) the **operator's stall gate**
   `terminationMessagePath` + `terminationMessagePolicy: File` shape; the
   file lives on the check-tmp emptyDir the check containers already mount
   at `/tmp`), and the operator reads it from the pod's
-  `status.initContainerStatuses[].lastState.terminated.terminationMessage`
+  `status.initContainerStatuses[].state.terminated.terminationMessage`
+  (falling back to `lastState.terminated.terminationMessage` for a
+  restarted container; a check init runs once, so its message is in
+  `state.terminated` — PR #82 fixed the code to read `state` first, then
+  `lastState`)
   (kubelet-recorded — the **same** evidence channel as `lastCheckResults`'
   exit codes; **no pod-log read** — the round-1 text's "APIReader log
   path" was never implementable, item 1's correction applies here too).
@@ -1726,8 +1730,10 @@ one-liner that commits a **one-character change to a non-protected file**
 (e.g. appends a newline to `README.md`) every time, so **every iteration
 produces a new commit** (the verify Job re-runs, the iteration advances,
 and the failing check's output is **identical every iteration** — the
-check is `test -f /nonexistent`, which fails with the same message
-regardless of the commit). The stub returns a fixed
+check is `test -f /nonexistent`, which **prints nothing** (the
+termination message is **empty**); the stall is detected on an **empty**
+output, not on a repeated message (PR #84 fixed the operator to count an
+empty message as evidence)). The stub returns a fixed
 `usage: {prompt_tokens: 100, completion_tokens: 100}` **per request**
 (**200 tokens total per request** — item I's arithmetic fix: the round-1
 text said "100 tokens per request" but the `usage` is 100 prompt + 100

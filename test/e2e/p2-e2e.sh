@@ -279,6 +279,12 @@ for img in "$CTRL_IMG" "$RUNNER_IMG" "$STUB_IMG" "$GIT_IMG" "$CHECK_IMG"; do
   echo "   kind load: $img"
   kind load docker-image "$img" --name "$CLUSTER" || die "kind load $img failed"
 done
+# I71: prune dangling images to reduce host memory pressure (P2h's seven
+# Loops plus image builds took the devbox to ~250 MB free; a prune between
+# builds keeps the host headroom). Dangling images only — the pinned
+# P2H_OPERATOR_IMAGE and the just-loaded images are NOT dangling.
+echo "--- STEP 0c: docker image prune (dangling only) ---"
+docker image prune -f >/dev/null 2>&1 || echo "   (prune failed; continuing)"
 # The dev overlay pins --runner-image=coxswain-runner:dev (the operator's
 # RunnerImage; isRunner is true only when spec.agent.image == RunnerImage).
 # The P2h Loops' spec.agent.image is $RUNNER_IMG, so the operator's
@@ -554,9 +560,17 @@ K -n "$NS" create secret generic p2h-model-creds \
   --from-literal=MODEL_BASE_URL="http://$REAL_VLLM" \
   --dry-run=client -o yaml | K apply -f - >/dev/null
 
-# --- the eight Loops ---
+# --- the Loops ---
 FAIL_CHECK='test -f /nonexistent'
 PASS_CHECK='sleep 0.1'
+
+# I71: P2H_LOOP_COUNT controls how many Loops are created (default 8). The
+# first 4 are the assertion Loops (stall, budget, ctrl, resume); the last 4
+# are the budgetpause Loops + the real cross-check. Setting P2H_LOOP_COUNT=4
+# skips the 4 non-assertion Loops (reduces host memory pressure from 7+
+# concurrent agent pods + verify Jobs).
+P2H_LOOP_COUNT="${P2H_LOOP_COUNT:-8}"
+echo "   P2H_LOOP_COUNT=$P2H_LOOP_COUNT"
 
 echo "   creating the stall Loop (stallAfter:3, stallAction:Fail, maxIterations:10)"
 create_loop_wait_pvc ${p2h_stall} <<EOF
@@ -677,6 +691,7 @@ spec:
     stallAction: Fail
 EOF
 
+if [ "$P2H_LOOP_COUNT" -ge 8 ]; then
 echo "   creating the two budget-Pause Loops (maxTokens:400, onExceeded:Pause)"
 create_loop_wait_pvc ${p2h_budgetpause} <<EOF
 apiVersion: coxswain.wattu.com/v1alpha1
@@ -779,6 +794,10 @@ spec:
     onExceeded: Pause
 EOF
 
+# The cross-check counters + real-vLLM Loop are part of the full 8-Loop set
+# (assertions 3 and 5 depend on them). They sit inside the
+# P2H_LOOP_COUNT >= 8 guard so a reduced run skips them and marks the
+# dependent assertions NOT RUN (the summary gates the RESULT).
 # Cross-check start counters (the reviewer's A3 fix): the instant values of
 # the homelab Prometheus vllm token series captured BEFORE ${p2h_real} exists —
 # its early requests (the goal request fires right after creation) fall
@@ -825,7 +844,11 @@ spec:
     maxIterations: 100
     stallAfter: 100
 EOF
-
+fi
+# Close the P2H_LOOP_COUNT guard: the budgetpause Loops + the real
+# cross-check Loop are created only when P2H_LOOP_COUNT >= 8. With a
+# reduced count, assertions 3 and 5 are NOT RUN (the summary gates the
+# RESULT so a reduced run cannot PASS).
 fi
 # STEP 4+ only: read the live fixture state the assertions need.
 # MODEL_ENDPOINT is carried in every Loop's spec.agent.modelEndpoint (a
@@ -842,6 +865,9 @@ fi
 # ===========================================================================
 if in_steps 4; then
 echo
+if [ "${P2H_LOOP_COUNT:-8}" -lt 8 ]; then
+  echo "   [NOTICE] reduced run: P2H_LOOP_COUNT=$P2H_LOOP_COUNT < 8 — assertions 3 and 5 will be NOT RUN (the RESULT cannot be PASS)"
+fi
 echo "--- STEP 4: wait + assert (the plan's five numbered assertions) ---"
 
 # loop phase / field readers (one value per call).
@@ -1035,6 +1061,11 @@ fi
 
 # --- assertion 3: the real-backend cross-check ---
 echo
+if [ "${P2H_LOOP_COUNT:-8}" -lt 8 ]; then
+  echo "--- assertion 3: the real-backend cross-check (the cross-check Loop vs the homelab Prometheus) ---"
+  assert_done 3 not-run
+  echo "   (assertion 3 NOT RUN: the cross-check Loop was not created (P2H_LOOP_COUNT=$P2H_LOOP_COUNT < 8))"
+else
 echo "--- assertion 3: the real-backend cross-check (the cross-check Loop vs the homelab Prometheus) ---"
 PRE_A3_FAIL=$FAIL_COUNT; PRE_A3_PASS=$PASS_COUNT
 REAL_PHASE="$(lphase ${p2h_real})"
@@ -1109,6 +1140,7 @@ elif [ "$XCHECK" = "dropped" ]; then assert_done 3 dropped
 else fail "cross-check: XCHECK=$XCHECK (not pass or dropped)"; assert_done 3 fail
 fi
 fi   # end the assertion-3 cross-check computation (the XCHECK=fail early-exit)
+fi   # end the P2H_LOOP_COUNT >= 8 guard for assertion 3
 
 # --- assertion 4: the paused-Loop resume ---
 echo
@@ -1257,6 +1289,11 @@ fi
 
 # --- assertion 5: the budget-Pause + raised-cap resume ---
 echo
+if [ "${P2H_LOOP_COUNT:-8}" -lt 8 ]; then
+  echo "--- assertion 5: the budget-Pause + raised-cap resume (both sub-cases) ---"
+  assert_done 5 not-run
+  echo "   (assertion 5 NOT RUN: the budgetpause Loops were not created (P2H_LOOP_COUNT=$P2H_LOOP_COUNT < 8))"
+else
 echo "--- assertion 5: the budget-Pause + raised-cap resume (both sub-cases) ---"
 PRE_A5_FAIL=$FAIL_COUNT; PRE_A5_PASS=$PASS_COUNT
 # The entry point: the budget fire happens at Verifying (the applyBudgetStep
@@ -1464,6 +1501,7 @@ if [ "$B1_REASON" = "Budget" ] && [ "$B1_EXC" = "true" ] && { [ "$B1_FROM" = "Im
 else
   assert_done 5 fail
 fi
+fi   # end the P2H_LOOP_COUNT >= 8 guard for assertion 5
 
 fi
 # ===========================================================================
@@ -1547,10 +1585,20 @@ for n in 1 2 3 4 5; do
   esac
 done
 [ -z "$MISSING" ] || fail "assertion accounting: section(s)$MISSING did not run (a script bug skipped them — the RESULT cannot be PASS)"
-for n in 1 2 4 5; do
+# I71: a reduced run (P2H_LOOP_COUNT < 8) marks assertions 3 and 5 NOT RUN;
+# the RESULT must not PASS in that case.
+REDUCED=0
+for n in 3 5; do
+  case "$ASSERT_STATE" in *" $n:not-run"*) REDUCED=1;; esac
+done
+if [ "$REDUCED" -eq 1 ]; then
+  fail "reduced run: assertions 3 and/or 5 were NOT RUN (P2H_LOOP_COUNT=$P2H_LOOP_COUNT < 8); the RESULT is FAIL (a full 8-Loop run is required for a PASS)"
+fi
+for n in 1 2 4; do
   case "$ASSERT_STATE" in *" $n:pass"*) ;; *) fail "assertion accounting: assertion $n did not reach pass (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep "^$n:" || echo missing))" ;; esac
 done
-case "$ASSERT_STATE" in *" 3:pass"*|*" 3:dropped"*) ;; *) fail "assertion accounting: assertion 3 is neither pass nor a justified dropped (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep '^3:' || echo missing))" ;; esac
+case "$ASSERT_STATE" in *" 3:pass"*|*" 3:dropped"*|*" 3:not-run"*) ;; *) fail "assertion accounting: assertion 3 is neither pass, a justified dropped, nor not-run (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep '^3:' || echo missing))" ;; esac
+case "$ASSERT_STATE" in *" 5:pass"*|*" 5:not-run"*) ;; *) fail "assertion accounting: assertion 5 is neither pass nor not-run (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep '^5:' || echo missing))" ;; esac
 echo "   assertion states: $ASSERT_STATE"
 if [ "$FAILED" -ne 0 ]; then echo "RESULT: FAIL"; else echo "RESULT: PASS"; fi
 

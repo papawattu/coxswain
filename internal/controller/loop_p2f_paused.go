@@ -126,13 +126,38 @@ func loopPaused(loop *coxv1alpha1.Loop) bool {
 	return loop.Status.Phase == coxv1alpha1.LoopPhasePaused
 }
 
+// loopSandboxStopped reports whether the operator must stop the sandbox for
+// this Loop: the Paused phase OR a terminal phase (Succeeded, Failed). A
+// terminal Loop's one-shot runner has nothing to execute (it executes only
+// Planning or Implementing) — leaving the sandbox Running makes the agent
+// container crashloop on "unknown desired-phase <Succeeded|Failed>" for the
+// rest of the Loop's lifetime (I74). The same OperatingMode=Suspended gate
+// the Paused phase uses (P2f) stops the sandbox: the deliver Job runs in its
+// own pod (clone-base/import-agent/push read the workspace from a volume,
+// independent of the sandbox pod), so delivery still works after Succeeded.
+func (r *LoopReconciler) loopSandboxStopped(loop *coxv1alpha1.Loop) bool {
+	return loopPaused(loop) ||
+		loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded ||
+		loop.Status.Phase == coxv1alpha1.LoopPhaseFailed
+}
+
 // sandboxOperatingMode is the P2f suspension gate: desired OperatingMode =
-// Suspended iff spec.suspend || phase==Paused (a budget- or stall-paused Loop
-// has spec.suspend=false — the gate still suspends it). pauseBlocked (the
-// item-F refusal) keeps the sandbox Running so the in-flight delivery
-// completes.
+// Suspended iff spec.suspend || phase==Paused || a terminal phase
+// (Succeeded, Failed). A budget- or stall-paused Loop has spec.suspend=false
+// — the gate still suspends it. A terminal Loop's sandbox is stopped (I74):
+// the one-shot runner would crashloop on the terminal desired-phase. The
+// deliver Job runs in its own pod (independent of the sandbox pod), so the
+// sandbox can be stopped once the Loop is terminal and delivery still works.
+// pauseBlocked (the item-F refusal) keeps the sandbox Running so the
+// in-flight delivery completes — it is honoured for a Paused Loop (the
+// Paused phase is not terminal) but a terminal phase is always stopped (a
+// Succeeded Loop is terminal and its deliver Job does not need the sandbox
+// pod, so the refusal is moot).
 func (r *LoopReconciler) sandboxOperatingMode(loop *coxv1alpha1.Loop, pauseBlocked bool) sandboxv1beta1.SandboxOperatingMode {
-	if loop.Spec.Suspend && !pauseBlocked || loopPaused(loop) {
+	if r.loopSandboxStopped(loop) {
+		return sandboxv1beta1.SandboxOperatingModeSuspended
+	}
+	if loop.Spec.Suspend && !pauseBlocked {
 		return sandboxv1beta1.SandboxOperatingModeSuspended
 	}
 	return sandboxv1beta1.SandboxOperatingModeRunning

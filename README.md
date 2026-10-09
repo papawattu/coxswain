@@ -209,7 +209,7 @@ assumed was closed. To close it, apply the cluster-hardening checklist below.
    ClusterRoleBinding, etc.) grants the agent a token.
 5. **KubeArmor BPF-LSM for the DNS fence (tool proxies).**
    The tool proxy's KubeArmor `matchDNSQueries` fence (the inner egress fence
-   that restricts the proxy's DNS to the upstream host + platform DNS) is
+   that restricts the proxy's DNS to the upstream host + platform DNS)
    can only be enforced on clusters with BPF-LSM active (the
    `SOCKET_SENDMSG` hook) — not yet verified on such a cluster. On clusters
    without BPF-LSM (e.g. kind on certain kernels), the fence is **not

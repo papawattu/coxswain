@@ -212,8 +212,12 @@ upstream host only; there is no per-request authority to validate). This is
 an accepted limitation (D50 = (a), R23 I64): the tool proxy's NetworkPolicy
 allows any external IP by design (the upstream's IP isn't known in advance),
 so where the DNS fence is unenforced, the application layer is the sole
-egress control. Clusters with BPF-LSM (the production target) enforce the
-fence; the limitation is documented here and in the install notes.
+egress control. The fence is *expected* to be enforced on clusters where
+KubeArmor reports BPF-LSM active (the production target), but this has not
+yet been verified on such a cluster (D41e ran on kind, where the fence is
+unenforced). Before relying on it, confirm enforcement with a probe: a
+tool proxy resolving a non-upstream host should see a refused DNS lookup.
+The limitation is documented here and in the install notes.
 
 ### Audit
 

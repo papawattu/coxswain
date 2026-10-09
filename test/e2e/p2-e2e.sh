@@ -1598,6 +1598,7 @@ for n in 1 2 4; do
   case "$ASSERT_STATE" in *" $n:pass"*) ;; *) fail "assertion accounting: assertion $n did not reach pass (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep "^$n:" || echo missing))" ;; esac
 done
 case "$ASSERT_STATE" in *" 3:pass"*|*" 3:dropped"*|*" 3:not-run"*) ;; *) fail "assertion accounting: assertion 3 is neither pass, a justified dropped, nor not-run (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep '^3:' || echo missing))" ;; esac
+case "$ASSERT_STATE" in *" 5:pass"*|*" 5:not-run"*) ;; *) fail "assertion accounting: assertion 5 is neither pass nor not-run (state: $(echo $ASSERT_STATE | tr ' ' '\\n' | grep '^5:' || echo missing))" ;; esac
 echo "   assertion states: $ASSERT_STATE"
 if [ "$FAILED" -ne 0 ]; then echo "RESULT: FAIL"; else echo "RESULT: PASS"; fi
 

@@ -34,12 +34,15 @@ Verify this before running the delete:
 # added post-upgrade) — do NOT delete anything until every live tool netpol
 # is labelled.
 NS=<ns>
+# NOTE: read each netpol's label by NAME, not from the first list's columns:
+# kubectl lists label-sorted, so the tab-separated name/label columns can
+# misalign (a name read with a foreign or empty label). The jsonpath below
+# escapes the dot in the label key: coxswain\.io.
 kubectl -n $NS get networkpolicy \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.coxswain\.io/tool-proxy-for}{"\n"}{end}' \
-  | awk '{print $1}' \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
   | grep -E '\-tool\-.*\-netpol$' \
-  | while read np; do
-      loop=$(kubectl -n $NS get networkpolicy "$np" -o jsonpath='{.metadata.labels.coxswain.io/tool-proxy-for}')
+  | while IFS= read -r np; do
+      loop=$(kubectl -n $NS get networkpolicy "$np" -o jsonpath='{.metadata.labels.coxswain\.io/tool-proxy-for}')
       tool=$(echo "$np" | sed 's/.*-tool-//; s/-netpol//')
       # Check if this tool is in the Loop's effective policy:
       in_policy=$(kubectl -n $NS get agentpolicy -o json 2>/dev/null | python3 -c "

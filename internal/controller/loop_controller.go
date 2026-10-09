@@ -4532,12 +4532,16 @@ export GIT_TERMINAL_PROMPT=0
 DEST=/workspace
 REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
-# The volume is a MOUNT POINT (cannot be rm -rf'd). If a previous run left a
-# half-cloned repo (.git present but no success marker), wipe its contents
-# (never the mount point itself) so the clone starts clean. rm -rf is scoped
-# to the .git dir, not ${DEST}.
-if [ -d "${DEST}/.git" ]; then rm -rf "${DEST}/.git"; fi
-rm -rf "${DEST}/.coxswain"
+# The volume is a MOUNT POINT (cannot be rm -rf'd). A previous run may have
+# left the workspace in any partial state (e.g. an interrupted first run that
+# already checked out files but left no success marker, or a stale .git from
+# an earlier clone). Wipe ALL contents of the mount (including dotfiles such
+# as .git and .coxswain) so the clone starts clean — but never the mount point
+# itself. A partial wipe (only .git + .coxswain) leaves checked-out files
+# behind, so a restart's checkout fails with 'untracked working tree files
+# would be overwritten by checkout' and the Loop wedges (I73: seen on the live
+# I54 run). mindepth 1 keeps the mount point itself.
+if [ -d "${DEST}" ]; then find "${DEST}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true; fi
 mkdir -p "${DEST}"
 
 git ` + safeDir + ` init "${DEST}"

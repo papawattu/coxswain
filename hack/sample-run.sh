@@ -194,19 +194,26 @@ fi
 	|| die "secret $GIT_CRED_SECRET is not kubernetes.io/basic-auth"
 
 if ! kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" >/dev/null 2>&1; then
-	# The model Secret (a no-auth vLLM endpoint: the API key is a dummy).
-	# This is dev-only configuration for the local vLLM at the Loop's
-	# modelEndpoint; the value is fixed and non-secret. The proxy stand-in
-	# only checks that the mounted files exist and are non-empty.
-	log "creating model secret '$MODEL_SECRET' (no-auth vLLM) in ns $NS..."
-	# kubectl create secret rejects dots in --from-literal keys (it would
-	# read the key as a file path); use temp files instead.
-	KEYF="$OUTDIR/.mkmodel-apikey"; NAMEF="$OUTDIR/.mkmodel-modelname"
-	printf 'none\n' > "$KEYF"; printf 'qwen3.8-27b\n' > "$NAMEF"
+	# The model-creds Secret the per-Loop metering model proxy mounts (P2b,
+	# ADR-0009). The operator's proxy reads the key literally named `model-key`
+	# (loop_controller.go sets MODEL_CRED_FILE=/model-creds/.data/model-key) and
+	# the documented contract also carries `MODEL_BASE_URL` (the agent's
+	# COX_MODEL_BASE_URL value; the stub ignores it). The key is a dummy — the
+	# no-auth vLLM ignores credentials and the operator sets the endpoint from
+	# spec.agent.modelEndpoint (not from the Secret). This is dev-only config for
+	# the local vLLM at the Loop's modelEndpoint; the value is fixed and
+	# non-secret. The stand-in proxy only needs a readable non-empty key file
+	# (D33: the metering proxy fatals at startup if none is found — the old
+	# api.key/model.name shape left the model-key file empty, so the proxy
+	# crashlooped, I75).
+	log "creating model secret '$MODEL_SECRET' (no-auth vLLM, the P2b shape) in ns $NS..."
+	# kubectl create secret rejects dots in --from-literal keys (it would read
+	# the key as a file path); model-key and MODEL_BASE_URL have no dots, so
+	# --from-literal works (no temp files).
+	MODEL_BASE_URL_VALUE="http://$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")"
 	kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
-		--from-file="api.key=$KEYF" \
-		--from-file="model.name=$NAMEF" >/dev/null
-	rm -f "$KEYF" "$NAMEF"
+		--from-literal="model-key=p2b-dummy-key" \
+		--from-literal="MODEL_BASE_URL=$MODEL_BASE_URL_VALUE" >/dev/null
 fi
 # The vLLM endpoint must be reachable from the operator node.
 VLLM_HOST_PORT=$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")

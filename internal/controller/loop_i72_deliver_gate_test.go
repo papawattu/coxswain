@@ -308,4 +308,86 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		Expect(job.Annotations[verifyCommitAnnotation]).To(Equal(s6HeadCommit),
 			"I72: the in-cluster deliver Job is NOT gated on the egress proxy (direct path)")
 	})
+
+	It("keeps a Failed deliver Job as DeliveryFailed while the egress proxy pod is not Ready (CREATE-path-only gate)", func() {
+		ns := freshNS("i72-failed")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		name := "i72g"
+		policy := i72AgentPolicy(ns, "i72g-policy")
+		r := i72Succeeded(ns, name, "https://github.com/o/r.git", policy)
+		// The I72 gate is on the CREATE path only: an existing deliver Job's
+		// outcome is mapped as before (Failed -> DeliveryFailed), NOT held as
+		// InProgress. This spec proves a terminal delivery outcome is not reset
+		// by a proxy that is not Ready. To reach that state we must first get
+		// the deliver Job created (the gate passes when the proxy is Ready),
+		// then mark it Failed, then mark the proxy not Ready, and assert the
+		// Failed outcome persists (not reset to InProgress by the gate).
+		//
+		// Phase 1: mark the egress proxy pod Ready so the I72 gate passes and
+		// the deliver Job is created. The operator creates its own egress proxy
+		// pod (ensureEgressProxy); in envtest it may be deleted for spec drift
+		// before it is stable. Mark the current pod Ready, then reconcile until
+		// the deliver Job is created (the gate passes once a pod is owned +
+		// Ready; if the operator recreates the pod, re-mark it Ready and
+		// re-reconcile).
+		egressPodName := egressProxyPodName(name)
+		var loop *coxv1alpha1.Loop
+		var job *batchv1.Job
+		for range 30 {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			Expect(err).NotTo(HaveOccurred())
+			// Is the deliver Job created yet?
+			job = &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver", Namespace: ns}, job); err == nil {
+				break // the Job exists — the gate passed and the Job was created
+			}
+			// The Job is not yet created: mark the current egress proxy pod
+			// Ready (envtest has no kubelet) so the gate can pass on the next
+			// reconcile. If the operator recreated the pod (spec drift), the
+			// new pod is marked Ready here too.
+			loop = &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			egressPod := &corev1.Pod{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: egressPodName, Namespace: ns}, egressPod); err == nil &&
+				metav1.IsControlledBy(egressPod, loop) {
+				egressPod.Status.Phase = corev1.PodRunning
+				egressPod.Status.Conditions = []corev1.PodCondition{{
+					Type: corev1.PodReady, Status: corev1.ConditionTrue,
+				}}
+				Expect(k8sClient.Status().Update(ctx, egressPod)).To(Succeed())
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		job = &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver", Namespace: ns}, job)).To(Succeed(),
+			"I72: the deliver Job must be created once the egress proxy is Ready")
+		Expect(job.Annotations[verifyCommitAnnotation]).To(Equal(s6HeadCommit),
+			"I72: the deliver Job must be stamped for the verified commit")
+		// Phase 2: mark the Job Failed (a terminal delivery outcome).
+		job.Status.Failed = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+		// Phase 3: mark the egress proxy pod NOT Ready (the I72 gate would hold
+		// a fresh Job, but the existing Job's outcome must be mapped as before).
+		egressPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: egressProxyPodName(name), Namespace: ns}, egressPod)).To(Succeed())
+		egressPod.Status.Phase = corev1.PodPending
+		egressPod.Status.Conditions = []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionFalse,
+		}}
+		Expect(k8sClient.Status().Update(ctx, egressPod)).To(Succeed())
+		// The reconcile must map the existing Failed Job to DeliveryFailed, NOT
+		// hold it as InProgress (the gate is CREATE-path-only).
+		loop = s6Reconcile(r, ns, name)
+		ok, status, reason := s6Cond(loop)
+		Expect(ok).To(BeTrue(), "I72: the Delivered condition must be set")
+		Expect(status).To(Equal(metav1.ConditionFalse))
+		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed),
+			"I72: a Failed deliver Job must stay DeliveryFailed even while the egress proxy is not Ready (the gate is CREATE-path-only, not an outcome override)")
+		// The Job is NOT deleted/recreated (no retry: one Job per verifiedCommit).
+		jobAfter := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-deliver", Namespace: ns}, jobAfter)).To(Succeed(),
+			"I72: the Failed deliver Job must persist (not deleted by the gate)")
+		Expect(jobAfter.Status.Failed).To(BeNumerically(">", 0),
+			"I72: the Failed deliver Job's status must be untouched (the gate does not retry)")
+	})
 })

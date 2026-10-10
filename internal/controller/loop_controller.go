@@ -605,7 +605,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// termination message is read via the APIReader (pod-blind, like the S3/
 	// S4 read-backs) and written to status.delivery + the Delivered
 	// condition (ensureDeliverReadback).
-	deliverRequeue, err := r.ensureDeliver(ctx, &loop)
+	deliverRequeue, deliverKeep, err := r.ensureDeliver(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -666,8 +666,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
 	// (AFTER it, so the two Loop writes never race) are extracted to
 	// finalizeLoopStatus to keep the top-level reconcile within the gocyclo
-	// budget.
-	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared); err != nil {
+	// budget. The I49 in-progress keep decision (I61) is carried EXPLICITLY
+	// from ensureDeliverRedeliver (the deliver Job is still running — the
+	// annotation must stay for the later trigger) and threaded into
+	// finalizeLoopStatus: finalize skips the end-of-pass removeDeliverAnnotation
+	// patch so the running Job's annotation is not stripped, but the rest of the
+	// reconcile (status writes, the requeue) runs unchanged. (Previously the
+	// keep decision was an in-memory annotation on the Loop, then an early
+	// return that skipped the whole finalize; both were wrong — the I61 risk
+	// and the P1 review on #100.)
+	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -695,7 +703,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // defeat optimistic concurrency (it can silently overwrite status another
 // writer just set). Extracted so the top-level reconcile stays within the
 // gocyclo budget.
-func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared bool) error {
+func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared, redeliverKeep bool) error {
 	if changed || conditionsChanged {
 		if err := r.Status().Update(ctx, loop); err != nil {
 			return err
@@ -708,6 +716,16 @@ func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alph
 		if err := r.removeResumeAnnotation(ctx, loop); err != nil {
 			return err
 		}
+	}
+	// I61: when the redeliver keep decision is set (a still-running deliver
+	// Job — the I49 in-progress case), SKIP the end-of-pass removeDeliverAnnotation
+	// patch so the user's coxswain.io/redeliver annotation stays in place for the
+	// running Job (a fresh re-read would otherwise see the key present and strip
+	// it before the Job's later trigger). The status write above still ran, so
+	// the rest of the reconcile is persisted — only the annotation removal is
+	// skipped.
+	if redeliverKeep {
+		return nil
 	}
 	_, err := r.removeDeliverAnnotation(ctx, loop)
 	return err

@@ -145,7 +145,15 @@ echo "operator-digest-before: $OP_DIGEST_BEFORE" >"$OUTDIR/digest.txt"
 # The controller must run with a non-empty --runner-image (else the sandbox
 # runs 'sleep infinity' and wedges in Planning — a non-A2 failure).
 RUNNER_FLAG=$(kubectl --context "$CTX" -n "$OP_NS" get deploy "$OP_DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].args}' \
-	| python3 -c 'import json,sys; [print(a) for a in json.loads(sys.argv[1]) if a.startswith("--runner-image=")]' 2>/dev/null || true)
+	| python3 -c 'import json,sys
+try:
+    args=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for a in args:
+    if a.startswith("--runner-image="):
+        print(a)
+' 2>/dev/null || true)
 [ -n "$RUNNER_FLAG" ] || die "controller has no --runner-image flag; the sandbox would wedge in Planning (not an A2 measurement)."
 
 # ---------------------------------------------------------------------------
@@ -160,18 +168,19 @@ iteration_of() {
 	kubectl --context "$CTX" -n "$NS" get loop "$1" -o jsonpath='{.status.iteration}' 2>/dev/null || echo ""
 }
 # reason_of <loop>: the Failed reason (or the last condition reason for a
-# non-Succeeded terminal phase).
+# non-Succeeded terminal phase). Kubectl output is captured into a variable
+# first (no pipeline) so `set -o pipefail` cannot make the `|| echo` fire a
+# second time when the python path already printed.
 reason_of() {
-	kubectl --context "$CTX" -n "$NS" get loop "$1" -o json 2>/dev/null \
-		| python3 -c '
+	local loop="$1" raw
+	raw=$(kubectl --context "$CTX" -n "$NS" get loop "$loop" -o json 2>/dev/null || true)
+	printf '%s' "$raw" | python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
 except Exception:
     print(""); sys.exit(0)
 s=(d.get("status") or {})
-ph=s.get("phase") or ""
-# The Failed condition reason is the authoritative terminal reason.
 for c in s.get("conditions", []):
     if c.get("type")=="Failed" and c.get("status")=="True":
         print(c.get("reason","") or c.get("message",""))
@@ -181,11 +190,12 @@ else:
 ' 2>/dev/null || echo ""
 }
 
-# deliver_job_state <loop>: "running" | "succeeded" | "failed" | "absent"
+# deliver_job_state <loop>: "running" | "succeeded" | "failed" | "absent".
+# Same pipefail guard as reason_of.
 deliver_job_state() {
-	local loop="$1"
-	kubectl --context "$CTX" -n "$NS" get job "${loop}-deliver" -o json 2>/dev/null \
-		| python3 -c '
+	local loop="$1" raw
+	raw=$(kubectl --context "$CTX" -n "$NS" get job "${loop}-deliver" -o json 2>/dev/null || true)
+	printf '%s' "$raw" | python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
@@ -579,13 +589,13 @@ log "table" "building the results table..."
 	for case in "${CASES[@]}"; do
 		dir="$OUTDIR/$case"
 		[ -f "$dir/outcome.txt" ] || { echo "| $case | ? | ? | ? | ? | ? | ? | (no outcome) |"; continue; }
-		target=$(sed -n 's/^target=//p' "$dir/outcome.txt" | head -1)
-		phase=$(sed -n 's/^terminal-phase=//p' "$dir/outcome.txt" | head -1)
-		iter=$(sed -n 's/^iteration=//p' "$dir/outcome.txt" | head -1)
-		reason=$(sed -n 's/^reason=//p' "$dir/outcome.txt" | head -1)
-		wedged=$(sed -n 's/^wedged=//p' "$dir/outcome.txt" | head -1)
-		deliver=$(sed -n 's/^deliver-job=//p' "$dir/outcome.txt" | head -1)
-		reached=$(sed -n 's/^reached-target=//p' "$dir/outcome.txt" | head -1)
+		target=$(sed -n 's/^target: //p' "$dir/outcome.txt" | head -1)
+		phase=$(sed -n 's/^terminal-phase: //p' "$dir/outcome.txt" | head -1)
+		iter=$(sed -n 's/^iteration: //p' "$dir/outcome.txt" | head -1)
+		reason=$(sed -n 's/^reason: //p' "$dir/outcome.txt" | head -1)
+		wedged=$(sed -n 's/^wedged: //p' "$dir/outcome.txt" | head -1)
+		deliver=$(sed -n 's/^deliver-job: //p' "$dir/outcome.txt" | head -1)
+		reached=$(sed -n 's/^reached-target: //p' "$dir/outcome.txt" | head -1)
 		[ "$case" = "control" ] && target="none"
 		echo "| $case | ${target} | ${phase} | ${iter} | ${reason} | ${wedged} | ${deliver} | [logs]($case/) |"
 	done

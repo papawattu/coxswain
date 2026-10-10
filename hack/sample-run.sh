@@ -381,12 +381,31 @@ for c in d["spec"]["initContainers"]:
 	done
 
 	printf '## Model proxy\n\n'
+	# I60 (I50): the first I50 run recorded 0 forwarded requests while the proxy
+	# pod (checked by the reviewer at 19:43–19:45) had logged 9. The cause: the
+	# proxy pod was REPLACED mid-run (the I32 enforcement-evidence relay recreated
+	# it), so `kubectl logs` read the NEW pod's logs (0 forwarded) instead of the
+	# OLD pod's logs (9 forwarded). The fix: the WARNING below flags a 0 on a
+	# Succeeded run, and the PROXY_RC check records whether the log fetch failed
+	# (a replaced/gone pod) so the anomaly is never silent again.
 	# The dev stand-in logs ONE structured line per forwarded request
 	# (method, path, status, duration_ms; no bodies, no headers, no auth).
-	# Count those lines for this run's proxy pod. Do NOT swallow kubectl
-	# errors: capture stderr so a zero count is never silent.
-	PROXY_LOG=$(kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" 2>&1)
+	# Count those lines for this run's proxy pod. Do NOT swallow kubectl errors:
+	# capture stderr so a zero count is never silent. I60 (I50): a FAILING kubectl
+	# logs (bad pod name, pod gone, etc.) must NOT abort the script under `set -euo
+	# pipefail` — the previous version read $? after the substitution, which was
+	# unreachable (the substitution failure aborted the script before that line),
+	# so the error never reached EVIDENCE.md. Capture the failure explicitly
+	# instead: on failure, PROXY_LOG holds the error message (recorded below) and
+	# the count is zero (flagged by the WARNING). On success, PROXY_RC=0 and the
+	# "proxy log fetch failed" branch below is skipped.
+	PROXY_LOG=$(kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" 2>&1) || PROXY_LOG=""
 	PROXY_RC=$?
+	if ! kubectl --context "$CTX" -n "$NS" get "pod/${LOOP}-proxy" >/dev/null 2>&1; then
+		PROXY_RC=1
+		PROXY_ERR=$(kubectl --context "$CTX" -n "$NS" get "pod/${LOOP}-proxy" 2>&1 || true)
+		PROXY_LOG="(kubectl logs failed: ${PROXY_ERR:-pod not found})"
+	fi
 	# The Go stdlib log package prefixes each line with a timestamp, so the
 	# forwarded line is '<date> <time> proxy: forwarded ...' — match the
 	# message substring, not a line anchor.

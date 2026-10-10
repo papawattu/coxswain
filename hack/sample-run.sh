@@ -489,7 +489,7 @@ print(f"{count}\t{prompt}\t{completion}")
 with open(sys.argv[1], "w") as f:
     f.write("\n".join(lines) + ("\n" if lines else ""))
 ' "$PROXY_USAGE_TMP" || true)
-	PROXY_STATS="${PROXY_STATS:-0\t0\t0}"
+	PROXY_STATS="${PROXY_STATS:-$(printf '0\t0\t0')}"
 	FORWARDED_COUNT=$(printf '%s' "$PROXY_STATS" | cut -f1)
 	PROXY_PROMPT_SUM=$(printf '%s' "$PROXY_STATS" | cut -f2)
 	PROXY_COMPLETION_SUM=$(printf '%s' "$PROXY_STATS" | cut -f3)

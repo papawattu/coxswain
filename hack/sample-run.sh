@@ -193,28 +193,32 @@ fi
 [ "$(kubectl --context "$CTX" -n "$NS" get secret "$GIT_CRED_SECRET" -o jsonpath='{.type}')" = "kubernetes.io/basic-auth" ] \
 	|| die "secret $GIT_CRED_SECRET is not kubernetes.io/basic-auth"
 
+# The model-creds Secret the per-Loop metering model proxy mounts (P2b,
+# ADR-0009). The operator's proxy reads the key literally named `model-key`
+# (loop_controller.go sets MODEL_CRED_FILE=/model-creds/.data/model-key) and
+# the documented contract also carries `MODEL_BASE_URL` (the agent's
+# COX_MODEL_BASE_URL value; the stub ignores it). The key is a dummy — the
+# no-auth vLLM ignores credentials and the operator sets the endpoint from
+# spec.agent.modelEndpoint (not from the Secret). This is dev-only config for
+# the local vLLM at the Loop's modelEndpoint; the value is fixed and
+# non-secret. The stand-in proxy only needs a readable non-empty key file
+# (D33: the metering proxy fatals at startup if none is found — the old
+# api.key/model.name shape left the model-key file empty, so the proxy
+# crashlooped, I75).
+# create_model_secret creates/recreates the Secret in the P2b shape (model-key
+# + MODEL_BASE_URL). kubectl create secret rejects dots in --from-literal keys
+# (it would read the key as a file path); model-key and MODEL_BASE_URL have no
+# dots, so --from-literal works (no temp files). Defined ABOVE the if so both
+# branches can call it (a function defined inside one branch is not visible
+# from the other — P1 review: the stale path called it and died with
+# 'command not found').
+create_model_secret() {
+	MODEL_BASE_URL_VALUE="http://$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")"
+	kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
+		--from-literal="model-key=p2b-dummy-key" \
+		--from-literal="MODEL_BASE_URL=$MODEL_BASE_URL_VALUE" >/dev/null
+}
 if ! kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" >/dev/null 2>&1; then
-	# The model-creds Secret the per-Loop metering model proxy mounts (P2b,
-	# ADR-0009). The operator's proxy reads the key literally named `model-key`
-	# (loop_controller.go sets MODEL_CRED_FILE=/model-creds/.data/model-key) and
-	# the documented contract also carries `MODEL_BASE_URL` (the agent's
-	# COX_MODEL_BASE_URL value; the stub ignores it). The key is a dummy — the
-	# no-auth vLLM ignores credentials and the operator sets the endpoint from
-	# spec.agent.modelEndpoint (not from the Secret). This is dev-only config for
-	# the local vLLM at the Loop's modelEndpoint; the value is fixed and
-	# non-secret. The stand-in proxy only needs a readable non-empty key file
-	# (D33: the metering proxy fatals at startup if none is found — the old
-	# api.key/model.name shape left the model-key file empty, so the proxy
-	# crashlooped, I75).
-	create_model_secret() {
-		MODEL_BASE_URL_VALUE="http://$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")"
-		kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
-			--from-literal="model-key=p2b-dummy-key" \
-			--from-literal="MODEL_BASE_URL=$MODEL_BASE_URL_VALUE" >/dev/null
-	}
-	# kubectl create secret rejects dots in --from-literal keys (it would read
-	# the key as a file path); model-key and MODEL_BASE_URL have no dots, so
-	# --from-literal works (no temp files).
 	log "creating model secret '$MODEL_SECRET' (no-auth vLLM, the P2b shape) in ns $NS..."
 	create_model_secret
 else

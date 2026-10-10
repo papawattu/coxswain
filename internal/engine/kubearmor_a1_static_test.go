@@ -238,16 +238,52 @@ func TestA1PolicySelectorMismatch(t *testing.T) {
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
 	kapt := a1Kapt()
-	kapt.Object["spec"] = map[string]any{
-		" + KaptSelectorKey + ": map[string]any{
+	// Live policy's selector targets a DIFFERENT loop than the sandbox pod
+	// template (l1). The recorded KaptSpecHash is the hash of THIS mismatched
+	// live spec, so the spec-hash check passes and ONLY the selector
+	// comparison fails. If the selector compare were disabled, this spec would
+	// pass (selector mismatch ignored), so it fails when that gate is off.
+	mismatchedSpec := map[string]any{
+		KaptSelectorKey: map[string]any{
 			KaptMatchLabelsKey: map[string]any{a1LoopLabelKey: "different-loop"},
 		},
 	}
+	kapt.Object[KaptSpecKey] = mismatchedSpec
 	e := a1Enforcer(t, nodes, pods, kapt)
 	loop := a1Loop()
+	// Record the hash of the live (mismatched) spec so only the selector
+	// check can fail.
+	loop.Status.Policy.KaptSpecHash = kaptSpecHash(mismatchedSpec)
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (selector mismatch), got true")
+	}
+	if reason != ReasonEnforcementUnverified {
+		t.Fatalf("expected reason=%s, got %s", ReasonEnforcementUnverified, reason)
+	}
+}
+
+func TestA1PolicySpecHashTampered(t *testing.T) {
+	nodes := []corev1.Node{bpfNode("node1")}
+	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
+	kapt := a1Kapt()
+	// The live policy's selector is intact (matches the sandbox pod template),
+	// but one rule has been changed so its spec hash differs from the
+	// recorded KaptSpecHash. The selector check passes; only the spec-hash
+	// comparison fails. If the hash compare were disabled, this spec would
+	// pass, so it fails when that gate is off.
+	tamperedSpec := map[string]any{
+		KaptSelectorKey: map[string]any{
+			KaptMatchLabelsKey: map[string]any{a1LoopLabelKey: "l1"},
+		},
+		"rules": []any{map[string]any{"name": "tampered-rule", "severity": "high"}},
+	}
+	kapt.Object[KaptSpecKey] = tamperedSpec
+	e := a1Enforcer(t, nodes, pods, kapt)
+	loop := a1Loop() // records the hash of the ORIGINAL (untampered) spec
+	enforcing, reason := e.Enforcing(context.Background(), loop)
+	if enforcing {
+		t.Fatalf("expected enforcing=false (spec hash tampered), got true")
 	}
 	if reason != ReasonEnforcementUnverified {
 		t.Fatalf("expected reason=%s, got %s", ReasonEnforcementUnverified, reason)

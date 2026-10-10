@@ -76,7 +76,14 @@ CASES=(
   "verify-job"
 )
 
-log() { printf '\033[1;34m[a2 %s]\033[0m %s\n' "${1:-setup}" "$2"; }
+# log <message> | log <tag> <message>: a single-arg call uses the "setup" tag.
+log() {
+	if [ $# -eq 1 ]; then
+		printf '\033[1;34m[a2 setup]\033[0m %s\n' "$1"
+	else
+		printf '\033[1;34m[a2 %s]\033[0m %s\n' "$1" "$2"
+	fi
+}
 die() { printf '\033[1;31m[a2 FATAL]\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v kubectl >/dev/null || die "kubectl not on PATH"

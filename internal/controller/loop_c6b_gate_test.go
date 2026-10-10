@@ -45,6 +45,12 @@ func (f *fakeEnforcer) Apply(_ context.Context, _ *coxv1alpha1.Loop, _ policy.Ef
 func (f *fakeEnforcer) Enforcing(_ context.Context, _ *coxv1alpha1.Loop) (bool, string) {
 	return f.enforcing, f.reason
 }
+func (f *fakeEnforcer) KaptSpecHash(_ *coxv1alpha1.Loop, _ policy.EffectivePolicy) string {
+	return ""
+}
+func (f *fakeEnforcer) BPFNodeAffinity() *corev1.Affinity {
+	return nil
+}
 
 var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 	var (
@@ -404,4 +410,10 @@ func (f *recordingEnforcer) Apply(_ context.Context, _ *coxv1alpha1.Loop, p poli
 }
 func (f *recordingEnforcer) Enforcing(_ context.Context, _ *coxv1alpha1.Loop) (bool, string) {
 	return true, ""
+}
+func (f *recordingEnforcer) KaptSpecHash(_ *coxv1alpha1.Loop, _ policy.EffectivePolicy) string {
+	return ""
+}
+func (f *recordingEnforcer) BPFNodeAffinity() *corev1.Affinity {
+	return nil
 }

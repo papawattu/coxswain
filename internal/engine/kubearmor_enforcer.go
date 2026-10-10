@@ -2,11 +2,14 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +40,13 @@ var ErrNoProxyFQDNs = fmt.Errorf("KubeArmorEnforcer: proxy FQDN functions are no
 // object (no KubeArmor Go type dependency) and owner-refs it to the Loop (P2).
 type KubeArmorEnforcer struct {
 	Client client.Client
+	// APIReader is the direct API reader (mgr.GetAPIReader()) for the A1
+	// static check's Node and agent-Pod reads. The operator's cached client
+	// (mgr.GetClient()) has its Pod cache label-filtered to proxy components,
+	// so KubeArmor agent pods are invisible through it. The APIReader bypasses
+	// the cache and reads directly from the API server. When nil, the Enforcing
+	// method falls back to Client (envtest tests use the fake client directly).
+	APIReader client.Reader
 	// proxyFQDN / egressProxyFQDN are the per-Loop proxy Service FQDNs the
 	// agent's DNS allowlist carries (built by the controller's reconciler from
 	// proxyServiceName / egressProxyServiceName + the cluster domain; R16 I44
@@ -63,6 +73,18 @@ type KubeArmorEnforcer struct {
 	// false (production), a missing KubeArmor CRD is a loud error, not a
 	// silent no-op — a misinstall must not silently disable the inner fence.
 	AllowUnenforced bool
+	// A1 (D52): the static enforcement check config (ADR-0007 amendment A1).
+	// The Enforcing method reads these to evaluate the three facts (agent pod
+	// on every BPF-LSM node, at least one BPF-LSM node, policy exists +
+	// controlled + spec-matches + selector-matches). All are operator config
+	// (the Enforcer interface stays engine-agnostic — the operator passes the
+	// engine's selectors, not hard-coded ones). Defaults when empty:
+	// AgentNamespace="kubearmor", AgentPodLabel="kubearmor-app=kubearmor",
+	// BPFLabel="kubearmor.io/enforcer", BPFLabelValue="bpf".
+	AgentNamespace string
+	AgentPodLabel  string
+	BPFLabel       string
+	BPFLabelValue  string
 }
 
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective
@@ -92,7 +114,7 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// D41d: the agent reaches each tool proxy via its Service FQDN; the
 	// per-tool FQDNs are added to the agent's DNS allowlist so the resolver
 	// (the pod-level policy's spec.action Block) does not block the queries.
-	var toolFQDNs []string
+	toolFQDNs := make([]string, 0, len(p.Tools))
 	for _, t := range p.Tools {
 		toolFQDNs = append(toolFQDNs, e.ToolProxyFQDN(loop.Name, loop.Namespace, t.Name))
 	}
@@ -317,20 +339,261 @@ func (e *KubeArmorEnforcer) createOrUpdateKapt(ctx context.Context, loop *v1alph
 	return nil
 }
 
-// Enforcing reports whether the KubeArmor engine is enforcing the Loop's policy.
-// The KubeArmorPolicy CRD has no enforcement status, so the evidence comes from
-// the engine's telemetry/alert stream (the I32 relay). Until the relay is wired
-// (I32) the operator has OBSERVED nothing: this returns (false,
-// ReasonEnforcementUnverified) so the PolicyEnforced condition is
-// Unknown/EnforcementUnverified — it names the missing probe rather than
-// claiming the engine is not enforcing (I46: the condition must describe the
-// cluster, not the flag). The gate is still fail-closed: without
-// --allow-unenforced the sandbox is held Suspended on the false result; the
-// flag only lets it run while the condition says so.
-func (e *KubeArmorEnforcer) Enforcing(_ context.Context, _ *v1alpha1.Loop) (bool, string) {
-	// TODO(I32): consume the KubeArmor relay alert stream for positive evidence.
-	// Until then, report that no enforcement probe exists (I46).
-	return false, ReasonEnforcementUnverified
+// Enforcing (A1/D52, ADR-0007 amendment A1) reports whether the KubeArmor
+// engine is enforcing the Loop's policy, via the static check. It reads three
+// facts from cluster state (envtest-fakeable; on kind, the real objects), all
+// evaluable while the sandbox is Suspended (no sandbox pod):
+//
+//  1. A Ready KubeArmor agent pod exists on EVERY node matching the BPF-LSM
+//     label, and at least one such node exists.
+//  2. At least one node with the BPF-LSM label exists (implied by fact 1).
+//  3. The Loop's KubeArmorPolicy exists, is controlled by the Loop, its spec
+//     matches the operator's rendered policy (effective-policy hash), and its
+//     selector matches the sandbox pod template labels.
+//
+// The gate (D30) opens only when all three are True. Any missing fact or
+// outage reads Unknown (never True), and the reason names the failing fact.
+func (e *KubeArmorEnforcer) Enforcing(ctx context.Context, loop *v1alpha1.Loop) (bool, string) {
+	// Nil client: no engine probe (the I46 stub behavior). The operator has
+	// OBSERVED nothing: report EnforcementUnverified (not NodeNotEnforcing).
+	if e.Client == nil {
+		return false, ReasonEnforcementUnverified
+	}
+	agentNS := e.agentNamespace()
+	agentLabel := e.agentPodLabel()
+	bpfLabel := e.bpfLabel()
+	bpfLabelValue := e.bpfLabelValue()
+
+	// Fact 2 (and the first half of fact 1): find nodes with the BPF-LSM label.
+	nodeList := &corev1.NodeList{}
+	if err := e.a1Reader().List(ctx, nodeList, client.MatchingLabels{bpfLabel: bpfLabelValue}); err != nil {
+		return false, ReasonEngineUnavailable
+	}
+	if len(nodeList.Items) == 0 {
+		return false, ReasonNodeNotEnforcing
+	}
+
+	// Fact 1: a Ready agent pod on EVERY BPF-LSM node.
+	for i := range nodeList.Items {
+		nodeName := nodeList.Items[i].Name
+		pods, err := e.listAgentPods(ctx, agentNS, agentLabel, nodeName)
+		if err != nil {
+			return false, ReasonEngineUnavailable
+		}
+		// Check if any pod on this node is Ready and owned by a DaemonSet.
+		found := false
+		for j := range pods.Items {
+			pod := &pods.Items[j]
+			if !isOwnedByDaemonSet(pod) {
+				continue
+			}
+			if isPodReady(pod) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, ReasonNodeNotEnforcing
+		}
+	}
+
+	// Fact 3: the Loop's KubeArmorPolicy exists, is controlled by the Loop,
+	// its spec matches the operator's rendered policy, and its selector
+	// matches the sandbox pod template labels.
+	kapt := &unstructured.Unstructured{}
+	kapt.SetGroupVersionKind(KubeArmorGVK)
+	kaptName := "coxswain-" + loop.Name
+	if err := e.a1Reader().Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: kaptName}, kapt); err != nil {
+		if errors.IsNotFound(err) {
+			return false, ReasonEnforcementUnverified // policy not yet created
+		}
+		if meta.IsNoMatchError(err) {
+			return false, ReasonEngineUnavailable
+		}
+		return false, ReasonEngineUnavailable
+	}
+	// Controlled by the Loop.
+	if !metav1.IsControlledBy(kapt, loop) {
+		return false, ReasonEnforcementUnverified
+	}
+	// Spec matches the operator's rendered policy (D52 fact 3).
+	liveSpec, found, _ := unstructured.NestedMap(kapt.Object, KaptSpecKey)
+	if !found {
+		return false, ReasonEnforcementUnverified
+	}
+	liveHash := kaptSpecHash(liveSpec)
+	if loop.Status.Policy == nil || loop.Status.Policy.KaptSpecHash == "" {
+		return false, ReasonEnforcementUnverified
+	}
+	if liveHash != loop.Status.Policy.KaptSpecHash {
+		return false, ReasonEnforcementUnverified
+	}
+	// Selector matches the sandbox pod template labels. The sandbox pod
+	// template carries the coxswain.io/loop label (ensureSandbox), so the
+	// policy's selector must match it.
+	sel, _, _ := unstructured.NestedMap(kapt.Object, KaptSpecKey, KaptSelectorKey)
+	raw, _ := sel[KaptMatchLabelsKey].(map[string]any)
+	templateLabels := sandboxPodTemplateLabels(loop.Name)
+	for k, v := range raw {
+		want, ok := templateLabels[k]
+		if !ok || v != want {
+			return false, ReasonEnforcementUnverified
+		}
+	}
+
+	return true, ""
+}
+
+// sandboxPodTemplateLabels returns the labels the operator renders on the
+// sandbox pod template (A1, D52 fact 3).
+func sandboxPodTemplateLabels(loopName string) map[string]string {
+	return map[string]string{
+		"coxswain.io/loop":            loopName,
+		"app.kubernetes.io/component": "agent",
+	}
+}
+
+// kaptSpecHash computes the canonical hash of a KubeArmorPolicy's spec field.
+func kaptSpecHash(spec any) string {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return "unhashable"
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
+}
+
+// a1Reader returns the reader for the A1 static check's Node and agent-Pod reads.
+func (e *KubeArmorEnforcer) a1Reader() client.Reader {
+	if e.APIReader != nil {
+		return e.APIReader
+	}
+	return e.Client
+}
+
+// BPFNodeAffinity returns the required node affinity for the sandbox pod (A1, D52).
+func (e *KubeArmorEnforcer) BPFNodeAffinity() *corev1.Affinity {
+	if e.AllowUnenforced {
+		return nil
+	}
+	key := e.BPFLabel
+	if key == "" {
+		key = "kubearmor.io/enforcer"
+	}
+	val := e.BPFLabelValue
+	if val == "" {
+		val = "bpf"
+	}
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      key,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{val},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// KaptSpecHash returns the canonical hash of the rendered KubeArmorPolicy spec
+// for the given Loop and effective policy (A1, D52 fact 3).
+func (e *KubeArmorEnforcer) KaptSpecHash(loop *v1alpha1.Loop, p policy.EffectivePolicy) string {
+	egressFQDN := ""
+	if len(p.Network) > 0 {
+		egressFQDN = e.EgressProxyFQDN(loop.Name, loop.Namespace)
+	}
+	toolFQDNs := make([]string, 0, len(p.Tools))
+	for _, t := range p.Tools {
+		toolFQDNs = append(toolFQDNs, e.ToolProxyFQDN(loop.Name, loop.Namespace, t.Name))
+	}
+	obj := EmitKubeArmorPolicyWithToolFQDNs(loop.Name, loop.Namespace, policy.Translate(p, e.ProxyFQDN(loop.Name, loop.Namespace), egressFQDN), toolFQDNs)
+	spec, _, _ := unstructured.NestedMap(obj.Object, KaptSpecKey)
+	return kaptSpecHash(spec)
+}
+
+// agentNamespace returns the KubeArmor agent's namespace (operator config).
+func (e *KubeArmorEnforcer) agentNamespace() string {
+	if e.AgentNamespace != "" {
+		return e.AgentNamespace
+	}
+	return "kubearmor"
+}
+
+// agentPodLabel returns the KubeArmor agent pod's label (operator config).
+func (e *KubeArmorEnforcer) agentPodLabel() string {
+	if e.AgentPodLabel != "" {
+		return e.AgentPodLabel
+	}
+	return "kubearmor-app=kubearmor"
+}
+
+// bpfLabel returns the BPF-LSM node label key (operator config).
+func (e *KubeArmorEnforcer) bpfLabel() string {
+	if e.BPFLabel != "" {
+		return e.BPFLabel
+	}
+	return "kubearmor.io/enforcer"
+}
+
+// bpfLabelValue returns the BPF-LSM node label value (operator config).
+func (e *KubeArmorEnforcer) bpfLabelValue() string {
+	if e.BPFLabelValue != "" {
+		return e.BPFLabelValue
+	}
+	return "bpf"
+}
+
+// listAgentPods lists the KubeArmor agent pods in the given namespace, with the
+// given label, on the given node.
+func (e *KubeArmorEnforcer) listAgentPods(ctx context.Context, ns, label, nodeName string) (*corev1.PodList, error) {
+	// Split the label into key=value.
+	var key, value string
+	parts := strings.SplitN(label, "=", 2)
+	if len(parts) == 2 {
+		key, value = parts[0], parts[1]
+	} else {
+		key = parts[0]
+	}
+	pods := &corev1.PodList{}
+	if err := e.a1Reader().List(ctx, pods, client.InNamespace(ns), client.MatchingLabels{key: value}); err != nil {
+		return nil, err
+	}
+	// Filter to pods on the given node.
+	filtered := &corev1.PodList{}
+	for i := range pods.Items {
+		if pods.Items[i].Spec.NodeName == nodeName {
+			filtered.Items = append(filtered.Items, pods.Items[i])
+		}
+	}
+	return filtered, nil
+}
+
+// isOwnedByDaemonSet returns true if the pod is owned by a DaemonSet.
+func isOwnedByDaemonSet(pod *corev1.Pod) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "DaemonSet" && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
+}
+
+// isPodReady returns true if the pod's Ready condition is True.
+func isPodReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // KubeArmorGVK is the GroupVersionKind of a KubeArmorPolicy.

@@ -881,6 +881,7 @@ func implementingPrompt(workspace, goal string) string {
 	}
 	p := "You are in the IMPLEMENTING phase. Use your shell tool to make the goal's changes in the workspace. " +
 		"Run the acceptance checks to confirm your work. " +
+		"Your plan lives in .coxswain/PLAN.md; do not create a root PLAN.md. " +
 		"End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
 		goal
 	if plan != "" {

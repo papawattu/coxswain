@@ -8,6 +8,7 @@ package runner
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -104,5 +105,20 @@ func TestCommitWorkspaceKeepsTrackedRootPlan(t *testing.T) {
 	}
 	if !foundPlan {
 		t.Errorf("staged set %v: a base-tracked root PLAN.md that the agent modified must be KEPT (not excluded)", staged)
+	}
+}
+
+// TestImplementingPromptTellsAgentPlanLivesInCoxswain: the implementing prompt
+// (D51) tells the agent its plan lives in .coxswain/PLAN.md and that it must
+// not create a root PLAN.md, so the agent does not write its plan to a root
+// PLAN.md (which the commit would otherwise exclude, but which would still
+// clutter the workspace and could be mistaken for source).
+func TestImplementingPromptTellsAgentPlanLivesInCoxswain(t *testing.T) {
+	p := implementingPrompt(t.TempDir(), "make the goal's changes")
+	if !strings.Contains(p, "Your plan lives in .coxswain/PLAN.md") {
+		t.Errorf("implementing prompt does not tell the agent its plan lives in .coxswain/PLAN.md:\n%s", p)
+	}
+	if !strings.Contains(p, "do not create a root PLAN.md") {
+		t.Errorf("implementing prompt does not tell the agent not to create a root PLAN.md:\n%s", p)
 	}
 }

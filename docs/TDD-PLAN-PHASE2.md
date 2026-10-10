@@ -627,8 +627,11 @@ first, and the decision slices simply call them).
     yet recorded `status.delivery`, a `spec.suspend=true` is **refused** —
     the operator keeps the phase `Succeeded`, sets the `Paused` condition
     `False` with a message naming the reason (`suspend` refused while a
-    deliver Job is in flight), and leaves the sandbox running so delivery
-    completes; the spec asserts the refusal + the deliver Job is undisturbed.
+    deliver Job is in flight), and **stops** the sandbox on the terminal
+    phase (I74, #98) — delivery reads the workspace PVC via `import-agent`
+    (the deliver Job runs in its own pod) and does not need the sandbox; the
+    spec asserts the refusal + the deliver Job is undisturbed + the sandbox
+    is `Suspended` (not `Running`).
     Once `status.delivery` is recorded (delivery done), `suspend=true` is
     again refused by the terminal-phase rule (spec 9). **The owner must pick
     one** — the plan chooses **refuse** (let delivery finish, do not suspend
@@ -809,7 +812,11 @@ first, and the decision slices simply call them).
    the operator **refuses** (item F): the phase stays `Succeeded`, the
    `Paused` condition stays `False` with a message naming the refusal, the
    deliver Job is **undisturbed** (not deleted, not suspended), and the
-   sandbox is left running so delivery completes.
+   sandbox is **stopped** on every terminal phase (I74, #98) — delivery
+   reads the workspace PVC via `import-agent` (the deliver Job runs in its
+   own pod) and does not need the sandbox. The spec 9c expectation was
+   updated to match (the sandbox is `Suspended` on the terminal Succeeded
+   phase, not `Running`).
 10. **In-progress: a pod mid-run at pause time (I49).** A Loop at
     `Implementing` with the agent container `Running` (not terminated) and
     `suspend` flipped to `true` → `phase=Paused`,

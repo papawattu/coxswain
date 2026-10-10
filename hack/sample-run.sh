@@ -193,20 +193,50 @@ fi
 [ "$(kubectl --context "$CTX" -n "$NS" get secret "$GIT_CRED_SECRET" -o jsonpath='{.type}')" = "kubernetes.io/basic-auth" ] \
 	|| die "secret $GIT_CRED_SECRET is not kubernetes.io/basic-auth"
 
-if ! kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" >/dev/null 2>&1; then
-	# The model Secret (a no-auth vLLM endpoint: the API key is a dummy).
-	# This is dev-only configuration for the local vLLM at the Loop's
-	# modelEndpoint; the value is fixed and non-secret. The proxy stand-in
-	# only checks that the mounted files exist and are non-empty.
-	log "creating model secret '$MODEL_SECRET' (no-auth vLLM) in ns $NS..."
-	# kubectl create secret rejects dots in --from-literal keys (it would
-	# read the key as a file path); use temp files instead.
-	KEYF="$OUTDIR/.mkmodel-apikey"; NAMEF="$OUTDIR/.mkmodel-modelname"
-	printf 'none\n' > "$KEYF"; printf 'qwen3.8-27b\n' > "$NAMEF"
+# The model-creds Secret the per-Loop metering model proxy mounts (P2b,
+# ADR-0009). The operator's proxy reads the key literally named `model-key`
+# (loop_controller.go sets MODEL_CRED_FILE=/model-creds/.data/model-key) and
+# the documented contract also carries `MODEL_BASE_URL` (the agent's
+# COX_MODEL_BASE_URL value; the stub ignores it). The key is a dummy — the
+# no-auth vLLM ignores credentials and the operator sets the endpoint from
+# spec.agent.modelEndpoint (not from the Secret). This is dev-only config for
+# the local vLLM at the Loop's modelEndpoint; the value is fixed and
+# non-secret. The stand-in proxy only needs a readable non-empty key file
+# (D33: the metering proxy fatals at startup if none is found — the old
+# api.key/model.name shape left the model-key file empty, so the proxy
+# crashlooped, I75).
+# create_model_secret creates/recreates the Secret in the P2b shape (model-key
+# + MODEL_BASE_URL). kubectl create secret rejects dots in --from-literal keys
+# (it would read the key as a file path); model-key and MODEL_BASE_URL have no
+# dots, so --from-literal works (no temp files). Defined ABOVE the if so both
+# branches can call it (a function defined inside one branch is not visible
+# from the other — P1 review: the stale path called it and died with
+# 'command not found').
+create_model_secret() {
+	MODEL_BASE_URL_VALUE="http://$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")"
 	kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
-		--from-file="api.key=$KEYF" \
-		--from-file="model.name=$NAMEF" >/dev/null
-	rm -f "$KEYF" "$NAMEF"
+		--from-literal="model-key=p2b-dummy-key" \
+		--from-literal="MODEL_BASE_URL=$MODEL_BASE_URL_VALUE" >/dev/null
+}
+if ! kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" >/dev/null 2>&1; then
+	log "creating model secret '$MODEL_SECRET' (no-auth vLLM, the P2b shape) in ns $NS..."
+	create_model_secret
+else
+	# An EXISTING model Secret: a pre-P2b shape (api.key/model.name) has no
+	# `model-key` entry, so the metering proxy (which reads
+	# /model-creds/.data/model-key) fatals at startup and the proxy pod
+	# crashloops (I75, D33). Treat a Secret without .data.model-key as stale:
+	# delete it and recreate it in the P2b shape (the proxy pod picks it up on
+	# restart — sample-run deletes the prior Loop anyway, so a fresh proxy pod
+	# mounts the recreated Secret).
+	MODEL_KEY_PRESENT=$(kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" -o jsonpath='{.data.model-key}' 2>/dev/null) || MODEL_KEY_PRESENT=""
+	if [ -z "$MODEL_KEY_PRESENT" ]; then
+		log "model secret '$MODEL_SECRET' has no model-key (pre-P2b api.key/model.name shape); replacing it with the P2b shape..."
+		kubectl --context "$CTX" -n "$NS" delete secret "$MODEL_SECRET" --wait=true >/dev/null
+		create_model_secret
+	else
+		log "model secret '$MODEL_SECRET' already in the P2b shape (has model-key); leaving it alone."
+	fi
 fi
 # The vLLM endpoint must be reachable from the operator node.
 VLLM_HOST_PORT=$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")
@@ -381,12 +411,37 @@ for c in d["spec"]["initContainers"]:
 	done
 
 	printf '## Model proxy\n\n'
+	# I60 (I50): the first I50 run recorded 0 forwarded requests while the proxy
+	# pod (checked by the reviewer at 19:43–19:45) had logged 9. The exact cause
+	# is UNKNOWN (the reviewer's hypothesis — the I32 enforcement-evidence relay
+	# recreated the pod mid-run — is not confirmed). The anomaly is real and the
+	# count discrepancy is unexplained; the fix is to never be silent about it:
+	# the WARNING below flags a 0 on a Succeeded run, and PROXY_RC / PROXY_LOG
+	# capture whether the log fetch itself failed and what kubectl said, so a
+	# failed fetch is recorded in EVIDENCE.md instead of silently showing 0.
 	# The dev stand-in logs ONE structured line per forwarded request
 	# (method, path, status, duration_ms; no bodies, no headers, no auth).
-	# Count those lines for this run's proxy pod. Do NOT swallow kubectl
-	# errors: capture stderr so a zero count is never silent.
-	PROXY_LOG=$(kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" 2>&1)
-	PROXY_RC=$?
+	# Count those lines for this run's proxy pod. Do NOT swallow kubectl errors:
+	# a FAILING `kubectl logs` (bad pod name, pod gone, etc.) must NOT abort the
+	# script under `set -euo pipefail` — the previous version read $? after the
+	# substitution, which was unreachable (the substitution failure aborted the
+	# script before that line), so the error never reached EVIDENCE.md. Capture
+	# the failure EXPLICITLY and KEEP the captured output: on failure PROXY_LOG
+	# holds the kubectl error text (recorded below) and PROXY_RC is non-zero,
+	# so the "proxy log fetch failed" branch records the actual error. On
+	# success PROXY_RC=0 and that branch is skipped. A pod that is simply GONE
+	# is distinguished (PROXY_RC=1, the message notes the pod was not found).
+	PROXY_RC=0
+	PROXY_LOG=$(kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" 2>&1) || PROXY_RC=$?
+	if [ "$PROXY_RC" -ne 0 ]; then
+		# Distinguish a gone pod (logs failed AND the pod is not present) from
+		# another logs failure. PROXY_LOG still holds the raw kubectl error text
+		# (NOT blanked) so it is recorded below.
+		if ! kubectl --context "$CTX" -n "$NS" get "pod/${LOOP}-proxy" >/dev/null 2>&1; then
+			PROXY_RC=1
+			PROXY_LOG="(pod ${LOOP}-proxy not found; kubectl logs output: ${PROXY_LOG:-<empty>})"
+		fi
+	fi
 	# The Go stdlib log package prefixes each line with a timestamp, so the
 	# forwarded line is '<date> <time> proxy: forwarded ...' — match the
 	# message substring, not a line anchor.

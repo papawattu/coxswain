@@ -56,10 +56,32 @@ pull requests; design is reviewed in review docs.**
 - **Builder: watch for new reviews** with `git tag -l 'review/*'` (or
   `git log --grep '^review('`). Before each work session, read any review
   tagged since your last one. P1 items block the next phase.
-- **Closing an issue:** tick its box in the review doc and add the fixing
-  commit hash. Reference the issue ID in the fix commit subject
+- **Closing an issue (I57):** tick its box in the review doc and add the fixing
+  commit hash ONLY — do not rewrite the item's text (the item's problem/fix/
+  acceptance text is the reviewer's; the closer just ticks the box and appends
+  the hash). Reference the issue ID in the fix commit subject
   (e.g. `I6: …`). Don't edit other parts of a review doc; reply to a
   verdict by adding a `Builder response:` line under the issue.
+  **Tick only after the fix has MERGED, and cite the squash hash** — the
+  merge commit's subject on `main`, not the branch HEAD or a pre-merge hash
+  (I76: a box ticked from a branch hash before merge is wrong and unmergeable
+  in place). The tick is part of a review-doc PR (a later round or a
+  housekeeping commit), never on the fix branch itself while it is still
+  unmerged.
+- **After replying to review threads, confirm no review is stuck PENDING**
+  (I76). A reply posted while a review is in the PENDING state is invisible
+  and blocks the reviewer's review. After posting replies, run
+  `gh api repos/<owner>/<repo>/pulls/<n>/reviews --jq '[.[]|select(.state=="PENDING")|.id]'`
+  and confirm it prints `[]` before ending the turn. If a review is PENDING,
+  submit it yourself (event COMMENT — builder, reviewer and owner share one
+  GitHub account, so there is no "not yours") and re-run the check until it
+  prints `[]`.
+- **Work a queue of items to completion without stopping to ask** (I76). When
+  handed a list of independent review items, carry on through the whole queue
+  — branch, fix, PR, reply, mark ready — and only stop at the end of the
+  queue or at a genuine blocker (a decision that needs the owner, a host
+  memory limit, a credential scope). Don't pause after each item to ask
+  "shall I continue?"; the queue is the instruction.
 - **Stage explicit paths, never `git add -A`** (I31). The owner and reviewer
   both edit files in the same tree; `git add -A` sweeps their in-progress edits
   (e.g. the owner's `CONTEXT.md` direction change) into builder commits and
@@ -168,11 +190,29 @@ make test       # Run unit tests
   check to "iterate").
 - Mutations run in a **scratch worktree** (`git worktree add`), never in the
   working tree. Record the result; delete the worktree.
+- **After any mutation KIND run, redeploy a build of `main` and say so in the
+  PR** (I76). A mutation operator left deployed (e.g. a budget-gate-disabled
+  build) is a live hazard: it masks the real behaviour and can confuse a
+  later reviewer or run. Redeploy the real `main` image after the mutation
+  run, and record in the PR that the cluster was restored to `main`.
 - Kind-run logs and generated evidence are **never discarded or redirected to
   `/dev/null`**.
+- **Paste command output for any "shown working" claim; never state an
+  unverified root cause** (I76). A claim that something works on kind (or
+  anywhere) must carry the actual command + output in the PR or review reply,
+  not a bare assertion. A doc comment or message that asserts *why* something
+  happened (a root cause) is only allowed when that cause was actually
+  verified (a kind test, a log, a repro); otherwise state that the cause is
+  unknown and the observation is unexplained. Don't write a confident cause
+  that a test disproves.
 - Any shell script embedded in Go (Job or init-container scripts) has an
   **execution test**: it runs the real generated script with only path or host
-  constants substituted, before any kind run.
+  constants substituted, before any kind run. A standalone hack script (e.g.
+  `hack/sample-run.sh`) is verified the same way: **execute the real changed
+  block with stubbed commands**, not a re-implementation. Copy the exact lines
+  into a harness that stubs the external commands (a fake `kubectl` on the
+  PATH), and run it — don't paraphrase the logic into a test that may diverge
+  from the committed script.
 - When a reviewer names a mutation, the builder applies **exactly** that diff
   in a scratch worktree and records the result. A broader mutation doesn't
   count.

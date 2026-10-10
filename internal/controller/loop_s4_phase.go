@@ -528,8 +528,10 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// init marker at 1 — was rejected: it would change the written
 		// .coxswain/iteration value, the runner's read-back, and the
 		// verifyJobName <=0 fallback for no behavioural gain.)
-		if claim.Iteration != loop.Status.Iteration &&
-			(claim.Iteration != 0 || loop.Status.Iteration != 0) {
+		// I63 (I48): the second clause is redundant — claim.Iteration != 0 ||
+		// loop.Status.Iteration != 0 is true whenever claim.Iteration !=
+		// loop.Status.Iteration (if they differ, at least one is non-zero). Dropped.
+		if claim.Iteration != loop.Status.Iteration {
 			logf.FromContext(ctx).Info("stale claim from a previous iteration ignored",
 				"claimIteration", claim.Iteration,
 				"statusIteration", loop.Status.Iteration)

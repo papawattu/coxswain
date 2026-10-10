@@ -227,9 +227,13 @@ isolated network, checks pass" — not "an SDLC that ships a PR."
   `host:port` becomes `http://host:port`, so `192.168.1.20:8000` →
   `http://192.168.1.20:8000`, which is exactly the vLLM address). The
   `endpointSecretRef` Secret is mounted read-only at `/model-creds`; the
-  stand-in proxy (`cmd/proxy-standin/main.go`) **fatals at startup if no
-  readable key file exists**, so the Secret must carry at least one entry —
-  vLLM needs no key, so the Secret holds `apiKey: "vllm-no-auth"` (dummy).
+  metering model proxy (P2b, `cmd/model-proxy/main.go`) **fatals at startup if no
+  readable key file exists**, so the Secret must carry the key literally
+  named `model-key` (the operator sets `MODEL_CRED_FILE=/model-creds/.data/
+  model-key`, `loop_controller.go`) plus the documented `MODEL_BASE_URL` entry
+  (the agent's `COX_MODEL_BASE_URL` value). vLLM needs no key, so the Secret
+  holds `model-key: "p2b-dummy-key"` (dummy) — the old `api.key`/`model.name`
+  shape left the `model-key` file empty and the proxy crashlooped (I75).
   The proxy forwards `:8080 → MODEL_ENDPOINT` (reverse proxy).
 - **The agent side.** `COX_MODEL_BASE_URL` is set by the operator to the
   proxy Service URL (`ensureSandbox`, `loop_controller.go:653`); a Loop

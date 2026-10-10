@@ -9,9 +9,10 @@
 #   2. ensure the Loop namespace has the git-credential Secret
 #      (samples-git-cred, copied from the seeded samples ns — never from
 #      masked output) and the model Secret (vllm-no-auth),
-#   3. apply the AgentPolicy and Loop manifests for the task
-#      (examples/<app>/tasks/<n>.agentpolicy.yaml, <n>.loop.yaml),
-#      deleting a prior Loop first. spec.agent.image is left empty in the
+#   3. apply the Loop manifest for the task (examples/<app>/tasks/<n>.loop.yaml),
+#      deleting a prior Loop first, plus the task's AgentPolicy manifest when one
+#      exists (a D46 task may have none — the AgentPolicy is optional).
+#      spec.agent.image is left empty in the
 #      manifest: the operator's --runner-image flag supplies the runner
 #      entrypoint, and the driver preflights that the controller runs with
 #      a non-empty --runner-image (and that it agrees with RUNNER_IMG if
@@ -79,7 +80,10 @@ LOOP="gocli-task$TASK"
 LOOP_YAML="$ROOT/examples/$APP/tasks/$TASK.loop.yaml"
 POLICY_YAML="$ROOT/examples/$APP/tasks/$TASK.agentpolicy.yaml"
 [ -f "$LOOP_YAML" ] || die "manifest $LOOP_YAML not found (task $TASK not defined)"
-[ -f "$POLICY_YAML" ] || die "manifest $POLICY_YAML not found (task $TASK not defined)"
+# D46: the task's AgentPolicy is optional — some tasks (e.g. the D46 gocli
+# task 1) ship no AgentPolicy manifest. Apply it only when it exists; the Loop
+# is applied in either case. (A missing AgentPolicy is not a fatal error.)
+[ -f "$POLICY_YAML" ] || log "no AgentPolicy for this task (D46)"
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +105,13 @@ if [ "$MODE" = "dry-run" ]; then
 	# targets the pinned ctx. The namespace must exist for server-side
 	# validation of the Secret reference (it is not — the ref is a name
 	# only, so a plain dry-run=server is enough).
-	kubectl --context "$CTX" apply -f "$POLICY_YAML" -f "$LOOP_RENDER" --dry-run=server \
-		|| die "server-side validation failed (are the coxswain CRDs installed? 'make install' / config/crd)"
+	if [ -f "$POLICY_YAML" ]; then
+		kubectl --context "$CTX" apply -f "$POLICY_YAML" -f "$LOOP_RENDER" --dry-run=server \
+			|| die "server-side validation failed (are the coxswain CRDs installed? 'make install' / config/crd)"
+	else
+		kubectl --context "$CTX" apply -f "$LOOP_RENDER" --dry-run=server \
+			|| die "server-side validation failed (are the coxswain CRDs installed? 'make install' / config/crd)"
+	fi
 	log "dry-run OK: manifests validate (CRDs accept the shapes; nothing created)"
 	exit 0
 fi
@@ -243,11 +252,15 @@ VLLM_HOST_PORT=$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv
 log "vLLM endpoint: $VLLM_HOST_PORT (must be reachable from the kind node)"
 
 # ---------------------------------------------------------------------------
-# 3. AgentPolicy + Loop (delete a prior Loop first; the AgentPolicy is
-#    replaced via apply).
+# 3. AgentPolicy (optional) + Loop (delete a prior Loop first; the AgentPolicy
+#    is replaced via apply when one exists — D46 tasks may have none).
 # ---------------------------------------------------------------------------
-log "applying AgentPolicy manifest(s)..."
-kubectl --context "$CTX" apply -f "$POLICY_YAML"
+if [ -f "$POLICY_YAML" ]; then
+	log "applying AgentPolicy manifest(s)..."
+	kubectl --context "$CTX" apply -f "$POLICY_YAML"
+else
+	log "no AgentPolicy for this task (D46)"
+fi
 
 if kubectl --context "$CTX" -n "$NS" get loop "$LOOP" >/dev/null 2>&1; then
 	log "deleting prior loop '$LOOP' (fresh run)..."

@@ -35,6 +35,7 @@ const (
 	a1AgentLabelKey = "kubearmor-app"
 	a1AgentLabelVal = "kubearmor"
 	a1AgentOwner    = "kubearmor-agent"
+	a1LoopLabelKey  = "coxswain.io/loop"
 )
 
 func a1Enforcer(t *testing.T, nodes []corev1.Node, agentPods []corev1.Pod, kapt *unstructured.Unstructured) *KubeArmorEnforcer {
@@ -116,8 +117,8 @@ func a1Kapt() *unstructured.Unstructured {
 		},
 	})
 	obj.Object["spec"] = map[string]any{
-		"selector": map[string]any{
-			"matchLabels": map[string]any{"coxswain.io/loop": "l1"},
+		KaptSelectorKey: map[string]any{
+			KaptMatchLabelsKey: map[string]any{a1LoopLabelKey: "l1"},
 		},
 	}
 	return obj
@@ -131,8 +132,8 @@ func a1Loop() *coxv1alpha1.Loop {
 	// The test sets it to the hash of the a1Kapt spec so the spec-hash check
 	// passes.
 	spec := map[string]any{
-		"selector": map[string]any{
-			"matchLabels": map[string]any{"coxswain.io/loop": "l1"},
+		KaptSelectorKey: map[string]any{
+			KaptMatchLabelsKey: map[string]any{a1LoopLabelKey: "l1"},
 		},
 	}
 	l.Status.Policy = &coxv1alpha1.PolicyStatus{
@@ -238,8 +239,8 @@ func TestA1PolicySelectorMismatch(t *testing.T) {
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
 	kapt := a1Kapt()
 	kapt.Object["spec"] = map[string]any{
-		"selector": map[string]any{
-			"matchLabels": map[string]any{"coxswain.io/loop": "different-loop"},
+		" + KaptSelectorKey + ": map[string]any{
+			KaptMatchLabelsKey: map[string]any{a1LoopLabelKey: "different-loop"},
 		},
 	}
 	e := a1Enforcer(t, nodes, pods, kapt)

@@ -25,6 +25,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const a1KubeArmorNS = "kubearmor"
+
 var _ = Describe("A1 static enforcement gate (D52)", func() {
 	var ctx context.Context
 
@@ -32,7 +34,7 @@ var _ = Describe("A1 static enforcement gate (D52)", func() {
 		ctx = context.Background()
 		// The KubeArmor agent pods live in the "kubearmor" namespace.
 		// Create it once (idempotent).
-		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kubearmor"}}
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: a1KubeArmorNS}}
 		_ = k8sClient.Create(ctx, ns)
 	})
 

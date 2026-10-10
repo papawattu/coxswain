@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -38,6 +40,13 @@ var ErrNoProxyFQDNs = fmt.Errorf("KubeArmorEnforcer: proxy FQDN functions are no
 // object (no KubeArmor Go type dependency) and owner-refs it to the Loop (P2).
 type KubeArmorEnforcer struct {
 	Client client.Client
+	// APIReader is the direct API reader (mgr.GetAPIReader()) for the A1
+	// static check's Node and agent-Pod reads. The operator's cached client
+	// (mgr.GetClient()) has its Pod cache label-filtered to proxy components,
+	// so KubeArmor agent pods are invisible through it. The APIReader bypasses
+	// the cache and reads directly from the API server. When nil, the Enforcing
+	// method falls back to Client (envtest tests use the fake client directly).
+	APIReader client.Reader
 	// proxyFQDN / egressProxyFQDN are the per-Loop proxy Service FQDNs the
 	// agent's DNS allowlist carries (built by the controller's reconciler from
 	// proxyServiceName / egressProxyServiceName + the cluster domain; R16 I44
@@ -105,7 +114,7 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// D41d: the agent reaches each tool proxy via its Service FQDN; the
 	// per-tool FQDNs are added to the agent's DNS allowlist so the resolver
 	// (the pod-level policy's spec.action Block) does not block the queries.
-	var toolFQDNs []string
+	toolFQDNs := make([]string, 0, len(p.Tools))
 	for _, t := range p.Tools {
 		toolFQDNs = append(toolFQDNs, e.ToolProxyFQDN(loop.Name, loop.Namespace, t.Name))
 	}
@@ -357,7 +366,7 @@ func (e *KubeArmorEnforcer) Enforcing(ctx context.Context, loop *v1alpha1.Loop) 
 
 	// Fact 2 (and the first half of fact 1): find nodes with the BPF-LSM label.
 	nodeList := &corev1.NodeList{}
-	if err := e.Client.List(ctx, nodeList, client.MatchingLabels{bpfLabel: bpfLabelValue}); err != nil {
+	if err := e.a1Reader().List(ctx, nodeList, client.MatchingLabels{bpfLabel: bpfLabelValue}); err != nil {
 		return false, ReasonEngineUnavailable
 	}
 	if len(nodeList.Items) == 0 {
@@ -394,7 +403,7 @@ func (e *KubeArmorEnforcer) Enforcing(ctx context.Context, loop *v1alpha1.Loop) 
 	kapt := &unstructured.Unstructured{}
 	kapt.SetGroupVersionKind(KubeArmorGVK)
 	kaptName := "coxswain-" + loop.Name
-	if err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: kaptName}, kapt); err != nil {
+	if err := e.a1Reader().Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: kaptName}, kapt); err != nil {
 		if errors.IsNotFound(err) {
 			return false, ReasonEnforcementUnverified // policy not yet created
 		}
@@ -407,27 +416,107 @@ func (e *KubeArmorEnforcer) Enforcing(ctx context.Context, loop *v1alpha1.Loop) 
 	if !metav1.IsControlledBy(kapt, loop) {
 		return false, ReasonEnforcementUnverified
 	}
-	// Spec matches the operator's rendered policy (effective-policy hash).
-	// The operator records the hash in loop.Status.Policy.EffectiveHash.
-	if loop.Status.Policy != nil && loop.Status.Policy.EffectiveHash != "" {
-		// The spec match is a re-computation: the operator rendered the policy
-		// with this hash, so the live policy's spec should match. In practice,
-		// the operator's Apply creates the policy with the rendered spec, so
-		// the hash match is a sanity check. For now, the existence +
-		// controlled + selector match is the primary evidence; the spec hash
-		// match is a belt-and-suspenders check that the policy wasn't mutated.
-		_ = loop.Status.Policy.EffectiveHash
+	// Spec matches the operator's rendered policy (D52 fact 3).
+	liveSpec, found, _ := unstructured.NestedMap(kapt.Object, KaptSpecKey)
+	if !found {
+		return false, ReasonEnforcementUnverified
+	}
+	liveHash := kaptSpecHash(liveSpec)
+	if loop.Status.Policy == nil || loop.Status.Policy.KaptSpecHash == "" {
+		return false, ReasonEnforcementUnverified
+	}
+	if liveHash != loop.Status.Policy.KaptSpecHash {
+		return false, ReasonEnforcementUnverified
 	}
 	// Selector matches the sandbox pod template labels. The sandbox pod
 	// template carries the coxswain.io/loop label (ensureSandbox), so the
 	// policy's selector must match it.
 	sel, _, _ := unstructured.NestedMap(kapt.Object, KaptSpecKey, KaptSelectorKey)
 	raw, _ := sel[KaptMatchLabelsKey].(map[string]any)
-	if raw["coxswain.io/loop"] != loop.Name {
-		return false, ReasonEnforcementUnverified
+	templateLabels := sandboxPodTemplateLabels(loop.Name)
+	for k, v := range raw {
+		want, ok := templateLabels[k]
+		if !ok || v != want {
+			return false, ReasonEnforcementUnverified
+		}
 	}
 
 	return true, ""
+}
+
+// sandboxPodTemplateLabels returns the labels the operator renders on the
+// sandbox pod template (A1, D52 fact 3).
+func sandboxPodTemplateLabels(loopName string) map[string]string {
+	return map[string]string{
+		"coxswain.io/loop":            loopName,
+		"app.kubernetes.io/component": "agent",
+	}
+}
+
+// kaptSpecHash computes the canonical hash of a KubeArmorPolicy's spec field.
+func kaptSpecHash(spec any) string {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return "unhashable"
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
+}
+
+// a1Reader returns the reader for the A1 static check's Node and agent-Pod reads.
+func (e *KubeArmorEnforcer) a1Reader() client.Reader {
+	if e.APIReader != nil {
+		return e.APIReader
+	}
+	return e.Client
+}
+
+// BPFNodeAffinity returns the required node affinity for the sandbox pod (A1, D52).
+func (e *KubeArmorEnforcer) BPFNodeAffinity() *corev1.Affinity {
+	if e.AllowUnenforced {
+		return nil
+	}
+	key := e.BPFLabel
+	if key == "" {
+		key = "kubearmor.io/enforcer"
+	}
+	val := e.BPFLabelValue
+	if val == "" {
+		val = "bpf"
+	}
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      key,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{val},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// KaptSpecHash returns the canonical hash of the rendered KubeArmorPolicy spec
+// for the given Loop and effective policy (A1, D52 fact 3).
+func (e *KubeArmorEnforcer) KaptSpecHash(loop *v1alpha1.Loop, p policy.EffectivePolicy) string {
+	egressFQDN := ""
+	if len(p.Network) > 0 {
+		egressFQDN = e.EgressProxyFQDN(loop.Name, loop.Namespace)
+	}
+	toolFQDNs := make([]string, 0, len(p.Tools))
+	for _, t := range p.Tools {
+		toolFQDNs = append(toolFQDNs, e.ToolProxyFQDN(loop.Name, loop.Namespace, t.Name))
+	}
+	obj := EmitKubeArmorPolicyWithToolFQDNs(loop.Name, loop.Namespace, policy.Translate(p, e.ProxyFQDN(loop.Name, loop.Namespace), egressFQDN), toolFQDNs)
+	spec, _, _ := unstructured.NestedMap(obj.Object, KaptSpecKey)
+	return kaptSpecHash(spec)
 }
 
 // agentNamespace returns the KubeArmor agent's namespace (operator config).
@@ -474,7 +563,7 @@ func (e *KubeArmorEnforcer) listAgentPods(ctx context.Context, ns, label, nodeNa
 		key = parts[0]
 	}
 	pods := &corev1.PodList{}
-	if err := e.Client.List(ctx, pods, client.InNamespace(ns), client.MatchingLabels{key: value}); err != nil {
+	if err := e.a1Reader().List(ctx, pods, client.InNamespace(ns), client.MatchingLabels{key: value}); err != nil {
 		return nil, err
 	}
 	// Filter to pods on the given node.

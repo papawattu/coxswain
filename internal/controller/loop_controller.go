@@ -1342,6 +1342,14 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 // kept Running even though spec.suspend=true (a Succeeded Loop's deliver Job
 // is in flight — suspending would strand a half-pushed PR, so the operator
 // refuses the pause and lets delivery complete).
+// applyBPFNodeAffinity sets the sandbox pod's required node affinity (A1, D52).
+// Nil affinity (allow-unenforced) is a no-op.
+func applyBPFNodeAffinity(e engine.Enforcer, spec *corev1.PodSpec) {
+	if aff := e.BPFNodeAffinity(); aff != nil {
+		spec.Affinity = aff
+	}
+}
+
 func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) error {
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
@@ -1502,9 +1510,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// NOT --allow-unenforced (a kind cluster without KubeArmor labels must
 		// not have its sandboxes wedged Pending).
 		if r.Enforcer != nil {
-			if aff := r.Enforcer.BPFNodeAffinity(); aff != nil {
-				desired.Spec.PodTemplate.Spec.Affinity = aff
-			}
+			applyBPFNodeAffinity(r.Enforcer, &desired.Spec.PodTemplate.Spec)
 		}
 		// I36: the agent and any future sidecars do not share a process
 		// namespace (no nsenter / /proc/<pid> cross-container access).

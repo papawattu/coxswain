@@ -129,6 +129,24 @@ delivery should drop it (or the runner should write it under `.coxswain/`).
 
 **Owner:** choose (a) keep, or (b) exclude from delivery.
 
+**Owner decision (2026-10-10), D51 = (b): exclude `PLAN.md` from delivery.**
+- **Where it comes from:** the runner already writes its plan to
+  `.coxswain/PLAN.md`, which its commit excludes (`runner/phase.go:477`, `:704`).
+  The root `PLAN.md` in papawattu/coxswain-sandbox#1 was written by the
+  agent itself during Implementing (#2 has none).
+- **Constraint:** delivery pushes the verified commit unchanged (head ==
+  `verifiedCommit`), so the file must be kept out of the agent's commit, not
+  stripped at delivery.
+- **Builder work (I80):** the runner's commit also excludes a root `PLAN.md`
+  that is **not tracked in the base commit**, so a repo's own tracked
+  `PLAN.md` can still be changed. The implementing prompt also tells the agent
+  its plan lives in `.coxswain/PLAN.md`.
+- **Acceptance:**
+  - a runner test where the agent writes a root `PLAN.md` and the commit
+    excludes it;
+  - a test where a base-tracked `PLAN.md` is modified and the change is kept;
+  - mutation: drop the exclude, and the first test fails.
+
 ### I77. init-workspace can wipe agent work on a pod restart
 
 - [ ] Open (design)

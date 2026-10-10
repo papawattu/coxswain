@@ -28,6 +28,15 @@ import (
 
 // a1Enforcer builds a KubeArmorEnforcer with the given nodes, agent pods, and
 // KubeArmorPolicy objects, for the A1 static check tests.
+var a1True = true
+
+const (
+	a1AgentNS       = "kubearmor"
+	a1AgentLabelKey = "kubearmor-app"
+	a1AgentLabelVal = "kubearmor"
+	a1AgentOwner    = "kubearmor-agent"
+)
+
 func a1Enforcer(t *testing.T, nodes []corev1.Node, agentPods []corev1.Pod, kapt *unstructured.Unstructured) *KubeArmorEnforcer {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -65,10 +74,10 @@ func readyAgentPod(nodeName, name string) corev1.Pod {
 	return corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: "kubearmor",
-			Labels:    map[string]string{"kubearmor-app": "kubearmor"},
+			Namespace: a1AgentNS,
+			Labels:    map[string]string{a1AgentLabelKey: a1AgentLabelVal},
 			OwnerReferences: []metav1.OwnerReference{
-				{Kind: "DaemonSet", Name: "kubearmor-agent", Controller: &controller},
+				{Kind: "DaemonSet", Name: a1AgentOwner, Controller: &controller},
 			},
 		},
 		Spec:   corev1.PodSpec{NodeName: nodeName},
@@ -81,10 +90,10 @@ func notReadyAgentPod(nodeName, name string) corev1.Pod {
 	return corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: "kubearmor",
-			Labels:    map[string]string{"kubearmor-app": "kubearmor"},
+			Namespace: a1AgentNS,
+			Labels:    map[string]string{a1AgentLabelKey: a1AgentLabelVal},
 			OwnerReferences: []metav1.OwnerReference{
-				{Kind: "DaemonSet", Name: "kubearmor-agent", Controller: &controller},
+				{Kind: "DaemonSet", Name: a1AgentOwner, Controller: &controller},
 			},
 		},
 		Spec:   corev1.PodSpec{NodeName: nodeName},
@@ -92,42 +101,40 @@ func notReadyAgentPod(nodeName, name string) corev1.Pod {
 	}
 }
 
-func a1Kapt(loopName, loopNS string) *unstructured.Unstructured {
+func a1Kapt() *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(KubeArmorGVK)
-	obj.SetName("coxswain-" + loopName)
-	obj.SetNamespace(loopNS)
+	obj.SetName("coxswain-l1")
+	obj.SetNamespace("default")
 	obj.SetOwnerReferences([]metav1.OwnerReference{
 		{
 			APIVersion: "coxswain.io/v1alpha1",
 			Kind:       "Loop",
-			Name:       loopName,
+			Name:       "l1",
 			UID:        "test-uid",
-			Controller: boolPtr(true),
+			Controller: &a1True,
 		},
 	})
 	obj.Object["spec"] = map[string]any{
 		"selector": map[string]any{
-			"matchLabels": map[string]any{"coxswain.io/loop": loopName},
+			"matchLabels": map[string]any{"coxswain.io/loop": "l1"},
 		},
 	}
 	return obj
 }
 
-func boolPtr(b bool) *bool { return &b }
-
-func a1Loop(name, ns string) *coxv1alpha1.Loop {
+func a1Loop() *coxv1alpha1.Loop {
 	return &coxv1alpha1.Loop{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: "test-uid"},
+		ObjectMeta: metav1.ObjectMeta{Name: "l1", Namespace: "default", UID: "test-uid"},
 	}
 }
 
 func TestA1AllFactsTrue(t *testing.T) {
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if !enforcing {
 		t.Fatalf("expected enforcing=true, got false (reason=%s)", reason)
@@ -140,9 +147,9 @@ func TestA1AllFactsTrue(t *testing.T) {
 func TestA1NoBPFNode(t *testing.T) {
 	nodes := []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}}
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (no BPF node), got true")
@@ -155,9 +162,9 @@ func TestA1NoBPFNode(t *testing.T) {
 func TestA1AgentPodNotReady(t *testing.T) {
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{notReadyAgentPod("node1", "ka-agent-1")}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (agent not Ready), got true")
@@ -170,9 +177,9 @@ func TestA1AgentPodNotReady(t *testing.T) {
 func TestA1AgentPodMissingOnNode(t *testing.T) {
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (no agent pod on node), got true")
@@ -186,7 +193,7 @@ func TestA1PolicyNotYetCreated(t *testing.T) {
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
 	e := a1Enforcer(t, nodes, pods, nil)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (policy not created), got true")
@@ -199,12 +206,12 @@ func TestA1PolicyNotYetCreated(t *testing.T) {
 func TestA1PolicyNotControlledByLoop(t *testing.T) {
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	kapt.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "other", UID: "other-uid", Controller: boolPtr(true)},
+		{APIVersion: "apps/v1", Kind: "Deployment", Name: "other", UID: "other-uid", Controller: &a1True},
 	})
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (policy not controlled by loop), got true")
@@ -217,14 +224,14 @@ func TestA1PolicyNotControlledByLoop(t *testing.T) {
 func TestA1PolicySelectorMismatch(t *testing.T) {
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	kapt.Object["spec"] = map[string]any{
 		"selector": map[string]any{
 			"matchLabels": map[string]any{"coxswain.io/loop": "different-loop"},
 		},
 	}
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (selector mismatch), got true")
@@ -240,18 +247,18 @@ func TestA1AgentPodNotDaemonSet(t *testing.T) {
 	pod := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "ka-agent-1",
-			Namespace: "kubearmor",
-			Labels:    map[string]string{"kubearmor-app": "kubearmor"},
+			Namespace: a1AgentNS,
+			Labels:    map[string]string{a1AgentLabelKey: a1AgentLabelVal},
 			OwnerReferences: []metav1.OwnerReference{
-				{Kind: "Deployment", Name: "kubearmor-agent", Controller: &controller},
+				{Kind: "Deployment", Name: a1AgentOwner, Controller: &controller},
 			},
 		},
 		Spec:   corev1.PodSpec{NodeName: "node1"},
 		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
 	}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, []corev1.Pod{pod}, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (agent not DaemonSet-owned), got true")
@@ -267,9 +274,9 @@ func TestA1MultipleNodesAllReady(t *testing.T) {
 		readyAgentPod("node1", "ka-agent-1"),
 		readyAgentPod("node2", "ka-agent-2"),
 	}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if !enforcing {
 		t.Fatalf("expected enforcing=true (both nodes Ready), got false (reason=%s)", reason)
@@ -282,9 +289,9 @@ func TestA1MultipleNodesOneNotReady(t *testing.T) {
 		readyAgentPod("node1", "ka-agent-1"),
 		notReadyAgentPod("node2", "ka-agent-2"),
 	}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if enforcing {
 		t.Fatalf("expected enforcing=false (one node not Ready), got true")
@@ -300,9 +307,9 @@ func TestA1GateOpensFromSuspended(t *testing.T) {
 	// the sandbox pod, so it can report True even with no pod.
 	nodes := []corev1.Node{bpfNode("node1")}
 	pods := []corev1.Pod{readyAgentPod("node1", "ka-agent-1")}
-	kapt := a1Kapt("l1", "default")
+	kapt := a1Kapt()
 	e := a1Enforcer(t, nodes, pods, kapt)
-	loop := a1Loop("l1", "default")
+	loop := a1Loop()
 	enforcing, reason := e.Enforcing(context.Background(), loop)
 	if !enforcing {
 		t.Fatalf("expected enforcing=true (gate opens from Suspended), got false (reason=%s)", reason)

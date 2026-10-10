@@ -72,10 +72,10 @@ type KubeArmorEnforcer struct {
 	// engine's selectors, not hard-coded ones). Defaults when empty:
 	// AgentNamespace="kubearmor", AgentPodLabel="kubearmor-app=kubearmor",
 	// BPFLabel="kubearmor.io/enforcer", BPFLabelValue="bpf".
-	AgentNamespace  string
-	AgentPodLabel   string
-	BPFLabel        string
-	BPFLabelValue   string
+	AgentNamespace string
+	AgentPodLabel  string
+	BPFLabel       string
+	BPFLabelValue  string
 }
 
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective

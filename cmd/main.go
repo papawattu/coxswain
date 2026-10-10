@@ -325,10 +325,10 @@ func main() {
 		// (no-op) only under the --allow-unenforced dev escape hatch (D38).
 		AllowUnenforced: allowUnenforced,
 		// A1 (D52): the static enforcement check config.
-		AgentNamespace:  kaAgentNamespace,
-		AgentPodLabel:   kaAgentPodLabel,
-		BPFLabel:        kaBPFLabel,
-		BPFLabelValue:   kaBPFLabelValue,
+		AgentNamespace: kaAgentNamespace,
+		AgentPodLabel:  kaAgentPodLabel,
+		BPFLabel:       kaBPFLabel,
+		BPFLabelValue:  kaBPFLabelValue,
 	}
 	// D38: the operator-side CNI self-test prober. It runs the probe pod in the
 	// fixed coxswain-cni-probe namespace, reads the termination message, and

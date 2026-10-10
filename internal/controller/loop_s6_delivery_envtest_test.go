@@ -1483,6 +1483,82 @@ var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
 		_, freshAnnOk := freshLoop.Annotations[redeliverAnnotation]
 		Expect(freshAnnOk).To(BeTrue(), "the user's redeliver annotation must still be KEPT on the persisted Loop (the Job is in progress)")
 	})
+
+	It("keeps the annotation AND persists a status change from the same reconcile when the deliver Job is in progress (P1 #100: finalizeLoopStatus must run, not early-return)", func() {
+		// P1 review on #100: the previous fix made Reconcile early-return (skip the
+		// WHOLE finalize) when deliverKeep was true. That skipped the trailing
+		// Status().Update, so any status change made earlier in the reconcile was
+		// NOT persisted. The fix threads deliverKeep into finalizeLoopStatus,
+		// which skips ONLY the removeDeliverAnnotation patch and still runs the
+		// status write.
+		//
+		// The keep case is the I49 in-progress state (the deliver Job has
+		// Failed=0 AND Succeeded=0 — a SUCCEEDED Job is deleted+re-run, not
+		// kept). In that state, ensureDeliver returns keep=true and skips the
+		// readback, so the status change must come from a path that runs AFTER
+		// ensureDeliver: recordEffectivePolicyHash (the C6a effective-policy hash
+		// in status.policy.effectiveHash). It sets that field when
+		// spec.policyRefs is non-empty and the hash differs from the stored
+		// value, and returns changed=true. Only finalizeLoopStatus's
+		// Status().Update persists it — with the old early-return (mutation (a)),
+		// the new hash never reached the API server.
+		ns := freshNS("p1-finalize")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "p1fin1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+
+		By("the deliver Job is in progress (Status.Failed=0, Status.Succeeded=0)")
+		Expect(job.Status.Failed).To(BeZero())
+		Expect(job.Status.Succeeded).To(BeZero())
+
+		By("adding the redeliver annotation while the Job is in progress (the keep case)")
+		s6AddRedeliverAnnotation(name, ns)
+
+		// Add a policyRef so recordEffectivePolicyHash has something to hash:
+		// it reads the AgentPolicy from the API server and sets
+		// status.policy.effectiveHash (a status change that only
+		// finalizeLoopStatus's Status().Update persists).
+		By("adding a policyRef (so recordEffectivePolicyHash sets status.policy.effectiveHash)")
+		policy := &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "p1fin-policy", Namespace: ns},
+			Spec: coxv1alpha1.AgentPolicySpec{
+				Exec:    []string{"/bin/sh"},
+				Network: []string{"example.com:443"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+		loopRef := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loopRef)).To(Succeed())
+		loopRef.Spec.PolicyRefs = append(loopRef.Spec.PolicyRefs, "p1fin-policy")
+		Expect(k8sClient.Update(ctx, loopRef)).To(Succeed())
+
+		By("reconciling: the effectiveHash is set (changed=true) and the annotation is KEPT")
+		loop := s6Reconcile(r, ns, name)
+
+		By("the persisted Loop KEEPS the redeliver annotation (the keep decision is honored)")
+		_, annOk := loop.Annotations[redeliverAnnotation]
+		Expect(annOk).To(BeTrue(), "the redeliver annotation must be KEPT (finalize skips removeDeliverAnnotation when keep is true)")
+
+		By("the status change from the same reconcile is PERSISTED (finalize ran the Status().Update, not an early return)")
+		// Re-read fresh from the API server: status.policy.effectiveHash must be
+		// set (recordEffectivePolicyHash set it this reconcile, and only
+		// finalizeLoopStatus's Status().Update persists it). With the old
+		// early-return (mutation (a)), the hash was never written and the fresh
+		// re-read still showed an empty effectiveHash.
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(fresh.Status.Policy).ToNot(BeNil(), "status.policy must be present after the reconcile (recordEffectivePolicyHash ran)")
+		Expect(fresh.Status.Policy.EffectiveHash).ToNot(BeEmpty(),
+			"status.policy.effectiveHash must be PERSISTED (finalize ran the Status().Update, not an early return — mutation (a))")
+		// The annotation is STILL present (kept) — finalize skipped the removal
+		// (mutation (b): if finalize dropped the annotation regardless, this
+		// fails).
+		_, freshAnnOk := fresh.Annotations[redeliverAnnotation]
+		Expect(freshAnnOk).To(BeTrue(), "the redeliver annotation must be KEPT on a fresh re-read (finalize skipped removeDeliverAnnotation, not the status write)")
+	})
 })
 
 var _ = Describe("S6: egress proxy hosts (unit)", func() {

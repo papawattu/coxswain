@@ -315,12 +315,12 @@ func redeliverEligible(loop *coxv1alpha1.Loop) bool {
 // concurrent writer (the test or a human) that landed between the re-read
 // and the patch — not the reconcile's own writes, which are ordered.
 func (r *LoopReconciler) removeDeliverAnnotation(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
-	// The I49 in-progress case is carried EXPLICITLY, not via an annotation:
-	// ensureDeliverRedeliver returns keep=true for a still-running deliver
-	// Job, and the caller (Reconcile) skips this end-of-pass patch — the
-	// annotation stays in place for the running Job (a fresh re-read would
-	// see the key still present and remove the annotation the Job needs for
-	// the later trigger).
+	// The I49 in-progress keep decision is carried EXPLICITLY (the redeliverKeep
+	// parameter on finalizeLoopStatus), not via an annotation: finalizeLoopStatus
+	// skips this end-of-pass patch when keep is true, so the annotation stays in
+	// place for a still-running deliver Job (a fresh re-read would otherwise see
+	// the key still present and remove the annotation the Job needs for the
+	// later trigger).
 	if _, ok := loop.Annotations[redeliverAnnotation]; !ok {
 		return false, nil
 	}

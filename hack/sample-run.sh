@@ -432,11 +432,10 @@ for c in d["spec"]["initContainers"]:
 	# the WARNING below flags a 0 on a Succeeded run, and PROXY_RC / PROXY_LOG
 	# capture whether the log fetch itself failed and what kubectl said, so a
 	# failed fetch is recorded in EVIDENCE.md instead of silently showing 0.
-	# The dev stand-in logs ONE structured line per forwarded request
-	# (method, path, status, duration_ms; no bodies, no headers, no auth).
-	# Count those lines for this run's proxy pod. Do NOT swallow kubectl errors:
-	# a FAILING `kubectl logs` (bad pod name, pod gone, etc.) must NOT abort the
-	# script under `set -euo pipefail` — the previous version read $? after the
+	# The metering model proxy (P2b onward) logs ONE JSON usage line per model
+	# request for this run's proxy pod. Do NOT swallow kubectl errors: a FAILING
+	# `kubectl logs` (bad pod name, pod gone, etc.) must NOT abort the script
+	# under `set -euo pipefail` — the previous version read $? after the
 	# substitution, which was unreachable (the substitution failure aborted the
 	# script before that line), so the error never reached EVIDENCE.md. Capture
 	# the failure EXPLICITLY and KEEP the captured output: on failure PROXY_LOG
@@ -455,10 +454,47 @@ for c in d["spec"]["initContainers"]:
 			PROXY_LOG="(pod ${LOOP}-proxy not found; kubectl logs output: ${PROXY_LOG:-<empty>})"
 		fi
 	fi
-	# The Go stdlib log package prefixes each line with a timestamp, so the
-	# forwarded line is '<date> <time> proxy: forwarded ...' — match the
-	# message substring, not a line anchor.
-	FORWARDED_COUNT=$(printf '%s\n' "$PROXY_LOG" | grep -c 'proxy: forwarded ' || true)
+	# Since P2b the metering model proxy logs ONE JSON line per model request
+	# (action=usage with promptTokens / completionTokens / source=model-proxy),
+	# not the old 'proxy: forwarded' line. Count the usage lines and sum the
+	# token counts (python3 is available on the kind node) for this run's proxy
+	# pod. (The old 'proxy: forwarded' grep has reported 0 on every run since
+	# P2b — the metering proxy never logs that string.)
+	PROXY_USAGE_TMP="$(mktemp)"
+	PROXY_STATS=$(printf '%s\n' "$PROXY_LOG" | python3 -c '
+import json, sys
+count = 0
+prompt = completion = 0
+lines = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    if "\"action\":\"usage\"" not in line:
+        continue
+    # The Go log package prefixes each line with a timestamp ("<date> <time>
+    # <level> ..."), so the JSON is a substring, not the whole line. Extract
+    # from the first "{" and parse that.
+    brace = line.find("{")
+    try:
+        d = json.loads(line[brace:]) if brace >= 0 else None
+    except Exception:
+        d = None
+    count += 1
+    lines.append(line)
+    if d is not None:
+        prompt += int(d.get("promptTokens", 0) or 0)
+        completion += int(d.get("completionTokens", 0) or 0)
+print(f"{count}\t{prompt}\t{completion}")
+with open(sys.argv[1], "w") as f:
+    f.write("\n".join(lines) + ("\n" if lines else ""))
+' "$PROXY_USAGE_TMP" || true)
+	PROXY_STATS="${PROXY_STATS:-$(printf '0\t0\t0')}"
+	FORWARDED_COUNT=$(printf '%s' "$PROXY_STATS" | cut -f1)
+	PROXY_PROMPT_SUM=$(printf '%s' "$PROXY_STATS" | cut -f2)
+	PROXY_COMPLETION_SUM=$(printf '%s' "$PROXY_STATS" | cut -f3)
+	PROXY_USAGE_LINES="$(cat "$PROXY_USAGE_TMP" 2>/dev/null || true)"
+	rm -f "$PROXY_USAGE_TMP"
 	# Sample vLLM request_success_total AFTER the run from each backend.
 	VLLM_BACKENDS="192.168.1.36:8000 192.168.1.37:8000"
 	vllm_sum_after() {
@@ -482,20 +518,21 @@ for c in d["spec"]["initContainers"]:
 	if [ -n "$VLLM_AFTER" ] && [ -n "$VLLM_BEFORE" ]; then
 		VLLM_DELTA=$((VLLM_AFTER - VLLM_BEFORE))
 	fi
-	printf 'forwarded-request count (one structured log line per forwarded request, no bodies/headers): %s\n\n' "$FORWARDED_COUNT"
-	# A Succeeded Loop with zero forwarded requests means the agent never
-	# called the model (or the log fetch failed). A silent zero would fail
-	# the I50 acceptance invisibly, so warn loudly.
+	printf 'model-request count (one metering-proxy usage log line per model request, P2b onward): %s\n' "$FORWARDED_COUNT"
+	printf 'token totals across those requests (prompt/completion): %s/%s\n\n' "$PROXY_PROMPT_SUM" "$PROXY_COMPLETION_SUM"
+	# A Succeeded Loop with zero model requests means the agent never called
+	# the model (or the log fetch failed). A silent zero would fail the I50
+	# acceptance invisibly, so warn loudly.
 	if [ "$PHASE" = "Succeeded" ] && { [ -z "${FORWARDED_COUNT:-}" ] || [ "$FORWARDED_COUNT" -eq 0 ] 2>/dev/null; }; then
-		printf '**WARNING: the Loop Succeeded but the proxy forwarded %s request(s). Either the agent never called the model, or the proxy log fetch failed.**\n\n' "${FORWARDED_COUNT:-0}"
+		printf '**WARNING: the Loop Succeeded but the metering proxy logged %s usage request(s). Either the agent never called the model, or the proxy log fetch failed.**\n\n' "${FORWARDED_COUNT:-0}"
 	fi
 	if [ "$PROXY_RC" -ne 0 ]; then
 		printf 'proxy log fetch failed (rc=%s); the count above may be wrong. Raw kubectl output:\n\n' "$PROXY_RC"
 		printf '%s\n' "$PROXY_LOG"
 		printf '\n'
 	fi
-	printf 'forwarded-request log lines:\n\n```\n'
-	printf '%s\n' "$PROXY_LOG" | grep 'proxy: forwarded ' || true
+	printf 'metering-proxy usage log lines (one per model request):\n\n```\n'
+	printf '%s\n' "$PROXY_USAGE_LINES"
 	printf '```\n\n'
 	printf 'vLLM request_success_total delta over the run (summed over both backends %s; read from each backend directly, not via the 192.168.1.20 LB): ' "$VLLM_BACKENDS"
 	if [ -n "$VLLM_DELTA" ]; then
@@ -503,7 +540,7 @@ for c in d["spec"]["initContainers"]:
 	else
 		printf 'unavailable (before=%s, after=%s)\n' "${VLLM_BEFORE:-?}" "${VLLM_AFTER:-?}"
 	fi
-	printf 'Note: the vLLM backends serve other traffic too, so this delta is an upper bound for this run. The forwarded count above is the operator-side ground truth for what the proxy of this Loop forwarded.\n\n'
+	printf 'Note: the vLLM backends serve other traffic too, so this delta is an upper bound for this run. The model-request count above is the operator-side ground truth for what the metering proxy of this Loop served.\n\n'
 
 	printf '## NetworkPolicies\n\n```\n'
 	# The verify netpol is labeled coxswain.io/verify-for, not loop, so the

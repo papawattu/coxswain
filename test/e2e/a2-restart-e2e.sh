@@ -360,11 +360,13 @@ start_events_watch() {
 	EV_WATCH_PID=$!
 }
 # stop_events_watch <outpath>: kill the watch and post-process the output into
-# true JSONL. `kubectl get events --watch-only -o json` emits a pretty-printed
-# JSON ARRAY (one big array of event objects), not line-delimited JSON — so
-# the raw watch file is not usable jsonl. jq is available and handles the
-# array: `jq -c '.[]'` emits one compact JSON object per line. If the file was
-# truncated mid-write (the watch was killed while the array was open), jq
+# true JSONL. `kubectl get events --watch-only -o json` emits a STREAM of
+# separate pretty-printed event objects (one per event, no enclosing array),
+# not line-delimited JSON — so the raw watch file is not usable jsonl. jq
+# handles both shapes: `jq -c 'if type=="array" then .[] else . end'` emits
+# one compact JSON object per line whether the stream was truncated to a
+# single object or concatenated objects. If the file was truncated
+# mid-write (the watch was killed in the middle of an event object), jq
 # fails; in that case salvage the complete top-level event objects with a
 # python fallback and note the truncation.
 stop_events_watch() {
@@ -378,7 +380,7 @@ stop_events_watch() {
 	raw="${out}.raw"
 	tmp="${out}.tmp"
 	mv -f "$out" "$raw" 2>/dev/null || cp "$out" "$raw"
-	if jq -c '.[]' "$raw" >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+	if jq -c 'if type=="array" then .[] else . end' "$raw" >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
 		mv -f "$tmp" "$out"
 		local n
 		n=$(wc -l <"$out")
@@ -415,21 +417,31 @@ print(f"# events.jsonl salvage: {len(objs)} complete event objects (raw was {len
 PY
 		log "events" "salvaged events to jsonl (raw watch was truncated; $raw kept)"
 	fi
-	# Validate the final jsonl (every non-empty line parses as JSON).
+	# Validate the final jsonl (every non-empty line is a JSON event object).
 	local final_out="$out"
-	python3 - "$final_out" <<'PY' 2>/dev/null || true
+	python3 - "$final_out" <<'PY' || true
 import sys, json
 n = bad = 0
+non_event = []
 for l in open(sys.argv[1], errors="replace"):
     l = l.strip()
     if not l:
         continue
     try:
-        json.loads(l)
-        n += 1
+        obj = json.loads(l)
     except Exception:
         bad += 1
-print(f"# events.jsonl: {n} valid jsonl lines, {bad} invalid", file=sys.stderr)
+        continue
+    if isinstance(obj, dict) and obj.get("kind") == "Event":
+        n += 1
+    else:
+        bad += 1
+        non_event.append(l[:80])
+print(f"# events.jsonl: {n} Event objects, {bad} invalid or non-Event lines", file=sys.stderr)
+for l in non_event[:5]:
+    print(f"#   not an Event: {l}", file=sys.stderr)
+if bad:
+    sys.exit(1)
 PY
 	log "events" "validated events.jsonl ($(wc -l <"$out" 2>/dev/null || echo 0) lines)"
 }

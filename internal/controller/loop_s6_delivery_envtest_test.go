@@ -1268,8 +1268,11 @@ var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, got)).To(Succeed())
 		_, annOk := got.Annotations[redeliverAnnotation]
 		Expect(annOk).To(BeTrue(), "the redeliver annotation must be KEPT while the Job is in progress (I49 in-progress case)")
-		_, keepOk := got.Annotations[redeliverKeepSignal]
-		Expect(keepOk).To(BeFalse(), "the in-memory keep marker must NEVER be persisted to the API server (in-memory only)")
+		// I61: the keep decision is carried EXPLICITLY (returned from
+		// ensureDeliverRedeliver), not as an in-memory annotation — the
+		// persisted Loop must NEVER carry the former marker annotation.
+		_, keepOk := got.Annotations["coxswain.io/redeliver-keep"]
+		Expect(keepOk).To(BeFalse(), "the keep decision must NOT be an annotation on the persisted Loop (I61: carried explicitly, not as a flag)")
 		// The Job is unchanged: same UID (not deleted/recreated).
 		// Nothing else changes: no delivery recorded, the condition stays
 		// InProgress, and the Job is unchanged.
@@ -1282,28 +1285,30 @@ var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
 		Expect(fresh.UID).To(Equal(uid), "an in-progress deliver Job must NOT be deleted/recreated by the annotation")
 		Expect(fresh.Annotations[verifyCommitAnnotation]).To(Equal(s6HeadCommit))
 
-		By("the Job SUCCEEDS: the read-back records the delivery, clears the keep marker, and removes the annotation")
+		By("the Job SUCCEEDS: the read-back records the delivery and removes the annotation")
 		job.Status.Succeeded = 1
 		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 		// Create the pod with a VALID termination message BEFORE the next
 		// reconcile: the read-back reads the pod (pod-blind: list by the
 		// deliver-for label) and records the delivery. If the pod does not
 		// exist yet, the read-back returns "no pod yet" and the condition
-		// stays InProgress — the annotation would NOT be removed in that
-		// pass (the keep marker is still set from the in-progress reconcile).
+		// stays InProgress — the annotation is NOT removed in that pass
+		// (the keep decision is still in effect from the in-progress
+		// reconcile: the Job is not yet terminal, so the end-of-pass patch is
+		// skipped and the annotation stays for the later trigger).
 		loop := s6Reconcile(r, ns, name) // drive the read-back to the "no pod yet" state (no outcome)
 		s6DeliverPod(ns, name, corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: s6ValidTermination(loop)},
 		})
-		loop = s6Reconcile(r, ns, name) // the read-back reads the pod's termination message + records the delivery + clears the keep marker + removes the annotation
+		loop = s6Reconcile(r, ns, name) // the read-back reads the pod's termination message + records the delivery + removes the annotation
 
 		By("re-reading the Loop from the API server: the delivery is recorded and the annotation is REMOVED")
 		Expect(loop.Status.Delivery).ToNot(BeNil(), "a successful read-back must record the delivery")
 		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
 		_, annOk = loop.Annotations[redeliverAnnotation]
-		Expect(annOk).To(BeFalse(), "the redeliver annotation must be REMOVED once the Job has succeeded (the read-back clears the keep marker)")
-		_, keepOk = loop.Annotations[redeliverKeepSignal]
-		Expect(keepOk).To(BeFalse(), "the in-memory keep marker must NEVER be persisted to the API server")
+		Expect(annOk).To(BeFalse(), "the redeliver annotation must be REMOVED once the Job has succeeded (the Job is terminal, so the end-of-pass patch runs)")
+		_, keepOk = loop.Annotations["coxswain.io/redeliver-keep"]
+		Expect(keepOk).To(BeFalse(), "the keep decision must NOT be an annotation on the persisted Loop (I61)")
 		ok, status, reason = s6Cond(loop)
 		Expect(ok).To(BeTrue())
 		Expect(status).To(Equal(metav1.ConditionTrue))
@@ -1433,6 +1438,50 @@ var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
 		Expect(status).To(Equal(metav1.ConditionFalse))
 		Expect(reason).To(Equal(coxv1alpha1.ReasonDeliveryInProgress),
 			"an empty-value annotation must trigger the same re-delivery as a valued one")
+	})
+
+	It("never carries the former keep-marker annotation on the persisted Loop after a redeliver (I61: the keep decision is carried explicitly, not as an annotation)", func() {
+		// I61 acceptance: the keep decision is carried explicitly (returned
+		// from ensureDeliverRedeliver), not as an annotation on the Loop. The
+		// former in-memory marker (coxswain.io/redeliver-keep) is removed
+		// entirely — so the persisted Loop must NEVER carry it, in BOTH the
+		// keep case (a still-running deliver Job) and the remove case (a
+		// failed delivery re-delivered). Drive the same-Loop lifecycle and
+		// assert the annotation is absent on every re-read from the API
+		// server.
+		ns := freshNS("i61-keep")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "i61keep1"
+		r := s6Succeeded(name, ns, "")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+
+		By("the deliver Job is in progress (Status.Failed=0, Status.Succeeded=0)")
+		Expect(job.Status.Failed).To(BeZero())
+		Expect(job.Status.Succeeded).To(BeZero())
+
+		By("adding the redeliver annotation while the Job is in progress (the keep case)")
+		s6AddRedeliverAnnotation(name, ns)
+
+		By("reconciling: the annotation is KEPT (the Job is in progress — I49 in-progress case)")
+		loop := s6Reconcile(r, ns, name)
+
+		By("the persisted Loop keeps the redeliver annotation but carries NO keep-marker annotation (I61)")
+		_, annOk := loop.Annotations[redeliverAnnotation]
+		Expect(annOk).To(BeTrue(), "the redeliver annotation must be KEPT while the Job is in progress")
+		_, keepOk := loop.Annotations["coxswain.io/redeliver-keep"]
+		Expect(keepOk).To(BeFalse(), "the persisted Loop must NEVER carry the former keep-marker annotation (I61: the keep decision is carried explicitly, not as an annotation)")
+
+		By("re-reading fresh from the API server: the keep-marker annotation is still absent (the fresh re-read is what a future r.Update(loop) would persist)")
+		freshLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, freshLoop)).To(Succeed())
+		_, freshKeepOk := freshLoop.Annotations["coxswain.io/redeliver-keep"]
+		Expect(freshKeepOk).To(BeFalse(), "the keep-marker annotation must be absent on a fresh re-read from the API server (I61: the keep decision is carried explicitly, not as an annotation on the Loop)")
+		// The redeliver annotation (the USER's) is still present (kept for the
+		// running Job) — only the internal keep decision changed representation.
+		_, freshAnnOk := freshLoop.Annotations[redeliverAnnotation]
+		Expect(freshAnnOk).To(BeTrue(), "the user's redeliver annotation must still be KEPT on the persisted Loop (the Job is in progress)")
 	})
 })
 

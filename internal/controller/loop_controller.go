@@ -605,7 +605,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// termination message is read via the APIReader (pod-blind, like the S3/
 	// S4 read-backs) and written to status.delivery + the Delivered
 	// condition (ensureDeliverReadback).
-	deliverRequeue, err := r.ensureDeliver(ctx, &loop)
+	deliverRequeue, deliverKeep, err := r.ensureDeliver(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -666,7 +666,15 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
 	// (AFTER it, so the two Loop writes never race) are extracted to
 	// finalizeLoopStatus to keep the top-level reconcile within the gocyclo
-	// budget.
+	// budget. The I49 in-progress keep decision (I61) is carried EXPLICITLY
+	// from ensureDeliverRedeliver (the deliver Job is still running — the
+	// annotation must stay for the later trigger): skip the end-of-pass patch
+	// so the fresh re-read does not remove the annotation the running Job
+	// needs. (Previously this was an in-memory annotation on the Loop; a
+	// future r.Update(loop) would have persisted it — the I61 risk.)
+	if deliverKeep {
+		return ctrl.Result{}, nil
+	}
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared); err != nil {
 		return ctrl.Result{}, err
 	}

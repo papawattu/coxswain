@@ -161,7 +161,11 @@ applied **and** the node reports BPF-LSM enforcement. Otherwise it sets a
 reason, consistent with Q5's "never fail the Loop"; *the owner may prefer a
 terminal reason — flag, don't pick*). Seam: envtest with the engine's status
 objects faked; e2e on kind with the engine removed → the sandbox **never
-runs**.
+runs**. **A1/D52 (2026-10-10):** the "e.g." above is now the specified static
+check (the KubeArmor DaemonSet Ready on the sandbox's node, the node reports
+BPF-LSM, and the Loop's KubeArmorPolicy exists and is accepted; any missing
+fact or outage reads `Unknown`, never `True`, and the gate opens only on
+`True`) — see `0007-amendment-a1-static-enforcement.md`.
 
 ## Learn mode (D31, round 9)
 

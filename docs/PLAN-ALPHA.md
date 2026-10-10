@@ -41,7 +41,13 @@ Loop against a GitHub sandbox repo, and:
 - **Acceptance:** as written in R24 and #107.
 
 ### A1. Real enforcement evidence (R22 I59). Needs **D52**
-- **Design first:** an ADR-0007 amendment choosing the evidence source.
+- **Design first:** an ADR-0007 amendment choosing the evidence source. **The
+design note is `docs/adr/0007-amendment-a1-static-enforcement.md` (D52 (b), the
+static check): the KubeArmor DaemonSet Ready on the sandbox's node, the node
+reports BPF-LSM, and the Loop's KubeArmorPolicy exists and is accepted; any
+missing fact or outage reads `Unknown` (never `True`); the D30 gate opens only
+on `True`; the in-progress states (DaemonSet rolling, policy pending) hold the
+gate, per the I49 norm.**
   - **(a)** The KubeArmor relay alert stream (R9 I32's original plan). Strong
     evidence, but it adds a runtime dependency and a trust edge.
   - **(b)** A static check: the KubeArmor DaemonSet is Ready on the sandbox's

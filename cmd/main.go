@@ -113,6 +113,23 @@ func main() {
 	var cniProbeNamespace string
 	flag.StringVar(&cniProbeNamespace, "cni-probe-namespace", "coxswain-cni-probe",
 		"The fixed namespace the CNI probe pod + NetworkPolicy live in (D38; created at install).")
+	// A1 (D52): the static enforcement check config (ADR-0007 amendment A1).
+	// The Enforcer reads these to evaluate the three facts. All are operator
+	// config (the Enforcer interface stays engine-agnostic). Defaults when
+	// empty: AgentNamespace="kubearmor", AgentPodLabel="kubearmor-app=kubearmor",
+	// BPFLabel="kubearmor.io/enforcer", BPFLabelValue="bpf".
+	var kaAgentNamespace string
+	flag.StringVar(&kaAgentNamespace, "kubearmor-agent-namespace", "",
+		"The KubeArmor agent's namespace (A1/D52 static check; default 'kubearmor').")
+	var kaAgentPodLabel string
+	flag.StringVar(&kaAgentPodLabel, "kubearmor-agent-pod-label", "",
+		"The KubeArmor agent pod's label (A1/D52 static check; default 'kubearmor-app=kubearmor').")
+	var kaBPFLabel string
+	flag.StringVar(&kaBPFLabel, "kubearmor-bpf-label", "",
+		"The BPF-LSM node label key (A1/D52 static check; default 'kubearmor.io/enforcer').")
+	var kaBPFLabelValue string
+	flag.StringVar(&kaBPFLabelValue, "kubearmor-bpf-label-value", "",
+		"The BPF-LSM node label value (A1/D52 static check; default 'bpf').")
 	var clusterDomain string
 	flag.StringVar(&clusterDomain, "cluster-domain", "",
 
@@ -307,6 +324,11 @@ func main() {
 		// A missing KubeArmor CRD is a loud error in production; tolerated
 		// (no-op) only under the --allow-unenforced dev escape hatch (D38).
 		AllowUnenforced: allowUnenforced,
+		// A1 (D52): the static enforcement check config.
+		AgentNamespace:  kaAgentNamespace,
+		AgentPodLabel:   kaAgentPodLabel,
+		BPFLabel:        kaBPFLabel,
+		BPFLabelValue:   kaBPFLabelValue,
 	}
 	// D38: the operator-side CNI self-test prober. It runs the probe pod in the
 	// fixed coxswain-cni-probe namespace, reads the termination message, and

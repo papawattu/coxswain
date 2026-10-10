@@ -1492,6 +1492,29 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		}
 		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, map[string]string{"coxswain.io/loop": loop.Name})
 		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, agentPodLabels(loop.Name))
+		// A1 (D52): the sandbox pod carries a REQUIRED node affinity
+		// kubearmor.io/enforcer=bpf, so the scheduler guarantees the BPF-LSM
+		// fact (fact 2) wherever the pod lands, and an unschedulable sandbox
+		// is visible as Pending (not a silent wedge). The static check (the
+		// Enforcer's Enforcing method) reads the nodes and agent pods, not
+		// the sandbox pod, so the gate can open from Suspended (no pod).
+		desired.Spec.PodTemplate.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "kubearmor.io/enforcer",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"bpf"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
 		// I36: the agent and any future sidecars do not share a process
 		// namespace (no nsenter / /proc/<pid> cross-container access).
 		noShare := false

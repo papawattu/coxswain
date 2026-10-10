@@ -210,6 +210,10 @@ i42-e2e: ## Run the full I42 acceptance kind e2e (pinned to --context kind-coxsw
 d41-e2e: ## Run the full D41e kind acceptance (per-tool proxies) kind e2e (pinned to --context kind-coxswain-dev).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/d41-e2e.sh
 
+.PHONY: a2-e2e
+a2-e2e: ## A2 (D53): restart durability e2e (MEASURE, don't fix). Runs the gocli sample Loop on kind-coxswain-dev and, in separate runs, kills the operator pod (Planning/Implementing/Verifying/deliver), the sandbox pod (mid-Implementing), and the verify Job pod, recording the terminal outcome against an uninterrupted control. Keeps ALL logs; records the operator digest; docker image prune first; one kind job at a time. A2_CAP/A2_KILL_DELAY/A2_PHASE_POLL override the timing.
+	@bash test/e2e/a2-restart-e2e.sh
+
 .PHONY: p2-e2e
 p2-e2e: ## Run the P2h kind acceptance (the Phase 2 "Done when": the stalled/budget-exceeded stop + the paused-Loop resume) kind e2e (pinned to --context kind-coxswain-dev). Builds the operator + runner; P2H_OPERATOR_IMAGE overrides the operator image (the gate mutations).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/p2-e2e.sh

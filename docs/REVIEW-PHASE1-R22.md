@@ -63,7 +63,7 @@ The items below are what today's reviews left open. None blocks the next slice.
 
 ### I58. The exposed GitHub token, and the credential rule in AGENTS.md
 
-- [ ] Open (owner action + docs)
+- [x] Open (owner action + docs) — 06a670e (AGENTS.md part; the owner chose not to revoke the token)
 
 **Where:** this session's `GITHUB_TOKEN`; AGENTS.md.
 

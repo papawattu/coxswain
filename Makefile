@@ -49,6 +49,15 @@ help: ## Display this help.
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
+# I63 (I51): deploy/deploy-dev run codegen (manifests) before require-img.sh, so a
+# missing IMG failed only AFTER a wasted codegen pass. This aggregate checks IMG
+# first, then runs codegen — deploy/deploy-dev depend on it (and keep a
+# TARGET-specific check in their recipe for a clearer message).
+.PHONY: codegen
+codegen:
+	@IMG="$(IMG)" TARGET=codegen hack/require-img.sh
+	$(MAKE) manifests
+
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
@@ -456,15 +465,16 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 # Never use for production.
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config (fail-closed; no --allow-unenforced).
+deploy: codegen kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config (fail-closed; no --allow-unenforced).
+	@# I51/I63: IMG was already checked first (codegen prerequisite); this TARGET-specific check is a clearer message.
 	@IMG="$(IMG)" TARGET=deploy hack/require-img.sh
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
 	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" apply -f -
 
 .PHONY: deploy-dev
-deploy-dev: manifests kustomize ## Dev/kind only: deploy the controller with --allow-unenforced (Loops run before the I32 enforcement-evidence relay is wired). Not for production.
-	@# I51 (R20): refuse to deploy without an explicit image tag.
+deploy-dev: codegen kustomize ## Dev/kind only: deploy the controller with --allow-unenforced (Loops run before the I32 enforcement-evidence relay is wired). Not for production.
+	@# I51/I63: IMG was already checked first (codegen prerequisite); this TARGET-specific check is a clearer message.
 	@IMG="$(IMG)" TARGET=deploy-dev hack/require-img.sh
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/dev | "$(KUBECTL)" apply -f -

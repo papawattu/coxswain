@@ -124,9 +124,21 @@ func a1Kapt() *unstructured.Unstructured {
 }
 
 func a1Loop() *coxv1alpha1.Loop {
-	return &coxv1alpha1.Loop{
+	l := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: "l1", Namespace: "default", UID: "test-uid"},
 	}
+	// The operator records the KaptSpecHash when it applies the policy.
+	// The test sets it to the hash of the a1Kapt spec so the spec-hash check
+	// passes.
+	spec := map[string]any{
+		"selector": map[string]any{
+			"matchLabels": map[string]any{"coxswain.io/loop": "l1"},
+		},
+	}
+	l.Status.Policy = &coxv1alpha1.PolicyStatus{
+		KaptSpecHash: kaptSpecHash(spec),
+	}
+	return l
 }
 
 func TestA1AllFactsTrue(t *testing.T) {

@@ -248,6 +248,14 @@ type PolicyStatus struct {
 	// +optional
 	EffectiveHash string `json:"effectiveHash,omitempty"`
 
+	// kaptSpecHash is the SHA-256 of the canonical JSON of the rendered
+	// KubeArmorPolicy spec (the agent Kapt). The operator records it when it
+	// applies the policy; the static enforcement check (A1) recomputes it from
+	// the live policy and compares, so a tampered or stale spec is detected
+	// (D52 fact 3). Empty when no policy is applied.
+	// +optional
+	KaptSpecHash string `json:"kaptSpecHash,omitempty"`
+
 	// blockedCount is the number of actions the engine has blocked for this Loop
 	// (ADR-0007 Q5 / C8). It is derived by the operator from the engine's alert
 	// stream; a relay outage must surface as "unknown", not zero (I32). +optional

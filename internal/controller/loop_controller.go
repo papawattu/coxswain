@@ -352,6 +352,9 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
+// A1 (D52): the static enforcement check reads Nodes (BPF-LSM label) and
+// agent Pods (Ready condition) directly from the API server (APIReader).
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // D34: the operator creates the per-Loop NetworkPolicies (ensureNetworkPolicy).
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // D38: the operator emits a Kubernetes Event on every Loop when its
@@ -1493,27 +1496,15 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, map[string]string{"coxswain.io/loop": loop.Name})
 		maps.Copy(desired.Spec.PodTemplate.ObjectMeta.Labels, agentPodLabels(loop.Name))
 		// A1 (D52): the sandbox pod carries a REQUIRED node affinity
-		// kubearmor.io/enforcer=bpf, so the scheduler guarantees the BPF-LSM
-		// fact (fact 2) wherever the pod lands, and an unschedulable sandbox
-		// is visible as Pending (not a silent wedge). The static check (the
-		// Enforcer's Enforcing method) reads the nodes and agent pods, not
-		// the sandbox pod, so the gate can open from Suspended (no pod).
-		desired.Spec.PodTemplate.Spec.Affinity = &corev1.Affinity{
-			NodeAffinity: &corev1.NodeAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-					NodeSelectorTerms: []corev1.NodeSelectorTerm{
-						{
-							MatchExpressions: []corev1.NodeSelectorRequirement{
-								{
-									Key:      "kubearmor.io/enforcer",
-									Operator: corev1.NodeSelectorOpIn,
-									Values:   []string{"bpf"},
-								},
-							},
-						},
-					},
-				},
-			},
+		// (kubearmor.io/enforcer=bpf by default), so the scheduler guarantees
+		// the BPF-LSM fact (fact 2) wherever the pod lands. The affinity uses
+		// the configured BPF label (not hard-coded) and is applied only when
+		// NOT --allow-unenforced (a kind cluster without KubeArmor labels must
+		// not have its sandboxes wedged Pending).
+		if r.Enforcer != nil {
+			if aff := r.Enforcer.BPFNodeAffinity(); aff != nil {
+				desired.Spec.PodTemplate.Spec.Affinity = aff
+			}
 		}
 		// I36: the agent and any future sidecars do not share a process
 		// namespace (no nsenter / /proc/<pid> cross-container access).
@@ -4309,6 +4300,13 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		if applyErr != nil {
 			return applyErr
 		}
+		// A1 (D52 fact 3): record the KaptSpecHash so the static enforcement
+		// check can recompute it from the live policy and detect a tampered or
+		// stale spec.
+		if loop.Status.Policy == nil {
+			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+		}
+		loop.Status.Policy.KaptSpecHash = r.Enforcer.KaptSpecHash(loop, effective)
 	}
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
 		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,

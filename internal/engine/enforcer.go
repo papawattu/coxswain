@@ -26,6 +26,7 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/policy"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // Enforcer is the engine-agnostic seam the operator uses to apply a policy and
@@ -46,6 +47,20 @@ type Enforcer interface {
 	// (OperatingMode Running) when Enforcing is true; otherwise it is held
 	// Suspended with PolicyEnforced=False and requeued (never fails the Loop).
 	Enforcing(ctx context.Context, loop *coxv1alpha1.Loop) (bool, string)
+
+	// KaptSpecHash returns the canonical hash of the rendered KubeArmorPolicy
+	// spec for the given Loop and effective policy (A1, D52 fact 3). The
+	// controller records it in loop.Status.Policy.KaptSpecHash when it applies
+	// the policy; the static enforcement check recomputes it from the live
+	// policy and compares.
+	KaptSpecHash(loop *coxv1alpha1.Loop, ep policy.EffectivePolicy) string
+
+	// BPFNodeAffinity returns the required node affinity for the sandbox pod
+	// (A1, D52). The sandbox is constrained to BPF-LSM nodes so the evidence
+	// exists wherever the pod lands. Returns nil when the enforcer is running
+	// with the --allow-unenforced escape hatch (a kind cluster without
+	// KubeArmor labels must not have its sandboxes wedged Pending).
+	BPFNodeAffinity() *corev1.Affinity
 }
 
 // EngineEnforcementReasons are the D30 reasons for PolicyEnforced=False.

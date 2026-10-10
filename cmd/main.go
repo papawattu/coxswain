@@ -317,6 +317,7 @@ func main() {
 	// concurrency is raised).
 	kaEnforcer := &engine.KubeArmorEnforcer{
 		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
 		ProxyFQDN:       controller.ProxyServiceFQDN,
 		EgressProxyFQDN: controller.EgressProxyServiceFQDN,
 		ToolProxyFQDN:   controller.ToolProxyServiceFQDN,

@@ -345,6 +345,11 @@ func (e *KubeArmorEnforcer) createOrUpdateKapt(ctx context.Context, loop *v1alph
 // The gate (D30) opens only when all three are True. Any missing fact or
 // outage reads Unknown (never True), and the reason names the failing fact.
 func (e *KubeArmorEnforcer) Enforcing(ctx context.Context, loop *v1alpha1.Loop) (bool, string) {
+	// Nil client: no engine probe (the I46 stub behavior). The operator has
+	// OBSERVED nothing: report EnforcementUnverified (not NodeNotEnforcing).
+	if e.Client == nil {
+		return false, ReasonEnforcementUnverified
+	}
 	agentNS := e.agentNamespace()
 	agentLabel := e.agentPodLabel()
 	bpfLabel := e.bpfLabel()

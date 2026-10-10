@@ -56,8 +56,10 @@ pull requests; design is reviewed in review docs.**
 - **Builder: watch for new reviews** with `git tag -l 'review/*'` (or
   `git log --grep '^review('`). Before each work session, read any review
   tagged since your last one. P1 items block the next phase.
-- **Closing an issue:** tick its box in the review doc and add the fixing
-  commit hash. Reference the issue ID in the fix commit subject
+- **Closing an issue (I57):** tick its box in the review doc and add the fixing
+  commit hash ONLY — do not rewrite the item's text (the item's problem/fix/
+  acceptance text is the reviewer's; the closer just ticks the box and appends
+  the hash). Reference the issue ID in the fix commit subject
   (e.g. `I6: …`). Don't edit other parts of a review doc; reply to a
   verdict by adding a `Builder response:` line under the issue.
 - **Stage explicit paths, never `git add -A`** (I31). The owner and reviewer

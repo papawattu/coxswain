@@ -109,7 +109,7 @@ With `spec.delivery.mode: PullRequest`, a successful, verified Loop pushes the
 verified commit to the workspace repo on branch `<branchPrefix><loop-name>` and
 opens a pull request against `spec.delivery.baseBranch` (default
 `spec.workspace.ref`). The PR is a draft by default (`spec.delivery.draft`);
-the builder marks it ready explicitly. Drafts are represented differently per
+it is marked ready for review explicitly. Drafts are represented differently per
 provider: on GitHub the PR is opened as a real draft PR; on Gitea the create-PR
 API ignores the draft flag, so the draft is marked by prefixing the PR title
 with `WIP: ` (Gitea's draft convention) — the only marker.

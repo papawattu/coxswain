@@ -1,4 +1,6 @@
-# Next phase: usable alpha (DRAFT for owner review)
+# Next phase: usable alpha
+
+**Status:** accepted (PR #109). D52–D54 decided by the owner on 2026-10-10 (see the table at the end).
 
 Status 2026-10-10, `main` at fa16581. PLAN.md Phases 0–2 are done, and
 their Done-when conditions hold on kind. The core loop works end to end on
@@ -135,9 +137,9 @@ Loop against a GitHub sandbox repo, and:
 ## Owner decisions needed
 | ID | Question | Recommendation |
 |---|---|---|
-| D52 | Enforcement evidence source (A1) | (b) static check for alpha; (a) relay later |
-| D53 | Alpha durability scope (A2) | Resume from the workspace PVC; snapshots after alpha |
-| D54 | Image registry; install.yaml vs Helm (A5) | ghcr.io + install.yaml for alpha |
+| D52 | Enforcement evidence source (A1) | **Decided (owner, 2026-10-10): (b) the static check**; (a) relay later |
+| D53 | Alpha durability scope (A2) | **Decided (owner, 2026-10-10): resume from the workspace PVC**; snapshots/rollback/fork after alpha (Phase 3) |
+| D54 | Image registry; install.yaml vs Helm (A5) | **Decided (owner, 2026-10-10): ghcr.io + install.yaml**; Helm in Phase 7 |
 
 ## Estimate
 A rough guess at the recent pace (pi building, reviewer gating every PR):

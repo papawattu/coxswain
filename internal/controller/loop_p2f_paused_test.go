@@ -592,9 +592,12 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 			"the deliver Job must exist (delivery is in flight)")
 		Expect(deliverJob.Spec.Suspend).NotTo(HaveValue(BeTrue()),
 			"the deliver Job is not suspended (item F: delivery is in flight)")
-		// The sandbox is left running so delivery completes.
-		Expect(sandboxMode(ns, "p2f-s9c")).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
-			"the sandbox is left running so the in-flight delivery completes")
+		// The deliver Job runs in its own pod (clone-base/import-agent/push read
+		// the workspace from a volume, independent of the sandbox pod), so the
+		// sandbox is stopped on the terminal Succeeded phase (I74). The deliver
+		// Job itself is undisturbed — it completes on its own.
+		Expect(sandboxMode(ns, "p2f-s9c")).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"I74: the sandbox is stopped on the terminal Succeeded phase (the deliver Job does not need the sandbox pod)")
 	})
 
 	It("spec 10: in-progress — a pod mid-run at pause time (I49): the claim is ignored on termination", func() {

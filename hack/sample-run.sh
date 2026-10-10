@@ -382,29 +382,35 @@ for c in d["spec"]["initContainers"]:
 
 	printf '## Model proxy\n\n'
 	# I60 (I50): the first I50 run recorded 0 forwarded requests while the proxy
-	# pod (checked by the reviewer at 19:43–19:45) had logged 9. The cause: the
-	# proxy pod was REPLACED mid-run (the I32 enforcement-evidence relay recreated
-	# it), so `kubectl logs` read the NEW pod's logs (0 forwarded) instead of the
-	# OLD pod's logs (9 forwarded). The fix: the WARNING below flags a 0 on a
-	# Succeeded run, and the PROXY_RC check records whether the log fetch failed
-	# (a replaced/gone pod) so the anomaly is never silent again.
+	# pod (checked by the reviewer at 19:43–19:45) had logged 9. The exact cause
+	# is UNKNOWN (the reviewer's hypothesis — the I32 enforcement-evidence relay
+	# recreated the pod mid-run — is not confirmed). The anomaly is real and the
+	# count discrepancy is unexplained; the fix is to never be silent about it:
+	# the WARNING below flags a 0 on a Succeeded run, and PROXY_RC / PROXY_LOG
+	# capture whether the log fetch itself failed and what kubectl said, so a
+	# failed fetch is recorded in EVIDENCE.md instead of silently showing 0.
 	# The dev stand-in logs ONE structured line per forwarded request
 	# (method, path, status, duration_ms; no bodies, no headers, no auth).
 	# Count those lines for this run's proxy pod. Do NOT swallow kubectl errors:
-	# capture stderr so a zero count is never silent. I60 (I50): a FAILING kubectl
-	# logs (bad pod name, pod gone, etc.) must NOT abort the script under `set -euo
-	# pipefail` — the previous version read $? after the substitution, which was
-	# unreachable (the substitution failure aborted the script before that line),
-	# so the error never reached EVIDENCE.md. Capture the failure explicitly
-	# instead: on failure, PROXY_LOG holds the error message (recorded below) and
-	# the count is zero (flagged by the WARNING). On success, PROXY_RC=0 and the
-	# "proxy log fetch failed" branch below is skipped.
-	PROXY_LOG=$(kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" 2>&1) || PROXY_LOG=""
-	PROXY_RC=$?
-	if ! kubectl --context "$CTX" -n "$NS" get "pod/${LOOP}-proxy" >/dev/null 2>&1; then
-		PROXY_RC=1
-		PROXY_ERR=$(kubectl --context "$CTX" -n "$NS" get "pod/${LOOP}-proxy" 2>&1 || true)
-		PROXY_LOG="(kubectl logs failed: ${PROXY_ERR:-pod not found})"
+	# a FAILING `kubectl logs` (bad pod name, pod gone, etc.) must NOT abort the
+	# script under `set -euo pipefail` — the previous version read $? after the
+	# substitution, which was unreachable (the substitution failure aborted the
+	# script before that line), so the error never reached EVIDENCE.md. Capture
+	# the failure EXPLICITLY and KEEP the captured output: on failure PROXY_LOG
+	# holds the kubectl error text (recorded below) and PROXY_RC is non-zero,
+	# so the "proxy log fetch failed" branch records the actual error. On
+	# success PROXY_RC=0 and that branch is skipped. A pod that is simply GONE
+	# is distinguished (PROXY_RC=1, the message notes the pod was not found).
+	PROXY_RC=0
+	PROXY_LOG=$(kubectl --context "$CTX" -n "$NS" logs "pod/${LOOP}-proxy" 2>&1) || PROXY_RC=$?
+	if [ "$PROXY_RC" -ne 0 ]; then
+		# Distinguish a gone pod (logs failed AND the pod is not present) from
+		# another logs failure. PROXY_LOG still holds the raw kubectl error text
+		# (NOT blanked) so it is recorded below.
+		if ! kubectl --context "$CTX" -n "$NS" get "pod/${LOOP}-proxy" >/dev/null 2>&1; then
+			PROXY_RC=1
+			PROXY_LOG="(pod ${LOOP}-proxy not found; kubectl logs output: ${PROXY_LOG:-<empty>})"
+		fi
 	fi
 	# The Go stdlib log package prefixes each line with a timestamp, so the
 	# forwarded line is '<date> <time> proxy: forwarded ...' — match the

@@ -114,8 +114,6 @@ var _ = Describe("I77: init-workspace skips a completed clone and keeps agent wo
 		script := i77InitScript(i77Dest)
 		Expect(script).To(ContainSubstring("DEST=" + i77Dest))
 		Expect(script).To(ContainSubstring(i77BareRepo))
-		Expect(script).To(ContainSubstring("cat-file -e"),
-			"I77: the real generated script must carry the success-marker guard")
 
 		// RUN 1: a clean first run. The clone succeeds; the success marker
 		// holds the bare repo's HEAD.

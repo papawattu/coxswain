@@ -265,6 +265,13 @@ var _ = Describe("I74: the sandbox is stopped once the Loop is terminal (Succeed
 		i74Loop(ns, name, coxv1alpha1.DeliveryModePullRequest)
 		i74PrimeProxy(r, i74GetLoop(ns, name))
 		i74Reconcile(r, ns, name) // bootstrap
+		// I72/I74 interaction: this spec delivers to an external (github.com)
+		// repo, so the I72 egress-ready gate holds the deliver Job until the
+		// operator's egress proxy pod is Ready (envtest has no kubelet, so the
+		// pod is never Ready on its own). Drive the proxy Ready (like the S6
+		// specs) so the deliver Job is actually created; otherwise the I72 hold
+		// keeps the Job absent and this spec fails "deliver Job not found".
+		s6ReadyEgressProxy(r, ns, name)
 		By("the Loop reaches Succeeded with delivery mode PullRequest (terminal)")
 		l := i74GetLoop(ns, name)
 		l.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
@@ -274,6 +281,15 @@ var _ = Describe("I74: the sandbox is stopped once the Loop is terminal (Succeed
 		i74Reconcile(r, ns, name)
 
 		By("the deliver Job is created (delivery works after Succeeded — it reads the workspace from a volume, not the sandbox pod)")
+		// I72/I74 interaction (continued): the egress proxy pod's spec changes
+		// again at Succeeded (the S6 deliver-host allow entry — example.com for
+		// this external repo — joins the allowlist only once delivery is
+		// expected, i.e. once the phase is Succeeded), so the pod is recreated
+		// and is not Ready. Drive it Ready a second time (like the S6 specs,
+		// which run s6ReadyEgressProxy right before the Job is expected) so the
+		// I72 hold releases and the Job is actually created.
+		s6ReadyEgressProxy(r, ns, name)
+		i74Reconcile(r, ns, name) // the requeue's next pass: the hold is gone, the Job is built
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: deliverJobName(name)}, job)).To(Succeed(),
 			"I74: the deliver Job must be created on a Succeeded delivery Loop (the deliver step does not need the sandbox)")

@@ -206,14 +206,33 @@ if ! kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" >/dev/null 2>&
 	# (D33: the metering proxy fatals at startup if none is found — the old
 	# api.key/model.name shape left the model-key file empty, so the proxy
 	# crashlooped, I75).
-	log "creating model secret '$MODEL_SECRET' (no-auth vLLM, the P2b shape) in ns $NS..."
+	create_model_secret() {
+		MODEL_BASE_URL_VALUE="http://$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")"
+		kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
+			--from-literal="model-key=p2b-dummy-key" \
+			--from-literal="MODEL_BASE_URL=$MODEL_BASE_URL_VALUE" >/dev/null
+	}
 	# kubectl create secret rejects dots in --from-literal keys (it would read
 	# the key as a file path); model-key and MODEL_BASE_URL have no dots, so
 	# --from-literal works (no temp files).
-	MODEL_BASE_URL_VALUE="http://$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")"
-	kubectl --context "$CTX" -n "$NS" create secret generic "$MODEL_SECRET" \
-		--from-literal="model-key=p2b-dummy-key" \
-		--from-literal="MODEL_BASE_URL=$MODEL_BASE_URL_VALUE" >/dev/null
+	log "creating model secret '$MODEL_SECRET' (no-auth vLLM, the P2b shape) in ns $NS..."
+	create_model_secret
+else
+	# An EXISTING model Secret: a pre-P2b shape (api.key/model.name) has no
+	# `model-key` entry, so the metering proxy (which reads
+	# /model-creds/.data/model-key) fatals at startup and the proxy pod
+	# crashloops (I75, D33). Treat a Secret without .data.model-key as stale:
+	# delete it and recreate it in the P2b shape (the proxy pod picks it up on
+	# restart — sample-run deletes the prior Loop anyway, so a fresh proxy pod
+	# mounts the recreated Secret).
+	MODEL_KEY_PRESENT=$(kubectl --context "$CTX" -n "$NS" get secret "$MODEL_SECRET" -o jsonpath='{.data.model-key}' 2>/dev/null) || MODEL_KEY_PRESENT=""
+	if [ -z "$MODEL_KEY_PRESENT" ]; then
+		log "model secret '$MODEL_SECRET' has no model-key (pre-P2b api.key/model.name shape); replacing it with the P2b shape..."
+		kubectl --context "$CTX" -n "$NS" delete secret "$MODEL_SECRET" --wait=true >/dev/null
+		create_model_secret
+	else
+		log "model secret '$MODEL_SECRET' already in the P2b shape (has model-key); leaving it alone."
+	fi
 fi
 # The vLLM endpoint must be reachable from the operator node.
 VLLM_HOST_PORT=$(python3 -c 'import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))["spec"]["agent"]["modelEndpoint"])' "$LOOP_YAML")

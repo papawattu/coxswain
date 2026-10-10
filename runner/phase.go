@@ -738,6 +738,15 @@ func commitWorkspace(workspace string) (string, []string, string) {
 			if info, statErr := os.Stat(filepath.Join(workspace, path)); statErr == nil && info.IsDir() {
 				continue // a dir entry is not a stageable file
 			}
+			// I80/D51: an UNTRACKED root PLAN.md is the agent's own plan (its
+			// plan lives in .coxswain/PLAN.md, which is excluded above). Keep
+			// it out of the verified commit so it is not delivered. A
+			// base-TRACKED root PLAN.md that the agent modified is source work
+			// (rec[:2] != "??") and is still committed, so a repo's own
+			// PLAN.md can be changed.
+			if path == "PLAN.md" && !isTrackedPath(workspace, path) {
+				continue
+			}
 			paths = append(paths, path) // untracked: new — refuse-eligible
 			continue
 		}

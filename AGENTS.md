@@ -69,7 +69,7 @@ pull requests; design is reviewed in review docs.**
 - **After replying to review threads, confirm no review is stuck PENDING**
   (I76). A reply posted while a review is in the PENDING state is invisible
   and blocks the reviewer's review. After posting replies, run
-  `gh api repos/<owner>/<repo>/pulls/<n>/reviews --jq '[.[]|select(.state=="PENDING")|.id]'
+  `gh api repos/<owner>/<repo>/pulls/<n>/reviews --jq '[.[]|select(.state=="PENDING")|.id]'`
   and confirm it prints `[]` before ending the turn. If a review is PENDING,
   submit it yourself (event COMMENT — builder, reviewer and owner share one
   GitHub account, so there is no "not yours") and re-run the check until it

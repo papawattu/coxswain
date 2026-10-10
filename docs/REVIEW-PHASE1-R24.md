@@ -88,7 +88,7 @@ mount point.
 
 ### I74. The sandbox keeps restarting after a Loop finishes
 
-- [ ] Open (PR #98: reviewer OK; it also amends TDD-PLAN-PHASE2 item 9/F)
+- [x] Open (PR #98: reviewer OK; it also amends TDD-PLAN-PHASE2 item 9/F) — 6be6e16
 
 **Where:** the sandbox lifecycle on terminal phases; the runner.
 
@@ -105,7 +105,7 @@ after Failed, plus the matching mutation.
 
 ### I75. The samples model Secret is pre-P2b
 
-- [ ] Open (PR #99: reviewer OK; the live `make sample-run` is still owed)
+- [x] Open (PR #99: reviewer OK; the live `make sample-run` is still owed) — a4df6a4
 
 **Where:** `hack/sample-run.sh` and the samples fixtures.
 
@@ -154,7 +154,7 @@ a workspace holding agent commits leaves them intact.
 
 ### I76. Builder habits seen this round
 
-- [ ] Open (AGENTS.md)
+- [x] Open (AGENTS.md) — 8d15503
 
 - **Mutation image left deployed:** after I69, the I69 G2 mutation operator
   (`coxswain-mut-g2-i69`, budget gate disabled) stayed deployed on

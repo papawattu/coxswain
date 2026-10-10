@@ -111,7 +111,7 @@ A relay or probe outage must read as `Unknown`, never `True`.
 
 ### I60. Demo-evidence robustness (from I50)
 
-- [ ] Open
+- [x] Open — afd6e3b
 
 **Where:** `hack/sample-run.sh`, the evidence block.
 
@@ -141,7 +141,7 @@ A relay or probe outage must read as `Unknown`, never `True`.
 
 ### I61. `redeliverKeepSignal` is an in-memory annotation used as a flag
 
-- [ ] Open
+- [x] Open — 3600e2b
 
 **Where:** `internal/controller/loop_deliver_job.go` (`ensureDeliverRedeliver`,
 `removeDeliverAnnotation`).
@@ -183,7 +183,7 @@ workflow can queue forever.
 
 ### I63. Small cleanups from today's reviews
 
-- [ ] Open
+- [x] Open — 6234209
 
 - **I48:** the guard
   `claim.Iteration != loop.Status.Iteration && (claim.Iteration != 0 || loop.Status.Iteration != 0)`

@@ -66,7 +66,7 @@ settled before Loops run against real tools or for long unattended stretches.
 
 ### I64. Tool-proxy egress is not fenced by DNS on clusters without BPF-LSM
 
-- [ ] Open (**owner decision**)
+- [x] Open (**owner decision**) — 0df223f
 
 **Owner decision (2026-10-07), D50 = (a):** accept the gap and document it as a
 limitation of clusters without BPF-LSM. No fail-closed hold and no IP pinning
@@ -137,7 +137,7 @@ Keep "still running" as no decision (the I49 norm).
 
 ### I66. D49 is not actually in effect
 
-- [ ] Open (**owner action**)
+- [x] Open (**owner action**) — settings.json lists neither memory package
 
 **Where:** `~/.pi/agent/settings.json` (owner's global pi config); the reviewer's
 `pi-args.txt`.
@@ -157,7 +157,7 @@ to a project scope that excludes coxswain), then restarts pi.
 
 ### I67. TDD-PLAN-PHASE2 corrections found on kind
 
-- [ ] Open (docs)
+- [x] Open (docs) — 73c2c5d
 
 **Where:** `docs/TDD-PLAN-PHASE2.md` (P2e "The normaliser" input; P2h fixture).
 
@@ -179,7 +179,7 @@ the hard way on kind.
 
 ### I68. Builder process: commits that a reviewer had to unwind
 
-- [ ] Open (AGENTS.md + a guard)
+- [x] Open (AGENTS.md + a guard) — 06a670e
 
 **Where:** AGENTS.md; the builder's commit habits.
 
@@ -207,7 +207,7 @@ the hard way on kind.
 
 ### I69. Re-run P2h's G1/G2 gate mutations on the final script
 
-- [ ] Open (evidence)
+- [x] Open (evidence) — PR #94 (closed; evidence in its body)
 
 **Where:** `.samples/p2h/mutations.md`; `test/e2e/p2-e2e.sh`.
 
@@ -228,7 +228,7 @@ digests, in the record.
 
 ### I70. Upgrade note: tool netpols created before D41d aren't cleaned up
 
-- [ ] Open (docs)
+- [x] Open (docs) — 4b15d13
 
 **Where:** `internal/controller/loop_controller.go` (`toolProxyForLabel`, the
 label-based stale cleanup).
@@ -245,7 +245,7 @@ one-time adoption by name.
 
 ### I71. Housekeeping
 
-- [ ] Open (filler)
+- [x] Open (filler) — 152a9f8
 
 - **A stale `.gnosis` inbox note:**
   `.gnosis/inbox/d38-external-positive-control-broken.md` asks how to fix

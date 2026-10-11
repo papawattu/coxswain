@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -310,8 +311,9 @@ func TestDeliverTerminationPRURLStrict(t *testing.T) {
 
 // fakeGiteaAPICall records one PR-create POST the fake Gitea API saw.
 type fakeGiteaAPICall struct {
-	method string
-	auth   string
+	method  string
+	auth    string
+	payload []byte // the PR create's JSON body (empty for the GET lookups)
 }
 
 // newFakeGiteaAPI stands up a Gitea-compatible provider API: GET /repos/{o}/{r}
@@ -386,8 +388,9 @@ func newFakeGiteaAPIWithNested(t *testing.T, owner, repoName, scheme, host, defa
 		}
 		// POST /repos/{owner}/{repo}/pulls — the create.
 		if r.Method == http.MethodPost && strings.HasSuffix(path, "/pulls") {
+			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
-			postList = append(postList, fakeGiteaAPICall{method: r.Method, auth: r.Header.Get("Authorization")})
+			postList = append(postList, fakeGiteaAPICall{method: r.Method, auth: r.Header.Get("Authorization"), payload: body})
 			openPR = 42
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")

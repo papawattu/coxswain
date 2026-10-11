@@ -35,6 +35,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -43,6 +45,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -213,37 +218,21 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 			"the foreign ConfigMap must be left alone by the operator's cleanup")
 	})
 
-	// P1 (R25): the Succeeded reconcile must NOT error when the deliver
-	// description ConfigMap cannot be created (the operator's ServiceAccount
-	// is forbidden to create ConfigMaps in the Loop's namespace — the
-	// reviewer's P2: "a transient read failure must not block the Job").
-	// The push container mounts the volume OPTIONAL and falls back to the
-	// minimal line, so a missing facts body degrades to the minimal
+	// R25/P1: a NON-forbidden transient failure of the description ConfigMap
+	// ensure (e.g. a transient API error) must NOT error the Succeeded
+	// reconcile (the reviewer's P2: "a transient read failure must not block
+	// the Job"). The push container mounts the volume OPTIONAL and falls back
+	// to the minimal line, so a missing facts body degrades to the minimal
 	// description — it never errors the reconcile (which would block
 	// Succeeded forever). The spec asserts the reconcile completes (no error,
-	// via s6Reconcile's Expect) and the deliver Job + description ConfigMap
-	// absent are both tolerated: the Job is still ensured (the delivery is
-	// expected) and the Loop is Succeeded (the reconcile did not error).
-	It("does not error the Succeeded reconcile when the description ConfigMap is absent (a forbidden or missing ConfigMap degrades to the minimal line)", func() {
+	// via s6Reconcile's Expect) and the deliver Job is still ensured (the
+	// delivery is expected).
+	It("does not error the Succeeded reconcile when the description ConfigMap is transiently absent (a non-Forbidden failure degrades to the minimal line)", func() {
 		ns := freshNS("a4-desc-nocm")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "desc5"
-		// A fresh Succeeded Loop: the reconcile ensures the deliver Job and
-		// attempts the description ConfigMap. With the ConfigMap present the
-		// spec asserts it is owned + carries the body (the happy path, already
-		// covered). Here we DELETE the ConfigMap and re-reconcile: the operator
-		// re-ensures it (create succeeds in envtest). To exercise the FORBIDDEN
-		// path (the real kind bug) without a real RBAC denial, we assert the
-		// degrade-to-minimal behaviour is the Job's, not the reconcile's: the
-		// reconcile must complete (s6Reconcile would Fail on an error) and the
-		// deliver Job must be present (the delivery is expected) even when the
-		// description ConfigMap is ABSENT.
 		_ = s6Succeeded(name, ns, "http://gitea.samples.svc:3000/samples/desc5.git")
-		// Delete the operator's description ConfigMap: the next reconcile
-		// re-ensures it (create). To simulate the FORBIDDEN path (the real kind
-		// bug), we instead assert the reconcile is best-effort: the Job is
-		// ensured regardless of the ConfigMap's presence.
 		cmName := deliverDescriptionConfigName(name)
 		cm := &corev1.ConfigMap{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, cm)).To(Succeed())
@@ -254,7 +243,7 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 		// description ConfigMap was just deleted (the operator re-ensures it;
 		// if the re-ensure were fatal the reconcile would error and s6Reconcile
 		// would Fail).
-		r2 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r2 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
 		_ = s6Reconcile(r2, ns, name)
 		// The deliver Job is present (the delivery is expected): the
 		// best-effort description ConfigMap never blocked the deliver Job.
@@ -264,4 +253,105 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, &corev1.ConfigMap{})).To(Succeed(),
 			"the operator re-ensures the description ConfigMap on the next reconcile")
 	})
+
+	// R26/P1: a FORBIDDEN error from the description ConfigMap ensure (the
+	// operator lacks the configmaps RBAC for the Loop's namespace — a
+	// misinstalled/broken cluster) must NOT be silent: it is logged at error
+	// level AND surfaced as a Warning Event (DeliveryDescriptionForbidden), so
+	// the operator owner can see that every PR is degrading to the minimal
+	// description. It must NOT error the reconcile (the push container falls
+	// back to the minimal line; the delivery proceeds).
+	It("surfaces a Forbidden description-ConfigMap ensure as a Warning Event (not silent) and does not error the reconcile", func() {
+		ns := freshNS("a4-desc-forbidden")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "desc6"
+		// Drive to Succeeded with the REAL client (the S5a/S6 helper pins the
+		// verify evidence + the Succeeded reconcile creates the deliver
+		// description ConfigMap via the real client).
+		_ = s6Succeeded(name, ns, "http://gitea.samples.svc:3000/samples/desc6.git")
+
+		// Delete the operator's deliver description ConfigMap (via the real
+		// client): the next reconcile through the wrapped client will try to
+		// CREATE it, and the wrapped client models a FORBIDDEN ConfigMap write
+		// (the operator's ServiceAccount lacks the configmaps RBAC — the R25
+		// kind bug, which the R26 RBAC marker fixes).
+		cmName := deliverDescriptionConfigName(name)
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, cm)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+
+		// A reconciler with a wrapped client (FORBIDDEN ConfigMap writes) and a
+		// fake recorder. The Succeeded reconcile must: (1) NOT error (the
+		// best-effort ensure logs the Forbidden and proceeds), (2) surface the
+		// Forbidden as a Warning Event (DeliveryDescriptionForbidden, not
+		// silent), and (3) still ensure the deliver Job (the delivery is
+		// expected; the minimal-line fallback degrades the description, not
+		// the delivery).
+		recorder := record.NewFakeRecorder(64)
+		wrapped := &forbiddenConfigMapWrites{Client: k8sClient}
+		r := &LoopReconciler{Client: wrapped, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		_, reconcileErr := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(reconcileErr).NotTo(HaveOccurred(), "the Succeeded reconcile must NOT error when the description ConfigMap ensure is Forbidden (best-effort; the minimal-line fallback)")
+
+		// The deliver Job is present (the delivery is expected): the Forbidden
+		// ConfigMap ensure never blocked the deliver Job.
+		job := s6GetJob(ns, name)
+		Expect(job).ToNot(BeNil(), "the deliver Job must be ensured even when the description ConfigMap ensure is Forbidden (best-effort; the minimal-line fallback)")
+
+		// A Warning Event was recorded (the Forbidden is NOT silent):
+		// DeliveryDescriptionForbidden.
+		found := false
+		for i := 0; i < 64; i++ {
+			select {
+			case ev := <-recorder.Events:
+				if ev != "" && strings.Contains(ev, "DeliveryDescriptionForbidden") {
+					found = true
+				}
+			default:
+				i = 64 // no more events to drain
+			}
+		}
+		Expect(found).To(BeTrue(), "a Forbidden description-ConfigMap ensure must be surfaced as a Warning Event (DeliveryDescriptionForbidden), not left silent")
+	})
 })
+
+// forbiddenConfigMapWrites wraps a client.Client and makes ConfigMap writes
+// (Create/Update/Delete) return a FORBIDDEN error (the operator's ServiceAccount
+// lacks the configmaps RBAC — the R25 kind bug, which the R26 RBAC marker fixes).
+// Reads and all other resources pass through (so the Succeeded reconcile and the
+// deliver Job are unaffected). Used by the R26 Forbidden spec to prove the
+// ensure is surfaced (logged at error + a Warning Event) and non-fatal.
+type forbiddenConfigMapWrites struct {
+	client.Client
+}
+
+func forbiddenErr() error {
+	return apierrors.NewForbidden(corev1.Resource("configmaps"), "forbidden by RBAC (test model)", fmt.Errorf("configmaps forbidden"))
+}
+
+func (c *forbiddenConfigMapWrites) isDeliverDescriptionCM(obj client.Object) bool {
+	cm, ok := obj.(*corev1.ConfigMap)
+	return ok && strings.HasSuffix(cm.Name, "-deliver-description")
+}
+
+func (c *forbiddenConfigMapWrites) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if c.isDeliverDescriptionCM(obj) {
+		return forbiddenErr()
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func (c *forbiddenConfigMapWrites) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if c.isDeliverDescriptionCM(obj) {
+		return forbiddenErr()
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func (c *forbiddenConfigMapWrites) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if c.isDeliverDescriptionCM(obj) {
+		return forbiddenErr()
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}

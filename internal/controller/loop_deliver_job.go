@@ -243,18 +243,21 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 	} else if ok {
 		requeue = true
 	}
-	// The deliver description ConfigMap is BEST-EFFORT (the reviewer's P2:
-	// "a transient read failure must not block the Job"): the operator's
-	// ServiceAccount may not be able to create a ConfigMap in the Loop's
-	// namespace (a restricted namespace), and that must NOT error the
-	// Succeeded reconcile (which would block Succeeded forever). The push
-	// container mounts the volume OPTIONAL and falls back to the minimal
-	// line when the ConfigMap is absent, so a missing facts body degrades to
-	// the minimal description — never a delivery failure. A failed ensure is
-	// logged and the reconcile proceeds (the deliver Job is already
-	// ensured; the description is a nicety the Job tolerates the absence of).
+	// The deliver description ConfigMap is BEST-EFFORT (a genuinely foreign
+	// ConfigMap of the same name is left alone, and the push container mounts
+	// the volume optional + falls back to the minimal line). But a Forbidden
+	// error (the operator lacks the configmaps RBAC for this namespace — a
+	// misinstalled/broken cluster) must NOT be silent (R26): it is logged at
+	// ERROR level and surfaced as a Warning Event, so the operator owner can
+	// see that every PR is degrading to the minimal description.
 	if err := r.ensureDeliverDescriptionConfig(ctx, loop); err != nil {
-		logf.FromContext(ctx).Info("Could not ensure deliver description ConfigMap (best-effort; the push container falls back to the minimal line)", "loop", loop.Name, "err", err)
+		if apierrors.IsForbidden(err) {
+			logf.FromContext(ctx).Error(err, "Forbidden: could not ensure the deliver description ConfigMap (the operator lacks configmaps RBAC for this namespace; the PR description degrades to the minimal line)", "loop", loop.Name)
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "DeliveryDescriptionForbidden",
+				"could not ensure the deliver description ConfigMap %s: %v (the operator lacks the configmaps RBAC for this namespace; the draft PR description degrades to the minimal line)", deliverDescriptionConfigName(loop.Name), err)
+		} else {
+			logf.FromContext(ctx).Info("Could not ensure deliver description ConfigMap (best-effort; the push container falls back to the minimal line)", "loop", loop.Name, "err", err)
+		}
 	}
 	if err := r.ensureDeliverNetPolicies(ctx, loop); err != nil {
 		return false, keep, err

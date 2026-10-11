@@ -365,6 +365,12 @@ type LoopReconciler struct {
 // exit-code reader; the Job runs the operator's trusted check containers, not
 // agent code).
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch;delete
+// A4 (R26): the operator owns the deliver description ConfigMap
+// (ensureDeliverDescriptionConfig / cleanupDeliverDescriptionConfig — the facts
+// body the push container reads to assemble the draft PR description). Only
+// the verbs the code uses: Get (idempotency + foreign guard), Create (ensure),
+// Update (facts changed), Delete (cleanup when delivery is no longer expected).
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;update;delete
 
 // agentPoliciesValid runs the C6a AgentPolicy validation gate: when the
 // referenced AgentPolicies are invalid it sets PolicyValid=False and suspends

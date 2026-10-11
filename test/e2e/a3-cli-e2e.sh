@@ -3,6 +3,13 @@
 # commands — pause -> resume -> describe -> redeliver — and keep the kept
 # `cox logs` output as evidence.
 #
+# The redeliver step proves its REAL path (I52): it STAGES a deterministic
+# FAILED first delivery (by pre-creating the delivery branch coxswain/<loop>
+# with unrelated history in the Gitea samples repo), so the first deliver Job
+# fails and `cox redeliver` re-delivers it (a NEW Job UID, ending
+# Delivered=True). See the redeliver section below. The first delivery is
+# never skipped and a successful-first-delivery run never prints PASS here.
+#
 # Prerequisites (same as the other e2e): the controller is deployed on
 # kind-coxswain-dev with a --runner-image; the gitea sample is running in the
 # `samples` namespace with the `samples-git-cred` secret; the `cox` CLI is
@@ -30,13 +37,28 @@ LOOP_NAME="${LOOP_NAME:-a3-cli-e2e-$RUN_TS}"
 LOOP_SRC="${LOOP_SRC:-$ROOT/examples/gocli/tasks/1.loop.yaml}"
 EVIDENCE="${EVIDENCE:-$ROOT/.samples/a3-cli-e2e-$RUN_TS}"
 COX_BIN="${COX_BIN:-$ROOT/bin/cox}"
+# The Gitea repo the Loop delivers to (spec.workspace.repo) and the delivery
+# branch prefix (spec.delivery.branchPrefix, default "coxswain/"). Used only to
+# stage / clean the delivery branch in the in-cluster Gitea (the redeliver
+# step); both match the sample manifest.
+GIT_REPO="samples/gocli"
+BRANCH_PREFIX="coxswain/"
 
 mkdir -p "$EVIDENCE"
 log() { printf '[a3] %s\n' "$*"; }
-fail() { log "FAIL: $*"; exit 1; }
+fail() { log "FAIL: $*"; echo; echo "=== FAILED: see $EVIDENCE/run.log ==="; exit 1; }
 
 command -v kubectl >/dev/null || fail "kubectl not found"
 command -v go >/dev/null || fail "go not found"
+# git + curl are used by the redeliver step to stage / clean the delivery
+# branch in the in-cluster Gitea (see below).
+command -v git >/dev/null || fail "git not found"
+command -v curl >/dev/null || fail "curl not found"
+
+# The e2e's own stdout is captured to $EVIDENCE/run.log (so any "shown working"
+# claim can be cited from the run.log lines around the step — I76). Redirecting
+# stderr too means a mid-run failure leaves its error in run.log.
+exec >"$EVIDENCE/run.log" 2>&1
 
 # --- build the cox binary from the branch under test ------------------------
 log "building $COX_BIN from $(git -C "$ROOT" rev-parse --short HEAD)"
@@ -52,6 +74,89 @@ phase() { kube get loop "$LOOP_NAME" -o jsonpath='{.status.phase}' 2>/dev/null |
 deliver_job_uid() { kube get job "${LOOP_NAME}-deliver" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo ""; }
 # The Delivered condition's status + reason.
 delivered_condition() { kube get loop "$LOOP_NAME" -o jsonpath='{range .status.conditions[?(@.type=="Delivered")]}{.status} {.reason}{end}' 2>/dev/null; }
+# The Deliver Job's push logs (the push container) — evidence of WHY a delivery
+# failed (e.g. the non-fast-forward rejection the staging provokes).
+deliver_push_logs() { kube logs "job/${LOOP_NAME}-deliver" -c push --tail=40 2>/dev/null || echo ""; }
+
+# --- Gitea helpers (staging the delivery branch) ----------------------------
+# The in-cluster Gitea is only reachable in-cluster, so it is reached host-side
+# through a kubectl port-forward (the S2 seed's pattern). The samples
+# basic-auth credential (the Loop's own gitCredentialSecret — nothing else)
+# is read from the cluster so the staging never disagrees with what the Loop
+# uses. Gitea rejects a credential embedded in the URL, so git uses GIT_ASKPASS
+# (the same credential) instead of an http://user:pass@ URL.
+gitea_port_forward() { # sets $GITEA_API and starts the port-forward (pid in $PF_PID)
+  GIT_USER=$(kube get secret samples-git-cred -o jsonpath='{.data.username}' | base64 -d)
+  GIT_PASS=$(kube get secret samples-git-cred -o jsonpath='{.data.password}' | base64 -d)
+  PF_PORT=$(( (RANDOM % 1000) + 35000 ))
+  kubectl --context "$CTX" -n "$NS" port-forward svc/gitea "$PF_PORT:3000" >/dev/null 2>&1 &
+  PF_PID=$!
+  local ok=0
+  for _ in $(seq 1 30); do
+    if curl -fsS -m 2 "http://127.0.0.1:$PF_PORT/api/healthz" >/dev/null 2>&1; then ok=1; break; fi
+    sleep 0.5
+  done
+  [ "$ok" = 1 ] || fail "gitea port-forward did not answer on 127.0.0.1:$PF_PORT (gitea pod not Ready?)"
+  GITEA_API="http://127.0.0.1:$PF_PORT"
+  # git askpass: emit the samples credential for username/password prompts.
+  cat >"$EVIDENCE/askpass.sh" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' "$GIT_USER";;
+  *Password*) printf '%s\n' "$GIT_PASS";;
+esac
+EOF
+  chmod +x "$EVIDENCE/askpass.sh"
+  export GIT_USER GIT_PASS GIT_ASKPASS="$EVIDENCE/askpass.sh" GIT_TERMINAL_PROMPT=0
+  GIT_URL="$GITEA_API/$GIT_REPO.git"
+  log "gitea port-forward ready ($GITEA_API, user $GIT_USER)"
+}
+gitea_stop() { [ -n "${PF_PID:-}" ] && kill "$PF_PID" 2>/dev/null || true; PF_PID=""; }
+trap 'gitea_stop; kube delete loop "$LOOP_NAME" --wait=false >/dev/null 2>&1 || true' EXIT
+
+# stage_delivery_branch BR: create BR in the Gitea repo with a single commit on
+# UNRELATED history (a scratch clone: no fetch of the repo, just an empty commit
+# pushed to BR). A later deliver push to the same BR is then non-fast-forward and
+# rejected ("fetch first") — a deterministic FAILED delivery. Idempotent against
+# a stale copy from a prior run (delete BR first).
+stage_delivery_branch() {
+  local br="$1" d; d=$(mktemp -d)
+  # Remove a stale copy of the branch (unique name makes this a no-op normally).
+  # `set +e`: deleting a non-existent branch returns 1; that is the success case.
+  set +e
+  ( cd "$d" \
+    && git init -q -b main \
+    && git remote add origin "$GIT_URL" \
+    && git push -q origin ":$br" 2>/dev/null )
+  set -e
+  # A fresh empty-commit scratch repo on UNRELATED history (no fetch of the
+  # repo), pushed to BR.
+  ( cd "$d" \
+    && git config user.name "coxswain-a3-e2e" \
+    && git config user.email "e2e@coxswain.local" \
+    && git commit -q --allow-empty -m "unrelated history: staged by the a3 e2e to force a failed delivery" \
+    && git push -q -u origin "HEAD:$br" ) \
+    || fail "staging delivery branch $br (git push failed; see $EVIDENCE/run.log)"
+  # Verify the branch now exists (a head that is NOT part of the repo's branch
+  # history — unrelated history — so a later deliver push is non-fast-forward).
+  local head; head=$(git ls-remote "$GIT_URL" "refs/heads/$br" | awk '{print $1}')
+  [ -n "$head" ] || fail "delivery branch $br not visible after staging (ls-remote empty)"
+  rm -rf "$d"
+  log "staged delivery branch $br (head $head) — the first delivery will be rejected"
+}
+# delete_delivery_branch BR: remove BR (the run's cleanup). Deleting a missing
+# branch is a no-op (unique name makes it a no-op normally).
+delete_delivery_branch() {
+  local br="$1" d; d=$(mktemp -d)
+  set +e
+  ( cd "$d" \
+    && git init -q -b main \
+    && git remote add origin "$GIT_URL" \
+    && git push -q origin ":$br" 2>/dev/null )
+  set -e
+  rm -rf "$d"
+  log "deleted delivery branch $br"
+}
 
 # --- preflight: operator deployed, sample gitea reachable ------------------
 OPS_NS="${OPS_NS:-coxswain-system}"
@@ -62,6 +167,19 @@ if ! kube get secret samples-git-cred >/dev/null 2>&1; then
   fail "samples-git-cred secret not found in $NS (the gitea sample is not set up)"
 fi
 log "operator + gitea sample present"
+
+# --- stage a FAILED first delivery (the redeliver path) ---------------------
+# Pre-create the delivery branch coxswain/<loop> in the Gitea samples repo with
+# UNRELATED history, so the deliver Job's push is non-fast-forward and rejected
+# ("fetch first") -> a deterministic FAILED first delivery (Delivered=False
+# reason=DeliveryFailed). `cox redeliver` then re-delivers it (a NEW Job UID,
+# ending Delivered=True) once the stale branch is deleted. Staged via the
+# in-cluster Gitea's existing samples credentials (nothing else) — the I81
+# scenario, staged deliberately, not as a cross-run leftover.
+gitea_port_forward
+DELIVER_BRANCH="${BRANCH_PREFIX}${LOOP_NAME}"
+stage_delivery_branch "$DELIVER_BRANCH"
+gitea_stop
 
 # --- apply the Loop ---------------------------------------------------------
 render="$(mktemp)"
@@ -185,120 +303,151 @@ for i in $(seq 1 300); do
     Delivered|Failed)
       break
       ;;
+    *)
+      # A FAILED first delivery is expected here (the branch was staged): the
+      # phase is Succeeded with Delivered=False reason=DeliveryFailed. The
+      # Delivered condition is what decides the redeliver; the phase alone
+      # (Succeeded) is not a terminal signal, so break on the delivery outcome.
+      ;;
+  esac
+  # Break once the first delivery has FAILED (the staged outcome) so the
+  # redeliver step can act — a clean Succeeded (Delivered InProgress/True) is
+  # not a failed delivery, and waiting for a terminal phase would block the
+  # run (the operator never leaves the first failed deliver Job).
+  dc="$(delivered_condition)"
+  case "$dc" in
+    False*DeliveryFailed*|*DeliveryFailed*) break ;;
   esac
   sleep 4
 done
 ph="$(phase)"
-case "$ph" in Succeeded|Delivered) ;; *) fail "Loop did not reach a terminal phase (ph='$ph')" ;; esac
-log "Loop reached $ph"
+# The Loop must be Succeeded (the work passed verify) — delivery failed, which
+# is the staged outcome the redeliver step re-runs.
+case "$ph" in Succeeded) ;; *) fail "Loop did not reach Succeeded before redeliver (ph='$ph')" ;; esac
+# The first delivery MUST have failed (the branch was staged): assert the
+# Deliver condition is False with reason DeliveryFailed (no successful first
+# delivery — otherwise there would be nothing to redeliver).
+case "$(delivered_condition)" in
+  False*DeliveryFailed*) log "first delivery FAILED as staged (Delivered=$(delivered_condition))" ;;
+  *) fail "first delivery did not fail as staged (Delivered='$(delivered_condition)'); the redeliver step cannot be proven" ;;
+esac
+log "Loop reached $ph with a FAILED first delivery (staged)"
 
-# --- describe (final) ---------------------------------------------------------
-cox describe "$LOOP_NAME" | tee "$EVIDENCE/describe-final.out"
+# Capture the deliver Job's push logs (the non-fast-forward rejection — the
+# evidence that the staging worked). Kept, not discarded.
+log "capturing the failed deliver Job's push logs (the rejection)"
+deliver_push_logs | tee "$EVIDENCE/logs-deliver-failed.out"
+if [ ! -s "$EVIDENCE/logs-deliver-failed.out" ]; then
+  fail "the failed deliver Job's push logs are empty (the staging did not produce a visible rejection)"
+fi
+
+# --- describe (final, before redeliver) ----------------------------------------
+cox describe "$LOOP_NAME" | tee "$EVIDENCE/describe-pre-redeliver.out"
 cox history "$LOOP_NAME" | tee "$EVIDENCE/history.out"
 
 # --- assert the kept log/plan evidence is non-empty (no `|| true`) ------------
-# The deliver capture only runs if the Loop had a delivery (task 1 does); if the
-# Loop reached Succeeded with no deliver Job, deliver_done stays false and the
-# deliver file is absent. Assert the files that the run actually produced.
-for f in logs-agent.out logs-proxy.out logs-verify.out plan.out; do
+# The agent/proxy/verify captures and the plan are produced while the Loop is
+# active; the deliver capture is the FAILED Job's push logs (captured above).
+for f in logs-agent.out logs-proxy.out logs-verify.out plan.out logs-deliver-failed.out; do
   test -s "$EVIDENCE/$f" || fail "evidence $f is empty"
 done
+# The in-run deliver capture (logs-deliver.out) is only present if the Loop
+# reached Succeeded while the deliver Job was still running; a staged failure
+# lands it terminal before the in-run window, so it is optional (the failed
+# Job's logs are in logs-deliver-failed.out, asserted above).
 if [ "$deliver_done" = true ]; then
   test -s "$EVIDENCE/logs-deliver.out" || fail "evidence logs-deliver.out is empty"
 fi
-log "component log + plan evidence captured (non-empty)"
+log "component log + plan + failed-deliver evidence captured (non-empty)"
 
 # --- redeliver (I52: re-trigger the delivery) -------------------------------
-# The redeliver step ALWAYS runs (never skipped): it asserts an observable
-# effect. A unique Loop name keeps the first delivery clean (no stale-branch
-# poisoning — I81, filed separately). The deliver Job is <loop>-deliver; its
-# UID changes when the Job is re-created (a redeliver deletes + re-creates it
-# for a FAILED delivery). For a delivery that ALREADY SUCCEEDED (Delivered=True
-# for the current verifiedCommit), the operator does NOT re-create the Job —
-# it just removes the annotation (redeliverEligible returns false; loop_
-# deliver_job.go). Both outcomes are valid, non-skipped redeliver results:
-#   (a) first delivery succeeded  -> annotation removed, delivery kept,
-#       Job UID unchanged;
-#   (b) first delivery failed      -> the operator deletes the failed Job and
-#       re-creates a fresh one (a NEW Job UID) for the same verifiedCommit.
-# The before/after UIDs and the final Delivered condition are pasted in the
-# evidence index. We NEVER require observing the annotation mid-flight: the
-# operator removes it within one reconcile, so a poll can miss it; the
-# observable is the operator's FINAL state (annotation gone + delivery intact,
-# or a new Job).
-JOB_UID_BEFORE="$(deliver_job_uid)"
+# The first delivery is FAILED (asserted above). `cox redeliver` sets the
+# coxswain.io/redeliver annotation; the operator deletes the failed Job,
+# re-creates a fresh one for the SAME pinned verifiedCommit, and removes the
+# annotation. The stale branch (the staged conflicting history) must be
+# deleted BEFORE the re-delivery so the fresh push is clean and Delivered ends
+# True. The observable, on its REAL path: a NEW deliver Job UID (#2 != #1) and
+# a final Delivered=True. A successful-first-delivery run can never reach here
+# (the first-delivery assert above fails first), so this step is never skipped.
+JOB_UID_BEFORE="$(deliver_job_uid)"        # deliver Job UID #1 (the FAILED Job)
 DELIVERED_BEFORE="$(delivered_condition)"
-log "deliver Job UID before redeliver: ${JOB_UID_BEFORE:-<none>}" | tee "$EVIDENCE/redeliver-uid-before.txt"
+log "deliver Job UID #1 (before redeliver): ${JOB_UID_BEFORE:-<none>}" | tee "$EVIDENCE/redeliver-uid-before.txt"
 log "Delivered condition before redeliver: ${DELIVERED_BEFORE:-<none>}" | tee "$EVIDENCE/delivered-before.txt"
+# The first deliver Job must exist (it failed, UID #1 recorded). Without it
+# there is no re-delivery to prove.
+[ -n "$JOB_UID_BEFORE" ] || fail "no failed deliver Job (UID #1) to redeliver (the first delivery did not run)"
 
-# The Loop must be in a delivery-eligible state (Succeeded with delivery
-# expected) for redeliver to have any effect. It reached Succeeded/Delivered in
-# the phase loop above.
-ph="$(phase)"
-case "$ph" in Succeeded|Delivered) ;; *) fail "Loop not Succeeded/Delivered before redeliver (ph='$ph')" ;; esac
-
-# cox redeliver sets the coxswain.io/redeliver annotation (I52). The command
-# itself confirms the annotation was set (its stdout is the evidence); we do
-# NOT poll for the annotation mid-flight (the operator removes it within one
-# reconcile, so a poll would race).
+# cox redeliver sets the coxswain.io/redeliver annotation (I52). The command's
+# stdout confirms the annotation write; `set -e` aborts on failure, so reaching
+# here means the annotation was set.
 cox redeliver "$LOOP_NAME" | tee "$EVIDENCE/redeliver.out"
-# The command must have succeeded (it exits non-zero if the annotation write
-# failed). `set -e` would already abort on a failure, so reaching here means the
-# annotation write succeeded.
 log "cox redeliver succeeded (the command set the annotation; see redeliver.out)"
 
-# Wait for the operator to act on the annotation: either (a) it removes the
-# annotation (an already-delivered Loop keeps its delivery, no new Job) or (b)
-# it deletes the failed Job and re-creates a fresh one (a new Job UID). The
-# observable we assert: the annotation is eventually REMOVED (the operator
-# processed it) AND the delivery state is valid (intact, or a fresh Job for
-# the re-delivery). Poll up to ~5 min.
-JOB_UID_AFTER=""
-ann_final="$(kube get loop "$LOOP_NAME" -o jsonpath='{.metadata.annotations.coxswain\.io/redeliver}')"
+# The operator deletes the FAILED Job (UID #1) and, on a later pass, creates a
+# fresh one (UID #2). We only need UID #1 to be gone; we do NOT require the
+# Job to be ABSENT in a visible window (the operator can create the fresh Job
+# before our first poll sees the delete — that is the success we want, a NEW
+# Job). So: wait until UID #1 is no longer present (absent, or a new UID), then
+# proceed; the fresh Job (UID #2 != #1) is what the later assertion records.
 for i in $(seq 1 75); do
-  ann_final="$(kube get loop "$LOOP_NAME" -o jsonpath='{.metadata.annotations.coxswain\.io/redeliver}')"
+  uid_now="$(deliver_job_uid)"
+  # UID #1 gone when the Job is absent or is a NEW Job (a different UID).
+  if [ -z "$uid_now" ] || [ "$uid_now" != "$JOB_UID_BEFORE" ]; then break; fi
+  sleep 4
+done
+uid_now="$(deliver_job_uid)"
+{ [ -z "$uid_now" ] || [ "$uid_now" != "$JOB_UID_BEFORE" ]; } \
+  || fail "the failed deliver Job (UID #1 $JOB_UID_BEFORE) was not deleted by the operator after redeliver (Job still present: $uid_now)"
+log "operator deleted the failed deliver Job (UID #1 gone; the re-delivery Job is ${uid_now:-<not created yet>})"
+
+# Delete the stale staged branch so the fresh deliver push is clean (otherwise
+# the re-delivery hits the same non-fast-forward rejection and Delivered would
+# stay False). Uses the same in-cluster Gitea + samples credentials as the
+# staging.
+gitea_port_forward
+delete_delivery_branch "$DELIVER_BRANCH"
+gitea_stop
+log "stale delivery branch $DELIVER_BRANCH deleted (the re-delivery push is now clean)"
+
+# Wait for the fresh deliver Job (UID #2, != #1) to be created AND for the
+# re-delivery to SUCCEED (Delivered=True). The fresh Job runs the same push
+# (now against a clean branch) and records the delivery.
+JOB_UID_AFTER=""
+for i in $(seq 1 75); do
   JOB_UID_AFTER="$(deliver_job_uid)"
-  # The operator has responded when the annotation is gone (removed).
-  if [ -z "$ann_final" ]; then break; fi
+  DELIVERED_FINAL="$(delivered_condition)"
+  # Success: a NEW Job (UID #2 != #1) exists and the delivery is True.
+  if [ -n "$JOB_UID_AFTER" ] && [ "$JOB_UID_AFTER" != "$JOB_UID_BEFORE" ]; then
+    case "$DELIVERED_FINAL" in True*) break ;; esac
+  fi
   sleep 4
 done
 JOB_UID_AFTER="$(deliver_job_uid)"
-log "deliver Job UID after redeliver: ${JOB_UID_AFTER:-<none>}" | tee "$EVIDENCE/redeliver-uid-after.txt"
-
-# The annotation must be gone (the operator processed it) in every case.
-[ -z "$ann_final" ] || fail "coxswain.io/redeliver annotation still present after the operator should have processed it (value '$ann_final')"
-log "redeliver annotation removed by the operator"
-
-# The final Delivered condition (re-decided: True/Delivered for a kept delivery,
-# or a fresh DeliveryFailed with a new Job for a re-delivery).
 DELIVERED_FINAL="$(delivered_condition)"
+log "deliver Job UID #2 (after redeliver): ${JOB_UID_AFTER:-<none>}" | tee "$EVIDENCE/redeliver-uid-after.txt"
 log "Delivered condition after redeliver: ${DELIVERED_FINAL:-<none>}" | tee "$EVIDENCE/delivered-final.txt"
-# cox describe / history to capture the final Loop state (the Delivered
-# condition is in describe's conditions block).
+# Capture the fresh deliver Job's push logs (the successful re-delivery).
+log "capturing the re-delivery deliver Job's push logs (the successful push)"
+deliver_push_logs | tee "$EVIDENCE/logs-deliver-redeliver.out" || true
+# cox describe / history for the final Loop state (the Delivered condition is in
+# describe's conditions block).
 cox describe "$LOOP_NAME" | tee "$EVIDENCE/describe-after-redeliver.out"
 
-# Assert the observable effect. The redeliver did SOMETHING observable: the
-# annotation was set (the command confirmed) and the operator processed it
-# (annotation removed + a valid final state). Two valid outcomes:
-#   (a) NEW Job UID (re-delivery: the first delivery had failed, so the
-#       operator re-created the Job) -> assert the UID changed.
-#   (b) SAME Job UID (already-delivered: the operator kept the delivery) ->
-#       assert the Job UID is unchanged and the delivery is intact (Delivered
-#       True).
-if [ -n "$JOB_UID_AFTER" ] && [ "$JOB_UID_AFTER" != "$JOB_UID_BEFORE" ]; then
-  log "redeliver re-created the deliver Job (UID $JOB_UID_BEFORE -> $JOB_UID_AFTER); Delivered=$DELIVERED_FINAL"
-elif [ -n "$JOB_UID_BEFORE" ] && [ "$JOB_UID_AFTER" = "$JOB_UID_BEFORE" ]; then
-  # The Job was not re-created: the Loop was already delivered for this
-  # verifiedCommit, so the annotation was removed and the delivery kept.
-  case "$DELIVERED_FINAL" in
-    True*) log "redeliver on an already-delivered Loop: annotation removed, delivery kept (Job UID unchanged: $JOB_UID_AFTER)" ;;
-    *) fail "already-delivered case but Delivered is not True (got: '$DELIVERED_FINAL')" ;;
-  esac
-else
-  # No Job before or after: the delivery never ran (should not happen for a
-  # Succeeded Loop with delivery expected — a real failure).
-  fail "redeliver produced no observable effect (Job UID before: ${JOB_UID_BEFORE:-<none>}, after: ${JOB_UID_AFTER:-<none>})"
-fi
+# --- assert the redeliver's REAL path ----------------------------------------
+# (1) a NEW deliver Job UID (#2 != #1): the operator deleted the failed Job and
+#     re-created a fresh one for the same pinned verifiedCommit.
+[ -n "$JOB_UID_AFTER" ] || fail "no fresh deliver Job (UID #2) after redeliver (the re-delivery did not create a Job)"
+[ "$JOB_UID_AFTER" != "$JOB_UID_BEFORE" ] \
+  || fail "the deliver Job UID did not change (UID #1 = UID #2 = $JOB_UID_BEFORE): the operator did not re-create the Job — the re-delivery path was not proven"
+log "redeliver re-created the deliver Job (UID #1 $JOB_UID_BEFORE -> UID #2 $JOB_UID_AFTER)"
+# (2) the re-delivery SUCCEEDED: the final Delivered condition is True (the
+#     stale branch was deleted, so the fresh push is clean and the delivery is
+#     recorded).
+case "$DELIVERED_FINAL" in
+  True*) log "re-delivery succeeded (Delivered=$DELIVERED_FINAL)" ;;
+  *) fail "the re-delivery did not end Delivered=True (got: '$DELIVERED_FINAL') — the redeliver path was not proven" ;;
+esac
+log "redeliver proven: a failed first delivery (UID #1) was re-delivered (UID #2) and ended Delivered=True"
 
 # --- evidence index ----------------------------------------------------------
 {
@@ -306,6 +455,9 @@ fi
   echo "operator image: $(kube get deployment coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo unknown)"
   echo "cox binary: $COX (built from $(git -C "$ROOT" rev-parse --short HEAD))"
   echo "final phase: $(phase)"
+  echo "final Delivered condition: $(delivered_condition)"
+  echo "deliver Job UID #1 (failed, before redeliver): $JOB_UID_BEFORE"
+  echo "deliver Job UID #2 (fresh, after redeliver): $JOB_UID_AFTER"
   echo
   for f in "$EVIDENCE"/*.out; do
     echo "=== $(basename "$f") ==="
@@ -314,4 +466,16 @@ fi
   done
 } >"$EVIDENCE/index.txt" 2>&1 || true
 log "evidence -> $EVIDENCE"
-log "PASS: A3 CLI lifecycle (pause -> resume -> describe -> redeliver) completed"
+
+# --- cleanup (the run's own Loop + the staged/re-delivered Gitea branch) ------
+# The EXIT trap already deletes the Loop and stops the port-forward if the run
+# aborted mid-run; on success we clean up explicitly (and idempotently) so the
+# cluster and the Gitea repo are left as we found them. The re-delivery left an
+# open PR on the (now-deleted) branch; the branch itself is the deliverable the
+# run created and is removed here.
+gitea_port_forward
+delete_delivery_branch "$DELIVER_BRANCH"
+gitea_stop
+kube delete loop "$LOOP_NAME" --wait=true --timeout=120s >/dev/null 2>&1 || kube delete loop "$LOOP_NAME" --wait=false >/dev/null 2>&1 || true
+log "cleaned up: Loop $LOOP_NAME deleted; delivery branch $DELIVER_BRANCH removed from the Gitea repo"
+log "PASS: A3 CLI lifecycle (pause -> resume -> describe -> redeliver) completed — redeliver proven on its real path (failed UID #1 -> fresh UID #2, Delivered=True)"

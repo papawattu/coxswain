@@ -243,8 +243,18 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 	} else if ok {
 		requeue = true
 	}
+	// The deliver description ConfigMap is BEST-EFFORT (the reviewer's P2:
+	// "a transient read failure must not block the Job"): the operator's
+	// ServiceAccount may not be able to create a ConfigMap in the Loop's
+	// namespace (a restricted namespace), and that must NOT error the
+	// Succeeded reconcile (which would block Succeeded forever). The push
+	// container mounts the volume OPTIONAL and falls back to the minimal
+	// line when the ConfigMap is absent, so a missing facts body degrades to
+	// the minimal description — never a delivery failure. A failed ensure is
+	// logged and the reconcile proceeds (the deliver Job is already
+	// ensured; the description is a nicety the Job tolerates the absence of).
 	if err := r.ensureDeliverDescriptionConfig(ctx, loop); err != nil {
-		return false, keep, err
+		logf.FromContext(ctx).Info("Could not ensure deliver description ConfigMap (best-effort; the push container falls back to the minimal line)", "loop", loop.Name, "err", err)
 	}
 	if err := r.ensureDeliverNetPolicies(ctx, loop); err != nil {
 		return false, keep, err

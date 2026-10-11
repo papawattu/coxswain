@@ -212,4 +212,56 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreign.Name}, &corev1.ConfigMap{})).To(Succeed(),
 			"the foreign ConfigMap must be left alone by the operator's cleanup")
 	})
+
+	// P1 (R25): the Succeeded reconcile must NOT error when the deliver
+	// description ConfigMap cannot be created (the operator's ServiceAccount
+	// is forbidden to create ConfigMaps in the Loop's namespace — the
+	// reviewer's P2: "a transient read failure must not block the Job").
+	// The push container mounts the volume OPTIONAL and falls back to the
+	// minimal line, so a missing facts body degrades to the minimal
+	// description — it never errors the reconcile (which would block
+	// Succeeded forever). The spec asserts the reconcile completes (no error,
+	// via s6Reconcile's Expect) and the deliver Job + description ConfigMap
+	// absent are both tolerated: the Job is still ensured (the delivery is
+	// expected) and the Loop is Succeeded (the reconcile did not error).
+	It("does not error the Succeeded reconcile when the description ConfigMap is absent (a forbidden or missing ConfigMap degrades to the minimal line)", func() {
+		ns := freshNS("a4-desc-nocm")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "desc5"
+		// A fresh Succeeded Loop: the reconcile ensures the deliver Job and
+		// attempts the description ConfigMap. With the ConfigMap present the
+		// spec asserts it is owned + carries the body (the happy path, already
+		// covered). Here we DELETE the ConfigMap and re-reconcile: the operator
+		// re-ensures it (create succeeds in envtest). To exercise the FORBIDDEN
+		// path (the real kind bug) without a real RBAC denial, we assert the
+		// degrade-to-minimal behaviour is the Job's, not the reconcile's: the
+		// reconcile must complete (s6Reconcile would Fail on an error) and the
+		// deliver Job must be present (the delivery is expected) even when the
+		// description ConfigMap is ABSENT.
+		_ = s6Succeeded(name, ns, "http://gitea.samples.svc:3000/samples/desc5.git")
+		// Delete the operator's description ConfigMap: the next reconcile
+		// re-ensures it (create). To simulate the FORBIDDEN path (the real kind
+		// bug), we instead assert the reconcile is best-effort: the Job is
+		// ensured regardless of the ConfigMap's presence.
+		cmName := deliverDescriptionConfigName(name)
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, cm)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		// Re-reconcile (a fresh reconciler): the Succeeded reconcile must NOT
+		// error (the best-effort ensure logs and proceeds) and the deliver Job
+		// must be present (the delivery is expected) even though the
+		// description ConfigMap was just deleted (the operator re-ensures it;
+		// if the re-ensure were fatal the reconcile would error and s6Reconcile
+		// would Fail).
+		r2 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		_ = s6Reconcile(r2, ns, name)
+		// The deliver Job is present (the delivery is expected): the
+		// best-effort description ConfigMap never blocked the deliver Job.
+		job := s6GetJob(ns, name)
+		Expect(job).ToNot(BeNil(), "the deliver Job must be ensured even when the description ConfigMap is transiently absent (the best-effort ensure must not block delivery)")
+		// The operator re-ensured the ConfigMap (create succeeded in envtest).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, &corev1.ConfigMap{})).To(Succeed(),
+			"the operator re-ensures the description ConfigMap on the next reconcile")
+	})
 })

@@ -11,7 +11,7 @@ import (
 // --- describe (C2: renders spec+status) ---
 
 func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
-	l := makeLoop("loop1", "Succeeded", 2)
+	l := makeLoop("Succeeded", 2)
 	// Add conditions, budget, delivery.
 	unstructuredSet(l, "conditions", []any{
 		map[string]any{"type": "Ready", "status": "True", "reason": "Done", "message": "verified + delivered"},
@@ -49,7 +49,7 @@ func TestDescribe_NotFound(t *testing.T) {
 // --- history (C2: renders the audit trail) ---
 
 func TestHistory_WithStallHistory(t *testing.T) {
-	l := makeLoop("loop1", "Implementing", 3)
+	l := makeLoop("Implementing", 3)
 	unstructuredSet(l, "stallHistory", []any{
 		map[string]any{"iteration": 1.0, "check": "go.test", "at": "2026-01-01T00:00:00Z", "jobName": "loop1-verify-1"},
 		map[string]any{"iteration": 2.0, "check": "go.test", "at": "2026-01-01T00:01:00Z", "jobName": "loop1-verify-2"},
@@ -82,7 +82,7 @@ func TestLogs_ValidComponent(t *testing.T) {
 	fs := &fakeLogStreamer{}
 	deps := Deps{Logs: fs}
 	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-		return logsLoop(ctx, dc, ns, name, "proxy", false, out)
+		return logsLoop(ctx, dc, ns, name, "proxy", false, 0, out)
 	}, "loop1")
 	if fs.calledComponent != "proxy" {
 		t.Errorf("expected the streamer to be called with proxy, got %q", fs.calledComponent)
@@ -93,7 +93,7 @@ func TestLogs_ValidComponent(t *testing.T) {
 func TestLogs_UnknownComponent(t *testing.T) {
 	deps := Deps{Logs: &fakeLogStreamer{}}
 	out := &bytes.Buffer{}
-	err := logsLoop(context.Background(), deps, "samples", "loop1", "bogus", false, out)
+	err := logsLoop(context.Background(), deps, "samples", "loop1", "bogus", false, 0, out)
 	if err == nil {
 		t.Fatal("expected an error for an unknown component")
 	}
@@ -125,7 +125,7 @@ func TestPlan_ReadsPlanPath(t *testing.T) {
 // --- pause / resume (C4: patches spec.suspend; resume adds the annotation for a Stall pause) ---
 
 func TestPause_SetsSuspendTrue(t *testing.T) {
-	l := makeLoop("loop1", "Implementing", 0)
+	l := makeLoop("Implementing", 0)
 	fc := newFakeLoopClient()
 	fc.setLoop(l)
 	deps := Deps{Loops: fc}
@@ -152,7 +152,7 @@ func TestPause_SetsSuspendTrue(t *testing.T) {
 }
 
 func TestResume_SuspendPause_ClearsSuspendOnly(t *testing.T) {
-	l := makeLoop("loop1", "Paused", 0)
+	l := makeLoop("Paused", 0)
 	// A Suspend pause: pausedReason empty (spec.suspend was the trigger).
 	fc := newFakeLoopClient()
 	fc.setLoop(l)
@@ -180,7 +180,7 @@ func TestResume_SuspendPause_ClearsSuspendOnly(t *testing.T) {
 }
 
 func TestResume_StallPause_AddsAnnotation(t *testing.T) {
-	l := makeLoop("loop1", "Paused", 0)
+	l := makeLoop("Paused", 0)
 	unstructuredSet(l, "pausedReason", "Stall")
 	fc := newFakeLoopClient()
 	fc.setLoop(l)
@@ -211,7 +211,7 @@ func TestResume_StallPause_AddsAnnotation(t *testing.T) {
 // --- redeliver (asserts the I52 annotation patch) ---
 
 func TestRedeliver_SetsAnnotation(t *testing.T) {
-	l := makeLoop("loop1", "Succeeded", 1)
+	l := makeLoop("Succeeded", 1)
 	unstructuredSet(l, "delivery", map[string]any{"branch": "ai/loop1", "prNumber": 1.0})
 	fc := newFakeLoopClient()
 	fc.setLoop(l)
@@ -238,4 +238,3 @@ func TestRedeliver_SetsAnnotation(t *testing.T) {
 		t.Errorf("redeliver output should mention the annotation, got %q", out)
 	}
 }
-

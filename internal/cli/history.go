@@ -13,17 +13,19 @@ import (
 // (the ring of the last 10 verify-failure iterations). This command renders
 // that array plus the current phase/iteration so the trail is readable
 // regardless of which history fields are populated.
-func newHistoryCommand(deps Deps) *cobra.Command {
+func newHistoryCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:     "history",
-		Short:   "Print a Loop's audit trail (phase + the verify-failure history ring)",
-		Args:    cobra.ExactArgs(1),
-		RunE:    func(cmd *cobra.Command, args []string) error { return historyLoop(cmd.Context(), currentDeps, namespaceOf(cmd), args[0], cmd.OutOrStdout()) },
+		Use:   "history",
+		Short: "Print a Loop's audit trail (phase + the verify-failure history ring)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return historyLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
+		},
 	}
 }
 
 // historyLoop renders the Loop's history (the history command's core action).
-func historyLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) error {
+func historyLoop(ctx context.Context, dc Deps, _, name string, out io.Writer) error {
 	u, err := getLoop(ctx, dc, name)
 	if err != nil {
 		return err
@@ -31,7 +33,7 @@ func historyLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	w := newWriter(out)
 
 	phase, _ := getNestedString(u, "status", "phase")
-	iter, _ := getNestedInt(u, "status", "iteration")
+	iter := getNestedInt(u, "status", "iteration")
 	w.printf("Loop:       %s\n", u.GetName())
 	w.printf("Phase:      %s\n", phaseOrDash(phase))
 	w.printf("Iteration:  %d\n", iter)

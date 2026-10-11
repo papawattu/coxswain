@@ -8,8 +8,8 @@ import (
 // writer is a thin stdout wrapper that tracks the first error so commands can
 // return it after rendering.
 type writer struct {
-	w      io.Writer
-	fail   error
+	w    io.Writer
+	fail error
 }
 
 func newWriter(w io.Writer) *writer { return &writer{w: w} }

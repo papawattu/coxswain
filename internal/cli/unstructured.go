@@ -43,21 +43,21 @@ func getNestedString(u *unstructured.Unstructured, fields ...string) (string, bo
 	return v, true
 }
 
-// getNestedInt reads a nested int field.
-func getNestedInt(u *unstructured.Unstructured, fields ...string) (int, bool) {
+// getNestedInt reads a nested int field (0 when absent).
+func getNestedInt(u *unstructured.Unstructured, fields ...string) int {
 	v, found := getNested(u, fields...)
 	if !found {
-		return 0, false
+		return 0
 	}
 	switch n := v.(type) {
 	case int:
-		return n, true
+		return n
 	case int64:
-		return int(n), true
+		return int(n)
 	case float64:
-		return int(n), true
+		return int(n)
 	}
-	return 0, false
+	return 0
 }
 
 // getNestedBool reads a nested bool field.
@@ -76,10 +76,4 @@ func getNestedSlice(u *unstructured.Unstructured, fields ...string) ([]any, bool
 func getNestedMap(u *unstructured.Unstructured, fields ...string) (map[string]any, bool) {
 	v, found, _ := unstructured.NestedMap(u.Object, fields...)
 	return v, found
-}
-
-// setNested sets a nested field on the unstructured object (mutating it in
-// place for the Update path).
-func setNested(u *unstructured.Unstructured, value any, fields ...string) error {
-	return unstructured.SetNestedField(u.Object, value, fields...)
 }

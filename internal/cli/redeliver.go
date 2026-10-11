@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/spf13/cobra"
@@ -15,19 +14,19 @@ const redeliverAnnotation = "coxswain.io/redeliver"
 
 // newRedeliverCommand builds `cox redeliver <loop>`: set the I52 annotation to
 // trigger a re-delivery of a failed delivery (A3).
-func newRedeliverCommand(deps Deps) *cobra.Command {
+func newRedeliverCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "redeliver <loop>",
 		Short: "Re-trigger delivery for a failed Loop (set the I52 coxswain.io/redeliver annotation)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return redeliverLoop(cmd.Context(), currentDeps, namespaceOf(cmd), args[0], cmd.OutOrStdout())
+			return redeliverLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
 		},
 	}
 }
 
 // redeliverLoop sets the I52 annotation (the redeliver command's core action).
-func redeliverLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) error {
+func redeliverLoop(ctx context.Context, dc Deps, _, name string, out io.Writer) error {
 	// Read the current delivery state so the message is accurate.
 	u, err := getLoop(ctx, dc, name)
 	if err != nil {
@@ -38,9 +37,9 @@ func redeliverLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer)
 		return err
 	}
 	if hasDelivery {
-		fmt.Fprintf(out, "redeliver requested for %s (%s set; a fresh deliver Job will be created for the pinned verifiedCommit)\n", name, redeliverAnnotation)
+		newWriter(out).printf("redeliver requested for %s (%s set; a fresh deliver Job will be created for the pinned verifiedCommit)", name, redeliverAnnotation)
 	} else {
-		fmt.Fprintf(out, "redeliver requested for %s (%s set; note: status.delivery is nil, so the operator will re-run delivery if the verifiedCommit is pinned)\n", name, redeliverAnnotation)
+		newWriter(out).printf("redeliver requested for %s (%s set; note: status.delivery is nil, so the operator will re-run delivery if the verifiedCommit is pinned)", name, redeliverAnnotation)
 	}
 	return nil
 }

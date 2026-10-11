@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -23,14 +23,14 @@ var loopGVR = schema.GroupVersionResource{
 	Resource: "loops",
 }
 
-// buildConfig builds a rest.Config from the kubeconfig path (or the ambient
-// context when empty).
-func buildConfig(kubeconfigPath string) (*rest.Config, error) {
+// buildConfig builds a rest.Config from the kubeconfig path and context
+// (empty = the ambient context).
+func buildConfig(kubeconfigPath, kubeContext string) (*rest.Config, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfigPath != "" {
 		rules.ExplicitPath = kubeconfigPath
 	}
-	overrides := &clientcmd.ConfigOverrides{}
+	overrides := &clientcmd.ConfigOverrides{CurrentContext: kubeContext}
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
 }
 
@@ -40,14 +40,6 @@ func buildConfig(kubeconfigPath string) (*rest.Config, error) {
 type dynamicLoopClient struct {
 	ns string
 	c  dynamic.Interface
-}
-
-func newDynamicLoopClient(cfg *rest.Config, ns string) (*dynamicLoopClient, error) {
-	c, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &dynamicLoopClient{ns: ns, c: c}, nil
 }
 
 // Get returns the named Loop as a *unstructured.Unstructured (or a
@@ -88,4 +80,32 @@ func mustJSON(v any) []byte {
 		panic(err)
 	}
 	return b
+}
+
+// NewDeps builds the real client-go dependencies from the CLI's --namespace /
+// --context / --kubeconfig flags. It is called by the two mains after cobra
+// parses the persistent flags.
+func NewDeps() (Deps, error) {
+	cfg, err := buildConfig(Kubeconfig, Context)
+	if err != nil {
+		return Deps{}, err
+	}
+	dc, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return Deps{}, err
+	}
+	ns := Namespace
+	if ns == "" {
+		cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{CurrentContext: Context})
+		if n, _, err := cc.Namespace(); err == nil && n != "" {
+			ns = n
+		} else {
+			ns = "default"
+		}
+	}
+	return Deps{
+		Loops:     &dynamicLoopClient{ns: ns, c: dc},
+		Logs:      &kubectlLogStreamer{ns: ns},
+		Workspace: &peekWorkspaceReader{ns: ns},
+	}, nil
 }

@@ -9,18 +9,20 @@ import (
 
 // newDescribeCommand builds `cox describe <loop>`: a human-readable summary of
 // phase, iteration, conditions, budget, and delivery (A3).
-func newDescribeCommand(deps Deps) *cobra.Command {
+func newDescribeCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "describe",
-		Short:   "Show a Loop's phase, iteration, conditions, budget, and delivery",
-		Args:    cobra.ExactArgs(1),
-		RunE:    func(cmd *cobra.Command, args []string) error { return describeLoop(cmd.Context(), currentDeps, namespaceOf(cmd), args[0], cmd.OutOrStdout()) },
+		Use:   "describe",
+		Short: "Show a Loop's phase, iteration, conditions, budget, and delivery",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return describeLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
+		},
 	}
 	return cmd
 }
 
 // namespaceOf resolves the -n flag (or "default").
-func namespaceOf(cmd *cobra.Command) string {
+func namespaceOf() string {
 	if Namespace != "" {
 		return Namespace
 	}
@@ -36,7 +38,7 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 	w := newWriter(out)
 
 	phase, _ := getNestedString(u, "status", "phase")
-	iter, _ := getNestedInt(u, "status", "iteration")
+	iter := getNestedInt(u, "status", "iteration")
 	suspend, _ := getNestedBool(u, "spec", "suspend")
 
 	w.printf("Name:         %s\n", u.GetName())

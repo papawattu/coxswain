@@ -16,6 +16,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,6 +26,10 @@ import (
 // context). The CLI resolves it once at command build time so every subcommand
 // shares it.
 var Namespace string
+
+// Context is the kubeconfig context (from the --context flag; empty = the
+// ambient context). Passed to the real client and the kubectl subcommands.
+var Context string
 
 // Kubeconfig is the kubeconfig path (or "" for the ambient context).
 var Kubeconfig string
@@ -78,18 +83,35 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		Short:         "Drive coxswain Loops (kubectl plugin: kubectl cox)",
 		SilenceUsage:  true,
 		SilenceErrors: false,
+		// Build the real client-go deps after the persistent flags
+		// (--namespace/--context/--kubeconfig) are parsed, unless the caller
+		// already injected a deps set (tests inject a fake before Execute).
+		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
+			if currentDeps.Loops == nil {
+				d, err := NewDeps()
+				if err != nil {
+					cmd.SilenceErrors = true
+					if _, ferr := fmt.Fprintln(cmd.ErrOrStderr(), "Error:", err); ferr != nil {
+						return
+					}
+					return
+				}
+				currentDeps = d
+			}
+		},
 	}
 	root.PersistentFlags().StringVarP(&Namespace, "namespace", "n", "", "the namespace for the coxswain objects (from the kubeconfig context if unset)")
+	root.PersistentFlags().StringVar(&Context, "context", "", "the kubeconfig context to use (the ambient context if unset)")
 	root.PersistentFlags().StringVar(&Kubeconfig, "kubeconfig", "", "the kubeconfig file to use (the ambient context if unset)")
 
 	root.AddCommand(
-		newDescribeCommand(deps),
-		newHistoryCommand(deps),
-		newLogsCommand(deps),
-		newPlanCommand(deps),
-		newPauseCommand(deps),
-		newResumeCommand(deps),
-		newRedeliverCommand(deps),
+		newDescribeCommand(),
+		newHistoryCommand(),
+		newLogsCommand(),
+		newPlanCommand(),
+		newPauseCommand(),
+		newResumeCommand(),
+		newRedeliverCommand(),
 	)
 	return root
 }
@@ -97,4 +119,21 @@ func NewRootCommand(deps Deps) *cobra.Command {
 // Execute runs the root command (os.Args[1:]). Both mains call this.
 func Execute(deps Deps) error {
 	return NewRootCommand(deps).ExecuteContext(context.Background())
+}
+
+// kubeFlagArgs returns the kubectl/client-go global flag args the CLI's
+// subcommands need: --context, --namespace, --kubeconfig (each omitted when
+// empty, so the ambient kubeconfig context is used).
+func kubeFlagArgs(ns string) []string {
+	var args []string
+	if Context != "" {
+		args = append(args, "--context", Context)
+	}
+	if ns != "" {
+		args = append(args, "--namespace", ns)
+	}
+	if Kubeconfig != "" {
+		args = append(args, "--kubeconfig", Kubeconfig)
+	}
+	return args
 }

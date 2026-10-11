@@ -2,46 +2,46 @@ package cli
 
 import (
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/spf13/cobra"
 )
 
 // newPauseCommand builds `cox pause <loop>`: set spec.suspend=true (A3).
-func newPauseCommand(deps Deps) *cobra.Command {
+func newPauseCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "pause <loop>",
 		Short: "Pause a Loop (set spec.suspend=true)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return suspendLoop(cmd.Context(), currentDeps, namespaceOf(cmd), args[0], true, cmd.OutOrStdout())
+			return suspendLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], true, cmd.OutOrStdout())
 		},
 	}
 }
 
 // newResumeCommand builds `cox resume <loop>`: clear spec.suspend and, for a
 // Stall/Budget pause, set the coxswain.io/resume annotation (A3 / P2f).
-func newResumeCommand(deps Deps) *cobra.Command {
+func newResumeCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "resume <loop>",
 		Short: "Resume a Loop (clear spec.suspend; set coxswain.io/resume for a Stall/Budget pause)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return resumeLoop(cmd.Context(), currentDeps, namespaceOf(cmd), args[0], cmd.OutOrStdout())
+			return resumeLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
 		},
 	}
 }
 
 // suspendLoop sets or clears spec.suspend (the pause command's core action).
-func suspendLoop(ctx context.Context, dc Deps, ns, name string, suspend bool, out io.Writer) error {
+func suspendLoop(ctx context.Context, dc Deps, _, name string, suspend bool, out io.Writer) error {
 	if err := setSuspend(ctx, dc, name, suspend); err != nil {
 		return err
 	}
+	w := newWriter(out)
 	if suspend {
-		fmt.Fprintf(out, "paused %s (spec.suspend=true)\n", name)
+		w.printf("paused %s (spec.suspend=true)", name)
 	} else {
-		fmt.Fprintf(out, "resumed %s (spec.suspend=false)\n", name)
+		w.printf("resumed %s (spec.suspend=false)", name)
 	}
 	return nil
 }
@@ -57,7 +57,7 @@ func setSuspend(ctx context.Context, dc Deps, name string, suspend bool) error {
 // reason (not a Suspend), sets the one-shot coxswain.io/resume annotation
 // (P2f: spec.suspend=false resumes only a Suspend pause; a Stall/Budget pause
 // needs the annotation).
-func resumeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) error {
+func resumeLoop(ctx context.Context, dc Deps, _, name string, out io.Writer) error {
 	u, err := getLoop(ctx, dc, name)
 	if err != nil {
 		return err
@@ -72,9 +72,9 @@ func resumeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) er
 		if err := setAnnotation(ctx, dc, name, resumeAnnotation, "true"); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "resumed %s (spec.suspend=false + %s=true)\n", name, resumeAnnotation)
+		newWriter(out).printf("resumed %s (spec.suspend=false + %s=true)", name, resumeAnnotation)
 	} else {
-		fmt.Fprintf(out, "resumed %s (spec.suspend=false)\n", name)
+		newWriter(out).printf("resumed %s (spec.suspend=false)", name)
 	}
 	return nil
 }

@@ -13,13 +13,13 @@ const planPath = ".coxswain/PLAN.md"
 
 // newPlanCommand builds `cox plan <loop>`: read the plan from the workspace
 // PVC (A3).
-func newPlanCommand(deps Deps) *cobra.Command {
+func newPlanCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:     "plan <loop>",
-		Short:   "Read the plan (.coxswain/PLAN.md) from the Loop's workspace",
-		Args:    cobra.ExactArgs(1),
+		Use:   "plan <loop>",
+		Short: "Read the plan (.coxswain/PLAN.md) from the Loop's workspace",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return planLoop(cmd.Context(), currentDeps, namespaceOf(cmd), args[0], cmd.OutOrStdout())
+			return planLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
 		},
 	}
 }
@@ -29,7 +29,7 @@ func newPlanCommand(deps Deps) *cobra.Command {
 // PVC); tests stub it.
 func planLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) error {
 	if dc.Workspace == nil {
-		dc.Workspace = &peekWorkspaceReader{ns: ns, kubeconfig: Kubeconfig}
+		dc.Workspace = &peekWorkspaceReader{ns: ns}
 	}
 	content, err := dc.Workspace.Read(ctx, name, planPath)
 	if err != nil {

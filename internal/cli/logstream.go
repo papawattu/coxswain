@@ -11,25 +11,25 @@ import (
 // for the component's pod (CLI-PLAN.md: the logs command shells out behind a
 // thin runner interface that tests stub).
 type kubectlLogStreamer struct {
-	ns         string
-	kubeconfig string
-	follow     bool
+	ns     string
+	follow bool
+	tail   int
 }
 
 // Stream runs `kubectl logs` for the component's pod and writes to
 // os.Stdout. The follow flag adds -f.
 func (k *kubectlLogStreamer) Stream(ctx context.Context, loop, component string) error {
-	args := []string{}
-	if k.kubeconfig != "" {
-		args = append(args, "--kubeconfig", k.kubeconfig)
-	}
-	args = append(args, "-n", k.ns, "logs")
+	args := kubeFlagArgs(k.ns)
+	args = append(args, "logs")
 	if k.follow {
 		args = append(args, "-f")
 	}
+	if k.tail > 0 {
+		args = append(args, "--tail", fmt.Sprintf("%d", k.tail))
+	}
 
 	switch component {
-	case "agent", "proxy":
+	case compAgent, "proxy":
 		args = append(args, "pod/"+loop+"-sandbox", "-c", component)
 	case "verify":
 		args = append(args, "-l", "app.kubernetes.io/loop="+loop, "component=verify")

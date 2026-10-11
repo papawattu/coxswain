@@ -9,12 +9,12 @@ import (
 )
 
 // makeLoop builds a minimal *unstructured.Unstructured Loop for the tests.
-func makeLoop(name, phase string, iteration int) *unstructured.Unstructured {
+func makeLoop(phase string, iteration int) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]any{
 			"apiVersion": "coxswain.wattu.com/v1alpha1",
 			"kind":       "Loop",
-			"metadata":   map[string]any{"name": name, "namespace": "samples"},
+			"metadata":   map[string]any{"name": "loop1", "namespace": "samples"},
 			"spec":       map[string]any{"goal": "make the thing work", "suspend": false},
 			"status": map[string]any{
 				"phase":     phase,

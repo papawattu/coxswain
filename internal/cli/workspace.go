@@ -14,8 +14,7 @@ import (
 // as the same UID as the sandbox (the repo is written by a different UID, and
 // git refuses to operate on a repo it doesn't own).
 type peekWorkspaceReader struct {
-	ns         string
-	kubeconfig string
+	ns          string
 	runnerImage string
 }
 
@@ -55,11 +54,13 @@ spec:
 		return "", fmt.Errorf("apply peek pod: %w", err)
 	}
 	podName := "cox-plan-peek-" + loop
-	defer p.kubectl("", "delete", "pod", podName, "--wait=false") // best-effort cleanup
+	// best-effort cleanup: delete the peek pod when we're done (ignore the
+	// error — the pod is short-lived and activeDeadlineSeconds bounds it).
+	defer func() { _ = p.kubectl("", "delete", "pod", podName, "--wait=false") }()
 
 	// Wait for the pod to be Succeeded/Failed (bounded by activeDeadlineSeconds).
 	var phase string
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		out, err := p.kubectlGet("get", "pod", podName, "-o", "jsonpath={.status.phase}")
 		if err == nil {
 			phase = out
@@ -109,10 +110,8 @@ func (p *peekWorkspaceReader) kubectlCmd(args ...string) *exec.Cmd {
 	return exec.Command("kubectl", full...)
 }
 
-// kubeArg returns the --kubeconfig prefix (empty when ambient).
+// kubeArg returns the kubectl global flag args for this reader's namespace
+// (--context/--namespace/--kubeconfig; each omitted when empty).
 func (p *peekWorkspaceReader) kubeArg() []string {
-	if p.kubeconfig == "" {
-		return nil
-	}
-	return []string{"--kubeconfig", p.kubeconfig}
+	return kubeFlagArgs(p.ns)
 }

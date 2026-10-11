@@ -200,8 +200,8 @@ func TestResume_StallPause_AddsAnnotation(t *testing.T) {
 	}
 	meta, _ := annPatch["metadata"].(map[string]any)
 	ann, _ := meta["annotations"].(map[string]any)
-	if _, ok := ann[resumeAnnotation]; !ok {
-		t.Errorf("resume of a Stall pause should set the %s annotation, got %v", resumeAnnotation, annPatch)
+	if v, ok := ann[resumeAnnotation].(string); !ok || v != "true" {
+		t.Errorf("resume of a Stall pause should set the %s=true annotation, got %v", resumeAnnotation, annPatch)
 	}
 	if !strings.Contains(out, resumeAnnotation) {
 		t.Errorf("resume output should mention the annotation, got %q", out)

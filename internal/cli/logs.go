@@ -12,10 +12,7 @@ import (
 
 // logsComponents are the component selectors `cox logs <loop> --component`
 // accepts (A3: agent, proxy, verify, deliver).
-var logsComponents = []string{compAgent, "proxy", "verify", "deliver"}
-
-// compAgent is the default component (the agent container in the sandbox pod).
-const compAgent = "agent"
+var logsComponents = []string{compAgent, compProxy, compVerify, compDeliver}
 
 // newLogsCommand builds `cox logs <loop> [--component agent|proxy|verify|deliver]
 // [-f]`: stream a component's logs (A3).

@@ -84,7 +84,11 @@ KILL_DELAY="${A2_KILL_DELAY:-3}"
 WRITE_POLL="${A2_WRITE_POLL:-5}"
 # WRITE_CAP: seconds to wait for an agent change (a dirty tree or HEAD !=
 # baseCommit) before recording a named miss (the sandbox-after-write case).
-WRITE_CAP="${A2_WRITE_CAP:-300}"
+# 540s: the fixture's Implementing run is ~8 min of in-progress dirty work
+# (8 sleep-60 + 8 echo-append rounds); the cap must outlast it so the kill
+# lands MID-RUN (the tree dirty), not after the run completes and commits
+# (a clean tree, which the case would not trigger on).
+WRITE_CAP="${A2_WRITE_CAP:-540}"
 # PHASE_POLL: seconds between phase polls while waiting for the target phase.
 PHASE_POLL="${A2_PHASE_POLL:-2}"
 OUTDIR="${A2_OUT:-$ROOT/.samples/a2-restart-$(date -u +%Y%m%d%H%M%S)}"

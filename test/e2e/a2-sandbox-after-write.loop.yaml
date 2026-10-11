@@ -7,15 +7,20 @@
 # reviewer's P1-2 ask: trigger on uncommitted edits, not a commit). The
 # original gocli task commits in a single model response and advances
 # Implementing -> Verifying within seconds, so a dirty window is never
-# observable and the case records `no-agent-change-in-window`. This goal keeps
-# the agent writing uncommitted lines to notes.tmp across MANY model responses
-# (each response does at most one echo-append or one short sleep, and the runner
-# hard-caps at 25 steps/response). That produces a sustained dirty tree in
-# Implementing that the case's peek can catch and kill.
-#
-# The goal deliberately forbids committing (the case measures uncommitted-work
-# survival across the kill), and the acceptance check is a trivial grep so the
-# case can reach Verifying -> Succeeded and end terminal after the kill.
+# observable and the case records `no-agent-change-in-window`. The runner does
+# NOT loop across model responses — it drives the model for ONE phase run and,
+# on success, immediately commits the work (runner/phase.go: the Implementing
+# success path calls commitWorkspace before writing the claim). So the dirty
+# window is only observable WHILE the Implementing run is in progress. This
+# goal makes that window long (~8 minutes): it makes the model echo a 60-second
+# sleep before each of 8 appends. Each sleep is one tool call (1 round), each
+# echo-append is one tool call, and each round waits for the full 60s to elapse
+# (the runner's shell timeout is 60s), so 8 cycles of (sleep 60 + append) is
+# roughly 8 minutes of in-progress dirty work — long enough for the case's
+# 5s poll to catch the dirty tree and fire the kill. The goal deliberately
+# forbids committing (the case measures uncommitted-work survival across the
+# kill), and the acceptance check is a trivial grep so the case can reach
+# Verifying -> Succeeded and end terminal after the kill.
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
@@ -23,19 +28,23 @@ metadata:
   namespace: samples
 spec:
   goal: >-
-    You are a meticulous librarian who keeps a journal. In /workspace there is
-    a file notes.tmp. For your ENTIRE session, every single message you write
-    must do EXACTLY ONE of the following, chosen in this repeating pattern
-    (append, append, pause, append, append, pause, ...): (A) append one new
-    short line to notes.tmp with the shell command
-    echo "<a short new sentence about the coxswain crew>" >> notes.tmp, or
-    (B) a short pause: run the single shell command sleep 15. Absolute rules
-    for the whole session: you MUST NEVER commit, never run any git command at
-    all, never create, edit or delete any file other than notes.tmp, never read
-    any other file, never run go build, go test, or any command other than the
-    echo append and sleep described above. Keep doing this pattern for at
-    least 25 messages. Only after you have appended at least 25 lines total may
-    your very final message consist of exactly the single word: DONE
+    You are a slow, careful librarian who keeps a journal in /workspace/notes.tmp.
+    Your task has EXACTLY 8 steps. Perform them in order, and do NOTHING else
+    before a step is fully done: step 1, run the shell command sleep 60 and wait
+    for it to finish; step 2, run the shell command echo "line 1: the coxswain
+    crew rows at dawn" >> notes.tmp; step 3, run the shell command sleep 60 and
+    wait for it to finish; step 4, run the shell command echo "line 2: the
+    helmsman keeps the log" >> notes.tmp; step 5, run the shell command sleep 60
+    and wait for it to finish; step 6, run the shell command echo "line 3: the
+    boatswain counts the knots" >> notes.tmp; step 7, run the shell command
+    sleep 60 and wait for it to finish; step 8, run the shell command echo "line
+    4: the crew rests after the watch" >> notes.tmp. Absolute rules for the whole
+    session: you MUST NEVER run any git command, never commit, never create, edit
+    or delete any file other than notes.tmp, never read any other file, never run
+    go build or go test, and never run any command other than the exact sleep 60
+    and echo ... >> notes.tmp commands listed above. Do the 8 steps in order. When
+    you have finished step 8, your very final message must consist of exactly the
+    single word: DONE
   workspace:
     repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial

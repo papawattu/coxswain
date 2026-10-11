@@ -37,6 +37,53 @@ import (
 // The mutation check (a scratch worktree with the old partial wipe) makes
 // the second run fail with the untracked-files error.
 
+// i73SetupBareRepo creates a local bare repo with one committed file, and
+// records its HEAD SHA. The bare repo is the "remote" the script clones from
+// (a file path — no network, no credential Secret needed). Package-level so
+// the I77 execution spec reuses the same stand-in remote.
+func i73SetupBareRepo(root string) (string, string, error) {
+	bare := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	if err := os.MkdirAll(seed, 0o755); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("I73 seed\n"), 0o644); err != nil {
+		return "", "", err
+	}
+	run := func(dir, args string) error {
+		c := exec.Command("git", strings.Fields(args)...)
+		c.Dir = dir
+		c.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=I73", "GIT_AUTHOR_EMAIL=i73@localhost",
+			"GIT_COMMITTER_NAME=I73", "GIT_COMMITTER_EMAIL=i73@localhost")
+		if out, e := c.CombinedOutput(); e != nil {
+			return fmt.Errorf("git %s: %w: %s", args, e, out)
+		}
+		return nil
+	}
+	if e := run(seed, "init"); e != nil {
+		return "", "", e
+	}
+	if e := run(seed, "add README.md"); e != nil {
+		return "", "", e
+	}
+	if e := run(seed, "commit -m seed"); e != nil {
+		return "", "", e
+	}
+	// Clone the seed repo into a bare repo at root (clone runs in root, not
+	// seed, so the bare repo is root/origin.git, not seed/origin.git).
+	if e := run(root, "clone --bare "+seed+" "+bare); e != nil {
+		return "", "", e
+	}
+	// The HEAD SHA of the bare repo.
+	c := exec.Command("git", "-C", bare, "rev-parse", "HEAD")
+	headOut, err := c.CombinedOutput()
+	if err != nil {
+		return "", "", err
+	}
+	return bare, strings.TrimSpace(string(headOut)), nil
+}
+
 var _ = Describe("I73: init-workspace survives an interrupted first run (execution test)", func() {
 	// i73BareRepo is a local bare repo the script clones from. Created once
 	// per spec run (a file-backed git remote — no network).
@@ -84,52 +131,6 @@ var _ = Describe("I73: init-workspace survives an interrupted first run (executi
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		return string(out), err
-	}
-
-	// i73SetupBareRepo creates a local bare repo with one committed file, and
-	// records its HEAD SHA. The bare repo is the "remote" the script clones
-	// from (a file path — no network, no credential Secret needed).
-	i73SetupBareRepo := func(root string) (string, string, error) {
-		bare := filepath.Join(root, "origin.git")
-		seed := filepath.Join(root, "seed")
-		if err := os.MkdirAll(seed, 0o755); err != nil {
-			return "", "", err
-		}
-		if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("I73 seed\n"), 0o644); err != nil {
-			return "", "", err
-		}
-		run := func(dir, args string) error {
-			c := exec.Command("git", strings.Fields(args)...)
-			c.Dir = dir
-			c.Env = append(os.Environ(),
-				"GIT_AUTHOR_NAME=I73", "GIT_AUTHOR_EMAIL=i73@localhost",
-				"GIT_COMMITTER_NAME=I73", "GIT_COMMITTER_EMAIL=i73@localhost")
-			if out, e := c.CombinedOutput(); e != nil {
-				return fmt.Errorf("git %s: %w: %s", args, e, out)
-			}
-			return nil
-		}
-		if e := run(seed, "init"); e != nil {
-			return "", "", e
-		}
-		if e := run(seed, "add README.md"); e != nil {
-			return "", "", e
-		}
-		if e := run(seed, "commit -m seed"); e != nil {
-			return "", "", e
-		}
-		// Clone the seed repo into a bare repo at root (clone runs in root, not
-		// seed, so the bare repo is root/origin.git, not seed/origin.git).
-		if e := run(root, "clone --bare "+seed+" "+bare); e != nil {
-			return "", "", e
-		}
-		// The HEAD SHA of the bare repo.
-		c := exec.Command("git", "-C", bare, "rev-parse", "HEAD")
-		headOut, err := c.CombinedOutput()
-		if err != nil {
-			return "", "", err
-		}
-		return bare, strings.TrimSpace(string(headOut)), nil
 	}
 
 	// i73SimulateInterrupt clears the success marker + the .git dir, leaving

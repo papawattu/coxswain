@@ -4566,26 +4566,62 @@ func (r *LoopReconciler) buildWorkspaceInitContainer(loop *coxv1alpha1.Loop, git
 	// refuses the repo with 'detected dubious ownership' (no config-file write
 	// needed — the per-command -c is honoured on every invocation).
 	safeDir := "-c safe.directory=/workspace"
-	// S4 review P1 (R18): this script runs ONLY the first clone (baseCommit
-	// empty), on a FRESH per-Loop PVC — the idempotent re-run branch is gone
-	// because later phases build the pod with no init-workspace and no
-	// credential volume. The clone fails loud (set -eu) so the operator's
-	// read-back rejects a non-SHA termination message.
+	// S4 review P1 (R18): this script runs the first clone (baseCommit empty)
+	// on a FRESH per-Loop PVC. Later phases build the pod with no
+	// init-workspace and no credential volume, but the pod still carrying
+	// init-workspace CAN restart before the operator rebuilds it without —
+	// and by then the agent may have committed work to the workspace. Two
+	// restart sub-cases:
+	//   - I77 (R24 option (a)): a COMPLETED clone leaves the success marker
+	//     .coxswain/base-commit holding a 40-hex SHA that exists in the
+	//     repo. The script SKIPS the wipe and the clone (no agent work is
+	//     deleted), writes the marker SHA to the termination log, and exits
+	//     0.
+	//   - I73: an INTERRUPTED first run leaves checked-out files but NO
+	//     success marker (the marker is written only after checkout), so
+	//     the script must still wipe ALL contents — a partial wipe leaves
+	//     files behind, so a restart's checkout fails with 'untracked
+	//     working tree files would be overwritten by checkout' and the Loop
+	//     wedges (seen on the live I54 run).
+	// The clone fails loud (set -eu) so the operator's read-back rejects a
+	// non-SHA termination message.
 	script := `#!/bin/sh
 set -eu
 export GIT_TERMINAL_PROMPT=0
 DEST=/workspace
 REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
-# The volume is a MOUNT POINT (cannot be rm -rf'd). A previous run may have
-# left the workspace in any partial state (e.g. an interrupted first run that
-# already checked out files but left no success marker, or a stale .git from
-# an earlier clone). Wipe ALL contents of the mount (including dotfiles such
-# as .git and .coxswain) so the clone starts clean — but never the mount point
-# itself. A partial wipe (only .git + .coxswain) leaves checked-out files
-# behind, so a restart's checkout fails with 'untracked working tree files
-# would be overwritten by checkout' and the Loop wedges (I73: seen on the live
-# I54 run). mindepth 1 keeps the mount point itself.
+# I77: a COMPLETED clone (a prior successful run of this script) left the
+# success marker .coxswain/base-commit. It is written only AFTER checkout
+# (below), so its presence with a 40-hex SHA that exists in the repo means
+# the workspace holds a completed clone — and possibly the agent's own
+# commits and uncommitted work built on it. A pod restart that re-runs this
+# container (the operator has not rebuilt the pod without init-workspace
+# yet) must NOT wipe or re-clone: skip, write the marker SHA to the
+# termination log (the operator's read-back is still a valid SHA) and exit
+# 0. Without this guard the wipe below deletes the agent's work (I77).
+if [ -f "${DEST}/.coxswain/base-commit" ]; then
+  MARKER=$(head -n1 "${DEST}/.coxswain/base-commit")
+  # Trim whitespace (shell parameter expansion, not tr: the S3 spec forbids
+  # tr on this script; a truncated or corrupted marker must fall through to
+  # the wipe, not be accepted).
+  MARKER="${MARKER%
+}"
+  MARKER="${MARKER#[ 	]*}"
+  if [ -n "${MARKER}" ] && [ "${#MARKER}" -eq 40 ]; then
+    if git ` + safeDir + ` -C "${DEST}" cat-file -e "${MARKER}^{commit}" 2>/dev/null; then
+      echo "${MARKER}" > /dev/termination-log
+      echo "workspace already initialised at ${MARKER}"
+      exit 0
+    fi
+  fi
+fi
+# No valid success marker: either a first run or an interrupted first run
+# (I73: checked-out files, no .coxswain/base-commit, or a marker whose SHA
+# the repo does not accept — a truncated write). The volume is a MOUNT POINT
+# (cannot be rm -rf'd). Wipe ALL contents of the mount (including dotfiles
+# such as .git and .coxswain) so the clone starts clean — but never the mount
+# point itself. mindepth 1 keeps the mount point itself.
 if [ -d "${DEST}" ]; then find "${DEST}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true; fi
 mkdir -p "${DEST}"
 

@@ -39,7 +39,7 @@ four operator bugs.
 
 ### I72. Every GitHub delivery fails on its first attempt
 
-- [ ] Open (PR #96: reviewer OK + notes; the live GitHub re-run is still owed, after host memory reaped the first attempt)
+- [x] Open (PR #96: reviewer OK + notes; the live GitHub re-run is still owed, after host memory reaped the first attempt) — 5685e71
 
 **Where:** `internal/controller/loop_deliver_job.go` `ensureDeliverJob`.
 
@@ -63,7 +63,7 @@ gate the sandbox uses (`loop_controller.go:1416`).
 
 ### I73. init-workspace wedges the Loop if its first run is interrupted
 
-- [ ] Open (PR #97: reviewer OK)
+- [x] Open (PR #97: reviewer OK) — 97fa543
 
 **Where:** `internal/controller/loop_controller.go`, the init-workspace
 script.
@@ -149,7 +149,7 @@ delivery should drop it (or the runner should write it under `.coxswain/`).
 
 ### I77. init-workspace can wipe agent work on a pod restart
 
-- [ ] Open (design)
+- [x] Open (design) — 00c0a09
 
 **Where:** the sandbox pod build (`loop_controller.go`, init-workspace
 present until the base commit is recorded).

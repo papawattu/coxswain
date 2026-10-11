@@ -115,33 +115,88 @@ done
 [ "$(phase)" != "Paused" ] || fail "Loop still Paused after cox resume"
 log "resumed (phase $(phase))"
 
-# --- logs (kept, per the acceptance criterion) ------------------------------
-# Capture the component logs WHILE the Loop is still running (the sandbox pod
-# is cleaned up once the Loop is terminal, so the logs must be read mid-run).
-cox logs "$LOOP_NAME" --component agent --tail 30  | tee "$EVIDENCE/logs-agent.out"  || true
-cox logs "$LOOP_NAME" --component proxy --tail 30  | tee "$EVIDENCE/logs-proxy.out" || true
+# --- component logs + plan (kept, per the acceptance criterion) --------------
+# Capture each component's logs WHILE its pod is running (the pods are cleaned
+# up once the Loop is terminal, so an end-of-run capture would be empty). The
+# runner writes .coxswain/PLAN.md at the start of the Implementing phase, so the
+# plan is captured in the phase-poll loop (once Implementing), not right after
+# resume (still Planning). The peek pod is a read-only cat (UID 65532); the PVC
+# is not modified. No `|| true`: a missing/non-empty capture fails the run.
+capture_logs() {
+  # $1 = component, $2 = out file. The pod is assumed to exist now (the caller
+  # gates on the phase); a short poll covers a brief not-ready window.
+  local component="$1" out="$2" i
+  for i in $(seq 1 45); do
+    if cox logs "$LOOP_NAME" --component "$component" --tail 40 2>/dev/null | tee "$out" | grep -q .; then
+      return 0
+    fi
+    sleep 4
+  done
+  test -s "$out"
+}
 
-# (the verify / deliver component logs are captured above; the verify job pod
-# is also transient, so a mid-run agent+proxy capture is what the acceptance
-# keeps.)
+# The agent and proxy sandbox pods exist right now (post-resume, the sandbox
+# pod exists from Planning through the end) — capture them immediately.
+capture_logs agent "$EVIDENCE/logs-agent.out"
+capture_logs proxy "$EVIDENCE/logs-proxy.out"
 
-# --- let it finish ----------------------------------------------------------
-for i in $(seq 1 240); do
+# Now drive the Loop to completion, capturing plan (Implementing phase — the
+# runner writes PLAN.md there), verify (Verifying phase) and deliver (Succeeded
+# phase, the deliver Job runs before Delivered) as each phase is entered. A
+# single poll loop watches the phase; each is captured once, the first time its
+# phase is seen.
+plan_done=false
+verify_done=false
+deliver_done=false
+for i in $(seq 1 300); do
   ph="$(phase)"
-  case "$ph" in Succeeded|Failed|Delivered) break ;; esac
-  sleep 5
+  case "$ph" in
+    Implementing)
+      if [ "$plan_done" = false ]; then
+        log "in Implementing; capturing plan"
+        cox plan "$LOOP_NAME" | tee "$EVIDENCE/plan.out"
+        plan_done=true
+      fi
+      ;;
+    Verifying)
+      if [ "$verify_done" = false ]; then
+        log "in Verifying; capturing verify logs"
+        capture_logs verify "$EVIDENCE/logs-verify.out"
+        verify_done=true
+      fi
+      ;;
+    Succeeded)
+      if [ "$deliver_done" = false ]; then
+        log "in Succeeded (deliver Job running); capturing deliver logs"
+        capture_logs deliver "$EVIDENCE/logs-deliver.out"
+        deliver_done=true
+      fi
+      ;;
+    Delivered|Failed)
+      break
+      ;;
+  esac
+  sleep 4
 done
 ph="$(phase)"
 case "$ph" in Succeeded|Delivered) ;; *) fail "Loop did not reach a terminal phase (ph='$ph')" ;; esac
 log "Loop reached $ph"
 
-# --- describe (final) -------------------------------------------------------
+# --- describe (final) ---------------------------------------------------------
 cox describe "$LOOP_NAME" | tee "$EVIDENCE/describe-final.out"
 cox history "$LOOP_NAME" | tee "$EVIDENCE/history.out"
 
-# (the verify / deliver component logs are captured above; the verify job pod
-# is also transient, so a mid-run agent+proxy capture is what the acceptance
-# keeps.)
+# --- assert the kept log/plan evidence is non-empty (no `|| true`) ------------
+# The deliver capture only runs if the Loop had a delivery (task 1 does); if the
+# Loop reached Succeeded with no deliver Job, deliver_done stays false and the
+# deliver file is absent. Assert the files that the run actually produced.
+for f in logs-agent.out logs-proxy.out logs-verify.out plan.out; do
+  test -s "$EVIDENCE/$f" || fail "evidence $f is empty"
+done
+if [ "$deliver_done" = true ]; then
+  test -s "$EVIDENCE/logs-deliver.out" || fail "evidence logs-deliver.out is empty"
+fi
+log "component log + plan evidence captured (non-empty)"
 
 # --- redeliver (I52: re-trigger the delivery) -------------------------------
 # Only meaningful when there is a delivery (Succeeded/Delivered with a branch).

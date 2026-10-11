@@ -165,7 +165,17 @@ func (p *peekWorkspaceReader) kubectl(ctx context.Context, stdin string, args ..
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
-	cmd.Stdout = os.Stdout
+	// The create/delete of the peek pod is housekeeping; keep the user's stdout
+	// clean (only the plan itself, read via kubectl logs/exec, reaches it). Errors
+	// still go to stderr.
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+	defer func() { _ = devNull.Close() }()
+	cmd.Stdout = devNull
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }

@@ -41,6 +41,9 @@ package controller
 import (
 	"strings"
 	"testing"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -48,6 +51,12 @@ import (
 // a4TamperDirty is the tamper exit code for the tampered case (non-zero = a
 // protected path changed).
 var a4TamperDirty = int32(1)
+
+// a4StallTime is the kubelet-recorded finish time for the fixture's
+// stallHistory entry (a fixed value so the body is deterministic — the
+// operator records the verify Job pod's finish time, never the runner's
+// clock).
+var a4StallTime = metav1.NewTime(time.Date(2026, 10, 11, 8, 30, 0, 0, time.UTC))
 
 // TestDeliverDescriptionFactsFromSpecStatusOnly (A4) asserts the facts body is
 // built from the Loop's spec/status fields only (never a runner claim). The
@@ -73,6 +82,13 @@ func TestDeliverDescriptionFactsFromSpecStatusOnly(t *testing.T) {
 		"- **Verified commit:** `c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`",
 		"- **Tamper check:** clean (no protected path changed)",
 		"- **Last verify:** the acceptance checks passed",
+		// The per-iteration verify record (A4 "the verify results per
+		// iteration"): the stallHistory failure (iteration 1, the failing
+		// check, the kubelet-recorded finish time) and the final pass
+		// (iteration 2, the pinned verifiedCommit).
+		"## Verify results per iteration",
+		"- iteration 1: FAILED (TestRound) at 2026-10-11 08:30:00Z",
+		"- iteration 2: passed (verified commit `c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`)",
 		"- **Budget (tokens):** 1500 of 1000000 cap",
 		"- **Budget (requests):** 7",
 		"- **Budget (cost):** $0.05",
@@ -174,6 +190,94 @@ func loopTFrom(l *coxv1alpha1.Loop) *loopT {
 
 // toLoop is a type-identity alias (loopT is coxv1alpha1.Loop).
 func toLoop(l *loopT) *coxv1alpha1.Loop { return l }
+
+// TestDeliverDescriptionVerifyHistoryPerIteration (A4, P2) asserts the facts
+// body carries the per-iteration verify record (PLAN-ALPHA A4: "the verify
+// results per iteration"): the stallHistory verify-failure entries (one per
+// failing iteration, oldest first, with the failing check and the kubelet-
+// recorded finish time) PLUS the final pass (the iteration the delivery names,
+// with the pinned verifiedCommit). The record is operator-side (status.
+// stallHistory is the operator's record of the verify Job pods' exit codes,
+// and status.currentVerify is the operator's pin) — never a runner claim. The
+// test:
+//   - asserts the base body carries the fixture's per-iteration record
+//     (the two stallHistory failures + the final pass);
+//   - mutates the stallHistory (add a third failing iteration, change a
+//     failure's check, change the finish time) and re-renders, asserting the
+//     body reflects each change (the record is a pure function of
+//     status.stallHistory + status.currentVerify);
+//   - asserts a first-iteration success (no stallHistory) prints a single
+//     "iteration 1 passed" line (no failure lines).
+func TestDeliverDescriptionVerifyHistoryPerIteration(t *testing.T) {
+	base := a4FactsLoop()
+	baseBody := renderDeliverDescriptionBody(deliverDescriptionForLoop(base))
+	for _, want := range []string{
+		"## Verify results per iteration",
+		"- iteration 1: FAILED (TestRound) at 2026-10-11 08:30:00Z",
+		"- iteration 2: passed (verified commit `c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`)",
+	} {
+		if !strings.Contains(baseBody, want) {
+			t.Errorf("the facts body does not carry the per-iteration record %q.\n\nbody:\n%s", want, baseBody)
+		}
+	}
+
+	render := func(l *coxv1alpha1.Loop) string {
+		return renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
+	}
+
+	// Add a third failing iteration (a new stallHistory entry): the body must
+	// reflect it (the record grows with the ring).
+	mut := base.DeepCopy()
+	mut.Status.StallHistory = append(mut.Status.StallHistory, coxv1alpha1.StallEntry{
+		Iteration:            2,
+		JobName:              "a4task1-verify-2",
+		Hash:                 "11112222333344445555666677778888",
+		NormalisationVersion: "v1",
+		Check:                "TestMain",
+		At:                   a4StallTime,
+	})
+	if got := render(mut); !strings.Contains(got, "- iteration 2: FAILED (TestMain) at 2026-10-11 08:30:00Z") {
+		t.Errorf("the body did not reflect a new stallHistory failure:\n%s", got)
+	}
+
+	// Change a failure's check: the body must reflect it.
+	mut2 := base.DeepCopy()
+	mut2.Status.StallHistory[0].Check = "TestOther"
+	if got := render(mut2); !strings.Contains(got, "- iteration 1: FAILED (TestOther) at 2026-10-11 08:30:00Z") {
+		t.Errorf("the body did not reflect a changed failure check:\n%s", got)
+	}
+
+	// Change the finish time: the body must reflect it (the time is the
+	// operator's kubelet-recorded fact, not a runner claim).
+	mut3 := base.DeepCopy()
+	mut3.Status.StallHistory[0].At = metav1.NewTime(time.Date(2026, 10, 11, 9, 45, 30, 0, time.UTC))
+	if got := render(mut3); !strings.Contains(got, "- iteration 1: FAILED (TestRound) at 2026-10-11 09:45:30Z") {
+		t.Errorf("the body did not reflect a changed stall finish time:\n%s", got)
+	}
+
+	// A first-iteration success (no stallHistory): the body carries a single
+	// "iteration 1 passed" line (no failure lines, the pass is the delivery's
+	// own pinned commit).
+	mut4 := base.DeepCopy()
+	mut4.Status.StallHistory = nil
+	mut4.Status.Iteration = 1
+	got := render(mut4)
+	if !strings.Contains(got, "- iteration 1: passed (verified commit `c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`)") {
+		t.Errorf("a first-iteration success must print the single pass line:\n%s", got)
+	}
+	if strings.Contains(got, "FAILED") {
+		t.Errorf("a first-iteration success must not carry a failure line:\n%s", got)
+	}
+
+	// The record is operator-side: the body does NOT carry the runner's claim
+	// (status.progress.lastResultStatus is a separate line — "Last verify" —
+	// and the per-iteration record is built from stallHistory +
+	// currentVerify, not the claim). A mutation that sourced a per-iteration
+	// fact from the claim would make the body carry the claim's text.
+	if strings.Contains(got, "observedPhase") || strings.Contains(got, "headCommit") {
+		t.Errorf("the per-iteration record must not carry the runner's claim text:\n%s", got)
+	}
+}
 
 // TestDeliverDescriptionDoesNotReadTheClaim (A4) is the mutation test that
 // "the facts section is built from status fields only (a mutation that

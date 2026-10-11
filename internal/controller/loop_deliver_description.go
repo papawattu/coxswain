@@ -62,6 +62,8 @@ import (
 	"strconv"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
@@ -131,9 +133,42 @@ type deliverDescription struct {
 	// decision the operator makes (a tampered verify never counts as
 	// passing), and the body names it.
 	Tampered bool
+	// VerifyHistory is the per-iteration verify record (PLAN-ALPHA A4: "the
+	// verify results per iteration"): the operator's status.stallHistory
+	// verify-failure entries (one per failing iteration, in the ring's order
+	// — oldest first) PLUS the final pass (the pinned verifiedCommit the
+	// delivery names). Empty when the Loop succeeded on its first iteration
+	// with no recorded stall (the body prints a single "iteration 1 passed"
+	// line).
+	VerifyHistory []verifyHistoryEntry
 	// Budget carries the used-vs-limit facts (nil when status.budget is
 	// nil: the body prints "budget not yet read").
 	Budget *deliverBudgetFacts
+}
+
+// verifyHistoryEntry is one line of the facts body's per-iteration verify
+// record. Either a FAILING iteration (from a status.stallHistory entry: the
+// iteration number, the failing check, and when the verify Job finished —
+// all operator-recorded, never a runner claim) or the FINAL PASS (the
+// iteration the delivery names, with the pinned verifiedCommit).
+type verifyHistoryEntry struct {
+	// Iteration is the 1-based iteration number (the stallHistory entry's
+	// iteration for a failure; the operator's status.iteration for the
+	// final pass).
+	Iteration int
+	// Check is the failing check's name (empty for the final pass).
+	Check string
+	// Pass is true for the final-pass entry (the verify that pinned
+	// status.currentVerify.verifiedCommit) and false for a stallHistory
+	// failure.
+	Pass bool
+	// VerifiedCommit is the pinned commit (the final pass only; empty for a
+	// stallHistory failure — a failing verify never pins a commit).
+	VerifiedCommit string
+	// At is the verify Job pod's finish time (the stallHistory entry's
+	// kubelet-recorded time for a failure; zero for the final pass, which
+	// the body does not print a time for).
+	At metav1.Time
 }
 
 // deliverBudgetFacts is the operator's used-vs-limit budget fact (A4: budget
@@ -192,6 +227,31 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 		}
 	}
 	tampered := tamper > 0
+	// The per-iteration verify record (A4 "the verify results per
+	// iteration"): the operator's status.stallHistory verify-failure
+	// entries (in the ring's order, oldest first) plus the final pass (the
+	// iteration the delivery names, with the pinned verifiedCommit). A
+	// stallHistory failure and the final pass are distinct: a failing
+	// verify never pins a commit, and the final pass is the verify that did
+	// pin one (status.currentVerify). Both are operator-side (the ring is
+	// the operator's record of the verify Job pods' exit codes, and
+	// status.currentVerify is the operator's pin) — never a runner claim.
+	var verifyHistory []verifyHistoryEntry
+	for i := range loop.Status.StallHistory {
+		verifyHistory = append(verifyHistory, verifyHistoryEntry{
+			Iteration: loop.Status.StallHistory[i].Iteration,
+			Check:     loop.Status.StallHistory[i].Check,
+			Pass:      false,
+			At:        loop.Status.StallHistory[i].At,
+		})
+	}
+	if loop.Status.CurrentVerify != nil && loop.Status.CurrentVerify.VerifiedCommit != "" {
+		verifyHistory = append(verifyHistory, verifyHistoryEntry{
+			Iteration:      loop.Status.Iteration,
+			Pass:           true,
+			VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit,
+		})
+	}
 	return deliverDescription{
 		Namespace:         loop.Namespace,
 		Name:              loop.Name,
@@ -201,6 +261,7 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 		VerifiedCommit:    loop.Status.CurrentVerify.VerifiedCommit,
 		TamperClean:       tamper,
 		LastVerifyOutcome: last,
+		VerifyHistory:     verifyHistory,
 		Budget:            budget,
 		Tampered:          tampered,
 	}
@@ -292,6 +353,7 @@ func renderDeliverDescriptionBody(d deliverDescription) string {
 	default:
 		fmt.Fprintf(&b, "- **Last verify:** %s\n", oneLine(d.LastVerifyOutcome))
 	}
+	b.WriteString(verifyHistoryLines(d.VerifyHistory))
 	b.WriteString(budgetLines(d.Budget))
 	if d.Budget != nil && d.Budget.Exceeded {
 		fmt.Fprintf(&b, "- **Budget gate:** the operator gated delivery (budget %s)\n", d.Budget.ExceededReason)
@@ -337,6 +399,50 @@ func budgetLines(bf *deliverBudgetFacts) string {
 	s.WriteString("\n")
 	if bf.Exceeded {
 		fmt.Fprintf(&s, "- **Budget exceeded:** yes (%s)\n", bf.ExceededReason)
+	}
+	return s.String()
+}
+
+// verifyHistoryLines renders the per-iteration verify record (A4 "the verify
+// results per iteration"): one line per failing iteration (from the
+// operator's status.stallHistory ring, oldest first) plus the final pass
+// (the iteration the delivery names, with the pinned verifiedCommit). It is a
+// pure function of the entries (no clock, no I/O), so a spec can call it with
+// a fixed fixture and assert the exact section.
+//
+// A failing line names the iteration, the failing check, and when the verify
+// Job finished (the stallHistory entry's kubelet-recorded time — operator-
+// side, never a runner claim). The final pass names the iteration and the
+// pinned verifiedCommit. An empty history (a first-iteration success with no
+// recorded stall) prints a single "iteration N passed" line (the pass is the
+// delivery's own pinned commit, so it is always present for a delivered
+// Loop).
+func verifyHistoryLines(vh []verifyHistoryEntry) string {
+	if len(vh) == 0 {
+		// No stallHistory and no pinned commit (a fixture that never verified)
+		// — the section is empty (the body has no per-iteration record to show).
+		return ""
+	}
+	var s strings.Builder
+	s.WriteString("\n## Verify results per iteration\n")
+	for _, e := range vh {
+		if e.Pass {
+			if e.VerifiedCommit == "" {
+				fmt.Fprintf(&s, "- iteration %d: passed\n", e.Iteration)
+			} else {
+				fmt.Fprintf(&s, "- iteration %d: passed (verified commit `%s`)\n", e.Iteration, e.VerifiedCommit)
+			}
+		} else {
+			check := oneLine(e.Check)
+			if check == "" {
+				check = "(check unnamed)"
+			}
+			if e.At.IsZero() {
+				fmt.Fprintf(&s, "- iteration %d: FAILED (%s)\n", e.Iteration, check)
+			} else {
+				fmt.Fprintf(&s, "- iteration %d: FAILED (%s) at %s\n", e.Iteration, check, e.At.UTC().Format("2006-01-02 15:04:05Z"))
+			}
+		}
 	}
 	return s.String()
 }

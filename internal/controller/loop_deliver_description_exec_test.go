@@ -199,6 +199,20 @@ func a4FactsLoop() *coxv1alpha1.Loop {
 		},
 		Status: coxv1alpha1.LoopStatus{
 			Iteration: 2,
+			// The per-iteration verify record (A4): iteration 1 FAILED
+			// (the failing check TestRound, the verify Job pod's finish time
+			// a4StallTime — operator-recorded), iteration 2 passed (the pinned
+			// verifiedCommit below). The facts body must carry both.
+			StallHistory: []coxv1alpha1.StallEntry{
+				{
+					Iteration:            1,
+					JobName:              "a4task1-verify-1",
+					Hash:                 "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+					NormalisationVersion: "v1",
+					Check:                "TestRound",
+					At:                   a4StallTime,
+				},
+			},
 			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{
 				VerifiedCommit: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
 			},

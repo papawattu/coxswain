@@ -623,7 +623,13 @@ ws_head() {
 # plus any change lines (M/??/A/D/R/C prefixes); a clean detached tree shows
 # only the '## HEAD (no branch)' line.
 ws_dirty() {
-	grep -E '^[A-Z?] ' "$1" 2>/dev/null | head -1 >/dev/null
+	# git status --short (the peek uses --short --branch) prints the branch
+	# line first ("## HEAD (no branch)"), then one line per dirty path with a
+	# two-char status prefix: "?? " (untracked), " M " / " M" / " D " /
+	# "A  " (worktree/index change). A tree is dirty iff any of those path
+	# lines is present. Match the status prefixes explicitly so the branch
+	# line ("## ") and the log/rev-parse lines are never mistaken for work.
+	grep -E '^\?\? |^ M |^ M$|^ D |^ D$|^A  |^A? ' "$1" 2>/dev/null | head -1 >/dev/null
 }
 
 # capture_logs <case> <loop>: keep ALL pod logs (operator, verify, deliver,

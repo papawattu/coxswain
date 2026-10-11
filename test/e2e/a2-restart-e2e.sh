@@ -1064,16 +1064,27 @@ run_case() {
 	sleep 5
 }
 
-# run_after_write <case> <loop>: the I77 e2e (R24). Apply the Loop, poll the
-# RO peek until the workspace has an AGENT CHANGE (a dirty tree, or HEAD !=
-# baseCommit) while the phase is Implementing, then kill the sandbox pod.
-# The peek BEFORE the kill (the change we waited for) and the peek AFTER
-# (post-run) are both recorded; the work-survived question is answered by
-# comparing them (the after-peek's HEAD must build on the before-peek's HEAD,
-# and the dirty state must not have been wiped). If the phase leaves
-# Implementing before any agent change is observed, the case ends with the
-# named reason 'no-agent-change-in-window' (the kill is not fired, and the
-# run is watched to its outcome like the other cases).
+# run_after_write <case> <loop>: the A2 e2e case (R24 review). Apply the
+# Loop, poll the RO peek until the workspace has an AGENT CHANGE, then —
+# only if the phase is STILL Implementing at that moment (re-read immediately
+# before the kill) — kill the sandbox pod. The peek BEFORE the change and the
+# peek AFTER the run are both recorded; the work-survived question is
+# answered by comparing them (the after-peek's HEAD must build on the
+# before-peek's HEAD, and a dirty tree must not have been wiped).
+# Trigger priority: a dirty tree (uncommitted edits, the agent mid-work) in
+# preference to a commit; a commit observed only while the phase is still
+# Implementing is accepted, otherwise polling continues (a commit usually
+# means Implementing is ending, and firing the kill after the phase advanced
+# measures the wrong window — the pre-fix first run's failure mode).
+# Named reasons for NOT killing: 'no-agent-change-in-window' (no change
+# observed before the window closed) and 'phase-left-implementing' (a change
+# was observed but the phase had advanced by the kill moment).
+# SCOPE (R24 review): this case measures RESUME-AFTER-KILL (A2), not the I77
+# init-workspace re-run. On main an Implementing pod carries no
+# init-workspace container (baseCommit is pinned by then; the operator only
+# re-inits while it is empty), so killing the sandbox here exercises the
+# agent's resume on the existing PVC, not the init script. The I77 proof is
+# the execution test (loop_i77_initworkspace_resume_test.go).
 run_after_write() {
 	local case="$1"
 	local name="$2"
@@ -1090,24 +1101,42 @@ run_after_write() {
 	# it to distinguish 'HEAD != baseCommit' from 'HEAD == baseCommit'.
 	local base_commit="" wh="" dirty_change="no" saw_dirty="no" saw_commit="no"
 	local deadline=$(( $(date +%s) + WRITE_CAP ))
-	local saw_implementing="no"
+	# Trigger priority (R24 review): saw_dirty (uncommitted edits, the agent
+	# mid-work) in preference to a commit. A commit usually means Implementing
+	# is ending, and by the time it is observed the phase may already have
+	# advanced (the first run caught the commit 12s after the
+	# Implementing->Verifying event — too late for the kill).
+	local trigger=""
 	while [ "$(date +%s)" -lt "$deadline" ]; do
 		local ph
 		ph=$(phase_of "$name")
-		[ "$ph" = "Implementing" ] && saw_implementing="yes"
 		[ -z "$base_commit" ] && base_commit=$(baseCommit_of "$name")
 		peek_workspace "$name" "$dir/ws-poll.txt" ""
 		wh=$(ws_head "$dir/ws-poll.txt")
 		if [ -n "$wh" ]; then
-			ws_dirty "$dir/ws-poll.txt" && saw_dirty="yes"
+			if ws_dirty "$dir/ws-poll.txt"; then
+				saw_dirty="yes"
+				trigger="dirty"
+				mv -f "$dir/ws-poll.txt" "$dir/ws-head-before.txt"
+				dirty_change="yes"
+				break
+			fi
 			if [ -n "$base_commit" ] && [ "$wh" != "$base_commit" ]; then
 				saw_commit="yes"
+				# A commit change is a WEAKER trigger: only accept it if the
+				# phase is STILL Implementing at this peek (a commit observed
+				# after the phase advanced would fire the kill in the wrong
+				# phase — the pre-fix first run's failure mode).
+				if [ "$ph" = "Implementing" ]; then
+					trigger="commit"
+					mv -f "$dir/ws-poll.txt" "$dir/ws-head-before.txt"
+					dirty_change="yes"
+					break
+				fi
+				# Otherwise keep polling: an uncommitted edit may still appear
+				# while Implementing (rare after a commit, but the dirty tree is
+				# the case we want to measure).
 			fi
-		fi
-		if { [ "$saw_dirty" = "yes" ] || [ "$saw_commit" = "yes" ]; } && [ "$saw_implementing" = "yes" ]; then
-			mv -f "$dir/ws-poll.txt" "$dir/ws-head-before.txt"
-			dirty_change="yes"
-			break
 		fi
 		# A terminal phase before any change: the run finished without
 		# observable agent work in the window (or the phase machine moved on).
@@ -1117,23 +1146,48 @@ run_after_write() {
 			;;
 		esac
 		sleep "$WRITE_POLL"
-	done
+
+done
 
 	local base_after_change pvc_before
 	pvc_before=$(pvc_uid "$name")
 	base_after_change=$(baseCommit_of "$name")
 
-	local ws_head_before=""
+	local ws_head_before="" killed="no" kill_reason=""
 	if [ "$dirty_change" = "yes" ]; then
 		ws_head_before=$(ws_head "$dir/ws-head-before.txt")
-		log "$case" "agent change observed in Implementing (dirty=$saw_dirty commit=$saw_commit) ws-head-before: ${ws_head_before:0:8} baseCommit: ${base_after_change:0:8}; settling ${KILL_DELAY}s before the kill"
+		log "$case" "agent change observed (trigger=$trigger dirty=$saw_dirty commit=$saw_commit) ws-head-before: ${ws_head_before:0:8} baseCommit: ${base_after_change:0:8}"
 		sleep "$KILL_DELAY"
-		kill_sandbox "$case" "$name"
+		# Re-read the phase IMMEDIATELY before the kill (R24 review): a
+		# commit-triggered change can be observed after the phase has already
+		# advanced (the first run killed in Verifying, 12s after the
+		# Implementing->Verifying event). The kill must fire while the phase
+		# is Implementing — that is the window the e2e measures.
+		local ph_now
+		ph_now=$(phase_of "$name")
+		if [ "$ph_now" = "Implementing" ]; then
+			kill_sandbox "$case" "$name"
+			killed="yes"
+		else
+			log "$case" "phase advanced to $ph_now between the change peek and the kill; NOT killing (named reason: phase-left-implementing)"
+			kill_reason="phase-left-implementing"
+			{
+				echo "sandbox-kill: case=$case"
+				echo "kill-utc: $(utc)"
+				echo "loop: $name"
+				echo "phase-iteration-baseCommit-at-moment: $(loop_meta "$name")"
+				echo "killed-pod: <none>"
+				echo "killed-pod-uid: <none>"
+				echo "reason: phase-left-implementing"
+				echo "workspace-pvc-uid: $pvc_before"
+			} >"$dir/kill.txt" 2>&1
+			kill_reason="phase-left-implementing"
+		fi
 	else
-		# Named miss: no agent change while Implementing in the window. The
-		# kill is NOT fired; record why, and the before/after peeks are the
-		# same (read them both, before and after the outcome, for the table).
-		log "$case" "NO agent change observed in Implementing within ${WRITE_CAP}s (dirty=$saw_dirty commit=$saw_commit, saw-implementing=$saw_implementing); kill not fired (named reason: no-agent-change-in-window)"
+		# Named miss: no agent change observed in the window. The kill is NOT
+		# fired; record why, and the before/after peeks are the same (read
+		# them both, before and after the outcome, for the table).
+		log "$case" "NO agent change observed within ${WRITE_CAP}s (dirty=$saw_dirty commit=$saw_commit); kill not fired (named reason: no-agent-change-in-window)"
 		peek_workspace "$name" "$dir/ws-head-before.txt" ""
 		ws_head_before=$(ws_head "$dir/ws-head-before.txt")
 		{
@@ -1146,8 +1200,8 @@ run_after_write() {
 			echo "reason: no-agent-change-in-window"
 			echo "workspace-pvc-uid: $pvc_before"
 		} >"$dir/kill.txt" 2>&1
-		# Keep a record of the last poll's evidence (it is the before peek's
-		# content source if the final before-peek produced nothing).
+		kill_reason="no-agent-change-in-window"
+		# Keep a record of the last poll's evidence.
 		cp "$dir/ws-poll.txt" "$dir/ws-poll-last.txt" 2>/dev/null || true
 	fi
 
@@ -1174,7 +1228,7 @@ run_after_write() {
 	# after tree is not a wiped re-clone (HEAD did not fall back to
 	# baseCommit when the before HEAD was past it).
 	local survived="n/a"
-	if [ "$dirty_change" = "yes" ]; then
+	if [ "$killed" = "yes" ]; then
 		if [ -n "$ws_head_before" ] && [ "$ws_head_before" != "$ws_head_after" ]; then
 			if grep -q '^BUILD-ON.*: yes' "$dir/ws-head-after.txt" 2>/dev/null; then
 				survived="yes"
@@ -1204,8 +1258,11 @@ run_after_write() {
 	{
 		echo "case: $case"
 		echo "loop: $name"
-		echo "target: Implementing + agent change (I77)"
+		echo "target: Implementing + agent change (A2, resume-after-kill)"
 		echo "agent-change-observed: $dirty_change"
+		echo "trigger: ${trigger:-none}"
+		echo "killed: $killed"
+		echo "kill-reason: ${kill_reason:-none}"
 		echo "saw-dirty: $saw_dirty"
 		echo "saw-commit-change: $saw_commit"
 		echo "terminal-phase: ${OUT_PHASE}"
@@ -1223,6 +1280,7 @@ run_after_write() {
 		echo "pvc-uid-unchanged: $( [ "$pvc_before" = "$pvc_after" ] && echo yes || echo no )"
 		echo "base-commit-at-change: ${base_after_change:-<unset>}"
 		echo "base-commit-after: $base_after"
+		echo "base-commit-unchanged: $([ -n "$base_after_change" ] && [ "$base_after_change" = "$base_after" ] && echo yes || echo no)"
 		echo "ws-head-before: $ws_head_before"
 		echo "ws-head-after: $ws_head_after"
 		echo "ws-head-builds-on: $(grep -E '^BUILD-ON' "$dir/ws-head-after.txt" 2>/dev/null | head -1 || echo '<no pre-kill HEAD or peek empty>')"
@@ -1230,7 +1288,7 @@ run_after_write() {
 		echo "operator-digest-after: $(op_digest)"
 	} >"$dir/outcome.txt" 2>&1
 	log "$case" "outcome: phase=${OUT_PHASE} reason=${OUT_REASON} wedged=${OUT_WEDGED} delivered=${DELIVERED_STATE} pr=$(pr_number_of "$name")"
-	log "$case" "I77: agent-change=$dirty_change ws-head: ${ws_head_before:0:8} -> ${ws_head_after:0:8} work-survived=$survived"
+	log "$case" "A2: agent-change=$dirty_change trigger=${trigger:-none} killed=$killed ws-head: ${ws_head_before:0:8} -> ${ws_head_after:0:8} work-survived=$survived"
 
 	kubectl --context "$CTX" -n "$NS" delete loop "$name" --wait=true --timeout=120s >/dev/null 2>&1 || true
 	kubectl --context "$CTX" -n "$NS" delete jobs --all --wait=true --timeout=60s >/dev/null 2>&1 || true

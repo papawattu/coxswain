@@ -84,7 +84,11 @@ KILL_DELAY="${A2_KILL_DELAY:-3}"
 WRITE_POLL="${A2_WRITE_POLL:-5}"
 # WRITE_CAP: seconds to wait for an agent change (a dirty tree or HEAD !=
 # baseCommit) before recording a named miss (the sandbox-after-write case).
-WRITE_CAP="${A2_WRITE_CAP:-300}"
+# 900s: the fixture's Implementing run is ~4-5 min of in-progress dirty work
+# (6 sleep-60 + 6 echo-append rounds); the cap must outlast it so the kill
+# lands MID-RUN (the tree dirty), not after the run completes and commits
+# (a clean tree, which the case would not trigger on).
+WRITE_CAP="${A2_WRITE_CAP:-900}"
 # PHASE_POLL: seconds between phase polls while waiting for the target phase.
 PHASE_POLL="${A2_PHASE_POLL:-2}"
 OUTDIR="${A2_OUT:-$ROOT/.samples/a2-restart-$(date -u +%Y%m%d%H%M%S)}"
@@ -95,6 +99,10 @@ OP_DEPLOY="coxswain-controller-manager"
 
 # The source Loop manifest (a unique name is rendered into a temp file per run).
 LOOP_SRC="$ROOT/examples/$APP/tasks/$TASK.loop.yaml"
+# The sandbox-after-write case uses its own fixture (a long-session after-write
+# goal; see the header of the fixture file for why): the original gocli task
+# commits in a single response so the case never observes a dirty window.
+AFTER_WRITE_SRC="$ROOT/test/e2e/a2-sandbox-after-write.loop.yaml"
 
 # Kill-case ids (one run each; the control runs first with no kill). The
 # sandbox-after-write case is I77's e2e: the RO peek is polled until the
@@ -342,12 +350,17 @@ verify_job_uid() {
 	kubectl --context "$CTX" -n "$NS" get job "$j" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "<gone>"
 }
 
-# apply_loop <name>: render the task Loop manifest with the given name + the
-# current runner image, and apply it (deleting a prior same-name Loop first).
+# apply_loop <name> [src]: render the task Loop manifest with the given name +
+# the current runner image, and apply it (deleting a prior same-name Loop
+# first). src (optional) is an alternative source manifest; it defaults to
+# LOOP_SRC. The sandbox-after-write case passes its own fixture (a long-session
+# after-write goal that keeps the tree dirty in Implementing so the case can
+# observe and kill it — the original gocli task commits in one response and
+# never leaves a dirty window).
 apply_loop() {
-	local name="$1" render
+	local name="$1" src="${2:-$LOOP_SRC}" render
 	render="$(mktemp)"
-	sed "s|name: ${APP}-task${TASK}|name: $name|" "$LOOP_SRC" >"$render"
+	sed "s|name: ${APP}-task${TASK}|name: $name|" "$src" >"$render"
 	if kubectl --context "$CTX" -n "$NS" get loop "$name" >/dev/null 2>&1; then
 		kubectl --context "$CTX" -n "$NS" delete loop "$name" --wait=true --timeout=120s >/dev/null 2>&1 \
 			|| kubectl --context "$CTX" -n "$NS" delete loop "$name" --wait=false >/dev/null 2>&1
@@ -610,7 +623,13 @@ ws_head() {
 # plus any change lines (M/??/A/D/R/C prefixes); a clean detached tree shows
 # only the '## HEAD (no branch)' line.
 ws_dirty() {
-	grep -E '^[A-Z?] ' "$1" 2>/dev/null | head -1 >/dev/null
+	# git status --short (the peek uses --short --branch) prints the branch
+	# line first ("## HEAD (no branch)"), then one line per dirty path with a
+	# two-char status prefix: "?? " (untracked), " M " / " M" / " D " /
+	# "A  " (worktree/index change). A tree is dirty iff any of those path
+	# lines is present. Match the status prefixes explicitly so the branch
+	# line ("## ") and the log/rev-parse lines are never mistaken for work.
+	grep -E '^\?\? |^ M |^ M$|^ D |^ D$|^A  |^A? ' "$1" 2>/dev/null | head -1 >/dev/null
 }
 
 # capture_logs <case> <loop>: keep ALL pod logs (operator, verify, deliver,
@@ -1095,7 +1114,7 @@ run_after_write() {
 
 	start_events_watch "$name" "$dir/events.jsonl"
 	start_sandbox_log_stream "$name" "$dir/sandbox.log"
-	apply_loop "$name"
+	apply_loop "$name" "$AFTER_WRITE_SRC"
 
 	# baseCommit is set by the operator during workspace init; the poll needs
 	# it to distinguish 'HEAD != baseCommit' from 'HEAD == baseCommit'.
@@ -1106,6 +1125,14 @@ run_after_write() {
 	# is ending, and by the time it is observed the phase may already have
 	# advanced (the first run caught the commit 12s after the
 	# Implementing->Verifying event — too late for the kill).
+	#
+	# Implementing-only dirty gate (R24 close-out): the dirty peek is only a
+	# valid trigger when the phase is Implementing AT THE PEEK. The Loop starts
+	# in Planning (the model plans before it implements), and the model creates
+	# notes.tmp during that window in some runs; a dirty peek during Planning is
+	# not the A2 window the case measures. If the phase is not Implementing when
+	# a dirty tree is seen, keep polling (the agent's Implementing run creates
+	# the dirty tree while Implementing, which is when the kill must fire).
 	local trigger=""
 	while [ "$(date +%s)" -lt "$deadline" ]; do
 		local ph
@@ -1116,10 +1143,14 @@ run_after_write() {
 		if [ -n "$wh" ]; then
 			if ws_dirty "$dir/ws-poll.txt"; then
 				saw_dirty="yes"
-				trigger="dirty"
-				mv -f "$dir/ws-poll.txt" "$dir/ws-head-before.txt"
-				dirty_change="yes"
-				break
+				# Fire the dirty trigger only in Implementing (the A2 window).
+				if [ "$ph" = "Implementing" ]; then
+					trigger="dirty"
+					mv -f "$dir/ws-poll.txt" "$dir/ws-head-before.txt"
+					dirty_change="yes"
+					break
+				fi
+				# Dirty but not Implementing (e.g. Planning): keep polling.
 			fi
 			if [ -n "$base_commit" ] && [ "$wh" != "$base_commit" ]; then
 				saw_commit="yes"

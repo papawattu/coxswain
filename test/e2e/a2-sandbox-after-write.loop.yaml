@@ -1,0 +1,55 @@
+# A2 sandbox-after-write fixture (R24 close-out). This is the Loop the
+# sandbox-after-write e2e case applies (test/e2e/a2-restart-e2e.sh,
+# run_after_write). It is the task source for that case ONLY — the other A2
+# cases still use examples/gocli/tasks/1.loop.yaml (LOOP_SRC).
+#
+# WHY this goal: the case must observe a DIRTY TREE in Implementing (the
+# reviewer's P1-2 ask: trigger on uncommitted edits, not a commit). The runner
+# commits on Implementing success (one model run per phase), so the dirty
+# window is only observable WHILE the run is in progress. A naive "append
+# lines" goal is flaky: the model varies how fast it works, and the sleep
+# between appends lets the phase machine move (Planning -> Implementing
+# flaps when the model proxies are slow), so the dirty peek can land in the
+# wrong phase. This goal is deterministic: the model echoes ONE line to
+# notes.tmp (making the tree dirty) and then runs a single 500-second sleep.
+# The sleep keeps the runner in Implementing for the whole window (no phase
+# change), and notes.tmp stays dirty (uncommitted) the whole time. The case's
+# peek catches the dirty tree in Implementing and the script fires the kill
+# ~2-3 min into the run, while the 500s sleep is still going.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: gocli-task1
+  namespace: samples
+spec:
+  goal: >-
+    You are a careful librarian keeping a journal in /workspace/notes.tmp. Do
+    exactly two shell steps, in order, and do NOTHING else: first, run the
+    shell command echo "the coxswain crew rows at dawn" >> notes.tmp; second,
+    run the shell command sleep 500 and wait for it to finish (do not interrupt
+    it). Absolute rules: you MUST NEVER run any git command, never commit, never
+    create, edit or delete any file other than notes.tmp, never read any other
+    file, never run go build or go test, and never run any command other than
+    the exact echo ... >> notes.tmp and sleep 500 commands listed above. When
+    the sleep 500 has finished, your very final message must consist of exactly
+    the single word: DONE
+  workspace:
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
+  verify:
+    acceptanceChecks:
+      - grep -c "" notes.tmp
+    preset: go
+    protectedPaths: []
+    image: docker.io/library/golang:1.26
+  agent:
+    # image intentionally omitted — the operator's --runner-image flag supplies
+    # the runner entrypoint (the same convention as examples/gocli/tasks/1.loop.yaml).
+    endpointSecretRef: vllm-no-auth
+    modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
+  delivery:
+    mode: PullRequest
+  loop:
+    maxIterations: 3

@@ -38,10 +38,12 @@ func TestLogArgs_Proxy(t *testing.T) {
 
 // TestLogArgs_Verify asserts the verify component uses a single
 // -l coxswain.io/verify-for=<loop> selector (the controller's pod label) and
-// does NOT pass the component name as a separate argv element.
+// does NOT pass the component name as a separate argv element. The expected
+// selector is the LITERAL key, not derived from the const, so a mutation that
+// changes the selector key fails this test.
 func TestLogArgs_Verify(t *testing.T) {
 	got := logArgs("samples", "loop1", compVerify, false, 0)
-	wantSel := verifyForLabel + "=loop1"
+	wantSel := "coxswain.io/verify-for=loop1"
 	found := false
 	for i, a := range got {
 		if a == "-l" && i+1 < len(got) && got[i+1] == wantSel {
@@ -63,7 +65,7 @@ func TestLogArgs_Verify(t *testing.T) {
 // -l coxswain.io/deliver-for=<loop> selector.
 func TestLogArgs_Deliver(t *testing.T) {
 	got := logArgs("samples", "loop1", compDeliver, false, 0)
-	wantSel := deliverForLabel + "=loop1"
+	wantSel := "coxswain.io/deliver-for=loop1"
 	found := false
 	for i, a := range got {
 		if a == "-l" && i+1 < len(got) && got[i+1] == wantSel {

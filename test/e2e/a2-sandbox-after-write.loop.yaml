@@ -29,22 +29,22 @@ metadata:
 spec:
   goal: >-
     You are a slow, careful librarian who keeps a journal in /workspace/notes.tmp.
-    Your task has EXACTLY 8 steps. Perform them in order, and do NOTHING else
-    before a step is fully done: step 1, run the shell command sleep 60 and wait
-    for it to finish; step 2, run the shell command echo "line 1: the coxswain
-    crew rows at dawn" >> notes.tmp; step 3, run the shell command sleep 60 and
-    wait for it to finish; step 4, run the shell command echo "line 2: the
-    helmsman keeps the log" >> notes.tmp; step 5, run the shell command sleep 60
-    and wait for it to finish; step 6, run the shell command echo "line 3: the
-    boatswain counts the knots" >> notes.tmp; step 7, run the shell command
-    sleep 60 and wait for it to finish; step 8, run the shell command echo "line
-    4: the crew rests after the watch" >> notes.tmp. Absolute rules for the whole
-    session: you MUST NEVER run any git command, never commit, never create, edit
-    or delete any file other than notes.tmp, never read any other file, never run
-    go build or go test, and never run any command other than the exact sleep 60
-    and echo ... >> notes.tmp commands listed above. Do the 8 steps in order. When
-    you have finished step 8, your very final message must consist of exactly the
-    single word: DONE
+    Your task is a strict alternating sequence of sleep and append steps. You MUST
+    do exactly the following, in this exact order, one step per shell command, and
+    you must wait for each step to finish before starting the next: sleep 60; then
+    echo "line 1: the coxswain crew rows at dawn" >> notes.tmp; sleep 60; echo
+    "line 2: the helmsman keeps the log" >> notes.tmp; sleep 60; echo "line 3: the
+    boatswain counts the knots" >> notes.tmp; sleep 60; echo "line 4: the
+    quartermaster stores the stores" >> notes.tmp; sleep 60; echo "line 5: the
+    lookout spots the land" >> notes.tmp; sleep 60; echo "line 6: the captain
+    signs the log" >> notes.tmp. That is exactly 8 steps: six sleep 60 commands
+    and six echo ... >> notes.tmp commands, alternating, starting with a sleep.
+    Absolute rules for the whole session: you MUST NEVER run any git command, never
+    commit, never create, edit or delete any file other than notes.tmp, never read
+    any other file, never run go build or go test, and never run any command other
+    than the exact sleep 60 and echo ... >> notes.tmp commands listed above. Do the
+    steps in order and do not skip any sleep. When you have finished the final echo
+    append, your very final message must consist of exactly the single word: DONE
   workspace:
     repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial

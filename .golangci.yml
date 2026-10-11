@@ -63,6 +63,11 @@ linters:
           - staticcheck
         path: cmd/egress-proxy/*
         text: QF1008
+      # Test fixtures repeat JSON field names ("status", "iteration", …); they
+      # are not production constants and should not drive goconst.
+      - linters:
+          - goconst
+        path: .*_test\.go
     paths:
       - third_party$
       - builtin$

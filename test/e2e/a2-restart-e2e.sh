@@ -1125,6 +1125,14 @@ run_after_write() {
 	# is ending, and by the time it is observed the phase may already have
 	# advanced (the first run caught the commit 12s after the
 	# Implementing->Verifying event — too late for the kill).
+	#
+	# Implementing-only dirty gate (R24 close-out): the dirty peek is only a
+	# valid trigger when the phase is Implementing AT THE PEEK. The Loop starts
+	# in Planning (the model plans before it implements), and the model creates
+	# notes.tmp during that window in some runs; a dirty peek during Planning is
+	# not the A2 window the case measures. If the phase is not Implementing when
+	# a dirty tree is seen, keep polling (the agent's Implementing run creates
+	# the dirty tree while Implementing, which is when the kill must fire).
 	local trigger=""
 	while [ "$(date +%s)" -lt "$deadline" ]; do
 		local ph
@@ -1135,10 +1143,14 @@ run_after_write() {
 		if [ -n "$wh" ]; then
 			if ws_dirty "$dir/ws-poll.txt"; then
 				saw_dirty="yes"
-				trigger="dirty"
-				mv -f "$dir/ws-poll.txt" "$dir/ws-head-before.txt"
-				dirty_change="yes"
-				break
+				# Fire the dirty trigger only in Implementing (the A2 window).
+				if [ "$ph" = "Implementing" ]; then
+					trigger="dirty"
+					mv -f "$dir/ws-poll.txt" "$dir/ws-head-before.txt"
+					dirty_change="yes"
+					break
+				fi
+				# Dirty but not Implementing (e.g. Planning): keep polling.
 			fi
 			if [ -n "$base_commit" ] && [ "$wh" != "$base_commit" ]; then
 				saw_commit="yes"

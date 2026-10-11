@@ -24,11 +24,14 @@ import (
 //
 // The fix: BEFORE the wipe, the script checks the success marker
 // .coxswain/base-commit. The marker is written only AFTER checkout, so if it
-// holds a 40-hex SHA that 'git cat-file -e <sha>^{commit}' accepts, the
-// workspace holds a COMPLETED clone and the script skips the wipe and the
-// clone: it writes the marker SHA to /dev/termination-log, echoes 'workspace
-// already initialised at <sha>' and exits 0. An interrupted first run (I73:
-// checked-out files, no marker) still gets the full wipe.
+// is 40 lowercase hex the workspace holds a COMPLETED clone and the script
+// skips the wipe and the clone: it writes the marker SHA to
+// /dev/termination-log, echoes 'workspace already initialised at <sha>' and
+// exits 0. The marker is validated by SHAPE ONLY (no git call: the init
+// container holds the git credential while .git is agent-controlled — S4 P1
+// / ADR-0006 forbids git there; R24 review). An interrupted first run (I73:
+// checked-out files, no marker) and a corrupted marker (not 40 lowercase
+// hex) still get the full wipe.
 //
 // This spec is an EXECUTION test (AGENTS.md norm: any shell script embedded
 // in Go has an execution test that runs the real generated script, only path
@@ -235,5 +238,111 @@ var _ = Describe("I77: interrupted first run (no success marker) still gets the 
 		mb, err := os.ReadFile(filepath.Join(i77Dest, ".coxswain", "base-commit"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(strings.TrimSpace(string(mb))).To(Equal(i77BareHead))
+	})
+})
+
+var _ = Describe("I77: a shape-invalid marker falls through to the wipe (execution test)", func() {
+	var (
+		i77BareRepo string
+		i77BareHead string
+		i77Work     string
+		i77Dest     string
+	)
+
+	i77InitScript := func(dest string) string {
+		loop := &coxv1alpha1.Loop{
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      "I77 execution test (shape-invalid marker)",
+				Workspace: coxv1alpha1.Workspace{Repo: i77BareRepo},
+			},
+		}
+		scheme := runtime.NewScheme()
+		_ = coxv1alpha1.AddToScheme(scheme)
+		c := (&LoopReconciler{Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
+		if len(c.Command) < 3 || c.Command[1] != "-c" {
+			GinkgoT().FailNow()
+		}
+		script := c.Command[2]
+		script = strings.ReplaceAll(script, "DEST=/workspace", "DEST="+dest)
+		script = strings.ReplaceAll(script, "> /dev/termination-log", "> "+dest+"/.termination-log-test")
+		return script
+	}
+
+	i77RunSh := func(dir, script string) (string, error) {
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// The R24 review also requires: the generated script must not invoke
+	// git to validate the marker (no cat-file), because running git against
+	// the agent-controlled .git while the credential is mounted is exactly
+	// what S4 P1 / ADR-0006 forbids.
+	It("the generated script contains no cat-file (marker validation is shape-only)", func() {
+		i77Work, err := os.MkdirTemp("", "i77-nocatfile-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(i77Work) }() //nolint:errcheck // best-effort cleanup
+		i77Dest = filepath.Join(i77Work, "workspace")
+		Expect(os.MkdirAll(i77Dest, 0o755)).To(Succeed())
+		i77BareRepo, _, err = i73SetupBareRepo(i77Work)
+		Expect(err).NotTo(HaveOccurred())
+
+		script := i77InitScript(i77Dest)
+		Expect(script).NotTo(ContainSubstring("cat-file"),
+			"I77: the init-workspace script must not run git against the agent-controlled .git while the credential is mounted (S4 P1 / ADR-0006)")
+	})
+
+	// runShapeCase: first run a clean clone (run 1), then OVERWRITE the
+	// marker with the given value, then run again; expect the wipe to fire
+	// (a re-clone to the bare HEAD, not the skip branch).
+	runShapeCase := func(markerValue, label string) {
+		script := i77InitScript(i77Dest)
+		out1, err := i77RunSh(i77Work, script)
+		Expect(err).NotTo(HaveOccurred(), "I77: the first run must succeed (%s)\n%s", label, out1)
+		Expect(out1).To(ContainSubstring("workspace initialised at " + i77BareHead))
+
+		Expect(os.WriteFile(filepath.Join(i77Dest, ".coxswain", "base-commit"), []byte(markerValue), 0o644)).To(Succeed())
+
+		out2, err := i77RunSh(i77Work, script)
+		Expect(err).NotTo(HaveOccurred(), "I77: the re-run after the %s marker must succeed (wipe + re-clone)\n%s", label, out2)
+		Expect(out2).To(ContainSubstring("workspace initialised at "+i77BareHead),
+			"I77: a %s marker must fall through to the wipe, not the skip branch\n%s", label, out2)
+		Expect(out2).NotTo(ContainSubstring("workspace already initialised at"))
+		mb, err := os.ReadFile(filepath.Join(i77Dest, ".coxswain", "base-commit"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(string(mb))).To(Equal(i77BareHead),
+			"I77: the re-clone must have rewritten the marker with the real base SHA")
+	}
+
+	It("a marker of 40 non-hex chars falls through to the wipe", func() {
+		var err error
+		i77Work, err = os.MkdirTemp("", "i77-mark40nonhex-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(i77Work) }() //nolint:errcheck // best-effort cleanup
+		i77Dest = filepath.Join(i77Work, "workspace")
+		Expect(os.MkdirAll(i77Dest, 0o755)).To(Succeed())
+		i77BareRepo, i77BareHead, err = i73SetupBareRepo(i77Work)
+		Expect(err).NotTo(HaveOccurred())
+
+		// 40 chars, each 'z' (a letter outside 0-9a-f) — right length,
+		// wrong character set.
+		runShapeCase(strings.Repeat("z", 40), "40-non-hex")
+	})
+
+	It("a marker of 39 hex chars (a truncated write) falls through to the wipe", func() {
+		var err error
+		i77Work, err = os.MkdirTemp("", "i77-mark39hex-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(i77Work) }() //nolint:errcheck // best-effort cleanup
+		i77Dest = filepath.Join(i77Work, "workspace")
+		Expect(os.MkdirAll(i77Dest, 0o755)).To(Succeed())
+		i77BareRepo, i77BareHead, err = i73SetupBareRepo(i77Work)
+		Expect(err).NotTo(HaveOccurred())
+
+		// The real base SHA truncated by one char (39 hex) — the marker's
+		// shape check is length + charset, so a truncated write must not be
+		// accepted.
+		runShapeCase(i77BareHead[:39], "39-hex-truncated")
 	})
 })

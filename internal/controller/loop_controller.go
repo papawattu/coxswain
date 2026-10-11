@@ -4593,35 +4593,42 @@ REPO=` + shellQuote(repo) + `
 REF=` + shellQuote(ref) + `
 # I77: a COMPLETED clone (a prior successful run of this script) left the
 # success marker .coxswain/base-commit. It is written only AFTER checkout
-# (below), so its presence with a 40-hex SHA that exists in the repo means
-# the workspace holds a completed clone — and possibly the agent's own
-# commits and uncommitted work built on it. A pod restart that re-runs this
-# container (the operator has not rebuilt the pod without init-workspace
-# yet) must NOT wipe or re-clone: skip, write the marker SHA to the
-# termination log (the operator's read-back is still a valid SHA) and exit
-# 0. Without this guard the wipe below deletes the agent's work (I77).
+# (below), so a marker that is 40 lowercase hex means the workspace holds a
+# completed clone — and possibly the agent's own commits and uncommitted work
+# built on it. A pod restart that re-runs this container (the operator has
+# not rebuilt the pod without init-workspace yet) must NOT wipe or re-clone:
+# skip, write the marker SHA to the termination log (the operator's read-back
+# is still a SHA-shaped value) and exit 0. Without this guard the wipe below
+# deletes the agent's work (I77).
+# The marker is validated by SHAPE ONLY (case on 0-9a-f), with NO git
+# invocation: this init container has the git credential mounted while
+# /workspace/.git is agent-controlled, and running git against it could let
+# agent-planted hooks or git config execute while the credential is present
+# (S4 P1 / ADR-0006). A truncated or corrupted marker is not 40 lowercase
+# hex, so the shape check falls through to the wipe; whether the SHA names a
+# commit in the repo is the operator's read-back job, not the script's.
+# Residual trust (documented only, R24 review): if this runs while
+# status.baseCommit is still empty (a restart racing the operator's first
+# read-back), the SHA recorded to the termination log is an agent-writable
+# value. In practice the operator records the first init's SHA within a
+# reconcile, so the race window is a single restart.
 if [ -f "${DEST}/.coxswain/base-commit" ]; then
   MARKER=$(head -n1 "${DEST}/.coxswain/base-commit")
-  # Trim whitespace (shell parameter expansion, not tr: the S3 spec forbids
-  # tr on this script; a truncated or corrupted marker must fall through to
-  # the wipe, not be accepted).
-  MARKER="${MARKER%
-}"
-  MARKER="${MARKER#[ 	]*}"
-  if [ -n "${MARKER}" ] && [ "${#MARKER}" -eq 40 ]; then
-    if git ` + safeDir + ` -C "${DEST}" cat-file -e "${MARKER}^{commit}" 2>/dev/null; then
-      echo "${MARKER}" > /dev/termination-log
-      echo "workspace already initialised at ${MARKER}"
-      exit 0
-    fi
-  fi
+  case "${MARKER}" in
+  *[!0-9a-f]* | '') ;;
+  *) if [ "${#MARKER}" -eq 40 ]; then
+    echo "${MARKER}" > /dev/termination-log
+    echo "workspace already initialised at ${MARKER}"
+    exit 0
+  fi ;;
+  esac
 fi
-# No valid success marker: either a first run or an interrupted first run
-# (I73: checked-out files, no .coxswain/base-commit, or a marker whose SHA
-# the repo does not accept — a truncated write). The volume is a MOUNT POINT
-# (cannot be rm -rf'd). Wipe ALL contents of the mount (including dotfiles
-# such as .git and .coxswain) so the clone starts clean — but never the mount
-# point itself. mindepth 1 keeps the mount point itself.
+# No shape-valid success marker: either a first run or an interrupted first
+# run (I73: checked-out files, no .coxswain/base-commit, or a marker that is
+# not 40 lowercase hex — a truncated or corrupted write). The volume is a
+# MOUNT POINT (cannot be rm -rf'd). Wipe ALL contents of the mount (including
+# dotfiles such as .git and .coxswain) so the clone starts clean — but never
+# the mount point itself. mindepth 1 keeps the mount point itself.
 if [ -d "${DEST}" ]; then find "${DEST}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true; fi
 mkdir -p "${DEST}"
 

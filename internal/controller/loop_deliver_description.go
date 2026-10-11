@@ -90,6 +90,15 @@ const deliverDescriptionDataKey = "description.md"
 // import; the operator's facts body has no plan content at all).
 const deliverPlanMaxBytes = 16 * 1024
 
+// deliverPlanCopyMaxBytes caps the plan BYTES import-agent carries into the
+// scratch volume (head -c, at the import step). It is the plan cap plus
+// slack (one line's worth of headroom, and the cap itself if the plan has no
+// newlines before it) so the copy always contains enough of the plan for the
+// push python's whole-line truncation to land the same cap — the python's
+// PLAN_MAX (deliverPlanMaxBytes) is the binding display cap, and the copy
+// cap only bounds the bytes the scratch volume carries.
+const deliverPlanCopyMaxBytes = deliverPlanMaxBytes + 4096
+
 // deliverPlanSectionHeader is the push script's label for the untrusted
 // plan section (A4: the plan is clearly labelled as written by the agent,
 // and fenced — markdown fences, which survive the JSON body verbatim). The
@@ -358,21 +367,22 @@ func renderDeliverDescriptionBody(d deliverDescription) string {
 	if d.Budget != nil && d.Budget.Exceeded {
 		fmt.Fprintf(&b, "- **Budget gate:** the operator gated delivery (budget %s)\n", d.Budget.ExceededReason)
 	}
-	// The plan section header the push script emits (labelled, fenced, the
-	// plan content is the agent's — see deliverPlanSectionHeader). It is
-	// listed here so a reader of the operator's body knows the shape of the
-	// final description (the push script appends the fenced plan AFTER this
-	// text).
-	b.WriteString("\n---\n")
 	return b.String()
 }
 
-// budgetLines renders the budget used-vs-limit facts. nil budget -> one line.
+// budgetLines renders the budget used-vs-limit facts under their own
+// "## Budget" heading (the budget lines were previously printed directly
+// after the per-iteration verify record and rendered under that section —
+// R26 P3). nil budget -> one line. The body itself no longer carries a
+// trailing "---": the push script's plan section supplies the single
+// separator before the (labelled, fenced) plan, so there is exactly one
+// "---" in the final description (R26 P3: the doubled "---").
 func budgetLines(bf *deliverBudgetFacts) string {
 	if bf == nil {
-		return "- **Budget:** not yet read\n"
+		return "\n## Budget\n- **Budget:** not yet read\n"
 	}
 	var s strings.Builder
+	s.WriteString("\n## Budget\n")
 	fmt.Fprintf(&s, "- **Budget (tokens):** %d", bf.Tokens)
 	if bf.MaxTokens != nil {
 		fmt.Fprintf(&s, " of %d cap", *bf.MaxTokens)

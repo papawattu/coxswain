@@ -90,6 +90,11 @@ func TestDeliverDescriptionFactsFromSpecStatusOnly(t *testing.T) {
 		"- iteration 1: FAILED (TestRound) at 2026-10-11 08:30:00Z",
 		"- iteration 2: passed (verified commit `c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`)",
 		"- **Budget (tokens):** 1500 of 1000000 cap",
+		// R26 P3: the budget lines carry their own "## Budget" heading (they
+		// used to render under "## Verify results per iteration"), and the
+		// facts body no longer carries a trailing "---" (the push script's
+		// plan section supplies the single separator — the doubled "---").
+		"\n## Budget\n",
 		"- **Budget (requests):** 7",
 		"- **Budget (cost):** $0.05",
 		"- **Budget (active time):** 5m0s",

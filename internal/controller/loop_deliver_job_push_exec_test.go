@@ -353,7 +353,8 @@ func newFakeGiteaAPIWithRepoGET(t *testing.T, owner, repoName, scheme, host, def
 func newFakeGiteaAPIWithNested(t *testing.T, owner, repoName, scheme, host, defaultBranch string, repoGETStatus int, nestedRepo, nestedPR string) (apiBase string, posts *[]fakeGiteaAPICall) {
 	var mu sync.Mutex
 	var postList []fakeGiteaAPICall
-	var openPR int // 0 = no open PR yet
+	var openPR int      // 0 = no open PR yet
+	var lastBody string // the body of the last created PR (served on the GET /pulls lookup, matching Gitea's behaviour of returning the PR object with its body — the R26 P1 plan test reads the body back this way)
 	repoPath := "/repos/" + owner + "/" + repoName
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -376,14 +377,34 @@ func newFakeGiteaAPIWithNested(t *testing.T, owner, repoName, scheme, host, defa
 		if r.Method == http.MethodGet && strings.HasSuffix(path, "/pulls") {
 			mu.Lock()
 			n := openPR
+			body := lastBody
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			if n == 0 {
 				_, _ = w.Write([]byte("[]"))
 				return
 			}
+			// The list response carries the recorded PR body when present
+			// (the R26 P1 plan test reads it back this way). nestedPR, when
+			// non-empty, already carries its own leading comma (it is appended
+			// directly into the JSON object). The body is added after the
+			// html_url, before nestedPR (with a leading comma when nestedPR is
+			// also present, or without when nestedPR is empty).
+			bodyPart := ""
+			if body != "" {
+				bodyPart = `"body":` + jsonQuote(body)
+			}
+			var listExtra string
+			switch {
+			case body != "" && nestedPR != "":
+				listExtra = "," + bodyPart + nestedPR
+			case body != "":
+				listExtra = "," + bodyPart
+			default:
+				listExtra = nestedPR
+			}
 			_, _ = fmt.Fprintf(w, `[{"number":%d,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/%d"%s}]`,
-				n, scheme, host, owner, repoName, n, nestedPR)
+				n, scheme, host, owner, repoName, n, listExtra)
 			return
 		}
 		// POST /repos/{owner}/{repo}/pulls — the create.
@@ -392,6 +413,14 @@ func newFakeGiteaAPIWithNested(t *testing.T, owner, repoName, scheme, host, defa
 			mu.Lock()
 			postList = append(postList, fakeGiteaAPICall{method: r.Method, auth: r.Header.Get("Authorization"), payload: body})
 			openPR = 42
+			var b string
+			var pr map[string]any
+			if err := json.Unmarshal(body, &pr); err == nil {
+				if bodyVal, ok := pr["body"].(string); ok {
+					b = bodyVal
+				}
+			}
+			lastBody = b
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"number":42,"state":"open","draft":true,"html_url":"%s://%s/%s/%s/pulls/42"%s}`,
@@ -404,6 +433,17 @@ func newFakeGiteaAPIWithNested(t *testing.T, owner, repoName, scheme, host, defa
 	t.Cleanup(ts.Close)
 	apiBase = ts.URL
 	return apiBase, &postList
+}
+
+// jsonQuote renders a string as a JSON string literal (the fake API's bodies
+// are JSON, so the recorded PR body is embedded as a JSON string — escaping
+// every byte so the body round-trips verbatim through the GET /pulls lookup).
+func jsonQuote(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "\"\""
+	}
+	return string(b)
 }
 
 // gitRemoteRef returns the commit a ref points at in a repo (a bare repo's

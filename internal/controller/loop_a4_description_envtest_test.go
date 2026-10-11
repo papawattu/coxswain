@@ -218,7 +218,48 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 			"the foreign ConfigMap must be left alone by the operator's cleanup")
 	})
 
-	// R25/P1: a NON-forbidden transient failure of the description ConfigMap
+	It("carries the agent plan into the scratch volume via import-agent (outside the git tree; the push reads it from there)", func() {
+		ns := freshNS("a4-desc-plan")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "desc7"
+		r := s6Succeeded(name, ns, "http://gitea.samples.svc:3000/samples/desc7.git")
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		inits, push := s6JobContainers(job)
+
+		// import-agent (the container that mounts the agent PVC read-only and
+		// the scratch volume writable) is the ONLY container that carries the
+		// plan: it copies ${SRC}/.coxswain/PLAN.md into the scratch volume
+		// OUTSIDE the git tree (${DEST}/plan.md). The copy is regular-file-only
+		// and never follows a symlink (a symlinked PLAN.md is agent-controlled
+		// and could point anywhere on the PVC), and is capped at read time
+		// (head -c to the copy cap — the plan cap plus slack).
+		importScript := deliverContainerScript(GinkgoT(), inits[deliverImport])
+		Expect(importScript).To(ContainSubstring("PLAN_SRC=${SRC}/.coxswain/PLAN.md"),
+			"import-agent must name the agent plan on the workspace PVC")
+		Expect(importScript).To(ContainSubstring("PLAN_DST=${DEST}/plan.md"),
+			"import-agent must carry the plan into the scratch volume OUTSIDE the git tree (${DEST}/plan.md)")
+		Expect(importScript).To(ContainSubstring("if [ -f \"${PLAN_SRC}\" ] && [ ! -L \"${PLAN_SRC}\" ]"),
+			"import-agent must copy the plan only if it is a regular file and NOT a symlink (agent-controlled; never follow links)")
+		Expect(importScript).To(ContainSubstring("head -c \"${PLAN_MAX}\" \"${PLAN_SRC}\" > \"${PLAN_DST}\""),
+			"import-agent must cap the plan at read time (head -c)")
+		Expect(importScript).To(ContainSubstring(fmt.Sprintf("PLAN_MAX=%d", deliverPlanCopyMaxBytes)),
+			"import-agent's copy cap must be the plan cap plus slack (the binding display cap stays the python's PLAN_MAX)")
+
+		// The push container reads the plan from the scratch-volume copy (the
+		// sibling of the checkout, ${SRC}/plan.md) — NEVER from the checkout
+		// itself: .coxswain is excluded from the agent commit (I80/D51), so
+		// the file can never exist in the pinned checkout, and the push
+		// container does not mount the agent PVC.
+		pushScript := deliverContainerScript(GinkgoT(), push)
+		Expect(pushScript).To(ContainSubstring("PLAN_FILE=${SRC}/plan.md"),
+			"the push script must read the plan from the scratch-volume copy import-agent carried (${SRC}/plan.md)")
+		Expect(pushScript).NotTo(ContainSubstring("PLAN_FILE=${SRC}/.coxswain/PLAN.md"),
+			"the push script's PLAN_FILE must not point at the scratch checkout (.coxswain is excluded from the agent commit and the push container has no agent PVC mount)")
+	})
+
+	// R26/P1: a NON-forbidden transient failure of the description ConfigMap
 	// ensure (e.g. a transient API error) must NOT error the Succeeded
 	// reconcile (the reviewer's P2: "a transient read failure must not block
 	// the Job"). The push container mounts the volume OPTIONAL and falls back

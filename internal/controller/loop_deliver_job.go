@@ -913,6 +913,26 @@ export GIT_TERMINAL_PROMPT=0
 SRC=` + deliverAgentSrc + `
 DEST=` + deliverScratchPath + `
 PINNED=` + shellQuote(verified) + `
+PLAN_SRC=${SRC}/.coxswain/PLAN.md
+PLAN_DST=${DEST}/plan.md
+PLAN_MAX=` + strconv.Itoa(deliverPlanCopyMaxBytes) + `
+# The agent's plan (.coxswain/PLAN.md on the workspace PVC) is agent data
+# that is EXCLUDED from the agent commit (I80/D51 — the commit never carries
+# it), so it can never exist in the ${DEST} checkout. The push container does
+# not mount the agent PVC, so the plan is CARRIED into the scratch volume
+# OUTSIDE the git tree (${DEST}/plan.md, a sibling of the checkout) where the
+# push container reads it from disk. It is treated as untrusted, agent-
+# controlled data: copied only if it is a REGULAR FILE and NOT A SYMLINK
+# (a symlinked PLAN.md is agent-controlled — it could point anywhere on the
+# PVC — and is never followed), and capped at read time (head -c to the cap
+# plus slack; the push python truncates to the whole-line cap).
+if [ -f "${PLAN_SRC}" ] && [ ! -L "${PLAN_SRC}" ]; then
+  head -c "${PLAN_MAX}" "${PLAN_SRC}" > "${PLAN_DST}"
+  echo "deliver import-agent: carried the agent plan to ${PLAN_DST} (capped at ${PLAN_MAX} bytes)"
+else
+  rm -f "${PLAN_DST}"
+  echo "deliver import-agent: no agent plan (absent or a symlink) — the push renders the no-plan line"
+fi
 # The base clone (clone-base's work) must exist: import into it, never wipe
 # or re-init (wiping .git leaves the checked-out base files untracked and
 # the pinned checkout aborts on them).
@@ -1118,19 +1138,23 @@ if [ -n "${PR_NUM}" ]; then
 else
   # --- the PR body (A4): the FACTS half comes from the operator's ConfigMap
   # (the operator built it from the Loop's spec/status only — never a runner
-  # claim), and the PLAN half is the agent-authored .coxswain/PLAN.md read
-  # from the agent's workspace (imported into the scratch clone at the pinned
-  # commit). The plan is UNTRUSTED DATA: it is fenced into a clearly labelled
-  # section ("Plan (written by the agent, untrusted)"), capped at PLAN_MAX
-  # bytes with a truncation note, and appended AFTER the facts (the plan can
-  # never alter the facts text). The payload is built with python3 json (the
-  # JSON library escapes every byte — quotes, backslashes, newlines and '}'
-  # in either half are impossible to inject into the payload; a printf of
-  # untrusted text into JSON is absent by construction). Every value is
-  # passed to the python via the ENVIRONMENT (os.environ), never inlined
-  # into the python source (a backtick or quote in a value must not become
-  # python or shell code); the plan is read from DISK by the python itself
-  # (never through a shell variable).
+  # claim), and the PLAN half is the agent-authored .coxswain/PLAN.md. The
+  # plan is EXCLUDED from the agent commit (I80/D51 — the commit never
+  # carries it) and the push container does not mount the agent PVC, so
+  # import-agent carried it into the scratch volume OUTSIDE the git tree
+  # (${SRC}/plan.md — a sibling of the checkout, never inside it) where the
+  # push reads it from disk. The plan is UNTRUSTED DATA: it is fenced into a
+  # clearly labelled section ("Plan (written by the agent, untrusted)"),
+  # capped at PLAN_MAX bytes with a truncation note, and appended AFTER the
+  # facts (the plan can never alter the facts text). The payload is built
+  # with python3 json (the JSON library escapes every byte — quotes,
+  # backslashes, newlines and '}' in either half are impossible to inject
+  # into the payload; a printf of untrusted text into JSON is absent by
+  # construction). Every value is passed to the python via the ENVIRONMENT
+  # (os.environ), never inlined into the python source (a backtick or quote
+  # in a value must not become python or shell code); the plan is read from
+  # DISK by the python itself (never through a shell variable). A missing
+  # plan file (import-agent carried nothing) renders the no-plan line.
   FACTS_FILE=${DESC_DIR}/description.md
   FACTS=
   if [ -f "${FACTS_FILE}" ]; then
@@ -1139,7 +1163,7 @@ else
   if [ -z "${FACTS}" ]; then
     FACTS="Delivered by coxswain from verified commit ${PINNED}."
   fi
-  PLAN_FILE=${SRC}/.coxswain/PLAN.md
+  PLAN_FILE=${SRC}/plan.md
   PLAN_MAX=` + strconv.Itoa(deliverPlanMaxBytes) + `
   export BRANCH BASE DRAFT TITLE_PREFIX FACTS PLAN_FILE PLAN_MAX
   PAYLOAD=$(python3 -c ` + shellQuote(deliverPushPayloadPython) + `)
@@ -1622,4 +1646,4 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 // double-quoted string literal (\n-escaped newlines, \"-escaped quotes, and
 // the fenced-markdown triple-backticks are just characters in the literal --
 // a Go raw string would terminate at the first backtick).
-const deliverPushPayloadPython = "import json, os\nfacts = os.environ.get(\"FACTS\", \"\")\nif not facts:\n    facts = \"Delivered by coxswain (facts unavailable)\"\ntry:\n    with open(os.environ[\"PLAN_FILE\"], \"rb\") as f:\n        raw = f.read()\nexcept OSError:\n    raw = b\"\"\nplan = raw.decode(\"utf-8\", \"replace\")\nplan_max = int(os.environ.get(\"PLAN_MAX\", \"16384\"))\nif len(plan) > plan_max:\n    cut = plan.rfind(\"\\n\", 0, plan_max)\n    if cut < 0:\n        cut = plan_max\n    plan = plan[:cut] + \"\\n(truncated: the plan exceeded the %d-byte cap)\" % plan_max\nbody = facts + \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n```markdown\\n\" + plan + \"\\n```\\n\"\npayload = {\n    \"title\": os.environ[\"TITLE_PREFIX\"] + \"coxswain: \" + os.environ[\"BRANCH\"],\n    \"head\": os.environ[\"BRANCH\"],\n    \"base\": os.environ[\"BASE\"],\n    \"body\": body,\n    \"draft\": os.environ.get(\"DRAFT\", \"true\") == \"true\",\n}\nprint(json.dumps(payload))"
+const deliverPushPayloadPython = "import json, os\nfacts = os.environ.get(\"FACTS\", \"\")\nif not facts:\n    facts = \"Delivered by coxswain (facts unavailable)\"\ntry:\n    with open(os.environ[\"PLAN_FILE\"], \"rb\") as f:\n        raw = f.read()\nexcept OSError:\n    raw = b\"\"\nplan = raw.decode(\"utf-8\", \"replace\")\nplan_max = int(os.environ.get(\"PLAN_MAX\", \"16384\"))\nif len(plan) > plan_max:\n    cut = plan.rfind(\"\\n\", 0, plan_max)\n    if cut < 0:\n        cut = plan_max\n    plan = plan[:cut] + \"\\n(truncated: the plan exceeded the %d-byte cap)\" % plan_max\nif not plan.strip():\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n_(no plan recorded)_\"\nelse:\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n```markdown\\n\" + plan + \"\\n```\"\nbody = facts + plan_section + \"\\n\"\npayload = {\n    \"title\": os.environ[\"TITLE_PREFIX\"] + \"coxswain: \" + os.environ[\"BRANCH\"],\n    \"head\": os.environ[\"BRANCH\"],\n    \"base\": os.environ[\"BASE\"],\n    \"body\": body,\n    \"draft\": os.environ.get(\"DRAFT\", \"true\") == \"true\",\n}\nprint(json.dumps(payload))"

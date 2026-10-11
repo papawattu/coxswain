@@ -29,8 +29,12 @@ func (k *kubectlLogStreamer) Stream(ctx context.Context, loop, component string)
 	}
 
 	switch component {
-	case compAgent, "proxy":
-		args = append(args, "pod/"+loop+"-sandbox", "-c", component)
+	case compAgent:
+		args = append(args, "pod/"+loop+"-sandbox", "-c", compAgent)
+	case "proxy":
+		// The egress proxy is a standalone pod (<loop>-proxy), not a container
+		// in the sandbox pod.
+		args = append(args, "pod/"+loop+"-proxy")
 	case "verify":
 		args = append(args, "-l", "app.kubernetes.io/loop="+loop, "component=verify")
 	case "deliver":

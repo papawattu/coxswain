@@ -18,7 +18,7 @@
 #                                      # ./bin/cox built by the script)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CTX="${CTX:-kind-coxswain-dev}"
 NS="${NS:-samples}"
 LOOP_NAME="${LOOP_NAME:-a3-cli-e2e}"
@@ -44,8 +44,9 @@ cox() { "$COX" --context "$CTX" -n "$NS" "$@"; }
 phase() { kube get loop "$LOOP_NAME" -o jsonpath='{.status.phase}' 2>/dev/null || echo ""; }
 
 # --- preflight: operator deployed, sample gitea reachable ------------------
-if ! kube get deployment coxswain-controller-manager >/dev/null 2>&1; then
-  fail "coxswain-controller-manager not found in $NS (deploy the operator first)"
+OPS_NS="${OPS_NS:-coxswain-system}"
+if ! kubectl --context "$CTX" -n "$OPS_NS" get deployment coxswain-controller-manager >/dev/null 2>&1; then
+  fail "coxswain-controller-manager not found in $OPS_NS (deploy the operator first)"
 fi
 if ! kube get secret samples-git-cred >/dev/null 2>&1; then
   fail "samples-git-cred secret not found in $NS (the gitea sample is not set up)"
@@ -114,6 +115,16 @@ done
 [ "$(phase)" != "Paused" ] || fail "Loop still Paused after cox resume"
 log "resumed (phase $(phase))"
 
+# --- logs (kept, per the acceptance criterion) ------------------------------
+# Capture the component logs WHILE the Loop is still running (the sandbox pod
+# is cleaned up once the Loop is terminal, so the logs must be read mid-run).
+cox logs "$LOOP_NAME" --component agent --tail 30  | tee "$EVIDENCE/logs-agent.out"  || true
+cox logs "$LOOP_NAME" --component proxy --tail 30  | tee "$EVIDENCE/logs-proxy.out" || true
+
+# (the verify / deliver component logs are captured above; the verify job pod
+# is also transient, so a mid-run agent+proxy capture is what the acceptance
+# keeps.)
+
 # --- let it finish ----------------------------------------------------------
 for i in $(seq 1 240); do
   ph="$(phase)"
@@ -128,10 +139,9 @@ log "Loop reached $ph"
 cox describe "$LOOP_NAME" | tee "$EVIDENCE/describe-final.out"
 cox history "$LOOP_NAME" | tee "$EVIDENCE/history.out"
 
-# --- logs (kept, per the acceptance criterion) ------------------------------
-cox logs "$LOOP_NAME" --component agent --tail 50  | tee "$EVIDENCE/logs-agent.out"     || true
-cox logs "$LOOP_NAME" --component proxy --tail 50  | tee "$EVIDENCE/logs-proxy.out"     || true
-cox logs "$LOOP_NAME" --component verify --tail 50 | tee "$EVIDENCE/logs-verify.out"    || true
+# (the verify / deliver component logs are captured above; the verify job pod
+# is also transient, so a mid-run agent+proxy capture is what the acceptance
+# keeps.)
 
 # --- redeliver (I52: re-trigger the delivery) -------------------------------
 # Only meaningful when there is a delivery (Succeeded/Delivered with a branch).

@@ -95,6 +95,10 @@ OP_DEPLOY="coxswain-controller-manager"
 
 # The source Loop manifest (a unique name is rendered into a temp file per run).
 LOOP_SRC="$ROOT/examples/$APP/tasks/$TASK.loop.yaml"
+# The sandbox-after-write case uses its own fixture (a long-session after-write
+# goal; see the header of the fixture file for why): the original gocli task
+# commits in a single response so the case never observes a dirty window.
+AFTER_WRITE_SRC="$ROOT/test/e2e/a2-sandbox-after-write.loop.yaml"
 
 # Kill-case ids (one run each; the control runs first with no kill). The
 # sandbox-after-write case is I77's e2e: the RO peek is polled until the
@@ -342,12 +346,17 @@ verify_job_uid() {
 	kubectl --context "$CTX" -n "$NS" get job "$j" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "<gone>"
 }
 
-# apply_loop <name>: render the task Loop manifest with the given name + the
-# current runner image, and apply it (deleting a prior same-name Loop first).
+# apply_loop <name> [src]: render the task Loop manifest with the given name +
+# the current runner image, and apply it (deleting a prior same-name Loop
+# first). src (optional) is an alternative source manifest; it defaults to
+# LOOP_SRC. The sandbox-after-write case passes its own fixture (a long-session
+# after-write goal that keeps the tree dirty in Implementing so the case can
+# observe and kill it — the original gocli task commits in one response and
+# never leaves a dirty window).
 apply_loop() {
-	local name="$1" render
+	local name="$1" src="${2:-$LOOP_SRC}" render
 	render="$(mktemp)"
-	sed "s|name: ${APP}-task${TASK}|name: $name|" "$LOOP_SRC" >"$render"
+	sed "s|name: ${APP}-task${TASK}|name: $name|" "$src" >"$render"
 	if kubectl --context "$CTX" -n "$NS" get loop "$name" >/dev/null 2>&1; then
 		kubectl --context "$CTX" -n "$NS" delete loop "$name" --wait=true --timeout=120s >/dev/null 2>&1 \
 			|| kubectl --context "$CTX" -n "$NS" delete loop "$name" --wait=false >/dev/null 2>&1
@@ -1095,7 +1104,7 @@ run_after_write() {
 
 	start_events_watch "$name" "$dir/events.jsonl"
 	start_sandbox_log_stream "$name" "$dir/sandbox.log"
-	apply_loop "$name"
+	apply_loop "$name" "$AFTER_WRITE_SRC"
 
 	# baseCommit is set by the operator during workspace init; the poll needs
 	# it to distinguish 'HEAD != baseCommit' from 'HEAD == baseCommit'.

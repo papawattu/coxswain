@@ -1,0 +1,58 @@
+# A2 sandbox-after-write fixture (R24 close-out). This is the Loop the
+# sandbox-after-write e2e case applies (test/e2e/a2-restart-e2e.sh,
+# run_after_write). It is the task source for that case ONLY — the other A2
+# cases still use examples/gocli/tasks/1.loop.yaml (LOOP_SRC).
+#
+# WHY this goal: the case must observe a DIRTY TREE in Implementing (the
+# reviewer's P1-2 ask: trigger on uncommitted edits, not a commit). The
+# original gocli task commits in a single model response and advances
+# Implementing -> Verifying within seconds, so a dirty window is never
+# observable and the case records `no-agent-change-in-window`. This goal keeps
+# the agent writing uncommitted lines to notes.tmp across MANY model responses
+# (each response does at most one echo-append or one short sleep, and the runner
+# hard-caps at 25 steps/response). That produces a sustained dirty tree in
+# Implementing that the case's peek can catch and kill.
+#
+# The goal deliberately forbids committing (the case measures uncommitted-work
+# survival across the kill), and the acceptance check is a trivial grep so the
+# case can reach Verifying -> Succeeded and end terminal after the kill.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: gocli-task1
+  namespace: samples
+spec:
+  goal: >-
+    You are a meticulous librarian who keeps a journal. In /workspace there is
+    a file notes.tmp. For your ENTIRE session, every single message you write
+    must do EXACTLY ONE of the following, chosen in this repeating pattern
+    (append, append, pause, append, append, pause, ...): (A) append one new
+    short line to notes.tmp with the shell command
+    echo "<a short new sentence about the coxswain crew>" >> notes.tmp, or
+    (B) a short pause: run the single shell command sleep 15. Absolute rules
+    for the whole session: you MUST NEVER commit, never run any git command at
+    all, never create, edit or delete any file other than notes.tmp, never read
+    any other file, never run go build, go test, or any command other than the
+    echo append and sleep described above. Keep doing this pattern for at
+    least 25 messages. Only after you have appended at least 25 lines total may
+    your very final message consist of exactly the single word: DONE
+  workspace:
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
+  verify:
+    acceptanceChecks:
+      - grep -c "" notes.tmp
+    preset: go
+    protectedPaths: []
+    image: docker.io/library/golang:1.26
+  agent:
+    # image intentionally omitted — the operator's --runner-image flag supplies
+    # the runner entrypoint (the same convention as examples/gocli/tasks/1.loop.yaml).
+    endpointSecretRef: vllm-no-auth
+    modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
+  delivery:
+    mode: PullRequest
+  loop:
+    maxIterations: 3

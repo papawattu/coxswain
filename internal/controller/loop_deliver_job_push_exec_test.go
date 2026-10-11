@@ -329,7 +329,7 @@ type fakeGiteaAPICall struct {
 // returns that status (the fail-closed default-branch lookup test);
 // when defaultBranch is "", the repo GET returns JSON with no
 // default_branch field (also fail-closed).
-func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host, defaultBranch string) (apiBase string, posts *[]fakeGiteaAPICall) {
+func newFakeGiteaAPI(t *testing.T, owner, repoName, scheme, host, defaultBranch string) (apiBase string, posts *[]fakeGiteaAPICall) { //nolint:unparam // the test suite's Gitea owner is always "samples" (convenience wrapper; newFakeGiteaAPIWithRepoGET keeps the param general)
 	t.Helper()
 	return newFakeGiteaAPIWithRepoGET(t, owner, repoName, scheme, host, defaultBranch, 0)
 }

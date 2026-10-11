@@ -4,23 +4,18 @@
 # cases still use examples/gocli/tasks/1.loop.yaml (LOOP_SRC).
 #
 # WHY this goal: the case must observe a DIRTY TREE in Implementing (the
-# reviewer's P1-2 ask: trigger on uncommitted edits, not a commit). The
-# original gocli task commits in a single model response and advances
-# Implementing -> Verifying within seconds, so a dirty window is never
-# observable and the case records `no-agent-change-in-window`. The runner does
-# NOT loop across model responses — it drives the model for ONE phase run and,
-# on success, immediately commits the work (runner/phase.go: the Implementing
-# success path calls commitWorkspace before writing the claim). So the dirty
-# window is only observable WHILE the Implementing run is in progress. This
-# goal makes that window long (~8 minutes): it makes the model echo a 60-second
-# sleep before each of 8 appends. Each sleep is one tool call (1 round), each
-# echo-append is one tool call, and each round waits for the full 60s to elapse
-# (the runner's shell timeout is 60s), so 8 cycles of (sleep 60 + append) is
-# roughly 8 minutes of in-progress dirty work — long enough for the case's
-# 5s poll to catch the dirty tree and fire the kill. The goal deliberately
-# forbids committing (the case measures uncommitted-work survival across the
-# kill), and the acceptance check is a trivial grep so the case can reach
-# Verifying -> Succeeded and end terminal after the kill.
+# reviewer's P1-2 ask: trigger on uncommitted edits, not a commit). The runner
+# commits on Implementing success (one model run per phase), so the dirty
+# window is only observable WHILE the run is in progress. A naive "append
+# lines" goal is flaky: the model varies how fast it works, and the sleep
+# between appends lets the phase machine move (Planning -> Implementing
+# flaps when the model proxies are slow), so the dirty peek can land in the
+# wrong phase. This goal is deterministic: the model echoes ONE line to
+# notes.tmp (making the tree dirty) and then runs a single 500-second sleep.
+# The sleep keeps the runner in Implementing for the whole window (no phase
+# change), and notes.tmp stays dirty (uncommitted) the whole time. The case's
+# peek catches the dirty tree in Implementing and the script fires the kill
+# ~2-3 min into the run, while the 500s sleep is still going.
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
@@ -28,23 +23,16 @@ metadata:
   namespace: samples
 spec:
   goal: >-
-    You are a slow, careful librarian who keeps a journal in /workspace/notes.tmp.
-    Your task is a strict alternating sequence of sleep and append steps. You MUST
-    do exactly the following, in this exact order, one step per shell command, and
-    you must wait for each step to finish before starting the next: sleep 60; then
-    echo "line 1: the coxswain crew rows at dawn" >> notes.tmp; sleep 60; echo
-    "line 2: the helmsman keeps the log" >> notes.tmp; sleep 60; echo "line 3: the
-    boatswain counts the knots" >> notes.tmp; sleep 60; echo "line 4: the
-    quartermaster stores the stores" >> notes.tmp; sleep 60; echo "line 5: the
-    lookout spots the land" >> notes.tmp; sleep 60; echo "line 6: the captain
-    signs the log" >> notes.tmp. That is exactly 8 steps: six sleep 60 commands
-    and six echo ... >> notes.tmp commands, alternating, starting with a sleep.
-    Absolute rules for the whole session: you MUST NEVER run any git command, never
-    commit, never create, edit or delete any file other than notes.tmp, never read
-    any other file, never run go build or go test, and never run any command other
-    than the exact sleep 60 and echo ... >> notes.tmp commands listed above. Do the
-    steps in order and do not skip any sleep. When you have finished the final echo
-    append, your very final message must consist of exactly the single word: DONE
+    You are a careful librarian keeping a journal in /workspace/notes.tmp. Do
+    exactly two shell steps, in order, and do NOTHING else: first, run the
+    shell command echo "the coxswain crew rows at dawn" >> notes.tmp; second,
+    run the shell command sleep 500 and wait for it to finish (do not interrupt
+    it). Absolute rules: you MUST NEVER run any git command, never commit, never
+    create, edit or delete any file other than notes.tmp, never read any other
+    file, never run go build or go test, and never run any command other than
+    the exact echo ... >> notes.tmp and sleep 500 commands listed above. When
+    the sleep 500 has finished, your very final message must consist of exactly
+    the single word: DONE
   workspace:
     repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial

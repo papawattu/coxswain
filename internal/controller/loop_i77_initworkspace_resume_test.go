@@ -104,7 +104,7 @@ var _ = Describe("I77: init-workspace skips a completed clone and keeps agent wo
 		var err error
 		i77Work, err = os.MkdirTemp("", "i77-initws-*")
 		Expect(err).NotTo(HaveOccurred())
-		defer os.RemoveAll(i77Work)
+		defer func() { _ = os.RemoveAll(i77Work) }() //nolint:errcheck // best-effort cleanup
 		i77Dest = filepath.Join(i77Work, "workspace")
 		Expect(os.MkdirAll(i77Dest, 0o755)).To(Succeed())
 		i77BareRepo, i77BareHead, err = i73SetupBareRepo(i77Work)
@@ -207,7 +207,7 @@ var _ = Describe("I77: interrupted first run (no success marker) still gets the 
 		var err error
 		i77Work, err = os.MkdirTemp("", "i77-interrupted-*")
 		Expect(err).NotTo(HaveOccurred())
-		defer os.RemoveAll(i77Work)
+		defer func() { _ = os.RemoveAll(i77Work) }() //nolint:errcheck // best-effort cleanup
 		i77Dest = filepath.Join(i77Work, "workspace")
 		Expect(os.MkdirAll(i77Dest, 0o755)).To(Succeed())
 		i77BareRepo, i77BareHead, err = i73SetupBareRepo(i77Work)

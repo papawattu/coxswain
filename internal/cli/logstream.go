@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // kubectlLogStreamer is the real LogStreamer: it shells out to `kubectl logs`
@@ -17,8 +18,15 @@ type kubectlLogStreamer struct {
 }
 
 // Stream runs `kubectl logs` for the component's pod and writes to
-// os.Stdout. The follow flag adds -f.
+// os.Stdout. The follow flag adds -f. For the verify component, the verify
+// Job pod has multiple containers (a noop main + check-N acceptance-check
+// containers); the meaningful output is in the check-N containers, so Stream
+// resolves the verify pod and streams its check-N containers (the pure
+// logArgs covers the selector; this adds the container selection).
 func (k *kubectlLogStreamer) Stream(ctx context.Context, loop, component string) error {
+	if component == compVerify {
+		return k.streamVerifyContainers(ctx, loop)
+	}
 	args := logArgs(k.ns, loop, component, k.follow, k.tail)
 	if len(args) == 0 {
 		return fmt.Errorf("cli: unknown component %q", component)
@@ -27,6 +35,57 @@ func (k *kubectlLogStreamer) Stream(ctx context.Context, loop, component string)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// streamVerifyContainers streams the verify Job pod's check-N containers (the
+// acceptance checks' output). The verify pod's main (noop) container is empty;
+// the checks run in check-N. It resolves the verify pod by the
+// coxswain.io/verify-for label and streams each check-N container.
+func (k *kubectlLogStreamer) streamVerifyContainers(ctx context.Context, loop string) error {
+	nsArgs := kubeFlagArgs(k.ns)
+	// Find the verify pod (the verify-for label is on the Job's pod).
+	podName, err := kubectlOutput(ctx, append(nsArgs, "get", "pod", "-l", verifyForLabel+"="+loop,
+		"-o", "jsonpath={.items[0].metadata.name}"))
+	podName = strings.TrimSpace(podName)
+	if err != nil || podName == "" {
+		// The verify pod is not present (the Job has not run yet, or the Loop is
+		// past Verifying and it was cleaned up). An empty log is the no-verify case.
+		return nil
+	}
+	// Enumerate the pod's containers and pick the check-N ones. The verify Job's
+	// acceptance checks run in init containers (check-0, check-1, ...); the main
+	// container (noop) is empty.
+	containers, err := kubectlOutput(ctx, append(nsArgs, "get", "pod", podName,
+		"-o", "jsonpath={.spec.initContainers[*].name}"))
+	if err != nil {
+		return fmt.Errorf("cli: could not list the verify pod's containers: %w", err)
+	}
+	streamed := false
+	fields := strings.FieldsSeq(containers)
+	for name := range fields {
+		if !strings.HasPrefix(name, "check-") {
+			continue
+		}
+		args := append(append([]string{}, nsArgs...), "logs", podName, "-c", name)
+		if k.tail > 0 {
+			args = append(args, "--tail", fmt.Sprintf("%d", k.tail))
+		}
+		cmd := exec.CommandContext(ctx, "kubectl", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		_ = cmd.Run() // a missing/empty check container is not an error
+		streamed = true
+	}
+	if !streamed {
+		// No check-N containers (the verify pod has not run its checks yet); fall
+		// back to the default container so the caller gets something.
+		args := logArgs(k.ns, loop, compVerify, k.follow, k.tail)
+		cmd := exec.CommandContext(ctx, "kubectl", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+	return nil
 }
 
 // logArgs builds the `kubectl logs` argument list for a component. It is a
@@ -84,6 +143,20 @@ const (
 	verifyForLabel  = "coxswain.io/verify-for"
 	deliverForLabel = "coxswain.io/deliver-for"
 )
+
+// kubectlOutput runs a kubectl subcommand and returns its stdout (for reading
+// pod names / container lists; the logs stream itself uses exec directly).
+func kubectlOutput(ctx context.Context, args []string) (string, error) {
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return string(out), fmt.Errorf("%s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return string(out), err
+	}
+	return string(out), nil
+}
 
 // VerifyForLabel / DeliverForLabel are the exported forms of the mirrored
 // label keys, so a cross-package spec in the controller package can assert

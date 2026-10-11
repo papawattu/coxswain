@@ -106,6 +106,6 @@ func NewDeps() (Deps, error) {
 	return Deps{
 		Loops:     &dynamicLoopClient{ns: ns, c: dc},
 		Logs:      &kubectlLogStreamer{ns: ns},
-		Workspace: &peekWorkspaceReader{ns: ns},
+		Workspace: &peekWorkspaceReader{ns: ns, Loops: &dynamicLoopClient{ns: ns, c: dc}},
 	}, nil
 }

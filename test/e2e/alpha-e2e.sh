@@ -743,8 +743,8 @@ collect_evidence() { # <loop> <tag>
 	cox describe "$loop" >"$d/cox-describe.log" 2>&1 || true
 	cox plan "$loop" >"$d/cox-plan.log" 2>&1 || true
 	cox history "$loop" >"$d/cox-history.log" 2>&1 || true
-	cox logs "$loop" agent >"$d/cox-logs-agent.log" 2>&1 || true
-	cox logs "$loop" deliver >"$d/cox-logs-deliver.log" 2>&1 || true
+	cox logs "$loop" --component agent >"$d/cox-logs-agent.log" 2>&1 || true
+	cox logs "$loop" --component deliver >"$d/cox-logs-deliver.log" 2>&1 || true
 	log evidence "$loop: evidence kept in $d (loop.json, events, pods, operator logs, cox describe/plan/history/logs)"
 }
 
@@ -1149,17 +1149,27 @@ log kill "RESUMED to Succeeded on the SAME workspace PVC (uid $PVC_UID unchanged
 # kill-phase.log, kill-delete.log). The deliver Job for this Loop also runs
 # (it reached Succeeded) — a second first-time PR on a DIFFERENT I81 branch
 # (the branch is unique per Loop instance, so no collision with the main PR).
+# Bounded wait for Delivered=True (at least 600 × 4s = 2400s): the deliver
+# Job's init containers (clone-base, import-agent) need the egress proxy to
+# be Ready, and the push container needs to clone, commit, and push. A
+# mid-Implementing kill can leave the deliver Job in PodInitializing if the
+# egress proxy was re-created at the same time as the Job.
+DELIVER_CAP=${DELIVER_CAP:-2400}
 i=0
 while :; do
 	dstate=$(delivered_state "$KILL_LOOP")
 	case "$dstate" in
 	True* ) break ;;
-	False* ) log kill "note: $KILL_LOOP delivery failed ($dstate) — the resume itself succeeded (Succeeded on the same PVC); the delivery is a separate concern" ; break ;;
+	False*DeliveryFailed* ) collect_evidence "$KILL_LOOP" kill-delivery-failed; die "gate case 2 DELIVERY FAILED: $KILL_LOOP delivery failed ($dstate) — the resume succeeded (Succeeded on the same PVC) but the deliver Job did not complete; see $EVIDENCE/kill-delivery-failed" ;;
 	*) : ;;
 	esac
-	i=$((i + 5)); [ "$i" -gt "$PR_CAP" ] && { log kill "note: $KILL_LOOP not delivered in ${PR_CAP}s (the Succeeded outcome is the gate case 2 evidence)"; break; }
-	sleep 5
+	i=$((i + 4)); [ "$i" -gt "$DELIVER_CAP" ] && { collect_evidence "$KILL_LOOP" kill-delivery-timeout; die "gate case 2 DELIVERY TIMEOUT: $KILL_LOOP not Delivered=True in ${DELIVER_CAP}s (last state: $dstate) — see $EVIDENCE/kill-delivery-timeout"; }
+	sleep 4
 done
+KILL_DELIVERED_STATE=$(delivered_state "$KILL_LOOP")
+KILL_PR_URL=$(echo "$KILL_DELIVERED_STATE" | awk '{print $4}')
+log kill "gate case 2: $KILL_LOOP Delivered=True (PR: $KILL_PR_URL)"
+[ -n "$KILL_PR_URL" ] || { collect_evidence "$KILL_LOOP" kill-no-pr-url; die "gate case 2 DELIVERY NO PR URL: $KILL_LOOP Delivered=True but no PR URL in status.delivery ($KILL_DELIVERED_STATE)"; }
 collect_evidence "$KILL_LOOP" kill
 log kill "gate case 2 evidence: $EVIDENCE/kill/ (kill.txt, the live agent stream, the phase trail, the PVC UID continuity)"
 kc -n "$NS" delete loop "$KILL_LOOP" --wait=false >/dev/null 2>&1 || true

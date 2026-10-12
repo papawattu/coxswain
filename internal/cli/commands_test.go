@@ -238,3 +238,29 @@ func TestRedeliver_SetsAnnotation(t *testing.T) {
 		t.Errorf("redeliver output should mention the annotation, got %q", out)
 	}
 }
+
+// TestRedeliver_FailedDeliveryMessage (I82): a Loop whose delivery failed has
+// no status.delivery map, but the Delivered condition carries status=False
+// reason=DeliveryFailed. The redeliver message must print the condition's
+// reason, not 'status.delivery is nil'.
+func TestRedeliver_FailedDeliveryMessage(t *testing.T) {
+	l := makeLoop("Succeeded", 1)
+	// No status.delivery (the map is only set on a successful delivery).
+	unstructuredSet(l, "conditions", []any{
+		map[string]any{"type": "Delivered", "status": "False", "reason": "DeliveryFailed", "message": "deliver Job failed"},
+	})
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+
+	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+		return redeliverLoop(ctx, dc, ns, name, out)
+	}, "loop1")
+
+	if strings.Contains(out, "status.delivery is nil") {
+		t.Errorf("redeliver output must not say 'status.delivery is nil' for a failed delivery, got %q", out)
+	}
+	if !strings.Contains(out, "DeliveryFailed") {
+		t.Errorf("redeliver output should mention the DeliveryFailed reason, got %q", out)
+	}
+}

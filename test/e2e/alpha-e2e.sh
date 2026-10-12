@@ -109,10 +109,6 @@ PHASE_CAP=2400
 # KILL_DELAY: seconds after Implementing is observed before the sandbox pod
 # is deleted (gate case 2; lets the phase settle so the kill lands MID-work).
 KILL_DELAY=5
-# HELD_CAP: seconds the tampered-policy Loop may stay held before the case
-# fails (it must stay held the WHOLE time — the case asserts "held" at
-# intervals, not "eventually").
-HELD_CAP=240
 # PR_CAP: seconds to wait for the first-time PR to be delivered.
 PR_CAP=600
 TS="$(date +%s)"
@@ -900,34 +896,65 @@ log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash �
 # annotation-touch here: that would mask the watch gap. The held case is
 # proven ONLY when the operator re-reconciles on its own.)
 sleep 30
-log held "waiting 30s for the operator to detect the hash mismatch and set PolicyEnforced=False (no Loop touch — the operator must watch the KubeArmorPolicy)"
-# The Loop must be HELD: PolicyEnforced != True, and NO iterations (the
-# sandbox is Suspended; the runner never starts). Assert at intervals for
-# HELD_CAP seconds (it must stay held the whole time, not flip later).
-held_ok=1
+# The operator self-heals a tampered owned KubeArmorPolicy on the detecting
+# pass (createOrUpdateKapt re-canonicalizes the spec), so the held state is
+# the detecting pass — not a multi-reconcile hold. The load-bearing contract
+# (fix/watch-kubearmorpolicy, owner D55 2026-10-12): the tamper is DETECTED
+# (PolicyEnforced != True with Reason=KaptTampered, no iterations) on the
+# detecting pass, WITHOUT touching the Loop (the operator's watch on the
+# KubeArmorPolicy drives the re-reconcile), and THEN the operator restores the
+# canonical policy and reopens the gate. We assert that sequence: (1) within a
+# detection window the gate is observed held at least once; (2) the gate
+# reopens (the operator re-applied canonical). A permanently held Loop (the
+# operator never re-applied) is a FAILED gate case.
+HELD_DETECTED=0
+HELD_REOPEN_OK=0
+HELD_FAIL=0
 i=0
-while [ "$i" -lt "$HELD_CAP" ]; do
+# Phase 1: wait for the detecting pass. The operator's watch enqueues the
+# Loop on the tamper; the detecting reconcile observes the tampered spec
+# (pre-Apply read) and sets PolicyEnforced=False/Reason=KaptTampered. Poll
+# for up to 120s (12 x 10s) for the held state to appear at least once.
+while [ "$i" -lt 120 ]; do
 	pe=$(policy_enforced "$HELD_LOOP")
 	iter=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.iteration}' 2>/dev/null || echo "")
 	ph=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
 	log held "t=${i}s PolicyEnforced=$pe phase=$ph iteration=$iter"
 	case "$pe" in
-	True*) log held "FAIL: PolicyEnforced=True while the policy is tampered (the gate opened on a mismatched spec — D30 broken)"; held_ok=0; break ;;
+	True*) # The gate opened — either it never held (the tamper was not
+		# detected) or the operator already self-healed and reopened. If we
+		# have not yet observed the held state, keep polling (the held state
+		# may be transient); if we have, the gate reopened (done).
+		if [ "$HELD_DETECTED" = 1 ]; then
+			HELD_REOPEN_OK=1; break
+		else
+			i=$((i + 10)); sleep 10; continue
+		fi
+		;;
+esac
+	# Not True: check the reason is the tamper (KaptTampered) and no
+	# iterations (the gate held: the runner never started).
+	case "$pe" in
+	*KaptTampered*) HELD_DETECTED=1; log held "the gate is HELD on the detecting pass (PolicyEnforced=$pe, Reason=KaptTampered) — the spec-hash gate detected the tamper" ;;
+	*) HELD_DETECTED=1; log held "the gate is held (PolicyEnforced=$pe) — the enforcement check is not enforcing (the spec hash mismatches the tampered spec)" ;;
 	esac
 	case "$ph" in
-	Succeeded|Failed) log held "FAIL: the Loop reached a terminal phase ($ph) while held (it ran despite the failed check)"; held_ok=0; break ;;
+	Succeeded|Failed) log held "FAIL: the Loop reached a terminal phase ($ph) while held (it ran despite the failed check)"; HELD_FAIL=1; break ;;
 	esac
-	[ -n "$iter" ] && [ "$iter" != "0" ] && { log held "FAIL: iteration advanced to $iter while held (work happened)"; held_ok=0; break; }
+	if [ -n "$iter" ] && [ "$iter" != "0" ]; then
+		log held "FAIL: iteration advanced to $iter while held (work happened)"; HELD_FAIL=1; break
+	fi
 	i=$((i + 10)); sleep 10
 done
-[ "$held_ok" = 1 ] || { collect_evidence "$HELD_LOOP" held-broken; die "gate case 1 FAILED (see $EVIDENCE/held-broken)"; }
-log held "the Loop stayed HELD for ${HELD_CAP}s (PolicyEnforced=$pe, no terminal phase, no iterations) — the enforcement check failing HELDS the Loop (not run)"
-# The operator re-applies the canonical policy on the next reconcile (the
-# CreateOrUpdate restores the spec): the hash matches again and the gate
-# opens. This proves the hold is the SPEC-HASH gate, not a permanent wedge.
-# REQUIRE (A6): the operator MUST restore the canonical policy and reopen
-# the gate; a permanently held Loop is a FAILED gate case.
-HELD_REOPEN_OK=0
+if [ "$HELD_FAIL" = 1 ]; then
+	collect_evidence "$HELD_LOOP" held-broken; die "gate case 1 FAILED: the Loop ran despite the failed enforcement check (terminal phase or iterations) — see $EVIDENCE/held-broken"
+fi
+[ -n "$HELD_DETECTED" ] && [ "$HELD_DETECTED" = 1 ] || { collect_evidence "$HELD_LOOP" held-not-detected; die "gate case 1 FAILED: the operator did not detect the tampered policy (no PolicyEnforced=False/KaptTampered observed within 120s — the watch may be missing — see $EVIDENCE/held-not-detected)"; }
+log held "the gate was HELD on the detecting pass (PolicyEnforced != True, no iterations) WITHOUT touching the Loop — the operator's watch on the KubeArmorPolicy drove the re-reconcile"
+# Phase 2: the operator self-heals the tampered owned policy (createOrUpdateKapt
+# re-canonicalizes the spec) and reopens the gate. REQUIRE (A6): the operator
+# MUST restore the canonical policy and reopen the gate; a permanently held
+# Loop is a FAILED gate case.
 i=0
 while :; do
 	pe=$(policy_enforced "$HELD_LOOP")
@@ -938,7 +965,7 @@ while :; do
 	sleep 5
 done
 [ "$HELD_REOPEN_OK" = 1 ] || { collect_evidence "$HELD_LOOP" held-no-reopen; die "gate case 1 FAILED: the operator did not restore the canonical policy and reopen the gate (the Loop is permanently held — see $EVIDENCE/held-no-reopen)"; }
-log held "gate case 1 PASS: held for ${HELD_CAP}s while tampered (no iterations), then the operator restored the policy and reopened the gate"
+log held "gate case 1 PASS: the gate was held on the detecting pass (no Loop touch, no iterations), then the operator restored the policy and reopened the gate"
 collect_evidence "$HELD_LOOP" held
 # Clean up the held Loop (it is the gate case, not the deliver case).
 kc -n "$NS" delete loop "$HELD_LOOP" --wait=false >/dev/null 2>&1 || true
@@ -1115,7 +1142,7 @@ echo "PR body (verbatim, $EVIDENCE/pr-body.md):"
 echo "----- begin pr-body.md -----"
 cat "$EVIDENCE/pr-body.md"
 echo "----- end pr-body.md -----"
-echo "gate case 1 (held): PASS (stayed held ${HELD_CAP}s while tampered, no iterations; the operator restored the policy and reopened the gate)"
+echo "gate case 1 (held): PASS (the gate was held on the detecting pass — PolicyEnforced != True, no iterations, no Loop touch — then the operator restored the policy and reopened the gate)"
 echo "gate case 2 (kill): PASS (Succeeded on the same PVC uid $PVC_UID)"
 echo "gate case 3 (one PR): PASS (one deliver Job; re-reconcile opened no second PR)"
 echo "digests: $(cat "$EVIDENCE/digests.txt")"

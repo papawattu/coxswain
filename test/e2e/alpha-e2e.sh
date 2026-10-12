@@ -879,12 +879,12 @@ spec = canon.get("spec", {})
 # different value. The canonical spec has no severity (or a default); setting
 # it to "High" (a valid KubeArmor severity) changes the spec hash without
 # breaking the schema.
-spec["severity"] = "High"
+spec["severity"] = 5
 canon["spec"] = spec
 out = json.dumps(canon)
 subprocess.run(["kubectl", "--context", "kind-coxswain-alpha", "-n", "alpha-e2e",
                 "apply", "-f", "-"], input=out.encode(), check=True)
-print(f"a6: tampered KubeArmorPolicy {name} (spec.severity=High)")
+print(f"a6: tampered KubeArmorPolicy {name} (spec.severity=5)")
 PYEOF
 log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash — A1 fact 3 fails)"
 # The Loop must be HELD: PolicyEnforced != True, and NO iterations (the

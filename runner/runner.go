@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -61,8 +62,19 @@ const (
 
 	// I11: default per-model-request timeout (was a hard 60s, too short for a
 	// local 27B-class model or a long-context request). Overridable via
-	// runConfig.ModelTimeout.
-	defaultModelTimeout = 10 * time.Minute
+	// runConfig.ModelTimeout. I89: reduced from 10 minutes to 120 seconds so a
+	// hung model call does not hold the Loop hostage for the full timeout;
+	// bounded retry with backoff (defaultModelRetries) absorbs transient
+	// slowness without a 10-minute wait.
+	defaultModelTimeout = 120 * time.Second
+
+	// I89: bounded retry for a model request that times out or returns a
+	// transport error. The backoff is exponential with a base of
+	// defaultModelRetryBackoff (2s), so the worst-case total wait for the
+	// default (3 retries) is 120s * 3 + 2s + 4s = 370s, well under the old
+	// 10-minute single-shot timeout.
+	defaultModelRetries      = 3
+	defaultModelRetryBackoff = 2 * time.Second
 
 	// I10: how long Wait tolerates pipes held open by straggler processes after
 	// the command's main process exits, before it stops waiting on them.
@@ -300,6 +312,13 @@ func run(cfg runConfig) Result {
 // callModel posts one chat-completions request and returns the assistant
 // message (with any tool calls). The request always advertises the runner's
 // tools (I1) so a real model can emit a shell tool call.
+// isTimeoutError reports whether err is a context deadline exceeded (the
+// model call timed out). A non-timeout error (HTTP 500, connection refused,
+// bad request) is definitive and should not be retried (I89).
+func isTimeoutError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
 func callModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []chatMessage,
 	extraBody map[string]any,
@@ -497,12 +516,46 @@ func driveModel(
 
 	for step := range maxSteps {
 		// I11: bound each model request with modelTimeout, derived from the
-		// caller's ctx so a run deadline can still cancel it.
-		reqCtx, cancel := context.WithTimeout(ctx, modelTimeout)
-		msg, err := callModel(reqCtx, client, baseURL, apiKey, model, messages, extraBody)
-		cancel()
-		if err != nil {
-			return "", append(trace, "call model: "+err.Error()), err.Error()
+		// caller's ctx so a run deadline can still cancel it. I89: bounded
+		// retry with exponential backoff — a hung model call (context deadline
+		// exceeded) is retried up to defaultModelRetries times before the
+		// runner surfaces ModelUnavailable and exits (the kubelet restarts
+		// the container; the operator's stall gate fires after repeated
+		// failures). A non-timeout error (HTTP 500, bad request) is NOT
+		// retried: the server responded, and the error is definitive.
+		var msg assistantMessage
+		var modelErr error
+		for attempt := range defaultModelRetries + 1 { // 0..defaultModelRetries (inclusive)
+			reqCtx, cancel := context.WithTimeout(ctx, modelTimeout)
+			m, err := callModel(reqCtx, client, baseURL, apiKey, model, messages, extraBody)
+			cancel()
+			if err == nil {
+				msg = m
+				modelErr = nil
+				break
+			}
+			modelErr = err
+			// Only retry on a timeout (context deadline exceeded). A non-
+			// timeout error (HTTP 500, connection refused) is definitive.
+			if !isTimeoutError(err) || attempt >= defaultModelRetries {
+				break
+			}
+			backoff := defaultModelRetryBackoff << uint(attempt) // 2s, 4s, 8s, ...
+			msg := "call model: retry " + strconv.Itoa(attempt+1) +
+				" after " + err.Error() + " (backoff " + backoff.String() + ")"
+			trace = append(trace, msg)
+			select {
+			case <-ctx.Done():
+				return "", append(trace, "call model: context cancelled"), "context cancelled"
+			case <-time.After(backoff):
+			}
+		}
+		if modelErr != nil {
+			// I89: all retries exhausted (or a non-retryable error). The
+			// message carries ModelUnavailable so the operator (or the
+			// termination log) can surface the reason.
+			errMsg := "ModelUnavailable: " + modelErr.Error()
+			return "", append(trace, "call model: "+errMsg), errMsg
 		}
 
 		// No tool calls → the model is done; its content is the final answer.

@@ -40,12 +40,12 @@ import (
 	"github.com/papawattu/coxswain/internal/engine"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"k8s.io/client-go/kubernetes/scheme"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 // captureLogger is a minimal logr.LogSink that records every log message (as
@@ -59,7 +59,7 @@ type captureLogger struct {
 }
 
 func (c *captureLogger) Init(info logr.RuntimeInfo) {}
-func (c *captureLogger) Enabled(level int) bool       { return true }
+func (c *captureLogger) Enabled(level int) bool     { return true }
 func (c *captureLogger) Info(level int, msg string, kv ...any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -70,7 +70,7 @@ func (c *captureLogger) Error(err error, msg string, kv ...any) {
 	defer c.mu.Unlock()
 	*c.entries = append(*c.entries, msg+" | "+err.Error())
 }
-func (c *captureLogger) VLevel(level int) logr.LogSink { return c }
+func (c *captureLogger) VLevel(level int) logr.LogSink     { return c }
 func (c *captureLogger) WithValues(kv ...any) logr.LogSink { return c }
 func (c *captureLogger) WithName(name string) logr.LogSink { return c }
 
@@ -203,7 +203,7 @@ var _ = Describe("KubeArmorPolicy watch is CRD-gated (PR #129, P1)", func() {
 		// the log assertion below is the load-bearing check.)
 		select {
 		case err := <-startErr:
-			Expect(err).To(BeNil(), "mgr.Start must not return a broken-source error")
+			Expect(err).ToNot(HaveOccurred(), "mgr.Start must not return a broken-source error")
 		case <-time.After(10 * time.Second):
 			Fail("mgr.Start did not return after the context was cancelled")
 		}

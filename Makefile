@@ -131,6 +131,10 @@ lint: golangci-lint ## Run golangci-lint linter
 	@command -v shellcheck >/dev/null 2>&1 || { echo "Error: shellcheck is not installed (apt install shellcheck)"; exit 1; }
 	@for f in hack/*.sh; do echo "shellcheck $$f"; shellcheck "$$f"; done
 
+.PHONY: github-secret-test
+github-secret-test: ## D55: execution test for hack/github-secret.sh (stub kubectl + fake token; never the real token file).
+	@bash hack/github-secret.test.sh
+
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	"$(GOLANGCI_LINT)" run --fix

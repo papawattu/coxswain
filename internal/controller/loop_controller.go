@@ -569,7 +569,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// observability only. The iterate/terminal branches (Verifying ->
 	// Implementing / Failed) are completed by B3 (verify outcome) and B4
 	// (iteration count). See internal/controller/loop_s4_phase.go.
-	claimReadPending, s4Changed := r.advancePhaseFromClaim(ctx, &loop)
+	claimReadPending, s4Changed, advancedFrom := r.advancePhaseFromClaim(ctx, &loop)
 	changed = changed || s4Changed // S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
 	// isolated evidence path). The Job is created when the current pin exists
 	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
@@ -692,7 +692,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// keep decision was an in-memory annotation on the Loop, then an early
 	// return that skipped the whole finalize; both were wrong — the I61 risk
 	// and the P1 review on #100.)
-	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep); err != nil {
+	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -720,10 +720,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // defeat optimistic concurrency (it can silently overwrite status another
 // writer just set). Extracted so the top-level reconcile stays within the
 // gocyclo budget.
-func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared, redeliverKeep bool) error {
+// finalizeLoopStatus persists the reconcile's status changes (the trailing
+// Status().Update), and — when a phase advance was committed this pass
+// (advancedFrom != "") — emits the PhaseAdvanced Event AFTER the status update
+// succeeds (I83: the event is emitted only when the advance is persisted, so a
+// Conflict on the status update cannot double-emit it on the requeue).
+func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared, redeliverKeep bool, advancedFrom coxv1alpha1.LoopPhase) error {
 	if changed || conditionsChanged {
 		if err := r.Status().Update(ctx, loop); err != nil {
 			return err
+		}
+		// I83: emit the PhaseAdvanced Event only now, after the status update
+		// persisted the advance. A Conflict on the status update returns the
+		// error above (the event is NOT emitted); the requeue re-processes the
+		// claim and emits the event exactly once when the update succeeds.
+		if advancedFrom != "" {
+			r.emitPhaseAdvancedEvent(loop, advancedFrom)
 		}
 	}
 	// P2f: after a valid resume, patch the coxswain.io/resume annotation off

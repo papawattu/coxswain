@@ -174,9 +174,14 @@ proxy's own code, the same accepted limitation as the D50 DNS-fence note).
 D38 network gate with this flag on a kindnet cluster — "the network gate was
 not exercised: A6 ran with `--allow-unenforced-network`, labelled as the
 escape hatch. See Q2." (`docs/REVIEW-PHASE1-R26.md`). That open question (R26
-Q2) is now answered by D57 (see above). For an enforcing-CNI configuration
-see `config/calico/kustomization.yaml` (it sets `--allow-unenforced` only, so
-the D38 network gate stays live).
+Q2) is now answered by D57 (see above). Note: `config/calico/kustomization.yaml`
+is the **D38 test profile** — Calico without KubeArmor, so it sets
+`--allow-unenforced` to keep the operator from holding Loops on the KubeArmor
+policy while the CNI enforcement is tested. It is **not a supported
+configuration**: that `--allow-unenforced` disables the KubeArmor policy gate
+that D57 makes required. A supported enforcing setup is **Calico plus
+KubeArmor, with neither flag** (`--allow-unenforced` nor
+`--allow-unenforced-network`).
 
 ## A Loop stuck in Implementing with no model traffic
 

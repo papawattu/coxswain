@@ -51,7 +51,7 @@ restart durability (A2) and `kubectl cox` (A3).
 
 ### I81. A Loop whose name was used before can never deliver
 
-- [ ] Open (design)
+- [x] Open (design) — 213dacf
 
 **Where:** the deliver Job's push (`internal/controller/loop_deliver_job.go`),
 which pushes to the branch `coxswain/<loop>`.

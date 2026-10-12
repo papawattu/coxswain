@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # A5 (PLAN-ALPHA): render dist/install.yaml with EVERY coxswain ghcr image
 # tagged from IMG. The release workflow (.github/workflows/release.yml)
-# packages ghcr.io/<owner>/coxswain-{controller,runner,model-proxy,tool-proxy};
-# this renders install.yaml so the manager container image AND the
-# --runner-image / --proxy-image / --tool-proxy-image args all carry the SAME
-# tag as IMG (no controller:latest, no :standin).
+# packages ghcr.io/<owner>/coxswain-{controller,runner,model-proxy,egress-
+# proxy,tool-proxy}; this renders install.yaml so the manager container image
+# AND the --runner-image / --proxy-image / --tool-proxy-image / --egress-proxy
+# -image args all carry the SAME tag as IMG (no controller:latest, no :standin).
 #
 # It renders in a TEMP overlay (never the working tree) so the working tree is
 # left clean: kustomize v5.8.1 has no `build --images`, so a temp copy +
@@ -14,10 +14,10 @@
 # Usage: IMG=ghcr.io/<owner>/coxswain-controller:<tag> \
 #        KUSTOMIZE=<path> hack/build-installer.sh
 #
-# The three ghcr arg image names are hardcoded to the release workflow's
+# The five ghcr arg image names are hardcoded to the release workflow's
 # public prefix (papawattu/coxswain-*); only the TAG is derived from IMG.
-# The egress proxy has no manager flag (cmd/main.go: --egress-proxy-image does
-# not exist), so only the three flags that exist are tagged.
+# The args are APPENDED (JSON6902 op: add to /spec/.../args/-) so the base
+# args are preserved (P1-1).
 set -euo pipefail
 
 # I51: fail unless IMG is set (the in-tree require-img.sh already runs in the
@@ -41,18 +41,17 @@ trap 'rm -rf "$OVERLAY"' EXIT
 
 cp -r "$ROOT/config" "$OVERLAY/config"
 
-# Add the three ghcr image args (derived from IMG's tag) to the manager
-# container via a strategic-merge patch. Rendered from the tree template with
-# sed (a heredoc cannot appear inside a Makefile recipe line).
+# Add the five ghcr image args (derived from IMG's tag) to the manager
+# container via a JSON6902 patch (op: add, one per flag, appended to the args
+# list so the base args survive). Rendered from the tree template with sed (a
+# heredoc cannot appear inside a Makefile recipe line).
 sed -e "s|__TAG__|$TAG|g" "$ROOT/hack/install-args.patch.tpl" \
 	> "$OVERLAY/config/manager/install-args.patch.yaml"
 
-# Wire the patch into the overlay's manager kustomization. Remove any existing
-# `patches:` block from the copied kustomization (the in-tree file has none;
-# this makes a re-run / dirty copy idempotent), then append ours.
+# Wire the JSON6902 patch into the overlay's manager kustomization. Remove any
+# existing `patches:` block from the copied kustomization (the in-tree file has
+# none; this makes a re-run / dirty copy idempotent), then append ours.
 sed -i '/^patches:$/d' "$OVERLAY/config/manager/kustomization.yaml" 2>/dev/null || true
-# Drop any dangling `- path:` continuation lines from a removed block (none in
-# the clean in-tree file; belt-and-suspenders for idempotency).
 printf '\npatches:\n- path: install-args.patch.yaml\n  target:\n    kind: Deployment\n' \
 	>> "$OVERLAY/config/manager/kustomization.yaml"
 

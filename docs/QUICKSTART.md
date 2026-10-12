@@ -13,7 +13,8 @@ is Phase 7 work). A `v*` release tag publishes the public images and the
 Coxswain needs three things on the cluster. Dev/CI pins **k8s 1.34**
 (`kindest/node:v1.34.0`; `KIND_NODE_IMAGE` in the Makefile) — a cluster that
 runs the alpha is expected to be at least that. The production floor is
-k8s ≥ 1.37 (an agent-sandbox requirement, D5).
+expected to be higher than the dev pin (see `docs/PLAN.md` for the tracked
+requirement), so use a recent stable Kubernetes.
 
 ### agent-sandbox
 
@@ -51,10 +52,12 @@ KubeArmor).
 
 Fetch the release's `install.yaml` and apply it. It installs the controller
 into the `coxswain-system` namespace (the manifest is namespaced + prefixed
-`coxswain-`). From a release tag (replace `v1.0.0` with the tag you want):
+`coxswain-`). From a release tag (the alphas are prereleases — GitHub's
+`releases/latest` skips them, so pin the tag; the first alpha release is
+`v0.1.0-alpha.1`):
 
 ```sh
-curl -sfL "https://github.com/papawattu/coxswain/releases/download/v1.0.0/install.yaml" \
+curl -sfL "https://github.com/papawattu/coxswain/releases/download/v0.1.0-alpha.1/install.yaml" \
   -o install.yaml
 kubectl apply -f install.yaml
 kubectl rollout status deploy/coxswain-controller-manager -n coxswain-system

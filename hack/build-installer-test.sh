@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # A5 execution test: render dist/install.yaml via the REAL build-installer
 # script for a given tag and assert EVERY coxswain image in it carries that
-# tag (no controller:latest, no :standin, no dev tag). Runs the real
+# tag (no :standin, no :dev, no :latest, no untagged). Runs the real
 # hack/build-installer.sh (temp overlay, kustomize v5.8.1) against a temp
 # kustomize so the working tree's dist/ is untouched.
 #
-# Asserts, for the manager Deployment in the rendered install.yaml:
+# Asserts, for the rendered install.yaml:
 #   1. the manager container image is <controller-with-tag>;
 #   2. --runner-image is ghcr.io/<prefix>/coxswain-runner:<tag>;
 #   3. --proxy-image is ghcr.io/<prefix>/coxswain-model-proxy:<tag>;
 #   4. --tool-proxy-image is ghcr.io/<prefix>/coxswain-tool-proxy:<tag>;
-#   5. no coxswain-* image in the file is :latest, :standin, or an untagged
-#      dev image (the assertion is on the coxswain component images, not
+#   5. --egress-proxy-image is ghcr.io/<prefix>/coxswain-egress-proxy:<tag>;
+#   6. the manager's BASE args are still present (P1-1: the patch must
+#      APPEND, not replace, the container args — a strategic-merge patch on
+#      args would drop --health-probe-bind-address and crash-loop the operator);
+#   7. no coxswain-* image in the file is :standin, :dev, :latest, or an
+#      untagged dev image (scoped to coxswain component images, not
 #      third-party images like python:3-alpine in the cni-probe).
 #
 # Usage: KUSTOMIZE=<path> [TAG=<tag>] [PREFIX=<prefix>] hack/build-installer-test.sh
@@ -44,32 +48,43 @@ KUSTOMIZE="$KUSTOMIZE" IMG="ghcr.io/$PREFIX/coxswain-controller:$TAG" bash "$TMP
 OUT="$TMP/dist/install.yaml"
 [ -s "$OUT" ] || { echo "FATAL: no rendered install.yaml produced"; exit 1; }
 
-# Isolate the manager Deployment (the first Deployment kind, which is the
-# controller-manager). Everything after it is still part of the default build
-# until the cni-probe append; we grep the whole file for the four assertions.
-#
 # 1. manager container image carries the tag.
 want_img="ghcr.io/$PREFIX/coxswain-controller:$TAG"
 [ "$(grep -c "image: $want_img" "$OUT")" -ge 1 ] \
 	|| { echo "FATAL: manager container image '$want_img' not found in install.yaml"; grep -n 'image: ghcr.io' "$OUT" || true; exit 1; }
 
-# 2-4. the three ghcr arg images carry the tag.
+# 2-5. the five ghcr arg images carry the tag.
 for img in \
 	"--runner-image=ghcr.io/$PREFIX/coxswain-runner:$TAG" \
 	"--proxy-image=ghcr.io/$PREFIX/coxswain-model-proxy:$TAG" \
-	"--tool-proxy-image=ghcr.io/$PREFIX/coxswain-tool-proxy:$TAG"; do
+	"--tool-proxy-image=ghcr.io/$PREFIX/coxswain-tool-proxy:$TAG" \
+	"--egress-proxy-image=ghcr.io/$PREFIX/coxswain-egress-proxy:$TAG"; do
 	[ "$(grep -Fc -- "$img" "$OUT")" -ge 1 ] \
 		|| { echo "FATAL: expected arg '$img' not found in install.yaml"; grep -n -- "$img" "$OUT" || true; exit 1; }
 done
 
-# 5. no coxswain component image is :latest, :standin, or untagged (a
-#    coxswain-* image with no ':' tag, or tagged :latest/:standin). The
-#    assertion is scoped to lines that reference a coxswain image.
+# 6. (P1-1) the manager's BASE args must still be present — the patch APPENDS
+#    to the args list, it must not replace it. Dropping --health-probe-bind-
+#    address would make the liveness/readiness probes on :8081 fail (the
+#    released operator would crash-loop); dropping --leader-elect changes HA
+#    behaviour. Assert each base arg is present.
+for base in \
+	"--metrics-bind-address=:8443" \
+	"--leader-elect" \
+	"--health-probe-bind-address=:8081"; do
+	[ "$(grep -Fc -- "$base" "$OUT")" -ge 1 ] \
+		|| { echo "FATAL: base manager arg '$base' was REPLACED/LOST by the patch (P1-1: the patch must append, not replace, the container args)"; grep -n -- "args:" "$OUT" || true; exit 1; }
+done
+
+# 7. no coxswain component image is :standin, :dev, :latest, or untagged.
+#    Scope to lines that reference a coxswain component image (the assertion
+#    is on the coxswain component images, not third-party images like
+#    python:3-alpine in the cni-probe).
 if grep -nE 'coxswain-(controller|runner|model-proxy|egress-proxy|tool-proxy)[[:space:]]*:$' "$OUT" >/dev/null; then
 	echo "FATAL: an untagged coxswain image (no tag) is present in install.yaml"; grep -nE 'coxswain-(controller|runner|model-proxy|egress-proxy|tool-proxy)[[:space:]]*:$' "$OUT"; exit 1
 fi
-if grep -nE 'coxswain-(controller|runner|model-proxy|egress-proxy|tool-proxy):(latest|standin)[[:space:]]*$' "$OUT" >/dev/null; then
-	echo "FATAL: a coxswain image tagged :latest or :standin is present in install.yaml"; grep -nE 'coxswain-(controller|runner|model-proxy|egress-proxy|tool-proxy):(latest|standin)[[:space:]]*$' "$OUT"; exit 1
+if grep -nE 'coxswain-(controller|runner|model-proxy|egress-proxy|tool-proxy):(latest|standin|dev)[[:space:]]*$' "$OUT" >/dev/null; then
+	echo "FATAL: a coxswain image tagged :latest, :standin, or :dev is present in install.yaml"; grep -nE 'coxswain-(controller|runner|model-proxy|egress-proxy|tool-proxy):(latest|standin|dev)[[:space:]]*$' "$OUT"; exit 1
 fi
 
-echo "OK: build-installer renders install.yaml with tag $TAG on all coxswain images (controller + runner + model-proxy + tool-proxy)"
+echo "OK: build-installer renders install.yaml with tag $TAG on all five coxswain images (controller + runner + model-proxy + tool-proxy + egress-proxy) and preserves the base manager args"

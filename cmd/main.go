@@ -190,6 +190,15 @@ func main() {
 		"The image the tool proxy pods run (one per tool per Loop, D41c/ADR-0008). "+
 			"Default: empty (the reconciler's coxswain-tool-proxy:standin dev stand-in; a real tool proxy image "+
 			"may be kind-loaded / pre-pulled and passed here).")
+	// A5: the egress proxy sidecar image (I42b). Default: empty (the
+	// reconciler's coxswain-egress-proxy:standin dev stand-in); a real egress
+	// proxy image (e.g. the release's ghcr.io/<owner>/coxswain-egress-proxy:<tag>)
+	// is passed here so a released install never tries to pull the stand-in.
+	var egressProxyImage string
+	flag.StringVar(&egressProxyImage, "egress-proxy-image", "",
+		"The image the egress proxy sidecar pods run (one per Loop with network allows, I42b). "+
+			"Default: empty (the reconciler's coxswain-egress-proxy:standin dev stand-in; the release's "+
+			"ghcr.io/<owner>/coxswain-egress-proxy image may be kind-loaded / pre-pulled and passed here).")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -367,6 +376,7 @@ func main() {
 		RunnerImage:            runnerImage,
 		VerifyImage:            verifyImage,
 		ToolProxyImage:         toolProxyImage,
+		EgressProxyImage:       egressProxyImage,
 		// P2b (ADR-0009): the metering model proxy image (default empty -> the
 		// reconciler's coxswain-proxy:metering) and the operator's namespace (the
 		// proxy pod's usage-port ingress source).

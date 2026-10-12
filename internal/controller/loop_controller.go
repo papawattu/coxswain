@@ -2497,8 +2497,8 @@ func (r *LoopReconciler) effectivePolicyNetwork(ctx context.Context, loop *coxv1
 }
 
 // egressProxyImage returns the egress proxy pod image. It is the reconciler's
-// EgressProxyImage field (settable in tests; a manager flag --egress-proxy-image
-// is a candidate for a future slice), or the egress proxy stand-in when unset.
+// EgressProxyImage field (set by the manager's --egress-proxy-image flag, A5),
+// or the egress proxy stand-in when unset.
 func (r *LoopReconciler) egressProxyImage() string {
 	if r.EgressProxyImage != "" {
 		return r.EgressProxyImage

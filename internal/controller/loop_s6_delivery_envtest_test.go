@@ -704,11 +704,12 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 			"a terminated push with a wrong-path prURL is terminal DeliveryFailed (not InProgress forever)")
 
 		By("accepting a VALID message: status.delivery + Delivered=True/Delivered")
-		msg := s6ValidTermination(&coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: loop.Spec.Workspace.Repo}},
-			Status:     coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit}},
-		})
+		// The termination message's branch must match the operator's delivery
+		// branch, which is <prefix><loop>-<uid8> (I81) — derived from the REAL
+		// loop's metadata.uid (set by the API at create). Use the real loop (not
+		// a fresh one without a uid) so the branch the message names is the
+		// uid-suffixed one the operator expects.
+		msg := s6ValidTermination(loop)
 		s6DeliverPod(ns, name, corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: msg},
 		})

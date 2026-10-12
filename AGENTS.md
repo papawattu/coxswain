@@ -267,8 +267,12 @@ make test       # Run unit tests
 - **Kill by PID, never `pkill -f`** (R26 I90). `pkill -f <pattern>` matches
   any process whose full command line contains the pattern, which can kill
   an unrelated process (e.g. a shell that has the pattern in its
-  arguments, or the builder's own agent process). Use `kill <pid>` or
-  `kill $(pgrep -x <name>)` instead.
+  arguments, or the builder's own agent process). Record the PID when you
+  start the process and kill that PID:
+  `cmd & pid=$!` then `kill "$pid"`. Don't use `kill $(pgrep -x <name>)`
+  — `pgrep -x` matches every process with that exact name, which can be an
+  unrelated process of the same name (the builder's own agent, a system
+  service), so the kill can hit the wrong process.
 
 ## CLI Commands Cheat Sheet
 

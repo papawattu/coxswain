@@ -47,6 +47,13 @@ SECRET_NAME="${2:-$DEFAULT_SECRET_NAME}"
 # is passed via --from-file (file contents -> the password key), never on the
 # command line and never echoed. set +x is the default (the script has no
 # 'set -x'); the manifest is piped to kubectl apply, not printed.
+#
+# D55 (owner, 2026-10-12): apply with --server-side --field-manager so that
+# NO kubectl.kubernetes.io/last-applied-configuration annotation is stored on
+# the object. The client-side apply writes that annotation, and because this
+# Secret carries the base64 GitHub token, the annotation is a SECOND copy of
+# the token on the cluster. Server-side apply with an explicit field-manager
+# records only the managed fields (no last-applied snapshot).
 # ---------------------------------------------------------------------------
 kubectl create secret generic "$SECRET_NAME" \
 	-n "$NS" \
@@ -54,4 +61,4 @@ kubectl create secret generic "$SECRET_NAME" \
 	--from-literal=username="$USERNAME" \
 	--from-file=password="$TOKEN_FILE" \
 	--dry-run=client -o yaml \
-	| kubectl apply -f -
+	| kubectl apply --server-side --field-manager=coxswain-github-secret -f -

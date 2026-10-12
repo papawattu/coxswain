@@ -435,12 +435,13 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	rm Dockerfile.cross
 
 .PHONY: build-installer
-build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+build-installer: manifests generate kustomize ## A5: render dist/install.yaml with ALL coxswain ghcr images tagged from IMG (see hack/build-installer.sh).
 	IMG="$(IMG)" TARGET=build-installer hack/require-img.sh
-	mkdir -p dist
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default > dist/install.yaml
-	"$(KUSTOMIZE)" build config/cni-probe >> dist/install.yaml
+	KUSTOMIZE="$(KUSTOMIZE)" IMG="$(IMG)" hack/build-installer.sh
+
+.PHONY: build-installer-test
+build-installer-test: kustomize ## A5: test that build-installer tags every coxswain image in install.yaml (see hack/build-installer-test.sh).
+	@KUSTOMIZE="$(KUSTOMIZE)" hack/build-installer-test.sh
 
 ##@ Deployment
 

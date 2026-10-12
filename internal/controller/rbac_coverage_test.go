@@ -34,13 +34,61 @@ import (
 // parsed role.yaml. If a new type is added to the controller, this test
 // will fail until the RBAC markers are updated and `make manifests` is run.
 const (
-	coxGroup   = "coxswain.wattu.com"
-	verbGet    = "get"
-	verbList   = "list"
-	verbWatch  = "watch"
-	verbCreate = "create"
-	verbUpdate = "update"
+	coxGroup         = "coxswain.wattu.com"
+	storageGroup     = "storage.k8s.io"
+	agentsGroup      = "agents.x-k8s.io"
+	snapshotGroup    = "snapshot.storage.k8s.io"
+	networkingGroup  = "networking.k8s.io"
+	batchGroup       = "batch"
+	coreGroup        = ""
+	verbGet          = "get"
+	verbList         = "list"
+	verbWatch        = "watch"
+	verbCreate       = "create"
+	verbUpdate       = "update"
 )
+
+// knownResourceGroup is the trusted table of resource -> its real API group,
+// derived from the Kubernetes API (the RESTMapper). It exists so the RBAC
+// coverage test can catch a rule placed under the WRONG group: the generated
+// role.yaml must grant the verbs on (group, resource) where group is the
+// resource's real group, not an arbitrary one. envtest runs as cluster-admin
+// so a wrong group is invisible there (the storageclasses B1 P1: the marker
+// and this test both said the core group "", so the test passed on the bug);
+// this table pins the group so a wrong marker (and a wrong test entry) both
+// fail.
+//
+// Only the groups the controller touches are listed. A resource NOT in the
+// table defaults to the core group "" (the K8s convention: core resources
+// live in group "").
+var knownResourceGroup = map[string]string{
+	// core (group "")
+	corePodsResource:         coreGroup,
+	"services":               coreGroup,
+	"configmaps":             coreGroup,
+	"persistentvolumeclaims": coreGroup,
+	// non-core
+	"storageclasses":          storageGroup,
+	"sandboxes":               agentsGroup,
+	"sandboxes/status":        agentsGroup,
+	"volumesnapshots":         snapshotGroup,
+	"volumesnapshotclasses":   snapshotGroup,
+	"networkpolicies":         networkingGroup,
+	"jobs":                    batchGroup,
+	"loops":                   coxGroup,
+	"loops/status":            coxGroup,
+	"loops/finalizers":        coxGroup,
+	"agentpolicies":           coxGroup,
+}
+
+// groupForResource returns the resource's real API group from the trusted
+// table, defaulting to the core group for unlisted (core) resources.
+func groupForResource(resource string) string {
+	if g, ok := knownResourceGroup[resource]; ok {
+		return g
+	}
+	return coreGroup
+}
 
 func TestRBACCoverage(t *testing.T) {
 	rolePath := filepath.Join("..", "..", "config", "rbac", "role.yaml")
@@ -96,10 +144,10 @@ func TestRBACCoverage(t *testing.T) {
 		{group: coxGroup, resource: "loops/finalizers",
 			minVerbs: []string{verbUpdate}},
 		// Owns(&Sandbox{}) — the controller creates and owns Sandboxes.
-		{group: "agents.x-k8s.io", resource: "sandboxes",
+		{group: agentsGroup, resource: "sandboxes",
 			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbUpdate}},
 		// Sandbox status (the controller reads sandbox status).
-		{group: "agents.x-k8s.io", resource: "sandboxes/status",
+		{group: agentsGroup, resource: "sandboxes/status",
 			minVerbs: []string{verbGet}},
 		// Owns(&Pod{}) — the controller creates and owns proxy Pods.
 		{group: "", resource: corePodsResource,
@@ -132,11 +180,11 @@ func TestRBACCoverage(t *testing.T) {
 			minVerbs: []string{verbGet, verbList, verbWatch}},
 		// Jobs: the deliver Job + verify Job are read through the cached client
 		// (loop_deliver_job.go / loop_verify_job.go r.Get).
-		{group: "batch", resource: "jobs",
+		{group: batchGroup, resource: "jobs",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
 		// NetworkPolicies: the loop/proxy/deliver netpols are read through the
 		// cached client (loop_controller.go r.Get).
-		{group: "networking.k8s.io", resource: "networkpolicies",
+		{group: networkingGroup, resource: "networkpolicies",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
 		// PersistentVolumeClaims: the workspace PVC is read through the cached
 		// client (loop_controller.go r.Get).
@@ -153,15 +201,19 @@ func TestRBACCoverage(t *testing.T) {
 		// client reads it, so the marker needs get;list;watch IN ADDITION TO
 		// create;delete (a create-only marker wedges a fresh install on the
 		// first cached read, exactly like the A6 configmaps P1).
-		{group: "snapshot.storage.k8s.io", resource: "volumesnapshots",
+		{group: snapshotGroup, resource: "volumesnapshots",
 			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate}},
 		// VolumeSnapshotClasses: the checkpoint support check reads the
 		// cluster's VolumeSnapshotClasses (cluster-scoped, cached read).
-		{group: "snapshot.storage.k8s.io", resource: "volumesnapshotclasses",
+		{group: snapshotGroup, resource: "volumesnapshotclasses",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
 		// StorageClasses: the checkpoint support check reads the workspace
-		// PVC's StorageClass (the CSI driver) through the cached client.
-		{group: "", resource: "storageclasses",
+		// PVC's StorageClass (the CSI driver) through the cached client. The
+		// group is storage.k8s.io (NOT core "") — storageclasses is a
+		// cluster-scoped resource in the storage group. The B1 P1: the marker
+		// (and this entry) wrongly used the core group, which envtest (admin)
+		// could not catch; groupForResource pins the real group.
+		{group: storageGroup, resource: "storageclasses",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
 	}
 
@@ -176,6 +228,20 @@ func TestRBACCoverage(t *testing.T) {
 				t.Errorf("RBAC rule for %s/%s is missing verb %q (has: %s)",
 					req.group, req.resource, v, verbsList(verbs))
 			}
+		}
+	}
+
+	// Group-correctness assertion (the B1 storageclasses P1 guard): for every
+	// required entry, the group listed here must be the resource's REAL API
+	// group (per the trusted knownResourceGroup table). A wrong group in this
+	// test list fails the test, so the test cannot pass on a bug where the
+	// marker and the test list both name the wrong group (exactly the
+	// storageclasses case: both said the core group ""). This is what envtest
+	// cannot catch (it runs as cluster-admin).
+	for _, req := range required {
+		if want := groupForResource(req.resource); req.group != want {
+			t.Errorf("required RBAC entry for %s names group %q but the resource's real group is %q (wrong group fails here — the marker must use %q)",
+				req.resource, req.group, want, want)
 		}
 	}
 }
@@ -267,12 +333,27 @@ func TestRBACCachedClientReads(t *testing.T) {
 		{"", "persistentvolumeclaims"},           // r.Get the workspace PVC
 		{coxGroup, "loops"},                      // r.Get/r.List the Loops
 		{coxGroup, "agentpolicies"},              // r.Get the loop's AgentPolicy
-		{"agents.x-k8s.io", "sandboxes"},         // r.Get the sandbox
+		{agentsGroup, "sandboxes"},               // r.Get the sandbox
 		// B1 (I86): the checkpoint VolumeSnapshots are read through the cached
 		// client (ensureCheckpoint / applyCheckpointRetention / gcLoopCheckpoints).
-		{"snapshot.storage.k8s.io", "volumesnapshots"},
-		{"snapshot.storage.k8s.io", "volumesnapshotclasses"}, // the support check
-		{"", "storageclasses"},                              // the support check (the PVC's CSI driver)
+		{snapshotGroup, "volumesnapshots"},
+		{snapshotGroup, "volumesnapshotclasses"}, // the support check
+		{storageGroup, "storageclasses"},        // the support check (the PVC's CSI driver; group storage.k8s.io, NOT core "")
+	}
+
+	// Group-correctness assertion (the B1 storageclasses P1 guard): for every
+	// required and cache-read entry, the group listed here must be the
+	// resource's REAL API group (per the trusted knownResourceGroup table).
+	// A wrong group in this test list fails the test, so the test cannot pass
+	// on a bug where the marker and the test list both name the wrong group
+	// (exactly the storageclasses case: both said the core group ""). This is
+	// what envtest cannot catch (it runs as cluster-admin). The required-entry
+	// group check lives in TestRBACCoverage (where `required` is scoped).
+	for _, cr := range cacheReads {
+		if want := groupForResource(cr.resource); cr.group != want {
+			t.Errorf("cache-read entry for %s names group %q but the resource's real group is %q (wrong group fails here)",
+				cr.resource, cr.group, want)
+		}
 	}
 
 	for _, cr := range cacheReads {

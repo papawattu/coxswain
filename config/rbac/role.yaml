@@ -41,14 +41,6 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - storageclasses
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
   - agents.x-k8s.io
   resources:
   - sandboxes
@@ -149,6 +141,14 @@ rules:
   verbs:
   - create
   - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
   - get
   - list
   - watch

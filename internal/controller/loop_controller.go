@@ -415,7 +415,7 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
 // The checkpoint support check reads the workspace PVC's StorageClass (the
 // CSI driver) to find the matching VolumeSnapshotClass.
-// +kubebuilder:rbac:groups="",resources=storageclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // A4 (R26): the operator owns the deliver description ConfigMap
 // (ensureDeliverDescriptionConfig / cleanupDeliverDescriptionConfig — the facts
 // body the push container reads to assemble the draft PR description). Only

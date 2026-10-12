@@ -1,7 +1,7 @@
 # Next phase: beta (v0.1.0)
 
-**Status:** draft for owner review. Decisions D58–D62 are open (see the
-table at the end).
+**Status:** accepted (PR #144). D58–D62 decided by the owner on 2026-10-12:
+all recommendations accepted (see the table at the end).
 
 Status 2026-10-12, `main` at 5cc1a97. The alpha is released as
 `v0.1.0-alpha.4`. Its acceptance (A6, `docs/PLAN-ALPHA.md`) holds on a fresh
@@ -122,11 +122,11 @@ with `approval.mode: Manual`, and:
 ## Owner decisions needed
 | ID | Question | Recommendation |
 |---|---|---|
-| D58 | Is Phase 5 (shared memory) in v0.1.0? | **No.** It carries the highest risk (memory pollution; ADR-0002 curator) and isn't needed for a usable release. Do it after v0.1.0, in its own phase. |
-| D59 | PLAN.md says checkpoints are **mandatory** (fail at start with `CheckpointUnavailable` without snapshot support). That would block every install on a cluster without a snapshot CSI, including default kind. | **Required only when the Loop asks for it** (`restoreFrom`, fork, or a new `spec.checkpoints: Required`). Otherwise take checkpoints when possible, fall back to A2 PVC-resume, and surface a `CheckpointsAvailable=False` condition (I90: fallbacks are visible). |
-| D60 | The Judge sidecar in v0.1.0? | **No.** It's optional, can never be the only gate, and adds a second model. Defer it. |
-| D61 | Prove the network gate together with KubeArmor before v0.1.0? | **Yes, on a dedicated VM** (no other KubeArmor agent on the kernel, ADR-0007 F2). Otherwise v0.1.0 keeps D57's KubeArmor-only wording. |
-| D62 | Helm in v0.1.0 (PLAN.md Phase 7; D54 deferred it there)? | **Yes.** Generated chart plus a release-workflow step. The workflow edit is an owner push (one PR). |
+| D58 (**decided: recommendation accepted, owner 2026-10-12**) | Is Phase 5 (shared memory) in v0.1.0? | **No.** It carries the highest risk (memory pollution; ADR-0002 curator) and isn't needed for a usable release. Do it after v0.1.0, in its own phase. |
+| D59 (**decided: recommendation accepted, owner 2026-10-12**) | PLAN.md says checkpoints are **mandatory** (fail at start with `CheckpointUnavailable` without snapshot support). That would block every install on a cluster without a snapshot CSI, including default kind. | **Required only when the Loop asks for it** (`restoreFrom`, fork, or a new `spec.checkpoints: Required`). Otherwise take checkpoints when possible, fall back to A2 PVC-resume, and surface a `CheckpointsAvailable=False` condition (I90: fallbacks are visible). |
+| D60 (**decided: recommendation accepted, owner 2026-10-12**) | The Judge sidecar in v0.1.0? | **No.** It's optional, can never be the only gate, and adds a second model. Defer it. |
+| D61 (**decided: recommendation accepted, owner 2026-10-12**) | Prove the network gate together with KubeArmor before v0.1.0? | **Yes, on a dedicated VM** (no other KubeArmor agent on the kernel, ADR-0007 F2). Otherwise v0.1.0 keeps D57's KubeArmor-only wording. |
+| D62 (**decided: recommendation accepted, owner 2026-10-12**) | Helm in v0.1.0 (PLAN.md Phase 7; D54 deferred it there)? | **Yes.** Generated chart plus a release-workflow step. The workflow edit is an owner push (one PR). |
 
 ## Estimate
 In plan-days at the alpha's pace. The alpha's 2–3 week estimate took about 3

@@ -52,6 +52,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
@@ -4292,6 +4293,21 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	if err != nil {
 		return err
 	}
+	// fix/watch-kubearmorpolicy (owner D55 2026-10-12): the Kapt spec-hash
+	// gate must be ORDER-INDEPENDENT (read-before-write), like the C6b and
+	// D41c gates. Capture the enforcement observation (the live Kapt's spec
+	// hash + ownership, via Enforcing) BEFORE Enforcer.Apply overwrites the
+	// spec with the canonical one. PolicyEnforced is set from this PRE-Apply
+	// observation (not from a post-Apply read), so a tamper is observed as
+	// held on the detecting pass (PolicyEnforced=False/Reason=KaptTampered,
+	// sandbox Suspended) rather than being silently repaired and read True in
+	// the same pass. The operator still converges the spec (Apply below); the
+	// held state is the detecting pass, and the gate reopens on the
+	// subsequent pass that reads the canonical spec (the watch re-fires on
+	// the operator's own repair write).
+	// Captured unconditionally (before the Enforcer nil check) so the
+	// PolicyEnforced condition always reflects the pre-Apply observation.
+	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
 	if r.Enforcer != nil {
 		// I42f review P2 (round 1): a foreign KubeArmorPolicy occupying one of
 		// the Loop's policy names is NEVER overwritten (createOrUpdateKapt's
@@ -4335,7 +4351,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
 			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
 	}
-	if enf, rs := r.enforcementStatus(ctx, loop); enf {
+	if enf, rs := preApplyEnf, preApplyRs; enf {
 		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
 			"the eBPF engine is enforcing the Loop's effective policy")
 	} else {
@@ -4821,6 +4837,36 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// PolicyNotFound; a policy edit must refresh the recorded hash).
 		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
 			r.agentPolicyToLoopRequests))
+	// The operator owns the per-Loop KubeArmorPolicy (A1/D52 fact 3, name
+	// "coxswain-<loop>"). Watch it so a tamper (a spec change after the
+	// operator applied the canonical policy) re-reconciles the Loop at once
+	// and the Enforcing() spec-hash check re-runs — without the watch, a
+	// tamper is only seen on an unrelated reconcile, and the D30 gate can
+	// stay open on a mismatched spec.
+	//
+	// fix/watch-kubearmorpolicy (PR #129) — the KubeArmorPolicy CRD is NOT
+	// shipped by install.yaml (KubeArmor installs it). The watch must be
+	// registered ONLY IF the RESTMapper resolves engine.KubeArmorGVK at
+	// setup: on a cluster without KubeArmor (a --allow-unenforced dev setup,
+	// the Calico cluster), the kind is absent and an unconditional watch
+	// makes the manager fail to start ("no matches for kind"), breaking
+	// cmd/main.go's promise that a missing KubeArmor CRD is tolerated (no-op)
+	// under the --allow-unenforced escape hatch. If the CRD is absent, log
+	// and skip the watch: the D30 gate already fails closed without
+	// enforcement (PolicyEnforced=False / NodeNotEnforcing, sandbox
+	// Suspended), so skipping the watch is safe.
+	// The KubeArmorPolicy is unstructured (the operator uses
+	// unstructured.Unstructured + engine.KubeArmorGVK), so the watch is on an
+	// unstructured object with that GVK.
+	if _, kaptMapErr := mgr.GetRESTMapper().RESTMapping(engine.KubeArmorGVK.GroupKind()); kaptMapErr != nil {
+		logf.Log.Info("KubeArmorPolicy CRD not present (RESTMapper does not resolve "+kaptGVKStr(engine.KubeArmorGVK)+"): the per-Loop KubeArmorPolicy watch is not registered. The D30 enforcement gate fails closed without enforcement (PolicyEnforced=False, sandbox Suspended); a tamper is detected only on an unrelated reconcile until KubeArmor installs the CRD.",
+			"gvk", kaptGVKStr(engine.KubeArmorGVK), "err", kaptMapErr)
+	} else {
+		kaptWatch := &unstructured.Unstructured{}
+		kaptWatch.SetGroupVersionKind(engine.KubeArmorGVK)
+		b = b.Watches(kaptWatch, handler.EnqueueRequestsFromMapFunc(
+			r.kubeArmorPolicyToLoopRequests))
+	}
 	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
 	// change enqueues every Loop so it re-reads the cached result and re-gates.
 	// Skipped when nil (envtest: the result is read on each reconcile anyway).
@@ -4863,6 +4909,43 @@ func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj clie
 		})
 	}
 	return requests
+}
+
+// kubeArmorPolicyToLoopRequests maps a KubeArmorPolicy (unstructured,
+// engine.KubeArmorGVK) to the Loop it belongs to, so a tamper re-reconciles
+// that Loop at once (the D30 gate's Enforcing() spec-hash check re-runs).
+// The operator names the per-Loop Kapt "coxswain-<loopName>" (A1/D52 fact 3,
+// ensureKapt + foreignKaptPolicies). A Kapt whose name is not prefixed
+// "coxswain-" (a foreign or unrelated policy) maps to nothing.
+func (r *LoopReconciler) kubeArmorPolicyToLoopRequests(_ context.Context, obj client.Object) []reconcile.Request {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil
+	}
+	name := u.GetName()
+	const prefix = "coxswain-"
+	if !strings.HasPrefix(name, prefix) {
+		return nil
+	}
+	loopName := strings.TrimPrefix(name, prefix)
+	if loopName == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: u.GetNamespace(),
+			Name:      loopName,
+		},
+	}}
+}
+
+// kaptGVKStr renders a schema.GroupVersionKind as "group/version/Kind" for
+// log messages. fix/watch-kubearmorpolicy (PR #129): used by the CRD-gated
+// watch log so an operator on a cluster without KubeArmor sees which GVK was
+// not found (the KubeArmorPolicy GVK has a non-empty group, so it renders as
+// "security.kubearmor.com/v1beta1/KubeArmorPolicy").
+func kaptGVKStr(gvk schema.GroupVersionKind) string {
+	return gvk.Group + "/" + gvk.Version + "/" + gvk.Kind
 }
 
 // suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it

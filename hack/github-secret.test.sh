@@ -9,7 +9,12 @@
 #      the token is never printed, echoed, logged, or placed on a command
 #      line);
 #   3. a missing token file fails with 'token file missing';
-#   4. an empty token file fails with 'token file missing'.
+#   4. an empty token file fails with 'token file missing';
+#   5. the apply is server-side (--server-side --field-manager) so no
+#      kubectl.kubernetes.io/last-applied-configuration annotation (a second
+#      copy of the token) is stored (D55, owner 2026-10-12); the stub records
+#      whether the apply was server-side and the test asserts it, and asserts
+#      the rendered manifest carries no last-applied-configuration annotation.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -88,6 +93,14 @@ if [ "${1:-}" = "apply" ]; then
 	# The real 'kubectl apply -f -' reads the manifest from stdin and prints a
 	# 'created'/'configured' message. The stub cats stdin (the manifest) to its
 	# own stdout so the test can assert on the type/username/password.
+	# D55: record whether the apply was server-side (the test asserts it, so a
+	# regression to a client-side apply — which stores a last-applied snapshot
+	# of the token — is caught).
+	server_side=0
+	for a in "$@"; do
+		[ "$a" = "--server-side" ] && server_side=1
+	done
+	printf 'SERVER_SIDE=%s\n' "$server_side" >> "$KLOG"
 	cat -
 	exit 0
 fi
@@ -150,6 +163,20 @@ fi
 # literal).
 if [ -f "$KUBECTL_LOG" ] && grep -Fq -- "$FAKE_TOKEN" "$KUBECTL_LOG"; then
 	echo "FATAL: the raw token was placed on the kubectl command line (D55 violation)"; exit 1
+fi
+
+# 5. D55 (owner 2026-10-12): the apply must be server-side so that no
+#    kubectl.kubernetes.io/last-applied-configuration annotation (a second
+#    copy of the token) is stored. The stub records SERVER_SIDE=1 for a
+#    server-side apply; the test asserts it.
+if [ ! -f "$KUBECTL_LOG" ] || ! grep -q '^SERVER_SIDE=1$' "$KUBECTL_LOG"; then
+	echo "FATAL: the kubectl apply was not server-side (--server-side) — a client-side apply stores a last-applied snapshot of the token (D55 violation)"; exit 1
+fi
+# The rendered manifest itself must carry no last-applied-configuration
+# annotation (a client-side dry-run would add one; the server-side path does
+# not, but assert it so a regression is caught at the manifest level too).
+if printf '%s' "$OUT" | grep -q 'last-applied-configuration'; then
+	echo "FATAL: the rendered Secret manifest carries a last-applied-configuration annotation (a second copy of the token — D55 violation)"; exit 1
 fi
 
 # ---------------------------------------------------------------------------

@@ -724,6 +724,8 @@ while :; do
 	log deliver "Delivered: ${dstate:-<pending>} (waiting up to ${PR_CAP}s)"
 	case "$dstate" in
 	True* ) break ;;
+	False*Failed* ) die "delivery failed: $dstate (evidence: collect below)";;
+	False*InProgress* ) : ;; # the operator's Delivered condition is momentarily "False InProgress" after Succeeded; wait for it to settle to True
 	False* ) die "delivery failed: $dstate (evidence: collect below)";;
 	*) : ;;
 	esac

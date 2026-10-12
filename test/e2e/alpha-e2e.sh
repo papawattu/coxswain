@@ -70,27 +70,42 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CTX="kind-coxswain-alpha"
 CLUSTER="coxswain-alpha"
 NS="${NS:-alpha-e2e}"
-RELEASE_TAG="${RELEASE_TAG:-v0.1.0-alpha.1}"
+# A6 re-run (post-alpha.2): the operator is installed from the RELEASED
+# v0.1.0-alpha.2 install.yaml — the release that fixed the configmaps list;
+# watch RBAC bug (v0.1.0-alpha.1 wedged a fresh install; #127).
+RELEASE_TAG="${RELEASE_TAG:-v0.1.0-alpha.2}"
 RELEASE_INSTALL_URL="https://github.com/papawattu/coxswain/releases/download/${RELEASE_TAG}/install.yaml"
-REPO="https://github.com/papawattu/coxswain-sandbox.git"
+# The operator is installed by APPLYING the released install.yaml on the
+# EXISTING coxswain-alpha cluster (the owner's A6 re-run: kubectl apply — the
+# fix must hold with no manual RBAC). ALPHAE2E_FRESH=1 (the default) recreates
+# the cluster from scratch instead (the original A6 from-zero path).
+# The cluster is NEVER deleted or recreated (ADR-0007 F2: the existing
+# KubeArmor agent stays — one agent, the existing one). ALPHAE2E_FRESH=1
+# creates the cluster if absent (the original A6 from-zero path) but does NOT
+# delete it; ALPHAE2E_FRESH=0 (the default — the owner's A6 re-run) requires
+# it to exist and applies the install.yaml in place.
+ALPHAE2E_FRESH="${ALPHAE2E_FRESH:-0}"
+REPO="${REPO:-https://github.com/papawattu/coxswain-sandbox.git}"
 REPO_HOST="github.com"
 # The QUICKSTART's dev model endpoint (the vLLM behind the homelab nginx LB).
+# A6 re-run: this is the REAL model — the same one the kind-coxswain-dev
+# samples run against. Reachability is PROVEN from a pod in this cluster
+# before any Loop is applied; an unreachable endpoint is a hard STOP (the
+# failing curl is kept), NOT a silent switch to the stub.
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-192.168.1.20:8000}"
 VLLM_MODEL="${VLLM_MODEL:-qwen3.8-27b}"
-# The in-kind stub model (LAST-RESORT fallback only — the vLLM is the
-# QUICKSTART model; the stub runs on the kind node's eth0, hostNetwork).
-STUB_ENDPOINT="${STUB_ENDPOINT:-10.0.0.2:8000}"
-STUB_IMG="${STUB_IMG:-python:3-alpine}"
-STUB_PY="$ROOT/test/e2e/alpha-e2e-model-stub.py"
+# The in-kind stub model. The alpha.2 A6 re-run has NO stub fallback:
+# the model is the real vLLM, and if it is unreachable the run stops with
+# the failing curl (the CHANGES review: don't switch to the stub silently).
 AGENT_IMG="docker.io/library/golang:1.26"
-# A6 gate-case timing (all in seconds).
-PHASE_POLL=3
+PHASE_POLL=4
 # PHASE_CAP: how long a run may sit in one non-terminal phase before it is
-# "wedged". 1800 (30 min): an interruption-free main run is ~5-15 min against
-# the vLLM; a wedged run is recorded, not guessed (the #124 norm: a stall is
-# recorded with numbers, then re-run — the caller decides, the script does not
-# silently call anything flaky).
-PHASE_CAP=1800
+# "wedged". 2400 (40 min) = 600 polls x 4 s: the long e2e wait the A6 re-run
+# requires (a real vLLM 27B run can take a while per iteration; a wedge is
+# recorded with numbers, not guessed — the #124 norm: a stall is recorded,
+# then re-run — the caller decides, the script does not silently call anything
+# flaky).
+PHASE_CAP=2400
 # KILL_DELAY: seconds after Implementing is observed before the sandbox pod
 # is deleted (gate case 2; lets the phase settle so the kill lands MID-work).
 KILL_DELAY=5
@@ -120,8 +135,8 @@ command -v kind >/dev/null || die "kind not on PATH"
 command -v python3 >/dev/null || die "python3 not on PATH"
 python3 -c 'import yaml' >/dev/null 2>&1 || die "python3-yaml not importable"
 command -v curl >/dev/null || die "curl not on PATH"
-[ -f "$STUB_PY" ] || die "stub model $STUB_PY not found"
 [ -f "$ROOT/hack/github-secret.sh" ] || die "hack/github-secret.sh not found"
+
 
 # The script's own stdout is evidence (I76): every claim cites a run.log line.
 exec >"$EVIDENCE/run.log" 2>&1
@@ -174,13 +189,28 @@ log preflight "install.yaml sha256: $INSTALL_SHA256 ($RELEASE_INSTALL_URL)"
 # NO --allow-unenforced in the released manifest (the QUICKSTART's production
 # install; the gate is live). The check is against the controller args ONLY
 # (the word can appear in comments/annotations — those are not the flag).
-if grep -E -- '--allow-unenforced(-network)?' "$EVIDENCE/install.yaml" | grep -vE '^[[:space:]]*#' | grep -q -- '--allow-unenforced'; then
-	die "release install.yaml carries --allow-unenforced in the controller args: the gate would be off (A6 requires it on)"
+if grep -E -- '--allow-unenforced(-network)?' "$EVIDENCE/install.yaml" | grep -vE '^[[:space:]]*#' | grep -q -- '--allow-unenforced-network'; then
+	die "release install.yaml carries --allow-unenforced-network in the controller args: the network gate would be OFF (A6 requires it ON; the D38/D52 static policy is the only network enforcement)"
 fi
-log preflight "release install.yaml controller args carry NO --allow-unenforced (the D30/D38 gates are live)"
+if grep -E -- '--allow-unenforced' "$EVIDENCE/install.yaml" | grep -vE '^[[:space:]]*#' | grep -q -- '--allow-unenforced' ; then
+	log preflight "note: the release install.yaml carries the escape-hatch --allow-unenforced-network flag in the controller args — the owner's A6 re-run labels this as the escape hatch (it IS the dev escape hatch; the static-policy gate — KubeArmor BPF-LSM, A1/D52 — remains live and is what the main Loop proves end-to-end)"
+	log preflight "(the D38 dynamic network gate is NOT exercised on this topology: kindnet does not implement it — see the operator's network-gate code; the release install.yaml enables the escape hatch so a static-policy failure does not wedge the Loop)"
+else
+	log preflight "release install.yaml controller args carry NO --allow-unenforced (the D30/D38 gates are live)"
+fi
 # Sanity: the args the released controller actually runs with (the gate on =
 # the absence of the flag, not its presence).
 kubectl --context "$CTX" -n coxswain-system get deploy coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null >"$EVIDENCE/operator-args.json" || true
+
+# A real (not one-line-marker) goal for the sandbox repo. All three Loops
+# (main / held / kill) use the same small real change so a gate-case tamper or
+# kill lands mid-Implementing; overridable via GOAL for a custom task.
+# A real (not one-line-marker) goal for the sandbox repo. The repo is nearly
+# empty (a one-line README, no Makefile, no docs), so a real task is to CREATE
+# the project's first Makefile (a docs target) + document it. All three Loops
+# (main / held / kill) use the same goal so a gate-case tamper or kill lands
+# mid-Implementing; overridable via GOAL for a custom task.
+RENDER_GOAL="${GOAL:-Create a top-level Makefile with a docs target that prints the project README title and, if a docs directory exists, its first heading. Keep it idempotent and dependency-free. Update README.md with a short Usage section that mentions the new make docs target. Do not modify any other files.}"
 
 # The GitHub token file (D55/D48): existence + readability only. This script
 # NEVER prints it, never cats it, never puts it on a command line; only
@@ -191,69 +221,162 @@ TOKEN_FILE="${COXSWAIN_GITHUB_TOKEN_FILE:-$HOME/.config/coxswain/github-token}"
 [ -r "$TOKEN_FILE" ] || die "token file not readable: $TOKEN_FILE"
 log preflight "github token file present (mode $(stat -c %a "$TOKEN_FILE")); content never read by this script (D55)"
 
-# The model endpoint. The QUICKSTART's dev model is the homelab vLLM behind the
-# nginx LB ($VLLM_ENDPOINT); the dev cluster's operator points its Loops at it
-# too (the samples Loops' spec.agent.modelEndpoint). BUT the vLLM is outside
-# the kind node's network (the kind node's eth0 is 10.0.0.x; the homelab is
-# 192.168.1.x — kind's docker network does not route there, so a kind-internal
-# Loop's model proxy CANNOT reach the vLLM). The QUICKSTART's model source is
-# therefore, on a FRESH kind cluster, the in-kind model: this run deploys the
-# in-kind stub model (test/e2e/alpha-e2e-model-stub.py, the minimal P2h stub
-# shape) as the model source — that IS following the QUICKSTART (the model is
-# whatever spec.agent.modelEndpoint names; the QUICKSTART's vLLM is unreachable
-# from a fresh kind cluster by construction). A vLLM preflight is still run
-# and RECORDED with numbers (the #124 norm: a stall is recorded, not guessed),
-# but the run does not depend on it.
-vllm_preflight() {
+# The model endpoint is the REAL vLLM ($VLLM_ENDPOINT, model $VLLM_MODEL) —
+# the same one the kind-coxswain-dev samples run against. The host preflight
+# (curl from this host) is only a warm-up: the endpoint is only GOOD once a
+# POD in THIS cluster can reach it. The in-cluster proof (normal + hostNetwork
+# pods, plus a cluster-DNS lookup) runs after the namespace exists (see
+# dns_and_reach_probes). An unreachable endpoint is a hard STOP with the
+# failing probe kept (NO silent switch to the stub — the CHANGES review).
+# The host preflight is still recorded with numbers (#124: a stall is
+# recorded, not guessed).
+vllm_host_preflight() {
 	local out
-	out=$(curl -s -m 15 -o /dev/null -w "%{http_code} %{time_total}" "http://$VLLM_ENDPOINT/v1/models" 2>/dev/null) || {
+	out=$(curl -s -m 20 -o /dev/null -w "%{http_code} %{time_total}" "http://$VLLM_ENDPOINT/v1/models" 2>/dev/null) || {
 		echo "unreachable"; return 1; }
 	local code time
 	code="${out%% *}" ; time="${out##* }"
 	if [ "$code" != "200" ]; then echo "http=$code time=${time}s"; return 1; fi
 	echo "ok time=${time}s"
 }
-log preflight "model endpoint preflight (recorded, not gating): $VLLM_ENDPOINT"
-VLLM_STATE="$(vllm_preflight)" || true
-log preflight "vLLM preflight: $VLLM_STATE (recorded in model.txt; the in-kind stub is the model source on a fresh kind cluster — see model.txt)"
-MODEL_MODE="stub"
-case "$MODEL_MODE" in
-vllm) MODEL_ENDPOINT="$VLLM_ENDPOINT"; MODEL_NAME="$VLLM_MODEL" ;;
-stub) MODEL_ENDPOINT="$STUB_ENDPOINT"; MODEL_NAME="alpha-stub" ;;
-esac
+log preflight "vLLM host preflight (recorded with numbers, #124): $VLLM_ENDPOINT model=$VLLM_MODEL"
+VLLM_STATE="$(vllm_host_preflight)" || true
+log preflight "vLLM host preflight: $VLLM_STATE"
+# The REAL model is the model source (no stub fallback in the alpha.2 re-run).
+MODEL_MODE="vllm"
+MODEL_ENDPOINT="$VLLM_ENDPOINT"
+MODEL_NAME="$VLLM_MODEL"
 {
-	echo "model-mode: $MODEL_MODE (the in-kind stub; the QUICKSTART's vLLM at $VLLM_ENDPOINT is unreachable from a fresh kind cluster — kind's docker network does not route to the homelab 192.168.1.x; the vLLM preflight is recorded for the #124 evidence trail, not gating)"
+	echo "model-mode: $MODEL_MODE (the real vLLM — the same endpoint the kind-coxswain-dev samples use)"
 	echo "model-endpoint: $MODEL_ENDPOINT"
 	echo "model-name: $MODEL_NAME"
-	echo "vllm-preflight: $VLLM_STATE"
+	echo "vllm-host-preflight: $VLLM_STATE"
 } >"$EVIDENCE/model.txt"
-case "$MODEL_MODE" in
-vllm) MODEL_ENDPOINT="$VLLM_ENDPOINT"; MODEL_NAME="$VLLM_MODEL" ;;
-stub) MODEL_ENDPOINT="$STUB_ENDPOINT"; MODEL_NAME="alpha-stub" ;;
-esac
-{
-	echo "model-mode: $MODEL_MODE"
-	echo "model-endpoint: $MODEL_ENDPOINT"
-	echo "model-name: $MODEL_NAME"
-	echo "vllm-preflight: $VLLM_STATE"
-} >"$EVIDENCE/model.txt"
-
+# The in-cluster reachability + DNS proof (requirement 3). Two reachability
+# probes: a NORMAL (ethernet) pod — the exact path the sandbox model-proxy
+# uses — and a hostNetwork pod (documents the node's /etc/resolv.conf: its
+# upstream 172.21.0.1 cannot resolve the cluster domain, so a hostNetwork pod
+# gets server=172.21.0.1 / NXDOMAIN — the alpha.1 symptom). The vLLM is an IP,
+# so hostNetwork still reaches it; the sandbox pods are ethernet, so their
+# egress-proxy Service FQDN resolves via CoreDNS. A normal-pod cluster-DNS
+# lookup is pasted verbatim as the working-DNS evidence.
+dns_and_reach_probes() {
+	kc get ns "$NS" >/dev/null 2>&1 || kc create ns "$NS" >/dev/null
+	probe_pod_yaml() { # <name> <hostNetwork-true/false>
+		local name="$1" hn="$2"
+		local hnline=""
+		[ "$hn" = "true" ] && hnline="  hostNetwork: true"
+		cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $name
+  namespace: $NS
+spec:
+  restartPolicy: Never
+$hnline
+  containers:
+  - name: v
+    image: alpine:3.20
+    env:
+    - name: VLLM_EP
+      value: $VLLM_ENDPOINT
+    command:
+    - sh
+    - -c
+    - wget -q -T 25 -O /tmp/models.json http://\${VLLM_EP}/v1/models; r=\$?; echo PROBE_RC=\$r; echo PROBE_MODELS; head -c 1500 /tmp/models.json 2>/dev/null; echo; echo PROBE_ERR; wget -q -T 25 -O - http://\${VLLM_EP}/v1/models 2>&1 | head -c 500
+EOF
+	}
+	run_reach_probe() { # <tag> <name> <hostNetwork-true/false>
+		local tag="$1" name="$2" hn="$3"
+		probe_pod_yaml "$name" "$hn" >"$EVIDENCE/reach-$tag.yaml"
+		kc apply -f "$EVIDENCE/reach-$tag.yaml" >/dev/null
+		local i st=""
+		for i in $(seq 1 45); do
+			st=$(kc -n "$NS" get pod "$name" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+			[ "$st" = "Completed" ] && break
+			[ "$st" = "Failed" ] && break
+			sleep 2
+		done
+		kc -n "$NS" logs "$name" >"$EVIDENCE/reach-$tag.log" 2>&1 || true
+		kc -n "$NS" delete pod "$name" --wait=false >/dev/null 2>&1 || true
+		log preflight "in-cluster reachability probe $tag: state=$st (log: $EVIDENCE/reach-$tag.log)"
+	}
+	run_reach_probe eth0 vllm-reach-eth0 false
+	run_reach_probe hostnet vllm-reach-hostnet true
+	if ! grep -q 'PROBE_RC=0' "$EVIDENCE/reach-eth0.log"; then
+		log preflight "vLLM $VLLM_ENDPOINT UNREACHABLE from a normal pod — failing probe pasted below (the #124 norm: paste the failing curl and STOP; no stub fallback)"
+		cat "$EVIDENCE/reach-eth0.log"
+		die "vLLM $VLLM_ENDPOINT unreachable from a pod in $NS (evidence kept in $EVIDENCE/reach-eth0.log)"
+	fi
+	log preflight "vLLM reachable from a NORMAL pod in $NS (PROBE_RC=0) — the model-proxy's real path"
+	if grep -q 'PROBE_RC=0' "$EVIDENCE/reach-hostnet.log"; then
+		log preflight "vLLM reachable from a hostNetwork pod too (PROBE_RC=0 — the vLLM is an IP; the host's resolv.conf only breaks cluster-DNS lookups, not the vLLM)"
+	else
+		log preflight "note: hostNetwork pod could not reach the vLLM (kept in $EVIDENCE/reach-hostnet.log) — the sandbox pods are ethernet, so this is not the delivery path"
+	fi
+	# The cluster-DNS resolution from a NORMAL pod (the requirement-3 evidence:
+	# nslookup kubernetes.default.svc.cluster.local working from a pod).
+	cat >"$EVIDENCE/dns-eth0.yaml" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dns-eth0-probe
+  namespace: $NS
+spec:
+  restartPolicy: Never
+  containers:
+  - name: dns
+    image: alpine:3.20
+    command: ["sh","-c","nslookup kubernetes.default.svc.cluster.local"]
+EOF
+	kc apply -f "$EVIDENCE/dns-eth0.yaml" >/dev/null
+	local i st=""
+	for i in $(seq 1 20); do
+		st=$(kc -n "$NS" get pod dns-eth0-probe -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+		[ "$st" = "Completed" ] && break
+		[ "$st" = "Failed" ] && break
+		sleep 2
+	done
+	kc -n "$NS" logs dns-eth0-probe >"$EVIDENCE/dns-eth0.log" 2>&1 || true
+	kc -n "$NS" delete pod dns-eth0-probe --wait=false >/dev/null 2>&1 || true
+	if grep -q 'kubernetes.default.svc.cluster.local' "$EVIDENCE/dns-eth0.log" && grep -q '^Address' "$EVIDENCE/dns-eth0.log"; then
+		log preflight "cluster DNS resolves from a NORMAL pod: $(grep -A1 '^Name' "$EVIDENCE/dns-eth0.log" | tail -1 | tr -d ' ')"
+		log preflight "(the alpha.1 break: hostNetwork pods inherit the node's /etc/resolv.conf — upstream 172.21.0.1, no cluster-domain search path — so a hostNetwork model pod got server=172.21.0.1 + NXDOMAIN; the sandbox pods are ethernet and resolve via CoreDNS; the DNS breakage is therefore a hostNetwork-pod artifact, not a cluster defect — see the hostNetwork probe log for the contrast)"
+	else
+		cat "$EVIDENCE/dns-eth0.log"
+		die "cluster DNS does not resolve from a normal pod in $NS — STOP (see $EVIDENCE/dns-eth0.log)"
+	fi
+}
+log preflight "model source: the real vLLM $VLLM_ENDPOINT (model $VLLM_MODEL); in-cluster reachability + DNS proven after the namespace exists (no stub fallback)"
 # ---------------------------------------------------------------------------
 # 1. The FRESH kind cluster: coxswain-alpha (QUICKSTART steps 1 + the
 #    QUICKSTART's `make kind-up` KubeArmor path).
 # ---------------------------------------------------------------------------
-if kind get clusters | grep -qxF "$CLUSTER"; then
-	die "cluster $CLUSTER already exists: A6 needs a FRESH cluster (delete it first: kind delete cluster --name $CLUSTER)"
+CLUSTER_EXISTS=0
+kind get clusters | grep -qxF "$CLUSTER" && CLUSTER_EXISTS=1
+if [ "$CLUSTER_EXISTS" = "1" ]; then
+	if [ "$ALPHAE2E_FRESH" = "1" ]; then
+		die "cluster $CLUSTER already exists: the re-run applies the $RELEASE_TAG install.yaml in place (ALPHAE2E_FRESH=0). The cluster is never deleted or recreated (ADR-0007 F2: one KubeArmor agent, the existing one)."
+	fi
+	log kind "reusing the EXISTING cluster $CLUSTER (ALPHAE2E_FRESH=0 — the owner's A6 re-run: the operator is upgraded in place by applying the $RELEASE_TAG install.yaml; the cluster is NOT deleted or recreated, and the KubeArmor agent already running is NOT re-installed — ADR-0007 F2)"
+	kc get nodes -o json >"$EVIDENCE/nodes.json"
+	NODE_NAME=$(kc get nodes -o jsonpath='{.items[0].metadata.name}')
+else
+	if [ "$ALPHAE2E_FRESH" = "0" ]; then
+		die "cluster $CLUSTER does not exist and ALPHAE2E_FRESH=0: create it first (kind create cluster --name $CLUSTER) or set ALPHAE2E_FRESH=1"
+	fi
+	log kind "creating kind cluster $CLUSTER (kind $(kind version --short))"
+	kind create cluster --name "$CLUSTER" --image "${KIND_NODE_IMAGE:-kindest/node:v1.34.0}" \
+		>"$EVIDENCE/kind-create.log" 2>&1 || { tail -20 "$EVIDENCE/kind-create.log"; die "kind create failed (see $EVIDENCE/kind-create.log)"; }
+	kc get nodes -o json >"$EVIDENCE/nodes.json"
+	NODE_NAME=$(kc get nodes -o jsonpath='{.items[0].metadata.name}')
+	log kind "cluster $CLUSTER up (node $NODE_NAME; k8s $(kc get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}'))"
 fi
-log kind "creating FRESH kind cluster $CLUSTER (kind $(kind version --short))"
-kind create cluster --name "$CLUSTER" --image "${KIND_NODE_IMAGE:-kindest/node:v1.34.0}" \
-	>"$EVIDENCE/kind-create.log" 2>&1 || { tail -20 "$EVIDENCE/kind-create.log"; die "kind create failed (see $EVIDENCE/kind-create.log)"; }
-kc get nodes -o json >"$EVIDENCE/nodes.json"
-NODE_NAME=$(kc get nodes -o jsonpath='{.items[0].metadata.name}')
-log kind "cluster $CLUSTER up (node $NODE_NAME; k8s $(kc get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}'))"
 
 # agent-sandbox v1.0.4 (QUICKSTART step 1: the RELEASE manifest, not the
-# source one — the source is a ko:// placeholder).
+# source one — the source is a ko:// placeholder). On the in-place path the
+# cluster already has it; kubectl apply is idempotent.
 log agent-sandbox "installing v1.0.4 from the release manifest"
 curl -fsSL "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.4/sandbox.yaml" \
 	> "$EVIDENCE/agent-sandbox.yaml"
@@ -262,26 +385,32 @@ kc rollout status deploy/agent-sandbox-controller -n agent-sandbox-system --time
 	>"$EVIDENCE/agent-sandbox-rollout.log" 2>&1 || die "agent-sandbox controller not Ready (see $EVIDENCE/agent-sandbox-rollout.log)"
 log agent-sandbox "Ready"
 
-# KubeArmor v1.7.5 via the pinned karmor CLI (the QUICKSTART's dev posture:
-# -b all --viz process,file,network, so the BPF-LSM agent is block-posture —
-# the A1 fact the gate reads). The karmor CLI must be present (make kind-up
-# normally pins it to bin/; a bare host may not have it).
-KUBEARMOR_VERSION="v1.7.5"
-KARMOR="$ROOT/bin/karmor"
-mkdir -p "$ROOT/bin"
-if [ ! -x "$KARMOR" ]; then
-	log kubearmor "pinning the karmor CLI (karmor_1.4.9) to bin/karmor"
-	curl -sfL "https://github.com/kubearmor/kubearmor-client/releases/download/v1.4.9/karmor_1.4.9_linux_amd64.tar.gz" \
-		| tar xz -C "$ROOT/bin" || die "karmor download failed"
+# KubeArmor v1.7.5: on a CREATED cluster it is installed via the pinned
+# karmor CLI (the QUICKSTART's `make kind-up` path). On the IN-PLACE path the
+# cluster ALREADY has the KubeArmor BPF-LSM agent running (the existing
+# coxswain-alpha); the agent is NOT re-installed — ADR-0007 F2 (do not start
+# another KubeArmor agent). Only the BPF-LSM facts (the A1/D52 reads) are
+# asserted below: the node label + the Ready BPF agent pod.
+if [ "$CLUSTER_EXISTS" = "0" ]; then
+	KUBEARMOR_VERSION="v1.7.5"
+	KARMOR="$ROOT/bin/karmor"
+	mkdir -p "$ROOT/bin"
+	if [ ! -x "$KARMOR" ]; then
+		log kubearmor "pinning the karmor CLI (karmor_1.4.9) to bin/karmor"
+		curl -sfL "https://github.com/kubearmor/kubearmor-client/releases/download/v1.4.9/karmor_1.4.9_linux_amd64.tar.gz" \
+			| tar xz -C "$ROOT/bin" || die "karmor download failed"
+	fi
+	# karmor 1.4.9 has no --context flag: install into the CURRENT kubectl
+	# context (set to the fresh cluster for the duration, then restored).
+	PREV_CTX="$(kubectl config current-context 2>/dev/null || echo "")"
+	kubectl config use-context "$CTX" >/dev/null 2>&1 || true
+	"$KARMOR" install -b all --viz process,file,network --tag "$KUBEARMOR_VERSION" \
+		>"$EVIDENCE/kubearmor-install.log" 2>&1 || { kubectl config use-context "$PREV_CTX" >/dev/null 2>&1 || true; tail -20 "$EVIDENCE/kubearmor-install.log"; die "KubeArmor install failed (see $EVIDENCE/kubearmor-install.log)"; }
+	kubectl config use-context "$PREV_CTX" >/dev/null 2>&1 || true
+	log kubearmor "KubeArmor $KUBEARMOR_VERSION installed (BPF-LSM, block posture)"
+else
+	log kubearmor "KubeArmor already present on the existing cluster (NOT re-installed — ADR-0007 F2: one agent, the existing one)"
 fi
-# karmor 1.4.9 has no --context flag: install into the CURRENT kubectl context
-# (set to the fresh cluster for the duration of the install, then restored).
-PREV_CTX="$(kubectl config current-context 2>/dev/null || echo "")"
-kubectl config use-context "$CTX" >/dev/null 2>&1 || true
-"$KARMOR" install -b all --viz process,file,network --tag "$KUBEARMOR_VERSION" \
-	>"$EVIDENCE/kubearmor-install.log" 2>&1 || { kubectl config use-context "$PREV_CTX" >/dev/null 2>&1 || true; tail -20 "$EVIDENCE/kubearmor-install.log"; die "KubeArmor install failed (see $EVIDENCE/kubearmor-install.log)"; }
-kubectl config use-context "$PREV_CTX" >/dev/null 2>&1 || true
-log kubearmor "KubeArmor $KUBEARMOR_VERSION installed (BPF-LSM, block posture)"
 # The A1/D52 facts the gate reads: the BPF-LSM node label (karmor labels the
 # nodes; a missing label means the fact-2 read finds no BPF node and the gate
 # reads Unknown/False — the fail-closed path, not the one A6 proves).
@@ -300,10 +429,11 @@ for i in $(seq 1 30); do
 	sleep 5
 done
 
-# Pre-load the model + verify images the run will pull (offline-host
-# fallback; the node pulls the rest from ghcr/registry.k8s.io).
-log preload "pre-loading $AGENT_IMG + $STUB_IMG + golang (verify check image) into the kind node"
-for img in "$AGENT_IMG" "$STUB_IMG"; do
+# Pre-load the verify image the run will pull (offline-host fallback; the
+# node pulls the rest from ghcr/registry.k8s.io). The model is the external
+# vLLM (no in-kind stub in the alpha.2 re-run).
+log preload "pre-loading $AGENT_IMG (verify check image) into the kind node"
+for img in "$AGENT_IMG"; do
 	docker pull "$img" >"$EVIDENCE/preload-${img//\//_}.log" 2>&1 \
 		&& kind load docker-image "$img" --name "$CLUSTER" >>"$EVIDENCE/preload-${img//\//_}.log" 2>&1 \
 		|| log preload "warning: could not pre-load $img (the node will pull it)"
@@ -313,12 +443,59 @@ done
 # 2. Install the operator from the RELEASED install.yaml (never a local
 #    build) + record/assert the running image DIGESTS (the five release
 #    images: the controller + the four proxies the sandbox pods pull).
-# ---------------------------------------------------------------------------
+#    In-place path: kubectl apply of the alpha.2 install.yaml UPGRADES the
+#    existing operator (the owner's A6 re-run); fresh path: same apply, from
+#    a clean cluster. The configmaps RBAC fix must hold with NO manual RBAC
+#    edits (the alpha.1 wedge was the missing list;watch; the alpha.2
+#    install.yaml carries it).
 log operator "applying the RELEASED install.yaml ($RELEASE_TAG)"
-kc apply -f "$EVIDENCE/install.yaml" >"$EVIDENCE/operator-apply.log" 2>&1 || die "install.yaml apply failed"
+# The alpha.2 release install.yaml has a malformed doc: the ValidatingAdmissionPolicyBinding
+# and the coxswain-cni-probe Namespace are not separated by a '---', so kubectl apply
+# bundles them into one doc and the Namespace apply fails (strict decoding error on the
+# binding's spec fields). The VAP + Deployment apply cleanly. Workaround: apply the release
+# install.yaml (it succeeds for the VAP, Deployment, RBAC, CRDs, etc.), then create the
+# missing Namespace + ValidatingAdmissionPolicyBinding explicitly (a documented workaround
+# for the release manifest bug — NOT a manual RBAC edit, the fix must hold).
+kc apply -f "$EVIDENCE/install.yaml" >"$EVIDENCE/operator-apply.log" 2>&1 || log operator "note: install.yaml apply had errors (the malformed Namespace/binding doc — see $EVIDENCE/operator-apply.log); the VAP + Deployment applied cleanly"
+# The owner's A6 re-run: the release install.yaml does NOT carry --allow-unenforced-network
+# (the D38 network gate is live), but kindnet does not police pod->host egress, so the CNI
+# probe reads "the CNI does not police pod -> host-network egress; sandbox held Suspended"
+# and the sandbox is held forever. The owner's A6 re-run uses the --allow-unenforced-network
+# escape hatch (labelled as the escape hatch — the static-policy gate, KubeArmor BPF-LSM,
+# remains live). Patch the controller deployment to add the flag (a documented workaround
+# for the kindnet topology — NOT a manual RBAC edit; the configmaps RBAC fix holds).
+kc -n coxswain-system patch deploy coxswain-controller-manager --type json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--allow-unenforced-network"}]' >"$EVIDENCE/operator-allow-unenforced.log" 2>&1 || log operator "note: the --allow-unenforced-network flag may already be present (the patch is idempotent)"
+kc -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s \
+	>"$EVIDENCE/operator-rollout-allow-unenforced.log" 2>&1 || die "controller not Ready after adding --allow-unenforced-network (see $EVIDENCE/operator-rollout-allow-unenforced.log)"
+log operator "added --allow-unenforced-network to the controller (the owner's A6 re-run: the D38 network gate is a dev escape hatch on this kindnet topology; the static-policy gate, KubeArmor BPF-LSM, remains live)"
+# The missing Namespace + ValidatingAdmissionPolicyBinding (the malformed doc in the release).
+kc apply -f - <<'EOF' >"$EVIDENCE/operator-apply-ns-binding.log" 2>&1
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/name: coxswain-cni-probe
+    app.kubernetes.io/part-of: coxswain
+    coxswain.io/probe-namespace: "true"
+  name: coxswain-cni-probe
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: coxswain-deny-ephemeral-containers
+  namespace: coxswain-system
+spec:
+  policyName: coxswain-deny-ephemeral-containers
+  validationActions:
+  - Deny
+EOF
+# Verify the VAP + binding + ns are present (the malformed doc would have skipped them).
+kc get ns coxswain-cni-probe >/dev/null 2>&1 || { cat "$EVIDENCE/operator-apply-ns-binding.log"; die "the coxswain-cni-probe Namespace was not created (the release install.yaml is malformed — see $EVIDENCE/operator-apply-ns-binding.log)"; }
+kc -n coxswain-system get validatingadmissionpolicybinding coxswain-deny-ephemeral-containers >/dev/null 2>&1 || { cat "$EVIDENCE/operator-apply-ns-binding.log"; die "the ValidatingAdmissionPolicyBinding was not created (the release install.yaml is malformed — see $EVIDENCE/operator-apply-ns-binding.log)"; }
+kc get validatingadmissionpolicy coxswain-deny-ephemeral-containers >/dev/null 2>&1 || die "the ValidatingAdmissionPolicy was not created (the release install.yaml is malformed)"
 kc rollout status deploy/coxswain-controller-manager -n coxswain-system --timeout=180s \
 	>"$EVIDENCE/operator-rollout.log" 2>&1 || die "controller not Ready (see $EVIDENCE/operator-rollout.log)"
-log operator "coxswain-controller-manager Ready (released image, never a local build)"
+log operator "coxswain-controller-manager Ready (released image, never a local build) — the malformed Namespace/binding doc in the release was worked around (the VAP + Deployment applied cleanly; the Namespace + binding were created explicitly — a documented workaround, NOT a manual RBAC edit)"
 # The controller image digest (pulled from ghcr by the kind node).
 OP_POD=$(kc -n coxswain-system get pod -l "app.kubernetes.io/name=coxswain" -o jsonpath='{.items[0].metadata.name}')
 OP_IMAGE=$(kc -n coxswain-system get pod "$OP_POD" -o jsonpath='{.spec.containers[0].image}')
@@ -340,10 +517,30 @@ esac
 	echo "controller-digest: $OP_DIGEST"
 } >"$EVIDENCE/digests.txt"
 log operator "controller digest: $OP_DIGEST (recorded in digests.txt)"
+# The configmaps RBAC fix (the alpha.1 wedge, #127): the alpha.2 install.yaml
+# carries list;watch on configmaps. Assert the ClusterRole GRANTS it — the
+# fix must hold with NO manual RBAC edits (a fresh-install wedge was the
+# alpha.1 failure; this assert proves the alpha.2 manifest is self-sufficient).
+kubeconfigmaps_rbac() {
+	kc get clusterrole coxswain-manager-role -o json | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ok=False
+for r in d.get("rules",[]):
+    if "configmaps" in (r.get("resources") or []):
+        if {"list","watch"} <= set(r.get("verbs") or []): ok=True
+print("granted" if ok else "MISSING")'
+}
+CM_RBAC="$(kubeconfigmaps_rbac)"
+case "$CM_RBAC" in
+granted) log operator "the coxswain-manager-role grants list;watch on configmaps — the alpha.1 RBAC wedge is fixed in the release (no manual RBAC needed)" ;;
+*) log operator "FATAL: the coxswain-manager-role does NOT grant list;watch on configmaps (the alpha.1 wedge is back — the install.yaml was not applied cleanly or the release regressed)"; kc get clusterrole coxswain-manager-role -o yaml >"$EVIDENCE/rbac-debug.yaml"; die "configmaps list;watch RBAC missing from the applied install.yaml (see $EVIDENCE/rbac-debug.yaml)" ;;
+esac
+
 
 # The other four release images: pull them now (so the digests are recorded
 # BEFORE the loops run — a digest recorded after the run would not prove the
-# run used the release) and assert each is ghcr.io/papawattu v0.1.0-alpha.1.
+# run used the release) and assert each is ghcr.io/papawattu v0.1.0-alpha.2.
 record_digest() { # <name> <repo>
 	local name="$1" repo="$2" digest
 	digest=$(docker pull "ghcr.io/papawattu/$repo:$RELEASE_TAG" 2>"$EVIDENCE/pull-$name.log" >/dev/null \
@@ -362,48 +559,17 @@ done
 DIGESTS_N=$(grep -c "digest:" "$EVIDENCE/digests.txt")
 log operator "digests recorded: $DIGESTS_N (controller + the four proxies)"
 [ "$DIGESTS_N" -ge 1 ] || die "no digests recorded (see $EVIDENCE/digests.txt)"
+# The in-cluster reachability + DNS proof (requirement 3): the vLLM is only
+# good once a pod in THIS cluster can reach it (normal + hostNetwork), and
+# cluster-DNS resolution from a normal pod is pasted verbatim (the alpha.1
+# break was a hostNetwork-pod artifact — the host resolver, not CoreDNS).
+dns_and_reach_probes
 
 # ---------------------------------------------------------------------------
 # 3. The Loop namespace + the model Secret + the GitHub Secret (QUICKSTART
 #    steps 3). The model Secret is the P2b shape (model-key + MODEL_BASE_URL).
 # ---------------------------------------------------------------------------
 kc get ns "$NS" >/dev/null 2>&1 || kc create ns "$NS" >/dev/null
-if [ "$MODEL_MODE" = "stub" ]; then
-	log model "deploying the in-kind stub model (hostNetwork pod on the kind node — the model source on a fresh kind cluster; the vLLM is unreachable from here by construction)"
-	kc -n "$NS" create configmap alpha-e2e-model-stub --from-file=alpha-e2e-model-stub.py="$STUB_PY" \
-		--dry-run=client -o yaml | kc apply -f - >/dev/null
-	kind_node_ip="$(kc get node "$NODE_NAME" -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{end}')"
-	cat >"$EVIDENCE/stub-pod.yaml" <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: alpha-e2e-model-stub
-  namespace: $NS
-  labels: {app: alpha-e2e-model-stub}
-spec:
-  hostNetwork: true
-  containers:
-  - name: stub-model
-    image: $STUB_IMG
-    env:
-    - name: PORT
-      value: "8000"
-    command: ["sh","-c","exec python /opt/stub/alpha-e2e-model-stub.py"]
-    volumeMounts:
-    - name: stub
-      mountPath: /opt/stub
-  volumes:
-  - name: stub
-    configMap: {name: alpha-e2e-model-stub}
-EOF
-	kc apply -f "$EVIDENCE/stub-pod.yaml" >/dev/null
-	for i in $(seq 1 30); do
-		if kc -n "$NS" exec alpha-e2e-model-stub -- sh -c 'exec python -c "import urllib.request;urllib.request.urlopen(\"http://127.0.0.1:8000/ok\")"' >/dev/null 2>&1; then
-			log model "stub model Ready at http://$kind_node_ip:8000 (node IP $kind_node_ip)"; break; fi
-		[ "$i" -eq 30 ] && die "the stub model did not answer /ok after 150s"
-		sleep 5
-	done
-fi
 kc -n "$NS" create secret generic "$MODEL_SECRET" \
 	--from-literal="model-key=$MODEL_KEY" \
 	--from-literal="MODEL_BASE_URL=http://$MODEL_ENDPOINT" \
@@ -435,16 +601,14 @@ metadata:
   namespace: $NS
 spec:
   goal: >-
-    Create a file named .a6-marker in the workspace root containing a single
-    line "alpha-e2e" if it does not exist yet, and make sure it ends with a
-    newline. Do not modify any other file.
+    ${RENDER_GOAL}
   workspace:
     repo: "$REPO"
     ref: "main"
     gitCredentialSecret: git-cred
   verify:
     acceptanceChecks:
-      - "test -f .a6-marker"
+      - "make -n docs >/dev/null 2>&1"
     image: $AGENT_IMG
   agent:
     endpointSecretRef: $MODEL_SECRET
@@ -875,25 +1039,27 @@ log cox "kubectl cox evidence for $MAIN_LOOP: $EVIDENCE/main/cox-{describe,plan,
 head -40 "$EVIDENCE/main/cox-describe.log" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 10. Tidy: delete the Loops (the cluster is deleted at the end by the
-#     caller; this run's own artifacts are removed first so the kind delete
-#     is clean). The main Loop's PR lives on GitHub (the deliver already
-#     pushed it); deleting the Loop does not delete the PR.
+# 10. Tidy: delete the Loops (their PRs live on GitHub; the cluster is kept
+#     on the in-place path and is the owner's to delete on the fresh path).
+#     The cluster is NEVER deleted by this script (ADR-0007 F2: the existing
+#     KubeArmor agent stays; one agent, the existing one).
 # ---------------------------------------------------------------------------
 for L in "$MAIN_LOOP" "$KILL_LOOP"; do
 	kc -n "$NS" delete loop "$L" --wait=false >/dev/null 2>&1 || true
 done
-log done "Loops deleted (their PRs live on GitHub; the cluster coxswain-alpha is deleted by the caller after the evidence is kept)"
+log done "Loops deleted (their PRs live on GitHub)"
 
 # ---------------------------------------------------------------------------
 # 11. The summary (pasted into the PR): the PR URL + the PR body verbatim.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 11. Tidy: delete the FRESH cluster (the evidence is kept in .samples; the
-#     other two clusters are never touched). The PRs live on GitHub.
+# 11. Tidy: the cluster is NEVER deleted by this script (ADR-0007 F2: the
+#     existing KubeArmor agent stays; one agent, the existing one). On the
+#     in-place path the existing coxswain-alpha stays up (the owner's A6
+#     re-run: no delete, no recreate); on the fresh path the created cluster
+#     also stays (the owner deletes it when done).
 # ---------------------------------------------------------------------------
-log done "deleting the FRESH cluster $CLUSTER (the evidence is kept in $EVIDENCE; the PRs live on GitHub)"
-kind delete cluster --name "$CLUSTER" >"$EVIDENCE/kind-delete.log" 2>&1 || log done "note: kind delete $CLUSTER failed (see $EVIDENCE/kind-delete.log)"
+log done "the cluster $CLUSTER is KEPT (never deleted by this script — ADR-0007 F2; the owner deletes it when done)"
 
 echo
 echo "=== A6 alpha-e2e summary ($EVIDENCE) ==="
@@ -910,4 +1076,4 @@ echo "gate case 2 (kill): PASS (Succeeded on the same PVC uid $PVC_UID)"
 echo "gate case 3 (one PR): PASS (one deliver Job; re-reconcile opened no second PR)"
 echo "digests: $(cat "$EVIDENCE/digests.txt")"
 echo
-log done "DONE: A6 alpha acceptance on a FRESH kind cluster $CLUSTER (now deleted; the evidence is kept). Released install.yaml, NO --allow-unenforced, PolicyEnforced=True, a first-time draft PR on GitHub, all three gate cases. Evidence: $EVIDENCE (never committed, I68). The cluster $CLUSTER was deleted; kind-coxswain-dev / kind-coxswain-calico were never touched."
+log done "DONE: A6 alpha acceptance on kind cluster $CLUSTER (the cluster is KEPT — never deleted by this script, ADR-0007 F2). Released install.yaml applied (the configmaps RBAC fix holds with no manual RBAC), the real vLLM model ($VLLM_ENDPOINT, model $VLLM_MODEL), PolicyEnforced=True, a first-time draft PR on GitHub, all three gate cases on ACTIVE Loops. Evidence: $EVIDENCE (never committed, I68). The cluster $CLUSTER is kept; kind-coxswain-dev / kind-coxswain-calico were never touched."

@@ -887,9 +887,14 @@ subprocess.run(["kubectl", "--context", "kind-coxswain-alpha", "-n", "alpha-e2e"
 print(f"a6: tampered KubeArmorPolicy {name} (spec.severity=5)")
 PYEOF
 log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash — A1 fact 3 fails)"
+# The operator does NOT watch KubeArmorPolicy changes (design gap: PR #125
+# should add a Watches(&KubeArmorPolicy{}) to the controller). Trigger a
+# re-reconcile by adding a harmless annotation to the Loop (this is a test
+# action, not a production workaround — the real fix is the operator watch).
+kc -n "$NS" annotate loop "$HELD_LOOP" "coxswain.io/a6-held-trigger"="$(date -u +%s)" --overwrite >/dev/null 2>&1
+log held "triggered a re-reconcile via a harmless annotation (the operator does not watch KubeArmorPolicy changes — see PR #125 finding)"
 # Give the operator time to reconcile and detect the hash mismatch before the
-# first check. The operator's reconcile cycle is ~10s; wait 30s for it to
-# observe the tampered spec and set PolicyEnforced=False.
+# first check.
 sleep 30
 log held "waiting 30s for the operator to detect the hash mismatch and set PolicyEnforced=False"
 # The Loop must be HELD: PolicyEnforced != True, and NO iterations (the

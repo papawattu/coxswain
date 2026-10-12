@@ -203,6 +203,13 @@ type LoopReconciler struct {
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
+	// lastDeliverDescriptionEnsureErr is the last non-nil error returned by
+	// ensureDeliverDescriptionConfig on this reconciler (the R27/P1 race fix
+	// holds the deliver Job until the description ConfigMap exists; the
+	// Forbidden path proceeds deliberately with the fallback and does not
+	// hold the Job).
+	lastDeliverDescriptionEnsureErr error
+
 	// readBaseCommit is the baseCommit read-back seam (S3a). The default
 	// (nil) reads the sandbox pod's init container termination message via
 	// the operator's APIReader path (a real, non-cached client) and validates
@@ -365,6 +372,12 @@ type LoopReconciler struct {
 // exit-code reader; the Job runs the operator's trusted check containers, not
 // agent code).
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch;delete
+// A4 (R26): the operator owns the deliver description ConfigMap
+// (ensureDeliverDescriptionConfig / cleanupDeliverDescriptionConfig — the facts
+// body the push container reads to assemble the draft PR description). Only
+// the verbs the code uses: Get (idempotency + foreign guard), Create (ensure),
+// Update (facts changed), Delete (cleanup when delivery is no longer expected).
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;update;delete
 
 // agentPoliciesValid runs the C6a AgentPolicy validation gate: when the
 // referenced AgentPolicies are invalid it sets PolicyValid=False and suspends

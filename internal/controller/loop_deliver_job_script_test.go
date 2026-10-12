@@ -154,8 +154,15 @@ func TestDeliverCloneImportScriptsInSequence(t *testing.T) {
 // deliverContainerScript extracts the shell script from a container built as
 // [sh, -c, <script>] (the deliver Job's container pattern) and fails the
 // test if the shape changed (the test rewrites the pod paths, so it must
-// know exactly what it is running).
-func deliverContainerScript(t *testing.T, c corev1.Container) string {
+// know exactly what it is running). It takes a minimal fatal interface (not
+// *testing.T) so Ginkgo specs can pass GinkgoT()'s FullGinkgoTInterface
+// (which carries Fatal but not the newer testing.TB methods such as
+// ArtifactDir).
+func deliverContainerScript(t interface {
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+	Helper()
+}, c corev1.Container) string {
 	t.Helper()
 	if len(c.Command) != 3 || c.Command[0] != verifySh || c.Command[1] != "-c" {
 		t.Fatalf("deliver container %q command %v; want [sh, -c, <script>]", c.Name, c.Command)

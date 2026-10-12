@@ -136,6 +136,14 @@ const (
 	deliverScratchVol  = "deliver-scratch"
 	deliverAgentVol    = "agent-workspace"
 	deliverAgentSrc    = "/agent-src"
+
+	// A4: the deliver description ConfigMap volume (the operator-built facts
+	// body) and its mount path in the push container (the push script reads
+	// the description.md key; the untrusted agent plan is fenced in by the
+	// script itself, from the agent workspace's .coxswain/PLAN.md — the plan
+	// is NEVER carried in the operator's ConfigMap).
+	deliverDescriptionVol = "deliver-description"
+	deliverDescriptionSrc = "/deliver-description"
 )
 
 // deliver termination-message limits (strict validation, operator read).
@@ -230,6 +238,28 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 		// deleted/recreated) and nothing else changes this pass.
 		return false, true, nil
 	}
+	// The deliver description ConfigMap is ensured BEFORE the deliver Job
+	// (R27/P1): the push container mounts the volume optional and falls back
+	// to the minimal line when it is missing, so if the Job's pod started
+	// before the ConfigMap existed, every PR silently degraded to the
+	// minimal description. Creating the Job only once the ConfigMap exists
+	// (Create/Get succeeded) closes the race.
+	//
+	// The ensure is otherwise BEST-EFFORT (a genuinely foreign ConfigMap of
+	// the same name is left alone). A Forbidden error (the operator lacks
+	// the configmaps RBAC for this namespace — a misinstalled/broken
+	// cluster) is surfaced (logged at ERROR level + a Warning Event, R26)
+	// and deliberately PROCEEDS with the fallback: the delivery must not be
+	// blocked by a broken ConfigMap, and the Warning Event tells the
+	// operator owner every PR is degrading to the minimal line.
+	descCMOK := r.deliverDescriptionConfigReady(ctx, loop)
+	if !descCMOK {
+		logf.FromContext(ctx).Info("Held the deliver Job: the deliver description ConfigMap is not ready (non-forbidden ensure failure; requeueing)", "loop", loop.Name)
+		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
+			coxv1alpha1.ReasonDeliveryInProgress,
+			"deliver Job held: the deliver description ConfigMap is not ready (the push container would fall back to the minimal line)")
+		return true, keep, nil
+	}
 	if ok, err := r.ensureDeliverJob(ctx, loop); err != nil {
 		return false, keep, err
 	} else if ok {
@@ -242,6 +272,96 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 		return false, keep, err
 	}
 	return requeue, keep, nil
+}
+
+// deliverDescriptionConfigReady ensures the deliver description ConfigMap
+// (the R27/P1 ordering fix: it is called BEFORE the deliver Job is created,
+// and returns true only when the ConfigMap exists or the ensure is a
+// deliberate fallback path — the Forbidden case, surfaced as a Warning
+// Event — so a deliver Job is NEVER created while the ConfigMap is missing
+// on a normal (non-Forbidden) path).
+func (r *LoopReconciler) deliverDescriptionConfigReady(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	r.lastDeliverDescriptionEnsureErr = nil
+	if err := r.ensureDeliverDescriptionConfig(ctx, loop); err != nil {
+		if apierrors.IsForbidden(err) {
+			logf.FromContext(ctx).Error(err, "Forbidden: could not ensure the deliver description ConfigMap (the operator lacks configmaps RBAC for this namespace; the PR description degrades to the minimal line)", "loop", loop.Name)
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "DeliveryDescriptionForbidden",
+				"could not ensure the deliver description ConfigMap %s: %v (the operator lacks the configmaps RBAC for this namespace; the draft PR description degrades to the minimal line)", deliverDescriptionConfigName(loop.Name), err)
+			return true // deliberate fallback: proceed with the minimal line.
+		}
+		r.lastDeliverDescriptionEnsureErr = err
+		logf.FromContext(ctx).Error(err, "Could not ensure the deliver description ConfigMap; the deliver Job is held this pass (requeueing)", "loop", loop.Name)
+		return false
+	}
+	return true
+}
+
+// ensureDeliverDescriptionConfig creates (idempotently) the deliver
+// description ConfigMap for a Loop whose delivery is expected (the facts body,
+// rendered from the Loop's spec/status only — A4), and cleans it up when
+// delivery is no longer expected. The push container reads it read-only and
+// optional (a transient read failure must not block the Job; the push script
+// falls back to the minimal line). The ConfigMap is owned by the Loop (the
+// mirror of the deliver netpol lifecycle, I42c-style): a foreign ConfigMap of
+// the same name is left alone.
+func (r *LoopReconciler) ensureDeliverDescriptionConfig(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if !deliveryExpected(loop) {
+		return r.cleanupDeliverDescriptionConfig(ctx, loop)
+	}
+	cmName := deliverDescriptionConfigName(loop.Name)
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: cmName}, cm)
+	if apierrors.IsNotFound(err) {
+		cm = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: loop.Namespace},
+			Data:       map[string]string{deliverDescriptionDataKey: renderDeliverDescriptionBody(deliverDescriptionForLoop(loop))},
+		}
+		if err := controllerutil.SetControllerReference(loop, cm, r.Scheme); err != nil {
+			return fmt.Errorf("set owner ref on deliver description ConfigMap %s: %w", cmName, err)
+		}
+		if err := r.Create(ctx, cm); err != nil {
+			return fmt.Errorf("create deliver description ConfigMap %s: %w", cmName, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get deliver description ConfigMap %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	if !metav1.IsControlledBy(cm, loop) {
+		return nil // foreign: leave alone
+	}
+	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(loop))
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	if cm.Data[deliverDescriptionDataKey] != body {
+		cm.Data[deliverDescriptionDataKey] = body
+		if err := r.Update(ctx, cm); err != nil {
+			return fmt.Errorf("update deliver description ConfigMap %s: %w", cmName, err)
+		}
+	}
+	return nil
+}
+
+// cleanupDeliverDescriptionConfig deletes the deliver description ConfigMap
+// when delivery is no longer expected (the mirror of cleanupDeliverNetpol,
+// I42c-style: a foreign ConfigMap of the same name is left alone).
+func (r *LoopReconciler) cleanupDeliverDescriptionConfig(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: deliverDescriptionConfigName(loop.Name)}, cm)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get deliver description ConfigMap %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	if !metav1.IsControlledBy(cm, loop) {
+		return nil // foreign: leave alone
+	}
+	if err := r.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete deliver description ConfigMap %s/%s: %w", loop.Namespace, loop.Name, err)
+	}
+	return nil
 }
 
 // deliverNetpolName is the deliver Job pod's NetworkPolicy name: <loop>-
@@ -686,6 +806,20 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 			}},
 		})
 	}
+	// A4: the operator-built facts body (the deliver description ConfigMap,
+	// <loop>-deliver-description). Mounted into the push container ONLY
+	// (read-only, optional — optional so a transient ConfigMap read failure
+	// never blocks the Job; the push script falls back to a minimal line when
+	// the key is missing). The ConfigMap is ensured in this reconcile BEFORE
+	// the Job is created (ensureDeliver), so it exists by the time the push
+	// runs.
+	volumes = append(volumes, corev1.Volume{
+		Name: deliverDescriptionVol,
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: deliverDescriptionConfigName(loop.Name)},
+			Optional:             &deliverTrue,
+		}},
+	})
 
 	backoff := int32(0)
 	never := corev1.RestartPolicyNever
@@ -807,6 +941,26 @@ export GIT_TERMINAL_PROMPT=0
 SRC=` + deliverAgentSrc + `
 DEST=` + deliverScratchPath + `
 PINNED=` + shellQuote(verified) + `
+PLAN_SRC=${SRC}/.coxswain/PLAN.md
+PLAN_DST=${DEST}/plan.md
+PLAN_MAX=` + strconv.Itoa(deliverPlanCopyMaxBytes) + `
+# The agent's plan (.coxswain/PLAN.md on the workspace PVC) is agent data
+# that is EXCLUDED from the agent commit (I80/D51 — the commit never carries
+# it), so it can never exist in the ${DEST} checkout. The push container does
+# not mount the agent PVC, so the plan is CARRIED into the scratch volume
+# OUTSIDE the git tree (${DEST}/plan.md, a sibling of the checkout) where the
+# push container reads it from disk. It is treated as untrusted, agent-
+# controlled data: copied only if it is a REGULAR FILE and NOT A SYMLINK
+# (a symlinked PLAN.md is agent-controlled — it could point anywhere on the
+# PVC — and is never followed), and capped at read time (head -c to the cap
+# plus slack; the push python truncates to the whole-line cap).
+if [ -f "${PLAN_SRC}" ] && [ ! -L "${PLAN_SRC}" ]; then
+  head -c "${PLAN_MAX}" "${PLAN_SRC}" > "${PLAN_DST}"
+  echo "deliver import-agent: carried the agent plan to ${PLAN_DST} (capped at ${PLAN_MAX} bytes)"
+else
+  rm -f "${PLAN_DST}"
+  echo "deliver import-agent: no agent plan (absent or a symlink) — the push renders the no-plan line"
+fi
 # The base clone (clone-base's work) must exist: import into it, never wipe
 # or re-init (wiping .git leaves the checked-out base files untracked and
 # the pinned checkout aborts on them).
@@ -894,6 +1048,13 @@ func (r *LoopReconciler) deliverPushContainer(loop *coxv1alpha1.Loop, verified, 
 
 	mounts := []corev1.VolumeMount{
 		{Name: deliverScratchVol, MountPath: deliverScratchPath},
+		// A4: the operator-built facts body (the deliver description
+		// ConfigMap, read-only; optional — the volume mount is optional, so a
+		// missing ConfigMap leaves the key absent and the script falls back
+		// to the minimal line). The push container is the ONLY container that
+		// reads it (the description is assembled in the PR create payload
+		// here; nothing else in the Job touches it).
+		{Name: deliverDescriptionVol, MountPath: deliverDescriptionSrc, ReadOnly: true},
 	}
 	if creds {
 		mounts = append(mounts, corev1.VolumeMount{Name: workspaceCredsVolume, MountPath: "/workspace-creds", ReadOnly: true})
@@ -916,6 +1077,7 @@ PINNED=` + shellQuote(verified) + `
 API_BASE=` + shellQuote(apiBase) + `
 DRAFT=` + strconv.FormatBool(draft) + `
 TITLE_PREFIX=` + shellQuote(draftTitlePrefix) + `
+DESC_DIR=` + deliverDescriptionSrc + `
 PATH_PART=${REPO#*://}
 REMAIN=${PATH_PART#*/}
 OWNER=${REMAIN%%/*}
@@ -997,11 +1159,43 @@ try:
 except Exception:
     pass')
 if [ -n "${PR_NUM}" ]; then
-  # An open PR for the branch: reuse it (idempotent).
+  # An open PR for the branch: reuse it (idempotent) — an existing PR's body
+  # is NOT updated by the operator (the operator's delivery evidence is the
+  # pushed commit + the PR URL; the body is set at create time).
   [ -n "${PR_URL}" ] || { echo "deliver push: existing PR ${PR_NUM} has no html_url"; exit 1; }
 else
-  PAYLOAD=$(printf '{"title":"%scoxswain: %s","head":"%s","base":"%s","body":"Delivered by coxswain from verified commit %s.","draft":%s}' \
-    "${TITLE_PREFIX}" "${BRANCH}" "${BRANCH}" "${BASE}" "${PINNED}" "${DRAFT}")
+  # --- the PR body (A4): the FACTS half comes from the operator's ConfigMap
+  # (the operator built it from the Loop's spec/status only — never a runner
+  # claim), and the PLAN half is the agent-authored .coxswain/PLAN.md. The
+  # plan is EXCLUDED from the agent commit (I80/D51 — the commit never
+  # carries it) and the push container does not mount the agent PVC, so
+  # import-agent carried it into the scratch volume OUTSIDE the git tree
+  # (${SRC}/plan.md — a sibling of the checkout, never inside it) where the
+  # push reads it from disk. The plan is UNTRUSTED DATA: it is fenced into a
+  # clearly labelled section ("Plan (written by the agent, untrusted)"),
+  # capped at PLAN_MAX bytes with a truncation note, and appended AFTER the
+  # facts (the plan can never alter the facts text). The payload is built
+  # with python3 json (the JSON library escapes every byte — quotes,
+  # backslashes, newlines and '}' in either half are impossible to inject
+  # into the payload; a printf of untrusted text into JSON is absent by
+  # construction). Every value is passed to the python via the ENVIRONMENT
+  # (os.environ), never inlined into the python source (a backtick or quote
+  # in a value must not become python or shell code); the plan is read from
+  # DISK by the python itself (never through a shell variable). A missing
+  # plan file (import-agent carried nothing) renders the no-plan line.
+  FACTS_FILE=${DESC_DIR}/description.md
+  FACTS=
+  if [ -f "${FACTS_FILE}" ]; then
+    FACTS=$(cat "${FACTS_FILE}")
+  fi
+  if [ -z "${FACTS}" ]; then
+    FACTS="Delivered by coxswain from verified commit ${PINNED}."
+  fi
+  PLAN_FILE=${SRC}/plan.md
+  PLAN_MAX=` + strconv.Itoa(deliverPlanMaxBytes) + `
+  export BRANCH BASE DRAFT TITLE_PREFIX FACTS PLAN_FILE PLAN_MAX
+  PAYLOAD=$(python3 -c ` + shellQuote(deliverPushPayloadPython) + `)
+  [ -n "${PAYLOAD}" ] || { echo "deliver push: the PR payload was not built (python3 json failed)"; exit 1; }
   # Gitea's PR create can reject a non-existent base branch; the push above
   # already pushed the delivery branch, and the base branch exists on the
   # remote (clone-base fetched it) — a failed create is a hard failure.
@@ -1464,3 +1658,20 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 	}
 	return nil
 }
+
+// deliverPushPayloadPython is the push container's python3 -c program that
+// builds the PR create payload (A4). It reads EVERYTHING from the environment
+// (os.environ): the operator's facts body (FACTS), the untrusted agent plan
+// (read from disk at PLAN_FILE by the python itself, never via a shell
+// variable), the branch/base/title/draft (operator-set shell locals), and the
+// plan cap (PLAN_MAX). The plan is capped at PLAN_MAX bytes (a whole-line
+// truncation) with a truncation note, fenced into a labelled markdown section
+// ("Plan (written by the agent, untrusted)") appended AFTER the facts (the
+// plan can never alter the facts text), and the payload is json.dumps'd (the
+// JSON library escapes every byte -- quotes/backslashes/newlines/} in either
+// half cannot inject into the payload; there is no hand-built JSON and no
+// printf of untrusted text into JSON). The python source is a single Go
+// double-quoted string literal (\n-escaped newlines, \"-escaped quotes, and
+// the fenced-markdown triple-backticks are just characters in the literal --
+// a Go raw string would terminate at the first backtick).
+const deliverPushPayloadPython = "import json, os\nfacts = os.environ.get(\"FACTS\", \"\")\nif not facts:\n    facts = \"Delivered by coxswain (facts unavailable)\"\ntry:\n    with open(os.environ[\"PLAN_FILE\"], \"rb\") as f:\n        raw = f.read()\nexcept OSError:\n    raw = b\"\"\nplan = raw.decode(\"utf-8\", \"replace\")\nplan_max = int(os.environ.get(\"PLAN_MAX\", \"16384\"))\nif len(plan) > plan_max:\n    cut = plan.rfind(\"\\n\", 0, plan_max)\n    if cut < 0:\n        cut = plan_max\n    plan = plan[:cut] + \"\\n(truncated: the plan exceeded the %d-byte cap)\" % plan_max\nif not plan.strip():\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n_(no plan recorded)_\"\nelse:\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n```markdown\\n\" + plan + \"\\n```\"\nbody = facts + plan_section + \"\\n\"\npayload = {\n    \"title\": os.environ[\"TITLE_PREFIX\"] + \"coxswain: \" + os.environ[\"BRANCH\"],\n    \"head\": os.environ[\"BRANCH\"],\n    \"base\": os.environ[\"BASE\"],\n    \"body\": body,\n    \"draft\": os.environ.get(\"DRAFT\", \"true\") == \"true\",\n}\nprint(json.dumps(payload))"

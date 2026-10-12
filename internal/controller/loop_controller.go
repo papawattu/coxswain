@@ -4292,6 +4292,21 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	if err != nil {
 		return err
 	}
+	// fix/watch-kubearmorpolicy (owner D55 2026-10-12): the Kapt spec-hash
+	// gate must be ORDER-INDEPENDENT (read-before-write), like the C6b and
+	// D41c gates. Capture the enforcement observation (the live Kapt's spec
+	// hash + ownership, via Enforcing) BEFORE Enforcer.Apply overwrites the
+	// spec with the canonical one. PolicyEnforced is set from this PRE-Apply
+	// observation (not from a post-Apply read), so a tamper is observed as
+	// held on the detecting pass (PolicyEnforced=False/Reason=KaptTampered,
+	// sandbox Suspended) rather than being silently repaired and read True in
+	// the same pass. The operator still converges the spec (Apply below); the
+	// held state is the detecting pass, and the gate reopens on the
+	// subsequent pass that reads the canonical spec (the watch re-fires on
+	// the operator's own repair write).
+	// Captured unconditionally (before the Enforcer nil check) so the
+	// PolicyEnforced condition always reflects the pre-Apply observation.
+	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
 	if r.Enforcer != nil {
 		// I42f review P2 (round 1): a foreign KubeArmorPolicy occupying one of
 		// the Loop's policy names is NEVER overwritten (createOrUpdateKapt's
@@ -4335,7 +4350,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
 			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
 	}
-	if enf, rs := r.enforcementStatus(ctx, loop); enf {
+	if enf, rs := preApplyEnf, preApplyRs; enf {
 		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
 			"the eBPF engine is enforcing the Loop's effective policy")
 	} else {
@@ -4821,6 +4836,20 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// PolicyNotFound; a policy edit must refresh the recorded hash).
 		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
 			r.agentPolicyToLoopRequests))
+	// The operator owns the per-Loop KubeArmorPolicy (A1/D52 fact 3, name
+	// "coxswain-<loop>"). Watch it so a tamper (a spec change after the
+	// operator applied the canonical policy) re-reconciles the Loop at once
+	// and the Enforcing() spec-hash check re-runs — without the watch, a
+	// tamper is only seen on an unrelated reconcile, and the D30 gate can
+	// stay open on a mismatched spec. The KubeArmorPolicy is unstructured
+	// (the operator uses unstructured.Unstructured + engine.KubeArmorGVK), so
+	// the watch is on an unstructured object with that GVK.
+	{
+		kaptWatch := &unstructured.Unstructured{}
+		kaptWatch.SetGroupVersionKind(engine.KubeArmorGVK)
+		b = b.Watches(kaptWatch, handler.EnqueueRequestsFromMapFunc(
+			r.kubeArmorPolicyToLoopRequests))
+	}
 	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
 	// change enqueues every Loop so it re-reads the cached result and re-gates.
 	// Skipped when nil (envtest: the result is read on each reconcile anyway).
@@ -4863,6 +4892,34 @@ func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj clie
 		})
 	}
 	return requests
+}
+
+// kubeArmorPolicyToLoopRequests maps a KubeArmorPolicy (unstructured,
+// engine.KubeArmorGVK) to the Loop it belongs to, so a tamper re-reconciles
+// that Loop at once (the D30 gate's Enforcing() spec-hash check re-runs).
+// The operator names the per-Loop Kapt "coxswain-<loopName>" (A1/D52 fact 3,
+// ensureKapt + foreignKaptPolicies). A Kapt whose name is not prefixed
+// "coxswain-" (a foreign or unrelated policy) maps to nothing.
+func (r *LoopReconciler) kubeArmorPolicyToLoopRequests(_ context.Context, obj client.Object) []reconcile.Request {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil
+	}
+	name := u.GetName()
+	const prefix = "coxswain-"
+	if !strings.HasPrefix(name, prefix) {
+		return nil
+	}
+	loopName := strings.TrimPrefix(name, prefix)
+	if loopName == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: u.GetNamespace(),
+			Name:      loopName,
+		},
+	}}
 }
 
 // suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it

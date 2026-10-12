@@ -285,8 +285,13 @@ func TestA1PolicySpecHashTampered(t *testing.T) {
 	if enforcing {
 		t.Fatalf("expected enforcing=false (spec hash tampered), got true")
 	}
-	if reason != ReasonEnforcementUnverified {
-		t.Fatalf("expected reason=%s, got %s", ReasonEnforcementUnverified, reason)
+	// fix/watch-kubearmorpolicy (owner D55 2026-10-12): a tampered spec
+	// (live spec != recorded KaptSpecHash) must carry the DISTINCT
+	// KaptTampered reason (the gate names the tamper, not a generic
+	// unverified). The D30 gate holds the sandbox Suspended from this
+	// reason (fail-closed).
+	if reason != ReasonKaptTampered {
+		t.Fatalf("expected reason=%s, got %s", ReasonKaptTampered, reason)
 	}
 }
 

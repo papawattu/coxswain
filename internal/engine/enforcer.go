@@ -77,4 +77,15 @@ const (
 	// Enforcer that reports not-enforcing) so the condition describes the
 	// cluster, not the flag.
 	ReasonEnforcementUnverified = "EnforcementUnverified"
+	// ReasonKaptTampered (fix/watch-kubearmorpolicy, owner D55 2026-10-12): the
+	// live KubeArmorPolicy spec's hash does not match the recorded
+	// KaptSpecHash for a Loop-owned policy — i.e. the spec was changed after
+	// the operator applied it (a tamper). Distinct from
+	// EnforcementUnverified so the PolicyEnforced condition NAMES the tamper
+	// (which fact failed) rather than a generic "unverified." The D30 gate
+	// holds the sandbox Suspended (fail-closed); the operator does NOT
+	// silently repair the tamper on the detecting pass (the read is ordered
+	// before the write — the Kapt spec-hash gate is the one gate that must be
+	// order-independent, like C6b/D41c).
+	ReasonKaptTampered = "KaptTampered"
 )

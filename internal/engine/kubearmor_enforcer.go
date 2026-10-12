@@ -416,17 +416,23 @@ func (e *KubeArmorEnforcer) Enforcing(ctx context.Context, loop *v1alpha1.Loop) 
 	if !metav1.IsControlledBy(kapt, loop) {
 		return false, ReasonEnforcementUnverified
 	}
-	// Spec matches the operator's rendered policy (D52 fact 3).
+	// Spec matches the operator's rendered policy (D52 fact 3). A Loop-owned
+	// policy whose live spec hash differs from the recorded KaptSpecHash was
+	// changed after the operator applied it (a tamper): report the distinct
+	// KaptTampered reason (the D30 gate holds the sandbox Suspended; the
+	// condition names the tamper rather than a generic unverified). An
+	// absent recorded hash (the operator has not applied the policy yet) is
+	// still the generic unverified (it is not a tamper — there is nothing to
+	// compare against).
 	liveSpec, found, _ := unstructured.NestedMap(kapt.Object, KaptSpecKey)
 	if !found {
 		return false, ReasonEnforcementUnverified
 	}
-	liveHash := kaptSpecHash(liveSpec)
 	if loop.Status.Policy == nil || loop.Status.Policy.KaptSpecHash == "" {
 		return false, ReasonEnforcementUnverified
 	}
-	if liveHash != loop.Status.Policy.KaptSpecHash {
-		return false, ReasonEnforcementUnverified
+	if kaptSpecHash(liveSpec) != loop.Status.Policy.KaptSpecHash {
+		return false, ReasonKaptTampered
 	}
 	// Selector matches the sandbox pod template labels. The sandbox pod
 	// template carries the coxswain.io/loop label (ensureSandbox), so the

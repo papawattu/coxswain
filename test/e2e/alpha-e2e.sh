@@ -650,7 +650,8 @@ watch_loop() { # <loop> <outfile>
 	done
 }
 collect_evidence() { # <loop> <tag>
-	local loop="${1:-}" tag="${2:-untagged}" d="$EVIDENCE/$tag"
+	local loop="${1:-<none>}" tag="${2:-untagged}" d="$EVIDENCE/${2:-untagged}"
+	echo "[collect_evidence] loop=$loop tag=$tag d=$d" >&2
 	mkdir -p "$d"
 	kc -n "$NS" get loop "$loop" -o json >"$d/loop.json"
 	kc -n "$NS" get events -o json --field-selector "involvedObject.name=$loop" >"$d/events.json" 2>/dev/null || true
@@ -874,14 +875,16 @@ import json, subprocess, sys
 canon = json.load(open(sys.argv[1]))
 name = sys.argv[2]
 spec = canon.get("spec", {})
-# Mutate: ensure spec.rule exists and set a tamper marker key.
-rule = spec.setdefault("rule", {})
-rule["__a6_tamper__"] = "1"
+# Mutate: change the severity field (a valid KubeArmorPolicy spec field) to a
+# different value. The canonical spec has no severity (or a default); setting
+# it to "High" (a valid KubeArmor severity) changes the spec hash without
+# breaking the schema.
+spec["severity"] = "High"
 canon["spec"] = spec
 out = json.dumps(canon)
 subprocess.run(["kubectl", "--context", "kind-coxswain-alpha", "-n", "alpha-e2e",
                 "apply", "-f", "-"], input=out.encode(), check=True)
-print(f"a6: tampered KubeArmorPolicy {name} (spec.rule.__a6_tamper__=1)")
+print(f"a6: tampered KubeArmorPolicy {name} (spec.severity=High)")
 PYEOF
 log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash — A1 fact 3 fails)"
 # The Loop must be HELD: PolicyEnforced != True, and NO iterations (the

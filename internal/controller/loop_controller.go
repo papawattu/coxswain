@@ -215,6 +215,25 @@ type LoopReconciler struct {
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
+	// workspaceDriverSeam is the B1 checkpoint seam: it resolves the
+	// workspace PVC's CSI driver for the VolumeSnapshotClass support check.
+	// When set (a test drives it directly without a real StorageClass — the
+	// workspace PVC is created with a nil storageClassName, so the live
+	// resolver defers to the default StorageClass, which a test does not
+	// want to read), the operator uses it instead of the live read. nil
+	// (production, most tests) uses the live read.
+	workspaceDriverSeam func(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool)
+
+	// snapshotCRDPresent is the B1 checkpoint seam: it reports whether the
+	// VolumeSnapshot CRD is resolvable (the I88 gate for the watch + the
+	// reconcile-side reads). It is a FUNCTION FIELD (not a method) so a test
+	// can override it (the no-CRD spec sets it to return false without
+	// wiring a RESTMapper that does not resolve the GVK). nil (production,
+	// most tests) reads r.RESTMapper (a nil mapper — a bare test reconciler
+	// without SetupWithManager — is treated as PRESENT, because the test
+	// envtest has the CRD).
+	snapshotCRDPresent func(ctx context.Context) bool
+
 	// lastDeliverDescriptionEnsureErr is the last non-nil error returned by
 	// ensureDeliverDescriptionConfig on this reconciler (the R27/P1 race fix
 	// holds the deliver Job until the description ConfigMap exists; the

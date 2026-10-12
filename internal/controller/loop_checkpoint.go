@@ -125,7 +125,9 @@ func checkpointName(loop *coxv1alpha1.Loop, iteration int) string {
 
 // newVolumeSnapshotObj returns an unstructured VolumeSnapshot for the Loop's
 // workspace PVC checkpoint (B1). The spec.source.persistentVolumeClaimName
-// names the PVC; the snapshot controller provisions the content.
+// names the PVC; the snapshot controller provisions the content. Built as a
+// raw map (the vendored CRD requires spec.source, and envtest does not run
+// CRD defaulting).
 //
 // (The deletionPolicy is intentionally left unset: defaulting is the
 // external-snapshotter controller's job (the CRD does not default it), and
@@ -133,55 +135,72 @@ func checkpointName(loop *coxv1alpha1.Loop, iteration int) string {
 // defaults it differently. B2's restore reads the snapshot; the content's
 // deletionPolicy governs the content's life, not the snapshot object's.)
 func newVolumeSnapshotObj(loop *coxv1alpha1.Loop, name string) *unstructured.Unstructured {
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(volumeSnapshotGVK)
-	u.SetName(name)
-	u.SetNamespace(loop.Namespace)
-	_ = unstructured.SetNestedField(u.Object, workspacePVCName(loop.Name),
-		"spec", "source", "persistentVolumeClaimName")
-	// Label so the finalizer's GC (CleaningUp) can find them without a
-	// name-prefix List: app.kubernetes.io/managed-by + the Loop name.
-	u.SetLabels(map[string]string{
-		"app.kubernetes.io/managed-by": "coxswain",
-		"coxswain.wattu.com/loop":      loop.Name,
-	})
-	return u
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": snapshotGV,
+		"kind":       volumeSnapshotKind,
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": loop.Namespace,
+			"labels": map[string]any{
+				"app.kubernetes.io/managed-by": "coxswain",
+				"coxswain.wattu.com/loop":      loop.Name,
+			},
+		},
+		"spec": map[string]any{
+			"source": map[string]any{
+				"persistentVolumeClaimName": workspacePVCName(loop.Name),
+			},
+		},
+	}}
 }
 
 // snapshotCRDPresent reports whether the VolumeSnapshot CRD is resolvable
-// (the RESTMapper check, I88). The reconcile-side cache reads (the List in
-// ensureCheckpoint and the GC) are gated on this: a List on an absent CRD
-// would make the manager's cache for the type error on every watch refresh
-// (the operator would log errors forever and the cache would never be
-// ready), so the operator only issues snapshot reads when the CRD is
-// present. The cache's lazy watch starts on the FIRST read; gating the first
-// read on the RESTMapper is what keeps a CRD-less cluster clean.
-//
-// It is a METHOD (not an inlined check) so a test can override it directly
-// (the no-CRD spec sets it to false without wiring a RESTMapper; the
-// default reads r.RESTMapper, and a nil mapper — a bare test reconciler —
-// is treated as PRESENT because the test envtest has the CRD).
-func (r *LoopReconciler) snapshotCRDPresent(ctx context.Context) bool {
-	_ = ctx
+// (the I88 gate for the watch + the reconcile-side reads). It is a FUNCTION
+// FIELD (not a method) so a test can override it (the no-CRD spec sets it
+// to return false without wiring a RESTMapper that does not resolve the
+// GVK). The default (nil field) reads r.RESTMapper: a List on an absent
+// CRD would make the manager's cache for the type error on every watch
+// refresh (the operator would log errors forever and the cache would never
+// be ready), so the operator only issues snapshot reads when the CRD is
+// present. The cache's lazy watch starts on the FIRST read; gating the
+// first read on the RESTMapper is what keeps a CRD-less cluster clean. A
+// nil mapper (a bare test reconciler without SetupWithManager) is treated
+// as PRESENT (the test envtest has the CRD).
+func (r *LoopReconciler) snapshotCRDPresentImpl(ctx context.Context) bool {
+	if r.snapshotCRDPresent != nil {
+		return r.snapshotCRDPresent(ctx)
+	}
 	if r.RESTMapper == nil {
-		// No mapper wired (bare test reconciler): assume present (the test
-		// envtest has the CRD).
 		return true
 	}
 	_, err := r.RESTMapper.RESTMapping(volumeSnapshotGVK.GroupKind())
 	return err == nil
 }
 
-// workspaceDriver reads the workspace PVC's CSI driver (the provisioner): the
-// PVC's storageClassName resolves to a StorageClass whose provisioner is the
-// CSI driver a VolumeSnapshotClass must match.
+// snapshotCRDPresent is the call site's entry: it routes to the override
+// (a test) or the live RESTMapper read (production + the default test).
+func (r *LoopReconciler) snapshotCRDPresentCall(ctx context.Context) bool {
+	return r.snapshotCRDPresentImpl(ctx)
+}
+
+// workspaceDriver resolves the workspace PVC's CSI driver (the provisioner).
+// It is the LIVE read: the PVC's storageClassName resolves to a
+// StorageClass whose provisioner is the CSI driver a VolumeSnapshotClass
+// must match. A test drives the B1 checkpoint seam instead
+// (r.workspaceDriverSeam), because the workspace PVC is created with a nil
+// storageClassName (the cluster's default StorageClass), and the live read
+// returns ("", false) for a nil-named PVC (the default is not
+// name-addressable without reading every StorageClass's is-default
+// annotation) — the seam is the test's way to assert the no-support /
+// support branches without a real StorageClass.
 //
 // Returns ("", false) when the PVC does not exist yet, names no
 // storageClassName, or its StorageClass cannot be resolved (the support check
-// is deferred to a later reconcile: the PVC is created by ensureLoopArtifacts
-// before the first verify, so by the time a checkpoint is due the PVC and its
-// StorageClass exist).
+// is deferred to a later reconcile).
 func (r *LoopReconciler) workspaceDriver(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool) {
+	if r.workspaceDriverSeam != nil {
+		return r.workspaceDriverSeam(ctx, loop)
+	}
 	pvc := &corev1.PersistentVolumeClaim{}
 	key := types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}
 	if err := r.Get(ctx, key, pvc); err != nil {
@@ -234,7 +253,7 @@ func (r *LoopReconciler) workspaceDriver(ctx context.Context, loop *coxv1alpha1.
 // not yet been able to verify).
 func (r *LoopReconciler) checkpointSupport(ctx context.Context, loop *coxv1alpha1.Loop) (metav1.ConditionStatus, string, string) {
 	policy := effectiveCheckpointPolicy(loop)
-	if !r.snapshotCRDPresent(ctx) {
+	if !r.snapshotCRDPresentCall(ctx) {
 		return metav1.ConditionFalse, CheckpointReasonCRDMissing,
 			"the VolumeSnapshot CRD is not installed (spec.checkpoints=" + string(policy) + ": " + checkpointPolicyCarryOn(policy) + ")"
 	}
@@ -324,24 +343,47 @@ func (r *LoopReconciler) applyCheckpointConditions(ctx context.Context, loop *co
 	return changed, terminal
 }
 
+// volumeSnapshotClassListGVK is the GVK the operator's cached client uses
+// for the VolumeSnapshotClass List. The list is a NAMESPACED EMPTY list
+// (listType=atomic, no namespace field): a cluster-scoped type read through
+// a NAMESPACED client errors ("the server is trying to watch an object that
+// doesn't exist" / the namespace is ignored), so the operator lists with
+// list.SetNamespace("") and no InNamespace option (the standard idiom for
+// cluster-scoped types through a namespaced cache — the same as the
+// StorageClass read, which uses a bare-name key).
+var volumeSnapshotClassListGVK = schema.GroupVersionKind{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshotClassList"}
+
 // snapshotClassForDriver lists the VolumeSnapshotClasses (cluster-scoped,
-// unstructured) and returns the one whose driver matches. (None, false) when
-// there is no match or the list fails (a list failure is treated as no
-// match: the conservative reading — do not claim availability on a read
-// error, and do not fail the Loop on a transient read either; the next
-// reconcile re-reads).
+// unstructured, via a namespaced empty list) and returns the one whose
+// driver matches. (None, false) when there is no match or the list fails (a
+// list failure is treated as no match: the conservative reading — do not
+// claim availability on a read error, and do not fail the Loop on a transient
+// read either; the next reconcile re-reads).
 func (r *LoopReconciler) snapshotClassForDriver(ctx context.Context, driver string) (*unstructured.Unstructured, bool) {
 	// The CRD presence is the caller's responsibility (checkpointSupport
 	// gates on it); a list on an absent CRD would error, and the operator
 	// would treat the error as "no match" (the conservative reading).
 	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(volumeSnapshotClassGVK)
+	list.SetGroupVersionKind(volumeSnapshotClassListGVK)
+	// cluster-scoped: the namespace must be empty (a cluster-scoped type read
+	// through a namespaced client with a non-empty namespace errors).
+	unstructured.SetNestedField(list.Object, "", "metadata", "namespace")
 	if err := r.List(ctx, list); err != nil {
 		return nil, false
 	}
 	for i := range list.Items {
 		item := &list.Items[i]
-		if d, ok, _ := unstructured.NestedString(item.Object, "spec", "driver"); ok && d == driver {
+		// The vendored v1 VolumeSnapshotClass schema is FLAT (driver at the
+		// top level, not under spec). Read both shapes for robustness (a
+		// future CRD version could nest it; a real csi-hostpath VSC is flat).
+		d, ok1, _ := unstructured.NestedString(item.Object, "driver")
+		d2, ok2, _ := unstructured.NestedString(item.Object, "spec", "driver")
+		drv := d
+		if !ok1 {
+			drv = d2
+			ok1 = ok2
+		}
+		if ok1 && drv == driver {
 			return item, true
 		}
 	}
@@ -378,11 +420,6 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	// numbers are never reused). If status.checkpoint already records
 	// status.iteration, the snapshot is already taken; do not re-create it.
 	if cp := loop.Status.Checkpoint; cp != nil && cp.Iteration == loop.Status.Iteration {
-		return false, false
-	}
-	// No verify has succeeded yet (iteration 0 means no verify ran; the
-	// first successful verify is iteration 1). Nothing to checkpoint.
-	if loop.Status.Iteration < 1 {
 		return false, false
 	}
 	// The support check gates the create (D59). When support is absent:
@@ -554,7 +591,7 @@ func isNotFound(err error) bool {
 func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha1.Loop) (done bool, err error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(volumeSnapshotListGVK)
-	if !r.snapshotCRDPresent(ctx) {
+	if !r.snapshotCRDPresentCall(ctx) {
 		// No CRD: there are no snapshots to delete (the operator never
 		// created any — the support check was False from the start). Done.
 		return true, nil

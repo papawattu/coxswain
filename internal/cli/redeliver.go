@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // redeliverAnnotation is the operator's supported re-delivery trigger (I52,
@@ -32,14 +33,42 @@ func redeliverLoop(ctx context.Context, dc Deps, _, name string, out io.Writer) 
 	if err != nil {
 		return err
 	}
-	_, hasDelivery := getNestedMap(u, "status", "delivery")
+	deliveredMsg := deliveredConditionMessage(u)
 	if err := setAnnotation(ctx, dc, name, redeliverAnnotation, "true"); err != nil {
 		return err
 	}
-	if hasDelivery {
-		newWriter(out).printf("redeliver requested for %s (%s set; a fresh deliver Job will be created for the pinned verifiedCommit)", name, redeliverAnnotation)
-	} else {
-		newWriter(out).printf("redeliver requested for %s (%s set; note: status.delivery is nil, so the operator will re-run delivery if the verifiedCommit is pinned)", name, redeliverAnnotation)
-	}
+	newWriter(out).printf("redeliver requested for %s (%s set; %s)", name, redeliverAnnotation, deliveredMsg)
 	return nil
+}
+
+// deliveredConditionMessage returns a human-readable summary of the Loop's
+// Delivered condition (I82: the old message 'status.delivery is nil' read as
+// 'never delivered' for a failed delivery). It returns 'a fresh deliver Job
+// will be created for the pinned verifiedCommit' when status.delivery exists
+// (a successful delivery), or the condition's status and reason otherwise.
+func deliveredConditionMessage(u *unstructured.Unstructured) string {
+	if _, ok := getNestedMap(u, "status", "delivery"); ok {
+		return "a fresh deliver Job will be created for the pinned verifiedCommit"
+	}
+	// Check the Delivered condition for a more specific message.
+	conds, _ := getNestedSlice(u, "status", "conditions")
+	for _, c := range conds {
+		cm, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cm["type"] != "Delivered" {
+			continue
+		}
+		status, _ := cm["status"].(string)
+		reason, _ := cm["reason"].(string)
+		if status == "True" {
+			return "a fresh deliver Job will be created for the pinned verifiedCommit"
+		}
+		if reason != "" {
+			return "previous delivery failed: " + reason
+		}
+		return "previous delivery failed: " + status
+	}
+	return "status.delivery is nil; the operator will re-run delivery if the verifiedCommit is pinned"
 }

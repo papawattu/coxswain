@@ -803,4 +803,74 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 			"a running agent must not write a progress record (no claim was read)")
 		drainEvents(recorder)
 	})
+
+	It("I89: a ModelUnavailable claim sets the ModelAvailable=False condition", func() {
+		ns := "s4-mau-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		loop, nn := primeReconcile(r, ns, "mauloop")
+		By("priming the fresh Loop to Planning (option B bootstrap)")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+
+		By("standing in for the one-shot runner: a pod whose agent terminated with a ModelUnavailable blocked claim")
+		ensureSandboxObject(ns, "mauloop")
+		createStandinPod(ns, "mauloop")
+		writeAgentTermination(ns, "mauloop",
+			`{"observedPhase":"Planning","status":"blocked","blockedReason":"ModelUnavailable: context deadline exceeded"}`)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		By("setting ModelAvailable=False with reason ModelUnavailable (I89)")
+		found := false
+		for _, c := range loop.Status.Conditions {
+			if c.Type == coxv1alpha1.ModelAvailableCondition {
+				found = true
+				Expect(c.Status).To(Equal(metav1.ConditionFalse))
+				Expect(c.Reason).To(Equal("ModelUnavailable"))
+			}
+		}
+		Expect(found).To(BeTrue(), "the ModelAvailable condition must be present")
+		By("not advancing the phase (a blocked claim is not a completion)")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+	})
+
+	It("I89: a success claim sets the ModelAvailable=True condition", func() {
+		ns := "s4-mar-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		_, nn := primeReconcile(r, ns, "marloop")
+
+		By("standing in for the one-shot runner: a pod whose agent terminated with a success claim")
+		ensureSandboxObject(ns, "marloop")
+		createStandinPod(ns, "marloop")
+		writeAgentTermination(ns, "marloop",
+			`{"observedPhase":"Planning","status":"success"}`)
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		By("setting ModelAvailable=True with reason Recovered (I89)")
+		found := false
+		for _, c := range loop.Status.Conditions {
+			if c.Type == coxv1alpha1.ModelAvailableCondition {
+				found = true
+				Expect(c.Status).To(Equal(metav1.ConditionTrue))
+				Expect(c.Reason).To(Equal("Recovered"))
+			}
+		}
+		Expect(found).To(BeTrue(), "the ModelAvailable condition must be present")
+	})
 })

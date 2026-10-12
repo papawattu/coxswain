@@ -578,9 +578,16 @@ log secrets "model Secret '$MODEL_SECRET' ($MODEL_MODE: $MODEL_ENDPOINT)"
 
 log secrets "creating the GitHub Secret via hack/github-secret.sh (D55: it reads only the token file; the token is never printed)"
 bash "$ROOT/hack/github-secret.sh" "$NS" >"$EVIDENCE/github-secret.log" 2>&1 || { cat "$EVIDENCE/github-secret.log"; die "hack/github-secret.sh failed"; }
-kc -n "$NS" get secret git-cred -o json >"$EVIDENCE/git-cred.json"
-kc -n "$NS" get secret git-cred -o jsonpath='{.type} {.data.username}' | sed 's/base64//'
-log secrets "git-cred present in $NS (kubernetes.io/basic-auth)"
+# D55: never `get secret -o json` — it dumps the base64 token to disk.
+# Record only the Secret's name, type, and key NAMES (no values).
+GIT_CRED_TYPE=$(kc -n "$NS" get secret git-cred -o jsonpath='{.type}' 2>/dev/null || echo "")
+GIT_CRED_KEYS=$(kc -n "$NS" get secret git-cred -o go-template='{{ range $k, $v := .data }}{{ $k }} {{ end }}' 2>/dev/null | tr -s ' ')
+{
+	echo "name: git-cred"
+	echo "type: $GIT_CRED_TYPE"
+	echo "keys: $GIT_CRED_KEYS"
+} >"$EVIDENCE/git-cred.txt"
+log secrets "git-cred present in $NS (type=$GIT_CRED_TYPE, keys=$GIT_CRED_KEYS) — values never dumped (D55)"
 
 # The cox CLI (local build — the CLI is not part of the release image set).
 build_cox
@@ -887,16 +894,13 @@ subprocess.run(["kubectl", "--context", "kind-coxswain-alpha", "-n", "alpha-e2e"
 print(f"a6: tampered KubeArmorPolicy {name} (spec.severity=5)")
 PYEOF
 log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash — A1 fact 3 fails)"
-# The operator does NOT watch KubeArmorPolicy changes (design gap: PR #125
-# should add a Watches(&KubeArmorPolicy{}) to the controller). Trigger a
-# re-reconcile by adding a harmless annotation to the Loop (this is a test
-# action, not a production workaround — the real fix is the operator watch).
-kc -n "$NS" annotate loop "$HELD_LOOP" "coxswain.io/a6-held-trigger"="$(date -u +%s)" --overwrite >/dev/null 2>&1
-log held "triggered a re-reconcile via a harmless annotation (the operator does not watch KubeArmorPolicy changes — see PR #125 finding)"
 # Give the operator time to reconcile and detect the hash mismatch before the
-# first check.
+# first check. (The operator must watch the KubeArmorPolicy it owns —
+# fix/watch-kubearmorpolicy — so a tamper re-reconciles at once. No
+# annotation-touch here: that would mask the watch gap. The held case is
+# proven ONLY when the operator re-reconciles on its own.)
 sleep 30
-log held "waiting 30s for the operator to detect the hash mismatch and set PolicyEnforced=False"
+log held "waiting 30s for the operator to detect the hash mismatch and set PolicyEnforced=False (no Loop touch — the operator must watch the KubeArmorPolicy)"
 # The Loop must be HELD: PolicyEnforced != True, and NO iterations (the
 # sandbox is Suspended; the runner never starts). Assert at intervals for
 # HELD_CAP seconds (it must stay held the whole time, not flip later).
@@ -1075,6 +1079,31 @@ log done "Loops deleted (their PRs live on GitHub)"
 #     also stays (the owner deletes it when done).
 # ---------------------------------------------------------------------------
 log done "the cluster $CLUSTER is KEPT (never deleted by this script — ADR-0007 F2; the owner deletes it when done)"
+
+# ---------------------------------------------------------------------------
+# 10. D55 leak guard: fail if any evidence file contains the decoded or
+#     base64 GitHub token. The check is done WITHOUT printing the token:
+#     we build the search strings from the token file and use grep -l
+#     (names only). If a match is found, we name the file (not its content)
+#     and die.
+# ---------------------------------------------------------------------------
+_d55_guard() {
+	local tok tok_b64 f
+	tok=$(tr -d '\n' < "$TOKEN_FILE" 2>/dev/null) || return 0
+	[ -n "$tok" ] || return 0
+	tok_b64=$(printf '%s' "$tok" | base64 | tr -d '\n')
+	local found=0
+	for f in $(grep -rlF "$tok_b64" "$EVIDENCE"/ 2>/dev/null; grep -rlF "$tok" "$EVIDENCE"/ 2>/dev/null); do
+		[ -n "$f" ] || continue
+		log FATAL "D55 LEAK GUARD: evidence file $f contains the GitHub token (base64 or decoded)"
+		found=1
+	done
+	if [ "$found" = 1 ]; then
+		die "D55 leak guard: at least one evidence file contains the GitHub token. The token file is $TOKEN_FILE (mode $(stat -c %a "$TOKEN_FILE")). The leaked files are named above (content NOT printed). Shred them and fix the script."
+	fi
+	log d55 "leak guard: no evidence file contains the GitHub token (base64 or decoded) — D55 holds"
+}
+_d55_guard
 
 echo
 echo "=== A6 alpha-e2e summary ($EVIDENCE) ==="

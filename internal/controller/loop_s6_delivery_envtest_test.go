@@ -305,7 +305,7 @@ func s6Cond(loop *coxv1alpha1.Loop) (bool, metav1.ConditionStatus, string) {
 // <repo-without-.git>/pulls/7 for a Gitea repo, https://github.com/<o>/<r>/
 // pull/7 for a GitHub delivery; the operator validates it exactly).
 func s6ValidTermination(loop *coxv1alpha1.Loop) string {
-	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
+	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID))
 	commit := loop.Status.CurrentVerify.VerifiedCommit
 	prov, _ := deliverProviderForRepo(loop.Spec.Workspace.Repo)
 	var prURL string
@@ -714,7 +714,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		})
 		loop = s6Reconcile(r, ns, name)
 		Expect(loop.Status.Delivery).ToNot(BeNil(), "a valid termination message must write status.delivery")
-		Expect(loop.Status.Delivery.Branch).To(Equal(deliverBranchName(deliverBranchPrefix(loop), loop.Name)),
+		Expect(loop.Status.Delivery.Branch).To(Equal(deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID))),
 			"branch= is the loop's delivery branch (prefix + name)")
 		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
 		Expect(loop.Status.Delivery.PRNumber).To(BeEquivalentTo(7))

@@ -369,8 +369,29 @@ func (r *LoopReconciler) cleanupDeliverDescriptionConfig(ctx context.Context, lo
 // DNS-1035 budget for a 55-char (the max valid) Loop name).
 func deliverNetpolName(loopName string) string { return derivedName(loopName, "-deliver-np") }
 
-// deliverBranchName is the delivery branch: <prefix><loop-name>.
-func deliverBranchName(prefix, loopName string) string { return prefix + loopName }
+// deliverBranchName is the delivery branch: <prefix><loop-name>-<uid8>, where
+// uid8 is the first 8 characters of the Loop's metadata.uid (I81).
+//
+// The uid suffix makes the branch UNIQUE PER LOOP INSTANCE: an earlier Loop of
+// the same name (this cluster or another) leaves <prefix><loop-name>-<olduid8>
+// on the remote, which used to reject the new Loop's push ("fetch first") and
+// made the Loop — and a `cox redeliver` of it — unable to deliver until the
+// remote branch was deleted by hand. Branches never collide and nothing is
+// overwritten. The first 8 chars (per I81; the review's `<uid[:8]>`) are
+// enough to distinguish two same-name Loops (k8s UIDs are 15-char lowercase
+// alphanumerics; 8 chars = 48 bits, collision-negligible in practice) and
+// keep the branch name short.
+//
+// An empty uid (only the in-process unit tests build Loops without one; the
+// reconciler always has a uid set by the API) degrades to <prefix><loop-name>
+// so the function never emits a dangling hyphen and a test loop still gets a
+// stable branch.
+func deliverBranchName(prefix, loopName, uid string) string {
+	if len(uid) < 8 {
+		return prefix + loopName
+	}
+	return prefix + loopName + "-" + uid[:8]
+}
 
 // deliverBaseBranch resolves spec.delivery.baseBranch (default
 // spec.workspace.ref; default "main" when the workspace ref is empty).
@@ -695,7 +716,7 @@ func (r *LoopReconciler) ensureDeliverJob(ctx context.Context, loop *coxv1alpha1
 			return false, fmt.Errorf("create deliver Job %s: %w", jobName, err)
 		}
 		logf.FromContext(ctx).Info("Created deliver Job", "job", jobName, "loop", loop.Name,
-			"verifiedCommit", verified, "branch", deliverBranchName(deliverBranchPrefix(loop), loop.Name))
+			"verifiedCommit", verified, "branch", deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID)))
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryInProgress, "deliver Job in progress")
 		return true, nil
@@ -779,7 +800,7 @@ func deliverJobLabels(loopName string) map[string]string {
 // a failure is not retried), RestartPolicy Never.
 func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.JobSpec {
 	verified := loop.Status.CurrentVerify.VerifiedCommit
-	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
+	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID))
 	base := deliverBaseBranch(loop)
 
 	inits := []corev1.Container{
@@ -1311,7 +1332,7 @@ func parseDeliverTermination(msg string, loop *coxv1alpha1.Loop) (deliverOutcome
 		return deliverOutcome{}, false, fmt.Errorf("termination message too large (%d bytes; max %d)", len(msg), deliverTermMsgMaxBytes)
 	}
 	verified := loop.Status.CurrentVerify.VerifiedCommit
-	wantBranch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
+	wantBranch := deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID))
 	prov, repoHost := deliverProviderForRepo(loop.Spec.Workspace.Repo)
 
 	fields := map[string]string{}

@@ -114,7 +114,7 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
 		},
 	}
-	branch := deliverBranchName(deliverBranchPrefix(loop), loopName)
+	branch := deliverBranchName(deliverBranchPrefix(loop), loopName, string(loop.UID))
 
 	// The fake Gitea API: GET /pulls (idempotency lookup) -> empty list;
 	// POST /pulls (create) -> draft PR number 42. Records every POST so the
@@ -259,7 +259,7 @@ func TestDeliverTerminationPRURLStrict(t *testing.T) {
 		},
 		Status: coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "1111111111111111111111111111111111111111"}},
 	}
-	branch := deliverBranchName(deliverBranchPrefix(giteaLoop), giteaLoop.Name)
+	branch := deliverBranchName(deliverBranchPrefix(giteaLoop), giteaLoop.Name, string(giteaLoop.UID))
 
 	t.Run("Gitea: the kind repo's own PR page is accepted", func(t *testing.T) {
 		msg := "branch=" + branch + "\ncommit=1111111111111111111111111111111111111111\nprNumber=1\nprURL=http://gitea.samples.svc:3000/samples/gocli/pulls/1\n"
@@ -670,7 +670,7 @@ func TestDeliverPushScriptRefusesWhenDefaultBranchLookupFails(t *testing.T) {
 			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
 		},
 	}
-	branch := deliverBranchName(deliverBranchPrefix(loop), loopName)
+	branch := deliverBranchName(deliverBranchPrefix(loop), loopName, string(loop.UID))
 
 	// The credential files.
 	credsDir := t.TempDir()
@@ -789,7 +789,7 @@ func TestDeliverPushScriptRecordsTopLevelJSONFields(t *testing.T) {
 			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
 		},
 	}
-	branch := deliverBranchName(deliverBranchPrefix(loop), loopName)
+	branch := deliverBranchName(deliverBranchPrefix(loop), loopName, string(loop.UID))
 
 	// The nested objects: each response body carries, AFTER the top-level
 	// fields, a nested repo object with its own (different) default_branch,

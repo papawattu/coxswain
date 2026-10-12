@@ -94,13 +94,36 @@ var _ = Describe("I45: ValidatingAdmissionPolicy denies ephemeral containers on 
 		Expect(vap).NotTo(BeNil(), "shipped YAML has a ValidatingAdmissionPolicy document")
 		Expect(vapb).NotTo(BeNil(), "shipped YAML has a ValidatingAdmissionPolicyBinding document")
 
+		// I85: the admission kustomization is standalone (not under
+		// config/default) and applies `namePrefix: coxswain-` to the VAP and
+		// binding metadata.name, but NOT to spec.policyName (a spec field —
+		// the raw file carries the prefixed name explicitly). The envtest
+		// creates the objects directly (not through kustomize), so it must
+		// apply the same namePrefix here: rename the VAP and binding to
+		// coxswain-<base> and ensure the binding's namespace exists.
+		vapNamePrefix := "coxswain-"
+		if !strings.HasPrefix(vap.Name, vapNamePrefix) {
+			vap.Name = vapNamePrefix + vap.Name
+		}
+		if !strings.HasPrefix(vapb.Name, vapNamePrefix) {
+			vapb.Name = vapNamePrefix + vapb.Name
+		}
+		// The binding is namespaced (namespace: coxswain-system in the raw
+		// YAML). Ensure the namespace exists in the envtest cluster.
+		if vapb.Namespace != "" {
+			_ = k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: vapb.Namespace}})
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: vapb.Namespace}})
+			})
+		}
+
 		ExpectWithOffset(1, k8sClient.Create(ctx, vap)).To(Succeed())
 		DeferCleanup(func() {
 			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: vap.Name}})
 		})
 		ExpectWithOffset(1, k8sClient.Create(ctx, vapb)).To(Succeed())
 		DeferCleanup(func() {
-			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: vapb.Name}})
+			_ = k8sClient.Delete(ctx, &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: vapb.Name, Namespace: vapb.Namespace}})
 		})
 		// NOTE: the apiserver needs a moment to load a freshly-applied VAP into
 		// the ValidatingAdmissionPolicy plugin's cache. We do NOT wait here —

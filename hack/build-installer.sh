@@ -60,6 +60,13 @@ printf '\npatches:\n- path: install-args.patch.yaml\n  target:\n    kind: Deploy
 
 mkdir -p "$ROOT/dist"
 "$KUSTOMIZE" build "$OVERLAY/config/default" > "$ROOT/dist/install.yaml"
-"$KUSTOMIZE" build "$OVERLAY/config/cni-probe" >> "$ROOT/dist/install.yaml"
+# I85: the admission (ValidatingAdmissionPolicy + binding) and the cni-probe
+# (Namespace + SA + Role + RoleBinding) are standalone kustomizations built
+# SEPARATELY from config/default. A `---` separator is prepended so the last
+# doc of the previous build and the first doc of the appended build are
+# distinct documents (without it, kubectl apply bundles them into one doc
+# and fails on strict decoding).
+{ echo '---'; "$KUSTOMIZE" build "$OVERLAY/config/admission"; } >> "$ROOT/dist/install.yaml"
+{ echo '---'; "$KUSTOMIZE" build "$OVERLAY/config/cni-probe"; } >> "$ROOT/dist/install.yaml"
 
 echo "dist/install.yaml rendered with tag $TAG (controller=$IMG)"

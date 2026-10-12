@@ -185,12 +185,17 @@ func TestPolicyYAMLBindingIsDeny(t *testing.T) {
 	}
 
 	// The binding must reference the policy by name. We read the policy name
-	// from the same file to keep them in sync.
+	// from the same file to keep them in sync. The admission kustomization
+	// applies `namePrefix: coxswain-`, which transforms metadata.name but NOT
+	// spec.policyName (a spec field). The raw file's spec.policyName must
+	// carry the PREFIXED name (coxswain-<base>) so the rendered binding
+	// references the rendered VAP. The test extracts the raw VAP
+	// metadata.name and applies the same prefix the kustomization uses.
 	data, err := os.ReadFile(policyYAMLRelativePath)
 	if err != nil {
 		t.Fatalf("reading config/admission/validating_admission_policy.yaml: %v", err)
 	}
-	policyName := ""
+	var baseName string
 	for doc := range strings.SplitSeq(string(data), "\n---") {
 		var m struct {
 			Kind     string `yaml:"kind"`
@@ -202,15 +207,19 @@ func TestPolicyYAMLBindingIsDeny(t *testing.T) {
 			continue
 		}
 		if m.Kind == "ValidatingAdmissionPolicy" {
-			policyName = m.Metadata.Name
+			baseName = m.Metadata.Name
 			break
 		}
 	}
-	if policyName == "" {
+	if baseName == "" {
 		t.Fatalf("could not find ValidatingAdmissionPolicy metadata.name in %s", policyYAMLRelativePath)
 	}
-	if b.PolicyName != policyName {
-		t.Errorf("binding policyName = %q, want %q (must match the policy document's metadata.name)", b.PolicyName, policyName)
+	// The admission kustomization applies namePrefix: coxswain- (see
+	// config/admission/kustomization.yaml). The rendered VAP name is
+	// coxswain-<baseName>; the binding's spec.policyName must match.
+	renderedPolicyName := "coxswain-" + baseName
+	if b.PolicyName != renderedPolicyName {
+		t.Errorf("binding policyName = %q, want %q (must match the rendered policy name: namePrefix 'coxswain-' + raw metadata.name %q)", b.PolicyName, renderedPolicyName, baseName)
 	}
 }
 

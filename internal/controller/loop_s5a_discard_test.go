@@ -100,7 +100,7 @@ var _ = Describe("S5a: consumed-claim discard (OS5 P3)", func() {
 		// is re-consumed — the machine spuriously advances to Verifying (a
 		// verify Job would then be built against the WRONG commit) and
 		// progress re-stamps with the stale claim.
-		pending, changed := r.advancePhaseFromClaim(ctx, loop)
+		pending, changed, _ := r.advancePhaseFromClaim(ctx, loop)
 		Expect(pending).To(BeFalse())
 		Expect(changed).To(BeFalse(), "a consumed success claim must not re-stamp progress or re-advance (M5: drop the discard guard -> the stale Planning claim spuriously advances to Verifying)")
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
@@ -109,7 +109,7 @@ var _ = Describe("S5a: consumed-claim discard (OS5 P3)", func() {
 
 		// The discard is STATELESS: the SAME claim is re-discarded on the
 		// next reconcile (until the pod is recycled).
-		pending, changed = r.advancePhaseFromClaim(ctx, loop)
+		pending, changed, _ = r.advancePhaseFromClaim(ctx, loop)
 		Expect(pending).To(BeFalse())
 		Expect(changed).To(BeFalse(), "the discard is stateless: the SAME claim is re-discarded on the next reconcile")
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
@@ -120,7 +120,7 @@ var _ = Describe("S5a: consumed-claim discard (OS5 P3)", func() {
 		// The discard guard applies to SUCCESS claims only. Iteration 2
 		// matches the current status iteration (the same-cycle marker).
 		swapClaim(&PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "blocked", BlockedReason: "model timeout", Iteration: 2})
-		pending, changed = r.advancePhaseFromClaim(ctx, loop)
+		pending, changed, _ = r.advancePhaseFromClaim(ctx, loop)
 		Expect(pending).To(BeFalse())
 		Expect(changed).To(BeTrue(), "a BLOCKED claim on the current phase is still recorded into progress (OS1)")
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "a blocked claim never advances")

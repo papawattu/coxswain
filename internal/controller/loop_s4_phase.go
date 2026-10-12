@@ -469,21 +469,25 @@ func progressEqual(a, b *coxv1alpha1.ProgressStatus) bool {
 // sandbox pod's termination message and advances the phase machine. The claim
 // reader is the ONLY claim source (the legacy B1 seam that fell back to
 // status.observedPhase was deleted in R17 — it clobbered progress while a
-// phase was running). Returns (claimReadPending, changed):
+// phase was running). Returns (claimReadPending, changed, advancedFrom):
 // claimReadPending is true when the operator must requeue (the claim reader
 // found nothing or a malformed claim); changed is true when the Loop's status
-// was mutated (progress record or phase advance).
-func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
+// was mutated (progress record or phase advance); advancedFrom is the phase
+// the machine advanced FROM ("" when it did not advance — the caller emits
+// the PhaseAdvanced Event only after the status update persists the advance,
+// I83: a Conflict on the status update must not double-emit the event).
+func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, coxv1alpha1.LoopPhase) {
 	claimReadPending := false
 	changed := false
+	var advancedFrom coxv1alpha1.LoopPhase
 	// P2f: the claim reader is INERT while paused (the agent container is
 	// stopped; a claim that does arrive while paused — e.g. from a pod mid-run
 	// at pause time — is ignored: the nextPhase gate is phase != Paused).
 	if loop.Status.Phase == coxv1alpha1.LoopPhasePaused {
-		return false, false
+		return false, false, ""
 	}
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded || loop.Status.Phase == coxv1alpha1.LoopPhaseFailed {
-		return false, false
+		return false, false, ""
 	}
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
 		// Verifying is evidence-gated (B3, S5): the runner does NOT execute
@@ -495,7 +499,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// exits 1 with a blocked claim on every restart because desired-phase
 		// is Verifying, and the OS1 progress record would flap on every 5s
 		// requeue (a churn the kind run observed live).
-		return false, false
+		return false, false, ""
 	}
 	claim, cerr := r.resolvePhaseClaim(ctx, loop)
 	if cerr != nil {
@@ -535,7 +539,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("stale claim from a previous iteration ignored",
 				"claimIteration", claim.Iteration,
 				"statusIteration", loop.Status.Iteration)
-			return false, false
+			return false, false, ""
 		}
 		// S5a (OS5 P3): a CONSUMED claim is discarded, not re-consumed.
 		// advancePhaseFromClaim runs every reconcile while the phase is not
@@ -564,7 +568,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("claim already consumed (observedPhase no longer matches the current phase); discarding",
 				"observedPhase", claim.ObservedPhase,
 				"currentPhase", loop.Status.Phase)
-			return false, false
+			return false, false, ""
 		}
 		// S4 review P2 (R18): the clock is injected (r.now, defaulting to
 		// metav1.Now) so a test can advance it more than 1s between reconciles
@@ -589,7 +593,12 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// affect the phase machine or the verify decision).
 		r.applyModelAvailableCondition(loop, claim)
 		if advanced {
-			r.emitPhaseAdvancedEvent(loop, fromPhase)
+			// I83: the PhaseAdvanced Event is NOT emitted here. It is queued
+			// (advancedFrom) and emitted by the caller only after the status
+			// update persists the advance. Emitting here (before the status
+			// update) is the race that double-emits the event when the status
+			// update returns a Conflict and the requeue re-processes the claim.
+			advancedFrom = fromPhase
 		}
 	} else {
 		// claim == nil && cerr == nil: the agent has not terminated yet.
@@ -605,7 +614,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	// ported to inject claims through the readPhaseClaim test seam instead
 	// (loop_phase_transition_envtest_test.go). The claim reader is the ONLY
 	// claim source: if it found nothing, the operator records nothing.
-	return claimReadPending, changed
+	return claimReadPending, changed, advancedFrom
 }
 
 // applyModelAvailableCondition (I89) maps the runner claim's model

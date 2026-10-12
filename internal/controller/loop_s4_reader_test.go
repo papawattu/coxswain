@@ -20,22 +20,133 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
+
+// conflictOnceClient (I83) wraps a client.Client so the FIRST status update
+// on a Loop returns a Conflict (a stale-cache read) and later updates pass
+// through. It implements client.Client by delegating to the inner client and
+// overriding SubResource so the status subresource client fires the Conflict
+// once. (interceptor.NewClient needs a WithWatch, which the envtest plain
+// client does not provide.)
+type conflictOnceClient struct {
+	inner client.Client
+	mu    sync.Mutex
+	left  int
+}
+
+type conflictStatusClient struct {
+	c   client.Client
+	sub string
+	cc  *conflictOnceClient
+}
+
+func (s *conflictStatusClient) Get(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceGetOption) error {
+	return s.c.SubResource(s.sub).Get(ctx, obj, subResource, opts...)
+}
+
+func (s *conflictStatusClient) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	return s.c.SubResource(s.sub).Create(ctx, obj, subResource, opts...)
+}
+
+func (s *conflictStatusClient) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if _, ok := obj.(*coxv1alpha1.Loop); ok {
+		s.cc.mu.Lock()
+		if s.cc.left > 0 {
+			s.cc.left--
+			s.cc.mu.Unlock()
+			return apierrors.NewConflict(
+				schema.GroupResource{Group: coxv1alpha1.GroupVersion.Group, Resource: "loops"}, obj.GetName(),
+				errors.New("stale cache"))
+		}
+		s.cc.mu.Unlock()
+	}
+	return s.c.SubResource(s.sub).Update(ctx, obj, opts...)
+}
+
+func (s *conflictStatusClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	return s.c.SubResource(s.sub).Patch(ctx, obj, patch, opts...)
+}
+
+func (s *conflictStatusClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	return s.c.SubResource(s.sub).Apply(ctx, obj, opts...)
+}
+
+func (c *conflictOnceClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.inner.Get(ctx, key, obj, opts...)
+}
+
+func (c *conflictOnceClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.inner.List(ctx, list, opts...)
+}
+
+func (c *conflictOnceClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	return c.inner.Create(ctx, obj, opts...)
+}
+
+func (c *conflictOnceClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+	return c.inner.Apply(ctx, obj, opts...)
+}
+
+func (c *conflictOnceClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	return c.inner.Delete(ctx, obj, opts...)
+}
+
+func (c *conflictOnceClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	return c.inner.Update(ctx, obj, opts...)
+}
+
+func (c *conflictOnceClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	return c.inner.Patch(ctx, obj, patch, opts...)
+}
+
+func (c *conflictOnceClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
+	return c.inner.DeleteAllOf(ctx, obj, opts...)
+}
+
+func (c *conflictOnceClient) GroupVersionKindFor(obj runtime.Object) (schema.GroupVersionKind, error) {
+	return c.inner.GroupVersionKindFor(obj)
+}
+
+func (c *conflictOnceClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
+	return c.inner.IsObjectNamespaced(obj)
+}
+
+func (c *conflictOnceClient) Scheme() *runtime.Scheme {
+	return c.inner.Scheme()
+}
+
+func (c *conflictOnceClient) RESTMapper() meta.RESTMapper {
+	return c.inner.RESTMapper()
+}
+
+func (c *conflictOnceClient) Status() client.SubResourceWriter {
+	return c.SubResource("status")
+}
+
+func (c *conflictOnceClient) SubResource(name string) client.SubResourceClient {
+	return &conflictStatusClient{c: c.inner, sub: name, cc: c}
+}
 
 // S4 (ADR-0004, R19 OS1/OS5/OS8): the runner as a one-shot phase driver and
 // the operator's claim reader.
@@ -872,5 +983,123 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 			}
 		}
 		Expect(found).To(BeTrue(), "the ModelAvailable condition must be present")
+	})
+
+	// I83: a Conflict on the status update must not double-emit the
+	// PhaseAdvanced Event. The pre-fix code emitted the event DURING claim
+	// processing (advancePhaseFromClaim), BEFORE Reconcile persisted the status
+	// via Status().Update. If that Update returned a Conflict (a stale-cache
+	// read), the reconcile errors and requeues; on the retry the stored phase
+	// is still the old one, the claim is re-processed, the advance fires again,
+	// and the event is emitted a second time (~1s later — the A2 control run's
+	// two events). The fix queues the event (advancedFrom) and emits it only
+	// after the status update persists the advance (finalizeLoopStatus), so a
+	// Conflict (the update fails) emits nothing and the requeue emits exactly
+	// once. The spec wraps the reconciler's client so the FIRST status update
+	// on the Loop returns a Conflict, reconciles twice with a success claim
+	// (the S4 reader seam), and asserts exactly one PhaseAdvanced event. The
+	// mutation (emit before the status update again) fails the spec with two
+	// events.
+	It("I83: a Conflict on the status update emits exactly one PhaseAdvanced event", func() {
+		ns := "i83-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		// conflictOnce fires a Conflict on the first Loop status update only;
+		// later updates pass through. Only the Loop is intercepted (a Pod
+		// status update must not conflict — the stand-in pod write must land).
+		// left starts at 0 so the bootstrap and the Planning -> Implementing
+		// advance pass through; it is armed to 1 just before the
+		// Implementing -> Verifying advance.
+		conflictClient := &conflictOnceClient{inner: k8sClient, left: 0}
+
+		recorder := record.NewFakeRecorder(64)
+		r := &LoopReconciler{
+			Client:    conflictClient,
+			Scheme:    k8sClient.Scheme(),
+			apiReader: k8sClient,
+			Recorder:  recorder,
+		}
+		primed, nn := primeReconcile(r, ns, "i83lp")
+		Expect(primed.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+
+		// Pin the baseCommit and create the stand-in pod + sandbox.
+		ensureSandboxObject(ns, "i83lp")
+		createStandinPod(ns, "i83lp")
+		pinsLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, pinsLoop)).To(Succeed())
+		pinsLoop.Status.BaseCommit = s3BaseCommitSHA
+		Expect(k8sClient.Status().Update(ctx, pinsLoop)).To(Succeed())
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "i83lp-sandbox", Namespace: ns}, pod)).To(Succeed())
+		terminated := int32(0)
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: terminated, Message: s3BaseCommitSHA}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// Advance Planning -> Implementing (claim 1); the status update
+		// succeeds (the Conflict is armed for the NEXT Loop status update).
+		loop := oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		_ = drainEvents(recorder)
+
+		// Arm the Conflict for the Implementing -> Verifying advance's status
+		// update. The first Loop status update from here on returns Conflict.
+		conflictClient.mu.Lock()
+		conflictClient.left = 1
+		conflictClient.mu.Unlock()
+
+		// Write the Implementing success claim. The claim is read via the
+		// reconciler's readPhaseClaim stub (the S4 reader seam): the stub
+		// returns the Implementing success claim directly, bypassing the pod's
+		// termination message. This makes the spec deterministic (the operator's
+		// sandbox-recycle on the Planning -> Implementing advance would
+		// otherwise delete the stand-in pod and wipe the claim before the
+		// advance reads it). The Conflict is on the status update, which is the
+		// I83 mechanism under test.
+		implClaim := &PhaseClaim{
+			ObservedPhase: coxv1alpha1.LoopPhaseImplementing,
+			Status:        claimSuccess,
+			HeadCommit:    "e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+		}
+		// The reconciler's S4 reader seam: the stub returns the Implementing
+		// success claim for every reconcile (both the first and the requeue,
+		// so the requeue re-processes the same claim). This bypasses the pod's
+		// termination message (the operator's sandbox-recycle would otherwise
+		// delete the stand-in pod and wipe the claim).
+		r.readPhaseClaim = func(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return implClaim, nil
+		}
+		_, err1 := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err1).To(HaveOccurred(), "the first status update returns Conflict, so the reconcile must error (requeue)")
+
+		// The requeue: re-read the Loop (phase still Implementing, the status
+		// update failed), re-process the claim, and (today) emit a SECOND
+		// PhaseAdvanced Event. The Conflict is now exhausted, so the status
+		// update succeeds.
+		_, err2 := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err2).NotTo(HaveOccurred(), "the requeued reconcile's status update succeeds")
+
+		// Exactly one PhaseAdvanced event for the Implementing -> Verifying
+		// transition (the Conflict must not double-emit).
+		events := drainEvents(recorder)
+		var implToVerify []string
+		for _, e := range events {
+			if strings.Contains(e, "Implementing -> Verifying") {
+				implToVerify = append(implToVerify, e)
+			}
+		}
+		Expect(implToVerify).To(HaveLen(1),
+			"exactly one PhaseAdvanced event for the Implementing -> Verifying transition; a Conflict on the status update must not double-emit. got %v", implToVerify)
+
+		// The persisted phase must be Verifying (the requeued reconcile
+		// committed the advance).
+		final := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, final)).To(Succeed())
+		Expect(final.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 	})
 })

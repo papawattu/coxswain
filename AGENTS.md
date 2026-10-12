@@ -174,7 +174,7 @@ make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
 
-### Test norms (R16 I43; R20 I49; R21 I55; R25 I84)
+### Test norms (R16 I43; R20 I49; R21 I55; R25 I84; R26 I90)
 
 - Every object the controller reconciles gets at least one **same-Loop**
   envtest spec that changes an input and re-reconciles, asserting the object
@@ -244,6 +244,31 @@ make test       # Run unit tests
   passwords). Evidence may record the Secret's **name, type, and key names**
   (e.g. `kubectl get secret git-cred -o go-template='{{.type}} {{range $k, $v := .data}}{{$k}} {{end}}'`),
   never its data.
+- **A release defect found by an e2e is reported and fixed in the release,
+  never worked around in the script** (R26 I90). If the e2e fails because
+  `install.yaml` is missing a resource (an RBAC rule, a
+  ValidatingAdmissionPolicyBinding, a Namespace) or a rendered manifest is
+  wrong, the fix is in the release (the kustomization, the build script, or
+  the operator code) — not a hand-applied `kubectl apply` or a patch in the
+  e2e script. A workaround in the script hides the defect from every future
+  release and from the review.
+- **A fallback must surface its failure before it degrades** (R26 I90). If
+  the operator falls back to a degraded path (e.g. a best-effort ConfigMap
+  ensure, a missing-escalation fallback), it must emit an Event or set a
+  condition (e.g. `ModelAvailable=False`, a `Degrade` condition) so the
+  degradation is visible to `kubectl cox describe` and the review. A silent
+  fallback that hides a missing permission or a missing resource turns a
+  loud failure into a confusing one-line PR body or a stuck Loop.
+- **Every fix branch starts from `main`** (R26 I90). When opening a branch
+  to fix an issue, always `git checkout -b <branch> origin/main` (or
+  `git checkout -b <branch> main` after a pull). Never cut a fix branch
+  from a feature branch or a release branch — that carries unreviewed
+  changes from the parent branch into the fix PR and muddies the review.
+- **Kill by PID, never `pkill -f`** (R26 I90). `pkill -f <pattern>` matches
+  any process whose full command line contains the pattern, which can kill
+  an unrelated process (e.g. a shell that has the pattern in its
+  arguments, or the builder's own agent process). Use `kill <pid>` or
+  `kill $(pgrep -x <name>)` instead.
 
 ## CLI Commands Cheat Sheet
 

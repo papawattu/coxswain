@@ -377,7 +377,7 @@ type LoopReconciler struct {
 // body the push container reads to assemble the draft PR description). Only
 // the verbs the code uses: Get (idempotency + foreign guard), Create (ensure),
 // Update (facts changed), Delete (cleanup when delivery is no longer expected).
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;delete
 
 // agentPoliciesValid runs the C6a AgentPolicy validation gate: when the
 // referenced AgentPolicies are invalid it sets PolicyValid=False and suspends

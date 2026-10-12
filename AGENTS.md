@@ -174,7 +174,7 @@ make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
 
-### Test norms (R16 I43; R20 I49; R21 I55)
+### Test norms (R16 I43; R20 I49; R21 I55; R25 I84)
 
 - Every object the controller reconciles gets at least one **same-Loop**
   envtest spec that changes an input and re-reconciles, asserting the object
@@ -216,6 +216,34 @@ make test       # Run unit tests
 - When a reviewer names a mutation, the builder applies **exactly** that diff
   in a scratch worktree and records the result. A broader mutation doesn't
   count.
+- **An e2e never prints PASS for a skipped or unproven step** (R25 I84). If a
+  step is skipped (e.g. a condition is not met, a resource is absent), the
+  script must say so explicitly and must not print a PASS line for that step.
+  If a step is attempted but its outcome is not verified (e.g. the evidence
+  was captured before the operation completed), the script must record the
+  uncertainty, not a PASS.
+- **A validation checks the content's meaning, not just that it parses**
+  (R25 I84). A `jq` or `python -c` that only asserts the JSON is well-formed
+  (e.g. `jq .` succeeds) is not a validation. It must assert a meaningful
+  field (e.g. `.kind == "Event"`, `.status == "Succeeded"`, `.metadata.name
+  == "expected"`). A file that parses but is the wrong resource or the wrong
+  shape must fail the validation.
+- **An evidence claim names the file and line it comes from** (R25 I84). A
+  claim in a PR or review reply that cites evidence (a log line, a condition,
+  a phase) must name the file path (relative to the repo or the evidence dir)
+  and, where practical, the line number or a grep pattern. "The log shows X"
+  without naming the file is not an evidence claim.
+- **A claimed cause must be shown, not inferred** (R25 I84, extending I76).
+  "Would have completed if given time", "the Job was probably still starting",
+  and similar speculative causes are not evidence. A cause is only stated when
+  it is demonstrated by a log, a repro, or a kind run that shows the cause and
+  effect. Otherwise state the observation (what the evidence shows) and that
+  the cause is unknown.
+- **Never dump a Secret into evidence** (R25 I84, A6). `kubectl get secret
+  -o json` or `-o yaml` into an evidence file leaks the Secret's data (tokens,
+  passwords). Evidence may record the Secret's **name, type, and key names**
+  (e.g. `kubectl get secret git-cred -o go-template='{{.type}} {{range $k, $v := .data}}{{$k}} {{end}}'`),
+  never its data.
 
 ## CLI Commands Cheat Sheet
 

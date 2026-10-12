@@ -69,7 +69,7 @@ of CoreDNS.
   `HTTPS_PROXY=http://<loop>-egress-proxy.<ns>.svc…`, which could not be
   resolved, so the deliver Job failed (`DeliveryFailed`). The Loop agent
   cycle still reached Succeeded only because the model endpoint is an IP.
-- **The alpha.3 A6 run** (`.samples/alpha-e2e-1791788025/dns-eth0.log`, the
+- **The alpha.3 A6 run** (`.samples/alpha-e2e-1791806082/dns-eth0.log`, the
   a6 preflight probe `dns-eth0` run from a pod via
   `test/e2e/alpha-e2e.sh:358-383`): `nslookup
   kubernetes.default.svc.cluster.local` returned `Address: 10.96.0.1` via

@@ -242,7 +242,7 @@ make test       # Run unit tests
 - **Never dump a Secret into evidence** (R25 I84, A6). `kubectl get secret
   -o json` or `-o yaml` into an evidence file leaks the Secret's data (tokens,
   passwords). Evidence may record the Secret's **name, type, and key names**
-  (e.g. `kubectl get secret git-cred -o jsonpath='{.type} {.data.keys}'`),
+  (e.g. `kubectl get secret git-cred -o go-template='{{.type}} {{range $k, $v := .data}}{{$k}} {{end}}'`),
   never its data.
 
 ## CLI Commands Cheat Sheet

@@ -238,26 +238,32 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 		// deleted/recreated) and nothing else changes this pass.
 		return false, true, nil
 	}
+	// The deliver description ConfigMap is ensured BEFORE the deliver Job
+	// (R27/P1): the push container mounts the volume optional and falls back
+	// to the minimal line when it is missing, so if the Job's pod started
+	// before the ConfigMap existed, every PR silently degraded to the
+	// minimal description. Creating the Job only once the ConfigMap exists
+	// (Create/Get succeeded) closes the race.
+	//
+	// The ensure is otherwise BEST-EFFORT (a genuinely foreign ConfigMap of
+	// the same name is left alone). A Forbidden error (the operator lacks
+	// the configmaps RBAC for this namespace — a misinstalled/broken
+	// cluster) is surfaced (logged at ERROR level + a Warning Event, R26)
+	// and deliberately PROCEEDS with the fallback: the delivery must not be
+	// blocked by a broken ConfigMap, and the Warning Event tells the
+	// operator owner every PR is degrading to the minimal line.
+	descCMOK := r.deliverDescriptionConfigReady(ctx, loop)
+	if !descCMOK {
+		logf.FromContext(ctx).Info("Held the deliver Job: the deliver description ConfigMap is not ready (non-forbidden ensure failure; requeueing)", "loop", loop.Name)
+		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
+			coxv1alpha1.ReasonDeliveryInProgress,
+			"deliver Job held: the deliver description ConfigMap is not ready (the push container would fall back to the minimal line)")
+		return true, keep, nil
+	}
 	if ok, err := r.ensureDeliverJob(ctx, loop); err != nil {
 		return false, keep, err
 	} else if ok {
 		requeue = true
-	}
-	// The deliver description ConfigMap is BEST-EFFORT (a genuinely foreign
-	// ConfigMap of the same name is left alone, and the push container mounts
-	// the volume optional + falls back to the minimal line). But a Forbidden
-	// error (the operator lacks the configmaps RBAC for this namespace — a
-	// misinstalled/broken cluster) must NOT be silent (R26): it is logged at
-	// ERROR level and surfaced as a Warning Event, so the operator owner can
-	// see that every PR is degrading to the minimal description.
-	if err := r.ensureDeliverDescriptionConfig(ctx, loop); err != nil {
-		if apierrors.IsForbidden(err) {
-			logf.FromContext(ctx).Error(err, "Forbidden: could not ensure the deliver description ConfigMap (the operator lacks configmaps RBAC for this namespace; the PR description degrades to the minimal line)", "loop", loop.Name)
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "DeliveryDescriptionForbidden",
-				"could not ensure the deliver description ConfigMap %s: %v (the operator lacks the configmaps RBAC for this namespace; the draft PR description degrades to the minimal line)", deliverDescriptionConfigName(loop.Name), err)
-		} else {
-			logf.FromContext(ctx).Info("Could not ensure deliver description ConfigMap (best-effort; the push container falls back to the minimal line)", "loop", loop.Name, "err", err)
-		}
 	}
 	if err := r.ensureDeliverNetPolicies(ctx, loop); err != nil {
 		return false, keep, err
@@ -266,6 +272,28 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 		return false, keep, err
 	}
 	return requeue, keep, nil
+}
+
+// deliverDescriptionConfigReady ensures the deliver description ConfigMap
+// (the R27/P1 ordering fix: it is called BEFORE the deliver Job is created,
+// and returns true only when the ConfigMap exists or the ensure is a
+// deliberate fallback path — the Forbidden case, surfaced as a Warning
+// Event — so a deliver Job is NEVER created while the ConfigMap is missing
+// on a normal (non-Forbidden) path).
+func (r *LoopReconciler) deliverDescriptionConfigReady(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	r.lastDeliverDescriptionEnsureErr = nil
+	if err := r.ensureDeliverDescriptionConfig(ctx, loop); err != nil {
+		if apierrors.IsForbidden(err) {
+			logf.FromContext(ctx).Error(err, "Forbidden: could not ensure the deliver description ConfigMap (the operator lacks configmaps RBAC for this namespace; the PR description degrades to the minimal line)", "loop", loop.Name)
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "DeliveryDescriptionForbidden",
+				"could not ensure the deliver description ConfigMap %s: %v (the operator lacks the configmaps RBAC for this namespace; the draft PR description degrades to the minimal line)", deliverDescriptionConfigName(loop.Name), err)
+			return true // deliberate fallback: proceed with the minimal line.
+		}
+		r.lastDeliverDescriptionEnsureErr = err
+		logf.FromContext(ctx).Error(err, "Could not ensure the deliver description ConfigMap; the deliver Job is held this pass (requeueing)", "loop", loop.Name)
+		return false
+	}
+	return true
 }
 
 // ensureDeliverDescriptionConfig creates (idempotently) the deliver

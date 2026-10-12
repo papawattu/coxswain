@@ -203,6 +203,13 @@ type LoopReconciler struct {
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
+	// lastDeliverDescriptionEnsureErr is the last non-nil error returned by
+	// ensureDeliverDescriptionConfig on this reconciler (the R27/P1 race fix
+	// holds the deliver Job until the description ConfigMap exists; the
+	// Forbidden path proceeds deliberately with the fallback and does not
+	// hold the Job).
+	lastDeliverDescriptionEnsureErr error
+
 	// readBaseCommit is the baseCommit read-back seam (S3a). The default
 	// (nil) reads the sandbox pod's init container termination message via
 	// the operator's APIReader path (a real, non-cached client) and validates

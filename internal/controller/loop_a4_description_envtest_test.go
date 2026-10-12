@@ -41,6 +41,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -259,40 +260,94 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 			"the push script's PLAN_FILE must not point at the scratch checkout (.coxswain is excluded from the agent commit and the push container has no agent PVC mount)")
 	})
 
-	// R26/P1: a NON-forbidden transient failure of the description ConfigMap
-	// ensure (e.g. a transient API error) must NOT error the Succeeded
-	// reconcile (the reviewer's P2: "a transient read failure must not block
-	// the Job"). The push container mounts the volume OPTIONAL and falls back
-	// to the minimal line, so a missing facts body degrades to the minimal
-	// description — it never errors the reconcile (which would block
-	// Succeeded forever). The spec asserts the reconcile completes (no error,
-	// via s6Reconcile's Expect) and the deliver Job is still ensured (the
-	// delivery is expected).
-	It("does not error the Succeeded reconcile when the description ConfigMap is transiently absent (a non-Forbidden failure degrades to the minimal line)", func() {
+	// R27/P1 (the new ordering): a NON-forbidden ensure failure of the
+	// description ConfigMap must NOT error the Succeeded reconcile (the
+	// reviewer's P2: "a transient read failure must not block the Job" — the
+	// reconcile completes and requeues), and the deliver Job must NOT be
+	// created while the ConfigMap is missing (the R27/P1 race fix): the
+	// push container mounts the volume OPTIONAL and falls back to the
+	// minimal line when the ConfigMap is absent, so a deliver Job created
+	// before the ConfigMap exists silently degrades to the minimal
+	// description. A non-forbidden ensure failure means the description
+	// cannot be carried into the PR body this pass, so the Job is HELD
+	// (requeued) until the ensure succeeds (the next reconcile retries).
+	It("holds the deliver Job (no Job, requeue) when the description ConfigMap ensure fails (non-Forbidden) and the ConfigMap is missing", func() {
 		ns := freshNS("a4-desc-nocm")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "desc5"
-		_ = s6Succeeded(name, ns, "http://gitea.samples.svc:3000/samples/desc5.git")
+		// The Succeeded reconcile must be driven through the WRAPPED client
+		// (the description ConfigMap's CREATE returns a NON-forbidden error —
+		// a transient API failure, not a Forbidden error) so the Succeeded
+		// reconcile HELDS the deliver Job (the ConfigMap is missing) and the
+		// Job is never created. A plain s6Succeeded would use the real client
+		// (the Succeeded reconcile would ensure the ConfigMap first, then
+		// create the Job — the normal path) and the Job would already exist
+		// before the spec can assert it is missing.
+		wrapped := &deliverCMEnsureFails{Client: k8sClient, err: transientAPIError}
+		r := &LoopReconciler{Client: wrapped, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
+		s5aEnsureSandbox(ns, name)
+		loop := s6Loop(name, ns, "http://gitea.samples.svc:3000/samples/desc5.git")
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		s6Reconcile(r, ns, name) // Pending -> Planning
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		s5aClaimPod(ns, name, "Planning", "")
+		s6Reconcile(r, ns, name)
+		s5aEnsureSandbox(ns, name)
+		s5aClaimPod(ns, name, "Implementing", s6HeadCommit)
+		s6Reconcile(r, ns, name)
+		s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
+		s6Reconcile(r, ns, name) // Verifying -> Succeeded: the wrapped client's
+		// Create on the deliver description ConfigMap returns a NON-forbidden
+		// error, so the deliver Job is HELD (the ConfigMap is missing) and
+		// never created (the R27/P1 ordering: the Job is created only after
+		// the ConfigMap exists).
+		cmName := deliverDescriptionConfigName(name)
+		// The ConfigMap is missing on the Succeeded reconcile (the wrapped
+		// client's Create returned a non-forbidden error; the Job is held).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, &corev1.ConfigMap{})).ToNot(Succeed(),
+			"the description ConfigMap must be missing on the Succeeded reconcile (the wrapped client's Create returned a non-forbidden error)")
+		// The deliver Job was NOT created: the Succeeded reconcile HELD it
+		// (the ConfigMap is missing) and never created it (the R27/P1
+		// ordering: the Job is created only after the ConfigMap exists).
+		jobName := deliverJobName(name)
+		jobErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: jobName}, &batchv1.Job{})
+		Expect(apierrors.IsNotFound(jobErr)).To(BeTrue(), "the deliver Job must NOT be created on the Succeeded reconcile when the description ConfigMap is missing (the R27/P1 ordering: the Job is held, not created, while the ConfigMap is missing)")
+	})
+
+	// R27/P1: the deliver Job must be created only AFTER the description
+	// ConfigMap exists on the NORMAL (non-forbidden) path: a Succeeded
+	// reconcile with a healthy client ensures the ConfigMap first (Create/
+	// Get succeeded), then creates the Job. The spec asserts the ConfigMap
+	// exists AND the Job exists after the Succeeded reconcile, and that the
+	// ConfigMap is owned by the Loop (the operator's own object, not a
+	// foreign one) and carries the facts body (rendered from the
+	// Loop's spec/status).
+	It("creates the deliver Job only after the description ConfigMap exists on the normal path (the R27/P1 ordering)", func() {
+		ns := freshNS("a4-desc-order")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "desc8"
+		r := s6Succeeded(name, ns, "http://gitea.samples.svc:3000/samples/desc8.git")
+		s6Reconcile(r, ns, name)
+		// Both exist after the Succeeded reconcile: the ConfigMap is ensured
+		// FIRST (Create/Get succeeded), the Job is created AFTER.
 		cmName := deliverDescriptionConfigName(name)
 		cm := &corev1.ConfigMap{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, cm)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
-		// Re-reconcile (a fresh reconciler): the Succeeded reconcile must NOT
-		// error (the best-effort ensure logs and proceeds) and the deliver Job
-		// must be present (the delivery is expected) even though the
-		// description ConfigMap was just deleted (the operator re-ensures it;
-		// if the re-ensure were fatal the reconcile would error and s6Reconcile
-		// would Fail).
-		r2 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
-		_ = s6Reconcile(r2, ns, name)
-		// The deliver Job is present (the delivery is expected): the
-		// best-effort description ConfigMap never blocked the deliver Job.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, cm)).To(Succeed(),
+			"the description ConfigMap must exist on the normal Succeeded path")
 		job := s6GetJob(ns, name)
-		Expect(job).ToNot(BeNil(), "the deliver Job must be ensured even when the description ConfigMap is transiently absent (the best-effort ensure must not block delivery)")
-		// The operator re-ensured the ConfigMap (create succeeded in envtest).
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, &corev1.ConfigMap{})).To(Succeed(),
-			"the operator re-ensures the description ConfigMap on the next reconcile")
+		Expect(job).ToNot(BeNil(), "the deliver Job must be created on the normal Succeeded path (after the ConfigMap is ensured)")
+		// The ConfigMap is owned by the Loop (the operator's own object) and
+		// carries the facts body.
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		Expect(metav1.IsControlledBy(cm, loop)).To(BeTrue(), "the ConfigMap must be owned by the Loop")
+		wantBody := renderDeliverDescriptionBody(deliverDescriptionForLoop(loop))
+		Expect(cm.Data[deliverDescriptionDataKey]).To(Equal(wantBody), "the ConfigMap must carry the facts body (rendered from the Loop's spec/status)")
 	})
 
 	// R26/P1: a FORBIDDEN error from the description ConfigMap ensure (the
@@ -395,4 +450,30 @@ func (c *forbiddenConfigMapWrites) Delete(ctx context.Context, obj client.Object
 		return forbiddenErr()
 	}
 	return c.Client.Delete(ctx, obj, opts...)
+}
+
+// deliverCMEnsureFails wraps a client.Client and makes the deliver
+// description ConfigMap's CREATE (the non-forbidden path: the ConfigMap is
+// missing, the ensure tries to create it) return a NON-forbidden error (a
+// transient API failure — not a Forbidden error). Reads and all other
+// resources pass through. Used by the R27/P1 non-forbidden ensure-failure
+// spec to prove the Job is held (not created) while the ConfigMap is missing
+// on a non-forbidden failure.
+const transientAPIError = "transient API error: the apiserver is briefly unavailable (test model)"
+
+type deliverCMEnsureFails struct {
+	client.Client
+	err string
+}
+
+func (c *deliverCMEnsureFails) isDeliverDescriptionCM(obj client.Object) bool {
+	cm, ok := obj.(*corev1.ConfigMap)
+	return ok && strings.HasSuffix(cm.Name, "-deliver-description")
+}
+
+func (c *deliverCMEnsureFails) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if c.isDeliverDescriptionCM(obj) {
+		return fmt.Errorf("%s", c.err)
+	}
+	return c.Client.Create(ctx, obj, opts...)
 }

@@ -53,6 +53,14 @@ apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
   name: deny-ephemeral-containers
+  # I85: the binding is namespaced (unlike the cluster-scoped VAP). The
+  # namespace is set explicitly here because the admission kustomization is
+  # standalone (not under config/default's namespace transform).
+  namespace: coxswain-system
 spec:
-  policyName: deny-ephemeral-containers
+  # I85: the kustomize namePrefix (coxswain-) transforms metadata.name but
+  # NOT spec.policyName (a spec field). The VAP is rendered as
+  # coxswain-deny-ephemeral-containers, so the binding must reference the
+  # prefixed name explicitly.
+  policyName: coxswain-deny-ephemeral-containers
   validationActions: ["Deny"]

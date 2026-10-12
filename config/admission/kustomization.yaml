@@ -1,5 +1,18 @@
 # [I45] ValidatingAdmissionPolicy + binding: deny ephemeral containers
 # (kubectl debug) on coxswain component pods. KubeArmor does not police
 # ephemeral containers, so this admission gate closes the escape hatch.
+#
+# Standalone kustomization: this kustomization is NOT added to config/default.
+# config/default applies `namespace: coxswain-system` and `namePrefix:
+# coxswain-`, which would add `namespace: coxswain-system` to the
+# ValidatingAdmissionPolicy (a cluster-scoped resource — invalid) and break
+# the binding (I85). The admission resources are therefore built and applied
+# SEPARATELY (the Makefile's `deploy`/`kind-up` targets and
+# hack/build-installer.sh apply `kustomize build config/default` and then
+# `kustomize build config/admission`). The VAP is cluster-scoped (no
+# namespace); the binding is namespaced (namespace: coxswain-system, set
+# explicitly in the YAML). The namePrefix is applied here so the rendered
+# names carry the coxswain- prefix.
+namePrefix: coxswain-
 resources:
 - validating_admission_policy.yaml

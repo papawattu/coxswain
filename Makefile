@@ -311,7 +311,10 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 		# config/cni-probe/kustomization.yaml) and must be applied separately \
 		# so the operator's CNI self-test probe can run. \
 		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/calico | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }; \
-		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/cni-probe | kubectl --context $$CTX apply -f -) || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 1; }
+		# I85: the admission (VAP + binding) is a standalone kustomization
+		# (not under config/calico — the namespace transform would break the
+		# cluster-scoped VAP). Applied separately, like cni-probe.
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/admission | kubectl --context $$CTX apply -f -) || { echo "FATAL: admission deploy failed"; exit 1; }; 		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/cni-probe | kubectl --context $$CTX apply -f -) || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 1; }
 	@rm -rf "$${TMP_OVERLAY:-}"
 	@echo "kind-calico-up complete (cluster ready, images loaded; make d38-cni-e2e runs the assertions)."
 
@@ -483,6 +486,10 @@ deploy: codegen kustomize ## Deploy controller to the K8s cluster specified in ~
 	@IMG="$(IMG)" TARGET=deploy hack/require-img.sh
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+	# I85: the admission (VAP + binding) is a standalone kustomization (not
+	# under config/default — the namespace transform would break the
+	# cluster-scoped VAP). Applied separately, like cni-probe.
+	"$(KUSTOMIZE)" build config/admission | "$(KUBECTL)" apply -f -
 	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" apply -f -
 
 .PHONY: deploy-dev
@@ -491,11 +498,15 @@ deploy-dev: codegen kustomize ## Dev/kind only: deploy the controller with --all
 	@IMG="$(IMG)" TARGET=deploy-dev hack/require-img.sh
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/dev | "$(KUBECTL)" apply -f -
+	# I85: the admission is a standalone kustomization (see deploy target).
+	"$(KUSTOMIZE)" build config/admission | "$(KUBECTL)" apply -f -
 	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+	# I85: the admission is a standalone kustomization (see deploy target).
+	"$(KUSTOMIZE)" build config/admission | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 	"$(KUSTOMIZE)" build config/cni-probe | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Dependencies

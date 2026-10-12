@@ -489,14 +489,11 @@ done
 #    edits (the alpha.1 wedge was the missing list;watch; the alpha.3
 #    install.yaml carries it).
 log operator "applying the RELEASED install.yaml ($RELEASE_TAG)"
-# The alpha.2 release install.yaml has a malformed doc: the ValidatingAdmissionPolicyBinding
-# and the coxswain-cni-probe Namespace are not separated by a '---', so kubectl apply
-# bundles them into one doc and the Namespace apply fails (strict decoding error on the
-# binding's spec fields). The VAP + Deployment apply cleanly. Workaround: apply the release
-# install.yaml (it succeeds for the VAP, Deployment, RBAC, CRDs, etc.), then create the
-# missing Namespace + ValidatingAdmissionPolicyBinding explicitly (a documented workaround
-# for the release manifest bug — NOT a manual RBAC edit, the fix must hold).
-kc apply -f "$EVIDENCE/install.yaml" >"$EVIDENCE/operator-apply.log" 2>&1 || log operator "note: install.yaml apply had errors (the malformed Namespace/binding doc — see $EVIDENCE/operator-apply.log); the VAP + Deployment applied cleanly"
+# I85: the release install.yaml now carries the ValidatingAdmissionPolicy +
+# binding (the admission kustomization is standalone — the namespace transform
+# no longer breaks the cluster-scoped VAP) and the cni-probe Namespace
+# (properly separated). The apply must succeed cleanly; no workaround.
+kc apply -f "$EVIDENCE/install.yaml" >"$EVIDENCE/operator-apply.log" 2>&1 || { cat "$EVIDENCE/operator-apply.log"; die "the release install.yaml apply failed (I85: the admission VAP + binding and the cni-probe Namespace must apply cleanly from the release — see $EVIDENCE/operator-apply.log)"; }
 # The owner's A6 re-run: apply --allow-unenforced-network ONLY, LABELLED as the
 # escape hatch. kindnet does not police pod->host egress, so the D38 dynamic
 # network gate would hold the sandbox Suspended forever; the escape hatch
@@ -514,34 +511,14 @@ fi
 kc -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s \
 	>"$EVIDENCE/operator-rollout-allow-unenforced.log" 2>&1 || die "controller not Ready after the --allow-unenforced-network step (see $EVIDENCE/operator-rollout-allow-unenforced.log)"
 log operator "controller Ready; the args it runs with: $(kc -n coxswain-system get deploy coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}') (the escape hatch is --allow-unenforced-network ONLY)"
-# The missing Namespace + ValidatingAdmissionPolicyBinding (the malformed doc in the release).
-kc apply -f - <<'EOF' >"$EVIDENCE/operator-apply-ns-binding.log" 2>&1
-apiVersion: v1
-kind: Namespace
-metadata:
-  labels:
-    app.kubernetes.io/name: coxswain-cni-probe
-    app.kubernetes.io/part-of: coxswain
-    coxswain.io/probe-namespace: "true"
-  name: coxswain-cni-probe
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: coxswain-deny-ephemeral-containers
-  namespace: coxswain-system
-spec:
-  policyName: coxswain-deny-ephemeral-containers
-  validationActions:
-  - Deny
-EOF
-# Verify the VAP + binding + ns are present (the malformed doc would have skipped them).
-kc get ns coxswain-cni-probe >/dev/null 2>&1 || { cat "$EVIDENCE/operator-apply-ns-binding.log"; die "the coxswain-cni-probe Namespace was not created (the release install.yaml is malformed — see $EVIDENCE/operator-apply-ns-binding.log)"; }
-kc -n coxswain-system get validatingadmissionpolicybinding coxswain-deny-ephemeral-containers >/dev/null 2>&1 || { cat "$EVIDENCE/operator-apply-ns-binding.log"; die "the ValidatingAdmissionPolicyBinding was not created (the release install.yaml is malformed — see $EVIDENCE/operator-apply-ns-binding.log)"; }
-kc get validatingadmissionpolicy coxswain-deny-ephemeral-containers >/dev/null 2>&1 || die "the ValidatingAdmissionPolicy was not created (the release install.yaml is malformed)"
+# I85: verify the VAP + binding + cni-probe Namespace are present (they come
+# from the release install.yaml, not a workaround).
+kc get ns coxswain-cni-probe >/dev/null 2>&1 || { cat "$EVIDENCE/operator-apply.log"; die "the coxswain-cni-probe Namespace was not created (the release install.yaml is missing it — see $EVIDENCE/operator-apply.log)"; }
+kc -n coxswain-system get validatingadmissionpolicybinding coxswain-deny-ephemeral-containers >/dev/null 2>&1 || { cat "$EVIDENCE/operator-apply.log"; die "the ValidatingAdmissionPolicyBinding was not created (I85: the release install.yaml must carry the binding — see $EVIDENCE/operator-apply.log)"; }
+kc get validatingadmissionpolicy coxswain-deny-ephemeral-containers >/dev/null 2>&1 || { cat "$EVIDENCE/operator-apply.log"; die "the ValidatingAdmissionPolicy was not created (I85: the release install.yaml must carry the VAP — see $EVIDENCE/operator-apply.log)"; }
 kc rollout status deploy/coxswain-controller-manager -n coxswain-system --timeout=180s \
 	>"$EVIDENCE/operator-rollout.log" 2>&1 || die "controller not Ready (see $EVIDENCE/operator-rollout.log)"
-log operator "coxswain-controller-manager Ready (released $RELEASE_TAG image, never a local build) — the malformed Namespace/binding doc in the release was worked around (the VAP + Deployment applied cleanly; the Namespace + binding were created explicitly — a documented workaround, NOT a manual RBAC edit)"
+log operator "coxswain-controller-manager Ready (released $RELEASE_TAG image, never a local build) — the release install.yaml applied cleanly (the I85 admission VAP + binding and the cni-probe Namespace are all present)"
 # The controller image digest (pulled from ghcr by the kind node).
 OP_POD=$(kc -n coxswain-system get pod -l "app.kubernetes.io/name=coxswain" -o jsonpath='{.items[0].metadata.name}')
 OP_IMAGE=$(kc -n coxswain-system get pod "$OP_POD" -o jsonpath='{.spec.containers[0].image}')

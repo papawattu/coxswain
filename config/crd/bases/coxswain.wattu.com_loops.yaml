@@ -207,6 +207,21 @@ spec:
                     - Fail
                     type: string
                 type: object
+              checkpoints:
+                default: BestEffort
+                description: |-
+                  checkpoints selects the checkpoint policy (D59, PLAN-BETA B1). An
+                  empty value reads as BestEffort (the CRD default): after each
+                  successful verify the operator takes a VolumeSnapshot of the workspace
+                  PVC named checkpoint-<loop>-iter-<N> when the cluster can, and
+                  otherwise sets CheckpointsAvailable=False and carries on with the A2
+                  PVC-resume. Required makes checkpoints mandatory: without a
+                  VolumeSnapshot CRD or a VolumeSnapshotClass for the PVC's CSI driver
+                  the Loop fails at start (terminal Failed:CheckpointUnavailable).
+                enum:
+                - BestEffort
+                - Required
+                type: string
               delivery:
                 description: |-
                   Delivery configures what happens to a SUCCESSFUL, VERIFIED Loop
@@ -504,6 +519,100 @@ spec:
                     format: int64
                     type: integer
                 type: object
+              checkpoint:
+                description: |-
+                  checkpoint is the operator's record of the LATEST checkpoint taken
+                  after a successful verify (B1, PLAN-BETA). nil until the first
+                  successful verify has taken one (or is being taken). It is the restore
+                  point B2's PVC-recovery path reads. Same shape as the entries of
+                  status.checkpoints (the latest entry).
+                properties:
+                  at:
+                    description: |-
+                      at is the operator's record of when the snapshot was taken (the
+                      operator's clock, set when the snapshot object is recorded).
+                    format: date-time
+                    type: string
+                  iteration:
+                    description: |-
+                      iteration is the 1-based iteration the checkpoint was taken at (the
+                      iteration whose verify just succeeded).
+                    type: integer
+                  milestone:
+                    description: |-
+                      milestone is true when the checkpoint is retained beyond the
+                      last-3 window: a milestone is a checkpoint of a SUCCESSFUL verify
+                      (PLAN.md Phase 3: "the last 3 plus all milestone (successful-verify)
+                      checkpoints"). In B1 every checkpoint is taken after a successful
+                      verify, so every checkpoint is a milestone and nothing is GC'd — the
+                      milestone flag is explicit in the API so B2's restore/rollback/fork
+                      can distinguish a plain recent checkpoint from one the user is likely
+                      to want back.
+                    type: boolean
+                  name:
+                    description: |-
+                      name is the VolumeSnapshot's name: checkpoint-<loop>-iter-<iteration>
+                      (B1). It is unique per Loop (iteration numbers are never reused), so
+                      the name is the operator's record of what exists on the cluster.
+                    minLength: 1
+                    type: string
+                required:
+                - at
+                - iteration
+                - milestone
+                - name
+                type: object
+              checkpoints:
+                description: |-
+                  checkpoints is the status list of every checkpoint the operator has
+                  taken for this Loop (B1, PLAN-BETA). It carries the retention record:
+                  the last 3 plus every milestone (successful-verify) checkpoint; the
+                  rest are GC'd (their VolumeSnapshots deleted). Written by the operator
+                  only; the agent has no write path (ADR-0004).
+                items:
+                  description: |-
+                    CheckpointStatus is one VolumeSnapshot the operator took of the Loop's
+                    workspace PVC after a successful verify (B1, PLAN-BETA). The snapshot
+                    outlives the sandbox pod and is the durability record behind
+                    status.checkpoint (the latest).
+                  properties:
+                    at:
+                      description: |-
+                        at is the operator's record of when the snapshot was taken (the
+                        operator's clock, set when the snapshot object is recorded).
+                      format: date-time
+                      type: string
+                    iteration:
+                      description: |-
+                        iteration is the 1-based iteration the checkpoint was taken at (the
+                        iteration whose verify just succeeded).
+                      type: integer
+                    milestone:
+                      description: |-
+                        milestone is true when the checkpoint is retained beyond the
+                        last-3 window: a milestone is a checkpoint of a SUCCESSFUL verify
+                        (PLAN.md Phase 3: "the last 3 plus all milestone (successful-verify)
+                        checkpoints"). In B1 every checkpoint is taken after a successful
+                        verify, so every checkpoint is a milestone and nothing is GC'd — the
+                        milestone flag is explicit in the API so B2's restore/rollback/fork
+                        can distinguish a plain recent checkpoint from one the user is likely
+                        to want back.
+                      type: boolean
+                    name:
+                      description: |-
+                        name is the VolumeSnapshot's name: checkpoint-<loop>-iter-<iteration>
+                        (B1). It is unique per Loop (iteration numbers are never reused), so
+                        the name is the operator's record of what exists on the cluster.
+                      minLength: 1
+                      type: string
+                  required:
+                  - at
+                  - iteration
+                  - milestone
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
               conditions:
                 description: |-
                   conditions represent the current state of the Loop resource.

@@ -146,6 +146,23 @@ func TestRBACCoverage(t *testing.T) {
 		// client (loop_controller.go r.Get).
 		{group: coxGroup, resource: "agentpolicies",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
+		// VolumeSnapshots: the B1 checkpoint reads (ensureCheckpoint's
+		// AlreadyExists re-read, applyCheckpointRetention's list + delete,
+		// gcLoopCheckpoints' label list) go through the cached client (I86):
+		// the manager's cache lazily watches the type the first time the cached
+		// client reads it, so the marker needs get;list;watch IN ADDITION TO
+		// create;delete (a create-only marker wedges a fresh install on the
+		// first cached read, exactly like the A6 configmaps P1).
+		{group: "snapshot.storage.k8s.io", resource: "volumesnapshots",
+			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate}},
+		// VolumeSnapshotClasses: the checkpoint support check reads the
+		// cluster's VolumeSnapshotClasses (cluster-scoped, cached read).
+		{group: "snapshot.storage.k8s.io", resource: "volumesnapshotclasses",
+			minVerbs: []string{verbGet, verbList, verbWatch}},
+		// StorageClasses: the checkpoint support check reads the workspace
+		// PVC's StorageClass (the CSI driver) through the cached client.
+		{group: "", resource: "storageclasses",
+			minVerbs: []string{verbGet, verbList, verbWatch}},
 	}
 
 	for _, req := range required {
@@ -251,6 +268,11 @@ func TestRBACCachedClientReads(t *testing.T) {
 		{coxGroup, "loops"},                      // r.Get/r.List the Loops
 		{coxGroup, "agentpolicies"},              // r.Get the loop's AgentPolicy
 		{"agents.x-k8s.io", "sandboxes"},         // r.Get the sandbox
+		// B1 (I86): the checkpoint VolumeSnapshots are read through the cached
+		// client (ensureCheckpoint / applyCheckpointRetention / gcLoopCheckpoints).
+		{"snapshot.storage.k8s.io", "volumesnapshots"},
+		{"snapshot.storage.k8s.io", "volumesnapshotclasses"}, // the support check
+		{"", "storageclasses"},                              // the support check (the PVC's CSI driver)
 	}
 
 	for _, cr := range cacheReads {

@@ -70,6 +70,31 @@ const (
 	ReasonDeliveryFailed = "DeliveryFailed"
 )
 
+// CheckpointPolicy is how hard a Loop requires volume-snapshot checkpoints
+// (D59, PLAN-BETA B1; PLAN.md Phase 3 says checkpoints are mandatory, but
+// D59's owner decision makes that opt-in so installs on clusters without a
+// snapshot CSI — including default kind — are not blocked).
+type CheckpointPolicy string
+
+const (
+	// CheckpointPolicyBestEffort is the default: take a VolumeSnapshot of the
+	// workspace PVC after each successful verify when the cluster can (the
+	// VolumeSnapshot CRD exists and the PVC's CSI driver has a
+	// VolumeSnapshotClass). When it cannot (no CRD, or no VolumeSnapshotClass
+	// for the PVC's CSI driver), the operator sets
+	// CheckpointsAvailable=False with the named reason and carries on with the
+	// A2 PVC-resume (the workspace PVC itself survives controller/sandbox
+	// restarts). The condition is a VISIBLE fallback (I90: fallbacks surface
+	// their failure before they degrade), never a silent one.
+	CheckpointPolicyBestEffort CheckpointPolicy = "BestEffort"
+	// CheckpointPolicyRequired fails the Loop at start (terminal
+	// Failed:CheckpointUnavailable) when checkpoints are not possible (no
+	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI driver).
+	// This is PLAN.md Phase 3's mandatory-checkpoint semantics, applied only
+	// to the Loops that ask for it.
+	CheckpointPolicyRequired CheckpointPolicy = "Required"
+)
+
 // Workspace defines where a Loop's code comes from and how it is
 // authenticated. The sandbox clones repo at ref on start and works on a
 // single branch per Loop (docs/CONTEXT.md: "Workspace").
@@ -511,6 +536,49 @@ type LoopSpec struct {
 	// budget caps.
 	// +optional
 	Budget *BudgetConfig `json:"budget,omitempty"`
+
+	// checkpoints selects the checkpoint policy (D59, PLAN-BETA B1). An
+	// empty value reads as BestEffort (the CRD default): after each
+	// successful verify the operator takes a VolumeSnapshot of the workspace
+	// PVC named checkpoint-<loop>-iter-<N> when the cluster can, and
+	// otherwise sets CheckpointsAvailable=False and carries on with the A2
+	// PVC-resume. Required makes checkpoints mandatory: without a
+	// VolumeSnapshot CRD or a VolumeSnapshotClass for the PVC's CSI driver
+	// the Loop fails at start (terminal Failed:CheckpointUnavailable).
+	// +kubebuilder:validation:Enum=BestEffort;Required
+	// +kubebuilder:default=BestEffort
+	// +optional
+	Checkpoints CheckpointPolicy `json:"checkpoints,omitempty"`
+}
+
+// CheckpointStatus is one VolumeSnapshot the operator took of the Loop's
+// workspace PVC after a successful verify (B1, PLAN-BETA). The snapshot
+// outlives the sandbox pod and is the durability record behind
+// status.checkpoint (the latest).
+type CheckpointStatus struct {
+	// iteration is the 1-based iteration the checkpoint was taken at (the
+	// iteration whose verify just succeeded).
+	Iteration int `json:"iteration"`
+
+	// name is the VolumeSnapshot's name: checkpoint-<loop>-iter-<iteration>
+	// (B1). It is unique per Loop (iteration numbers are never reused), so
+	// the name is the operator's record of what exists on the cluster.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// milestone is true when the checkpoint is retained beyond the
+	// last-3 window: a milestone is a checkpoint of a SUCCESSFUL verify
+	// (PLAN.md Phase 3: "the last 3 plus all milestone (successful-verify)
+	// checkpoints"). In B1 every checkpoint is taken after a successful
+	// verify, so every checkpoint is a milestone and nothing is GC'd — the
+	// milestone flag is explicit in the API so B2's restore/rollback/fork
+	// can distinguish a plain recent checkpoint from one the user is likely
+	// to want back.
+	Milestone bool `json:"milestone"`
+
+	// at is the operator's record of when the snapshot was taken (the
+	// operator's clock, set when the snapshot object is recorded).
+	At metav1.Time `json:"at"`
 }
 
 // LoopStatus defines the observed state of a Loop.
@@ -614,6 +682,23 @@ type LoopStatus struct {
 	// coxswain.io/resume annotation (P2f). Cleared on resume.
 	// +optional
 	PausedReason PausedReason `json:"pausedReason,omitempty"`
+
+	// checkpoint is the operator's record of the LATEST checkpoint taken
+	// after a successful verify (B1, PLAN-BETA). nil until the first
+	// successful verify has taken one (or is being taken). It is the restore
+	// point B2's PVC-recovery path reads. Same shape as the entries of
+	// status.checkpoints (the latest entry).
+	// +optional
+	Checkpoint *CheckpointStatus `json:"checkpoint,omitempty"`
+
+	// checkpoints is the status list of every checkpoint the operator has
+	// taken for this Loop (B1, PLAN-BETA). It carries the retention record:
+	// the last 3 plus every milestone (successful-verify) checkpoint; the
+	// rest are GC'd (their VolumeSnapshots deleted). Written by the operator
+	// only; the agent has no write path (ADR-0004).
+	// +listType=atomic
+	// +optional
+	Checkpoints []CheckpointStatus `json:"checkpoints,omitempty"`
 
 	// progress is the operator's structured progress record (R19 OS1),
 	// populated from the runner's ADR-0004 claim (the agent container's
@@ -830,6 +915,18 @@ const (
 	// backend timed out after bounded retries. It is set back to True when
 	// a subsequent claim succeeds (the model recovered).
 	ModelAvailableCondition = "ModelAvailable"
+	// CheckpointsAvailableCondition (B1, D59) records whether volume-snapshot
+	// checkpoints are possible for this Loop. True + reason Available = the
+	// VolumeSnapshot CRD exists and the workspace PVC's CSI driver has a
+	// VolumeSnapshotClass (checkpoints are taken after each successful
+	// verify). False + a named reason (VolumeSnapshotCRDMissing / NoSnapshotClassForDriver,
+	// or SnapshotCreateFailed) = checkpoints are NOT being taken; the Loop
+	// carries on with the A2 PVC-resume under BestEffort (a VISIBLE fallback,
+	// I90), while under Required the Loop is already terminal
+	// Failed:CheckpointUnavailable (the gate runs at start, before any
+	// phase work). Absent = the check has not run yet (the PVC's
+	// provisioner/driver is not known until the PVC has a storageClass).
+	CheckpointsAvailableCondition = "CheckpointsAvailable"
 )
 
 // +kubebuilder:object:root=true

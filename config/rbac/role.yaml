@@ -41,6 +41,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - storageclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - agents.x-k8s.io
   resources:
   - sandboxes
@@ -125,4 +133,22 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshotclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshots
+  verbs:
+  - create
+  - delete
+  - get
+  - list
   - watch

@@ -146,6 +146,17 @@ type LoopReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// RESTMapper is the manager's dynamic RESTMapper (SetupWithManager wires
+	// mgr.GetRESTMapper()). It is the source of truth for "is the CRD for
+	// this type installed?" (I88): the VolumeSnapshot watch is registered
+	// ONLY if it resolves volumeSnapshotGVK at setup, and the reconcile-side
+	// snapshot reads (ensureCheckpoint / the GC) are gated on the same check
+	// so a CRD-less cluster's manager cache is never asked to watch the
+	// absent type (a List on it would wedge the cache). nil (a bare test
+	// reconciler without SetupWithManager) is treated as PRESENT (the test
+	// envtest has the CRD; the no-CRD spec overrides snapshotCRDPresent).
+	RESTMapper meta.RESTMapper
+
 	// apiReader is the operator's non-cached client (mgr.GetAPIReader()), used
 	// for the baseCommit read-back (S3a): the sandbox pod is not in the
 	// manager's Pod cache (the cache is scoped to ProxyComponentSelector), so
@@ -373,6 +384,19 @@ type LoopReconciler struct {
 // exit-code reader; the Job runs the operator's trusted check containers, not
 // agent code).
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch;delete
+// B1 (D59): the operator creates the per-Loop checkpoint VolumeSnapshot after
+// each successful verify (ensureCheckpoint) and deletes them in CleaningUp
+// (the finalizer's GC). I86: the manager's CACHE reads VolumeSnapshots
+// (ensureCheckpoint's AlreadyExists re-read, applyCheckpointRetention's list
+// and delete, gcLoopCheckpoints' label list) — the cache lazily watches a
+// type the first time the cached client reads it, so the marker needs
+// get;list;watch in addition to create;delete (a create-only marker wedges a
+// fresh install on the first cached read, exactly like the A6 configmaps P1).
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
+// The checkpoint support check reads the workspace PVC's StorageClass (the
+// CSI driver) to find the matching VolumeSnapshotClass.
+// +kubebuilder:rbac:groups="",resources=storageclasses,verbs=get;list;watch
 // A4 (R26): the operator owns the deliver description ConfigMap
 // (ensureDeliverDescriptionConfig / cleanupDeliverDescriptionConfig — the facts
 // body the push container reads to assemble the draft PR description). Only
@@ -517,6 +541,26 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// B1 (finalizer): a Loop being deleted (deletionTimestamp set) is in
+	// CleaningUp — its work is the checkpoint GC (delete the Loop's
+	// VolumeSnapshots). The finalizer holds the Loop until the GC is done
+	// (gcLoopCheckpoints returns done when none remain; the finalizer is
+	// removed then so the apiserver can delete the object). Nothing else runs
+	// for a deleting Loop (the sandbox is already gone by the time the Loop
+	// delete is processed — the sandbox is owned by the Loop and the operator
+	// deletes it explicitly when the Loop is cleaned up; the snapshot GC is
+	// the last thing the Loop owns).
+	if !loop.DeletionTimestamp.IsZero() {
+		return r.reconcileCleaningUp(ctx, &loop)
+	}
+
+	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
+	// on the first reconcile; idempotent). It is what keeps the Loop alive
+	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
+	if err := r.applyLoopFinalizer(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// C6a + D34: validate the referenced AgentPolicies and the
 	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
 	// the Reconcile within the gocyclo budget).
@@ -546,6 +590,30 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	changed, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
+	// and the Required gate. The gate fails the Loop (terminal
+	// Failed:CheckpointUnavailable) at start — before any phase work — when
+	// spec.checkpoints=Required and the snapshot support is absent (no
+	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI
+	// driver). The condition is set on every reconcile (the support may
+	// change: the CRD or a VolumeSnapshotClass can be installed later), but
+	// the gate fires only once (a Failed Loop is terminal and nothing reverts
+	// it). When the gate fires, stop this reconcile (the status write
+	 // persists the terminal phase; no sandbox / proxy / verify work runs for a
+	// Loop that cannot be checkpointed).
+	if cpChanged, cpTerminal := r.applyCheckpointConditions(ctx, &loop); cpTerminal {
+		setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+			checkpointUnavailableReason,
+			"spec.checkpoints=Required but checkpoints are not available (the CheckpointsAvailable condition names the reason); the Loop fails at start (D59: checkpoints are mandatory only when the Loop asks for them)")
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		_ = cpChanged // the condition is already folded into the status
+		if err := r.Status().Update(ctx, &loop); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
@@ -608,6 +676,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
+	// B1: after a successful verify, take the workspace checkpoint
+	// (checkpoint-<loop>-iter-<N>) and apply retention (GC the non-kept
+	// snapshots). It runs after applyVerifyOutcome so the phase is Succeeded
+	// when the checkpoint is taken (the verify outcome flips the phase in the
+	// same reconcile). It is idempotent (one checkpoint per iteration, guarded
+	// by status.checkpoint.iteration == status.iteration).
+	if cpChanged, cpRequeue := r.ensureCheckpoint(ctx, &loop); cpChanged || cpRequeue {
+		changed = changed || cpChanged
+		verifyRequeue = verifyRequeue || cpRequeue
+	}
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a
 	// pinned verifiedCommit. The stale-Job guard (D27) deletes a Job stamped
@@ -4879,9 +4957,24 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		b = b.Watches(kaptWatch, handler.EnqueueRequestsFromMapFunc(
 			r.kubeArmorPolicyToLoopRequests))
 	}
-	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
-	// change enqueues every Loop so it re-reads the cached result and re-gates.
-	// Skipped when nil (envtest: the result is read on each reconcile anyway).
+	// D59/B1: watch the per-Loop checkpoint VolumeSnapshots so a snapshot
+	// state change (the snapshot controller marking it ready, or a delete
+	// completing) re-reconciles the Loop that owns it (the finalizer's GC
+	// and the retention GC both re-read on the next reconcile). Like the
+	// KubeArmorPolicy watch, it is registered ONLY if the RESTMapper
+	// resolves the CRD at setup (I88): on a cluster without the snapshot CRD
+	// the kind is absent and an unconditional watch makes the manager fail
+	// to start. The map is by the coxswain.wattu.com/loop label (the
+	// operator's own label on the snapshot object — a foreign or unrelated
+	// snapshot maps to nothing).
+	if _, snapMapErr := mgr.GetRESTMapper().RESTMapping(volumeSnapshotGVK.GroupKind()); snapMapErr != nil {
+		logf.Log.Info("VolumeSnapshot CRD not present (RESTMapper does not resolve snapshot.storage.k8s.io/v1/VolumeSnapshot): the per-Loop checkpoint watch is not registered. Checkpoints are not taken (the CheckpointsAvailable condition is False, reason VolumeSnapshotCRDMissing; D59 BestEffort carries on with the A2 PVC-resume, Required fails at start).")
+	} else {
+		snapWatch := &unstructured.Unstructured{}
+		snapWatch.SetGroupVersionKind(volumeSnapshotGVK)
+		b = b.Watches(snapWatch, handler.EnqueueRequestsFromMapFunc(
+			r.volumeSnapshotToLoopRequests))
+	}
 	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
 	// change enqueues every Loop so it re-reads the cached result and re-gates.
 	// Skipped when nil (envtest: the result is read on each reconcile anyway).
@@ -4890,6 +4983,27 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return b.Named("loop").
 		Complete(r)
+}
+
+// volumeSnapshotToLoopRequests maps a checkpoint VolumeSnapshot to the Loop
+// that owns it (B1), by the operator's coxswain.wattu.com/loop label. A
+// snapshot without the label (a foreign or unrelated snapshot) maps to
+// nothing.
+func (r *LoopReconciler) volumeSnapshotToLoopRequests(_ context.Context, obj client.Object) []reconcile.Request {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil
+	}
+	loopName, ok := u.GetLabels()["coxswain.wattu.com/loop"]
+	if !ok || loopName == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: u.GetNamespace(),
+			Name:      loopName,
+		},
+	}}
 }
 
 // agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace

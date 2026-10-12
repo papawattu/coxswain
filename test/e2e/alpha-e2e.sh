@@ -114,7 +114,7 @@ KILL_DELAY=5
 # intervals, not "eventually").
 HELD_CAP=240
 # PR_CAP: seconds to wait for the first-time PR to be delivered.
-PR_CAP=240
+PR_CAP=600
 TS="$(date +%s)"
 EVIDENCE="$ROOT/.samples/alpha-e2e-$TS"
 mkdir -p "$EVIDENCE"

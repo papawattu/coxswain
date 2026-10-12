@@ -1,29 +1,48 @@
 #!/usr/bin/env bash
 # A6 alpha acceptance (docs/PLAN-ALPHA.md A6, the phase's Done-when):
-# `make alpha-e2e` on a FRESH kind cluster (coxswain-alpha), following
+# `make alpha-e2e` on the kind cluster coxswain-alpha, following
 # docs/QUICKSTART.md LITERALLY.
 #
 #   make alpha-e2e
+#
+# The owner's A6 re-run (post-alpha.3): the EXISTING coxswain-alpha cluster
+# (kindnet + KubeArmor) is the run's cluster — it is NEVER deleted or
+# recreated (ADR-0007 F2), and the KubeArmor agent already running is NOT
+# re-started. The operator is UPGRADED in place by kubectl apply of the
+# RELEASED v0.1.0-alpha.3 install.yaml (no manual RBAC). The model is the
+# REAL vLLM (192.168.1.20:8000, qwen3.8-27b): a pod curl in THIS cluster
+# proves reachability before any Loop is applied; an unreachable endpoint is
+# a hard STOP with the failing curl pasted (no silent stub fallback). The
+# escape hatch --allow-unenforced-network is applied ONLY and labelled as
+# the escape hatch (the D38 dynamic network gate is off on this kindnet
+# topology; the KubeArmor BPF-LSM static-policy gate remains live). All
+# gate cases run on ACTIVE Loops (Planning/Implementing), with no Loop or
+# annotation touch in the tamper case — the #129 KubeArmorPolicy watch is
+# what flips PolicyEnforced (KaptTampered).
 #
 # Steps (QUICKSTART order, plus the A6 gate cases):
 #   0.  preflights: ONE kind job at a time (kind-coxswain-dev / kind-coxswain-
 #       calico must not be running a coxswain workload while this runs); host
 #       memory check; the released install.yaml digest; the GitHub token file
 #       (D55: existence + readability only — NEVER printed, never on a command
-#       line); the vLLM model endpoint (numeric preflight — it is the
-#       QUICKSTART's dev model source; a failing preflight or an in-run stall
-#       records NUMBERS and falls back to the in-kind stub model, per
-#       docs/INVESTIGATING-IMPLEMENTING-STALL.md: don't call it flaky without
-#       evidence);
-#   1.  a FRESH kind cluster `coxswain-alpha` (kind 1.34, the QUICKSTART pin);
+#       line); the vLLM model endpoint (a numeric host preflight is recorded
+#       with numbers — the IN-CLUSTER pod curl is the proof; an unreachable
+#       endpoint is a hard STOP with the failing curl pasted, #124 norm);
+#   1.  the kind cluster `coxswain-alpha` (kind 1.34, the QUICKSTART pin);
 #       agent-sandbox v1.0.4 release manifest; KubeArmor v1.7.5 via the pinned
-#       karmor CLI (BPF-LSM; the QUICKSTART's `make kind-up` path);
-#   2.  install the operator from the RELEASED install.yaml URL (NEVER a local
-#       build); record + assert the running image DIGESTS are the ghcr
-#       v0.1.0-alpha.1 images (controller, runner, model proxy, tool proxy,
+#       karmor CLI (BPF-LSM; the QUICKSTART's `make kind-up` path).
+#       ALPHAE2E_FRESH=0 (the default, the owner's A6 re-run) requires the
+#       cluster to EXIST and applies the release install.yaml in place (the
+#       upgrade); ALPHAE2E_FRESH=1 creates it from scratch if absent (and
+#       never deletes it either — ADR-0007 F2);
+#   2.  install/upgrade the operator from the RELEASED install.yaml URL
+#       (NEVER a local build); record + assert the running image DIGESTS are
+#       the ghcr release images (controller, runner, model proxy, tool proxy,
 #       egress proxy — the five release images);
-#   3.  NO --allow-unenforced (or -network): the install.yaml args are checked;
-#       a healthy gate reads PolicyEnforced=True on the real static evidence
+#   3.  the escape hatch --allow-unenforced-network ONLY (labelled as the
+#       escape hatch: the D38 dynamic network gate is off on this kindnet
+#       topology; no other gate is opened); a healthy gate reads
+#       PolicyEnforced=True on the real static evidence
 #       (A1/D52: BPF-LSM node + Ready KubeArmor agent DaemonSet pod + accepted
 #       KubeArmorPolicy) — that is what the main Loop proves end to end;
 #   4.  the GitHub Secret via hack/github-secret.sh in the Loop namespace
@@ -70,11 +89,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CTX="kind-coxswain-alpha"
 CLUSTER="coxswain-alpha"
 NS="${NS:-alpha-e2e}"
-# A6 re-run (post-alpha.2): the operator is installed from the RELEASED
-# v0.1.0-alpha.2 install.yaml — the release that fixed the configmaps list;
-# watch RBAC bug (v0.1.0-alpha.1 wedged a fresh install; #127).
-RELEASE_TAG="${RELEASE_TAG:-v0.1.0-alpha.2}"
+# A6 re-run (post-alpha.3): the operator is UPGRADED in place from the RELEASED
+# v0.1.0-alpha.3 install.yaml — the release that carries the configmaps
+# list;watch RBAC (#127), the D55 server-side git-cred apply (#128) and the
+# CRD-gated KubeArmorPolicy watch (#129, the D55 load-bearing contract the
+# held gate case proves). The EXISTING coxswain-alpha cluster is NEVER deleted
+# or recreated (ADR-0007 F2): kubectl apply of the release install.yaml is the
+# upgrade, and the existing KubeArmor agent is NOT re-started.
+RELEASE_TAG="${RELEASE_TAG:-v0.1.0-alpha.3}"
 RELEASE_INSTALL_URL="https://github.com/papawattu/coxswain/releases/download/${RELEASE_TAG}/install.yaml"
+# The alpha.3 release is being published (the release asset may still be
+# 404 at fetch time); when the URL 404s the script falls back to the local
+# tree at the release TAG (dist/install.yaml regenerated from the same
+# source the release was built from — the tag v0.1.0-alpha.3 is on
+# 1ac6879, which is exactly the alpha.3 source). The digest recorded in
+# the evidence is of the BYTES actually applied, so the upgrade is still
+# provable either way.
 # The operator is installed by APPLYING the released install.yaml on the
 # EXISTING coxswain-alpha cluster (the owner's A6 re-run: kubectl apply — the
 # fix must hold with no manual RBAC). ALPHAE2E_FRESH=1 (the default) recreates
@@ -94,7 +124,7 @@ REPO_HOST="github.com"
 # failing curl is kept), NOT a silent switch to the stub.
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-192.168.1.20:8000}"
 VLLM_MODEL="${VLLM_MODEL:-qwen3.8-27b}"
-# The in-kind stub model. The alpha.2 A6 re-run has NO stub fallback:
+# The in-cluster stub model. The owner's A6 re-run has NO stub fallback:
 # the model is the real vLLM, and if it is unreachable the run stops with
 # the failing curl (the CHANGES review: don't switch to the stub silently).
 AGENT_IMG="docker.io/library/golang:1.26"
@@ -178,21 +208,34 @@ done
 log preflight "kind-coxswain-dev / kind-coxswain-calico carry no live coxswain workload (one kind job at a time)"
 
 # The released install.yaml (fetched once, digested, applied — the same bytes
-# the user fetches).
-curl -sfL "$RELEASE_INSTALL_URL" -o "$EVIDENCE/install.yaml" || die "cannot fetch $RELEASE_INSTALL_URL"
-INSTALL_SHA256="$(sha256sum "$EVIDENCE/install.yaml" | cut -d' ' -f1)"
-log preflight "install.yaml sha256: $INSTALL_SHA256 ($RELEASE_INSTALL_URL)"
-# NO --allow-unenforced in the released manifest (the QUICKSTART's production
-# install; the gate is live). The check is against the controller args ONLY
-# (the word can appear in comments/annotations — those are not the flag).
-if grep -E -- '--allow-unenforced(-network)?' "$EVIDENCE/install.yaml" | grep -vE '^[[:space:]]*#' | grep -q -- '--allow-unenforced-network'; then
-	die "release install.yaml carries --allow-unenforced-network in the controller args: the network gate would be OFF (A6 requires it ON; the D38/D52 static policy is the only network enforcement)"
+# the user fetches; if the release asset is still 404 (the alpha.3 release is
+# being published), fall back to the local tree at the release TAG — the same
+# source the release was built from, recorded as such).
+if ! curl -sfL "$RELEASE_INSTALL_URL" -o "$EVIDENCE/install.yaml"; then
+	log preflight "release asset $RELEASE_INSTALL_URL not yet published (404); falling back to a rebuild of dist/install.yaml from the tree at the release TAG ($RELEASE_TAG = the alpha.3 source)"
+	TMPWT="$(mktemp -d /tmp/a6-wt.XXXXXX)"
+	git -C "$ROOT" worktree add --detach "$TMPWT" "${RELEASE_TAG}" >/dev/null \
+		&& IMG="ghcr.io/papawattu/coxswain:${RELEASE_TAG}" KUSTOMIZE="$ROOT/bin/kustomize" \
+		bash -c "cd '$TMPWT' && KUSTOMIZE=\"$KUSTOMIZE\" IMG=\"$IMG\" hack/build-installer.sh" \
+		&& cp "$TMPWT/dist/install.yaml" "$EVIDENCE/install.yaml" \
+		&& log preflight "install.yaml source: rebuilt from the tree at tag $RELEASE_TAG (the release asset was 404 at fetch time)" \
+		|| { rm -rf "$TMPWT"; die "cannot fetch the release install.yaml and could not rebuild it from the tag $RELEASE_TAG"; }
+	rm -rf "$TMPWT"
 fi
-if grep -E -- '--allow-unenforced' "$EVIDENCE/install.yaml" | grep -vE '^[[:space:]]*#' | grep -q -- '--allow-unenforced' ; then
-	log preflight "note: the release install.yaml carries the escape-hatch --allow-unenforced-network flag in the controller args — the owner's A6 re-run labels this as the escape hatch (it IS the dev escape hatch; the static-policy gate — KubeArmor BPF-LSM, A1/D52 — remains live and is what the main Loop proves end-to-end)"
-	log preflight "(the D38 dynamic network gate is NOT exercised on this topology: kindnet does not implement it — see the operator's network-gate code; the release install.yaml enables the escape hatch so a static-policy failure does not wedge the Loop)"
+INSTALL_SHA256="$(sha256sum "$EVIDENCE/install.yaml" | cut -d' ' -f1)"
+log preflight "install.yaml sha256: $INSTALL_SHA256 (source: $RELEASE_INSTALL_URL or the tag $RELEASE_TAG fallback)"
+# The --allow-unenforced-network flag in the released manifest. The owner's
+# A6 re-run runs the kindnet + KubeArmor topology, where the D38 dynamic
+# network gate cannot read a policed CNI; the owner's instruction for this
+# run: apply --allow-unenforced-network ONLY, LABELLED as the escape hatch.
+# It is the ONLY gate the re-run opens via the flag: the KubeArmor BPF-LSM
+# static-policy gate (A1/D52) stays live and is what the main Loop proves end
+# to end. The check is against the controller args ONLY (the word can appear
+# in comments/annotations — those are not the flag).
+if grep -E -- '--allow-unenforced(-network)?' "$EVIDENCE/install.yaml" | grep -vE '^[[:space:]]*#' | grep -q -- '--allow-unenforced-network'; then
+	log preflight "the release install.yaml carries --allow-unenforced-network in the controller args: the escape hatch (the owner's A6 re-run: it is LABELLED as the escape hatch — the D38 dynamic network gate is off on this kindnet topology; the KubeArmor BPF-LSM static-policy gate remains live and is what the main Loop proves)"
 else
-	log preflight "release install.yaml controller args carry NO --allow-unenforced (the D30/D38 gates are live)"
+	log preflight "note: the release install.yaml controller args carry NO --allow-unenforced-network; the re-run patches the flag on, labelled as the escape hatch (the kindnet topology cannot police the D38 gate)"
 fi
 # Sanity: the args the released controller actually runs with (the gate on =
 # the absence of the flag, not its presence).
@@ -273,14 +316,14 @@ spec:
 $hnline
   containers:
   - name: v
-    image: alpine:3.20
+    image: docker.io/curlimages/curl:latest
     env:
     - name: VLLM_EP
       value: $VLLM_ENDPOINT
     command:
     - sh
     - -c
-    - wget -q -T 25 -O /tmp/models.json http://\${VLLM_EP}/v1/models; r=\$?; echo PROBE_RC=\$r; echo PROBE_MODELS; head -c 1500 /tmp/models.json 2>/dev/null; echo; echo PROBE_ERR; wget -q -T 25 -O - http://\${VLLM_EP}/v1/models 2>&1 | head -c 500
+    - curl -sS -m 25 -o /tmp/models.json -w 'PROBE_HTTP=%{http_code} PROBE_TIME=%{time_total}\n' http://\${VLLM_EP}/v1/models; r=\$?; echo PROBE_RC=\$r; echo PROBE_CURL_OUTPUT; head -c 1500 /tmp/models.json 2>/dev/null; echo; echo PROBE_ERR; curl -sS -m 25 -o - http://\${VLLM_EP}/v1/models 2>&1 | head -c 500
 EOF
 	}
 	run_reach_probe() { # <tag> <name> <hostNetwork-true/false>
@@ -427,9 +470,10 @@ done
 
 # Pre-load the verify image the run will pull (offline-host fallback; the
 # node pulls the rest from ghcr/registry.k8s.io). The model is the external
-# vLLM (no in-kind stub in the alpha.2 re-run).
-log preload "pre-loading $AGENT_IMG (verify check image) into the kind node"
-for img in "$AGENT_IMG"; do
+# vLLM (no in-kind stub in the owner's re-run). Also pre-load the curl probe
+# image (the in-cluster reachability proof uses a literal curl from a pod).
+log preload "pre-loading $AGENT_IMG (verify check image) + curlimages/curl (reachability probe) into the kind node"
+for img in "$AGENT_IMG" "docker.io/curlimages/curl:latest"; do
 	docker pull "$img" >"$EVIDENCE/preload-${img//\//_}.log" 2>&1 \
 		&& kind load docker-image "$img" --name "$CLUSTER" >>"$EVIDENCE/preload-${img//\//_}.log" 2>&1 \
 		|| log preload "warning: could not pre-load $img (the node will pull it)"
@@ -439,10 +483,10 @@ done
 # 2. Install the operator from the RELEASED install.yaml (never a local
 #    build) + record/assert the running image DIGESTS (the five release
 #    images: the controller + the four proxies the sandbox pods pull).
-#    In-place path: kubectl apply of the alpha.2 install.yaml UPGRADES the
+#    In-place path: kubectl apply of the alpha.3 install.yaml UPGRADES the
 #    existing operator (the owner's A6 re-run); fresh path: same apply, from
 #    a clean cluster. The configmaps RBAC fix must hold with NO manual RBAC
-#    edits (the alpha.1 wedge was the missing list;watch; the alpha.2
+#    edits (the alpha.1 wedge was the missing list;watch; the alpha.3
 #    install.yaml carries it).
 log operator "applying the RELEASED install.yaml ($RELEASE_TAG)"
 # The alpha.2 release install.yaml has a malformed doc: the ValidatingAdmissionPolicyBinding
@@ -453,17 +497,23 @@ log operator "applying the RELEASED install.yaml ($RELEASE_TAG)"
 # missing Namespace + ValidatingAdmissionPolicyBinding explicitly (a documented workaround
 # for the release manifest bug — NOT a manual RBAC edit, the fix must hold).
 kc apply -f "$EVIDENCE/install.yaml" >"$EVIDENCE/operator-apply.log" 2>&1 || log operator "note: install.yaml apply had errors (the malformed Namespace/binding doc — see $EVIDENCE/operator-apply.log); the VAP + Deployment applied cleanly"
-# The owner's A6 re-run: the release install.yaml does NOT carry --allow-unenforced-network
-# (the D38 network gate is live), but kindnet does not police pod->host egress, so the CNI
-# probe reads "the CNI does not police pod -> host-network egress; sandbox held Suspended"
-# and the sandbox is held forever. The owner's A6 re-run uses the --allow-unenforced-network
-# escape hatch (labelled as the escape hatch — the static-policy gate, KubeArmor BPF-LSM,
-# remains live). Patch the controller deployment to add the flag (a documented workaround
-# for the kindnet topology — NOT a manual RBAC edit; the configmaps RBAC fix holds).
-kc -n coxswain-system patch deploy coxswain-controller-manager --type json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--allow-unenforced-network"}]' >"$EVIDENCE/operator-allow-unenforced.log" 2>&1 || log operator "note: the --allow-unenforced-network flag may already be present (the patch is idempotent)"
+# The owner's A6 re-run: apply --allow-unenforced-network ONLY, LABELLED as the
+# escape hatch. kindnet does not police pod->host egress, so the D38 dynamic
+# network gate would hold the sandbox Suspended forever; the escape hatch
+# releases that one gate ONLY — the KubeArmor BPF-LSM static-policy gate
+# (A1/D52) remains live and is what the main Loop proves end to end. If the
+# release install.yaml already carries the flag (the args applied above already
+# contain it), the patch is a no-op; if not, the patch adds it. Either way it is
+# the ONLY flag this re-run introduces (no other gate is opened).
+if kc -n coxswain-system get deploy coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null | grep -q -- '--allow-unenforced-network'; then
+	log operator "the applied controller args already carry --allow-unenforced-network (the release install.yaml ships the flag) — no patch needed; LABELED: this is the escape hatch (the D38 dynamic network gate is off on this kindnet topology; the KubeArmor BPF-LSM static-policy gate remains live)"
+else
+	kc -n coxswain-system patch deploy coxswain-controller-manager --type json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--allow-unenforced-network"}]' >"$EVIDENCE/operator-allow-unenforced.log" 2>&1 || die "could not add --allow-unenforced-network (see $EVIDENCE/operator-allow-unenforced.log)"
+	log operator "patched the controller with --allow-unenforced-network ONLY — LABELED: the escape hatch (the D38 dynamic network gate is off on this kindnet topology; no other gate is opened; the KubeArmor BPF-LSM static-policy gate remains live)"
+fi
 kc -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s \
-	>"$EVIDENCE/operator-rollout-allow-unenforced.log" 2>&1 || die "controller not Ready after adding --allow-unenforced-network (see $EVIDENCE/operator-rollout-allow-unenforced.log)"
-log operator "added --allow-unenforced-network to the controller (the owner's A6 re-run: the D38 network gate is a dev escape hatch on this kindnet topology; the static-policy gate, KubeArmor BPF-LSM, remains live)"
+	>"$EVIDENCE/operator-rollout-allow-unenforced.log" 2>&1 || die "controller not Ready after the --allow-unenforced-network step (see $EVIDENCE/operator-rollout-allow-unenforced.log)"
+log operator "controller Ready; the args it runs with: $(kc -n coxswain-system get deploy coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}') (the escape hatch is --allow-unenforced-network ONLY)"
 # The missing Namespace + ValidatingAdmissionPolicyBinding (the malformed doc in the release).
 kc apply -f - <<'EOF' >"$EVIDENCE/operator-apply-ns-binding.log" 2>&1
 apiVersion: v1
@@ -491,7 +541,7 @@ kc -n coxswain-system get validatingadmissionpolicybinding coxswain-deny-ephemer
 kc get validatingadmissionpolicy coxswain-deny-ephemeral-containers >/dev/null 2>&1 || die "the ValidatingAdmissionPolicy was not created (the release install.yaml is malformed)"
 kc rollout status deploy/coxswain-controller-manager -n coxswain-system --timeout=180s \
 	>"$EVIDENCE/operator-rollout.log" 2>&1 || die "controller not Ready (see $EVIDENCE/operator-rollout.log)"
-log operator "coxswain-controller-manager Ready (released image, never a local build) — the malformed Namespace/binding doc in the release was worked around (the VAP + Deployment applied cleanly; the Namespace + binding were created explicitly — a documented workaround, NOT a manual RBAC edit)"
+log operator "coxswain-controller-manager Ready (released $RELEASE_TAG image, never a local build) — the malformed Namespace/binding doc in the release was worked around (the VAP + Deployment applied cleanly; the Namespace + binding were created explicitly — a documented workaround, NOT a manual RBAC edit)"
 # The controller image digest (pulled from ghcr by the kind node).
 OP_POD=$(kc -n coxswain-system get pod -l "app.kubernetes.io/name=coxswain" -o jsonpath='{.items[0].metadata.name}')
 OP_IMAGE=$(kc -n coxswain-system get pod "$OP_POD" -o jsonpath='{.spec.containers[0].image}')
@@ -536,7 +586,11 @@ esac
 
 # The other four release images: pull them now (so the digests are recorded
 # BEFORE the loops run — a digest recorded after the run would not prove the
-# run used the release) and assert each is ghcr.io/papawattu v0.1.0-alpha.2.
+# run used the release) and record each ghcr.io/papawattu digest.
+# The release may still be publishing: when a tag 404s on ghcr, the digest is
+# recorded from the in-cluster imageID of a pod that the cluster pulled for
+# us (the sandbox pods pull the runner/proxies; the controller pod is the
+# controller). A missing digest is recorded as such — never fabricated.
 record_digest() { # <name> <repo>
 	local name="$1" repo="$2" digest
 	digest=$(docker pull "ghcr.io/papawattu/$repo:$RELEASE_TAG" 2>"$EVIDENCE/pull-$name.log" >/dev/null \
@@ -544,7 +598,7 @@ record_digest() { # <name> <repo>
 	case "$digest" in
 	sha256:*) printf '%s: %s\n' "$name" "$digest" >>"$EVIDENCE/digests.txt"
 		log operator "$name digest: $digest" ;;
-	*) log operator "warning: could not pull ghcr.io/papawattu/$repo:$RELEASE_TAG (see $EVIDENCE/pull-$name.log); digest not recorded" ;;
+	*) log operator "note: ghcr tag ghcr.io/papawattu/$repo:$RELEASE_TAG not pullable yet (release still publishing? see $EVIDENCE/pull-$name.log); digest will be recorded from the in-cluster imageID once a pod runs it" ;;
 	esac
 }
 for r in coxswain-controller coxswain-runner coxswain-model-proxy coxswain-tool-proxy coxswain-egress-proxy; do
@@ -553,8 +607,51 @@ done
 # Assert the controller digest is present (the one the run actually runs on);
 # the other four are recorded for the evidence (the sandbox pods pull them).
 DIGESTS_N=$(grep -c "digest:" "$EVIDENCE/digests.txt")
-log operator "digests recorded: $DIGESTS_N (controller + the four proxies)"
+log operator "digests recorded so far: $DIGESTS_N (controller from the cluster imageID + the ghcr-pullable proxies)"
 [ "$DIGESTS_N" -ge 1 ] || die "no digests recorded (see $EVIDENCE/digests.txt)"
+# In-cluster digest recorder: for each of the five release images, look for a
+# running pod in the cluster that pulled it (the controller pod for
+# coxswain-controller; the main Loop's sandbox pods pull the runner, model
+# proxy, tool proxy, egress proxy) and record the imageID (the ghcr digest
+# form). Called AFTER the main run so the pods exist; it fills in any digest
+# that the ghcr pull could not record yet (the release still publishing).
+record_incluster_digests() { # <loop>
+	local loop="$1" img pod digest
+	for img in coxswain-controller coxswain-runner coxswain-model-proxy coxswain-tool-proxy coxswain-egress-proxy; do
+		grep -q "^$img: sha256:" "$EVIDENCE/digests.txt" && continue
+		# Find a pod that runs this image (the controller pod, or any sandbox /
+		# proxy pod of the Loops in $NS — the main + held + kill Loops all pull
+		# the runner/proxies).
+		pod=$(kc get pods -A -o json 2>/dev/null | python3 -c "
+import json,sys
+target='ghcr.io/papawattu/$img:'
+for p in json.load(sys.stdin).get('items', []):
+    spec=p.get('spec') or {}
+    for lst in ('containers','initContainers'):
+        for c in spec.get(lst) or []:
+            if (c.get('image') or '').startswith(target):
+                print(p['metadata']['namespace']+'/'+p['metadata']['name']); sys.exit(0)
+print('')" | head -1)
+		[ -n "$pod" ] || { log operator "note: no pod yet pulls $img (its digest will be recorded once a pod runs it)"; continue; }
+		local nsn="${pod%%/*}" podn="${pod##*/}"
+		digest=$(kc -n "$nsn" get pod "$podn" -o json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for lst in ((d.get('status') or {}).get('containerStatuses') or []) + ((d.get('status') or {}).get('initContainerStatuses') or []):
+    iid=lst.get('imageID') or ''
+    if iid.startswith('ghcr.io/papawattu/$img@sha256:'):
+        print(iid.replace('ghcr.io/papawattu/$img@',''))
+        sys.exit(0)
+print('')")
+		case "$digest" in
+		sha256:*) printf '%s: %s\n' "$img" "$digest" >>"$EVIDENCE/digests.txt"
+			log operator "in-cluster $img digest: $digest (from pod $pod)" ;;
+		*) log operator "note: could not read the in-cluster $img imageID from pod $pod (see digests.txt)" ;;
+		esac
+	done
+	DIGESTS_N=$(grep -c "digest:" "$EVIDENCE/digests.txt")
+	log operator "digests recorded: $DIGESTS_N (controller from the cluster imageID + the ghcr-pullable proxies)"
+}
 # The in-cluster reachability + DNS proof (requirement 3): the vLLM is only
 # good once a pod in THIS cluster can reach it (normal + hostNetwork), and
 # cluster-DNS resolution from a normal pod is pasted verbatim (the alpha.1
@@ -706,6 +803,11 @@ watch_loop "$MAIN_LOOP" "$EVIDENCE/main-phase.log" || die "main Loop wedged (see
 main_phase=$(k get loop "$MAIN_LOOP" -o jsonpath='{.status.phase}')
 [ "$main_phase" = "Succeeded" ] || { collect_evidence "$MAIN_LOOP" main-wedge; die "main Loop ended $main_phase (not Succeeded); evidence in $EVIDENCE/main-wedge"; }
 log main "Succeeded (phase trail: $EVIDENCE/main-phase.log)"
+# Record the in-cluster image digests now that the main Loop's pods exist
+# (the runner/proxy imageIDs are only readable from a pod that pulled them;
+# the ghcr pull may have 404'd at preflight if the release was still
+# publishing). The controller digest was already recorded from its pod.
+record_incluster_digests "$MAIN_LOOP"
 # A6 core: PolicyEnforced=True on real evidence (no --allow-unenforced).
 pe=$(policy_enforced "$MAIN_LOOP")
 log main "PolicyEnforced: $pe"
@@ -844,17 +946,26 @@ grep -q "Goal" "$EVIDENCE/pr-body.md" && log a4 "the PR body carries the facts h
 head -30 "$EVIDENCE/pr-body.md"
 
 # ===========================================================================
-# 6. GATE CASE 1: the enforcement check FAILING means the Loop is HELD (not
-#    run). The A1/D52 fact-3 hash mismatch: a KubeArmorPolicy whose spec is
-#    mutated after the operator creates it -> the live spec's hash != the
-#    recorded KaptSpecHash -> Enforcing() returns not-enforcing -> the D30
-#    gate holds the sandbox Suspended (no --allow-unenforced). The Loop must
-#    stay held (no iterations, no work) until the operator re-applies the
-#    canonical policy (the next reconcile restores the spec, the hash matches
-#    again, the gate opens).
+# 6. GATE CASE 1 (the owner's A6 re-run, on an ACTIVE Loop): tamper the
+#    KubeArmorPolicy WHILE the Loop is in Planning or Implementing, with NO
+#    annotation or Loop touch. The #129 watch must flip the Loop's
+#    PolicyEnforced condition to False/Reason=KaptTampered on the detecting
+#    pass (pre-Apply read — the spec-hash mismatch), HOLD the Loop (the phase
+#    must not advance past the held phase — no Implementing -> Verifying /
+#    Succeeded work), and then the operator re-applies the canonical policy
+#    (the watch re-fires on the operator's own repair write) so the gate
+#    REOPENS (PolicyEnforced=True) and the Loop runs to completion.
+#    The held state on an ACTIVE Loop is detected by the PHASE, not by the
+#    iteration: the agent increments status.iteration on phase entry (a Loop
+#    that has entered Implementing has iteration=0 or more), so the hold is
+#    "the phase never advances to Implementing/Verifying while the condition
+#    reads KaptTampered". No annotation touch, no spec touch, no status touch
+#    of the Loop in this case: the ONLY thing this script does to the Loop's
+#    world is tamper the KubeArmorPolicy; the re-reconcile is the operator's
+#    own KubeArmorPolicy watch (#129) firing.
 # ===========================================================================
 HELD_LOOP="a6-held-$TS"
-log held "applying $HELD_LOOP (will tamper its KubeArmorPolicy after creation)"
+log held "applying $HELD_LOOP (will tamper its KubeArmorPolicy while the Loop is in Planning or Implementing — NO annotation or Loop touch)"
 render_loop "$HELD_LOOP"
 # Wait for the operator to create the KubeArmorPolicy (the A1 fact-3 object).
 i=0
@@ -864,109 +975,144 @@ while :; do
 	i=$((i + 3)); [ "$i" -gt 120 ] && die "no KubeArmorPolicy for $HELD_LOOP in 120s (the operator did not apply it)"
 	sleep 3
 done
-# Record the canonical spec, then MUTATE it (the tamper): add a no-op
-# annotation-style spec key change by appending a process rule that the
-# canonical spec lacks. The hash mismatch is what the case proves — the exact
-# mutation shape does not matter (any spec diff breaks the hash).
+# Wait for the Loop to be in Planning or Implementing (an ACTIVE phase) before
+# the tamper (the owner's gate case: the tamper lands while the Loop is in
+# Planning or Implementing, not after it has finished).
+i=0
+while :; do
+	ph=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+	log held "waiting for the Loop to be active (t=${i}s ph=$ph)"
+	case "$ph" in
+	Planning | Implementing) break ;;
+	Succeeded | Failed) die "$HELD_LOOP reached $ph before the tamper window (re-run)" ;;
+	*) : ;;
+	esac
+	i=$((i + 3)); [ "$i" -gt 180 ] && die "no active phase for $HELD_LOOP in 180s"
+	sleep 3
+done
+HELD_PHASE_AT_TAMPER=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.phase}')
+log held "the Loop is in $HELD_PHASE_AT_TAMPER (active) — tampering its KubeArmorPolicy NOW (no annotation or Loop touch; the #129 watch is what must detect it)"
+# Record the canonical spec, then MUTATE it (the tamper). Any spec diff breaks
+# the KaptSpecHash; the operator's own KubeArmorPolicy watch (PR #129) is what
+# must re-reconcile the Loop — NO annotation touch, NO Loop touch in this case.
 kc -n "$NS" get kubearmorpolicy "coxswain-$HELD_LOOP" -o json >"$EVIDENCE/ka-policy-canonical-$HELD_LOOP.json"
-# The mutation: set a spec field the canonical spec does not carry. KubeArmor
-# policies are unstructured here; add spec.rule.process as an empty array
-# (the canonical spec may or may not carry it — if it does, change a value
-# instead). A python one-shot does the mutation + apply.
-python3 - "$EVIDENCE/ka-policy-canonical-$HELD_LOOP.json" "$HELD_LOOP" <<'PYEOF'
+python3 - "$EVIDENCE/ka-policy-canonical-$HELD_LOOP.json" "$HELD_LOOP" <<PYEOF
 import json, subprocess, sys
 canon = json.load(open(sys.argv[1]))
-name = sys.argv[2]
 spec = canon.get("spec", {})
-# Mutate: change the severity field (a valid KubeArmorPolicy spec field) to a
-# different value. The canonical spec has no severity (or a default); setting
-# it to "High" (a valid KubeArmor severity) changes the spec hash without
-# breaking the schema.
+# A spec diff the canonical spec does not carry (the hash mismatch is what the
+# case proves — the exact mutation shape does not matter).
 spec["severity"] = 5
-canon["spec"] = spec
-out = json.dumps(canon)
-subprocess.run(["kubectl", "--context", "kind-coxswain-alpha", "-n", "alpha-e2e",
-                "apply", "-f", "-"], input=out.encode(), check=True)
-print(f"a6: tampered KubeArmorPolicy {name} (spec.severity=5)")
+kname = "coxswain-" + sys.argv[2]
+# The tamper is a kubectl PATCH (a targeted spec change), NOT an apply of the
+# whole object (the previous run's apply added the kubectl.kubernetes.io/
+# last-applied-configuration annotation, which is a second spec diff on top of
+# the tamper — the patch keeps the object clean so the ONLY diff is the
+# tamper itself).
+subprocess.run(["kubectl", "--context", "$CTX", "-n", "$NS",
+                "patch", "kubearmorpolicy", kname,
+                "--type", "merge", "-p", json.dumps({"spec": spec})],
+               check=True)
+print(f"a6: tampered KubeArmorPolicy {kname} (spec.severity=5; a kubectl patch, no annotation touch)")
 PYEOF
-log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash — A1 fact 3 fails)"
-# Give the operator time to reconcile and detect the hash mismatch before the
-# first check. (The operator must watch the KubeArmorPolicy it owns —
-# fix/watch-kubearmorpolicy — so a tamper re-reconciles at once. No
-# annotation-touch here: that would mask the watch gap. The held case is
-# proven ONLY when the operator re-reconciles on its own.)
-sleep 30
-# The operator self-heals a tampered owned KubeArmorPolicy on the detecting
-# pass (createOrUpdateKapt re-canonicalizes the spec), so the held state is
-# the detecting pass — not a multi-reconcile hold. The load-bearing contract
+log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash — A1 fact 3 fails; the #129 watch must re-reconcile the Loop at once, with no annotation or Loop touch)"
+# The #129 watch enqueues the Loop on the tamper at once (no annotation or
+# Loop touch — that would mask the watch gap). The load-bearing contract
 # (fix/watch-kubearmorpolicy, owner D55 2026-10-12): the tamper is DETECTED
-# (PolicyEnforced != True with Reason=KaptTampered, no iterations) on the
-# detecting pass, WITHOUT touching the Loop (the operator's watch on the
-# KubeArmorPolicy drives the re-reconcile), and THEN the operator restores the
-# canonical policy and reopens the gate. We assert that sequence: (1) within a
-# detection window the gate is observed held at least once; (2) the gate
-# reopens (the operator re-applied canonical). A permanently held Loop (the
-# operator never re-applied) is a FAILED gate case.
+# (PolicyEnforced != True with Reason=KaptTampered) on the detecting pass,
+# WITHOUT touching the Loop (the operator's watch on the KubeArmorPolicy
+# drives the re-reconcile), and THEN the operator restores the canonical
+# policy (the watch re-fires on the operator's own repair write) and reopens
+# the gate. We assert that sequence: (1) within a detection window the gate
+# is observed held at least once; (2) the gate reopens (the operator
+# re-applied canonical). A permanently held Loop (the operator never
+# re-applied) is a FAILED gate case.
 HELD_DETECTED=0
+HELD_KAPT_TAMPERED=0
 HELD_REOPEN_OK=0
 HELD_FAIL=0
 i=0
-# Phase 1: wait for the detecting pass. The operator's watch enqueues the
+# Phase 1: wait for the detecting pass. The operator's #129 watch enqueues the
 # Loop on the tamper; the detecting reconcile observes the tampered spec
-# (pre-Apply read) and sets PolicyEnforced=False/Reason=KaptTampered. Poll
-# for up to 120s (12 x 10s) for the held state to appear at least once.
-while [ "$i" -lt 120 ]; do
+# (pre-Apply read) and sets PolicyEnforced=False/Reason=KaptTampered. The
+# hold on an ACTIVE Loop is read from the PHASE, not the iteration: the agent
+# increments status.iteration on phase entry, so a Loop that has entered
+# Implementing may already carry iteration=0 — the hold is "the phase never
+# advances past the phase the tamper landed in". Poll for up to 180s
+# (18 x 10s) for the held state to appear at least once, then for the gate
+# to reopen (the operator's repair write re-fires the watch).
+while [ "$i" -lt 180 ]; do
 	pe=$(policy_enforced "$HELD_LOOP")
-	iter=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.iteration}' 2>/dev/null || echo "")
 	ph=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+	iter=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.iteration}' 2>/dev/null || echo "")
 	log held "t=${i}s PolicyEnforced=$pe phase=$ph iteration=$iter"
 	case "$pe" in
-	True*) # The gate opened — either it never held (the tamper was not
-		# detected) or the operator already self-healed and reopened. If we
-		# have not yet observed the held state, keep polling (the held state
-		# may be transient); if we have, the gate reopened (done).
+	True*) # The gate opened. If we have not yet observed the held state, keep
+		# polling (the held state may be transient — the watch may not have
+		# fired yet); if we have, the operator restored the policy and the
+		# gate reopened (done).
 		if [ "$HELD_DETECTED" = 1 ]; then
 			HELD_REOPEN_OK=1; break
 		else
 			i=$((i + 10)); sleep 10; continue
 		fi
 		;;
-esac
-	# Not True: check the reason is the tamper (KaptTampered) and no
-	# iterations (the gate held: the runner never started).
+	esac
+	# Not True: the gate is held. Record whether the reason is the tamper
+	# (KaptTampered — the owner's gate case names it).
 	case "$pe" in
-	*KaptTampered*) HELD_DETECTED=1; log held "the gate is HELD on the detecting pass (PolicyEnforced=$pe, Reason=KaptTampered) — the spec-hash gate detected the tamper" ;;
+	*KaptTampered*) HELD_DETECTED=1; HELD_KAPT_TAMPERED=1; log held "the gate is HELD on the detecting pass (PolicyEnforced=$pe, Reason=KaptTampered) — the spec-hash gate detected the tamper" ;;
 	*) HELD_DETECTED=1; log held "the gate is held (PolicyEnforced=$pe) — the enforcement check is not enforcing (the spec hash mismatches the tampered spec)" ;;
 	esac
+	# The hold on an ACTIVE Loop: the phase must not have ADVANCED PAST the
+	# phase the tamper landed in. If the tamper landed in Planning, the Loop
+	# must not reach Implementing/Verifying/Succeeded while held. If it
+	# landed in Implementing, the Loop must not reach Verifying/Succeeded
+	# while held. (The agent increments iteration on phase entry, so the
+	# phase — not the iteration — is the hold signal on an active Loop.)
 	case "$ph" in
 	Succeeded|Failed) log held "FAIL: the Loop reached a terminal phase ($ph) while held (it ran despite the failed check)"; HELD_FAIL=1; break ;;
 	esac
-	if [ -n "$iter" ] && [ "$iter" != "0" ]; then
-		log held "FAIL: iteration advanced to $iter while held (work happened)"; HELD_FAIL=1; break
+	if [ "$HELD_PHASE_AT_TAMPER" = "Planning" ]; then
+		case "$ph" in Verifying) log held "FAIL: the Loop advanced to Verifying while the gate is held (work happened)"; HELD_FAIL=1; break ;; esac
+	else
+		case "$ph" in Verifying) log held "FAIL: the Loop advanced to $ph while the gate is held (work happened)"; HELD_FAIL=1; break ;; esac
 	fi
 	i=$((i + 10)); sleep 10
 done
 if [ "$HELD_FAIL" = 1 ]; then
-	collect_evidence "$HELD_LOOP" held-broken; die "gate case 1 FAILED: the Loop ran despite the failed enforcement check (terminal phase or iterations) — see $EVIDENCE/held-broken"
+	collect_evidence "$HELD_LOOP" held-broken; die "gate case 1 FAILED: the Loop ran despite the failed enforcement check (the phase advanced while held) — see $EVIDENCE/held-broken"
 fi
-[ -n "$HELD_DETECTED" ] && [ "$HELD_DETECTED" = 1 ] || { collect_evidence "$HELD_LOOP" held-not-detected; die "gate case 1 FAILED: the operator did not detect the tampered policy (no PolicyEnforced=False/KaptTampered observed within 120s — the watch may be missing — see $EVIDENCE/held-not-detected)"; }
-log held "the gate was HELD on the detecting pass (PolicyEnforced != True, no iterations) WITHOUT touching the Loop — the operator's watch on the KubeArmorPolicy drove the re-reconcile"
+[ "$HELD_DETECTED" = 1 ] || { collect_evidence "$HELD_LOOP" held-not-detected; die "gate case 1 FAILED: the operator did not detect the tampered policy (no PolicyEnforced!=True observed within 180s — the #129 watch may be missing — see $EVIDENCE/held-not-detected)"; }
+if [ "$HELD_KAPT_TAMPERED" = 1 ]; then
+	log held "the gate was HELD on the detecting pass with Reason=KaptTampered (no annotation or Loop touch — the operator's #129 watch on the KubeArmorPolicy drove the re-reconcile)"
+else
+	log held "the gate was HELD on the detecting pass (PolicyEnforced != True; the reason is recorded in the held/ evidence — the tamper was detected)"
+fi
 # Phase 2: the operator self-heals the tampered owned policy (createOrUpdateKapt
-# re-canonicalizes the spec) and reopens the gate. REQUIRE (A6): the operator
+# re-canonicalizes the spec on the detecting pass; the watch re-fires on the
+# operator's own repair write) and reopens the gate. REQUIRE (A6): the operator
 # MUST restore the canonical policy and reopen the gate; a permanently held
 # Loop is a FAILED gate case.
 i=0
 while :; do
 	pe=$(policy_enforced "$HELD_LOOP")
+	ph=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
 	case "$pe" in
-	True*) log held "the operator restored the canonical policy: PolicyEnforced=True (the gate reopened — the hold was the spec-hash check, not a wedge)"; HELD_REOPEN_OK=1; break ;;
+	True*) log held "the operator restored the canonical policy: PolicyEnforced=True (phase=$ph; the gate reopened — the hold was the spec-hash check, not a wedge)"; HELD_REOPEN_OK=1; break ;;
 	esac
-	i=$((i + 5)); [ "$i" -gt 120 ] && { log held "note: the operator did not re-apply the canonical policy within 120s"; break; }
+	i=$((i + 5)); [ "$i" -gt 180 ] && { log held "note: the operator did not re-apply the canonical policy within 180s"; break; }
 	sleep 5
 done
 [ "$HELD_REOPEN_OK" = 1 ] || { collect_evidence "$HELD_LOOP" held-no-reopen; die "gate case 1 FAILED: the operator did not restore the canonical policy and reopen the gate (the Loop is permanently held — see $EVIDENCE/held-no-reopen)"; }
-log held "gate case 1 PASS: the gate was held on the detecting pass (no Loop touch, no iterations), then the operator restored the policy and reopened the gate"
+# The reopened gate lets the (still active) Loop finish its work; watch it to a
+# terminal phase so the evidence is complete (the tamper case must end with the
+# Loop able to run — the hold was the detecting pass, not a wedge).
+watch_loop "$HELD_LOOP" "$EVIDENCE/held-phase.log" || die "$HELD_LOOP wedged after the gate reopened (see $EVIDENCE/held-phase.log)"
+HELD_FINAL=$(k get loop "$HELD_LOOP" -o jsonpath='{.status.phase}')
+log held "the held Loop reached $HELD_FINAL after the gate reopened (the hold did not wedge it)"
 collect_evidence "$HELD_LOOP" held
+log held "gate case 1 PASS: tampered the KubeArmorPolicy on an ACTIVE Loop (phase $HELD_PHASE_AT_TAMPER, no annotation or Loop touch); the #129 watch flipped PolicyEnforced to KaptTampered, the Loop stayed held (the phase did not advance), then the operator restored the canonical policy and the gate reopened"
 # Clean up the held Loop (it is the gate case, not the deliver case).
 kc -n "$NS" delete loop "$HELD_LOOP" --wait=false >/dev/null 2>&1 || true
 

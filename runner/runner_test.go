@@ -5,7 +5,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/papawattu/coxswain/runner/testhelper"
 )
@@ -143,5 +146,62 @@ func TestRunnerPostsV1ChatCompletionsPath(t *testing.T) {
 	}
 	if len(paths) == 0 || paths[0] != "/v1/chat/completions" {
 		t.Fatalf("request paths = %v, want [/v1/chat/completions] first", paths)
+	}
+}
+
+// I89: a hanging model stub — the runner times out quickly, retries with
+// backoff, and surfaces ModelUnavailable after all retries are exhausted.
+func TestModelTimeout_RetriesAndSurfacesModelUnavailable(t *testing.T) {
+	// The model hangs for 5s on every request. The runner's ModelTimeout is
+	// 100ms, so every call times out. With the default 3 retries (4 attempts
+	// total), the runner should make 4 requests and then surface
+	// ModelUnavailable.
+	var mu sync.Mutex
+	nRequests := 0
+	fm := testhelper.New()
+	fm.SetHandler(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		nRequests++
+		mu.Unlock()
+		time.Sleep(5 * time.Second) // hang — the context will time out
+	})
+	defer fm.Close()
+
+	cfg := runConfig{
+		Prompt:       "test",
+		Workspace:    t.TempDir(),
+		BaseURL:      fm.URL,
+		APIKey:       "test",
+		Model:        "test-model",
+		MaxSteps:     1,
+		ModelTimeout: 100 * time.Millisecond,
+	}
+
+	start := time.Now()
+	result := run(cfg)
+	elapsed := time.Since(start)
+
+	// The runner must have made 4 attempts (initial + 3 retries).
+	mu.Lock()
+	gotRequests := nRequests
+	mu.Unlock()
+	if gotRequests < 4 {
+		t.Fatalf("expected at least 4 model requests (initial + 3 retries), got %d", gotRequests)
+	}
+
+	// The runner must have surfaced ModelUnavailable in the error.
+	if !strings.Contains(result.VerificationNotes, "ModelUnavailable") {
+		t.Errorf("result.VerificationNotes should contain 'ModelUnavailable', got %q", result.VerificationNotes)
+	}
+	if result.Status != "blocked" {
+		t.Errorf("result.Status should be 'blocked', got %q", result.Status)
+	}
+
+	// The total elapsed time should be bounded: 4 * 100ms timeout + backoff
+	// (2s + 4s + 8s = 14s) ≈ 14.4s. The old 10-minute single-shot timeout
+	// would have taken 600s. Assert it's well under the old timeout.
+	maxExpected := 60 * time.Second
+	if elapsed > maxExpected {
+		t.Errorf("runner took %v, want < %v (the old 10-minute timeout would have taken 600s)", elapsed, maxExpected)
 	}
 }

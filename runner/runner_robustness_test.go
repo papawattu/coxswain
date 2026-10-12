@@ -274,10 +274,14 @@ func TestRunnerShellTimeoutKillsChildAfterSuccess(t *testing.T) {
 // timeout message. With a ModelTimeout larger than the delay, it must succeed.
 func TestRunnerModelTimeoutConfigurable(t *testing.T) {
 	// Case 1: a 500ms delay against a 200ms timeout -> blocked (timeout).
-	fakeSlow := testhelper.New(testhelper.ModelResponse{
-		Content: "slow answer",
-		Delay:   500 * time.Millisecond,
-	})
+	// I89: the runner retries a timeout up to 3 times, so queue 4 slow
+	// responses (one per attempt).
+	fakeSlow := testhelper.New(
+		testhelper.ModelResponse{Content: "slow answer", Delay: 500 * time.Millisecond},
+		testhelper.ModelResponse{Content: "slow answer", Delay: 500 * time.Millisecond},
+		testhelper.ModelResponse{Content: "slow answer", Delay: 500 * time.Millisecond},
+		testhelper.ModelResponse{Content: "slow answer", Delay: 500 * time.Millisecond},
+	)
 	defer fakeSlow.Close()
 
 	slowRes := run(runConfig{

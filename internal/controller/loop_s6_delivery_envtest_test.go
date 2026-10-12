@@ -305,7 +305,7 @@ func s6Cond(loop *coxv1alpha1.Loop) (bool, metav1.ConditionStatus, string) {
 // <repo-without-.git>/pulls/7 for a Gitea repo, https://github.com/<o>/<r>/
 // pull/7 for a GitHub delivery; the operator validates it exactly).
 func s6ValidTermination(loop *coxv1alpha1.Loop) string {
-	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name)
+	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID))
 	commit := loop.Status.CurrentVerify.VerifiedCommit
 	prov, _ := deliverProviderForRepo(loop.Spec.Workspace.Repo)
 	var prURL string
@@ -704,17 +704,18 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 			"a terminated push with a wrong-path prURL is terminal DeliveryFailed (not InProgress forever)")
 
 		By("accepting a VALID message: status.delivery + Delivered=True/Delivered")
-		msg := s6ValidTermination(&coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       coxv1alpha1.LoopSpec{Workspace: coxv1alpha1.Workspace{Repo: loop.Spec.Workspace.Repo}},
-			Status:     coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit}},
-		})
+		// The termination message's branch must match the operator's delivery
+		// branch, which is <prefix><loop>-<uid8> (I81) — derived from the REAL
+		// loop's metadata.uid (set by the API at create). Use the real loop (not
+		// a fresh one without a uid) so the branch the message names is the
+		// uid-suffixed one the operator expects.
+		msg := s6ValidTermination(loop)
 		s6DeliverPod(ns, name, corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: msg},
 		})
 		loop = s6Reconcile(r, ns, name)
 		Expect(loop.Status.Delivery).ToNot(BeNil(), "a valid termination message must write status.delivery")
-		Expect(loop.Status.Delivery.Branch).To(Equal(deliverBranchName(deliverBranchPrefix(loop), loop.Name)),
+		Expect(loop.Status.Delivery.Branch).To(Equal(deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID))),
 			"branch= is the loop's delivery branch (prefix + name)")
 		Expect(loop.Status.Delivery.Commit).To(Equal(s6HeadCommit))
 		Expect(loop.Status.Delivery.PRNumber).To(BeEquivalentTo(7))

@@ -168,26 +168,47 @@ if ! kube get secret samples-git-cred >/dev/null 2>&1; then
 fi
 log "operator + gitea sample present"
 
-# --- stage a FAILED first delivery (the redeliver path) ---------------------
-# Pre-create the delivery branch coxswain/<loop> in the Gitea samples repo with
-# UNRELATED history, so the deliver Job's push is non-fast-forward and rejected
-# ("fetch first") -> a deterministic FAILED first delivery (Delivered=False
-# reason=DeliveryFailed). `cox redeliver` then re-delivers it (a NEW Job UID,
-# ending Delivered=True) once the stale branch is deleted. Staged via the
-# in-cluster Gitea's existing samples credentials (nothing else) — the I81
-# scenario, staged deliberately, not as a cross-run leftover.
-gitea_port_forward
-DELIVER_BRANCH="${BRANCH_PREFIX}${LOOP_NAME}"
-stage_delivery_branch "$DELIVER_BRANCH"
-gitea_stop
-
 # --- apply the Loop ---------------------------------------------------------
+# Applied BEFORE staging the delivery branch: the delivery branch name is now
+# coxswain/<loop>-<uid8> (R25 I81), and uid8 is the Loop's metadata.uid[:8],
+# which only exists once the Loop is applied. The branch must be staged with the
+# NEW (uid-suffixed) name so the first delivery's push is rejected (fetch first)
+# and the redeliver proof (delete the branch -> re-deliver) still holds — with
+# the I81 fix, the old coxswain/<loop> name no longer collides, so staging the
+# old name would make the first delivery SUCCEED and the redeliver step would
+# fail.
 render="$(mktemp)"
 sed "s|name: gocli-task1|name: $LOOP_NAME|" "$LOOP_SRC" >"$render"
 kube get loop "$LOOP_NAME" >/dev/null 2>&1 && kube delete loop "$LOOP_NAME" --wait=false >/dev/null 2>&1 || true
 kube apply -f "$render" >/dev/null
 rm -f "$render"
 log "applied Loop $LOOP_NAME"
+
+# --- stage a FAILED first delivery (the redeliver path) ---------------------
+# Pre-create the delivery branch coxswain/<loop>-<uid8> in the Gitea samples
+# repo with UNRELATED history, so the deliver Job's push is non-fast-forward and
+# rejected ("fetch first") -> a deterministic FAILED first delivery (Delivered
+# =False reason=DeliveryFailed). `cox redeliver` then re-delivers it (a NEW
+# Job UID, ending Delivered=True) once the stale branch is deleted. uid8 is the
+# Loop's metadata.uid[:8] (I81). Staged via the in-cluster Gitea's existing
+# samples credentials (nothing else) — a deterministic failed first delivery,
+# not a cross-run leftover.
+# The uid is available as soon as the Loop is applied (the API assigns it at
+# create); wait a moment for it to be populated, then derive the branch.
+for i in $(seq 1 20); do
+  LOOP_UID="$(kube get loop "$LOOP_NAME" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")"
+  [ -n "$LOOP_UID" ] && break
+  sleep 1
+done
+[ -n "$LOOP_UID" ] || fail "could not read the Loop's metadata.uid (needed for the uid-suffixed delivery branch)"
+# uid8 = first 8 chars of the uid (the same truncation the operator uses).
+UID8="${LOOP_UID:0:8}"
+[ "${#UID8}" -eq 8 ] || fail "uid8 must be 8 chars (got '${UID8}' from uid '${LOOP_UID}')"
+DELIVER_BRANCH="${BRANCH_PREFIX}${LOOP_NAME}-${UID8}"
+gitea_port_forward
+stage_delivery_branch "$DELIVER_BRANCH"
+gitea_stop
+log "staged the uid-suffixed delivery branch (I81) — the first delivery will be rejected (fetch first)"
 
 # wait for the sandbox to start (Planning or later)
 for i in $(seq 1 60); do

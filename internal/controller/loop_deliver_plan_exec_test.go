@@ -103,7 +103,7 @@ func TestDeliverPlanCarriedFromPVCNotCheckout(t *testing.T) {
 			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
 		},
 	}
-	branch := deliverBranchName(deliverBranchPrefix(loop), loopName)
+	branch := deliverBranchName(deliverBranchPrefix(loop), loopName, string(loop.UID))
 
 	// The plan content (on the PVC only, never in a commit).
 	const planText = "Agent plan: fix Round to round half away from zero.\n- step 1: change round.go\n- step 2: run go test ./...\n"

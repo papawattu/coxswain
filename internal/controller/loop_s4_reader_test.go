@@ -873,4 +873,79 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		}
 		Expect(found).To(BeTrue(), "the ModelAvailable condition must be present")
 	})
+
+	// I83: exactly one PhaseAdvanced event per transition under a
+	// re-reconcile. The claim consumption guard (claim.ObservedPhase !=
+	// loop.Status.Phase) must discard the already-consumed claim on the
+	// second reconcile, so the event is emitted exactly once.
+	//
+	// NOTE: this is a regression test, not a faithful reproduction of the
+	// race condition observed in the live cluster (R25 I83: the A2 control
+	// run recorded two PhaseAdvanced events ~1s apart for the same
+	// transition). In envtest the Status().Update is synchronous (the API
+	// server commits immediately), so the second reconcile always sees the
+	// updated phase and the guard fires. The race (the second reconcile
+	// reading the Loop before the first one's status update is committed)
+	// cannot be reproduced in envtest. The evidence from the live cluster
+	// (.samples/a2-restart-20261010191544/op-planning/events.jsonl, the
+	// count:2 event) shows the race occurred, but the cause is not
+	// verified. This test asserts that the guard is in place (if removed,
+	// the existing "discards a consumed success claim" spec fails).
+	It("I83: exactly one PhaseAdvanced event per transition under a re-reconcile", func() {
+		ns := "i83-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		primed, nn := primeReconcile(r, ns, "i83lp")
+		Expect(primed.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+
+		// Pin the baseCommit and create the stand-in pod + sandbox.
+		ensureSandboxObject(ns, "i83lp")
+		createStandinPod(ns, "i83lp")
+		pinsLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, pinsLoop)).To(Succeed())
+		pinsLoop.Status.BaseCommit = s3BaseCommitSHA
+		Expect(k8sClient.Status().Update(ctx, pinsLoop)).To(Succeed())
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "i83lp-sandbox", Namespace: ns}, pod)).To(Succeed())
+		terminated := int32(0)
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: workspaceInitContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: terminated, Message: s3BaseCommitSHA}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// Advance Planning -> Implementing (claim 1).
+		loop := oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		// Clear the events from the Planning -> Implementing transition.
+		_ = drainEvents(recorder)
+
+		// Advance Implementing -> Verifying (claim 2).
+		loop = oneShotRun(r, nn, coxv1alpha1.LoopPhaseImplementing, true)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"the Implementing -> Verifying advance must have happened")
+
+		// Re-reconcile with the SAME claim still on the pod. The claim
+		// consumption guard must discard it (observedPhase=Implementing
+		// != current phase=Verifying), so no second event is emitted.
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Count the PhaseAdvanced events for the Implementing -> Verifying
+		// transition. Exactly one is expected.
+		events := drainEvents(recorder)
+		var implToVerify []string
+		for _, e := range events {
+			if strings.Contains(e, "Implementing -> Verifying") {
+				implToVerify = append(implToVerify, e)
+			}
+		}
+		Expect(implToVerify).To(HaveLen(1),
+			"exactly one PhaseAdvanced event per Implementing -> Verifying transition under a re-reconcile; got %v", implToVerify)
+	})
 })

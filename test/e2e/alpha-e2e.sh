@@ -887,6 +887,11 @@ subprocess.run(["kubectl", "--context", "kind-coxswain-alpha", "-n", "alpha-e2e"
 print(f"a6: tampered KubeArmorPolicy {name} (spec.severity=5)")
 PYEOF
 log held "KubeArmorPolicy TAMPERED (spec hash now != the recorded KaptSpecHash — A1 fact 3 fails)"
+# Give the operator time to reconcile and detect the hash mismatch before the
+# first check. The operator's reconcile cycle is ~10s; wait 30s for it to
+# observe the tampered spec and set PolicyEnforced=False.
+sleep 30
+log held "waiting 30s for the operator to detect the hash mismatch and set PolicyEnforced=False"
 # The Loop must be HELD: PolicyEnforced != True, and NO iterations (the
 # sandbox is Suspended; the runner never starts). Assert at intervals for
 # HELD_CAP seconds (it must stay held the whole time, not flip later).

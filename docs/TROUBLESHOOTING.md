@@ -55,42 +55,42 @@ the *symptom*, not that cause: the hang now surfaces as a named, bounded
 ## Service DNS NXDOMAIN from a fresh kind cluster
 
 **What you see:** on a freshly created kind cluster, lookups of
-`<service>.<ns>.svc.cluster.local` fail (NXDOMAIN) from **hostNetwork pods**;
-`nslookup` reports the node IP (e.g. `172.21.0.1`) as the DNS server instead
-of CoreDNS. CoreDNS pods are running and normal pods resolve fine.
+`<service>.<ns>.svc.cluster.local` fail (NXDOMAIN) from inside the cluster,
+and `nslookup` reports the node IP (`172.21.0.1`) as the DNS server instead
+of CoreDNS.
 
-**Cause:** on the dev host, kind nodes inherit the host's
-`/etc/resolv.conf` — upstream is the host gateway (`172.21.0.1`), which has
-no cluster-domain search path, so hostNetwork pods (whose network
-namespace is the node's) cannot resolve cluster DNS. Sandbox and agent pods
-run on the pod network and resolve via CoreDNS; only hostNetwork pods are
-affected. This is a hostNetwork-pod artifact of the dev host's resolv.conf,
-not a defect in the cluster (A6, `docs/REVIEW-PHASE1-R26.md`).
+**What the alpha runs showed (observation; the cause was not established):**
+- **The alpha.1 A6 run** (`.samples/alpha-e2e-1791784606/summary.txt`,
+  "BLOCKERS FOUND ON THE FRESH CLUSTER" item 2): on the fresh `coxswain-alpha`
+  cluster, "Service DNS broken on the fresh kind node: kube-dns.<ns>.svc
+  does not resolve (nslookup server = node IP 172.21.0.1, not CoreDNS
+  10.96.0.10; NXDOMAIN for all svc FQDNs). CoreDNS pods are 2/2 Running." The
+  deliver Job's `clone-base` step uses
+  `HTTPS_PROXY=http://<loop>-egress-proxy.<ns>.svc…`, which could not be
+  resolved, so the deliver Job failed (`DeliveryFailed`). The Loop agent
+  cycle still reached Succeeded only because the model endpoint is an IP.
+- **The alpha.3 A6 run** (`.samples/alpha-e2e-1791788025/dns-eth0.log`, the
+  a6 preflight probe `dns-eth0` run from a pod via
+  `test/e2e/alpha-e2e.sh:358-383`): `nslookup
+  kubernetes.default.svc.cluster.local` returned `Address: 10.96.0.1` via
+  `Server: 10.96.0.10` — cluster DNS resolved from a pod on that run.
 
-**Diagnosis** (how A6 found it, PR #125): the a6 preflight runs in-cluster
-reachability probes from both a normal (eth0) pod and a hostNetwork pod,
-and the run log records the contrast —
-`.samples/alpha-e2e-1791788025/run.log:38-39`:
+**Cause:** not established. The two runs differ (one NXDOMAIN, one resolved)
+and the alpha.1 evidence does not isolate which component is at fault, so
+no cause is asserted here.
 
-```
-[a6 preflight] in-cluster reachability probe eth0: state=Succeeded (log: …/reach-eth0.log)
-[a6 preflight] in-cluster reachability probe hostnet: state=Succeeded (log: …/reach-hostnet.log)
-[a6 preflight] (the alpha.1 break: hostNetwork pods inherit the node's /etc/resolv.conf — upstream 172.21.0.1, no cluster-domain search path — so a hostNetwork model pod got server=172.21.0.1 + NXDOMAIN; the sandbox pods are ethernet and resolve via CoreDNS; the DNS breakage is therefore a hostNetwork-pod artifact, not a cluster defect — see the hostNetwork probe log for the contrast)
-```
-
-**Fix:** A6's first run (`.samples/alpha-e2e-1791784606/summary.txt`,
-"BLOCKERS FOUND ON THE FRESH CLUSTER") worked around the same class of
-breakage by pointing the model endpoint at an IP (`192.168.1.20:8000`),
-because a hostNetwork model pod with a broken resolv.conf could not resolve
-a name. The final alpha acceptance (PR #125) runs the preflight probes and
-records the DNS server: "CoreDNS at 10.96.0.10 is the DNS server" and the
-`nslookup` from a pod resolves `kubernetes.default.svc.cluster.local` to
-`10.96.0.1` — i.e. on a cluster where the kind nodes' resolv.conf is correct,
-nothing in the operator or the Loops needs a workaround. If you hit this on
-your host, the fix is on the kind node side (a resolv.conf that points at
-CoreDNS with the `cluster.local` search path), not in coxswain: the e2e
-preflight (`test/e2e/alpha-e2e.sh`) will show you which of the two pods is
-broken.
+**What to check when you hit it:**
+1. The failing pod's `/etc/resolv.conf`:
+   `kubectl -n <ns> exec <pod> -- cat /etc/resolv.conf` — is the nameserver
+   the node IP or CoreDNS, and is the `cluster.local` search path present?
+2. The kubelet `clusterDNS` setting (on the node, `kubelet --cluster-dns`
+   or the `--cluster-dns` flag in the kubelet args) — it must point at the
+   in-cluster DNS service IP (`10.96.0.10` by default).
+3. The `kube-dns` Service and its endpoints in `kube-system`:
+   `kubectl -n kube-system get svc,endpoints kube-dns` — the Service must
+   have the CoreDNS pod IPs as endpoints.
+4. CoreDNS logs: `kubectl -n kube-system logs -l k8s-app=kube-dns` — look
+   for resolution errors during the failing window.
 
 ## `cannot list resource configmaps at the cluster scope` on a pre-alpha.2 install
 
@@ -200,10 +200,10 @@ stall in Implementing (vLLM backends, environmental)"):**
   it is bounded to ~8 minutes with a named `ModelUnavailable` condition.
 
 **What to check if you hit this:**
-1. Is the model endpoint healthy from a normal pod (not just from the host)?
-   A6's preflight pattern — a reachability probe from an eth0 pod and one
-   from a hostNetwork pod (`test/e2e/alpha-e2e.sh`) — separates a broken
-   backend from a broken DNS path (see the DNS entry above).
+1. Is the model endpoint healthy from a normal pod (not just from the
+   host)? A6's preflight probes a pod's reachability to the endpoint
+   (`test/e2e/alpha-e2e.sh`), which separates a broken backend from a
+   broken DNS path (see the DNS entry above).
 2. If the endpoint is an LB over multiple backends, check **each** backend
    directly (PR #124 read `request_success_total` /
    `num_requests_running` / `num_requests_waiting` from each backend, not

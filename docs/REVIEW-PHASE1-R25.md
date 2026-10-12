@@ -82,7 +82,7 @@ which pushes to the branch `coxswain/<loop>`.
 
 ### I82. `cox redeliver` mislabels a failed delivery
 
-- [ ] Open
+- [x] Open — eb5d8c8
 
 **Where:** `internal/cli/redeliver.go`.
 
@@ -97,7 +97,7 @@ delivered".
 
 ### I83. A duplicate PhaseAdvanced event
 
-- [ ] Open (cause unverified)
+- [x] Open (cause unverified) — f01ac82
 
 **Where:** the phase-advance event emission (`loop_controller.go`
 `emitPhaseAdvancedEvent`, and a second site on the verify path).
@@ -115,7 +115,7 @@ under a re-reconcile.
 
 ### I84. e2e claims ahead of their evidence
 
-- [ ] Open (AGENTS.md)
+- [x] Open (AGENTS.md) — 8f6a084
 
 Three times this round, an e2e result or PR reply said more than its
 evidence:

@@ -137,7 +137,7 @@ check only re-ran when something else touched the Loop. The first A6 held case
 
 ### I89. The agent waits 10 minutes on a hung model call
 
-- [ ] Open
+- [x] Open — e5af830, 06a0157
 
 **Where:** the runner's model client.
 
@@ -156,7 +156,7 @@ quickly, retries, and the Loop reports the reason.
 
 ### I90. Builder habits seen this round
 
-- [ ] Open (AGENTS.md; partly R25 I84)
+- [x] Open (AGENTS.md; partly R25 I84) — 90ebbcf, 50766d0
 
 - **Causes stated without evidence:**
   - "flaky agent" (#123);

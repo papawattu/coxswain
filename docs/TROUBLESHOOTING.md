@@ -155,17 +155,33 @@ run anyway on a non-enforcing CNI; the condition records that the CNI does
 not police that egress. It is separate from `--allow-unenforced` (the
 KubeArmor gate); the two flags are independent.
 
+**The supported topology is decided (D57).** R26 Q2 is answered: the alpha
+ships **KubeArmor-only**, with the network gate documented as requiring an
+enforcing CNI. The KubeArmor policy gate (A1, ADR-0007) is the alpha's
+enforcement layer and is **required**; the D38 network gate is a second,
+network-layer gate that needs a CNI that enforces NetworkPolicy (e.g.
+Calico — the tested profile is `test/e2e/d38-cni-e2e.sh`). On a CNI that
+doesn't enforce NetworkPolicy (kindnet included), the released
+`install.yaml` is fail-closed: Loops are held Suspended with
+`NetworkEnforced=False` (reason `CNIUnenforced`). To run anyway on a
+non-enforcing CNI (dev/kind only), add `--allow-unenforced-network` to the
+manager args — see the QUICKSTART "Network gate (D38)" section for the exact
+`kubectl patch` command and what that gives up (the CNI does not police pod →
+host-network egress; the only egress control left on that path is the
+proxy's own code, the same accepted limitation as the D50 DNS-fence note).
+
 **Why the alpha used it:** A6 proved the KubeArmor policy gate but ran the
 D38 network gate with this flag on a kindnet cluster — "the network gate was
 not exercised: A6 ran with `--allow-unenforced-network`, labelled as the
-escape hatch. See Q2." (`docs/REVIEW-PHASE1-R26.md`). The supported alpha
-topology for the network gate is **an open owner decision (R26 Q2)**:
-prove Calico + KubeArmor together on a host without another KubeArmor, or
-ship the alpha as KubeArmor-only with the network gate documented as
-requiring an enforcing CNI. Until that decision lands, an enforcing-CNI
-run of the network gate is not part of the accepted alpha path. For an
-enforcing-CNI configuration see `config/calico/kustomization.yaml` (it
-sets `--allow-unenforced` only, so the D38 network gate stays live).
+escape hatch. See Q2." (`docs/REVIEW-PHASE1-R26.md`). That open question (R26
+Q2) is now answered by D57 (see above). Note: `config/calico/kustomization.yaml`
+is the **D38 test profile** — Calico without KubeArmor, so it sets
+`--allow-unenforced` to keep the operator from holding Loops on the KubeArmor
+policy while the CNI enforcement is tested. It is **not a supported
+configuration**: that `--allow-unenforced` disables the KubeArmor policy gate
+that D57 makes required. A supported enforcing setup is **Calico plus
+KubeArmor, with neither flag** (`--allow-unenforced` nor
+`--allow-unenforced-network`).
 
 ## A Loop stuck in Implementing with no model traffic
 

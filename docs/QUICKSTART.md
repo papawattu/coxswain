@@ -34,24 +34,80 @@ kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/downl
 kubectl rollout status deploy/agent-sandbox-controller -n agent-sandbox-system
 ```
 
-### KubeArmor (BPF-LSM for the DNS fence)
+### KubeArmor (BPF-LSM for the policy gate) — REQUIRED
 
-The operator enforces egress with KubeArmor `KubeArmorPolicy` objects. The
-tool proxy's `matchDNSQueries` fence (the inner egress fence that restricts
-the proxy's DNS to the upstream host + platform DNS) needs **BPF-LSM active**
-(the `SOCKET_SENDMSG` hook). On a cluster without BPF-LSM the fence is **not
-enforced** and the only thing keeping the tool proxy on the configured upstream
-is the proxy's own code (it dials the fixed upstream host only) — an accepted
-limitation (D50, R23 I64; see `docs/adr/0008-tool-proxies.md`). For a fully
-fenced run, use a node/kernel with BPF-LSM enabled (the dev cluster installs
-KubeArmor v1.7.5 via the pinned `karmor` CLI; `make kind-up` does this for
-kind).
+**KubeArmor with BPF-LSM is required for the alpha** (D57: the alpha ships
+KubeArmor-only). The operator enforces egress with KubeArmor
+`KubeArmorPolicy` objects (the A1 policy gate, ADR-0007): without KubeArmor
+the `PolicyEnforced` gate cannot be enforced and the alpha is not running
+as designed. The tool proxy's `matchDNSQueries` fence (the inner egress
+fence that restricts the proxy's DNS to the upstream host + platform DNS)
+needs **BPF-LSM active** (the `SOCKET_SENDMSG` hook). On a cluster without
+BPF-LSM the fence is **not enforced** and the only thing keeping the tool
+proxy on the configured upstream is the proxy's own code (it dials the fixed
+upstream host only) — an accepted limitation (D50, R23 I64; see
+`docs/adr/0008-tool-proxies.md`). For a fully fenced run, use a node/kernel
+with BPF-LSM enabled (the dev cluster installs KubeArmor v1.7.5 via the
+pinned `karmor` CLI; `make kind-up` does this for kind).
 
 ### A Kubernetes cluster
 
 A reachable cluster (kubectl in `~/.kube/config` pointing at it). For local
 dev the Makefile creates one: `make kind-up` (kind 1.34, agent-sandbox,
 KubeArmor).
+
+### Network gate (D38)
+
+The alpha enforces the agent's egress at two layers. The KubeArmor policy
+gate (above) is the alpha's enforcement layer. The **network gate (D38)** is
+a second, network-layer gate: it needs a CNI that **enforces NetworkPolicy**
+(e.g. Calico; the tested profile is the `coxswain-calico` cluster from
+`test/e2e/d38-cni-e2e.sh` — kindnet is disabled and Calico polices the agent's
+allowlist NetworkPolicy against real endpoints). On a CNI that does **not**
+enforce NetworkPolicy (kind's default `kindnet` included), the network gate
+cannot be satisfied.
+
+The released `install.yaml` is **fail-closed** on this gate. On a CNI that
+doesn't enforce NetworkPolicy, Loops are **held Suspended** with the
+`NetworkEnforced` condition `False` (reason `CNIUnenforced` — "the CNI does
+not police pod -> host-network egress; sandbox held Suspended",
+`internal/controller/loop_controller.go:1008`). The operator probes the CNI
+with a self-test pod + NetworkPolicy in the `coxswain-cni-probe` namespace
+(`cmd/main.go`, `--cni-probe-*` flags) and re-gates every Loop when the result
+changes. Until the first probe succeeds, the condition is `Unknown` and the
+sandbox is held Suspended (fail-closed from startup, not just from the first
+probe failure).
+
+**To run anyway on a non-enforcing CNI** (dev/kind only — never in
+production), add `--allow-unenforced-network` to the manager's args. This is
+a **dev escape hatch** (D38), separate from `--allow-unenforced` (the eBPF
+policy gate). Loops run with `NetworkEnforced=False` reason
+`EnforcementDisabled` and the operator's own condition message:
+
+> "--allow-unenforced-network is set: the Loop runs but the CNI does NOT
+> police pod -> host-network egress (dev escape hatch)"
+> (`internal/controller/loop_controller.go:992,1000`)
+
+What that gives up, plainly: **the CNI does not police pod → host-network
+egress.** The agent can still reach any host-network target the NetworkPolicy
+would have blocked; the only egress control left on that path is the proxy's
+own code (it dials the fixed upstream host only) — the same accepted
+limitation as the D50 DNS-fence note (see `docs/adr/0008-tool-proxies.md`,
+"Limitation: DNS fence unenforced on clusters without BPF-LSM (D50, I64)").
+
+Do **not** use `--allow-unenforced` to work around the network gate: that
+flag disables the KubeArmor **policy** gate (the A1 enforcement), not the
+network gate. The two flags are independent (`cmd/main.go:93-104`).
+
+To add the network escape hatch to a deployed manager, patch the Deployment's
+args (the base manifest carries `--leader-elect` and
+`--health-probe-bind-address=:8081` as the manager's args, so this appends):
+
+```sh
+kubectl -n coxswain-system patch deploy coxswain-controller-manager --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--allow-unenforced-network"}]'
+kubectl -n coxswain-system rollout status deploy/coxswain-controller-manager
+```
 
 ## 2. Install the operator
 

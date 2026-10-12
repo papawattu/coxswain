@@ -52,6 +52,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
@@ -4841,10 +4842,26 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// operator applied the canonical policy) re-reconciles the Loop at once
 	// and the Enforcing() spec-hash check re-runs — without the watch, a
 	// tamper is only seen on an unrelated reconcile, and the D30 gate can
-	// stay open on a mismatched spec. The KubeArmorPolicy is unstructured
-	// (the operator uses unstructured.Unstructured + engine.KubeArmorGVK), so
-	// the watch is on an unstructured object with that GVK.
-	{
+	// stay open on a mismatched spec.
+	//
+	// fix/watch-kubearmorpolicy (PR #129) — the KubeArmorPolicy CRD is NOT
+	// shipped by install.yaml (KubeArmor installs it). The watch must be
+	// registered ONLY IF the RESTMapper resolves engine.KubeArmorGVK at
+	// setup: on a cluster without KubeArmor (a --allow-unenforced dev setup,
+	// the Calico cluster), the kind is absent and an unconditional watch
+	// makes the manager fail to start ("no matches for kind"), breaking
+	// cmd/main.go's promise that a missing KubeArmor CRD is tolerated (no-op)
+	// under the --allow-unenforced escape hatch. If the CRD is absent, log
+	// and skip the watch: the D30 gate already fails closed without
+	// enforcement (PolicyEnforced=False / NodeNotEnforcing, sandbox
+	// Suspended), so skipping the watch is safe.
+	// The KubeArmorPolicy is unstructured (the operator uses
+	// unstructured.Unstructured + engine.KubeArmorGVK), so the watch is on an
+	// unstructured object with that GVK.
+	if _, kaptMapErr := mgr.GetRESTMapper().RESTMapping(engine.KubeArmorGVK.GroupKind()); kaptMapErr != nil {
+		logf.Log.Info("KubeArmorPolicy CRD not present (RESTMapper does not resolve "+kaptGVKStr(engine.KubeArmorGVK)+"): the per-Loop KubeArmorPolicy watch is not registered. The D30 enforcement gate fails closed without enforcement (PolicyEnforced=False, sandbox Suspended); a tamper is detected only on an unrelated reconcile until KubeArmor installs the CRD.",
+			"gvk", kaptGVKStr(engine.KubeArmorGVK), "err", kaptMapErr)
+	} else {
 		kaptWatch := &unstructured.Unstructured{}
 		kaptWatch.SetGroupVersionKind(engine.KubeArmorGVK)
 		b = b.Watches(kaptWatch, handler.EnqueueRequestsFromMapFunc(
@@ -4920,6 +4937,15 @@ func (r *LoopReconciler) kubeArmorPolicyToLoopRequests(_ context.Context, obj cl
 			Name:      loopName,
 		},
 	}}
+}
+
+// kaptGVKStr renders a schema.GroupVersionKind as "group/version/Kind" for
+// log messages. fix/watch-kubearmorpolicy (PR #129): used by the CRD-gated
+// watch log so an operator on a cluster without KubeArmor sees which GVK was
+// not found (the KubeArmorPolicy GVK has a non-empty group, so it renders as
+// "security.kubearmor.com/v1beta1/KubeArmorPolicy").
+func kaptGVKStr(gvk schema.GroupVersionKind) string {
+	return gvk.Group + "/" + gvk.Version + "/" + gvk.Kind
 }
 
 // suspendSandboxIfRunning sets the sandbox's operatingMode to Suspended if it

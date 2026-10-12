@@ -8,6 +8,11 @@ The alpha ships `dist/install.yaml` (D54: ghcr.io + install.yaml; a Helm chart
 is Phase 7 work). A `v*` release tag publishes the public images and the
 `install.yaml` that points at them.
 
+When something is not working, start with `docs/TROUBLESHOOTING.md` — the
+symptoms alpha users have hit (ModelUnavailable, fresh-kind DNS, the
+configmaps RBAC wedge, kubectl debug denials, NetworkEnforced, the #124
+Implementing stall), each with its documented cause and fix.
+
 ## 1. Prerequisites
 
 Coxswain needs three things on the cluster. Dev/CI pins **k8s 1.34**

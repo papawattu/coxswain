@@ -176,3 +176,27 @@ kubectl cox redeliver <loop>    # re-trigger delivery for a failed Loop (I52 ann
 terminal phase (Succeeded / the budget or stall condition), the iteration
 count, and the delivery outcome (the PR the deliver Job opened, or the
 delivery failure reason).
+
+## 6. Model timeout and tuning
+
+The runner's model client uses a 120-second per-request timeout (I89). If
+the model backend hangs (no response within 120s), the runner retries up to
+3 times with exponential backoff (2s, 4s, 8s). After all retries are
+exhausted, the runner surfaces `ModelUnavailable` in its claim and exits
+with a blocked status. The operator maps this to a `ModelAvailable=False`
+condition (reason `ModelUnavailable`) on the Loop, visible via
+`kubectl cox describe`.
+
+**Worst case:** with the defaults (120s timeout, 3 retries), a fully hung
+model backend surfaces `ModelUnavailable` after about 8 minutes
+(4×120s + 14s of backoff). This is an improvement over the pre-I89
+behaviour (a single 10-minute timeout followed by kubelet back-off churn
+with no named reason).
+
+**Tuning:** the timeout is configurable via the runner's `ModelTimeout`
+field (set in the sandbox pod's agent container env or the Loop's spec). For
+a local 27B-class model under load, a legitimate response can approach 120s
+(#124 saw a 60s worst case); increase `ModelTimeout` if you see spurious
+`ModelUnavailable` conditions on a healthy backend. The retry count and
+backoff base are currently constants (`defaultModelRetries = 3`,
+`defaultModelRetryBackoff = 2s` in `runner/runner.go`).

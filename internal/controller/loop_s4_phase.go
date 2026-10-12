@@ -579,6 +579,15 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		fromPhase := loop.Status.Phase
 		c, advanced := r.recordPhaseClaim(loop, claim, now)
 		changed = changed || c
+		// I89: map a ModelUnavailable claim to a Loop condition so
+		// `kubectl cox describe` shows the model backend is down. The
+		// condition is set to False (reason=ModelUnavailable) when the
+		// claim carries ModelUnavailable in its blocked reason, and back
+		// to True when a subsequent claim succeeds (the model recovered).
+		// This is a diagnostic signal (infrastructure failure), not a gate
+		// input (ADR-0005 anti-gaming is preserved: the condition does not
+		// affect the phase machine or the verify decision).
+		r.applyModelAvailableCondition(loop, claim)
 		if advanced {
 			r.emitPhaseAdvancedEvent(loop, fromPhase)
 		}
@@ -597,4 +606,21 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	// (loop_phase_transition_envtest_test.go). The claim reader is the ONLY
 	// claim source: if it found nothing, the operator records nothing.
 	return claimReadPending, changed
+}
+
+// applyModelAvailableCondition (I89) maps the runner claim's model
+// availability to a Loop condition. When the claim is blocked and its
+// BlockedReason carries ModelUnavailable, the condition is set to False
+// (reason=ModelUnavailable). When the claim succeeds, the condition is
+// set back to True (reason=Recovered). The condition is purely
+// diagnostic (visible via `kubectl cox describe`); it does not gate the
+// phase machine or the verify decision (ADR-0005 anti-gaming preserved).
+func (r *LoopReconciler) applyModelAvailableCondition(loop *coxv1alpha1.Loop, claim *PhaseClaim) {
+	if claim.Status == "blocked" && strings.Contains(claim.BlockedReason, "ModelUnavailable") {
+		setCondition(loop, coxv1alpha1.ModelAvailableCondition, metav1.ConditionFalse,
+			"ModelUnavailable", "model backend unavailable: "+claim.BlockedReason)
+	} else if claim.Status == "success" {
+		setCondition(loop, coxv1alpha1.ModelAvailableCondition, metav1.ConditionTrue,
+			"Recovered", "model backend reachable")
+	}
 }

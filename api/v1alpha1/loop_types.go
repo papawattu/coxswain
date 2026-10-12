@@ -824,6 +824,12 @@ const (
 	// PausedCondition is True while the phase is Paused; the message names
 	// the pausedReason (P2f).
 	PausedCondition = "Paused"
+	// ModelAvailableCondition is True while the model backend is reachable
+	// (I89). It is set to False (reason=ModelUnavailable) when the runner
+	// claim carries ModelUnavailable in its blocked reason — the model
+	// backend timed out after bounded retries. It is set back to True when
+	// a subsequent claim succeeds (the model recovered).
+	ModelAvailableCondition = "ModelAvailable"
 )
 
 // +kubebuilder:object:root=true

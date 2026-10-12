@@ -650,7 +650,7 @@ watch_loop() { # <loop> <outfile>
 	done
 }
 collect_evidence() { # <loop> <tag>
-	local loop="$1" tag="$2" d="$EVIDENCE/$tag"
+	local loop="${1:-}" tag="${2:-untagged}" d="$EVIDENCE/$tag"
 	mkdir -p "$d"
 	kc -n "$NS" get loop "$loop" -o json >"$d/loop.json"
 	kc -n "$NS" get events -o json --field-selector "involvedObject.name=$loop" >"$d/events.json" 2>/dev/null || true

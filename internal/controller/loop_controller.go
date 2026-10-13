@@ -1616,100 +1616,14 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// item-F refusal) keeps the sandbox Running so the in-flight delivery
 		// completes.
 		desired.Spec.OperatingMode = r.sandboxOperatingMode(loop, pauseBlocked)
-		// B2 (R-B2 design point (b)): while the workspace restore is in
-		// progress (the Restore condition False, reason StoppingSandbox or
-		// DeletingPVC), the sandbox must STAY suspended — the restore step
-		// stopped it (spec-level suspension is a request; the pod may still be
-		// draining) and a flip back to Running mid-restore would remount the
-		// PVC the restore is about to delete (pvc-protection would hold the
-		// delete until the pod is gone again). The hold clears with the
-		// one-shot marker (True/Restored): from the next reconcile the sandbox
-		// is built as usual on the restored content (the A2 PVC-resume path).
-		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning && r.b2RestoreHoldSuspended(loop) {
+		// The suspension gate cascade (B2, D30, D35a, I42b, D41c, I42c, I42f,
+		// D38) holds the sandbox Suspended fail-closed when a required
+		// dependency is not Ready or a workspace restore is in progress. It
+		// runs every reconcile (level-based, order-independent — it reads the
+		// live objects, the I42c review P2 pattern) and is extracted into
+		// sandboxSuspendedByGate for the gocyclo budget.
+		if r.sandboxSuspendedByGate(ctx, loop) {
 			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-		}
-		// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
-		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
-		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
-		// invalid policy suspends via suspendSandboxIfRunning, and unenforced
-		// also suspends here. I46: the gate reads the OBSERVED result (the
-		// Enforcer's, or EnforcementUnverified when there is no Enforcer), never
-		// the flag; the escape hatch is applied here, so a flag-set but
-		// unenforced (or unverifiable) engine still lets the sandbox run while
-		// the condition records what was observed.
-		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
-			if observed, _ := r.enforcementStatus(ctx, loop); !observed && !r.AllowUnenforced {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// D35a: the proxy pod must be Ready and owned by the Loop.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				loop.Spec.Agent.EndpointSecretRef != "" {
-				proxyPod := &corev1.Pod{}
-				perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
-				proxyReady := perr == nil && metav1.IsControlledBy(proxyPod, loop) && isPodReady(proxyPod)
-				if !proxyReady {
-					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-				}
-			}
-			// I42b: the egress proxy pod must be Ready and owned by the Loop when
-			// the effective policy has network allows. Same gate pattern as D35a.
-			// Fails closed: a transient error reading the AgentPolicies holds the
-			// sandbox Suspended (reconcile requeues), never skips the gate.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				needsEgressProxy(ctx, r, loop) {
-				egressPod := &corev1.Pod{}
-				errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egressPod)
-				egressReady := errE == nil && metav1.IsControlledBy(egressPod, loop) && isPodReady(egressPod)
-				if !egressReady {
-					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-				}
-			}
-			// D41c: the tool proxies must all be Ready and owned by the Loop
-			// when the effective policy has ≥1 tool (the owned+Ready gate,
-			// D35a pattern; order-independent like the I42b/I42c-review
-			// gates — it reads the live objects). Fails closed on a transient
-			// read error (toolProxyGatesSuspended returns true), never skips.
-			if r.toolProxyGatesSuspended(ctx, loop) {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// I42c review P2 (round 3): the NetworkPolicy gate must be
-			// ORDER-INDEPENDENT (ensureSandbox runs before ensureNetworkPolicy,
-			// so the conflict set there would flap the next reconcile back to
-			// Running). Read the live objects: hold Suspended when any of this
-			// Loop's netpol names exists and is NOT controlled by the Loop
-			// (same gate pattern as D35a). Absent netpols are not a conflict
-			// (ensureNetworkPolicy creates them); a real read error FAILS CLOSED
-			// (Suspended), consistent with needsEgressProxy.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				foreignNetPols(ctx, r, loop) {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// I42f review P2 (round 1): the KubeArmorPolicy gate mirrors the
-			// NetworkPolicy gate above (reviewer: "like NetworkPolicyConflict").
-			// Hold Suspended when any of this Loop's KubeArmorPolicy names exists
-			// and is NOT controlled by the Loop. createOrUpdateKapt refuses to
-			// take over a foreign policy (errForeignKapt) and the
-			// KubeArmorPolicyConflict condition is set by applyEffectivePolicyAndConditions
-			// on the sentinel; this gate is the order-independent hold (it runs
-			// before the Enforcer.Apply of the same reconcile, so it must read
-			// the live objects). Same fail-closed semantics: a real read error
-			// holds Suspended.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				foreignKaptPolicies(ctx, r, loop) {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// D38: the CNI self-test gate (network layer, analogous to the D30
-			// eBPF gate above). Unknown (no probe result yet), CNIUnenforced,
-			// and ProbeUnavailable all hold the sandbox Suspended (fail-closed)
-			// unless AllowUnenforcedNetwork is set. The condition is set in
-			// applyEffectivePolicyAndConditions (order-independent, like the
-			// PolicyEnforced condition).
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
-				run, _, _, _ := r.cniNetworkStatus()
-				if !run {
-					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-				}
-			}
 		}
 		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
 		// (KubeArmorPolicy selector) and the D33 agent component label
@@ -1784,6 +1698,104 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		)
 	}
 	return nil
+}
+
+// sandboxSuspendedByGate reports whether any of the sandbox's suspension
+// gates holds (the sandbox must be Suspended, fail-closed): the B2 restore
+// hold (R-B2 design point (b)) runs FIRST — while the workspace restore is
+// in progress (the Restore condition False, reason StoppingSandbox or
+// DeletingPVC) the sandbox must STAY suspended: the restore step stopped it
+// (spec-level suspension is a request; the pod may still be draining) and a
+// flip back to Running mid-restore would remount the PVC the restore is
+// about to delete (pvc-protection would hold the delete until the pod is
+// gone again). The hold clears with the one-shot marker (True/Restored): from
+// the next reconcile the sandbox is built as usual on the restored content
+// (the A2 PVC-resume path). Then the D30/D35a/I42b/D41c/I42c/I42f/D38 gates:
+// the enforcement engine, the model proxy pod, the egress proxy pod, the
+// tool proxies, the NetworkPolicy conflict set, the KubeArmorPolicy conflict
+// set, and the CNI self-test. Every gate reads the LIVE objects (the I42c
+// review P2 pattern: order-independent — the gate runs every reconcile,
+// before the resources it gates are ensured, so it cannot rely on an
+// in-pass conflict set). A real read error FAILS CLOSED (Suspended), never
+// skips the gate. Extracted from ensureSandbox for the gocyclo budget; the
+// semantics are unchanged (each gate's comment is preserved in its original
+// location: ensureSandbox's D30/D35a/I42b/I42c/I42f/D38 gate comments above
+// the CreateOrUpdate, and the D41c/foreignKapt comments below).
+func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if r.b2RestoreHoldSuspended(loop) {
+		return true
+	}
+	// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
+	// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
+	// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
+	// invalid policy suspends via suspendSandboxIfRunning, and unenforced
+	// also suspends here. I46: the gate reads the OBSERVED result (the
+	// Enforcer's, or EnforcementUnverified when there is no Enforcer), never
+	// the flag; the escape hatch is applied here, so a flag-set but
+	// unenforced (or unverifiable) engine still lets the sandbox run while
+	// the condition records what was observed.
+	if observed, _ := r.enforcementStatus(ctx, loop); !observed && !r.AllowUnenforced {
+		return true
+	}
+	// D35a: the proxy pod must be Ready and owned by the Loop.
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		proxyPod := &corev1.Pod{}
+		perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
+		if perr != nil || !metav1.IsControlledBy(proxyPod, loop) || !isPodReady(proxyPod) {
+			return true
+		}
+	}
+	// I42b: the egress proxy pod must be Ready and owned by the Loop when the
+	// effective policy has network allows. Same gate pattern as D35a. Fails
+	// closed: a transient error reading the AgentPolicies holds the sandbox
+	// Suspended (reconcile requeues), never skips the gate.
+	if needsEgressProxy(ctx, r, loop) {
+		egPod := &corev1.Pod{}
+		errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod)
+		if errE != nil || !metav1.IsControlledBy(egPod, loop) || !isPodReady(egPod) {
+			return true
+		}
+	}
+	// D41c: the tool proxies must all be Ready and owned by the Loop when the
+	// effective policy has ≥1 tool (the owned+Ready gate, D35a pattern;
+	// order-independent like the I42b/I42c-review gates — it reads the live
+	// objects). Fails closed on a transient read error
+	// (toolProxyGatesSuspended returns true), never skips.
+	if r.toolProxyGatesSuspended(ctx, loop) {
+		return true
+	}
+	// I42c review P2 (round 3): the NetworkPolicy gate must be
+	// ORDER-INDEPENDENT (ensureSandbox runs before ensureNetworkPolicy, so
+	// the conflict set there would flap the next reconcile back to Running).
+	// Read the live objects: hold Suspended when any of this Loop's netpol
+	// names exists and is NOT controlled by the Loop (same gate pattern as
+	// D35a). Absent netpols are not a conflict (ensureNetworkPolicy creates
+	// them); a real read error FAILS CLOSED (Suspended), consistent with
+	// needsEgressProxy.
+	if foreignNetPols(ctx, r, loop) {
+		return true
+	}
+	// I42f review P2 (round 1): the KubeArmorPolicy gate mirrors the
+	// NetworkPolicy gate above (reviewer: "like NetworkPolicyConflict").
+	// Hold Suspended when any of this Loop's KubeArmorPolicy names exists
+	// and is NOT controlled by the Loop. createOrUpdateKapt refuses to take
+	// over a foreign policy (errForeignKapt) and the KubeArmorPolicyConflict
+	// condition is set by applyEffectivePolicyAndConditions on the sentinel;
+	// this gate is the order-independent hold (it runs before the
+	// Enforcer.Apply of the same reconcile, so it must read the live
+	// objects). Same fail-closed semantics: a real read error holds
+	// Suspended.
+	if foreignKaptPolicies(ctx, r, loop) {
+		return true
+	}
+	// D38: the CNI self-test gate (network layer, analogous to the D30 eBPF
+	// gate above). Unknown (no probe result yet), CNIUnenforced, and
+	// ProbeUnavailable all hold the sandbox Suspended (fail-closed) unless
+	// AllowUnenforcedNetwork is set. The condition is set in
+	// applyEffectivePolicyAndConditions (order-independent, like the
+	// PolicyEnforced condition).
+	run, _, _, _ := r.cniNetworkStatus()
+	return !run
 }
 
 // sandboxDesiredPhaseAnnotation is the annotation the operator stamps on the

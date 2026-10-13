@@ -600,9 +600,9 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 
 		// The level-based sequence (stop -> delete -> create), driven as in
 		// the ready rollback spec.
-		b2Reconcile(r, ns, name) // step 1: stop the sandbox
+		b2Reconcile(r, ns, name)          // step 1: stop the sandbox
 		b2DeleteSandboxPod(ctx, ns, name) // the agent-sandbox controller removes the pod
-		b2Reconcile(r, ns, name) // step 2: delete the PVC
+		b2Reconcile(r, ns, name)          // step 2: delete the PVC
 		b2RemovePVCProtectionFinalizer(ctx, ns, name)
 		l3 := b2Reconcile(r, ns, name) // step 3: create the PVC from the snapshot
 		c3 := b2RestoreCondition(l3)

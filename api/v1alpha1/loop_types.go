@@ -1038,6 +1038,19 @@ const (
 	// to the A2 PVC-resume (the PVC is recreated EMPTY) — a VISIBLE
 	// fallback, not a silent ignore (I90).
 	RestoreReasonNoUsableCheckpoint = "NoUsableCheckpoint"
+	// RestoreReasonStoppingSandbox: the ROLLBACK restore is in progress —
+	// the sandbox was just suspended (a mounted PVC is held by
+	// kubernetes.io/pvc-protection until the pod is gone; the A2 kill path
+	// stops it the same way). NOT terminal: the operator deletes the PVC on
+	// the next reconcile, once the sandbox is stopped, and recreates it from
+	// the snapshot (in-progress state, I49).
+	RestoreReasonStoppingSandbox = "StoppingSandbox"
+	// RestoreReasonDeletingPVC: the ROLLBACK restore is in progress — the
+	// sandbox is stopped and the workspace PVC delete has been issued (the
+	// delete is async; the PVC may still be present with a deletionTimestamp)
+	// and the PVC is recreated from the snapshot once it is gone. NOT
+	// terminal (in-progress state, I49).
+	RestoreReasonDeletingPVC = "DeletingPVC"
 )
 
 // +kubebuilder:object:root=true

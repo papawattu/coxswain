@@ -18,6 +18,15 @@
 // dataSource is immutable — the PVC is deleted and recreated), then the A2
 // PVC-resume path picks the Loop up on the restored content.
 //
+// The PVC replacement is LEVEL-BASED (the reviewer's P1, the R-B2 review at
+// 20ef538): stop the sandbox (a mounted PVC is held by
+// kubernetes.io/pvc-protection), delete the PVC, and create it from the
+// snapshot are each a SEPARATE reconcile step, with the progress recorded in
+// the Restore condition (StoppingSandbox / DeletingPVC / Restored). A spec
+// drives the sequence by removing the PVC's pvc-protection finalizer (the
+// envtest has no pod controller to remove it) between the delete and the
+// create reconcile — the same way a real cluster's pod controller would.
+//
 // The specs (envtest, no snapshot controller — the specs assert the OBJECT
 // the operator creates, not the content it would produce):
 //
@@ -40,26 +49,44 @@
 //     the fallback is VISIBLE).
 //   - ROLLBACK: spec.restoreFrom: iter-N names the checkpoint the operator
 //     restores from. The checkpoint must EXIST and be ReadyToUse. A ready
-//     checkpoint is restored. An ABSENT checkpoint is rejected VISIBLY
-//     (RestoreSourceMissing). A NOT-READY checkpoint is DEFERRED
-//     (RestoreSourceNotReady, I49).
+//     checkpoint is restored through the level-based sequence (the sandbox
+//     is stopped, the PVC is deleted, the PVC is recreated from the
+//     snapshot — one reconcile per step, the in-progress states
+//     StoppingSandbox / DeletingPVC are VISIBLE). An ABSENT checkpoint is
+//     rejected VISIBLY (RestoreSourceMissing). A NOT-READY checkpoint is
+//     DEFERRED (RestoreSourceNotReady, I49). iter-0 is a valid target (the
+//     first verify — the B1 iter-0 lesson), and a completed rollback is
+//     ONE-SHOT: a later reconcile with restoreFrom still set does not
+//     re-restore the PVC (a re-restore would wipe the Loop's work since the
+//     restore).
 //   - FORK: spec.forkOf {loop, iteration} seeds the Loop from another
 //     Loop's checkpoint. At start the operator restores this Loop's OWN
-//     workspace PVC from the source snapshot. Deleting the source Loop does
-//     NOT break a fork that has already restored. A fork with an ABSENT
-//     source checkpoint is rejected VISIBLY (RestoreSourceMissing).
+//     workspace PVC from the source snapshot (the fork's PVC is a separate
+//     object, controller-owned by the fork — NOT the source's PVC). The
+//     fork's restore is a one-shot decision: the fork's restore claims a
+//     fork-retention label on the source's snapshot (the source's GC skips
+//     a labelled snapshot), and removes it once the fork's PVC is present
+//     (the fork's PVC is self-sufficient). Deleting the source Loop does NOT
+//     break a fork that has already restored (the fork's PVC is a separate
+//     object — the source's GC deletes the source's snapshots, not the
+//     fork's PVC). A fork with an ABSENT source checkpoint is rejected
+//     VISIBLY (RestoreSourceMissing).
 //
 // The named mutations (applied in a scratch worktree — see the PR for the
 // commands and the FAIL they produce):
 //
-//   - M1 (restore ignores the checkpoint): change b2ApplyRestoreStep's
-//     ready-branch to NOT recreate the PVC (skip the
-//     restorePVCFromSnapshot call). The restore spec must FAIL.
-//   - M2 (rollback accepts a non-ReadyToUse source): change
+//   - M1 / (a) (restore ignores the checkpoint): change b2ApplyRestoreStep's
+//     ready-branch (the lostPVC case) to NOT recreate the PVC from the
+//     snapshot (call ensureWorkspacePVC instead — the empty-PVC path). The
+//     RESTORE spec must FAIL (the restored PVC has no dataSource).
+//   - M2 / (b) (rollback accepts a non-ReadyToUse source): change
 //     resolveCheckpointSource's notready-branch to return "ready". The
-//     rollback not-ReadyToUse spec must FAIL.
-//   - M3 (fork reuses the source PVC): change restorePVCFromSnapshot's
-//     fork-branch to NOT delete + recreate the PVC. The fork spec must FAIL.
+//     ROLLBACK not-ReadyToUse spec must FAIL (the PVC is replaced instead of
+//     deferred).
+//   - M3 / (c) (fork reuses the source PVC): change
+//     createWorkspacePVCFromSnapshot to create the PVC with the SOURCE's
+//     PVC name (workspacePVCName(loop.Spec.ForkOf.Loop)) instead of the
+//     fork's own. The FORK spec must FAIL (the fork's own PVC is absent).
 
 package controller
 
@@ -104,10 +131,7 @@ func b2Reconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 // b2ReconcileToleratingGone runs one Reconcile and EXPECTS it to succeed (a
 // nil error), but TOLERATES the Loop being gone (a deleted Loop's reconcile
 // is a no-op — the operator's Get returns NotFound and the Reconcile returns
-// nil via client.IgnoreNotFound). It is the test's equivalent of the
-// controller's workqueue processing a deleted Loop's event (the FORK
-// source-deleted spec: the source Loop is deleted and its reconcile must
-// succeed, not error, on the gone Loop).
+// nil via client.IgnoreNotFound).
 func b2ReconcileToleratingGone(r *LoopReconciler, ns, name string) {
 	_, err := r.Reconcile(context.Background(),
 		reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
@@ -117,11 +141,9 @@ func b2ReconcileToleratingGone(r *LoopReconciler, ns, name string) {
 // b2SandboxName returns the Loop's Sandbox name (the operator's naming).
 func b2SandboxName(name string) string { return name + "-sandbox" }
 
-// b2MakeSnapshotReady sets status.readyToUse=true on a checkpoint snapshot
 // (envtest has no snapshot-controller; the spec sets it manually). The
 // VolumeSnapshot CRD has a status subresource, so the spec uses the status
-// subresource update (not the main resource update, which would strip the
-// status).
+// subresource update.
 func b2MakeSnapshotReady(ctx context.Context, ns, name string) {
 	snap, err := b2GetSnapshot(ctx, ns, name)
 	if err != nil {
@@ -133,8 +155,9 @@ func b2MakeSnapshotReady(ctx context.Context, ns, name string) {
 
 // b2EnsureSandbox creates the stand-in Sandbox object for a Loop (the S5a
 // idiom: envtest has no agent-sandbox controller, so the spec creates the
-// object the controller would own — the operator's ensureSandbox then finds
-// it and leaves it, instead of CreateOrUpdate racing the apiserver).
+// object the controller would own). The operatingMode is set so the B2
+// restore's level-based stop can read it (Running = a pod that would hold
+// the PVC mounted; Suspended = a pod already gone).
 func b2EnsureSandbox(ns, name string) {
 	ctx := context.Background()
 	sb := &sandboxv1beta1.Sandbox{}
@@ -142,6 +165,7 @@ func b2EnsureSandbox(ns, name string) {
 		Expect(k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
 			ObjectMeta: metav1.ObjectMeta{Name: b2SandboxName(name), Namespace: ns},
 			Spec: sandboxv1beta1.SandboxSpec{
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
 				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 					PodTemplate: sandboxv1beta1.PodTemplate{
 						Spec: corev1.PodSpec{
@@ -156,18 +180,32 @@ func b2EnsureSandbox(ns, name string) {
 	}
 }
 
+// b2RemovePVCProtectionFinalizer removes the workspace PVC's
+// kubernetes.io/pvc-protection finalizer (the envtest has no pod controller
+// to remove it — on a real cluster the pod controller removes the finalizer
+// when no pod uses the PVC, so the PVC delete completes). Without this, the
+// operator's PVC delete (the level-based restore's delete step) is async
+// and NEVER completes in envtest: the apiserver sets the deletionTimestamp
+// but does not remove the object until the finalizer is gone, and the
+// create step (which runs only once the PVC is gone) would never run.
+func b2RemovePVCProtectionFinalizer(ctx context.Context, ns, loopName string) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: workspacePVCName(loopName), Namespace: ns}, pvc)).To(Succeed())
+	fins := []string{}
+	for _, f := range pvc.Finalizers {
+		if f != "kubernetes.io/pvc-protection" {
+			fins = append(fins, f)
+		}
+	}
+	pvc.Finalizers = fins
+	Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+}
+
 // b2NewReconciler builds a fresh reconciler for a Loop.
 func b2NewReconciler() *LoopReconciler {
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return b1Driver, true }
 	r.snapshotCRDPresent = func(context.Context) bool { return true }
-	// The B2 restore's PVC-delete wait (restorePVCFromSnapshot) is a no-op in
-	// the envtest (the envtest has no csi driver, so the PVC's built-in
-	// kubernetes.io/pvc-protection finalizer is never removed by the apiserver
-	// and the delete never completes in envtest — the restore's create races
-	// the delete, and the spec's PVC read is the restored one). Production
-	// uses the live bounded wait (the 10s poll in restorePVCFromSnapshot).
-	r.pvcDeleteWaitSeam = func(context.Context, *coxv1alpha1.Loop) error { return nil }
 	return r
 }
 
@@ -205,12 +243,18 @@ func b2RestoreCondition(loop *coxv1alpha1.Loop) *metav1.Condition {
 	return nil
 }
 
-// b2DrainEvents drains the FakeRecorder's event buffer.
-func b2DrainEvents(rec *record.FakeRecorder) {
+// b2ExpectEvent asserts that a Restore Event with the named reason was
+// emitted (the transient signal; the condition is the durable record).
+func b2ExpectEvent(rec *record.FakeRecorder, reason string) {
+	found := false
 	for {
 		select {
-		case <-rec.Events:
+		case e := <-rec.Events:
+			if strings.Contains(e, "reason="+reason) {
+				found = true
+			}
 		default:
+			Expect(found).To(BeTrue(), "expected a Restore Event with reason "+reason)
 			return
 		}
 	}
@@ -244,11 +288,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}()
 
 		name := "restore-loop"
-		loop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		})).To(Succeed())
 
 		r, rec := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, name)
@@ -264,7 +307,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		b2MakeSnapshotReady(ctx, ns, snapName)
 
 		// LOSE the PVC (delete it — the lost-PVC case). The PVC has a
-		// finalizer (the B1 PVC-resume path adds one); remove it so the
+		// finalizer (the A2 PVC-resume path adds one); remove it so the
 		// apiserver actually deletes the PVC (the finalizer is not run in
 		// envtest — there is no controller to remove it).
 		pvc, err := b2GetPVC(ctx, ns, name)
@@ -277,10 +320,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// Reconcile: the operator detects the LOST PVC + the ready checkpoint
 		// and restores (the PVC is recreated with the checkpoint's
 		// VolumeSnapshot as the dataSource). The restore decision is
-		// persisted at the point of decision (I90): even though this
-		// reconcile's sandbox build later fails in envtest (no kubelet
-		// provisioner), the condition and the PVC are persisted by the
-		// restore step itself.
+		// persisted at the point of decision (I90).
 		b2Reconcile(r, ns, name)
 
 		By("recreating the workspace PVC with spec.dataSource=the checkpoint's VolumeSnapshot")
@@ -299,21 +339,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 
 		By("emitting a WorkspaceRestored Event")
-		found := false
-		for {
-			select {
-			case e := <-rec.Events:
-				if strings.Contains(e, "Restore=true") && strings.Contains(e, "Restored") {
-					found = true
-				}
-			default:
-				Expect(found).To(BeTrue(), "expected a WorkspaceRestored Event (the B2 transient signal)")
-				return
-			}
-		}
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonRestored)
 	})
 
-	It("RESTORE (reactive, not-ready): a LOST workspace PVC whose latest checkpoint is NOT ReadyToUse is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; the PVC is NOT recreated — the in-progress state, no decision, I49)", func() {
+	It("RESTORE (reactive, not-ready): a LOST workspace PVC whose latest checkpoint is NOT ReadyToUse is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; the PVC is NOT recreated from the checkpoint — the in-progress state, no decision, I49)", func() {
 		ns := "b2-restore-notready-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -321,11 +350,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}()
 
 		name := "restore-notready"
-		loop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		})).To(Succeed())
 
 		r, rec := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, name)
@@ -347,11 +375,6 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// decision, I49).
 		b2Reconcile(r, ns, name)
 
-		By("recreating the PVC EMPTY (the bootstrap runs after the B2 defer; the PVC is present but has NO dataSource — the A2 behavior, not a restore from the checkpoint)")
-		deferredPVC, err := b2GetPVC(ctx, ns, name)
-		Expect(err).NotTo(HaveOccurred(), "the PVC is present (the bootstrap created it after the B2 defer)")
-		Expect(deferredPVC.Spec.DataSource).To(BeNil(), "the deferred PVC has NO dataSource (the bootstrap created it empty — the A2 behavior, not a restore from the checkpoint)")
-
 		By("setting the Restore condition False reason RestoreSourceNotReady (the in-progress state is VISIBLE, I49)")
 		deferredLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, deferredLoop)).To(Succeed())
@@ -360,19 +383,12 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonSourceNotReady))
 
+		By("NOT recreating the PVC from the checkpoint (the in-progress state — no decision, I49)")
+		_, err = b2GetPVC(ctx, ns, name)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the deferred PVC is NOT recreated (the bootstrap's ensureWorkspacePVC would create it empty on the next pass — the restore itself creates NOTHING until the snapshot is ReadyToUse)")
+
 		By("emitting a RestoreSourceNotReady Event")
-		found := false
-		for {
-			select {
-			case e := <-rec.Events:
-				if strings.Contains(e, coxv1alpha1.RestoreReasonSourceNotReady) {
-					found = true
-				}
-			default:
-				Expect(found).To(BeTrue(), "expected a RestoreSourceNotReady Event (the in-progress state is VISIBLE)")
-				return
-			}
-		}
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonSourceNotReady)
 	})
 
 	It("RESTORE (A2 fallback): a LOST workspace PVC with NO usable checkpoint (the latest checkpoint's VolumeSnapshot is ABSENT) falls back to the A2 PVC-resume (the PVC is recreated EMPTY; the Restore condition is False reason NoUsableCheckpoint; a WorkspaceRestoreUnavailable Event is emitted — I90: the fallback is VISIBLE)", func() {
@@ -383,11 +399,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}()
 
 		name := "fallback-loop"
-		loop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		})).To(Succeed())
 
 		r, rec := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, name)
@@ -429,23 +444,11 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
 
-		By("emitting a WorkspaceRestoreUnavailable Event")
-		found := false
-		for {
-			select {
-			case e := <-rec.Events:
-				if strings.Contains(e, coxv1alpha1.RestoreReasonNoUsableCheckpoint) {
-					found = true
-					Expect(e).To(ContainSubstring("Restore=false"))
-				}
-			default:
-				Expect(found).To(BeTrue(), "expected a NoUsableCheckpoint Event (the I90 fallback is VISIBLE)")
-				return
-			}
-		}
+		By("emitting a NoUsableCheckpoint Event")
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonNoUsableCheckpoint)
 	})
 
-	It("ROLLBACK: a ready checkpoint (spec.restoreFrom: iter-N) is restored (the PVC is recreated with spec.dataSource=the checkpoint's VolumeSnapshot; the Restore condition is True reason Restored)", func() {
+	It("ROLLBACK (ready, level-based): a ready checkpoint (spec.restoreFrom: iter-N) is restored through the level-based sequence — the sandbox is STOPPED first (StoppingSandbox), then the PVC is DELETED (DeletingPVC), then the PVC is RECREATED from the snapshot (Restored) — one reconcile per step, the in-progress states are VISIBLE", func() {
 		ns := "b2-rollback-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -453,78 +456,130 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}()
 
 		name := "rollback-loop"
-		loop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		})).To(Succeed())
 
 		r, rec := b2NewReconcilerWithRecorder()
+		// The sandbox is RUNNING (the rollback case: a mounted PVC is held by
+		// pvc-protection — the restore must stop the sandbox first, like the
+		// A2 kill path).
 		b2EnsureSandbox(ns, name)
 		b1DriveToSucceeded(ctx, r, ns, name)
 		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
 		b2MakeSnapshotReady(ctx, ns, snapName)
 
-		// Remove the workspace PVC's built-in kubernetes.io/pvc-protection
-		// finalizer (the envtest has no pod controller to remove it). Without
-		// this, the operator's PVC delete (restorePVCFromSnapshot) is async
-		// (the apiserver sets deletionTimestamp but does not remove the object
-		// until the finalizer is gone), and the restore's Create races the
-		// delete and hits AlreadyExists (the name is still taken by the
-		// deleting PVC). A real cluster's pod controller removes the
-		// finalizer when no pods use the PVC, so the delete completes before
-		// the Create; the envtest's spec removes it manually so the operator's
-		// delete+create sequence is the same.
-		pvc, err := b2GetPVC(ctx, ns, name)
-		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
-		pvc.Finalizers = []string{}
-		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
-
 		// Set spec.restoreFrom: iter-0 (the rollback target — the B1
-		// checkpoint's iter). The field is mutable (the user can change it
-		// to roll back to different iters).
+		// checkpoint's iter).
 		rbLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, rbLoop)).To(Succeed())
 		rbLoop.Spec.RestoreFrom = "iter-0"
 		Expect(k8sClient.Update(ctx, rbLoop)).To(Succeed())
 
-		// Reconcile: the operator detects the rollback target + the ready
-		// checkpoint and restores (the PVC is recreated with the checkpoint's
-		// VolumeSnapshot as the dataSource). The decision is persisted at the
-		// point of decision (I90).
-		b2Reconcile(r, ns, name)
+		By("step 1: the restore stops the sandbox (the PVC is still PRESENT — pvc-protection holds it while the sandbox is running; the Restore condition is False reason StoppingSandbox)")
+		l1 := b2Reconcile(r, ns, name)
+		sb1 := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, sb1)).To(Succeed())
+		Expect(sb1.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended), "the operator must stop the sandbox before deleting its PVC (pvc-protection holds a mounted PVC)")
+		c1 := b2RestoreCondition(l1)
+		Expect(c1).NotTo(BeNil(), "the in-progress state must be VISIBLE (the Restore condition is the durable record)")
+		Expect(c1.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c1.Reason).To(Equal(coxv1alpha1.RestoreReasonStoppingSandbox))
+		pvc1, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the PVC is NOT deleted while the sandbox is stopped-but-still-present (the delete is the NEXT step — the level-based sequence)")
+		_ = pvc1
 
-		By("recreating the workspace PVC with spec.dataSource=the checkpoint's VolumeSnapshot (the rollback target)")
+		By("step 2: the PVC is DELETED (the Restore condition is False reason DeletingPVC; the PVC's delete is async — the spec removes the pvc-protection finalizer so the delete completes, as a real cluster's pod controller would)")
+		l2 := b2Reconcile(r, ns, name)
+		c2 := b2RestoreCondition(l2)
+		Expect(c2).NotTo(BeNil())
+		Expect(c2.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c2.Reason).To(Equal(coxv1alpha1.RestoreReasonDeletingPVC), "the in-progress state (the delete) must be VISIBLE")
+		// The operator's delete is async: the PVC has a deletionTimestamp and
+		// the pvc-protection finalizer (the envtest has no pod controller to
+		// remove it). The PVC is still present (with the deletionTimestamp) —
+		// the create step runs only once the PVC is actually gone.
+		pvcPending, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the PVC is still present after the delete was issued (it is deleting, not yet gone)")
+		Expect(!pvcPending.DeletionTimestamp.IsZero()).To(BeTrue(), "the operator's delete must have been issued (the PVC has a deletionTimestamp)")
+		// The envtest's delete never completes without the finalizer removed
+		// (no pod controller): the spec removes it so the create step can run
+		// (the real cluster's pod controller does the same when the sandbox
+		// is stopped).
+		b2RemovePVCProtectionFinalizer(ctx, ns, name)
+
+		By("step 3: the PVC is RECREATED from the snapshot (the Restore condition is True reason Restored — the one-shot marker)")
+		l3 := b2Reconcile(r, ns, name)
 		restored, err := b2GetPVC(ctx, ns, name)
-		Expect(err).NotTo(HaveOccurred(), "the operator must restore the PVC from the rollback target")
+		Expect(err).NotTo(HaveOccurred(), "the operator must recreate the PVC from the snapshot (the rollback target)")
 		Expect(restored.Spec.DataSource).NotTo(BeNil(), "the restored PVC must carry a dataSource (the rollback target's VolumeSnapshot)")
 		Expect(restored.Spec.DataSource.Kind).To(Equal(volumeSnapshotKind))
 		Expect(restored.Spec.DataSource.Name).To(Equal(snapName))
+		c3 := b2RestoreCondition(l3)
+		Expect(c3).NotTo(BeNil())
+		Expect(c3.Status).To(Equal(metav1.ConditionTrue))
+		Expect(c3.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 
-		By("setting the Restore condition True reason Restored (persisted at the point of decision — I90)")
-		restoredLoop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, restoredLoop)).To(Succeed())
-		cond := b2RestoreCondition(restoredLoop)
-		Expect(cond).NotTo(BeNil())
-		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
-
-		By("emitting a WorkspaceRestored Event")
-		found := false
-		for {
-			select {
-			case e := <-rec.Events:
-				if strings.Contains(e, "Restore=true") && strings.Contains(e, "Restored") {
-					found = true
-				}
-			default:
-				Expect(found).To(BeTrue(), "expected a WorkspaceRestored Event")
-				return
-			}
-		}
+		By("emitting the in-progress + restored Events")
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonStoppingSandbox)
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonDeletingPVC)
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonRestored)
 	})
 
-	It("ROLLBACK (absent): an ABSENT checkpoint (the VolumeSnapshot is missing) is rejected VISIBLY (the Restore condition is False reason RestoreSourceMissing; a WorkspaceRestoreUnavailable Event; no PVC is created — the target is gone, terminal)", func() {
+	It("ROLLBACK (one-shot): after a completed rollback with restoreFrom still set, the PVC is NOT re-restored on a later reconcile (a re-restore would wipe the Loop's work since the restore)", func() {
+		ns := "b2-rollback-once-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "rollback-once"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		rbLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, rbLoop)).To(Succeed())
+		rbLoop.Spec.RestoreFrom = "iter-0"
+		Expect(k8sClient.Update(ctx, rbLoop)).To(Succeed())
+
+		// The level-based sequence (stop -> delete -> create), driven as in
+		// the ready rollback spec.
+		b2Reconcile(r, ns, name) // step 1: stop the sandbox
+		b2Reconcile(r, ns, name) // step 2: delete the PVC
+		b2RemovePVCProtectionFinalizer(ctx, ns, name)
+		l3 := b2Reconcile(r, ns, name) // step 3: create the PVC from the snapshot
+		c3 := b2RestoreCondition(l3)
+		Expect(c3).NotTo(BeNil())
+		Expect(c3.Status).To(Equal(metav1.ConditionTrue), "the rollback must complete (True/Restored)")
+		Expect(c3.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
+		restored, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(restored.Spec.DataSource).NotTo(BeNil())
+		restoredUID := restored.UID
+
+		// A LATER reconcile with restoreFrom still set (the Loop kept working
+		// after the rollback — its PVC now holds the restored content plus
+		// whatever it has done since): the PVC is NOT re-restored.
+		l4 := b2Reconcile(r, ns, name)
+		after, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the PVC must still be present (a re-restore would delete it)")
+		Expect(after.UID).To(Equal(restoredUID), "the PVC must be the SAME object (a re-restore would recreate it with a new UID)")
+		Expect(after.Spec.DataSource.Name).To(Equal(snapName), "the dataSource is unchanged (the one-shot marker — the condition is True/Restored for this spec generation)")
+		c4 := b2RestoreCondition(l4)
+		Expect(c4.Status).To(Equal(metav1.ConditionTrue), "the one-shot marker stays (the restore is not re-run)")
+		Expect(c4.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
+	})
+
+	It("ROLLBACK (absent): an ABSENT checkpoint (the VolumeSnapshot is missing) is rejected VISIBLY (the Restore condition is False reason RestoreSourceMissing; a WorkspaceRestoreUnavailable Event; no PVC is deleted — the target is gone, terminal)", func() {
 		ns := "b2-rollback-absent-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -532,11 +587,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}()
 
 		name := "rollback-absent"
-		loop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		})).To(Succeed())
 
 		r, rec := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, name)
@@ -559,7 +613,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// RestoreSourceMissing; the PVC is left as-is — the target is gone).
 		b2Reconcile(r, ns, name)
 
-		By("NOT recreating the PVC (the target is gone — no restore)")
+		By("NOT deleting the PVC (the target is gone — no restore)")
 		_, err = b2GetPVC(ctx, ns, name)
 		Expect(err).NotTo(HaveOccurred(), "the bootstrap-created PVC is present (the reject path does NOT delete it)")
 
@@ -572,22 +626,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonSourceMissing))
 
 		By("emitting a RestoreSourceMissing Event")
-		found := false
-		for {
-			select {
-			case e := <-rec.Events:
-				if strings.Contains(e, coxv1alpha1.RestoreReasonSourceMissing) {
-					found = true
-					Expect(e).To(ContainSubstring("Restore=false"))
-				}
-			default:
-				Expect(found).To(BeTrue(), "expected a RestoreSourceMissing Event (the reject is VISIBLE)")
-				return
-			}
-		}
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonSourceMissing)
 	})
 
-	It("ROLLBACK (not-ReadyToUse): a NOT-READY checkpoint (status.readyToUse != true) is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; a WorkspaceRestoreUnavailable Event; no PVC is created — the in-progress state, no decision, I49)", func() {
+	It("ROLLBACK (not-ReadyToUse): a NOT-READY checkpoint (status.readyToUse != true) is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; a WorkspaceRestoreUnavailable Event; no PVC is touched — the in-progress state, no decision, I49)", func() {
 		ns := "b2-rollback-notready-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -595,11 +637,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}()
 
 		name := "rollback-notready"
-		loop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		})).To(Succeed())
 
 		r, rec := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, name)
@@ -619,9 +660,11 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// state, no decision, I49).
 		b2Reconcile(r, ns, name)
 
-		By("NOT recreating the PVC (the checkpoint is not ReadyToUse yet — no decision, I49)")
-		_, err := b2GetPVC(ctx, ns, name)
+		By("NOT touching the PVC (the checkpoint is not ReadyToUse yet — no decision, I49)")
+		pvc, err := b2GetPVC(ctx, ns, name)
 		Expect(err).NotTo(HaveOccurred(), "the bootstrap-created PVC is present (the defer path does NOT delete it)")
+		Expect(pvc.DeletionTimestamp.IsZero()).To(BeTrue(), "the defer path does NOT delete the PVC (the in-progress state is before the stop/delete steps)")
+		Expect(pvc.Spec.DataSource).To(BeNil(), "the defer path does NOT change the PVC (no decision yet)")
 
 		By("setting the Restore condition False reason RestoreSourceNotReady (the in-progress state is VISIBLE, I49)")
 		deferredLoop := &coxv1alpha1.Loop{}
@@ -632,22 +675,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonSourceNotReady))
 
 		By("emitting a RestoreSourceNotReady Event")
-		found := false
-		for {
-			select {
-			case e := <-rec.Events:
-				if strings.Contains(e, coxv1alpha1.RestoreReasonSourceNotReady) {
-					found = true
-					Expect(e).To(ContainSubstring("Restore=false"))
-				}
-			default:
-				Expect(found).To(BeTrue(), "expected a RestoreSourceNotReady Event (the in-progress state is VISIBLE)")
-				return
-			}
-		}
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonSourceNotReady)
 	})
 
-	It("FORK: a ready source checkpoint (spec.forkOf {loop, iteration}) seeds the fork's OWN workspace PVC (the PVC is recreated with spec.dataSource=the source's checkpoint VolumeSnapshot; the fork's PVC carries the FORK's loop label; the Restore condition is True reason Restored)", func() {
+	It("FORK: a ready source checkpoint (spec.forkOf {loop, iteration}) seeds the fork's OWN workspace PVC (the fork's PVC is a SEPARATE object, controller-owned by the fork, with spec.dataSource=the source's checkpoint VolumeSnapshot; the source's snapshot carries the fork-retention label while the fork's PVC is being materialised; the Restore condition is True reason Restored)", func() {
 		ns := "b2-fork-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -656,17 +687,16 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 
 		// The SOURCE Loop (the Loop whose checkpoint the fork seeds from).
 		srcName := "fork-source"
-		srcLoop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: srcName, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, srcLoop)).To(Succeed())
+		})).To(Succeed())
 
 		r, rec := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, srcName)
 		// Drive the source to a successful verify: the B1 checkpoint is
-		// taken (a recorded status.checkpoints entry + a ReadyToUse
-		// VolumeSnapshot named checkpoint-<source>-iter-0).
+		// taken (a recorded status.checkpoints entry + a VolumeSnapshot named
+		// checkpoint-<source>-iter-0).
 		b1DriveToSucceeded(ctx, r, ns, srcName)
 		srcPVC, err := b2GetPVC(ctx, ns, srcName)
 		Expect(err).NotTo(HaveOccurred(), "the source's workspace PVC must exist after the bootstrap")
@@ -676,7 +706,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// The FORK Loop (spec.forkOf {loop: source, iteration: 0} — the B1
 		// checkpoint's iter).
 		forkName := "fork-target"
-		forkLoop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: forkName, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      loopGoal,
@@ -684,13 +714,14 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
 				ForkOf:    &coxv1alpha1.ForkOf{Loop: srcName, Iteration: 0},
 			},
-		}
-		Expect(k8sClient.Create(ctx, forkLoop)).To(Succeed())
+		})).To(Succeed())
 
 		// Reconcile the FORK: the operator detects the fork target + the
 		// ready source checkpoint and restores the FORK's OWN workspace PVC
-		// from the source's snapshot. The decision is persisted at the point
-		// of decision (I90).
+		// from the source's snapshot (a fresh Loop — the PVC is absent and
+		// the sandbox does not exist, so the level-based sequence goes
+		// straight to the create). The decision is persisted at the point of
+		// decision (I90).
 		b2EnsureSandbox(ns, forkName)
 		b2Reconcile(r, ns, forkName)
 
@@ -702,6 +733,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(forkPVC.Spec.DataSource.Kind).To(Equal(volumeSnapshotKind))
 		Expect(forkPVC.Spec.DataSource.Name).To(Equal(srcSnapName))
 		Expect(forkPVC.Spec.DataSource).NotTo(Equal(srcPVC.Spec.DataSource), "the fork's PVC is NOT the source's PVC (it is a separate object with its own dataSource)")
+		Expect(forkPVC.UID).NotTo(Equal(srcPVC.UID), "the fork's PVC is a SEPARATE object (a different UID — not the source's PVC)")
 
 		By("setting the Restore condition True reason Restored on the FORK (persisted at the point of decision — I90)")
 		forkRestored := &coxv1alpha1.Loop{}
@@ -711,19 +743,65 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 
+		By("claiming the fork-retention label on the source's snapshot (the source's GC skips a labelled snapshot — the safety net against a source delete racing the fork's restore)")
+		srcSnap, err := b2GetSnapshot(ctx, ns, srcSnapName)
+		Expect(err).NotTo(HaveOccurred(), "the source's snapshot is still present (the fork's PVC is materialising from it)")
+		Expect(srcSnap.GetLabels()[forkSnapshotLabelKey]).To(Equal(forkName), "the fork-retention label is set to the fork's name (the source's GC skips it while present)")
+
 		By("emitting a WorkspaceRestored Event on the FORK")
-		found := false
-		for {
-			select {
-			case e := <-rec.Events:
-				if strings.Contains(e, "Restore=true") && strings.Contains(e, "Restored") {
-					found = true
-				}
-			default:
-				Expect(found).To(BeTrue(), "expected a WorkspaceRestored Event on the FORK")
-				return
-			}
-		}
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonRestored)
+	})
+
+	It("FORK (one-shot + label release): the fork's restore is one-shot (a later reconcile does NOT re-restore), and the fork-retention label is REMOVED once the fork's PVC is present (the source's GC is free to delete the snapshot — the fork's PVC is self-sufficient)", func() {
+		ns := "b2-fork-once-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		srcName := "fork-once-source"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: srcName, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, srcName)
+		b1DriveToSucceeded(ctx, r, ns, srcName)
+		srcSnapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: srcName, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, srcSnapName)
+
+		forkName := "fork-once-target"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: forkName, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: testWorkspace(),
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+				ForkOf:    &coxv1alpha1.ForkOf{Loop: srcName, Iteration: 0},
+			},
+		})).To(Succeed())
+		b2EnsureSandbox(ns, forkName)
+		b2Reconcile(r, ns, forkName) // the fork's restore (one-shot)
+
+		// A LATER reconcile: the fork's PVC is present and the Restore marker
+		// is True/Restored — the restore is one-shot (no re-restore) and the
+		// fork-retention label is removed (the fork's PVC is self-sufficient;
+		// the source's GC is free to delete the snapshot).
+		forkPVC, err := b2GetPVC(ctx, ns, forkName)
+		Expect(err).NotTo(HaveOccurred(), "the fork's PVC must be present after its restore")
+		restoredUID := forkPVC.UID
+		b2Reconcile(r, ns, forkName)
+
+		By("keeping the fork's PVC the SAME object (the one-shot marker — no re-restore)")
+		forkAfter, err := b2GetPVC(ctx, ns, forkName)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(forkAfter.UID).To(Equal(restoredUID), "the fork's PVC must not be recreated (the restore is one-shot)")
+
+		By("removing the fork-retention label from the source's snapshot (the source's GC is free to delete it)")
+		srcSnap, err := b2GetSnapshot(ctx, ns, srcSnapName)
+		Expect(err).NotTo(HaveOccurred(), "the source's snapshot is still present (the source is not being deleted — the label is simply released)")
+		Expect(srcSnap.GetLabels()[forkSnapshotLabelKey]).To(BeEmpty(), "the fork-retention label must be removed once the fork's PVC is present (the fork's PVC is self-sufficient)")
 	})
 
 	It("FORK (source deleted): deleting the source Loop AFTER the fork's restore does NOT break the fork (the fork's PVC is present; the fork's Restore condition stays True; the fork carries on — the source's GC deletes the source's snapshots, but the fork's PVC is a separate object and is NOT touched)", func() {
@@ -740,16 +818,15 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 			Spec:       b2LoopSpec(),
 		}
 		Expect(k8sClient.Create(ctx, srcLoop)).To(Succeed())
-		r, rec := b2NewReconcilerWithRecorder()
+		r, _ := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, srcName)
 		b1DriveToSucceeded(ctx, r, ns, srcName)
 		srcSnapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: srcName, Namespace: ns}}, 0)
 		b2MakeSnapshotReady(ctx, ns, srcSnapName)
 
-		// The FORK Loop (spec.forkOf {loop: source, iteration: 0} — the B1
-		// checkpoint's iter).
+		// The FORK Loop + its restore (one-shot).
 		forkName := "fork-del-target"
-		forkLoop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: forkName, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      loopGoal,
@@ -757,13 +834,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
 				ForkOf:    &coxv1alpha1.ForkOf{Loop: srcName, Iteration: 0},
 			},
-		}
-		Expect(k8sClient.Create(ctx, forkLoop)).To(Succeed())
-		// The fork's restore: the fork's own reconcile runs the B2 restore
-		// step BEFORE the bootstrap (the PVC is created + restored from the
-		// source's snapshot in the same pass). The restore is a one-shot
-		// decision — the condition is persisted at the point of decision
-		// (I90), before the fork's own bootstrap runs.
+		})).To(Succeed())
 		b2EnsureSandbox(ns, forkName)
 		b2Reconcile(r, ns, forkName)
 		forkRestored := &coxv1alpha1.Loop{}
@@ -775,16 +846,9 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// DELETE the source Loop (the source's finalizer runs: the source's
 		// checkpoint GC deletes the source's snapshots).
 		Expect(k8sClient.Delete(ctx, srcLoop)).To(Succeed())
-		// Reconcile the source (the finalizer's work runs). The source Loop is
-		// being deleted (it has a deletionTimestamp and the finalizer), so the
-		// reconcile runs the B2 restore step (a no-op — the source's PVC is
-		// present and it has no restoreFrom/forkOf) and then the CleaningUp
-		// work (the B1 finalizer's snapshot GC). The reconcile must succeed
-		// (a nil error) — it must NOT error on the gone Loop (the operator's
-		// Get returns NotFound for the Loop's children, and the Reconcile
-		// returns nil via client.IgnoreNotFound for the gone Loop itself —
-		// the FORK spec's failure in the 89937b9 CI run: b2Reconcile expected
-		// the source Loop to be present, but it was deleted).
+		// Reconcile the source (the finalizer's work runs; the B2 restore step
+		// is a no-op for the source — its PVC is present and it has no
+		// restoreFrom/forkOf — and the CleaningUp work GCs its snapshots).
 		b2ReconcileToleratingGone(r, ns, srcName)
 
 		// DELETE the source's snapshot (simulating the source's GC — the
@@ -816,11 +880,9 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(condAfter).NotTo(BeNil())
 		Expect(condAfter.Status).To(Equal(metav1.ConditionTrue), "the fork's Restore condition stays True (the one-shot marker; the fork carries on)")
 		Expect(condAfter.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
-
-		_ = rec // the Event is not asserted here (the restore was asserted in the prior spec)
 	})
 
-	It("FORK (absent source): a fork with an ABSENT source checkpoint (the source's VolumeSnapshot is missing) is rejected VISIBLY (the Restore condition is False reason RestoreSourceMissing)", func() {
+	It("FORK (absent source): a fork with an ABSENT source checkpoint (the source's VolumeSnapshot is missing) is rejected VISIBLY (the Restore condition is False reason RestoreSourceMissing; the fork's PVC is NOT created from a snapshot — the target is gone, terminal)", func() {
 		ns := "b2-fork-absent-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -831,11 +893,10 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// checkpoint was never taken, so there is NO VolumeSnapshot for any
 		// iter).
 		srcName := "fork-absent-source"
-		srcLoop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: srcName, Namespace: ns},
 			Spec:       b2LoopSpec(),
-		}
-		Expect(k8sClient.Create(ctx, srcLoop)).To(Succeed())
+		})).To(Succeed())
 		r, _ := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, srcName)
 		b2Reconcile(r, ns, srcName)
@@ -844,7 +905,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// iter the source's B1 checkpoint would be at; the snapshot is
 		// ABSENT because the source never reached a successful verify).
 		forkName := "fork-absent-target"
-		forkLoop := &coxv1alpha1.Loop{
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: forkName, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      loopGoal,
@@ -852,8 +913,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
 				ForkOf:    &coxv1alpha1.ForkOf{Loop: srcName, Iteration: 0},
 			},
-		}
-		Expect(k8sClient.Create(ctx, forkLoop)).To(Succeed())
+		})).To(Succeed())
 
 		// Reconcile the FORK: the operator detects the fork target + the
 		// ABSENT source checkpoint and REJECTS (the condition is False
@@ -863,9 +923,9 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		b2EnsureSandbox(ns, forkName)
 		b2Reconcile(r, ns, forkName)
 
-		By("NOT deleting + recreating the fork's PVC (the source's checkpoint is gone — no restore)")
+		By("NOT creating the fork's PVC from a snapshot (the source's checkpoint is gone — no restore)")
 		_, err := b2GetPVC(ctx, ns, forkName)
-		Expect(err).NotTo(HaveOccurred(), "the fork's PVC is present (the bootstrap created it; the reject path does NOT delete it)")
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the reject path does NOT create the fork's PVC from a snapshot (the target is gone; the bootstrap creates the PVC empty on the next pass if the fork is kept)")
 
 		By("setting the Restore condition False reason RestoreSourceMissing on the FORK (persisted at the point of decision — I90)")
 		forkRejected := &coxv1alpha1.Loop{}

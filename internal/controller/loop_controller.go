@@ -234,21 +234,6 @@ type LoopReconciler struct {
 	// envtest has the CRD).
 	snapshotCRDPresent func(ctx context.Context) bool
 
-	// pvcDeleteWaitSeam is the B2 restore seam: it replaces the bounded
-	// poll of restorePVCFromSnapshot's PVC-delete wait. When set (a test
-	// bypasses the wait — the envtest has no csi driver, so the PVC's
-	// built-in kubernetes.io/pvc-protection finalizer is never removed by
-	// the apiserver and the delete never completes in envtest), the operator
-	// uses it instead of the live wait. The test sets it to a no-op (the
-	// PVC is "gone" for the test's purposes — the restore's create then
-	// races the delete in envtest, and the spec's PVC read is the restored
-	// one). nil (production, most tests) uses the live wait (the bounded
-	// poll in restorePVCFromSnapshot). The seam is the operator's own read
-	// (no new RBAC — the operator already reads the PVC); the bound (10s)
-	// outlasts a normal csi release and surfaces a wedged delete (a
-	// requeue, not an infinite hang).
-	pvcDeleteWaitSeam func(ctx context.Context, loop *coxv1alpha1.Loop) error
-
 	// lastDeliverDescriptionEnsureErr is the last non-nil error returned by
 	// ensureDeliverDescriptionConfig on this reconciler (the R27/P1 race fix
 	// holds the deliver Job until the description ConfigMap exists; the
@@ -568,6 +553,41 @@ func (r *LoopReconciler) applyBudgetStep(ctx context.Context, loop *coxv1alpha1.
 	return budgetRequeue, budgetChanged
 }
 
+// reconcileVerifySteps is the S4 claim read + the S5a verify Job + the S5a
+// verify outcome + the checkpoint step (B1) — extracted from Reconcile so the
+// top-level reconcile stays within the gocyclo budget. It returns
+// (changed, requeue, claimReadPending, advancedFrom): changed is whether the
+// Loop's status was mutated (the S4 claim read or the verify outcome);
+// requeue is whether a requeue is needed (the stale-Job guard's D27
+// verifyStaleDeleted, the verify outcome's in-progress requeue, or the
+// checkpoint step's requeue); claimReadPending is the S4 claim-read requeue
+// (the runner's claim is not yet readable); advancedFrom is the S4 phase
+// advance (for the PhaseAdvanced Event, the I83 write). The verify Job's
+// ensure error (other than the stale-Job guard's verifyStaleDeleted) is
+// returned as an error (a controller error, the next reconcile retries).
+func (r *LoopReconciler) reconcileVerifySteps(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, bool, coxv1alpha1.LoopPhase, error) {
+	claimReadPending, s4Changed, advancedFrom := r.advancePhaseFromClaim(ctx, loop)
+	changed := s4Changed
+	verifyRequeue := false
+	if err := r.ensureVerifyJobAndNetPolicies(ctx, loop); err != nil {
+		if !errors.Is(err, errVerifyStaleDeleted) {
+			return false, false, false, "", err // a controller error (the caller propagates it)
+		}
+		verifyRequeue = true
+	}
+	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, loop)
+	changed = changed || verifyChanged
+	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
+	// B1: take the workspace checkpoint and apply retention. The checkpoint
+	// step runs on every reconcile (level-based); the idempotency guard in
+	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
+	// The checkpoint is keyed off the operator-recorded verify outcome
+	// (status.verify.iteration), not the current iteration.
+	_, cpRequeue := r.ensureCheckpointStep(ctx, loop)
+	verifyRequeue = verifyRequeue || cpRequeue
+	return changed, verifyRequeue, claimReadPending, advancedFrom, nil
+}
+
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var loop coxv1alpha1.Loop
 	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
@@ -595,10 +615,35 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// once) rather than a silent disappearance. The CleaningUp work (the
 	// snapshot GC + the finalizer removal) still runs below, unchanged.
 	b2Deleting := !loop.DeletionTimestamp.IsZero()
-	if !b2Deleting {
-		if err := r.applyLoopFinalizer(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
+	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
+	// on the first reconcile; idempotent). It is what keeps the Loop alive
+	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
+	//
+	// B2: a Loop being deleted (deletionTimestamp set) is in CleaningUp —
+	// its normal work is the checkpoint GC (delete the Loop's VolumeSnapshots)
+	// and the finalizer holds the Loop until the GC is done (CleaningUp).
+	// The B2 restore step runs BEFORE the CleaningUp early return, on the
+	// deleting object: a rollback set at the same time as (or after) the
+	// delete still has to be decided before the Loop disappears (the
+	// condition + the Event + the restored PVC are written at the point of
+	// the decision — the PVC is controller-owned, so a restored PVC is
+	// garbage-collected with the Loop, and the condition is the durable
+	// record the user asked for the restore to have). For a fork
+	// (spec.forkOf) the same applies: a fork being deleted before its
+	// restore completes gets a Restore decision (RestoreSourceMissing —
+	// the snapshot is gone with the source, or the restore is attempted
+	// once) rather than a silent disappearance. The CleaningUp work (the
+	// snapshot GC + the finalizer removal) still runs below, unchanged.
+	if b2Deleting {
+		// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the B2-deleting early return
+		// (validate + the policy gate + the B2 restore decision + the
+		// CleaningUp work). The B2 decision is the durable record a deleting
+		// Loop leaves behind (finalizeB2DeleteStep persists it before the
+		// snapshot GC runs).
+		return r.finalizeB2DeleteStep(ctx, &loop)
+	}
+	if err := r.applyLoopFinalizer(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// C6a + D34: validate the referenced AgentPolicies and the
@@ -623,8 +668,16 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
+	var resumeCleared bool
+	var bootChanged bool
+	var err error
+	bootChanged, resumeCleared, err = r.phaseBootstrap(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	changed := bootChanged || resumeCleared // the phase bootstrap's condition change (the I90 point-of-decision write)
 	// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the workspace restore step
-	// (restore/rollback/fork). It runs BEFORE phaseBootstrap (the bootstrap's
+	// (restore/rollback/fork). It runs BEFORE the phase work (the bootstrap's
 	// ensureLoopArtifacts + ensureSandbox would recreate the PVC and build the
 	// sandbox; the restore step DELETEs + recreates the PVC with a dataSource,
 	// and the sandbox build reads the PVC by name, not spec, so a restored
@@ -637,53 +690,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed := b2Changed // the B2 restore step's condition change
+	changed = changed || b2Changed // the B2 restore step's condition change (the I90 point-of-decision write)
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
-	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
-	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
-	// budget).
-	var resumeCleared bool
-	if !b2Deleting {
-		_, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		changed = changed || resumeCleared
-	} else {
-		// A deleting Loop: the B2 restore step has just decided (above) — the
-		// restore decision is persisted at the point of the decision (I90),
-		// the condition is the durable record, and the PVC is controller-owned
-		// (it is garbage-collected with the Loop when the finalizer runs).
-		// The phase machine is a NO-OP for a deleting Loop (the bootstrap
-		// would recreate the PVC and build the sandbox for an object being
-		// deleted, and the phase advances below would act on sandbox pods the
-		// deletion is tearing down). The CleaningUp work (the snapshot GC +
-		// the finalizer removal) runs in the early return below — the same
-		// B1 behaviour a deleting Loop had before B2, with the B2 decision
-		// now running BEFORE it.
-		//
-		// The B2 restore step's requeue (the snapshot is not ReadyToUse yet —
-		// the in-progress state, I49 — or a transient read failed) ORs into
-		// the RequeueAfter so the decision is retried while the Loop is
-		// deleting (the PVC is recreated on the next pass; the finalizer's
-		// GC is a no-op on the PVC — the PVC is a child object the apiserver
-		// garbage-collects, not a snapshot, so the GC does not block on it).
-		b2PersistedChanged := changed // the B2 step's condition change (the I90 write)
-		conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
-		if err := r.finalizeLoopStatus(ctx, &loop, b2PersistedChanged, conditionsChanged, false, false, ""); err != nil {
-			return ctrl.Result{}, err
-		}
-		if b2Requeue {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		// The B2 decision is complete (or there was no target — a deleting
-		// Loop with no restoreFrom/forkOf and the PVC present is a no-op).
-		// Run the CleaningUp work (the B1 finalizer's snapshot GC + the
-		// finalizer removal) and return its result (the RequeueAfter for an
-		// async delete, the error for a delete failure, or the done result).
-		return r.reconcileCleaningUp(ctx, &loop)
-	}
+	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
+	// phaseBootstrap helper keeps the Reconcile within the gocyclo budget).
 	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
 	// and the Required gate. The gate fails the Loop (terminal
 	// Failed:CheckpointUnavailable) at start — before any phase work — when
@@ -731,18 +742,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// running at pause time is left to terminate, and its termination produces
 	// no iterate/stall/budget decision because the phase is Paused, not
 	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
-	claimReadPending, s4Changed, advancedFrom := r.advancePhaseFromClaim(ctx, &loop)
-	changed = changed || s4Changed
-	verifyRequeue := false
-	if err := r.ensureVerifyJobAndNetPolicies(ctx, &loop); err != nil {
-		if !errors.Is(err, errVerifyStaleDeleted) {
-			return ctrl.Result{}, err
-		}
-		verifyRequeue = true
+	verifyChanged, verifyRequeue, claimReadPending, advancedFrom, err := r.reconcileVerifySteps(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
-	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 	// B1: take the workspace checkpoint and apply retention. The checkpoint
 	// step runs on every reconcile (level-based); the idempotency guard in
 	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
@@ -833,9 +837,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// keep decision was an in-memory annotation on the Loop, then an early
 	// return that skipped the whole finalize; both were wrong — the I61 risk
 	// and the P1 review on #100.)
-	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
-		return ctrl.Result{}, err
-	}
 	// B2 (PLAN-BETA): the restore step's requeue (the snapshot is not
 	// ReadyToUse yet — the in-progress state, I49 — or a transient read
 	// failed) ORs into the requeue-after (the 5s RequeueAfter in the FINAL
@@ -843,6 +844,9 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// one-shot (the Restore condition True/Restored is the marker — no
 	// requeue).
 	verifyRequeue = verifyRequeue || b2Requeue
+	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
+		return ctrl.Result{}, err
+	}
 	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue), nil
 }
 
@@ -856,6 +860,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // defeat optimistic concurrency (it can silently overwrite status another
 // writer just set). Extracted so the top-level reconcile stays within the
 // gocyclo budget.
+
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
 // Status().Update), and — when a phase advance was committed this pass
 // (advancedFrom != "") — emits the PhaseAdvanced Event AFTER the status update
@@ -5373,20 +5378,6 @@ func (r *LoopReconciler) ensureObservedGeneration(loop *coxv1alpha1.Loop) bool {
 		return true
 	}
 	return false
-}
-
-// reconcileDeletionAndFinalizer handles the deletion branch (CleaningUp) and
-// the finalizer application. Returns (done, result, err): done is true when
-// the caller should return the result (deletion or error).
-func (r *LoopReconciler) reconcileDeletionAndFinalizer(ctx context.Context, loop *coxv1alpha1.Loop) (bool, ctrl.Result, error) {
-	if !loop.DeletionTimestamp.IsZero() {
-		res, err := r.reconcileCleaningUp(ctx, loop)
-		return true, res, err
-	}
-	if err := r.applyLoopFinalizer(ctx, loop); err != nil {
-		return true, ctrl.Result{}, err
-	}
-	return false, ctrl.Result{}, nil
 }
 
 // ensureVerifyJobAndNetPolicies is the ensureVerifyJobIfActive +

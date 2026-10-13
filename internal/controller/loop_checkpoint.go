@@ -50,6 +50,7 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,6 +80,11 @@ const (
 	volumeSnapshotClassKind   = "VolumeSnapshotClass"
 	volumeSnapshotContentKind = "VolumeSnapshotContent"
 )
+
+// snapshotGroupRef is the addressable form of snapshotGroup (the PVC
+// dataSource's APIGroup field needs a *string; the const itself cannot be
+// addressed).
+var snapshotGroupRef = snapshotGroup
 
 // volumeSnapshotGVK is the GVK the operator creates and reads for the
 // per-Loop checkpoints (the unstructured watch + the cached List/Get).
@@ -740,6 +746,61 @@ func (r *LoopReconciler) applyLoopFinalizer(ctx context.Context, loop *coxv1alph
 		return r.Update(ctx, loop)
 	}
 	return nil
+}
+
+// finalizeB2DeleteStep is the B2-deleting early return (a Loop being deleted
+// — deletionTimestamp set): it validates the referenced AgentPolicies +
+// endpointSecretRef/modelEndpoint pair (C6a + D34), resolves the effective
+// policy (D30 gate), runs the B2 workspace restore step (b2ApplyRestoreStep —
+// the restore decision is the durable record a deleting Loop leaves behind),
+// persists the decision (finalizeB2Delete, the I90 point-of-decision write),
+// and runs the CleaningUp work (the B1 finalizer's snapshot GC + the
+// finalizer removal). It is the same B1 behaviour a deleting Loop had before
+// B2, with the B2 decision now running BEFORE the snapshot GC — and it is
+// what keeps Reconcile within the gocyclo budget (the deleting branch is the
+// whole early-return, not a nested sequence of steps).
+func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, error) {
+	if res, done := r.validateStep(ctx, loop); done {
+		return res, nil
+	}
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
+	if err := r.applyEffectivePolicyAndConditions(ctx, loop); err != nil {
+		return ctrl.Result{}, err
+	}
+	b2Changed, b2Requeue, err := r.b2ApplyRestoreStep(ctx, loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.finalizeB2Delete(ctx, loop, condsBefore, b2Changed, b2Requeue)
+}
+
+// finalizeB2Delete is the B2-restore-decided early return for a Loop being
+// deleted (deletionTimestamp set). The B2 restore step has just decided
+// (b2ApplyRestoreStep, the I90 point-of-decision write) and the decision is
+// persisted HERE: the finalizeLoopStatus write (changed = the B2 step's
+// condition change, conditionsChanged = the D38 capture). A requeue (the
+// snapshot is not ReadyToUse yet — the in-progress state, I49 — or a
+// transient read failed) is a clean RequeueAfter so the decision is retried
+// while the Loop is deleting (the PVC is recreated on the next pass; the
+// finalizer's GC is a no-op on the PVC — the PVC is a child object the
+// apiserver garbage-collects, not a snapshot, so the GC does not block on
+// it). When the decision is complete (or there was no target — a deleting
+// Loop with no restoreFrom/forkOf and the PVC present is a no-op), the
+// CleaningUp work (the B1 finalizer's snapshot GC + the finalizer removal)
+// runs and its result is returned (the RequeueAfter for an async delete, the
+// error for a delete failure, or the done result). It is the same B1
+// behaviour a deleting Loop had before B2, with the B2 decision now running
+// BEFORE it.
+func (r *LoopReconciler) finalizeB2Delete(ctx context.Context, loop *coxv1alpha1.Loop, condsBefore []metav1.Condition, b2Changed bool, b2Requeue bool) (ctrl.Result, error) {
+	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
+	if err := r.finalizeLoopStatus(ctx, loop, b2Changed, conditionsChanged, false, false, ""); err != nil {
+		return ctrl.Result{}, err
+	}
+	if b2Requeue {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	return r.reconcileCleaningUp(ctx, loop)
 }
 
 // reconcileCleaningUp is the B1 finalizer's work for a Loop being deleted

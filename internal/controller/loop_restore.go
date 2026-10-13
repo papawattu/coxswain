@@ -24,19 +24,19 @@ limitations under the License.
 //   - RESTORE (reactive): the workspace PVC is LOST (NotFound — e.g. a
 //     local-path PV loss, or an operator bug that deleted it) and the Loop
 //     has a usable checkpoint. The operator restores from the latest
-//     ReadyToUse checkpoint and surfaces it (WorkspaceRestored Event + the
-//     Restore condition). No usable checkpoint: it falls back to the A2
-//     PVC-resume (recreate the PVC EMPTY) and surfaces THAT (I90: the
-//     fallback is visible — a WorkspaceRestoreUnavailable Event + the
-//     Restore condition, not a silent ignore).
+//     ReadyToUse checkpoint and surfaces it (Restore Event + the Restore
+//     condition). No usable checkpoint: it falls back to the A2 PVC-resume
+//     (recreate the PVC EMPTY) and surfaces THAT (I90: the fallback is
+//     visible — a Restore Event + the Restore condition, not a silent
+//     ignore).
 //   - ROLLBACK (explicit): spec.restoreFrom: iter-N names the checkpoint
 //     the operator restores from. The checkpoint must EXIST (a recorded
 //     status.checkpoints entry whose VolumeSnapshot is present) and be
 //     ReadyToUse. An unknown iter is rejected VISIBLY (Restore condition
 //     False reason RestoreSourceMissing + an Event, terminal — the object
 //     is gone); a not-yet-ready snapshot is DEFERRED (Restore condition
-//     False reason RestoreSourceNotReady + an Event, retried each reconcile
-//     — the in-progress state, no restore decision, I49).
+//     False reason RestoreSourceNotReady + an Event, retried each
+//     reconcile — the in-progress state, no restore decision, I49).
 //   - FORK (explicit, at creation): spec.forkOf {loop, iteration} seeds the
 //     Loop from another Loop's checkpoint. At start the operator restores
 //     this Loop's OWN workspace PVC from the source snapshot
@@ -47,17 +47,51 @@ limitations under the License.
 //     materialised from the snapshot at restore), and the source's
 //     checkpoint GC (the source's finalizer, CleaningUp) deletes the
 //     SOURCE's snapshots, which the fork no longer reads. The fork's
-//     restore is a ONE-SHOT decision recorded in status (a
-//     status.condition Restore=True/Restored is the marker): once the
-//     source snapshot is gone the fork carries on (it does not re-restore,
-//     does not treat the gone snapshot as a lost-PVC fallback case — the
-//     PVC is present).
+//     restore is a ONE-SHOT decision recorded in the Restore condition
+//     (True/Restored): once the restore is complete the fork does not
+//     re-restore and does not treat a gone source snapshot as a lost-PVC
+//     fallback case — the PVC is present.
+//
+// The PVC replacement is LEVEL-BASED (no blocking poll in Reconcile): the
+// decision, the sandbox stop, the PVC delete and the PVC create are each a
+// separate reconcile step, and progress is recorded in the Restore
+// condition (the decision survives a restart — the reviewer's P1, the R-B2
+// review at 20ef538):
+//
+//  1. a rollback target with a READY source and a PRESENT PVC: the sandbox
+//     is STOPPED (Suspended — a mounted PVC is held by
+//     kubernetes.io/pvc-protection until the pod is gone; the A2 kill path
+//     stops it the same way) and the Restore condition is False reason
+//     StoppingSandbox (the in-progress state — no PVC change yet, no
+//     restore decision, I49). The PVC is NOT deleted yet (the delete of a
+//     still-mounted PVC would not complete on a real cluster).
+//  2. a rollback target with a ready source and the sandbox STOPPED: the
+//     PVC is DELETED (the dataSource is immutable — delete + recreate is
+//     the only way) and the condition is False reason DeletingPVC. The
+//     delete is async (the apiserver removes the object after the
+//     finalizer work is done); a still-present PVC (a pending delete) does
+//     NOT re-trigger the delete (idempotent) and the reconcile returns.
+//  3. a rollback target with a ready source and the PVC GONE: the PVC is
+//     CREATED with spec.dataSource = the snapshot (AlreadyExists is a
+//     success — a concurrent pass created it; the content is from the
+//     snapshot either way) and the condition is True reason Restored (the
+//     one-shot marker). The restore then completes: no further PVC action
+//     until the next explicit restoreFrom (the next rollback re-arms via
+//     the spec's generation — see the marker discussion in
+//     b2RestoreTarget).
+//
+// A FORK runs the same steps at creation, but the PVC is ABSENT (a fresh
+// Loop) and the sandbox does not exist yet, so it skips the stop + delete
+// and goes straight to the create (step 3). A LOST-PVC restore is the
+// reactive case: the PVC is already gone, so it also goes straight to the
+// create (step 3), with the A2 fallback (empty PVC + a visible condition +
+// Event) when the latest checkpoint is missing.
 //
 // The Restore condition is set on every restore decision (the I83 pattern:
 // the condition is the durable record; the Event is the transient signal).
-// The condition is NOT re-set on every reconcile once the restore is
-// complete (Restore=True/Restored stays until the Loop ends) — a re-set on
-// every reconcile would churn the status and race the A2 path.
+// It is NOT re-set on every reconcile once the restore is complete (True/
+// Restored stays until the next explicit restoreFrom or the Loop ends) —
+// a re-set on every reconcile would churn the status and race the A2 path.
 
 package controller
 
@@ -66,7 +100,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -75,6 +108,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -84,8 +119,8 @@ import (
 // resolveCheckpointSource reads the VolumeSnapshot named after the Loop's
 // checkpoint for (loopName, iteration) and returns (snapshot, decision):
 //   - decision "ready": the snapshot exists AND is ReadyToUse
-//     (status.boundSnapshotVolumeReadyToUse == true) — the operator may
-//     recreate the PVC from it.
+//     (status.readyToUse == true) — the operator may recreate the PVC
+//     from it.
 //   - decision "notready": the snapshot exists but is not ReadyToUse yet —
 //     DEFER (requeue; the in-progress state, no decision, I49).
 //   - decision "missing": the snapshot does not exist — the checkpoint is
@@ -131,114 +166,6 @@ func (r *LoopReconciler) resolveCheckpointSource(ctx context.Context, ns, loopNa
 	return snap, b2SourceReady
 }
 
-// pvcDeleteWaitSeam is the B2 restore seam: it replaces the bounded poll of
-// restorePVCFromSnapshot's PVC-delete wait. When set (a test), the operator
-// uses it instead of the live wait. The default (nil) is the live wait (the
-// bounded poll in restorePVCFromSnapshot).
-//
-// The envtest has no csi driver, so the PVC's built-in
-// kubernetes.io/pvc-protection finalizer is never removed by the apiserver
-// (the finalizer is removed when the PVC has no pods using it — the pod
-// controller, which envtest does not run). A PVC delete with the finalizer
-// present is async (the apiserver sets deletionTimestamp but does not remove
-// the object until the finalizer is gone), so the restore's Create (issued
-// after the delete) races the delete and hits AlreadyExists (the name is
-// still taken by the deleting PVC). The test's seam REMOVES the PVC's
-// kubernetes.io/pvc-protection finalizer (so the delete completes
-// immediately — the apiserver removes the object when the finalizer is
-// gone), then polls the PVC until it is NotFound (the delete is done). This
-// is the envtest's way of asserting the restore's delete+create sequence
-// without a real csi driver (the production code's live wait is the same
-// poll, but with the real csi driver the delete completes when the driver
-// releases the volume, and the pvc-protection finalizer is removed by the
-// pod controller). The seam is the operator's own read (no new RBAC — the
-// operator already reads the PVC); the bound (10s) outlasts a normal csi
-// release and surfaces a wedged delete (a requeue, not an infinite hang).
-// recreates it with spec.dataSource = the named VolumeSnapshot (a PVC
-// dataSource is IMMUTABLE — the only way to change it is delete + create).
-// It returns an error only on a real create/read failure (the delete is
-// idempotent: a NotFound is a success). The restored PVC is controller-owned
-// by the Loop (the same GC contract as the original PVC).
-//
-// The delete is SYNCHRONOUS-waited: a PVC delete is async (the apiserver
-// removes the object only after the finalizer work is done — on a real
-// cluster the csi driver releases the volume; in envtest there is no
-// finalizer so the delete is immediate). A recreate issued before the old
-// PVC is gone would hit AlreadyExists (the name is still taken) and the
-// restore would be retried next reconcile — but the old PVC (with its OLD
-// dataSource, or none) would be the object the spec reads, and the restore
-// would appear to have done nothing (the ROLLBACK ready spec's failure in
-// the 89937b9 CI run: the delete was issued, the create raced the delete,
-// and the PVC the spec read was the OLD one with no dataSource). The wait
-// polls the PVC by name until it is NotFound (bounded, so a wedged delete
-// is surfaced, not an infinite hang).
-func (r *LoopReconciler) restorePVCFromSnapshot(ctx context.Context, loop *coxv1alpha1.Loop, snapshotName string) error {
-	snapshotGroupRef := snapshotGroup
-	key := types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}
-	pvc := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, key, pvc); err == nil {
-		// The PVC is present: delete it (the dataSource is immutable on an
-		// existing PVC; the new PVC must carry the new dataSource). A
-		// NotFound is a success (the PVC was already gone — the lost-PVC
-		// restore path arrives here with the PVC already deleted).
-		if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete workspace PVC %s for restore: %w", workspacePVCName(loop.Name), err)
-		}
-		// Wait for the delete to complete (the PVC is gone). A bounded poll
-		// (the delete is async on a real cluster; immediate in envtest). The
-		// wait is the operator's own read (no new RBAC — the operator already
-		// reads the PVC); the bound (10s) outlasts a normal csi release and
-		// surfaces a wedged delete (a requeue, not an infinite hang).
-		//
-		// The pvcDeleteWaitSeam (a test) replaces the live wait: the envtest
-		// has no csi driver, so the PVC's built-in kubernetes.io/pvc-protection
-		// finalizer is never removed by the apiserver and the delete never
-		// completes in envtest — a test sets the seam to a no-op (the PVC is
-		// "gone" for the test's purposes; the restore's create then races the
-		// delete in envtest, and the spec's PVC read is the restored one).
-		if r.pvcDeleteWaitSeam != nil {
-			if err := r.pvcDeleteWaitSeam(ctx, loop); err != nil {
-				return err
-			}
-		} else {
-			deadline := time.Now().Add(10 * time.Second)
-			for {
-				p := &corev1.PersistentVolumeClaim{}
-				if err := r.Get(ctx, key, p); err == nil {
-					if time.Now().After(deadline) {
-						return fmt.Errorf("wait for workspace PVC %s delete (restore): still present after 10s (the delete is wedged — the csi driver may be stuck releasing the volume)", workspacePVCName(loop.Name))
-					}
-					time.Sleep(100 * time.Millisecond)
-					continue
-				}
-				if !apierrors.IsNotFound(err) {
-					return fmt.Errorf("wait for workspace PVC %s delete (restore): %w", workspacePVCName(loop.Name), err)
-				}
-				break // the PVC is gone
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("read workspace PVC %s for restore: %w", workspacePVCName(loop.Name), err)
-	}
-	// Recreate the PVC with the dataSource (the A2 path's ensureWorkspacePVC
-	// will NOT rewrite it — an existing PVC is left untouched except the
-	// owner ref, so the dataSource survives).
-	newPVC := workspacePVCSpec(loop)
-	ds := corev1.TypedLocalObjectReference{
-		APIGroup: &snapshotGroupRef,
-		Kind:     volumeSnapshotKind,
-		Name:     snapshotName,
-	}
-	newPVC.Spec.DataSource = &ds
-	if err := controllerutil.SetControllerReference(loop, newPVC, r.Scheme); err != nil {
-		return fmt.Errorf("set owner on restored workspace PVC %s: %w", workspacePVCName(loop.Name), err)
-	}
-	if err := r.Create(ctx, newPVC); err != nil {
-		return fmt.Errorf("create restored workspace PVC %s from snapshot %s: %w", workspacePVCName(loop.Name), snapshotName, err)
-	}
-	return nil
-}
-
 // b2RestoreTarget names the checkpoint a Loop should restore from, and
 // WHY (the Restore condition's message carries it). For a rollback
 // (spec.restoreFrom) the target is the named iter; for a fork (spec.forkOf)
@@ -261,35 +188,50 @@ const (
 	b2KindFallback b2Kind = "noSnapshot" // the PVC was lost with no usable checkpoint (A2 fallback)
 )
 
-// b2RestoreTargetFor computes the Loop's restore target (nil when no
-// restore applies this reconcile):
-//   - a fork (spec.forkOf) whose restore is not yet complete (the
-//     Restore condition is not True/Restored): the source checkpoint.
-//   - a rollback (spec.restoreFrom): the named iter (always — a rollback
-//     is a one-time restore decision, recorded once the PVC is restored).
-//   - a LOST workspace PVC (NotFound) with no restoreFrom/forkOf: the
-//     latest recorded checkpoint (status.checkpoints' last entry), when
-//     one exists.
+// b2RestoreTarget computes the Loop's restore target (nil when no restore
+// applies this reconcile):
 //
-// The rollback/fork restore is ONE-SHOT per Loop life: once the Restore
-// condition is True/Restored (the PVC was recreated from the snapshot),
-// the operator does not re-restore (re-restore would be a wedge: the
-// snapshot may have been GC'd in the meantime, and the PVC now holds the
-// restored content the Loop is working on). A LOST PVC is a different
-// decision (reactive): it re-evaluates every reconcile until the PVC is
-// back (a restore or the empty-PVC fallback).
+//   - a FORK (spec.forkOf) whose restore is not yet complete: the source
+//     checkpoint (one-shot at creation).
+//   - a ROLLBACK (spec.restoreFrom): the named iter, when the restore for
+//     that generation has not yet completed. The one-shot marker is the
+//     Restore condition itself (True/Restored) PLUS the spec's generation:
+//     once a rollback has completed the operator does not re-restore (a
+//     re-restore would wipe the Loop's work since the restore) — the
+//     condition's observedGeneration carries the spec generation the
+//     restore completed for (a condition whose observedGeneration < the
+//     Loop's generation is a stale marker — a NEW spec.restoreFrom value
+//     bumps the generation and re-arms the restore; a same-value update
+//     does not). The CRD makes restoreFrom immutable, so in practice the
+//     re-arm happens only for a Loop that changed the field through a
+//     bypassing client (defensive) or a future CRD relaxation.
+//   - a LOST workspace PVC (NotFound) with no completed restore for the
+//     current generation: the reactive case — the latest recorded
+//     checkpoint (nil when none — the A2 fallback recreates the PVC
+//     empty). The reactive case re-evaluates every reconcile until the
+//     PVC is back.
+//
+// The in-progress markers (StoppingSandbox / DeletingPVC) do NOT stop the
+// target from applying: they ARE the restore's progress, and the step
+// (b2ApplyRestoreStep) is idempotent on them (a still-present PVC while
+// DeletingPVC is not re-deleted; a running sandbox while StoppingSandbox is
+// not re-updated).
 func (r *LoopReconciler) b2RestoreTarget(ctx context.Context, loop *coxv1alpha1.Loop) *b2RestoreTarget {
-	// A completed restore is one-shot: the condition is the marker.
+	// A completed restore is one-shot: the condition is the marker. The
+	// marker is valid for the spec generation it was recorded against
+	// (observedGeneration >= loop.Generation): a new spec.restoreFrom value
+	// bumps the generation and re-arms (the condition's observedGeneration
+	// stays at the old generation until the next restore writes it).
 	if c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition); c != nil &&
-		c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.RestoreReasonRestored {
-		// The restore is complete. Do NOT re-restore if the PVC is present
-		// (re-restore would wipe the Loop's work since the restore).
-		// A LOST PVC on a RESTORED Loop is the reactive case again (the PVC
-		// was restored once and then lost): the target is the rollback
-		// target if set (the explicit one wins), otherwise the latest
-		// recorded checkpoint.
-		pvc := &corev1.PersistentVolumeClaim{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc); err == nil {
+		c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.RestoreReasonRestored &&
+		c.ObservedGeneration >= loop.Generation {
+		// The restore is complete for this spec generation. Do NOT
+		// re-restore if the PVC is present (re-restore would wipe the Loop's
+		// work since the restore). A LOST PVC on a RESTORED Loop is the
+		// reactive case again (the PVC was restored once and then lost):
+		// the target is the rollback target if set (the explicit one wins),
+		// otherwise the latest recorded checkpoint.
+		if r.workspacePVCPresent(ctx, loop) {
 			return nil // the PVC is present: the restore is complete, do not re-restore
 		}
 		if loop.Spec.RestoreFrom != "" {
@@ -299,12 +241,14 @@ func (r *LoopReconciler) b2RestoreTarget(ctx context.Context, loop *coxv1alpha1.
 		}
 		return r.b2LostPVCTarget(ctx, loop)
 	}
-	// A fork: seed from the source checkpoint (one-shot at creation).
+	// A fork: seed from the source checkpoint (one-shot at creation; a fork
+	// never re-arms — its spec.forkOf is immutable and its Restore marker is
+	// written with the fork's generation).
 	if loop.Spec.ForkOf != nil {
 		return &b2RestoreTarget{loopName: loop.Spec.ForkOf.Loop, iteration: loop.Spec.ForkOf.Iteration,
 			snapshot: checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: loop.Spec.ForkOf.Loop}}, loop.Spec.ForkOf.Iteration), kind: b2KindFork}
 	}
-	// A rollback: the named iter (one-shot per Loop life).
+	// A rollback: the named iter (one-shot per spec generation).
 	if loop.Spec.RestoreFrom != "" {
 		if it, err := parseRestoreFrom(loop.Spec.RestoreFrom); err == nil {
 			return &b2RestoreTarget{loopName: loop.Name, iteration: it, snapshot: checkpointName(loop, it), kind: b2KindRollback}
@@ -320,19 +264,19 @@ func (r *LoopReconciler) b2RestoreTarget(ctx context.Context, loop *coxv1alpha1.
 }
 
 // b2LostPVCTarget returns the reactive restore target when the workspace
-// PVC is LOST (NotFound) and no explicit restore is set: the latest
+// PVC is LOST (NotFound) and no explicit restore applies: the latest
 // recorded checkpoint (status.checkpoints' last entry), or nil (no usable
 // checkpoint — the caller applies the A2 fallback). It returns nil when the
 // PVC is present (the reactive case does not apply — the PVC is there).
 func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.Loop) *b2RestoreTarget {
-	pvc := &corev1.PersistentVolumeClaim{}
-	key := types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}
-	err := r.Get(ctx, key, pvc)
-	if err == nil {
+	if r.workspacePVCPresent(ctx, loop) {
 		return nil // the PVC is present: no reactive restore
 	}
-	if !apierrors.IsNotFound(err) {
-		return nil // a transient read failure: no decision (retried next reconcile)
+	// A transient read failure (a non-NotFound error): no decision (the
+	// operator does not act on a failed read; the next reconcile retries).
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc); err != nil && !apierrors.IsNotFound(err) {
+		return nil
 	}
 	// The PVC is LOST. The latest recorded checkpoint is the restore source
 	// (nil when none — the A2 fallback recreates the PVC empty).
@@ -342,6 +286,17 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 	}
 	last := cps[len(cps)-1]
 	return &b2RestoreTarget{loopName: loop.Name, iteration: last.Iteration, snapshot: last.Name, kind: b2KindLostPVC}
+}
+
+// workspacePVCPresent reports whether the Loop's workspace PVC currently
+// exists (a transient read failure is reported as "not present" — the
+// caller's decision is retried next reconcile, and a failed read is not
+// grounds for a restore decision — the conservative reading, as in B1's
+// support check).
+func (r *LoopReconciler) workspacePVCPresent(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
+	return err == nil
 }
 
 // parseRestoreFrom parses "iter-N" (the CRD pattern validates the shape;
@@ -359,156 +314,121 @@ func parseRestoreFrom(s string) (int, error) {
 	return n, nil
 }
 
-// b2ApplyRestoreStep is the B2 restore step extracted from Reconcile (the
-// gocyclo budget). It runs BEFORE phaseBootstrap (the bootstrap's
-// ensureLoopArtifacts would recreate a LOST PVC EMPTY before the restore
-// could decide; the sandbox build reads the PVC by name, not spec, so a
-// restored PVC is invisible to it). It:
-//
-//  1. computes the restore target (b2RestoreTarget),
-//  2. resolves the source snapshot (ready / notready / missing / error),
-//  3. on ready: restores the PVC from the snapshot, sets Restore=True
-//     (reason Restored) and emits the WorkspaceRestored Event,
-//  4. on notready: DEFERS (Restore=False reason RestoreSourceNotReady +
-//     the Event; the requeue is the 5s RequeueAfter in the final return),
-//  5. on missing: the kind decides — a rollback/fork is TERMINAL
-//     (Restore=False reason RestoreSourceMissing + the Event; no requeue —
-//     the object is gone); a lost-PVC restore falls back to the A2 path
-//     (recreate the PVC empty + Restore=False reason NoUsableCheckpoint +
-//     the WorkspaceRestoreUnavailable Event — I90: the fallback is
-//     VISIBLE),
-//  6. on error: requeues (no decision on a transient read failure).
-//
-// It returns (changed, requeue, err). changed is true when the condition was
-// (re)set this pass; requeue is true when a requeue is needed (notready or
-// error); err is a real failure (the caller returns it).
-//
-// The step is ONE-SHOT per Loop life for an explicit restore (rollback /
-// fork): once the Restore condition is True/Restored the operator does not
-// re-restore (re-restore would be a wedge: the snapshot may have been GC'd
-// in the meantime, and the PVC now holds the restored content the Loop is
-// working on). A LOST PVC on a RESTORED Loop is the reactive case again
-// (the PVC was restored once and then lost): the target is the latest
-// recorded checkpoint (or the rollback target if set — the explicit one
-// wins). The one-shot marker is the condition itself (b2RestoreTarget
-// reads it), so the step never re-decides a completed restore.
-func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
-	target := r.b2RestoreTarget(ctx, loop)
-	if target == nil {
-		return false, false, nil // no restore applies this reconcile
+// sandboxRunning reports whether the Loop's sandbox (if any) is in the
+// Running operating mode (the only state that can hold the workspace PVC
+// mounted — the agent-sandbox controller creates the pod for a Running
+// sandbox and scales it to zero / removes it when the sandbox is
+// Suspended). A missing sandbox or a non-Running sandbox is "not running"
+// (no PVC to unmount).
+func (r *LoopReconciler) sandboxRunning(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	sb := &sandboxv1beta1.Sandbox{}
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
+	if err := r.Get(ctx, key, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	snap, decision := r.resolveCheckpointSource(ctx, loop.Namespace, target.loopName, target.iteration)
-	// persist is the I90 write (the reviewer's guidance, R-B2): the condition
-	// is already set on `loop` by this point, so persisting it HERE (at the
-	// point of decision) makes the decision durable even when a later step in
-	// the same reconcile fails (e.g. ensureSandbox). The Event is emitted
-	// immediately (the transient signal fires at the point of decision, before
-	// any later failure can hide it); the Status().Update is what survives a
-	// later failure in the same reconcile. The step returns (persisted,
-	// requeue, err): persisted is true when the step wrote the status this
-	// pass (the caller ORs it into `changed` so a failed later step does not
-	// make finalizeLoopStatus skip the write — the step already wrote it);
-	// requeue is true when a requeue is needed (notready or error); err is a
-	// real failure (the caller returns it).
-	persist := func() bool { return r.Status().Update(ctx, loop) == nil }
-	switch decision {
-	case b2SourceReady:
-		if err := r.restorePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
-			// A restore failure is surfaced (I90) and requeued (the next
-			// reconcile retries — the PVC delete may have succeeded and the
-			// create failed; the retry recreates it).
-			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
-				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())
-			persisted := persist()
-			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
-				"workspace PVC restore from "+target.snapshot+" failed; retrying")
-			return persisted, true, nil
-		}
-		// B2 FORK-RETENTION: a fork that has just restored its PVC from the
-		// source's checkpoint REMOVES the fork-of label from the source's
-		// snapshot (the fork's PVC now owns its content — the snapshot was
-		// materialised into the PVC at restore, and the fork no longer
-		// reads it). The label removal is the operator's own action (the
-		// fork's operator, not the source's). Once the label is removed,
-		// the source's GC (the source's loopCheckpointFinalizer) is free
-		// to delete the snapshot on the source's next reconcile (the fork
-		// is self-sufficient). A rollback or a lost-PVC restore does NOT
-		// touch the label (it is the fork's responsibility; a rollback
-		// restores from the Loop's OWN snapshot, not another Loop's).
-		if target.kind == b2KindFork {
-			r.removeForkRetentionLabel(ctx, loop, target.loopName, target.snapshot)
-		}
-		setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
-			"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
-		persisted := persist()
-		r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
-			"workspace PVC restored from "+target.snapshot)
-		return persisted, false, nil
-	case b2SourceNotReady:
-		// DEFER: the snapshot exists but is not ReadyToUse (the in-progress
-		// state — no restore decision, I49). The condition names it; the
-		// requeue retries (the 5s RequeueAfter in the final return). The
-		// snap value is not needed (the condition names the snapshot).
-		_ = snap
-		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
-			"checkpoint "+target.snapshot+" ("+string(target.kind)+") exists but is not ReadyToUse yet; the restore is deferred")
-		persisted := persist()
-		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
-			"checkpoint "+target.snapshot+" not ReadyToUse yet; restore deferred")
-		return persisted, true, nil
-	case b2SourceMissing:
-		switch target.kind {
-		case b2KindRollback, b2KindFork:
-			// TERMINAL: the explicit target is gone. The condition names it;
-			// NO requeue (the object will not come back — the source Loop's
-			// GC deleted it, or it was never taken).
-			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
-				"checkpoint "+target.snapshot+" ("+string(target.kind)+") does not exist (it was never taken, or it was GC'd); the restore is rejected")
-			persisted := persist()
-			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
-				"checkpoint "+target.snapshot+" does not exist; restore rejected")
-			return persisted, false, nil
-		default: // b2KindLostPVC
-			// The A2 fallback: the PVC is lost and the (latest) checkpoint
-			// is gone. Recreate the PVC EMPTY (the A2 PVC-resume — the
-			// content is lost, the Loop continues from the untouched base)
-			// and surface the fallback (I90: VISIBLE).
-			if err := r.recreateWorkspacePVCEmpty(ctx, loop); err != nil {
-				return false, true, fmt.Errorf("A2 fallback: recreate workspace PVC empty: %w", err)
-			}
-			setRestoreCondition(loop, false, noUsableCheckpointReason,
-				"the workspace PVC was lost and checkpoint "+target.snapshot+" does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)")
-			persisted := persist()
-			r.emitRestoreEvent(loop, false, noUsableCheckpointReason,
-				"workspace PVC lost, no usable checkpoint; A2 fallback (empty workspace)")
-			return persisted, false, nil
-		}
-	case b2SourceError:
-		// A transient read failure: no decision, requeue.
-		log.FromContext(ctx).V(1).Info("restore: reading the checkpoint snapshot failed; requeueing (no decision on a transient read failure)",
-			"snapshot", target.snapshot, "kind", string(target.kind))
-		return false, true, nil
-	}
-	return false, false, nil
+	return sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning, nil
 }
 
-// noUsableCheckpointReason is the Restore condition's reason for the
-// A2 fallback (the PVC was lost with no usable checkpoint; I90 names it).
-// The constant lives in the API package (the CRD's status enum references
-// it) and is aliased here so the controller reads as a local.
-var noUsableCheckpointReason = coxv1alpha1.RestoreReasonNoUsableCheckpoint
+// stopSandboxForRestore sets the sandbox's operatingMode to Suspended (the
+// A2 kill path's stop: a PVC delete is held by kubernetes.io/pvc-protection
+// while the sandbox's pod still mounts the PVC — the operator must stop the
+// sandbox first and let the pod go before the PVC can be deleted). A missing
+// sandbox is a no-op (nothing to stop — the fork case and a Loop whose
+// sandbox was never built).
+func (r *LoopReconciler) stopSandboxForRestore(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	sb := &sandboxv1beta1.Sandbox{}
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
+	if err := r.Get(ctx, key, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get sandbox %s for the restore stop: %w", key, err)
+	}
+	if sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
+		return nil // already suspended
+	}
+	sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	if err := r.Update(ctx, sb); err != nil {
+		return fmt.Errorf("suspend sandbox %s for the restore: %w", key, err)
+	}
+	log.FromContext(ctx).Info("sandbox suspended for the workspace restore (pvc-protection holds a mounted PVC)", "sandbox", sandboxName(loop.Name), "loop", loop.Name)
+	return nil
+}
 
-// setRestoreCondition sets the Restore condition (the B2 durable record).
+// deleteWorkspacePVC deletes the Loop's workspace PVC (the level-based
+// restore's delete step). The delete is ASYNC (the apiserver removes the
+// object only after the finalizer work is done — on a real cluster the csi
+// driver releases the volume and the pvc-protection finalizer is removed
+// when no pod uses the PVC); the caller does NOT wait (the Reconcile must
+// never block on the PVC's delete — the reviewer's P1, the R-B2 review at
+// 20ef538). A NotFound is a success (the PVC was already gone).
+func (r *LoopReconciler) deleteWorkspacePVC(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	pvc := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}
+	if err := r.Get(ctx, key, pvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // already gone
+		}
+		return fmt.Errorf("read workspace PVC %s for the restore delete: %w", key, err)
+	}
+	if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete workspace PVC %s for the restore: %w", key, err)
+	}
+	log.FromContext(ctx).Info("workspace PVC deleted for the restore (the delete is async; the PVC is recreated from the snapshot once it is gone)",
+		"pvc", workspacePVCName(loop.Name), "loop", loop.Name)
+	return nil
+}
+
+// createWorkspacePVCFromSnapshot creates the Loop's workspace PVC with
+// spec.dataSource = the named VolumeSnapshot (the level-based restore's
+// create step — it runs only when the PVC is GONE, so the name is free).
+// AlreadyExists is a success (a concurrent pass created it; the content is
+// from the snapshot either way). The restored PVC is controller-owned by
+// the Loop (the same GC contract as the original PVC — a deleted Loop's
+// restored PVC is garbage-collected with it).
+func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loop *coxv1alpha1.Loop, snapshotName string) error {
+	newPVC := &corev1.PersistentVolumeClaim{}
+	newPVC.Spec = workspacePVCSpec(loop).Spec
+	newPVC.Name = workspacePVCName(loop.Name)
+	newPVC.Namespace = loop.Namespace
+	snapshotGroup := snapshotGroupRef
+	newPVC.Spec.DataSource = &corev1.TypedLocalObjectReference{
+		APIGroup: &snapshotGroup,
+		Kind:     volumeSnapshotKind,
+		Name:     snapshotName,
+	}
+	if err := controllerutil.SetControllerReference(loop, newPVC, r.Scheme); err != nil {
+		return fmt.Errorf("set owner on restored workspace PVC %s: %w", newPVC.Name, err)
+	}
+	if err := r.Create(ctx, newPVC); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil // a concurrent pass created it
+		}
+		return fmt.Errorf("create restored workspace PVC %s from snapshot %s: %w", newPVC.Name, snapshotName, err)
+	}
+	log.FromContext(ctx).Info("workspace PVC recreated from the checkpoint snapshot",
+		"pvc", newPVC.Name, "loop", loop.Name, "snapshot", snapshotName)
+	return nil
+}
+
+// setRestoreCondition sets the Restore condition (the B2 durable record)
+// with the condition's observedGeneration = the Loop's current generation
+// (the one-shot marker's re-arm check: a new spec.restoreFrom bumps the
+// generation and invalidates the stale marker).
 func setRestoreCondition(loop *coxv1alpha1.Loop, status bool, reason, message string) {
 	st := metav1.ConditionFalse
 	if status {
 		st = metav1.ConditionTrue
 	}
 	meta.SetStatusCondition(&loop.Status.Conditions, metav1.Condition{
-		Type:    coxv1alpha1.RestoreCondition,
-		Status:  st,
-		Reason:  reason,
-		Message: message,
+		Type:               coxv1alpha1.RestoreCondition,
+		Status:             st,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: loop.Generation,
 	})
 }
 
@@ -526,58 +446,297 @@ func (r *LoopReconciler) emitRestoreEvent(loop *coxv1alpha1.Loop, status bool, r
 	r.Recorder.Eventf(loop, typ, "Restore", "Restore=%t reason=%s: %s", status, reason, message)
 }
 
-// recreateWorkspacePVCEmpty recreates a LOST workspace PVC with an empty
-// spec (the A2 PVC-resume path — ensureWorkspacePVC creates it on NotFound;
-// this helper makes the fallback EXPLICIT so the spec can assert the
-// operator created it from the fallback path, not the bootstrap). It
-// re-uses ensureWorkspacePVC (the A2 path) — the idempotency is the same.
-func (r *LoopReconciler) recreateWorkspacePVCEmpty(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	return r.ensureWorkspacePVC(ctx, loop)
+// b2ApplyRestoreStep is the B2 restore step (the reviewer's P1, the R-B2
+// review at 20ef538): the level-based workspace restore (restore /
+// rollback / fork). It runs BEFORE phaseBootstrap in Reconcile. It:
+//
+//  1. computes the restore target (b2RestoreTarget — nil means no restore
+//     applies this reconcile),
+//  2. resolves the source snapshot (ready / notready / missing / error),
+//  3. on notready: DEFERS (Restore=False reason RestoreSourceNotReady +
+//     the Event; the requeue is the caller's 5s RequeueAfter — the
+//     in-progress state, no restore decision, I49),
+//  4. on error: requeues (no decision on a transient read failure),
+//  5. on missing: the kind decides — a rollback/fork is TERMINAL
+//     (Restore=False reason RestoreSourceMissing + the Event; no requeue —
+//     the object is gone); a lost-PVC restore falls back to the A2 path
+//     (recreate the PVC empty + Restore=False reason NoUsableCheckpoint +
+//     the Restore Event — I90: the fallback is VISIBLE),
+//  6. on ready: the PVC replacement, level-based:
+//     - the sandbox running -> STOP it (Suspended) + Restore=False reason
+//     StoppingSandbox (the PVC is held by pvc-protection while mounted —
+//     delete it only once the sandbox is stopped, like the A2 kill
+//     path);
+//     - the sandbox stopped and the PVC present -> DELETE the PVC +
+//     Restore=False reason DeletingPVC (a still-present PVC (a pending
+//     delete) does NOT re-trigger the delete);
+//     - the PVC gone -> CREATE it from the snapshot (AlreadyExists is a
+//     success) + Restore=True reason Restored (the one-shot marker).
+//
+// It returns (changed, requeue, err). changed is true when the condition
+// was (re)set this pass; requeue is true when a requeue is needed
+// (notready, error, or an in-progress stop/delete — the 5s RequeueAfter in
+// the caller's FINAL return); err is a real failure (the caller returns
+// it). The step persists the condition at the point of decision (the I90
+// write: a later step in the same reconcile failing must not lose the
+// decision — the Status().Update here is what survives it), and the
+// caller's finalizeLoopStatus skips the re-write when the step already
+// persisted.
+func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
+	// A fork whose restore is complete (the one-shot marker) has nothing
+	// left to do here EXCEPT remove its fork-retention label from the source
+	// snapshot (the source's GC is then free to delete it — the fork's PVC
+	// is self-sufficient). The step's target is nil for a completed fork
+	// (b2RestoreTarget returns nil once the marker is set and the PVC is
+	// present), so the removal is driven from here, before the target
+	// check (the label's absence is the source-side release; a failed
+	// removal is a no-op — the snapshot's persistence is a known B2
+	// limitation, documented in gcLoopCheckpoints).
+	if loop.Spec.ForkOf != nil {
+		if c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition); c != nil &&
+			c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.RestoreReasonRestored &&
+			c.ObservedGeneration >= loop.Generation && r.workspacePVCPresent(ctx, loop) {
+			r.removeForkRetentionLabel(ctx, loop)
+		}
+	}
+	target := r.b2RestoreTarget(ctx, loop)
+	if target == nil {
+		return false, false, nil // no restore applies this reconcile
+	}
+	// persist is the I90 write (the reviewer's guidance, R-B2): the
+	// condition is already set on `loop` by the time it is called, so
+	// persisting it HERE (at the point of decision) makes the decision
+	// durable even when a later step in the same reconcile fails (e.g.
+	// ensureSandbox). The Event is emitted immediately (the transient
+	// signal fires at the point of decision, before any later failure can
+	// hide it).
+	persist := func() {
+		if err := r.Status().Update(ctx, loop); err != nil {
+			log.FromContext(ctx).Error(err, "the restore decision could not be persisted; it is retried on the next reconcile",
+				"loop", loop.Name)
+		}
+	}
+	snap, decision := r.resolveCheckpointSource(ctx, loop.Namespace, target.loopName, target.iteration)
+	switch decision {
+	case b2SourceReady:
+		if loop.Spec.ForkOf != nil || target.kind == b2KindLostPVC {
+			// A fork (a fresh Loop — the PVC is absent, the sandbox does not
+			// exist) and a lost-PVC restore (the PVC is already gone) go
+			// straight to the create.
+			if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
+				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())
+				persist()
+				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
+					"workspace PVC restore from "+target.snapshot+" failed; retrying")
+				return true, true, nil
+			}
+			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
+				"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
+			// B2 FORK-RETENTION: a fork that has just restored its PVC claims
+			// the release on the source's snapshot (the fork-retention label:
+			// while present, the source's GC skips it — see
+			// forkRetainedSnapshotLabelKey). A rollback or a lost-PVC restore
+			// does NOT touch the label (it restores from the Loop's OWN
+			// snapshot; the source's GC is unaffected).
+			if target.kind == b2KindFork {
+				r.markForkRetentionLabel(ctx, loop, target.snapshot)
+			}
+			persist()
+			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
+				"workspace PVC restored from "+target.snapshot)
+			return true, false, nil
+		}
+		// The ROLLBACK (an explicit restoreFrom on a running Loop): the PVC
+		// is present and the sandbox may hold it mounted (pvc-protection).
+		if !r.workspacePVCPresent(ctx, loop) {
+			// A rollback whose PVC is already gone (a previous pass deleted it,
+			// the delete has completed): skip to the create (the delete is done,
+			// the PVC is recreated from the snapshot).
+			if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
+				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+") failed: "+err.Error())
+				persist()
+				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
+					"workspace PVC restore from "+target.snapshot+" failed; retrying")
+				return true, true, nil
+			}
+			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
+				"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
+			persist()
+			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
+				"workspace PVC restored from "+target.snapshot)
+			return true, false, nil
+		}
+		running, err := r.sandboxRunning(ctx, loop)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "the restore could not read the sandbox's operating mode; no decision on a transient read failure",
+				"loop", loop.Name)
+			return false, true, nil
+		}
+		if running {
+			// Step 1: STOP the sandbox (the A2 kill path's stop). The PVC is
+			// NOT deleted yet (a delete of a still-mounted PVC would not
+			// complete — pvc-protection holds it until the pod is gone).
+			if err := r.stopSandboxForRestore(ctx, loop); err != nil {
+				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+					"stopping the sandbox before the rollback restore of "+target.snapshot+" failed: "+err.Error())
+				persist()
+				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
+					"sandbox stop for the rollback restore failed; retrying")
+				return true, true, nil
+			}
+			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
+				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the sandbox is stopped (step 1 of 3; the PVC is deleted once the sandbox is gone)")
+			persist()
+			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
+				"restoring the workspace PVC from "+target.snapshot+": the sandbox is stopped (step 1 of 3)")
+			return true, true, nil
+		}
+		// The sandbox is stopped. The PVC is present (checked above):
+		// DELETE it (the A2 kill path's delete). The delete is async
+		// (pvc-protection releases it once the pod is gone; the apiserver
+		// sets the deletionTimestamp immediately).
+		if err := r.deleteWorkspacePVC(ctx, loop); err != nil {
+			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+				"deleting the workspace PVC for the rollback restore from "+target.snapshot+" failed: "+err.Error())
+			persist()
+			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
+				"workspace PVC delete for the rollback restore failed; retrying")
+			return true, true, nil
+		}
+		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the PVC is deleted (step 2 of 3; the PVC is recreated from the snapshot once the delete completes)")
+		persist()
+		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+			"restoring the workspace PVC from "+target.snapshot+": the PVC is deleted (step 2 of 3)")
+		return true, true, nil
+	case b2SourceNotReady:
+		// DEFER: the snapshot exists but is not ReadyToUse (the in-progress
+		// state — no restore decision, I49). The condition names it; the
+		// requeue retries (the 5s RequeueAfter in the caller's final return).
+		_ = snap
+		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
+			"checkpoint "+target.snapshot+" ("+string(target.kind)+") exists but is not ReadyToUse yet; the restore is deferred")
+		persist()
+		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
+			"checkpoint "+target.snapshot+" not ReadyToUse yet; restore deferred")
+		return true, true, nil
+	case b2SourceMissing:
+		switch target.kind {
+		case b2KindRollback, b2KindFork:
+			// TERMINAL: the explicit target is gone. The condition names it;
+			// NO requeue (the object will not come back — the source Loop's
+			// GC deleted it, or it was never taken).
+			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
+				"checkpoint "+target.snapshot+" ("+string(target.kind)+") does not exist (it was never taken, or it was GC'd); the restore is rejected")
+			persist()
+			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
+				"checkpoint "+target.snapshot+" does not exist; restore rejected")
+			return true, false, nil
+		default: // b2KindLostPVC
+			// The A2 fallback: the PVC is lost and the (latest) checkpoint
+			// is gone. Recreate the PVC EMPTY (the A2 PVC-resume — the
+			// content is lost, the Loop continues from the untouched base)
+			// and surface the fallback (I90: VISIBLE).
+			if err := r.ensureWorkspacePVC(ctx, loop); err != nil {
+				return false, true, fmt.Errorf("A2 fallback: recreate workspace PVC empty: %w", err)
+			}
+			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
+				"the workspace PVC was lost and checkpoint "+target.snapshot+" does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)")
+			persist()
+			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
+				"workspace PVC lost, no usable checkpoint; A2 fallback (empty workspace)")
+			return true, false, nil
+		}
+	case b2SourceError:
+		// A transient read failure: no decision, requeue.
+		log.FromContext(ctx).V(1).Info("restore: reading the checkpoint snapshot failed; requeueing (no decision on a transient read failure)",
+			"snapshot", target.snapshot, "kind", string(target.kind))
+		return false, true, nil
+	}
+	return false, false, nil
 }
 
-// removeForkRetentionLabel removes the fork-of label from the source's
-// checkpoint snapshot (B2 fork-retention: the fork has completed its
-// restore, and the source's snapshot is no longer needed). It is a
-// best-effort action (the label removal is the fork's responsibility; a
-// failure to remove the label does NOT break the fork — the fork's PVC is
-// self-sufficient — but the source's GC will not delete the snapshot until
-// the label is removed, so the label's persistence is a known B2
-// limitation, documented in gcLoopCheckpoints). It is a no-op when the
-// snapshot is absent (the source's GC already deleted it, or the label was
-// already removed). The label write is the fork's operator action (the
-// operator is the sole writer of its own objects' labels — the fork's
-// operator, not the source's, writes the label onto the source's snapshot
-// at fork creation, and removes it here at fork restore completion).
-func (r *LoopReconciler) removeForkRetentionLabel(ctx context.Context, fork *coxv1alpha1.Loop, sourceLoopName, snapshotName string) {
+// forkRetainedSnapshotLabelKey is the label key the fork's operator writes
+// onto the source Loop's checkpoint snapshot (the value is the fork's Loop
+// name). See the interaction documentation at the top of this file (the
+// step's comment block above b2ApplyRestoreStep covers the decided
+// interaction with the source's retention and finalizer).
+const forkRetainedSnapshotLabelKey = "coxswain.wattu.com/fork-of"
+
+// forkSnapshotLabelKey is the label key on the source snapshot (the same as
+// forkRetainedSnapshotLabelKey; a separate name for the reader's clarity —
+// the label KEY is shared, the VALUE is the fork's name).
+const forkSnapshotLabelKey = forkRetainedSnapshotLabelKey
+
+// markForkRetentionLabel sets the fork-retention label on the source's
+// checkpoint snapshot (the fork's PVC restore just created the fork's PVC
+// from this snapshot; while the label is present the source's GC skips the
+// snapshot — the safety net for the race in which the source's GC runs
+// between the fork's snapshot read and the fork's PVC create). Best-effort:
+// a failed label write does NOT break the fork (the fork's PVC create has
+// already been accepted — the content is the csi driver's to materialise,
+// not the snapshot's to keep serving); the label's persistence is a known
+// B2 limitation (a snapshot the source's GC skips forever), documented in
+// gcLoopCheckpoints.
+func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1alpha1.Loop, snapshotName string) {
 	if !r.snapshotCRDPresentCall(ctx) {
-		return // no CRD: the snapshot is not present (the fork's restore is
-		// complete, so the snapshot must have been present at restore time;
-		// a CRD absence now is a no-op — the label was never set)
+		return // no CRD: the snapshot is not present
 	}
 	snap := &unstructured.Unstructured{Object: map[string]any{unstructuredAPI: snapshotGV, unstructuredKind: volumeSnapshotKind}}
 	snap.SetGroupVersionKind(volumeSnapshotGVK)
 	key := types.NamespacedName{Namespace: fork.Namespace, Name: snapshotName}
 	if err := r.Get(ctx, key, snap); err != nil {
-		return // the snapshot is absent (a no-op: the label was never set, or
-		// the source's GC already deleted it)
+		log.FromContext(ctx).V(1).Info("fork: the source snapshot is absent; the fork-retention label could not be set (best-effort)",
+			"snapshot", snapshotName, "fork", fork.Name)
+		return
+	}
+	labels := snap.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[forkSnapshotLabelKey] = fork.Name
+	snap.SetLabels(labels)
+	if err := r.Update(ctx, snap); err != nil {
+		log.FromContext(ctx).V(1).Info("fork: setting the fork-retention label on the source's snapshot failed; the label persists (a known B2 limitation; the fork's PVC is self-sufficient)",
+			"snapshot", snapshotName, "fork", fork.Name, "err", err.Error())
+	}
+}
+
+// removeForkRetentionLabel removes the fork-retention label from the source
+// Loop's checkpoint snapshot (the fork's restore is complete — the fork's
+// PVC owns its content — so the source's GC is free to delete the snapshot).
+// The source snapshot's name is derived from the fork's spec.forkOf (the
+// checkpoint naming is deterministic: checkpoint-<source>-iter-<N>).
+// Best-effort: a failure is logged and the label persists (a known B2
+// limitation — the source's GC skips a labelled snapshot, so a failed
+// removal orphans the snapshot; the data is in the fork's PVC, which the
+// fork's own GC deletes).
+func (r *LoopReconciler) removeForkRetentionLabel(ctx context.Context, fork *coxv1alpha1.Loop) {
+	if !r.snapshotCRDPresentCall(ctx) {
+		return
+	}
+	src := fork.Spec.ForkOf
+	snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: src.Loop}}, src.Iteration)
+	snap := &unstructured.Unstructured{Object: map[string]any{unstructuredAPI: snapshotGV, unstructuredKind: volumeSnapshotKind}}
+	snap.SetGroupVersionKind(volumeSnapshotGVK)
+	key := types.NamespacedName{Namespace: fork.Namespace, Name: snapName}
+	if err := r.Get(ctx, key, snap); err != nil {
+		return // the snapshot is absent (already GC'd — a no-op)
 	}
 	labels := snap.GetLabels()
 	if labels == nil {
 		return // no labels: the label was never set (a no-op)
 	}
-	if _, ok := labels["coxswain.wattu.com/fork-of"]; !ok {
+	if _, ok := labels[forkSnapshotLabelKey]; !ok {
 		return // the label is absent (a no-op: it was never set, or it was
 		// already removed)
 	}
-	delete(labels, "coxswain.wattu.com/fork-of")
+	delete(labels, forkSnapshotLabelKey)
 	snap.SetLabels(labels)
 	if err := r.Update(ctx, snap); err != nil {
-		// A label-removal failure is a no-op (the fork's PVC is
-		// self-sufficient; the label's persistence is a known B2
-		// limitation, documented in gcLoopCheckpoints). Log it (the spec
-		// asserts the label's absence after a successful removal; a failure
-		// here means the label persists, and the spec will catch it).
-		log.FromContext(ctx).V(1).Info("fork: removing the fork-of label from the source's snapshot failed; the label persists (a known B2 limitation; the fork's PVC is self-sufficient)",
-			"snapshot", snapshotName, "sourceLoop", sourceLoopName, "err", err.Error())
+		log.FromContext(ctx).V(1).Info("fork: removing the fork-retention label from the source's snapshot failed; the label persists (a known B2 limitation; the fork's PVC is self-sufficient)",
+			"snapshot", snapName, "fork", fork.Name, "err", err.Error())
 	}
 }

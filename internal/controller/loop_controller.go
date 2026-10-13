@@ -146,6 +146,17 @@ type LoopReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// RESTMapper is the manager's dynamic RESTMapper (SetupWithManager wires
+	// mgr.GetRESTMapper()). It is the source of truth for "is the CRD for
+	// this type installed?" (I88): the VolumeSnapshot watch is registered
+	// ONLY if it resolves volumeSnapshotGVK at setup, and the reconcile-side
+	// snapshot reads (ensureCheckpoint / the GC) are gated on the same check
+	// so a CRD-less cluster's manager cache is never asked to watch the
+	// absent type (a List on it would wedge the cache). nil (a bare test
+	// reconciler without SetupWithManager) is treated as PRESENT (the test
+	// envtest has the CRD; the no-CRD spec overrides snapshotCRDPresent).
+	RESTMapper meta.RESTMapper
+
 	// apiReader is the operator's non-cached client (mgr.GetAPIReader()), used
 	// for the baseCommit read-back (S3a): the sandbox pod is not in the
 	// manager's Pod cache (the cache is scoped to ProxyComponentSelector), so
@@ -203,6 +214,25 @@ type LoopReconciler struct {
 	// client-go's record.EventRecorder so the manager's GetEventRecorderFor and
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
+
+	// workspaceDriverSeam is the B1 checkpoint seam: it resolves the
+	// workspace PVC's CSI driver for the VolumeSnapshotClass support check.
+	// When set (a test drives it directly without a real StorageClass — the
+	// workspace PVC is created with a nil storageClassName, so the live
+	// resolver defers to the default StorageClass, which a test does not
+	// want to read), the operator uses it instead of the live read. nil
+	// (production, most tests) uses the live read.
+	workspaceDriverSeam func(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool)
+
+	// snapshotCRDPresent is the B1 checkpoint seam: it reports whether the
+	// VolumeSnapshot CRD is resolvable (the I88 gate for the watch + the
+	// reconcile-side reads). It is a FUNCTION FIELD (not a method) so a test
+	// can override it (the no-CRD spec sets it to return false without
+	// wiring a RESTMapper that does not resolve the GVK). nil (production,
+	// most tests) reads r.RESTMapper (a nil mapper — a bare test reconciler
+	// without SetupWithManager — is treated as PRESENT, because the test
+	// envtest has the CRD).
+	snapshotCRDPresent func(ctx context.Context) bool
 
 	// lastDeliverDescriptionEnsureErr is the last non-nil error returned by
 	// ensureDeliverDescriptionConfig on this reconciler (the R27/P1 race fix
@@ -359,7 +389,7 @@ type LoopReconciler struct {
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update
 // A1 (D52): the static enforcement check reads Nodes (BPF-LSM label) and
 // agent Pods (Ready condition) directly from the API server (APIReader).
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
@@ -373,6 +403,19 @@ type LoopReconciler struct {
 // exit-code reader; the Job runs the operator's trusted check containers, not
 // agent code).
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch;delete
+// B1 (D59): the operator creates the per-Loop checkpoint VolumeSnapshot after
+// each successful verify (ensureCheckpoint) and deletes them in CleaningUp
+// (the finalizer's GC). I86: the manager's CACHE reads VolumeSnapshots
+// (ensureCheckpoint's AlreadyExists re-read, applyCheckpointRetention's list
+// and delete, gcLoopCheckpoints' label list) — the cache lazily watches a
+// type the first time the cached client reads it, so the marker needs
+// get;list;watch in addition to create;delete (a create-only marker wedges a
+// fresh install on the first cached read, exactly like the A6 configmaps P1).
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
+// The checkpoint support check reads the workspace PVC's StorageClass (the
+// CSI driver) to find the matching VolumeSnapshotClass.
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // A4 (R26): the operator owns the deliver description ConfigMap
 // (ensureDeliverDescriptionConfig / cleanupDeliverDescriptionConfig — the facts
 // body the push container reads to assemble the draft PR description). Only
@@ -517,6 +560,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// B1 (finalizer): a Loop being deleted (deletionTimestamp set) is in
+	// CleaningUp — its work is the checkpoint GC (delete the Loop's
+	// VolumeSnapshots). The finalizer holds the Loop until the GC is done
+	// (gcLoopCheckpoints returns done when none remain; the finalizer is
+	// removed then so the apiserver can delete the object). Nothing else runs
+	// for a deleting Loop (the sandbox is already gone by the time the Loop
+	// delete is processed — the sandbox is owned by the Loop and the operator
+	// deletes it explicitly when the Loop is cleaned up; the snapshot GC is
+	// the last thing the Loop owns).
+	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
+	// on the first reconcile; idempotent). It is what keeps the Loop alive
+	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
+	if done, res, err := r.reconcileDeletionAndFinalizer(ctx, &loop); done || err != nil {
+		return res, err
+	}
+
 	// C6a + D34: validate the referenced AgentPolicies and the
 	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
 	// the Reconcile within the gocyclo budget).
@@ -543,19 +602,35 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
 	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
 	// budget).
-	changed, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
+	changed := false
+	_, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
+	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
+	// and the Required gate. The gate fails the Loop (terminal
+	// Failed:CheckpointUnavailable) at start — before any phase work — when
+	// spec.checkpoints=Required and the snapshot support is absent (no
+	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI
+	// driver). The condition is set on every reconcile (the support may
+	// change: the CRD or a VolumeSnapshotClass can be installed later), but
+	// the gate fires only once (a Failed Loop is terminal and nothing reverts
+	// it). When the gate fires, stop this reconcile (the status write
+	// persists the terminal phase; no sandbox / proxy / verify work runs for a
+	// Loop that cannot be checkpointed).
+	if cpChanged, done, err := r.applyCheckpointGate(ctx, &loop); done || err != nil {
+		return ctrl.Result{}, err
+	} else {
+		changed = changed || cpChanged
+	}
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	changed = changed || policiesChanged
-	if loop.Status.ObservedGeneration != loop.Generation {
-		loop.Status.ObservedGeneration = loop.Generation
+	if r.ensureObservedGeneration(&loop) {
 		changed = true
 	}
 	// S4 (ADR-0004): read the runner's claim from the agent container's
@@ -593,21 +668,25 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// no iterate/stall/budget decision because the phase is Paused, not
 	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
 	verifyRequeue := false
-	if !loopPaused(&loop) {
-		if err := r.ensureVerifyJob(ctx, &loop); err != nil {
-			if errors.Is(err, errVerifyStaleDeleted) {
-				verifyRequeue = true
-			} else {
-				return ctrl.Result{}, err
-			}
+	if err := r.ensureVerifyJobAndNetPolicies(ctx, &loop); err != nil {
+		if errors.Is(err, errVerifyStaleDeleted) {
+			verifyRequeue = true
+		} else {
+			return ctrl.Result{}, err
 		}
-	}
-	if err := r.ensureVerifyNetworkPolicy(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
 	}
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
+	// B1: take the workspace checkpoint and apply retention. The checkpoint
+	// step runs on every reconcile (level-based); the idempotency guard in
+	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
+	// The checkpoint is keyed off the operator-recorded verify outcome
+	// (status.verify.iteration), not the current iteration.
+	if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop); cpChanged || cpRequeue {
+		changed = changed || cpChanged
+		verifyRequeue = verifyRequeue || cpRequeue
+	}
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a
 	// pinned verifiedCommit. The stale-Job guard (D27) deletes a Job stamped
@@ -644,9 +723,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if hashChanged {
-		changed = true
-	}
+	changed = changed || hashChanged
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
 	// container's termination message (read via the operator's own APIReader
 	// path — NOT a cached client, NOT a kubelet ReadFile) carries the resolved
@@ -695,19 +772,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// P2d item 10: the wall-clock RequeueAfter (the quiet-Loop rule) is the
-	// ONLY timer this reconcile sets: when spec.budget.maxWallClock is set and
-	// not yet hit, a Loop with no other activity (no baseCommit/claim/verify/
-	// deliver requeue) re-reconciles at the remaining time so the wall clock
-	// still trips. The pending flags are 5s timers; the wall clock is exact.
-	if !r.baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	if budgetRequeue > 0 {
-		return ctrl.Result{RequeueAfter: budgetRequeue}, nil
-	}
-	return ctrl.Result{}, nil
+	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue), nil
 }
 
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
@@ -4879,9 +4944,24 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		b = b.Watches(kaptWatch, handler.EnqueueRequestsFromMapFunc(
 			r.kubeArmorPolicyToLoopRequests))
 	}
-	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
-	// change enqueues every Loop so it re-reads the cached result and re-gates.
-	// Skipped when nil (envtest: the result is read on each reconcile anyway).
+	// D59/B1: watch the per-Loop checkpoint VolumeSnapshots so a snapshot
+	// state change (the snapshot controller marking it ready, or a delete
+	// completing) re-reconciles the Loop that owns it (the finalizer's GC
+	// and the retention GC both re-read on the next reconcile). Like the
+	// KubeArmorPolicy watch, it is registered ONLY if the RESTMapper
+	// resolves the CRD at setup (I88): on a cluster without the snapshot CRD
+	// the kind is absent and an unconditional watch makes the manager fail
+	// to start. The map is by the coxswain.wattu.com/loop label (the
+	// operator's own label on the snapshot object — a foreign or unrelated
+	// snapshot maps to nothing).
+	if _, snapMapErr := mgr.GetRESTMapper().RESTMapping(volumeSnapshotGVK.GroupKind()); snapMapErr != nil {
+		logf.Log.Info("VolumeSnapshot CRD not present (RESTMapper does not resolve snapshot.storage.k8s.io/v1/VolumeSnapshot): the per-Loop checkpoint watch is not registered. Checkpoints are not taken (the CheckpointsAvailable condition is False, reason VolumeSnapshotCRDMissing; D59 BestEffort carries on with the A2 PVC-resume, Required fails at start).")
+	} else {
+		snapWatch := &unstructured.Unstructured{}
+		snapWatch.SetGroupVersionKind(volumeSnapshotGVK)
+		b = b.Watches(snapWatch, handler.EnqueueRequestsFromMapFunc(
+			r.volumeSnapshotToLoopRequests))
+	}
 	// D38: watch the CNI probe re-gate source (design point 3a). A probe result
 	// change enqueues every Loop so it re-reads the cached result and re-gates.
 	// Skipped when nil (envtest: the result is read on each reconcile anyway).
@@ -4890,6 +4970,27 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return b.Named("loop").
 		Complete(r)
+}
+
+// volumeSnapshotToLoopRequests maps a checkpoint VolumeSnapshot to the Loop
+// that owns it (B1), by the operator's coxswain.wattu.com/loop label. A
+// snapshot without the label (a foreign or unrelated snapshot) maps to
+// nothing.
+func (r *LoopReconciler) volumeSnapshotToLoopRequests(_ context.Context, obj client.Object) []reconcile.Request {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil
+	}
+	loopName, ok := u.GetLabels()["coxswain.wattu.com/loop"]
+	if !ok || loopName == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: u.GetNamespace(),
+			Name:      loopName,
+		},
+	}}
 }
 
 // agentPolicyToLoopRequests maps an AgentPolicy to the Loops in its namespace
@@ -5182,4 +5283,60 @@ func isNonCanonicalPath(p string) bool {
 		return true
 	}
 	return false
+}
+
+// ensureVerifyJobIfActive is the ensureVerifyJob call gated on phase !=
+// Paused, extracted to keep Reconcile within the gocyclo budget.
+func (r *LoopReconciler) ensureVerifyJobIfActive(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if loopPaused(loop) {
+		return nil
+	}
+	return r.ensureVerifyJob(ctx, loop)
+}
+
+// ensureObservedGeneration sets loop.Status.ObservedGeneration to
+// loop.Generation when they differ, returning whether it changed.
+func (r *LoopReconciler) ensureObservedGeneration(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.ObservedGeneration != loop.Generation {
+		loop.Status.ObservedGeneration = loop.Generation
+		return true
+	}
+	return false
+}
+
+// reconcileDeletionAndFinalizer handles the deletion branch (CleaningUp) and
+// the finalizer application. Returns (done, result, err): done is true when
+// the caller should return the result (deletion or error).
+func (r *LoopReconciler) reconcileDeletionAndFinalizer(ctx context.Context, loop *coxv1alpha1.Loop) (bool, ctrl.Result, error) {
+	if !loop.DeletionTimestamp.IsZero() {
+		res, err := r.reconcileCleaningUp(ctx, loop)
+		return true, res, err
+	}
+	if err := r.applyLoopFinalizer(ctx, loop); err != nil {
+		return true, ctrl.Result{}, err
+	}
+	return false, ctrl.Result{}, nil
+}
+
+// ensureVerifyJobAndNetPolicies is the ensureVerifyJobIfActive +
+// ensureVerifyNetworkPolicy pair, extracted to keep Reconcile within the
+// gocyclo budget.
+func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if err := r.ensureVerifyJobIfActive(ctx, loop); err != nil {
+		return err
+	}
+	return r.ensureVerifyNetworkPolicy(ctx, loop)
+}
+
+// reconcileRequeueAfter is the trailing requeue decision, extracted to keep
+// Reconcile within the gocyclo budget. P2d item 10: the wall-clock
+// RequeueAfter (the quiet-Loop rule) is the ONLY timer this reconcile sets.
+func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue time.Duration) ctrl.Result {
+	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+	if budgetRequeue > 0 {
+		return ctrl.Result{RequeueAfter: budgetRequeue}
+	}
+	return ctrl.Result{}
 }

@@ -39,6 +39,7 @@ rules:
   - create
   - get
   - list
+  - update
   - watch
 - apiGroups:
   - agents.x-k8s.io
@@ -125,4 +126,30 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshotclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshots
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
+  - get
+  - list
   - watch

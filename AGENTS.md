@@ -273,6 +273,19 @@ make test       # Run unit tests
   — `pgrep -x` matches every process with that exact name, which can be an
   unrelated process of the same name (the builder's own agent, a system
   service), so the kill can hit the wrong process.
+- **Every RBAC rule the new code needs must be exercised on kind, not only
+  envtest** (B1 storageclasses P1). envtest runs as cluster-admin, so a missing
+  rule OR a rule under the wrong API group is invisible there. A marker that
+  names the wrong group (e.g. `groups=""` for `storageclasses`, which lives in
+  `storage.k8s.io`) passes envtest but wedges a fresh kind install (129x
+  `failed to list ... forbidden`, and a Loop delete can hang on the checkpoint
+  finalizer). Before marking a slice ready: (a) the RBAC coverage test must
+  check each resource's group against a trusted table (not just the presence of
+  a rule for the resource), so a wrong group fails the test; (b) deploy to a kind
+  cluster and confirm `kubectl auth can-i <verb> <resource> --as=<the
+  operator's ServiceAccount>` returns yes for every rule the new code reads,
+  and that the operator log has **zero** `forbidden` errors after a Loop
+  lifecycle (create + delete) that exercises the new reads. Show both in the PR.
 
 ## CLI Commands Cheat Sheet
 

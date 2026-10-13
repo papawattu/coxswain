@@ -215,10 +215,10 @@ func verifyJobName(loop *coxv1alpha1.Loop) string {
 // is the "coxswain.io/verify-for" label.
 func verifyJobLabels(loopName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/part-of":    partOfCoxswain,
-		verifyLoopLabel:                loopName,
-		verifyForLabel:                 loopName,
-		"app.kubernetes.io/managed-by": "coxswain-controller",
+		"app.kubernetes.io/part-of": partOfCoxswain,
+		verifyLoopLabel:             loopName,
+		verifyForLabel:              loopName,
+		managedByLabel:              "coxswain-controller",
 	}
 }
 
@@ -1081,6 +1081,47 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount, jobFailed)
 	if requeue {
 		return false, true
+	}
+	// Record the completed verify outcome in status.verify (the operator's
+	// own record of the verify result). The checkpoint step keys off this
+	// record (status.verify.iteration) to ensure the checkpoint for the
+	// completed verify is taken (level-based: retried on every reconcile if
+	// the checkpoint is not yet recorded). The Milestone flag is derived from
+	// lastCheckResults (all exit codes are 0 = the verify passed).
+	if loop.Status.Verify == nil {
+		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
+	}
+	iter := int32(loop.Status.Iteration)
+	loop.Status.Verify.Iteration = &iter
+	// Record the check exit codes (one per acceptance check, in order).
+	// A check that did not run (the pod status lacks it) is recorded as nil.
+	if pod != nil {
+		results := make([]*int32, checkCount)
+		for i := range checkCount {
+			name := fmt.Sprintf("check-%d", i)
+			found := false
+			for j := range pod.Status.InitContainerStatuses {
+				if pod.Status.InitContainerStatuses[j].Name == name {
+					if pod.Status.InitContainerStatuses[j].State.Terminated != nil {
+						code := pod.Status.InitContainerStatuses[j].State.Terminated.ExitCode
+						results[i] = &code
+					} else {
+						// The check is still running (not terminated): record -1
+						// as a sentinel (the API server rejects nil).
+						notRun := int32(-1)
+						results[i] = &notRun
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				// The check did not run: record -1 as a sentinel.
+				notRun := int32(-1)
+				results[i] = &notRun
+			}
+		}
+		loop.Status.Verify.LastCheckResults = results
 	}
 	switch outcome {
 	case verifySucceeded:

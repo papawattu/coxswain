@@ -365,6 +365,50 @@ func s5aVerifyInitStatuses(artifact corev1.ContainerState, checkExits []int32) [
 	return inits
 }
 
+// s5aVerifyPodInProg creates a verify pod whose trusted inits, tamper and
+// artifact are all terminated (exit 0) but check-0 is still Running (not
+// terminated) — the verify is IN PROGRESS (the outcome is not yet recorded).
+// It is the I49 in-progress stand-in: the operator must not make a decision
+// (no checkpoint) while the verify is still running.
+func s5aVerifyPodInProg(ctx context.Context, ns, name, jobName string) {
+	job := &batchv1.Job{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+		job = &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      jobName,
+				Namespace: ns,
+				Labels:    verifyJobLabels(name),
+			},
+		}
+		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + "-verify-pod",
+			Namespace: ns,
+			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(),
+				Kind:       i65JobKind,
+				Name:       jobName,
+				UID:        job.UID,
+			}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	// Trusted inits + tamper + artifact terminated (exit 0); check-0 still
+	// Running (Terminated == nil).
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aArtifact, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aCheck0, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
 var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 	ctx := context.Background()
 
@@ -1782,3 +1826,33 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			"no verify-2: a re-pin from the stale claim would create it")
 	})
 })
+
+// s5aDriveToVerifyingWithReconciler is the s5aDriveToVerifying variant that
+// uses the SPEC's reconciler (so the driver seam and CRD seam are active on
+// every reconcile, not just the final one). It drives a fresh Loop to
+// Verifying via the claim path (bootstrap -> Planning -> Implementing with
+// the headCommit). The spec must create the Loop before calling this.
+func s5aDriveToVerifyingWithReconciler(r *LoopReconciler, ns, name string) {
+	ctx := context.Background()
+	// A stand-in sandbox object (envtest has no agent-sandbox controller).
+	ensure := func() { s5aEnsureSandbox(ns, name) }
+	ensure()
+	// Bootstrap: Pending -> Planning on the first reconcile.
+	s5aReconcile(r, ns, name)
+	// Pin status.baseCommit (the tamper diff needs it; the verify Job's
+	// clone-base fetches both baseCommit and verifiedCommit).
+	loop := &coxv1alpha1.Loop{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+	loop.Status.BaseCommit = s5aBaseCommit
+	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+	// Planning claim (the runner executed Planning).
+	s5aClaimPod(ns, name, "Planning", "")
+	s5aReconcile(r, ns, name)
+	// The operator's annotation-based recycle deleted the Sandbox on the
+	// advance; re-ensure it before the next claim.
+	ensure()
+	// Implementing claim WITH the headCommit (the operator pins it on the
+	// Implementing -> Verifying advance).
+	s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
+	s5aReconcile(r, ns, name)
+}

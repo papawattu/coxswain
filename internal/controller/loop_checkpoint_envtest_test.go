@@ -333,7 +333,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(loop.Status.Checkpoints).To(HaveLen(1), "the re-reconcile must not append a duplicate status entry")
 	})
 
-	It("creates the checkpoint for a recorded verify on a LATER reconcile when the first create failed (requeue then create; the named mutation — first create fails and the loop requeues — must fail against the older commit)", func() {
+	It("takes the checkpoint on a LATER reconcile when the first create failed (the interceptor fails the FIRST VolumeSnapshot Create; no checkpoint is recorded, CheckpointsAvailable=False CreateFailed, requeue; a later reconcile with the normal client creates iter-0; level-based, not edge-triggered)", func() {
 		ns := "b1-retry-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -342,54 +342,130 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		b1CreateVSC()
 
 		name := "retryloop"
-		spec := b1LoopSpec()
-		spec.Loop.MaxIterations = 9
-		stall := int32(100)
-		spec.Loop.StallAfter = &stall
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       spec,
+			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
+		// The first checkpoint create is made to fail by a WRAPPING client:
+		// the first Create whose object is a VolumeSnapshot returns an
+		// injected (non-AlreadyExists) error; every other call passes through
+		// to the real client. The reconciler uses the wrapped client, so
+		// ensureCheckpoint's r.Create gets the real error — the CreateFailed
+		// path (condition False + requeue).
+		wrapped := B1CreateFailClient(k8sClient, 1)
 		r := b1NewReconciler(true, false)
-		// Simulate the first checkpoint create failing (e.g. a transient API
-		// server error). The operator requeues (the RequeueAfter path), and
-		// the NEXT reconcile (a later pass) creates the checkpoint for the
-		// already-recorded verify. This is the same-Loop update spec (I43):
-		// the operator UPDATES the object on requeue, not just creates it on
-		// first pass.
-		//
-		// The spec drives the Loop to a successful verify (iteration 0),
-		// then simulates the first checkpoint create failing by NOT creating
-		// the snapshot object on the first reconcile. The second reconcile
-		// (a later pass) creates the snapshot. The spec asserts the snapshot
-		// is created on the second reconcile (not the first).
+		r.Client = wrapped
+		r.apiReader = wrapped
+
 		s5aDriveToVerifyingWithReconciler(r, ns, name)
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 		s5aVerifyPod(ctx, ns, name, jobName, 0)
 
-		// First reconcile: the verify outcome is applied (verifyChanged is
-		// true), and the checkpoint step attempts to create the snapshot.
-		// The spec simulates the first create failing by NOT asserting the
-		// snapshot exists yet (the operator's create is a no-op if the
-		// object already exists, so the spec must not pre-create it).
-		b1Reconcile(r, ns, name)
-		// The snapshot is created on the first reconcile (the operator's
-		// ensureCheckpoint creates it when absent). The spec asserts it
-		// exists (the create succeeded on the first pass).
-		Expect(b1SnapshotExists(ctx, ns, "checkpoint-"+name+"-iter-0")).To(BeTrue(), "the checkpoint is created on the first reconcile (the create succeeded)")
-
-		// Second reconcile (a later pass): the operator does NOT re-create
-		// the snapshot (the status already records the iteration, so
-		// ensureCheckpoint's guard returns early). The spec asserts the
-		// snapshot still exists (the requeue did not delete it).
-		b1Reconcile(r, ns, name)
-		Expect(b1SnapshotExists(ctx, ns, "checkpoint-"+name+"-iter-0")).To(BeTrue(), "the checkpoint still exists after the second reconcile (the requeue did not delete it)")
-
-		// The status is UNCHANGED by the second reconcile (no duplicate entry).
+		By("the first checkpoint reconcile: the create fails (injected), so no snapshot object, no status record, CheckpointsAvailable=False CreateFailed, and a requeue")
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).NotTo(BeZero(), "a checkpoint create failure requeues (the retry is level-based, not edge-triggered)")
+		Expect(b1SnapshotExists(ctx, ns, "checkpoint-"+name+"-iter-0")).To(BeFalse(), "the failed create left no snapshot object")
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		Expect(loop.Status.Checkpoints).To(HaveLen(1), "no duplicate status entry after the requeue")
+		Expect(loop.Status.Verify).NotTo(BeNil(), "the verify outcome IS recorded (the checkpoint retry keys off it)")
+		Expect(loop.Status.Checkpoints).To(BeEmpty(), "no checkpoint is recorded when the create fails")
+		c := b1CheckpointCondition(loop)
+		Expect(c).NotTo(BeNil(), "the failure is surfaced (a VISIBLE fallback, I90)")
+		Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c.Reason).To(Equal(CheckpointReasonCreateFailed))
+
+		By("a later reconcile (no verify change; the normal client) creates checkpoint-<loop>-iter-0")
+		rNormal := b1NewReconciler(true, false)
+		b1Reconcile(rNormal, ns, name)
+		Expect(b1SnapshotExists(ctx, ns, "checkpoint-"+name+"-iter-0")).To(BeTrue(),
+			"the level-based retry creates the checkpoint on the later reconcile")
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(fresh.Status.Checkpoint).NotTo(BeNil())
+		Expect(fresh.Status.Checkpoint.Iteration).To(Equal(0), "the checkpoint is named for the recorded verify's iteration (0)")
+		Expect(fresh.Status.Checkpoint.Milestone).To(BeTrue(), "the verify passed, so the checkpoint is a milestone")
+		c = b1CheckpointCondition(fresh)
+		Expect(c.Status).To(Equal(metav1.ConditionTrue), "the support is available again on the retry")
+		Expect(c.Reason).To(Equal(CheckpointReasonAvailable))
+	})
+
+	It("takes the checkpoint for a FAILED verify on the iterate path: checkpoint-<loop>-iter-N with Milestone=false on a later reconcile, and NO checkpoint for iter-(N+1) (the iterate increments to N+1 and persists it; the checkpoint create for N may have failed or been skipped; must FAIL against 06767ac which keys off the current iteration)", func() {
+		ns := "b1-fail-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "failloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		// Drive to Verifying at iteration 0, then make the verify FAIL
+		// (check-0 exits 1). The operator records the outcome for iteration 0
+		// (lastCheckResults = [1]) and iterates to 1 (Implementing). The
+		// checkpoint create for iteration 0 is skipped on that reconcile
+		// (support absent — the driver seam reports unavailable), so nothing
+		// is recorded yet.
+		rUnavailable := b1NewReconciler(false, false)
+		s5aDriveToVerifyingWithReconciler(rUnavailable, ns, name)
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPod(ctx, ns, name, jobName, 1) // check-0 FAILS
+
+		b1Reconcile(rUnavailable, ns, name) // iterate path: record outcome for iter 0, iterate 0 -> 1
+		// The iterate deleted the (stand-in) Sandbox; re-ensure it so the
+		// next reconcile (a plain b1Reconcile that asserts no error) does not
+		// wedge on the missing sandbox.
+		s5aEnsureSandbox(ns, name)
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Status.Verify).NotTo(BeNil(), "the FAILED verify outcome is recorded")
+		Expect(loop.Status.Verify.Iteration).NotTo(BeNil())
+		Expect(int(*loop.Status.Verify.Iteration)).To(Equal(0), "the outcome is recorded for iteration 0")
+		Expect(loop.Status.Iteration).To(BeNumerically(">", 0), "the operator iterated past 0")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "the failing verify iterated to Implementing")
+		Expect(loop.Status.Checkpoint).To(BeNil(), "the checkpoint create for iter 0 was skipped (support was absent)")
+		Expect(loop.Status.Checkpoints).To(BeEmpty())
+
+		// A LATER reconcile (the Loop is at the iterated iteration,
+		// Implementing — no verify in progress for it yet, and no verify
+		// outcome change this pass). The level-based checkpoint step must
+		// create checkpoint-<loop>-iter-0 with Milestone=false (the check
+		// failed), and must NOT create iter-(N+1) (N+1's verify has not
+		// completed, so keying off the current iteration would be wrong).
+		rAvailable := b1NewReconciler(true, false)
+		b1Reconcile(rAvailable, ns, name)
+
+		By("creating checkpoint-<loop>-iter-0 (Milestone=false: the verify FAILED)")
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(b1SnapshotExists(ctx, ns, "checkpoint-"+name+"-iter-0")).To(BeTrue(), "the later reconcile creates the checkpoint for the FAILED verify at iteration 0")
+		Expect(fresh.Status.Checkpoint).NotTo(BeNil())
+		Expect(fresh.Status.Checkpoint.Iteration).To(Equal(0))
+		Expect(fresh.Status.Checkpoint.Milestone).To(BeFalse(), "Milestone is false: the verify's check-0 failed (a -1/non-zero lastCheckResults is not a pass)")
+
+		By("NOT creating checkpoint-<loop>-iter-1 (iteration 1's verify has not completed)")
+		nextIter := int(fresh.Status.Iteration)
+		if nextIter > 0 {
+			Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, nextIter))).To(BeFalse(),
+				"no checkpoint for the iterated-into iteration whose verify has not completed")
+		}
+		for _, cp := range fresh.Status.Checkpoints {
+			Expect(cp.Iteration).To(Equal(0), "the only recorded checkpoint is the iter-0 one")
+		}
+
+		// Idempotency: a further reconcile adds nothing (the guard sees the
+		// recorded iter-0 entry).
+		b1Reconcile(rAvailable, ns, name)
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(volumeSnapshotListGVK)
+		Expect(k8sClient.List(ctx, list, client.InNamespace(ns),
+			client.MatchingLabels{"coxswain.wattu.com/loop": name})).To(Succeed())
+		Expect(list.Items).To(HaveLen(1), "no re-take on a later reconcile")
 	})
 
 	It("does NOT create a checkpoint for the current iteration while its verify is in progress (one spec per in-progress state; the named mutation — drop the in-progress guard — must fail against the older commit)", func() {
@@ -608,7 +684,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(fresh.Status.Checkpoint.Milestone).To(BeTrue(), "the verify passed, so the checkpoint is a milestone")
 	})
 
-	It("does NOT create a checkpoint for the next iteration while its verify is in progress (no recorded outcome for N+1; must FAIL against 0840f87 which keys off the current iteration)", func() {
+	It("does NOT create a checkpoint for iteration 0 while its verify is in progress (no recorded outcome yet; keying off the current iteration would wrongly create iter-0 before the verify completes; must FAIL against 0840f87 which keys off the current iteration)", func() {
 		ns := "b1-inprog-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {

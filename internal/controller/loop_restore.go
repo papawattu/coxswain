@@ -65,6 +65,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -212,10 +213,16 @@ func (r *LoopReconciler) b2RestoreTarget(ctx context.Context, loop *coxv1alpha1.
 	// A completed restore is one-shot: the condition is the marker.
 	if c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition); c != nil &&
 		c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.RestoreReasonRestored {
-		// The restore is complete. A LOST PVC on a RESTORED Loop is the
-		// reactive case again (the PVC was restored once and then lost):
-		// the target is the latest recorded checkpoint (or the rollback
-		// target if set — the explicit one wins).
+		// The restore is complete. Do NOT re-restore if the PVC is present
+		// (re-restore would wipe the Loop's work since the restore).
+		// A LOST PVC on a RESTORED Loop is the reactive case again (the PVC
+		// was restored once and then lost): the target is the rollback
+		// target if set (the explicit one wins), otherwise the latest
+		// recorded checkpoint.
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc); err == nil {
+			return nil // the PVC is present: the restore is complete, do not re-restore
+		}
 		if loop.Spec.RestoreFrom != "" {
 			if it, err := parseRestoreFrom(loop.Spec.RestoreFrom); err == nil {
 				return &b2RestoreTarget{loopName: loop.Name, iteration: it, snapshot: checkpointName(loop, it), kind: b2KindRollback}
@@ -269,20 +276,25 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 }
 
 // parseRestoreFrom parses "iter-N" (the CRD pattern validates the shape;
-// this is the int extraction, error = malformed).
+// this is the int extraction, error = malformed). Iteration 0 is a valid
+// checkpoint (the first verify; the same lesson as B1's iter-0).
 func parseRestoreFrom(s string) (int, error) {
-	n, err := strconv.Atoi(s[len("iter-"):])
-	if err != nil || n < 1 {
+	rest, ok := strings.CutPrefix(s, "iter-")
+	if !ok || rest == "" {
+		return 0, fmt.Errorf("malformed restoreFrom %q", s)
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil || n < 0 {
 		return 0, fmt.Errorf("malformed restoreFrom %q", s)
 	}
 	return n, nil
 }
 
 // b2ApplyRestoreStep is the B2 restore step extracted from Reconcile (the
-// gocyclo budget). It runs AFTER phaseBootstrap (the PVC exists — the
-// bootstrap created it) and BEFORE the checkpoint gate (the checkpoint
-// support check reads the PVC's StorageClass; a restored PVC has the same
-// StorageClass, so the check is unchanged). It:
+// gocyclo budget). It runs BEFORE phaseBootstrap (the bootstrap's
+// ensureLoopArtifacts would recreate a LOST PVC EMPTY before the restore
+// could decide; the sandbox build reads the PVC by name, not spec, so a
+// restored PVC is invisible to it). It:
 //
 //  1. computes the restore target (b2RestoreTarget),
 //  2. resolves the source snapshot (ready / notready / missing / error),
@@ -317,6 +329,19 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 		return false, false, nil // no restore applies this reconcile
 	}
 	snap, decision := r.resolveCheckpointSource(ctx, loop.Namespace, target.loopName, target.iteration)
+	// persist is the I90 write (the reviewer's guidance, R-B2): the condition
+	// is already set on `loop` by this point, so persisting it HERE (at the
+	// point of decision) makes the decision durable even when a later step in
+	// the same reconcile fails (e.g. ensureSandbox). The Event is emitted
+	// immediately (the transient signal fires at the point of decision, before
+	// any later failure can hide it); the Status().Update is what survives a
+	// later failure in the same reconcile. The step returns (persisted,
+	// requeue, err): persisted is true when the step wrote the status this
+	// pass (the caller ORs it into `changed` so a failed later step does not
+	// make finalizeLoopStatus skip the write — the step already wrote it);
+	// requeue is true when a requeue is needed (notready or error); err is a
+	// real failure (the caller returns it).
+	persist := func() bool { return r.Status().Update(ctx, loop) == nil }
 	switch decision {
 	case b2SourceReady:
 		if err := r.restorePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
@@ -325,9 +350,10 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			// create failed; the retry recreates it).
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
 				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())
+			persisted := persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
 				"workspace PVC restore from "+target.snapshot+" failed; retrying")
-			return true, true, nil
+			return persisted, true, nil
 		}
 		// B2 FORK-RETENTION: a fork that has just restored its PVC from the
 		// source's checkpoint REMOVES the fork-of label from the source's
@@ -345,9 +371,10 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 		}
 		setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 			"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
+		persisted := persist()
 		r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
 			"workspace PVC restored from "+target.snapshot)
-		return true, false, nil
+		return persisted, false, nil
 	case b2SourceNotReady:
 		// DEFER: the snapshot exists but is not ReadyToUse (the in-progress
 		// state — no restore decision, I49). The condition names it; the
@@ -356,9 +383,10 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 		_ = snap
 		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
 			"checkpoint "+target.snapshot+" ("+string(target.kind)+") exists but is not ReadyToUse yet; the restore is deferred")
+		persisted := persist()
 		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
 			"checkpoint "+target.snapshot+" not ReadyToUse yet; restore deferred")
-		return true, true, nil
+		return persisted, true, nil
 	case b2SourceMissing:
 		switch target.kind {
 		case b2KindRollback, b2KindFork:
@@ -367,9 +395,10 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			// GC deleted it, or it was never taken).
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
 				"checkpoint "+target.snapshot+" ("+string(target.kind)+") does not exist (it was never taken, or it was GC'd); the restore is rejected")
+			persisted := persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
 				"checkpoint "+target.snapshot+" does not exist; restore rejected")
-			return true, false, nil
+			return persisted, false, nil
 		default: // b2KindLostPVC
 			// The A2 fallback: the PVC is lost and the (latest) checkpoint
 			// is gone. Recreate the PVC EMPTY (the A2 PVC-resume — the
@@ -380,9 +409,10 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			}
 			setRestoreCondition(loop, false, noUsableCheckpointReason,
 				"the workspace PVC was lost and checkpoint "+target.snapshot+" does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)")
+			persisted := persist()
 			r.emitRestoreEvent(loop, false, noUsableCheckpointReason,
 				"workspace PVC lost, no usable checkpoint; A2 fallback (empty workspace)")
-			return true, false, nil
+			return persisted, false, nil
 		}
 	case b2SourceError:
 		// A transient read failure: no decision, requeue.
@@ -395,7 +425,9 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 
 // noUsableCheckpointReason is the Restore condition's reason for the
 // A2 fallback (the PVC was lost with no usable checkpoint; I90 names it).
-const noUsableCheckpointReason = "NoUsableCheckpoint"
+// The constant lives in the API package (the CRD's status enum references
+// it) and is aliased here so the controller reads as a local.
+var noUsableCheckpointReason = coxv1alpha1.RestoreReasonNoUsableCheckpoint
 
 // setRestoreCondition sets the Restore condition (the B2 durable record).
 func setRestoreCondition(loop *coxv1alpha1.Loop, status bool, reason, message string) {

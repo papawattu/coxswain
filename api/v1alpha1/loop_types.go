@@ -579,8 +579,7 @@ type LoopSpec struct {
 	// the restored content. Immutable (PVC dataSource is immutable): a
 	// change is rejected at admission; a different rollback target is a
 	// fork.
-	// +kubebuilder:validation:Pattern=`^iter-[1-9][0-9]*$`
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="restoreFrom is immutable (it rewrites the workspace PVC's dataSource)"
+	// +kubebuilder:validation:Pattern=`^iter-[0-9]+$`
 	// +optional
 	RestoreFrom string `json:"restoreFrom,omitempty"`
 
@@ -616,9 +615,10 @@ type ForkOf struct {
 	Loop string `json:"loop"`
 
 	// iteration is the source checkpoint's iteration (the
-	// checkpoint-<loop>-iter-<iteration> name component).
+	// checkpoint-<loop>-iter-<iteration> name component). Iteration 0 is
+	// a valid checkpoint (the first verify; the same lesson as B1's iter-0).
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Minimum=0
 	Iteration int `json:"iteration"`
 }
 
@@ -1008,8 +1008,9 @@ const (
 	// restore is DEFERRED, retried each reconcile, and is NOT a terminal
 	// rejection), RestoreRejected (the spec is malformed or the restore
 	// failed). Absent = no restore was requested and the PVC was never lost.
-	// (A PVC lost with no usable checkpoint carries on with the A2 PVC-resume
-	// — that is surfaced by the PVCRecreated Event, not this condition.)
+	// A PVC lost with no usable checkpoint carries on with the A2 PVC-resume
+	// — that is surfaced by the Restore condition False reason
+	// NoUsableCheckpoint + the WorkspaceRestoreUnavailable Event (I90).
 	RestoreCondition = "Restore"
 )
 
@@ -1031,6 +1032,12 @@ const (
 	// RestoreReasonRejected: the restore spec is malformed or a restore
 	// attempt failed (visible, never a silent ignore).
 	RestoreReasonRejected = "RestoreRejected"
+	// RestoreReasonNoUsableCheckpoint: the workspace PVC was LOST and no
+	// usable checkpoint exists (the latest recorded checkpoint's
+	// VolumeSnapshot is absent — GC'd or never taken). The Loop falls back
+	// to the A2 PVC-resume (the PVC is recreated EMPTY) — a VISIBLE
+	// fallback, not a silent ignore (I90).
+	RestoreReasonNoUsableCheckpoint = "NoUsableCheckpoint"
 )
 
 // +kubebuilder:object:root=true

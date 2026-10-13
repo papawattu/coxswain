@@ -295,8 +295,9 @@ spec:
                   iteration:
                     description: |-
                       iteration is the source checkpoint's iteration (the
-                      checkpoint-<loop>-iter-<iteration> name component).
-                    minimum: 1
+                      checkpoint-<loop>-iter-<iteration> name component). Iteration 0 is
+                      a valid checkpoint (the first verify; the same lesson as B1's iter-0).
+                    minimum: 0
                     type: integer
                   loop:
                     description: |-
@@ -367,12 +368,8 @@ spec:
                   the restored content. Immutable (PVC dataSource is immutable): a
                   change is rejected at admission; a different rollback target is a
                   fork.
-                pattern: ^iter-[1-9][0-9]*$
+                pattern: ^iter-[0-9]+$
                 type: string
-                x-kubernetes-validations:
-                - message: restoreFrom is immutable (it rewrites the workspace PVC's
-                    dataSource)
-                  rule: self == oldSelf
               suspend:
                 description: suspend, when true, pauses the Loop at its current phase.
                 type: boolean

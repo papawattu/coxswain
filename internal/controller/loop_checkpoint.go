@@ -712,12 +712,13 @@ func (r *LoopReconciler) ensureCheckpointStep(ctx context.Context, loop *coxv1al
 // keep the gocyclo budget. It runs applyCheckpointConditions and, when the
 // gate fires (spec.checkpoints=Required and the snapshot support is absent),
 // sets the terminal Failed:CheckpointUnavailable phase and writes the
-// status. Returns (result, done): done is true when the gate fired (the
-// caller should return the result and stop this reconcile).
-func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
-	_, cpTerminal := r.applyCheckpointConditions(ctx, loop)
+// status. Returns (changed, done, err): done is true when the gate fired
+// (the caller should return the result and stop this reconcile); changed is
+// true when the condition was (re)set this pass.
+func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
+	condChanged, cpTerminal := r.applyCheckpointConditions(ctx, loop)
 	if !cpTerminal {
-		return false, nil
+		return condChanged, false, nil
 	}
 	setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
 		checkpointUnavailableReason,
@@ -725,7 +726,7 @@ func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alp
 	loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
 	if err := r.Status().Update(ctx, loop); err != nil {
-		return false, err
+		return condChanged, false, err
 	}
-	return true, nil
+	return condChanged, true, nil
 }

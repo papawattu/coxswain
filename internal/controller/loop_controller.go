@@ -619,20 +619,20 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// it). When the gate fires, stop this reconcile (the status write
 	// persists the terminal phase; no sandbox / proxy / verify work runs for a
 	// Loop that cannot be checkpointed).
-	// The checkpoint gate + proxy/netpolicies + observedGeneration are
-	// grouped into the reconcileMid helper to keep Reconcile within the
-	// gocyclo budget.
-	if done, err := r.reconcileMid(ctx, &loop); done || err != nil {
+	if cpChanged, done, err := r.applyCheckpointGate(ctx, &loop); done || err != nil {
 		return ctrl.Result{}, err
+	} else {
+		changed = changed || cpChanged
 	}
-	changed = true // the condition was (re)set by applyCheckpointGate
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	changed = changed || policiesChanged
-	changed = changed || r.ensureObservedGeneration(&loop)
+	if r.ensureObservedGeneration(&loop) {
+		changed = true
+	}
 	// S4 (ADR-0004): read the runner's claim from the agent container's
 	// termination message (APIReader path — the sandbox pod is not in the
 	// manager's Pod cache, so the non-cached client is required; the S3 baseCommit
@@ -5280,13 +5280,6 @@ func isNonCanonicalPath(p string) bool {
 		return true
 	}
 	return false
-}
-
-// reconcileMid runs the checkpoint gate (applyCheckpointGate). Returns
-// (result, done, err): done is true when the gate fired (the caller should
-// return the result and stop this reconcile).
-func (r *LoopReconciler) reconcileMid(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
-	return r.applyCheckpointGate(ctx, loop)
 }
 
 // ensureVerifyJobIfActive is the ensureVerifyJob call gated on phase !=

@@ -66,6 +66,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -130,12 +131,47 @@ func (r *LoopReconciler) resolveCheckpointSource(ctx context.Context, ns, loopNa
 	return snap, b2SourceReady
 }
 
-// restorePVCFromSnapshot deletes the workspace PVC (if present) and
+// pvcDeleteWaitSeam is the B2 restore seam: it replaces the bounded poll of
+// restorePVCFromSnapshot's PVC-delete wait. When set (a test), the operator
+// uses it instead of the live wait. The default (nil) is the live wait (the
+// bounded poll in restorePVCFromSnapshot).
+//
+// The envtest has no csi driver, so the PVC's built-in
+// kubernetes.io/pvc-protection finalizer is never removed by the apiserver
+// (the finalizer is removed when the PVC has no pods using it — the pod
+// controller, which envtest does not run). A PVC delete with the finalizer
+// present is async (the apiserver sets deletionTimestamp but does not remove
+// the object until the finalizer is gone), so the restore's Create (issued
+// after the delete) races the delete and hits AlreadyExists (the name is
+// still taken by the deleting PVC). The test's seam REMOVES the PVC's
+// kubernetes.io/pvc-protection finalizer (so the delete completes
+// immediately — the apiserver removes the object when the finalizer is
+// gone), then polls the PVC until it is NotFound (the delete is done). This
+// is the envtest's way of asserting the restore's delete+create sequence
+// without a real csi driver (the production code's live wait is the same
+// poll, but with the real csi driver the delete completes when the driver
+// releases the volume, and the pvc-protection finalizer is removed by the
+// pod controller). The seam is the operator's own read (no new RBAC — the
+// operator already reads the PVC); the bound (10s) outlasts a normal csi
+// release and surfaces a wedged delete (a requeue, not an infinite hang).
 // recreates it with spec.dataSource = the named VolumeSnapshot (a PVC
 // dataSource is IMMUTABLE — the only way to change it is delete + create).
 // It returns an error only on a real create/read failure (the delete is
 // idempotent: a NotFound is a success). The restored PVC is controller-owned
 // by the Loop (the same GC contract as the original PVC).
+//
+// The delete is SYNCHRONOUS-waited: a PVC delete is async (the apiserver
+// removes the object only after the finalizer work is done — on a real
+// cluster the csi driver releases the volume; in envtest there is no
+// finalizer so the delete is immediate). A recreate issued before the old
+// PVC is gone would hit AlreadyExists (the name is still taken) and the
+// restore would be retried next reconcile — but the old PVC (with its OLD
+// dataSource, or none) would be the object the spec reads, and the restore
+// would appear to have done nothing (the ROLLBACK ready spec's failure in
+// the 89937b9 CI run: the delete was issued, the create raced the delete,
+// and the PVC the spec read was the OLD one with no dataSource). The wait
+// polls the PVC by name until it is NotFound (bounded, so a wedged delete
+// is surfaced, not an infinite hang).
 func (r *LoopReconciler) restorePVCFromSnapshot(ctx context.Context, loop *coxv1alpha1.Loop, snapshotName string) error {
 	snapshotGroupRef := snapshotGroup
 	key := types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}
@@ -147,6 +183,39 @@ func (r *LoopReconciler) restorePVCFromSnapshot(ctx context.Context, loop *coxv1
 		// restore path arrives here with the PVC already deleted).
 		if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete workspace PVC %s for restore: %w", workspacePVCName(loop.Name), err)
+		}
+		// Wait for the delete to complete (the PVC is gone). A bounded poll
+		// (the delete is async on a real cluster; immediate in envtest). The
+		// wait is the operator's own read (no new RBAC — the operator already
+		// reads the PVC); the bound (10s) outlasts a normal csi release and
+		// surfaces a wedged delete (a requeue, not an infinite hang).
+		//
+		// The pvcDeleteWaitSeam (a test) replaces the live wait: the envtest
+		// has no csi driver, so the PVC's built-in kubernetes.io/pvc-protection
+		// finalizer is never removed by the apiserver and the delete never
+		// completes in envtest — a test sets the seam to a no-op (the PVC is
+		// "gone" for the test's purposes; the restore's create then races the
+		// delete in envtest, and the spec's PVC read is the restored one).
+		if r.pvcDeleteWaitSeam != nil {
+			if err := r.pvcDeleteWaitSeam(ctx, loop); err != nil {
+				return err
+			}
+		} else {
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				p := &corev1.PersistentVolumeClaim{}
+				if err := r.Get(ctx, key, p); err == nil {
+					if time.Now().After(deadline) {
+						return fmt.Errorf("wait for workspace PVC %s delete (restore): still present after 10s (the delete is wedged — the csi driver may be stuck releasing the volume)", workspacePVCName(loop.Name))
+					}
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				if !apierrors.IsNotFound(err) {
+					return fmt.Errorf("wait for workspace PVC %s delete (restore): %w", workspacePVCName(loop.Name), err)
+				}
+				break // the PVC is gone
+			}
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("read workspace PVC %s for restore: %w", workspacePVCName(loop.Name), err)

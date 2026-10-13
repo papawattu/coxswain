@@ -101,6 +101,19 @@ func b2Reconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 	return loop
 }
 
+// b2ReconcileToleratingGone runs one Reconcile and EXPECTS it to succeed (a
+// nil error), but TOLERATES the Loop being gone (a deleted Loop's reconcile
+// is a no-op — the operator's Get returns NotFound and the Reconcile returns
+// nil via client.IgnoreNotFound). It is the test's equivalent of the
+// controller's workqueue processing a deleted Loop's event (the FORK
+// source-deleted spec: the source Loop is deleted and its reconcile must
+// succeed, not error, on the gone Loop).
+func b2ReconcileToleratingGone(r *LoopReconciler, ns, name string) {
+	_, err := r.Reconcile(context.Background(),
+		reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+	Expect(err).NotTo(HaveOccurred(), "a gone Loop's reconcile must be a no-op (the operator's Get returns NotFound and the Reconcile returns nil)")
+}
+
 // b2SandboxName returns the Loop's Sandbox name (the operator's naming).
 func b2SandboxName(name string) string { return name + "-sandbox" }
 
@@ -148,6 +161,13 @@ func b2NewReconciler() *LoopReconciler {
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return b1Driver, true }
 	r.snapshotCRDPresent = func(context.Context) bool { return true }
+	// The B2 restore's PVC-delete wait (restorePVCFromSnapshot) is a no-op in
+	// the envtest (the envtest has no csi driver, so the PVC's built-in
+	// kubernetes.io/pvc-protection finalizer is never removed by the apiserver
+	// and the delete never completes in envtest — the restore's create races
+	// the delete, and the spec's PVC read is the restored one). Production
+	// uses the live bounded wait (the 10s poll in restorePVCFromSnapshot).
+	r.pvcDeleteWaitSeam = func(context.Context, *coxv1alpha1.Loop) error { return nil }
 	return r
 }
 
@@ -445,6 +465,21 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
 		b2MakeSnapshotReady(ctx, ns, snapName)
 
+		// Remove the workspace PVC's built-in kubernetes.io/pvc-protection
+		// finalizer (the envtest has no pod controller to remove it). Without
+		// this, the operator's PVC delete (restorePVCFromSnapshot) is async
+		// (the apiserver sets deletionTimestamp but does not remove the object
+		// until the finalizer is gone), and the restore's Create races the
+		// delete and hits AlreadyExists (the name is still taken by the
+		// deleting PVC). A real cluster's pod controller removes the
+		// finalizer when no pods use the PVC, so the delete completes before
+		// the Create; the envtest's spec removes it manually so the operator's
+		// delete+create sequence is the same.
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
+		pvc.Finalizers = []string{}
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+
 		// Set spec.restoreFrom: iter-0 (the rollback target — the B1
 		// checkpoint's iter). The field is mutable (the user can change it
 		// to roll back to different iters).
@@ -740,8 +775,17 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// DELETE the source Loop (the source's finalizer runs: the source's
 		// checkpoint GC deletes the source's snapshots).
 		Expect(k8sClient.Delete(ctx, srcLoop)).To(Succeed())
-		// Reconcile the source (the finalizer's work runs).
-		b2Reconcile(r, ns, srcName)
+		// Reconcile the source (the finalizer's work runs). The source Loop is
+		// being deleted (it has a deletionTimestamp and the finalizer), so the
+		// reconcile runs the B2 restore step (a no-op — the source's PVC is
+		// present and it has no restoreFrom/forkOf) and then the CleaningUp
+		// work (the B1 finalizer's snapshot GC). The reconcile must succeed
+		// (a nil error) — it must NOT error on the gone Loop (the operator's
+		// Get returns NotFound for the Loop's children, and the Reconcile
+		// returns nil via client.IgnoreNotFound for the gone Loop itself —
+		// the FORK spec's failure in the 89937b9 CI run: b2Reconcile expected
+		// the source Loop to be present, but it was deleted).
+		b2ReconcileToleratingGone(r, ns, srcName)
 
 		// DELETE the source's snapshot (simulating the source's GC — the
 		// source's finalizer would delete it, but envtest's finalizer

@@ -8,6 +8,7 @@ rules:
   - ""
   resources:
   - configmaps
+  - persistentvolumeclaims
   - pods
   - services
   verbs:
@@ -31,16 +32,6 @@ rules:
   verbs:
   - get
   - list
-- apiGroups:
-  - ""
-  resources:
-  - persistentvolumeclaims
-  verbs:
-  - create
-  - get
-  - list
-  - update
-  - watch
 - apiGroups:
   - agents.x-k8s.io
   resources:

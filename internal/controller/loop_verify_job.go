@@ -1104,13 +1104,20 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 					if pod.Status.InitContainerStatuses[j].State.Terminated != nil {
 						code := pod.Status.InitContainerStatuses[j].State.Terminated.ExitCode
 						results[i] = &code
+					} else {
+						// The check is still running (not terminated): record -1
+						// as a sentinel (the API server rejects nil).
+						notRun := int32(-1)
+						results[i] = &notRun
 					}
 					found = true
 					break
 				}
 			}
 			if !found {
-				results[i] = nil // the check did not run
+				// The check did not run: record -1 as a sentinel.
+				notRun := int32(-1)
+				results[i] = &notRun
 			}
 		}
 		loop.Status.Verify.LastCheckResults = results

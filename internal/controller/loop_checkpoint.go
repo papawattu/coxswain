@@ -740,19 +740,19 @@ func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alp
 }
 
 // verifyMilestone reports whether the verify passed (all lastCheckResults
-// exit codes are 0). A nil entry means the check did not run (I14 NotRun),
-// which is NOT a pass. An empty lastCheckResults (no checks) is a pass
-// (vacuously true).
+// exit codes are 0). A -1 entry means the check did not run (sentinel value;
+// the API server rejects nil), which is NOT a pass. An empty lastCheckResults
+// (no checks) is a pass (vacuously true).
 func verifyMilestone(loop *coxv1alpha1.Loop) bool {
 	if loop.Status.Verify == nil {
 		return false
 	}
 	for _, code := range loop.Status.Verify.LastCheckResults {
 		if code == nil {
-			return false // a check did not run
+			return false // defensive: should not happen (the operator uses -1)
 		}
 		if *code != 0 {
-			return false // a check failed
+			return false // a check failed or did not run (-1)
 		}
 	}
 	return true

@@ -604,7 +604,8 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
-		r := b1NewReconcilerDriverUnknown() // the driver seam resolves ("", false) — no matching VSC
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return "unmatched.csi.k8s.io", true } // known driver, no matching VSC
 		b1DriveToSucceeded(ctx, r, ns, name)
 		b1Reconcile(r, ns, name) // the reconcile that records the successful verify + takes the checkpoint
 

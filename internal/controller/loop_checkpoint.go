@@ -414,6 +414,13 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	if cp := loop.Status.Checkpoint; cp != nil && cp.Iteration == iteration {
 		return false, false
 	}
+	// The checkpoint is taken only when the verify outcome is known (the
+	// phase is NOT Verifying — the verify is complete). A verify still
+	// running (phase == Verifying) does not get a checkpoint (the outcome
+	// is unknown yet; the Milestone flag would be set incorrectly).
+	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
+		return false, false
+	}
 	// The support check gates the create (D59). When support is absent:
 	// BestEffort carries on (the condition is False, set by
 	// applyCheckpointConditions); Required is already terminal (the gate

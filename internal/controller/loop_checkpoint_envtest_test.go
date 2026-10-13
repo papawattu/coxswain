@@ -449,7 +449,8 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(fresh.Status.Checkpoint.Milestone).To(BeFalse(), "Milestone is false: the verify's check-0 failed (a -1/non-zero lastCheckResults is not a pass)")
 
 		By("NOT creating checkpoint-<loop>-iter-1 (iteration 1's verify has not completed)")
-		nextIter := int(fresh.Status.Iteration)
+		// The operator iterates to a 1-based iteration (nextIter := max(iteration+1, 2)).
+		nextIter := fresh.Status.Iteration
 		if nextIter > 0 {
 			Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, nextIter))).To(BeFalse(),
 				"no checkpoint for the iterated-into iteration whose verify has not completed")

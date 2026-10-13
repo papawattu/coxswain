@@ -753,5 +753,13 @@ func (r *LoopReconciler) verifyPodTerminated(ctx context.Context, loop *coxv1alp
 	if err != nil || pod == nil {
 		return false // no pod: the verify has not started or the pod is gone
 	}
-	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+	// The verify is complete when all init containers are terminated
+	// (the checks have run). In envtest the pod phase is not set
+	// automatically, so check the init container statuses directly.
+	for i := range pod.Status.InitContainerStatuses {
+		if pod.Status.InitContainerStatuses[i].State.Terminated == nil {
+			return false // an init container is still running
+		}
+	}
+	return len(pod.Status.InitContainerStatuses) > 0
 }

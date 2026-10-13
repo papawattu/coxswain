@@ -124,16 +124,29 @@ func checkpointName(loop *coxv1alpha1.Loop, iteration int) string {
 
 // newVolumeSnapshotObj returns an unstructured VolumeSnapshot for the Loop's
 // workspace PVC checkpoint (B1). The spec.source.persistentVolumeClaimName
-// names the PVC; the snapshot controller provisions the content. Built as a
-// raw map (the vendored CRD requires spec.source, and envtest does not run
-// CRD defaulting).
+// names the PVC; snapshotClassName names the VolumeSnapshotClass (the
+// operator passes the one it already resolved for the PVC's CSI driver —
+// setting it means the snapshot-controller does not need to find a
+// DEFAULT class, which is more robust across snapshot-controller versions
+// (v8.6.0's default-class lookup is unreliable in some clusters, while an
+// explicit class name is always honored)). snapshotClassName is optional: an
+// empty string omits it (the envtest specs pass "" — envtest has no
+// snapshot-controller, so the class name is inert there).
 //
 // (The deletionPolicy is intentionally left unset: defaulting is the
 // external-snapshotter controller's job (the CRD does not default it), and
 // an operator that pins it here would fight a controller version that
 // defaults it differently. B2's restore reads the snapshot; the content's
 // deletionPolicy governs the content's life, not the snapshot object's.)
-func newVolumeSnapshotObj(loop *coxv1alpha1.Loop, name string) *unstructured.Unstructured {
+func newVolumeSnapshotObj(loop *coxv1alpha1.Loop, name, snapshotClassName string) *unstructured.Unstructured {
+	spec := map[string]any{
+		"source": map[string]any{
+			"persistentVolumeClaimName": workspacePVCName(loop.Name),
+		},
+	}
+	if snapshotClassName != "" {
+		spec["volumeSnapshotClassName"] = snapshotClassName
+	}
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": snapshotGV,
 		"kind":       volumeSnapshotKind,
@@ -145,11 +158,7 @@ func newVolumeSnapshotObj(loop *coxv1alpha1.Loop, name string) *unstructured.Uns
 				loopLabelKey:   loop.Name,
 			},
 		},
-		"spec": map[string]any{
-			"source": map[string]any{
-				"persistentVolumeClaimName": workspacePVCName(loop.Name),
-			},
-		},
+		"spec": spec,
 	}}
 }
 
@@ -434,11 +443,27 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	if status != metav1.ConditionTrue {
 		return changed, false
 	}
+	// Resolve the VolumeSnapshotClass for the workspace PVC's CSI driver and
+	// name it on the snapshot. The operator already resolved it for the
+	// support check (checkpointSupport -> workspaceDriver ->
+	// snapshotClassForDriver); resolve it here to get the NAME (the support
+	// check only returns a bool). Setting the class name on the snapshot
+	// means the snapshot-controller does not need to find a DEFAULT class
+	// (more robust across snapshot-controller versions, and it is the
+	// explicit, less ambiguous form). If the class has disappeared between
+	// the support check and the create (rare), the create will fail
+	// (surfaced via the condition + requeue, I90).
+	snapshotClassName := ""
+	if driver, ok := r.workspaceDriver(ctx, loop); ok {
+		if vsc, found := r.snapshotClassForDriver(ctx, driver); found {
+			snapshotClassName = vsc.GetName()
+		}
+	}
 	// Create the snapshot (idempotent: the name is unique per iteration; a
 	// AlreadyExists on the same-name object is the same checkpoint being
 	// re-attempted, treated as recorded).
 	name := checkpointName(loop, iteration)
-	snap := newVolumeSnapshotObj(loop, name)
+	snap := newVolumeSnapshotObj(loop, name, snapshotClassName)
 	err := r.Create(ctx, snap)
 	if err != nil {
 		if !isAlreadyExists(err) {
@@ -521,8 +546,9 @@ func (r *LoopReconciler) applyCheckpointRetention(ctx context.Context, loop *cox
 			rebuilt = append(rebuilt, cp)
 			continue
 		}
-		// GC this checkpoint's VolumeSnapshot.
-		snap := newVolumeSnapshotObj(loop, cp.Name)
+		// GC this checkpoint's VolumeSnapshot (the class name is irrelevant
+		// for a delete — it addresses the object by name).
+		snap := newVolumeSnapshotObj(loop, cp.Name, "")
 		if err := r.Delete(ctx, snap); err != nil && !isNotFound(err) {
 			// A delete failure (other than NotFound) is surfaced + requeued
 			// (the GC retries next reconcile; the status entry is kept so

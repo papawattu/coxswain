@@ -141,7 +141,7 @@ func b1CreateVSC() {
 func b1MakeSnapshotObj(loopName, ns string, iteration int) *unstructured.Unstructured {
 	u := newVolumeSnapshotObj(&coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: loopName, Namespace: ns},
-	}, checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: loopName, Namespace: ns}}, iteration))
+	}, checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: loopName, Namespace: ns}}, iteration), "")
 	return u
 }
 

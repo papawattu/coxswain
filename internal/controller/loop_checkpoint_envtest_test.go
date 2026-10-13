@@ -115,13 +115,6 @@ func b1NewReconciler(withSupport, withoutCRD bool) *LoopReconciler {
 	return r
 }
 
-// b1NewReconcilerDriverUnknown builds a reconciler where the driver seam
-// resolves ("", false) — the deferred / no-VSC branch.
-func b1NewReconcilerDriverUnknown() *LoopReconciler {
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
-	r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return "", false }
-	return r
-}
 
 // b1CreateVSC creates the cluster-scoped VolumeSnapshotClass (unstructured).
 // The vendored CRD's v1 schema is FLAT (driver and deletionPolicy at the top

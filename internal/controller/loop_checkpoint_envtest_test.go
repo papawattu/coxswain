@@ -59,6 +59,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -143,19 +144,6 @@ func b1MakeSnapshotObj(loopName, ns string, iteration int) *unstructured.Unstruc
 	return u
 }
 
-// b1CreateLoopSnapshots seeds the status + the VolumeSnapshot objects for a
-// Loop with the given iterations (the GC fixture: the operator's GC reads the
-// status entries and deletes the snapshots behind them).
-func b1CreateLoopSnapshots(ctx context.Context, loop *coxv1alpha1.Loop) {
-	for i := range loop.Status.Checkpoints {
-		cp := loop.Status.Checkpoints[i]
-		snap := b1MakeSnapshotObj(loop.Name, loop.Namespace, cp.Iteration)
-		if err := k8sClient.Create(ctx, snap); err != nil && !apierrors.IsAlreadyExists(err) {
-			Expect(err).ToNot(HaveOccurred())
-		}
-	}
-}
-
 // b1EnsureSandbox re-ensures the stand-in Sandbox object (envtest has no
 // agent-sandbox controller; the phase advance's annotation-based recycle
 // deletes it, so a multi-cycle drive must re-ensure it before each claim).
@@ -183,27 +171,31 @@ func b1EnsureSandbox(ns, name string) {
 // same-named pod would not reliably disappear for the read, and a fresh name
 // is what the S5a in-progress spec already relies on).
 func b1Cycle(ctx context.Context, r *LoopReconciler, ns, name string, seq int, checkExit int32) {
-	b1EnsureSandbox(ns, name)
-	head := fmt.Sprintf("%040x", seq)
-	s5aClaimPod(ns, name, "Implementing", head)
-	// Reconcile until the Loop is at Verifying. The Implementing -> Verifying
-	// advance reads the claim from the sandbox pod's termination message and
-	// pins status.currentVerify; it may need a second reconcile (the first
-	// reads the claim and advances; the second is a safety net for the
-	// operator's requeue-after-claim-read path). A single retry, not a loop.
-	for i := 0; i < 2; i++ {
-		_, _ = r.Reconcile(context.Background(),
-			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
-		loop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
-			break
-		}
-		// The Loop is still at Implementing (the claim was not advanced this
-		// reconcile). Re-claim and retry once.
-		s5aClaimPod(ns, name, "Implementing", head)
+	// Delete the prior cycle's verify pod (a pod the prior cycle created and
+	// whose check has terminated). Leaving it in place makes the operator's
+	// readVerifyJobPod read the STALE pod for the same Job UID (the batch
+	// controller recreates the Job with the same name on the next advance,
+	// but the stale pod lingers until GC) and the outcome is read twice — a
+	// requeue storm that hangs the spec. Deleting it is the S5a idiom (each
+	// verify cycle's pod is a fresh object).
+	priorPod := &corev1.Pod{}
+	_ = k8sClient.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("%s-verify-pod-%d", name, seq-1), Namespace: ns}, priorPod)
+	if priorPod.UID != "" {
+		_ = k8sClient.Delete(ctx, priorPod)
 	}
+	b1EnsureSandbox(ns, name)
+	// The Loop's CURRENT iteration (the claim must carry the operator's
+	// authoritative count — the S5a stale-iteration guard (I48/I63) ignores a
+	// claim whose echoed .coxswain/iteration differs from status.iteration;
+	// after the first iterate the count is 2, 3, 4 …, so the claim must echo
+	// it or the advance is ignored and the spec hangs).
 	loop := &coxv1alpha1.Loop{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+	curIter := int(loop.Status.Iteration)
+	head := fmt.Sprintf("%040x", seq)
+	b1ClaimPod(ns, name, "Implementing", head, curIter)
+	_, _ = r.Reconcile(context.Background(),
+		reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		Fail(fmt.Sprintf("b1Cycle: the Loop is not at Verifying before the verify pod (got %s)", loop.Status.Phase))
@@ -211,8 +203,7 @@ func b1Cycle(ctx context.Context, r *LoopReconciler, ns, name string, seq int, c
 	jobName := verifyJobName(loop)
 	// Create the Job (if absent) and a fresh pod (unique per cycle — the
 	// S5a idiom: the operator finds the pod via the job-name label and reads
-	// its init exit codes; a fresh name per cycle avoids the same-named-pod
-	// confusion envtest's live apiReader would not reliably clear).
+	// its init exit codes).
 	job := &batchv1.Job{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
 		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
@@ -239,6 +230,39 @@ func b1Cycle(ctx context.Context, r *LoopReconciler, ns, name string, seq int, c
 		reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 }
 
+// b1ClaimPod creates the agent claim pod (a success claim carrying headCommit
+// and the .coxswain/iteration marker the S5a stale-iteration guard (I48/I63)
+// compares against status.iteration). The agent container is terminated with
+// the claim JSON (exit 0); the marker is the operator's authoritative count
+// at the time the claim was written (the spec reads it from the Loop's
+// status.iteration). Unlike s5aClaimPod (which carries no marker — the
+// first-cycle case), b1ClaimPod is used for the multi-cycle drive where the
+// count is non-zero and a stale (marker-less, echoed 0) claim would be
+// ignored by the guard.
+func b1ClaimPod(ns, name, phase, head string, iteration int) {
+	ctx := context.Background()
+	nn := types.NamespacedName{Name: name + "-sandbox", Namespace: ns}
+	existing := &corev1.Pod{}
+	if !apierrors.IsNotFound(k8sClient.Get(ctx, nn, existing)) {
+		_ = k8sClient.Delete(ctx, existing)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":"","iteration":` + strconv.Itoa(iteration)
+	if head != "" {
+		msg += `,"headCommit":"` + head + `"`
+	}
+	msg += `}`
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: agentContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0, Message: msg}}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
 // b1VerifyPodStatuses builds the verify pod's init container statuses: the
 // two trusted inits (clone-base, import-agent) terminated exit 0 (the
 // verifyOutcome's trusted-inits loop requires them, or it returns noDecision
@@ -257,17 +281,6 @@ func b1VerifyPodStatuses(checkExit int32, seq int) []corev1.ContainerStatus {
 		{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: checkExit,
 			Message: fmt.Sprintf("b1 cycle %d failing output", seq)}}},
 	}
-}
-
-// b1SetIteration sets the Loop's current iteration (the spec drives the
-// iteration explicitly so the spec names the verify Job it must build: the
-// operator's real iterate path would increment it, but the checkpoint specs
-// care about the RECORD, not the increment).
-func b1SetIteration(ctx context.Context, ns, name string, iteration int) {
-	loop := &coxv1alpha1.Loop{}
-	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-	loop.Status.Iteration = iteration
-	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 }
 
 // b1SnapshotExists reports whether a VolumeSnapshot object exists.
@@ -318,19 +331,18 @@ func b1DriveToSucceeded(ctx context.Context, r *LoopReconciler, ns, name string)
 
 // b1InProgSpec drives the verify at iteration 0 to the given in-progress pod
 // state (one of: a trusted init still Running, the tamper init still Running,
-// the artifact init still Running, or the check-0 init absent from the pod
-// status) and asserts the operator does NOT take a checkpoint for the
-// in-progress iteration (no recorded outcome — the verify has not completed,
-// so the operator must not checkpoint it; I49: a decision on an in-progress
-// state is wrong).
+// the artifact init still Running, or check-0 still Running — the I49
+// in-progress stand-in) and asserts the operator does NOT take a checkpoint
+// for the in-progress iteration (no recorded outcome — the verify has not
+// completed, so the operator must not checkpoint it; I49: a decision on an
+// in-progress state is wrong).
 //
 // The pod's trusted-inits + tamper + artifact are terminated (exit 0) UNLESS
-// the in-progress state is one of them; check-0 is absent from the pod's init
-// status when the in-progress state is the check-0 (the kubelet has not
-// advanced to it yet — the verifyOutcome's check-read loop finds no status
-// for check-0 and returns noDecision, the requeue). The pod's name is unique
-// per in-progress state (the S5a in-progress spec's same-named-pod idiom,
-// which works because envtest's apiReader is live, not cached).
+// the in-progress state is one of them; the in-progress state's init is still
+// Running (not terminated). The "check-0" state uses s5aVerifyPodInProg
+// (check-0 still Running, all inits terminated). The pod's name is unique per
+// in-progress state (the S5a in-progress spec's same-named-pod idiom, which
+// works because envtest's apiReader is live, not cached).
 func b1InProgSpec(ctx context.Context, name, ns string, inProgressState string) *coxv1alpha1.Loop {
 	spec := b1LoopSpec()
 	spec.Loop.MaxIterations = 9
@@ -353,62 +365,72 @@ func b1InProgSpec(ctx context.Context, name, ns string, inProgressState string) 
 
 	s5aDriveToVerifyingWithReconciler(r, ns, name)
 
+	// The in-progress verify pod: the in-progress state's init container is
+	// still Running (not terminated), the rest are terminated (exit 0). The
+	// "check-0" state uses s5aVerifyPodInProg (the I49 in-progress stand-in:
+	// check-0 still Running, all inits terminated).
 	jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 	job := &batchv1.Job{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
 		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
 		Expect(k8sClient.Create(ctx, job)).To(Succeed())
 	}
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name + "-verify-pod-inprog",
-			Namespace: ns,
-			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: batchv1.SchemeGroupVersion.String(),
-				Kind:       i65JobKind,
-				Name:       jobName,
-				UID:        job.UID,
-			}},
-		},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+	if inProgressState == "check-0" {
+		// The I49 in-progress stand-in: check-0 still Running (not
+		// terminated), all inits terminated. s5aVerifyPodInProg creates this
+		// pod; the spec then reconciles and asserts no checkpoint.
+		s5aVerifyPodInProg(ctx, ns, name, jobName)
+	} else {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name + "-verify-pod-inprog",
+				Namespace: ns,
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		inits := []corev1.ContainerStatus{}
+		addTerminated := func(n string) {
+			inits = append(inits, corev1.ContainerStatus{Name: n, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}})
+		}
+		addRunning := func(n string) {
+			inits = append(inits, corev1.ContainerStatus{Name: n, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}})
+		}
+		switch inProgressState {
+		case "trusted-init":
+			addRunning(s5aCloneBase)
+			addTerminated(s5aImportAgent)
+			addTerminated(s5aTamper)
+			addTerminated(s5aArtifact)
+		case "tamper":
+			addTerminated(s5aCloneBase)
+			addTerminated(s5aImportAgent)
+			addRunning(s5aTamper)
+			addTerminated(s5aArtifact)
+		case "artifact":
+			addTerminated(s5aCloneBase)
+			addTerminated(s5aImportAgent)
+			addTerminated(s5aTamper)
+			addRunning(s5aArtifact)
+		default:
+			Fail(fmt.Sprintf("b1InProgSpec: unknown in-progress state %q", inProgressState))
+		}
+		pod.Status.InitContainerStatuses = inits
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 	}
-	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-	inits := []corev1.ContainerStatus{}
-	addTerminated := func(n string) {
-		inits = append(inits, corev1.ContainerStatus{Name: n, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}})
-	}
-	addRunning := func(n string) {
-		inits = append(inits, corev1.ContainerStatus{Name: n, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}})
-	}
-	switch inProgressState {
-	case "trusted-init":
-		addRunning(s5aCloneBase)
-		addTerminated(s5aImportAgent)
-		addTerminated(s5aTamper)
-		addTerminated(s5aArtifact)
-	case "tamper":
-		addTerminated(s5aCloneBase)
-		addTerminated(s5aImportAgent)
-		addRunning(s5aTamper)
-		addTerminated(s5aArtifact)
-	case "artifact":
-		addTerminated(s5aCloneBase)
-		addTerminated(s5aImportAgent)
-		addTerminated(s5aTamper)
-		addRunning(s5aArtifact)
-	case "check-0":
-		addTerminated(s5aCloneBase)
-		addTerminated(s5aImportAgent)
-		addTerminated(s5aTamper)
-		addTerminated(s5aArtifact)
-	default:
-		Fail(fmt.Sprintf("b1InProgSpec: unknown in-progress state %q", inProgressState))
-	}
-	pod.Status.InitContainerStatuses = inits
-	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
-	b1Reconcile(r, ns, name)
+	// Reconcile once: the verify outcome is NOT yet recorded (the in-progress
+	// state is pending — the operator requeues, no decision), so no
+	// checkpoint must be created for the in-progress iteration.
+	_, _ = r.Reconcile(ctx,
+		reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 	loop := &coxv1alpha1.Loop{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 	Expect(loop.Status.Verify).To(BeNil(), "no recorded verify outcome while the verify is in progress (the in-progress state is pending, not a decision)")
@@ -557,9 +579,11 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		name := "retainloop"
 		spec := b1LoopSpec()
 		// The cap is the max verify iteration + 1 (the operator's iterate
-		// guard: a failing verify at the cap's iteration is terminal Failed,
-		// not another iterate). 8 verify cycles (iter 0,2,3,4,5,6,7,8) need
-		// the cap 9 to reach the GC at the iter-8 verify without tripping.
+		// guard: a failing verify whose increment would exceed the cap is
+		// terminal Failed). The drive's 4 verify cycles (iter 0 -> 2 -> 3 -> 4)
+		// need a cap >= 5; 9 leaves headroom. (The CRD default is 3, which
+		// would fail the Loop at the iter-4 verify — the spec needs 4 cycles
+		// to prove the GC, so the cap is raised explicitly.)
 		spec.Loop.MaxIterations = 9
 		// stallAfter 100: the spec drives 8 consecutive failing verifies with
 		// the per-cycle readCheckOutput seam giving DIFFERENT raw output each
@@ -587,48 +611,45 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		}
 
 		// Drive to Verifying (iteration 0) on r (the driver/CRD seams active
-		// on every reconcile). Then 8 verify cycles with a FAILING check
-		// (exit 1): the operator applies each outcome (iter 0 -> 2 -> 3 ->
-		// 4 -> 5 -> 6 -> 7 -> 8), and — level-based, keyed off the
-		// operator-recorded verify outcome — takes a checkpoint per iteration
-		// (Milestone=false, the verify failed). After the 8th cycle the
-		// checkpoint list has 8 entries (the last 3 + every milestone
-		// retention = {5,6,7,8} kept; {0,2,3,4} GC'd — every entry is
-		// non-milestone, so the last-3 rule alone governs the keep-set).
+		// on every reconcile). Then 4 verify cycles with a FAILING check
+		// (exit 1): the operator applies each outcome (iter 0 -> 2 -> 3 -> 4)
+		// and — level-based, keyed off the operator-recorded verify outcome —
+		// takes a checkpoint per iteration (Milestone=false, the verify
+		// failed). After the 4th cycle the checkpoint list has 4 entries
+		// (iter 0,2,3,4); the last 3 (2,3,4) are kept and iter 0 (not in the
+		// last 3, not a milestone) is GC'd. Four cycles are enough to prove
+		// the operator PRODUCED the checkpoints (no hand-built fixtures) and
+		// that the GC deleted the one that fell out of the last-3 window.
 		s5aDriveToVerifyingWithReconciler(r, ns, name)
-		for seq := 1; seq <= 8; seq++ {
+		for seq := 1; seq <= 4; seq++ {
 			b1Cycle(ctx, r, ns, name, seq, 1)
 		}
 
-		By("keeping the last 3 (iters 6,7,8) and GC'ing the older non-milestone checkpoints (0,2,3,4,5)")
+		By("keeping the last 3 (iters 2,3,4) and GC'ing the older non-milestone checkpoint (iter 0)")
 		fresh := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
-			"the 8th failing verify sent the Loop back to Implementing (iteration 8)")
+			"the 4th failing verify sent the Loop back to Implementing (iteration 4)")
 		kept := map[int]bool{}
 		for _, cp := range fresh.Status.Checkpoints {
 			kept[cp.Iteration] = true
 		}
 		// The GC is applied on EVERY checkpoint take (level-based): after the
-		// 8th take (iter 8) the keep-set over the full 8-entry list is the
-		// last 3 (6,7,8) + the milestones (none — every verify failed). The
-		// older non-milestone checkpoints (0,2,3,4,5) are GC'd.
-		Expect(kept).To(HaveKeyWithValue(6, true), "iter 6 is in the last 3 — kept")
-		Expect(kept).To(HaveKeyWithValue(7, true), "iter 7 is in the last 3 — kept")
-		Expect(kept).To(HaveKeyWithValue(8, true), "iter 8 is the newest checkpoint — kept")
-		for _, gcIter := range []int{0, 2, 3, 4, 5} {
-			Expect(kept).NotTo(HaveKey(gcIter), "iter %d is not in the last 3 and is not a milestone — GC'd", gcIter)
-		}
+		// 4th take (iter 4) the keep-set over the full 4-entry list is the
+		// last 3 (2,3,4) + the milestones (none — every verify failed). The
+		// older non-milestone checkpoint (iter 0) is GC'd.
+		Expect(kept).To(HaveKeyWithValue(2, true), "iter 2 is in the last 3 — kept")
+		Expect(kept).To(HaveKeyWithValue(3, true), "iter 3 is in the last 3 — kept")
+		Expect(kept).To(HaveKeyWithValue(4, true), "iter 4 is the newest checkpoint — kept")
+		Expect(kept).NotTo(HaveKey(0), "iter 0 is not in the last 3 and is not a milestone — GC'd")
 
-		By("deleting the GC'd VolumeSnapshot objects and keeping the kept ones")
-		for _, it := range []int{6, 7, 8} {
+		By("deleting the GC'd VolumeSnapshot object and keeping the kept ones")
+		for _, it := range []int{2, 3, 4} {
 			Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, it))).
 				To(BeTrue(), "the retention must keep the snapshot iter-%d", it)
 		}
-		for _, it := range []int{0, 2, 3, 4, 5} {
-			Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, it))).
-				To(BeFalse(), "the retention must GC the snapshot iter-%d", it)
-		}
+		Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, 0))).
+			To(BeFalse(), "the retention must GC the snapshot iter-0")
 
 		By("recording the checkpoints as non-milestone (the verifies FAILED — milestone = the verify passed)")
 		for _, cp := range fresh.Status.Checkpoints {

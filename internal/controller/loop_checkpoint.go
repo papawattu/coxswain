@@ -768,7 +768,7 @@ func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1al
 	if err := r.applyEffectivePolicyAndConditions(ctx, loop); err != nil {
 		return ctrl.Result{}, err
 	}
-	b2Changed, b2Requeue, err := r.b2ApplyRestoreStep(ctx, loop)
+	b2Changed, b2Requeue, _, err := r.b2ApplyRestoreStep(ctx, loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

@@ -482,7 +482,7 @@ func (r *LoopReconciler) emitRestoreEvent(loop *coxv1alpha1.Loop, status bool, r
 // decision — the Status().Update here is what survives it), and the
 // caller's finalizeLoopStatus skips the re-write when the step already
 // persisted.
-func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
+func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, bool, error) {
 	// A fork whose restore is complete (the one-shot marker) has nothing
 	// left to do here EXCEPT remove its fork-retention label from the source
 	// snapshot (the source's GC is then free to delete it — the fork's PVC
@@ -501,7 +501,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 	}
 	target := r.b2RestoreTarget(ctx, loop)
 	if target == nil {
-		return false, false, nil // no restore applies this reconcile
+		return false, false, false, nil // no restore applies this reconcile
 	}
 	// persist is the I90 write (the reviewer's guidance, R-B2): the
 	// condition is already set on `loop` by the time it is called, so
@@ -529,7 +529,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				persist()
 				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
 					"workspace PVC restore from "+target.snapshot+" failed; retrying")
-				return true, true, nil
+				return true, true, true, nil
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 				"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
@@ -545,7 +545,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			persist()
 			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
 				"workspace PVC restored from "+target.snapshot)
-			return true, false, nil
+			return true, false, false, nil
 		}
 		// The ROLLBACK (an explicit restoreFrom on a running Loop): the PVC
 		// is present and the sandbox may hold it mounted (pvc-protection).
@@ -559,20 +559,20 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				persist()
 				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
 					"workspace PVC restore from "+target.snapshot+" failed; retrying")
-				return true, true, nil
+				return true, true, true, nil
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 				"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
 			persist()
 			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
 				"workspace PVC restored from "+target.snapshot)
-			return true, false, nil
+			return true, false, false, nil
 		}
 		running, err := r.sandboxRunning(ctx, loop)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "the restore could not read the sandbox's operating mode; no decision on a transient read failure",
 				"loop", loop.Name)
-			return false, true, nil
+			return false, true, true, nil
 		}
 		if running {
 			// Step 1: STOP the sandbox (the A2 kill path's stop). The PVC is
@@ -584,14 +584,14 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				persist()
 				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
 					"sandbox stop for the rollback restore failed; retrying")
-				return true, true, nil
+				return true, true, true, nil
 			}
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
 				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the sandbox is stopped (step 1 of 3; the PVC is deleted once the sandbox is gone)")
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
 				"restoring the workspace PVC from "+target.snapshot+": the sandbox is stopped (step 1 of 3)")
-			return true, true, nil
+			return true, true, true, nil
 		}
 		// The sandbox is stopped. The PVC is present (checked above):
 		// DELETE it (the A2 kill path's delete). The delete is async
@@ -603,14 +603,14 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
 				"workspace PVC delete for the rollback restore failed; retrying")
-			return true, true, nil
+			return true, true, true, nil
 		}
 		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
 			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the PVC is deleted (step 2 of 3; the PVC is recreated from the snapshot once the delete completes)")
 		persist()
 		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
 			"restoring the workspace PVC from "+target.snapshot+": the PVC is deleted (step 2 of 3)")
-		return true, true, nil
+		return true, true, true, nil
 	case b2SourceNotReady:
 		// DEFER: the snapshot exists but is not ReadyToUse (the in-progress
 		// state — no restore decision, I49). The condition names it; the
@@ -621,7 +621,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 		persist()
 		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
 			"checkpoint "+target.snapshot+" not ReadyToUse yet; restore deferred")
-		return true, true, nil
+		return true, true, true, nil
 	case b2SourceMissing:
 		switch target.kind {
 		case b2KindRollback, b2KindFork:
@@ -633,29 +633,29 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
 				"checkpoint "+target.snapshot+" does not exist; restore rejected")
-			return true, false, nil
+			return true, false, false, nil
 		default: // b2KindLostPVC
 			// The A2 fallback: the PVC is lost and the (latest) checkpoint
 			// is gone. Recreate the PVC EMPTY (the A2 PVC-resume — the
 			// content is lost, the Loop continues from the untouched base)
 			// and surface the fallback (I90: VISIBLE).
 			if err := r.ensureWorkspacePVC(ctx, loop); err != nil {
-				return false, true, fmt.Errorf("A2 fallback: recreate workspace PVC empty: %w", err)
+				return false, true, false, fmt.Errorf("A2 fallback: recreate workspace PVC empty: %w", err)
 			}
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
 				"the workspace PVC was lost and checkpoint "+target.snapshot+" does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)")
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
 				"workspace PVC lost, no usable checkpoint; A2 fallback (empty workspace)")
-			return true, false, nil
+			return true, false, false, nil
 		}
 	case b2SourceError:
 		// A transient read failure: no decision, requeue.
 		log.FromContext(ctx).V(1).Info("restore: reading the checkpoint snapshot failed; requeueing (no decision on a transient read failure)",
 			"snapshot", target.snapshot, "kind", string(target.kind))
-		return false, true, nil
+		return false, true, true, nil
 	}
-	return false, false, nil
+	return false, false, false, nil
 }
 
 // forkRetainedSnapshotLabelKey is the label key the fork's operator writes

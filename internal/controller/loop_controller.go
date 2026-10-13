@@ -576,6 +576,20 @@ func (r *LoopReconciler) s4ClaimAndVerifyJob(ctx context.Context, loop *coxv1alp
 	return claimReadPending, advancedFrom, verifyRequeue, s4Changed, nil
 }
 
+// b2GatedBootstrap is the phase bootstrap gated on the B2 hold: when the B2
+// restore step is in progress or deferred (hold), the bootstrap is SKIPPED
+// (the PVC must not be recreated empty — the restore step deletes + recreates
+// it from the snapshot). Returns the bootChanged (the bootstrap's condition
+// change) and the resumeCleared (the P2f resume annotation consumed).
+// Extracted from Reconcile to keep it within the gocyclo budget.
+func (r *LoopReconciler) b2GatedBootstrap(ctx context.Context, loop *coxv1alpha1.Loop, hold bool) (bool, bool, error) {
+	if hold {
+		return false, false, nil // the B2 restore is in progress / deferred / rejected — skip the bootstrap
+	}
+	bootChanged, resumeCleared, err := r.phaseBootstrap(ctx, loop)
+	return bootChanged, resumeCleared, err
+}
+
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var loop coxv1alpha1.Loop
 	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
@@ -667,7 +681,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// transient read failed) ORs into the requeue-after in the FINAL return
 	// (below).
 	var err error
-	b2Changed, b2Requeue, err := r.b2ApplyRestoreStep(ctx, &loop)
+	b2Changed, b2Requeue, b2Hold, err := r.b2ApplyRestoreStep(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -676,13 +690,18 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
 	// phaseBootstrap helper keeps the Reconcile within the gocyclo budget).
-	var resumeCleared bool
-	var bootChanged bool
-	bootChanged, resumeCleared, err = r.phaseBootstrap(ctx, &loop)
+	// B2: when the restore step is in progress or deferred (b2Hold), the
+	// bootstrap SKIPS ensureWorkspacePVC (the restore step deletes + recreates
+	// the PVC from the snapshot; the bootstrap's empty PVC create would mask
+	// the restore decision and recreate the lost PVC empty, defeating the
+	// restore). The sandbox build is also skipped (a restored PVC is invisible
+	// to the sandbox build — the sandbox reads the PVC by name, not spec).
+	bootChanged, resumeCleared, err := r.b2GatedBootstrap(ctx, &loop, b2Hold)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	changed = changed || bootChanged || resumeCleared
+
 	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
 	// and the Required gate. The gate fails the Loop (terminal
 	// Failed:CheckpointUnavailable) at start — before any phase work — when

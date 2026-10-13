@@ -77,7 +77,7 @@ import (
 const (
 	b1HeadCommit = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" // 40-hex
 	b1BaseCommit = "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5" // 40-hex
-	b1Driver     = "hostpath.csi.k8s.io" // the csi-hostpath-driver's provisioner (the kind e2e uses the same)
+	b1Driver     = "hostpath.csi.k8s.io"                      // the csi-hostpath-driver's provisioner (the kind e2e uses the same)
 )
 
 // b1LoopSpec is a minimal Loop (no workspace repo, one acceptance check) so
@@ -103,19 +103,23 @@ func b1Reconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 // b1NewReconciler builds a fresh reconciler for a Loop. withSupport drives
 // the support check to present (the CRD seam is the default — present — and
 // the driver seam resolves b1Driver). withoutCRD overrides
-// snapshotCRDPresent to false (the no-CRD branch). driverUnknown drives the
-// driver seam to ("", false) (the deferred / no-VSC branch).
-func b1NewReconciler(withSupport, withoutCRD, driverUnknown bool) *LoopReconciler {
+// snapshotCRDPresent to false (the no-CRD branch).
+func b1NewReconciler(withSupport, withoutCRD bool) *LoopReconciler {
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	if withoutCRD {
 		r.snapshotCRDPresent = func(context.Context) bool { return false }
 	}
-	switch {
-	case driverUnknown:
-		r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return "", false }
-	case withSupport:
+	if withSupport {
 		r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return b1Driver, true }
 	}
+	return r
+}
+
+// b1NewReconcilerDriverUnknown builds a reconciler where the driver seam
+// resolves ("", false) — the deferred / no-VSC branch.
+func b1NewReconcilerDriverUnknown() *LoopReconciler {
+	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return "", false }
 	return r
 }
 
@@ -125,12 +129,12 @@ func b1NewReconciler(withSupport, withoutCRD, driverUnknown bool) *LoopReconcile
 // openAPIV3Schema, so a nested spec is dropped by the apiserver's structural
 // pruning, which is why a spec-nested object fails validation with "driver:
 // Required value, deletionPolicy: Required value").
-func b1CreateVSC(name string) {
+func b1CreateVSC() {
 	ctx := context.Background()
 	vsc := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion":     snapshotGV,
 		"kind":           volumeSnapshotClassKind,
-		"metadata":       map[string]any{"name": name},
+		"metadata":       map[string]any{"name": "b1-test-vsc"},
 		"driver":         b1Driver,
 		"deletionPolicy": "Delete",
 	}}
@@ -225,8 +229,10 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("takes the workspace checkpoint after a successful verify and records it (create + naming)", func() {
 		ns := "b1-create-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
-		b1CreateVSC("b1-test-vsc")
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
 
 		name := "cploop"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
@@ -234,7 +240,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
-		r := b1NewReconciler(true, false, false)
+		r := b1NewReconciler(true, false)
 		b1DriveToSucceeded(ctx, r, ns, name)
 		b1Reconcile(r, ns, name) // the reconcile that records the successful verify + takes the checkpoint
 
@@ -268,8 +274,10 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("does NOT re-take a checkpoint for an already-recorded iteration (idempotency, the same-Loop update spec I43)", func() {
 		ns := "b1-idem-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
-		b1CreateVSC("b1-test-vsc")
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
 
 		name := "idemloop"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
@@ -277,7 +285,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
-		r := b1NewReconciler(true, false, false)
+		r := b1NewReconciler(true, false)
 		b1DriveToSucceeded(ctx, r, ns, name)
 		b1Reconcile(r, ns, name) // the reconcile that records the successful verify + takes the checkpoint
 
@@ -307,8 +315,10 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("retains the last 3 + every milestone and GCs the rest (retention + GC; the named mutation — break retention — must fail)", func() {
 		ns := "b1-retain-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
-		b1CreateVSC("b1-test-vsc")
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
 
 		name := "retainloop"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
@@ -342,7 +352,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		// Seed the VolumeSnapshot objects the status entries name.
 		b1CreateLoopSnapshots(ctx, loop)
 
-		r := b1NewReconciler(true, false, false)
+		r := b1NewReconciler(true, false)
 		// Reconcile: the operator takes the checkpoint for status.iteration (7 —
 		// a NEW checkpoint, since the last recorded was 6) and applies retention
 		// over the full set {1..6,7}. The keep-set under B1 retention (last 3 =
@@ -389,8 +399,10 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("adds the checkpoint finalizer and holds a deleting Loop until its snapshots are GC'd (finalizer, CleaningUp)", func() {
 		ns := "b1-final-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
-		b1CreateVSC("b1-test-vsc")
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
 
 		name := "finloop"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
@@ -398,7 +410,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
-		r := b1NewReconciler(true, false, false)
+		r := b1NewReconciler(true, false)
 		// A reconcile adds the finalizer.
 		b1Reconcile(r, ns, name)
 		loop := &coxv1alpha1.Loop{}
@@ -459,15 +471,17 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("deletes a deleting Loop with NO snapshots immediately (finalizer does not block on nothing)", func() {
 		ns := "b1-final-none-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
-		b1CreateVSC("b1-test-vsc")
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
 
 		name := "nonefinloop"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
-		r := b1NewReconciler(true, false, false)
+		r := b1NewReconciler(true, false)
 		b1Reconcile(r, ns, name) // adds the finalizer
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
@@ -504,7 +518,9 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("BestEffort without the VolumeSnapshot CRD: CheckpointsAvailable=False (VolumeSnapshotCRDMissing) and the Loop still Succeeds (carries on, I90 visible fallback)", func() {
 		ns := "b1-nocrd-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 		// No VSC created (the CRD is "absent" — the seam overrides
 		// snapshotCRDPresent to false; the support check's CRD branch wins
 		// before any VSC list).
@@ -515,7 +531,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(), // spec.checkpoints unset -> BestEffort (default)
 		})).To(Succeed())
 
-		r := b1NewReconciler(false, true, false) // withoutCRD
+		r := b1NewReconciler(false, true) // withoutCRD
 		b1DriveToSucceeded(ctx, r, ns, name)
 		b1Reconcile(r, ns, name) // the reconcile that records the successful verify + takes the checkpoint
 
@@ -537,7 +553,9 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("Required without the VolumeSnapshot CRD: terminal Failed:CheckpointUnavailable at start (the named mutation — drop the Required check — must fail)", func() {
 		ns := "b1-required-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 
 		name := "reqloop"
 		spec := b1LoopSpec()
@@ -547,7 +565,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       spec,
 		})).To(Succeed())
 
-		r := b1NewReconciler(false, true, false) // withoutCRD
+		r := b1NewReconciler(false, true) // withoutCRD
 		// A single reconcile at start must fail the Loop (terminal).
 		loop := b1Reconcile(r, ns, name)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
@@ -567,7 +585,9 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	It("BestEffort with a known driver but no matching VolumeSnapshotClass: CheckpointsAvailable=False (NoSnapshotClassForDriver) and the Loop still Succeeds", func() {
 		ns := "b1-novsc-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 		// A VSC exists but for a DIFFERENT driver (the support check's
 		// list-and-match finds no match for b1Driver -> NoSnapshotClassForDriver).
 		// The v1 VSC schema is FLAT (driver at the top level, not under spec).
@@ -587,7 +607,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
-		r := b1NewReconciler(true, false, false) // the driver is known (b1Driver), but no matching VSC
+		r := b1NewReconcilerDriverUnknown() // the driver seam resolves ("", false) — no matching VSC
 		b1DriveToSucceeded(ctx, r, ns, name)
 		b1Reconcile(r, ns, name) // the reconcile that records the successful verify + takes the checkpoint
 

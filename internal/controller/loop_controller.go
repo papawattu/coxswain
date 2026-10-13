@@ -569,15 +569,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// delete is processed — the sandbox is owned by the Loop and the operator
 	// deletes it explicitly when the Loop is cleaned up; the snapshot GC is
 	// the last thing the Loop owns).
-	if !loop.DeletionTimestamp.IsZero() {
-		return r.reconcileCleaningUp(ctx, &loop)
-	}
-
 	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
 	// on the first reconcile; idempotent). It is what keeps the Loop alive
 	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
-	if err := r.applyLoopFinalizer(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
+	if done, res, err := r.reconcileDeletionAndFinalizer(ctx, &loop); done || err != nil {
+		return res, err
 	}
 
 	// C6a + D34: validate the referenced AgentPolicies and the
@@ -606,7 +602,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
 	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
 	// budget).
-	changed, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
+	changed := false
+	_, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -620,31 +617,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// change: the CRD or a VolumeSnapshotClass can be installed later), but
 	// the gate fires only once (a Failed Loop is terminal and nothing reverts
 	// it). When the gate fires, stop this reconcile (the status write
-	 // persists the terminal phase; no sandbox / proxy / verify work runs for a
+	// persists the terminal phase; no sandbox / proxy / verify work runs for a
 	// Loop that cannot be checkpointed).
-	if cpChanged, cpTerminal := r.applyCheckpointConditions(ctx, &loop); cpTerminal {
-		setCondition(&loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
-			checkpointUnavailableReason,
-			"spec.checkpoints=Required but checkpoints are not available (the CheckpointsAvailable condition names the reason); the Loop fails at start (D59: checkpoints are mandatory only when the Loop asks for them)")
-		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
-		_ = cpChanged // the condition is already folded into the status
-		if err := r.Status().Update(ctx, &loop); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+	// The checkpoint gate + proxy/netpolicies + observedGeneration are
+	// grouped into the reconcileMid helper to keep Reconcile within the
+	// gocyclo budget.
+	if done, err := r.reconcileMid(ctx, &loop); done || err != nil {
+		return ctrl.Result{}, err
 	}
-
+	changed = true // the condition was (re)set by applyCheckpointGate
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	changed = changed || policiesChanged
-	if loop.Status.ObservedGeneration != loop.Generation {
-		loop.Status.ObservedGeneration = loop.Generation
-		changed = true
-	}
+	changed = changed || r.ensureObservedGeneration(&loop)
 	// S4 (ADR-0004): read the runner's claim from the agent container's
 	// termination message (APIReader path — the sandbox pod is not in the
 	// manager's Pod cache, so the non-cached client is required; the S3 baseCommit
@@ -680,28 +668,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// no iterate/stall/budget decision because the phase is Paused, not
 	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
 	verifyRequeue := false
-	if !loopPaused(&loop) {
-		if err := r.ensureVerifyJob(ctx, &loop); err != nil {
-			if errors.Is(err, errVerifyStaleDeleted) {
-				verifyRequeue = true
-			} else {
-				return ctrl.Result{}, err
-			}
+	if err := r.ensureVerifyJobAndNetPolicies(ctx, &loop); err != nil {
+		if errors.Is(err, errVerifyStaleDeleted) {
+			verifyRequeue = true
+		} else {
+			return ctrl.Result{}, err
 		}
-	}
-	if err := r.ensureVerifyNetworkPolicy(ctx, &loop); err != nil {
-		return ctrl.Result{}, err
 	}
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
-	// B1: after a successful verify, take the workspace checkpoint
-	// (checkpoint-<loop>-iter-<N>) and apply retention (GC the non-kept
-	// snapshots). It runs after applyVerifyOutcome so the phase is Succeeded
-	// when the checkpoint is taken (the verify outcome flips the phase in the
-	// same reconcile). It is idempotent (one checkpoint per iteration, guarded
-	// by status.checkpoint.iteration == status.iteration).
-	if cpChanged, cpRequeue := r.ensureCheckpoint(ctx, &loop); cpChanged || cpRequeue {
+	// B1: after a successful verify, take the workspace checkpoint and apply
+	// retention (the extracted step keeps Reconcile within the gocyclo budget).
+	if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop); cpChanged || cpRequeue {
 		changed = changed || cpChanged
 		verifyRequeue = verifyRequeue || cpRequeue
 	}
@@ -741,9 +720,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if hashChanged {
-		changed = true
-	}
+	changed = changed || hashChanged
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
 	// container's termination message (read via the operator's own APIReader
 	// path — NOT a cached client, NOT a kubelet ReadFile) carries the resolved
@@ -792,19 +769,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// P2d item 10: the wall-clock RequeueAfter (the quiet-Loop rule) is the
-	// ONLY timer this reconcile sets: when spec.budget.maxWallClock is set and
-	// not yet hit, a Loop with no other activity (no baseCommit/claim/verify/
-	// deliver requeue) re-reconciles at the remaining time so the wall clock
-	// still trips. The pending flags are 5s timers; the wall clock is exact.
-	if !r.baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	if budgetRequeue > 0 {
-		return ctrl.Result{RequeueAfter: budgetRequeue}, nil
-	}
-	return ctrl.Result{}, nil
+	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue), nil
 }
 
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
@@ -5315,4 +5280,67 @@ func isNonCanonicalPath(p string) bool {
 		return true
 	}
 	return false
+}
+
+// reconcileMid runs the checkpoint gate (applyCheckpointGate). Returns
+// (result, done, err): done is true when the gate fired (the caller should
+// return the result and stop this reconcile).
+func (r *LoopReconciler) reconcileMid(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	return r.applyCheckpointGate(ctx, loop)
+}
+
+// ensureVerifyJobIfActive is the ensureVerifyJob call gated on phase !=
+// Paused, extracted to keep Reconcile within the gocyclo budget.
+func (r *LoopReconciler) ensureVerifyJobIfActive(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if loopPaused(loop) {
+		return nil
+	}
+	return r.ensureVerifyJob(ctx, loop)
+}
+
+// ensureObservedGeneration sets loop.Status.ObservedGeneration to
+// loop.Generation when they differ, returning whether it changed.
+func (r *LoopReconciler) ensureObservedGeneration(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.ObservedGeneration != loop.Generation {
+		loop.Status.ObservedGeneration = loop.Generation
+		return true
+	}
+	return false
+}
+
+// reconcileDeletionAndFinalizer handles the deletion branch (CleaningUp) and
+// the finalizer application. Returns (done, result, err): done is true when
+// the caller should return the result (deletion or error).
+func (r *LoopReconciler) reconcileDeletionAndFinalizer(ctx context.Context, loop *coxv1alpha1.Loop) (bool, ctrl.Result, error) {
+	if !loop.DeletionTimestamp.IsZero() {
+		res, err := r.reconcileCleaningUp(ctx, loop)
+		return true, res, err
+	}
+	if err := r.applyLoopFinalizer(ctx, loop); err != nil {
+		return true, ctrl.Result{}, err
+	}
+	return false, ctrl.Result{}, nil
+}
+
+// ensureVerifyJobAndNetPolicies is the ensureVerifyJobIfActive +
+// ensureVerifyNetworkPolicy pair, extracted to keep Reconcile within the
+// gocyclo budget.
+func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	if err := r.ensureVerifyJobIfActive(ctx, loop); err != nil {
+		return err
+	}
+	return r.ensureVerifyNetworkPolicy(ctx, loop)
+}
+
+// reconcileRequeueAfter is the trailing requeue decision, extracted to keep
+// Reconcile within the gocyclo budget. P2d item 10: the wall-clock
+// RequeueAfter (the quiet-Loop rule) is the ONLY timer this reconcile sets.
+func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue time.Duration) ctrl.Result {
+	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+	if budgetRequeue > 0 {
+		return ctrl.Result{RequeueAfter: budgetRequeue}
+	}
+	return ctrl.Result{}
 }

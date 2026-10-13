@@ -50,16 +50,16 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // The snapshot types are handled as unstructured (the operator never
@@ -69,25 +69,24 @@ import (
 
 // GVKs for the VolumeSnapshot family (snapshot.storage.k8s.io/v1).
 const (
+	// snapshotGroup is the API group for the VolumeSnapshot family.
+	snapshotGroup = "snapshot.storage.k8s.io"
+
 	snapshotGV = "snapshot.storage.k8s.io/v1"
 
-	volumeSnapshotKind         = "VolumeSnapshot"
-	volumeSnapshotListKind     = "VolumeSnapshotList"
-	volumeSnapshotClassKind    = "VolumeSnapshotClass"
-	volumeSnapshotContentKind  = "VolumeSnapshotContent"
+	volumeSnapshotKind        = "VolumeSnapshot"
+	volumeSnapshotListKind    = "VolumeSnapshotList"
+	volumeSnapshotClassKind   = "VolumeSnapshotClass"
+	volumeSnapshotContentKind = "VolumeSnapshotContent"
 )
 
 // volumeSnapshotGVK is the GVK the operator creates and reads for the
 // per-Loop checkpoints (the unstructured watch + the cached List/Get).
-var volumeSnapshotGVK = schema.GroupVersionKind{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: volumeSnapshotKind}
+var volumeSnapshotGVK = schema.GroupVersionKind{Group: snapshotGroup, Version: "v1", Kind: volumeSnapshotKind}
 
 // volumeSnapshotListGVK is the GVK the operator's cached client uses for
 // List (controller-runtime derives the list type from the Kind + "List").
-var volumeSnapshotListGVK = schema.GroupVersionKind{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: volumeSnapshotListKind}
-
-// volumeSnapshotClassGVK is the GVK the operator reads for the
-// VolumeSnapshotClass (cluster-scoped) that backs the PVC's CSI driver.
-var volumeSnapshotClassGVK = schema.GroupVersionKind{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: volumeSnapshotClassKind}
+var volumeSnapshotListGVK = schema.GroupVersionKind{Group: snapshotGroup, Version: "v1", Kind: volumeSnapshotListKind}
 
 // B1 checkpoint condition reasons (the CheckpointsAvailableCondition's
 // named reasons; D59 requires the fallback to be NAMED and visible).
@@ -142,8 +141,8 @@ func newVolumeSnapshotObj(loop *coxv1alpha1.Loop, name string) *unstructured.Uns
 			"name":      name,
 			"namespace": loop.Namespace,
 			"labels": map[string]any{
-				"app.kubernetes.io/managed-by": "coxswain",
-				"coxswain.wattu.com/loop":      loop.Name,
+				managedByLabel: partOfCoxswain,
+				loopLabelKey:   loop.Name,
 			},
 		},
 		"spec": map[string]any{
@@ -351,7 +350,7 @@ func (r *LoopReconciler) applyCheckpointConditions(ctx context.Context, loop *co
 // list.SetNamespace("") and no InNamespace option (the standard idiom for
 // cluster-scoped types through a namespaced cache — the same as the
 // StorageClass read, which uses a bare-name key).
-var volumeSnapshotClassListGVK = schema.GroupVersionKind{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshotClassList"}
+var volumeSnapshotClassListGVK = schema.GroupVersionKind{Group: snapshotGroup, Version: "v1", Kind: "VolumeSnapshotClassList"}
 
 // snapshotClassForDriver lists the VolumeSnapshotClasses (cluster-scoped,
 // unstructured, via a namespaced empty list) and returns the one whose
@@ -367,7 +366,9 @@ func (r *LoopReconciler) snapshotClassForDriver(ctx context.Context, driver stri
 	list.SetGroupVersionKind(volumeSnapshotClassListGVK)
 	// cluster-scoped: the namespace must be empty (a cluster-scoped type read
 	// through a namespaced client with a non-empty namespace errors).
-	unstructured.SetNestedField(list.Object, "", "metadata", "namespace")
+	if err := unstructured.SetNestedField(list.Object, "", "metadata", "namespace"); err != nil {
+		return nil, false
+	}
 	if err := r.List(ctx, list); err != nil {
 		return nil, false
 	}
@@ -400,25 +401,15 @@ func (r *LoopReconciler) snapshotClassForDriver(ctx context.Context, driver stri
 // B1's durability record is the snapshot OBJECT's existence, not the
 // content's readiness; B2's restore waits for ReadyToUse).
 func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, requeue bool) {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded {
-		// B1 takes checkpoints after each successful verify. The verify
-		// outcome (applyVerifyOutcome) flips the phase to Succeeded in the
-		// same reconcile; the checkpoint step runs AFTER that flip (the
-		// Reconcile calls it after applyVerifyOutcome), so by the time
-		// ensureCheckpoint runs the phase is Succeeded and the just-completed
-		// iteration is status.iteration. (A Loop that is already Succeeded
-		// from a previous reconcile does NOT re-take: the idempotency guard
-		// below — a recorded checkpoint for status.iteration means the
-		// snapshot is already recorded.)
-		// A Loop at Succeeded from a PREVIOUS verify (a second successful
-		// verify is impossible in B1 — the phase machine is one-shot,
-		// ADR-0003: a successful verify is terminal) has the same iteration,
-		// so the guard is the idempotency.
-	}
 	// Idempotency: a checkpoint is taken ONCE per iteration (the
 	// checkpoint-<loop>-iter-<N> name is unique per iteration — iteration
 	// numbers are never reused). If status.checkpoint already records
 	// status.iteration, the snapshot is already taken; do not re-create it.
+	// B1 takes checkpoints after each successful verify. The verify outcome
+	// (applyVerifyOutcome) flips the phase to Succeeded in the same reconcile;
+	// the checkpoint step runs AFTER that flip. A Loop at Succeeded from a
+	// PREVIOUS verify does NOT re-take (the idempotency guard below — a recorded
+	// checkpoint for status.iteration means the snapshot is already recorded).
 	if cp := loop.Status.Checkpoint; cp != nil && cp.Iteration == loop.Status.Iteration {
 		return false, false
 	}
@@ -702,3 +693,39 @@ func nowTime(r *LoopReconciler) metav1.Time {
 // Unused imports guard: client.ObjectKey is the key type for the
 // cluster-scoped reads (the StorageClass Get uses a bare name key).
 var _ = client.ObjectKey{}
+
+// ensureCheckpointStep is the B1 checkpoint step extracted from Reconcile to
+// keep the gocyclo budget. It runs after applyVerifyOutcome: it takes the
+// workspace checkpoint (checkpoint-<loop>-iter-<N>) and applies retention
+// (GC the non-kept snapshots). It is idempotent (one checkpoint per
+// iteration, guarded by status.checkpoint.iteration == status.iteration).
+// Returns (changed, requeue): changed is true when a snapshot was created
+// or GC'd; requeue is true when the GC is pending.
+func (r *LoopReconciler) ensureCheckpointStep(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, requeue bool) {
+	cpChanged, cpRequeue := r.ensureCheckpoint(ctx, loop)
+	changed = cpChanged
+	requeue = cpRequeue
+	return
+}
+
+// applyCheckpointGate is the B1 Required gate extracted from Reconcile to
+// keep the gocyclo budget. It runs applyCheckpointConditions and, when the
+// gate fires (spec.checkpoints=Required and the snapshot support is absent),
+// sets the terminal Failed:CheckpointUnavailable phase and writes the
+// status. Returns (result, done): done is true when the gate fired (the
+// caller should return the result and stop this reconcile).
+func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	_, cpTerminal := r.applyCheckpointConditions(ctx, loop)
+	if !cpTerminal {
+		return false, nil
+	}
+	setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+		checkpointUnavailableReason,
+		"spec.checkpoints=Required but checkpoints are not available (the CheckpointsAvailable condition names the reason); the Loop fails at start (D59: checkpoints are mandatory only when the Loop asks for them)")
+	loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+	if err := r.Status().Update(ctx, loop); err != nil {
+		return false, err
+	}
+	return true, nil
+}

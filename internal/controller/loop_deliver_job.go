@@ -787,9 +787,9 @@ func (r *LoopReconciler) buildDeliverJob(loop *coxv1alpha1.Loop) *batchv1.Job {
 // NetworkPolicy selects on this; the Job stamps it on the pod template).
 func deliverJobLabels(loopName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/managed-by": partOfCoxswain,
-		"app.kubernetes.io/component":  deliverComponent,
-		deliverForLabel:                loopName,
+		managedByLabel:                partOfCoxswain,
+		"app.kubernetes.io/component": deliverComponent,
+		deliverForLabel:               loopName,
 	}
 }
 

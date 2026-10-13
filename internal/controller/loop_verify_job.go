@@ -215,10 +215,10 @@ func verifyJobName(loop *coxv1alpha1.Loop) string {
 // is the "coxswain.io/verify-for" label.
 func verifyJobLabels(loopName string) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/part-of":    partOfCoxswain,
-		verifyLoopLabel:                loopName,
-		verifyForLabel:                 loopName,
-		"app.kubernetes.io/managed-by": "coxswain-controller",
+		"app.kubernetes.io/part-of": partOfCoxswain,
+		verifyLoopLabel:             loopName,
+		verifyForLabel:              loopName,
+		managedByLabel:              "coxswain-controller",
 	}
 }
 

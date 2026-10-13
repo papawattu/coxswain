@@ -34,18 +34,17 @@ import (
 // parsed role.yaml. If a new type is added to the controller, this test
 // will fail until the RBAC markers are updated and `make manifests` is run.
 const (
-	coxGroup         = "coxswain.wattu.com"
-	storageGroup     = "storage.k8s.io"
-	agentsGroup      = "agents.x-k8s.io"
-	snapshotGroup    = "snapshot.storage.k8s.io"
-	networkingGroup  = "networking.k8s.io"
-	batchGroup       = "batch"
-	coreGroup        = ""
-	verbGet          = "get"
-	verbList         = "list"
-	verbWatch        = "watch"
-	verbCreate       = "create"
-	verbUpdate       = "update"
+	coxGroup        = "coxswain.wattu.com"
+	storageGroup    = "storage.k8s.io"
+	agentsGroup     = "agents.x-k8s.io"
+	networkingGroup = "networking.k8s.io"
+	batchGroup      = "batch"
+	coreGroup       = ""
+	verbGet         = "get"
+	verbList        = "list"
+	verbWatch       = "watch"
+	verbCreate      = "create"
+	verbUpdate      = "update"
 )
 
 // knownResourceGroup is the trusted table of resource -> its real API group,
@@ -68,17 +67,17 @@ var knownResourceGroup = map[string]string{
 	"configmaps":             coreGroup,
 	"persistentvolumeclaims": coreGroup,
 	// non-core
-	"storageclasses":          storageGroup,
-	"sandboxes":               agentsGroup,
-	"sandboxes/status":        agentsGroup,
-	"volumesnapshots":         snapshotGroup,
-	"volumesnapshotclasses":   snapshotGroup,
-	"networkpolicies":         networkingGroup,
-	"jobs":                    batchGroup,
-	"loops":                   coxGroup,
-	"loops/status":            coxGroup,
-	"loops/finalizers":        coxGroup,
-	"agentpolicies":           coxGroup,
+	"storageclasses":        storageGroup,
+	"sandboxes":             agentsGroup,
+	"sandboxes/status":      agentsGroup,
+	"volumesnapshots":       snapshotGroup,
+	"volumesnapshotclasses": snapshotGroup,
+	"networkpolicies":       networkingGroup,
+	"jobs":                  batchGroup,
+	"loops":                 coxGroup,
+	"loops/status":          coxGroup,
+	"loops/finalizers":      coxGroup,
+	"agentpolicies":         coxGroup,
 }
 
 // groupForResource returns the resource's real API group from the trusted
@@ -338,7 +337,7 @@ func TestRBACCachedClientReads(t *testing.T) {
 		// client (ensureCheckpoint / applyCheckpointRetention / gcLoopCheckpoints).
 		{snapshotGroup, "volumesnapshots"},
 		{snapshotGroup, "volumesnapshotclasses"}, // the support check
-		{storageGroup, "storageclasses"},        // the support check (the PVC's CSI driver; group storage.k8s.io, NOT core "")
+		{storageGroup, "storageclasses"},         // the support check (the PVC's CSI driver; group storage.k8s.io, NOT core "")
 	}
 
 	// Group-correctness assertion (the B1 storageclasses P1 guard): for every

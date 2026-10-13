@@ -414,11 +414,13 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	if cp := loop.Status.Checkpoint; cp != nil && cp.Iteration == iteration {
 		return false, false
 	}
-	// The checkpoint is taken only when the verify outcome is known (the
-	// phase is NOT Verifying — the verify is complete). A verify still
-	// running (phase == Verifying) does not get a checkpoint (the outcome
-	// is unknown yet; the Milestone flag would be set incorrectly).
-	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
+	// The checkpoint is taken only when the verify outcome is known. The
+	// verify outcome is known when the verify Job pod is terminated (the
+	// verify is complete). A verify still running (the pod is not terminated)
+	// does not get a checkpoint (the outcome is unknown; the Milestone flag
+	// would be set incorrectly). The Milestone flag is set to whether the
+	// verify passed (the phase is Succeeded only when the verify passed).
+	if !r.verifyPodTerminated(ctx, loop) {
 		return false, false
 	}
 	// The support check gates the create (D59). When support is absent:
@@ -739,4 +741,17 @@ func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alp
 		return condChanged, false, err
 	}
 	return condChanged, true, nil
+}
+
+// verifyPodTerminated reports whether the verify Job pod is terminated
+// (the verify is complete). The pod is found via the Loop's verify Job name
+// and the verify-for label. If the pod does not exist or is not terminated,
+// the verify is still running (or has not started), and the checkpoint
+// should not be taken.
+func (r *LoopReconciler) verifyPodTerminated(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	pod, err := r.readVerifyJobPod(ctx, loop)
+	if err != nil || pod == nil {
+		return false // no pod: the verify has not started or the pod is gone
+	}
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }

@@ -199,19 +199,16 @@ func b1CheckpointCondition(loop *coxv1alpha1.Loop) *metav1.Condition {
 // returns the reconciler (the caller keeps using it) so the spec can read the
 // fresh Loop and assert the checkpoint the reconcile took.
 func b1DriveToSucceeded(ctx context.Context, r *LoopReconciler, ns, name string) {
-	// Drive to Verifying (the S5a helper does the bootstrap -> planning ->
-	// implementing-claim-with-headCommit -> Verifying advance).
-	_ = r
-	_ = s5aDriveToVerifying(ns, name)
+	// Drive to Verifying using the SPEC's reconciler r (so the driver seam
+	// and CRD seam are active on every reconcile, not just the final one).
+	s5aDriveToVerifyingWithReconciler(r, ns, name)
 	// The successful verify pod (a stand-in the operator's verify path reads
 	// init exit codes from; envtest has no Job controller).
 	jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 	s5aVerifyPod(ctx, ns, name, jobName, 0)
 	// Reconcile: the successful verify -> Succeeded, iteration 1, and the
 	// checkpoint is taken (after applyVerifyOutcome flips the phase).
-	// (The reconcile is performed by the SPEC's reconciler r — b1Reconcile is
-	// the caller's, so the spec reconciles after this helper returns; the
-	// helper sets up the verify pod so that reconcile records the outcome.)
+	b1Reconcile(r, ns, name)
 }
 
 var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {

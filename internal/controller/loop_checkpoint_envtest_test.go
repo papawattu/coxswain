@@ -115,7 +115,6 @@ func b1NewReconciler(withSupport, withoutCRD bool) *LoopReconciler {
 	return r
 }
 
-
 // b1CreateVSC creates the cluster-scoped VolumeSnapshotClass (unstructured).
 // The vendored CRD's v1 schema is FLAT (driver and deletionPolicy at the top
 // level, NOT nested under a spec key — the spec key is not in the v1

@@ -194,6 +194,14 @@ type VerifyStatus struct {
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 
+	// iteration is the Loop iteration the verify ran at (recorded when the
+	// verify outcome is applied). The checkpoint for this verify is named
+	// checkpoint-<loop>-iter-<iteration>. The operator records it so the
+	// checkpoint step can key off the recorded outcome (not the current
+	// iteration, which may have been incremented on the iterate path).
+	// +optional
+	Iteration int `json:"iteration,omitempty"`
+
 	// tamperExitCode is the tamper-check init container's exit code. A NON-NIL
 	// value means the operator copied it from a TERMINATED tamper init container
 	// (0 = clean, non-zero = a protected path differs between baseCommit and

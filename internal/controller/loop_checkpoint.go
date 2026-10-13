@@ -400,28 +400,24 @@ func (r *LoopReconciler) snapshotClassForDriver(ctx context.Context, driver stri
 // reconcile to confirm it is recorded / the content is ReadyToUse — though
 // B1's durability record is the snapshot OBJECT's existence, not the
 // content's readiness; B2's restore waits for ReadyToUse).
-func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1.Loop, iteration int) (changed bool, requeue bool) {
-	// Idempotency: a checkpoint is taken ONCE per iteration (the
-	// checkpoint-<loop>-iter-<N> name is unique per iteration — iteration
-	// numbers are never reused). If status.checkpoint already records
-	// iteration, the snapshot is already taken; do not re-create it.
-	// B1 takes checkpoints after each verify (pass or fail). The iteration
-	// parameter is the PRE-verify iteration (the iteration the verify ran
-	// at, captured before applyVerifyOutcome increments it on the iterate
-	// path). A Loop at Succeeded from a PREVIOUS verify does NOT re-take
-	// (the idempotency guard below — a recorded checkpoint for iteration
-	// means the snapshot is already recorded).
-	if cp := loop.Status.Checkpoint; cp != nil && cp.Iteration == iteration {
-		return false, false
+func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, requeue bool) {
+	// The checkpoint is keyed off the operator-recorded verify outcome
+	// (status.verify.iteration), not the current iteration. The current
+	// iteration may have been incremented on the iterate path (N -> N+1),
+	// so keying off it would lose the checkpoint for iteration N on retry
+	// and could create a wrong checkpoint (iter-N+1 before N+1 has
+	// implemented or verified anything).
+	if loop.Status.Verify == nil || loop.Status.Verify.Iteration == 0 {
+		return false, false // no recorded verify outcome yet
 	}
-	// The checkpoint is taken only when the verify outcome is known. The
-	// verify outcome is known when the verify Job pod is terminated (the
-	// verify is complete). A verify still running (the pod is not terminated)
-	// does not get a checkpoint (the outcome is unknown; the Milestone flag
-	// would be set incorrectly). The Milestone flag is set to whether the
-	// verify passed (the phase is Succeeded only when the verify passed).
-	if !r.verifyPodTerminated(ctx, loop) {
-		return false, false
+	iteration := loop.Status.Verify.Iteration
+	// Idempotency: a checkpoint is taken ONCE per iteration. If
+	// status.checkpoints already has an entry for this iteration, the
+	// snapshot is already taken; do not re-create it.
+	for _, cp := range loop.Status.Checkpoints {
+		if cp.Iteration == iteration {
+			return false, false
+		}
 	}
 	// The support check gates the create (D59). When support is absent:
 	// BestEffort carries on (the condition is False, set by
@@ -471,7 +467,7 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	entry := coxv1alpha1.CheckpointStatus{
 		Iteration: iteration,
 		Name:      name,
-		Milestone: loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded, // milestone only when the verify passed
+		Milestone: verifyMilestone(loop), // milestone = all lastCheckResults exit codes are 0
 		At:        at,
 	}
 	loop.Status.Checkpoint = &entry
@@ -713,8 +709,8 @@ var _ = client.ObjectKey{}
 // ran at, captured before applyVerifyOutcome increments it on the iterate
 // path). Returns (changed, requeue): changed is true when a snapshot was
 // created or GC'd; requeue is true when the GC is pending.
-func (r *LoopReconciler) ensureCheckpointStep(ctx context.Context, loop *coxv1alpha1.Loop, iteration int) (changed bool, requeue bool) {
-	cpChanged, cpRequeue := r.ensureCheckpoint(ctx, loop, iteration)
+func (r *LoopReconciler) ensureCheckpointStep(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, requeue bool) {
+	cpChanged, cpRequeue := r.ensureCheckpoint(ctx, loop)
 	changed = cpChanged
 	requeue = cpRequeue
 	return
@@ -743,23 +739,21 @@ func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alp
 	return condChanged, true, nil
 }
 
-// verifyPodTerminated reports whether the verify Job pod is terminated
-// (the verify is complete). The pod is found via the Loop's verify Job name
-// and the verify-for label. If the pod does not exist or is not terminated,
-// the verify is still running (or has not started), and the checkpoint
-// should not be taken.
-func (r *LoopReconciler) verifyPodTerminated(ctx context.Context, loop *coxv1alpha1.Loop) bool {
-	pod, err := r.readVerifyJobPod(ctx, loop)
-	if err != nil || pod == nil {
-		return false // no pod: the verify has not started or the pod is gone
+// verifyMilestone reports whether the verify passed (all lastCheckResults
+// exit codes are 0). A nil entry means the check did not run (I14 NotRun),
+// which is NOT a pass. An empty lastCheckResults (no checks) is a pass
+// (vacuously true).
+func verifyMilestone(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Verify == nil {
+		return false
 	}
-	// The verify is complete when all init containers are terminated
-	// (the checks have run). In envtest the pod phase is not set
-	// automatically, so check the init container statuses directly.
-	for i := range pod.Status.InitContainerStatuses {
-		if pod.Status.InitContainerStatuses[i].State.Terminated == nil {
-			return false // an init container is still running
+	for _, code := range loop.Status.Verify.LastCheckResults {
+		if code == nil {
+			return false // a check did not run
+		}
+		if *code != 0 {
+			return false // a check failed
 		}
 	}
-	return len(pod.Status.InitContainerStatuses) > 0
+	return true
 }

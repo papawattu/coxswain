@@ -1082,6 +1082,39 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	if requeue {
 		return false, true
 	}
+	// Record the completed verify outcome in status.verify (the operator's
+	// own record of the verify result). The checkpoint step keys off this
+	// record (status.verify.iteration) to ensure the checkpoint for the
+	// completed verify is taken (level-based: retried on every reconcile if
+	// the checkpoint is not yet recorded). The Milestone flag is derived from
+	// lastCheckResults (all exit codes are 0 = the verify passed).
+	if loop.Status.Verify == nil {
+		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
+	}
+	loop.Status.Verify.Iteration = loop.Status.Iteration
+	// Record the check exit codes (one per acceptance check, in order).
+	// A check that did not run (the pod status lacks it) is recorded as nil.
+	if pod != nil {
+		results := make([]*int32, checkCount)
+		for i := range checkCount {
+			name := fmt.Sprintf("check-%d", i)
+			found := false
+			for j := range pod.Status.InitContainerStatuses {
+				if pod.Status.InitContainerStatuses[j].Name == name {
+					if pod.Status.InitContainerStatuses[j].State.Terminated != nil {
+						code := pod.Status.InitContainerStatuses[j].State.Terminated.ExitCode
+						results[i] = &code
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				results[i] = nil // the check did not run
+			}
+		}
+		loop.Status.Verify.LastCheckResults = results
+	}
 	switch outcome {
 	case verifySucceeded:
 		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded

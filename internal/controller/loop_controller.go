@@ -675,22 +675,15 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			return ctrl.Result{}, err
 		}
 	}
-	// B1: the checkpoint is level-based (not edge-triggered): on every
-	// reconcile, if the current iteration's checkpoint is not recorded, ensure
-	// it (create is idempotent on AlreadyExists). The iteration captured here
-	// is the PRE-verify iteration (the iteration the verify ran at, before
-	// applyVerifyOutcome increments it on the iterate path), so the checkpoint
-	// is named iter-N for the verify that ran at iteration N.
-	preVerifyIteration := loop.Status.Iteration
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 	// B1: take the workspace checkpoint and apply retention. The checkpoint
 	// step runs on every reconcile (level-based); the idempotency guard in
 	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
-	// The Milestone flag is set to whether the verify passed (the phase is
-	// Succeeded only when the verify passed).
-	if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop, preVerifyIteration); cpChanged || cpRequeue {
+	// The checkpoint is keyed off the operator-recorded verify outcome
+	// (status.verify.iteration), not the current iteration.
+	if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop); cpChanged || cpRequeue {
 		changed = changed || cpChanged
 		verifyRequeue = verifyRequeue || cpRequeue
 	}

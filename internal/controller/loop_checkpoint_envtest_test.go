@@ -316,13 +316,18 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		})).To(Succeed())
 
 		r := b1NewReconciler(true, false)
+		// Drive the Loop to Verifying (iteration 0) using the SPEC's
+		// reconciler r (so the driver seam and CRD seam are active on every
+		// reconcile).
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
 		// Set the iteration to 7 (the spec is testing the retention GC with
 		// a new checkpoint at iteration 7; the hand-built fixtures are for
 		// iterations 1..6). The verify outcome is applied on the next
-		// reconcile (verifyChanged is true), and the checkpoint step takes
-		// the new checkpoint for iteration 7 and applies retention over the
-		// full set {1..6,7}. The keep-set under B1 retention (last 3 = iters
-		// 5,6,7 + the milestones 5,6) = {5,6,7}; the GC'd set = {1,2,3,4}.
+		// reconcile, and the checkpoint step takes the new checkpoint for
+		// iteration 7 (the pre-verify iteration) and applies retention over
+		// the full set {1..6,7}. The keep-set under B1 retention (last 3 =
+		// iters 5,6,7 + the milestones 5,6) = {5,6,7}; the GC'd set =
+		// {1,2,3,4}.
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		loop.Status.Iteration = 7
@@ -343,9 +348,6 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		// Seed the VolumeSnapshot objects the hand-built entries name.
 		b1CreateLoopSnapshots(ctx, loop)
-		// Drive the Loop to Verifying using the SPEC's reconciler r (so the
-		// driver seam and CRD seam are active on every reconcile).
-		s5aDriveToVerifyingWithReconciler(r, ns, name)
 		// The successful verify pod (a stand-in the operator's verify path
 		// reads init exit codes from; envtest has no Job controller).
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})

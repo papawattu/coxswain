@@ -218,6 +218,13 @@ type VerifyStatus struct {
 	// (one entry per acceptance check, in order) to feed forward (B3). A nil entry
 	// means that check did not run (I14 NotRun); a non-nil 0 means it ran and
 	// passed. B3 distinguishes the two.
+	//
+	// The operator records a still-running or never-run check as the -1 sentinel
+	// (the API server rejects a nil element): -1 means "no exit code yet" — the
+	// check is still running, or it was not in the pod status at all — and is NOT
+	// a pass. The B1 milestone check treats any non-zero entry (including -1) as
+	// "the verify did not pass", so a -1 entry never flips a checkpoint into a
+	// milestone.
 	// +listType=atomic
 	// +optional
 	LastCheckResults []*int32 `json:"lastCheckResults,omitempty"`

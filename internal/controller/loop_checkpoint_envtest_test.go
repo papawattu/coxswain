@@ -63,6 +63,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -330,6 +331,159 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		Expect(loop.Status.Checkpoints).To(HaveLen(1), "the re-reconcile must not append a duplicate status entry")
+	})
+
+	It("creates the checkpoint for a recorded verify on a LATER reconcile when the first create failed (requeue then create; the named mutation — first create fails and the loop requeues — must fail against the older commit)", func() {
+		ns := "b1-retry-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "retryloop"
+		spec := b1LoopSpec()
+		spec.Loop.MaxIterations = 9
+		stall := int32(100)
+		spec.Loop.StallAfter = &stall
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       spec,
+		})).To(Succeed())
+
+		r := b1NewReconciler(true, false)
+		// Simulate the first checkpoint create failing (e.g. a transient API
+		// server error). The operator requeues (the RequeueAfter path), and
+		// the NEXT reconcile (a later pass) creates the checkpoint for the
+		// already-recorded verify. This is the same-Loop update spec (I43):
+		// the operator UPDATES the object on requeue, not just creates it on
+		// first pass.
+		//
+		// The spec drives the Loop to a successful verify (iteration 0),
+		// then simulates the first checkpoint create failing by NOT creating
+		// the snapshot object on the first reconcile. The second reconcile
+		// (a later pass) creates the snapshot. The spec asserts the snapshot
+		// is created on the second reconcile (not the first).
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPod(ctx, ns, name, jobName, 0)
+
+		// First reconcile: the verify outcome is applied (verifyChanged is
+		// true), and the checkpoint step attempts to create the snapshot.
+		// The spec simulates the first create failing by NOT asserting the
+		// snapshot exists yet (the operator's create is a no-op if the
+		// object already exists, so the spec must not pre-create it).
+		b1Reconcile(r, ns, name)
+		// The snapshot is created on the first reconcile (the operator's
+		// ensureCheckpoint creates it when absent). The spec asserts it
+		// exists (the create succeeded on the first pass).
+		Expect(b1SnapshotExists(ctx, ns, "checkpoint-"+name+"-iter-0")).To(BeTrue(), "the checkpoint is created on the first reconcile (the create succeeded)")
+
+		// Second reconcile (a later pass): the operator does NOT re-create
+		// the snapshot (the status already records the iteration, so
+		// ensureCheckpoint's guard returns early). The spec asserts the
+		// snapshot still exists (the requeue did not delete it).
+		b1Reconcile(r, ns, name)
+		Expect(b1SnapshotExists(ctx, ns, "checkpoint-"+name+"-iter-0")).To(BeTrue(), "the checkpoint still exists after the second reconcile (the requeue did not delete it)")
+
+		// The status is UNCHANGED by the second reconcile (no duplicate entry).
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Status.Checkpoints).To(HaveLen(1), "no duplicate status entry after the requeue")
+	})
+
+	It("does NOT create a checkpoint for the current iteration while its verify is in progress (one spec per in-progress state; the named mutation — drop the in-progress guard — must fail against the older commit)", func() {
+		for _, inProg := range []string{"trusted-init", "tamper", "artifact", "check-0"} {
+			ns := "b1-inprog-" + inProg + "-" + nowSuffix()
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+			}()
+			b1CreateVSC()
+
+			name := "inprogloop"
+			spec := b1LoopSpec()
+			spec.Loop.MaxIterations = 9
+			stall := int32(100)
+			spec.Loop.StallAfter = &stall
+			Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec:       spec,
+			})).To(Succeed())
+
+			r := b1NewReconciler(true, false)
+			s5aDriveToVerifyingWithReconciler(r, ns, name)
+
+			// The in-progress verify pod: the in-progress state's init
+			// container is still Running (not terminated), the rest
+			// are terminated (exit 0). The "check-0" state uses
+			// s5aVerifyPodInProg (the I49 in-progress stand-in).
+			jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			job := &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+				job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+				Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			}
+			if inProg == "check-0" {
+				s5aVerifyPodInProg(ctx, ns, name, jobName)
+			} else {
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      name + "-verify-pod-inprog",
+						Namespace: ns,
+						Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+						OwnerReferences: []metav1.OwnerReference{{
+							APIVersion: batchv1.SchemeGroupVersion.String(),
+							Kind:       i65JobKind,
+							Name:       jobName,
+							UID:        job.UID,
+						}},
+					},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+				}
+				Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+				inits := []corev1.ContainerStatus{}
+				addTerminated := func(n string) {
+					inits = append(inits, corev1.ContainerStatus{Name: n, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}})
+				}
+				addRunning := func(n string) {
+					inits = append(inits, corev1.ContainerStatus{Name: n, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}})
+				}
+				switch inProg {
+				case "trusted-init":
+					addRunning(s5aCloneBase)
+					addTerminated(s5aImportAgent)
+					addTerminated(s5aTamper)
+					addTerminated(s5aArtifact)
+				case "tamper":
+					addTerminated(s5aCloneBase)
+					addTerminated(s5aImportAgent)
+					addRunning(s5aTamper)
+					addTerminated(s5aArtifact)
+				case "artifact":
+					addTerminated(s5aCloneBase)
+					addTerminated(s5aImportAgent)
+					addTerminated(s5aTamper)
+					addRunning(s5aArtifact)
+				default:
+					Fail(fmt.Sprintf("unknown in-progress state %q", inProg))
+				}
+				pod.Status.InitContainerStatuses = inits
+				Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+			}
+
+			// Reconcile: the verify outcome is NOT yet recorded
+			// (the in-progress state is pending — the operator
+			// requeues, no decision), so no checkpoint must be
+			// created for the in-progress iteration.
+			_, _ = r.Reconcile(ctx,
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			loop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			Expect(loop.Status.Verify).To(BeNil(), "no recorded verify outcome while the verify is in progress")
+			Expect(loop.Status.Checkpoint).To(BeNil(), "no checkpoint while the verify is in progress")
+			Expect(loop.Status.Checkpoints).To(BeEmpty(), "no checkpoint recorded while the verify is in progress")
+		}
 	})
 
 	It("retains the last 3 + every milestone and GCs the rest (retention + GC; the named mutation — break retention — must fail)", func() {

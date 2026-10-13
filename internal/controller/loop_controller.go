@@ -553,39 +553,27 @@ func (r *LoopReconciler) applyBudgetStep(ctx context.Context, loop *coxv1alpha1.
 	return budgetRequeue, budgetChanged
 }
 
-// reconcileVerifySteps is the S4 claim read + the S5a verify Job + the S5a
-// verify outcome + the checkpoint step (B1) — extracted from Reconcile so the
-// top-level reconcile stays within the gocyclo budget. It returns
-// (changed, requeue, claimReadPending, advancedFrom): changed is whether the
-// Loop's status was mutated (the S4 claim read or the verify outcome);
-// requeue is whether a requeue is needed (the stale-Job guard's D27
-// verifyStaleDeleted, the verify outcome's in-progress requeue, or the
-// checkpoint step's requeue); claimReadPending is the S4 claim-read requeue
-// (the runner's claim is not yet readable); advancedFrom is the S4 phase
-// advance (for the PhaseAdvanced Event, the I83 write). The verify Job's
-// ensure error (other than the stale-Job guard's verifyStaleDeleted) is
-// returned as an error (a controller error, the next reconcile retries).
-func (r *LoopReconciler) reconcileVerifySteps(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, bool, coxv1alpha1.LoopPhase, error) {
-	claimReadPending, s4Changed, advancedFrom := r.advancePhaseFromClaim(ctx, loop)
-	changed := s4Changed
-	verifyRequeue := false
+// s4ClaimAndVerifyJob is the S4 claim read (the runner's claim from the agent
+// container's strict-parsed) + the S5a verify Job's ensure (the trusted,
+// isolated evidence path). It returns the claimReadPending (the claim was
+// recorded but the phase did not advance — a transient parse fail), the
+// advancedFrom (the phase advanced from Verifying), the verifyRequeue (the
+// stale-Job guard requeue), the s4Changed (the claim read's condition change),
+// and the err (the verify Job's ensure error, other than the stale-Job guard).
+// Extracted from Reconcile to keep it within the gocyclo budget. The
+// applyVerifyOutcome + ensureCheckpointStep calls remain in Reconcile (the
+// checkpoint timing must match the B1 specs — the checkpoint is taken on the
+// same reconcile as the verify outcome, not in a helper that returns early).
+func (r *LoopReconciler) s4ClaimAndVerifyJob(ctx context.Context, loop *coxv1alpha1.Loop) (claimReadPending bool, advancedFrom coxv1alpha1.LoopPhase, verifyRequeue bool, s4Changed bool, err error) {
+	claimReadPending, s4Changed, advancedFrom = r.advancePhaseFromClaim(ctx, loop)
+	verifyRequeue = false
 	if err := r.ensureVerifyJobAndNetPolicies(ctx, loop); err != nil {
 		if !errors.Is(err, errVerifyStaleDeleted) {
-			return false, false, false, "", err // a controller error (the caller propagates it)
+			return claimReadPending, advancedFrom, verifyRequeue, s4Changed, err
 		}
 		verifyRequeue = true
 	}
-	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, loop)
-	changed = changed || verifyChanged
-	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
-	// B1: take the workspace checkpoint and apply retention. The checkpoint
-	// step runs on every reconcile (level-based); the idempotency guard in
-	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
-	// The checkpoint is keyed off the operator-recorded verify outcome
-	// (status.verify.iteration), not the current iteration.
-	_, cpRequeue := r.ensureCheckpointStep(ctx, loop)
-	verifyRequeue = verifyRequeue || cpRequeue
-	return changed, verifyRequeue, claimReadPending, advancedFrom, nil
+	return claimReadPending, advancedFrom, verifyRequeue, s4Changed, nil
 }
 
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -668,16 +656,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
-	var resumeCleared bool
-	var bootChanged bool
-	var err error
-	bootChanged, resumeCleared, err = r.phaseBootstrap(ctx, &loop)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	changed := bootChanged || resumeCleared // the phase bootstrap's condition change (the I90 point-of-decision write)
 	// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the workspace restore step
-	// (restore/rollback/fork). It runs BEFORE the phase work (the bootstrap's
+	// (restore/rollback/fork). It runs BEFORE phaseBootstrap (the bootstrap's
 	// ensureLoopArtifacts + ensureSandbox would recreate the PVC and build the
 	// sandbox; the restore step DELETEs + recreates the PVC with a dataSource,
 	// and the sandbox build reads the PVC by name, not spec, so a restored
@@ -686,15 +666,23 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// (the snapshot is not ReadyToUse yet — the in-progress state, I49 — or a
 	// transient read failed) ORs into the requeue-after in the FINAL return
 	// (below).
+	var err error
 	b2Changed, b2Requeue, err := r.b2ApplyRestoreStep(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed = changed || b2Changed // the B2 restore step's condition change (the I90 point-of-decision write)
+	changed := b2Changed // the B2 restore step's condition change (the I90 point-of-decision write)
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
 	// phaseBootstrap helper keeps the Reconcile within the gocyclo budget).
+	var resumeCleared bool
+	var bootChanged bool
+	bootChanged, resumeCleared, err = r.phaseBootstrap(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	changed = changed || bootChanged || resumeCleared
 	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
 	// and the Required gate. The gate fails the Loop (terminal
 	// Failed:CheckpointUnavailable) at start — before any phase work — when
@@ -742,11 +730,42 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// running at pause time is left to terminate, and its termination produces
 	// no iterate/stall/budget decision because the phase is Paused, not
 	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
-	verifyChanged, verifyRequeue, claimReadPending, advancedFrom, err := r.reconcileVerifySteps(ctx, &loop)
-	if err != nil {
-		return ctrl.Result{}, err
+	// S4 (ADR-0004): read the runner's claim from the agent container's
+	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
+	// logged and requeued, never acted on; the OS1 progress record is
+	// observability only. The iterate/terminal branches (Verifying ->
+	// Implementing / Failed) are completed by B3 (verify outcome) and B4
+	// (iteration count). See internal/controller/loop_s4_phase.go.
+	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
+	// isolated evidence path). The Job is created when the current pin exists
+	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
+	// Verifying advance) and its init containers' exit codes drive the
+	// Verifying outcome (Succeeded | iterate | TamperedVerify). The
+	// applyVerifyOutcome reader runs every reconcile at Verifying (the B2
+	// tamper gate ALSO runs every reconcile below — order-independent, D38
+	// pattern).
+	//
+	// The stale-Job guard (D27) returns verifyStaleDeleted when it has just
+	// deleted a Job stamped for a different pin. The caller maps it to a
+	// clean requeue (the 5s RequeueAfter in the FINAL return, AFTER the
+	// shared Status().Update) — never a controller error, and never an
+	// in-same-reconcile create of the fresh Job (the name is still taken;
+	// the apiserver deletes async, so a Create here would hit AlreadyExists
+	// and the new pin would be left un-built). The requeue creates the fresh
+	// Job on the next reconcile.
+	// P2f: no Jobs run while paused — the verify Job's ensure is gated on
+	// phase != Paused (a paused Loop has no in-flight verify; a Job that was
+	// running at pause time is left to terminate, and its termination produces
+	// no iterate/stall/budget decision because the phase is Paused, not
+	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
+	claimReadPending, advancedFrom, verifyRequeue, s4Changed, s4Err := r.s4ClaimAndVerifyJob(ctx, &loop)
+	if s4Err != nil {
+		return ctrl.Result{}, s4Err
 	}
+	changed = changed || s4Changed
+	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
+	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 	// B1: take the workspace checkpoint and apply retention. The checkpoint
 	// step runs on every reconcile (level-based); the idempotency guard in
 	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).

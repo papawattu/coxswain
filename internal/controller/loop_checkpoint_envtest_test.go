@@ -385,6 +385,50 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		}
 	})
 
+	It("retries the checkpoint on the next reconcile when the first create was skipped (level-based, not edge-triggered; must FAIL against the if-verifyChanged version)", func() {
+		ns := "b1-retry-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "retryloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		// Reconciler with the driver seam set to UNAVAILABLE (the checkpoint
+		// create is skipped on the first reconcile — support is absent).
+		rUnavailable := b1NewReconciler(false, false) // driver unavailable
+		s5aDriveToVerifyingWithReconciler(rUnavailable, ns, name)
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPod(ctx, ns, name, jobName, 0)
+
+		// First reconcile: the verify outcome is applied (verifyChanged is
+		// true, phase → Succeeded), but the checkpoint create is skipped
+		// (support is absent — the driver seam reports unavailable). The
+		// checkpoint is NOT recorded.
+		b1Reconcile(rUnavailable, ns, name)
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded), "the verify passed")
+		Expect(loop.Status.Checkpoint).To(BeNil(), "the checkpoint was NOT recorded (support was absent)")
+
+		// Second reconcile: the driver seam is now AVAILABLE (support is
+		// present). The verify outcome was already applied (verifyChanged is
+		// false — the phase is already Succeeded). The checkpoint step must
+		// still run (level-based) and create the checkpoint.
+		rAvailable := b1NewReconciler(true, false) // driver available
+		b1Reconcile(rAvailable, ns, name)
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(fresh.Status.Checkpoint).NotTo(BeNil(), "the checkpoint MUST be created on the retry reconcile (level-based, not edge-triggered)")
+		Expect(fresh.Status.Checkpoint.Iteration).To(Equal(0), "the checkpoint is named for the PRE-verify iteration (0), not the post-verify iteration")
+		Expect(fresh.Status.Checkpoint.Milestone).To(BeTrue(), "the verify passed, so the checkpoint is a milestone")
+	})
+
 	It("adds the checkpoint finalizer and holds a deleting Loop until its snapshots are GC'd (finalizer, CleaningUp)", func() {
 		ns := "b1-final-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

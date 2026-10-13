@@ -400,17 +400,18 @@ func (r *LoopReconciler) snapshotClassForDriver(ctx context.Context, driver stri
 // reconcile to confirm it is recorded / the content is ReadyToUse — though
 // B1's durability record is the snapshot OBJECT's existence, not the
 // content's readiness; B2's restore waits for ReadyToUse).
-func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, requeue bool) {
+func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1.Loop, iteration int) (changed bool, requeue bool) {
 	// Idempotency: a checkpoint is taken ONCE per iteration (the
 	// checkpoint-<loop>-iter-<N> name is unique per iteration — iteration
 	// numbers are never reused). If status.checkpoint already records
-	// status.iteration, the snapshot is already taken; do not re-create it.
-	// B1 takes checkpoints after each successful verify. The verify outcome
-	// (applyVerifyOutcome) flips the phase to Succeeded in the same reconcile;
-	// the checkpoint step runs AFTER that flip. A Loop at Succeeded from a
-	// PREVIOUS verify does NOT re-take (the idempotency guard below — a recorded
-	// checkpoint for status.iteration means the snapshot is already recorded).
-	if cp := loop.Status.Checkpoint; cp != nil && cp.Iteration == loop.Status.Iteration {
+	// iteration, the snapshot is already taken; do not re-create it.
+	// B1 takes checkpoints after each verify (pass or fail). The iteration
+	// parameter is the PRE-verify iteration (the iteration the verify ran
+	// at, captured before applyVerifyOutcome increments it on the iterate
+	// path). A Loop at Succeeded from a PREVIOUS verify does NOT re-take
+	// (the idempotency guard below — a recorded checkpoint for iteration
+	// means the snapshot is already recorded).
+	if cp := loop.Status.Checkpoint; cp != nil && cp.Iteration == iteration {
 		return false, false
 	}
 	// The support check gates the create (D59). When support is absent:
@@ -431,7 +432,7 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	// Create the snapshot (idempotent: the name is unique per iteration; a
 	// AlreadyExists on the same-name object is the same checkpoint being
 	// re-attempted, treated as recorded).
-	name := checkpointName(loop, loop.Status.Iteration)
+	name := checkpointName(loop, iteration)
 	snap := newVolumeSnapshotObj(loop, name)
 	err := r.Create(ctx, snap)
 	if err != nil {
@@ -459,7 +460,7 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	// Record it: status.checkpoint (latest) + status.checkpoints (the list).
 	at := nowTime(r)
 	entry := coxv1alpha1.CheckpointStatus{
-		Iteration: loop.Status.Iteration,
+		Iteration: iteration,
 		Name:      name,
 		Milestone: loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded, // milestone only when the verify passed
 		At:        at,
@@ -698,11 +699,13 @@ var _ = client.ObjectKey{}
 // keep the gocyclo budget. It runs after applyVerifyOutcome: it takes the
 // workspace checkpoint (checkpoint-<loop>-iter-<N>) and applies retention
 // (GC the non-kept snapshots). It is idempotent (one checkpoint per
-// iteration, guarded by status.checkpoint.iteration == status.iteration).
-// Returns (changed, requeue): changed is true when a snapshot was created
-// or GC'd; requeue is true when the GC is pending.
-func (r *LoopReconciler) ensureCheckpointStep(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, requeue bool) {
-	cpChanged, cpRequeue := r.ensureCheckpoint(ctx, loop)
+// iteration, guarded by status.checkpoint.iteration == iteration). The
+// iteration parameter is the PRE-verify iteration (the iteration the verify
+// ran at, captured before applyVerifyOutcome increments it on the iterate
+// path). Returns (changed, requeue): changed is true when a snapshot was
+// created or GC'd; requeue is true when the GC is pending.
+func (r *LoopReconciler) ensureCheckpointStep(ctx context.Context, loop *coxv1alpha1.Loop, iteration int) (changed bool, requeue bool) {
+	cpChanged, cpRequeue := r.ensureCheckpoint(ctx, loop, iteration)
 	changed = cpChanged
 	requeue = cpRequeue
 	return

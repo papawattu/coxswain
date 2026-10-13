@@ -260,6 +260,37 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(c.Reason).To(Equal(CheckpointReasonAvailable))
 	})
 
+	It("takes the checkpoint for iteration 0 (a recorded outcome at iteration 0 must not be treated as 'not recorded'; must FAIL against the int/Iteration==0 version)", func() {
+		ns := "b1-iter0-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "iter0loop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		r := b1NewReconciler(true, false)
+		b1DriveToSucceeded(ctx, r, ns, name) // drives the verify at iteration 0 to Succeeded
+		b1Reconcile(r, ns, name)
+
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		// The recorded outcome is iteration 0 (a valid value). The checkpoint
+		// must be taken for it — the int/Iteration==0 version treats 0 as
+		// 'not recorded' and never creates the iter-0 checkpoint.
+		Expect(loop.Status.Verify).NotTo(BeNil(), "the operator recorded the verify outcome")
+		Expect(loop.Status.Verify.Iteration).NotTo(BeNil(), "the recorded iteration is present (iteration 0 is a valid value)")
+		Expect(int(*loop.Status.Verify.Iteration)).To(Equal(0), "the verify ran at iteration 0")
+		Expect(loop.Status.Checkpoint).NotTo(BeNil(), "the iteration-0 checkpoint MUST be taken (the int/Iteration==0 version skips it)")
+		Expect(loop.Status.Checkpoint.Iteration).To(Equal(0), "the checkpoint is named for iteration 0")
+		Expect(loop.Status.Checkpoint.Milestone).To(BeTrue(), "all checks passed (exit 0), so the checkpoint is a milestone")
+	})
+
 	It("does NOT re-take a checkpoint for an already-recorded iteration (idempotency, the same-Loop update spec I43)", func() {
 		ns := "b1-idem-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
@@ -429,6 +460,41 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(fresh.Status.Checkpoint).NotTo(BeNil(), "the checkpoint MUST be created on the retry reconcile (level-based, not edge-triggered)")
 		Expect(fresh.Status.Checkpoint.Iteration).To(Equal(0), "the checkpoint is named for the PRE-verify iteration (0), not the post-verify iteration")
 		Expect(fresh.Status.Checkpoint.Milestone).To(BeTrue(), "the verify passed, so the checkpoint is a milestone")
+	})
+
+	It("does NOT create a checkpoint for the next iteration while its verify is in progress (no recorded outcome for N+1; must FAIL against 0840f87 which keys off the current iteration)", func() {
+		ns := "b1-inprog-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "inprogloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		r := b1NewReconciler(true, false)
+		// Drive to Verifying for the FIRST verify (iteration 0). The verify
+		// pod is NOT created yet — the verify is in progress (no recorded
+		// outcome for iteration 0).
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+		// The verify pod is in progress (an init container is still running,
+		// not terminated). Create a pod with the trusted inits terminated but
+		// check-0 still Running.
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPodInProg(ctx, ns, name, jobName)
+		// Reconcile: the verify outcome is NOT yet recorded (the check is
+		// still running), so no checkpoint must be created for iteration 0
+		// (the recorded outcome is absent; keying off the current iteration
+		// would wrongly create iter-0 before the verify completes).
+		b1Reconcile(r, ns, name)
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Status.Checkpoint).To(BeNil(), "no checkpoint while the verify is in progress (no recorded outcome)")
+		Expect(loop.Status.Checkpoints).To(BeEmpty(), "no checkpoint recorded while the verify is in progress")
 	})
 
 	It("adds the checkpoint finalizer and holds a deleting Loop until its snapshots are GC'd (finalizer, CleaningUp)", func() {

@@ -1091,7 +1091,8 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	if loop.Status.Verify == nil {
 		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 	}
-	loop.Status.Verify.Iteration = loop.Status.Iteration
+	iter := int32(loop.Status.Iteration)
+	loop.Status.Verify.Iteration = &iter
 	// Record the check exit codes (one per acceptance check, in order).
 	// A check that did not run (the pod status lacks it) is recorded as nil.
 	if pod != nil {

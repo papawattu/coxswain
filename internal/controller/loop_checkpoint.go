@@ -407,10 +407,10 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	// so keying off it would lose the checkpoint for iteration N on retry
 	// and could create a wrong checkpoint (iter-N+1 before N+1 has
 	// implemented or verified anything).
-	if loop.Status.Verify == nil || loop.Status.Verify.Iteration == 0 {
-		return false, false // no recorded verify outcome yet
+	if loop.Status.Verify == nil || loop.Status.Verify.Iteration == nil {
+		return false, false // no recorded verify outcome yet (iteration 0 is a valid recorded value)
 	}
-	iteration := loop.Status.Verify.Iteration
+	iteration := int(*loop.Status.Verify.Iteration)
 	// Idempotency: a checkpoint is taken ONCE per iteration. If
 	// status.checkpoints already has an entry for this iteration, the
 	// snapshot is already taken; do not re-create it.

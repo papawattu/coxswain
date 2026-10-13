@@ -315,18 +315,22 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
-		// Seed the status with 6 checkpoints: iterations 1..4 are NOT
-		// milestones (a hand-built fixture — B1's writer only produces
-		// milestones, so this exercises the GC path a B1 writer never
-		// reaches on its own), iterations 5 and 6 ARE milestones. The
-		// keep-set under B1 retention (last 3 = iters 4,5,6 + the milestones
-		// 5,6) = {4,5,6}; the GC'd set = {1,2,3}.
+		r := b1NewReconciler(true, false)
+		// Set the iteration to 7 (the spec is testing the retention GC with
+		// a new checkpoint at iteration 7; the hand-built fixtures are for
+		// iterations 1..6). The verify outcome is applied on the next
+		// reconcile (verifyChanged is true), and the checkpoint step takes
+		// the new checkpoint for iteration 7 and applies retention over the
+		// full set {1..6,7}. The keep-set under B1 retention (last 3 = iters
+		// 5,6,7 + the milestones 5,6) = {5,6,7}; the GC'd set = {1,2,3,4}.
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		// The Loop must not be Succeeded (ensureCheckpoint's guard would
-		// short-circuit the retention if the phase were Succeeded and
-		// status.iteration matched; here the phase is left Planning so the
-		// retention runs on the reconcile).
+		loop.Status.Iteration = 7
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		// Seed the status with 6 hand-built checkpoints (iterations 1..4 are
+		// NOT milestones — a hand-built fixture that exercises the GC path
+		// the operator's writer never produces on its own; iterations 5 and 6
+		// ARE milestones).
 		for i := 1; i <= 6; i++ {
 			at := metav1.Now()
 			loop.Status.Checkpoints = append(loop.Status.Checkpoints, coxv1alpha1.CheckpointStatus{
@@ -336,23 +340,19 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 				At:        at,
 			})
 		}
-		loop.Status.Checkpoint = &loop.Status.Checkpoints[5]
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		// Seed the VolumeSnapshot objects the status entries name.
+		// Seed the VolumeSnapshot objects the hand-built entries name.
 		b1CreateLoopSnapshots(ctx, loop)
-
-		r := b1NewReconciler(true, false)
-		// Reconcile: the operator takes the checkpoint for status.iteration (7 —
-		// a NEW checkpoint, since the last recorded was 6) and applies retention
-		// over the full set {1..6,7}. The keep-set under B1 retention (last 3 =
-		// iters 5,6,7 + the milestones 5,6) = {5,6,7}; the GC'd set = {1,2,3,4}.
-		// (The reconcile records iteration 7 as a new checkpoint — the verify
-		// succeeded at iteration 7 — and the retention GCs the oldest non-kept.)
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
-		loop.Status.Iteration = 7 // not 1..6 (a new checkpoint is taken for it)
-		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		// Drive the Loop to Verifying using the SPEC's reconciler r (so the
+		// driver seam and CRD seam are active on every reconcile).
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+		// The successful verify pod (a stand-in the operator's verify path
+		// reads init exit codes from; envtest has no Job controller).
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPod(ctx, ns, name, jobName, 0)
+		// Reconcile: the verify outcome is applied (verifyChanged is true),
+		// the checkpoint step takes the new checkpoint for iteration 7 and
+		// runs the retention GC over {1..6,7}.
 		b1Reconcile(r, ns, name)
 
 		By("keeping the last 3 (iters 5,6,7) and the milestones (5,6); GCing 1,2,3,4")

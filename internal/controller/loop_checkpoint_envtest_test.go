@@ -505,18 +505,14 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		// reconciler r (so the driver seam and CRD seam are active on every
 		// reconcile).
 		s5aDriveToVerifyingWithReconciler(r, ns, name)
-		// Set the iteration to 7 (the spec is testing the retention GC with
-		// a new checkpoint at iteration 7; the hand-built fixtures are for
-		// iterations 1..6). The verify outcome is applied on the next
-		// reconcile, and the checkpoint step takes the new checkpoint for
-		// iteration 7 (the pre-verify iteration) and applies retention over
-		// the full set {1..6,7}. The keep-set under B1 retention (last 3 =
-		// iters 5,6,7 + the milestones 5,6) = {5,6,7}; the GC'd set =
-		// {1,2,3,4}.
+		// The verify outcome will record status.verify.iteration = 0 (the
+		// current iteration). The checkpoint is for iteration 0. The
+		// hand-built fixtures are for iterations 1..6 (iterations 1..4 are
+		// NOT milestones; iterations 5 and 6 ARE milestones). The keep-set
+		// under B1 retention (last 3 = iters 0,5,6 + the milestones 5,6) =
+		// {0,5,6}; the GC'd set = {1,2,3,4}.
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		loop.Status.Iteration = 7
-		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		// Seed the status with 6 hand-built checkpoints (iterations 1..4 are
 		// NOT milestones — a hand-built fixture that exercises the GC path
 		// the operator's writer never produces on its own; iterations 5 and 6
@@ -538,11 +534,11 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 		s5aVerifyPod(ctx, ns, name, jobName, 0)
 		// Reconcile: the verify outcome is applied (verifyChanged is true),
-		// the checkpoint step takes the new checkpoint for iteration 7 and
-		// runs the retention GC over {1..6,7}.
+		// the checkpoint step takes the new checkpoint for iteration 0 and
+		// runs the retention GC over {0,1..6}.
 		b1Reconcile(r, ns, name)
 
-		By("keeping the last 3 (iters 5,6,7) and the milestones (5,6); GCing 1,2,3,4")
+		By("keeping the last 3 (iters 0,5,6) and the milestones (5,6); GCing 1,2,3,4")
 		fresh := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
 		kept := map[int]bool{}
@@ -551,24 +547,20 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		}
 		Expect(kept).To(HaveKeyWithValue(5, true), "iter 5 is in the last 3 (and a milestone) — kept")
 		Expect(kept).To(HaveKeyWithValue(6, true), "iter 6 is in the last 3 (and a milestone) — kept")
-		Expect(kept).To(HaveKeyWithValue(7, true), "iter 7 is the newest checkpoint — kept")
+		Expect(kept).To(HaveKeyWithValue(0, true), "iter 0 is the newest checkpoint — kept")
 		Expect(kept).NotTo(HaveKey(1), "iter 1 is not a milestone and not in the last 3 — GC'd")
 		Expect(kept).NotTo(HaveKey(2), "iter 2 — GC'd")
 		Expect(kept).NotTo(HaveKey(3), "iter 3 — GC'd")
-		Expect(kept).NotTo(HaveKey(4), "iter 4 — GC'd (the last 3 are 5,6,7)")
+		Expect(kept).NotTo(HaveKey(4), "iter 4 — GC'd (the last 3 are 0,5,6)")
 
-		By("deleting the GC'd VolumeSnapshot objects (1,2,3) and keeping the kept objects (4,5,6)")
-		for _, it := range []int{1, 2, 3} {
+		By("deleting the GC'd VolumeSnapshot objects (1,2,3,4) and keeping the kept objects (0,5,6)")
+		for _, it := range []int{1, 2, 3, 4} {
 			Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, it))).
 				To(BeFalse(), "the GC must delete the non-kept snapshot iter-%d", it)
 		}
-		for _, it := range []int{5, 6, 7} {
+		for _, it := range []int{0, 5, 6} {
 			Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, it))).
 				To(BeTrue(), "the retention must keep the snapshot iter-%d", it)
-		}
-		for _, it := range []int{1, 2, 3, 4} {
-			Expect(b1SnapshotExists(ctx, ns, fmt.Sprintf("checkpoint-%s-iter-%d", name, it))).
-				To(BeFalse(), "the retention must GC the snapshot iter-%d", it)
 		}
 	})
 

@@ -608,22 +608,31 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the workspace restore step
+	// (restore/rollback/fork) + the B1 checkpoint support check + Required
+	// gate (D59). The restore step runs FIRST (it may DELETE + recreate the
+	// PVC; the bootstrap's sandbox build reads the PVC by name, not spec, so a
+	// restored PVC is invisible to it). A completed restore is one-shot (the
+	// Restore condition True/Restored is the marker). The B1 gate fires only
+	// once (a Failed Loop is terminal and nothing reverts it). The B2
+	// restore step's requeue (the snapshot is not ReadyToUse yet — the
+	// in-progress state, I49 — or a transient read failed) ORs into the
+	// requeue-after in the FINAL return (below).
+	b2Changed, b2Requeue, err := r.b2ApplyRestoreStep(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	changed = changed || b2Changed
 	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
 	// and the Required gate. The gate fails the Loop (terminal
 	// Failed:CheckpointUnavailable) at start — before any phase work — when
 	// spec.checkpoints=Required and the snapshot support is absent (no
-	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI
-	// driver). The condition is set on every reconcile (the support may
-	// change: the CRD or a VolumeSnapshotClass can be installed later), but
-	// the gate fires only once (a Failed Loop is terminal and nothing reverts
-	// it). When the gate fires, stop this reconcile (the status write
-	// persists the terminal phase; no sandbox / proxy / verify work runs for a
-	// Loop that cannot be checkpointed).
-	if cpChanged, done, err := r.applyCheckpointGate(ctx, &loop); done || err != nil {
+	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI driver).
+	cpChanged, done, err := r.applyCheckpointGate(ctx, &loop)
+	if done || err != nil {
 		return ctrl.Result{}, err
-	} else {
-		changed = changed || cpChanged
 	}
+	changed = changed || cpChanged
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
@@ -634,11 +643,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		changed = true
 	}
 	// S4 (ADR-0004): read the runner's claim from the agent container's
-	// termination message (APIReader path — the sandbox pod is not in the
-	// manager's Pod cache, so the non-cached client is required; the S3 baseCommit
-	// pattern) and advance the phase machine when the claim names the
-	// immediate-next phase (the existing nextPhase table, unchanged, gated by
-	// the OS8 PhaseGate — option B: auto-approve). The claim is size-limited,
 	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
 	// logged and requeued, never acted on; the OS1 progress record is
 	// observability only. The iterate/terminal branches (Verifying ->
@@ -669,11 +673,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
 	verifyRequeue := false
 	if err := r.ensureVerifyJobAndNetPolicies(ctx, &loop); err != nil {
-		if errors.Is(err, errVerifyStaleDeleted) {
-			verifyRequeue = true
-		} else {
+		if !errors.Is(err, errVerifyStaleDeleted) {
 			return ctrl.Result{}, err
 		}
+		verifyRequeue = true
 	}
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
@@ -683,10 +686,9 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
 	// The checkpoint is keyed off the operator-recorded verify outcome
 	// (status.verify.iteration), not the current iteration.
-	if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop); cpChanged || cpRequeue {
-		changed = changed || cpChanged
-		verifyRequeue = verifyRequeue || cpRequeue
-	}
+	cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop)
+	changed = changed || cpChanged
+	verifyRequeue = verifyRequeue || cpRequeue
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a
 	// pinned verifiedCommit. The stale-Job guard (D27) deletes a Job stamped
@@ -772,6 +774,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
+	// B2 (PLAN-BETA): the restore step's requeue (the snapshot is not
+	// ReadyToUse yet — the in-progress state, I49 — or a transient read
+	// failed) ORs into the requeue-after (the 5s RequeueAfter in the FINAL
+	// return, AFTER the shared Status().Update). A completed restore is
+	// one-shot (the Restore condition True/Restored is the marker — no
+	// requeue).
+	verifyRequeue = verifyRequeue || b2Requeue
 	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue), nil
 }
 

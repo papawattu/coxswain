@@ -112,6 +112,7 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newPauseCommand(),
 		newResumeCommand(),
 		newRedeliverCommand(),
+		newForkCommand(),
 	)
 	return root
 }

@@ -1616,6 +1616,18 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// item-F refusal) keeps the sandbox Running so the in-flight delivery
 		// completes.
 		desired.Spec.OperatingMode = r.sandboxOperatingMode(loop, pauseBlocked)
+		// B2 (R-B2 design point (b)): while the workspace restore is in
+		// progress (the Restore condition False, reason StoppingSandbox or
+		// DeletingPVC), the sandbox must STAY suspended — the restore step
+		// stopped it (spec-level suspension is a request; the pod may still be
+		// draining) and a flip back to Running mid-restore would remount the
+		// PVC the restore is about to delete (pvc-protection would hold the
+		// delete until the pod is gone again). The hold clears with the
+		// one-shot marker (True/Restored): from the next reconcile the sandbox
+		// is built as usual on the restored content (the A2 PVC-resume path).
+		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning && r.b2RestoreHoldSuspended(loop) {
+			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+		}
 		// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
 		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
 		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an

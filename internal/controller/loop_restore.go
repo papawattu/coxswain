@@ -314,22 +314,53 @@ func parseRestoreFrom(s string) (int, error) {
 	return n, nil
 }
 
-// sandboxRunning reports whether the Loop's sandbox (if any) is in the
-// Running operating mode (the only state that can hold the workspace PVC
-// mounted — the agent-sandbox controller creates the pod for a Running
-// sandbox and scales it to zero / removes it when the sandbox is
-// Suspended). A missing sandbox or a non-Running sandbox is "not running"
-// (no PVC to unmount).
-func (r *LoopReconciler) sandboxRunning(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
-	sb := &sandboxv1beta1.Sandbox{}
+// b2RestoreHoldSuspended reports whether the B2 workspace restore is in
+// progress in a way that must hold the sandbox Suspended (the reviewer's
+// design point (b), R-B2): the Restore condition is False, reason
+// StoppingSandbox or DeletingPVC. ensureSandbox consults it BEFORE the
+// gate cascade: while the restore is in progress, the sandbox must not be
+// flipped back to Running mid-restore (a flip would remount the PVC the
+// restore is about to delete — kubernetes.io/pvc-protection would hold the
+// delete until the pod was gone again, stalling the sequence). The hold
+// clears with the one-shot marker (True/Restored): from the next reconcile
+// the sandbox is built as usual on the restored content (the A2 PVC-resume
+// path). A REJECTED (False/RestoreSourceMissing) or DEFERRED (False/
+// RestoreSourceNotReady) restore does NOT apply to the sandbox: those
+// states leave the PVC and the sandbox untouched (the deferred restore may
+// not touch the sandbox at all — its snapshot is not ready; the rejected
+// target is gone).
+func (r *LoopReconciler) b2RestoreHoldSuspended(loop *coxv1alpha1.Loop) bool {
+	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
+	if c == nil || c.Status != metav1.ConditionFalse {
+		return false
+	}
+	return c.Reason == coxv1alpha1.RestoreReasonStoppingSandbox || c.Reason == coxv1alpha1.RestoreReasonDeletingPVC
+}
+
+// sandboxPodGone reports whether the Loop's sandbox POD is gone — the
+// REST of the restore's level-based sequence (the PVC delete) may advance
+// only once the pod is gone.
+//
+// "Stopped" here means the POD is gone, NOT just the sandbox's
+// spec.operatingMode == Suspended (the reviewer's design point (a), R-B2):
+// spec-level suspension is a REQUEST — the pod still exists (and still
+// mounts the workspace PVC) while the agent-sandbox controller acts on it,
+// and kubernetes.io/pvc-protection holds the PVC until no pod uses it.
+// Deleting the PVC on a Suspended-but-pod-still-present sandbox would not
+// complete on a real cluster (the delete would stay in Terminating behind
+// pvc-protection). The operator therefore advances the delete step only
+// once the pod is actually gone (NotFound). A read error is reported as the
+// error (the caller requeues; no decision on a transient read failure).
+func (r *LoopReconciler) sandboxPodGone(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	pod := &corev1.Pod{}
 	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
-	if err := r.Get(ctx, key, sb); err != nil {
+	if err := r.Get(ctx, key, pod); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return true, nil // no pod: the sandbox is gone
 		}
 		return false, err
 	}
-	return sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning, nil
+	return false, nil // the pod is still present
 }
 
 // stopSandboxForRestore sets the sandbox's operatingMode to Suspended (the
@@ -568,16 +599,21 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				"workspace PVC restored from "+target.snapshot)
 			return true, false, false, nil
 		}
-		running, err := r.sandboxRunning(ctx, loop)
+		// Step 1: the sandbox must be STOPPED (the A2 kill path's stop).
+		// "Stopped" = the sandbox POD is gone (the reviewer's design point
+		// (a), R-B2): spec.operatingMode == Suspended is a REQUEST and the
+		// pod may still exist while it drains; kubernetes.io/pvc-protection
+		// holds the PVC until no pod uses it, so the delete step (below) may
+		// advance only once the pod is gone. A still-present pod reissues the
+		// suspend (idempotent) and reports StoppingSandbox (the in-progress
+		// state — no PVC change yet, I49).
+		podGone, err := r.sandboxPodGone(ctx, loop)
 		if err != nil {
-			log.FromContext(ctx).Error(err, "the restore could not read the sandbox's operating mode; no decision on a transient read failure",
+			log.FromContext(ctx).Error(err, "the restore could not read the sandbox pod; no decision on a transient read failure",
 				"loop", loop.Name)
 			return false, true, true, nil
 		}
-		if running {
-			// Step 1: STOP the sandbox (the A2 kill path's stop). The PVC is
-			// NOT deleted yet (a delete of a still-mounted PVC would not
-			// complete — pvc-protection holds it until the pod is gone).
+		if !podGone {
 			if err := r.stopSandboxForRestore(ctx, loop); err != nil {
 				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
 					"stopping the sandbox before the rollback restore of "+target.snapshot+" failed: "+err.Error())
@@ -587,10 +623,10 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				return true, true, true, nil
 			}
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
-				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the sandbox is stopped (step 1 of 3; the PVC is deleted once the sandbox is gone)")
+				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the sandbox is being stopped (step 1 of 3; the PVC is deleted once the sandbox pod is gone)")
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
-				"restoring the workspace PVC from "+target.snapshot+": the sandbox is stopped (step 1 of 3)")
+				"restoring the workspace PVC from "+target.snapshot+": the sandbox is being stopped (step 1 of 3)")
 			return true, true, true, nil
 		}
 		// The sandbox is stopped. The PVC is present (checked above):
@@ -633,7 +669,17 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
 				"checkpoint "+target.snapshot+" does not exist; restore rejected")
-			return true, false, false, nil
+			// The hold covers the REJECTED state (the reviewer's diagnosis 2,
+			// R-B2): a rejected fork is not seeded with an empty PVC by the
+			// bootstrap (phaseBootstrap -> ensureLoopArtifacts would create it
+			// in the same pass, masking the reject as "a fresh empty
+			// workspace"). The hold stays while the target applies: on the
+			// next pass b2RestoreTarget is nil only when the Restore marker
+			// says True/Restored (it says False/RestoreSourceMissing here), so
+			// the hold is permanent and the user's choice is visible (the
+			// condition + the Event) — seed it by deleting + recreating the
+			// fork's Loop, or wait for the source's snapshot to reappear.
+			return true, false, true, nil
 		default: // b2KindLostPVC
 			// The A2 fallback: the PVC is lost and the (latest) checkpoint
 			// is gone. Recreate the PVC EMPTY (the A2 PVC-resume — the

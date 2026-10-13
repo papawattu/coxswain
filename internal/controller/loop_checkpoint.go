@@ -461,7 +461,7 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	entry := coxv1alpha1.CheckpointStatus{
 		Iteration: loop.Status.Iteration,
 		Name:      name,
-		Milestone: true, // B1: every checkpoint is a successful-verify checkpoint (a milestone).
+		Milestone: loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded, // milestone only when the verify passed
 		At:        at,
 	}
 	loop.Status.Checkpoint = &entry

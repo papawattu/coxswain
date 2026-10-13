@@ -678,11 +678,17 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
-	// B1: after a successful verify, take the workspace checkpoint and apply
-	// retention (the extracted step keeps Reconcile within the gocyclo budget).
-	if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop); cpChanged || cpRequeue {
-		changed = changed || cpChanged
-		verifyRequeue = verifyRequeue || cpRequeue
+	// B1: after the verify outcome is applied (the phase changed this
+	// reconcile), take the workspace checkpoint and apply retention. The
+	// checkpoint is taken only when the verify has completed (verifyChanged
+	// is true); a verify still running does not get a checkpoint (the
+	// outcome is unknown yet). The Milestone flag is set to whether the
+	// verify passed (the phase is Succeeded only when the verify passed).
+	if verifyChanged {
+		if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop); cpChanged || cpRequeue {
+			changed = changed || cpChanged
+			verifyRequeue = verifyRequeue || cpRequeue
+		}
 	}
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a

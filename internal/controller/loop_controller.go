@@ -598,31 +598,30 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
-	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
-	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
-	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
-	// budget).
-	changed := false
-	_, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
 	// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the workspace restore step
-	// (restore/rollback/fork) + the B1 checkpoint support check + Required
-	// gate (D59). The restore step runs FIRST (it may DELETE + recreate the
-	// PVC; the bootstrap's sandbox build reads the PVC by name, not spec, so a
-	// restored PVC is invisible to it). A completed restore is one-shot (the
-	// Restore condition True/Restored is the marker). The B1 gate fires only
-	// once (a Failed Loop is terminal and nothing reverts it). The B2
-	// restore step's requeue (the snapshot is not ReadyToUse yet — the
-	// in-progress state, I49 — or a transient read failed) ORs into the
-	// requeue-after in the FINAL return (below).
+	// (restore/rollback/fork). It runs BEFORE phaseBootstrap (the bootstrap's
+	// ensureLoopArtifacts + ensureSandbox would recreate the PVC and build the
+	// sandbox; the restore step DELETEs + recreates the PVC with a dataSource,
+	// and the sandbox build reads the PVC by name, not spec, so a restored
+	// PVC is invisible to it). A completed restore is one-shot (the Restore
+	// condition True/Restored is the marker). The B2 restore step's requeue
+	// (the snapshot is not ReadyToUse yet — the in-progress state, I49 — or a
+	// transient read failed) ORs into the requeue-after in the FINAL return
+	// (below).
 	b2Changed, b2Requeue, err := r.b2ApplyRestoreStep(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed = changed || b2Changed
+	changed := b2Changed // the B2 restore step's condition change
+
+	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
+	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
+	// budget).
+	_, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
 	// and the Required gate. The gate fails the Loop (terminal
 	// Failed:CheckpointUnavailable) at start — before any phase work — when

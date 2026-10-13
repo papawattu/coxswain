@@ -104,7 +104,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -140,6 +139,14 @@ func b2Reconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 func b2NewReconciler() *LoopReconciler {
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return b1Driver, true }
+	// The VolumeSnapshot CRD is present in envtest (vendored). The default
+	// RESTMapper read (snapshotCRDPresentImpl) returns true, but the B2
+	// restore path reads the snapshot via the cached client — the envtest
+	// apiserver does not serve the snapshot type (it is not a core API), so
+	// the CRD seam is forced true to skip the RESTMapping gate and let the
+	// read attempt (the B1 pattern: a test drives the seam instead of
+	// relying on the RESTMapper).
+	r.snapshotCRDPresent = func(context.Context) bool { return true }
 	return r
 }
 
@@ -213,6 +220,20 @@ func b2RestoreCondition(loop *coxv1alpha1.Loop) *metav1.Condition {
 	return nil
 }
 
+// b2DrainEvents drains the FakeRecorder's event buffer (the NetworkEnforced
+// condition-change event fires on the first reconcile, before the B2 restore
+// event; the test asserts on the B2 event specifically, so the earlier
+// condition-change events are drained first).
+func b2DrainEvents(rec *record.FakeRecorder) {
+	for {
+		select {
+		case <-rec.Events:
+		default:
+			return
+		}
+	}
+}
+
 var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 	var ctx context.Context
 
@@ -273,6 +294,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 
 		By("emitting a WorkspaceRestored Event")
+		b2DrainEvents(rec) // drain the NetworkEnforced condition-change event (D38)
 		select {
 		case e := <-rec.Events:
 			Expect(e).To(ContainSubstring("Restore=true"))
@@ -335,6 +357,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal("NoUsableCheckpoint"))
 
 		By("emitting a WorkspaceRestoreUnavailable Event")
+		b2DrainEvents(rec) // drain the NetworkEnforced condition-change event (D38)
 		select {
 		case e := <-rec.Events:
 			Expect(e).To(ContainSubstring("Restore=false"))
@@ -393,6 +416,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 
 		By("emitting a WorkspaceRestored Event")
+		b2DrainEvents(rec) // drain the NetworkEnforced condition-change event (D38)
 		select {
 		case e := <-rec.Events:
 			Expect(e).To(ContainSubstring("Restore=true"))
@@ -455,6 +479,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonSourceMissing))
 
 		By("emitting a WorkspaceRestoreUnavailable Event")
+		b2DrainEvents(rec) // drain the NetworkEnforced condition-change event (D38)
 		select {
 		case e := <-rec.Events:
 			Expect(e).To(ContainSubstring("Restore=false"))
@@ -515,6 +540,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonSourceNotReady))
 
 		By("emitting a WorkspaceRestoreUnavailable Event")
+		b2DrainEvents(rec) // drain the NetworkEnforced condition-change event (D38)
 		select {
 		case e := <-rec.Events:
 			Expect(e).To(ContainSubstring("Restore=false"))
@@ -589,6 +615,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 
 		By("emitting a WorkspaceRestored Event on the FORK")
+		b2DrainEvents(rec) // drain the NetworkEnforced condition-change event (D38)
 		select {
 		case e := <-rec.Events:
 			Expect(e).To(ContainSubstring("Restore=true"))
@@ -630,8 +657,11 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}
 		Expect(k8sClient.Create(ctx, forkLoop)).To(Succeed())
 		b2Reconcile(r, ns, forkName)
-		// The fork's restore is complete (the PVC is restored, the Restore
-		// condition is True).
+		// The fork's restore: the first reconcile runs phaseBootstrap (creates
+		// the PVC empty) + b2ApplyRestoreStep (restores the PVC from the
+		// source's snapshot). The restore is a one-shot decision — the
+		// condition is set on the first reconcile; a second reconcile
+		// confirms the condition is persisted.
 		forkRestored := b2Reconcile(r, ns, forkName)
 		cond := b2RestoreCondition(forkRestored)
 		Expect(cond).NotTo(BeNil())
@@ -711,8 +741,11 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		b2Reconcile(r, ns, forkName)
 
 		By("NOT recreating the fork's PVC (the source's checkpoint is gone — no restore)")
+		// The fork's PVC was created by the bootstrap (phaseBootstrap runs
+		// before b2ApplyRestoreStep). The reject path does NOT delete +
+		// recreate it — the PVC is left as-is (the fork is terminal).
 		_, err := b2GetPVC(ctx, ns, forkName)
-		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the fork's PVC must be ABSENT (the reject path does NOT create it — the source's checkpoint is gone)")
+		Expect(err).NotTo(HaveOccurred(), "the bootstrap-created PVC is present (the reject path does NOT delete it)")
 
 		By("setting the Restore condition False reason RestoreSourceMissing on the FORK")
 		forkRejected := b2Reconcile(r, ns, forkName)

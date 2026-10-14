@@ -146,6 +146,37 @@ spec:
                 - message: endpointSecretRef and modelEndpoint must be set together
                     (a Loop with a model Secret must also name the model endpoint)
                   rule: has(self.endpointSecretRef) == has(self.modelEndpoint)
+              approval:
+                description: |-
+                  approval is the user's plan-approval settings (PLAN-BETA B3; PLAN.md
+                  Phase 4). The operator reads spec.approval.mode to decide whether to
+                  hold the phase machine at AwaitingApproval after Planning, and
+                  spec.approval.onReject to decide the action when the user sets
+                  PlanRejected (Replan = re-plan with the reason, Fail = terminal).
+                  An empty/zero value reads as Auto (no approval hold).
+                properties:
+                  mode:
+                    default: Auto
+                    description: |-
+                      mode selects whether the plan requires explicit approval. Auto (the
+                      default) never holds; Manual holds at AwaitingApproval until the
+                      PlanApproved condition is set.
+                    enum:
+                    - Auto
+                    - Manual
+                    type: string
+                  onReject:
+                    default: Replan
+                    description: |-
+                      onReject is the operator's action when the user sets the PlanRejected
+                      condition. Replan (default) re-enters Planning with the rejection
+                      reason fed to the next plan; Fail terminates the Loop as
+                      Failed:PlanRejected.
+                    enum:
+                    - Replan
+                    - Fail
+                    type: string
+                type: object
               budget:
                 description: |-
                   budget caps the Loop's token, active-time and derived-cost totals

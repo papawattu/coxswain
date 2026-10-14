@@ -229,30 +229,38 @@ BPF_NODES=$(kc get nodes -l "kubearmor.io/enforcer=bpf" -o jsonpath='{range .ite
 [ -n "$BPF_NODES" ] || die "no node carries the BPF-LSM label (the A1 fact is absent; see $EVIDENCE/kubearmor-install.log)"
 log kubearmor "KubeArmor $KUBEARMOR_VERSION installed (BPF-LSM nodes: $BPF_NODES)"
 
-# snapshot-controller (external-snapshotter; the B1-B4 runs installed it the
-# same way — its StatefulSet sidecar provisions the hostpath snapshots):
-# CRDs + the controller Deployment. The CRDs the operator's install.yaml ALSO
-# ships (config/crd/external) are applied here first so the snapshot
-# controller can start; the operator's later apply of the same CRDs is
-# idempotent.
-log snapshot "installing the external-snapshotter (CRDs + controller)"
-curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.0.0/config/crd/standard.yaml" \
-	> "$EVIDENCE/snapshot-crd.yaml" || die "cannot fetch the external-snapshotter CRDs"
-kc apply -f "$EVIDENCE/snapshot-crd.yaml" >"$EVIDENCE/snapshot-crd-apply.log"
-curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.0.0/deploy/kubernetes/snapshot-controller.yaml" \
-	> "$EVIDENCE/snapshot-controller.yaml" || die "cannot fetch the external-snapshotter controller manifest"
-kc apply -f "$EVIDENCE/snapshot-controller.yaml" >"$EVIDENCE/snapshot-controller-apply.log"
+# snapshot-controller (external-snapshotter master; the B1-B4 runs installed it
+# the same way — its Deployment in kube-system + the hostpath plugin's sidecar
+# provision the hostpath snapshots). The CRDs the operator's install.yaml ALSO
+# ships (config/crd/external) are applied here first so the snapshot controller
+# can start; the operator's later apply of the same CRDs is idempotent.
+# NOTE (B6 run, 2026-10-14): the old config/crd/standard.yaml +
+# deploy/kubernetes/snapshot-controller.yaml layout no longer exists upstream
+# (those URLs 404). The controller moved to
+# deploy/kubernetes/snapshot-controller/{rbac,setup}-snapshot-controller.yaml
+# (SA snapshot-controller in kube-system + Deployment). The CRDs are shipped
+# by the OPERATOR's install.yaml (config/crd/external) — no separate CRD
+# fetch is needed.
+log snapshot "installing the external-snapshotter controller (RBAC + Deployment, SA in kube-system)"
+curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml" \
+	> "$EVIDENCE/snapshot-controller-rbac.yaml" || die "cannot fetch the external-snapshotter controller RBAC (the upstream layout changed; the controller moved to deploy/kubernetes/snapshot-controller/)"
+kc apply -f "$EVIDENCE/snapshot-controller-rbac.yaml" >"$EVIDENCE/snapshot-controller-rbac-apply.log" 2>&1 || { cat "$EVIDENCE/snapshot-controller-rbac-apply.log"; die "snapshot-controller RBAC apply failed"; }
+curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml" \
+	> "$EVIDENCE/snapshot-controller.yaml" || die "cannot fetch the external-snapshotter controller Deployment"
+kc apply -f "$EVIDENCE/snapshot-controller.yaml" >"$EVIDENCE/snapshot-controller-apply.log" 2>&1 || { cat "$EVIDENCE/snapshot-controller-apply.log"; die "snapshot-controller Deployment apply failed"; }
 kc -n kube-system rollout status deploy/snapshot-controller --timeout=180s \
 	>"$EVIDENCE/snapshot-controller-rollout.log" 2>&1 || die "snapshot-controller not Ready (see $EVIDENCE/snapshot-controller-rollout.log)"
-log snapshot "external-snapshotter Ready"
+log snapshot "external-snapshotter controller Ready (kube-system)"
 
 # upstream csi-driver-host-path (the B1-B4 runs used the upstream
 # kubernetes-csi driver, driver name hostpath.csi.k8s.io): the StatefulSet
-# csi-hostpathplugin in default + the StorageClass + the VolumeSnapshotClass.
-log snapshot "installing the upstream csi-driver-host-path + hostpath StorageClass + hostpath-snapclass"
-curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-host-path/master/deploy/kubernetes/hostpath-installer.yaml" \
-	> "$EVIDENCE/csi-hostpath.yaml" || die "cannot fetch the csi-driver-host-path installer"
-kc apply -f "$EVIDENCE/csi-hostpath.yaml" >"$EVIDENCE/csi-hostpath-apply.log"
+# csi-hostpathplugin in default + its RBAC. The operator's workspace PVC uses
+# the cluster's DEFAULT StorageClass, so this run creates the hostpath
+# StorageClass as default (nil storageClassName on the PVC => the default SC).
+log snapshot "installing the upstream csi-driver-host-path (plugin StatefulSet in default)"
+curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-host-path/master/deploy/kubernetes-1.34/hostpath/csi-hostpath-plugin.yaml" \
+	> "$EVIDENCE/csi-hostpath.yaml" || die "cannot fetch the csi-driver-host-path plugin manifest (the upstream layout changed: it is now deploy/kubernetes-<ver>/hostpath/csi-hostpath-plugin.yaml)"
+kc apply -f "$EVIDENCE/csi-hostpath.yaml" >"$EVIDENCE/csi-hostpath-apply.log" 2>&1 || { cat "$EVIDENCE/csi-hostpath-apply.log"; die "csi-hostpath apply failed"; }
 i=0
 while :; do
 	ready=$(kc -n default get sts csi-hostpathplugin -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
@@ -260,10 +268,21 @@ while :; do
 	i=$((i + 5)); [ "$i" -gt 180 ] && { kc -n default get pods -l app=csi-hostpathplugin >"$EVIDENCE/csi-hostpath-debug.txt"; die "csi-hostpathplugin not Ready after 180s (see $EVIDENCE/csi-hostpath-debug.txt)"; }
 	sleep 5
 done
-# The StorageClass (hostpath, default) + the VolumeSnapshotClass (the B1-B4
-# runs' hostpath-snapclass). The installer manifest carries the StorageClass;
-# the snapshot class is applied explicitly (the same object the B1 run used).
-cat >"$EVIDENCE/hostpath-snapclass.yaml" <<'EOF'
+# The hostpath StorageClass (default) + the VolumeSnapshotClass (the upstream
+# csi-hostpath-snapclass, driver hostpath.csi.k8s.io — the B1-B4 runs' recipe).
+# The plugin manifest does NOT ship a StorageClass (the operator needs the
+# workspace PVC to use a snapshot-capable default SC), so it is applied here.
+cat >"$EVIDENCE/hostpath-sc-snapclass.yaml" <<'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hostpath
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: hostpath.csi.k8s.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+---
 apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:
@@ -271,11 +290,11 @@ metadata:
 driver: hostpath.csi.k8s.io
 deletionPolicy: Delete
 EOF
-kc apply -f "$EVIDENCE/hostpath-snapclass.yaml" >/dev/null
+kc apply -f "$EVIDENCE/hostpath-sc-snapclass.yaml" >/dev/null 2>&1 || { cat "$EVIDENCE/hostpath-sc-snapclass.yaml"; die "could not apply the hostpath StorageClass/VolumeSnapshotClass"; }
 kc get storageclass >"$EVIDENCE/storageclasses.txt"
 kc get volumesnapshotclass -o json >"$EVIDENCE/snapshotclasses.json"
 grep -q "hostpath" "$EVIDENCE/storageclasses.txt" || die "no hostpath StorageClass (see $EVIDENCE/storageclasses.txt)"
-log snapshot "snapshot-capable StorageClass: $(grep hostpath "$EVIDENCE/storageclasses.txt" | awk '{print $1}')"
+log snapshot "snapshot-capable default StorageClass: $(grep hostpath "$EVIDENCE/storageclasses.txt" | awk '{print $1}'); VolumeSnapshotClass: hostpath-snapclass (driver hostpath.csi.k8s.io)"
 
 # Pre-load the images the run will pull: the verify/peek pod image and the
 # curl pod (the vLLM reachability probe + the metrics scrape — both run on

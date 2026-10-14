@@ -989,7 +989,7 @@ log done "Loops deleted (their PRs live on GitHub); the scratch cluster $CLUSTER
 
 # ---------------------------------------------------------------------------
 # D55 leak guard: fail if any evidence file contains the decoded or base64
-# GitHub token (or the metrics-reader token). Names only, never content.
+# GitHub token. Names only, never content.
 # ---------------------------------------------------------------------------
 _d55_guard() {
 	local tok tok_b64 f
@@ -1005,7 +1005,7 @@ _d55_guard() {
 	if [ "$found" = 1 ]; then
 		die "leak guard: at least one evidence file contains a credential (named above, content NOT printed). Shred them and fix the script."
 	fi
-	log d55 "leak guard: no evidence file contains the GitHub token or the metrics-reader token — D55 holds"
+	log d55 "leak guard: no evidence file contains the GitHub token — D55 holds"
 }
 _d55_guard
 

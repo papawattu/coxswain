@@ -362,6 +362,12 @@ var _ = Describe("B3 plan approval gate", func() {
 			}
 		}
 		Expect(hasRejected).To(BeFalse(), "the PlanRejected condition is cleared (the re-plan starts fresh)")
+		// The operator moved the phase to Planning on the Replan reconcile (the
+		// re-plan runs now — the runner's next Planning claim, once the user
+		// re-approves, advances to Implementing). ASSERT the phase is Planning
+		// (the gate's own decision, not a manual force).
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"the operator moved the phase to Planning on the Replan reconcile (the re-plan runs now)")
 
 		// Now the phase-init script (the operator's sole writer of
 		// .coxswain/plan-feedback) runs on the next Planning sandbox. It reads
@@ -369,9 +375,6 @@ var _ = Describe("B3 plan approval gate", func() {
 		// reason to the file. The phase is now Planning (the re-plan).
 		loop = &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "b3-replan-durable", Namespace: ns}, loop)).To(Succeed())
-		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
-		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
-		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
 		// The phase-init's decision (planApprovalFiles) reads the DURABLE field
 		// (the condition is cleared — the durable field is what survives).
@@ -426,9 +429,18 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(loop.Status.Approval).ToNot(BeNil(), "the operator set the durable rejection record")
 		Expect(loop.Status.Approval.LastRejectionReason).To(Equal(reason),
 			"the rejection reason is DURABLE after the Replan reconcile")
+		// The operator moved the phase to Planning on the Replan reconcile (the
+		// re-plan runs now). ASSERT the phase is Planning (the gate's own
+		// decision, not a manual force).
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"the operator moved the phase to Planning on the Replan reconcile (the re-plan runs now)")
 
 		// Now the user approves the (re)plan. The gate's approved branch clears
-		// the durable reason + advances to Implementing.
+		// the durable reason + advances to Implementing. (The phase is Planning
+		// — the re-plan; the user re-approves the new plan. The gate's approved
+		// branch fires when the phase is AwaitingApproval, so force the phase
+		// back to AwaitingApproval to simulate the hold re-entering on the new
+		// plan, then the user approves it.)
 		loop = &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval

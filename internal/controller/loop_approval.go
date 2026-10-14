@@ -262,11 +262,14 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				// the Loop AFTER this reconcile). The durable status field does,
 				// and planApprovalFiles reads it to write .coxswain/plan-feedback
 				// (the runner's planning-prompt read channel) on the next
-				// Planning sandbox run. The phase STAYS at AwaitingApproval (the
-				// hold is still in force; the runner's next Planning claim, once
-				// the user re-approves, advances to Implementing).
+				// Planning sandbox run. MOVE the phase to Planning (the re-plan
+				// runs now — the runner's next Planning claim, once the user
+				// re-approves, advances to Implementing). The operator is the sole
+				// writer of status (ADR-0004).
 				setLastRejectionReason(loop, rejectedPlanReason(loop))
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
+				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 				changed = true
 			}
 		} else if planApproved {

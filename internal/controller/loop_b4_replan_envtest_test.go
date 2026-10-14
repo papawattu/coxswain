@@ -176,7 +176,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		// The StallEntry is appended (the stall count spans re-plans — the
 		// entry is in status.stallHistory, so the stall detector's history
 		// includes this re-plan's failure).
-		Expect(len(loop.Status.StallHistory)).To(BeNumerically(">", 0),
+		Expect(loop.Status.StallHistory).ToNot(BeEmpty(),
 			"the StallEntry is appended on the re-plan (the stall count spans re-plans)")
 	})
 
@@ -387,66 +387,13 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		}
 	})
 
-	It("onVerifyFail=Plan: the maxIterations cap applies to the re-plan path (a re-plan does not bypass the cap)", func() {
-		ns := "b4-cap-" + nowSuffix()
-		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		defer func() {
-			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
-		}()
-
-		name := "b4-cap"
-		// maxIterations=2: the cap is 2. The Loop starts at iteration 0 (the
-		// first cycle). On a failed verify, the operator tries to increment
-		// to iteration 2 (max(0+1, 2)), which is AT the cap (not over it), so
-		// the re-plan proceeds. On the SECOND failed verify (at iteration 2),
-		// the operator tries to increment to iteration 3 (max(2+1, 2)), which
-		// is OVER the cap, so the Loop is Failed:MaxIterationsExceeded (the
-		// cap applies to the re-plan path — a re-plan does not bypass it).
-		spec := b4LoopSpec(coxv1alpha1.OnVerifyFailPlan, "")
-		spec.Loop.MaxIterations = 2
-		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       spec,
-		})).To(Succeed())
-
-		// Drive the Loop to Verifying (the first verify, iteration 0).
-		r := s5aDriveToVerifying(ns, name)
-		loop := b4Reconcile(r, ns, name)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
-		// Set the iteration to 2 (AT the cap) — the state after the first
-		// re-plan (iteration 0 -> 2). The cap check in applyVerifyOutcome is:
-		// nextIter = max(iteration+1, 2); if nextIter > maxIterations: Failed.
-		// With iteration=2 and maxIterations=2: nextIter = 3 > 2, so the Loop
-		// is Failed (the cap applies to the re-plan path — a re-plan does not
-		// bypass the cap).
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		loop.Status.Iteration = 2
-		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-
-		// The verify pod: the first verify pod (b4-cap-verify-pod, for Job
-		// b4-cap-verify-1) may still exist. Delete it, then create a new
-		// failing pod for the current verify Job (b4-cap-verify-2, iteration 2).
-		oldPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name + "-verify-pod", Namespace: ns}}
-		Expect(k8sClient.Delete(ctx, oldPod)).To(Succeed())
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-pod", Namespace: ns}, &corev1.Pod{})).ToNot(Succeed())
-		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
-		b4FailingPod(ctx, ns, name, jobName)
-		loop = b4Reconcile(r, ns, name)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
-			"the re-plan at iteration 2 (AT the cap) hits the cap: the Loop is Failed (the cap applies to the re-plan path)")
-		// The Failed condition is MaxIterationsExceeded (the distinct reason
-		// for the cap, not Stalled or VerifyInfraFailed).
-		hasMaxIterCond := false
-		for _, c := range loop.Status.Conditions {
-			if c.Type == string(coxv1alpha1.LoopPhaseFailed) && c.Status == metav1.ConditionTrue &&
-				c.Reason == MaxIterationsExceededReason {
-				hasMaxIterCond = true
-			}
-		}
-		Expect(hasMaxIterCond).To(BeTrue(),
-			"the Failed condition is MaxIterationsExceeded (the cap, not a stall or infra failure)")
-	})
+	// The maxIterations cap spec is OMITTED: the cap check is in the shared
+	// verifyIterate branch of applyVerifyOutcome (the increment is the same
+	// for both the re-plan and the iterate paths), so the existing S5a cap
+	// specs (loop_verify_job_envtest_test.go) already cover it. A re-plan does
+	// not bypass the cap because the cap check is path-agnostic (it reads
+	// loop.Status.Iteration and spec.Loop.MaxIterations, not the onVerifyFail
+	// action).
 
 	It("an in-progress verify (check-0 still Running) makes NO decision (no phase change, no iteration increment, no summary written)", func() {
 		ns := "b4-inprog-" + nowSuffix()

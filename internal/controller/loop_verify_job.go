@@ -1312,7 +1312,7 @@ func verifyFailureSummary(pod *corev1.Pod, failedCheck string, checkExitCode int
 				if len(msg) > verifyFailureSummaryTailCap {
 					msg = msg[len(msg)-verifyFailureSummaryTailCap:]
 				}
-				s += "\n\ncheck output tail:\n" + msg
+				return s + "\n\ncheck output tail:\n" + msg
 			}
 			break
 		}

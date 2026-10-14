@@ -24,6 +24,61 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// ApprovalMode selects how a Loop's plan is approved before it may move
+// from Planning to Implementing (PLAN-BETA B3; PLAN.md Phase 4).
+type ApprovalMode string
+
+const (
+	// ApprovalModeAuto is the default: no approval hold. The phase machine
+	// advances Planning -> Implementing as soon as the runner completes the
+	// Planning phase.
+	ApprovalModeAuto ApprovalMode = "Auto"
+	// ApprovalModeManual adds an AwaitingApproval hold after Planning:
+	// the operator parks the Loop in AwaitingApproval when the runner
+	// completes Planning, and advances only when the PlanApproved condition
+	// is set (by the user, via cox approve). A plan change after approval
+	// (PlanApproved.planHash != the new plan's hash) clears the condition and
+	// re-enters the hold.
+	ApprovalModeManual ApprovalMode = "Manual"
+)
+
+// OnRejectAction is what happens when the user rejects the plan with a
+// reason (PLAN-BETA B3; PLAN.md Phase 4).
+type OnRejectAction string
+
+const (
+	// OnRejectReplan is the default: the operator sets PlanRejected and
+	// re-enters Planning; the rejection reason is written to the workspace
+	// for the next Planning prompt (fed into the re-plan).
+	OnRejectReplan OnRejectAction = "Replan"
+	// OnRejectFail is terminal: the operator sets PlanRejected and the Loop
+	// is Failed with the PlanRejected reason.
+	OnRejectFail OnRejectAction = "Fail"
+)
+
+// Approval holds the user-facing plan-approval settings (PLAN-BETA B3;
+// PLAN.md Phase 4). It is operator-side only — the user sets it on the Loop
+// spec; the operator reads it to decide whether to hold the phase machine
+// at AwaitingApproval.
+type Approval struct {
+	// mode selects whether the plan requires explicit approval. Auto (the
+	// default) never holds; Manual holds at AwaitingApproval until the
+	// PlanApproved condition is set.
+	// +kubebuilder:validation:Enum=Auto;Manual
+	// +kubebuilder:default=Auto
+	// +optional
+	Mode ApprovalMode `json:"mode,omitempty"`
+
+	// onReject is the operator's action when the user sets the PlanRejected
+	// condition. Replan (default) re-enters Planning with the rejection
+	// reason fed to the next plan; Fail terminates the Loop as
+	// Failed:PlanRejected.
+	// +kubebuilder:validation:Enum=Replan;Fail
+	// +kubebuilder:default=Replan
+	// +optional
+	OnReject OnRejectAction `json:"onReject,omitempty"`
+}
+
 // LoopPhase is the phase of a Loop's state machine.
 // The full transition table is defined in docs/PLAN.md (Phase 1 implements it).
 // +kubebuilder:validation:Enum=Pending;Planning;AwaitingApproval;Implementing;Verifying;Succeeded;Failed;Paused;CleaningUp
@@ -503,6 +558,9 @@ type AgentEnvVar struct {
 	Value string `json:"value,omitempty"`
 }
 
+// Approval is the user-facing plan-approval block (PLAN-BETA B3; PLAN.md
+// Phase 4). See the type's own fields.
+
 // A Loop is one-shot and single-goal (docs/adr/0003).
 type LoopSpec struct {
 	// goal is the natural-language objective for this Loop.
@@ -543,6 +601,15 @@ type LoopSpec struct {
 	// +optional
 	// +kubebuilder:default={}
 	Loop LoopSettings `json:"loop,omitempty"`
+
+	// approval is the user's plan-approval settings (PLAN-BETA B3; PLAN.md
+	// Phase 4). The operator reads spec.approval.mode to decide whether to
+	// hold the phase machine at AwaitingApproval after Planning, and
+	// spec.approval.onReject to decide the action when the user sets
+	// PlanRejected (Replan = re-plan with the reason, Fail = terminal).
+	// An empty/zero value reads as Auto (no approval hold).
+	// +optional
+	Approval *Approval `json:"approval,omitempty"`
 
 	// suspend, when true, pauses the Loop at its current phase.
 	// +optional
@@ -972,6 +1039,35 @@ type StallEntry struct {
 
 // Loop condition types (the DeliveredCondition pattern).
 const (
+	// PlanApprovedCondition (PLAN-BETA B3; PLAN.md Phase 4) is the
+	// user-settable approval signal for a Loop's plan. The user (via
+	// cox approve) sets it to True with reason Approved and a message that
+	// carries the SHA-256 of the plan (the operator parses the hash from
+	// the message — the operator does NOT compute the hash itself, and a
+	// missing/incorrect hash is the operator's decision, not the user's
+	// mistake). When the plan changes (a fresh Planning run re-writes
+	// PLAN.md), the operator clears the condition and the Loop re-enters
+	// AwaitingApproval (the plan the user approved is no longer the one on
+	// the disk).
+	//
+	// The operator is the sole writer of the condition in the Manual-approve
+	// flow: the user sets it, the operator clears it when the plan changes
+	// and re-stamps LastTransitionTime. The user does NOT set it to False
+	// (rejection is PlanRejected, a separate condition).
+	PlanApprovedCondition = "PlanApproved"
+	// PlanRejectedCondition (PLAN-BETA B3; PLAN.md Phase 4) is the
+	// user-settable rejection signal. The user (via cox reject --reason) sets
+	// it to True with reason Rejected and a message that carries the reason
+	// (the operator parses the reason from the message — a missing/empty
+	// reason is the operator's decision to treat as Replan with an empty
+	// reason, not a hard fail). The operator's action on it depends on
+	// spec.approval.onReject: Replan re-enters Planning (the operator writes
+	// the reason to the workspace for the next plan); Fail is terminal
+	// (the operator sets the Loop to Failed:PlanRejected). The operator
+	// clears the condition when the re-plan completes (so the Loop can be
+	// rejected again on the new plan) and when the Loop transitions out of
+	// AwaitingApproval for a non-rejection reason.
+	PlanRejectedCondition = "PlanRejected"
 	// StalledCondition is True when the stall detector has fired (P2e).
 	StalledCondition = "Stalled"
 	// BudgetExceededCondition is True when status.budget.exceeded is true

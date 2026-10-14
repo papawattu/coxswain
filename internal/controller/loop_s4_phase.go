@@ -117,6 +117,14 @@ type PhaseClaim struct {
 	// this SHA, D11). A missing/malformed headCommit blocks the advance
 	// (ADR-0005: no evidence, no advance).
 	HeadCommit string `json:"headCommit,omitempty"`
+	// B3 (PLAN-BETA / PLAN.md Phase 4): true when the runner's Planning run
+	// detected a PLAN CHANGE (the fresh PLAN.md's SHA-256 does not match the
+	// approved hash the operator wrote to .coxswain/plan-hash). It is a CLAIM
+	// (ADR-0005): the operator uses it as a SIGNAL to clear the PlanApproved
+	// condition (re-enter the hold), not as an authoritative gate input (the
+	// operator's own read of the condition + phase is the gate input). An
+	// absent field (pre-B3 runners) is false (no plan change detected).
+	PlanChanged bool `json:"planChanged,omitempty"`
 }
 
 // parsePhaseClaim strict-parses a termination message into a PhaseClaim
@@ -171,6 +179,14 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 		}
 		if claim.HeadCommit != "" && !isCommitSHA(claim.HeadCommit) {
 			return nil, fmt.Errorf("claim.headCommit %q is not a 40-hex commit SHA", claim.HeadCommit)
+		}
+	}
+	// B3 (PLAN-BETA / PLAN.md Phase 4): planChanged, when present, must be a
+	// boolean (the runner's plan-change signal). An absent field (pre-B3
+	// runners) is false (no plan change detected).
+	if v, ok := raw["planChanged"]; ok {
+		if err := json.Unmarshal(v, &claim.PlanChanged); err != nil {
+			return nil, fmt.Errorf("claim.planChanged is not a boolean: %w", err)
 		}
 	}
 	claim.ObservedPhase = coxv1alpha1.LoopPhase(op)
@@ -592,6 +608,25 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// input (ADR-0005 anti-gaming is preserved: the condition does not
 		// affect the phase machine or the verify decision).
 		r.applyModelAvailableCondition(loop, claim)
+		// B3 (PLAN-BETA / PLAN.md Phase 4): the runner's plan-change signal.
+		// When the runner's Planning run detected a PLAN CHANGE (the fresh
+		// PLAN.md's SHA-256 does not match the approved hash the operator
+		// wrote to .coxswain/plan-hash), the operator clears the PlanApproved
+		// condition (re-enter the hold). The signal is a CLAIM (ADR-0005):
+		// it is the runner's evidence that the plan on disk differs from the
+		// approved hash; the operator's own read of the condition + phase is
+		// the gate input, and the applyApprovalGate function (level-based) is
+		// the one that decides the hold. The operator uses the claim only as
+		// a trigger to clear the condition (the re-hold) — the gate then
+		// holds the advance on the next reconcile (the claim's observedPhase
+		// is Planning, the gate's Planning -> AwaitingApproval hold applies).
+		// The clear is idempotent (a no-op when the condition is absent).
+		if claim.PlanChanged && approvedPlanHash(loop) != "" {
+			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
+			changed = true
+			logf.FromContext(ctx).Info("runner detected a plan change; clearing the PlanApproved condition (re-entering the hold)",
+				"loop", loop.Name)
+		}
 		if advanced {
 			// I83: the PhaseAdvanced Event is NOT emitted here. It is queued
 			// (advancedFrom) and emitted by the caller only after the status

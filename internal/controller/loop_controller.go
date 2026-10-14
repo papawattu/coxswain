@@ -96,6 +96,26 @@ const (
 	// runner reads. Single source of truth for the operator and the runner
 	// (the runner's own constant mirrors this; both read/write the same name).
 	coxDesiredPhaseFile = "desired-phase"
+	// coxPlanHashFile / coxPlanFeedbackFile (B3, PLAN-BETA / PLAN.md Phase 4):
+	// the .coxswain files the phase-init container writes for the runner's
+	// PLANNING phase. plan-hash carries the SHA-256 (lowercase hex, 64 chars)
+	// of the plan the user approved via cox approve (the operator writes it
+	// from the PlanApproved condition's message on the Manual gate; the
+	// runner reads it after writing the fresh PLAN.md and compares to detect
+	// a plan change — an empty file means "no approved plan" (a fresh Loop
+	// or a plan the user has not approved yet), so the change check is a
+	// no-op). plan-feedback carries the rejection reason the user set via
+	// cox reject --reason (the operator writes it from the PlanRejected
+	// condition's message on the Replan action); the runner's planning prompt
+	// includes it so the next plan addresses the rejection. An empty file
+	// means "no prior rejection" (the prompt is unchanged).
+	//
+	// Both files are cleared (removed) by the phase-init container when
+	// there is nothing to write: a stale file from a prior phase run must
+	// not leak into the next plan (the runner reads the file as the "current"
+	// signal).
+	coxPlanHashFile     = "plan-hash"
+	coxPlanFeedbackFile = "plan-feedback"
 	// workspaceCredsUsernameKey / workspaceCredsPasswordKey are the keys the
 	// spec.workspace.gitCredentialSecret Secret MUST carry: a standard
 	// kubernetes.io/basic-auth Secret (the same shape as the samples
@@ -782,6 +802,25 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, s4Err
 	}
 	changed = changed || s4Changed
+	// B3 (PLAN-BETA / PLAN.md Phase 4): the plan approval gate. It runs
+	// AFTER the claim-driven advance (the gate's phase change is
+	// authoritative over the claim's advance — a claim-driven
+	// Planning -> AwaitingApproval must not override the gate's
+	// AwaitingApproval -> Implementing when the user has approved) and
+	// BEFORE the verify outcome (the gate's Failed (onReject: Fail) must
+	// not be re-driven by a stale verify claim). In Auto mode (the default)
+	// the gate is a no-op (the S4 behaviour is preserved); in Manual mode
+	// it holds the Planning -> AwaitingApproval advance until the user
+	// approves, applies the onReject action on a rejection, and clears a
+	// stale approval on a re-plan. The gate is level-based (a function of
+	// the Loop's current status + conditions), so it is idempotent across
+	// reconciles. A gate phase change is recorded in advancedFrom ONLY when
+	// the gate itself advanced the phase (the claim-driven advance is
+	// already recorded; the gate's advance is a separate decision the
+	// PhaseAdvanced Event should also cover).
+	if r.applyApprovalGate(&loop) {
+		changed = true
+	}
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
@@ -1455,30 +1494,42 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	if loop.Spec.Workspace.Repo != "" && loop.Status.BaseCommit == "" {
 		initContainers = append(initContainers, r.workspaceInitContainer(loop))
 	}
-	// S4 (ADR-0004): the phase-init container materialises the operator's
-	// status.desiredPhase into <workspace>/.coxswain/desired-phase (the
-	// runner's read channel; the operator is the sole writer of the phase —
-	// ADR-0004) AND status.iteration into <workspace>/.coxswain/iteration
-	// (the runner's iteration marker). The runner is one-shot per phase: it
-	// reads the desired phase, does that phase's work, and exits with the
-	// claim in its termination message. It is ALWAYS present (the phase
-	// machine is core, not workspace-gated) and runs AFTER the workspace init
-	// so the .coxswain dir exists (the workspace init creates it; a fresh
-	// emptyDir has none). A fresh phase-init per pod recreation is the
-	// mechanism that re-writes the desired phase after a phase advance
-	// (recycleSandboxForPhase deletes the sandbox; this init re-runs on the
-	// new pod). The phase value is a fixed enum (CRD-validated on
-	// status.desiredPhase), but it is shell-quoted anyway (the init script is
-	// sh -c; an unusual-but-valid value must not inject). The iteration value
-	// is the authoritative iteration count (CRD-validated integer): a verify
-	// iterate (failed check -> Implementing, iteration+1) writes a NEW value,
-	// so the runner's stale-iteration guard (ADR-0005 D11) discards the prior
-	// success result.json and does fresh model work against the failing
-	// check instead of re-emitting the old claim.
+	// S4 (ADR-0004; B3 approval files): the phase-init container materialises
+	// the operator's status.desiredPhase into <workspace>/.coxswain/
+	// desired-phase (the runner's read channel; the operator is the sole
+	// writer of the phase — ADR-0004) AND status.iteration into
+	// <workspace>/.coxswain/iteration (the runner's iteration marker). The
+	// runner is one-shot per phase: it reads the desired phase, does that
+	// phase's work, and exits with the claim in its termination message. It
+	// is ALWAYS present (the phase machine is core, not workspace-gated) and
+	// runs AFTER the workspace init so the .coxswain dir exists (the
+	// workspace init creates it; a fresh emptyDir has none). A fresh
+	// phase-init per pod recreation is the mechanism that re-writes the
+	// desired phase after a phase advance (recycleSandboxForPhase deletes the
+	// sandbox; this init re-runs on the new pod). The phase value is a fixed
+	// enum (CRD-validated on status.desiredPhase), but it is shell-quoted
+	// anyway (the init script is sh -c; an unusual-but-valid value must not
+	// inject). The iteration value is the authoritative iteration count
+	// (CRD-validated integer): a verify iterate (failed check -> Implementing,
+	// iteration+1) writes a NEW value, so the runner's stale-iteration guard
+	// (ADR-0005 D11) discards the prior success result.json and does fresh
+	// model work against the failing check instead of re-emitting the old
+	// claim.
+	//
+	// B3 (PLAN-BETA / PLAN.md Phase 4): the same phase-init ALSO materialises
+	// the two plan-approval files (plan-hash + plan-feedback) into
+	// <workspace>/.coxswain/ — the operator is the sole writer of the
+	// approval signals, the runner is the sole reader. The values are read
+	// from the Loop's status conditions (PlanApproved.message carries the
+	// plan's SHA-256; PlanRejected.message carries the rejection reason) and
+	// passed to phaseInitScript. An empty value REMOVES the file (the
+	// runner reads the file as the "current" signal; a stale file from a
+	// prior phase run must not leak into the next plan).
+	planHash, planFeedback := r.planApprovalFiles(loop)
 	initContainers = append(initContainers, corev1.Container{
 		Name:    phaseInitContainerName,
 		Image:   r.workspaceGitImage(),
-		Command: []string{verifySh, "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration)},
+		Command: []string{verifySh, "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, planHash, planFeedback)},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
 		},
@@ -1723,6 +1774,18 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 // the CreateOrUpdate, and the D41c/foreignKapt comments below).
 func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	if r.b2RestoreHoldSuspended(loop) {
+		return true
+	}
+	// B3 (PLAN-BETA / PLAN.md Phase 4): hold the sandbox Suspended while the
+	// Loop is at AwaitingApproval in Manual mode (the plan approval gate's
+	// hold: the runner's one-shot container would otherwise re-run Planning
+	// on every pod recycle, re-reading the claim and re-asking the gate — a
+	// churn the operator's hold must prevent). The hold is ONLY in Manual
+	// mode: Auto mode never enters AwaitingApproval (the S4 behaviour
+	// advances Planning -> Implementing directly), so the hold is a no-op
+	// there. The sandbox is the only pod the runner runs in; the verify Job
+	// is independent and is not relevant at AwaitingApproval.
+	if r.approvalHoldPhase(loop) {
 		return true
 	}
 	// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
@@ -4927,17 +4990,32 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'''`) + "'"
 }
 
-// phaseInitScript (S4, ADR-0004) returns the sh script the phase-init container
-// runs: it materialises the operator's status.desiredPhase into
-// <workspace>/.coxswain/desired-phase (the one-shot runner's read channel).
-// The operator is the sole writer of the phase (ADR-0004) — the runner reads
-// it, does the phase's work, and exits with the claim; it never chooses the
-// phase itself. The value is a CRD-validated enum (status.desiredPhase), but
-// it is shell-quoted anyway (the script is sh -c; an unusual-but-valid value
-// must not inject). An EMPTY desired phase writes nothing (the runner waits
-// for the operator to set one; the operator's first reconcile sets
+// phaseInitScript (S4, ADR-0004; B3 approval files) returns the sh script
+// the phase-init container runs. It materialises the operator's
+// status.desiredPhase into <workspace>/.coxswain/desired-phase (the one-shot
+// runner's read channel), status.iteration into
+// <workspace>/.coxswain/iteration (the runner's iteration marker), and —
+// for the B3 approval gate — the plan-hash + plan-feedback files into
+// <workspace>/.coxswain/. The operator is the sole writer of all four files
+// (ADR-0004: the phase is the operator's; B3: the approval signals are the
+// operator's); the runner is the sole reader.
+//
+// The value is a CRD-validated enum (status.desiredPhase), but it is
+// shell-quoted anyway (the script is sh -c; an unusual-but-valid value must
+// not inject). An EMPTY desired phase writes nothing (the runner waits for
+// the operator to set one; the operator's first reconcile sets
 // status.desiredPhase = Planning for a fresh Loop — see the S4 advance path).
-func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase, iteration int) string {
+//
+// The plan-hash + plan-feedback writes are the B3 approval files. Each is
+// written when non-empty and REMOVED when empty (a stale file from a prior
+// phase run must not leak into the next plan): the runner reads the file as
+// the "current" signal for THIS phase, and a Loop that was rejected and then
+// re-planned must not carry the prior rejection reason into the new plan
+// (the new plan's feedback file is written ONLY by the Replan action, not by
+// a fresh Planning run with no rejection). The values are passed in already
+// validated (the hash is 64-hex or ""; the feedback is a CRD-length-bounded
+// string) so shell-quoting is the only escaping needed.
+func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase, iteration int, planHash, planFeedback string) string {
 	if desiredPhase == "" {
 		return `#!/bin/sh
 set -eu
@@ -4948,16 +5026,29 @@ set -eu
 exit 0
 `
 	}
-	return `#!/bin/sh
-set -eu
-DEST=/workspace
-mkdir -p "${DEST}/.coxswain"
-printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"
-# The iteration marker (S5a: the verify iterate bumps status.iteration and
-# recycles the pod; the runner's stale-iteration guard uses this file to
-# discard the prior success result and do fresh model work).
-printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswain/iteration"
-`
+	// Build the script. The desired-phase + iteration writes are unconditional
+	// (the runner's core channel). The plan-hash + plan-feedback writes are
+	// the B3 approval files: each is written when non-empty, removed when
+	// empty (a stale file from a prior run must not leak into the next plan).
+	sb := []string{
+		`#!/bin/sh`,
+		`set -eu`,
+		`DEST=/workspace`,
+		`mkdir -p "${DEST}/.coxswain"`,
+		`printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"`,
+		`printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswain/iteration"`,
+	}
+	if planHash != "" {
+		sb = append(sb, `printf '%s' `+shellQuote(planHash)+` > "${DEST}/.coxswain/`+coxPlanHashFile+`"`)
+	} else {
+		sb = append(sb, `rm -f "${DEST}/.coxswain/`+coxPlanHashFile+`"`)
+	}
+	if planFeedback != "" {
+		sb = append(sb, `printf '%s' `+shellQuote(planFeedback)+` > "${DEST}/.coxswain/`+coxPlanFeedbackFile+`"`)
+	} else {
+		sb = append(sb, `rm -f "${DEST}/.coxswain/`+coxPlanFeedbackFile+`"`)
+	}
+	return strings.Join(sb, "\n") + "\n"
 }
 
 // proxyImage returns the model proxy pod image. It is the reconciler's
@@ -4981,6 +5072,16 @@ const loopPolicyRefsFieldIndex = "spec.policyRefs"
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// B3 (PLAN-BETA / PLAN.md Phase 4): wire the plan approval gate (the
+	// OS8 seam). The S4 build ships autoApprovePhaseGate as the default
+	// (the zero value of the phaseGate field, the option B: no approval
+	// gate — the owner's bar is the verify loop, not a human sign-off);
+	// B3 replaces it with the approval gate so the Manual-mode hold is
+	// exercised. In Auto mode (spec.approval.mode == Auto, the default) the
+	// gate is a no-op (the S4 behaviour is preserved); in Manual mode it
+	// holds the Planning -> AwaitingApproval advance until the user sets
+	// the PlanApproved condition (via cox approve).
+	r.wireApprovalGate()
 	// S3a: wire the baseCommit read-back to the operator's non-cached client
 	// (APIReader). The sandbox pod is NOT in the manager's Pod cache (the
 	// cache is scoped to ProxyComponentSelector), so a cached Get returns

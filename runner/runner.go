@@ -139,6 +139,20 @@ type Result struct {
 	// 40-hex shape before acting on it and never advances without it.
 	HeadCommit string `json:"headCommit,omitempty"`
 
+	// B3 (PLAN-BETA / PLAN.md Phase 4): true when the runner's Planning run
+	// detected a PLAN CHANGE (the fresh PLAN.md's SHA-256 does not match the
+	// approved hash the operator wrote to .coxswain/plan-hash from the
+	// PlanApproved condition's message). It rides into the result.json (the
+	// runner's claim, the operator's read channel); the operator reads it on
+	// the next reconcile and re-enters the hold (clears the PlanApproved
+	// condition). A CLAIM (ADR-0005): the operator treats it as a signal to
+	// re-hold, not as an authoritative gate input (the operator's own read of
+	// the condition + the phase is the gate input; this is the runner's
+	// evidence that the plan on disk differs from the approved hash).
+	// False (the zero value) when the plan was not changed (a match, or no
+	// approved hash to compare against).
+	PlanChanged bool `json:"planChanged,omitempty"`
+
 	// toolConversation is the A4 conversation state (the messages after this
 	// phase run, for the next phase WITHOUT a pod recycle). It is unexported
 	// (not part of the result.json schema — the conversation is the

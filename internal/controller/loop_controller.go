@@ -115,10 +115,10 @@ var (
 		Name: "coxswain_loop_stalls_total",
 		Help: "Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs).",
 	})
-	loopsActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "coxswain_loops_active",
-		Help: "Loops currently in a non-terminal phase, by phase (idempotently set on every reconcile; 1 for active, 0 for terminal).",
-	}, []string{"phase"})
+	// B5a: loops_active is now a custom Collector (loops_active_collector.go)
+	// that counts Loops per non-terminal phase from the cache at scrape time.
+	// It is registered in SetupWithManager (where the client is available),
+	// not in init(). The GaugeVec is removed.
 	loopTokensTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "coxswain_loop_tokens_total",
 		Help: "Total model tokens consumed, as folded into status.budget from the proxy reading, by kind (prompt|completion).",
@@ -131,7 +131,7 @@ func init() {
 	metrics.Registry.MustRegister(verifyResultsTotal)
 	metrics.Registry.MustRegister(loopsCompletedTotal)
 	metrics.Registry.MustRegister(loopStallsTotal)
-	metrics.Registry.MustRegister(loopsActive)
+	// B5a: loops_active is a custom Collector, registered in SetupWithManager.
 	metrics.Registry.MustRegister(loopTokensTotal)
 }
 
@@ -725,8 +725,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// once) rather than a silent disappearance. The CleaningUp work (the
 	// snapshot GC + the finalizer removal) still runs below, unchanged.
 	b2Deleting := !loop.DeletionTimestamp.IsZero()
-	// B5a: maintain the loops-active gauge idempotently.
-	maintainLoopsActiveGauge(loop, b2Deleting)
 	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
 	// on the first reconcile; idempotent). It is what keeps the Loop alive
 	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
@@ -5227,6 +5225,18 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.CNIRegateSource != nil {
 		b = b.WatchesRawSource(r.CNIRegateSource)
 	}
+	// B5a: register the loops-active custom Collector. It counts Loops per
+	// non-terminal phase from the cache at scrape time, replacing the old
+	// GaugeVec (which left stale labels for phases a Loop had already left).
+	// The collector uses the manager's cached client (mgr.GetClient()), so
+	// List is a fast in-memory operation.
+	if err := metrics.Registry.Register(NewLoopsActiveCollector(mgr.GetClient())); err != nil {
+		// If the collector is already registered (e.g. a re-run), ignore the
+		// AlreadyRegisteredError. Other errors are fatal.
+		if !strings.Contains(err.Error(), "already registered") {
+			return fmt.Errorf("register loops-active collector: %w", err)
+		}
+	}
 	return b.Named("loop").
 		Complete(r)
 }
@@ -5593,13 +5603,4 @@ func isTerminalPhase(phase coxv1alpha1.LoopPhase) bool {
 	return phase == coxv1alpha1.LoopPhaseSucceeded || phase == coxv1alpha1.LoopPhaseFailed
 }
 
-// B5a: maintainLoopsActiveGauge sets the loops-active gauge to 1 for the
-// Loop's current phase if it is non-terminal and the Loop is not being
-// deleted (idempotent: setting 1 again is a no-op). The terminal transitions
-// in applyVerifyOutcome and applyStallGate set the gauge to 0. On operator
-// restart the gauge is lost (in-memory) but the next reconcile restores it.
-func maintainLoopsActiveGauge(loop coxv1alpha1.Loop, deleting bool) {
-	if !deleting && !isTerminalPhase(loop.Status.Phase) {
-		loopsActive.WithLabelValues(string(loop.Status.Phase)).Set(1)
-	}
-}
+

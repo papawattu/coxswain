@@ -112,7 +112,9 @@ func TestMetricsRegistered(t *testing.T) {
 	loopsCompletedTotal.WithLabelValues("__test__", "__test__").Inc()
 	loopStallsTotal.Inc()
 	loopTokensTotal.WithLabelValues("__test__").Inc()
-	loopsActive.WithLabelValues("__test__").Set(1)
+	// B5a: loops_active is now a custom Collector (loops_active_collector.go),
+	// registered in SetupWithManager. It is not tested here (it requires a
+	// client with Loops in the cache). The envtest covers it.
 	for _, name := range []string{
 		"coxswain_loop_phase_transitions_total",
 		"coxswain_loop_iterations_total",
@@ -120,7 +122,6 @@ func TestMetricsRegistered(t *testing.T) {
 		"coxswain_loops_completed_total",
 		"coxswain_loop_stalls_total",
 		"coxswain_loop_tokens_total",
-		"coxswain_loops_active",
 	} {
 		if _, ok := readMetric(t, name); !ok {
 			t.Errorf("%s is not registered on the process-wide metrics registry", name)
@@ -318,13 +319,11 @@ func TestMetricsVerifyResults(t *testing.T) {
 	}
 }
 
-// TestMetricsLoopsCompleted: bumpLoopCompletion bumps
-// coxswain_loops_completed_total and sets coxswain_loops_active to 0 for the
-// previous phase. Mutation: drop the bump must fail.
+// TestMetricsLoopsCompleted: bumpLoopCompletion bumps coxswain_loops_completed_total.
+// Mutation: drop the bump must fail.
 func TestMetricsLoopsCompleted(t *testing.T) {
 	// Reset the metrics to a known baseline.
 	loopsCompletedTotal.Reset()
-	loopsActive.Reset()
 
 	// Test a succeeded completion.
 	bumpLoopCompletion("succeeded", "verify_passed")
@@ -332,12 +331,6 @@ func TestMetricsLoopsCompleted(t *testing.T) {
 		map[string]string{"result": "succeeded", "reason": "verify_passed"})
 	if !found || succCount != 1 {
 		t.Fatalf("coxswain_loops_completed_total{result=succeeded,reason=verify_passed} = %v (found=%v), want 1", succCount, found)
-	}
-	// Check the active gauge was set to 0 for Verifying.
-	activeVal, found := readMetricLabel(t, "coxswain_loops_active",
-		map[string]string{"phase": "Verifying"})
-	if !found || activeVal != 0 {
-		t.Fatalf("coxswain_loops_active{phase=Verifying} = %v (found=%v), want 0", activeVal, found)
 	}
 
 	// Test a failed completion.

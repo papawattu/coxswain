@@ -350,9 +350,6 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 			"paused (stall): stall detector fired after "+fmt.Sprintf("%d", run)+" consecutive identical verify failures")
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
 			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run))
-		// B5a: non-terminal (Paused is not terminal) — set the active gauge for
-		// the Paused phase (idempotent).
-		loopsActive.WithLabelValues(string(coxv1alpha1.LoopPhasePaused)).Set(1)
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeNormal, pauseEventReason,
 				"paused: source stall, from phase %s (stall detector fired)", loop.Status.PausedFrom)

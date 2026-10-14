@@ -1243,9 +1243,6 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// (Verifying -> Planning, never the stale phase a leftover claim
 			// would imply). The failing check + exit code ride in the message.
 			r.emitVerifyReplanEvent(loop, from, failedCheck, checkExitCode, nextIter)
-			// B5a: non-terminal transition — set the active gauge for the new
-			// phase (idempotent: setting 1 again is a no-op).
-			loopsActive.WithLabelValues(string(coxv1alpha1.LoopPhasePlanning)).Set(1)
 			return true, false
 		default: // OnVerifyFailImplement (the default)
 			// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
@@ -1258,9 +1255,6 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// (Verifying -> Implementing, never the stale phase a leftover claim
 			// would imply). The failing check + exit code ride in the message.
 			r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
-			// B5a: non-terminal transition — set the active gauge for the new
-			// phase (idempotent: setting 1 again is a no-op).
-			loopsActive.WithLabelValues(string(coxv1alpha1.LoopPhaseImplementing)).Set(1)
 			return true, false
 		}
 	case verifyTampered:
@@ -1303,7 +1297,8 @@ func bumpVerifyResult(outcome int) {
 // before the terminal transition (typically Verifying).
 func bumpLoopCompletion(result, reason string) {
 	loopsCompletedTotal.WithLabelValues(result, reason).Inc()
-	loopsActive.WithLabelValues(string(coxv1alpha1.LoopPhaseVerifying)).Set(0)
+	// B5a: loops_active is now a custom Collector (loops_active_collector.go)
+	// that counts from the cache at scrape time. No manual gauge maintenance.
 }
 
 // B5a: bumpIteration bumps the loop-iterations counter on an iteration

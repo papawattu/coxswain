@@ -1,0 +1,63 @@
+# Example Loop: fix a failing Go test (the simplest possible task).
+#
+# The gocli sample app (examples/gocli) ships with Round() returning the
+# wrong value, so `go test ./...` is red. This Loop tells the agent to fix
+# round.go so the tests pass. The test files are protected paths: weakening
+# them trips the tamper gate (B2/D24).
+#
+# Prerequisites (see docs/QUICKSTART.md):
+#   - the operator is installed and running
+#   - a GitHub/Gitea token Secret named `git-cred` exists in the namespace
+#     (the deliver Job reads it; without it the deliver step fails)
+#   - the workspace repo is reachable from the sandbox (for a local dev
+#     cluster, use the in-cluster Gitea: http://gitea.samples.svc:3000)
+#
+# Apply:
+#   kubectl apply -f config/samples/loop-fix-failing-test.yaml
+#
+# Watch it:
+#   kubectl cox describe loop-fix-failing-test
+#   kubectl cox logs loop-fix-failing-test agent
+#
+# Expected outcome (with a working model backend):
+#   Planning -> Implementing -> Verifying -> Succeeded
+#   status.delivery: the PR the deliver Job opened (or the failure reason).
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: loop-fix-failing-test
+  namespace: default
+spec:
+  goal: >-
+    Fix Round in round.go so it rounds half away from zero. The test suite
+    (round_test.go) is currently red and is a protected path: do not change
+    or weaken any test file. Make `go test ./...` pass on the tests as written.
+  workspace:
+    # Replace with your own repo + ref (the workspace the agent clones).
+    # For the coxswain dev cluster, use the in-cluster Gitea:
+    #   repo: http://gitea.samples.svc:3000/samples/gocli.git
+    #   ref:  initial
+    #   gitCredentialSecret: samples-git-cred
+    repo: "https://github.com/papawattu/coxswain.git"
+    ref: "main"
+  verify:
+    acceptanceChecks:
+      - go build ./...
+      - go vet ./...
+      - go test ./...
+    preset: go
+    # The test files the agent must not modify (the "no cheating" boundary).
+    protectedPaths:
+      - round_test.go
+      - main_test.go
+    # The image the verify Job runs the checks in.
+    image: docker.io/library/golang:1.26
+  agent:
+    # image omitted: the operator's --runner-image flag supplies it.
+    # endpointSecretRef + modelEndpoint + model point at your model backend.
+    # For the dev cluster's vLLM:
+    #   endpointSecretRef: vllm-no-auth
+    #   modelEndpoint: 192.168.1.20:8000
+    #   model: qwen3.8-27b
+  loop:
+    maxIterations: 3

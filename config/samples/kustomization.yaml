@@ -1,4 +1,7 @@
 ## Append samples of your project ##
 resources:
 - coxswain_v1alpha1_loop.yaml
+- loop-fix-failing-test.yaml
+- loop-implement-missing-endpoint.yaml
+- loop-python-missing-function.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

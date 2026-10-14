@@ -797,30 +797,35 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// running at pause time is left to terminate, and its termination produces
 	// no iterate/stall/budget decision because the phase is Paused, not
 	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
+	// B3 (PLAN-BETA / PLAN.md Phase 4): the plan approval gate runs BEFORE
+	// the claim-driven advance: the gate's phase change is authoritative over
+	// the claim's advance — a claim-driven Planning -> AwaitingApproval must
+	// not override the gate's AwaitingApproval -> Implementing when the user
+	// has approved (the gate's phase is the current phase for the next
+	// claim-driven advance, so the gate's AwaitingApproval -> Implementing
+	// is not clobbered by a stale Planning claim). The gate is a no-op in
+	// Auto mode (the S4 behaviour is preserved); in Manual mode it holds the
+	// Planning -> AwaitingApproval advance until the user approves (the
+	// phaseGate seam, approvalPhaseGate), applies the onReject action on a
+	// rejection, and clears a stale approval on a re-plan. The gate is
+	// level-based (a function of the Loop's current status + conditions), so
+	// it is idempotent across reconciles. A gate phase change is recorded in
+	// advancedFrom ONLY when the gate itself advanced the phase (the
+	// claim-driven advance is already recorded; the gate's advance is a
+	// separate decision the PhaseAdvanced Event should also cover).
+	if r.applyApprovalGate(&loop) {
+		changed = true
+	}
 	claimReadPending, advancedFrom, verifyRequeue, s4Changed, s4Err := r.s4ClaimAndVerifyJob(ctx, &loop)
 	if s4Err != nil {
 		return ctrl.Result{}, s4Err
 	}
 	changed = changed || s4Changed
-	// B3 (PLAN-BETA / PLAN.md Phase 4): the plan approval gate. It runs
-	// AFTER the claim-driven advance (the gate's phase change is
-	// authoritative over the claim's advance — a claim-driven
-	// Planning -> AwaitingApproval must not override the gate's
-	// AwaitingApproval -> Implementing when the user has approved) and
-	// BEFORE the verify outcome (the gate's Failed (onReject: Fail) must
-	// not be re-driven by a stale verify claim). In Auto mode (the default)
-	// the gate is a no-op (the S4 behaviour is preserved); in Manual mode
-	// it holds the Planning -> AwaitingApproval advance until the user
-	// approves, applies the onReject action on a rejection, and clears a
-	// stale approval on a re-plan. The gate is level-based (a function of
-	// the Loop's current status + conditions), so it is idempotent across
-	// reconciles. A gate phase change is recorded in advancedFrom ONLY when
-	// the gate itself advanced the phase (the claim-driven advance is
-	// already recorded; the gate's advance is a separate decision the
-	// PhaseAdvanced Event should also cover).
-	if r.applyApprovalGate(&loop) {
-		changed = true
-	}
+	// The gate's phase change is recorded in advancedFrom (the PhaseAdvanced
+	// Event covers the gate's advance, not just the claim-driven advance).
+	// The claim-driven advance is already recorded in advancedFrom by
+	// s4ClaimAndVerifyJob; the gate's advance is a separate decision the
+	// Event should also cover.
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue

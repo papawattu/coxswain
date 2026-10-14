@@ -211,16 +211,12 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 					"Rejected", rejectedPlanReason(loop))
 				changed = true
 			default: // Replan
-				// Re-plan: set the phase to Planning (the next reconcile
-				// re-runs Planning; the phase-init writes the reason to the
-				// workspace for the re-plan). Clear PlanRejected (the
-				// re-plan starts fresh — the user can reject again on the
-				// new plan). Keep AwaitingApproval in the hold state (the
-				// phase is the machine's, not the condition's: the hold is
-				// re-entered on the next reconcile when the runner's
-				// Planning claim arrives).
-				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
-				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+				// Re-plan: clear the condition (the re-plan starts fresh — the
+				// user can reject again on the new plan). The phase STAYS at
+				// AwaitingApproval (the hold is still in force; the runner's
+				// next Planning claim, once the user re-approves, advances to
+				// Implementing). The phase-init writes the reason to the
+				// workspace for the re-plan (the plan-feedback file).
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 				changed = true
 			}
@@ -236,15 +232,28 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 		// Suspended (the phase gate, below).
 	case coxv1alpha1.LoopPhasePlanning:
 		// A stale approval from a prior plan (the user approved a plan, the
-		// Loop was rejected and re-entered Planning, but the user has not yet
-		// approved the new plan): clear it. The runner's post-write
-		// plan-change check (the plan-hash file) is the OPERATOR's fallback
-		// for a plan the user never rejected (a fresh Planning run that
-		// rewrites PLAN.md); this branch is the operator's own detection of a
-		// re-plan after a rejection (the phase is the machine's evidence that
-		// a re-plan is in flight).
-		if planApproved {
-			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
+		// Loop re-entered Planning (a re-plan after a rejection, or a plan
+		// change that cleared the approval and the runner re-wrote PLAN.md),
+		// but the user has not yet re-approved the new plan): the gate does
+		// NOT clear it on this reconcile. The claim-driven advance (allowed
+		// when the condition is present, see approvalPhaseGate) is the happy
+		// path: the user's PlanApproved is the signal that the plan on disk
+		// is the one to approve, and the runner's Planning claim (consumed by
+		// advancePhaseFromClaim, which runs AFTER the gate) then advances
+		// Planning -> Implementing. Clearing the condition here would
+		// clobber the user's approval before the claim-driven advance sees
+		// it. The stale-approval detection is the operator's own read of the
+		// phase (a re-plan is in flight: the phase is Planning, the user has
+		// not re-approved) + the runner's plan-change signal (the
+		// PlanChanged claim, consumed by advancePhaseFromClaim, clears the
+		// condition there), NOT a clear on every Planning + PlanApproved.
+		// A rejection at Planning (the user rejected the plan before it was
+		// approved — the Loop is still planning the re-plan): clear the
+		// condition (the re-plan starts fresh). The phase STAYS at Planning
+		// (the re-plan is in flight; the runner's next Planning claim, once
+		// the user re-approves, advances to Implementing).
+		if planRejected {
+			clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 			changed = true
 		}
 	case coxv1alpha1.LoopPhaseImplementing:
@@ -261,8 +270,11 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
 				changed = true
 			default: // Replan
-				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
-				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+				// Re-plan: clear the condition (the re-plan starts fresh). The
+				// phase STAYS at Implementing (the runner's next Planning claim,
+				// once the user re-approves, advances to AwaitingApproval ->
+				// Implementing). The phase-init writes the reason to the
+				// workspace for the re-plan (the plan-feedback file).
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 				changed = true
 			}
@@ -315,12 +327,13 @@ func (approvalPhaseGate) Allow(loop *coxv1alpha1.Loop, current, next coxv1alpha1
 	if approvalMode(loop) != coxv1alpha1.ApprovalModeManual {
 		return true, "" // Auto: no gate (the S4 behaviour).
 	}
-	if current == coxv1alpha1.LoopPhasePlanning && next == coxv1alpha1.LoopPhaseAwaitingApproval {
-		// The claim-driven advance (the runner's Planning claim). Hold until
-		// the user approves a plan (PlanApproved True, a valid hash in the
-		// message). The hold is the operator's decision: the runner's claim
-		// is not a gate input (ADR-0005) — the operator reads the condition
-		// (the user's signal) to decide.
+	// The Manual-mode hold: the Planning -> Implementing advance (the
+	// claim-driven advance, driven by the runner's Planning claim) is held
+	// until the user sets PlanApproved. The nextPhase table advances
+	// Planning -> Implementing directly (there is no AwaitingApproval phase
+	// between them in the table); the gate's hold is on that advance (the
+	// operator's decision, not the runner's — ADR-0005).
+	if current == coxv1alpha1.LoopPhasePlanning && next == coxv1alpha1.LoopPhaseImplementing {
 		if approvedPlanHash(loop) != "" {
 			return true, ""
 		}

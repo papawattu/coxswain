@@ -420,7 +420,7 @@ kc apply -f "$EVIDENCE/reach-eth0.yaml" >/dev/null
 i=0
 while :; do
 	st=$(kc -n "$NS" get pod vllm-reach-eth0 -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-	case "$st" in Completed | Failed) break ;; esac
+	case "$st" in Succeeded | Failed) break ;; esac
 	i=$((i + 2)); [ "$i" -gt 90 ] && die "the reachability probe pod did not finish in 90s (state $st)"
 	sleep 2
 done
@@ -976,7 +976,7 @@ kc apply -f "$EVIDENCE/step6-scrape.yaml" >/dev/null
 i=0
 while :; do
 	st=$(kc -n "$NS" get pod b6-metrics-scrape -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-	case "$st" in Completed | Failed) break ;; esac
+	case "$st" in Succeeded | Failed) break ;; esac
 	i=$((i + 2)); [ "$i" -gt 120 ] && die "step6: the scrape pod did not finish in 120s (state $st)"
 	sleep 2
 done

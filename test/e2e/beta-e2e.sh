@@ -748,8 +748,19 @@ log step1 "PASS: the re-plan's .coxswain/plan-feedback contains the rejection re
 	echo "plan-feedback contains the reason: yes (grep -qF matched)"
 } >"$EVIDENCE/step1-verify.txt"
 # Approve the SECOND plan (B3: the CLI computes the plan's SHA-256 and sets
-# PlanApproved with it; the operator advances to Implementing).
-log step2 "approving the second plan"
+# PlanApproved with it; the operator advances to Implementing). The CLI's
+# plan peek pod mounts the workspace PVC RO and `cat`s the plan file to
+# compute its hash; the PVC must be Bound before the peek pod can schedule.
+# The B6 run 5's first approve failed because the peek pod went Pending
+# (the PVC was still being provisioned when the reject triggered the
+# re-plan). Wait for the PVC to be Bound before approving.
+log step2 "approving the second plan (waiting for the workspace PVC to be Bound first — the CLI's plan peek pod mounts it)"
+for i in $(seq 1 60); do
+	PVC_STATUS=$(kubectl --context "$CTX" -n "beta-e2e" get pvc "${MANUAL_LOOP}-workspace" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+	[ "$PVC_STATUS" = "Bound" ] && break
+	sleep 2
+done
+[ "$PVC_STATUS" = "Bound" ] || { kubectl --context "$CTX" -n beta-e2e get pvc >"$EVIDENCE/step2-pvc-stuck.txt"; die "step2: the workspace PVC is not Bound after 120s (the CLI's plan peek pod cannot schedule — see $EVIDENCE/step2-pvc-stuck.txt)"; }
 cox approve "$MANUAL_LOOP" >"$EVIDENCE/step2-approve.txt" 2>&1 || die "step2: cox approve failed"
 log step2 "second plan APPROVED; watching to a terminal phase"
 watch_loop "$MANUAL_LOOP" "$EVIDENCE/step2-phase.log" || die "step2: $MANUAL_LOOP wedged (see $EVIDENCE/step2-phase.log — recorded, not guessed)"

@@ -47,7 +47,6 @@ package controller
 
 import (
 	"regexp"
-	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -367,34 +366,4 @@ func (r *LoopReconciler) wireApprovalGate() {
 func (r *LoopReconciler) approvalHoldPhase(loop *coxv1alpha1.Loop) bool {
 	return approvalMode(loop) == coxv1alpha1.ApprovalModeManual &&
 		loop.Status.Phase == coxv1alpha1.LoopPhaseAwaitingApproval
-}
-
-// approvalFailedReason is the terminal Failed reason the operator records
-// when a Loop is failed by a plan rejection (onReject: Fail). It is a
-// distinct reason (not "Stalled", "MaxIterationsExceeded", or
-// "CheckpointUnavailable") so the user can see in the Loop's status that the
-// Loop stopped because the plan was rejected, not because of a model or
-// infrastructure failure.
-const approvalFailedReason = "PlanRejected"
-
-// approvalReason is the stable Event reason the operator emits on a B3
-// approval decision (an OS5-style stable reason, documented as an API):
-// "PlanApproved" when the user approves (the advance to Implementing),
-// "PlanRejected" when the user rejects (the onReject action). The message
-// carries the operator's decision (the reason for a rejection, the onReject
-// action that applied).
-const (
-	approvalApprovedReason = "PlanApproved"
-	approvalRejectedReason = "PlanRejected"
-)
-
-// approvalEventMessage builds the Event message for a B3 approval decision.
-// It is a one-line summary (the Event's message is the user-facing
-// explanation; the condition's message carries the detail).
-func approvalEventMessage(decision string, detail string) string {
-	s := strings.TrimSpace(detail)
-	if s == "" {
-		return decision
-	}
-	return decision + ": " + s
 }

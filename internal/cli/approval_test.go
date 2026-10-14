@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"maps"
 	"strings"
 	"testing"
 
@@ -124,7 +125,7 @@ func TestRejectLoop_SetsPlanRejectedCondition(t *testing.T) {
 		Loops: f,
 	}
 	var out bytes.Buffer
-	if err := rejectLoop(context.Background(), dc, "ns", loopName, "the plan misses the edge case", &out); err != nil {
+	if err := rejectLoop(context.Background(), dc, loopName, "the plan misses the edge case", &out); err != nil {
 		t.Fatalf("rejectLoop: %v", err)
 	}
 	if len(f.updates) == 0 {
@@ -261,10 +262,7 @@ func (f *fakeWorkspace) Read(ctx context.Context, loopName, path string) (string
 // newFakeLoop builds a fake Loop (an *unstructured.Unstructured) with the given
 // status.conditions (nil-safe: a nil conditions slice is an empty status).
 func newFakeLoop(name string, status map[string]any) *unstructured.Unstructured {
-	statusMap := map[string]any{}
-	for k, v := range status {
-		statusMap[k] = v
-	}
+	statusMap := maps.Clone(status)
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "coxswain.wattu.com/v1alpha1",
 		"kind":       "Loop",

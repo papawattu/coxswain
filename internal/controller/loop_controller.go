@@ -585,7 +585,24 @@ func (r *LoopReconciler) applyBudgetStep(ctx context.Context, loop *coxv1alpha1.
 // checkpoint timing must match the B1 specs — the checkpoint is taken on the
 // same reconcile as the verify outcome, not in a helper that returns early).
 func (r *LoopReconciler) s4ClaimAndVerifyJob(ctx context.Context, loop *coxv1alpha1.Loop) (claimReadPending bool, advancedFrom coxv1alpha1.LoopPhase, verifyRequeue bool, s4Changed bool, err error) {
-	claimReadPending, s4Changed, advancedFrom = r.advancePhaseFromClaim(ctx, loop)
+	// B3 (PLAN-BETA / PLAN.md Phase 4): the plan approval gate runs BEFORE
+	// the claim-driven advance: the gate's phase change is authoritative over
+	// the claim's advance. The gate is a no-op in Auto mode (the S4 behaviour
+	// is preserved); in Manual mode it holds the Planning -> AwaitingApproval
+	// advance until the user approves (the phaseGate seam, approvalPhaseGate),
+	// applies the onReject action on a rejection, and clears a stale approval
+	// on a re-plan. The gate is level-based (a function of the Loop's current
+	// status + conditions), so it is idempotent across reconciles. A gate
+	// phase change is recorded in advancedFrom ONLY when the gate itself
+	// advanced the phase (the claim-driven advance is already recorded by
+	// advancePhaseFromClaim; the gate's advance is a separate decision the
+	// PhaseAdvanced Event should also cover).
+	if r.applyApprovalGate(loop) {
+		s4Changed = true
+	}
+	claimReadPending, s4Changed2, advancedFromClaim := r.advancePhaseFromClaim(ctx, loop)
+	s4Changed = s4Changed || s4Changed2
+	advancedFrom = advancedFromClaim
 	verifyRequeue = false
 	if err := r.ensureVerifyJobAndNetPolicies(ctx, loop); err != nil {
 		if !errors.Is(err, errVerifyStaleDeleted) {
@@ -685,10 +702,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
 	}
-	// D30 gate: if the engine is not enforcing and AllowUnenforced is not set,
-	// the sandbox stays Suspended (fail-closed). An invalid policy (C6a) ALSO
-	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
-	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
 	// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the workspace restore step
 	// (restore/rollback/fork). It runs BEFORE phaseBootstrap (the bootstrap's
@@ -696,10 +709,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// sandbox; the restore step DELETEs + recreates the PVC with a dataSource,
 	// and the sandbox build reads the PVC by name, not spec, so a restored
 	// PVC is invisible to it). A completed restore is one-shot (the Restore
-	// condition True/Restored is the marker). The B2 restore step's requeue
-	// (the snapshot is not ReadyToUse yet — the in-progress state, I49 — or a
-	// transient read failed) ORs into the requeue-after in the FINAL return
-	// (below).
+	// condition True/Restored is the marker).
 	var err error
 	b2Changed, b2Requeue, b2Hold, err := r.b2ApplyRestoreStep(ctx, &loop)
 	if err != nil {
@@ -732,6 +742,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 	changed = changed || cpChanged
+
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
@@ -741,86 +752,32 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if r.ensureObservedGeneration(&loop) {
 		changed = true
 	}
+
 	// S4 (ADR-0004): read the runner's claim from the agent container's
-	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
-	// logged and requeued, never acted on; the OS1 progress record is
-	// observability only. The iterate/terminal branches (Verifying ->
-	// Implementing / Failed) are completed by B3 (verify outcome) and B4
-	// (iteration count). See internal/controller/loop_s4_phase.go.
+	// termination message (strict-parsed), and never a gate input (ADR-0005).
 	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
-	// isolated evidence path). The Job is created when the current pin exists
-	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
-	// Verifying advance) and its init containers' exit codes drive the
-	// Verifying outcome (Succeeded | iterate | TamperedVerify). The
-	// applyVerifyOutcome reader runs every reconcile at Verifying (the B2
-	// tamper gate ALSO runs every reconcile below — order-independent, D38
-	// pattern).
-	//
-	// The stale-Job guard (D27) returns verifyStaleDeleted when it has just
-	// deleted a Job stamped for a different pin. The caller maps it to a
-	// clean requeue (the 5s RequeueAfter in the FINAL return, AFTER the
-	// shared Status().Update) — never a controller error, and never an
-	// in-same-reconcile create of the fresh Job (the name is still taken;
-	// the apiserver deletes async, so a Create here would hit AlreadyExists
-	// and the new pin would be left un-built). The requeue creates the fresh
-	// Job on the next reconcile.
-	// P2f: no Jobs run while paused — the verify Job's ensure is gated on
-	// phase != Paused (a paused Loop has no in-flight verify; a Job that was
-	// running at pause time is left to terminate, and its termination produces
-	// no iterate/stall/budget decision because the phase is Paused, not
-	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
-	// S4 (ADR-0004): read the runner's claim from the agent container's
-	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
-	// logged and requeued, never acted on; the OS1 progress record is
-	// observability only. The iterate/terminal branches (Verifying ->
-	// Implementing / Failed) are completed by B3 (verify outcome) and B4
-	// (iteration count). See internal/controller/loop_s4_phase.go.
-	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
-	// isolated evidence path). The Job is created when the current pin exists
-	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
-	// Verifying advance) and its init containers' exit codes drive the
-	// Verifying outcome (Succeeded | iterate | TamperedVerify). The
-	// applyVerifyOutcome reader runs every reconcile at Verifying (the B2
-	// tamper gate ALSO runs every reconcile below — order-independent, D38
-	// pattern).
-	//
-	// The stale-Job guard (D27) returns verifyStaleDeleted when it has just
-	// deleted a Job stamped for a different pin. The caller maps it to a
-	// clean requeue (the 5s RequeueAfter in the FINAL return, AFTER the
-	// shared Status().Update) — never a controller error, and never an
-	// in-same-reconcile create of the fresh Job (the name is still taken;
-	// the apiserver deletes async, so a Create here would hit AlreadyExists
-	// and the new pin would be left un-built). The requeue creates the fresh
-	// Job on the next reconcile.
-	// P2f: no Jobs run while paused — the verify Job's ensure is gated on
-	// phase != Paused (a paused Loop has no in-flight verify; a Job that was
-	// running at pause time is left to terminate, and its termination produces
-	// no iterate/stall/budget decision because the phase is Paused, not
-	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
+	// isolated evidence path). The applyVerifyOutcome reader runs every
+	// reconcile at Verifying.
 	// B3 (PLAN-BETA / PLAN.md Phase 4): the plan approval gate runs BEFORE
 	// the claim-driven advance: the gate's phase change is authoritative over
-	// the claim's advance — a claim-driven Planning -> AwaitingApproval must
-	// not override the gate's AwaitingApproval -> Implementing when the user
-	// has approved (the gate's phase is the current phase for the next
-	// claim-driven advance, so the gate's AwaitingApproval -> Implementing
-	// is not clobbered by a stale Planning claim). The gate is a no-op in
-	// Auto mode (the S4 behaviour is preserved); in Manual mode it holds the
-	// Planning -> AwaitingApproval advance until the user approves (the
-	// phaseGate seam, approvalPhaseGate), applies the onReject action on a
-	// rejection, and clears a stale approval on a re-plan. The gate is
-	// level-based (a function of the Loop's current status + conditions), so
-	// it is idempotent across reconciles. A gate phase change is recorded in
-	// advancedFrom ONLY when the gate itself advanced the phase (the
-	// claim-driven advance is already recorded; the gate's advance is a
-	// separate decision the PhaseAdvanced Event should also cover).
-	if r.applyApprovalGate(&loop) {
-		changed = true
-	}
+	// the claim's advance. The gate is a no-op in Auto mode (the S4 behaviour
+	// is preserved); in Manual mode it holds the Planning -> AwaitingApproval
+	// advance until the user approves (the phaseGate seam, approvalPhaseGate),
+	// applies the onReject action on a rejection, and clears a stale approval
+	// on a re-plan. The gate is level-based (a function of the Loop's current
+	// status + conditions), so it is idempotent across reconciles.
+	//
+	// The s4ClaimAndVerifyJob helper keeps the Reconcile within the gocyclo
+	// budget: it runs the claim-driven advance (advancePhaseFromClaim) and
+	// the verify Job ensure (ensureVerifyJob) in one step, returning the
+	// claim-read-pending flag, the advance source (for the PhaseAdvanced
+	// Event), the verify requeue, and the changed flag.
 	claimReadPending, advancedFrom, verifyRequeue, s4Changed, s4Err := r.s4ClaimAndVerifyJob(ctx, &loop)
 	if s4Err != nil {
 		return ctrl.Result{}, s4Err
 	}
 	changed = changed || s4Changed
+
 	// The gate's phase change is recorded in advancedFrom (the PhaseAdvanced
 	// Event covers the gate's advance, not just the claim-driven advance).
 	// The claim-driven advance is already recorded in advancedFrom by
@@ -829,32 +786,26 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
+
 	// B1: take the workspace checkpoint and apply retention. The checkpoint
 	// step runs on every reconcile (level-based); the idempotency guard in
 	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
-	// The checkpoint is keyed off the operator-recorded verify outcome
-	// (status.verify.iteration), not the current iteration.
 	cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop)
 	changed = changed || cpChanged
 	verifyRequeue = verifyRequeue || cpRequeue
+
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a
 	// pinned verifiedCommit. The stale-Job guard (D27) deletes a Job stamped
 	// for a different verifiedCommit and requeues (the 5s RequeueAfter in the
 	// FINAL return) — never a controller error, never an in-same-reconcile
-	// create. The deliver pod's NetworkPolicy (DNS + egress proxy for an
-	// external repo host; the direct repo-peer rule in-cluster) is expected
-	// while delivery is expected, cleaned up when the Loop leaves Succeeded
-	// or the mode flips off. The egress proxy's SNI allowlist carries the
-	// repo host + api.github.com (GitHub) for the push + the provider API
-	// (deliverEgressProxyHosts in ensureEgressProxy). The push container's
-	// termination message is read via the APIReader (pod-blind, like the S3/
-	// S4 read-backs) and written to status.delivery + the Delivered
-	// condition (ensureDeliverReadback).
+	// create. The egress proxy's SNI allowlist carries the repo host +
+	// api.github.com (GitHub) for the push + the provider API.
 	deliverRequeue, deliverKeep, err := r.ensureDeliver(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
 	// gate (see applyTamperGate for the tri-state logic). The gate must run
 	// every reconcile — calling it into a local and only then OR-ing into
@@ -864,35 +815,26 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if r.applyTamperGate(&loop) {
 		changed = true
 	}
+
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references
 	// (spec.policyRefs[]). The operator computes the hash and stores it in
-	// status.policy.effectiveHash so the decision audit shows what the agent was
-	// allowed to do (D32); the hash is over the union, not stored allows.
+	// status.policy.effectiveHash so the decision audit shows what the agent
+	// was allowed to do (D32); the hash is over the union, not stored allows.
 	hashChanged, err := r.recordEffectivePolicyHash(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	changed = changed || hashChanged
+
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
 	// container's termination message (read via the operator's own APIReader
 	// path — NOT a cached client, NOT a kubelet ReadFile) carries the resolved
 	// commit SHA; a non-SHA message (e.g. 'no base commit') means the clone
-	// failed and the read-back must fail. The reconciler reads the pod and
-	// validates the SHA.
-	//
-	// baseCommitPending drives the RequeueAfter: spec.workspace.repo != '' and
-	// baseCommit is empty and the init has not yet terminated. Once set
-	// (immutable, ADR-0005 D10) or the init failed (terminated) the timer
-	// stops. The requeue is applied in the FINAL return (below the
-	// Status().Update), so a pending baseCommit never skips persisting other
-	// status changes from this reconcile (e.g. the I42b EgressProxyConflict
-	// condition set earlier in ensureProxyAndNetPolicies).
-	//
-	// (The reviewer's MVP fix: no exec/kubelet/new RBAC; readBaseCommit reads
-	// pod.status.initContainerStatuses and validates a 40-hex SHA.)
+	// failed and the read-back must fail.
 	baseCommitPending, baseCommitChanged := r.recordBaseCommitFromInit(ctx, &loop)
 	changed = changed || baseCommitChanged
+
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
 	// P2d: the budget decision — the operator reads the proxy's usage endpoint

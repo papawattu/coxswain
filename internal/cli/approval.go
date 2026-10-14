@@ -12,6 +12,21 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// planApprovedConditionType is the PlanApproved condition's type string (the
+// goconst for the CLI's approve command — the operator's constant is in a
+// different module, so the CLI defines its own).
+const planApprovedConditionType = "PlanApproved"
+
+// conditionStatusTrue is the condition's status "True" (the goconst for the
+// CLI's approve/reject commands — the operator's constant is in a different
+// module, so the CLI defines its own).
+const conditionStatusTrue = "True"
+
+// planRejectedConditionType is the PlanRejected condition's type string (the
+// goconst for the CLI's reject command — the operator's constant is in a
+// different module, so the CLI defines its own).
+const planRejectedConditionType = "PlanRejected"
+
 // newApproveCommand builds `cox approve <loop>`: set the PlanApproved condition
 // on the Loop (the B3 plan approval gate). The CLI computes the SHA-256 of the
 // plan (read from the workspace via the existing plan reader) and sets the
@@ -50,8 +65,8 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	// message carries the hash (the operator parses it from the message; the
 	// condition's status is True, the reason is Approved).
 	cond := map[string]any{
-		"type":    "PlanApproved",
-		"status":  "True",
+		"type":    planApprovedConditionType,
+		"status":  conditionStatusTrue,
 		"reason":  "Approved",
 		"message": "Approved: " + hash,
 	}
@@ -93,7 +108,7 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 		if !ok {
 			continue
 		}
-		if cm["type"] == "PlanApproved" {
+		if cm["type"] == planApprovedConditionType {
 			conds[i] = cond
 			replaced = true
 			break
@@ -108,7 +123,7 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	if err := dc.Loops.Update(ctx, u); err != nil {
 		return fmt.Errorf("update loop %q (set PlanApproved): %w", name, err)
 	}
-	fmt.Fprintf(out, "Approved the plan for loop %q (SHA-256 %s)\n", name, hash)
+	_, _ = fmt.Fprintf(out, "Approved the plan for loop %q (SHA-256 %s)\n", name, hash)
 	return nil
 }
 
@@ -138,7 +153,7 @@ func newRejectCommand() *cobra.Command {
 			if reason == "" {
 				return fmt.Errorf("--reason is required (the reason the plan was rejected)")
 			}
-			return rejectLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], reason, cmd.OutOrStdout())
+			return rejectLoop(cmd.Context(), currentDeps, args[0], reason, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().String("reason", "", "the reason the plan was rejected (required)")
@@ -149,13 +164,13 @@ func newRejectCommand() *cobra.Command {
 // condition (True, message "Rejected: <reason>") on the Loop's status
 // subresource. The operator's approval gate then applies the onReject action
 // (Replan: re-enter Planning with the reason; Fail: terminal).
-func rejectLoop(ctx context.Context, dc Deps, ns, name, reason string, out io.Writer) error {
+func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer) error {
 	// Build the condition (the user is the sole writer of PlanRejected). The
 	// message carries the reason (the operator reads it from the message; the
 	// condition's status is True, the reason is Rejected).
 	cond := map[string]any{
-		"type":    "PlanRejected",
-		"status":  "True",
+		"type":    planRejectedConditionType,
+		"status":  conditionStatusTrue,
 		"reason":  "Rejected",
 		"message": "Rejected: " + reason,
 	}
@@ -182,7 +197,7 @@ func rejectLoop(ctx context.Context, dc Deps, ns, name, reason string, out io.Wr
 		if !ok {
 			continue
 		}
-		if cm["type"] == "PlanRejected" {
+		if cm["type"] == planRejectedConditionType {
 			conds[i] = cond
 			replaced = true
 			break
@@ -197,7 +212,7 @@ func rejectLoop(ctx context.Context, dc Deps, ns, name, reason string, out io.Wr
 	if err := dc.Loops.Update(ctx, u); err != nil {
 		return fmt.Errorf("update loop %q (set PlanRejected): %w", name, err)
 	}
-	fmt.Fprintf(out, "Rejected the plan for loop %q: %s\n", name, reason)
+	_, _ = fmt.Fprintf(out, "Rejected the plan for loop %q: %s\n", name, reason)
 	return nil
 }
 
@@ -251,7 +266,7 @@ func diffLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) erro
 		if !ok {
 			continue
 		}
-		if cm["type"] == "PlanApproved" && cm["status"] == "True" {
+		if cm["type"] == planApprovedConditionType && cm["status"] == conditionStatusTrue {
 			if msg, ok := cm["message"].(string); ok {
 				// The message format is "Approved: <hash>" (the same format
 				// approveLoop writes). Parse the hash (a 64-hex string at the
@@ -270,11 +285,11 @@ func diffLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) erro
 	currentHash := planSHA256([]byte(plan))
 	switch {
 	case approvedHash == "":
-		fmt.Fprintf(out, "No prior approval. Current plan (SHA-256 %s):\n\n%s\n", currentHash, plan)
+		_, _ = fmt.Fprintf(out, "No prior approval. Current plan (SHA-256 %s):\n\n%s\n", currentHash, plan)
 	case currentHash == approvedHash:
-		fmt.Fprintf(out, "No diff: the plan is the same the user last approved (SHA-256 %s)\n", approvedHash)
+		_, _ = fmt.Fprintf(out, "No diff: the plan is the same the user last approved (SHA-256 %s)\n", approvedHash)
 	default:
-		fmt.Fprintf(out, "Plan changed since the last approval (approved SHA-256 %s, current SHA-256 %s):\n\n%s\n", approvedHash, currentHash, plan)
+		_, _ = fmt.Fprintf(out, "Plan changed since the last approval (approved SHA-256 %s, current SHA-256 %s):\n\n%s\n", approvedHash, currentHash, plan)
 	}
 	return nil
 }

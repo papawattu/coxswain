@@ -184,3 +184,41 @@ func TestMetricsTokenTotalBumpedOnFold(t *testing.T) {
 		t.Fatalf("coxswain_loop_tokens_total bumped on a zero-delta reading (%v -> %v)", before2, after2)
 	}
 }
+
+// TestMetricsIterationBumpedOnNewPhase: recordPhaseClaim bumps
+// coxswain_loop_iterations_total when the claim names a phase different from
+// the Loop's current phase (a new-phase transition). A re-claim of the same
+// phase does not bump. Mutation: drop the bump in recordPhaseClaim must fail
+// (the counter stays at its baseline).
+func TestMetricsIterationBumpedOnNewPhase(t *testing.T) {
+	// Reset the metric to a known baseline.
+	loopIterationsTotal.Reset()
+	_, _ = readMetric(t, "coxswain_loop_iterations_total") // re-materialise
+
+	r := &LoopReconciler{Recorder: record.NewFakeRecorder(64)}
+	now := metav1.Now()
+
+	// A Loop currently in Planning. A claim reporting it just executed
+	// Implementing (a new phase) should bump the metric once.
+	l := &coxv1alpha1.Loop{}
+	l.Name = "lp"
+	l.Namespace = "ns"
+	l.Status.Phase = coxv1alpha1.LoopPhasePlanning
+	claim := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 1}
+	_, _ = r.recordPhaseClaim(l, claim, now)
+
+	got, _ := readMetric(t, "coxswain_loop_iterations_total")
+	if got != 1 {
+		t.Fatalf("coxswain_loop_iterations_total = %v after a new-phase transition (Planning -> Implementing), want 1", got)
+	}
+
+	// A re-claim of the SAME phase (Implementing again) does not bump.
+	l.Status.Phase = coxv1alpha1.LoopPhaseImplementing
+	claim2 := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 2}
+	_, _ = r.recordPhaseClaim(l, claim2, now)
+
+	got2, _ := readMetric(t, "coxswain_loop_iterations_total")
+	if got2 != 1 {
+		t.Fatalf("coxswain_loop_iterations_total = %v after a re-claim of the same phase, want 1 (no bump)", got2)
+	}
+}

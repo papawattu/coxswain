@@ -88,11 +88,26 @@ jobs:
       - name: Build dist/install.yaml
         run: make build-installer IMG="${IMAGE_PREFIX}-controller:${GITHUB_REF_NAME}"
 
+      - name: Setup Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      # D62: the chart ships with placeholder image tags; stamp the release tag
+      # into every coxswain image (controller + runner/proxy args), refuse to
+      # package if any placeholder survives, then lint and package.
+      - name: Package the Helm chart
+        run: |
+          sed -i "s/:placeholder\b/:${GITHUB_REF_NAME}/g; s/tag: \"placeholder\"/tag: \"${GITHUB_REF_NAME}\"/" dist/chart/values.yaml
+          if grep -rn placeholder dist/chart/values.yaml; then echo "placeholder left in the chart" >&2; exit 1; fi
+          helm lint dist/chart
+          helm package dist/chart --version "${GITHUB_REF_NAME#v}" --app-version "${GITHUB_REF_NAME}" --destination dist
+          if helm template coxswain dist/coxswain-*.tgz | grep -n placeholder; then echo "placeholder in the rendered chart" >&2; exit 1; fi
+          ls -l dist/coxswain-*.tgz
+
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/install.yaml \
+          gh release create "${GITHUB_REF_NAME}" dist/install.yaml dist/coxswain-*.tgz \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --prerelease \

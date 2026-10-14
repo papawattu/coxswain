@@ -123,6 +123,48 @@ curl -sk https://localhost:8080/metrics | grep coxswain_
 (HTTPS requires the metrics auth token; use `--metrics-secure=false` on the
 manager for a plain-HTTP scrape in dev.)
 
+### Reading /metrics with a bound token (reviewer's recipe)
+
+The metrics endpoint uses `filters.WithAuthenticationAndAuthorization`
+(controller-runtime). To read it with `curl`, you need a token bound to the
+`coxswain-metrics-reader` Role. The generated operator RBAC does NOT include
+this permission — it must be granted explicitly:
+
+```sh
+# 1. Create a ServiceAccount for metrics access
+kubectl -n coxswain-system create sa metrics-reader
+
+# 2. Create a Role that allows the SubjectAccessReview the metrics filter needs
+#    (Verb: "get", Path: "/metrics" — the filter converts this to a SAR on
+#    the "metrics" resource in the "" API group).
+cat <<'EOF' | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metrics-reader
+  namespace: coxswain-system
+rules:
+- apiGroups: [""]
+  resources: ["metrics"]
+  verbs: ["get"]
+EOF
+
+# 3. Bind the Role to the SA
+kubectl -n coxswain-system create rolebinding metrics-reader-binding \
+  --role=metrics-reader --serviceaccount=coxswain-system:metrics-reader
+
+# 4. Create a token for the SA
+TOKEN=$(kubectl -n coxswain-system create token metrics-reader --duration=5m)
+
+# 5. Port-forward and read /metrics
+kubectl -n coxswain-system port-forward \
+  svc/coxswain-controller-manager-metrics-service 8080:8443 &
+PF_PID=$!
+sleep 3
+curl -sk https://localhost:8080/metrics -H "Authorization: Bearer $TOKEN" | grep coxswain_
+kill $PF_PID
+```
+
 ### The B5a metrics
 
 | Metric | Type | Labels | Meaning |
@@ -132,7 +174,7 @@ manager for a plain-HTTP scrape in dev.)
 | `coxswain_verify_results_total` | Counter | `result` (pass\|fail\|infra) | Total verify outcomes, by result. The verify pass rate is computed as `pass / (pass + fail)`. |
 | `coxswain_loops_completed_total` | Counter | `result` (succeeded\|failed), `reason` | Total Loops that reached a terminal phase, by result and reason (verify_passed, max_iterations, stalled, tampered, verify_infra). |
 | `coxswain_loop_stalls_total` | Counter | — | Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs). |
-| `coxswain_loops_active` | Gauge | `phase` | Loops currently in a non-terminal phase, by phase. Set to 1 for each active Loop; reset to 0 when the Loop reaches a terminal phase. |
+| `coxswain_loops_active` | Gauge | `phase` | Loops currently in a non-terminal phase, by phase. Counted from the manager's cache at scrape time (custom Collector, not set on reconcile). Terminal phases (Succeeded, Failed) are excluded. |
 | `coxswain_loop_tokens_total` | Counter | `kind` (prompt\|completion) | Total model tokens consumed, as folded into `status.budget` from the proxy reading, by kind. Bumped by the delta on each same-bootID, no-drop reading. |
 
 **Alerting examples** (PromQL):

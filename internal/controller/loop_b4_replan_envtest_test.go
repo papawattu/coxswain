@@ -64,12 +64,13 @@ import (
 var _ = Describe("B4 re-plan on verify failure", func() {
 	ctx := context.Background()
 
-	// b4LoopSpec builds a Loop spec with the given onVerifyFail value (and
+	// b4LoopSpec builds a Loop spec with onVerifyFail=Plan (and the given
 	// approval mode). The acceptance check is a single check (check-0) so the
-	// verify Job's check inits are non-empty.
-	b4LoopSpec := func(onVerifyFail coxv1alpha1.OnVerifyFailAction, mode coxv1alpha1.ApprovalMode) coxv1alpha1.LoopSpec {
+	// verify Job's check inits are non-empty. The onVerifyFail is always Plan
+	// (the default/Implement path is tested by the S5a specs, not here).
+	b4LoopSpec := func(mode coxv1alpha1.ApprovalMode) coxv1alpha1.LoopSpec {
 		spec := s5aLoopSpec()
-		spec.Verify.OnVerifyFail = onVerifyFail
+		spec.Verify.OnVerifyFail = coxv1alpha1.OnVerifyFailPlan
 		if mode != "" {
 			spec.Approval = &coxv1alpha1.Approval{Mode: mode}
 		}
@@ -174,7 +175,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		name := "b4-plan"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       b4LoopSpec(coxv1alpha1.OnVerifyFailPlan, ""),
+			Spec:       b4LoopSpec(""),
 		})).To(Succeed())
 
 		r := s5aDriveToVerifying(ns, name)
@@ -268,7 +269,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		name := "b4-manual"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       b4LoopSpec(coxv1alpha1.OnVerifyFailPlan, coxv1alpha1.ApprovalModeManual),
+			Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
 		})).To(Succeed())
 
 		// Wire the approval gate (the OS8 seam: the S4 default is
@@ -446,7 +447,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		name := "b4-inprog"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       b4LoopSpec(coxv1alpha1.OnVerifyFailPlan, ""),
+			Spec:       b4LoopSpec(""),
 		})).To(Succeed())
 
 		r := s5aDriveToVerifying(ns, name)
@@ -481,12 +482,67 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		name := "b4-rej"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       b4LoopSpec(coxv1alpha1.OnVerifyFailPlan, ""),
+			Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
 		})).To(Succeed())
 
-		r := s5aDriveToVerifying(ns, name)
-		loop := b4Reconcile(r, ns, name)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		// Drive to Verifying in Manual mode (the s5aDriveToVerifying helper
+		// assumes Auto mode; Manual mode holds at AwaitingApproval after the
+		// Planning claim, so the spec must approve the plan to advance).
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r.wireApprovalGate()
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return nil, nil
+		}
+		s5aEnsureSandbox(ns, name)
+		// Bootstrap: Pending -> Planning.
+		b4Reconcile(r, ns, name)
+		// Pin status.baseCommit.
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		// Planning claim -> AwaitingApproval (Manual hold).
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return &PhaseClaim{
+				ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+				Status:        "success",
+				HeadCommit:    s5aHeadCommit,
+			}, nil
+		}
+		b4Reconcile(r, ns, name)
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return nil, nil
+		}
+		// Set PlanApproved (the user approves the plan).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		now := metav1.Now()
+		loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
+			Type:               coxv1alpha1.PlanApprovedCondition,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Approved",
+			Message:            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+			LastTransitionTime: now,
+		})
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		b4Reconcile(r, ns, name)
+		// Implementing claim -> Verifying.
+		s5aEnsureSandbox(ns, name)
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return &PhaseClaim{
+				ObservedPhase: coxv1alpha1.LoopPhaseImplementing,
+				Status:        "success",
+				Iteration:     0,
+				HeadCommit:    s5aHeadCommit,
+			}, nil
+		}
+		b4Reconcile(r, ns, name)
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return nil, nil
+		}
+		loop = b4Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"Manual mode: the Loop is at Verifying (the plan was approved)")
 
 		// Failed verify -> re-plan (Planning). The failure summary is set.
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
@@ -505,7 +561,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		// Simulate the rejection: set the PlanRejected condition on the Loop.
 		loop = &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		now := metav1.Now()
+		now = metav1.Now()
 		loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
 			Type:               coxv1alpha1.PlanRejectedCondition,
 			Status:             metav1.ConditionTrue,
@@ -546,7 +602,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		name := "b4-pass"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       b4LoopSpec(coxv1alpha1.OnVerifyFailPlan, ""),
+			Spec:       b4LoopSpec(""),
 		})).To(Succeed())
 
 		r := s5aDriveToVerifying(ns, name)
@@ -594,11 +650,16 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 
 		// Second verify PASSES (check-0 exit 0). The operator's verifyOutcome
 		// returns verifySucceeded. The failure summary is CLEARED (the
-		// failure is resolved).
+		// failure is resolved). The iteration is 2 after the re-plan, so the
+		// verify Job name uses iteration 2 (verifyJobName clamps to min 1).
 		oldPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name + "-verify-pod", Namespace: ns}}
 		Expect(k8sClient.Delete(ctx, oldPod)).To(Succeed())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-pod", Namespace: ns}, &corev1.Pod{})).ToNot(Succeed())
-		jobName = verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// The verify Job name for the CURRENT iteration (the re-plan
+		// incremented it to 2). verifyJobName uses loop.Status.Iteration
+		// (min 1), so we pass the actual loop (with status) to get the
+		// correct name.
+		jobName = verifyJobName(loop)
 		// Create a PASSING verify pod (check-0 exit 0).
 		s5aPassingPod(ctx, ns, name, jobName)
 		loop = b4Reconcile(r, ns, name)
@@ -618,6 +679,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 			"a later Planning has EMPTY feedback (the summary was cleared on pass)")
 	})
 })
+
 // tamper TERMINATED (exit 0) but check-0 STILL RUNNING (not terminated) —
 // the verify is IN PROGRESS (the outcome is not yet recorded). The operator
 // must not make a decision (no phase change, no iteration increment, no

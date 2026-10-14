@@ -357,17 +357,20 @@ kc apply -f "$EVIDENCE/hostpath-sc-snapclass.yaml" >/dev/null 2>&1 || { cat "$EV
 # workspace PVC went Pending partly because 'standard' was still marked
 # default. Unmark every default annotation except hostpath's, and fail the
 # run if more than one default SC remains.
+# Find every SC that carries the default annotation EXCEPT hostpath, and
+# unmark it (kubectl annotate with the trailing dash deletes the key).
 kubectl --context "$CTX" get storageclass -o json | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-unmarked = []
 for sc in d["items"]:
     name = sc["metadata"]["name"]
     ann = sc["metadata"].get("annotations", {})
-    if name != "hostpath" and ann.pop("storageclass.kubernetes.io/is-default-class", None) is not None:
-        unmarked.append(name)
-print("unmarked default annotation on: " + " ".join(unmarked) if unmarked else "no other SC carried the default annotation")
-' >"$EVIDENCE/storageclass-defaults.log" 2>&1
+    if name != "hostpath" and ann.get("storageclass.kubernetes.io/is-default-class") is not None:
+        print(name)
+' >"$EVIDENCE/storageclass-unmark-list.txt" 2>&1
+while IFS= read -r sc; do
+	[ -n "$sc" ] && { kubectl --context "$CTX" annotate sc "$sc" storageclass.kubernetes.io/is-default-class- >/dev/null 2>&1 || true; }
+done < "$EVIDENCE/storageclass-unmark-list.txt"
 # Re-apply hostpath WITH the default annotation so it is the only one left:
 kubectl --context "$CTX" apply -f "$EVIDENCE/hostpath-sc-snapclass.yaml" >/dev/null 2>&1
 N_DEFAULT=$(kubectl --context "$CTX" get storageclass --no-headers 2>/dev/null | grep -c "(default)" || echo 0)
@@ -376,7 +379,7 @@ kubectl --context "$CTX" get storageclass >"$EVIDENCE/storageclasses.txt"
 kubectl --context "$CTX" get volumesnapshotclass -o json >"$EVIDENCE/snapshotclasses.json"
 grep -q "hostpath" "$EVIDENCE/storageclasses.txt" || die "no hostpath StorageClass (see $EVIDENCE/storageclasses.txt)"
 grep -q "(default)" "$EVIDENCE/storageclasses.txt" || die "no StorageClass is marked default (see $EVIDENCE/storageclasses.txt) — the workspace PVC would have no default SC"
-log snapshot "the default StorageClass is hostpath ($(cat "$EVIDENCE/storageclass-defaults.log" | tr "\n" " ")); VolumeSnapshotClass: hostpath-snapclass (driver hostpath.csi.k8s.io)"
+log snapshot "the default StorageClass is hostpath (unmarked: $(tr "\n" " " < "$EVIDENCE/storageclass-unmark-list.txt" | sed "s/\s\+$//"); VolumeSnapshotClass: hostpath-snapclass (driver hostpath.csi.k8s.io)"
 
 # Pre-load the images the run will pull: the verify/peek pod image and the
 # curl pod (the vLLM reachability probe + the metrics scrape — both run on

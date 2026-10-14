@@ -186,12 +186,11 @@ if kind get clusters | grep -qxF "$CLUSTER"; then
 	log kind "deleting the EXISTING scratch cluster $CLUSTER (this run's cluster — the owner's instruction; never the dev/calico/alpha clusters)"
 	kind delete cluster --name "$CLUSTER" >"$EVIDENCE/kind-delete.log" 2>&1 || { tail -20 "$EVIDENCE/kind-delete.log"; die "kind delete failed (see $EVIDENCE/kind-delete.log)"; }
 fi
-log kind "creating the FRESH kind cluster $CLUSTER (kind $(kind version --short), node ${KIND_NODE_IMAGE:-kindest/node:v1.34.0})"
+log kind "creating the FRESH kind cluster $CLUSTER (kind $(kind version 2>/dev/null | head -1), node ${KIND_NODE_IMAGE:-kindest/node:v1.34.0})"
 kind create cluster --name "$CLUSTER" --image "${KIND_NODE_IMAGE:-kindest/node:v1.34.0}" \
 	>"$EVIDENCE/kind-create.log" 2>&1 || { tail -20 "$EVIDENCE/kind-create.log"; die "kind create failed (see $EVIDENCE/kind-create.log)"; }
 kc get nodes -o json >"$EVIDENCE/nodes.json"
 log kind "cluster $CLUSTER up (k8s $(kc get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}'))"
-
 # agent-sandbox v1.0.4 (QUICKSTART step 1: the RELEASE manifest — the source
 # manifest is a ko:// placeholder).
 log agent-sandbox "installing v1.0.4 from the release manifest"
@@ -659,9 +658,9 @@ True*) : ;;
 esac
 # The live draft PR (D55): wait for Delivered=True and capture the PR URL.
 wait_delivered "$MANUAL_LOOP" 900 || { collect_evidence "$MANUAL_LOOP" manual-delivery; die "step2: delivery did not complete (see $EVIDENCE/manual-delivery)"; }
-PR_URL=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.prURL}')
-PR_NUM=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.prNumber}')
-BRANCH=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.branch}')
+PR_URL=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
+PR_NUM=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.prNumber}' 2>/dev/null || echo "")
+BRANCH=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.branch}' 2>/dev/null || echo "")
 [ -n "$PR_URL" ] || die "step2: Delivered but no PR URL in status.delivery"
 {
 	echo "loop: $MANUAL_LOOP"
@@ -867,7 +866,7 @@ FORK_PHASE=$(phase_of "$FORK_LOOP")
 FORK_BRANCH=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.branch}' 2>/dev/null || echo "")
 FORK_PR=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
 wait_delivered "$FORK_LOOP" 900 || { collect_evidence "$FORK_LOOP" fork-delivery; die "step5: the fork's delivery did not complete (see $EVIDENCE/fork-delivery)"; }
-FORK_PR=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.prURL}')
+FORK_PR=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
 [ -n "$FORK_PR" ] || { collect_evidence "$FORK_LOOP" fork-nopr; die "step5: the fork Delivered but has no PR URL (independence not proven — I84)"; }
 [ "$FORK_BRANCH" != "$BRANCH" ] || die "step5 FAILED: the fork's branch ($FORK_BRANCH) equals the source's branch — the fork is not independent (ADR-0003)"
 # The fork's Restore condition: the operator restored the fork's OWN PVC from

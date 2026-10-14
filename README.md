@@ -120,8 +120,12 @@ Coxswain deploys a `ValidatingAdmissionPolicy` + binding (see
 `config/admission/validating_admission_policy.yaml`, wired into
 `config/default`) that **denies adding ephemeral containers**
 (`kubectl debug`) to coxswain component pods (agent, model-proxy,
-egress-proxy). KubeArmor does not police ephemeral containers, so one added
-to a fenced pod would escape the fence and share its network namespace.
+egress-proxy). In one kind run (KubeArmor v1.7.5, BPF-LSM, R16 I45) a
+`kubectl debug` busybox ephemeral container in a fenced pod ran `busybox
+true` unblocked. The cause was not established; that test ran the ephemeral
+container entrypoint, not a child exec, so it may reflect enforcement timing
+rather than a KubeArmor gap. The admission policy denies ephemeral containers
+on coxswain pods regardless, as defence in depth.
 
 **RBAC rules for Loop namespaces:**
 

@@ -81,6 +81,13 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 runner-test: ## Run the runner module's tests (separate go.mod).
 	cd runner && go vet ./... && go test ./... -coverprofile cover-runner.out
 
+# B5a: verify the generated Helm chart (dist/chart) offline — helm lint, helm
+# template, and every install.yaml resource present in the chart render.
+# Requires helm (make install-helm) + python3. No cluster.
+.PHONY: chart-check
+chart-check: install-helm ## B5a: helm lint + helm template + install.yaml coverage for dist/chart (offline).
+	@bash hack/chart-check.sh
+
 # S1: the sample apps are separate Go/Python modules (examples/<app>); the root
 # `go test ./...` and golangci-lint skip them. Verify each app's scoped checks
 # fail on the seed and pass after the reference patch. No cluster needed.
@@ -591,3 +598,50 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+##@ Helm Deployment
+
+## Helm binary to use for deploying the chart
+HELM ?= helm
+## Namespace to deploy the Helm release
+HELM_NAMESPACE ?= coxswain-system
+## Name of the Helm release
+HELM_RELEASE ?= coxswain
+## Path to the Helm chart directory
+HELM_CHART_DIR ?= dist/chart
+## Additional arguments to pass to helm commands
+HELM_EXTRA_ARGS ?=
+
+.PHONY: install-helm
+install-helm: ## Install the latest version of Helm.
+	@command -v $(HELM) >/dev/null 2>&1 || { \
+		echo "Installing Helm..." && \
+		curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash; \
+	}
+
+.PHONY: helm-deploy
+helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.
+	IMG="$(IMG)"; $(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) \
+		--create-namespace \
+		--set manager.image.repository=$${IMG%:*} \
+		--set manager.image.tag=$${IMG##*:} \
+		--wait \
+		--timeout 5m \
+		$(HELM_EXTRA_ARGS)
+
+.PHONY: helm-uninstall
+helm-uninstall: ## Uninstall the Helm release from the K8s cluster.
+	$(HELM) uninstall $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-status
+helm-status: ## Show Helm release status.
+	$(HELM) status $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-history
+helm-history: ## Show Helm release history.
+	$(HELM) history $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-rollback
+helm-rollback: ## Rollback to previous Helm release.
+	$(HELM) rollback $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)

@@ -1,0 +1,354 @@
+{{- if .Values.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    {{- if .Values.crd.keep }}
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: agentpolicies.coxswain.wattu.com
+spec:
+  group: coxswain.wattu.com
+  names:
+    kind: AgentPolicy
+    listKind: AgentPolicyList
+    plural: agentpolicies
+    singular: agentpolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.observedGeneration
+      name: Generation
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          AgentPolicy is the Schema for the agentpolicies API (ADR-0007 Q2). It is a
+          namespaced, default-deny, additive-allow policy selected by a Loop via
+          spec.policyRefs[]. Who may create an AgentPolicy is a different RBAC role from
+          who may create a Loop, so a Loop author cannot grant themselves more.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              AgentPolicySpec is the desired state of an AgentPolicy (ADR-0007 Q2): a
+              default-deny, additive-allow policy for the agents a Loop runs. Rules are
+              only ever allows; a Loop's effective policy is the union of the allows across
+              every AgentPolicy it references (spec.policyRefs[]).
+            properties:
+              exec:
+                description: |-
+                  exec is the commands the agent may run, as ABSOLUTE binary paths (e.g.
+                  "/usr/bin/git", "/usr/local/go/bin/go"). An empty list means the agent may
+                  run no commands beyond the platform minimum (its own entrypoint).
+
+                  D46 (R20, owner decision (c), 2026-10-03): exec fencing applies to the
+                  OPERATOR-OWNED PROXIES (model proxy, egress proxy), NOT to the agent
+                  container, in the MVP. The agent's runner executes every tool call via
+                  "/bin/sh -c", and a shell command spawns an open-ended set of binaries
+                  (the shell's external commands, the Go toolchain's compile/link helpers),
+                  so an exact-path allow-list cannot describe an agent shell — a restrictive
+                  agent exec list wedges the Loop under an enforcing Block policy. What
+                  protects the system instead: the network fence (egress proxy +
+                  NetworkPolicy), credential isolation (ADR-0006) and the verify Job
+                  (ADR-0005); exec inside the agent sandbox is deliberately unrestricted.
+                  A referenced exec list that omits the runner's shell (/bin/sh) is
+                  rejected by the controller (PolicyValid=False, reason
+                  ExecListMissingShell) before the sandbox is created — the Loop fails fast
+                  instead of wedging. Per-tool agent proxies (no general shell) are the
+                  D41 follow-on that makes agent exec fencing meaningful again.
+
+                  Absolute paths are required (P1, ADR-0007 Q3): the agent has three writable
+                  mounts (/workspace, /scratch, /tmp), so a bare command name ("git") is
+                  spoofable — the agent could write its own /tmp/git that does anything and
+                  claim it is the allowed "git". The eBPF engine matches the binary by
+                  absolute path, so the allow must name a real binary outside the writable
+                  mounts.
+
+                  The XValidation rejects bare names (no leading /) and anything at or under
+                  the writable mounts (/workspace, /scratch, /tmp).
+
+                  P1 (R15): non-canonical paths that resolve to a writable mount after
+                  normalization ("//tmp/git", "/usr/../tmp/git") are NOT caught by this CEL
+                  rule — adding a !contains('..') check would push the CRD over the CEL cost
+                  budget (2.0x over). They ARE caught by the controller in
+                  effectivePolicyHash (isNonCanonicalPath), which rejects the Loop before it
+                  reaches the eBPF engine. The CRD is the first line of defence (catches the
+                  common case at admission); the controller is the second (catches everything).
+                items:
+                  maxLength: 512
+                  type: string
+                maxItems: 64
+                type: array
+                x-kubernetes-validations:
+                - message: exec entries must be canonical absolute paths (no ., ..,
+                    //, trailing /) at or outside the writable mounts
+                  rule: self.all(e, e.matches('^(/[A-Za-z0-9._+-]+)+$') && !e.contains('/./')
+                    && !e.contains('/../') && !e.endsWith('/.') && !e.endsWith('/..')
+                    && !e.startsWith('/workspace/') && e != '/workspace' && !e.startsWith('/scratch/')
+                    && e != '/scratch' && !e.startsWith('/tmp/') && e != '/tmp')
+              files:
+                description: |-
+                  files is the paths the agent may access (e.g. "/workspace"). The agent's
+                  own workspace is always accessible; a path here grants access elsewhere.
+                items:
+                  type: string
+                type: array
+              network:
+                description: |-
+                  network is the host:port endpoints the agent may reach (e.g.
+                  "proxy.golang.org:443"). The model endpoint is reached only by the model
+                  proxy, never the agent (D29). An empty list means the agent has no
+                  external egress.
+
+                  I42e (first layer of the SSRF defence): an allow must not name an
+                  in-cluster target, because the agent's egress is enforced by the
+                  operator's egress proxy (I42a/I42b) — an in-cluster "external" allow is
+                  the exfiltration path. This CEL rule is the cheap first layer that fires
+                  at admission; it rejects, case-insensitively (lowerAscii) and
+                  trailing-dot-aware, the in-cluster name suffixes the CRD can check
+                  without cluster config (".svc" / ".svc.cluster.local" / ".cluster.local",
+                  i.e. a Service / cluster-local FQDN) and the literal loopback hostnames
+                  localhost / 127.0.0.1.
+
+                  The rule uses only the free string methods (startsWith / endsWith /
+                  contains / lowerAscii): a regex (matches) cannot express the dotted
+                  suffixes because CEL string literals do not process backslash escapes
+                  (\. is an illegal escape), so a literal backslash can never reach the
+                  regex. Consequence (documented per review P2/P3): the CRD name rule is a
+                  deliberate, cheap first layer and the controller-side check
+                  (policy.FindInClusterNetworkAllow, run before the egress proxy is
+                  created) is the authoritative first layer. The controller catches, for
+                  every object (including ones created before this rule and any future CRD
+                  drift): the .svc / .svc.cluster.local / cluster.local name suffixes
+                  (mirrored, case-insensitive, trailing-dot-aware — so the trailing root-dot
+                  forms "…svc.", "…svc.cluster.local." that this rule admits because the
+                  host text is followed by ":port", not the suffix itself, are still
+                  rejected by the controller), the full loopback / unspecified / link-local
+                  IP forms (127/8, 169.254/16, 0.0.0.0, [::], etc.), and IP literals inside
+                  the operator's pod/service CIDR. The egress proxy's resolved-IP check
+                  (I42a) is the backstop that catches rebinding / split-horizon.
+                items:
+                  maxLength: 512
+                  type: string
+                maxItems: 64
+                type: array
+                x-kubernetes-validations:
+                - message: 'network allows must not name in-cluster targets (.svc
+                    / .svc.cluster.local / .cluster.local / localhost / 127.0.0.1):
+                    the agent''s external egress is enforced by the egress proxy,
+                    and an in-cluster target is an SSRF path'
+                  rule: self.all(e, !(e.contains('.svc:') || e.contains('.svc.cluster.local:')
+                    || e.contains('.cluster.local:') || e.lowerAscii().contains('.svc:')
+                    || e.lowerAscii().contains('.svc.cluster.local:') || e.lowerAscii().contains('.cluster.local:')
+                    || e.startsWith('localhost') || e.startsWith('127.0.0.1') || e.endsWith('.svc:')
+                    || e.endsWith('.svc.cluster.local:') || e.endsWith('.cluster.local:')
+                    || e.lowerAscii().endsWith('.svc:') || e.lowerAscii().endsWith('.svc.cluster.local:')
+                    || e.lowerAscii().endsWith('.cluster.local:') || e.endsWith('.svc.')
+                    || e.endsWith('.svc.cluster.local.') || e.endsWith('.cluster.local.')
+                    || e.lowerAscii().endsWith('.svc.') || e.lowerAscii().endsWith('.svc.cluster.local.')
+                    || e.lowerAscii().endsWith('.cluster.local.')))
+              tools:
+                description: |-
+                  tools is the credentialed external tools the agent may use through
+                  operator-owned tool proxies (ADR-0008, D41). Each tool declares an
+                  upstream base URL, an optional credential Secret, and a set of allowed
+                  HTTP methods + path prefixes. The operator provisions one proxy pod +
+                  Service per tool per Loop (D41c); the agent reaches the tool through
+                  the proxy and never holds the credential.
+
+                  An empty or absent tools list means the agent has no tools (unchanged
+                  behaviour). Tools are additive to the other allows; a Loop's effective
+                  tool set is the union of the tools across every AgentPolicy it
+                  references (spec.policyRefs[]), same as network/exec/files.
+
+                  CEL validation (I42e pattern, first layer at admission):
+                    - name: DNS-1035 (^[a-z0-9]([-a-z0-9]*[a-z0-9])?$); unique within the
+                      list. Forms the derived proxy name <loop>-tool-<name> (D41c).
+                    - upstream: must start with https:// or http:// (the controller does
+                      the host-level in-cluster checks; the CRD cannot see cluster CIDRs).
+                    - upstream host: must NOT be an in-cluster target. The cheap, suffix-
+                      based CEL layer rejects hosts ending in .svc / .svc.cluster.local /
+                      .cluster.local, and the literal localhost / 127.0.0.1. The
+                      controller-side check (ToolUpstreamInCluster) is the authoritative
+                      first layer (catches IP literals in the operator's pod/service
+                      CIDR, 127/8, 169.254/16, 0.0.0.0, full loopback forms — the cases
+                      the CRD cannot see without cluster config).
+                    - rules: at least one rule per tool; each rule's methods entries are
+                      one of GET/POST/PATCH/PUT/DELETE (case-sensitive).
+
+                  The CEL rules are per-field on ToolSpec / ToolRule (name, upstream,
+                  rules.methods) plus a cross-field uniqueness rule on the tools list
+                  (names unique within the list). The in-cluster upstream check is the
+                  cheap suffix-based layer (like I42e's network rule); the controller is
+                  the authoritative first layer.
+                items:
+                  description: |-
+                    ToolSpec is one credentialed external tool the agent may use through an
+                    operator-owned tool proxy (ADR-0008, D41). A tool is declared on an
+                    AgentPolicy; the operator (D41c) provisions one proxy pod + Service per
+                    tool per Loop. The agent reaches the tool through the proxy and never
+                    holds the credential (the proxy injects it from the mounted Secret).
+
+                    The proxy is a reverse proxy (not a forward proxy): it originates its own
+                    request to the fixed upstream (TLS with the upstream's certificate
+                    verified for https://), so the rules engine sees the real method and path
+                    of every upstream request.
+                  properties:
+                    credentialSecretRef:
+                      description: |-
+                        credentialSecretRef is the {name, key} pair of the Secret and the key
+                        within it that holds the tool credential. The Secret must be in the
+                        same namespace as the AgentPolicy. The operator (D41c) mounts it
+                        read-only into the tool proxy pod only; the proxy injects the value
+                        into requests (Authorization: Bearer <value> in the Phase 1 generic
+                        proxy, replacing any agent-supplied Authorization / Proxy-Authorization
+                        header). A tool entry without it is a credential-less passthrough.
+                      properties:
+                        key:
+                          description: key is the key within the Secret that holds
+                            the credential value.
+                          maxLength: 253
+                          type: string
+                        name:
+                          description: name is the name of the Secret in the AgentPolicy's
+                            namespace.
+                          maxLength: 253
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                    name:
+                      description: |-
+                        name is a DNS-1035 label that forms the derived proxy pod/Service name
+                        <loop>-tool-<name> (D41c). It must be unique within the tools list
+                        (enforced by the CEL rule on AgentPolicy.spec.tools). Max 24 chars so
+                        the derived name fits the 63-char DNS-1035 budget even with a long
+                        loop name (derivedName truncates + hashes near-max names, but a short
+                        tool name keeps the derived name human-readable).
+                      maxLength: 24
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    rules:
+                      description: |-
+                        rules is the set of allowed HTTP methods + path prefixes for this
+                        tool. At least one rule is required. Each rule is a set of allowed
+                        methods (GET/POST/PATCH/PUT/DELETE, case-sensitive) plus allowed path
+                        prefixes (matched against the request path after the upstream's base
+                        prefix). Anything matching no rule → 403 + an audit record (D41c).
+                      items:
+                        description: |-
+                          ToolRule is one allowed method+path-prefix pair for a tool. The proxy (D41c)
+                          matches the incoming request's method and path (after the upstream's base
+                          prefix) against the rules; anything matching no rule gets a 403 + an audit
+                          record. Methods are case-sensitive (uppercase HTTP method tokens).
+                        properties:
+                          methods:
+                            description: |-
+                              methods is the set of allowed HTTP methods (GET/POST/PATCH/PUT/DELETE,
+                              case-sensitive). At least one method is required per rule.
+                            items:
+                              pattern: ^(GET|POST|PATCH|PUT|DELETE)$
+                              type: string
+                            maxItems: 8
+                            minItems: 1
+                            type: array
+                          paths:
+                            description: |-
+                              paths is the set of allowed path prefixes (matched against the request
+                              path after the upstream's base prefix). An empty or absent paths list
+                              means no path restriction (any path is allowed for the listed methods).
+                            items:
+                              maxLength: 2048
+                              type: string
+                            maxItems: 64
+                            type: array
+                        required:
+                        - methods
+                        type: object
+                      maxItems: 64
+                      minItems: 1
+                      type: array
+                    upstream:
+                      description: |-
+                        upstream is the base URL the proxy dials (scheme://host[:port][/prefix]).
+                        Must start with https:// or http://. The proxy dials only this host as
+                        the origin of its own request (reverse proxy, not forward proxy).
+                        https:// means the proxy originates its own TLS connection to the
+                        upstream and verifies its certificate; http:// is plain.
+
+                        In-cluster upstream rejection (first layer, I42e pattern):
+                          - CRD CEL (admission): the host must NOT end in .svc / .svc.cluster.local /
+                            .cluster.local, and must NOT be localhost / 127.0.0.1 (the cheap
+                            suffix-based layer; the CRD cannot see cluster CIDRs).
+                          - Controller (authoritative first layer): the host must NOT be an IP
+                            literal in the operator's POD_CIDR / SERVICE_CIDR, 127/8, 169.254/16,
+                            0.0.0.0, or a full loopback form. Failure: PolicyValid=False reason
+                            ToolUpstreamInCluster, fail-closed, no sandbox, no reconcile-error loop.
+                      maxLength: 2048
+                      pattern: ^https?://
+                      type: string
+                      x-kubernetes-validations:
+                      - message: 'tool upstream must not carry userinfo (https://user:pass@host):
+                          the embedded credential bypasses the tool proxy''s credential
+                          boundary (ADR-0008)'
+                        rule: '!self.contains(''@'')'
+                      - message: 'tool upstream must not name an in-cluster target
+                          (.svc / .svc.cluster.local / .cluster.local / localhost
+                          / 127.0.0.1): an in-cluster tool upstream is an SSRF path'
+                        rule: '!(self.contains(''.svc:'') || self.contains(''.svc/'')
+                          || self.endsWith(''.svc'') || self.contains(''.svc.cluster.local:'')
+                          || self.contains(''.svc.cluster.local/'') || self.endsWith(''.svc.cluster.local'')
+                          || self.contains(''.cluster.local:'') || self.contains(''.cluster.local/'')
+                          || self.endsWith(''.cluster.local'') || self.contains(''://localhost'')
+                          || self.contains(''://127.0.0.1''))'
+                  required:
+                  - name
+                  - rules
+                  - upstream
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-validations:
+                - message: tool names must be unique within the tools list
+                  rule: self.all(t, self.filter(o, o.name == t.name).size() == 1)
+            type: object
+          status:
+            description: AgentPolicyStatus defines the observed state of an AgentPolicy.
+            properties:
+              generation:
+                description: |-
+                  generation is the spec generation this status was computed from (so the
+                  operator can tell a status is stale).
+                format: int64
+                type: integer
+              observedGeneration:
+                description: observedGeneration is the last processed generation.
+                format: int64
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}

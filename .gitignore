@@ -48,3 +48,8 @@ go.work
 # Python (the P2h stub model server fixture, test/e2e/p2h-stub-model.py).
 __pycache__/
 *.pyc
+
+# B5a: the Helm chart is generated (kubebuilder edit --plugins=helm/v2-alpha)
+# and its dist/chart/ tree is committed; dist/install.yaml is rendered on
+# demand by hack/build-installer.sh (regenerable, not committed).
+/dist/install.yaml

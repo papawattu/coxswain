@@ -1,0 +1,14 @@
+apiVersion: v2
+name: coxswain
+description: A Helm chart to distribute coxswain
+type: application
+
+version: 0.1.0
+appVersion: "placeholder"
+
+keywords:
+  - kubernetes
+  - operator
+
+annotations:
+  kubebuilder.io/generated-by: kubebuilder

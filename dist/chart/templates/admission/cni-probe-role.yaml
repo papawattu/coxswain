@@ -1,0 +1,22 @@
+{{- /*
+D38: the operator's in-namespace RBAC for the CNI probe (the coxswain-cni-probe-operator
+Role, in the coxswain-cni-probe namespace; the ServiceAccount is the
+chart's generated rbac/cni-probe.yaml, and the RoleBinding is the
+generated rbac/cni-probe-operator-coxswain-cni-probe.yaml). The name is
+literal: the operator's probe code references it by name.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coxswain-cni-probe-operator
+  namespace: coxswain-cni-probe
+  labels:
+    app.kubernetes.io/name: coxswain-cni-probe
+    app.kubernetes.io/part-of: coxswain
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [create, get, delete]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [create, delete]

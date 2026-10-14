@@ -1,0 +1,18 @@
+{{- /*
+D38: the fixed namespace the operator's CNI self-test probe pod + probe
+NetworkPolicy live in. The operator creates the probe pod + NetworkPolicy
+in this namespace as the coxswain-cni-probe ServiceAccount (created by the
+chart's generated rbac/cni-probe.yaml); the namespace must exist before the
+operator's probe pod can run, so it ships with the chart (and with the
+install.yaml). The name is literal (not the Helm fullname): the operator's
+--cni-probe-namespace default and the probe RBAC names are hard-wired to
+coxswain-cni-probe (config/cni-probe).
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: coxswain-cni-probe
+  labels:
+    app.kubernetes.io/name: coxswain-cni-probe
+    app.kubernetes.io/part-of: coxswain
+    coxswain.io/probe-namespace: "true"

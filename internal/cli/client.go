@@ -58,12 +58,28 @@ func (d *dynamicLoopClient) Patch(ctx context.Context, name, subresource string,
 }
 
 // Update writes the whole object (used to set annotations / spec.suspend).
+// Update writes the whole object. The Loop CRD has a status subresource, and the
+// CLI's commands (approve/reject) write status.conditions. A main-resource Update
+// does NOT persist status (the server resets status to the live value); a
+// status-subresource PUT is rejected for a bare-status body ("must be of type Loop:
+// Kind is missing"). The verified working path (the kind cluster: a full-object PUT
+// to /status returns 200 and persists the condition) is a whole-object PUT to the
+// status subresource. The CLI therefore sends the whole object (kind + status) to
+// the status subresource.
 func (d *dynamicLoopClient) Update(ctx context.Context, obj runtime.Object) error {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {
 		return fmt.Errorf("cli: expected *unstructured.Unstructured, got %T", obj)
 	}
-	_, err := d.c.Resource(loopGVR).Namespace(d.ns).Update(ctx, u, metav1.UpdateOptions{})
+	// Ensure the object carries its kind (a status-subresource PUT validates the
+	// full object shape).
+	if u.GetKind() == "" {
+		u.SetKind("Loop")
+	}
+	if u.GetAPIVersion() == "" {
+		u.SetAPIVersion("coxswain.wattu.com/v1alpha1")
+	}
+	_, err := d.c.Resource(loopGVR).Namespace(d.ns).Update(ctx, u, metav1.UpdateOptions{}, "status")
 	return err
 }
 

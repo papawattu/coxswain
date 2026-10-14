@@ -113,6 +113,9 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newResumeCommand(),
 		newRedeliverCommand(),
 		newForkCommand(),
+		newApproveCommand(),
+		newRejectCommand(),
+		newDiffCommand(),
 	)
 	return root
 }

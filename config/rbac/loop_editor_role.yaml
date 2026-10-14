@@ -31,3 +31,13 @@ rules:
   - loops/status
   verbs:
   - get
+  # B3 (PLAN-BETA / PLAN.md Phase 4): the CLI's `cox approve` / `cox reject`
+  # write the PlanApproved / PlanRejected conditions to the Loop's status
+  # subresource (the CLI's sole write path — client.go Update sends the whole
+  # object to /status). The editor role grants these writes so an editor-bound
+  # user can approve/reject a plan (the operator is the only other writer of
+  # the phase; the user owns the two approval conditions). R1 review (CHANGES
+  # on #148) P2: the editor role had only `get` on loops/status, so an
+  # editor-only user could not approve/reject.
+  - update
+  - patch

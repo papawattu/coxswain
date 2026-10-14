@@ -62,7 +62,7 @@ func deliveredConditionMessage(u *unstructured.Unstructured) string {
 		}
 		status, _ := cm["status"].(string)
 		reason, _ := cm["reason"].(string)
-		if status == "True" {
+		if status == conditionStatusTrue {
 			return "a fresh deliver Job will be created for the pinned verifiedCommit"
 		}
 		if reason != "" {

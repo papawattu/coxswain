@@ -55,6 +55,8 @@ package runner
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -93,6 +95,18 @@ const (
 	planFileName         = "PLAN.md"
 	iterationFileName    = "iteration"
 	conversationFileName = "conversation.json"
+	// B3 (PLAN-BETA / PLAN.md Phase 4): the plan-approval files the operator's
+	// phase-init container writes (the operator is the sole writer; the runner
+	// is the sole reader). planHashFile carries the SHA-256 (lowercase hex,
+	// 64 chars) of the plan the user approved via cox approve (the operator
+	// writes it from the PlanApproved condition's message); an absent file
+	// means "no approved plan" (a fresh Loop or a plan the user has not
+	// approved yet), so the plan-change check is a no-op. planFeedbackFile
+	// carries the rejection reason the user set via cox reject --reason (the
+	// operator writes it from the PlanRejected condition's message); an absent
+	// file means "no prior rejection" (the planning prompt is unchanged).
+	planHashFile     = "plan-hash"
+	planFeedbackFile = "plan-feedback"
 )
 
 // A2 (TDD-PLAN): the PLAN.md size cap. 4KB.
@@ -294,8 +308,31 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	var res Result
 	switch phase {
 	case PhasePlanning:
-		res = drivePhaseOnce(cfg, planningPrompt(cfg.Goal, planCap), phase, conversation,
+		res = drivePhaseOnce(cfg, planningPrompt(cfg.Workspace, cfg.Goal, planCap), phase, conversation,
 			func(answer string) { writePlan(cfg.Workspace, answer, planCap) })
+		// B3 (PLAN-BETA / PLAN.md Phase 4): the plan-change check. After
+		// writing the fresh PLAN.md, the runner reads the approved hash
+		// (the operator wrote it to .coxswain/plan-hash from the
+		// PlanApproved condition's message) and compares it to the new
+		// plan's SHA-256. A MISMATCH means the plan changed since the user
+		// approved (a fresh Planning run rewrote PLAN.md with a different
+		// plan): the runner records a STALE PlanApproved in the claim's
+		// result.json (the operator reads it on the next reconcile and
+		// re-enters the hold — the runner is the sole writer of the
+		// workspace, but the operator is the sole writer of the Loop's
+		// status conditions; the result.json is the runner's claim, the
+		// operator's read channel). An absent or empty approved hash (a
+		// fresh Loop, or a plan the user has not approved yet) is a no-op
+		// (the check is skipped). A MATCH (the plan is the same the user
+		// approved) is a no-op (the approval is still valid; the operator's
+		// gate sees the PlanApproved condition True and advances).
+		//
+		// The check is ONLY in the Planning phase (the only phase that
+		// rewrites PLAN.md). It is a best-effort read (a read error on the
+		// approved-hash file is treated as "no approved hash", a no-op).
+		if res.Status == statusSuccess {
+			res.PlanChanged = planChanged(cfg.Workspace)
+		}
 	case PhaseImplementing:
 		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation)
 		// S5a (B3): at the end of a successful Implementing, commit the work in
@@ -860,12 +897,114 @@ func readDesiredPhase(workspace string) (string, bool) {
 // with the goal and asks for a concise plan summary (not the implementation
 // itself) that the runner writes to PLAN.md. The plan cap is stated so the
 // model's answer fits the ADR-0004 <=4KB file.
-func planningPrompt(goal string, planCap int) string {
-	return "You are in the PLANNING phase. Produce a concise plan (under " +
+// planningPrompt (A2) returns the PLANNING phase prompt: it asks the model to
+// produce a concise plan (a summary of the steps, not the implementation),
+// capped to planCap bytes (the Plan.md cap). The plan is written to
+// <workspace>/.coxswain/PLAN.md (writePlan).
+//
+// B3 (PLAN-BETA / PLAN.md Phase 4): when the operator has written a
+// plan-feedback file (the rejection reason the user set via cox reject),
+// the prompt includes it so the next plan addresses the rejection. The
+// feedback is read from <workspace>/.coxswain/plan-feedback (the operator's
+// phase-init container is the sole writer; the runner is the sole reader).
+// An absent or empty file means "no prior rejection" (the prompt is
+// unchanged).
+func planningPrompt(workspace, goal string, planCap int) string {
+	prompt := "You are in the PLANNING phase. Produce a concise plan (under " +
 		fmt.Sprintf("%d bytes", planCap) +
 		") to accomplish the goal below. The plan must be a summary of the steps you will take, " +
 		"not the implementation itself. End your reply with the plan text (it will be written to PLAN.md).\n\nGOAL:\n" +
 		goal
+	// B3: include the rejection reason (if the operator wrote it) so the next
+	// plan addresses the rejection.
+	if fb := readPlanFeedback(workspace); fb != "" {
+		prompt += "\n\nREJECTION FEEDBACK (the user rejected the prior plan; address this in the new plan):\n" + fb
+	}
+	return prompt
+}
+
+// readPlanFeedback (B3) returns the rejection reason the operator wrote to
+// <workspace>/.coxswain/plan-feedback (the cox reject --reason reason), or ""
+// when the file is absent or empty (no prior rejection; the prompt is
+// unchanged). The operator is the sole writer (the phase-init container,
+// from the PlanRejected condition's message); the runner is the sole reader.
+// A read error (permission, the file is a dir) is treated as "no feedback"
+// (a best-effort read; the plan is still produced, the rejection is just not
+// included in the prompt).
+func readPlanFeedback(workspace string) string {
+	b, err := os.ReadFile(filepath.Join(workspace, resultDirName, planFeedbackFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// readApprovedPlanHash (B3) returns the SHA-256 the user approved (the
+// operator wrote it to <workspace>/.coxswain/plan-hash from the PlanApproved
+// condition's message), or "" when the file is absent or empty (no approved
+// plan; the plan-change check is a no-op). The operator is the sole writer
+// (the phase-init container); the runner is the sole reader. A read error is
+// treated as "no approved hash" (a best-effort read).
+func readApprovedPlanHash(workspace string) string {
+	b, err := os.ReadFile(filepath.Join(workspace, resultDirName, planHashFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// planSHA256 returns the lowercase-hex SHA-256 of a plan's content (the B3
+// plan-change check: the runner compares the approved hash (read from
+// .coxswain/plan-hash) to the new plan's hash after writing PLAN.md; a
+// mismatch means the plan changed since the user approved, and the runner
+// re-writes the PlanApproved condition as stale — the operator re-enters the
+// hold). The hash is over the plan's EXACT bytes (the bytes written to
+// PLAN.md, after the cap is applied) — the same bytes the operator's
+// cox approve computes (the CLI reads PLAN.md from the workspace and hashes
+// it, so a trailing newline or cap difference would mismatch; the runner
+// and the CLI must hash the same bytes).
+func planSHA256(plan []byte) string {
+	h := sha256.Sum256(plan)
+	return hex.EncodeToString(h[:])
+}
+
+// planChanged (B3) returns true when the runner's Planning run detected a
+// PLAN CHANGE: the fresh PLAN.md (just written by writePlan) has a SHA-256
+// that does NOT match the approved hash the operator wrote to
+// <workspace>/.coxswain/plan-hash (from the PlanApproved condition's
+// message). A mismatch means the plan on disk differs from the plan the user
+// approved (a fresh Planning run rewrote PLAN.md with a different plan): the
+// runner records PlanChanged=true in the result.json (the operator's claim
+// channel; the operator re-enters the hold on the next reconcile, clearing
+// the PlanApproved condition). An ABSENT or EMPTY approved-hash file (a
+// fresh Loop, or a plan the user has not approved yet) is a NO-OP (returns
+// false — there is nothing to compare against). A MATCH (the plan is the
+// same the user approved) is a no-op (returns false — the approval is still
+// valid; the operator's gate sees the PlanApproved condition True and
+// advances).
+//
+// The check reads the fresh PLAN.md from the workspace (the bytes writePlan
+// just wrote — the same bytes the operator's cox approve computes the hash
+// over, so a trailing newline or cap difference would mismatch). A read
+// error (the file was not written, e.g. writePlan failed) is treated as
+// "no plan" (returns false — the claim is still a success; the operator
+// will re-reconcile and re-ask the gate).
+func planChanged(workspace string) bool {
+	// Read the approved hash (the operator's .coxswain/plan-hash file). An
+	// absent/empty file means "no approved plan" (a no-op).
+	approved := readApprovedPlanHash(workspace)
+	if approved == "" {
+		return false
+	}
+	// Read the fresh PLAN.md (the bytes writePlan just wrote). A read error
+	// (the file was not written) is treated as "no plan" (a no-op).
+	planBytes, err := os.ReadFile(filepath.Join(workspace, resultDirName, planFileName))
+	if err != nil {
+		return false
+	}
+	// Compare the fresh plan's SHA-256 to the approved hash. A mismatch is a
+	// plan change.
+	return planSHA256(planBytes) != approved
 }
 
 // implementingPrompt (A3) returns the IMPLEMENTING phase prompt: it seeds the

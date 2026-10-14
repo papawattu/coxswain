@@ -127,10 +127,13 @@ manager for a plain-HTTP scrape in dev.)
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `coxswain_loop_iterations_total` | Counter | `phase` | Total Loop phase transitions (iteration boundary crossings), by destination phase. Bumped once per NEW-phase transition (a no-op re-set to the same phase does not bump). |
+| `coxswain_loop_phase_transitions_total` | Counter | `phase` | Total Loop phase transitions (new-phase advances), by destination phase. Bumped once per NEW-phase transition (a no-op re-set to the same phase does not bump). |
+| `coxswain_loop_iterations_total` | Counter | — | Total Loop iteration increments (status.iteration advances: the verify-iterate and re-plan paths). This is the "iterations per Loop" metric. |
+| `coxswain_verify_results_total` | Counter | `result` (pass\|fail\|infra) | Total verify outcomes, by result. The verify pass rate is computed as `pass / (pass + fail)`. |
+| `coxswain_loops_completed_total` | Counter | `result` (succeeded\|failed), `reason` | Total Loops that reached a terminal phase, by result and reason (verify_passed, max_iterations, stalled, tampered, verify_infra). |
 | `coxswain_loop_stalls_total` | Counter | — | Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs). |
-| `coxswain_loop_tokens_total` | Counter | `kind` (prompt\|completion) | Total model tokens consumed, as folded into `status.budget` from the proxy reading, by kind. Bumped by the delta on each same-bootID, no-drop reading. |
 | `coxswain_loops_active` | Gauge | `phase` | Loops currently in a non-terminal phase, by phase. Set to 1 for each active Loop; reset to 0 when the Loop reaches a terminal phase. |
+| `coxswain_loop_tokens_total` | Counter | `kind` (prompt\|completion) | Total model tokens consumed, as folded into `status.budget` from the proxy reading, by kind. Bumped by the delta on each same-bootID, no-drop reading. |
 
 **Alerting examples** (PromQL):
 
@@ -151,19 +154,35 @@ and
     )
   ) > 1800
 )
+
+# Verify pass rate (pass / (pass + fail)).
+sum(coxswain_verify_results_total{result="pass"})
+/
+sum(coxswain_verify_results_total{result=~"pass|fail"})
+
+# Tokens per successful Loop completion.
+sum(coxswain_loop_tokens_total)
+/
+sum(coxswain_loops_completed_total{result="succeeded"})
 ```
 
 **Dashboard query examples:**
 
 ```promql
-# Iterations by phase (cumulative, since process start).
-sum(coxswain_loop_iterations_total) by (phase)
+# Phase transitions by phase (cumulative, since process start).
+sum(coxswain_loop_phase_transitions_total) by (phase)
+
+# Total iterations (cumulative, since process start).
+sum(coxswain_loop_iterations_total)
 
 # Total tokens consumed (prompt + completion, cumulative).
 sum(coxswain_loop_tokens_total)
 
 # Active Loops by phase.
 sum(coxswain_loops_active) by (phase)
+
+# Loops completed by result and reason.
+sum(coxswain_loops_completed_total) by (result, reason)
 ```
 
 ---

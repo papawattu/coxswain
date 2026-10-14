@@ -51,6 +51,6 @@ func TestPlanningPromptEmptyFeedback(t *testing.T) {
 	}
 	prompt := planningPrompt(ws, "append a newline to README.md", 512)
 	if strings.Contains(prompt, "REJECTION FEEDBACK") {
-		t.Fatalf("the planning prompt includes a REJECTION FEEDBACK section with an empty feedback file;\nprompt:\n%s", prompt)
+		t.Fatalf("the planning prompt includes a REJECTION FEEDBACK section with an empty feedback; prompt:\n%s", prompt)
 	}
 }

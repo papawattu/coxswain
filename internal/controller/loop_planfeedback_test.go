@@ -37,9 +37,9 @@ func b3LoopWithRejectedCondition(reason string) *coxv1alpha1.Loop {
 		Status: coxv1alpha1.LoopStatus{
 			DesiredPhase: coxv1alpha1.LoopPhasePlanning,
 			Conditions: []metav1.Condition{{
-				Type:   coxv1alpha1.PlanRejectedCondition,
-				Status: metav1.ConditionTrue,
-				Reason: "Rejected",
+				Type:    coxv1alpha1.PlanRejectedCondition,
+				Status:  metav1.ConditionTrue,
+				Reason:  "Rejected",
 				Message: "Rejected: " + reason,
 			}},
 		},
@@ -83,9 +83,9 @@ func TestPhaseInitScriptWritesRejectionReason(t *testing.T) {
 func TestPhaseInitScriptRemovesFeedbackWhenNoRejection(t *testing.T) {
 	r := &LoopReconciler{}
 	loop := &coxv1alpha1.Loop{
-		ObjectMeta:   metav1.ObjectMeta{Name: "b3", Namespace: "b3"},
-		Spec:         coxv1alpha1.LoopSpec{Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual}},
-		Status:       coxv1alpha1.LoopStatus{DesiredPhase: coxv1alpha1.LoopPhasePlanning},
+		ObjectMeta: metav1.ObjectMeta{Name: "b3", Namespace: "b3"},
+		Spec:       coxv1alpha1.LoopSpec{Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual}},
+		Status:     coxv1alpha1.LoopStatus{DesiredPhase: coxv1alpha1.LoopPhasePlanning},
 	}
 	_, planFeedback := r.planApprovalFiles(loop)
 	if planFeedback != "" {

@@ -430,6 +430,25 @@ spec:
                       else a built-in Go image so `go build` / `go test` checks work out of
                       the box).
                     type: string
+                  onVerifyFail:
+                    default: Implement
+                    description: |-
+                      onVerifyFail is the operator's action when a verify's acceptance check
+                      FAILS (PLAN-BETA B4; PLAN.md Phase 6 remainder). Implement (the
+                      default) iterates back to Implementing (the agent re-works the failing
+                      check — the alpha behaviour, unchanged). Plan sends the Loop back to
+                      Planning with the failure summary fed into the next planning prompt
+                      (reusing B3's plan-feedback channel, .coxswain/plan-feedback, written
+                      by the phase-init from the durable status field
+                      status.verify.lastFailureSummary). A re-plan still increments the
+                      iteration (the stall detector and maxIterations count iterations across
+                      re-plans — a re-plan is not a reset); with approval.mode Manual the
+                      re-plan goes through AwaitingApproval again (the new plan needs
+                      approval).
+                    enum:
+                    - Implement
+                    - Plan
+                    type: string
                   preset:
                     default: go
                     description: |-
@@ -1142,6 +1161,23 @@ spec:
                       type: integer
                     type: array
                     x-kubernetes-list-type: atomic
+                  lastFailureSummary:
+                    description: |-
+                      lastFailureSummary is the DURABLE operator summary of the most recent
+                      FAILED verify check (PLAN-BETA B4; PLAN.md Phase 6 remainder). It is set
+                      by the operator when a verify's acceptance check fails AND
+                      spec.verify.onVerifyFail is Plan (the re-plan action): the phase-init
+                      container reads it to write .coxswain/plan-feedback (reusing B3's
+                      plan-feedback channel — the same file the user's rejection reason rides
+                      in) so the next planning prompt addresses the failure. It is CLEARED when
+                      the Loop leaves the re-plan (a verify succeeds, or a check fails again
+                      with a fresh summary overwriting the prior — the operator sets it fresh
+                      on every failed verify, so a stale summary from a prior iteration never
+                      leaks into a later plan). An empty value means no failed-verify summary
+                      to feed (the plan-feedback file is removed, the same as B3's empty
+                      rejection reason). The operator is the sole writer (ADR-0004); the
+                      runner never writes status.
+                    type: string
                   tamperExitCode:
                     description: |-
                       tamperExitCode is the tamper-check init container's exit code. A NON-NIL

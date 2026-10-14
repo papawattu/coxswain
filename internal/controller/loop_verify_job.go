@@ -1125,6 +1125,9 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	}
 	switch outcome {
 	case verifySucceeded:
+		// B4: clear the failure summary (the last verify passed — the failure
+		// is resolved; the next planning prompt must not carry a stale summary).
+		clearLastFailureSummary(loop)
 		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		return true, false
@@ -1151,10 +1154,27 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		if r.applyStallGate(ctx, loop, pod, failedCheck) {
 			return true, false
 		}
-		// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
-		// is created only for a fresh pin at the next advance). The failing
-		// check rides into status.progress so the next Implementing run can
-		// target it.
+		// B4 (PLAN-BETA B4; PLAN.md Phase 6 remainder): onVerifyFail selects
+		// the destination on a failed verify. Implement (the default) iterates
+		// back to Implementing (the agent re-works the failing check — the
+		// alpha behaviour). Plan sends the Loop back to PLANNING with the
+		// failure summary fed into the next planning prompt (reusing B3's
+		// plan-feedback channel, .coxswain/plan-feedback, written by the
+		// phase-init from the durable status field status.verify.
+		// lastFailureSummary). The iteration is STILL incremented either way
+		// (the stall detector and maxIterations count iterations across
+		// re-plans — a re-plan is not a reset; the cap below applies to both
+		// destinations). The pin is cleared either way (the next run produces
+		// a new headCommit and re-pins on the next advance). With
+		// approval.mode Manual the re-plan goes through AwaitingApproval again
+		// (the claim-driven advance: the runner's next Planning claim, once the
+		// user approves, advances to Implementing — the gate's hold re-enters
+		// on the new plan). The operator is the sole writer of status
+		// (ADR-0004).
+		onVerifyFail := loop.Spec.Verify.OnVerifyFail
+		if onVerifyFail == "" {
+			onVerifyFail = coxv1alpha1.OnVerifyFailImplement // the CRD default
+		}
 		nextIter := max(loop.Status.Iteration+1, 2)
 		cap := loop.Spec.Loop.MaxIterations
 		if cap <= 0 {
@@ -1164,7 +1184,10 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// The cap is hit: the last allowed iteration's check failed. Fail
 			// the Loop (terminal) instead of iterating again — this is the
 			// hot-loop guard (a failing check without a cap would create
-			// verify-N jobs in a tight loop).
+			// verify-N jobs in a tight loop). The cap applies to BOTH the
+			// iterate (Implementing) and the re-plan (Planning) paths: a
+			// re-plan does not bypass it (the increment is the same either way,
+			// so the cap is reached at the same iteration).
 			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
 				MaxIterationsExceededReason,
 				fmt.Sprintf("acceptance check %s failed (exit %d) on iteration %d; the maxIterations cap (%d) is reached",
@@ -1175,26 +1198,53 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		}
 		loop.Status.Iteration = nextIter
 		from := loop.Status.Phase // Verifying — the ACTUAL previous phase (OS5)
-		loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
-		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
-		// OS1: record the failing check into progress (the next Implementing
-		// run can target it). The progress block is the operator's structured
-		// record; this is the operator's own evidence (the verify Job pod's
-		// exit codes), not a runner claim.
+		// Clear the current pin: the next run will produce a new headCommit and
+		// re-pin on the next advance (the fresh Job is created for THAT pin
+		// only). Applies to BOTH the iterate (Implementing) and the re-plan
+		// (Planning) paths.
+		loop.Status.CurrentVerify = nil
+		// OS1: record the failing check into progress (the next run can target
+		// it). The progress block is the operator's structured record; this is
+		// the operator's own evidence (the verify Job pod's exit codes), not a
+		// runner claim.
 		if loop.Status.Progress == nil {
 			loop.Status.Progress = &coxv1alpha1.ProgressStatus{}
 		}
 		loop.Status.Progress.LastResultStatus = fmt.Sprintf("check-failed: %s (exit %d)", failedCheck, checkExitCode)
 		loop.Status.Progress.Iteration = loop.Status.Iteration
-		// Clear the current pin: the next Implementing run will produce a new
-		// headCommit and re-pin on the next advance (the fresh Job is created
-		// for THAT pin only).
-		loop.Status.CurrentVerify = nil
-		// OS5: the iterate is a distinct Event with the correct from-phase
-		// (Verifying -> Implementing, never the stale phase a leftover claim
-		// would imply). The failing check + exit code ride in the message.
-		r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
-		return true, false
+		switch onVerifyFail {
+		case coxv1alpha1.OnVerifyFailPlan:
+			// B4: re-plan — back to Planning with the failure summary fed into
+			// the next planning prompt (the B3 plan-feedback channel). The
+			// failure summary is made DURABLE on status.verify.lastFailureSummary
+			// (the operator's record; the phase-init reads it to write .coxswain/
+			// plan-feedback). The summary names the failing check, its exit code,
+			// and (when readable) the check's raw output tail (reusing the
+			// readCheckOutputSeam the stall gate already read — no second read).
+			loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+			loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+			if loop.Status.Verify == nil {
+				loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
+			}
+			loop.Status.Verify.LastFailureSummary = verifyFailureSummary(pod, failedCheck, checkExitCode)
+			// OS5: the re-plan is a distinct Event with the correct from-phase
+			// (Verifying -> Planning, never the stale phase a leftover claim
+			// would imply). The failing check + exit code ride in the message.
+			r.emitVerifyReplanEvent(loop, from, failedCheck, checkExitCode, nextIter)
+			return true, false
+		default: // OnVerifyFailImplement (the default)
+			// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
+			// is created only for a fresh pin at the next advance). The failing
+			// check rides into status.progress so the next Implementing run can
+			// target it.
+			loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
+			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
+			// OS5: the iterate is a distinct Event with the correct from-phase
+			// (Verifying -> Implementing, never the stale phase a leftover claim
+			// would imply). The failing check + exit code ride in the message.
+			r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
+			return true, false
+		}
 	case verifyTampered:
 		// The B2 tamper gate is the authority (it runs every reconcile and
 		// flips to Failed:TamperedVerify). Belt-and-suspenders: if it has not
@@ -1208,6 +1258,82 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		}
 	}
 	return false, false
+}
+
+// emitVerifyReplanEvent (OS5, B4) emits the distinct Event for a verify
+// re-plan (Verifying -> Planning). It is emitted at the moment of the
+// transition — before status.phase is mutated — so the message carries the
+// ACTUAL previous phase (Verifying), never a stale phase. Best-effort like
+// emitVerifyIteratedEvent: a nil Recorder (most envtests) skips it; a failed
+// Event never blocks the reconcile.
+func (r *LoopReconciler) emitVerifyReplanEvent(loop *coxv1alpha1.Loop, from coxv1alpha1.LoopPhase, failedCheck string, checkExitCode int32, nextIter int) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(loop, corev1.EventTypeNormal, verifyReplanEventReason,
+		"phase advanced %s -> %s (iteration %d, %s exit %d; re-plan)",
+		from, loop.Status.Phase, nextIter, failedCheck, checkExitCode)
+}
+
+// verifyReplanEventReason is the stable Event reason the operator emits when a
+// verify failure triggers a re-plan (B4, PLAN-BETA / PLAN.md Phase 6
+// remainder): Verifying -> Planning (onVerifyFail=Plan). It is distinct from
+// verifyIteratedReason (PhaseIterated, Verifying -> Implementing) so the
+// re-plan is observable as a distinct transition in the Event trail.
+const verifyReplanEventReason = "PhaseReplanned"
+
+// verifyFailureSummary builds the operator's DURABLE summary of a failed
+// verify check (B4, PLAN-BETA / PLAN.md Phase 6 remainder). It names the
+// failing check, its exit code, and (when readable) the check's raw output
+// tail — reusing the readCheckOutputSeam the stall gate already read (no
+// second read of the terminationMessage). The summary is the operator's own
+// evidence (the verify Job pod's exit code + the check's terminationMessage),
+// not a runner claim. It is made DURABLE on status.verify.lastFailureSummary
+// so it survives to the phase-init (which reads the Loop AFTER the reconcile
+// that set it) and feeds the next planning prompt via the B3 plan-feedback
+// channel (.coxswain/plan-feedback). The output tail is capped at 2KB (the
+// plan-feedback file is a shell-quoted string in the phase-init script; a
+// huge output would make the script unreadable, and the planning prompt has
+// a cap — the model does not need the full log, just the tail that explains
+// the failure).
+const verifyFailureSummaryTailCap = 2048
+
+// clearLastFailureSummary clears the durable failure summary (B4). It is
+// called when the failure is resolved: the verify passes (the failure is
+// fixed), the plan is approved (the re-plan is consumed), or the plan is
+// rejected (the rejection reason takes over as the planning feedback). A
+// stale summary must not leak into a later planning prompt (the reviewer's
+// P1: after one failed verify, every later plan got the stale summary and a
+// later cox reject reason was ignored).
+func clearLastFailureSummary(loop *coxv1alpha1.Loop) {
+	if loop.Status.Verify != nil {
+		loop.Status.Verify.LastFailureSummary = ""
+	}
+}
+
+func verifyFailureSummary(pod *corev1.Pod, failedCheck string, checkExitCode int32) string {
+	s := fmt.Sprintf("verify check %s failed (exit %d)", failedCheck, checkExitCode)
+	// Best-effort read of the check's raw output tail (the terminationMessage
+	// the stall gate already read). A read error or an absent message means
+	// the check produced no output (or the pod is gone) — the summary still
+	// names the check and exit code (the operator's own evidence).
+	if pod != nil {
+		for i := range pod.Status.InitContainerStatuses {
+			ics := &pod.Status.InitContainerStatuses[i]
+			if ics.Name != failedCheck {
+				continue
+			}
+			if t := ics.State.Terminated; t != nil && t.Message != "" {
+				msg := t.Message
+				if len(msg) > verifyFailureSummaryTailCap {
+					msg = msg[len(msg)-verifyFailureSummaryTailCap:]
+				}
+				return s + "\n\ncheck output tail:\n" + msg
+			}
+			break
+		}
+	}
+	return s
 }
 
 // emitVerifyIteratedEvent (OS5, S5a) emits the distinct Event for a verify

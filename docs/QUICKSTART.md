@@ -228,9 +228,13 @@ kubectl cox describe <loop>     # phase, iteration, conditions, budget, delivery
 kubectl cox history <loop>      # the audit trail (phase + verify-failure history ring)
 kubectl cox logs <loop> [agent|proxy|verify|deliver]  # stream a component's logs
 kubectl cox plan <loop>         # read the plan (.coxswain/PLAN.md) from the workspace
+kubectl cox diff <loop>         # show the plan diff (current vs. last approved plan)
+kubectl cox approve <loop>      # approve the plan (set the PlanApproved condition)
+kubectl cox reject <loop> --reason <reason>  # reject the plan (set the PlanRejected condition)
 kubectl cox pause <loop>        # set spec.suspend=true
 kubectl cox resume <loop>       # clear spec.suspend (set coxswain.io/resume for a Stall/Budget pause)
 kubectl cox redeliver <loop>    # re-trigger delivery for a failed Loop (I52 annotation)
+kubectl cox fork <name> --loop <source> --iteration <n>  # fork from a checkpoint
 ```
 
 `describe` is the one to run first after a Loop finishes: it shows the
@@ -238,7 +242,64 @@ terminal phase (Succeeded / the budget or stall condition), the iteration
 count, and the delivery outcome (the PR the deliver Job opened, or the
 delivery failure reason).
 
-## 6. Model timeout and tuning
+## 6. Plan approval (manual approval gate)
+
+By default the runner drives the phases without an approval gate (the
+owner's "option B" decision). To enable the **manual approval gate** (B3),
+set `spec.approval.mode: Manual` on the Loop. The Loop then pauses at
+`AwaitingApproval` after Planning; the user reads the plan and either
+approves or rejects it:
+
+```sh
+# Read the plan the agent wrote.
+kubectl cox plan <loop>
+
+# Show the diff (the current plan vs. the last approved plan, if any).
+kubectl cox diff <loop>
+
+# Approve: sets the PlanApproved condition with the plan's SHA-256.
+# The operator's approval gate sees the condition True and advances the
+# Loop to Implementing.
+kubectl cox approve <loop>
+
+# Reject: sets the PlanRejected condition with a reason. The operator's
+# approval gate applies the onReject action (Replan: re-enter Planning
+# with the reason; Fail: terminal). The reason is shown to the agent on
+# the next Planning pass.
+kubectl cox reject <loop> --reason "the plan does not address the error handling; add retry logic"
+```
+
+A Loop with `approval.mode: Manual` is held at `AwaitingApproval` until
+the user runs `cox approve` or `cox reject`. The plan's hash (SHA-256) is
+computed by the CLI from the plan's exact bytes; a plan change after
+approval invalidates the approval (the operator requires a re-approval
+when the hash differs).
+
+## 7. Forking a Loop
+
+A **fork** seeds a new one-shot Loop from an existing Loop's checkpoint
+(ADR-0003: forks, not re-tasks). The fork inherits the source Loop's
+workspace (the repo) and model, and is seeded from the source Loop's
+checkpoint at the given iteration. The fork runs a normal one-shot Loop
+(own branch, own deliver, own PR) — it does NOT re-task the source Loop.
+
+```sh
+# Fork from iteration 2 of the source Loop.
+kubectl cox fork my-fork --loop <source-loop> --iteration 2
+```
+
+The operator does the fork's PVC restore (the controller's
+`spec.forkOf` handling restores the fork's OWN workspace PVC from the
+source's checkpoint snapshot at the fork's start). The source Loop's
+checkpoint must exist (the source's `status.checkpoints` must have an
+entry for the given iteration) and must be ReadyToUse (the source's
+VolumeSnapshot must be ReadyToUse) — the operator defers the fork's
+restore when the snapshot is not ReadyToUse (the Restore condition is
+False, reason `RestoreSourceNotReady`, the requeue retries) and rejects
+it when the snapshot is absent (the Restore condition is False, reason
+`RestoreSourceMissing`, the fork is terminal).
+
+## 8. Model timeout and tuning
 
 The runner's model client uses a 120-second per-request timeout (I89). If
 the model backend hangs (no response within 120s), the runner retries up to

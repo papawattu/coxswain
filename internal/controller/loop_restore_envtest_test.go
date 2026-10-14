@@ -92,6 +92,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -1182,14 +1183,8 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond).NotTo(BeNil(), "the operator must set the Restore condition (the restore is in progress)")
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse), "the restore is in progress (not complete yet)")
 		expectedReasons := []string{coxv1alpha1.RestoreReasonStoppingWorkloads, coxv1alpha1.RestoreReasonStoppingSandbox, coxv1alpha1.RestoreReasonDeletingPVC}
-		foundReason := false
-		for _, r := range expectedReasons {
-			if cond.Reason == r {
-				foundReason = true
-				break
-			}
-		}
-		Expect(foundReason).To(BeTrue(), "the Restore condition's reason must be one of the in-progress reasons (StoppingWorkloads, StoppingSandbox, DeletingPVC), got: "+string(cond.Reason))
+		Expect(slices.Contains(expectedReasons, cond.Reason)).To(BeTrue(),
+			"the Restore condition's reason must be one of the in-progress reasons (StoppingWorkloads, StoppingSandbox, DeletingPVC), got: "+cond.Reason)
 
 		By("the verify Job is stopped (deleted) by the restore logic (the restore hold is active, and the verify Job would mount the PVC and hold it in Terminating via pvc-protection, stalling the restore)")
 		verifyJobsAfter := &batchv1.JobList{}

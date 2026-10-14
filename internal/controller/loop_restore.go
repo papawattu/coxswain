@@ -668,6 +668,70 @@ func (r *LoopReconciler) emitRestoreEvent(loop *coxv1alpha1.Loop, status bool, r
 // decision — the Status().Update here is what survives it), and the
 // caller's finalizeLoopStatus skips the re-write when the step already
 // persisted.
+// b2ApplyLostPVCRestore handles the fork and lost-PVC restore cases (a fresh
+// Loop — the PVC is absent — and a lost-PVC restore — the PVC is gone or
+// being deleted). If the PVC is still present (the Get succeeds, even with a
+// DeletionTimestamp — the B2 fix: a PVC with a non-nil DeletionTimestamp is
+// treated as NOT present by workspacePVCPresent, but the apiserver still has
+// the object), the verify/deliver Jobs must be STOPPED first (they mount the
+// PVC and hold it in Terminating via kubernetes.io/pvc-protection), then wait
+// for the PVC to be fully gone. If the PVC is gone (NotFound), create it from
+// the snapshot. The fork-retention label is claimed for forks (the source's
+// GC skips the snapshot while the label is present); a lost-PVC restore does
+// NOT touch the label (it restores from the Loop's OWN snapshot).
+func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget, persist func()) (bool, bool, bool, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	pvcErr := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
+	if pvcErr == nil {
+		// The PVC is still present (even if Terminating). Stop the workloads
+		// first (the verify/deliver Jobs mount the PVC and hold it in
+		// Terminating via kubernetes.io/pvc-protection), then wait for the PVC
+		// to be fully gone.
+		workloadsStopped, err := r.stopWorkloadsForRestore(ctx, loop)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "the restore could not stop the Loop-owned workloads; no decision on a transient read failure",
+				"loop", loop.Name)
+			return false, true, true, nil
+		}
+		if !workloadsStopped {
+			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the Loop-owned workloads are being stopped (the PVC is held by pvc-protection while they mount it)")
+			persist()
+			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+				"workspace PVC restore: the Loop-owned workloads are being stopped")
+			return true, true, true, nil
+		}
+		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still present (being deleted); waiting for it to be fully gone before creating the new one")
+		persist()
+		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+			"workspace PVC restore: waiting for the old PVC to be fully gone")
+		return true, true, true, nil
+	}
+	if !apierrors.IsNotFound(pvcErr) {
+		// A transient read failure: no decision, requeue.
+		return false, true, true, nil
+	}
+	// The PVC is fully gone (NotFound). Create it from the snapshot.
+	if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
+		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())
+		persist()
+		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
+			"workspace PVC restore from "+target.snapshot+" failed; retrying")
+		return true, true, true, nil
+	}
+	setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
+		"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
+	if target.kind == b2KindFork {
+		r.markForkRetentionLabel(ctx, loop, target.snapshot)
+	}
+	persist()
+	r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
+		"workspace PVC restored from "+target.snapshot)
+	return true, false, false, nil
+}
+
 func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, bool, error) {
 	// A fork whose restore is complete (the one-shot marker) has nothing
 	// left to do here EXCEPT remove its fork-retention label from the source
@@ -706,75 +770,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 	switch decision {
 	case b2SourceReady:
 		if loop.Spec.ForkOf != nil || target.kind == b2KindLostPVC {
-			// A fork (a fresh Loop — the PVC is absent, the sandbox does not
-			// exist) goes straight to the create. A lost-PVC restore (the PVC
-			// is gone or being deleted) also goes to the create, but only when
-			// the PVC is fully gone (NotFound). If the PVC is still present
-			// (including Terminating — the B2 fix: a PVC with a non-nil
-			// DeletionTimestamp is treated as NOT present by
-			// workspacePVCPresent, but the apiserver still has the object), the
-			// create would fail with AlreadyExists (the object is still there).
-			// So: if the PVC is still present (the Get succeeds, even with a
-			// DeletionTimestamp), the verify/deliver Jobs must be STOPPED first
-			// (they mount the PVC and hold it in Terminating via
-			// kubernetes.io/pvc-protection), then wait for the PVC to be fully
-			// gone. If the PVC is gone (NotFound), create it from the snapshot.
-			pvc := &corev1.PersistentVolumeClaim{}
-			pvcErr := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
-			if pvcErr == nil {
-				// The PVC is still present (even if Terminating). Stop the
-				// workloads first (the verify/deliver Jobs mount the PVC and
-				// hold it in Terminating via kubernetes.io/pvc-protection), then
-				// wait for the PVC to be fully gone.
-				workloadsStopped, err := r.stopWorkloadsForRestore(ctx, loop)
-				if err != nil {
-					log.FromContext(ctx).Error(err, "the restore could not stop the Loop-owned workloads; no decision on a transient read failure",
-						"loop", loop.Name)
-					return false, true, true, nil
-				}
-				if !workloadsStopped {
-					setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
-						"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the Loop-owned workloads are being stopped (the PVC is held by pvc-protection while they mount it)")
-					persist()
-					r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
-						"workspace PVC restore: the Loop-owned workloads are being stopped")
-					return true, true, true, nil
-				}
-				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
-					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still present (being deleted); waiting for it to be fully gone before creating the new one")
-				persist()
-				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
-					"workspace PVC restore: waiting for the old PVC to be fully gone")
-				return true, true, true, nil
-			}
-			if !apierrors.IsNotFound(pvcErr) {
-				// A transient read failure: no decision, requeue.
-				return false, true, true, nil
-			}
-			// The PVC is fully gone (NotFound). Create it from the snapshot.
-			if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
-				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
-					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())
-				persist()
-				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
-					"workspace PVC restore from "+target.snapshot+" failed; retrying")
-				return true, true, true, nil
-			}
-			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
-				"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
-			// B2 FORK-RETENTION: a fork that has just restored its PVC claims
-			// the release on the source's snapshot (the fork-retention label:
-			// while present, the source's GC skips it — see
-			// forkRetainedSnapshotLabelKey). A rollback or a lost-PVC restore
-			// does NOT touch the label (it restores from the Loop's OWN
-			// snapshot; the source's GC is unaffected).
-			if target.kind == b2KindFork {
-				r.markForkRetentionLabel(ctx, loop, target.snapshot)
-			}
-			persist()
-			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
-				"workspace PVC restored from "+target.snapshot)
-			return true, false, false, nil
+			return r.b2ApplyLostPVCRestore(ctx, loop, target, persist)
 		}
 		// The ROLLBACK (an explicit restoreFrom on a running Loop): the PVC
 		// is present and the sandbox may hold it mounted (pvc-protection).

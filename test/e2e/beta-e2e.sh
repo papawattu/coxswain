@@ -853,7 +853,7 @@ while :; do
 	ph=$(phase_of "$REPLAN_LOOP")
 	iter=$(k get loop "$REPLAN_LOOP" -o jsonpath='{.status.iteration}' 2>/dev/null || echo "")
 	printf '%s ph=%s iter=%s\n' "$(utc)" "$ph" "$iter" >>"$EVIDENCE/step3-trail.log"
-	[ "$ph" != "${prev_ph:-}" ] && log step3 "phase change: $prev_ph -> $ph (iter=$iter, t=${i}s)"
+	[ "$ph" != "${prev_ph:-}" ] && log step3 "phase change: ${prev_ph:-<start>} -> $ph (iter=$iter, t=${i}s)"
 	prev_ph="$ph"
 	case "$ph" in
 	Implementing) SAW_IMPLEMENTING=1 ;;

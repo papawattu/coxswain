@@ -451,6 +451,24 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 			}
 			advanced = true
 			changed = true
+		} else if next == coxv1alpha1.LoopPhaseImplementing && loop.Status.Phase == coxv1alpha1.LoopPhasePlanning && approvalMode(loop) == coxv1alpha1.ApprovalModeManual {
+			// B3 (R1 P1, fourth round): the gate DENIED the Planning ->
+			// Implementing advance (no approval — a Manual-mode Loop). The
+			// runner COMPLETED the Planning phase (a success claim with a valid
+			// headCommit), but the Loop must NOT advance to Implementing without
+			// the user's approval. MOVE the phase to AwaitingApproval (the hold
+			// re-enters; the user approves/rejects the plan, and the gate's
+			// approved branch then advances to Implementing). The operator is the
+			// sole writer of status (ADR-0004). This is the missing transition
+			// that kept Manual Loops rerunning Planning forever (the gate denied
+			// the advance, but nothing moved the Loop to the hold). The check is
+			// on the Manual mode (the approval gate is active), so a generic
+			// denying gate (e.g., the S4 mutation test's denyingPhaseGate) does NOT
+			// trigger the move (it holds the advance at Planning, not AwaitingApproval).
+			loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+			advanced = true
+			changed = true
 		}
 	}
 	// Keep status.observedPhase in sync with the claim (the B1 field; the

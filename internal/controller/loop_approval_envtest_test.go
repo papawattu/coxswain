@@ -175,19 +175,19 @@ var _ = Describe("B3 plan approval gate", func() {
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
 		nn, r := makeLoop(ns, "b3-hold", coxv1alpha1.ApprovalModeManual, "")
-		// The gate holds the Planning -> Implementing advance (the approval
+		// The gate DENIES the Planning -> Implementing advance (the approval
 		// gate's Allow returns false for that transition when the PlanApproved
 		// condition is absent). The claim is consumed (recorded into progress)
-		// but the phase does not advance (it stays at Planning until the user
-		// approves). The nextPhase table advances Planning -> Implementing
-		// directly (there is no AwaitingApproval phase between them in the
-		// table); the gate's hold is on that advance (the Manual-mode hold).
+		// and the phase MOVES to AwaitingApproval (the hold re-enters — the
+		// user approves/rejects the plan, and the gate's approved branch then
+		// advances to Implementing). The operator is the sole writer of status
+		// (ADR-0004).
 		reportClaim(r, ns, "b3-hold", &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhasePlanning, Status: "success"})
 
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
-			"Manual mode: the gate holds the Planning -> Implementing advance (the phase stays at Planning until the user approves)")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
+			"Manual mode: the operator moves the phase to AwaitingApproval on the successful Planning claim (the hold re-enters; the user approves/rejects the plan)")
 		// The claim was consumed (recorded into progress) — the hold is on the
 		// advance, not on the claim read.
 		Expect(loop.Status.Progress).NotTo(BeNil(), "the claim is recorded into progress (OS1) even while the gate holds")
@@ -470,5 +470,52 @@ var _ = Describe("B3 plan approval gate", func() {
 		_, planFeedback := r.planApprovalFiles(loop)
 		Expect(planFeedback).To(BeEmpty(),
 			"the later Planning run writes an EMPTY plan-feedback (the durable reason was cleared on approval; no stale reason leaks into the next plan's prompt)")
+	})
+
+	// B3 (R1 P1, fourth round): on a SUCCESSFUL Planning claim with no
+	// approval (a Manual-mode Loop), the operator MUST MOVE the phase to
+	// AwaitingApproval (the hold re-enters). The gate DENIES the Planning ->
+	// Implementing advance (no approval), but the runner COMPLETED the Planning
+	// phase (a success claim with a valid headCommit) — the Loop must NOT rerun
+	// Planning forever. The claim-driven advance (recordPhaseClaim) moves the
+	// phase to AwaitingApproval when the gate denies the Planning ->
+	// Implementing transition. This spec FAILS against 521d7d5 (the phase stayed
+	// at Planning — nothing moved it to the hold).
+	It("Manual mode: a successful Planning claim with no approval MOVES the phase to AwaitingApproval (the hold re-enters; the Loop does NOT rerun Planning forever)", func() {
+		ns := "b3-plan-claim-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		_, r := makeLoop(ns, "b3-plan-claim", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
+		loop := &coxv1alpha1.Loop{}
+		nn := types.NamespacedName{Name: "b3-plan-claim", Namespace: ns}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		// The Loop is at Planning (the runner is running the Planning phase).
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		// Simulate the runner's successful Planning claim (the runner wrote
+		// PLAN.md + a success claim with a valid headCommit). The claim is on
+		// the sandbox pod (the operator reads it from the pod's annotation or
+		// the PVC — in envtest, the claim is simulated by calling
+		// recordPhaseClaim directly, which is the operator's own decision).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		claim := &PhaseClaim{
+			ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+			Status:        "success",
+			Iteration:     1,
+			HeadCommit:    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", // sha256("plan-v1\n") — 40-hex
+		}
+		now := metav1.Now()
+		changed, advanced := r.recordPhaseClaim(loop, claim, now)
+		_ = changed
+		Expect(advanced).To(BeTrue(), "the phase advanced (the claim-driven move to AwaitingApproval)")
+		// The phase is now AwaitingApproval (the hold re-enters — the user
+		// approves/rejects the plan). The operator is the sole writer of
+		// status (ADR-0004).
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
+			"the operator moved the phase to AwaitingApproval on the successful Planning claim (the hold re-enters; the Loop does NOT rerun Planning forever)")
 	})
 })

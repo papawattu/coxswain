@@ -150,6 +150,22 @@ func setLastRejectionReason(loop *coxv1alpha1.Loop, reason string) {
 	loop.Status.Approval.LastRejectionReason = reason
 }
 
+// clearLastRejectionReason clears the DURABLE rejection reason
+// (status.approval.lastRejectionReason) so a later Planning run (a plan change
+// that re-enters the hold, or a new rejection cycle) does NOT read a stale
+// reason from a prior rejection. The gate calls it when an approval is
+// ACCEPTED (the user approved the plan — the prior rejection is no longer
+// relevant; the phase-init's planApprovalFiles then writes an empty
+// plan-feedback, so the next plan has no stale rejection to address). An
+// absent/empty field is a no-op. The operator is the sole writer (ADR-0004).
+func clearLastRejectionReason(loop *coxv1alpha1.Loop) {
+	// Nil the whole record (not just the string): the prior rejection is no
+	// longer relevant, and planApprovalFiles reads the field as "" when the
+	// record is absent (the fallback to the condition applies; a later
+	// rejection re-sets the record via setLastRejectionReason).
+	loop.Status.Approval = nil
+}
+
 // planApprovalFiles returns the (planHash, planFeedback) the phase-init
 // container should write to the workspace for THIS phase run. Both are ""
 // when there is nothing to write (the phase-init script then REMOVES the
@@ -257,6 +273,12 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 			// Approved: advance to Implementing. The phase-init script
 			// (written on the next pod recreation) carries the hash to the
 			// runner (the plan-change check on the next Planning run, if any).
+			// CLEAR the durable rejection reason (the user accepted the plan —
+			// the prior rejection is no longer relevant; a later Planning run
+			// (a plan change that re-enters the hold, or a new rejection) must
+			// not read a stale reason from the prior rejection). The operator is
+			// the sole writer of status (ADR-0004).
+			clearLastRejectionReason(loop)
 			loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
 			changed = true

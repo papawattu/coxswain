@@ -390,4 +390,73 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(script).NotTo(ContainSubstring("rm -f \"${DEST}/.coxswain/"+coxPlanFeedbackFile+"\""),
 			"the phase-init WRITES (not removes) the plan-feedback file on a Replan re-plan")
 	})
+
+	// B3 (R1 review P1, second round): the DURABLE rejection reason must be
+	// CLEARED when an approval is accepted, so a LATER Planning run (a plan
+	// change that re-enters the hold, or a new rejection cycle) does NOT read a
+	// stale reason from a prior rejection. The full sequence: reject (Replan) ->
+	// the durable reason is set -> re-plan -> approve (the approval is
+	// accepted) -> the durable reason is CLEARED -> another Planning run ->
+	// planApprovalFiles writes an EMPTY plan-feedback (no stale reason leaks
+	// into the next plan's prompt). This spec FAILS against 18aa3dd (the
+	// durable reason was never cleared, so the later Planning run reads the
+	// stale reason).
+	It("Manual mode, onReject=Replan: the durable rejection reason is CLEARED when an approval is accepted, so a later Planning run writes an EMPTY plan-feedback (no stale reason leaks into the next plan)", func() {
+		ns := "b3-replan-clear-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		const reason = "Rejected: the plan misses the edge case"
+		const approvedHash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" // sha256("plan-v1\n")
+		// A Manual-mode Loop at AwaitingApproval. The user rejects the plan
+		// (Replan). The gate sets the durable reason + clears the condition.
+		_, r := makeLoop(ns, "b3-replan-clear", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
+		loop := &coxv1alpha1.Loop{}
+		nn := types.NamespacedName{Name: "b3-replan-clear", Namespace: ns}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		setCondition(ns, "b3-replan-clear", coxv1alpha1.PlanRejectedCondition, "True", reason)
+		reconcileLoop(r, ns, "b3-replan-clear")
+		// The durable reason is now set.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Approval).ToNot(BeNil(), "the operator set the durable rejection record")
+		Expect(loop.Status.Approval.LastRejectionReason).To(Equal(reason),
+			"the rejection reason is DURABLE after the Replan reconcile")
+
+		// Now the user approves the (re)plan. The gate's approved branch clears
+		// the durable reason + advances to Implementing.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		setCondition(ns, "b3-replan-clear", coxv1alpha1.PlanApprovedCondition, "True", approvedHash)
+		reconcileLoop(r, ns, "b3-replan-clear")
+		// The approval is accepted: the phase advanced to Implementing AND the
+		// durable reason is CLEARED.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"the approval released the hold (the phase advanced to Implementing)")
+		Expect(loop.Status.Approval).To(BeNil(),
+			"the durable rejection record is CLEARED after the approval is accepted (the prior rejection is no longer relevant)")
+
+		// Now a LATER Planning run (e.g. a plan change that re-enters the hold).
+		// The phase-init's planApprovalFiles must write an EMPTY plan-feedback
+		// (no stale reason leaks into the next plan's prompt).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		_, planFeedback := r.planApprovalFiles(loop)
+		Expect(planFeedback).To(BeEmpty(),
+			"the later Planning run writes an EMPTY plan-feedback (the durable reason was cleared on approval; no stale reason leaks into the next plan's prompt)")
+	})
 })

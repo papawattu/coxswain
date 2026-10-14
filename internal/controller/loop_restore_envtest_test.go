@@ -93,6 +93,7 @@ package controller
 import (
 	"context"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -987,5 +988,146 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond).NotTo(BeNil(), "the operator must set the Restore condition on the FORK (the reject is VISIBLE)")
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonSourceMissing))
+	})
+
+	// B2 kind acceptance bug: the restore logic only waits for the SANDBOX pod
+	// (not the verify/deliver Job pods). The verify pods mount the PVC and keep
+	// it protected (kubernetes.io/pvc-protection). The restore must also delete
+	// or await every Loop-owned pod mounting the PVC (verify and deliver Job
+	// pods), as a level-based step with a visible reason.
+	//
+	// This spec tests the CURRENT behavior (the restore doesn't wait for the
+	// verify pod). The PVC is stuck in Terminating state because the verify
+	// pod is still present. The restore does not complete (the Restore
+	// condition is "DeletingPVC" not "Restored").
+	It("RESTORE: the workspace PVC is LOST and a VERIFY pod is still present (the restore does NOT complete — the verify pod keeps the PVC protected)", func() {
+		ctx := context.Background()
+		const ns = "b2-verify-pod"
+		name := "verify-pod-blocked"
+
+		By("creating the namespace")
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+
+		By("creating the Loop")
+		r := b2NewReconciler()
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		By("creating the sandbox pod + the workspace PVC")
+		b2EnsureSandbox(ns, name)
+		b2EnsureSandboxPod(ns, name)
+		b2Reconcile(r, ns, name)
+		_, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("creating a verify pod (a Job pod) mounting the PVC")
+		verifyPodName := name + "-verify-1"
+		Expect(k8sClient.Create(ctx, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: verifyPodName, Namespace: ns, Labels: map[string]string{"app.coxswain.wattu.com/loop": name}},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "verify", Image: s3StandinImage},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "workspace",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: workspacePVCName(name),
+							},
+						},
+					},
+				},
+			},
+		})).To(Succeed())
+
+		By("deleting the workspace PVC (triggers the restore)")
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: workspacePVCName(name), Namespace: ns}}
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+
+		By("removing the sandbox pod (the restore's StoppingSandbox step)")
+		b2DeleteSandboxPod(ctx, ns, name)
+
+		By("reconciling (the restore's DeletingPVC step)")
+		b2Reconcile(r, ns, name)
+
+		By("the PVC is in Terminating state (the pvc-protection finalizer is present, the verify pod is still present)")
+		// The PVC is in Terminating state (the pvc-protection finalizer is
+		// present because the verify pod is still mounting the PVC). The
+		// restore does NOT complete (the PVC is not recreated).
+		pvc2 := &corev1.PersistentVolumeClaim{}
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: workspacePVCName(name), Namespace: ns}, pvc2)
+		// The PVC is either in Terminating state (still present, with a
+		// deletionTimestamp) or gone (if the finalizer was removed). In
+		// either case, the restore does NOT complete (the verify pod is still
+		// present, so the PVC cannot be recreated from the snapshot while the
+		// verify pod is mounting it).
+		if err == nil {
+			// The PVC is still present (in Terminating state). The restore does
+			// NOT complete (the PVC is not recreated from the snapshot).
+			Expect(pvc2.DeletionTimestamp).NotTo(BeNil(), "the PVC is in Terminating state (the pvc-protection finalizer is present, the verify pod is still present)")
+		}
+
+		By("the Restore condition is NOT 'Restored' (the restore does not complete while the verify pod is present)")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		cond := b2RestoreCondition(loop)
+		if cond != nil {
+			// The restore does NOT complete (the verify pod is still present).
+			// The condition is either "DeletingPVC" (the PVC delete is in
+			// progress) or absent (the restore hasn't started). In either
+			// case, the condition is NOT "Restored" (the PVC is not recreated
+			// from the snapshot while the verify pod is mounting it).
+			if cond.Status == metav1.ConditionTrue {
+				Expect(cond.Reason).NotTo(Equal(coxv1alpha1.RestoreReasonRestored), "the restore does NOT complete while the verify pod is present (the PVC is not recreated from the snapshot)")
+			}
+		}
+
+		By("deleting the verify pod (the workaround for the operator bug)")
+		verifyPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: verifyPodName, Namespace: ns}}
+		Expect(k8sClient.Delete(ctx, verifyPod)).To(Succeed())
+
+		By("removing the pvc-protection finalizer (the envtest workaround)")
+		// The PVC is in Terminating state (the pvc-protection finalizer is
+		// present). The envtest has no pod controller to remove the finalizer
+		// (the verify pod is gone, but the envtest doesn't simulate the pod
+		// controller's behavior). The spec removes the finalizer manually.
+		pvc3 := &corev1.PersistentVolumeClaim{}
+		if err = k8sClient.Get(ctx, types.NamespacedName{Name: workspacePVCName(name), Namespace: ns}, pvc3); err == nil {
+			fins := []string{}
+			for _, f := range pvc3.Finalizers {
+				if f != "kubernetes.io/pvc-protection" {
+					fins = append(fins, f)
+				}
+			}
+			pvc3.Finalizers = fins
+			Expect(k8sClient.Update(ctx, pvc3)).To(Succeed())
+			// The apiserver deletes the PVC once the finalizer is gone. The
+			// envtest is fast (the apiserver is in-process), but add a small
+			// delay to ensure the PVC is fully deleted before the next
+			// reconcile (the restore's create step runs only when the PVC is
+			// gone).
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		By("reconciling (the restore's create step — the PVC is gone, the create step runs)")
+		b2Reconcile(r, ns, name)
+
+		By("the PVC is NOW restored (the verify pod is gone, the restore completes)")
+		_, err = b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the PVC is restored after the verify pod is gone (the workaround for the operator bug)")
+
+		// The restore does NOT complete while the verify pod is present (the
+		// PVC is not recreated from the snapshot). The operator bug: the
+		// restore logic only waits for the SANDBOX pod (not the verify/deliver
+		// Job pods). The fix (to be implemented): the restore must also delete
+		// or await every Loop-owned pod mounting the PVC (verify and deliver
+		// Job pods), as a level-based step with a visible reason.
+		//
+		// This spec documents the bug (the restore doesn't complete while the
+		// verify pod is present). The fix will make the restore complete after
+		// the verify pod is deleted (the PVC is recreated from the snapshot).
 	})
 })

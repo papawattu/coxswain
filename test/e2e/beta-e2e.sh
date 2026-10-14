@@ -609,7 +609,8 @@ wait_phase() { # <loop> <phase> [cap-seconds] -> 0 if reached
 }
 
 collect_evidence() { # <loop> <tag>
-	local loop="${1:-<none>}" tag="$2" d="$EVIDENCE/$tag"
+	local loop="${1:-<none>}" tag="${2:-<none>}" d
+	d="$EVIDENCE/$tag"
 	mkdir -p "$d"
 	kc -n "$NS" get loop "$loop" -o json >"$d/loop.json" 2>/dev/null || true
 	kc -n "$NS" get events -o json --field-selector "involvedObject.name=$loop" >"$d/events.json" 2>/dev/null || true
@@ -1103,6 +1104,7 @@ done
 kc -n "$NS" delete secret b6-metrics-secret >/dev/null 2>&1 || true
 kc -n "$NS" delete rolebinding b6-metrics-reader-binding >/dev/null 2>&1 || true
 kc -n "$NS" delete serviceaccount b6-metrics-sa >/dev/null 2>&1 || true
+# shellcheck disable=SC1010 # 'done' here is the log tag, not the keyword
 log done "Loops deleted (their PRs live on GitHub); the scratch cluster $CLUSTER is kept for inspection (the owner deletes it when done)"
 
 # ---------------------------------------------------------------------------
@@ -1141,4 +1143,5 @@ echo "step6 (metrics via coxswain-metrics-reader token): PASS (loops_completed_t
 echo "digests:"
 cat "$EVIDENCE/digests.txt"
 echo
+# shellcheck disable=SC1010 # 'done' here is the log tag, not the keyword
 log done "DONE: B6 beta acceptance (all six Done-when steps) on the FRESH snapshot-capable kind cluster $CLUSTER, from the CURRENT main build, following docs/QUICKSTART.md. Live GitHub (D55), real vLLM ($VLLM_ENDPOINT, $VLLM_MODEL). Evidence: $EVIDENCE (never committed, I68). kind-coxswain-dev / kind-coxswain-calico / kind-coxswain-alpha were never touched. No release defect was worked around in this script (I90); the owner tags v0.1.0 after this passes."

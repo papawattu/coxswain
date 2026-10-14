@@ -42,6 +42,7 @@ import (
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	"github.com/papawattu/coxswain/internal/proxy"
+	"github.com/prometheus/client_golang/prometheus"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -62,9 +63,48 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
+
+// B5a: Prometheus metrics (the plan's "metrics endpoint already serves
+// operator metrics"). The plan does not enumerate the metric set; these
+// four are the ones the controller already tracks in status (iteration,
+// stall fires, token usage) — the minimum useful set for a dashboard.
+//
+// Registration: prometheus.NewCounterVec/NewGaugeVec WITHOUT an explicit
+// registerer default to the prometheus.DefaultRegisterer (the process-wide
+// default registry). The controller-runtime manager serves its /metrics
+// endpoint from metrics.Registry (a DIFFERENT registry) — so these metrics
+// are NOT served at the manager's /metrics unless explicitly registered
+// there. We register them on metrics.Registry in init() below (the test
+// reads from metrics.Registry, matching the manager's served endpoint).
+var (
+	loopIterationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_loop_iterations_total",
+		Help: "Total Loop phase transitions (iteration boundary crossings), by destination phase.",
+	}, []string{"phase"})
+	loopStallsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "coxswain_loop_stalls_total",
+		Help: "Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs).",
+	})
+	loopsActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "coxswain_loops_active",
+		Help: "Loops currently in a non-terminal phase, by phase.",
+	}, []string{"phase"})
+	loopTokensTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_loop_tokens_total",
+		Help: "Total model tokens consumed, as folded into status.budget from the proxy reading, by kind (prompt|completion).",
+	}, []string{"kind"})
+)
+
+func init() {
+	metrics.Registry.MustRegister(loopIterationsTotal)
+	metrics.Registry.MustRegister(loopStallsTotal)
+	metrics.Registry.MustRegister(loopsActive)
+	metrics.Registry.MustRegister(loopTokensTotal)
+}
 
 // C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
 // model key; it talks to the local proxy on COX_MODEL_BASE_URL, which holds the

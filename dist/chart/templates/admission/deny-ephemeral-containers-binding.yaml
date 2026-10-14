@@ -1,0 +1,17 @@
+{{- /*
+I45: the namespace-scoped ValidatingAdmissionPolicyBinding for the
+coxswain-deny-ephemeral-containers VAP (the template next to this one). The
+generated binding template dist/chart/templates/extras/deny-ephemeral-containers.yaml
+is kept for the release-namespace binding; this one matches the kustomize
+install.yaml's literal binding (namespace: coxswain-system) so a chart
+deployed to the release's own namespace is identical to the install.yaml
+deploy.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: coxswain-deny-ephemeral-containers
+  namespace: coxswain-system
+spec:
+  policyName: coxswain-deny-ephemeral-containers
+  validationActions: ["Deny"]

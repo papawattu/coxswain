@@ -1,0 +1,29 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: {{ include "coxswain.name" . }}-cni-probe
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: coxswain
+{{- /*
+D38: the operator's in-namespace RoleBinding for the CNI probe. The names are
+literal (not the Helm fullname) because the Role they reference is the
+literal-named coxswain-cni-probe-operator Role in
+templates/admission/cni-probe-role.yaml (the operator's probe code references
+the role by name), and the target namespace is the fixed coxswain-cni-probe
+(the operator's --cni-probe-namespace default). The subject is the chart's
+serviceAccountName (the operator, in the release namespace) — the one part
+that must follow the release name.
+*/}}
+  name: coxswain-cni-probe-operator
+  namespace: coxswain-cni-probe
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coxswain-cni-probe-operator
+subjects:
+- kind: ServiceAccount
+  name: {{ include "coxswain.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}

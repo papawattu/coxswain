@@ -338,10 +338,21 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 	}
 
 	// Rule 1: same bootID, no drop — add the deltas (floored at 0 per counter).
-	b.PromptTokens += max(0, reading.PromptTokens-b.LastPromptTokens)
-	b.CompletionTokens += max(0, reading.CompletionTokens-b.LastCompletionTokens)
+	promptDelta := max(0, reading.PromptTokens-b.LastPromptTokens)
+	completionDelta := max(0, reading.CompletionTokens-b.LastCompletionTokens)
+	b.PromptTokens += promptDelta
+	b.CompletionTokens += completionDelta
 	b.Requests += max(0, reading.Requests-b.LastRequests)
 	b.UnmeteredRequests += max(0, reading.UnmeteredRequests-b.LastUnmeteredRequests)
+	// B5a: bump the token metric by the same deltas (the metric is the
+	// process-wide, per-process sum of what the operator has folded into
+	// status.budget; it is NOT per-Loop — the per-Loop view is status.budget).
+	if promptDelta > 0 {
+		loopTokensTotal.WithLabelValues("prompt").Add(float64(promptDelta))
+	}
+	if completionDelta > 0 {
+		loopTokensTotal.WithLabelValues("completion").Add(float64(completionDelta))
+	}
 	b.LastPromptTokens = reading.PromptTokens
 	b.LastCompletionTokens = reading.CompletionTokens
 	b.LastRequests = reading.Requests

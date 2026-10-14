@@ -317,6 +317,9 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 	if !fired {
 		return false
 	}
+	// B5a: count the stall fire (the process-wide counter; per-Loop the
+	// Stalled condition is the record).
+	loopStallsTotal.Inc()
 	action := loop.Spec.Loop.StallAction
 	if action == "" {
 		action = coxv1alpha1.StallActionFail // the CRD default
@@ -373,6 +376,9 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run))
 		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		// B5a: terminal transition — bump the completion counter and clear the
+		// active gauge.
+		bumpLoopCompletion("failed", "stalled")
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run)
 		}

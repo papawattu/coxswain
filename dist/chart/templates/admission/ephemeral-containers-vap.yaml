@@ -1,0 +1,37 @@
+{{- /*
+I45: the cluster-scoped ValidatingAdmissionPolicy that denies ephemeral
+containers (kubectl debug) on coxswain component pods. The kustomize
+install.yaml install applies this (config/admission, the standalone
+kustomization hack/build-installer.sh appends to install.yaml); the generated
+chart template dist/chart/templates/extras/deny-ephemeral-containers.yaml
+carries the matching ValidatingAdmissionPolicyBinding. The binding's
+policyName must reference the VAP's rendered name (the kustomize namePrefix
+coxswain- in config/admission, not the Helm fullname — the two install
+methods are independent), so the chart's VAP must render with the literal
+name the kustomize install produces.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: coxswain-deny-ephemeral-containers
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods/ephemeralcontainers"]
+        operations: ["UPDATE"]
+  matchConditions:
+    - name: coxswainComponentPod
+      expression: >-
+        has(object.metadata.labels)
+        && 'app.kubernetes.io/component' in object.metadata.labels
+        && object.metadata.labels['app.kubernetes.io/component']
+        in ['agent', 'model-proxy', 'egress-proxy', 'tool-proxy']
+  validations:
+    - expression: "false"
+      message: >-
+        Adding ephemeral containers to coxswain component pods (agent,
+        model-proxy, egress-proxy, tool-proxy) is denied: the container would run
+        outside the KubeArmor fence and share the pod's network namespace.

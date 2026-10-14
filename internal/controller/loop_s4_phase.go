@@ -371,6 +371,12 @@ const claimSuccess = "success"
 // the runner was executing, never the next, so the nextPhase match
 // naturally rejects it: nextPhase(current, current) == current.)
 func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseClaim, now metav1.Time) (changed, advanced bool) {
+	// B5a: bump the iteration metric on a NEW-phase transition (a re-claim of
+	// the same phase does not bump). The claim's observedPhase is the phase
+	// the runner reports having executed (the destination of this advance).
+	if claim != nil && claim.ObservedPhase != "" && claim.ObservedPhase != loop.Status.Phase {
+		loopPhaseTransitionsTotal.WithLabelValues(string(claim.ObservedPhase)).Inc()
+	}
 	// OS1: record the claim into status.progress. The pins (observed
 	// generation / base commit) are the OPERATOR's, never the claim's (a
 	// claim cannot set a pin for itself).

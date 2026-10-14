@@ -1,0 +1,44 @@
+# Example Loop: a Python library task (exercises a non-Go toolchain).
+#
+# The pylib sample app (examples/pylib) is a small `numutils` Python
+# package. One public function is missing, so the test suite fails on
+# import. This Loop tells the agent to implement the missing function so
+# the tests pass.
+#
+# This example is useful for two reasons:
+#   1. It exercises a non-Go toolchain (Python 3, unittest).
+#   2. It shows the `preset: none` path (no preset to protect Python files;
+#      the protectedPaths list is the only "no cheating" boundary).
+#
+# Apply:
+#   kubectl apply -f config/samples/loop-python-missing-function.yaml
+#
+# Expected outcome:
+#   Planning -> Implementing (adds the missing function) ->
+#   Verifying (unittest discover passes) -> Succeeded
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: loop-python-missing-function
+  namespace: default
+spec:
+  goal: >-
+    Implement the missing public function in the numutils package so the
+    test suite passes. The tests import the function from numutils and
+    assert its behaviour; the function signature and expected values are
+    defined by the tests (do not modify the test files). Run
+    `python3 -m unittest discover -s tests` to verify.
+  workspace:
+    repo: "https://github.com/papawattu/coxswain.git"
+    ref: "main"
+  verify:
+    acceptanceChecks:
+      - python3 -m compileall -q .
+      - python3 -m unittest discover -s tests
+    preset: none
+    protectedPaths:
+      - tests/
+    image: docker.io/library/python:3.13-slim
+  agent:
+  loop:
+    maxIterations: 3

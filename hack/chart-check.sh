@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# B5a: verify the generated Helm chart (dist/chart) without a cluster.
+#
+# 1. helm lint dist/chart
+# 2. helm template coxswain dist/chart (release namespace coxswain-system)
+# 3. every (kind, name) the kustomize install.yaml carries (rendered by
+#    hack/build-installer.sh) is present in the chart's rendered output —
+#    so the chart is a superset of install.yaml (the chart may add
+#    release-namespace templating, but must not drop a resource the
+#    kustomize install ships).
+#
+# It runs offline (no kind, no cluster) so CI can run it before a helm
+# binary exists in the image (it only needs helm + go + python3).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+command -v helm >/dev/null 2>&1 || { echo "Error: helm not found (make install-helm)"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "Error: python3 not found"; exit 1; }
+
+echo "=== helm lint dist/chart ==="
+helm lint "$ROOT/dist/chart"
+
+echo "=== helm template (release coxswain, namespace coxswain-system) ==="
+RENDERED="$(mktemp)"
+trap 'rm -f "$RENDERED"' EXIT
+helm template coxswain "$ROOT/dist/chart" --namespace coxswain-system > "$RENDERED"
+
+echo "=== install.yaml coverage (every install.yaml resource must be in the chart) ==="
+IMG="${IMG:-ghcr.io/papawattu/coxswain-controller:placeholder}" \
+  KUSTOMIZE="$(command -v kustomize 2>/dev/null || echo "$ROOT/bin/kustomize")" \
+  "$ROOT/hack/build-installer.sh" > /dev/null
+
+python3 - "$ROOT/dist/install.yaml" "$RENDERED" <<'EOF'
+import sys, yaml
+
+def docs(f):
+    return [d for d in yaml.safe_load_all(open(f).read()) if d]
+
+def keyset(ds):
+    s = set()
+    for d in ds:
+        k = d.get('kind')
+        n = (d.get('metadata') or {}).get('name')
+        if k and n:
+            s.add((k, n))
+    return s
+
+inst = keyset(docs(sys.argv[1]))
+chart = keyset(docs(sys.argv[2]))
+missing = sorted(inst - chart)
+extra = sorted(chart - inst)
+
+print(f"install.yaml resources: {len(inst)}, chart resources: {len(chart)}")
+if missing:
+    # The kubebuilder helm/v2-alpha generator skips the kustomize
+    # `namespace` transformer (the chart assumes the release namespace
+    # exists) and the helper Roles are opt-in (values.yaml
+    # rbac.helpers.enabled defaults to false, while install.yaml ships
+    # them enabled). Those four are the ONLY expected differences — the
+    # chart's render must not drop anything else install.yaml carries.
+    expected = {
+        ('Namespace', 'coxswain-system'),  # release namespace: helm --create-namespace
+        ('ClusterRole', 'coxswain-loop-admin-role'),   # rbac.helpers.enabled=false in the chart
+        ('ClusterRole', 'coxswain-loop-editor-role'),  # rbac.helpers.enabled=false in the chart
+        ('ClusterRole', 'coxswain-loop-viewer-role'),  # rbac.helpers.enabled=false in the chart
+    }
+    unexpected = [x for x in missing if x not in expected]
+    if unexpected:
+        print("FAIL: in install.yaml but NOT in the chart (beyond the expected release-namespace/helper differences):")
+        for x in unexpected:
+            print("   ", x)
+        sys.exit(1)
+    print("OK: every install.yaml (kind, name) is present in the chart render, or in the expected difference set:")
+    for x in sorted(expected):
+        print("   (expected)", x)
+for x in extra:
+    print("  (chart-only, expected: release-namespace templating)", x)
+EOF
+
+echo "chart-check: PASS"

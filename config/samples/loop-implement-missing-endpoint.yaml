@@ -1,0 +1,48 @@
+# Example Loop: implement a missing endpoint (a small feature, not a bug fix).
+#
+# The webapi sample app (examples/webapi) is a tiny Go HTTP server with
+# /healthz (works) and /api/v1/ping (missing). This Loop tells the agent to
+# implement the /api/v1/ping endpoint so the smoke test passes.
+#
+# Unlike the fix-a-bug example, this task requires the agent to ADD code
+# (not just fix a broken function), so it exercises the full
+# Planning -> Implementing -> Verifying cycle with a non-trivial plan.
+#
+# Apply:
+#   kubectl apply -f config/samples/loop-implement-missing-endpoint.yaml
+#
+# Watch it:
+#   kubectl cox describe loop-implement-missing-endpoint
+#   kubectl cox plan loop-implement-missing-endpoint   # read the plan
+#
+# Expected outcome:
+#   Planning (the agent writes .coxswain/PLAN.md) ->
+#   Implementing (adds the /api/v1/ping handler) ->
+#   Verifying (smoke test curls both endpoints) -> Succeeded
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: loop-implement-missing-endpoint
+  namespace: default
+spec:
+  goal: >-
+    Implement the /api/v1/ping endpoint on the existing HTTP server. It
+    must return HTTP 200 with a JSON body {"status":"ok"} and a
+    Content-Type: application/json header. Do not modify the /healthz
+    handler or the smoke test. The smoke test (test/smoke.sh) starts the
+    server on a free port, curls /healthz and /api/v1/ping, and expects
+    both to return 200 with the correct body.
+  workspace:
+    repo: "https://github.com/papawattu/coxswain.git"
+    ref: "main"
+  verify:
+    acceptanceChecks:
+      - go build ./...
+      - bash test/smoke.sh
+    preset: go
+    protectedPaths:
+      - test/smoke.sh
+    image: docker.io/library/golang:1.26
+  agent:
+  loop:
+    maxIterations: 5

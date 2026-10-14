@@ -1,0 +1,64 @@
+# B5a proposal: release-workflow change to build and publish the Helm chart.
+#
+# STATUS: OWNER PUSH. This file is the PROPOSED diff for
+# .github/workflows/release.yml. The builder does not edit
+# .github/workflows (the release workflow is an owner-pushed file per
+# AGENTS.md), so this patch is written here for the owner to review and
+# apply (e.g. `git apply docs/proposals/release-workflow-helm.patch` from the
+# repo root, or by hand).
+#
+# What it does:
+#   - adds a `helm` install step to the `release` job (GitHub-hosted
+#     ubuntu-latest; helm v4 via the official get-helm script, the same
+#     `make install-helm` path the Makefile uses);
+#   - after `make build-installer`, runs `helm lint dist/chart` and
+#     `helm package dist/chart --destination dist` so the release
+#     artifact set includes the packaged chart tarball
+#     (coxswain-<chart-version>.tgz) alongside dist/install.yaml;
+#   - attaches the tarball to the GitHub release (the existing
+#     `gh release create` step is unchanged in intent; only the file
+#     list grows).
+#
+# The chart itself is generated in-tree by
+# `kubebuilder edit --plugins=helm/v2-alpha` (dist/chart) and is committed,
+# so the release job needs no extra codegen step beyond what
+# `make build-installer` already runs (which the chart generator itself
+# invokes; see the `helm.kubebuilder.io/v2-alpha` entry in PROJECT).
+#
+# The patch is a context diff against the `release` job in
+# .github/workflows/release.yml (as of B5a). Line numbers are approximate
+# (the file has changed between B5a and the owner's apply time); apply with
+# `git apply --3way` if the context has drifted.
+
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -60,12 +60,25 @@
+       - name: Setup Go
+         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+         with:
+           go-version-file: go.mod
+ 
++      - name: Install Helm
++        run: |
++          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash
++          helm version --short
++
+       - name: Build dist/install.yaml
+         run: make build-installer IMG="${IMAGE_PREFIX}-controller:${GITHUB_REF_NAME}"
+ 
++      - name: Lint and package the Helm chart
++        run: |
++          helm lint dist/chart
++          helm package dist/chart --destination dist
++          ls -l dist/*.tgz
++
+       - name: Create the GitHub release
+         env:
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         run: |
+-          gh release create "${GITHUB_REF_NAME}" dist/install.yaml \
++          gh release create "${GITHUB_REF_NAME}" dist/install.yaml dist/coxswain-*.tgz \
+             --repo "${GITHUB_REPOSITORY}" \
+             --title "${GITHUB_REF_NAME}" \
+             --prerelease \
+             --generate-notes

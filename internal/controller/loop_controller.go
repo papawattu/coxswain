@@ -42,6 +42,7 @@ import (
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	"github.com/papawattu/coxswain/internal/proxy"
+	"github.com/prometheus/client_golang/prometheus"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -62,9 +63,77 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
+
+// B5a: Prometheus metrics (the plan's "metrics endpoint already serves
+// operator metrics"). The plan does not enumerate the metric set; these
+// four are the ones the controller already tracks in status (iteration,
+// stall fires, token usage) — the minimum useful set for a dashboard.
+//
+// Registration: prometheus.NewCounterVec/NewGaugeVec WITHOUT an explicit
+// registerer default to the prometheus.DefaultRegisterer (the process-wide
+// default registry). The controller-runtime manager serves its /metrics
+// endpoint from metrics.Registry (a DIFFERENT registry) — so these metrics
+// are NOT served at the manager's /metrics unless explicitly registered
+// there. We register them on metrics.Registry in init() below (the test
+// reads from metrics.Registry, matching the manager's served endpoint).
+var (
+	// coxswain_loop_phase_transitions_total: bumped on every new-phase
+	// transition (the claim-driven advance in recordPhaseClaim + the
+	// bootstrap's first transition). This counts PHASE TRANSITIONS, not
+	// iterations (an iteration is a full cycle of the phase machine;
+	// status.iteration is the iteration counter).
+	loopPhaseTransitionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_loop_phase_transitions_total",
+		Help: "Total Loop phase transitions (new-phase advances), by destination phase.",
+	}, []string{"phase"})
+	// coxswain_loop_iterations_total: bumped when status.iteration
+	// increments (the iterate path in applyVerifyOutcome + the re-plan
+	// path). This is the "iterations per Loop" metric from PLAN-BETA B5.
+	loopIterationsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "coxswain_loop_iterations_total",
+		Help: "Total Loop iteration increments (status.iteration advances: the verify-iterate and re-plan paths).",
+	})
+	// coxswain_verify_results_total: bumped on every verify outcome decision
+	// (pass / fail / infra). This is the "verify pass rate" metric from
+	// PLAN-BETA B5 (pass rate = pass / (pass + fail), computed in PromQL).
+	verifyResultsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_verify_results_total",
+		Help: "Total verify outcomes, by result (pass|fail|infra).",
+	}, []string{"result"})
+	// coxswain_loops_completed_total: bumped once per Loop on the terminal
+	// transition (Succeeded or Failed). This enables "tokens per success"
+	// (tokens / completed{result="succeeded"}, computed in PromQL).
+	loopsCompletedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_loops_completed_total",
+		Help: "Total Loops that reached a terminal phase, by result (succeeded|failed) and reason.",
+	}, []string{"result", "reason"})
+	loopStallsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "coxswain_loop_stalls_total",
+		Help: "Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs).",
+	})
+	// B5a: loops_active is now a custom Collector (loops_active_collector.go)
+	// that counts Loops per non-terminal phase from the cache at scrape time.
+	// It is registered in SetupWithManager (where the client is available),
+	// not in init(). The GaugeVec is removed.
+	loopTokensTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_loop_tokens_total",
+		Help: "Total model tokens consumed, as folded into status.budget from the proxy reading, by kind (prompt|completion).",
+	}, []string{"kind"})
+)
+
+func init() {
+	metrics.Registry.MustRegister(loopPhaseTransitionsTotal)
+	metrics.Registry.MustRegister(loopIterationsTotal)
+	metrics.Registry.MustRegister(verifyResultsTotal)
+	metrics.Registry.MustRegister(loopsCompletedTotal)
+	metrics.Registry.MustRegister(loopStallsTotal)
+	// B5a: loops_active is a custom Collector, registered in SetupWithManager.
+	metrics.Registry.MustRegister(loopTokensTotal)
+}
 
 // C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no
 // model key; it talks to the local proxy on COX_MODEL_BASE_URL, which holds the
@@ -508,6 +577,8 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 		changed = true
+		// B5a: count the bootstrap's first transition (Pending -> Planning).
+		loopPhaseTransitionsTotal.WithLabelValues(string(coxv1alpha1.LoopPhasePlanning)).Inc()
 	}
 
 	// S4 review P1 (R17): the workspace must survive the per-phase pod
@@ -5154,6 +5225,18 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.CNIRegateSource != nil {
 		b = b.WatchesRawSource(r.CNIRegateSource)
 	}
+	// B5a: register the loops-active custom Collector. It counts Loops per
+	// non-terminal phase from the cache at scrape time, replacing the old
+	// GaugeVec (which left stale labels for phases a Loop had already left).
+	// The collector uses the manager's cached client (mgr.GetClient()), so
+	// List is a fast in-memory operation.
+	if err := metrics.Registry.Register(NewLoopsActiveCollector(mgr.GetClient())); err != nil {
+		// If the collector is already registered (e.g. a re-run), ignore the
+		// AlreadyRegisteredError. Other errors are fatal.
+		if !strings.Contains(err.Error(), "already registered") {
+			return fmt.Errorf("register loops-active collector: %w", err)
+		}
+	}
 	return b.Named("loop").
 		Complete(r)
 }
@@ -5511,4 +5594,11 @@ func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommit
 		return ctrl.Result{RequeueAfter: budgetRequeue}
 	}
 	return ctrl.Result{}
+}
+
+// isTerminalPhase reports whether the given phase is a terminal phase
+// (Succeeded or Failed). Paused is NOT terminal (the Loop can be resumed).
+// Used by the loops-active gauge maintenance (B5a).
+func isTerminalPhase(phase coxv1alpha1.LoopPhase) bool {
+	return phase == coxv1alpha1.LoopPhaseSucceeded || phase == coxv1alpha1.LoopPhaseFailed
 }

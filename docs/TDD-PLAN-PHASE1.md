@@ -1012,13 +1012,17 @@ and, per ADR-0005, gains:
   `spec.workspace.gitCredentialSecret` for go-git ref resolution (D15).
 
 **RBAC guidance — `pods/ephemeralcontainers` (I45, R16):** the operator does
-NOT need `pods/ephemeralcontainers`, and neither does the agent runner. Adding
-an ephemeral container (`kubectl debug`) to a coxswain component pod (agent,
-model-proxy, egress-proxy) runs the debug container OUTSIDE the KubeArmor fence
-and shares the pod's network namespace — so it is denied for those pods by the
+NOT need `pods/ephemeralcontainers`, and neither does the agent runner. In one
+kind run (KubeArmor v1.7.5, BPF-LSM, R16 I45) a `kubectl debug` busybox
+ephemeral container in a fenced pod ran `busybox true` unblocked. The cause
+was not established; that test ran the ephemeral container entrypoint, not a
+child exec, so it may reflect enforcement timing rather than a KubeArmor gap.
+Adding an ephemeral container (`kubectl debug`) to a coxswain component pod
+(agent, model-proxy, egress-proxy) is therefore denied for those pods by the
 `ValidatingAdmissionPolicy` + binding in
 `config/admission/validating_admission_policy.yaml` (wired into
-`config/default`/`config/dev`). Cluster admins may still grant it elsewhere.
+`config/default`/`config/dev`), as defence in depth. Cluster admins may still
+grant it elsewhere.
 Loop-namespace Roles should NOT include `pods/ephemeralcontainers` for any
 non-admin principal.
 

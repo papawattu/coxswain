@@ -391,7 +391,6 @@ log operator "coxswain-controller-manager Ready (current main build $BUILD_TAG)"
 kc -n coxswain-system get deploy coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null | grep -q -- '--allow-unenforced-network' \
 	&& log operator "the applied controller args already carry --allow-unenforced-network (the install.yaml ships it) — LABELED: the D38 escape hatch (kindnet does not police pod->host egress; the KubeArmor BPF-LSM static-policy gate remains live)" \
 	|| { kc -n coxswain-system patch deploy coxswain-controller-manager --type json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--allow-unenforced-network"}]' >"$EVIDENCE/operator-allow-unenforced.log" 2>&1 \
-		kc -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s >>"$EVIDENCE/operator-allow-unenforced.log" 2>&1 \
 		|| die "could not add --allow-unenforced-network (see $EVIDENCE/operator-allow-unenforced.log)"
 		log operator "patched --allow-unenforced-network ONLY — LABELED: the D38 escape hatch (the KubeArmor BPF-LSM static-policy gate remains live and is what the main Loop proves)"
 		kc -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s >"$EVIDENCE/operator-rollout-2.log" 2>&1 || die "controller not Ready after the escape hatch (see $EVIDENCE/operator-rollout-2.log)"; }

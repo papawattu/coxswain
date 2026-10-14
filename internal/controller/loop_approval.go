@@ -132,6 +132,24 @@ func rejectedPlanReason(loop *coxv1alpha1.Loop) string {
 	return ""
 }
 
+// setLastRejectionReason makes the rejection reason DURABLE on the Loop's
+// status (status.approval.lastRejectionReason) so it survives the PlanRejected
+// condition clear. The Replan branch calls it BEFORE clearCondition (the
+// condition is cleared on the same reconcile, before the phase-init reads the
+// Loop — the kind finding the R1 review called a P1). The phase-init's
+// planApprovalFiles reads this field to write .coxswain/plan-feedback (the
+// runner's planning-prompt read channel). An empty reason is a no-op (nothing
+// to make durable). The operator is the sole writer (ADR-0004).
+func setLastRejectionReason(loop *coxv1alpha1.Loop, reason string) {
+	if reason == "" {
+		return
+	}
+	if loop.Status.Approval == nil {
+		loop.Status.Approval = &coxv1alpha1.ApprovalStatus{}
+	}
+	loop.Status.Approval.LastRejectionReason = reason
+}
+
 // planApprovalFiles returns the (planHash, planFeedback) the phase-init
 // container should write to the workspace for THIS phase run. Both are ""
 // when there is nothing to write (the phase-init script then REMOVES the
@@ -156,7 +174,17 @@ func (r *LoopReconciler) planApprovalFiles(loop *coxv1alpha1.Loop) (string, stri
 	if loop.Status.DesiredPhase != coxv1alpha1.LoopPhasePlanning {
 		return "", ""
 	}
-	return approvedPlanHash(loop), rejectedPlanReason(loop)
+	// The DURABLE reason (status.approval.lastRejectionReason, set by the
+	// Replan branch) wins: it survives the PlanRejected clear, so the
+	// phase-init writes it into the next planning prompt (the B3 Replan
+	// requirement — the reason feeds the next plan, even though the condition
+	// was cleared on the same reconcile). The condition is the fallback (the
+	// Fail action keeps the condition; a rejection not yet Replan'd).
+	reason := rejectedPlanReason(loop)
+	if loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
+		reason = loop.Status.Approval.LastRejectionReason
+	}
+	return approvedPlanHash(loop), reason
 }
 
 // applyApprovalGate runs the B3 approval decision on the Loop (level-based,
@@ -210,12 +238,18 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 					"Rejected", rejectedPlanReason(loop))
 				changed = true
 			default: // Replan
-				// Re-plan: clear the condition (the re-plan starts fresh — the
-				// user can reject again on the new plan). The phase STAYS at
-				// AwaitingApproval (the hold is still in force; the runner's
-				// next Planning claim, once the user re-approves, advances to
-				// Implementing). The phase-init writes the reason to the
-				// workspace for the re-plan (the plan-feedback file).
+				// Re-plan: make the reason DURABLE (status.approval.
+				// lastRejectionReason) BEFORE clearing the condition. The
+				// condition is cleared on this same reconcile (the re-plan starts
+				// fresh — the user can reject again on the new plan), so the
+				// condition alone would not survive to the phase-init (which reads
+				// the Loop AFTER this reconcile). The durable status field does,
+				// and planApprovalFiles reads it to write .coxswain/plan-feedback
+				// (the runner's planning-prompt read channel) on the next
+				// Planning sandbox run. The phase STAYS at AwaitingApproval (the
+				// hold is still in force; the runner's next Planning claim, once
+				// the user re-approves, advances to Implementing).
+				setLastRejectionReason(loop, rejectedPlanReason(loop))
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 				changed = true
 			}
@@ -252,6 +286,7 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 		// (the re-plan is in flight; the runner's next Planning claim, once
 		// the user re-approves, advances to Implementing).
 		if planRejected {
+			setLastRejectionReason(loop, rejectedPlanReason(loop))
 			clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 			changed = true
 		}
@@ -269,11 +304,14 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
 				changed = true
 			default: // Replan
-				// Re-plan: clear the condition (the re-plan starts fresh). The
-				// phase STAYS at Implementing (the runner's next Planning claim,
-				// once the user re-approves, advances to AwaitingApproval ->
-				// Implementing). The phase-init writes the reason to the
-				// workspace for the re-plan (the plan-feedback file).
+				// Re-plan: make the reason DURABLE (status.approval.
+				// lastRejectionReason) before clearing the condition (the same
+				// AwaitingApproval rationale — the condition is cleared on this
+				// reconcile, so the durable field carries the reason to the
+				// phase-init on the next Planning run). The phase STAYS at
+				// Implementing (the runner's next Planning claim, once the user
+				// re-approves, advances to AwaitingApproval -> Implementing).
+				setLastRejectionReason(loop, rejectedPlanReason(loop))
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 				changed = true
 			}

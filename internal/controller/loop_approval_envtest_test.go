@@ -311,4 +311,83 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
 			"Manual mode, Fail: a PlanRejected condition fails the Loop (terminal)")
 	})
+
+	// B3 (R1 review P1): the FULL Replan sequence — AwaitingApproval ->
+	// PlanRejected (Replan) -> reconcile -> the operator makes the reason
+	// DURABLE (status.approval.lastRejectionReason) AND clears the PlanRejected
+	// condition on the same reconcile -> the phase-init script (run on the next
+	// Planning sandbox) writes the reason to .coxswain/plan-feedback from the
+	// DURABLE field (the condition is already cleared — the durable field is
+	// what survives to the phase-init). This is the handoff the kind finding
+	// proved was broken (the condition did not survive the clear); it FAILS
+	// against the pre-fix code (dc0ee8c: planApprovalFiles read the transient
+	// condition, which the Replan branch had cleared).
+	It("Manual mode, onReject=Replan: the rejection reason is DURABLE (status.approval.lastRejectionReason) and the phase-init script writes it to plan-feedback even after the PlanRejected condition is cleared (the full AwaitingApproval -> Replan -> phase-init sequence)", func() {
+		ns := "b3-replan-durable-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		const reason = "Rejected: the plan misses the edge case: it does not handle empty input"
+		// A Manual-mode Loop at AwaitingApproval (the hold kept it there after
+		// Planning). The user rejects the plan (the PlanRejected condition is
+		// set). onReject=Replan.
+		_, r := makeLoop(ns, "b3-replan-durable", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "b3-replan-durable", Namespace: ns}, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		setCondition(ns, "b3-replan-durable", coxv1alpha1.PlanRejectedCondition, "True", reason)
+
+		// The gate's applyApprovalGate sees PlanRejected True at AwaitingApproval
+		// + onReject=Replan: it sets the DURABLE status.approval.
+		// lastRejectionReason AND clears the PlanRejected condition on the SAME
+		// reconcile. The phase STAYS at AwaitingApproval (the hold is still in
+		// force; the re-plan is triggered by the next Planning claim).
+		reconcileLoop(r, ns, "b3-replan-durable")
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "b3-replan-durable", Namespace: ns}, loop)).To(Succeed())
+		// The DURABLE field now carries the reason (the operator made it durable
+		// before clearing the condition).
+		Expect(loop.Status.Approval).ToNot(BeNil(),
+			"the operator set status.approval (the durable rejection record)")
+		Expect(loop.Status.Approval.LastRejectionReason).To(Equal(reason),
+			"the rejection reason is DURABLE on status.approval.lastRejectionReason")
+		// The PlanRejected condition is CLEARED (the re-plan starts fresh).
+		hasRejected := false
+		for _, c := range loop.Status.Conditions {
+			if c.Type == coxv1alpha1.PlanRejectedCondition && c.Status == metav1.ConditionTrue {
+				hasRejected = true
+			}
+		}
+		Expect(hasRejected).To(BeFalse(), "the PlanRejected condition is cleared (the re-plan starts fresh)")
+
+		// Now the phase-init script (the operator's sole writer of
+		// .coxswain/plan-feedback) runs on the next Planning sandbox. It reads
+		// the DURABLE field (the condition is already cleared) and writes the
+		// reason to the file. The phase is now Planning (the re-plan).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "b3-replan-durable", Namespace: ns}, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// The phase-init's decision (planApprovalFiles) reads the DURABLE field
+		// (the condition is cleared — the durable field is what survives).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "b3-replan-durable", Namespace: ns}, loop)).To(Succeed())
+		planHash, planFeedback := r.planApprovalFiles(loop)
+		Expect(planFeedback).To(Equal(reason),
+			"the phase-init writes the DURABLE reason to plan-feedback (the condition was cleared on the prior reconcile)")
+		// The phase-init script carries the reason (shell-quoted, written to the
+		// file) and references the feedback file.
+		script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, planHash, planFeedback)
+		Expect(script).To(ContainSubstring(coxPlanFeedbackFile),
+			"the phase-init script references the plan-feedback file")
+		Expect(script).To(ContainSubstring("the plan misses the edge case"),
+			"the phase-init script carries the rejection reason")
+		Expect(script).NotTo(ContainSubstring("rm -f \"${DEST}/.coxswain/"+coxPlanFeedbackFile+"\""),
+			"the phase-init WRITES (not removes) the plan-feedback file on a Replan re-plan")
+	})
 })

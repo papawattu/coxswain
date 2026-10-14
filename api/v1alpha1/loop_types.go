@@ -845,6 +845,36 @@ type LoopStatus struct {
 	// gate reads it. Written only when the operator has actually read a claim;
 	// nil before the first claim. +optional
 	Progress *ProgressStatus `json:"progress,omitempty"`
+
+	// approval is the operator's record of the plan-approval state (B3,
+	// PLAN-BETA / PLAN.md Phase 4). lastRejectionReason is the most recent
+	// rejection reason the user set (via `cox reject --reason`), DURABLE across
+	// the Replan transition: the PlanRejected condition is CLEARED on the
+	// same reconcile the operator re-enters Planning (the re-plan starts
+	// fresh), but the phase-init container (the operator's sole writer of the
+	// .coxswain/plan-feedback file) must still carry the reason into the next
+	// planning prompt. Writing the reason to the durable status field (not the
+	// transient condition) is what makes the handoff survive the clear. Set by
+	// the operator's Replan branch; the phase-init reads it. The runner never
+	// writes it (ADR-0004: the operator is the sole writer of status). +optional
+	Approval *ApprovalStatus `json:"approval,omitempty"`
+}
+
+// ApprovalStatus is the operator's record of the plan-approval state (B3,
+// PLAN-BETA / PLAN.md Phase 4). It is written only by the operator (ADR-0004);
+// the user's approval/rejection is on the status CONDITIONS (PlanApproved /
+// PlanRejected), and this struct is the operator's DURABLE copy of the
+// rejection reason that survives the Replan clear.
+type ApprovalStatus struct {
+	// lastRejectionReason is the most recent rejection reason the user set
+	// (the PlanRejected condition's message, "Rejected: <reason>"). It is
+	// DURABLE: set by the operator's Replan branch on the reconcile that
+	// re-enters Planning, and read by the phase-init container to write
+	// .coxswain/plan-feedback (the runner's planning-prompt read channel). The
+	// PlanRejected condition is cleared on the same reconcile (the re-plan
+	// starts fresh), so the condition alone would not survive to the
+	// phase-init — this field does. Empty before the first rejection. +optional
+	LastRejectionReason string `json:"lastRejectionReason,omitempty"`
 }
 
 // ProgressStatus is the operator's structured progress record (R19 OS1). The

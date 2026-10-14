@@ -26,10 +26,30 @@ import (
 
 const b3ReplanReason = "the plan misses the edge case: it does not handle empty input"
 
-// loopWithRejectedCondition builds a Manual-mode Loop at Planning with a
-// PlanRejected condition (message "Rejected: <reason>") — the state the
-// operator's planApprovalFiles reads when it decides what the phase-init
-// container should write.
+// b3LoopWithDurableRejection builds a Manual-mode Loop at Planning with the
+// rejection reason on the DURABLE status field (status.approval.
+// lastRejectionReason) — the state after the operator's Replan branch has
+// run (the PlanRejected condition is CLEARED, the reason is on the durable
+// field). This is what planApprovalFiles reads to write .coxswain/plan-feedback
+// (the B3 Replan requirement: the reason feeds the next plan even though the
+// condition was cleared on the same reconcile).
+func b3LoopWithDurableRejection(reason string) *coxv1alpha1.Loop {
+	return &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "b3", Namespace: "b3"},
+		Spec:       coxv1alpha1.LoopSpec{Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual, OnReject: coxv1alpha1.OnRejectReplan}},
+		Status: coxv1alpha1.LoopStatus{
+			DesiredPhase: coxv1alpha1.LoopPhasePlanning,
+			Approval:     &coxv1alpha1.ApprovalStatus{LastRejectionReason: "Rejected: " + reason},
+		},
+	}
+}
+
+// b3LoopWithRejectedCondition builds a Manual-mode Loop at Planning with a
+// PlanRejected condition (message "Rejected: <reason>") and NO durable field —
+// the state BEFORE the operator's Replan branch runs (the condition is still
+// present, the reason not yet made durable). The fallback path of
+// planApprovalFiles (a rejection not yet Replan'd, or the Fail action where the
+// condition persists).
 func b3LoopWithRejectedCondition(reason string) *coxv1alpha1.Loop {
 	return &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: "b3", Namespace: "b3"},
@@ -48,14 +68,31 @@ func b3LoopWithRejectedCondition(reason string) *coxv1alpha1.Loop {
 
 // On Replan, the operator's phase-init container writes the rejection reason
 // to .coxswain/plan-feedback (the runner reads it into the planning prompt).
+// The reason is read from the DURABLE status.approval.lastRejectionReason (the
+// B3 Replan requirement — it survives the PlanRejected clear).
 func TestPhaseInitScriptWritesRejectionReason(t *testing.T) {
 	r := &LoopReconciler{}
-	loop := b3LoopWithRejectedCondition(b3ReplanReason)
+	loop := b3LoopWithDurableRejection(b3ReplanReason)
 	planHash, planFeedback := r.planApprovalFiles(loop)
 	// The operator's decision: the feedback file carries the full rejection
-	// message (the reason the user set via cox reject --reason).
+	// message (the reason the user set via cox reject --reason), read from the
+	// DURABLE field (the condition is cleared by the Replan branch — the
+	// durable field is what survives to the phase-init).
 	if planFeedback != "Rejected: "+b3ReplanReason {
-		t.Fatalf("planApprovalFiles feedback = %q, want the rejection reason \"Rejected: %s\"", planFeedback, b3ReplanReason)
+		t.Fatalf("planApprovalFiles feedback = %q, want the rejection reason \"Rejected: %s\" (read from the durable status field)", planFeedback, b3ReplanReason)
+	}
+	// The durable field must win over the (cleared) condition. A loop with the
+	// condition present AND the durable field set reads the durable field.
+	loopWithBoth := b3LoopWithRejectedCondition(b3ReplanReason)
+	loopWithBoth.Status.Approval = &coxv1alpha1.ApprovalStatus{LastRejectionReason: "Rejected: "+b3ReplanReason}
+	if _, fb := r.planApprovalFiles(loopWithBoth); fb != "Rejected: "+b3ReplanReason {
+		t.Fatalf("planApprovalFiles with both condition + durable field = %q, want the durable value", fb)
+	}
+	// The fallback: a rejection NOT yet Replan'd (the condition present, the
+	// durable field absent) still reads the condition (the phase-init writes it
+	// before the Replan branch clears the condition + makes it durable).
+	if _, fb := r.planApprovalFiles(b3LoopWithRejectedCondition(b3ReplanReason)); fb != "Rejected: "+b3ReplanReason {
+		t.Fatalf("planApprovalFiles fallback (condition present, no durable field) = %q, want the condition's reason", fb)
 	}
 	// The phase-init script (the phase-init container's sh -c body) writes the
 	// file with that content. The script is the execution seam — the operator

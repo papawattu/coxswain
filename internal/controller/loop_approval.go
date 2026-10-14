@@ -183,16 +183,20 @@ func clearLastRejectionReason(loop *coxv1alpha1.Loop) {
 //     next planning prompt. B3 sets it from the user's rejection reason
 //     (status.approval.lastRejectionReason, durable across the PlanRejected
 //     clear). B4 (PLAN-BETA / PLAN.md Phase 6 remainder) ALSO sets it from
-//     the verify-failure summary (status.verify.lastFailureSummary, durable
-//     across the re-plan): when onVerifyFail is Plan, a failed verify sends
-//     the Loop back to Planning with the failure summary fed into the next
-//     planning prompt, reusing the SAME plan-feedback channel B3 uses (no
-//     second channel). The verify-failure summary takes PRECEDENCE over the
-//     rejection reason (a re-plan after a failed verify is the freshest
-//     feedback; the rejection reason from a prior plan cycle is stale by
-//     definition — the user rejected the prior plan, not the new one). When
-//     both are empty, the file is removed (no stale feedback leaks into the
-//     next plan).
+//     the verify-failure summary (status.verify.lastFailureSummary, set on a
+//     failed verify and cleared when the re-plan is consumed: the plan is
+//     approved, the plan is rejected, or the verify passes). When onVerifyFail
+//     is Plan, a failed verify sends the Loop back to Planning with the
+//     failure summary fed into the next planning prompt, reusing the SAME
+//     plan-feedback channel B3 uses (no second channel). The verify-failure
+//     summary takes PRECEDENCE over the rejection reason when both are set
+//     (a re-plan after a failed verify is the freshest feedback; the
+//     rejection reason from a prior plan cycle is stale by definition — the
+//     user rejected the prior plan, not the new one). The summary is cleared
+//     when the rejection reason is set (the rejection takes over) or when
+//     the plan is approved (the re-plan is consumed), so a stale summary
+//     never leaks into a later planning prompt. When both are empty, the
+//     file is removed (no stale feedback leaks into the next plan).
 //
 // Both are written ONLY when the phase is Planning (the only phase the
 // runner reads them in) — the other phases write "" (the phase-init script
@@ -288,6 +292,10 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				// re-approves, advances to Implementing). The operator is the sole
 				// writer of status (ADR-0004).
 				setLastRejectionReason(loop, rejectedPlanReason(loop))
+				// B4: clear the failure summary (the rejection reason takes over
+				// as the planning feedback — a stale verify-failure summary must
+				// not leak into the next planning prompt after a rejection).
+				clearLastFailureSummary(loop)
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
@@ -303,6 +311,10 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 			// not read a stale reason from the prior rejection). The operator is
 			// the sole writer of status (ADR-0004).
 			clearLastRejectionReason(loop)
+			// B4: clear the failure summary (the plan is approved — the re-plan
+			// is consumed; a stale verify-failure summary must not leak into a
+			// later planning prompt).
+			clearLastFailureSummary(loop)
 			loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
 			changed = true
@@ -333,6 +345,9 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 		// the user re-approves, advances to Implementing).
 		if planRejected {
 			setLastRejectionReason(loop, rejectedPlanReason(loop))
+			// B4: clear the failure summary (the rejection reason takes over
+			// as the planning feedback).
+			clearLastFailureSummary(loop)
 			clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 			changed = true
 		}
@@ -358,6 +373,9 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				// Implementing (the runner's next Planning claim, once the user
 				// re-approves, advances to AwaitingApproval -> Implementing).
 				setLastRejectionReason(loop, rejectedPlanReason(loop))
+				// B4: clear the failure summary (the rejection reason takes over
+				// as the planning feedback).
+				clearLastFailureSummary(loop)
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
 				changed = true
 			}

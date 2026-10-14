@@ -1125,6 +1125,9 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	}
 	switch outcome {
 	case verifySucceeded:
+		// B4: clear the failure summary (the last verify passed — the failure
+		// is resolved; the next planning prompt must not carry a stale summary).
+		clearLastFailureSummary(loop)
 		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		return true, false
@@ -1294,6 +1297,19 @@ const verifyReplanEventReason = "PhaseReplanned"
 // a cap — the model does not need the full log, just the tail that explains
 // the failure).
 const verifyFailureSummaryTailCap = 2048
+
+// clearLastFailureSummary clears the durable failure summary (B4). It is
+// called when the failure is resolved: the verify passes (the failure is
+// fixed), the plan is approved (the re-plan is consumed), or the plan is
+// rejected (the rejection reason takes over as the planning feedback). A
+// stale summary must not leak into a later planning prompt (the reviewer's
+// P1: after one failed verify, every later plan got the stale summary and a
+// later cox reject reason was ignored).
+func clearLastFailureSummary(loop *coxv1alpha1.Loop) {
+	if loop.Status.Verify != nil {
+		loop.Status.Verify.LastFailureSummary = ""
+	}
+}
 
 func verifyFailureSummary(pod *corev1.Pod, failedCheck string, checkExitCode int32) string {
 	s := fmt.Sprintf("verify check %s failed (exit %d)", failedCheck, checkExitCode)

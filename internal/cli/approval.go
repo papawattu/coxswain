@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/spf13/cobra"
@@ -65,10 +67,11 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	// message carries the hash (the operator parses it from the message; the
 	// condition's status is True, the reason is Approved).
 	cond := map[string]any{
-		"type":    planApprovedConditionType,
-		"status":  conditionStatusTrue,
-		"reason":  "Approved",
-		"message": "Approved: " + hash,
+		"type":               planApprovedConditionType,
+		"status":             conditionStatusTrue,
+		"reason":             "Approved",
+		"message":            "Approved: " + hash,
+		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
 	}
 	// Patch the status subresource (the condition is on the status, not the
 	// main resource). The dynamic client's Patch does not support subresources
@@ -169,14 +172,15 @@ func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer
 	// message carries the reason (the operator reads it from the message; the
 	// condition's status is True, the reason is Rejected).
 	cond := map[string]any{
-		"type":    planRejectedConditionType,
-		"status":  conditionStatusTrue,
-		"reason":  "Rejected",
-		"message": "Rejected: " + reason,
+		"type":               planRejectedConditionType,
+		"status":             conditionStatusTrue,
+		"reason":             "Rejected",
+		"message":            "Rejected: " + reason,
+		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
 	}
 	// Read the whole object, add the condition to status.conditions, and
-	// Update (the same path as approveLoop — the dynamic client's Patch does
-	// not support subresources, so the Update is the correct path).
+	// Update (the same path as approveLoop — the Update writes the status
+	// subresource, see client.go).
 	obj, err := dc.Loops.Get(ctx, name)
 	if err != nil {
 		return fmt.Errorf("get loop %q: %w", name, err)

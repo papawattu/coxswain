@@ -908,47 +908,56 @@ collect_evidence "$REPLAN_LOOP" step3
 #    not a silent fallback, D59).
 # ===========================================================================
 RESTORE_LOOP="b6-restore-$TS"
-log step4 "applying $RESTORE_LOOP (checkpoints: Required; approval.mode: Manual, maxIterations: 3 — the Loop is held at AwaitingApproval for the plan approval (iter 0) and after each verify; the script approves the plan, waits for the post-verify hold (checkpoint taken), approves again, deletes the PVC during iteration 2's Implementing, then approves once more after the restore. Deterministic: the Manual hold guarantees the Loop does not race to Succeeded)"
-render_loop "$RESTORE_LOOP" '  approval:
-    mode: Manual
-  checkpoints: Required
-  loop:
-    maxIterations: 3'
-# The first AwaitingApproval is the PLAN approval (iteration 0). Approve it
-# to start iteration 1's Implementing.
-wait_phase "$RESTORE_LOOP" AwaitingApproval 300 || die "step4: $RESTORE_LOOP did not reach AwaitingApproval for the plan approval (see $EVIDENCE/loop-$RESTORE_LOOP.yaml)"
-log step4 "the Loop is at AwaitingApproval (plan approval) — approving to start iteration 1"
-cox approve "$RESTORE_LOOP" >"$EVIDENCE/step4-approve-plan.txt" 2>&1 || die "step4: cox approve (plan) failed (see $EVIDENCE/step4-approve-plan.txt)"
-# Now wait for the NEXT AwaitingApproval (the first verify succeeded, a
-# checkpoint was taken, and the Loop is held at AwaitingApproval by Manual
-# mode). This is the deterministic hold: the Manual mode guarantees the Loop
-# does not race to Succeeded after the verify.
-wait_phase "$RESTORE_LOOP" AwaitingApproval 900 || die "step4: $RESTORE_LOOP did not reach AwaitingApproval after the first verify (checkpoints: Required — a missing checkpoint is a failure, D59; see $EVIDENCE/loop-$RESTORE_LOOP.yaml)"
+# The deterministic verify check: the first verify FAILS (but writes a marker
+# file to the workspace PVC); subsequent verifies PASS (the marker exists).
+# This forces the Loop to iterate at least twice (verify 1 fails, verify 2
+# passes, checkpoint taken after verify 2), giving a wide Implementing window
+# for the PVC delete (iteration 3's Implementing, after the checkpoint).
+# The workspace PVC persists across iterations, so the marker file written by
+# verify 1 is visible to verify 2 and beyond.
+log step4 "applying $RESTORE_LOOP (checkpoints: Required; the verify check fails on the first verify (marker written) and passes on subsequent verifies — deterministic: the Loop iterates at least twice, giving a wide Implementing window for the PVC delete after the checkpoint)"
+# Render the Loop with a custom verify check that fails on the first verify
+# (writes a marker file) and passes on subsequent verifies (the marker
+# exists). This forces the Loop to iterate at least twice, giving a wide
+# Implementing window for the PVC delete after the checkpoint. The marker
+# file is written to the workspace PVC, which persists across iterations.
+SAVE_VERIFY_CHECK="$VERIFY_CHECK"
+VERIFY_CHECK='test -f /workspace/.b6-verify-passed || { touch /workspace/.b6-verify-passed; exit 1; }'
+render_loop "$RESTORE_LOOP" '  checkpoints: Required'
+VERIFY_CHECK="$SAVE_VERIFY_CHECK"
+# Wait for the Loop to reach Implementing (after the first verify fails, the
+# Loop re-plans and goes back to Implementing for iteration 2; after the
+# second verify passes, a checkpoint is taken and the Loop goes to
+# Implementing for iteration 3). Watch for a checkpoint to exist, then for
+# Implementing of a LATER iteration (so the PVC delete lands after the
+# checkpoint).
+i=0
+while :; do
+	CK_NAMES=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null)
+	n_ck=$(echo "$CK_NAMES" | tr ' ' '\n' | grep -c .) || true
+	case "$n_ck" in ''|*[!0-9]*) n_ck=0 ;; esac
+	ph=$(phase_of "$RESTORE_LOOP")
+	[ $((i % 4)) -eq 0 ] && log step4 "t=${i}s phase=$ph checkpoints=$n_ck"
+	[ "$n_ck" -ge 1 ] && [ "$ph" = "Implementing" ] && break
+	case "$ph" in
+	Succeeded | Failed) die "step4: $RESTORE_LOOP reached $ph before a checkpoint+Implementing window (checkpoints=$n_ck; the verify check should have forced iteration 2 — re-run)" ;;
+	esac
+	i=$((i + PHASE_POLL)); [ "$i" -gt "$PHASE_CAP" ] && die "step4: no checkpoint+Implementing window in $PHASE_CAP s (last: $ph, checkpoints=$n_ck)"
+	sleep "$PHASE_POLL"
+done
 CK_LIST=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null)
-[ -n "$CK_LIST" ] || { collect_evidence "$RESTORE_LOOP" restore-nocheckpoint; die "step4: $RESTORE_LOOP is at AwaitingApproval but has no checkpoint (checkpoints: Required — the verify should have taken one; see $EVIDENCE/restore-nocheckpoint)"; }
-log step4 "a checkpoint exists ($CK_LIST); the Loop is held at AwaitingApproval (post-verify, Manual mode) — approving to start iteration 2, then deleting the PVC mid-Implementing"
-cox approve "$RESTORE_LOOP" >"$EVIDENCE/step4-approve.txt" 2>&1 || die "step4: cox approve failed (see $EVIDENCE/step4-approve.txt)"
-# Now the Loop is in Implementing for iteration 2. Delete the PVC after a
-# short delay (give the sandbox pod a moment to pick up the new Implementing
-# phase before the volume disappears).
-sleep 5
+log step4 "a checkpoint exists ($CK_LIST) and the Loop is in Implementing — deleting the workspace PVC NOW (B2: the restore must bring it back from the last checkpoint)"
 PVC_NAME="$RESTORE_LOOP-workspace"
 kc -n "$NS" delete pvc "$PVC_NAME" --wait=true --timeout=60s >"$EVIDENCE/step4-pvc-delete.log" 2>&1 || true
 # The operator's B2 path: the lost PVC is detected (the sandbox pod loses
 # its volume), the workspace PVC is recreated from the LAST checkpoint
-# (spec.dataSource = the VolumeSnapshot), and the Loop resumes. Watch for the
-# next AwaitingApproval (the Loop resumed from the checkpoint, completed the
-# work, verified, and is held at AwaitingApproval by Manual mode).
-log step4 "PVC deleted; watching for the restore + the next AwaitingApproval (Manual hold)"
-wait_phase "$RESTORE_LOOP" AwaitingApproval 900 || die "step4: $RESTORE_LOOP did not reach AwaitingApproval after the PVC delete (the restore did not bring it back)"
-log step4 "the Loop resumed from the checkpoint and is held at AwaitingApproval — approving to let it finish"
-cox approve "$RESTORE_LOOP" >"$EVIDENCE/step4-approve2.txt" 2>&1 || die "step4: cox approve (after restore) failed (see $EVIDENCE/step4-approve2.txt)"
-# Now wait for the terminal phase (Succeeded — maxIterations: 3, so the Loop
-# has at most one more iteration to complete).
-watch_loop "$RESTORE_LOOP" "$EVIDENCE/step4-phase.log" || die "step4: $RESTORE_LOOP wedged after the second approve (see $EVIDENCE/step4-phase.log)"
+# (spec.dataSource = the VolumeSnapshot), and the Loop resumes. Watch to the
+# terminal outcome.
+log step4 "PVC deleted; watching for the restore + terminal outcome"
+watch_loop "$RESTORE_LOOP" "$EVIDENCE/step4-phase.log" || die "step4: $RESTORE_LOOP wedged after the PVC delete (see $EVIDENCE/step4-phase.log — the restore did not bring it back)"
 RESTORE_PHASE=$(phase_of "$RESTORE_LOOP")
 [ "$RESTORE_PHASE" = "Succeeded" ] || { collect_evidence "$RESTORE_LOOP" restore-wedge; die "step4 FAILED: $RESTORE_LOOP ended $RESTORE_PHASE after the PVC delete (not Succeeded) — see $EVIDENCE/restore-wedge"; }
-# # The Restore condition: the operator's own record that it restored from the
+# # # The Restore condition: the operator's own record that it restored from the
 # checkpoint (reason Restored).
 RESTORE_COND=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].message}' 2>/dev/null || echo "")
 log step4 "Restore condition: ${RESTORE_COND:-absent}"

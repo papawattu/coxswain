@@ -76,3 +76,15 @@ jobs:
       - name: Check Helm release status
         run: |
           make helm-status
+
+# ------------------------------------------------------------------------
+# B5a note (owner): this file is the kubebuilder helm/v2-alpha plugin's
+# GENERATED CI workflow (.github/workflows/test-chart.yml). The builder's
+# push token lacks the 'workflow' scope, so it is stored here for the
+# owner to move into .github/workflows/ (or to replace with an in-`make
+# lint` invocation of 'make chart-check' — the chart-check target in the
+# Makefile is the offline, cluster-free half of what this workflow does;
+# the kind deploy half needs a runner). See docs/proposals/release-
+# workflow-helm.patch for the related release.yml change (also an owner
+# push).
+# ------------------------------------------------------------------------

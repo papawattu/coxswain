@@ -375,7 +375,7 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 	// the same phase does not bump). The claim's observedPhase is the phase
 	// the runner reports having executed (the destination of this advance).
 	if claim != nil && claim.ObservedPhase != "" && claim.ObservedPhase != loop.Status.Phase {
-		loopIterationsTotal.WithLabelValues(string(claim.ObservedPhase)).Inc()
+		loopPhaseTransitionsTotal.WithLabelValues(string(claim.ObservedPhase)).Inc()
 	}
 	// OS1: record the claim into status.progress. The pins (observed
 	// generation / base commit) are the OPERATOR's, never the claim's (a

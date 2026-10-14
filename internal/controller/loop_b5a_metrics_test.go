@@ -4,7 +4,8 @@
 // /metrics), and that a metric bump at a real call site is observable.
 // Mutation: drop a registration must fail (the metric is missing from the
 // registry). The bump-site tests drive the REAL production call sites
-// (applyStallGate, applyUsageReading) and assert a delta.
+// (recordPhaseClaim, applyStallGate, applyUsageReading, bumpVerifyResult,
+// bumpLoopCompletion) and assert a delta.
 package controller
 
 import (
@@ -49,23 +50,74 @@ func readMetric(t *testing.T, name string) (float64, bool) {
 	return 0, false
 }
 
-// TestMetricsRegistered: all four B5a metrics are registered on the
-// process-wide registry (the one the manager serves at /metrics). A
-// CounterVec/GaugeVec only appears in the registry's Gather() output once it
-// has at least one label sample, so this test bumps each metric once with a
-// test-only label value to materialise it, then reads it back. Mutation: drop
-// a registration must fail (the metric is missing from the registry even
-// after a bump).
+// readMetricLabel reads the value of a named metric for a specific label
+// combination. Returns (value, found).
+func readMetricLabel(t *testing.T, name string, labels map[string]string) (float64, bool) {
+	t.Helper()
+	mfs, err := metrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			match := true
+			for _, lp := range m.GetLabel() {
+				if v, ok := labels[lp.GetName()]; ok && v != lp.GetValue() {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			// Check that all requested labels are present.
+			allPresent := true
+			for _, lp := range m.GetLabel() {
+				if _, ok := labels[lp.GetName()]; !ok {
+					allPresent = false
+					break
+				}
+			}
+			if !allPresent {
+				continue
+			}
+			if c := m.GetCounter(); c != nil {
+				return c.GetValue(), true
+			}
+			if g := m.GetGauge(); g != nil {
+				return g.GetValue(), true
+			}
+			return 0, true
+		}
+	}
+	return 0, false
+}
+
+// TestMetricsRegistered: all B5a metrics are registered on the process-wide
+// registry (the one the manager serves at /metrics). A CounterVec/GaugeVec
+// only appears in the registry's Gather() output once it has at least one
+// label sample, so this test bumps each metric once with a test-only label
+// value to materialise it, then reads it back. Mutation: drop a registration
+// must fail (the metric is missing from the registry even after a bump).
 func TestMetricsRegistered(t *testing.T) {
 	// Materialise each metric (a labelled metric is absent from Gather() until
 	// it has a label sample; the manager's /metrics endpoint serves the same
 	// registry, so this matches what the endpoint exposes).
-	loopIterationsTotal.WithLabelValues("__test__").Inc()
+	loopPhaseTransitionsTotal.WithLabelValues("__test__").Inc()
+	loopIterationsTotal.Inc()
+	verifyResultsTotal.WithLabelValues("__test__").Inc()
+	loopsCompletedTotal.WithLabelValues("__test__", "__test__").Inc()
 	loopStallsTotal.Inc()
 	loopTokensTotal.WithLabelValues("__test__").Inc()
 	loopsActive.WithLabelValues("__test__").Set(1)
 	for _, name := range []string{
+		"coxswain_loop_phase_transitions_total",
 		"coxswain_loop_iterations_total",
+		"coxswain_verify_results_total",
+		"coxswain_loops_completed_total",
 		"coxswain_loop_stalls_total",
 		"coxswain_loop_tokens_total",
 		"coxswain_loops_active",
@@ -76,14 +128,59 @@ func TestMetricsRegistered(t *testing.T) {
 	}
 }
 
+// TestMetricsPhaseTransitionBumpedOnNewPhase: recordPhaseClaim bumps
+// coxswain_loop_phase_transitions_total when the claim names a phase different
+// from the Loop's current phase (a new-phase transition). A re-claim of the
+// same phase does not bump. Mutation: drop the bump in recordPhaseClaim must
+// fail (the counter stays at its baseline).
+func TestMetricsPhaseTransitionBumpedOnNewPhase(t *testing.T) {
+	// Reset the metric to a known baseline.
+	loopPhaseTransitionsTotal.Reset()
+	_, _ = readMetric(t, "coxswain_loop_phase_transitions_total") // re-materialise
+
+	r := &LoopReconciler{Recorder: record.NewFakeRecorder(64)}
+	now := metav1.Now()
+
+	// A Loop currently in Planning. A claim reporting it just executed
+	// Implementing (a new phase) should bump the metric once.
+	l := &coxv1alpha1.Loop{}
+	l.Name = "lp"
+	l.Namespace = "ns"
+	l.Status.Phase = coxv1alpha1.LoopPhasePlanning
+	claim := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 1}
+	_, _ = r.recordPhaseClaim(l, claim, now)
+
+	got, _ := readMetric(t, "coxswain_loop_phase_transitions_total")
+	if got != 1 {
+		t.Fatalf("coxswain_loop_phase_transitions_total = %v after a new-phase transition (Planning -> Implementing), want 1", got)
+	}
+
+	// A re-claim of the SAME phase (Implementing again) does not bump.
+	l.Status.Phase = coxv1alpha1.LoopPhaseImplementing
+	claim2 := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 2}
+	_, _ = r.recordPhaseClaim(l, claim2, now)
+
+	got2, _ := readMetric(t, "coxswain_loop_phase_transitions_total")
+	if got2 != 1 {
+		t.Fatalf("coxswain_loop_phase_transitions_total = %v after a re-claim of the same phase, want 1 (no bump)", got2)
+	}
+}
+
 // TestMetricsStallFires: applyStallGate firing (a new Job at k=N) bumps
 // coxswain_loop_stalls_total exactly once. A non-fire (k < N) bumps nothing.
+// Also checks that the terminal stall-fire transition bumps
+// coxswain_loops_completed_total{result=failed,reason=stalled}.
 // Mutation: drop the bump must fail.
 func TestMetricsStallFires(t *testing.T) {
 	before, ok := readMetric(t, "coxswain_loop_stalls_total")
 	if !ok {
 		t.Fatalf("coxswain_loop_stalls_total is not registered")
 	}
+	// Reset the completion metric to a known baseline.
+	loopsCompletedTotal.Reset()
+	_, _ = readMetricLabel(t, "coxswain_loops_completed_total",
+		map[string]string{"result": "failed", "reason": "stalled"}) // re-materialise
+
 	_, h := normalizeCheckOutput(p2eStallSeamOutput)
 	r := &LoopReconciler{readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
 	terminatedState := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
@@ -120,6 +217,16 @@ func TestMetricsStallFires(t *testing.T) {
 	after, _ := readMetric(t, "coxswain_loop_stalls_total")
 	if after != before+1 {
 		t.Fatalf("coxswain_loop_stalls_total = %v after a fire, want %v (before+1)", after, before+1)
+	}
+	// Check the loopsCompletedTotal bump for the stall-fire terminal
+	// transition.
+	completed, found := readMetricLabel(t, "coxswain_loops_completed_total",
+		map[string]string{"result": "failed", "reason": "stalled"})
+	if !found {
+		t.Fatalf("coxswain_loops_completed_total{result=failed,reason=stalled} not found after a stall fire")
+	}
+	if completed != 1 {
+		t.Fatalf("coxswain_loops_completed_total{result=failed,reason=stalled} = %v after a stall fire, want 1", completed)
 	}
 	// Non-fire case: k < N.
 	n2 := int32(3)
@@ -185,40 +292,75 @@ func TestMetricsTokenTotalBumpedOnFold(t *testing.T) {
 	}
 }
 
-// TestMetricsIterationBumpedOnNewPhase: recordPhaseClaim bumps
-// coxswain_loop_iterations_total when the claim names a phase different from
-// the Loop's current phase (a new-phase transition). A re-claim of the same
-// phase does not bump. Mutation: drop the bump in recordPhaseClaim must fail
-// (the counter stays at its baseline).
-func TestMetricsIterationBumpedOnNewPhase(t *testing.T) {
+// TestMetricsVerifyResults: bumpVerifyResult bumps coxswain_verify_results_total
+// for each outcome. Mutation: drop the bump must fail.
+func TestMetricsVerifyResults(t *testing.T) {
 	// Reset the metric to a known baseline.
-	loopIterationsTotal.Reset()
-	_, _ = readMetric(t, "coxswain_loop_iterations_total") // re-materialise
+	verifyResultsTotal.Reset()
 
-	r := &LoopReconciler{Recorder: record.NewFakeRecorder(64)}
-	now := metav1.Now()
-
-	// A Loop currently in Planning. A claim reporting it just executed
-	// Implementing (a new phase) should bump the metric once.
-	l := &coxv1alpha1.Loop{}
-	l.Name = "lp"
-	l.Namespace = "ns"
-	l.Status.Phase = coxv1alpha1.LoopPhasePlanning
-	claim := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 1}
-	_, _ = r.recordPhaseClaim(l, claim, now)
-
-	got, _ := readMetric(t, "coxswain_loop_iterations_total")
-	if got != 1 {
-		t.Fatalf("coxswain_loop_iterations_total = %v after a new-phase transition (Planning -> Implementing), want 1", got)
+	// Test each outcome.
+	bumpVerifyResult(verifySucceeded)
+	passCount, found := readMetricLabel(t, "coxswain_verify_results_total", map[string]string{"result": "pass"})
+	if !found || passCount != 1 {
+		t.Fatalf("coxswain_verify_results_total{result=pass} = %v (found=%v) after bumpVerifyResult(verifySucceeded), want 1", passCount, found)
 	}
 
-	// A re-claim of the SAME phase (Implementing again) does not bump.
-	l.Status.Phase = coxv1alpha1.LoopPhaseImplementing
-	claim2 := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 2}
-	_, _ = r.recordPhaseClaim(l, claim2, now)
+	bumpVerifyResult(verifyIterate)
+	failCount, found := readMetricLabel(t, "coxswain_verify_results_total", map[string]string{"result": "fail"})
+	if !found || failCount != 1 {
+		t.Fatalf("coxswain_verify_results_total{result=fail} = %v (found=%v) after bumpVerifyResult(verifyIterate), want 1", failCount, found)
+	}
 
-	got2, _ := readMetric(t, "coxswain_loop_iterations_total")
-	if got2 != 1 {
-		t.Fatalf("coxswain_loop_iterations_total = %v after a re-claim of the same phase, want 1 (no bump)", got2)
+	bumpVerifyResult(verifyInfraFailed)
+	infraCount, found := readMetricLabel(t, "coxswain_verify_results_total", map[string]string{"result": "infra"})
+	if !found || infraCount != 1 {
+		t.Fatalf("coxswain_verify_results_total{result=infra} = %v (found=%v) after bumpVerifyResult(verifyInfraFailed), want 1", infraCount, found)
+	}
+}
+
+// TestMetricsLoopsCompleted: bumpLoopCompletion bumps
+// coxswain_loops_completed_total and sets coxswain_loops_active to 0 for the
+// previous phase. Mutation: drop the bump must fail.
+func TestMetricsLoopsCompleted(t *testing.T) {
+	// Reset the metrics to a known baseline.
+	loopsCompletedTotal.Reset()
+	loopsActive.Reset()
+
+	// Test a succeeded completion.
+	bumpLoopCompletion("succeeded", "verify_passed")
+	succCount, found := readMetricLabel(t, "coxswain_loops_completed_total",
+		map[string]string{"result": "succeeded", "reason": "verify_passed"})
+	if !found || succCount != 1 {
+		t.Fatalf("coxswain_loops_completed_total{result=succeeded,reason=verify_passed} = %v (found=%v), want 1", succCount, found)
+	}
+	// Check the active gauge was set to 0 for Verifying.
+	activeVal, found := readMetricLabel(t, "coxswain_loops_active",
+		map[string]string{"phase": "Verifying"})
+	if !found || activeVal != 0 {
+		t.Fatalf("coxswain_loops_active{phase=Verifying} = %v (found=%v), want 0", activeVal, found)
+	}
+
+	// Test a failed completion.
+	bumpLoopCompletion("failed", "stalled")
+	failCount, found := readMetricLabel(t, "coxswain_loops_completed_total",
+		map[string]string{"result": "failed", "reason": "stalled"})
+	if !found || failCount != 1 {
+		t.Fatalf("coxswain_loops_completed_total{result=failed,reason=stalled} = %v (found=%v), want 1", failCount, found)
+	}
+}
+
+// TestMetricsIterationBumped: bumpIteration bumps coxswain_loop_iterations_total.
+// Mutation: drop the bump must fail.
+func TestMetricsIterationBumped(t *testing.T) {
+	// Read the baseline (a plain Counter has no Reset; we read the current
+	// value and assert the delta).
+	before, ok := readMetric(t, "coxswain_loop_iterations_total")
+	if !ok {
+		t.Fatalf("coxswain_loop_iterations_total is not registered")
+	}
+	bumpIteration()
+	after, _ := readMetric(t, "coxswain_loop_iterations_total")
+	if after != before+1 {
+		t.Fatalf("coxswain_loop_iterations_total = %v after bumpIteration(), want %v (before+1)", after, before+1)
 	}
 }

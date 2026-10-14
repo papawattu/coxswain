@@ -81,17 +81,43 @@ import (
 // there. We register them on metrics.Registry in init() below (the test
 // reads from metrics.Registry, matching the manager's served endpoint).
 var (
-	loopIterationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "coxswain_loop_iterations_total",
-		Help: "Total Loop phase transitions (iteration boundary crossings), by destination phase.",
+	// coxswain_loop_phase_transitions_total: bumped on every new-phase
+	// transition (the claim-driven advance in recordPhaseClaim + the
+	// bootstrap's first transition). This counts PHASE TRANSITIONS, not
+	// iterations (an iteration is a full cycle of the phase machine;
+	// status.iteration is the iteration counter).
+	loopPhaseTransitionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_loop_phase_transitions_total",
+		Help: "Total Loop phase transitions (new-phase advances), by destination phase.",
 	}, []string{"phase"})
+	// coxswain_loop_iterations_total: bumped when status.iteration
+	// increments (the iterate path in applyVerifyOutcome + the re-plan
+	// path). This is the "iterations per Loop" metric from PLAN-BETA B5.
+	loopIterationsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "coxswain_loop_iterations_total",
+		Help: "Total Loop iteration increments (status.iteration advances: the verify-iterate and re-plan paths).",
+	})
+	// coxswain_verify_results_total: bumped on every verify outcome decision
+	// (pass / fail / infra). This is the "verify pass rate" metric from
+	// PLAN-BETA B5 (pass rate = pass / (pass + fail), computed in PromQL).
+	verifyResultsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_verify_results_total",
+		Help: "Total verify outcomes, by result (pass|fail|infra).",
+	}, []string{"result"})
+	// coxswain_loops_completed_total: bumped once per Loop on the terminal
+	// transition (Succeeded or Failed). This enables "tokens per success"
+	// (tokens / completed{result="succeeded"}, computed in PromQL).
+	loopsCompletedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_loops_completed_total",
+		Help: "Total Loops that reached a terminal phase, by result (succeeded|failed) and reason.",
+	}, []string{"result", "reason"})
 	loopStallsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "coxswain_loop_stalls_total",
 		Help: "Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs).",
 	})
 	loopsActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "coxswain_loops_active",
-		Help: "Loops currently in a non-terminal phase, by phase.",
+		Help: "Loops currently in a non-terminal phase, by phase (idempotently set on every reconcile; 1 for active, 0 for terminal).",
 	}, []string{"phase"})
 	loopTokensTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "coxswain_loop_tokens_total",
@@ -100,7 +126,10 @@ var (
 )
 
 func init() {
+	metrics.Registry.MustRegister(loopPhaseTransitionsTotal)
 	metrics.Registry.MustRegister(loopIterationsTotal)
+	metrics.Registry.MustRegister(verifyResultsTotal)
+	metrics.Registry.MustRegister(loopsCompletedTotal)
 	metrics.Registry.MustRegister(loopStallsTotal)
 	metrics.Registry.MustRegister(loopsActive)
 	metrics.Registry.MustRegister(loopTokensTotal)
@@ -549,7 +578,7 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 		changed = true
 		// B5a: count the bootstrap's first transition (Pending -> Planning).
-		loopIterationsTotal.WithLabelValues(string(coxv1alpha1.LoopPhasePlanning)).Inc()
+		loopPhaseTransitionsTotal.WithLabelValues(string(coxv1alpha1.LoopPhasePlanning)).Inc()
 	}
 
 	// S4 review P1 (R17): the workspace must survive the per-phase pod
@@ -696,6 +725,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// once) rather than a silent disappearance. The CleaningUp work (the
 	// snapshot GC + the finalizer removal) still runs below, unchanged.
 	b2Deleting := !loop.DeletionTimestamp.IsZero()
+	// B5a: maintain the loops-active gauge idempotently.
+	maintainLoopsActiveGauge(loop, b2Deleting)
 	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
 	// on the first reconcile; idempotent). It is what keeps the Loop alive
 	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
@@ -5553,4 +5584,22 @@ func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommit
 		return ctrl.Result{RequeueAfter: budgetRequeue}
 	}
 	return ctrl.Result{}
+}
+
+// isTerminalPhase reports whether the given phase is a terminal phase
+// (Succeeded or Failed). Paused is NOT terminal (the Loop can be resumed).
+// Used by the loops-active gauge maintenance (B5a).
+func isTerminalPhase(phase coxv1alpha1.LoopPhase) bool {
+	return phase == coxv1alpha1.LoopPhaseSucceeded || phase == coxv1alpha1.LoopPhaseFailed
+}
+
+// B5a: maintainLoopsActiveGauge sets the loops-active gauge to 1 for the
+// Loop's current phase if it is non-terminal and the Loop is not being
+// deleted (idempotent: setting 1 again is a no-op). The terminal transitions
+// in applyVerifyOutcome and applyStallGate set the gauge to 0. On operator
+// restart the gauge is lost (in-memory) but the next reconcile restores it.
+func maintainLoopsActiveGauge(loop coxv1alpha1.Loop, deleting bool) {
+	if !deleting && !isTerminalPhase(loop.Status.Phase) {
+		loopsActive.WithLabelValues(string(loop.Status.Phase)).Set(1)
+	}
 }

@@ -1123,6 +1123,8 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		}
 		loop.Status.Verify.LastCheckResults = results
 	}
+	// B5a: bumpVerifyResult is called for every verify outcome decision.
+	bumpVerifyResult(outcome)
 	switch outcome {
 	case verifySucceeded:
 		// B4: clear the failure summary (the last verify passed — the failure
@@ -1130,6 +1132,9 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		clearLastFailureSummary(loop)
 		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
+		// B5a: terminal transition — bump the completion counter and clear the
+		// active gauge.
+		bumpLoopCompletion("succeeded", "verify_passed")
 		return true, false
 	case verifyInfraFailed:
 		// I65: the verify infrastructure failed (a trusted init died, or the
@@ -1194,9 +1199,16 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 					failedCheck, checkExitCode, loop.Status.Iteration, cap))
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+			// B5a: terminal transition — bump the completion counter and clear
+			// the active gauge.
+			bumpLoopCompletion("failed", "max_iterations")
 			return true, false
 		}
 		loop.Status.Iteration = nextIter
+		// B5a: count the iteration increment (the iterate and re-plan paths
+		// both increment status.iteration; this is the "iterations per Loop"
+		// metric from PLAN-BETA B5).
+		bumpIteration()
 		from := loop.Status.Phase // Verifying — the ACTUAL previous phase (OS5)
 		// Clear the current pin: the next run will produce a new headCommit and
 		// re-pin on the next advance (the fresh Job is created for THAT pin
@@ -1231,6 +1243,9 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// (Verifying -> Planning, never the stale phase a leftover claim
 			// would imply). The failing check + exit code ride in the message.
 			r.emitVerifyReplanEvent(loop, from, failedCheck, checkExitCode, nextIter)
+			// B5a: non-terminal transition — set the active gauge for the new
+			// phase (idempotent: setting 1 again is a no-op).
+			loopsActive.WithLabelValues(string(coxv1alpha1.LoopPhasePlanning)).Set(1)
 			return true, false
 		default: // OnVerifyFailImplement (the default)
 			// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
@@ -1243,6 +1258,9 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// (Verifying -> Implementing, never the stale phase a leftover claim
 			// would imply). The failing check + exit code ride in the message.
 			r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
+			// B5a: non-terminal transition — set the active gauge for the new
+			// phase (idempotent: setting 1 again is a no-op).
+			loopsActive.WithLabelValues(string(coxv1alpha1.LoopPhaseImplementing)).Set(1)
 			return true, false
 		}
 	case verifyTampered:
@@ -1254,10 +1272,44 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 				TamperedVerifyReason, "a protected path changed between baseCommit and verifiedCommit")
 			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+			// B5a: terminal transition — bump the completion counter and clear
+			// the active gauge.
+			bumpLoopCompletion("failed", "tampered")
 			return true, false
 		}
 	}
 	return false, false
+}
+
+// B5a: bumpVerifyResult bumps the verify-results metric for a verify outcome
+// decision. pass = verifySucceeded, fail = verifyIterate + verifyTampered,
+// infra = verifyInfraFailed. This is the numerator/denominator for the verify
+// pass rate (pass / (pass + fail), computed in PromQL).
+func bumpVerifyResult(outcome int) {
+	switch outcome {
+	case verifySucceeded:
+		verifyResultsTotal.WithLabelValues("pass").Inc()
+	case verifyIterate, verifyTampered:
+		verifyResultsTotal.WithLabelValues("fail").Inc()
+	case verifyInfraFailed:
+		verifyResultsTotal.WithLabelValues("infra").Inc()
+	}
+}
+
+// B5a: bumpLoopCompletion bumps the loops-completed counter and clears the
+// active gauge on a terminal phase transition. result is "succeeded" or
+// "failed"; reason is the specific reason (verify_passed, max_iterations,
+// stalled, tampered, verify_infra). prevPhase is the phase the Loop was in
+// before the terminal transition (typically Verifying).
+func bumpLoopCompletion(result, reason string) {
+	loopsCompletedTotal.WithLabelValues(result, reason).Inc()
+	loopsActive.WithLabelValues(string(coxv1alpha1.LoopPhaseVerifying)).Set(0)
+}
+
+// B5a: bumpIteration bumps the loop-iterations counter on an iteration
+// increment (the iterate and re-plan paths in applyVerifyOutcome).
+func bumpIteration() {
+	loopIterationsTotal.Inc()
 }
 
 // emitVerifyReplanEvent (OS5, B4) emits the distinct Event for a verify
@@ -1520,6 +1572,9 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 			fmt.Sprintf("verify infrastructure failed after %d attempts (%s)", attempt, msg))
 		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		// B5a: terminal transition — bump the completion counter and clear the
+		// active gauge.
+		bumpLoopCompletion("failed", "verify_infra")
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, verifyInfraFinalEventReason,
 				"verify infrastructure failed after %d attempts: %s", attempt, msg)

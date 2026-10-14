@@ -271,17 +271,62 @@ log snapshot "external-snapshotter controller Ready (kube-system)"
 # csi-hostpathplugin in default + its RBAC. The operator's workspace PVC uses
 # the cluster's DEFAULT StorageClass, so this run creates the hostpath
 # StorageClass as default (nil storageClassName on the PVC => the default SC).
-log snapshot "installing the upstream csi-driver-host-path (plugin StatefulSet in default)"
-curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-host-path/master/deploy/kubernetes-1.34/hostpath/csi-hostpath-plugin.yaml" \
-	> "$EVIDENCE/csi-hostpath.yaml" || die "cannot fetch the csi-driver-host-path plugin manifest (the upstream layout changed: it is now deploy/kubernetes-<ver>/hostpath/csi-hostpath-plugin.yaml)"
-kc apply -f "$EVIDENCE/csi-hostpath.yaml" >"$EVIDENCE/csi-hostpath-apply.log" 2>&1 || { cat "$EVIDENCE/csi-hostpath-apply.log"; die "csi-hostpath apply failed"; }
+#
+# The install must apply EXACTLY what the upstream deploy.sh applies
+# (deploy/kubernetes-1.34/deploy.sh -> ../util/deploy-hostpath.sh, csi-driver-
+# host-path v1.18.0): the five sidecar RBAC manifests at the PINNED sidecar
+# versions (the sidecar ClusterRoles external-{provisioner,attacher,
+# snapshotter,resizer,snapshot-metadata,health-monitor}-runner that the
+# plugin manifest's ClusterRoleBindings bind to — WITHOUT them the sidecars
+# log 'persistentvolumeclaims is forbidden ... external-provisioner-runner not
+# found' and the PVC stays Pending), plus the hostpath/*.yaml manifests
+# (plugin + the CSIDriver object csi-hostpath-driverinfo.yaml — without the
+# CSIDriver the kubelet cannot mount the volume and the PVC never binds).
+# The B6 run's csi-hostpath-plugin.yaml-only install (the fe0f6dd 404 fix)
+# dropped both of those. Pinned, not master: a future upstream layout change
+# must not break this run silently.
+log snapshot "installing the upstream csi-driver-host-path v1.18.0 (the sidecar RBAC at the pinned sidecar versions + the plugin + the CSIDriver, exactly as the upstream deploy.sh does)"
+CSI_HOSTPATH_TAG="v1.18.0"
+CSI_HOSTPATH_BASE="https://raw.githubusercontent.com/kubernetes-csi/csi-driver-host-path/$CSI_HOSTPATH_TAG/deploy/kubernetes-1.34/hostpath"
+# The sidecar RBAC at the pinned sidecar versions (deploy-hostpath.sh's
+# rbac_version() reads the image tag from the plugin manifest and fetches that
+# version's rbac.yaml from each sidecar repo; the snapshotter RBAC moved to
+# csi-snapshotter/rbac-csi-snapshotter.yaml for snapshotter >= v6, which the
+# v8.6.0 pin is):
+SIDECAR_RBACS=(
+	"external-provisioner|v6.3.0|deploy/kubernetes/rbac.yaml"
+	"external-attacher|v4.12.0|deploy/kubernetes/rbac.yaml"
+	"external-snapshotter|v8.6.0|deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml"
+	"external-resizer|v2.2.1|deploy/kubernetes/rbac.yaml"
+	"external-health-monitor|v0.15.0|deploy/kubernetes/external-health-monitor-controller/rbac.yaml"
+)
+for entry in "${SIDECAR_RBACS[@]}"; do
+	IFS='|' read -r repo ver path <<<"$entry"
+	curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/$repo/$ver/$path" \
+		> "$EVIDENCE/csi-rbac-$repo-$ver.yaml" || die "cannot fetch the $repo $ver RBAC (the upstream layout changed; pin a working version — the sidecar ClusterRoles the plugin binds to)"
+done
+kc apply -f "$EVIDENCE/csi-rbac-external-provisioner-v6.3.0.yaml" \
+	-f "$EVIDENCE/csi-rbac-external-attacher-v4.12.0.yaml" \
+	-f "$EVIDENCE/csi-rbac-external-snapshotter-v8.6.0.yaml" \
+	-f "$EVIDENCE/csi-rbac-external-resizer-v2.2.1.yaml" \
+	-f "$EVIDENCE/csi-rbac-external-health-monitor-v0.15.0.yaml" \
+	>"$EVIDENCE/csi-sidecar-rbac-apply.log" 2>&1 || { cat "$EVIDENCE/csi-sidecar-rbac-apply.log"; die "the sidecar RBAC apply failed"; }
+kc get clusterrole external-provisioner-runner >/dev/null 2>&1 || die "the external-provisioner-runner ClusterRole is missing (the provisioner sidecar cannot list PVCs — the PVC would stay Pending)"
+log snapshot "the sidecar RBAC is in place (external-provisioner-runner present: $(kc get clusterrole external-provisioner-runner -o jsonpath='{.metadata.name}') + 4 more)"
+curl -fsSL "$CSI_HOSTPATH_BASE/csi-hostpath-plugin.yaml" \
+	> "$EVIDENCE/csi-hostpath.yaml" || die "cannot fetch the csi-driver-host-path $CSI_HOSTPATH_TAG plugin manifest ($CSI_HOSTPATH_BASE)"
+curl -fsSL "$CSI_HOSTPATH_BASE/csi-hostpath-driverinfo.yaml" \
+	> "$EVIDENCE/csi-hostpath-driverinfo.yaml" || die "cannot fetch the csi-driver-host-path $CSI_HOSTPATH_TAG CSIDriver manifest (the kubelet needs the CSIDriver object to mount the volumes)"
+kc apply -f "$EVIDENCE/csi-hostpath.yaml" -f "$EVIDENCE/csi-hostpath-driverinfo.yaml" >"$EVIDENCE/csi-hostpath-apply.log" 2>&1 || { cat "$EVIDENCE/csi-hostpath-apply.log"; die "csi-hostpath apply failed"; }
 i=0
 while :; do
 	ready=$(kc -n default get sts csi-hostpathplugin -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
 	[ "$ready" -ge 1 ] 2>/dev/null && { log snapshot "csi-hostpathplugin Ready"; break; }
-	i=$((i + 5)); [ "$i" -gt 180 ] && { kc -n default get pods -l app=csi-hostpathplugin >"$EVIDENCE/csi-hostpath-debug.txt"; die "csi-hostpathplugin not Ready after 180s (see $EVIDENCE/csi-hostpath-debug.txt)"; }
+	i=$((i + 5)); [ "$i" -gt 180 ] && { kc -n default get pods -l app=csi-hostpathplugin >"$EVIDENCE/csi-hostpath-debug.txt"; kc -n default logs sts/csi-hostpathplugin -c csi-provisioner --tail=30 >>"$EVIDENCE/csi-hostpath-debug.txt" 2>&1; die "csi-hostpathplugin not Ready after 180s (see $EVIDENCE/csi-hostpath-debug.txt)"; }
 	sleep 5
 done
+kc get csidriver hostpath.csi.k8s.io >/dev/null 2>&1 || die "the hostpath.csi.k8s.io CSIDriver object is missing (the kubelet cannot mount hostpath volumes; the workspace PVC would stay Pending)"
+log snapshot "the CSIDriver hostpath.csi.k8s.io is registered"
 # The hostpath StorageClass (default) + the VolumeSnapshotClass (the upstream
 # csi-hostpath-snapclass, driver hostpath.csi.k8s.io — the B1-B4 runs' recipe).
 # The plugin manifest does NOT ship a StorageClass (the operator needs the
@@ -305,10 +350,33 @@ driver: hostpath.csi.k8s.io
 deletionPolicy: Delete
 EOF
 kc apply -f "$EVIDENCE/hostpath-sc-snapclass.yaml" >/dev/null 2>&1 || { cat "$EVIDENCE/hostpath-sc-snapclass.yaml"; die "could not apply the hostpath StorageClass/VolumeSnapshotClass"; }
-kc get storageclass >"$EVIDENCE/storageclasses.txt"
-kc get volumesnapshotclass -o json >"$EVIDENCE/snapshotclasses.json"
+# kind (v1.34) ships the local-path 'standard' StorageClass with the
+# is-default-class annotation TOO: two default SCs makes the default
+# ambiguous for a PVC that does not name a storageClassName (the operator's
+# workspace PVC does not — it uses the cluster default), and the B6 run 3's
+# workspace PVC went Pending partly because 'standard' was still marked
+# default. Unmark every default annotation except hostpath's, and fail the
+# run if more than one default SC remains.
+kubectl --context "$CTX" get storageclass -o json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+unmarked = []
+for sc in d["items"]:
+    name = sc["metadata"]["name"]
+    ann = sc["metadata"].get("annotations", {})
+    if name != "hostpath" and ann.pop("storageclass.kubernetes.io/is-default-class", None) is not None:
+        unmarked.append(name)
+print("unmarked default annotation on: " + " ".join(unmarked) if unmarked else "no other SC carried the default annotation")
+' >"$EVIDENCE/storageclass-defaults.log" 2>&1
+# Re-apply hostpath WITH the default annotation so it is the only one left:
+kubectl --context "$CTX" apply -f "$EVIDENCE/hostpath-sc-snapclass.yaml" >/dev/null 2>&1
+N_DEFAULT=$(kubectl --context "$CTX" get storageclass --no-headers 2>/dev/null | grep -c "(default)" || echo 0)
+[ "$N_DEFAULT" -eq 1 ] || { kubectl --context "$CTX" get storageclass >"$EVIDENCE/storageclasses-two-defaults.txt"; die "more than one default StorageClass after the unmark ($N_DEFAULT — see $EVIDENCE/storageclasses-two-defaults.txt): the workspace PVC's default SC is ambiguous"; }
+kubectl --context "$CTX" get storageclass >"$EVIDENCE/storageclasses.txt"
+kubectl --context "$CTX" get volumesnapshotclass -o json >"$EVIDENCE/snapshotclasses.json"
 grep -q "hostpath" "$EVIDENCE/storageclasses.txt" || die "no hostpath StorageClass (see $EVIDENCE/storageclasses.txt)"
-log snapshot "snapshot-capable default StorageClass: $(grep hostpath "$EVIDENCE/storageclasses.txt" | awk '{print $1}'); VolumeSnapshotClass: hostpath-snapclass (driver hostpath.csi.k8s.io)"
+grep -q "(default)" "$EVIDENCE/storageclasses.txt" || die "no StorageClass is marked default (see $EVIDENCE/storageclasses.txt) — the workspace PVC would have no default SC"
+log snapshot "the default StorageClass is hostpath ($(cat "$EVIDENCE/storageclass-defaults.log" | tr "\n" " ")); VolumeSnapshotClass: hostpath-snapclass (driver hostpath.csi.k8s.io)"
 
 # Pre-load the images the run will pull: the verify/peek pod image and the
 # curl pod (the vLLM reachability probe + the metrics scrape — both run on

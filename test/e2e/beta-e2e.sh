@@ -900,16 +900,16 @@ kc -n "$NS" create rolebinding b6-metrics-reader-binding \
 	--serviceaccount="$NS:b6-metrics-sa" >"$EVIDENCE/step6-rb.log" 2>&1 || { cat "$EVIDENCE/step6-rb.log"; die "step6: could not bind coxswain-metrics-reader"; }
 kc -n "$NS" create token b6-metrics-sa --duration=1h >"$EVIDENCE/step6-token.txt" 2>&1 || die "step6: could not create the metrics-reader token"
 # D55/I84: the token is NEVER written to the evidence. It goes straight from
-# kubectl's output into a 600-mode temp file (outside the evidence dir) that
+# kubectl's output into a 600-mode temp file (OUTSIDE the evidence dir) that
 # kubectl reads via --from-file to build the scrape pod's Secret; the temp
-# file is deleted immediately. Only the token's presence (a non-empty line)
-# is recorded — never its value.
+# file and the kubectl output file are both deleted immediately. Only the
+# token's presence (a non-empty line) is recorded — never its value.
 [ -s "$EVIDENCE/step6-token.txt" ] || die "step6: the token file is empty"
 TOKEN_TMP="$(mktemp)"; chmod 600 "$TOKEN_TMP"
 cat "$EVIDENCE/step6-token.txt" >"$TOKEN_TMP"
 kc -n "$NS" create secret generic b6-metrics-secret --from-file=tok="$TOKEN_TMP" --dry-run=client -o yaml | kc apply -f - >/dev/null
 rm -f "$TOKEN_TMP" "$EVIDENCE/step6-token.txt"
-log step6 "token minted and loaded into the b6-metrics-secret Secret via --from-file (the token value is never written to the evidence; Secret type/keys: $(kc -n "$NS" get secret b6-metrics-secret -o jsonpath='{.type} {{range $k,$v := .data}}{{$k}} {{end}}'))"
+log step6 "token minted and loaded into the b6-metrics-secret Secret via --from-file (the token value is never written to the evidence; Secret: $(kc -n "$NS" get secret b6-metrics-secret -o jsonpath='{.type} keys={{range $k,$v := .data}}{{$k}} {{end}}'))"
 # The scrape pod curls the secure endpoint with the token (mounted from the
 # Secret) and streams the full /metrics body to stdout — the pod's log IS the
 # scrape (I84: the bytes are kept where the claim reads them).

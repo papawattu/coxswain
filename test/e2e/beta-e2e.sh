@@ -908,29 +908,16 @@ collect_evidence "$REPLAN_LOOP" step3
 #    not a silent fallback, D59).
 # ===========================================================================
 RESTORE_LOOP="b6-restore-$TS"
-# The deterministic verify check: the first verify FAILS (but writes a marker
-# file to the workspace PVC); subsequent verifies PASS (the marker exists).
-# This forces the Loop to iterate at least twice (verify 1 fails, verify 2
-# passes, checkpoint taken after verify 2), giving a wide Implementing window
-# for the PVC delete (iteration 3's Implementing, after the checkpoint).
-# The workspace PVC persists across iterations, so the marker file written by
-# verify 1 is visible to verify 2 and beyond.
-log step4 "applying $RESTORE_LOOP (checkpoints: Required; the verify check fails on the first verify (marker written) and passes on subsequent verifies — deterministic: the Loop iterates at least twice, giving a wide Implementing window for the PVC delete after the checkpoint)"
-# Render the Loop with a custom verify check that fails on the first verify
-# (writes a marker file) and passes on subsequent verifies (the marker
-# exists). This forces the Loop to iterate at least twice, giving a wide
-# Implementing window for the PVC delete after the checkpoint. The marker
-# file is written to the workspace PVC, which persists across iterations.
-SAVE_VERIFY_CHECK="$VERIFY_CHECK"
-VERIFY_CHECK='test -f /workspace/.b6-verify-passed || { touch /workspace/.b6-verify-passed; exit 1; }'
+# The verify check is the default (passes on the first verify). The
+# checkpoint+Implementing window is wide enough with a real model (each
+# Implementing phase takes several minutes). The script watches for a
+# checkpoint to exist, then for Implementing of a LATER iteration (so the
+# PVC delete lands after the checkpoint). The grep -c bug (fixed in 491b5a6)
+# no longer prevents the loop from breaking.
+log step4 "applying $RESTORE_LOOP (checkpoints: Required; the script watches for a checkpoint to exist, then for Implementing of a LATER iteration — the PVC delete lands after the checkpoint)"
 render_loop "$RESTORE_LOOP" '  checkpoints: Required'
-VERIFY_CHECK="$SAVE_VERIFY_CHECK"
-# Wait for the Loop to reach Implementing (after the first verify fails, the
-# Loop re-plans and goes back to Implementing for iteration 2; after the
-# second verify passes, a checkpoint is taken and the Loop goes to
-# Implementing for iteration 3). Watch for a checkpoint to exist, then for
-# Implementing of a LATER iteration (so the PVC delete lands after the
-# checkpoint).
+# Watch for a checkpoint to exist, then for Implementing of a LATER
+# iteration (so the PVC delete lands after the checkpoint).
 i=0
 while :; do
 	CK_NAMES=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null)

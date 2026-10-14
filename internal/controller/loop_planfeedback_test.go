@@ -84,7 +84,7 @@ func TestPhaseInitScriptWritesRejectionReason(t *testing.T) {
 	// The durable field must win over the (cleared) condition. A loop with the
 	// condition present AND the durable field set reads the durable field.
 	loopWithBoth := b3LoopWithRejectedCondition(b3ReplanReason)
-	loopWithBoth.Status.Approval = &coxv1alpha1.ApprovalStatus{LastRejectionReason: "Rejected: "+b3ReplanReason}
+	loopWithBoth.Status.Approval = &coxv1alpha1.ApprovalStatus{LastRejectionReason: "Rejected: " + b3ReplanReason}
 	if _, fb := r.planApprovalFiles(loopWithBoth); fb != "Rejected: "+b3ReplanReason {
 		t.Fatalf("planApprovalFiles with both condition + durable field = %q, want the durable value", fb)
 	}

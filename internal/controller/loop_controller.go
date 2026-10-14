@@ -411,7 +411,7 @@ type LoopReconciler struct {
 // type the first time the cached client reads it, so the marker needs
 // get;list;watch in addition to create;delete (a create-only marker wedges a
 // fresh install on the first cached read, exactly like the A6 configmaps P1).
-// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch;create;delete;patch
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
 // The checkpoint support check reads the workspace PVC's StorageClass (the
 // CSI driver) to find the matching VolumeSnapshotClass.

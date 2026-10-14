@@ -1045,6 +1045,13 @@ const (
 	// the next reconcile, once the sandbox is stopped, and recreates it from
 	// the snapshot (in-progress state, I49).
 	RestoreReasonStoppingSandbox = "StoppingSandbox"
+	// RestoreReasonStoppingWorkloads: the ROLLBACK restore is in progress —
+	// the Loop-owned verify and deliver Jobs are being deleted (the delete is
+	// async — the Job controller deletes the Pods; the PVC is held by
+	// kubernetes.io/pvc-protection while any Loop-owned pod mounts it; the
+	// sandbox is stopped once the Jobs are gone). NOT terminal (in-progress
+	// state, I49).
+	RestoreReasonStoppingWorkloads = "StoppingWorkloads"
 	// RestoreReasonDeletingPVC: the ROLLBACK restore is in progress — the
 	// sandbox is stopped and the workspace PVC delete has been issued (the
 	// delete is async; the PVC may still be present with a deletionTimestamp)

@@ -102,6 +102,7 @@ import (
 	"strings"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -445,6 +446,117 @@ func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loo
 	return nil
 }
 
+// stopWorkloadsForRestore deletes the Loop-owned verify and deliver Jobs
+// (the restore's new step 0, the reviewer's P1, the R-B2 review at 6833e2e:
+// the restore logic only waits for the SANDBOX pod (not the verify/deliver
+// Job pods). The verify pods mount the PVC and keep it protected
+// (kubernetes.io/pvc-protection). The restore must also delete or await
+// every Loop-owned pod mounting the PVC (verify and deliver Job pods), as a
+// level-based step with a visible reason).
+//
+// The verify and deliver Jobs use DIFFERENT label keys than the Loop label
+// (loopLabelKey): the verify Job uses verifyLoopLabel ("coxswain.io/loop"),
+// the deliver Job uses deliverForLabel ("coxswain.io/deliver-for"). The
+// method lists Jobs with BOTH label keys (the verify and deliver Jobs) and
+// deletes them (propagationPolicy=Background, so the Job controller deletes
+// the Pods once the Jobs are gone). The method then lists ALL Pods in the
+// namespace and reports whether any Loop-owned pod mounts the PVC (the pod
+// must carry one of the Loop's labels AND mount the PVC). "Stopped" = no
+// such pod (the Job controller has deleted the Pods).
+//
+// (The envtest has no Job controller, so the spec must manually delete the
+// Pods; the kind cluster has the Job controller, so the Pods are deleted
+// automatically once the Jobs are deleted.)
+//
+// (b2ApplyRestoreStep calls this before StoppingSandbox — the restore's
+// sequence is: StoppingWorkloads → StoppingSandbox → DeletingPVC →
+// Restored.)
+func (r *LoopReconciler) stopWorkloadsForRestore(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
+	// List the verify Jobs (the B1 label key: verifyLoopLabel).
+	verifyJobs := &batchv1.JobList{}
+	if err := r.List(ctx, verifyJobs,
+		client.InNamespace(loop.Namespace),
+		client.MatchingLabels{verifyLoopLabel: loop.Name},
+	); err != nil {
+		return false, fmt.Errorf("list the verify Jobs for the restore: %w", err)
+	}
+	// List the deliver Jobs (the B1 label key: deliverForLabel).
+	deliverJobs := &batchv1.JobList{}
+	if err := r.List(ctx, deliverJobs,
+		client.InNamespace(loop.Namespace),
+		client.MatchingLabels{deliverForLabel: loop.Name},
+	); err != nil {
+		return false, fmt.Errorf("list the deliver Jobs for the restore: %w", err)
+	}
+	// Delete the Jobs (propagationPolicy=Background, so the Job controller
+	// deletes the Pods once the Jobs are gone). The delete is idempotent
+	// (IsNotFound is tolerated).
+	for i := range verifyJobs.Items {
+		job := &verifyJobs.Items[i]
+		if job.DeletionTimestamp == nil {
+			propagation := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
+				return false, fmt.Errorf("delete the verify Job %s for the restore: %w", job.Name, err)
+			}
+		}
+	}
+	for i := range deliverJobs.Items {
+		job := &deliverJobs.Items[i]
+		if job.DeletionTimestamp == nil {
+			propagation := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
+				return false, fmt.Errorf("delete the deliver Job %s for the restore: %w", job.Name, err)
+			}
+		}
+	}
+	// List ALL Pods in the namespace and report whether any Loop-owned pod
+	// mounts the workspace PVC. "Loop-owned" = the pod carries one of the
+	// Loop's labels (loopLabelKey, verifyLoopLabel, or deliverForLabel).
+	// "Mounts the PVC" = the pod's spec.volumes includes a
+	// PersistentVolumeClaimVolumeSource with ClaimName = workspacePVCName(loop).
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(loop.Namespace)); err != nil {
+		return false, fmt.Errorf("list the pods for the restore: %w", err)
+	}
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.DeletionTimestamp != nil {
+			continue // the pod is being deleted (it will not mount the PVC once it is gone).
+		}
+		// Check if the pod is Loop-owned (it carries one of the Loop's labels).
+		loopOwned := false
+		if _, ok := pod.Labels[loopLabelKey]; ok && pod.Labels[loopLabelKey] == loop.Name {
+			loopOwned = true
+		}
+		if _, ok := pod.Labels[verifyLoopLabel]; ok && pod.Labels[verifyLoopLabel] == loop.Name {
+			loopOwned = true
+		}
+		if _, ok := pod.Labels[deliverForLabel]; ok && pod.Labels[deliverForLabel] == loop.Name {
+			loopOwned = true
+		}
+		if !loopOwned {
+			continue // the pod is not Loop-owned (it does not block the restore).
+		}
+		// Check if the pod mounts the workspace PVC.
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == workspacePVCName(loop.Name) {
+				// The pod is Loop-owned AND mounts the PVC. The restore is
+				// in progress (the PVC is protected while this pod is
+				// present).
+				log.FromContext(ctx).Info("Loop-owned pod still mounts the workspace PVC; the restore is in progress",
+					"pod", pod.Name, "pvc", workspacePVCName(loop.Name), "loop", loop.Name)
+				return false, nil
+			}
+		}
+	}
+	// No Loop-owned pod mounts the workspace PVC (the Job controller has
+	// deleted the Pods once the Jobs are deleted, or the spec manually
+	// deleted them). The restore can proceed.
+	log.FromContext(ctx).Info("No Loop-owned pod mounts the workspace PVC; the restore can proceed",
+		"pvc", workspacePVCName(loop.Name), "loop", loop.Name)
+	return true, nil
+}
+
 // setRestoreCondition sets the Restore condition (the B2 durable record)
 // with the condition's observedGeneration = the Loop's current generation
 // (the one-shot marker's re-arm check: a new spec.restoreFrom bumps the
@@ -599,6 +711,33 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				"workspace PVC restored from "+target.snapshot)
 			return true, false, false, nil
 		}
+		// Step 0: the Loop-owned verify and deliver Jobs must be STOPPED
+		// (the reviewer's P1, the R-B2 review at 6833e2e: the restore logic
+		// only waits for the SANDBOX pod (not the verify/deliver Job pods).
+		// The verify pods mount the PVC and keep it protected
+		// (kubernetes.io/pvc-protection). The restore must also delete or
+		// await every Loop-owned pod mounting the PVC (verify and deliver Job
+		// pods), as a level-based step with a visible reason).
+		// "Stopped" = no Loop-owned pod mounts the workspace PVC (the Job
+		// controller deletes the Pods once the Jobs are gone; the PVC is held
+		// by kubernetes.io/pvc-protection until no pod uses it, so the
+		// sandbox stop (below) may advance only once no Loop-owned pod
+		// mounts the PVC). A still-present pod reports StoppingWorkloads (the
+		// in-progress state — no PVC change yet, I49).
+		workloadsStopped, err := r.stopWorkloadsForRestore(ctx, loop)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "the restore could not stop the Loop-owned workloads; no decision on a transient read failure",
+				"loop", loop.Name)
+			return false, true, true, nil
+		}
+		if !workloadsStopped {
+			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the Loop-owned workloads are being stopped (step 0 of 4; the sandbox is stopped once no Loop-owned pod mounts the PVC)")
+			persist()
+			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+				"restoring the workspace PVC from "+target.snapshot+": the Loop-owned workloads are being stopped (step 0 of 4)")
+			return true, true, true, nil
+		}
 		// Step 1: the sandbox must be STOPPED (the A2 kill path's stop).
 		// "Stopped" = the sandbox POD is gone (the reviewer's design point
 		// (a), R-B2): spec.operatingMode == Suspended is a REQUEST and the
@@ -623,10 +762,10 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				return true, true, true, nil
 			}
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
-				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the sandbox is being stopped (step 1 of 3; the PVC is deleted once the sandbox pod is gone)")
+				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the sandbox is being stopped (step 1 of 4; the PVC is deleted once the sandbox pod is gone)")
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingSandbox,
-				"restoring the workspace PVC from "+target.snapshot+": the sandbox is being stopped (step 1 of 3)")
+				"restoring the workspace PVC from "+target.snapshot+": the sandbox is being stopped (step 1 of 4)")
 			return true, true, true, nil
 		}
 		// The sandbox is stopped. The PVC is present (checked above):
@@ -642,7 +781,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			return true, true, true, nil
 		}
 		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
-			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the PVC is deleted (step 2 of 3; the PVC is recreated from the snapshot once the delete completes)")
+			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the PVC is deleted (step 2 of 4; the PVC is recreated from the snapshot once the delete completes)")
 		persist()
 		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
 			"restoring the workspace PVC from "+target.snapshot+": the PVC is deleted (step 2 of 3)")

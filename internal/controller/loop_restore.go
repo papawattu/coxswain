@@ -514,15 +514,40 @@ func (r *LoopReconciler) stopWorkloadsForRestore(ctx context.Context, loop *coxv
 	// Loop's labels (loopLabelKey, verifyLoopLabel, or deliverForLabel).
 	// "Mounts the PVC" = the pod's spec.volumes includes a
 	// PersistentVolumeClaimVolumeSource with ClaimName = workspacePVCName(loop).
+	//
+	// The Pod list uses the APIReader (the non-cached client) because the
+	// manager's Pod cache is scoped to ProxyComponentSelector (cmd/main.go:
+	// the cache ByObject for corev1.Pod uses the proxy label selector), so a
+	// cached List would never see the verify/deliver pods (the reviewer's P2,
+	// the R-B2 review at e338d06: the Pod cache is limited to proxy pods, so
+	// in production the cached List never sees verify pods). The APIReader
+	// hits the API server directly, so the verify/deliver pods are always
+	// visible. A nil apiReader (a bare test reconciler without
+	// SetupWithManager) falls back to the cached client (the envtest has no
+	// cache scoping, so the cached List works in envtest).
+	//
+	// Pods with a deletionTimestamp are NOT skipped (the reviewer's P2, the
+	// R-B2 review at e338d06: a pod with a deletionTimestamp still mounts
+	// the PVC until it is gone — the kubernetes.io/pvc-protection finalizer
+	// holds the PVC until no pod uses it, so a pod being deleted still
+	// protects the PVC). The restore must wait until the pod is fully gone
+	// (not just terminating).
+	podReader := client.Reader(r.Client)
+	if r.apiReader != nil {
+		podReader = r.apiReader
+	}
 	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(loop.Namespace)); err != nil {
+	if err := podReader.List(ctx, podList, client.InNamespace(loop.Namespace)); err != nil {
 		return false, fmt.Errorf("list the pods for the restore: %w", err)
 	}
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.DeletionTimestamp != nil {
-			continue // the pod is being deleted (it will not mount the PVC once it is gone).
-		}
+		// DO NOT skip pods with a deletionTimestamp (the reviewer's P2, the
+		// R-B2 review at e338d06: a pod with a deletionTimestamp still mounts
+		// the PVC until it is gone — the kubernetes.io/pvc-protection
+		// finalizer holds the PVC until no pod uses it, so a pod being
+		// deleted still protects the PVC). The restore must wait until the
+		// pod is fully gone (not just terminating).
 		// Check if the pod is Loop-owned (it carries one of the Loop's labels).
 		loopOwned := false
 		if _, ok := pod.Labels[loopLabelKey]; ok && pod.Labels[loopLabelKey] == loop.Name {
@@ -542,7 +567,7 @@ func (r *LoopReconciler) stopWorkloadsForRestore(ctx context.Context, loop *coxv
 			if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == workspacePVCName(loop.Name) {
 				// The pod is Loop-owned AND mounts the PVC. The restore is
 				// in progress (the PVC is protected while this pod is
-				// present).
+				// present, even if the pod is being deleted).
 				log.FromContext(ctx).Info("Loop-owned pod still mounts the workspace PVC; the restore is in progress",
 					"pod", pod.Name, "pvc", workspacePVCName(loop.Name), "loop", loop.Name)
 				return false, nil

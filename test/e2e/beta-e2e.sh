@@ -373,7 +373,7 @@ while IFS= read -r sc; do
 done < "$EVIDENCE/storageclass-unmark-list.txt"
 # Re-apply hostpath WITH the default annotation so it is the only one left:
 kubectl --context "$CTX" apply -f "$EVIDENCE/hostpath-sc-snapclass.yaml" >/dev/null 2>&1
-N_DEFAULT=$(kubectl --context "$CTX" get storageclass --no-headers 2>/dev/null | grep -c "(default)" || echo 0)
+N_DEFAULT=$(kubectl --context "$CTX" get storageclass --no-headers 2>/dev/null | grep -c "(default)") || N_DEFAULT=0
 [ "$N_DEFAULT" -eq 1 ] || { kubectl --context "$CTX" get storageclass >"$EVIDENCE/storageclasses-two-defaults.txt"; die "more than one default StorageClass after the unmark ($N_DEFAULT — see $EVIDENCE/storageclasses-two-defaults.txt): the workspace PVC's default SC is ambiguous"; }
 kubectl --context "$CTX" get storageclass >"$EVIDENCE/storageclasses.txt"
 kubectl --context "$CTX" get volumesnapshotclass -o json >"$EVIDENCE/snapshotclasses.json"
@@ -918,7 +918,8 @@ render_loop "$RESTORE_LOOP" '  checkpoints: Required'
 i=0
 while :; do
 	CK_NAMES=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null)
-	n_ck=$(echo "$CK_NAMES" | tr ' ' '\n' | grep -c . || echo 0)
+	n_ck=$(echo "$CK_NAMES" | tr ' ' '\n' | grep -c .) || true
+	case "$n_ck" in ''|*[!0-9]*) n_ck=0 ;; esac
 	ph=$(phase_of "$RESTORE_LOOP")
 	[ $((i % 4)) -eq 0 ] && log step4 "t=${i}s phase=$ph checkpoints=$n_ck"
 	[ "$n_ck" -ge 1 ] && [ "$ph" = "Implementing" ] && break

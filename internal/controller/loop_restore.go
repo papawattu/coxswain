@@ -290,14 +290,32 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 }
 
 // workspacePVCPresent reports whether the Loop's workspace PVC currently
-// exists (a transient read failure is reported as "not present" — the
-// caller's decision is retried next reconcile, and a failed read is not
-// grounds for a restore decision — the conservative reading, as in B1's
-// support check).
+// exists and is NOT being deleted (a transient read failure is reported as
+// "not present" — the caller's decision is retried next reconcile, and a
+// failed read is not grounds for a restore decision — the conservative
+// reading, as in B1's support check). A PVC with a non-nil DeletionTimestamp
+// is treated as NOT present (it is being deleted; the kubernetes.io/
+// pvc-protection finalizer holds it until no pod uses it, and it is not
+// usable while Terminating). This is the B2 fix: the reactive restore
+// trigger (b2LostPVCTarget) and the completed-restore check both consult
+// this function, and a Terminating PVC must be treated as LOST so the
+// restore can start (the old code returned true for a Terminating PVC, so
+// the reactive restore never started and the PVC was stuck in Terminating
+// behind the pvc-protection finalizer held by the pods that mount it).
 func (r *LoopReconciler) workspacePVCPresent(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
-	return err == nil
+	if err != nil {
+		return false // NotFound or a transient read failure: not present
+	}
+	// A PVC with a non-nil DeletionTimestamp is being deleted (the apiserver
+	// has accepted the delete; the finalizer work is in progress). It is not
+	// usable (the kubernetes.io/pvc-protection finalizer holds it until no
+	// pod uses it), so treat it as NOT present.
+	if pvc.DeletionTimestamp != nil {
+		return false
+	}
+	return true
 }
 
 // parseRestoreFrom parses "iter-N" (the CRD pattern validates the shape;
@@ -689,8 +707,51 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 	case b2SourceReady:
 		if loop.Spec.ForkOf != nil || target.kind == b2KindLostPVC {
 			// A fork (a fresh Loop — the PVC is absent, the sandbox does not
-			// exist) and a lost-PVC restore (the PVC is already gone) go
-			// straight to the create.
+			// exist) goes straight to the create. A lost-PVC restore (the PVC
+			// is gone or being deleted) also goes to the create, but only when
+			// the PVC is fully gone (NotFound). If the PVC is still present
+			// (including Terminating — the B2 fix: a PVC with a non-nil
+			// DeletionTimestamp is treated as NOT present by
+			// workspacePVCPresent, but the apiserver still has the object), the
+			// create would fail with AlreadyExists (the object is still there).
+			// So: if the PVC is still present (the Get succeeds, even with a
+			// DeletionTimestamp), the verify/deliver Jobs must be STOPPED first
+			// (they mount the PVC and hold it in Terminating via
+			// kubernetes.io/pvc-protection), then wait for the PVC to be fully
+			// gone. If the PVC is gone (NotFound), create it from the snapshot.
+			pvc := &corev1.PersistentVolumeClaim{}
+			pvcErr := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
+			if pvcErr == nil {
+				// The PVC is still present (even if Terminating). Stop the
+				// workloads first (the verify/deliver Jobs mount the PVC and
+				// hold it in Terminating via kubernetes.io/pvc-protection), then
+				// wait for the PVC to be fully gone.
+				workloadsStopped, err := r.stopWorkloadsForRestore(ctx, loop)
+				if err != nil {
+					log.FromContext(ctx).Error(err, "the restore could not stop the Loop-owned workloads; no decision on a transient read failure",
+						"loop", loop.Name)
+					return false, true, true, nil
+				}
+				if !workloadsStopped {
+					setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+						"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the Loop-owned workloads are being stopped (the PVC is held by pvc-protection while they mount it)")
+					persist()
+					r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+						"workspace PVC restore: the Loop-owned workloads are being stopped")
+					return true, true, true, nil
+				}
+				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still present (being deleted); waiting for it to be fully gone before creating the new one")
+				persist()
+				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+					"workspace PVC restore: waiting for the old PVC to be fully gone")
+				return true, true, true, nil
+			}
+			if !apierrors.IsNotFound(pvcErr) {
+				// A transient read failure: no decision, requeue.
+				return false, true, true, nil
+			}
+			// The PVC is fully gone (NotFound). Create it from the snapshot.
 			if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
 				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
 					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())

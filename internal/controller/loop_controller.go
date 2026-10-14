@@ -5560,6 +5560,16 @@ func (r *LoopReconciler) ensureVerifyJobIfActive(ctx context.Context, loop *coxv
 	if loopPaused(loop) {
 		return nil
 	}
+	// B2 fix: while the restore hold is active (the Restore condition is False,
+	// reason StoppingWorkloads, StoppingSandbox, or DeletingPVC), do NOT create
+	// a new verify Job. The verify Job mounts the workspace PVC, and a new
+	// verify Job would re-mount the PVC (or a Terminating PVC) and hold it via
+	// kubernetes.io/pvc-protection, stalling the restore. The restore must
+	// complete (the hold clears with the True/Restored marker) before a new
+	// verify Job is created.
+	if r.b2RestoreHoldSuspended(loop) {
+		return nil
+	}
 	return r.ensureVerifyJob(ctx, loop)
 }
 

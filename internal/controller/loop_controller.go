@@ -548,6 +548,8 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 		changed = true
+		// B5a: count the bootstrap's first transition (Pending -> Planning).
+		loopIterationsTotal.WithLabelValues(string(coxv1alpha1.LoopPhasePlanning)).Inc()
 	}
 
 	// S4 review P1 (R17): the workspace must survive the per-phase pod

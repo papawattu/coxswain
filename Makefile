@@ -85,7 +85,13 @@ runner-test: ## Run the runner module's tests (separate go.mod).
 # template, and every install.yaml resource present in the chart render.
 # Requires helm (make install-helm) + python3. No cluster.
 .PHONY: chart-check
-chart-check: install-helm ## B5a: helm lint + helm template + install.yaml coverage for dist/chart (offline).
+# B5a: helm lint + helm template + install.yaml coverage for dist/chart (offline).
+# The B5a review follow-up: chart-check now depends on kustomize — it shells to
+# hack/chart-check.sh, which invokes the Kustomize binary to build config/default
+# (the coverage check compares the chart's rendered output against it). Without
+# the dependency the target ran before the binary was downloaded and silently
+# skipped the coverage step.
+chart-check: install-helm kustomize ## B5a: helm lint + helm template + install.yaml coverage for dist/chart (offline).
 	@bash hack/chart-check.sh
 
 # S1: the sample apps are separate Go/Python modules (examples/<app>); the root

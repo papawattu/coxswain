@@ -16,19 +16,28 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v helm >/dev/null 2>&1 || { echo "Error: helm not found (make install-helm)"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "Error: python3 not found"; exit 1; }
+BUILD_ERR="$(mktemp)"
+trap 'rm -f "${BUILD_ERR:-}" "${RENDERED:-}"' EXIT
 
 echo "=== helm lint dist/chart ==="
 helm lint "$ROOT/dist/chart"
 
 echo "=== helm template (release coxswain, namespace coxswain-system) ==="
 RENDERED="$(mktemp)"
-trap 'rm -f "$RENDERED"' EXIT
 helm template coxswain "$ROOT/dist/chart" --namespace coxswain-system > "$RENDERED"
 
 echo "=== install.yaml coverage (every install.yaml resource must be in the chart) ==="
-IMG="${IMG:-ghcr.io/papawattu/coxswain-controller:placeholder}" \
-  KUSTOMIZE="$(command -v kustomize 2>/dev/null || echo "$ROOT/bin/kustomize")" \
-  "$ROOT/hack/build-installer.sh" > /dev/null
+# The B5a review follow-up: do not swallow build-installer's stderr — a build
+# failure was previously hidden by '/dev/null' (only the rendered YAML went to
+# stdout, which the coverage check then compared against a STALE install.yaml).
+# Now the stderr is captured and shown on failure.
+if ! IMG="${IMG:-ghcr.io/papawattu/coxswain-controller:placeholder}" \
+   KUSTOMIZE="$(command -v kustomize 2>/dev/null || echo "$ROOT/bin/kustomize")" \
+   "$ROOT/hack/build-installer.sh" 2>"$BUILD_ERR" ; then
+	echo "Error: hack/build-installer.sh failed; its stderr:" >&2
+	cat "$BUILD_ERR" >&2
+	exit 1
+fi
 
 python3 - "$ROOT/dist/install.yaml" "$RENDERED" <<'EOF'
 import sys, yaml

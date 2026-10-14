@@ -242,6 +242,21 @@ log kubearmor "KubeArmor $KUBEARMOR_VERSION installed (BPF-LSM nodes: $BPF_NODES
 # by the OPERATOR's install.yaml (config/crd/external) — no separate CRD
 # fetch is needed.
 log snapshot "installing the external-snapshotter controller (RBAC + Deployment, SA in kube-system)"
+# The snapshot CRDs (VCS/VSC/VolumeSnapshot) must exist BEFORE the controller
+# starts — it lists VCS on startup and exits with 'the server could not find
+# the requested resource' if they are absent (the 2026-10-14 run's crash-loop:
+# 4 restarts in 180s, 'Failed to list v1 volumesnapshots ... not found'). The
+# operator ships the same CRDs in its install.yaml (config/crd/external, applied
+# later); applying them here from the repo is idempotent with that later apply.
+curl -fsSL "https://raw.githubusercontent.com/papawattu/coxswain/slice/b6-beta-e2e/config/crd/external/snapshot.storage.k8s.io_volumesnapshots.yaml" \
+	> "$EVIDENCE/snapshot-crd-volumesnapshots.yaml" || die "cannot fetch the VolumeSnapshot CRD from the repo (config/crd/external)"
+curl -fsSL "https://raw.githubusercontent.com/papawattu/coxswain/slice/b6-beta-e2e/config/crd/external/snapshot.storage.k8s.io_volumesnapshotcontents.yaml" \
+	> "$EVIDENCE/snapshot-crd-contents.yaml" || die "cannot fetch the VolumeSnapshotContent CRD from the repo (config/crd/external)"
+curl -fsSL "https://raw.githubusercontent.com/papawattu/coxswain/slice/b6-beta-e2e/config/crd/external/snapshot.storage.k8s.io_volumesnapshotclasses.yaml" \
+	> "$EVIDENCE/snapshot-crd-classes.yaml" || die "cannot fetch the VolumeSnapshotClass CRD from the repo (config/crd/external)"
+kc apply -f "$EVIDENCE/snapshot-crd-volumesnapshots.yaml" -f "$EVIDENCE/snapshot-crd-contents.yaml" -f "$EVIDENCE/snapshot-crd-classes.yaml" >"$EVIDENCE/snapshot-crd-apply.log" 2>&1 || { cat "$EVIDENCE/snapshot-crd-apply.log"; die "could not apply the snapshot CRDs (the operator needs them for the controller)"; }
+kc get crd volumesnapshots.snapshot.storage.k8s.io >/dev/null 2>&1 || die "the VolumeSnapshot CRD is not registered (the controller would crash-loop)"
+log snapshot "snapshot CRDs applied (VolumeSnapshot, VolumeSnapshotContent, VolumeSnapshotClass)"
 curl -fsSL "https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml" \
 	> "$EVIDENCE/snapshot-controller-rbac.yaml" || die "cannot fetch the external-snapshotter controller RBAC (the upstream layout changed; the controller moved to deploy/kubernetes/snapshot-controller/)"
 kc apply -f "$EVIDENCE/snapshot-controller-rbac.yaml" >"$EVIDENCE/snapshot-controller-rbac-apply.log" 2>&1 || { cat "$EVIDENCE/snapshot-controller-rbac-apply.log"; die "snapshot-controller RBAC apply failed"; }

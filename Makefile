@@ -229,6 +229,10 @@ a2-e2e: ## A2 (D53): restart durability e2e (MEASURE, don't fix). Runs the gocli
 alpha-e2e: ## A6 alpha acceptance (PLAN-ALPHA.md A6): a FRESH kind cluster coxswain-alpha, the released install.yaml (NO --allow-unenforced), PolicyEnforced=True on real evidence, a first-time draft PR on GitHub (A4 live run), the three gate cases (held / sandbox-kill resume / one PR), driven with kubectl cox. Evidence kept under .samples/alpha-e2e-<ts>/ (never committed). The cluster coxswain-alpha is deleted at the end; kind-coxswain-dev / kind-coxswain-calico are never touched.
 	@bash test/e2e/alpha-e2e.sh
 
+.PHONY: beta-e2e
+beta-e2e: ## B6 beta acceptance (PLAN-BETA.md Done-when): a FRESH snapshot-capable kind cluster (kind-coxswain-snap, deleted and recreated by the run) with the CURRENT main build, the six Done-when steps (manual reject/re-plan/approve + draft PR, forced verify re-plan, PVC-delete restore, cox fork, metrics via coxswain-metrics-reader). Evidence kept under .samples/beta-e2e-<ts>/ (never committed). kind-coxswain-dev / -calico / -alpha are never touched.
+	@bash test/e2e/beta-e2e.sh
+
 .PHONY: p2-e2e
 p2-e2e: ## Run the P2h kind acceptance (the Phase 2 "Done when": the stalled/budget-exceeded stop + the paused-Loop resume) kind e2e (pinned to --context kind-coxswain-dev). Builds the operator + runner; P2H_OPERATOR_IMAGE overrides the operator image (the gate mutations).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/p2-e2e.sh

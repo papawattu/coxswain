@@ -172,15 +172,27 @@ func clearLastRejectionReason(loop *coxv1alpha1.Loop) {
 // file — a stale file from a prior phase run must not leak into the next
 // plan).
 //
-// The values are the OPERATOR's view of the two approval conditions:
+// The values are the OPERATOR's view of the two approval conditions + the
+// B4 verify-failure summary:
 //   - planHash is approvedPlanHash (the PlanApproved message's hash, "" if
 //     absent/stale/malformed). The runner reads it after writing the fresh
 //     PLAN.md and compares it to the new plan's hash: a mismatch means the
 //     plan changed since the user approved (the runner re-writes the
 //     PlanApproved condition as stale, the operator re-enters the hold).
-//   - planFeedback is rejectedPlanReason (the PlanRejected message, "" if
-//     absent). The runner's planning prompt includes it (the next plan
-//     addresses the rejection).
+//   - planFeedback is the operator's most recent feedback to feed into the
+//     next planning prompt. B3 sets it from the user's rejection reason
+//     (status.approval.lastRejectionReason, durable across the PlanRejected
+//     clear). B4 (PLAN-BETA / PLAN.md Phase 6 remainder) ALSO sets it from
+//     the verify-failure summary (status.verify.lastFailureSummary, durable
+//     across the re-plan): when onVerifyFail is Plan, a failed verify sends
+//     the Loop back to Planning with the failure summary fed into the next
+//     planning prompt, reusing the SAME plan-feedback channel B3 uses (no
+//     second channel). The verify-failure summary takes PRECEDENCE over the
+//     rejection reason (a re-plan after a failed verify is the freshest
+//     feedback; the rejection reason from a prior plan cycle is stale by
+//     definition — the user rejected the prior plan, not the new one). When
+//     both are empty, the file is removed (no stale feedback leaks into the
+//     next plan).
 //
 // Both are written ONLY when the phase is Planning (the only phase the
 // runner reads them in) — the other phases write "" (the phase-init script
@@ -190,17 +202,26 @@ func (r *LoopReconciler) planApprovalFiles(loop *coxv1alpha1.Loop) (string, stri
 	if loop.Status.DesiredPhase != coxv1alpha1.LoopPhasePlanning {
 		return "", ""
 	}
-	// The DURABLE reason (status.approval.lastRejectionReason, set by the
-	// Replan branch) wins: it survives the PlanRejected clear, so the
-	// phase-init writes it into the next planning prompt (the B3 Replan
-	// requirement — the reason feeds the next plan, even though the condition
-	// was cleared on the same reconcile). The condition is the fallback (the
-	// Fail action keeps the condition; a rejection not yet Replan'd).
-	reason := rejectedPlanReason(loop)
-	if loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
-		reason = loop.Status.Approval.LastRejectionReason
+	// B4: the verify-failure summary (status.verify.lastFailureSummary) takes
+	// precedence over the rejection reason (a re-plan after a failed verify is
+	// the freshest feedback). When the summary is absent (onVerifyFail is not
+	// Plan, or the last verify passed), fall back to B3's rejection reason
+	// (status.approval.lastRejectionReason, durable across the PlanRejected
+	// clear).
+	var feedback string
+	if loop.Status.Verify != nil && loop.Status.Verify.LastFailureSummary != "" {
+		feedback = loop.Status.Verify.LastFailureSummary
 	}
-	return approvedPlanHash(loop), reason
+	if feedback == "" {
+		// B3: the rejection reason (the user's cox reject --reason), durable
+		// across the PlanRejected clear.
+		reason := rejectedPlanReason(loop)
+		if loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
+			reason = loop.Status.Approval.LastRejectionReason
+		}
+		feedback = reason
+	}
+	return approvedPlanHash(loop), feedback
 }
 
 // applyApprovalGate runs the B3 approval decision on the Loop (level-based,

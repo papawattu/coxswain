@@ -42,6 +42,27 @@ const (
 	ApprovalModeManual ApprovalMode = "Manual"
 )
 
+// OnVerifyFailAction is what happens when a verify's acceptance check FAILS
+// (PLAN-BETA B4; PLAN.md Phase 6 remainder). It selects where the Loop goes
+// when a check does not pass: Implement (the default) iterates back to
+// Implementing (the agent re-works the failing check); Plan re-plans (the
+// agent goes back to Planning with the failure summary fed into the next
+// plan).
+type OnVerifyFailAction string
+
+const (
+	// OnVerifyFailImplement is the default: a failed verify iterates back to
+	// Implementing (the S4/alpha behaviour, unchanged). The failing check's
+	// name and exit code ride into status.progress for the next iteration.
+	OnVerifyFailImplement OnVerifyFailAction = "Implement"
+	// OnVerifyFailPlan re-plans: a failed verify goes back to Planning with
+	// the failure summary fed into the next planning prompt (reusing B3's
+	// plan-feedback channel). The iteration is STILL incremented (the stall
+	// detector and maxIterations count iterations across re-plans — a
+	// re-plan is not a reset).
+	OnVerifyFailPlan OnVerifyFailAction = "Plan"
+)
+
 // OnRejectAction is what happens when the user rejects the plan with a
 // reason (PLAN-BETA B3; PLAN.md Phase 4).
 type OnRejectAction string
@@ -213,6 +234,23 @@ type VerifyConfig struct {
 	// +optional
 	ProtectedPathsOverride bool `json:"protectedPathsOverride,omitempty"`
 
+	// onVerifyFail is the operator's action when a verify's acceptance check
+	// FAILS (PLAN-BETA B4; PLAN.md Phase 6 remainder). Implement (the
+	// default) iterates back to Implementing (the agent re-works the failing
+	// check — the alpha behaviour, unchanged). Plan sends the Loop back to
+	// Planning with the failure summary fed into the next planning prompt
+	// (reusing B3's plan-feedback channel, .coxswain/plan-feedback, written
+	// by the phase-init from the durable status field
+	// status.verify.lastFailureSummary). A re-plan still increments the
+	// iteration (the stall detector and maxIterations count iterations across
+	// re-plans — a re-plan is not a reset); with approval.mode Manual the
+	// re-plan goes through AwaitingApproval again (the new plan needs
+	// approval).
+	// +kubebuilder:validation:Enum=Implement;Plan
+	// +kubebuilder:default=Implement
+	// +optional
+	OnVerifyFail OnVerifyFailAction `json:"onVerifyFail,omitempty"`
+
 	// image is the container image the check-* acceptance-check containers
 	// run (S5a: the acceptance checks are user commands that may need a
 	// toolchain — `go test` needs a Go image, not the operator's git image).
@@ -283,6 +321,23 @@ type VerifyStatus struct {
 	// +listType=atomic
 	// +optional
 	LastCheckResults []*int32 `json:"lastCheckResults,omitempty"`
+
+	// lastFailureSummary is the DURABLE operator summary of the most recent
+	// FAILED verify check (PLAN-BETA B4; PLAN.md Phase 6 remainder). It is set
+	// by the operator when a verify's acceptance check fails AND
+	// spec.verify.onVerifyFail is Plan (the re-plan action): the phase-init
+	// container reads it to write .coxswain/plan-feedback (reusing B3's
+	// plan-feedback channel — the same file the user's rejection reason rides
+	// in) so the next planning prompt addresses the failure. It is CLEARED when
+	// the Loop leaves the re-plan (a verify succeeds, or a check fails again
+	// with a fresh summary overwriting the prior — the operator sets it fresh
+	// on every failed verify, so a stale summary from a prior iteration never
+	// leaks into a later plan). An empty value means no failed-verify summary
+	// to feed (the plan-feedback file is removed, the same as B3's empty
+	// rejection reason). The operator is the sole writer (ADR-0004); the
+	// runner never writes status.
+	// +optional
+	LastFailureSummary string `json:"lastFailureSummary,omitempty"`
 
 	// infraAttempts is the number of verify Job attempts the operator has made
 	// for this verifiedCommit after a verify INFRASTRUCTURE failure (I65):

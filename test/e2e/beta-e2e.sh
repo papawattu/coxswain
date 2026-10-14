@@ -104,7 +104,6 @@ build_cox() {
 	log cox "building bin/cox from $(git -C "$ROOT" rev-parse --short HEAD) (the CLI is local — the operator is the CURRENT main build)"
 	go -C "$ROOT" build -o "$ROOT/bin/cox" ./cmd/cox
 	COX_BIN="$ROOT/bin/cox"
-	cox "$@"
 }
 cox() { "$COX_BIN" --context "$CTX" -n "$NS" "$@"; }
 
@@ -352,12 +351,17 @@ log installer "install.yaml built (sha256 $INSTALL_SHA256; all coxswain images t
 echo "build tag: $BUILD_TAG (current main, commit $(git -C "$ROOT" rev-parse --short HEAD))" >>"$EVIDENCE/digests.txt"
 build_load_record() { # <name> <dockerfile> [make-arg-image]
 	local name="$1" df="$2"
-	local iid="$EVIDENCE/iid-$name.txt"
+	# $name is a full image reference (registry/namespace/repo); slashes make
+	# it a path into directories that do not exist when used in a local
+	# filename. Sanitise for the evidence filenames; keep the full ref for
+	# the docker/kind commands.
+	local base; base=$(printf '%s' "$name" | tr '/:' '__')
+	local iid="$EVIDENCE/iid-$base.txt"
 	log installer "building $name:$BUILD_TAG from $df"
 	docker build -f "$df" -t "$name:$BUILD_TAG" --iidfile "$iid" "$ROOT" \
-		>"$EVIDENCE/docker-build-$name.log" 2>&1 \
-		|| { tail -30 "$EVIDENCE/docker-build-$name.log"; die "docker build of $name failed (see $EVIDENCE/docker-build-$name.log)"; }
-	kind load docker-image "$name:$BUILD_TAG" --name "$CLUSTER" >>"$EVIDENCE/docker-build-$name.log" 2>&1 \
+		>"$EVIDENCE/docker-build-$base.log" 2>&1 \
+		|| { tail -30 "$EVIDENCE/docker-build-$base.log"; die "docker build of $name failed (see $EVIDENCE/docker-build-$base.log)"; }
+	kind load docker-image "$name:$BUILD_TAG" --name "$CLUSTER" >>"$EVIDENCE/docker-build-$base.log" 2>&1 \
 		|| die "could not load $name:$BUILD_TAG into the node"
 	local id
 	id=$(cat "$iid")
@@ -778,7 +782,7 @@ while :; do
 		SAW_PLANNING_AFTER_VERIFY=1
 		log step3 "observed the re-plan: Planning after Implementing (the onVerifyFail: Plan path)"
 		# Keep watching to the terminal outcome (the budget ends it Failed).
-		case "$(phase_of $REPLAN_LOOP)" in Planning) : ;; esac
+		case "$(phase_of "$REPLAN_LOOP")" in Planning) : ;; esac
 	fi
 	case "$ph" in
 	Succeeded) die "step3 FAILED: the Loop Succeeded despite the forced verify failure (the check is 'false' — impossible; the run is wrong) — record and stop" ;;
@@ -795,7 +799,7 @@ k get loop "$REPLAN_LOOP" -o json >"$EVIDENCE/step3-loop.json" 2>/dev/null || tr
 {
 	echo "saw-Implementing: $SAW_IMPLEMENTING"
 	echo "saw-Planning-after-verify: $SAW_PLANNING_AFTER_VERIFY"
-	echo "final-phase: $(phase_of $REPLAN_LOOP) (a terminal Failed is EXPECTED — the forced check never passes; the step proves the re-plan, not the outcome)"
+	echo "final-phase: $(phase_of "$REPLAN_LOOP") (a terminal Failed is EXPECTED — the forced check never passes; the step proves the re-plan, not the outcome)"
 } >"$EVIDENCE/step3-observe.txt"
 kc -n "$NS" get events -o json --field-selector "involvedObject.name=$REPLAN_LOOP" >"$EVIDENCE/step3-events.json" 2>/dev/null || true
 # The operator-side corroboration: at least one failed verify recorded (the
@@ -834,7 +838,7 @@ while :; do
 	CK_NAMES=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null)
 	n_ck=$(echo "$CK_NAMES" | tr ' ' '\n' | grep -c . || echo 0)
 	ph=$(phase_of "$RESTORE_LOOP")
-	[ "$i" % 4 -eq 0 ] 2>/dev/null && log step4 "t=${i}s phase=$ph checkpoints=$n_ck"
+	[ $((i % 4)) -eq 0 ] && log step4 "t=${i}s phase=$ph checkpoints=$n_ck"
 	[ "$n_ck" -ge 1 ] && [ "$ph" = "Implementing" ] && break
 	case "$ph" in
 	Succeeded | Failed) die "step4: $RESTORE_LOOP reached $ph before a checkpoint+Implementing window (checkpoints=$n_ck; re-run)" ;;

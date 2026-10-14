@@ -126,37 +126,26 @@ manager for a plain-HTTP scrape in dev.)
 ### Reading /metrics with a bound token (reviewer's recipe)
 
 The metrics endpoint uses `filters.WithAuthenticationAndAuthorization`
-(controller-runtime). To read it with `curl`, you need a token bound to the
-`coxswain-metrics-reader` Role. The generated operator RBAC does NOT include
-this permission — it must be granted explicitly:
+(controller-runtime). To read it with `curl`, you need a token whose
+ServiceAccount is bound to the `coxswain-metrics-reader` **ClusterRole**
+(installed by `dist/install.yaml` / the Helm chart). A namespaced Role
+cannot grant the `nonResourceURL /metrics` — only a ClusterRole can.
 
 ```sh
 # 1. Create a ServiceAccount for metrics access
 kubectl -n coxswain-system create sa metrics-reader
 
-# 2. Create a Role that allows the SubjectAccessReview the metrics filter needs
-#    (Verb: "get", Path: "/metrics" — the filter converts this to a SAR on
-#    the "metrics" resource in the "" API group).
-cat <<'EOF' | kubectl apply -f -
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: metrics-reader
-  namespace: coxswain-system
-rules:
-- apiGroups: [""]
-  resources: ["metrics"]
-  verbs: ["get"]
-EOF
+# 2. Bind the existing coxswain-metrics-reader ClusterRole to the SA
+#    (the ClusterRole is installed by dist/install.yaml; it grants
+#    nonResourceURLs: ["/metrics"] verbs: ["get"]).
+kubectl create clusterrolebinding metrics-reader-binding \
+  --clusterrole=coxswain-metrics-reader \
+  --serviceaccount=coxswain-system:metrics-reader
 
-# 3. Bind the Role to the SA
-kubectl -n coxswain-system create rolebinding metrics-reader-binding \
-  --role=metrics-reader --serviceaccount=coxswain-system:metrics-reader
+# 3. Create a token for the SA (minimum duration: 10 minutes)
+TOKEN=$(kubectl -n coxswain-system create token metrics-reader --duration=10m)
 
-# 4. Create a token for the SA
-TOKEN=$(kubectl -n coxswain-system create token metrics-reader --duration=5m)
-
-# 5. Port-forward and read /metrics
+# 4. Port-forward and read /metrics
 kubectl -n coxswain-system port-forward \
   svc/coxswain-controller-manager-metrics-service 8080:8443 &
 PF_PID=$!

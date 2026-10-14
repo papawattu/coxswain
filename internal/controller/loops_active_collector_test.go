@@ -110,7 +110,7 @@ func TestLoopsActiveCollector(t *testing.T) {
 		var phase string
 		var value float64
 		for _, lp := range m.GetLabel() {
-			if lp.GetName() == "phase" {
+			if lp.GetName() == loopsActivePhaseLabel {
 				phase = lp.GetValue()
 			}
 		}
@@ -122,7 +122,7 @@ func TestLoopsActiveCollector(t *testing.T) {
 
 	// Check the expected counts.
 	expected := map[string]float64{
-		"Planning":    1,
+		"Planning":     1,
 		"Implementing": 1,
 		"Verifying":    2,
 		"Paused":       1,

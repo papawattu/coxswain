@@ -5602,5 +5602,3 @@ func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommit
 func isTerminalPhase(phase coxv1alpha1.LoopPhase) bool {
 	return phase == coxv1alpha1.LoopPhaseSucceeded || phase == coxv1alpha1.LoopPhaseFailed
 }
-
-

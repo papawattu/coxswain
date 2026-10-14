@@ -15,6 +15,10 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
+// loopsActivePhaseLabel is the label name for the coxswain_loops_active metric.
+// goconst: a single const avoids the goconst lint on the repeated "phase" string.
+const loopsActivePhaseLabel = "phase"
+
 // loopsActiveCollector is a custom Prometheus collector that counts Loops per
 // non-terminal phase from the cache at scrape time. It replaces the
 // GaugeVec (which set labels on reconcile and left stale values for phases
@@ -40,7 +44,7 @@ func (c *loopsActiveCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc(
 		"coxswain_loops_active",
 		"Loops currently in a non-terminal phase, by phase (counted from the cache at scrape time).",
-		[]string{"phase"},
+		[]string{loopsActivePhaseLabel},
 		nil,
 	)
 }
@@ -79,7 +83,7 @@ func (c *loopsActiveCollector) Collect(ch chan<- prometheus.Metric) {
 			prometheus.NewDesc(
 				"coxswain_loops_active",
 				"Loops currently in a non-terminal phase, by phase (counted from the cache at scrape time).",
-				[]string{"phase"},
+				[]string{loopsActivePhaseLabel},
 				nil,
 			),
 			prometheus.GaugeValue,

@@ -73,6 +73,11 @@ const (
 	// suspend=true is refused on a Succeeded Loop whose deliver Job is still
 	// in flight (item F).
 	suspendedRefusedCondReason = "SuspendRefused"
+	// forkPauseRefusedReason is the False-condition reason when a FORK Loop
+	// (spec.forkOf set) has spec.suspend=true (B2: forks are one-shot,
+	// ADR-0003 — a fork does not pause; the refusal is recorded so the
+	// suspend is not a silent no-op, I90).
+	forkPauseRefusedReason = "ForkPauseRefused"
 )
 
 // pausedPhases lists every non-terminal phase a Loop may pause FROM (item 9:
@@ -192,6 +197,20 @@ func (r *LoopReconciler) applyPauseMechanics(ctx context.Context, loop *coxv1alp
 		return r.handlePausedLoop(ctx, loop)
 	}
 	blocked, c := r.handleSuspendEntry(loop)
+	// B2 FORK: a fork Loop (spec.forkOf set) is ONE-SHOT (ADR-0003: forks,
+	// not re-tasks). A fork does not pause (a paused fork would be a fork
+	// that never finishes — the one-shot goal is the fork's only goal). The
+	// fork's pause is refused: a spec.suspend=true on a fork is treated as
+	// a no-op (the Paused condition records the refusal, the sandbox keeps
+	// running). The refusal is the same shape as the S1 terminal-phase
+	// refusal (a fork is one-shot: its goal is not re-scopeable, so a pause
+	// is a refusal, not a hold).
+	if loop.Spec.ForkOf != nil && loop.Spec.Suspend {
+		setCondition(loop, coxv1alpha1.PausedCondition, metav1.ConditionFalse,
+			forkPauseRefusedReason,
+			"fork Loops are one-shot (ADR-0003): spec.suspend is refused (the fork runs to its terminal phase; it does not pause)")
+		return true, true, false
+	}
 	return blocked, c, false
 }
 

@@ -273,6 +273,46 @@ spec:
                     - PullRequest
                     type: string
                 type: object
+              forkOf:
+                description: |-
+                  forkOf seeds this Loop from ANOTHER Loop's checkpoint (B2, PLAN-BETA /
+                  PLAN.md Phase 3; ADR-0003: a fork, not a re-task). forkOf.loop is the
+                  source Loop's name (any namespace; the operator reads the source
+                  snapshot by name in THIS Loop's namespace) and forkOf.iteration names
+                  the source checkpoint iteration. At start the operator restores this
+                  Loop's OWN workspace PVC from the source snapshot
+                  checkpoint-<loop>-iter-<N> (PVC spec.dataSource = the VolumeSnapshot);
+                  the fork then runs a normal one-shot Loop on that content: its own
+                  branch, its own deliver, its own PR. A fork is a one-shot Loop
+                  (ADR-0003: forks, not re-tasks). The source Loop may be deleted after
+                  the fork's restore: a restored PVC owns its content, not the source
+                  snapshot, so the fork is independent (the source's snapshot GC is
+                  documented and tested — the source's finalizer still deletes its
+                  snapshots in CleaningUp; the fork's PVC survives that delete because
+                  the PVC content was materialised at restore).
+                  Immutable (a fork target is a seeding decision made at creation).
+                properties:
+                  iteration:
+                    description: |-
+                      iteration is the source checkpoint's iteration (the
+                      checkpoint-<loop>-iter-<iteration> name component). Iteration 0 is
+                      a valid checkpoint (the first verify; the same lesson as B1's iter-0).
+                    minimum: 0
+                    type: integer
+                  loop:
+                    description: |-
+                      loop is the source Loop's name (the checkpoint name is
+                      checkpoint-<loop>-iter-<iteration>). Same namespace as the fork.
+                    minLength: 1
+                    type: string
+                required:
+                - iteration
+                - loop
+                type: object
+                x-kubernetes-validations:
+                - message: forkOf is immutable (it seeds the workspace PVC from the
+                    source snapshot at creation)
+                  rule: self == oldSelf
               goal:
                 description: goal is the natural-language objective for this Loop.
                 minLength: 1
@@ -314,6 +354,22 @@ spec:
                 items:
                   type: string
                 type: array
+              restoreFrom:
+                description: |-
+                  restoreFrom is the ROLLBACK target (B2, PLAN-BETA / PLAN.md Phase 3):
+                  "iter-N" names the checkpoint checkpoint-<loop>-iter-<N> the operator
+                  restores the workspace PVC from. The checkpoint must EXIST (a recorded
+                  status.checkpoints entry whose VolumeSnapshot is present) and be
+                  ReadyToUse (status.boundSnapshotVolumeReadyToUse of the snapshot is
+                  true); an unknown or not-ready iter is rejected VISIBLY (a
+                  RestoreRejected condition plus an Event, never a silent ignore). The
+                  operator deletes and recreates the workspace PVC with
+                  spec.dataSource = the VolumeSnapshot, then resumes the A2 path from
+                  the restored content. Immutable (PVC dataSource is immutable): a
+                  change is rejected at admission; a different rollback target is a
+                  fork.
+                pattern: ^iter-[0-9]+$
+                type: string
               suspend:
                 description: suspend, when true, pauses the Loop at its current phase.
                 type: boolean

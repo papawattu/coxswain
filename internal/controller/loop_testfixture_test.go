@@ -66,21 +66,51 @@ const (
 	// agentContainerName is the name of the Loop's agent container in the
 	// Sandbox pod spec (goconst: it appears in several test files).
 	agentContainerName = "agent"
-
-	unstructuredGoal  = "goal"
-	unstructuredWs    = "workspace"
-	unstructuredRepo  = "repo"
-	unstructuredRef   = "ref"
-	unstructuredVer   = "verify"
-	unstructuredAcck  = "acceptanceChecks"
-	unstructuredKind  = "kind"
-	unstructuredMeta  = "metadata"
-	unstructuredAPI   = "apiVersion"
-	unstructuredSpec  = "spec"
-	unstructuredName  = "name"
-	unstructuredEnv   = "env"
-	unstructuredValue = "value"
 )
+
+// unstructuredGoal is the "goal" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredGoal = "goal"
+
+// unstructuredWs is the "workspace" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredWs = "workspace"
+
+// unstructuredRepo is the "repo" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredRepo = "repo"
+
+// unstructuredRef is the "ref" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredRef = "ref"
+
+// unstructuredVer is the "verify" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredVer = "verify"
+
+// unstructuredAcck is the "acceptanceChecks" key (a goconst-shared constant
+// across the controller's unstructured object builders).
+const unstructuredAcck = "acceptanceChecks"
+
+// unstructuredMeta is the "metadata" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredMeta = "metadata"
+
+// unstructuredSpec is the "spec" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredSpec = "spec"
+
+// unstructuredName is the "name" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredName = "name"
+
+// unstructuredEnv is the "env" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredEnv = "env"
+
+// unstructuredValue is the "value" key (a goconst-shared constant across the
+// controller's unstructured object builders).
+const unstructuredValue = "value"
 
 // mkUnstructuredLoop builds an unstructured Loop with the given name,
 // namespace, and repo. The loop: block is omitted so the CRD's defaulting is

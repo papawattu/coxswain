@@ -44,6 +44,7 @@ const (
 	verbList        = "list"
 	verbWatch       = "watch"
 	verbCreate      = "create"
+	verbPatch       = "patch"
 	verbUpdate      = "update"
 )
 
@@ -198,10 +199,12 @@ func TestRBACCoverage(t *testing.T) {
 		// gcLoopCheckpoints' label list) go through the cached client (I86):
 		// the manager's cache lazily watches the type the first time the cached
 		// client reads it, so the marker needs get;list;watch IN ADDITION TO
-		// create;delete (a create-only marker wedges a fresh install on the
-		// first cached read, exactly like the A6 configmaps P1).
+		// create;delete;patch (a create-only marker wedges a fresh install on
+		// the first cached read, exactly like the A6 configmaps P1). The patch
+		// verb is for the fork-retention label (removeForkRetentionLabel
+		// patches the source's VolumeSnapshot).
 		{group: snapshotGroup, resource: "volumesnapshots",
-			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate}},
+			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbPatch}},
 		// VolumeSnapshotClasses: the checkpoint support check reads the
 		// cluster's VolumeSnapshotClasses (cluster-scoped, cached read).
 		{group: snapshotGroup, resource: "volumesnapshotclasses",

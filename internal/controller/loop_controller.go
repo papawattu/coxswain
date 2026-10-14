@@ -389,7 +389,7 @@ type LoopReconciler struct {
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;delete
 // A1 (D52): the static enforcement check reads Nodes (BPF-LSM label) and
 // agent Pods (Ready condition) directly from the API server (APIReader).
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
@@ -411,7 +411,7 @@ type LoopReconciler struct {
 // type the first time the cached client reads it, so the marker needs
 // get;list;watch in addition to create;delete (a create-only marker wedges a
 // fresh install on the first cached read, exactly like the A6 configmaps P1).
-// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch;create;delete;patch
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
 // The checkpoint support check reads the workspace PVC's StorageClass (the
 // CSI driver) to find the matching VolumeSnapshotClass.
@@ -553,6 +553,43 @@ func (r *LoopReconciler) applyBudgetStep(ctx context.Context, loop *coxv1alpha1.
 	return budgetRequeue, budgetChanged
 }
 
+// s4ClaimAndVerifyJob is the S4 claim read (the runner's claim from the agent
+// container's strict-parsed) + the S5a verify Job's ensure (the trusted,
+// isolated evidence path). It returns the claimReadPending (the claim was
+// recorded but the phase did not advance — a transient parse fail), the
+// advancedFrom (the phase advanced from Verifying), the verifyRequeue (the
+// stale-Job guard requeue), the s4Changed (the claim read's condition change),
+// and the err (the verify Job's ensure error, other than the stale-Job guard).
+// Extracted from Reconcile to keep it within the gocyclo budget. The
+// applyVerifyOutcome + ensureCheckpointStep calls remain in Reconcile (the
+// checkpoint timing must match the B1 specs — the checkpoint is taken on the
+// same reconcile as the verify outcome, not in a helper that returns early).
+func (r *LoopReconciler) s4ClaimAndVerifyJob(ctx context.Context, loop *coxv1alpha1.Loop) (claimReadPending bool, advancedFrom coxv1alpha1.LoopPhase, verifyRequeue bool, s4Changed bool, err error) {
+	claimReadPending, s4Changed, advancedFrom = r.advancePhaseFromClaim(ctx, loop)
+	verifyRequeue = false
+	if err := r.ensureVerifyJobAndNetPolicies(ctx, loop); err != nil {
+		if !errors.Is(err, errVerifyStaleDeleted) {
+			return claimReadPending, advancedFrom, verifyRequeue, s4Changed, err
+		}
+		verifyRequeue = true
+	}
+	return claimReadPending, advancedFrom, verifyRequeue, s4Changed, nil
+}
+
+// b2GatedBootstrap is the phase bootstrap gated on the B2 hold: when the B2
+// restore step is in progress or deferred (hold), the bootstrap is SKIPPED
+// (the PVC must not be recreated empty — the restore step deletes + recreates
+// it from the snapshot). Returns the bootChanged (the bootstrap's condition
+// change) and the resumeCleared (the P2f resume annotation consumed).
+// Extracted from Reconcile to keep it within the gocyclo budget.
+func (r *LoopReconciler) b2GatedBootstrap(ctx context.Context, loop *coxv1alpha1.Loop, hold bool) (bool, bool, error) {
+	if hold {
+		return false, false, nil // the B2 restore is in progress / deferred / rejected — skip the bootstrap
+	}
+	bootChanged, resumeCleared, err := r.phaseBootstrap(ctx, loop)
+	return bootChanged, resumeCleared, err
+}
+
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var loop coxv1alpha1.Loop
 	if err := r.Get(ctx, req.NamespacedName, &loop); err != nil {
@@ -560,20 +597,55 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// B1 (finalizer): a Loop being deleted (deletionTimestamp set) is in
-	// CleaningUp — its work is the checkpoint GC (delete the Loop's
-	// VolumeSnapshots). The finalizer holds the Loop until the GC is done
-	// (gcLoopCheckpoints returns done when none remain; the finalizer is
-	// removed then so the apiserver can delete the object). Nothing else runs
-	// for a deleting Loop (the sandbox is already gone by the time the Loop
-	// delete is processed — the sandbox is owned by the Loop and the operator
-	// deletes it explicitly when the Loop is cleaned up; the snapshot GC is
-	// the last thing the Loop owns).
 	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
 	// on the first reconcile; idempotent). It is what keeps the Loop alive
 	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
-	if done, res, err := r.reconcileDeletionAndFinalizer(ctx, &loop); done || err != nil {
-		return res, err
+	//
+	// B2: a Loop being deleted (deletionTimestamp set) is in CleaningUp —
+	// its normal work is the checkpoint GC (delete the Loop's VolumeSnapshots)
+	// and the finalizer holds the Loop until the GC is done (CleaningUp).
+	// The B2 restore step runs BEFORE the CleaningUp early return, on the
+	// deleting object: a rollback set at the same time as (or after) the
+	// delete still has to be decided before the Loop disappears (the
+	// condition + the Event + the restored PVC are written at the point of
+	// the decision — the PVC is controller-owned, so a restored PVC is
+	// garbage-collected with the Loop, and the condition is the durable
+	// record the user asked for the restore to have). For a fork
+	// (spec.forkOf) the same applies: a fork being deleted before its
+	// restore completes gets a Restore decision (RestoreSourceMissing —
+	// the snapshot is gone with the source, or the restore is attempted
+	// once) rather than a silent disappearance. The CleaningUp work (the
+	// snapshot GC + the finalizer removal) still runs below, unchanged.
+	b2Deleting := !loop.DeletionTimestamp.IsZero()
+	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
+	// on the first reconcile; idempotent). It is what keeps the Loop alive
+	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
+	//
+	// B2: a Loop being deleted (deletionTimestamp set) is in CleaningUp —
+	// its normal work is the checkpoint GC (delete the Loop's VolumeSnapshots)
+	// and the finalizer holds the Loop until the GC is done (CleaningUp).
+	// The B2 restore step runs BEFORE the CleaningUp early return, on the
+	// deleting object: a rollback set at the same time as (or after) the
+	// delete still has to be decided before the Loop disappears (the
+	// condition + the Event + the restored PVC are written at the point of
+	// the decision — the PVC is controller-owned, so a restored PVC is
+	// garbage-collected with the Loop, and the condition is the durable
+	// record the user asked for the restore to have). For a fork
+	// (spec.forkOf) the same applies: a fork being deleted before its
+	// restore completes gets a Restore decision (RestoreSourceMissing —
+	// the snapshot is gone with the source, or the restore is attempted
+	// once) rather than a silent disappearance. The CleaningUp work (the
+	// snapshot GC + the finalizer removal) still runs below, unchanged.
+	if b2Deleting {
+		// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the B2-deleting early return
+		// (validate + the policy gate + the B2 restore decision + the
+		// CleaningUp work). The B2 decision is the durable record a deleting
+		// Loop leaves behind (finalizeB2DeleteStep persists it before the
+		// snapshot GC runs).
+		return r.finalizeB2DeleteStep(ctx, &loop)
+	}
+	if err := r.applyLoopFinalizer(ctx, &loop); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// C6a + D34: validate the referenced AgentPolicies and the
@@ -598,32 +670,48 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// suspends via validateAgentPolicies + suspendSandboxIfRunning above. Both
 	// gates apply: an invalid policy suspends, and unenforced also suspends.
 
-	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
-	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox
-	// (the phaseBootstrap helper keeps the Reconcile within the gocyclo
-	// budget).
-	changed := false
-	_, resumeCleared, err := r.phaseBootstrap(ctx, &loop)
+	// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the workspace restore step
+	// (restore/rollback/fork). It runs BEFORE phaseBootstrap (the bootstrap's
+	// ensureLoopArtifacts + ensureSandbox would recreate the PVC and build the
+	// sandbox; the restore step DELETEs + recreates the PVC with a dataSource,
+	// and the sandbox build reads the PVC by name, not spec, so a restored
+	// PVC is invisible to it). A completed restore is one-shot (the Restore
+	// condition True/Restored is the marker). The B2 restore step's requeue
+	// (the snapshot is not ReadyToUse yet — the in-progress state, I49 — or a
+	// transient read failed) ORs into the requeue-after in the FINAL return
+	// (below).
+	var err error
+	b2Changed, b2Requeue, b2Hold, err := r.b2ApplyRestoreStep(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	changed := b2Changed // the B2 restore step's condition change (the I90 point-of-decision write)
+
+	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
+	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
+	// phaseBootstrap helper keeps the Reconcile within the gocyclo budget).
+	// B2: when the restore step is in progress or deferred (b2Hold), the
+	// bootstrap SKIPS ensureWorkspacePVC (the restore step deletes + recreates
+	// the PVC from the snapshot; the bootstrap's empty PVC create would mask
+	// the restore decision and recreate the lost PVC empty, defeating the
+	// restore). The sandbox build is also skipped (a restored PVC is invisible
+	// to the sandbox build — the sandbox reads the PVC by name, not spec).
+	bootChanged, resumeCleared, err := r.b2GatedBootstrap(ctx, &loop, b2Hold)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	changed = changed || bootChanged || resumeCleared
 
 	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
 	// and the Required gate. The gate fails the Loop (terminal
 	// Failed:CheckpointUnavailable) at start — before any phase work — when
 	// spec.checkpoints=Required and the snapshot support is absent (no
-	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI
-	// driver). The condition is set on every reconcile (the support may
-	// change: the CRD or a VolumeSnapshotClass can be installed later), but
-	// the gate fires only once (a Failed Loop is terminal and nothing reverts
-	// it). When the gate fires, stop this reconcile (the status write
-	// persists the terminal phase; no sandbox / proxy / verify work runs for a
-	// Loop that cannot be checkpointed).
-	if cpChanged, done, err := r.applyCheckpointGate(ctx, &loop); done || err != nil {
+	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI driver).
+	cpChanged, done, err := r.applyCheckpointGate(ctx, &loop)
+	if done || err != nil {
 		return ctrl.Result{}, err
-	} else {
-		changed = changed || cpChanged
 	}
+	changed = changed || cpChanged
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
@@ -634,18 +722,12 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		changed = true
 	}
 	// S4 (ADR-0004): read the runner's claim from the agent container's
-	// termination message (APIReader path — the sandbox pod is not in the
-	// manager's Pod cache, so the non-cached client is required; the S3 baseCommit
-	// pattern) and advance the phase machine when the claim names the
-	// immediate-next phase (the existing nextPhase table, unchanged, gated by
-	// the OS8 PhaseGate — option B: auto-approve). The claim is size-limited,
 	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
 	// logged and requeued, never acted on; the OS1 progress record is
 	// observability only. The iterate/terminal branches (Verifying ->
 	// Implementing / Failed) are completed by B3 (verify outcome) and B4
 	// (iteration count). See internal/controller/loop_s4_phase.go.
-	claimReadPending, s4Changed, advancedFrom := r.advancePhaseFromClaim(ctx, &loop)
-	changed = changed || s4Changed // S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
+	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
 	// isolated evidence path). The Job is created when the current pin exists
 	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
 	// Verifying advance) and its init containers' exit codes drive the
@@ -667,14 +749,39 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// running at pause time is left to terminate, and its termination produces
 	// no iterate/stall/budget decision because the phase is Paused, not
 	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
-	verifyRequeue := false
-	if err := r.ensureVerifyJobAndNetPolicies(ctx, &loop); err != nil {
-		if errors.Is(err, errVerifyStaleDeleted) {
-			verifyRequeue = true
-		} else {
-			return ctrl.Result{}, err
-		}
+	// S4 (ADR-0004): read the runner's claim from the agent container's
+	// strict-parsed, and never a gate input (ADR-0005): a malformed claim is
+	// logged and requeued, never acted on; the OS1 progress record is
+	// observability only. The iterate/terminal branches (Verifying ->
+	// Implementing / Failed) are completed by B3 (verify outcome) and B4
+	// (iteration count). See internal/controller/loop_s4_phase.go.
+	// S5a (B3): at Verifying, the operator owns the verify Job (the trusted,
+	// isolated evidence path). The Job is created when the current pin exists
+	// (status.currentVerify.VerifiedCommit, pinned on the Implementing ->
+	// Verifying advance) and its init containers' exit codes drive the
+	// Verifying outcome (Succeeded | iterate | TamperedVerify). The
+	// applyVerifyOutcome reader runs every reconcile at Verifying (the B2
+	// tamper gate ALSO runs every reconcile below — order-independent, D38
+	// pattern).
+	//
+	// The stale-Job guard (D27) returns verifyStaleDeleted when it has just
+	// deleted a Job stamped for a different pin. The caller maps it to a
+	// clean requeue (the 5s RequeueAfter in the FINAL return, AFTER the
+	// shared Status().Update) — never a controller error, and never an
+	// in-same-reconcile create of the fresh Job (the name is still taken;
+	// the apiserver deletes async, so a Create here would hit AlreadyExists
+	// and the new pin would be left un-built). The requeue creates the fresh
+	// Job on the next reconcile.
+	// P2f: no Jobs run while paused — the verify Job's ensure is gated on
+	// phase != Paused (a paused Loop has no in-flight verify; a Job that was
+	// running at pause time is left to terminate, and its termination produces
+	// no iterate/stall/budget decision because the phase is Paused, not
+	// Verifying — applyVerifyOutcome already holds on phase != Verifying).
+	claimReadPending, advancedFrom, verifyRequeue, s4Changed, s4Err := r.s4ClaimAndVerifyJob(ctx, &loop)
+	if s4Err != nil {
+		return ctrl.Result{}, s4Err
 	}
+	changed = changed || s4Changed
 	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
@@ -683,10 +790,9 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// ensureCheckpoint prevents re-creation (one checkpoint per iteration).
 	// The checkpoint is keyed off the operator-recorded verify outcome
 	// (status.verify.iteration), not the current iteration.
-	if cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop); cpChanged || cpRequeue {
-		changed = changed || cpChanged
-		verifyRequeue = verifyRequeue || cpRequeue
-	}
+	cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop)
+	changed = changed || cpChanged
+	verifyRequeue = verifyRequeue || cpRequeue
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a
 	// pinned verifiedCommit. The stale-Job guard (D27) deletes a Job stamped
@@ -769,6 +875,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// keep decision was an in-memory annotation on the Loop, then an early
 	// return that skipped the whole finalize; both were wrong — the I61 risk
 	// and the P1 review on #100.)
+	// B2 (PLAN-BETA): the restore step's requeue (the snapshot is not
+	// ReadyToUse yet — the in-progress state, I49 — or a transient read
+	// failed) ORs into the requeue-after (the 5s RequeueAfter in the FINAL
+	// return, AFTER the shared Status().Update). A completed restore is
+	// one-shot (the Restore condition True/Restored is the marker — no
+	// requeue).
+	verifyRequeue = verifyRequeue || b2Requeue
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -785,6 +898,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // defeat optimistic concurrency (it can silently overwrite status another
 // writer just set). Extracted so the top-level reconcile stays within the
 // gocyclo budget.
+
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
 // Status().Update), and — when a phase advance was committed this pass
 // (advancedFrom != "") — emits the PhaseAdvanced Event AFTER the status update
@@ -1502,88 +1616,14 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// item-F refusal) keeps the sandbox Running so the in-flight delivery
 		// completes.
 		desired.Spec.OperatingMode = r.sandboxOperatingMode(loop, pauseBlocked)
-		// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
-		// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
-		// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
-		// invalid policy suspends via suspendSandboxIfRunning, and unenforced
-		// also suspends here. I46: the gate reads the OBSERVED result (the
-		// Enforcer's, or EnforcementUnverified when there is no Enforcer), never
-		// the flag; the escape hatch is applied here, so a flag-set but
-		// unenforced (or unverifiable) engine still lets the sandbox run while
-		// the condition records what was observed.
-		if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
-			if observed, _ := r.enforcementStatus(ctx, loop); !observed && !r.AllowUnenforced {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// D35a: the proxy pod must be Ready and owned by the Loop.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				loop.Spec.Agent.EndpointSecretRef != "" {
-				proxyPod := &corev1.Pod{}
-				perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
-				proxyReady := perr == nil && metav1.IsControlledBy(proxyPod, loop) && isPodReady(proxyPod)
-				if !proxyReady {
-					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-				}
-			}
-			// I42b: the egress proxy pod must be Ready and owned by the Loop when
-			// the effective policy has network allows. Same gate pattern as D35a.
-			// Fails closed: a transient error reading the AgentPolicies holds the
-			// sandbox Suspended (reconcile requeues), never skips the gate.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				needsEgressProxy(ctx, r, loop) {
-				egressPod := &corev1.Pod{}
-				errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egressPod)
-				egressReady := errE == nil && metav1.IsControlledBy(egressPod, loop) && isPodReady(egressPod)
-				if !egressReady {
-					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-				}
-			}
-			// D41c: the tool proxies must all be Ready and owned by the Loop
-			// when the effective policy has ≥1 tool (the owned+Ready gate,
-			// D35a pattern; order-independent like the I42b/I42c-review
-			// gates — it reads the live objects). Fails closed on a transient
-			// read error (toolProxyGatesSuspended returns true), never skips.
-			if r.toolProxyGatesSuspended(ctx, loop) {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// I42c review P2 (round 3): the NetworkPolicy gate must be
-			// ORDER-INDEPENDENT (ensureSandbox runs before ensureNetworkPolicy,
-			// so the conflict set there would flap the next reconcile back to
-			// Running). Read the live objects: hold Suspended when any of this
-			// Loop's netpol names exists and is NOT controlled by the Loop
-			// (same gate pattern as D35a). Absent netpols are not a conflict
-			// (ensureNetworkPolicy creates them); a real read error FAILS CLOSED
-			// (Suspended), consistent with needsEgressProxy.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				foreignNetPols(ctx, r, loop) {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// I42f review P2 (round 1): the KubeArmorPolicy gate mirrors the
-			// NetworkPolicy gate above (reviewer: "like NetworkPolicyConflict").
-			// Hold Suspended when any of this Loop's KubeArmorPolicy names exists
-			// and is NOT controlled by the Loop. createOrUpdateKapt refuses to
-			// take over a foreign policy (errForeignKapt) and the
-			// KubeArmorPolicyConflict condition is set by applyEffectivePolicyAndConditions
-			// on the sentinel; this gate is the order-independent hold (it runs
-			// before the Enforcer.Apply of the same reconcile, so it must read
-			// the live objects). Same fail-closed semantics: a real read error
-			// holds Suspended.
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning &&
-				foreignKaptPolicies(ctx, r, loop) {
-				desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-			}
-			// D38: the CNI self-test gate (network layer, analogous to the D30
-			// eBPF gate above). Unknown (no probe result yet), CNIUnenforced,
-			// and ProbeUnavailable all hold the sandbox Suspended (fail-closed)
-			// unless AllowUnenforcedNetwork is set. The condition is set in
-			// applyEffectivePolicyAndConditions (order-independent, like the
-			// PolicyEnforced condition).
-			if desired.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
-				run, _, _, _ := r.cniNetworkStatus()
-				if !run {
-					desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
-				}
-			}
+		// The suspension gate cascade (B2, D30, D35a, I42b, D41c, I42c, I42f,
+		// D38) holds the sandbox Suspended fail-closed when a required
+		// dependency is not Ready or a workspace restore is in progress. It
+		// runs every reconcile (level-based, order-independent — it reads the
+		// live objects, the I42c review P2 pattern) and is extracted into
+		// sandboxSuspendedByGate for the gocyclo budget.
+		if r.sandboxSuspendedByGate(ctx, loop) {
+			desired.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 		}
 		// C6b (P1 #2) + D33: the sandbox pod carries the coxswain.io/loop label
 		// (KubeArmorPolicy selector) and the D33 agent component label
@@ -1658,6 +1698,104 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		)
 	}
 	return nil
+}
+
+// sandboxSuspendedByGate reports whether any of the sandbox's suspension
+// gates holds (the sandbox must be Suspended, fail-closed): the B2 restore
+// hold (R-B2 design point (b)) runs FIRST — while the workspace restore is
+// in progress (the Restore condition False, reason StoppingSandbox or
+// DeletingPVC) the sandbox must STAY suspended: the restore step stopped it
+// (spec-level suspension is a request; the pod may still be draining) and a
+// flip back to Running mid-restore would remount the PVC the restore is
+// about to delete (pvc-protection would hold the delete until the pod is
+// gone again). The hold clears with the one-shot marker (True/Restored): from
+// the next reconcile the sandbox is built as usual on the restored content
+// (the A2 PVC-resume path). Then the D30/D35a/I42b/D41c/I42c/I42f/D38 gates:
+// the enforcement engine, the model proxy pod, the egress proxy pod, the
+// tool proxies, the NetworkPolicy conflict set, the KubeArmorPolicy conflict
+// set, and the CNI self-test. Every gate reads the LIVE objects (the I42c
+// review P2 pattern: order-independent — the gate runs every reconcile,
+// before the resources it gates are ensured, so it cannot rely on an
+// in-pass conflict set). A real read error FAILS CLOSED (Suspended), never
+// skips the gate. Extracted from ensureSandbox for the gocyclo budget; the
+// semantics are unchanged (each gate's comment is preserved in its original
+// location: ensureSandbox's D30/D35a/I42b/I42c/I42f/D38 gate comments above
+// the CreateOrUpdate, and the D41c/foreignKapt comments below).
+func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if r.b2RestoreHoldSuspended(loop) {
+		return true
+	}
+	// D30 (C6b): if the engine is not enforcing and AllowUnenforced is not
+	// set, hold the sandbox Suspended (fail-closed). The D30 gate applies in
+	// ADDITION to the C6a policy-validity gate (validateAgentPolicies): an
+	// invalid policy suspends via suspendSandboxIfRunning, and unenforced
+	// also suspends here. I46: the gate reads the OBSERVED result (the
+	// Enforcer's, or EnforcementUnverified when there is no Enforcer), never
+	// the flag; the escape hatch is applied here, so a flag-set but
+	// unenforced (or unverifiable) engine still lets the sandbox run while
+	// the condition records what was observed.
+	if observed, _ := r.enforcementStatus(ctx, loop); !observed && !r.AllowUnenforced {
+		return true
+	}
+	// D35a: the proxy pod must be Ready and owned by the Loop.
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		proxyPod := &corev1.Pod{}
+		perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
+		if perr != nil || !metav1.IsControlledBy(proxyPod, loop) || !isPodReady(proxyPod) {
+			return true
+		}
+	}
+	// I42b: the egress proxy pod must be Ready and owned by the Loop when the
+	// effective policy has network allows. Same gate pattern as D35a. Fails
+	// closed: a transient error reading the AgentPolicies holds the sandbox
+	// Suspended (reconcile requeues), never skips the gate.
+	if needsEgressProxy(ctx, r, loop) {
+		egPod := &corev1.Pod{}
+		errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod)
+		if errE != nil || !metav1.IsControlledBy(egPod, loop) || !isPodReady(egPod) {
+			return true
+		}
+	}
+	// D41c: the tool proxies must all be Ready and owned by the Loop when the
+	// effective policy has ≥1 tool (the owned+Ready gate, D35a pattern;
+	// order-independent like the I42b/I42c-review gates — it reads the live
+	// objects). Fails closed on a transient read error
+	// (toolProxyGatesSuspended returns true), never skips.
+	if r.toolProxyGatesSuspended(ctx, loop) {
+		return true
+	}
+	// I42c review P2 (round 3): the NetworkPolicy gate must be
+	// ORDER-INDEPENDENT (ensureSandbox runs before ensureNetworkPolicy, so
+	// the conflict set there would flap the next reconcile back to Running).
+	// Read the live objects: hold Suspended when any of this Loop's netpol
+	// names exists and is NOT controlled by the Loop (same gate pattern as
+	// D35a). Absent netpols are not a conflict (ensureNetworkPolicy creates
+	// them); a real read error FAILS CLOSED (Suspended), consistent with
+	// needsEgressProxy.
+	if foreignNetPols(ctx, r, loop) {
+		return true
+	}
+	// I42f review P2 (round 1): the KubeArmorPolicy gate mirrors the
+	// NetworkPolicy gate above (reviewer: "like NetworkPolicyConflict").
+	// Hold Suspended when any of this Loop's KubeArmorPolicy names exists
+	// and is NOT controlled by the Loop. createOrUpdateKapt refuses to take
+	// over a foreign policy (errForeignKapt) and the KubeArmorPolicyConflict
+	// condition is set by applyEffectivePolicyAndConditions on the sentinel;
+	// this gate is the order-independent hold (it runs before the
+	// Enforcer.Apply of the same reconcile, so it must read the live
+	// objects). Same fail-closed semantics: a real read error holds
+	// Suspended.
+	if foreignKaptPolicies(ctx, r, loop) {
+		return true
+	}
+	// D38: the CNI self-test gate (network layer, analogous to the D30 eBPF
+	// gate above). Unknown (no probe result yet), CNIUnenforced, and
+	// ProbeUnavailable all hold the sandbox Suspended (fail-closed) unless
+	// AllowUnenforcedNetwork is set. The condition is set in
+	// applyEffectivePolicyAndConditions (order-independent, like the
+	// PolicyEnforced condition).
+	run, _, _, _ := r.cniNetworkStatus()
+	return !run
 }
 
 // sandboxDesiredPhaseAnnotation is the annotation the operator stamps on the
@@ -5302,20 +5440,6 @@ func (r *LoopReconciler) ensureObservedGeneration(loop *coxv1alpha1.Loop) bool {
 		return true
 	}
 	return false
-}
-
-// reconcileDeletionAndFinalizer handles the deletion branch (CleaningUp) and
-// the finalizer application. Returns (done, result, err): done is true when
-// the caller should return the result (deletion or error).
-func (r *LoopReconciler) reconcileDeletionAndFinalizer(ctx context.Context, loop *coxv1alpha1.Loop) (bool, ctrl.Result, error) {
-	if !loop.DeletionTimestamp.IsZero() {
-		res, err := r.reconcileCleaningUp(ctx, loop)
-		return true, res, err
-	}
-	if err := r.applyLoopFinalizer(ctx, loop); err != nil {
-		return true, ctrl.Result{}, err
-	}
-	return false, ctrl.Result{}, nil
 }
 
 // ensureVerifyJobAndNetPolicies is the ensureVerifyJobIfActive +

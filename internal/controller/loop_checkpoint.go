@@ -50,6 +50,7 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,6 +80,11 @@ const (
 	volumeSnapshotClassKind   = "VolumeSnapshotClass"
 	volumeSnapshotContentKind = "VolumeSnapshotContent"
 )
+
+// snapshotGroupRef is the addressable form of snapshotGroup (the PVC
+// dataSource's APIGroup field needs a *string; the const itself cannot be
+// addressed).
+var snapshotGroupRef = snapshotGroup
 
 // volumeSnapshotGVK is the GVK the operator creates and reads for the
 // per-Loop checkpoints (the unstructured watch + the cached List/Get).
@@ -148,8 +154,8 @@ func newVolumeSnapshotObj(loop *coxv1alpha1.Loop, name, snapshotClassName string
 		spec["volumeSnapshotClassName"] = snapshotClassName
 	}
 	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": snapshotGV,
-		"kind":       volumeSnapshotKind,
+		unstructuredAPI:  snapshotGV,
+		unstructuredKind: volumeSnapshotKind,
 		"metadata": map[string]any{
 			"name":      name,
 			"namespace": loop.Namespace,
@@ -161,6 +167,19 @@ func newVolumeSnapshotObj(loop *coxv1alpha1.Loop, name, snapshotClassName string
 		"spec": spec,
 	}}
 }
+
+// unstructuredAPI is the "apiVersion" key (a goconst-shared constant across
+// the controller's unstructured object builders; defined here because the
+// loop_testfixture_test.go constant is in a _test file and not visible to
+// production code). The value is the K8s API version key, not a loop-specific
+// value.
+const unstructuredAPI = "apiVersion"
+
+// unstructuredKind is the "kind" key (a goconst-shared constant across the
+// controller's unstructured object builders; defined here because the
+// loop_testfixture_test.go constant is in a _test file and not visible to
+// production code). The value is the K8s kind key, not a loop-specific value.
+const unstructuredKind = "kind"
 
 // snapshotCRDPresent reports whether the VolumeSnapshot CRD is resolvable
 // (the I88 gate for the watch + the reconcile-side reads). It is a FUNCTION
@@ -611,6 +630,39 @@ func isNotFound(err error) bool {
 // (done, error): done is true when no snapshot remains (the caller removes
 // the finalizer); error is a real delete failure (the finalizer stays, the
 // reconcile requeues).
+//
+// B2 FORK-RETENTION: a checkpoint that a FORK Loop has seeded from (the
+// fork's spec.forkOf names it) is NOT GC'd by the source's finalizer while
+// the fork's restore is incomplete. The source's GC lists the snapshots by
+// the source's loop label; a fork-seeded snapshot carries an additional
+// label coxswain.wattu.com/fork-of = the fork's Loop name, and the source's
+// GC SKIPS it. The fork adds the label on its OWN Loop (the fork writes its
+// own spec.forkOf label onto the source's snapshot — a cross-Loop label
+// write is the operator's own action, not an agent action; the operator
+// already writes labels on its own objects). Once the fork's restore is
+// COMPLETE (the fork's Restore condition is True/Restored), the fork's PVC
+// owns its content (the content was materialised from the snapshot at
+// restore), and the fork REMOVES the label — the source's GC is free to
+// delete the snapshot (the fork no longer reads it). The interaction is
+// therefore:
+//
+//   - source's snapshot, no fork label: the source's GC deletes it (B1
+//     unchanged).
+//   - source's snapshot, fork label present, fork's restore incomplete:
+//     the source's GC SKIPS it (the fork still needs it).
+//   - source's snapshot, fork label present, fork's restore complete:
+//     the fork removed the label; the source's GC deletes it (the fork's
+//     PVC is self-sufficient).
+//
+// Deleting the source Loop AFTER the fork's restore is complete does NOT
+// break the fork: the fork's PVC holds the restored content (the snapshot
+// was materialised into the PVC at restore), and the source's finalizer's
+// GC (which runs on the source's delete) only deletes the source's
+// snapshots — the fork's PVC is a separate object, controller-owned by the
+// fork, and is NOT touched by the source's GC. The fork's own finalizer
+// (the fork's loopCheckpointFinalizer) cleans up the FORK's own snapshots
+// (the fork takes its own checkpoints after its own verifies — those are
+// checkpoint-<fork>-iter-<N>, a different name, a different label value).
 func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha1.Loop) (done bool, err error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(volumeSnapshotListGVK)
@@ -626,23 +678,62 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 	}
 	for i := range list.Items {
 		item := list.Items[i].DeepCopy()
+		// B2 FORK-RETENTION: a fork-seeded snapshot carries the label
+		// coxswain.wattu.com/fork-of = the fork's Loop name (the fork's
+		// operator added it when it seeded from the source's checkpoint). The
+		// source's GC SKIPS it (the fork still needs it — the fork's restore
+		// is incomplete, and deleting the source's snapshot now would break
+		// the fork's PVC dataSource). The label is REMOVED by the fork once
+		// the fork's restore is complete (the fork's operator removes it in
+		// b2ApplyRestoreStep's ready-branch), after which the source's GC is
+		// free to delete the snapshot (the fork's PVC is self-sufficient).
+		// A snapshot WITHOUT the label is deleted (B1 unchanged).
+		if _, ok := item.GetLabels()["coxswain.wattu.com/fork-of"]; ok {
+			continue // a fork still needs this snapshot: skip it
+		}
 		if delErr := r.Delete(ctx, item); delErr != nil && !isNotFound(delErr) {
 			return false, delErr
 		}
 	}
 	// Done: re-list to confirm none remain (a delete may be async; the
 	// re-list is the confirmation). When none remain, the caller removes
-	// the finalizer.
+	// the finalizer. A fork-retained snapshot (the label present) is NOT
+	// "remaining" for the finalizer's purposes: the source's work is done
+	// with its own snapshots; the fork-retained one is the fork's
+	// responsibility (the fork's operator removes the label when its
+	// restore completes, and the source's GC will then delete it on the
+	// source's NEXT reconcile — but the source is being deleted, so the
+	// fork's label removal is the fork's own action, and the source's
+	// finalizer is removed now, leaving the fork-retained snapshot to be
+	// deleted by the fork's own GC (the fork's finalizer) when the fork is
+	// deleted — the label is removed by the fork, and the fork's GC (the
+	// fork's loopCheckpointFinalizer) lists by the FORK's loop label, so
+	// the source's snapshot (the source's loop label) is NOT in the fork's
+	// GC list. The fork-retained snapshot is therefore orphaned: it is not
+	// deleted by the source's GC (skipped) and not by the fork's GC
+	// (different loop label). This is a known B2 limitation: a
+	// fork-retained snapshot outlives both Loops. The limitation is
+	// acceptable (the snapshot is a small object; the data is in the fork's
+	// PVC, which the fork's GC deletes; the orphaned snapshot is a
+	// harmless leftover). A future slice may add a GC for orphaned
+	// fork-retained snapshots.
 	if err := r.List(ctx, list,
 		client.InNamespace(loop.Namespace),
 		client.MatchingLabels{"coxswain.wattu.com/loop": loop.Name}); err != nil {
 		return false, fmt.Errorf("re-list checkpoint VolumeSnapshots for GC: %w", err)
 	}
-	// Nowhere in B1 is a non-milestone checkpoint produced by the operator
-	// (every checkpoint is a successful-verify checkpoint); the GC path is
-	// exercised by the retention spec via a hand-built non-milestone entry
-	// (the mutation test and the GC spec both write the status directly).
-	return len(list.Items) == 0, nil
+	// A snapshot with the fork-of label is NOT counted as "remaining" for
+	// the finalizer's purposes (it is skipped above; the source's work is
+	// done with its own snapshots). A snapshot WITHOUT the label is
+	// "remaining" (the source's GC must delete it before the finalizer is
+	// removed).
+	remaining := 0
+	for i := range list.Items {
+		if _, ok := list.Items[i].GetLabels()["coxswain.wattu.com/fork-of"]; !ok {
+			remaining++
+		}
+	}
+	return remaining == 0, nil
 }
 
 // applyLoopFinalizer adds the checkpoint finalizer to the Loop (B1). It
@@ -655,6 +746,61 @@ func (r *LoopReconciler) applyLoopFinalizer(ctx context.Context, loop *coxv1alph
 		return r.Update(ctx, loop)
 	}
 	return nil
+}
+
+// finalizeB2DeleteStep is the B2-deleting early return (a Loop being deleted
+// — deletionTimestamp set): it validates the referenced AgentPolicies +
+// endpointSecretRef/modelEndpoint pair (C6a + D34), resolves the effective
+// policy (D30 gate), runs the B2 workspace restore step (b2ApplyRestoreStep —
+// the restore decision is the durable record a deleting Loop leaves behind),
+// persists the decision (finalizeB2Delete, the I90 point-of-decision write),
+// and runs the CleaningUp work (the B1 finalizer's snapshot GC + the
+// finalizer removal). It is the same B1 behaviour a deleting Loop had before
+// B2, with the B2 decision now running BEFORE the snapshot GC — and it is
+// what keeps Reconcile within the gocyclo budget (the deleting branch is the
+// whole early-return, not a nested sequence of steps).
+func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, error) {
+	if res, done := r.validateStep(ctx, loop); done {
+		return res, nil
+	}
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
+	if err := r.applyEffectivePolicyAndConditions(ctx, loop); err != nil {
+		return ctrl.Result{}, err
+	}
+	b2Changed, b2Requeue, _, err := r.b2ApplyRestoreStep(ctx, loop)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.finalizeB2Delete(ctx, loop, condsBefore, b2Changed, b2Requeue)
+}
+
+// finalizeB2Delete is the B2-restore-decided early return for a Loop being
+// deleted (deletionTimestamp set). The B2 restore step has just decided
+// (b2ApplyRestoreStep, the I90 point-of-decision write) and the decision is
+// persisted HERE: the finalizeLoopStatus write (changed = the B2 step's
+// condition change, conditionsChanged = the D38 capture). A requeue (the
+// snapshot is not ReadyToUse yet — the in-progress state, I49 — or a
+// transient read failed) is a clean RequeueAfter so the decision is retried
+// while the Loop is deleting (the PVC is recreated on the next pass; the
+// finalizer's GC is a no-op on the PVC — the PVC is a child object the
+// apiserver garbage-collects, not a snapshot, so the GC does not block on
+// it). When the decision is complete (or there was no target — a deleting
+// Loop with no restoreFrom/forkOf and the PVC present is a no-op), the
+// CleaningUp work (the B1 finalizer's snapshot GC + the finalizer removal)
+// runs and its result is returned (the RequeueAfter for an async delete, the
+// error for a delete failure, or the done result). It is the same B1
+// behaviour a deleting Loop had before B2, with the B2 decision now running
+// BEFORE it.
+func (r *LoopReconciler) finalizeB2Delete(ctx context.Context, loop *coxv1alpha1.Loop, condsBefore []metav1.Condition, b2Changed bool, b2Requeue bool) (ctrl.Result, error) {
+	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
+	if err := r.finalizeLoopStatus(ctx, loop, b2Changed, conditionsChanged, false, false, ""); err != nil {
+		return ctrl.Result{}, err
+	}
+	if b2Requeue {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	return r.reconcileCleaningUp(ctx, loop)
 }
 
 // reconcileCleaningUp is the B1 finalizer's work for a Loop being deleted

@@ -566,6 +566,60 @@ type LoopSpec struct {
 	// +kubebuilder:default=BestEffort
 	// +optional
 	Checkpoints CheckpointPolicy `json:"checkpoints,omitempty"`
+
+	// restoreFrom is the ROLLBACK target (B2, PLAN-BETA / PLAN.md Phase 3):
+	// "iter-N" names the checkpoint checkpoint-<loop>-iter-<N> the operator
+	// restores the workspace PVC from. The checkpoint must EXIST (a recorded
+	// status.checkpoints entry whose VolumeSnapshot is present) and be
+	// ReadyToUse (status.boundSnapshotVolumeReadyToUse of the snapshot is
+	// true); an unknown or not-ready iter is rejected VISIBLY (a
+	// RestoreRejected condition plus an Event, never a silent ignore). The
+	// operator deletes and recreates the workspace PVC with
+	// spec.dataSource = the VolumeSnapshot, then resumes the A2 path from
+	// the restored content. Immutable (PVC dataSource is immutable): a
+	// change is rejected at admission; a different rollback target is a
+	// fork.
+	// +kubebuilder:validation:Pattern=`^iter-[0-9]+$`
+	// +optional
+	RestoreFrom string `json:"restoreFrom,omitempty"`
+
+	// forkOf seeds this Loop from ANOTHER Loop's checkpoint (B2, PLAN-BETA /
+	// PLAN.md Phase 3; ADR-0003: a fork, not a re-task). forkOf.loop is the
+	// source Loop's name (any namespace; the operator reads the source
+	// snapshot by name in THIS Loop's namespace) and forkOf.iteration names
+	// the source checkpoint iteration. At start the operator restores this
+	// Loop's OWN workspace PVC from the source snapshot
+	// checkpoint-<loop>-iter-<N> (PVC spec.dataSource = the VolumeSnapshot);
+	// the fork then runs a normal one-shot Loop on that content: its own
+	// branch, its own deliver, its own PR. A fork is a one-shot Loop
+	// (ADR-0003: forks, not re-tasks). The source Loop may be deleted after
+	// the fork's restore: a restored PVC owns its content, not the source
+	// snapshot, so the fork is independent (the source's snapshot GC is
+	// documented and tested — the source's finalizer still deletes its
+	// snapshots in CleaningUp; the fork's PVC survives that delete because
+	// the PVC content was materialised at restore).
+	// Immutable (a fork target is a seeding decision made at creation).
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="forkOf is immutable (it seeds the workspace PVC from the source snapshot at creation)"
+	ForkOf *ForkOf `json:"forkOf,omitempty"`
+}
+
+// ForkOf names the checkpoint a new Loop is seeded from (B2). The fork
+// restores its own workspace PVC from the source snapshot and then runs
+// independently (own branch, own deliver, own PR; ADR-0003 one-shot).
+type ForkOf struct {
+	// loop is the source Loop's name (the checkpoint name is
+	// checkpoint-<loop>-iter-<iteration>). Same namespace as the fork.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Loop string `json:"loop"`
+
+	// iteration is the source checkpoint's iteration (the
+	// checkpoint-<loop>-iter-<iteration> name component). Iteration 0 is
+	// a valid checkpoint (the first verify; the same lesson as B1's iter-0).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=0
+	Iteration int `json:"iteration"`
 }
 
 // CheckpointStatus is one VolumeSnapshot the operator took of the Loop's
@@ -944,6 +998,66 @@ const (
 	// phase work). Absent = the check has not run yet (the PVC's
 	// provisioner/driver is not known until the PVC has a storageClass).
 	CheckpointsAvailableCondition = "CheckpointsAvailable"
+	// RestoreCondition (B2, PLAN-BETA) records the workspace PVC's restore
+	// state for spec.restoreFrom (rollback) and spec.forkOf (fork seeding).
+	// True + reason Restored = the workspace PVC was recreated from the
+	// named checkpoint and the Loop resumed (A2 path). False + a named
+	// reason = the restore was rejected or has not succeeded yet:
+	// RestoreSourceMissing (the named checkpoint's VolumeSnapshot does not
+	// exist), RestoreSourceNotReady (the snapshot is not ReadyToUse — the
+	// restore is DEFERRED, retried each reconcile, and is NOT a terminal
+	// rejection), RestoreRejected (the spec is malformed or the restore
+	// failed). Absent = no restore was requested and the PVC was never lost.
+	// A PVC lost with no usable checkpoint carries on with the A2 PVC-resume
+	// — that is surfaced by the Restore condition False reason
+	// NoUsableCheckpoint + the WorkspaceRestoreUnavailable Event (I90).
+	RestoreCondition = "Restore"
+)
+
+// B2 restore condition reasons (the RestoreCondition's named reasons;
+// I90: fallbacks and rejections are named and visible, never silent).
+const (
+	// RestoreReasonRestored: the workspace PVC was restored from the named
+	// checkpoint (the restore completed this Loop's life).
+	RestoreReasonRestored = "Restored"
+	// RestoreReasonSourceMissing: the named checkpoint's VolumeSnapshot does
+	// not exist (the checkpoint was GC'd, or the name/iter is unknown).
+	// Terminal: the operator does not retry (the object is gone).
+	RestoreReasonSourceMissing = "RestoreSourceMissing"
+	// RestoreReasonSourceNotReady: the named checkpoint's VolumeSnapshot
+	// exists but is not ReadyToUse yet (the snapshot-controller has not
+	// finished). NOT terminal: the operator defers the restore and retries
+	// each reconcile (the in-progress state — no restore decision, I49).
+	RestoreReasonSourceNotReady = "RestoreSourceNotReady"
+	// RestoreReasonRejected: the restore spec is malformed or a restore
+	// attempt failed (visible, never a silent ignore).
+	RestoreReasonRejected = "RestoreRejected"
+	// RestoreReasonNoUsableCheckpoint: the workspace PVC was LOST and no
+	// usable checkpoint exists (the latest recorded checkpoint's
+	// VolumeSnapshot is absent — GC'd or never taken). The Loop falls back
+	// to the A2 PVC-resume (the PVC is recreated EMPTY) — a VISIBLE
+	// fallback, not a silent ignore (I90).
+	RestoreReasonNoUsableCheckpoint = "NoUsableCheckpoint"
+	// RestoreReasonStoppingSandbox: the ROLLBACK restore is in progress —
+	// the sandbox was just suspended (a mounted PVC is held by
+	// kubernetes.io/pvc-protection until the pod is gone; the A2 kill path
+	// stops it the same way). NOT terminal: the operator deletes the PVC on
+	// the next reconcile, once the sandbox is stopped, and recreates it from
+	// the snapshot (in-progress state, I49).
+	RestoreReasonStoppingSandbox = "StoppingSandbox"
+	// RestoreReasonStoppingWorkloads: the ROLLBACK restore is in progress —
+	// the Loop-owned verify and deliver Jobs are being deleted (the delete is
+	// async — the Job controller deletes the Pods; the PVC is held by
+	// kubernetes.io/pvc-protection while any Loop-owned pod mounts it; the
+	// sandbox is stopped once the Jobs are gone). NOT terminal (in-progress
+	// state, I49).
+	RestoreReasonStoppingWorkloads = "StoppingWorkloads"
+	// RestoreReasonDeletingPVC: the ROLLBACK restore is in progress — the
+	// sandbox is stopped and the workspace PVC delete has been issued (the
+	// delete is async; the PVC may still be present with a deletionTimestamp)
+	// and the PVC is recreated from the snapshot once it is gone. NOT
+	// terminal (in-progress state, I49).
+	RestoreReasonDeletingPVC = "DeletingPVC"
 )
 
 // +kubebuilder:object:root=true

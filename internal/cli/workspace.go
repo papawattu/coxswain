@@ -110,8 +110,11 @@ spec:
 	// to a deadline (no back-to-back busy loop): a few 1s checks cover the cat
 	// completing in ~2s, and a truly-stuck pod (scheduling/pull) is caught by
 	// the deadline. A still-Pending pod after the deadline is an error.
+	// The B6 run 5/6 found the peek pod takes ~15s to start and fail (image
+	// pull + PVC mount + container start); 8s is too short. 30s covers the
+	// worst case on a slow node.
 	phase := ""
-	for range 8 {
+	for range 30 {
 		phase, _ = p.kubectlGet(ctx, "get", "pod", podName, "-o", "jsonpath={.status.phase}")
 		if phase == "Succeeded" || phase == "Failed" {
 			break

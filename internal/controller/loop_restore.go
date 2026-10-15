@@ -618,6 +618,28 @@ func setRestoreCondition(loop *coxv1alpha1.Loop, status bool, reason, message st
 	})
 }
 
+// setRestoreConditionWithEvent sets the Restore condition AND emits the event
+// only when the reason or status changed (the reviewer's P2, PR #154 follow-up:
+// the event fired on every reconcile in an in-progress state, 2233 in about
+// 8 min on kind). The condition carries the steady state; the event marks the
+// transition. This is the preferred helper for the in-progress restore steps
+// (StoppingWorkloads, StoppingSandbox, DeletingPVC) where the same reason is
+// set on every reconcile until the step completes.
+func (r *LoopReconciler) setRestoreConditionWithEvent(loop *coxv1alpha1.Loop, status bool, reason, message string) {
+	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
+	var want metav1.ConditionStatus
+	if status {
+		want = metav1.ConditionTrue
+	} else {
+		want = metav1.ConditionFalse
+	}
+	reasonChanged := c == nil || c.Reason != reason || c.Status != want
+	setRestoreCondition(loop, status, reason, message)
+	if reasonChanged {
+		r.emitRestoreEvent(loop, status, reason, message)
+	}
+}
+
 // emitRestoreEvent emits the restore Event (the transient signal; the
 // condition is the durable record). Best-effort: a nil Recorder (most
 // envtests) skips it.
@@ -683,10 +705,19 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	pvc := &corev1.PersistentVolumeClaim{}
 	pvcErr := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
 	if pvcErr == nil {
-		// The PVC is still present (even if Terminating). Stop the workloads
-		// first (the verify/deliver Jobs mount the PVC and hold it in
+		// The PVC is still present (even if Terminating). Stop the sandbox
+		// first (the sandbox pod carries the loop label and mounts the
+		// workspace PVC; it must be suspended so the pod is deleted and the
+		// PVC is released — the reviewer's P1, the R-154 kind run: the lost-PVC
+		// path deadlocked because the sandbox was never stopped), then stop
+		// the verify/deliver Jobs (they mount the PVC and hold it in
 		// Terminating via kubernetes.io/pvc-protection), then wait for the PVC
 		// to be fully gone.
+		if err := r.stopSandboxForRestore(ctx, loop); err != nil {
+			log.FromContext(ctx).Error(err, "the restore could not stop the sandbox; no decision on a transient read failure",
+				"loop", loop.Name)
+			return false, true, true, nil
+		}
 		workloadsStopped, err := r.stopWorkloadsForRestore(ctx, loop)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "the restore could not stop the Loop-owned workloads; no decision on a transient read failure",
@@ -694,18 +725,14 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 			return false, true, true, nil
 		}
 		if !workloadsStopped {
-			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+			r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
 				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the Loop-owned workloads are being stopped (the PVC is held by pvc-protection while they mount it)")
 			persist()
-			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
-				"workspace PVC restore: the Loop-owned workloads are being stopped")
 			return true, true, true, nil
 		}
-		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+		r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
 			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still present (being deleted); waiting for it to be fully gone before creating the new one")
 		persist()
-		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
-			"workspace PVC restore: waiting for the old PVC to be fully gone")
 		return true, true, true, nil
 	}
 	if !apierrors.IsNotFound(pvcErr) {
@@ -733,6 +760,16 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 }
 
 func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, bool, error) {
+	// A deleted Loop needs no workspace (the reviewer's P1, PR #154 follow-up):
+	// the restore step runs for a Loop with a deletionTimestamp, and the
+	// CleaningUp/finalizer path never completes (the restore step keeps
+	// re-setting the Restore condition and re-emitting the event, and the
+	// checkpoints finalizer is never cleared because the phase machine is
+	// skipped while the restore hold is active). Skip the B2 restore decision
+	// entirely when the Loop is being deleted.
+	if loop.DeletionTimestamp != nil {
+		return false, false, false, nil
+	}
 	// A fork whose restore is complete (the one-shot marker) has nothing
 	// left to do here EXCEPT remove its fork-retention label from the source
 	// snapshot (the source's GC is then free to delete it — the fork's PVC

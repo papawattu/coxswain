@@ -1196,4 +1196,99 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 
 		_ = rec // the Event is emitted by the operator; the condition is the durable record
 	})
+
+	It("RESTORE (reactive, Terminating PVC + sandbox pod): the sandbox is suspended while Restore is StoppingWorkloads (the sandbox pod carries the loop label and mounts the workspace PVC; the restore hold suspends the sandbox so the pod is deleted and the PVC is released)", func() {
+		ns := "b2-restore-term-sandbox-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "restore-term-sandbox-loop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, rec := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		// Create the sandbox pod with the loop label and the workspace PVC
+		// volume (the sandbox pod's shape on a real cluster: it carries
+		// coxswain.wattu.com/loop=<loop> and mounts the workspace PVC).
+		// Delete any existing pod first (the operator's ensureSandbox may have
+		// created one during b1DriveToSucceeded).
+		existingPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: b2SandboxName(name), Namespace: ns}}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, existingPod); err == nil {
+			_ = k8sClient.Delete(ctx, existingPod)
+		}
+		Expect(k8sClient.Create(ctx, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      b2SandboxName(name),
+				Namespace: ns,
+				Labels:    map[string]string{loopLabelKey: name},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: agentContainerName, Image: s3StandinImage},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "workspace",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: workspacePVCName(name),
+							},
+						},
+					},
+				},
+			},
+		})).To(Succeed())
+
+		// Ensure the sandbox is Running (the restore hold must suspend it;
+		// if it's already Suspended, the spec can't prove the hold works).
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, sb)).To(Succeed())
+		if sb.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeRunning {
+			sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
+			Expect(k8sClient.Update(ctx, sb)).To(Succeed())
+		}
+
+		// Put the PVC in Terminating state: add a finalizer, then delete it.
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
+		pvc.Finalizers = append(pvc.Finalizers, "b2-test/fake-finalizer")
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+
+		// Reconcile: the operator detects the Terminating PVC (treated as LOST
+		// by workspacePVCPresent) + the ready checkpoint and starts the
+		// reactive restore. The restore hold is active (StoppingWorkloads), so
+		// the sandbox is suspended (the sandbox pod is deleted, releasing the
+		// PVC). Two reconciles: the first sets the Restore condition
+		// (StoppingWorkloads), the second applies the hold (suspends the
+		// sandbox via sandboxSuspendedByGate).
+		b2Reconcile(r, ns, name)
+		b2Reconcile(r, ns, name)
+
+		By("the Restore condition is StoppingWorkloads (the restore is in progress)")
+		restoredLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, restoredLoop)).To(Succeed())
+		cond := b2RestoreCondition(restoredLoop)
+		Expect(cond).NotTo(BeNil(), "the operator must set the Restore condition (the restore is in progress)")
+		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonStoppingWorkloads),
+			"the Restore condition's reason must be StoppingWorkloads (the workloads are being stopped), got: "+cond.Reason)
+
+		By("the Sandbox is suspended (the restore hold covers StoppingWorkloads, so the sandbox is Suspended and its pod is deleted, releasing the PVC)")
+		sb2 := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, sb2)).To(Succeed())
+		Expect(sb2.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the Sandbox must be Suspended while Restore is StoppingWorkloads (the restore hold covers StoppingWorkloads; the sandbox pod is deleted and the PVC is released)")
+
+		_ = rec
+	})
+
 })

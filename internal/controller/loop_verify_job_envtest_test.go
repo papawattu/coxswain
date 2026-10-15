@@ -17,7 +17,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 
@@ -1827,7 +1826,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			"no verify-2: a re-pin from the stale claim would create it")
 	})
 
-	It("adds an IPBlock egress rule for an external repo host (D61)", func() {
+	It("allows egress to the egress-proxy pod (no IPBlock) for an external repo host (D61)", func() {
 		ns := "s5a-external-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -1835,13 +1834,6 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		}()
 
 		name := "extloop"
-		// Override lookupRepoHost for deterministic IP resolution.
-		origLookup := lookupRepoHost
-		lookupRepoHost = func(ctx context.Context, host string) ([]net.IP, error) {
-			return []net.IP{net.ParseIP("140.82.121.4")}, nil // github.com's IP
-		}
-		defer func() { lookupRepoHost = origLookup }()
-
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
 			Type:       corev1.SecretTypeBasicAuth,
@@ -1863,21 +1855,86 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		npol := &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: npolName, Namespace: ns}, npol)).To(Succeed())
 
-		// The egress rules must include an IPBlock for 140.82.121.4/32 on port 443.
-		found := false
+		// The egress rules must include a rule to the egress-proxy POD (the
+		// PodSelector carries the egress-proxy labels) on the egress-proxy port,
+		// and NO IPBlock anywhere (the IPBlock approach is unsafe: an IPv6
+		// "/32" is a 2^96 hole, github.com rotates IPs, and it bypasses the
+		// egress proxy's SNI allowlist + logging).
+		epg := egressProxyLabels(name)
+		foundProxyPeer := false
 		for _, rule := range npol.Spec.Egress {
 			for _, peer := range rule.To {
-				if peer.IPBlock != nil && peer.IPBlock.CIDR == "140.82.121.4/32" {
-					for _, p := range rule.Ports {
-						if p.Port.IntValue() == 443 {
-							found = true
+				if peer.IPBlock != nil {
+					Fail("the verify NetworkPolicy must have NO IPBlock rule for an external repo host (D61)")
+				}
+				if peer.PodSelector != nil {
+					match := true
+					for k, v := range epg {
+						if peer.PodSelector.MatchLabels[k] != v {
+							match = false
+							break
+						}
+					}
+					if match {
+						for _, p := range rule.Ports {
+							if p.Port.IntValue() == int(egressProxyPort) {
+								foundProxyPeer = true
+							}
 						}
 					}
 				}
 			}
 		}
-		Expect(found).To(BeTrue(),
-			"the verify NetworkPolicy must have an IPBlock egress rule for the external repo host (D61)")
+		Expect(foundProxyPeer).To(BeTrue(),
+			"the verify NetworkPolicy must have an egress rule to the egress-proxy pod on the egress-proxy port (D61)")
+	})
+
+	It("puts the egress-proxy env on the verify clone-base for an external repo host (D61, I42)", func() {
+		ns := "s5a-ext-env-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "extenv"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{workspaceCredsUsernameKey: []byte("u"), workspaceCredsPasswordKey: []byte("p")},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/org/repo.git", GitCredentialSecret: "test-cred"},
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+			},
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
+		var cloneCt *corev1.Container
+		for i := range job.Spec.Template.Spec.InitContainers {
+			if job.Spec.Template.Spec.InitContainers[i].Name == "clone-base" {
+				cloneCt = &job.Spec.Template.Spec.InitContainers[i]
+			}
+		}
+		Expect(cloneCt).NotTo(BeNil(), "the clone-base init container must exist")
+		env := map[string]string{}
+		for _, e := range cloneCt.Env {
+			env[e.Name] = e.Value
+		}
+		// The clone-base fetches through the egress proxy for an external repo
+		// (github.com): HTTPS_PROXY points at the per-Loop egress-proxy
+		// Service. The SNI allowlist carries the repo host (verifyProxyHost ->
+		// ensureEgressProxy), so the proxy admits the fetch.
+		Expect(env["HTTPS_PROXY"]).To(ContainSubstring("-egress-proxy"),
+			"the external-repo verify clone-base must traverse the egress proxy (D61, I42)")
+		Expect(env["NO_PROXY"]).To(ContainSubstring("-egress-proxy"),
+			"the proxy FQDN must be in NO_PROXY (no loop to the proxy)")
 	})
 })
 

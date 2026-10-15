@@ -932,7 +932,13 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		name := "netpol1"
 		r := s6Succeeded(name, ns, githubRepoURL)
-		s6Reconcile(r, ns, name)
+		// D61: the egress proxy's SNI allowlist gains api.github.com:443 once the
+		// Loop reaches Succeeded (deliveryExpected -> deliverEgressProxyHosts),
+		// which churns the proxy pod's spec-hash (delete + recreate). Reconcile
+		// until the pod is stable (no spec drift) and owned by the Loop, so the
+		// allowlist assertion below reads the FINAL pod (not a transient absent
+		// state between the delete and recreate).
+		s6ReadyEgressProxy(r, ns, name)
 
 		By("allowlisting exactly {github.com, api.github.com} on the egress proxy")
 		pod := &corev1.Pod{}

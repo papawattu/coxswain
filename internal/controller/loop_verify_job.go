@@ -470,6 +470,32 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		},
 	}
 
+	// D61 (I42): for an EXTERNAL repo host (repoPeer nil — e.g. github.com),
+	// the clone-base fetch traverses the egress proxy. The verify NetworkPolicy
+	// allows egress to the egress-proxy pod (ensureVerifyNetworkPolicy) and the
+	// proxy's SNI allowlist carries the repo host (deliverEgressProxyHosts in
+	// ensureEgressProxy). The proxy env vars route git's fetch through the
+	// egress proxy Service; NO_PROXY keeps in-cluster egress (the workspace
+	// PVC, the model proxy) direct. Mirrors the deliver Job's clone-base (I42d)
+	// and the workspace init container's S6 proxy env. An in-cluster repo
+	// (repoPeer non-nil) keeps the direct path — no proxy env.
+	if r.verifyNeedsProxy(loop) {
+		proxyURL := r.egressProxyServiceURL(loop.Name, loop.Namespace)
+		noProxy := strings.Join([]string{
+			EgressProxyServiceFQDN(loop.Name, loop.Namespace),
+			EgressProxyServiceFQDN(loop.Name, loop.Namespace) + "." + r.clusterDomain(),
+			noProxyLocal,
+		}, ",")
+		cloneCt.Env = append(cloneCt.Env,
+			corev1.EnvVar{Name: envHTTPSProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHttpsProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHTTPProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHttpProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envNoProxy, Value: noProxy},
+			corev1.EnvVar{Name: envNoProxyLower, Value: noProxy},
+		)
+	}
+
 	// The git credential mount: ONLY when the Loop declares a git secret AND
 	// ONLY into the clone-base container (the operator's trusted container,
 	// never the agent's). The secret is a standard kubernetes.io/basic-auth
@@ -732,6 +758,21 @@ echo "clone-base ok"
 `, shellQuote(repo), shellQuote(baseCommit))
 }
 
+// verifyNeedsProxy is true when the verify Job's clone-base fetch must
+// traverse the egress proxy (D61, I42): the repo is set and its host is
+// EXTERNAL (repoPeer nil — no expressible NetworkPolicy repo rule: an external
+// FQDN such as github.com, or an unmapped bare name). An in-cluster repo
+// (repoPeer non-nil) uses the direct repo-peer rule and never the proxy. The
+// verify Job always fetches baseCommit from origin (the pin is set), so the
+// proxy is needed for any external repo. The egress proxy's SNI allowlist is
+// already wired by deliverEgressProxyHosts (the verify repo is the same repo
+// delivery pushes, so the host is on the allowlist whenever verify needs the
+// proxy — see ensureEgressProxy).
+func (r *LoopReconciler) verifyNeedsProxy(loop *coxv1alpha1.Loop) bool {
+	return loop.Spec.Workspace.Repo != "" &&
+		repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost) == nil
+}
+
 // ensureVerifyNetworkPolicy creates or updates the verify Job's NetworkPolicy:
 // egress only to the git repo peer (for the clone-base fetch) + DNS. The
 // verify pod has NO model/egress access — it is a trusted, isolated check
@@ -741,12 +782,16 @@ echo "clone-base ok"
 // I42c pattern (createOrUpdateNP): the spec is set in the mutate func so that
 // input changes (e.g. the repo port) propagate to an existing policy.
 //
-// D61: for EXTERNAL repo hosts (repoPeer nil — e.g. github.com), the
-// NetworkPolicy cannot name the host (K8s NetworkPolicy peers are IPs, pods,
-// or namespaces, not DNS names). The operator resolves the host's IP at
-// reconcile time and adds an IPBlock egress rule. The verify Job is
-// short-lived (minutes), so IP staleness between reconciles is acceptable;
-// the next reconcile updates the rule if the IP changes.
+// D61 (I42/I72): for EXTERNAL repo hosts (repoPeer nil — e.g. github.com),
+// the NetworkPolicy cannot name the host (K8s peers are IPs, pods, or
+// namespaces, not DNS names). As the deliver Job does (I42), the clone-base
+// fetch traverses the Loop's egress proxy: the egress adds a rule to the
+// egress-proxy POD (egressProxyLabels) on egressProxyPort, and the proxy's
+// SNI allowlist carries the repo host (deliverEgressProxyHosts, wired in
+// ensureEgressProxy). No IPBlock: an operator-resolved IP is unsafe (an
+// IPv6 "/32" is a 2^96 hole), flaky (github.com rotates IPs — the operator's
+// resolution need not match the pod's seconds later), and outside the
+// egress proxy's SNI allowlist + logging.
 func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return nil
@@ -759,28 +804,25 @@ func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *co
 		{To: []networkingv1.NetworkPolicyPeer{dnsPeer()}, Ports: dnsPorts()},
 	}
 	if peer := repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost); peer != nil {
+		// An in-cluster repo: the direct repo-peer rule (no proxy hop).
 		port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
 		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 			To:    []networkingv1.NetworkPolicyPeer{*peer},
 			Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
 		})
 	} else {
-		// D61: external repo host — resolve the IP and add an IPBlock rule.
-		host := workspaceRepoHost(loop.Spec.Workspace.Repo)
-		port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
-		ips, err := lookupRepoHost(ctx, host)
-		if err != nil {
-			return fmt.Errorf("resolve repo host %s for verify netpol: %w", host, err)
+		// D61 (I42): an external repo host — the clone-base fetch traverses the
+		// egress proxy (mirrors ensureDeliverNetPolicies). The proxy pod carries
+		// egressProxyLabels; the SNI allowlist carries the repo host.
+		peer := networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: egressProxyLabels(loop.Name)},
 		}
-		for _, ip := range ips {
-			cidr := ip.String() + "/32"
-			egress = append(egress, networkingv1.NetworkPolicyEgressRule{
-				To: []networkingv1.NetworkPolicyPeer{
-					{IPBlock: &networkingv1.IPBlock{CIDR: cidr}},
-				},
-				Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
-			})
-		}
+		port := intstrPtr32(egressProxyPort)
+		protocol := corev1.ProtocolTCP
+		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+			To:    []networkingv1.NetworkPolicyPeer{peer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: &protocol}},
+		})
 	}
 	npol := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{

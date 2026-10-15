@@ -2587,6 +2587,12 @@ const (
 	envAllProxyLower = "all_proxy"
 )
 
+// noProxyLocal is the loopback NO_PROXY value (the egress proxy's NO_PROXY
+// carries it so a client never proxies to the proxy itself). A constant so
+// the egressNOProxy + deliverProxyEnv + verifyProxyEnv call sites do not
+// each carry the literal (goconst: three occurrences trips the linter).
+const noProxyLocal = "localhost,127.0.0.1"
+
 // operatorProxyEnv returns the operator-owned proxy env vars for the egress
 // proxy (I42d): HTTPS_PROXY/https_proxy and HTTP_PROXY/http_proxy point at
 // the egress proxy Service. NO_PROXY/no_proxy are appended by the caller
@@ -2935,6 +2941,32 @@ func (r *LoopReconciler) workspaceInitProxyHost(loop *coxv1alpha1.Loop) string {
 	return host
 }
 
+// verifyProxyHost is the repo host to add to the egress proxy's SNI allowlist
+// for the verify Job's clone-base fetch (D61, I42): the repo URL's host:port
+// when the verify Job's clone-base traverses the proxy (verifyNeedsProxy — an
+// EXTERNAL repo host, github.com, ...). An in-cluster repo (repoPeer non-nil)
+// returns "" (the direct repo-peer rule covers it, no proxy hop). It is NOT
+// phase-gated (unlike a per-phase gate) so the egress proxy's SNI allowlist —
+// and therefore the proxy pod's spec and spec-hash — is STABLE across phase
+// transitions (no pod recreation churn): the verify host is the same string
+// as the deliver host for the same repo, so it dedupes with deliverEgressProxy
+// Hosts in ensureEgressProxy. The port is the repo port (git dials it), so the
+// proxy matches the connection.
+func (r *LoopReconciler) verifyProxyHost(loop *coxv1alpha1.Loop) string {
+	if !r.verifyNeedsProxy(loop) {
+		return ""
+	}
+	host := workspaceRepoHost(loop.Spec.Workspace.Repo)
+	if host == "" {
+		return ""
+	}
+	port := workspaceRepoPort(loop.Spec.Workspace.Repo)
+	if port > 0 {
+		return fmt.Sprintf("%s:%d", host, port)
+	}
+	return host
+}
+
 func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	log := logf.FromContext(ctx)
 	// One read of the referenced AgentPolicies for the whole path (P3: no
@@ -2954,6 +2986,15 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		networkAllows = append(networkAllows, host)
 		hasAllows = true
 	}
+	// D61 (I42): the verify Job's clone-base fetch traverses the egress proxy
+	// for an EXTERNAL repo host (github.com, ...) — the verify NetworkPolicy
+	// allows egress to the egress-proxy pod and the proxy's SNI allowlist must
+	// carry the repo host. An in-cluster repo (repoPeer non-nil) keeps the
+	// direct repo-peer rule and adds no host.
+	if host := r.verifyProxyHost(loop); host != "" {
+		networkAllows = append(networkAllows, host)
+		hasAllows = true
+	}
 	// S6: the deliver Job's git push + provider API traverse the proxy for an
 	// external repo host (github.com, ...). The SNI allowlist must carry the
 	// repo host AND api.github.com for a GitHub delivery (deliverEgressProxy
@@ -2966,6 +3007,24 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 			hasAllows = true
 		}
 	}
+	// Dedupe the allowlist (order-preserving): the verify + deliver + workspace
+	// init hosts can overlap for the same repo (verifyProxyHost and
+	// deliverEgressProxyHosts both carry github.com:443 for a github.com
+	// PullRequest delivery). A duplicate host would change the proxy pod's
+	// EGRESS_POLICY_JSON env and spec-hash, churning the pod (spec drift ->
+	// delete + recreate) and breaking the S6 "allowlist is exactly {...}" spec
+	// (ConsistOf counts elements, so a duplicate trips it). The SNI allowlist
+	// is a set — duplicates are semantically identical.
+	seen := map[string]bool{}
+	uniqueAllows := networkAllows[:0]
+	for _, h := range networkAllows {
+		if seen[h] {
+			continue
+		}
+		seen[h] = true
+		uniqueAllows = append(uniqueAllows, h)
+	}
+	networkAllows = uniqueAllows
 	if !hasAllows {
 		// No network allows: no egress proxy needed. Clean up if one exists.
 		// P3: clear a stale EgressProxyConflict here too — if a foreign pod once
@@ -4374,19 +4433,6 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 		}
 	}
 	return nil
-}
-
-// lookupRepoHost resolves an external repo host's IP addresses via net.LookupIP.
-// It is a package-level variable (not a function) so envtest specs can override
-// it for deterministic IP resolution without real DNS. The returned IPs are
-// used to build IPBlock rules for the verify NetworkPolicy (D61): external
-// repo hosts (e.g. github.com) cannot be expressed as NetworkPolicy peers
-// (K8s peers are IPs, pods, or namespaces, not DNS names), so the operator
-// resolves the IP at reconcile time and adds an IPBlock /32 rule. The verify
-// Job is short-lived (minutes), so IP staleness between reconciles is
-// acceptable; the next reconcile updates the rule if the IP changes.
-var lookupRepoHost = func(ctx context.Context, host string) ([]net.IP, error) {
-	return net.LookupIP(host)
 }
 
 // repoPeer is the NetworkPolicy peer for the sandbox pod's workspace init

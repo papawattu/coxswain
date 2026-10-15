@@ -1,0 +1,46 @@
+# coxswain Helm chart (dist/chart)
+
+The chart is generated from the kustomize overlays by `make build-installer`
+(hack/build-installer.sh renders it with the helm plugin). It ships the
+operator's CRDs, RBAC, manager Deployment, admission (ValidatingAdmissionPolicy
++ binding), the cni-probe namespace, and the metrics service — the same set as
+`dist/install.yaml` (the `chart-check` target verifies the chart is a superset
+of install.yaml: every (kind, name) the kustomize build carries is in the
+chart's rendered output).
+
+## Values of note
+
+- `rbac.namespaced` (default `false`): `false` installs ClusterRole +
+  ClusterRoleBinding (all namespaces); `true` installs Role + RoleBinding
+  (release namespace only).
+- `rbac.helpers.enabled` (default `false`): installs the convenience
+  `loop-admin` / `loop-editor` / `loop-viewer` roles for the `loops` CRD.
+
+## Driving Manual-mode approvals with the cox CLI (rbac.helpers.enabled)
+
+`cox approve <loop>` and `cox reject <loop> --reason <reason>` PATCH the
+Loop's status conditions (PlanApproved / PlanRejected). The base operator
+roles do not grant a user the `patch` verb on `loops`, so a human driving
+Manual-mode approvals (`approval.mode: Manual`) needs the **loop editor**
+role — or an equivalent binding:
+
+- install with `--set rbac.helpers.enabled=true` (creates the `loop-editor`
+  role with `create;delete;get;list;patch;update;watch` on
+  `coxswain.wattu.com/loops`), then bind it to a user or group:
+
+  ```bash
+  kubectl create rolebinding <name> \
+    --role=loop-editor --user=<user> \
+    -n <release-namespace>
+  ```
+
+  (with `rbac.namespaced=false` the role is a ClusterRole: use
+  `--clusterrole=loop-editor --user=<user>` without `-n`.)
+
+- or create your own Role/ClusterRole + binding with the `patch` verb on
+  `loops` (the minimum `cox approve`/`reject`/`diff` need).
+
+Without such a binding, `cox approve`/`reject` are rejected by the API
+server. The operator is unaffected: Auto-mode Loops advance without any
+user action, and the `cox` CLI still works for read-only commands
+(`cox get/describe/history/plan/diff` use `get`).

@@ -48,6 +48,26 @@ func (d *dynamicLoopClient) Get(ctx context.Context, name string) (runtime.Objec
 	return d.c.Resource(loopGVR).Namespace(d.ns).Get(ctx, name, metav1.GetOptions{})
 }
 
+// Create applies a NEW Loop object (the main resource; the dynamic client's
+// Create issues a POST). A new object must NOT go through Update, which PUTs
+// to the STATUS subresource and 404s for a Loop that does not exist yet —
+// the B6 run 12's `cox fork` failure: forkLoop built a new Loop object and
+// applied it via Loops.Update, so the operator never saw it.
+func (d *dynamicLoopClient) Create(ctx context.Context, obj runtime.Object) error {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return fmt.Errorf("cli: expected *unstructured.Unstructured, got %T", obj)
+	}
+	if u.GetKind() == "" {
+		u.SetKind("Loop")
+	}
+	if u.GetAPIVersion() == "" {
+		u.SetAPIVersion("coxswain.wattu.com/v1alpha1")
+	}
+	_, err := d.c.Resource(loopGVR).Namespace(d.ns).Create(ctx, u, metav1.CreateOptions{})
+	return err
+}
+
 // Patch applies a JSON merge patch to the named Loop's main resource.
 // (The CLI's commands patch only the main resource — spec.suspend and
 // metadata.annotations. The subresource parameter is accepted for interface

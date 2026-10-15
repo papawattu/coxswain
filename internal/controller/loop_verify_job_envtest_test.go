@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -1824,6 +1825,59 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		job2 := &batchv1.Job{}
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-2", Namespace: ns}, job2))).To(BeTrue(),
 			"no verify-2: a re-pin from the stale claim would create it")
+	})
+
+	It("adds an IPBlock egress rule for an external repo host (D61)", func() {
+		ns := "s5a-external-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "extloop"
+		// Override lookupRepoHost for deterministic IP resolution.
+		origLookup := lookupRepoHost
+		lookupRepoHost = func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("140.82.121.4")}, nil // github.com's IP
+		}
+		defer func() { lookupRepoHost = origLookup }()
+
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{workspaceCredsUsernameKey: []byte("u"), workspaceCredsPasswordKey: []byte("p")},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/org/repo.git", GitCredentialSecret: "test-cred"},
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+			},
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		npolName := name + "-verify-netpol"
+		npol := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: npolName, Namespace: ns}, npol)).To(Succeed())
+
+		// The egress rules must include an IPBlock for 140.82.121.4/32 on port 443.
+		found := false
+		for _, rule := range npol.Spec.Egress {
+			for _, peer := range rule.To {
+				if peer.IPBlock != nil && peer.IPBlock.CIDR == "140.82.121.4/32" {
+					for _, p := range rule.Ports {
+						if p.Port.IntValue() == 443 {
+							found = true
+						}
+					}
+				}
+			}
+		}
+		Expect(found).To(BeTrue(),
+			"the verify NetworkPolicy must have an IPBlock egress rule for the external repo host (D61)")
 	})
 })
 

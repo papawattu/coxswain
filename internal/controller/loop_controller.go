@@ -4376,6 +4376,19 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 	return nil
 }
 
+// lookupRepoHost resolves an external repo host's IP addresses via net.LookupIP.
+// It is a package-level variable (not a function) so envtest specs can override
+// it for deterministic IP resolution without real DNS. The returned IPs are
+// used to build IPBlock rules for the verify NetworkPolicy (D61): external
+// repo hosts (e.g. github.com) cannot be expressed as NetworkPolicy peers
+// (K8s peers are IPs, pods, or namespaces, not DNS names), so the operator
+// resolves the IP at reconcile time and adds an IPBlock /32 rule. The verify
+// Job is short-lived (minutes), so IP staleness between reconciles is
+// acceptable; the next reconcile updates the rule if the IP changes.
+var lookupRepoHost = func(ctx context.Context, host string) ([]net.IP, error) {
+	return net.LookupIP(host)
+}
+
 // repoPeer is the NetworkPolicy peer for the sandbox pod's workspace init
 // container's git egress (S3a), fail-closed: a numeric IP host is an ipBlock
 // /32; an in-cluster Service FQDN (host ending ".svc" or

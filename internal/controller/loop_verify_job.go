@@ -740,6 +740,13 @@ echo "clone-base ok"
 //
 // I42c pattern (createOrUpdateNP): the spec is set in the mutate func so that
 // input changes (e.g. the repo port) propagate to an existing policy.
+//
+// D61: for EXTERNAL repo hosts (repoPeer nil — e.g. github.com), the
+// NetworkPolicy cannot name the host (K8s NetworkPolicy peers are IPs, pods,
+// or namespaces, not DNS names). The operator resolves the host's IP at
+// reconcile time and adds an IPBlock egress rule. The verify Job is
+// short-lived (minutes), so IP staleness between reconciles is acceptable;
+// the next reconcile updates the rule if the IP changes.
 func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return nil
@@ -757,6 +764,23 @@ func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *co
 			To:    []networkingv1.NetworkPolicyPeer{*peer},
 			Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
 		})
+	} else {
+		// D61: external repo host — resolve the IP and add an IPBlock rule.
+		host := workspaceRepoHost(loop.Spec.Workspace.Repo)
+		port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
+		ips, err := lookupRepoHost(ctx, host)
+		if err != nil {
+			return fmt.Errorf("resolve repo host %s for verify netpol: %w", host, err)
+		}
+		for _, ip := range ips {
+			cidr := ip.String() + "/32"
+			egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+				To: []networkingv1.NetworkPolicyPeer{
+					{IPBlock: &networkingv1.IPBlock{CIDR: cidr}},
+				},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
+			})
+		}
 	}
 	npol := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{

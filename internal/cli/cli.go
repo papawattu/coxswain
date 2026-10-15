@@ -39,6 +39,10 @@ var Kubeconfig string
 type LoopClient interface {
 	// Get returns the named Loop (or a not-found error).
 	Get(ctx context.Context, name string) (runtime.Object, error)
+	// Create applies a NEW Loop object (the main resource; the `fork` command
+	// uses it — a new Loop must not go through Update, which PUTs to the
+	// status subresource and 404s for a Loop that does not exist yet).
+	Create(ctx context.Context, obj runtime.Object) error
 	// Patch applies a JSON merge patch (or a raw patch) to the named Loop.
 	// The subresource is "" for the main resource, "status" for the status
 	// subresource.

@@ -122,7 +122,10 @@ func forkLoop(ctx context.Context, dc Deps, ns, forkName, sourceLoop string, ite
 
 	// Build the fork's Loop object (a new Loop with spec.forkOf set).
 	fork := buildForkLoop(forkName, ns, sourceLoop, iteration, workspace, model)
-	if err := dc.Loops.Update(ctx, fork); err != nil {
+	// Apply the fork as a NEW object (Create, the main resource) — not Update,
+	// which PUTs to the status subresource and 404s for a Loop that does not
+	// exist yet (the B6 run 12's `cox fork` failure).
+	if err := dc.Loops.Create(ctx, fork); err != nil {
 		return fmt.Errorf("apply the fork Loop %s: %w", forkName, err)
 	}
 	w := newWriter(out)

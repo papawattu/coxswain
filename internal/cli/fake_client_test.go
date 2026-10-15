@@ -20,6 +20,8 @@ type fakeLoopClient struct {
 	patches []patchCall
 	// updates records the whole object of every Update call.
 	updates []runtime.Object
+	// creates records the whole object of every Create call.
+	creates []runtime.Object
 
 	// patchResult / getResult are injected errors (nil = success).
 	patchResult error
@@ -69,6 +71,13 @@ func (f *fakeLoopClient) Update(_ context.Context, obj runtime.Object) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updates = append(f.updates, obj)
+	return nil
+}
+
+func (f *fakeLoopClient) Create(_ context.Context, obj runtime.Object) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creates = append(f.creates, obj)
 	return nil
 }
 

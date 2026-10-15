@@ -518,9 +518,11 @@ and `Delivered` (draft PR on the sandbox repo). Evidence:
   `kubearmor.io/enforcer=bpf`, kernel `7.0.0-28-generic`. (Not AppArmor.)
 - **Gates live**: `PolicyEnforced=True (Enforcing)`, `NetworkEnforced=True
   (CNIEnforced)`, `ModelAvailable=True (Recovered)`, `Delivered=True`.
-- **KubeArmor policy** (the exec/file gate): the operator's KubeArmorPolicy
-  for the agent is `action: Block` (default-deny) — only the model-proxy hop
-  + model endpoint are allowed.
+- **KubeArmor policy** (the network allow): the operator's KubeArmorPolicy for
+  the agent is `action: Block` (default-deny) with an Allow for the model-proxy
+  hop + model endpoint. It governs the **network** policy via BPF-LSM; it has
+  no exec-deny rule (a `kubectl exec` is not blocked — see the
+  `Known limitations` note and `karmor-exec-test-honest.txt`).
 - **Blocked egress (CNI gate)**: a pod matching the verify selector attempts a
   **direct** egress to `github.com:443` (bypassing the proxy) — **BLOCKED by
   Calico** (no route).
@@ -539,18 +541,23 @@ blocked-egress and egress-proxy SNI logs) is under
 | Component     | Version | Source |
 |---------------|---------|--------|
 | kind          | v0.34.0 | `github.com/kubernetes-sigs/kind/releases` |
-| kubectl       | v1.34.0 | `dl.k8s.io` |
+| kindest/node  | v1.37.0 | `kind` v0.34.0's default node image (`kindest/node:v1.37.0`) |
+| kubectl       | v1.34.0 | `dl.k8s.io` (client; the node is v1.37.0) |
 | Calico        | v3.30.1 | `projectcalico/calico/manifests/calico.yaml` |
 | KubeArmor     | v1.7.5  | `karmor install --tag v1.7.5` |
 | karmor CLI    | v1.4.9  | `kubearmor/KubeArmor/install.sh` |
-| agent-sandbox | main    | `kubernetes-sigs/agent-sandbox/config/install.yaml` |
+| agent-sandbox | v0.5.2  | `registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.2` (the VM proof installed v0.5.2; the alpha/beta e2e above uses the v1.0.4 release) |
 
 ### Known limitations
 
 - **BPF-LSM wedge risk (ADR-0007 F2):** never restart/kill the KubeArmor
   agent while Loops run. A BPF wedge locks the node's LSM enforcement and
   requires a host reboot to clear.
-- **IP staleness:** the verify NetworkPolicy's IPBlock rule for external repo
-  hosts (e.g. github.com) is resolved at reconcile time. If the host's IP
-  changes between reconciles, the next reconcile updates the rule. The verify
-  Job is short-lived (minutes), so this is not a practical concern.
+- **The KubeArmor policy is a network allow, not an exec-deny:** the operator's
+  KubeArmorPolicy for the agent is `action: Block` (default-deny) with an Allow
+  for the model-proxy hop + model endpoint. It governs the **network** policy
+  (the model-proxy hop) via BPF-LSM; it does **not** contain an exec-deny rule,
+  so a `kubectl exec` of a non-allowlisted binary is **not** blocked by
+  KubeArmor (observed: exit 0, 0 KubeArmor Block alerts). Network egress
+  enforcement (blocking disallowed egress) is Calico's job — the
+  `NetworkEnforced` gate. See the evidence (`karmor-exec-test-honest.txt`).

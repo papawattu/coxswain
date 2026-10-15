@@ -1205,6 +1205,36 @@ rm -f "$TOKEN_TMP" "$EVIDENCE/step6-token.txt"
 _SECTYPE=$(kc -n "$NS" get secret b6-metrics-secret -o jsonpath='{.type}' 2>/dev/null || echo "?")
 _SECKEYS=$(kc -n "$NS" get secret b6-metrics-secret -o go-template='{{range $k, $v := .data}}{{$k}} {{end}}' 2>/dev/null || echo "?")
 log step6 "token minted and loaded into the b6-metrics-secret Secret via --from-file (the token value is never written to the evidence; Secret: b6-metrics-secret type=$_SECTYPE keys=$_SECKEYS)"
+ACTIVE_LOOP="b6-active-$TS"
+kc -n "$NS" apply -f - >/dev/null <<EOF
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: $ACTIVE_LOOP
+  namespace: $NS
+spec:
+  goal: "echo b6-active"
+  workspace:
+    repo: "https://github.com/papawattu/coxswain-sandbox.git"
+    ref: main
+    gitCredentialSecret: git-cred
+  agent:
+    modelEndpoint: "$VLLM_ENDPOINT"
+    model: "$VLLM_MODEL"
+    endpointSecretRef: beta-model-creds
+  approval:
+    mode: Manual
+EOF
+log step6 "applied $ACTIVE_LOOP (approval.mode=Manual) to make coxswain_loops_active deterministic; waiting for AwaitingApproval"
+i=0
+while :; do
+	_ph=$(kc -n "$NS" get loop "$ACTIVE_LOOP" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+	case "$_ph" in AwaitingApproval) break ;; esac
+	i=$((i + 2)); [ "$i" -gt 120 ] && { kc -n "$NS" get loop "$ACTIVE_LOOP" -o yaml >"$EVIDENCE/step6-active-loop.yaml"; die "step6: $ACTIVE_LOOP did not reach AwaitingApproval in 120s (phase $_ph)"; }
+	sleep 2
+done
+log step6 "$ACTIVE_LOOP is at AwaitingApproval (a non-terminal phase the loops_active collector will see)"
+
 # The scrape pod curls the secure endpoint with the token (mounted from the
 # Secret) and streams the full /metrics body to stdout — the pod's log IS the
 # scrape (I84: the bytes are kept where the claim reads them).
@@ -1281,35 +1311,6 @@ log step6 "the metrics endpoint answered the coxswain-metrics-reader token (HTTP
 # scrape (the collector sees the AwaitingApproval Loop and emits the metric),
 # then delete that Loop. The scrape must show
 # coxswain_loops_active{phase="AwaitingApproval"} >= 1.
-ACTIVE_LOOP="b6-active-$TS"
-kc -n "$NS" apply -f - >/dev/null <<EOF
-apiVersion: coxswain.wattu.com/v1alpha1
-kind: Loop
-metadata:
-  name: $ACTIVE_LOOP
-  namespace: $NS
-spec:
-  goal: "echo b6-active"
-  workspace:
-    repo: "https://github.com/papawattu/coxswain-sandbox.git"
-    ref: main
-    gitCredentialSecret: git-cred
-  agent:
-    modelEndpoint: "$VLLM_ENDPOINT"
-    model: "$VLLM_MODEL"
-    endpointSecretRef: beta-model-creds
-  approval:
-    mode: Manual
-EOF
-log step6 "applied $ACTIVE_LOOP (approval.mode=Manual) to make coxswain_loops_active deterministic; waiting for AwaitingApproval"
-i=0
-while :; do
-	_ph=$(kc -n "$NS" get loop "$ACTIVE_LOOP" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-	case "$_ph" in AwaitingApproval) break ;; esac
-	i=$((i + 2)); [ "$i" -gt 120 ] && { kc -n "$NS" get loop "$ACTIVE_LOOP" -o yaml >"$EVIDENCE/step6-active-loop.yaml"; die "step6: $ACTIVE_LOOP did not reach AwaitingApproval in 120s (phase $_ph)"; }
-	sleep 2
-done
-log step6 "$ACTIVE_LOOP is at AwaitingApproval (a non-terminal phase the loops_active collector will see)"
 
 # I84: a validation asserts the CONTENT'S MEANING, not just that it parses.
 # The handoff's step 6: the coxswain_* metrics must EXIST in the scrape with

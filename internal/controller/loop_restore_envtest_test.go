@@ -92,6 +92,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -104,6 +105,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -1129,4 +1131,243 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond2.Status).To(Equal(metav1.ConditionTrue), "the restore completed (the separate verify pod is gone, the PVC is recreated from the snapshot)")
 		Expect(cond2.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored), "the restore is 'Restored' (the PVC is recreated from the snapshot after the separate verify pod is gone)")
 	})
+
+	It("RESTORE (reactive, Terminating PVC): a workspace PVC with a non-nil DeletionTimestamp (being deleted) is treated as LOST (the reactive restore starts; the Restore condition is StoppingWorkloads or StoppingSandbox; no new verify Job is created while the restore hold is active)", func() {
+		ns := "b2-restore-terminating-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "restore-terminating-loop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, rec := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		// Put the PVC in Terminating state: add a finalizer, then delete it.
+		// The finalizer keeps the PVC in Terminating (the apiserver sets the
+		// DeletionTimestamp, but the PVC is not fully deleted because the
+		// finalizer work is not done — in envtest there is no controller to
+		// remove the finalizer).
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
+		pvc.Finalizers = append(pvc.Finalizers, "b2-test/fake-finalizer")
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+
+		// Verify the PVC is in Terminating state (the DeletionTimestamp is
+		// set, the PVC is still present).
+		terminatingPVC, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the PVC must still be present (it is Terminating, not gone)")
+		Expect(terminatingPVC.DeletionTimestamp).NotTo(BeZero(), "the PVC must have a non-nil DeletionTimestamp (it is being deleted)")
+
+		// Reconcile: the operator detects the Terminating PVC (treated as LOST
+		// by workspacePVCPresent) + the ready checkpoint and starts the
+		// reactive restore. The restore hold is active (the Restore condition
+		// is set to StoppingWorkloads or StoppingSandbox), so the verify Job is
+		// stopped (deleted) by the restore logic (it would mount the PVC and
+		// hold it in Terminating via pvc-protection, stalling the restore).
+		b2Reconcile(r, ns, name)
+
+		By("the Restore condition is set (StoppingWorkloads or StoppingSandbox — the restore is in progress)")
+		restoredLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, restoredLoop)).To(Succeed())
+		cond := b2RestoreCondition(restoredLoop)
+		Expect(cond).NotTo(BeNil(), "the operator must set the Restore condition (the restore is in progress)")
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse), "the restore is in progress (not complete yet)")
+		expectedReasons := []string{coxv1alpha1.RestoreReasonStoppingWorkloads, coxv1alpha1.RestoreReasonStoppingSandbox, coxv1alpha1.RestoreReasonDeletingPVC}
+		Expect(slices.Contains(expectedReasons, cond.Reason)).To(BeTrue(),
+			"the Restore condition's reason must be one of the in-progress reasons (StoppingWorkloads, StoppingSandbox, DeletingPVC), got: "+cond.Reason)
+
+		By("the verify Job is stopped (deleted) by the restore logic (the restore hold is active, and the verify Job would mount the PVC and hold it in Terminating via pvc-protection, stalling the restore)")
+		verifyJobsAfter := &batchv1.JobList{}
+		Expect(k8sClient.List(ctx, verifyJobsAfter,
+			client.InNamespace(ns),
+			client.MatchingLabels{verifyLoopLabel: name})).To(Succeed())
+		Expect(verifyJobsAfter.Items).To(BeEmpty(),
+			"the verify Job must be stopped (deleted) by the restore logic (the restore hold is active, and the verify Job would mount the PVC and hold it in Terminating via pvc-protection, stalling the restore)")
+
+		_ = rec // the Event is emitted by the operator; the condition is the durable record
+	})
+
+	It("RESTORE (reactive, Terminating PVC + sandbox pod): the sandbox is suspended while Restore is StoppingWorkloads (the sandbox pod carries the loop label and mounts the workspace PVC; the restore hold suspends the sandbox so the pod is deleted and the PVC is released)", func() {
+		ns := "b2-restore-term-sandbox-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "restore-term-sandbox-loop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, rec := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		// Create the sandbox pod with the loop label and the workspace PVC
+		// volume (the sandbox pod's shape on a real cluster: it carries
+		// coxswain.wattu.com/loop=<loop> and mounts the workspace PVC).
+		// Delete any existing pod first (the operator's ensureSandbox may have
+		// created one during b1DriveToSucceeded).
+		existingPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: b2SandboxName(name), Namespace: ns}}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, existingPod); err == nil {
+			_ = k8sClient.Delete(ctx, existingPod)
+		}
+		Expect(k8sClient.Create(ctx, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      b2SandboxName(name),
+				Namespace: ns,
+				Labels:    map[string]string{loopLabelKey: name},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: agentContainerName, Image: s3StandinImage},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "workspace",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: workspacePVCName(name),
+							},
+						},
+					},
+				},
+			},
+		})).To(Succeed())
+
+		// Ensure the sandbox is Running (the restore hold must suspend it;
+		// if it's already Suspended, the spec can't prove the hold works).
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, sb)).To(Succeed())
+		if sb.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeRunning {
+			sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeRunning
+			Expect(k8sClient.Update(ctx, sb)).To(Succeed())
+		}
+
+		// Put the PVC in Terminating state: add a finalizer, then delete it.
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
+		pvc.Finalizers = append(pvc.Finalizers, "b2-test/fake-finalizer")
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+
+		// Reconcile: the operator detects the Terminating PVC (treated as LOST
+		// by workspacePVCPresent) + the ready checkpoint and starts the
+		// reactive restore. The restore hold is active (StoppingWorkloads), so
+		// the sandbox is suspended (the sandbox pod is deleted, releasing the
+		// PVC). Two reconciles: the first sets the Restore condition
+		// (StoppingWorkloads), the second applies the hold (suspends the
+		// sandbox via sandboxSuspendedByGate).
+		b2Reconcile(r, ns, name)
+		b2Reconcile(r, ns, name)
+
+		By("the Restore condition is StoppingWorkloads (the restore is in progress)")
+		restoredLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, restoredLoop)).To(Succeed())
+		cond := b2RestoreCondition(restoredLoop)
+		Expect(cond).NotTo(BeNil(), "the operator must set the Restore condition (the restore is in progress)")
+		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonStoppingWorkloads),
+			"the Restore condition's reason must be StoppingWorkloads (the workloads are being stopped), got: "+cond.Reason)
+
+		By("the Sandbox is suspended (the restore hold covers StoppingWorkloads, so the sandbox is Suspended and its pod is deleted, releasing the PVC)")
+		sb2 := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, sb2)).To(Succeed())
+		Expect(sb2.Spec.OperatingMode).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the Sandbox must be Suspended while Restore is StoppingWorkloads (the restore hold covers StoppingWorkloads; the sandbox pod is deleted and the PVC is released)")
+
+		_ = rec
+	})
+
+	It("RESTORE (deleted Loop): a deleting Loop with a lost PVC skips the B2 restore decision (the restore step is skipped so the checkpoint finalizer is cleared and the Loop is deleted, rather than being held open by a lost-PVC restore that requeues on the still-mounted workspace PVC)", func() {
+		ns := "b2-restore-deleted-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "restore-deleted-loop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		// The sandbox pod carries the loop label and mounts the workspace PVC
+		// (the shape on a real cluster): stopWorkloadsForRestore returns false
+		// while it is present, so the lost-PVC restore would stall at
+		// StoppingWorkloads and requeue. Delete any existing pod first (the
+		// operator may have created one during b1DriveToSucceeded).
+		existingPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: b2SandboxName(name), Namespace: ns}}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, existingPod); err == nil {
+			_ = k8sClient.Delete(ctx, existingPod)
+		}
+		Expect(k8sClient.Create(ctx, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      b2SandboxName(name),
+				Namespace: ns,
+				Labels:    map[string]string{loopLabelKey: name},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: agentContainerName, Image: s3StandinImage},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "workspace",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: workspacePVCName(name),
+							},
+						},
+					},
+				},
+			},
+		})).To(Succeed())
+
+		// Put the PVC in Terminating state (the reactive lost-PVC restore would
+		// trigger for a LIVE Loop: a Terminating PVC is treated as LOST by
+		// workspacePVCPresent, and the ready checkpoint is the restore source).
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
+		pvc.Finalizers = append(pvc.Finalizers, "b2-test/fake-finalizer")
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+
+		// Delete the Loop (the checkpoint finalizer holds it; the apiserver
+		// sets the deletionTimestamp).
+		Expect(k8sClient.Delete(ctx, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})).To(Succeed())
+
+		// Reconcile: the B2 restore step is SKIPPED (the deletion guard). The
+		// CleaningUp work runs (the checkpoint GC + the finalizer removal), so
+		// the Loop is fully deleted. Without the guard, the lost-PVC restore
+		// would run for the deleting Loop: the PVC is still present (the
+		// sandbox pod mounts it), stopWorkloadsForRestore returns false, the
+		// restore requeues at StoppingWorkloads, and the checkpoint finalizer
+		// is never cleared (the Loop is held open).
+		b2ReconcileToleratingGone(r, ns, name)
+
+		By("the Loop is fully deleted (the checkpoint finalizer was cleared; the lost-PVC restore did not hold the delete open)")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &coxv1alpha1.Loop{})).To(
+			MatchError(apierrors.IsNotFound, "apiserver returns NotFound for a fully-deleted object"),
+			"the Loop must be fully deleted (the checkpoint finalizer was cleared; the B2 restore step is skipped for a deleting Loop)")
+	})
+
 })

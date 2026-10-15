@@ -50,24 +50,34 @@ awk '
 
 [ -s "$TMPDIR_T/step6-scrape.yaml" ] || { fail "could not extract the step6-scrape.yaml heredoc from $SCRIPT"; exit 1; }
 
-# Parse the YAML and check the command field is a string.
-python3 - "$TMPDIR_T/step6-scrape.yaml" <<'PY' || fail "step6-scrape.yaml: the scrape container's `command` field is not a valid string (the run 16 defect: a YAML sequence)"
+# Parse the YAML and check the command field is a list of 3 strings:
+# [sh, -c, <curl command>].
+python3 - "$TMPDIR_T/step6-scrape.yaml" <<'PY' || fail "step6-scrape.yaml: the scrape container's `command` field is not a valid YAML sequence (the run 18 defect: a single string)"
 import sys, yaml
 with open(sys.argv[1]) as f:
     doc = yaml.safe_load(f)
 containers = doc["spec"]["containers"]
 scrape = next(c for c in containers if c["name"] == "scrape")
 cmd = scrape["command"]
-if not isinstance(cmd, str):
-    print(f"ERROR: command is {type(cmd).__name__}, want str (got: {cmd!r})")
+if not isinstance(cmd, list):
+    print(f"ERROR: command is {type(cmd).__name__}, want list (got: {cmd!r})")
     sys.exit(1)
-if not cmd.startswith("curl"):
-    print(f"ERROR: command does not start with 'curl' (got: {cmd[:40]!r}...)")
+if len(cmd) != 3:
+    print(f"ERROR: command has {len(cmd)} elements, want 3 (got: {cmd!r})")
     sys.exit(1)
-print(f"OK: command is a string ({len(cmd)} chars, starts with 'curl')")
+if cmd[0] != "/bin/sh" or cmd[1] != "-c":
+    print(f"ERROR: command[0] != '/bin/sh' or command[1] != '-c' (got: {cmd!r})")
+    sys.exit(1)
+if not cmd[2].startswith("curl"):
+    print(f"ERROR: command[2] does not start with 'curl' (got: {cmd[2][:40]!r}...)")
+    sys.exit(1)
+if "$(cat /tok/tok)" not in cmd[2]:
+    print(f"ERROR: $(cat /tok/tok) not in command[2] (got: {cmd[2][:80]!r}...)")
+    sys.exit(1)
+print(f"OK: command is a list of 3 strings [/bin/sh, -c, <curl command> ({len(cmd[2])} chars)]")
 PY
 [ $? -eq 0 ] || FAILS=$((FAILS + 1))
-pass "step6-scrape.yaml: the scrape container's `command` is a string (the v1 Pod spec's required form)"
+pass "step6-scrape.yaml: the scrape container's `command` is a YAML sequence [/bin/sh, -c, <curl>] (the v1 Pod spec's required form)"
 
 # =========================================================================
 # Test 2: the step 5 independence check dies on a blank FORK_BRANCH.

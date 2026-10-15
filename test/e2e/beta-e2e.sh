@@ -1186,11 +1186,11 @@ collect_evidence "$FORK_LOOP" step5
 #    bound ONLY to coxswain-metrics-reader (no admin, no other role) — the
 #    Done-when's "scraped via a coxswain-metrics-reader token".
 # ===========================================================================
-log step6 "creating a ServiceAccount in $NS bound ONLY to coxswain-metrics-reader, and minting its token"
+log step6 "creating a ServiceAccount in $NS bound ONLY to coxswain-metrics-reader (ClusterRoleBinding: /metrics is a nonResourceURL which a RoleBinding cannot grant), and minting its token"
 kc -n "$NS" create serviceaccount b6-metrics-sa >"$EVIDENCE/step6-sa.log" 2>&1 || { cat "$EVIDENCE/step6-sa.log"; die "step6: could not create the metrics ServiceAccount"; }
-kc -n "$NS" create rolebinding b6-metrics-reader-binding \
+kc create clusterrolebinding "b6-metrics-reader-crb-$TS" \
 	--clusterrole=coxswain-metrics-reader \
-	--serviceaccount="$NS:b6-metrics-sa" >"$EVIDENCE/step6-rb.log" 2>&1 || { cat "$EVIDENCE/step6-rb.log"; die "step6: could not bind coxswain-metrics-reader"; }
+	--serviceaccount="$NS:b6-metrics-sa" >"$EVIDENCE/step6-crb.log" 2>&1 || { cat "$EVIDENCE/step6-crb.log"; die "step6: could not create the ClusterRoleBinding (the /metrics nonResourceURL requires cluster scope)"; }
 kc -n "$NS" create token b6-metrics-sa --duration=1h >"$EVIDENCE/step6-token.txt" 2>&1 || die "step6: could not create the metrics-reader token"
 # D55/I84: the token is NEVER written to the evidence. It goes straight from
 # kubectl's output into a 600-mode temp file (OUTSIDE the evidence dir) that
@@ -1208,6 +1208,14 @@ log step6 "token minted and loaded into the b6-metrics-secret Secret via --from-
 # The scrape pod curls the secure endpoint with the token (mounted from the
 # Secret) and streams the full /metrics body to stdout — the pod's log IS the
 # scrape (I84: the bytes are kept where the claim reads them).
+# The scrape pod curls the secure endpoint with the token (mounted from the
+# Secret) and streams the full /metrics body to stdout — the pod's log IS the
+# scrape (I84: the bytes are kept where the claim reads them).
+# The token is at /tok/tok (NOT /tok): a Secret volume is a directory with one
+# file per key, and the key is 'tok' (from --from-file=tok=...).
+# The command is a YAML block literal (|): the shell runs the multi-line
+# command as-is, with $(cat /tok/tok) and $? expanded by the pod's shell at
+# runtime (not by the script's shell — the heredoc is quoted <<'EOF').
 cat >"$EVIDENCE/step6-scrape.yaml" <<'EOF'
 apiVersion: v1
 kind: Pod
@@ -1219,21 +1227,23 @@ spec:
   containers:
   - name: scrape
     image: docker.io/curlimages/curl:latest
-    # The v1 Pod spec's `command` field is a STRING (the full shell command),
-    # not a YAML sequence. A sequence (the run 16 defect: `command: [sh, -c,
-    # curl ...]`) is rejected by `kc apply` with "cannot unmarshal object
-    # into Go struct field Container.spec.containers.command of type
-    # string". The string is YAML-double-quoted (the inner double quotes
-    # around "Authorization: Bearer $(cat /tok)" are escaped as \"; the
-    # $() and $?/$r/%{http_code} are passed through as literals to the pod's
-    # shell, which expands them when the pod runs). The \\n inside the
-    # double-quoted YAML string is a literal backslash-n (the YAML parser
-    # interprets the YAML-level \\n as the two characters \\n, and the
-    # pod's shell `echo` then interprets that as a newline).
-    command: 'curl -skS --max-time 30 --header "Authorization: Bearer $(cat /tok)" https://coxswain-controller-manager-metrics-service.coxswain-system.svc:8443/metrics -o /tmp/metrics.txt -w ''SCRAPE_HTTP=%{http_code}\n''; r=$?; echo SCRAPE_RC=$r; wc -c </tmp/metrics.txt; echo METRICS_BEGIN; cat /tmp/metrics.txt; echo METRICS_END'
+    command:
+    - /bin/sh
+    - -c
+    - |
+      curl -skS --max-time 30 --header "Authorization: Bearer $(cat /tok/tok)" \
+        https://coxswain-controller-manager-metrics-service.coxswain-system.svc:8443/metrics \
+        -o /tmp/metrics.txt -w 'SCRAPE_HTTP=%{http_code}\n'
+      r=$?
+      echo "SCRAPE_RC=$r"
+      wc -c </tmp/metrics.txt
+      echo METRICS_BEGIN
+      cat /tmp/metrics.txt
+      echo METRICS_END
     volumeMounts:
     - name: tok
       mountPath: /tok
+      readOnly: true
   volumes:
   - name: tok
     secret:
@@ -1250,28 +1260,64 @@ while :; do
 done
 kc -n "$NS" logs b6-metrics-scrape >"$EVIDENCE/step6-scrape.log" 2>&1 || true
 kc -n "$NS" delete pod b6-metrics-scrape --wait=false >/dev/null 2>&1 || true
+# I84: assert SCRAPE_HTTP=200 (NOT SCRAPE_RC=0 — curl exits 0 on a 403
+# without -f, so SCRAPE_RC=0 passes vacuously on a 403; the I84 hollow
+# assertion). The 200 proves the token was accepted by the /metrics
+# endpoint (the RBAC the token carries is exactly coxswain-metrics-reader
+# — no admin). The ClusterRoleBinding (not a RoleBinding) is required
+# because /metrics is a nonResourceURL.
+grep -q "SCRAPE_HTTP=200" "$EVIDENCE/step6-scrape.log" || { cat "$EVIDENCE/step6-scrape.log"; die "step6: the metrics endpoint did not return 200 to the coxswain-metrics-reader token (see $EVIDENCE/step6-scrape.log; the ClusterRoleBinding may be missing or the token expired)"; }
+# SCRAPE_RC=0 is implied by SCRAPE_HTTP=200 but assert it explicitly for the evidence trail.
 grep -q "SCRAPE_RC=0" "$EVIDENCE/step6-scrape.log" || { cat "$EVIDENCE/step6-scrape.log"; die "step6: the metrics scrape failed (see $EVIDENCE/step6-scrape.log)"; }
-grep -q "SCRAPE_HTTP=200" "$EVIDENCE/step6-scrape.log" || { cat "$EVIDENCE/step6-scrape.log"; die "step6: the metrics endpoint did not return 200 to the coxswain-metrics-reader token (see $EVIDENCE/step6-scrape.log)"; }
 # The metric lines (between the BEGIN/END markers) are the scrape itself.
 sed -n '/^METRICS_BEGIN$/,/^METRICS_END$/p' "$EVIDENCE/step6-scrape.log" | sed '1d;$d' >"$EVIDENCE/step6-metrics.log"
 grep -q "^coxswain_" "$EVIDENCE/step6-metrics.log" || { cat "$EVIDENCE/step6-scrape.log"; die "step6: the scrape carried no coxswain_ metric lines (see $EVIDENCE/step6-scrape.log)"; }
 log step6 "the metrics endpoint answered the coxswain-metrics-reader token (HTTP 200; the RBAC the token carries is exactly coxswain-metrics-reader — no admin)"
-# I84: a validation asserts the CONTENT's MEANING, not just that it parses.
-# The handoff's step 6: the four coxswain_* metrics must EXIST in the scrape
-# with a SENSIBLE value (not absent, not NaN, and where the run's own Loops
-# should have bumped them, actually > 0). The four named metrics (B5a):
+# coxswain_loops_active is a scrape-time collector (loops_active_collector.go)
+# that counts Loops per NON-TERMINAL phase from the cache at scrape time.
+# At step 6, all of THIS run's Loops are terminal (Succeeded/Failed), so the
+# metric is absent by design. To make it deterministic: apply a small
+# approval.mode=Manual Loop, wait for AwaitingApproval (a non-terminal phase),
+# scrape (the collector sees the AwaitingApproval Loop and emits the metric),
+# then delete that Loop. The scrape must show
+# coxswain_loops_active{phase="AwaitingApproval"} >= 1.
+ACTIVE_LOOP="b6-active-$TS"
+kc -n "$NS" apply -f - >/dev/null <<EOF
+apiVersion: coxswain.io/v1alpha1
+kind: Loop
+metadata:
+  name: $ACTIVE_LOOP
+  namespace: $NS
+spec:
+  goal: "echo b6-active"
+  agent: preset-go
+  approval:
+    mode: Manual
+EOF
+log step6 "applied $ACTIVE_LOOP (approval.mode=Manual) to make coxswain_loops_active deterministic; waiting for AwaitingApproval"
+i=0
+while :; do
+	_ph=$(kc -n "$NS" get loop "$ACTIVE_LOOP" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+	case "$_ph" in AwaitingApproval) break ;; esac
+	i=$((i + 2)); [ "$i" -gt 120 ] && { kc -n "$NS" get loop "$ACTIVE_LOOP" -o yaml >"$EVIDENCE/step6-active-loop.yaml"; die "step6: $ACTIVE_LOOP did not reach AwaitingApproval in 120s (phase $_ph)"; }
+	sleep 2
+done
+log step6 "$ACTIVE_LOOP is at AwaitingApproval (a non-terminal phase the loops_active collector will see)"
+
+# I84: a validation asserts the CONTENT'S MEANING, not just that it parses.
+# The handoff's step 6: the coxswain_* metrics must EXIST in the scrape with
+# a SENSIBLE value (not absent, not NaN, and where the run's own Loops should
+# have bumped them, actually > 0). The named metrics (B5a):
 #   coxswain_loop_phase_transitions_total  (counter by destination phase)
 #   coxswain_loop_iterations_total         (counter, iteration increments)
 #   coxswain_verify_results_total          (counter by result pass|fail|infra)
 #   coxswain_loops_completed_total         (counter by result + reason)
-# All four were bumped by THIS run's own Loops (steps 1-3 each transitioned
-# phases, each verify — pass or fail — bumped verify_results_total, and each
-# terminal Loop bumped loops_completed_total), so a zero on any of them is a
-# real finding (the metric is broken or the Loop did not run as the trail
-# says), not a pass.
-METRICS_CHECK=$(python3 - <<'PY'
-import re, sys
-lines = open(sys.argv[1]).read().splitlines() if len(sys.argv) > 1 else []
+#   coxswain_loops_active                  (gauge by phase, scrape-time)
+# The first four were bumped by THIS run's own Loops; coxswain_loops_active is
+# made deterministic by the $ACTIVE_LOOP Loop (AwaitingApproval) applied above.
+METRICS_CHECK=$(python3 - "$EVIDENCE/step6-metrics.log" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
 def val(name, labels=None):
     for l in lines:
         if l.startswith(name + "{") and (labels is None or all(p in l for p in labels)):
@@ -1281,28 +1327,37 @@ def val(name, labels=None):
                 continue
     return None
 ok = True
-for name, want in [
-    ("coxswain_loop_phase_transitions_total", None),
-    ("coxswain_loop_iterations_total", " > 0"),
-    ("coxswain_verify_results_total", " > 0"),
-    ("coxswain_loops_completed_total", " > 0"),
+for name, want, labels in [
+    ("coxswain_loop_phase_transitions_total", "present", None),
+    ("coxswain_loop_iterations_total", " > 0", None),
+    ("coxswain_verify_results_total", " > 0", None),
+    ("coxswain_loops_completed_total", " > 0", None),
+    ("coxswain_loops_active", " >= 1", ['phase="AwaitingApproval"']),
 ]:
-    v = val(name)
+    v = val(name, labels)
     if v is None:
-        print(f"FAIL {name}: ABSENT from the scrape (I84: the metric did not exist)")
+        lbl = "{" + ",".join(labels) + "}" if labels else ""
+        print(f"FAIL {name}{lbl}: ABSENT from the scrape (I84: the metric did not exist)")
         ok = False
         continue
     if want == " > 0" and not (v > 0):
         print(f"FAIL {name}: present but {v} (not > 0 — this run's Loops should have bumped it)")
         ok = False
         continue
-    print(f"OK   {name}: {v} {want or '(present with a numeric value)'}")
+    if want == " >= 1" and not (v >= 1):
+        lbl = "{" + ",".join(labels) + "}" if labels else ""
+        print(f"FAIL {name}{lbl}: present but {v} (not >= 1 — the active Loop should be counted)")
+        ok = False
+        continue
+    lbl = "{" + ",".join(labels) + "}" if labels else ""
+    print(f"OK   {name}{lbl}: {v} {want}")
 print("RESULT:", "OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)
 PY
- "$EVIDENCE/step6-metrics.log"
-) || { cat "$EVIDENCE/step6-metrics.log" | grep -E '^coxswain_' ; die "step6 FAILED: one of the four coxswain_* metrics is absent or not > 0 (see above; I84: the scrape's content, not just its parse, is the assertion)"; }
-log step6 "the four coxswain_* metrics are present with sensible values: $(printf '%s\n' "$METRICS_CHECK" | tr '\n' ' ')"
+) || { cat "$EVIDENCE/step6-metrics.log" | grep -E '^coxswain_' ; die "step6 FAILED: one of the coxswain_* metrics is absent or not > 0 (see above; I84: the scrape's content, not just its parse, is the assertion)"; }
+# Delete the active Loop now (the scrape is done; the metric was captured).
+kc -n "$NS" delete loop "$ACTIVE_LOOP" --wait=false >/dev/null 2>&1 || true
+log step6 "the coxswain_* metrics are present with sensible values (including coxswain_loops_active{phase=\"AwaitingApproval\"} >= 1 from the deterministic active Loop): $(printf '%s\n' "$METRICS_CHECK" | tr '\n' ' ')"
 # Delete the metrics Secret now (the scrape is done; do not leave the token
 # on the cluster — and never dump it to the evidence).
 kc -n "$NS" delete secret b6-metrics-secret >/dev/null 2>&1 || true
@@ -1335,7 +1390,7 @@ for L in "$MANUAL_LOOP" "$REPLAN_LOOP" "$RESTORE_LOOP" "$FORK_LOOP"; do
 	kc -n "$NS" delete loop "$L" --wait=false >/dev/null 2>&1 || true
 done
 kc -n "$NS" delete secret b6-metrics-secret >/dev/null 2>&1 || true
-kc -n "$NS" delete rolebinding b6-metrics-reader-binding >/dev/null 2>&1 || true
+kc delete clusterrolebinding "b6-metrics-reader-crb-$TS" >/dev/null 2>&1 || true
 kc -n "$NS" delete serviceaccount b6-metrics-sa >/dev/null 2>&1 || true
 # shellcheck disable=SC1010 # 'done' here is the log tag, not the keyword
 log done "Loops deleted (their PRs live on GitHub); the scratch cluster $CLUSTER is kept for inspection (the owner deletes it when done)"

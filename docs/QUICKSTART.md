@@ -506,6 +506,34 @@ ModelAvailable=True    reason=Recovered     message=model backend reachable
 **Expected Loop outcome:** `phase=Succeeded` (the agent implements the goal,
 the verify Job runs the acceptance checks, and the Loop reaches Succeeded).
 
+### This run's evidence (post-#155 merge)
+
+A fresh proof ran on the dedicated VM (host `192.168.1.61`) from HEAD
+`68b9ac8` (#155 merged to main) — operator installed with **no**
+`--allow-unenforced` / `--allow-unenforced-network` flag (images tagged
+`d61-68b9ac8-20261015182601`). The Loop `d61-proof` reached `Succeeded`
+and `Delivered` (draft PR on the sandbox repo). Evidence:
+
+- **BPF-LSM enforcer** (`karmor probe`): `Active LSM: BPFLSM`, node label
+  `kubearmor.io/enforcer=bpf`, kernel `7.0.0-28-generic`. (Not AppArmor.)
+- **Gates live**: `PolicyEnforced=True (Enforcing)`, `NetworkEnforced=True
+  (CNIEnforced)`, `ModelAvailable=True (Recovered)`, `Delivered=True`.
+- **KubeArmor policy** (the exec/file gate): the operator's KubeArmorPolicy
+  for the agent is `action: Block` (default-deny) — only the model-proxy hop
+  + model endpoint are allowed.
+- **Blocked egress (CNI gate)**: a pod matching the verify selector attempts a
+  **direct** egress to `github.com:443` (bypassing the proxy) — **BLOCKED by
+  Calico** (no route).
+- **Allowed egress via proxy**: the verify NetworkPolicy allows egress **only**
+  to kube-dns (53) and the egress proxy (3128) — no direct egress. The
+  deliver Job's git push + GitHub API calls went **through the egress proxy**
+  (SNI log: `github.com:443`, `api.github.com:443`, all `verdict=allowed`).
+
+Full evidence (the pinned versions + probe output, the Loop's full status +
+gate conditions, the KubeArmorPolicy, the verify NetworkPolicy, the
+blocked-egress and egress-proxy SNI logs) is under
+`.samples/d61-156-<timestamp>/` (see the PR body for the exact path).
+
 ### Pinned versions
 
 | Component     | Version | Source |

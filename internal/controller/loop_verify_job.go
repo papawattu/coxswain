@@ -197,6 +197,18 @@ func (r *LoopReconciler) verifyCheckImage(loop *coxv1alpha1.Loop) string {
 // still taken; the apiserver deletes async).
 var errVerifyStaleDeleted = errors.New("stale verify Job deleted")
 
+// errVerifyProxyNotReady is the sentinel error ensureVerifyJob returns when
+// the D61 verify-egress hold applies (the repo host is external, so the
+// clone-base fetch traverses the egress proxy) but the egress proxy pod is
+// not yet Ready and owned by the Loop. The caller (s4ClaimAndVerifyJob) maps
+// it to a clean requeue — the verify Job is NOT created in this reconcile
+// (clone-base would fail in milliseconds against a missing proxy and burn a
+// VerifyInfra attempt). Same gate pattern as the deliver Job's I72 hold
+// (loop_deliver_job.go:685-707): no Job until the egress proxy pod is Ready
+// and controlled by the Loop. An in-cluster repo (repoPeer non-nil, no
+// proxy) and a proxy-absent/foreign pod both keep the hold active.
+var errVerifyProxyNotReady = errors.New("verify Job held: the egress proxy pod is not Ready")
+
 // verifyJobName returns the verify Job name: <loop>-verify-<iteration>. The
 // iteration is the Loop's current 1-based iteration count (the pin in
 // status.currentVerify is the evidence the Job produces; the Job name carries
@@ -300,6 +312,32 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 	}
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get verify job %s: %w", name, err)
+	}
+	// D61 (I90): the verify-egress hold. When the clone-base fetch traverses
+	// the egress proxy (an EXTERNAL repo host — verifyNeedsProxy), the verify
+	// Job is NOT created until the egress proxy pod is Ready and owned by the
+	// Loop. Without the hold, a verify Job created in the window where the
+	// operator is recreating the proxy ("egress proxy pod spec drift
+	// detected, deleting for recreation") runs clone-base against a missing
+	// proxy, exits 128, and burns a VerifyInfra attempt — three in a row end
+	// the Loop VerifyInfraFailed, the very failure this fix targets. The gate
+	// is on the CREATE path only, mirroring the deliver Job's I72 hold
+	// (loop_deliver_job.go:685-707): an existing verify Job (any outcome) is
+	// mapped as before; only the create of a fresh Job is gated. An
+	// in-cluster repo (verifyNeedsProxy false) keeps the direct path — no
+	// hold. The hold surfaces with a Warning Event (I90) and requeues so the
+	// next reconcile retries once the proxy pod is Ready.
+	if r.verifyNeedsProxy(loop) {
+		egPod := &corev1.Pod{}
+		egErr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod)
+		egReady := egErr == nil && metav1.IsControlledBy(egPod, loop) && isPodReady(egPod)
+		if !egReady {
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "VerifyHeldForProxy",
+					"verify Job %s held: the egress proxy pod %s is not Ready and owned by the Loop (clone-base would fail before the proxy is listening)", name, egressProxyPodName(loop.Name))
+			}
+			return errVerifyProxyNotReady
+		}
 	}
 	// Create the fresh Job. If the name is still taken (a stale Job from a
 	// prior reconcile's deletion has not gone away yet), the Create returns

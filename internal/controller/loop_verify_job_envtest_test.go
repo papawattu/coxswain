@@ -293,6 +293,13 @@ func s5aDriveToVerifying(ns, name string) *LoopReconciler {
 	// Implementing -> Verifying advance).
 	s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
 	s5aReconcile(r, ns, name)
+	// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+	// Ready and owned before the verify Job is created (an external repo like
+	// the fixture's example.com traverses the proxy). envtest has no kubelet,
+	// so the operator's own pod is never Ready — drive it Ready here (the
+	// proven s6ReadyEgressProxy pattern) so the verify Job is created for the
+	// specs that exercise it.
+	d61ReadyVerifyProxy(r, ns, name)
 	return r
 }
 
@@ -1911,6 +1918,10 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			},
 		})).To(Succeed())
 
+		// D61 (I90): the verify-egress hold means the verify Job is NOT created
+		// until the egress proxy pod is Ready and owned. s5aDriveToVerifying
+		// drives the operator's own egress proxy pod Ready (d61ReadyVerifyProxy)
+		// so the hold passes and the verify Job is created for the env assertion.
 		r := s5aDriveToVerifying(ns, name)
 		s5aReconcile(r, ns, name)
 
@@ -1936,7 +1947,232 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(env["NO_PROXY"]).To(ContainSubstring("-egress-proxy"),
 			"the proxy FQDN must be in NO_PROXY (no loop to the proxy)")
 	})
+
+	// I49 in-progress spec (D61, I90): the verify-egress hold. The gate is on
+	// the verify Job CREATE path only, and it fires when the clone-base fetch
+	// traverses the egress proxy (an external repo host, verifyNeedsProxy):
+	//   - egress proxy pod present but NOT Ready (or not owned) -> NO verify
+	//     Job (held);
+	//   - egress proxy pod Ready and owned by the Loop -> the verify Job is
+	//     created.
+	// The VM log shows the proxy being recreated mid-Loop ("egress proxy pod
+	// spec drift detected, deleting for recreation"); without the hold a
+	// verify created in that window runs clone-base against a missing proxy,
+	// exits 128, and burns a VerifyInfra attempt. This spec drives to
+	// Verifying manually so the hold is exercised on the
+	// Implementing -> Verifying advance; envtest has no kubelet, so the
+	// operator's own egress proxy pod is present but never Ready — the
+	// in-progress case for free. Marking it Ready (d61ReadyVerifyProxy) is the
+	// positive case.
+	It("holds the verify Job while the egress proxy pod is not Ready, and creates it once Ready (external repo, D61 I90)", func() {
+		ns := "s5a-d61hold-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "d61hold"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{workspaceCredsUsernameKey: []byte("u"), workspaceCredsPasswordKey: []byte("p")},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/org/repo.git", GitCredentialSecret: "test-cred"},
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+			},
+		})).To(Succeed())
+
+		// Drive to Implementing (NOT Verifying) — the verify Job is created on
+		// the Implementing -> Verifying advance, which is what the gate gates.
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		s5aEnsureSandbox(ns, name)
+		s5aReconcile(r, ns, name) // Pending -> Planning
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		s5aClaimPod(ns, name, "Planning", "")
+		s5aReconcile(r, ns, name) // advance (recycles the Sandbox)
+		s5aEnsureSandbox(ns, name)
+
+		// Advance to Verifying. The operator's ensureEgressProxy creates its
+		// own egress proxy pod (correct spec-hash, Loop-owned), but envtest has
+		// no kubelet so the pod is present but NOT Ready. The verify-egress
+		// hold must keep the verify Job from being created.
+		s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
+		s5aReconcile(r, ns, name) // -> Verifying (verify Job would be created)
+		s5aReconcile(r, ns, name)
+
+		// The operator's own egress proxy pod must exist (proves the hold saw a
+		// present, owned pod — the in-progress state, not an absent one).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		ep := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: egressProxyPodName(name), Namespace: ns}, ep)).To(Succeed(),
+			"D61 I90: the operator's egress proxy pod must exist (the hold saw a present pod, not an absent one)")
+		Expect(metav1.IsControlledBy(ep, loop)).To(BeTrue(),
+			"D61 I90: the egress proxy pod must be owned by the Loop")
+		Expect(isPodReady(ep)).To(BeFalse(),
+			"D61 I90: the egress proxy pod must be NOT Ready (envtest has no kubelet)")
+
+		// The verify Job must NOT exist while the egress proxy pod is not Ready.
+		job := &batchv1.Job{}
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job))).To(BeTrue(),
+			"D61 I90: no verify Job while the egress proxy pod is present but not Ready")
+
+		// Now make the egress proxy pod Ready: the hold passes and the verify
+		// Job is created.
+		d61ReadyVerifyProxy(r, ns, name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed(),
+			"D61 I90: the verify Job is created once the egress proxy pod is Ready and owned")
+	})
+
+	// D61 (I90): the foreign-egress-proxy hold case. A pod named
+	// <loop>-egress-proxy that is NOT owned by the Loop (no owner ref) is
+	// treated by the operator's ensureEgressProxy as EgressProxyConflict (the
+	// conflict early-return — it never creates/updates/deletes it), so it
+	// occupies the name. The verify-egress hold gate is IsControlledBy AND
+	// isPodReady; a foreign pod is not controlled by the Loop, so the hold
+	// fires (no verify Job) and EgressProxyConflict is set.
+	It("holds the verify Job and sets EgressProxyConflict while a foreign (unowned) egress proxy pod occupies the name (external repo, D61 I90)", func() {
+		ns := "s5a-d61foreign-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "d61foreign"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{workspaceCredsUsernameKey: []byte("u"), workspaceCredsPasswordKey: []byte("p")},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/org/repo.git", GitCredentialSecret: "test-cred"},
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+			},
+		})).To(Succeed())
+
+		// Drive to Implementing (NOT Verifying).
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		s5aEnsureSandbox(ns, name)
+		s5aReconcile(r, ns, name) // Pending -> Planning
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		s5aClaimPod(ns, name, "Planning", "")
+		s5aReconcile(r, ns, name) // advance (recycles the Sandbox)
+		s5aEnsureSandbox(ns, name)
+
+		// Plant a FOREIGN (ownerless) egress proxy pod so it occupies the name.
+		// The operator's ensureEgressProxy bails at the EgressProxyConflict
+		// early-return and never creates/updates/deletes it.
+		d61EgressPod(ctx, ns, name, true)
+		s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
+		s5aReconcile(r, ns, name) // -> Verifying (verify Job would be created)
+		s5aReconcile(r, ns, name)
+
+		// The verify Job must NOT exist: the foreign pod is not controlled by
+		// the Loop, so the verify-egress hold fires.
+		job := &batchv1.Job{}
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job))).To(BeTrue(),
+			"D61 I90: no verify Job while a foreign egress proxy pod occupies the name")
+
+		// EgressProxyConflict must be set (the operator saw the foreign pod).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		var epc *metav1.Condition
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == "EgressProxyConflict" {
+				epc = &loop.Status.Conditions[i]
+				break
+			}
+		}
+		Expect(epc).NotTo(BeNil(), "D61 I90: EgressProxyConflict must be set")
+		Expect(epc.Status).To(Equal(metav1.ConditionTrue),
+			"D61 I90: EgressProxyConflict must be True (the foreign pod is not owned by the Loop)")
+	})
 })
+
+// d61ReadyVerifyProxy drives reconcile until the operator's egress proxy pod
+// is stable (no spec drift) and owned by the Loop, then marks it Ready
+// (envtest has no kubelet). The D61 verify-egress hold (the verify Job is not
+// created until the egress proxy pod is Ready and owned, for an external repo
+// whose clone-base fetch traverses the proxy) needs this for any spec that
+// drives to Verifying and exercises the verify Job. Mirrors
+// s6ReadyEgressProxy (the I72 deliver-gate pattern) — the operator's own pod
+// trivially carries the correct spec-hash annotation, so no drift-recreation.
+func d61ReadyVerifyProxy(r *LoopReconciler, ns, name string) {
+	ctx := context.Background()
+	var podUID types.UID
+	for range 30 {
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		pod := &corev1.Pod{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: egressProxyPodName(name), Namespace: ns}, pod); err == nil &&
+			metav1.IsControlledBy(pod, loop) {
+			if podUID != "" && pod.UID == podUID {
+				break // stable across two reconciles
+			}
+			podUID = pod.UID
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	Expect(podUID).ToNot(Equal(types.UID("")),
+		"D61: the operator's egress proxy pod must exist and be owned by the Loop (uid=%s)", podUID)
+	pod := &corev1.Pod{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: egressProxyPodName(name), Namespace: ns}, pod)).To(Succeed())
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionTrue,
+	}}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	// One more reconcile so the verify-egress hold (which runs in the
+	// Verifying phase) sees the Ready pod and creates the verify Job.
+	s5aReconcile(r, ns, name)
+}
+
+// d61EgressPod plants a FOREIGN (ownerless) egress proxy pod for the Loop
+// (name+"-egress-proxy"). The operator's ensureEgressProxy treats a
+// non-owned pod as EgressProxyConflict and never creates/updates/deletes it
+// (the conflict early-return), so it occupies the name and the verify-egress
+// hold fires (the pod is not controlled by the Loop). ready controls the
+// PodReady status (the hold gate is IsControlledBy AND isPodReady, so the
+// foreign pod is held regardless, but the status is set for clarity).
+func d61EgressPod(ctx context.Context, ns, loopName string, ready bool) {
+	nn := types.NamespacedName{Name: loopName + "-egress-proxy", Namespace: ns}
+	existing := &corev1.Pod{}
+	if !apierrors.IsNotFound(k8sClient.Get(ctx, nn, existing)) {
+		Expect(k8sClient.Delete(ctx, existing)).To(Succeed())
+	}
+	loop := &coxv1alpha1.Loop{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: loopName, Namespace: ns}, loop)).To(Succeed())
+	pod := buildEgressProxyPod(loopName, ns, "coxswain-egress-proxy:standin",
+		[]string{"github.com:443"}, "testhash", "10.244.0.0/16", "10.96.0.0/12")
+	pod.Annotations = map[string]string{proxySpecHashAnnotation: egressProxyPodSpecHash(pod)}
+	// No owner ref: the pod is FOREIGN. The operator's ensureEgressProxy bails
+	// at the EgressProxyConflict early-return (never creates/updates/deletes
+	// it), so it occupies the name and the verify-egress hold fires (the pod
+	// is not controlled by the Loop).
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	pod.Status.Phase = corev1.PodRunning
+	if ready {
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	} else {
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
 
 // s5aDriveToVerifyingWithReconciler is the s5aDriveToVerifying variant that
 // uses the SPEC's reconciler (so the driver seam and CRD seam are active on
@@ -1966,4 +2202,7 @@ func s5aDriveToVerifyingWithReconciler(r *LoopReconciler, ns, name string) {
 	// Implementing -> Verifying advance).
 	s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
 	s5aReconcile(r, ns, name)
+	// D61 (I90): drive the operator's own egress proxy pod Ready so the
+	// verify-egress hold passes (mirrors s5aDriveToVerifying).
+	d61ReadyVerifyProxy(r, ns, name)
 }

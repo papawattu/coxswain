@@ -676,7 +676,12 @@ func (r *LoopReconciler) s4ClaimAndVerifyJob(ctx context.Context, loop *coxv1alp
 	advancedFrom = advancedFromClaim
 	verifyRequeue = false
 	if err := r.ensureVerifyJobAndNetPolicies(ctx, loop); err != nil {
-		if !errors.Is(err, errVerifyStaleDeleted) {
+		// errVerifyStaleDeleted: the D27 stale-Job guard just deleted a Job
+		// (requeue to recreate). errVerifyProxyNotReady: the D61 verify-egress
+		// hold — the egress proxy pod is not Ready (external repo), so no
+		// verify Job is created yet; requeue so the next reconcile retries once
+		// the proxy is Ready. Both are clean requeues, never controller errors.
+		if !errors.Is(err, errVerifyStaleDeleted) && !errors.Is(err, errVerifyProxyNotReady) {
 			return claimReadPending, advancedFrom, verifyRequeue, s4Changed, err
 		}
 		verifyRequeue = true

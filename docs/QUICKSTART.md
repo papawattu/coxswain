@@ -278,15 +278,34 @@ when the hash differs).
 ## 7. Forking a Loop
 
 A **fork** seeds a new one-shot Loop from an existing Loop's checkpoint
-(ADR-0003: forks, not re-tasks). The fork inherits the source Loop's
-workspace (the repo) and model, and is seeded from the source Loop's
-checkpoint at the given iteration. The fork runs a normal one-shot Loop
-(own branch, own deliver, own PR) — it does NOT re-task the source Loop.
+(ADR-0003: forks, not re-tasks). The fork inherits the source Loop's spec
+(goal, agent, verify, delivery, loop, checkpoints) and is seeded from the
+source Loop's checkpoint at the given iteration. The fork runs a normal
+one-shot Loop (own branch, own deliver, own PR) — it does NOT re-task the
+source Loop.
 
 ```sh
-# Fork from iteration 2 of the source Loop.
+# Fork from iteration 2 of the source Loop (inherits the source's spec
+# as-is, including its acceptance checks).
 kubectl cox fork my-fork --loop <source-loop> --iteration 2
+
+# Fork with a different acceptance check (replaces
+# spec.verify.acceptanceChecks; the rest of verify — preset,
+# protectedPaths, etc. — is inherited from the source).
+kubectl cox fork my-fork --loop <source-loop> --iteration 2 --check "make -n docs"
+
+# Fork with a different goal (replaces spec.goal; the rest of the spec is
+# inherited from the source).
+kubectl cox fork my-fork --loop <source-loop> --iteration 2 --goal "a new objective"
 ```
+
+The `--check` flag (repeatable) replaces the fork's acceptance checks
+(`spec.verify.acceptanceChecks`) while keeping the rest of verify intact
+(`preset`, `protectedPaths`, `onVerifyFail`, etc. are inherited from the
+source). A fork WITHOUT `--check` inherits the source's acceptance checks
+(a user forks to try another path toward the SAME acceptance). The `--goal`
+flag (when given) replaces the fork's goal (`spec.goal`); a fork WITHOUT
+`--goal` inherits the source's goal.
 
 The operator does the fork's PVC restore (the controller's
 `spec.forkOf` handling restores the fork's OWN workspace PVC from the

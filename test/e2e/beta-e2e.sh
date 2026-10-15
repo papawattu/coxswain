@@ -1134,9 +1134,9 @@ while :; do
 	sleep 5
 done
 FORK_LOOP="b6-fork-$TS"
-log step5 "forking: cox fork $FORK_LOOP --loop $FORK_SRC --iteration $SRC_ITER (the QUICKSTART step-7 form of 'fork --from iter-N')"
-cox fork "$FORK_LOOP" --loop "$FORK_SRC" --iteration "$SRC_ITER" >"$EVIDENCE/step5-fork.txt" 2>&1 || { cat "$EVIDENCE/step5-fork.txt"; die "step5: cox fork failed"; }
-log step5 "the fork Loop $FORK_LOOP is applied (spec.forkOf loop=$FORK_SRC iteration=$SRC_ITER; its verify check is the PASSING default 'make -n docs' — the fork SUCCEEDS where the source's forced check cannot); watching to a terminal phase"
+log step5 "forking: cox fork $FORK_LOOP --loop $FORK_SRC --iteration $SRC_ITER --check 'make -n docs' (the QUICKSTART step-7 form of 'fork --from iter-N' with --check: the fork INHERITS the source's spec (goal, agent, delivery, loop, checkpoints) and the source's verify (preset, protectedPaths), but the --check flag REPLACES spec.verify.acceptanceChecks with a PASSING check ('make -n docs') — the fork SUCCEEDS where the source's forced 'false' check cannot)"
+cox fork "$FORK_LOOP" --loop "$FORK_SRC" --iteration "$SRC_ITER" --check "make -n docs" >"$EVIDENCE/step5-fork.txt" 2>&1 || { cat "$EVIDENCE/step5-fork.txt"; die "step5: cox fork failed"; }
+log step5 "the fork Loop $FORK_LOOP is applied (spec.forkOf loop=$FORK_SRC iteration=$SRC_ITER; spec.verify.acceptanceChecks=[make -n docs] (the --check override); the rest of verify (preset, protectedPaths) is inherited from the source); watching to a terminal phase"
 watch_loop "$FORK_LOOP" "$EVIDENCE/step5-phase.log" || die "step5: the fork $FORK_LOOP wedged (see $EVIDENCE/step5-phase.log — recorded, not guessed)"
 FORK_PHASE=$(phase_of "$FORK_LOOP")
 [ "$FORK_PHASE" = "Succeeded" ] || { collect_evidence "$FORK_LOOP" fork-wedge; die "step5 FAILED: the fork $FORK_LOOP ended $FORK_PHASE (not Succeeded) — see $EVIDENCE/fork-wedge"; }

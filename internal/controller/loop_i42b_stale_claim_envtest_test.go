@@ -160,10 +160,11 @@ var _ = Describe("I42b stale Planning claim after re-plan", func() {
 		setCondition(ns, "i42b-rej", coxv1alpha1.PlanRejectedCondition, "True", "the plan is wrong")
 
 		// Step 3: reconcile. applyApprovalGate moves AwaitingApproval ->
-		// Planning and increments planAttempt to 1. advancePhaseFromClaim
-		// reads the STALE claim from the pod (planAttempt 0). The planAttempt
-		// guard must REJECT it: the Loop stays in Planning.
-		reconcileLoop(r, ns, "i42b-rej")
+		// Planning and increments planAttempt to 1. The pod still has the
+		// STALE claim (planAttempt 0) — re-inject it via the seam to simulate
+		// the operator reading it from the pod. The planAttempt guard must
+		// REJECT it: the Loop stays in Planning.
+		reportClaim(r, ns, "i42b-rej", staleClaim)
 
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		Expect(loop.Status.PlanAttempt).To(Equal(1),

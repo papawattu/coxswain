@@ -781,7 +781,8 @@ wait_delivered "$MANUAL_LOOP" 900 || { collect_evidence "$MANUAL_LOOP" manual-de
 PR_URL=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
 PR_NUM=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.prNumber}' 2>/dev/null || echo "")
 BRANCH=$(k get loop "$MANUAL_LOOP" -o jsonpath='{.status.delivery.branch}' 2>/dev/null || echo "")
-[ -n "$PR_URL" ] || die "step2: Delivered but no PR URL in status.delivery"
+[ -n "$PR_URL" ] || { collect_evidence "$MANUAL_LOOP" step2-nopr; die "step2: Delivered but no PR URL in status.delivery (I84: the PR URL is the evidence the step 5 independence check compares against — an empty PR_URL would make the step-5 PR-independence check pass vacuously; see $EVIDENCE/step2-nopr)"; }
+[ -n "$BRANCH" ] || { collect_evidence "$MANUAL_LOOP" step2-nobranch; die "step2: Delivered but no branch in status.delivery (I84: the branch is the evidence the step 5 independence check compares against — an empty BRANCH would make the step-5 branch-independence check pass vacuously; see $EVIDENCE/step2-nobranch)"; }
 {
 	echo "loop: $MANUAL_LOOP"
 	echo "pr-number: $PR_NUM"
@@ -1151,10 +1152,17 @@ log step5 "the fork's Restore condition is True (reason $(k get loop "$FORK_LOOP
 # step 2's Loop's delivery) — ADR-0003. The source here is step 2's Loop
 # (the fork's branch must differ from the STEP 2 Loop's branch — the fork is
 # an independent Loop, its own branch and PR, not a re-delivery of step 2).
+# The fork's branch + PR are read AFTER wait_delivered (the delivery must
+# complete before the branch/PR are set on status.delivery; reading them
+# before wait_delivered would yield an empty string and the independence
+# checks would pass vacuously — the I84 hollow-assertion finding from the
+# run 16 review). The step-2 BRANCH and PR_URL are asserted non-empty in
+# step 2 (a guard added in this fix), so the comparison below is against
+# real values, not empty strings.
+wait_delivered "$FORK_LOOP" 900 || { collect_evidence "$FORK_LOOP" fork-delivery; die "step5: the fork's delivery did not complete (see $EVIDENCE/fork-delivery)"; }
 FORK_BRANCH=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.branch}' 2>/dev/null || echo "")
 FORK_PR=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
-wait_delivered "$FORK_LOOP" 900 || { collect_evidence "$FORK_LOOP" fork-delivery; die "step5: the fork's delivery did not complete (see $EVIDENCE/fork-delivery)"; }
-FORK_PR=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
+[ -n "$FORK_BRANCH" ] || { collect_evidence "$FORK_LOOP" fork-nobranch; die "step5: the fork Delivered but has no branch in status.delivery (I84: an empty FORK_BRANCH would make the branch-independence check pass vacuously; see $EVIDENCE/fork-nobranch)"; }
 [ -n "$FORK_PR" ] || { collect_evidence "$FORK_LOOP" fork-nopr; die "step5: the fork Delivered but has no PR URL (independence not proven — I84)"; }
 [ "$FORK_BRANCH" != "$BRANCH" ] || die "step5 FAILED: the fork's branch ($FORK_BRANCH) equals step 2's branch — the fork is not independent (ADR-0003)"
 [ "$FORK_PR" != "$PR_URL" ] || die "step5 FAILED: the fork's PR URL ($FORK_PR) equals step 2's PR URL — the fork did not open its OWN draft PR (the handoff's step-5 PASS condition requires a URL different from step 2's)"
@@ -1194,7 +1202,9 @@ TOKEN_TMP="$(mktemp)"; chmod 600 "$TOKEN_TMP"
 cat "$EVIDENCE/step6-token.txt" >"$TOKEN_TMP"
 kc -n "$NS" create secret generic b6-metrics-secret --from-file=tok="$TOKEN_TMP" --dry-run=client -o yaml | kc apply -f - >/dev/null
 rm -f "$TOKEN_TMP" "$EVIDENCE/step6-token.txt"
-log step6 "token minted and loaded into the b6-metrics-secret Secret via --from-file (the token value is never written to the evidence; Secret: $(kc -n "$NS" get secret b6-metrics-secret -o jsonpath='{.type} keys={{range $k,$v := .data}}{{$k}} {{end}}'))"
+_SECTYPE=$(kc -n "$NS" get secret b6-metrics-secret -o jsonpath='{.type}' 2>/dev/null || echo "?")
+_SECKEYS=$(kc -n "$NS" get secret b6-metrics-secret -o go-template='{{range $k, $v := .data}}{{$k}} {{end}}' 2>/dev/null || echo "?")
+log step6 "token minted and loaded into the b6-metrics-secret Secret via --from-file (the token value is never written to the evidence; Secret: b6-metrics-secret type=$_SECTYPE keys=$_SECKEYS)"
 # The scrape pod curls the secure endpoint with the token (mounted from the
 # Secret) and streams the full /metrics body to stdout — the pod's log IS the
 # scrape (I84: the bytes are kept where the claim reads them).
@@ -1209,10 +1219,18 @@ spec:
   containers:
   - name: scrape
     image: docker.io/curlimages/curl:latest
-    command:
-    - sh
-    - -c
-    - curl -skS --max-time 30 --header "Authorization: Bearer \$(cat /tok)" https://coxswain-controller-manager-metrics-service.coxswain-system.svc:8443/metrics -o /tmp/metrics.txt -w 'SCRAPE_HTTP=%{http_code}\n'; r=\$?; echo SCRAPE_RC=\$r; wc -c </tmp/metrics.txt; echo METRICS_BEGIN; cat /tmp/metrics.txt; echo METRICS_END
+    # The v1 Pod spec's `command` field is a STRING (the full shell command),
+    # not a YAML sequence. A sequence (the run 16 defect: `command: [sh, -c,
+    # curl ...]`) is rejected by `kc apply` with "cannot unmarshal object
+    # into Go struct field Container.spec.containers.command of type
+    # string". The string is YAML-double-quoted (the inner double quotes
+    # around "Authorization: Bearer $(cat /tok)" are escaped as \"; the
+    # $() and $?/$r/%{http_code} are passed through as literals to the pod's
+    # shell, which expands them when the pod runs). The \\n inside the
+    # double-quoted YAML string is a literal backslash-n (the YAML parser
+    # interprets the YAML-level \\n as the two characters \\n, and the
+    # pod's shell `echo` then interprets that as a newline).
+    command: "curl -skS --max-time 30 --header \"Authorization: Bearer $(cat /tok)\" https://coxswain-controller-manager-metrics-service.coxswain-system.svc:8443/metrics -o /tmp/metrics.txt -w 'SCRAPE_HTTP=%{http_code}\\n'; r=$?; echo SCRAPE_RC=$r; wc -c </tmp/metrics.txt; echo METRICS_BEGIN; cat /tmp/metrics.txt; echo METRICS_END"
     volumeMounts:
     - name: tok
       mountPath: /tok

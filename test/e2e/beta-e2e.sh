@@ -1328,11 +1328,24 @@ import sys
 lines = open(sys.argv[1]).read().splitlines()
 def val(name, labels=None):
     for l in lines:
-        if l.startswith(name + "{") and (labels is None or all(p in l for p in labels)):
-            try:
-                return float(l.rsplit(" ", 1)[1])
-            except (ValueError, IndexError):
-                continue
+        if labels is not None:
+            if l.startswith(name + "{") and all(p in l for p in labels):
+                try:
+                    return float(l.rsplit(" ", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+        else:
+            # Match labeled form (name{...} value) or unlabeled form (name value)
+            if l.startswith(name + "{"):
+                try:
+                    return float(l.rsplit(" ", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+            if l.startswith(name + " ") and not l.startswith(name + "_"):
+                try:
+                    return float(l.rsplit(" ", 1)[1])
+                except (ValueError, IndexError):
+                    continue
     return None
 ok = True
 for name, want, labels in [
@@ -1362,7 +1375,7 @@ for name, want, labels in [
 print("RESULT:", "OK" if ok else "FAIL")
 sys.exit(0 if ok else 1)
 PY
-) || { cat "$EVIDENCE/step6-metrics.log" | grep -E '^coxswain_' ; die "step6 FAILED: one of the coxswain_* metrics is absent or not > 0 (see above; I84: the scrape's content, not just its parse, is the assertion)"; }
+) || { echo "$METRICS_CHECK"; cat "$EVIDENCE/step6-metrics.log" | grep -E '^coxswain_' ; die "step6 FAILED: one of the coxswain_* metrics is absent or not > 0 (see above; I84: the scrape's content, not just its parse, is the assertion)"; }
 # Delete the active Loop now (the scrape is done; the metric was captured).
 kc -n "$NS" delete loop "$ACTIVE_LOOP" --wait=false >/dev/null 2>&1 || true
 log step6 "the coxswain_* metrics are present with sensible values (including coxswain_loops_active{phase=\"AwaitingApproval\"} >= 1 from the deterministic active Loop): $(printf '%s\n' "$METRICS_CHECK" | tr '\n' ' ')"

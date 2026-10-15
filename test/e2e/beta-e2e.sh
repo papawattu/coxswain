@@ -1446,7 +1446,7 @@ echo "model: $VLLM_ENDPOINT (model $VLLM_MODEL; vllm-preflight: $VLLM_STATE; in-
 echo "step1 (reject + reason in re-plan feedback): PASS (plan-feedback grep -qF matched the reason; $EVIDENCE/step1-verify.txt)"
 echo "step2 (approve second plan -> Succeeded + draft PR): PASS (PR $PR_URL, branch $BRANCH; PolicyEnforced=$PE)"
 echo "step3 (forced verify failure re-plans, onVerifyFail: Plan): PASS ($EVIDENCE/step3-observe.txt)"
-echo "step4 (PVC deleted mid-Implementing -> restored from last checkpoint): PASS (Restore condition: $RESTORE_COND)"
+echo "step4 (PVC deleted mid-Implementing -> restored from last checkpoint): PASS (Restore condition: status=$RESTORE_COND_STATUS reason=$RESTORE_COND_REASON)"
 echo "step5 (cox fork --from iter-$SRC_ITER -> independent Succeeded Loop): PASS (fork PR $FORK_PR, branch $FORK_BRANCH)"
 echo "step6 (metrics via coxswain-metrics-reader token): PASS (loops_completed_total{result=\"succeeded\"}=$SUCCEEDED_COUNT >= 2; verify_results_total{result=\"pass\"}=$PASS_COUNT >= 2)"
 echo "digests:"

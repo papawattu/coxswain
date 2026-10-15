@@ -518,11 +518,23 @@ and `Delivered` (draft PR on the sandbox repo). Evidence:
   `kubearmor.io/enforcer=bpf`, kernel `7.0.0-28-generic`. (Not AppArmor.)
 - **Gates live**: `PolicyEnforced=True (Enforcing)`, `NetworkEnforced=True
   (CNIEnforced)`, `ModelAvailable=True (Recovered)`, `Delivered=True`.
-- **KubeArmor policy** (the network allow): the operator's KubeArmorPolicy for
-  the agent is `action: Block` (default-deny) with an Allow for the model-proxy
-  hop + model endpoint. It governs the **network** policy via BPF-LSM; it has
-  no exec-deny rule (a `kubectl exec` is not blocked — see the
-  `Known limitations` note and `karmor-exec-test-honest.txt`).
+- **PolicyEnforced = the KubeArmor-enforced DNS/network fence** (the exact
+  thing the gate claims, shown enforcing): the operator's KubeArmorPolicy for
+  the agent is `action: Block` (default-deny) with a DNS Allow for **only**
+  `<loop>-proxy.<ns>.svc` + `model-endpoint`. From inside a running agent
+  container, a direct DNS lookup for a non-allowlisted name is **BLOCKED by
+  KubeArmor (BPF-LSM)**:
+  - `getent hosts github.com` → **exit 2** (no output)
+  - `curl -m 10 https://github.com` → `curl: (6) Could not resolve host: github.com`, **exit 6**
+  - the KubeArmor audit emits the Block alert: `Enforcer: BPFLSM`, `Action:
+    Block`, `Result: "Permission denied"`, `Operation: Network`, `Resource:
+    github.com` (see `karmor-dns-fence-block.txt` / `karmor-dns-fence-logs.json`)
+  - **allowed control**: `getent hosts <loop>-proxy.<ns>.svc` → resolves to the
+    model proxy's ClusterIP, **exit 0** (the in-fence name resolves)
+  This is the KubeArmor DNS fence — **not** an exec-deny: agent exec is
+  **unrestricted by design** (a `kubectl exec` of a non-allowlisted binary is
+  not blocked — see `karmor-exec-test-honest.txt` and the `Known limitations`
+  note).
 - **Blocked egress (CNI gate)**: a pod matching the verify selector attempts a
   **direct** egress to `github.com:443` (bypassing the proxy) — **BLOCKED by
   Calico** (no route).
@@ -553,11 +565,16 @@ blocked-egress and egress-proxy SNI logs) is under
 - **BPF-LSM wedge risk (ADR-0007 F2):** never restart/kill the KubeArmor
   agent while Loops run. A BPF wedge locks the node's LSM enforcement and
   requires a host reboot to clear.
-- **The KubeArmor policy is a network allow, not an exec-deny:** the operator's
-  KubeArmorPolicy for the agent is `action: Block` (default-deny) with an Allow
-  for the model-proxy hop + model endpoint. It governs the **network** policy
-  (the model-proxy hop) via BPF-LSM; it does **not** contain an exec-deny rule,
-  so a `kubectl exec` of a non-allowlisted binary is **not** blocked by
-  KubeArmor (observed: exit 0, 0 KubeArmor Block alerts). Network egress
-  enforcement (blocking disallowed egress) is Calico's job — the
-  `NetworkEnforced` gate. See the evidence (`karmor-exec-test-honest.txt`).
+- **`PolicyEnforced` is the KubeArmor-enforced DNS/network fence, not an
+  exec-deny:** the operator's KubeArmorPolicy for the agent is `action: Block`
+  (default-deny) with a DNS Allow for **only** `<loop>-proxy.<ns>.svc` +
+  `model-endpoint`. The eBPF engine (BPF-LSM) enforces that fence: a direct DNS
+  lookup for a non-allowlisted name (e.g. `github.com`) is **blocked**
+  (`getent`/`curl` fail, and the KubeArmor audit emits an `Action: Block` /
+  `Result: "Permission denied"` alert for `Operation: Network`). Agent **exec**
+  is **unrestricted by design** — the policy has no exec-deny rule, so a
+  `kubectl exec` of a non-allowlisted binary is **not** blocked (observed: exit
+  0, 0 exec-related Block alerts). Arbitrary-host network egress is blocked both
+  by this fence (DNS denied) and by Calico's NetworkPolicy (the separate
+  `NetworkEnforced` gate). See the evidence (`karmor-dns-fence-block.txt`,
+  `karmor-exec-test-honest.txt`).

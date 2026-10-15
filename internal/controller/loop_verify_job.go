@@ -1339,6 +1339,10 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// readCheckOutputSeam the stall gate already read — no second read).
 			loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 			loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+			// I42b: increment planAttempt so a stale Planning success claim
+			// from a prior attempt is rejected by advancePhaseFromClaim (the
+			// claim's planAttempt does not match the new status.planAttempt).
+			loop.Status.PlanAttempt++
 			if loop.Status.Verify == nil {
 				loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 			}

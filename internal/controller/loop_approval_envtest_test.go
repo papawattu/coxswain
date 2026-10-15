@@ -385,7 +385,7 @@ var _ = Describe("B3 plan approval gate", func() {
 			"the phase-init writes the DURABLE reason to plan-feedback (the condition was cleared on the prior reconcile)")
 		// The phase-init script carries the reason (shell-quoted, written to the
 		// file) and references the feedback file.
-		script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, planHash, planFeedback)
+		script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.PlanAttempt, planHash, planFeedback)
 		Expect(script).To(ContainSubstring(coxPlanFeedbackFile),
 			"the phase-init script references the plan-feedback file")
 		Expect(script).To(ContainSubstring("the plan misses the edge case"),

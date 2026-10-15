@@ -97,7 +97,7 @@ func TestPhaseInitScriptWritesRejectionReason(t *testing.T) {
 	// The phase-init script (the phase-init container's sh -c body) writes the
 	// file with that content. The script is the execution seam — the operator
 	// is the sole writer.
-	script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, planHash, planFeedback)
+	script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.PlanAttempt, planHash, planFeedback)
 	if !strings.Contains(script, coxPlanFeedbackFile) {
 		t.Fatalf("the phase-init script does not reference %s;\nscript:\n%s", coxPlanFeedbackFile, script)
 	}
@@ -128,7 +128,7 @@ func TestPhaseInitScriptRemovesFeedbackWhenNoRejection(t *testing.T) {
 	if planFeedback != "" {
 		t.Fatalf("planApprovalFiles feedback = %q, want \"\" (no rejection)", planFeedback)
 	}
-	script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, "", planFeedback)
+	script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.PlanAttempt, "", planFeedback)
 	if !strings.Contains(script, `rm -f "${DEST}/.coxswain/`+coxPlanFeedbackFile+`"`) {
 		t.Fatalf("the phase-init script does not remove %s when there is no rejection;\nscript:\n%s", coxPlanFeedbackFile, script)
 	}
@@ -145,7 +145,7 @@ func TestPhaseInitScriptNoFeedbackWhenNotPlanning(t *testing.T) {
 	if planFeedback != "" {
 		t.Fatalf("planApprovalFiles feedback at Implementing = %q, want \"\" (the runner reads the feedback only in Planning)", planFeedback)
 	}
-	script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, "", planFeedback)
+	script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.PlanAttempt, "", planFeedback)
 	if !strings.Contains(script, `rm -f "${DEST}/.coxswain/`+coxPlanFeedbackFile+`"`) {
 		t.Fatalf("the phase-init script does not remove %s at a non-Planning phase;\nscript:\n%s", coxPlanFeedbackFile, script)
 	}

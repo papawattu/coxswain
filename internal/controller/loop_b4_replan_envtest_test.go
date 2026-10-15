@@ -402,12 +402,14 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		// iteration increments, and the failure summary is set. The
 		// AwaitingApproval hold is a B3 concern (the plan-change gate).
 		replanIter := loop.Status.Iteration
+		replanAttempt := loop.Status.PlanAttempt
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return &PhaseClaim{
 				ObservedPhase: coxv1alpha1.LoopPhasePlanning,
 				Status:        "success",
 				Iteration:     replanIter,
 				HeadCommit:    s5aHeadCommit,
+				PlanAttempt:   replanAttempt,
 				PlanChanged:   true,
 			}, nil
 		}
@@ -631,12 +633,14 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		// Drive the Loop back through the re-plan cycle to a SECOND verify:
 		// Planning -> Implementing (claim) -> Verifying (claim with headCommit).
 		replanIter := loop.Status.Iteration
+		replanAttempt := loop.Status.PlanAttempt
 		s5aEnsureSandbox(ns, name)
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return &PhaseClaim{
 				ObservedPhase: coxv1alpha1.LoopPhasePlanning,
 				Status:        "success",
 				Iteration:     replanIter,
+				PlanAttempt:   replanAttempt,
 			}, nil
 		}
 		b4Reconcile(r, ns, name)

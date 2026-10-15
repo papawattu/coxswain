@@ -943,6 +943,16 @@ spec:
                 - Paused
                 - CleaningUp
                 type: string
+              planAttempt:
+                default: 0
+                description: |-
+                  planAttempt is the 1-based count of Planning runs (incremented on
+                  every re-entry to Planning: a rejection re-plan or an onVerifyFail=Plan
+                  re-plan). The runner echoes it from .coxswain/plan-attempt into its
+                  claim; advancePhaseFromClaim ignores a claim whose planAttempt does not
+                  match status.planAttempt, so a stale Planning success claim from a prior
+                  attempt cannot satisfy the new Planning phase (I42b).
+                type: integer
               policy:
                 description: |-
                   policy is the operator's record of the effective AgentPolicy for the

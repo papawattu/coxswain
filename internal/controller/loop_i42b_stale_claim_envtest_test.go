@@ -213,6 +213,9 @@ var _ = Describe("I42b stale Planning claim after re-plan", func() {
 		r := i42bReconciler()
 		nn := types.NamespacedName{Name: "i42b-mixed", Namespace: ns}
 		loopSpec := s5aLoopSpec()
+		if loopSpec.Approval == nil {
+			loopSpec.Approval = &coxv1alpha1.Approval{}
+		}
 		loopSpec.Approval.Mode = coxv1alpha1.ApprovalModeManual
 		loopSpec.Approval.OnReject = coxv1alpha1.OnRejectReplan
 		loop := &coxv1alpha1.Loop{
@@ -244,6 +247,9 @@ var _ = Describe("I42b stale Planning claim after re-plan", func() {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 		loop.Status.PlanAttempt = 0 // the OLD operator did not increment
+		if loop.Status.Approval == nil {
+			loop.Status.Approval = &coxv1alpha1.ApprovalStatus{}
+		}
 		loop.Status.Approval.LastRejectionReason = "remove the kustomize target"
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 

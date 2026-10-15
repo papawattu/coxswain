@@ -1031,16 +1031,24 @@ PVC_PHASE=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get
 log step4 "the restored PVC $PVC_NAME: uid=$PVC_UID_AFTER (was $PVC_UID_BEFORE) dataSource.name=$PVC_DS_NAME phase=$PVC_PHASE"
 [ "$PVC_UID_AFTER" != "$PVC_UID_BEFORE" ] || die "step4 FAILED: the PVC after the restore has the SAME uid ($PVC_UID_AFTER) as before the delete — the restore did not recreate the PVC from the checkpoint (see $EVIDENCE/step4-pvc-after.json)"
 [ "$PVC_DS_NAME" != "" ] || die "step4 FAILED: the restored PVC has no spec.dataSource.name (it was not created FROM a VolumeSnapshot — see $EVIDENCE/step4-pvc-after.json)"
-case "$CK_LIST" in
-*"$PVC_DS_NAME"*) : ;; # the dataSource checkpoint is in the recorded list
-*) die "step4 FAILED: the restored PVC's dataSource.name ($PVC_DS_NAME) is not in the Loop's recorded checkpoints ([${CK_LIST:-}] — see $EVIDENCE/step4-pvc-after.json)" ;;
+case "$CK_PRE_DELETE" in
+*"$PVC_DS_NAME"*) : ;; # the restored-from checkpoint existed BEFORE the delete (retention GCs non-kept checkpoints DURING the run — e.g. iter-0 is GC'd after iter-3's checkpoint exists — so it is NOT necessarily in the post-terminal status.checkpoints; asserting against the post-terminal list would be a script bug, not an operator defect)
+*) die "step4 FAILED: the restored PVC's dataSource.name ($PVC_DS_NAME) was not one of the checkpoints that existed before the delete ([${CK_PRE_DELETE:-}] — the restore picked a checkpoint that did not exist; see $EVIDENCE/step4-pvc-after.json)" ;;
+esac
+case "$PVC_DS_NAME" in
+checkpoint-"$RESTORE_LOOP"-iter-*) : ;;
+*) die "step4 FAILED: the restored PVC's dataSource.name ($PVC_DS_NAME) is not a checkpoint of $RESTORE_LOOP (expected checkpoint-$RESTORE_LOOP-iter-N — see $EVIDENCE/step4-pvc-after.json)" ;;
 esac
 # (3) The Loop carried on past the restore: the phase trail after the delete
 # must show the phase REACHING Verifying (a later verify ran — the iteration
 # advanced past the restore hold; the reviewer's evidence: Implementing ->
 # Verifying -> a new checkpoint at a higher iteration), OR a NEW checkpoint at
 # an iteration higher than the pre-delete one must exist. Either proves the
-# restore hold released and the Loop continued its phase machine.
+# restore hold released and the Loop continued its phase machine. (The trail
+# check is primary: a later Verifying phase proves the phase machine kept
+# running after the restore hold, which is exactly what "carried on" means.
+# The new-checkpoint check is the fallback proof, in case the 4s poll missed
+# a short Verifying window.)
 CK_NEW=$(grep -E 'phase=(Verifying|Succeeded|Failed).*' "$EVIDENCE/step4-trail-after.log" | head -1 || true)
 CK_NEW_2=$(python3 -c '
 import json,sys,subprocess

@@ -197,6 +197,18 @@ func (r *LoopReconciler) verifyCheckImage(loop *coxv1alpha1.Loop) string {
 // still taken; the apiserver deletes async).
 var errVerifyStaleDeleted = errors.New("stale verify Job deleted")
 
+// errVerifyProxyNotReady is the sentinel error ensureVerifyJob returns when
+// the D61 verify-egress hold applies (the repo host is external, so the
+// clone-base fetch traverses the egress proxy) but the egress proxy pod is
+// not yet Ready and owned by the Loop. The caller (s4ClaimAndVerifyJob) maps
+// it to a clean requeue — the verify Job is NOT created in this reconcile
+// (clone-base would fail in milliseconds against a missing proxy and burn a
+// VerifyInfra attempt). Same gate pattern as the deliver Job's I72 hold
+// (loop_deliver_job.go:685-707): no Job until the egress proxy pod is Ready
+// and controlled by the Loop. An in-cluster repo (repoPeer non-nil, no
+// proxy) and a proxy-absent/foreign pod both keep the hold active.
+var errVerifyProxyNotReady = errors.New("verify Job held: the egress proxy pod is not Ready")
+
 // verifyJobName returns the verify Job name: <loop>-verify-<iteration>. The
 // iteration is the Loop's current 1-based iteration count (the pin in
 // status.currentVerify is the evidence the Job produces; the Job name carries
@@ -300,6 +312,32 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 	}
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get verify job %s: %w", name, err)
+	}
+	// D61 (I90): the verify-egress hold. When the clone-base fetch traverses
+	// the egress proxy (an EXTERNAL repo host — verifyNeedsProxy), the verify
+	// Job is NOT created until the egress proxy pod is Ready and owned by the
+	// Loop. Without the hold, a verify Job created in the window where the
+	// operator is recreating the proxy ("egress proxy pod spec drift
+	// detected, deleting for recreation") runs clone-base against a missing
+	// proxy, exits 128, and burns a VerifyInfra attempt — three in a row end
+	// the Loop VerifyInfraFailed, the very failure this fix targets. The gate
+	// is on the CREATE path only, mirroring the deliver Job's I72 hold
+	// (loop_deliver_job.go:685-707): an existing verify Job (any outcome) is
+	// mapped as before; only the create of a fresh Job is gated. An
+	// in-cluster repo (verifyNeedsProxy false) keeps the direct path — no
+	// hold. The hold surfaces with a Warning Event (I90) and requeues so the
+	// next reconcile retries once the proxy pod is Ready.
+	if r.verifyNeedsProxy(loop) {
+		egPod := &corev1.Pod{}
+		egErr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod)
+		egReady := egErr == nil && metav1.IsControlledBy(egPod, loop) && isPodReady(egPod)
+		if !egReady {
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "VerifyHeldForProxy",
+					"verify Job %s held: the egress proxy pod %s is not Ready and owned by the Loop (clone-base would fail before the proxy is listening)", name, egressProxyPodName(loop.Name))
+			}
+			return errVerifyProxyNotReady
+		}
 	}
 	// Create the fresh Job. If the name is still taken (a stale Job from a
 	// prior reconcile's deletion has not gone away yet), the Create returns
@@ -468,6 +506,32 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: verifyVol, MountPath: verifyScratchPath},
 		},
+	}
+
+	// D61 (I42): for an EXTERNAL repo host (repoPeer nil — e.g. github.com),
+	// the clone-base fetch traverses the egress proxy. The verify NetworkPolicy
+	// allows egress to the egress-proxy pod (ensureVerifyNetworkPolicy) and the
+	// proxy's SNI allowlist carries the repo host (deliverEgressProxyHosts in
+	// ensureEgressProxy). The proxy env vars route git's fetch through the
+	// egress proxy Service; NO_PROXY keeps in-cluster egress (the workspace
+	// PVC, the model proxy) direct. Mirrors the deliver Job's clone-base (I42d)
+	// and the workspace init container's S6 proxy env. An in-cluster repo
+	// (repoPeer non-nil) keeps the direct path — no proxy env.
+	if r.verifyNeedsProxy(loop) {
+		proxyURL := r.egressProxyServiceURL(loop.Name, loop.Namespace)
+		noProxy := strings.Join([]string{
+			EgressProxyServiceFQDN(loop.Name, loop.Namespace),
+			EgressProxyServiceFQDN(loop.Name, loop.Namespace) + "." + r.clusterDomain(),
+			noProxyLocal,
+		}, ",")
+		cloneCt.Env = append(cloneCt.Env,
+			corev1.EnvVar{Name: envHTTPSProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHttpsProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHTTPProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envHttpProxy, Value: proxyURL},
+			corev1.EnvVar{Name: envNoProxy, Value: noProxy},
+			corev1.EnvVar{Name: envNoProxyLower, Value: noProxy},
+		)
 	}
 
 	// The git credential mount: ONLY when the Loop declares a git secret AND
@@ -732,6 +796,21 @@ echo "clone-base ok"
 `, shellQuote(repo), shellQuote(baseCommit))
 }
 
+// verifyNeedsProxy is true when the verify Job's clone-base fetch must
+// traverse the egress proxy (D61, I42): the repo is set and its host is
+// EXTERNAL (repoPeer nil — no expressible NetworkPolicy repo rule: an external
+// FQDN such as github.com, or an unmapped bare name). An in-cluster repo
+// (repoPeer non-nil) uses the direct repo-peer rule and never the proxy. The
+// verify Job always fetches baseCommit from origin (the pin is set), so the
+// proxy is needed for any external repo. The egress proxy's SNI allowlist is
+// already wired by deliverEgressProxyHosts (the verify repo is the same repo
+// delivery pushes, so the host is on the allowlist whenever verify needs the
+// proxy — see ensureEgressProxy).
+func (r *LoopReconciler) verifyNeedsProxy(loop *coxv1alpha1.Loop) bool {
+	return loop.Spec.Workspace.Repo != "" &&
+		repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost) == nil
+}
+
 // ensureVerifyNetworkPolicy creates or updates the verify Job's NetworkPolicy:
 // egress only to the git repo peer (for the clone-base fetch) + DNS. The
 // verify pod has NO model/egress access — it is a trusted, isolated check
@@ -740,6 +819,17 @@ echo "clone-base ok"
 //
 // I42c pattern (createOrUpdateNP): the spec is set in the mutate func so that
 // input changes (e.g. the repo port) propagate to an existing policy.
+//
+// D61 (I42/I72): for EXTERNAL repo hosts (repoPeer nil — e.g. github.com),
+// the NetworkPolicy cannot name the host (K8s peers are IPs, pods, or
+// namespaces, not DNS names). As the deliver Job does (I42), the clone-base
+// fetch traverses the Loop's egress proxy: the egress adds a rule to the
+// egress-proxy POD (egressProxyLabels) on egressProxyPort, and the proxy's
+// SNI allowlist carries the repo host (deliverEgressProxyHosts, wired in
+// ensureEgressProxy). No IPBlock: an operator-resolved IP is unsafe (an
+// IPv6 "/32" is a 2^96 hole), flaky (github.com rotates IPs — the operator's
+// resolution need not match the pod's seconds later), and outside the
+// egress proxy's SNI allowlist + logging.
 func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return nil
@@ -752,10 +842,24 @@ func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *co
 		{To: []networkingv1.NetworkPolicyPeer{dnsPeer()}, Ports: dnsPorts()},
 	}
 	if peer := repoPeer(loop.Spec.Workspace.Repo, r.serviceNamespaceFromHost); peer != nil {
+		// An in-cluster repo: the direct repo-peer rule (no proxy hop).
 		port := intstrPtr32(int32(workspaceRepoPort(loop.Spec.Workspace.Repo)))
 		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 			To:    []networkingv1.NetworkPolicyPeer{*peer},
 			Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: new(corev1.ProtocolTCP)}},
+		})
+	} else {
+		// D61 (I42): an external repo host — the clone-base fetch traverses the
+		// egress proxy (mirrors ensureDeliverNetPolicies). The proxy pod carries
+		// egressProxyLabels; the SNI allowlist carries the repo host.
+		peer := networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: egressProxyLabels(loop.Name)},
+		}
+		port := intstrPtr32(egressProxyPort)
+		protocol := corev1.ProtocolTCP
+		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+			To:    []networkingv1.NetworkPolicyPeer{peer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: port, Protocol: &protocol}},
 		})
 	}
 	npol := &networkingv1.NetworkPolicy{

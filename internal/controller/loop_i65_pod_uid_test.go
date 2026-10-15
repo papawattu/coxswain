@@ -339,6 +339,12 @@ func i65ansDrive(r *LoopReconciler, ns, name string) {
 	s5aEnsureSandbox(ns, name)
 	s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
 	s5aReconcile(r, ns, name)
+	// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+	// Ready and owned before the operator creates the verify Job (external
+	// repo). Drive the operator's own pod Ready (the tolerant
+	// d61ReadyVerifyProxy) so these specs — which test the verify Job's pod
+	// UID matching, not the proxy hold — reach the verify Job.
+	d61ReadyVerifyProxy(r, ns, name)
 }
 
 // i65ansPlantPod plants a verify Job pod for jobName with the given init

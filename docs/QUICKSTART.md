@@ -341,3 +341,188 @@ a local 27B-class model under load, a legitimate response can approach 120s
 `ModelUnavailable` conditions on a healthy backend. The retry count and
 backoff base are currently constants (`defaultModelRetries = 3`,
 `defaultModelRetryBackoff = 2s` in `runner/runner.go`).
+
+## 9. Calico + KubeArmor VM (both gates enforcing)
+
+The alpha and beta e2e runs use kindnet (the default kind CNI) with the
+`--allow-unenforced` / `--allow-unenforced-network` escape hatches. A
+production deployment requires both gates to be live without escape hatches:
+
+- **NetworkEnforced=True** — an enforcing CNI (Calico) polices pod →
+  host-network egress. The operator's CNI probe confirms this.
+- **PolicyEnforced=True** — KubeArmor (BPF-LSM) enforces the Loop's
+  effective policy (file, network, process, capabilities). The operator's
+  eBPF enforcer confirms this.
+
+This section walks through setting up a dedicated VM with Calico +
+KubeArmor and running a Loop with both gates enforcing.
+
+### Prerequisites
+
+- A dedicated VM on the LAN (e.g. Proxmox LXC or VM) with:
+  - **BPF-LSM enabled in the kernel** (the host kernel must have
+    `CONFIG_BPF_LSM=y`). Verify: `cat /sys/kernel/security/lsm` must
+    include `bpf` in the comma-separated list.
+  - **Docker** (or a container runtime) for kind.
+  - **SSH access** from the devbox.
+  - **Network reachability** to the vLLM model endpoint (e.g.
+    `192.168.1.20:8000`).
+- The coxswain operator built from `main` (the release commit).
+
+### Step 1: Install tools on the VM
+
+```bash
+# kind (pinned v0.34.0)
+curl -sfSL https://github.com/kubernetes-sigs/kind/releases/download/v0.34.0/kind-linux-amd64 \
+  | sudo tee /usr/local/bin/kind >/dev/null && sudo chmod +x /usr/local/bin/kind
+
+# kubectl (pinned v1.34.0)
+curl -sfSL https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl \
+  | sudo tee /usr/local/bin/kubectl >/dev/null && sudo chmod +x /usr/local/bin/kubectl
+```
+
+### Step 2: Create the kind cluster (Calico CNI)
+
+```bash
+# The config disables kindnet; Calico is installed separately.
+cat > /tmp/kind-calico.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha1
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+networking:
+  disableDefaultCNI: true
+EOF
+
+kind create cluster --name coxswain-d61 --config /tmp/kind-calico.yaml
+
+# Calico v3.30.1 (pinned)
+kubectl --context kind-coxswain-d61 apply -f \
+  https://raw.githubusercontent.com/projectcalico/calico/v3.30.1/manifests/calico.yaml
+
+# Wait for the node to become Ready (Calico must be up before anything else)
+kubectl --context kind-coxswain-d61 get nodes -w
+# (wait until READY=Ready; the node transitions NotReady → Ready once Calico is up)
+```
+
+### Step 3: Install KubeArmor (BPF-LSM)
+
+```bash
+# karmor CLI (pinned v1.4.9)
+curl -sfSL https://raw.githubusercontent.com/kubearmor/KubeArmor/master/install.sh | \
+  bash -s -- -v 1.7.5
+
+# KubeArmor v1.7.5 with BPF-LSM enforcement + network/process/file viz
+sudo karmor install -b all --viz process,file,network --tag v1.7.5
+
+# Verify the enforcer is BPF-LSM
+karmor probe
+# Expected: "Active LSM: BPFLSM" and node label kubearmor.io/enforcer: bpf
+```
+
+### Step 4: Install agent-sandbox
+
+```bash
+kubectl --context kind-coxswain-d61 create namespace agent-sandbox-system
+kubectl --context kind-coxswain-d61 apply -f \
+  https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/main/config/install.yaml
+kubectl --context kind-coxswain-d61 -n agent-sandbox-system rollout status deploy/agent-sandbox-controller-manager --timeout=120s
+```
+
+### Step 5: Build and load the coxswain images
+
+On the devbox (where the build dependencies live):
+
+```bash
+BUILD_TAG="d61-$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+make proxy-build PROXY_IMG=coxswain-tool-proxy:$BUILD_TAG \
+     EGRESS_IMG=coxswain-egress-proxy:$BUILD_TAG \
+     PROXY_IMG=coxswain-model-proxy:$BUILD_TAG
+make runner-build RUNNER_IMG=coxswain-runner:$BUILD_TAG
+make docker-build IMG=coxswain-controller:$BUILD_TAG
+
+# Transfer to the VM and load into the kind cluster
+for img in controller runner egress-proxy model-proxy tool-proxy; do
+  docker tag coxswain-$img:$BUILD_TAG ghcr.io/papawattu/coxswain-$img:$BUILD_TAG
+done
+docker save ghcr.io/papawattu/coxswain-{controller,runner,egress-proxy,model-proxy,tool-proxy}:$BUILD_TAG \
+  | ssh <vm> "sudo docker load"
+
+ssh <vm> "
+  for img in controller runner egress-proxy model-proxy tool-proxy; do
+    kind load docker-image ghcr.io/papawattu/coxswain-$img:$BUILD_TAG --name coxswain-d61
+  done
+"
+```
+
+### Step 6: Install the operator (NO escape hatches)
+
+```bash
+# Render install.yaml with the build tag
+make build-installer IMG=ghcr.io/papawattu/coxswain-controller:$BUILD_TAG
+
+# Copy to the VM and apply (NO --allow-unenforced, NO --allow-unenforced-network)
+scp dist/install.yaml <vm>:/tmp/install-d61.yaml
+ssh <vm> "kubectl --context kind-coxswain-d61 apply -f /tmp/install-d61.yaml"
+ssh <vm> "kubectl --context kind-coxswain-d61 -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s"
+```
+
+### Step 7: Create Secrets
+
+```bash
+ssh <vm> "
+  NS=d61
+  kubectl --context kind-coxswain-d61 create namespace $NS
+  # Model secret (vLLM is no-auth; the metering proxy needs a non-empty key)
+  kubectl --context kind-coxswain-d61 -n $NS create secret generic beta-model-creds \
+    --from-literal='model-key=d61-dummy-key' \
+    --from-literal='MODEL_BASE_URL=http://192.168.1.20:8000'
+  # GitHub secret (the token file must be on the VM at ~/.config/coxswain/github-token)
+  bash hack/github-secret.sh $NS
+"
+```
+
+### Step 8: Run a Loop and verify both gates
+
+```bash
+ssh <vm> "
+  kubectl --context kind-coxswain-d61 apply -f /tmp/d61-loop.yaml
+  # Watch the Loop
+  kubectl --context kind-coxswain-d61 -n d61 get loop d61-loop -w
+"
+```
+
+**Expected conditions (both gates live, no escape hatches):**
+
+```
+PolicyEnforced=True    reason=Enforcing     message=the eBPF engine is enforcing the Loop's effective policy
+NetworkEnforced=True   reason=CNIEnforced   message=every target was BLOCKED by the NetworkPolicy (pod -> host-network egress is policed)
+ModelAvailable=True    reason=Recovered     message=model backend reachable
+```
+
+**Expected Loop outcome:** `phase=Succeeded` (the agent implements the goal,
+the verify Job runs the acceptance checks, and the Loop reaches Succeeded).
+
+### Pinned versions
+
+| Component     | Version | Source |
+|---------------|---------|--------|
+| kind          | v0.34.0 | `github.com/kubernetes-sigs/kind/releases` |
+| kubectl       | v1.34.0 | `dl.k8s.io` |
+| Calico        | v3.30.1 | `projectcalico/calico/manifests/calico.yaml` |
+| KubeArmor     | v1.7.5  | `karmor install --tag v1.7.5` |
+| karmor CLI    | v1.4.9  | `kubearmor/KubeArmor/install.sh` |
+| agent-sandbox | main    | `kubernetes-sigs/agent-sandbox/config/install.yaml` |
+
+### Known limitations
+
+- **BPF-LSM wedge risk (ADR-0007 F2):** never restart/kill the KubeArmor
+  agent while Loops run. A BPF wedge locks the node's LSM enforcement and
+  requires a host reboot to clear.
+- **IP staleness:** the verify NetworkPolicy's IPBlock rule for external repo
+  hosts (e.g. github.com) is resolved at reconcile time. If the host's IP
+  changes between reconciles, the next reconcile updates the rule. The verify
+  Job is short-lived (minutes), so this is not a practical concern.

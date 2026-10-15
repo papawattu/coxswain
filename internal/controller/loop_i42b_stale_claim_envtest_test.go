@@ -188,6 +188,80 @@ var _ = Describe("I42b stale Planning claim after re-plan", func() {
 			"the NEW Planning claim (planAttempt 1) is accepted: the gate holds and moves the Loop to AwaitingApproval (as before)")
 	})
 
+	// Kind finding: the operator that processed the rejection was an OLD
+	// version that did not increment planAttempt (the field is new and
+	// defaults to 0). The NEW operator starts and reads the Loop with
+	// planAttempt=0, but lastRejectionReason is non-empty (set by the
+	// rejection). A stale Planning claim with planAttempt=0 must be
+	// rejected — the Loop must stay at Planning until a fresh claim (with
+	// planAttempt > 0) arrives. Without this guard, the stale claim passes
+	// the planAttempt guard (0 == 0), the approval gate denies the advance
+	// (no PlanApproved), and the else-if branch moves the phase to
+	// AwaitingApproval — a rejected Loop reaches AwaitingApproval without
+	// a fresh runner claim.
+	It("keeps Planning when a stale planAttempt-0 claim arrives after a rejection (mixed-version operator)", func() {
+		ns := "i42b-mixed-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		// Build a Manual-mode Loop, drive to AwaitingApproval (the initial
+		// Planning claim, planAttempt 0), then simulate the OLD operator's
+		// rejection handling: the phase moves to Planning, lastRejectionReason
+		// is set, but planAttempt stays 0 (the old operator did not increment
+		// it). The stale claim (planAttempt 0) is still on the pod.
+		r := i42bReconciler()
+		nn := types.NamespacedName{Name: "i42b-mixed", Namespace: ns}
+		loopSpec := s5aLoopSpec()
+		loopSpec.Approval.Mode = coxv1alpha1.ApprovalModeManual
+		loopSpec.Approval.OnReject = coxv1alpha1.OnRejectReplan
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "i42b-mixed", Namespace: ns},
+			Spec:       loopSpec,
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcileLoop(r, ns, "i42b-mixed")
+
+		// Step 1: initial Planning claim (planAttempt 0) -> AwaitingApproval.
+		reportClaim(r, ns, "i42b-mixed", &PhaseClaim{
+			ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+			Status:        "success",
+			Iteration:     0,
+			PlanAttempt:   0,
+		})
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval))
+
+		// Step 2: simulate the OLD operator's rejection: phase -> Planning,
+		// lastRejectionReason set, but planAttempt stays 0.
+		setCondition(ns, "i42b-mixed", coxv1alpha1.PlanRejectedCondition, "True", "remove the kustomize target")
+		// The NEW operator's applyApprovalGate will clear the PlanApproved
+		// condition (the new fix) and move to Planning. But to simulate the
+		// OLD operator's behavior (planAttempt not incremented), we manually
+		// set the status to the post-rejection state with planAttempt=0.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.PlanAttempt = 0 // the OLD operator did not increment
+		loop.Status.Approval.LastRejectionReason = "remove the kustomize target"
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// Step 3: the stale claim (planAttempt 0) is on the pod. The NEW
+		// operator reconciles. The planAttempt guard is a no-op (0 == 0), but
+		// the new belt-and-suspenders guard (lastRejectionReason present,
+		// planAttempt 0) must reject the claim. The Loop stays at Planning.
+		reportClaim(r, ns, "i42b-mixed", &PhaseClaim{
+			ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+			Status:        "success",
+			Iteration:     0,
+			PlanAttempt:   0,
+		})
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"the stale planAttempt-0 claim must NOT advance the Loop to AwaitingApproval when lastRejectionReason is present")
+	})
+
 	It("onVerifyFail=Plan -> re-plan: the stale Planning claim is also rejected by the planAttempt guard", func() {
 		ns := "i42b-verify-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}

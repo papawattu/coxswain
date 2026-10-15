@@ -618,10 +618,25 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// the new phase at once. An Implementing/Verifying claim's staleness
 		// is the iteration guard's job (the planAttempt only changes on a
 		// re-plan, which always re-enters Planning).
+		// I42b kind finding: the planAttempt counter can be 0 even after a
+		// rejection (an older operator that did not increment the field
+		// processed the rejection; the field is new and defaults to 0). In
+		// that case the planAttempt guard above is a no-op (0 == 0), and a
+		// stale Planning claim with planAttempt 0 passes. The belt-and-
+		// suspenders guard: a Planning claim with planAttempt 0 is STALE when
+		// lastRejectionReason is non-empty (a rejection has occurred, so a
+		// fresh claim with planAttempt > 0 is expected). This catches the
+		// mixed-version case where the operator that processed the rejection
+		// did not increment planAttempt.
 		if claim.ObservedPhase == coxv1alpha1.LoopPhasePlanning && claim.PlanAttempt != loop.Status.PlanAttempt {
 			logf.FromContext(ctx).Info("stale claim from a previous plan attempt ignored",
 				"claimPlanAttempt", claim.PlanAttempt,
 				"statusPlanAttempt", loop.Status.PlanAttempt)
+			return false, false, ""
+		}
+		if claim.ObservedPhase == coxv1alpha1.LoopPhasePlanning && claim.PlanAttempt == 0 && loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
+			logf.FromContext(ctx).Info("stale claim from a previous plan attempt ignored (rejection reason present, planAttempt 0)",
+				"claimPlanAttempt", claim.PlanAttempt)
 			return false, false, ""
 		}
 		// S5a (OS5 P3): a CONSUMED claim is discarded, not re-consumed.

@@ -1208,7 +1208,7 @@ log step6 "token minted and loaded into the b6-metrics-secret Secret via --from-
 # The scrape pod curls the secure endpoint with the token (mounted from the
 # Secret) and streams the full /metrics body to stdout — the pod's log IS the
 # scrape (I84: the bytes are kept where the claim reads them).
-cat >"$EVIDENCE/step6-scrape.yaml" <<EOF
+cat >"$EVIDENCE/step6-scrape.yaml" <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata:
@@ -1230,7 +1230,7 @@ spec:
     # double-quoted YAML string is a literal backslash-n (the YAML parser
     # interprets the YAML-level \\n as the two characters \\n, and the
     # pod's shell `echo` then interprets that as a newline).
-    command: "curl -skS --max-time 30 --header \"Authorization: Bearer $(cat /tok)\" https://coxswain-controller-manager-metrics-service.coxswain-system.svc:8443/metrics -o /tmp/metrics.txt -w 'SCRAPE_HTTP=%{http_code}\\n'; r=$?; echo SCRAPE_RC=$r; wc -c </tmp/metrics.txt; echo METRICS_BEGIN; cat /tmp/metrics.txt; echo METRICS_END"
+    command: 'curl -skS --max-time 30 --header "Authorization: Bearer $(cat /tok)" https://coxswain-controller-manager-metrics-service.coxswain-system.svc:8443/metrics -o /tmp/metrics.txt -w ''SCRAPE_HTTP=%{http_code}\n''; r=$?; echo SCRAPE_RC=$r; wc -c </tmp/metrics.txt; echo METRICS_BEGIN; cat /tmp/metrics.txt; echo METRICS_END'
     volumeMounts:
     - name: tok
       mountPath: /tok
@@ -1239,6 +1239,7 @@ spec:
     secret:
       secretName: b6-metrics-secret
 EOF
+sed -i "s/\$NS/${NS}/g" "$EVIDENCE/step6-scrape.yaml"
 kc apply -f "$EVIDENCE/step6-scrape.yaml" >/dev/null
 i=0
 while :; do

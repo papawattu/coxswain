@@ -35,13 +35,15 @@ fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 # Test 1: the step 6 scrape pod's `command` is a STRING (not a list).
 # =========================================================================
 # Extract the step6-scrape.yaml heredoc from the script. The heredoc is
-# delimited by `cat >"$EVIDENCE/step6-scrape.yaml" <<EOF` and `EOF`.
+# delimited by `cat >"$EVIDENCE/step6-scrape.yaml" <<'EOF'` (quoted delimiter:
+# no shell expansion during the heredoc write; the `$NS` is substituted by a
+# `sed` after the heredoc) and `EOF`.
 TMPDIR_T=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_T"' EXIT
 
 # Find the heredoc start line and extract to the closing EOF.
 awk '
-  /cat >"\$EVIDENCE\/step6-scrape\.yaml" <<EOF/ { found=1; next }
+  /cat >"\$EVIDENCE\/step6-scrape\.yaml" <<.EOF./ { found=1; next }
   found && /^EOF$/ { exit }
   found { print }
 ' "$SCRIPT" > "$TMPDIR_T/step6-scrape.yaml"

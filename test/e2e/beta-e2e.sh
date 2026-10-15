@@ -1283,14 +1283,21 @@ log step6 "the metrics endpoint answered the coxswain-metrics-reader token (HTTP
 # coxswain_loops_active{phase="AwaitingApproval"} >= 1.
 ACTIVE_LOOP="b6-active-$TS"
 kc -n "$NS" apply -f - >/dev/null <<EOF
-apiVersion: coxswain.io/v1alpha1
+apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
   name: $ACTIVE_LOOP
   namespace: $NS
 spec:
   goal: "echo b6-active"
-  agent: preset-go
+  workspace:
+    repo: "https://github.com/papawattu/coxswain-sandbox.git"
+    ref: main
+    gitCredentialSecret: git-cred
+  agent:
+    modelEndpoint: "$VLLM_ENDPOINT"
+    model: "$VLLM_MODEL"
+    endpointSecretRef: beta-model-creds
   approval:
     mode: Manual
 EOF

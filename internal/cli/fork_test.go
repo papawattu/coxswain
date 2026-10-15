@@ -118,9 +118,18 @@ func TestFork_CreatesNewLoop_NotUpdates(t *testing.T) {
 		t.Errorf("the created Loop's spec.agent is %v (ok=%v), want the source's agent (the fork inherits the source's model)", forkSpec["agent"], ok)
 	}
 	// The fork inherits the source's verify (the fork's acceptance checks are
-	// the source's — the fork is a copy, not a new objective).
-	if _, ok := forkSpec["verify"].(map[string]any); !ok {
-		t.Errorf("the created Loop's spec.verify is %v, want the source's verify (the fork inherits the source's acceptance checks)", forkSpec["verify"])
+	// the source's — the fork is a copy, not a new objective). EXCEPTION: the
+	// fork DROPS the source's forced-fail verify (the B6 step 4's 'false'
+	// check) and sets a fresh, passing check (the fork succeeds where the
+	// source's forced check cannot — the B6 run 14 failure: the fork
+	// inherited the source's 'false' verify check and hit
+	// MaxIterationsExceeded). The fork's verify is 'make -n docs' (a check
+	// that succeeds on any well-formed repo).
+	verify, ok := forkSpec["verify"].(map[string]any)
+	if !ok || verify == nil {
+		t.Errorf("the created Loop's spec.verify is %v (ok=%v), want a non-nil verify (the fork sets a fresh, passing check)", forkSpec["verify"], ok)
+	} else if checks, ok := verify["checks"].([]any); !ok || len(checks) != 1 || checks[0] != "make -n docs" {
+		t.Errorf("the created Loop's spec.verify.checks is %v, want [make -n docs] (the fork's fresh, passing check — NOT the source's forced-fail 'false')", verify["checks"])
 	}
 	// The fork inherits the source's delivery (the fork's delivery config is
 	// the source's — the fork delivers the same way).

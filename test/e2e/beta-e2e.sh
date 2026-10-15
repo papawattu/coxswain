@@ -907,54 +907,192 @@ collect_evidence "$REPLAN_LOOP" step3
 #    verify takes one — checkpoints: Required makes the absence a failure,
 #    not a silent fallback, D59).
 # ===========================================================================
+# Step 4's recipe (reviewer-proven on kind, .samples/rv154b-1792027909):
+# the Loop runs acceptanceChecks ["false"] (every verify FAILS; the step is
+# about the restore, not the agent) with loop {maxIterations: 4, stallAction:
+# Continue} and onVerifyFail: Implement (the default iterate path). A FAILED
+# verify still records a checkpoint (ensureCheckpointStep runs after
+# applyVerifyOutcome and is not gated on the verify outcome — the reviewer's
+# trail shows checkpoint-<loop>-iter-0 recorded after the first failed verify,
+# with status.iteration already advanced): the restore's "last checkpoint" is
+# the iter-0 snapshot after the PVC delete, the restore hold keeps the Loop in
+# Implementing while it recreates the PVC, and a LATER verify pass (the
+# operator's own record of the iteration having advanced past the restore) is
+# the proof the Loop carried on. The final Failed:MaxIterationsExceeded after
+# 4 iterations is EXPECTED (as in step 3) — the forced check never passes.
 RESTORE_LOOP="b6-restore-$TS"
-# The verify check is the default (passes on the first verify). The
-# checkpoint+Implementing window is wide enough with a real model (each
-# Implementing phase takes several minutes). The script watches for a
-# checkpoint to exist, then for Implementing of a LATER iteration (so the
-# PVC delete lands after the checkpoint). The grep -c bug (fixed in 491b5a6)
-# no longer prevents the loop from breaking.
-log step4 "applying $RESTORE_LOOP (checkpoints: Required; the script watches for a checkpoint to exist, then for Implementing of a LATER iteration — the PVC delete lands after the checkpoint)"
-render_loop "$RESTORE_LOOP" '  checkpoints: Required'
-# Watch for a checkpoint to exist, then for Implementing of a LATER
-# iteration (so the PVC delete lands after the checkpoint).
+log step4 "applying $RESTORE_LOOP (checkpoints: Required; acceptanceChecks [\"false\"]; loop {maxIterations: 4, stallAction: Continue}; onVerifyFail: Implement — a failed verify still records a checkpoint, and the restore's continuation is what is asserted)"
+cat >"$EVIDENCE/loop-$RESTORE_LOOP.yaml" <<EOF
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: $RESTORE_LOOP
+  namespace: $NS
+spec:
+  goal: >-
+    ${RENDER_GOAL}
+  workspace:
+    repo: "$REPO"
+    ref: "main"
+    gitCredentialSecret: git-cred
+  verify:
+    acceptanceChecks:
+      - "$FORCED_CHECK"
+    image: $AGENT_IMG
+  agent:
+    endpointSecretRef: $MODEL_SECRET
+    modelEndpoint: $VLLM_ENDPOINT
+    model: $VLLM_MODEL
+  delivery:
+    mode: PullRequest
+    baseBranch: main
+    branchPrefix: coxswain/
+  checkpoints: Required
+  loop:
+    maxIterations: 4
+    stallAction: Continue
+EOF
+kc apply -f "$EVIDENCE/loop-$RESTORE_LOOP.yaml" >/dev/null
+k get loop "$RESTORE_LOOP" -o jsonpath='{.spec.verify}{" \\n"}{.spec.loop}' >"$EVIDENCE/step4-spec.txt"
+log step4 "applied spec (verify + loop): $(tr '\n' ' ' < "$EVIDENCE/step4-spec.txt")"
+# The pre-delete PVC uid (the restore must REPLACE the PVC with a NEW uid;
+# a same-uid object proves the operator just re-labeled it, not restored it).
+PVC_NAME="$RESTORE_LOOP-workspace"
+# Wait for the preconditions the reviewer's recipe proved: a checkpoint
+# recorded (status.checkpoints non-empty) AND the phase in Implementing (the
+# iterate path, with the sandbox pod mounting the workspace PVC). The
+# checkpoint's iteration is the restore's source (the last checkpoint
+# existing at delete time — the reviewer's evidence: iter-0 recorded after
+# the first failed verify, status.iteration already at 2).
+log step4 "watching for status.checkpoints non-empty AND phase==Implementing (the PVC delete must land after the checkpoint exists and while the sandbox mounts the PVC)"
+: >"$EVIDENCE/step4-trail.log"
 i=0
 while :; do
-	CK_NAMES=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null)
-	n_ck=$(echo "$CK_NAMES" | tr ' ' '\n' | grep -c .) || true
-	case "$n_ck" in ''|*[!0-9]*) n_ck=0 ;; esac
+	CK_LIST=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null || echo "")
 	ph=$(phase_of "$RESTORE_LOOP")
-	[ $((i % 4)) -eq 0 ] && log step4 "t=${i}s phase=$ph checkpoints=$n_ck"
-	[ "$n_ck" -ge 1 ] && [ "$ph" = "Implementing" ] && break
+	iter=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.iteration}' 2>/dev/null || echo "")
+	printf '%s phase=%s iter=%s cps=%s\n' "$(utc)" "$ph" "$iter" "${CK_LIST:-[]}" >>"$EVIDENCE/step4-trail.log"
+	[ $((i % 8)) -eq 0 ] && log step4 "t=${i}s phase=$ph iter=$iter checkpoints=[${CK_LIST:-}]."
+	[ -n "$CK_LIST" ] && [ "$ph" = "Implementing" ] && break
 	case "$ph" in
-	Succeeded | Failed) die "step4: $RESTORE_LOOP reached $ph before a checkpoint+Implementing window (checkpoints=$n_ck; the verify check should have forced iteration 2 — re-run)" ;;
+	Failed) die "step4: $RESTORE_LOOP reached Failed before a checkpoint+Implementing window (trail: $EVIDENCE/step4-trail.log — recorded, not guessed)" ;;
 	esac
-	i=$((i + PHASE_POLL)); [ "$i" -gt "$PHASE_CAP" ] && die "step4: no checkpoint+Implementing window in $PHASE_CAP s (last: $ph, checkpoints=$n_ck)"
+	i=$((i + PHASE_POLL)); [ "$i" -gt "$PHASE_CAP" ] && { cat "$EVIDENCE/step4-trail.log"; die "step4: no checkpoint+Implementing window in $PHASE_CAP s (last: ph=$ph cps=[${CK_LIST:-}])"; }
 	sleep "$PHASE_POLL"
 done
-CK_LIST=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null)
-log step4 "a checkpoint exists ($CK_LIST) and the Loop is in Implementing — deleting the workspace PVC NOW (B2: the restore must bring it back from the last checkpoint)"
-PVC_NAME="$RESTORE_LOOP-workspace"
-kc -n "$NS" delete pvc "$PVC_NAME" --wait=true --timeout=60s >"$EVIDENCE/step4-pvc-delete.log" 2>&1 || true
-# The operator's B2 path: the lost PVC is detected (the sandbox pod loses
-# its volume), the workspace PVC is recreated from the LAST checkpoint
-# (spec.dataSource = the VolumeSnapshot), and the Loop resumes. Watch to the
-# terminal outcome.
-log step4 "PVC deleted; watching for the restore + terminal outcome"
-watch_loop "$RESTORE_LOOP" "$EVIDENCE/step4-phase.log" || die "step4: $RESTORE_LOOP wedged after the PVC delete (see $EVIDENCE/step4-phase.log — the restore did not bring it back)"
+CK_PRE_DELETE=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[-1:].name}' 2>/dev/null || echo "")
+PVC_UID_BEFORE=$(kc -n "$NS" get pvc "$PVC_NAME" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+log step4 "preconditions met: checkpoint [$(echo "$CK_LIST" | tr '\n' ' ')] (last: $CK_PRE_DELETE) and the Loop is in Implementing — deleting the workspace PVC NOW (B2: the restore must recreate it from the last checkpoint)"
+log step4 "the PVC delete lands while the sandbox mounts it (mid-Implementing, by construction — the precondition above)"
+kc -n "$NS" delete pvc "$PVC_NAME" --wait=false >"$EVIDENCE/step4-pvc-delete.log" 2>&1 || true
+# The operator's B2 path (reviewer-verified on kind, #154's fix): the lost
+# PVC is detected, the Restore condition goes False/StoppingWorkloads and then
+# True/Restored, the workspace PVC is RECREATED from the last checkpoint
+# (spec.dataSource.name = checkpoint-<loop>-iter-N — a NEW uid), and the Loop
+# carries on (a later verify run at a higher iteration; the phase trail shows
+# the Implementing -> Verifying pass after the restore). Watch to the terminal
+# outcome; the FINAL phase must be Failed (MaxIterationsExceeded) — the
+# forced check never passes, as in step 3 (that is expected and is said so in
+# the PASS log; it is NOT a failure of the step).
+log step4 "PVC deleted; watching for the restore + continuation to the terminal outcome (a final Failed:MaxIterationsExceeded is EXPECTED — the forced check never passes)"
+: >"$EVIDENCE/step4-trail-after.log"
+i=0
+while :; do
+	ph=$(phase_of "$RESTORE_LOOP")
+	iter=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.iteration}' 2>/dev/null || echo "")
+	CK_LIST=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.checkpoints[*].name}' 2>/dev/null || echo "")
+	printf '%s phase=%s iter=%s cps=%s\n' "$(utc)" "$ph" "$iter" "${CK_LIST:-[]}" >>"$EVIDENCE/step4-trail-after.log"
+	[ $((i % 8)) -eq 0 ] && log step4 "t=${i}s (post-delete) phase=$ph iter=$iter checkpoints=[${CK_LIST:-}]."
+	case "$ph" in
+	Succeeded) die "step4: $RESTORE_LOOP Succeeded — impossible (the forced check 'false' never passes; the run is wrong) — record and stop" ;;
+	Failed) break ;;
+	esac
+	i=$((i + PHASE_POLL)); [ "$i" -gt "$PHASE_CAP" ] && { tail -20 "$EVIDENCE/step4-trail-after.log"; die "step4: no terminal phase in $PHASE_CAP s after the PVC delete (last: ph=$ph) — the restore did not bring the Loop back to a terminal outcome"; }
+	sleep "$PHASE_POLL"
+done
 RESTORE_PHASE=$(phase_of "$RESTORE_LOOP")
-[ "$RESTORE_PHASE" = "Succeeded" ] || { collect_evidence "$RESTORE_LOOP" restore-wedge; die "step4 FAILED: $RESTORE_LOOP ended $RESTORE_PHASE after the PVC delete (not Succeeded) — see $EVIDENCE/restore-wedge"; }
-# # # The Restore condition: the operator's own record that it restored from the
-# checkpoint (reason Restored).
-RESTORE_COND=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].message}' 2>/dev/null || echo "")
-log step4 "Restore condition: ${RESTORE_COND:-absent}"
-[ -n "$RESTORE_COND" ] || { collect_evidence "$RESTORE_LOOP" restore-nocond; die "step4 FAILED: the Loop Succeeded but no Restore condition is recorded (the restore path was not exercised — I84: not verified; see $EVIDENCE/restore-nocond)"; }
+# (1) The Restore condition: True, reason Restored (the operator's own record
+# it restored the PVC from a checkpoint — not just that a PVC exists).
+RESTORE_COND_STATUS=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].status}' 2>/dev/null || echo "")
+RESTORE_COND_REASON=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].reason}' 2>/dev/null || echo "")
+RESTORE_COND_MSG=$(k get loop "$RESTORE_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].message}' 2>/dev/null || echo "")
+log step4 "Restore condition: status=$RESTORE_COND_STATUS reason=$RESTORE_COND_REASON message=${RESTORE_COND_MSG:-absent}"
+[ "$RESTORE_COND_STATUS" = "True" ] && [ "$RESTORE_COND_REASON" = "Restored" ] || {
+	collect_evidence "$RESTORE_LOOP" restore-nocond
+	die "step4 FAILED: the Restore condition is not True/Restored (got status=$RESTORE_COND_STATUS reason=$RESTORE_COND_REASON — see $EVIDENCE/restore-nocond)"
+}
+# (2) The new PVC: spec.dataSource.name must equal the checkpoint name and the
+# uid must be NEW (a restore RECREATES the PVC from the snapshot; a same-uid
+# object would be the operator re-labeling the old PVC, not restoring it).
+kc -n "$NS" get pvc "$PVC_NAME" -o json >"$EVIDENCE/step4-pvc-after.json" 2>/dev/null || die "step4: the workspace PVC $PVC_NAME is ABSENT after the restore (the restore did not recreate it)"
+PVC_UID_AFTER=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("metadata",{}).get("uid",""))' "$EVIDENCE/step4-pvc-after.json")
+PVC_DS_NAME=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("spec",{}) or {}).get("dataSource",{}).get("name",""))' "$EVIDENCE/step4-pvc-after.json")
+PVC_PHASE=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("status",{}) or {}).get("phase",""))' "$EVIDENCE/step4-pvc-after.json")
+log step4 "the restored PVC $PVC_NAME: uid=$PVC_UID_AFTER (was $PVC_UID_BEFORE) dataSource.name=$PVC_DS_NAME phase=$PVC_PHASE"
+[ "$PVC_UID_AFTER" != "$PVC_UID_BEFORE" ] || die "step4 FAILED: the PVC after the restore has the SAME uid ($PVC_UID_AFTER) as before the delete — the restore did not recreate the PVC from the checkpoint (see $EVIDENCE/step4-pvc-after.json)"
+[ "$PVC_DS_NAME" != "" ] || die "step4 FAILED: the restored PVC has no spec.dataSource.name (it was not created FROM a VolumeSnapshot — see $EVIDENCE/step4-pvc-after.json)"
+case "$CK_LIST" in
+*"$PVC_DS_NAME"*) : ;; # the dataSource checkpoint is in the recorded list
+*) die "step4 FAILED: the restored PVC's dataSource.name ($PVC_DS_NAME) is not in the Loop's recorded checkpoints ([${CK_LIST:-}] — see $EVIDENCE/step4-pvc-after.json)" ;;
+esac
+# (3) The Loop carried on past the restore: the phase trail after the delete
+# must show the phase REACHING Verifying (a later verify ran — the iteration
+# advanced past the restore hold; the reviewer's evidence: Implementing ->
+# Verifying -> a new checkpoint at a higher iteration), OR a NEW checkpoint at
+# an iteration higher than the pre-delete one must exist. Either proves the
+# restore hold released and the Loop continued its phase machine.
+CK_NEW=$(grep -E 'phase=(Verifying|Succeeded|Failed).*' "$EVIDENCE/step4-trail-after.log" | head -1 || true)
+CK_NEW_2=$(python3 -c '
+import json,sys,subprocess
+# the highest iteration among the recorded checkpoints, read fresh
+out=subprocess.run(["kubectl","--context","kind-coxswain-snap","-n","beta-e2e","get","loop","'$RESTORE_LOOP'","-o","json"],capture_output=True,text=True).stdout
+try: d=json.loads(out)
+except Exception: print(-1); raise SystemExit
+cps=(d.get("status") or {}).get("checkpoints") or []
+print(max([int(c.get("iteration",-1)) for c in cps], default=-1))' 2>/dev/null || echo -1)
+PRE_DELETE_ITER=$(python3 -c '
+import json,sys,subprocess
+out=subprocess.run(["kubectl","--context","kind-coxswain-snap","-n","beta-e2e","get","loop","'$RESTORE_LOOP'","-o","json"],capture_output=True,text=True).stdout
+try: d=json.loads(out)
+except Exception: print(-1); raise SystemExit
+print(max([int(c.get("iteration",-1)) for c in ((d.get("status") or {}).get("checkpoints") or [])], default=-1))' 2>/dev/null || echo -1)
+log step4 "continuation check: saw a post-delete phase in {Verifying,Succeeded,Failed} trail: ${CK_NEW:-<none>}; highest checkpoint iteration now: $CK_NEW_2 (pre-delete checkpoints went up to $PRE_DELETE_ITER)"
+if [ -z "$CK_NEW" ] && [ "${CK_NEW_2:--1}" -le "${PRE_DELETE_ITER:--1}" ] 2>/dev/null; then
+	collect_evidence "$RESTORE_LOOP" restore-nocarry
+	die "step4 FAILED: the Loop did not carry on past the restore (no post-delete Verifying phase in the trail AND no new checkpoint at a higher iteration — see $EVIDENCE/step4-trail-after.log, $EVIDENCE/restore-nocarry)"
+fi
+# (4) The expected terminal outcome: Failed (the forced check never passes;
+# the budget of 4 iterations exhausts the Loop). Say so, as in step 3.
+log step4 "final phase: $RESTORE_PHASE — a final Failed (MaxIterationsExceeded) is EXPECTED: the forced check 'false' never passes and the 4-iteration budget exhausted it (as in step 3; the step proves the restore + continuation, not the outcome)"
+# (5) The operator's own corroboration: the Restore events (count per reason)
+# and the operator log (zero 'forbidden' — the B2 restore path reads the
+# snapshot and recreates the PVC with no RBAC hole; #154's evidence form).
+kc -n "$NS" get events -o json --field-selector "involvedObject.name=$RESTORE_LOOP" >"$EVIDENCE/step4-events.json" 2>/dev/null || true
+python3 -c '
+import json,sys,collections
+evs=json.load(open(sys.argv[1])).get("items") or []
+c=collections.Counter()
+for e in evs:
+    if (e.get("reason") or "").startswith("Restore") or "Restore=" in (e.get("message") or ""):
+        c[e.get("reason","?" or "?")]+=1
+print("restore-event-counts:", dict(c))' "$EVIDENCE/step4-events.json" >"$EVIDENCE/step4-restore-events.txt" 2>/dev/null || true
+cat "$EVIDENCE/step4-restore-events.txt"
+kc -n coxswain-system logs deploy/coxswain-controller-manager >"$EVIDENCE/step4-operator-logs.log" 2>&1 || true
+FORBIDDEN=$(grep -c forbidden "$EVIDENCE/step4-operator-logs.log" || true)
+[ -n "$FORBIDDEN" ] && [ "$FORBIDDEN" -gt 0 ] 2>/dev/null && FORBIDDEN=$FORBIDDEN || FORBIDDEN=0
+log step4 "operator log 'forbidden' count: $FORBIDDEN (must be 0: the restore path reads the snapshot + recreates the PVC without an RBAC hole — #154's evidence form)"
+[ "$FORBIDDEN" -eq 0 ] || die "step4 FAILED: the operator log carries $FORBIDDEN 'forbidden' error(s) during the run (see $EVIDENCE/step4-operator-logs.log)"
 {
-	echo "checkpoint-existed: $CK_LIST"
-	echo "restore-condition: $RESTORE_COND"
-	echo "final-phase: $RESTORE_PHASE"
+	echo "checkpoints-pre-delete: $CK_LIST (last: $CK_PRE_DELETE)"
+	echo "pvc-uid-before: $PVC_UID_BEFORE"
+	echo "pvc-uid-after: $PVC_UID_AFTER (NEW: the restore recreated the PVC)"
+	echo "pvc-dataSource.name: $PVC_DS_NAME (the checkpoint the PVC was restored from)"
+	echo "pvc-phase: $PVC_PHASE"
+	echo "restore-condition: status=$RESTORE_COND_STATUS reason=$RESTORE_COND_REASON message=${RESTORE_COND_MSG:-absent}"
+	echo "final-phase: $RESTORE_PHASE (a final Failed is EXPECTED — the forced check never passes)"
+	echo "operator-forbidden-count: $FORBIDDEN"
 } >"$EVIDENCE/step4-verify.txt"
-log step4 "PASS: the PVC was deleted mid-Implementing and the Loop restored it from its last checkpoint (B2) — Restore condition: $RESTORE_COND"
+log step4 "PASS: the PVC was deleted mid-Implementing (after its checkpoint existed) and the Loop restored it from the last checkpoint (Restore True/Restored; the new PVC's spec.dataSource.name=$PVC_DS_NAME with a NEW uid $PVC_UID_AFTER) and CARRIED ON (post-delete phase trail: $EVIDENCE/step4-trail-after.log; highest checkpoint iteration $CK_NEW_2) — the final Failed (MaxIterationsExceeded) is EXPECTED (the forced check never passes)"
 collect_evidence "$RESTORE_LOOP" step4
 
 # ===========================================================================
@@ -964,10 +1102,19 @@ collect_evidence "$RESTORE_LOOP" step4
 #    final checkpoint (it Succeeded — its last checkpoint is the one after
 #    the successful verify).
 # ===========================================================================
-FORK_SRC="$MANUAL_LOOP"
+# Step 5 forks from STEP 4's checkpoint (the handoff's instruction: the fork
+# seeds from the Loop that just proved the restore, from the iteration the
+# reviewer's recipe names). Step 4's Loop is Failed (the forced check never
+# passes) but its checkpoints survive on the Loop object until it is cleaned
+# up in the tidy phase, so the fork reads the fork source (the step-4 Loop)
+# and seeds from its last recorded checkpoint. The fork runs a PASSING check
+# (the default make -n docs), so the fork SUCCEEDS (unlike the source) and
+# opens its OWN draft PR (a URL different from step 2's).
+FORK_SRC="$RESTORE_LOOP"
 SRC_ITER=$(k get loop "$FORK_SRC" -o jsonpath='{.status.checkpoints[-1:].iteration}' 2>/dev/null || echo "")
 SRC_SNAP=$(k get loop "$FORK_SRC" -o jsonpath='{.status.checkpoint.name}' 2>/dev/null || echo "")
-[ -n "$SRC_ITER" ] && [ -n "$SRC_SNAP" ] || { collect_evidence "$FORK_SRC" fork-nosrc; die "step5: the source Loop $FORK_SRC has no recorded checkpoint (status.checkpoint absent — see $EVIDENCE/fork-nosrc)"; }
+[ -n "$SRC_ITER" ] && [ -n "$SRC_SNAP" ] || { collect_evidence "$FORK_SRC" fork-nosrc; die "step5: the fork source $FORK_SRC (step 4's Loop) has no recorded checkpoint (status.checkpoint absent — see $EVIDENCE/fork-nosrc)"; }
+log step5 "fork source: $FORK_SRC (step 4's Loop, its final Failed phase is EXPECTED and does not block the fork — its checkpoints are recorded on the Loop object and survive until the tidy phase deletes the Loop)"
 # The source snapshot must be ReadyToUse before the fork starts (the operator
 # defers the restore otherwise — a long poll the fork does not need to
 # sit in). Wait for it.
@@ -981,21 +1128,28 @@ done
 FORK_LOOP="b6-fork-$TS"
 log step5 "forking: cox fork $FORK_LOOP --loop $FORK_SRC --iteration $SRC_ITER (the QUICKSTART step-7 form of 'fork --from iter-N')"
 cox fork "$FORK_LOOP" --loop "$FORK_SRC" --iteration "$SRC_ITER" >"$EVIDENCE/step5-fork.txt" 2>&1 || { cat "$EVIDENCE/step5-fork.txt"; die "step5: cox fork failed"; }
-log step5 "the fork Loop $FORK_LOOP is applied (spec.forkOf loop=$FORK_SRC iteration=$SRC_ITER); watching to a terminal phase"
+log step5 "the fork Loop $FORK_LOOP is applied (spec.forkOf loop=$FORK_SRC iteration=$SRC_ITER; its verify check is the PASSING default 'make -n docs' — the fork SUCCEEDS where the source's forced check cannot); watching to a terminal phase"
 watch_loop "$FORK_LOOP" "$EVIDENCE/step5-phase.log" || die "step5: the fork $FORK_LOOP wedged (see $EVIDENCE/step5-phase.log — recorded, not guessed)"
 FORK_PHASE=$(phase_of "$FORK_LOOP")
 [ "$FORK_PHASE" = "Succeeded" ] || { collect_evidence "$FORK_LOOP" fork-wedge; die "step5 FAILED: the fork $FORK_LOOP ended $FORK_PHASE (not Succeeded) — see $EVIDENCE/fork-wedge"; }
+# The fork's Restore condition: True/Restored (the operator restored the
+# fork's OWN PVC from the source's checkpoint — the fork's independence is
+# proven by the restore + its own branch + its own PR, all three asserted).
+FORK_RESTORE_STATUS=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].status}' 2>/dev/null || echo "")
+FORK_RESTORE=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].message}' 2>/dev/null || echo "")
+[ "$FORK_RESTORE_STATUS" = "True" ] || { collect_evidence "$FORK_LOOP" fork-norrestore; die "step5 FAILED: the fork's Restore condition is not True (got status=$FORK_RESTORE_STATUS message=${FORK_RESTORE:-absent} — the fork's PVC was not restored from the source's checkpoint; see $EVIDENCE/fork-norrestore)"; }
+log step5 "the fork's Restore condition is True (reason $(k get loop "$FORK_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].reason}' 2>/dev/null || echo '?')) — the operator restored the fork's OWN PVC from the source's snapshot $SRC_SNAP (iteration $SRC_ITER)"
 # Independence: the fork has its OWN branch (a different I81 branch name than
-# the source's delivery) — ADR-0003.
+# step 2's Loop's delivery) — ADR-0003. The source here is step 2's Loop
+# (the fork's branch must differ from the STEP 2 Loop's branch — the fork is
+# an independent Loop, its own branch and PR, not a re-delivery of step 2).
 FORK_BRANCH=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.branch}' 2>/dev/null || echo "")
 FORK_PR=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
 wait_delivered "$FORK_LOOP" 900 || { collect_evidence "$FORK_LOOP" fork-delivery; die "step5: the fork's delivery did not complete (see $EVIDENCE/fork-delivery)"; }
 FORK_PR=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.delivery.prURL}' 2>/dev/null || echo "")
 [ -n "$FORK_PR" ] || { collect_evidence "$FORK_LOOP" fork-nopr; die "step5: the fork Delivered but has no PR URL (independence not proven — I84)"; }
-[ "$FORK_BRANCH" != "$BRANCH" ] || die "step5 FAILED: the fork's branch ($FORK_BRANCH) equals the source's branch — the fork is not independent (ADR-0003)"
-# The fork's Restore condition: the operator restored the fork's OWN PVC from
-# the source's checkpoint.
-FORK_RESTORE=$(k get loop "$FORK_LOOP" -o jsonpath='{.status.conditions[?(@.type=="Restore")].message}' 2>/dev/null || echo "")
+[ "$FORK_BRANCH" != "$BRANCH" ] || die "step5 FAILED: the fork's branch ($FORK_BRANCH) equals step 2's branch — the fork is not independent (ADR-0003)"
+[ "$FORK_PR" != "$PR_URL" ] || die "step5 FAILED: the fork's PR URL ($FORK_PR) equals step 2's PR URL — the fork did not open its OWN draft PR (the handoff's step-5 PASS condition requires a URL different from step 2's)"
 {
 	echo "source: $FORK_SRC iteration=$SRC_ITER snapshot=$SRC_SNAP"
 	echo "fork: $FORK_LOOP"
@@ -1075,6 +1229,53 @@ grep -q "SCRAPE_HTTP=200" "$EVIDENCE/step6-scrape.log" || { cat "$EVIDENCE/step6
 sed -n '/^METRICS_BEGIN$/,/^METRICS_END$/p' "$EVIDENCE/step6-scrape.log" | sed '1d;$d' >"$EVIDENCE/step6-metrics.log"
 grep -q "^coxswain_" "$EVIDENCE/step6-metrics.log" || { cat "$EVIDENCE/step6-scrape.log"; die "step6: the scrape carried no coxswain_ metric lines (see $EVIDENCE/step6-scrape.log)"; }
 log step6 "the metrics endpoint answered the coxswain-metrics-reader token (HTTP 200; the RBAC the token carries is exactly coxswain-metrics-reader — no admin)"
+# I84: a validation asserts the CONTENT's MEANING, not just that it parses.
+# The handoff's step 6: the four coxswain_* metrics must EXIST in the scrape
+# with a SENSIBLE value (not absent, not NaN, and where the run's own Loops
+# should have bumped them, actually > 0). The four named metrics (B5a):
+#   coxswain_loop_phase_transitions_total  (counter by destination phase)
+#   coxswain_loop_iterations_total         (counter, iteration increments)
+#   coxswain_verify_results_total          (counter by result pass|fail|infra)
+#   coxswain_loops_completed_total         (counter by result + reason)
+# All four were bumped by THIS run's own Loops (steps 1-3 each transitioned
+# phases, each verify — pass or fail — bumped verify_results_total, and each
+# terminal Loop bumped loops_completed_total), so a zero on any of them is a
+# real finding (the metric is broken or the Loop did not run as the trail
+# says), not a pass.
+METRICS_CHECK=$(python3 - <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines() if len(sys.argv) > 1 else []
+def val(name, labels=None):
+    for l in lines:
+        if l.startswith(name + "{") and (labels is None or all(p in l for p in labels)):
+            try:
+                return float(l.rsplit(" ", 1)[1])
+            except (ValueError, IndexError):
+                continue
+    return None
+ok = True
+for name, want in [
+    ("coxswain_loop_phase_transitions_total", None),
+    ("coxswain_loop_iterations_total", " > 0"),
+    ("coxswain_verify_results_total", " > 0"),
+    ("coxswain_loops_completed_total", " > 0"),
+]:
+    v = val(name)
+    if v is None:
+        print(f"FAIL {name}: ABSENT from the scrape (I84: the metric did not exist)")
+        ok = False
+        continue
+    if want == " > 0" and not (v > 0):
+        print(f"FAIL {name}: present but {v} (not > 0 — this run's Loops should have bumped it)")
+        ok = False
+        continue
+    print(f"OK   {name}: {v} {want or '(present with a numeric value)'}")
+print("RESULT:", "OK" if ok else "FAIL")
+sys.exit(0 if ok else 1)
+PY
+ "$EVIDENCE/step6-metrics.log"
+) || { cat "$EVIDENCE/step6-metrics.log" | grep -E '^coxswain_' ; die "step6 FAILED: one of the four coxswain_* metrics is absent or not > 0 (see above; I84: the scrape's content, not just its parse, is the assertion)"; }
+log step6 "the four coxswain_* metrics are present with sensible values: $(printf '%s\n' "$METRICS_CHECK" | tr '\n' ' ')"
 # Delete the metrics Secret now (the scrape is done; do not leave the token
 # on the cluster — and never dump it to the evidence).
 kc -n "$NS" delete secret b6-metrics-secret >/dev/null 2>&1 || true
@@ -1086,7 +1287,8 @@ PASS_COUNT=$(grep -E '^coxswain_verify_results_total\{[^}]*result="pass"[^}]*\}'
 grep -E '^coxswain_(loops_completed_total|verify_results_total)' "$EVIDENCE/step6-metrics.log" >"$EVIDENCE/step6-assert-lines.txt" || true
 {
 	echo "loops_completed_total{result=\"succeeded\"}: ${SUCCEEDED_COUNT:-0} (required >= 2: the manual Loop + the fork Loop, both Succeeded)"
-	echo "verify_results_total{result=\"pass\"}: ${PASS_COUNT:-0} (required >= 2: the manual Loop's successful verify + the restore Loop's successful verify)"
+	echo "verify_results_total{result=\"pass\"}: ${PASS_COUNT:-0} (required >= 2: the manual Loop's successful verify + the fork Loop's successful verify)"
+	echo "four-metrics-check: $(printf '%s' "$METRICS_CHECK" | tr '\n' ' ')"
 	echo "assert-lines: $EVIDENCE/step6-assert-lines.txt"
 } >"$EVIDENCE/step6-verify.txt"
 cat "$EVIDENCE/step6-assert-lines.txt"

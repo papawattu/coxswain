@@ -1291,4 +1291,83 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		_ = rec
 	})
 
+	It("RESTORE (deleted Loop): a deleting Loop with a lost PVC skips the B2 restore decision (the restore step is skipped so the checkpoint finalizer is cleared and the Loop is deleted, rather than being held open by a lost-PVC restore that requeues on the still-mounted workspace PVC)", func() {
+		ns := "b2-restore-deleted-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "restore-deleted-loop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		// The sandbox pod carries the loop label and mounts the workspace PVC
+		// (the shape on a real cluster): stopWorkloadsForRestore returns false
+		// while it is present, so the lost-PVC restore would stall at
+		// StoppingWorkloads and requeue. Delete any existing pod first (the
+		// operator may have created one during b1DriveToSucceeded).
+		existingPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: b2SandboxName(name), Namespace: ns}}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: b2SandboxName(name), Namespace: ns}, existingPod); err == nil {
+			_ = k8sClient.Delete(ctx, existingPod)
+		}
+		Expect(k8sClient.Create(ctx, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      b2SandboxName(name),
+				Namespace: ns,
+				Labels:    map[string]string{loopLabelKey: name},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: agentContainerName, Image: s3StandinImage},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "workspace",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: workspacePVCName(name),
+							},
+						},
+					},
+				},
+			},
+		})).To(Succeed())
+
+		// Put the PVC in Terminating state (the reactive lost-PVC restore would
+		// trigger for a LIVE Loop: a Terminating PVC is treated as LOST by
+		// workspacePVCPresent, and the ready checkpoint is the restore source).
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
+		pvc.Finalizers = append(pvc.Finalizers, "b2-test/fake-finalizer")
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+
+		// Delete the Loop (the checkpoint finalizer holds it; the apiserver
+		// sets the deletionTimestamp).
+		Expect(k8sClient.Delete(ctx, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})).To(Succeed())
+
+		// Reconcile: the B2 restore step is SKIPPED (the deletion guard). The
+		// CleaningUp work runs (the checkpoint GC + the finalizer removal), so
+		// the Loop is fully deleted. Without the guard, the lost-PVC restore
+		// would run for the deleting Loop: the PVC is still present (the
+		// sandbox pod mounts it), stopWorkloadsForRestore returns false, the
+		// restore requeues at StoppingWorkloads, and the checkpoint finalizer
+		// is never cleared (the Loop is held open).
+		b2ReconcileToleratingGone(r, ns, name)
+
+		By("the Loop is fully deleted (the checkpoint finalizer was cleared; the lost-PVC restore did not hold the delete open)")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &coxv1alpha1.Loop{})).To(
+			MatchError(apierrors.IsNotFound, "apiserver returns NotFound for a fully-deleted object"),
+			"the Loop must be fully deleted (the checkpoint finalizer was cleared; the B2 restore step is skipped for a deleting Loop)")
+	})
+
 })

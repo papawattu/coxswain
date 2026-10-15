@@ -2190,6 +2190,16 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		// (the agent, via COX_MODEL_BASE_URL) reach it. D34's NetworkPolicy then
 		// restricts who may call it.
 		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+		// Reset the fields the operator does NOT manage (same as the egress
+		// proxy Service): a pre-existing (possibly headless) proxy Service must
+		// not leak a defaulted IPFamilyPolicy (RequireDualStack on a headless
+		// create) or a headless ClusterIP into the operator's ClusterIP Service
+		// (the apiserver rejects the Update on a single-stack cluster). Set it
+		// to PreferDualStack (the k8s default, valid on both single- and
+		// dual-stack clusters) so the apiserver does not need to default it.
+		svcDesired.Spec.ClusterIP = ""
+		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
+		svcDesired.Spec.IPFamilies = nil
 		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
 	})
 	if err != nil {
@@ -2592,6 +2602,14 @@ const (
 // the egressNOProxy + deliverProxyEnv + verifyProxyEnv call sites do not
 // each carry the literal (goconst: three occurrences trips the linter).
 const noProxyLocal = "localhost,127.0.0.1"
+
+// ipFamilyPreferDualStack is the k8s-default Service IPFamilyPolicy (valid on
+// both single- and dual-stack clusters). A package-level var so the proxy and
+// egress proxy Service mutateFuncs can take its address (the constant is not
+// addressable). The operator sets it explicitly so a pre-existing (headless)
+// Service's apiserver-defaulted IPFamilyPolicy (RequireDualStack, which a
+// single-stack cluster rejects) is not inherited into the operator's Update.
+var ipFamilyPreferDualStack = corev1.IPFamilyPolicyPreferDualStack
 
 // operatorProxyEnv returns the operator-owned proxy env vars for the egress
 // proxy (I42d): HTTPS_PROXY/https_proxy and HTTP_PROXY/http_proxy point at
@@ -3060,6 +3078,19 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		}}
 		svcDesired.Spec.Selector = egressProxyLabels(loopName)
 		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+		// Reset the fields the operator does NOT manage so a pre-existing
+		// (possibly headless, ClusterIP: None) egress proxy Service — e.g. one
+		// planted by a test fixture — does not leak a defaulted IPFamilyPolicy
+		// (RequireDualStack on a headless create) or a headless ClusterIP into
+		// the operator's ClusterIP Service. The apiserver defaults IPFamilyPolicy
+		// to RequireDualStack on the fixture's headless create; on a single-stack
+		// cluster the operator's Update then rejects it ("this cluster is not
+		// configured for dual-stack services"). Set it to PreferDualStack (the
+		// k8s default, valid on both single- and dual-stack clusters) so the
+		// apiserver does not need to default it.
+		svcDesired.Spec.ClusterIP = ""
+		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
+		svcDesired.Spec.IPFamilies = nil
 		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
 	})
 	if err != nil {

@@ -361,6 +361,11 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"the Implementing claim advances to Verifying")
+		// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+		// Ready before the verify Job is created (external repo). Drive the
+		// operator's pod Ready so the verify Job is created for the failing-pod
+		// evidence below.
+		d61ReadyVerifyProxy(r, ns, name)
 		// Re-arm the claim reader to (nil, nil) (agent running).
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return nil, nil
@@ -543,6 +548,11 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		loop = b4Reconcile(r, ns, name)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"Manual mode: the Loop is at Verifying (the plan was approved)")
+		// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+		// Ready before the verify Job is created (external repo). Drive the
+		// operator's pod Ready so the verify Job is created for the failing-pod
+		// evidence below.
+		d61ReadyVerifyProxy(r, ns, name)
 
 		// Failed verify -> re-plan (Planning). The failure summary is set.
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})

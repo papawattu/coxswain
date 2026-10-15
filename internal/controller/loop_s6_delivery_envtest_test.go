@@ -118,6 +118,12 @@ func s6Succeeded(name, ns string, repo string) *LoopReconciler {
 	// Implementing claim with the headCommit (pins status.currentVerify).
 	s5aClaimPod(ns, name, "Implementing", s6HeadCommit)
 	s6Reconcile(r, ns, name)
+	// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+	// Ready and owned before the operator creates the verify Job (external
+	// repo). Drive the operator's own pod Ready (the proven s6ReadyEgressProxy
+	// pattern, with the in-cluster early-return) so the verify Job is created
+	// and verify can pass. In-cluster repos skip this (no proxy needed).
+	d61ReadyVerifyProxy(r, ns, name)
 	// Verifying: the verify Job's evidence.
 	s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
 	s6Reconcile(r, ns, name)

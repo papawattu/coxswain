@@ -118,6 +118,12 @@ func s6Succeeded(name, ns string, repo string) *LoopReconciler {
 	// Implementing claim with the headCommit (pins status.currentVerify).
 	s5aClaimPod(ns, name, "Implementing", s6HeadCommit)
 	s6Reconcile(r, ns, name)
+	// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+	// Ready and owned before the operator creates the verify Job (external
+	// repo). Drive the operator's own pod Ready (the proven s6ReadyEgressProxy
+	// pattern, with the in-cluster early-return) so the verify Job is created
+	// and verify can pass. In-cluster repos skip this (no proxy needed).
+	d61ReadyVerifyProxy(r, ns, name)
 	// Verifying: the verify Job's evidence.
 	s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
 	s6Reconcile(r, ns, name)
@@ -932,7 +938,13 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		name := "netpol1"
 		r := s6Succeeded(name, ns, githubRepoURL)
-		s6Reconcile(r, ns, name)
+		// D61: the egress proxy's SNI allowlist gains api.github.com:443 once the
+		// Loop reaches Succeeded (deliveryExpected -> deliverEgressProxyHosts),
+		// which churns the proxy pod's spec-hash (delete + recreate). Reconcile
+		// until the pod is stable (no spec drift) and owned by the Loop, so the
+		// allowlist assertion below reads the FINAL pod (not a transient absent
+		// state between the delete and recreate).
+		s6ReadyEgressProxy(r, ns, name)
 
 		By("allowlisting exactly {github.com, api.github.com} on the egress proxy")
 		pod := &corev1.Pod{}

@@ -200,7 +200,13 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 		s5aReconcile(r, ns, name)
 		s5aEnsureSandbox(ns, name)
 		s5aClaimPod(ns, name, "Implementing", s5aHeadCommit)
-		s5aReconcile(r, ns, name)
+		s5aReconcile(r, ns, name) // -> Verifying (the verify Job is created here)
+		// D61 (I90): the fixture repo (example.com) is external, so the
+		// verify-egress hold requires the egress proxy pod to be Ready and
+		// owned before the verify Job is created. Drive the operator's own pod
+		// Ready (the proven s6ReadyEgressProxy pattern) so these specs — which
+		// test verify-retry logic, not the proxy hold — reach the verify Job.
+		d61ReadyVerifyProxy(r, ns, name)
 	}
 
 	It("recreates a failed verify Job (clone-base failed) within the retry bound — no decision burned, no iterate, an Event per retry — and the stale pod is not re-counted (P1-A)", func() {

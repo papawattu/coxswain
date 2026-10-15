@@ -676,7 +676,12 @@ func (r *LoopReconciler) s4ClaimAndVerifyJob(ctx context.Context, loop *coxv1alp
 	advancedFrom = advancedFromClaim
 	verifyRequeue = false
 	if err := r.ensureVerifyJobAndNetPolicies(ctx, loop); err != nil {
-		if !errors.Is(err, errVerifyStaleDeleted) {
+		// errVerifyStaleDeleted: the D27 stale-Job guard just deleted a Job
+		// (requeue to recreate). errVerifyProxyNotReady: the D61 verify-egress
+		// hold — the egress proxy pod is not Ready (external repo), so no
+		// verify Job is created yet; requeue so the next reconcile retries once
+		// the proxy is Ready. Both are clean requeues, never controller errors.
+		if !errors.Is(err, errVerifyStaleDeleted) && !errors.Is(err, errVerifyProxyNotReady) {
 			return claimReadPending, advancedFrom, verifyRequeue, s4Changed, err
 		}
 		verifyRequeue = true
@@ -2190,6 +2195,16 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		// (the agent, via COX_MODEL_BASE_URL) reach it. D34's NetworkPolicy then
 		// restricts who may call it.
 		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+		// Reset the fields the operator does NOT manage (same as the egress
+		// proxy Service): a pre-existing (possibly headless) proxy Service must
+		// not leak a defaulted IPFamilyPolicy (RequireDualStack on a headless
+		// create) or a headless ClusterIP into the operator's ClusterIP Service
+		// (the apiserver rejects the Update on a single-stack cluster). Set it
+		// to PreferDualStack (the k8s default, valid on both single- and
+		// dual-stack clusters) so the apiserver does not need to default it.
+		svcDesired.Spec.ClusterIP = ""
+		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
+		svcDesired.Spec.IPFamilies = nil
 		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
 	})
 	if err != nil {
@@ -2587,6 +2602,20 @@ const (
 	envAllProxyLower = "all_proxy"
 )
 
+// noProxyLocal is the loopback NO_PROXY value (the egress proxy's NO_PROXY
+// carries it so a client never proxies to the proxy itself). A constant so
+// the egressNOProxy + deliverProxyEnv + verifyProxyEnv call sites do not
+// each carry the literal (goconst: three occurrences trips the linter).
+const noProxyLocal = "localhost,127.0.0.1"
+
+// ipFamilyPreferDualStack is the k8s-default Service IPFamilyPolicy (valid on
+// both single- and dual-stack clusters). A package-level var so the proxy and
+// egress proxy Service mutateFuncs can take its address (the constant is not
+// addressable). The operator sets it explicitly so a pre-existing (headless)
+// Service's apiserver-defaulted IPFamilyPolicy (RequireDualStack, which a
+// single-stack cluster rejects) is not inherited into the operator's Update.
+var ipFamilyPreferDualStack = corev1.IPFamilyPolicyPreferDualStack
+
 // operatorProxyEnv returns the operator-owned proxy env vars for the egress
 // proxy (I42d): HTTPS_PROXY/https_proxy and HTTP_PROXY/http_proxy point at
 // the egress proxy Service. NO_PROXY/no_proxy are appended by the caller
@@ -2935,6 +2964,32 @@ func (r *LoopReconciler) workspaceInitProxyHost(loop *coxv1alpha1.Loop) string {
 	return host
 }
 
+// verifyProxyHost is the repo host to add to the egress proxy's SNI allowlist
+// for the verify Job's clone-base fetch (D61, I42): the repo URL's host:port
+// when the verify Job's clone-base traverses the proxy (verifyNeedsProxy — an
+// EXTERNAL repo host, github.com, ...). An in-cluster repo (repoPeer non-nil)
+// returns "" (the direct repo-peer rule covers it, no proxy hop). It is NOT
+// phase-gated (unlike a per-phase gate) so the egress proxy's SNI allowlist —
+// and therefore the proxy pod's spec and spec-hash — is STABLE across phase
+// transitions (no pod recreation churn): the verify host is the same string
+// as the deliver host for the same repo, so it dedupes with deliverEgressProxy
+// Hosts in ensureEgressProxy. The port is the repo port (git dials it), so the
+// proxy matches the connection.
+func (r *LoopReconciler) verifyProxyHost(loop *coxv1alpha1.Loop) string {
+	if !r.verifyNeedsProxy(loop) {
+		return ""
+	}
+	host := workspaceRepoHost(loop.Spec.Workspace.Repo)
+	if host == "" {
+		return ""
+	}
+	port := workspaceRepoPort(loop.Spec.Workspace.Repo)
+	if port > 0 {
+		return fmt.Sprintf("%s:%d", host, port)
+	}
+	return host
+}
+
 func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	log := logf.FromContext(ctx)
 	// One read of the referenced AgentPolicies for the whole path (P3: no
@@ -2954,6 +3009,15 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		networkAllows = append(networkAllows, host)
 		hasAllows = true
 	}
+	// D61 (I42): the verify Job's clone-base fetch traverses the egress proxy
+	// for an EXTERNAL repo host (github.com, ...) — the verify NetworkPolicy
+	// allows egress to the egress-proxy pod and the proxy's SNI allowlist must
+	// carry the repo host. An in-cluster repo (repoPeer non-nil) keeps the
+	// direct repo-peer rule and adds no host.
+	if host := r.verifyProxyHost(loop); host != "" {
+		networkAllows = append(networkAllows, host)
+		hasAllows = true
+	}
 	// S6: the deliver Job's git push + provider API traverse the proxy for an
 	// external repo host (github.com, ...). The SNI allowlist must carry the
 	// repo host AND api.github.com for a GitHub delivery (deliverEgressProxy
@@ -2966,6 +3030,24 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 			hasAllows = true
 		}
 	}
+	// Dedupe the allowlist (order-preserving): the verify + deliver + workspace
+	// init hosts can overlap for the same repo (verifyProxyHost and
+	// deliverEgressProxyHosts both carry github.com:443 for a github.com
+	// PullRequest delivery). A duplicate host would change the proxy pod's
+	// EGRESS_POLICY_JSON env and spec-hash, churning the pod (spec drift ->
+	// delete + recreate) and breaking the S6 "allowlist is exactly {...}" spec
+	// (ConsistOf counts elements, so a duplicate trips it). The SNI allowlist
+	// is a set — duplicates are semantically identical.
+	seen := map[string]bool{}
+	uniqueAllows := networkAllows[:0]
+	for _, h := range networkAllows {
+		if seen[h] {
+			continue
+		}
+		seen[h] = true
+		uniqueAllows = append(uniqueAllows, h)
+	}
+	networkAllows = uniqueAllows
 	if !hasAllows {
 		// No network allows: no egress proxy needed. Clean up if one exists.
 		// P3: clear a stale EgressProxyConflict here too — if a foreign pod once
@@ -3001,6 +3083,19 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		}}
 		svcDesired.Spec.Selector = egressProxyLabels(loopName)
 		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+		// Reset the fields the operator does NOT manage so a pre-existing
+		// (possibly headless, ClusterIP: None) egress proxy Service — e.g. one
+		// planted by a test fixture — does not leak a defaulted IPFamilyPolicy
+		// (RequireDualStack on a headless create) or a headless ClusterIP into
+		// the operator's ClusterIP Service. The apiserver defaults IPFamilyPolicy
+		// to RequireDualStack on the fixture's headless create; on a single-stack
+		// cluster the operator's Update then rejects it ("this cluster is not
+		// configured for dual-stack services"). Set it to PreferDualStack (the
+		// k8s default, valid on both single- and dual-stack clusters) so the
+		// apiserver does not need to default it.
+		svcDesired.Spec.ClusterIP = ""
+		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
+		svcDesired.Spec.IPFamilies = nil
 		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
 	})
 	if err != nil {

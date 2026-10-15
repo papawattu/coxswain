@@ -54,7 +54,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -82,6 +81,25 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		return name
 	}
 
+	// i72SetPodReady sets the operator's own egress proxy pod's Ready status
+	// (envtest has no kubelet). Keeps the pod's spec (the spec-hash still
+	// matches — no drift). ready=true sets PodReady=True, ready=false sets
+	// PodReady=False. Used by i72Succeeded to get the verify hold to pass
+	// (Ready) and then to make the deliver gate hold (NOT Ready).
+	i72SetPodReady := func(ns, loopName string, ready bool) {
+		ctx := context.Background()
+		ann := types.NamespacedName{Name: loopName + "-egress-proxy", Namespace: ns}
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, ann, pod)).To(Succeed(), "I72: the egress proxy pod must exist")
+		pod.Status.Phase = corev1.PodRunning
+		if ready {
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		} else {
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	}
+
 	// i72Succeeded drives a fresh Loop with delivery mode PullRequest to
 	// Succeeded (the S5a claim path) and returns the reconciler. repo is the
 	// workspace repo (github.com -> external -> the egress proxy is needed
@@ -103,7 +121,15 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		s6Reconcile(r, ns, name)
 		s5aEnsureSandbox(ns, name) // the annotation recycle deleted the Sandbox
 		s5aClaimPod(ns, name, "Implementing", s6HeadCommit)
-		s6Reconcile(r, ns, name)
+		// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+		// Ready and owned before the operator creates the verify Job (external
+		// repo). Mark the operator's pod Ready so the verify Job is created and
+		// verify can pass, then set it back to NOT Ready so the DELIVER gate
+		// holds at S6 (the I72 specs test the deliver hold).
+		s6Reconcile(r, ns, name)        // create the egress proxy pod (not Ready yet)
+		i72SetPodReady(ns, name, true)  // pod Ready -> verify hold passes
+		s6Reconcile(r, ns, name)        // -> Verifying (verify Job created, pod Ready)
+		i72SetPodReady(ns, name, false) // pod NOT Ready -> deliver gate holds at S6
 		s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
 		s6Reconcile(r, ns, name)
 		loop = &coxv1alpha1.Loop{}
@@ -113,68 +139,47 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		return r
 	}
 
-	// i72EgressPod creates the egress proxy pod for the Loop (name+
-	// "-egress-proxy") using buildEgressProxyPod (the operator's own builder,
-	// so the spec-hash annotation matches the desired spec and the operator's
-	// ensureEgressProxy does not delete it for drift), with the given phase
-	// and Ready status (the operator-owned pod the gate reads). ready=true
-	// sets the PodReady condition to True; ready=false sets it to False.
-	i72EgressPod := func(ns, loopName string, phase corev1.PodPhase, ready bool) {
+	// i72EgressPod modifies the operator's own egress proxy pod (created by
+	// d61ReadyVerifyProxy in i72Succeeded) IN PLACE: it keeps the pod's spec
+	// (so the spec-hash matches the operator's desired hash — no drift, no
+	// recreation) and only changes the status (phase + Ready) or the owner
+	// ref. phase=absent deletes the pod (no replant) so the deliver gate sees
+	// no pod. ready=true sets PodReady=True, ready=false sets PodReady=False.
+	// foreign=true drops the owner ref (the pod is foreign — the operator
+	// treats it as EgressProxyConflict and the deliver gate holds because the
+	// pod is not controlled by the Loop).
+	i72EgressPod := func(ns, loopName string, phase corev1.PodPhase, ready, foreign bool) {
 		ctx := context.Background()
 		nn := types.NamespacedName{Name: loopName + "-egress-proxy", Namespace: ns}
-		existing := &corev1.Pod{}
-		if !apierrors.IsNotFound(k8sClient.Get(ctx, nn, existing)) {
-			Expect(k8sClient.Delete(ctx, existing)).To(Succeed())
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, nn, pod)).To(Succeed(), "I72: the operator's egress proxy pod must exist (d61ReadyVerifyProxy created it)")
+		if phase == corev1.PodPhase("absent") {
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed(), "I72: delete the egress proxy pod (absent hold state)")
+			return
 		}
-		loop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: loopName, Namespace: ns}, loop)).To(Succeed())
-		pod := buildEgressProxyPod(loopName, ns, "coxswain-egress-proxy:standin",
-			[]string{i42eGitHubHost}, "testhash", "10.244.0.0/16", "10.96.0.0/12")
-		pod.Annotations = map[string]string{proxySpecHashAnnotation: egressProxyPodSpecHash(pod)}
-		if err := controllerutil.SetControllerReference(loop, pod, k8sClient.Scheme()); err != nil {
-			Expect(err).NotTo(HaveOccurred(), "I72: set owner ref on the egress proxy pod")
+		if foreign {
+			// Drop the owner ref: the pod is foreign. The operator's
+			// ensureEgressProxy treats a non-owned pod as EgressProxyConflict
+			// (the conflict early-return) and does not delete it; the deliver
+			// gate holds because the pod is not controlled by the Loop.
+			pod.OwnerReferences = nil
+			Expect(k8sClient.Update(ctx, pod)).To(Succeed())
 		}
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.Phase = phase
 		if ready {
-			pod.Status.Conditions = []corev1.PodCondition{{
-				Type: corev1.PodReady, Status: corev1.ConditionTrue,
-			}}
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 		} else {
-			pod.Status.Conditions = []corev1.PodCondition{{
-				Type: corev1.PodReady, Status: corev1.ConditionFalse,
-			}}
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 	}
 
-	// i72ForeignEgressPod creates an egress proxy pod for the Loop that is
-	// NOT owned by the Loop (no owner ref — the operator treats it as
-	// EgressProxyConflict and does not delete it, and the I72 gate holds
-	// because the pod is not controlled by the Loop, same pattern as
-	// D35a/I42b). The spec-hash annotation is set so the operator's
-	// ensureEgressProxy does not delete it for drift.
+	// i72ForeignEgressPod makes the operator's own egress proxy pod FOREIGN
+	// (drops the owner ref) so the operator treats it as EgressProxyConflict
+	// and the deliver gate holds (the pod is not controlled by the Loop). The
+	// pod's spec is unchanged (the spec-hash still matches — no drift).
 	i72ForeignEgressPod := func(ns, loopName string) {
-		ctx := context.Background()
-		nn := types.NamespacedName{Name: loopName + "-egress-proxy", Namespace: ns}
-		existing := &corev1.Pod{}
-		if !apierrors.IsNotFound(k8sClient.Get(ctx, nn, existing)) {
-			Expect(k8sClient.Delete(ctx, existing)).To(Succeed())
-		}
-		pod := buildEgressProxyPod(loopName, ns, "coxswain-egress-proxy:standin",
-			[]string{i42eGitHubHost}, "testhash", "10.244.0.0/16", "10.96.0.0/12")
-		// No owner ref (the pod is foreign). The spec-hash annotation is set
-		// to the hash of this pod's own spec so the operator does not delete
-		// it for drift (the operator's ensureEgressProxy skips deletion when
-		// the pod is not controlled by the Loop, but the annotation keeps the
-		// pod stable across reconciles).
-		pod.Annotations = map[string]string{proxySpecHashAnnotation: egressProxyPodSpecHash(pod)}
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		pod.Status.Phase = corev1.PodRunning
-		pod.Status.Conditions = []corev1.PodCondition{{
-			Type: corev1.PodReady, Status: corev1.ConditionTrue,
-		}}
-		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		i72EgressPod(ns, loopName, corev1.PodRunning, true, true)
 	}
 
 	// i72AssertHold asserts the deliver step is held: no deliver Job exists
@@ -201,9 +206,10 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		name := "i72a"
 		policy := i72AgentPolicy(ns, "i72a-policy")
 		r := i72Succeeded(ns, name, "https://github.com/o/r.git", policy)
-		// The egress proxy pod is absent (the operator creates it, but in
-		// envtest the spec does not run a full reconcile that would create
-		// it — assert the hold before it exists).
+		// The egress proxy pod is deleted (i72Succeeded created it via
+		// d61ReadyVerifyProxy to get past the verify hold; the spec deletes it
+		// to test the DELIVER hold while the pod is absent).
+		i72EgressPod(ns, name, corev1.PodPhase("absent"), false, false)
 		s6Reconcile(r, ns, name)
 		i72AssertHold(ns, name, "pod absent")
 	})
@@ -214,7 +220,7 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		name := "i72b"
 		policy := i72AgentPolicy(ns, "i72b-policy")
 		r := i72Succeeded(ns, name, "https://github.com/o/r.git", policy)
-		i72EgressPod(ns, name, corev1.PodPending, false)
+		i72EgressPod(ns, name, corev1.PodPending, false, false)
 		s6Reconcile(r, ns, name)
 		i72AssertHold(ns, name, "pod Pending, not Ready")
 	})
@@ -225,7 +231,7 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		name := "i72c"
 		policy := i72AgentPolicy(ns, "i72c-policy")
 		r := i72Succeeded(ns, name, "https://github.com/o/r.git", policy)
-		i72EgressPod(ns, name, corev1.PodRunning, false)
+		i72EgressPod(ns, name, corev1.PodRunning, false, false)
 		s6Reconcile(r, ns, name)
 		i72AssertHold(ns, name, "pod Running, Ready=False")
 	})

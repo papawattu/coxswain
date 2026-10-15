@@ -278,6 +278,10 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		l.Status.BaseCommit = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
 		reconcile(r, ns, "p2f-s3")
+		// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+		// Ready before the verify Job is created (external repo: example.com).
+		// Drive the operator's pod Ready so the verify Job is created.
+		d61ReadyVerifyProxy(r, ns, "p2f-s3")
 
 		job := &batchv1.Job{}
 		jobErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "p2f-s3-verify-1"}, job)

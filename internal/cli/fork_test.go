@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -17,13 +18,42 @@ import (
 // (a nil error) so the bug was invisible until the real apiserver; this test
 // pins the real call.
 //
-// Mutation (the norm): switching fork.go's Create call back to Update makes
-// this test FAIL (f.creates is empty; the fork Loop is recorded in
+// B6 (the cox fork spec deep-copy pin): the fork's spec is a DEEP COPY of the
+// source's spec (the fork inherits the source's goal, agent, verify,
+// delivery, loop and checkpoints — the fork is a copy, not a new objective).
+// The B6 run 13 failure: buildForkLoop copied only spec.workspace and
+// spec.model (a top-level spec.model that does not exist in LoopSpec — the
+// model lives in spec.agent.model), so the fork had no goal (the CRD
+// rejects 'spec.goal: Required value') and no agent/verify/delivery/loop/
+// checkpoints. This test pins the full spec copy.
+//
+// Mutation 1 (the norm): switching fork.go's Create call back to Update
+// makes this test FAIL (f.creates is empty; the fork Loop is recorded in
 // f.updates instead) — recorded in the PR.
+//
+// Mutation 2 (the norm): reverting buildForkLoop to copy only workspace
+// (the old behaviour) makes this test FAIL (the fork's spec is missing
+// goal/agent/verify/delivery/loop/checkpoints — the source's spec is not
+// inherited) — recorded in the PR.
 func TestFork_CreatesNewLoop_NotUpdates(t *testing.T) {
-	// The source Loop (the fork inherits its workspace; it must exist for
-	// forkLoop's Get to succeed).
+	// The source Loop (the fork inherits its spec; it must exist for
+	// forkLoop's Get to succeed). The source's spec carries goal, agent,
+	// verify, delivery, loop, checkpoints, and restoreFrom (the fork must
+	// DROP restoreFrom and any existing forkOf, and SET forkOf to the
+	// source's loop + iteration).
 	src := makeLoop("Succeeded", 2)
+	// The source's spec (the fork deep-copies it). Use a JSON round-trip to
+	// build the spec so the spec carries only JSON types (the runtime
+	// helpers panic on raw Go ints — a JSON round-trip converts them to
+	// float64, which the helpers can deep-copy).
+	specJSON := `{"goal":"make the thing work","agent":{"image":"ghcr.io/papawattu/coxswain-agent:latest","model":{"endpoint":"http://model:8000"}},"verify":{"checks":["make -n docs"]},"delivery":{"kind":"PullRequest"},"loop":{"maxIterations":4},"checkpoints":["checkpoint-loop1-iter-2"],"restoreFrom":"checkpoint-loop1-iter-1"}`
+	var specMap map[string]any
+	if err := json.Unmarshal([]byte(specJSON), &specMap); err != nil {
+		t.Fatalf("unmarshal the source's spec: %v", err)
+	}
+	if err := unstructured.SetNestedMap(src.Object, specMap, "spec"); err != nil {
+		t.Fatalf("set the source's spec: %v", err)
+	}
 	fc := newFakeLoopClient()
 	fc.setLoop(src)
 	deps := Deps{Loops: fc}
@@ -49,14 +79,15 @@ func TestFork_CreatesNewLoop_NotUpdates(t *testing.T) {
 	if got := created.GetNamespace(); got != "samples" {
 		t.Errorf("the created Loop's namespace is %q, want samples", got)
 	}
-	// spec.forkOf must carry the source's loop + iteration (the fork's seed).
-	// The CLI builds spec.forkOf with an int; read it as a map (the
-	// unstructured helpers deep-copy nested values, which panics on raw ints
-	// — read the map instead).
-	var foMap map[string]any
-	if spec, ok := created.Object["spec"].(map[string]any); ok {
-		foMap, _ = spec["forkOf"].(map[string]any)
+	// The fork's spec must be the source's spec (deep-copied), with
+	// restoreFrom and any existing forkOf DROPPED, and forkOf SET to the
+	// source's loop + iteration.
+	forkSpec, ok := created.Object["spec"].(map[string]any)
+	if !ok {
+		t.Fatalf("the created Loop has no spec")
 	}
+	// spec.forkOf must carry the source's loop + iteration (the fork's seed).
+	foMap, _ := forkSpec["forkOf"].(map[string]any)
 	if foMap == nil {
 		t.Fatal("spec.forkOf is absent on the created Loop")
 	}
@@ -69,6 +100,48 @@ func TestFork_CreatesNewLoop_NotUpdates(t *testing.T) {
 	}
 	if i, ok := iter.(int); !ok || i != 2 {
 		t.Errorf("spec.forkOf.iteration is %v (%T), want 2", iter, iter)
+	}
+	// The fork inherits the source's goal (the CRD requires a non-empty
+	// goal — the B6 run 13 failure: 'spec.goal: Required value').
+	if g, ok := forkSpec["goal"].(string); !ok || g == "" {
+		t.Errorf("the created Loop's spec.goal is %v (ok=%v), want the source's non-empty goal (the CRD requires it)", forkSpec["goal"], ok)
+	} else if g != "make the thing work" {
+		t.Errorf("the created Loop's spec.goal is %q, want the source's goal (make the thing work)", g)
+	}
+	// The fork inherits the source's agent (the fork is a copy — the source's
+	// model is inherited, not re-authored). The B6 run 13 failure: buildForkLoop
+	// copied only workspace + model (a top-level spec.model that does not
+	// exist in LoopSpec — the model lives in spec.agent.model), so the fork
+	// had no agent.
+	agent, ok := forkSpec["agent"].(map[string]any)
+	if !ok || agent == nil {
+		t.Errorf("the created Loop's spec.agent is %v (ok=%v), want the source's agent (the fork inherits the source's model)", forkSpec["agent"], ok)
+	}
+	// The fork inherits the source's verify (the fork's acceptance checks are
+	// the source's — the fork is a copy, not a new objective).
+	if _, ok := forkSpec["verify"].(map[string]any); !ok {
+		t.Errorf("the created Loop's spec.verify is %v, want the source's verify (the fork inherits the source's acceptance checks)", forkSpec["verify"])
+	}
+	// The fork inherits the source's delivery (the fork's delivery config is
+	// the source's — the fork delivers the same way).
+	if _, ok := forkSpec["delivery"].(map[string]any); !ok {
+		t.Errorf("the created Loop's spec.delivery is %v, want the source's delivery (the fork inherits the source's delivery config)", forkSpec["delivery"])
+	}
+	// The fork inherits the source's loop (the fork's loop config is the
+	// source's — the fork runs the same way).
+	if _, ok := forkSpec["loop"].(map[string]any); !ok {
+		t.Errorf("the created Loop's spec.loop is %v, want the source's loop (the fork inherits the source's loop config)", forkSpec["loop"])
+	}
+	// The fork inherits the source's checkpoints (the fork's checkpoint list
+	// is the source's — the fork is a copy, not a new objective).
+	if _, ok := forkSpec["checkpoints"].([]any); !ok {
+		t.Errorf("the created Loop's spec.checkpoints is %v, want the source's checkpoints (the fork inherits the source's checkpoint list)", forkSpec["checkpoints"])
+	}
+	// The fork DROPS restoreFrom (the fork's restore is one-shot at creation
+	// from the source's checkpoint; a stale restoreFrom would re-arm the
+	// fork's own restore path and break the fork's one-shot semantics).
+	if _, ok := forkSpec["restoreFrom"]; ok {
+		t.Errorf("the created Loop's spec.restoreFrom is %v, want ABSENT (the fork DROPS restoreFrom — the fork's restore is one-shot at creation from the source's checkpoint)", forkSpec["restoreFrom"])
 	}
 	// The CLI's output names the fork (the user-facing confirmation).
 	if !strings.Contains(out.String(), "b6-fork") {

@@ -32,6 +32,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // newForkCommand builds `cox fork <fork-name> --loop <source> --iteration <n>`:
@@ -78,11 +79,14 @@ is False, reason RestoreSourceMissing, the fork is terminal).`,
 	return cmd
 }
 
-// forkLoop reads the SOURCE Loop (to inherit the workspace and model),
-// builds the FORK Loop object (a new Loop with spec.forkOf set), and
-// applies it (the operator does the rest). It does NOT create the snapshot
-// or the PVC (the operator does that at the fork's start). It prints the
-// fork's name and namespace on success.
+// forkLoop reads the SOURCE Loop (to deep-copy its spec), builds the FORK
+// Loop object (a new Loop with spec.forkOf set, the source's spec otherwise
+// intact — the fork inherits the source's goal, agent, verify, delivery,
+// loop and checkpoints; restoreFrom and any existing forkOf are DROPPED, and
+// forkOf is SET to the source's loop + iteration), and applies it (the
+// operator does the rest). It does NOT create the snapshot or the PVC (the
+// operator does that at the fork's start). It prints the fork's name and
+// namespace on success.
 func forkLoop(ctx context.Context, dc Deps, ns, forkName, sourceLoop string, iteration int, out io.Writer) error {
 	if sourceLoop == "" {
 		return fmt.Errorf("--loop is required (the SOURCE Loop's name)")
@@ -93,10 +97,11 @@ func forkLoop(ctx context.Context, dc Deps, ns, forkName, sourceLoop string, ite
 	if dc.Loops == nil {
 		return fmt.Errorf("cli: no Loop client (the real client-go impl is not wired)")
 	}
-	// The fork's workspace: the source Loop's workspace (the fork inherits
-	// the source's repo). The CLI reads the source Loop to get its workspace
-	// (a read, not a write — the operator does the fork's PVC restore; the
-	// CLI's read is to build the fork's Loop object correctly).
+	// The fork's spec is a DEEP COPY of the source's spec (the fork inherits
+	// the source's goal, agent, verify, delivery, loop and checkpoints — the
+	// fork is a copy, not a new objective). The CLI reads the source Loop to
+	// get its spec (a read, not a write — the operator does the fork's PVC
+	// restore; the CLI's read is to build the fork's Loop object correctly).
 	src, err := dc.Loops.Get(ctx, sourceLoop)
 	if err != nil {
 		return fmt.Errorf("read the source Loop %s: %w (the source must exist)", sourceLoop, err)
@@ -105,23 +110,36 @@ func forkLoop(ctx context.Context, dc Deps, ns, forkName, sourceLoop string, ite
 	if !ok {
 		return fmt.Errorf("cli: expected the source Loop as *unstructured.Unstructured, got %T", src)
 	}
-	// The fork's workspace is the source's workspace (the fork inherits the
-	// source's repo — the fork is a copy, not a new repo).
-	workspace, found, _ := unstructured.NestedMap(srcU.Object, "spec", "workspace")
-	if !found || workspace == nil {
-		// A source Loop with no workspace (a workspace-less Loop) is forked
-		// with no workspace (the fork is a copy — the source has no repo, so
-		// the fork has no repo). This is a no-op (the fork's PVC is an empty
-		// scratch workspace; the fork's one-shot goal is a fresh start).
-		workspace = nil
+	// Deep-copy the source's spec (the fork is a copy — the source's spec is
+	// inherited, not re-authored). A nil spec (a source with no spec) is
+	// treated as an empty spec (the fork's spec is just forkOf).
+	spec, found, _ := unstructured.NestedMap(srcU.Object, "spec")
+	if !found || spec == nil {
+		spec = map[string]any{}
 	}
-	// The fork's model is the source's model (the fork inherits the source's
-	// model; the fork is a one-shot continuation of the source's work, not a
-	// new model experiment).
-	model, _, _ := unstructured.NestedMap(srcU.Object, "spec", "model")
-
-	// Build the fork's Loop object (a new Loop with spec.forkOf set).
-	fork := buildForkLoop(forkName, ns, sourceLoop, iteration, workspace, model)
+	// Deep-copy the spec (a shallow copy would share nested maps with the
+	// source's object; the fork's spec must be independent so the fork's
+	// mutation does not leak into the source's object).
+	specCopy := runtime.DeepCopyJSONValue(spec)
+	forkSpec, ok := specCopy.(map[string]any)
+	if !ok || forkSpec == nil {
+		return fmt.Errorf("cli: the deep-copied spec is %T, want map[string]any", specCopy)
+	}
+	// DROP restoreFrom (the fork's restore is one-shot at creation from the
+	// source's checkpoint; a stale restoreFrom would re-arm the fork's own
+	// restore path and break the fork's one-shot semantics).
+	delete(forkSpec, "restoreFrom")
+	// DROP any existing forkOf (the source's forkOf — the source was itself
+	// a fork — would be stale; the fork's forkOf is the source's loop +
+	// iteration, set below).
+	delete(forkSpec, "forkOf")
+	// SET forkOf (the fork's seed: the source's loop + iteration).
+	forkSpec["forkOf"] = map[string]any{
+		"loop":      sourceLoop,
+		"iteration": iteration,
+	}
+	// Build the fork's Loop object (a new Loop with the fork's spec).
+	fork := buildForkLoop(forkName, ns, forkSpec)
 	// Apply the fork as a NEW object (Create, the main resource) — not Update,
 	// which PUTs to the status subresource and 404s for a Loop that does not
 	// exist yet (the B6 run 12's `cox fork` failure).
@@ -134,33 +152,13 @@ func forkLoop(ctx context.Context, dc Deps, ns, forkName, sourceLoop string, ite
 	return nil
 }
 
-// buildForkLoop builds the fork's Loop object (a new Loop with spec.forkOf
-// set). The fork's name is the fork name; the fork's namespace is the
+// buildForkLoop builds the fork's Loop object (a new Loop with the fork's
+// spec). The fork's name is the fork name; the fork's namespace is the
 // source's namespace (the fork is in the source's namespace); the fork's
-// workspace is the source's workspace (the fork inherits the source's
-// repo); the fork's model is the source's model (the fork inherits the
-// source's model); the fork's forkOf is {loop: sourceLoop, iteration:
-// iteration} (the fork's seed).
-func buildForkLoop(forkName, ns, sourceLoop string, iteration int, workspace, model map[string]any) *unstructured.Unstructured {
-	spec := map[string]any{
-		"forkOf": map[string]any{
-			"loop":      sourceLoop,
-			"iteration": iteration,
-		},
-	}
-	// The fork's workspace: the source's workspace (a map; the fork inherits
-	// the source's repo). A nil workspace (a workspace-less source) is
-	// omitted (the fork has no workspace — the fork's PVC is an empty
-	// scratch workspace).
-	if workspace != nil {
-		spec["workspace"] = workspace
-	}
-	// The fork's model: the source's model (a map; the fork inherits the
-	// source's model). A nil model is omitted (the fork uses the operator's
-	// default model).
-	if model != nil {
-		spec["model"] = model
-	}
+// spec is the source's spec (deep-copied, with restoreFrom and any existing
+// forkOf DROPPED, and forkOf SET to the source's loop + iteration — the
+// fork's seed).
+func buildForkLoop(forkName, ns string, spec map[string]any) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "coxswain.wattu.com/v1alpha1",
 		"kind":       "Loop",

@@ -95,7 +95,7 @@ Optional overrides:
 	}
 	cmd.Flags().StringVar(&sourceLoop, "loop", "", "the SOURCE Loop's name (the Loop whose checkpoint the fork seeds from)")
 	cmd.Flags().IntVar(&iteration, "iteration", 0, "the checkpoint's iteration (the source Loop's status.checkpoints entry; a positive integer)")
-	cmd.Flags().StringSliceVar(&checks, "check", nil, "the fork's acceptance checks (repeatable; when given, replaces spec.verify.acceptanceChecks; a fork WITHOUT --check inherits the source's acceptance checks)")
+	cmd.Flags().StringArrayVar(&checks, "check", nil, "the fork's acceptance checks (repeatable; when given, replaces spec.verify.acceptanceChecks; a fork WITHOUT --check inherits the source's acceptance checks)")
 	cmd.Flags().StringVar(&goal, "goal", "", "the fork's goal (when given, replaces spec.goal; a fork WITHOUT --goal inherits the source's goal)")
 	return cmd
 }

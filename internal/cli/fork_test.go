@@ -258,6 +258,62 @@ func TestFork_GoalOverride(t *testing.T) {
 	}
 }
 
+// B6 (the cox fork --check comma pin): --check "jq '.a,.b' x.json" must
+// yield EXACTLY ONE acceptance check ("jq '.a,.b' x.json"), not two
+// ("jq '.a" and "b' x.json"). StringSliceVar splits on commas; StringArrayVar
+// does not. This test exercises the cobra flag parsing (not forkLoop
+// directly) to pin the flag type.
+//
+// Mutation (the norm): reverting fork.go's StringArrayVar back to
+// StringSliceVar makes this test FAIL (the parsed value is two elements
+// instead of one) — recorded in the PR.
+func TestFork_CheckFlag_CommaNotSplit(t *testing.T) {
+	cmd := newForkCommand()
+	// Simulate: cox fork my-fork --loop loop1 --iteration 2 --check "jq '.a,.b' x.json"
+	cmd.SetArgs([]string{"my-fork", "--loop", "loop1", "--iteration", "2", "--check", "jq '.a,.b' x.json"})
+	// We need a Loop client so the command can run. Use a fake that records
+	// the created object.
+	fc := newFakeLoopClient()
+	src := makeLoop("Succeeded", 2)
+	fc.setLoop(src)
+	// Wire the fake into the command's deps.
+	currentDeps = Deps{Loops: fc}
+	t.Cleanup(func() { currentDeps = Deps{} })
+
+	out := new(bytes.Buffer)
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("cobra Execute: %v (output: %s)", err, out.String())
+	}
+	if len(fc.creates) != 1 {
+		t.Fatalf("the fork Loop was applied via Create %d time(s), want exactly 1", len(fc.creates))
+	}
+	created, ok := fc.creates[0].(*unstructured.Unstructured)
+	if !ok {
+		t.Fatalf("Create received %T, want *unstructured.Unstructured", fc.creates[0])
+	}
+	forkSpec, ok := created.Object["spec"].(map[string]any)
+	if !ok {
+		t.Fatalf("the created Loop has no spec")
+	}
+	verify, ok := forkSpec["verify"].(map[string]any)
+	if !ok || verify == nil {
+		t.Fatalf("the created Loop's spec.verify is %v (ok=%v), want a non-nil verify", forkSpec["verify"], ok)
+	}
+	checks, ok := verify["acceptanceChecks"].([]any)
+	if !ok {
+		t.Fatalf("the created Loop's spec.verify.acceptanceChecks is %T, want []any", verify["acceptanceChecks"])
+	}
+	if len(checks) != 1 {
+		t.Fatalf("spec.verify.acceptanceChecks has %d element(s), want exactly 1 (a --check with a comma must NOT be split — StringArrayVar, not StringSliceVar)", len(checks))
+	}
+	if c, ok := checks[0].(string); !ok || c != "jq '.a,.b' x.json" {
+		t.Errorf("spec.verify.acceptanceChecks[0] is %q (ok=%v), want the exact string 'jq '.a,.b' x.json' (the comma must be preserved)", checks[0], ok)
+	}
+}
+
 // B6 (the cox fork --check mutation pin): ignoring the --check flag (the
 // fork inherits the source's acceptance checks even when --check is given)
 // must make TestFork_CreatesNewLoop_NotUpdates FAIL (the assertion

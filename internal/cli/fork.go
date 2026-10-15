@@ -133,18 +133,6 @@ func forkLoop(ctx context.Context, dc Deps, ns, forkName, sourceLoop string, ite
 	// a fork — would be stale; the fork's forkOf is the source's loop +
 	// iteration, set below).
 	delete(forkSpec, "forkOf")
-	// DROP the source's verify (the fork's acceptance checks are the fork's
-	// own — the source's forced fail check (the B6 step 4's 'false' check)
-	// would make the fork FAIL (the B6 run 14 failure: the fork inherited
-	// the source's 'false' verify check and hit MaxIterationsExceeded). The
-	// fork's verify is a fresh, passing default (the operator's default check
-	// 'make -n docs' — a check that succeeds on any well-formed repo).
-	delete(forkSpec, "verify")
-	// SET the fork's verify (a fresh, passing check — the fork succeeds where
-	// the source's forced check cannot).
-	forkSpec["verify"] = map[string]any{
-		"checks": []any{"make -n docs"},
-	}
 	// SET forkOf (the fork's seed: the source's loop + iteration).
 	forkSpec["forkOf"] = map[string]any{
 		"loop":      sourceLoop,

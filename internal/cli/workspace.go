@@ -30,10 +30,10 @@ type peekWorkspaceReader struct {
 	// kubectlCreate / kubectlGet / kubectlLogs / kubectlDelete are the kubectl
 	// exec seams (the test fakes return canned output). They default to the
 	// real kubectl when nil.
-	kubectlCreate  func(ctx context.Context, stdin string, args ...string) error
-	kubectlGetFn   func(ctx context.Context, args ...string) (string, error)
-	kubectlLogsFn  func(ctx context.Context, args ...string) (string, error)
-	kubectlDelete  func(ctx context.Context, args ...string) error
+	kubectlCreate func(ctx context.Context, stdin string, args ...string) error
+	kubectlGetFn  func(ctx context.Context, args ...string) (string, error)
+	kubectlLogsFn func(ctx context.Context, args ...string) (string, error)
+	kubectlDelete func(ctx context.Context, args ...string) error
 }
 
 // Read runs `cat <path>` in a read-only peek pod mounted on the
@@ -174,7 +174,7 @@ type peekPodOutcome struct {
 // container) returns error=false with the phase recorded (the caller keeps
 // polling). A pod that ended Failed, or a container that terminated non-zero,
 // returns error=true (the F7 condition).
-func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string) (peekPodOutcome, error) {
+func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string) peekPodOutcome {
 	podJSON, _ := p.peekKubectlGet(ctx, "get", "pod", podName, "-o", "json")
 	var pod struct {
 		Status struct {
@@ -193,7 +193,7 @@ func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string
 		// A parse failure is NOT an error outcome: the pod exists (the Get
 		// succeeded), its status is just not readable this tick. The caller
 		// keeps polling (phase "" is not terminal).
-		return peekPodOutcome{phase: ""}, nil
+		return peekPodOutcome{phase: ""}
 	}
 	out := peekPodOutcome{phase: pod.Status.Phase}
 	if len(pod.Status.ContainerStatuses) > 0 {
@@ -211,7 +211,7 @@ func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string
 	if pod.Status.Phase == "Failed" {
 		out.error = true
 	}
-	return out, nil
+	return out
 }
 
 // pollPeekPodOutcome polls peekPodOutcome up to 30 times (1s apart) until the
@@ -221,7 +221,7 @@ func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string
 func (p *peekWorkspaceReader) pollPeekPodOutcome(ctx context.Context, podName string) (peekPodOutcome, error) {
 	var last peekPodOutcome
 	for range 30 {
-		last, _ = p.peekPodOutcome(ctx, podName)
+		last = p.peekPodOutcome(ctx, podName)
 		// Stop when the pod is terminal (Succeeded/Failed) or the container has
 		// terminated (an error outcome, e.g. a non-zero exit while the phase is
 		// still settling). A non-terminated, non-terminal pod keeps polling.

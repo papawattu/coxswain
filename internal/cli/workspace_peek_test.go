@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -53,15 +54,13 @@ const peekPodRunningJSON = `{
 // newPeekTestReader builds a peekWorkspaceReader with the kubectl seams stubbed:
 // the pod-name lookup returns podName, the pod-json lookup returns podJSON, and
 // `logs` returns logsOut. This isolates the outcome parsing from a cluster.
-func newPeekTestReader(podName, podJSON, logsOut string) *peekWorkspaceReader {
+func newPeekTestReader(podJSON, logsOut string) *peekWorkspaceReader {
 	return &peekWorkspaceReader{
 		ns: "ns",
 		kubectlGetFn: func(ctx context.Context, args ...string) (string, error) {
 			// The pod-name lookup has "-l"; the pod-json lookup does not.
-			for _, a := range args {
-				if a == "-l" {
-					return podName, nil
-				}
+			if slices.Contains(args, "-l") {
+				return "peek-abc", nil
 			}
 			return podJSON, nil
 		},
@@ -79,11 +78,8 @@ func newPeekTestReader(podName, podJSON, logsOut string) *peekWorkspaceReader {
 // mutation where the reader returned the container log as the file content on
 // a Failed pod.
 func TestPeekPodOutcome_FailedIsError(t *testing.T) {
-	p := newPeekTestReader("peek-abc", peekPodFailedJSON, "cat: can't open ...")
-	out, err := p.peekPodOutcome(context.Background(), "peek-abc")
-	if err != nil {
-		t.Fatalf("peekPodOutcome: unexpected error %v", err)
-	}
+	p := newPeekTestReader(peekPodFailedJSON, "cat: can't open ...")
+	out := p.peekPodOutcome(context.Background(), "peek-abc")
 	if !out.error {
 		t.Fatal("a Failed peek pod (container terminated non-zero) must be an error outcome")
 	}
@@ -101,11 +97,8 @@ func TestPeekPodOutcome_FailedIsError(t *testing.T) {
 // TestPeekPodOutcome_SucceededIsNotError verifies that a Succeeded peek pod
 // (container exited 0) is NOT an error outcome (the file was read).
 func TestPeekPodOutcome_SucceededIsNotError(t *testing.T) {
-	p := newPeekTestReader("peek-abc", peekPodSucceededJSON, "step one\n")
-	out, err := p.peekPodOutcome(context.Background(), "peek-abc")
-	if err != nil {
-		t.Fatalf("peekPodOutcome: unexpected error %v", err)
-	}
+	p := newPeekTestReader(peekPodSucceededJSON, "step one\n")
+	out := p.peekPodOutcome(context.Background(), "peek-abc")
 	if out.error {
 		t.Fatal("a Succeeded peek pod (container exited 0) must NOT be an error outcome")
 	}
@@ -118,11 +111,8 @@ func TestPeekPodOutcome_SucceededIsNotError(t *testing.T) {
 // terminal) peek pod is not an error and not terminal (the caller keeps
 // polling).
 func TestPeekPodOutcome_RunningIsNotTerminal(t *testing.T) {
-	p := newPeekTestReader("peek-abc", peekPodRunningJSON, "")
-	out, err := p.peekPodOutcome(context.Background(), "peek-abc")
-	if err != nil {
-		t.Fatalf("peekPodOutcome: unexpected error %v", err)
-	}
+	p := newPeekTestReader(peekPodRunningJSON, "")
+	out := p.peekPodOutcome(context.Background(), "peek-abc")
 	if out.error {
 		t.Fatal("a running peek pod must NOT be an error outcome")
 	}
@@ -135,7 +125,7 @@ func TestPeekPodOutcome_RunningIsNotTerminal(t *testing.T) {
 // (not the container log) when the peek pod ends Failed — the F7 regression.
 // The mutation (return the log as content on a Failed pod) makes this FAIL.
 func TestPeekWorkspaceRead_FailedPodIsError(t *testing.T) {
-	p := newPeekTestReader("peek-abc", peekPodFailedJSON, "cat: can't open '/workspace/.coxswain/PLAN.md': No such file or directory")
+	p := newPeekTestReader(peekPodFailedJSON, "cat: can't open '/workspace/.coxswain/PLAN.md': No such file or directory")
 	_, err := p.Read(context.Background(), "loop1", planPath)
 	if err == nil {
 		t.Fatal("Read with a Failed peek pod: want an error, got nil (the container log must not be returned as content)")
@@ -149,7 +139,7 @@ func TestPeekWorkspaceRead_FailedPodIsError(t *testing.T) {
 // container's stdout (the plan bytes) UNCHANGED when the peek pod succeeds.
 func TestPeekWorkspaceRead_SucceededReturnsLog(t *testing.T) {
 	const planBytes = "step one\nstep two\n" // trailing newline is content
-	p := newPeekTestReader("peek-abc", peekPodSucceededJSON, planBytes)
+	p := newPeekTestReader(peekPodSucceededJSON, planBytes)
 	got, err := p.Read(context.Background(), "loop1", planPath)
 	if err != nil {
 		t.Fatalf("Read: %v", err)

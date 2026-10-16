@@ -274,7 +274,8 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	curIterForPrior := readIteration(cfg.Workspace)
 	curPlanAttemptForPrior := readPlanAttempt(cfg.Workspace)
 	if res, done := priorCompletedResult(
-		filepath.Join(cfg.Workspace, resultDirName, resultFileName), phase, claimIteration(curIterForPrior), curPlanAttemptForPrior,
+		filepath.Join(cfg.Workspace, resultDirName, resultFileName),
+		phase, claimIteration(curIterForPrior), curPlanAttemptForPrior,
 	); done {
 		// S5a (B3): an Implementing success without a headCommit re-commits
 		// (the first run's commit may have failed; the workspace is on the

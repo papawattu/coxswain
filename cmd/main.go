@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -280,6 +281,14 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Cache: cache.Options{
+			// F10: a periodic cache resync re-fires the For(&Loop) source for
+			// every cached Loop, including the deleting ones (deletionTimestamp
+			// set). Without it, a Loop being deleted in a terminating namespace is
+			// never re-triggered (the Owns watches stop firing) and its checkpoint
+			// finalizer is never removed — the namespace is stuck forever (the
+			// dogfood4-df4 repro). Live Loops are re-reconciled too, but the
+			// reconcile is idempotent, so the extra pass is a cheap no-op.
+			SyncPeriod: ptr.To(controller.LoopResyncPeriod),
 			// Scope the Pod and Service cache to the operator's two proxy
 			// components (the model proxy and the egress proxy) so the
 			// operator doesn't cache every Pod and Service in the cluster

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,10 +17,23 @@ import (
 // read a file out of the workspace. The runner image is used because it runs
 // as the same UID as the sandbox (the repo is written by a different UID, and
 // git refuses to operate on a repo it doesn't own).
+// peekWorkspaceReader reads files from a Loop's workspace by running a command
+// in a read-only "peek" pod (a cat command) on the workspace PVC. The kubectl
+// exec functions are injectable fields (defaulting to the real kubectl) so the
+// outcome parsing is testable without a cluster (F7: a failed cat must be an
+// error, never content).
 type peekWorkspaceReader struct {
 	ns          string
 	runnerImage string
 	Loops       LoopClient
+
+	// kubectlCreate / kubectlGet / kubectlLogs / kubectlDelete are the kubectl
+	// exec seams (the test fakes return canned output). They default to the
+	// real kubectl when nil.
+	kubectlCreate func(ctx context.Context, stdin string, args ...string) error
+	kubectlGetFn  func(ctx context.Context, args ...string) (string, error)
+	kubectlLogsFn func(ctx context.Context, args ...string) (string, error)
+	kubectlDelete func(ctx context.Context, args ...string) error
 }
 
 // Read runs `cat <path>` in a read-only peek pod mounted on the
@@ -73,7 +87,7 @@ spec:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
-    command: ["/bin/sh", "-c", "cat %s"]
+    command: ['/bin/sh', '-c', 'cat %s 2>&1 || { echo plan-read-failed-cat-exit-$? >&2; exit 1; }']
     volumeMounts:
     - name: ws
       mountPath: /workspace
@@ -87,54 +101,149 @@ spec:
 
 	// Create from stdin (generateName requires create, not apply). The pod is
 	// created fresh with a unique name each time and cleaned up by label delete.
-	if err := p.kubectl(ctx, manifest, "create", "-f", "-"); err != nil {
+	if err := p.peekKubectlCreate(ctx, manifest, "create", "-f", "-"); err != nil {
 		return "", fmt.Errorf("create peek pod: %w", err)
 	}
 	// Best-effort cleanup: delete the peek pod when we're done (ignore the
 	// error — the pod is short-lived; the delete is by label so the random
 	// generateName suffix is irrelevant).
 	defer func() {
-		_ = p.kubectl(ctx, "", "delete", "pod", "-l", "coxswain.io/plan-peek="+loop, "--wait=false", "--ignore-not-found")
+		_ = p.peekKubectlDelete(ctx, "delete", "pod", "-l", "coxswain.io/plan-peek="+loop, "--wait=false", "--ignore-not-found")
 	}()
 
 	// Find the peek pod's name (generateName appends a random suffix).
-	podName, err := p.kubectlGet(ctx, "get", "pod", "-l", "coxswain.io/plan-peek="+loop,
+	podName, err := p.peekKubectlGet(ctx, "get", "pod", "-l", "coxswain.io/plan-peek="+loop,
 		"-o", "jsonpath={.items[0].metadata.name}")
 	if err != nil || podName == "" {
 		return "", fmt.Errorf("cli: plan peek pod not found for loop %q", loop)
 	}
 
-	// Wait for the peek pod to reach a terminal phase. The `cat` command exits
-	// immediately, so the pod goes Succeeded once the file is read (or Failed if
-	// the file is missing and the shell's exit is non-zero). Poll with a delay up
-	// to a deadline (no back-to-back busy loop): a few 1s checks cover the cat
-	// completing in ~2s, and a truly-stuck pod (scheduling/pull) is caught by
-	// the deadline. A still-Pending pod after the deadline is an error.
+	// Wait for the peek pod to reach a terminal phase and read its outcome. The
+	// `cat` command exits immediately, so the pod goes Succeeded once the file
+	// is read (or Failed if the file is missing or unreadable). Poll with a
+	// delay up to a deadline (no back-to-back busy loop): a few 1s checks cover
+	// the cat completing in ~2s, and a truly-stuck pod (scheduling/pull) is
+	// caught by the deadline. A still-Pending pod after the deadline is an
+	// error.
 	// The B6 run 5/6 found the peek pod takes ~15s to start and fail (image
 	// pull + PVC mount + container start); 8s is too short. 30s covers the
 	// worst case on a slow node.
-	phase := ""
+	outcome, err := p.pollPeekPodOutcome(ctx, podName)
+	if err != nil {
+		return "", err
+	}
+	if outcome.error {
+		// F7 (dogfood 2 finding): a peek pod that ends Failed (or whose
+		// container exited non-zero) is an ERROR, never content. Returning the
+		// container log of a failed cat as the "file content" made cox approve
+		// hash the cat ERROR STRING ("cat: can't open ...") instead of the plan
+		// — three different plans with one approved hash. The exit code is
+		// authoritative: the `cat` wrapper above exits non-zero when the file
+		// is missing or unreadable (or "" when the shell is absent), and 0 only
+		// when the file was read. The termination message (truncated to 4096
+		// bytes by the runtime) carries the shell's stderr for the error text.
+		return "", fmt.Errorf("cli: plan read failed (peek pod %s: phase=%s exit=%s): %s", podName, outcome.phase, outcome.exitCode, firstNonEmpty(outcome.terminationMsg, "the peek pod exited non-zero (file missing or unreadable)"))
+	}
+	// The cat output is the container's stdout, recorded in the pod's log. The
+	// SUCCEEDED bytes are returned UNCHANGED: the approval contract hashes the
+	// exact file bytes (the runner's plan-change check hashes the PLAN.md bytes
+	// it wrote, runner/phase.go planChanged), so no trim — a trailing newline
+	// is part of the hash.
+	out, err := p.peekKubectlLogs(ctx, "logs", podName)
+	if err != nil {
+		return "", fmt.Errorf("read peek pod log: %w", err)
+	}
+	return out, nil
+}
+
+// peekPodOutcome is the outcome of a single read of the peek pod's status.
+// It separates the pod-state parsing (testable without a cluster) from the
+// polling loop (which sleeps). error is true when the pod ended in a state
+// that is NOT a successful cat (phase Failed, or a container that terminated
+// non-zero) — the F7 condition that must never be returned as content.
+type peekPodOutcome struct {
+	phase          string
+	exitCode       string
+	terminationMsg string
+	error          bool
+}
+
+// peekPodOutcome reads the peek pod once and returns its outcome. It does not
+// poll or sleep (the caller does that): one Get, one parse. A pod that has not
+// reached a terminal phase yet (phase "" or Pending, or a not-yet-terminated
+// container) returns error=false with the phase recorded (the caller keeps
+// polling). A pod that ended Failed, or a container that terminated non-zero,
+// returns error=true (the F7 condition).
+func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string) peekPodOutcome {
+	podJSON, _ := p.peekKubectlGet(ctx, "get", "pod", podName, "-o", "json")
+	var pod struct {
+		Status struct {
+			Phase             string `json:"phase"`
+			ContainerStatuses []struct {
+				State struct {
+					Terminated *struct {
+						ExitCode int64  `json:"exitCode"`
+						Message  string `json:"message"`
+					} `json:"terminated"`
+				} `json:"state"`
+			} `json:"containerStatuses"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(podJSON), &pod); err != nil {
+		// A parse failure is NOT an error outcome: the pod exists (the Get
+		// succeeded), its status is just not readable this tick. The caller
+		// keeps polling (phase "" is not terminal).
+		return peekPodOutcome{phase: ""}
+	}
+	out := peekPodOutcome{phase: pod.Status.Phase}
+	if len(pod.Status.ContainerStatuses) > 0 {
+		if t := pod.Status.ContainerStatuses[0].State.Terminated; t != nil {
+			out.exitCode = fmt.Sprint(t.ExitCode)
+			out.terminationMsg = t.Message
+			// A non-zero exit is an error outcome regardless of the pod phase
+			// (the cat wrapper exits non-zero when the file is missing or
+			// unreadable; 0 only on a successful read).
+			if t.ExitCode != 0 {
+				out.error = true
+			}
+		}
+	}
+	if pod.Status.Phase == "Failed" {
+		out.error = true
+	}
+	return out
+}
+
+// pollPeekPodOutcome polls peekPodOutcome up to 30 times (1s apart) until the
+// peek pod reaches a terminal phase (Succeeded or Failed) or its container
+// terminates (an error outcome), then returns the outcome. A still-Pending pod
+// after the deadline is an error.
+func (p *peekWorkspaceReader) pollPeekPodOutcome(ctx context.Context, podName string) (peekPodOutcome, error) {
+	var last peekPodOutcome
 	for range 30 {
-		phase, _ = p.kubectlGet(ctx, "get", "pod", podName, "-o", "jsonpath={.status.phase}")
-		if phase == "Succeeded" || phase == "Failed" {
-			break
+		last = p.peekPodOutcome(ctx, podName)
+		// Stop when the pod is terminal (Succeeded/Failed) or the container has
+		// terminated (an error outcome, e.g. a non-zero exit while the phase is
+		// still settling). A non-terminated, non-terminal pod keeps polling.
+		if last.phase == "Succeeded" || last.phase == "Failed" || last.error {
+			return last, nil
 		}
 		time.Sleep(time.Second)
 	}
-	if phase == "" || phase == "Pending" {
-		return "", fmt.Errorf("cli: plan peek pod did not run (phase=%s, loop %q)", phase, loop)
+	if last.phase == "" || last.phase == "Pending" {
+		return last, fmt.Errorf("cli: plan peek pod did not run (phase=%s)", last.phase)
 	}
-	// The cat output is the container's stdout, recorded in the pod's log.
-	out, err := p.kubectlOut(ctx, "logs", podName)
-	if err != nil {
-		// A missing PLAN.md is the no-plan case (the runner writes it at the
-		// start of the Implementing phase; PLAN.md is optional), not an error.
-		if strings.Contains(err.Error(), "No such file") || strings.Contains(err.Error(), "no such file") {
-			return "", nil
+	return last, nil
+}
+
+// firstNonEmpty returns the first non-empty string (error detail fallbacks).
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
 		}
-		return "", fmt.Errorf("read peek pod log: %w", err)
 	}
-	return strings.TrimSpace(out), nil
+	return ""
 }
 
 // sandboxAgentImage resolves the Loop's sandbox agent image: first the Loop's
@@ -162,6 +271,39 @@ func (p *peekWorkspaceReader) sandboxAgentImage(ctx context.Context, loop string
 }
 
 // kubectl runs a kubectl subcommand, reading stdin when -f - is used.
+// peekKubectlCreate / peekKubectlGet / peekKubectlLogs / peekKubectlDelete are
+// the kubectl exec seams for the peek reader. They default to the real kubectl
+// (the p.kubectl* methods) when the injectable field is nil (production); a
+// test sets the field to return canned output (F7: the outcome parsing must be
+// testable without a cluster).
+func (p *peekWorkspaceReader) peekKubectlCreate(ctx context.Context, stdin string, args ...string) error {
+	if p.kubectlCreate != nil {
+		return p.kubectlCreate(ctx, stdin, args...)
+	}
+	return p.kubectl(ctx, stdin, args...)
+}
+
+func (p *peekWorkspaceReader) peekKubectlGet(ctx context.Context, args ...string) (string, error) {
+	if p.kubectlGetFn != nil {
+		return p.kubectlGetFn(ctx, args...)
+	}
+	return p.kubectlGet(ctx, args...)
+}
+
+func (p *peekWorkspaceReader) peekKubectlLogs(ctx context.Context, args ...string) (string, error) {
+	if p.kubectlLogsFn != nil {
+		return p.kubectlLogsFn(ctx, args...)
+	}
+	return p.kubectlOut(ctx, args...)
+}
+
+func (p *peekWorkspaceReader) peekKubectlDelete(ctx context.Context, args ...string) error {
+	if p.kubectlDelete != nil {
+		return p.kubectlDelete(ctx, args...)
+	}
+	return p.kubectl(ctx, "", args...)
+}
+
 func (p *peekWorkspaceReader) kubectl(ctx context.Context, stdin string, args ...string) error {
 	full := append(append([]string{}, p.kubeArg()...), args...)
 	cmd := exec.CommandContext(ctx, "kubectl", full...)

@@ -862,7 +862,7 @@ type sandboxFailure struct {
 
 func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.Loop) (*sandboxFailure, error) {
 	sb := &sandboxv1beta1.Sandbox{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil // no Sandbox yet (or it is being deleted): no decision
 		}
@@ -1016,7 +1016,7 @@ func (r *LoopReconciler) applySandboxFailure(ctx context.Context, loop *coxv1alp
 // ensureSandbox work).
 func (r *LoopReconciler) DeleteSandboxForRetry(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	sb := &sandboxv1beta1.Sandbox{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false // already gone
 		}
@@ -1047,7 +1047,7 @@ func (r *LoopReconciler) DeleteSandboxForRetry(ctx context.Context, loop *coxv1a
 // or already Terminating (the GC is handling it).
 func (r *LoopReconciler) ReissueSandboxDelete(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	sb := &sandboxv1beta1.Sandbox{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false // gone: nothing to re-issue
 		}

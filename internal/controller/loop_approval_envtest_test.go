@@ -520,24 +520,24 @@ var _ = Describe("B3 plan approval gate", func() {
 			"the operator moved the phase to AwaitingApproval on the successful Planning claim (the hold re-enters; the Loop does NOT rerun Planning forever)")
 	})
 
-	// P2 (dogfood): a rejection that triggers a re-plan refreshes
-	// lastActivityTime so the stall watchdog does not fire on the re-plan's
-	// planning run (the prior plan's lastActivityTime is stale — the stall
-	// timer has been running since the last activity, not since the re-plan
-	// started). The I42b advance pattern is mirrored: the re-plan is fresh
-	// activity.
-	It("P2: a rejection at AwaitingApproval (Replan) refreshes lastActivityTime on the re-plan", func() {
-		ns := "p2-replan-" + nowSuffix()
+	// P1 (reviewer fix): lastActivityTime is NOT refreshed at the rejection.
+	// Stamping at the reject would make the field move on a user action even
+	// if the agent never runs. The refresh happens on the re-plan's
+	// claim-driven advance (recordPhaseClaim), where a new planAttempt claim
+	// signals that the agent actually ran.
+	//
+	// (a) reject alone, with no new claim, leaves lastActivityTime UNCHANGED.
+	It("P1 (a): reject alone, with no new claim, leaves lastActivityTime unchanged", func() {
+		ns := "p2-reject-a-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
-		_, r := makeLoop(ns, "p2-replan", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
-		// Move the Loop to AwaitingApproval with a STALE lastActivityTime
-		// (simulating a prior plan that ran a while ago).
-		staleTime := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+		_, r := makeLoop(ns, "p2-reject-a", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
+		// Move the Loop to AwaitingApproval with a STALE lastActivityTime.
+		staleTime := metav1.NewTime(time.Now().Add(-2 * time.Hour).Truncate(time.Second))
 		loop := &coxv1alpha1.Loop{}
-		nn := types.NamespacedName{Name: "p2-replan", Namespace: ns}
+		nn := types.NamespacedName{Name: "p2-reject-a", Namespace: ns}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
@@ -547,32 +547,103 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
 		// The user rejects the plan (the PlanRejected condition is set).
-		setCondition(ns, "p2-replan", coxv1alpha1.PlanRejectedCondition, "True",
+		setCondition(ns, "p2-reject-a", coxv1alpha1.PlanRejectedCondition, "True",
 			"Rejected: the plan is missing error handling")
 
 		// Reconcile: the gate's applyApprovalGate sees PlanRejected True at
-		// AwaitingApproval + onReject=Replan: it re-plans AND refreshes
-		// lastActivityTime (the P2 fix).
-		reconcileLoop(r, ns, "p2-replan")
+		// AwaitingApproval + onReject=Replan: it re-plans. But the rejection
+		// does NOT refresh lastActivityTime (P1 fix).
+		reconcileLoop(r, ns, "p2-reject-a")
 
 		loop = &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		// The phase is Planning (the re-plan runs now).
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
 			"the re-plan moved the phase to Planning")
-		// P2: lastActivityTime is REFRESHED (not the stale 2h-ago value).
-		// The re-plan is fresh activity — the stall watchdog's timer resets.
+		// P1 (a): lastActivityTime is UNCHANGED (the rejection is a user action,
+		// not agent activity).
 		Expect(loop.Status.Progress).ToNot(BeNil(),
 			"status.progress must be set")
 		Expect(loop.Status.Progress.LastActivityTime).ToNot(BeNil(),
-			"lastActivityTime must be set after the re-plan")
-		staleHours := loop.Status.Progress.LastActivityTime.Time.Sub(staleTime.Time).Hours()
-		Expect(staleHours).To(BeNumerically(">", 1.5),
-			"lastActivityTime must be refreshed (the stale value was 2h ago; the new value is within the last minute)")
-		Expect(loop.Status.Progress.LastActivityTime.Time.Before(staleTime.Time)).To(BeFalse(),
-			"lastActivityTime must be AHEAD of the stale value (the re-plan refreshed it)")
-		// Mutation: remove the P2 refresh block in loop_approval.go (the
-		// lastActivityTime = now lines) and this spec FAILS (lastActivityTime
-		// stays at the stale 2h-ago value, which is BEFORE staleTime, not after).
+			"lastActivityTime must be set")
+		// The API server truncates timestamps to seconds; compare with Truncate.
+		actualTime := loop.Status.Progress.LastActivityTime.Time.Truncate(time.Second)
+		expectedTime := staleTime.Time.Truncate(time.Second)
+		Expect(actualTime.Equal(expectedTime)).To(BeTrue(),
+			"lastActivityTime must be UNCHANGED after a reject with no new claim (the rejection does not refresh it)")
+	})
+
+	// P1 (reviewer fix): a new planAttempt claim refreshes lastActivityTime
+	// on the claim-driven advance (recordPhaseClaim). This is the fix for the
+	// F4 gap: the re-plan's advance did not refresh lastActivityTime because
+	// progressEqual suppressed the write when the claim-derived fields were
+	// the same. Now planAttempt is included in progressEqual, so a re-plan
+	// claim (same phase, iteration, status but a new planAttempt) triggers a
+	// progress write, which refreshes lastActivityTime.
+	//
+	// (b) reject then a new planAttempt claim gives lastActivityTime >= the
+	// claim-processing time.
+	It("P1 (b): reject then a new planAttempt claim refreshes lastActivityTime", func() {
+		ns := "p2-replan-b-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		_, r := makeLoop(ns, "p2-replan-b", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
+		// Move the Loop to AwaitingApproval with a STALE lastActivityTime.
+		staleTime := metav1.NewTime(time.Now().Add(-2 * time.Hour).Truncate(time.Second))
+		loop := &coxv1alpha1.Loop{}
+		nn := types.NamespacedName{Name: "p2-replan-b", Namespace: ns}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.Progress = &coxv1alpha1.ProgressStatus{
+			LastActivityTime: &staleTime,
+		}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// The user rejects the plan (the PlanRejected condition is set).
+		setCondition(ns, "p2-replan-b", coxv1alpha1.PlanRejectedCondition, "True",
+			"Rejected: the plan is missing error handling")
+		reconcileLoop(r, ns, "p2-replan-b")
+
+		// The re-plan moved the phase to Planning.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"the re-plan moved the phase to Planning")
+
+		// Now the runner's re-plan Planning claim arrives (a new planAttempt).
+		// The claim has the same phase, iteration, and status as the prior
+		// plan's claim, but a new planAttempt. This triggers a progress write
+		// (progressEqual now includes planAttempt), which refreshes
+		// lastActivityTime.
+		beforeClaim := metav1.Now().Truncate(time.Second)
+		reportClaim(r, ns, "p2-replan-b", &PhaseClaim{
+			ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+			Status:        "success",
+			Iteration:     1,
+			PlanAttempt:   1, // the re-plan (planAttempt incremented by the reject)
+		})
+
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Progress).ToNot(BeNil(),
+			"status.progress must be set")
+		Expect(loop.Status.Progress.LastActivityTime).ToNot(BeNil(),
+			"lastActivityTime must be set after the re-plan claim")
+		// P1 (b): lastActivityTime is >= the claim-processing time (the agent
+		// actually ran the re-plan).
+		actualTime := loop.Status.Progress.LastActivityTime.Time.Truncate(time.Second)
+		Expect(actualTime.Before(beforeClaim)).To(BeFalse(),
+			"lastActivityTime must be >= the claim-processing time (the re-plan claim refreshed it)")
+		// Mutation: drop the PlanAttempt from progressEqual (revert to comparing
+		// only Phase, LastResultStatus, BlockedReason, Iteration) and this spec
+		// FAILS (the re-plan claim is suppressed by progressEqual, so
+		// lastActivityTime stays at the stale value).
+		//
+		// Mutation: move the stamp back to the reject (loop_approval.go) and
+		// spec (a) FAILS (lastActivityTime is refreshed at the reject, not at
+		// the claim).
 	})
 })

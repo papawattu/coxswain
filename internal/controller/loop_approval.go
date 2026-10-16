@@ -311,15 +311,11 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.PlanAttempt++
-				// P2 (dogfood): refresh lastActivityTime on the re-plan (the
-				// rejection is fresh activity — the stall watchdog must not fire
-				// on the re-plan's planning run just because the prior plan's
-				// lastActivityTime is stale). Mirror the I42b advance pattern.
-				now := metav1.Now()
-				if loop.Status.Progress == nil {
-					loop.Status.Progress = &coxv1alpha1.ProgressStatus{}
-				}
-				loop.Status.Progress.LastActivityTime = &now
+				// Note: lastActivityTime is NOT refreshed here (P1 reviewer fix).
+				// Stamping at the reject would make the field move on a user action
+				// even if the agent never runs. The refresh happens on the re-plan's
+				// claim-driven advance (recordPhaseClaim in loop_s4_phase.go), where
+				// a new planAttempt claim signals that the agent actually ran.
 				changed = true
 			}
 		} else if planApproved {

@@ -400,12 +400,21 @@ func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1
 	// OS1: record the claim into status.progress. The pins (observed
 	// generation / base commit) are the OPERATOR's, never the claim's (a
 	// claim cannot set a pin for itself).
+	// P2 (dogfood) + P1 (reviewer fix): include planAttempt in the progress
+	// record so that a re-plan claim (same phase, iteration, status but a new
+	// planAttempt) triggers a progress write, which refreshes lastActivityTime
+	// on the claim-driven advance. This is the fix for the F4 gap: the
+	// re-plan's advance did not refresh lastActivityTime because
+	// progressEqual suppressed the write when the claim-derived fields were
+	// the same (a re-plan claim has the same phase, iteration, and status as
+	// the prior plan's claim, but a new planAttempt).
 	p := &coxv1alpha1.ProgressStatus{
 		Phase:            claim.ObservedPhase,
 		LastActivityTime: &now,
 		Iteration:        claim.Iteration,
 		LastResultStatus: claim.Status,
 		BlockedReason:    claim.BlockedReason,
+		PlanAttempt:      claim.PlanAttempt,
 	}
 	if loop.Status.Progress == nil || !progressEqual(loop.Status.Progress, p) {
 		// Copy the operator's pins onto the new progress record.
@@ -560,7 +569,8 @@ func progressEqual(a, b *coxv1alpha1.ProgressStatus) bool {
 		return a == b
 	}
 	return a.Phase == b.Phase && a.LastResultStatus == b.LastResultStatus &&
-		a.BlockedReason == b.BlockedReason && a.Iteration == b.Iteration
+		a.BlockedReason == b.BlockedReason && a.Iteration == b.Iteration &&
+		a.PlanAttempt == b.PlanAttempt
 }
 
 // advancePhaseFromClaim (S4) reads the runner's ADR-0004 claim from the

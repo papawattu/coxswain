@@ -743,10 +743,22 @@ if ! grep -qF "$REJECT_REASON" "$EVIDENCE/step1-plan-feedback.txt"; then
 	die "step1 FAILED: the re-plan's .coxswain/plan-feedback does NOT contain the rejection reason (I84: the step is not verified — see $EVIDENCE/step1-plan-feedback.txt)"
 fi
 log step1 "PASS: the re-plan's .coxswain/plan-feedback contains the rejection reason (B3's reason hand-off)"
+# I42b/F4: the re-plan must actually differ from the original plan. A stale
+# claim re-advance (the F4 defect) would produce an IDENTICAL plan (no new
+# inference ran). Capture plan-2 and assert it differs from plan-1.
+peek_pvc_file "$MANUAL_LOOP" ".coxswain/PLAN.md" "$EVIDENCE/step1-plan-2.md"
+if diff -q "$EVIDENCE/step1-plan-1.md" "$EVIDENCE/step1-plan-2.md" >/dev/null 2>&1; then
+	die "step1 FAILED: the re-plan is IDENTICAL to the original plan (no new inference ran — the stale Planning claim re-advanced; see $EVIDENCE/step1-plan-1.md and $EVIDENCE/step1-plan-2.md)"
+fi
+diff "$EVIDENCE/step1-plan-1.md" "$EVIDENCE/step1-plan-2.md" >"$EVIDENCE/step1-plan-diff.txt" 2>&1 || true
+log step1 "PASS: the re-plan differs from the original plan (I42b/F4: the re-plan is a real re-plan, not a stale-claim re-advance; diff: $EVIDENCE/step1-plan-diff.txt)"
 {
 	echo "reject-reason: $REJECT_REASON"
 	echo "plan-feedback-file: $EVIDENCE/step1-plan-feedback.txt"
 	echo "plan-feedback contains the reason: yes (grep -qF matched)"
+	echo "plan-1-file: $EVIDENCE/step1-plan-1.md"
+	echo "plan-2-file: $EVIDENCE/step1-plan-2.md"
+	echo "plan-1 != plan-2: yes (diff -q matched)"
 } >"$EVIDENCE/step1-verify.txt"
 # Approve the SECOND plan (B3: the CLI computes the plan's SHA-256 and sets
 # PlanApproved with it; the operator advances to Implementing). The CLI's

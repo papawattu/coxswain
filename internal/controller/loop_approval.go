@@ -311,6 +311,15 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.PlanAttempt++
+				// P2 (dogfood): refresh lastActivityTime on the re-plan (the
+				// rejection is fresh activity — the stall watchdog must not fire
+				// on the re-plan's planning run just because the prior plan's
+				// lastActivityTime is stale). Mirror the I42b advance pattern.
+				now := metav1.Now()
+				if loop.Status.Progress == nil {
+					loop.Status.Progress = &coxv1alpha1.ProgressStatus{}
+				}
+				loop.Status.Progress.LastActivityTime = &now
 				changed = true
 			}
 		} else if planApproved {

@@ -3898,6 +3898,23 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	agentPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
 	}
+	// F8 (dogfood 2 finding): the verify and deliver Job pods ALSO traverse the
+	// egress proxy (D61, I42d: the clone-base init container fetches an external
+	// repo through the proxy). Their labels are coxswain.io/verify-for=<loop> /
+	// coxswain.io/deliver-for=<loop> (they carry NO app.kubernetes.io/component
+	// = agent label), so the agent-only ingress peer above does not admit them
+	// and the proxy times out the clone-base fetch (the F8 dogfood: verify stuck
+	// in Verifying, clone-base exit 128). Admit the verify + deliver pods (by
+	// their for-label) so the proxy can accept their traffic. (The D61 proof
+	// passed only because the D61 VM's egress proxy netpol did not apply the
+	// agent-only ingress restriction to the verify pod in the same way the
+	// kind-coxswain-snap build does; the agent-only peer is the defect.)
+	verifyPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{verifyForLabel: loopName}},
+	}
+	deliverPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{deliverForLabel: loopName}},
+	}
 	// I42c: the agent's egress to the egress proxy is expected only when the
 	// egress proxy is expected (network allows present); with no network
 	// allows the agent's egress stays model-proxy + DNS (D34).
@@ -4101,7 +4118,11 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 				Ingress: []networkingv1.NetworkPolicyIngressRule{
 					{
-						From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+						// F8 (dogfood 2 finding): admit the agent AND the verify/deliver
+						// Job pods (the latter also traverse the proxy, D61/I42d). The
+						// agent-only peer blocked the verify clone-base fetch (the F8
+						// dogfood: verify stuck in Verifying, clone-base exit 128).
+						From:  []networkingv1.NetworkPolicyPeer{agentPeer, verifyPeer, deliverPeer},
 						Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(egressProxyPort), Protocol: new(corev1.ProtocolTCP)}},
 					},
 				},

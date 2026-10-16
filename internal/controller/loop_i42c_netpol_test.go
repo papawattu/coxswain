@@ -20,7 +20,10 @@ package controller
 // egress proxy when the egress proxy is expected (the effective AgentPolicy has
 // network allows); with no network allows the agent's egress rules stay
 // model-proxy + DNS only. A NEW NetworkPolicy is created for the egress proxy
-// pod (<loop>-egress-proxy-netpol): ingress only from this Loop's agent on 3128,
+// pod (<loop>-egress-proxy-netpol): ingress from this Loop's agent AND the
+// verify/deliver Job pods on 3128 (the verify/deliver clone-base fetch also
+// traverses the proxy, D61/I42d; F8 dogfood finding: the agent-only peer
+// blocked the verify fetch),
 // and egress to the external world with carve-outs (0.0.0.0/0 minus the
 // RFC1918/loopback/link-local/multicast/reserved ranges plus the cluster's
 // POD_CIDR and SERVICE_CIDR) + the v6 mirror, plus DNS to kube-dns. The
@@ -284,13 +287,40 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		Expect(np.Spec.PolicyTypes).To(ContainElement(networkingv1.PolicyTypeIngress))
 		Expect(np.Spec.PolicyTypes).To(ContainElement(networkingv1.PolicyTypeEgress))
 
-		// Ingress: only from this Loop's agent on 3128/TCP.
+		// Ingress: from this Loop's agent AND the verify/deliver Job pods on
+		// 3128/TCP. F8 (dogfood 2 finding): the verify and deliver Job pods ALSO
+		// traverse the egress proxy (D61/I42d clone-base fetch), but their labels
+		// (coxswain.io/verify-for / coxswain.io/deliver-for) are NOT the agent's
+		// app.kubernetes.io/component=agent label, so the agent-only ingress peer
+		// blocked the verify clone-base fetch (verify stuck in Verifying,
+		// clone-base exit 128). The fix admits all three (agent + verify +
+		// deliver) on 3128/TCP.
 		Expect(np.Spec.Ingress).To(HaveLen(1))
 		ing := np.Spec.Ingress[0]
-		Expect(ing.From).To(HaveLen(1))
-		Expect(ing.From[0].PodSelector).ToNot(BeNil())
-		Expect(ing.From[0].PodSelector.MatchLabels).To(HaveKeyWithValue("coxswain.io/loop", "eg-np"))
-		Expect(ing.From[0].PodSelector.MatchLabels).To(HaveKeyWithValue("app.kubernetes.io/component", "agent"))
+		Expect(ing.From).To(HaveLen(3), "ingress must admit agent + verify + deliver pods")
+		// The agent peer (component=agent, coxswain.io/loop).
+		agentFound := false
+		// The verify peer (coxswain.io/verify-for).
+		verifyFound := false
+		// The deliver peer (coxswain.io/deliver-for).
+		deliverFound := false
+		for _, from := range ing.From {
+			if from.PodSelector == nil {
+				continue
+			}
+			if from.PodSelector.MatchLabels["app.kubernetes.io/component"] == "agent" && from.PodSelector.MatchLabels["coxswain.io/loop"] == "eg-np" {
+				agentFound = true
+			}
+			if from.PodSelector.MatchLabels["coxswain.io/verify-for"] == "eg-np" {
+				verifyFound = true
+			}
+			if from.PodSelector.MatchLabels["coxswain.io/deliver-for"] == "eg-np" {
+				deliverFound = true
+			}
+		}
+		Expect(agentFound).To(BeTrue(), "ingress must admit the agent pod")
+		Expect(verifyFound).To(BeTrue(), "ingress must admit the verify Job pod (F8)")
+		Expect(deliverFound).To(BeTrue(), "ingress must admit the deliver Job pod (F8)")
 		found3128 := false
 		for _, p := range ing.Ports {
 			if p.Port.IntValue() == int(i42cEgressProxyPort) && p.Protocol != nil && *p.Protocol == corev1.ProtocolTCP {

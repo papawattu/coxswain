@@ -1588,7 +1588,7 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 			SizeLimit: newLimit("350Mi"),
 		}}},
 		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-			SizeLimit: newLimit("100Mi"),
+			SizeLimit: tmpSizeLimit(loop),
 		}}},
 	}
 	// S3a (ADR-0006): the git credential Secret is a volume on the sandbox
@@ -2039,6 +2039,19 @@ func newLimit(q string) *resource.Quantity {
 	p := new(resource.Quantity)
 	*p = resource.MustParse(q)
 	return p
+}
+
+// tmpSizeLimit returns the /tmp emptyDir sizeLimit for the agent container
+// (F5, dogfood: the default 100Mi is too small for agentic work). When the
+// Loop's spec.agent.tmpSizeLimit is set, it uses that value; otherwise it
+// falls back to the platform default (100Mi). The value is validated by the
+// CRD schema (pattern: ^[0-9]+(Mi|Gi|T)?$), so a malformed value is rejected
+// at admission — no runtime error here.
+func tmpSizeLimit(loop *coxv1alpha1.Loop) *resource.Quantity {
+	if loop.Spec.Agent.TmpSizeLimit != "" {
+		return newLimit(loop.Spec.Agent.TmpSizeLimit)
+	}
+	return newLimit("100Mi")
 }
 
 // nextPhase is the operator's *claim-driven* phase-transition table (B1). It

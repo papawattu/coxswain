@@ -590,6 +590,19 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded || loop.Status.Phase == coxv1alpha1.LoopPhaseFailed {
 		return false, false, ""
 	}
+	// F6 (review follow-up): the AgentFailed condition is cleared to
+	// False/Recovered on ANY valid fresh claim — BEFORE the other early
+	// returns (the Verifying hold, the exhausted-failure terminal phase,
+	// the F6 failure path). A fresh claim is evidence the agent recovered
+	// from a prior sandbox failure (the pod that failed without a claim is
+	// gone, its replacement is doing the work), so a healthy Loop must not
+	// still show AgentFailed=True (the API doc promise on AgentFailedCondition).
+	// A no-op when the condition is absent (the common path: no failure ever
+	// happened); it does NOT change the phase machine (ADR-0005: the claim
+	// channel is the only thing that advances).
+	if changedByClear := clearRecoveredCondition(loop, sandboxFailedCondition); changedByClear {
+		changed = true
+	}
 	// F6: a sandbox pod that FAILED without a phase claim (evicted, OOMKilled,
 	// or the agent container terminated without a claim — the dogfood F6:
 	// the EmptyDir /tmp sizeLimit eviction left the Loop silently stuck in
@@ -921,12 +934,30 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 	if term == nil {
 		term = agent.LastTerminationState.Terminated
 	}
+	// The pod-level status (pod.status.reason / the pod condition message)
+	// carries the KUBELET's word for the failure — on an eviction the
+	// reason is "Evicted" and the condition message is "Usage of EmptyDir
+	// volume tmp exceeds the limit 100Mi" — while the container's
+	// termination reason is the coarser "Error" (exit 137). Prefer the
+	// pod-level reason/message when set; fall back to the container's
+	// (the doc promise on AgentFailedCondition — its reason is the
+	// termination reason, its message the kubelet message).
+	reason, message := term.Reason, term.Message
+	if podReason, podMsg := podConditionMessage(pod); podReason != "PodFailed" {
+		reason = podReason
+		if podMsg != "" {
+			message = podMsg
+		}
+	}
+	if pod.Status.Reason != "" {
+		reason = pod.Status.Reason
+	}
 	return &sandboxFailure{
 		sandboxUID: sb.UID,
 		container:  agent.Name,
-		reason:     term.Reason,
+		reason:     reason,
 		exitCode:   term.ExitCode,
-		message:    term.Message,
+		message:    message,
 		podFailed:  true,
 	}, nil
 }
@@ -1094,6 +1125,29 @@ func sandboxFailureMessage(f *sandboxFailure) string {
 		s += ": " + truncate(s4ClaimMaxBytes, f.message)
 	}
 	return s
+}
+
+// clearRecoveredCondition is the operator's "recovered" clear for a SURFACE
+// condition the operator itself sets (AgentFailed — F6): it upserts the
+// condition to False / Recovered, and returns false (a no-op) when the
+// condition is absent or already False. Unlike clearCondition (which removes
+// a user-set condition), the recovered state is left in place as the audit
+// record that the Loop recovered (the I90 visibility: the condition's
+// LastTransitionTime is when the recovery was observed).
+func clearRecoveredCondition(loop *coxv1alpha1.Loop, condType string) bool {
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == condType {
+			if loop.Status.Conditions[i].Status != metav1.ConditionTrue {
+				return false // absent or already False: no change
+			}
+			loop.Status.Conditions[i].Status = metav1.ConditionFalse
+			loop.Status.Conditions[i].Reason = "Recovered"
+			loop.Status.Conditions[i].Message = "the agent recovered from the sandbox failure (a fresh phase claim arrived)"
+			loop.Status.Conditions[i].LastTransitionTime = metav1.Now()
+			return true
+		}
+	}
+	return false // absent: a no-op
 }
 
 // agentContainerStatus returns the agent container's status (nil when the

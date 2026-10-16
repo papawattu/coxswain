@@ -1220,11 +1220,13 @@ const (
 	// is deciding what to do about a sandbox pod that FAILED without a phase
 	// claim (evicted, OOMKilled, or the agent container terminated without a
 	// claim — the silent-Planning wedge F6 fixes). The condition's reason is
-	// the container's termination reason (Evicted / Error / OOMKilled / …) and
-	// its message carries the kubelet message ("Usage of EmptyDir volume tmp
-	// exceeds the limit 100Mi"). It is cleared (removed) once the Loop
-	// advances past the failure (a fresh claim arrives) or the bounded retry
-	// is exhausted (the distinct SandboxFailed Failed-condition carries the
+	// the pod's failure reason (Evicted / OOMKilled / Error / … — the
+	// pod.status.reason / pod condition reason when set, falling back to the
+	// container's termination reason) and its message carries the kubelet
+	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi").
+	// It is set to False / Recovered once the Loop advances past the failure
+	// (a fresh phase claim arrives) and removed once the bounded retry is
+	// exhausted (the distinct SandboxFailed Failed-condition carries the
 	// durable record). The condition is a SURFACE (I90), not a gate input:
 	// the phase machine does not read it (ADR-0005 is preserved — the only
 	// thing that advances the phase is a valid claim).

@@ -938,6 +938,45 @@ type LoopStatus struct {
 	// the operator's Replan branch; the phase-init reads it. The runner never
 	// writes it (ADR-0004: the operator is the sole writer of status). +optional
 	Approval *ApprovalStatus `json:"approval,omitempty"`
+
+	// agent is the operator's record of the sandbox pod's infrastructure state
+	// (F6, dogfood finding): the attempt count for a sandbox pod that FAILED
+	// without a claim (evicted, OOMKilled, or the agent container terminated
+	// without a claim — a pod failure, not the agent's work) and the Sandbox
+	// UID the last counted failure was read from (the "one attempt per
+	// Sandbox UID" guard, exactly the I65 P1-A infraJobUID pattern). nil until
+	// the first counted sandbox failure. Written by the operator only.
+	// +optional
+	Agent *AgentStatus `json:"agent,omitempty"`
+}
+
+// AgentStatus is the operator's record of the sandbox pod's infra-failure
+// retry state (F6). It mirrors VerifyStatus.infraAttempts/infraJobUID: the
+// bounded, visible retry for a sandbox pod that failed without a phase claim.
+// The pod's workspace survives on the PVC (the workspace volume is the
+// per-Loop <loop>-workspace PVC), so a recreation re-clones/continues from
+// the same state — the retry is a fresh Sandbox (the operator never mutates
+// a running one), and an exhausted bound fails the Loop with the distinct
+// SandboxFailed reason.
+type AgentStatus struct {
+	// infraAttempts is the number of sandbox pods the operator has counted as
+	// failed-without-a-claim for the current Sandbox generation (F6). The
+	// operator recreates the Sandbox a bounded number of times (the
+	// sandboxInfraRetries cap, the controller's constant) and fails the Loop
+	// with the SandboxFailed reason once the bound is exhausted.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	InfraAttempts int32 `json:"infraAttempts,omitempty"`
+
+	// infraSandboxUID is the UID of the Sandbox whose failed pod was most
+	// recently counted into infraAttempts (F6, the I65 P1-A UID guard): the
+	// operator increments infraAttempts only when the failing Sandbox's UID
+	// differs from the one recorded here. A recreated Sandbox has a new UID,
+	// so its first counted failure IS counted (the retry), while a re-read of
+	// the SAME failing Sandbox does not double-count. An empty value means no
+	// attempt has been counted yet.
+	// +optional
+	InfraSandboxUID string `json:"infraSandboxUID,omitempty"`
 }
 
 // ApprovalStatus is the operator's record of the plan-approval state (B3,
@@ -1192,6 +1231,21 @@ const (
 	// backend timed out after bounded retries. It is set back to True when
 	// a subsequent claim succeeds (the model recovered).
 	ModelAvailableCondition = "ModelAvailable"
+	// AgentFailedCondition (F6, dogfood finding) is True while the operator
+	// is deciding what to do about a sandbox pod that FAILED without a phase
+	// claim (evicted, OOMKilled, or the agent container terminated without a
+	// claim — the silent-Planning wedge F6 fixes). The condition's reason is
+	// the pod's failure reason (Evicted / OOMKilled / Error / … — the
+	// pod.status.reason / pod condition reason when set, falling back to the
+	// container's termination reason) and its message carries the kubelet
+	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi").
+	// It is set to False / Recovered once the Loop advances past the failure
+	// (a fresh phase claim arrives) and removed once the bounded retry is
+	// exhausted (the distinct SandboxFailed Failed-condition carries the
+	// durable record). The condition is a SURFACE (I90), not a gate input:
+	// the phase machine does not read it (ADR-0005 is preserved — the only
+	// thing that advances the phase is a valid claim).
+	AgentFailedCondition = "AgentFailed"
 	// CheckpointsAvailableCondition (B1, D59) records whether volume-snapshot
 	// checkpoints are possible for this Loop. True + reason Available = the
 	// VolumeSnapshot CRD exists and the workspace PVC's CSI driver has a

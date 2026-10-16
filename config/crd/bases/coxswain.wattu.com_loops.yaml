@@ -534,6 +534,37 @@ spec:
           status:
             description: status defines the observed state of Loop
             properties:
+              agent:
+                description: |-
+                  agent is the operator's record of the sandbox pod's infrastructure state
+                  (F6, dogfood finding): the attempt count for a sandbox pod that FAILED
+                  without a claim (evicted, OOMKilled, or the agent container terminated
+                  without a claim — a pod failure, not the agent's work) and the Sandbox
+                  UID the last counted failure was read from (the "one attempt per
+                  Sandbox UID" guard, exactly the I65 P1-A infraJobUID pattern). nil until
+                  the first counted sandbox failure. Written by the operator only.
+                properties:
+                  infraAttempts:
+                    description: |-
+                      infraAttempts is the number of sandbox pods the operator has counted as
+                      failed-without-a-claim for the current Sandbox generation (F6). The
+                      operator recreates the Sandbox a bounded number of times (the
+                      sandboxInfraRetries cap, the controller's constant) and fails the Loop
+                      with the SandboxFailed reason once the bound is exhausted.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  infraSandboxUID:
+                    description: |-
+                      infraSandboxUID is the UID of the Sandbox whose failed pod was most
+                      recently counted into infraAttempts (F6, the I65 P1-A UID guard): the
+                      operator increments infraAttempts only when the failing Sandbox's UID
+                      differs from the one recorded here. A recreated Sandbox has a new UID,
+                      so its first counted failure IS counted (the retry), while a re-read of
+                      the SAME failing Sandbox does not double-count. An empty value means no
+                      attempt has been counted yet.
+                    type: string
+                type: object
               approval:
                 description: |-
                   approval is the operator's record of the plan-approval state (B3,

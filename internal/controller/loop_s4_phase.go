@@ -873,6 +873,19 @@ type sandboxFailure struct {
 	podFailed  bool
 }
 
+// The F6 claim-wins check: the agent's own claim (its termination message)
+// is the ADR-0004 channel, and a VALID claim is evidence the phase advanced
+// even when the pod also ended up Failed. The envtest race (reviewer,
+// 13:04): the agent exited 0 with a valid claim at about the same moment the
+// kubelet evicted the pod for the EmptyDir overrun — the pod is Failed
+// (Evicted) AND the claim is valid. The claim WINS: this is not a sandbox
+// infrastructure failure, the advance path proceeds. A malformed/absent
+// claim does not win (the failure surfaces, ADR-0005 fail-closed).
+func (r *LoopReconciler) hasValidSandboxClaim(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	claim, cerr := r.resolvePhaseClaim(ctx, loop)
+	return cerr == nil && claim != nil
+}
+
 func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.Loop) (*sandboxFailure, error) {
 	reader := r.apiReader
 	if reader == nil {
@@ -911,7 +924,7 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 		// registered — e.g. a workspace init failure): still a failed pod with
 		// no claim; the decision below is the same (surface + retry) but the
 		// condition names the pod-level reason instead of a container's.
-		podReason, podMsg := podConditionMessage(pod)
+		podReason, podMsg := podStatusMessage(pod)
 		return &sandboxFailure{
 			sandboxUID: sb.UID,
 			container:  "<pod>",
@@ -926,31 +939,39 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 	if agent.State.Terminated == nil && agent.LastTerminationState.Terminated == nil {
 		return nil, nil
 	}
+	// The agent container terminated: if the termination carried a VALID
+	// claim, the claim wins (ADR-0004: the claim channel is the only thing
+	// that advances) and this is NOT a sandbox infrastructure failure —
+	// the evict-and-exit race the reviewer observed (the agent exited 0 at
+	// about the same moment as the kubelet eviction) advances the Loop
+	// instead of retrying the sandbox. A malformed or absent claim is no
+	// claim: the F6 failure stands.
+	if r.hasValidSandboxClaim(ctx, loop) {
+		return nil, nil
+	}
 	// The agent container terminated WITHOUT a valid claim: this is the
 	// failure the F6 check is for (the claim reader already returned nothing
-	// or a malformed claim — the call site is advancePhaseFromClaim's
-	// claim-read-pending path). Surface the container's termination evidence.
+	// or a malformed claim). Surface the container's termination evidence.
 	term := agent.State.Terminated
 	if term == nil {
 		term = agent.LastTerminationState.Terminated
 	}
-	// The pod-level status (pod.status.reason / the pod condition message)
-	// carries the KUBELET's word for the failure — on an eviction the
-	// reason is "Evicted" and the condition message is "Usage of EmptyDir
-	// volume tmp exceeds the limit 100Mi" — while the container's
-	// termination reason is the coarser "Error" (exit 137). Prefer the
-	// pod-level reason/message when set; fall back to the container's
-	// (the doc promise on AgentFailedCondition — its reason is the
-	// termination reason, its message the kubelet message).
+	// The pod-level status carries the KUBELET's word for the failure — on
+	// an eviction the kubelet sets pod.status.reason="Evicted" and
+	// pod.status.message ("Usage of EmptyDir volume tmp exceeds the limit
+	// 100Mi") while the container's termination reason is the coarser
+	// "Error" (exit 137). Prefer the pod status when set; fall back to the
+	// container's (the doc promise on AgentFailedCondition — its reason is
+	// the termination reason, its message the kubelet message). A
+	// DisruptionTarget/TerminationByKubelet condition message is a secondary
+	// source for the kubelet text (its Status=True marks the target, not a
+	// failure condition, so it is never scanned as one).
 	reason, message := term.Reason, term.Message
-	if podReason, podMsg := podConditionMessage(pod); podReason != "PodFailed" {
+	if podReason, podMsg := podStatusMessage(pod); podReason != podFailedReason {
 		reason = podReason
 		if podMsg != "" {
 			message = podMsg
 		}
-	}
-	if pod.Status.Reason != "" {
-		reason = pod.Status.Reason
 	}
 	return &sandboxFailure{
 		sandboxUID: sb.UID,
@@ -1161,19 +1182,37 @@ func agentContainerStatus(pod *corev1.Pod) *corev1.ContainerStatus {
 	return nil
 }
 
-// podConditionMessage returns the pod-level failure evidence: the first
-// pod condition whose Status is not True (the failure condition, e.g.
-// ContainersReady=False) with its reason + message. An empty (reason, "")
-// pair when no such condition exists (the caller still treats the pod as
-// failed — pod.Status.Phase is the primary signal).
-func podConditionMessage(pod *corev1.Pod) (string, string) {
-	for i := range pod.Status.Conditions {
-		c := &pod.Status.Conditions[i]
-		if c.Status != corev1.ConditionTrue && c.Reason != "" {
-			return c.Reason, c.Message
+const podFailedReason = "PodFailed"
+
+// podStatusMessage returns the pod-level failure evidence from the POD
+// STATUS (the kubelet's own words): pod.status.reason ("Evicted", "Low
+// on ephemeral-storage", ...) and pod.status.message ("Usage of EmptyDir
+// volume tmp exceeds the limit 100Mi") when set. A DisruptionTarget
+// condition set to TerminationByKubelet (Status=True — it marks the pod as
+// a disruption target, not a failure condition) is a SECONDARY source for
+// the message only; the generic failure conditions (Ready=False/PodFailed,
+// ContainersReady=False) carry no message and are deliberately NOT scanned
+// (a real failed pod's Ready condition is reason PodFailed with an empty
+// message — scanning it would hide the kubelet text). The caller still
+// treats the pod as failed — pod.Status.Phase is the primary signal.
+func podStatusMessage(pod *corev1.Pod) (string, string) {
+	reason := podFailedReason
+	if pod.Status.Reason != "" {
+		reason = pod.Status.Reason
+	}
+	message := pod.Status.Message
+	if message == "" {
+		for i := range pod.Status.Conditions {
+			c := &pod.Status.Conditions[i]
+			if c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue && c.Reason == "TerminationByKubelet" {
+				message = c.Message
+				if reason == podFailedReason {
+					reason = "Evicted"
+				}
+			}
 		}
 	}
-	return "PodFailed", ""
+	return reason, message
 }
 
 // truncate caps s to n bytes (the I90 condition/Event messages must stay

@@ -255,21 +255,69 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		f6PlantSandboxAndPodPodStatusFn(ns, name)
 		loop := &cov.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
-		// Mutation: remove the pod-level override in sandboxFailure
-		// (loop_s4_phase.go — the reason/message that prefers the pod's
-		// status over the container's) and this spec FAILS (reason is
-		// "Error", not "Evicted").
+		// Mutation: drop the pod.Status.Message read in sandboxFailure
+		// (loop_s4_phase.go — podStatusMessage) and this spec FAILS (the
+		// message is empty: the failure conditions carry no message and the
+		// DisruptionTarget message is the bare "Evicted", not the EmptyDir
+		// text).
 		f, err := r.sandboxFailure(ctx, loop)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(f).ToNot(BeNil(), "the failed pod must be detected")
 		Expect(f.reason).To(Equal("Evicted"), "the pod-level reason must win over the container's Error")
-		Expect(f.message).To(ContainSubstring("EmptyDir volume tmp"), "the kubelet message must be carried")
+		Expect(f.message).To(ContainSubstring("Usage of EmptyDir volume"), "the kubelet's pod.status.message must be carried")
 		// And the condition carries it.
 		r.applySandboxFailure(ctx, loop, f)
 		cond := findConditionFn(loop.Status.Conditions, cov.AgentFailedCondition)
 		Expect(cond).ToNot(BeNil())
 		Expect(cond.Reason).To(Equal("Evicted"))
-		Expect(cond.Message).To(ContainSubstring("EmptyDir volume tmp"))
+		Expect(cond.Message).To(ContainSubstring("Usage of EmptyDir volume"))
+	})
+
+	// The evict-and-exit race (reviewer, 13:04): the agent exits 0 with a
+	// valid claim at about the same moment the kubelet evicts the pod for
+	// the EmptyDir overrun. The pod is Failed (Evicted) AND the claim is
+	// valid. The claim WINS (ADR-0004: the claim channel is the only thing
+	// that advances): sandboxFailure returns nil, and advancePhaseFromClaim
+	// advances the phase machine instead of surfacing an AgentFailed failure.
+	It("does NOT treat an evicted pod as an infra failure when the agent already terminated with a valid claim (the claim wins, the race is defined)", func() {
+		const ns, name = "f6-race-ns", "f6-race"
+		r := f6NewReconciler(ns, name)
+		f6PlantSandboxAndPodPodStatusFn(ns, name) // the real kubelet Evicted shape
+		// The agent's valid claim (exit 0) — the race: it terminated with a
+		// valid claim at about the same moment the pod went Failed/Evicted.
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, pod)).To(Succeed())
+		pod.Status.ContainerStatuses[0].State.Terminated = &corev1.ContainerStateTerminated{
+			ExitCode: 0,
+			Reason:   "Completed",
+			Message:  `{"observedPhase":"Planning","status":"success","headCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		}
+		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
+		loop := &cov.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		// Mutation: drop the hasValidSandboxClaim claim-wins check in
+		// sandboxFailure (loop_s4_phase.go) and this spec FAILS at the
+		// sandboxFailure assertion (the evicted pod surfaces as an AgentFailed
+		// failure instead of being skipped).
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(f).To(BeNil(), "a valid claim wins over the Failed/Evicted pod (no infra failure)")
+		// And the advance path proceeds: no AgentFailed condition.
+		Expect(findConditionFn(loop.Status.Conditions, cov.AgentFailedCondition)).To(BeNil(), "no AgentFailed condition (the claim won)")
+		// The race is a defined behaviour: the claim channel is the ONLY thing
+		// that advances (ADR-0004), so the advance path (advancePhaseFromClaim
+		// with a valid Planning claim on a Planning Loop) must run and advance
+		// to Implementing, not surface an infra failure.
+		loopIn := &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID(name + "-uid")},
+			Spec:       loop.Spec,
+			Status:     cov.LoopStatus{Phase: cov.LoopPhasePlanning},
+		}
+		_, changed, advancedFrom := r.advancePhaseFromClaim(ctx, loopIn)
+		Expect(advancedFrom).To(Equal(cov.LoopPhasePlanning), "the claim advanced the phase (the race is a defined behaviour)")
+		Expect(changed).To(BeTrue())
+		Expect(loopIn.Status.Phase).To(Equal(cov.LoopPhaseImplementing))
+		Expect(findConditionFn(loopIn.Status.Conditions, cov.AgentFailedCondition)).To(BeNil(), "no AgentFailed condition after the advance")
 	})
 
 	// The fallback: a failed pod WITHOUT a pod-level condition (no
@@ -418,11 +466,17 @@ var _ = Describe("F6 wiring: advancePhaseFromClaim invokes sandbox failure handl
 	})
 })
 
-// f6PlantSandboxAndPodPodStatusFn creates the Sandbox CR + a failed pod that
-// carries the POD-LEVEL status (pod.status.reason "Evicted" + the pod
-// condition with the kubelet message) while the container termination
-// reason is the coarser "Error" (the kind repro: the operator saw "reason
-// Error, exit 137" in the condition, not the kubelet's Evicted word).
+// f6PlantSandboxAndPodPodStatusFn creates the Sandbox CR + a failed pod in
+// the REAL KUBELET eviction shape: status.phase=Failed, status.reason=
+// "Evicted", status.message with the kubelet's EmptyDir text, conditions
+// Ready=False/ContainersNotReady, ContainersReady=False/PodFailed (no
+// messages — a scan of failure conditions would return "no message" on this
+// pod) and DisruptionTarget=True/TerminationByKubelet (the kubelet's
+// secondary eviction word, Status=True), with the agent container terminated
+// exitCode 137 reason Error (the coarser container-level word). The spec
+// asserts the AgentFailed reason is Evicted and the message carries the
+// kubelet's EmptyDir text — the P1 fix reads these from the pod STATUS, not
+// a failure-condition scan.
 func f6PlantSandboxAndPodPodStatusFn(ns, name string) {
 	sb := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-sb-uid")},
@@ -448,14 +502,14 @@ func f6PlantSandboxAndPodPodStatusFn(ns, name string) {
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 	pod.Status = corev1.PodStatus{
-		Phase:  corev1.PodFailed,
-		Reason: "Evicted", // pod.status.reason: the kubelet's word
-		Conditions: []corev1.PodCondition{{
-			Type:    corev1.PodInitialized,
-			Status:  corev1.ConditionFalse,
-			Reason:  "Evicted",
-			Message: "Usage of EmptyDir volume tmp exceeds the limit 100Mi",
-		}},
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",                                                        // pod.status.reason: the kubelet's word
+		Message: "Usage of EmptyDir volume \"tmp\" exceeds the limit \"100Mi\". ", // pod.status.message: the kubelet's message
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady"},
+			{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, Reason: "PodFailed"},
+			{Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue, Reason: "TerminationByKubelet", Message: "Evicted"},
+		},
 		ContainerStatuses: []corev1.ContainerStatus{{
 			Name: "agent",
 			State: corev1.ContainerState{

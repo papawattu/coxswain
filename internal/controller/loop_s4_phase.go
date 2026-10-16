@@ -605,7 +605,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		claimReadPending = true
 	} else if f != nil {
 		changed = r.applySandboxFailure(ctx, loop, f)
-		return changed, false, ""
+		return false, changed, ""
 	}
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
 		// Verifying is evidence-gated (B3, S5): the runner does NOT execute
@@ -861,16 +861,24 @@ type sandboxFailure struct {
 }
 
 func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.Loop) (*sandboxFailure, error) {
+	reader := r.apiReader
+	if reader == nil {
+		// No APIReader wired (a bare test reconciler without
+		// SetupWithManager): fall back to the cached client. If THAT is also
+		// nil (the S5a discard spec builds the reconciler with no client at
+		// all — only the readPhaseClaim seam), there is no reader: no
+		// decision (the F6 check is a no-op for a bare reconciler).
+		if r.Client == nil {
+			return nil, nil
+		}
+		reader = r
+	}
 	sb := &sandboxv1beta1.Sandbox{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil // no Sandbox yet (or it is being deleted): no decision
 		}
 		return nil, err
-	}
-	reader := r.apiReader
-	if reader == nil {
-		reader = r // no APIReader wired (bare test reconciler): the cached client
 	}
 	pod := &corev1.Pod{}
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, pod); err != nil {

@@ -98,69 +98,10 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		return r
 	}
 
-	// f6PlantSandboxAndPod creates the Sandbox CR + a failed pod (the F6
-	// failure signature). The pod status is set via the status subresource
-	// (Create does NOT set status in envtest).
-	f6PlantSandboxAndPod := func(ns, name string) {
-		sbUID := types.UID(name + "-sb-uid")
-		sb := &sandboxv1beta1.Sandbox{
-			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: sbUID},
-			Spec: sandboxv1beta1.SandboxSpec{
-				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
-					PodTemplate: sandboxv1beta1.PodTemplate{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
-						},
-					},
-				},
-				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
-			},
-		}
-		Expect(k8sClient.Create(ctx, sb)).To(Succeed())
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
-			},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
-			},
-		}
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		// Set the status via the status subresource.
-		pod.Status = corev1.PodStatus{
-			Phase: corev1.PodFailed,
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name: "agent",
-				State: corev1.ContainerState{
-					Terminated: &corev1.ContainerStateTerminated{
-						ExitCode: 137, Reason: "Evicted",
-						Message: "Usage of EmptyDir volume tmp exceeds the limit 100Mi",
-					},
-				},
-				LastTerminationState: corev1.ContainerState{
-					Terminated: &corev1.ContainerStateTerminated{
-						ExitCode: 137, Reason: "Evicted",
-						Message: "Usage of EmptyDir volume tmp exceeds the limit 100Mi",
-					},
-				},
-			}},
-		}
-		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
-	}
-
-	findCondition := func(conds []metav1.Condition, condType string) *metav1.Condition {
-		for i := range conds {
-			if conds[i].Type == condType {
-				return &conds[i]
-			}
-		}
-		return nil
-	}
-
 	It("surfaces an evicted pod with no claim (the live F6 repro)", func() {
 		const ns, name = "f6-evict-ns", "f6-evict"
 		r := f6NewReconciler(ns, name)
-		f6PlantSandboxAndPod(ns, name)
+		f6PlantSandboxAndPodFn(ns, name)
 		By("sandboxFailure detects the evicted pod")
 		loop := &cov.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
@@ -172,7 +113,7 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		By("applySandboxFailure surfaces the failure (I90): condition + Event + attempt count")
 		changed := r.applySandboxFailure(ctx, loop, f)
 		Expect(changed).To(BeTrue())
-		cond := findCondition(loop.Status.Conditions, cov.AgentFailedCondition)
+		cond := findConditionFn(loop.Status.Conditions, cov.AgentFailedCondition)
 		Expect(cond).ToNot(BeNil(), "AgentFailed condition must be set")
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal("Evicted"))
@@ -215,7 +156,7 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 			InfraSandboxUID: "prior-uid",
 		}
 		// Plant a NEW sandbox + failed pod (a different UID).
-		f6PlantSandboxAndPod(ns, name)
+		f6PlantSandboxAndPodFn(ns, name)
 		By("sandboxFailure detects the evicted pod (new UID)")
 		f, err := r.sandboxFailure(ctx, loop)
 		Expect(err).ToNot(HaveOccurred())
@@ -224,7 +165,7 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		changed := r.applySandboxFailure(ctx, loop, f)
 		Expect(changed).To(BeTrue())
 		Expect(loop.Status.Phase).To(Equal(cov.LoopPhaseFailed))
-		cond := findCondition(loop.Status.Conditions, string(cov.LoopPhaseFailed))
+		cond := findConditionFn(loop.Status.Conditions, string(cov.LoopPhaseFailed))
 		Expect(cond).ToNot(BeNil(), "the Failed condition must be set")
 		Expect(cond.Reason).To(Equal(sandboxInfraFailedCondition))
 	})
@@ -280,3 +221,143 @@ func (f6FakeEnforcer) Apply(context.Context, *cov.Loop, policy.EffectivePolicy) 
 func (f6FakeEnforcer) Enforcing(context.Context, *cov.Loop) (bool, string)            { return true, "Enforcing" }
 func (f6FakeEnforcer) KaptSpecHash(*cov.Loop, policy.EffectivePolicy) string          { return "" }
 func (f6FakeEnforcer) BPFNodeAffinity() *corev1.Affinity                              { return nil }
+
+var _ = Describe("F6 wiring: advancePhaseFromClaim invokes sandbox failure handling", func() {
+	It("surfaces an Evicted pod via the advancePhaseFromClaim path (the wiring)", func() {
+		const ns, name = "f6-wiring-ns", "f6-wiring"
+		// Ensure the VolumeSnapshotClass (the suite setup does this, but this
+		// spec runs in the same suite).
+		vsc := &unstructured.Unstructured{}
+		vsc.SetAPIVersion("snapshot.storage.k8s.io/v1")
+		vsc.SetKind("VolumeSnapshotClass")
+		vsc.SetName("f6-test-vsc")
+		_ = unstructured.SetNestedField(vsc.Object, "test.driver", "driver")
+		_ = unstructured.SetNestedField(vsc.Object, "Delete", "deletionPolicy")
+		_ = k8sClient.Create(ctx, vsc) // ignore already-exists
+
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: ns},
+		})).To(Succeed())
+
+		rec := record.NewFakeRecorder(64)
+		r := &LoopReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			Recorder:           rec,
+			Enforcer:           &f6FakeEnforcer{},
+			CNIProber:          &cni.FakeProber{NextResult: cni.CNIProbeResult{Reason: cni.ReasonCNIEnforced}},
+			SandboxImage:       "example.com/cox-sandbox:v1",
+			ProxyImage:         "example.com/cox-proxy:v1",
+			EgressProxyImage:   "example.com/egress-proxy:v1",
+			ToolProxyImage:     "example.com/tool-proxy:v1",
+			WorkspaceGitImage:  "example.com/git:v1",
+			snapshotCRDPresent: func(context.Context) bool { return true },
+			workspaceDriverSeam: func(context.Context, *cov.Loop) (string, bool) {
+				return "test.driver", true
+			},
+			// No claim (the F6 scenario: the pod failed BEFORE writing a claim).
+			readPhaseClaim: func(context.Context, *cov.Loop) (*PhaseClaim, error) {
+				return nil, nil
+			},
+		}
+
+		loop := &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID(name + "-uid")},
+			Spec: cov.LoopSpec{
+				Goal:      "F6 wiring",
+				Agent:     cov.AgentConfig{Image: "example.com/cox-agent:v1"},
+				Workspace: cov.Workspace{Repo: "https://example.com/repo.git"},
+			},
+			Status: cov.LoopStatus{
+				Phase: cov.LoopPhasePlanning,
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// Plant the Sandbox + Evicted pod.
+		f6PlantSandboxAndPodFn(ns, name)
+
+		// Re-read the loop (fresh resourceVersion).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+
+		// Call advancePhaseFromClaim directly (the wiring test: does the
+		// reconcile path invoke the F6 failure handling?).
+		// Mutation: remove the sandboxFailure call at loop_s4_phase.go:601
+		// (the F6 check) and this spec FAILS (no AgentFailed condition).
+		pending, changed, _ := r.advancePhaseFromClaim(ctx, loop)
+		_ = pending
+		Expect(changed).To(BeTrue(), "advancePhaseFromClaim must surface the F6 failure (the wiring)")
+
+		// The AgentFailed condition is set on the in-memory loop.
+		cond := findConditionFn(loop.Status.Conditions, cov.AgentFailedCondition)
+		Expect(cond).ToNot(BeNil(), "the F6 wiring must set the AgentFailed condition")
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Reason).To(Equal("Evicted"))
+
+		// The attempt count is set.
+		Expect(loop.Status.Agent).ToNot(BeNil())
+		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(1)))
+	})
+})
+
+// findConditionFn finds a condition by type (package-level for reuse across
+// Describe blocks).
+func findConditionFn(conds []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conds {
+		if conds[i].Type == condType {
+			return &conds[i]
+		}
+	}
+	return nil
+}
+
+// f6PlantSandboxAndPodFn creates the Sandbox CR + a failed (Evicted) pod.
+// The pod status is set via the status subresource (Create does NOT set
+// status in envtest — the API server strips it).
+func f6PlantSandboxAndPodFn(ns, name string) {
+	sbUID := types.UID(name + "-sb-uid")
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: sbUID},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
+					},
+				},
+			},
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+		},
+	}
+	Expect(k8sClient.Create(ctx, sb)).To(Succeed())
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
+		},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	// Set the status via the status subresource.
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodFailed,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "agent",
+			State: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 137, Reason: "Evicted",
+					Message: "Usage of EmptyDir volume tmp exceeds the limit 100Mi",
+				},
+			},
+			LastTerminationState: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 137, Reason: "Evicted",
+					Message: "Usage of EmptyDir volume tmp exceeds the limit 100Mi",
+				},
+			},
+		}},
+	}
+	Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
+}

@@ -66,12 +66,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -587,6 +590,23 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded || loop.Status.Phase == coxv1alpha1.LoopPhaseFailed {
 		return false, false, ""
 	}
+	// F6: a sandbox pod that FAILED without a phase claim (evicted, OOMKilled,
+	// or the agent container terminated without a claim — the dogfood F6:
+	// the EmptyDir /tmp sizeLimit eviction left the Loop silently stuck in
+	// Planning) is a sandbox INFRASTRUCTURE failure, not the agent's work
+	// (ADR-0005: no claim means no advance). It must be SURFACED (I90: a
+	// condition + a Warning Event) and retried in a bounded, visible way, or
+	// the Loop fails with the distinct SandboxFailed reason once the bound is
+	// exhausted — the I65 VerifyInfraFailed pattern mirrored onto the sandbox.
+	if f, serr := r.sandboxFailure(ctx, loop); serr != nil {
+		// A transient read error (the sandbox pod read failed): no decision
+		// (I49: a failed read is never a failure decision). Requeue.
+		logf.FromContext(ctx).Error(serr, "sandbox pod read for the F6 failure check failed; no decision", "loop", loop.Name)
+		claimReadPending = true
+	} else if f != nil {
+		changed = r.applySandboxFailure(ctx, loop, f)
+		return changed, false, ""
+	}
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
 		// Verifying is evidence-gated (B3, S5): the runner does NOT execute
 		// Verifying (ADR-0005 — verify evidence comes from the operator's
@@ -787,4 +807,319 @@ func (r *LoopReconciler) applyModelAvailableCondition(loop *coxv1alpha1.Loop, cl
 		setCondition(loop, coxv1alpha1.ModelAvailableCondition, metav1.ConditionTrue,
 			"Recovered", "model backend reachable")
 	}
+}
+
+// F6 (dogfood finding): the sandbox pod's infrastructure failure. An evicted
+// or otherwise-terminated agent pod that left NO phase claim (eviction, a
+// non-claim exit, a crash with no termination message) leaves the phase
+// machine stuck: the claim reader re-queues forever (no claim, no decision)
+// and nothing is surfaced. The operator must NOTICE it, SURFACE it (I90:
+// AgentFailed condition + Warning Event) and retry in a bounded, visible way
+// (recreate the Sandbox; count attempts) — or fail the Loop after N, mirroring
+// the I65 VerifyInfraFailed infra-retry pattern.
+const (
+	// sandboxInfraRetries is the bounded retry count for a sandbox pod that
+	// failed without a claim: 1 original pod + 2 recreations = 3 total before
+	// the Loop is Failed:SandboxFailed. The bound keeps a persistently broken
+	// node (a node whose memory pressure evicts every sandbox pod) from
+	// recreating the Sandbox forever, and the recreation does not burn a
+	// maxIterations iteration (a pod failure says nothing about the agent's
+	// work — the ADR-0005 claim channel is exactly why a failure without a
+	// claim is infra, not work).
+	sandboxInfraRetries = 2
+	// sandboxFailedCondition is the Loop condition type that SURFACES a
+	// sandbox pod failure without a claim (F6, I90): True with the pod's
+	// termination reason (Evicted, Error, OOMKilled, …) and the kubelet
+	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi") while
+	// the operator is deciding what to do. Cleared (to False/Recovered) once
+	// the Loop advances past the failure (a fresh claim arrives) or the bound
+	// is exhausted (the Failed condition carries the durable record).
+	sandboxFailedCondition = "AgentFailed"
+	// sandboxInfraRetryEventReason / sandboxInfraFinalEventReason are the
+	// stable Warning Event reasons for the sandbox infra retry and the final
+	// failure (every state change has an Event — I90 observability).
+	sandboxInfraRetryEventReason   = "SandboxRetry"
+	sandboxInfraFinalEventReason   = "SandboxFailed"
+	sandboxInfraFailedCondition    = "SandboxFailed"
+)
+
+// sandboxFailure is the operator's read of the sandbox pod for the F6
+// failure check: it reports the pod's failed-without-a-claim state (nil when
+// there is no such failure, the error when the pod read failed — the caller
+// makes NO decision on a read error, I49). It is reached only when the
+// phase machine has no current claim (advancePhaseFromClaim's claim reader
+// found nothing or a malformed claim), so it never mis-fires on a pod that is
+// progressing (the I49 norm: an in-progress agent — Waiting or Running — is
+// never a failure).
+type sandboxFailure struct {
+	sandboxUID   types.UID
+	container    string
+	reason       string
+	exitCode     int32
+	message      string
+	podFailed    bool
+}
+
+func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.Loop) (*sandboxFailure, error) {
+	sb := &sandboxv1beta1.Sandbox{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil // no Sandbox yet (or it is being deleted): no decision
+		}
+		return nil, err
+	}
+	reader := r.apiReader
+	if reader == nil {
+		reader = r // no APIReader wired (bare test reconciler): the cached client
+	}
+	pod := &corev1.Pod{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil // pod not created yet (or deleted): no decision
+		}
+		return nil, err
+	}
+	// A pod that has not FAILED (Running/Pending): no decision (I49 — an
+	// in-progress agent is never a failure).
+	if pod.Status.Phase != corev1.PodFailed {
+		return nil, nil
+	}
+	agent := agentContainerStatus(pod)
+	if agent == nil {
+		// No agent container status yet (the pod failed before the agent
+		// registered — e.g. a workspace init failure): still a failed pod with
+		// no claim; the decision below is the same (surface + retry) but the
+		// condition names the pod-level reason instead of a container's.
+		podReason, podMsg := podConditionMessage(pod)
+		return &sandboxFailure{
+			sandboxUID: sb.UID,
+			container:  "<pod>",
+			reason:     podReason,
+			message:    podMsg,
+			podFailed:  true,
+		}, nil
+	}
+	// The agent container has a live (non-terminated) state: the pod is in
+	// progress (Running/Waiting), not a failure without a claim (I49: no
+	// decision).
+	if agent.State.Terminated == nil && agent.LastTerminationState.Terminated == nil {
+		return nil, nil
+	}
+	// The agent container terminated WITHOUT a valid claim: this is the
+	// failure the F6 check is for (the claim reader already returned nothing
+	// or a malformed claim — the call site is advancePhaseFromClaim's
+	// claim-read-pending path). Surface the container's termination evidence.
+	term := agent.State.Terminated
+	if term == nil {
+		term = agent.LastTerminationState.Terminated
+	}
+	return &sandboxFailure{
+		sandboxUID: sb.UID,
+		container:  agent.Name,
+		reason:     term.Reason,
+		exitCode:   term.ExitCode,
+		message:    term.Message,
+		podFailed:  true,
+	}, nil
+}
+
+// applySandboxFailure is the F6 bounded-retry decision for a sandbox pod that
+// failed without a claim. It mirrors applyVerifyInfraFailure (I65):
+//
+//  1. it SURFACES the failure (I90): the AgentFailed condition (True, the
+//     container's reason + the kubelet message) and a Warning Event per retry
+//     and on the final failure — the wedge F6 fixes (a silent Planning) is
+//     made visible;
+//  2. it counts the failure into status.agent.infraAttempts (the
+//     per-Sandbox-UID guard, infraSandboxUID — a re-read of the same failing
+//     Sandbox does not double-count, the I65 P1-A pattern);
+//  3. while within the bound (sandboxInfraRetries recreations) it DELETES the
+//     Sandbox so the next reconcile recreates a fresh one (a NEW Sandbox —
+//     the operator never mutates a running one; the workspace survives on
+//     the per-Loop PVC) and requeues; and
+//  4. once exhausted it fails the Loop with the distinct SandboxFailed
+//     reason (the Failed condition, phase Failed, the Warning Event).
+//
+// It returns changed (whether the Loop's status was mutated this call — the
+// caller ORs it in and persists in the shared Status().Update). A failed
+// delete is returned as an error (the reconcile retries; the attempt count is
+// already persisted, so a re-reconcile does not double-count — the same
+// failed-delete handling as applyVerifyInfraFailure).
+func (r *LoopReconciler) applySandboxFailure(ctx context.Context, loop *coxv1alpha1.Loop, f *sandboxFailure) bool {
+	log := logf.FromContext(ctx)
+	msg := sandboxFailureMessage(f)
+	// I90: surface the failure. The condition carries the reason + the kubelet
+	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi"); the
+	// message is kubelet-recorded (not the runner's clock, not the agent's
+	// claim — there is no claim, which is the whole point).
+	setCondition(loop, sandboxFailedCondition, metav1.ConditionTrue, f.reason, msg)
+	if loop.Status.Agent == nil {
+		loop.Status.Agent = &coxv1alpha1.AgentStatus{}
+	}
+	// I65 P1-A (mirrored): count at most ONE infra attempt per Sandbox UID. A
+	// re-read of the same failing Sandbox (the reconcile re-ran before the
+	// delete completed, or the stale pod still owned by the old Sandbox) must
+	// not burn another attempt.
+	if loop.Status.Agent.InfraSandboxUID != "" && string(f.sandboxUID) == loop.Status.Agent.InfraSandboxUID {
+		// Already counted: re-issue the delete if the Sandbox is still present
+		// and not Terminating (a transient delete failure left it in place),
+		// and keep the condition + Event visible. Never a controller error,
+		// never a double-count.
+		if r.ReissueSandboxDelete(ctx, loop) {
+			return true
+		}
+		log.Info("sandbox failure re-read (same UID); skipping (already counted)", "loop", loop.Name, "attempt", loop.Status.Agent.InfraAttempts)
+		return false
+	}
+	loop.Status.Agent.InfraAttempts++
+	loop.Status.Agent.InfraSandboxUID = string(f.sandboxUID)
+	attempt := loop.Status.Agent.InfraAttempts
+	if attempt > sandboxInfraRetries {
+		// Exhausted: fail the Loop with the distinct reason. The Failed
+		// condition carries the durable record; the AgentFailed condition is
+		// cleared (the Failed condition supersedes it).
+		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+			sandboxInfraFailedCondition,
+			fmt.Sprintf("sandbox failed without a phase claim after %d attempts (%s)", attempt, msg))
+		clearCondition(loop, sandboxFailedCondition)
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		bumpLoopCompletion("failed", "sandbox_infra")
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, sandboxInfraFinalEventReason,
+				"sandbox failed without a phase claim after %d attempts: %s", attempt, msg)
+		}
+		return true
+	}
+	// Within the bound: surface + recreate the Sandbox and requeue.
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, sandboxInfraRetryEventReason,
+			"sandbox pod failed without a phase claim (attempt %d of %d); recreating the sandbox: %s",
+			attempt, sandboxInfraRetries+1, msg)
+	}
+	if r.DeleteSandboxForRetry(ctx, loop) {
+		// A failed delete: the attempt count is already persisted, so the next
+		// reconcile sees the same failing Sandbox and the same count and
+		// retries the delete (never a controller error, never a wedge).
+		log.Error(nil, "failed to delete sandbox for recreate; requeueing (will retry)", "loop", loop.Name, "attempt", attempt)
+		return true
+	}
+	log.Info("sandbox pod failed without a claim; recreating the sandbox", "loop", loop.Name, "attempt", attempt)
+	return true
+}
+
+// DeleteSandboxForRetry deletes the Loop's Sandbox so the next reconcile
+// recreates it fresh (the F6 sandbox infra-retry, the I65 verify-Job-recreate
+// pattern). It returns true when the delete FAILED (the caller requeues and
+// retries on the next reconcile) and false when it succeeded or the Sandbox
+// is already gone (nothing to delete — the recreate is the next reconcile's
+// ensureSandbox work).
+func (r *LoopReconciler) DeleteSandboxForRetry(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	sb := &sandboxv1beta1.Sandbox{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false // already gone
+		}
+		// A failed read is treated as "delete unknown" — the caller requeues
+		// and retries; it is NOT a controller error (never a wedge).
+		return true
+	}
+	if sb.DeletionTimestamp != nil {
+		return false // already Terminating: the GC is handling it
+	}
+	// Background propagation deletes the pod with the Sandbox (the D27
+	// pattern: the apiserver's default ORPHAN propagation leaves the stale
+	// pod in place without a GC, and the pod would carry the failed agent
+	// statuses into the new Sandbox's read-back). The fresh Sandbox is
+	// created on the next reconcile (the name is still taken until the
+	// apiserver deletes async — the same requeue dance the D27 stale-guard
+	// uses).
+	if err := r.Delete(ctx, sb, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		return true
+	}
+	return false
+}
+
+// ReissueSandboxDelete re-issues the background delete of the Loop's Sandbox
+// when it is still present and NOT yet Terminating (a transient delete
+// failure left it in place — the I65 P1-A re-read path). It returns true
+// when it re-issued (the caller requeues) and false when the Sandbox is gone
+// or already Terminating (the GC is handling it).
+func (r *LoopReconciler) ReissueSandboxDelete(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	sb := &sandboxv1beta1.Sandbox{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false // gone: nothing to re-issue
+		}
+		return false // a read failure: no decision (I49)
+	}
+	if sb.DeletionTimestamp != nil {
+		return false // already Terminating
+	}
+	if err := r.Delete(ctx, sb, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		return true
+	}
+	return true
+}
+
+// sandboxFailureMessage builds the human-readable failure message for the
+// AgentFailed condition / Events / the SandboxFailed Failed-condition:
+// it names the failed container and its termination reason + exit code, plus
+// the kubelet message (the eviction reason, "Usage of EmptyDir volume tmp
+// exceeds the limit 100Mi") when the status carries one. A failed pod with
+// no agent container status names the pod-level condition instead.
+func sandboxFailureMessage(f *sandboxFailure) string {
+	if f == nil {
+		return "sandbox pod failed without a phase claim"
+	}
+	s := "the sandbox pod's " + f.container + " container terminated without a phase claim"
+	if f.reason != "" {
+		s += " (reason " + f.reason
+		if f.exitCode != 0 {
+			s += ", exit " + strconv.FormatInt(int64(f.exitCode), 10)
+		}
+		s += ")"
+	} else if f.exitCode != 0 {
+		s += fmt.Sprintf(" (exit %d)", f.exitCode)
+	}
+	if f.message != "" {
+		s += ": " + truncate(s4ClaimMaxBytes, f.message)
+	}
+	return s
+}
+
+// agentContainerStatus returns the agent container's status (nil when the
+// pod has no agent container status yet).
+func agentContainerStatus(pod *corev1.Pod) *corev1.ContainerStatus {
+	for i := range pod.Status.ContainerStatuses {
+		if pod.Status.ContainerStatuses[i].Name == agentContainerNameS4 {
+			return &pod.Status.ContainerStatuses[i]
+		}
+	}
+	return nil
+}
+
+// podConditionMessage returns the pod-level failure evidence: the first
+// pod condition whose Status is not True (the failure condition, e.g.
+// ContainersReady=False) with its reason + message. An empty (reason, "")
+// pair when no such condition exists (the caller still treats the pod as
+// failed — pod.Status.Phase is the primary signal).
+func podConditionMessage(pod *corev1.Pod) (string, string) {
+	for i := range pod.Status.Conditions {
+		c := &pod.Status.Conditions[i]
+		if c.Status != corev1.ConditionTrue && c.Reason != "" {
+			return c.Reason, c.Message
+		}
+	}
+	return "PodFailed", ""
+}
+
+// truncate caps s to n bytes (the I90 condition/Event messages must stay
+// readable; a kubelet message that grows past the cap is truncated, not
+// silently dropped).
+func truncate(n int, s string) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

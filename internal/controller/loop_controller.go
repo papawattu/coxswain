@@ -1672,6 +1672,27 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			}
 			return nil // Sandbox deleted; the next reconcile creates it fresh
 		}
+		// F6 (the I65 P1-B pattern mirrored): a RECREATED Sandbox has a new
+		// UID. When the operator's last counted sandbox failure (status.agent.
+		// infraSandboxUID) names a DIFFERENT UID, the Sandbox the failure was
+		// read from is gone — the failure is the old one, and the fresh pod
+		// must get a clean attempt count (an exhausted bound on the old
+		// Sandbox must not doom the fresh one, and a fresh pod that then
+		// succeeds must not carry the old pod's count into the next failure's
+		// bound). The clear is the operator's (it is a status field, written
+		// in the shared trailing Status().Update); the phase-advance delete
+		// does NOT clear it (a phase advance is not an infra failure, and the
+		// count is per-Sandbox-UID, so the old UID's count stays bound to that
+		// UID — only a different live UID clears it).
+		if loop.Status.Agent != nil && loop.Status.Agent.InfraSandboxUID != "" &&
+			string(existingSb.UID) != loop.Status.Agent.InfraSandboxUID {
+			loop.Status.Agent.InfraAttempts = 0
+			loop.Status.Agent.InfraSandboxUID = ""
+		}
+	} else if !apierrors.IsNotFound(gerr) {
+		// A failed read (not NotFound): fail closed (I49 — a failed read is
+		// never a success); the reconcile retries.
+		return fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {

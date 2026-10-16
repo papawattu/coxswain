@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -33,7 +34,17 @@ func planLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) erro
 	}
 	content, err := dc.Workspace.Read(ctx, name, planPath)
 	if err != nil {
-		return fmt.Errorf("read %s from loop %q: %w", planPath, name, err)
+		// F7 (dogfood 2 finding): the plan read is now an ERROR whenever it fails
+		// (a missing file makes the peek pod exit non-zero — it is never returned
+		// as content, and never hashed). Show the missing-plan hint explicitly
+		// for the common case; the underlying error message carries the peek
+		// pod's details for anything else.
+		return fmt.Errorf("read %s from loop %q: %w (if the Loop has not finished Planning, the plan is not written yet)", planPath, name, err)
+	}
+	if strings.TrimSpace(content) == "" {
+		// An empty read (a blank file) is "no plan": say so, don't print nothing.
+		_, werr := io.WriteString(out, "No plan: "+planPath+" is empty in the workspace of loop "+name+"\n")
+		return werr
 	}
 	_, werr := io.WriteString(out, content)
 	return werr

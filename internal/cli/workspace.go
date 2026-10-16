@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -73,7 +74,7 @@ spec:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
-    command: ["/bin/sh", "-c", "cat %s"]
+    command: ["/bin/sh", "-c", "cat %s 2>&1 || { echo \"plan read failed: cat exit $?\" >&2; exit 1; }\n"
     volumeMounts:
     - name: ws
       mountPath: /workspace
@@ -106,16 +107,40 @@ spec:
 
 	// Wait for the peek pod to reach a terminal phase. The `cat` command exits
 	// immediately, so the pod goes Succeeded once the file is read (or Failed if
-	// the file is missing and the shell's exit is non-zero). Poll with a delay up
-	// to a deadline (no back-to-back busy loop): a few 1s checks cover the cat
-	// completing in ~2s, and a truly-stuck pod (scheduling/pull) is caught by
-	// the deadline. A still-Pending pod after the deadline is an error.
+	// the file is missing or unreadable). Poll with a delay up to a deadline (no
+	// back-to-back busy loop): a few 1s checks cover the cat completing in ~2s,
+	// and a truly-stuck pod (scheduling/pull) is caught by the deadline. A
+	// still-Pending pod after the deadline is an error.
 	// The B6 run 5/6 found the peek pod takes ~15s to start and fail (image
 	// pull + PVC mount + container start); 8s is too short. 30s covers the
 	// worst case on a slow node.
-	phase := ""
+	var phase, exitCode, terminationMsg string
 	for range 30 {
-		phase, _ = p.kubectlGet(ctx, "get", "pod", podName, "-o", "jsonpath={.status.phase}")
+		podJSON, _ := p.kubectlGet(ctx, "get", "pod", podName, "-o", "json")
+		var pod struct {
+			Status struct {
+				Phase string `json:"phase"`
+				ContainerStatuses []struct {
+					State struct {
+						Terminated *struct {
+							ExitCode    int64  `json:"exitCode"`
+							Reason      string `json:"reason"`
+							Message     string `json:"message"`
+						} `json:"terminated"`
+					} `json:"state"`
+				} `json:"containerStatuses"`
+			} `json:"status"`
+		}
+		if err := json.Unmarshal([]byte(podJSON), &pod); err == nil {
+			phase = pod.Status.Phase
+			if len(pod.Status.ContainerStatuses) > 0 {
+				t := pod.Status.ContainerStatuses[0].State.Terminated
+				if t != nil {
+					exitCode = fmt.Sprint(t.ExitCode)
+					terminationMsg = t.Message
+				}
+			}
+		}
 		if phase == "Succeeded" || phase == "Failed" {
 			break
 		}
@@ -124,17 +149,38 @@ spec:
 	if phase == "" || phase == "Pending" {
 		return "", fmt.Errorf("cli: plan peek pod did not run (phase=%s, loop %q)", phase, loop)
 	}
-	// The cat output is the container's stdout, recorded in the pod's log.
+	// F7 (dogfood 2 finding): a peek pod that ends Failed (or whose container
+	// exited non-zero) is an ERROR, never content. Returning the container log
+	// of a failed cat as the "file content" made cox approve hash the cat ERROR
+	// STRING ("cat: can't open '.coxswain/PLAN.md': No such file or directory")
+	// instead of the plan — three different plans with one approved hash. The
+	// exit code is authoritative: the `cat` wrapper above exits non-zero when
+	// the file is missing or unreadable (or "" when the shell is absent), and
+	// 0 only when the file was read. The termination message (truncated to
+	// 4096 bytes by the runtime) carries the shell's stderr for the error text.
+	if phase == "Failed" || (phase == "Succeeded" && exitCode != "0") || (exitCode != "" && exitCode != "0") {
+		return "", fmt.Errorf("cli: plan read failed (peek pod %s: phase=%s exit=%s): %s", podName, phase, exitCode, firstNonEmpty(terminationMsg, "the peek pod exited non-zero (file missing or unreadable)"))
+	}
+	// The cat output is the container's stdout, recorded in the pod's log. The
+	// SUCCEEDED bytes are returned UNCHANGED: the approval contract hashes the
+	// exact file bytes (the runner's plan-change check hashes the PLAN.md bytes
+	// it wrote, runner/phase.go planChanged), so no trim — a trailing newline
+	// is part of the hash.
 	out, err := p.kubectlOut(ctx, "logs", podName)
 	if err != nil {
-		// A missing PLAN.md is the no-plan case (the runner writes it at the
-		// start of the Implementing phase; PLAN.md is optional), not an error.
-		if strings.Contains(err.Error(), "No such file") || strings.Contains(err.Error(), "no such file") {
-			return "", nil
-		}
 		return "", fmt.Errorf("read peek pod log: %w", err)
 	}
-	return strings.TrimSpace(out), nil
+	return out, nil
+}
+
+// firstNonEmpty returns the first non-empty string (error detail fallbacks).
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // sandboxAgentImage resolves the Loop's sandbox agent image: first the Loop's

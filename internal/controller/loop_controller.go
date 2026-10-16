@@ -2235,34 +2235,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		},
 	}
 	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
-		svcDesired.Labels = proxyLabels(loopName)
-		svcDesired.Spec.Ports = []corev1.ServicePort{{
-			Name:       httpPortName,
-			Port:       proxyPort,
-			TargetPort: intstr.FromInt32(proxyPort),
-			Protocol:   corev1.ProtocolTCP,
-		}}
-		svcDesired.Spec.Selector = proxyLabels(loopName)
-		// ClusterIP (the default): no external exposure; only in-cluster callers
-		// (the agent, via COX_MODEL_BASE_URL) reach it. D34's NetworkPolicy then
-		// restricts who may call it.
-		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
-		// Reset the fields the operator does NOT manage (same as the egress
-		// proxy Service): a pre-existing (possibly headless) proxy Service must
-		// not leak a defaulted IPFamilyPolicy (RequireDualStack on a headless
-		// create) or a headless ClusterIP into the operator's ClusterIP Service
-		// (the apiserver rejects the Update on a single-stack cluster). Set it
-		// to PreferDualStack (the k8s default, valid on both single- and
-		// dual-stack clusters) so the apiserver does not need to default it.
-		// F11: only reset ClusterIP on the create path (the existing object has
-		// no resourceVersion) — on the update path the assigned ClusterIP is
-		// left alone so a no-op reconcile is "unchanged" (not "updated").
-		if svcDesired.ResourceVersion == "" {
-			svcDesired.Spec.ClusterIP = ""
-		}
-		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
-		svcDesired.Spec.IPFamilies = nil
-		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
+		return mutateModelProxyService(r.Scheme, loop, svcDesired)
 	})
 	if err != nil {
 		return fmt.Errorf("ensure proxy service %s/%s: %w", ns, proxyServiceName(loopName), err)
@@ -2831,6 +2804,73 @@ func shortHash(s string) string {
 // would exceed the 63-char DNS-1035 budget).
 func egressProxyPodName(loopName string) string { return derivedName(loopName, "-egress-proxy") }
 
+// mutateEgressProxyService is the mutateFn for the egress proxy Service
+// (called by controllerutil.CreateOrUpdate inside ensureEgressProxy). It is a
+// named function (not an inline closure) so the F11 spec can call it directly
+// on a Service with an apiserver-assigned ClusterIP and assert the operator
+// does NOT reset it (the regression that caused the reconcile storm).
+//
+// F11: it only resets Spec.ClusterIP="" on the CREATE path (the existing
+// object has no resourceVersion — CreateOrUpdate loads the existing object
+// into svcDesired before calling this, so a create is detected by an empty
+// resourceVersion). On the UPDATE path the apiserver-assigned ClusterIP is
+// left alone; resetting it to "" would make the before/after objects differ
+// (existing has the IP, the desired has ""), so CreateOrUpdate would Update
+// the Service on EVERY reconcile, firing the Owns(&Service) watch and
+// re-triggering the Loop (a reconcile storm). It also resets the fields the
+// operator does NOT manage (IPFamilyPolicy, IPFamilies) so a pre-existing
+// headless Service does not leak a defaulted IPFamilyPolicy (RequireDualStack
+// on a headless create) or a headless ClusterIP into the operator's ClusterIP
+// Service.
+func mutateEgressProxyService(scheme *runtime.Scheme, loop *coxv1alpha1.Loop, svcDesired *corev1.Service) error {
+	svcDesired.Labels = egressProxyLabels(loop.Name)
+	svcDesired.Spec.Ports = []corev1.ServicePort{{
+		Name:       httpPortName,
+		Port:       egressProxyPort,
+		TargetPort: intstr.FromInt32(egressProxyPort),
+		Protocol:   corev1.ProtocolTCP,
+	}}
+	svcDesired.Spec.Selector = egressProxyLabels(loop.Name)
+	svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+	// F11: only reset ClusterIP on the create path (see the F11 comment above).
+	if svcDesired.ResourceVersion == "" {
+		svcDesired.Spec.ClusterIP = ""
+	}
+	svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
+	svcDesired.Spec.IPFamilies = nil
+	return controllerutil.SetControllerReference(loop, svcDesired, scheme)
+}
+
+// mutateModelProxyService is the mutateFn for the model proxy Service (D33,
+// called by controllerutil.CreateOrUpdate inside ensureProxy). It shares the
+// F11 fix with the egress proxy Service: only reset Spec.ClusterIP="" on the
+// CREATE path; on the update path the apiserver-assigned ClusterIP is left
+// alone so a no-op reconcile is "unchanged" (not "updated" — the storm). It
+// also resets the fields the operator does NOT manage (IPFamilyPolicy,
+// IPFamilies) so a pre-existing headless Service does not leak a defaulted
+// IPFamilyPolicy or a headless ClusterIP into the operator's ClusterIP Service.
+func mutateModelProxyService(scheme *runtime.Scheme, loop *coxv1alpha1.Loop, svcDesired *corev1.Service) error {
+	svcDesired.Labels = proxyLabels(loop.Name)
+	svcDesired.Spec.Ports = []corev1.ServicePort{{
+		Name:       httpPortName,
+		Port:       proxyPort,
+		TargetPort: intstr.FromInt32(proxyPort),
+		Protocol:   corev1.ProtocolTCP,
+	}}
+	svcDesired.Spec.Selector = proxyLabels(loop.Name)
+	// ClusterIP (the default): no external exposure; only in-cluster callers
+	// (the agent, via COX_MODEL_BASE_URL) reach it. D34's NetworkPolicy then
+	// restricts who may call it.
+	svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
+	// F11: only reset ClusterIP on the create path (see mutateEgressProxyService).
+	if svcDesired.ResourceVersion == "" {
+		svcDesired.Spec.ClusterIP = ""
+	}
+	svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
+	svcDesired.Spec.IPFamilies = nil
+	return controllerutil.SetControllerReference(loop, svcDesired, scheme)
+}
+
 // egressProxyServiceName returns the egress proxy Service name for a Loop.
 func egressProxyServiceName(loopName string) string { return derivedName(loopName, "-egress-proxy") }
 
@@ -3131,43 +3171,7 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		},
 	}
 	svcOp, err := controllerutil.CreateOrUpdate(ctx, r.Client, svcDesired, func() error {
-		svcDesired.Labels = egressProxyLabels(loopName)
-		svcDesired.Spec.Ports = []corev1.ServicePort{{
-			Name:       httpPortName,
-			Port:       egressProxyPort,
-			TargetPort: intstr.FromInt32(egressProxyPort),
-			Protocol:   corev1.ProtocolTCP,
-		}}
-		svcDesired.Spec.Selector = egressProxyLabels(loopName)
-		svcDesired.Spec.Type = corev1.ServiceTypeClusterIP
-		// Reset the fields the operator does NOT manage so a pre-existing
-		// (possibly headless, ClusterIP: None) egress proxy Service — e.g. one
-		// planted by a test fixture — does not leak a defaulted IPFamilyPolicy
-		// (RequireDualStack on a headless create) or a headless ClusterIP into
-		// the operator's ClusterIP Service. The apiserver defaults IPFamilyPolicy
-		// to RequireDualStack on the fixture's headless create; on a single-stack
-		// cluster the operator's Update then rejects it ("this cluster is not
-		// configured for dual-stack services"). Set it to PreferDualStack (the
-		// k8s default, valid on both single- and dual-stack clusters) so the
-		// apiserver does not need to default it.
-		//
-		// F11: only reset ClusterIP to "" on the CREATE path (the existing
-		// object has no resourceVersion — CreateOrUpdate loads the existing
-		// object into svcDesired before calling this mutateFn, so a create is
-		// detected by an empty resourceVersion). On the UPDATE path the Service
-		// already has the apiserver-assigned ClusterIP; resetting it to "" would
-		// make the before/after objects differ (existing has the IP, the desired
-		// has ""), so CreateOrUpdate would Update the Service on EVERY reconcile,
-		// firing the Owns(&Service) watch and re-triggering the Loop — a
-		// reconcile storm (83 "op:updated" in 2 min on the live kind cluster).
-		// Leaving the assigned ClusterIP alone makes the before/after equal on a
-		// no-op reconcile (op:"unchanged").
-		if svcDesired.ResourceVersion == "" {
-			svcDesired.Spec.ClusterIP = ""
-		}
-		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
-		svcDesired.Spec.IPFamilies = nil
-		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
+		return mutateEgressProxyService(r.Scheme, loop, svcDesired)
 	})
 	if err != nil {
 		return fmt.Errorf("ensure egress proxy service %s/%s: %w", ns, egressProxyServiceName(loopName), err)

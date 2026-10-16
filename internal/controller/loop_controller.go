@@ -2042,16 +2042,20 @@ func newLimit(q string) *resource.Quantity {
 }
 
 // tmpSizeLimit returns the /tmp emptyDir sizeLimit for the agent container
-// (F5, dogfood: the default 100Mi is too small for agentic work). When the
-// Loop's spec.agent.tmpSizeLimit is set, it uses that value; otherwise it
-// falls back to the platform default (100Mi). The value is validated by the
-// CRD schema (pattern: ^[0-9]+(Mi|Gi|T)?$), so a malformed value is rejected
-// at admission — no runtime error here.
+// (F5, dogfood: the default 100Mi was too small for agentic work — the
+// agent's pip/npm caches, build artifacts, and scratch files easily exceed
+// it; the dogfood repro showed the agent's /tmp usage hitting the 100Mi
+// limit mid-plan, triggering an eviction). The platform default is now 1Gi
+// (matching the agent container's ephemeral-storage limit, so /tmp is the
+// largest scratch space available). When the Loop's spec.agent.tmpSizeLimit
+// is set, it uses that value instead (an override for Loops that need more
+// or less). The value is validated by the CRD schema (pattern:
+// ^[0-9]+(Mi|Gi|T)?$), so a malformed value is rejected at admission.
 func tmpSizeLimit(loop *coxv1alpha1.Loop) *resource.Quantity {
 	if loop.Spec.Agent.TmpSizeLimit != "" {
 		return newLimit(loop.Spec.Agent.TmpSizeLimit)
 	}
-	return newLimit("100Mi")
+	return newLimit("1Gi")
 }
 
 // nextPhase is the operator's *claim-driven* phase-transition table (B1). It

@@ -2254,7 +2254,12 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 		// (the apiserver rejects the Update on a single-stack cluster). Set it
 		// to PreferDualStack (the k8s default, valid on both single- and
 		// dual-stack clusters) so the apiserver does not need to default it.
-		svcDesired.Spec.ClusterIP = ""
+		// F11: only reset ClusterIP on the create path (the existing object has
+		// no resourceVersion) — on the update path the assigned ClusterIP is
+		// left alone so a no-op reconcile is "unchanged" (not "updated").
+		if svcDesired.ResourceVersion == "" {
+			svcDesired.Spec.ClusterIP = ""
+		}
 		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
 		svcDesired.Spec.IPFamilies = nil
 		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)
@@ -3145,7 +3150,21 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		// configured for dual-stack services"). Set it to PreferDualStack (the
 		// k8s default, valid on both single- and dual-stack clusters) so the
 		// apiserver does not need to default it.
-		svcDesired.Spec.ClusterIP = ""
+		//
+		// F11: only reset ClusterIP to "" on the CREATE path (the existing
+		// object has no resourceVersion — CreateOrUpdate loads the existing
+		// object into svcDesired before calling this mutateFn, so a create is
+		// detected by an empty resourceVersion). On the UPDATE path the Service
+		// already has the apiserver-assigned ClusterIP; resetting it to "" would
+		// make the before/after objects differ (existing has the IP, the desired
+		// has ""), so CreateOrUpdate would Update the Service on EVERY reconcile,
+		// firing the Owns(&Service) watch and re-triggering the Loop — a
+		// reconcile storm (83 "op:updated" in 2 min on the live kind cluster).
+		// Leaving the assigned ClusterIP alone makes the before/after equal on a
+		// no-op reconcile (op:"unchanged").
+		if svcDesired.ResourceVersion == "" {
+			svcDesired.Spec.ClusterIP = ""
+		}
 		svcDesired.Spec.IPFamilyPolicy = &ipFamilyPreferDualStack
 		svcDesired.Spec.IPFamilies = nil
 		return controllerutil.SetControllerReference(loop, svcDesired, r.Scheme)

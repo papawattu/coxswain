@@ -185,6 +185,12 @@ const (
 	// signal).
 	coxPlanHashFile     = "plan-hash"
 	coxPlanFeedbackFile = "plan-feedback"
+	// coxPlanAttemptFile (I42b): the .coxswain filename the phase-init
+	// container writes for the runner's plan-attempt marker. The runner reads
+	// it and echoes it into its claim; advancePhaseFromClaim rejects a claim
+	// whose planAttempt does not match status.planAttempt (a stale Planning
+	// success claim from a prior attempt cannot satisfy the new phase).
+	coxPlanAttemptFile = "plan-attempt"
 	// workspaceCredsUsernameKey / workspaceCredsPasswordKey are the keys the
 	// spec.workspace.gitCredentialSecret Secret MUST carry: a standard
 	// kubernetes.io/basic-auth Secret (the same shape as the samples
@@ -1552,7 +1558,7 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	initContainers = append(initContainers, corev1.Container{
 		Name:    phaseInitContainerName,
 		Image:   r.workspaceGitImage(),
-		Command: []string{verifySh, "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, planHash, planFeedback)},
+		Command: []string{verifySh, "-c", phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.PlanAttempt, planHash, planFeedback)},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
 		},
@@ -5128,7 +5134,7 @@ func shellQuote(s string) string {
 // a fresh Planning run with no rejection). The values are passed in already
 // validated (the hash is 64-hex or ""; the feedback is a CRD-length-bounded
 // string) so shell-quoting is the only escaping needed.
-func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase, iteration int, planHash, planFeedback string) string {
+func phaseInitScript(desiredPhase coxv1alpha1.LoopPhase, iteration int, planAttempt int, planHash, planFeedback string) string {
 	if desiredPhase == "" {
 		return `#!/bin/sh
 set -eu
@@ -5150,6 +5156,11 @@ exit 0
 		`mkdir -p "${DEST}/.coxswain"`,
 		`printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"`,
 		`printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswain/iteration"`,
+		// I42b: the plan-attempt marker (the runner echoes it into its claim;
+		// advancePhaseFromClaim rejects a claim whose planAttempt does not match
+		// status.planAttempt, so a stale Planning success claim from a prior
+		// attempt cannot satisfy the new Planning phase).
+		`printf '%s' ` + shellQuote(fmt.Sprintf("%d", planAttempt)) + ` > "${DEST}/.coxswain/` + coxPlanAttemptFile + `"`,
 	}
 	if planHash != "" {
 		sb = append(sb, `printf '%s' `+shellQuote(planHash)+` > "${DEST}/.coxswain/`+coxPlanHashFile+`"`)

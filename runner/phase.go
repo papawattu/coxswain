@@ -107,6 +107,14 @@ const (
 	// file means "no prior rejection" (the planning prompt is unchanged).
 	planHashFile     = "plan-hash"
 	planFeedbackFile = "plan-feedback"
+	// I42b (F4 dogfood finding): the .coxswain/plan-attempt file the operator's
+	// phase-init writes (the operator's plan-attempt marker, as a string). The
+	// runner reads it and echoes it into its claim; the operator's planAttempt
+	// guard rejects a claim whose planAttempt does not match status.planAttempt
+	// (a stale Planning success claim from a prior attempt cannot satisfy the
+	// new Planning phase). An absent file reads as 0 (the operator's guard is a
+	// no-op for a fresh Loop whose status.planAttempt is also 0).
+	planAttemptFileName = "plan-attempt"
 )
 
 // A2 (TDD-PLAN): the PLAN.md size cap. 4KB.
@@ -264,8 +272,10 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// phase for a new iteration) is NOT reused: the phase must run again
 	// with fresh model work.
 	curIterForPrior := readIteration(cfg.Workspace)
+	curPlanAttemptForPrior := readPlanAttempt(cfg.Workspace)
 	if res, done := priorCompletedResult(
-		filepath.Join(cfg.Workspace, resultDirName, resultFileName), phase, claimIteration(curIterForPrior),
+		filepath.Join(cfg.Workspace, resultDirName, resultFileName),
+		phase, claimIteration(curIterForPrior), curPlanAttemptForPrior,
 	); done {
 		// S5a (B3): an Implementing success without a headCommit re-commits
 		// (the first run's commit may have failed; the workspace is on the
@@ -396,6 +406,7 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// recorded (the claim is the runner's ONLY output channel; a failed
 	// write is a blocked run the operator must see).
 	res.Iteration = claimIteration(curIter)
+	res.PlanAttempt = readPlanAttempt(cfg.Workspace)
 	if err := writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res); err != nil {
 		res.Status = statusBlocked
 		res.VerificationNotes = fmt.Sprintf("write result: %v", err)
@@ -416,7 +427,7 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 // old success). The iteration check is the ADR-0005 D11 guard: after a failed
 // verify sends the Loop back to Implementing (iteration+1), the runner must
 // NOT re-emit the old success claim without new model work.
-func priorCompletedResult(resultPath, phase string, currentIteration int) (Result, bool) {
+func priorCompletedResult(resultPath, phase string, currentIteration, currentPlanAttempt int) (Result, bool) {
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
 		return Result{}, false
@@ -431,6 +442,14 @@ func priorCompletedResult(resultPath, phase string, currentIteration int) (Resul
 	// Stale-iteration guard: a result from a previous iteration is not
 	// reusable for the current iteration (the phase must run fresh).
 	if res.Iteration != currentIteration {
+		return Result{}, false
+	}
+	// I42b (F4 dogfood finding): a result from a previous plan attempt is not
+	// reusable for the current plan attempt (the phase must run fresh — the
+	// prior plan was rejected and the runner must produce a new plan that
+	// addresses the rejection feedback). This mirrors the stale-iteration
+	// guard above.
+	if res.PlanAttempt != currentPlanAttempt {
 		return Result{}, false
 	}
 	return res, true
@@ -548,6 +567,13 @@ func writeClaim(path string, res Result) {
 		// "success","headCommit":"…"} — no iteration — and the Loop could
 		// never advance past Verifying -> Stalled).
 		Iteration int `json:"iteration"`
+		// I42b (F4 dogfood finding): the .coxswain/plan-attempt the runner read.
+		// It MUST ride the claim: the operator's planAttempt guard compares
+		// claim.PlanAttempt against loop.Status.PlanAttempt and discards a
+		// mismatched Planning claim (a stale claim from a prior attempt cannot
+		// satisfy the new Planning phase). A missing "planAttempt" key parses
+		// as 0, so an omitted field reads as a stale claim from attempt 0.
+		PlanAttempt int `json:"planAttempt"`
 	}
 	c := claim{
 		ObservedPhase: res.ObservedPhase,
@@ -555,6 +581,7 @@ func writeClaim(path string, res Result) {
 		BlockedReason: res.VerificationNotes,
 		HeadCommit:    res.HeadCommit,
 		Iteration:     res.Iteration,
+		PlanAttempt:   res.PlanAttempt,
 	}
 	data, err := json.Marshal(c)
 	if err != nil {
@@ -1053,6 +1080,30 @@ func claimIteration(iter string) int {
 		if r < '0' || r > '9' {
 			return 0 // not a pure integer marker: report 0 (the marker is
 			// informational; the claim must not parse garbage).
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+// readPlanAttempt reads the .coxswain/plan-attempt marker (the operator's
+// plan-attempt counter, written by the phase-init). Returns the int value (0
+// when the file is absent or contains a non-integer — pre-I42b operators do
+// not write the file, and the operator's guard is a no-op for a fresh Loop
+// whose status.planAttempt is also 0).
+func readPlanAttempt(workspace string) int {
+	data, err := os.ReadFile(filepath.Join(workspace, resultDirName, planAttemptFileName))
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" {
+		return 0
+	}
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0 // not a pure integer marker: report 0
 		}
 		n = n*10 + int(r-'0')
 	}

@@ -291,14 +291,26 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				// runs now — the runner's next Planning claim, once the user
 				// re-approves, advances to Implementing). The operator is the sole
 				// writer of status (ADR-0004).
+				// I42b: increment planAttempt so a stale Planning success claim
+				// from the prior attempt is rejected by advancePhaseFromClaim (the
+				// claim's planAttempt does not match the new status.planAttempt).
+				// Also clear the PlanApproved condition: a stale approval from
+				// the prior plan must not survive the rejection (the gate's
+				// Planning -> Implementing hold checks approvedPlanHash; a stale
+				// approval would allow a stale claim to advance to Implementing
+				// without the user's re-approval).
 				setLastRejectionReason(loop, rejectedPlanReason(loop))
 				// B4: clear the failure summary (the rejection reason takes over
 				// as the planning feedback — a stale verify-failure summary must
 				// not leak into the next planning prompt after a rejection).
 				clearLastFailureSummary(loop)
 				clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
+				// I42b: clear the stale PlanApproved (the rejection invalidates
+				// the prior approval; the user must re-approve the new plan).
+				clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
 				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+				loop.Status.PlanAttempt++
 				changed = true
 			}
 		} else if planApproved {

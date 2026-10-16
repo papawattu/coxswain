@@ -125,6 +125,13 @@ type PhaseClaim struct {
 	// operator's own read of the condition + phase is the gate input). An
 	// absent field (pre-B3 runners) is false (no plan change detected).
 	PlanChanged bool `json:"planChanged,omitempty"`
+	// planAttempt is the .coxswain/plan-attempt the runner read (the operator's
+	// plan-attempt marker file). OS1 only — never a gate input. The guard in
+	// advancePhaseFromClaim uses it to reject a stale Planning success claim
+	// from a prior attempt (I42b). An absent field (pre-I42b runners) is 0,
+	// which matches a fresh Loop's status.planAttempt (also 0) — the guard is
+	// a no-op for runners that do not echo the marker.
+	PlanAttempt int `json:"planAttempt,omitempty"`
 }
 
 // parsePhaseClaim strict-parses a termination message into a PhaseClaim
@@ -188,6 +195,19 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 		if err := json.Unmarshal(v, &claim.PlanChanged); err != nil {
 			return nil, fmt.Errorf("claim.planChanged is not a boolean: %w", err)
 		}
+	}
+	// I42b: planAttempt, when present, must be a non-negative integer (the
+	// runner's echo of the .coxswain/plan-attempt marker). An absent field
+	// (pre-I42b runners) is 0, which matches a fresh Loop's status.planAttempt.
+	if v, ok := raw["planAttempt"]; ok {
+		var pa int
+		if err := json.Unmarshal(v, &pa); err != nil {
+			return nil, fmt.Errorf("claim.planAttempt is not an integer: %w", err)
+		}
+		if pa < 0 {
+			return nil, fmt.Errorf("claim.planAttempt is negative: %d", pa)
+		}
+		claim.PlanAttempt = pa
 	}
 	claim.ObservedPhase = coxv1alpha1.LoopPhase(op)
 	// Review P3: the claimed phase must be one the runner can claim
@@ -370,7 +390,7 @@ const claimSuccess = "success"
 // the next one. (A blocked claim's observedPhase equals the CURRENT phase
 // the runner was executing, never the next, so the nextPhase match
 // naturally rejects it: nextPhase(current, current) == current.)
-func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseClaim, now metav1.Time) (changed, advanced bool) {
+func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1.Loop, claim *PhaseClaim, now metav1.Time) (changed, advanced bool) {
 	// B5a: bump the iteration metric on a NEW-phase transition (a re-claim of
 	// the same phase does not bump). The claim's observedPhase is the phase
 	// the runner reports having executed (the destination of this advance).
@@ -477,6 +497,44 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 			changed = true
 		}
 	}
+	// I42b: Planning -> AwaitingApproval for Manual mode. When the runner
+	// completes a Planning run (success claim, observedPhase=Planning, current
+	// phase=Planning) in Manual mode, the Loop moves to AwaitingApproval (the
+	// hold). This transition lives here (not in applyApprovalGate) so it only
+	// happens when a FRESH claim is read (the agent actually ran). The gate's
+	// Planning -> AwaitingApproval branch (applyApprovalGate) handles the case
+	// where the Loop is ALREADY at AwaitingApproval (the hold) and the user
+	// approves/rejects.
+	if loop.Status.Phase == coxv1alpha1.LoopPhasePlanning &&
+		claim.ObservedPhase == coxv1alpha1.LoopPhasePlanning &&
+		claim.Status == claimSuccess &&
+		approvalMode(loop) == coxv1alpha1.ApprovalModeManual {
+		logf.FromContext(ctx).Info("advancing Planning -> AwaitingApproval on fresh Planning claim",
+			"loop", loop.Name,
+			"claimStatus", claim.Status,
+			"observedPhase", claim.ObservedPhase,
+			"planAttempt", claim.PlanAttempt,
+			"currentPlanAttempt", loop.Status.PlanAttempt)
+		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		// I42b: refresh lastActivityTime on the advance (the agent just ran;
+		// the claim is fresh). This is the evidence that the re-plan completed.
+		// The no-churn spec (R17 P1) is preserved because this branch only
+		// fires when the phase advances (a one-shot transition), not on every
+		// reconcile where the same claim is re-read.
+		if loop.Status.Progress == nil {
+			loop.Status.Progress = &coxv1alpha1.ProgressStatus{}
+		}
+		loop.Status.Progress.LastActivityTime = &now
+		if loop.Status.Progress.ObservedGeneration == 0 {
+			loop.Status.Progress.ObservedGeneration = loop.Generation
+		}
+		if loop.Status.Progress.BaseCommit == "" {
+			loop.Status.Progress.BaseCommit = loop.Status.BaseCommit
+		}
+		advanced = true
+		changed = true
+	}
 	// Keep status.observedPhase in sync with the claim (the B1 field; the
 	// progress block is the OS1 structured record).
 	if loop.Status.ObservedPhase != claim.ObservedPhase {
@@ -581,6 +639,44 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 				"statusIteration", loop.Status.Iteration)
 			return false, false, ""
 		}
+		// I42b: a claim from a PREVIOUS plan attempt is ignored — no advance,
+		// no progress write. The planAttempt counter is incremented on every
+		// re-entry to Planning (a rejection re-plan or an onVerifyFail=Plan
+		// re-plan); the phase-init writes it to .coxswain/plan-attempt and the
+		// runner echoes it into its claim. A stale Planning success claim from
+		// the prior attempt (same iteration, different planAttempt) would
+		// otherwise pass the S5a consumed-guard (observedPhase matches the
+		// current phase) and re-advance the new Planning phase at once (the
+		// F4 dogfood finding: the reject -> Planning re-plan completed in 15s
+		// with no new inference). An absent field (pre-I42b runners) is 0,
+		// which matches a fresh Loop's status.planAttempt (also 0) — the guard
+		// is a no-op for runners that do not echo the marker.
+		// The guard applies to PLANNING claims only: the re-plan re-enters
+		// Planning, so a stale Planning claim is the one that can re-advance
+		// the new phase at once. An Implementing/Verifying claim's staleness
+		// is the iteration guard's job (the planAttempt only changes on a
+		// re-plan, which always re-enters Planning).
+		// I42b kind finding: the planAttempt counter can be 0 even after a
+		// rejection (an older operator that did not increment the field
+		// processed the rejection; the field is new and defaults to 0). In
+		// that case the planAttempt guard above is a no-op (0 == 0), and a
+		// stale Planning claim with planAttempt 0 passes. The belt-and-
+		// suspenders guard: a Planning claim with planAttempt 0 is STALE when
+		// lastRejectionReason is non-empty (a rejection has occurred, so a
+		// fresh claim with planAttempt > 0 is expected). This catches the
+		// mixed-version case where the operator that processed the rejection
+		// did not increment planAttempt.
+		if claim.ObservedPhase == coxv1alpha1.LoopPhasePlanning && claim.PlanAttempt != loop.Status.PlanAttempt {
+			logf.FromContext(ctx).Info("stale claim from a previous plan attempt ignored",
+				"claimPlanAttempt", claim.PlanAttempt,
+				"statusPlanAttempt", loop.Status.PlanAttempt)
+			return false, false, ""
+		}
+		if claim.ObservedPhase == coxv1alpha1.LoopPhasePlanning && claim.PlanAttempt == 0 && loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
+			logf.FromContext(ctx).Info("stale claim from a previous plan attempt ignored (rejection reason present, planAttempt 0)",
+				"claimPlanAttempt", claim.PlanAttempt)
+			return false, false, ""
+		}
 		// S5a (OS5 P3): a CONSUMED claim is discarded, not re-consumed.
 		// advancePhaseFromClaim runs every reconcile while the phase is not
 		// terminal, and the operator never acknowledges a claim — so without
@@ -621,7 +717,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			now = metav1.Now()
 		}
 		fromPhase := loop.Status.Phase
-		c, advanced := r.recordPhaseClaim(loop, claim, now)
+		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		changed = changed || c
 		// I89: map a ModelUnavailable claim to a Loop condition so
 		// `kubectl cox describe` shows the model backend is down. The

@@ -129,6 +129,13 @@ type Result struct {
 	// status.progress.iteration (OS1 observability only; the Loop's
 	// status.iteration is the authoritative count, never the claim's).
 	Iteration int `json:"iteration,omitempty"`
+	// I42b (F4 dogfood finding): the .coxswain/plan-attempt the runner read
+	// (the operator's plan-attempt marker, as an int — 0 when unset). It
+	// rides into the ADR-0004 claim; the operator's planAttempt guard
+	// rejects a Planning claim whose planAttempt does not match
+	// status.planAttempt (a stale claim from a prior attempt cannot satisfy
+	// the new Planning phase).
+	PlanAttempt int `json:"planAttempt,omitempty"`
 
 	// S5a (B3): the 40-hex head commit SHA the runner committed to at the end
 	// of a successful Implementing run (committed in the workspace repo with

@@ -839,6 +839,135 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(gone).To(BeTrue(), "a deleting Loop with no snapshots deletes (the finalizer is removed on the first reconcile)")
 	})
 
+	// F10 (dogfood 3 finding): deleting a NAMESPACE that holds a Loop leaves
+	// the Loop, and so the namespace, stuck forever on the checkpoint finalizer.
+	// The root cause (measured, operator logs): a deleting Loop's reconcile hit
+	// the ensure/cleanup path (create proxy pod ... forbidden: namespace is
+	// being terminated) and returned an error to the controller-runtime retry
+	// loop, which never reaches the finalizer removal; once the error loop
+	// exhausts (and the Owns watches stop firing for a terminating ns), the
+	// finalizer is never removed. The fix: a deleting Loop's checkpoint GC
+	// TOLERATES a terminating-namespace error (Forbidden list/delete — the
+	// children go away with the namespace) and removes the finalizer, so the
+	// namespace can complete its delete. These specs drive the real Reconcile
+	// with a client whose VolumeSnapshot list/delete return a
+	// terminating-namespace Forbidden (simulating the live repro in a live
+	// namespace, which envtest cannot do — a namespace delete is async and the
+	// apiserver does not reject creates the way a terminating ns does).
+	It("a deleting Loop whose checkpoint list returns Forbidden (terminating ns) STILL has its finalizer removed (F10)", func() {
+		ns := "f10-forbidden-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "f10forb"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		// A client whose VolumeSnapshot list AND delete return a terminating-ns
+		// Forbidden (the live repro: "unable to create new content in namespace
+		// ... because it is being terminated"). Everything else passes through.
+		forbClient := &f10TerminatingNSClient{inner: k8sClient}
+		r := b1NewReconciler(true, false)
+		r.Client = forbClient
+		r.apiReader = forbClient
+
+		b1Reconcile(r, ns, name) // adds the finalizer
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		// Seed a snapshot (the GC must tolerate the Forbidden delete of it).
+		snap := b1MakeSnapshotObj(name, ns, 1)
+		Expect(k8sClient.Create(ctx, snap)).To(Succeed())
+
+		// Delete the Loop: the finalizer holds it.
+		Expect(k8sClient.Delete(ctx, loop)).To(Succeed())
+		for range 5 {
+			got := &coxv1alpha1.Loop{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, got); err == nil {
+				Expect(got.DeletionTimestamp).NotTo(BeZero(), "the deleting Loop is held by the finalizer")
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		// Reconcile the deleting Loop. The checkpoint list returns a
+		// terminating-ns Forbidden; the F10 fix treats it as "done" (the
+		// children go away with the namespace) and removes the finalizer, so
+		// the apiserver deletes the Loop. Without the fix, the list error
+		// requeues forever and the finalizer is never removed.
+		_, _ = r.Reconcile(context.Background(),
+			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		var gone bool
+		for range 10 {
+			if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &coxv1alpha1.Loop{})) {
+				gone = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+			_, _ = r.Reconcile(context.Background(),
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		}
+		Expect(gone).To(BeTrue(),
+			"a deleting Loop whose checkpoint list returns a terminating-ns Forbidden has its finalizer removed (the namespace can complete its delete)")
+	})
+
+	// F10 (second spec): a deleting Loop with CheckpointsAvailable=False (no
+	// VolumeSnapshot CRD — the support check is False) still has its finalizer
+	// removed. The no-CRD branch of gcLoopCheckpoints returns done immediately
+	// (there are no snapshots to delete), so the finalizer is removed on the
+	// first reconcile of the deleting Loop. This is the dogfood4-df4 shape
+	// (CheckpointsAvailable=False, no VolumeSnapshotClass for the PVC's CSI
+	// driver): the finalizer must not block on a support check that was False
+	// from the start.
+	It("a deleting Loop with CheckpointsAvailable=False (no snapshot CRD) STILL has its finalizer removed (F10)", func() {
+		ns := "f10-nocrd-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		// No VSC created (the CRD is "absent" — snapshotCRDPresent is false).
+		name := "f10nocrd"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		r := b1NewReconciler(false, true) // no CRD: snapshotCRDPresent false
+		b1Reconcile(r, ns, name)          // adds the finalizer
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, loop)).To(Succeed())
+		for range 5 {
+			got := &coxv1alpha1.Loop{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, got); err == nil {
+				Expect(got.DeletionTimestamp).NotTo(BeZero(), "the deleting Loop is held by the finalizer")
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		// Reconcile the deleting Loop. The no-CRD branch of gcLoopCheckpoints
+		// returns done (no snapshots), so the finalizer is removed and the
+		// Loop deletes. Without this, the finalizer would block forever on a
+		// support check that was False from the start (the dogfood4-df4 shape).
+		_, _ = r.Reconcile(context.Background(),
+			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		var gone bool
+		for range 10 {
+			if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &coxv1alpha1.Loop{})) {
+				gone = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+			_, _ = r.Reconcile(context.Background(),
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		}
+		Expect(gone).To(BeTrue(),
+			"a deleting Loop with CheckpointsAvailable=False (no snapshot CRD) has its finalizer removed (the namespace can complete its delete)")
+	})
+
 	It("BestEffort without the VolumeSnapshot CRD: CheckpointsAvailable=False (VolumeSnapshotCRDMissing) and the Loop still Succeeds (carries on, I90 visible fallback)", func() {
 		ns := "b1-nocrd-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

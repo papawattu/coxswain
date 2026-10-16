@@ -624,6 +624,16 @@ func isNotFound(err error) bool {
 	return apierrors.IsNotFound(err)
 }
 
+// isForbidden is true when the apiserver rejected the request because the
+// namespace is terminating (Forbidden: "unable to create new content in
+// namespace ... because it is being terminated") or an RBAC denial. For the
+// checkpoint GC (B1 finalizer cleanup) a Forbidden delete is NOT a real
+// failure: the namespace is going away and its children (including the
+// checkpoint) are torn down with it, so the finalizer can be removed.
+func isForbidden(err error) bool {
+	return apierrors.IsForbidden(err)
+}
+
 // gcLoopCheckpoints deletes the Loop's checkpoint VolumeSnapshots (B1
 // finalizer: CleaningUp). It lists the snapshots by the Loop label and
 // deletes each (NotFound is a success — the GC is idempotent). It returns
@@ -674,6 +684,20 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 	if err := r.List(ctx, list,
 		client.InNamespace(loop.Namespace),
 		client.MatchingLabels{"coxswain.wattu.com/loop": loop.Name}); err != nil {
+		// F10: a terminating namespace rejects creates (Forbidden: "unable to
+		// create new content in namespace ... because it is being terminated")
+		// and can fail list reads too. The namespace is going away: its children
+		// (including any checkpoint) are torn down with it by the apiserver's
+		// namespace-level GC, so there is nothing left to clean. Treat this as
+		// "done" (the caller removes the finalizer) rather than an error —
+		// blocking the finalizer on an unrecoverable condition (a namespace that
+		// is terminating) would leave the Loop, and so the namespace, stuck
+		// forever (the dogfood4-df4 repro: the namespace delete hung 52+ min on
+		// the Loop's checkpoint finalizer). NotFound is the same: the snapshot
+		// (or the whole CRD, in a namespace being torn down) is gone.
+		if isNotFound(err) || isForbidden(err) {
+			return true, nil
+		}
 		return false, fmt.Errorf("list checkpoint VolumeSnapshots for GC: %w", err)
 	}
 	for i := range list.Items {
@@ -691,7 +715,10 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 		if _, ok := item.GetLabels()["coxswain.wattu.com/fork-of"]; ok {
 			continue // a fork still needs this snapshot: skip it
 		}
-		if delErr := r.Delete(ctx, item); delErr != nil && !isNotFound(delErr) {
+		if delErr := r.Delete(ctx, item); delErr != nil && !isNotFound(delErr) && !isForbidden(delErr) {
+			// F10: a Forbidden delete (a terminating namespace rejects it) is not
+			// a real failure — the snapshot goes away with the namespace. Only a
+			// genuine error (e.g. a transient apiserver failure) requeues.
 			return false, delErr
 		}
 	}
@@ -831,9 +858,18 @@ func (r *LoopReconciler) finalizeB2Delete(ctx context.Context, loop *coxv1alpha1
 func (r *LoopReconciler) reconcileCleaningUp(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, error) {
 	done, err := r.gcLoopCheckpoints(ctx, loop)
 	if err != nil {
-		// A delete failed: requeue (the finalizer stays, the GC retries).
+		// A real (not terminating-ns) GC error: surface it as an Event so the
+		// user sees the cleanup is stuck (the dogfood4-df4 repro left the Loop
+		// silently holding the finalizer — no Event, no log once the error
+		// loop exhausted). Requeue to retry, but the Event is the durable record
+		// that the finalizer is blocked (I90: a fallback/degradation must be
+		// visible, not silent).
 		logf.FromContext(ctx).Error(err, "CleaningUp: the checkpoint GC failed; requeueing (the finalizer keeps the Loop until the GC is done)",
 			"loop", loop.Name)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "CheckpointGCFailed",
+				"checkpoint GC failed during namespace cleanup; requeueing (the finalizer keeps the Loop until the GC is done): %v", err)
+		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if !done {

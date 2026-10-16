@@ -457,6 +457,17 @@ func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loo
 		if apierrors.IsAlreadyExists(err) {
 			return nil // a concurrent pass created it
 		}
+		// F10: a Forbidden create (a terminating namespace rejects it) is NOT a
+		// real failure for the B2 restore: the namespace is going away and the
+		// PVC is torn down with it (it is a controller-owned child). The restore
+		// decision is already recorded as a condition + Event; returning a
+		// Forbidden error here would loop the deleting-Loop reconcile on the
+		// restore step and block the checkpoint finalizer forever (the
+		// dogfood4-df4 repro). Treat it as a no-op (the PVC will not be usable
+		// anyway in a terminating namespace).
+		if apierrors.IsForbidden(err) {
+			return nil
+		}
 		return fmt.Errorf("create restored workspace PVC %s from snapshot %s: %w", newPVC.Name, snapshotName, err)
 	}
 	log.FromContext(ctx).Info("workspace PVC recreated from the checkpoint snapshot",

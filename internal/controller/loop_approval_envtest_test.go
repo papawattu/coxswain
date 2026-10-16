@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -517,5 +518,61 @@ var _ = Describe("B3 plan approval gate", func() {
 		// status (ADR-0004).
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
 			"the operator moved the phase to AwaitingApproval on the successful Planning claim (the hold re-enters; the Loop does NOT rerun Planning forever)")
+	})
+
+	// P2 (dogfood): a rejection that triggers a re-plan refreshes
+	// lastActivityTime so the stall watchdog does not fire on the re-plan's
+	// planning run (the prior plan's lastActivityTime is stale — the stall
+	// timer has been running since the last activity, not since the re-plan
+	// started). The I42b advance pattern is mirrored: the re-plan is fresh
+	// activity.
+	It("P2: a rejection at AwaitingApproval (Replan) refreshes lastActivityTime on the re-plan", func() {
+		ns := "p2-replan-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		_, r := makeLoop(ns, "p2-replan", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
+		// Move the Loop to AwaitingApproval with a STALE lastActivityTime
+		// (simulating a prior plan that ran a while ago).
+		staleTime := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+		loop := &coxv1alpha1.Loop{}
+		nn := types.NamespacedName{Name: "p2-replan", Namespace: ns}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.Progress = &coxv1alpha1.ProgressStatus{
+			LastActivityTime: &staleTime,
+		}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// The user rejects the plan (the PlanRejected condition is set).
+		setCondition(ns, "p2-replan", coxv1alpha1.PlanRejectedCondition, "True",
+			"Rejected: the plan is missing error handling")
+
+		// Reconcile: the gate's applyApprovalGate sees PlanRejected True at
+		// AwaitingApproval + onReject=Replan: it re-plans AND refreshes
+		// lastActivityTime (the P2 fix).
+		reconcileLoop(r, ns, "p2-replan")
+
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		// The phase is Planning (the re-plan runs now).
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"the re-plan moved the phase to Planning")
+		// P2: lastActivityTime is REFRESHED (not the stale 2h-ago value).
+		// The re-plan is fresh activity — the stall watchdog's timer resets.
+		Expect(loop.Status.Progress).ToNot(BeNil(),
+			"status.progress must be set")
+		Expect(loop.Status.Progress.LastActivityTime).ToNot(BeNil(),
+			"lastActivityTime must be set after the re-plan")
+		staleHours := loop.Status.Progress.LastActivityTime.Time.Sub(staleTime.Time).Hours()
+		Expect(staleHours).To(BeNumerically(">", 1.5),
+			"lastActivityTime must be refreshed (the stale value was 2h ago; the new value is within the last minute)")
+		Expect(loop.Status.Progress.LastActivityTime.Time.Before(staleTime.Time)).To(BeFalse(),
+			"lastActivityTime must be AHEAD of the stale value (the re-plan refreshed it)")
+		// Mutation: remove the P2 refresh block in loop_approval.go (the
+		// lastActivityTime = now lines) and this spec FAILS (lastActivityTime
+		// stays at the stale 2h-ago value, which is BEFORE staleTime, not after).
 	})
 })

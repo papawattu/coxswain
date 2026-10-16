@@ -1461,15 +1461,23 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		}
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
 	}
-	// I36 (R10): ADR-0006 item 4 requires CPU/memory limits (one agent must not
-	// starve the node) + an ephemeral-storage limit (/workspace + /scratch are
-	// emptyDir; an agent can fill the node's disk). Platform defaults here; a
-	// per-Loop override bounded by a cluster maximum is a follow-on (I36) once
-	// the coxswain-agent-defaults ConfigMap exists.
+	// F5 follow-up (P1): the ephemeral-storage LIMIT must be derived from the
+	// emptyDir VOLUMES (scratch + tmp + a writable-layer headroom), not
+	// hard-coded. EmptyDir usage counts toward the pod's ephemeral storage, so
+	// a hard 1Gi cap with scratch(350Mi) + tmp(1Gi) = 1.35Gi of sizeLimits
+	// means /tmp effectively gets ~650Mi and a user who sets
+	// tmpSizeLimit: 2Gi hits the same 1Gi ceiling with a less obvious message.
+	// Deriving it from the volumes keeps the I36/ADR-0006 property that every
+	// agent is bounded: raising tmpSizeLimit raises the cap consistently.
+	// scratch (350Mi) + tmp + headroom (256Mi writable-layer floor);
+	// default: 350Mi + 1Gi + 256Mi = 1.6Gi; tmpSizeLimit=2Gi: 350Mi+2Gi+256Mi.
+	agentEphemeral := newLimit("350Mi")
+	agentEphemeral.Add(*tmpSizeLimit(loop))
+	agentEphemeral.Add(*newLimit("256Mi"))
 	agentLimits := corev1.ResourceList{
 		corev1.ResourceCPU:              resource.MustParse("500m"),
 		corev1.ResourceMemory:           resource.MustParse("512Mi"),
-		corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+		corev1.ResourceEphemeralStorage: *agentEphemeral,
 	}
 	agentContainer := corev1.Container{
 		Name:  "agent",
@@ -1588,7 +1596,7 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 			SizeLimit: newLimit("350Mi"),
 		}}},
 		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-			SizeLimit: newLimit("100Mi"),
+			SizeLimit: tmpSizeLimit(loop),
 		}}},
 	}
 	// S3a (ADR-0006): the git credential Secret is a volume on the sandbox
@@ -2039,6 +2047,23 @@ func newLimit(q string) *resource.Quantity {
 	p := new(resource.Quantity)
 	*p = resource.MustParse(q)
 	return p
+}
+
+// tmpSizeLimit returns the /tmp emptyDir sizeLimit for the agent container
+// (F5, dogfood: the default 100Mi was too small for agentic work — the
+// agent's pip/npm caches, build artifacts, and scratch files easily exceed
+// it; the dogfood repro showed the agent's /tmp usage hitting the 100Mi
+// limit mid-plan, triggering an eviction). The platform default is now 1Gi
+// (matching the agent container's ephemeral-storage limit, so /tmp is the
+// largest scratch space available). When the Loop's spec.agent.tmpSizeLimit
+// is set, it uses that value instead (an override for Loops that need more
+// or less). The value is validated by the CRD schema (pattern:
+// ^[0-9]+(Mi|Gi|T)?$), so a malformed value is rejected at admission.
+func tmpSizeLimit(loop *coxv1alpha1.Loop) *resource.Quantity {
+	if loop.Spec.Agent.TmpSizeLimit != "" {
+		return newLimit(loop.Spec.Agent.TmpSizeLimit)
+	}
+	return newLimit("1Gi")
 }
 
 // nextPhase is the operator's *claim-driven* phase-transition table (B1). It

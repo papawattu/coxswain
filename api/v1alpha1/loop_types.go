@@ -588,6 +588,21 @@ type AgentConfig struct {
 	// +listMapKey=name
 	// +optional
 	Env []AgentEnvVar `json:"env,omitempty"`
+
+	// tmpSizeLimit is the optional size limit for the agent's /tmp emptyDir
+	// volume (F5, dogfood: the original 100Mi default was too small for
+	// agentic work — the agent's pip/npm caches, build artifacts, and scratch
+	// files easily exceed it; the platform default is now 1Gi). When set, the
+	// operator uses this value instead of the platform default (1Gi). The
+	// value must be a Kubernetes resource quantity (e.g. "500Mi", "2Gi").
+	// Bounded by the agent container's ephemeral-storage limit (default 1Gi)
+	// — a tmp sizeLimit larger than that is rejected at admission.
+	// Immutable: the emptyDir sizeLimit is part of the sandbox pod spec, which
+	// is immutable after creation (same reason as endpointSecretRef).
+	// +optional
+	// +kubebuilder:validation:Pattern="^[0-9]+(Mi|Gi|T)?$"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="tmpSizeLimit is immutable (the sandbox pod's emptyDir sizeLimit cannot change)"
+	TmpSizeLimit string `json:"tmpSizeLimit,omitempty"`
 }
 
 // AgentEnvVar is a literal-only environment variable for the agent container

@@ -838,9 +838,9 @@ const (
 	// sandboxInfraRetryEventReason / sandboxInfraFinalEventReason are the
 	// stable Warning Event reasons for the sandbox infra retry and the final
 	// failure (every state change has an Event — I90 observability).
-	sandboxInfraRetryEventReason   = "SandboxRetry"
-	sandboxInfraFinalEventReason   = "SandboxFailed"
-	sandboxInfraFailedCondition    = "SandboxFailed"
+	sandboxInfraRetryEventReason = "SandboxRetry"
+	sandboxInfraFinalEventReason = "SandboxFailed"
+	sandboxInfraFailedCondition  = "SandboxFailed"
 )
 
 // sandboxFailure is the operator's read of the sandbox pod for the F6
@@ -852,17 +852,17 @@ const (
 // progressing (the I49 norm: an in-progress agent — Waiting or Running — is
 // never a failure).
 type sandboxFailure struct {
-	sandboxUID   types.UID
-	container    string
-	reason       string
-	exitCode     int32
-	message      string
-	podFailed    bool
+	sandboxUID types.UID
+	container  string
+	reason     string
+	exitCode   int32
+	message    string
+	podFailed  bool
 }
 
 func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.Loop) (*sandboxFailure, error) {
 	sb := &sandboxv1beta1.Sandbox{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil // no Sandbox yet (or it is being deleted): no decision
 		}
@@ -1016,7 +1016,7 @@ func (r *LoopReconciler) applySandboxFailure(ctx context.Context, loop *coxv1alp
 // ensureSandbox work).
 func (r *LoopReconciler) DeleteSandboxForRetry(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	sb := &sandboxv1beta1.Sandbox{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false // already gone
 		}
@@ -1047,7 +1047,7 @@ func (r *LoopReconciler) DeleteSandboxForRetry(ctx context.Context, loop *coxv1a
 // or already Terminating (the GC is handling it).
 func (r *LoopReconciler) ReissueSandboxDelete(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	sb := &sandboxv1beta1.Sandbox{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false // gone: nothing to re-issue
 		}

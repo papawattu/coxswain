@@ -1461,15 +1461,23 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		}
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
 	}
-	// I36 (R10): ADR-0006 item 4 requires CPU/memory limits (one agent must not
-	// starve the node) + an ephemeral-storage limit (/workspace + /scratch are
-	// emptyDir; an agent can fill the node's disk). Platform defaults here; a
-	// per-Loop override bounded by a cluster maximum is a follow-on (I36) once
-	// the coxswain-agent-defaults ConfigMap exists.
+	// F5 follow-up (P1): the ephemeral-storage LIMIT must be derived from the
+	// emptyDir VOLUMES (scratch + tmp + a writable-layer headroom), not
+	// hard-coded. EmptyDir usage counts toward the pod's ephemeral storage, so
+	// a hard 1Gi cap with scratch(350Mi) + tmp(1Gi) = 1.35Gi of sizeLimits
+	// means /tmp effectively gets ~650Mi and a user who sets
+	// tmpSizeLimit: 2Gi hits the same 1Gi ceiling with a less obvious message.
+	// Deriving it from the volumes keeps the I36/ADR-0006 property that every
+	// agent is bounded: raising tmpSizeLimit raises the cap consistently.
+	// scratch (350Mi) + tmp + headroom (256Mi writable-layer floor);
+	// default: 350Mi + 1Gi + 256Mi = 1.6Gi; tmpSizeLimit=2Gi: 350Mi+2Gi+256Mi.
+	agentEphemeral := newLimit("350Mi")
+	agentEphemeral.Add(*tmpSizeLimit(loop))
+	agentEphemeral.Add(*newLimit("256Mi"))
 	agentLimits := corev1.ResourceList{
 		corev1.ResourceCPU:              resource.MustParse("500m"),
 		corev1.ResourceMemory:           resource.MustParse("512Mi"),
-		corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+		corev1.ResourceEphemeralStorage: *agentEphemeral,
 	}
 	agentContainer := corev1.Container{
 		Name:  "agent",
@@ -1588,7 +1596,7 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 			SizeLimit: newLimit("350Mi"),
 		}}},
 		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-			SizeLimit: newLimit("100Mi"),
+			SizeLimit: tmpSizeLimit(loop),
 		}}},
 	}
 	// S3a (ADR-0006): the git credential Secret is a volume on the sandbox
@@ -1672,6 +1680,27 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			}
 			return nil // Sandbox deleted; the next reconcile creates it fresh
 		}
+		// F6 (the I65 P1-B pattern mirrored): a RECREATED Sandbox has a new
+		// UID. When the operator's last counted sandbox failure (status.agent.
+		// infraSandboxUID) names a DIFFERENT UID, the Sandbox the failure was
+		// read from is gone — the failure is the old one, and the fresh pod
+		// must get a clean attempt count (an exhausted bound on the old
+		// Sandbox must not doom the fresh one, and a fresh pod that then
+		// succeeds must not carry the old pod's count into the next failure's
+		// bound). The clear is the operator's (it is a status field, written
+		// in the shared trailing Status().Update); the phase-advance delete
+		// does NOT clear it (a phase advance is not an infra failure, and the
+		// count is per-Sandbox-UID, so the old UID's count stays bound to that
+		// UID — only a different live UID clears it).
+		if loop.Status.Agent != nil && loop.Status.Agent.InfraSandboxUID != "" &&
+			string(existingSb.UID) != loop.Status.Agent.InfraSandboxUID {
+			loop.Status.Agent.InfraAttempts = 0
+			loop.Status.Agent.InfraSandboxUID = ""
+		}
+	} else if !apierrors.IsNotFound(gerr) {
+		// A failed read (not NotFound): fail closed (I49 — a failed read is
+		// never a success); the reconcile retries.
+		return fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
@@ -2039,6 +2068,23 @@ func newLimit(q string) *resource.Quantity {
 	p := new(resource.Quantity)
 	*p = resource.MustParse(q)
 	return p
+}
+
+// tmpSizeLimit returns the /tmp emptyDir sizeLimit for the agent container
+// (F5, dogfood: the default 100Mi was too small for agentic work — the
+// agent's pip/npm caches, build artifacts, and scratch files easily exceed
+// it; the dogfood repro showed the agent's /tmp usage hitting the 100Mi
+// limit mid-plan, triggering an eviction). The platform default is now 1Gi
+// (matching the agent container's ephemeral-storage limit, so /tmp is the
+// largest scratch space available). When the Loop's spec.agent.tmpSizeLimit
+// is set, it uses that value instead (an override for Loops that need more
+// or less). The value is validated by the CRD schema (pattern:
+// ^[0-9]+(Mi|Gi|T)?$), so a malformed value is rejected at admission.
+func tmpSizeLimit(loop *coxv1alpha1.Loop) *resource.Quantity {
+	if loop.Spec.Agent.TmpSizeLimit != "" {
+		return newLimit(loop.Spec.Agent.TmpSizeLimit)
+	}
+	return newLimit("1Gi")
 }
 
 // nextPhase is the operator's *claim-driven* phase-transition table (B1). It
@@ -3852,6 +3898,23 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	agentPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: agentLabels},
 	}
+	// F8 (dogfood 2 finding): the verify and deliver Job pods ALSO traverse the
+	// egress proxy (D61, I42d: the clone-base init container fetches an external
+	// repo through the proxy). Their labels are coxswain.io/verify-for=<loop> /
+	// coxswain.io/deliver-for=<loop> (they carry NO app.kubernetes.io/component
+	// = agent label), so the agent-only ingress peer above does not admit them
+	// and the proxy times out the clone-base fetch (the F8 dogfood: verify stuck
+	// in Verifying, clone-base exit 128). Admit the verify + deliver pods (by
+	// their for-label) so the proxy can accept their traffic. (The D61 proof
+	// passed only because the D61 VM's egress proxy netpol did not apply the
+	// agent-only ingress restriction to the verify pod in the same way the
+	// kind-coxswain-snap build does; the agent-only peer is the defect.)
+	verifyPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{verifyForLabel: loopName}},
+	}
+	deliverPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{deliverForLabel: loopName}},
+	}
 	// I42c: the agent's egress to the egress proxy is expected only when the
 	// egress proxy is expected (network allows present); with no network
 	// allows the agent's egress stays model-proxy + DNS (D34).
@@ -4055,7 +4118,11 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 				Ingress: []networkingv1.NetworkPolicyIngressRule{
 					{
-						From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+						// F8 (dogfood 2 finding): admit the agent AND the verify/deliver
+						// Job pods (the latter also traverse the proxy, D61/I42d). The
+						// agent-only peer blocked the verify clone-base fetch (the F8
+						// dogfood: verify stuck in Verifying, clone-base exit 128).
+						From:  []networkingv1.NetworkPolicyPeer{agentPeer, verifyPeer, deliverPeer},
 						Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(egressProxyPort), Protocol: new(corev1.ProtocolTCP)}},
 					},
 				},

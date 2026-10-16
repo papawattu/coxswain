@@ -197,4 +197,61 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		Expect(agent.Image).To(Equal(runnerImage),
 			"the agent container must use spec.agent.image when set")
 	})
+
+	// F5 follow-up (P1): the agent container's ephemeral-storage LIMIT must be
+	// consistent with the emptyDir volume sizeLimits (scratch + tmp). EmptyDir
+	// usage counts toward the pod's ephemeral storage, so the cap must be >=
+	// scratch + tmp (a hard 1Gi cap with a 1Gi tmp + 350Mi scratch left /tmp
+	// with only ~650Mi effective and made a tmpSizeLimit override hit the same
+	// ceiling). The cap is derived from the volumes (scratch + tmp + headroom),
+	// so raising tmpSizeLimit raises it consistently.
+	//
+	// Mutation: hard-code the ephemeral limit back to 1Gi (loop_controller.go
+	// agentLimits) and the consistency assertion FAILS (the cap is no longer
+	// >= scratch + tmp once tmp > ~650Mi).
+	It("keeps the agent ephemeral-storage limit consistent with the /tmp and /scratch sizeLimits (F5 follow-up)", func() {
+		ns := "c1-f5eph-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// The default Loop (tmp = 1Gi, scratch = 350Mi): the cap must be >=
+		// scratch + tmp (1Gi + 350Mi = 1.35Gi), so /tmp is not capped below its
+		// sizeLimit.
+		name := "f5eph-default"
+		loop := buildLoop(name, ns)
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		sb := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
+		agent := agentContainer(sb)
+		limit := agent.Resources.Limits[corev1.ResourceEphemeralStorage]
+		var emptyDirTotal int64
+		for _, v := range sb.Spec.PodTemplate.Spec.Volumes {
+			if v.EmptyDir != nil && v.EmptyDir.SizeLimit != nil {
+				emptyDirTotal += v.EmptyDir.SizeLimit.Value()
+			}
+		}
+		Expect(limit.Value()).To(BeNumerically(">=", emptyDirTotal),
+			"the agent ephemeral-storage limit must be >= the sum of the emptyDir sizeLimits (scratch + tmp)")
+
+		// An override (tmpSizeLimit = 2Gi) must RAISE the cap consistently.
+		ns2 := "c1-f5eph-override-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns2}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns2}}) }()
+		name2 := "f5eph-override"
+		loop2 := buildLoop(name2, ns2)
+		loop2.Spec.Agent.TmpSizeLimit = "2Gi"
+		Expect(k8sClient.Create(ctx, loop2)).To(Succeed())
+		sb2 := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name2, ns2)
+		agent2 := agentContainer(sb2)
+		limit2 := agent2.Resources.Limits[corev1.ResourceEphemeralStorage]
+		var emptyDirTotal2 int64
+		for _, v := range sb2.Spec.PodTemplate.Spec.Volumes {
+			if v.EmptyDir != nil && v.EmptyDir.SizeLimit != nil {
+				emptyDirTotal2 += v.EmptyDir.SizeLimit.Value()
+			}
+		}
+		Expect(limit2.Value()).To(BeNumerically(">=", emptyDirTotal2),
+			"the ephemeral-storage limit must be >= scratch + the overridden tmp (2Gi)")
+		Expect(limit2.Value()).To(BeNumerically(">", limit.Value()),
+			"raising tmpSizeLimit must raise the ephemeral-storage limit (consistency)")
+	})
 })

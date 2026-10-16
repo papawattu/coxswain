@@ -1952,6 +1952,73 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			"the proxy FQDN must be in NO_PROXY (no loop to the proxy)")
 	})
 
+	// F9 (dogfood 3 finding): the acceptance-check containers (check-0, check-1,
+	// ...) ALSO traverse the egress proxy for toolchain fetches (Go modules from
+	// proxy.golang.org + sum.golang.org). WITHOUT the proxy env the checks dial
+	// proxy.golang.org directly and time out under the verify NetworkPolicy
+	// (which allows only DNS + the egress proxy): dogfood3's check-0 'go build
+	// ./...' failed with 'Get "https://proxy.golang.org/...": dial tcp ...: i/o
+	// timeout' even though the clone-base (which HAS the proxy env) succeeded
+	// through the proxy. Give every check container the SAME egress-proxy env as
+	// clone-base so checks reach exactly the Loop's allowlisted hosts through the
+	// audited proxy. The tamper / artifact / import-agent containers stay
+	// proxy-less (they need no network).
+	It("puts the egress-proxy env on every verify CHECK container for an external repo host (F9)", func() {
+		ns := "s5a-check-env-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "checkenv"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cred", Namespace: ns},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{workspaceCredsUsernameKey: []byte("u"), workspaceCredsPasswordKey: []byte("p")},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: "https://github.com/org/repo.git", GitCredentialSecret: "test-cred"},
+				Verify:    coxv1alpha1.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd, loopCheckCmd}},
+			},
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name)
+
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
+		// Every check-<k> container must carry the egress-proxy env (the
+		// acceptance checks are user-authored and may need a toolchain — `go
+		// build` fetches Go modules from proxy.golang.org + sum.golang.org).
+		for i, c := range job.Spec.Template.Spec.InitContainers {
+			if !strings.HasPrefix(c.Name, "check-") {
+				continue
+			}
+			env := map[string]string{}
+			for _, e := range c.Env {
+				env[e.Name] = e.Value
+			}
+			Expect(env["HTTPS_PROXY"]).To(ContainSubstring("-egress-proxy"),
+				"the verify %s check must traverse the egress proxy for toolchain fetches (F9)", c.Name)
+			Expect(env["NO_PROXY"]).To(ContainSubstring("-egress-proxy"),
+				"the proxy FQDN must be in NO_PROXY (no loop to the proxy) for %s", c.Name)
+			_ = i
+		}
+		// The tamper / artifact / import-agent containers must stay proxy-less
+		// (they only read the local clone; they need no network).
+		for _, c := range job.Spec.Template.Spec.InitContainers {
+			if c.Name == "tamper" || c.Name == "artifact" || c.Name == "import-agent" {
+				for _, e := range c.Env {
+					Expect(e.Name).ToNot(Equal("HTTPS_PROXY"),
+						"the %s container must NOT carry the egress-proxy env (it needs no network)", c.Name)
+				}
+			}
+		}
+	})
+
 	// I49 in-progress spec (D61, I90): the verify-egress hold. The gate is on
 	// the verify Job CREATE path only, and it fires when the clone-base fetch
 	// traverses the egress proxy (an external repo host, verifyNeedsProxy):

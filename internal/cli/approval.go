@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,6 +62,14 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	plan, err := dc.Workspace.Read(ctx, name, planPath)
 	if err != nil {
 		return fmt.Errorf("read the plan (to compute its hash): %w", err)
+	}
+	// F7 (dogfood 2 finding): refuse to approve when the plan is missing or
+	// empty. Hashing an absent plan would write a PlanApproved condition whose
+	// message carries sha256("") — the approval would bind to nothing (and a
+	// prior F7 variant bound it to a cat ERROR string). The user must wait for
+	// the agent to write the plan before approving.
+	if strings.TrimSpace(plan) == "" {
+		return fmt.Errorf("no plan to approve: %s is missing or empty in the workspace of loop %q (wait for the Planning phase to write it)", planPath, name)
 	}
 	hash := planSHA256([]byte(plan))
 	// Build the condition (the user is the sole writer of PlanApproved). The
@@ -253,6 +262,14 @@ func diffLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) erro
 	plan, err := dc.Workspace.Read(ctx, name, planPath)
 	if err != nil {
 		return fmt.Errorf("read the plan: %w", err)
+	}
+	// F7 (dogfood 2 finding): an empty plan (missing or blank) is shown as
+	// "no plan", not diffed as an empty document (an empty current plan would
+	// otherwise print "Plan changed" against any approved hash — the diff of
+	// nothing).
+	if strings.TrimSpace(plan) == "" {
+		_, _ = fmt.Fprintln(out, "No plan: "+planPath+" is missing or empty in the workspace of loop "+name)
+		return nil
 	}
 	// Read the Loop's PlanApproved condition (the last approved plan's hash).
 	obj, err := dc.Loops.Get(ctx, name)

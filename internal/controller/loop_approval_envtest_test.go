@@ -509,7 +509,7 @@ var _ = Describe("B3 plan approval gate", func() {
 			HeadCommit:    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", // sha256("plan-v1\n") — 40-hex
 		}
 		now := metav1.Now()
-		changed, advanced := r.recordPhaseClaim(loop, claim, now)
+		changed, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		_ = changed
 		Expect(advanced).To(BeTrue(), "the phase advanced (the claim-driven move to AwaitingApproval)")
 		// The phase is now AwaitingApproval (the hold re-enters — the user

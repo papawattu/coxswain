@@ -390,7 +390,7 @@ const claimSuccess = "success"
 // the next one. (A blocked claim's observedPhase equals the CURRENT phase
 // the runner was executing, never the next, so the nextPhase match
 // naturally rejects it: nextPhase(current, current) == current.)
-func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseClaim, now metav1.Time) (changed, advanced bool) {
+func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1.Loop, claim *PhaseClaim, now metav1.Time) (changed, advanced bool) {
 	// B5a: bump the iteration metric on a NEW-phase transition (a re-claim of
 	// the same phase does not bump). The claim's observedPhase is the phase
 	// the runner reports having executed (the destination of this advance).
@@ -496,6 +496,44 @@ func (r *LoopReconciler) recordPhaseClaim(loop *coxv1alpha1.Loop, claim *PhaseCl
 			advanced = true
 			changed = true
 		}
+	}
+	// I42b: Planning -> AwaitingApproval for Manual mode. When the runner
+	// completes a Planning run (success claim, observedPhase=Planning, current
+	// phase=Planning) in Manual mode, the Loop moves to AwaitingApproval (the
+	// hold). This transition lives here (not in applyApprovalGate) so it only
+	// happens when a FRESH claim is read (the agent actually ran). The gate's
+	// Planning -> AwaitingApproval branch (applyApprovalGate) handles the case
+	// where the Loop is ALREADY at AwaitingApproval (the hold) and the user
+	// approves/rejects.
+	if loop.Status.Phase == coxv1alpha1.LoopPhasePlanning &&
+		claim.ObservedPhase == coxv1alpha1.LoopPhasePlanning &&
+		claim.Status == claimSuccess &&
+		approvalMode(loop) == coxv1alpha1.ApprovalModeManual {
+		logf.FromContext(ctx).Info("advancing Planning -> AwaitingApproval on fresh Planning claim",
+			"loop", loop.Name,
+			"claimStatus", claim.Status,
+			"observedPhase", claim.ObservedPhase,
+			"planAttempt", claim.PlanAttempt,
+			"currentPlanAttempt", loop.Status.PlanAttempt)
+		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		// I42b: refresh lastActivityTime on the advance (the agent just ran;
+		// the claim is fresh). This is the evidence that the re-plan completed.
+		// The no-churn spec (R17 P1) is preserved because this branch only
+		// fires when the phase advances (a one-shot transition), not on every
+		// reconcile where the same claim is re-read.
+		if loop.Status.Progress == nil {
+			loop.Status.Progress = &coxv1alpha1.ProgressStatus{}
+		}
+		loop.Status.Progress.LastActivityTime = &now
+		if loop.Status.Progress.ObservedGeneration == 0 {
+			loop.Status.Progress.ObservedGeneration = loop.Generation
+		}
+		if loop.Status.Progress.BaseCommit == "" {
+			loop.Status.Progress.BaseCommit = loop.Status.BaseCommit
+		}
+		advanced = true
+		changed = true
 	}
 	// Keep status.observedPhase in sync with the claim (the B1 field; the
 	// progress block is the OS1 structured record).
@@ -679,7 +717,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			now = metav1.Now()
 		}
 		fromPhase := loop.Status.Phase
-		c, advanced := r.recordPhaseClaim(loop, claim, now)
+		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		changed = changed || c
 		// I89: map a ModelUnavailable claim to a Loop condition so
 		// `kubectl cox describe` shows the model backend is down. The

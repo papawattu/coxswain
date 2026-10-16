@@ -149,7 +149,7 @@ func TestMetricsPhaseTransitionBumpedOnNewPhase(t *testing.T) {
 	l.Namespace = "ns"
 	l.Status.Phase = coxv1alpha1.LoopPhasePlanning
 	claim := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 1}
-	_, _ = r.recordPhaseClaim(l, claim, now)
+	_, _ = r.recordPhaseClaim(context.Background(), l, claim, now)
 
 	got, _ := readMetric(t, "coxswain_loop_phase_transitions_total")
 	if got != 1 {
@@ -159,7 +159,7 @@ func TestMetricsPhaseTransitionBumpedOnNewPhase(t *testing.T) {
 	// A re-claim of the SAME phase (Implementing again) does not bump.
 	l.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 	claim2 := &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhaseImplementing, Status: "success", Iteration: 2}
-	_, _ = r.recordPhaseClaim(l, claim2, now)
+	_, _ = r.recordPhaseClaim(context.Background(), l, claim2, now)
 
 	got2, _ := readMetric(t, "coxswain_loop_phase_transitions_total")
 	if got2 != 1 {

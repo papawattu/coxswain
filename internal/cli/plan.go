@@ -9,8 +9,16 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// planPath is the workspace path of the plan the agent wrote (A3: `.coxswain/PLAN.md`).
-const planPath = ".coxswain/PLAN.md"
+// planPath is the ABSOLUTE path of the plan in the peek pod (A3:
+// `.coxswain/PLAN.md` in the workspace, mounted at /workspace in the peek pod).
+// F7 (dogfood 2 finding): the path must be absolute. The peek pod's WORKDIR is
+// image-dependent (golang:1.26 sets /workspace; busybox does not), so a relative
+// path like `.coxswain/PLAN.md` resolves against the image's WORKDIR and can
+// point to the wrong place (busybox starts in /, so `cat .coxswain/PLAN.md`
+// fails with "No such file" even though /workspace/.coxswain/PLAN.md exists).
+// The absolute path /workspace/.coxswain/PLAN.md is correct regardless of the
+// image's WORKDIR.
+const planPath = "/workspace/.coxswain/PLAN.md"
 
 // newPlanCommand builds `cox plan <loop>`: read the plan from the workspace
 // PVC (A3).

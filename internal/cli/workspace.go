@@ -87,7 +87,7 @@ spec:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
-    command: ["/bin/sh", "-c", "cat %s 2>&1 || { echo \"plan read failed: cat exit $?\" >&2; exit 1; }\n"
+    command: ['/bin/sh', '-c', 'cat %s 2>&1 || { echo plan-read-failed-cat-exit-$? >&2; exit 1; }']
     volumeMounts:
     - name: ws
       mountPath: /workspace

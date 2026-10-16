@@ -475,6 +475,36 @@ func verifyGitSafeEnv() []corev1.EnvVar {
 	}
 }
 
+// egressProxyEnv returns the egress-proxy env vars (HTTPS_PROXY / https_proxy /
+// HTTP_PROXY / http_proxy + NO_PROXY / no_proxy) that route a container's
+// egress through the Loop's egress proxy Service. The proxy's SNI allowlist
+// carries the Loop's allowlisted hosts (the AgentPolicy's network allows), so
+// a container with this env reaches EXACTLY those hosts through the audited
+// proxy — no other egress. NO_PROXY keeps in-cluster egress (the workspace
+// PVC, the model proxy, the egress proxy itself, loopback) direct. Used by the
+// clone-base init (D61/I42) and, since F9, by the acceptance-check containers
+// (a check that needs a toolchain — `go build` fetches Go modules from
+// proxy.golang.org + sum.golang.org — otherwise dials those hosts directly and
+// times out under the verify NetworkPolicy, which only allows DNS + the egress
+// proxy). An in-cluster repo (verifyNeedsProxy false) keeps the direct path —
+// callers skip this (the checks have no proxy env).
+func (r *LoopReconciler) egressProxyEnv(loop *coxv1alpha1.Loop) []corev1.EnvVar {
+	proxyURL := r.egressProxyServiceURL(loop.Name, loop.Namespace)
+	noProxy := strings.Join([]string{
+		EgressProxyServiceFQDN(loop.Name, loop.Namespace),
+		EgressProxyServiceFQDN(loop.Name, loop.Namespace) + "." + r.clusterDomain(),
+		noProxyLocal,
+	}, ",")
+	return []corev1.EnvVar{
+		{Name: envHTTPSProxy, Value: proxyURL},
+		{Name: envHttpsProxy, Value: proxyURL},
+		{Name: envHTTPProxy, Value: proxyURL},
+		{Name: envHttpProxy, Value: proxyURL},
+		{Name: envNoProxy, Value: noProxy},
+		{Name: envNoProxyLower, Value: noProxy},
+	}
+}
+
 // buildVerifyJobSpec builds the verify Job's spec: the init containers in
 // evidence order + the no-op main container + restartPolicy Never +
 // backoffLimit 0 (B3b: exactly one run).
@@ -518,20 +548,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	// and the workspace init container's S6 proxy env. An in-cluster repo
 	// (repoPeer non-nil) keeps the direct path — no proxy env.
 	if r.verifyNeedsProxy(loop) {
-		proxyURL := r.egressProxyServiceURL(loop.Name, loop.Namespace)
-		noProxy := strings.Join([]string{
-			EgressProxyServiceFQDN(loop.Name, loop.Namespace),
-			EgressProxyServiceFQDN(loop.Name, loop.Namespace) + "." + r.clusterDomain(),
-			noProxyLocal,
-		}, ",")
-		cloneCt.Env = append(cloneCt.Env,
-			corev1.EnvVar{Name: envHTTPSProxy, Value: proxyURL},
-			corev1.EnvVar{Name: envHttpsProxy, Value: proxyURL},
-			corev1.EnvVar{Name: envHTTPProxy, Value: proxyURL},
-			corev1.EnvVar{Name: envHttpProxy, Value: proxyURL},
-			corev1.EnvVar{Name: envNoProxy, Value: noProxy},
-			corev1.EnvVar{Name: envNoProxyLower, Value: noProxy},
-		)
+		cloneCt.Env = append(cloneCt.Env, r.egressProxyEnv(loop)...)
 	}
 
 	// The git credential mount: ONLY when the Loop declares a git secret AND
@@ -675,6 +692,28 @@ exit 0
 			},
 		}
 		checkCts = append(checkCts, ct)
+	}
+
+	// F9 (dogfood 3 finding): the acceptance-check containers (check-0, check-1,
+	// ...) ALSO need network for toolchain fetches (Go modules from
+	// proxy.golang.org + sum.golang.org, npm, pip). The verify NetworkPolicy
+	// allows egress only to DNS + the egress proxy, and the proxy's SNI allowlist
+	// carries the Loop's allowlisted hosts (proxy.golang.org, sum.golang.org,
+	// github.com — see the AgentPolicy). WITHOUT the proxy env the checks dial
+	// proxy.golang.org directly and the (non-allowlisted) direct egress times
+	// out: check-0 'go build ./...' failed with 'Get "https://proxy.golang.org/...":
+	// dial tcp ...: i/o timeout' even though the clone-base (which HAS the proxy
+	// env) succeeded through the proxy. Give every check container the SAME
+	// egress-proxy env as clone-base, so checks reach exactly the Loop's
+	// allowlisted hosts through the audited proxy. No direct egress, no IPBlocks
+	// are added (the verify netpol is unchanged); the checks simply route through
+	// the proxy they were already allowed to talk to. The tamper / artifact /
+	// import-agent containers need no network (they only read the local clone,
+	// so they stay proxy-less).
+	if r.verifyNeedsProxy(loop) {
+		for i := range checkCts {
+			checkCts[i].Env = append(checkCts[i].Env, r.egressProxyEnv(loop)...)
+		}
 	}
 
 	// The main container: a no-op (the inits do the work). It exits 0

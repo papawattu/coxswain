@@ -567,8 +567,8 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(loop.Status.Progress.LastActivityTime).ToNot(BeNil(),
 			"lastActivityTime must be set")
 		// The API server truncates timestamps to seconds; compare with Truncate.
-		actualTime := loop.Status.Progress.LastActivityTime.Time.Truncate(time.Second)
-		expectedTime := staleTime.Time.Truncate(time.Second)
+		actualTime := loop.Status.Progress.LastActivityTime.Truncate(time.Second)
+		expectedTime := staleTime.Truncate(time.Second)
 		Expect(actualTime.Equal(expectedTime)).To(BeTrue(),
 			"lastActivityTime must be UNCHANGED after a reject with no new claim (the rejection does not refresh it)")
 	})
@@ -625,7 +625,7 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		Expect(loop.Status.Progress).ToNot(BeNil(),
 			"status.progress must be set before the re-plan claim")
-		preClaimTime := loop.Status.Progress.LastActivityTime.Time.Truncate(time.Second)
+		preClaimTime := loop.Status.Progress.LastActivityTime.Truncate(time.Second)
 		// The re-plan claim (a fresh claim with the current planAttempt; the
 		// claim's planAttempt must equal status.planAttempt, which the reject
 		// incremented to 1). recordPhaseClaim refreshes lastActivityTime on
@@ -645,7 +645,7 @@ var _ = Describe("B3 plan approval gate", func() {
 		// P1 (b): lastActivityTime is > the pre-claim value (the claim-driven
 		// advance refreshed it; the reject alone left the stale value in
 		// place, so a no-refresh would leave it at the pre-claim value).
-		actualTime := loop.Status.Progress.LastActivityTime.Time.Truncate(time.Second)
+		actualTime := loop.Status.Progress.LastActivityTime.Truncate(time.Second)
 		Expect(actualTime.After(preClaimTime)).To(BeTrue(),
 			"lastActivityTime must be > the pre-claim value (the re-plan claim refreshed it; a no-refresh would leave the pre-claim value in place)")
 

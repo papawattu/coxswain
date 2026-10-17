@@ -833,11 +833,19 @@ func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1al
 	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
 	copy(condsBefore, loop.Status.Conditions)
 	if policiesReadable {
-		if err := r.applyEffectivePolicyAndConditions(ctx, loop); err != nil {
-			logf.FromContext(ctx).Error(err, "Deleting Loop: the effective policy resolution failed; requeueing", "loop", loop.Name)
-			return ctrl.Result{}, err
+		if err := r.applyEffectivePolicyAndConditionsBestEffort(ctx, loop); err != nil {
+			// F12 (the #164 review): a deleting Loop's enforcement writes are
+			// moot (the sandbox is torn down with the Loop) and are run
+			// BEST-EFFORT: in a terminating namespace the KubeArmorPolicy writes
+			// are Forbidden, and an error return here would end the pass BEFORE
+			// the CleaningUp work (the B1 finalizer removal) — the namespace
+			// hangs in Terminating. The conditions are still recorded (the
+			// resolve + the condition half run first); only the write failure is
+			// tolerated (with an Event), never an error that blocks CleaningUp.
+			logf.FromContext(ctx).Error(err, "Deleting Loop: the effective policy enforcement write failed (best-effort; the CleaningUp work proceeds — F12)",
+				"loop", loop.Name)
 		}
-		logf.FromContext(ctx).Info("Deleting Loop: the effective policy was applied (conditions resolved)", "loop", loop.Name)
+		logf.FromContext(ctx).Info("Deleting Loop: the effective policy was applied (conditions resolved; enforcement writes best-effort — F12)", "loop", loop.Name)
 	} else {
 		logf.FromContext(ctx).Info("Deleting Loop: the referenced AgentPolicy is not readable (a terminating namespace); the effective policy is not resolved (the policy enforcement is moot on a deleting Loop — F10b)",
 			"loop", loop.Name)

@@ -574,15 +574,16 @@ var _ = Describe("B3 plan approval gate", func() {
 	})
 
 	// P1 (reviewer fix): a new planAttempt claim refreshes lastActivityTime
-	// on the claim-driven advance (recordPhaseClaim). This is the fix for the
-	// F4 gap: the re-plan's advance did not refresh lastActivityTime because
-	// progressEqual suppressed the write when the claim-derived fields were
-	// the same. Now planAttempt is included in progressEqual, so a re-plan
-	// claim (same phase, iteration, status but a new planAttempt) triggers a
-	// progress write, which refreshes lastActivityTime.
+	// on the claim-driven advance (recordPhaseClaim). The re-plan claim must
+	// be identical to the previous one in every progress field except
+	// planAttempt (same phase, status, iteration, blockedReason), so that
+	// only the new PlanAttempt comparison in progressEqual makes the
+	// progress write fire. This is the fix for the F4 gap: the re-plan's
+	// advance did not refresh lastActivityTime because progressEqual
+	// suppressed the write when the claim-derived fields were the same.
 	//
-	// (b) reject then a new planAttempt claim gives lastActivityTime >= the
-	// claim-processing time.
+	// (b) reject then a new planAttempt claim (identical in every progress
+	// field except planAttempt) refreshes lastActivityTime.
 	It("P1 (b): reject then a new planAttempt claim refreshes lastActivityTime", func() {
 		ns := "p2-replan-b-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
@@ -590,15 +591,44 @@ var _ = Describe("B3 plan approval gate", func() {
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
 		_, r := makeLoop(ns, "p2-replan-b", coxv1alpha1.ApprovalModeManual, coxv1alpha1.OnRejectReplan)
-		// Move the Loop to AwaitingApproval with a STALE lastActivityTime.
+		// Move the Loop to AwaitingApproval with a STALE lastActivityTime and
+		// a progress record from the PRIOR claim (planAttempt=0, same
+		// phase/status/iteration as the re-plan claim). The reject branch does
+		// not write progress (it only moves the phase to Planning and
+		// increments planAttempt), so the progress record survives the reject
+		// unchanged. The re-plan claim (planAttempt=1) differs from the
+		// progress record in exactly one field (planAttempt), so
+		// progressEqual can only make the progress write fire on the new
+		// PlanAttempt comparison.
+		//
+		// The clock is overridden so the refresh is deterministic (the operator
+		// stamps lastActivityTime with now(); without the override, the
+		// same-second refresh can be indistinguishable from the stale value at
+		// 1-second precision).
+		var fakeNow int64
+		r.now = func() metav1.Time { return metav1.NewTime(time.Now().Add(time.Duration(fakeNow) * time.Second)) }
 		staleTime := metav1.NewTime(time.Now().Add(-2 * time.Hour).Truncate(time.Second))
 		loop := &coxv1alpha1.Loop{}
 		nn := types.NamespacedName{Name: "p2-replan-b", Namespace: ns}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+		// The iteration is 1 (matching the progress record and the re-plan
+		// claim). The S5a stale-iteration guard (advancePhaseFromClaim) rejects
+		// a claim whose Iteration differs from loop.Status.Iteration; without
+		// this, the re-plan claim (Iteration=1) is rejected before
+		// recordPhaseClaim is called.
+		loop.Status.Iteration = 1
+		// The progress record is the PRIOR claim's record (planAttempt=0,
+		// same phase/status/iteration as the re-plan claim). Only
+		// planAttempt differs, so progressEqual can only make the progress
+		// write fire on the new PlanAttempt comparison.
 		loop.Status.Progress = &coxv1alpha1.ProgressStatus{
+			Phase:            coxv1alpha1.LoopPhasePlanning,
 			LastActivityTime: &staleTime,
+			Iteration:        1,
+			LastResultStatus: "success",
+			PlanAttempt:      0, // the prior plan (the reject increments to 1)
 		}
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
@@ -607,33 +637,37 @@ var _ = Describe("B3 plan approval gate", func() {
 			"Rejected: the plan is missing error handling")
 		reconcileLoop(r, ns, "p2-replan-b")
 
+		// The reject branch does NOT write progress (it only moves the phase
+		// to Planning and increments planAttempt). The progress record is
+		// still the prior claim's record (planAttempt=0, stale
+		// lastActivityTime). The re-plan claim (planAttempt=1) will be
+		// compared against that record on the claim-driven advance.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Progress).ToNot(BeNil(),
+			"the progress record must survive the reject (the reject branch does not write progress)")
+		Expect(loop.Status.Progress.LastActivityTime).ToNot(BeNil(),
+			"the stale lastActivityTime must survive the reject (the reject branch does not refresh it)")
+		preClaimTime := loop.Status.Progress.LastActivityTime.Truncate(time.Second)
+
 		// The re-plan moved the phase to Planning.
 		loop = &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
 			"the re-plan moved the phase to Planning")
 
-		// Now the runner's re-plan Planning claim arrives (a new planAttempt).
-		// The claim has the same phase, iteration, and status as the prior
-		// plan's claim, but a new planAttempt. This triggers a progress write
-		// (progressEqual now includes planAttempt), which refreshes
-		// lastActivityTime.
-		// Capture the pre-claim lastActivityTime (the stale value the reject
-		// left in place). The claim-driven advance's recordPhaseClaim must
-		// overwrite it with the claim-processing time.
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-		Expect(loop.Status.Progress).ToNot(BeNil(),
-			"status.progress must be set before the re-plan claim")
-		preClaimTime := loop.Status.Progress.LastActivityTime.Truncate(time.Second)
-		// The re-plan claim (a fresh claim with the current planAttempt; the
-		// claim's planAttempt must equal status.planAttempt, which the reject
-		// incremented to 1). recordPhaseClaim refreshes lastActivityTime on
-		// the claim-driven advance.
+		// Now the runner's re-plan Planning claim arrives. The claim is
+		// identical to the previous one in every progress field except
+		// planAttempt (same phase=Planning, status=success, iteration=1,
+		// no blockedReason; planAttempt=1 vs the prior 0). recordPhaseClaim
+		// refreshes lastActivityTime on the claim-driven advance (the new
+		// PlanAttempt comparison in progressEqual makes the write fire).
+		fakeNow = 1
 		reportClaim(r, ns, "p2-replan-b", &PhaseClaim{
 			ObservedPhase: coxv1alpha1.LoopPhasePlanning,
 			Status:        "success",
-			PlanAttempt:   1, // the re-plan (planAttempt incremented by the reject)
+			Iteration:     1, // matches the progress record's iteration (the S5a guard passes)
+			PlanAttempt:   1, // the re-plan (planAttempt incremented by the reject; the only field that differs)
 		})
 
 		loop = &coxv1alpha1.Loop{}
@@ -643,19 +677,27 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(loop.Status.Progress.LastActivityTime).ToNot(BeNil(),
 			"lastActivityTime must be set after the re-plan claim")
 		// P1 (b): lastActivityTime is > the pre-claim value (the claim-driven
-		// advance refreshed it; the reject alone left the stale value in
-		// place, so a no-refresh would leave it at the pre-claim value).
+		// advance refreshed it; a no-refresh would leave the pre-claim value
+		// in place). preClaimTime is the stale value the reject left in the
+		// progress record (the reject branch does not write progress). The
+		// clock was advanced 1s before the claim, so the refreshed value is
+		// strictly after the pre-claim value (deterministic, not a
+		// same-second flake).
 		actualTime := loop.Status.Progress.LastActivityTime.Truncate(time.Second)
 		Expect(actualTime.After(preClaimTime)).To(BeTrue(),
-			"lastActivityTime must be > the pre-claim value (the re-plan claim refreshed it; a no-refresh would leave the pre-claim value in place)")
+			"lastActivityTime must be > the stale pre-claim value (the re-plan claim refreshed it; a no-refresh would leave the stale value in place)")
 
-		// Mutation: drop the PlanAttempt from progressEqual (revert to comparing
-		// only Phase, LastResultStatus, BlockedReason, Iteration) and this spec
-		// FAILS (the re-plan claim is suppressed by progressEqual, so
-		// lastActivityTime stays at the stale value).
+		// Mutation B: drop `&& a.PlanAttempt == b.PlanAttempt` from
+		// progressEqual (loop_s4_phase.go:575-576) — the re-plan claim is
+		// identical to the progress record in every progress field, so
+		// progressEqual returns true and no progress write fires;
+		// lastActivityTime stays at the stale value and this spec FAILS.
 		//
-		// Mutation: move the stamp back to the reject (loop_approval.go) and
-		// spec (a) FAILS (lastActivityTime is refreshed at the reject, not at
-		// the claim).
+		// Mutation C: drop `PlanAttempt: claim.PlanAttempt,` from
+		// recordPhaseClaim (loop_s4_phase.go:420) — the progress record's
+		// PlanAttempt is 0 (zero-value), the same as the prior claim; the
+		// candidate's PlanAttempt is also 0, so progressEqual returns true
+		// and no progress write fires; lastActivityTime stays at the stale
+		// value and this spec FAILS.
 	})
 })

@@ -280,6 +280,13 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Cache: cache.Options{
+			// F10: the global 30s SyncPeriod (the first attempt) was too broad —
+			// it resynced every cached object (all Loops, the proxy Pods and
+			// Services) every 30s for the operator's lifetime, to fix one case.
+			// The fix is now targeted: reconcileCleaningUp (the B1 finalizer's
+			// work for a deleting Loop) returns a RequeueAfter when the
+			// finalizer-removal Update is rejected (a terminating namespace), so
+			// only that Loop is retried. No global resync is needed.
 			// Scope the Pod and Service cache to the operator's two proxy
 			// components (the model proxy and the egress proxy) so the
 			// operator doesn't cache every Pod and Service in the cluster

@@ -624,6 +624,16 @@ func isNotFound(err error) bool {
 	return apierrors.IsNotFound(err)
 }
 
+// isForbidden is true when the apiserver rejected the request because the
+// namespace is terminating (Forbidden: "unable to create new content in
+// namespace ... because it is being terminated") or an RBAC denial. For the
+// checkpoint GC (B1 finalizer cleanup) a Forbidden delete is NOT a real
+// failure: the namespace is going away and its children (including the
+// checkpoint) are torn down with it, so the finalizer can be removed.
+func isForbidden(err error) bool {
+	return apierrors.IsForbidden(err)
+}
+
 // gcLoopCheckpoints deletes the Loop's checkpoint VolumeSnapshots (B1
 // finalizer: CleaningUp). It lists the snapshots by the Loop label and
 // deletes each (NotFound is a success — the GC is idempotent). It returns
@@ -669,13 +679,32 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 	if !r.snapshotCRDPresentCall(ctx) {
 		// No CRD: there are no snapshots to delete (the operator never
 		// created any — the support check was False from the start). Done.
+		logf.FromContext(ctx).Info("CleaningUp GC: the VolumeSnapshot CRD is not present; nothing to GC (done)",
+			"loop", loop.Name, "namespace", loop.Namespace)
 		return true, nil
 	}
 	if err := r.List(ctx, list,
 		client.InNamespace(loop.Namespace),
 		client.MatchingLabels{"coxswain.wattu.com/loop": loop.Name}); err != nil {
+		// F10: a terminating namespace rejects creates (Forbidden: "unable to
+		// create new content in namespace ... because it is being terminated")
+		// and can fail list reads too. The namespace is going away: its children
+		// (including any checkpoint) are torn down with it by the apiserver's
+		// namespace-level GC, so there is nothing left to clean. Treat this as
+		// "done" (the caller removes the finalizer) rather than an error —
+		// blocking the finalizer on an unrecoverable condition (a namespace that
+		// is terminating) would leave the Loop, and so the namespace, stuck
+		// forever (the dogfood4-df4 repro: the namespace delete hung 52+ min on
+		// the Loop's checkpoint finalizer). NotFound is the same: the snapshot
+		// (or the whole CRD, in a namespace being torn down) is gone.
+		if isNotFound(err) || isForbidden(err) {
+			logf.FromContext(ctx).Info("CleaningUp GC: the checkpoint list was rejected (terminating namespace or gone); the children go away with the namespace (done)",
+				"loop", loop.Name, "namespace", loop.Namespace, "err", err.Error())
+			return true, nil
+		}
 		return false, fmt.Errorf("list checkpoint VolumeSnapshots for GC: %w", err)
 	}
+	logf.FromContext(ctx).Info("CleaningUp GC: the checkpoint list was read", "loop", loop.Name, "namespace", loop.Namespace, "snapshots", len(list.Items))
 	for i := range list.Items {
 		item := list.Items[i].DeepCopy()
 		// B2 FORK-RETENTION: a fork-seeded snapshot carries the label
@@ -691,7 +720,10 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 		if _, ok := item.GetLabels()["coxswain.wattu.com/fork-of"]; ok {
 			continue // a fork still needs this snapshot: skip it
 		}
-		if delErr := r.Delete(ctx, item); delErr != nil && !isNotFound(delErr) {
+		if delErr := r.Delete(ctx, item); delErr != nil && !isNotFound(delErr) && !isForbidden(delErr) {
+			// F10: a Forbidden delete (a terminating namespace rejects it) is not
+			// a real failure — the snapshot goes away with the namespace. Only a
+			// genuine error (e.g. a transient apiserver failure) requeues.
 			return false, delErr
 		}
 	}
@@ -733,6 +765,7 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 			remaining++
 		}
 	}
+	logf.FromContext(ctx).Info("CleaningUp GC: the checkpoint re-list was read", "loop", loop.Name, "namespace", loop.Namespace, "snapshots", len(list.Items), "non-fork-retained", remaining)
 	return remaining == 0, nil
 }
 
@@ -750,28 +783,72 @@ func (r *LoopReconciler) applyLoopFinalizer(ctx context.Context, loop *coxv1alph
 
 // finalizeB2DeleteStep is the B2-deleting early return (a Loop being deleted
 // — deletionTimestamp set): it validates the referenced AgentPolicies +
-// endpointSecretRef/modelEndpoint pair (C6a + D34), resolves the effective
-// policy (D30 gate), runs the B2 workspace restore step (b2ApplyRestoreStep —
-// the restore decision is the durable record a deleting Loop leaves behind),
-// persists the decision (finalizeB2Delete, the I90 point-of-decision write),
-// and runs the CleaningUp work (the B1 finalizer's snapshot GC + the
-// finalizer removal). It is the same B1 behaviour a deleting Loop had before
-// B2, with the B2 decision now running BEFORE the snapshot GC — and it is
-// what keeps Reconcile within the gocyclo budget (the deleting branch is the
-// whole early-return, not a nested sequence of steps).
+// endpointSecretRef/modelEndpoint pair (C6a + D34) without HOLDING the
+// pass, resolves the effective policy when the referenced policies are
+// readable (D30 gate), runs the B2 workspace restore step
+// (b2ApplyRestoreStep — a no-op for a deleting Loop), persists the decision
+// (finalizeB2Delete, the I90 point-of-decision write), and runs the
+// CleaningUp work (the B1 finalizer's snapshot GC + the finalizer removal).
+// It is what keeps Reconcile within the gocyclo budget (the deleting branch
+// is the whole early-return, not a nested sequence of steps).
+//
+// F10b (the dogfood4-df4 hang): the LIVE validateStep is a HARD gate for a
+// deleting Loop. The dogfood4-df4 Loop referenced an AgentPolicy that had
+// been deleted from its terminating namespace (namespaced objects are gone
+// by the time the operator reconciles the deleting Loop — the live kind
+// state showed PolicyValid=False/PolicyNotFound and the finalizer stuck for
+// 8+ hours). The validation re-checks the spec on every pass, the spec never
+// changes, so the deleting path requeued forever and the finalizer was never
+// removed (the namespace hung in Terminating). A deleting Loop's policy
+// enforcement is moot (the sandbox is torn down with the Loop), and a
+// MISSING referenced policy is not a misconfiguration to hold on — it is the
+// expected state of a namespace mid-teardown. The deleting path therefore
+// records the validation result as a condition (the same PolicyValid/
+// ModelConfigValid conditions, so the record is identical to the live
+// path's) and ALWAYS proceeds to the CleaningUp work (the B2 restore step
+// is a no-op for a deleting Loop, so the decision it leaves behind is
+// "no restore applies" — the same as before F10b). The effective policy is
+// resolved only when every referenced policy is readable (effectivePolicy
+// errors on a missing AgentPolicy); when one is gone, the policy steps are
+// skipped (there is nothing to resolve) and the conditions still record the
+// validation result.
 func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, error) {
-	if res, done := r.validateStep(ctx, loop); done {
-		return res, nil
+	logf.FromContext(ctx).Info("Deleting Loop: entering the B2-deleting early return (validate + policy + restore decision + CleaningUp)",
+		"loop", loop.Name, "namespace", loop.Namespace, "deletionTimestamp", loop.DeletionTimestamp.String())
+	// F10b: the spec validation is OBSERVED, not a gate, for a deleting Loop
+	// (the comment above covers the why — the dogfood4-df4 hang: a missing
+	// referenced AgentPolicy in a terminating namespace must not requeue this
+	// path forever and hold the finalizer). The conditions are set exactly as
+	// the live validateStep sets them, so the durable record is identical.
+	policiesReadable := true
+	if !r.agentPoliciesValid(ctx, loop) {
+		policiesReadable = false
+		logf.FromContext(ctx).Info("Deleting Loop: the spec validation observed an invalid reference (recorded as a condition; NOT holding the pass — F10b)",
+			"loop", loop.Name)
+	}
+	if r.modelConfigInvalid(ctx, loop) {
+		logf.FromContext(ctx).Info("Deleting Loop: the spec validation observed an incomplete endpoint pair (recorded as a condition; NOT holding the pass — F10b)",
+			"loop", loop.Name)
 	}
 	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
 	copy(condsBefore, loop.Status.Conditions)
-	if err := r.applyEffectivePolicyAndConditions(ctx, loop); err != nil {
-		return ctrl.Result{}, err
+	if policiesReadable {
+		if err := r.applyEffectivePolicyAndConditions(ctx, loop); err != nil {
+			logf.FromContext(ctx).Error(err, "Deleting Loop: the effective policy resolution failed; requeueing", "loop", loop.Name)
+			return ctrl.Result{}, err
+		}
+		logf.FromContext(ctx).Info("Deleting Loop: the effective policy was applied (conditions resolved)", "loop", loop.Name)
+	} else {
+		logf.FromContext(ctx).Info("Deleting Loop: the referenced AgentPolicy is not readable (a terminating namespace); the effective policy is not resolved (the policy enforcement is moot on a deleting Loop — F10b)",
+			"loop", loop.Name)
 	}
 	b2Changed, b2Requeue, _, err := r.b2ApplyRestoreStep(ctx, loop)
 	if err != nil {
+		logf.FromContext(ctx).Error(err, "Deleting Loop: the B2 restore step failed; requeueing", "loop", loop.Name)
 		return ctrl.Result{}, err
 	}
+	logf.FromContext(ctx).Info("Deleting Loop: the B2 restore step decided (a deleting Loop does no restore work immediately — F10b proceeds to the finalizer work)",
+		"loop", loop.Name, "b2Changed", b2Changed, "b2Requeue", b2Requeue)
 	return r.finalizeB2Delete(ctx, loop, condsBefore, b2Changed, b2Requeue)
 }
 
@@ -795,8 +872,10 @@ func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1al
 func (r *LoopReconciler) finalizeB2Delete(ctx context.Context, loop *coxv1alpha1.Loop, condsBefore []metav1.Condition, b2Changed bool, b2Requeue bool) (ctrl.Result, error) {
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 	if err := r.finalizeLoopStatus(ctx, loop, b2Changed, conditionsChanged, false, false, ""); err != nil {
+		logf.FromContext(ctx).Error(err, "Deleting Loop: the restore-decision status write failed; requeueing", "loop", loop.Name)
 		return ctrl.Result{}, err
 	}
+	logf.FromContext(ctx).Info("Deleting Loop: the restore decision was persisted", "loop", loop.Name, "conditionsChanged", conditionsChanged)
 	if b2Requeue {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
@@ -829,24 +908,55 @@ func (r *LoopReconciler) finalizeB2Delete(ctx context.Context, loop *coxv1alpha1
 // async on a real cluster; the finalizer's work is idempotent — a re-read
 // next reconcile finds what is left).
 func (r *LoopReconciler) reconcileCleaningUp(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, error) {
+	logf.FromContext(ctx).Info("Deleting Loop: entering CleaningUp (the B1 finalizer's checkpoint GC + finalizer removal)",
+		"loop", loop.Name, "namespace", loop.Namespace)
 	done, err := r.gcLoopCheckpoints(ctx, loop)
 	if err != nil {
-		// A delete failed: requeue (the finalizer stays, the GC retries).
+		// A real (not terminating-ns) GC error: surface it as an Event so the
+		// user sees the cleanup is stuck (the dogfood4-df4 repro left the Loop
+		// silently holding the finalizer — no Event, no log once the error
+		// loop exhausted). Requeue to retry, but the Event is the durable record
+		// that the finalizer is blocked (I90: a fallback/degradation must be
+		// visible, not silent).
 		logf.FromContext(ctx).Error(err, "CleaningUp: the checkpoint GC failed; requeueing (the finalizer keeps the Loop until the GC is done)",
 			"loop", loop.Name)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "CheckpointGCFailed",
+				"checkpoint GC failed during namespace cleanup; requeueing (the finalizer keeps the Loop until the GC is done): %v", err)
+		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if !done {
 		// The delete is async (the object is not gone yet): requeue.
+		logf.FromContext(ctx).Info("CleaningUp: a checkpoint delete is in progress; requeueing", "loop", loop.Name)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+	logf.FromContext(ctx).Info("CleaningUp: the checkpoint GC is done (no snapshot remains); removing the finalizer", "loop", loop.Name)
 	// The GC is done (no snapshot remains): remove the finalizer so the
 	// apiserver can delete the Loop. A Conflict (another writer touched the
 	// Loop's finalizers) is a reconcile error the controller retries — the
 	// next reconcile re-runs the GC (idempotent) and retries the removal.
+	// A Forbidden (a terminating namespace rejects the Update) is NOT a real
+	// failure: the namespace is going away and its children (including the
+	// Loop) are torn down with it, so the finalizer is moot once the namespace
+	// is gone. Surface the reason as an Event and requeue with a targeted
+	// RequeueAfter (not the error backoff, which caps at 1000s) so only this
+	// Loop is retried (F10: the global 30s SyncPeriod was too broad — it
+	// resynced every cached object for the operator's lifetime to fix one
+	// case; a targeted RequeueAfter retries only this Loop).
 	if err := r.removeLoopCheckpointFinalizer(ctx, loop); err != nil {
+		if isForbidden(err) {
+			logf.FromContext(ctx).Info("CleaningUp: the finalizer-removal Update was rejected (terminating namespace); requeueing", "loop", loop.Name)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "FinalizerRemovalBlocked",
+					"finalizer removal rejected (terminating namespace); requeueing: %v", err)
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		logf.FromContext(ctx).Error(err, "CleaningUp: the finalizer removal failed; requeueing with backoff", "loop", loop.Name)
 		return ctrl.Result{}, err
 	}
+	logf.FromContext(ctx).Info("CleaningUp: the finalizer was removed; the Loop (and its namespace, when nothing else remains) can now be deleted", "loop", loop.Name)
 	return ctrl.Result{}, nil
 }
 

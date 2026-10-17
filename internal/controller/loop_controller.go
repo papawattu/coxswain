@@ -310,6 +310,12 @@ type LoopReconciler struct {
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
+	// applyEnforcementWritesFn is the F12 deleting-path seam: a test drives the
+	// Enforcer.Apply (the KubeArmorPolicy write) directly without a real
+	// unstructured round-trip (the envtest cluster has no KubeArmorPolicy
+	// CRD). nil (the default) = the Enforcer's own Apply (the live behaviour).
+	ApplyEnforcementWritesFn func(ctx context.Context, loop *coxv1alpha1.Loop, ep policy.EffectivePolicy) error
+
 	// workspaceDriverSeam is the B1 checkpoint seam: it resolves the
 	// workspace PVC's CSI driver for the VolumeSnapshotClass support check.
 	// When set (a test drives it directly without a real StorageClass — the
@@ -4813,6 +4819,70 @@ func isPodReady(pod *corev1.Pod) bool {
 	return false
 }
 
+// applyEnforcementWrites runs the enforcement WRITE side of the policy apply
+// (the Enforcer.Apply + the KubeArmorPolicyConflict handling + the
+// KaptSpecHash record). It is extracted from applyEffectivePolicyAndConditions
+// so the deleting path (finalizeB2DeleteStep) can run it BEST-EFFORT (F12):
+// in a terminating namespace the KubeArmorPolicy writes are Forbidden, and a
+// deleting Loop's enforcement is moot (the sandbox is torn down with the
+// Loop) — the write failure must NOT block the CleaningUp work (the B1
+// finalizer removal), or the namespace hangs in Terminating. The live path
+// calls this through applyEffectivePolicyAndConditions and propagates every
+// error (the live path is unchanged).
+func (r *LoopReconciler) applyEnforcementWrites(ctx context.Context, loop *coxv1alpha1.Loop, effective policy.EffectivePolicy) error {
+	// I42f review P2 (round 1): a foreign KubeArmorPolicy occupying one of
+	// the Loop's policy names is NEVER overwritten (createOrUpdateKapt's
+	// errForeignKapt sentinel). The same pattern as I42c's
+	// NetworkPolicyConflict: set KubeArmorPolicyConflict=True/
+	// ForeignKubeArmorPolicy and hold the sandbox Suspended (the
+	// order-independent gate in ensureSandbox reads the live objects).
+	// Reconcile does not error-loop.
+	applyErr := r.enforcementApply(ctx, loop, effective)
+	if applyErr != nil && errors.Is(applyErr, engine.ErrForeignKapt) {
+		setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionTrue, "ForeignKubeArmorPolicy",
+			"a KubeArmorPolicy controlled by another controller occupies a coxswain-<loop> name; left untouched")
+		return r.Status().Update(ctx, loop)
+	}
+	// A conflict was resolved this reconcile (a previously foreign policy
+	// is gone or now Loop-owned): clear it to False/Resolved when it was
+	// previously set (the hadNetpolConflict pattern).
+	if hadKaptConflict(loop) {
+		setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionFalse, "Resolved",
+			"all per-Loop KubeArmorPolicies are controlled by this Loop")
+		if err := r.Status().Update(ctx, loop); err != nil {
+			return fmt.Errorf("update Loop status (KubeArmorPolicyConflict resolved): %w", err)
+		}
+	}
+	if applyErr != nil {
+		return applyErr
+	}
+	// A1 (D52 fact 3): record the KaptSpecHash so the static enforcement
+	// check can recompute it from the live policy and detect a tampered or
+	// stale spec.
+	if loop.Status.Policy == nil {
+		loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+	}
+	loop.Status.Policy.KaptSpecHash = r.Enforcer.KaptSpecHash(loop, effective)
+	return nil
+}
+
+// enforcementApply is the Enforcer.Apply seam (F12): a deleting-path envtest
+// spec injects a client that returns Forbidden on the KubeArmorPolicy write
+// without a real unstructured round-trip (the envtest cluster has no
+// KubeArmorPolicy CRD). It defaults to the Enforcer's own Apply (the live
+// behaviour); the seam is only used by the deleting-path spec. When both the
+// seam and the Enforcer are nil, it is a no-op (nil Enforcer = no
+// enforcement, the envtest default).
+func (r *LoopReconciler) enforcementApply(ctx context.Context, loop *coxv1alpha1.Loop, effective policy.EffectivePolicy) error {
+	if r.ApplyEnforcementWritesFn != nil {
+		return r.ApplyEnforcementWritesFn(ctx, loop, effective)
+	}
+	if r.Enforcer == nil {
+		return nil
+	}
+	return r.Enforcer.Apply(ctx, loop, effective)
+}
+
 // applyEffectivePolicyAndConditions (C6b+I41+D30) resolves the effective
 // policy, applies it through the Enforcer, records the hash, and sets the
 // PolicyTranslationLossy and PolicyEnforced conditions.
@@ -4837,39 +4907,9 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	// PolicyEnforced condition always reflects the pre-Apply observation.
 	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
 	if r.Enforcer != nil {
-		// I42f review P2 (round 1): a foreign KubeArmorPolicy occupying one of
-		// the Loop's policy names is NEVER overwritten (createOrUpdateKapt's
-		// errForeignKapt sentinel). The same pattern as I42c's
-		// NetworkPolicyConflict: set KubeArmorPolicyConflict=True/
-		// ForeignKubeArmorPolicy and hold the sandbox Suspended (the
-		// order-independent gate in ensureSandbox reads the live objects).
-		// Reconcile does not error-loop.
-		applyErr := r.Enforcer.Apply(ctx, loop, effective)
-		if applyErr != nil && errors.Is(applyErr, engine.ErrForeignKapt) {
-			setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionTrue, "ForeignKubeArmorPolicy",
-				"a KubeArmorPolicy controlled by another controller occupies a coxswain-<loop> name; left untouched")
-			return r.Status().Update(ctx, loop)
+		if err := r.applyEnforcementWrites(ctx, loop, effective); err != nil {
+			return err
 		}
-		// A conflict was resolved this reconcile (a previously foreign policy
-		// is gone or now Loop-owned): clear it to False/Resolved when it was
-		// previously set (the hadNetpolConflict pattern).
-		if hadKaptConflict(loop) {
-			setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionFalse, "Resolved",
-				"all per-Loop KubeArmorPolicies are controlled by this Loop")
-			if err := r.Status().Update(ctx, loop); err != nil {
-				return fmt.Errorf("update Loop status (KubeArmorPolicyConflict resolved): %w", err)
-			}
-		}
-		if applyErr != nil {
-			return applyErr
-		}
-		// A1 (D52 fact 3): record the KaptSpecHash so the static enforcement
-		// check can recompute it from the live policy and detect a tampered or
-		// stale spec.
-		if loop.Status.Policy == nil {
-			loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
-		}
-		loop.Status.Policy.KaptSpecHash = r.Enforcer.KaptSpecHash(loop, effective)
 	}
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
 		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
@@ -4929,6 +4969,94 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		}
 	}
 	return nil
+}
+
+// applyEffectivePolicyAndConditionsBestEffort is the DELETING-path variant of
+// applyEffectivePolicyAndConditions (F12): it resolves the effective policy
+// and records the conditions (the same PolicyEnforced / NetworkEnforced /
+// PolicyTranslationLossy conditions the live path records), but runs the
+// enforcement writes BEST-EFFORT. In a terminating namespace the
+// KubeArmorPolicy writes are Forbidden; a deleting Loop's enforcement is moot
+// (the sandbox is torn down with the Loop), so the write failure is logged +
+// emitted as a Warning Event and NEVER returned — the CleaningUp work (the B1
+// finalizer removal) must not be blocked. The live path keeps
+// applyEffectivePolicyAndConditions (every error propagates).
+//
+// The condition half of applyEffectivePolicyAndConditions is read-only (it
+// reads the live Kapt via enforcementStatus and the cni status; it sets
+// conditions on the in-memory loop object, which the caller persists via the
+// finalizeLoopStatus write), so a write failure after the conditions are set
+// does not corrupt the record.
+func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context.Context, loop *coxv1alpha1.Loop) {
+	effective, err := r.effectivePolicy(ctx, loop)
+	if err != nil {
+		logf.FromContext(ctx).Info("Deleting Loop: the effective policy resolution failed (best-effort; the CleaningUp work proceeds — F12)",
+			"loop", loop.Name, "err", err.Error())
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "PolicyEnforcementSkipped",
+				"effective policy resolution failed on the deleting path (best-effort, F12): %s", err)
+		}
+		return // best-effort: never block CleaningUp
+	}
+	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
+	if r.Enforcer != nil {
+		if err := r.applyEnforcementWrites(ctx, loop, effective); err != nil {
+			// Tolerate the write failure (a terminating namespace's
+			// Forbidden is the expected case; any other write failure is
+			// moot on a deleting Loop too). The conditions are still set
+			// below (best-effort: the in-memory object is persisted by the
+			// caller's finalizeLoopStatus write).
+			logf.FromContext(ctx).Info("Deleting Loop: the KubeArmorPolicy enforcement write failed (best-effort; the CleaningUp work proceeds — F12)",
+				"loop", loop.Name, "err", err.Error())
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "PolicyEnforcementSkipped",
+					"KubeArmorPolicy enforcement write failed on the deleting path (best-effort, F12): %s", err)
+			}
+			// Continue to the condition recording (best-effort: the write
+			// failed, but the conditions are still recorded so the record
+			// is not silently lost).
+		}
+	}
+	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
+		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
+			"KubeArmorDroppedPorts",
+			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
+	} else {
+		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
+			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
+	}
+	if enf, rs := preApplyEnf, preApplyRs; enf {
+		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
+			"the eBPF engine is enforcing the Loop's effective policy")
+	} else {
+		var msg string
+		switch rs {
+		case engine.ReasonEnforcementUnverified:
+			if r.Enforcer == nil {
+				msg = "no engine probe (no Enforcer wired); the Loop runs because --allow-unenforced is set (dev escape hatch)"
+			} else {
+				msg = "engine installed, no enforcement probe yet (I32); the Loop runs only because --allow-unenforced is set (dev escape hatch)"
+			}
+		case engine.ReasonEngineUnavailable:
+			msg = "no engine (Enforcer not installed); sandbox held Suspended (D30 fail-closed)"
+		default:
+			msg = "engine not enforcing the Loop policy (" + rs + "); sandbox held Suspended (D30 fail-closed)"
+		}
+		if r.AllowUnenforced && rs != engine.ReasonEnforcementUnverified {
+			msg += "; the Loop runs because --allow-unenforced is set (dev escape hatch)"
+		}
+		status := metav1.ConditionFalse
+		if rs == engine.ReasonEnforcementUnverified {
+			status = metav1.ConditionUnknown
+		}
+		setCondition(loop, string(PolicyEnforcedCondition), status, rs, msg)
+	}
+	if _, reason, status, msg := r.cniNetworkStatus(); status != "" {
+		if r.networkEnforcedChanged(loop, status, string(reason), msg) {
+			setCondition(loop, cni.NetworkEnforcedCondition, status, string(reason), msg)
+			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)
+		}
+	}
 }
 
 // ensureProxyAndNetPolicies runs the D33 proxy, D34 NetworkPolicy, and D35

@@ -618,11 +618,21 @@ var _ = Describe("B3 plan approval gate", func() {
 		// plan's claim, but a new planAttempt. This triggers a progress write
 		// (progressEqual now includes planAttempt), which refreshes
 		// lastActivityTime.
-		beforeClaim := metav1.Now().Truncate(time.Second)
+		// Capture the pre-claim lastActivityTime (the stale value the reject
+		// left in place). The claim-driven advance's recordPhaseClaim must
+		// overwrite it with the claim-processing time.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Progress).ToNot(BeNil(),
+			"status.progress must be set before the re-plan claim")
+		preClaimTime := loop.Status.Progress.LastActivityTime.Time.Truncate(time.Second)
+		// The re-plan claim (a fresh claim with the current planAttempt; the
+		// claim's planAttempt must equal status.planAttempt, which the reject
+		// incremented to 1). recordPhaseClaim refreshes lastActivityTime on
+		// the claim-driven advance.
 		reportClaim(r, ns, "p2-replan-b", &PhaseClaim{
 			ObservedPhase: coxv1alpha1.LoopPhasePlanning,
 			Status:        "success",
-			Iteration:     1,
 			PlanAttempt:   1, // the re-plan (planAttempt incremented by the reject)
 		})
 
@@ -632,11 +642,13 @@ var _ = Describe("B3 plan approval gate", func() {
 			"status.progress must be set")
 		Expect(loop.Status.Progress.LastActivityTime).ToNot(BeNil(),
 			"lastActivityTime must be set after the re-plan claim")
-		// P1 (b): lastActivityTime is >= the claim-processing time (the agent
-		// actually ran the re-plan).
+		// P1 (b): lastActivityTime is > the pre-claim value (the claim-driven
+		// advance refreshed it; the reject alone left the stale value in
+		// place, so a no-refresh would leave it at the pre-claim value).
 		actualTime := loop.Status.Progress.LastActivityTime.Time.Truncate(time.Second)
-		Expect(actualTime.Before(beforeClaim)).To(BeFalse(),
-			"lastActivityTime must be >= the claim-processing time (the re-plan claim refreshed it)")
+		Expect(actualTime.After(preClaimTime)).To(BeTrue(),
+			"lastActivityTime must be > the pre-claim value (the re-plan claim refreshed it; a no-refresh would leave the pre-claim value in place)")
+
 		// Mutation: drop the PlanAttempt from progressEqual (revert to comparing
 		// only Phase, LastResultStatus, BlockedReason, Iteration) and this spec
 		// FAILS (the re-plan claim is suppressed by progressEqual, so

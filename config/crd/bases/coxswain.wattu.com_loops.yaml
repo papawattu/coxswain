@@ -1092,6 +1092,14 @@ spec:
                     - Paused
                     - CleaningUp
                     type: string
+                  planAttempt:
+                    description: |-
+                      planAttempt is the claim's planAttempt (the re-plan counter the runner
+                      read from .coxswain/plan-attempt; 0 for the first plan). Including this
+                      in progressEqual means a re-plan claim (same phase, iteration, status
+                      but a new planAttempt) triggers a progress write, which refreshes
+                      lastActivityTime on the claim-driven advance.
+                    type: integer
                 type: object
               stallHistory:
                 description: |-

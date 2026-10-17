@@ -5057,7 +5057,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context
 			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)
 		}
 	}
-	}
+}
 
 // ensureProxyAndNetPolicies runs the D33 proxy, D34 NetworkPolicy, and D35
 // condition snapshot. It returns whether the Loop's conditions changed.

@@ -295,6 +295,14 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 		l = getLoop(ns, "p2f-s3")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused))
 		Expect(l.Status.PausedFrom).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		// I95: the wall clock may have created status.budget during the
+		// pre-pause reconciles (Verifying phase, non-paused). Capture the
+		// budget state so the post-pause assertion checks "unchanged", not
+		// "nil".
+		budgetBeforePause := l.Status.Budget
+		if budgetBeforePause != nil {
+			budgetBeforePause = budgetBeforePause.DeepCopy()
+		}
 
 		By("asserting no new verify Job and no decision (stallHistory/budget unchanged, phase stays Paused)")
 		reconcile(r, ns, "p2f-s3")
@@ -303,7 +311,13 @@ var _ = Describe("P2f: Paused phase, pausedFrom/pausedReason, suspension gate, r
 			"a verify Job termination while paused must produce no iterate/stall/budget decision")
 		Expect(l.Status.Iteration).To(Equal(0))
 		Expect(l.Status.StallHistory).To(BeEmpty())
-		Expect(l.Status.Budget).To(BeNil())
+		if budgetBeforePause == nil {
+			Expect(l.Status.Budget).To(BeNil(), "a Paused Loop with no prior budget must not create status.budget (item E)")
+		} else {
+			Expect(l.Status.Budget).NotTo(BeNil(), "the pre-pause budget must still exist")
+			Expect(l.Status.Budget.ActiveSeconds).To(Equal(budgetBeforePause.ActiveSeconds),
+				"a Paused Loop must not accumulate active time (item E)")
+		}
 		// No NEW verify Job (the existing one is left to terminate).
 		jobs := &batchv1.JobList{}
 		Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns), client.MatchingLabels{verifyForLabel: "p2f-s3"})).To(Succeed())

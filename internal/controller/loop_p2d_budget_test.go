@@ -822,7 +822,13 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		l := getLoopP2d(ns, "p2d-s12")
 		// The default read fails (the seeded pod has no PodIP in envtest) ->
 		// no reading, no decision, no BudgetExceeded condition.
-		Expect(l.Status.Budget).To(BeNil(), "a failed read leaves status.budget UNCHANGED (absent, not reset)")
+		// The wall clock creates status.budget with a stamp (I95: the wall
+		// clock is always accumulated on a non-paused reconcile), but the
+		// token counts are zero (no successful read).
+		if l.Status.Budget != nil {
+			Expect(l.Status.Budget.PromptTokens).To(BeZero(), "a failed read leaves the token counts absent")
+			Expect(l.Status.Budget.CompletionTokens).To(BeZero(), "a failed read leaves the token counts absent")
+		}
 		for _, c := range l.Status.Conditions {
 			Expect(c.Type).NotTo(Equal(coxv1alpha1.BudgetExceededCondition), "no BudgetExceeded condition on a failed read (the operator does not decide from an absent reading)")
 		}
@@ -1087,6 +1093,109 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		// not move the phase to Paused.
 		Expect(l.Status.Phase).NotTo(Equal(coxv1alpha1.LoopPhasePaused),
 			"the Pause action is a no-op on a terminal phase (the Loop is already Failed)")
+	})
+
+	// I95 applyBudget spec: a Loop with NO spec.budget and no stamp.
+	// Pass 1: the wall clock sets the stamp (status.budget is created with
+	// the stamp, activeSeconds 0). Pass 2 (+3m via the fake clock): the
+	// accumulation adds 180s (now - stamp). This exercises the wall-clock
+	// accumulation in applyBudget for a no-cap Loop (the #166 fix).
+	// Without the fix (the wall clock gated on spec.budget.maxWallClock),
+	// pass 1 would not set the stamp, and pass 2 would add 0.
+	It("I95: a no-cap Loop accumulates active time across two reconciles (#166 shape)", func() {
+		ns := nsFor("i95-apply")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		nowPtr := new(metav1.Time)
+		r := newP2dReconciler(recorder, &nowPtr)
+		loop := createP2dNoModelLoop(ns, "i95-apply1", nil)
+		// No spec.budget (the #166 shape) — confirm it.
+		Expect(loop.Spec.Budget).To(BeNil(), "the fixture must have no spec.budget (the #166 shape)")
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+
+		// Pass 1: the first reconcile. The wall clock sets the stamp.
+		reconcileP2d(r, ns, "i95-apply1")
+		l := getLoopP2d(ns, "i95-apply1")
+		Expect(l.Status.Budget).NotTo(BeNil(), "pass 1 must create status.budget with the stamp (I95)")
+		Expect(l.Status.Budget.LastActiveStamp).NotTo(BeNil(), "pass 1 must set the stamp")
+		Expect(l.Status.Budget.ActiveSeconds).To(BeZero(), "pass 1 adds 0 (no prior stamp)")
+
+		// Advance the clock 3m and reconcile again.
+		*nowPtr = metav1.NewTime(nowPtr.Add(3 * time.Minute))
+		reconcileP2d(r, ns, "i95-apply1")
+		l = getLoopP2d(ns, "i95-apply1")
+		Expect(l.Status.Budget).NotTo(BeNil())
+		// The accumulation adds now - lastActiveStamp = 3m = 180s.
+		Expect(l.Status.Budget.ActiveSeconds).To(BeNumerically("~", 180, 1),
+			"pass 2 must add 180s (3m) to the active time (I95, #166 shape)")
+	})
+
+	// I95 Paused no-cap spec: a Paused Loop with no spec.budget does NOT
+	// accumulate (item E: the pause stops the clock). The stamp is not set,
+	// and activeSeconds stays 0.
+	It("I95: a Paused no-cap Loop does not accumulate (item E)", func() {
+		ns := nsFor("i95-paused")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		nowPtr := new(metav1.Time)
+		r := newP2dReconciler(recorder, &nowPtr)
+		loop := createP2dNoModelLoop(ns, "i95-paused1", nil)
+		Expect(loop.Spec.Budget).To(BeNil(), "the fixture must have no spec.budget")
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePaused)
+
+		// Pass 1: Paused — the wall clock does not run.
+		reconcileP2d(r, ns, "i95-paused1")
+		l := getLoopP2d(ns, "i95-paused1")
+		Expect(l.Status.Budget).To(BeNil(), "a Paused no-cap Loop must not create status.budget (item E)")
+
+		// Advance the clock 3m and reconcile again — still no accumulation.
+		*nowPtr = metav1.NewTime(nowPtr.Add(3 * time.Minute))
+		reconcileP2d(r, ns, "i95-paused1")
+		l = getLoopP2d(ns, "i95-paused1")
+		Expect(l.Status.Budget).To(BeNil(), "a Paused no-cap Loop must not accumulate after 3m (item E)")
+	})
+
+	// I95 terminal no-cap spec (the reviewer's P1 on the third review): a
+	// Succeeded Loop with a stamp does NOT accumulate on later reconciles —
+	// the clock stops in terminal phases exactly as in Paused. Without the
+	// terminal check, pass 2 would add 180s (now - stamp) and rewrite the
+	// stamp, and every later reconcile (I96: terminal Loops are
+	// re-reconciled) would keep growing activeSeconds without bound.
+	It("I95: a Succeeded no-cap Loop does not accumulate on later reconciles (terminal stops the clock)", func() {
+		ns := nsFor("i95-terminal")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		nowPtr := new(metav1.Time)
+		r := newP2dReconciler(recorder, &nowPtr)
+		loop := createP2dNoModelLoop(ns, "i95-terminal1", nil)
+		Expect(loop.Spec.Budget).To(BeNil(), "the fixture must have no spec.budget")
+		// Pass 1 in a non-terminal phase: the wall clock sets the stamp and
+		// records 0 active seconds (the I95 baseline, same as the #166 spec).
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+		reconcileP2d(r, ns, "i95-terminal1")
+		l := getLoopP2d(ns, "i95-terminal1")
+		Expect(l.Status.Budget).NotTo(BeNil(), "pass 1 (non-terminal) must create status.budget with the stamp (I95)")
+		Expect(l.Status.Budget.LastActiveStamp).NotTo(BeNil(), "pass 1 must set the stamp")
+		Expect(l.Status.Budget.ActiveSeconds).To(BeZero(), "pass 1 adds 0 (no prior stamp)")
+		// The Loop finishes: Succeeded, carrying the stamp and 0 active
+		// seconds into the terminal phase.
+		setPhaseP2d(l, coxv1alpha1.LoopPhaseSucceeded)
+		setCondition(l, string(coxv1alpha1.LoopPhaseSucceeded), metav1.ConditionTrue, "Succeeded", "the Loop Succeeded")
+
+		// Advance the clock 3m and reconcile again in Succeeded: activeSeconds
+		// must stay 0 and the stamp must NOT be rewritten (the status is not
+		// rewritten by the wall clock — no accumulation, no new stamp).
+		sampledAt := time.Now().Add(6 * time.Hour) // a deterministic, clearly-later time
+		stampBefore := l.Status.Budget.LastActiveStamp.DeepCopy()
+		*nowPtr = metav1.NewTime(sampledAt)
+		reconcileP2d(r, ns, "i95-terminal1")
+		l = getLoopP2d(ns, "i95-terminal1")
+		Expect(l.Status.Budget).NotTo(BeNil(), "the budget status is still present (nothing removed it)")
+		Expect(l.Status.Budget.ActiveSeconds).To(BeZero(),
+			"a Succeeded no-cap Loop must not accumulate after 3m (the terminal phase stops the clock, as Paused does)")
+		Expect(l.Status.Budget.LastActiveStamp.Equal(stampBefore)).To(BeTrue(),
+			"a Succeeded no-cap Loop must not rewrite the stamp (the status is not rewritten by the wall clock)")
+		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded), "the terminal phase is unchanged")
 	})
 })
 

@@ -61,6 +61,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -208,6 +209,23 @@ type deliverBudgetFacts struct {
 // A4 spec asserts exactly this — the body changes when and only when the
 // facts change, and never carries a runner claim).
 func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
+	// I95: the PR body is rendered only when the deliver Job is (re)created
+	// (the deliver description ConfigMap is ensured from ensureDeliver, before
+	// the Job exists), while status.budget is accumulated on EVERY reconcile
+	// (applyBudgetStep runs the wall-clock accumulation before the deliver
+	// step). A Loop that takes minutes from Planning to Delivered therefore
+	// rendered its body from a status.budget that stopped at the last
+	// reconciliation BEFORE delivery was first expected (the S5 -> S6 phase
+	// flip) — #166 printed "Budget (active time): 0s" because status.budget
+	// was nil until that first Succeeded reconcile, whose wall-clock
+	// accumulation adds 0 (no lastActiveStamp yet). Refresh the budget with
+	// the same accumulation the normal reconcile does (now -
+	// status.budget.lastActiveStamp) so the body carries the active time
+	// measured up to this render. applyBudgetStep is NOT re-run here (it
+	// would also read the proxy's usage endpoint and re-apply the caps —
+	// unnecessary for a description); refreshDeliverDescriptionBudget is the
+	// wall-clock-only half of applyBudget.
+	refreshDeliverDescriptionBudget(loop)
 	tamper := int32(-1)
 	if loop.Status.Verify != nil && loop.Status.Verify.TamperExitCode != nil {
 		tamper = *loop.Status.Verify.TamperExitCode
@@ -480,4 +498,40 @@ func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\n", " / ")
 	return strings.TrimSpace(s)
+}
+
+// refreshDeliverDescriptionBudget accumulates the wall clock into
+// status.budget the way applyBudgetStep does (loop_p2d_budget.go: add
+// now - lastActiveStamp, floor at 0, set the stamp to now), but ONLY the
+// wall-clock half (no proxy read, no cap re-application). I95: the facts
+// body is rendered before the deliver Job is created, when the last
+// budget accumulation may be minutes old (the applyBudgetStep call in the
+// same reconcile runs on the loop object and is not yet visible here when
+// the body is rendered — the body is a snapshot; see the comment on
+// deliverDescriptionForLoop). It mutates the caller's loop IN PLACE so the
+// caller's subsequent status write (finalizeLoopStatus persists the loop
+// after the deliver step) carries the refresh — the body and the persisted
+// status agree on the value, and a later reconcile does not re-measure the
+// same interval (the stamp is already current).
+//
+// It is a no-op only when the Loop is Paused (applyBudgetStep stops the
+// clock in Paused, and a Paused Loop cannot be Succeeded — deliveryExpected
+// requires Phase == Succeeded — so this path never sees one; the guard is
+// here to mirror applyBudgetStep's shape). It is NOT gated on
+// spec.budget.maxWallClock: the wall clock is always accumulated (I95, the
+// cap only decides enforcement, not recording).
+func refreshDeliverDescriptionBudget(loop *coxv1alpha1.Loop) {
+	if loopPaused(loop) {
+		return
+	}
+	if loop.Status.Budget == nil || loop.Status.Budget.LastActiveStamp == nil {
+		// Nothing to accumulate: no existing budget or no stamp yet. The
+		// deliver description body prints 0s (the zero value) — that is
+		// correct for a Loop that has never been reconciled with a stamp.
+		return
+	}
+	now := time.Now()
+	loop.Status.Budget.ActiveSeconds += max(0, int64(now.Sub(loop.Status.Budget.LastActiveStamp.Time)/time.Second))
+	st := metav1.NewTime(now)
+	loop.Status.Budget.LastActiveStamp = &st
 }

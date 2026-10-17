@@ -89,40 +89,60 @@ func (p *modelPrices) hasAny() bool {
 
 // applyBudget is the P2d reconcile step: read the usage, accumulate the wall
 // clock, update status.budget, and apply the caps. It runs on every reconcile
-// (including Paused — the wall clock keeps recording, the decision does not
-// re-fire). It returns the wall-clock RequeueAfter (0 when the cap is unset
-// or already hit) and an error only for transient budget-status persistence
-// failures (a read failure is NOT an error — status.budget is left unchanged
-// and the decision waits for the next successful read).
+// (including Paused — the decision does not re-fire). The wall clock stops in
+// Paused (item E) AND in terminal phases (Succeeded/Failed — a finished Loop's
+// active time is fixed; re-reconciles of a terminal Loop must not keep
+// accumulating and rewriting status). It returns the wall-clock RequeueAfter
+// (0 when the cap is unset or already hit) and an error only for transient
+// budget-status persistence failures (a read failure is NOT an error —
+// status.budget is left unchanged and the decision waits for the next
+// successful read).
 func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop) time.Duration {
 	now := r.operatorNow()
 
 	// --- wall clock (item 10 / item E) ---
 	// activeSeconds accumulates ACTIVE time: each reconcile adds
-	// now - lastActiveStamp when the Loop is not Paused (the pause stops the
-	// clock), and lastActiveStamp is set to now on every non-paused reconcile
-	// (reset on resume, P2f). A fresh accumulation (no stamp yet) adds 0.
+	// now - lastActiveStamp when the Loop is not Paused and not terminal
+	// (the pause and the terminal phases stop the clock), and
+	// lastActiveStamp is set to now on every such reconcile (reset on resume,
+	// P2f). A fresh accumulation (no stamp yet) adds 0.
 	var budgetRequeue time.Duration
+	// The wall clock is accumulated on every non-paused, non-terminal
+	// reconcile. The cap only decides enforcement (onExceeded), not recording
+	// (I95): active time is useful without a cap — a Loop with no spec.budget
+	// still carries its wall clock in status.budget.activeSeconds, and the
+	// deliver description body prints it. A Paused Loop does not accumulate
+	// (item E: the pause stops the clock), and neither does a terminal Loop
+	// (Succeeded/Failed): a finished Loop's active time is fixed — every later
+	// reconcile would add now - lastActiveStamp and rewrite the stamp, so
+	// terminal Loops re-reconciled on any trigger (I96) would keep growing
+	// activeSeconds without bound. Stopping the clock in terminal phases is
+	// the same treatment as Paused.
+	var added int64
+	var stamp *metav1.Time
+	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) {
+		b := loop.Status.Budget
+		if b != nil && b.LastActiveStamp != nil {
+			added = max(0, int64(now.Sub(b.LastActiveStamp.Time).Seconds()))
+		}
+		// Set/refresh the stamp on every non-paused, non-terminal reconcile.
+		// The stamp is set regardless of whether a cap is set (I95: the wall
+		// clock is always accumulated; the cap only decides enforcement).
+		// A Paused Loop does not set the stamp (item E: the pause stops the
+		// clock). A terminal Loop does not set the stamp either (the clock is
+		// stopped the same way: a finished Loop's active time is fixed).
+		st := now
+		stamp = &st
+	}
+	var current int64
+	if loop.Status.Budget != nil {
+		current = loop.Status.Budget.ActiveSeconds
+	}
+	current += added
+	r.ensureBudgetStatus(loop, current, stamp)
+	// The RequeueAfter for a quiet wall-clock Loop (item 10): only when the
+	// cap is set and not yet hit, re-reconcile at the remaining time.
 	if loop.Spec.Budget != nil && loop.Spec.Budget.MaxWallClock != "" {
-		var added int64
-		var stamp *metav1.Time
-		if !loopPaused(loop) {
-			b := loop.Status.Budget
-			if b != nil && b.LastActiveStamp != nil {
-				added = max(0, int64(now.Sub(b.LastActiveStamp.Time)/time.Second))
-			}
-			// Set/refresh the stamp on every non-paused reconcile (item E).
-			st := now
-			stamp = &st
-		}
-		var current int64
-		if loop.Status.Budget != nil {
-			current = loop.Status.Budget.ActiveSeconds
-		}
-		current += added
-		r.ensureBudgetStatus(loop, current, stamp)
-		// The RequeueAfter for a quiet wall-clock Loop (item 10): when the cap
-		// is set and not yet hit, re-reconcile at the remaining time.
 		if d, err := coxv1alpha1.ParseMaxWallClock(loop.Spec.Budget.MaxWallClock); err == nil && d > 0 {
 			remaining := d - time.Duration(current)*time.Second
 			if remaining > 0 {
@@ -188,6 +208,12 @@ func (r *LoopReconciler) resolveProxyUsageRead(ctx context.Context, loop *coxv1a
 // error except for programmer errors, kept for signature symmetry).
 func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSeconds int64, stamp *metav1.Time) {
 	if loop.Status.Budget == nil {
+		if stamp == nil {
+			// Nothing to record: no existing budget, no stamp. Leave
+			// status.budget absent (the P2c invariant: a Paused Loop with
+			// no prior budget status stays absent).
+			return
+		}
 		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
 	}
 	loop.Status.Budget.ActiveSeconds = activeSeconds

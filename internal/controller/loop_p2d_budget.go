@@ -103,26 +103,48 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// clock), and lastActiveStamp is set to now on every non-paused reconcile
 	// (reset on resume, P2f). A fresh accumulation (no stamp yet) adds 0.
 	var budgetRequeue time.Duration
-	if loop.Spec.Budget != nil && loop.Spec.Budget.MaxWallClock != "" {
-		var added int64
-		var stamp *metav1.Time
-		if !loopPaused(loop) {
-			b := loop.Status.Budget
-			if b != nil && b.LastActiveStamp != nil {
-				added = max(0, int64(now.Sub(b.LastActiveStamp.Time)/time.Second))
-			}
-			// Set/refresh the stamp on every non-paused reconcile (item E).
+	// The wall clock is accumulated on every non-paused reconcile. The cap
+	// only decides enforcement (onExceeded), not recording (I95): active
+	// time is useful without a cap — a Loop with no spec.budget still carries
+	// its wall clock in status.budget.activeSeconds, and the deliver
+	// description body prints it. A Paused Loop does not accumulate (item E:
+	// the pause stops the clock).
+	//
+	// However, when no cap is set, the stamp is only refreshed if
+	// status.budget already exists (i.e. the wall clock was already being
+	// tracked). A fresh Loop with no cap and no prior status.budget does NOT
+	// create a budget status just to set a stamp — that would violate the
+	// P2c/P2d invariant (a Loop that has never had a proxy read or a wall-
+	// clock accumulation has no budget status). The stamp is created on the
+	// first proxy read (applyUsageReading) or the first cap-set reconcile.
+	var added int64
+	var stamp *metav1.Time
+	if !loopPaused(loop) {
+		b := loop.Status.Budget
+		if b != nil && b.LastActiveStamp != nil {
+			added = max(0, int64(now.Sub(b.LastActiveStamp.Time)/time.Second))
+		}
+		// Set/refresh the stamp on every non-paused reconcile (item E).
+		// When no cap is set and status.budget is absent, do NOT create it
+		// just for the stamp (the P2c/P2d invariant). The stamp will be set
+		// on the first proxy read (applyUsageReading) or when a cap is set.
+		if loop.Spec.Budget != nil && loop.Spec.Budget.MaxWallClock != "" {
+			st := now
+			stamp = &st
+		} else if b != nil {
 			st := now
 			stamp = &st
 		}
-		var current int64
-		if loop.Status.Budget != nil {
-			current = loop.Status.Budget.ActiveSeconds
-		}
-		current += added
-		r.ensureBudgetStatus(loop, current, stamp)
-		// The RequeueAfter for a quiet wall-clock Loop (item 10): when the cap
-		// is set and not yet hit, re-reconcile at the remaining time.
+	}
+	var current int64
+	if loop.Status.Budget != nil {
+		current = loop.Status.Budget.ActiveSeconds
+	}
+	current += added
+	r.ensureBudgetStatus(loop, current, stamp)
+	// The RequeueAfter for a quiet wall-clock Loop (item 10): only when the
+	// cap is set and not yet hit, re-reconcile at the remaining time.
+	if loop.Spec.Budget != nil && loop.Spec.Budget.MaxWallClock != "" {
 		if d, err := coxv1alpha1.ParseMaxWallClock(loop.Spec.Budget.MaxWallClock); err == nil && d > 0 {
 			remaining := d - time.Duration(current)*time.Second
 			if remaining > 0 {
@@ -187,6 +209,13 @@ func (r *LoopReconciler) resolveProxyUsageRead(ctx context.Context, loop *coxv1a
 // this only mutates the in-memory object — so this method never returns an
 // error except for programmer errors, kept for signature symmetry).
 func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSeconds int64, stamp *metav1.Time) {
+	if loop.Status.Budget == nil && stamp == nil {
+		// Nothing to record: no existing budget, no stamp to set, and the
+		// caller passed the current (zero) active time. Leave status.budget
+		// absent (the P2c/P2d invariant: a Loop that has never had a proxy
+		// read or a wall-clock accumulation has no budget status).
+		return
+	}
 	if loop.Status.Budget == nil {
 		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
 	}

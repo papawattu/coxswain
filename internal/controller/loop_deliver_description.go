@@ -514,26 +514,24 @@ func oneLine(s string) string {
 // status agree on the value, and a later reconcile does not re-measure the
 // same interval (the stamp is already current).
 //
-// It is a no-op when spec.budget.maxWallClock is unset (applyBudgetStep
-// accumulates the wall clock only in that case — the wall clock is
-// recorded for the cap decision, and a Loop with no cap has no budget
-// status to read). Paused Loops are not refreshed: applyBudgetStep stops
-// the clock in Paused (item E), and a Paused Loop cannot be Succeeded
-// (deliveryExpected requires Phase == Succeeded), so this path never sees
-// one — the guard is here only to mirror applyBudgetStep's shape (a
-// future phase that allows paused delivery would not silently resume the
-// clock).
+// It is a no-op only when the Loop is Paused (applyBudgetStep stops the
+// clock in Paused, and a Paused Loop cannot be Succeeded — deliveryExpected
+// requires Phase == Succeeded — so this path never sees one; the guard is
+// here to mirror applyBudgetStep's shape). It is NOT gated on
+// spec.budget.maxWallClock: the wall clock is always accumulated (I95, the
+// cap only decides enforcement, not recording).
 func refreshDeliverDescriptionBudget(loop *coxv1alpha1.Loop) {
-	if loop.Spec.Budget == nil || loop.Spec.Budget.MaxWallClock == "" {
+	if loopPaused(loop) {
 		return
 	}
-	if loop.Status.Budget == nil {
-		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
+	if loop.Status.Budget == nil || loop.Status.Budget.LastActiveStamp == nil {
+		// Nothing to accumulate: no existing budget or no stamp yet. The
+		// deliver description body prints 0s (the zero value) — that is
+		// correct for a Loop that has never been reconciled with a stamp.
+		return
 	}
 	now := time.Now()
-	if loop.Status.Budget.LastActiveStamp != nil {
-		loop.Status.Budget.ActiveSeconds += max(0, int64(now.Sub(loop.Status.Budget.LastActiveStamp.Time)/time.Second))
-	}
+	loop.Status.Budget.ActiveSeconds += max(0, int64(now.Sub(loop.Status.Budget.LastActiveStamp.Time)/time.Second))
 	st := metav1.NewTime(now)
 	loop.Status.Budget.LastActiveStamp = &st
 }

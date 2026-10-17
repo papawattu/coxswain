@@ -13,51 +13,35 @@
 // limitations under the License.
 
 // I95 (R28): the deliver PR body must carry the Loop's active time as of
-// the moment the body is rendered.
+// the moment the body is rendered, whether or not a cap is set.
 //
-// #166's body said "Budget (active time): 0s" for a run that took several
-// minutes from Planning to Delivered. The body is rendered from the Loop's
-// in-memory status (deliverDescriptionForLoop) at the point ensureDeliver
-// ensures the deliver description ConfigMap, and the applyBudgetStep call
-// in the same Reconcile runs on the loop BEFORE the deliver step — so by
-// the time the body is rendered, status.budget.lastActiveStamp is the
-// current pass's now (the S5->S6 phase flip reconcile's own applyBudget
-// already refreshed it), and the render's own now - stamp is 0s. The body
-// therefore shows 0s even though the Loop has been active for minutes: the
-// accumulated value in status.budget.activeSeconds is stale (it lags by
-// the last reconcile-to-reconcile gap, which is minutes between phase
-// flips), and the render's refresh adds 0 on top of the stale value.
+// #166's Loop (dogfood5-df5) had NO spec.budget. Its body said
+// "Budget (active time): 0s" because applyBudgetStep accumulated the wall
+// clock only when spec.budget.maxWallClock was set — with no cap,
+// status.budget.activeSeconds was never written, and the body printed the
+// zero value.
 //
-// The fix: deliverDescriptionForLoop accumulates the wall clock into
-// status.budget (the same now - lastActiveStamp accumulation
-// applyBudgetStep does) BEFORE rendering, so the body carries the time
-// measured up to this render. Because applyBudgetStep in the same
-// reconcile already set the stamp to now (for a non-paused Loop), the
-// body's active time equals status.budget.activeSeconds as of the start
-// of this reconcile — the last accumulated value — which is the correct
-// "active time up to now" for the run (the render's own sub-second
-// elapsed is not material). The stale-by-one-gap behaviour is what made
-// #166 print 0s: the S5->S6 first Succeeded reconcile created
-// status.budget (a fresh accumulation adds 0), and the body rendered from
-// that fresh 0.
+// The fix (option (a)): the wall clock is always accumulated on every
+// non-paused reconcile, whether or not a cap is set. The cap only decides
+// enforcement (onExceeded), not recording. deliverDescriptionForLoop calls
+// refreshDeliverDescriptionBudget first (the wall-clock-only half of
+// applyBudgetStep: now - lastActiveStamp, floor 0, set stamp) so the body
+// carries the active time measured up to this render.
 //
 // The spec:
-//   - (unit) a Loop with status.budget.activeSeconds = 0 and a
-//     lastActiveStamp N minutes ago, with spec.budget.maxWallClock set,
-//     renders a body with the N-minute active time (not 0s);
+//   - (unit, PRIMARY) a Loop with NO spec.budget (the #166 shape) and a
+//     lastActiveStamp 3 minutes ago renders a body with the 3-minute active
+//     time (not 0s);
 //   - (unit) a Loop with no lastActiveStamp renders 0s (a fresh
 //     accumulation adds 0);
-//   - (envtest, same-Loop) a Succeeded Loop whose status.budget was set
-//     before delivery (with a known stamp) re-reconciles and the deliver
-//     description ConfigMap's body carries the non-zero active time
-//     measured from the stamp to the reconcile — not 0s. The spec mutates
-//     the Loop's status (the input) and re-reconciles, asserting the
-//     ConfigMap's body is UPDATED (the I42c-style same-Loop update).
+//   - (envtest, same-Loop) a Succeeded Loop with NO spec.budget and a known
+//     stamp re-reconciles and the deliver description ConfigMap's body
+//     carries the non-zero active time — not 0s.
 //
 // The mutation (exact diff + exact focus command in the PR): skip the
 // refresh in deliverDescriptionForLoop (remove the
 // refreshDeliverDescriptionBudget(loop) call) in a scratch worktree and
-// re-run the focus command; the envtest spec must FAIL with the body
+// re-run the focus command; the primary spec must FAIL with the body
 // showing 0s.
 package controller
 
@@ -79,6 +63,7 @@ import (
 // i95LoopWithBudget builds a delivery-expected Loop (Succeeded +
 // PullRequest + a pinned verifiedCommit + an in-cluster repo) with a
 // status.budget carrying the given activeSeconds and lastActiveStamp.
+// spec.budget is NOT set by default — the #166 shape.
 func i95LoopWithBudget(name, ns string, activeSeconds int64, stamp *metav1.Time) *coxv1alpha1.Loop {
 	tamper := int32(0)
 	return &coxv1alpha1.Loop{
@@ -92,7 +77,6 @@ func i95LoopWithBudget(name, ns string, activeSeconds int64, stamp *metav1.Time)
 				ModelEndpoint:     s3ModelEndpoint,
 			},
 			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
-			Budget:   &coxv1alpha1.BudgetConfig{MaxWallClock: "1h"},
 		},
 		Status: coxv1alpha1.LoopStatus{
 			Phase:     coxv1alpha1.LoopPhaseSucceeded,
@@ -109,7 +93,7 @@ func i95LoopWithBudget(name, ns string, activeSeconds int64, stamp *metav1.Time)
 
 // activeTimeLine extracts the "Budget (active time)" line from a body.
 func activeTimeLine(body string) (string, bool) {
-	for _, ln := range strings.Split(body, "\n") {
+	for ln := range strings.SplitSeq(body, "\n") {
 		if strings.HasPrefix(ln, "- **Budget (active time):**") {
 			return ln, true
 		}
@@ -117,22 +101,26 @@ func activeTimeLine(body string) (string, bool) {
 	return "", false
 }
 
-// TestI95DeliverDescriptionActiveTimeKnown (I95) feeds the description a
-// Loop with a known active time (status.budget.lastActiveStamp 3 minutes
-// ago, activeSeconds 0 — the shape the S5->S6 first Succeeded reconcile
-// leaves) and asserts the body carries the 3-minute active time, not 0s.
-// The body is a pure function of spec/status, so the test calls
-// deliverDescriptionForLoop directly (no cluster needed).
-func TestI95DeliverDescriptionActiveTimeKnown(t *testing.T) {
+// TestI95DeliverDescriptionActiveTimeNoCap (I95, PRIMARY) feeds the
+// description a Loop with NO spec.budget (the #166 shape) and a known
+// lastActiveStamp 3 minutes ago. It asserts the body carries the 3-minute
+// active time, not 0s. Before the fix, applyBudgetStep only accumulated
+// the wall clock when a cap was set, so status.budget.activeSeconds was 0
+// and the body printed 0s.
+func TestI95DeliverDescriptionActiveTimeNoCap(t *testing.T) {
 	stamp := metav1.NewTime(time.Now().Add(-3 * time.Minute))
 	l := i95LoopWithBudget("i95unit", "i95ns", 0, &stamp)
+	// spec.budget is nil (the #166 shape) — confirm it.
+	if l.Spec.Budget != nil {
+		t.Fatal("the fixture must have no spec.budget (the #166 shape)")
+	}
 	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
 	line, ok := activeTimeLine(body)
 	if !ok {
 		t.Fatalf("the body does not carry an active time line:\n%s", body)
 	}
 	if strings.Contains(line, " 0s") {
-		t.Fatalf("the body must not carry 0s active time for a Loop with a lastActiveStamp 3 minutes ago (I95): %s", line)
+		t.Fatalf("the body must not carry 0s active time for a Loop with a lastActiveStamp 3 minutes ago and no spec.budget (I95, #166 shape): %s", line)
 	}
 	if !strings.HasPrefix(line, "- **Budget (active time):** 3m") {
 		t.Fatalf("the body must carry the 3-minute active time (I95): %s", line)
@@ -150,28 +138,31 @@ func TestI95DeliverDescriptionActiveTimeNoStamp(t *testing.T) {
 	if !ok {
 		t.Fatalf("the body does not carry an active time line:\n%s", body)
 	}
-	// The line is "- **Budget (active time):** 0s of 1h0m0s cap" (a 1h cap
-	// is set in the fixture); the value rendered must be exactly 0s (the
-	// cap suffix may follow).
+	// The line is "- **Budget (active time):** 0s (no cap)" (no spec.budget
+	// in the fixture); the value rendered must be exactly 0s.
 	if !strings.Contains(line, ":** 0s") {
 		t.Fatalf("a no-stamp Loop must render 0s active time (a fresh accumulation adds 0): %s", line)
 	}
 }
 
-// TestI95DeliverDescriptionActiveTimeNoCap (I95) asserts the no-cap case:
-// a Loop with no spec.budget has no wall clock to accumulate — the body's
-// active time line is 0s (applyBudgetStep records the wall clock only when
-// maxWallClock is set; the body must not invent a budget status).
-func TestI95DeliverDescriptionActiveTimeNoCap(t *testing.T) {
-	l := i95LoopWithBudget("i95nocap", "i95ns", 0, nil)
-	l.Spec.Budget = nil
+// TestI95DeliverDescriptionActiveTimeWithCap (I95) asserts that with a cap
+// set, the accumulation still works (regression guard: the cap gate used to
+// surround the wall-clock accumulation; moving it out must not break the
+// capped case).
+func TestI95DeliverDescriptionActiveTimeWithCap(t *testing.T) {
+	stamp := metav1.NewTime(time.Now().Add(-3 * time.Minute))
+	l := i95LoopWithBudget("i95cap", "i95ns", 0, &stamp)
+	l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxWallClock: "1h"}
 	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
 	line, ok := activeTimeLine(body)
 	if !ok {
 		t.Fatalf("the body does not carry an active time line:\n%s", body)
 	}
-	if !strings.Contains(line, ":** 0s") {
-		t.Fatalf("a no-cap Loop must render 0s active time (no wall clock to read): %s", line)
+	if strings.Contains(line, " 0s") {
+		t.Fatalf("the body must not carry 0s active time for a capped Loop with a lastActiveStamp 3 minutes ago (I95): %s", line)
+	}
+	if !strings.HasPrefix(line, "- **Budget (active time):** 3m") {
+		t.Fatalf("the body must carry the 3-minute active time (I95, capped): %s", line)
 	}
 }
 
@@ -184,13 +175,13 @@ var _ = Describe("I95 deliver description active time (envtest)", func() {
 		return ns
 	}
 
-	// I95: a Succeeded Loop with a known active time (status.budget set
-	// before delivery, lastActiveStamp a few minutes ago) re-reconciles and
-	// the deliver description ConfigMap's body carries the non-zero active
-	// time — not 0s. Same-Loop: the spec mutates the Loop's status (the
-	// input) and re-reconciles, asserting the ConfigMap's body is UPDATED
-	// (the I42c-style same-Loop update).
-	It("renders the deliver description ConfigMap body with the Loop's known active time", func() {
+	// I95 (PRIMARY): a Succeeded Loop with NO spec.budget (the #166 shape)
+	// and a known lastActiveStamp re-reconciles and the deliver description
+	// ConfigMap's body carries the non-zero active time — not 0s. Same-Loop:
+	// the spec mutates the Loop's status (the input) and re-reconciles,
+	// asserting the ConfigMap's body is UPDATED (the I42c-style same-Loop
+	// update).
+	It("renders the deliver description ConfigMap body with the Loop's known active time (no cap)", func() {
 		ns := freshNS("i95-desc")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
@@ -198,17 +189,17 @@ var _ = Describe("I95 deliver description active time (envtest)", func() {
 		r := s6Succeeded(name, ns, inClusterRepoURL)
 
 		// The S5->S6 shape: the Loop is Succeeded and delivery is expected,
-		// but status.budget was set before delivery with a known stamp.
-		// s6Loop does not set a spec.budget (no cap), so set it (the wall
-		// clock only records when maxWallClock is set) and the budget with
-		// a 3-minute-old stamp and 0 accumulated seconds (the first
-		// Succeeded reconcile's fresh accumulation — the shape #166 left).
+		// but status.budget has a known stamp from a prior reconcile.
+		// NO spec.budget (the #166 shape — the Loop never had a cap set).
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
-		loop.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxWallClock: "1h"}
-		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		if loop.Spec.Budget != nil {
+			// Ensure the fixture has no spec.budget (the #166 shape).
+			loop.Spec.Budget = nil
+			Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+			loop = &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		}
 		stamp := metav1.NewTime(time.Now().Add(-3 * time.Minute))
 		loop.Status.Budget = &coxv1alpha1.BudgetStatus{ActiveSeconds: 0, LastActiveStamp: &stamp}
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
@@ -223,8 +214,8 @@ var _ = Describe("I95 deliver description active time (envtest)", func() {
 		line, ok := activeTimeLine(body)
 		Expect(ok).To(BeTrue(), "the body must carry an active time line:\n%s", body)
 		Expect(line).To(HavePrefix("- **Budget (active time):** 3m"),
-			"the body must carry the 3-minute active time measured from the stamp to the reconcile (I95): %s", line)
+			"the body must carry the 3-minute active time measured from the stamp to the reconcile (I95, no cap): %s", line)
 		Expect(line).ToNot(ContainSubstring(" 0s"),
-			"the body must not carry 0s for a Loop with a lastActiveStamp 3 minutes ago (I95): %s", line)
+			"the body must not carry 0s for a Loop with a lastActiveStamp 3 minutes ago and no spec.budget (I95, #166 shape): %s", line)
 	})
 })

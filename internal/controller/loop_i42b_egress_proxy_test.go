@@ -247,6 +247,73 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			"the sandbox must be Suspended when the egress proxy is not Ready")
 	})
 
+	// F11 (dogfood P1): a no-op reconcile must NOT update the egress proxy
+	// Service (the reconcile storm). The operator's mutateFn used to reset
+	// Spec.ClusterIP="" on every pass; on the update path the existing Service
+	// has the apiserver-assigned ClusterIP, so the before/after objects differed
+	// and CreateOrUpdate updated the Service on EVERY reconcile, firing the
+	// Owns(&Service) watch and re-triggering the Loop (83 "op:updated" in 2 min
+	// on the live kind cluster). The fix: only reset ClusterIP on the create
+	// path (resourceVersion empty). This spec drives the REAL Reconcile: a
+	// second reconcile of an UNCHANGED Loop must leave the Service's
+	// resourceVersion unchanged (a no-op), while a real input change (the
+	// network allows) still updates it (the test norms: same-Loop, assert the
+	// object is updated when the input changes).
+	It("a no-op reconcile leaves the egress proxy Service resourceVersion UNCHANGED (F11, no reconcile storm)", func() {
+		ns := "f11-svc-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42bPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42bExternalAllow}},
+		})).To(Succeed())
+
+		name := "f11-storm"
+		loop := buildLoop(name, ns, []string{i42bPolicyName})
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Pre-create the egress proxy Service WITH an assigned ClusterIP (the
+		// apiserver's job on a real cluster). envtest does not run the service
+		// controller, so a Service the operator creates has no ClusterIP and the
+		// F11 guard (only reset on the create path) is invisible. Pre-creating it
+		// with a ClusterIP makes the operator's reconcile hit the UPDATE path
+		// (the Service exists with a non-empty resourceVersion + ClusterIP),
+		// where the F11 fix (don't reset the assigned ClusterIP) matters.
+		svcFixture := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-egress-proxy", Namespace: ns},
+			Spec: corev1.ServiceSpec{
+				ClusterIP: "10.0.99.99",
+				Ports:     []corev1.ServicePort{{Name: "http", Port: egressProxyPort, Protocol: corev1.ProtocolTCP}},
+				Selector:  egressProxyLabels(name),
+				Type:      corev1.ServiceTypeClusterIP,
+			},
+		}
+		Expect(k8sClient.Create(ctx, svcFixture)).To(Succeed(), "pre-create the egress proxy Service with an assigned ClusterIP")
+
+		// Reconcile 1 (the UPDATE path — the Service already exists with a
+		// ClusterIP): the operator must leave the assigned ClusterIP alone (the
+		// F11 fix) and not update the Service (a no-op on the managed fields).
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-egress-proxy"}, svc)).To(Succeed())
+		rv1 := svc.ResourceVersion
+		Expect(svc.Spec.ClusterIP).To(Equal("10.0.99.99"),
+			"the operator must NOT reset the apiserver-assigned ClusterIP (the F11 fix)")
+
+		// Reconcile 2 (no input change): a NO-OP (resourceVersion unchanged).
+		// Without the F11 fix the mutateFn resets ClusterIP="" and the update
+		// fires (resourceVersion bumps — the storm).
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-egress-proxy"}, svc)).To(Succeed())
+		Expect(svc.ResourceVersion).To(Equal(rv1),
+			"a no-op reconcile must leave the egress proxy Service UNCHANGED (no reconcile storm)")
+		Expect(svc.Spec.ClusterIP).To(Equal("10.0.99.99"),
+			"the assigned ClusterIP must survive a no-op reconcile")
+	})
+
 	// spec 3: egress proxy pod Ready -> sandbox Running.
 	It("sets the sandbox to Running when the egress proxy pod is Ready", func() {
 		ns := "i42b-ready-" + nowSuffix()

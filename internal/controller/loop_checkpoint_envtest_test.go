@@ -1054,6 +1054,99 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(hasFinalizer).To(BeTrue(), "the finalizer must NOT be removed when the Update is Forbidden (the requeue will retry)")
 	})
 
+	// F10b (the dogfood4-df4 hang): a deleting Loop whose referenced
+	// AgentPolicy is GONE (deleted from its terminating namespace — the
+	// namespaced object is gone by the time the operator reconciles the
+	// deleting Loop) still has its checkpoint finalizer removed. Before F10b
+	// the deleting path ran the LIVE validateStep (C6a), which is a HARD gate:
+	// a missing referenced AgentPolicy sets PolicyValid=False/PolicyNotFound
+	// and requeues with RequeueAfter:10s. The validation re-checks the spec on
+	// every pass, the spec never changes, so the deleting path requeued
+	// forever and the finalizer was never removed — the dogfood4-df4 repro
+	// (finalizer stuck 8+ hours, namespace Terminating; the Loop's status
+	// showed PolicyValid=False/PolicyNotFound and a single CNIUnenforced Event
+	// was the only trace of a reconcile). The F10b fix observes the
+	// validation (the same PolicyValid condition is recorded) but does not
+	// HOLD the deleting pass, so the CleaningUp work (GC + finalizer removal)
+	// always runs. This spec drives the REAL Reconcile with a missing
+	// AgentPolicy (no client wrapper — the envtest apiserver returns the
+	// NotFound) and asserts the finalizer is removed. MUST FAIL without the
+	// fix (the exact-revert mutation: restore the validateStep gate — the
+	// deleting path returns the 10s requeue and the finalizer stays).
+	It("a deleting Loop whose referenced AgentPolicy is GONE still has its finalizer removed (F10b: the validation must not hold the deleting path)", func() {
+		ns := "f10b-missing-policy-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "f10bmiss"
+		// The Loop references an AgentPolicy that is NEVER created (it was
+		// deleted from the terminating namespace in the live repro).
+		loopSpec := b1LoopSpec()
+		loopSpec.PolicyRefs = []string{"gone-policy"}
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       loopSpec,
+		})).To(Succeed())
+
+		r := b1NewReconciler(false, false)
+		b1Reconcile(r, ns, name) // the live reconcile: adds the finalizer
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Finalizers).To(ContainElement(loopCheckpointFinalizer), "the live reconcile must have added the checkpoint finalizer")
+
+		// Delete the Loop: the finalizer holds it.
+		Expect(k8sClient.Delete(ctx, loop)).To(Succeed())
+		for range 5 {
+			got := &coxv1alpha1.Loop{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, got); err == nil {
+				Expect(got.DeletionTimestamp).NotTo(BeZero(), "the deleting Loop is held by the finalizer")
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// Reconcile the deleting Loop. The referenced AgentPolicy is gone
+		// (NotFound); before F10b this held the pass (10s requeue, no
+		// CleaningUp). F10b observes the validation (PolicyValid=False/
+		// PolicyNotFound is recorded on the Loop) and proceeds to the CleaningUp
+		// work: the checkpoint GC (no snapshots — the support seam is off) and
+		// the finalizer removal. The Loop deletes. The reconcile must NOT return
+		// an error and must NOT return the validation's 10s RequeueAfter (the
+		// held-pass shape): the F10b deleting pass either completes (the Loop
+		// deletes) or requeues on the finalizer's own 5s work.
+		res, err := r.Reconcile(context.Background(),
+			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).ToNot(HaveOccurred(), "the deleting pass must not return an error for a missing referenced AgentPolicy (it is observed, not held — F10b)")
+		Expect(res.RequeueAfter).NotTo(Equal(10*time.Second),
+			"the deleting pass must not return the validateStep's 10s requeue (the held-pass shape — the dogfood4-df4 hang)")
+
+		// The finalizer must be removed and the Loop deleted (the dogfood4-df4
+		// assertion: without F10b this never happens — the validateStep gate
+		// requeued forever and the Loop held the namespace in Terminating).
+		// Without the F10b fix this spec FAILS: the reconcile returns the 10s
+		// requeue, the finalizer stays, the Loop is never deleted, and the
+		// RequeueAfter assertion above fails in the same pass.
+		var gone bool
+		for range 10 {
+			if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &coxv1alpha1.Loop{})) {
+				gone = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+			// Re-run the deleting reconcile: the finalizer's requeue (when the
+			// pass's own writes race with the object's delete) is what a live
+			// controller-runtime manager does on every 5s RequeueAfter. The F10b
+			// pass is level-based: every pass observes the (unchanged) missing
+			// policy and retries the finalizer removal.
+			_, _ = r.Reconcile(context.Background(),
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		}
+		Expect(gone).To(BeTrue(),
+			"a deleting Loop whose referenced AgentPolicy is gone has its finalizer removed and is deleted (the validation must not hold the deleting path — F10b, the dogfood4-df4 hang)")
+	})
+
 	It("BestEffort without the VolumeSnapshot CRD: CheckpointsAvailable=False (VolumeSnapshotCRDMissing) and the Loop still Succeeds (carries on, I90 visible fallback)", func() {
 		ns := "b1-nocrd-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

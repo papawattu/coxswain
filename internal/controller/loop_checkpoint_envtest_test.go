@@ -59,6 +59,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -69,6 +71,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -844,14 +847,18 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 	// The root cause (measured, operator logs): a deleting Loop's reconcile hit
 	// the ensure/cleanup path (create proxy pod ... forbidden: namespace is
 	// being terminated) and returned an error to the controller-runtime retry
-	// loop, which never reaches the finalizer removal; once the error loop
-	// exhausts (and the Owns watches stop firing for a terminating ns), the
-	// finalizer is never removed. The fix: a deleting Loop's checkpoint GC
-	// TOLERATES a terminating-namespace error (Forbidden list/delete — the
-	// children go away with the namespace) and removes the finalizer, so the
-	// namespace can complete its delete. These specs drive the real Reconcile
-	// with a client whose VolumeSnapshot list/delete return a
-	// terminating-namespace Forbidden (simulating the live repro in a live
+	// loop, which never reaches the finalizer removal; the error backoff (up to
+	// 1000s) requeues, but by then the namespace delete has already timed out or
+	// the storm (F11) has monopolized the workqueue. The fix: a deleting Loop's
+	// checkpoint GC TOLERATES a terminating-namespace error (Forbidden
+	// list/delete — the children go away with the namespace) and removes the
+	// finalizer, so the namespace can complete its delete. The finalizer-removal
+	// Update is also rejected (Forbidden) on a terminating namespace, so
+	// reconcileCleaningUp surfaces it as an Event and requeues with a targeted
+	// RequeueAfter (5s, no backoff cap) so only that Loop is retried. These
+	// specs drive the real Reconcile with a client whose VolumeSnapshot
+	// list/delete return a terminating-namespace Forbidden (simulating the live
+	// repro in a live
 	// namespace, which envtest cannot do — a namespace delete is async and the
 	// apiserver does not reject creates the way a terminating ns does).
 	It("a deleting Loop whose checkpoint list returns Forbidden (terminating ns) STILL has its finalizer removed (F10)", func() {
@@ -966,6 +973,85 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		}
 		Expect(gone).To(BeTrue(),
 			"a deleting Loop with CheckpointsAvailable=False (no snapshot CRD) has its finalizer removed (the namespace can complete its delete)")
+	})
+
+	// F10 (targeted RequeueAfter): a deleting Loop whose finalizer-removal
+	// Update is rejected (a terminating namespace rejects the Update with
+	// Forbidden) surfaces it as an Event (FinalizerRemovalBlocked) and
+	// requeues with a targeted RequeueAfter (5s, NOT the error backoff cap).
+	// This spec uses a client whose Loop Update returns a terminating-ns
+	// Forbidden (in addition to the VolumeSnapshot list/delete Forbidden) and
+	// asserts: (1) the Event is emitted, (2) the Reconcile returns
+	// RequeueAfter: 5s (not an error), (3) the finalizer is NOT removed (the
+	// Update failed, so the finalizer stays — the requeue will retry when the
+	// namespace is gone).
+	It("a deleting Loop whose finalizer-removal Update is Forbidden (terminating ns) requeues with a targeted RequeueAfter and surfaces an Event (F10)", func() {
+		ns := "f10-finalizer-forb-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "f10finalforb"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		// A client whose VolumeSnapshot list/delete AND the Loop Update return
+		// a terminating-ns Forbidden (the full live F10 repro: a namespace being
+		// terminated rejects creates, reads, AND updates).
+		forbClient := &f10TerminatingNSUpdateClient{inner: k8sClient}
+		r := b1NewReconciler(true, false)
+		r.Client = forbClient
+		r.apiReader = forbClient
+
+		// A fake recorder to capture the Event.
+		recorder := record.NewFakeRecorder(64)
+		r.Recorder = recorder
+
+		b1Reconcile(r, ns, name) // adds the finalizer
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+
+		// Delete the Loop: the finalizer holds it.
+		Expect(k8sClient.Delete(ctx, loop)).To(Succeed())
+		for range 5 {
+			got := &coxv1alpha1.Loop{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, got); err == nil {
+				Expect(got.DeletionTimestamp).NotTo(BeZero(), "the deleting Loop is held by the finalizer")
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// Reconcile the deleting Loop. The checkpoint list returns a
+		// terminating-ns Forbidden (treated as "done"), the finalizer-removal
+		// Update ALSO returns a terminating-ns Forbidden (the F10 fix surfaces
+		// it as an Event and requeues with a targeted RequeueAfter).
+		res, err := r.Reconcile(context.Background(),
+			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).ToNot(HaveOccurred(), "the Reconcile must NOT return an error for a terminating-ns Forbidden (it is not a real failure)")
+		Expect(res.RequeueAfter).To(Equal(5*time.Second), "the Reconcile must requeue with a targeted 5s RequeueAfter (not the error backoff cap)")
+
+		// The Event must be emitted (FinalizerRemovalBlocked).
+		var sawFinalizerRemovalBlocked bool
+		for range recorder.Events {
+			event := <-recorder.Events
+			if strings.Contains(event, "FinalizerRemovalBlocked") {
+				sawFinalizerRemovalBlocked = true
+				break
+			}
+		}
+		Expect(sawFinalizerRemovalBlocked).To(BeTrue(), "the finalizer-removal Forbidden must be surfaced as a FinalizerRemovalBlocked Event")
+
+		// The finalizer must NOT be removed (the Update failed, so the
+		// finalizer stays — the requeue will retry when the namespace is gone).
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, got)).To(Succeed())
+		hasFinalizer := slices.Contains(got.Finalizers, loopCheckpointFinalizer)
+		Expect(hasFinalizer).To(BeTrue(), "the finalizer must NOT be removed when the Update is Forbidden (the requeue will retry)")
 	})
 
 	It("BestEffort without the VolumeSnapshot CRD: CheckpointsAvailable=False (VolumeSnapshotCRDMissing) and the Loop still Succeeds (carries on, I90 visible fallback)", func() {

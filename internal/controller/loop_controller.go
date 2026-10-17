@@ -5478,20 +5478,6 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// LoopResyncPeriod is the manager's cache SyncPeriod (F10). It is the standard
-// fix for the dogfood4-df4 hang: a Loop being deleted (deletionTimestamp set)
-// must have its checkpoint finalizer's work re-run until the finalizer is
-// removed, but the Owns watches (and the cache's events for the deleting
-// object's children) STOP firing for a namespace that is terminating — so the
-// deleting Loop's reconcile is never re-triggered and the finalizer is never
-// removed (the namespace is stuck forever). A periodic cache resync re-fires
-// the For(&Loop) source for every cached Loop, including the deleting ones, so
-// the finalizer's work (gcLoopCheckpoints + the removal) runs and the namespace
-// can complete its delete. Live Loops are re-reconciled too, but the reconcile
-// is idempotent (it returns early when nothing changed), so the extra pass is
-// a cheap no-op. Set on the manager's Cache in cmd/main.go.
-const LoopResyncPeriod = 30 * time.Second
-
 // volumeSnapshotToLoopRequests maps a checkpoint VolumeSnapshot to the Loop
 // that owns it (B1), by the operator's coxswain.wattu.com/loop label. A
 // snapshot without the label (a foreign or unrelated snapshot) maps to

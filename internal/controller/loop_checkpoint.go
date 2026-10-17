@@ -880,7 +880,23 @@ func (r *LoopReconciler) reconcileCleaningUp(ctx context.Context, loop *coxv1alp
 	// apiserver can delete the Loop. A Conflict (another writer touched the
 	// Loop's finalizers) is a reconcile error the controller retries — the
 	// next reconcile re-runs the GC (idempotent) and retries the removal.
+	// A Forbidden (a terminating namespace rejects the Update) is NOT a real
+	// failure: the namespace is going away and its children (including the
+	// Loop) are torn down with it, so the finalizer is moot once the namespace
+	// is gone. Surface the reason as an Event and requeue with a targeted
+	// RequeueAfter (not the error backoff, which caps at 1000s) so only this
+	// Loop is retried (F10: the global 30s SyncPeriod was too broad — it
+	// resynced every cached object for the operator's lifetime to fix one
+	// case; a targeted RequeueAfter retries only this Loop).
 	if err := r.removeLoopCheckpointFinalizer(ctx, loop); err != nil {
+		if isForbidden(err) {
+			logf.FromContext(ctx).Info("CleaningUp: the finalizer-removal Update was rejected (terminating namespace); requeueing", "loop", loop.Name)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "FinalizerRemovalBlocked",
+					"finalizer removal rejected (terminating namespace); requeueing: %v", err)
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil

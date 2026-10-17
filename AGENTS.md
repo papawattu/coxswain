@@ -174,7 +174,7 @@ make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
 
-### Test norms (R16 I43; R20 I49; R21 I55; R25 I84; R26 I90)
+### Test norms (R16 I43; R20 I49; R21 I55; R25 I84; R26 I90; R28 I92)
 
 - Every object the controller reconciles gets at least one **same-Loop**
   envtest spec that changes an input and re-reconciles, asserting the object
@@ -286,6 +286,35 @@ make test       # Run unit tests
   operator's ServiceAccount>` returns yes for every rule the new code reads,
   and that the operator log has **zero** `forbidden` errors after a Loop
   lifecycle (create + delete) that exercises the new reads. Show both in the PR.
+- **A count or grep used as evidence needs a positive control** (R28 I92).
+  Show the same pattern matching a line known to contain it, or present the
+  count as a before/after pair where the "before" is non-zero. #165 counted
+  `grep -c "…op=updated"` against operator logs that log JSON
+  ("op": "updated"), so the count was 0 whether the defect existed or not
+  and proved nothing.
+- **A mutation claim names the exact diff and the exact focus command, with
+  its output** (R28 I92). The reviewer re-runs both; a paraphrased diff or a
+  "the spec fails" claim without the command is not a mutation claim. #160
+  claimed a mutation B that fails a spec; with that exact diff the spec
+  passed because the spec did not isolate the field under test.
+- **Evidence is saved before the thing it describes goes away** (R28 I92).
+  Tee the operator log into `.samples/` before a rollout or replacement
+  takes the pod's history with it. #164's first kind proof was claimed in
+  prose, but the operator pod was replaced and its log was never saved.
+- **A claim that a tool or cluster is broken carries the failing command
+  and its output** (R28 I92). No workaround is built on an unshown fault.
+  #164 claimed "dockerd can't reach the kind node" and added a local
+  registry plus node containerd edits to route around it; the real cause was
+  that `kind` was not on `PATH`, and `~/go/bin/kind load` worked.
+- **Never edit another author's comment** (R28 I92). Reply instead. Editing
+  a reviewer's comment body rewrites the record the review is built on.
+- **No `timeout` around `go test` and no long `sleep` in capture
+  commands** (R28 I92). Use `make test`; wait on a condition with a bounded
+  poll. `timeout 240 go test` and `sleep 3600` left envtest apiserver/etcd
+  orphans holding GiBs during R28.
+- **Use `~/go/bin/kind`** (or put it on `PATH` in hack scripts) (R28 I92).
+  A `kind` not found on `PATH` is not a kind fault — check `~/go/bin` first
+  before claiming the tooling is broken (see the rule above).
 
 ## CLI Commands Cheat Sheet
 

@@ -89,48 +89,48 @@ func (p *modelPrices) hasAny() bool {
 
 // applyBudget is the P2d reconcile step: read the usage, accumulate the wall
 // clock, update status.budget, and apply the caps. It runs on every reconcile
-// (including Paused — the wall clock keeps recording, the decision does not
-// re-fire). It returns the wall-clock RequeueAfter (0 when the cap is unset
-// or already hit) and an error only for transient budget-status persistence
-// failures (a read failure is NOT an error — status.budget is left unchanged
-// and the decision waits for the next successful read).
+// (including Paused — the decision does not re-fire). The wall clock stops in
+// Paused (item E) AND in terminal phases (Succeeded/Failed — a finished Loop's
+// active time is fixed; re-reconciles of a terminal Loop must not keep
+// accumulating and rewriting status). It returns the wall-clock RequeueAfter
+// (0 when the cap is unset or already hit) and an error only for transient
+// budget-status persistence failures (a read failure is NOT an error —
+// status.budget is left unchanged and the decision waits for the next
+// successful read).
 func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop) time.Duration {
 	now := r.operatorNow()
 
 	// --- wall clock (item 10 / item E) ---
 	// activeSeconds accumulates ACTIVE time: each reconcile adds
-	// now - lastActiveStamp when the Loop is not Paused (the pause stops the
-	// clock), and lastActiveStamp is set to now on every non-paused reconcile
-	// (reset on resume, P2f). A fresh accumulation (no stamp yet) adds 0.
+	// now - lastActiveStamp when the Loop is not Paused and not terminal
+	// (the pause and the terminal phases stop the clock), and
+	// lastActiveStamp is set to now on every such reconcile (reset on resume,
+	// P2f). A fresh accumulation (no stamp yet) adds 0.
 	var budgetRequeue time.Duration
-	// The wall clock is accumulated on every non-paused reconcile. The cap
-	// only decides enforcement (onExceeded), not recording (I95): active
-	// time is useful without a cap — a Loop with no spec.budget still carries
-	// its wall clock in status.budget.activeSeconds, and the deliver
-	// description body prints it. A Paused Loop does not accumulate (item E:
-	// the pause stops the clock).
-	//
-	// However, when no cap is set, the stamp is only refreshed if
-	// status.budget already exists (i.e. the wall clock was already being
-	// tracked). A fresh Loop with no cap and no prior status.budget does NOT
-	// create a budget status just to set a stamp — that would violate the
-	// P2c/P2d invariant (a Loop that has never had a proxy read or a wall-
-	// clock accumulation has no budget status). The stamp is created on the
-	// first proxy read (applyUsageReading) or the first cap-set reconcile.
+	// The wall clock is accumulated on every non-paused, non-terminal
+	// reconcile. The cap only decides enforcement (onExceeded), not recording
+	// (I95): active time is useful without a cap — a Loop with no spec.budget
+	// still carries its wall clock in status.budget.activeSeconds, and the
+	// deliver description body prints it. A Paused Loop does not accumulate
+	// (item E: the pause stops the clock), and neither does a terminal Loop
+	// (Succeeded/Failed): a finished Loop's active time is fixed — every later
+	// reconcile would add now - lastActiveStamp and rewrite the stamp, so
+	// terminal Loops re-reconciled on any trigger (I96) would keep growing
+	// activeSeconds without bound. Stopping the clock in terminal phases is
+	// the same treatment as Paused.
 	var added int64
 	var stamp *metav1.Time
-	if !loopPaused(loop) {
+	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) {
 		b := loop.Status.Budget
 		if b != nil && b.LastActiveStamp != nil {
-			added = max(0, int64(now.Sub(b.LastActiveStamp.Time)/time.Second))
+			added = max(0, int64(now.Sub(b.LastActiveStamp.Time).Seconds()))
 		}
-		// Set/refresh the stamp on every non-paused reconcile (item E).
+		// Set/refresh the stamp on every non-paused, non-terminal reconcile.
 		// The stamp is set regardless of whether a cap is set (I95: the wall
 		// clock is always accumulated; the cap only decides enforcement).
 		// A Paused Loop does not set the stamp (item E: the pause stops the
-		// clock). A fresh Loop (no status.budget yet) gets a stamp on the
-		// first non-paused reconcile — the P2c invariant is about Paused
-		// Loops (no accumulation), not about no-cap Loops.
+		// clock). A terminal Loop does not set the stamp either (the clock is
+		// stopped the same way: a finished Loop's active time is fixed).
 		st := now
 		stamp = &st
 	}

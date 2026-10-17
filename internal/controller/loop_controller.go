@@ -4987,7 +4987,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 // conditions on the in-memory loop object, which the caller persists via the
 // finalizeLoopStatus write), so a write failure after the conditions are set
 // does not corrupt the record.
-func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context.Context, loop *coxv1alpha1.Loop) error {
+func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context.Context, loop *coxv1alpha1.Loop) {
 	effective, err := r.effectivePolicy(ctx, loop)
 	if err != nil {
 		logf.FromContext(ctx).Info("Deleting Loop: the effective policy resolution failed (best-effort; the CleaningUp work proceeds — F12)",
@@ -4996,7 +4996,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "PolicyEnforcementSkipped",
 				"effective policy resolution failed on the deleting path (best-effort, F12): %s", err)
 		}
-		return nil // best-effort: never block CleaningUp
+		return // best-effort: never block CleaningUp
 	}
 	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
 	if r.Enforcer != nil {
@@ -5057,8 +5057,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context
 			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)
 		}
 	}
-	return nil
-}
+	}
 
 // ensureProxyAndNetPolicies runs the D33 proxy, D34 NetworkPolicy, and D35
 // condition snapshot. It returns whether the Loop's conditions changed.

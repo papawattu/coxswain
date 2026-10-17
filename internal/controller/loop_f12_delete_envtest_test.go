@@ -55,6 +55,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"slices"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -168,12 +169,7 @@ var _ = Describe("F12 deleting Loop with a Forbidden KubeArmorPolicy write (the 
 				return true
 			}
 			Expect(err).NotTo(HaveOccurred())
-			for _, f := range l.Finalizers {
-				if f == loopCheckpointFinalizer {
-					return false
-				}
-			}
-			return true
+			return !slices.Contains(l.Finalizers, loopCheckpointFinalizer)
 		}, "5s", "100ms").Should(BeTrue(),
 			"the B1 checkpoint finalizer must be REMOVED (the CleaningUp work completed despite the Forbidden KubeArmorPolicy write — best-effort, F12); the Loop must be deleted")
 	})

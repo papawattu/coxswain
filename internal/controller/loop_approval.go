@@ -311,6 +311,11 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 				loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 				loop.Status.PlanAttempt++
+				// Note: lastActivityTime is NOT refreshed here (P1 reviewer fix).
+				// Stamping at the reject would make the field move on a user action
+				// even if the agent never runs. The refresh happens on the re-plan's
+				// claim-driven advance (recordPhaseClaim in loop_s4_phase.go), where
+				// a new planAttempt claim signals that the agent actually ran.
 				changed = true
 			}
 		} else if planApproved {

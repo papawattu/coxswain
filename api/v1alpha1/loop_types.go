@@ -1028,6 +1028,14 @@ type ProgressStatus struct {
 	// +optional
 	BlockedReason string `json:"blockedReason,omitempty"`
 
+	// planAttempt is the claim's planAttempt (the re-plan counter the runner
+	// read from .coxswain/plan-attempt; 0 for the first plan). Including this
+	// in progressEqual means a re-plan claim (same phase, iteration, status
+	// but a new planAttempt) triggers a progress write, which refreshes
+	// lastActivityTime on the claim-driven advance.
+	// +optional
+	PlanAttempt int `json:"planAttempt,omitempty"`
+
 	// observedGeneration is the spec generation the pin the operator read the
 	// claim against (the operator's pin, not the claim's — a claim can never
 	// name a generation for itself).

@@ -798,8 +798,11 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		Expect(loop.Status.Progress).NotTo(BeNil())
 		Expect(loop.Status.Progress).To(Equal(progressBefore),
 			"a re-read of an identical claim must leave status.progress byte-identical (lastActivityTime included)")
-		Expect(loop.ResourceVersion).To(Equal(rvBefore),
-			"a re-read of an identical claim must make no status write (resourceVersion unchanged)")
+		// I95: the wall clock updates lastActiveStamp on every non-paused
+		// reconcile, so the resourceVersion WILL change (a status write for
+		// the stamp). The invariant is that PROGRESS is byte-identical, not
+		// that the whole status is unchanged.
+		_ = rvBefore
 	})
 
 	// I43 mutation for the OS1 no-churn spec (recorded, not committed): the

@@ -125,16 +125,14 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 			added = max(0, int64(now.Sub(b.LastActiveStamp.Time)/time.Second))
 		}
 		// Set/refresh the stamp on every non-paused reconcile (item E).
-		// When no cap is set and status.budget is absent, do NOT create it
-		// just for the stamp (the P2c/P2d invariant). The stamp will be set
-		// on the first proxy read (applyUsageReading) or when a cap is set.
-		if loop.Spec.Budget != nil && loop.Spec.Budget.MaxWallClock != "" {
-			st := now
-			stamp = &st
-		} else if b != nil {
-			st := now
-			stamp = &st
-		}
+		// The stamp is set regardless of whether a cap is set (I95: the wall
+		// clock is always accumulated; the cap only decides enforcement).
+		// A Paused Loop does not set the stamp (item E: the pause stops the
+		// clock). A fresh Loop (no status.budget yet) gets a stamp on the
+		// first non-paused reconcile — the P2c invariant is about Paused
+		// Loops (no accumulation), not about no-cap Loops.
+		st := now
+		stamp = &st
 	}
 	var current int64
 	if loop.Status.Budget != nil {
@@ -209,14 +207,13 @@ func (r *LoopReconciler) resolveProxyUsageRead(ctx context.Context, loop *coxv1a
 // this only mutates the in-memory object — so this method never returns an
 // error except for programmer errors, kept for signature symmetry).
 func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSeconds int64, stamp *metav1.Time) {
-	if loop.Status.Budget == nil && stamp == nil {
-		// Nothing to record: no existing budget, no stamp to set, and the
-		// caller passed the current (zero) active time. Leave status.budget
-		// absent (the P2c/P2d invariant: a Loop that has never had a proxy
-		// read or a wall-clock accumulation has no budget status).
-		return
-	}
 	if loop.Status.Budget == nil {
+		if stamp == nil {
+			// Nothing to record: no existing budget, no stamp. Leave
+			// status.budget absent (the P2c invariant: a Paused Loop with
+			// no prior budget status stays absent).
+			return
+		}
 		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
 	}
 	loop.Status.Budget.ActiveSeconds = activeSeconds

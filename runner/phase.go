@@ -888,8 +888,17 @@ func commitWorkspace(workspace string) (string, []string, string) {
 		return head, nil, ""
 	}
 
+	// P5e (R28 I94): the implement-commit subject is the operator-derived
+	// delivery title (COX_DELIVERY_TITLE, set on the agent from spec.goal), so
+	// the commit subject matches the delivery PR title. Fall back to the
+	// historical subject when the env is absent (e.g. the operator predates
+	// the wiring).
+	subject := os.Getenv("COX_DELIVERY_TITLE")
+	if subject == "" {
+		subject = "coxswain: implement"
+	}
 	commitArgs := []string{"-c", "user.name=coxswain-agent", "-c", "user.email=agent@localhost",
-		"commit", "-m", "coxswain: implement"}
+		"commit", "-m", subject}
 	if out, commitErr := gitC(workspace, commitArgs...); commitErr != nil {
 		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", commitErr, out)
 		return "", stagedPaths, ""

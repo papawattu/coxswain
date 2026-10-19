@@ -108,6 +108,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+
+	"github.com/papawattu/coxswain/internal/deliverytitle"
 )
 
 // deliver Job name/label constants.
@@ -1098,6 +1100,7 @@ PINNED=` + shellQuote(verified) + `
 API_BASE=` + shellQuote(apiBase) + `
 DRAFT=` + strconv.FormatBool(draft) + `
 TITLE_PREFIX=` + shellQuote(draftTitlePrefix) + `
+PR_TITLE=` + shellQuote(deliverytitle.Title(loop.Spec.Goal)) + `
 DESC_DIR=` + deliverDescriptionSrc + `
 PATH_PART=${REPO#*://}
 REMAIN=${PATH_PART#*/}
@@ -1214,7 +1217,7 @@ else
   fi
   PLAN_FILE=${SRC}/plan.md
   PLAN_MAX=` + strconv.Itoa(deliverPlanMaxBytes) + `
-  export BRANCH BASE DRAFT TITLE_PREFIX FACTS PLAN_FILE PLAN_MAX
+  export BRANCH BASE DRAFT TITLE_PREFIX PR_TITLE FACTS PLAN_FILE PLAN_MAX
   PAYLOAD=$(python3 -c ` + shellQuote(deliverPushPayloadPython) + `)
   [ -n "${PAYLOAD}" ] || { echo "deliver push: the PR payload was not built (python3 json failed)"; exit 1; }
   # Gitea's PR create can reject a non-existent base branch; the push above
@@ -1695,4 +1698,4 @@ func (r *LoopReconciler) ensureDeliverReadback(ctx context.Context, loop *coxv1a
 // double-quoted string literal (\n-escaped newlines, \"-escaped quotes, and
 // the fenced-markdown triple-backticks are just characters in the literal --
 // a Go raw string would terminate at the first backtick).
-const deliverPushPayloadPython = "import json, os\nfacts = os.environ.get(\"FACTS\", \"\")\nif not facts:\n    facts = \"Delivered by coxswain (facts unavailable)\"\ntry:\n    with open(os.environ[\"PLAN_FILE\"], \"rb\") as f:\n        raw = f.read()\nexcept OSError:\n    raw = b\"\"\nplan = raw.decode(\"utf-8\", \"replace\")\nplan_max = int(os.environ.get(\"PLAN_MAX\", \"16384\"))\nif len(plan) > plan_max:\n    cut = plan.rfind(\"\\n\", 0, plan_max)\n    if cut < 0:\n        cut = plan_max\n    plan = plan[:cut] + \"\\n(truncated: the plan exceeded the %d-byte cap)\" % plan_max\nif not plan.strip():\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n_(no plan recorded)_\"\nelse:\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n```markdown\\n\" + plan + \"\\n```\"\nbody = facts + plan_section + \"\\n\"\npayload = {\n    \"title\": os.environ[\"TITLE_PREFIX\"] + \"coxswain: \" + os.environ[\"BRANCH\"],\n    \"head\": os.environ[\"BRANCH\"],\n    \"base\": os.environ[\"BASE\"],\n    \"body\": body,\n    \"draft\": os.environ.get(\"DRAFT\", \"true\") == \"true\",\n}\nprint(json.dumps(payload))"
+const deliverPushPayloadPython = "import json, os\nfacts = os.environ.get(\"FACTS\", \"\")\nif not facts:\n    facts = \"Delivered by coxswain (facts unavailable)\"\ntry:\n    with open(os.environ[\"PLAN_FILE\"], \"rb\") as f:\n        raw = f.read()\nexcept OSError:\n    raw = b\"\"\nplan = raw.decode(\"utf-8\", \"replace\")\nplan_max = int(os.environ.get(\"PLAN_MAX\", \"16384\"))\nif len(plan) > plan_max:\n    cut = plan.rfind(\"\\n\", 0, plan_max)\n    if cut < 0:\n        cut = plan_max\n    plan = plan[:cut] + \"\\n(truncated: the plan exceeded the %d-byte cap)\" % plan_max\nif not plan.strip():\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n_(no plan recorded)_\"\nelse:\n    plan_section = \"\\n---\\n\\n## Plan (written by the agent, untrusted)\\n\\n```markdown\\n\" + plan + \"\\n```\"\nbody = facts + plan_section + \"\\n\"\npayload = {\n    \"title\": os.environ[\"TITLE_PREFIX\"] + os.environ[\"PR_TITLE\"],\n    \"head\": os.environ[\"BRANCH\"],\n    \"base\": os.environ[\"BASE\"],\n    \"body\": body,\n    \"draft\": os.environ.get(\"DRAFT\", \"true\") == \"true\",\n}\nprint(json.dumps(payload))"

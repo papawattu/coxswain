@@ -586,6 +586,16 @@ func writeClaim(path string, res Result) {
 		Status        string `json:"status"`
 		BlockedReason string `json:"blockedReason,omitempty"`
 		HeadCommit    string `json:"headCommit,omitempty"`
+		// I93 (R29): the plan-hash-mismatch flag at the start of an
+		// Implementing run. It MUST ride the claim (not just result.json):
+		// the operator's advancePhaseFromClaim reads claim.PlanMismatch to
+		// clear the PlanApproved condition, set the PlanMismatch condition,
+		// and re-enter the AwaitingApproval hold. Without it, the runner's
+		// blocked-claim is parsed as a generic block (no PlanMismatch key),
+		// the operator does not hold the Loop, and the agent crash-loops
+		// (redo3, i93-kind-redo3: the runner detected the mismatch but the
+		// flag was dropped before the claim, so the operator never held).
+		PlanMismatch bool `json:"planMismatch,omitempty"`
 		// S4 (R19 OS1): the .coxswain/iteration the runner read. It MUST ride
 		// the claim (not just result.json): the operator's stale-iteration
 		// guard compares claim.Iteration against loop.Status.Iteration and
@@ -609,6 +619,7 @@ func writeClaim(path string, res Result) {
 		Status:        res.Status,
 		BlockedReason: res.VerificationNotes,
 		HeadCommit:    res.HeadCommit,
+		PlanMismatch:  res.PlanMismatch,
 		Iteration:     res.Iteration,
 		PlanAttempt:   res.PlanAttempt,
 	}

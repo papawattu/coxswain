@@ -141,6 +141,24 @@ type PhaseClaim struct {
 	PlanAttempt int `json:"planAttempt,omitempty"`
 }
 
+// pausedConditionResumeTime returns the LastTransitionTime of the Paused
+// condition when it is False with reason "Resumed" (the resume time), or
+// nil otherwise. Used by the claim reader to discard a stale claim whose
+// FinishedAt predates the resume (I93 R30 P1: a resume must not advance
+// on a claim from before the pause).
+func pausedConditionResumeTime(loop *coxv1alpha1.Loop) *metav1.Time {
+	for i := range loop.Status.Conditions {
+		c := &loop.Status.Conditions[i]
+		if c.Type == coxv1alpha1.PausedCondition &&
+			c.Status == metav1.ConditionFalse &&
+			c.Reason == "Resumed" {
+			t := c.LastTransitionTime
+			return &t
+		}
+	}
+	return nil
+}
+
 // parsePhaseClaim strict-parses a termination message into a PhaseClaim
 // (ADR-0005). It rejects: a nil/oversized message, a non-JSON message, a
 // JSON non-object, and a claim with no observedPhase. A malformed claim is
@@ -270,6 +288,15 @@ func (r *LoopReconciler) resolvePhaseClaim(ctx context.Context, loop *coxv1alpha
 // gets the sandbox pod via the APIReader and reads the agent container's
 // terminated status. See readPhaseClaim for the contract.
 func (r *LoopReconciler) readPhaseClaimFromTerminationMessage(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error) {
+	// I93 R30 P1 (redo4): a resume must not advance on a claim from before
+	// the pause. The agent container's termination message survives the
+	// Suspended -> Running transition (the pod is not recreated; the
+	// container is restarted in place). If the Loop was just resumed (the
+	// Paused condition is False/Resumed) and the agent's termination
+	// FinishedAt predates the resume, the claim is from the pre-pause run
+	// and must not be consumed (the operator would advance the phase on a
+	// stale claim before the post-resume runner has even started).
+	pausedResumeAt := pausedConditionResumeTime(loop)
 	reader := r.apiReader
 	if reader == nil {
 		// No APIReader wired (a bare test reconciler without
@@ -306,6 +333,17 @@ func (r *LoopReconciler) readPhaseClaimFromTerminationMessage(ctx context.Contex
 			// The agent is still running the phase (or has no status yet):
 			// no claim yet. Requeue (the phase-init container has written the
 			// desired phase and the runner is doing the work).
+			return nil, nil
+		}
+		// I93 R30 P1 (redo4): a resume must not advance on a claim from before
+		// the pause. If the Loop was just resumed (the Paused condition is
+		// False/Resumed) and the agent's termination FinishedAt predates the
+		// resume, the claim is from the pre-pause run and must not be consumed.
+		if !terminated.FinishedAt.IsZero() && pausedResumeAt != nil &&
+			terminated.FinishedAt.Before(pausedResumeAt) {
+			logf.FromContext(ctx).Info("stale claim from before the pause ignored (FinishedAt predates resume)",
+				"finishedAt", terminated.FinishedAt,
+				"resumeAt", pausedResumeAt)
 			return nil, nil
 		}
 		claim, err := parsePhaseClaim(terminated.Message)

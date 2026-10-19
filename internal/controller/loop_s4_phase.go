@@ -128,6 +128,10 @@ type PhaseClaim struct {
 	// operator's own read of the condition + phase is the gate input). An
 	// absent field (pre-B3 runners) is false (no plan change detected).
 	PlanChanged bool `json:"planChanged,omitempty"`
+	// I93 (R28 P1): planMismatch, when present, must be a boolean (the
+	// runner's plan-hash-mismatch signal at Implementing start). An absent
+	// field (pre-I93 runners) is false (no mismatch detected).
+	PlanMismatch bool `json:"planMismatch,omitempty"`
 	// planAttempt is the .coxswain/plan-attempt the runner read (the operator's
 	// plan-attempt marker file). OS1 only — never a gate input. The guard in
 	// advancePhaseFromClaim uses it to reject a stale Planning success claim
@@ -135,6 +139,24 @@ type PhaseClaim struct {
 	// which matches a fresh Loop's status.planAttempt (also 0) — the guard is
 	// a no-op for runners that do not echo the marker.
 	PlanAttempt int `json:"planAttempt,omitempty"`
+}
+
+// pausedConditionResumeTime returns the LastTransitionTime of the Paused
+// condition when it is False with reason "Resumed" (the resume time), or
+// nil otherwise. Used by the claim reader to discard a stale claim whose
+// FinishedAt predates the resume (I93 R30 P1: a resume must not advance
+// on a claim from before the pause).
+func pausedConditionResumeTime(loop *coxv1alpha1.Loop) *metav1.Time {
+	for i := range loop.Status.Conditions {
+		c := &loop.Status.Conditions[i]
+		if c.Type == coxv1alpha1.PausedCondition &&
+			c.Status == metav1.ConditionFalse &&
+			c.Reason == "Resumed" {
+			t := c.LastTransitionTime
+			return &t
+		}
+	}
+	return nil
 }
 
 // parsePhaseClaim strict-parses a termination message into a PhaseClaim
@@ -199,6 +221,14 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 			return nil, fmt.Errorf("claim.planChanged is not a boolean: %w", err)
 		}
 	}
+	// I93 (R28 P1): planMismatch, when present, must be a boolean (the
+	// runner's plan-hash-mismatch signal at Implementing start). An absent
+	// field (pre-I93 runners) is false (no mismatch detected).
+	if v, ok := raw["planMismatch"]; ok {
+		if err := json.Unmarshal(v, &claim.PlanMismatch); err != nil {
+			return nil, fmt.Errorf("claim.planMismatch is not a boolean: %w", err)
+		}
+	}
 	// I42b: planAttempt, when present, must be a non-negative integer (the
 	// runner's echo of the .coxswain/plan-attempt marker). An absent field
 	// (pre-I42b runners) is 0, which matches a fresh Loop's status.planAttempt.
@@ -258,6 +288,15 @@ func (r *LoopReconciler) resolvePhaseClaim(ctx context.Context, loop *coxv1alpha
 // gets the sandbox pod via the APIReader and reads the agent container's
 // terminated status. See readPhaseClaim for the contract.
 func (r *LoopReconciler) readPhaseClaimFromTerminationMessage(ctx context.Context, loop *coxv1alpha1.Loop) (*PhaseClaim, error) {
+	// I93 R30 P1 (redo4): a resume must not advance on a claim from before
+	// the pause. The agent container's termination message survives the
+	// Suspended -> Running transition (the pod is not recreated; the
+	// container is restarted in place). If the Loop was just resumed (the
+	// Paused condition is False/Resumed) and the agent's termination
+	// FinishedAt predates the resume, the claim is from the pre-pause run
+	// and must not be consumed (the operator would advance the phase on a
+	// stale claim before the post-resume runner has even started).
+	pausedResumeAt := pausedConditionResumeTime(loop)
 	reader := r.apiReader
 	if reader == nil {
 		// No APIReader wired (a bare test reconciler without
@@ -294,6 +333,17 @@ func (r *LoopReconciler) readPhaseClaimFromTerminationMessage(ctx context.Contex
 			// The agent is still running the phase (or has no status yet):
 			// no claim yet. Requeue (the phase-init container has written the
 			// desired phase and the runner is doing the work).
+			return nil, nil
+		}
+		// I93 R30 P1 (redo4): a resume must not advance on a claim from before
+		// the pause. If the Loop was just resumed (the Paused condition is
+		// False/Resumed) and the agent's termination FinishedAt predates the
+		// resume, the claim is from the pre-pause run and must not be consumed.
+		if !terminated.FinishedAt.IsZero() && pausedResumeAt != nil &&
+			terminated.FinishedAt.Before(pausedResumeAt) {
+			logf.FromContext(ctx).Info("stale claim from before the pause ignored (FinishedAt predates resume)",
+				"finishedAt", terminated.FinishedAt.String(),
+				"resumeAt", pausedResumeAt.String())
 			return nil, nil
 		}
 		claim, err := parsePhaseClaim(terminated.Message)
@@ -760,6 +810,50 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			now = metav1.Now()
 		}
 		fromPhase := loop.Status.Phase
+		// I93 (R29): the runner's plan-hash-mismatch claim. The check now
+		// runs at the START of the Implementing run, BEFORE any agent work
+		// (R29 P1): a mismatch blocks the run (no agent call, no commit) and
+		// the claim carries status=blocked + PlanMismatch=true + a
+		// blockedReason naming both hashes. The operator re-enters the
+		// AwaitingApproval hold (clear the PlanApproved condition), SURFACES
+		// the mismatch as the PlanMismatch condition (I90: visible via
+		// `kubectl cox describe`; the hashes ride in the message) and emits
+		// the PlanHashMismatch Warning Event (every state change has an Event).
+		// The handler keys on the claim alone (not the phase): a blocked claim
+		// never advances, so the phase is Implementing whenever the operator
+		// first sees it, and the guarded phase move below is idempotent for a
+		// re-queued claim (a re-hold to AwaitingApproval has already happened).
+		// The signal is a CLAIM (ADR-0005): it is the runner's evidence that
+		// the plan on disk differs from the approved hash; the re-hold itself
+		// is the approval gate's input (the cleared PlanApproved condition),
+		// so the PlanMismatch condition is a SURFACE, never a gate input.
+		// This runs BEFORE recordPhaseClaim (which would advance the phase to
+		// Verifying on a success claim); the re-hold must happen before the
+		// advance, otherwise the Loop would advance past the hold.
+		if claim.PlanMismatch && approvedPlanHash(loop) != "" {
+			approved := approvedPlanHash(loop)
+			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
+			changed = true
+			if loop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
+				loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+				loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+			}
+			// I93 (R29 P2): surface the mismatch as a condition + Event. The
+			// blockedReason (from the runner) names the current plan's hash and
+			// the approved hash; the Event is emitted only on the transition
+			// into True (the condition's setCondition is a no-op when
+			// unchanged, but a re-queued claim would otherwise re-emit the
+			// Event on every reconcile while the condition is already True).
+			msg := fmt.Sprintf("plan-hash mismatch at Implementing start: approved hash %s; %s", approved, claim.BlockedReason)
+			if !conditionTruePresent(loop, coxv1alpha1.PlanMismatchCondition) {
+				if r.Recorder != nil {
+					r.Recorder.Eventf(loop, corev1.EventTypeWarning, "PlanHashMismatch", "%s", msg)
+				}
+			}
+			setCondition(loop, coxv1alpha1.PlanMismatchCondition, metav1.ConditionTrue, "PlanHashMismatch", msg)
+			logf.FromContext(ctx).Info("runner blocked Implementing on a plan-hash mismatch before any agent work; clearing the PlanApproved condition, surfacing the PlanMismatch condition and re-entering the AwaitingApproval hold",
+				"loop", loop.Name, "approvedHash", approved)
+		}
 		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		changed = changed || c
 		// I89: map a ModelUnavailable claim to a Loop condition so

@@ -171,6 +171,22 @@ type Result struct {
 	// approved hash to compare against).
 	PlanChanged bool `json:"planChanged,omitempty"`
 
+	// I93 (R28 P1): true when the runner, at the START of an Implementing
+	// run, detected a PLAN MISMATCH: the current .coxswain/PLAN.md's SHA-256
+	// does not match the approved hash the operator wrote to
+	// .coxswain/plan-hash. This is the check the runner was missing at
+	// Implementing entry (R28 I93: the check lived only after a Planning
+	// rewrite, so an edit to PLAN.md between approval and Implementing start
+	// was invisible to the runner). It rides into the result.json (the
+	// runner's claim); the operator clears the PlanApproved condition and
+	// re-enters the AwaitingApproval hold (the user must re-approve the
+	// current plan). A CLAIM (ADR-0005): the operator uses it as a trigger
+	// to clear the condition (the re-hold), not as an authoritative gate
+	// input. False (the zero value) when the plan matches the approved hash,
+	// or there is no approved hash (a fresh Loop, or a plan the user has not
+	// approved yet — the check is a no-op, as in planChanged).
+	PlanMismatch bool `json:"planMismatch,omitempty"`
+
 	// toolConversation is the A4 conversation state (the messages after this
 	// phase run, for the next phase WITHOUT a pod recycle). It is unexported
 	// (not part of the result.json schema — the conversation is the

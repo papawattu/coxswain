@@ -6,6 +6,7 @@
 package runner
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -514,5 +515,60 @@ func TestWriteClaimCarriesIteration(t *testing.T) {
 	}
 	if *claim.Iteration != res.Iteration {
 		t.Fatalf("claim iteration = %d, want %d (res.Iteration): %s", *claim.Iteration, res.Iteration, data)
+	}
+}
+
+// TestWriteClaimCarriesPlanMismatch (I93, R29): writeClaim's JSON (the
+// /dev/termination-log the operator parses) MUST carry planMismatch when
+// res.PlanMismatch is true. The operator's advancePhaseFromClaim reads
+// claim.PlanMismatch to clear the PlanApproved condition, set the
+// PlanMismatch condition, and re-enter the AwaitingApproval hold. Without
+// the field, the runner's blocked-claim is parsed as a generic block (no
+// planMismatch key), the operator does not hold the Loop, and the agent
+// crash-loops (redo3, i93-kind-redo3).
+func TestWriteClaimCarriesPlanMismatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claim.json")
+	res := Result{Status: statusBlocked, ObservedPhase: PhaseImplementing,
+		PlanMismatch: true, VerificationNotes: "PlanMismatch: hash A does not match approved hash B"}
+	writeClaim(path, res)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim struct {
+		ObservedPhase string `json:"observedPhase"`
+		Status        string `json:"status"`
+		BlockedReason string `json:"blockedReason"`
+		PlanMismatch  *bool  `json:"planMismatch"`
+	}
+	if err := json.Unmarshal(data, &claim); err != nil {
+		t.Fatalf("claim is not JSON: %v (%s)", err, data)
+	}
+	if claim.ObservedPhase != PhaseImplementing || claim.Status != statusBlocked {
+		t.Fatalf("claim observedPhase/status = %q/%q, want Implementing/blocked: %s", claim.ObservedPhase, claim.Status, data)
+	}
+	if claim.PlanMismatch == nil {
+		t.Fatalf("the claim MUST carry the planMismatch key when res.PlanMismatch is true: %s", data)
+	}
+	if !*claim.PlanMismatch {
+		t.Fatalf("claim planMismatch = false, want true (res.PlanMismatch): %s", data)
+	}
+	// The operator's strict parser must accept the key. Simulate the
+	// operator's PhaseClaim parse (strict: unknown fields are rejected).
+	var opClaim struct {
+		ObservedPhase string `json:"observedPhase"`
+		Status        string `json:"status"`
+		BlockedReason string `json:"blockedReason"`
+		PlanMismatch  bool   `json:"planMismatch"`
+		Iteration     int    `json:"iteration"`
+		PlanAttempt   int    `json:"planAttempt"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&opClaim); err != nil {
+		t.Fatalf("the operator's strict parser rejects the claim: %v (%s)", err, data)
+	}
+	if !opClaim.PlanMismatch {
+		t.Fatalf("the operator's parser did not read planMismatch=true: %s", data)
 	}
 }

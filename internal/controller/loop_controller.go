@@ -38,6 +38,7 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/cni"
+	"github.com/papawattu/coxswain/internal/deliverytitle"
 	"github.com/papawattu/coxswain/internal/egress"
 	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
@@ -151,6 +152,12 @@ const (
 	// spec.goal (S3, GAP 1: the goal was never passed to the agent). COX_* is
 	// I34-protected, so a Loop cannot override it.
 	coxGoal = "COX_GOAL"
+	// coxDeliveryTitle is the env var the operator sets on the agent carrying
+	// the derived delivery title (P5e, R28 I94): deliverytitle.Title(loop.Spec.Goal).
+	// It is the same string the deliver Job uses for the PR title, so the
+	// runner implement-commit subject and the PR title match. COX_* is
+	// I34-protected, so a Loop cannot override it.
+	coxDeliveryTitle = "COX_DELIVERY_TITLE"
 	// workspaceInitContainerName is the name of the sandbox pod's workspace
 	// init container (S3a). It clones spec.workspace.repo @ ref into the
 	// 'workspace' volume and writes the resolved SHA to baseCommitFile.
@@ -1438,6 +1445,11 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// S3 (GAP 1): the goal, set by the operator only (COX_* is I34-protected).
 	// The runner reads it as its prompt; a non-runner image ignores it.
 	agentEnv = append(agentEnv, corev1.EnvVar{Name: coxGoal, Value: loop.Spec.Goal})
+	// P5e (R28 I94): the derived delivery title, set by the operator only
+	// (COX_* is I34-protected). The runner uses it as the implement-commit
+	// subject; the deliver Job uses the same string for the PR title, so the
+	// commit subject and the PR title match.
+	agentEnv = append(agentEnv, corev1.EnvVar{Name: coxDeliveryTitle, Value: deliverytitle.Title(loop.Spec.Goal)})
 	// C2 (ADR-0006 item 2): the agent holds no model key. It talks to the local
 	// proxy sidecar (COX_MODEL_BASE_URL), which holds the key and injects auth.
 	// The operator sets this; a Loop cannot override it (COX_* names are
@@ -1480,13 +1492,15 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		}
 	}
 	for _, e := range loop.Spec.Agent.Env {
-		if isOperatorProxyEnv(e.Name) || isToolEnv(e.Name) {
+		if isOperatorProxyEnv(e.Name) || isToolEnv(e.Name) || isOperatorCoxEnv(e.Name) {
 			// A user spec.agent.env var colliding with the operator-owned proxy
 			// names is dropped (I42d): the operator value wins so the agent
 			// cannot re-route its egress away from the egress proxy. A
 			// COX_TOOL_<NAME>_URL var is also reserved (D41d): the agent cannot
-			// re-route a tool URL away from the tool proxy. A non-colliding name
-			// falls through and is preserved.
+			// re-route a tool URL away from the tool proxy. An operator-owned
+			// COX_* env (COX_GOAL, COX_DELIVERY_TITLE) is reserved too: the
+			// agent cannot override the goal or the derived delivery title. A
+			// non-colliding name falls through and is preserved.
 			continue
 		}
 		agentEnv = append(agentEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
@@ -2604,6 +2618,21 @@ var operatorProxyEnvNames = map[string]struct{}{
 // shape is not a tool env (it falls through and is preserved).
 func isToolEnv(name string) bool {
 	return strings.HasPrefix(name, "COX_TOOL_") && strings.HasSuffix(name, "_URL") && len(name) > len("COX_TOOL_")+len("_URL")
+}
+
+// isOperatorCoxEnv reports whether a spec.agent.env var name is an
+// operator-owned COX_* name the operator sets on the agent (COX_GOAL,
+// P5e/R28 I94 COX_DELIVERY_TITLE). Defence in depth: the CRD already
+// rejects any spec.agent.env name starting COX_ (I34), so this check is
+// unreachable in practice; it guards against a future CRD relaxation.
+// A user var with one of these names is dropped: the operator value wins
+// (the agent cannot override the goal or the derived delivery title).
+func isOperatorCoxEnv(name string) bool {
+	switch name {
+	case coxGoal, coxDeliveryTitle:
+		return true
+	}
+	return false
 }
 
 // toolEnv is the COX_TOOL_<NAME>_URL env var for one tool in the effective

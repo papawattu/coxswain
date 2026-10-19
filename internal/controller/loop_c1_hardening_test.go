@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/deliverytitle"
 )
 
 // C1 (ADR-0006): the operator builds the Sandbox pod hardened and credential-
@@ -263,5 +264,62 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 			"the ephemeral-storage limit must be >= scratch + the overridden tmp (2Gi)")
 		Expect(limit2.Value()).To(BeNumerically(">", limit.Value()),
 			"raising tmpSizeLimit must raise the ephemeral-storage limit (consistency)")
+	})
+})
+
+// P5e (R28 I94, #174 P1, R31): the operator wires the derived delivery title
+// into the agent env (COX_DELIVERY_TITLE) so the runner's implement-commit
+// subject matches the deliver Job's PR title. M1 mutation: drop the
+// COX_DELIVERY_TITLE agent env line — this spec FAILS. The goal is multi-line
+// so the spec proves the title is the FIRST line, not the whole goal.
+var _ = Describe("P5e delivery title wiring into the agent env (M1)", func() {
+	ctx := context.Background()
+
+	const multiLineGoal = "Add a TODO comment at the top of README.md.\nIt must be an HTML comment placed above the first heading."
+
+	It("sets COX_DELIVERY_TITLE to deliverytitle.Title(goal) for a multi-line goal", func() {
+		ns := "p5e-title-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "p5e-title"
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      multiLineGoal,
+				Workspace: testWorkspace(),
+				Agent: coxv1alpha1.AgentConfig{
+					Image:             runnerImage,
+					Model:             testModel,
+					EndpointSecretRef: "cox-model-creds",
+					ModelEndpoint:     d34ModelEndpoint,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		sb := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, sb)).To(Succeed())
+
+		agent := &corev1.Container{}
+		for i := range sb.Spec.PodTemplate.Spec.Containers {
+			if sb.Spec.PodTemplate.Spec.Containers[i].Name == agentContainerName {
+				agent = &sb.Spec.PodTemplate.Spec.Containers[i]
+				break
+			}
+		}
+		envByName := map[string]string{}
+		for _, e := range agent.Env {
+			envByName[e.Name] = e.Value
+		}
+
+		want := deliverytitle.Title(multiLineGoal)
+		Expect(envByName[coxDeliveryTitle]).To(Equal(want),
+			"COX_DELIVERY_TITLE must equal deliverytitle.Title(goal) — the commit subject and PR title must match by construction")
+		// The title must be the FIRST line only (multi-line goal, not the whole thing).
+		Expect(want).To(Equal("coxswain: Add a TODO comment at the top of README.md."))
 	})
 })

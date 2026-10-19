@@ -218,7 +218,7 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		// The Sandbox is deleted (the retry): recreate it so the F6 check
 		// (sandboxFailure reads the Sandbox) finds the fresh pod + sandbox.
 		sb := &sandboxv1beta1.Sandbox{
-			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-sb-uid-2")},
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox"},
 			Spec: sandboxv1beta1.SandboxSpec{
 				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 					PodTemplate: sandboxv1beta1.PodTemplate{
@@ -231,6 +231,16 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 			},
 		}
 		Expect(k8sClient.Create(ctx, sb)).To(Succeed())
+		// Read back the actual UID and update the pod's ownerRef to match.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb)).To(Succeed())
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: sandboxv1beta1.GroupVersion.String(),
+			Kind:       "Sandbox",
+			Name:       name + "-sandbox",
+			UID:        sb.UID,
+			Controller: &[]bool{true}[0],
+		}}
+		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
 
 		// Mutation: remove the clearRecoveredCondition call in
 		// advancePhaseFromClaim (loop_s4_phase.go) and this spec FAILS
@@ -462,7 +472,7 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		// name and attributes its failure to Sandbox B's UID. The fix (owner
 		// check) must make sandboxFailure return nil (no decision) for a pod
 		// not controlled by the current Sandbox.
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			loop = &cov.Loop{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
 			f, err = r.sandboxFailure(ctx, loop)
@@ -582,7 +592,7 @@ var _ = Describe("F6 wiring: advancePhaseFromClaim invokes sandbox failure handl
 // a failure-condition scan.
 func f6PlantSandboxAndPodPodStatusFn(ns, name string) {
 	sb := &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-sb-uid")},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox"},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 				PodTemplate: sandboxv1beta1.PodTemplate{
@@ -595,9 +605,19 @@ func f6PlantSandboxAndPodPodStatusFn(ns, name string) {
 		},
 	}
 	Expect(k8sClient.Create(ctx, sb)).To(Succeed())
+	// Read back the actual UID (the API server generates it).
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb)).To(Succeed())
+	controller := true
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: sandboxv1beta1.GroupVersion.String(),
+				Kind:       "Sandbox",
+				Name:       name + "-sandbox",
+				UID:        sb.UID,
+				Controller: &controller,
+			}},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
@@ -645,9 +665,8 @@ func findConditionFn(conds []metav1.Condition, condType string) *metav1.Conditio
 // The pod status is set via the status subresource (Create does NOT set
 // status in envtest — the API server strips it).
 func f6PlantSandboxAndPodFn(ns, name string) {
-	sbUID := types.UID(name + "-sb-uid")
 	sb := &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: sbUID},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox"},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 				PodTemplate: sandboxv1beta1.PodTemplate{
@@ -660,9 +679,19 @@ func f6PlantSandboxAndPodFn(ns, name string) {
 		},
 	}
 	Expect(k8sClient.Create(ctx, sb)).To(Succeed())
+	// Read back the actual UID (the API server generates it).
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb)).To(Succeed())
+	controller := true
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: sandboxv1beta1.GroupVersion.String(),
+				Kind:       "Sandbox",
+				Name:       name + "-sandbox",
+				UID:        sb.UID,
+				Controller: &controller,
+			}},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},

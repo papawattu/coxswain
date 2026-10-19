@@ -1411,6 +1411,15 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	}
 	agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+3)
 	agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
+	// F13: point Go's build temp dir at the workspace PVC (1Gi+ default,
+	// user-configurable) rather than the /tmp emptyDir (1Gi default,
+	// evicted when full: "Usage of EmptyDir volume 'tmp' exceeds the
+	// limit '1Gi'" — dogfood6-p5e, 2026-10-19). GOCACHE is already on
+	// /scratch (via HOME=/scratch); GOTMPDIR defaults to /tmp, so a go
+	// build/test on a real repo fills /tmp and the pod is evicted.
+	// /workspace/.gotmp is a hidden subdirectory the Go toolchain manages
+	// (it cleans up after each build); it does not interfere with the repo.
+	agentEnv = append(agentEnv, corev1.EnvVar{Name: "GOTMPDIR", Value: "/workspace/.gotmp"})
 	// S3 (GAP 1): the goal, set by the operator only (COX_* is I34-protected).
 	// The runner reads it as its prompt; a non-runner image ignores it.
 	agentEnv = append(agentEnv, corev1.EnvVar{Name: coxGoal, Value: loop.Spec.Goal})
@@ -5401,6 +5410,10 @@ set -eu
 # Pending (a fresh Loop's first reconcile sets status.desiredPhase =
 # Planning). Write nothing so the one-shot runner waits (it exits 0 with no
 # claim until a desired phase appears) instead of erroring.
+# F13: create the Go build temp dir on the workspace PVC (GOTMPDIR points at
+# /workspace/.gotmp; Go's MkdirTemp requires the parent to exist).
+DEST=/workspace
+mkdir -p "${DEST}/.gotmp"
 exit 0
 `
 	}
@@ -5413,6 +5426,11 @@ exit 0
 		`set -eu`,
 		`DEST=/workspace`,
 		`mkdir -p "${DEST}/.coxswain"`,
+		// F13: the Go build temp dir on the workspace PVC (the agent container
+		// sets GOTMPDIR=/workspace/.gotmp; Go's MkdirTemp requires the parent
+		// to exist, and this phase-init container always runs before the agent
+		// with /workspace mounted, so it is the reliable place to create it).
+		`mkdir -p "${DEST}/.gotmp"`,
 		`printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"`,
 		`printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswain/iteration"`,
 		// I42b: the plan-attempt marker (the runner echoes it into its claim;

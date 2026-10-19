@@ -218,14 +218,23 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 	// reconciliation BEFORE delivery was first expected (the S5 -> S6 phase
 	// flip) — #166 printed "Budget (active time): 0s" because status.budget
 	// was nil until that first Succeeded reconcile, whose wall-clock
-	// accumulation adds 0 (no lastActiveStamp yet). Refresh the budget with
-	// the same accumulation the normal reconcile does (now -
-	// status.budget.lastActiveStamp) so the body carries the active time
-	// measured up to this render. applyBudgetStep is NOT re-run here (it
-	// would also read the proxy's usage endpoint and re-apply the caps —
-	// unnecessary for a description); refreshDeliverDescriptionBudget is the
-	// wall-clock-only half of applyBudget.
-	refreshDeliverDescriptionBudget(loop)
+	// accumulation adds 0 (no lastActiveStamp yet).
+	//
+	// A4 flake (fix/a4-flake): the wall-clock refresh (now - lastActiveStamp)
+	// is the OPERATOR's job (ensureDeliverDescriptionConfig calls
+	// refreshDeliverDescriptionBudget on the loop before rendering, and the
+	// caller's status write persists the refreshed value). This function is
+	// a PURE READER of the persisted status — it does NOT refresh. The
+	// earlier implementation called refreshDeliverDescriptionBudget(loop)
+	// here, which MUTATED the caller's loop IN PLACE; the caller's status
+	// write then persisted the mutation, and a spec that read the loop back
+	// and called this function again (to compute wantBody) measured
+	// time.Since(mutatedStamp) — a SECOND mutation — and wantBody's budget
+	// section diverged from the ConfigMap body (the A4 flake). Making the
+	// reader pure + having the operator refresh before rendering (so the
+	// refresh is persisted) makes the body deterministic: the spec reads the
+	// persisted (already-refreshed) value and computes the same body as the
+	// operator.
 	tamper := int32(-1)
 	if loop.Status.Verify != nil && loop.Status.Verify.TamperExitCode != nil {
 		tamper = *loop.Status.Verify.TamperExitCode

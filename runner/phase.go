@@ -928,8 +928,13 @@ func commitWorkspace(workspace string) (string, []string, string) {
 		return head, nil, ""
 	}
 
+	// P5e (R28 I94): the implement-commit subject is the operator-derived
+	// delivery title (COX_DELIVERY_TITLE, set on the agent from spec.goal), so
+	// the commit subject matches the delivery PR title. Fall back to the
+	// historical subject when the env is absent (e.g. the operator predates
+	// the wiring).
 	commitArgs := []string{"-c", "user.name=coxswain-agent", "-c", "user.email=agent@localhost",
-		"commit", "-m", "coxswain: implement"}
+		"commit", "-m", commitSubject()}
 	if out, commitErr := gitC(workspace, commitArgs...); commitErr != nil {
 		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", commitErr, out)
 		return "", stagedPaths, ""
@@ -948,6 +953,20 @@ func commitWorkspace(workspace string) (string, []string, string) {
 // larger than maxDesiredPhaseBytes is treated as absent (bounded read,
 // ADR-0005 trust hygiene: the operator is trusted, but a bounded read is
 // free).
+
+// commitSubject returns the implement-commit subject: the operator-derived
+// delivery title (COX_DELIVERY_TITLE, set on the agent from spec.goal) so
+// the commit subject matches the delivery PR title. Falls back to the
+// historical subject when the env is absent (e.g. the operator predates
+// the wiring). Extracted from commitWorkspace to keep its cyclomatic
+// complexity under the gocyclo limit (P5e R28 I94, #174 P1).
+func commitSubject() string {
+	if s := os.Getenv("COX_DELIVERY_TITLE"); s != "" {
+		return s
+	}
+	return "coxswain: implement"
+}
+
 func readDesiredPhase(workspace string) (string, bool) {
 	data, err := os.ReadFile(filepath.Join(workspace, resultDirName, desiredPhaseFileName))
 	if err != nil {

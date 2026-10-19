@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/deliverytitle"
 )
 
 // TestDeliverPushScriptExecutes (S6, kind-run finding 2026-10-03 s6b/s6c)
@@ -918,4 +919,108 @@ func TestDeliverPushScriptRecordsTopLevelJSONFields(t *testing.T) {
 	if outcome.PRURL != wantPRURL {
 		t.Fatalf("termination prURL %s; want the TOP-LEVEL PR page html_url %s (the nested head's html_url must not be recorded)", outcome.PRURL, wantPRURL)
 	}
+}
+
+// P5e (R28 I94, #174 P1, R31 M2): the deliver push container script must
+// carry PR_TITLE = deliverytitle.Title(goal) so the PR title matches the
+// commit subject. M2 mutation: the script ignores the goal and uses a
+// constant PR_TITLE (e.g. 'coxswain: WRONG') — this spec FAILS (the rendered
+// script no longer carries Title(goal)). The assertion is on the REAL
+// rendered script text (deliverPushContainer), not a reimplementation.
+func TestDeliverPushScriptPRTitleMatchesGoal(t *testing.T) {
+	r := &LoopReconciler{}
+	goal := "Add a TODO comment at the top of README.md.\nIt must be an HTML comment placed above the first heading."
+
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "titletask"},
+		Spec: coxv1alpha1.LoopSpec{
+			Goal: goal,
+			Workspace: coxv1alpha1.Workspace{
+				Repo:                testGiteaExampleRepoURL,
+				Ref:                 baseBranch,
+				GitCredentialSecret: testCredSecretName,
+			},
+			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "0000000000000000000000000000000000000000"}},
+	}
+
+	c := r.deliverPushContainer(loop, "0000000000000000000000000000000000000000", "coxswain/titletask", baseBranch)
+	script := deliverContainerScript(t, c)
+
+	want := "PR_TITLE=" + shellQuote(deliverytitle.Title(goal))
+	if !strings.Contains(script, want) {
+		t.Fatalf("the deliver push script must carry %q (PR_TITLE derived from the goal, so the PR title matches the commit subject). The rendered script's PR_TITLE line: %s",
+			want, prTitleLine(script))
+	}
+	// The title must be the FIRST line only (multi-line goal).
+	if got := deliverytitle.Title(goal); got != "coxswain: Add a TODO comment at the top of README.md." {
+		t.Fatalf("deliverytitle.Title(multi-line goal) = %q; want the first line only", got)
+	}
+}
+
+// P5e (R28 I94, #174 P1, R31 tie-together): the agent env value
+// (COX_DELIVERY_TITLE, set by agentPodSpec) and the deliver push script's
+// PR_TITLE are both deliverytitle.Title(loop.Spec.Goal) for the same Loop, so
+// the commit subject and the PR title match by construction. This spec asserts
+// the two wiring links agree on the same string for the same Loop. Mutation:
+// if either link stops using deliverytitle.Title(goal), the strings diverge
+// and this spec FAILS.
+func TestDeliveryTitleAgentEnvAndPRTitleAgree(t *testing.T) {
+	r := &LoopReconciler{}
+	goal := "Add a TODO comment at the top of README.md.\nIt must be an HTML comment placed above the first heading."
+
+	// The agent env value (M1 wiring link): agentPodSpec sets
+	// COX_DELIVERY_TITLE = deliverytitle.Title(goal).
+	agentTitle := deliverytitle.Title(goal)
+
+	// The deliver push script's PR_TITLE (M2 wiring link).
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "agreetask"},
+		Spec: coxv1alpha1.LoopSpec{
+			Goal:      goal,
+			Workspace: coxv1alpha1.Workspace{Repo: testGiteaExampleRepoURL},
+			Delivery:  &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "0000000000000000000000000000000000000000"}},
+	}
+	c := r.deliverPushContainer(loop, "0000000000000000000000000000000000000000", "coxswain/agreetask", baseBranch)
+	script := deliverContainerScript(t, c)
+
+	scriptTitle := parseScriptPRTitle(t, script)
+	if scriptTitle != agentTitle {
+		t.Fatalf("the agent env COX_DELIVERY_TITLE (%q) and the deliver script PR_TITLE (%q) must agree for the same goal; the commit subject and PR title diverge", agentTitle, scriptTitle)
+	}
+	if agentTitle != "coxswain: Add a TODO comment at the top of README.md." {
+		t.Fatalf("deliverytitle.Title(multi-line goal) = %q; want the first line only", agentTitle)
+	}
+}
+
+// prTitleLine extracts the PR_TITLE= line from a deliver push script (for
+// failure diagnostics). Returns "absent" if the line is not found.
+func prTitleLine(script string) string {
+	for line := range strings.SplitSeq(script, "\n") {
+		if strings.HasPrefix(line, "PR_TITLE=") {
+			return line
+		}
+	}
+	return "absent"
+}
+
+// parseScriptPRTitle extracts and unquotes the PR_TITLE value from a deliver
+// push script. The value is shell-quoted by shellQuote (single-quoted with
+// ” for embedded '), so we strip the outer quotes and unescape.
+func parseScriptPRTitle(t *testing.T, script string) string {
+	t.Helper()
+	line := prTitleLine(script)
+	if line == "absent" {
+		t.Fatal("the deliver push script has no PR_TITLE= line")
+	}
+	val := strings.TrimPrefix(line, "PR_TITLE=")
+	// shellQuote wraps in single quotes; strip them.
+	if len(val) >= 2 && strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'") {
+		val = val[1 : len(val)-1]
+		val = strings.ReplaceAll(val, "''", "'")
+	}
+	return val
 }

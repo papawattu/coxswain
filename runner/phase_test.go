@@ -511,3 +511,20 @@ func TestPhaseRunBlockedClaimRetries(t *testing.T) {
 		t.Fatalf("after the retry, the claim must be success (the retry drove the model): %v", claim)
 	}
 }
+
+// P5e (R28 I94, #174 P1): commitSubject reads COX_DELIVERY_TITLE and falls
+// back to "coxswain: implement" when unset. Mutation: hard-code the old
+// subject — both cases FAIL.
+func TestCommitSubjectUsesDeliveryTitle(t *testing.T) {
+	// Case 1: COX_DELIVERY_TITLE is set → the subject is the env value.
+	t.Setenv("COX_DELIVERY_TITLE", "coxswain: a derived title from spec.goal")
+	if got := commitSubject(); got != "coxswain: a derived title from spec.goal" {
+		t.Fatalf("commitSubject() with COX_DELIVERY_TITLE set = %q, want %q", got, "coxswain: a derived title from spec.goal")
+	}
+
+	// Case 2: COX_DELIVERY_TITLE is unset → the fallback.
+	t.Setenv("COX_DELIVERY_TITLE", "")
+	if got := commitSubject(); got != "coxswain: implement" {
+		t.Fatalf("commitSubject() with COX_DELIVERY_TITLE empty = %q, want %q", got, "coxswain: implement")
+	}
+}

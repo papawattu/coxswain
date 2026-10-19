@@ -64,7 +64,7 @@ opened PR #166, which was merged.
 
 ## P1
 
-- [ ] **I92: the builder's evidence must be able to fail, and must be kept**
+- [x] **I92: the builder's evidence must be able to fail, and must be kept** (7b44044, #169)
 
   **Where:** AGENTS.md "Test norms"; PRs #158, #164, #165, #160 this round.
 
@@ -154,7 +154,7 @@ opened PR #166, which was merged.
   multi-line and special-character goals), and a kind delivery whose PR
   title shows the goal.
 
-- [ ] **I95: the PR body reports 0s active time**
+- [x] **I95: the PR body reports 0s active time** (287f911, #170)
 
   **Where:** `internal/controller/loop_deliver_description.go:403`;
   `activeSeconds` in `internal/controller/loop_p2d_budget.go:101`.
@@ -170,7 +170,7 @@ opened PR #166, which was merged.
   active time, plus a kind delivery whose body shows a non-zero, plausible
   value.
 
-- [ ] **I96: reconcile rate on terminal Loops unexplained (observation)**
+- [x] **I96: reconcile rate on terminal Loops unexplained (observation)** (not reproducible on main; measured on #170)
 
   **Where:** operator on kind-coxswain-snap, measured 2026-10-17 at
   00:03–00:05Z.
@@ -190,7 +190,7 @@ opened PR #166, which was merged.
   rate is low, or a fix whose spec shows that a terminal Loop, left alone,
   is not reconciled again.
 
-- [ ] **I97 (F12): the deleting path still writes enforcement objects**
+- [x] **I97 (F12): the deleting path still writes enforcement objects** (d99e55c, #168)
 
   **Where:** `finalizeB2DeleteStep` in `internal/controller/loop_checkpoint.go`.
 
@@ -260,3 +260,14 @@ opened PR #166, which was merged.
   `docs/PLAN-PHASE5.md` (the builder writes the plan, docs only, and the
   owner approves it before any code). Should I94 and I98 fold into that plan
   or be fixed first?
+
+---
+
+## Owner decisions (2026-10-19)
+
+The owner accepted every recommendation.
+
+- **Q1: tag `v0.1.2`.** Yes, once F12 has merged. F12 merged as d99e55c, so the tag goes on `main` after this round merges.
+- **D64 (Q2): `Succeeded` waits for delivery.** The Loop holds `Succeeded` until `Delivered` is terminal. A failed delivery is still reported as `Succeeded` with `Delivered=False`, as today. This resolves I98.
+- **D63 (Q3): verify checks get the Loop's own allowlist through the egress proxy.** Recorded as a decision. F9 (#163, cebe29b) implements it: verify containers carry the proxy env, and the verify NetworkPolicy allows egress only to the proxy.
+- **D65 (Q4): I94 and I98 fold into the Phase 5 plan.** They go into `docs/PLAN-PHASE5.md` (docs only; the owner approves the plan before any code), not separate fixes now.

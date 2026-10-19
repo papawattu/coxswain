@@ -1105,4 +1105,136 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		Expect(k8sClient.Get(ctx, nn, final)).To(Succeed())
 		Expect(final.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 	})
+
+	// I93 R30 P1 (redo5): a resume must not advance on a stale claim from
+	// before the pause. The live reader (readPhaseClaimFromTerminationMessage)
+	// carries the guard: if the Loop was just resumed (Paused=False/Resumed
+	// with LastTransitionTime R) and the agent container's termination
+	// FinishedAt predates R, the claim is from the pre-pause run and must NOT
+	// be consumed. These specs drive the LIVE reader (no readPhaseClaim seam)
+	// so the guard is exercised.
+	//
+	// Mutation (reviewer, loop_s4_phase.go:342): `if !terminated.FinishedAt.
+	// IsZero() && pausedResumeAt != nil &&` -> `if false && ...` -- the guard
+	// never fires; the stale-claim It below FAILS (the operator advances on the
+	// stale claim).
+	//
+	// Both FinishedAt and R are 1-second-resolution metav1.Time values. When
+	// FinishedAt == R (the same second) the claim is treated as FRESH: the
+	// guard uses strict Before (FinishedAt.Before(R)), so a claim in the same
+	// second as the resume is consumed (a claim written in the resume second
+	// is from the post-resume run, not the pre-pause one). The control It
+	// covers the > R case.
+	writeAgentTerminationAt := func(ns, name, message string, finishedAt *metav1.Time) {
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-sandbox", Namespace: ns}, pod)).To(Succeed())
+		terminated := int32(0)
+		tst := &corev1.ContainerStateTerminated{ExitCode: terminated, Message: message}
+		if finishedAt != nil {
+			tst.FinishedAt = *finishedAt
+		}
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+			{Name: agentContainerName, State: corev1.ContainerState{Terminated: tst}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	}
+
+	setResumedAt := func(ns, name string, at metav1.Time) {
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		cond := metav1.Condition{
+			Type:               coxv1alpha1.PausedCondition,
+			Status:             metav1.ConditionFalse,
+			Reason:             "Resumed",
+			Message:            "resumed",
+			ObservedGeneration: loop.Generation,
+			LastTransitionTime: at,
+		}
+		conditions := make([]metav1.Condition, 0, len(loop.Status.Conditions)+1)
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type != coxv1alpha1.PausedCondition {
+				conditions = append(conditions, loop.Status.Conditions[i])
+			}
+		}
+		conditions = append(conditions, cond)
+		loop.Status.Conditions = conditions
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+	}
+
+	advanceToImplementing := func(r *LoopReconciler, ns, name string) types.NamespacedName {
+		_, nn := primeReconcile(r, ns, name)
+		ensureSandboxObject(ns, name)
+		createStandinPod(ns, name)
+		pins := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, pins)).To(Succeed())
+		pins.Status.BaseCommit = s3BaseCommitSHA
+		Expect(k8sClient.Status().Update(ctx, pins)).To(Succeed())
+		loop := oneShotRun(r, nn, coxv1alpha1.LoopPhasePlanning, true)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"the setup must reach Implementing before the stale-claim case")
+		return nn
+	}
+
+	implClaimJSON := `{"observedPhase":"Implementing","status":"success","blockedReason":"","headCommit":"` + b1HeadCommit + `"}`
+
+	It("does not advance on a stale claim (FinishedAt before the resume time R)", func() {
+		ns := "i93stale-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		nn := advanceToImplementing(r, ns, "stalelp")
+
+		// The resume happens at R. The agent container's termination
+		// FinishedAt is BEFORE R (the claim is from the pre-pause run). 10s
+		// apart to avoid any second-boundary ambiguity.
+		R := metav1.NewTime(time.Now().Add(-30 * time.Second).Truncate(time.Second))
+		staleFinished := metav1.NewTime(R.Time.Add(-10 * time.Second).Truncate(time.Second))
+		Expect(staleFinished.Time.Before(R.Time)).To(BeTrue())
+		setResumedAt(ns, "stalelp", R)
+
+		// A fresh stand-in pod (the resume recycle) whose agent terminated with
+		// a valid Implementing SUCCESS claim whose FinishedAt predates R.
+		createStandinPod(ns, "stalelp")
+		writeAgentTerminationAt(ns, "stalelp", implClaimJSON, &staleFinished)
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+			"a stale claim (FinishedAt before the resume time) must NOT advance the phase")
+	})
+
+	It("advances on a fresh claim (FinishedAt after the resume time R, control case)", func() {
+		ns := "i93fresh-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		recorder := record.NewFakeRecorder(64)
+		r := s4Reconciler(recorder)
+		nn := advanceToImplementing(r, ns, "freshlp")
+
+		// The resume happens at R. The agent container's termination
+		// FinishedAt is AFTER R (the claim is from the post-resume run).
+		R := metav1.NewTime(time.Now().Add(-30 * time.Second).Truncate(time.Second))
+		freshFinished := metav1.NewTime(R.Time.Add(10 * time.Second).Truncate(time.Second))
+		Expect(freshFinished.Time.After(R.Time)).To(BeTrue())
+		setResumedAt(ns, "freshlp", R)
+
+		createStandinPod(ns, "freshlp")
+		writeAgentTerminationAt(ns, "freshlp", implClaimJSON, &freshFinished)
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"a fresh claim (FinishedAt after the resume time) must advance Implementing -> Verifying")
+	})
 })

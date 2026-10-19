@@ -472,4 +472,88 @@ var _ = Describe("I93 plan-hash check at Implementing start", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"the Implementing claim (no PlanMismatch) advances to Verifying (a no-op — the plan matches the approved hash)")
 	})
+
+	// I93 (R29, kind finding — the writer-side gap): the approved hash must be
+	// written to .coxswain/plan-hash at the START of an Implementing run so
+	// the runner's planHashMismatchAtStart can detect a post-approval edit to
+	// PLAN.md before any agent work. The phase-init re-runs when the sandbox
+	// recycles for the AwaitingApproval -> Implementing transition
+	// (DesiredPhase=Implementing), so planApprovalFiles MUST return the
+	// approved hash for Implementing (not only for Planning) — otherwise the
+	// phase-init's `rm -f .coxswain/plan-hash` REMOVES the hash on the
+	// Implementing transition and the runner's check is a no-op (the edited
+	// plan is implemented silently, no PlanMismatch, no Event). The FEEDBACK
+	// file stays Planning-only (the planning prompt's read channel; an
+	// Implementing run must not carry a stale rejection/replan feedback into
+	// the conversation).
+	It("the phase-init for DesiredPhase=Implementing writes .coxswain/plan-hash with the approved hash (the runner's Implementing-start check read channel)", func() {
+		r := &LoopReconciler{}
+		// A Manual-mode Loop at Implementing (DesiredPhase=Implementing) with
+		// a valid PlanApproved condition (the user approved the plan).
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "i93-w", Namespace: "i93-w"},
+			Spec:       coxv1alpha1.LoopSpec{Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual}},
+			Status: coxv1alpha1.LoopStatus{
+				DesiredPhase: coxv1alpha1.LoopPhaseImplementing,
+				Conditions: []metav1.Condition{{
+					Type:    coxv1alpha1.PlanApprovedCondition,
+					Status:  metav1.ConditionTrue,
+					Reason:  "Approved",
+					Message: "Approved: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+				}},
+			},
+		}
+		// The operator's decision: the approved hash is returned for
+		// Implementing (the phase-init writes it to .coxswain/plan-hash). The
+		// feedback is empty (the planning prompt's read channel — an Implementing
+		// run must not carry a stale rejection/replan feedback).
+		hash, feedback := r.planApprovalFiles(loop)
+		wantHash := "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+		Expect(hash).To(Equal(wantHash),
+			"planApprovalFiles at Implementing must return the approved hash (the phase-init writes .coxswain/plan-hash; the runner's planHashMismatchAtStart reads it at the Implementing start)")
+		Expect(feedback).To(Equal(""),
+			"planApprovalFiles at Implementing must return an EMPTY feedback (the planning prompt's read channel — no stale rejection/replan leaks into the Implementing run)")
+
+		// The phase-init script (the phase-init container's sh -c body) WRITES
+		// the hash file (printf >), not removes it (rm -f).
+		script := phaseInitScript(loop.Status.DesiredPhase, loop.Status.Iteration, loop.Status.PlanAttempt, hash, feedback)
+		Expect(script).To(ContainSubstring(coxPlanHashFile),
+			"the phase-init script must reference the plan-hash file")
+		Expect(script).To(ContainSubstring(wantHash),
+			"the phase-init script must carry the approved hash")
+		// It writes (printf >), not removes (rm -f), the plan-hash file.
+		hashRemove := `rm -f "${DEST}/.coxswain/` + coxPlanHashFile + `"`
+		Expect(script).ToNot(ContainSubstring(hashRemove),
+			"the phase-init script must NOT remove .coxswain/plan-hash at the Implementing start (it must write the approved hash); the runner's check needs the hash to detect a post-approval edit")
+		Expect(script).To(ContainSubstring(`printf '%s'`),
+			"the phase-init script must printf the file contents")
+		// The feedback file is still removed (empty feedback) — the planning
+		// prompt's read channel must not carry a stale rejection into the
+		// Implementing run.
+		feedbackRemove := `rm -f "${DEST}/.coxswain/` + coxPlanFeedbackFile + `"`
+		Expect(script).To(ContainSubstring(feedbackRemove),
+			"the phase-init script must remove .coxswain/plan-feedback at the Implementing start (no stale rejection/replan feedback)")
+
+		// Planning still carries BOTH the hash and the feedback (the existing
+		// behaviour is preserved — the planning prompt reads the feedback, the
+		// plan-change check reads the hash).
+		planningLoop := loop.DeepCopy()
+		planningLoop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		planningLoop.Status.Approval = &coxv1alpha1.ApprovalStatus{LastRejectionReason: "Rejected: the plan is missing the edge case"}
+		phash, pfeedback := r.planApprovalFiles(planningLoop)
+		Expect(phash).To(Equal(wantHash), "planApprovalFiles at Planning returns the approved hash (unchanged)")
+		Expect(pfeedback).To(ContainSubstring("Rejected:"),
+			"planApprovalFiles at Planning returns the rejection feedback (the planning prompt's read channel — unchanged)")
+
+		// A non-Planning, non-Implementing phase (e.g. Verifying) writes NEITHER
+		// file (the runner reads the hash only in Planning + Implementing; a
+		// stale hash must not leak into a later phase).
+		verifyingLoop := loop.DeepCopy()
+		verifyingLoop.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying
+		vhash, vfeedback := r.planApprovalFiles(verifyingLoop)
+		Expect(vhash).To(Equal(""),
+			"planApprovalFiles at Verifying returns an EMPTY hash (the runner reads the hash only in Planning + Implementing; a stale hash must not leak)")
+		Expect(vfeedback).To(Equal(""),
+			"planApprovalFiles at Verifying returns an EMPTY feedback (the planning prompt's read channel — no stale rejection)")
+	})
 })

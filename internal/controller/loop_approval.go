@@ -202,30 +202,56 @@ func clearLastRejectionReason(loop *coxv1alpha1.Loop) {
 // runner reads them in) — the other phases write "" (the phase-init script
 // removes the files, so an Implementing phase does not carry a stale
 // feedback into the conversation).
+// I93 (R29, kind finding): the approved hash must reach the workspace at the
+// START of an Implementing run (the runner's planHashMismatchAtStart reads
+// .coxswain/plan-hash and blocks on a mismatch — a post-approval edit to
+// PLAN.md must be caught before any agent work). The phase-init re-runs when
+// the sandbox recycles for the AwaitingApproval -> Implementing transition
+// (DesiredPhase=Implementing), so planApprovalFiles MUST return the approved
+// hash for Implementing as well, not only for Planning — otherwise the
+// phase-init's `rm -f .coxswain/plan-hash` REMOVES the hash on the Implementing
+// transition and the runner's check is a no-op (the edited plan is implemented
+// silently, no PlanMismatch condition, no PlanHashMismatch Event). The FEEDBACK
+// file stays Planning-only (the planning prompt reads it; an Implementing run
+// must not carry a stale rejection/replan feedback into the conversation).
+//
+// The phase is Planning (the only phase the runner reads the feedback file in)
+// for the feedback, and Planning OR Implementing for the approved hash (the
+// runner reads the hash in both: after a Planning rewrite to detect a plan
+// change, and at the Implementing start to catch a post-approval edit).
 func (r *LoopReconciler) planApprovalFiles(loop *coxv1alpha1.Loop) (string, string) {
-	if loop.Status.DesiredPhase != coxv1alpha1.LoopPhasePlanning {
+	switch loop.Status.DesiredPhase {
+	case coxv1alpha1.LoopPhasePlanning:
+		// B4: the verify-failure summary (status.verify.lastFailureSummary) takes
+		// precedence over the rejection reason (a re-plan after a failed verify is
+		// the freshest feedback). When the summary is absent (onVerifyFail is not
+		// Plan, or the last verify passed), fall back to B3's rejection reason
+		// (status.approval.lastRejectionReason, durable across the PlanRejected
+		// clear).
+		var feedback string
+		if loop.Status.Verify != nil && loop.Status.Verify.LastFailureSummary != "" {
+			feedback = loop.Status.Verify.LastFailureSummary
+		}
+		if feedback == "" {
+			// B3: the rejection reason (the user's cox reject --reason), durable
+			// across the PlanRejected clear.
+			reason := rejectedPlanReason(loop)
+			if loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
+				reason = loop.Status.Approval.LastRejectionReason
+			}
+			feedback = reason
+		}
+		return approvedPlanHash(loop), feedback
+	case coxv1alpha1.LoopPhaseImplementing:
+		// I93 (R29, kind finding): the approved hash is written for the
+		// Implementing start (the runner's planHashMismatchAtStart read channel).
+		// The feedback file stays empty (the planning prompt's read channel —
+		// an Implementing run must not carry a stale rejection/replan feedback
+		// into the conversation).
+		return approvedPlanHash(loop), ""
+	default:
 		return "", ""
 	}
-	// B4: the verify-failure summary (status.verify.lastFailureSummary) takes
-	// precedence over the rejection reason (a re-plan after a failed verify is
-	// the freshest feedback). When the summary is absent (onVerifyFail is not
-	// Plan, or the last verify passed), fall back to B3's rejection reason
-	// (status.approval.lastRejectionReason, durable across the PlanRejected
-	// clear).
-	var feedback string
-	if loop.Status.Verify != nil && loop.Status.Verify.LastFailureSummary != "" {
-		feedback = loop.Status.Verify.LastFailureSummary
-	}
-	if feedback == "" {
-		// B3: the rejection reason (the user's cox reject --reason), durable
-		// across the PlanRejected clear.
-		reason := rejectedPlanReason(loop)
-		if loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
-			reason = loop.Status.Approval.LastRejectionReason
-		}
-		feedback = reason
-	}
-	return approvedPlanHash(loop), feedback
 }
 
 // applyApprovalGate runs the B3 approval decision on the Loop (level-based,

@@ -180,7 +180,8 @@ func TestCommitWorkspaceExcludesGOTMPDir(t *testing.T) {
 	// The GOTMPDIR file must NOT be in the staged set.
 	for _, p := range staged {
 		if p == gotmpPath || strings.HasPrefix(p, gotmpPath+"/") {
-			t.Fatalf("GOTMPDIR path %q leaked into the staged set: %v (F13 P1: leftover go-build* dirs must not be committed and delivered)", p, staged)
+			t.Fatalf("GOTMPDIR path %q leaked into the staged set: %v (F13 P1: "+
+				"leftover go-build* dirs must not be committed and delivered)", p, staged)
 		}
 	}
 	// The GOTMPDIR file must NOT be tracked in the commit's tree.

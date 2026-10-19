@@ -923,6 +923,19 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 		}
 		return nil, err
 	}
+	// F14 (P1): the pod must be controlled by the current Sandbox. A stale
+	// Failed pod from a previous Sandbox generation (the GC has not run yet)
+	// is still present with the same name; without this check, sandboxFailure
+	// attributes its failure to the NEW Sandbox's UID, the dedup by UID fails
+	// (different UID), and the same pod termination is counted as multiple
+	// infra attempts (the F14 bug: 1→2→3 in one second, Loop Failed). A pod
+	// with a DeletionTimestamp is Terminating (being deleted) — no decision.
+	if pod.DeletionTimestamp != nil {
+		return nil, nil // the pod is being deleted: no decision
+	}
+	if !metav1.IsControlledBy(pod, sb) {
+		return nil, nil // the pod is not controlled by the current Sandbox (stale): no decision
+	}
 	// A pod that has not FAILED (Running/Pending): no decision (I49 — an
 	// in-progress agent is never a failure).
 	if pod.Status.Phase != corev1.PodFailed {

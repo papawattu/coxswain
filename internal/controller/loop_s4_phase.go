@@ -928,11 +928,7 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 	// is still present with the same name; without this check, sandboxFailure
 	// attributes its failure to the NEW Sandbox's UID, the dedup by UID fails
 	// (different UID), and the same pod termination is counted as multiple
-	// infra attempts (the F14 bug: 1→2→3 in one second, Loop Failed). A pod
-	// with a DeletionTimestamp is Terminating (being deleted) — no decision.
-	if pod.DeletionTimestamp != nil {
-		return nil, nil // the pod is being deleted: no decision
-	}
+	// infra attempts (the F14 bug: 1→2→3 in one second, Loop Failed).
 	if !metav1.IsControlledBy(pod, sb) {
 		return nil, nil // the pod is not controlled by the current Sandbox (stale): no decision
 	}

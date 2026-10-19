@@ -218,7 +218,7 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		// The Sandbox is deleted (the retry): recreate it so the F6 check
 		// (sandboxFailure reads the Sandbox) finds the fresh pod + sandbox.
 		sb := &sandboxv1beta1.Sandbox{
-			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-sb-uid-2")},
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox"},
 			Spec: sandboxv1beta1.SandboxSpec{
 				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 					PodTemplate: sandboxv1beta1.PodTemplate{
@@ -231,6 +231,16 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 			},
 		}
 		Expect(k8sClient.Create(ctx, sb)).To(Succeed())
+		// Read back the actual UID and update the pod's ownerRef to match.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb)).To(Succeed())
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: sandboxv1beta1.GroupVersion.String(),
+			Kind:       "Sandbox",
+			Name:       name + "-sandbox",
+			UID:        sb.UID,
+			Controller: &[]bool{true}[0],
+		}}
+		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
 
 		// Mutation: remove the clearRecoveredCondition call in
 		// advancePhaseFromClaim (loop_s4_phase.go) and this spec FAILS
@@ -377,6 +387,109 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		Expect(err).ToNot(HaveOccurred())
 		Expect(f).To(BeNil(), "a Running pod is never a failure (I49)")
 	})
+
+	It("F14 repro: a stale Failed pod (not controlled by the current Sandbox) is NOT counted as a new attempt", func() {
+		const ns, name = "f6-f14-ns", "f6-f14"
+		r := f6NewReconciler(ns, name)
+		// Step 1: Create Sandbox A (UID: A) + a Failed pod controlled by A.
+		sbAUID := types.UID("f14-sandbox-a-uid")
+		sbA := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: sbAUID},
+			Spec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
+						},
+					},
+				},
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			},
+		}
+		Expect(k8sClient.Create(ctx, sbA)).To(Succeed())
+		// The API server generates the UID (it ignores the one we set).
+		// Read it back.
+		sbAActual := &sandboxv1beta1.Sandbox{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sbAActual)).To(Succeed())
+		sbAUID = sbAActual.UID
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: sandboxv1beta1.GroupVersion.String(),
+					Kind:       "Sandbox",
+					Name:       name + "-sandbox",
+					UID:        sbAUID,
+					Controller: &[]bool{true}[0],
+				}},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status = corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "agent",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "Error"},
+				},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "Error"},
+				},
+			}},
+		}
+		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
+		// Step 2: Run applySandboxFailure (counts attempt 1, deletes Sandbox A).
+		loop := &cov.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(f).ToNot(BeNil(), "sandboxFailure must detect the failed pod")
+		Expect(string(f.sandboxUID)).To(Equal(string(sbAUID)), "the failure must be attributed to Sandbox A")
+		r.applySandboxFailure(ctx, loop, f)
+		// Step 3: Create Sandbox B (new UID), keep the old pod present.
+		// The old pod is still Failed and still present (the GC has not run).
+		// It is controlled by Sandbox A (deleted), NOT by Sandbox B.
+		sbBUID := types.UID("f14-sandbox-b-uid")
+		sbB := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: sbBUID},
+			Spec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
+						},
+					},
+				},
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			},
+		}
+		Expect(k8sClient.Create(ctx, sbB)).To(Succeed())
+		// Step 4: Re-reconcile N times. The old pod is still present (Failed,
+		// controlled by the deleted Sandbox A). sandboxFailure reads it by
+		// name and attributes its failure to Sandbox B's UID. The fix (owner
+		// check) must make sandboxFailure return nil (no decision) for a pod
+		// not controlled by the current Sandbox.
+		for i := range 3 {
+			loop = &cov.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+			f, err = r.sandboxFailure(ctx, loop)
+			Expect(err).ToNot(HaveOccurred())
+			// The fix: sandboxFailure must return nil for a pod not controlled
+			// by the current Sandbox (the stale pod from the deleted Sandbox A).
+			Expect(f).To(BeNil(),
+				"F14: sandboxFailure must NOT return a failure for a pod not controlled by the current Sandbox (reconcile %d)", i+1)
+		}
+		// Assert InfraAttempts == 1 (only the original failure was counted).
+		loop = &cov.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		if loop.Status.Agent != nil {
+			Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(1)),
+				"F14: a stale Failed pod (not controlled by the current Sandbox) must not be counted as a new attempt")
+		}
+	})
 })
 
 // f6FakeEnforcer is a no-op engine.Enforcer for the F6 spec.
@@ -479,7 +592,7 @@ var _ = Describe("F6 wiring: advancePhaseFromClaim invokes sandbox failure handl
 // a failure-condition scan.
 func f6PlantSandboxAndPodPodStatusFn(ns, name string) {
 	sb := &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-sb-uid")},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox"},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 				PodTemplate: sandboxv1beta1.PodTemplate{
@@ -492,9 +605,19 @@ func f6PlantSandboxAndPodPodStatusFn(ns, name string) {
 		},
 	}
 	Expect(k8sClient.Create(ctx, sb)).To(Succeed())
+	// Read back the actual UID (the API server generates it).
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb)).To(Succeed())
+	controller := true
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: sandboxv1beta1.GroupVersion.String(),
+				Kind:       "Sandbox",
+				Name:       name + "-sandbox",
+				UID:        sb.UID,
+				Controller: &controller,
+			}},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},
@@ -542,9 +665,8 @@ func findConditionFn(conds []metav1.Condition, condType string) *metav1.Conditio
 // The pod status is set via the status subresource (Create does NOT set
 // status in envtest — the API server strips it).
 func f6PlantSandboxAndPodFn(ns, name string) {
-	sbUID := types.UID(name + "-sb-uid")
 	sb := &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox", UID: sbUID},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-sandbox"},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 				PodTemplate: sandboxv1beta1.PodTemplate{
@@ -557,9 +679,19 @@ func f6PlantSandboxAndPodFn(ns, name string) {
 		},
 	}
 	Expect(k8sClient.Create(ctx, sb)).To(Succeed())
+	// Read back the actual UID (the API server generates it).
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb)).To(Succeed())
+	controller := true
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: sandboxv1beta1.GroupVersion.String(),
+				Kind:       "Sandbox",
+				Name:       name + "-sandbox",
+				UID:        sb.UID,
+				Controller: &controller,
+			}},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}},

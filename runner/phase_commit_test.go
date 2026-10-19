@@ -132,14 +132,20 @@ func TestCommitWorkspaceNotAGitRepoReturnsEmpty(t *testing.T) {
 // go-build* work dir under the GOTMPDIR path (Go only removes it on a clean
 // exit; a killed, timed-out, or `go test -work` agent leaves it behind) must
 // NOT be committed and delivered. GOTMPDIR lives INSIDE the operator-owned
-// .coxswain dir (gotmpPath), so commitWorkspace's :exclude pathspec covers
-// it. This is the spec the review asked for: "a runner commit test with a
-// file under the GOTMPDIR path, asserting the file is NOT in the commit."
+// .coxswain dir (gotmpPath), so commitWorkspace keeps it out — the status
+// pathspec excludes .coxswain, and the per-record defensive skip
+// (strings.HasPrefix(path, resultDirName+"/")) drops any .coxswain path that
+// reached the listing. This is the spec the review asked for: "a runner
+// commit test with a file under the GOTMPDIR path, asserting the file is NOT
+// in the commit."
 //
-// Mutation: drop the .coxswain exclusion from commitWorkspace's status
-// pathspec (see the scratch worktree mutation below) — the gotmp file
-// becomes untracked-and-listed, enters the staged set, and this assertion
-// FAILS.
+// Mutation (recorded in the PR): drop the .coxswain exclusion — the status
+// pathspec AND the per-record defensive skip in commitWorkspace's status
+// loop (the line that skips a path equal to resultDirName or prefixed by
+// resultDirName+"/"). Both guards keep a .coxswain path out of the staged
+// set; dropping either one alone is masked by the other, so the mutation
+// disables both. The spec FAILS (the gotmp file enters the staged set).
+// The exact diff + command + output are in the PR body.
 func TestCommitWorkspaceExcludesGOTMPDir(t *testing.T) {
 	ws := t.TempDir()
 	initTestRepo(t, ws)

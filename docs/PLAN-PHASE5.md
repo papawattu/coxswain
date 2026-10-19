@@ -345,9 +345,18 @@ which lessons were written and why.
     phase to the machine and the `nextPhase` table; option (i) reuses the
     existing `Verifying` phase + the existing `Delivered` condition and is the
     first cut. See D69.)
-  - **Meanwhile the sandbox gate sees `DesiredPhase=Verifying`** (the sandbox
-    stays stopped / suspended per I74 — the gate keys on the phase, and
-    `Verifying` is not a sandbox-running phase, so the sandbox does not resume).
+  - **The sandbox is stopped during the hold (R29 correction, option (b)).**
+    Today the gate `loopSandboxStopped`
+    (`internal/controller/loop_p2f_paused.go:143-147`) stops the sandbox only
+    for the Paused, Succeeded and Failed phases — during a `Verifying` hold the
+    sandbox would stay Running, and a `Verifying` Loop is not a one-shot runner
+    crash (the runner only executes Planning or Implementing), so I74's
+    rationale does not cover it. P5f therefore **extends `loopSandboxStopped`
+    to also return true for `Phase==Verifying` with the `Delivering` reason**
+    (a `Verifying` Loop that is not holding on `Delivered` keeps its sandbox
+    Running). Delivery does not need the sandbox: the deliver Job runs in its
+    own pod (clone-base/import-agent/push read the workspace from a volume,
+    independent of the sandbox pod).
   - **When `spec.delivery` is unset:** there is no delivery, so there is no
     `Delivered` condition to wait for — `Succeeded` is set immediately at verify
     (the current behaviour, unchanged for delivery-off Loops). The gate checks
@@ -363,8 +372,8 @@ which lessons were written and why.
   - envtest: a Loop that passes verify with delivery enabled is **not** set to
     `Succeeded` (it stays at `Verifying` with reason `Delivering`) until the
     `Delivered` condition is terminal (True or False). The sandbox stays
-    stopped (the sandbox gate sees `DesiredPhase=Verifying`, not a running
-    phase).
+    stopped (the extended `loopSandboxStopped` gate covers `Verifying` + reason
+    `Delivering`).
   - envtest: a Loop that passes verify and delivers successfully is set to
     `Succeeded` with `Delivered=True` (both `phase` and `desiredPhase`).
   - envtest: a Loop that passes verify and **fails** delivery is set to
@@ -379,19 +388,22 @@ which lessons were written and why.
     - **set Succeeded at verify**: set `Succeeded` the moment verify passes (the
       current behaviour). The "not set to Succeeded until Delivered is
       terminal" spec FAILS.
-    - **resume the sandbox during the hold**: set `DesiredPhase` to a running
-      phase while `Delivered` is in progress. The "sandbox stays stopped" spec
-      FAILS.
+    - **revert the gate**: remove the `Verifying` + reason `Delivering` case
+      from `loopSandboxStopped` (back to Paused/Succeeded/Failed only). The
+      "sandbox stays stopped" spec FAILS. (This mutation covers the extension
+      itself, since `loopSandboxStopped` today does not stop the sandbox for
+      `Verifying`.)
 - **Kind acceptance:** a Loop that passes verify (delivery on) is held at
   `Verifying` (reason `Delivering`, not `Succeeded`) while `Delivered` is in
   progress; when delivery completes (True or False), it is set to
-  `Succeeded`. The sandbox stays stopped during the hold. A delivery-off Loop
+  `Succeeded`. The sandbox is suspended during the hold (the extended gate). A delivery-off Loop
   goes straight to `Succeeded`. `kubectl cox describe` shows the hold and the
   `Delivered` condition.
 - **Done when:** `Succeeded` is set only when `Delivered` is terminal (or
   delivery is off), a failed delivery is still `Succeeded` + `Delivered=False`
-  (D64), the sandbox stays stopped during the hold, and the behaviour is
-  documented in OPERATOR.md (R28 I98 acceptance).
+  (D64), the sandbox is stopped during the hold via the extended
+  `loopSandboxStopped` gate (`Verifying` + reason `Delivering`), and the
+  behaviour is documented in OPERATOR.md (R28 I98 acceptance).
 
 ## Explicitly deferred (keep their PLAN.md homes)
 - **Phase 6:** the Judge sidecar (D60) — still deferred.
@@ -448,8 +460,11 @@ which lessons were written and why.
   "stuck" at `Verifying` while delivery is in flight (a user sees it as not
   done). Mitigation: the hold is **visible** (the `Delivered` condition is
   `False/InProgress`, and `kubectl cox describe` shows the hold + the reason),
-  and the sandbox stays stopped (the sandbox gate sees `DesiredPhase=Verifying`,
-  not a running phase, so I74's suspend is preserved). A delivery-off Loop goes
+  and the sandbox is stopped during the hold because P5f extends
+  `loopSandboxStopped` to cover `Verifying` + reason `Delivering` (the gate
+  today stops only Paused/Succeeded/Failed — without the extension a
+  delivery-holding Loop's sandbox would keep running; delivery needs no
+  sandbox, since the deliver Job runs in its own pod). A delivery-off Loop goes
   straight to `Succeeded` (no `Delivered` condition to wait for).
 
 ## Questions for the owner
@@ -459,6 +474,6 @@ which lessons were written and why.
 | D66 | Where does the memory PVC live, and what access mode? A PVC is mountable only by pods in its own namespace, and sandboxes run in the Loop's namespace (never `coxswain-system`), so an operator-namespace PVC (the earlier (c)) cannot be mounted by any sandbox. **(a)** a per-namespace PVC keyed by (namespace, git URL) in the Loop's namespace. **(b)** copy lessons into the Loop namespace (a ConfigMap or an init container copies from an operator-side store). Also: several sandboxes on different nodes mounting one PVC need **ReadWriteMany** (RWO would not schedule) — or a copy-in init container so no long-lived mount is shared. | **(a)** a per-(namespace, git URL) PVC in the Loop's namespace, **ReadWriteMany** (a copy-in init container as the fallback when the storage class lacks RWX support). (b) (ConfigMap/init-copy) is simpler but loses the "shared across Loops on the same repo" property (each Loop gets a copy); (a) keeps it. Cross-namespace sharing stays out of scope (a documented limitation). |
 | D67 | I94 title derivation edge cases: **(a)** how to cap a >72-char first line — truncate at 72 or elide with `…`? **(b)** what to do with a goal whose first line is empty or whitespace — fall back to `coxswain: implement` (today) or reject the Loop? | **(a)** elide with `…` (the reviewer sees the title was capped, not silently cut). **(b)** fall back to `coxswain: implement` (a Loop with a blank first line still delivers; rejecting a Loop for a cosmetic goal format is too harsh). |
 | D68 | P5b "references a file path or error signature" — what is the exact heuristic? **(a)** a path-shaped token (`foo/bar`, `/abs/path`, `file.go:12`) **or** a line matching an error-signature regex (e.g. `panic:`, `error:`, `fatal:`, `Traceback`, `Exception`). **(b)** a stricter rule: must contain a path-shaped token **and** an error signature. | **(a)** (either). A lesson that names a file path is useful even without an error signature; a lesson that names an error signature is useful even without a path. The `and` rule (b) would drop too many valid lessons. |
-| D69 | P5f (I98) mechanism: how to hold `Succeeded` until `Delivered` is terminal? (There is no "observed phase" field — `status.phase` and `status.desiredPhase` are the two phase fields, and there is no `Delivering` phase today.) **(i)** keep `status.phase` at `Verifying` (reason `Delivering`) until `Delivered` is terminal, then set both `phase` and `desiredPhase` to `Succeeded`. **(ii)** add a new `Delivering` phase to the machine + the `nextPhase` table. | **(i)** for the first cut (reuses the existing `Verifying` phase + the existing `Delivered` condition; the sandbox gate sees `DesiredPhase=Verifying`, so the sandbox stays stopped per I74; the hold is visible via the `Delivered` condition + `kubectl cox describe`). (ii) is heavier (a new phase + table entry) — acceptable if the owner wants an explicit phase. |
+| D69 | P5f (I98) mechanism: how to hold `Succeeded` until `Delivered` is terminal? (There is no "observed phase" field — `status.phase` and `status.desiredPhase` are the two phase fields, and there is no `Delivering` phase today.) **(i)** keep `status.phase` at `Verifying` (reason `Delivering`) until `Delivered` is terminal, then set both `phase` and `desiredPhase` to `Succeeded`. **(ii)** add a new `Delivering` phase to the machine + the `nextPhase` table. | **(i)** for the first cut (reuses the existing `Verifying` phase + the existing `Delivered` condition; P5f extends `loopSandboxStopped` to cover `Verifying` + reason `Delivering` so the sandbox is stopped during the hold — the gate today stops only Paused/Succeeded/Failed; the hold is visible via the `Delivered` condition + `kubectl cox describe`). (ii) is heavier (a new phase + table entry) — acceptable if the owner wants an explicit phase. |
 | D70 | P5c curator: is the curator call **required** (a lesson is written only on a `true` verdict) or **best-effort** (a curator-call failure writes the lesson anyway, recorded as "curator unavailable")? ADR-0002 says the verdict is recorded; it does not say a failure blocks the write. | **Required** (a lesson is written only on a `true` verdict; a curator-call failure drops the lesson, recorded as "curator unavailable", and the Loop's terminal state is unchanged). This keeps the curator the gate it is meant to be (ADR-0002: the operator never interprets content itself, but it may *ask* and *record* — a failure to ask is a failure to gate). |
 | D71 | P5b memory-growth cap: when the per-(namespace, git URL) lesson count reaches the max (e.g. 100), what happens to a new lesson? **(a)** evict the **oldest** lesson (by write time) to make room. **(b)** **reject** the new lesson (recorded in the audit trail as "memory full"). | **(a)** evict the oldest (a new lesson is generally more relevant than an old one; the cap still bounds the dir, so growth is bounded). (b) is safer (no data loss) but eventually stops all writes on a busy repo; (a) keeps the memory fresh. The cap + eviction is enforced by the writer Job (P5b) with a spec. |

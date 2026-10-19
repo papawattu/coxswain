@@ -308,6 +308,14 @@ func (r *LoopReconciler) ensureDeliverDescriptionConfig(ctx context.Context, loo
 	if !deliveryExpected(loop) {
 		return r.cleanupDeliverDescriptionConfig(ctx, loop)
 	}
+	// A4 flake (fix/a4-flake): refresh the wall clock IN PLACE on the loop
+	// (the operator's job) so the caller's status write persists the
+	// refreshed value. deliverDescriptionForLoop is a pure reader (it does
+	// NOT refresh); this call is the I95 refresh that makes the body carry
+	// the active time measured up to this render. The spec reads the loop
+	// back (with the persisted refreshed value) and computes the same body
+	// as the operator (no second mutation, no flake).
+	refreshDeliverDescriptionBudget(loop)
 	cmName := deliverDescriptionConfigName(loop.Name)
 	cm := &corev1.ConfigMap{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: cmName}, cm)

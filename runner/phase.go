@@ -344,23 +344,36 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 			res.PlanChanged = planChanged(cfg.Workspace)
 		}
 	case PhaseImplementing:
-		// I93 (R28 P1): the plan-hash check at the START of an Implementing run.
-		// The runner was missing this: the plan-change check (planChanged) lived
-		// only after a Planning rewrite, so an edit to PLAN.md between the
-		// user's approval and the Implementing run was invisible to the runner.
-		// A MISMATCH (the current PLAN.md differs from the approved hash) means
-		// the plan changed since the user approved: the runner records
-		// PlanMismatch=true in the claim (the operator clears the PlanApproved
-		// condition and re-enters the AwaitingApproval hold — the user must
-		// re-approve the current plan). An ABSENT or EMPTY approved-hash file
-		// (a fresh Loop, or a plan the user has not approved yet) is a NO-OP (a
-		// no-op, the same as planChanged). A MATCH is a no-op (the approval is
-		// still valid; the operator's gate advances).
+		// I93 (R29): the plan-hash check at the START of an Implementing run,
+		// BEFORE any agent work. The runner was missing this: the plan-change
+		// check (planChanged) lived only after a Planning rewrite, so an edit
+		// to PLAN.md between the user's approval and the Implementing run was
+		// invisible to the runner. The check must run before drivePhaseOnce:
+		// a MISMATCH means the plan changed since the user approved — the agent
+		// must NOT implement the mismatched plan, and nothing may be committed
+		// (the S5a block below commits only a successful Implementing, and a
+		// blocked result never reaches it). Computing the check AFTER the agent
+		// ran (the original defect) let the agent implement a stale plan AND
+		// let an agent that edited .coxswain/PLAN.md during Implementing make
+		// the hashes match or mismatch at will. A MISSING PLAN.md with a
+		// non-empty approved hash blocks too (the more dangerous case: an
+		// approved Loop whose plan vanished — a silent no-op would have let the
+		// agent implement an unknown plan). An ABSENT or EMPTY approved-hash
+		// file (a fresh Loop, or a plan the user has not approved yet) is a
+		// NO-OP (a no-op, the same as planChanged). A MATCH is a no-op (the
+		// approval is still valid; the operator's gate advances).
+		if mismatch, blockedReason := planHashMismatchAtStart(cfg.Workspace); mismatch {
+			res = Result{
+				Status:            statusBlocked,
+				ObservedPhase:     phase,
+				Summary:           blockedReason,
+				VerificationNotes: blockedReason,
+				PlanMismatch:      true,
+			}
+			log.Printf("runner: %s", blockedReason)
+			break
+		}
 		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation)
-		// I93: the check is best-effort and runs regardless of the run's outcome
-		// (a MISMATCH is a signal to re-hold even if the run succeeded — the
-		// agent may have implemented a stale plan). A read error is a no-op.
-		res.PlanMismatch = planHashMismatchAtStart(cfg.Workspace)
 		// S5a (B3): at the end of a successful Implementing, commit the work in
 		// the workspace repo (excluding the operator-owned .coxswain dir) and
 		// record the head SHA in the claim. A CLAIM (ADR-0005): the operator
@@ -1050,48 +1063,63 @@ func planChanged(workspace string) bool {
 	return planSHA256(planBytes) != approved
 }
 
-// planHashMismatchAtStart (I93, R28 P1) returns true when the runner, at the
-// START of an Implementing run, detects a PLAN MISMATCH: the current
-// .coxswain/PLAN.md's SHA-256 does not match the approved hash the operator
-// wrote to <workspace>/.coxswain/plan-hash (from the PlanApproved condition's
-// message). This is the check the runner was missing at Implementing entry
-// (R28 I93: the plan-change check lived only after a Planning rewrite in
-// planChanged, so an edit to PLAN.md between the user's approval and the
-// Implementing run was invisible to the runner — a stale plan was implemented
-// and verified, and the approval was never re-checked).
+// planHashMismatchAtStart (I93, R29) returns (true, blockedReason) when the
+// runner, at the START of an Implementing run (BEFORE any agent work),
+// detects a PLAN MISMATCH: the current .coxswain/PLAN.md's SHA-256 does not
+// match the approved hash the operator wrote to <workspace>/.coxswain/
+// plan-hash (from the PlanApproved condition's message). This is the check
+// the runner was missing at Implementing entry (R28 I93: the plan-change
+// check lived only after a Planning rewrite in planChanged, so an edit to
+// PLAN.md between the user's approval and the Implementing run was invisible
+// to the runner — a stale plan was implemented and verified, and the approval
+// was never re-checked). It MUST run before drivePhaseOnce: on a mismatch
+// the agent is never invoked and nothing is committed (R29 P1).
 //
-// The check is a best-effort read (a read error on either file is treated as
-// "no comparison possible", a no-op). An ABSENT or EMPTY approved-hash file
-// (a fresh Loop, or a plan the user has not approved yet) is a NO-OP (returns
-// false — there is nothing to compare against, the same as planChanged). A
-// MATCH (the plan is the same the user approved) is a no-op (returns false —
-// the approval is still valid; the operator's gate sees the PlanApproved
-// condition True and advances). A MISMATCH (the plan on disk differs from the
-// approved hash) returns true: the runner records PlanMismatch=true in the
-// result.json (the operator's claim channel); the operator clears the
-// PlanApproved condition and re-enters the AwaitingApproval hold (the user
-// must re-approve the current plan).
+// An ABSENT or EMPTY approved-hash file (a fresh Loop, or a plan the user has
+// not approved yet) is a NO-OP (returns false — there is nothing to compare
+// against, the same as planChanged). A MATCH (the plan is the same the user
+// approved) is a no-op (returns false — the approval is still valid; the
+// operator's gate sees the PlanApproved condition True and advances). A
+// MISMATCH (the plan on disk differs from the approved hash) returns
+// true with a blockedReason naming both hashes: the runner returns a blocked
+// result with PlanMismatch=true (the operator's claim channel); the operator
+// clears the PlanApproved condition, sets the PlanMismatch condition and
+// emits the PlanHashMismatch Event, and re-enters the AwaitingApproval hold
+// (the user must re-approve the current plan). A MISSING PLAN.md with a
+// non-empty approved hash also blocks (returns true — R29 P1.2: the more
+// dangerous case, an approved Loop whose plan vanished, must not silently
+// become a no-op that lets the agent implement an unknown plan).
 //
 // The check reads the CURRENT PLAN.md from the workspace (the bytes on disk at
 // the start of the Implementing run — the same bytes the operator's
 // cox approve computes the hash over, so a trailing newline or cap difference
 // would mismatch, the same as planChanged).
-func planHashMismatchAtStart(workspace string) bool {
+func planHashMismatchAtStart(workspace string) (bool, string) {
 	// Read the approved hash (the operator's .coxswain/plan-hash file). An
 	// absent/empty file means "no approved plan" (a no-op).
 	approved := readApprovedPlanHash(workspace)
 	if approved == "" {
-		return false
+		return false, ""
 	}
-	// Read the current PLAN.md. A read error (the file was not written) is
-	// treated as "no plan" (a no-op).
+	// Read the current PLAN.md. A MISSING plan with a non-empty approved hash
+	// is a mismatch (R29 P1.2): block, the reason names the approved hash.
 	planBytes, err := os.ReadFile(filepath.Join(workspace, resultDirName, planFileName))
 	if err != nil {
-		return false
+		msg := fmt.Sprintf(
+			"PlanMismatch: PLAN.md is missing but the approved hash is non-empty (%s); "+
+				"blocking Implementing (the approved plan is gone; re-approve)",
+			approved)
+		return true, msg
 	}
-	// Compare the current plan's SHA-256 to the approved hash. A mismatch is
-	// a plan mismatch at Implementing start (I93).
-	return planSHA256(planBytes) != approved
+	planHash := planSHA256(planBytes)
+	if planHash == approved {
+		return false, ""
+	}
+	msg := fmt.Sprintf(
+		"PlanMismatch: current plan hash %s does not match the approved hash %s; "+
+			"blocking Implementing (do not implement a mismatched plan; re-approve)",
+		planHash, approved)
+	return true, msg
 }
 
 // implementingPrompt (A3) returns the IMPLEMENTING phase prompt: it seeds the

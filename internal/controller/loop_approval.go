@@ -332,6 +332,12 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 			// is consumed; a stale verify-failure summary must not leak into a
 			// later planning prompt).
 			clearLastFailureSummary(loop)
+			// I93 (R29 P2): the re-approval releases the hold — clear the
+			// PlanMismatch surface (the mismatch that caused the re-hold is
+			// resolved by the user's approval of the current plan).
+			if conditionTruePresent(loop, coxv1alpha1.PlanMismatchCondition) {
+				setCondition(loop, coxv1alpha1.PlanMismatchCondition, metav1.ConditionFalse, "Cleared", "the current plan was re-approved")
+			}
 			loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
 			changed = true
@@ -407,6 +413,21 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 // absent. Unlike setCondition (which upserts), clearCondition never creates
 // a condition (the user is the sole creator of PlanApproved / PlanRejected;
 // the operator only clears them).
+// conditionTruePresent reports whether the loop's status carries condType as
+// True (any reason). It is the Event-dedup guard: a Warning Event is emitted
+// only on the transition into True, not on every reconcile while the
+// condition is already True (I93, R29 P2).
+func conditionTruePresent(loop *coxv1alpha1.Loop, condType string) bool {
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == condType {
+			return loop.Status.Conditions[i].Status == metav1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// clearCondition removes a condition from the loop's status (a no-op when
+// absent).
 func clearCondition(loop *coxv1alpha1.Loop, condType string) {
 	for i := range loop.Status.Conditions {
 		if loop.Status.Conditions[i].Type == condType {

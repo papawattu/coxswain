@@ -772,28 +772,49 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			now = metav1.Now()
 		}
 		fromPhase := loop.Status.Phase
-		// I93 (R28 P1): the runner's plan-hash-mismatch signal at Implementing
-		// start. When the runner detected that the current PLAN.md differs from
-		// the approved hash (the plan changed between the user's approval and
-		// the Implementing run), the operator clears the PlanApproved condition
-		// and re-enters the AwaitingApproval hold (the user must re-approve the
-		// current plan). The signal is a CLAIM (ADR-0005): it is the runner's
-		// evidence that the plan on disk differs from the approved hash; the
-		// operator's own read of the condition + phase is the gate input. The
-		// clear is idempotent (a no-op when the condition is absent). The phase
-		// is moved to AwaitingApproval (the hold) when the Loop is in
-		// Implementing. This runs BEFORE recordPhaseClaim (which would advance
-		// the phase to Verifying on a success claim); the re-hold must happen
-		// before the advance, otherwise the Loop would advance past the hold.
+		// I93 (R29): the runner's plan-hash-mismatch claim. The check now
+		// runs at the START of the Implementing run, BEFORE any agent work
+		// (R29 P1): a mismatch blocks the run (no agent call, no commit) and
+		// the claim carries status=blocked + PlanMismatch=true + a
+		// blockedReason naming both hashes. The operator re-enters the
+		// AwaitingApproval hold (clear the PlanApproved condition), SURFACES
+		// the mismatch as the PlanMismatch condition (I90: visible via
+		// `kubectl cox describe`; the hashes ride in the message) and emits
+		// the PlanHashMismatch Warning Event (every state change has an Event).
+		// The handler keys on the claim alone (not the phase): a blocked claim
+		// never advances, so the phase is Implementing whenever the operator
+		// first sees it, and the guarded phase move below is idempotent for a
+		// re-queued claim (a re-hold to AwaitingApproval has already happened).
+		// The signal is a CLAIM (ADR-0005): it is the runner's evidence that
+		// the plan on disk differs from the approved hash; the re-hold itself
+		// is the approval gate's input (the cleared PlanApproved condition),
+		// so the PlanMismatch condition is a SURFACE, never a gate input.
+		// This runs BEFORE recordPhaseClaim (which would advance the phase to
+		// Verifying on a success claim); the re-hold must happen before the
+		// advance, otherwise the Loop would advance past the hold.
 		if claim.PlanMismatch && approvedPlanHash(loop) != "" {
+			approved := approvedPlanHash(loop)
 			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
 			changed = true
 			if loop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
 				loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
 				loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
 			}
-			logf.FromContext(ctx).Info("runner detected a plan-hash mismatch at Implementing start; clearing the PlanApproved condition and re-entering the AwaitingApproval hold",
-				"loop", loop.Name)
+			// I93 (R29 P2): surface the mismatch as a condition + Event. The
+			// blockedReason (from the runner) names the current plan's hash and
+			// the approved hash; the Event is emitted only on the transition
+			// into True (the condition's setCondition is a no-op when
+			// unchanged, but a re-queued claim would otherwise re-emit the
+			// Event on every reconcile while the condition is already True).
+			msg := fmt.Sprintf("plan-hash mismatch at Implementing start: approved hash %s; %s", approved, claim.BlockedReason)
+			if !conditionTruePresent(loop, coxv1alpha1.PlanMismatchCondition) {
+				if r.Recorder != nil {
+					r.Recorder.Eventf(loop, corev1.EventTypeWarning, "PlanHashMismatch", "%s", msg)
+				}
+			}
+			setCondition(loop, coxv1alpha1.PlanMismatchCondition, metav1.ConditionTrue, "PlanHashMismatch", msg)
+			logf.FromContext(ctx).Info("runner blocked Implementing on a plan-hash mismatch before any agent work; clearing the PlanApproved condition, surfacing the PlanMismatch condition and re-entering the AwaitingApproval hold",
+				"loop", loop.Name, "approvedHash", approved)
 		}
 		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		changed = changed || c

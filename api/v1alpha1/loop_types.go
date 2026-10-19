@@ -1280,6 +1280,19 @@ const (
 	// — that is surfaced by the Restore condition False reason
 	// NoUsableCheckpoint + the WorkspaceRestoreUnavailable Event (I90).
 	RestoreCondition = "Restore"
+	// PlanMismatchCondition (I93, R29 P2) SURFACES the runner's plan-hash
+	// mismatch at Implementing start (R29 I93: the runner detects that the
+	// current PLAN.md differs from the approved hash, or is missing with a
+	// non-empty approved hash, BEFORE any agent work, and claims a
+	// PlanMismatch block). The operator sets it to True (reason
+	// PlanHashMismatch) with the two hashes in the message when the claim
+	// carries PlanMismatch=true; it is cleared (to False, reason Cleared)
+	// once the Loop leaves AwaitingApproval (a re-approval re-releases the
+	// hold). It is a SURFACE (I90: visible via `kubectl cox describe`), not
+	// a gate input — the phase machine does not read it (ADR-0005 is
+	// preserved: the re-hold comes from clearing the PlanApproved condition
+	// + the approval gate, the condition only surfaces the mismatch).
+	PlanMismatchCondition = "PlanMismatch"
 )
 
 // B2 restore condition reasons (the RestoreCondition's named reasons;

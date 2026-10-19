@@ -23,15 +23,22 @@
 //
 // The fix (option (a)): the wall clock is always accumulated on every
 // non-paused reconcile, whether or not a cap is set. The cap only decides
-// enforcement (onExceeded), not recording. deliverDescriptionForLoop calls
-// refreshDeliverDescriptionBudget first (the wall-clock-only half of
-// applyBudgetStep: now - lastActiveStamp, floor 0, set stamp) so the body
-// carries the active time measured up to this render.
+// enforcement (onExceeded), not recording. The operator's
+// ensureDeliverDescriptionConfig calls refreshDeliverDescriptionBudget on
+// the loop before rendering (the wall-clock-only half of applyBudgetStep:
+// now - lastActiveStamp, floor 0, set stamp) so the body carries the active
+// time measured up to this render. deliverDescriptionForLoop is a PURE
+// READER (it does NOT refresh) — the refresh is the operator's job, and the
+// caller's status write persists the refreshed value. A4 flake (fix/a4-flake):
+// the earlier implementation called refreshDeliverDescriptionBudget inside
+// deliverDescriptionForLoop (in place), which mutated the caller's loop and
+// caused a second mutation when a spec called it again to compute wantBody.
 //
 // The spec:
 //   - (unit, PRIMARY) a Loop with NO spec.budget (the #166 shape) and a
-//     lastActiveStamp 3 minutes ago renders a body with the 3-minute active
-//     time (not 0s);
+//     lastActiveStamp 3 minutes ago: the operator's refresh (called in the
+//     test, mirroring ensureDeliverDescriptionConfig) makes the body carry
+//     the 3-minute active time (not 0s);
 //   - (unit) a Loop with no lastActiveStamp renders 0s (a fresh
 //     accumulation adds 0);
 //   - (envtest, same-Loop) a Succeeded Loop with NO spec.budget and a known
@@ -39,7 +46,7 @@
 //     carries the non-zero active time — not 0s.
 //
 // The mutation (exact diff + exact focus command in the PR): skip the
-// refresh in deliverDescriptionForLoop (remove the
+// refresh in ensureDeliverDescriptionConfig (remove the
 // refreshDeliverDescriptionBudget(loop) call) in a scratch worktree and
 // re-run the focus command; the primary spec must FAIL with the body
 // showing 0s.
@@ -114,6 +121,11 @@ func TestI95DeliverDescriptionActiveTimeNoCap(t *testing.T) {
 	if l.Spec.Budget != nil {
 		t.Fatal("the fixture must have no spec.budget (the #166 shape)")
 	}
+	// A4 flake (fix/a4-flake): the operator's ensureDeliverDescriptionConfig
+	// calls refreshDeliverDescriptionBudget on the loop before rendering.
+	// The unit test mirrors the operator's behavior (the reader is now a
+	// pure reader; the refresh is the operator's job).
+	refreshDeliverDescriptionBudget(l)
 	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
 	line, ok := activeTimeLine(body)
 	if !ok {
@@ -153,6 +165,8 @@ func TestI95DeliverDescriptionActiveTimeWithCap(t *testing.T) {
 	stamp := metav1.NewTime(time.Now().Add(-3 * time.Minute))
 	l := i95LoopWithBudget("i95cap", "i95ns", 0, &stamp)
 	l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxWallClock: "1h"}
+	// A4 flake (fix/a4-flake): mirror the operator's refresh before rendering.
+	refreshDeliverDescriptionBudget(l)
 	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
 	line, ok := activeTimeLine(body)
 	if !ok {

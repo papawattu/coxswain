@@ -172,6 +172,7 @@ func runDeliverPushPayloadPython(t *testing.T, facts, planFile string, planMax i
 		"BASE=main",
 		"DRAFT=true",
 		"TITLE_PREFIX=",
+		"PR_TITLE=coxswain: implement",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

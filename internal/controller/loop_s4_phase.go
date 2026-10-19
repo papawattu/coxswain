@@ -342,8 +342,8 @@ func (r *LoopReconciler) readPhaseClaimFromTerminationMessage(ctx context.Contex
 		if !terminated.FinishedAt.IsZero() && pausedResumeAt != nil &&
 			terminated.FinishedAt.Before(pausedResumeAt) {
 			logf.FromContext(ctx).Info("stale claim from before the pause ignored (FinishedAt predates resume)",
-				"finishedAt", terminated.FinishedAt,
-				"resumeAt", pausedResumeAt)
+				"finishedAt", terminated.FinishedAt.Time.String(),
+				"resumeAt", pausedResumeAt.Time.String())
 			return nil, nil
 		}
 		claim, err := parsePhaseClaim(terminated.Message)

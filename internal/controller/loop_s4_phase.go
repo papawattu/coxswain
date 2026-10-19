@@ -128,6 +128,10 @@ type PhaseClaim struct {
 	// operator's own read of the condition + phase is the gate input). An
 	// absent field (pre-B3 runners) is false (no plan change detected).
 	PlanChanged bool `json:"planChanged,omitempty"`
+	// I93 (R28 P1): planMismatch, when present, must be a boolean (the
+	// runner's plan-hash-mismatch signal at Implementing start). An absent
+	// field (pre-I93 runners) is false (no mismatch detected).
+	PlanMismatch bool `json:"planMismatch,omitempty"`
 	// planAttempt is the .coxswain/plan-attempt the runner read (the operator's
 	// plan-attempt marker file). OS1 only — never a gate input. The guard in
 	// advancePhaseFromClaim uses it to reject a stale Planning success claim
@@ -197,6 +201,14 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 	if v, ok := raw["planChanged"]; ok {
 		if err := json.Unmarshal(v, &claim.PlanChanged); err != nil {
 			return nil, fmt.Errorf("claim.planChanged is not a boolean: %w", err)
+		}
+	}
+	// I93 (R28 P1): planMismatch, when present, must be a boolean (the
+	// runner's plan-hash-mismatch signal at Implementing start). An absent
+	// field (pre-I93 runners) is false (no mismatch detected).
+	if v, ok := raw["planMismatch"]; ok {
+		if err := json.Unmarshal(v, &claim.PlanMismatch); err != nil {
+			return nil, fmt.Errorf("claim.planMismatch is not a boolean: %w", err)
 		}
 	}
 	// I42b: planAttempt, when present, must be a non-negative integer (the
@@ -760,6 +772,29 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			now = metav1.Now()
 		}
 		fromPhase := loop.Status.Phase
+		// I93 (R28 P1): the runner's plan-hash-mismatch signal at Implementing
+		// start. When the runner detected that the current PLAN.md differs from
+		// the approved hash (the plan changed between the user's approval and
+		// the Implementing run), the operator clears the PlanApproved condition
+		// and re-enters the AwaitingApproval hold (the user must re-approve the
+		// current plan). The signal is a CLAIM (ADR-0005): it is the runner's
+		// evidence that the plan on disk differs from the approved hash; the
+		// operator's own read of the condition + phase is the gate input. The
+		// clear is idempotent (a no-op when the condition is absent). The phase
+		// is moved to AwaitingApproval (the hold) when the Loop is in
+		// Implementing. This runs BEFORE recordPhaseClaim (which would advance
+		// the phase to Verifying on a success claim); the re-hold must happen
+		// before the advance, otherwise the Loop would advance past the hold.
+		if claim.PlanMismatch && approvedPlanHash(loop) != "" {
+			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
+			changed = true
+			if loop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
+				loop.Status.Phase = coxv1alpha1.LoopPhaseAwaitingApproval
+				loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseAwaitingApproval
+			}
+			logf.FromContext(ctx).Info("runner detected a plan-hash mismatch at Implementing start; clearing the PlanApproved condition and re-entering the AwaitingApproval hold",
+				"loop", loop.Name)
+		}
 		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		changed = changed || c
 		// I89: map a ModelUnavailable claim to a Loop condition so

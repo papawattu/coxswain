@@ -2598,9 +2598,11 @@ func isToolEnv(name string) bool {
 
 // isOperatorCoxEnv reports whether a spec.agent.env var name is an
 // operator-owned COX_* name the operator sets on the agent (COX_GOAL,
-// P5e/R28 I94 COX_DELIVERY_TITLE). COX_* names are I34-protected, so a user
-// var with one of these names is dropped: the operator value wins (the agent
-// cannot override the goal or the derived delivery title).
+// P5e/R28 I94 COX_DELIVERY_TITLE). Defence in depth: the CRD already
+// rejects any spec.agent.env name starting COX_ (I34), so this check is
+// unreachable in practice; it guards against a future CRD relaxation.
+// A user var with one of these names is dropped: the operator value wins
+// (the agent cannot override the goal or the derived delivery title).
 func isOperatorCoxEnv(name string) bool {
 	switch name {
 	case coxGoal, coxDeliveryTitle:

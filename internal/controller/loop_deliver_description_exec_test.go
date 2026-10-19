@@ -54,6 +54,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/deliverytitle"
 )
 
 // TestDeliverPushPayloadJSONSafety (A4) runs the REAL deliverPushPayloadPython
@@ -229,5 +230,85 @@ func a4FactsLoop() *coxv1alpha1.Loop {
 				ActiveSeconds:    300,
 			},
 		},
+	}
+}
+
+// P5e (R28 I94, #174 P1): the payload's title equals TITLE_PREFIX + PR_TITLE
+// (the commit subject and the PR title match). The PR_TITLE is the
+// deliverytitle.Title(spec.goal) the operator sets on both the agent
+// (COX_DELIVERY_TITLE) and the deliver Job (PR_TITLE). Mutation: set PR_TITLE
+// to a different string — this test FAILS.
+func TestDeliverPushPayloadTitleMatchesCommitSubject(t *testing.T) {
+	goal := "Add a TODO comment at the top of README.md"
+	expectedTitle := deliverytitle.Title(goal)
+
+	facts := renderDeliverDescriptionBody(deliverDescriptionForLoop(a4FactsLoop()))
+	planFile := filepath.Join(t.TempDir(), "PLAN.md")
+	if err := os.WriteFile(planFile, []byte("# Plan\n\ndo the thing\n"), 0o644); err != nil {
+		t.Fatalf("write the plan file: %v", err)
+	}
+
+	cmd := exec.Command("python3", "-c", deliverPushPayloadPython)
+	cmd.Env = append(os.Environ(),
+		"FACTS="+facts,
+		"PLAN_FILE="+planFile,
+		"PLAN_MAX="+fmt.Sprint(deliverPlanMaxBytes),
+		"BRANCH=coxswain/task",
+		"BASE=main",
+		"DRAFT=true",
+		"TITLE_PREFIX=",
+		"PR_TITLE="+expectedTitle,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the push payload python failed: %v\noutput: %s", err, out)
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("the PR payload is not valid JSON: %v; payload: %q", err, out)
+	}
+
+	title, ok := obj["title"].(string)
+	if !ok {
+		t.Fatalf("the PR payload has no string title field: %v", obj)
+	}
+
+	// TITLE_PREFIX is empty, so title == PR_TITLE == the commit subject.
+	if title != expectedTitle {
+		t.Fatalf("the payload title = %q, want %q (the commit subject and PR title must match)", title, expectedTitle)
+	}
+}
+
+// P5e (R28 I94, #174 P1): deliverytitle.Title derives the title from
+// spec.goal (first line, trimmed, capped at 72 runes). The old behavior was
+// a fixed "coxswain: " + BRANCH. Mutation: restore the fixed title — this
+// test FAILS.
+func TestDeliveryTitleDerivedFromGoal(t *testing.T) {
+	// A single-line goal.
+	if got := deliverytitle.Title("Add a TODO comment at the top of README.md"); got != "coxswain: Add a TODO comment at the top of README.md" {
+		t.Fatalf("Title(%q) = %q", "Add a TODO comment at the top of README.md", got)
+	}
+
+	// A multi-line goal: only the first line is used.
+	if got := deliverytitle.Title("First line.\nSecond line.\nThird line."); got != "coxswain: First line." {
+		t.Fatalf("Title(multi-line) = %q, want %q", got, "coxswain: First line.")
+	}
+
+	// A blank goal: the fallback.
+	if got := deliverytitle.Title(""); got != "coxswain: implement" {
+		t.Fatalf("Title(\"\") = %q, want %q", got, "coxswain: implement")
+	}
+
+	// A whitespace-only first line: the fallback.
+	if got := deliverytitle.Title("   \nSecond line."); got != "coxswain: implement" {
+		t.Fatalf("Title(whitespace) = %q, want %q", got, "coxswain: implement")
+	}
+
+	// A long first line: cut to 71 runes + "…".
+	longLine := strings.Repeat("a", 80)
+	expected := "coxswain: " + strings.Repeat("a", 71) + "…"
+	if got := deliverytitle.Title(longLine); got != expected {
+		t.Fatalf("Title(long) = %q (len %d), want %q (len %d)", got, len(got), expected, len(expected))
 	}
 }

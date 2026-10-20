@@ -144,6 +144,22 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		}
 		Expect(tmpMount).NotTo(BeNil(), "the agent must mount a writable emptyDir at /tmp")
 		Expect(tmpMount.ReadOnly).To(BeFalse(), "/tmp must be writable")
+
+		// F13: GOTMPDIR points at the workspace PVC so Go build temp files
+		// don't fill the /tmp emptyDir (1Gi default; evicted when full). It
+		// lives INSIDE the operator-owned .coxswain dir so commitWorkspace's
+		// exclusion keeps a leftover go-build* work dir out of the verified
+		// commit (Go only removes them on a clean exit; review #178 P1).
+		// Because the workspace PVC is a FIXED 1Gi (workspacePVCSpec), the
+		// phase-init empties .coxswain/gotmp at every phase start (rm then
+		// mkdir) so a run of leftovers cannot grow to ENOSPC the agent in the
+		// repo itself (the /tmp eviction this replaces). The phase-init rm is
+		// exercised by TestPhaseInitEmptiesGOTMPDir (an execution test of the
+		// real generated script); Mutation: remove the GOTMPDIR env var — this
+		// assertion FAILS.
+		By("pointing GOTMPDIR at the workspace PVC (F13)")
+		Expect(envByName["GOTMPDIR"]).To(Equal("/workspace/.coxswain/gotmp"),
+			"GOTMPDIR must point at the .coxswain dir on the workspace PVC so go build temp files don't evict the /tmp emptyDir")
 		for _, v := range pod.Volumes {
 			if v.Name == tmpMount.Name {
 				Expect(v.EmptyDir).NotTo(BeNil(), "/tmp must back onto an emptyDir volume")

@@ -129,6 +129,76 @@ func TestCommitWorkspaceNotAGitRepoReturnsEmpty(t *testing.T) {
 	}
 }
 
+// TestCommitWorkspaceExcludesGOTMPDir (F13 P1, review #178): a leftover
+// go-build* work dir under the GOTMPDIR path (Go only removes it on a clean
+// exit; a killed, timed-out, or `go test -work` agent leaves it behind) must
+// NOT be committed and delivered. GOTMPDIR lives INSIDE the operator-owned
+// .coxswain dir (gotmpPath), so commitWorkspace keeps it out — the status
+// pathspec excludes .coxswain, and the per-record defensive skip
+// (strings.HasPrefix(path, resultDirName+"/")) drops any .coxswain path that
+// reached the listing. This is the spec the review asked for: "a runner
+// commit test with a file under the GOTMPDIR path, asserting the file is NOT
+// in the commit."
+//
+// Mutation (recorded in the PR): drop the .coxswain exclusion — the status
+// pathspec AND the per-record defensive skip in commitWorkspace's status
+// loop (the line that skips a path equal to resultDirName or prefixed by
+// resultDirName+"/"). Both guards keep a .coxswain path out of the staged
+// set; dropping either one alone is masked by the other, so the mutation
+// disables both. The spec FAILS (the gotmp file enters the staged set).
+// The exact diff + command + output are in the PR body.
+func TestCommitWorkspaceExcludesGOTMPDir(t *testing.T) {
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+
+	// The agent's real source work (so the commit path runs).
+	if err := os.WriteFile(filepath.Join(ws, "src.go"), []byte("package main\nfunc Src() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A leftover go-build* work dir under the GOTMPDIR path (the exact path
+	// the agent container sets: /workspace/.coxswain/gotmp). Go names its
+	// work dirs go-build<random>; this is what a killed/timed-out agent
+	// leaves behind.
+	if err := os.MkdirAll(filepath.Join(ws, gotmpPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	leftover := filepath.Join(ws, gotmpPath, "go-build123", "a.log")
+	if err := os.MkdirAll(filepath.Dir(leftover), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(leftover, []byte("build output\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	head, staged, refuse := commitWorkspace(ws)
+	if refuse != "" {
+		t.Fatalf("no refusal expected, got %q", refuse)
+	}
+	if head == "" || !isHex40(head) {
+		t.Fatalf("commitWorkspace returned %q, want a 40-hex SHA", head)
+	}
+	// The GOTMPDIR file must NOT be in the staged set.
+	for _, p := range staged {
+		if p == gotmpPath || strings.HasPrefix(p, gotmpPath+"/") {
+			t.Fatalf("GOTMPDIR path %q leaked into the staged set: %v (F13 P1: "+
+				"leftover go-build* dirs must not be committed and delivered)", p, staged)
+		}
+	}
+	// The GOTMPDIR file must NOT be tracked in the commit's tree.
+	tracked := gitIn(t, ws, "ls-tree", "-r", "--name-only", "HEAD")
+	for line := range strings.SplitSeq(tracked, "\n") {
+		line = filepath.FromSlash(line)
+		if line == gotmpPath || strings.HasPrefix(line, gotmpPath+"/") {
+			t.Fatalf("GOTMPDIR path %q leaked into the committed tree (F13 P1)", line)
+		}
+	}
+	// The real source work IS in the commit (the exclusion must not swallow
+	// the agent's own work).
+	if got := gitIn(t, ws, "show", "HEAD:src.go"); !strings.Contains(got, "Src") {
+		t.Fatal("the agent's source work was not committed")
+	}
+}
+
 // TestCommitWorkspaceUsesSafeDirectory verifies that commitWorkspace passes
 // -c safe.directory=<workspace> to all git calls. The PVC mount /workspace
 // is root-owned (init container runs as root) while the runner runs as

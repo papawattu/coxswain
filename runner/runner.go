@@ -31,6 +31,17 @@ const (
 	resultDirName  = ".coxswain"
 	resultFileName = "result.json"
 
+	// gotmpPath (F13) is the Go build temp dir the agent container sets
+	// (GOTMPDIR=/workspace/.coxswain/gotmp). It lives INSIDE the operator-owned
+	// .coxswain dir so the existing commit exclusion (:(exclude).coxswain,
+	// commitWorkspace) keeps leftover go-build* work dirs OUT of the verified
+	// commit and the delivery PR: Go only removes its go-build* dirs on a clean
+	// exit, so a killed, timed-out, or `go test -work` agent leaves them
+	// behind. /workspace/.gotmp was the original F13 location, but it is not
+	// inside .coxswain, so the exclusion does not cover it and the leftover
+	// dirs were committed and delivered (review #178 P1, 2026-10-19).
+	gotmpPath = ".coxswain/gotmp"
+
 	// result.json status values (Phase 0 subset).
 	statusSuccess = "success"
 	statusBlocked = "blocked"

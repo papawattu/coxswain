@@ -168,6 +168,14 @@ type peekPodOutcome struct {
 	error          bool
 }
 
+// peekPodPhaseSucceeded / peekPodPhaseFailed are the peek pod's terminal
+// phases (the goconst "Succeeded"/"Failed" — the outcome parsing compares
+// them; a named constant keeps the literal from recurring in three places).
+const (
+	peekPodPhaseSucceeded = "Succeeded"
+	peekPodPhaseFailed    = "Failed"
+)
+
 // peekPodOutcome reads the peek pod once and returns its outcome. It does not
 // poll or sleep (the caller does that): one Get, one parse. A pod that has not
 // reached a terminal phase yet (phase "" or Pending, or a not-yet-terminated
@@ -176,6 +184,14 @@ type peekPodOutcome struct {
 // returns error=true (the F7 condition).
 func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string) peekPodOutcome {
 	podJSON, _ := p.peekKubectlGet(ctx, "get", "pod", podName, "-o", "json")
+	return parsePeekPodOutcome(podJSON)
+}
+
+// parsePeekPodOutcome parses a peek pod's JSON status into its outcome (the
+// shared outcome parsing: a Failed pod or a non-zero exit is an error, never
+// content — the F7 rule). Exposed for the memory peek reader (the same
+// pattern).
+func parsePeekPodOutcome(podJSON string) peekPodOutcome {
 	var pod struct {
 		Status struct {
 			Phase             string `json:"phase"`
@@ -200,15 +216,12 @@ func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string
 		if t := pod.Status.ContainerStatuses[0].State.Terminated; t != nil {
 			out.exitCode = fmt.Sprint(t.ExitCode)
 			out.terminationMsg = t.Message
-			// A non-zero exit is an error outcome regardless of the pod phase
-			// (the cat wrapper exits non-zero when the file is missing or
-			// unreadable; 0 only on a successful read).
 			if t.ExitCode != 0 {
 				out.error = true
 			}
 		}
 	}
-	if pod.Status.Phase == "Failed" {
+	if pod.Status.Phase == peekPodPhaseFailed {
 		out.error = true
 	}
 	return out
@@ -225,7 +238,7 @@ func (p *peekWorkspaceReader) pollPeekPodOutcome(ctx context.Context, podName st
 		// Stop when the pod is terminal (Succeeded/Failed) or the container has
 		// terminated (an error outcome, e.g. a non-zero exit while the phase is
 		// still settling). A non-terminated, non-terminal pod keeps polling.
-		if last.phase == "Succeeded" || last.phase == "Failed" || last.error {
+		if last.phase == peekPodPhaseSucceeded || last.phase == peekPodPhaseFailed || last.error {
 			return last, nil
 		}
 		time.Sleep(time.Second)

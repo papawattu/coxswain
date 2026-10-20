@@ -107,6 +107,14 @@ func main() {
 	var cniProbeTimeout time.Duration
 	flag.DurationVar(&cniProbeTimeout, "cni-probe-timeout", 60*time.Second,
 		"Per-run timeout for one CNI probe; not-Ready / no exit / pull failure within it = ProbeUnavailable (D38).")
+	// P5a: the memory PVC's StorageClass. Empty = the cluster default.
+	// Set to a RWX-capable class (e.g. local-shared) on kind clusters where
+	// the default (rancher.io/local-path, nodePathMap) is RWO-only.
+	var memoryStorageClass string
+	flag.StringVar(&memoryStorageClass, "memory-storage-class", "",
+		"StorageClass for the per-(namespace, git-URL) memory PVC (P5a). "+
+			"Empty = cluster default. Set to a RWX-capable class on clusters "+
+			"whose default StorageClass does not support ReadWriteMany.")
 	var cniProbeImage string
 	flag.StringVar(&cniProbeImage, "cni-probe-image", "python:3-alpine",
 		"The image the CNI probe pod runs (D38). Must be pullable by the probe node.")
@@ -376,6 +384,7 @@ func main() {
 		Enforcer:               kaEnforcer,
 		AllowUnenforced:        allowUnenforced,
 		AllowUnenforcedNetwork: allowUnenforcedNetwork,
+		MemoryStorageClass:     memoryStorageClass,
 		CNIProber:              cniProber,
 		CNIRegateSource:        cniRegateSrc,
 		ClusterDomain:          clusterDomain,

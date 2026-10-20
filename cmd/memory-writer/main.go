@@ -32,6 +32,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -68,6 +69,18 @@ func memoryDirFromEnv() string {
 		return d
 	}
 	return "/memory"
+}
+
+// summaryPathFromEnv returns the COX_SUMMARY_PATH env var (the path the
+// binary writes its bounded summary to, IN ADDITION to stdout). The Job
+// sets this to the container's termination-message path
+// (/tmp/memory-write-summary.txt on the /tmp emptyDir) so the operator can
+// read the bounded summary from the pod's container status without a shell
+// wrapper (the operator's distroless image has no /bin/sh — the binary is
+// the container's direct entrypoint). Empty (the execution test, or a
+// non-Job invocation) = stdout only.
+func summaryPathFromEnv() string {
+	return os.Getenv("COX_SUMMARY_PATH")
 }
 
 func main() {
@@ -117,7 +130,7 @@ func run(outcome string) (int, error) {
 		if os.IsNotExist(err) {
 			// No lessons file (the runner proposed nothing): a valid
 			// "nothing to write". Report the bounded summary and exit 0.
-			fmt.Println(summaryLine(0, 0, 0))
+			emitSummary([]string{summaryLine(0, 0, 0)})
 			return 0, nil
 		}
 		return 1, fmt.Errorf("read %s: %w", lp, err)
@@ -149,9 +162,56 @@ func run(outcome string) (int, error) {
 	// sha256-prefix, written|dropped, and rule. NEVER the lesson text.
 	total := len(lessons)
 	dropped := total - written
-	printSummary(lessons, reasons, outcome)
-	fmt.Println(summaryLine(total, written, dropped))
+	emitSummary(summaryLines(lessons, reasons, total, written, dropped))
 	return 0, nil
+}
+
+// summaryLines builds the bounded summary's lines (one line per lesson with
+// its sha256-prefix, written|dropped, and rule, plus the final counts line).
+// It returns ONLY lines — the lesson text is NEVER in a line. This is the
+// pure content of the summary (the emission — stdout + the termination
+// message file — is in emitSummary).
+func summaryLines(lessons, reasons []string, total, written, dropped int) []string {
+	out := make([]string, 0, len(lessons)+1)
+	for i, lesson := range lessons {
+		status := "written"
+		rule := "eligible"
+		if i < len(reasons) && reasons[i] != "" {
+			status = "dropped"
+			rule = reasons[i]
+		}
+		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
+	}
+	out = append(out, summaryLine(total, written, dropped))
+	return out
+}
+
+// emitSummary writes the bounded summary's lines to stdout AND, if
+// COX_SUMMARY_PATH is set, to that file (the container's termination-message
+// path — the operator reads it from the pod's container status). A write
+// failure to the summary file is non-fatal (the summary is best-effort
+// evidence; the Lesson write already succeeded): it is logged to stderr but
+// does not change the exit code. A bounded summary must never echo a lesson's
+// text — the lines are built by summaryLines, which uses only the sha prefix.
+func emitSummary(lines []string) {
+	var buf bytes.Buffer
+	for _, line := range lines {
+		fmt.Fprintln(&buf, line)
+	}
+	// stdout (always).
+	if _, werr := os.Stdout.Write(buf.Bytes()); werr != nil {
+		fmt.Fprintf(os.Stderr, "memory-write: could not write the summary to stdout: %v (non-fatal)\n", werr)
+	}
+	// The termination-message file (if set). A failure here is non-fatal.
+	if p := summaryPathFromEnv(); p != "" {
+		if err := os.WriteFile(p, buf.Bytes(), 0o644); err != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"memory-write: could not write the summary to %s: %v (non-fatal; the lesson write succeeded)\n",
+				p, err,
+			)
+		}
+	}
 }
 
 // screenLessons applies the eligibility + per-lesson static policy. It
@@ -223,22 +283,6 @@ func shaPrefix(lesson string) string {
 // the 1-based input index, so a dropped lesson's n is its input position,
 // not the written file's n — the written-file n is only assigned to
 // survivors, in survivor order).
-func printSummary(lessons, reasons []string, outcome string) {
-	// Map each input lesson to written|dropped. A survivor (reasons[i] ==
-	// "") is written; a dropped lesson (reasons[i] != "") is dropped with
-	// its rule. The outcome is reported for context (it is the operator's
-	// eligibility decision, passed as an arg).
-	for i, lesson := range lessons {
-		status := "written"
-		rule := "eligible"
-		if i < len(reasons) && reasons[i] != "" {
-			status = "dropped"
-			rule = reasons[i]
-		}
-		fmt.Printf("lesson-%03d %s %s %s\n", i+1, shaPrefix(lesson), status, rule)
-	}
-	_ = outcome
-}
 
 // summaryLine is the final bounded summary line (the counts): the operator
 // parses this from the termination message.

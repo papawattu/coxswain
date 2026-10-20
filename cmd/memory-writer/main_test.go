@@ -28,6 +28,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -254,5 +255,59 @@ func TestMemoryWriteBoundedSummaryNeverLeaksLessonText(t *testing.T) {
 		if strings.Contains(content, "ghp_abcDEF1234567890") {
 			t.Errorf("%s contains a credential; the secrets screen must drop it", name)
 		}
+	}
+}
+
+// TestSummaryPathFile asserts the binary writes the bounded summary to
+// COX_SUMMARY_PATH (the container's termination-message path) in ADDITION to
+// stdout — the operator's distroless image has no /bin/sh, so the binary is
+// the Job's direct entrypoint and must write the summary file itself (no
+// shell redirect). The file's content must match stdout (the same bounded
+// summary, never the lesson text).
+func TestSummaryPathFile(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	sumPath := filepath.Join(t.TempDir(), "summary.txt")
+	t.Setenv("COX_SUMMARY_PATH", sumPath)
+	t.Setenv("COX_MEMORY_DIR", mem)
+	t.Setenv("COX_LESSONS_PATH", filepath.Join(ws, ".coxswain", "lessons.json"))
+	writeLessonsFile(t, ws, []string{
+		"clean lesson: the retry must back off",
+		"the token is ghp_abcDEF1234567890abcdefghijklmnopQR",
+	})
+	// Capture stdout to compare against the file.
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	code, err := run("succeeded")
+	_ = w.Close()
+	os.Stdout = oldStdout
+	stdoutData, _ := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("run(succeeded) = (%d, %v); want 0", code, err)
+	}
+	fileData, err := os.ReadFile(sumPath)
+	if err != nil {
+		t.Fatalf("read COX_SUMMARY_PATH %s: %v (the binary must write the summary file)", sumPath, err)
+	}
+	// The file must contain the same bounded summary as stdout.
+	if !strings.Contains(string(fileData), "summary: total=2 written=1 dropped=1") {
+		t.Errorf("summary file lacks the counts line:\n%s", string(fileData))
+	}
+	// The file must NOT leak a lesson's text (the bounded summary is the
+	// sha prefix + status + rule, never the lesson text).
+	if strings.Contains(string(fileData), "ghp_abcDEF1234567890") ||
+		strings.Contains(string(fileData), "retry must back off") {
+		t.Errorf("summary file leaks a lesson's text:\n%s", string(fileData))
+	}
+	// stdout and the file must agree on the counts line (the same emission).
+	if !strings.Contains(string(stdoutData), "summary: total=2 written=1 dropped=1") {
+		t.Errorf("stdout lacks the counts line:\n%s", string(stdoutData))
 	}
 }

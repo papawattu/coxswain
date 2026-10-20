@@ -110,13 +110,26 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 			"the memory PVC must be the P5a memory-<url-hash>")
 		Expect(memVol.PersistentVolumeClaim.ReadOnly).To(BeFalse())
 
-		// The container runs the operator-controlled entrypoint (the
-		// memory-write binary with the outcome arg "succeeded").
-		Expect(c.Command).To(HaveLen(3))
-		Expect(c.Command[0]).To(Equal("/bin/sh"))
-		Expect(c.Command[1]).To(Equal("-c"))
-		Expect(c.Command[2]).To(ContainSubstring("memory-write"))
-		Expect(c.Command[2]).To(ContainSubstring("succeeded"))
+		// The container runs the operator-controlled memory-write binary
+		// DIRECTLY (no /bin/sh wrapper — the operator's distroless image has
+		// no shell; the kind run showed a StartError "exec /bin/sh: no such
+		// file or directory" when the Job used /bin/sh -c). The binary's
+		// first arg is the terminal outcome ("succeeded"), and the
+		// COX_SUMMARY_PATH env points it at the termination-message path so
+		// it writes the bounded summary there itself.
+		Expect(c.Command).To(HaveLen(2))
+		Expect(c.Command[0]).To(ContainSubstring("coxswain-memory-write"))
+		Expect(c.Command[1]).To(Equal("succeeded"))
+		// COX_SUMMARY_PATH is the termination-message path (the binary writes
+		// the bounded summary there).
+		var summaryEnv *corev1.EnvVar
+		for i := range c.Env {
+			if c.Env[i].Name == "COX_SUMMARY_PATH" {
+				summaryEnv = &c.Env[i]
+			}
+		}
+		Expect(summaryEnv).NotTo(BeNil(), "COX_SUMMARY_PATH must be set (the binary writes the summary there)")
+		Expect(summaryEnv.Value).To(Equal("/tmp/memory-write-summary.txt"))
 
 		// The Job's NetworkPolicy denies ALL egress (the ADR-0007 fence).
 		netpol := &networkingv1.NetworkPolicy{}

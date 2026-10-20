@@ -306,17 +306,6 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 	// it from the Job's pod's container status). The path is the operator's
 	// constant (no user input, so it is unquoted in the entrypoint script).
 	termMsgPath := "/tmp/memory-write-summary.txt"
-	// The entrypoint: the operator-controlled memory-write subcommand. It
-	// reads /workspace/.coxswain/lessons.json, screens it (the outcome arg
-	// is the eligibility rule), writes the eligible lessons to
-	// /memory/lesson-<n>.txt, and tees its bounded summary to
-	// /tmp/memory-write-summary.txt (the termination message) AND stdout.
-	// The script is POSIX sh (the alpine/git image's /bin/sh is busybox ash /
-	// dash): it runs the memory-write binary (the operator's
-	// /usr/local/bin/coxswain-memory-write), tees the output to the
-	// termination message, and EXITS WITH THE BINARY'S EXIT CODE (the tee
-	// must not mask a non-zero write failure). See memoryWriteEntrypoint.
-	entrypoint := memoryWriteEntrypoint(termMsgPath, outcomeArg)
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      memoryWriterJobName(loop),
@@ -336,8 +325,23 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 						Name:            "memory-write",
 						Image:           r.memoryWriterImage(),
 						ImagePullPolicy: corev1.PullIfNotPresent,
-						Command:         []string{"/bin/sh", "-c", entrypoint},
-						WorkingDir:      "/",
+						// The operator's memory-write binary, run DIRECTLY
+						// (no shell wrapper — the operator's distroless image
+						// has no /bin/sh; the kind run showed a StartError
+						// "exec /bin/sh: no such file or directory" when the
+						// Job used /bin/sh -c). The binary's first arg is the
+						// terminal outcome (the eligibility rule). COX_SUMMARY_PATH
+						// points the binary at the termination-message path so
+						// it writes the bounded summary there itself (the
+						// operator reads it from the pod's container status);
+						// COX_LESSONS_PATH / COX_MEMORY_DIR are the Job's
+						// mounts (the defaults match, but the env makes the
+						// paths explicit).
+						Command: []string{
+							"/usr/local/bin/coxswain-memory-write",
+							outcomeArg,
+						},
+						WorkingDir: "/",
 						SecurityContext: &corev1.SecurityContext{
 							RunAsNonRoot:             &memoryWriterTrue,
 							ReadOnlyRootFilesystem:   &memoryWriterTrue,
@@ -345,8 +349,13 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
-						TerminationMessagePath: termMsgPath,
-						Env:                    []corev1.EnvVar{},
+						TerminationMessagePath:   termMsgPath,
+						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+						Env: []corev1.EnvVar{
+							{Name: "COX_SUMMARY_PATH", Value: termMsgPath},
+							{Name: "COX_LESSONS_PATH", Value: "/workspace/.coxswain/lessons.json"},
+							{Name: "COX_MEMORY_DIR", Value: "/memory"},
+						},
 						VolumeMounts: []corev1.VolumeMount{
 							// The workspace PVC (READ-ONLY — the Job reads the
 							// lessons file but never writes the workspace).
@@ -384,34 +393,6 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 			},
 		},
 	}
-}
-
-// memoryWriteEntrypoint is the shell snippet the memory-writer Job's
-// container runs: it invokes the operator-controlled memory-write binary
-// (the entrypoint that reads the lessons file, screens it, and writes the
-// eligible lessons to the memory PVC), tees its output to the termination
-// message path, and exits with the binary's exit code (a write failure is
-// the Job's failure — the operator records MemoryWriteFailed). The snippet
-// is POSIX sh (the alpine/git image's /bin/sh is busybox ash / dash):
-//
-//	/usr/local/bin/coxswain-memory-write <outcome> 2> >(tee ... >&2) | tee <termMsgPath>
-//
-// but process substitution ( >(...) ) is a BASH feature, unavailable in
-// busybox ash / dash. So the entrypoint is a two-step: run the binary,
-// capturing stdout+stderr to the termination message file via a redirect
-// (the file is on the /tmp emptyDir, writable), and exit with the binary's
-// exit code. The bounded summary is on stdout (the binary prints it);
-// stderr carries a bounded error on failure (the operator reads the pod's
-// container status + the termination message).
-func memoryWriteEntrypoint(termMsgPath, outcomeArg string) string {
-	// The binary path (the operator's memory-write entrypoint — the
-	// /usr/local/bin/coxswain-memory-write binary). The outcome arg is the
-	// eligibility rule (succeeded / failed-stalled).
-	binary := "/usr/local/bin/coxswain-memory-write"
-	return fmt.Sprintf(
-		"%s %s > %s 2>&1; rc=$?; exit $rc",
-		shellQuote(binary), shellQuote(outcomeArg), shellQuote(termMsgPath),
-	)
 }
 
 // ensureMemoryWriterNetworkPolicy creates (idempotently) the memory-writer

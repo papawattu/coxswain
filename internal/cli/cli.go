@@ -70,6 +70,9 @@ type Deps struct {
 	Loops     LoopClient
 	Logs      LogStreamer
 	Workspace WorkspaceReader
+	// Memory reads the memory PVC (the `cox memory` command; P5a). nil = the
+	// real peek pod (peekMemoryReader).
+	Memory MemoryReader
 }
 
 // currentDeps is the active seam set. It is set by NewRootCommand/Execute and
@@ -120,6 +123,7 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newApproveCommand(),
 		newRejectCommand(),
 		newDiffCommand(),
+		newMemoryCommand(),
 	)
 	return root
 }

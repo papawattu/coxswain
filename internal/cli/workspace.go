@@ -176,6 +176,14 @@ type peekPodOutcome struct {
 // returns error=true (the F7 condition).
 func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string) peekPodOutcome {
 	podJSON, _ := p.peekKubectlGet(ctx, "get", "pod", podName, "-o", "json")
+	return parsePeekPodOutcome(podJSON)
+}
+
+// parsePeekPodOutcome parses a peek pod's JSON status into its outcome (the
+// shared outcome parsing: a Failed pod or a non-zero exit is an error, never
+// content — the F7 rule). Exposed for the memory peek reader (the same
+// pattern).
+func parsePeekPodOutcome(podJSON string) peekPodOutcome {
 	var pod struct {
 		Status struct {
 			Phase             string `json:"phase"`
@@ -200,9 +208,6 @@ func (p *peekWorkspaceReader) peekPodOutcome(ctx context.Context, podName string
 		if t := pod.Status.ContainerStatuses[0].State.Terminated; t != nil {
 			out.exitCode = fmt.Sprint(t.ExitCode)
 			out.terminationMsg = t.Message
-			// A non-zero exit is an error outcome regardless of the pod phase
-			// (the cat wrapper exits non-zero when the file is missing or
-			// unreadable; 0 only on a successful read).
 			if t.ExitCode != 0 {
 				out.error = true
 			}

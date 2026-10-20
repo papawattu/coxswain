@@ -614,7 +614,8 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	// S4 review P1 (R17): the workspace must survive the per-phase pod
 	// recycle — a fresh emptyDir per phase wiped PLAN.md and the
 	// Implementing edits. The step is a small helper (Reconcile complexity,
-	// gocyclo 31).
+	// gocyclo 31). P5a: it also ensures the shared memory PVC (per
+	// (namespace, git URL)) that the sandbox's copy-in init container reads.
 	if err := r.ensureLoopArtifacts(ctx, loop); err != nil {
 		return false, false, err
 	}
@@ -1822,7 +1823,24 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		}
 		// The agent container + workspace init container + pod volumes (S3a: the
 		// init container mounts the git credential ONLY; the agent never does).
+		// P5a (D66): the shared memory PVC (per (namespace, git URL)) is read
+		// into the workspace's .coxswain/memory/ by a copy-in init container —
+		// ONLY when the PVC is Bound. An unbound (Pending; RWX on local-path)
+		// PVC must NOT be mounted (the kubelet would never start the pod); the
+		// degradation is VISIBLE (an Event, R26 I90), never silent.
+		memoryBound, memErr := r.memoryPVCBound(ctx, loop)
+		if memErr != nil {
+			return memErr
+		}
 		containers, initContainers, volumes := agentPodSpec(ctx, r, loop, hasModel)
+		if memoryBound && memoryPVCName(loop) != "" {
+			initContainers, volumes = appendMemoryCopyIn(initContainers, volumes, true, memoryPVCName(loop), r)
+		} else if memoryPVCName(loop) != "" {
+			// A PVC exists but is not Bound: the visible degradation (the Loop
+			// runs without memory; a repo-less Loop has no PVC at all and is
+			// "no memory", not a degradation — no Event there).
+			r.emitMemoryPVCUnboundEvent(loop, memoryPVCName(loop))
+		}
 		desired.Spec.PodTemplate.Spec.Containers = containers
 		desired.Spec.PodTemplate.Spec.InitContainers = initContainers
 		desired.Spec.PodTemplate.Spec.Volumes = volumes
@@ -2066,7 +2084,13 @@ func (r *LoopReconciler) ensureWorkspacePVC(ctx context.Context, loop *coxv1alph
 // the per-phase pod recycle; the sandbox's 'workspace' volume references it.
 // Kept as a helper because Reconcile was at gocyclo 31.
 func (r *LoopReconciler) ensureLoopArtifacts(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	return r.ensureWorkspacePVC(ctx, loop)
+	if err := r.ensureWorkspacePVC(ctx, loop); err != nil {
+		return err
+	}
+	// P5a (Phase 5, D66): the shared memory PVC (per (namespace, git URL))
+	// the sandbox's copy-in init container reads. Idempotent; a repo-less
+	// Loop has none (memoryPVCName "").
+	return r.ensureMemoryPVC(ctx, loop)
 }
 
 // recordBaseCommitFromInit records status.baseCommit from the workspace clone's

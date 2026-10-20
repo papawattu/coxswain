@@ -126,35 +126,37 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 		}
 	})
 
-	// reconcileLoop runs the reconciler on the Loop a bounded number of times
-	// (the envtest pattern: the specs drive the reconciler directly, recreating
-	// the sandbox the same way every other spec in this suite does — the
-	// bootstrap's option-B recycle). The reconciler is built per spec (a fresh
-	// LoopReconciler on the suite's k8sClient; the memoryPVC decision is a
-	// pure function of the Loop + the PVC's phase, no external state).
+	// reconcileLoop runs the reconciler on the Loop TWICE (a direct two-pass
+	// reconcile, matching the pattern of every other spec in this suite —
+	// the bootstrap's option-B recycle: pass 1 creates the sandbox, the spec
+	// recreates it, pass 2 re-ensures the pod spec on the recreated pod).
+	//
+	// NOT wrapped in Eventually: the other specs call Reconcile directly and
+	// assert on the result. Wrapping a direct function call in
+	// Eventually(30s) polls the full 30s whenever the second pass requeues
+	// (returns a non-nil error), which is what made the full envtest suite
+	// run 1200s+ instead of main's 355s (each P5a spec could hit the 30s
+	// timeout). The two passes are deterministic; a requeue on the second
+	// pass is a ctrl.Result (not an error) and does not block the spec.
 	reconcileLoop := func(name, ns string) {
-		By("reconciling the Loop")
+		By("reconciling the Loop (two passes)")
 		ctrlReconciler := &LoopReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 		}
-		Eventually(func() error {
-			_, err := ctrlReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
-			if err != nil {
-				return err
-			}
-			// Recreate the sandbox (the bootstrap's option-B recycle) so the
-			// operator re-ensures the pod spec on the recreated pod (the same
-			// pattern as every other spec in this suite).
-			probe := &sandboxv1beta1.Sandbox{}
-			if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, probe)) {
-				if cerr := k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns}}); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-					return cerr
-				}
-			}
-			_, err2 := ctrlReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
-			return err2
-		}, 30*time.Second, time.Second).Should(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}
+		_, err := ctrlReconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred(), "pass 1 reconcile must not error")
+		// Recreate the sandbox (the bootstrap's option-B recycle) so the
+		// operator re-ensures the pod spec on the recreated pod (the same
+		// pattern as every other spec in this suite).
+		probe := &sandboxv1beta1.Sandbox{}
+		if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, probe)) {
+			err = k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns}})
+			Expect(err).To(Succeed(), "recreate the sandbox for pass 2")
+		}
+		_, err = ctrlReconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred(), "pass 2 reconcile must not error")
 	}
 
 	Context("(a) the PVC is created in the Loop's namespace, keyed by (ns, URL), RWX", func() {

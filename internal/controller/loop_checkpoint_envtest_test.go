@@ -1036,8 +1036,20 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(res.RequeueAfter).To(Equal(5*time.Second), "the Reconcile must requeue with a targeted 5s RequeueAfter (not the error backoff cap)")
 
 		// The Event must be emitted (FinalizerRemovalBlocked).
+		//
+		// Drain the fake recorder's BOUNDED buffer, not `for range` over the
+		// channel: `for range` over a Go channel keeps looping while the channel
+		// is OPEN, and FakeRecorder closes Events only when its buffer drains
+		// and the recorder is stopped. This spec never stops the recorder, so
+		// the range loop hangs at `<-recorder.Events` on the first unbuffered
+		// send (P5a: the one-shot MemoryPVCUnbound Event queued ahead of the
+		// FinalizerRemovalBlocked Event made the hang deterministic; before P5a
+		// the single FinalizerRemovalBlocked Event filled the last slot and the
+		// break on it exited the loop first, which is why the spec passed for
+		// a year). `for len(recorder.Events) > 0` drains exactly the queued
+		// events and stops.
 		var sawFinalizerRemovalBlocked bool
-		for range recorder.Events {
+		for len(recorder.Events) > 0 {
 			event := <-recorder.Events
 			if strings.Contains(event, "FinalizerRemovalBlocked") {
 				sawFinalizerRemovalBlocked = true

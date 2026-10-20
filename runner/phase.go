@@ -137,6 +137,23 @@ const (
 	memoryPromptMaxBytes = 16 * 1024
 )
 
+// P5b (PLAN-PHASE5.md slice P5b): the lessons transport's file and caps.
+// lessonsFileName is the WORKSPACE FILE the runner writes the proposed
+// lessons to (<workspace>/.coxswain/lessons.json) — the plan's "a workspace
+// file, not the 4096-byte claim". maxLessons is the bounded count (a
+// runaway proposal must not blow the writer Job's env/args or the operator's
+// exec-read); maxLessonChars is P5b's size cap (≤500 chars each) mirrored
+// from pkg/memorywrite.MaxLessonChars (the runner is a separate module and
+// cannot import it — the same mirror convention as memoryDir). A lesson is
+// SINGLE-LINE (one file per lesson; a newline would corrupt the flat
+// memory dir the reader assumes).
+const (
+	lessonsFileName    = "lessons.json"
+	maxLessons         = 10
+	maxLessonChars     = 500
+	maxLessonsJSONBytes = 16 * 1024
+)
+
 // maxDesiredPhaseBytes bounds the desired-phase file (operator-written, but
 // bounded anyway: a runaway value must not blow the runner's context).
 const maxDesiredPhaseBytes = 512
@@ -390,7 +407,12 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 			log.Printf("runner: %s", blockedReason)
 			break
 		}
-		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation)
+		var implAnswer string
+		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation,
+			// P5b: capture the implementing answer so the lessons proposal
+			// (the LESSON: lines) is written to the workspace file on success
+			// (the writeLessonsFile call below).
+			func(answer string) { implAnswer = answer })
 		// S5a (B3): at the end of a successful Implementing, commit the work in
 		// the workspace repo (excluding the operator-owned .coxswain dir) and
 		// record the head SHA in the claim. A CLAIM (ADR-0005): the operator
@@ -404,6 +426,15 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		// binary new file) BLOCKS the claim with the reason — no headCommit,
 		// the operator holds the Verifying advance.
 		if res.Status == statusSuccess {
+			// P5b: propose the lessons this run learned (into
+			// <workspace>/.coxswain/lessons.json on the workspace volume) BEFORE
+			// the commit (the file is in the operator-owned .coxswain dir,
+			// which the commit excludes — it rides the workspace PVC to the
+			// operator, who reads it with `kubectl exec cat` and screens it with
+			// pkg/memorywrite before the writer Job persists it). A write
+			// failure is non-fatal (ADR-0004: a failed memory write does not
+			// fail the Loop).
+			writeLessonsFile(cfg.Workspace, parseLessons(implAnswer))
 			sha, staged, commitErr := commitWorkspace(cfg.Workspace)
 			if sha != "" {
 				res.HeadCommit = sha
@@ -1199,11 +1230,14 @@ func implementingPrompt(workspace, goal string) string {
 	if mem := readMemorySection(workspace); mem != "" {
 		p += mem
 	}
+	// P5b: the lessons transport (the runner proposes lessons into
+	// .coxswain/lessons.json; the operator screens and persists them).
+	p += lessonsPromptSection()
 	return p
 }
 
-// readMemorySection (P5a) returns the shared memory's prompt section: the
-// contents of <workspace>/.coxswain/memory/ (one file per lesson, written by
+// readMemorySection (P5a) returns the shared memory's prompt section:
+// the contents of <workspace>/.coxswain/memory/ (one file per lesson, written by
 // P5b's writer Job to the memory PVC, copied in by the operator's copy-in
 // init container), or "" when the dir is absent or empty (a fresh repo: the
 // prompt is unchanged). The section is capped to memoryPromptMaxBytes (a

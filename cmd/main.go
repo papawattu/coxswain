@@ -115,6 +115,17 @@ func main() {
 		"StorageClass for the per-(namespace, git-URL) memory PVC (P5a). "+
 			"Empty = cluster default. Set to a RWX-capable class on clusters "+
 			"whose default StorageClass does not support ReadWriteMany.")
+	// P5b: the image the memory-writer Job's container runs (the operator's own
+	// image, which contains the /usr/local/bin/coxswain-memory-write binary —
+	// built into the same image as the manager by the Dockerfile). When empty,
+	// the reconciler falls back to the workspace git image (a real deployment
+	// MUST set this flag to the operator image, or the Job's container will
+	// not find the binary and the write will fail).
+	var memoryWriterImage string
+	flag.StringVar(&memoryWriterImage, "memory-writer-image", "",
+		"Image for the P5b memory-writer Job (the operator's own image, which "+
+			"contains /usr/local/bin/coxswain-memory-write). Empty = the workspace "+
+			"git image (the Job's container will not find the binary).")
 	var cniProbeImage string
 	flag.StringVar(&cniProbeImage, "cni-probe-image", "python:3-alpine",
 		"The image the CNI probe pod runs (D38). Must be pullable by the probe node.")
@@ -385,6 +396,7 @@ func main() {
 		AllowUnenforced:        allowUnenforced,
 		AllowUnenforcedNetwork: allowUnenforcedNetwork,
 		MemoryStorageClass:     memoryStorageClass,
+		MemoryWriterImage:      memoryWriterImage,
 		CNIProber:              cniProber,
 		CNIRegateSource:        cniRegateSrc,
 		ClusterDomain:          clusterDomain,

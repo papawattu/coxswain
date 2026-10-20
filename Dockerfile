@@ -22,12 +22,18 @@ COPY . .
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager ./cmd
+# The P5b memory-writer Job runs the operator's own binary (the memory-write
+# entrypoint, cmd/memory-writer). Build it into the SAME image as the manager
+# (the Job's container runs /usr/local/bin/coxswain-memory-write; the operator
+# passes its own image to --memory-writer-image so the Job runs this binary).
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o coxswain-memory-write ./cmd/memory-writer
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
+COPY --from=builder /workspace/coxswain-memory-write /usr/local/bin/coxswain-memory-write
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

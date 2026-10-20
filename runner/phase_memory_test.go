@@ -74,7 +74,8 @@ func TestPromptUnchangedWhenMemoryAbsent(t *testing.T) {
 		"not the implementation itself. End your reply with the plan text (it will be written to PLAN.md).\n\nGOAL:\n" +
 		"do the thing"
 	if got := planningPrompt(ws, "do the thing", planMaxBytes); got != wantPlanning {
-		t.Fatalf("planning prompt with absent memory differs from the pre-P5a baseline:\nGOT:\n%s\nWANT:\n%s", got, wantPlanning)
+		t.Fatalf("planning prompt with absent memory differs from the pre-P5a\n"+
+			"baseline:\nGOT:\n%s\nWANT:\n%s", got, wantPlanning)
 	}
 
 	// Implementing: the baseline prompt (no plan, no memory).
@@ -84,7 +85,8 @@ func TestPromptUnchangedWhenMemoryAbsent(t *testing.T) {
 		"End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
 		"do the thing"
 	if got := implementingPrompt(ws, "do the thing"); got != wantImpl {
-		t.Fatalf("implementing prompt with absent memory differs from the pre-P5a baseline:\nGOT:\n%s\nWANT:\n%s", got, wantImpl)
+		t.Fatalf("implementing prompt with absent memory differs from the pre-P5a\n"+
+			"baseline:\nGOT:\n%s\nWANT:\n%s", got, wantImpl)
 	}
 }
 
@@ -119,7 +121,7 @@ func TestMemoryPromptIsSortedAndBounded(t *testing.T) {
 	ia := strings.Index(got, "-- aaa:")
 	ib := strings.Index(got, "-- bbb:")
 	ic := strings.Index(got, "-- ccc:")
-	if ia == -1 || ib == -1 || ic == -1 || !(ia < ib && ib < ic) {
+	if ia == -1 || ib == -1 || ic == -1 || ia >= ib || ib >= ic {
 		t.Fatalf("memory files not in sorted order (aaa<bbb<ccc): ia=%d ib=%d ic=%d\n%s", ia, ib, ic, got)
 	}
 	if strings.Contains(got, big) {
@@ -138,7 +140,7 @@ func TestMemorySectionDroppedWhenDirTooLarge(t *testing.T) {
 	// A single file that fits memoryFileMaxBytes (so it is included in the
 	// build) but a dir whose TOTAL exceeds memoryPromptMaxBytes: 40 files x
 	// 512B = 20480B > 16384B.
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		name := filepath.Join(ws, resultDirName, memoryDir)
 		_ = os.MkdirAll(name, 0o755)
 		f := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + ".lesson"

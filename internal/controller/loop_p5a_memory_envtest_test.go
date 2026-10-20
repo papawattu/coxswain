@@ -77,7 +77,7 @@ func p5aMakeLoop(name, ns, repo string) *coxv1alpha1.Loop {
 // p5aSandboxPodSpec reads the Loop's sandbox pod spec from the Sandbox
 // object (the envtest stand-in pattern: the operator writes the pod spec onto
 // the Sandbox; the specs assert on it).
-func p5aSandboxPodSpec(ctx context.Context, clx client.Client, name, ns string) *corev1.PodSpec {
+func p5aSandboxPodSpec(ctx context.Context, name, ns string) *corev1.PodSpec {
 	sb := &sandboxv1beta1.Sandbox{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb); err != nil {
 		return nil
@@ -296,7 +296,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 			boundMemoryPVC(nsA, repoA)
 			reconcileLoop("p5a-b1", nsA)
 
-			ps := p5aSandboxPodSpec(ctx, k8sClient, "p5a-b1", nsA)
+			ps := p5aSandboxPodSpec(ctx, "p5a-b1", nsA)
 			Expect(ps).ToNot(BeNil(), "the sandbox must exist")
 
 			// (b) the copy-in init container is present with the memory
@@ -349,7 +349,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 			boundMemoryPVC(nsA, repoA)
 			reconcileLoop("p5a-b2", nsA)
 
-			ps := p5aSandboxPodSpec(ctx, k8sClient, "p5a-b2", nsA)
+			ps := p5aSandboxPodSpec(ctx, "p5a-b2", nsA)
 			Expect(ps).ToNot(BeNil())
 			idxCopy := p5aInitContainerIndex(ps, "memory-copy-in")
 			idxPhase := p5aInitContainerIndex(ps, "init-phase")
@@ -367,7 +367,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 			// (envtest has no provisioner; the PVC is Pending). The operator
 			// must NOT mount it (the kubelet would never start the pod) and
 			// must surface the degradation (an Event, R26 I90).
-			ps := p5aSandboxPodSpec(ctx, k8sClient, "p5a-b3", nsA)
+			ps := p5aSandboxPodSpec(ctx, "p5a-b3", nsA)
 			Expect(ps).ToNot(BeNil())
 			Expect(p5aInitContainerIndex(ps, "memory-copy-in")).To(Equal(-1),
 				"an unbound (Pending) memory PVC must NOT be mounted (the kubelet would never start the pod)")
@@ -387,7 +387,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 			defer func() { _ = k8sClient.Delete(ctx, loop) }()
 			reconcileLoop("p5a-b4", nsA)
 
-			ps := p5aSandboxPodSpec(ctx, k8sClient, "p5a-b4", nsA)
+			ps := p5aSandboxPodSpec(ctx, "p5a-b4", nsA)
 			Expect(ps).ToNot(BeNil())
 			Expect(p5aInitContainerIndex(ps, "memory-copy-in")).To(Equal(-1))
 			for _, v := range ps.Volumes {

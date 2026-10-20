@@ -209,7 +209,7 @@ func (p *peekMemoryReader) pollPeekPodOutcome(ctx context.Context, podName strin
 	var last peekPodOutcome
 	for range 30 {
 		last = memoryPeekPodOutcome(ctx, podName)
-		if last.phase == "Succeeded" || last.phase == "Failed" || last.error {
+		if last.phase == peekPodPhaseSucceeded || last.phase == peekPodPhaseFailed || last.error {
 			return last, nil
 		}
 		time.Sleep(time.Second)

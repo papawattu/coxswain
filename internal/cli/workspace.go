@@ -168,6 +168,14 @@ type peekPodOutcome struct {
 	error          bool
 }
 
+// peekPodPhaseSucceeded / peekPodPhaseFailed are the peek pod's terminal
+// phases (the goconst "Succeeded"/"Failed" — the outcome parsing compares
+// them; a named constant keeps the literal from recurring in three places).
+const (
+	peekPodPhaseSucceeded = "Succeeded"
+	peekPodPhaseFailed    = "Failed"
+)
+
 // peekPodOutcome reads the peek pod once and returns its outcome. It does not
 // poll or sleep (the caller does that): one Get, one parse. A pod that has not
 // reached a terminal phase yet (phase "" or Pending, or a not-yet-terminated
@@ -213,7 +221,7 @@ func parsePeekPodOutcome(podJSON string) peekPodOutcome {
 			}
 		}
 	}
-	if pod.Status.Phase == "Failed" {
+	if pod.Status.Phase == peekPodPhaseFailed {
 		out.error = true
 	}
 	return out
@@ -230,7 +238,7 @@ func (p *peekWorkspaceReader) pollPeekPodOutcome(ctx context.Context, podName st
 		// Stop when the pod is terminal (Succeeded/Failed) or the container has
 		// terminated (an error outcome, e.g. a non-zero exit while the phase is
 		// still settling). A non-terminated, non-terminal pod keeps polling.
-		if last.phase == "Succeeded" || last.phase == "Failed" || last.error {
+		if last.phase == peekPodPhaseSucceeded || last.phase == peekPodPhaseFailed || last.error {
 			return last, nil
 		}
 		time.Sleep(time.Second)

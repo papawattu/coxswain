@@ -132,8 +132,8 @@ const planMaxBytes = 4 * 1024
 // runaway or untrusted dir (a single huge file must not blow the model's
 // context).
 const (
-	memoryDir           = "memory"
-	memoryFileMaxBytes  = 512
+	memoryDir            = "memory"
+	memoryFileMaxBytes   = 512
 	memoryPromptMaxBytes = 16 * 1024
 )
 

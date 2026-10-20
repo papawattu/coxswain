@@ -630,9 +630,11 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, loop)
 	changed = changed || pauseChanged
 
-	if err := r.ensureSandbox(ctx, loop, pauseBlocked); err != nil {
+	sandboxUpdated, err := r.ensureSandbox(ctx, loop, pauseBlocked)
+	if err != nil {
 		return false, false, err
 	}
+	changed = changed || sandboxUpdated
 	return changed, resumeCleared, nil
 }
 
@@ -1691,7 +1693,8 @@ func applyBPFNodeAffinity(e engine.Enforcer, spec *corev1.PodSpec) {
 	}
 }
 
-func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) error {
+func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) (bool, error) {
+	loopUpdated := false
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
 	log := logf.FromContext(ctx)
@@ -1724,9 +1727,9 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				"stale", staleAnnotation,
 				"desired", string(loop.Status.DesiredPhase))
 			if derr := r.Delete(ctx, existingSb); derr != nil && !apierrors.IsNotFound(derr) {
-				return fmt.Errorf("delete sandbox for phase advance: %w", derr)
+				return false, fmt.Errorf("delete sandbox for phase advance: %w", derr)
 			}
-			return nil // Sandbox deleted; the next reconcile creates it fresh
+			return false, nil // Sandbox deleted; the next reconcile creates it fresh
 		}
 		// F6 (the I65 P1-B pattern mirrored): a RECREATED Sandbox has a new
 		// UID. When the operator's last counted sandbox failure (status.agent.
@@ -1748,7 +1751,35 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	} else if !apierrors.IsNotFound(gerr) {
 		// A failed read (not NotFound): fail closed (I49 — a failed read is
 		// never a success); the reconcile retries.
-		return fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
+		return false, fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
+	}
+
+	// P5a (D66): the memory PVC decision (bound vs unbound) is computed BEFORE
+	// the CreateOrUpdate (the mutate func may run twice and must not emit the
+	// Event or write the annotation twice). The one-shot Event + annotation
+	// (R26 I90: a fallback must surface its failure, visible not silent) run
+	// here, once per reconcile, OUTSIDE the mutate func.
+	memoryBound, memErr := r.memoryPVCBound(ctx, loop)
+	if memErr != nil {
+		return false, memErr
+	}
+	if memoryBound && memoryPVCName(loop) != "" {
+		// The PVC is Bound: clear the one-shot unbound marker (a future
+		// unbound transition re-emits the Event).
+		if r.clearMemoryPVCUnboundNotified(ctx, loop) {
+			loopUpdated = true
+		}
+	} else if memoryPVCName(loop) != "" {
+		// A PVC exists but is not Bound: the visible degradation (the Loop
+		// runs without memory; a repo-less Loop has no PVC at all and is
+		// "no memory", not a degradation — no Event there). The Event is
+		// emitted at most once per Loop (the operator-owned annotation makes
+		// it a one-shot transition signal, not a per-reconcile noise source).
+		r.emitMemoryPVCUnboundEvent(loop, memoryPVCName(loop))
+		if merr := r.markMemoryPVCUnboundNotified(ctx, loop); merr != nil {
+			return false, merr
+		}
+		loopUpdated = true
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
@@ -1825,21 +1856,13 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// init container mounts the git credential ONLY; the agent never does).
 		// P5a (D66): the shared memory PVC (per (namespace, git URL)) is read
 		// into the workspace's .coxswain/memory/ by a copy-in init container —
-		// ONLY when the PVC is Bound. An unbound (Pending; RWX on local-path)
-		// PVC must NOT be mounted (the kubelet would never start the pod); the
-		// degradation is VISIBLE (an Event, R26 I90), never silent.
-		memoryBound, memErr := r.memoryPVCBound(ctx, loop)
-		if memErr != nil {
-			return memErr
-		}
+		// ONLY when the PVC is Bound (the bound-vs-unbound decision is computed
+		// OUTSIDE the mutate func above; the mutate func must not emit the
+		// Event or write the annotation twice, because CreateOrUpdate may
+		// call it twice).
 		containers, initContainers, volumes := agentPodSpec(ctx, r, loop, hasModel)
 		if memoryBound && memoryPVCName(loop) != "" {
 			initContainers, volumes = appendMemoryCopyIn(initContainers, volumes, true, memoryPVCName(loop), r)
-		} else if memoryPVCName(loop) != "" {
-			// A PVC exists but is not Bound: the visible degradation (the Loop
-			// runs without memory; a repo-less Loop has no PVC at all and is
-			// "no memory", not a degradation — no Event there).
-			r.emitMemoryPVCUnboundEvent(loop, memoryPVCName(loop))
 		}
 		desired.Spec.PodTemplate.Spec.Containers = containers
 		desired.Spec.PodTemplate.Spec.InitContainers = initContainers
@@ -1852,7 +1875,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		return controllerutil.SetControllerReference(loop, desired, r.Scheme)
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Phase 0 done-when: the controller logs the sandbox it created/updated.
@@ -1871,7 +1894,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			"loop", loop.Name,
 		)
 	}
-	return nil
+	return loopUpdated, nil
 }
 
 // sandboxSuspendedByGate reports whether any of the sandbox's suspension

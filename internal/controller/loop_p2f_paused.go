@@ -52,6 +52,10 @@ import (
 // non-paused Loop is ignored (left for the next pause/resume cycle).
 const resumeAnnotation = "coxswain.io/resume"
 
+// resumeAnnotationTrue is the resume annotation's value (the goconst "true" —
+// the annotation is a boolean flag, not a variable payload).
+const resumeAnnotationTrue = "true"
+
 // Event reasons (P2f). Stable, documented strings (the OS5 pattern).
 const (
 	// pauseEventReason is the Normal Event reason when a Loop enters Paused.
@@ -106,7 +110,7 @@ func (r *LoopReconciler) resumeTriggered(loop *coxv1alpha1.Loop) bool {
 	if loop.Status.PausedReason == coxv1alpha1.PausedReasonSuspend {
 		return !loop.Spec.Suspend
 	}
-	return loop.Annotations[resumeAnnotation] == "true"
+	return loop.Annotations[resumeAnnotation] == resumeAnnotationTrue
 }
 
 // pausedLoopInDeliveryFlight reports whether a Succeeded Loop has a deliver

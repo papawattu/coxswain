@@ -314,6 +314,13 @@ type LoopReconciler struct {
 	// Suspended. For dev/kind only — never in production.
 	AllowUnenforcedNetwork bool
 
+	// MemoryStorageClass is the P5a memory PVC's StorageClass (nil/empty =
+	// the cluster default). On kind clusters whose default StorageClass
+	// (rancher.io/local-path, nodePathMap) is RWO-only, set this to a
+	// RWX-capable class (e.g. local-shared) so the memory PVC can be Bound
+	// and the copy-in init container runs.
+	MemoryStorageClass string
+
 	// CNIRegateSource is the source the Loop controller watches for CNI probe
 	// re-gate requests (D38, design point 3a). When set, SetupWithManager adds
 	// a WatchesRawSource on it; a result change enqueues every Loop so it

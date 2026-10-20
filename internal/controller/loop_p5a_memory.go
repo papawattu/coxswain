@@ -160,6 +160,15 @@ func (r *LoopReconciler) ensureMemoryPVC(ctx context.Context, loop *coxv1alpha1.
 	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, pvc)
 	if apierrors.IsNotFound(err) {
 		pvc.Spec = memoryPVCSpec(loop).Spec
+		// P5a: the memory PVC's StorageClass (the operator's
+		// --memory-storage-class flag; empty = the cluster default).
+		// On kind clusters whose default SC is RWO-only (rancher.io/local-path,
+		// nodePathMap), set this to a RWX-capable class (e.g. local-shared) so
+		// the PVC can be Bound and the copy-in init container runs.
+		if r.MemoryStorageClass != "" {
+			sc := r.MemoryStorageClass
+			pvc.Spec.StorageClassName = &sc
+		}
 		// NO controller owner ref (contrast ensureWorkspacePVC): the memory
 		// PVC is shared across Loops and must outlive any single Loop.
 		if cerr := r.Create(ctx, pvc); cerr != nil {

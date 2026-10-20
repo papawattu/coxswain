@@ -398,6 +398,54 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 			Expect(pvc.OwnerReferences).To(BeEmpty(), "the memory PVC must have no controller owner ref (the operator does not own it; P5b's writer Job is the sole writer)")
 			Expect(pvc.Spec.AccessModes).To(Equal([]corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}), "a no-change reconcile must not rewrite the access modes")
 		})
+
+		// P5a --memory-storage-class flag: when the operator is configured
+		// with a non-empty MemoryStorageClass, the memory PVC is created
+		// with that storageClassName. When empty (the default), the PVC
+		// uses the cluster default (nil storageClassName). This spec tests
+		// the non-empty path; the specs above (which use the default
+		// reconciler with no MemoryStorageClass) implicitly test the
+		// nil path.
+		It("sets the memory PVC's storageClassName when --memory-storage-class is set", func() {
+			loop := p5aMakeLoop("p5a-sc1", nsA, repoA)
+			Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, loop) }()
+
+			// Reconcile with a reconciler that has MemoryStorageClass set.
+			scReconciler := &LoopReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				MemoryStorageClass: "local-shared",
+			}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsA, Name: "p5a-sc1"}}
+			_, err := scReconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred(), "reconcile must not error")
+
+			pvcName := memkeyPVCName(repoA)
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: pvcName}, pvc)).To(Succeed(), "the memory PVC must be created")
+			Expect(pvc.Spec.StorageClassName).NotTo(BeNil(), "the memory PVC must have a storageClassName set when the operator is configured with --memory-storage-class")
+			Expect(*pvc.Spec.StorageClassName).To(Equal("local-shared"), "the memory PVC's storageClassName must match the operator's --memory-storage-class flag")
+		})
+
+		// The nil path: when MemoryStorageClass is empty (the default), the
+		// memory PVC's storageClassName is nil (the cluster default).
+		It("leaves the memory PVC's storageClassName nil when --memory-storage-class is empty (the default)", func() {
+			loop := p5aMakeLoop("p5a-sc2", nsA, repoA)
+			Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, loop) }()
+
+			// Use the default reconciler (no MemoryStorageClass set — nil path).
+			reconcileLoop("p5a-sc2", nsA)
+
+			pvcName := memkeyPVCName(repoA)
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: pvcName}, pvc)).To(Succeed(), "the memory PVC must be created")
+			// nil or empty string = the cluster default.
+			if pvc.Spec.StorageClassName != nil {
+				Expect(*pvc.Spec.StorageClassName).To(Equal(""), "when --memory-storage-class is empty, the PVC's storageClassName must be empty or nil (the cluster default)")
+			}
+		})
 	})
 
 	_ = nsB

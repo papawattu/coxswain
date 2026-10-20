@@ -222,19 +222,47 @@ func (r *LoopReconciler) emitMemoryPVCUnboundEvent(loop *coxv1alpha1.Loop, pvcNa
 
 // markMemoryPVCUnboundNotified records the one-shot annotation (the Event
 // was emitted; do not re-emit on every reconcile). The annotation is on the
-// Loop (operator-owned; the user does not set it). Returns an error only on
-// a real update failure (a conflict is retried on the next reconcile).
+// Loop (operator-owned; the user does not set it).
+//
+// The patch is applied to a DEEP COPY (metadata-only MergeFrom patch), NOT
+// the caller's `loop` object. A full r.Update(ctx, loop) writes the server
+// response back into `loop`, resetting loop.Status to the PERSISTED (old)
+// status and DROPPING the conditions set earlier in this reconcile — so the
+// trailing Status().Update would write the old status (the S4/S6 specs
+// saw "changed=true but conditions not persisted"). The MergeFrom patch
+// touches ONLY metadata.annotations (the one-shot marker); it does not
+// touch the status subresource and does not reset the caller's in-memory
+// status. The caller's `loop` keeps its in-memory status; the reconcile's
+// trailing Status().Update persists it.
 func (r *LoopReconciler) markMemoryPVCUnboundNotified(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if loop.Annotations == nil {
-		loop.Annotations = make(map[string]string)
-	}
-	if loop.Annotations[memoryPVCUnboundNotifiedAnnotation] == memoryPVCUnboundNotifiedValue {
+	if loop.Annotations != nil && loop.Annotations[memoryPVCUnboundNotifiedAnnotation] == memoryPVCUnboundNotifiedValue {
 		return nil // already marked (no update needed)
 	}
-	loop.Annotations[memoryPVCUnboundNotifiedAnnotation] = memoryPVCUnboundNotifiedValue
-	if err := r.Update(ctx, loop); err != nil {
+	// Patch on a SEPARATE object (not the caller's `loop`), so the server
+	// response does NOT reset the caller's in-memory status. A MergeFrom
+	// patch on the caller's `loop` would write the server response (the
+	// persisted object, with the OLD status) back into `loop`, overwriting
+	// the conditions and phase set earlier in this reconcile (the S4/S6
+	// specs saw "changed=true but conditions not persisted" for this
+	// reason). The patch touches ONLY metadata.annotations; the caller's
+	// `loop` keeps its in-memory status.
+	patched := loop.DeepCopy()
+	if patched.Annotations == nil {
+		patched.Annotations = make(map[string]string)
+	}
+	patched.Annotations[memoryPVCUnboundNotifiedAnnotation] = memoryPVCUnboundNotifiedValue
+	patch := client.MergeFrom(loop.DeepCopy())
+	if err := r.Patch(ctx, patched, patch); err != nil {
 		return fmt.Errorf("mark memory PVC unbound notified on %s/%s: %w", loop.Namespace, loop.Name, err)
 	}
+	// Refresh the caller's resourceVersion (the patch bumped it); the
+	// caller's in-memory status is intact (the patch was on `copy`, not
+	// `loop`). The trailing Status().Update uses the fresh resourceVersion.
+	fresh := &coxv1alpha1.Loop{}
+	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil && !apierrors.IsNotFound(gerr) {
+		return fmt.Errorf("re-get Loop after memory PVC unbound mark %s/%s: %w", loop.Namespace, loop.Name, gerr)
+	}
+	loop.ResourceVersion = fresh.ResourceVersion
 	return nil
 }
 
@@ -249,13 +277,22 @@ func (r *LoopReconciler) clearMemoryPVCUnboundNotified(ctx context.Context, loop
 	if loop.Annotations == nil || loop.Annotations[memoryPVCUnboundNotifiedAnnotation] != memoryPVCUnboundNotifiedValue {
 		return false
 	}
-	delete(loop.Annotations, memoryPVCUnboundNotifiedAnnotation)
-	if err := r.Update(ctx, loop); err != nil {
-		// Best-effort: a failure is not load-bearing (the Event will not
-		// re-emit this reconcile; the next unbound transition re-marks and
-		// re-emits).
+	// Patch on a SEPARATE object (not the caller's `loop`), so the server
+	// response does NOT reset the caller's in-memory status.
+	patched := loop.DeepCopy()
+	delete(patched.Annotations, memoryPVCUnboundNotifiedAnnotation)
+	patch := client.MergeFrom(loop.DeepCopy())
+	if err := r.Patch(ctx, patched, patch); err != nil {
+		// Best-effort: a failure is not load-bearing.
 		return false
 	}
+	// Refresh the caller's resourceVersion; the caller's in-memory status is
+	// intact.
+	fresh := &coxv1alpha1.Loop{}
+	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil && !apierrors.IsNotFound(gerr) {
+		return false
+	}
+	loop.ResourceVersion = fresh.ResourceVersion
 	return true
 }
 

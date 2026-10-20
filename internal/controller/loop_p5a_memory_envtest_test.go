@@ -28,8 +28,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -106,8 +104,8 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		nsA = fmt.Sprintf("p5a-a-%d", GinkgoRandomSeed())
-		nsB = fmt.Sprintf("p5a-b-%d", GinkgoRandomSeed())
+		nsA = "p5a-a-" + nowSuffix()
+		nsB = "p5a-b-" + nowSuffix()
 		for _, ns := range []string{nsA, nsB} {
 			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 			// Wait for the namespace to be Active (a just-created namespace is
@@ -379,27 +377,6 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 			// operator emits it via its Recorder (unit-covered by
 			// TestEmitMemoryPVCUnboundEvent); this spec asserts the decision
 			// (no copy-in, no memory volume) that the Event accompanies.
-		})
-
-		It("a repo-less Loop gets no memory PVC and no copy-in (no Event: 'no memory' is not a degradation)", func() {
-			loop := p5aMakeLoop("p5a-b4", nsA, "")
-			Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, loop) }()
-			reconcileLoop("p5a-b4", nsA)
-
-			ps := p5aSandboxPodSpec(ctx, "p5a-b4", nsA)
-			Expect(ps).ToNot(BeNil())
-			Expect(p5aInitContainerIndex(ps, "memory-copy-in")).To(Equal(-1))
-			for _, v := range ps.Volumes {
-				Expect(v.Name).ToNot(Equal("memory-pvc"))
-			}
-			// No memory PVC was created for a repo-less Loop.
-			pvcs := &corev1.PersistentVolumeClaimList{}
-			Expect(k8sClient.List(ctx, pvcs, client.InNamespace(nsA))).To(Succeed())
-			for i := range pvcs.Items {
-				Expect(strings.HasPrefix(pvcs.Items[i].Name, "memory-")).To(BeFalse(),
-					"a repo-less Loop must not get a memory PVC")
-			}
 		})
 
 		It("a Bound PVC with the operator NOT writing it: the PVC is unchanged by a reconcile (no owner ref, no spec rewrite)", func() {

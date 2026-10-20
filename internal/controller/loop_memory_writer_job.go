@@ -53,6 +53,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -431,6 +432,15 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 			Ingress: []networkingv1.NetworkPolicyIngressRule{{}},
 			Egress:  []networkingv1.NetworkPolicyEgressRule{{}},
 		},
+	}
+	// The NetPol is owned by the Loop (controller reference) so the apiserver
+	// garbage-collects it when the Loop is deleted — the same way the
+	// memory-writer Job is GC'd (the Job is SetControllerReference'd in
+	// buildMemoryWriterJob). Without the owner, the NetPol leaks on Loop
+	// delete (a standalone object the B1 finalizer does not clean up; the
+	// kind acceptance left p5b-df3c/df4-memory-write-netpol behind).
+	if err := controllerutil.SetControllerReference(loop, denyAll, r.Scheme); err != nil {
+		return fmt.Errorf("set the memory-writer netpol %s owner to the Loop: %w", name, err)
 	}
 	if err := r.Create(ctx, denyAll); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create memory-writer netpol %s: %w", name, err)

@@ -104,17 +104,6 @@ func secretPatternNames() []string {
 	return names
 }
 
-// secretPattern looks up a pattern by name (the operator's drop log names
-// the pattern; nil when the name is unknown).
-func secretPattern(name string) (*regexp.Regexp, bool) {
-	for _, sp := range secretsPatterns {
-		if sp.name == name {
-			return sp.pattern, true
-		}
-	}
-	return nil, false
-}
-
 // Screen applies the static write policy to the runner's proposed lessons and
 // returns the surviving lessons (the ones the writer Job will persist) plus
 // the set of dropped pattern names (one per dropped lesson, in lesson

@@ -57,13 +57,19 @@ func testPatternSpec(t *testing.T, patternName, matchingSample, proseLesson stri
 	// it).
 	_, reasons := Screen([]string{matchingSample})
 	if len(reasons) != 1 || !strings.HasPrefix(reasons[0], "secret: "+patternName) {
-		t.Fatalf("pattern %s: matching sample %q: reasons=%v, want the first drop to be named %q", patternName, matchingSample, reasons, patternName)
+		t.Fatalf(
+			"pattern %s: matching sample %q: reasons=%v, want the first drop to be named %q",
+			patternName, matchingSample, reasons, patternName,
+		)
 	}
 
 	// The prose lesson survives (no rule trips).
 	survivors, reasons := Screen([]string{proseLesson})
 	if len(survivors) != 1 {
-		t.Fatalf("pattern %s: prose lesson %q: survivors=%v, want it kept (reasons=%v)", patternName, proseLesson, survivors, reasons)
+		t.Fatalf(
+			"pattern %s: prose lesson %q: survivors=%v, want it kept (reasons=%v)",
+			patternName, proseLesson, survivors, reasons,
+		)
 	}
 }
 
@@ -98,7 +104,8 @@ func TestPatternSpecAnthropicKey(t *testing.T) {
 // TestPatternSpecJWT: a JWT is dropped.
 func TestPatternSpecJWT(t *testing.T) {
 	testPatternSpec(t, "jwt",
-		"the bearer token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozWaM5B9c_GCKJUiFxyoWpDpFhUJYR71cXm2D3eLkU was echoed in the log",
+		"the bearer token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."+
+			"dozWaM5B9c_GCKJUiFxyoWpDpFhUJYR71cXm2D3eLkU was echoed in the log",
 		"the agent's tmpSizeLimit is 4Gi, not the emptyDir default")
 }
 
@@ -253,11 +260,11 @@ func TestShapeMultiLine(t *testing.T) {
 // survivor list — the writer names files by position in the SURVIVOR list).
 func TestScreenOrderAndGaps(t *testing.T) {
 	in := []string{
-		"keep one",                       // kept
-		"secret AKIAIOSFODNN7EXAMPLE",    // dropped (aws)
-		"keep two",                       // kept
-		"",                               // dropped (blank)
-		"keep three",                     // kept
+		"keep one",                    // kept
+		"secret AKIAIOSFODNN7EXAMPLE", // dropped (aws)
+		"keep two",                    // kept
+		"",                            // dropped (blank)
+		"keep three",                  // kept
 	}
 	survivors, reasons := Screen(in)
 	if len(survivors) != 3 {

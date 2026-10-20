@@ -321,6 +321,14 @@ type LoopReconciler struct {
 	// and the copy-in init container runs.
 	MemoryStorageClass string
 
+	// MemoryWriterImage is the image the P5b memory-writer Job's container
+	// runs (the operator-controlled memory-write entrypoint — the operator's
+	// own binary with the memory-write subcommand, cmd/memory-writer). When
+	// empty (envtests / minimal setups), the operator falls back to the
+	// workspace git image (the Job still builds; a real run uses the operator
+	// image, which contains the memory-write entrypoint).
+	MemoryWriterImage string
+
 	// CNIRegateSource is the source the Loop controller watches for CNI probe
 	// re-gate requests (D38, design point 3a). When set, SetupWithManager adds
 	// a WatchesRawSource on it; a result change enqueues every Loop so it
@@ -909,6 +917,23 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	cpChanged, cpRequeue := r.ensureCheckpointStep(ctx, &loop)
 	changed = changed || cpChanged
 	verifyRequeue = verifyRequeue || cpRequeue
+
+	// P5b: the memory-writer Job (the operator's sole writer of the shared
+	// memory PVC). The Job mounts the workspace PVC read-only and the memory
+	// PVC read-write; it runs the operator-controlled memory-write entrypoint
+	// (cmd/memory-writer), which reads the runner's proposed lessons from
+	// the workspace file, screens them with the static write policy
+	// (pkg/memorywrite), and writes the eligible lessons to the memory PVC.
+	// The operator gates the Job on a qualifying terminal outcome
+	// (Succeeded or Failed:Stalled) and records the outcome on the
+	// MemoryWriteDone condition. A failed write does NOT fail the Loop
+	// (ADR-0004: the memory is best-effort) — the MemoryWriteDone condition
+	// + a Warning Event surface it. The Job is owned by the Loop
+	// (controller ref, so deleting the Loop garbage-collects it).
+	if memErr := r.reconcileP5bMemoryWriter(ctx, &loop, &verifyRequeue); memErr != nil {
+		return ctrl.Result{}, memErr
+	}
+
 
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a

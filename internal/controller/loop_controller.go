@@ -1429,8 +1429,8 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	}
 	agentEnv := make([]corev1.EnvVar, 0, len(loop.Spec.Agent.Env)+3)
 	agentEnv = append(agentEnv, corev1.EnvVar{Name: "HOME", Value: "/scratch"})
-	// F13: point Go's build temp dir at the workspace PVC (1Gi+ default,
-	// user-configurable) rather than the /tmp emptyDir (1Gi default,
+	// F13: point Go's build temp dir at the workspace PVC (a FIXED 1Gi —
+	// workspacePVCSpec) rather than the /tmp emptyDir (1Gi default,
 	// evicted when full: "Usage of EmptyDir volume 'tmp' exceeds the
 	// limit '1Gi'" — dogfood6-p5e, 2026-10-19). GOCACHE is already on
 	// /scratch (via HOME=/scratch); GOTMPDIR defaults to /tmp, so a go
@@ -1439,6 +1439,9 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// so commitWorkspace's :exclude pathspec keeps a leftover go-build* work
 	// dir OUT of the verified commit: Go removes them only on a clean exit,
 	// so a killed / timed-out / `go test -work` agent leaves them behind.
+	// Because the PVC is fixed 1Gi, the phase-init empties .coxswain/gotmp at
+	// every phase start (rm then mkdir) so a run of leftovers cannot grow to
+	// ENOSPC the agent in the repo itself (the /tmp eviction this replaces).
 	// (The original F13 location /workspace/.gotmp was NOT inside .coxswain
 	// and the leftover dirs were committed and delivered — review #178 P1.)
 	agentEnv = append(agentEnv, corev1.EnvVar{Name: "GOTMPDIR", Value: "/workspace/" + gotmpDir})
@@ -5458,7 +5461,14 @@ set -eu
 # /workspace/.coxswain/gotmp; Go's MkdirTemp requires the parent to exist).
 # It lives inside .coxswain so commitWorkspace's exclusion keeps a leftover
 # go-build* work dir out of the verified commit (F13 P1 fix, review #178).
+# The workspace PVC is a FIXED 1Gi (workspacePVCSpec), so leftover go-build*
+# dirs from a killed, timed-out, or go-test-with-work run are garbage that
+# would eventually fill the PVC and ENOSPC the agent in the repo itself
+# (worse than the /tmp eviction this replaces). Go's temp dirs from an
+# earlier phase are always garbage, so empty the dir at every phase start
+# (rm then mkdir).
 DEST=/workspace
+rm -rf "${DEST}/.coxswain/gotmp"
 mkdir -p "${DEST}/.coxswain/gotmp"
 exit 0
 `
@@ -5477,6 +5487,13 @@ exit 0
 		// parent to exist, and this phase-init container always runs before the
 		// agent with /workspace mounted, so it is the reliable place to create
 		// it). Inside .coxswain so the commit exclusion covers a leftover dir.
+		// The workspace PVC is a FIXED 1Gi (workspacePVCSpec), so leftover
+		// go-build* dirs from a killed / timed-out / `go test -work` run are
+		// garbage that would eventually fill the PVC and ENOSPC the agent in the
+		// repo itself (worse than the /tmp eviction this replaces). Go's temp
+		// dirs from an earlier phase are always garbage, so empty the dir at
+		// every phase start (rm then mkdir).
+		`rm -rf "${DEST}/.coxswain/gotmp"`,
 		`mkdir -p "${DEST}/.coxswain/gotmp"`,
 		`printf '%s' ` + shellQuote(string(desiredPhase)) + ` > "${DEST}/.coxswain/` + coxDesiredPhaseFile + `"`,
 		`printf '%s' ` + shellQuote(fmt.Sprintf("%d", iteration)) + ` > "${DEST}/.coxswain/iteration"`,

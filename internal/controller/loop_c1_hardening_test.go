@@ -150,7 +150,13 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		// lives INSIDE the operator-owned .coxswain dir so commitWorkspace's
 		// exclusion keeps a leftover go-build* work dir out of the verified
 		// commit (Go only removes them on a clean exit; review #178 P1).
-		// Mutation: remove the GOTMPDIR env var — this assertion FAILS.
+		// Because the workspace PVC is a FIXED 1Gi (workspacePVCSpec), the
+		// phase-init empties .coxswain/gotmp at every phase start (rm then
+		// mkdir) so a run of leftovers cannot grow to ENOSPC the agent in the
+		// repo itself (the /tmp eviction this replaces). The phase-init rm is
+		// exercised by TestPhaseInitEmptiesGOTMPDir (an execution test of the
+		// real generated script); Mutation: remove the GOTMPDIR env var — this
+		// assertion FAILS.
 		By("pointing GOTMPDIR at the workspace PVC (F13)")
 		Expect(envByName["GOTMPDIR"]).To(Equal("/workspace/.coxswain/gotmp"),
 			"GOTMPDIR must point at the .coxswain dir on the workspace PVC so go build temp files don't evict the /tmp emptyDir")

@@ -28,7 +28,10 @@ func TestParseLessonsNone(t *testing.T) {
 // TestParseLessonsBasic: a reply with two LESSON: lines yields both, in
 // reply order (the operator persists them as lesson-001.txt, lesson-002.txt).
 func TestParseLessonsBasic(t *testing.T) {
-	reply := "made the change and verified it.\nLESSON: the build order is compile, test, deploy\nLESSON: the verify image is golang:1.26\nDone."
+	reply := ("made the change and verified it.\n" +
+		"LESSON: the build order is compile, test, deploy\n" +
+		"LESSON: the verify image is golang:1.26\n" +
+		"Done.")
 	got := parseLessons(reply)
 	if len(got) != 2 {
 		t.Fatalf("basic: got %d lessons, want 2: %v", len(got), got)
@@ -107,7 +110,7 @@ func TestCapLessonsSizeCap(t *testing.T) {
 // FIRST maxLessons (a bounded proposal is better than a truncated one).
 func TestCapLessonsCountCap(t *testing.T) {
 	in := make([]string, 0, maxLessons+5)
-	for i := 0; i < maxLessons+5; i++ {
+	for i := range maxLessons + 5 {
 		in = append(in, "lesson "+string(rune('a'+i)))
 	}
 	got := capLessons(in)

@@ -594,3 +594,15 @@ func (r *LoopReconciler) reconcileP5bMemoryWriter(ctx context.Context, loop *cox
 	*requeue = *requeue || memRequeue
 	return nil
 }
+
+// runTamperGate runs the B2 tamper gate (applyTamperGate) unconditionally and
+// folds its result into *changed. The gate must run every reconcile — a
+// short-circuiting changed = changed || r.applyTamperGate(...) would skip the
+// security gate when changed was already true this reconcile (the red B2
+// tamper spec). Extracted from Reconcile to keep its cyclomatic complexity
+// under the gocyclo threshold.
+func (r *LoopReconciler) runTamperGate(loop *coxv1alpha1.Loop, changed *bool) {
+	if r.applyTamperGate(loop) {
+		*changed = true
+	}
+}

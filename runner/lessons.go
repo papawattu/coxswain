@@ -148,7 +148,7 @@ func lessonsPromptSection() string {
 // capLessons step bounds it further).
 func parseLessons(answer string) []string {
 	var out []string
-	for _, line := range strings.Split(answer, "\n") {
+	for line := range strings.SplitSeq(answer, "\n") {
 		t := strings.TrimSpace(line)
 		const prefix = "LESSON:"
 		if !strings.HasPrefix(t, prefix) {

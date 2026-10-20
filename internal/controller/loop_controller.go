@@ -934,7 +934,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, memErr
 	}
 
-
 	// S6: at Succeeded, the operator owns the deliver Job (the delivery
 	// evidence path) for a Loop with spec.delivery.mode == PullRequest and a
 	// pinned verifiedCommit. The stale-Job guard (D27) deletes a Job stamped
@@ -952,10 +951,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// every reconcile — calling it into a local and only then OR-ing into
 	// changed (changed = changed || r.applyTamperGate(...)) would short-circuit
 	// the call whenever changed was already true this reconcile, skipping the
-	// security gate (the red B2 tamper spec).
-	if r.applyTamperGate(&loop) {
-		changed = true
-	}
+	// security gate (the red B2 tamper spec). The runTamperGate helper runs
+	// the gate unconditionally (no short-circuit) and folds the result into
+	// changed, keeping Reconcile's cyclomatic complexity under the threshold.
+	r.runTamperGate(&loop, &changed)
 
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references

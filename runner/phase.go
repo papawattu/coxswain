@@ -148,9 +148,9 @@ const (
 // SINGLE-LINE (one file per lesson; a newline would corrupt the flat
 // memory dir the reader assumes).
 const (
-	lessonsFileName    = "lessons.json"
-	maxLessons         = 10
-	maxLessonChars     = 500
+	lessonsFileName     = "lessons.json"
+	maxLessons          = 10
+	maxLessonChars      = 500
 	maxLessonsJSONBytes = 16 * 1024
 )
 

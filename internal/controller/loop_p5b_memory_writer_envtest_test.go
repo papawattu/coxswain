@@ -141,6 +141,20 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(netpol.Spec.Egress).To(HaveLen(1))
 		Expect(netpol.Spec.Egress[0].To).To(BeEmpty(), "the egress rule must be deny-all (no allowed peers)")
 
+		// P5b: the Job runs under its DEDICATED ServiceAccount
+		// (coxswain-memory-writer) with automountServiceAccountToken: false
+		// (the plan: "a dedicated ServiceAccount with the stated RBAC"; the
+		// binary makes no API calls, so no token is mounted — the Job CANNOT
+		// make API calls even if the SA's RBAC were broader). The
+		// "write from the operator pod" mutation is prevented by this
+		// dedicated SA + the no-token pod.
+		Expect(job.Spec.Template.Spec.ServiceAccountName).To(Equal("coxswain-memory-writer"),
+			"the writer Job must run under its dedicated ServiceAccount, not the operator's")
+		automount := job.Spec.Template.Spec.AutomountServiceAccountToken
+		Expect(automount).NotTo(BeNil(), "automountServiceAccountToken must be set")
+		Expect(*automount).To(BeFalse(),
+			"the writer Job's pod must NOT mount a service-account token (it makes no API calls)")
+
 		// The operator has NOT yet recorded the outcome (the Job's pod is not
 		// yet terminal in envtest — envtest has no kubelet to run the Job's
 		// pod). Reconcile again to confirm the operator requeues (it does not
@@ -163,6 +177,31 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// The Loop is still Succeeded (a memory write does not change the
 		// phase — ADR-0004).
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+	})
+
+	It("creates the memory-writer Job's dedicated ServiceAccount (the plan's dedicated SA with the stated RBAC)", func() {
+		// The memory-writer Job's dedicated SA (config/rbac/
+		// memory_writer_service_account.yaml) is installed with the
+		// operator (the RBAC kustomization). The envtest does not load the
+		// RBAC manifests, so this spec CREATES the SA in the test namespace
+		// (the operator's RBAC kustomization would create it in the operator's
+		// namespace; the Job's pod references it by name in the LOOP's
+		// namespace — the SA must exist in the Loop's namespace for the pod
+		// to be scheduled. The operator's install creates the SA in the
+		// operator's namespace; for the Job's namespace, the SA is created
+		// by the install's RBAC (a cluster-scoped install puts it in the
+		// operator's namespace; a namespaced install puts it in the target
+		// namespace). For the spec, create it in the test ns.)
+		sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+			Name:      "coxswain-memory-writer",
+			Namespace: ns,
+		}}
+		Expect(k8sClient.Create(context.Background(), sa)).To(Succeed(),
+			"the dedicated memory-writer ServiceAccount must be creatable in the Loop's namespace")
+		// The SA exists (the plan: "a spec asserts the ServiceAccount exists").
+		got := &corev1.ServiceAccount{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "coxswain-memory-writer", Namespace: ns}, got)).To(Succeed())
+		Expect(got.Name).To(Equal("coxswain-memory-writer"))
 	})
 
 	It("does NOT create the memory-writer Job for a non-qualifying terminal reason (MemoryWriteSkipped)", func() {
@@ -206,6 +245,51 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(err).To(HaveOccurred(), "no memory-writer Job for a non-qualifying terminal reason")
 
 		// The MemoryWriteSkipped condition is recorded.
+		loop = p5bMustLoop(ns, name)
+		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
+		Expect(cond).NotTo(BeNil(), "the MemoryWriteDone condition must be set")
+		Expect(cond.Reason).To(Equal(memoryWriteSkippedReason))
+	})
+
+	It("writes nothing for a Failed:BudgetExceeded Loop (the eligibility trigger: only Succeeded or Failed:Stalled qualifies)", func() {
+		// The plan's eligibility trigger: a lesson is eligible only on
+		// Succeeded or Failed:Stalled. ANY other terminal reason (e.g.
+		// Failed:BudgetExceeded — the budget gate stopped the Loop before it
+		// could iterate) is ineligible: the operator records the
+		// MemoryWriteSkipped condition and does NOT create the Job.
+		name := "p5b-mw-budget"
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		s5aEnsureSandbox(ns, name)
+		loop := s6Loop(name, ns, inClusterRepoURL)
+		Expect(k8sClient.Create(context.Background(), loop)).To(Succeed())
+		s6Reconcile(r, ns, name)
+		loop = p5bMustLoop(ns, name)
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(context.Background(), loop)).To(Succeed())
+		// Force the Loop to Failed with a BUDGET reason (BudgetExceeded — a
+		// non-Stalled terminal reason). The phase machine is authoritative;
+		// a terminal Failed state is stable (the S4 phase machine does NOT
+		// re-derive from a terminal Failed).
+		loop = p5bMustLoop(ns, name)
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, "BudgetExceeded", "the iteration budget was exhausted (non-Stalled reason)")
+		Expect(k8sClient.Status().Update(context.Background(), loop)).To(Succeed())
+
+		// Reconcile: the operator sees the Failed:BudgetExceeded outcome and
+		// records the MemoryWriteSkipped condition (no Job is created — the
+		// eligibility trigger is Succeeded or Failed:Stalled ONLY).
+		s6Reconcile(r, ns, name)
+
+		// No memory-writer Job is created.
+		job := &batchv1.Job{}
+		err := k8sClient.Get(context.Background(), types.NamespacedName{
+			Name: memoryWriterJobName(p5bMustLoop(ns, name)), Namespace: ns,
+		}, job)
+		Expect(err).To(HaveOccurred(), "no memory-writer Job for a Failed:BudgetExceeded Loop (the eligibility trigger)")
+
+		// The MemoryWriteSkipped condition is recorded (the drop is in the
+		// audit trail with the rule that failed — the eligibility rule).
 		loop = p5bMustLoop(ns, name)
 		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
 		Expect(cond).NotTo(BeNil(), "the MemoryWriteDone condition must be set")

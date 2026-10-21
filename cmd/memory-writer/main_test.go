@@ -27,6 +27,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
@@ -64,8 +66,9 @@ func writeLessonsFile(t *testing.T, workspace string, lessons []string) {
 	}
 }
 
-// readMemoryFiles returns the lesson-*.txt files in the memory dir, sorted by
-// name, with their content (the trailing newline trimmed).
+// readMemoryFiles returns the *.txt files in the memory dir (named by their
+// sha256 — the plan: "files named by its SHA-256"), keyed by file name, with
+// their content (the trailing newline trimmed).
 func readMemoryFiles(t *testing.T, memoryDir string) map[string]string {
 	t.Helper()
 	entries, err := os.ReadDir(memoryDir)
@@ -77,7 +80,7 @@ func readMemoryFiles(t *testing.T, memoryDir string) map[string]string {
 	}
 	out := map[string]string{}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), "lesson-") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".txt") {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join(memoryDir, e.Name()))
@@ -111,12 +114,19 @@ func TestMemoryWriteWritesEligibleLessons(t *testing.T) {
 	}
 	files := readMemoryFiles(t, mem)
 	// Only the eligible lesson is written (the credential lesson is dropped
-	// by the secrets screen). One file.
+	// by the secrets screen). One file (named by the lesson's sha256).
 	if len(files) != 1 {
 		t.Fatalf("memory dir has %d files (%v); want 1 (the credential lesson is dropped)", len(files), files)
 	}
-	if got := files["lesson-001.txt"]; got != lessons[0] {
-		t.Errorf("lesson-001.txt = %q; want %q", got, lessons[0])
+	// The file's content is the eligible lesson (the name is the sha256).
+	found := false
+	for _, content := range files {
+		if content == lessons[0] {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the eligible lesson %q is not in the memory dir: %v", lessons[0], files)
 	}
 	// The dropped lesson's content must NOT be on the memory PVC.
 	for name, content := range files {
@@ -309,5 +319,86 @@ func TestSummaryPathFile(t *testing.T) {
 	// stdout and the file must agree on the counts line (the same emission).
 	if !strings.Contains(string(stdoutData), "summary: total=2 written=1 dropped=1") {
 		t.Errorf("stdout lacks the counts line:\n%s", string(stdoutData))
+	}
+}
+
+// TestMemoryWriteDedupByHash: a lesson whose SHA-256 matches an existing
+// memory file is dropped as a duplicate (the plan: "a lesson whose SHA-256
+// matches an existing lesson is dropped"). The memory dir is pre-populated
+// with a file named <sha256>.txt for the lesson; the writer must NOT write it
+// again (the file count is unchanged, the summary reports it as a duplicate).
+func TestMemoryWriteDedupByHash(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	lesson := "internal/dedup/file.go: the cache key must include the namespace"
+	lessons := []string{lesson, lesson} // the same lesson twice
+	writeLessonsFile(t, ws, lessons)
+	// Pre-populate the memory dir with the lesson's sha256 file (it already
+	// exists in memory — the dedup must drop the new proposal).
+	sum := sha256.Sum256([]byte(lesson))
+	name := hex.EncodeToString(sum[:]) + ".txt"
+	if err := os.WriteFile(filepath.Join(mem, name), []byte(lesson+"\n"), 0o644); err != nil {
+		t.Fatalf("pre-populate: %v", err)
+	}
+	// Capture stdout (the bounded summary) by redirecting os.Stdout to a
+	// pipe (run prints the summary with fmt.Println, which writes to
+	// os.Stdout at call time).
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	code, err := runMemoryWrite(t, ws, mem, "succeeded")
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	summary := buf.String()
+	if code != 0 || err != nil {
+		t.Fatalf("run(succeeded) = (%d, %v); want (0, nil)", code, err)
+	}
+	// The pre-existing file is there; the writer did NOT write a second copy
+	// (both lessons are the same hash — both are duplicates of the
+	// pre-existing file). One file total.
+	files := readMemoryFiles(t, mem)
+	if len(files) != 1 {
+		t.Fatalf("memory dir has %d files (%v); want 1 (the duplicate is not re-written)", len(files), files)
+	}
+	// The content is unchanged (the original pre-populated file).
+	if got := files[name]; got != lesson {
+		t.Errorf("%s = %q; want the original lesson %q", name, got, lesson)
+	}
+	// The bounded summary reports written=0 (both lessons were duplicates of
+	// the pre-existing file — the dedup dropped them). THIS is the assertion
+	// the skip-dedup mutation breaks: with the dedup disabled, the writer
+	// re-writes the file (written=2), and the summary reports written=2
+	// dropped=0 — the assertion fails.
+	if !strings.Contains(summary, "summary: total=2 written=0 dropped=2") {
+		t.Errorf("summary does not report the dedup (written=0 dropped=2):\n%s", summary)
+	}
+	// Each lesson is reported as "dropped duplicate".
+	if c := strings.Count(summary, "dropped duplicate"); c != 2 {
+		t.Errorf("summary reports %d 'dropped duplicate' lines; want 2:\n%s", c, summary)
+	}
+}
+
+// TestMemoryWriteDedupSummary: the bounded summary reports a duplicate lesson
+// as "dropped duplicate" (the rule name is "duplicate").
+func TestMemoryWriteDedupSummary(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	lesson := "internal/dedup/summary.go: the audit trail must name the lesson hash"
+	lessons := []string{lesson, lesson}
+	writeLessonsFile(t, ws, lessons)
+	sum := sha256.Sum256([]byte(lesson))
+	name := hex.EncodeToString(sum[:]) + ".txt"
+	if err := os.WriteFile(filepath.Join(mem, name), []byte(lesson+"\n"), 0o644); err != nil {
+		t.Fatalf("pre-populate: %v", err)
+	}
+	code, err := runMemoryWrite(t, ws, mem, "succeeded")
+	if code != 0 || err != nil {
+		t.Fatalf("run(succeeded) = (%d, %v); want (0, nil)", code, err)
+	}
+	files := readMemoryFiles(t, mem)
+	if len(files) != 1 {
+		t.Fatalf("memory dir has %d files (%v); want 1", len(files), files)
 	}
 }

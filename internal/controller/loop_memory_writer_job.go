@@ -320,8 +320,23 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 					Labels: memoryWriterJobLabels(loop.Name),
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyNever,
-					ServiceAccountName: "default",
+					RestartPolicy: corev1.RestartPolicyNever,
+					// P5b: the memory-writer Job's DEDICATED ServiceAccount (the
+					// plan: "runs under a dedicated ServiceAccount with RBAC
+					// (get/list on the Loop, create on the Job's pods; no access
+					// to the operator's secrets)"). The Job does NO API access
+					// (it reads the lessons file from the workspace mount and
+					// writes to the memory PVC — both mounted volumes, no
+					// kubectl/API calls), so automountServiceAccountToken is false
+					// (no token is mounted: the Job CANNOT make API calls even if
+					// the SA's RBAC were broader — the "write from the operator
+					// pod" mutation is prevented by the dedicated SA + the no-token
+					// pod). The SA's Role (config/rbac/memory_writer_role.yaml)
+					// is the SA's documented intended scope (get/list on the
+					// Loop, create/get/list on the Job's pods) — NARROWER than the
+					// operator's manager-role (no Secrets, no PVC writes).
+					ServiceAccountName:           "coxswain-memory-writer",
+					AutomountServiceAccountToken: &memoryWriterFalse,
 					Containers: []corev1.Container{{
 						Name:            "memory-write",
 						Image:           r.memoryWriterImage(),

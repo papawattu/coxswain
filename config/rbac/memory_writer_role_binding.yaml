@@ -1,0 +1,19 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/managed-by: kustomize
+    coxswain.io/component: memory-writer
+  name: coxswain-memory-writer-rolebinding
+  namespace: system
+# P5b: binds the memory-writer Job's dedicated ServiceAccount to its dedicated
+# Role (the plan: "a dedicated ServiceAccount with the stated RBAC").
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coxswain-memory-writer-role
+subjects:
+  - kind: ServiceAccount
+    name: coxswain-memory-writer
+    namespace: system

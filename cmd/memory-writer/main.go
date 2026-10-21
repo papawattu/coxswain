@@ -151,19 +151,65 @@ func run(outcome string) (int, error) {
 	// a mis-invocation writes nothing).
 	survivors, reasons := screenLessons(lessons, eligibleOutcome)
 
-	// Write the eligible lessons to the memory PVC.
-	written, err := writeLessons(md, survivors)
+	// Write the eligible lessons to the memory PVC (files named by sha256;
+	// a lesson whose sha256 matches an existing file is dropped as a
+	// duplicate).
+	written, writtenNames, err := writeLessons(md, survivors)
 	if err != nil {
 		return 1, fmt.Errorf("write lessons to %s: %w", md, err)
 	}
 
-	// The bounded summary: total (len(lessons)), written (len(survivors)),
-	// dropped (total - written), and one line per lesson with its
-	// sha256-prefix, written|dropped, and rule. NEVER the lesson text.
+	// Mark the survivors that were NOT written (duplicates) as "dropped
+	// duplicate" in the per-lesson reasons (the summary reports them). A
+	// survivor that WAS written keeps its "" reason (written).
+	annotateDedup(lessons, reasons, writtenNames)
+
 	total := len(lessons)
 	dropped := total - written
 	emitSummary(summaryLines(lessons, reasons, total, written, dropped))
 	return 0, nil
+}
+
+// annotateDedup marks the survivors that were NOT written (duplicates) as
+// "dropped duplicate" in the reasons slice (the per-lesson drop reason for
+// the summary). The survivors are the input positions whose reason is ""
+// (Screen preserves input order; a screen-drop has a non-empty reason). For
+// each survivor, its sha256 file name is computed from the LESSON TEXT
+// (lessons[i]); if that name is NOT in writtenNames (the files actually
+// written), the lesson was a duplicate (its sha256 matched an existing file)
+// and its reason is set to "duplicate". A survivor that WAS written keeps its
+// "" reason (the summary reports it as "written").
+func annotateDedup(lessons, reasons []string, writtenNames []string) {
+	if len(writtenNames) == 0 && countSurvivors(reasons) == 0 {
+		return
+	}
+	writtenSet := make(map[string]bool, len(writtenNames))
+	for _, n := range writtenNames {
+		writtenSet[n] = true
+	}
+	for i := range reasons {
+		if reasons[i] != "" {
+			continue // screen-dropped (not a survivor)
+		}
+		// A survivor: compute its sha256 file name from the lesson text.
+		sum := sha256.Sum256([]byte(lessons[i]))
+		name := hex.EncodeToString(sum[:]) + ".txt"
+		if !writtenSet[name] {
+			reasons[i] = "duplicate"
+		}
+	}
+}
+
+// countSurvivors returns the number of lessons whose reason is "" (the
+// survivors).
+func countSurvivors(reasons []string) int {
+	n := 0
+	for _, r := range reasons {
+		if r == "" {
+			n++
+		}
+	}
+	return n
 }
 
 // summaryLines builds the bounded summary's lines (one line per lesson with
@@ -237,33 +283,66 @@ func screenLessons(lessons []string, eligibleOutcome bool) (survivors, reasons [
 	return survivors, reasons
 }
 
-// writeLessons writes each survivor to <memoryDir>/lesson-<n>.txt (n
-// zero-padded to 3 digits, in input order — lesson-001 < lesson-002 < ...).
-// It creates the directory if absent (the memory PVC is mounted at
-// /memory; a missing dir is a write failure — the mount is not writable).
-// Returns the number of lessons written.
-func writeLessons(dir string, survivors []string) (int, error) {
+// writeLessons writes each survivor to <memoryDir>/<sha256>.txt (the file is
+// named by the lesson's SHA-256 — the plan: "writes each curator-approved
+// lesson as one file named by its SHA-256"). It creates the directory if
+// absent (the memory PVC is mounted at /memory; a missing dir is a write
+// failure — the mount is not writable).
+//
+// Dedup (the plan: "a lesson whose SHA-256 matches an existing lesson is
+// dropped"): before writing, the existing files in the memory dir are listed;
+// a lesson whose sha256 matches an existing file's name (<sha256>.txt) is
+// dropped as "duplicate" (it is already in memory). The dedup is against the
+// FILE NAMES (which are the sha256), not the file contents (the content IS
+// the lesson; the name IS its hash).
+//
+// Returns (written, dupes, error). written is the number of lessons written;
+// dupes is the number of survivors that were dropped as duplicates (their
+// sha256 matched an existing file). The caller uses dupes to mark the
+// duplicate lessons in the summary.
+func writeLessons(dir string, survivors []string) (int, []string, error) {
 	if len(survivors) == 0 {
-		// Nothing to write (the screen dropped everything, or the runner
-		// proposed nothing): a valid zero-write. Ensure the dir is writable
-		// is NOT required (no file is written).
-		return 0, nil
+		return 0, nil, nil
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return 0, fmt.Errorf("mkdir %s: %w", dir, err)
+		return 0, nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	for i, lesson := range survivors {
+	// List the existing files (the dedup set: the sha256 names already in
+	// memory). A read failure of the dir is a write failure (the mount is
+	// not readable — treat it as a write error).
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, nil, fmt.Errorf("list %s: %w", dir, err)
+	}
+	existing := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		existing[e.Name()] = true
+	}
+	written := 0
+	writtenNames := make([]string, 0, len(survivors))
+	for _, lesson := range survivors {
+		sum := sha256.Sum256([]byte(lesson))
+		name := hex.EncodeToString(sum[:]) + ".txt"
+		if existing[name] {
+			// A lesson whose sha256 matches an existing file is a duplicate:
+			// dropped (the plan: "a lesson whose SHA-256 matches an existing
+			// lesson is dropped"). The summary reports it as a duplicate drop.
+			continue
+		}
 		// The lesson is single-line (the screen enforces that) and ≤500
 		// chars (the size cap), so a single-line write is safe. A trailing
 		// newline is appended (the memory-reader reads the file's content;
 		// the trailing newline is a conventional text-file terminator and
 		// the reader trims it).
-		name := fmt.Sprintf("%s/lesson-%03d.txt", dir, i+1)
-		if err := os.WriteFile(name, []byte(lesson+"\n"), 0o644); err != nil {
-			return i, fmt.Errorf("write %s: %w", name, err)
+		path := dir + "/" + name
+		if err := os.WriteFile(path, []byte(lesson+"\n"), 0o644); err != nil {
+			return written, nil, fmt.Errorf("write %s: %w", name, err)
 		}
+		existing[name] = true
+		written++
+		writtenNames = append(writtenNames, name)
 	}
-	return len(survivors), nil
+	return written, writtenNames, nil
 }
 
 // shaPrefix returns the first shaPrefixLen hex chars of the lesson's

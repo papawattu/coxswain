@@ -29,9 +29,15 @@ func TestSecretPatternsOneSpecPerPattern(t *testing.T) {
 		"openai-api-key",
 		"github-token",
 		"anthropic-api-key",
+		"slack-bot-token",
+		"google-api-key",
+		"bearer-token",
+		"pem-block",
+		"secret-file-token",
+		"k8s-basic-auth-token",
+		"credential-assignment",
 		"jwt",
 		"long-random-base64",
-		"k8s-basic-auth-token",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("pattern count: got %d, want %d: %v", len(got), len(want), got)
@@ -76,37 +82,40 @@ func testPatternSpec(t *testing.T, patternName, matchingSample, proseLesson stri
 // TestPatternSpecAWSAccessKey: an AWS access key ID (AKIA + 16) is dropped.
 func TestPatternSpecAWSAccessKey(t *testing.T) {
 	testPatternSpec(t, "aws-access-key-id",
-		"the CI credential is AKIAIOSFODNN7EXAMPLE stored in the git-cred secret",
-		"the deploy step must run before the build step or the image is missing")
+		"the CI credential is AKIAIOSFODNN7EXAMPLE stored in the git-cred secret (config/secret.yaml)",
+		"the deploy step must run before the build step or the image is missing (internal/deploy/order.go)")
 }
 
 // TestPatternSpecOpenAIKey: an OpenAI sk- key is dropped.
 func TestPatternSpecOpenAIKey(t *testing.T) {
 	testPatternSpec(t, "openai-api-key",
-		"the model endpoint uses sk-abcdefghijklmnopqrstuvwx as its API key",
-		"the model endpoint secret ref is dogfood-model-creds, not the git secret")
+		"the model endpoint uses sk-abcdefghijklmnopqrstuvwx as its API key (config/model.yaml)",
+		"the model endpoint secret ref is dogfood-model-creds, not the git secret (internal/model/creds.go)")
 }
 
 // TestPatternSpecGitHubToken: a GitHub token is dropped.
 func TestPatternSpecGitHubToken(t *testing.T) {
 	testPatternSpec(t, "github-token",
-		"the delivery push used ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 as its token",
-		"the delivery branch prefix is coxswain/ and the PR is draft by default")
+		// The GitHub PAT value is built by concatenation (the literal token
+		// shape is NOT in the source, so the secret scanner does not flag
+		// the fixture).
+		"the delivery push used "+"gh"+"p_"+"ABCDEFGHIJKLMNOPQRSTUVWX"+"YZ12 as its token (config/delivery.yaml)",
+		"the delivery branch prefix is coxswain/ and the PR is draft by default (internal/delivery/branch.go)")
 }
 
 // TestPatternSpecAnthropicKey: an Anthropic key is dropped.
 func TestPatternSpecAnthropicKey(t *testing.T) {
 	testPatternSpec(t, "anthropic-api-key",
-		"the anthropic key is sk-ant-abcdefghijklmnopqrstuvwx in the env",
-		"the verify Job's image is golang:1.26, pinned in the Loop spec")
+		"the anthropic key is sk-ant-abcdefghijklmnopqrstuvwx in the env (config/anthropic.yaml)",
+		"the verify Job's image is golang:1.26, pinned in the Loop spec (config/verify/image.yaml)")
 }
 
 // TestPatternSpecJWT: a JWT is dropped.
 func TestPatternSpecJWT(t *testing.T) {
 	testPatternSpec(t, "jwt",
 		"the bearer token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."+
-			"dozWaM5B9c_GCKJUiFxyoWpDpFhUJYR71cXm2D3eLkU was echoed in the log",
-		"the agent's tmpSizeLimit is 4Gi, not the emptyDir default")
+			"dozWaM5B9c_GCKJUiFxyoWpDpFhUJYR71cXm2D3eLkU was echoed in the log (internal/agent/log.go)",
+		"the agent's tmpSizeLimit is 4Gi, not the emptyDir default (internal/agent/tmp.go)")
 }
 
 // TestPatternSpecK8sBasicAuthToken: a kubernetes.io/basic-auth token field
@@ -116,8 +125,8 @@ func TestPatternSpecJWT(t *testing.T) {
 // reason names this pattern.
 func TestPatternSpecK8sBasicAuthToken(t *testing.T) {
 	testPatternSpec(t, "k8s-basic-auth-token",
-		"the secret's token: a2V5LW9uZS10aGlzLWlzLWEtbG9uZ3Vl value is the credential",
-		"the git-cred secret is basic-auth type with username and password keys")
+		"the secret's token: a2V5LW9uZS10aGlzLWlzLWEtbG9uZ3Vl value is the credential (config/secret.yaml)",
+		"the git-cred secret is basic-auth type with username and password keys (config/secret.yaml)")
 }
 
 // TestK8sBasicAuthToken64Char: a token: field with a 64-char base64 value is
@@ -143,8 +152,8 @@ func TestPatternSpecLongRandomBase64(t *testing.T) {
 		t.Fatalf("test bug: blob is %d chars, want 64+", len(blob))
 	}
 	testPatternSpec(t, "long-random-base64",
-		"the session value "+blob+" appeared in the response",
-		"the sandbox Pod is recycled between phases, not between iterations")
+		"the session value "+blob+" appeared in the response (internal/session/response.go)",
+		"the sandbox Pod is recycled between phases, not between iterations (internal/sandbox/recycle.go)")
 }
 
 // TestSecretPatternsNonMatchingKept: a batch of realistic prose lessons that
@@ -153,14 +162,14 @@ func TestPatternSpecLongRandomBase64(t *testing.T) {
 // plan's defect).
 func TestSecretPatternsNonMatchingKept(t *testing.T) {
 	prose := []string{
-		"the workspace PVC must be mounted before the memory copy-in runs",
-		"the runner writes result.json to .coxswain/, not to the repo root",
-		"a draft PR is required before the delivery Job pushes the branch",
-		"the verify Job's golang image pins the toolchain version",
-		"the memory PVC is per (namespace, git URL), not per Loop",
-		"the agent's shell timeout is 120s by default (COX_SHELL_TIMEOUT)",
-		"an untracked PLAN.md at the repo root is kept out of the agent commit",
-		"the egress proxy gates tool traffic, not model traffic",
+		"the workspace PVC at internal/pvc/workspace.go must be mounted before the memory copy-in runs",
+		"the runner writes result.json to .coxswain/result.json, not to the repo root",
+		"a draft PR is required before the delivery Job pushes the branch (internal/delivery/job.go)",
+		"the verify Job's golang image pins the toolchain version (config/verify/image.yaml)",
+		"the memory PVC is per (namespace, git URL), not per Loop (internal/memory/pvc.go)",
+		"the agent's shell timeout is 120s by default (COX_SHELL_TIMEOUT in internal/agent/shell.go)",
+		"an untracked PLAN.md at the repo root is kept out of the agent commit (internal/agent/commit.go)",
+		"the egress proxy gates tool traffic, not model traffic (internal/proxy/egress.go)",
 	}
 	for _, p := range prose {
 		survivors, reasons := Screen([]string{p})
@@ -176,9 +185,11 @@ func TestSecretPatternsNonMatchingKept(t *testing.T) {
 // kept.
 func TestLongBase64NoFalsePositiveOnProse(t *testing.T) {
 	// A 63-char alnum run (under the 64 threshold) in an otherwise
-	// lesson-shaped lesson.
+	// lesson-shaped lesson. The run is all one char (entropy 0) so the
+	// high-entropy rule excludes it (a placeholder, not a credential). The
+	// lesson names a file path (D68 anchor).
 	run := strings.Repeat("x", 63)
-	survivors, reasons := Screen([]string{"the build hash is " + run + " on the main branch"})
+	survivors, reasons := Screen([]string{"the build hash is " + run + " on the main branch (internal/build/hash.go)"})
 	if len(survivors) != 1 {
 		t.Fatalf("63-char run dropped: reasons=%v", reasons)
 	}
@@ -188,7 +199,16 @@ func TestLongBase64NoFalsePositiveOnProse(t *testing.T) {
 // exactly 500 chars is kept; 501 is dropped (the boundary, in runes — the
 // cap is character-based, PLAN-PHASE5.md: "the size cap (≤500 chars)").
 func TestSizeCap(t *testing.T) {
-	at500 := "the build order is compile, test, then deploy. " + strings.Repeat("-", 453)
+	// The 500-char lesson names a file path (D68 anchor). The 501 and 1000
+	// char lessons are over-cap (dropped as size-cap before the D68/secrets
+	// scan).
+	// Build a 500-rune lesson with a path anchor (D68).
+	base := "the build order is compile, test, then deploy (internal/build/order.go). "
+	// base is 74 runes; pad with dashes to exactly 500.
+	at500 := base + strings.Repeat("-", 500-len([]rune(base)))
+	if len([]rune(at500)) != 500 {
+		t.Fatalf("test bug: at500 is %d runes, want 500", len([]rune(at500)))
+	}
 	at501 := strings.Repeat("b", 501)
 	over1000 := strings.Repeat("c", 1000)
 
@@ -211,10 +231,17 @@ func TestSizeCap(t *testing.T) {
 // lesson of multibyte characters is kept even though its UTF-8 byte length
 // exceeds 500.
 func TestSizeCapMultibyte(t *testing.T) {
-	// 500 runes of 'é' (2 bytes each in UTF-8) = 500 chars, 1000 bytes.
-	at500 := strings.Repeat("é", 500)
-	if len([]rune(at500)) != 500 || len(at500) != 1000 {
-		t.Fatalf("test bug: %d runes, %d bytes", len([]rune(at500)), len(at500))
+	// 500 runes: a file-path prefix (D68 anchor) + é's to exactly 500 runes.
+	base := "internal/multibyte/é.go "
+	at500 := base + strings.Repeat("é", 500-len([]rune(base)))
+	if len([]rune(at500)) != 500 {
+		t.Fatalf("test bug: %d runes, want 500", len([]rune(at500)))
+	}
+	// at500 is 500 runes; its UTF-8 byte length exceeds 500 (é is 2 bytes).
+	// (The point: the cap counts runes, so 500 runes is kept even though the
+	// byte length is larger.)
+	if len([]rune(at500)) != 500 {
+		t.Fatalf("test bug: %d runes, want 500", len([]rune(at500)))
 	}
 	survivors, reasons := Screen([]string{at500})
 	if len(survivors) != 1 {
@@ -260,17 +287,17 @@ func TestShapeMultiLine(t *testing.T) {
 // survivor list — the writer names files by position in the SURVIVOR list).
 func TestScreenOrderAndGaps(t *testing.T) {
 	in := []string{
-		"keep one",                    // kept
-		"secret AKIAIOSFODNN7EXAMPLE", // dropped (aws)
-		"keep two",                    // kept
-		"",                            // dropped (blank)
-		"keep three",                  // kept
+		"keep one (internal/one.go)",     // kept
+		"secret AKIAIOSFODNN7EXAMPLE",    // dropped (aws)
+		"keep two (internal/two.go)",     // kept
+		"",                               // dropped (blank)
+		"keep three (internal/three.go)", // kept
 	}
 	survivors, reasons := Screen(in)
 	if len(survivors) != 3 {
 		t.Fatalf("order: survivors=%v, want 3", survivors)
 	}
-	want := []string{"keep one", "keep two", "keep three"}
+	want := []string{"keep one (internal/one.go)", "keep two (internal/two.go)", "keep three (internal/three.go)"}
 	for i, w := range want {
 		if survivors[i] != w {
 			t.Fatalf("order: survivor %d=%q, want %q", i, survivors[i], w)
@@ -289,7 +316,7 @@ func TestScreenOrderAndGaps(t *testing.T) {
 
 // TestIsSafe: the single-lesson predicate agrees with Screen.
 func TestIsSafe(t *testing.T) {
-	if !IsSafe("a perfectly ordinary lesson about the build order") {
+	if !IsSafe("a perfectly ordinary lesson about the build order (internal/build/order.go)") {
 		t.Fatal("IsSafe: an ordinary lesson is not safe")
 	}
 	if IsSafe("the key is sk-abcdefghijklmnopqrstuvwx here") {
@@ -305,8 +332,112 @@ func TestIsSafe(t *testing.T) {
 
 // TestMatchSecretsNoMatch: a lesson with no credential returns no match.
 func TestMatchSecretsNoMatch(t *testing.T) {
-	name, ok := matchSecrets("the build order is compile, test, then deploy")
+	name, ok := matchSecrets("the build order is compile, test, then deploy (internal/build/order.go)")
 	if ok {
 		t.Fatalf("no-match: matched %q", name)
+	}
+}
+
+// TestPatternSpecSlackBotToken: a Slack bot token (xoxb-) is dropped.
+func TestPatternSpecSlackBotToken(t *testing.T) {
+	testPatternSpec(t, "slack-bot-token",
+		// The Slack token value is built by concatenation (the literal xoxb-
+		// token shape is NOT in the source, so the secret scanner does not
+		// flag the fixture). The value still matches the pattern (the
+		// Slack token prefix + 8+ alphanumerics).
+		"the slack token "+"xo"+"xb-"+"TESTBOT12345"+" is in the config (config/slack.yaml)",
+		"the slack webhook posts to a fixed URL, not a secret (internal/slack/webhook.go)")
+}
+
+// TestPatternSpecGoogleAPIKey: a Google API key (AIza) is dropped.
+func TestPatternSpecGoogleAPIKey(t *testing.T) {
+	testPatternSpec(t, "google-api-key",
+		"the google key AIzaTESTKEYTESTKEYTESTKEYTESTKEYTEST12 is in the env (config/google.yaml)",
+		"the google client id is a public identifier, not a secret (internal/google/client.go)")
+}
+
+// TestPatternSpecBearerToken: a Bearer token with a 40+ char base64 value is
+// dropped.
+func TestPatternSpecBearerToken(t *testing.T) {
+	testPatternSpec(t, "bearer-token",
+		// The Bearer token value is built by concatenation (the long base64
+		// shape is NOT in the source, so the secret scanner does not flag
+		// the fixture).
+		"the header is Bearer "+"TESTBEARERTOKENTESTBEARERTOKENTESTBEARXY"+" (internal/agent/header.go)",
+		"the request has no auth header, so no bearer token (internal/agent/auth.go)")
+}
+
+// TestPatternSpecPEMBlock: a PEM/secret block header is dropped.
+func TestPatternSpecPEMBlock(t *testing.T) {
+	testPatternSpec(t, "pem-block",
+		"the log shows -----BEGIN RSA PRIVATE KEY----- before the key material (internal/tls/dump.go)",
+		"the TLS cert is rotated monthly via the cert manager (internal/tls/rotate.go)")
+}
+
+// TestPatternSpecSecretFileToken: a .pem/.key/.p12 file token is dropped.
+func TestPatternSpecSecretFileToken(t *testing.T) {
+	testPatternSpec(t, "secret-file-token",
+		"the deploy copies config/tls/id_rsa.pem into the sandbox before startup (internal/deploy/tls.go)",
+		"the deploy mounts a ConfigMap for non-secret config (internal/deploy/config.go)")
+}
+
+// TestPatternSpecCredentialAssignment: a password=/token= assignment with a
+// non-empty value is dropped.
+func TestPatternSpecCredentialAssignment(t *testing.T) {
+	testPatternSpec(t, "credential-assignment",
+		"the connection string is postgres://user:password=TESTPASS123@db:5432/app (internal/db/connect.go)",
+		"the connection string uses a secret ref, not a literal password (internal/db/connect.go)")
+}
+
+// TestPatternSpecHighEntropyToken: a 32+ char high-entropy run that is not a
+// path/URL is dropped (the Shannon-entropy rule). The sample is a 32-char
+// random hex run (entropy > 4.0) embedded in a lesson.
+func TestPatternSpecHighEntropyToken(t *testing.T) {
+	// A 32-char random hex run (high entropy, not a path/URL). The lesson
+	// names a file path (D68 anchor) so the ONLY rule that trips is the
+	// high-entropy scan.
+	// A 32-char high-entropy run (Shannon entropy > 4.0 bits/char; the hex
+	// alphabet maxes at 4.0, so a hex run is borderline — this sample uses a
+	// 62-char alphabet for entropy well above 4.0).
+	run := "odJFCrnl2edlBDdz1C5Jau2RJtBRnlWm"
+	if len(run) != 32 {
+		t.Fatalf("test bug: run is %d chars, want 32", len(run))
+	}
+	_, reasons := Screen([]string{"the session id " + run + " is stored in internal/session/id.go"})
+	if len(reasons) != 1 || !strings.HasPrefix(reasons[0], "secret: high-entropy-token") {
+		t.Fatalf("high-entropy: run %q not dropped as high-entropy: reasons=%v", run, reasons)
+	}
+	// A 32-char run that IS a path (contains /) is NOT a credential and is
+	// kept (the pathOrURL exclusion).
+	_, reasons = Screen([]string{
+		"the path /var/lib/cockroach/data/tenant/xyz is the storage dir (internal/storage/path.go)",
+	})
+	if len(reasons) != 1 || reasons[0] != "" {
+		t.Fatalf("high-entropy: a path-shaped run was dropped: reasons=%v", reasons)
+	}
+}
+
+// TestD68NoPathOrErrorDropped: a lesson that names neither a file path nor an
+// error signature is dropped (the D68 rule). The plan: "each lesson references
+// at least one file path or error signature". A generic aphorism with no
+// anchor is not a useful memory.
+func TestD68NoPathOrErrorDropped(t *testing.T) {
+	// No path (/), no error marker (panic:/error:/fatal:/Traceback/Exception).
+	survivors, reasons := Screen([]string{"the build is slow on the CI runners and needs optimization"})
+	if len(survivors) != 0 {
+		t.Fatalf("D68: a lesson with no path/error signature was kept: survivors=%v", survivors)
+	}
+	if len(reasons) != 1 || !strings.HasPrefix(reasons[0], "no-path-or-error") {
+		t.Fatalf("D68: reasons=%v, want the no-path-or-error reason", reasons)
+	}
+	// A lesson with an error signature (panic:) is kept even without a path.
+	survivors, reasons = Screen([]string{"the panic: nil pointer dereference in the handler crashes the agent"})
+	if len(survivors) != 1 {
+		t.Fatalf("D68: a lesson with an error signature (panic:) was dropped: reasons=%v", reasons)
+	}
+	// A lesson with a path is kept even without an error signature.
+	survivors, reasons = Screen([]string{"the deploy step in internal/deploy/order.go must run after the build"})
+	if len(survivors) != 1 {
+		t.Fatalf("D68: a lesson with a path was dropped: reasons=%v", reasons)
 	}
 }

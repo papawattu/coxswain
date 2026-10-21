@@ -75,7 +75,7 @@ var secretsPatterns = []struct {
 	// xoxb- token shape) so the secret scanner does not flag the pattern
 	// definition as a real token.
 	{"slack-bot-token", regexp.MustCompile(`\b` + "xo" + "xb" + `-[A-Za-z0-9-]{8,}\b`)},
-	// Google API key / client-id prefix: the 4-char Google prefix (AIza) 
+	// Google API key / client-id prefix: the 4-char Google prefix (AIza)
 	// followed by at least 30 alphanumerics + underscores. The plan's named
 	// prefix (2). The bare AIza prefix is safe to write literally (the secret
 	// scanner flags AIza + a 30-char key shape, not the 4-char prefix), so it

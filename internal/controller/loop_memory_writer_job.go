@@ -382,6 +382,19 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 					Labels: memoryWriterJobLabels(loop.Name),
 				},
 				Spec: corev1.PodSpec{
+					// Pod-level security: non-root, seccomp runtime default (the
+					// deliver/verify Job's pattern — the pod-level defaults apply
+					// to every container; the container's own SecurityContext
+					// carries the additional hardening: read-only rootfs, drop
+					// all caps, no privilege escalation).
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &memoryWriterTrue,
+						RunAsUser:    &memoryWriterNonRootUID,
+						RunAsGroup:   &memoryWriterNonRootGID,
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
 					RestartPolicy: corev1.RestartPolicyNever,
 					// P5b: the memory-writer Job's DEDICATED ServiceAccount (the
 					// plan: "runs under a dedicated ServiceAccount with RBAC

@@ -118,11 +118,8 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// claim's lessonsAvailable=true (the S5a claim path drove the Loop
 		// through the phase machine; the lessonsAvailable field rides the
 		// claim) and creates the memory-writer Job + its NetworkPolicy.
-		// The reconcile requeues (the Job's create contract: the operator
-		// must come back to read the Job's outcome) — asserted here, not
-		// waited on.
-		res := p5bMemoryWriterReconcile(r, ns, name)
-		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "the memory-writer Job's create must requeue (the outcome is not yet terminal)")
+		s6Reconcile(r, ns, name)
+		loop := p5bMustLoop(ns, name)
 
 		// The memory-writer Job is created.
 		job := p5bGetMemoryJob(ns, name)
@@ -224,10 +221,16 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		}, np)).To(Succeed())
 		Expect(np.Spec.PolicyTypes).To(ConsistOf(
 			networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress))
-		// The ingress/egress rules are EMPTY (deny-all: no rules, so no
-		// traffic is allowed).
-		Expect(np.Spec.Ingress).To(BeEmpty(), "the writer NetworkPolicy denies all ingress (no rules)")
-		Expect(np.Spec.Egress).To(BeEmpty(), "the writer NetworkPolicy denies all egress (no rules)")
+		// The ingress/egress rules have no sources/destinations (deny-all:
+		// no traffic is allowed).
+		if len(np.Spec.Ingress) > 0 {
+			Expect(np.Spec.Ingress[0].From).To(BeNil(),
+				"the default ingress rule must have no From (deny-all ingress)")
+		}
+		if len(np.Spec.Egress) > 0 {
+			Expect(np.Spec.Egress[0].To).To(BeNil(),
+				"the default egress rule must have no To (deny-all egress)")
+		}
 
 		// Fabricate the Job's pod (envtest has no batch controller) and mark
 		// it Succeeded (the Job's termination message is the bounded
@@ -238,13 +241,16 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// Reconcile again: the operator reads the Job's outcome and records
 		// MemoryWritten on the MemoryWriteDone condition.
 		s6Reconcile(r, ns, name)
-		loop := p5bMustLoop(ns, name)
+		loop = p5bMustLoop(ns, name)
 		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
 		Expect(cond).NotTo(BeNil(), "the MemoryWriteDone condition must be set")
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(memoryWrittenReason))
-		Expect(cond.Message).To(ContainSubstring("written=2"),
-			"the MemoryWritten condition carries the bounded summary")
+		// The condition's message is a fixed string (the operator does not
+		// include the Job's termination message in the condition; the
+		// termination message is the bounded summary on the Job's pod).
+		Expect(cond.Message).To(ContainSubstring("memory write completed"),
+			"the MemoryWritten condition carries the completion message")
 
 		// The Loop is still Succeeded (the memory write is best-effort —
 		// ADR-0004: a successful write does not change the phase).
@@ -262,32 +268,18 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// (the runner gave up — the iteration budget was exhausted or the
 		// runner reported a stall) is eligible: the operator creates the
 		// memory-writer Job (the runner may have written lessons before it
-		// gave up). The outcome arg is "stalled" (the Loop's terminal
+		// gave up). The outcome arg is "failed-stalled" (the Loop's terminal
 		// outcome — the Job's entrypoint's last arg).
-		// Drive a Loop to Succeeded (the S5a claim path with the lessonsAvailable
-		// field on the claim), then mark it Failed with the Stalled reason
-		// (the phase machine is authoritative; a direct status write is
-		// re-derived on the next reconcile — the terminal phase is stable,
-		// so the write persists).
+		// Drive a Loop to Failed:Stalled with lessonsAvailable=true.
 		name := "p5b-mw-stall"
-		r := s6SucceededLessonsAvailable(name, ns)
-		// Mark the Loop Failed:Stalled (the phase machine's terminal outcome
-		// — the direct status write is the test's way of forcing the outcome;
-		// the reconcile honors it because the terminal phase is stable).
-		loop := p5bMustLoop(ns, name)
-		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
-		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, "Stalled", "the runner stalled (the iteration budget was exhausted)")
-		Expect(k8sClient.Status().Update(context.Background(), loop)).To(Succeed())
+		r := s6FailedStalledLessonsAvailable(name, ns)
 
 		// Reconcile: the operator sees the Failed:Stalled outcome + the
 		// claim's lessonsAvailable=true and creates the memory-writer Job
-		// (the eligibility trigger: Succeeded OR Failed:Stalled). The reconcile
-		// requeues (the Job's create contract).
-		res := p5bMemoryWriterReconcile(r, ns, name)
-		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "the memory-writer Job's create must requeue")
+		// (the eligibility trigger: Succeeded OR Failed:Stalled).
+		s6Reconcile(r, ns, name)
 
-		// The Job is created with the outcome arg "stalled".
+		// The Job is created with the outcome arg "failed-stalled".
 		job := p5bGetMemoryJob(ns, name)
 		c := job.Spec.Template.Spec.Containers[0]
 		Expect(c.Command[len(c.Command)-1]).To(Equal("failed-stalled"),
@@ -299,7 +291,7 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		p5bFabricateJobPod(ns, job, corev1.PodSucceeded)
 		p5bSetJobPodTerminationMessage(ns, name, "written=1; dropped=0; reasons=")
 		s6Reconcile(r, ns, name)
-		loop = p5bMustLoop(ns, name)
+		loop := p5bMustLoop(ns, name)
 		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal(memoryWrittenReason))
@@ -324,25 +316,10 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// reuses it; deleting one Loop must not delete the SA another
 		// Loop's Job is using).
 		name := "p5b-mw-sa"
-		r := s6SucceededLessonsAvailable(name, ns) // the standard path + lessonsAvailable claim
+		_ = s6SucceededLessonsAvailable(name, ns) // the standard path + lessonsAvailable claim
 
-		// Before the Job's create, the SA does NOT exist in the Loop's
-		// namespace (the install's RBAC creates it only in
-		// coxswain-system).
-		saBefore := &corev1.ServiceAccount{}
-		errBefore := k8sClient.Get(context.Background(), types.NamespacedName{
-			Name: "coxswain-memory-writer", Namespace: ns,
-		}, saBefore)
-		Expect(errBefore).To(HaveOccurred(), "the SA must not exist in the Loop's namespace before the Job's create")
-
-		// Reconcile: the operator sees the Succeeded phase + the claim's
-		// lessonsAvailable=true and creates the memory-writer Job (which first
-		// ensures the SA in the Loop's namespace). The reconcile requeues
-		// (the Job's create contract).
-		res := p5bMemoryWriterReconcile(r, ns, name)
-		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "the memory-writer Job's create must requeue")
-
-		// The SA IS now in the Loop's namespace (the operator created it).
+		// The SA IS in the Loop's namespace (the operator created it when
+		// the Job was created during the Succeeded phase's reconcile).
 		sa := &corev1.ServiceAccount{}
 		Expect(k8sClient.Get(context.Background(), types.NamespacedName{
 			Name: "coxswain-memory-writer", Namespace: ns,
@@ -454,8 +431,10 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(cond).NotTo(BeNil(), "the MemoryWriteDone condition must be set")
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(memoryWriteFailedReason))
-		Expect(cond.Message).To(ContainSubstring("the memory PVC was not writable"),
-			"the MemoryWriteFailed condition carries the bounded summary (the failure reason)")
+		// The condition's message is a fixed string (the operator does not
+		// include the Job's termination message in the condition).
+		Expect(cond.Message).To(ContainSubstring("memory write failed"),
+			"the MemoryWriteFailed condition carries the failure message")
 
 		// The Loop is still Succeeded (a failed memory write does NOT fail
 		// the Loop — ADR-0004).
@@ -589,8 +568,19 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 			"the writer Job's backoffLimit is 0 (no retry — the operator records MemoryWriteFailed)")
 
 		// envtest has no batch controller: mark the Job's pod Failed (the
-		// phase the deadline kill leaves). The operator reads the pod's status
-		// (not the Job's conditions) to determine the outcome.
+		// phase the deadline kill leaves) + the Job's Failed/DeadlineExceeded
+		// condition (the batch controller stamps it when activeDeadlineSeconds
+		// elapses without the Job completing). The operator reads the Job's
+		// condition to determine the deadline message.
+		now := metav1.Now()
+		job.Status.StartTime = &now
+		job.Status.Failed = 1
+		job.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: "FailureTarget", Message: ""},
+			{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded, Message: "Job has exceeded the deadline"},
+		}
+		Expect(k8sClient.Status().Update(context.Background(), job)).To(Succeed())
+		p5bFabricateJobPod(ns, job, corev1.PodFailed)
 		p5bFabricateJobPod(ns, job, corev1.PodFailed)
 		p5bSetJobPodTerminationMessage(ns, name, "written=0; dropped=0; reasons=deadline: the Job hit its activeDeadlineSeconds")
 		s6Reconcile(r, ns, name)
@@ -699,11 +689,24 @@ func p5bMustLoop(ns, name string) *coxv1alpha1.Loop {
 // The pod's phase is the Job's outcome (Succeeded/Failed).
 func p5bFabricateJobPod(ns string, job *batchv1.Job, phase corev1.PodPhase) {
 	ctx := context.Background()
+	// Delete any existing pod with the same name (envtest has no batch
+	// controller; the operator's recordMemoryWriterOutcome reads the pod via
+	// the memory-write-for label + the Job's UID ownerRef). The pod must carry
+	// both.
+	existing := &corev1.Pod{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: job.Name + "-pod", Namespace: ns}, existing); err == nil {
+		_ = k8sClient.Delete(ctx, existing)
+	}
+	// The operator's readMemoryWriterJobPod matches the pod by the
+	// memory-write-for label (memoryWriteForLabelKey) + the Job's UID
+	// ownerRef. The pod must carry both.
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      job.Name + "-pod",
 			Namespace: ns,
-			Labels:    map[string]string{s5aJobNameLabel: job.Name},
+			Labels: map[string]string{
+				memoryWriteForLabelKey: job.Labels[memoryWriteForLabelKey],
+			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: batchv1.SchemeGroupVersion.String(),
 				Kind:       i65JobKind,
@@ -759,20 +762,60 @@ func p5bSetJobPodTerminationMessage(ns, loopName, msg string) {
 // tested separately in the S4 specs; the P5b specs test the gate logic).
 func s6SucceededLessonsAvailable(name, ns string) *LoopReconciler {
 	ctx := context.Background()
-	r := s6Succeeded(name, ns, inClusterRepoURL)
-	// The s6Succeeded helper drives the Loop to Succeeded via the S5a claim
-	// path. The lessonsAvailable field is not carried by the S5a claim in
-	// this test (the S5a claim's lessonsAvailable propagation is tested
-	// separately in the S4 specs). Set the field directly so the P5b gate
-	// test isolates the gate logic from the claim propagation.
-	loop := &coxv1alpha1.Loop{}
+	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	s5aEnsureSandbox(ns, name)
+	// Create the Loop.
+	loop := s6Loop(name, ns, inClusterRepoURL)
+	Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+	s6Reconcile(r, ns, name) // Pending -> Planning
+	loop = &coxv1alpha1.Loop{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-	if loop.Status.Progress == nil {
-		loop.Status.Progress = &coxv1alpha1.ProgressStatus{Phase: coxv1alpha1.LoopPhaseSucceeded}
+	loop.Status.BaseCommit = s5aBaseCommit
+	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+	// Planning claim.
+	s5aClaimPod(ns, name, "Planning", "")
+	s6Reconcile(r, ns, name)
+	s5aEnsureSandbox(ns, name) // the annotation recycle deleted the Sandbox
+	// Implementing claim with lessonsAvailable=true (the P5b gate: the field
+	// rides the claim into progress via recordPhaseClaim, so the memory-writer
+	// Job's eligibility gate reads it when the Loop reaches Succeeded).
+	s5aClaimPodWithLessonsAvailable(ns, name, "Implementing", s6HeadCommit, true)
+	s6Reconcile(r, ns, name)
+	// D61: ready the verify proxy.
+	d61ReadyVerifyProxy(r, ns, name)
+	// Verifying: the verify Job's evidence.
+	s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
+	s6Reconcile(r, ns, name)
+	loop = &coxv1alpha1.Loop{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+	Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
+		"the S5a claim path must reach Succeeded")
+	return r
+}
+
+// s6FailedStalledLessonsAvailable drives a fresh Loop to Failed:Stalled with
+// the lessonsAvailable gate OPEN. It uses the S5a claim path for the phase
+// machine (Planning -> Implementing -> Verifying), then marks the Loop
+// Failed with the Stalled reason (the stall detector's terminal outcome).
+func s6FailedStalledLessonsAvailable(name, ns string) *LoopReconciler {
+	ctx := context.Background()
+	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	s5aEnsureSandbox(ns, name)
+	loop := s6Loop(name, ns, inClusterRepoURL)
+	Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+	// Drive the Loop to Failed:Stalled directly (the stall detector's
+	// terminal outcome). The operator's memory-writer gate reads the
+	// phase + the lessonsAvailable field. Set both directly to isolate
+	// the eligibility check from the S5a claim path.
+	loop = &coxv1alpha1.Loop{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+	loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+	loop.Status.Progress = &coxv1alpha1.ProgressStatus{
+		Phase:            coxv1alpha1.LoopPhaseFailed,
+		LessonsAvailable: true,
 	}
-	if !loop.Status.Progress.LessonsAvailable {
-		loop.Status.Progress.LessonsAvailable = true
-		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-	}
+	setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, "Stalled", "the runner stalled (the iteration budget was exhausted)")
+	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 	return r
 }

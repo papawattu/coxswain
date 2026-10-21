@@ -374,6 +374,8 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 						WorkingDir: "/",
 						SecurityContext: &corev1.SecurityContext{
 							RunAsNonRoot:             &memoryWriterTrue,
+							RunAsUser:                &memoryWriterNonRootUID,
+							RunAsGroup:               &memoryWriterNonRootGID,
 							ReadOnlyRootFilesystem:   &memoryWriterTrue,
 							AllowPrivilegeEscalation: &memoryWriterFalse,
 							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -650,6 +652,18 @@ func setMemoryWriterCondition(loop *coxv1alpha1.Loop, reason, message string) {
 var (
 	memoryWriterTrue  = true
 	memoryWriterFalse = false
+)
+
+// memoryWriterNonRootUID / memoryWriterNonRootGID are the writer Job
+// container's runAsUser/runAsGroup (65532 — the nonroot UID the operator
+// image is built with, USER 65532:65532; the deliver/verify Jobs and the
+// sandbox set the same UID on the same image). RunAsNonRoot alone rejects
+// the image at pod admission ("image will run as root") because the image
+// manifest carries no USER; the explicit UID/GID make the run user
+// explicit.
+var (
+	memoryWriterNonRootUID = int64(65532)
+	memoryWriterNonRootGID = int64(65532)
 )
 
 // reconcileP5bMemoryWriter is the Reconcile's P5b step (the memory-writer Job +

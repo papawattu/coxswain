@@ -179,29 +179,46 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
 	})
 
-	It("creates the memory-writer Job's dedicated ServiceAccount (the plan's dedicated SA with the stated RBAC)", func() {
-		// The memory-writer Job's dedicated SA (config/rbac/
-		// memory_writer_service_account.yaml) is installed with the
-		// operator (the RBAC kustomization). The envtest does not load the
-		// RBAC manifests, so this spec CREATES the SA in the test namespace
-		// (the operator's RBAC kustomization would create it in the operator's
-		// namespace; the Job's pod references it by name in the LOOP's
-		// namespace — the SA must exist in the Loop's namespace for the pod
-		// to be scheduled. The operator's install creates the SA in the
-		// operator's namespace; for the Job's namespace, the SA is created
-		// by the install's RBAC (a cluster-scoped install puts it in the
-		// operator's namespace; a namespaced install puts it in the target
-		// namespace). For the spec, create it in the test ns.)
-		sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
-			Name:      "coxswain-memory-writer",
-			Namespace: ns,
-		}}
-		Expect(k8sClient.Create(context.Background(), sa)).To(Succeed(),
-			"the dedicated memory-writer ServiceAccount must be creatable in the Loop's namespace")
-		// The SA exists (the plan: "a spec asserts the ServiceAccount exists").
-		got := &corev1.ServiceAccount{}
-		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: "coxswain-memory-writer", Namespace: ns}, got)).To(Succeed())
-		Expect(got.Name).To(Equal("coxswain-memory-writer"))
+	It("ensures the memory-writer Job's dedicated ServiceAccount in the Loop's namespace (the operator creates it; the Job's pod runs under it)", func() {
+		// The memory-writer Job runs in the LOOP's namespace under the
+		// dedicated ServiceAccount (coxswain-memory-writer). The install's SA
+		// (config/rbac) is in the operator's namespace (coxswain-system), so
+		// the SA does NOT exist in the Loop's namespace by default — a Job
+		// that references a missing SA cannot create its pod. The operator
+		// ENSURES the SA in the Loop's namespace (automountServiceAccountToken:
+		// false, NO RoleBinding — the Job's binary makes no API calls). The SA
+		// is NOT owned by the Loop (shared per namespace — deleting one Loop
+		// must not delete the SA another Loop's Job is using).
+		//
+		// Drive the Loop to Succeeded + reconcile: the operator creates the
+		// Job (which references the SA) AND ensures the SA in the Loop's
+		// namespace.
+		name := "p5b-mw-sa"
+		r := s6Succeeded(name, ns, inClusterRepoURL)
+		s6Reconcile(r, ns, name)
+
+		// The SA exists in the Loop's namespace (the operator ensured it).
+		sa := &corev1.ServiceAccount{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{
+			Name: "coxswain-memory-writer", Namespace: ns,
+		}, sa)).To(Succeed(), "the operator must ensure the memory-writer SA in the Loop's namespace")
+		Expect(sa.Name).To(Equal("coxswain-memory-writer"))
+
+		// The SA has automountServiceAccountToken: false (no token mounted —
+		// the Job makes no API calls).
+		automount := sa.AutomountServiceAccountToken
+		Expect(automount).NotTo(BeNil(), "automountServiceAccountToken must be set on the ensured SA")
+		Expect(*automount).To(BeFalse(), "the ensured SA must NOT mount a service-account token")
+
+		// The SA is NOT owned by the Loop (shared per namespace — no
+		// ownerReference; deleting the Loop does not GC the SA).
+		Expect(sa.OwnerReferences).To(BeEmpty(),
+			"the memory-writer SA must have no ownerReference (it is shared per namespace, not owned by one Loop)")
+
+		// The Job was created (it references the SA) + the SA exists before
+		// the Job's pod is created (the pod's serviceAccountName resolves).
+		job := p5bGetMemoryJob(ns, name)
+		Expect(job.Spec.Template.Spec.ServiceAccountName).To(Equal("coxswain-memory-writer"))
 	})
 
 	It("does NOT create the memory-writer Job for a non-qualifying terminal reason (MemoryWriteSkipped)", func() {

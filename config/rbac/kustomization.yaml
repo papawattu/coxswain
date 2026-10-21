@@ -7,13 +7,6 @@ resources:
 - service_account.yaml
 - role.yaml
 - role_binding.yaml
-# P5b: the memory-writer Job's dedicated ServiceAccount + Role +
-# RoleBinding (the plan: a dedicated SA with minimal RBAC, no access to the
-# operator's secrets). The Job's pod sets automountServiceAccountToken: false
-# (the binary makes no API calls).
-- memory_writer_service_account.yaml
-- memory_writer_role.yaml
-- memory_writer_role_binding.yaml
 - leader_election_role.yaml
 - leader_election_role_binding.yaml
 # The following RBAC configurations are used to protect

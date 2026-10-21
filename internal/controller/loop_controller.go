@@ -556,6 +556,14 @@ type LoopReconciler struct {
 // the verbs the code uses: Get (idempotency + foreign guard), Create (ensure),
 // Update (facts changed), Delete (cleanup when delivery is no longer expected).
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;delete
+// P5b: the operator ensures the memory-writer Job's dedicated ServiceAccount
+// in the Loop's namespace (ensureMemoryWriterServiceAccount — the Job runs in
+// the Loop's namespace, but the install's SA is in the operator's namespace;
+// a Job that references a missing SA cannot create its pod). Only the verbs
+// the code uses: Get (idempotency), Create (ensure). The SA is NOT owned by
+// the Loop (shared per namespace) and has NO RoleBinding (the Job's pod is
+// no-token — automountServiceAccountToken: false — so it makes no API calls).
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create
 
 // agentPoliciesValid runs the C6a AgentPolicy validation gate: when the
 // referenced AgentPolicies are invalid it sets PolicyValid=False and suspends

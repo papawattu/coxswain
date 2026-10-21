@@ -275,6 +275,20 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 		return false, fmt.Errorf("get memory-writer job %s: %w", jobName, err)
 	}
 
+	// The memory-writer Job runs in the LOOP's namespace under the dedicated
+	// ServiceAccount (coxswain-memory-writer). The SA does NOT exist in the
+	// Loop's namespace by default (the install's RBAC creates it in the
+	// operator's namespace, coxswain-system). The operator ENSURES the SA in
+	// the Loop's namespace (automountServiceAccountToken: false, NO
+	// RoleBinding — the Job's binary makes no API calls) so the Job's pod can
+	// be created (a Job that references a missing SA cannot create its pod).
+	// The SA is NOT owned by the Loop (it is shared per namespace — a second
+	// Loop in the same namespace reuses it; deleting one Loop must not delete
+	// the SA another Loop's Job is using).
+	if err := r.ensureMemoryWriterServiceAccount(ctx, loop.Namespace); err != nil {
+		return false, fmt.Errorf("ensure memory-writer serviceaccount in %s: %w", loop.Namespace, err)
+	}
+
 	// Create the Job (the operator-controlled memory-write entrypoint) + the
 	// NetworkPolicy (deny-all). The Job is owned by the Loop.
 	job := r.buildMemoryWriterJob(loop, pvcName, outcomeArg)
@@ -459,6 +473,58 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 	}
 	if err := r.Create(ctx, denyAll); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create memory-writer netpol %s: %w", name, err)
+	}
+	return nil
+}
+
+// memoryWriterServiceAccountName is the dedicated ServiceAccount the
+// memory-writer Job's pod runs under (the plan: "a dedicated ServiceAccount
+// with the stated RBAC" — the Job makes no API calls; the SA's RBAC is the
+// Job's intended scope, but automountServiceAccountToken: false means no
+// token is mounted, so the Job CANNOT make API calls even if the SA's RBAC
+// were broader). The SA is created in the LOOP's namespace by the operator
+// (ensureMemoryWriterServiceAccount) — NOT owned by the Loop (it is shared
+// per namespace: a second Loop in the same namespace reuses it; deleting one
+// Loop must not delete the SA another Loop's Job is using). There is NO
+// RoleBinding in the Loop's namespace (the Job needs no API access; the
+// install's Role/RoleBinding in the operator's namespace is unused by the
+// Job and is dropped — the Job's no-token pod is the security boundary).
+const memoryWriterServiceAccountName = "coxswain-memory-writer"
+
+// ensureMemoryWriterServiceAccount creates (idempotently) the dedicated
+// ServiceAccount in the given namespace (the Loop's namespace) so the
+// memory-writer Job's pod can be created (a Job that references a missing SA
+// cannot create its pod). The SA has automountServiceAccountToken: false
+// (no token mounted — the Job makes no API calls). It is NOT owned by any
+// Loop (shared per namespace; no ownerReference, so deleting a Loop does not
+// GC it). Returns an error only on a genuine failure (not AlreadyExists).
+func (r *LoopReconciler) ensureMemoryWriterServiceAccount(ctx context.Context, namespace string) error {
+	sa := &corev1.ServiceAccount{}
+	err := r.Get(ctx, types.NamespacedName{Name: memoryWriterServiceAccountName, Namespace: namespace}, sa)
+	if err == nil {
+		return nil // the SA exists (a previous Loop in this namespace created it)
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get memory-writer serviceaccount %s/%s: %w", namespace, memoryWriterServiceAccountName, err)
+	}
+	// The SA does not exist: create it. automountServiceAccountToken: false
+	// (no token mounted — the Job makes no API calls). No ownerReference
+	// (shared per namespace — deleting one Loop must not delete the SA
+	// another Loop's Job is using).
+	noAutomount := false
+	saToCreate := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      memoryWriterServiceAccountName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				labelPartOf:                   partOfCoxswain,
+				"app.kubernetes.io/component": "memory-writer",
+			},
+		},
+		AutomountServiceAccountToken: &noAutomount,
+	}
+	if err := r.Create(ctx, saToCreate); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create memory-writer serviceaccount %s/%s: %w", namespace, memoryWriterServiceAccountName, err)
 	}
 	return nil
 }

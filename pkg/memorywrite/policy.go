@@ -75,11 +75,12 @@ var secretsPatterns = []struct {
 	// xoxb- token shape) so the secret scanner does not flag the pattern
 	// definition as a real token.
 	{"slack-bot-token", regexp.MustCompile(`\b` + "xo" + "xb" + `-[A-Za-z0-9-]{8,}\b`)},
-	// Google API key / client-id prefix: the 4-char Google prefix (built by
-	// concatenation so the secret scanner does not flag the literal key
-	// shape) followed by at least 30 alphanumerics + underscores. The
-	// plan's named prefix (2).
-	{"google-api-key", regexp.MustCompile(`\b` + "AI" + "za" + `[A-Za-z0-9_-]{30,}\b`)},
+	// Google API key / client-id prefix: the 4-char Google prefix (AIza) 
+	// followed by at least 30 alphanumerics + underscores. The plan's named
+	// prefix (2). The bare AIza prefix is safe to write literally (the secret
+	// scanner flags AIza + a 30-char key shape, not the 4-char prefix), so it
+	// is grep-able (the reviewer's P2: the AIza prefix must be present).
+	{"google-api-key", regexp.MustCompile(`\bAIza[A-Za-z0-9_-]{30,}\b`)},
 	// A Bearer token with a 40+ char base64 value: "Bearer
 	// <40+ base64>" (a JWT echoed as a bearer token, an OAuth access token).
 	// The plan's named pattern (1): "Bearer <40+ base64>". The base64 run is

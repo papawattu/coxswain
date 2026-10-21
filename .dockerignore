@@ -5,8 +5,6 @@
 !cmd
 !api
 !internal
-!pkg
-!pkg/**/*.go
 !**/*.go
 **/*_test.go
 !go.mod

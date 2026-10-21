@@ -54,7 +54,7 @@ func importedRootModulePackages(t *testing.T, root string) map[string]bool {
 		t.Fatalf("go list -deps ./cmd: %v (stderr: %s)", err, err)
 	}
 	pkgs := make(map[string]bool)
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, modulePath) {
 			pkgs[line] = true
@@ -87,7 +87,7 @@ func dockerignoreIncludesPkg(t *testing.T, root string) bool {
 		t.Fatalf("read .dockerignore: %v", err)
 	}
 	reIncludesPkg := regexp.MustCompile(`(?m)^!\s*pkg(\s*$|/|\s)`)
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		// The exception must include pkg/ : "!pkg", "!pkg/**", "!pkg/**/*",
 		// or "!pkg/...". A comment (#) or an exclusion (no !) does not count.

@@ -139,6 +139,15 @@ type PhaseClaim struct {
 	// which matches a fresh Loop's status.planAttempt (also 0) — the guard is
 	// a no-op for runners that do not echo the marker.
 	PlanAttempt int `json:"planAttempt,omitempty"`
+	// P5b (PLAN-PHASE5.md: "the claim carries only a lessonsAvailable boolean
+	// (present on disk)"): true when the runner wrote .coxswain/lessons.json on
+	// the workspace volume for this run. The lessons FILE is the transport;
+	// this boolean is the operator's gate input for the memory-writer Job (the
+	// Job is created only for a terminal Loop whose claim says lessons are
+	// present — no retroactive writes for old terminal Loops that produced no
+	// lessons). An absent field (pre-P5b runners) is false: no lessons
+	// proposed, no writer Job.
+	LessonsAvailable bool `json:"lessonsAvailable,omitempty"`
 }
 
 // pausedConditionResumeTime returns the LastTransitionTime of the Paused
@@ -241,6 +250,20 @@ func parsePhaseClaim(msg string) (*PhaseClaim, error) {
 			return nil, fmt.Errorf("claim.planAttempt is negative: %d", pa)
 		}
 		claim.PlanAttempt = pa
+	}
+	// P5b: lessonsAvailable, when present, must be a boolean (the runner's
+	// no-lessons report: the .coxswain/lessons.json file's presence on the
+	// workspace). An absent field (pre-P5b runners) is false — the SAME
+	// shape as a current runner's honest no-lessons report (the operator
+	// cannot distinguish the two; both are "no lessons file this run"),
+	// which is exactly the gate's contract: the field rides the claim
+	// (strict-JSON parse, like headCommit/planChanged), and the memory-writer
+	// Job's eligibility reads the claim's field (persisted into
+	// status.progress), not the operator's own inference.
+	if v, ok := raw["lessonsAvailable"]; ok {
+		if err := json.Unmarshal(v, &claim.LessonsAvailable); err != nil {
+			return nil, fmt.Errorf("claim.lessonsAvailable is not a boolean: %w", err)
+		}
 	}
 	claim.ObservedPhase = coxv1alpha1.LoopPhase(op)
 	// Review P3: the claimed phase must be one the runner can claim
@@ -468,6 +491,16 @@ func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1
 		LastResultStatus: claim.Status,
 		BlockedReason:    claim.BlockedReason,
 		PlanAttempt:      claim.PlanAttempt,
+	// P5b: the claim's lessonsAvailable boolean (the writer Job's gate
+	// input) rides into progress like the other claim-derived fields. When
+	// progress was NOT rewritten this advance (the claim-derived fields were
+	// unchanged — e.g. a no-op Succeeded claim after the phase already moved,
+	// which is all the lessonsAvailable-only claim does), the existing
+	// progress record's field is updated in place: the gate reads the LATEST
+	// claim's field, and a stale record (the Implementing claim's, which
+	// never carried the field) must not mask a current claim's honest
+	// no-lessons report (the retroactive-write protection depends on it).
+	LessonsAvailable: claim.LessonsAvailable,
 	}
 	if loop.Status.Progress == nil || !progressEqual(loop.Status.Progress, p) {
 		// Copy the operator's pins onto the new progress record.
@@ -475,6 +508,14 @@ func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1
 		p.BaseCommit = loop.Status.BaseCommit
 		loop.Status.Progress = p
 		changed = true
+	} else {
+		// The claim-derived fields are unchanged (no progress rewrite) but the
+		// lessonsAvailable gate input still has to reflect the latest claim
+		// (the field rides the claim, and a stale record must not mask it).
+		if loop.Status.Progress.LessonsAvailable != claim.LessonsAvailable {
+			loop.Status.Progress.LessonsAvailable = claim.LessonsAvailable
+			changed = true
+		}
 	}
 	// B1 + OS8: advance one step when the claim names the immediate-next
 	// phase AND the gate allows it (option B: the gate always allows).
@@ -623,7 +664,7 @@ func progressEqual(a, b *coxv1alpha1.ProgressStatus) bool {
 	}
 	return a.Phase == b.Phase && a.LastResultStatus == b.LastResultStatus &&
 		a.BlockedReason == b.BlockedReason && a.Iteration == b.Iteration &&
-		a.PlanAttempt == b.PlanAttempt
+		a.PlanAttempt == b.PlanAttempt && a.LessonsAvailable == b.LessonsAvailable
 }
 
 // advancePhaseFromClaim (S4) reads the runner's ADR-0004 claim from the

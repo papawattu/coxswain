@@ -113,7 +113,10 @@ const memoryWriterConditionType = "MemoryWriteDone"
 //     Succeeds, ADR-0004, but the condition + a Warning Event surface it).
 //   - MemoryWriteSkipped: the Loop did not end in a qualifying outcome
 //     (a non-terminal phase, or a terminal reason other than Succeeded /
-//     Failed:Stalled — the eligibility rule; the Job is not created).
+//     Failed:Stalled — the eligibility rule; the Job is not created) or the
+//     Loop's claim did not carry lessonsAvailable=true (the runner proposed
+//     no lessons into the workspace file — the plan's gate: no retroactive
+//     writes for terminal Loops that never produced lessons).
 const (
 	memoryWrittenReason      = "MemoryWritten"
 	memoryWriteFailedReason  = "MemoryWriteFailed"
@@ -248,6 +251,20 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 		return false, nil
 	}
 
+	// The lessonsAvailable gate (the plan: "the claim carries only a
+	// lessonsAvailable boolean (present on disk)"): a qualifying terminal
+	// Loop whose runner proposed no lessons (the claim's lessonsAvailable is
+	// false — or the pre-P5b claim field is absent) gets NO writer Job. Without
+	// this check the operator creates writer Jobs for OLD terminal Loops that
+	// never produced lessons (the kind finding: retroactive writes for the
+	// dogfood3/5/7 Loops by an earlier build, whose writer pods hung in
+	// CreateContainerConfigError).
+	if loop.Status.Progress != nil && !loop.Status.Progress.LessonsAvailable {
+		setMemoryWriterCondition(loop, memoryWriteSkippedReason,
+			"memory write skipped: the Loop's claim did not report lessons (lessonsAvailable is false — the runner wrote no lessons file)")
+		return false, nil
+	}
+
 	// The memory PVC name (P5a: memory-<url-hash>, keyed by (namespace,
 	// git URL)). A repo-less Loop has no memory PVC; the write is skipped
 	// (the eligibility outcome is recorded as skipped — the Job cannot
@@ -307,7 +324,25 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 	return true, nil
 }
 
-// buildMemoryWriterJobSpec returns the Job spec: a single hardened container
+// memoryWriterJobDeadlineSeconds is the writer Job's activeDeadlineSeconds
+// (the hung-writer-pod fix, reviewer P1 round 4): a writer pod stuck in
+// CreateContainerConfigError (or any other non-terminating state) must FAIL
+// the Job after this deadline (the batch controller fails it with reason
+// DeadlineExceeded) so the operator records MemoryWriteFailed. Without it
+// the Job runs forever, the operator keeps requeueing, and the failure is
+// never surfaced (the kind finding: old writer pods sat 6h40m+ with no
+// MemoryWriteFailed condition).
+const memoryWriterJobDeadlineSeconds = int64(300)
+
+// memoryWriterJobBackoffLimit is the writer Job's backoffLimit: the Job runs
+// once (a failed write is not retried — the operator records
+// MemoryWriteFailed; a retry would re-read the same lessons file and re-write
+// the same files — idempotent but pointless, and the plan does not ask for
+// retries). A non-zero backoffLimit would let the batch controller restart
+// the pod after a failure and mask the failed write.
+const memoryWriterJobBackoffLimit = int32(0)
+
+// buildMemoryWriterJob returns the Job spec: a single hardened container
 // (the operator-controlled memory-write entrypoint) that reads the lessons
 // file from the workspace PVC (read-only at /workspace), screens it, and
 // writes the eligible lessons to the memory PVC (read-write at /memory).
@@ -316,7 +351,12 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 // writable mount (the readOnly rootfs makes the PVC the sole write target),
 // and the workspace PVC is mounted READ-ONLY.
 func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, outcomeArg string) *batchv1.Job {
-	backoff := int32(0) // the Job runs once (a failed write is not retried: the operator records MemoryWriteFailed; a retry would re-read the same lessons file and re-write the same files — idempotent but pointless, and the plan does not ask for retries).
+	// The Job runs once with a bounded lifetime (the hung-writer-pod fix):
+	// activeDeadlineSeconds fails a stuck pod (reason DeadlineExceeded — the
+	// operator records MemoryWriteFailed), backoffLimit 0 means a failed pod
+	// is terminal (the operator records MemoryWriteFailed; no retry).
+	deadline := memoryWriterJobDeadlineSeconds
+	backoff := memoryWriterJobBackoffLimit
 	// The termination message path (the bounded summary — the operator reads
 	// it from the Job's pod's container status). The path is the operator's
 	// constant (no user input, so it is unquoted in the entrypoint script).
@@ -328,7 +368,8 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 			Labels:    memoryWriterJobLabels(loop.Name),
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit: &backoff,
+			BackoffLimit:          &backoff,
+			ActiveDeadlineSeconds: &deadline,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: memoryWriterJobLabels(loop.Name),
@@ -559,7 +600,12 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 	// The Job's terminal state (the batch Job's conditions: Complete or
 	// Failed). The pod's phase is the authoritative signal (the Job's
 	// conditions are updated by the batch controller after the pod
-	// terminates).
+	// terminates). The Job's own conditions are the direct record of a
+	// deadline fail: the activeDeadlineSeconds kill (reason DeadlineExceeded
+	// — the hung-writer-pod fix) is a Job-level condition the batch
+	// controller stamps when the pod never became terminal; the condition's
+	// message names the deadline so the review sees the hang.
+	deadlineExceeded := jobHasConditionReason(job, batchv1.JobFailed, batchv1.JobReasonDeadlineExceeded)
 	podPhase := pod.Status.Phase
 	switch podPhase {
 	case corev1.PodSucceeded:
@@ -570,8 +616,16 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 		return false
 	case corev1.PodFailed:
 		// The Job's pod failed: a write failure. Record MemoryWriteFailed +
-		// a Warning Event (the Loop still Succeeds, ADR-0004).
+		// a Warning Event (the Loop still Succeeds, ADR-0004). When the
+		// failure is the activeDeadlineSeconds deadline (reason
+		// DeadlineExceeded — the hung-writer-pod fix: a pod stuck in
+		// CreateContainerConfigError etc. that the deadline killed), the
+		// condition's message names the deadline so the review sees the
+		// hang, not just a generic failure.
 		msg := "memory write failed (the Job's pod failed; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
+		if deadlineExceeded {
+			msg = "memory write failed (the Job hit its activeDeadlineSeconds deadline — the pod never became terminal; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
+		}
 		setMemoryWriterCondition(loop, memoryWriteFailedReason, msg)
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
@@ -627,6 +681,22 @@ func (r *LoopReconciler) readMemoryWriterJobPod(ctx context.Context, loop *coxv1
 func podOwnedByJobUID(pod *corev1.Pod, jobUID types.UID) bool {
 	for i := range pod.OwnerReferences {
 		if pod.OwnerReferences[i].UID == jobUID && pod.OwnerReferences[i].Kind == "Job" {
+			return true
+		}
+	}
+	return false
+}
+
+// jobHasConditionReason reports whether the Job's status carries the given
+// condition type (ConditionTrue) with the given reason (the deadline-fail
+// detection: Failed/DeadlineExceeded — the batch controller stamps it when
+// activeDeadlineSeconds elapses without the Job completing). An absent
+// condition is false (the envtest specs stamp the condition themselves
+// because envtest has no batch controller).
+func jobHasConditionReason(job *batchv1.Job, condType batchv1.JobConditionType, reason string) bool {
+	for i := range job.Status.Conditions {
+		c := &job.Status.Conditions[i]
+		if c.Type == condType && c.Status == corev1.ConditionTrue && c.Reason == reason {
 			return true
 		}
 	}

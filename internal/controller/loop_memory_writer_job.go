@@ -253,15 +253,22 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 
 	// The lessonsAvailable gate (the plan: "the claim carries only a
 	// lessonsAvailable boolean (present on disk)"): a qualifying terminal
-	// Loop whose runner proposed no lessons (the claim's lessonsAvailable is
-	// false — or the pre-P5b claim field is absent) gets NO writer Job. Without
-	// this check the operator creates writer Jobs for OLD terminal Loops that
-	// never produced lessons (the kind finding: retroactive writes for the
-	// dogfood3/5/7 Loops by an earlier build, whose writer pods hung in
+	// Loop gets a writer Job ONLY when its claim reported lessonsAvailable
+	// true. Every other terminal Loop — the runner proposed no lessons
+	// (the claim's lessonsAvailable is false), or the field is absent
+	// (no progress record yet — a terminal phase the phase machine reached
+	// without a claim that carried the field) — gets NO writer Job. The
+	// strict form (a nil progress is not a gate input) prevents retroactive
+	// writes for OLD terminal Loops that never produced lessons (the kind
+	// finding: the dogfood3/5/7 writer pods hung in
 	// CreateContainerConfigError).
-	if loop.Status.Progress != nil && !loop.Status.Progress.LessonsAvailable {
+	if loop.Status.Progress == nil || !loop.Status.Progress.LessonsAvailable {
+		reason := "the Loop's claim did not report lessons (lessonsAvailable is false or absent — the runner wrote no lessons file)"
+		if loop.Status.Progress == nil {
+			reason = "the Loop has no progress record carrying a lessonsAvailable claim (no claim reported lessons)"
+		}
 		setMemoryWriterCondition(loop, memoryWriteSkippedReason,
-			"memory write skipped: the Loop's claim did not report lessons (lessonsAvailable is false — the runner wrote no lessons file)")
+			"memory write skipped: "+reason)
 		return false, nil
 	}
 

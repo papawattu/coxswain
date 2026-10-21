@@ -148,6 +148,36 @@ func s5aClaimPod(ns, name, phase, head string) {
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
+// s5aClaimPodWithLessonsAvailable is s5aClaimPod with an explicit
+// lessonsAvailable boolean in the claim (the P5b field: the runner's report
+// that it wrote .coxswain/lessons.json on the workspace volume). The field
+// rides the claim into progress via the S4 phase machine's recordPhaseClaim,
+// so the memory-writer Job's eligibility gate reads it.
+func s5aClaimPodWithLessonsAvailable(ns, name, phase, head string, lessonsAvailable bool) {
+	ctx := context.Background()
+	nn := types.NamespacedName{Name: name + "-sandbox", Namespace: ns}
+	existing := &corev1.Pod{}
+	if !apierrors.IsNotFound(k8sClient.Get(ctx, nn, existing)) {
+		Expect(k8sClient.Delete(ctx, existing)).To(Succeed())
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-sandbox", Namespace: ns},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: s3StandinImage}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	msg := `{"observedPhase":"` + phase + `","status":"success","blockedReason":""`
+	if head != "" {
+		msg += `,"headCommit":"` + head + `"`
+	}
+	msg += `,"lessonsAvailable":` + map[bool]string{true: "true", false: "false"}[lessonsAvailable]
+	msg += `}`
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: agentContainerName, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0, Message: msg}}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
 // s5aClaimPodWithIteration is s5aClaimPod with an explicit iteration marker
 // in the claim (the .coxswain/iteration the operator's phase-init wrote when
 // the pod was created; the runner echoes it into the claim). Used to plant a

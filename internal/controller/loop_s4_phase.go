@@ -491,16 +491,16 @@ func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1
 		LastResultStatus: claim.Status,
 		BlockedReason:    claim.BlockedReason,
 		PlanAttempt:      claim.PlanAttempt,
-	// P5b: the claim's lessonsAvailable boolean (the writer Job's gate
-	// input) rides into progress like the other claim-derived fields. When
-	// progress was NOT rewritten this advance (the claim-derived fields were
-	// unchanged — e.g. a no-op Succeeded claim after the phase already moved,
-	// which is all the lessonsAvailable-only claim does), the existing
-	// progress record's field is updated in place: the gate reads the LATEST
-	// claim's field, and a stale record (the Implementing claim's, which
-	// never carried the field) must not mask a current claim's honest
-	// no-lessons report (the retroactive-write protection depends on it).
-	LessonsAvailable: claim.LessonsAvailable,
+		// P5b: the claim's lessonsAvailable boolean (the writer Job's gate
+		// input) rides into progress like the other claim-derived fields. When
+		// progress was NOT rewritten this advance (the claim-derived fields were
+		// unchanged — e.g. a no-op Succeeded claim after the phase already moved,
+		// which is all the lessonsAvailable-only claim does), the existing
+		// progress record's field is updated in place: the gate reads the LATEST
+		// claim's field, and a stale record (the Implementing claim's, which
+		// never carried the field) must not mask a current claim's honest
+		// no-lessons report (the retroactive-write protection depends on it).
+		LessonsAvailable: claim.LessonsAvailable,
 	}
 	if loop.Status.Progress == nil || !progressEqual(loop.Status.Progress, p) {
 		// Copy the operator's pins onto the new progress record.

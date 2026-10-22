@@ -157,7 +157,7 @@ func TestCuratorNoChoices(t *testing.T) {
 	// The response has an empty choices array: treated as unparseable.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"choices":[]}`)
+		_, _ = fmt.Fprint(w, `{"choices":[]}`)
 	}))
 	defer srv.Close()
 

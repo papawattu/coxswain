@@ -468,7 +468,7 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 						},
 						TerminationMessagePath:   termMsgPath,
 						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
-						Env: r.memoryWriterEnvVars(loop, termMsgPath),
+						Env:                      r.memoryWriterEnvVars(loop, termMsgPath),
 						VolumeMounts: []corev1.VolumeMount{
 							// The workspace PVC (READ-ONLY — the Job reads the
 							// lessons file but never writes the workspace).
@@ -555,7 +555,7 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 					// carries the label coxswain.io/proxy-for: <loop>.
 					To: []networkingv1.NetworkPolicyPeer{{
 						NamespaceSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{"kubernetes.io/metadata.name": loop.Namespace},
+							MatchLabels: map[string]string{kubeNSLabelKey: loop.Namespace},
 						},
 						PodSelector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},

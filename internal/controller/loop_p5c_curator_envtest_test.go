@@ -135,7 +135,7 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		// The proxy-allow rule: to the model proxy pod (same namespace,
 		// label coxswain.io/proxy-for: <loop>).
 		allowRule := np.Spec.Egress[1]
-		Expect(len(allowRule.To)).To(Equal(1))
+		Expect(allowRule.To).To(HaveLen(1))
 		peer := allowRule.To[0]
 		Expect(peer.NamespaceSelector).NotTo(BeNil())
 		Expect(peer.NamespaceSelector.MatchLabels).To(HaveKeyWithValue(

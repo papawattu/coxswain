@@ -101,7 +101,9 @@ func (c *Client) Judge(ctx context.Context, lesson string) Verdict {
 		return Verdict{Keep: false, Reason: "curator unparseable (marshal error)"}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(reqBody),
+	)
 	if err != nil {
 		return Verdict{Keep: false, Reason: "curator unavailable (request error)"}
 	}

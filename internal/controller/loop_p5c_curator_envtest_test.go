@@ -22,8 +22,8 @@ package controller
 
 import (
 	"context"
-
 	"encoding/json"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -129,13 +129,17 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		npName := name + "-memory-write-netpol"
 		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: npName, Namespace: ns}, np)).To(Succeed())
 
-		// The egress rules: the first is a blank rule (deny all), the second
-		// allows egress to the model proxy pod.
-		Expect(len(np.Spec.Egress)).To(BeNumerically(">", 1),
-			"the NetworkPolicy must have a blank egress rule (deny all) + a proxy-allow rule")
+		// The desired policy (F16 + P5c): NO ingress rules (deny-all ingress)
+		// and EXACTLY ONE egress rule — the proxy-allow (the curator call).
+		// A blank egress rule {} would match everything — ALLOW all — the
+		// opposite of the ADR-0007 fence.
+		Expect(np.Spec.Ingress).To(BeEmpty(),
+			"the NetworkPolicy must have NO ingress rules (deny-all ingress)")
+		Expect(np.Spec.Egress).To(HaveLen(1),
+			"the NetworkPolicy must have EXACTLY ONE egress rule (the proxy-allow; a blank rule {} would allow all)")
 		// The proxy-allow rule: to the model proxy pod (same namespace,
 		// label coxswain.io/proxy-for: <loop>).
-		allowRule := np.Spec.Egress[1]
+		allowRule := np.Spec.Egress[0]
 		Expect(allowRule.To).To(HaveLen(1))
 		peer := allowRule.To[0]
 		Expect(peer.NamespaceSelector).NotTo(BeNil())
@@ -201,31 +205,10 @@ var _ = Describe("P5c negative lesson (Phase 5, PLAN-PHASE5.md slice P5c)", func
 		// prepends it to the runner's lessons (the seed flows through the
 		// static rules + the curator exactly like the runner's lessons).
 		name := "p5c-stall-fail"
-		// Drive to Succeeded (the memory-writer's base path: the Job is
-		// created for a Succeeded Loop with lessonsAvailable=true).
-		_ = s6SucceededLessonsAvailable(name, ns)
-		// Override the Loop to a terminal Failed:Stalled stall (the trigger:
-		// only Succeeded or Failed:Stalled qualifies) with stallHistory (the
-		// stall signature the negative lesson is composed from).
-		loop := p5bMustLoop(ns, name)
-		loop.Status.Phase = coxs.LoopPhaseFailed
-		loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
-			Type:    string(coxs.LoopPhaseFailed),
-			Status:  metav1.ConditionTrue,
-			Reason:  "Stalled",
-			Message: "stall detector fired: 3 consecutive identical verify failures",
-		})
-		loop.Status.StallHistory = []coxs.StallEntry{{
-			Iteration:            1,
-			JobName:              name + "-verify-1",
-			Hash:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			NormalisationVersion: "1",
-			Check:                loopCheckCmd,
-		}}
-		Expect(k8sClient.Status().Update(context.Background(), loop)).To(Succeed())
+		rr := s6FailedStalledLessonsAvailable(name, ns)
 		// The reconcile that creates the memory-writer Job runs in the
 		// terminal phase's handler (the Failed:Stalled trigger).
-		s6Reconcile(r, ns, name)
+		s6Reconcile(rr, ns, name)
 		job := p5bGetMemoryJob(ns, name)
 		c := job.Spec.Template.Spec.Containers[0]
 		envNames := map[string]string{}
@@ -257,28 +240,13 @@ var _ = Describe("P5c negative lesson (Phase 5, PLAN-PHASE5.md slice P5c)", func
 		// Fail/Pause, off for Continue"). The Job's COX_SEEDED_LESSONS is
 		// absent (the Job sees no seed).
 		name := "p5c-stall-continue"
-		loop := s6Loop(name, ns, inClusterRepoURL)
+		_ = s6FailedStalledLessonsAvailable(name, ns)
+		// Override the Loop's stallAction to Continue (the plan: off for
+		// Continue — even a terminal Failed:Stalled Loop under a Continue
+		// stall does not seed).
+		loop := p5bMustLoop(ns, name)
 		loop.Spec.Loop.StallAction = coxs.StallActionContinue
-		Expect(k8sClient.Create(context.Background(), loop)).To(Succeed())
-		// Drive to a terminal Failed:Stalled outcome (the stall gate fires).
-		// s6SucceededLessonsAvailable drives a fresh Loop to Succeeded; here
-		// we create the Loop with stallAction=Continue and drive it to
-		// Failed:Stalled directly (the trigger).
-		loop.Status.Phase = coxs.LoopPhaseFailed
-		loop.Status.Conditions = []metav1.Condition{{
-			Type:    string(coxs.LoopPhaseFailed),
-			Status:  metav1.ConditionTrue,
-			Reason:  "Stalled",
-			Message: "stall detector fired: 3 consecutive identical verify failures",
-		}}
-		loop.Status.StallHistory = []coxs.StallEntry{{
-			Iteration:            1,
-			JobName:              name + "-verify-1",
-			Hash:                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-			NormalisationVersion: "1",
-			Check:                loopCheckCmd,
-		}}
-		Expect(k8sClient.Status().Update(context.Background(), loop)).To(Succeed())
+		Expect(k8sClient.Update(context.Background(), loop)).To(Succeed())
 		s6Reconcile(r, ns, name)
 		job := p5bGetMemoryJob(ns, name)
 		c := job.Spec.Template.Spec.Containers[0]

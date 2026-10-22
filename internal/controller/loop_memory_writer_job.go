@@ -379,6 +379,19 @@ func (r *LoopReconciler) memoryWriterEnvVars(loop *coxv1alpha1.Loop, termMsgPath
 			corev1.EnvVar{Name: "COX_MODEL", Value: loop.Spec.Agent.Model},
 		)
 	}
+	// P5c: the negative lesson (the stall signature) is seeded on a terminal
+	// Failed:Stalled Loop with stallAction != Continue (PLAN.md:82: default
+	// on for Fail/Pause, off for Continue). The seed is operator-composed
+	// (the repeated verify-failure hash — NOT the agent's text) and is
+	// passed as COX_SEEDED_LESSONS (a JSON array) so the Job prepends it to
+	// the runner's lessons; the seed flows through the static rules + the
+	// curator exactly like the runner's lessons (the curator can drop it).
+	if text, ok := negativeLesson(loop); ok {
+		env = append(env, corev1.EnvVar{
+			Name:  "COX_SEEDED_LESSONS",
+			Value: seededLessonsEnvValue([]string{text}),
+		})
+	}
 	return env
 }
 

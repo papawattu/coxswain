@@ -645,6 +645,55 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
 		Expect(cond).To(BeNil(), "no MemoryWriteDone condition on a non-terminal phase")
 	})
+
+	It("updates a drifted (allow-all) existing NetworkPolicy to deny-all (F16)", func() {
+		// The P5b build created the memory-writer NetworkPolicy with
+		// Ingress: []NetworkPolicyIngressRule{{}} and
+		// Egress: []NetworkPolicyEgressRule{{}} (which ALLOWS all traffic).
+		// ensureMemoryWriterNetworkPolicy must UPDATE the drifted policy to
+		// the desired spec (no rules, both PolicyTypes) — not skip it.
+		name := "p5b-drifted"
+
+		// Pre-create the drifted (allow-all) policy BEFORE the reconcile
+		// that would create it. The policy is named <loop>-memory-write-netpol.
+		drifted := &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      memoryWriterNetPolName(name),
+				Namespace: ns,
+				Labels:    memoryWriterJobLabels(name),
+			},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{
+					MatchLabels: map[string]string{memoryWriteForLabelKey: name},
+				},
+				PolicyTypes: []networkingv1.PolicyType{
+					networkingv1.PolicyTypeIngress,
+					networkingv1.PolicyTypeEgress,
+				},
+				// Drifted: the P5b build's allow-all rules.
+				Ingress: []networkingv1.NetworkPolicyIngressRule{{}},
+				Egress:  []networkingv1.NetworkPolicyEgressRule{{}},
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), drifted)).To(Succeed())
+
+		// Drive the Loop to Succeeded with lessonsAvailable (the standard
+		// P5b path). The reconcile will call ensureMemoryWriterNetworkPolicy
+		// and see the existing (drifted) policy.
+		_ = s6SucceededLessonsAvailable(name, ns)
+
+		// After reconcile, the policy must be updated to deny-all (no rules).
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{
+			Name: memoryWriterNetPolName(name), Namespace: ns,
+		}, np)).To(Succeed())
+		Expect(np.Spec.Ingress).To(BeEmpty(),
+			"the drifted ingress rule must be removed (deny-all)")
+		Expect(np.Spec.Egress).To(BeEmpty(),
+			"the drifted egress rule must be removed (deny-all)")
+		Expect(np.Spec.PolicyTypes).To(ConsistOf(
+			networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress))
+	})
 })
 
 // p5bMemoryWriterReconcile drives a manual reconcile of the Loop and returns

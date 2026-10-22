@@ -220,16 +220,12 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		}, np)).To(Succeed())
 		Expect(np.Spec.PolicyTypes).To(ConsistOf(
 			networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress))
-		// The ingress/egress rules have no sources/destinations (deny-all:
-		// no traffic is allowed).
-		if len(np.Spec.Ingress) > 0 {
-			Expect(np.Spec.Ingress[0].From).To(BeNil(),
-				"the default ingress rule must have no From (deny-all ingress)")
-		}
-		if len(np.Spec.Egress) > 0 {
-			Expect(np.Spec.Egress[0].To).To(BeNil(),
-				"the default egress rule must have no To (deny-all egress)")
-		}
+		// Deny ALL: no Ingress or Egress rules (an empty rule {} would
+		// match everything — ALLOW all, the opposite of the ADR-0007 fence).
+		Expect(np.Spec.Ingress).To(BeEmpty(),
+			"the NetworkPolicy must have NO ingress rules (deny-all ingress)")
+		Expect(np.Spec.Egress).To(BeEmpty(),
+			"the NetworkPolicy must have NO egress rules (deny-all egress)")
 
 		// Fabricate the Job's pod (envtest has no batch controller) and mark
 		// it Succeeded (the Job's termination message is the bounded

@@ -521,8 +521,9 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{}},
-			Egress:  []networkingv1.NetworkPolicyEgressRule{{}},
+			// Deny ALL: PolicyTypes [Ingress, Egress] with no Ingress/Egress
+			// rules. An empty rule {} would MATCH everything (allow all),
+			// the opposite of the ADR-0007 fence.
 		},
 	}
 	// The NetPol is owned by the Loop (controller reference) so the apiserver

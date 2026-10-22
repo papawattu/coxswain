@@ -119,7 +119,6 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// through the phase machine; the lessonsAvailable field rides the
 		// claim) and creates the memory-writer Job + its NetworkPolicy.
 		s6Reconcile(r, ns, name)
-		loop := p5bMustLoop(ns, name)
 
 		// The memory-writer Job is created.
 		job := p5bGetMemoryJob(ns, name)
@@ -241,7 +240,7 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// Reconcile again: the operator reads the Job's outcome and records
 		// MemoryWritten on the MemoryWriteDone condition.
 		s6Reconcile(r, ns, name)
-		loop = p5bMustLoop(ns, name)
+		loop := p5bMustLoop(ns, name)
 		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
 		Expect(cond).NotTo(BeNil(), "the MemoryWriteDone condition must be set")
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))

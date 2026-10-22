@@ -357,6 +357,30 @@ const memoryWriterJobBackoffLimit = int32(0)
 // deliver/verify Job's container pattern); the memory PVC is the ONLY
 // writable mount (the readOnly rootfs makes the PVC the sole write target),
 // and the workspace PVC is mounted READ-ONLY.
+// memoryWriterEnvVars returns the Job container's env vars. The curator
+// env vars (COX_CURATOR_BASE_URL, COX_MODEL) are set only when the Loop has
+// a model (endpointSecretRef); without a model there is no proxy and the
+// curator is disabled (the Job writes all static-rule survivors — the P5b
+// behavior).
+func (r *LoopReconciler) memoryWriterEnvVars(loop *coxv1alpha1.Loop, termMsgPath string) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: "COX_SUMMARY_PATH", Value: termMsgPath},
+		{Name: "COX_LESSONS_PATH", Value: "/workspace/.coxswain/lessons.json"},
+		{Name: "COX_MEMORY_DIR", Value: "/memory"},
+	}
+	// P5c: the curator call goes to the Loop's model proxy (the same
+	// endpoint + Secret the runner uses; the proxy injects the API key).
+	// The curator is set only when the Loop has a model (endpointSecretRef);
+	// without a model there is no proxy and the curator is disabled.
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "COX_CURATOR_BASE_URL", Value: r.proxyServiceURL(loop.Name, loop.Namespace)},
+			corev1.EnvVar{Name: "COX_MODEL", Value: loop.Spec.Agent.Model},
+		)
+	}
+	return env
+}
+
 func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, outcomeArg string) *batchv1.Job {
 	// The Job runs once with a bounded lifetime (the hung-writer-pod fix):
 	// activeDeadlineSeconds fails a stuck pod (reason DeadlineExceeded — the
@@ -444,11 +468,7 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 						},
 						TerminationMessagePath:   termMsgPath,
 						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
-						Env: []corev1.EnvVar{
-							{Name: "COX_SUMMARY_PATH", Value: termMsgPath},
-							{Name: "COX_LESSONS_PATH", Value: "/workspace/.coxswain/lessons.json"},
-							{Name: "COX_MEMORY_DIR", Value: "/memory"},
-						},
+						Env: r.memoryWriterEnvVars(loop, termMsgPath),
 						VolumeMounts: []corev1.VolumeMount{
 							// The workspace PVC (READ-ONLY — the Job reads the
 							// lessons file but never writes the workspace).
@@ -489,11 +509,14 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 }
 
 // ensureMemoryWriterNetworkPolicy creates (idempotently) the memory-writer
-// Job's NetworkPolicy: denies ALL ingress and ALL egress for the Job's pod.
-// The writer Job makes NO network calls (it reads/writes local PVCs); the
-// deny-all egress is the ADR-0007 fence (a lesson must not be exfiltrated
-// during the write). The podSelector is the "coxswain.io/memory-write-for"
-// label (the Job stamps it on the pod template).
+// Job's NetworkPolicy: denies ALL ingress and ALL egress EXCEPT the model
+// proxy pod (the P5c curator call goes to the Loop's model proxy Service;
+// the proxy pod is identified by the coxswain.io/proxy-for label). The
+// writer Job's only network call is the curator's /v1/chat/completions POST
+// to the proxy; all other egress is denied (the ADR-0007 fence: a lesson
+// must not be exfiltrated during the write). The podSelector is the
+// "coxswain.io/memory-write-for" label (the Job stamps it on the pod
+// template).
 func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	name := memoryWriterNetPolName(loop.Name)
 	existing := &networkingv1.NetworkPolicy{}
@@ -504,9 +527,11 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get memory-writer netpol %s: %w", name, err)
 	}
-	// Deny ALL ingress and ALL egress (the writer Job makes no network
-	// calls; the deny-all is the fence). The podSelector is the
-	// memory-write-for label.
+	// Deny ALL ingress and ALL egress EXCEPT the model proxy pod (the P5c
+	// curator call). The blank egress rule `{}` denies all egress; the
+	// proxy-allow rule permits egress to the proxy pod (same namespace,
+	// label coxswain.io/proxy-for: <loop>). The proxy pod's label is set
+	// by buildProxyPod (the operator's per-Loop model proxy).
 	denyAll := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -522,7 +547,22 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 				networkingv1.PolicyTypeEgress,
 			},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{{}},
-			Egress:  []networkingv1.NetworkPolicyEgressRule{{}},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{}, // blank rule: deny all egress
+				{
+					// Allow egress to the model proxy pod (the P5c curator
+					// call). The proxy pod is in the same namespace and
+					// carries the label coxswain.io/proxy-for: <loop>.
+					To: []networkingv1.NetworkPolicyPeer{{
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"kubernetes.io/metadata.name": loop.Namespace},
+						},
+						PodSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
+						},
+					}},
+				},
+			},
 		},
 	}
 	// The NetPol is owned by the Loop (controller reference) so the apiserver

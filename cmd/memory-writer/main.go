@@ -33,12 +33,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 
+	"github.com/papawattu/coxswain/pkg/curator"
 	"github.com/papawattu/coxswain/pkg/memorywrite"
 )
 
@@ -81,6 +83,21 @@ func memoryDirFromEnv() string {
 // non-Job invocation) = stdout only.
 func summaryPathFromEnv() string {
 	return os.Getenv("COX_SUMMARY_PATH")
+}
+
+// curatorBaseURLFromEnv returns the COX_CURATOR_BASE_URL env var (the model
+// proxy's base URL for the curator call) or empty (the curator is disabled —
+// the Job runs without a model proxy, e.g. in the execution test). When
+// empty, the curator is skipped and all static-rule survivors are written
+// (the P5b behavior — the curator is a P5c addition).
+func curatorBaseURLFromEnv() string {
+	return os.Getenv("COX_CURATOR_BASE_URL")
+}
+
+// curatorModelFromEnv returns the COX_MODEL env var (the model name for the
+// curator call) or empty (the curator is disabled).
+func curatorModelFromEnv() string {
+	return os.Getenv("COX_MODEL")
 }
 
 func main() {
@@ -150,6 +167,35 @@ func run(outcome string) (int, error) {
 	// the Job on a qualifying outcome, but the Job enforces the rule too, so
 	// a mis-invocation writes nothing).
 	survivors, reasons := screenLessons(lessons, eligibleOutcome)
+
+	// P5c: the Memory Curator gate (ADR-0002). Only when ALL static rules
+	// pass (the survivors) does the curator judge each lesson. The curator
+	// call goes to the Loop's model proxy (COX_CURATOR_BASE_URL); a call
+	// failure drops the lesson ("curator unavailable"). The curator is
+	// disabled (COX_CURATOR_BASE_URL empty) in the execution test and in
+	// the P5b-only path (all static-rule survivors are written).
+	if curBase := curatorBaseURLFromEnv(); curBase != "" {
+		curModel := curatorModelFromEnv()
+		curClient := curator.NewClient(curBase, curModel)
+		curCtx := context.Background()
+		var curated []string
+		for _, s := range survivors {
+			v := curClient.Judge(curCtx, s)
+			if v.Keep {
+				curated = append(curated, s)
+			} else {
+				// The curator dropped this survivor: mark it in the reasons
+				// so the summary reports the drop reason.
+				for j := range lessons {
+					if lessons[j] == s && reasons[j] == "" {
+						reasons[j] = "curator: " + v.Reason
+						break
+					}
+				}
+			}
+		}
+		survivors = curated
+	}
 
 	// Write the eligible lessons to the memory PVC (files named by sha256;
 	// a lesson whose sha256 matches an existing file is dropped as a

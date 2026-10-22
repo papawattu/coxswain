@@ -496,18 +496,7 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 // label (the Job stamps it on the pod template).
 func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	name := memoryWriterNetPolName(loop.Name)
-	existing := &networkingv1.NetworkPolicy{}
-	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get memory-writer netpol %s: %w", name, err)
-	}
-	// Deny ALL ingress and ALL egress (the writer Job makes no network
-	// calls; the deny-all is the fence). The podSelector is the
-	// memory-write-for label.
-	denyAll := &networkingv1.NetworkPolicy{
+	desired := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: loop.Namespace,
@@ -521,9 +510,30 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{}},
-			Egress:  []networkingv1.NetworkPolicyEgressRule{{}},
+			// Deny ALL: PolicyTypes [Ingress, Egress] with no Ingress/Egress
+			// rules. An empty rule {} would MATCH everything (allow all),
+			// the opposite of the ADR-0007 fence.
 		},
+	}
+
+	existing := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
+	if err == nil {
+		// The policy exists: check for drift (the P5b build created it with
+		// Ingress/Egress [{}] which ALLOWS all traffic). If drifted, update
+		// to the desired spec.
+		drifted := len(existing.Spec.Ingress) != 0 || len(existing.Spec.Egress) != 0
+		if !drifted {
+			return nil // already correct
+		}
+		existing.Spec = desired.Spec
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("update drifted memory-writer netpol %s: %w", name, err)
+		}
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get memory-writer netpol %s: %w", name, err)
 	}
 	// The NetPol is owned by the Loop (controller reference) so the apiserver
 	// garbage-collects it when the Loop is deleted — the same way the
@@ -531,10 +541,10 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 	// buildMemoryWriterJob). Without the owner, the NetPol leaks on Loop
 	// delete (a standalone object the B1 finalizer does not clean up; the
 	// kind acceptance left p5b-df3c/df4-memory-write-netpol behind).
-	if err := controllerutil.SetControllerReference(loop, denyAll, r.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(loop, desired, r.Scheme); err != nil {
 		return fmt.Errorf("set the memory-writer netpol %s owner to the Loop: %w", name, err)
 	}
-	if err := r.Create(ctx, denyAll); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create memory-writer netpol %s: %w", name, err)
 	}
 	return nil

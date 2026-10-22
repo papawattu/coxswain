@@ -511,13 +511,19 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 
 // ensureMemoryWriterNetworkPolicy creates (idempotently) the memory-writer
 // Job's NetworkPolicy: denies ALL ingress and ALL egress EXCEPT the model
-// proxy pod (the P5c curator call goes to the Loop's model proxy Service;
-// the proxy pod is identified by the coxswain.io/proxy-for label). The
-// writer Job's only network call is the curator's /v1/chat/completions POST
-// to the proxy; all other egress is denied (the ADR-0007 fence: a lesson
-// must not be exfiltrated during the write). The podSelector is the
+// proxy pod (the P5c curator call goes to the Loop's model proxy Service; the
+// proxy pod is identified by the coxswain.io/proxy-for label). The writer
+// Job's only network call is the curator's /v1/chat/completions POST to the
+// proxy; all other egress is denied (the ADR-0007 fence: a lesson must not
+// be exfiltrated during the write). The podSelector is the
 // "coxswain.io/memory-write-for" label (the Job stamps it on the pod
 // template).
+//
+// F16: the desired spec carries NO Ingress rules and at most ONE Egress rule
+// (the proxy-allow). An empty rule {} MATCHES everything (allow all) — the
+// opposite of the fence — so a blank Ingress or Egress rule must never be
+// emitted. Drift is detected against the WHOLE desired spec (semantic
+// equality, not rule counts) so a drifted rule set is updated in place.
 func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	name := memoryWriterNetPolName(loop.Name)
 	desired := &networkingv1.NetworkPolicy{
@@ -534,20 +540,19 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			// Deny ALL ingress: no Ingress rules. An empty ingress rule {}
-			// would MATCH everything (allow all), the opposite of the
-			// ADR-0007 fence (F16).
-			// Egress is denied too, EXCEPT the model proxy pod when the Loop
-			// has a model (the P5c curator call goes to the Loop's model proxy
-			// Service; the proxy pod carries the label coxswain.io/proxy-for:
-			// <loop>). The proxy-allow rule is the ONLY egress rule: a blank
-			// egress rule {} would also MATCH everything (allow all), so it
-			// must never appear here (F16).
+			// Deny ALL ingress: no Ingress rules (F16: an empty ingress rule {}
+			// would MATCH everything — allow all, the opposite of the ADR-0007
+			// fence). Egress is denied the same way, EXCEPT the model proxy
+			// pod when the Loop has a model: the P5c curator call goes to the
+			// Loop's model proxy Service, and the proxy pod carries the label
+			// coxswain.io/proxy-for: <loop>. The proxy-allow rule is the ONLY
+			// egress rule (F16: a blank egress rule {} would also allow all).
 		},
 	}
-	// The proxy egress rule is added AFTER the struct literal (an if cannot
-	// appear inside a struct literal). The rule is the ONLY egress rule —
-	// a nil Egress slice means all egress is denied.
+	// The proxy egress rule (the P5c curator call) is the ONLY egress rule,
+	// added AFTER the struct literal (an if cannot appear inside a struct
+	// literal). A Loop with no model (no endpointSecretRef) has NO proxy and
+	// a fully denied NetworkPolicy (the P5b fence).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
 		desired.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{{
 			To: []networkingv1.NetworkPolicyPeer{{
@@ -557,18 +562,17 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 				PodSelector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
 				},
-			},
-		}},
+			}},
+		}}
 	}
 
 	existing := &networkingv1.NetworkPolicy{}
 	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
 	if err == nil {
 		// The policy exists: check for drift against the WHOLE desired spec
-		// (the P5b build created it with Ingress/Egress [{}] which ALLOWS
-		// all traffic; rule counts alone would miss a drifted rule set, so
-		// compare semantically — F16). If drifted, update to the desired
-		// spec.
+		// (the P5b build created it with Ingress/Egress [{}] which ALLOWS all
+		// traffic; rule counts alone would miss a drifted rule set, so compare
+		// semantically — F16). If drifted, update to the desired spec.
 		if equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
 			return nil // already correct
 		}

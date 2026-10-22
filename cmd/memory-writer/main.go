@@ -100,6 +100,23 @@ func curatorModelFromEnv() string {
 	return os.Getenv("COX_MODEL")
 }
 
+// seededLessonsFromEnv returns the COX_SEEDED_LESSONS env var (a JSON array of
+// single-line strings) — the operator's seeded lessons (P5c's negative
+// lesson: the stall signature, not the agent's text). "[]" or absent means
+// "no seed". A malformed value is treated as "no seed" (the seed is
+// best-effort; the runner's lessons are the authoritative input).
+func seededLessonsFromEnv() []string {
+	v := os.Getenv("COX_SEEDED_LESSONS")
+	if v == "" || v == "[]" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(v), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
 func main() {
 	// The terminal outcome is the first arg: "succeeded" or "failed-stalled".
 	// A missing arg is a usage error (exit 2) — the operator always passes it.
@@ -159,6 +176,17 @@ func run(outcome string) (int, error) {
 		// credential the screen would have dropped); report the bounded
 		// error.
 		return 1, fmt.Errorf("parse %s: %w (malformed lessons JSON)", lp, err)
+	}
+
+	// P5c: prepend the operator's seeded lessons (the negative lesson — the
+	// stall signature, not the agent's text; PLAN-PHASE5.md:213-215). The
+	// seed flows through the static rules + the curator exactly like the
+	// runner's lessons (the seed's position in the input is index 0, so its
+	// sha256-prefix in the bounded summary is stable). The seed is
+	// operator-composed (not the agent's text) — the curator's injection
+	// resistance still applies to it (the curator reads it as untrusted).
+	if seeded := seededLessonsFromEnv(); len(seeded) > 0 {
+		lessons = append(seeded, lessons...)
 	}
 
 	// Screen the proposals (the operator's static write policy). The outcome

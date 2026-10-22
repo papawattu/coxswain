@@ -30,10 +30,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -403,5 +400,88 @@ func TestMemoryWriteDedupSummary(t *testing.T) {
 	files := readMemoryFiles(t, mem)
 	if len(files) != 1 {
 		t.Fatalf("memory dir has %d files (%v); want 1", len(files), files)
+	}
+}
+
+// TestMemoryWriteSeededNegativeLessonFailSeeds: a terminal Failed:Stalled
+// stall with stallAction=Fail (the default) seeds a negative lesson (the
+// stall signature — operator-composed, not the agent's text). The seed is
+// passed to the Job via COX_SEEDED_LESSONS (a JSON array) and is PREPENDED to
+// the runner's lessons, so the seed flows through the static rules + the
+// curator exactly like the runner's lessons. The seeded lesson's sha256
+// lands in the memory dir (it passes the static screen: it names a file path
+// + the failure hash).
+//
+// The seed text is the operator's negativeLesson: "stall: repeated verify
+// failure <hash> (see .coxswain/verify-result.json)" — a single line that the
+// static write policy admits (it references a file path).
+func TestMemoryWriteSeededNegativeLessonFailSeeds(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	// The runner's proposed lessons (one eligible lesson).
+	writeLessonsFile(t, ws, []string{"foo/bar: the retry must back off"})
+	// The seed (the operator's negative lesson — the stall signature).
+	seed := "stall: repeated verify failure deadbeef (see .coxswain/verify-result.json)"
+	t.Setenv("COX_SEEDED_LESSONS", `["stall: repeated verify failure deadbeef (see .coxswain/verify-result.json)"]`)
+	t.Setenv("COX_LESSONS_PATH", filepath.Join(ws, ".coxswain", "lessons.json"))
+	t.Setenv("COX_MEMORY_DIR", mem)
+	code, err := run("failed-stalled")
+	if code != 0 || err != nil {
+		t.Fatalf("run(failed-stalled, seeded) = (%d, %v); want (0, nil)", code, err)
+	}
+	files := readMemoryFiles(t, mem)
+	// The seed + the runner's lesson: TWO files (both pass the static screen).
+	if len(files) != 2 {
+		t.Fatalf("memory dir has %d files (%v); want 2 (the seed + the runner's lesson)", len(files), files)
+	}
+	// The seed's text is on the PVC (byte-identical — the writer never
+	// rewrites; the curator's "never rewrites" spec is the same guarantee).
+	seedFound := false
+	for _, content := range files {
+		if content == seed {
+			seedFound = true
+		}
+	}
+	if !seedFound {
+		t.Errorf("the seeded negative lesson %q is not on the memory PVC (byte-identical); files: %v", seed, files)
+	}
+	// The seed's file is named by its sha256 (the dedup key).
+	sum := sha256.Sum256([]byte(seed))
+	if _, ok := files[hex.EncodeToString(sum[:])+".txt"]; !ok {
+		t.Errorf("the seed's file %q (sha256 of the seed text) is not on the PVC; files: %v", hex.EncodeToString(sum[:])+".txt", files)
+	}
+}
+
+// TestMemoryWriteSeededNegativeLessonContinueDoesNotSeed: a Continue stall
+// (stallAction=Continue) does NOT seed a negative lesson (the plan: "default
+// on for Fail/Pause, off for Continue"). The operator does not set
+// COX_SEEDED_LESSONS (the Job sees no seed); the Job writes only the
+// runner's lessons. The memory dir has ONLY the runner's lesson (no seed
+// file).
+func TestMemoryWriteSeededNegativeLessonContinueDoesNotSeed(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	writeLessonsFile(t, ws, []string{"foo/bar: the retry must back off"})
+	// COX_SEEDED_LESSONS is NOT set (the operator seeds nothing on a
+	// Continue stall). A fresh env (t.Setenv with empty = "no seed").
+	t.Setenv("COX_SEEDED_LESSONS", "")
+	t.Setenv("COX_LESSONS_PATH", filepath.Join(ws, ".coxswain", "lessons.json"))
+	t.Setenv("COX_MEMORY_DIR", mem)
+	code, err := run("failed-stalled")
+	if code != 0 || err != nil {
+		t.Fatalf("run(failed-stalled, no seed) = (%d, %v); want (0, nil)", code, err)
+	}
+	files := readMemoryFiles(t, mem)
+	// ONLY the runner's lesson (no seed file — the Continue stall does not
+	// seed).
+	if len(files) != 1 {
+		t.Fatalf("memory dir has %d files (%v); want 1 (the Continue stall does NOT seed a negative lesson)", len(files), files)
+	}
+	// The single file is the runner's lesson (not a seed — the seed text
+	// would start with "stall: repeated verify failure").
+	for name, content := range files {
+		if strings.HasPrefix(content, "stall: repeated verify failure") {
+			t.Errorf("%s is a seeded negative lesson; a Continue stall must NOT seed one", name)
+		}
 	}
 }

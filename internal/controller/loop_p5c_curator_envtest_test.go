@@ -23,6 +23,7 @@ package controller
 import (
 	"context"
 
+	"encoding/json"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -169,5 +170,121 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		Expect(cond).NotTo(BeNil(), "the MemoryWriteDone condition must be set")
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(memoryWrittenReason))
+	})
+})
+
+var _ = Describe("P5c negative lesson (Phase 5, PLAN-PHASE5.md slice P5c)", func() {
+	var (
+		r  *LoopReconciler
+		ns string
+	)
+
+	BeforeEach(func() {
+		ns = "p5c-neg-" + nowSuffix()
+		Expect(k8sClient.Create(context.Background(), &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: ns},
+		})).To(Succeed())
+		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	})
+
+	AfterEach(func() {
+		Expect(k8sClient.Delete(context.Background(), &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: ns},
+		})).To(Succeed())
+	})
+
+	It("seeds the negative lesson (COX_SEEDED_LESSONS) on a terminal Failed:Stalled Loop with stallAction=Fail (the default)", func() {
+		// A terminal Failed:Stalled stall (stallAction=Fail — the default):
+		// the operator seeds a negative lesson (the stall signature — the
+		// repeated verify-failure hash, NOT the agent's text). The seed is
+		// passed to the Job via COX_SEEDED_LESSONS (a JSON array) so the Job
+		// prepends it to the runner's lessons (the seed flows through the
+		// static rules + the curator exactly like the runner's lessons).
+		name := "p5c-stall-fail"
+		// Drive to Succeeded (the memory-writer's base path: the Job is
+		// created for a Succeeded Loop with lessonsAvailable=true).
+		_ = s6SucceededLessonsAvailable(name, ns)
+		// Override the Loop to a terminal Failed:Stalled stall (the trigger:
+		// only Succeeded or Failed:Stalled qualifies) with stallHistory (the
+		// stall signature the negative lesson is composed from).
+		loop := p5bMustLoop(ns, name)
+		loop.Status.Phase = coxs.LoopPhaseFailed
+		loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
+			Type:    string(coxs.LoopPhaseFailed),
+			Status:  metav1.ConditionTrue,
+			Reason:  "Stalled",
+			Message: "stall detector fired: 3 consecutive identical verify failures",
+		})
+		loop.Status.StallHistory = []coxs.StallEntry{{
+			Iteration:            1,
+			JobName:              name + "-verify-1",
+			Hash:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			NormalisationVersion: "1",
+			Check:                loopCheckCmd,
+		}}
+		Expect(k8sClient.Status().Update(context.Background(), loop)).To(Succeed())
+		// The reconcile that creates the memory-writer Job runs in the
+		// terminal phase's handler (the Failed:Stalled trigger).
+		s6Reconcile(r, ns, name)
+		job := p5bGetMemoryJob(ns, name)
+		c := job.Spec.Template.Spec.Containers[0]
+		envNames := map[string]string{}
+		for _, e := range c.Env {
+			envNames[e.Name] = e.Value
+		}
+		// The seed env var is set (the Loop is a terminal Failed:Stalled stall
+		// with stallAction=Fail — the default on).
+		Expect(envNames).To(HaveKey("COX_SEEDED_LESSONS"),
+			"the Job must carry COX_SEEDED_LESSONS on a terminal Failed:Stalled stall (stallAction=Fail)")
+		var seeded []string
+		Expect(json.Unmarshal([]byte(envNames["COX_SEEDED_LESSONS"]), &seeded)).To(Succeed(),
+			"COX_SEEDED_LESSONS must be a JSON array of single-line strings")
+		Expect(seeded).To(HaveLen(1), "the seed must be a single lesson (the stall signature)")
+		// The seed text is the stall signature (the repeated verify-failure
+		// hash) — NOT the agent's text. It references the verify-result file
+		// path (the static write policy admits it: a file-path reference).
+		Expect(seeded[0]).To(ContainSubstring("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+			"the seed must carry the stall signature (the repeated verify-failure hash)")
+		Expect(seeded[0]).To(ContainSubstring(".coxswain/verify-result.json"),
+			"the seed must reference the verify-result file path (the static write policy admits it)")
+		Expect(seeded[0]).To(HavePrefix("stall: repeated verify failure"),
+			"the seed must be operator-composed (the 'stall: repeated verify failure' marker)")
+	})
+
+	It("does NOT seed the negative lesson (no COX_SEEDED_LESSONS) on a terminal Failed:Stalled Loop with stallAction=Continue", func() {
+		// A terminal Failed:Stalled stall with stallAction=Continue: the
+		// operator does NOT seed a negative lesson (the plan: "default on for
+		// Fail/Pause, off for Continue"). The Job's COX_SEEDED_LESSONS is
+		// absent (the Job sees no seed).
+		name := "p5c-stall-continue"
+		loop := s6Loop(name, ns, inClusterRepoURL)
+		loop.Spec.Loop.StallAction = coxs.StallActionContinue
+		Expect(k8sClient.Create(context.Background(), loop)).To(Succeed())
+		// Drive to a terminal Failed:Stalled outcome (the stall gate fires).
+		// s6SucceededLessonsAvailable drives a fresh Loop to Succeeded; here
+		// we create the Loop with stallAction=Continue and drive it to
+		// Failed:Stalled directly (the trigger).
+		loop.Status.Phase = coxs.LoopPhaseFailed
+		loop.Status.Conditions = []metav1.Condition{{
+			Type:    string(coxs.LoopPhaseFailed),
+			Status:  metav1.ConditionTrue,
+			Reason:  "Stalled",
+			Message: "stall detector fired: 3 consecutive identical verify failures",
+		}}
+		loop.Status.StallHistory = []coxs.StallEntry{{
+			Iteration:            1,
+			JobName:              name + "-verify-1",
+			Hash:                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			NormalisationVersion: "1",
+			Check:                loopCheckCmd,
+		}}
+		Expect(k8sClient.Status().Update(context.Background(), loop)).To(Succeed())
+		s6Reconcile(r, ns, name)
+		job := p5bGetMemoryJob(ns, name)
+		c := job.Spec.Template.Spec.Containers[0]
+		for _, e := range c.Env {
+			Expect(e.Name).ToNot(Equal("COX_SEEDED_LESSONS"),
+				"the Job must NOT carry COX_SEEDED_LESSONS on a Continue stall (the plan: off for Continue)")
+		}
 	})
 })

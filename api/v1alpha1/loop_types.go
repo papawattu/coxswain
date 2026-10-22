@@ -1046,6 +1046,17 @@ type ProgressStatus struct {
 	// status.baseCommit pin, D10 — the claim cannot set it for itself).
 	// +optional
 	BaseCommit string `json:"baseCommit,omitempty"`
+
+	// lessonsAvailable (P5b, PLAN-PHASE5.md: "the claim carries only a
+	// lessonsAvailable boolean (present on disk)") is the runner's signal that
+	// it wrote .coxswain/lessons.json on the workspace volume for this run. The
+	// lessons FILE is the transport (a workspace file, not the 4096-byte claim);
+	// this boolean is the only lesson-related thing that rides the claim. The
+	// memory-writer gate reads it: the operator creates the memory-writer Job
+	// only when the Loop terminated with lessonsAvailable true (an old terminal
+	// Loop with no lessons file must not get a retroactive write).
+	// +optional
+	LessonsAvailable bool `json:"lessonsAvailable,omitempty"`
 }
 
 // BudgetExceededReason names the cap that was hit (P2c/P2d); empty until

@@ -190,6 +190,17 @@ func TestRBACCoverage(t *testing.T) {
 		// client (loop_controller.go r.Get).
 		{group: "", resource: "persistentvolumeclaims",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
+		// ServiceAccounts: the operator ensures the memory-writer Job's
+		// dedicated ServiceAccount in the Loop's namespace
+		// (ensureMemoryWriterServiceAccount, loop_memory_writer_job.go — the
+		// Job runs in the Loop's namespace; a Job that references a missing SA
+		// cannot create its pod). r.Get (idempotency, cached read — needs
+		// get;list;watch) + r.Create (ensure). The SA is NOT owned by the Loop
+		// (shared per namespace) and has NO RoleBinding (the Job's pod is
+		// no-token — automountServiceAccountToken: false — so it makes no API
+		// calls; the operator only creates the SA, not the binding).
+		{group: "", resource: "serviceaccounts",
+			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate}},
 		// AgentPolicies: the loop's AgentPolicy is read through the cached
 		// client (loop_controller.go r.Get).
 		{group: coxGroup, resource: "agentpolicies",
@@ -333,6 +344,7 @@ func TestRBACCachedClientReads(t *testing.T) {
 		{"batch", "jobs"},                        // r.Get the deliver + verify jobs
 		{"networking.k8s.io", "networkpolicies"}, // r.Get the loop/proxy/deliver netpols
 		{"", "persistentvolumeclaims"},           // r.Get the workspace PVC
+		{"", "serviceaccounts"},                  // r.Get the memory-writer SA (the ensure's idempotency read; the Loop's namespace)
 		{coxGroup, "loops"},                      // r.Get/r.List the Loops
 		{coxGroup, "agentpolicies"},              // r.Get the loop's AgentPolicy
 		{agentsGroup, "sandboxes"},               // r.Get the sandbox

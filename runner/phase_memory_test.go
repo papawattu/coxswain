@@ -60,10 +60,11 @@ func TestImplementingPromptIncludesMemoryWhenPresent(t *testing.T) {
 }
 
 // TestPromptUnchangedWhenMemoryAbsent (a fresh repo): with no .coxswain/
-// memory dir, the prompt is EXACTLY the pre-P5a prompt (the P5a spec:
-// "unchanged when absent (a fresh repo)"). The baseline is the prompt with
-// no memory — the planning prompt is goal + cap + (no rejection feedback)
-// and the implementing prompt is goal + (no plan).
+// memory dir, the PLANNING prompt is EXACTLY the pre-P5a prompt (the P5a
+// spec: "unchanged when absent (a fresh repo)"). The IMPLEMENTING prompt
+// carries P5b's lessons section (the lessons transport is always present —
+// it is the runner's proposal channel, independent of whether the shared
+// memory exists); the planning prompt is unchanged.
 func TestPromptUnchangedWhenMemoryAbsent(t *testing.T) {
 	ws := t.TempDir() // no .coxswain/memory dir at all.
 
@@ -78,15 +79,17 @@ func TestPromptUnchangedWhenMemoryAbsent(t *testing.T) {
 			"baseline:\nGOT:\n%s\nWANT:\n%s", got, wantPlanning)
 	}
 
-	// Implementing: the baseline prompt (no plan, no memory).
+	// Implementing: the baseline prompt (no plan, no memory) PLUS P5b's
+	// lessons section (the lessons transport is always present in the
+	// implementing prompt — the runner's proposal channel).
 	wantImpl := "You are in the IMPLEMENTING phase. Use your shell tool to make the goal's changes in the workspace. " +
 		"Run the acceptance checks to confirm your work. " +
 		"Your plan lives in .coxswain/PLAN.md; do not create a root PLAN.md. " +
 		"End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
-		"do the thing"
+		"do the thing" + lessonsPromptSection()
 	if got := implementingPrompt(ws, "do the thing"); got != wantImpl {
-		t.Fatalf("implementing prompt with absent memory differs from the pre-P5a\n"+
-			"baseline:\nGOT:\n%s\nWANT:\n%s", got, wantImpl)
+		t.Fatalf("implementing prompt with absent memory differs from the P5b\n"+
+			"baseline (pre-P5a + lessons section):\nGOT:\n%s\nWANT:\n%s", got, wantImpl)
 	}
 }
 
@@ -148,12 +151,15 @@ func TestMemorySectionDroppedWhenDirTooLarge(t *testing.T) {
 			t.Fatalf("write: %v", err)
 		}
 	}
+	// The prompt is the no-memory baseline PLUS P5b's lessons section (the
+	// lessons transport is always present; the memory section is what is
+	// dropped when the dir is too large).
 	wantImpl := "You are in the IMPLEMENTING phase. Use your shell tool to make the goal's changes in the workspace. " +
 		"Run the acceptance checks to confirm your work. " +
 		"Your plan lives in .coxswain/PLAN.md; do not create a root PLAN.md. " +
 		"End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
-		"do the thing"
+		"do the thing" + lessonsPromptSection()
 	if got := implementingPrompt(ws, "do the thing"); got != wantImpl {
-		t.Fatalf("prompt with an oversized memory dir is not the no-memory baseline:\n%s", got)
+		t.Fatalf("prompt with an oversized memory dir is not the no-memory baseline + lessons section:\n%s", got)
 	}
 }

@@ -1070,6 +1070,17 @@ spec:
                       lastResultStatus is the claim's status (success/blocked) for the last
                       phase run.
                     type: string
+                  lessonsAvailable:
+                    description: |-
+                      lessonsAvailable (P5b, PLAN-PHASE5.md: "the claim carries only a
+                      lessonsAvailable boolean (present on disk)") is the runner's signal that
+                      it wrote .coxswain/lessons.json on the workspace volume for this run. The
+                      lessons FILE is the transport (a workspace file, not the 4096-byte claim);
+                      this boolean is the only lesson-related thing that rides the claim. The
+                      memory-writer gate reads it: the operator creates the memory-writer Job
+                      only when the Loop terminated with lessonsAvailable true (an old terminal
+                      Loop with no lessons file must not get a retroactive write).
+                    type: boolean
                   observedGeneration:
                     description: |-
                       observedGeneration is the spec generation the pin the operator read the

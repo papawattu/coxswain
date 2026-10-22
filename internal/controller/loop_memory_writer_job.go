@@ -48,6 +48,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -519,20 +520,7 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 // template).
 func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	name := memoryWriterNetPolName(loop.Name)
-	existing := &networkingv1.NetworkPolicy{}
-	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get memory-writer netpol %s: %w", name, err)
-	}
-	// Deny ALL ingress and ALL egress EXCEPT the model proxy pod (the P5c
-	// curator call). The blank egress rule `{}` denies all egress; the
-	// proxy-allow rule permits egress to the proxy pod (same namespace,
-	// label coxswain.io/proxy-for: <loop>). The proxy pod's label is set
-	// by buildProxyPod (the operator's per-Loop model proxy).
-	denyAll := &networkingv1.NetworkPolicy{
+	desired := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: loop.Namespace,
@@ -546,24 +534,52 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{}},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{}, // blank rule: deny all egress
-				{
-					// Allow egress to the model proxy pod (the P5c curator
-					// call). The proxy pod is in the same namespace and
-					// carries the label coxswain.io/proxy-for: <loop>.
-					To: []networkingv1.NetworkPolicyPeer{{
-						NamespaceSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{kubeNSLabelKey: loop.Namespace},
-						},
-						PodSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
-						},
-					}},
+			// Deny ALL ingress: no Ingress rules. An empty ingress rule {}
+			// would MATCH everything (allow all), the opposite of the
+			// ADR-0007 fence (F16).
+			// Egress is denied too, EXCEPT the model proxy pod when the Loop
+			// has a model (the P5c curator call goes to the Loop's model proxy
+			// Service; the proxy pod carries the label coxswain.io/proxy-for:
+			// <loop>). The proxy-allow rule is the ONLY egress rule: a blank
+			// egress rule {} would also MATCH everything (allow all), so it
+			// must never appear here (F16).
+		},
+	}
+	// The proxy egress rule is added AFTER the struct literal (an if cannot
+	// appear inside a struct literal). The rule is the ONLY egress rule —
+	// a nil Egress slice means all egress is denied.
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		desired.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{{
+			To: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{kubeNSLabelKey: loop.Namespace},
+				},
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
 				},
 			},
-		},
+		}},
+	}
+
+	existing := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
+	if err == nil {
+		// The policy exists: check for drift against the WHOLE desired spec
+		// (the P5b build created it with Ingress/Egress [{}] which ALLOWS
+		// all traffic; rule counts alone would miss a drifted rule set, so
+		// compare semantically — F16). If drifted, update to the desired
+		// spec.
+		if equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+			return nil // already correct
+		}
+		existing.Spec = desired.Spec
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("update drifted memory-writer netpol %s: %w", name, err)
+		}
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get memory-writer netpol %s: %w", name, err)
 	}
 	// The NetPol is owned by the Loop (controller reference) so the apiserver
 	// garbage-collects it when the Loop is deleted — the same way the
@@ -571,10 +587,10 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 	// buildMemoryWriterJob). Without the owner, the NetPol leaks on Loop
 	// delete (a standalone object the B1 finalizer does not clean up; the
 	// kind acceptance left p5b-df3c/df4-memory-write-netpol behind).
-	if err := controllerutil.SetControllerReference(loop, denyAll, r.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(loop, desired, r.Scheme); err != nil {
 		return fmt.Errorf("set the memory-writer netpol %s owner to the Loop: %w", name, err)
 	}
-	if err := r.Create(ctx, denyAll); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := r.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create memory-writer netpol %s: %w", name, err)
 	}
 	return nil

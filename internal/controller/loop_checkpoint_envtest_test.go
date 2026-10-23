@@ -73,6 +73,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -919,6 +920,49 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		}
 		Expect(gone).To(BeTrue(),
 			"a deleting Loop whose checkpoint list returns a terminating-ns Forbidden has its finalizer removed (the namespace can complete its delete)")
+	})
+
+	// F25: the VolumeSnapshot CRD is absent (hermes), but the support check
+	// reads "present" (the production reconciler has no RESTMapper wired), so
+	// the GC list fails with a NoMatchError. That is "nothing to GC" (done), not
+	// an error: before the fix the finalizer never cleared and the Loop (and its
+	// namespace) stayed Terminating.
+	It("a deleting Loop whose checkpoint list returns NoMatch (VolumeSnapshot CRD absent) has its finalizer removed (F25)", func() {
+		ns := "f25-nomatch-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "f25nomatch"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		nmClient := &f25NoMatchClient{Client: k8sClient}
+		r := b1NewReconciler(true, false)
+		r.Client = nmClient
+		r.apiReader = nmClient
+
+		b1Reconcile(r, ns, name) // adds the finalizer
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(controllerutil.ContainsFinalizer(loop, loopCheckpointFinalizer)).To(BeTrue(), "the finalizer is set before the delete")
+		Expect(k8sClient.Delete(ctx, loop)).To(Succeed())
+
+		var gone bool
+		for range 10 {
+			_, _ = r.Reconcile(context.Background(),
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &coxv1alpha1.Loop{})) {
+				gone = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		Expect(gone).To(BeTrue(), "a NoMatch on the checkpoint list is 'nothing to GC': the finalizer is removed and the Loop is deleted")
 	})
 
 	// F10 (second spec): a deleting Loop with CheckpointsAvailable=False (no

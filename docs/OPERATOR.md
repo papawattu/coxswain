@@ -257,6 +257,29 @@ kubectl -n coxswain-system patch deploy coxswain-controller-manager \
 - `--memory-storage-class` (optional): an RWX-capable StorageClass for the
   memory PVC (kind's default `rancher.io/local-path` is RWO-only).
 
+### RWX storage for the memory PVC (`hack/rwx-storage.sh`)
+
+The memory PVC is ReadWriteMany. kind, k3d and k3s ship an RWO-only default
+class, so the PVC would stay Pending. `hack/rwx-storage.sh` installs a second,
+pinned rancher local-path-provisioner (own namespace `coxswain-rwx-storage`,
+own provisioner name, `sharedFileSystemPath` mode) and a `local-shared`
+StorageClass on any cluster, without touching the cluster's own provisioner or
+default class:
+
+```sh
+hack/rwx-storage.sh --context kind-coxswain          # or --kubeconfig FILE
+# then run the operator with --memory-storage-class=local-shared
+# and import with: cox memory import <repo-url> -f f.tar.gz --storage-class local-shared
+```
+
+It is idempotent and refuses to replace an existing StorageClass that has a
+different provisioner. `sharedFileSystemPath` is only shared if the path is the
+same filesystem on every node (NFS, CephFS, or on k3d a docker volume mounted
+into every node, e.g. `--shared-path /k3d/images/rwx`); on a single-node
+cluster the default path works. Images (`rancher/local-path-provisioner:v0.0.31`,
+`busybox:1.36`) must be pullable or pre-loaded. Tested by
+`make rwx-storage-test` (real script, stubbed kubectl).
+
 ### Component logs
 
 The `kubectl cox logs` command streams the **sandbox component** logs

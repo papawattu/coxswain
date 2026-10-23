@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# F21: install a dynamic ReadWriteMany StorageClass for the coxswain memory PVC
+# on a cluster whose default class is RWO-only (kind, k3d/k3s local-path).
+#
+# It installs a SECOND, pinned rancher local-path-provisioner in its own
+# namespace, with its own provisioner name and its own ClusterRole, running in
+# sharedFileSystemPath mode (which is what lets it provision RWX volumes), and
+# a StorageClass (default name local-shared) that points at it. The cluster's
+# own local-path provisioner and default StorageClass are NOT touched.
+#
+# sharedFileSystemPath is only truly shared if that path is the same
+# filesystem on every node (NFS, CephFS, a docker volume mounted into every
+# k3d node). On a single-node cluster any path works. Pass --shared-path to
+# point at a genuinely shared mount on a multi-node cluster.
+#
+# Idempotent: every object is applied with `kubectl apply`; a re-run changes
+# nothing. If a StorageClass of the same name already exists with a DIFFERENT
+# provisioner (a StorageClass provisioner is immutable), the script stops and
+# says so instead of replacing it.
+#
+# Usage: hack/rwx-storage.sh --context <ctx> | --kubeconfig <file> [flags]
+#   --context CTX        kubeconfig context (repeatable with --kubeconfig)
+#   --kubeconfig FILE    kubeconfig file
+#   --namespace NS       provisioner namespace          (default coxswain-rwx-storage)
+#   --storage-class NAME StorageClass to create          (default local-shared)
+#   --provisioner NAME   provisioner name                (default coxswain.io/local-path-shared)
+#   --shared-path PATH   sharedFileSystemPath            (default /var/local-path-shared)
+#   --image IMG          provisioner image (pinned)
+#   --helper-image IMG   helper (busybox) image (pinned)
+# Use the storage class with the operator's --memory-storage-class (and
+# `cox memory import --storage-class`).
+set -euo pipefail
+
+KUBECTL="${KUBECTL:-kubectl}"
+CTX="" KCFG=""
+NS="coxswain-rwx-storage"
+SC="local-shared"
+PROV="coxswain.io/local-path-shared"
+SHARED_PATH="/var/local-path-shared"
+IMAGE="docker.io/rancher/local-path-provisioner:v0.0.31"
+HELPER="docker.io/library/busybox:1.36"
+
+die() { echo "Error: $*" >&2; exit 1; }
+while [ $# -gt 0 ]; do
+	[ $# -ge 2 ] || die "flag $1 needs a value"
+	case "$1" in
+	--context) CTX="$2" ;;
+	--kubeconfig) KCFG="$2" ;;
+	--namespace) NS="$2" ;;
+	--storage-class) SC="$2" ;;
+	--provisioner) PROV="$2" ;;
+	--shared-path) SHARED_PATH="$2" ;;
+	--image) IMAGE="$2" ;;
+	--helper-image) HELPER="$2" ;;
+	*) die "unknown flag $1" ;;
+	esac
+	shift 2
+done
+[ -n "$CTX" ] || [ -n "$KCFG" ] || die "pass --context and/or --kubeconfig (this script never uses the ambient context)"
+
+kc() {
+	local a=()
+	[ -z "$KCFG" ] || a+=(--kubeconfig "$KCFG")
+	[ -z "$CTX" ] || a+=(--context "$CTX")
+	"$KUBECTL" "${a[@]}" "$@"
+}
+
+# A StorageClass's provisioner is immutable: refuse to fight an existing one.
+existing="$(kc get storageclass "$SC" -o jsonpath='{.provisioner}' 2>/dev/null || true)"
+if [ -n "$existing" ] && [ "$existing" != "$PROV" ]; then
+	die "StorageClass $SC already exists with provisioner '$existing' (want '$PROV'); pick another --storage-class or delete it yourself (this script does not replace a StorageClass)"
+fi
+
+kc apply -f - <<YAML
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $NS
+  labels: {app.kubernetes.io/part-of: coxswain-rwx-storage}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: coxswain-rwx-provisioner, namespace: $NS}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: coxswain-rwx-provisioner}
+rules:
+- apiGroups: [""]
+  resources: [nodes, persistentvolumeclaims, configmaps, pods, pods/log]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [persistentvolumes]
+  verbs: [get, list, watch, create, patch, update, delete]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch, update]
+- apiGroups: [storage.k8s.io]
+  resources: [storageclasses]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: coxswain-rwx-provisioner}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: coxswain-rwx-provisioner}
+subjects:
+- {kind: ServiceAccount, name: coxswain-rwx-provisioner, namespace: $NS}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: coxswain-rwx-provisioner, namespace: $NS}
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: coxswain-rwx-provisioner, namespace: $NS}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: coxswain-rwx-provisioner}
+subjects:
+- {kind: ServiceAccount, name: coxswain-rwx-provisioner, namespace: $NS}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: coxswain-rwx-config, namespace: $NS}
+data:
+  config.json: |-
+    {"sharedFileSystemPath": "$SHARED_PATH"}
+  helperPod.yaml: |-
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: helper-pod
+    spec:
+      containers:
+      - name: helper-pod
+        image: $HELPER
+        imagePullPolicy: IfNotPresent
+  setup: |-
+    #!/bin/sh
+    set -eu
+    mkdir -m 0777 -p "\$VOL_DIR"
+  teardown: |-
+    #!/bin/sh
+    set -eu
+    rm -rf "\$VOL_DIR"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: coxswain-rwx-provisioner, namespace: $NS}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: coxswain-rwx-provisioner}
+  template:
+    metadata:
+      labels: {app: coxswain-rwx-provisioner}
+    spec:
+      serviceAccountName: coxswain-rwx-provisioner
+      containers:
+      - name: provisioner
+        image: $IMAGE
+        imagePullPolicy: IfNotPresent
+        command:
+        - local-path-provisioner
+        - start
+        - --config=/etc/config/config.json
+        - --configmap-name=coxswain-rwx-config
+        - --service-account-name=coxswain-rwx-provisioner
+        - --provisioner-name=$PROV
+        - --helper-image=$HELPER
+        - --helper-pod-file=/etc/config/helperPod.yaml
+        env:
+        - name: POD_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        volumeMounts:
+        - {name: config, mountPath: /etc/config}
+      volumes:
+      - name: config
+        configMap: {name: coxswain-rwx-config}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: $SC}
+provisioner: $PROV
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+YAML
+
+kc -n "$NS" rollout status deployment/coxswain-rwx-provisioner --timeout=180s
+echo "OK: StorageClass $SC (RWX, provisioner $PROV) ready; use --memory-storage-class=$SC"

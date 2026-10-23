@@ -56,12 +56,18 @@ sed -e "s|__TAG__|$TAG|g" "$ROOT/hack/install-args.patch.tpl" \
 	> "$OVERLAY/config/manager/install-args.patch.yaml"
 
 # F22: optional --memory-storage-class. Must be a DNS-1123 subdomain (the same
-# rule the operator and `cox memory import` enforce) so a typo cannot inject
-# YAML into the patch.
+# rule the operator and `cox memory import` enforce). The value is written into
+# a YAML patch, so it is matched as the WHOLE string with bash's [[ =~ ]] (no
+# line semantics: `grep -E '^..$'` on a value with embedded newlines passes if
+# ANY line matches, which would inject patch ops) and CR/LF are refused first.
+nl=$'\n'
+cr=$'\r'
 MEMORY_STORAGE_CLASS="${MEMORY_STORAGE_CLASS:-}"
 if [ -n "$MEMORY_STORAGE_CLASS" ]; then
-	if [ "${#MEMORY_STORAGE_CLASS}" -gt 253 ] || ! printf '%s' "$MEMORY_STORAGE_CLASS" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'; then
-		echo "Error: MEMORY_STORAGE_CLASS=$MEMORY_STORAGE_CLASS is not a valid StorageClass name"
+	sc_re='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+	if [[ "$MEMORY_STORAGE_CLASS" == *"$nl"* || "$MEMORY_STORAGE_CLASS" == *"$cr"* ]] \
+		|| [ "${#MEMORY_STORAGE_CLASS}" -gt 253 ] || ! [[ "$MEMORY_STORAGE_CLASS" =~ $sc_re ]]; then
+		echo "Error: MEMORY_STORAGE_CLASS is not a valid StorageClass name (a DNS-1123 subdomain, one line)"
 		exit 1
 	fi
 	printf -- '- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: --memory-storage-class=%s\n' \
@@ -69,15 +75,56 @@ if [ -n "$MEMORY_STORAGE_CLASS" ]; then
 fi
 
 # F22: MANAGER_EXTRA_ARGS (optional, space-separated --flag[=value] tokens) is
-# appended the same way, for flags that have no dedicated knob (e.g. the
-# lab-only --allow-unenforced on a cluster without KubeArmor). Each token must
-# look like --name or --name=value from a conservative charset.
-for a in ${MANAGER_EXTRA_ARGS:-}; do
-	printf '%s' "$a" | grep -Eq '^--[a-z0-9][-a-z0-9]*(=[A-Za-z0-9._:/@,-]*)?$' \
-		|| { echo "Error: MANAGER_EXTRA_ARGS token '$a' is not --flag or --flag=value"; exit 1; }
-	printf -- '- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: %s\n' "$a" \
-		>> "$OVERLAY/config/manager/install-args.patch.yaml"
-done
+# appended the same way, for flags that have no dedicated knob. Rules:
+#  - one line only (CR/LF refused), each token matched whole with [[ =~ ]];
+#  - split with read -ra under set -f, so a token like --x=* never globs;
+#  - --allow-unenforced-network is ALWAYS refused (the network gate stays live);
+#  - any --*-image token is refused (the images have their own pins);
+#  - a flag already in the rendered args (base manifest, the image pins, the
+#    memory knob) or repeated in the list is refused (last-wins would silently
+#    override it);
+#  - --allow-unenforced (tool policy, lab clusters without KubeArmor) is allowed
+#    with a WARNING; a release build must not pass it.
+MANAGER_EXTRA_ARGS="${MANAGER_EXTRA_ARGS:-}"
+if [[ "$MANAGER_EXTRA_ARGS" == *"$nl"* || "$MANAGER_EXTRA_ARGS" == *"$cr"* ]]; then
+	echo "Error: MANAGER_EXTRA_ARGS must be a single line"
+	exit 1
+fi
+if [ -n "$MANAGER_EXTRA_ARGS" ]; then
+	arg_re='^--([a-z0-9][-a-z0-9]*)(=[A-Za-z0-9._:/@,-]*)?$'
+	# Flag names already rendered: base manager + default overlay args and our patch.
+	existing_flags="$(grep -hoE -- '(^|[[:space:]])(- |value: )--[a-z0-9][-a-z0-9]*' \
+		"$OVERLAY"/config/manager/*.yaml "$OVERLAY"/config/default/*.yaml 2>/dev/null \
+		| grep -oE -- '--[a-z0-9][-a-z0-9]*' | sort -u || true)"
+	seen=" "
+	set -f
+	read -ra extra_tokens <<< "$MANAGER_EXTRA_ARGS"
+	set +f
+	for a in "${extra_tokens[@]}"; do
+		if ! [[ "$a" =~ $arg_re ]]; then
+			echo "Error: MANAGER_EXTRA_ARGS token '$a' is not --flag or --flag=value"
+			exit 1
+		fi
+		name="--${BASH_REMATCH[1]}"
+		case "$name" in
+		--allow-unenforced-network)
+			echo "Error: MANAGER_EXTRA_ARGS may never carry --allow-unenforced-network (the network gate must stay live)"
+			exit 1 ;;
+		--*-image)
+			echo "Error: MANAGER_EXTRA_ARGS may not set $name (the images are pinned by IMG's tag)"
+			exit 1 ;;
+		--allow-unenforced)
+			echo "WARNING: rendering --allow-unenforced (tool-policy gate off): lab clusters without KubeArmor only, never a release" >&2 ;;
+		esac
+		if grep -qxF -- "$name" <<< "$existing_flags" || [[ "$seen" == *" $name "* ]]; then
+			echo "Error: MANAGER_EXTRA_ARGS flag $name is already set in the rendered manager args"
+			exit 1
+		fi
+		seen+="$name "
+		printf -- '- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: %s\n' "$a" \
+			>> "$OVERLAY/config/manager/install-args.patch.yaml"
+	done
+fi
 
 # Wire the JSON6902 patch into the overlay's manager kustomization. Remove any
 # existing `patches:` block from the copied kustomization (the in-tree file has

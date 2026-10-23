@@ -277,8 +277,11 @@ kubectl cox logs <loop> deliver  # the deliver Job log
   `make build-installer IMG=... MEMORY_STORAGE_CLASS=local-shared` (F22): the
   script appends the flag in a temp overlay, no tracked file is edited, and
   unset means no flag. Other flags: `MANAGER_EXTRA_ARGS="--flag[=value] ..."`
-  (lab only: `--allow-unenforced` on a cluster without KubeArmor; never use
-  `--allow-unenforced-network` where NetworkPolicy is enforced). On Helm use `manager.args`.
+  (one line; each token matched whole). `--allow-unenforced` is allowed with a
+  WARNING for lab clusters without KubeArmor (a release build must never pass
+  it). Refused: `--allow-unenforced-network` (always), any `--*-image` flag (the
+  images are pinned by IMG's tag), and any flag already in the rendered args.
+  On Helm use `manager.args`.
 
 ### RWX storage for the memory PVC (`hack/rwx-storage.sh`)
 
@@ -523,7 +526,12 @@ To remove the operator and all its resources:
 **Order matters.** Delete the Loops (and wait for them to go) BEFORE removing
 the operator. Each Loop carries the `coxswain.wattu.com/checkpoints` finalizer,
 which only the running operator clears; with the operator gone, a Loop and its
-namespace stay `Terminating` forever.
+namespace stay `Terminating` forever. (F25 removed the other wedge, a missing
+VolumeSnapshot CRD, but an uninstalled operator still strands Loops.)
+
+**Already stuck?** Re-install the operator (`kubectl apply -f install.yaml`); it
+processes the finalizers and the namespaces finish deleting. Do not strip the
+finalizer by hand unless you accept leaving checkpoint snapshots behind.
 
 ```sh
 # 1. Remove any running Loops (this deletes the sandbox pods, the verify Jobs,

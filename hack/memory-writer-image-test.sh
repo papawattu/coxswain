@@ -58,24 +58,53 @@ cp "$ROOT/hack/build-installer.sh" "$ROOT/hack/install-args.patch.tpl" "$TMP/ins
 KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" bash "$TMP/inst/hack/build-installer.sh" >/dev/null
 check "install.yaml" "$TMP/inst/dist/install.yaml" "$IMG"
 
-# F22: MEMORY_STORAGE_CLASS knob. Unset: no --memory-storage-class (default
-# unchanged). Set: exactly one --memory-storage-class=<value>. Bad value: fails.
-n="$(grep -c -- "--memory-storage-class" "$TMP/inst/dist/install.yaml" || true)"
-[ "$n" = "0" ] || { echo "FATAL[F22]: unset knob still rendered $n --memory-storage-class args"; exit 1; }
-KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MEMORY_STORAGE_CLASS=local-shared bash "$TMP/inst/hack/build-installer.sh" >/dev/null
-n="$(grep -Fc -- "- --memory-storage-class=local-shared" "$TMP/inst/dist/install.yaml" || true)"
+# F22: the MEMORY_STORAGE_CLASS / MANAGER_EXTRA_ARGS knobs. Every render clears
+# both from the ambient env first (env -u), so an exported knob cannot skew the
+# "unset" case.
+inst() { env -u MEMORY_STORAGE_CLASS -u MANAGER_EXTRA_ARGS KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" "$@" bash "$TMP/inst/hack/build-installer.sh"; }
+count() { grep -Fc -- "$1" "$TMP/inst/dist/install.yaml" || true; }
+# must_fail <label> <VAR=value>...: the render exits non-zero.
+must_fail() {
+	local label="$1"; shift
+	if inst "$@" >/dev/null 2>&1; then echo "FATAL[F22]: $label was accepted"; exit 1; fi
+}
+
+# Unset: no --memory-storage-class (the default is unchanged).
+inst >/dev/null
+n="$(count "--memory-storage-class")"
+[ "$n" = "0" ] || { echo "FATAL[F22]: unset knob rendered $n --memory-storage-class args"; exit 1; }
+[ "$(count "--allow-unenforced")" = "0" ] || { echo "FATAL[F22]: a default (release-shaped) render carries --allow-unenforced*"; exit 1; }
+# Set: exactly one.
+inst MEMORY_STORAGE_CLASS=local-shared >/dev/null
+n="$(count "- --memory-storage-class=local-shared")"
 [ "$n" = "1" ] || { echo "FATAL[F22]: expected exactly one '--memory-storage-class=local-shared' (found $n)"; exit 1; }
 check "install.yaml (MEMORY_STORAGE_CLASS=local-shared)" "$TMP/inst/dist/install.yaml" "$IMG"
-if KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MEMORY_STORAGE_CLASS='a..b' bash "$TMP/inst/hack/build-installer.sh" >/dev/null 2>&1; then
-	echo "FATAL[F22]: invalid MEMORY_STORAGE_CLASS a..b was accepted"; exit 1
-fi
-KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MANAGER_EXTRA_ARGS="--allow-unenforced" bash "$TMP/inst/hack/build-installer.sh" >/dev/null
-n="$(grep -Fc -- "- --allow-unenforced" "$TMP/inst/dist/install.yaml" || true)"
-[ "$n" = "1" ] || { echo "FATAL[F22]: expected exactly one '--allow-unenforced' from MANAGER_EXTRA_ARGS (found $n)"; exit 1; }
-if KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MANAGER_EXTRA_ARGS='--x; rm' bash "$TMP/inst/hack/build-installer.sh" >/dev/null 2>&1; then
-	echo "FATAL[F22]: invalid MANAGER_EXTRA_ARGS was accepted"; exit 1
-fi
-echo "OK[F22]: MEMORY_STORAGE_CLASS renders exactly one --memory-storage-class; unset renders none"
+must_fail "MEMORY_STORAGE_CLASS a..b" MEMORY_STORAGE_CLASS='a..b'
+# P1: a value with embedded newlines whose FIRST line is valid (grep -E '^..$'
+# matched per line) must be refused, not written into the patch.
+inj=$'local-shared\n- op: replace\n  path: /spec/template/spec/containers/0/image\n  value: evil/img:x'
+must_fail "MEMORY_STORAGE_CLASS with embedded newlines" MEMORY_STORAGE_CLASS="$inj"
+must_fail "MEMORY_STORAGE_CLASS with a CR" MEMORY_STORAGE_CLASS=$'local-shared\r'
+# MANAGER_EXTRA_ARGS.
+inst MANAGER_EXTRA_ARGS="--allow-unenforced" >/dev/null 2>"$TMP/warn.txt"
+n="$(count "- --allow-unenforced")"
+[ "$n" = "1" ] || { echo "FATAL[F22]: expected exactly one '--allow-unenforced' (found $n)"; exit 1; }
+[ "$(count "--allow-unenforced-network")" = "0" ] || { echo "FATAL[F22]: --allow-unenforced-network rendered"; exit 1; }
+grep -q "^WARNING: rendering --allow-unenforced" "$TMP/warn.txt" || { echo "FATAL[F22]: no WARNING for --allow-unenforced"; exit 1; }
+must_fail "MANAGER_EXTRA_ARGS '--x; rm'" MANAGER_EXTRA_ARGS='--x; rm'
+must_fail "MANAGER_EXTRA_ARGS with a newline" MANAGER_EXTRA_ARGS=$'--allow-unenforced\n- op: remove'
+must_fail "MANAGER_EXTRA_ARGS --allow-unenforced-network" MANAGER_EXTRA_ARGS='--allow-unenforced-network'
+must_fail "MANAGER_EXTRA_ARGS --allow-unenforced-network=true" MANAGER_EXTRA_ARGS='--allow-unenforced --allow-unenforced-network=true'
+must_fail "MANAGER_EXTRA_ARGS --runner-image" MANAGER_EXTRA_ARGS='--runner-image=evil/img:x'
+must_fail "MANAGER_EXTRA_ARGS --memory-writer-image" MANAGER_EXTRA_ARGS='--memory-writer-image=evil/img:x'
+must_fail "MANAGER_EXTRA_ARGS duplicate of a base flag" MANAGER_EXTRA_ARGS='--leader-elect'
+must_fail "MANAGER_EXTRA_ARGS duplicate of the memory knob" MEMORY_STORAGE_CLASS=a MANAGER_EXTRA_ARGS='--memory-storage-class=b'
+must_fail "MANAGER_EXTRA_ARGS repeated token" MANAGER_EXTRA_ARGS='--allow-unenforced --allow-unenforced'
+# A glob in a token is matched literally (refused by the charset), never expanded.
+touch "$TMP/inst/--x=zz"
+( cd "$TMP/inst" && must_fail "MANAGER_EXTRA_ARGS glob" MANAGER_EXTRA_ARGS='--x=*' )
+rm -f "$TMP/inst/--x=zz"
+echo "OK[F22]: knobs render exactly one flag when set and none when unset; injection, network, image and duplicate tokens are refused"
 
 # the Helm chart.
 helm template coxswain "$ROOT/dist/chart" --namespace coxswain-system > "$TMP/chart.yaml"

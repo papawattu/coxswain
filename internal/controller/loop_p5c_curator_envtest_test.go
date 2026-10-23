@@ -152,13 +152,14 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: npName, Namespace: ns}, np)).To(Succeed())
 
 		// The desired policy (F16 + P5c): NO ingress rules (deny-all ingress)
-		// and EXACTLY ONE egress rule — the proxy-allow (the curator call).
-		// A blank egress rule {} would match everything — ALLOW all — the
-		// opposite of the ADR-0007 fence.
+		// and EXACTLY TWO egress rules — the proxy-allow (the curator call)
+		// + the DNS egress rule (the curator URL is a DNS name that must be
+		// resolved — P1-3). A blank egress rule {} would match everything —
+		// ALLOW all — the opposite of the ADR-0007 fence.
 		Expect(np.Spec.Ingress).To(BeEmpty(),
 			"the NetworkPolicy must have NO ingress rules (deny-all ingress)")
-		Expect(np.Spec.Egress).To(HaveLen(1),
-			"the NetworkPolicy must have EXACTLY ONE egress rule (the proxy-allow; a blank rule {} would allow all)")
+		Expect(np.Spec.Egress).To(HaveLen(2),
+			"the NetworkPolicy must have EXACTLY TWO egress rules (the proxy-allow + DNS; a blank rule {} would allow all)")
 		// The proxy-allow rule: to the model proxy pod (same namespace,
 		// label coxswain.io/proxy-for: <loop>).
 		allowRule := np.Spec.Egress[0]
@@ -170,6 +171,14 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		Expect(peer.PodSelector).NotTo(BeNil())
 		Expect(peer.PodSelector.MatchLabels).To(HaveKeyWithValue(
 			"coxswain.io/proxy-for", name))
+		// The DNS egress rule: UDP+TCP 53 to kube-system k8s-app=kube-dns
+		// (P1-3: the curator URL is a DNS name that must be resolved).
+		dnsRule := np.Spec.Egress[1]
+		Expect(dnsRule.To).To(HaveLen(1))
+		Expect(dnsRule.To[0].NamespaceSelector).ToNot(BeNil())
+		Expect(dnsRule.To[0].NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+			"kubernetes.io/metadata.name", "kube-system"))
+		Expect(dnsRule.Ports).To(HaveLen(2), "DNS is UDP 53 + TCP 53")
 	})
 
 	It("records the curator's verdict on the MemoryWriteDone condition (the audit trail)", func() {
@@ -248,8 +257,8 @@ var _ = Describe("P5c negative lesson (Phase 5, PLAN-PHASE5.md slice P5c)", func
 		// The seed text is the stall signature (the repeated verify-failure
 		// hash) — NOT the agent's text. It references the verify-result file
 		// path (the static write policy admits it: a file-path reference).
-		Expect(seeded[0]).To(ContainSubstring("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-			"the seed must carry the stall signature (the repeated verify-failure hash)")
+		Expect(seeded[0]).To(ContainSubstring("aaaaaaaaaaaa"),
+			"the seed must carry the stall signature (the repeated verify-failure hash, 12-char prefix)")
 		Expect(seeded[0]).To(ContainSubstring(".coxswain/verify-result.json"),
 			"the seed must reference the verify-result file path (the static write policy admits it)")
 		Expect(seeded[0]).To(HavePrefix("stall: repeated verify failure"),

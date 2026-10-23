@@ -229,11 +229,12 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// fence).
 		Expect(np.Spec.Ingress).To(BeEmpty(),
 			"the NetworkPolicy must have NO ingress rules (deny-all ingress)")
-		// Egress: EXACTLY ONE rule — the proxy-allow (the P5c curator call).
-		// A second (blank) egress rule {} would match everything — ALLOW
-		// all — and defeat the fence.
-		Expect(np.Spec.Egress).To(HaveLen(1),
-			"the NetworkPolicy must have EXACTLY ONE egress rule (the proxy-allow)")
+		// Egress: EXACTLY TWO rules — the proxy-allow (the P5c curator call)
+		// + the DNS egress rule (the curator URL is a DNS name that must be
+		// resolved — P1-3). A blank (extra) egress rule {} would match
+		// everything — ALLOW all — and defeat the fence.
+		Expect(np.Spec.Egress).To(HaveLen(2),
+			"the NetworkPolicy must have EXACTLY TWO egress rules (the proxy-allow + DNS)")
 		Expect(np.Spec.Egress[0].To).To(HaveLen(1))
 		peer := np.Spec.Egress[0].To[0]
 		Expect(peer.NamespaceSelector).NotTo(BeNil())
@@ -711,10 +712,10 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(np.Spec.Ingress).To(BeEmpty(),
 			"the drifted allow-all ingress rule {} must be removed (deny-all ingress)")
 		// The drifted allow-all egress rule {} must be GONE (it would match
-		// everything — ALLOW all) and replaced by the desired single
-		// proxy-allow egress rule.
-		Expect(np.Spec.Egress).To(HaveLen(1),
-			"the drifted allow-all egress rule must be replaced by the desired single proxy-allow rule")
+		// everything — ALLOW all) and replaced by the desired two egress
+		// rules (the proxy-allow + the DNS egress rule — P1-3).
+		Expect(np.Spec.Egress).To(HaveLen(2),
+			"the drifted allow-all egress rule must be replaced by the desired proxy-allow + DNS rules")
 		Expect(np.Spec.Egress[0].To).To(HaveLen(1))
 		peer := np.Spec.Egress[0].To[0]
 		Expect(peer.NamespaceSelector).NotTo(BeNil())

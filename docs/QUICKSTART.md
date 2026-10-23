@@ -372,8 +372,8 @@ KubeArmor and running a Loop with both gates enforcing.
 ### Step 1: Install tools on the VM
 
 ```bash
-# kind (pinned v0.34.0)
-curl -sfSL https://github.com/kubernetes-sigs/kind/releases/download/v0.34.0/kind-linux-amd64 \
+# kind (pinned v0.30.0; v0.34.0 does not exist)
+curl -sfSL https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-linux-amd64 \
   | sudo tee /usr/local/bin/kind >/dev/null && sudo chmod +x /usr/local/bin/kind
 
 # kubectl (pinned v1.34.0)
@@ -385,18 +385,25 @@ curl -sfSL https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl \
 
 ```bash
 # The config disables kindnet; Calico is installed separately.
+# The extraMounts give EVERY node the same host dir for the RWX memory PVC
+# (see "RWX memory", after Step 6); drop them if you do not use Loop memory. Create the
+# host dir first: sudo mkdir -p /srv/local-path-shared && sudo chmod 0777 /srv/local-path-shared
 cat > /tmp/kind-calico.yaml <<'EOF'
 kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha1
-nodes:
-  - role: control-plane
-  - role: worker
-  - role: worker
+apiVersion: kind.x-k8s.io/v1alpha4
 networking:
   disableDefaultCNI: true
+  podSubnet: 10.244.0.0/16
+nodes:
+  - role: control-plane
+    extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
+  - role: worker
+    extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
+  - role: worker
+    extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
 EOF
 
-kind create cluster --name coxswain-d61 --config /tmp/kind-calico.yaml
+kind create cluster --name coxswain-d61 --image kindest/node:v1.34.0 --config /tmp/kind-calico.yaml
 
 # Calico v3.30.1 (pinned)
 kubectl --context kind-coxswain-d61 apply -f \
@@ -410,9 +417,10 @@ kubectl --context kind-coxswain-d61 get nodes -w
 ### Step 3: Install KubeArmor (BPF-LSM)
 
 ```bash
-# karmor CLI (pinned v1.4.9)
-curl -sfSL https://raw.githubusercontent.com/kubearmor/KubeArmor/master/install.sh | \
-  bash -s -- -v 1.7.5
+# karmor CLI (pinned v1.4.9; the installer lives in kubearmor-client, not
+# KubeArmor, whose install.sh is a 404)
+curl -sfSL https://raw.githubusercontent.com/kubearmor/kubearmor-client/main/install.sh | \
+  sudo bash -s -- -b /usr/local/bin v1.4.9
 
 # KubeArmor v1.7.5 with BPF-LSM enforcement + network/process/file viz
 sudo karmor install -b all --viz process,file,network --tag v1.7.5
@@ -425,10 +433,10 @@ karmor probe
 ### Step 4: Install agent-sandbox
 
 ```bash
-kubectl --context kind-coxswain-d61 create namespace agent-sandbox-system
+# The v1.0.4 release manifest (as the Makefile); it creates the namespace.
 kubectl --context kind-coxswain-d61 apply -f \
-  https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/main/config/install.yaml
-kubectl --context kind-coxswain-d61 -n agent-sandbox-system rollout status deploy/agent-sandbox-controller-manager --timeout=120s
+  https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.4/sandbox.yaml
+kubectl --context kind-coxswain-d61 -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
 ```
 
 ### Step 5: Build and load the coxswain images
@@ -463,12 +471,34 @@ ssh <vm> "
 ```bash
 # Render install.yaml with the build tag
 make build-installer IMG=ghcr.io/papawattu/coxswain-controller:$BUILD_TAG
+# With RWX memory (see "RWX memory", after Step 6): add MEMORY_STORAGE_CLASS=local-shared
+#   make build-installer IMG=ghcr.io/papawattu/coxswain-controller:$BUILD_TAG MEMORY_STORAGE_CLASS=local-shared
 
 # Copy to the VM and apply (NO --allow-unenforced, NO --allow-unenforced-network)
 scp dist/install.yaml <vm>:/tmp/install-d61.yaml
 ssh <vm> "kubectl --context kind-coxswain-d61 apply -f /tmp/install-d61.yaml"
 ssh <vm> "kubectl --context kind-coxswain-d61 -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s"
 ```
+
+### RWX memory (optional; Loop memory across nodes)
+
+Loop memory is a ReadWriteMany PVC, and kind's default class is RWO-only. Three
+pieces make it work:
+
+1. **The same host dir mounted at the same path on EVERY node**, a
+   cluster-creation property (the `extraMounts` in Step 2). Without it each node
+   has a private copy and a Loop on another node sees none of the lessons.
+2. **`hack/rwx-storage.sh`** installs a second, pinned local-path provisioner
+   and the `local-shared` StorageClass (volumeBindingMode `Immediate`):
+
+   ```bash
+   hack/rwx-storage.sh --context kind-coxswain-d61
+   ```
+
+   Re-running it is safe. See `docs/OPERATOR.md` ("RWX storage for the memory PVC").
+3. **Point the operator at the class.** On the `install.yaml` path, render it
+   in Step 6 with `MEMORY_STORAGE_CLASS=local-shared` (below); on Helm use
+   `manager.args`.
 
 ### Step 7: Create Secrets
 
@@ -552,13 +582,13 @@ blocked-egress and egress-proxy SNI logs) is under
 
 | Component     | Version | Source |
 |---------------|---------|--------|
-| kind          | v0.34.0 | `github.com/kubernetes-sigs/kind/releases` |
-| kindest/node  | v1.37.0 | `kind` v0.34.0's default node image (`kindest/node:v1.37.0`) |
-| kubectl       | v1.34.0 | `dl.k8s.io` (client; the node is v1.37.0) |
+| kind          | v0.30.0 | `github.com/kubernetes-sigs/kind/releases` (v0.34.0 does not exist) |
+| kindest/node  | v1.34.0 | `kindest/node:v1.34.0`, passed with `--image` |
+| kubectl       | v1.34.0 | `dl.k8s.io` (client) |
 | Calico        | v3.30.1 | `projectcalico/calico/manifests/calico.yaml` |
 | KubeArmor     | v1.7.5  | `karmor install --tag v1.7.5` |
-| karmor CLI    | v1.4.9  | `kubearmor/KubeArmor/install.sh` |
-| agent-sandbox | v0.5.2  | `registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.2` (the VM proof installed v0.5.2; the alpha/beta e2e above uses the v1.0.4 release) |
+| karmor CLI    | v1.4.9  | `kubearmor/kubearmor-client/main/install.sh` |
+| agent-sandbox | v1.0.4  | release `sandbox.yaml`; Deployment `agent-sandbox-controller` (the original VM proof ran v0.5.2) |
 
 ### Known limitations
 

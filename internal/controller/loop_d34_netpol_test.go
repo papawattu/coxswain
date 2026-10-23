@@ -247,7 +247,7 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		reconcileLoop("fqdn-np", ns)
 
 		np := &networkingv1.NetworkPolicy{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "fqdn-np-proxy-netpol"}, np)).To(Succeed()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "fqdn-np-proxy-netpol"}, np)).To(Succeed())
 
 		// The proxy NetPol's egress has the model rule (the last rule).
 		Expect(np.Spec.Egress).To(HaveLen(2), "DNS + model rule")

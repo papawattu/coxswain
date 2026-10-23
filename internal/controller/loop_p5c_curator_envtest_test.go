@@ -90,7 +90,7 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		loop := &coxs.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxs.LoopSpec{
-				Goal: "a test goal",
+				Goal:  "a test goal",
 				Agent: coxs.AgentConfig{
 					// No ModelEndpoint (no model): the curator is disabled.
 				},

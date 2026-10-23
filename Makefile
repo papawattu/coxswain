@@ -472,6 +472,10 @@ build-installer: manifests generate kustomize ## A5: render dist/install.yaml wi
 memory-writer-image-test: kustomize install-helm ## F19: every shipped manifest passes --memory-writer-image = the operator's own image.
 	@KUSTOMIZE="$(KUSTOMIZE)" hack/memory-writer-image-test.sh
 
+.PHONY: rwx-storage-test
+rwx-storage-test: ## F21: execution test of hack/rwx-storage.sh against a stubbed kubectl.
+	@hack/rwx-storage-test.sh
+
 .PHONY: build-installer-test
 build-installer-test: kustomize ## A5: test that build-installer tags every coxswain image in install.yaml (see hack/build-installer-test.sh).
 	@KUSTOMIZE="$(KUSTOMIZE)" hack/build-installer-test.sh

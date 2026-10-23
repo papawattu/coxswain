@@ -378,7 +378,8 @@ spec:
 // memoryWriteCommand is one write pod's command: the script plus <name>
 // <base64> argument pairs.
 func memoryWriteCommand(names []string, files map[string][]byte) []string {
-	cmd := []string{memShell, "-c", memoryWriteScript, "sh"}
+	cmd := make([]string, 0, 4+2*len(names))
+	cmd = append(cmd, memShell, "-c", memoryWriteScript, "sh")
 	for _, n := range names {
 		cmd = append(cmd, n, base64.StdEncoding.EncodeToString(files[n]))
 	}

@@ -124,27 +124,33 @@ func TestMemoryPodManifestHardened(t *testing.T) {
 		if pod.Namespace != "ns1" || pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
 			t.Errorf("ro=%v: namespace/restartPolicy: %s %s", ro, pod.Namespace, pod.Spec.RestartPolicy)
 		}
-		psc := pod.Spec.SecurityContext
-		if psc == nil || psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot || psc.SeccompProfile == nil || psc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
-			t.Errorf("ro=%v: pod securityContext: %+v", ro, psc)
-		}
+		checkPodSecurity(t, ro, &pod)
 		c := pod.Spec.Containers[0]
-		sc := c.SecurityContext
-		if c.Image != memoryPodImage || strings.HasSuffix(c.Image, ":latest") || !strings.Contains(c.Image, ":") {
-			t.Errorf("ro=%v: image must be pinned: %s", ro, c.Image)
-		}
-		if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 65532 || !*sc.RunAsNonRoot ||
-			sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem ||
-			sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation ||
-			sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
-			t.Errorf("ro=%v: container securityContext: %+v", ro, sc)
-		}
 		if got := c.VolumeMounts[0].ReadOnly; got != ro {
 			t.Errorf("ro=%v: mount readOnly=%v", ro, got)
 		}
 		if v := pod.Spec.Volumes[0].PersistentVolumeClaim; v == nil || v.ClaimName != "memory-abc" || v.ReadOnly != ro {
 			t.Errorf("ro=%v: volume claim: %+v", ro, v)
 		}
+	}
+}
+
+func checkPodSecurity(t *testing.T, ro bool, pod *corev1.Pod) {
+	t.Helper()
+	psc := pod.Spec.SecurityContext
+	if psc == nil || psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot || psc.SeccompProfile == nil || psc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("ro=%v: pod securityContext: %+v", ro, psc)
+	}
+	c := pod.Spec.Containers[0]
+	sc := c.SecurityContext
+	if c.Image != memoryPodImage || strings.HasSuffix(c.Image, ":latest") || !strings.Contains(c.Image, ":") {
+		t.Errorf("ro=%v: image must be pinned: %s", ro, c.Image)
+	}
+	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 65532 || !*sc.RunAsNonRoot ||
+		sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem ||
+		sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation ||
+		sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
+		t.Errorf("ro=%v: container securityContext: %+v", ro, sc)
 	}
 }
 

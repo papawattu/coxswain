@@ -69,6 +69,12 @@ check "install.yaml (MEMORY_STORAGE_CLASS=local-shared)" "$TMP/inst/dist/install
 if KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MEMORY_STORAGE_CLASS='a..b' bash "$TMP/inst/hack/build-installer.sh" >/dev/null 2>&1; then
 	echo "FATAL[F22]: invalid MEMORY_STORAGE_CLASS a..b was accepted"; exit 1
 fi
+KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MANAGER_EXTRA_ARGS="--allow-unenforced" bash "$TMP/inst/hack/build-installer.sh" >/dev/null
+n="$(grep -Fc -- "- --allow-unenforced" "$TMP/inst/dist/install.yaml" || true)"
+[ "$n" = "1" ] || { echo "FATAL[F22]: expected exactly one '--allow-unenforced' from MANAGER_EXTRA_ARGS (found $n)"; exit 1; }
+if KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MANAGER_EXTRA_ARGS='--x; rm' bash "$TMP/inst/hack/build-installer.sh" >/dev/null 2>&1; then
+	echo "FATAL[F22]: invalid MANAGER_EXTRA_ARGS was accepted"; exit 1
+fi
 echo "OK[F22]: MEMORY_STORAGE_CLASS renders exactly one --memory-storage-class; unset renders none"
 
 # the Helm chart.

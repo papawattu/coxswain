@@ -470,10 +470,12 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 # F22: optional RWX StorageClass for the memory PVC (e.g. local-shared from
 # hack/rwx-storage.sh); rendered as --memory-storage-class=<value>.
 MEMORY_STORAGE_CLASS ?=
+# F22: other manager flags to append, space-separated (e.g. --allow-unenforced).
+MANAGER_EXTRA_ARGS ?=
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## A5: render dist/install.yaml with ALL coxswain ghcr images tagged from IMG (see hack/build-installer.sh).
 	IMG="$(IMG)" TARGET=build-installer hack/require-img.sh
-	KUSTOMIZE="$(KUSTOMIZE)" IMG="$(IMG)" MEMORY_STORAGE_CLASS="$(MEMORY_STORAGE_CLASS)" hack/build-installer.sh
+	KUSTOMIZE="$(KUSTOMIZE)" IMG="$(IMG)" MEMORY_STORAGE_CLASS="$(MEMORY_STORAGE_CLASS)" MANAGER_EXTRA_ARGS="$(MANAGER_EXTRA_ARGS)" hack/build-installer.sh
 
 .PHONY: memory-writer-image-test
 memory-writer-image-test: kustomize install-helm ## F19: every shipped manifest passes --memory-writer-image = the operator's own image.

@@ -276,7 +276,9 @@ kubectl cox logs <loop> deliver  # the deliver Job log
   kustomize / `install.yaml` path, render with
   `make build-installer IMG=... MEMORY_STORAGE_CLASS=local-shared` (F22): the
   script appends the flag in a temp overlay, no tracked file is edited, and
-  unset means no flag. On Helm use `manager.args`.
+  unset means no flag. Other flags: `MANAGER_EXTRA_ARGS="--flag[=value] ..."`
+  (lab only: `--allow-unenforced` on a cluster without KubeArmor; never use
+  `--allow-unenforced-network` where NetworkPolicy is enforced). On Helm use `manager.args`.
 
 ### RWX storage for the memory PVC (`hack/rwx-storage.sh`)
 
@@ -518,16 +520,21 @@ up on the next reconcile and re-runs the deliver Job.
 
 To remove the operator and all its resources:
 
-```sh
-# Remove the operator (the CRDs, RBAC, the manager Deployment).
-kubectl delete -f install.yaml
+**Order matters.** Delete the Loops (and wait for them to go) BEFORE removing
+the operator. Each Loop carries the `coxswain.wattu.com/checkpoints` finalizer,
+which only the running operator clears; with the operator gone, a Loop and its
+namespace stay `Terminating` forever.
 
-# Remove any running Loops (this deletes the sandbox pods, the verify Jobs,
-# the deliver Jobs, and the workspace PVCs).
+```sh
+# 1. Remove any running Loops (this deletes the sandbox pods, the verify Jobs,
+# the deliver Jobs, and the workspace PVCs). Wait until none are left.
 kubectl get loops -A
 kubectl delete loops --all-namespaces
 
-# Remove the CRDs (if you want a clean cluster).
+# 2. Remove the operator (the CRDs, RBAC, the manager Deployment).
+kubectl delete -f install.yaml
+
+# 3. Remove the CRDs (if you want a clean cluster).
 kubectl delete crd loops.coxswain.wattu.com agentpolicies.coxswain.wattu.com
 ```
 

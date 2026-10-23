@@ -18,6 +18,8 @@
 # to the manager args in the temp overlay, so an install.yaml can enable the
 # RWX memory PVC (see hack/rwx-storage.sh) without hand-patching the
 # Deployment. Unset/empty = no flag (the cluster default class).
+# MANAGER_EXTRA_ARGS (optional, space-separated --flag[=value]) appends other
+# manager flags the same way.
 #
 # The five ghcr arg image names are hardcoded to the release workflow's
 # public prefix (papawattu/coxswain-*); only the TAG is derived from IMG.
@@ -64,6 +66,17 @@ if [ -n "$MEMORY_STORAGE_CLASS" ]; then
 	printf -- '- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: --memory-storage-class=%s\n' \
 		"$MEMORY_STORAGE_CLASS" >> "$OVERLAY/config/manager/install-args.patch.yaml"
 fi
+
+# F22: MANAGER_EXTRA_ARGS (optional, space-separated --flag[=value] tokens) is
+# appended the same way, for flags that have no dedicated knob (e.g. the
+# lab-only --allow-unenforced on a cluster without KubeArmor). Each token must
+# look like --name or --name=value from a conservative charset.
+for a in ${MANAGER_EXTRA_ARGS:-}; do
+	printf '%s' "$a" | grep -Eq '^--[a-z0-9][-a-z0-9]*(=[A-Za-z0-9._:/@,-]*)?$' \
+		|| { echo "Error: MANAGER_EXTRA_ARGS token '$a' is not --flag or --flag=value"; exit 1; }
+	printf -- '- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: %s\n' "$a" \
+		>> "$OVERLAY/config/manager/install-args.patch.yaml"
+done
 
 # Wire the JSON6902 patch into the overlay's manager kustomization. Remove any
 # existing `patches:` block from the copied kustomization (the in-tree file has

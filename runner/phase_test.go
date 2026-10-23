@@ -25,6 +25,13 @@ func s4FakeModel() *testhelper.FakeModel {
 	return testhelper.New(testhelper.ModelResponse{Content: "plan: step one, step two"})
 }
 
+// s4FakeModelAnswer returns a fake model server that answers with the given
+// plain final answer (no tool calls).
+func s4FakeModelAnswer(t *testing.T, answer string) *testhelper.FakeModel {
+	t.Helper()
+	return testhelper.New(testhelper.ModelResponse{Content: answer})
+}
+
 // s4ClaimPath redirects the claim write to a temp file for the test's
 // duration (the real runner writes /dev/termination-log; the unit test cannot
 // and does not need to — the claim's CONTENT is what is under test). It

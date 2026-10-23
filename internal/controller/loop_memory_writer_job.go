@@ -428,7 +428,16 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: &memoryWriterTrue,
 						RunAsUser:    &memoryWriterNonRootUID,
-						RunAsGroup:   &memoryWriterNonRootGID,
+						// P5c kind finding: a dynamically provisioned memory PVC
+						// (e.g. NFS local-shared) is root-owned; the writer pod
+						// (uid 65532) cannot create files in the volume root
+						// without fsGroup. fsGroup sets the group of all files on
+						// the volume to RunAsGroup (65532) and applies the group
+						// permissions to the volume root, so the writer can create
+						// lesson files without a hand chown (the kind run's
+						// permission-denied workaround).
+						FSGroup:    &memoryWriterNonRootGID,
+						RunAsGroup: &memoryWriterNonRootGID,
 						SeccompProfile: &corev1.SeccompProfile{
 							Type: corev1.SeccompProfileTypeRuntimeDefault,
 						},

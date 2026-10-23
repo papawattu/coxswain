@@ -272,7 +272,16 @@ kubectl cox logs <loop> deliver  # the deliver Job log
   `hack/memory-writer-image-test.sh` guards that. Only override it with another
   build of the operator image.
 - `--memory-storage-class` (optional): an RWX-capable StorageClass for the
-  memory PVC (kind's default `rancher.io/local-path` is RWO-only).
+  memory PVC (kind's default `rancher.io/local-path` is RWO-only). On the
+  kustomize / `install.yaml` path, render with
+  `make build-installer IMG=... MEMORY_STORAGE_CLASS=local-shared` (F22): the
+  script appends the flag in a temp overlay, no tracked file is edited, and
+  unset means no flag. Other flags: `MANAGER_EXTRA_ARGS="--flag[=value] ..."`
+  (one line; each token matched whole). `--allow-unenforced` is allowed with a
+  WARNING for lab clusters without KubeArmor (a release build must never pass
+  it). Refused: `--allow-unenforced-network` (always), any `--*-image` flag (the
+  images are pinned by IMG's tag), and any flag already in the rendered args.
+  On Helm use `manager.args`.
 
 ### RWX storage for the memory PVC (`hack/rwx-storage.sh`)
 
@@ -286,6 +295,7 @@ default class:
 ```sh
 hack/rwx-storage.sh --context kind-coxswain          # or --kubeconfig FILE
 # then run the operator with --memory-storage-class=local-shared
+# (install.yaml: make build-installer IMG=... MEMORY_STORAGE_CLASS=local-shared)
 # (import with `cox memory import ... --storage-class local-shared` needs the
 # P5d CLI, PR #186; until that merges, only the operator flag applies)
 ```
@@ -513,16 +523,26 @@ up on the next reconcile and re-runs the deliver Job.
 
 To remove the operator and all its resources:
 
-```sh
-# Remove the operator (the CRDs, RBAC, the manager Deployment).
-kubectl delete -f install.yaml
+**Order matters.** Delete the Loops (and wait for them to go) BEFORE removing
+the operator. Each Loop carries the `coxswain.wattu.com/checkpoints` finalizer,
+which only the running operator clears; with the operator gone, a Loop and its
+namespace stay `Terminating` forever. (F25 removed the other wedge, a missing
+VolumeSnapshot CRD, but an uninstalled operator still strands Loops.)
 
-# Remove any running Loops (this deletes the sandbox pods, the verify Jobs,
-# the deliver Jobs, and the workspace PVCs).
+**Already stuck?** Re-install the operator (`kubectl apply -f install.yaml`); it
+processes the finalizers and the namespaces finish deleting. Do not strip the
+finalizer by hand unless you accept leaving checkpoint snapshots behind.
+
+```sh
+# 1. Remove any running Loops (this deletes the sandbox pods, the verify Jobs,
+# the deliver Jobs, and the workspace PVCs). Wait until none are left.
 kubectl get loops -A
 kubectl delete loops --all-namespaces
 
-# Remove the CRDs (if you want a clean cluster).
+# 2. Remove the operator (the CRDs, RBAC, the manager Deployment).
+kubectl delete -f install.yaml
+
+# 3. Remove the CRDs (if you want a clean cluster).
 kubectl delete crd loops.coxswain.wattu.com agentpolicies.coxswain.wattu.com
 ```
 

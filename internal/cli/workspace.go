@@ -71,6 +71,7 @@ metadata:
     coxswain.io/plan-peek: "%s"
 spec:
   restartPolicy: Never
+  automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
     seccompProfile:

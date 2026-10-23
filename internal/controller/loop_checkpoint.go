@@ -697,7 +697,11 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 		// forever (the dogfood4-df4 repro: the namespace delete hung 52+ min on
 		// the Loop's checkpoint finalizer). NotFound is the same: the snapshot
 		// (or the whole CRD, in a namespace being torn down) is gone.
-		if isNotFound(err) || isForbidden(err) {
+		// F25: a NoMatchError means the VolumeSnapshot CRD is not installed
+		// (the RESTMapper cannot resolve the kind), so there are no snapshots
+		// to GC: done. Without this, a cluster with no snapshot CRDs wedged
+		// every Loop deletion on the checkpoint finalizer.
+		if isNotFound(err) || isForbidden(err) || meta.IsNoMatchError(err) {
 			logf.FromContext(ctx).Info("CleaningUp GC: the checkpoint list was rejected (terminating namespace or gone); the children go away with the namespace (done)",
 				"loop", loop.Name, "namespace", loop.Namespace, "err", err.Error())
 			return true, nil
@@ -752,6 +756,9 @@ func (r *LoopReconciler) gcLoopCheckpoints(ctx context.Context, loop *coxv1alpha
 	if err := r.List(ctx, list,
 		client.InNamespace(loop.Namespace),
 		client.MatchingLabels{"coxswain.wattu.com/loop": loop.Name}); err != nil {
+		if meta.IsNoMatchError(err) {
+			return true, nil // F25: the CRD is absent; nothing remains
+		}
 		return false, fmt.Errorf("re-list checkpoint VolumeSnapshots for GC: %w", err)
 	}
 	// A snapshot with the fork-of label is NOT counted as "remaining" for

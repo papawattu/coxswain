@@ -158,12 +158,12 @@ func checkPodSecurity(t *testing.T, ro bool, pod *corev1.Pod) {
 
 // P2-3: --storage-class must be a DNS-1123 name, and the created PVC is RWX 1Gi.
 func TestValidStorageClass(t *testing.T) {
-	for _, ok := range []string{"", "local-shared", "a", "fast.ssd-1"} {
+	for _, ok := range []string{"", "local-shared", "a", "fast.ssd-1", "a.b.c", "a-b.c-d"} {
 		if err := validStorageClass(ok); err != nil {
 			t.Errorf("%q rejected: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"Bad", "a b", "x\ny: z", "a\"b", "-a", "a-", strings.Repeat("a", 254), "a: {b: c}"} {
+	for _, bad := range []string{"Bad", "a b", "x\ny: z", "a\"b", "-a", "a-", "a..b", "a.-b", "a-.b", ".a", "a.", strings.Repeat("a", 254), "a: {b: c}"} {
 		if err := validStorageClass(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}

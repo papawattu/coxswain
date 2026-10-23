@@ -165,7 +165,10 @@ func (p *peekMemoryReader) peekKubectlCreate(ctx context.Context, stdin string, 
 	if p.kubectlCreate != nil {
 		return p.kubectlCreate(ctx, stdin, args...)
 	}
-	full := memoryKubeArgs()
+	// The command args (create -f -) MUST follow the global flags: the
+	// kind run found this call passed only the globals, so kubectl never
+	// created the peek pod ("memory peek pod not found").
+	full := append(append([]string{}, memoryKubeArgs()...), args...)
 	cmd := exec.CommandContext(ctx, "kubectl", full...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)

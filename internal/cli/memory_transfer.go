@@ -72,7 +72,7 @@ func newMemoryExportCommand() *cobra.Command {
 }
 
 func newMemoryImportCommand() *cobra.Command {
-	var inPath string
+	var inPath, storageClass string
 	c := &cobra.Command{
 		Use:   "import <repo-url> -f file.tar.gz",
 		Short: "Write a memory tarball into the repo's memory PVC (idempotent; manual)",
@@ -82,24 +82,25 @@ func newMemoryImportCommand() *cobra.Command {
 			"(same SHA-256) is skipped, so re-importing changes nothing.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return memoryImportFromFile(cmd.Context(), currentDeps, namespaceOf(), args[0], inPath, cmd.OutOrStdout())
+			return memoryImportFromFile(cmd.Context(), currentDeps, namespaceOf(), args[0], inPath, storageClass, cmd.OutOrStdout())
 		},
 	}
 	c.Flags().StringVarP(&inPath, "file", "f", "", "the tarball to import (required)")
+	c.Flags().StringVar(&storageClass, "storage-class", "", "StorageClass for the memory PVC if import has to create it (default: the cluster default; use an RWX-capable class, the operator's --memory-storage-class)")
 	_ = c.MarkFlagRequired("file")
 	return c
 }
 
-func memoryStoreOf(dc Deps, ns string) MemoryStore {
+func memoryStoreOf(dc Deps, ns, storageClass string) MemoryStore {
 	if dc.MemoryStore != nil {
 		return dc.MemoryStore
 	}
-	return &kubectlMemoryStore{pod: &peekMemoryReader{ns: ns}, ns: ns}
+	return &kubectlMemoryStore{pod: &peekMemoryReader{ns: ns}, ns: ns, storageClass: storageClass}
 }
 
 func memoryExportToFile(ctx context.Context, dc Deps, ns, repoURL, path string, out io.Writer) error {
 	var buf bytes.Buffer
-	n, err := memoryExport(ctx, memoryStoreOf(dc, ns), repoURL, &buf)
+	n, err := memoryExport(ctx, memoryStoreOf(dc, ns, ""), repoURL, &buf)
 	if err != nil {
 		return err
 	}
@@ -110,12 +111,12 @@ func memoryExportToFile(ctx context.Context, dc Deps, ns, repoURL, path string, 
 	return err
 }
 
-func memoryImportFromFile(ctx context.Context, dc Deps, ns, repoURL, path string, out io.Writer) error {
+func memoryImportFromFile(ctx context.Context, dc Deps, ns, repoURL, path, storageClass string, out io.Writer) error {
 	data, err := readFileBounded(path)
 	if err != nil {
 		return err
 	}
-	written, skipped, err := memoryImport(ctx, memoryStoreOf(dc, ns), repoURL, bytes.NewReader(data))
+	written, skipped, err := memoryImport(ctx, memoryStoreOf(dc, ns, storageClass), repoURL, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -243,8 +244,9 @@ func memoryImport(ctx context.Context, store MemoryStore, repoURL string, r io.R
 // kubectlMemoryStore is the real MemoryStore: hardened pods against the
 // memory PVC (read-only for ListFiles; read-write only for WriteFiles).
 type kubectlMemoryStore struct {
-	pod *peekMemoryReader
-	ns  string
+	pod          *peekMemoryReader
+	ns           string
+	storageClass string // "" = the cluster default
 }
 
 const memoryListScript = `for f in /memory/*.txt; do [ -f "$f" ] || continue; printf '%s ' "${f#/memory/}"; base64 "$f" | tr -d '\n'; echo; done`
@@ -283,6 +285,10 @@ func parseMemoryList(out string) (map[string][]byte, error) {
 
 func (k *kubectlMemoryStore) WriteFiles(ctx context.Context, pvcName string, files map[string][]byte) error {
 	if _, err := k.pod.peekKubectlGet(ctx, "get", "pvc", pvcName, "-o", "json"); err != nil {
+		scLine := ""
+		if k.storageClass != "" {
+			scLine = "  storageClassName: " + k.storageClass + "\n"
+		}
 		manifest := fmt.Sprintf(`apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -290,10 +296,10 @@ metadata:
   namespace: %s
 spec:
   accessModes: [ReadWriteMany]
-  resources:
+%s  resources:
     requests:
       storage: 1Gi
-`, pvcName, k.ns)
+`, pvcName, k.ns, scLine)
 		if cerr := k.pod.peekKubectlCreate(ctx, manifest, "create", "-f", "-"); cerr != nil {
 			return fmt.Errorf("create memory PVC %s: %w", pvcName, cerr)
 		}

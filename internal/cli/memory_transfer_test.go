@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -189,7 +190,7 @@ func TestMemoryExportImportFiles(t *testing.T) {
 		t.Fatalf("export must not overwrite an existing file")
 	}
 	dst := &fakeMemoryStore{} // PVC deleted
-	if err := memoryImportFromFile(context.Background(), Deps{MemoryStore: dst}, "default", memTestRepo, path, out); err != nil {
+	if err := memoryImportFromFile(context.Background(), Deps{MemoryStore: dst}, "default", memTestRepo, path, "", out); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 	if strings.Join(shaSet(dst.files), ",") != strings.Join(shaSet(src.files), ",") {
@@ -203,4 +204,32 @@ func TestMemoryExportImportFiles(t *testing.T) {
 // The real script pair, run against a temp dir with only the path substituted.
 func TestMemoryScriptsExecute(t *testing.T) {
 	runMemoryScriptsTest(t)
+}
+
+// Regression (found on kind): the real create path must pass the command args
+// ("create -f -") after the global flags; it once passed only the globals, so
+// no peek pod was ever created. Runs the REAL peekKubectlCreate against a fake
+// kubectl on PATH that records its argv and stdin.
+func TestPeekKubectlCreatePassesArgs(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "argv")
+	script := "#!/bin/sh\necho \"$*\" > " + log + "\ncat > " + log + ".stdin\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	old := Namespace
+	Namespace = "ns1"
+	defer func() { Namespace = old }()
+	p := &peekMemoryReader{ns: "ns1"}
+	if err := p.peekKubectlCreate(context.Background(), "kind: Pod\n", "create", "-f", "-"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, _ := os.ReadFile(log)
+	if strings.TrimSpace(string(got)) != "--namespace ns1 create -f -" {
+		t.Fatalf("kubectl argv = %q, want the globals then create -f -", got)
+	}
+	if in, _ := os.ReadFile(log + ".stdin"); string(in) != "kind: Pod\n" {
+		t.Fatalf("stdin = %q", in)
+	}
 }

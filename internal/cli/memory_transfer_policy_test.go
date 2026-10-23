@@ -9,6 +9,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/papawattu/coxswain/pkg/memorywrite"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
 )
@@ -281,11 +283,141 @@ func TestChunkNames(t *testing.T) {
 	}
 }
 
-// A write failure is reported as a write failure, not a read failure.
 func TestMemoryWriteCommandShape(t *testing.T) {
 	n, b := lessonFile("fix internal/a.go build")
 	cmd := memoryWriteCommand([]string{n}, map[string][]byte{n: b})
 	if len(cmd) != 6 || cmd[0] != memShell || cmd[3] != "sh" || cmd[4] != n {
 		t.Fatalf("command: %v", cmd)
+	}
+}
+
+// D1: a lesson already on the PVC is "skipped", never "dropped", even if
+// today's write policy would reject it (a lesson an older writer accepted):
+// a no-op re-import changes nothing and exits 0.
+func TestMemoryImportAlreadyPresentIsNotDropped(t *testing.T) {
+	old := "use aws_secret_access_key=" + "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" + " in cmd/aws.go" // rejected by today's rules
+	if s, _ := memorywriteScreen(old); len(s) != 0 {
+		t.Fatalf("test bug: %q must be rejected by the policy", old)
+	}
+	dst := newStore(old) // an older writer accepted it
+	path := filepath.Join(t.TempDir(), "m.tar.gz")
+	if err := os.WriteFile(path, tarballOf(t, dst), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := &strings.Builder{}
+	if err := memoryImportFromFile(context.Background(), Deps{MemoryStore: dst}, "default", memTestRepo, path, "", out); err != nil {
+		t.Fatalf("a no-op re-import must exit 0: %v\n%s", err, out)
+	}
+	if !strings.Contains(out.String(), "skipped 1 already present, dropped 0") || len(dst.writes) != 0 {
+		t.Fatalf("output %q writes %v", out.String(), dst.writes)
+	}
+	// ...but the SAME lesson arriving as NEW is dropped.
+	fresh := newStore()
+	if err := os.WriteFile(path, tarballOf(t, newStore(old)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := memoryImportFromFile(context.Background(), Deps{MemoryStore: fresh}, "default", memTestRepo, path, "", &strings.Builder{}); err == nil || len(fresh.files) != 0 {
+		t.Fatalf("a new unsafe lesson must be dropped: err=%v files=%d", err, len(fresh.files))
+	}
+}
+
+func memorywriteScreen(l string) ([]string, []string) { return memorywrite.Screen([]string{l}) }
+
+// fakeKubectlDir installs a fake kubectl on PATH that answers the memory
+// pod flow (get pvc, create -f -, get pod, logs, delete), saving every
+// create's stdin to create.<n>; `get pvc` fails until it has been created
+// when pvcMissing. Returns the dir.
+func fakeKubectlDir(t *testing.T, pvcMissing bool, podLog string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "podlog"), []byte(podLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := "0"
+	if pvcMissing {
+		missing = "1"
+	}
+	script := `#!/bin/sh
+d="` + dir + `"
+case " $* " in
+*" get pvc "*)
+  if [ "` + missing + `" = 1 ] && ! ls "$d"/create.* >/dev/null 2>&1; then exit 1; fi
+  echo '{}'; exit 0 ;;
+*" create -f - "*)
+  n=$(ls "$d" | grep -c '^create\.'); cat > "$d/create.$n"; exit 0 ;;
+*" get pod -l "*) printf podx; exit 0 ;;
+*" get pod podx "*) echo '{"status":{"phase":"Succeeded"}}'; exit 0 ;;
+*" logs "*) cat "$d/podlog"; exit 0 ;;
+*" delete "*) exit 0 ;;
+esac
+echo "unexpected: $*" >&2; exit 99
+`
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir
+}
+
+func readCreate(t *testing.T, dir string, n int) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("create.%d", n)))
+	if err != nil {
+		t.Fatalf("create.%d: %v", n, err)
+	}
+	return string(b)
+}
+
+// D2: the pod the REAL store actually submits (not just the renderer) is
+// read-only for listing, read-write only for writing, tokenless and pinned.
+func TestKubectlMemoryStoreSubmitsHardenedPods(t *testing.T) {
+	n, b := lessonFile("fix internal/a.go build")
+	dir := fakeKubectlDir(t, false, n+" "+base64.StdEncoding.EncodeToString(b)+"\n")
+	k := &kubectlMemoryStore{pod: &peekMemoryReader{ns: "ns1"}, ns: "ns1"}
+
+	got, err := k.ListFiles(context.Background(), "memory-abc")
+	if err != nil || string(got[n]) != string(b) {
+		t.Fatalf("ListFiles = %v, %v", got, err)
+	}
+	list := readCreate(t, dir, 0)
+	if strings.Count(list, "readOnly: true") != 2 || strings.Contains(list, "readOnly: false") {
+		t.Errorf("the list pod must mount the PVC read-only:\n%s", list)
+	}
+
+	if err := k.WriteFiles(context.Background(), "memory-abc", map[string][]byte{n: b}); err != nil {
+		t.Fatal(err)
+	}
+	write := readCreate(t, dir, 1)
+	if strings.Count(write, "readOnly: false") != 2 || strings.Contains(write, "readOnly: true") {
+		t.Errorf("the write pod must mount the PVC read-write:\n%s", write)
+	}
+	if !strings.Contains(write, n) {
+		t.Errorf("the write pod must carry the lesson name")
+	}
+	for name, m := range map[string]string{"list": list, "write": write} {
+		if !strings.Contains(m, "automountServiceAccountToken: false") {
+			t.Errorf("%s pod must not mount an SA token:\n%s", name, m)
+		}
+		if !strings.Contains(m, "image: "+memoryPodImage) {
+			t.Errorf("%s pod must use the pinned image %s", name, memoryPodImage)
+		}
+	}
+}
+
+// The PVC import creates when absent is what is submitted (RWX, 1Gi, the
+// requested class), then the write pod follows.
+func TestKubectlMemoryStoreCreatesMissingPVC(t *testing.T) {
+	dir := fakeKubectlDir(t, true, "")
+	k := &kubectlMemoryStore{pod: &peekMemoryReader{ns: "ns1"}, ns: "ns1", storageClass: "local-shared"}
+	n, b := lessonFile("fix internal/a.go build")
+	if err := k.WriteFiles(context.Background(), "memory-abc", map[string][]byte{n: b}); err != nil {
+		t.Fatal(err)
+	}
+	pvc := readCreate(t, dir, 0)
+	if !strings.Contains(pvc, "kind: PersistentVolumeClaim") || !strings.Contains(pvc, "storageClassName: local-shared") || !strings.Contains(pvc, "ReadWriteMany") {
+		t.Errorf("PVC submitted:\n%s", pvc)
+	}
+	if !strings.Contains(readCreate(t, dir, 1), "kind: Pod") {
+		t.Errorf("the write pod must follow the PVC")
 	}
 }

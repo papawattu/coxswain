@@ -99,7 +99,11 @@ func newMemoryImportCommand() *cobra.Command {
 		Long: "cox memory import writes the lessons in a tarball made by `cox memory export`\n" +
 			"into the memory PVC for <repo-url> in the current namespace, creating the PVC\n" +
 			"(RWX, 1Gi, default StorageClass) when it is absent. A lesson already present\n" +
-			"(same SHA-256) is skipped, so re-importing changes nothing.",
+			"(same SHA-256) is skipped, so re-importing changes nothing. Every NEW lesson\n" +
+			"is screened by the same static write policy a Loop's lessons go through\n" +
+			"(size, path/error anchor, secrets patterns): a lesson that fails is dropped\n" +
+			"and listed with its rule, the rest are imported, and the command exits\n" +
+			"non-zero if anything was dropped (there is no --strict; it is always strict).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return memoryImportFromFile(cmd.Context(), currentDeps, namespaceOf(), args[0], inPath, storageClass, cmd.OutOrStdout())
@@ -271,15 +275,28 @@ func memoryImport(ctx context.Context, store MemoryStore, repoURL string, r io.R
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	// The static screen, per lesson, in a stable order.
+	existing, err := store.ListFiles(ctx, name)
+	if err != nil && !isNoMemoryErr(err) {
+		return 0, 0, nil, fmt.Errorf("read memory PVC %s: %w", name, err)
+	}
+	// Presence is checked BEFORE the screen: a lesson already on the PVC is
+	// "skipped (already present)", never "dropped" (nothing is written, the
+	// PVC is unchanged, so a no-op re-import must exit 0 even if today's rules
+	// would reject a lesson an older writer accepted). Then the static screen,
+	// per new lesson, in a stable order.
 	names := make([]string, 0, len(files))
 	for n := range files {
 		names = append(names, n)
 	}
 	slices.Sort(names)
 	var dropped []droppedLesson
-	screened := map[string][]byte{}
+	toWrite := map[string][]byte{}
+	skipped := 0
 	for _, n := range names {
+		if _, dup := existing[n]; dup {
+			skipped++
+			continue
+		}
 		text := strings.TrimSuffix(string(files[n]), "\n")
 		survivors, reasons := memorywrite.Screen([]string{text})
 		if len(survivors) != 1 {
@@ -290,22 +307,9 @@ func memoryImport(ctx context.Context, store MemoryStore, repoURL string, r io.R
 			dropped = append(dropped, droppedLesson{Name: n, Reason: reason})
 			continue
 		}
-		screened[n] = files[n]
+		toWrite[n] = files[n]
 	}
-	existing, err := store.ListFiles(ctx, name)
-	if err != nil && !isNoMemoryErr(err) {
-		return 0, 0, nil, fmt.Errorf("read memory PVC %s: %w", name, err)
-	}
-	toWrite := map[string][]byte{}
-	skipped := 0
-	for n, body := range screened {
-		if _, dup := existing[n]; dup {
-			skipped++
-			continue
-		}
-		toWrite[n] = body
-	}
-	if len(toWrite) > 0 || (isNoMemoryErr(err) && len(screened) > 0) {
+	if len(toWrite) > 0 {
 		if werr := store.WriteFiles(ctx, name, toWrite); werr != nil {
 			return 0, 0, dropped, fmt.Errorf("write memory PVC %s: %w", name, werr)
 		}

@@ -60,9 +60,10 @@ sed -e "s|__TAG__|$TAG|g" "$ROOT/hack/install-args.patch.tpl" \
 # YAML into the patch.
 MEMORY_STORAGE_CLASS="${MEMORY_STORAGE_CLASS:-}"
 if [ -n "$MEMORY_STORAGE_CLASS" ]; then
-	printf '%s' "$MEMORY_STORAGE_CLASS" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$' \
-		&& [ "${#MEMORY_STORAGE_CLASS}" -le 253 ] \
-		|| { echo "Error: MEMORY_STORAGE_CLASS=$MEMORY_STORAGE_CLASS is not a valid StorageClass name"; exit 1; }
+	if [ "${#MEMORY_STORAGE_CLASS}" -gt 253 ] || ! printf '%s' "$MEMORY_STORAGE_CLASS" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'; then
+		echo "Error: MEMORY_STORAGE_CLASS=$MEMORY_STORAGE_CLASS is not a valid StorageClass name"
+		exit 1
+	fi
 	printf -- '- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: --memory-storage-class=%s\n' \
 		"$MEMORY_STORAGE_CLASS" >> "$OVERLAY/config/manager/install-args.patch.yaml"
 fi

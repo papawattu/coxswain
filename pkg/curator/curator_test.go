@@ -200,3 +200,52 @@ func TestCuratorTrimsReason(t *testing.T) {
 		t.Errorf("Reason length = %d, want ≤201 (trimmed to 200)", len(v.Reason))
 	}
 }
+
+// TestCuratorUnknownFieldRejected: the P3 strict parse rejects a JSON object
+// with a field other than "keep"/"reason" (an unknown field is unparseable).
+func TestCuratorUnknownFieldRejected(t *testing.T) {
+	content := `{"keep": true, "reason": "ok", "extra": "field"}`
+	srv := fakeProxy(t, content, http.StatusOK)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "test-model")
+	v := c.Judge(context.Background(), "a lesson")
+	if v.Keep {
+		t.Errorf("Keep = true on unknown-field response, want false (strict parse rejects unknown fields)")
+	}
+	if !strings.Contains(v.Reason, "unknown field") {
+		t.Errorf("Reason = %q, want a mention of the unknown field", v.Reason)
+	}
+}
+
+// TestCuratorFencedJSONStripped: the P3 strict parse strips fenced JSON
+// (```json ... ```) before parsing (a model that wraps the JSON in fences is
+// a deviation, but the content is still parseable).
+func TestCuratorFencedJSONStripped(t *testing.T) {
+	content := "```json\n{\"keep\": true, \"reason\": \"ok\"}\n```"
+	srv := fakeProxy(t, content, http.StatusOK)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "test-model")
+	v := c.Judge(context.Background(), "a lesson")
+	if !v.Keep {
+		t.Errorf("Keep = false, want true (fenced JSON is stripped and parsed)")
+	}
+}
+
+// TestCuratorCRStrip: the P3 CR/LF stripping removes newlines from the
+// model-supplied reason before it goes into the line-based summary.
+func TestCuratorCRStrip(t *testing.T) {
+	content := `{"keep": true, "reason": "line1\nline2"}`
+	srv := fakeProxy(t, content, http.StatusOK)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "test-model")
+	v := c.Judge(context.Background(), "a lesson")
+	if !v.Keep {
+		t.Errorf("Keep = false, want true")
+	}
+	if strings.Contains(v.Reason, "\n") || strings.Contains(v.Reason, "\r") {
+		t.Errorf("Reason = %q contains a newline; CR/LF must be stripped", v.Reason)
+	}
+}

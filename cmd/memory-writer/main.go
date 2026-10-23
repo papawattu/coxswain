@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/papawattu/coxswain/pkg/curator"
 	"github.com/papawattu/coxswain/pkg/memorywrite"
@@ -222,9 +223,29 @@ func run(outcome string) (int, error) {
 	} else {
 		curModel := curatorModelFromEnv()
 		curClient := curator.NewClient(curBase, curModel)
-		curCtx := context.Background()
+		// P2-3: the curator's per-lesson timeout is 60s. With up to 11
+		// lessons (the runner's 10 + the seed), 60s × 11 = 660s — far
+		// beyond the Job's 300s deadline. An overall budget (120s) ensures
+		// the curator loop cannot exceed the Job's deadline; lessons that
+		// are not judged before the budget expires are dropped as
+		// "curator unavailable" (fail-closed: no lesson is written without
+		// a true verdict).
+		curBudget := 120 * time.Second
+		curCtx, cancel := context.WithTimeout(context.Background(), curBudget)
+		defer cancel()
 		var curated []string
 		for _, s := range survivors {
+			if curCtx.Err() != nil {
+				// The overall budget is exhausted: drop this survivor (and
+				// any remaining) as "curator unavailable".
+				for j := range lessons {
+					if lessons[j] == s && reasons[j] == "" {
+						reasons[j] = "curator unavailable"
+						break
+					}
+				}
+				continue
+			}
 			v := curClient.Judge(curCtx, s)
 			if v.Keep {
 				curated = append(curated, s)

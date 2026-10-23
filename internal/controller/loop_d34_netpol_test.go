@@ -228,6 +228,50 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		}))
 	})
 
+	It("proxy NetworkPolicy: Service-FQDN model endpoint scopes egress to the endpoint's namespace + port (P2-2)", func() {
+		// P2-2: the modelPeer's Service-FQDN peer (a model endpoint that is a
+		// same-cluster Service FQDN, e.g. svc.ns.svc) allows egress to every
+		// pod in the named namespace. The agent can't change the endpoint
+		// (immutable spec field), so this isn't an agent escape, but it is
+		// broader than necessary. The egress rule is scoped to the endpoint's
+		// port (already done by the caller) — this spec pins that scoping and
+		// the cross-namespace namespaceSelector.
+		ns := "d34-fqdn-netpol"
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		makeSecret("fqdn-creds", ns)
+
+		// A Service FQDN in a DIFFERENT namespace (the model is in another
+		// namespace — the cross-namespace allow).
+		loop := buildLoopWithNetPol("fqdn-np", ns, "fqdn-creds", "vllm-svc.other-ns.svc:8000")
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcileLoop("fqdn-np", ns)
+
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "fqdn-np-proxy-netpol"}, np)).To(Succeed()
+
+		// The proxy NetPol's egress has the model rule (the last rule).
+		Expect(np.Spec.Egress).To(HaveLen(2), "DNS + model rule")
+		modelRule := np.Spec.Egress[1]
+
+		// The model rule's peer is a namespaceSelector for the Service's
+		// namespace (other-ns) — the cross-namespace allow (documented in
+		// ADR-0007).
+		Expect(modelRule.To).To(HaveLen(1))
+		peer := modelRule.To[0]
+		Expect(peer.NamespaceSelector).ToNot(BeNil(),
+			"the Service-FQDN model peer must be a namespaceSelector (the cross-namespace allow)")
+		Expect(peer.NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+			"kubernetes.io/metadata.name", "other-ns",
+		), "the namespaceSelector must name the Service's namespace")
+
+		// The model rule is scoped to the endpoint's port (8000) — the P2-2
+		// scoping (not every port in the namespace).
+		Expect(modelRule.Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
+			Protocol: new(corev1.ProtocolTCP),
+			Port:     intstrPtr(8000),
+		}), "the model egress rule must be scoped to the endpoint's port (P2-2)")
+	})
+
 	It("adds the egress-proxy peer to the agent NetworkPolicy when the referenced policy gains a network allow (I43 same-Loop)", func() {
 		ns := "d34-i43-same" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

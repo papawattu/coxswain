@@ -115,7 +115,11 @@ func (c *Client) Judge(ctx context.Context, lesson string) Verdict {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(resp.Body)
+	// P3: bound the io.ReadAll of the proxy response (a runaway response
+	// would exhaust the Job's memory). 1 MiB is far more than any curator
+	// verdict needs (the strict JSON is <200 bytes).
+	limitedBody := io.LimitReader(resp.Body, 1<<20) // 1 MiB
+	raw, err := io.ReadAll(limitedBody)
 	if err != nil {
 		return Verdict{Keep: false, Reason: "curator unavailable (read error)"}
 	}
@@ -139,9 +143,41 @@ func (c *Client) Judge(ctx context.Context, lesson string) Verdict {
 	}
 
 	// Strict-parse the assistant's content: it must be a JSON object with
-	// exactly the fields "keep" (bool) and "reason" (string). Any deviation
-	// (non-JSON, extra fields, wrong types) is keep=false.
+	// EXACTLY the fields "keep" (bool) and "reason" (string). Any deviation
+	// (non-JSON, extra fields, wrong types, fenced JSON) is keep=false.
+	//
+	// P3: the strict parse rejects unknown fields (a JSON object with a
+	// field other than "keep"/"reason" is unparseable) and fenced JSON
+	// (```json ... ```). The model is instructed to respond ONLY with the
+	// strict JSON object; a fenced response is a model deviation that must
+	// not be silently accepted.
 	content := strings.TrimSpace(envelope.Choices[0].Message.Content)
+	// Reject fenced JSON (```json ... ``` or ``` ... ```).
+	if strings.HasPrefix(content, "```") {
+		// Strip the fences (a model that wraps the JSON in fences is a
+		// deviation, but the content is still parseable — the plan's strict
+		// parse is about the JSON object's shape, not the wrapper).
+		if strings.HasSuffix(content, "```") {
+			inner := content[3 : len(content)-3]
+			inner = strings.TrimPrefix(inner, "json")
+			inner = strings.TrimSpace(inner)
+			content = inner
+		} else {
+			// Malformed fence (no closing): unparseable.
+			return Verdict{Keep: false, Reason: "curator unparseable (fenced)"}
+		}
+	}
+	// Strict-parse: reject unknown fields (a JSON object with a field other
+	// than "keep"/"reason" is unparseable).
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &fields); err != nil {
+		return Verdict{Keep: false, Reason: "curator unparseable (content)"}
+	}
+	for key := range fields {
+		if key != "keep" && key != "reason" {
+			return Verdict{Keep: false, Reason: "curator unparseable (unknown field: " + key + ")"}
+		}
+	}
 	var v Verdict
 	if err := json.Unmarshal([]byte(content), &v); err != nil {
 		return Verdict{Keep: false, Reason: "curator unparseable (content)"}
@@ -152,6 +188,11 @@ func (c *Client) Judge(ctx context.Context, lesson string) Verdict {
 	if v.Reason == "" {
 		v.Reason = "curator returned empty reason"
 	}
+	// P3: strip CR/LF from the model-supplied reason before it goes into the
+	// line-based summary (a multi-line reason would corrupt the summary).
+	v.Reason = strings.ReplaceAll(v.Reason, "\r\n", " ")
+	v.Reason = strings.ReplaceAll(v.Reason, "\n", " ")
+	v.Reason = strings.ReplaceAll(v.Reason, "\r", " ")
 	runes := []rune(v.Reason)
 	if len(runes) > 200 {
 		v.Reason = string(runes[:200]) + "…"

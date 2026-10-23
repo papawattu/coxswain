@@ -44,6 +44,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -718,13 +719,34 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 	// message names the deadline so the review sees the hang.
 	deadlineExceeded := jobHasConditionReason(job, batchv1.JobFailed, batchv1.JobReasonDeadlineExceeded)
 	podPhase := pod.Status.Phase
+	// The bounded summary (the termination message). The container's
+	// TerminationMessagePolicy is FallbackToLogsOnError, so a pod that crashed
+	// before the summary was written may carry a message; an empty message is
+	// "no summary" (the audit falls back to the plain completion form). The
+	// summary is the curator's verdict record (item 7, the Phase 5 done-when
+	// PLAN.md:85): the operator records every per-lesson line on the Loop
+	// (a Normal Event + the MemoryWriteDone condition message) so
+	// `kubectl cox describe` shows which lessons were written and why.
+	summary := memoryWriterSummary(pod)
 	switch podPhase {
 	case corev1.PodSucceeded:
 		// The Job's pod succeeded: the write completed (whether or not any
-		// lesson was eligible). Record MemoryWritten.
-		setMemoryWriterCondition(loop, memoryWrittenReason,
-			"memory write completed (the Job's pod succeeded; the eligible lessons are on the memory PVC)")
+		// lesson was eligible). Record MemoryWritten (the condition message
+		// carries the audit trail: the counts + one line per lesson with its
+		// sha256-prefix, written|dropped, and the reason — the curator's
+		// verdict, item 7). The Normal Event carries the same text (a
+		// separate Event per lesson would spam the Event stream on a large
+		// write); the Event fires only on a reason transition (setCondition
+		// returns whether the condition actually changed this reconcile,
+		// so re-reconciles of the same terminal outcome do not re-emit).
+		transitioned := setMemoryWriterCondition(loop, memoryWrittenReason,
+			memoryWriteAuditMessage(summary))
+		if transitioned && r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
+				"memory write audit: %s", memoryWriteAuditText(summary))
+		}
 		return false
+
 	case corev1.PodFailed:
 		// The Job's pod failed: a write failure. Record MemoryWriteFailed +
 		// a Warning Event (the Loop still Succeeds, ADR-0004). When the
@@ -820,10 +842,86 @@ func jobHasConditionReason(job *batchv1.Job, condType batchv1.JobConditionType, 
 // fail the Loop, ADR-0004, but it IS surfaced). The condition is a
 // status-only change (the operator updates it via Status().Update; it does
 // NOT change the phase machine — ADR-0005: the claim channel is the only
-// thing that advances).
-func setMemoryWriterCondition(loop *coxv1alpha1.Loop, reason, message string) {
+// thing that advances). Returns true when the condition was created or
+// changed this call (the caller uses this to gate the audit-trail Event so
+// re-reconciles of the same terminal outcome do not re-emit it, item 7).
+func setMemoryWriterCondition(loop *coxv1alpha1.Loop, reason, message string) bool {
+	prev := ""
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == memoryWriterConditionType {
+			prev = loop.Status.Conditions[i].Reason
+			break
+		}
+	}
 	status := metav1.ConditionTrue
 	setCondition(loop, memoryWriterConditionType, status, reason, message)
+	// setCondition is a no-op when (status, reason, message) is unchanged,
+	// so "reason changed OR condition was absent" is the transition signal
+	// (a reason change with the same message still fires the audit Event).
+	if prev == "" {
+		return true
+	}
+	cur := ""
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == memoryWriterConditionType {
+			cur = loop.Status.Conditions[i].Reason
+			break
+		}
+	}
+	return cur != prev
+}
+
+// memoryWriterSummary returns the Job's bounded summary (the termination
+// message: the last container's terminated state's Message). It is the
+// curator's verdict record (item 7). An empty string means "no summary"
+// (the pod crashed before the summary was written, or the message is empty
+// — the audit then falls back to the plain completion form).
+func memoryWriterSummary(pod *corev1.Pod) string {
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.State.Terminated != nil {
+			return strings.TrimSpace(cs.State.Terminated.Message)
+		}
+	}
+	return ""
+}
+
+// memoryWriteAuditMessage builds the MemoryWriteDone condition's message
+// from the bounded summary (item 7, the Phase 5 done-when PLAN.md:85):
+// "memory write completed — audit: " + the per-lesson verdict lines (one
+// line each: "lesson-<n> <sha12> written|dropped <reason>") + the counts
+// line. The summary is the Job's own output (never lesson text — the Job's
+// summary lines carry only the sha256-prefix, written|dropped, and the
+// rule), so echoing it on the Loop leaks no lesson content. A failed write
+// is UNRELIABLE evidence (the write did not complete) and gets the plain
+// failure message — the operator does not fabricate an audit for a write
+// that did not happen. An empty summary (no termination message) falls
+// back to the plain completion message (pre-existing P5b behavior).
+func memoryWriteAuditMessage(summary string) string {
+	if summary == "" {
+		return "memory write completed (the Job's pod succeeded; the eligible lessons are on the memory PVC)"
+	}
+	return "memory write completed — audit: " + memoryWriteAuditText(summary)
+}
+
+// memoryWriteAuditText is the bounded audit text: the summary's lines
+// joined with a single space. The per-lesson lines already carry the
+// verdict (written|dropped + the one-line reason — the curator's
+// "<reason>" string, or the static rule name), so the text shows which
+// lessons were written and why. The Event's message is capped by
+// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes, so
+// the audit text is truncated to 1000 bytes here (the per-lesson lines are
+// ≤ ~80 bytes each; the truncation never cuts mid-lesson for the bounded
+// lesson count the policy enforces). The truncation is BOUNDED and never
+// includes lesson text (the summary lines are sha-prefix + status + rule).
+func memoryWriteAuditText(summary string) string {
+	const max = 1000
+	text := strings.ReplaceAll(summary, "\n", " ")
+	text = strings.TrimSpace(text)
+	if len(text) > max {
+		return text[:max] + "…"
+	}
+	return text
 }
 
 // memoryWriterTrue / memoryWriterFalse are the bool values the memory-writer

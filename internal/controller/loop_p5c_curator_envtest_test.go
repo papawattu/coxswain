@@ -23,6 +23,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -31,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 
 	coxs "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -184,9 +186,12 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 	It("records the curator's verdict on the MemoryWriteDone condition (the audit trail)", func() {
 		// The curator's verdict (the one-line reason) is recorded in the
 		// bounded summary (the Job's termination message). The operator
-		// reads the summary and records it on the MemoryWriteDone condition.
+		// reads the summary and records it on the MemoryWriteDone condition
+		// AND emits a Normal Event (item 7, the Phase 5 done-when
+		// PLAN.md:85: `kubectl cox describe` shows which lessons were
+		// written and why). A FakeRecorder makes the Event text assertable.
 		name := "p5c-audit"
-		rr := s6SucceededLessonsAvailable(name, ns)
+		_ = s6SucceededLessonsAvailable(name, ns)
 
 		job := p5bGetMemoryJob(ns, name)
 		// Simulate the Job completing with a curator drop in the summary:
@@ -197,14 +202,68 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 			"lesson-001 aaaa11111111 dropped curator: too generic\n"+
 				"lesson-002 bbbb22222222 written eligible\n"+
 				"summary: total=2 written=1 dropped=1")
-		s6Reconcile(rr, ns, name)
 
-		// The MemoryWriteDone condition is set (the write completed).
+		// A reconciler with a FakeRecorder (the Event is emitted in this
+		// reconcile).
+		recorder := record.NewFakeRecorder(64)
+		rec := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		s6Reconcile(rec, ns, name)
+
+		// The MemoryWriteDone condition is set (the write completed) and its
+		// message carries the audit trail (the per-lesson verdicts: the
+		// sha-prefix, written|dropped, and the reason — the curator's
+		// verdict).
 		loop := p5bMustLoop(ns, name)
 		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
 		Expect(cond).NotTo(BeNil(), "the MemoryWriteDone condition must be set")
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(memoryWrittenReason))
+		Expect(cond.Message).To(ContainSubstring("audit:"),
+			"the condition message must carry the audit trail (item 7)")
+		Expect(cond.Message).To(ContainSubstring("lesson-001 aaaa11111111 dropped curator: too generic"),
+			"the condition must record the dropped lesson's sha-prefix + curator verdict")
+		Expect(cond.Message).To(ContainSubstring("lesson-002 bbbb22222222 written eligible"),
+			"the condition must record the written lesson")
+		Expect(cond.Message).To(ContainSubstring("summary: total=2 written=1 dropped=1"),
+			"the condition must record the counts line")
+
+		// The Normal Event carries the same audit text (the transient signal;
+		// the condition is the durable record).
+		events := drainEvents(recorder)
+		auditEventSeen := false
+		for _, e := range events {
+			if strings.Contains(e, "Normal MemoryWritten") && strings.Contains(e, "memory write audit") {
+				auditEventSeen = true
+			}
+		}
+		Expect(auditEventSeen).To(BeTrue(),
+			"a Normal MemoryWritten audit Event must be emitted (item 7)")
+	})
+
+	It("emits the audit Event exactly once per terminal write (a re-reconcile does not re-emit it)", func() {
+		// Item 7 (no Event spam): the audit Event fires only when the
+		// MemoryWriteDone condition's reason transitions. A second reconcile
+		// of the same terminal outcome must NOT re-emit the Event (the
+		// condition is unchanged — setCondition is a no-op, the reason did
+		// not change).
+		name := "p5c-audit-once"
+		_ = s6SucceededLessonsAvailable(name, ns)
+		job := p5bGetMemoryJob(ns, name)
+		p5bFabricateJobPod(ns, job, corev1.PodSucceeded)
+		p5bSetJobPodTerminationMessage(ns, name,
+			"lesson-001 aaaa11111111 written eligible\nsummary: total=1 written=1 dropped=0")
+		recorder := record.NewFakeRecorder(64)
+		rec := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		s6Reconcile(rec, ns, name)
+		// First reconcile: exactly one audit Event.
+		events1 := drainEvents(recorder)
+		Expect(events1).To(HaveLen(1), "the first terminal reconcile emits exactly one audit Event")
+		Expect(events1[0]).To(ContainSubstring("Normal MemoryWritten"))
+		Expect(events1[0]).To(ContainSubstring("memory write audit"))
+		// Second reconcile: the condition is unchanged — NO new Event.
+		s6Reconcile(rec, ns, name)
+		events2 := drainEvents(recorder)
+		Expect(events2).To(BeEmpty(), "a re-reconcile of the same terminal outcome must not re-emit the audit Event")
 	})
 })
 

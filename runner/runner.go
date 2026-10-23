@@ -148,6 +148,14 @@ type Result struct {
 	// the new Planning phase).
 	PlanAttempt int `json:"planAttempt,omitempty"`
 
+	// P5b: true when the runner wrote a non-empty
+	// <workspace>/.coxswain/lessons.json on this run. It rides into the ADR-0004
+	// claim (the operator's lessonsAvailable gate reads it from status.progress).
+	// The caller (PhaseRun / Run) sets this field BEFORE calling writeClaim
+	// (the claim struct's lessonsAvailable field is a plain bool, not a function
+	// call — writeClaim has no workspace path to read the lessons file itself).
+	LessonsAvailable bool `json:"lessonsAvailable"`
+
 	// S5a (B3): the 40-hex head commit SHA the runner committed to at the end
 	// of a successful Implementing run (committed in the workspace repo with
 	// the agent's committed work). It rides into the ADR-0004 claim and the

@@ -519,6 +519,77 @@ func TestWriteClaimCarriesIteration(t *testing.T) {
 	}
 }
 
+// TestWriteClaimCarriesLessonsAvailable (P5b): the lessonsFileAvailable
+// helper (the input to writeClaim's lessonsAvailable field) MUST report true
+// when the runner wrote a <workspace>/.coxswain/lessons.json file on this
+// run, and false when it did not. The operator's lessonsAvailable gate (the
+// memory-writer Job's eligibility) reads claim.LessonsAvailable from
+// status.progress: a terminal Loop with lessonsAvailable false or absent gets
+// NO writer Job (the retroactive-write protection — an old terminal Loop that
+// never proposed lessons must not get a write job after an operator upgrade).
+func TestWriteClaimCarriesLessonsAvailable(t *testing.T) {
+	// The lessons-present case: the file exists on the workspace volume and
+	// the helper MUST report it (the claim then carries lessonsAvailable
+	// true, and the operator creates the writer Job once the Loop is
+	// terminal).
+	workspace := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workspace, resultDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, resultDirName, "lessons.json"),
+		[]byte(`["internal/round/round.go: the round-half test fails"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !lessonsFileAvailable(workspace) {
+		t.Fatalf("lessonsFileAvailable = false, want true (the lessons file " +
+			"exists on the workspace volume)")
+	}
+
+	// The lessons-absent case: no file on the workspace (a fresh run with
+	// nothing to persist) — the helper reports false (the honest no-lessons
+	// report; the claim then carries lessonsAvailable false, and the
+	// operator skips the write).
+	workspace2 := t.TempDir()
+	if lessonsFileAvailable(workspace2) {
+		t.Fatalf("lessonsFileAvailable = true, want false (no lessons file " +
+			"on the workspace volume)")
+	}
+
+	// The lessons-absent case (a directory named lessons.json is NOT a
+	// lessons file): the helper reports false (a directory is not a valid
+	// lessons file; the operator's exec-read would fail to parse it anyway).
+	if err := os.MkdirAll(filepath.Join(workspace2, resultDirName, "lessons.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if lessonsFileAvailable(workspace2) {
+		t.Fatalf("lessonsFileAvailable = true for a DIRECTORY named " +
+			"lessons.json, want false (a directory is not a lessons file)")
+	}
+
+	// The claim struct carries the lessonsAvailable field (a unit test for
+	// the field's presence, not its value — the helper above is the value
+	// test; this guards the field from being dropped from the claim struct,
+	// which would make the operator's strict-JSON parse of the field fall
+	// through to the zero value (false) and skip every write).
+	path := filepath.Join(t.TempDir(), "claim.json")
+	writeClaim(path, Result{Status: statusSuccess, ObservedPhase: PhaseImplementing,
+		HeadCommit: "abc"})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim struct {
+		LessonsAvailable *bool `json:"lessonsAvailable"`
+	}
+	if err := json.Unmarshal(data, &claim); err != nil {
+		t.Fatalf("claim is not JSON: %v (%s)", err, data)
+	}
+	if claim.LessonsAvailable == nil {
+		t.Fatalf("the claim MUST carry the lessonsAvailable key (a missing key "+
+			"parses as false at the operator, which skips the writer Job): %s", data)
+	}
+}
+
 // TestWriteClaimCarriesPlanMismatch (I93, R29): writeClaim's JSON (the
 // /dev/termination-log the operator parses) MUST carry planMismatch when
 // res.PlanMismatch is true. The operator's advancePhaseFromClaim reads
@@ -557,12 +628,13 @@ func TestWriteClaimCarriesPlanMismatch(t *testing.T) {
 	// The operator's strict parser must accept the key. Simulate the
 	// operator's PhaseClaim parse (strict: unknown fields are rejected).
 	var opClaim struct {
-		ObservedPhase string `json:"observedPhase"`
-		Status        string `json:"status"`
-		BlockedReason string `json:"blockedReason"`
-		PlanMismatch  bool   `json:"planMismatch"`
-		Iteration     int    `json:"iteration"`
-		PlanAttempt   int    `json:"planAttempt"`
+		ObservedPhase    string `json:"observedPhase"`
+		Status           string `json:"status"`
+		BlockedReason    string `json:"blockedReason"`
+		PlanMismatch     bool   `json:"planMismatch"`
+		Iteration        int    `json:"iteration"`
+		PlanAttempt      int    `json:"planAttempt"`
+		LessonsAvailable bool   `json:"lessonsAvailable"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()

@@ -215,3 +215,20 @@ func (c *f10TerminatingNSUpdateClient) RESTMapper() meta.RESTMapper {
 func (c *f10TerminatingNSUpdateClient) Scheme() *runtime.Scheme {
 	return c.inner.Scheme()
 }
+
+// f25NoMatchClient makes every VolumeSnapshot list fail with the RESTMapper's
+// NoKindMatchError, which is what a client returns for a kind whose CRD is not
+// installed (F25: hermes has no snapshot CRDs). Everything else passes through.
+type f25NoMatchClient struct {
+	client.Client
+}
+
+func (c *f25NoMatchClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if isVolumeSnapshotList(list) {
+		return &meta.NoKindMatchError{
+			GroupKind:        schema.GroupKind{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshot"},
+			SearchedVersions: []string{"v1"},
+		}
+	}
+	return c.Client.List(ctx, list, opts...)
+}

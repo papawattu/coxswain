@@ -29,6 +29,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/papawattu/coxswain/pkg/memkey"
+	"github.com/papawattu/coxswain/pkg/memorywrite"
 )
 
 // memShell is the pods' shell.
@@ -39,7 +40,26 @@ const (
 	// <=500 chars, the memory cap is ~100; these are generous ceilings).
 	maxImportFiles = 1000
 	maxLessonBytes = 4096
+	// maxTarballBytes bounds the file read before parsing.
+	maxTarballBytes = 16 << 20
+	// writeBatch is how many lessons one write pod carries (each is passed as
+	// a pod argument; batching keeps the pod spec and argv far below their
+	// limits for any tarball up to maxImportFiles).
+	writeBatch = 50
 )
+
+// storageClassRe is a DNS-1123 subdomain (what a StorageClass name must be).
+var storageClassRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+
+func validStorageClass(sc string) error {
+	if sc == "" {
+		return nil
+	}
+	if len(sc) > 253 || !storageClassRe.MatchString(sc) {
+		return fmt.Errorf("--storage-class %q is not a valid StorageClass name (a DNS-1123 subdomain)", sc)
+	}
+	return nil
+}
 
 // lessonNameRe is the only file name an export/import handles: the writer's
 // <sha256>.txt.
@@ -112,16 +132,29 @@ func memoryExportToFile(ctx context.Context, dc Deps, ns, repoURL, path string, 
 }
 
 func memoryImportFromFile(ctx context.Context, dc Deps, ns, repoURL, path, storageClass string, out io.Writer) error {
+	if err := validStorageClass(storageClass); err != nil {
+		return err
+	}
 	data, err := readFileBounded(path)
 	if err != nil {
 		return err
 	}
-	written, skipped, err := memoryImport(ctx, memoryStoreOf(dc, ns, storageClass), repoURL, bytes.NewReader(data))
+	written, skipped, dropped, err := memoryImport(ctx, memoryStoreOf(dc, ns, storageClass), repoURL, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(out, "Imported %d lesson(s), skipped %d already present\n", written, skipped)
-	return err
+	if _, err = fmt.Fprintf(out, "Imported %d lesson(s), skipped %d already present, dropped %d by the write policy\n", written, skipped, len(dropped)); err != nil {
+		return err
+	}
+	for _, d := range dropped {
+		if _, err = fmt.Fprintf(out, "  dropped %s: %s\n", d.Name, d.Reason); err != nil {
+			return err
+		}
+	}
+	if len(dropped) > 0 {
+		return fmt.Errorf("%d lesson(s) were dropped by the memory write policy (the rest were imported)", len(dropped))
+	}
+	return nil
 }
 
 // memoryExport writes the PVC's lessons for repoURL as a .tar.gz to w and
@@ -175,6 +208,7 @@ func parseMemoryTarball(r io.Reader) (map[string][]byte, error) {
 	}
 	tr := tar.NewReader(gz)
 	files := map[string][]byte{}
+	entries := 0
 	for {
 		h, err := tr.Next()
 		if err == io.EOF {
@@ -187,8 +221,14 @@ func parseMemoryTarball(r io.Reader) (map[string][]byte, error) {
 		if h.Typeflag != tar.TypeReg || m == nil {
 			return nil, fmt.Errorf("tarball entry %q is not a regular <sha256>.txt lesson file", h.Name)
 		}
-		if len(files) >= maxImportFiles {
-			return nil, fmt.Errorf("tarball has more than %d lessons", maxImportFiles)
+		// Count RAW entries (not unique names): a tarball repeating one name
+		// must not make the importer hash it unboundedly often.
+		entries++
+		if entries > maxImportFiles {
+			return nil, fmt.Errorf("tarball has more than %d entries", maxImportFiles)
+		}
+		if _, dup := files[h.Name]; dup {
+			return nil, fmt.Errorf("tarball entry %s appears more than once", h.Name)
 		}
 		body, err := io.ReadAll(io.LimitReader(tr, maxLessonBytes+1))
 		if err != nil {
@@ -209,36 +249,68 @@ func parseMemoryTarball(r io.Reader) (map[string][]byte, error) {
 	return files, nil
 }
 
-// memoryImport writes the tarball's lessons into the PVC, skipping any whose
-// SHA-256 (the file name) is already present. Returns (written, skipped).
-func memoryImport(ctx context.Context, store MemoryStore, repoURL string, r io.Reader) (int, int, error) {
+// droppedLesson is an imported lesson the P5b static write policy refused.
+type droppedLesson struct {
+	Name   string
+	Reason string // pkg/memorywrite's reason (a rule name), never the lesson text
+}
+
+// memoryImport writes the tarball's lessons into the PVC. Every lesson goes
+// through the same static screen the P5b writer applies (pkg/memorywrite:
+// shape, size cap, path/error anchor, secrets patterns): memory is injected
+// into every later Loop's prompt, so a tarball (from another cluster, or edited
+// by hand) must not carry in what a Loop could not have written. A lesson that
+// fails is dropped and reported; the rest are imported. A lesson already in the
+// PVC (same SHA-256) is skipped. Returns (written, skipped, dropped).
+func memoryImport(ctx context.Context, store MemoryStore, repoURL string, r io.Reader) (int, int, []droppedLesson, error) {
 	name := memkey.PVCName(repoURL)
 	if name == "" {
-		return 0, 0, errors.New("an empty repo URL has no memory PVC")
+		return 0, 0, nil, errors.New("an empty repo URL has no memory PVC")
 	}
 	files, err := parseMemoryTarball(r)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
+	}
+	// The static screen, per lesson, in a stable order.
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	var dropped []droppedLesson
+	screened := map[string][]byte{}
+	for _, n := range names {
+		text := strings.TrimSuffix(string(files[n]), "\n")
+		survivors, reasons := memorywrite.Screen([]string{text})
+		if len(survivors) != 1 {
+			reason := "dropped by the write policy"
+			if len(reasons) > 0 && reasons[0] != "" {
+				reason = reasons[0]
+			}
+			dropped = append(dropped, droppedLesson{Name: n, Reason: reason})
+			continue
+		}
+		screened[n] = files[n]
 	}
 	existing, err := store.ListFiles(ctx, name)
 	if err != nil && !isNoMemoryErr(err) {
-		return 0, 0, fmt.Errorf("read memory PVC %s: %w", name, err)
+		return 0, 0, nil, fmt.Errorf("read memory PVC %s: %w", name, err)
 	}
 	toWrite := map[string][]byte{}
 	skipped := 0
-	for n, body := range files {
+	for n, body := range screened {
 		if _, dup := existing[n]; dup {
 			skipped++
 			continue
 		}
 		toWrite[n] = body
 	}
-	if len(toWrite) > 0 || isNoMemoryErr(err) {
+	if len(toWrite) > 0 || (isNoMemoryErr(err) && len(screened) > 0) {
 		if werr := store.WriteFiles(ctx, name, toWrite); werr != nil {
-			return 0, 0, fmt.Errorf("write memory PVC %s: %w", name, werr)
+			return 0, 0, dropped, fmt.Errorf("write memory PVC %s: %w", name, werr)
 		}
 	}
-	return len(toWrite), skipped, nil
+	return len(toWrite), skipped, dropped, nil
 }
 
 // kubectlMemoryStore is the real MemoryStore: hardened pods against the
@@ -283,13 +355,14 @@ func parseMemoryList(out string) (map[string][]byte, error) {
 	return files, nil
 }
 
-func (k *kubectlMemoryStore) WriteFiles(ctx context.Context, pvcName string, files map[string][]byte) error {
-	if _, err := k.pod.peekKubectlGet(ctx, "get", "pvc", pvcName, "-o", "json"); err != nil {
-		scLine := ""
-		if k.storageClass != "" {
-			scLine = "  storageClassName: " + k.storageClass + "\n"
-		}
-		manifest := fmt.Sprintf(`apiVersion: v1
+// memoryPVCManifest renders the PVC import creates when it is absent (the
+// operator's shape: RWX, 1Gi). storageClass "" = the cluster default.
+func memoryPVCManifest(pvcName, ns, storageClass string) string {
+	scLine := ""
+	if storageClass != "" {
+		scLine = "  storageClassName: " + storageClass + "\n"
+	}
+	return fmt.Sprintf(`apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: %s
@@ -299,23 +372,50 @@ spec:
 %s  resources:
     requests:
       storage: 1Gi
-`, pvcName, k.ns, scLine)
-		if cerr := k.pod.peekKubectlCreate(ctx, manifest, "create", "-f", "-"); cerr != nil {
-			return fmt.Errorf("create memory PVC %s: %w", pvcName, cerr)
-		}
+`, pvcName, ns, scLine)
+}
+
+// memoryWriteCommand is one write pod's command: the script plus <name>
+// <base64> argument pairs.
+func memoryWriteCommand(names []string, files map[string][]byte) []string {
+	cmd := []string{memShell, "-c", memoryWriteScript, "sh"}
+	for _, n := range names {
+		cmd = append(cmd, n, base64.StdEncoding.EncodeToString(files[n]))
 	}
-	if len(files) == 0 {
-		return nil
+	return cmd
+}
+
+func (k *kubectlMemoryStore) WriteFiles(ctx context.Context, pvcName string, files map[string][]byte) error {
+	if err := validStorageClass(k.storageClass); err != nil {
+		return err
+	}
+	if _, err := k.pod.peekKubectlGet(ctx, "get", "pvc", pvcName, "-o", "json"); err != nil {
+		if cerr := k.pod.peekKubectlCreate(ctx, memoryPVCManifest(pvcName, k.ns, k.storageClass), "create", "-f", "-"); cerr != nil {
+			// Another importer (or the operator) may have created it between
+			// our get and create: that is fine, the PVC exists.
+			if _, gerr := k.pod.peekKubectlGet(ctx, "get", "pvc", pvcName, "-o", "json"); gerr != nil {
+				return fmt.Errorf("create memory PVC %s: %w", pvcName, cerr)
+			}
+		}
 	}
 	names := make([]string, 0, len(files))
 	for n := range files {
 		names = append(names, n)
 	}
 	slices.Sort(names)
-	cmd := []string{memShell, "-c", memoryWriteScript, "sh"}
-	for _, n := range names {
-		cmd = append(cmd, n, base64.StdEncoding.EncodeToString(files[n]))
+	for _, batch := range chunkNames(names, writeBatch) {
+		if _, _, err := k.pod.runPod(ctx, pvcName, false, memoryWriteCommand(batch, files)); err != nil {
+			return err
+		}
 	}
-	_, _, err := k.pod.runPod(ctx, pvcName, false, cmd)
-	return err
+	return nil
+}
+
+// chunkNames splits names into batches of at most size.
+func chunkNames(names []string, size int) [][]string {
+	var out [][]string
+	for start := 0; start < len(names); start += size {
+		out = append(out, names[start:min(start+size, len(names))])
+	}
+	return out
 }

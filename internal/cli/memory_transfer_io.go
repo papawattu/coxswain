@@ -26,11 +26,11 @@ func readFileBounded(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, 16<<20+1))
+	data, err := io.ReadAll(io.LimitReader(f, maxTarballBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > 16<<20 {
+	if len(data) > maxTarballBytes {
 		return nil, fmt.Errorf("%s is larger than 16 MiB", path)
 	}
 	return data, nil

@@ -61,31 +61,23 @@ func (p *peekMemoryReader) Read(ctx context.Context, pvcName string) (string, bo
 // name as a header).
 const memoryReadScript = `if [ -z "$(find /memory -mindepth 1 -maxdepth 1 -type f 2>/dev/null)" ]; then exit 0; fi; find /memory -mindepth 1 -maxdepth 1 -type f | sort | while IFS= read -r f; do echo "-- ${f#/memory/}:"; cat "$f"; echo; done 2>&1 || { echo memory-read-failed-exit-$? >&2; exit 1; }`
 
-// runPod runs one hardened pod against the memory PVC with the given command
-// and returns its log (found=false when the log is empty). readOnly selects
-// the PVC mount mode: Read (inspect, export) is read-only; only the P5d
-// import writes (readOnly=false). A missing PVC is memoryNotFoundErr.
-func (p *peekMemoryReader) runPod(ctx context.Context, pvcName string, readOnly bool, command []string) (string, bool, error) {
-	// The memory PVC must exist (a missing PVC is a fresh repo: the CLI
-	// prints a note, not an error). A real read failure (a PVC that exists
-	// but the API rejects) is an error.
-	pvcJSON, err := p.peekKubectlGet(ctx, "get", "pvc", pvcName, "-o", "json")
-	if err != nil || pvcJSON == "" {
-		return "", false, memoryNotFoundErr{}
-	}
+// memoryPodImage is the pods' image, pinned (a floating tag would run
+// whatever the registry serves against the memory PVC). The same image the
+// RWX helper uses (hack/rwx-storage.sh).
+const memoryPodImage = "docker.io/library/busybox:1.36"
 
-	// Build the peek pod manifest (RO mount on the memory PVC). generateName
-	// gives a unique name (a leftover peek pod never collides with a new one).
-	// The container is hardened: non-root, read-only rootfs, drop all caps,
-	// seccomp (the same as the workspace peek pod). It runs as UID 65532
-	// (the coxswain non-root UID the controller uses for the agent/verify/
-	// deliver pods — the memory PVC's files are written by P5b's writer Job,
-	// which runs as that same UID).
-	cmdJSON, jerr := json.Marshal(command) // JSON is valid YAML flow syntax.
-	if jerr != nil {
-		return "", false, fmt.Errorf("encode memory pod command: %w", jerr)
+// memoryPodManifest renders the hardened pod that runs a command against the
+// memory PVC: non-root UID 65532 (the P5b writer's UID), read-only rootfs,
+// drop ALL, no privilege escalation, seccomp RuntimeDefault, and NO
+// ServiceAccount token (the pod needs no API access; the import pod mounts the
+// PVC read-write, so it must not carry a credential). The PVC is mounted
+// read-only unless readOnly is false (the import writer only).
+func memoryPodManifest(ns, pvcName string, readOnly bool, command []string) (string, error) {
+	cmdJSON, err := json.Marshal(command) // JSON is valid YAML flow syntax.
+	if err != nil {
+		return "", fmt.Errorf("encode memory pod command: %w", err)
 	}
-	manifest := fmt.Sprintf(`apiVersion: v1
+	return fmt.Sprintf(`apiVersion: v1
 kind: Pod
 metadata:
   generateName: cox-memory-peek-
@@ -94,13 +86,14 @@ metadata:
     coxswain.io/memory-peek: "%s"
 spec:
   restartPolicy: Never
+  automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
     seccompProfile:
       type: RuntimeDefault
   containers:
   - name: peek
-    image: busybox
+    image: %s
     imagePullPolicy: IfNotPresent
     securityContext:
       runAsNonRoot: true
@@ -120,7 +113,37 @@ spec:
     persistentVolumeClaim:
       claimName: %s
       readOnly: %t
-`, p.ns, memkey.Key(pvcName), cmdJSON, readOnly, pvcName, readOnly)
+`, ns, memkey.Key(pvcName), memoryPodImage, cmdJSON, readOnly, pvcName, readOnly), nil
+}
+
+// runPod runs one hardened pod against the memory PVC with the given command
+// and returns its log (found=false when the log is empty). readOnly selects
+// the PVC mount mode: Read (inspect, export) is read-only; only the P5d
+// import writes (readOnly=false). A missing PVC is memoryNotFoundErr.
+func (p *peekMemoryReader) runPod(ctx context.Context, pvcName string, readOnly bool, command []string) (string, bool, error) {
+	op := "read"
+	if !readOnly {
+		op = "write"
+	}
+	// The memory PVC must exist (a missing PVC is a fresh repo: the CLI
+	// prints a note, not an error). A real read failure (a PVC that exists
+	// but the API rejects) is an error.
+	pvcJSON, err := p.peekKubectlGet(ctx, "get", "pvc", pvcName, "-o", "json")
+	if err != nil || pvcJSON == "" {
+		return "", false, memoryNotFoundErr{}
+	}
+
+	// Build the peek pod manifest (RO mount on the memory PVC). generateName
+	// gives a unique name (a leftover peek pod never collides with a new one).
+	// The container is hardened: non-root, read-only rootfs, drop all caps,
+	// seccomp (the same as the workspace peek pod). It runs as UID 65532
+	// (the coxswain non-root UID the controller uses for the agent/verify/
+	// deliver pods — the memory PVC's files are written by P5b's writer Job,
+	// which runs as that same UID).
+	manifest, merr := memoryPodManifest(p.ns, pvcName, readOnly, command)
+	if merr != nil {
+		return "", false, merr
+	}
 
 	// Create from stdin (generateName requires create, not apply).
 	if err := p.peekKubectlCreate(ctx, manifest, "create", "-f", "-"); err != nil {
@@ -146,7 +169,7 @@ spec:
 		return "", false, err
 	}
 	if outcome.error {
-		return "", false, fmt.Errorf("cli: memory read failed (peek pod %s: phase=%s exit=%s): %s", podName, outcome.phase, outcome.exitCode, firstNonEmpty(outcome.terminationMsg, "the peek pod exited non-zero (the memory PVC is not Bound or is empty)"))
+		return "", false, fmt.Errorf("cli: memory %s failed (peek pod %s: phase=%s exit=%s): %s", op, podName, outcome.phase, outcome.exitCode, firstNonEmpty(outcome.terminationMsg, "the pod exited non-zero (the memory PVC is not Bound?)"))
 	}
 	out, err := p.peekKubectlLogs(ctx, "logs", podName)
 	if err != nil {

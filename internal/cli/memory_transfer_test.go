@@ -106,7 +106,7 @@ func TestMemoryImportRestores(t *testing.T) {
 	src := newStore("fix internal/a.go build", "error: foo failed in pkg/b")
 	tb := tarballOf(t, src)
 	dst := newStore()
-	w, s, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb))
+	w, s, _, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb))
 	if err != nil || w != 2 || s != 0 {
 		t.Fatalf("import = (%d,%d,%v), want (2,0,nil)", w, s, err)
 	}
@@ -119,7 +119,7 @@ func TestMemoryImportRestores(t *testing.T) {
 func TestMemoryImportCreatesMissingPVC(t *testing.T) {
 	tb := tarballOf(t, newStore("fix internal/a.go build"))
 	dst := &fakeMemoryStore{}
-	if _, _, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb)); err != nil || !dst.created {
+	if _, _, _, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb)); err != nil || !dst.created {
 		t.Fatalf("import into missing PVC: err=%v created=%v", err, dst.created)
 	}
 }
@@ -130,13 +130,13 @@ func TestMemoryImportCreatesMissingPVC(t *testing.T) {
 func TestMemoryImportIdempotent(t *testing.T) {
 	tb := tarballOf(t, newStore("fix internal/a.go build", "error: foo failed in pkg/b"))
 	dst := newStore("fix internal/a.go build") // one already present
-	w, s, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb))
+	w, s, _, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb))
 	if err != nil || w != 1 || s != 1 {
 		t.Fatalf("first import = (%d,%d,%v), want (1,1,nil)", w, s, err)
 	}
 	before := strings.Join(shaSet(dst.files), ",")
 	dst.writes = nil
-	w, s, err = memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb))
+	w, s, _, err = memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb))
 	if err != nil || w != 0 || s != 2 {
 		t.Fatalf("re-import = (%d,%d,%v), want (0,2,nil)", w, s, err)
 	}
@@ -155,7 +155,7 @@ func TestMemoryImportRejectsHashMismatch(t *testing.T) {
 	bad := &fakeMemoryStore{pvcExists: true, files: map[string][]byte{name: []byte("different text\n")}}
 	tb := tarballOf(t, bad)
 	dst := newStore()
-	if _, _, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb)); err == nil {
+	if _, _, _, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb)); err == nil {
 		t.Fatalf("a hash-mismatched lesson must be rejected")
 	}
 	if len(dst.writes) != 0 {
@@ -167,13 +167,13 @@ func TestMemoryImportRejectsHashMismatch(t *testing.T) {
 func TestMemoryImportRejectsBadNames(t *testing.T) {
 	bad := &fakeMemoryStore{pvcExists: true, files: map[string][]byte{"../evil.txt": []byte("x")}}
 	tb := tarballOf(t, bad)
-	if _, _, err := memoryImport(context.Background(), newStore(), memTestRepo, bytes.NewReader(tb)); err == nil {
+	if _, _, _, err := memoryImport(context.Background(), newStore(), memTestRepo, bytes.NewReader(tb)); err == nil {
 		t.Fatalf("a non-<sha256>.txt entry must be rejected")
 	}
 }
 
 func TestMemoryImportRejectsNonTarball(t *testing.T) {
-	if _, _, err := memoryImport(context.Background(), newStore(), memTestRepo, strings.NewReader("junk")); err == nil {
+	if _, _, _, err := memoryImport(context.Background(), newStore(), memTestRepo, strings.NewReader("junk")); err == nil {
 		t.Fatalf("junk must be rejected")
 	}
 }

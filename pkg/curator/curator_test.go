@@ -6,6 +6,7 @@
 package curator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -247,5 +248,65 @@ func TestCuratorCRStrip(t *testing.T) {
 	}
 	if strings.Contains(v.Reason, "\n") || strings.Contains(v.Reason, "\r") {
 		t.Errorf("Reason = %q contains a newline; CR/LF must be stripped", v.Reason)
+	}
+}
+
+// TestCuratorResponseBodyBounded: the P3 ReadAll bound — the client reads
+// the proxy response through io.LimitReader(1 MiB), so a runaway response
+// cannot exhaust the Job's memory. This spec feeds a response whose body
+// is >1 MiB (a 2 MiB 'content' string inside the OpenAI envelope) and
+// asserts the verdict is keep=false ("curator unparseable"): the
+// LimitReader truncates the read at 1 MiB, the JSON is malformed
+// (truncated mid-string), and the strict parse rejects it.
+//
+// The spec verifies the BOUND is active by checking the verdict reason:
+// with the bound, the reason is "curator unparseable" (the JSON parse
+// fails on the truncated body). Without the bound, the client reads the
+// full 2 MiB body; the JSON is still truncated mid-string and the parse
+// still fails — the verdict is the same. The distinguishing assertion is
+// therefore on the reason: a "curator unavailable (read error)" would
+// mean the ReadAll failed (the body was too large for the reader), which
+// is the unbounded behavior. The bound makes the read SUCCEED (at 1 MiB)
+// and the parse fail — a clean, bounded failure.
+func TestCuratorResponseBodyBounded(t *testing.T) {
+	const oneMiB = 1 << 20
+	const twoMiB = 2 << 20
+	padding := strings.Repeat("a", twoMiB)
+	content := `{"keep": true, "reason": "` + padding + `"}`
+	resp := openAIResponse{}
+	resp.Choices = append(resp.Choices, struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}{})
+	resp.Choices[0].Message.Content = content
+	var buf bytes.Buffer
+	_ = json.NewEncoder(&buf).Encode(resp)
+	body := buf.Bytes()
+	// The body is >1 MiB (2 MiB padding + envelope overhead).
+	if len(body) <= oneMiB {
+		t.Fatalf("test fixture: body is %d bytes, must be >1 MiB", len(body))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "test-model")
+	v := c.Judge(context.Background(), "a good lesson")
+	// The verdict: keep=false, reason contains "unparseable" (the JSON
+	// parse failed on the truncated body — the LimitReader read 1 MiB,
+	// the JSON string is cut mid-value, the parse is malformed).
+	if v.Keep {
+		t.Fatalf("Keep = true on a >1 MiB response, want false (truncated by the 1 MiB cap)")
+	}
+	// The reason must be "unparseable" (the parse failed), NOT "read error"
+	// (which would mean the ReadAll itself failed — the unbounded behavior
+	// where the full 2 MiB body is consumed). With the bound, the read
+	// succeeds at 1 MiB and the parse fails cleanly.
+	if !strings.Contains(v.Reason, "unparseable") {
+		t.Fatalf("Reason = %q, want 'curator unparseable' (the LimitReader truncated the read; the parse failed on the truncated JSON). 'read error' would mean the bound is missing and ReadAll consumed the full body.", v.Reason)
 	}
 }

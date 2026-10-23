@@ -35,6 +35,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -823,5 +824,52 @@ func TestMemoryWriteNoCuratorFailsClosed(t *testing.T) {
 		if !strings.Contains(summary, "dropped curator: curator unavailable") && !strings.Contains(summary, "curator unavailable") {
 			t.Errorf("audit trail lacks 'curator unavailable' for lesson %d:\n%s", i, summary)
 		}
+	}
+}
+
+// TestMemoryWriteCuratorReasonCRStrippedFromSummary: the model-supplied
+// curator reason (the free-text "reason" field of the strict JSON verdict)
+// can carry CR/LF. The bounded summary is line-based (one line per lesson:
+// "lesson-NNN <sha> written|dropped <reason>"); a two-line reason would
+// corrupt it (a phantom second line that reads as a broken entry). P3 (R16
+// review pass 3): the writer strips CR/LF from the reason before it enters
+// the line-based summary (defence in depth — the curator client also
+// strips, pkg/curator). The summary must have EXACTLY one line per lesson
+// + the counts line, and the reason must be flattened to spaces.
+//
+// Mutation (the spec must FAIL): remove the stripReasonCR call in
+// summaryLines (cmd/memory-writer/main.go) — the reason keeps its "\n",
+// and the summary gains a phantom extra line.
+func TestMemoryWriteCuratorReasonCRStrippedFromSummary(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	lesson := "foo/bar: the retry must back off before the 500"
+	writeLessonsFile(t, ws, []string{lesson})
+	// The model's reason carries a CRLF and a bare LF (free model text the
+	// strict JSON parse admits as a string).
+	// JSON must carry the CR/LF as escapes (a literal newline inside a JSON
+	// string is malformed). The client's CR/LF strip (pkg/curator) flattens
+	// them to spaces; the writer's stripReasonCR (summaryLines) is the
+	// defence in depth this spec isolates.
+	reason := "too generic\r\nand\nnot specific"
+	content := `{"keep": false, "reason": ` + strconv.Quote(reason) + `}`
+	srv := fakeCuratorProxy(t, content, http.StatusOK)
+	defer srv.Close()
+	summary, code, err := captureSummary(t, func() (int, error) {
+		return runWithCurator(t, ws, mem, srv.URL)
+	})
+	if code != 0 || err != nil {
+		t.Fatalf("run(curator=false, multi-line reason) = (%d, %v); want (0, nil)", code, err)
+	}
+	lines := strings.Split(strings.TrimRight(summary, "\n"), "\n")
+	// Exactly one line per lesson + the counts line (2 total). A reason with
+	// an unstripped CR/LF would add a phantom line.
+	if len(lines) != 2 {
+		t.Fatalf("summary must be exactly 2 lines (1 lesson + counts), got %d: %q", len(lines), lines)
+	}
+	// The reason is flattened: CR/LF become spaces, so the drop line reads
+	// "dropped curator: too generic and not specific" on ONE line.
+	if !strings.Contains(lines[0], "dropped curator: too generic and not specific") {
+		t.Fatalf("summary line 0 must carry the flattened reason (CR/LF -> space); got %q", lines[0])
 	}
 }

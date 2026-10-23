@@ -328,6 +328,26 @@ This is recorded here so that the D34 NetworkPolicy's coarser-grained
 model-egress peer is understood as the outer fence (port-level), with the
 D35 KubeArmor policy providing the inner fence (hostname-level).
 
+**A cross-namespace Service-FQDN model endpoint (P5c, PR #182):** when the
+model endpoint is a same-cluster Service FQDN in ANOTHER namespace
+(`svc.other-ns.svc.cluster.local`), the proxy's model-egress rule is a
+namespaceSelector over the endpoint's namespace (the
+`kubernetes.io/metadata.name` label), scoped to the endpoint's port. This is
+a cross-namespace allow — the proxy's egress can reach every pod in the
+named namespace on that port, not only the target Service's pods. That is
+acceptable because the endpoint is an **operator-set, immutable spec field**
+(`spec.agent.modelEndpoint`); the proxy dials ONLY the configured upstream,
+and the agent cannot change it (the agent's egress is fenced by its own
+per-Loop NetworkPolicy, which allows egress to this proxy on 8080 and to
+kube-dns — nothing else). NetworkPolicy cannot select a single Service
+(pods are matched by labels, and the operator does not watch Service
+endpoint pods), so the namespace+port scope is the tightest expression;
+the hostname-level precision (only `svc`, not every pod in `other-ns`) is
+the same known limit as the same-namespace case above (the KubeArmor policy
+is the inner fence). Anything that is not an in-cluster Service FQDN, an
+IP, or a same-namespace single-label name yields NO model-egress rule
+(fail-closed).
+
 **AgentPolicy network allows (D34, R17 P2):** the agent's `AgentPolicy`
 `spec.network` allows (e.g. `proxy.golang.org:443`) are NOT translated into
 the agent NetworkPolicy's egress rules. AgentPolicy (C6a, PR #7) is not

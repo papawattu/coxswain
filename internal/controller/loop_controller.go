@@ -4789,7 +4789,7 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 
 // svcNamespaceFromFQDN extracts the namespace from a same-cluster Service FQDN.
 // It recognises the canonical in-cluster forms:
-//   - svc.ns.svc.cluster.local (6 parts) — the full FQDN.
+//   - svc.ns.svc.cluster.local (5 parts) — the full FQDN.
 //   - svc.ns.svc (3 parts) — the minimal same-cluster FQDN (no cluster.local).
 //
 // It returns false for anything else (an external FQDN, an IP, a single-label

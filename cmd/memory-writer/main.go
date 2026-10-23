@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/papawattu/coxswain/pkg/curator"
@@ -282,6 +283,22 @@ func run(outcome string) (int, error) {
 	return 0, nil
 }
 
+// stripReasonCR strips CR/LF from a model-supplied curator reason before it
+// enters the line-based bounded summary (P3, R16 review pass 3 at 27014da):
+// the reason is free model text, and a \n or \r in it would corrupt the
+// one-line-per-lesson summary layout (a two-line reason would read as a
+// phantom second lesson line and break the per-lesson parsing the operator
+// and the review do against the termination message). The client already
+// strips CR/LF (pkg/curator); this is defence in depth at the summary's
+// single entry point, so a reason that reaches the summary from any path
+// is single-line. Spaces are NOT collapsed otherwise (the reason is
+// recorded verbatim except for CR/LF).
+func stripReasonCR(reason string) string {
+	reason = strings.ReplaceAll(reason, "\r\n", " ")
+	reason = strings.ReplaceAll(reason, "\n", " ")
+	return strings.ReplaceAll(reason, "\r", " ")
+}
+
 // annotateDedup marks the survivors that were NOT written (duplicates) as
 // "dropped duplicate" in the reasons slice (the per-lesson drop reason for
 // the summary). The survivors are the input positions whose reason is ""
@@ -336,7 +353,9 @@ func summaryLines(lessons, reasons []string, total, written, dropped int) []stri
 		rule := "eligible"
 		if i < len(reasons) && reasons[i] != "" {
 			status = "dropped"
-			rule = reasons[i]
+			// The reason is model- or screen-supplied text; CR/LF in a
+			// curator reason would corrupt the line-based summary (P3).
+			rule = stripReasonCR(reasons[i])
 		}
 		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
 	}

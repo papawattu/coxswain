@@ -63,6 +63,12 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          # F19/P5b: the memory-writer Job runs the operator's OWN image (the
+          # only image containing /usr/local/bin/coxswain-memory-write). The
+          # value after "=" is replaced from this container's image by the
+          # `replacements` rule in kustomization.yaml, so it follows
+          # `kustomize edit set image controller=$IMG` in every render path.
+          - --memory-writer-image=IMG_PLACEHOLDER
         image: controller:latest
         name: manager
         # P2b (ADR-0009): the operator's own namespace, injected via the

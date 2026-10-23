@@ -37,6 +37,9 @@ import (
 // lesson keeps even a few dozen lessons well under those caps.
 const MaxLessonChars = 500
 
+// credKeys are the credential-assignment keywords.
+const credKeys = `(?:password|passwd|secret|token|api[_-]?key)`
+
 // secretsPatterns is the static secrets pattern set (one spec per pattern —
 // the plan's acceptance: "one spec per pattern"). Each pattern is matched
 // with regexp.MatchString (the lesson text is untrusted runner output; a
@@ -105,7 +108,23 @@ var secretsPatterns = []struct {
 	// value (a credential leaked into a lesson). The plan's named pattern
 	// (4): "password=, passwd=, secret=, token=, api[_-]?key= followed by a
 	// non-empty value". The value is [^\s]+ (at least one non-space char).
-	{"credential-assignment", regexp.MustCompile(`\b(password|passwd|secret|token|api[_-]?key)=\s*[^\s]+`)},
+	//
+	// Case-insensitive and with NO leading \b: env files use DB_PASSWORD= /
+	// GITHUB_TOKEN=, and there is no word boundary between "_" and a word, so
+	// the old `\bpassword=` never matched db_password=. A keyword embedded in
+	// a longer name (bypassword=) therefore also matches: fail-safe.
+	// "=" takes any non-empty value. ":" (YAML / kubectl describe form) drops
+	// only when followed by a token-shaped value of 8+ chars
+	// ([A-Za-z0-9+/=_.-]), so "token: abc123xyz" is dropped but prose such as
+	// "the token: parser lives in internal/lex/token.go" stays eligible.
+	{"credential-assignment", regexp.MustCompile(
+		`(?i)(?:` + credKeys + `=\s*\S+|` + credKeys + `:\s*[A-Za-z0-9+/=_.-]{8,})`)},
+	// An HTTP Authorization header echoed into a lesson (Basic base64 is
+	// typically under 64 chars, so long-random-base64 misses it).
+	{"authorization-header", regexp.MustCompile(`(?i)\bauthorization:\s*\S+`)},
+	// An AWS secret access key assignment (the "/" in the key splits it below
+	// the high-entropy run threshold, so nothing else catches it).
+	{"aws-secret-access-key", regexp.MustCompile(`(?i)aws_?secret_?access_?key\s*=\s*\S+`)},
 	// A JWT: three base64url segments joined by dots (eyJhbGciOiJIUzI1NiJ9.)
 	// — a bearer token echoed into a lesson is a credential.
 	{"jwt", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)},

@@ -36,6 +36,8 @@ func TestSecretPatternsOneSpecPerPattern(t *testing.T) {
 		"secret-file-token",
 		"k8s-basic-auth-token",
 		"credential-assignment",
+		"authorization-header",
+		"aws-secret-access-key",
 		"jwt",
 		"long-random-base64",
 	}
@@ -440,4 +442,58 @@ func TestD68NoPathOrErrorDropped(t *testing.T) {
 	if len(survivors) != 1 {
 		t.Fatalf("D68: a lesson with a path was dropped: reasons=%v", reasons)
 	}
+}
+
+// F18: the credential-assignment rule is case-insensitive and has no leading
+// \b, so DB_PASSWORD= / db_password= / API_KEY= match. Fixtures are built by
+// concatenation (the GitHub secret scanner blocks literal credential shapes).
+func TestPatternSpecCredentialAssignmentCaseAndPrefix(t *testing.T) {
+	testPatternSpec(t, "credential-assignment",
+		"set DB_PASSWORD="+"hunter2"+" in deploy/config.yaml before applying",
+		"the connection string uses a secret ref, not a literal password (internal/db/connect.go)")
+	testPatternSpec(t, "credential-assignment",
+		"set db_password="+"hunter2x"+" in config/dev/env",
+		"the secret store is mounted read-only for the agent (internal/secrets/mount.go)")
+	testPatternSpec(t, "credential-assignment",
+		"export GITHUB_TOKEN="+"plaintextvalue1"+" in hack/run.sh",
+		"the token parser lives in internal/lex/token.go")
+	testPatternSpec(t, "credential-assignment",
+		"export API_KEY="+"abcdef"+" in deploy/env.sh",
+		"the api key is read from the environment (internal/cfg/env.go)")
+}
+
+// The ":" form: a token-shaped value (8+ chars of [A-Za-z0-9+/=_.-]) is
+// dropped; prose after a colon is kept.
+func TestCredentialAssignmentColonForm(t *testing.T) {
+	testPatternSpec(t, "credential-assignment",
+		"the secret yaml has token: "+"abc123xyz"+" in deploy/secret.yaml",
+		"the token: parser lives in internal/lex/token.go")
+	for _, l := range []string{
+		"password: " + "hunter2hunter2" + " in config/dev/env",
+		"api_key: " + "abcdef123456" + " in deploy/env.sh",
+	} {
+		if s, _ := Screen([]string{l}); len(s) != 0 {
+			t.Errorf("colon credential %q was written, want dropped", l)
+		}
+	}
+	for _, l := range []string{
+		"the token: parser lives in internal/lex/token.go",
+		"token: see the auth docs (docs/auth.md)",
+	} {
+		if s, r := Screen([]string{l}); len(s) != 1 {
+			t.Errorf("prose %q was dropped (%v), want kept", l, r)
+		}
+	}
+}
+
+func TestPatternSpecAuthorizationHeader(t *testing.T) {
+	testPatternSpec(t, "authorization-header",
+		"send -H 'Authorization: Basic "+"dXNlcjpwYXNzd29yZA=="+"' from internal/cli/http.go",
+		"the request carries no auth header, so nothing is signed (internal/agent/auth.go)")
+}
+
+func TestPatternSpecAWSSecretAccessKey(t *testing.T) {
+	testPatternSpec(t, "aws-secret-access-key",
+		"use aws_secret_access_key="+"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"+" in cmd/aws.go",
+		"the AWS credential comes from the IRSA role, not a key (internal/aws/creds.go)")
 }

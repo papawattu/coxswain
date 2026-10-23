@@ -84,6 +84,10 @@ spec:
         - --metrics-bind-address=0
         {{- end }}
         - --health-probe-bind-address=:{{ .Values.manager.healthProbe.port }}
+        # F19/P5b: the memory-writer Job runs the operator's own image (the only
+        # image with coxswain-memory-write). Emitted BEFORE manager.args so a
+        # --memory-writer-image in values overrides it (last flag wins).
+        - --memory-writer-image={{ .Values.manager.image.repository | default "controller" }}{{- if not (contains "@" (.Values.manager.image.repository | default "controller")) }}:{{ .Values.manager.image.tag | default .Chart.AppVersion }}{{- end }}
         {{- range .Values.manager.args }}
         - {{ tpl . $ }}
         {{- end }}

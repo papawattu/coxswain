@@ -148,3 +148,24 @@ func TestPeekWorkspaceRead_SucceededReturnsLog(t *testing.T) {
 		t.Errorf("Read returned %q, want the log UNCHANGED %q (no trim — the hash is over the exact bytes)", got, planBytes)
 	}
 }
+
+// D6: the peek pod reads a PVC and never calls the API, so it must not mount
+// a ServiceAccount token (like the memory list/write pods).
+func TestPeekPodManifest_NoServiceAccountToken(t *testing.T) {
+	var manifest string
+	r := newPeekTestReader(peekPodSucceededJSON, "ok")
+	r.runnerImage = "example.test/runner:x"
+	r.kubectlCreate = func(ctx context.Context, stdin string, args ...string) error {
+		manifest = stdin
+		return nil
+	}
+	if _, err := r.Read(context.Background(), "loop", "/workspace/.coxswain/PLAN.md"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(manifest, "kind: Pod") {
+		t.Fatalf("no Pod manifest captured:\n%s", manifest)
+	}
+	if !strings.Contains(manifest, "\n  automountServiceAccountToken: false\n") {
+		t.Errorf("peek pod spec must set automountServiceAccountToken: false:\n%s", manifest)
+	}
+}

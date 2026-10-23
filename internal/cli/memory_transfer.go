@@ -48,8 +48,10 @@ const (
 	writeBatch = 50
 )
 
-// storageClassRe is a DNS-1123 subdomain (what a StorageClass name must be).
-var storageClassRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+// storageClassRe is a DNS-1123 subdomain (what a StorageClass name must be): dot-separated
+// DNS-1123 labels, none empty, each starting and ending alphanumeric (D5:
+// "a..b" and "a.-b" are not valid).
+var storageClassRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
 
 func validStorageClass(sc string) error {
 	if sc == "" {

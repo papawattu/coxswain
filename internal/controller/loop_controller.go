@@ -4127,6 +4127,19 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	deliverPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{deliverForLabel: loopName}},
 	}
+	// P5c (R31 kind finding): the memory-writer Job's curator call goes to
+	// this SAME model proxy pod (its egress netpol allows the proxy pod,
+	// loop_memory_writer_job.go), so the proxy's INGRESS must admit the
+	// writer pod too. The writer pod carries coxswain.io/memory-write-for=
+	// <loop> (memoryWriterJobLabels), which matches neither the agent peer
+	// (app.kubernetes.io/component=agent) nor the loop label alone (the
+	// writer pod's full label set is the memory-write-for label). Without
+	// this peer the curator call times out at the proxy and every lesson
+	// is dropped with "curator unavailable" (the kind evidence:
+	// .samples/p5c-kind/memory-writer-logs.txt).
+	memoryWriterPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{memoryWriteForLabelKey: loopName}},
+	}
 	// I42c: the agent's egress to the egress proxy is expected only when the
 	// egress proxy is expected (network allows present); with no network
 	// allows the agent's egress stays model-proxy + DNS (D34).
@@ -4265,7 +4278,11 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{
 				{
-					From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+					// The model proxy admits the Loop's agent AND the memory-writer
+					// Job's curator call on 8080 (the writer's only network call
+					// is the curator POST to this proxy; F8 admits the verify +
+					// deliver pods to the egress proxy above, not this proxy).
+					From:  []networkingv1.NetworkPolicyPeer{agentPeer, memoryWriterPeer},
 					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
 				},
 			},

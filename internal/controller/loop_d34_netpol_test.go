@@ -181,13 +181,28 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			"app.kubernetes.io/component", "model-proxy",
 		))
 
-		// Ingress: only from this Loop's agent on 8080 (per-Loop peer, P1-1).
+		// Ingress: from this Loop's agent AND the memory-writer Job's curator
+		// call on 8080 (per-Loop peers, P1-1; P5c kind finding: the writer's
+		// curator POST rides this same proxy port and its pod's only label is
+		// coxswain.io/memory-write-for=<loop> — agent-only ingress dropped
+		// every lesson with "curator unavailable").
 		Expect(np.Spec.Ingress).To(HaveLen(1))
-		Expect(np.Spec.Ingress[0].From).To(HaveLen(1))
-		Expect(np.Spec.Ingress[0].From[0].PodSelector).ToNot(BeNil())
-		Expect(np.Spec.Ingress[0].From[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
-			"coxswain.io/loop", "proxy-np",
-		), "the agent peer must name this Loop (P1-1)")
+		Expect(np.Spec.Ingress[0].From).To(HaveLen(2))
+		agentFound, writerFound := false, false
+		for _, from := range np.Spec.Ingress[0].From {
+			if from.PodSelector == nil {
+				continue
+			}
+			if from.PodSelector.MatchLabels["coxswain.io/loop"] == "proxy-np" &&
+				from.PodSelector.MatchLabels[policy.ComponentLabelKey] == "agent" {
+				agentFound = true
+			}
+			if from.PodSelector.MatchLabels["coxswain.io/memory-write-for"] == "proxy-np" {
+				writerFound = true
+			}
+		}
+		Expect(agentFound).To(BeTrue(), "the agent peer must name this Loop (P1-1)")
+		Expect(writerFound).To(BeTrue(), "the memory-writer peer must name this Loop (P5c)")
 		Expect(np.Spec.Ingress[0].Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
 			Protocol: new(corev1.ProtocolTCP),
 			Port:     intstrPtr(8080),
@@ -321,12 +336,24 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			"coxswain.io/proxy-for", "loop-b",
 		))
 
-		// Proxy NP for loop-a: ingress only from loop-a's agent.
+		// Proxy NP for loop-a: ingress from loop-a's agent AND loop-a's
+		// memory-writer pod (P5c: the curator call rides this port).
 		npProxyA := &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "loop-a-proxy-netpol"}, npProxyA)).To(Succeed())
-		Expect(npProxyA.Spec.Ingress[0].From[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
-			"coxswain.io/loop", "loop-a",
-		))
+		agentA, writerA := false, false
+		for _, from := range npProxyA.Spec.Ingress[0].From {
+			if from.PodSelector == nil {
+				continue
+			}
+			if from.PodSelector.MatchLabels["coxswain.io/loop"] == "loop-a" {
+				agentA = true
+			}
+			if from.PodSelector.MatchLabels["coxswain.io/memory-write-for"] == "loop-a" {
+				writerA = true
+			}
+		}
+		Expect(agentA).To(BeTrue(), "proxy NP for loop-a must admit loop-a's agent")
+		Expect(writerA).To(BeTrue(), "proxy NP for loop-a must admit loop-a's memory-writer pod (P5c)")
 	})
 
 	It("sandbox pod template carries the per-Loop agent labels (P1-1: NetworkPolicy can select it)", func() {

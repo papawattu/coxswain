@@ -8,8 +8,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"maps"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -26,9 +27,7 @@ func (f *fakeMemoryStore) ListFiles(_ context.Context, _ string) (map[string][]b
 		return nil, memoryNotFoundErr{}
 	}
 	out := map[string][]byte{}
-	for k, v := range f.files {
-		out[k] = v
-	}
+	maps.Copy(out, f.files)
 	return out, nil
 }
 
@@ -61,12 +60,12 @@ func newStore(lessons ...string) *fakeMemoryStore {
 }
 
 func shaSet(files map[string][]byte) []string {
-	var out []string
+	out := make([]string, 0, len(files))
 	for n, b := range files {
 		sum := sha256.Sum256(b)
 		out = append(out, n+":"+hex.EncodeToString(sum[:]))
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 

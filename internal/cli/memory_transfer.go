@@ -23,13 +23,16 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/papawattu/coxswain/pkg/memkey"
 )
+
+// memShell is the pods' shell.
+const memShell = "/bin/sh"
 
 const (
 	// maxImportFiles / maxLessonBytes bound an imported tarball (lessons are
@@ -141,7 +144,7 @@ func memoryExport(ctx context.Context, store MemoryStore, repoURL string, w io.W
 	for n := range files {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	for _, n := range names {
@@ -251,7 +254,7 @@ const memoryListScript = `for f in /memory/*.txt; do [ -f "$f" ] || continue; pr
 const memoryWriteScript = `set -e; while [ $# -gt 0 ]; do printf '%s' "$2" | base64 -d > "/memory/$1.tmp"; if [ -e "/memory/$1" ]; then rm -f "/memory/$1.tmp"; else mv "/memory/$1.tmp" "/memory/$1"; fi; shift 2; done`
 
 func (k *kubectlMemoryStore) ListFiles(ctx context.Context, pvcName string) (map[string][]byte, error) {
-	out, _, err := k.pod.runPod(ctx, pvcName, true, []string{"/bin/sh", "-c", memoryListScript})
+	out, _, err := k.pod.runPod(ctx, pvcName, true, []string{memShell, "-c", memoryListScript})
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +264,7 @@ func (k *kubectlMemoryStore) ListFiles(ctx context.Context, pvcName string) (map
 // parseMemoryList parses the list script's "<name> <base64>" lines.
 func parseMemoryList(out string) (map[string][]byte, error) {
 	files := map[string][]byte{}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -302,8 +305,8 @@ spec:
 	for n := range files {
 		names = append(names, n)
 	}
-	sort.Strings(names)
-	cmd := []string{"/bin/sh", "-c", memoryWriteScript, "sh"}
+	slices.Sort(names)
+	cmd := []string{memShell, "-c", memoryWriteScript, "sh"}
 	for _, n := range names {
 		cmd = append(cmd, n, base64.StdEncoding.EncodeToString(files[n]))
 	}

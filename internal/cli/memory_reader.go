@@ -54,7 +54,7 @@ type peekMemoryReader struct {
 // as a header). A missing PVC is memoryNotFoundErr (a fresh repo: the CLI
 // prints a note, not an error).
 func (p *peekMemoryReader) Read(ctx context.Context, pvcName string) (string, bool, error) {
-	return p.runPod(ctx, pvcName, true, []string{"/bin/sh", "-c", memoryReadScript})
+	return p.runPod(ctx, pvcName, true, []string{memShell, "-c", memoryReadScript})
 }
 
 // memoryReadScript is the read pod's script (one file per block, the file

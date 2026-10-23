@@ -273,12 +273,36 @@ hack/rwx-storage.sh --context kind-coxswain          # or --kubeconfig FILE
 ```
 
 It is idempotent and refuses to replace an existing StorageClass that has a
-different provisioner. `sharedFileSystemPath` is only shared if the path is the
-same filesystem on every node (NFS, CephFS, or on k3d a docker volume mounted
-into every node, e.g. `--shared-path /k3d/images/rwx`); on a single-node
-cluster the default path works. Images (`rancher/local-path-provisioner:v0.0.31`,
-`busybox:1.36`) must be pullable or pre-loaded. Tested by
-`make rwx-storage-test` (real script, stubbed kubectl).
+different provisioner. `--shared-path` (default `/var/local-path-shared`) is the
+`sharedFileSystemPath`.
+
+**Prerequisite on a multi-node cluster: the same host directory must be mounted
+at that path on EVERY node.** The script mounts nothing itself, and the mount is
+a cluster-creation property. Without it each node has its own private copy and a
+pod on another node sees an empty volume. (On a single-node cluster nothing is
+needed; on a real cluster use NFS/CephFS/etc. at that path.)
+
+```sh
+# k3d: mount one host dir into every node at cluster creation
+mkdir -p /srv/local-path-shared
+k3d cluster create mylab --agents 2 \
+  --volume /srv/local-path-shared:/var/local-path-shared@all
+```
+
+```yaml
+# kind: extraMounts on every node in the cluster config
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
+- role: worker
+  extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
+```
+
+Images (`rancher/local-path-provisioner:v0.0.31`, `busybox:1.36`) must be
+pullable or pre-loaded. Tested by `make rwx-storage-test` (real script, stubbed
+kubectl).
 
 ### Component logs
 

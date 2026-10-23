@@ -49,6 +49,8 @@ has "$A" "kind: StorageClass" "StorageClass"
 has "$A" "name: local-shared" "StorageClass name"
 has "$A" "provisioner: coxswain.io/local-path-shared" "StorageClass provisioner"
 has "$A" "volumeBindingMode: WaitForFirstConsumer" "binding mode"
+# the script mounts nothing itself (the every-node mount is a cluster property)
+if grep -Eq 'hostPath|volumes:.*hostPath' "$A"; then fail "the script's manifest mounts a host path itself"; fi
 # never touches the cluster's own provisioner / default class
 if grep -Eq 'local-path-storage|rancher.io/local-path$|is-default-class' "$A"; then fail "touches the cluster's own local-path provisioner or default class"; fi
 if grep -Eq ' (create|delete|patch|replace) ' "$T/argv.log"; then fail "used a non-apply verb"; fi

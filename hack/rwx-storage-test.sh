@@ -49,6 +49,15 @@ has "$A" "kind: StorageClass" "StorageClass"
 has "$A" "name: local-shared" "StorageClass name"
 has "$A" "provisioner: coxswain.io/local-path-shared" "StorageClass provisioner"
 has "$A" "volumeBindingMode: WaitForFirstConsumer" "binding mode"
+has "$A" "setup: |-" "setup script key (every provision needs it)"
+has "$A" "teardown: |-" "teardown script key"
+# shellcheck disable=SC2016  # literal $VOL_DIR is the point
+has "$A" 'mkdir -m 0777 -p "$VOL_DIR"' "setup body"
+# shellcheck disable=SC2016
+has "$A" 'rm -rf "$VOL_DIR"' "teardown body"
+has "$A" "image: docker.io/library/busybox:1.36" "helper image not pinned"
+has "$A" "--helper-image=docker.io/library/busybox:1.36" "helper image flag"
+has "$A" "automountServiceAccountToken: false" "helper pod must not mount an SA token"
 # the script mounts nothing itself (the every-node mount is a cluster property)
 if grep -Eq 'hostPath|volumes:.*hostPath' "$A"; then fail "the script's manifest mounts a host path itself"; fi
 # never touches the cluster's own provisioner / default class
@@ -70,6 +79,13 @@ before="$(wc -c < "$A")"
 if STUB_SC_PROVISIONER="kubernetes.io/no-provisioner" "$ROOT/hack/rwx-storage.sh" --context ctx1 >"$T/out3" 2>&1; then fail "replaced a foreign StorageClass"; fi
 has "$T/out3" "already exists with provisioner 'kubernetes.io/no-provisioner'" "conflict message"
 [ "$(wc -c < "$A")" = "$before" ] || fail "applied something despite the conflict"
+
+# 3b. input validation: a bad --shared-path / the cluster's own provisioner name.
+for bad in 'rel/path' '/srv/a"b' '/' '/srv/a b'; do
+	if "$ROOT/hack/rwx-storage.sh" --context c --shared-path "$bad" >/dev/null 2>&1; then fail "accepted --shared-path '$bad'"; fi
+done
+if "$ROOT/hack/rwx-storage.sh" --context c --provisioner rancher.io/local-path >/dev/null 2>&1; then fail "accepted the cluster's own provisioner name"; fi
+[ "$(wc -c < "$A")" = "$before" ] || fail "applied something on invalid input"
 
 # 4. flags are honoured (custom class, namespace, shared path).
 "$ROOT/hack/rwx-storage.sh" --context c2 --storage-class rwx --namespace ns9 --shared-path /srv/x >/dev/null 2>&1 || fail "run 4 failed"

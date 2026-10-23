@@ -10,6 +10,7 @@ see `docs/QUICKSTART.md`.
 - [Install](#install)
 - [Metrics](#metrics)
 - [Logs](#logs)
+- [Shared memory storage (Phase 5)](#shared-memory-storage-phase-5)
 - [Reading Loop status](#reading-loop-status)
 - [Debugging a stuck Loop](#debugging-a-stuck-loop)
 - [Uninstall](#uninstall)
@@ -246,6 +247,22 @@ kubectl -n coxswain-system patch deploy coxswain-controller-manager \
 
 (Revert by replacing the flag value with `--zap-log-level=info`.)
 
+### Component logs
+
+The `kubectl cox logs` command streams the **sandbox component** logs
+(agent, proxy, verify, deliver) — not the operator log:
+
+```sh
+kubectl cox logs <loop> agent    # the runner (agent) log
+kubectl cox logs <loop> proxy    # the model proxy sidecar log
+kubectl cox logs <loop> verify   # the verify Job log
+kubectl cox logs <loop> deliver  # the deliver Job log
+```
+
+---
+
+## Shared memory storage (Phase 5)
+
 ### Memory flags
 
 - `--memory-writer-image` (required for lesson writes): the memory-writer Job
@@ -269,12 +286,14 @@ default class:
 ```sh
 hack/rwx-storage.sh --context kind-coxswain          # or --kubeconfig FILE
 # then run the operator with --memory-storage-class=local-shared
-# and import with: cox memory import <repo-url> -f f.tar.gz --storage-class local-shared
+# (import with `cox memory import ... --storage-class local-shared` needs the
+# P5d CLI, PR #186; until that merges, only the operator flag applies)
 ```
 
 It is idempotent and refuses to replace an existing StorageClass that has a
 different provisioner. `--shared-path` (default `/var/local-path-shared`) is the
-`sharedFileSystemPath`.
+`sharedFileSystemPath`. If one host dir backs several clusters, give each its
+own subdirectory (`--shared-path /var/local-path-shared/<cluster>`).
 
 **Prerequisite on a multi-node cluster: the same host directory must be mounted
 at that path on EVERY node.** The script mounts nothing itself, and the mount is
@@ -289,6 +308,11 @@ k3d cluster create mylab --agents 2 \
   --volume /srv/local-path-shared:/var/local-path-shared@all
 ```
 
+```sh
+# kind: create the host dir first, then mount it on every node
+mkdir -p /srv/local-path-shared
+```
+
 ```yaml
 # kind: extraMounts on every node in the cluster config
 kind: Cluster
@@ -300,23 +324,16 @@ nodes:
   extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
 ```
 
+**Posture: this is a dev/lab storage class, not a hardened one.** Upstream
+local-path's design: its short-lived helper pods run as root with a hostPath
+mount of `--shared-path` to create/remove volume dirs, and volumes are created
+mode 0777. The helper pods carry no ServiceAccount token
+(`automountServiceAccountToken: false`). Do not use it where tenants are
+untrusted; use a real RWX class (NFS/CephFS) in production.
+
 Images (`rancher/local-path-provisioner:v0.0.31`, `busybox:1.36`) must be
 pullable or pre-loaded. Tested by `make rwx-storage-test` (real script, stubbed
 kubectl).
-
-### Component logs
-
-The `kubectl cox logs` command streams the **sandbox component** logs
-(agent, proxy, verify, deliver) — not the operator log:
-
-```sh
-kubectl cox logs <loop> agent    # the runner (agent) log
-kubectl cox logs <loop> proxy    # the model proxy sidecar log
-kubectl cox logs <loop> verify   # the verify Job log
-kubectl cox logs <loop> deliver  # the deliver Job log
-```
-
----
 
 ## Reading Loop status
 

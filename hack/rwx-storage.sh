@@ -56,6 +56,20 @@ while [ $# -gt 0 ]; do
 	esac
 	shift 2
 done
+# --shared-path lands inside a JSON string and a hostPath: absolute, and only
+# a safe charset (an embedded quote would emit invalid config.json and the only
+# symptom would be a rollout timeout).
+case "$SHARED_PATH" in
+/*) ;;
+*) die "--shared-path must be an absolute path (got '$SHARED_PATH')" ;;
+esac
+[ "$SHARED_PATH" != "/" ] || die "--shared-path must not be /"
+if ! printf '%s' "$SHARED_PATH" | grep -Eq '^/[A-Za-z0-9._/-]+$'; then
+	die "--shared-path may contain only letters, digits and . _ / - (got '$SHARED_PATH')"
+fi
+# The cluster's own local-path provisioner owns this name; two provisioners
+# fighting over it would break every PVC on the cluster.
+[ "$PROV" != "rancher.io/local-path" ] || die "--provisioner must not be rancher.io/local-path (the cluster's own local-path provisioner)"
 [ -n "$CTX" ] || [ -n "$KCFG" ] || die "pass --context and/or --kubeconfig (this script never uses the ambient context)"
 
 kc() {
@@ -133,6 +147,8 @@ data:
     metadata:
       name: helper-pod
     spec:
+      # The helper only mkdir/rm's on the host path; it never calls the API.
+      automountServiceAccountToken: false
       containers:
       - name: helper-pod
         image: $HELPER

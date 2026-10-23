@@ -590,6 +590,48 @@ func TestWriteClaimCarriesLessonsAvailable(t *testing.T) {
 	}
 }
 
+// TestPhaseRunClaimLessonsAvailable (F17): PhaseRun's CLAIM (not just the
+// lessonsFileAvailable helper) MUST carry lessonsAvailable=true when the run
+// wrote a non-empty lessons file, and false when it wrote none. The operator
+// reads status.progress.LessonsAvailable from this claim; a missing or false
+// field skips the memory-writer Job (the retroactive-write protection), so
+// the claim itself is the gate input.
+func TestPhaseRunClaimLessonsAvailable(t *testing.T) {
+	run := func(t *testing.T, answer string) map[string]any {
+		t.Helper()
+		fake := s4FakeModelAnswer(t, answer)
+		defer fake.Close()
+		claimPath, cleanup := s4ClaimPath(t)
+		defer cleanup()
+		ws := t.TempDir()
+		initTestRepo(t, ws)
+		writeDesiredPhase(t, ws, PhaseImplementing)
+		res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+			PollInterval: 5 * time.Millisecond}, make(chan any))
+		if res.Status != statusSuccess {
+			t.Fatalf("status = %q, want %q (notes: %s)", res.Status, statusSuccess, res.VerificationNotes)
+		}
+		return parseClaim(t, claimPath)
+	}
+
+	// With a LESSON: line the run writes .coxswain/lessons.json and the claim
+	// MUST carry lessonsAvailable=true (the operator's gate then creates the
+	// memory-writer Job once the Loop is terminal).
+	claim := run(t, "the agent fixed the code\nLESSON: the build needs -tags integration")
+	if v, ok := claim["lessonsAvailable"]; !ok || v != true {
+		t.Fatalf("claim lessonsAvailable = %v (present: %v), want true (the run wrote a "+
+			"non-empty lessons file): %v", v, ok, claim)
+	}
+
+	// Without a LESSON: line no lessons file is written and the claim MUST
+	// carry lessonsAvailable=false (the operator then skips the write).
+	claim = run(t, "the agent fixed the code and added the tests")
+	if v, ok := claim["lessonsAvailable"]; !ok || v != false {
+		t.Fatalf("claim lessonsAvailable = %v (present: %v), want false (the run wrote "+
+			"no lessons file): %v", v, ok, claim)
+	}
+}
+
 // TestWriteClaimCarriesPlanMismatch (I93, R29): writeClaim's JSON (the
 // /dev/termination-log the operator parses) MUST carry planMismatch when
 // res.PlanMismatch is true. The operator's advancePhaseFromClaim reads

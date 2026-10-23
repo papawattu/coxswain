@@ -754,11 +754,3 @@ func TestMemoryWriteCuratorCallFailureDrops(t *testing.T) {
 		t.Errorf("audit trail lacks %s:\n%s", want, summary)
 	}
 }
-
-// TestMemoryWriteCuratorFreeTextKeepDrops (P5c strict-parse): the curator's
-// verdict MUST be the STRICT JSON {"keep": bool, "reason": string} — a
-// FREE-TEXT response that contains the word "keep" (or says "I would keep
-// this") is NOT a strict-JSON verdict and must be dropped ("curator
-// unparseable"). A lenient parser (e.g. strings.Contains(content, "keep") ->
-// keep=true) would write a lesson the curator never strictly approved,
-// defeating the ADR-0002 gate.

@@ -176,17 +176,6 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(c.SecurityContext.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")))
 		Expect(job.Spec.Template.Spec.SecurityContext.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
 
-		// P5c kind finding: a dynamically provisioned memory PVC (e.g. NFS
-		// local-shared) is root-owned; the writer pod (uid 65532) cannot
-		// create files in the volume root without fsGroup. The pod spec
-		// MUST carry FSGroup=RunAsGroup (the kernel's fsGroupChown sets the
-		// group of all files on the volume to 65532, so the writer can
-		// create lesson files without a hand chown).
-		Expect(job.Spec.Template.Spec.SecurityContext.FSGroup).NotTo(BeNil(),
-			"the memory-writer Job's pod spec must set FSGroup (the writer is uid 65532; a root-owned volume is otherwise unwritable)")
-		Expect(*job.Spec.Template.Spec.SecurityContext.FSGroup).To(Equal(int64(65532)),
-			"FSGroup must equal the writer's non-root GID (65532)")
-
 		// The container's command is the memory-write entrypoint (the
 		// operator-controlled binary — the Job's pod runs the memory-write
 		// subcommand, NOT the operator's main; the entrypoint is

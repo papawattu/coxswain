@@ -12,7 +12,12 @@
 # target keeps its own in-tree edit (local dev leaves the args empty).
 #
 # Usage: IMG=ghcr.io/<owner>/coxswain-controller:<tag> \
-#        KUSTOMIZE=<path> hack/build-installer.sh
+#        [MEMORY_STORAGE_CLASS=<class>] KUSTOMIZE=<path> hack/build-installer.sh
+#
+# F22: MEMORY_STORAGE_CLASS (optional) appends --memory-storage-class=<class>
+# to the manager args in the temp overlay, so an install.yaml can enable the
+# RWX memory PVC (see hack/rwx-storage.sh) without hand-patching the
+# Deployment. Unset/empty = no flag (the cluster default class).
 #
 # The five ghcr arg image names are hardcoded to the release workflow's
 # public prefix (papawattu/coxswain-*); only the TAG is derived from IMG.
@@ -47,6 +52,18 @@ cp -r "$ROOT/config" "$OVERLAY/config"
 # heredoc cannot appear inside a Makefile recipe line).
 sed -e "s|__TAG__|$TAG|g" "$ROOT/hack/install-args.patch.tpl" \
 	> "$OVERLAY/config/manager/install-args.patch.yaml"
+
+# F22: optional --memory-storage-class. Must be a DNS-1123 subdomain (the same
+# rule the operator and `cox memory import` enforce) so a typo cannot inject
+# YAML into the patch.
+MEMORY_STORAGE_CLASS="${MEMORY_STORAGE_CLASS:-}"
+if [ -n "$MEMORY_STORAGE_CLASS" ]; then
+	printf '%s' "$MEMORY_STORAGE_CLASS" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$' \
+		&& [ "${#MEMORY_STORAGE_CLASS}" -le 253 ] \
+		|| { echo "Error: MEMORY_STORAGE_CLASS=$MEMORY_STORAGE_CLASS is not a valid StorageClass name"; exit 1; }
+	printf -- '- op: add\n  path: /spec/template/spec/containers/0/args/-\n  value: --memory-storage-class=%s\n' \
+		"$MEMORY_STORAGE_CLASS" >> "$OVERLAY/config/manager/install-args.patch.yaml"
+fi
 
 # Wire the JSON6902 patch into the overlay's manager kustomization. Remove any
 # existing `patches:` block from the copied kustomization (the in-tree file has

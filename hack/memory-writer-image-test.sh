@@ -58,6 +58,19 @@ cp "$ROOT/hack/build-installer.sh" "$ROOT/hack/install-args.patch.tpl" "$TMP/ins
 KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" bash "$TMP/inst/hack/build-installer.sh" >/dev/null
 check "install.yaml" "$TMP/inst/dist/install.yaml" "$IMG"
 
+# F22: MEMORY_STORAGE_CLASS knob. Unset: no --memory-storage-class (default
+# unchanged). Set: exactly one --memory-storage-class=<value>. Bad value: fails.
+n="$(grep -c -- "--memory-storage-class" "$TMP/inst/dist/install.yaml" || true)"
+[ "$n" = "0" ] || { echo "FATAL[F22]: unset knob still rendered $n --memory-storage-class args"; exit 1; }
+KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MEMORY_STORAGE_CLASS=local-shared bash "$TMP/inst/hack/build-installer.sh" >/dev/null
+n="$(grep -Fc -- "- --memory-storage-class=local-shared" "$TMP/inst/dist/install.yaml" || true)"
+[ "$n" = "1" ] || { echo "FATAL[F22]: expected exactly one '--memory-storage-class=local-shared' (found $n)"; exit 1; }
+check "install.yaml (MEMORY_STORAGE_CLASS=local-shared)" "$TMP/inst/dist/install.yaml" "$IMG"
+if KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" MEMORY_STORAGE_CLASS='a..b' bash "$TMP/inst/hack/build-installer.sh" >/dev/null 2>&1; then
+	echo "FATAL[F22]: invalid MEMORY_STORAGE_CLASS a..b was accepted"; exit 1
+fi
+echo "OK[F22]: MEMORY_STORAGE_CLASS renders exactly one --memory-storage-class; unset renders none"
+
 # the Helm chart.
 helm template coxswain "$ROOT/dist/chart" --namespace coxswain-system > "$TMP/chart.yaml"
 want="$(grep -E '^[[:space:]]+image: "ghcr.io/.*coxswain-controller:' "$TMP/chart.yaml" | head -1 | sed -E 's/.*image: "([^"]+)".*/\1/')"

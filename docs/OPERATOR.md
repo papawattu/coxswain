@@ -272,7 +272,11 @@ kubectl cox logs <loop> deliver  # the deliver Job log
   `hack/memory-writer-image-test.sh` guards that. Only override it with another
   build of the operator image.
 - `--memory-storage-class` (optional): an RWX-capable StorageClass for the
-  memory PVC (kind's default `rancher.io/local-path` is RWO-only).
+  memory PVC (kind's default `rancher.io/local-path` is RWO-only). On the
+  kustomize / `install.yaml` path, render with
+  `make build-installer IMG=... MEMORY_STORAGE_CLASS=local-shared` (F22): the
+  script appends the flag in a temp overlay, no tracked file is edited, and
+  unset means no flag. On Helm use `manager.args`.
 
 ### RWX storage for the memory PVC (`hack/rwx-storage.sh`)
 
@@ -286,6 +290,7 @@ default class:
 ```sh
 hack/rwx-storage.sh --context kind-coxswain          # or --kubeconfig FILE
 # then run the operator with --memory-storage-class=local-shared
+# (install.yaml: make build-installer IMG=... MEMORY_STORAGE_CLASS=local-shared)
 # (import with `cox memory import ... --storage-class local-shared` needs the
 # P5d CLI, PR #186; until that merges, only the operator flag applies)
 ```

@@ -28,7 +28,7 @@ import (
 // contents (the shared lessons for this repo in this namespace) via a
 // read-only peek pod.
 func newMemoryCommand() *cobra.Command {
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "memory <repo-url>",
 		Short: "Inspect the shared memory PVC (lessons from prior Loops) for a repo",
 		Long: "cox memory <repo-url> reads the per-(namespace, repo) memory PVC — the\n" +
@@ -40,6 +40,8 @@ func newMemoryCommand() *cobra.Command {
 			return memoryRepo(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
 		},
 	}
+	c.AddCommand(newMemoryExportCommand(), newMemoryImportCommand())
+	return c
 }
 
 // memoryRepo reads and prints the memory PVC's contents (the command's core

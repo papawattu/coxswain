@@ -13,6 +13,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,6 +54,18 @@ type peekMemoryReader struct {
 // as a header). A missing PVC is memoryNotFoundErr (a fresh repo: the CLI
 // prints a note, not an error).
 func (p *peekMemoryReader) Read(ctx context.Context, pvcName string) (string, bool, error) {
+	return p.runPod(ctx, pvcName, true, []string{"/bin/sh", "-c", memoryReadScript})
+}
+
+// memoryReadScript is the read pod's script (one file per block, the file
+// name as a header).
+const memoryReadScript = `if [ -z "$(find /memory -mindepth 1 -maxdepth 1 -type f 2>/dev/null)" ]; then exit 0; fi; find /memory -mindepth 1 -maxdepth 1 -type f | sort | while IFS= read -r f; do echo "-- ${f#/memory/}:"; cat "$f"; echo; done 2>&1 || { echo memory-read-failed-exit-$? >&2; exit 1; }`
+
+// runPod runs one hardened pod against the memory PVC with the given command
+// and returns its log (found=false when the log is empty). readOnly selects
+// the PVC mount mode: Read (inspect, export) is read-only; only the P5d
+// import writes (readOnly=false). A missing PVC is memoryNotFoundErr.
+func (p *peekMemoryReader) runPod(ctx context.Context, pvcName string, readOnly bool, command []string) (string, bool, error) {
 	// The memory PVC must exist (a missing PVC is a fresh repo: the CLI
 	// prints a note, not an error). A real read failure (a PVC that exists
 	// but the API rejects) is an error.
@@ -68,6 +81,10 @@ func (p *peekMemoryReader) Read(ctx context.Context, pvcName string) (string, bo
 	// (the coxswain non-root UID the controller uses for the agent/verify/
 	// deliver pods — the memory PVC's files are written by P5b's writer Job,
 	// which runs as that same UID).
+	cmdJSON, jerr := json.Marshal(command) // JSON is valid YAML flow syntax.
+	if jerr != nil {
+		return "", false, fmt.Errorf("encode memory pod command: %w", jerr)
+	}
 	manifest := fmt.Sprintf(`apiVersion: v1
 kind: Pod
 metadata:
@@ -93,17 +110,17 @@ spec:
       readOnlyRootFilesystem: true
       capabilities:
         drop: ["ALL"]
-    command: ['/bin/sh', '-c', 'if [ -z "$(find /memory -mindepth 1 -maxdepth 1 -type f 2>/dev/null)" ]; then exit 0; fi; find /memory -mindepth 1 -maxdepth 1 -type f | sort | while IFS= read -r f; do echo "-- ${f#/memory/}:"; cat "$f"; echo; done 2>&1 || { echo memory-read-failed-exit-$? >&2; exit 1; }']
+    command: %s
     volumeMounts:
     - name: mem
       mountPath: /memory
-      readOnly: true
+      readOnly: %t
   volumes:
   - name: mem
     persistentVolumeClaim:
       claimName: %s
-      readOnly: true
-`, p.ns, memkey.Key(pvcName), pvcName)
+      readOnly: %t
+`, p.ns, memkey.Key(pvcName), cmdJSON, readOnly, pvcName, readOnly)
 
 	// Create from stdin (generateName requires create, not apply).
 	if err := p.peekKubectlCreate(ctx, manifest, "create", "-f", "-"); err != nil {

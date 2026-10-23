@@ -73,6 +73,8 @@ type Deps struct {
 	// Memory reads the memory PVC (the `cox memory` command; P5a). nil = the
 	// real peek pod (peekMemoryReader).
 	Memory MemoryReader
+	// MemoryStore is the export/import boundary (P5d); nil = real pods.
+	MemoryStore MemoryStore
 }
 
 // currentDeps is the active seam set. It is set by NewRootCommand/Execute and

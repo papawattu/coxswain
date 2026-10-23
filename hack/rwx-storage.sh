@@ -79,10 +79,22 @@ kc() {
 	"$KUBECTL" "${a[@]}" "$@"
 }
 
-# A StorageClass's provisioner is immutable: refuse to fight an existing one.
-existing="$(kc get storageclass "$SC" -o jsonpath='{.provisioner}' 2>/dev/null || true)"
-if [ -n "$existing" ] && [ "$existing" != "$PROV" ]; then
+# A StorageClass's provisioner and volumeBindingMode are immutable.
+# Refuse to fight an existing class with another provisioner.
+read -r existing existing_mode < <(kc get storageclass "$SC" -o jsonpath='{.provisioner} {.volumeBindingMode}{"\n"}' 2>/dev/null || true) || true
+if [ -n "${existing:-}" ] && [ "$existing" != "$PROV" ]; then
 	die "StorageClass $SC already exists with provisioner '$existing' (want '$PROV'); pick another --storage-class or delete it yourself (this script does not replace a StorageClass)"
+fi
+# F24: the class must be Immediate. The operator mounts the memory PVC only once
+# it is Bound, and a WaitForFirstConsumer PVC is only bound by a consumer pod, so
+# WaitForFirstConsumer deadlocks (memory never binds). sharedFileSystemPath
+# volumes are not node-bound, so Immediate is safe. An older run of this script
+# created the class as WaitForFirstConsumer; the mode cannot be patched, so
+# recreate OUR OWN class (provisioner matched above). Existing PVs/PVCs are
+# unaffected: a StorageClass is only a template.
+if [ -n "${existing:-}" ] && [ "${existing_mode:-}" != "Immediate" ]; then
+	echo "Recreating StorageClass $SC: volumeBindingMode ${existing_mode:-<unset>} -> Immediate (F24)"
+	kc delete storageclass "$SC"
 fi
 
 # The provisioner reads its config + helper-pod template once at start, so a
@@ -207,7 +219,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata: {name: $SC}
 provisioner: $PROV
-volumeBindingMode: WaitForFirstConsumer
+volumeBindingMode: Immediate
 reclaimPolicy: Delete
 YAML
 

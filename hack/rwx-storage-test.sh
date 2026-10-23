@@ -16,7 +16,8 @@ cat > "$T/bin/kubectl" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_DIR/argv.log"
 case " $* " in
-*" get storageclass "*) printf '%s' "${STUB_SC_PROVISIONER:-}"; exit 0 ;;
+*" get storageclass "*) [ -z "${STUB_SC_PROVISIONER:-}" ] || printf '%s %s\n' "$STUB_SC_PROVISIONER" "${STUB_SC_MODE:-Immediate}"; exit 0 ;;
+*" delete storageclass "*) exit 0 ;;
 *" apply -f - "*) cat >> "$STUB_DIR/applied.yaml"; echo "---RUN-END---" >> "$STUB_DIR/applied.yaml"; exit 0 ;;
 *" rollout status "*) exit 0 ;;
 esac
@@ -48,7 +49,8 @@ has "$A" "name: coxswain-rwx-provisioner" "own ClusterRole name"
 has "$A" "kind: StorageClass" "StorageClass"
 has "$A" "name: local-shared" "StorageClass name"
 has "$A" "provisioner: coxswain.io/local-path-shared" "StorageClass provisioner"
-has "$A" "volumeBindingMode: WaitForFirstConsumer" "binding mode"
+has "$A" "volumeBindingMode: Immediate" "binding mode (F24: WaitForFirstConsumer deadlocks the operator's memory PVC)"
+if grep -Fq "WaitForFirstConsumer" "$A"; then fail "StorageClass is WaitForFirstConsumer"; fi
 has "$A" "coxswain.io/config-sum:" "pod template must carry the config checksum (config changes must roll the provisioner)"
 has "$A" "setup: |-" "setup script key (every provision needs it)"
 has "$A" "teardown: |-" "teardown script key"
@@ -74,6 +76,13 @@ runs = [r for r in open(sys.argv[1]).read().split("---RUN-END---\n") if r.strip(
 assert len(runs) == 2, len(runs)
 assert runs[0] == runs[1], "manifests differ"
 PY
+
+# 2b. F24: an existing class of OURS that is WaitForFirstConsumer is recreated
+# (delete + apply), an Immediate one is not deleted.
+grep -Eq ' delete ' "$T/argv.log" && fail "deleted the StorageClass when it was already Immediate"
+STUB_SC_PROVISIONER="coxswain.io/local-path-shared" STUB_SC_MODE=WaitForFirstConsumer "$ROOT/hack/rwx-storage.sh" --context ctx1 --kubeconfig /tmp/kc >"$T/out2b" 2>&1 || { cat "$T/out2b"; fail "run 2b failed"; }
+has "$T/argv.log" "delete storageclass local-shared" "a WaitForFirstConsumer class of ours was not recreated"
+[ "$(grep -c ' delete ' "$T/argv.log")" = "1" ] || fail "expected exactly one delete"
 
 # 3. a StorageClass with ANOTHER provisioner: stop before applying anything.
 before="$(wc -c < "$A")"

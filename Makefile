@@ -93,6 +93,7 @@ runner-test: ## Run the runner module's tests (separate go.mod).
 # skipped the coverage step.
 chart-check: install-helm kustomize ## B5a: helm lint + helm template + install.yaml coverage for dist/chart (offline).
 	@bash hack/chart-check.sh
+	@KUSTOMIZE="$(KUSTOMIZE)" hack/memory-writer-image-test.sh
 
 # S1: the sample apps are separate Go/Python modules (examples/<app>); the root
 # `go test ./...` and golangci-lint skip them. Verify each app's scoped checks
@@ -466,6 +467,14 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 build-installer: manifests generate kustomize ## A5: render dist/install.yaml with ALL coxswain ghcr images tagged from IMG (see hack/build-installer.sh).
 	IMG="$(IMG)" TARGET=build-installer hack/require-img.sh
 	KUSTOMIZE="$(KUSTOMIZE)" IMG="$(IMG)" hack/build-installer.sh
+
+.PHONY: memory-writer-image-test
+memory-writer-image-test: kustomize install-helm ## F19: every shipped manifest passes --memory-writer-image = the operator's own image.
+	@KUSTOMIZE="$(KUSTOMIZE)" hack/memory-writer-image-test.sh
+
+.PHONY: rwx-storage-test
+rwx-storage-test: ## F21: execution test of hack/rwx-storage.sh against a stubbed kubectl.
+	@hack/rwx-storage-test.sh
 
 .PHONY: build-installer-test
 build-installer-test: kustomize ## A5: test that build-installer tags every coxswain image in install.yaml (see hack/build-installer-test.sh).

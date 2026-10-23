@@ -10,6 +10,7 @@ see `docs/QUICKSTART.md`.
 - [Install](#install)
 - [Metrics](#metrics)
 - [Logs](#logs)
+- [Shared memory storage (Phase 5)](#shared-memory-storage-phase-5)
 - [Reading Loop status](#reading-loop-status)
 - [Debugging a stuck Loop](#debugging-a-stuck-loop)
 - [Uninstall](#uninstall)
@@ -259,6 +260,80 @@ kubectl cox logs <loop> deliver  # the deliver Job log
 ```
 
 ---
+
+## Shared memory storage (Phase 5)
+
+### Memory flags
+
+- `--memory-writer-image` (required for lesson writes): the memory-writer Job
+  runs `/usr/local/bin/coxswain-memory-write`, which exists only in the
+  operator's own image. The shipped kustomize base, `install.yaml` and the Helm
+  chart set it to the manager's image automatically (F19);
+  `hack/memory-writer-image-test.sh` guards that. Only override it with another
+  build of the operator image.
+- `--memory-storage-class` (optional): an RWX-capable StorageClass for the
+  memory PVC (kind's default `rancher.io/local-path` is RWO-only).
+
+### RWX storage for the memory PVC (`hack/rwx-storage.sh`)
+
+The memory PVC is ReadWriteMany. kind, k3d and k3s ship an RWO-only default
+class, so the PVC would stay Pending. `hack/rwx-storage.sh` installs a second,
+pinned rancher local-path-provisioner (own namespace `coxswain-rwx-storage`,
+own provisioner name, `sharedFileSystemPath` mode) and a `local-shared`
+StorageClass on any cluster, without touching the cluster's own provisioner or
+default class:
+
+```sh
+hack/rwx-storage.sh --context kind-coxswain          # or --kubeconfig FILE
+# then run the operator with --memory-storage-class=local-shared
+# (import with `cox memory import ... --storage-class local-shared` needs the
+# P5d CLI, PR #186; until that merges, only the operator flag applies)
+```
+
+It is idempotent and refuses to replace an existing StorageClass that has a
+different provisioner. `--shared-path` (default `/var/local-path-shared`) is the
+`sharedFileSystemPath`. If one host dir backs several clusters, give each its
+own subdirectory (`--shared-path /var/local-path-shared/<cluster>`).
+
+**Prerequisite on a multi-node cluster: the same host directory must be mounted
+at that path on EVERY node.** The script mounts nothing itself, and the mount is
+a cluster-creation property. Without it each node has its own private copy and a
+pod on another node sees an empty volume. (On a single-node cluster nothing is
+needed; on a real cluster use NFS/CephFS/etc. at that path.)
+
+```sh
+# k3d: mount one host dir into every node at cluster creation
+mkdir -p /srv/local-path-shared
+k3d cluster create mylab --agents 2 \
+  --volume /srv/local-path-shared:/var/local-path-shared@all
+```
+
+```sh
+# kind: create the host dir first, then mount it on every node
+mkdir -p /srv/local-path-shared
+```
+
+```yaml
+# kind: extraMounts on every node in the cluster config
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
+- role: worker
+  extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
+```
+
+**Posture: this is a dev/lab storage class, not a hardened one.** Upstream
+local-path's design: its short-lived helper pods run as root with a hostPath
+mount of `--shared-path` to create/remove volume dirs, and volumes are created
+mode 0777. The helper pods carry no ServiceAccount token
+(`automountServiceAccountToken: false`). Do not use it where tenants are
+untrusted; use a real RWX class (NFS/CephFS) in production.
+
+Images (`rancher/local-path-provisioner:v0.0.31`, `busybox:1.36`) must be
+pullable or pre-loaded. Tested by `make rwx-storage-test` (real script, stubbed
+kubectl).
 
 ## Reading Loop status
 

@@ -1,2 +1,19 @@
 resources:
 - manager.yaml
+# F19: point --memory-writer-image at the manager container's own image (after
+# the images transformer has rewritten it). Selected by the arg's value, not
+# its index, so inserting another arg cannot break it.
+replacements:
+- source:
+    kind: Deployment
+    name: controller-manager
+    fieldPath: spec.template.spec.containers.[name=manager].image
+  targets:
+  - select:
+      kind: Deployment
+      name: controller-manager
+    fieldPaths:
+    - spec.template.spec.containers.[name=manager].args.[=--memory-writer-image=IMG_PLACEHOLDER]
+    options:
+      delimiter: "="
+      index: 1

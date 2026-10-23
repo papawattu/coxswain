@@ -331,10 +331,18 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 				} else {
 					res.VerificationNotes = "commit failed: re-commit on restart returned empty headCommit"
 				}
+				// P5b: the lessonsAvailable claim field is the lessons FILE's
+				// presence on the workspace volume (the operator's gate reads it
+				// from status.progress). Set it BEFORE the writeClaim call.
+				res.LessonsAvailable = lessonsFileAvailable(cfg.Workspace)
 				writeClaim(claimWritePath, res)
 				return res
 			}
 		}
+		// P5b: the lessonsAvailable claim field is the lessons FILE's presence
+		// on the workspace volume (the operator's gate reads it from
+		// status.progress). Set it BEFORE the writeClaim call.
+		res.LessonsAvailable = lessonsFileAvailable(cfg.Workspace)
 		writeClaim(claimWritePath, res)
 		return res
 	}
@@ -484,6 +492,12 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// write is a blocked run the operator must see).
 	res.Iteration = claimIteration(curIter)
 	res.PlanAttempt = readPlanAttempt(cfg.Workspace)
+	// P5b: the lessonsAvailable claim field is the lessons FILE's presence on
+	// the workspace volume (the operator's gate reads it from status.progress).
+	// Set it BEFORE the writeClaim call (the claim struct's field is a plain
+	// bool, not a function call — writeClaim has no workspace path to read
+	// the lessons file itself).
+	res.LessonsAvailable = lessonsFileAvailable(cfg.Workspace)
 	if err := writeResult(filepath.Join(cfg.Workspace, resultDirName, resultFileName), res); err != nil {
 		res.Status = statusBlocked
 		res.VerificationNotes = fmt.Sprintf("write result: %v", err)
@@ -628,6 +642,19 @@ func writePlan(workspace, answer string, capBytes int) {
 // the result.json remains on the workspace volume for debugging. The claim
 // is size-limited to claimMaxBytes (well under the kubelet cap) so a long
 // blockedReason cannot truncate the object mid-field.
+// P5b: the lessonsAvailable claim field is the lessons FILE's presence on
+// the workspace volume. The claim is written at the end of a phase run, after
+// the phase's cfg has been discarded, and the claim struct is a local type
+// with no field to carry the workspace path — writeClaim therefore has no
+// direct access to the workspace. The lessonsFileAvailable helper reads the
+// lessons file from the workspace path (passed by the caller, which has the
+// cfg), and the claim's lessonsAvailable field is set from that helper.
+//
+// writeClaim is the ADR-0004 claim writer: it writes the size-limited, strict
+// object to the termination log. The caller (PhaseRun / Run) is responsible
+// for setting res.LessonsAvailable BEFORE calling writeClaim (the claim
+// struct's lessonsAvailable field is a plain bool, not a function call —
+// writeClaim has no workspace path to read the lessons file itself).
 func writeClaim(path string, res Result) {
 	type claim struct {
 		ObservedPhase string `json:"observedPhase"`
@@ -661,15 +688,26 @@ func writeClaim(path string, res Result) {
 		// satisfy the new Planning phase). A missing "planAttempt" key parses
 		// as 0, so an omitted field reads as a stale claim from attempt 0.
 		PlanAttempt int `json:"planAttempt"`
+		// P5b: true when the runner wrote a non-empty
+		// <workspace>/.coxswain/lessons.json on this run. It MUST ride the
+		// claim: the operator's lessonsAvailable gate (the memory-writer Job's
+		// eligibility) reads it from status.progress — a terminal Loop with no
+		// lessons file gets no writer Job (the retroactive-write protection).
+		// The caller (PhaseRun / Run) sets res.LessonsAvailable BEFORE calling
+		// writeClaim (the claim struct's field is a plain bool, not a function
+		// call — writeClaim has no workspace path to read the lessons file
+		// itself).
+		LessonsAvailable bool `json:"lessonsAvailable"`
 	}
 	c := claim{
-		ObservedPhase: res.ObservedPhase,
-		Status:        res.Status,
-		BlockedReason: res.VerificationNotes,
-		HeadCommit:    res.HeadCommit,
-		PlanMismatch:  res.PlanMismatch,
-		Iteration:     res.Iteration,
-		PlanAttempt:   res.PlanAttempt,
+		ObservedPhase:    res.ObservedPhase,
+		Status:           res.Status,
+		BlockedReason:    res.VerificationNotes,
+		HeadCommit:       res.HeadCommit,
+		PlanMismatch:     res.PlanMismatch,
+		Iteration:        res.Iteration,
+		PlanAttempt:      res.PlanAttempt,
+		LessonsAvailable: res.LessonsAvailable,
 	}
 	data, err := json.Marshal(c)
 	if err != nil {
@@ -1315,6 +1353,32 @@ func claimIteration(iter string) int {
 		n = n*10 + int(r-'0')
 	}
 	return n
+}
+
+// lessonsFileAvailable reports whether the .coxswain/lessons.json file
+// exists on the workspace volume (the P5b lessonsAvailable claim field: the
+// file's presence on disk is the runner's signal that it proposed lessons
+// this run; the memory-writer Job reads the file itself, the gate only
+// needs the boolean). A missing file (no lessons proposed) or an unreadable
+// one reports false (the honest no-lessons report; the operator then skips
+// the write rather than guess).
+//
+// The workspace path is passed explicitly (writeClaim has no cfg: the claim
+// is written at the end of a phase run, after the phase's cfg has been
+// discarded, and the claim struct is a local type with no field to carry
+// the workspace path — the caller passes it from its own cfg). A nil or
+// empty workspace path (a legacy single-phase run, or a test that does not
+// set a workspace) reports false (the honest no-lessons report; the
+// operator's gate then skips the write — a false negative is the safe
+// direction, not a false positive).
+func lessonsFileAvailable(workspace string) bool {
+	if workspace == "" {
+		return false
+	}
+	if info, err := os.Stat(filepath.Join(workspace, resultDirName, "lessons.json")); err == nil && !info.IsDir() {
+		return true
+	}
+	return false
 }
 
 // readPlanAttempt reads the .coxswain/plan-attempt marker (the operator's

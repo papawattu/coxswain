@@ -4770,7 +4770,41 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{}},
 		}
 	}
+	// P5c proxy egress: the model endpoint is a same-cluster Service FQDN
+	// (svc.ns.svc or svc.ns.svc.cluster.local). The loop proxy must be able
+	// to dial it, so allow egress to the Service's namespace (via the
+	// kubernetes.io/metadata.name label, set by the API server on every
+	// namespace). A service name with a single dot (svc.ns) is not a valid
+	// in-cluster FQDN and is treated as nil (fail-closed). This mirrors
+	// repoPeer's FQDN handling for the workspace git egress.
+	if ns, ok := svcNamespaceFromFQDN(host); ok {
+		return &networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"kubernetes.io/metadata.name": ns},
+			},
+		}
+	}
 	return nil
+}
+
+// svcNamespaceFromFQDN extracts the namespace from a same-cluster Service FQDN.
+// It recognises the canonical in-cluster forms:
+//   - svc.ns.svc.cluster.local (6 parts) — the full FQDN.
+//   - svc.ns.svc (3 parts) — the minimal same-cluster FQDN (no cluster.local).
+//
+// It returns false for anything else (an external FQDN, an IP, a single-label
+// name) so the caller fails closed. A namespace containing a dot is rejected
+// (namespaces are DNS labels, no dots).
+func svcNamespaceFromFQDN(host string) (string, bool) {
+	parts := strings.Split(host, ".")
+	switch {
+	case len(parts) == 5 && parts[2] == "svc" && parts[3] == "cluster" && parts[4] == "local":
+		return parts[1], true
+	case len(parts) == 3 && parts[2] == "svc":
+		return parts[1], true
+	default:
+		return "", false
+	}
 }
 
 // repoPeer is the NetworkPolicy peer for the sandbox pod's workspace init

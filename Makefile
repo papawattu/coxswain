@@ -72,6 +72,10 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
+	@# F20: the shipped-manifest guard (F19) runs first so a dropped --memory-writer-image fails fast.
+	$(MAKE) memory-writer-image-test
+	@# F21: the RWX-storage script's execution test (real script, stubbed kubectl).
+	$(MAKE) rwx-storage-test
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 	$(MAKE) runner-test
 

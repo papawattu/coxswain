@@ -196,13 +196,30 @@ func run(outcome string) (int, error) {
 	// a mis-invocation writes nothing).
 	survivors, reasons := screenLessons(lessons, eligibleOutcome)
 
-	// P5c: the Memory Curator gate (ADR-0002). Only when ALL static rules
-	// pass (the survivors) does the curator judge each lesson. The curator
-	// call goes to the Loop's model proxy (COX_CURATOR_BASE_URL); a call
-	// failure drops the lesson ("curator unavailable"). The curator is
-	// disabled (COX_CURATOR_BASE_URL empty) in the execution test and in
-	// the P5b-only path (all static-rule survivors are written).
-	if curBase := curatorBaseURLFromEnv(); curBase != "" {
+	// P5c: the Memory Curator gate (ADR-0002, D70). Only when ALL static
+	// rules pass (the survivors) does the curator judge each lesson. The
+	// curator call goes to the Loop's model proxy (COX_CURATOR_BASE_URL); a
+	// call failure drops the lesson ("curator unavailable").
+	//
+	// FAIL-CLOSED (D70): a lesson is written only on a true curator verdict.
+	// When the curator is NOT configured (COX_CURATOR_BASE_URL empty), every
+	// static-rule survivor is dropped with reason "curator unavailable" — the
+	// writer writes NOTHING. This is the D70 rule: a curator that can't be
+	// asked drops the lesson. The operator always configures the curator for a
+	// Loop with a model endpoint (the proxy exists whether or not there is a
+	// key Secret); if there is genuinely no model endpoint, no lesson is
+	// written. The execution test sets COX_CURATOR_BASE_URL to a stub that
+	// returns keep:true, so the test still writes survivors.
+	curBase := curatorBaseURLFromEnv()
+	if curBase == "" {
+		// Fail closed: drop every survivor as "curator unavailable" (D70).
+		for j := range lessons {
+			if reasons[j] == "" {
+				reasons[j] = "curator unavailable"
+			}
+		}
+		survivors = nil
+	} else {
 		curModel := curatorModelFromEnv()
 		curClient := curator.NewClient(curBase, curModel)
 		curCtx := context.Background()

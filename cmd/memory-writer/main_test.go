@@ -110,7 +110,12 @@ func TestMemoryWriteWritesEligibleLessons(t *testing.T) {
 		"the key is sk-abc123def456ghi789jkl012mno345pq67890", // dropped (provider key)
 	}
 	writeLessonsFile(t, ws, lessons)
-	code, err := runMemoryWrite(t, ws, mem, "succeeded")
+	// P5c fail-closed (D70): the curator is configured (a true-verdict stub) so
+	// the eligible survivor is written. The operator always configures the
+	// curator for a Loop with a model endpoint.
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	code, err := runWithCurator(t, ws, mem, srv.URL)
 	if code != 0 || err != nil {
 		t.Fatalf("run(succeeded) = (%d, %v); want (0, nil)", code, err)
 	}
@@ -166,7 +171,9 @@ func TestMemoryWriteFailedStalledIsQualifying(t *testing.T) {
 	ws := t.TempDir()
 	mem := t.TempDir()
 	writeLessonsFile(t, ws, []string{"foo/bar: the retry must back off"})
-	code, err := runMemoryWrite(t, ws, mem, "failed-stalled")
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	code, err := runWithCurator(t, ws, mem, srv.URL)
 	if code != 0 || err != nil {
 		t.Fatalf("run(failed-stalled) = (%d, %v); want (0, nil)", code, err)
 	}
@@ -206,7 +213,11 @@ func TestMemoryWriteWriteFailureExitsNonZero(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(mem, 0o755) })
 	writeLessonsFile(t, ws, []string{"foo/bar: the retry must back off"})
-	code, err := runMemoryWrite(t, ws, mem, "succeeded")
+	// The curator is configured (a true-verdict stub) so the write is
+	// attempted (the read-only dir failure is what this spec exercises).
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	code, err := runWithCurator(t, ws, mem, srv.URL)
 	if code == 0 {
 		t.Fatalf(
 			"run(succeeded, read-only memory dir) = (0, %v); want non-zero exit (a write failure is the Job's failure)",
@@ -239,7 +250,9 @@ func TestMemoryWriteBoundedSummaryNeverLeaksLessonText(t *testing.T) {
 	oldStdout := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	code, err := runMemoryWrite(t, ws, mem, "succeeded")
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	code, err := runWithCurator(t, ws, mem, srv.URL)
 	_ = w.Close()
 	os.Stdout = oldStdout
 	var buf bytes.Buffer
@@ -308,8 +321,12 @@ func TestSummaryPathFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read COX_SUMMARY_PATH %s: %v (the binary must write the summary file)", sumPath, err)
 	}
-	// The file must contain the same bounded summary as stdout.
-	if !strings.Contains(string(fileData), "summary: total=2 written=1 dropped=1") {
+	// The file must contain the same bounded summary as stdout. With the
+	// fail-closed curator gate (D70), the eligible lesson is dropped as
+	// "curator unavailable" (no COX_CURATOR_BASE_URL in this test) and the
+	// credential lesson is dropped by the secrets screen: total=2 written=0
+	// dropped=2.
+	if !strings.Contains(string(fileData), "summary: total=2 written=0 dropped=2") {
 		t.Errorf("summary file lacks the counts line:\n%s", string(fileData))
 	}
 	// The file must NOT leak a lesson's text (the bounded summary is the
@@ -319,7 +336,7 @@ func TestSummaryPathFile(t *testing.T) {
 		t.Errorf("summary file leaks a lesson's text:\n%s", string(fileData))
 	}
 	// stdout and the file must agree on the counts line (the same emission).
-	if !strings.Contains(string(stdoutData), "summary: total=2 written=1 dropped=1") {
+	if !strings.Contains(string(stdoutData), "summary: total=2 written=0 dropped=2") {
 		t.Errorf("stdout lacks the counts line:\n%s", string(stdoutData))
 	}
 }
@@ -348,7 +365,9 @@ func TestMemoryWriteDedupByHash(t *testing.T) {
 	oldStdout := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	code, err := runMemoryWrite(t, ws, mem, "succeeded")
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	code, err := runWithCurator(t, ws, mem, srv.URL)
 	_ = w.Close()
 	os.Stdout = oldStdout
 	var buf bytes.Buffer
@@ -395,7 +414,9 @@ func TestMemoryWriteDedupSummary(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mem, name), []byte(lesson+"\n"), 0o644); err != nil {
 		t.Fatalf("pre-populate: %v", err)
 	}
-	code, err := runMemoryWrite(t, ws, mem, "succeeded")
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	code, err := runWithCurator(t, ws, mem, srv.URL)
 	if code != 0 || err != nil {
 		t.Fatalf("run(succeeded) = (%d, %v); want (0, nil)", code, err)
 	}
@@ -427,6 +448,10 @@ func TestMemoryWriteSeededNegativeLessonFailSeeds(t *testing.T) {
 	t.Setenv("COX_SEEDED_LESSONS", `["stall: repeated verify failure deadbeef (see .coxswain/verify-result.json)"]`)
 	t.Setenv("COX_LESSONS_PATH", filepath.Join(ws, ".coxswain", "lessons.json"))
 	t.Setenv("COX_MEMORY_DIR", mem)
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	t.Setenv("COX_CURATOR_BASE_URL", srv.URL)
+	t.Setenv("COX_MODEL", "test-model")
 	code, err := run("failed-stalled")
 	if code != 0 || err != nil {
 		t.Fatalf("run(failed-stalled, seeded) = (%d, %v); want (0, nil)", code, err)
@@ -470,6 +495,13 @@ func TestMemoryWriteSeededNegativeLessonContinueDoesNotSeed(t *testing.T) {
 	t.Setenv("COX_SEEDED_LESSONS", "")
 	t.Setenv("COX_LESSONS_PATH", filepath.Join(ws, ".coxswain", "lessons.json"))
 	t.Setenv("COX_MEMORY_DIR", mem)
+	// The curator is configured (a true-verdict stub) so the runner's lesson
+	// is written (the Continue stall does not seed, but the runner's lesson
+	// is still curator-judged and written).
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	t.Setenv("COX_CURATOR_BASE_URL", srv.URL)
+	t.Setenv("COX_MODEL", "test-model")
 	code, err := run("failed-stalled")
 	if code != 0 || err != nil {
 		t.Fatalf("run(failed-stalled, no seed) = (%d, %v); want (0, nil)", code, err)
@@ -752,5 +784,44 @@ func TestMemoryWriteCuratorCallFailureDrops(t *testing.T) {
 	if !strings.Contains(summary, "dropped curator: curator unavailable") {
 		want := "'curator unavailable' (a call failure must record it)"
 		t.Errorf("audit trail lacks %s:\n%s", want, summary)
+	}
+}
+
+// TestMemoryWriteNoCuratorFailsClosed: the D70 fail-closed gate. When the
+// curator is NOT configured (COX_CURATOR_BASE_URL empty), every static-rule
+// survivor is dropped with reason "curator unavailable" and the writer
+// writes NOTHING (no lesson is written without a true curator verdict).
+// This is the P1-1 fix: the curator gate must not fail open (write lessons
+// with no verdict). Mutation: restore the `if curBase != ""` fail-open and
+// this spec FAILS (the survivor is written with no verdict).
+func TestMemoryWriteNoCuratorFailsClosed(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	// Two eligible lessons (path-shaped, static rules pass).
+	lessons := []string{
+		"foo/bar: the retry must back off before the 500",
+		"baz/qux: the lock must be released on the error path",
+	}
+	writeLessonsFile(t, ws, lessons)
+	// No COX_CURATOR_BASE_URL (the curator is NOT configured). runMemoryWrite
+	// does not set it.
+	summary, code, err := captureSummary(t, func() (int, error) {
+		return runMemoryWrite(t, ws, mem, "succeeded")
+	})
+	if code != 0 || err != nil {
+		t.Fatalf("run(succeeded, no curator) = (%d, %v); want (0, nil)", code, err)
+	}
+	// The memory dir is EMPTY (the fail-closed gate drops every survivor as
+	// "curator unavailable" — no lesson is written without a true verdict).
+	files := readMemoryFiles(t, mem)
+	if len(files) != 0 {
+		t.Fatalf("memory dir has %d files (%v); want 0 (fail-closed: no curator, no lesson is written)", len(files), files)
+	}
+	// The audit trail records the "curator unavailable" drop reason for each
+	// survivor.
+	for i := range lessons {
+		if !strings.Contains(summary, "dropped curator: curator unavailable") && !strings.Contains(summary, "curator unavailable") {
+			t.Errorf("audit trail lacks 'curator unavailable' for lesson %d:\n%s", i, summary)
+		}
 	}
 }

@@ -64,9 +64,21 @@ func negativeLesson(loop *coxv1alpha1.Loop) (string, bool) {
 		return "", false
 	}
 	// A single line the static write policy admits: a file-path reference
-	// (.coxswain/verify-result.json) + the failure hash. The "stall —" marker
-	// distinguishes it from the agent's lessons in the audit trail.
-	return "stall: repeated verify failure " + sig + " (see .coxswain/verify-result.json)", true
+	// (.coxswain/verify-result.json) + a SHORT hash prefix (12 hex chars).
+	// The "stall —" marker distinguishes it from the agent's lessons in the
+	// audit trail.
+	//
+	// P2-1: the full 64-hex stall hash matches the static secrets screen's
+	// long-random-base64 rule ([A-Za-z0-9+/]{64,}), so the operator's own
+	// seed would ALWAYS be dropped. A 12-char prefix is short enough to pass
+	// the screen and long enough to be a useful identifier in the audit
+	// trail (12 hex = 48 bits — more than enough to distinguish one stall
+	// from another in practice).
+	hashPrefix := sig
+	if len(hashPrefix) > 12 {
+		hashPrefix = hashPrefix[:12]
+	}
+	return "stall: repeated verify failure " + hashPrefix + " (see .coxswain/verify-result.json)", true
 }
 
 // seededLessonsEnvValue serialises the seeded lessons for the memory-writer

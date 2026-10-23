@@ -37,7 +37,6 @@ import (
 
 var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 	var (
-		r  *LoopReconciler
 		ns string
 	)
 
@@ -46,7 +45,6 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		Expect(k8sClient.Create(context.Background(), &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	})
 
 	AfterEach(func() {
@@ -81,42 +79,66 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 	})
 
 	It("does NOT set the curator env vars when the Loop has no model", func() {
-		// A Loop with no model (no endpointSecretRef): the memory-writer Job
-		// does NOT get the curator env vars (the curator is disabled; the Job
-		// writes all static-rule survivors — the P5b behavior).
+		// A Loop with no model (no modelEndpoint): the memory-writer Job does
+		// NOT get the curator env vars (the curator is disabled; the writer
+		// fails closed and drops every survivor as "curator unavailable" —
+		// D70: no lesson is written without a true curator verdict).
 		//
-		// This spec tests the buildMemoryWriterJob function directly (not the
-		// full reconcile path) to isolate the env var logic.
+		// This spec tests buildMemoryWriterJob directly (not the full
+		// reconcile path) to isolate the env var logic.
 		name := "p5c-nomodel"
 		loop := &coxs.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxs.LoopSpec{
 				Goal: "a test goal",
-				Workspace: coxs.Workspace{
-					Repo: inClusterRepoURL,
-				},
 				Agent: coxs.AgentConfig{
-					Model:             "", // no model
-					EndpointSecretRef: "", // no endpoint secret
+					// No ModelEndpoint (no model): the curator is disabled.
 				},
 			},
 		}
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		job := r.buildMemoryWriterJob(loop, "memory-pvc", "succeeded")
 		c := job.Spec.Template.Spec.Containers[0]
-		for _, e := range c.Env {
-			Expect(e.Name).ToNot(Equal("COX_CURATOR_BASE_URL"),
-				"the Job must NOT carry COX_CURATOR_BASE_URL when the Loop has no model")
-			Expect(e.Name).ToNot(Equal("COX_MODEL"),
-				"the Job must NOT carry COX_MODEL when the Loop has no model")
-		}
-		// The base env vars are still present.
 		envNames := map[string]string{}
 		for _, e := range c.Env {
 			envNames[e.Name] = e.Value
 		}
-		Expect(envNames).To(HaveKey("COX_SUMMARY_PATH"))
-		Expect(envNames).To(HaveKey("COX_LESSONS_PATH"))
-		Expect(envNames).To(HaveKey("COX_MEMORY_DIR"))
+		_, hasCurator := envNames["COX_CURATOR_BASE_URL"]
+		Expect(hasCurator).To(BeFalse(),
+			"the Job must NOT carry COX_CURATOR_BASE_URL when there is no model endpoint (the curator is disabled; the writer fails closed)")
+	})
+
+	It("sets the curator env vars when the Loop has a model endpoint and NO key Secret (D70 fail-closed)", func() {
+		// P1-1 (D70): a Loop whose model needs no key (no endpointSecretRef,
+		// e.g. a homelab vLLM) STILL gets the curator env vars. The curator
+		// gate must not fail open: the writer drops every survivor as
+		// "curator unavailable" only when the curator is genuinely absent
+		// (no model endpoint), not when there is simply no key Secret.
+		name := "p5c-nokey"
+		loop := &coxs.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxs.LoopSpec{
+				Goal: "a test goal",
+				Agent: coxs.AgentConfig{
+					ModelEndpoint: s3ModelEndpoint,
+					Model:         "test-model",
+					// NO EndpointSecretRef (the model is keyless).
+				},
+			},
+		}
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		job := r.buildMemoryWriterJob(loop, "memory-pvc", "succeeded")
+		c := job.Spec.Template.Spec.Containers[0]
+		envNames := map[string]string{}
+		for _, e := range c.Env {
+			envNames[e.Name] = e.Value
+		}
+		Expect(envNames).To(HaveKey("COX_CURATOR_BASE_URL"),
+			"the Job must carry COX_CURATOR_BASE_URL when there is a model endpoint, even without a key Secret (D70: the curator gate must not fail open)")
+		Expect(envNames["COX_CURATOR_BASE_URL"]).To(ContainSubstring(name),
+			"the curator base URL must reference the Loop's model proxy")
+		Expect(envNames).To(HaveKey("COX_MODEL"),
+			"the Job must carry COX_MODEL (the model name for the curator call)")
 	})
 
 	It("allows egress to the model proxy pod in the memory-writer NetworkPolicy", func() {

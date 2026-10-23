@@ -370,10 +370,16 @@ func (r *LoopReconciler) memoryWriterEnvVars(loop *coxv1alpha1.Loop, termMsgPath
 		{Name: "COX_MEMORY_DIR", Value: "/memory"},
 	}
 	// P5c: the curator call goes to the Loop's model proxy (the same
-	// endpoint + Secret the runner uses; the proxy injects the API key).
-	// The curator is set only when the Loop has a model (endpointSecretRef);
-	// without a model there is no proxy and the curator is disabled.
-	if loop.Spec.Agent.EndpointSecretRef != "" {
+	// endpoint the runner uses; the proxy injects the API key when there is
+	// a key Secret, and passes through keyless requests when there is not).
+	// The curator is set whenever the Loop has a model endpoint — NOT only
+	// when there is a key Secret (D70, ADR-0002: the curator gate must not
+	// fail open). A Loop with a model endpoint but no endpointSecretRef (a
+	// keyless homelab vLLM) still gets the curator env, so its lessons are
+	// curator-judged. Without a model endpoint there is no proxy and the
+	// curator is disabled (fail-closed: the writer drops every survivor as
+	// "curator unavailable").
+	if loop.Spec.Agent.ModelEndpoint != "" {
 		env = append(env,
 			corev1.EnvVar{Name: "COX_CURATOR_BASE_URL", Value: r.proxyServiceURL(loop.Name, loop.Namespace)},
 			corev1.EnvVar{Name: "COX_MODEL", Value: loop.Spec.Agent.Model},
@@ -562,21 +568,33 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 			// egress rule (F16: a blank egress rule {} would also allow all).
 		},
 	}
-	// The proxy egress rule (the P5c curator call) is the ONLY egress rule,
-	// added AFTER the struct literal (an if cannot appear inside a struct
-	// literal). A Loop with no model (no endpointSecretRef) has NO proxy and
-	// a fully denied NetworkPolicy (the P5b fence).
-	if loop.Spec.Agent.EndpointSecretRef != "" {
-		desired.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{{
-			To: []networkingv1.NetworkPolicyPeer{{
-				NamespaceSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{kubeNSLabelKey: loop.Namespace},
-				},
-				PodSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
-				},
-			}},
-		}}
+	// The proxy egress rule (the P5c curator call) + the DNS egress rule are
+	// added after the struct literal (an if cannot appear inside a struct
+	// literal). The curator URL is a DNS name (proxyServiceURL: <loop>-proxy.
+	// <ns>.svc.<domain>:8080), so the writer also needs DNS egress (UDP+TCP
+	// 53 to kube-system k8s-app=kube-dns) to resolve it — the same DNS rule
+	// the other Loop policies use (D34). Without the DNS rule, on any
+	// NetworkPolicy-enforcing CNI the lookup is denied and every curator
+	// call fails (the P1-3 finding). A Loop with no model endpoint has NO
+	// proxy and a fully denied NetworkPolicy (the P5b fence).
+	if loop.Spec.Agent.ModelEndpoint != "" {
+		desired.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{
+			{
+				To: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{kubeNSLabelKey: loop.Namespace},
+					},
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(proxyPort)}},
+			},
+			{
+				To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+				Ports: dnsPorts(),
+			},
+		}
 	}
 
 	existing := &networkingv1.NetworkPolicy{}

@@ -246,6 +246,17 @@ kubectl -n coxswain-system patch deploy coxswain-controller-manager \
 
 (Revert by replacing the flag value with `--zap-log-level=info`.)
 
+### Memory flags
+
+- `--memory-writer-image` (required for lesson writes): the memory-writer Job
+  runs `/usr/local/bin/coxswain-memory-write`, which exists only in the
+  operator's own image. The shipped kustomize base, `install.yaml` and the Helm
+  chart set it to the manager's image automatically (F19);
+  `hack/memory-writer-image-test.sh` guards that. Only override it with another
+  build of the operator image.
+- `--memory-storage-class` (optional): an RWX-capable StorageClass for the
+  memory PVC (kind's default `rancher.io/local-path` is RWO-only).
+
 ### Component logs
 
 The `kubectl cox logs` command streams the **sandbox component** logs

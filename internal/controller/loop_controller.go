@@ -4699,9 +4699,7 @@ func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, loop *coxv1alpha1
 func dnsPeer() networkingv1.NetworkPolicyPeer {
 	return networkingv1.NetworkPolicyPeer{
 		NamespaceSelector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"kubernetes.io/metadata.name": "kube-system",
-			},
+			MatchLabels: map[string]string{kubeNSLabelKey: "kube-system"},
 		},
 		PodSelector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{

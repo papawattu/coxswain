@@ -307,6 +307,7 @@ func TestCuratorResponseBodyBounded(t *testing.T) {
 	// where the full 2 MiB body is consumed). With the bound, the read
 	// succeeds at 1 MiB and the parse fails cleanly.
 	if !strings.Contains(v.Reason, "unparseable") {
-		t.Fatalf("Reason = %q, want 'curator unparseable' (the LimitReader truncated the read; the parse failed on the truncated JSON). 'read error' would mean the bound is missing and ReadAll consumed the full body.", v.Reason)
+		// 'read error' would mean the bound is missing and ReadAll consumed the full body.
+		t.Fatalf("Reason = %q, want 'curator unparseable' (the LimitReader truncated the read)", v.Reason)
 	}
 }

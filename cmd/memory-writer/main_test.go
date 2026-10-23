@@ -821,7 +821,7 @@ func TestMemoryWriteNoCuratorFailsClosed(t *testing.T) {
 	// The audit trail records the "curator unavailable" drop reason for each
 	// survivor.
 	for i := range lessons {
-		if !strings.Contains(summary, "dropped curator: curator unavailable") && !strings.Contains(summary, "curator unavailable") {
+		if !strings.Contains(summary, "curator unavailable") {
 			t.Errorf("audit trail lacks 'curator unavailable' for lesson %d:\n%s", i, summary)
 		}
 	}

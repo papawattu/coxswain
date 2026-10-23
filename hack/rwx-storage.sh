@@ -85,6 +85,12 @@ if [ -n "$existing" ] && [ "$existing" != "$PROV" ]; then
 	die "StorageClass $SC already exists with provisioner '$existing' (want '$PROV'); pick another --storage-class or delete it yourself (this script does not replace a StorageClass)"
 fi
 
+# The provisioner reads its config + helper-pod template once at start, so a
+# changed ConfigMap alone does not take effect. A checksum annotation on the pod
+# template (this script + the flag values that feed the ConfigMap) makes a
+# changed config roll the Deployment, and an unchanged one a no-op.
+CFG_SUM="$(printf '%s\n%s\n%s\n%s\n%s' "$(sha256sum < "${BASH_SOURCE[0]}")" "$SHARED_PATH" "$HELPER" "$PROV" "$IMAGE" | sha256sum | cut -c1-16)"
+
 kc apply -f - <<YAML
 apiVersion: v1
 kind: Namespace
@@ -172,6 +178,7 @@ spec:
   template:
     metadata:
       labels: {app: coxswain-rwx-provisioner}
+      annotations: {coxswain.io/config-sum: "$CFG_SUM"}
     spec:
       serviceAccountName: coxswain-rwx-provisioner
       containers:

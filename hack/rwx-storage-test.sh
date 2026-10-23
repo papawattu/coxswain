@@ -49,6 +49,7 @@ has "$A" "kind: StorageClass" "StorageClass"
 has "$A" "name: local-shared" "StorageClass name"
 has "$A" "provisioner: coxswain.io/local-path-shared" "StorageClass provisioner"
 has "$A" "volumeBindingMode: WaitForFirstConsumer" "binding mode"
+has "$A" "coxswain.io/config-sum:" "pod template must carry the config checksum (config changes must roll the provisioner)"
 has "$A" "setup: |-" "setup script key (every provision needs it)"
 has "$A" "teardown: |-" "teardown script key"
 # shellcheck disable=SC2016  # literal $VOL_DIR is the point

@@ -37,6 +37,9 @@ import (
 // lesson keeps even a few dozen lessons well under those caps.
 const MaxLessonChars = 500
 
+// credKeys are the credential-assignment keywords.
+const credKeys = `(?:password|passwd|secret|token|api[_-]?key)`
+
 // secretsPatterns is the static secrets pattern set (one spec per pattern —
 // the plan's acceptance: "one spec per pattern"). Each pattern is matched
 // with regexp.MatchString (the lesson text is untrusted runner output; a
@@ -114,7 +117,8 @@ var secretsPatterns = []struct {
 	// only when followed by a token-shaped value of 8+ chars
 	// ([A-Za-z0-9+/=_.-]), so "token: abc123xyz" is dropped but prose such as
 	// "the token: parser lives in internal/lex/token.go" stays eligible.
-	{"credential-assignment", regexp.MustCompile(`(?i)(?:(?:password|passwd|secret|token|api[_-]?key)=\s*\S+|(?:password|passwd|secret|token|api[_-]?key):\s*[A-Za-z0-9+/=_.-]{8,})`)},
+	{"credential-assignment", regexp.MustCompile(
+		`(?i)(?:` + credKeys + `=\s*\S+|` + credKeys + `:\s*[A-Za-z0-9+/=_.-]{8,})`)},
 	// An HTTP Authorization header echoed into a lesson (Basic base64 is
 	// typically under 64 chars, so long-random-base64 misses it).
 	{"authorization-header", regexp.MustCompile(`(?i)\bauthorization:\s*\S+`)},

@@ -4317,7 +4317,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// (agent.modelEndpoint), not read from the Secret (which would require
 	// cluster-wide secrets RBAC and a cluster-wide Secret informer).
 	if loop.Spec.Agent.ModelEndpoint != "" {
-		if peer := modelPeer(loop.Spec.Agent.ModelEndpoint); peer != nil {
+		if peer := modelPeer(loop.Spec.Agent.ModelEndpoint, r.serviceNamespaceFromHost); peer != nil {
 			port := intstrPtr32(int32(modelEndpointPort(loop.Spec.Agent.ModelEndpoint)))
 			proxyNP.Spec.Egress = append(proxyNP.Spec.Egress, networkingv1.NetworkPolicyEgressRule{
 				To:    []networkingv1.NetworkPolicyPeer{*peer},
@@ -4751,7 +4751,7 @@ func egressCarveOutCIDRs(podCIDR, serviceCIDR string) []string {
 //   - anything else (external FQDN that does not resolve here): no peer —
 //     the model egress rule is omitted entirely (fail-closed), and the
 //     hostname-level allow belongs to D35's KubeArmor proxy policy.
-func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
+func modelPeer(endpoint string, nsFromHost func(string) (string, bool)) *networkingv1.NetworkPolicyPeer {
 	host := endpoint
 	if strings.Contains(endpoint, "://") {
 		if u, err := neturl.Parse(endpoint); err == nil && u.Host != "" {
@@ -4771,13 +4771,15 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 		}
 	}
 	// P5c proxy egress: the model endpoint is a same-cluster Service FQDN
-	// (svc.ns.svc or svc.ns.svc.cluster.local). The loop proxy must be able
+	// (svc.ns.svc or svc.ns.svc.<clusterDomain>). The loop proxy must be able
 	// to dial it, so allow egress to the Service's namespace (via the
 	// kubernetes.io/metadata.name label, set by the API server on every
 	// namespace). A service name with a single dot (svc.ns) is not a valid
 	// in-cluster FQDN and is treated as nil (fail-closed). This mirrors
-	// repoPeer's FQDN handling for the workspace git egress.
-	if ns, ok := svcNamespaceFromFQDN(host); ok {
+	// repoPeer's FQDN handling for the workspace git egress. nsFromHost is
+	// domain-aware (r.serviceNamespaceFromHost), so clusters with a custom
+	// cluster domain are handled the same as the default cluster.local.
+	if ns, ok := nsFromHost(host); ok {
 		return &networkingv1.NetworkPolicyPeer{
 			NamespaceSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"kubernetes.io/metadata.name": ns},
@@ -4785,26 +4787,6 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 		}
 	}
 	return nil
-}
-
-// svcNamespaceFromFQDN extracts the namespace from a same-cluster Service FQDN.
-// It recognises the canonical in-cluster forms:
-//   - svc.ns.svc.cluster.local (5 parts) — the full FQDN.
-//   - svc.ns.svc (3 parts) — the minimal same-cluster FQDN (no cluster.local).
-//
-// It returns false for anything else (an external FQDN, an IP, a single-label
-// name) so the caller fails closed. A namespace containing a dot is rejected
-// (namespaces are DNS labels, no dots).
-func svcNamespaceFromFQDN(host string) (string, bool) {
-	parts := strings.Split(host, ".")
-	switch {
-	case len(parts) == 5 && parts[2] == "svc" && parts[3] == "cluster" && parts[4] == "local":
-		return parts[1], true
-	case len(parts) == 3 && parts[2] == "svc":
-		return parts[1], true
-	default:
-		return "", false
-	}
 }
 
 // repoPeer is the NetworkPolicy peer for the sandbox pod's workspace init
@@ -4855,7 +4837,7 @@ func (r *LoopReconciler) serviceNamespaceFromHost(host string) (string, bool) {
 	// labels is now "<svc>.<ns>" (dots in the Service name are illegal, so
 	// the namespace is everything after the first '.').
 	i := strings.IndexByte(labels, '.')
-	if i <= 0 || i == len(labels)-1 {
+	if i <= 0 || i == len(labels)-1 || strings.IndexByte(labels[i+1:], '.') >= 0 {
 		return "", false
 	}
 	return labels[i+1:], true

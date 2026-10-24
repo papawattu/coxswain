@@ -398,6 +398,13 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 			// as the planning feedback).
 			clearLastFailureSummary(loop)
 			clearCondition(loop, coxv1alpha1.PlanRejectedCondition)
+			// F38 (gates P2-1): a rejection invalidates the prior approval and
+			// starts a new attempt, as the AwaitingApproval Replan branch does.
+			// Without the clear the stale hash opens the gate; without the bump
+			// a stale Planning success claim already on the pod matches the
+			// current planAttempt and is consumed, absorbing the rejection.
+			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
+			loop.Status.PlanAttempt++
 			changed = true
 		}
 	case coxv1alpha1.LoopPhaseImplementing:

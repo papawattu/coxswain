@@ -466,6 +466,10 @@ const claimSuccess = "success"
 // the next one. (A blocked claim's observedPhase equals the CURRENT phase
 // the runner was executing, never the next, so the nextPhase match
 // naturally rejects it: nextPhase(current, current) == current.)
+// planChangedReHoldReason is the Event reason emitted when a runner plan-change
+// claim clears the approval and the plan must be re-approved (F38).
+const planChangedReHoldReason = "PlanChangedReHold"
+
 func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1.Loop, claim *PhaseClaim, now metav1.Time) (changed, advanced bool) {
 	// B5a: bump the iteration metric on a NEW-phase transition (a re-claim of
 	// the same phase does not bump). The claim's observedPhase is the phase
@@ -895,6 +899,32 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("runner blocked Implementing on a plan-hash mismatch before any agent work; clearing the PlanApproved condition, surfacing the PlanMismatch condition and re-entering the AwaitingApproval hold",
 				"loop", loop.Name, "approvedHash", approved)
 		}
+		// B3 (PLAN-BETA / PLAN.md Phase 4): the runner's plan-change signal.
+		// When the runner's Planning run detected a PLAN CHANGE (the fresh
+		// PLAN.md's SHA-256 does not match the approved hash the operator
+		// wrote to .coxswain/plan-hash), the operator clears the PlanApproved
+		// condition so the approval gate holds. F38 (gates P1-1): this MUST run
+		// BEFORE recordPhaseClaim. recordPhaseClaim asks the gate whether
+		// Planning -> Implementing may advance, and the gate reads the approved
+		// hash; clearing it afterwards let the stale hash open the gate for an
+		// unapproved plan. The signal is a CLAIM (ADR-0005), used only as the
+		// trigger; the gate's input is the cleared condition. The clear is
+		// idempotent (a no-op when the condition is absent) and the re-hold is
+		// surfaced as an Event. The Event is emitted here, before the status
+		// write, like PlanHashMismatch above (not queued like PhaseAdvanced,
+		// I83, which is queued because it is emitted per advance): if the
+		// status update conflicts, the requeue re-reads the claim and may emit
+		// it again. Accepted: it is a diagnostic, never a gate input.
+		if claim.PlanChanged && approvedPlanHash(loop) != "" {
+			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
+			changed = true
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeNormal, planChangedReHoldReason,
+					"the re-plan differs from the approved plan; the approval was cleared and the plan must be re-approved")
+			}
+			logf.FromContext(ctx).Info("runner detected a plan change; clearing the PlanApproved condition (re-entering the hold)",
+				"loop", loop.Name)
+		}
 		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		changed = changed || c
 		// I89: map a ModelUnavailable claim to a Loop condition so
@@ -906,25 +936,6 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// input (ADR-0005 anti-gaming is preserved: the condition does not
 		// affect the phase machine or the verify decision).
 		r.applyModelAvailableCondition(loop, claim)
-		// B3 (PLAN-BETA / PLAN.md Phase 4): the runner's plan-change signal.
-		// When the runner's Planning run detected a PLAN CHANGE (the fresh
-		// PLAN.md's SHA-256 does not match the approved hash the operator
-		// wrote to .coxswain/plan-hash), the operator clears the PlanApproved
-		// condition (re-enter the hold). The signal is a CLAIM (ADR-0005):
-		// it is the runner's evidence that the plan on disk differs from the
-		// approved hash; the operator's own read of the condition + phase is
-		// the gate input, and the applyApprovalGate function (level-based) is
-		// the one that decides the hold. The operator uses the claim only as
-		// a trigger to clear the condition (the re-hold) — the gate then
-		// holds the advance on the next reconcile (the claim's observedPhase
-		// is Planning, the gate's Planning -> AwaitingApproval hold applies).
-		// The clear is idempotent (a no-op when the condition is absent).
-		if claim.PlanChanged && approvedPlanHash(loop) != "" {
-			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
-			changed = true
-			logf.FromContext(ctx).Info("runner detected a plan change; clearing the PlanApproved condition (re-entering the hold)",
-				"loop", loop.Name)
-		}
 		if advanced {
 			// I83: the PhaseAdvanced Event is NOT emitted here. It is queued
 			// (advancedFrom) and emitted by the caller only after the status

@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -24,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -259,181 +261,298 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		}
 	})
 
-	It("onVerifyFail=Plan + approval.mode=Manual: the re-plan goes to Planning; the PlanChanged signal clears PlanApproved (the re-hold, when the plan hash differs)", func() {
-		ns := "b4-manual-" + nowSuffix()
+	// F38 (gates P1-1): the re-plan must re-hold for approval WHETHER OR NOT the
+	// runner reports planChanged. The B4 re-plan transition itself clears the
+	// stale PlanApproved; the planChanged clear (now before recordPhaseClaim)
+	// is the second line. planChanged=false is the case that isolates the B4
+	// clear (a runner that does not signal a change must still not advance).
+	for _, replanPlanChanged := range []bool{true, false} {
+		It(fmt.Sprintf("onVerifyFail=Plan + approval.mode=Manual (claim planChanged=%v): the re-plan clears PlanApproved and re-holds at AwaitingApproval; the agent cannot run", replanPlanChanged), func() {
+			ns := "b4-manual-" + nowSuffix()
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+			}()
+
+			name := "b4-manual"
+			Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
+			})).To(Succeed())
+
+			// Wire the approval gate (the OS8 seam: the S4 default is
+			// autoApprovePhaseGate; B3 replaces it with the approval gate so the
+			// Manual-mode hold is exercised).
+			r := &LoopReconciler{
+				Client:    k8sClient,
+				Scheme:    k8sClient.Scheme(),
+				apiReader: k8sClient,
+			}
+			r.wireApprovalGate()
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return nil, nil
+			}
+
+			// Drive to Verifying: Pending -> Planning (bootstrap) -> claim ->
+			// Implementing -> claim (headCommit) -> Verifying. In Manual mode,
+			// the Planning claim moves the phase to AwaitingApproval (the gate's
+			// hold), so the spec must approve the plan first to advance to
+			// Implementing, then the Implementing claim advances to Verifying.
+			//
+			// Step 1: bootstrap (Pending -> Planning).
+			b4Reconcile(r, ns, name)
+			// Pin status.baseCommit (the tamper diff needs it).
+			loop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			loop.Status.BaseCommit = s5aBaseCommit
+			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+			// Step 2: the Planning claim (the runner executed Planning). In
+			// Manual mode, the gate holds the advance — the phase moves to
+			// AwaitingApproval (the hold re-enters).
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return &PhaseClaim{
+					ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+					Status:        "success",
+					HeadCommit:    s5aHeadCommit,
+				}, nil
+			}
+			b4Reconcile(r, ns, name)
+			loop = &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
+				"Manual mode: the Planning claim moves the phase to AwaitingApproval (the hold re-enters)")
+			// Re-arm the claim reader to (nil, nil) (agent running).
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return nil, nil
+			}
+
+			// Step 3: the user approves the plan (the PlanApproved condition is
+			// set with a valid hash). The gate's approvalPhaseGate sees the
+			// condition present and allows the Planning -> Implementing advance.
+			// But the phase is AwaitingApproval (not Planning), so the gate's
+			// applyApprovalGate (the AwaitingApproval branch) advances it to
+			// Implementing.
+			setCondition := func(ns, name string, condType string, status string, message string) {
+				nn := types.NamespacedName{Name: name, Namespace: ns}
+				l := &coxv1alpha1.Loop{}
+				Expect(k8sClient.Get(ctx, nn, l)).To(Succeed())
+				now := metav1.Now()
+				l.Status.Conditions = append(l.Status.Conditions, metav1.Condition{
+					Type:               condType,
+					Status:             metav1.ConditionStatus(status),
+					Reason:             condType,
+					Message:            message,
+					LastTransitionTime: now,
+				})
+				Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+			}
+			setCondition(ns, name, coxv1alpha1.PlanApprovedCondition, "True",
+				"Approved: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+			b4Reconcile(r, ns, name)
+			loop = &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
+				"Manual mode: the PlanApproved condition releases the hold (the phase advanced to Implementing)")
+
+			// Step 4: the Implementing claim (with the headCommit — the operator
+			// pins it on the Implementing -> Verifying advance).
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return &PhaseClaim{
+					ObservedPhase: coxv1alpha1.LoopPhaseImplementing,
+					Status:        "success",
+					HeadCommit:    s5aHeadCommit,
+				}, nil
+			}
+			b4Reconcile(r, ns, name)
+			loop = &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+				"the Implementing claim advances to Verifying")
+			// D61 (I90): the verify-egress hold requires the egress proxy pod to be
+			// Ready before the verify Job is created (external repo). Drive the
+			// operator's pod Ready so the verify Job is created for the failing-pod
+			// evidence below.
+			d61ReadyVerifyProxy(r, ns, name)
+			// Re-arm the claim reader to (nil, nil) (agent running).
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return nil, nil
+			}
+
+			// Step 5: the verify Job pod with check-0 FAILED (exit 1). The
+			// onVerifyFail=Plan action fires: back to PLANNING. The re-plan goes
+			// to PLANNING (not Implementing) — the re-plan does NOT skip the plan
+			// approval gate. In Manual mode, the NEXT Planning claim (once the
+			// runner writes a new plan with a DIFFERENT hash) triggers the B3
+			// plan-change gate's re-hold (the PlanChanged signal clears the
+			// PlanApproved condition, and the gate's hold re-enters on the next
+			// reconcile). If the runner writes the SAME plan (same hash), the
+			// approval is still valid and the Loop advances directly to Implementing
+			// (no re-hold). This spec asserts the B4 concern: the re-plan goes to
+			// Planning (not Implementing), and the PlanChanged signal clears
+			// PlanApproved (the re-hold mechanism, when the plan hash differs).
+			jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+			b4FailingPod(ctx, ns, name, jobName)
+			loop = b4Reconcile(r, ns, name)
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+				"onVerifyFail=Plan + Manual: the failed verify goes to PLANNING (the re-plan)")
+			Expect(loop.Status.Iteration).To(Equal(2),
+				"the iteration increments on the re-plan (a re-plan is not a reset)")
+			Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil(),
+				"F38: the B4 re-plan transition clears the stale approval")
+
+			// Step 6: the runner's NEXT Planning claim (the re-plan runs, the
+			// runner writes a new PLAN.md). In Manual mode, the re-plan goes to
+			// PLANNING (the phase is Planning, not Implementing — the re-plan does
+			// NOT skip the plan approval gate). The plan-change gate (B3) clears
+			// the PlanApproved condition on the PlanChanged signal (the re-hold),
+			// and the gate's hold re-enters on the NEXT reconcile (the B3
+			// plan-change mechanism, tested by the B3 specs). This spec asserts
+			// the B4 concern: the re-plan goes to Planning (not Implementing), the
+			// iteration increments, and the failure summary is set. The
+			// AwaitingApproval hold is a B3 concern (the plan-change gate).
+			replanIter := loop.Status.Iteration
+			replanAttempt := loop.Status.PlanAttempt
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return &PhaseClaim{
+					ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+					Status:        "success",
+					Iteration:     replanIter,
+					HeadCommit:    s5aHeadCommit,
+					PlanAttempt:   replanAttempt,
+					PlanChanged:   replanPlanChanged,
+				}, nil
+			}
+			b4Reconcile(r, ns, name)
+			loop = &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			// F38: the re-plan's Planning claim must NOT advance to Implementing:
+			// the approval was cleared, so the gate denies and the Manual hold
+			// re-enters. (The previous version of this spec asserted only that the
+			// approval was cleared and accepted the advance to Implementing, which
+			// codified the bug: an unapproved re-plan was implemented.)
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
+				"F38: an unapproved re-plan holds at AwaitingApproval")
+			Expect(loop.Status.DesiredPhase).NotTo(Equal(coxv1alpha1.LoopPhaseImplementing),
+				"F38: the agent must not be sent to Implementing before the re-plan is approved")
+			Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil(),
+				"the stale approval stays cleared")
+			// A further reconcile with no approval keeps the hold.
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return nil, nil
+			}
+			loop = b4Reconcile(r, ns, name)
+			Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval))
+			Expect(loop.Status.DesiredPhase).NotTo(Equal(coxv1alpha1.LoopPhaseImplementing))
+			// Re-arm the claim reader to (nil, nil) (agent running).
+			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+				return nil, nil
+			}
+		})
+	}
+
+	// F38 (review of #214): the PlanChanged clear must run BEFORE
+	// recordPhaseClaim. On the B4 path the re-plan clear already ran, so only
+	// this case isolates the reorder: a plan-change claim lands while an
+	// approval is still set (the user re-approved during the re-plan window).
+	// With the clear AFTER recordPhaseClaim the gate reads the stale hash and
+	// allows Planning -> Implementing.
+	It("a PlanChanged Planning claim while an approval is set re-holds at AwaitingApproval (the clear runs before the gate) and emits PlanChangedReHold", func() {
+		ns := "b4-planchanged-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
-
-		name := "b4-manual"
+		name := "b4-planchanged"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
 		})).To(Succeed())
-
-		// Wire the approval gate (the OS8 seam: the S4 default is
-		// autoApprovePhaseGate; B3 replaces it with the approval gate so the
-		// Manual-mode hold is exercised).
-		r := &LoopReconciler{
-			Client:    k8sClient,
-			Scheme:    k8sClient.Scheme(),
-			apiReader: k8sClient,
-		}
+		rec := record.NewFakeRecorder(20)
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
 		r.wireApprovalGate()
-		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
-			return nil, nil
-		}
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil }
 
-		// Drive to Verifying: Pending -> Planning (bootstrap) -> claim ->
-		// Implementing -> claim (headCommit) -> Verifying. In Manual mode,
-		// the Planning claim moves the phase to AwaitingApproval (the gate's
-		// hold), so the spec must approve the plan first to advance to
-		// Implementing, then the Implementing claim advances to Verifying.
-		//
-		// Step 1: bootstrap (Pending -> Planning).
-		b4Reconcile(r, ns, name)
-		// Pin status.baseCommit (the tamper diff needs it).
-		loop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		loop.Status.BaseCommit = s5aBaseCommit
+		loop := b4Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
+			Type: coxv1alpha1.PlanApprovedCondition, Status: metav1.ConditionTrue, Reason: "Approved",
+			Message:            "Approved: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+			LastTransitionTime: metav1.Now()})
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
-		// Step 2: the Planning claim (the runner executed Planning). In
-		// Manual mode, the gate holds the advance — the phase moves to
-		// AwaitingApproval (the hold re-enters).
+		attempt := loop.Status.PlanAttempt
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return &PhaseClaim{
 				ObservedPhase: coxv1alpha1.LoopPhasePlanning,
 				Status:        "success",
 				HeadCommit:    s5aHeadCommit,
-			}, nil
-		}
-		b4Reconcile(r, ns, name)
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
-			"Manual mode: the Planning claim moves the phase to AwaitingApproval (the hold re-enters)")
-		// Re-arm the claim reader to (nil, nil) (agent running).
-		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
-			return nil, nil
-		}
-
-		// Step 3: the user approves the plan (the PlanApproved condition is
-		// set with a valid hash). The gate's approvalPhaseGate sees the
-		// condition present and allows the Planning -> Implementing advance.
-		// But the phase is AwaitingApproval (not Planning), so the gate's
-		// applyApprovalGate (the AwaitingApproval branch) advances it to
-		// Implementing.
-		setCondition := func(ns, name string, condType string, status string, message string) {
-			nn := types.NamespacedName{Name: name, Namespace: ns}
-			l := &coxv1alpha1.Loop{}
-			Expect(k8sClient.Get(ctx, nn, l)).To(Succeed())
-			now := metav1.Now()
-			l.Status.Conditions = append(l.Status.Conditions, metav1.Condition{
-				Type:               condType,
-				Status:             metav1.ConditionStatus(status),
-				Reason:             condType,
-				Message:            message,
-				LastTransitionTime: now,
-			})
-			Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
-		}
-		setCondition(ns, name, coxv1alpha1.PlanApprovedCondition, "True",
-			"Approved: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
-		b4Reconcile(r, ns, name)
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
-			"Manual mode: the PlanApproved condition releases the hold (the phase advanced to Implementing)")
-
-		// Step 4: the Implementing claim (with the headCommit — the operator
-		// pins it on the Implementing -> Verifying advance).
-		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
-			return &PhaseClaim{
-				ObservedPhase: coxv1alpha1.LoopPhaseImplementing,
-				Status:        "success",
-				HeadCommit:    s5aHeadCommit,
-			}, nil
-		}
-		b4Reconcile(r, ns, name)
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
-			"the Implementing claim advances to Verifying")
-		// D61 (I90): the verify-egress hold requires the egress proxy pod to be
-		// Ready before the verify Job is created (external repo). Drive the
-		// operator's pod Ready so the verify Job is created for the failing-pod
-		// evidence below.
-		d61ReadyVerifyProxy(r, ns, name)
-		// Re-arm the claim reader to (nil, nil) (agent running).
-		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
-			return nil, nil
-		}
-
-		// Step 5: the verify Job pod with check-0 FAILED (exit 1). The
-		// onVerifyFail=Plan action fires: back to PLANNING. The re-plan goes
-		// to PLANNING (not Implementing) — the re-plan does NOT skip the plan
-		// approval gate. In Manual mode, the NEXT Planning claim (once the
-		// runner writes a new plan with a DIFFERENT hash) triggers the B3
-		// plan-change gate's re-hold (the PlanChanged signal clears the
-		// PlanApproved condition, and the gate's hold re-enters on the next
-		// reconcile). If the runner writes the SAME plan (same hash), the
-		// approval is still valid and the Loop advances directly to Implementing
-		// (no re-hold). This spec asserts the B4 concern: the re-plan goes to
-		// Planning (not Implementing), and the PlanChanged signal clears
-		// PlanApproved (the re-hold mechanism, when the plan hash differs).
-		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
-		b4FailingPod(ctx, ns, name, jobName)
-		loop = b4Reconcile(r, ns, name)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
-			"onVerifyFail=Plan + Manual: the failed verify goes to PLANNING (the re-plan)")
-		Expect(loop.Status.Iteration).To(Equal(2),
-			"the iteration increments on the re-plan (a re-plan is not a reset)")
-
-		// Step 6: the runner's NEXT Planning claim (the re-plan runs, the
-		// runner writes a new PLAN.md). In Manual mode, the re-plan goes to
-		// PLANNING (the phase is Planning, not Implementing — the re-plan does
-		// NOT skip the plan approval gate). The plan-change gate (B3) clears
-		// the PlanApproved condition on the PlanChanged signal (the re-hold),
-		// and the gate's hold re-enters on the NEXT reconcile (the B3
-		// plan-change mechanism, tested by the B3 specs). This spec asserts
-		// the B4 concern: the re-plan goes to Planning (not Implementing), the
-		// iteration increments, and the failure summary is set. The
-		// AwaitingApproval hold is a B3 concern (the plan-change gate).
-		replanIter := loop.Status.Iteration
-		replanAttempt := loop.Status.PlanAttempt
-		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
-			return &PhaseClaim{
-				ObservedPhase: coxv1alpha1.LoopPhasePlanning,
-				Status:        "success",
-				Iteration:     replanIter,
-				HeadCommit:    s5aHeadCommit,
-				PlanAttempt:   replanAttempt,
+				PlanAttempt:   attempt,
 				PlanChanged:   true,
 			}, nil
 		}
-		b4Reconcile(r, ns, name)
-		loop = &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-		// The re-plan's Planning claim advanced the phase (the phase is no
-		// longer Planning — it advanced to Implementing, the B3 plan-change
-		// gate's normal path). The B4 concern is that the re-plan went to
-		// PLANNING first (not Implementing directly), which is asserted in
-		// step 5. The PlanChanged signal cleared the PlanApproved condition
-		// (the re-hold — the B3 plan-change mechanism).
-		planApprovedPresent := false
-		for _, c := range loop.Status.Conditions {
-			if c.Type == coxv1alpha1.PlanApprovedCondition && c.Status == metav1.ConditionTrue {
-				planApprovedPresent = true
-			}
+		loop = b4Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
+			"the changed plan must be re-approved before Implementing")
+		Expect(loop.Status.DesiredPhase).NotTo(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil())
+		var events []string
+		for len(rec.Events) > 0 {
+			events = append(events, <-rec.Events)
 		}
-		Expect(planApprovedPresent).To(BeFalse(),
-			"the PlanChanged signal cleared the PlanApproved condition (the re-hold — the new plan needs re-approval)")
-		// Re-arm the claim reader to (nil, nil) (agent running).
+		Expect(events).To(ContainElement(ContainSubstring(planChangedReHoldReason)))
+	})
+
+	// F38 (gates P2-1): a rejection while the phase is Planning must clear the
+	// stale approval and bump planAttempt, so a stale Planning success claim
+	// already on the pod (carrying the old planAttempt) is ignored instead of
+	// being consumed (which moved the Loop to AwaitingApproval without a new
+	// plan and absorbed the rejection).
+	It("a rejection while Planning clears PlanApproved, bumps planAttempt, and a stale Planning claim does not advance the Loop", func() {
+		ns := "b4-rejplanning-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		name := "b4-rejplanning"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
+		})).To(Succeed())
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r.wireApprovalGate()
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil }
+
+		loop := b4Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		attemptBefore := loop.Status.PlanAttempt
+
+		// A pending approval from a prior cycle, and a rejection while Planning.
+		now := metav1.Now()
+		loop.Status.Conditions = append(loop.Status.Conditions,
+			metav1.Condition{Type: coxv1alpha1.PlanApprovedCondition, Status: metav1.ConditionTrue, Reason: "Approved",
+				Message: "Approved: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", LastTransitionTime: now},
+			metav1.Condition{Type: coxv1alpha1.PlanRejectedCondition, Status: metav1.ConditionTrue, Reason: "Rejected",
+				Message: "use a different approach", LastTransitionTime: now})
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// The stale claim: a Planning success claim for the PRIOR attempt.
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
-			return nil, nil
+			return &PhaseClaim{
+				ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+				Status:        "success",
+				HeadCommit:    s5aHeadCommit,
+				PlanAttempt:   attemptBefore,
+			}, nil
 		}
+		loop = b4Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"the stale claim must not advance a Loop whose plan was just rejected")
+		Expect(loop.Status.PlanAttempt).To(Equal(attemptBefore+1), "the rejection starts a new plan attempt")
+		Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil(),
+			"the stale approval is cleared")
+		Expect(loop.Status.Approval).NotTo(BeNil())
+		Expect(loop.Status.Approval.LastRejectionReason).To(Equal("use a different approach"))
 	})
 
 	// The maxIterations cap spec is OMITTED: the cap check is in the shared

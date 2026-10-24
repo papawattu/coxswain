@@ -1428,6 +1428,13 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// from a prior attempt is rejected by advancePhaseFromClaim (the
 			// claim's planAttempt does not match the new status.planAttempt).
 			loop.Status.PlanAttempt++
+			// F38 (gates P1-1): the re-plan invalidates the prior approval, as
+			// the rejection path does (loop_approval.go). Left in place, the
+			// stale approved hash opens the Planning -> Implementing gate for a
+			// plan the user never saw.
+			if conditionTruePresent(loop, coxv1alpha1.PlanApprovedCondition) {
+				clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
+			}
 			if loop.Status.Verify == nil {
 				loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 			}

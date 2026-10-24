@@ -1,8 +1,8 @@
 # Phase 1 review, round 31: the ADRs against the code, and what the release P1 fixes left behind
 
 Round 31, 2026-10-24. It follows R30 (PR #211, not yet merged) and covers the
-work merged since R30 was drafted. Line numbers are against main at `6eb74c2`
-unless a row says otherwise. Source material is not committed:
+work merged since R30 was drafted. Code line numbers are against main at
+`6eb74c2` (re-derived after #213-#216 moved them); ADR line numbers are ADR lines. Source material is not committed:
 - an ADR-by-ADR audit (`.samples/adr-audit/REPORT.md`, ADR-0001 to 0009);
 - its cross-check (`.samples/prereview-adr-audit.md`);
 - the corrections table (`.samples/r31-adr-corrections.md`);
@@ -19,8 +19,10 @@ unless a row says otherwise. Source material is not committed:
 **Status:**
 - **All seven R30 I103 P1s are merged.** R30's I103 is ticked on its branch.
 - **The ADRs no longer describe the system.** 31 claims in ADR-0004 to 0008
-  are broken, not built or superseded (I107). Two of them are security
-  defects already queued as fixes (F53, F54).
+  are broken, not built or superseded (I107). Eight carry a security
+  consequence: two are queued (F53(a), the writable verify checkout; F54,
+  the evil-agent e2e), row 16's is closed by F42, and the rest are new
+  F-items under I107.
 - **F42 widened an existing race, and `make deploy` ships an operator that
   can't run an agent.** Both are queued (F55, F56); see I108.
 - **No security gate is off by default.** Missing KubeArmor, snapshot CRDs or
@@ -57,7 +59,7 @@ unless a row says otherwise. Source material is not committed:
   ADR-0005:
   - 4 `0005:117-118` (also `:213-214`) [BROKEN]: a pod error is `VerifyError`,
     re-run once → the reason is `VerifyInfraFailed`, bound 2
-    (`loop_verify_job.go:1613,1619`). `CONTEXT.md:57` repeats it.
+    (`loop_verify_job.go:1620,1626`). `CONTEXT.md:57` repeats it.
   - 5 `0005:212` [NOT BUILT]: the verify Job sets `activeDeadlineSeconds` →
     absent from `loop_verify_job.go`, while the deliver and memory-writer Jobs
     set it. **Queued as F53(b).**
@@ -69,15 +71,15 @@ unless a row says otherwise. Source material is not committed:
     fs only, so agent code run by check N can rewrite what check N+1 builds
     from. **Queued as F53(a).**
   - 8 `0005:196-197` (and `:319-322`) [NOT BUILT]: a `pods/log` grant → none;
-    failure text is the termination message (`loop_verify_job.go:1554`).
+    failure text is the termination message (`loop_verify_job.go:1561`).
   - 9 `0005:271-272` (and `:319-322`) [NOT BUILT]: RBAC adds `secrets/get` →
     none; the git credential is a volume in `clone-base` only
     (`loop_verify_job.go:606`).
   - 10 `0005:266-272` (D15) [NOT BUILT]: refs resolved in-process with go-git →
     no go-git; the base SHA comes from the init container's termination
-    message (`loop_controller.go:1141`).
+    message (`loop_controller.go:1140`, `readBaseCommitFromTerminationMessage` at `:1152`).
   - 11 `0005:154-156` (D11) [BROKEN]: the operator resolves the branch head
-    itself → the pin is the runner's claim (`loop_s4_phase.go:563`). The
+    itself → the pin is the runner's claim (`loop_s4_phase.go:567`). The
     property holds: the pinned SHA is what verify checks out and deliver
     pushes. The mechanism differs, and the ancestry check is F43.
   - 12 `0005:240-247` (D17.1) [NOT BUILT] [sec]: a canary test that must fail
@@ -94,9 +96,9 @@ unless a row says otherwise. Source material is not committed:
   - 16 `0006:68-73` [BROKEN] [sec]: egress only from the proxy container → the
     NetworkPolicy is pod-scoped, and agent egress covers the model proxy, the
     egress proxy, DNS, the repo and each tool proxy
-    (`loop_controller.go:4180-4249`).
+    (`loop_controller.go:4213-4274`; `modelProxyEgress` at `:4153`).
   - 17 `0006:53-58` [SUPERSEDED]: a sidecar model proxy → a separate pod (D33,
-    `loop_controller.go:2391`).
+    `loop_controller.go:2410`).
   - 18 `0006:87`, `:147-148` [NOT BUILT]: defaults from a ConfigMap → CRD
     markers.
   - 19 `0006:91-99` [NOT BUILT] [sec]: the "evil agent" e2e → absent.
@@ -129,7 +131,7 @@ unless a row says otherwise. Source material is not committed:
   ADR-0007 amendment A1:
   - 29 `a1:142-166` [BROKEN]: a missing fact or an outage reads `Unknown` →
     only `EnforcementUnverified` maps to `Unknown`; `EngineUnavailable` is
-    `False` (`loop_controller.go:5158-5165`). It still fails closed.
+    `False` (`loop_controller.go:5198`, `:5209-5210`). It still fails closed.
   - 30 `a1:208-215` [NOT BUILT]: the optional post-start node re-check → absent.
 
   ADR-0008:
@@ -176,8 +178,10 @@ unless a row says otherwise. Source material is not committed:
 - [ ] **I109: verification gaps the lab can't close yet**
 
   **Where / Problem:**
-  - F36 changed an RBAC verb, and AGENTS.md's B1 rule asks for a kind
-    lifecycle run. Neither lab cluster has a CSI snapshotter: hermes-sim has
+  - F36 changed no RBAC: the role already granted `patch` and never
+    `update`; the code called `Update`. Its new code path uses `patch
+    volumesnapshots`, and AGENTS.md's B1 rule asks for the kind lifecycle run
+    that would have caught the original `Update`. Neither lab cluster has a CSI snapshotter: hermes-sim has
     no `volumesnapshots` CRD, and ref has no `VolumeSnapshotClass`. So a fork
     and source-delete run is impossible. The merge rests on an envtest RBAC
     wrapper (patch allowed, update denied) and `can-i` on ref (patch yes,
@@ -205,7 +209,8 @@ unless a row says otherwise. Source material is not committed:
 
   Builder slips:
   - #216 was marked ready with a WIP body and no verification recorded.
-  - The read-only builder executed scripts once.
+  - The read-only builder executed generated scripts once, while proving
+    F37 (its own report, `.samples/review-gates-delivery/FINDINGS.md`, P1-2).
   - Builder #1 looped twice on code-heavy work and was moved to writing tasks
     (relevant to D72).
 

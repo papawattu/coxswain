@@ -250,6 +250,16 @@ func run(outcome string) (int, error) {
 			v := curClient.Judge(curCtx, s)
 			if v.Keep {
 				curated = append(curated, s)
+				// ADR-0002: record the curator's reason for keeps too (the
+				// audit trail: the verdict, keep or drop, plus a one-line
+				// reason, goes into the audit for EVERY lesson). Mark the
+				// reason so the summary reports "written curator-keep: <reason>".
+				for j := range lessons {
+					if lessons[j] == s && reasons[j] == "" {
+						reasons[j] = "curator-keep: " + v.Reason
+						break
+					}
+				}
 			} else {
 				// The curator dropped this survivor: mark it in the reasons
 				// so the summary reports the drop reason.
@@ -317,14 +327,19 @@ func annotateDedup(lessons, reasons []string, writtenNames []string) {
 		writtenSet[n] = true
 	}
 	for i := range reasons {
-		if reasons[i] != "" {
-			continue // screen-dropped (not a survivor)
+		if reasons[i] != "" && !strings.HasPrefix(reasons[i], "curator-keep: ") {
+			continue // screen-dropped or curator-dropped (not a survivor)
 		}
+		// A survivor (reason == "" or "curator-keep: ..."): compute its
+		// sha256 file name from the lesson text. A curator-keep reason is
+		// a survivor (the curator kept it); a dedup override must replace
+		// it with "dropped duplicate" (the file was not written).
 		// A survivor: compute its sha256 file name from the lesson text.
 		sum := sha256.Sum256([]byte(lessons[i]))
 		name := hex.EncodeToString(sum[:]) + ".txt"
 		if !writtenSet[name] {
 			reasons[i] = "duplicate"
+		} else {
 		}
 	}
 }
@@ -334,7 +349,9 @@ func annotateDedup(lessons, reasons []string, writtenNames []string) {
 func countSurvivors(reasons []string) int {
 	n := 0
 	for _, r := range reasons {
-		if r == "" {
+		// A survivor has an empty reason (no curator yet) or a curator-keep
+		// reason (the curator kept it — still a survivor, not yet deduped).
+		if r == "" || strings.HasPrefix(r, "curator-keep: ") {
 			n++
 		}
 	}
@@ -352,7 +369,12 @@ func summaryLines(lessons, reasons []string, total, written, dropped int) []stri
 		status := "written"
 		rule := "eligible"
 		if i < len(reasons) && reasons[i] != "" {
-			status = "dropped"
+			// A non-empty reason is either a drop (curator/screen/duplicate)
+			// or a keep with a curator reason (curator-keep: ...).
+			// A keep reason does NOT change the status to "dropped".
+			if !strings.HasPrefix(reasons[i], "curator-keep: ") {
+				status = "dropped"
+			}
 			// The reason is model- or screen-supplied text; CR/LF in a
 			// curator reason would corrupt the line-based summary (P3).
 			rule = stripReasonCR(reasons[i])

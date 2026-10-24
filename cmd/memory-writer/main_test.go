@@ -619,7 +619,11 @@ func TestMemoryWriteCuratorTrueVerdictWrites(t *testing.T) {
 	writeLessonsFile(t, ws, []string{lesson})
 	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete, specific to this repo"}`, http.StatusOK)
 	defer srv.Close()
-	code, err := runWithCurator(t, ws, mem, srv.URL)
+	// Capture stdout (the bounded summary — the audit trail). ADR-0002: the
+	// curator's reason is recorded for keeps too ("written curator-keep: <reason>").
+	summary, code, err := captureSummary(t, func() (int, error) {
+		return runWithCurator(t, ws, mem, srv.URL)
+	})
 	if code != 0 || err != nil {
 		t.Fatalf("run(succeeded, curator=true) = (%d, %v); want (0, nil)", code, err)
 	}
@@ -633,6 +637,48 @@ func TestMemoryWriteCuratorTrueVerdictWrites(t *testing.T) {
 		if content != lesson {
 			t.Errorf("%s = %q; want byte-identical %q (the curator never rewrites)", name, content, lesson)
 		}
+	}
+	// ADR-0002: the audit trail records the curator's keep reason (the
+	// verdict, keep or drop, plus a one-line reason, goes into the audit for
+	// EVERY lesson). The summary must show "written curator-keep: concrete,
+	// specific to this repo" — not the bare "eligible".
+	if !strings.Contains(summary, "written curator-keep: concrete, specific to this repo") {
+		t.Errorf("audit trail lacks the curator's keep reason (written curator-keep: concrete, specific to this repo):\n%s", summary)
+	}
+}
+
+// TestMutationCuratorKeepReasonNotRecorded: mutation test for the ADR-0002
+// keep-reason audit. The mutation: remove the keep-reason recording from
+// main.go (the v.Keep branch appends to curated but does NOT set
+// reasons[j] = "curator-keep: " + v.Reason). With the mutation, the audit
+// trail shows "written eligible" (the bare default) instead of "written
+// curator-keep: <reason>", and this test must FAIL.
+//
+// To run the mutation: apply this diff in a scratch worktree:
+//
+//   - reasons[j] = "curator-keep: " + v.Reason
+//
+// (the line in the v.Keep branch of the curator loop in run). Then run
+// `go test -run TestMutationCuratorKeepReasonNotRecorded -count=1 .` — the
+// test must fail (the summary lacks the keep reason). Then `git checkout .`
+// and re-run to confirm it passes.
+func TestMutationCuratorKeepReasonNotRecorded(t *testing.T) {
+	ws := t.TempDir()
+	mem := t.TempDir()
+	writeLessonsFile(t, ws, []string{"foo/bar: the retry must back off before the 500"})
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "a specific, non-trivial reason"}`, http.StatusOK)
+	defer srv.Close()
+	summary, code, err := captureSummary(t, func() (int, error) {
+		return runWithCurator(t, ws, mem, srv.URL)
+	})
+	if code != 0 || err != nil {
+		t.Fatalf("run(curator=keep) = (%d, %v); want (0, nil)", code, err)
+	}
+	// The audit trail MUST contain the curator's keep reason. If the mutation
+	// (removal of the keep-reason recording) is applied, the summary shows
+	// "written eligible" and this assertion fails.
+	if !strings.Contains(summary, "written curator-keep: a specific, non-trivial reason") {
+		t.Fatalf("MUTATION DETECTED: audit trail lacks the curator's keep reason. Got:\n%s\nWant: 'written curator-keep: a specific, non-trivial reason'\nMutation: remove the keep-reason recording (reasons[j] = \"curator-keep: \" + v.Reason) from the v.Keep branch in run.", summary)
 	}
 }
 

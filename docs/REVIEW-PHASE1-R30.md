@@ -39,7 +39,7 @@ was run.
 
 ## P1
 
-- [ ] **I103: security and integrity defects in released code**
+- [x] **I103: security and integrity defects in released code** (7dcf262 #207, dc628a5 #210, c9a53f8 #212, b90d1db #213, daf4cd6 #214, 628fb1a #215, 6eb74c2 #216)
 
   **Where / Problem:** each row was confirmed by the reviewer in the code.
   The row marked *reproduced* was also run.

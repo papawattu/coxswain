@@ -31,7 +31,7 @@ func TestParseLessonsBasic(t *testing.T) {
 	reply := ("made the change and verified it.\n" +
 		"LESSON: the build order is compile, test, deploy\n" +
 		"LESSON: the verify image is golang:1.26\n" +
-		"Done.")
+		"\nDone.")
 	got := parseLessons(reply)
 	if len(got) != 2 {
 		t.Fatalf("basic: got %d lessons, want 2: %v", len(got), got)
@@ -45,7 +45,7 @@ func TestParseLessonsBasic(t *testing.T) {
 // mid-line are NOT lessons (the instruction says a line that STARTS with
 // LESSON: after whitespace; a mid-line mention is prose).
 func TestParseLessonsIgnoresNonLessonLines(t *testing.T) {
-	reply := "the LESSON: prefix is the convention.\nLESSON: only this is a lesson\nsee the lesson doc for details"
+	reply := "the LESSON: prefix is the convention.\nLESSON: only this is a lesson\n\nsee the lesson doc for details"
 	got := parseLessons(reply)
 	if len(got) != 1 || got[0] != "only this is a lesson" {
 		t.Fatalf("mid-line: got %v, want the one true lesson", got)
@@ -88,21 +88,26 @@ func TestCapLessonsMultiLineCut(t *testing.T) {
 	}
 }
 
-// TestCapLessonsSizeCap: a proposal over maxLessonChars runes is truncated to
-// the cap (P5b's size cap, ≤500 chars, the plan's named spec). Exactly 500 is
-// kept; 501 is cut to 500.
+// TestCapLessonsSizeCap: a proposal over maxLessonChars runes is DROPPED, not
+// cut (P5b's size cap, ≤500 chars; a cut lesson is a fragment, I99). Exactly
+// 500 is kept; 501 is dropped.
 func TestCapLessonsSizeCap(t *testing.T) {
 	at500 := strings.Repeat("é", 500)
 	at501 := strings.Repeat("x", 501)
-	got := capLessons([]string{at500, at501})
-	if len(got) != 2 {
-		t.Fatalf("size cap: got %d lessons, want 2", len(got))
+	got := capLessons([]string{at500, at501, "short"})
+	if len(got) != 2 || got[0] != at500 || got[1] != "short" {
+		t.Fatalf("size cap: got %d lessons, want the 500-rune one and \"short\"", len(got))
 	}
-	if r := []rune(got[0]); len(r) != 500 {
-		t.Fatalf("size cap: 500-rune lesson has %d runes", len(r))
-	}
-	if r := []rune(got[1]); len(r) != 500 {
-		t.Fatalf("size cap: 501-rune lesson was not cut to 500 (got %d)", len(r))
+}
+
+// TestParseLessonsWrappedTooLongDropped (I99): three wrapped 200-char lines
+// join to over 500 runes; the lesson is dropped, not stored cut mid-word.
+func TestParseLessonsWrappedTooLongDropped(t *testing.T) {
+	l := strings.Repeat("w", 200)
+	reply := "LESSON: " + l + "\n" + l + "\n" + l + "\nLESSON: kept\n"
+	got := capLessons(parseLessons(reply))
+	if len(got) != 1 || got[0] != "kept" {
+		t.Fatalf("got %d lessons %q, want only \"kept\"", len(got), got)
 	}
 }
 
@@ -201,5 +206,36 @@ func TestLessonsNotInPlanningPrompt(t *testing.T) {
 	got := planningPrompt(ws, "do the thing", planMaxBytes)
 	if strings.Contains(got, "LESSON:") {
 		t.Fatalf("planning prompt carries the lessons section (P5b is implementing-only):\n%s", got)
+	}
+}
+
+// TestParseLessonsWrapped (I99): the exact reply from the Phase 5 acceptance
+// run, where the stand-in wrapped a lesson over three lines. The whole
+// sentence is one lesson, not the first-line fragment.
+func TestParseLessonsWrapped(t *testing.T) {
+	reply := "Summary of the change.\n\n" +
+		"LESSON: round.go: the original Round() truncated (toward zero) instead of\n" +
+		"rounding half away from zero, so Round(0.5) returned 0; the fix is to add\n" +
+		"0.5 / subtract 0.5 before truncating.\n" +
+		"LESSON: round_test.go: second lesson.\n"
+	got := parseLessons(reply)
+	want := []string{
+		"round.go: the original Round() truncated (toward zero) instead of " +
+			"rounding half away from zero, so Round(0.5) returned 0; the fix is to add " +
+			"0.5 / subtract 0.5 before truncating.",
+		"round_test.go: second lesson.",
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// TestParseLessonsSummaryAfter (I99): a summary paragraph after the lessons,
+// separated by a blank line, is not joined into the last lesson.
+func TestParseLessonsSummaryAfter(t *testing.T) {
+	reply := "LESSON: a wrapped\nlesson here.\n\nAll tests pass. Done."
+	got := parseLessons(reply)
+	if len(got) != 1 || got[0] != "a wrapped lesson here." {
+		t.Fatalf("got %q", got)
 	}
 }

@@ -76,6 +76,8 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	$(MAKE) memory-writer-image-test
 	@# F21: the RWX-storage script's execution test (real script, stubbed kubectl).
 	$(MAKE) rwx-storage-test
+	@# F29: the Helm chart's manager role must cover config/rbac/role.yaml (the P5b serviceaccounts rule was missing).
+	$(MAKE) chart-rbac-test
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 	$(MAKE) runner-test
 
@@ -476,6 +478,11 @@ MANAGER_EXTRA_ARGS ?=
 build-installer: manifests generate kustomize ## A5: render dist/install.yaml with ALL coxswain ghcr images tagged from IMG (see hack/build-installer.sh).
 	IMG="$(IMG)" TARGET=build-installer hack/require-img.sh
 	KUSTOMIZE="$(KUSTOMIZE)" IMG="$(IMG)" MEMORY_STORAGE_CLASS="$(MEMORY_STORAGE_CLASS)" MANAGER_EXTRA_ARGS="$(MANAGER_EXTRA_ARGS)" hack/build-installer.sh
+
+.PHONY: chart-rbac-test
+chart-rbac-test: install-helm ## F29: chart manager role covers config/rbac/role.yaml; the guard fails on a chart missing serviceaccounts.
+	@hack/chart-rbac-check.sh
+	@hack/chart-rbac-check-test.sh
 
 .PHONY: memory-writer-image-test
 memory-writer-image-test: kustomize install-helm ## F19: every shipped manifest passes --memory-writer-image = the operator's own image.

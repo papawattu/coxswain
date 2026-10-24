@@ -53,7 +53,7 @@ parsing `status.containerStatuses[agent].state.terminated` into the strict
 claim object, `internal/controller/loop_s4_phase.go:26-28` / `:100-101`). The
 runner mirrors the strict `{"observedPhase","status","blockedReason"}` object
 into `/dev/termination-log` (`runner/phase.go:171-184`; the writer is
-`writeClaim`, `runner/phase.go:634-`). `result.json` remains on the workspace
+`writeClaim`, `runner/phase.go:658-`). `result.json` remains on the workspace
 volume as the full record, but the operator's read-back is the termination
 message, not an exec. The operator's own comment records the pattern: "no
 exec, no kubelet ReadFile, and no new RBAC"
@@ -73,12 +73,12 @@ operator gains `pods/exec` (read claims) and `jobs` create/delete/list/get
 (obtain evidence) RBAC." (The same claim appears at ADR-0005 `:319-322`.)
 
 **What was built:** `pods/exec` was never granted and is never needed.
-`grep -rn 'verbs=.*exec' internal/` = 0 hits; the pods marker is
+`grep -rn 'verbs=.*exec' internal/` = 0 hits; a grep for
+`resources=pods` finds the pods marker at
 `internal/controller/loop_controller.go:549`
 (`+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete`),
-and the generated `config/rbac/role.yaml` pods rule (`:9-20`) carries no
-`exec` verb and no subresource. Positive control: the same grep finds the
-`jobs` marker at `internal/controller/loop_controller.go:564`.
+which has no exec verb, and the generated `config/rbac/role.yaml` pods rule
+(`:9-20`) carries no `exec` verb and no subresource.
 
 **Decision now recorded:** the operator's claim read needs no `pods/exec`
 (the termination message arrives via the APIReader pod `Get`, covered by the

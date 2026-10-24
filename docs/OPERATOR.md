@@ -187,9 +187,9 @@ sum(rate(coxswain_memory_writes_total{outcome="failed"}[1h])) / sum(rate(coxswai
 # Token consumption rate (tokens/second) over the last 5 minutes.
 sum(rate(coxswain_loop_tokens_total[5m]))
 
-# Loops stuck in Implementing for more than 30 minutes (no phase transition).
-# Note: as written this measures pod age (requires kube-state-metrics), not
-# time since the last phase transition — it is not a reliable stall detector.
+# Loops in Implementing while the newest coxswain-system pod is over 30
+# minutes old (requires kube-state-metrics). This is pod age, not time since
+# the last phase transition, so it is not a reliable stall detector.
 coxswain_loops_active{phase="Implementing"} > 0
 and
 (

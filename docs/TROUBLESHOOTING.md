@@ -64,8 +64,9 @@ changed how the failure looks (it now surfaces as a named, bounded
 and `nslookup` reports the node IP (`172.21.0.1`) as the DNS server instead
 of CoreDNS.
 
-**What the alpha runs showed.** The A-numbered runs (A1–A6) are the alpha
-acceptance test runs run against a fresh cluster.
+**What the alpha runs showed.** A1–A6 are the work items of the alpha plan
+(`docs/PLAN-ALPHA.md`). A6 is the alpha acceptance, and "the A6 run" below
+means that acceptance run against a fresh cluster.
 
 These are observations; the cause was not established.
 
@@ -167,10 +168,8 @@ not police that egress. It is separate from `--allow-unenforced` (the
 KubeArmor gate); the two flags are independent.
 
 **The supported topology is decided (D57).** The open question from the
-R26 review (Q2) is answered: the alpha's enforcement layer is
-**KubeArmor only**; the network gate is a separate second layer that
-requires a CNI which enforces NetworkPolicy. The KubeArmor policy gate (A1, ADR-0007) is the alpha's
-enforcement layer and is **required**; the D38 network gate is a second,
+R26 review (Q2) is answered: the alpha ships **KubeArmor-only**. The
+KubeArmor policy gate (A1, ADR-0007) is the alpha's enforcement layer and is **required**; the D38 network gate is a second,
 network-layer gate that needs a CNI that enforces NetworkPolicy (e.g.
 Calico — the tested profile is `test/e2e/d38-cni-e2e.sh`). On a CNI that
 doesn't enforce NetworkPolicy (kindnet included), the released

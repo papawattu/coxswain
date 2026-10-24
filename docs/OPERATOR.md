@@ -50,7 +50,6 @@ For kind, load the image into the cluster before applying:
 ```sh
 make kind-up
 make docker-build IMG=ghcr.io/papawattu/coxswain-controller:dev
-make kind-load IMG=ghcr.io/papawattu/coxswain-controller:dev
 make deploy IMG=ghcr.io/papawattu/coxswain-controller:dev
 ```
 
@@ -102,8 +101,9 @@ on a non-enforcing CNI (dev only), add the escape hatch (see
 ## Metrics
 
 The operator exposes Prometheus metrics at `/metrics` on the manager's
-metrics port (default `:8443` with HTTPS; `:8080` with
-`--metrics-secure=false`). The metrics Service is
+metrics port (the shipped manifests bind `:8443` with HTTPS; the manager flag
+is `--metrics-bind-address`, default `0` = disabled — the `config/default`
+kustomize patch and the Helm chart both set `:8443`). The metrics Service is
 `coxswain-controller-manager-metrics-service` in the `coxswain-system`
 namespace.
 
@@ -247,7 +247,8 @@ kubectl -n coxswain-system logs deploy/coxswain-controller-manager -c manager \
 ### Log levels
 
 The manager's log level is controlled by the `--zap-log-level` flag
-(default `info`). To get debug logs for a specific Loop:
+(controller-runtime's built-in flag; default `info`). To get debug logs for a
+specific Loop:
 
 ```sh
 kubectl -n coxswain-system patch deploy coxswain-controller-manager \
@@ -543,10 +544,11 @@ verify outcome, the budget fold, the stall gate). If the operator is not
 reconciling the Loop (no log lines for it), check:
 
 - The operator is running (`kubectl -n coxswain-system get pods`).
-- The Loop is in a namespace the operator watches (the operator watches
-  all namespaces by default; check `--namespace` if it is set).
+- The Loop is in a namespace the operator watches (the operator watches all
+  namespaces; there is no `--namespace` flag to scope it — it would need a
+  label selector added to the cache to be scoped).
 - The Loop's finalizer is present (`status.finalizers` includes
-  `coxswain.wattu.com/finalizer`).
+  `coxswain.wattu.com/checkpoints`).
 
 ### 6. Pause and resume
 

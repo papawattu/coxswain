@@ -86,7 +86,7 @@ policy gate). Loops run with `NetworkEnforced=False` reason
 
 > "--allow-unenforced-network is set: the Loop runs but the CNI does NOT
 > police pod -> host-network egress (dev escape hatch)"
-> (`internal/controller/loop_controller.go:992,1000`)
+> (`cniNetworkStatus` in `internal/controller/loop_controller.go`)
 
 What that gives up, plainly: **the CNI does not police pod → host-network
 egress.** The agent can still reach any host-network target the NetworkPolicy
@@ -171,8 +171,15 @@ kubectl create secret generic git-cred -n <namespace> \
 ```
 
 Create the Secret in **every namespace** where a Loop may run (the deliver Job
-reads it from the Loop's namespace). If the Secret is missing, the deliver Job
-fails with a `deliver/secret-missing` failure and the Loop's PR is not opened.
+reads it from the Loop's namespace). If `spec.workspace.gitCredentialSecret`
+points at a missing Secret (or is left empty), the deliver Job's push fails:
+with an empty field the git push is attempted unauthenticated and the PR
+create call has no API auth; with a missing Secret the pod cannot start
+(`CreateContainerConfigError`) and the push never runs. Either way the Loop's
+PR is not opened — the failure is visible in the deliver Job's pod events /
+termination log, and the operator records it in `status.delivery`.
+(`internal/controller/loop_deliver_job.go`: the credential volume and the
+git/PR auth flags are added only when the field is non-empty.)
 
 ## 4. A first Loop
 
@@ -228,7 +235,7 @@ The subcommands (from `internal/cli`):
 ```sh
 kubectl cox describe <loop>     # phase, iteration, conditions, budget, delivery
 kubectl cox history <loop>      # the audit trail (phase + verify-failure history ring)
-kubectl cox logs <loop> [agent|proxy|verify|deliver]  # stream a component's logs
+kubectl cox logs <loop> --component agent|proxy|verify|deliver  # stream a component's logs (default: agent)
 kubectl cox plan <loop>         # read the plan (.coxswain/PLAN.md) from the workspace
 kubectl cox diff <loop>         # show the plan diff (current vs. last approved plan)
 kubectl cox approve <loop>      # approve the plan (set the PlanApproved condition)
@@ -323,25 +330,27 @@ it when the snapshot is absent (the Restore condition is False, reason
 ## 8. Model timeout and tuning
 
 The runner's model client uses a 120-second per-request timeout (I89). If
-the model backend hangs (no response within 120s), the runner retries up to
-3 times with exponential backoff (2s, 4s, 8s). After all retries are
-exhausted, the runner surfaces `ModelUnavailable` in its claim and exits
-with a blocked status. The operator maps this to a `ModelAvailable=False`
-condition (reason `ModelUnavailable`) on the Loop, visible via
-`kubectl cox describe`.
+the model backend hangs (no response within 120s), the runner makes at most
+3 calls total, sleeping 2s then 4s between them (exponential backoff from a
+2s base, `runner/runner.go`). After all calls fail, the
+runner surfaces `ModelUnavailable` in its claim and exits with a blocked
+status. The operator maps this to a `ModelAvailable=False` condition (reason
+`ModelUnavailable`) on the Loop, visible via `kubectl cox describe`.
 
-**Worst case:** with the defaults (120s timeout, 3 retries), a fully hung
-model backend surfaces `ModelUnavailable` after about 8 minutes
-(4×120s + 14s of backoff). This is an improvement over the pre-I89
-behaviour (a single 10-minute timeout followed by kubelet back-off churn
-with no named reason).
+**Worst case:** with the defaults (120s timeout, 3 calls), a fully hung model
+backend surfaces `ModelUnavailable` after about 6.2 minutes
+(3×120s + 6s of backoff). This is an improvement over the pre-I89 behaviour
+(a single 10-minute timeout followed by kubelet back-off churn with no named
+reason).
 
-**Tuning:** the timeout is configurable via the runner's `ModelTimeout`
-field (set in the sandbox pod's agent container env or the Loop's spec). For
-a local 27B-class model under load, a legitimate response can approach 120s
-(#124 saw a 60s worst case); increase `ModelTimeout` if you see spurious
-`ModelUnavailable` conditions on a healthy backend. The retry count and
-backoff base are currently constants (`defaultModelRetries = 3`,
+**Tuning:** there is currently no user-facing knob for the timeout. The
+runner's `runConfig.ModelTimeout` field (`runner/runner.go`) exists but the
+runner entrypoint (`runner/cmd/main.go`) never sets it, so it always
+defaults to `defaultModelTimeout` (120s). If you see spurious
+`ModelUnavailable` conditions on a healthy backend (a local 27B-class model
+under load can approach 120s; #124 saw a 60s worst case), the fix today is to
+reduce the load or the context size, not to tune the timeout. The retry count
+and backoff base are constants (`defaultModelRetries = 3`,
 `defaultModelRetryBackoff = 2s` in `runner/runner.go`).
 
 ## 9. Calico + KubeArmor VM (both gates enforcing)

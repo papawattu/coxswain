@@ -2,13 +2,13 @@
 
 **Status:** Proposed (docs-only; to be reviewed per R31 I107).
 **Date:** 2026-10-24
+**Code line numbers:** as of `6eb74c2` (main on 2026-10-24); later merges may
+move them; the function names are the stable anchor.
 **Amends:** ADR-0006 (agent isolation / zero credentials) — rows 15-18 of
 `docs/REVIEW-PHASE1-R31.md` (I107, on `origin/review-phase1-r31`) and the
 corrections table (`.samples/r31-adr-corrections.md`).
 **Supersedes:** the four ADR-0006 claims quoted below. The original ADR is a
 decision record and is not edited; this amendment records what was built.
-**Code line numbers:** as of `6eb74c2` (main on 2026-10-24); later merges may
-move them; the function names are the stable anchor.
 
 ## Context
 
@@ -54,21 +54,21 @@ the model endpoint (plus DNS); the agent container reaches nothing but
 NetworkPolicy has no per-container egress scope — and the model proxy is a
 separate pod (D33), so the agent pod's egress cannot be limited "only from the
 proxy container". The built policy (`ensureNetworkPolicy`,
-`internal/controller/loop_controller.go:4165`) selects the whole agent pod
-(`:4309-4318`, the `<loop>-agent-netpol`'s PodSelector matches the agent pod
+`internal/controller/loop_controller.go:4164`) selects the whole agent pod
+(`:4308-4317`, the `<loop>-agent-netpol`'s PodSelector matches the agent pod
 labels) with deny-all ingress and an egress allowlist of:
 
-- the model proxy pod (one rule, `modelProxyEgress` at `:4165-4174`, added at
-  `:4225`), present only when `spec.agent.endpointSecretRef` is set;
-- the egress proxy pod (`:4226-4231`), present only when network allows exist
-  (`needsEgressProxy`, called at `:4224`, defined `:3144`);
-- DNS (`:4232-4235`);
+- the model proxy pod (one rule, `modelProxyEgress` at `:4153-4162`, added at
+  `:4213`), present only when `spec.agent.endpointSecretRef` is set;
+- the egress proxy pod (`:4214-4218`), present only when network allows exist
+  (`needsEgressProxy`, called at `:4212`, defined `:3142`);
+- DNS (`:4220-4223`);
 - the repo host for the workspace init container's first clone — a **pod-wide**
   rule, documented in-place as an accepted MVP widening (the comment at
-  `:4248-4252` says the agent container can also reach the repo host; the rule
-  is at `:4255-4259`, plus an egress-proxy route for external repo hosts,
-  `:4260-4272`); and
-- one rule per tool proxy (`:4281-4284`), one per tool in the effective
+  `:4236-4240` says the agent container can also reach the repo host; the rule
+  is at `:4244-4248`, plus an egress-proxy route for external repo hosts,
+  `:4257-4261`); and
+- one rule per tool proxy (`:4264-4274`), one per tool in the effective
   policy (D41d).
 
 The per-container fence the ADR describes is **not built**: the engine emits a
@@ -81,7 +81,7 @@ the same review round: the fence is the D34 NetworkPolicy, not per-container
 eBPF). Today the agent's inability to reach the model endpoint directly comes
 from the NetworkPolicy, which does not name the endpoint in the agent pod's
 allowlist (the agent's peers are the proxies, DNS, the repo host and the tool
-proxies, `:4225-4284`), and because the proxy holds the key (D33): recording
+proxies, `:4213-4274`), and because the proxy holds the key (D33): recording
 a per-container engine as the built inner fence would overstate the fence.
 
 **Decision now recorded:** the built mechanism is D33/D34/D41 — the pod-scoped

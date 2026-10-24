@@ -54,7 +54,7 @@ Opened by the runner on Succeeded. Draft by default; `spec.pr.ready: true` overr
 _Avoid_: pull request, merge request, branch
 
 **Failure reason**:
-The string attached to `Failed` or a warning. Terminal reasons: `TamperedVerify`, `SubvertedVerify` (the canary control passed, i.e. a test binary that exits 0 regardless of tests — ADR-0005 round 8, D17), `CheckpointUnavailable`, `MaxIterations`, `PlanRejected` (onReject=Fail), `BudgetExceeded` (onExceeded=Fail), `Stalled` (stallAction=Fail). Resumable reasons: `RunnerNoResult`, `PhaseTimeout`, `SandboxCrash`, `VerifyError` (re-run once, then terminal if it crashes again), `GitPushFailed`. `BudgetExceeded` and `Stalled` go to Paused instead of Failed when their configured action is Pause.
+The string attached to `Failed` or a warning. Terminal reasons: `TamperedVerify`, `SubvertedVerify` (the canary control passed, i.e. a test binary that exits 0 regardless of tests — ADR-0005 round 8, D17), `CheckpointUnavailable`, `MaxIterations`, `PlanRejected` (onReject=Fail), `BudgetExceeded` (onExceeded=Fail), `Stalled` (stallAction=Fail). Resumable reasons: `RunnerNoResult`, `PhaseTimeout`, `SandboxCrash`, `VerifyInfraFailed` (recreate the verify Job up to 2 times — 3 total runs — then terminal), `GitPushFailed`. `BudgetExceeded` and `Stalled` go to Paused instead of Failed when their configured action is Pause.
 _Avoid_: error, fault, exception
 
 **VerifySuspicious condition**:

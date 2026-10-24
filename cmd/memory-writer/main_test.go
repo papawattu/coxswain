@@ -1097,7 +1097,7 @@ func TestMemoryWriteDuplicateAtCapEvictsNothing(t *testing.T) {
 func TestMemoryWriteHugeBatchStaysUnderCap(t *testing.T) {
 	mem := t.TempDir()
 	seedLessons(t, mem, memorywrite.MaxLessons)
-	var batch []string
+	batch := make([]string, 0, 3*memorywrite.MaxLessons)
 	for i := range 3 * memorywrite.MaxLessons {
 		batch = append(batch, fmt.Sprintf("batch lesson %03d: a distinct note", i))
 	}
@@ -1108,8 +1108,81 @@ func TestMemoryWriteHugeBatchStaysUnderCap(t *testing.T) {
 	if got := len(readMemoryFiles(t, mem)); got < memorywrite.MaxLessons-memorywrite.MaxLessonsPerWrite {
 		t.Fatalf("memory dir has %d files: a huge batch wiped the old lessons", got)
 	}
-	want := fmt.Sprintf("truncated %d lessons over the batch cap %d", len(batch)-memorywrite.MaxLessonsPerWrite, memorywrite.MaxLessonsPerWrite)
+	want := fmt.Sprintf("truncated %d lessons over the batch cap %d",
+		len(batch)-memorywrite.MaxLessonsPerWrite, memorywrite.MaxLessonsPerWrite)
 	if !strings.Contains(summary, want) {
 		t.Errorf("summary lacks %q:\n%s", want, summary)
+	}
+}
+
+// Review 233 #5: the audit lines (evicted / truncated) come BEFORE the per-lesson
+// lines, because the Loop's audit text keeps only the first 1000 bytes.
+func TestMemoryWriteAuditLinesPrecedeLessonLines(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	batch := make([]string, 0, 3*memorywrite.MaxLessons)
+	for i := range 3 * memorywrite.MaxLessons {
+		batch = append(batch, fmt.Sprintf("order lesson %03d: a distinct note", i))
+	}
+	summary := runCapped(t, mem, batch)
+	first := strings.Index(summary, "lesson-001")
+	for _, marker := range []string{"evicted ", "truncated "} {
+		i := strings.Index(summary, marker)
+		if i < 0 || first < 0 || i > first {
+			t.Errorf("%q (at %d) must come before lesson-001 (at %d):\n%s", marker, i, first, summary)
+		}
+	}
+	// the counts line stays last
+	lines := strings.Split(strings.TrimSpace(summary), "\n")
+	if !strings.HasPrefix(lines[len(lines)-1], "summary: total=") {
+		t.Errorf("the counts line must stay last:\n%s", summary)
+	}
+}
+
+// Review 233 #3: a write that fails must not leave lessons evicted with no audit.
+// The eviction runs only after every write succeeded.
+func TestMemoryWriteFailureEvictsNothing(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	calls := 0
+	orig := writeFile
+	writeFile = func(name string, data []byte, perm os.FileMode) error {
+		calls++
+		if calls == 2 {
+			return fmt.Errorf("injected write failure")
+		}
+		return orig(name, data, perm)
+	}
+	defer func() { writeFile = orig }()
+	_, _, evicted, err := writeLessons(mem, []string{"first new lesson: one", "second new lesson: two"})
+	if err == nil {
+		t.Fatal("want the injected write error")
+	}
+	if len(evicted) != 0 {
+		t.Errorf("evicted %v before/after a failed write", evicted)
+	}
+	// the 100 seeded lessons are all still there (+ the one new file written before the failure)
+	files := readMemoryFiles(t, mem)
+	if len(files) != memorywrite.MaxLessons+1 {
+		t.Errorf("memory dir has %d files, want %d (no seeded lesson lost)", len(files), memorywrite.MaxLessons+1)
+	}
+}
+
+// Review 233 #3 (name shape): only <sha256>.txt files are lessons; a stray .txt
+// is never evicted.
+func TestMemoryWriteNeverEvictsNonLessonFile(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	junk := filepath.Join(mem, "junk.txt")
+	if err := os.WriteFile(junk, []byte("not a lesson\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-1000 * time.Hour) // older than every seeded lesson
+	if err := os.Chtimes(junk, old, old); err != nil {
+		t.Fatal(err)
+	}
+	runCapped(t, mem, []string{"a new lesson: back off"})
+	if _, err := os.Stat(junk); err != nil {
+		t.Errorf("junk.txt was evicted: %v", err)
 	}
 }

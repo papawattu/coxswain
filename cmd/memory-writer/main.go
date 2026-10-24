@@ -305,7 +305,8 @@ func run(outcome string) (int, error) {
 		audit = append(audit, "evicted "+sha[:min(shaPrefixLen, len(sha))]+" cap")
 	}
 	if overBatch > 0 {
-		audit = append(audit, fmt.Sprintf("truncated %d lessons over the batch cap %d", overBatch, memorywrite.MaxLessonsPerWrite))
+		audit = append(audit, fmt.Sprintf("truncated %d lessons over the batch cap %d",
+			overBatch, memorywrite.MaxLessonsPerWrite))
 	}
 	emitSummary(summaryLines(lessons, reasons, audit, total, written, dropped))
 	return 0, nil
@@ -382,6 +383,10 @@ func countSurvivors(reasons []string) int {
 // message file — is in emitSummary).
 func summaryLines(lessons, reasons, audit []string, total, written, dropped int) []string {
 	out := make([]string, 0, len(lessons)+len(audit)+1)
+	// The audit lines ("evicted <sha12> cap", batch truncation) come FIRST: the
+	// Loop's bounded audit text keeps only the first 1000 bytes of the summary,
+	// so after ~11 per-lesson lines a trailing audit line would be cut off.
+	out = append(out, audit...)
 	for i, lesson := range lessons {
 		status := "written"
 		rule := "eligible"
@@ -398,9 +403,6 @@ func summaryLines(lessons, reasons, audit []string, total, written, dropped int)
 		}
 		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
 	}
-	// D71: each eviction ("evicted <sha12> cap") and a batch truncation are in the
-	// audit: sha prefixes and counts, never lesson text.
-	out = append(out, audit...)
 	out = append(out, summaryLine(total, written, dropped))
 	return out
 }
@@ -456,6 +458,9 @@ func screenLessons(lessons []string, eligibleOutcome bool) (survivors, reasons [
 	return survivors, reasons
 }
 
+// writeFile is os.WriteFile; a seam so a spec can fail a write after others succeeded.
+var writeFile = os.WriteFile
+
 // writeLessons writes each survivor to <memoryDir>/<sha256>.txt (the file is
 // named by the lesson's SHA-256 — the plan: "writes each curator-approved
 // lesson as one file named by its SHA-256"). It creates the directory if
@@ -491,15 +496,6 @@ func writeLessons(dir string, survivors []string) (int, []string, []string, erro
 	for _, e := range entries {
 		existing[e.Name()] = true
 	}
-	// D71 (a): the per-PVC lesson cap. Evict the oldest (by mtime) so the dir
-	// never holds more than memorywrite.MaxLessons after this write.
-	evicted, err := evictOldest(dir, entries, survivors, memorywrite.MaxLessons)
-	if err != nil {
-		return 0, nil, evicted, err
-	}
-	for _, n := range evicted {
-		delete(existing, n)
-	}
 	written := 0
 	writtenNames := make([]string, 0, len(survivors))
 	for _, lesson := range survivors {
@@ -517,12 +513,23 @@ func writeLessons(dir string, survivors []string) (int, []string, []string, erro
 		// the trailing newline is a conventional text-file terminator and
 		// the reader trims it).
 		path := dir + "/" + name
-		if err := os.WriteFile(path, []byte(lesson+"\n"), 0o644); err != nil {
-			return written, nil, evicted, fmt.Errorf("write %s: %w", name, err)
+		if err := writeFile(path, []byte(lesson+"\n"), 0o644); err != nil {
+			return written, nil, nil, fmt.Errorf("write %s: %w", name, err)
 		}
 		existing[name] = true
 		written++
 		writtenNames = append(writtenNames, name)
+	}
+	// D71 (a): the per-PVC lesson cap. Evict the oldest (by mtime) AFTER every
+	// write succeeded, so a failed write never leaves lessons deleted with no
+	// audit (a write error returns above, before anything is evicted). The
+	// pre-write snapshot is the candidate set, so a lesson written just now is
+	// never evicted.
+	evicted, err := evictOldest(dir, entries, survivors, memorywrite.MaxLessons)
+	if err != nil {
+		// Non-fatal and loud: the lessons are written; some evictions may have
+		// happened and are still audited (evicted holds the removed names).
+		fmt.Fprintf(os.Stderr, "memory-write: %v (non-fatal; the lessons were written)\n", boundedError(err))
 	}
 	return written, writtenNames, evicted, nil
 }
@@ -546,8 +553,8 @@ func evictOldest(dir string, entries []os.DirEntry, survivors []string, max int)
 	var files []lf
 	existingSet := make(map[string]bool, len(entries))
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".txt") {
-			continue
+		if e.IsDir() || !isLessonFileName(e.Name()) {
+			continue // only <sha256>.txt files are lessons: anything else is never evicted
 		}
 		info, err := e.Info()
 		if err != nil {
@@ -623,4 +630,19 @@ func boundedError(err error) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// isLessonFileName reports whether name is a lesson file: 64 lowercase hex
+// characters plus ".txt" (the writer's own naming).
+func isLessonFileName(name string) bool {
+	h, ok := strings.CutSuffix(name, ".txt")
+	if !ok || len(h) != 64 {
+		return false
+	}
+	for _, c := range h {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

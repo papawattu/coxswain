@@ -678,6 +678,16 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, loop)
 	changed = changed || pauseChanged
 
+	// F42: best-effort ensure of the agent NetworkPolicy BEFORE the sandbox, so
+	// the sandbox gate (an absent agent netpol holds it Suspended) releases in
+	// this same reconcile instead of one reconcile later. A failure is not
+	// surfaced here: ensureProxyAndNetPolicies repeats the ensure later in the
+	// reconcile and surfaces it (condition + Event), and the gate holds the
+	// sandbox Suspended meanwhile.
+	if nerr := r.ensureNetworkPolicy(ctx, loop); nerr != nil {
+		logf.FromContext(ctx).V(1).Info("Could not ensure NetworkPolicy before the sandbox", "error", nerr.Error())
+	}
+
 	sandboxUpdated, err := r.ensureSandbox(ctx, loop, pauseBlocked)
 	if err != nil {
 		return false, false, err
@@ -903,13 +913,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
-		if policiesChanged {
-			// F42: persist the AgentNetworkPolicyReady=False condition so the
-			// failure is visible (kubectl cox describe) before the requeue.
-			if uerr := r.Status().Update(ctx, &loop); uerr != nil {
-				logf.FromContext(ctx).V(1).Info("Could not persist the NetworkPolicy failure condition", "error", uerr.Error())
-			}
-		}
+		r.persistNetPolFailure(ctx, &loop, policiesChanged)
 		return ctrl.Result{}, err
 	}
 	changed = changed || policiesChanged
@@ -4143,6 +4147,20 @@ func (r *LoopReconciler) cleanupEgressProxy(ctx context.Context, loop *coxv1alph
 	return nil
 }
 
+// modelProxyEgress is the agent's egress rule to the model proxy (F42): it
+// exists only when there is a model proxy (spec.agent.endpointSecretRef set).
+// The returned slice is non-nil either way.
+func modelProxyEgress(loop *coxv1alpha1.Loop, proxyPeer networkingv1.NetworkPolicyPeer) []networkingv1.NetworkPolicyEgressRule {
+	rules := []networkingv1.NetworkPolicyEgressRule{}
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+			To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+		})
+	}
+	return rules
+}
+
 func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	ns := loop.Namespace
 	loopName := loop.Name
@@ -4192,14 +4210,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// egress proxy is expected (network allows present); with no network
 	// allows the agent's egress stays model-proxy + DNS (D34).
 	egressExpected := needsEgressProxy(ctx, r, loop)
-	agentEgress := []networkingv1.NetworkPolicyEgressRule{}
-	// F42: the model-proxy rule only exists when there is a model proxy.
-	if loop.Spec.Agent.EndpointSecretRef != "" {
-		agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
-			To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
-			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
-		})
-	}
+	agentEgress := modelProxyEgress(loop, proxyPeer)
 	if egressExpected {
 		agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
 			To:    []networkingv1.NetworkPolicyPeer{egressProxyPeer},
@@ -4633,6 +4644,17 @@ func (r *LoopReconciler) cleanupStaleToolProxyNetpols(ctx context.Context, loop 
 		}
 	}
 	return nil
+}
+
+// persistNetPolFailure persists the AgentNetworkPolicyReady=False condition
+// (F42) so the failure is visible (kubectl cox describe) before the requeue.
+func (r *LoopReconciler) persistNetPolFailure(ctx context.Context, loop *coxv1alpha1.Loop, changed bool) {
+	if !changed {
+		return
+	}
+	if err := r.Status().Update(ctx, loop); err != nil {
+		logf.FromContext(ctx).V(1).Info("Could not persist the NetworkPolicy failure condition", "error", err.Error())
+	}
 }
 
 // agentNetPolMissing reports whether this Loop's agent NetworkPolicy is absent

@@ -339,7 +339,6 @@ func annotateDedup(lessons, reasons []string, writtenNames []string) {
 		name := hex.EncodeToString(sum[:]) + ".txt"
 		if !writtenSet[name] {
 			reasons[i] = "duplicate"
-		} else {
 		}
 	}
 }

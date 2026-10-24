@@ -643,7 +643,8 @@ func TestMemoryWriteCuratorTrueVerdictWrites(t *testing.T) {
 	// EVERY lesson). The summary must show "written curator-keep: concrete,
 	// specific to this repo" — not the bare "eligible".
 	if !strings.Contains(summary, "written curator-keep: concrete, specific to this repo") {
-		t.Errorf("audit trail lacks the curator's keep reason (written curator-keep: concrete, specific to this repo):\n%s", summary)
+		want := "written curator-keep: concrete, specific to this repo"
+		t.Errorf("audit trail lacks the curator's keep reason (%s):\n%s", want, summary)
 	}
 }
 
@@ -677,8 +678,14 @@ func TestMutationCuratorKeepReasonNotRecorded(t *testing.T) {
 	// The audit trail MUST contain the curator's keep reason. If the mutation
 	// (removal of the keep-reason recording) is applied, the summary shows
 	// "written eligible" and this assertion fails.
-	if !strings.Contains(summary, "written curator-keep: a specific, non-trivial reason") {
-		t.Fatalf("MUTATION DETECTED: audit trail lacks the curator's keep reason. Got:\n%s\nWant: 'written curator-keep: a specific, non-trivial reason'\nMutation: remove the keep-reason recording (reasons[j] = \"curator-keep: \" + v.Reason) from the v.Keep branch in run.", summary)
+	got := summary
+	want := "written curator-keep: a specific, non-trivial reason"
+	if !strings.Contains(got, want) {
+		msg := "MUTATION DETECTED: audit trail lacks the curator's keep reason. " +
+			"Got:\n" + got + "\nWant: '" + want + "'\nMutation: remove the " +
+			"keep-reason recording (reasons[j] = \"curator-keep: \" + v.Reason) " +
+			"from the v.Keep branch in run."
+		t.Fatalf("%s", msg)
 	}
 }
 

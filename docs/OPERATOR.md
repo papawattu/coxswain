@@ -644,7 +644,7 @@ carries a model key (0006-A1 row 17).
 The network allows, through the egress proxy. When the effective policy has
 network allows — or when the workspace-init clone must traverse the egress
 proxy (an external repo before the first clone, see below) — the agent's
-evergress to the outside world runs through the per-Loop egress proxy, which
+egress to the outside world runs through the per-Loop egress proxy, which
 enforces the `host:port` allowlist at the CONNECT / SNI / Host layer
 (ADR-0007, "I42 resolution": the per-Loop proxy decision and the CONNECT +
 SNI/Host enforcement point; `ensureEgressProxy` creates the proxy for both
@@ -714,8 +714,9 @@ pinned it is omitted from the pod (the "credential volume exists ONLY for
 the first clone" comment in `agentPodSpec`; asserted in
 `loop_s3_workspace_test.go`), and the agent container never mounts it. The
 agent container therefore holds no model key and no git credential at
-runtime, and the pod sets `shareProcessNamespace: false` so the agent cannot
-read the init container's memory. Two caveats, both recorded in the code:
+runtime, and the pod sets `shareProcessNamespace: false`, so the init
+container runs in its own PID namespace — the agent cannot see its processes
+or read its memory. Two caveats, both recorded in the code:
 the Basic-auth header built from the credential is visible in the init
 git process's argv for that one command (a known limitation noted in
 `workspaceInitContainer`), and the credential is readable in-process by the

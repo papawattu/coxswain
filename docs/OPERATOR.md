@@ -15,6 +15,7 @@ see `docs/QUICKSTART.md`.
 - [Debugging a stuck Loop](#debugging-a-stuck-loop)
 - [Uninstall](#uninstall)
 - [What the sandbox can and cannot reach](#what-the-sandbox-can-and-cannot-reach)
+- [Reading the egress proxy log](#reading-the-egress-proxy-log)
 - [Upgrade](#upgrade)
 
 ---
@@ -254,10 +255,10 @@ The `kubectl cox logs` command streams the **sandbox component** logs
 (agent, proxy, verify, deliver) — not the operator log:
 
 ```sh
-kubectl cox logs <loop> agent    # the runner (agent) log
-kubectl cox logs <loop> proxy    # the model proxy sidecar log
-kubectl cox logs <loop> verify   # the verify Job log
-kubectl cox logs <loop> deliver  # the deliver Job log
+kubectl cox logs <loop> --component agent    # the runner (agent) log
+kubectl cox logs <loop> --component proxy    # the model proxy log (its own pod)
+kubectl cox logs <loop> --component verify   # the verify Job log
+kubectl cox logs <loop> --component deliver  # the deliver Job log
 ```
 
 ---
@@ -461,10 +462,10 @@ field is the most useful diagnostic:
 - `ModelUnavailable` → the model backend is unreachable. Check the proxy
   pod (`kubectl -n <ns> get pods | grep <loop>-proxy`), the model endpoint
   (`spec.agent.modelEndpoint`), and the proxy log (`kubectl cox logs <loop>
-  proxy`).
+  --component proxy`).
 - `Stalled` → the verify Job is producing identical failures. Read the
   stall history (`status.stallHistory`) and the verify Job log (`kubectl
-  cox logs <loop> verify`). The check output is in the verify Job's
+  cox logs <loop> --component verify`). The check output is in the verify Job's
   termination message.
 - `BudgetExceeded` → a budget cap was hit. Read `status.budget` (the token
   counts, wall-clock time, cost) and `spec.budget` (the caps).
@@ -481,7 +482,7 @@ container's termination message) is the evidence for why the checks
 failed:
 
 ```sh
-kubectl cox logs <loop> verify
+kubectl cox logs <loop> --component verify
 ```
 
 If the verify Job is still Running (not yet terminal), the Loop is in the
@@ -500,7 +501,7 @@ implementing, the model calls). If the agent is stuck in a phase, the log
 will show the last model response or the last action:
 
 ```sh
-kubectl cox logs <loop> agent
+kubectl cox logs <loop> --component agent
 ```
 
 ### 4. Check the sandbox pod
@@ -747,6 +748,114 @@ and reads no pod logs (0005-A1 row 8).
 - Domain fronting through an allowlisted CDN hostname is a recorded limit of
   the tunnel-only egress proxy, not solved (ADR-0007, "Known limits of
   tunnel-only mode").
+
+## Reading the egress proxy log
+
+Not every Loop has an egress proxy: the operator creates it only when the
+effective policy has network allows, or when the workspace-init clone of an
+external repo must traverse it (and for the verify/deliver Jobs' external-repo
+traffic). A Loop with an in-cluster repo and no network allows has no egress
+proxy pod and therefore no log.
+
+Each Loop with an egress proxy gets one long-lived proxy pod. In the common
+case it is named `<loop>-egress-proxy`, but a long Loop name is truncated and
+hashed to fit the pod-name budget, so the literal name can fail with
+NotFound. The robust form is the pod's own label (it deliberately does not
+carry the Loop's usual `coxswain.io/loop` label):
+
+```
+kubectl logs -n <ns> -l coxswain.io/egress-proxy-for=<loop> --tail=20
+```
+
+`cox logs` has no egress component: its `proxy` component is the **model**
+proxy pod, not this one. Use `kubectl logs` for the egress proxy.
+
+Every connection attempt — allowed **and** blocked — emits one Q4 audit
+record as a single JSON line on the pod's stdout; the workspace-init clone's
+first-fetch attempts appear in the same log, since the repo host is appended
+to the proxy's allowlist for it. A 403 the agent sees from the proxy has a
+matching `blocked` record here. Records are written to the container's stdout
+only — there is no persistent audit store. The pod is deleted and recreated
+when the proxy's spec drifts, and the spec includes the effective policy's
+network allows, so **changing an AgentPolicy's network allows deletes the
+pod and its audit history with it**. Save the log before changing a policy:
+
+```
+kubectl logs -n <ns> -l coxswain.io/egress-proxy-for=<loop> > egress-audit.log
+```
+
+A recreated pod starts a fresh log.
+
+### Record fields
+
+Each line is a JSON object with these keys (see
+`internal/egress/audit.go`, `AuditRecord`):
+
+- `time` — the attempt time, UTC, RFC 3339.
+- `loop`, `namespace` — the Loop and its namespace.
+- `source` — always `egress-proxy`.
+- `action` — `connect` for the HTTPS path, `http` for plain HTTP.
+- `target` — the host (and port) the client asked to reach.
+- `verdict` — `allowed` or `blocked`.
+- `detail` — free-form key=value pairs, listed below.
+
+The record deliberately carries **no** `iteration` field: the proxy pod is
+long-lived with an immutable env, so it cannot read `status.iteration`.
+The relay that joins records into the Q4 stream fills the iteration by
+time window; the policy hash in `detail` disambiguates a mid-iteration
+policy change.
+
+### `allowed` vs `blocked`
+
+- For `connect` (HTTPS), `allowed` is emitted once the allow check, the
+  resolved-IP check, and the SNI check all pass. A dial failure on the
+  CONNECT tunnel is `blocked` with `reason=dial-failed, ip=<ip>`.
+- For `http` (plain HTTP), `allowed` is emitted only after the upstream
+  responds. A dial/upstream failure is `blocked` with
+  `reason=upstream-error, policy=<hash>` — that value appears only on the
+  plain-HTTP path; on `connect` the equivalent failure is
+  `reason=dial-failed`.
+- `blocked` is every other outcome. The `detail` values are:
+  `reason=bad-host` / `reason=bad-port` (unparseable CONNECT target);
+  `reason=not-allowed, policy=<hash>` (host:port not in the effective
+  network allows); `dns=nxdomain` or `reason=resolved-ip-rejected, ip=<ip>`
+  (the SSRF backstop: the resolved IP does not exist or lands in a
+  carved-out range); `reason=no-hijack` / `reason=hijack-failed` /
+  `reason=read-deadline-failed` / `reason=dial-failed, ip=<ip>` (proxy-
+  internal failures); `sni=absent` / `sni=absent-in-hello` / `sni=<value>`
+  (the SNI check on CONNECT); `reason=upstream-error` (plain HTTP).
+- `detail` also carries `ip=<resolved IP>` — the exact address the proxy
+  dialed, so a DNS rebind is visible after the fact — and `policy=<hash>`,
+  correlating with `status.policy.effectiveHash`.
+
+### Example lines
+
+An allowed HTTPS connection. The record shape (the keys, `verdict`, and
+`ip=` in `detail`) is asserted against a live proxy pod by
+`test/e2e/i42-e2e.sh`, which fetches the log by pod name
+(`<loop>-egress-proxy`); no test fetches it by label. The values shown here
+are illustrative, taken from the record-shape unit test:
+
+```
+{"time":"2026-09-28T12:00:00Z","loop":"loop-x","namespace":"ns-x",
+ "source":"egress-proxy","action":"connect",
+ "target":"proxy.golang.org:443","verdict":"allowed",
+ "detail":"sni=proxy.golang.org, proto=https, ip=151.101.0.223, policy=abc123"}
+```
+
+A blocked attempt to a host not in the network allows:
+
+```
+{"time":"...","loop":"loop-x","namespace":"ns-x",
+ "source":"egress-proxy","action":"connect",
+ "target":"evil.example.net:443","verdict":"blocked",
+ "detail":"reason=not-allowed, policy=abc123"}
+```
+
+Note: non-JSON lines in the same stream (the startup
+`egress-proxy: listening on :3128, ...` line and audit-write error log
+lines) are operator logs, not audit records — filter for JSON lines when
+grepping.
 
 ## Upgrade
 

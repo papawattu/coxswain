@@ -142,21 +142,32 @@ func lessonsPromptSection() string {
 // LESSON lines yields an empty slice (the runner writes no file — a fresh
 // run with nothing to persist).
 //
-// The parse is LINE-BASED (the instruction says "a line `LESSON: ...`"); a
-// line that is not a lesson is ignored (the model's summary text is not a
-// lesson). A lesson's text is everything after `LESSON:` (trimmed; the
-// capLessons step bounds it further).
+// The parse is LINE-BASED with continuation (I99): models wrap long lines, so
+// the non-blank lines that follow a LESSON: line and do not start a new
+// LESSON: are that lesson's continuation, joined with single spaces. A
+// blank line ends the lesson (so a summary paragraph after the lessons is
+// not joined into the last one). We join rather than drop because the whole
+// sentence is recoverable; storing only the first line would persist a
+// fragment silently. A line that is not part of a lesson is ignored. The
+// capLessons step bounds the joined text.
 func parseLessons(answer string) []string {
 	var out []string
+	cur := -1 // index in out of the lesson still accepting continuations
 	for line := range strings.SplitSeq(answer, "\n") {
 		t := strings.TrimSpace(line)
 		const prefix = "LESSON:"
-		if !strings.HasPrefix(t, prefix) {
-			continue
-		}
-		text := strings.TrimSpace(strings.TrimPrefix(t, prefix))
-		if text != "" {
-			out = append(out, text)
+		switch {
+		case strings.HasPrefix(t, prefix):
+			cur = -1
+			text := strings.TrimSpace(strings.TrimPrefix(t, prefix))
+			if text != "" {
+				out = append(out, text)
+				cur = len(out) - 1
+			}
+		case t == "":
+			cur = -1
+		case cur >= 0:
+			out[cur] += " " + t
 		}
 	}
 	return out

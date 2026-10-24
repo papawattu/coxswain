@@ -120,7 +120,7 @@ func (r *LoopReconciler) resumeTriggered(loop *coxv1alpha1.Loop) bool {
 // alternative (suspending while the deliver Job pushes) would strand a
 // half-pushed PR.
 func pausedLoopInDeliveryFlight(loop *coxv1alpha1.Loop) bool {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded {
+	if !deliveryPhaseActive(loop) {
 		return false
 	}
 	if loop.Spec.Delivery == nil || loop.Spec.Delivery.Mode != coxv1alpha1.DeliveryModePullRequest {
@@ -147,7 +147,8 @@ func loopPaused(loop *coxv1alpha1.Loop) bool {
 func (r *LoopReconciler) loopSandboxStopped(loop *coxv1alpha1.Loop) bool {
 	return loopPaused(loop) ||
 		loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded ||
-		loop.Status.Phase == coxv1alpha1.LoopPhaseFailed
+		loop.Status.Phase == coxv1alpha1.LoopPhaseFailed ||
+		loopHoldingForDelivery(loop) // P5f: Verifying+Delivering hold (D69)
 }
 
 // sandboxOperatingMode is the P2f suspension gate: desired OperatingMode =

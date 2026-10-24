@@ -258,7 +258,7 @@ func verifyJobLabels(loopName string) map[string]string {
 // The main container is a no-op (the inits do the work; the main is there
 // because a Job pod requires a main container — it exits 0 immediately).
 func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loopHoldingForDelivery(loop) {
 		return nil
 	}
 	if loop.Status.CurrentVerify == nil || loop.Status.CurrentVerify.VerifiedCommit == "" {
@@ -1197,7 +1197,8 @@ const defaultMaxIterations = 3
 // maxIterations cap bounds the iterate: when the increment would exceed it,
 // the Loop is Failed:MaxIterationsExceeded instead of iterating.
 func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loopHoldingForDelivery(loop) {
+		// P5f: a Loop held for delivery has already passed verify.
 		return false, false
 	}
 	// The B2 tamper gate runs FIRST (every reconcile, order-independent). If
@@ -1273,6 +1274,15 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// B4: clear the failure summary (the last verify passed — the failure
 		// is resolved; the next planning prompt must not carry a stale summary).
 		clearLastFailureSummary(loop)
+		if deliveryEnabled(loop) {
+			// P5f (I98, D69 option i): hold at Verifying (reason Delivering)
+			// until the Delivered condition is terminal; Succeeded (phase and
+			// desiredPhase) is set by settleDeliveryHold.
+			setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue,
+				coxv1alpha1.ReasonVerifyingDelivering,
+				"verify passed; holding Succeeded until delivery (Delivered condition) is terminal")
+			return true, false
+		}
 		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		// B5a: terminal transition — bump the completion counter and clear the

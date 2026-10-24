@@ -388,11 +388,26 @@ The plan the agent wrote (`.coxswain/PLAN.md` in the workspace):
 kubectl cox plan <loop>
 ```
 
+### What `Succeeded` means (P5f, I98)
+
+`Succeeded` means **verified AND delivery is terminal (or delivery is off)**.
+With `spec.delivery.mode: PullRequest`, a Loop that passes verify is held at
+`status.phase: Verifying` (condition `Verifying=True reason=Delivering`, the
+sandbox Suspended) while the `Delivered` condition is in progress. When
+`Delivered` becomes True (PR opened) or False (`DeliveryFailed`), both
+`status.phase` and `status.desiredPhase` become `Succeeded`. A failed
+delivery is therefore `Succeeded` + `Delivered=False` (retry with
+`kubectl cox redeliver`). A script that waits for `phase=Succeeded` never
+reads the Loop before its PR exists (or delivery has failed). With delivery
+off, `Succeeded` is set as soon as verify passes. The memory-writer Job
+starts only after the Loop is `Succeeded`, not during the hold.
+
 ### Key conditions to watch
 
 | Condition | What it means |
 |-----------|---------------|
-| `Succeeded=True` | The Loop's goal was met; the verify checks all passed. |
+| `status.phase=Succeeded` (no separate `Succeeded` condition type) | The goal was met: the verify checks passed and delivery is terminal (or delivery is off). |
+| `Verifying=True reason=Delivering` | Verify passed and delivery is on: the Loop is held at phase `Verifying` (sandbox Suspended) until the `Delivered` condition is terminal. |
 | `Failed=True reason=Stalled` | The P2e stall gate fired (k consecutive identical verify failures). |
 | `Failed=True reason=BudgetExceeded` | A budget cap (tokens, wall-clock, cost) was hit. |
 | `Paused=True reason=Stall` | The stall gate fired with `stallAction=Pause`; the Loop is held Paused until resumed. |

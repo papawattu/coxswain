@@ -949,7 +949,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// FINAL return) — never a controller error, never an in-same-reconcile
 	// create. The egress proxy's SNI allowlist carries the repo host +
 	// api.github.com (GitHub) for the push + the provider API.
-	deliverRequeue, deliverKeep, err := r.ensureDeliver(ctx, &loop)
+	deliverRequeue, deliverKeep, err := r.ensureDeliverAndSettle(ctx, &loop, &changed)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

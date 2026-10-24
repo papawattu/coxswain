@@ -132,6 +132,7 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 		i72SetPodReady(ns, name, false) // pod NOT Ready -> deliver gate holds at S6
 		s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
 		s6Reconcile(r, ns, name)
+		s6ForceSucceededFromHold(ns, name)
 		loop = &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),

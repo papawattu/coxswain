@@ -276,6 +276,20 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 	return requeue, keep, nil
 }
 
+// ensureDeliverAndSettle runs ensureDeliver, then (P5f, I98) settles a Loop
+// held at Verifying+Delivering to Succeeded once Delivered is terminal,
+// setting *changed when it did.
+func (r *LoopReconciler) ensureDeliverAndSettle(ctx context.Context, loop *coxv1alpha1.Loop, changed *bool) (bool, bool, error) {
+	requeue, keep, err := r.ensureDeliver(ctx, loop)
+	if err != nil {
+		return false, false, err
+	}
+	if settleDeliveryHold(loop) {
+		*changed = true
+	}
+	return requeue, keep, nil
+}
+
 // deliverDescriptionConfigReady ensures the deliver description ConfigMap
 // (the R27/P1 ordering fix: it is called BEFORE the deliver Job is created,
 // and returns true only when the ConfigMap exists or the ensure is a
@@ -557,7 +571,7 @@ func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1
 		// annotation (and clear the stale Delivered condition if present).
 	case err != nil:
 		return false, fmt.Errorf("get deliver Job %s for redeliver: %w", jobName, err)
-	case existing.Status.Failed == 0 && existing.Status.Succeeded == 0:
+	case existing.Status.Failed == 0 && existing.Status.Succeeded == 0 && !deliverJobFailedCondition(existing):
 		// In progress (or just created): leave the annotation in place (the
 		// documented in-progress behaviour). A COMPLETED Job (Succeeded=1,
 		// Failed=0) is NOT in progress — it fell through to the delete path
@@ -631,8 +645,8 @@ func (r *LoopReconciler) deliverClearDeliveredCondition(loop *coxv1alpha1.Loop) 
 // commit is re-run by the operator's redeliverAnnotation (I52,
 // ensureDeliverRedeliver).
 func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded {
-		return false, "phase is not Succeeded"
+	if !deliveryPhaseActive(loop) {
+		return false, "phase is not Succeeded (or the Verifying delivery hold)"
 	}
 	if loop.Spec.Delivery == nil || loop.Spec.Delivery.Mode != coxv1alpha1.DeliveryModePullRequest {
 		return false, "delivery mode is not PullRequest"
@@ -655,14 +669,91 @@ func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
 // status.delivery is set; it is cleaned up only when the Loop is no longer
 // Succeeded or the mode flips off).
 func deliveryExpected(loop *coxv1alpha1.Loop) bool {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded {
-		return false
-	}
+	return deliveryPhaseActive(loop) && deliveryEnabled(loop)
+}
+
+// deliveryEnabled reports whether this Loop will deliver once verified:
+// mode PullRequest + a pinned verifiedCommit + a repo (the phase-independent
+// half of deliveryExpected; P5f uses it at verify time to decide whether to
+// hold Succeeded).
+func deliveryEnabled(loop *coxv1alpha1.Loop) bool {
 	if loop.Spec.Delivery == nil || loop.Spec.Delivery.Mode != coxv1alpha1.DeliveryModePullRequest {
 		return false
 	}
 	return loop.Status.CurrentVerify != nil && loop.Status.CurrentVerify.VerifiedCommit != "" &&
 		loop.Spec.Workspace.Repo != ""
+}
+
+// loopHoldingForDelivery (P5f, I98, D69 option i) reports whether the Loop
+// passed verify but is held at phase Verifying (condition Verifying=True,
+// reason Delivering) until the Delivered condition is terminal.
+// NOTE: the hold is carried ONLY by this condition's reason; the operator is
+// its single writer (verify outcome sets it, settleDeliveryHold clears it).
+// Any new writer of the Verifying condition must preserve or deliberately
+// clear the Delivering reason, or the hold is lost/stuck.
+func loopHoldingForDelivery(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+		return false
+	}
+	for i := range loop.Status.Conditions {
+		c := &loop.Status.Conditions[i]
+		if c.Type == string(coxv1alpha1.LoopPhaseVerifying) {
+			return c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.ReasonVerifyingDelivering
+		}
+	}
+	return false
+}
+
+// deliveryPhaseActive reports whether the Loop is in a phase where the deliver
+// Job runs: Succeeded, or the P5f Verifying+Delivering hold.
+func deliveryPhaseActive(loop *coxv1alpha1.Loop) bool {
+	return loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded || loopHoldingForDelivery(loop)
+}
+
+// deliveryTerminal reports whether the Delivered condition is terminal: True,
+// or False with a reason other than InProgress (DeliveryFailed, D64), or a
+// delivery already recorded for the pinned verifiedCommit.
+func deliveryTerminal(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Delivery != nil && loop.Status.CurrentVerify != nil &&
+		loop.Status.Delivery.Commit == loop.Status.CurrentVerify.VerifiedCommit {
+		return true
+	}
+	for i := range loop.Status.Conditions {
+		c := &loop.Status.Conditions[i]
+		if c.Type == coxv1alpha1.DeliveredCondition {
+			return c.Status == metav1.ConditionTrue ||
+				(c.Status == metav1.ConditionFalse && c.Reason == coxv1alpha1.ReasonDeliveryFailed)
+		}
+	}
+	return false
+}
+
+// settleDeliveryHold (P5f) moves a held Loop (Verifying+Delivering) to
+// Succeeded once the Delivered condition is terminal (True, or False — D64: a
+// failed delivery is still Succeeded). It sets both phase and desiredPhase and
+// clears the hold condition. Returns true when it changed the Loop.
+func settleDeliveryHold(loop *coxv1alpha1.Loop) bool {
+	if !loopHoldingForDelivery(loop) {
+		return false
+	}
+	// A hold whose delivery is no longer enabled (spec.delivery cleared or the
+	// repo removed mid-hold; spec.delivery has no immutability rule) has no
+	// deliver Job and no Delivered condition to wait for: it settles like a
+	// delivery-off Loop instead of holding forever.
+	if deliveryEnabled(loop) && !deliveryTerminal(loop) {
+		return false
+	}
+	conds := make([]metav1.Condition, 0, len(loop.Status.Conditions))
+	for _, c := range loop.Status.Conditions {
+		if c.Type != string(coxv1alpha1.LoopPhaseVerifying) {
+			conds = append(conds, c)
+		}
+	}
+	loop.Status.Conditions = conds
+	loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
+	bumpLoopCompletion("succeeded", "verify_passed")
+	return true
 }
 
 // deliverOutcome is the validated delivery outcome (the operator's record
@@ -762,7 +853,7 @@ func (r *LoopReconciler) deliverJobOutcome(loop *coxv1alpha1.Loop, job *batchv1.
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryInProgress, "deliver Job succeeded; reading the push container's termination message")
 		return true, nil
-	case job.Status.Failed > 0:
+	case job.Status.Failed > 0 || deliverJobFailedCondition(job):
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryFailed,
 			fmt.Sprintf("deliver Job %s failed (no retry: one Job per verifiedCommit; re-run delivery with the coxswain.io/redeliver annotation — I52)",
@@ -773,6 +864,24 @@ func (r *LoopReconciler) deliverJobOutcome(loop *coxv1alpha1.Loop, job *batchv1.
 			coxv1alpha1.ReasonDeliveryInProgress, "deliver Job in progress")
 		return true, nil
 	}
+}
+
+// deliverJobActiveDeadlineSeconds bounds the deliver Job (P5f, I98): a hung
+// clone/push would otherwise hold the Loop at Verifying/Delivering forever.
+// A deadline-exceeded Job gets the JobFailed condition (reason
+// DeadlineExceeded) and maps to Delivered=False/DeliveryFailed (terminal,
+// D64; re-run with coxswain.io/redeliver).
+const deliverJobActiveDeadlineSeconds = int64(600)
+
+// deliverJobFailedCondition reports whether the Job carries a true Failed
+// condition (e.g. DeadlineExceeded), which can be set while status.failed is 0.
+func deliverJobFailedCondition(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // buildDeliverJob builds the deliver Job (owned by the Loop, annotated with
@@ -853,9 +962,11 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 	})
 
 	backoff := int32(0)
+	deadline := deliverJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
 	return batchv1.JobSpec{
-		BackoffLimit: &backoff,
+		BackoffLimit:          &backoff,
+		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: deliverJobLabels(loop.Name)},
 			Spec: corev1.PodSpec{

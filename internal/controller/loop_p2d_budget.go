@@ -120,7 +120,10 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// the same treatment as Paused.
 	var added int64
 	var stamp *metav1.Time
-	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) {
+	// P5f: a Loop held for delivery (Verifying+Delivering) already passed
+	// verify; its clock is stopped like a terminal Loop's, and no budget
+	// decision may fail it (it would lose the delivery result).
+	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
 		b := loop.Status.Budget
 		if b != nil && b.LastActiveStamp != nil {
 			added = max(0, int64(now.Sub(b.LastActiveStamp.Time).Seconds()))
@@ -175,7 +178,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// phase action does not fire). The decision runs AFTER the verify/stall
 	// decisions (item 8: a phase already changed by the stall decision is seen
 	// here and the budget decision is inert).
-	if !loopPaused(loop) && isPausablePhase(loop.Status.Phase) {
+	if !loopPaused(loop) && isPausablePhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
 		r.applyBudgetDecision(ctx, loop)
 	}
 

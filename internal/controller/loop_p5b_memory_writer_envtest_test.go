@@ -863,6 +863,8 @@ func s6SucceededLessonsAvailable(name, ns string) *LoopReconciler {
 	// Verifying: the verify Job's evidence.
 	s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
 	s6Reconcile(r, ns, name)
+	s6ForceSucceededFromHold(ns, name)
+	s6Reconcile(r, ns, name) // the memory writer reads the settled Succeeded
 	loop = &coxv1alpha1.Loop{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 	Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),

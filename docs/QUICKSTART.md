@@ -211,8 +211,10 @@ What you will see, in order:
 2. The runner clones the workspace, plans (`.coxswain/PLAN.md`), implements,
    and verifies the acceptance checks.
 3. Each iteration is recorded in the Loop's `status.iterations` ring; on
-   success the Loop's `Succeeded` condition flips to `True` and the deliver
-   Job opens the PR (using the `git-cred` Secret from step 3).
+   success the deliver Job opens the PR (using the `git-cred` Secret from
+   step 3) while the Loop is held at `Verifying`; the phase becomes
+   `Succeeded` only once delivery is terminal (the PR is open, or delivery
+   failed).
 4. If the verify keeps failing, the Loop hits its `maxIterations` budget and
    stops with the iteration history in `status` (read it back with
    `kubectl cox history <loop>`).

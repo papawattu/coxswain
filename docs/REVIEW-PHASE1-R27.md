@@ -60,7 +60,7 @@ stands.
 
 ### I91. TROUBLESHOOTING cites the wrong release's A6 run
 
-- [ ] Open
+- [x] Open (5cc1a97, #143)
 
 **Where:** `docs/TROUBLESHOOTING.md`, the Service DNS section.
 

@@ -111,7 +111,7 @@ opened PR #166, which was merged.
 
 ## P2
 
-- [ ] **I93: nothing checks the approved plan when Implementing starts**
+- [x] **I93: nothing checks the approved plan when Implementing starts** (1902f8e, #172)
 
   **Where:** `runner/phase.go:344`. `planChanged` runs only after a
   successful **Planning** run. The operator writes the approved hash to
@@ -136,7 +136,7 @@ opened PR #166, which was merged.
   approve and Implementing is held with the condition visible in
   `kubectl cox describe`.
 
-- [ ] **I94: the delivery PR and commit carry no description**
+- [x] **I94: the delivery PR and commit carry no description** (407cbf8, #174)
 
   **Where:** `runner/phase.go:892` (`git commit -m "coxswain: implement"`);
   the deliver push script in `internal/controller/loop_deliver_job.go`
@@ -213,7 +213,7 @@ opened PR #166, which was merged.
 
 ## P3
 
-- [ ] **I98: "Succeeded" is reported before delivery finishes**
+- [x] **I98: "Succeeded" is reported before delivery finishes** (a84b7c9, #198)
 
   **Where:** Loop `dogfood5-df5`: `phase: Succeeded` while
   `Delivered=False reason=InProgress`.

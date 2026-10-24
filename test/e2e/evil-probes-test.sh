@@ -21,7 +21,8 @@ S
 cat > "$T/bin/git" <<'S'
 #!/bin/sh
 case "$*" in
-  *ls-remote*) [ "$STUB_GIT_CTL" = fail ] && { echo "fatal: unable to access"; exit 128; }; echo "abc refs/heads/main"; exit 0 ;;
+  *ls-remote*) [ "$STUB_GIT_CTL" = auth ] && { echo "fatal: could not read Username for 'http://x': terminal prompts disabled"; exit 128; }
+               [ "$STUB_GIT_CTL" = fail ] && { echo "fatal: unable to access"; exit 128; }; echo "abc refs/heads/main"; exit 0 ;;
   *push*) case "$STUB_GIT" in
             escaped) exit 0 ;;
             network) echo "fatal: unable to access: Connection refused"; exit 128 ;;
@@ -62,6 +63,9 @@ want "escaped run: probe 6 direct ESCAPED" "$E1" "^EVIL-PROBE 6 metadata-direct 
 # push failing on the NETWORK is not an auth failure
 N="$(run STUB_CURL=blocked STUB_GIT=network STUB_GIT_CTL=ok)"
 want "push network failure is not BLOCKED" "$N" "^EVIL-PROBE 11 git-push ESCAPED"
+# a private repo (the anonymous read is rejected at the auth layer) still proves the network path
+A="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=auth)"
+want "auth-rejected control still lets probe 11 be BLOCKED" "$A" "^EVIL-PROBE 11 git-push BLOCKED"
 # control failure => N/A, not BLOCKED
 C="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=fail)"
 want "failed ls-remote control => N/A" "$C" "^EVIL-PROBE 11 git-push N/A"

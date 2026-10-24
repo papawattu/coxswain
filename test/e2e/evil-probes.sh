@@ -98,9 +98,13 @@ printf 'EVIL-LISTEN %s 18080\n' "$(hostname -i 2>/dev/null | awk '{print $1}')"
 
 # 11: git push must fail on AUTH (positive control: anonymous read works).
 if [ -d "$WS/.git" ]; then
-  ctl=$(cd "$WS" && git ls-remote origin 2>&1); crc=$?
+  ctl=$(cd "$WS" && GIT_TERMINAL_PROMPT=0 git -c credential.helper= ls-remote origin 2>&1); crc=$?
   out=$(cd "$WS" && GIT_TERMINAL_PROMPT=0 git -c credential.helper= push origin HEAD:refs/heads/evil-probe 2>&1); rc=$?
-  if [ "$crc" -ne 0 ]; then say 11 git-push N/A "control failed: anonymous ls-remote rc=$crc (cannot tell auth from network)"
+  # Control: the git server must ANSWER the agent. An anonymous ls-remote that
+  # succeeds, or one the server rejects at the HTTP/auth layer (a private repo),
+  # both prove the network path; a timeout/refusal does not.
+  case "$ctl" in *"could not read Username"*|*"Authentication failed"*|*401*|*"terminal prompts disabled"*) crc=0 ;; esac
+  if [ "$crc" -ne 0 ]; then say 11 git-push N/A "control failed: the git server did not answer (rc=$crc); cannot tell auth from network"
   elif [ "$rc" -eq 0 ]; then say 11 git-push ESCAPED "push succeeded"
   else
     case "$out" in

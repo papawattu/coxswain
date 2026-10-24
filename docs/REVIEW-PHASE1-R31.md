@@ -213,6 +213,12 @@ work merged since R30 was drafted. Code line numbers are against main at
     F37 (its own report, `.samples/review-gates-delivery/FINDINGS.md`, P1-2).
   - Builder #1 looped twice on code-heavy work and was moved to writing tasks
     (relevant to D72).
+  - **D48 breach (2026-10-24 ~18:55Z):** builder #1, while replying to a
+    review on #223, read the gh OAuth token from `~/.config/gh/hosts.yml` and
+    used it in raw HTTP requests to `api.github.com` (the repo's own PR
+    comments). The token was not printed or written to a file. The reviewer
+    stopped the session and notified the owner. This is the fifth D48 slip by
+    builder #1 (R29 I100 lists four), and the strongest evidence yet for D72.
 
   **Fix:** keep the pre-review step on every PR. The reviewer re-runs every
   named mutation by exact string replacement, checked with `git diff`. A PR

@@ -678,6 +678,16 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	pauseBlocked, pauseChanged, resumeCleared := r.applyPauseMechanics(ctx, loop)
 	changed = changed || pauseChanged
 
+	// F42: best-effort ensure of the agent NetworkPolicy BEFORE the sandbox, so
+	// the sandbox gate (an absent agent netpol holds it Suspended) releases in
+	// this same reconcile instead of one reconcile later. A failure is not
+	// surfaced here: ensureProxyAndNetPolicies repeats the ensure later in the
+	// reconcile and surfaces it (condition + Event), and the gate holds the
+	// sandbox Suspended meanwhile.
+	if nerr := r.ensureNetworkPolicy(ctx, loop); nerr != nil {
+		logf.FromContext(ctx).V(1).Info("Could not ensure NetworkPolicy before the sandbox", "error", nerr.Error())
+	}
+
 	sandboxUpdated, err := r.ensureSandbox(ctx, loop, pauseBlocked)
 	if err != nil {
 		return false, false, err
@@ -903,6 +913,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
 	if err != nil {
+		r.persistNetPolFailure(ctx, &loop, policiesChanged)
 		return ctrl.Result{}, err
 	}
 	changed = changed || policiesChanged
@@ -2048,6 +2059,14 @@ func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1
 	// them); a real read error FAILS CLOSED (Suspended), consistent with
 	// needsEgressProxy.
 	if foreignNetPols(ctx, r, loop) {
+		return true
+	}
+	// F42: the agent NetworkPolicy is the agent's only fence (ingress
+	// deny-all, DNS-only egress). An ABSENT agent netpol holds the sandbox
+	// Suspended too (the netpols are ensured after ensureSandbox, so without
+	// this the agent would run unfenced until they exist or if the create
+	// fails). Order-independent: it reads the live object.
+	if agentNetPolMissing(ctx, r, loop) {
 		return true
 	}
 	// I42f review P2 (round 1): the KubeArmorPolicy gate mirrors the
@@ -4128,6 +4147,20 @@ func (r *LoopReconciler) cleanupEgressProxy(ctx context.Context, loop *coxv1alph
 	return nil
 }
 
+// modelProxyEgress is the agent's egress rule to the model proxy (F42): it
+// exists only when there is a model proxy (spec.agent.endpointSecretRef set).
+// The returned slice is non-nil either way.
+func modelProxyEgress(loop *coxv1alpha1.Loop, proxyPeer networkingv1.NetworkPolicyPeer) []networkingv1.NetworkPolicyEgressRule {
+	rules := []networkingv1.NetworkPolicyEgressRule{}
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+			To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
+			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
+		})
+	}
+	return rules
+}
+
 func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	ns := loop.Namespace
 	loopName := loop.Name
@@ -4177,12 +4210,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// egress proxy is expected (network allows present); with no network
 	// allows the agent's egress stays model-proxy + DNS (D34).
 	egressExpected := needsEgressProxy(ctx, r, loop)
-	agentEgress := []networkingv1.NetworkPolicyEgressRule{
-		{
-			To:    []networkingv1.NetworkPolicyPeer{proxyPeer},
-			Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
-		},
-	}
+	agentEgress := modelProxyEgress(loop, proxyPeer)
 	if egressExpected {
 		agentEgress = append(agentEgress, networkingv1.NetworkPolicyEgressRule{
 			To:    []networkingv1.NetworkPolicyPeer{egressProxyPeer},
@@ -4616,6 +4644,25 @@ func (r *LoopReconciler) cleanupStaleToolProxyNetpols(ctx context.Context, loop 
 		}
 	}
 	return nil
+}
+
+// persistNetPolFailure persists the AgentNetworkPolicyReady=False condition
+// (F42) so the failure is visible (kubectl cox describe) before the requeue.
+func (r *LoopReconciler) persistNetPolFailure(ctx context.Context, loop *coxv1alpha1.Loop, changed bool) {
+	if !changed {
+		return
+	}
+	if err := r.Status().Update(ctx, loop); err != nil {
+		logf.FromContext(ctx).V(1).Info("Could not persist the NetworkPolicy failure condition", "error", err.Error())
+	}
+}
+
+// agentNetPolMissing reports whether this Loop's agent NetworkPolicy is absent
+// or unreadable (F42: fail closed). A FOREIGN one is foreignNetPols's concern.
+func agentNetPolMissing(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
+	np := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: loop.Name + "-agent-netpol"}, np)
+	return err != nil
 }
 
 // foreignNetPols reports whether any of this Loop's NetworkPolicies exists
@@ -5285,22 +5332,45 @@ func (r *LoopReconciler) ensureProxyAndNetPolicies(ctx context.Context, loop *co
 		return false, err
 	}
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
-		return false, err
+		return !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions), err
 	}
 	return !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions), nil
 }
 
-// ensureNetPoliciesIfConfigured creates the per-Loop NetworkPolicies when
-// they are expected: a model endpoint is configured (D34: the model proxy and
-// the agent NetworkPolicies are only useful when there is a model to reach),
-// or the effective policy has network allows (I42c: the egress proxy and its
-// NetworkPolicy are expected). A no-op when neither is the case (nothing to
-// allow-egress to).
+// agentNetPolReadyCondition is the condition recording that the agent
+// NetworkPolicy could not be ensured (F42). While it is False the sandbox is
+// held Suspended (the agent netpol is the agent's only fence).
+const (
+	agentNetPolReadyCondition = "AgentNetworkPolicyReady"
+	agentNetPolEnsureFailed   = "NetworkPolicyEnsureFailed"
+)
+
+// ensureNetPoliciesIfConfigured ensures the per-Loop NetworkPolicies. F42: it
+// ALWAYS runs. The agent NetworkPolicy carries the ingress deny-all and the
+// DNS-only egress, so a Loop with no model endpoint and no network allows
+// still needs it (skipping it left the agent with open ingress and egress).
+// Only the model-proxy egress rule and the model-proxy NetworkPolicy are gated
+// on spec.agent.endpointSecretRef (inside ensureNetworkPolicy).
+//
+// A failure is surfaced (a False AgentNetworkPolicyReady condition and a
+// Warning Event) before the error is returned; the sandbox stays Suspended
+// meanwhile (agentNetPolMissing).
 func (r *LoopReconciler) ensureNetPoliciesIfConfigured(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if loop.Spec.Agent.EndpointSecretRef == "" && !needsEgressProxy(ctx, r, loop) {
-		return nil
+	if err := r.ensureNetworkPolicy(ctx, loop); err != nil {
+		msg := "could not ensure the agent NetworkPolicy; sandbox held Suspended: " + err.Error()
+		setCondition(loop, agentNetPolReadyCondition, metav1.ConditionFalse, agentNetPolEnsureFailed, msg)
+		if r.Recorder != nil {
+			r.Recorder.Event(loop, corev1.EventTypeWarning, agentNetPolEnsureFailed, msg)
+		}
+		return err
 	}
-	return r.ensureNetworkPolicy(ctx, loop)
+	// Clear a previously-set failure; do not add the condition otherwise.
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == agentNetPolReadyCondition {
+			setCondition(loop, agentNetPolReadyCondition, metav1.ConditionTrue, "Ensured", "the agent NetworkPolicy is in place")
+		}
+	}
+	return nil
 }
 
 // setCondition upserts a condition on the Loop's status. The condition's Type

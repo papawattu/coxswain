@@ -350,9 +350,11 @@ run without memory (no lessons seeded from prior Loops) while its new memory
 PVC binds. This is harmless: there are no prior lessons to seed yet, so the
 agent starts with an empty memory. Once the PVC binds (the `local-shared`
 class provisions it on the first request), subsequent Loops on the same repo
-read the accumulated lessons. The `MemoryPVCUnbound` condition (visible via
-`kubectl cox describe <loop>`) flags the binding wait; it clears automatically
-once the PVC is Bound.
+read the accumulated lessons. A one-shot Warning Event `MemoryPVCUnbound`
+(listable via `kubectl get events`) flags the binding wait: the operator emits
+it at most once per Loop. It is recorded on the Loop with the
+`coxswain.io/memory-pvc-unbound-notified` annotation and is re-emitted only if
+that annotation is cleared while the PVC is still unbound.
 
 ## Reading Loop status
 

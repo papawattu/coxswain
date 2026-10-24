@@ -137,3 +137,61 @@ command printed nothing; the live and non-tool netpols were untouched.
 
 A fresh install is unaffected (every tool netpol is created labelled from
 the start).
+
+## Upgrading from v0.1.2
+
+The following changes landed after v0.1.2. Each entry says what changed and
+what you must DO (or why there is nothing to do).
+
+### The operator's ClusterRole gained a serviceaccounts rule
+
+The ClusterRole now includes `serviceaccounts` (create, get, list, watch)
+(F29, PR #199). A standard `kubectl apply -f dist/install.yaml` picks it up
+automatically; there is nothing to do. If your RBAC is managed separately
+(not via `install.yaml`), apply the new rule to your ClusterRole.
+
+### `spec.workspace.restoreFrom` is now immutable
+
+`restoreFrom` is immutable (F35, PR #215). Changing it on an existing Loop
+is now rejected by the API server; there is nothing to do. A different
+rollback target is a fork, not a re-task of the same Loop.
+
+### Two new manager flags
+
+`--memory-storage-class` (P5a, PR #191) sets the StorageClass for the
+per-(namespace, git-URL) memory PVC; empty is the cluster default.
+`--memory-writer-image` (P5b, PR #182) sets the image for the memory-writer
+Job; it must be the operator image, because only the operator image contains
+the `/usr/local/bin/coxswain-memory-write` binary. `config/default`
+(`config/manager/manager.yaml`) passes `--memory-writer-image`; if your
+install is not `config/default`, set it. Set `--memory-storage-class` to a
+ReadWriteMany-capable class if your cluster's default StorageClass does not
+support ReadWriteMany.
+
+### The agent NetworkPolicy is always created
+
+The operator now always creates the `<loop>-agent-netpol` NetworkPolicy,
+even when `spec.agent.endpointSecretRef` is empty and the policy has no
+network allows (F42, PR #213). Before this change, such a Loop's agent ran
+with no ingress or egress restrictions. After the upgrade, the agent netpol
+carries deny-all ingress and DNS-only egress. On upgrade, existing Loops
+that previously ran with an open network are held `Suspended` until the
+first reconcile creates and confirms the netpol. There is nothing to do;
+the operator creates it on the first reconcile post-upgrade.
+
+### The sandbox waits for the egress proxy for the init clone
+
+For a Loop with an external repo and no base commit, the sandbox is held
+`Suspended` until the egress proxy pod is `Ready` (F55, PR #220). Before
+this change, such a Loop could start before the proxy was ready and the
+init clone would fail. On upgrade, such a Loop may briefly be held
+`Suspended` if the proxy is not yet ready. There is nothing to do.
+
+### Memory lesson cap
+
+The memory-writer Job keeps at most 100 lessons per memory PVC, evicting the
+oldest by mtime on the next write (F32, PR #233). An existing PVC with more
+than 100 lessons is trimmed on the next memory-writer run. The memory reader
+also now stops adding whole files at its 16 KiB section cap instead of
+silently dropping the whole memory section past that size. There is nothing
+to do.

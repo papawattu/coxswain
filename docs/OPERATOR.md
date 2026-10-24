@@ -373,8 +373,10 @@ kubectl cox memory delete <repo-url> -n <namespace>
 ```
 
 `delete` refuses while any Loop on that repo in the namespace is not
-`Succeeded` or `Failed` (including `Paused` and one with no phase yet), and
-names the Loops. Otherwise it deletes the PVC. A repo with no PVC prints a note.
+`Succeeded` or `Failed` (including `Paused` and one with no phase yet), or is
+`Succeeded` / `Failed:Stalled` but has no `MemoryWriteDone` condition yet (its
+memory writer Job starts after the terminal phase and would lose its lessons),
+and names the Loops. Otherwise it deletes the PVC. A repo with no PVC prints a note.
 The next Loop on the repo creates a fresh, empty PVC. (`kubectl delete pvc
 memory-<hash>` also works, but has no Loop check.)
 

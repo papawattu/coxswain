@@ -684,9 +684,7 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	// surfaced here: ensureProxyAndNetPolicies repeats the ensure later in the
 	// reconcile and surfaces it (condition + Event), and the gate holds the
 	// sandbox Suspended meanwhile.
-	if nerr := r.ensureNetworkPolicy(ctx, loop); nerr != nil {
-		logf.FromContext(ctx).V(1).Info("Could not ensure NetworkPolicy before the sandbox", "error", nerr.Error())
-	}
+	r.ensureAgentNetPolBeforeSandbox(ctx, loop)
 
 	sandboxUpdated, err := r.ensureSandbox(ctx, loop, pauseBlocked)
 	if err != nil {
@@ -2035,7 +2033,11 @@ func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1
 	// effective policy has network allows. Same gate pattern as D35a. Fails
 	// closed: a transient error reading the AgentPolicies holds the sandbox
 	// Suspended (reconcile requeues), never skips the gate.
-	if needsEgressProxy(ctx, r, loop) {
+	// F55 (1): the agent netpol routes the workspace-init clone of an external
+	// repo through the egress proxy even with no network allows (F42), and
+	// ensureEgressProxy creates the proxy for that shape, so the gate must wait
+	// for it too or the first clone gets connection refused.
+	if needsEgressProxy(ctx, r, loop) || r.workspaceInitNeedsProxy(loop) {
 		egPod := &corev1.Pod{}
 		errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod)
 		if errE != nil || !metav1.IsControlledBy(egPod, loop) || !isPodReady(egPod) {
@@ -4659,10 +4661,40 @@ func (r *LoopReconciler) persistNetPolFailure(ctx context.Context, loop *coxv1al
 
 // agentNetPolMissing reports whether this Loop's agent NetworkPolicy is absent
 // or unreadable (F42: fail closed). A FOREIGN one is foreignNetPols's concern.
+//
+// F55 (2): the cache is allowed to say "present" but not "absent". A netpol
+// the operator created a moment ago may not be in the informer yet, and a
+// false "absent" flips a Running sandbox to Suspended (stopping in-flight
+// work), so an absent/error from the cache is confirmed with the uncached
+// apiReader before the gate holds.
 func agentNetPolMissing(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
 	np := &networkingv1.NetworkPolicy{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: loop.Name + "-agent-netpol"}, np)
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: loop.Name + "-agent-netpol"}
+	err := r.Get(ctx, key, np)
+	if err != nil && r.apiReader != nil {
+		err = r.apiReader.Get(ctx, key, np)
+	}
 	return err != nil
+}
+
+// ensureAgentNetPolBeforeSandbox is the F42 early ensure. When the netpol was
+// absent and the Loop's sandbox already exists (an upgrade of a pre-F42
+// Loop), it emits one Normal Event once the netpol is created: the fence now
+// applies to a running pod (F55 (2b)).
+func (r *LoopReconciler) ensureAgentNetPolBeforeSandbox(ctx context.Context, loop *coxv1alpha1.Loop) {
+	wasMissing := agentNetPolMissing(ctx, r, loop)
+	if nerr := r.ensureNetworkPolicy(ctx, loop); nerr != nil {
+		logf.FromContext(ctx).V(1).Info("Could not ensure NetworkPolicy before the sandbox", "error", nerr.Error())
+		return
+	}
+	if !wasMissing || r.Recorder == nil {
+		return
+	}
+	sb := &sandboxv1beta1.Sandbox{}
+	if r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sb) == nil {
+		r.Recorder.Event(loop, corev1.EventTypeNormal, "AgentEgressFenced",
+			"The agent NetworkPolicy now applies to this Loop's running sandbox: agent egress is now fenced to DNS and the proxies")
+	}
 }
 
 // foreignNetPols reports whether any of this Loop's NetworkPolicies exists

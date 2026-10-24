@@ -113,9 +113,15 @@ default and candidate solid external implementations (R15:114-128):
 | Checks / evals | run a command in an isolated verify pod and report pass/fail (today's verify); eval = a list of such runs | ai-native-sdlc evals, custom suites |
 | Deliver | open a PR (the SDLC case) or write an artifact | Argo CD/Flux for deploys, object stores, ticket systems |
 | Maintain / monitoring | a webhook that turns an alert into a new Loop | Prometheus/Alertmanager with bands |
-| Views | a console over operator-held state (flow graph, run monitor): everything shown comes from operator-held state, agent-supplied text rendered escaped, never as HTML — **not yet built** | the web console in the mockup, or a `kubectl coxswain` TUI (built-in default); a Grafana plugin, a Backstage plugin (R15:237-241) |
+| Views | the web console in the mockup, or a `kubectl coxswain` TUI — **not yet built** | a Grafana plugin, a Backstage plugin (R15:237-241) |
 | Enforcement engine | KubeArmor | Tetragon |
 | Model proxy | the stand-in forwarder | LiteLLM, a vendor gateway |
+
+The contract rules for Views (R15:232-241): the console is read-mostly (its
+only writes are gate approvals and suspend/resume, made as the signed-in
+human), everything shown comes from operator-held state, never from files the
+agent wrote, and agent-supplied text (plans, audit `detail`, memory content)
+is rendered as untrusted data — escaped, never as HTML.
 
 ### The extension contract — the invariants (R15:139-158)
 

@@ -212,8 +212,10 @@ func TestRBACCoverage(t *testing.T) {
 		// client reads it, so the marker needs get;list;watch IN ADDITION TO
 		// create;delete;patch (a create-only marker wedges a fresh install on
 		// the first cached read, exactly like the A6 configmaps P1). The patch
-		// verb is for the fork-retention label (removeForkRetentionLabel
-		// patches the source's VolumeSnapshot).
+		// verb is for the fork-retention label: markForkRetentionLabel and
+		// removeForkRetentionLabel r.Patch (client.MergeFrom) the source's
+		// VolumeSnapshot (F36: they used r.Update, which the role never
+		// granted, so both writes were Forbidden on a real cluster).
 		{group: snapshotGroup, resource: "volumesnapshots",
 			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbPatch}},
 		// VolumeSnapshotClasses: the checkpoint support check reads the

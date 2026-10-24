@@ -97,6 +97,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -439,6 +440,11 @@ func (r *LoopReconciler) deleteWorkspacePVC(ctx context.Context, loop *coxv1alph
 // from the snapshot either way). The restored PVC is controller-owned by
 // the Loop (the same GC contract as the original PVC — a deleted Loop's
 // restored PVC is garbage-collected with it).
+// errWorkspacePVCTerminating is returned by createWorkspacePVCFromSnapshot when
+// the name is still held by a Terminating PVC: the restore is not complete and
+// must wait for the PVC to be fully gone (F36).
+var errWorkspacePVCTerminating = errors.New("the old workspace PVC is still Terminating")
+
 func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loop *coxv1alpha1.Loop, snapshotName string) error {
 	newPVC := &corev1.PersistentVolumeClaim{}
 	newPVC.Spec = workspacePVCSpec(loop).Spec
@@ -455,7 +461,15 @@ func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loo
 	}
 	if err := r.Create(ctx, newPVC); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			return nil // a concurrent pass created it
+			// A concurrent pass created it: success. But a Terminating PVC
+			// still owns the name (workspacePVCPresent reports it as absent):
+			// that is NOT a restored PVC (F36 P2-1: it was reported Restored,
+			// and once it finished deleting nothing re-triggered the restore).
+			existing := &corev1.PersistentVolumeClaim{}
+			if gerr := r.Get(ctx, client.ObjectKeyFromObject(newPVC), existing); gerr == nil && existing.DeletionTimestamp != nil {
+				return errWorkspacePVCTerminating
+			}
+			return nil
 		}
 		// F10: a Forbidden create (a terminating namespace rejects it) is NOT a
 		// real failure for the B2 restore: the namespace is going away and the
@@ -715,6 +729,7 @@ func (r *LoopReconciler) emitRestoreEvent(loop *coxv1alpha1.Loop, status bool, r
 func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget, persist func()) (bool, bool, bool, error) {
 	pvc := &corev1.PersistentVolumeClaim{}
 	pvcErr := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
+	restored := false
 	if pvcErr == nil {
 		// The PVC is still present (even if Terminating). Stop the sandbox
 		// first (the sandbox pod carries the loop label and mounts the
@@ -741,8 +756,18 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 			persist()
 			return true, true, true, nil
 		}
+		// F36 (P2-2): actually DELETE it. This branch only announced the
+		// delete, so a fork or lost-PVC restore whose own PVC was present
+		// could never complete. The delete is idempotent (a Terminating PVC is
+		// a no-op) and async: the PVC is recreated from the snapshot once it
+		// is gone.
+		if err := r.deleteWorkspacePVC(ctx, loop); err != nil {
+			log.FromContext(ctx).Error(err, "the restore could not delete the workspace PVC; no decision on a transient failure",
+				"loop", loop.Name)
+			return false, true, true, nil
+		}
 		r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
-			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still present (being deleted); waiting for it to be fully gone before creating the new one")
+			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is being deleted; waiting for it to be fully gone before creating the new one")
 		persist()
 		return true, true, true, nil
 	}
@@ -751,7 +776,16 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 		return false, true, true, nil
 	}
 	// The PVC is fully gone (NotFound). Create it from the snapshot.
+	if r.markForkRetentionBeforeCreate(ctx, loop, target) {
+		defer r.unmarkForkRetentionOnFailure(ctx, loop, target, &restored)
+	}
 	if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
+		if errors.Is(err, errWorkspacePVCTerminating) {
+			r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still Terminating; waiting for it to be fully gone before creating the new one")
+			persist()
+			return true, true, true, nil
+		}
 		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
 			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())
 		persist()
@@ -761,9 +795,7 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	}
 	setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 		"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
-	if target.kind == b2KindFork {
-		r.markForkRetentionLabel(ctx, loop, target.snapshot)
-	}
+	restored = true
 	persist()
 	r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
 		"workspace PVC restored from "+target.snapshot)
@@ -827,6 +859,12 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			// the delete has completed): skip to the create (the delete is done,
 			// the PVC is recreated from the snapshot).
 			if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
+				if errors.Is(err, errWorkspacePVCTerminating) {
+					r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+						"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still Terminating; waiting for it to be fully gone before creating the new one")
+					persist()
+					return true, true, true, nil
+				}
 				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
 					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+") failed: "+err.Error())
 				persist()
@@ -995,9 +1033,9 @@ const forkSnapshotLabelKey = forkRetainedSnapshotLabelKey
 // not the snapshot's to keep serving); the label's persistence is a known
 // B2 limitation (a snapshot the source's GC skips forever), documented in
 // gcLoopCheckpoints.
-func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1alpha1.Loop, snapshotName string) {
+func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1alpha1.Loop, snapshotName string) bool {
 	if !r.snapshotCRDPresentCall(ctx) {
-		return // no CRD: the snapshot is not present
+		return false // no CRD: the snapshot is not present
 	}
 	snap := &unstructured.Unstructured{Object: map[string]any{unstructuredAPI: snapshotGV, unstructuredKind: volumeSnapshotKind}}
 	snap.SetGroupVersionKind(volumeSnapshotGVK)
@@ -1005,18 +1043,54 @@ func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1
 	if err := r.Get(ctx, key, snap); err != nil {
 		log.FromContext(ctx).V(1).Info("fork: the source snapshot is absent; the fork-retention label could not be set (best-effort)",
 			"snapshot", snapshotName, "fork", fork.Name)
-		return
+		return false
 	}
+	orig := snap.DeepCopy()
 	labels := snap.GetLabels()
 	if labels == nil {
 		labels = map[string]string{}
 	}
 	labels[forkSnapshotLabelKey] = fork.Name
 	snap.SetLabels(labels)
-	if err := r.Update(ctx, snap); err != nil {
-		log.FromContext(ctx).V(1).Info("fork: setting the fork-retention label on the source's snapshot failed; the label persists (a known B2 limitation; the fork's PVC is self-sufficient)",
-			"snapshot", snapshotName, "fork", fork.Name, "err", err.Error())
+	// F36 (P1-2): PATCH, not Update: the operator's role grants only `patch`
+	// on volumesnapshots, so Update was Forbidden on every real cluster. A
+	// failure is surfaced as a Warning Event (it was swallowed at V(1)).
+	if err := r.Patch(ctx, snap, client.MergeFrom(orig)); err != nil {
+		r.warnForkRetention(fork, "ForkRetentionLabelFailed",
+			"setting the fork-retention label on snapshot "+snapshotName+" failed ("+err.Error()+"); the source's GC may delete it while the fork restores")
+		return false
 	}
+	return true
+}
+
+// warnForkRetention emits a Warning Event for a failed fork-retention label
+// write (F36: never a silent V(1) log).
+func (r *LoopReconciler) warnForkRetention(fork *coxv1alpha1.Loop, reason, msg string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(fork, corev1.EventTypeWarning, reason, msg)
+	}
+}
+
+// markForkRetentionBeforeCreate writes the fork-retention label BEFORE the
+// fork's PVC is created (F36 P3-3: labelling after the create closed nothing:
+// a source GC between the snapshot read and the create left the fork's PVC
+// Pending on a deleted dataSource). It reports whether the label was written
+// (only for forks). The caller removes it again if the create fails.
+func (r *LoopReconciler) markForkRetentionBeforeCreate(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget) bool {
+	if target.kind != b2KindFork {
+		return false
+	}
+	return r.markForkRetentionLabel(ctx, loop, target.snapshot)
+}
+
+// unmarkForkRetentionOnFailure removes the label written before the create
+// when the restore did not complete (the create failed or the old PVC is still
+// terminating); the next pass writes it again.
+func (r *LoopReconciler) unmarkForkRetentionOnFailure(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget, restored *bool) {
+	if *restored || target.kind != b2KindFork {
+		return
+	}
+	r.removeForkRetentionLabel(ctx, loop)
 }
 
 // removeForkRetentionLabel removes the fork-retention label from the source
@@ -1048,10 +1122,11 @@ func (r *LoopReconciler) removeForkRetentionLabel(ctx context.Context, fork *cox
 		return // the label is absent (a no-op: it was never set, or it was
 		// already removed)
 	}
+	orig := snap.DeepCopy()
 	delete(labels, forkSnapshotLabelKey)
 	snap.SetLabels(labels)
-	if err := r.Update(ctx, snap); err != nil {
-		log.FromContext(ctx).V(1).Info("fork: removing the fork-retention label from the source's snapshot failed; the label persists (a known B2 limitation; the fork's PVC is self-sufficient)",
-			"snapshot", snapName, "fork", fork.Name, "err", err.Error())
+	if err := r.Patch(ctx, snap, client.MergeFrom(orig)); err != nil {
+		r.warnForkRetention(fork, "ForkRetentionLabelRemoveFailed",
+			"removing the fork-retention label from snapshot "+snapName+" failed ("+err.Error()+"); the label persists and the source's GC skips the snapshot (a known B2 limitation)")
 	}
 }

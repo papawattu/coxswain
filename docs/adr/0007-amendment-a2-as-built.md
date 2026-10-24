@@ -43,23 +43,24 @@ disambiguates if the effective policy changed mid-iteration." The record is
 `target`, `verdict`, `detail`), `Source = "egress-proxy"` (`:30`).
 
 The other two producers in the tree omit it as well: the tool proxy's
-`AuditRecord` (`internal/toolproxy/audit.go:7-18`, `Source = "tool-proxy"`
-`:21`) has tool-level fields and no iteration, and the model proxy's audit
+`AuditRecord` (`internal/toolproxy/audit.go:9-20`, `Source = "tool-proxy"`
+`:23`) has tool-level fields and no iteration, and the model proxy's audit
 line is a map literal with no iteration (`internal/proxy/proxy.go:257-268`:
 `time, loop, namespace, source, action, model, promptTokens,
-completionTokens, status, usagePresent`). `grep -rn 'json:"iteration"'
-internal/` has exactly **one** hit, `internal/controller/loop_s4_phase.go:115`
-— the phase claim's field, not an audit record.
+completionTokens, status, usagePresent`).
+`git grep -n 'json:"iteration' origin/main -- internal/` has exactly **one**
+hit, `internal/controller/loop_s4_phase.go:115` — the phase claim's field,
+not an audit record.
 
 There is also no relay to fill the field: `git ls-tree --name-only origin/main
 cmd/` is `cox`, `egress-proxy`, `kubectl-cox`, `main.go`, `memory-writer`,
 `model-proxy`, `proxy-standin`, `runner`, `tool-proxy` — no relay binary — and
 `internal/` has no relay package.
 
-**Decision now recorded:** the Q4 envelope as built has no `iteration`. Two
-of the three sources cannot carry it (the proxies' env is immutable and they
-do not read Loop status), and the joiner that would add it is not built (that
-absence is I107 row 23, a build row, not this one). The correlation handles
+**Decision now recorded:** the Q4 envelope as built has no `iteration`. All
+three sources cannot carry it (the proxies are long-lived pods whose env is
+immutable and which do not read Loop status), and the joiner that would add it
+is not built (that absence is I107 row 23, a build row, not this one). The correlation handles
 that exist today are `loop`/`namespace` on every record and the
 effective-policy hash in `detail`
 (`internal/egress/audit.go:15-16`, the same hash as
@@ -215,8 +216,8 @@ and flip the gate back to Suspended if that node no longer satisfies the
 facts (e.g. the agent pod was deleted, the BPF-LSM label was removed)."
 
 **What was built:** nothing reads the sandbox pod's `spec.nodeName`.
-`grep -rn 'Spec.NodeName' internal/` (non-test) has one hit,
-`internal/engine/kubearmor_enforcer.go:578`, and it selects **KubeArmor
+`git grep -n 'Spec.NodeName' origin/main -- internal/ ':!*_test.go'` has one
+hit, `internal/engine/kubearmor_enforcer.go:578`, and it selects **KubeArmor
 agent** pods on a given node inside the agent-pod lister
 (`listAgentPods`, `:562`) — not the sandbox pod. The static check reads the
 nodes that **currently** carry the BPF-LSM label (`:367-374`) and requires a

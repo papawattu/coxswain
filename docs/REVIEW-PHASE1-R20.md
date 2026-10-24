@@ -27,7 +27,7 @@ blocks the MVP; I46 and I49 should land before the delivery slice.
 - [x] Owner decision (2026-10-03): **(c)**. No exec fencing for agents in the
   MVP. Rely on the network fence, credential isolation and the verify Job.
   Exec fencing stays for the proxies; D41 per-tool proxies come later.
-- [ ] Implemented (the Acceptance below)
+- [x] Implemented (the Acceptance below) (89f67ad, #69)
 
 **Where:** `AgentPolicy.spec.exec` (`api/v1alpha1/agentpolicy_types.go`) and
 its KubeArmor translation. Related to D41 (tools on AgentPolicy).

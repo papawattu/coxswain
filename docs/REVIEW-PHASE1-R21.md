@@ -130,7 +130,7 @@ These cases must FAIL on a5cec25.
 
 ### I54. No live GitHub delivery yet
 
-- [ ] Open (blocked on the owner action below)
+- [x] Open (blocked on the owner action below) (owner live run, recorded in REVIEW-PHASE1-R24.md:19)
 
 **Where:** S6's GitHub path, covered today only by:
 - the httptest fake-GitHub provider test (draft PR, Bearer auth, idempotent

@@ -15,7 +15,7 @@ envtest. That is itself the main lesson (see I43).
 
 - [x] Owner decision (2026-10-01): production CNI requirement (question 1 below): **a requirement on the property, plus a preflight check**
 - [x] Owner decision: CNI-independent defence in depth (question 2 below) — decided, see R18
-- [ ] Planned as slices
+- [x] Planned as slices (f02a1fe … e42b953, #42)
 
 **Where:** the per-Loop agent NetworkPolicy (D34, I42c) on kind's default CNI,
 kindnet.

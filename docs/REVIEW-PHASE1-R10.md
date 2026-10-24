@@ -37,7 +37,7 @@ and scratch as `emptyDir`. Two defects break the slice's own goals.
 
 ### I34. `spec.agent.env` can inject Secrets into the agent container
 
-- [ ] Done
+- [x] Done (59bab37)
 
 **Where:** `api/v1alpha1/loop_types.go` `AgentConfig.Env []corev1.EnvVar`;
 `ensureSandbox` (`Env: loop.Spec.Agent.Env`).
@@ -68,7 +68,7 @@ in the namespace through the agent, bypassing whoever owns that Secret.
 
 ### I35. `runAsNonRoot` without a UID breaks the default and README sandbox
 
-- [ ] Done
+- [x] Done (59bab37)
 
 **Where:** `ensureSandbox` — `RunAsNonRoot: true`, no `RunAsUser`/`RunAsGroup`
 / `fsGroup`; default image `docker.io/library/golang:1.26` runs as root.

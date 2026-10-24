@@ -505,6 +505,10 @@ func (r *LoopReconciler) egressProxyEnv(loop *coxv1alpha1.Loop) []corev1.EnvVar 
 	}
 }
 
+// tamperGitErrorExit is the tamper script's exit status when git itself fails
+// (distinct from 1, "a protected path changed").
+const tamperGitErrorExit = 2
+
 // tamperCheckScript builds the tamper init's sh script (B2, F39). It diffs
 // baseCommit..verifiedCommit over the protected globs and exits 1 listing any
 // changed protected path. Two defects fixed in F39:
@@ -534,7 +538,7 @@ cd %s
 # (tampered). Empty => exit 0 (clean). A git failure => exit 2 (fail closed).
 if ! CHANGED=$(git diff --name-only %s %s -- %s); then
   echo "tamper: git diff failed; refusing to report clean"
-  exit 2
+  exit %d
 fi
 if [ -n "$CHANGED" ]; then
   echo "tamper: protected paths changed:"
@@ -543,7 +547,7 @@ if [ -n "$CHANGED" ]; then
 fi
 echo "tamper: clean"
 exit 0
-`, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "))
+`, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit)
 }
 
 // buildVerifyJobSpec builds the verify Job's spec: the init containers in
@@ -1121,6 +1125,12 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool) (int, bool, 
 	tamperStatus := pod.Status.InitContainerStatuses[tamperIdx]
 	if tamperStatus.State.Terminated == nil {
 		return verifyNoDecision, true, "", 0
+	}
+	// F39: exit tamperGitErrorExit means the script's own git diff failed (an
+	// infrastructure fault), not that the agent changed a protected path. It
+	// fails closed as an infra failure, never as TamperedVerify.
+	if tamperStatus.State.Terminated.ExitCode == tamperGitErrorExit {
+		return verifyInfraFailed, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
 	}
 	if tamperStatus.State.Terminated.ExitCode != 0 {
 		return verifyTampered, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode

@@ -17,6 +17,8 @@ package controller
 import (
 	"fmt"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func int32Ptr(v int32) *int32 {
@@ -54,7 +56,9 @@ func TestTamperVerdict(t *testing.T) {
 		{"explicit 0 -> Clean", int32Ptr(0), commitSame, commitSame, TamperClean},
 		// non-zero -> Tampered (terminal), the anti-gaming property.
 		{"non-zero exit -> Tampered", int32Ptr(1), commitSame, commitSame, TamperTampered},
-		{"non-zero exit (code 2) -> Tampered", int32Ptr(2), commitSame, commitSame, TamperTampered},
+		// F39: exit 2 is the script's own git failure (infra), not tampering.
+		{"git-failure exit (2) -> Unknown, not Tampered", int32Ptr(tamperGitErrorExit), commitSame, commitSame, TamperUnknown},
+		{"non-zero exit (code 3) -> Tampered", int32Ptr(3), commitSame, commitSame, TamperTampered},
 		// Stale evidence: the evidence names a different verifiedCommit than the
 		// current one -> treated as nil (Unknown), even if it is a clean 0
 		// (D24.3: evidence from a previous iteration's Job can't be reused).
@@ -106,4 +110,39 @@ func desc(p *int32) string {
 		return "nil"
 	}
 	return fmt.Sprint(*p)
+}
+
+// TestVerifyOutcomeTamperExit (F39): the tamper init's exit code decides the
+// outcome: 1 (a protected path changed) is verifyTampered, the script's own
+// git failure (2) is verifyInfraFailed (fail closed, but not blamed on the
+// agent), and a tamper init that has not terminated is no decision.
+func TestVerifyOutcomeTamperExit(t *testing.T) {
+	pod := func(st corev1.ContainerState) *corev1.Pod {
+		return &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+			{Name: verifyCloneBaseInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}}},
+			{Name: verifyImportAgentInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}}},
+			{Name: verifyTamperInit, State: st},
+		}}}
+	}
+	term := func(c int32) corev1.ContainerState {
+		return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: c}}
+	}
+	cases := []struct {
+		name string
+		st   corev1.ContainerState
+		want int
+	}{
+		{"exit 1 -> tampered", term(1), verifyTampered},
+		{"git failure exit -> infra failed", term(tamperGitErrorExit), verifyInfraFailed},
+		{"running -> no decision", corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, verifyNoDecision},
+		{"waiting -> no decision", corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{}}, verifyNoDecision},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, _, _ := verifyOutcome(pod(tc.st), 1, false)
+			if got != tc.want {
+				t.Errorf("verifyOutcome = %d, want %d", got, tc.want)
+			}
+		})
+	}
 }

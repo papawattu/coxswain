@@ -2315,6 +2315,7 @@ const (
 //	tamperExitCode == nil            -> TamperUnknown (no evidence; NEVER clean)
 //	commit binding missing or stale    -> TamperUnknown (D27: both commits non-empty AND equal)
 //	*exitCode == 0                    -> TamperClean
+//	*exitCode == tamperGitErrorExit   -> TamperUnknown (git failed; infra, not tamper)
 //	*exitCode != 0                    -> TamperTampered (terminal Failed:TamperedVerify)
 //
 
@@ -2337,6 +2338,11 @@ func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string)
 	}
 	if *tamperExitCode == 0 {
 		return TamperClean
+	}
+	// F39: the script's own git failure is not evidence of tampering; it is
+	// fail-closed elsewhere (verifyInfraFailed), never TamperedVerify.
+	if *tamperExitCode == tamperGitErrorExit {
+		return TamperUnknown
 	}
 	return TamperTampered
 }

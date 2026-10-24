@@ -153,4 +153,32 @@ var _ = Describe("F30 memory-write metrics", func() {
 			Expect(f30Read()).To(Equal(before), "pod phase %s", phase)
 		}
 	})
+
+	It("counts a write once when its first status update conflicts", func() {
+		// Hermes-sim finding: the audit Event fired twice and both counters
+		// doubled because a Conflict dropped the in-memory condition after the
+		// bump. The count now follows the persisted status.
+		name := "f30-conflict"
+		ctx := context.Background()
+		r := s6SucceededLessonsAvailable(name, ns)
+		p5bMemoryWriterReconcile(r, ns, name)
+		job := p5bGetMemoryJob(ns, name)
+		p5bFabricateJobPod(ns, job, corev1.PodSucceeded)
+		p5bSetJobPodTerminationMessage(ns, name, f30Summary)
+
+		stale := p5bMustLoop(ns, name)
+		f30Touch(name) // bumps resourceVersion: stale's status update will Conflict
+		before := f30Read()
+		Expect(r.recordMemoryWriterOutcome(ctx, stale, job)).To(BeFalse())
+		err := r.finalizeLoopStatus(ctx, stale, true, true, false, true, "")
+		Expect(err).To(HaveOccurred(), "the stale status update must conflict")
+		Expect(f30Read()).To(Equal(before), "nothing is counted for an unpersisted condition")
+
+		s6Reconcile(r, ns, name) // fresh read: transitions again and persists
+		after := f30Read()
+		Expect(after.written).To(Equal(before.written+1), "counted exactly once")
+		Expect(after.kept).To(Equal(before.kept + 2))
+		s6Reconcile(r, ns, name)
+		Expect(f30Read()).To(Equal(after))
+	})
 })

@@ -743,8 +743,9 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 			memoryWriteAuditMessage(summary))
 		if transitioned {
 			// F30: once per Loop, on the transition only (a re-reconcile of
-			// the already-set condition does not bump).
-			bumpMemoryWriteMetrics("written", summary)
+			// the already-set condition does not bump), counted after the
+			// status update persists it.
+			r.notePendingMemoryMetric(loop, "written", summary)
 			if r.Recorder != nil {
 				r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
 					"memory write audit: %s", memoryWriteAuditText(summary))
@@ -765,7 +766,7 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 			msg = "memory write failed (the Job hit its activeDeadlineSeconds deadline — the pod never became terminal; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
 		}
 		if setMemoryWriterCondition(loop, memoryWriteFailedReason, msg) {
-			bumpMemoryWriteMetrics("failed", "") // F30: once, on the transition.
+			r.notePendingMemoryMetric(loop, "failed", "") // F30: once, after persist.
 		}
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
@@ -891,6 +892,25 @@ func memoryWriterSummary(pod *corev1.Pod) string {
 		}
 	}
 	return ""
+}
+
+type pendingMemoryWrite struct{ outcome, summary string }
+
+// notePendingMemoryMetric records the outcome to count once the Loop's status
+// update persists MemoryWriteDone (see flushPendingMemoryMetric).
+func (r *LoopReconciler) notePendingMemoryMetric(loop *coxv1alpha1.Loop, outcome, summary string) {
+	r.pendingMemoryMetric.Store(client.ObjectKeyFromObject(loop), pendingMemoryWrite{outcome, summary})
+}
+
+// flushPendingMemoryMetric counts the noted outcome, if any, and forgets it.
+// Called only after the status update succeeded: a failed update (Conflict)
+// drops the in-memory condition, so the next reconcile re-transitions and
+// re-notes, and the write is counted exactly once.
+func (r *LoopReconciler) flushPendingMemoryMetric(loop *coxv1alpha1.Loop) {
+	if v, ok := r.pendingMemoryMetric.LoadAndDelete(client.ObjectKeyFromObject(loop)); ok {
+		p := v.(pendingMemoryWrite)
+		bumpMemoryWriteMetrics(p.outcome, p.summary)
+	}
 }
 
 // bumpMemoryWriteMetrics records one memory-write outcome (F30). The caller

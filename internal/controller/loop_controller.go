@@ -33,6 +33,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"time"
 
@@ -275,6 +276,13 @@ const (
 type LoopReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// pendingMemoryMetric (F30) holds a memory-write outcome noted when
+	// MemoryWriteDone is set in memory, keyed by namespace/name. It is
+	// counted only after the status update persists the condition
+	// (finalizeLoopStatus), so a Conflict that drops the in-memory condition
+	// cannot count the same write twice. A re-note overwrites (never appends).
+	pendingMemoryMetric sync.Map
 
 	// RESTMapper is the manager's dynamic RESTMapper (SetupWithManager wires
 	// mgr.GetRESTMapper()). It is the source of truth for "is the CRD for
@@ -1067,6 +1075,8 @@ func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alph
 		if advancedFrom != "" {
 			r.emitPhaseAdvancedEvent(loop, advancedFrom)
 		}
+		// F30: count the memory write only now that its condition is durable.
+		r.flushPendingMemoryMetric(loop)
 	}
 	// P2f: after a valid resume, patch the coxswain.io/resume annotation off
 	// (AFTER the status write so the two Loop writes never race — the I52

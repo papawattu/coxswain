@@ -19,7 +19,7 @@
 #
 # Watch it:
 #   kubectl cox describe loop-fix-failing-test
-#   kubectl cox logs loop-fix-failing-test agent
+#   kubectl cox logs loop-fix-failing-test --component agent
 #
 # Expected outcome (with a working model backend):
 #   Planning -> Implementing -> Verifying -> Succeeded

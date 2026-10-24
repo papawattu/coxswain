@@ -42,11 +42,17 @@ spec:
     preset: go
     protectedPaths:
       - test/smoke.sh
-    # The image the verify Job runs the checks in. NOTE: test/smoke.sh picks
-    # its free port with python3 (test/smoke.sh:21); a golang-only image has
-    # no python3, so the script falls back to a RANDOM port there. Use an
+    # The image the verify Job runs the checks in. Note this check only
+    # applies when the workspace is the seeded webapi sample repo
+    # (samples/webapi.git — see the commented dev-cluster values below),
+    # where test/smoke.sh picks its free port with python3
+    # (examples/webapi/test/smoke.sh:21); a golang-only image has no
+    # python3, so the script falls back to a RANDOM port there. Use an
     # image that carries python3 (e.g. a python:go build image) for the
-    # reliable path — the golang value below works via the RANDOM fallback.
+    # reliable path — the golang value below works via the RANDOM
+    # fallback in that repo. The default workspace (papawattu/coxswain at
+    # main) has no test/smoke.sh, so the check cannot run there; see the
+    # "Replace with your own repo" note above the repo field.
     image: docker.io/library/golang:1.26
   agent:
   loop:

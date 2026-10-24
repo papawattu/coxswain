@@ -7,7 +7,8 @@ isolated Job) — rows 2, 4, 8, 9, 10, 11 and 14 of
 `docs/REVIEW-PHASE1-R31.md` (I107) and the corrections table
 (`.samples/r31-adr-corrections.md`).
 **Supersedes:** the ADR-0005 rows quoted below. The original ADR is a decision
-record and is not edited; this amendment records what was built. Row 2's
+record and is not edited; this amendment records what was built. **Code line numbers:** as of `6eb74c2` (main on 2026-10-24); later merges may
+move them; the function names are the stable anchor. Row 2's
 shared ADR-0004 side is recorded in ADR-0004 Amendment A1.
 
 ## Context

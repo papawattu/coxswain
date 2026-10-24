@@ -145,12 +145,12 @@ var _ = Describe("I74: the sandbox is stopped once the Loop is terminal (Succeed
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 	}
 
-	i74Loop := func(ns, name string, deliveryMode coxv1alpha1.DeliveryMode) {
+	i74LoopRepo := func(ns, name string, deliveryMode coxv1alpha1.DeliveryMode, repo string) {
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: coxv1alpha1.LoopSpec{
 				Goal:      "I74 terminal sandbox spec",
-				Workspace: testWorkspace(),
+				Workspace: coxv1alpha1.Workspace{Repo: repo},
 				Agent: coxv1alpha1.AgentConfig{
 					Image:             runnerImage,
 					Model:             testModel,
@@ -163,6 +163,9 @@ var _ = Describe("I74: the sandbox is stopped once the Loop is terminal (Succeed
 			loop.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: deliveryMode}
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+	}
+	i74Loop := func(ns, name string, deliveryMode coxv1alpha1.DeliveryMode) {
+		i74LoopRepo(ns, name, deliveryMode, testRepoURL)
 	}
 
 	i74Reconcile := func(r *LoopReconciler, ns, name string) {
@@ -262,7 +265,9 @@ var _ = Describe("I74: the sandbox is stopped once the Loop is terminal (Succeed
 		r := newI74Reconciler(record.NewFakeRecorder(64))
 
 		name := "i74d"
-		i74Loop(ns, name, coxv1alpha1.DeliveryModePullRequest)
+		// F55: an EXTERNAL repo on purpose (the shared fixture repo is now
+		// in-cluster so the sandbox gate does not wait for an egress proxy).
+		i74LoopRepo(ns, name, coxv1alpha1.DeliveryModePullRequest, "https://example.com/repo.git")
 		i74PrimeProxy(r, i74GetLoop(ns, name))
 		i74Reconcile(r, ns, name) // bootstrap
 		// I72/I74 interaction: this spec delivers to an external (github.com)

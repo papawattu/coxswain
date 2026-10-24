@@ -9,7 +9,9 @@ AgentPolicy, eBPF enforcement), ADR-0008 (tool proxies as the first
 capability extension)
 **Origin:** `docs/REVIEW-PHASE1-R15.md` D36 — the owner's decision (R15:13,
 "Decided (owner, 2026-09-28): option (d), an extensible core") and the
-decision text (R15:16-49). Line numbers below refer to that file.
+decision text (R15:16-49). Line numbers below refer to that file. R15's
+acceptance text (R15:177, 243) names this record "ADR-0008"; it was
+renumbered to 0010 because ADR-0008 is tool proxies.
 
 ## Context
 
@@ -23,7 +25,7 @@ operator-verified **Test** — while everything around them (stages, gates at
 every handoff, a durable approval ledger, intake, deploy, maintain) is
 missing.
 
-Four options were on the table (R15:98-113): (a) coxswain as a Build/Test
+Four options were on the table (R15:97-114): (a) coxswain as a Build/Test
 engine driven by an external SDLC; (b) the whole lifecycle inside coxswain;
 (c) staged (a)-now-(b)-later; **(d) an extensible core — chosen by the owner**
 (R15:110).
@@ -31,7 +33,7 @@ engine driven by an external SDLC; (b) the whole lifecycle inside coxswain;
 Under (d), coxswain defines an **extension point for every capability in the
 gap table**, and each capability is implemented by a pluggable extension.
 The core keeps what must be trusted: isolation, the evidence gates, and
-ledger integrity. Extensions supply everything else (R15:110-113).
+ledger integrity. Extensions supply everything else (R15:110-114).
 
 ## Decision
 
@@ -85,7 +87,7 @@ the core API** (R15:47-49).
 ### Extension points (R15:115-128)
 
 The gap-table capabilities become extension points, each with a built-in
-default and candidate solid external implementations (R15:115-128):
+default and candidate solid external implementations (R15:114-128):
 
 | Extension point | Built-in default (per R15) | Solid externals (per R15) |
 |---|---|---|
@@ -96,8 +98,9 @@ default and candidate solid external implementations (R15:115-128):
 > is **not** the per-repo `.coxswain/memory.md` notes file sketched above
 > (R15:118). It is a **per-(namespace, git URL) PVC** in the Loop's
 > namespace, **`ReadWriteMany`** (copy-in init container as the fallback when
-> the storage class lacks RWX support), read-only into the agent's workspace
-> at `.coxswain/memory/`, and written only by the operator's memory-writer
+> the storage class lacks RWX support), copied read-only at each phase start
+> into the operator-owned `.coxswain/memory/` (not mounted into the agent),
+> and written only by the operator's memory-writer
 > Job after the static screen and the rule-gated Memory Curator
 > (`docs/PLAN.md:80-82`, `docs/PLAN-PHASE5.md` D66). The per-namespace PVC
 > (not a file in the agent's repo) is the shipped default; the R15 sketch is
@@ -110,6 +113,7 @@ default and candidate solid external implementations (R15:115-128):
 | Checks / evals | run a command in an isolated verify pod and report pass/fail (today's verify); eval = a list of such runs | ai-native-sdlc evals, custom suites |
 | Deliver | open a PR (the SDLC case) or write an artifact | Argo CD/Flux for deploys, object stores, ticket systems |
 | Maintain / monitoring | a webhook that turns an alert into a new Loop | Prometheus/Alertmanager with bands |
+| Views | a console over operator-held state (flow graph, run monitor): everything shown comes from operator-held state, agent-supplied text rendered escaped, never as HTML — **not yet built** | the web console in the mockup, or a `kubectl coxswain` TUI (built-in default); a Grafana plugin, a Backstage plugin (R15:237-241) |
 | Enforcement engine | KubeArmor | Tetragon |
 | Model proxy | the stand-in forwarder | LiteLLM, a vendor gateway |
 
@@ -153,8 +157,9 @@ the pattern works."** (Audited against `origin/main` as of
   fail-closed gate driven by it (the comment at
   `internal/engine/enforcer.go:43-50`).
 - **Model proxy.** The per-Loop proxy pod's image is overridable
-  (`internal/controller/loop_controller.go:2622-2629`: the reconciler's
-  `ProxyImage` field / a future `--proxy-image` flag, or the stand-in).
+  (`proxyImage()` in `internal/controller/loop_controller.go`: the
+  reconciler's `ProxyImage` field / a future `--proxy-image` flag, or the
+  stand-in; ~`:2674` on `main` today, line numbers above are as of `04472d5`).
   ADR-0008 (`docs/adr/0008-tool-proxies.md`) generalises the same
   pattern to **tool proxies** — a second, working example of a capability
   extension: a credentialed proxy the agent never holds the secret for,
@@ -211,7 +216,10 @@ rest of the table is the *intended* shape of the core.
   observer and R17 D41–D43 (tool proxies shipped as D41a–D41e; D42 fan-out
   and D43 multi-tenancy remain unplanned). The D37 flow console
   (R15 P2, `docs/REVIEW-PHASE1-R15.md:191-200`) is direction-approved but
-  unplanned. None of this contradicts D36; it sequences it.
+  unplanned.
+- **D37 is recorded here per R15:243 as the "Views" extension point** (with
+  its built-in default in the extension-point table above); its console
+  slices stay unplanned.
 - **The extension contract is the new review bar for any capability.** A
   proposed extension must satisfy the five invariants above (R15:139-158);
   reviewer/PM/CTO-style agents remain advisory-only.
@@ -232,7 +240,7 @@ rest of the table is the *intended* shape of the core.
 
 ## Deferred / open (not decided by D36)
 
-1. **The extension mechanism** (R15 Q4, R15:168-173) — CRDs/webhooks,
+1. **The extension mechanism** (R15 Q4, R15:170-174) — CRDs/webhooks,
    in-process Go interfaces, or both. Owner to confirm.
 2. **The ledger store** (R15 Q2, R15:163-166) — pluggable store with
    core-side verification vs core-owned. Owner to confirm.

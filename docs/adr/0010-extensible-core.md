@@ -90,6 +90,18 @@ default and candidate solid external implementations (R15:115-128):
 | Extension point | Built-in default (per R15) | Solid externals (per R15) |
 |---|---|---|
 | Memory | notes file in the repo (per-repo `.coxswain/memory.md`), read-only to the agent, curated by the operator | Honcho |
+
+> **Shipped default differs from this sketch (D66).** The built-in memory
+> default that actually shipped (Phase 5, complete on `main` at `04472d5`)
+> is **not** the per-repo `.coxswain/memory.md` notes file sketched above
+> (R15:118). It is a **per-(namespace, git URL) PVC** in the Loop's
+> namespace, **`ReadWriteMany`** (copy-in init container as the fallback when
+> the storage class lacks RWX support), read-only into the agent's workspace
+> at `.coxswain/memory/`, and written only by the operator's memory-writer
+> Job after the static screen and the rule-gated Memory Curator
+> (`docs/PLAN.md:80-82`, `docs/PLAN-PHASE5.md` D66). The per-namespace PVC
+> (not a file in the agent's repo) is the shipped default; the R15 sketch is
+> the originally-proposed shape, superseded by D66.
 | Intake | `kubectl apply` a Loop, or a label on a GitHub issue | forms, email, hermes kanban |
 | Workflow definition | a simple linear graph format, shipped with an SDLC example definition | ai-native-sdlc skill, hermes, Argo Workflows |
 | Gate approvers | an annotation or `kubectl coxswain approve` by a human with RBAC | GitHub review, Slack |
@@ -158,10 +170,14 @@ the pattern works."** (Audited against `origin/main` as of
   pass/fail (today's verify)" is exactly the S3/B3 verify Job — the built-in
   default exists; the *extension contract* (a generic check/eval surface)
   does not, yet.
-- **Memory.** Phase 5 (shared memory + Memory Curator,
-  `docs/PLAN-PHASE5.md:1-6`) is building the built-in default (memory PVC +
-  operator-curated lessons, `docs/PLAN-ALPHA.md:138` deferral). The
-  external memory extension (Honcho) is not yet built.
+- **Memory.** **Built (Phase 5, complete on `main` at `04472d5`).** The
+  built-in default is a per-(namespace, git URL) PVC, read into the agent's
+  workspace at `.coxswain/memory/` and written only by the operator's
+  memory-writer Job after the static screen and the rule-gated Memory
+  Curator (`docs/PLAN.md:80-82`, `docs/PLAN-PHASE5.md` D66). The R15 table's
+  originally-proposed default (a per-repo `.coxswain/memory.md` notes file,
+  R15:118) was **superseded by D66** — see the note under the extension-point
+  table. The external memory extension (Honcho) is not yet built.
 
 **Intended only — not yet built:**
 - **Workflow definition.** There is no workflow/stage-graph resource or
@@ -170,8 +186,9 @@ the pattern works."** (Audited against `origin/main` as of
 - **Intake.** Not yet built (a Loop is started by `kubectl apply` today).
 - **Ledger store.** Not yet built — no hash-chained approval ledger exists;
   Loop status and Events are not hash-chained (R15:82).
-- **Agent roles (advisory).** Not yet built — one runner per Loop (the Judge
-  is deferred, `docs/PLAN-ALPHA.md:139`).
+- **Agent roles (advisory).** Not yet built — one runner per Loop. The Judge
+  sidecar is deferred past v0.1.0 by D60 (`docs/PLAN-BETA.md:127`; also
+  listed under "Phase 6" in `docs/PLAN-BETA.md:117`).
 - **Deliver (beyond PR).** Delivery opens a PR today (S6); the generic
   deliver extension (release/report/dataset) is not yet built.
 - **Maintain / monitoring.** Not yet built.

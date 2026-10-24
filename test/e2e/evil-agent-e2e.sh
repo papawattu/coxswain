@@ -8,7 +8,7 @@
 #   (b) NO model endpoint, no policy (the F42 shape): spec.agent.image is
 #       golang:1.26 (the container is `sleep infinity`), the same script is
 #       kubectl cp'd in and exec'd. Same container, UID, read-only rootfs, netns
-#       and netpol selector, so the verdicts are equivalent.
+#       and netpol selector, so the verdicts are equivalent (probe 10 excepted).
 # Plus probe 14 (the ephemeral-container VAP) and probe 15 (a tamper Loop).
 #
 # EXPECTED TO FAIL on a build without the F42 fix (variant (b): the agent
@@ -40,6 +40,14 @@ record() {
   echo "PROBE $2 $4 variant=$1 name=$3 $5" >> "$VERDICT"
   echo "   [$1] probe $2 $3: $4 ($5)"
   [ "$4" = ESCAPED ] && FAIL=1
+}
+# expect <variant> "<probe numbers>": every number must have produced at least one PROBE verdict line for
+# the variant (PF1: a missing probe is a failure, never a silent OK; 11 appears twice, push + credential).
+expect() {
+  local n
+  for n in $2; do
+    grep -Eq "^PROBE $n [A-Z/]+ variant=$1 " "$VERDICT" || fail "variant $1: probe $n produced no verdict (missing, truncated or never wired)"
+  done
 }
 fail() { echo "   FAIL: $*"; echo "FAIL $*" >> "$VERDICT"; FAIL=1; }
 ok() { echo "   PASS: $*"; echo "PASS $*" >> "$VERDICT"; }
@@ -254,6 +262,7 @@ else record b 14 ephemeral ESCAPED "not denied by the VAP: $(echo "$D14" | head 
 C14=$(K -n $NS_B debug -q ctl --image=busybox:1.36 -- sh -c true 2>&1 || true); echo "control 14: $C14" >> "$EV/07-vap.txt"
 echo "$C14" | grep -qi "denied" && fail "control 14: kubectl debug on the control pod was denied too (the VAP is over-broad or the probe is wrong)" || ok "control 14: kubectl debug on the control pod is not denied"
 K -n $NS_B delete pod ctl --wait=false >/dev/null 2>&1   # the debug container persists in its spec
+expect b "1 2 3 4 5 6 7 8 9 10 11 12 13 14"
 
 fi
 # ---------------------------------------------------------------------------
@@ -269,7 +278,14 @@ metadata: {name: model-endpoint, namespace: $NS_A}
 spec: {selector: {app: fake-model}, ports: [{port: 8000, targetPort: 8000}]}
 EOF
 MODEL_IP=$(K -n $NS_A get svc model-endpoint -o jsonpath='{.spec.clusterIP}')
-echo "cd /workspace; export NS=$NS_A NODE_IP=$CP_IP VICTIM_IP=$VICTIM_IP MODEL=$MODEL_IP:8000 EXAMPLE_IP=$EXAMPLE_IP REPO=$REPO_IP; export PROXY=\"\$HTTPS_PROXY\"; echo $B64 | base64 -d | sh" > "$EV/probe-cmd.txt"
+# PF3: the runner kills a tool call after 60 s (runner.go defaultShellTimeout) and a fenced agent burns the
+# full --max-time per network probe, so the probes go out as THREE tool calls (one line each; EVIL_GROUP
+# selects the probes, see evil-probes.sh). Budget per call: group 1 ~20 s, group 2 ~40 s, group 3 <= ~35 s
+# (git bounded at 15 s each).
+: > "$EV/probe-cmd.txt"
+for g in 1 2 3; do
+  echo "cd /workspace; export EVIL_GROUP=$g NS=$NS_A NODE_IP=$CP_IP VICTIM_IP=$VICTIM_IP MODEL=$MODEL_IP:8000 EXAMPLE_IP=$EXAMPLE_IP REPO=$REPO_IP; export PROXY=\"\$HTTPS_PROXY\"; echo $B64 | base64 -d | sh" >> "$EV/probe-cmd.txt"
+done
 cat <<EOF | K apply -f - >/dev/null
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: AgentPolicy
@@ -281,7 +297,7 @@ K -n $NS_A exec ctl -- curl -s -o /dev/null --max-time 8 "http://$MODEL_IP:8000/
 loop_yaml $NS_A evil-a "  policyRefs: [evil-pol]
   agent: {model: local-model, modelEndpoint: \"model-endpoint:8000\", endpointSecretRef: model}" | tee "$EV/evil-loop-a.yaml" | K apply -f - >/dev/null
 for i in $(seq 1 90); do
-  K -n $NS_A logs fake-model 2>/dev/null | grep -q TOOL-RESULT-END && break; sleep 5
+  [ "$(K -n $NS_A logs fake-model 2>/dev/null | grep -c TOOL-RESULT-END)" -ge 3 ] && break; sleep 5
 done
 K -n $NS_A logs fake-model > "$EV/06-standin.log" 2>&1
 # probe 8 evidence (instead of usage counters: the usage endpoint is operator-only and the counters include
@@ -296,6 +312,10 @@ else echo "UNPROVEN probe 8 model-side: the control pod's call is not in the sta
 K -n $NS_A get netpol -o yaml > "$EV/01-netpol-a.yaml" 2>&1
 if grep -q '^EVIL-PROBE ' "$EV/06-standin.log"; then
   grep '^EVIL-PROBE \|^EVIL-LISTEN ' "$EV/06-standin.log" > "$EV/04-probes-agent-a.txt"; parse_probes a "$EV/04-probes-agent-a.txt"
+  expect a "1 2 3 4 5 6 7 8 9 11 12 13"
+  # PF1: declared, not silent. Probe 10 (agent ingress) needs a listener that outlives the tool call; the runner
+  # kills the call's process group on return, so variant (a) cannot hold one. Variant (b) carries probe 10.
+  echo "ABSENT probe 10 variant=a name=ingress declared absent: the runner kills the tool call's process group, so no listener survives; probe 10 is covered by variant b only" | tee -a "$VERDICT"
 else fail "variant a: the stand-in logged no EVIL-PROBE lines in 450s (see 06-standin.log)"; fi
 # probe 6 audit (the proxy's own record) + proxy-path control
 EGP=$(K -n $NS_A get pods -o name | grep egress-proxy | head -1)

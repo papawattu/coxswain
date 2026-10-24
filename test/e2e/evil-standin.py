@@ -3,7 +3,7 @@
 
 The reference runner runs every model tool call through `sh -c` in the agent
 container, so a model that returns `shell` tool calls IS the hostile agent.
-In the IMPLEMENTING phase the first turn returns ONE shell tool call (the
+In the IMPLEMENTING phase the first turn returns ONE shell tool call (more, one per line of the command, on later turns) (the
 --probe-cmd, or --tamper-cmd for the tamper Loop); the next turn (the tool
 result is the last message) returns plain text. Every request and the tool
 result is logged verbatim to stderr (and --log if given) so the orchestrator
@@ -31,12 +31,15 @@ def reply_for(body):
     msgs = body.get("messages") or []
     all_user = " ".join(m.get("content") or "" for m in msgs if m.get("role") == "user")
     implementing = "IMPLEMENTING phase" in all_user
-    done = bool(msgs) and msgs[-1].get("role") == "tool"
-    cmd = ARGS.tamper_cmd or ARGS.probe_cmd
-    if implementing and not done and cmd:
+    # PF3: the command may have several lines; line N is the Nth tool call (the
+    # runner kills a tool call after 60 s, so the probes are sent in groups). The
+    # Nth call is sent when N tool results are already in the conversation.
+    cmds = [c for c in (ARGS.tamper_cmd or ARGS.probe_cmd).split("\n") if c.strip()]
+    n_results = sum(1 for m in msgs if m.get("role") == "tool")
+    if implementing and n_results < len(cmds) and msgs and (msgs[-1].get("role") == "tool") == (n_results > 0):
         return {"role": "assistant", "content": None, "tool_calls": [{
-            "id": "call_1", "type": "function",
-            "function": {"name": "shell", "arguments": json.dumps({"command": cmd})}}]}
+            "id": "call_%d" % (n_results + 1), "type": "function",
+            "function": {"name": "shell", "arguments": json.dumps({"command": cmds[n_results]})}}]}
     return {"role": "assistant", "content": "Done."}
 
 

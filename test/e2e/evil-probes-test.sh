@@ -14,6 +14,7 @@ chmod 555 "$T/ro"
 cat > "$T/bin/curl" <<'S'
 #!/bin/sh
 proxied=0; for a in "$@"; do [ "$a" = "-x" ] && proxied=1; done
+if [ "$STUB_LISTEN" = ok ]; then case "$*" in *127.0.0.1:18080*) printf 200; exit 0 ;; esac; fi
 if [ "$STUB_CURL" = dns ]; then exit 6; fi
 if [ "$STUB_CURL" = escaped ]; then printf '200 gitVersion "kind":"SecretList" ok'; exit 0; fi
 [ "$proxied" = 1 ] && { printf 403; exit 0; }
@@ -25,6 +26,7 @@ case "$*" in
   *ls-remote*) [ "$STUB_GIT_CTL" = auth ] && { echo "fatal: could not read Username for 'http://x': terminal prompts disabled"; exit 128; }
                [ "$STUB_GIT_CTL" = fail ] && { echo "fatal: unable to access"; exit 128; }; echo "abc refs/heads/main"; exit 0 ;;
   *push*) case "$STUB_GIT" in
+            timeout) exit 124 ;;
             escaped) exit 0 ;;
             network) echo "fatal: unable to access: Connection refused"; exit 128 ;;
             *) echo "fatal: could not read Username for 'http://x': terminal prompts disabled"; exit 128 ;;
@@ -108,5 +110,23 @@ rm -f "$T/rw2/.evil-ctl"; chmod 555 "$T/rw2"
 R="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok)"
 want "unwritable control mount => probe 12 N/A" "$R" "^EVIL-PROBE 12 rootfs-write N/A"
 chmod 755 "$T/rw2"
+
+# PF3: EVIL_GROUP selects a subset (the stand-in sends the groups as separate tool calls).
+nums() { printf '%s\n' "$1" | sed -n 's/^EVIL-PROBE \([0-9]*\) .*/\1/p' | sort -un | tr '\n' ' '; }
+G1="$(run EVIL_GROUP=1 STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok)"
+G2="$(run EVIL_GROUP=2 STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok)"
+G3="$(run EVIL_GROUP=3 STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok)"
+want "group 1 runs exactly probes 1-5" "$(nums "$G1")" '^1 2 3 4 5 $'
+want "group 2 runs exactly probes 6-9" "$(nums "$G2")" '^6 7 8 9 $'
+want "group 3 runs exactly probes 11-13 (+ the listener line)" "$(nums "$G3")" '^11 12 13 $'
+want "group 3 prints the listener line" "$G3" "^EVIL-LISTEN "
+want "group 1 prints no listener line" "$(printf '%s\n' "$G1" | grep -c '^EVIL-LISTEN')" '^0$'
+# PF2: the listener line is verified, not asserted. curl answering 200 => ok; curl failing => failed.
+L1="$(run EVIL_GROUP=3 STUB_LISTEN=ok STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok)"
+want "listener answers locally => EVIL-LISTEN ok" "$L1" "^EVIL-LISTEN ok "
+want "no local answer => EVIL-LISTEN failed" "$G3" "^EVIL-LISTEN failed "
+# PF3: a timed-out push is N/A, not an auth verdict and not an escape.
+TO="$(run EVIL_GROUP=3 STUB_CURL=blocked STUB_GIT=timeout STUB_GIT_CTL=ok)"
+want "push timeout => probe 11 N/A" "$TO" "^EVIL-PROBE 11 git-push N/A"
 
 [ "$FAIL" -eq 0 ] && echo "evil-probes-test: OK" || { echo "evil-probes-test: FAILED"; exit 1; }

@@ -10,7 +10,7 @@ the fix belongs to D33/D34, not to a C6b line change.
 
 ### I41. A `host:PORT` allow that loses its port must set `PolicyTranslationLossy` on the Loop
 
-- [x] Done (9d04086, #15)
+- [ ] Done
 
 **Where:** `internal/engine/kubearmor.go` (`splitNetworkAllows`), and the
 Loop status conditions set by the controller.

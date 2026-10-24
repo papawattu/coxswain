@@ -56,7 +56,7 @@ call from an unrelated pod to the proxy Service fails.
 
 ### D35. Gate, audit and enforcement cover both pods
 
-- [x] Done (5e1aecc, #13; 90b16a3, #8)
+- [x] Done (5e1aecc, #13; 90b16a3, #8; aae9a3e, #28; e474ae0, #78)
 
 - The D30 gate requires the proxy pod Ready (and its policy enforced) before
   the sandbox is `Running`.

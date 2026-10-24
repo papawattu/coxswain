@@ -38,7 +38,7 @@ Update `AGENTS.md` → *Review protocol* → *Pull requests* to say this (replac
 
 ### I40. Give each CI job a unique name, then require them
 
-- [x] Done (1a6cc88, #4)
+- [ ] Done
 
 **Where:** `.github/workflows/test.yml`, `lint.yml`, `test-e2e.yml`.
 

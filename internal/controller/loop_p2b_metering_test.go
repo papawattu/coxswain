@@ -245,7 +245,20 @@ var _ = Describe("P2b: metering model proxy operator wiring", func() {
 		// leave it as-tampered; the controller's createOrUpdateNP must
 		// re-assert the desired spec and restore the usage rule.
 		tampered := np.DeepCopy()
-		tampered.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{tampered.Spec.Ingress[0]}
+		kept := make([]networkingv1.NetworkPolicyIngressRule, 0, len(tampered.Spec.Ingress))
+		for i := range tampered.Spec.Ingress {
+			isUsage := false
+			for _, peer := range tampered.Spec.Ingress[i].From {
+				if peer.NamespaceSelector != nil {
+					isUsage = true
+				}
+			}
+			if !isUsage {
+				kept = append(kept, tampered.Spec.Ingress[i])
+			}
+		}
+		tampered.Spec.Ingress = kept
+		Expect(usageIngressRule(tampered)).To(BeNil(), "the tamper dropped the usage-port rule")
 		Expect(k8sClient.Update(ctx, tampered)).To(Succeed())
 
 		// Reconcile the SAME Loop: the controller must restore the usage-port

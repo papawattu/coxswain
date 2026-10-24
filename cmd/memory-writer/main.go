@@ -33,12 +33,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
+	"github.com/papawattu/coxswain/pkg/curator"
 	"github.com/papawattu/coxswain/pkg/memorywrite"
 )
 
@@ -81,6 +85,38 @@ func memoryDirFromEnv() string {
 // non-Job invocation) = stdout only.
 func summaryPathFromEnv() string {
 	return os.Getenv("COX_SUMMARY_PATH")
+}
+
+// curatorBaseURLFromEnv returns the COX_CURATOR_BASE_URL env var (the model
+// proxy's base URL for the curator call) or empty (the curator is disabled —
+// the Job runs without a model proxy, e.g. in the execution test). When
+// empty, the curator is skipped and all static-rule survivors are written
+// (the P5b behavior — the curator is a P5c addition).
+func curatorBaseURLFromEnv() string {
+	return os.Getenv("COX_CURATOR_BASE_URL")
+}
+
+// curatorModelFromEnv returns the COX_MODEL env var (the model name for the
+// curator call) or empty (the curator is disabled).
+func curatorModelFromEnv() string {
+	return os.Getenv("COX_MODEL")
+}
+
+// seededLessonsFromEnv returns the COX_SEEDED_LESSONS env var (a JSON array of
+// single-line strings) — the operator's seeded lessons (P5c's negative
+// lesson: the stall signature, not the agent's text). "[]" or absent means
+// "no seed". A malformed value is treated as "no seed" (the seed is
+// best-effort; the runner's lessons are the authoritative input).
+func seededLessonsFromEnv() []string {
+	v := os.Getenv("COX_SEEDED_LESSONS")
+	if v == "" || v == "[]" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(v), &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 func main() {
@@ -144,12 +180,99 @@ func run(outcome string) (int, error) {
 		return 1, fmt.Errorf("parse %s: %w (malformed lessons JSON)", lp, err)
 	}
 
+	// P5c: prepend the operator's seeded lessons (the negative lesson — the
+	// stall signature, not the agent's text; PLAN-PHASE5.md:213-215). The
+	// seed flows through the static rules + the curator exactly like the
+	// runner's lessons (the seed's position in the input is index 0, so its
+	// sha256-prefix in the bounded summary is stable). The seed is
+	// operator-composed (not the agent's text) — the curator's injection
+	// resistance still applies to it (the curator reads it as untrusted).
+	if seeded := seededLessonsFromEnv(); len(seeded) > 0 {
+		lessons = append(seeded, lessons...)
+	}
+
 	// Screen the proposals (the operator's static write policy). The outcome
 	// eligibility is applied FIRST (a non-qualifying outcome drops every
 	// lesson, regardless of the per-lesson rules — the operator only invokes
 	// the Job on a qualifying outcome, but the Job enforces the rule too, so
 	// a mis-invocation writes nothing).
 	survivors, reasons := screenLessons(lessons, eligibleOutcome)
+
+	// P5c: the Memory Curator gate (ADR-0002, D70). Only when ALL static
+	// rules pass (the survivors) does the curator judge each lesson. The
+	// curator call goes to the Loop's model proxy (COX_CURATOR_BASE_URL); a
+	// call failure drops the lesson ("curator unavailable").
+	//
+	// FAIL-CLOSED (D70): a lesson is written only on a true curator verdict.
+	// When the curator is NOT configured (COX_CURATOR_BASE_URL empty), every
+	// static-rule survivor is dropped with reason "curator unavailable" — the
+	// writer writes NOTHING. This is the D70 rule: a curator that can't be
+	// asked drops the lesson. The operator always configures the curator for a
+	// Loop with a model endpoint (the proxy exists whether or not there is a
+	// key Secret); if there is genuinely no model endpoint, no lesson is
+	// written. The execution test sets COX_CURATOR_BASE_URL to a stub that
+	// returns keep:true, so the test still writes survivors.
+	curBase := curatorBaseURLFromEnv()
+	if curBase == "" {
+		// Fail closed: drop every survivor as "curator unavailable" (D70).
+		for j := range lessons {
+			if reasons[j] == "" {
+				reasons[j] = "curator unavailable"
+			}
+		}
+		survivors = nil
+	} else {
+		curModel := curatorModelFromEnv()
+		curClient := curator.NewClient(curBase, curModel)
+		// P2-3: the curator's per-lesson timeout is 60s. With up to 11
+		// lessons (the runner's 10 + the seed), 60s × 11 = 660s — far
+		// beyond the Job's 300s deadline. An overall budget (120s) ensures
+		// the curator loop cannot exceed the Job's deadline; lessons that
+		// are not judged before the budget expires are dropped as
+		// "curator unavailable" (fail-closed: no lesson is written without
+		// a true verdict).
+		curBudget := 120 * time.Second
+		curCtx, cancel := context.WithTimeout(context.Background(), curBudget)
+		defer cancel()
+		var curated []string
+		for _, s := range survivors {
+			if curCtx.Err() != nil {
+				// The overall budget is exhausted: drop this survivor (and
+				// any remaining) as "curator unavailable".
+				for j := range lessons {
+					if lessons[j] == s && reasons[j] == "" {
+						reasons[j] = "curator unavailable"
+						break
+					}
+				}
+				continue
+			}
+			v := curClient.Judge(curCtx, s)
+			if v.Keep {
+				curated = append(curated, s)
+				// ADR-0002: record the curator's reason for keeps too (the
+				// audit trail: the verdict, keep or drop, plus a one-line
+				// reason, goes into the audit for EVERY lesson). Mark the
+				// reason so the summary reports "written curator-keep: <reason>".
+				for j := range lessons {
+					if lessons[j] == s && reasons[j] == "" {
+						reasons[j] = "curator-keep: " + v.Reason
+						break
+					}
+				}
+			} else {
+				// The curator dropped this survivor: mark it in the reasons
+				// so the summary reports the drop reason.
+				for j := range lessons {
+					if lessons[j] == s && reasons[j] == "" {
+						reasons[j] = "curator: " + v.Reason
+						break
+					}
+				}
+			}
+		}
+		survivors = curated
+	}
 
 	// Write the eligible lessons to the memory PVC (files named by sha256;
 	// a lesson whose sha256 matches an existing file is dropped as a
@@ -170,6 +293,22 @@ func run(outcome string) (int, error) {
 	return 0, nil
 }
 
+// stripReasonCR strips CR/LF from a model-supplied curator reason before it
+// enters the line-based bounded summary (P3, R16 review pass 3 at 27014da):
+// the reason is free model text, and a \n or \r in it would corrupt the
+// one-line-per-lesson summary layout (a two-line reason would read as a
+// phantom second lesson line and break the per-lesson parsing the operator
+// and the review do against the termination message). The client already
+// strips CR/LF (pkg/curator); this is defence in depth at the summary's
+// single entry point, so a reason that reaches the summary from any path
+// is single-line. Spaces are NOT collapsed otherwise (the reason is
+// recorded verbatim except for CR/LF).
+func stripReasonCR(reason string) string {
+	reason = strings.ReplaceAll(reason, "\r\n", " ")
+	reason = strings.ReplaceAll(reason, "\n", " ")
+	return strings.ReplaceAll(reason, "\r", " ")
+}
+
 // annotateDedup marks the survivors that were NOT written (duplicates) as
 // "dropped duplicate" in the reasons slice (the per-lesson drop reason for
 // the summary). The survivors are the input positions whose reason is ""
@@ -188,9 +327,13 @@ func annotateDedup(lessons, reasons []string, writtenNames []string) {
 		writtenSet[n] = true
 	}
 	for i := range reasons {
-		if reasons[i] != "" {
-			continue // screen-dropped (not a survivor)
+		if reasons[i] != "" && !strings.HasPrefix(reasons[i], "curator-keep: ") {
+			continue // screen-dropped or curator-dropped (not a survivor)
 		}
+		// A survivor (reason == "" or "curator-keep: ..."): compute its
+		// sha256 file name from the lesson text. A curator-keep reason is
+		// a survivor (the curator kept it); a dedup override must replace
+		// it with "dropped duplicate" (the file was not written).
 		// A survivor: compute its sha256 file name from the lesson text.
 		sum := sha256.Sum256([]byte(lessons[i]))
 		name := hex.EncodeToString(sum[:]) + ".txt"
@@ -205,7 +348,9 @@ func annotateDedup(lessons, reasons []string, writtenNames []string) {
 func countSurvivors(reasons []string) int {
 	n := 0
 	for _, r := range reasons {
-		if r == "" {
+		// A survivor has an empty reason (no curator yet) or a curator-keep
+		// reason (the curator kept it — still a survivor, not yet deduped).
+		if r == "" || strings.HasPrefix(r, "curator-keep: ") {
 			n++
 		}
 	}
@@ -223,8 +368,15 @@ func summaryLines(lessons, reasons []string, total, written, dropped int) []stri
 		status := "written"
 		rule := "eligible"
 		if i < len(reasons) && reasons[i] != "" {
-			status = "dropped"
-			rule = reasons[i]
+			// A non-empty reason is either a drop (curator/screen/duplicate)
+			// or a keep with a curator reason (curator-keep: ...).
+			// A keep reason does NOT change the status to "dropped".
+			if !strings.HasPrefix(reasons[i], "curator-keep: ") {
+				status = "dropped"
+			}
+			// The reason is model- or screen-supplied text; CR/LF in a
+			// curator reason would corrupt the line-based summary (P3).
+			rule = stripReasonCR(reasons[i])
 		}
 		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
 	}

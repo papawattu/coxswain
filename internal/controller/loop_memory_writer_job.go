@@ -44,10 +44,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -357,6 +359,49 @@ const memoryWriterJobBackoffLimit = int32(0)
 // deliver/verify Job's container pattern); the memory PVC is the ONLY
 // writable mount (the readOnly rootfs makes the PVC the sole write target),
 // and the workspace PVC is mounted READ-ONLY.
+// memoryWriterEnvVars returns the Job container's env vars. The curator
+// env vars (COX_CURATOR_BASE_URL, COX_MODEL) are set only when the Loop has
+// a model (endpointSecretRef); without a model there is no proxy and the
+// curator is disabled (the Job writes all static-rule survivors — the P5b
+// behavior).
+func (r *LoopReconciler) memoryWriterEnvVars(loop *coxv1alpha1.Loop, termMsgPath string) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: "COX_SUMMARY_PATH", Value: termMsgPath},
+		{Name: "COX_LESSONS_PATH", Value: "/workspace/.coxswain/lessons.json"},
+		{Name: "COX_MEMORY_DIR", Value: "/memory"},
+	}
+	// P5c: the curator call goes to the Loop's model proxy (the same
+	// endpoint the runner uses; the proxy injects the API key when there is
+	// a key Secret, and passes through keyless requests when there is not).
+	// The curator is set whenever the Loop has a model endpoint — NOT only
+	// when there is a key Secret (D70, ADR-0002: the curator gate must not
+	// fail open). A Loop with a model endpoint but no endpointSecretRef (a
+	// keyless homelab vLLM) still gets the curator env, so its lessons are
+	// curator-judged. Without a model endpoint there is no proxy and the
+	// curator is disabled (fail-closed: the writer drops every survivor as
+	// "curator unavailable").
+	if loop.Spec.Agent.ModelEndpoint != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "COX_CURATOR_BASE_URL", Value: r.proxyServiceURL(loop.Name, loop.Namespace)},
+			corev1.EnvVar{Name: "COX_MODEL", Value: loop.Spec.Agent.Model},
+		)
+	}
+	// P5c: the negative lesson (the stall signature) is seeded on a terminal
+	// Failed:Stalled Loop with stallAction != Continue (PLAN.md:82: default
+	// on for Fail/Pause, off for Continue). The seed is operator-composed
+	// (the repeated verify-failure hash — NOT the agent's text) and is
+	// passed as COX_SEEDED_LESSONS (a JSON array) so the Job prepends it to
+	// the runner's lessons; the seed flows through the static rules + the
+	// curator exactly like the runner's lessons (the curator can drop it).
+	if text, ok := negativeLesson(loop); ok {
+		env = append(env, corev1.EnvVar{
+			Name:  "COX_SEEDED_LESSONS",
+			Value: seededLessonsEnvValue([]string{text}),
+		})
+	}
+	return env
+}
+
 func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, outcomeArg string) *batchv1.Job {
 	// The Job runs once with a bounded lifetime (the hung-writer-pod fix):
 	// activeDeadlineSeconds fails a stuck pod (reason DeadlineExceeded — the
@@ -444,11 +489,7 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 						},
 						TerminationMessagePath:   termMsgPath,
 						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
-						Env: []corev1.EnvVar{
-							{Name: "COX_SUMMARY_PATH", Value: termMsgPath},
-							{Name: "COX_LESSONS_PATH", Value: "/workspace/.coxswain/lessons.json"},
-							{Name: "COX_MEMORY_DIR", Value: "/memory"},
-						},
+						Env:                      r.memoryWriterEnvVars(loop, termMsgPath),
 						VolumeMounts: []corev1.VolumeMount{
 							// The workspace PVC (READ-ONLY — the Job reads the
 							// lessons file but never writes the workspace).
@@ -489,11 +530,20 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 }
 
 // ensureMemoryWriterNetworkPolicy creates (idempotently) the memory-writer
-// Job's NetworkPolicy: denies ALL ingress and ALL egress for the Job's pod.
-// The writer Job makes NO network calls (it reads/writes local PVCs); the
-// deny-all egress is the ADR-0007 fence (a lesson must not be exfiltrated
-// during the write). The podSelector is the "coxswain.io/memory-write-for"
-// label (the Job stamps it on the pod template).
+// Job's NetworkPolicy: denies ALL ingress and ALL egress EXCEPT the model
+// proxy pod (the P5c curator call goes to the Loop's model proxy Service; the
+// proxy pod is identified by the coxswain.io/proxy-for label). The writer
+// Job's only network call is the curator's /v1/chat/completions POST to the
+// proxy; all other egress is denied (the ADR-0007 fence: a lesson must not
+// be exfiltrated during the write). The podSelector is the
+// "coxswain.io/memory-write-for" label (the Job stamps it on the pod
+// template).
+//
+// F16: the desired spec carries NO Ingress rules and at most ONE Egress rule
+// (the proxy-allow). An empty rule {} MATCHES everything (allow all) — the
+// opposite of the fence — so a blank Ingress or Egress rule must never be
+// emitted. Drift is detected against the WHOLE desired spec (semantic
+// equality, not rule counts) so a drifted rule set is updated in place.
 func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	name := memoryWriterNetPolName(loop.Name)
 	desired := &networkingv1.NetworkPolicy{
@@ -510,20 +560,52 @@ func (r *LoopReconciler) ensureMemoryWriterNetworkPolicy(ctx context.Context, lo
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			// Deny ALL: PolicyTypes [Ingress, Egress] with no Ingress/Egress
-			// rules. An empty rule {} would MATCH everything (allow all),
-			// the opposite of the ADR-0007 fence.
+			// Deny ALL ingress: no Ingress rules (F16: an empty ingress rule {}
+			// would MATCH everything — allow all, the opposite of the ADR-0007
+			// fence). Egress is denied the same way, EXCEPT the model proxy
+			// pod when the Loop has a model: the P5c curator call goes to the
+			// Loop's model proxy Service, and the proxy pod carries the label
+			// coxswain.io/proxy-for: <loop>. The proxy-allow rule is the ONLY
+			// egress rule (F16: a blank egress rule {} would also allow all).
 		},
+	}
+	// The proxy egress rule (the P5c curator call) + the DNS egress rule are
+	// added after the struct literal (an if cannot appear inside a struct
+	// literal). The curator URL is a DNS name (proxyServiceURL: <loop>-proxy.
+	// <ns>.svc.<domain>:8080), so the writer also needs DNS egress (UDP+TCP
+	// 53 to kube-system k8s-app=kube-dns) to resolve it — the same DNS rule
+	// the other Loop policies use (D34). Without the DNS rule, on any
+	// NetworkPolicy-enforcing CNI the lookup is denied and every curator
+	// call fails (the P1-3 finding). A Loop with no model endpoint has NO
+	// proxy and a fully denied NetworkPolicy (the P5b fence).
+	if loop.Spec.Agent.ModelEndpoint != "" {
+		desired.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{
+			{
+				To: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{kubeNSLabelKey: loop.Namespace},
+					},
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(proxyPort)}},
+			},
+			{
+				To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+				Ports: dnsPorts(),
+			},
+		}
 	}
 
 	existing := &networkingv1.NetworkPolicy{}
 	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
 	if err == nil {
-		// The policy exists: check for drift (the P5b build created it with
-		// Ingress/Egress [{}] which ALLOWS all traffic). If drifted, update
-		// to the desired spec.
-		drifted := len(existing.Spec.Ingress) != 0 || len(existing.Spec.Egress) != 0
-		if !drifted {
+		// The policy exists: check for drift against the WHOLE desired spec
+		// (the P5b build created it with Ingress/Egress [{}] which ALLOWS all
+		// traffic; rule counts alone would miss a drifted rule set, so compare
+		// semantically — F16). If drifted, update to the desired spec.
+		if equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
 			return nil // already correct
 		}
 		existing.Spec = desired.Spec
@@ -637,13 +719,34 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 	// message names the deadline so the review sees the hang.
 	deadlineExceeded := jobHasConditionReason(job, batchv1.JobFailed, batchv1.JobReasonDeadlineExceeded)
 	podPhase := pod.Status.Phase
+	// The bounded summary (the termination message). The container's
+	// TerminationMessagePolicy is FallbackToLogsOnError, so a pod that crashed
+	// before the summary was written may carry a message; an empty message is
+	// "no summary" (the audit falls back to the plain completion form). The
+	// summary is the curator's verdict record (item 7, the Phase 5 done-when
+	// PLAN.md:85): the operator records every per-lesson line on the Loop
+	// (a Normal Event + the MemoryWriteDone condition message) so
+	// `kubectl cox describe` shows which lessons were written and why.
+	summary := memoryWriterSummary(pod)
 	switch podPhase {
 	case corev1.PodSucceeded:
 		// The Job's pod succeeded: the write completed (whether or not any
-		// lesson was eligible). Record MemoryWritten.
-		setMemoryWriterCondition(loop, memoryWrittenReason,
-			"memory write completed (the Job's pod succeeded; the eligible lessons are on the memory PVC)")
+		// lesson was eligible). Record MemoryWritten (the condition message
+		// carries the audit trail: the counts + one line per lesson with its
+		// sha256-prefix, written|dropped, and the reason — the curator's
+		// verdict, item 7). The Normal Event carries the same text (a
+		// separate Event per lesson would spam the Event stream on a large
+		// write); the Event fires only on a reason transition (setCondition
+		// returns whether the condition actually changed this reconcile,
+		// so re-reconciles of the same terminal outcome do not re-emit).
+		transitioned := setMemoryWriterCondition(loop, memoryWrittenReason,
+			memoryWriteAuditMessage(summary))
+		if transitioned && r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
+				"memory write audit: %s", memoryWriteAuditText(summary))
+		}
 		return false
+
 	case corev1.PodFailed:
 		// The Job's pod failed: a write failure. Record MemoryWriteFailed +
 		// a Warning Event (the Loop still Succeeds, ADR-0004). When the
@@ -739,10 +842,86 @@ func jobHasConditionReason(job *batchv1.Job, condType batchv1.JobConditionType, 
 // fail the Loop, ADR-0004, but it IS surfaced). The condition is a
 // status-only change (the operator updates it via Status().Update; it does
 // NOT change the phase machine — ADR-0005: the claim channel is the only
-// thing that advances).
-func setMemoryWriterCondition(loop *coxv1alpha1.Loop, reason, message string) {
+// thing that advances). Returns true when the condition was created or
+// changed this call (the caller uses this to gate the audit-trail Event so
+// re-reconciles of the same terminal outcome do not re-emit it, item 7).
+func setMemoryWriterCondition(loop *coxv1alpha1.Loop, reason, message string) bool {
+	prev := ""
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == memoryWriterConditionType {
+			prev = loop.Status.Conditions[i].Reason
+			break
+		}
+	}
 	status := metav1.ConditionTrue
 	setCondition(loop, memoryWriterConditionType, status, reason, message)
+	// setCondition is a no-op when (status, reason, message) is unchanged,
+	// so "reason changed OR condition was absent" is the transition signal
+	// (a reason change with the same message still fires the audit Event).
+	if prev == "" {
+		return true
+	}
+	cur := ""
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == memoryWriterConditionType {
+			cur = loop.Status.Conditions[i].Reason
+			break
+		}
+	}
+	return cur != prev
+}
+
+// memoryWriterSummary returns the Job's bounded summary (the termination
+// message: the last container's terminated state's Message). It is the
+// curator's verdict record (item 7). An empty string means "no summary"
+// (the pod crashed before the summary was written, or the message is empty
+// — the audit then falls back to the plain completion form).
+func memoryWriterSummary(pod *corev1.Pod) string {
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.State.Terminated != nil {
+			return strings.TrimSpace(cs.State.Terminated.Message)
+		}
+	}
+	return ""
+}
+
+// memoryWriteAuditMessage builds the MemoryWriteDone condition's message
+// from the bounded summary (item 7, the Phase 5 done-when PLAN.md:85):
+// "memory write completed — audit: " + the per-lesson verdict lines (one
+// line each: "lesson-<n> <sha12> written|dropped <reason>") + the counts
+// line. The summary is the Job's own output (never lesson text — the Job's
+// summary lines carry only the sha256-prefix, written|dropped, and the
+// rule), so echoing it on the Loop leaks no lesson content. A failed write
+// is UNRELIABLE evidence (the write did not complete) and gets the plain
+// failure message — the operator does not fabricate an audit for a write
+// that did not happen. An empty summary (no termination message) falls
+// back to the plain completion message (pre-existing P5b behavior).
+func memoryWriteAuditMessage(summary string) string {
+	if summary == "" {
+		return "memory write completed (the Job's pod succeeded; the eligible lessons are on the memory PVC)"
+	}
+	return "memory write completed — audit: " + memoryWriteAuditText(summary)
+}
+
+// memoryWriteAuditText is the bounded audit text: the summary's lines
+// joined with a single space. The per-lesson lines already carry the
+// verdict (written|dropped + the one-line reason — the curator's
+// "<reason>" string, or the static rule name), so the text shows which
+// lessons were written and why. The Event's message is capped by
+// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes, so
+// the audit text is truncated to 1000 bytes here (the per-lesson lines are
+// ≤ ~80 bytes each; the truncation never cuts mid-lesson for the bounded
+// lesson count the policy enforces). The truncation is BOUNDED and never
+// includes lesson text (the summary lines are sha-prefix + status + rule).
+func memoryWriteAuditText(summary string) string {
+	const max = 1000
+	text := strings.ReplaceAll(summary, "\n", " ")
+	text = strings.TrimSpace(text)
+	if len(text) > max {
+		return text[:max] + "…"
+	}
+	return text
 }
 
 // memoryWriterTrue / memoryWriterFalse are the bool values the memory-writer

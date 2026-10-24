@@ -212,20 +212,37 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(*job.Spec.BackoffLimit).To(BeZero(),
 			"the writer Job's backoffLimit is 0 (no retry — the operator records MemoryWriteFailed)")
 
-		// The deny-all NetworkPolicy is created for the Job (the ADR-0007
-		// fence: a lesson must not be exfiltrated during the write).
+		// The desired NetworkPolicy is created for the Job (F16 + P5c:
+		// deny-all ingress — NO Ingress rules; egress denies all EXCEPT the
+		// model proxy pod, because s6Loop gives the Loop a model
+		// (endpointSecretRef), so the P5c curator call is the ONLY egress
+		// rule. A blank rule {} would match everything — ALLOW all, the
+		// opposite of the ADR-0007 fence).
 		np := &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(context.Background(), types.NamespacedName{
 			Name: memoryWriterNetPolName(name), Namespace: ns,
 		}, np)).To(Succeed())
 		Expect(np.Spec.PolicyTypes).To(ConsistOf(
 			networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress))
-		// Deny ALL: no Ingress or Egress rules (an empty rule {} would
-		// match everything — ALLOW all, the opposite of the ADR-0007 fence).
+		// Deny ALL ingress: no Ingress rules (F16: an empty ingress rule {}
+		// would match everything — allow all, the opposite of the ADR-0007
+		// fence).
 		Expect(np.Spec.Ingress).To(BeEmpty(),
 			"the NetworkPolicy must have NO ingress rules (deny-all ingress)")
-		Expect(np.Spec.Egress).To(BeEmpty(),
-			"the NetworkPolicy must have NO egress rules (deny-all egress)")
+		// Egress: EXACTLY TWO rules — the proxy-allow (the P5c curator call)
+		// + the DNS egress rule (the curator URL is a DNS name that must be
+		// resolved — P1-3). A blank (extra) egress rule {} would match
+		// everything — ALLOW all — and defeat the fence.
+		Expect(np.Spec.Egress).To(HaveLen(2),
+			"the NetworkPolicy must have EXACTLY TWO egress rules (the proxy-allow + DNS)")
+		Expect(np.Spec.Egress[0].To).To(HaveLen(1))
+		peer := np.Spec.Egress[0].To[0]
+		Expect(peer.NamespaceSelector).NotTo(BeNil())
+		Expect(peer.NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+			"kubernetes.io/metadata.name", ns))
+		Expect(peer.PodSelector).NotTo(BeNil())
+		Expect(peer.PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/proxy-for", name))
 
 		// Fabricate the Job's pod (envtest has no batch controller) and mark
 		// it Succeeded (the Job's termination message is the bounded
@@ -682,15 +699,31 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// and see the existing (drifted) policy.
 		_ = s6SucceededLessonsAvailable(name, ns)
 
-		// After reconcile, the policy must be updated to deny-all (no rules).
+		// After reconcile, the policy must be updated to the desired spec
+		// (the whole spec, not just rule counts — the F16 drift check uses
+		// equality.Semantic.DeepEqual on the desired Spec): the drifted
+		// allow-all rules are gone, and the desired policy (NO ingress rules;
+		// EXACTLY ONE egress rule — the proxy-allow, because s6Loop gives the
+		// Loop a model) is in place.
 		np := &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(context.Background(), types.NamespacedName{
 			Name: memoryWriterNetPolName(name), Namespace: ns,
 		}, np)).To(Succeed())
 		Expect(np.Spec.Ingress).To(BeEmpty(),
-			"the drifted ingress rule must be removed (deny-all)")
-		Expect(np.Spec.Egress).To(BeEmpty(),
-			"the drifted egress rule must be removed (deny-all)")
+			"the drifted allow-all ingress rule {} must be removed (deny-all ingress)")
+		// The drifted allow-all egress rule {} must be GONE (it would match
+		// everything — ALLOW all) and replaced by the desired two egress
+		// rules (the proxy-allow + the DNS egress rule — P1-3).
+		Expect(np.Spec.Egress).To(HaveLen(2),
+			"the drifted allow-all egress rule must be replaced by the desired proxy-allow + DNS rules")
+		Expect(np.Spec.Egress[0].To).To(HaveLen(1))
+		peer := np.Spec.Egress[0].To[0]
+		Expect(peer.NamespaceSelector).NotTo(BeNil())
+		Expect(peer.NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+			"kubernetes.io/metadata.name", ns))
+		Expect(peer.PodSelector).NotTo(BeNil())
+		Expect(peer.PodSelector.MatchLabels).To(HaveKeyWithValue(
+			"coxswain.io/proxy-for", name))
 		Expect(np.Spec.PolicyTypes).To(ConsistOf(
 			networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress))
 	})
@@ -841,6 +874,8 @@ func s6SucceededLessonsAvailable(name, ns string) *LoopReconciler {
 // the lessonsAvailable gate OPEN. It uses the S5a claim path for the phase
 // machine (Planning -> Implementing -> Verifying), then marks the Loop
 // Failed with the Stalled reason (the stall detector's terminal outcome).
+// The Loop's status carries a stallHistory entry (the stall signature the
+// P5c negative lesson is composed from) and the default stallAction (Fail).
 func s6FailedStalledLessonsAvailable(name, ns string) *LoopReconciler {
 	ctx := context.Background()
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
@@ -859,6 +894,17 @@ func s6FailedStalledLessonsAvailable(name, ns string) *LoopReconciler {
 		Phase:            coxv1alpha1.LoopPhaseFailed,
 		LessonsAvailable: true,
 	}
+	// The stall signature (the P5c negative lesson's input: the repeated
+	// verify-failure hash — the last status.stallHistory entry's hash).
+	// at is required by the CRD (the verify Job pod's finish time).
+	loop.Status.StallHistory = []coxv1alpha1.StallEntry{{
+		Iteration:            1,
+		JobName:              name + "-verify-1",
+		Hash:                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		NormalisationVersion: "1",
+		Check:                loopCheckCmd,
+		At:                   metav1.Now(),
+	}}
 	setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, "Stalled", "the runner stalled (the iteration budget was exhausted)")
 	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 	return r

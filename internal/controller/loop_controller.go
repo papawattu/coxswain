@@ -4127,6 +4127,19 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	deliverPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{deliverForLabel: loopName}},
 	}
+	// P5c (R31 kind finding): the memory-writer Job's curator call goes to
+	// this SAME model proxy pod (its egress netpol allows the proxy pod,
+	// loop_memory_writer_job.go), so the proxy's INGRESS must admit the
+	// writer pod too. The writer pod carries coxswain.io/memory-write-for=
+	// <loop> (memoryWriterJobLabels), which matches neither the agent peer
+	// (app.kubernetes.io/component=agent) nor the loop label alone (the
+	// writer pod's full label set is the memory-write-for label). Without
+	// this peer the curator call times out at the proxy and every lesson
+	// is dropped with "curator unavailable" (the kind evidence:
+	// .samples/p5c-kind/memory-writer-logs.txt).
+	memoryWriterPeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{memoryWriteForLabelKey: loopName}},
+	}
 	// I42c: the agent's egress to the egress proxy is expected only when the
 	// egress proxy is expected (network allows present); with no network
 	// allows the agent's egress stays model-proxy + DNS (D34).
@@ -4265,7 +4278,11 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{
 				{
-					From:  []networkingv1.NetworkPolicyPeer{agentPeer},
+					// The model proxy admits the Loop's agent AND the memory-writer
+					// Job's curator call on 8080 (the writer's only network call
+					// is the curator POST to this proxy; F8 admits the verify +
+					// deliver pods to the egress proxy above, not this proxy).
+					From:  []networkingv1.NetworkPolicyPeer{agentPeer, memoryWriterPeer},
 					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
 				},
 			},
@@ -4300,7 +4317,7 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	// (agent.modelEndpoint), not read from the Secret (which would require
 	// cluster-wide secrets RBAC and a cluster-wide Secret informer).
 	if loop.Spec.Agent.ModelEndpoint != "" {
-		if peer := modelPeer(loop.Spec.Agent.ModelEndpoint); peer != nil {
+		if peer := modelPeer(loop.Spec.Agent.ModelEndpoint, r.serviceNamespaceFromHost); peer != nil {
 			port := intstrPtr32(int32(modelEndpointPort(loop.Spec.Agent.ModelEndpoint)))
 			proxyNP.Spec.Egress = append(proxyNP.Spec.Egress, networkingv1.NetworkPolicyEgressRule{
 				To:    []networkingv1.NetworkPolicyPeer{*peer},
@@ -4682,9 +4699,7 @@ func (r *LoopReconciler) createOrUpdateNP(ctx context.Context, loop *coxv1alpha1
 func dnsPeer() networkingv1.NetworkPolicyPeer {
 	return networkingv1.NetworkPolicyPeer{
 		NamespaceSelector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"kubernetes.io/metadata.name": "kube-system",
-			},
+			MatchLabels: map[string]string{kubeNSLabelKey: "kube-system"},
 		},
 		PodSelector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{
@@ -4734,7 +4749,7 @@ func egressCarveOutCIDRs(podCIDR, serviceCIDR string) []string {
 //   - anything else (external FQDN that does not resolve here): no peer —
 //     the model egress rule is omitted entirely (fail-closed), and the
 //     hostname-level allow belongs to D35's KubeArmor proxy policy.
-func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
+func modelPeer(endpoint string, nsFromHost func(string) (string, bool)) *networkingv1.NetworkPolicyPeer {
 	host := endpoint
 	if strings.Contains(endpoint, "://") {
 		if u, err := neturl.Parse(endpoint); err == nil && u.Host != "" {
@@ -4751,6 +4766,22 @@ func modelPeer(endpoint string) *networkingv1.NetworkPolicyPeer {
 	if len(host) > 0 && host[0] != '.' && !strings.Contains(host, ".") {
 		return &networkingv1.NetworkPolicyPeer{
 			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{}},
+		}
+	}
+	// P5c proxy egress: the model endpoint is a same-cluster Service FQDN
+	// (svc.ns.svc or svc.ns.svc.<clusterDomain>). The loop proxy must be able
+	// to dial it, so allow egress to the Service's namespace (via the
+	// kubernetes.io/metadata.name label, set by the API server on every
+	// namespace). A service name with a single dot (svc.ns) is not a valid
+	// in-cluster FQDN and is treated as nil (fail-closed). This mirrors
+	// repoPeer's FQDN handling for the workspace git egress. nsFromHost is
+	// domain-aware (r.serviceNamespaceFromHost), so clusters with a custom
+	// cluster domain are handled the same as the default cluster.local.
+	if ns, ok := nsFromHost(host); ok {
+		return &networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"kubernetes.io/metadata.name": ns},
+			},
 		}
 	}
 	return nil
@@ -4804,7 +4835,7 @@ func (r *LoopReconciler) serviceNamespaceFromHost(host string) (string, bool) {
 	// labels is now "<svc>.<ns>" (dots in the Service name are illegal, so
 	// the namespace is everything after the first '.').
 	i := strings.IndexByte(labels, '.')
-	if i <= 0 || i == len(labels)-1 {
+	if i <= 0 || i == len(labels)-1 || strings.IndexByte(labels[i+1:], '.') >= 0 {
 		return "", false
 	}
 	return labels[i+1:], true

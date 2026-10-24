@@ -97,6 +97,29 @@ func TestF55ExternalRepoNoAllowsWaitsForEgressProxy(t *testing.T) {
 	}
 }
 
+// F55 review F1: a repo URL with an EMPTY host (https://:8080/repo.git passes
+// admission) has workspaceInitNeedsProxy true but no host for ensureEgressProxy
+// to allow, so no proxy is ever created. The gate must not wait for it (it
+// would hold Suspended forever with no condition). Gate = creation predicate.
+func TestF55EmptyHostRepoIsNotHeldForAProxyThatIsNeverCreated(t *testing.T) {
+	ctx := context.Background()
+	scheme := f55Scheme(t)
+	loop := f42Loop("f55-emptyhost")
+	loop.Spec.Workspace.Repo = "https://:8080/repo.git"
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
+	r := &LoopReconciler{Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
+	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if !r.workspaceInitNeedsProxy(loop) || r.workspaceInitProxyCreated(loop) {
+		t.Fatalf("precondition: needs=%v created=%v, want needs=true created=false (the degenerate shape)",
+			r.workspaceInitNeedsProxy(loop), r.workspaceInitProxyCreated(loop))
+	}
+	if r.sandboxSuspendedByGate(ctx, loop) {
+		t.Fatal("no egress proxy is created for an empty host, so the gate must not hold the sandbox for one")
+	}
+}
+
 // Positive control: an in-cluster repo needs no proxy, so no proxy pod is no hold.
 func TestF55InClusterRepoDoesNotWaitForEgressProxy(t *testing.T) {
 	ctx := context.Background()

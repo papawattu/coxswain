@@ -2037,7 +2037,7 @@ func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1
 	// repo through the egress proxy even with no network allows (F42), and
 	// ensureEgressProxy creates the proxy for that shape, so the gate must wait
 	// for it too or the first clone gets connection refused.
-	if needsEgressProxy(ctx, r, loop) || r.workspaceInitNeedsProxy(loop) {
+	if needsEgressProxy(ctx, r, loop) || r.workspaceInitProxyCreated(loop) {
 		egPod := &corev1.Pod{}
 		errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod)
 		if errE != nil || !metav1.IsControlledBy(egPod, loop) || !isPodReady(egPod) {
@@ -3304,6 +3304,16 @@ func (r *LoopReconciler) workspaceInitProxyHost(loop *coxv1alpha1.Loop) string {
 	return host
 }
 
+// workspaceInitProxyCreated reports whether ensureEgressProxy adds the
+// workspace-init host (and so creates the proxy) for this Loop. The sandbox
+// gate and ensureEgressProxy both use it, so the gate can never wait for a
+// proxy that is never created (F55 review: a repo URL with an empty host, e.g.
+// https://:8080/repo.git, passes admission, has workspaceInitNeedsProxy true
+// but no host to allow).
+func (r *LoopReconciler) workspaceInitProxyCreated(loop *coxv1alpha1.Loop) bool {
+	return r.workspaceInitProxyHost(loop) != ""
+}
+
 // verifyProxyHost is the repo host to add to the egress proxy's SNI allowlist
 // for the verify Job's clone-base fetch (D61, I42): the repo URL's host:port
 // when the verify Job's clone-base traverses the proxy (verifyNeedsProxy — an
@@ -3345,8 +3355,8 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 	// allowlist even when the AgentPolicy declares no network allows. An
 	// in-cluster repo (repoPeer non-nil) keeps the direct repo-peer rule and
 	// adds no host.
-	if host := r.workspaceInitProxyHost(loop); host != "" {
-		networkAllows = append(networkAllows, host)
+	if r.workspaceInitProxyCreated(loop) {
+		networkAllows = append(networkAllows, r.workspaceInitProxyHost(loop))
 		hasAllows = true
 	}
 	// D61 (I42): the verify Job's clone-base fetch traverses the egress proxy

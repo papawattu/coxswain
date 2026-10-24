@@ -1,12 +1,12 @@
 # Phase 1 review, round 30: a whole-codebase read-only review finds P1s in released code
 
-Round 30, 2026-10-24, since tag `review/phase1-r29`. The owner asked for all
+Round 30, 2026-10-24. It covers the work merged after the R29 doc was drafted (the tag `review/phase1-r29` is on #200, which landed after #201-#208), plus what merged since. Line numbers are against main at `04472d5`, the tree the reviews read; F37 and F39 have since moved some of them. The owner asked for all
 three builder sessions to be kept busy. The reviewer used the third (read-only)
 session for eleven focused, read-only reviews of the released code, then
 verified each finding before queueing it. The reviews are in `.samples/review-*/FINDINGS.md` and
 indexed in `.samples/review-index.md` (not committed). Every P1 below was
-checked by the reviewer against the code, and the two marked *reproduced*
-were run.
+checked by the reviewer against the code, and the one marked *reproduced*
+was run.
 
 | PR | Item | Merge |
 |---|---|---|
@@ -17,13 +17,14 @@ were run.
 | #207 | F37: `shellQuote` escaped an apostrophe wrongly (command injection) | 7dcf262 |
 | #208 | Docs: fix drift found by the docs-vs-code audit | 2a3208f |
 | #209 | Docs: fix drift in samples, examples and chart docs | 9178e51 |
+| #210 | F39: tamper check passed all globs as one pathspec and failed open | dc628a5 |
 
 **Closed in this round** (ticked in their own docs): I99 (cfffcc2), I101
 (8a5940b, 04472d5).
 
 **Status:**
-- **Seven P1s were found in released code** (I103). One (F37) is merged; the
-  rest are queued for builder #2 in order of risk.
+- **Seven P1s were found in released code** (I103). Two (F37, F39) are
+  merged, F40 is in review, and the rest are queued for builder #2 in order of risk.
 - **The reviewer missed one of them earlier.** The D71 memory cap was decided
   but never built, and the Phase 5 acceptance did not check for it (I104).
 - **The specs hid two of the P1s** (I105).
@@ -37,13 +38,13 @@ were run.
 - [ ] **I103: security and integrity defects in released code**
 
   **Where / Problem:** each row was confirmed by the reviewer in the code.
-  Rows marked *reproduced* were also run.
+  The row marked *reproduced* was also run.
 
   | F-item | Defect | Where | State |
   |---|---|---|---|
   | F37 | `shellQuote` wrote `'` as `'''`: an apostrophe broke the script, and two injected commands. It reached the deliver Job, which holds the git credential, via `PR_TITLE` from `spec.goal`. Wrong since S3 (e7148d4). | `loop_controller.go:5540` | merged 7dcf262 |
-  | F39 | The tamper check is a no-op with 2+ globs, including the default `go` preset: the globs were joined into ONE newline-separated pathspec. A failing `git diff` also read as clean. *Reproduced* with real git. | `loop_verify_job.go:522,636,644` | PR #210 (CHANGES) |
-  | F40 | The egress proxy's plain-HTTP client follows redirects, and the dial re-checks nothing, so the allowlist and SSRF carve-outs are bypassed. | `cmd/egress-proxy/main.go:371-375,396-416` | queued |
+  | F39 | The tamper check is a no-op with 2+ globs, including the default `go` preset: the globs were joined into ONE newline-separated pathspec. A failing `git diff` also read as clean. *Reproduced* with real git. | `loop_verify_job.go:522,636,644` | merged dc628a5 (#210) |
+  | F40 | The egress proxy's plain-HTTP client follows redirects, and the dial re-checks nothing, so the allowlist and SSRF carve-outs are bypassed. | `cmd/egress-proxy/main.go:371-375,396-416` | PR #212 (Verdict OK) |
   | F42 | A Loop with no `endpointSecretRef` and no policy network allows gets **no** NetworkPolicy: its agent has open ingress and egress. A missing NetworkPolicy also does not hold the sandbox Suspended. | `loop_controller.go:5266-5270`, `:4596-4619` | queued |
   | F38 | Manual approval + `onVerifyFail: Plan`: the re-plan keeps the stale `PlanApproved`, and the gate reads it before it is cleared, so an unapproved re-plan is implemented and delivered. The B4 spec asserts the bug. | `loop_s4_phase.go:898,922`; `loop_approval.go:491-505` | queued |
   | F35 | The rollback one-shot is keyed on `metadata.generation`, so any spec edit re-runs the restore. `cox pause` patches `spec.suspend` (`internal/cli/pause.go:52`), so pausing after a rollback wipes all work since. `restoreFrom` is documented immutable but has no CEL rule. | `loop_restore.go:222-228,618-630` | queued |
@@ -90,8 +91,9 @@ were run.
     - the tamper script had no execution test (F39);
     - the Manual-approval sandbox hold has no spec (`loop_approval.go:520-535`);
     - the deliver "no pin" branch has no spec (`loop_deliver_job.go:655`).
-  - Separately, `loop_b4_replan_envtest_test.go:383-431` asserts F38's
-    buggy behaviour as correct.
+  - Separately, `loop_b4_replan_envtest_test.go:415-431` codifies F38's
+    bug: its own comment calls the advance to Implementing the normal path,
+    and it asserts only that `PlanApproved` is absent.
   - The AGENTS.md norm ("every gate spec must FAIL when the gate is
     disabled") was being met per PR, but nothing checks it across the codebase.
 
@@ -196,7 +198,7 @@ unanswered.
 ## Still open from earlier rounds (no change)
 
 - OS5's stable Event reasons `GateHeld`, `GateReleased` and `VerifyFailed`
-  do not exist (`docs/REVIEW-PHASE1-R19.md:24`).
+  do not exist (`docs/REVIEW-PHASE1-R19.md:91`).
 - D37 (the flow console) and D42/D43 (fan-out, multi-tenancy) are approved
   in direction but not planned.
 - I62 (the CI cache key and the e2e runner) needs a workflow edit, which is

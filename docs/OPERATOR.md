@@ -345,6 +345,15 @@ Images (`rancher/local-path-provisioner:v0.0.31`, `busybox:1.36`) must be
 pullable or pre-loaded. Tested by `make rwx-storage-test` (real script, stubbed
 kubectl).
 
+**First Loop on a new repo:** the first Loop on a brand-new repository may
+run without memory (no lessons seeded from prior Loops) while its new memory
+PVC binds. This is harmless: there are no prior lessons to seed yet, so the
+agent starts with an empty memory. Once the PVC binds (the `local-shared`
+class provisions it on the first request), subsequent Loops on the same repo
+read the accumulated lessons. The `MemoryPVCUnbound` condition (visible via
+`kubectl cox describe <loop>`) flags the binding wait; it clears automatically
+once the PVC is Bound.
+
 ## Reading Loop status
 
 The `kubectl cox describe` command is the primary way to read a Loop's

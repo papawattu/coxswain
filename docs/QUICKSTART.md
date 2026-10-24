@@ -403,14 +403,14 @@ nodes:
     extraMounts: [{hostPath: /srv/local-path-shared, containerPath: /var/local-path-shared}]
 EOF
 
-kind create cluster --name coxswain-d61 --image kindest/node:v1.34.0 --config /tmp/kind-calico.yaml
+kind create cluster --name coxswain-ref --image kindest/node:v1.34.0 --config /tmp/kind-calico.yaml
 
 # Calico v3.30.1 (pinned)
-kubectl --context kind-coxswain-d61 apply -f \
+kubectl --context kind-coxswain-ref apply -f \
   https://raw.githubusercontent.com/projectcalico/calico/v3.30.1/manifests/calico.yaml
 
 # Wait for the node to become Ready (Calico must be up before anything else)
-kubectl --context kind-coxswain-d61 get nodes -w
+kubectl --context kind-coxswain-ref get nodes -w
 # (wait until READY=Ready; the node transitions NotReady → Ready once Calico is up)
 ```
 
@@ -434,9 +434,9 @@ karmor probe
 
 ```bash
 # The v1.0.4 release manifest (as the Makefile); it creates the namespace.
-kubectl --context kind-coxswain-d61 apply -f \
+kubectl --context kind-coxswain-ref apply -f \
   https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.4/sandbox.yaml
-kubectl --context kind-coxswain-d61 -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
+kubectl --context kind-coxswain-ref -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
 ```
 
 ### Step 5: Build and load the coxswain images
@@ -461,7 +461,7 @@ docker save ghcr.io/papawattu/coxswain-{controller,runner,egress-proxy,model-pro
 
 ssh <vm> "
   for img in controller runner egress-proxy model-proxy tool-proxy; do
-    kind load docker-image ghcr.io/papawattu/coxswain-$img:$BUILD_TAG --name coxswain-d61
+    kind load docker-image ghcr.io/papawattu/coxswain-$img:$BUILD_TAG --name coxswain-ref
   done
 "
 ```
@@ -476,8 +476,8 @@ make build-installer IMG=ghcr.io/papawattu/coxswain-controller:$BUILD_TAG
 
 # Copy to the VM and apply (NO --allow-unenforced, NO --allow-unenforced-network)
 scp dist/install.yaml <vm>:/tmp/install-d61.yaml
-ssh <vm> "kubectl --context kind-coxswain-d61 apply -f /tmp/install-d61.yaml"
-ssh <vm> "kubectl --context kind-coxswain-d61 -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s"
+ssh <vm> "kubectl --context kind-coxswain-ref apply -f /tmp/install-d61.yaml"
+ssh <vm> "kubectl --context kind-coxswain-ref -n coxswain-system rollout status deploy/coxswain-controller-manager --timeout=120s"
 ```
 
 ### RWX memory (optional; Loop memory across nodes)
@@ -492,7 +492,7 @@ pieces make it work:
    and the `local-shared` StorageClass (volumeBindingMode `Immediate`):
 
    ```bash
-   hack/rwx-storage.sh --context kind-coxswain-d61
+   hack/rwx-storage.sh --context kind-coxswain-ref
    ```
 
    Re-running it is safe. See `docs/OPERATOR.md` ("RWX storage for the memory PVC").
@@ -505,9 +505,9 @@ pieces make it work:
 ```bash
 ssh <vm> "
   NS=d61
-  kubectl --context kind-coxswain-d61 create namespace $NS
+  kubectl --context kind-coxswain-ref create namespace $NS
   # Model secret (vLLM is no-auth; the metering proxy needs a non-empty key)
-  kubectl --context kind-coxswain-d61 -n $NS create secret generic beta-model-creds \
+  kubectl --context kind-coxswain-ref -n $NS create secret generic beta-model-creds \
     --from-literal='model-key=d61-dummy-key' \
     --from-literal='MODEL_BASE_URL=http://192.168.1.20:8000'
   # GitHub secret (the token file must be on the VM at ~/.config/coxswain/github-token)
@@ -519,9 +519,9 @@ ssh <vm> "
 
 ```bash
 ssh <vm> "
-  kubectl --context kind-coxswain-d61 apply -f /tmp/d61-loop.yaml
+  kubectl --context kind-coxswain-ref apply -f /tmp/d61-loop.yaml
   # Watch the Loop
-  kubectl --context kind-coxswain-d61 -n d61 get loop d61-loop -w
+  kubectl --context kind-coxswain-ref -n d61 get loop d61-loop -w
 "
 ```
 

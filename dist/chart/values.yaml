@@ -23,6 +23,14 @@ manager:
     pullPolicy: IfNotPresent
 
   ## Arguments
+  ## Note: the chart emits --memory-writer-image BEFORE manager.args (from
+  ## manager.image, F19/P5b). If you also put --memory-writer-image in
+  ## manager.args, it appears twice in the rendered Deployment; the last
+  ## occurrence wins (Go's flag package takes the last value). This is
+  ## intentional: manager.args overrides the chart-derived value. To avoid
+  ## the duplicate, omit --memory-writer-image from manager.args and set
+  ## manager.image.repository/tag instead (the chart derives
+  ## --memory-writer-image from those).
   ##
   args:
     - --leader-elect

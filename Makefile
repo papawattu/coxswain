@@ -230,6 +230,22 @@ egress-proxy-e2e: ## Run the I42a egress proxy kind e2e (real proxy, TLS + plain
 i42-e2e: ## Run the full I42 acceptance kind e2e (pinned to --context kind-coxswain-dev).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/i42-e2e.sh
 
+.PHONY: evil-probes-test
+evil-probes-test: ## F54 execution test: the real test/e2e/evil-probes.sh against stubbed curl/git/unshare/mount (no cluster).
+	@bash test/e2e/evil-probes-test.sh
+
+.PHONY: evil-standin-test
+evil-standin-test: ## F54 execution test: the real test/e2e/evil-standin.py on a port with real chat requests (no cluster).
+	@bash test/e2e/evil-standin-test.sh
+
+.PHONY: evil-agent-e2e
+evil-agent-e2e: evil-probes-test evil-standin-test ## F54 (ADR-0006:95-99) evil-agent e2e, ~15 min: 15 probes + controls, variants (a)/(b) and the tamper Loop. Default context kind-ref (Calico + KubeArmor). Not in CI; run on kind-ref. Evidence under .samples/evil-agent-<epoch>/. EXPECTED TO FAIL on a build without the F42 fix.
+	@K8S_CONTEXT=$${K8S_CONTEXT:-kind-ref} bash test/e2e/evil-agent-e2e.sh
+
+.PHONY: evil-agent-e2e-fast
+evil-agent-e2e-fast: evil-probes-test evil-standin-test ## F54: the evil-agent e2e without the tamper phase (EVIL_AGENT_SKIP_TAMPER=1), ~6 min. Not in CI; run on kind-ref.
+	@EVIL_AGENT_SKIP_TAMPER=1 K8S_CONTEXT=$${K8S_CONTEXT:-kind-ref} bash test/e2e/evil-agent-e2e.sh
+
 .PHONY: d41-e2e
 d41-e2e: ## Run the full D41e kind acceptance (per-tool proxies) kind e2e (pinned to --context kind-coxswain-dev).
 	@K8S_CONTEXT=kind-coxswain-dev KIND_CLUSTER_NAME=coxswain-dev bash test/e2e/d41-e2e.sh
@@ -415,7 +431,7 @@ kubearmor-e2e:
 	@KUBEARMOR_VERSION=$(KUBEARMOR_VERSION) bash test/e2e/kubearmor-exec-block.sh
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: evil-probes-test evil-standin-test setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 

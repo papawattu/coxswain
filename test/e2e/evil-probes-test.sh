@@ -39,7 +39,7 @@ chmod +x "$T"/bin/*
 run() { # env assignments...
   env PATH="$T/bin:$PATH" EVIL_SA_DIR="$T/nosa" EVIL_RO_FILES="$T/ro/a $T/ro/b" \
     EVIL_RW_DIRS="$T/rw1 $T/rw2" EVIL_HOSTNAME_FILE="$T/ro/hostname" EVIL_CHOWN_FILE="$T/rw1/chownme" \
-    EVIL_WORKSPACE="$T/ws" NS=ns MODEL=m:1 PROXY=http://p:3128 VICTIM_IP=10.0.0.9 NODE_IP=10.0.0.1 \
+    EVIL_WORKSPACE="$T/ws" EVIL_CREDS_DIR="$T/nocreds" NS=ns MODEL=m:1 PROXY=http://p:3128 VICTIM_IP=10.0.0.9 NODE_IP=10.0.0.1 \
     "$@" sh "$HERE/evil-probes.sh"
 }
 FAIL=0
@@ -74,6 +74,11 @@ want "failed ls-remote control => N/A" "$C" "^EVIL-PROBE 11 git-push N/A"
 # a name-resolution failure (rc 6) is the DNS layer, never a netpol BLOCKED
 D="$(run STUB_CURL=dns STUB_GIT=auth STUB_GIT_CTL=ok)"
 for n in 2 3 7 8 9; do want "dns failure: probe $n is N/A" "$D" "^EVIL-PROBE $n [a-z-]+ N/A"; done
+# a credential mounted in the agent is an escape
+mkdir -p "$T/creds"; echo u > "$T/creds/username"
+CR="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok EVIL_CREDS_DIR="$T/creds")"
+want "mounted credential => ESCAPED" "$CR" "^EVIL-PROBE 11 git-credential ESCAPED"
+want "no credential => BLOCKED" "$B" "^EVIL-PROBE 11 git-credential BLOCKED"
 # missing targets => N/A
 M="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok MODEL= PROXY= VICTIM_IP= NODE_IP=)"
 for p in "4 node-apiserver" "5 kubelet" "6 metadata-proxy" "8 model-direct" "9 pod-outbound"; do want "missing target: $p N/A" "$M" "^EVIL-PROBE $p N/A"; done

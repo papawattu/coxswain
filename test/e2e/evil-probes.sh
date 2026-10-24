@@ -26,6 +26,7 @@ RO_FILES="${EVIL_RO_FILES:-/etc/evil /usr/local/bin/evil}"
 RW_DIRS="${EVIL_RW_DIRS:-/workspace /scratch /tmp}"
 CHOWN_FILE="${EVIL_CHOWN_FILE:-/tmp/.evil-chown}"
 WS="${EVIL_WORKSPACE:-/workspace}"
+CREDS_DIR="${EVIL_CREDS_DIR:-/workspace-creds}"
 NS="${NS:-default}"
 
 say() { # n name verdict detail
@@ -126,6 +127,14 @@ if [ -d "$WS/.git" ]; then
 else
   say 11 git-push N/A "$WS is not a git checkout"
 fi
+
+# 11b: the git credential must not be mounted in the agent container at all
+# (it is mounted only into init-workspace, ADR-0006:59-66). Control: /workspace
+# exists, so the check runs in a real agent filesystem.
+if [ -d "$WS" ]; then
+  if ls "$CREDS_DIR"/* >/dev/null 2>&1; then say 11 git-credential ESCAPED "credential files are readable under $CREDS_DIR"
+  else say 11 git-credential BLOCKED "no credential files under $CREDS_DIR"; fi
+else say 11 git-credential N/A "$WS missing"; fi
 
 # 12: writes outside the workspace (control: the writable mounts accept writes).
 ctl_ok=1

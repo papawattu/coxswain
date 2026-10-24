@@ -99,8 +99,8 @@ work merged since R30 was drafted. Code line numbers are against main at
     (`loop_controller.go:4213-4274`; `modelProxyEgress` at `:4153`).
   - 17 `0006:53-58` [SUPERSEDED]: a sidecar model proxy → a separate pod (D33,
     `loop_controller.go:2410`).
-  - 18 `0006:87`, `:147-148` [NOT BUILT]: defaults from a ConfigMap → CRD
-    markers.
+  - 18 `0006:87`, `:147-148` [NOT BUILT]: defaults from a ConfigMap → none:
+    the agent fields have no `+kubebuilder:default` markers; the Loop sets them.
   - 19 `0006:91-99` [NOT BUILT] [sec]: the "evil agent" e2e → absent.
     **Queued as F54.**
 

@@ -88,21 +88,26 @@ func TestCapLessonsMultiLineCut(t *testing.T) {
 	}
 }
 
-// TestCapLessonsSizeCap: a proposal over maxLessonChars runes is truncated to
-// the cap (P5b's size cap, ≤500 chars, the plan's named spec). Exactly 500 is
-// kept; 501 is cut to 500.
+// TestCapLessonsSizeCap: a proposal over maxLessonChars runes is DROPPED, not
+// cut (P5b's size cap, ≤500 chars; a cut lesson is a fragment, I99). Exactly
+// 500 is kept; 501 is dropped.
 func TestCapLessonsSizeCap(t *testing.T) {
 	at500 := strings.Repeat("é", 500)
 	at501 := strings.Repeat("x", 501)
-	got := capLessons([]string{at500, at501})
-	if len(got) != 2 {
-		t.Fatalf("size cap: got %d lessons, want 2", len(got))
+	got := capLessons([]string{at500, at501, "short"})
+	if len(got) != 2 || got[0] != at500 || got[1] != "short" {
+		t.Fatalf("size cap: got %d lessons, want the 500-rune one and \"short\"", len(got))
 	}
-	if r := []rune(got[0]); len(r) != 500 {
-		t.Fatalf("size cap: 500-rune lesson has %d runes", len(r))
-	}
-	if r := []rune(got[1]); len(r) != 500 {
-		t.Fatalf("size cap: 501-rune lesson was not cut to 500 (got %d)", len(r))
+}
+
+// TestParseLessonsWrappedTooLongDropped (I99): three wrapped 200-char lines
+// join to over 500 runes; the lesson is dropped, not stored cut mid-word.
+func TestParseLessonsWrappedTooLongDropped(t *testing.T) {
+	l := strings.Repeat("w", 200)
+	reply := "LESSON: " + l + "\n" + l + "\n" + l + "\nLESSON: kept\n"
+	got := capLessons(parseLessons(reply))
+	if len(got) != 1 || got[0] != "kept" {
+		t.Fatalf("got %d lessons %q, want only \"kept\"", len(got), got)
 	}
 }
 

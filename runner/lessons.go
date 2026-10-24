@@ -105,10 +105,13 @@ func capLessons(lessons []string) []string {
 				continue
 			}
 		}
-		// Size cap: truncate to maxLessonChars RUNES (the cap is character-
-		// based, PLAN-PHASE5.md: "the size cap (≤500 chars)").
-		if r := []rune(l); len(r) > maxLessonChars {
-			l = string(r[:maxLessonChars])
+		// Size cap: DROP a lesson over maxLessonChars RUNES (the cap is
+		// character-based, PLAN-PHASE5.md: "the size cap (≤500 chars)").
+		// Truncating would store a mid-word fragment (I99); the operator's
+		// screen (pkg/memorywrite, "size-cap") drops it the same way.
+		if n := len([]rune(l)); n > maxLessonChars {
+			log.Printf("runner: dropping lesson of %d chars (> %d cap, too-long)", n, maxLessonChars)
+			continue
 		}
 		out = append(out, l)
 	}

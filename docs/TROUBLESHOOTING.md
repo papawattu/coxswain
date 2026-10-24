@@ -266,7 +266,7 @@ to see whether a foreign object is in the way.
 ### Sandbox Suspended with no condition explaining why (F42-b)
 
 **What you see:** the sandbox is `Suspended` and no condition names the
-cause, or the cause names nothing yet.
+cause.
 
 **What it means:** the agent NetworkPolicy is **absent** — `agentNetPolMissing`
 (in `internal/controller/loop_controller.go`) is a gate term in the
@@ -280,9 +280,9 @@ cause — a persistent absence is never silent.
 
 **What to do:** `kubectl get networkpolicy -n <ns>` and look for
 `<loop>-agent-netpol`. If it is missing and the condition above is `False`,
-act on its message. If it is missing and no condition is set, the operator
-has not reconciled this Loop yet — the early ensure will create it on the
-next pass.
+act on its message. If it is missing and no condition is set, this pass did
+not reach the ensure (an earlier gate can also return first) — check the
+operator log; the next pass creates it.
 
 ### Sandbox Suspended while the `<loop>-egress-proxy` pod is not Ready (F55-a)
 
@@ -291,7 +291,8 @@ proxy.
 
 **What it means:** the sandbox gate now also waits for the egress proxy when
 the workspace-init clone must traverse it (`workspaceInitProxyCreated` in
-`internal/controller/loop_controller.go`), not only when network allows exist. For an external repo with no network allows,
+`internal/controller/loop_controller.go`), not only when network allows exist.
+For an external repo with no network allows,
 the init clone goes through the egress proxy, so the sandbox cannot start until
 that pod is Ready.
 

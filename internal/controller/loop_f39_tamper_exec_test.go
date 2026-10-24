@@ -144,9 +144,17 @@ func TestTamperScriptFailsClosedOnGitError(t *testing.T) {
 // not run a pathspec-less git diff (which would flag every change).
 func TestTamperScriptNoGlobsIsClean(t *testing.T) {
 	dir, base, verified := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// agent work\n"))
-	code, out := f39Run(t, dir, base, verified, nil)
-	if code != 0 || !strings.Contains(out, "tamper: clean") {
-		t.Fatalf("no protected paths: exit=%d output=%q, want clean", code, out)
+	// The real expansion paths that yield zero globs (T-1): preset none with
+	// no protectedPaths, and an override with none; plus a nil list.
+	for name, globs := range map[string][]string{
+		"nil":               nil,
+		"preset none":       tamper.ExpandPreset(tamper.PresetNone, nil, false),
+		"override, no list": tamper.ExpandPreset(tamper.PresetGo, nil, true),
+	} {
+		code, out := f39Run(t, dir, base, verified, globs)
+		if code != 0 || !strings.Contains(out, "tamper: clean (no protected paths)") {
+			t.Fatalf("%s: exit=%d output=%q, want explicit clean", name, code, out)
+		}
 	}
 }
 

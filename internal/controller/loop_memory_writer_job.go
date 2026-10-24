@@ -45,6 +45,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -940,9 +941,9 @@ func bumpMemoryWriteMetrics(outcome, summary string) {
 // memoryWriteVerdicts counts the lessons of the writer's summary by verdict.
 // The summary's COUNTS line ("summary: total=N written=W dropped=D",
 // cmd/memory-writer summaryLine) is authoritative for kept and for the total
-// dropped: the per-lesson lines can disagree with it (two identical lessons in
-// one batch both read "written" while the counts say written=1 dropped=1,
-// reviewer finding P3-2, queued as F33). The per-lesson lines are used only to
+// dropped. The per-lesson lines agree with it (the writer de-dupes identical
+// lessons in a batch before writing, F33 P3-2), so the counts line stays the
+// authority and the lines are used only to
 // split the drops: a line "dropped" with a reason that starts "curator: " or is
 // "curator unavailable" is a curator drop; the remaining drops (static policy,
 // ineligible outcome, duplicate) are static drops. A summary with no counts
@@ -986,9 +987,12 @@ func memoryWriteVerdicts(summary string) (kept, static, curatorDrop int) {
 // from the bounded summary (item 7, the Phase 5 done-when PLAN.md:85):
 // "memory write completed — audit: " + the per-lesson verdict lines (one
 // line each: "lesson-<n> <sha12> written|dropped <reason>") + the counts
-// line. The summary is the Job's own output (never lesson text — the Job's
-// summary lines carry only the sha256-prefix, written|dropped, and the
-// rule), so echoing it on the Loop leaks no lesson content. A failed write
+// line. The summary is the Job's own output. The lines carry the sha256-prefix,
+// written|dropped and the rule; for a lesson the curator judged the rule is the
+// curator's reason, which is free model text (pkg/curator strips CR/LF and cuts
+// at 200 runes) and CAN quote the lesson (F33, p5-code P3-5). The text already
+// passed the secrets screen, so this is not a credential leak, but the audit is
+// not guaranteed lesson-free. A failed write
 // is UNRELIABLE evidence (the write did not complete) and gets the plain
 // failure message — the operator does not fabricate an audit for a write
 // that did not happen. An empty summary (no termination message) falls
@@ -1006,16 +1010,20 @@ func memoryWriteAuditMessage(summary string) string {
 // "<reason>" string, or the static rule name), so the text shows which
 // lessons were written and why. The Event's message is capped by
 // client-go (1024 bytes); the Job's summary is bounded to 4096 bytes, so
-// the audit text is truncated to 1000 bytes here (the per-lesson lines are
-// ≤ ~80 bytes each; the truncation never cuts mid-lesson for the bounded
-// lesson count the policy enforces). The truncation is BOUNDED and never
-// includes lesson text (the summary lines are sha-prefix + status + rule).
+// the audit text is truncated to 1000 bytes here, on a rune boundary (a byte
+// cut could split a multi-byte rune of a curator reason, F33 P3-5). The
+// truncation is bounded; the lines are sha-prefix + status + rule, where a
+// curator reason is model text (see memoryWriteAuditMessage).
 func memoryWriteAuditText(summary string) string {
 	const max = 1000
 	text := strings.ReplaceAll(summary, "\n", " ")
 	text = strings.TrimSpace(text)
 	if len(text) > max {
-		return text[:max] + "…"
+		cut := max
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		return text[:cut] + "…"
 	}
 	return text
 }

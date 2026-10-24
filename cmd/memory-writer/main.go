@@ -653,6 +653,9 @@ func markBatchDuplicates(lessons, reasons []string) []string {
 			continue
 		}
 		if seen[l] {
+			// "duplicate" of the earlier copy: marked before the curator judges
+			// the original, so if the curator drops it this reads "duplicate"
+			// of a lesson that was never written. The counts still agree.
 			reasons[i] = "duplicate"
 			continue
 		}

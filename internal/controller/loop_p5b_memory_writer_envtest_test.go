@@ -679,8 +679,12 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		r := s6SucceededLessonsAvailableWith(name, ns, func(c client.Client) client.Client {
 			return &failNetPolCreateClient{Client: c}
 		})
-		_, _ = r.Reconcile(context.Background(),
+		_, err := r.Reconcile(context.Background(),
 			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		// The error text is the only signal this failure produces: assert the
+		// netpol step was reached AND failed, so "not reached" cannot pass.
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("memory-writer netpol"))
 		job := &batchv1.Job{}
 		getErr := k8sClient.Get(context.Background(), types.NamespacedName{
 			Name: memoryWriterJobName(p5bMustLoop(ns, name)), Namespace: ns,

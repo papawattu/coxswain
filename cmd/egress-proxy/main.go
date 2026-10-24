@@ -371,6 +371,15 @@ func (p *h) proxyRequest(w http.ResponseWriter, r *http.Request, resolvedIP net.
 	client := &http.Client{
 		Transport: p.transport(),
 		Timeout:   60 * time.Second,
+		// F40: never follow an upstream redirect. The redirect target was not
+		// checked against the allowlist or the carve-outs, so following it
+		// would let an allowlisted host steer the proxy to an internal
+		// address (SSRF, e.g. 169.254.169.254). As a forward proxy, pass the
+		// 3xx back to the agent, which re-requests through the proxy and is
+		// checked like any other request.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 	resp, err := client.Do(out)
 	if err != nil {

@@ -127,6 +127,7 @@ func s6Succeeded(name, ns string, repo string) *LoopReconciler {
 	// Verifying: the verify Job's evidence.
 	s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
 	s6Reconcile(r, ns, name)
+	s6ForceSucceededFromHold(ns, name)
 	loop = &coxv1alpha1.Loop{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 	Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
@@ -134,6 +135,32 @@ func s6Succeeded(name, ns string, repo string) *LoopReconciler {
 	Expect(loop.Status.CurrentVerify).ToNot(BeNil(), "status.currentVerify must be pinned")
 	Expect(loop.Status.CurrentVerify.VerifiedCommit).To(Equal(s6HeadCommit))
 	return r
+}
+
+// s6ForceSucceededFromHold (P5f) asserts the Loop that just passed verify with
+// delivery on is HELD at Verifying (condition Verifying=True/Delivering), then
+// flips it to Succeeded with the delivery not yet recorded. That state is no
+// longer reachable through the verify path (I98), but it is still a valid
+// Loop (a Succeeded Loop created by an older operator, or one the deliver
+// machinery must handle after settle), and the S6/I52/I72/P5b specs exercise
+// the deliver Job from it.
+func s6ForceSucceededFromHold(ns, name string) {
+	ctx := context.Background()
+	loop := &coxv1alpha1.Loop{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+	Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+		"P5f: a verify-passed delivery-on Loop is held at Verifying")
+	Expect(loopHoldingForDelivery(loop)).To(BeTrue())
+	conds := []metav1.Condition{}
+	for _, c := range loop.Status.Conditions {
+		if c.Type != string(coxv1alpha1.LoopPhaseVerifying) {
+			conds = append(conds, c)
+		}
+	}
+	loop.Status.Conditions = conds
+	loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
+	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 }
 
 // s6Loop builds a S6 delivery Loop: an in-cluster .svc repo (the kind demo's

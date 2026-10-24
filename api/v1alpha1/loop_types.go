@@ -138,6 +138,10 @@ const DeliveredCondition = "Delivered"
 const (
 	// ReasonDelivered: the verified commit is pushed and the PR is open.
 	ReasonDelivered = "Delivered"
+	// ReasonVerifyingDelivering: the reason on the Verifying condition while
+	// the Loop passed verify and is held at phase Verifying until Delivered is
+	// terminal (P5f, I98). Succeeded is set only after.
+	ReasonVerifyingDelivering = "Delivering"
 	// ReasonDeliveryInProgress: the deliver Job has not terminated yet.
 	ReasonDeliveryInProgress = "InProgress"
 	// ReasonDeliveryFailed: the deliver Job definitively failed (an init or

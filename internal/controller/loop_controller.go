@@ -953,6 +953,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// P5f (I98): a Loop held at Verifying+Delivering becomes Succeeded once
+	// the Delivered condition is terminal.
+	if settleDeliveryHold(&loop) {
+		changed = true
+	}
 
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
 	// gate (see applyTamperGate for the tri-state logic). The gate must run

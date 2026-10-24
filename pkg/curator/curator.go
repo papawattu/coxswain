@@ -51,7 +51,16 @@ type Client struct {
 	baseURL string // e.g. http://<loop>-proxy.<ns>.svc:8080
 	model   string // the model name for the request body
 	http    *http.Client
+	// retryDelays are the waits before each retry of a TRANSPORT failure
+	// (the request never got an HTTP response). F41: on k3s the writer Job's
+	// first call, made at pod start, failed every time and the same call
+	// succeeded after a 10s start delay; a short bounded retry rides that out.
+	retryDelays []time.Duration
 }
+
+// defaultRetryDelays: 3 retries, 7s in total — well inside the writer's
+// overall curator budget (120s) and the Job deadline (300s).
+var defaultRetryDelays = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 // NewClient builds a curator client. baseURL is the model proxy's base URL
 // (the Job's COX_CURATOR_BASE_URL env); model is the Loop's model name
@@ -61,6 +70,8 @@ func NewClient(baseURL, model string) *Client {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		model:   model,
 		http:    &http.Client{Timeout: 60 * time.Second},
+
+		retryDelays: defaultRetryDelays,
 	}
 }
 
@@ -101,17 +112,30 @@ func (c *Client) Judge(ctx context.Context, lesson string) Verdict {
 		return Verdict{Keep: false, Reason: "curator unparseable (marshal error)"}
 	}
 
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(reqBody),
-	)
-	if err != nil {
-		return Verdict{Keep: false, Reason: "curator unavailable (request error)"}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return Verdict{Keep: false, Reason: "curator unavailable (call failed)"}
+	// Transport failures (no HTTP response) are retried on a short backoff;
+	// an HTTP status or a bad body is never retried (fail-closed, D70: the
+	// lesson is still dropped when every attempt fails).
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(reqBody),
+		)
+		if err != nil {
+			return Verdict{Keep: false, Reason: "curator unavailable (request error)"}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err = c.http.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt >= len(c.retryDelays) {
+			return Verdict{Keep: false, Reason: "curator unavailable (call failed)"}
+		}
+		select {
+		case <-ctx.Done():
+			return Verdict{Keep: false, Reason: "curator unavailable (call failed)"}
+		case <-time.After(c.retryDelays[attempt]):
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 

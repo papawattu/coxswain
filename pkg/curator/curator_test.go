@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // openAIResponse is the OpenAI /v1/chat/completions response envelope.
@@ -129,6 +131,7 @@ func TestCuratorCallFailure(t *testing.T) {
 	// The model proxy is down (connection refused): the verdict is
 	// keep=false ("curator unavailable").
 	c := NewClient("http://127.0.0.1:1", "test-model") // nothing on port 1
+	c.retryDelays = []time.Duration{time.Millisecond}
 	v := c.Judge(context.Background(), "a good lesson")
 	if v.Keep {
 		t.Errorf("Keep = true on call failure, want false")
@@ -309,5 +312,81 @@ func TestCuratorResponseBodyBounded(t *testing.T) {
 	if !strings.Contains(v.Reason, "unparseable") {
 		// 'read error' would mean the bound is missing and ReadAll consumed the full body.
 		t.Fatalf("Reason = %q, want 'curator unparseable' (the LimitReader truncated the read)", v.Reason)
+	}
+}
+
+// flakyProxy closes the first `drop` connections without a response (a
+// transport failure: the client sees EOF), then answers keep=true. hits counts
+// every request that reached the server.
+func flakyProxy(t *testing.T, drop int, hits *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(hits.Add(1))
+		if n <= drop {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"keep\": true, \"reason\": \"ok\"}"}}]}`))
+	}))
+}
+
+// TestCuratorRetriesTransportFailure (F41): the first calls fail with no
+// response (the k3s pod-start case); a later attempt succeeds, so the lesson
+// is judged instead of dropped as "call failed".
+func TestCuratorRetriesTransportFailure(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 2, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	v := c.Judge(context.Background(), "a good lesson")
+	if !v.Keep {
+		t.Fatalf("Keep = false (%q), want true after the transport retries", v.Reason)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Errorf("requests = %d, want 3 (2 dropped + 1 answered)", got)
+	}
+}
+
+// TestCuratorRetryBounded (F41): a persistent transport failure makes exactly
+// 1+len(retryDelays) attempts, then drops fail-closed.
+func TestCuratorRetryBounded(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 1000, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	v := c.Judge(context.Background(), "a good lesson")
+	if v.Keep || !strings.Contains(v.Reason, "call failed") {
+		t.Fatalf("verdict = %+v, want keep=false 'call failed'", v)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Errorf("requests = %d, want 3 (1 + 2 retries)", got)
+	}
+}
+
+// TestCuratorNoRetryOnHTTPStatus (F41): an HTTP response (even a 500) is an
+// answer, not a transport failure: one request, no retry.
+func TestCuratorNoRetryOnHTTPStatus(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	v := c.Judge(context.Background(), "a good lesson")
+	if v.Keep || !strings.Contains(v.Reason, "HTTP 500") {
+		t.Fatalf("verdict = %+v, want keep=false 'HTTP 500'", v)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("requests = %d, want 1 (no retry on an HTTP status)", got)
 	}
 }

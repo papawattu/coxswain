@@ -314,6 +314,28 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 		Expect(loop.Status.Delivery).ToNot(BeNil(), "the delivery result is recorded")
 	})
 
+	It("P2-1b: the budget DECISION is inert during the hold (already-exceeded wall clock does not fail a held Loop)", func() {
+		ns := freshNS("p5f-budget2")
+		name := "budget2"
+		r := p5fToVerifyPassed(name, ns, true, false, func(l *coxv1alpha1.Loop) {
+			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxWallClock: "1m", OnExceeded: coxv1alpha1.BudgetExceededActionFail}
+		})
+		s6Reconcile(r, ns, name)
+		l := p5fGet(ns, name)
+		Expect(loopHoldingForDelivery(l)).To(BeTrue())
+		if l.Status.Budget == nil {
+			l.Status.Budget = &coxv1alpha1.BudgetStatus{}
+		}
+		l.Status.Budget.ActiveSeconds = 7200 // past the 1m cap, as if accrued before the hold
+		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+		var loop *coxv1alpha1.Loop
+		for range 3 {
+			loop = s6Reconcile(r, ns, name)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "the budget decision must not fail a held Loop")
+		Expect(loopHoldingForDelivery(loop)).To(BeTrue())
+	})
+
 	It("P2-2: clearing spec.delivery mid-hold settles to Succeeded (no permanent hold)", func() {
 		ns := freshNS("p5f-clear")
 		name := "clear1"

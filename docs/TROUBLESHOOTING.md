@@ -57,6 +57,39 @@ changed how the failure looks (it now surfaces as a named, bounded
 `ModelUnavailable` condition), but it did not change the underlying cause
 (the backend outage).
 
+### Reading the evidence when the model endpoint is slow or down
+
+Where to look: the proxy log (`kubectl cox logs <loop> proxy`). A
+completed request produces one audit line per metered request (source
+`model-proxy`, the HTTP `status`, `usagePresent`); a hung call produces
+**no** audit line at all, since the line is written only after the upstream
+responds. A 502 means the proxy could not dial the upstream at all (the
+reverse proxy's default failure). The model proxy itself sets **no**
+timeouts and does **not** retry — one request dials the upstream exactly
+once, and a non-2xx response is returned as-is (`internal/proxy`);
+the bound is on the runner side.
+
+What times out: the runner bounds each model request with a 120-second
+per-request timeout (`defaultModelTimeout` in `runner/runner.go`). There
+is deliberately no client-level timeout: a client-level timeout would race
+the per-request context and could cut a long request.
+
+What happens after a timeout: a timeout (context deadline exceeded) is
+retried up to 3 more times with exponential backoff (2s, 4s, 8s). A
+non-timeout error (HTTP 500, connection refused) is **not** retried: the
+server responded, so the error is definitive. When all attempts fail, the
+runner exits blocked with a claim carrying `ModelUnavailable: <cause>`;
+the operator maps the claim to the `ModelAvailable=False` condition
+(reason `ModelUnavailable`, set in `applyModelAvailableCondition`,
+`internal/controller`). Worst case to the condition: ~8 minutes (4 × 120s
++ 14s backoff). A success claim resets the condition to `True` (reason
+`Recovered`), so the condition returning to True means the backend
+recovered, not that anything was tuned.
+
+Tuning: there is no user-facing knob for the timeout, retry count, or
+backoff — the runner's `runConfig.ModelTimeout` field is never set by the
+runner entrypoint, so the timeout is fixed at 120s in practice.
+
 ## Service DNS NXDOMAIN from a fresh kind cluster
 
 **What you see:** on a freshly created kind cluster, lookups of

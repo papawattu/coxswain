@@ -20,6 +20,7 @@ was run.
 | #210 | F39: tamper check passed all globs as one pathspec and failed open | dc628a5 |
 | #212 | F40: egress proxy followed upstream redirects to unchecked addresses (SSRF) | c9a53f8 |
 | #213 | F42: the agent ran unfenced without a NetworkPolicy | b90d1db |
+| #216 | F36: VolumeSnapshot label write used Update (Forbidden) and restore progress defects | 6eb74c2 |
 | #215 | F35: restore re-ran on any spec edit (one-shot keyed on generation) | 628fb1a |
 | #214 | F38: an unapproved re-plan was implemented (stale approval on re-plan) | daf4cd6 |
 
@@ -27,8 +28,7 @@ was run.
 (8a5940b, 04472d5).
 
 **Status:**
-- **Seven P1s were found in released code** (I103). Six (F37, F39, F40, F42, F38, F35) are
-  merged, and the rest are queued for builder #2 in order of risk.
+- **Seven P1s were found in released code** (I103). All seven are merged (F37, F39, F40, F42, F38, F35, F36).
 - **The reviewer missed one of them earlier.** The D71 memory cap was decided
   but never built, and the Phase 5 acceptance did not check for it (I104).
 - **The specs hid two of the P1s** (I105).
@@ -52,7 +52,7 @@ was run.
   | F42 | A Loop with no `endpointSecretRef` and no policy network allows gets **no** NetworkPolicy: its agent has open ingress and egress. A missing NetworkPolicy also does not hold the sandbox Suspended. | `loop_controller.go:5266-5270`, `:4596-4619` | merged b90d1db (#213) |
   | F38 | Manual approval + `onVerifyFail: Plan`: the re-plan keeps the stale `PlanApproved`, and the gate reads it before it is cleared, so an unapproved re-plan is implemented and delivered. The B4 spec asserts the bug. | `loop_s4_phase.go:898,922`; `loop_approval.go:491-505` | merged daf4cd6 (#214) |
   | F35 | The rollback one-shot is keyed on `metadata.generation`, so any spec edit re-runs the restore. `cox pause` patches `spec.suspend` (`internal/cli/pause.go:52`), so pausing after a rollback wipes all work since. `restoreFrom` is documented immutable but has no CEL rule. | `loop_restore.go:222-228,618-630` | merged 628fb1a (#215) |
-  | F36 | The fork-retention label is written with `Update`, but RBAC grants only `patch` on volumesnapshots. It is Forbidden on every real cluster, logged at V(1), so the source's GC can delete a snapshot a fork is restoring from. | `loop_controller.go:548`; `loop_restore.go:1016,1053` | queued |
+  | F36 | The fork-retention label is written with `Update`, but RBAC grants only `patch` on volumesnapshots. It is Forbidden on every real cluster, logged at V(1), so the source's GC can delete a snapshot a fork is restoring from. | `loop_controller.go:548`; `loop_restore.go:1016,1053` | merged 6eb74c2 (#216) |
 
   **Fix:** one PR per F-item. Each needs: an execution test for any changed
   script; a named mutation that makes a spec fail; and kind evidence on an

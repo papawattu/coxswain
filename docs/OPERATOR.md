@@ -255,10 +255,10 @@ The `kubectl cox logs` command streams the **sandbox component** logs
 (agent, proxy, verify, deliver) — not the operator log:
 
 ```sh
-kubectl cox logs <loop> agent    # the runner (agent) log
-kubectl cox logs <loop> proxy    # the model proxy sidecar log
-kubectl cox logs <loop> verify   # the verify Job log
-kubectl cox logs <loop> deliver  # the deliver Job log
+kubectl cox logs <loop> --component agent    # the runner (agent) log
+kubectl cox logs <loop> --component proxy    # the model proxy log (its own pod)
+kubectl cox logs <loop> --component verify   # the verify Job log
+kubectl cox logs <loop> --component deliver  # the deliver Job log
 ```
 
 ---
@@ -462,10 +462,10 @@ field is the most useful diagnostic:
 - `ModelUnavailable` → the model backend is unreachable. Check the proxy
   pod (`kubectl -n <ns> get pods | grep <loop>-proxy`), the model endpoint
   (`spec.agent.modelEndpoint`), and the proxy log (`kubectl cox logs <loop>
-  proxy`).
+  --component proxy`).
 - `Stalled` → the verify Job is producing identical failures. Read the
   stall history (`status.stallHistory`) and the verify Job log (`kubectl
-  cox logs <loop> verify`). The check output is in the verify Job's
+  cox logs <loop> --component verify`). The check output is in the verify Job's
   termination message.
 - `BudgetExceeded` → a budget cap was hit. Read `status.budget` (the token
   counts, wall-clock time, cost) and `spec.budget` (the caps).
@@ -482,7 +482,7 @@ container's termination message) is the evidence for why the checks
 failed:
 
 ```sh
-kubectl cox logs <loop> verify
+kubectl cox logs <loop> --component verify
 ```
 
 If the verify Job is still Running (not yet terminal), the Loop is in the
@@ -501,7 +501,7 @@ implementing, the model calls). If the agent is stuck in a phase, the log
 will show the last model response or the last action:
 
 ```sh
-kubectl cox logs <loop> agent
+kubectl cox logs <loop> --component agent
 ```
 
 ### 4. Check the sandbox pod
@@ -830,10 +830,11 @@ policy change.
 
 ### Example lines
 
-An allowed HTTPS connection. The record shape is the one asserted against
-live output by the e2e (the e2e asserts the same `kubectl logs` command
-against a running proxy pod); the values shown here are illustrative, taken
-from the record-shape unit test:
+An allowed HTTPS connection. The record shape (the keys, `verdict`, and
+`ip=` in `detail`) is asserted against a live proxy pod by
+`test/e2e/i42-e2e.sh`, which fetches the log by pod name
+(`<loop>-egress-proxy`); no test fetches it by label. The values shown here
+are illustrative, taken from the record-shape unit test:
 
 ```
 {"time":"2026-09-28T12:00:00Z","loop":"loop-x","namespace":"ns-x",

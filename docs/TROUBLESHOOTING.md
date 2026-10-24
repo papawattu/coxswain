@@ -59,7 +59,7 @@ changed how the failure looks (it now surfaces as a named, bounded
 
 ### Reading the evidence when the model endpoint is slow or down
 
-Where to look: the proxy log (`kubectl cox logs <loop> proxy`). A
+Where to look: the proxy log (`kubectl cox logs <loop> --component proxy`). A
 completed request produces one audit line per metered request (source
 `model-proxy`, the HTTP `status`, `usagePresent`); a hung call produces
 **no** audit line at all, since the line is written only after the upstream

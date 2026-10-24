@@ -12,6 +12,7 @@ see `docs/QUICKSTART.md`.
 - [Logs](#logs)
 - [Shared memory storage (Phase 5)](#shared-memory-storage-phase-5)
 - [Reading Loop status](#reading-loop-status)
+- [What the sandbox can and cannot reach](#what-the-sandbox-can-and-cannot-reach)
 - [Debugging a stuck Loop](#debugging-a-stuck-loop)
 - [Uninstall](#uninstall)
 - [Upgrade](#upgrade)
@@ -614,6 +615,117 @@ make helm-uninstall   # helm uninstall coxswain -n coxswain-system
 ```
 
 ---
+
+## What the sandbox can and cannot reach
+
+This section is the operator's view of what a sandboxed agent is and is not
+able to do or see. It records the security posture the operator can rely on
+when choosing what to give a Loop, including the accepted MVP widenings and
+the known gaps. The code references name functions and fields (not line
+numbers, which drift); the amendment rows (ADR-0004/0005/0006/0007) and the
+ADR text they cite are the normative source, and the merged ADR text
+(`docs/adr/...`) is the stable citation below.
+
+### What the sandbox can reach
+
+The model, through the model proxy only. When the Loop declares a model
+endpoint (`spec.agent.endpointSecretRef` set), the agent's only route to the
+model is the model proxy: `COX_MODEL_BASE_URL` is set (in `agentPodSpec`) to
+the proxy's in-cluster Service URL (via `proxyServiceURL`), and the agent's
+egress NetworkPolicy names the proxy pod as a peer (built by
+`modelProxyEgress`). A Loop with no endpoint has no model route at all —
+`modelProxyEgress` adds no peer and no `COX_MODEL_BASE_URL` is set. The
+proxy pod, not the agent, holds the model key: the model-credentials Secret
+is mounted into the per-Loop proxy pod only, so the agent container never
+carries a model key (0006-A1 row 17).
+
+The network allows, through the egress proxy. When the effective policy has
+network allows, the agent's egress to the outside world runs through the
+per-Loop egress proxy, which enforces the `host:port` allowlist at the
+CONNECT / SNI / Host layer (ADR-0007, "I42 resolution": the per-Loop proxy
+decision and the CONNECT + SNI/Host enforcement point; 0006-A1 row 16).
+DNS is allowed to the agent pod (the `dnsPeer()` egress rule built in
+`ensureNetworkPolicy`; 0006-A1 row 16).
+
+The repo host, on a pod-wide widening. The agent pod's egress allowlist also
+names the repository host so the workspace init container's first clone can
+fetch. This is a **pod-wide** rule (NetworkPolicy has no per-container
+scoping), documented in place as an accepted MVP widening: the agent
+container can reach the repo host too (the "P3 (known limitation, MVP)"
+comment in `ensureNetworkPolicy`: "the AGENT container can also reach the
+repo host … Accepted for the MVP"). Note the in-place "S3a" comment a few
+lines above it says the repo rule "does NOT widen the agent's runtime egress"
+because the init container runs to completion before the agent starts —
+that claim is the inaccurate one: the rule the CNI enforces is pod-wide, so
+the widening is real (the two comments disagree in spirit; the P3 one
+matches what a NetworkPolicy can express).
+
+The tool proxies. The allowlist adds one egress peer per tool proxy, one per
+tool in the effective policy (the `toolProxyNetpolPeer` rule in
+`ensureNetworkPolicy`; 0006-A1 row 16).
+
+### What the sandbox cannot reach
+
+The model endpoint, directly. A direct agent → model-endpoint connection is
+dropped by the NetworkPolicy, because the endpoint is not in the agent pod's
+allowlist (which is only the model proxy, the egress proxy when network
+allows exist, DNS, the repo host, and the tool proxies). The attempt is
+**not** recorded in the activity audit (there is no engine-alert producer
+for a CNI/NetworkPolicy drop) and is not metered (the call is dropped)
+(0007-A2 row 26).
+
+The ADR-0007 claim that eBPF enforces per-container egress so the agent
+container is fenced from the proxy's model-endpoint allow is **not built**:
+`emitKubeArmorPolicy` emits one pod-level union of every container's allows,
+so the KubeArmor policy cannot distinguish the agent container from the
+proxy container (the emitter's own comment says the per-container split is
+enforced elsewhere; 0007-A2 row 26; 0006-A1 row 16).
+
+Everything else. The agent pod's egress default-deny stands: anything not in
+the allowlist above (proxies, DNS, repo host, tool proxies) is dropped by
+the CNI (0007-A2 row 26; 0006-A1 row 16). In-cluster targets cannot be
+allowed into the egress proxy at all: a `*.svc` name, a cluster DNS suffix,
+or an in-CIDR IP literal is rejected at policy-validation time, and the
+proxy's resolved-IP check rejects private/link-local/cluster-CIDR IPs as a
+backstop (ADR-0007, "Resolved-IP check (SSRF defence)").
+
+No credentials in the agent container. The only Secret volume the sandbox
+pod ever carries is the git credential: it is mounted read-only into the
+workspace init container for the first clone only — once the base SHA is
+pinned it is omitted from the pod (the "credential volume exists ONLY for
+the first clone" comment in `agentPodSpec`; asserted in
+`loop_s3_workspace_test.go`), and the agent container never mounts it. The
+agent container therefore holds no model key and no git credential at
+runtime. It also carries no service-account token: the pod sets
+`automountServiceAccountToken: false` explicitly (asserted in
+`loop_c1_hardening_test.go`), so the agent has no API-server identity at
+all.
+
+### What the sandbox cannot see of itself
+
+The runner reports its phase claim through the agent container's
+**termination message**, which the operator reads with a plain pod `Get`
+(`readPhaseClaimFromTerminationMessage`); there is no `pods/exec` grant and
+the operator never execs into the sandbox (0004-A1 rows 2–3; 0005-A1 row 2).
+Verify failures feed back to the next iteration via the check container's
+termination message (`verifyFailureSummary` on
+`status.verify.lastFailureSummary`); the operator has no `pods/log` grant
+and reads no pod logs (0005-A1 row 8).
+
+### Known gaps (stated here so they are not missed)
+
+- If the BPF-LSM label is removed from the node the sandbox actually landed
+  on, the running sandbox is not re-suspended by the gate; there is no
+  post-start re-check anchored to the pod's landed node (0007-A2 A1 row 30).
+- A NetworkPolicy drop is unaudited: there is no producer that translates
+  engine or CNI denials into the Q4 audit envelope (0007-A2 row 26,
+  pointing at I107 row 25).
+- The policy hash (`status.policy.effectiveHash`) is a current-value field,
+  not a per-iteration record: it cannot show what the agent was allowed to
+  do in iteration *n* once the policy changed (0007-A2 row 28).
+- Domain fronting through an allowlisted CDN hostname is a recorded limit of
+  the tunnel-only egress proxy, not solved (ADR-0007, "Known limits of
+  tunnel-only mode").
 
 ## Upgrade
 

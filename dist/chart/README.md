@@ -15,6 +15,27 @@ chart's rendered output).
   (release namespace only).
 - `rbac.helpers.enabled` (default `false`): installs the convenience
   `loop-admin` / `loop-editor` / `loop-viewer` roles for the `loops` CRD.
+- `metrics.enabled` (default `true`): installs the metrics Service, the
+  metrics-auth Role/RoleBinding, and passes `--metrics-bind-address` to the
+  manager; `metrics.secure` (default `true`) selects HTTPS + the auth RBAC
+  path. Set `metrics.enabled=false` to disable all of it (the manager then
+  binds metrics to :0).
+- `crd.enabled` (default `true`) / `crd.keep` (default `true`): install the
+  CRDs with the chart and keep them on uninstall.
+- `certManager.enabled` (default `false`): the Prometheus ServiceMonitor's
+  `tlsConfig.ca` is emitted from the cert-manager issuer only when this is
+  true (with `prometheus.enabled=true` and `metrics.secure=true`).
+- `serviceAccount.enabled` (default `true`): install the chart's
+  ServiceAccounts (including the fixed-name `coxswain-cni-probe` SA in the
+  `coxswain-cni-probe` namespace); with `enabled=false` set
+  `serviceAccount.name` to an existing SA.
+- `manager.env` (list) and `manager.envOverrides` (map): the envOverrides
+  map wins over a same-name entry in the env list.
+- `manager.healthProbe.port` (default `8081`): the liveness/readiness port
+  (the manager serves /healthz and /readyz on it).
+- `rbac.roleNamespaces` and `webhook.*`: currently NOT read by any template
+  (the cni-probe namespace is hard-wired and the chart ships no operator
+  webhook); changing them has no effect on the rendered chart today.
 
 ## Driving Manual-mode approvals with the cox CLI (rbac.helpers.enabled)
 

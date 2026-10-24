@@ -31,6 +31,8 @@ manager:
   ## the duplicate, omit --memory-writer-image from manager.args and set
   ## manager.image.repository/tag instead (the chart derives
   ## --memory-writer-image from those).
+  ## manager.extraVolumes / manager.extraVolumeMounts (not in this file by
+  ## default) add volumes/mounts to the manager pod (templates/manager/).
   ##
   args:
     - --leader-elect
@@ -146,7 +148,11 @@ rbac:
   namespaced: false
 
   ## Multi-namespace RBAC role mappings (advanced use)
-  ## Maps role suffixes to target namespaces for multi-namespace deployments
+  ## Maps role suffixes to target namespaces for multi-namespace deployments.
+  ## NOTE: this value is currently NOT read by any template (the cni-probe
+  ## namespace is hard-wired to coxswain-cni-probe in the admission/ and
+  ## rbac/ templates); it is kept for future use. Changing it has no effect
+  ## on the rendered chart today.
   ##
   roleNamespaces:
     "cni-probe-operator": "coxswain-cni-probe"
@@ -204,6 +210,10 @@ certManager:
   enabled: false
 
 ## Webhook server configuration
+## NOTE: no template currently reads webhook.* (the chart ships no
+## Mutating/Validating webhook for the operator; admission control is the
+## ValidatingAdmissionPolicy pair in templates/admission/). Kept for
+## completeness; changing it has no effect on the rendered chart today.
 ##
 webhook:
   enabled: false

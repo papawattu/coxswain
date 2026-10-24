@@ -29,10 +29,11 @@ VerificationNotes, NextIterationPlan, Lessons}` (plus `ToolTrace`,
 `ObservedPhase`, `Iteration`, `PlanAttempt`, `LessonsAvailable`,
 `HeadCommit`). `grep -rn -i 'needs_input\|NeedsInput' runner/` = 0 hits. The
 `AwaitingApproval` phase exists (`api/v1alpha1/loop_types.go:111`) and is
-reached only by the Manual plan gate
-(`internal/controller/loop_s4_phase.go:603-622`) — a phase transition on a
-fresh Planning success claim in `ApprovalModeManual`, not on any result-file
-status value. `CONTEXT.md:69` carried the same stale sentence; it is corrected
+reached only by the plan-approval gate and its I93 re-hold — the phase is
+assigned at three sites, `internal/controller/loop_s4_phase.go:601`, `:625`
+and `:883` (the last being the I93 plan-mismatch re-hold) — a phase transition
+on a Planning claim in `ApprovalModeManual`, not on any result-file status
+value. `CONTEXT.md:69` carried the same stale sentence; it is corrected
 in this amendment's PR to match what is built.
 
 **Decision now recorded:** the result file has no `needs_input` status. The
@@ -58,7 +59,7 @@ volume as the full record, but the operator's read-back is the termination
 message, not an exec. The operator's own comment records the pattern: "no
 exec, no kubelet ReadFile, and no new RBAC"
 (`internal/controller/loop_s4_phase.go:52-54`). ADR-0005's D2 wording is
-covered by the matching ADR-0005 amendment (I107 row 2 names both ADRs).
+covered by the matching ADR-0005 amendment (#219).
 
 **Decision now recorded:** the runner→operator claim channel is the agent
 container's termination message (size-limited, strict-parsed by the operator,
@@ -90,8 +91,8 @@ from the record; the `jobs` verbs remain as built.
 - **The result file itself** — `result.json` is still the runner's full
   output on the workspace; only the operator's read path (row 2) and two
   stale details (rows 1 and 3) are corrected.
-- **ADR-0005** — its matching rows (D2, `:319-322`) are amended under
-  ADR-0005's own amendment, per I107; this amendment only records the
-  ADR-0004 side of the shared rows.
+- **ADR-0005** — the shared rows (D2, `:319-322`) are amended under
+  ADR-0005's own amendment (#219); this amendment only records the ADR-0004
+  side of them.
 - **The `AwaitingApproval` phase** — it exists and is reachable; only the
   trigger record is corrected (row 1).

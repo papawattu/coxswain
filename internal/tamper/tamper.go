@@ -25,11 +25,7 @@
 // package Go repo keeps its tests (D25).
 package tamper
 
-import (
-	"fmt"
-	"os/exec"
-	"strings"
-)
+import "strings"
 
 // Preset is a per-language protected-path glob set name (spec.verify.preset).
 type Preset string
@@ -86,28 +82,4 @@ func magicGlob(g string) string {
 		return g // already a git pathspec magic
 	}
 	return ":(glob)" + g
-}
-
-// Changed lists the protected paths that differ between base and verified in
-// the repo at repoDir. It runs `git -C repoDir diff --name-only <base>
-// <verified> -- <globs...>` and returns the changed paths (empty slice = clean).
-// An empty result with a non-zero exit is an error (the diff itself failed);
-// a zero exit with an empty list is a clean (no protected path changed).
-func Changed(repoDir, base, verified string, globs []string) ([]string, error) {
-	args := []string{"-C", repoDir, "diff", "--name-only", base, verified}
-	if len(globs) > 0 {
-		args = append(args, "--")
-		args = append(args, globs...)
-	}
-	out, err := exec.Command("git", args...).CombinedOutput()
-	if err != nil {
-		// git diff returns non-zero on usage/IO errors. A legitimate "no
-		// changes" is exit 0 with empty output, so any error here is real.
-		return nil, fmt.Errorf("git diff %s..%s: %w: %s", base, verified, err, strings.TrimSpace(string(out)))
-	}
-	changed := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(changed) == 1 && changed[0] == "" {
-		return nil, nil
-	}
-	return changed, nil
 }

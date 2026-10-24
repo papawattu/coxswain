@@ -50,10 +50,10 @@ the D18 pod-selection bullet at `:213-214`).
 
 **What was built:** there is no `VerifyError` reason. A verify infra failure
 (pod crash, missing status) is bounded by `verifyInfraRetries = 2`
-(`internal/controller/loop_verify_job.go:1613` — 1 original attempt + 2
+(`internal/controller/loop_verify_job.go:1620` — 1 original attempt + 2
 recreations = 3 total runs) and the Failed condition reason is
 `verifyInfraFailedReason = "VerifyInfraFailed"`
-(`internal/controller/loop_verify_job.go:1619`). The only `VerifyError` hits in
+(`internal/controller/loop_verify_job.go:1626`). The only `VerifyError` hits in
 the file are comments, not a constant or condition reason. `CONTEXT.md:57`
 carried the same stale sentence; it is corrected in this amendment's PR.
 
@@ -72,7 +72,7 @@ the next prompt.
 config/rbac/role.yaml` = 0 (the generated role has no pod subresource and no
 secrets rule). The failure text that feeds the next prompt comes from the
 failed check's **termination message**: `verifyFailureSummary`
-(`internal/controller/loop_verify_job.go:1554`), recorded at
+(`internal/controller/loop_verify_job.go:1561`), recorded at
 `status.verify.lastFailureSummary`.
 
 **Decision now recorded:** the verify-failure feed-forward channel is the check
@@ -105,8 +105,8 @@ manager image is distroless, so no `ls-remote` binary).
 **What was built:** there is no go-git dependency or call — `grep -n 'go-git'
 go.mod go.sum` = 0 and `grep -rn 'go-git' --include=*.go internal/` = 0. The
 base SHA comes from the workspace-init container's **termination message**:
-`internal/controller/loop_controller.go:1141`
-(`readBaseCommitFromTerminationMessage`, called at `:1129`).
+`internal/controller/loop_controller.go:1152`
+(`readBaseCommitFromTerminationMessage`, called at `:1140`).
 
 **Decision now recorded:** ref resolution uses the init container's termination
 message (the ADR's option (b), "a tiny resolve step that reports the SHA via
@@ -120,7 +120,7 @@ D11): the operator resolves the branch head *itself* at `Verifying` start
 (`ls-remote`) and records it as the pin.
 
 **What was built:** the pin is the **runner's claim**:
-`internal/controller/loop_s4_phase.go:563`
+`internal/controller/loop_s4_phase.go:567`
 (`VerifiedCommit: claim.HeadCommit`), shape-checked as 40-hex at
 `internal/controller/loop_s4_phase.go:217-224`. The verify Job checks out the
 pinned SHA out of the workspace PVC, and the deliver Job asserts the resolved

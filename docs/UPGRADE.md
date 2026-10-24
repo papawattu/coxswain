@@ -6,11 +6,11 @@ Tool proxy NetworkPolicies created before PR #74 (D41d) carry no
 `coxswain.io/tool-proxy-for` or `coxswain.io/tool` label. The operator does
 not recreate them: `createOrUpdateNP` merges the labels into the live
 object in place (`maps.Copy(np.Labels, desired.Labels)` in
-`internal/controller/loop_controller.go:3946`), so on the first reconcile
+`createOrUpdateNP`, `internal/controller/loop_controller.go`), so on the first reconcile
 post-upgrade the **live** tool netpols are labelled in place and heal.
 
 The leak is narrower than it looks: `cleanupStaleToolProxyNetpols`
-(`internal/controller/loop_controller.go:3814`) lists by the
+(`internal/controller/loop_controller.go`) lists by the
 `coxswain.io/tool-proxy-for` label, so a pre-D41d netpol for a tool that is
 **still in the Loop's policy** is healed on the first reconcile (labelled in
 place) and is no longer stale. Only netpols whose tool was **removed from
@@ -24,7 +24,7 @@ removals are cleaned up correctly.
 
 **Precondition:** the upgraded operator must have reconciled every Loop at
 least once, so that every **live** tool netpol has been labelled in place
-by `createOrUpdateNP` (`internal/controller/loop_controller.go:3946`).
+by `createOrUpdateNP` (`internal/controller/loop_controller.go`).
 Verify this before running the delete:
 
 ```bash
@@ -78,7 +78,7 @@ allow-all egress for it.
 
 The command below lists every NetworkPolicy whose name matches the tool
 netpol pattern (`-tool-…-netpol`; `derivedName`
-(`internal/controller/loop_controller.go:2376`) shortens near-63-char Loop
+(`internal/controller/loop_controller.go`) shortens near-63-char Loop
 names with a hash, so match on the suffix, not the full Loop name) and, for
 each, checks the `coxswain.io/tool-proxy-for` label. It prints the leaked
 ones (unlabelled) and deletes them; it keeps the live ones (labelled by the

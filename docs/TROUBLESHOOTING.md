@@ -20,12 +20,13 @@ connection refused) is **not** retried: the server responded, so the error
 is definitive. When all attempts fail, the runner surfaces `ModelUnavailable`
 in its claim and exits blocked; the operator maps the claim to the
 `ModelAvailable=False` condition (reason `ModelUnavailable`) so the state is
-visible — `internal/controller/loop_s4_phase.go:620-633`
-(`applyModelAvailableCondition`, I89, merged as 06a0157 / PR #136). The
+visible — `applyModelAvailableCondition` in
+`internal/controller/loop_s4_phase.go` (I89, merged as 06a0157 / PR #136). The
 condition is diagnostic only; it does not gate the phase machine.
 
-**Worst case:** about 8 minutes before the condition appears — 4×120s of
-timeouts plus 14s of backoff (QUICKSTART §6, written with I89). Pre-I89 the
+**Worst case:** about 8 minutes before the condition appears — 4 model
+calls of 120s plus 14s of backoff (2s, 4s, 8s; QUICKSTART §8, written with
+I89). Pre-I89 the
 same hang meant a single 10-minute timeout plus kubelet back-off restarts
 with no named reason (the finding I89 in `docs/REVIEW-PHASE1-R26.md:138` —
 "in #124, the vLLM backends went silent for about 24 minutes. Each runner
@@ -34,10 +35,11 @@ call hung for its full 10-minute timeout before the runner exited").
 **Tuning:** if you see `ModelUnavailable` on a healthy backend, the model is
 slow, not dead. A legitimate response on a local 27B-class model under load
 can approach 120s (PR #124 observed a 60s single-call tail on the healthy
-endpoint). Raise the runner's `ModelTimeout` (a `runConfig.ModelTimeout` in
-`runner/runner.go:108`, defaulting to `defaultModelTimeout` when unset;
-QUICKSTART §6 covers the tuning) so a slow-but-healthy backend stops being
-classified as unavailable. The retry count and backoff base are constants
+endpoint). Note there is currently no user-facing knob for the timeout: the
+runner's `runConfig.ModelTimeout` field (`runner/runner.go`, defaulting to
+`defaultModelTimeout` when unset) is never set by the runner entrypoint
+(`runner/cmd/main.go`), so the timeout is fixed at 120s in practice. The
+retry count and backoff base are constants
 (`defaultModelRetries = 3`, `defaultModelRetryBackoff = 2s` in
 `runner/runner.go`) and not user-tunable. A success claim resets the
 condition to `True` (reason `Recovered`) — so the condition returning to
@@ -146,7 +148,7 @@ agent's own tooling; ephemeral containers are intentionally unavailable.
 `EnforcementDisabled`) and the condition message reads:
 "--allow-unenforced-network is set: the Loop runs but the CNI does NOT
 police pod → host-network egress (dev escape hatch)"
-(`internal/controller/loop_controller.go:992-1000`).
+(`cniNetworkStatus` in `internal/controller/loop_controller.go`).
 
 **What it means:** the operator's CNI gate (D38) needs an **enforcing CNI**
 (e.g. Calico) to actually police pod → host-network egress. kindnet does

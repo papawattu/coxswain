@@ -999,9 +999,9 @@ func TestMutationSummaryLinesStripReasonCRRemoved(t *testing.T) {
 // eviction is in the audit summary.
 func seedLessons(t *testing.T, dir string, n int) []string {
 	t.Helper()
-	var names []string
+	names := make([]string, 0, n)
 	base := time.Now().Add(-48 * time.Hour)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		text := fmt.Sprintf("seed lesson %03d: a distinct note", i)
 		sum := sha256.Sum256([]byte(text))
 		name := hex.EncodeToString(sum[:]) + ".txt"

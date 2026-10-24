@@ -33,13 +33,14 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -384,7 +385,8 @@ func summaryLines(lessons, reasons, evicted []string, total, written, dropped in
 	// D71: each eviction is in the audit ("evicted <sha12> cap"): the sha prefix
 	// of the removed file's name, never its text.
 	for _, n := range evicted {
-		out = append(out, "evicted "+strings.TrimSuffix(n, ".txt")[:min(shaPrefixLen, len(strings.TrimSuffix(n, ".txt")))]+" cap")
+		sha := strings.TrimSuffix(n, ".txt")
+		out = append(out, "evicted "+sha[:min(shaPrefixLen, len(sha))]+" cap")
 	}
 	out = append(out, summaryLine(total, written, dropped))
 	return out
@@ -553,11 +555,11 @@ func evictOldest(dir string, entries []os.DirEntry, survivors []string, max int)
 	if over <= 0 {
 		return nil, nil
 	}
-	sort.Slice(files, func(i, j int) bool {
-		if !files[i].mod.Equal(files[j].mod) {
-			return files[i].mod.Before(files[j].mod)
+	slices.SortFunc(files, func(a, b lf) int {
+		if c := a.mod.Compare(b.mod); c != 0 {
+			return c
 		}
-		return files[i].name < files[j].name
+		return cmp.Compare(a.name, b.name)
 	})
 	var evicted []string
 	for _, f := range files {

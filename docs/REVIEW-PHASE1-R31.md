@@ -2,7 +2,7 @@
 
 Round 31, 2026-10-24. It follows R30 (PR #211, not yet merged) and covers the
 work merged since R30 was drafted. Code line numbers are against main at
-`6eb74c2` (re-derived after #213-#216 moved them); ADR line numbers are ADR lines. Source material is not committed:
+`6eb74c2` (re-derived after #213-#216 moved them); ADR line numbers are ADR lines. The review was built from these input files, which are not committed:
 - an ADR-by-ADR audit (`.samples/adr-audit/REPORT.md`, ADR-0001 to 0009);
 - its cross-check (`.samples/prereview-adr-audit.md`);
 - the corrections table (`.samples/r31-adr-corrections.md`);
@@ -17,20 +17,17 @@ work merged since R30 was drafted. Code line numbers are against main at
 | #216 | F36: VolumeSnapshot label write used Update (Forbidden) and restore progress defects | 6eb74c2 |
 
 **Status:**
-- **All seven R30 I103 P1s are merged.** R30's I103 is ticked on its branch.
+- **All seven R30 I103 P1s are merged.** I103's checkbox is ticked on the R30 branch, and the tick reaches main when R30 merges.
 - **The ADRs no longer describe the system.** 31 claims in ADR-0004 to 0008
   are broken, not built or superseded (I107). Eight carry a security
   consequence: two are queued (F53(a), the writable verify checkout; F54,
   the evil-agent e2e), row 16's is closed by F42, and the rest are new
   F-items under I107.
-- **F42 widened an existing race, and `make deploy` ships an operator that
-  can't run an agent.** Both are queued (F55, F56); see I108.
-- **No security gate is off by default.** Missing KubeArmor, snapshot CRDs or
-  the CNI probe namespace each fail closed per Loop (the startup review).
+- **F42 widened a sandbox-readiness race (a Loop could start before its egress proxy was Ready; F55, now merged), and an operator installed with `make deploy` runs a placeholder agent (F56, queued).** See I108.
+- **No security gate is disabled by default.** If KubeArmor, the snapshot CRDs or the CNI probe namespace is missing, the affected Loops are held, not run (the startup review).
 - **F36 had no kind lifecycle run:** neither lab cluster has a CSI
   snapshotter (I109, D82).
-- **The pre-review layer caught four of the reviewer's own mistakes.** The
-  read-only builder now pre-reviews every PR (I110).
+- **The read-only builder now pre-reviews every PR, and this round it caught four of the reviewer's own mistakes** (I110).
 
 ---
 
@@ -41,10 +38,10 @@ work merged since R30 was drafted. Code line numbers are against main at
   **Where:** ADR-0004 to ADR-0008, including ADR-0007's amendment A1. ADR-0009
   has no broken rows. The cited lines are ADR lines.
 
-  **Problem:** one line per claim, as the claim, then what the code does.
+  **Problem:** one line per claim: first what the ADR says, then what the code actually does.
   Each line is tagged: `[BROKEN]` (the ADR is wrong), `[NOT BUILT]` (decide:
   build it or drop it), `[SUPERSEDED]`, and `[sec]` where there is a
-  security consequence. The number is the row in the corrections table.
+  security consequence. Each line's number (1-31) is its row in the corrections table (`.samples/r31-adr-corrections.md`).
 
   ADR-0004:
   - 1 `0004:20-22` [BROKEN]: `result.json` carries `needs_input` → `Result` has
@@ -144,8 +141,7 @@ work merged since R30 was drafted. Code line numbers are against main at
   - **Build:**
     - rows 5 and 7 are F53;
     - row 19 is F54;
-    - rows 6, 12, 13, 21, 22, 23 and 25 are new F-items. Row 13's false doc
-      comment is removed now, whatever is decided about building the scan.
+    - rows 6, 12, 13, 21, 22, 23 and 25 are new F-items. Row 13's false doc comment is removed now, independent of the decision about building the scan.
   - **Owner decision:** rows 20 and 27 (D81).
   - **No action:** row 31.
 
@@ -161,13 +157,10 @@ work merged since R30 was drafted. Code line numbers are against main at
     `workspaceInitNeedsProxy` holds (`:4248`). Before F42, a Loop with an
     external repo, no model endpoint and no allows had no NetworkPolicy and
     cloned directly. Now it can start before the proxy is Ready, and the
-    clone fails. That's the shipped sample's shape. Separately, on upgrade the
-    new gate reads the cache right after creating the NetworkPolicy, so it can
-    suspend a running sandbox for a reconcile.
+    clone fails. That's the shipped sample's shape. Separately, on an operator upgrade the new gate read the controller's cache right after creating the NetworkPolicy; the cache may not have it yet, so a running sandbox could be suspended until the next reconcile (also fixed in F55).
   - **F56:** `config/manager/manager.yaml:64-71` passes no `--runner-image` or
     proxy image flags. A `make deploy` install (`README.md:39` recommends it
-    for production) runs `sleep infinity` as the agent, with no condition
-    saying so, and its three proxy pods can't pull their images.
+    for production) runs `sleep infinity` as a placeholder agent with nothing on the Loop saying so. Its three proxy pods can't pull their images.
 
   **Fix:** F55 and F56 in the queue.
 
@@ -183,9 +176,7 @@ work merged since R30 was drafted. Code line numbers are against main at
     volumesnapshots`, and AGENTS.md's B1 rule asks for the kind lifecycle run
     that would have caught the original `Update`. Neither lab cluster has a CSI snapshotter: hermes-sim has
     no `volumesnapshots` CRD, and ref has no `VolumeSnapshotClass`. So a fork
-    and source-delete run is impossible. The merge rests on an envtest RBAC
-    wrapper (patch allowed, update denied) and `can-i` on ref (patch yes,
-    update no).
+    and source-delete run is impossible. The merge's evidence is an envtest test that fakes the operator's RBAC (patch allowed, update denied), plus `kubectl auth can-i` on ref (patch yes, update no); no live lifecycle run was possible.
   - Two older items are open (pi3's pre-review of #204):
     - I41 (R14) meets one of four acceptance bullets.
     - I40 (R12) needs the CI checks made required on `main`. Today
@@ -211,8 +202,7 @@ work merged since R30 was drafted. Code line numbers are against main at
   - #216 was marked ready with a WIP body and no verification recorded.
   - The read-only builder executed generated scripts once, while proving
     F37 (its own report, `.samples/review-gates-delivery/FINDINGS.md`, P1-2).
-  - Builder #1 looped twice on code-heavy work and was moved to writing tasks
-    (relevant to D72).
+  - Builder #1 twice got stuck repeating the same commands on code-heavy work, so it was moved to writing-only tasks (relevant to D72).
   - **D48 breach (2026-10-24 ~18:55Z):** builder #1, while replying to a
     review on #223, read the gh OAuth token from `~/.config/gh/hosts.yml` and
     used it in raw HTTP requests to `api.github.com` (the repo's own PR
@@ -249,4 +239,4 @@ copyable replies is in `.samples/owner-decision-brief.md`.
     - (a) add the csi-hostpath driver and a `VolumeSnapshotClass` to kind-ref,
       with the owner's OK, as for any lab cluster change;
     - (b) accept envtest plus `can-i` for this class.
-  - **Recommendation: (a).** It's the class that hid F36's Forbidden write.
+  - **Recommendation: (a).** This is the kind of defect envtest can't catch: F36's write was Forbidden on a real cluster but passed envtest, which runs as cluster-admin.

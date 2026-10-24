@@ -67,9 +67,9 @@ make helm-deploy IMG=ghcr.io/papawattu/coxswain-controller:<tag>
 The chart carries the same resources as `install.yaml` (CRDs, manager
 Deployment, Service, RBAC, the I85 admission VAP + binding, the D38
 coxswain-cni-probe Namespace/RBAC). The release namespace is created by
-Helm (`--create-namespace`); the helper Roles (loop-admin/editor/viewer)
-are opt-in (`rbac.helpers.enabled=true` in values.yaml; `install.yaml`
-ships them enabled).
+Helm (`--create-namespace`); the helper Roles (loop-admin, loop-editor,
+loop-viewer) are included in `install.yaml` by default; in the Helm chart
+they are opt-in (`rbac.helpers.enabled=true` in values.yaml).
 
 To verify the chart without a cluster:
 
@@ -102,9 +102,9 @@ on a non-enforcing CNI (dev only), add the escape hatch (see
 ## Metrics
 
 The operator exposes Prometheus metrics at `/metrics` on the manager's
-metrics port (the shipped manifests bind `:8443` with HTTPS; the manager flag
-is `--metrics-bind-address`, default `0` = disabled — the `config/default`
-kustomize patch and the Helm chart both set `:8443`). The metrics Service is
+metrics port. The shipped manifests bind `:8443` with HTTPS. By default the
+port is disabled (`--metrics-bind-address` defaults to `0`); the
+`config/default` kustomize patch and the Helm chart both set it to `:8443`. The metrics Service is
 `coxswain-controller-manager-metrics-service` in the `coxswain-system`
 namespace.
 
@@ -130,8 +130,9 @@ manager for a plain-HTTP scrape in dev.)
 The metrics endpoint uses `filters.WithAuthenticationAndAuthorization`
 (controller-runtime). To read it with `curl`, you need a token whose
 ServiceAccount is bound to the `coxswain-metrics-reader` **ClusterRole**
-(installed by `dist/install.yaml` / the Helm chart). A namespaced Role
-cannot grant the `nonResourceURL /metrics` — only a ClusterRole can.
+(installed by `dist/install.yaml` / the Helm chart). The metrics endpoint is
+a cluster-scoped URL (not namespaced), so access to it can only be granted by
+a ClusterRole binding; a namespaced Role cannot grant it.
 
 ```sh
 # 1. Create a ServiceAccount for metrics access
@@ -166,7 +167,7 @@ kill $PF_PID
 | `coxswain_loops_completed_total` | Counter | `result` (succeeded\|failed), `reason` | Total Loops that reached a terminal phase, by result and reason (verify_passed, max_iterations, stalled, tampered, verify_infra). |
 | `coxswain_loop_stalls_total` | Counter | — | Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs). |
 | `coxswain_loops_active` | Gauge | `phase` | Loops currently in a non-terminal phase, by phase. Counted from the manager's cache at scrape time (custom Collector, not set on reconcile). Terminal phases (Succeeded, Failed) are excluded. |
-| `coxswain_loop_tokens_total` | Counter | `kind` (prompt\|completion) | Total model tokens consumed, as folded into `status.budget` from the proxy reading, by kind. Bumped by the delta on each same-bootID, no-drop reading. |
+| `coxswain_loop_tokens_total` | Counter | `kind` (prompt\|completion) | Total model tokens consumed, as folded into `status.budget` from the proxy reading, by kind. Bumped by the token delta on each proxy reading that comes from the same proxy process (same boot ID) and did not drop (a dropped reading is not counted). |
 | `coxswain_memory_writes_total` | Counter | `outcome` (written\|failed) | Memory-writer outcomes (F30), bumped once per Loop on the transition that sets the `MemoryWriteDone` condition: `written` when the writer Job succeeded (including a write where every lesson was dropped), `failed` when it failed. A Loop with no write (ineligible, no lessons, or still running) bumps nothing. |
 | `coxswain_memory_lessons_total` | Counter | `verdict` (kept\|static-drop\|curator-drop) | Lessons in successful writes' summaries (F30), bumped with `written`: `kept` = written to the PVC; `curator-drop` = the curator dropped it or was unavailable; `static-drop` = any other drop (static write policy, ineligible outcome, duplicate). |
 
@@ -185,17 +186,6 @@ sum(rate(coxswain_memory_writes_total{outcome="failed"}[1h])) / sum(rate(coxswai
 
 # Token consumption rate (tokens/second) over the last 5 minutes.
 sum(rate(coxswain_loop_tokens_total[5m]))
-
-# Loops stuck in Implementing for more than 30 minutes (no phase transition).
-coxswain_loops_active{phase="Implementing"} > 0
-and
-(
-  time() - timestamp on (namespace) (
-    max by (namespace) (
-      kube_pod_created{namespace="coxswain-system"}
-    )
-  ) > 1800
-)
 
 # Verify pass rate (pass / (pass + fail)).
 sum(coxswain_verify_results_total{result="pass"})
@@ -277,11 +267,10 @@ kubectl cox logs <loop> deliver  # the deliver Job log
 ### Memory flags
 
 - `--memory-writer-image` (required for lesson writes): the memory-writer Job
-  runs `/usr/local/bin/coxswain-memory-write`, which exists only in the
-  operator's own image. The shipped kustomize base, `install.yaml` and the Helm
-  chart set it to the manager's image automatically (F19);
-  `hack/memory-writer-image-test.sh` guards that. Only override it with another
-  build of the operator image.
+  runs a binary that exists only in the operator's own image, so this flag
+  should point at the operator image — which the shipped kustomize base,
+  `install.yaml` and the Helm chart already do; `hack/memory-writer-image-test.sh`
+  guards that. Only override it with another build of the operator image.
 - `--memory-storage-class` (optional): an RWX-capable StorageClass for the
   memory PVC (kind's default `rancher.io/local-path` is RWO-only). On the
   kustomize / `install.yaml` path, render with
@@ -373,8 +362,8 @@ There is one memory PVC per (namespace, repo URL), named
 `memory-<first 12 hex of sha256(repo URL as written in spec.workspace.repo)>`.
 It is created by the first Loop on that repo and **persists after every Loop on
 the repo is deleted**: deleting a namespace's Loops does not clear the lessons.
-A PVC lives only in its own namespace, so the same repo in another namespace has
-its own.
+A PVC lives only in its own namespace, so the same repo in another namespace gets
+its own separate memory PVC.
 
 To start a repo's memory from scratch:
 
@@ -383,11 +372,12 @@ kubectl cox memory export <repo-url> -o backup.tar.gz   # optional: keep a copy
 kubectl cox memory delete <repo-url> -n <namespace>
 ```
 
-`delete` refuses while any Loop on that repo in the namespace is not
-`Succeeded` or `Failed` (including `Paused` and one with no phase yet), or is
-`Succeeded` / `Failed:Stalled` but has no `MemoryWriteDone` condition yet (its
-memory writer Job starts after the terminal phase and would lose its lessons),
-and names the Loops. Otherwise it deletes the PVC. A repo with no PVC prints a note.
+`delete` refuses if any Loop on that repo in the namespace is still active
+(not yet `Succeeded` or `Failed` — this includes `Paused` Loops and Loops
+with no phase yet), or has reached `Succeeded` or `Failed:Stalled` but has
+no `MemoryWriteDone` condition yet (its memory-writer Job starts after the
+terminal phase and would lose its lessons). It names the blocking Loops.
+Otherwise it deletes the PVC. A repo with no PVC prints a note.
 The next Loop on the repo creates a fresh, empty PVC. (`kubectl delete pvc
 memory-<hash>` also works, but has no Loop check.)
 
@@ -425,8 +415,9 @@ kubectl cox plan <loop>
 
 ### What `Succeeded` means (P5f, I98)
 
-`Succeeded` means **verified AND delivery is terminal (or delivery is off)**.
-With `spec.delivery.mode: PullRequest`, a Loop that passes verify is held at
+`Succeeded` means the verify checks passed AND delivery has finished (a PR
+was opened, delivery failed, or delivery is turned off — "terminal" delivery
+in the conditions table below). With `spec.delivery.mode: PullRequest`, a Loop that passes verify is held at
 `status.phase: Verifying` (condition `Verifying=True reason=Delivering`, the
 sandbox Suspended) while the `Delivered` condition is in progress. When
 `Delivered` becomes True (PR opened) or False (`DeliveryFailed`), both
@@ -478,7 +469,7 @@ field is the most useful diagnostic:
 - `BudgetExceeded` → a budget cap was hit. Read `status.budget` (the token
   counts, wall-clock time, cost) and `spec.budget` (the caps).
 - `CNIUnenforced` → the network gate is not satisfied. The CNI does not
-  enforce NetworkPolicy. Either install a enforcing CNI (Calico) or use the
+  enforce NetworkPolicy. Either install an enforcing CNI (Calico) or use the
   `--allow-unenforced-network` escape hatch (dev only).
 - `PolicyEnforced=False` → the KubeArmor policy gate is not enforced. Check
   that KubeArmor is installed and the BPF-LSM hooks are active.
@@ -668,8 +659,11 @@ what the peer expresses — the widening is to the whole namespace on the
 repo port. Note the adjacent "S3a" comment says the repo rule "does NOT
 widen the agent's runtime egress" because the init container runs to
 completion before the agent starts; that claim is the inaccurate one: the
-rule the CNI enforces is pod-wide, so the widening is real (the two comments
-disagree in spirit; the P3 one matches what a NetworkPolicy can express). For
+rule the CNI enforces is pod-wide, so the widening is real. The two in-code
+comments contradict each other; the current enforcement is the pod-wide rule
+(the init-container-only claim in the S3a comment is inaccurate). In practice:
+while the agent runs, it can reach every pod in the repo's namespace on the
+repo port. For
 an **external** repo (the default in the shipped samples) there is **no** repo
 rule at all — NetworkPolicy cannot name a hostname — and the first clone goes
 through the egress proxy (`workspaceInitProxyCreated`; the F55 gate above
@@ -720,9 +714,9 @@ or read its memory. Two caveats, both recorded in the code:
 the Basic-auth header built from the credential is visible in the init
 git process's argv for that one command (a known limitation noted in
 `workspaceInitContainer`), and the credential is readable in-process by the
-init container itself while it runs. It also carries no service-account
-token: the pod sets `automountServiceAccountToken: false` explicitly
-(asserted in `loop_c1_hardening_test.go`), so the agent has no API-server
+init container itself while it runs. The agent container also carries no
+service-account token: the pod sets `automountServiceAccountToken: false`
+explicitly (asserted in `loop_c1_hardening_test.go`), so the agent has no API-server
 identity at all.
 
 ### How the operator reads the sandbox's self-report

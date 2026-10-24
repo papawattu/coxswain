@@ -15,22 +15,24 @@ unavailable: …"), and the Loop is making little or no progress.
 exhausted. The runner uses a 120-second per-request timeout with 3 retries
 and exponential backoff (2s, 4s, 8s) — `defaultModelTimeout` /
 `defaultModelRetries` / `defaultModelRetryBackoff` in `runner/runner.go`
-(I89, merged as e5af830 / PR #135). A non-timeout error (HTTP 500,
+(fixed in PR #135, squash commit e5af830). A non-timeout error (HTTP 500,
 connection refused) is **not** retried: the server responded, so the error
 is definitive. When all attempts fail, the runner surfaces `ModelUnavailable`
 in its claim and exits blocked; the operator maps the claim to the
 `ModelAvailable=False` condition (reason `ModelUnavailable`) so the state is
 visible — `applyModelAvailableCondition` in
-`internal/controller/loop_s4_phase.go` (I89, merged as 06a0157 / PR #136). The
+`internal/controller/loop_s4_phase.go` (fixed in PR #136, squash commit
+06a0157). The
 condition is diagnostic only; it does not gate the phase machine.
 
 **Worst case:** about 8 minutes before the condition appears — 4 model
 calls of 120s plus 14s of backoff (2s, 4s, 8s; QUICKSTART §8, written with
-I89). Pre-I89 the
-same hang meant a single 10-minute timeout plus kubelet back-off restarts
-with no named reason (the finding I89 in `docs/REVIEW-PHASE1-R26.md:138` —
-"in #124, the vLLM backends went silent for about 24 minutes. Each runner
-call hung for its full 10-minute timeout before the runner exited").
+I89). Before the fix, the same hang meant a single 10-minute timeout
+followed by kubelet restarts with no named reason.
+
+The original finding (I89, `docs/REVIEW-PHASE1-R26.md`) recorded: "in #124,
+the vLLM backends went silent for about 24 minutes. Each runner call hung
+for its full 10-minute timeout before the runner exited".
 
 **Tuning:** if you see `ModelUnavailable` on a healthy backend, the model is
 slow, not dead. A legitimate response on a local 27B-class model under load
@@ -50,9 +52,10 @@ backends behind the nginx LB stopped serving model calls for about 24
 minutes) was an endpoint-side fault, not a coxswain defect — the operator
 digest was byte-identical to the release and the identical e2e path
 completed in ~4 min on healthy backends (PR #124, merged 4653e9a; evidence
-`.samples/implementing-stall-*` and the PR's evidence tables). I89 changed
-the *symptom*, not that cause: the hang now surfaces as a named, bounded
-`ModelUnavailable` instead of a 10-minute silent timeout.
+`.samples/implementing-stall-*` and the PR's evidence tables). The fix
+changed how the failure looks (it now surfaces as a named, bounded
+`ModelUnavailable` condition), but it did not change the underlying cause
+(the backend outage).
 
 ## Service DNS NXDOMAIN from a fresh kind cluster
 
@@ -61,8 +64,13 @@ the *symptom*, not that cause: the hang now surfaces as a named, bounded
 and `nslookup` reports the node IP (`172.21.0.1`) as the DNS server instead
 of CoreDNS.
 
-**What the alpha runs showed (observation; the cause was not established):**
-- **The alpha.1 A6 run** (`.samples/alpha-e2e-1791784606/summary.txt`,
+**What the alpha runs showed.** A1–A6 are the work items of the alpha plan
+(`docs/PLAN-ALPHA.md`). A6 is the alpha acceptance, and "the A6 run" below
+means that acceptance run against a fresh cluster.
+
+These are observations; the cause was not established.
+
+- **The alpha.1 A6 run** (evidence: `.samples/alpha-e2e-1791784606/summary.txt`,
   "BLOCKERS FOUND ON THE FRESH CLUSTER" item 2): on the fresh `coxswain-alpha`
   cluster, "Service DNS broken on the fresh kind node: kube-dns.<ns>.svc
   does not resolve (nslookup server = node IP 172.21.0.1, not CoreDNS
@@ -100,10 +108,11 @@ no cause is asserted here.
 `v0.1.0-alpha.1`; the controller log repeats `cannot list resource
 configmaps at the cluster scope` and Loops do not start.
 
-**Cause (I86, `docs/REVIEW-PHASE1-R26.md:83`):** A4 added a ConfigMap read
-through the manager cache, but the RBAC marker granted
-`get;create;update;delete` without `list;watch` — and the
-controller-runtime cache needs `list;watch` on every type it caches.
+**Cause (I86, `docs/REVIEW-PHASE1-R26.md:83`):** An earlier change (A4)
+added a ConfigMap read that goes through the controller-runtime cache. The
+RBAC comment (which renders the ClusterRole) only granted
+`get;create;update;delete`, but the cache also needs `list;watch` on every
+type it reads.
 
 **Fix:** upgrade to `v0.1.0-alpha.2` or later (I86, merged b72ece1 / PR
 #127, adds `list;watch` to the marker; `rbac_coverage_test.go` asserts
@@ -134,11 +143,12 @@ alpha.4 release ships a `ValidatingAdmissionPolicy`
 (`coxswain-deny-ephemeral-containers`) and its binding, so an ephemeral
 container added to a coxswain pod would run **outside** the KubeArmor fence
 and share the pod's network namespace — the same pod's egress controls would
-no longer apply to it. The alpha.4 smoke test recorded the denial
+no longer apply to it. Releases alpha.1–alpha.3 shipped the policy but no
+working binding, so the denial was not active in those releases. PR #130
+(squash commit 41635e9) added the working binding to the rendered
+`install.yaml`, and the alpha.4 smoke test recorded the denial
 (`.samples/alpha4-smoke-1791809703/summary.md`, "kubectl debug DENIED").
-alpha.1–.3 shipped the policy without a working binding (the gate was off
-in those releases; I85, merged 41635e9 / PR #130, fixed the rendered
-`install.yaml`). To inspect a coxswain pod's contents use `kubectl cp` /
+To inspect a coxswain pod's contents use `kubectl cp` /
 `kubectl exec` from a sidecar that is part of the pod, or attach via the
 agent's own tooling; ephemeral containers are intentionally unavailable.
 
@@ -157,10 +167,9 @@ run anyway on a non-enforcing CNI; the condition records that the CNI does
 not police that egress. It is separate from `--allow-unenforced` (the
 KubeArmor gate); the two flags are independent.
 
-**The supported topology is decided (D57).** R26 Q2 is answered: the alpha
-ships **KubeArmor-only**, with the network gate documented as requiring an
-enforcing CNI. The KubeArmor policy gate (A1, ADR-0007) is the alpha's
-enforcement layer and is **required**; the D38 network gate is a second,
+**The supported topology is decided (D57).** The open question from the
+R26 review (Q2) is answered: the alpha ships **KubeArmor-only**. The
+KubeArmor policy gate (A1, ADR-0007) is the alpha's enforcement layer and is **required**; the D38 network gate is a second,
 network-layer gate that needs a CNI that enforces NetworkPolicy (e.g.
 Calico — the tested profile is `test/e2e/d38-cni-e2e.sh`). On a CNI that
 doesn't enforce NetworkPolicy (kindnet included), the released
@@ -240,8 +249,8 @@ put new conditions, Events and reasons on the object. Each entry below: the
 symptom, what it means, and what to do. Conditions appear in `kubectl cox
 describe` (its Conditions block); Events do not — show them with
 `kubectl get events --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>`
-or `kubectl describe loop <name>`. Code is cited by function name and path;
-line numbers drift.
+or `kubectl describe loop <name>`. Code references use function names and
+file paths rather than line numbers, which change as main moves on.
 
 ### `AgentNetworkPolicyReady=False`
 
@@ -271,18 +280,18 @@ cause.
 **What it means:** the agent NetworkPolicy is **absent** — `agentNetPolMissing`
 (in `internal/controller/loop_controller.go`) is a gate term in the
 sandbox-suspended check, so a missing netpol holds the sandbox just like a
-foreign one does. The absence is normally transient: the early ensure
-(`ensureAgentNetPolBeforeSandbox`, which runs before the sandbox is created)
-recreates a merely-missing netpol before the gate runs, so a Loop normally
-never sits here. If it persists, the ensure is erroring and the
-`AgentNetworkPolicyReady` condition and its Warning Event (above) name the
-cause — a persistent absence is never silent.
+foreign one does. The absence is usually short-lived: the operator recreates
+a missing netpol before creating the sandbox (the ensure runs in
+`ensureAgentNetPolBeforeSandbox`, before the sandbox is created), so a
+healthy Loop rarely waits here. If it persists, the recreation is failing
+and the `AgentNetworkPolicyReady` condition and its Warning Event (above)
+name the cause — a persistent absence is never silent.
 
 **What to do:** `kubectl get networkpolicy -n <ns>` and look for
 `<loop>-agent-netpol`. If it is missing and the condition above is `False`,
-act on its message. If it is missing and no condition is set, this pass did
-not reach the ensure (an earlier gate can also return first) — check the
-operator log; the next pass creates it.
+act on its message. If it is missing and no condition is set, this reconciliation did not get as far as creating the
+netpol (an earlier gate returned first) — check the operator log; the next
+reconciliation creates it.
 
 ### Sandbox Suspended while the `<loop>-egress-proxy` pod is not Ready (F55-a)
 
@@ -310,11 +319,11 @@ proxies."
 absent while this Loop's sandbox already existed, and created the netpol.
 The likely case is an operator upgrade (F42) while the sandbox was already
 running unfenced, but the Event fires equally if the netpol was deleted by
-hand while the sandbox ran. It records that the now-running sandbox is
-fenced.
+hand while the sandbox ran. The Event only records that the sandbox now has its
+NetworkPolicy in place.
 
-**What to do:** nothing — it is informational and load-bearing (the sandbox
-is fenced now). Any in-flight network activity that is not DNS or a proxy
+**What to do:** nothing. The Event is informational; no action is needed.
+Any in-flight network activity that is not DNS or a proxy
 will be dropped from this point on.
 
 ### Event `PlanChangedReHold` (F38)
@@ -383,8 +392,9 @@ The agent did not tamper; the check could not run.
 ### The other holds on a Suspended sandbox
 
 The entries above cover the holds added on 2026-10-24. A sandbox can also be
-held by earlier gates: a tool proxy that is not owned+Ready
-(`toolProxyGatesSuspended` in `internal/controller/loop_controller.go`), the
+held by earlier gates: a tool proxy that the Loop does not own or that is
+not Ready (owned = carries the Loop as its controller owner;
+`toolProxyGatesSuspended` in `internal/controller/loop_controller.go`), the
 Manual-approval hold at `AwaitingApproval` (`approvalHoldPhase` in
 `internal/controller/loop_approval.go`), the restore-in-progress hold
 (`loop_restore.go`), a budget pause (token/cost cap reached), and the engine

@@ -59,13 +59,23 @@ func TestB2RestoreHoldSuspendedReasons(t *testing.T) {
 }
 
 // TestMemoryWriterHeldWhileStoppingWorkloads (F34 P3-4): with the restore in
-// StoppingWorkloads the writer Job is not created. The hold returns before
-// any API call, so the zero reconciler is enough: a regression that lets it
-// through would dereference the nil client and panic.
+// StoppingWorkloads the writer Job is not created. The Loop is otherwise
+// eligible (Succeeded, lessons available, a repo), so WITHOUT the hold the
+// function goes on to read the Job through the nil client and panics; the
+// spec reports that as a failure.
 func TestMemoryWriterHeldWhileStoppingWorkloads(t *testing.T) {
+	l := f34Loop(metav1.ConditionFalse, coxv1alpha1.RestoreReasonStoppingWorkloads)
+	l.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
+	l.Status.Progress = &coxv1alpha1.ProgressStatus{LessonsAvailable: true}
+	l.Spec.Workspace.Repo = "http://gitea.example/samples/gocli.git"
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("the hold did not stop the writer: it went on to the Job read (panic: %v)", rec)
+		}
+	}()
 	r := &LoopReconciler{}
-	requeue, err := r.ensureMemoryWriterJobAndNetPolicy(context.Background(),
-		f34Loop(metav1.ConditionFalse, coxv1alpha1.RestoreReasonStoppingWorkloads))
+	requeue, err := r.ensureMemoryWriterJobAndNetPolicy(context.Background(), l)
 	if requeue || err != nil {
 		t.Fatalf("held: requeue=%v err=%v, want false,nil", requeue, err)
 	}

@@ -468,6 +468,13 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 				res.Summary = res.Summary + "; " + res.VerificationNotes
 				log.Printf("runner: %s; emitting blocked claim (operator will hold the advance)", res.VerificationNotes)
 			}
+		} else {
+			// F34: a blocked Implementing proposes nothing. Clear any file an
+			// EARLIER iteration left, or the epilogue's lessonsFileAvailable
+			// would put that stale proposal in this run's claim. (The restart
+			// re-commit paths above are left alone: they resume the SAME
+			// iteration, whose own run wrote the file.)
+			writeLessonsFile(cfg.Workspace, nil)
 		}
 	default:
 		// Unknown phase (a typo, or a phase the runner does not execute,

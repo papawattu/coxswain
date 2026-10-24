@@ -466,6 +466,10 @@ const claimSuccess = "success"
 // the next one. (A blocked claim's observedPhase equals the CURRENT phase
 // the runner was executing, never the next, so the nextPhase match
 // naturally rejects it: nextPhase(current, current) == current.)
+// planChangedReHoldReason is the Event reason emitted when a runner plan-change
+// claim clears the approval and the plan must be re-approved (F38).
+const planChangedReHoldReason = "PlanChangedReHold"
+
 func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1.Loop, claim *PhaseClaim, now metav1.Time) (changed, advanced bool) {
 	// B5a: bump the iteration metric on a NEW-phase transition (a re-claim of
 	// the same phase does not bump). The claim's observedPhase is the phase
@@ -906,12 +910,16 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		// unapproved plan. The signal is a CLAIM (ADR-0005), used only as the
 		// trigger; the gate's input is the cleared condition. The clear is
 		// idempotent (a no-op when the condition is absent) and the re-hold is
-		// surfaced as an Event.
+		// surfaced as an Event. The Event is emitted here, before the status
+		// write, like PlanHashMismatch above (not queued like PhaseAdvanced,
+		// I83, which is queued because it is emitted per advance): if the
+		// status update conflicts, the requeue re-reads the claim and may emit
+		// it again. Accepted: it is a diagnostic, never a gate input.
 		if claim.PlanChanged && approvedPlanHash(loop) != "" {
 			clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
 			changed = true
 			if r.Recorder != nil {
-				r.Recorder.Eventf(loop, corev1.EventTypeNormal, "PlanChangedReHold",
+				r.Recorder.Eventf(loop, corev1.EventTypeNormal, planChangedReHoldReason,
 					"the re-plan differs from the approved plan; the approval was cleared and the plan must be re-approved")
 			}
 			logf.FromContext(ctx).Info("runner detected a plan change; clearing the PlanApproved condition (re-entering the hold)",

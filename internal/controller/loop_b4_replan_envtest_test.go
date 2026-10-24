@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -397,10 +398,8 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 				"onVerifyFail=Plan + Manual: the failed verify goes to PLANNING (the re-plan)")
 			Expect(loop.Status.Iteration).To(Equal(2),
 				"the iteration increments on the re-plan (a re-plan is not a reset)")
-			for _, c := range loop.Status.Conditions {
-				Expect(c.Type).NotTo(Equal(coxv1alpha1.PlanApprovedCondition),
-					"F38: the B4 re-plan transition clears the stale approval")
-			}
+			Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil(),
+				"F38: the B4 re-plan transition clears the stale approval")
 
 			// Step 6: the runner's NEXT Planning claim (the re-plan runs, the
 			// runner writes a new PLAN.md). In Manual mode, the re-plan goes to
@@ -436,9 +435,8 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 				"F38: an unapproved re-plan holds at AwaitingApproval")
 			Expect(loop.Status.DesiredPhase).NotTo(Equal(coxv1alpha1.LoopPhaseImplementing),
 				"F38: the agent must not be sent to Implementing before the re-plan is approved")
-			for _, c := range loop.Status.Conditions {
-				Expect(c.Type).NotTo(Equal(coxv1alpha1.PlanApprovedCondition), "the stale approval stays cleared")
-			}
+			Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil(),
+				"the stale approval stays cleared")
 			// A further reconcile with no approval keeps the hold.
 			r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 				return nil, nil
@@ -452,6 +450,58 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 			}
 		})
 	}
+
+	// F38 (review of #214): the PlanChanged clear must run BEFORE
+	// recordPhaseClaim. On the B4 path the re-plan clear already ran, so only
+	// this case isolates the reorder: a plan-change claim lands while an
+	// approval is still set (the user re-approved during the re-plan window).
+	// With the clear AFTER recordPhaseClaim the gate reads the stale hash and
+	// allows Planning -> Implementing.
+	It("a PlanChanged Planning claim while an approval is set re-holds at AwaitingApproval (the clear runs before the gate) and emits PlanChangedReHold", func() {
+		ns := "b4-planchanged-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		name := "b4-planchanged"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
+		})).To(Succeed())
+		rec := record.NewFakeRecorder(20)
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
+		r.wireApprovalGate()
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil }
+
+		loop := b4Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
+		loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
+			Type: coxv1alpha1.PlanApprovedCondition, Status: metav1.ConditionTrue, Reason: "Approved",
+			Message:            "Approved: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+			LastTransitionTime: metav1.Now()})
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		attempt := loop.Status.PlanAttempt
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return &PhaseClaim{
+				ObservedPhase: coxv1alpha1.LoopPhasePlanning,
+				Status:        "success",
+				HeadCommit:    s5aHeadCommit,
+				PlanAttempt:   attempt,
+				PlanChanged:   true,
+			}, nil
+		}
+		loop = b4Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
+			"the changed plan must be re-approved before Implementing")
+		Expect(loop.Status.DesiredPhase).NotTo(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil())
+		var events []string
+		for len(rec.Events) > 0 {
+			events = append(events, <-rec.Events)
+		}
+		Expect(events).To(ContainElement(ContainSubstring(planChangedReHoldReason)))
+	})
 
 	// F38 (gates P2-1): a rejection while the phase is Planning must clear the
 	// stale approval and bump planAttempt, so a stale Planning success claim
@@ -499,9 +549,8 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
 			"the stale claim must not advance a Loop whose plan was just rejected")
 		Expect(loop.Status.PlanAttempt).To(Equal(attemptBefore+1), "the rejection starts a new plan attempt")
-		for _, c := range loop.Status.Conditions {
-			Expect(c.Type).NotTo(Equal(coxv1alpha1.PlanApprovedCondition), "the stale approval is cleared")
-		}
+		Expect(findCondition(loop, coxv1alpha1.PlanApprovedCondition)).To(BeNil(),
+			"the stale approval is cleared")
 		Expect(loop.Status.Approval).NotTo(BeNil())
 		Expect(loop.Status.Approval.LastRejectionReason).To(Equal("use a different approach"))
 	})

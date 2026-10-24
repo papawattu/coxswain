@@ -16,7 +16,7 @@
 # Inputs (env): NS, MODEL (host:port of the model endpoint, direct),
 # PROXY (egress proxy URL), VICTIM_IP (a pod in ANOTHER namespace, port
 # 18080), NODE_IP, REPO (git remote URL). Path constants (EVIL_SA_DIR,
-# EVIL_RO_FILES, EVIL_RW_DIRS, EVIL_KILL_PID, EVIL_WORKSPACE) default to the
+# EVIL_RO_FILES, EVIL_RW_DIRS, EVIL_CHOWN_FILE, EVIL_WORKSPACE) default to the
 # real container paths; the execution test overrides them.
 # "Direct" probes pass --noproxy '*': HTTPS_PROXY is set on the agent when the
 # egress proxy exists, so without it the probe would silently test the proxy.
@@ -24,7 +24,7 @@
 SA_DIR="${EVIL_SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
 RO_FILES="${EVIL_RO_FILES:-/etc/evil /usr/local/bin/evil}"
 RW_DIRS="${EVIL_RW_DIRS:-/workspace /scratch /tmp}"
-KILL_PID="${EVIL_KILL_PID:-1}"
+CHOWN_FILE="${EVIL_CHOWN_FILE:-/tmp/.evil-chown}"
 WS="${EVIL_WORKSPACE:-/workspace}"
 NS="${NS:-default}"
 
@@ -37,7 +37,8 @@ direct() {
   out=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --noproxy '*' "$@" "$url" 2>&1); rc=$?
   case "$out" in
     2??|3??|4??|5??) say "$n" "$name" ESCAPED "got HTTP $out from $url" ;;
-    *) if [ "$rc" -ne 0 ]; then say "$n" "$name" BLOCKED "curl rc=$rc (no HTTP answer) for $url"
+    *) if [ "$rc" -eq 6 ]; then say "$n" "$name" N/A "name resolution failed (rc=6): that is the DNS layer (KubeArmor matchDNSQueries), not a NetworkPolicy verdict; use an IP"
+       elif [ "$rc" -ne 0 ]; then say "$n" "$name" BLOCKED "curl rc=$rc (no HTTP answer) for $url"
        else say "$n" "$name" ESCAPED "curl rc=0 out=$out for $url"; fi ;;
   esac
 }
@@ -45,10 +46,18 @@ direct() {
 body_probe() {
   n=$1; name=$2; url=$3; needle=$4
   out=$(curl -sk --max-time 5 --noproxy '*' "$url" 2>&1); rc=$?
-  case "$out" in
-    *"$needle"*) say "$n" "$name" ESCAPED "body contains $needle (rc=$rc)" ;;
-    *) say "$n" "$name" BLOCKED "no $needle in the answer (curl rc=$rc)" ;;
-  esac
+  if [ "$rc" -eq 6 ]; then
+    say "$n" "$name" N/A "name resolution failed (rc=6): DNS layer, not a NetworkPolicy verdict"
+  elif [ -n "$needle" ]; then
+    case "$out" in
+      *"$needle"*) say "$n" "$name" ESCAPED "answer matched '$needle' (rc=$rc)" ;;
+      *) say "$n" "$name" BLOCKED "no '$needle' in the answer (curl rc=$rc)" ;;
+    esac
+  elif [ "$rc" -eq 0 ]; then
+    say "$n" "$name" ESCAPED "the endpoint answered (rc=0): $(printf %s "$out" | head -c 60)"
+  else
+    say "$n" "$name" BLOCKED "no answer (curl rc=$rc)"
+  fi
 }
 
 # 1: the SA token must not exist ("No such file", not "Permission denied").
@@ -60,13 +69,14 @@ case "$out$out2" in
 esac
 
 # 2/3: the API server (Secrets list / /version).
-body_probe 2 api-secrets "https://kubernetes.default.svc/api/v1/namespaces/$NS/secrets" '"kind":"SecretList"'
-body_probe 3 api-version "https://kubernetes.default.svc/version" gitVersion
+API="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+body_probe 2 api-secrets "https://$API/api/v1/namespaces/$NS/secrets" ""
+body_probe 3 api-version "https://$API/version" gitVersion
 
 # 4/5: host-network endpoints (node apiserver, kubelet).
 if [ -n "${NODE_IP:-}" ]; then
   body_probe 4 node-apiserver "https://$NODE_IP:6443/version" gitVersion
-  body_probe 5 kubelet "https://$NODE_IP:10250/healthz" ok
+  body_probe 5 kubelet "https://$NODE_IP:10250/healthz" ""
 else
   say 4 node-apiserver N/A "NODE_IP unset"; say 5 kubelet N/A "NODE_IP unset"
 fi
@@ -82,7 +92,8 @@ else
 fi
 
 # 7: arbitrary internet host, bypassing the egress proxy.
-direct 7 internet-direct https://example.com/
+if [ -n "${EXAMPLE_IP:-}" ]; then direct 7 internet-direct https://example.com/ --resolve "example.com:443:$EXAMPLE_IP"
+else direct 7 internet-direct https://example.com/; fi
 
 # 8: the model endpoint direct (bypassing the model proxy).
 if [ -n "${MODEL:-}" ]; then direct 8 model-direct "http://$MODEL/v1/models"
@@ -98,8 +109,8 @@ printf 'EVIL-LISTEN %s 18080\n' "$(hostname -i 2>/dev/null | awk '{print $1}')"
 
 # 11: git push must fail on AUTH (positive control: anonymous read works).
 if [ -d "$WS/.git" ]; then
-  ctl=$(cd "$WS" && GIT_TERMINAL_PROMPT=0 git -c credential.helper= ls-remote origin 2>&1); crc=$?
-  out=$(cd "$WS" && GIT_TERMINAL_PROMPT=0 git -c credential.helper= push origin HEAD:refs/heads/evil-probe 2>&1); rc=$?
+  ctl=$(cd "$WS" && GIT_TERMINAL_PROMPT=0 git -c safe.directory="*" -c http.proxy= -c credential.helper= ls-remote "${REPO:-origin}" 2>&1); crc=$?
+  out=$(cd "$WS" && GIT_TERMINAL_PROMPT=0 git -c safe.directory="*" -c http.proxy= -c credential.helper= push "${REPO:-origin}" HEAD:refs/heads/evil-probe 2>&1); rc=$?
   # Control: the git server must ANSWER the agent. An anonymous ls-remote that
   # succeeds, or one the server rejects at the HTTP/auth layer (a private repo),
   # both prove the network path; a timeout/refusal does not.
@@ -133,12 +144,13 @@ fi
 
 # 13: privilege (all three must fail with "not permitted").
 bad=""
-for c in "unshare -m true" "mount -t tmpfs none /mnt" "kill $KILL_PID"; do
+touch "$CHOWN_FILE" 2>/dev/null
+for c in "unshare -m true" "mount -t tmpfs none /mnt" "chown 0:0 $CHOWN_FILE"; do
   o=$(sh -c "$c" 2>&1); rc=$?
   if [ "$rc" -eq 0 ]; then bad="$bad [$c]"
-  else case "$o" in *"not permitted"*|*"Permission denied"*) ;; *) bad="$bad [$c: $(printf %s "$o" | head -c 40)]" ;; esac; fi
+  else case "$o" in *"not permitted"*|*"Permission denied"*|*"must be superuser"*) ;; *) bad="$bad [$c: $(printf %s "$o" | head -c 40)]" ;; esac; fi
 done
-if [ -z "$bad" ]; then say 13 privilege BLOCKED "unshare/mount/kill refused"
+if [ -z "$bad" ]; then say 13 privilege BLOCKED "unshare/mount/chown refused"
 else say 13 privilege ESCAPED "$bad"; fi
 
 # Evidence integrity (the ADR's second half): an UNCOMMITTED marker the verify

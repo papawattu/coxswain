@@ -14,6 +14,7 @@ chmod 555 "$T/ro"
 cat > "$T/bin/curl" <<'S'
 #!/bin/sh
 proxied=0; for a in "$@"; do [ "$a" = "-x" ] && proxied=1; done
+if [ "$STUB_CURL" = dns ]; then exit 6; fi
 if [ "$STUB_CURL" = escaped ]; then printf '200 gitVersion "kind":"SecretList" ok'; exit 0; fi
 [ "$proxied" = 1 ] && { printf 403; exit 0; }
 exit 28
@@ -37,7 +38,7 @@ chmod +x "$T"/bin/*
 
 run() { # env assignments...
   env PATH="$T/bin:$PATH" EVIL_SA_DIR="$T/nosa" EVIL_RO_FILES="$T/ro/a $T/ro/b" \
-    EVIL_RW_DIRS="$T/rw1 $T/rw2" EVIL_HOSTNAME_FILE="$T/ro/hostname" EVIL_KILL_PID=1 \
+    EVIL_RW_DIRS="$T/rw1 $T/rw2" EVIL_HOSTNAME_FILE="$T/ro/hostname" EVIL_CHOWN_FILE="$T/rw1/chownme" \
     EVIL_WORKSPACE="$T/ws" NS=ns MODEL=m:1 PROXY=http://p:3128 VICTIM_IP=10.0.0.9 NODE_IP=10.0.0.1 \
     "$@" sh "$HERE/evil-probes.sh"
 }
@@ -70,6 +71,9 @@ want "auth-rejected control still lets probe 11 be BLOCKED" "$A" "^EVIL-PROBE 11
 C="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=fail)"
 want "failed ls-remote control => N/A" "$C" "^EVIL-PROBE 11 git-push N/A"
 
+# a name-resolution failure (rc 6) is the DNS layer, never a netpol BLOCKED
+D="$(run STUB_CURL=dns STUB_GIT=auth STUB_GIT_CTL=ok)"
+for n in 2 3 7 8 9; do want "dns failure: probe $n is N/A" "$D" "^EVIL-PROBE $n [a-z-]+ N/A"; done
 # missing targets => N/A
 M="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok MODEL= PROXY= VICTIM_IP= NODE_IP=)"
 for p in "4 node-apiserver" "5 kubelet" "6 metadata-proxy" "8 model-direct" "9 pod-outbound"; do want "missing target: $p N/A" "$M" "^EVIL-PROBE $p N/A"; done

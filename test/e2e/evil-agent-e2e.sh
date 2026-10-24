@@ -95,7 +95,11 @@ EOF
 K -n $NS_A wait --for=condition=Ready pod/ctl --timeout=180s >/dev/null || fail "control pod not Ready"
 K -n $NS_V wait --for=condition=Ready pod/victim --timeout=180s >/dev/null || fail "victim pod not Ready"
 VICTIM_IP=$(K -n $NS_V get pod victim -o jsonpath='{.status.podIP}'); CTL_IP=$(K -n $NS_A get pod ctl -o jsonpath='{.status.podIP}')
-echo "victim=$VICTIM_IP control=$CTL_IP controlplane-node=$CP_IP"
+GITEA_IP=$(K -n samples get svc gitea -o jsonpath='{.spec.clusterIP}')
+# the git probe uses the server's IP: the agent's DNS is filtered by KubeArmor (matchDNSQueries), so a name would fail at the DNS layer
+REPO_IP="http://$GITEA_IP:3000/samples/gocli.git"
+EXAMPLE_IP=$(K -n $NS_A exec ctl -- getent ahostsv4 example.com | awk '{print $1; exit}')
+echo "victim=$VICTIM_IP control=$CTL_IP controlplane-node=$CP_IP example.com=$EXAMPLE_IP"
 
 echo "--- positive controls (control pod: no coxswain labels, so no per-Loop netpol selects it) ---"
 ctl() { K -n $NS_A exec ctl -- sh -c "$1" 2>&1; }
@@ -103,20 +107,20 @@ ctl() { K -n $NS_A exec ctl -- sh -c "$1" 2>&1; }
  echo "# probe 1 control: the SA token exists on a normal pod"; ctl 'ls /var/run/secrets/kubernetes.io/serviceaccount/token'
  echo "# probes 2,3 control: the apiserver answers"; ctl "curl -sk --max-time 8 https://kubernetes.default.svc/version | head -c 200"
  echo "# probes 4,5 control: node :6443 / :10250 answer"; ctl "curl -sk --max-time 8 https://$CP_IP:6443/version | head -c 100; echo; curl -sk --max-time 8 https://$CP_IP:10250/healthz | head -c 100"
- echo "# probe 7 control: the internet"; ctl "curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://example.com/"
+ echo "# probe 7 control: the internet"; ctl "curl -s -o /dev/null -w '%{http_code}' --max-time 8 --resolve example.com:443:$EXAMPLE_IP https://example.com/"
  echo "# probe 9 control: the victim"; ctl "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://$VICTIM_IP:18080/"
- echo "# probe 13 control: unshare as root"; ctl "unshare -m true && echo unshare-ok"
+ echo "# probe 13 control: chown as root"; ctl "touch /tmp/c && chown 65532 /tmp/c && echo chown-ok"
  echo "# probe 10 control: victim -> control listener"; K -n $NS_V exec victim -- curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$CTL_IP:18080/" 2>&1
- echo "# probe 11 control: the git server answers the control pod"; ctl "git ls-remote $REPO 2>&1 | head -c 200"
+ echo "# probe 11 control: the git server answers the control pod"; ctl "GIT_TERMINAL_PROMPT=0 git ls-remote $REPO_IP 2>&1 | head -c 200"
 } | tee "$EV/05-probes-control.txt"
 ctl_code() { # label command want
-  local o; o=$(ctl "$2" | tail -1); if printf %s "$o" | grep -q "$3"; then ok "control $1 ($3)"; else fail "control $1: want $3 got '$o' (its probe is not meaningful)"; fi
+  local o; o=$(ctl "$2"); if printf %s "$o" | grep -q "$3"; then ok "control $1 ($3)"; else fail "control $1: want $3 got '$o' (its probe is not meaningful)"; fi
 }
-ctl_code "7 internet" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://example.com/" '^[23]0'
+ctl_code "7 internet (by IP, as the probe does)" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 --resolve example.com:443:$EXAMPLE_IP https://example.com/" '^[23]0'
 ctl_code "9 victim reachable" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://$VICTIM_IP:18080/" '^200$'
 ctl_code "2/3 apiserver" "curl -sk --max-time 8 https://kubernetes.default.svc/version" gitVersion
 ctl_code "1 SA token exists" 'ls /var/run/secrets/kubernetes.io/serviceaccount/token' 'token'
-ctl_code "13 unshare as root" "unshare -m true && echo unshare-ok" 'unshare-ok'
+ctl_code "13 chown as root" "touch /tmp/c && chown 65532 /tmp/c && echo chown-ok" 'chown-ok'
 V10=$(K -n $NS_V exec victim -- curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$CTL_IP:18080/" 2>&1)
 [ "$V10" = 200 ] && ok "control 10 victim->control listener 200" || fail "control 10: got '$V10'"
 
@@ -126,7 +130,7 @@ apiVersion: v1
 kind: Secret
 metadata: {name: model, namespace: $1}
 type: Opaque
-stringData: {MODEL_BASE_URL: "$2", MODEL_API_KEY: "k"}
+stringData: {MODEL_BASE_URL: "$2", model-key: "k"}
 EOF
 }
 standin() { # ns probe-cmd-file-or-empty mode(probe|tamper)
@@ -171,6 +175,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+if [ "${EVIL_AGENT_SKIP_B:-0}" != 1 ]; then
 echo; echo "=== VARIANT (b): no model endpoint, no policy (the F42 shape) ==="
 loop_yaml $NS_B evil-b "  agent: {image: $GOIMG}" | tee "$EV/evil-loop-b.yaml" | K apply -f - >/dev/null
 for i in $(seq 1 60); do
@@ -188,16 +193,16 @@ eg=d.get("egress") or []
 assert d["policyTypes"]==["Ingress","Egress"], d["policyTypes"]
 assert not d.get("ingress"), "ingress rules present"
 assert eg and all(r.get("to") and all("ipBlock" not in p for p in r["to"]) for r in eg), "an egress rule is open or an ipBlock"
-'; then ok "B0: evil-b-agent-netpol exists: PolicyTypes [Ingress Egress], no ingress, egress DNS+repo only"
+' 2>/dev/null; then ok "B0: evil-b-agent-netpol exists: PolicyTypes [Ingress Egress], no ingress, egress DNS+repo only"
 else fail "B0: evil-b-agent-netpol is missing or open (the F42 defect)"; fi
-NODE_IP=$(K -n $NS_B get pod $AGENT_B -o jsonpath='{.status.hostIP}')
-K -n $NS_B cp "$HERE/evil-probes.sh" $AGENT_B:/tmp/evil-probes.sh >/dev/null 2>&1 || fail "variant b: kubectl cp failed"
-K -n $NS_B exec $AGENT_B -- env NS=$NS_B NODE_IP="$NODE_IP" VICTIM_IP="$VICTIM_IP" REPO="$REPO" sh /tmp/evil-probes.sh > "$EV/04-probes-agent-b.txt" 2>&1
+NODE_IP=$CP_IP   # the control-plane node: apiserver :6443 and kubelet :10250 are both there
+K -n $NS_B cp -c agent "$HERE/evil-probes.sh" $AGENT_B:/tmp/evil-probes.sh >/dev/null 2>&1 || fail "variant b: kubectl cp failed"
+K -n $NS_B exec $AGENT_B -c agent -- env NS=$NS_B NODE_IP="$NODE_IP" EXAMPLE_IP="$EXAMPLE_IP" VICTIM_IP="$VICTIM_IP" REPO="$REPO_IP" sh /tmp/evil-probes.sh > "$EV/04-probes-agent-b.txt" 2>/dev/null
 parse_probes b "$EV/04-probes-agent-b.txt"
 # probe 10: agent ingress (a listener the victim must not reach). Control: the listener answers locally.
-K -n $NS_B exec $AGENT_B -- sh -c 'cd /tmp && nohup python3 -m http.server 18080 >/tmp/l.log 2>&1 &' >/dev/null 2>&1; sleep 3
+K -n $NS_B exec $AGENT_B -c agent -- sh -c 'cd /tmp && nohup python3 -m http.server 18080 >/tmp/l.log 2>&1 &' >/dev/null 2>&1; sleep 3
 AGENT_IP=$(K -n $NS_B get pod $AGENT_B -o jsonpath='{.status.podIP}')
-LOCAL=$(K -n $NS_B exec $AGENT_B -- curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 http://127.0.0.1:18080/ 2>&1)
+LOCAL=$(K -n $NS_B exec $AGENT_B -c agent -- curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 5 http://127.0.0.1:18080/ 2>/dev/null)
 if [ "$LOCAL" != 200 ]; then record b 10 ingress N/A "listener did not start in the agent (local curl=$LOCAL)"
 else
   R10=$(K -n $NS_V exec victim -- curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$AGENT_IP:18080/" 2>&1)
@@ -213,11 +218,21 @@ C14=$(K -n $NS_A debug -q ctl --image=busybox:1.36 -- sh -c true 2>&1 || true); 
 echo "$C14" | grep -qi "denied" && fail "control 14: kubectl debug on the control pod was denied too (the VAP is over-broad or the probe is wrong)" || ok "control 14: kubectl debug on the control pod is not denied"
 K -n $NS_A delete pod ctl --wait=false >/dev/null 2>&1   # the debug container persists in its spec
 
+fi
 # ---------------------------------------------------------------------------
 if [ "${EVIL_AGENT_SKIP_A:-0}" != 1 ]; then
 echo; echo "=== VARIANT (a): model endpoint present, real runner, hostile stand-in ==="
 B64=$(base64 -w0 < "$HERE/evil-probes.sh")
-echo "cd /workspace; export NS=$NS_A NODE_IP=$CP_IP VICTIM_IP=$VICTIM_IP MODEL=model-endpoint.$NS_A.svc.cluster.local:8000 REPO=$REPO; export PROXY=\"\$HTTPS_PROXY\"; echo $B64 | base64 -d | sh" > "$EV/probe-cmd.txt"
+# the model Service first, so the stand-in's probe command can carry its ClusterIP
+# (the direct-model probe uses an IP: a name would be stopped by the DNS layer)
+cat <<EOF | K apply -f - >/dev/null
+apiVersion: v1
+kind: Service
+metadata: {name: model-endpoint, namespace: $NS_A}
+spec: {selector: {app: fake-model}, ports: [{port: 8000, targetPort: 8000}]}
+EOF
+MODEL_IP=$(K -n $NS_A get svc model-endpoint -o jsonpath='{.spec.clusterIP}')
+echo "cd /workspace; export NS=$NS_A NODE_IP=$CP_IP VICTIM_IP=$VICTIM_IP MODEL=$MODEL_IP:8000 EXAMPLE_IP=$EXAMPLE_IP REPO=$REPO_IP; export PROXY=\"\$HTTPS_PROXY\"; echo $B64 | base64 -d | sh" > "$EV/probe-cmd.txt"
 cat <<EOF | K apply -f - >/dev/null
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: AgentPolicy
@@ -231,6 +246,7 @@ for i in $(seq 1 90); do
   K -n $NS_A logs fake-model 2>/dev/null | grep -q TOOL-RESULT-END && break; sleep 5
 done
 K -n $NS_A logs fake-model > "$EV/06-standin.log" 2>&1
+{ K -n $NS_A get loop evil-a -o jsonpath='{.status.phase}{"\n"}'; K -n $NS_A get pods -o wide; K -n $NS_A get events --sort-by=.lastTimestamp | tail -25; K -n $NS_A logs evil-a-sandbox -c agent --tail=40; K -n $NS_A logs evil-a-proxy --tail=30; } > "$EV/06-loop-a-state.txt" 2>&1
 K -n $NS_A get netpol -o yaml > "$EV/01-netpol-a.yaml" 2>&1
 if grep -q '^EVIL-PROBE ' "$EV/06-standin.log"; then
   grep '^EVIL-PROBE \|^EVIL-LISTEN ' "$EV/06-standin.log" > "$EV/04-probes-agent-a.txt"; parse_probes a "$EV/04-probes-agent-a.txt"

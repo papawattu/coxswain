@@ -6,7 +6,8 @@ work merged since R31 was opened. Code line numbers are against main at
 committed:
 - a post-merge integration review of F55, F35 and F36 (`.samples/review-postmerge-2.md`);
 - a post-merge review of F54 as shipped (`.samples/review-postmerge-3.md`);
-- the pre-reviews of PRs #222 and #227-#233 (`.samples/prereview-*.md`);
+- the pre-reviews of PRs #222 and #224-#233 (`.samples/prereview-*.md`;
+  #224 and #225 are `prereview-troubleshoot.md` and `prereview-opsec.md`);
 - a comparison of `CONTEXT.md` with `docs/GLOSSARY.md`, checked against the
   code (`.samples/context-vs-glossary.md`, `.samples/context-md-proposal.md`);
 - design notes for queued items (`.samples/design-f56-f70.md`, `.samples/design-f72-f73.md`).
@@ -22,7 +23,8 @@ committed:
 **Status:**
 - **The evil-agent e2e exists and catches the F42 shape.** On kind-ref, the
   pre-F42 build fails it and main passes a full run, and each of five
-  security mutations (M1-M5) fails it. As shipped it can still exit 0 with
+  security mutations (M1-M5, PR #222's body; M4 is backed by its re-run
+  after the first build failed, see I114) fails it. As shipped it can still exit 0 with
   probes that were never measured, and it can't be run from the repo alone
   (I111).
 - **F55's gate holds a forked Loop for a proxy the fork never uses** (I112).
@@ -51,8 +53,9 @@ committed:
   - (b) The preflight notices missing KubeArmor but keeps going.
     It never checks that the operator, the samples namespace or the host
     tools are present.
-  - (c) Nothing in the repo builds the environment the harness needs. The
-    passing runs used kind-ref on the lab VM, set up by hand.
+  - (c) No target or doc produces the environment the harness defaults to: a
+    `kind-ref` context plus the `samples` Gitea seed it reads. QUICKSTART §9
+    builds most of it, under a different context name and without the seed.
 
   The unproven steps (the verify-checkout assertions, probe 15's control
   Loop, the exec-path equivalence run) are labelled honestly. None prints as
@@ -125,8 +128,8 @@ committed:
 
 - [ ] **I114: the docs pass, what pre-review caught, and process slips**
 
-  **Where:** PRs #227, #228, #230, #231 and #232 (docs drafted by builder
-  #1), and #222 (F54).
+  **Where:** PRs #224, #225, #227, #228, #230, #231 and #232 (docs), and
+  #222 (F54).
 
   **Problem:** every docs PR needed fixes after pre-review. The wrong or unbacked
   claims caught before merge include:
@@ -139,7 +142,8 @@ committed:
     `spec.checkpoints`);
   - a PromQL "stall" query that measured scrape time;
   - `kubectl cox logs <loop> proxy`, which `ExactArgs(1)` rejects. The same
-    error was already on main in five places, and all are fixed in #232;
+    error was already on main in eight places in `docs/OPERATOR.md`, and
+    all are fixed in #232;
   - a claim that an e2e runs a command it doesn't.
 
   Process slips this round:

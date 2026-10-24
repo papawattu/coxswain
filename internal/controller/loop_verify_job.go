@@ -505,6 +505,51 @@ func (r *LoopReconciler) egressProxyEnv(loop *coxv1alpha1.Loop) []corev1.EnvVar 
 	}
 }
 
+// tamperGitErrorExit is the tamper script's exit status when git itself fails
+// (distinct from 1, "a protected path changed").
+const tamperGitErrorExit = 2
+
+// tamperCheckScript builds the tamper init's sh script (B2, F39). It diffs
+// baseCommit..verifiedCommit over the protected globs and exits 1 listing any
+// changed protected path. Two defects fixed in F39:
+//   - the globs were joined with newlines into ONE pathspec argument, which git
+//     does not split, so with two or more globs nothing ever matched and the
+//     gate printed "tamper: clean". Each glob is now its own quoted argument.
+//   - the diff ran inside a pipe to sed, so a failing git diff took sed's exit
+//     status and also read as clean. The diff's own status is now checked and
+//     a failure exits 2 (fail closed).
+//
+// With no globs (preset none and no protectedPaths) nothing is protected, and a
+// bare "git diff" with no pathspec would flag every change, so the script
+// reports clean without running it.
+func tamperCheckScript(baseCommit, verifyCommit string, globs []string) string {
+	if len(globs) == 0 {
+		return "set -e\necho \"tamper: clean (no protected paths)\"\nexit 0\n"
+	}
+	quoted := make([]string, len(globs))
+	for i, g := range globs {
+		quoted[i] = shellQuote(g)
+	}
+	return fmt.Sprintf(`
+set -e
+cd %s
+# Diff baseCommit..verifiedCommit over the protected globs, one pathspec per
+# argument. A non-empty result (any protected path changed) => exit 1
+# (tampered). Empty => exit 0 (clean). A git failure => exit 2 (fail closed).
+if ! CHANGED=$(git diff --name-only %s %s -- %s); then
+  echo "tamper: git diff failed; refusing to report clean"
+  exit %d
+fi
+if [ -n "$CHANGED" ]; then
+  echo "tamper: protected paths changed:"
+  echo "$CHANGED"
+  exit 1
+fi
+echo "tamper: clean"
+exit 0
+`, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit)
+}
+
 // buildVerifyJobSpec builds the verify Job's spec: the init containers in
 // evidence order + the no-op main container + restartPolicy Never +
 // backoffLimit 0 (B3b: exactly one run).
@@ -519,7 +564,6 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	// <globs...>` and exits non-zero on any hit.
 	globs := tamper.ExpandPreset(tamper.Preset(loop.Spec.Verify.Preset),
 		loop.Spec.Verify.ProtectedPaths, loop.Spec.Verify.ProtectedPathsOverride)
-	globArgs := strings.Join(globs, "\n")
 
 	// The trusted clone-base init: fetches baseCommit from origin into /verify
 	// (emptyDir). It is the ONLY container that touches credentials — and
@@ -627,21 +671,7 @@ echo "import-agent ok"
 	// non-zero exit means a protected path changed (TamperedVerify, B2). The
 	// check is a single git diff over the protected globs; the exit code is
 	// the evidence (the operator reads it from pod status).
-	tamperScript := fmt.Sprintf(`
-set -e
-cd /verify
-# Diff baseCommit..verifiedCommit over the protected globs. A non-empty
-# result (any protected path changed) => exit 1 (tampered). Empty => exit 0
-# (clean). The globs are one per line.
-CHANGED=$(git diff --name-only %s %s -- %s | sed '/^$/d')
-if [ -n "$CHANGED" ]; then
-  echo "tamper: protected paths changed:"
-  echo "$CHANGED"
-  exit 1
-fi
-echo "tamper: clean"
-exit 0
-`, shellQuote(baseCommit), shellQuote(verifyCommit), shellQuote(globArgs))
+	tamperScript := tamperCheckScript(baseCommit, verifyCommit, globs)
 	tamperCt := corev1.Container{
 		Name:            verifyTamperInit,
 		Image:           baseImage,
@@ -1095,6 +1125,12 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool) (int, bool, 
 	tamperStatus := pod.Status.InitContainerStatuses[tamperIdx]
 	if tamperStatus.State.Terminated == nil {
 		return verifyNoDecision, true, "", 0
+	}
+	// F39: exit tamperGitErrorExit means the script's own git diff failed (an
+	// infrastructure fault), not that the agent changed a protected path. It
+	// fails closed as an infra failure, never as TamperedVerify.
+	if tamperStatus.State.Terminated.ExitCode == tamperGitErrorExit {
+		return verifyInfraFailed, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
 	}
 	if tamperStatus.State.Terminated.ExitCode != 0 {
 		return verifyTampered, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode

@@ -196,8 +196,8 @@ Apply a minimal Loop CR (a `coxswain.wattu.com/v1alpha1` Loop). The operator
 creates the agent-sandbox workspace for it, the runner plans → implements →
 verifies inside the sandbox, and on success the Loop's PR is opened by the
 deliver Job. The agent needs a model endpoint: create a Secret in the
-Loop's namespace holding the model base URL and API key (see §9 Step 7 for
-the key names), then set `spec.agent.endpointSecretRef` to that Secret's name
+Loop's namespace holding the model API key under the key `model-key` (§9
+Step 7 shows one), then set `spec.agent.endpointSecretRef` to that Secret's name
 and `spec.agent.modelEndpoint` to the endpoint's `host:port`. The CRD requires
 both together, and both are immutable, so a new endpoint means a new Loop.
 `config/samples/loop-fix-failing-test.yaml` shows the two fields as a

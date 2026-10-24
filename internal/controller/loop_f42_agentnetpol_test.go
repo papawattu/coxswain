@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/policy"
 )
 
 // f42Loop is a Loop with a repo and NO spec.agent.endpointSecretRef (the
@@ -69,14 +70,81 @@ func TestF42AgentNetPolExistsWithoutEndpoint(t *testing.T) {
 		np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress || np.Spec.PolicyTypes[1] != networkingv1.PolicyTypeEgress {
 		t.Errorf("PolicyTypes = %v, want [Ingress Egress]", np.Spec.PolicyTypes)
 	}
+	if n := f42CountComponentPeers(np, policy.ComponentProxyLabel); n != 0 {
+		t.Errorf("agent egress has %d model-proxy peer rule(s) without an endpoint, want 0", n)
+	}
+}
+
+// f42CountComponentPeers counts the agent netpol egress peers whose podSelector
+// carries app.kubernetes.io/component=<component> (the model proxy's label;
+// proxyLabels has no coxswain.io/loop key).
+func f42CountComponentPeers(np *networkingv1.NetworkPolicy, component string) int {
+	n := 0
 	for _, rule := range np.Spec.Egress {
 		for _, peer := range rule.To {
-			if peer.PodSelector != nil && peer.PodSelector.MatchLabels["coxswain.io/loop"] != "" &&
-				peer.PodSelector.MatchLabels["app.kubernetes.io/component"] == "model-proxy" {
-				t.Errorf("no model-proxy egress rule expected without an endpoint, got %v", peer)
+			if peer.PodSelector != nil && peer.PodSelector.MatchLabels[policy.ComponentLabelKey] == component {
+				n++
 			}
 		}
 	}
+	return n
+}
+
+// Positive control for the assertion above: WITH an endpoint the same counter
+// finds exactly one model-proxy peer, so a count of 0 is meaningful.
+func TestF42ModelProxyRuleExistsWithEndpoint(t *testing.T) {
+	ctx := context.Background()
+	scheme := newI42cForeignNPScheme(t)
+	loop := f42Loop("f42-endpoint")
+	loop.Spec.Agent.EndpointSecretRef = "model-creds"
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
+	r := &LoopReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	np := &networkingv1.NetworkPolicy{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: loop.Name + "-agent-netpol"}, np); err != nil {
+		t.Fatalf("get agent netpol: %v", err)
+	}
+	if n := f42CountComponentPeers(np, policy.ComponentProxyLabel); n != 1 {
+		t.Fatalf("model-proxy peers = %d, want 1 with an endpoint", n)
+	}
+}
+
+// The failure condition is PERSISTED (not just set in memory) by
+// persistNetPolFailure, so it survives the error requeue.
+func TestF42NetPolFailureConditionIsPersisted(t *testing.T) {
+	ctx := context.Background()
+	scheme := newI42cForeignNPScheme(t)
+	loop := f42Loop("f42-persist")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).
+		WithStatusSubresource(&coxv1alpha1.Loop{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*networkingv1.NetworkPolicy); ok {
+					return errors.New("forbidden")
+				}
+				return cl.Create(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &LoopReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+
+	changed, err := r.ensureProxyAndNetPolicies(ctx, loop)
+	if err == nil || !changed {
+		t.Fatalf("want (changed=true, err), got (%v, %v)", changed, err)
+	}
+	r.persistNetPolFailure(ctx, loop, changed)
+
+	got := &coxv1alpha1.Loop{}
+	if gerr := c.Get(ctx, client.ObjectKeyFromObject(loop), got); gerr != nil {
+		t.Fatal(gerr)
+	}
+	for _, cond := range got.Status.Conditions {
+		if cond.Type == agentNetPolReadyCondition && cond.Status == metav1.ConditionFalse {
+			return
+		}
+	}
+	t.Fatalf("the stored Loop has no %s=False condition: %v", agentNetPolReadyCondition, got.Status.Conditions)
 }
 
 // Spec 2: the absent agent netpol holds the sandbox Suspended; once it exists

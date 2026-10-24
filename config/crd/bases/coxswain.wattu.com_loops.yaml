@@ -419,6 +419,10 @@ spec:
                   fork.
                 pattern: ^iter-[0-9]+$
                 type: string
+                x-kubernetes-validations:
+                - message: restoreFrom is immutable (a different rollback target is
+                    a fork)
+                  rule: self == oldSelf
               suspend:
                 description: suspend, when true, pauses the Loop at its current phase.
                 type: boolean

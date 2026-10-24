@@ -630,6 +630,106 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(c4.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 	})
 
+	// F35: the one-shot marker was keyed on metadata.generation, so ANY spec
+	// edit (the reviewer's reproduction: `cox pause` patches spec.suspend)
+	// re-armed a completed rollback: the PVC was deleted and the old snapshot
+	// restored over the work since. It is now keyed on the restore target.
+	for _, tc := range []struct {
+		name  string
+		steps map[string]func(*coxv1alpha1.Loop)
+		order []string
+	}{
+		{
+			name: "spec.suspend true then false (what `cox pause` / `cox resume` patch)",
+			steps: map[string]func(*coxv1alpha1.Loop){
+				"spec.suspend=true":  func(l *coxv1alpha1.Loop) { l.Spec.Suspend = true },
+				"spec.suspend=false": func(l *coxv1alpha1.Loop) { l.Spec.Suspend = false },
+			},
+			order: []string{"spec.suspend=true", "spec.suspend=false"},
+		},
+		{
+			name: "spec.goal",
+			steps: map[string]func(*coxv1alpha1.Loop){
+				"spec.goal edit": func(l *coxv1alpha1.Loop) { l.Spec.Goal += " (edited)" },
+			},
+			order: []string{"spec.goal edit"},
+		},
+	} {
+		It("ROLLBACK (one-shot, F35): after a completed rollback, editing "+tc.name+" does NOT re-arm the restore (the workspace PVC UID is unchanged)", func() {
+			ns := "b2-rollback-edit-" + nowSuffix()
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+			}()
+
+			name := "rollback-edit"
+			Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec:       b2LoopSpec(),
+			})).To(Succeed())
+
+			r, _ := b2NewReconcilerWithRecorder()
+			b2EnsureSandbox(ns, name)
+			b2EnsureSandboxPod(ns, name)
+			b1DriveToSucceeded(ctx, r, ns, name)
+			snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+			b2MakeSnapshotReady(ctx, ns, snapName)
+
+			rbLoop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, rbLoop)).To(Succeed())
+			rbLoop.Spec.RestoreFrom = "iter-0"
+			Expect(k8sClient.Update(ctx, rbLoop)).To(Succeed())
+
+			b2Reconcile(r, ns, name)
+			b2DeleteSandboxPod(ctx, ns, name)
+			b2Reconcile(r, ns, name)
+			b2RemovePVCProtectionFinalizer(ctx, ns, name)
+			l3 := b2Reconcile(r, ns, name)
+			Expect(b2RestoreCondition(l3).Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
+			restored, err := b2GetPVC(ctx, ns, name)
+			Expect(err).NotTo(HaveOccurred())
+			restoredUID := restored.UID
+
+			for _, step := range tc.order {
+				l := &coxv1alpha1.Loop{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, l)).To(Succeed())
+				gen := l.Generation
+				tc.steps[step](l)
+				Expect(k8sClient.Update(ctx, l)).To(Succeed())
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, l)).To(Succeed())
+				Expect(l.Generation).To(BeNumerically(">", gen), "the edit must bump metadata.generation (the old re-arm key)")
+
+				l = b2Reconcile(r, ns, name)
+				after, perr := b2GetPVC(ctx, ns, name)
+				Expect(perr).NotTo(HaveOccurred(), "after "+step)
+				Expect(after.UID).To(Equal(restoredUID), "after "+step+": the PVC must be the SAME object (a re-arm deletes and recreates it)")
+				c := b2RestoreCondition(l)
+				Expect(c.Status).To(Equal(metav1.ConditionTrue), "after "+step)
+				Expect(c.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored), "after "+step)
+			}
+		})
+	}
+
+	// F35: restoreFrom was documented immutable but had no CRD rule (forkOf
+	// has one).
+	It("ROLLBACK (F35): changing spec.restoreFrom once set is rejected at admission", func() {
+		ns := "b2-rollback-immut-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		spec := b2LoopSpec()
+		spec.RestoreFrom = "iter-0"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "immut", Namespace: ns}, Spec: spec})).To(Succeed())
+		l := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "immut", Namespace: ns}, l)).To(Succeed())
+		l.Spec.RestoreFrom = "iter-1"
+		err := k8sClient.Update(ctx, l)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("restoreFrom is immutable"))
+	})
+
 	It("ROLLBACK (absent): an ABSENT checkpoint (the VolumeSnapshot is missing) is rejected VISIBLY (the Restore condition is False reason RestoreSourceMissing; a WorkspaceRestoreUnavailable Event; no PVC is deleted — the target is gone, terminal)", func() {
 		ns := "b2-rollback-absent-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

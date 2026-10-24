@@ -39,9 +39,12 @@ spec:
     unchanged. The smoke test script test/smoke.sh is a protected path: do
     not modify or weaken it; make it pass by adding the route.
   workspace:
-    repo: http://gitea.samples.svc:3000/webapi.git
+    # The seeded repo lives under the 'samples' Gitea user (hack/samples-seed.sh
+    # owns it); the git credential Secret is the seeded samples-git-cred in
+    # the Loop's namespace.
+    repo: http://gitea.samples.svc:3000/samples/webapi.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...
@@ -93,9 +96,10 @@ spec:
     echo assertion to test/smoke.sh (a new check, not a weakening of the
     existing ping check).
   workspace:
-    repo: http://gitea.samples.svc:3000/webapi.git
+    # Same seeded repo as task 1 (samples/webapi.git on the in-cluster Gitea).
+    repo: http://gitea.samples.svc:3000/samples/webapi.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...

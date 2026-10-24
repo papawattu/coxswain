@@ -61,10 +61,9 @@ spec:
     # the operator's git image regardless.
     image: docker.io/library/golang:1.26
   agent:
-    # The operator's --runner-image flag (set by the dev overlay) selects the
-    # real runner entrypoint; image is the stand-in value the flag compares
-    # against.
-    image: coxswain-runner:latest
+    # image omitted: the operator's --runner-image flag supplies the runner
+    # entrypoint (the checked-in manifest examples/gocli/tasks/1.loop.yaml
+    # is deliberately the same — see its header note).
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b
@@ -93,7 +92,8 @@ stays for the operator-owned proxies; per-tool agent proxies (no general
 shell) are the D41 follow-on. A Loop whose policyRefs carry an exec list
 without the runner's shell (`/bin/sh`) is rejected fail-fast (`PolicyValid=False` reason `ExecListMissingShell`) before the sandbox is created.
 
-**Expected evidence:** `go build`/`go vet`/`go test` exit 0; the only change
+**Expected evidence:** `go build` and `go test` exit 0 (the two acceptance
+checks; `go vet` is not a gate check for this task); the only change
 is `round.go` (the reference fix is `tasks/1.patch`); `round_test.go`
 untouched (tamper check 0).
 
@@ -133,7 +133,8 @@ spec:
       - round_test.go
       - main_test.go
   agent:
-    image: coxswain-runner:latest
+    # image omitted: the operator's --runner-image flag supplies it (same
+    # convention as the task-1 checked-in manifest).
     endpointSecretRef: vllm-no-auth
     modelEndpoint: 192.168.1.20:8000
     model: qwen3.8-27b

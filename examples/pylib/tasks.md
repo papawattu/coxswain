@@ -49,9 +49,12 @@ spec:
     weaken it. Make `python3 -m unittest tests.test_median` pass on the
     tests as written.
   workspace:
-    repo: http://gitea.samples.svc:3000/pylib.git
+    # The seeded repo lives under the 'samples' Gitea user (hack/samples-seed.sh
+    # owns it); the git credential Secret is the seeded samples-git-cred in
+    # the Loop's namespace.
+    repo: http://gitea.samples.svc:3000/samples/pylib.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - python3 -m compileall -q .
@@ -107,9 +110,10 @@ spec:
     is a protected path: do not change or weaken it. Make
     `python3 -m unittest tests.test_clamp` pass on the tests as written.
   workspace:
-    repo: http://gitea.samples.svc:3000/pylib.git
+    # Same seeded repo as task 1 (samples/pylib.git on the in-cluster Gitea).
+    repo: http://gitea.samples.svc:3000/samples/pylib.git
     ref: initial
-    gitCredentialSecret: gitea-clone
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - python3 -m compileall -q .

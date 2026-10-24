@@ -232,3 +232,162 @@ stall in Implementing (vLLM backends, environmental)"):**
    going quiet — so the absence of that condition while the Loop is stuck
    is itself evidence that the runner is not even reaching the model client
    (look at the agent log and the proxy usage lines, as #124 did).
+
+## Why is my Loop Suspended or Failed?
+
+The gates and failure paths added on 2026-10-24 (F42, F55, F38, F35, F36, F39)
+put new conditions, Events and reasons on the object. Each entry below: the
+symptom, what it means, and what to do. Conditions appear in `kubectl cox
+describe` (its Conditions block); Events do not — show them with
+`kubectl get events --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>`
+or `kubectl describe loop <name>`. Code is cited by function name and path;
+line numbers drift.
+
+### `AgentNetworkPolicyReady=False`
+
+**What you see:** the condition is `False` with a message naming the error
+(`persistNetPolFailure` in `internal/controller/loop_controller.go` writes it),
+and a Warning Event with the same reason and message (`NetworkPolicyEnsureFailed`).
+
+**What it means:** the operator could not ensure the agent pod's NetworkPolicy
+(RBAC denied the write, a foreign object of the same name is not controlled by
+the Loop, or the policy is invalid). Note the condition is a report of the
+failed ensure; the hold itself is the netpol being **absent** (see below), so
+an update failure on an *existing* netpol sets this condition without
+suspending anything. The sandbox is held while the netpol is absent and is
+released once the ensure succeeds and the netpol exists.
+
+**What to do:** read the condition message; check the operator's RBAC — the
+ensure is a create-or-update, so check the verbs it actually uses
+(`kubectl auth can-i create,update,patch networkpolicies --as=<the
+operator's ServiceAccount>`), and `kubectl get networkpolicy <loop>-agent-netpol`
+to see whether a foreign object is in the way.
+
+### Sandbox Suspended with no condition explaining why (F42-b)
+
+**What you see:** the sandbox is `Suspended` and no condition names the
+cause.
+
+**What it means:** the agent NetworkPolicy is **absent** — `agentNetPolMissing`
+(in `internal/controller/loop_controller.go`) is a gate term in the
+sandbox-suspended check, so a missing netpol holds the sandbox just like a
+foreign one does. The absence is normally transient: the early ensure
+(`ensureAgentNetPolBeforeSandbox`, which runs before the sandbox is created)
+recreates a merely-missing netpol before the gate runs, so a Loop normally
+never sits here. If it persists, the ensure is erroring and the
+`AgentNetworkPolicyReady` condition and its Warning Event (above) name the
+cause — a persistent absence is never silent.
+
+**What to do:** `kubectl get networkpolicy -n <ns>` and look for
+`<loop>-agent-netpol`. If it is missing and the condition above is `False`,
+act on its message. If it is missing and no condition is set, this pass did
+not reach the ensure (an earlier gate can also return first) — check the
+operator log; the next pass creates it.
+
+### Sandbox Suspended while the `<loop>-egress-proxy` pod is not Ready (F55-a)
+
+**What you see:** the sandbox stays Suspended; no condition names the egress
+proxy.
+
+**What it means:** the sandbox gate now also waits for the egress proxy when
+the workspace-init clone must traverse it (`workspaceInitProxyCreated` in
+`internal/controller/loop_controller.go`), not only when network allows exist.
+For an external repo with no network allows,
+the init clone goes through the egress proxy, so the sandbox cannot start until
+that pod is Ready.
+
+**What to do:** `kubectl get pod <loop>-egress-proxy` and its logs. Once it is
+Ready the gate releases.
+
+### Event `AgentEgressFenced` (F55-b)
+
+**What you see:** a one-shot Normal Event: "The agent NetworkPolicy now applies
+to this Loop's running sandbox: agent egress is now fenced to DNS and the
+proxies."
+
+**What it means:** `ensureAgentNetPolBeforeSandbox` (in
+`internal/controller/loop_controller.go`) found the agent NetworkPolicy
+absent while this Loop's sandbox already existed, and created the netpol.
+The likely case is an operator upgrade (F42) while the sandbox was already
+running unfenced, but the Event fires equally if the netpol was deleted by
+hand while the sandbox ran. It records that the now-running sandbox is
+fenced.
+
+**What to do:** nothing — it is informational and load-bearing (the sandbox
+is fenced now). Any in-flight network activity that is not DNS or a proxy
+will be dropped from this point on.
+
+### Event `PlanChangedReHold` (F38)
+
+**What you see:** a Normal Event: "the re-plan differs from the approved plan;
+the approval was cleared and the plan must be re-approved", and the Loop re-enters
+`AwaitingApproval` in `ApprovalModeManual`.
+
+**What it means:** the runner detected that its plan changed after approval
+(a re-plan); the stale approval was cleared so an unapproved re-plan cannot be
+implemented.
+
+**What to do:** approve the new plan (`cox approve`) or reject it. If you did
+not expect a re-plan, read the plan in the Loop's workspace to see what
+changed.
+
+### Editing `spec.restoreFrom` is rejected by admission (F35)
+
+**What you see:** `Error: ... restoreFrom is immutable (a different rollback
+target is a fork)`.
+
+**What it means:** the field carries a CEL rule (`self == oldSelf`) so a
+mid-Loop rollback target cannot be swapped; a different rollback target is a
+fork, not an edit.
+
+**What to do:** to roll back to a different checkpoint, create a fork (`cox
+fork`) or a new Loop seeded from that checkpoint; do not edit the field.
+
+### Warning `ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed` (F36)
+
+**What you see:** Warning Events naming the snapshot, repeating on every
+reconcile until the patch succeeds: setting or removing the fork-retention
+label failed.
+
+**What it means:** the fork's source VolumeSnapshot was not (or could not be)
+marked for retention (`ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed`,
+emitted from `internal/controller/loop_restore.go`). On the set failure, the
+source's garbage collection may delete the snapshot while the fork is
+restoring; on the remove failure, the label persists and the source's GC
+skips the snapshot (a known B2 limitation).
+
+**What to do:** check the operator's RBAC for `patch` on volumesnapshots
+(`kubectl auth can-i patch volumesnapshots --as=<the operator's
+ServiceAccount>`); once RBAC is correct the next reconcile retries the patch
+and the Events stop.
+
+### `VerifyInfraFailed` — was the agent tampering? (F39)
+
+**What you see:** Warning Events `VerifyInfraRetry` ("verify infrastructure
+failed (attempt N of 3); recreating the verify Job") while the verify Job is
+recreated, and the Loop ends `Failed` with reason `VerifyInfraFailed` and a
+final `VerifyInfraFailed` Warning Event.
+
+**What it means:** the tamper script exited `2` (`tamperGitErrorExit` in
+`internal/controller/loop_verify_job.go`), which the verdict map in the
+controller maps to the internal `TamperUnknown` verdict — an infrastructure
+failure (git itself failed — a missing rev, a corrupt index, a clone problem),
+never tampering. Verify infra failures are retried twice (three total runs)
+before the Loop fails with `VerifyInfraFailed`, a reason distinct from
+`TamperedVerify` (a protected path actually changed) and from check failures.
+
+**What to do:** treat it as infrastructure: check the repo is reachable from
+the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
+The agent did not tamper; the check could not run.
+
+### The other holds on a Suspended sandbox
+
+The entries above cover the holds added on 2026-10-24. A sandbox can also be
+held by earlier gates: a tool proxy that is not owned+Ready
+(`toolProxyGatesSuspended` in `internal/controller/loop_controller.go`), the
+Manual-approval hold at `AwaitingApproval` (`approvalHoldPhase` in
+`internal/controller/loop_approval.go`), the restore-in-progress hold
+(`loop_restore.go`), a budget pause (token/cost cap reached), and the engine
+hold (`PolicyEnforced` condition, `internal/controller/loop_controller.go`).
+The `NetworkEnforced=False` hold has its own section above
+(`NetworkEnforced=False` with `--allow-unenforced-network`).

@@ -112,6 +112,8 @@ func TestMetricsRegistered(t *testing.T) {
 	loopsCompletedTotal.WithLabelValues("__test__", "__test__").Inc()
 	loopStallsTotal.Inc()
 	loopTokensTotal.WithLabelValues("__test__").Inc()
+	memoryWritesTotal.WithLabelValues("__test__").Inc()
+	memoryLessonsTotal.WithLabelValues("__test__").Inc()
 	// B5a: loops_active is now a custom Collector (loops_active_collector.go),
 	// registered in SetupWithManager. It is not tested here (it requires a
 	// client with Loops in the cache). The envtest covers it.
@@ -122,6 +124,8 @@ func TestMetricsRegistered(t *testing.T) {
 		"coxswain_loops_completed_total",
 		"coxswain_loop_stalls_total",
 		"coxswain_loop_tokens_total",
+		"coxswain_memory_writes_total",
+		"coxswain_memory_lessons_total",
 	} {
 		if _, ok := readMetric(t, name); !ok {
 			t.Errorf("%s is not registered on the process-wide metrics registry", name)

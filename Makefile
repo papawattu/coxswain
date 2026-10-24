@@ -76,8 +76,8 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	$(MAKE) memory-writer-image-test
 	@# F21: the RWX-storage script's execution test (real script, stubbed kubectl).
 	$(MAKE) rwx-storage-test
-	@# F29: the Helm chart's manager role must cover config/rbac/role.yaml (the P5b serviceaccounts rule was missing).
-	$(MAKE) chart-rbac-test
+	@# F29: the Helm chart's manager role and CRDs must not drift from config/ (serviceaccounts rule, lessonsAvailable were missing).
+	$(MAKE) chart-drift-test
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 	$(MAKE) runner-test
 
@@ -479,10 +479,11 @@ build-installer: manifests generate kustomize ## A5: render dist/install.yaml wi
 	IMG="$(IMG)" TARGET=build-installer hack/require-img.sh
 	KUSTOMIZE="$(KUSTOMIZE)" IMG="$(IMG)" MEMORY_STORAGE_CLASS="$(MEMORY_STORAGE_CLASS)" MANAGER_EXTRA_ARGS="$(MANAGER_EXTRA_ARGS)" hack/build-installer.sh
 
-.PHONY: chart-rbac-test
-chart-rbac-test: install-helm ## F29: chart manager role covers config/rbac/role.yaml; the guard fails on a chart missing serviceaccounts.
+.PHONY: chart-drift-test
+chart-drift-test: install-helm ## F29: chart manager role covers config/rbac/role.yaml and chart CRDs equal config/crd/bases; each guard fails on a mutated chart.
 	@hack/chart-rbac-check.sh
-	@hack/chart-rbac-check-test.sh
+	@hack/chart-crd-check.sh
+	@hack/chart-drift-check-test.sh
 
 .PHONY: memory-writer-image-test
 memory-writer-image-test: kustomize install-helm ## F19: every shipped manifest passes --memory-writer-image = the operator's own image.

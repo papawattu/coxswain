@@ -690,18 +690,13 @@ func setRestoreCondition(loop *coxv1alpha1.Loop, status bool, reason, message st
 // transition. This is the preferred helper for the in-progress restore steps
 // (StoppingWorkloads, StoppingSandbox, DeletingPVC) where the same reason is
 // set on every reconcile until the step completes.
-func (r *LoopReconciler) setRestoreConditionWithEvent(loop *coxv1alpha1.Loop, status bool, reason, message string) {
+func (r *LoopReconciler) setRestoreConditionWithEvent(loop *coxv1alpha1.Loop, reason, message string) {
+	// Every in-progress step reports status False.
 	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
-	var want metav1.ConditionStatus
-	if status {
-		want = metav1.ConditionTrue
-	} else {
-		want = metav1.ConditionFalse
-	}
-	reasonChanged := c == nil || c.Reason != reason || c.Status != want
-	setRestoreCondition(loop, status, reason, message)
+	reasonChanged := c == nil || c.Reason != reason || c.Status != metav1.ConditionFalse
+	setRestoreCondition(loop, false, reason, message)
 	if reasonChanged {
-		r.emitRestoreEvent(loop, status, reason, message)
+		r.emitRestoreEvent(loop, false, reason, message)
 	}
 }
 
@@ -791,7 +786,7 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 			return false, true, true, nil
 		}
 		if !workloadsStopped {
-			r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonStoppingWorkloads,
+			r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonStoppingWorkloads,
 				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the Loop-owned workloads are being stopped (the PVC is held by pvc-protection while they mount it)")
 			persist()
 			return true, true, true, nil
@@ -806,7 +801,7 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 				"loop", loop.Name)
 			return false, true, true, nil
 		}
-		r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+		r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonDeletingPVC,
 			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is being deleted; waiting for it to be fully gone before creating the new one")
 		persist()
 		return true, true, true, nil
@@ -821,7 +816,7 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	}
 	if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
 		if errors.Is(err, errWorkspacePVCTerminating) {
-			r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+			r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonDeletingPVC,
 				"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still Terminating; waiting for it to be fully gone before creating the new one")
 			persist()
 			return true, true, true, nil
@@ -898,7 +893,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			// the PVC is recreated from the snapshot).
 			if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
 				if errors.Is(err, errWorkspacePVCTerminating) {
-					r.setRestoreConditionWithEvent(loop, false, coxv1alpha1.RestoreReasonDeletingPVC,
+					r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonDeletingPVC,
 						"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+"): the old PVC is still Terminating; waiting for it to be fully gone before creating the new one")
 					persist()
 					return true, true, true, nil

@@ -71,7 +71,7 @@ func (c *f36RBACClient) Create(ctx context.Context, obj client.Object, opts ...c
 		if c.labelAtPVCCreate != nil {
 			snap := &unstructured.Unstructured{}
 			snap.SetGroupVersionKind(volumeSnapshotGVK)
-			if err := c.Client.Get(ctx, types.NamespacedName{Namespace: c.snapNS, Name: c.snapName}, snap); err == nil {
+			if err := c.Get(ctx, types.NamespacedName{Namespace: c.snapNS, Name: c.snapName}, snap); err == nil {
 				_, has := snap.GetLabels()[forkSnapshotLabelKey]
 				*c.labelAtPVCCreate = has
 			}

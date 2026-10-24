@@ -317,15 +317,18 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 
 	// Create the Job (the operator-controlled memory-write entrypoint) + the
 	// NetworkPolicy (deny-all). The Job is owned by the Loop.
+	// P3-6: the deny-all NetworkPolicy BEFORE the Job, so the writer pod never
+	// exists without its egress fence (ADR-0007: a lesson must not be
+	// exfiltrated during the write).
+	if err := r.ensureMemoryWriterNetworkPolicy(ctx, loop); err != nil {
+		return false, fmt.Errorf("create memory-writer netpol %s: %w", memoryWriterNetPolName(loop.Name), err)
+	}
 	job := r.buildMemoryWriterJob(loop, pvcName, outcomeArg)
 	if err := ctrl.SetControllerReference(loop, job, r.Scheme); err != nil {
 		return false, fmt.Errorf("set owner on memory-writer job %s: %w", jobName, err)
 	}
 	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
 		return false, fmt.Errorf("create memory-writer job %s: %w", jobName, err)
-	}
-	if err := r.ensureMemoryWriterNetworkPolicy(ctx, loop); err != nil {
-		return false, fmt.Errorf("create memory-writer netpol %s: %w", memoryWriterNetPolName(loop.Name), err)
 	}
 	logf.FromContext(ctx).Info("created memory-writer Job", "job", jobName, "outcome", outcomeArg)
 	// The Job was just created: requeue to read its outcome (the Job's pod

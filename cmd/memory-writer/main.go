@@ -196,7 +196,17 @@ func run(outcome string) (int, error) {
 	// lesson, regardless of the per-lesson rules — the operator only invokes
 	// the Job on a qualifying outcome, but the Job enforces the rule too, so
 	// a mis-invocation writes nothing).
-	survivors, reasons := screenLessons(lessons, eligibleOutcome)
+	// P3-1: Screen trims each lesson and the file is named by the TRIMMED text's
+	// sha256, so the audit (the sha prefix and the dedup annotation) must hash
+	// the trimmed text too, or a written lesson reads "duplicate" and the sha12
+	// does not match the file on the PVC.
+	for i := range lessons {
+		lessons[i] = strings.TrimSpace(lessons[i])
+	}
+	_, reasons := screenLessons(lessons, eligibleOutcome)
+	// P3-2: an identical lesson earlier in the same batch makes a later one a
+	// duplicate, so the per-lesson lines, the counts and the metric agree.
+	survivors := markBatchDuplicates(lessons, reasons)
 
 	// P5c: the Memory Curator gate (ADR-0002, D70). Only when ALL static
 	// rules pass (the survivors) does the curator judge each lesson. The
@@ -533,4 +543,24 @@ func boundedError(err error) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// markBatchDuplicates marks every survivor (reason "") whose text already
+// appeared as an earlier survivor in the batch as "duplicate", and returns the
+// remaining survivors in input order (the lessons are already trimmed).
+func markBatchDuplicates(lessons, reasons []string) []string {
+	seen := make(map[string]bool, len(lessons))
+	out := make([]string, 0, len(lessons))
+	for i, l := range lessons {
+		if i >= len(reasons) || reasons[i] != "" {
+			continue
+		}
+		if seen[l] {
+			reasons[i] = "duplicate"
+			continue
+		}
+		seen[l] = true
+		out = append(out, l)
+	}
+	return out
 }

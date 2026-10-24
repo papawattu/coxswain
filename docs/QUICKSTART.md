@@ -142,8 +142,8 @@ Loop's PR through the Gitea/GitHub API using a `kubernetes.io/basic-auth`
 Secret named **`git-cred`** (username `x-access-token`). The token is a
 fine-grained GitHub token scoped to the sandbox repo, and it must never be
 printed, `cat`'d, or placed on a command line (D55). In GitHub, create a
-fine-grained personal access token with read/write contents on the repo the
-Loop will use, then save it to `~/.config/coxswain/github-token` (mode 600).
+fine-grained personal access token with Contents and Pull requests both set
+to Read and write on the repo the Loop will use, then save it to `~/.config/coxswain/github-token` (mode 600).
 Two ways to create the Secret:
 
 **Option A — the helper (preferred).** Put the token in
@@ -196,9 +196,12 @@ Apply a minimal Loop CR (a `coxswain.wattu.com/v1alpha1` Loop). The operator
 creates the agent-sandbox workspace for it, the runner plans → implements →
 verifies inside the sandbox, and on success the Loop's PR is opened by the
 deliver Job. The agent needs a model endpoint: create a Secret in the
-Loop's namespace with the key material your model backend expects (see
-§9 Step 7 for the field names), then set `spec.model` in the Loop so the
-runner can reach the model.
+Loop's namespace holding the model base URL and API key (see §9 Step 7 for
+the key names), then set `spec.agent.endpointSecretRef` to that Secret's name
+and `spec.agent.modelEndpoint` to the endpoint's `host:port`. The CRD requires
+both together, and both are immutable, so a new endpoint means a new Loop.
+`config/samples/loop-fix-failing-test.yaml` shows the two fields as a
+commented-out example.
 
 `config/samples` has a working example:
 

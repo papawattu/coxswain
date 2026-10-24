@@ -1186,3 +1186,60 @@ func TestMemoryWriteNeverEvictsNonLessonFile(t *testing.T) {
 		t.Errorf("junk.txt was evicted: %v", err)
 	}
 }
+
+// F33 P3-1: Screen trims, the file is named by the TRIMMED text, so the audit's
+// sha12 must be the trimmed text's and the lesson must read "written".
+func TestMemoryWriteAuditHashesTrimmedLesson(t *testing.T) {
+	mem := t.TempDir()
+	trimmed := "a/b.go: retry the clone"
+	sum := runCapped(t, mem, []string{"  " + trimmed + "  "})
+	files := readMemoryFiles(t, mem)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	var fileSha string
+	for n := range files {
+		fileSha = strings.TrimSuffix(n, ".txt")[:shaPrefixLen]
+	}
+	if fileSha != shaPrefix(trimmed) {
+		t.Fatalf("file sha %s != trimmed-text sha %s", fileSha, shaPrefix(trimmed))
+	}
+	if !strings.Contains(sum, "lesson-001 "+fileSha+" written ") {
+		t.Errorf("audit must say lesson-001 <file sha12> written:\n%s", sum)
+	}
+	if strings.Contains(sum, "duplicate") {
+		t.Errorf("a written lesson was reported as a duplicate:\n%s", sum)
+	}
+}
+
+// F33 P3-2: two identical lessons in one batch: one written, the other a
+// duplicate, and the lines agree with the counts line.
+func TestMemoryWriteIdenticalLessonsInBatchAgreeWithCounts(t *testing.T) {
+	mem := t.TempDir()
+	l := "a/b.go: use make lint-fix"
+	sum := runCapped(t, mem, []string{l, l})
+	if got := len(readMemoryFiles(t, mem)); got != 1 {
+		t.Fatalf("want 1 file, got %d", got)
+	}
+	if !strings.Contains(sum, "summary: total=2 written=1 dropped=1") {
+		t.Errorf("counts line:\n%s", sum)
+	}
+	w, d := 0, 0
+	for line := range strings.SplitSeq(sum, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && strings.HasPrefix(f[0], "lesson-") {
+			switch f[2] {
+			case "written":
+				w++
+			case "dropped":
+				d++
+				if !strings.Contains(line, "duplicate") {
+					t.Errorf("dropped line without the duplicate reason: %s", line)
+				}
+			}
+		}
+	}
+	if w != 1 || d != 1 {
+		t.Errorf("per-lesson lines say written=%d dropped=%d, want 1 and 1:\n%s", w, d, sum)
+	}
+}

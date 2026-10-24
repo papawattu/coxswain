@@ -21,7 +21,7 @@ Set by the owner's request:
 
 ### I39. Nobody can "Approve" a PR here — use comment reviews + resolved threads
 
-- [ ] Noted in `AGENTS.md`
+- [x] Noted in `AGENTS.md` (ea380d5, #3)
 
 The builder, the reviewer and the owner all act through the same GitHub
 account, and GitHub doesn't let an account approve its own PR, so a required
@@ -38,7 +38,7 @@ Update `AGENTS.md` → *Review protocol* → *Pull requests* to say this (replac
 
 ### I40. Give each CI job a unique name, then require them
 
-- [ ] Done
+- [x] Done (1a6cc88, #4)
 
 **Where:** `.github/workflows/test.yml`, `lint.yml`, `test-e2e.yml`.
 

@@ -32,8 +32,8 @@ all of them:
 
 - [x] Owner direction (2026-10-01): tool proxies use allowlisted egress
 - [x] Owner decision: questions below — answered in R18
-- [ ] ADR written (generalises ADR-0006's zero-credential rule to tools)
-- [ ] Planned as slices
+- [x] ADR written (generalises ADR-0006's zero-credential rule to tools) (761db78, #70)
+- [x] Planned as slices (761db78, #70; d57d998 … b47ed62, #75)
 
 **Where:** a new per-Loop component, alongside the model proxy (D33) and the
 egress proxy (I42).

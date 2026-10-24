@@ -21,7 +21,7 @@ pod-to-pod boundary that works for keyed and keyless endpoints alike.
 
 ### D33. Proxy pod + Service per Loop (replaces C2a's sidecar)
 
-- [ ] Done
+- [x] Done (1f51db4, #12)
 
 The operator creates, per Loop, a proxy **Pod** (or single-replica
 Deployment) and a **Service** `<loop>-proxy`, owner-referenced to the Loop
@@ -40,7 +40,7 @@ endpoint secret).
 
 ### D34. NetworkPolicies do the split
 
-- [ ] Done
+- [x] Done (5e1aecc, #13)
 
 Generated per Loop, default-deny both ways:
 - **Agent pod:** egress to the `<loop>-proxy` pod on 8080, DNS, and the
@@ -56,7 +56,7 @@ call from an unrelated pod to the proxy Service fails.
 
 ### D35. Gate, audit and enforcement cover both pods
 
-- [ ] Done
+- [x] Done (5e1aecc, #13; 90b16a3, #8)
 
 - The D30 gate requires the proxy pod Ready (and its policy enforced) before
   the sandbox is `Running`.

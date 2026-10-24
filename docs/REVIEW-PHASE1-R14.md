@@ -10,7 +10,7 @@ the fix belongs to D33/D34, not to a C6b line change.
 
 ### I41. A `host:PORT` allow that loses its port must set `PolicyTranslationLossy` on the Loop
 
-- [ ] Done
+- [x] Done (9d04086, #15)
 
 **Where:** `internal/engine/kubearmor.go` (`splitNetworkAllows`), and the
 Loop status conditions set by the controller.
@@ -52,7 +52,7 @@ output.
 ### I42. How does the agent reach the hosts its AgentPolicy allows?
 
 - [x] Decided (owner, 2026-09-28): **option (b), egress proxy**
-- [ ] Done
+- [x] Done (5a227fd … 896fa95, #36)
 
 **Where:** ADR-0007 (the D34 "AgentPolicy network allows" paragraph),
 `ensureNetworkPolicy` (agent egress), and D35.

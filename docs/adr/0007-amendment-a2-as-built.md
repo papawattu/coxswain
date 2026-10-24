@@ -2,6 +2,8 @@
 
 **Status:** Proposed (docs-only; to be reviewed per R31 I107).
 **Date:** 2026-10-24
+**Code line numbers:** as of `6eb74c2` (main on 2026-10-24); later merges may
+move them; the function names are the stable anchor.
 **Amends:** ADR-0007 rows 24, 26 and 28 of `docs/REVIEW-PHASE1-R31.md`
 (I107, on `origin/review-phase1-r31`), **ADR-0007 Amendment A1** rows 29 and
 30 of the same table (the rows that cite
@@ -10,8 +12,6 @@ passage at `0007:573-582` (the line I107 calls `0007:562-575`).
 **Supersedes:** the five passages quoted below (three of ADR-0007 D29/Q4/D32,
 two of Amendment A1) and the "will add" / "does not exist yet" clauses at
 `0007:573-582`. The ADR and A1 are decision records and are not edited; this
-**Code line numbers:** as of `6eb74c2` (main on 2026-10-24); later merges may
-move them; the function names are the stable anchor.
 amendment records what was built.
 
 ## Context
@@ -45,23 +45,24 @@ disambiguates if the effective policy changed mid-iteration." The record is
 `target`, `verdict`, `detail`), `Source = "egress-proxy"` (`:30`).
 
 The other two producers in the tree omit it as well: the tool proxy's
-`AuditRecord` (`internal/toolproxy/audit.go:7-18`, `Source = "tool-proxy"`
-`:21`) has tool-level fields and no iteration, and the model proxy's audit
+`AuditRecord` (`internal/toolproxy/audit.go:9-20`, `Source = "tool-proxy"`
+`:23`) has tool-level fields and no iteration, and the model proxy's audit
 line is a map literal with no iteration (`internal/proxy/proxy.go:257-268`:
 `time, loop, namespace, source, action, model, promptTokens,
-completionTokens, status, usagePresent`). `grep -rn 'json:"iteration"'
-internal/` has exactly **one** hit, `internal/controller/loop_s4_phase.go:115`
-— the phase claim's field, not an audit record.
+completionTokens, status, usagePresent`).
+`git grep -n 'json:"iteration' origin/main -- internal/` has exactly **one**
+hit, `internal/controller/loop_s4_phase.go:115` — the phase claim's field,
+not an audit record.
 
 There is also no relay to fill the field: `git ls-tree --name-only origin/main
 cmd/` is `cox`, `egress-proxy`, `kubectl-cox`, `main.go`, `memory-writer`,
 `model-proxy`, `proxy-standin`, `runner`, `tool-proxy` — no relay binary — and
 `internal/` has no relay package.
 
-**Decision now recorded:** the Q4 envelope as built has no `iteration`. Two
-of the three sources cannot carry it (the proxies' env is immutable and they
-do not read Loop status), and the joiner that would add it is not built (that
-absence is I107 row 23, a build row, not this one). The correlation handles
+**Decision now recorded:** the Q4 envelope as built has no `iteration`. All
+three sources cannot carry it (the proxies are long-lived pods whose env is
+immutable and which do not read Loop status), and the joiner that would add it
+is not built (that absence is I107 row 23, a build row, not this one). The correlation handles
 that exist today are `loop`/`namespace` on every record and the
 effective-policy hash in `detail`
 (`internal/egress/audit.go:15-16`, the same hash as
@@ -102,10 +103,10 @@ the bypass D29 exists to prevent. The **per-container fence is NOT built**.
 
 What actually keeps the agent off the model endpoint is the **NetworkPolicy**:
 the agent pod's egress allowlist is the model proxy peer
-(`loop_controller.go:4225`), the egress proxy peer when network allows exist
-(`:4226-4231`), DNS (`:4232-4235`), the repo host for the init clone
-(`:4255-4259`) or the egress proxy when the repo host is external
-(`:4260-4272`), and one peer per tool proxy (`:4281-4284`) — the model
+(`loop_controller.go:4213`), the egress proxy peer when network allows exist
+(`:4214-4219`), DNS (`:4220-4223`), the repo host for the init clone
+(`:4241-4248`) or the egress proxy when the repo host is external
+(`:4252-4259`), and one peer per tool proxy (`:4264-4274`) — the model
 endpoint is not among them, so a direct connection is dropped by the CNI. No
 eBPF audit record exists for such an attempt: nothing translates engine
 alerts into the Q4 envelope (I107 row 25, a build row).
@@ -217,8 +218,8 @@ and flip the gate back to Suspended if that node no longer satisfies the
 facts (e.g. the agent pod was deleted, the BPF-LSM label was removed)."
 
 **What was built:** nothing reads the sandbox pod's `spec.nodeName`.
-`grep -rn 'Spec.NodeName' internal/` (non-test) has one hit,
-`internal/engine/kubearmor_enforcer.go:578`, and it selects **KubeArmor
+`git grep -n 'Spec.NodeName' origin/main -- internal/ ':!*_test.go'` has one
+hit, `internal/engine/kubearmor_enforcer.go:578`, and it selects **KubeArmor
 agent** pods on a given node inside the agent-pod lister
 (`listAgentPods`, `:562`) — not the sandbox pod. The static check reads the
 nodes that **currently** carry the BPF-LSM label (`:367-374`) and requires a

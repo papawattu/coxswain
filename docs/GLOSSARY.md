@@ -8,7 +8,7 @@ Alphabetical; each entry links to where the docs define the term.
   exit 0 = pass. They are the only *automated* gate — a human reviewing the
   draft PR is separate.
   See: [ADR-0005, Decision](adr/0005-operator-verifies-via-isolated-job.md#decision),
-  [QUICKSTART §4 (What you will see, in order)](QUICKSTART.md#a-first-loop).
+  [QUICKSTART §4 (What you will see, in order)](QUICKSTART.md#4-a-first-loop).
 
 - **Agent** — The AI process that does the work inside the sandbox: it clones
   the workspace, writes the plan, implements the goal, and reports its phase
@@ -23,7 +23,7 @@ Alphabetical; each entry links to where the docs define the term.
   the effective policy is what the operator enforces.
   See: [OPERATOR.md §Verify the
   install](OPERATOR.md#verify-the-install),
-  [ADR-0007, Q2](adr/0007-agentpolicy-default-deny-ebpf-audit.md#q2--agentpolicy).
+  [ADR-0007, Q2](adr/0007-agentpolicy-default-deny-ebpf-audit.md#q2--agentpolicy-its-own-crd-default-deny-additive-allows).
 
 - **Approval gate** — The optional manual gate (`spec.approval.mode: Manual`):
   the Loop pauses at `AwaitingApproval` after Planning, the user reads the
@@ -47,7 +47,7 @@ Alphabetical; each entry links to where the docs define the term.
   (1)](OPERATOR.md#debugging-a-stuck-loop).
 
 - **Checkpoint** — A VolumeSnapshot of the workspace taken per iteration
-  (best-effort by default; `CheckpointPolicy: Required` fails the Loop at
+  (best-effort by default; `spec.checkpoints: Required` fails the Loop at
   start if snapshots are impossible). Checkpoints are what forks and
   rollbacks restore from, and what the Loop's finalizer protects.
   See: [QUICKSTART §7 (Forking a
@@ -59,7 +59,7 @@ Alphabetical; each entry links to where the docs define the term.
   keeping?"; its verdict (boolean + one-line reason) is written to the audit
   trail and it never rewrites the lesson text.
   See: [ADR-0002,
-  Context](adr/0002-llm-curation-rule-gated.md#context).
+  Context](adr/0002-llm-curation-rule-gated.md).
 
 - **Deliver Job** — The operator-owned Job that opens the Loop's PR through
   the Gitea/GitHub API using the `git-cred` basic-auth Secret in the Loop's
@@ -83,7 +83,7 @@ Alphabetical; each entry links to where the docs define the term.
   proxies).
   See: [OPERATOR.md §What the sandbox can
   reach](OPERATOR.md#what-the-sandbox-can-reach),
-  [ADR-0007, I42 resolution](adr/0007-agentpolicy-default-deny-ebpf-audit.md#i42-resolution).
+  [ADR-0007, I42 resolution](adr/0007-agentpolicy-default-deny-ebpf-audit.md#i42-resolution-the-egress-proxy-owner-decision-2026-09-28).
 
 - **Escape hatches** — The two dev-only manager flags, independent of each
   other: `--allow-unenforced` (disables the KubeArmor policy gate) and
@@ -98,7 +98,7 @@ Alphabetical; each entry links to where the docs define the term.
   the source.
   See: [QUICKSTART §7 (Forking a
   Loop)](QUICKSTART.md#7-forking-a-loop),
-  [ADR-0003, Context](adr/0003-one-shot-loop-fork-not-retask.md#context).
+  [ADR-0003, Context](adr/0003-one-shot-loop-fork-not-retask.md).
 
 - **Gate** — A fail-closed precondition the operator checks before letting a
   Loop run: the network gate (the CNI must enforce NetworkPolicy, probed by
@@ -129,7 +129,7 @@ Alphabetical; each entry links to where the docs define the term.
   is recorded in the `status.iterations` ring, and the Loop stops at its
   `maxIterations` budget if verify keeps failing.
   See: [QUICKSTART §4 (What you will see,
-  in order)](QUICKSTART.md#a-first-loop),
+  in order)](QUICKSTART.md#4-a-first-loop),
   [OPERATOR.md §Reading Loop status](OPERATOR.md#reading-loop-status).
 
 - **KubeArmorPolicy** — The KubeArmor object (the A1 policy gate, ADR-0007)
@@ -147,7 +147,7 @@ Alphabetical; each entry links to where the docs define the term.
   then gets written to the memory PVC. Dropped lessons show up as
   `curator-drop` or `static-drop` in `coxswain_memory_lessons_total`.
   See: [ADR-0002,
-  Context](adr/0002-llm-curation-rule-gated.md#context),
+  Context](adr/0002-llm-curation-rule-gated.md),
   [OPERATOR.md §The B5a metrics](OPERATOR.md#the-b5a-metrics).
 
 - **Loop** — A one-shot, single-purpose unit of work: a `Loop` CR whose phase
@@ -155,12 +155,13 @@ Alphabetical; each entry links to where the docs define the term.
   until it passes its acceptance checks or hits a limit. Loops are never
   re-tasked mid-flight; a changed goal is a new Loop or a fork.
   See: [QUICKSTART §4 (A first
-  Loop)](QUICKSTART.md#a-first-loop),
-  [ADR-0003, Context](adr/0003-one-shot-loop-fork-not-retask.md#context).
+  Loop)](QUICKSTART.md#4-a-first-loop),
+  [ADR-0003, Context](adr/0003-one-shot-loop-fork-not-retask.md).
 
 - **Memory** — The shared, per-(namespace, repo URL) ReadWriteMany PVC
   holding lessons accumulated across Loops in that namespace; new Loops are
-  seeded from it and a memory-writer Job writes back after a Loop succeeds.
+  seeded from it and a memory-writer Job writes back when a Loop ends `Succeeded` or
+  `Failed:Stalled`.
   Without it a Loop simply runs without seeded lessons.
   See: [OPERATOR.md §Shared memory storage
   (Phase 5)](OPERATOR.md#shared-memory-storage-phase-5),
@@ -266,10 +267,11 @@ Alphabetical; each entry links to where the docs define the term.
   [OPERATOR.md §How the operator reads the
   sandbox's self-report](OPERATOR.md#how-the-operator-reads-the-sandboxs-self-report).
 
-- **Sandbox** — The isolated agent-sandbox workspace pod the operator creates
-  for each Loop; it is where the agent runs, with the agent container plus
-  proxy sidecar(s). If the pod is not Running, the Loop is stuck at the
-  sandbox level.
+- **Sandbox** — The isolated agent-sandbox workspace pod for each Loop: the
+  operator creates the Sandbox and the agent-sandbox controller starts the pod.
+  It runs the agent container only; the model, egress and tool proxies are
+  separate pods. If the pod is not Running, the Loop is stuck at the sandbox
+  level.
   See: [QUICKSTART §1 (agent-sandbox)](QUICKSTART.md#agent-sandbox),
   [OPERATOR.md §What the sandbox can and cannot
   reach](OPERATOR.md#what-the-sandbox-can-and-cannot-reach).

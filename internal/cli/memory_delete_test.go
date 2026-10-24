@@ -69,7 +69,7 @@ func TestMemoryDeleteMissingPVC(t *testing.T) {
 // Succeeded/Failed and other repos do not; an unset phase is active.
 func TestActiveLoopsFromJSON(t *testing.T) {
 	js := `{"items":[
-	 {"metadata":{"name":"a"},"spec":{"workspace":{"repo":"` + memTestRepo + `"}},"status":{"phase":"Succeeded"}},
+	 {"metadata":{"name":"a"},"spec":{"workspace":{"repo":"` + memTestRepo + `"}},"status":{"phase":"Succeeded","conditions":[{"type":"MemoryWriteDone","status":"True"}]}},
 	 {"metadata":{"name":"b"},"spec":{"workspace":{"repo":"` + memTestRepo + `"}},"status":{"phase":"Failed"}},
 	 {"metadata":{"name":"c"},"spec":{"workspace":{"repo":"` + memTestRepo + `"}},"status":{"phase":"Paused"}},
 	 {"metadata":{"name":"d"},"spec":{"workspace":{"repo":"` + memTestRepo + `"}},"status":{}},
@@ -80,5 +80,34 @@ func TestActiveLoopsFromJSON(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "c (Paused),d (Pending)" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// TestActiveLoopsFromJSONWriterPending (I101 follow-up): a terminal Loop whose
+// memory writer has not finished (no MemoryWriteDone condition) is active, if
+// it qualifies for a write; a terminal Loop with the condition, or one that
+// never qualifies (Failed, other reason), is not.
+func TestActiveLoopsFromJSONWriterPending(t *testing.T) {
+	loop := func(name, phase, conds string) string {
+		return `{"metadata":{"name":"` + name + `"},"spec":{"workspace":{"repo":"` + memTestRepo +
+			`"}},"status":{"phase":"` + phase + `","conditions":[` + conds + `]}}`
+	}
+	done := `{"type":"MemoryWriteDone","status":"True","reason":"MemoryWritten"}`
+	stalled := `{"type":"Failed","status":"True","reason":"Stalled"}`
+	budget := `{"type":"Failed","status":"True","reason":"BudgetExceeded"}`
+	js := `{"items":[` + strings.Join([]string{
+		loop("ok-pending", "Succeeded", ""),
+		loop("ok-done", "Succeeded", done),
+		loop("stall-pending", "Failed", stalled),
+		loop("stall-done", "Failed", stalled+","+done),
+		loop("budget", "Failed", budget),
+	}, ",") + `]}`
+	got, err := activeLoopsFromJSON([]byte(js), memTestRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ok-pending (Succeeded, memory write pending),stall-pending (Failed, memory write pending)"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

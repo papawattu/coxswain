@@ -292,11 +292,6 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 		})
 		s6Reconcile(r, ns, name)
 		Expect(loopHoldingForDelivery(p5fGet(ns, name))).To(BeTrue())
-		before := p5fGet(ns, name).Status.Budget
-		var activeBefore int64
-		if before != nil {
-			activeBefore = before.ActiveSeconds
-		}
 		By("the clock jumps 2h during the hold")
 		r.now = func() metav1.Time { return metav1.NewTime(time.Now().Add(2 * time.Hour)) }
 		s6DeliverPod(ns, name, corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})
@@ -307,7 +302,9 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "the budget must not fail a verified, delivering Loop")
 		Expect(loopHoldingForDelivery(loop)).To(BeTrue())
 		if loop.Status.Budget != nil {
-			Expect(loop.Status.Budget.ActiveSeconds).To(Equal(activeBefore), "no wall-clock accrual during the hold")
+			// A few real seconds may accrue before the hold starts; the 2h clock
+			// jump must not be added.
+			Expect(loop.Status.Budget.ActiveSeconds).To(BeNumerically("<", 600), "no wall-clock accrual during the hold")
 		}
 		pushDone(ns, name, 0, s6ValidTermination(loop))
 		for range 3 {

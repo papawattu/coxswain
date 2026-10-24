@@ -28,7 +28,7 @@ import (
 // testRepoURL is the fixture workspace repo used across the controller tests.
 // It's a placeholder that the tests never actually clone (envtest has no
 // git), so one shared constant avoids goconst churn.
-const testRepoURL = "https://example.com/repo.git"
+const testRepoURL = "http://gitea.samples.svc:3000/samples/gocli.git"
 
 // agentPolicyExecGit is the exec allow the AgentPolicy test fixtures reference
 // (git), shared across the policy test files to avoid goconst churn.

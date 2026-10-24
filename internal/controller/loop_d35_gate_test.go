@@ -21,7 +21,7 @@ var _ = Describe("D35: proxy readiness gate + ProxyConflict", func() {
 	// Local consts (the shared consts from the main suite are not available
 	// in this file because it's a separate Describe).
 	const (
-		d35TestRepo         = "https://github.com/papawattu/coxswain.git"
+		d35TestRepo         = "http://gitea.samples.svc:3000/samples/gocli.git"
 		d35TestKey          = "key"
 		d35ModelEndpoint    = "fake-model:8000"
 		d35RunnerImage      = "docker.io/library/golang:1.26"

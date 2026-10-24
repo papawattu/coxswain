@@ -34,7 +34,7 @@ import (
 const (
 	c6aGitBin        = "/usr/bin/git"
 	c6aGoBin         = "/usr/local/go/bin/go"
-	c6aTestRepo      = "https://github.com/papawattu/coxswain.git"
+	c6aTestRepo      = "http://gitea.samples.svc:3000/samples/gocli.git"
 	nonCanonLoopName = "noncanon-loop"
 	policyValidType  = "PolicyValid"
 	missingPolName   = "missing-pol-loop"

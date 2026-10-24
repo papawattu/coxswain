@@ -630,6 +630,80 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(c4.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
 	})
 
+	// F35: the one-shot marker was keyed on metadata.generation, so ANY spec
+	// edit (the reviewer's reproduction: `cox pause` patches spec.suspend)
+	// re-armed a completed rollback: the PVC was deleted and the old snapshot
+	// restored over the work since. It is now keyed on the restore target.
+	It("ROLLBACK (one-shot, F35): spec edits after a completed rollback (spec.suspend true then false, spec.goal) do NOT re-arm the restore (the workspace PVC UID is unchanged), and changing restoreFrom is rejected at admission", func() {
+		ns := "b2-rollback-edit-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "rollback-edit"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b2EnsureSandboxPod(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		rbLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, rbLoop)).To(Succeed())
+		rbLoop.Spec.RestoreFrom = "iter-0"
+		Expect(k8sClient.Update(ctx, rbLoop)).To(Succeed())
+
+		b2Reconcile(r, ns, name)
+		b2DeleteSandboxPod(ctx, ns, name)
+		b2Reconcile(r, ns, name)
+		b2RemovePVCProtectionFinalizer(ctx, ns, name)
+		l3 := b2Reconcile(r, ns, name)
+		Expect(b2RestoreCondition(l3).Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
+		restored, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred())
+		restoredUID := restored.UID
+
+		edit := func(mutate func(*coxv1alpha1.Loop)) {
+			l := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, l)).To(Succeed())
+			gen := l.Generation
+			mutate(l)
+			Expect(k8sClient.Update(ctx, l)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, l)).To(Succeed())
+			Expect(l.Generation).To(BeNumerically(">", gen), "the edit must bump metadata.generation (the old re-arm key)")
+		}
+		expectPVCUnchanged := func(why string) {
+			l := b2Reconcile(r, ns, name)
+			after, perr := b2GetPVC(ctx, ns, name)
+			Expect(perr).NotTo(HaveOccurred(), why)
+			Expect(after.UID).To(Equal(restoredUID), why+": the PVC must be the SAME object (a re-arm deletes and recreates it)")
+			c := b2RestoreCondition(l)
+			Expect(c.Status).To(Equal(metav1.ConditionTrue), why)
+			Expect(c.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored), why)
+		}
+
+		edit(func(l *coxv1alpha1.Loop) { l.Spec.Suspend = true })
+		expectPVCUnchanged("after spec.suspend=true")
+		edit(func(l *coxv1alpha1.Loop) { l.Spec.Suspend = false })
+		expectPVCUnchanged("after spec.suspend=false")
+		edit(func(l *coxv1alpha1.Loop) { l.Spec.Goal = l.Spec.Goal + " (edited)" })
+		expectPVCUnchanged("after spec.goal edit")
+
+		By("restoreFrom is immutable at admission")
+		l := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, l)).To(Succeed())
+		l.Spec.RestoreFrom = "iter-1"
+		err = k8sClient.Update(ctx, l)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("restoreFrom is immutable"))
+	})
+
 	It("ROLLBACK (absent): an ABSENT checkpoint (the VolumeSnapshot is missing) is rejected VISIBLY (the Restore condition is False reason RestoreSourceMissing; a WorkspaceRestoreUnavailable Event; no PVC is deleted — the target is gone, terminal)", func() {
 		ns := "b2-rollback-absent-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

@@ -721,6 +721,7 @@ type LoopSpec struct {
 	// change is rejected at admission; a different rollback target is a
 	// fork.
 	// +kubebuilder:validation:Pattern=`^iter-[0-9]+$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="restoreFrom is immutable (a different rollback target is a fork)"
 	// +optional
 	RestoreFrom string `json:"restoreFrom,omitempty"`
 

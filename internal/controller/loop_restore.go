@@ -195,17 +195,13 @@ const (
 //   - a FORK (spec.forkOf) whose restore is not yet complete: the source
 //     checkpoint (one-shot at creation).
 //   - a ROLLBACK (spec.restoreFrom): the named iter, when the restore for
-//     that generation has not yet completed. The one-shot marker is the
-//     Restore condition itself (True/Restored) PLUS the spec's generation:
-//     once a rollback has completed the operator does not re-restore (a
-//     re-restore would wipe the Loop's work since the restore) — the
-//     condition's observedGeneration carries the spec generation the
-//     restore completed for (a condition whose observedGeneration < the
-//     Loop's generation is a stale marker — a NEW spec.restoreFrom value
-//     bumps the generation and re-arms the restore; a same-value update
-//     does not). The CRD makes restoreFrom immutable, so in practice the
-//     re-arm happens only for a Loop that changed the field through a
-//     bypassing client (defensive) or a future CRD relaxation.
+//     that target has not yet completed. The one-shot marker is the Restore
+//     condition itself (True/Restored) keyed on the spec's restore TARGET
+//     (restoreCompletedForSpec), NOT on metadata.generation: a generation key
+//     re-armed a completed rollback on any spec edit (F35: `cox pause`
+//     patches spec.suspend), wiping the work done since the restore. The CRD
+//     makes restoreFrom immutable, so the target only changes through a
+//     bypassing client or by setting restoreFrom on a Loop that had none.
 //   - a LOST workspace PVC (NotFound) with no completed restore for the
 //     current generation: the reactive case — the latest recorded
 //     checkpoint (nil when none — the A2 fallback recreates the PVC
@@ -218,15 +214,10 @@ const (
 // DeletingPVC is not re-deleted; a running sandbox while StoppingSandbox is
 // not re-updated).
 func (r *LoopReconciler) b2RestoreTarget(ctx context.Context, loop *coxv1alpha1.Loop) *b2RestoreTarget {
-	// A completed restore is one-shot: the condition is the marker. The
-	// marker is valid for the spec generation it was recorded against
-	// (observedGeneration >= loop.Generation): a new spec.restoreFrom value
-	// bumps the generation and re-arms (the condition's observedGeneration
-	// stays at the old generation until the next restore writes it).
-	if c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition); c != nil &&
-		c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.RestoreReasonRestored &&
-		c.ObservedGeneration >= loop.Generation {
-		// The restore is complete for this spec generation. Do NOT
+	// A completed restore is one-shot: the condition is the marker, keyed on
+	// the spec's restore target (restoreCompletedForSpec; F35).
+	if restoreCompletedForSpec(loop) {
+		// The restore is complete for this spec's restore target. Do NOT
 		// re-restore if the PVC is present (re-restore would wipe the Loop's
 		// work since the restore). A LOST PVC on a RESTORED Loop is the
 		// reactive case again (the PVC was restored once and then lost):
@@ -611,6 +602,55 @@ func (r *LoopReconciler) stopWorkloadsForRestore(ctx context.Context, loop *coxv
 	return true, nil
 }
 
+// restoreSpecKeyMarker brackets the spec restore target recorded in the
+// Restored condition's message (F35).
+const restoreSpecKeyMarker = " [spec-target="
+
+// specRestoreKey identifies the restore target the Loop's SPEC names: the
+// rollback iter, the fork source, or "" (neither: only the reactive lost-PVC
+// restore applies). It depends only on the spec, so it is the same whichever
+// kind of restore (rollback, fork, lost PVC) wrote the marker.
+func specRestoreKey(loop *coxv1alpha1.Loop) string {
+	switch {
+	case loop.Spec.ForkOf != nil:
+		return "fork:" + loop.Spec.ForkOf.Loop + "/" + strconv.Itoa(loop.Spec.ForkOf.Iteration)
+	case loop.Spec.RestoreFrom != "":
+		return "rollback:" + loop.Spec.RestoreFrom
+	default:
+		return ""
+	}
+}
+
+// restoredMessage is the Restored condition's message: the human text plus the
+// spec target the restore completed for (the one-shot marker's key).
+func restoredMessage(loop *coxv1alpha1.Loop, target *b2RestoreTarget) string {
+	return "workspace PVC restored from " + target.snapshot + " (" + string(target.kind) +
+		", iter-" + strconv.Itoa(target.iteration) + ")" + restoreSpecKeyMarker + specRestoreKey(loop) + "]"
+}
+
+// restoreCompletedForSpec reports whether the one-shot Restored marker covers
+// the Loop's current spec restore target (F35). The marker was keyed on
+// metadata.generation, so ANY spec edit (e.g. `cox pause` patching
+// spec.suspend) re-armed a completed rollback, which deleted the workspace PVC
+// and restored the old snapshot over the work done since. It is now keyed on
+// the TARGET: an unrelated edit keeps it; a different restore target (only
+// reachable by a client that bypasses the CRD immutability rule, or by setting
+// restoreFrom/forkOf on a Loop that had none) re-arms it. A marker written
+// before this key existed has no key and counts as complete (it cannot be
+// re-armed by an edit either).
+func restoreCompletedForSpec(loop *coxv1alpha1.Loop) bool {
+	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != coxv1alpha1.RestoreReasonRestored {
+		return false
+	}
+	_, rest, found := strings.Cut(c.Message, restoreSpecKeyMarker)
+	if !found {
+		return true // legacy marker (no key)
+	}
+	key, _, _ := strings.Cut(rest, "]")
+	return key == specRestoreKey(loop)
+}
+
 // setRestoreCondition sets the Restore condition (the B2 durable record)
 // with the condition's observedGeneration = the Loop's current generation
 // (the one-shot marker's re-arm check: a new spec.restoreFrom bumps the
@@ -760,7 +800,7 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 		return true, true, true, nil
 	}
 	setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
-		"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
+		restoredMessage(loop, target))
 	if target.kind == b2KindFork {
 		r.markForkRetentionLabel(ctx, loop, target.snapshot)
 	}
@@ -791,9 +831,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 	// removal is a no-op — the snapshot's persistence is a known B2
 	// limitation, documented in gcLoopCheckpoints).
 	if loop.Spec.ForkOf != nil {
-		if c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition); c != nil &&
-			c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.RestoreReasonRestored &&
-			c.ObservedGeneration >= loop.Generation && r.workspacePVCPresent(ctx, loop) {
+		if restoreCompletedForSpec(loop) && r.workspacePVCPresent(ctx, loop) {
 			r.removeForkRetentionLabel(ctx, loop)
 		}
 	}
@@ -835,7 +873,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				return true, true, true, nil
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
-				"workspace PVC restored from "+target.snapshot+" ("+string(target.kind)+", iter-"+strconv.Itoa(target.iteration)+")")
+				restoredMessage(loop, target))
 			persist()
 			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
 				"workspace PVC restored from "+target.snapshot)

@@ -237,37 +237,52 @@ stall in Implementing (vLLM backends, environmental)"):**
 
 The gates and failure paths added on 2026-10-24 (F42, F55, F38, F35, F36, F39)
 put new conditions, Events and reasons on the object. Each entry below: the
-symptom as it appears in `kubectl cox describe`, what it means, and what to do.
-Code is cited by function name; line numbers drift.
+symptom, what it means, and what to do. Conditions appear in `kubectl cox
+describe` (its Conditions block); Events do not — show them with
+`kubectl get events --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>`
+or `kubectl describe loop <name>`. Code is cited by function name and path;
+line numbers drift.
 
 ### `AgentNetworkPolicyReady=False`
 
 **What you see:** the condition is `False` with a message naming the error
-(`persistNetPolFailure` writes it).
+(`persistNetPolFailure` in `internal/controller/loop_controller.go` writes it),
+and a Warning Event with the same reason and message (`NetworkPolicyEnsureFailed`).
 
 **What it means:** the operator could not ensure the agent pod's NetworkPolicy
 (RBAC denied the write, a foreign object of the same name is not controlled by
-the Loop, or the policy is invalid). The sandbox stays Suspended until it is
-`True`.
+the Loop, or the policy is invalid). Note the condition is a report of the
+failed ensure; the hold itself is the netpol being **absent** (see below), so
+an update failure on an *existing* netpol sets this condition without
+suspending anything. The sandbox is held while the netpol is absent and is
+released once the ensure succeeds and the netpol exists.
 
-**What to do:** read the condition message; check the operator's RBAC
-(`kubectl auth can-i create networkpolicies --as=<the operator's
-ServiceAccount>`), and `kubectl get networkpolicy <loop>-agent-netpol` to see
-whether a foreign object is in the way.
+**What to do:** read the condition message; check the operator's RBAC — the
+ensure is a create-or-update, so check the verbs it actually uses
+(`kubectl auth can-i create,update,patch networkpolicies --as=<the
+operator's ServiceAccount>`), and `kubectl get networkpolicy <loop>-agent-netpol`
+to see whether a foreign object is in the way.
 
 ### Sandbox Suspended with no condition explaining why (F42-b)
 
-**What you see:** the sandbox is `Suspended` and nothing names the cause.
+**What you see:** the sandbox is `Suspended` and no condition names the
+cause, or the cause names nothing yet.
 
 **What it means:** the agent NetworkPolicy is **absent** — `agentNetPolMissing`
-is a gate term in the sandbox-suspended check, so a missing netpol holds the
-sandbox just like a foreign one does. The absence is silent by design; the
-`AgentNetworkPolicyReady` condition above is only set when the ensure
-*fails*, not when the object is simply gone.
+(in `internal/controller/loop_controller.go`) is a gate term in the
+sandbox-suspended check, so a missing netpol holds the sandbox just like a
+foreign one does. The absence is normally transient: the early ensure
+(`ensureAgentNetPolBeforeSandbox`, which runs before the sandbox is created)
+recreates a merely-missing netpol before the gate runs, so a Loop normally
+never sits here. If it persists, the ensure is erroring and the
+`AgentNetworkPolicyReady` condition and its Warning Event (above) name the
+cause — a persistent absence is never silent.
 
 **What to do:** `kubectl get networkpolicy -n <ns>` and look for
-`<loop>-agent-netpol`. If it is missing, the operator's ensure has not run or
-is erroring; check the operator log for the ensure error.
+`<loop>-agent-netpol`. If it is missing and the condition above is `False`,
+act on its message. If it is missing and no condition is set, the operator
+has not reconciled this Loop yet — the early ensure will create it on the
+next pass.
 
 ### Sandbox Suspended while the `<loop>-egress-proxy` pod is not Ready (F55-a)
 
@@ -275,8 +290,8 @@ is erroring; check the operator log for the ensure error.
 proxy.
 
 **What it means:** the sandbox gate now also waits for the egress proxy when
-the workspace-init clone must traverse it (`workspaceInitProxyCreated`), not
-only when network allows exist. For an external repo with no network allows,
+the workspace-init clone must traverse it (`workspaceInitProxyCreated` in
+`internal/controller/loop_controller.go`), not only when network allows exist. For an external repo with no network allows,
 the init clone goes through the egress proxy, so the sandbox cannot start until
 that pod is Ready.
 
@@ -289,13 +304,17 @@ Ready the gate releases.
 to this Loop's running sandbox: agent egress is now fenced to DNS and the
 proxies."
 
-**What it means:** the operator was upgraded (F42) while this Loop's sandbox
-was already running without a fence; `ensureAgentNetPolBeforeSandbox` created
-the netpol early and records that the now-running sandbox is fenced.
+**What it means:** `ensureAgentNetPolBeforeSandbox` (in
+`internal/controller/loop_controller.go`) found the agent NetworkPolicy
+absent while this Loop's sandbox already existed, and created the netpol.
+The likely case is an operator upgrade (F42) while the sandbox was already
+running unfenced, but the Event fires equally if the netpol was deleted by
+hand while the sandbox ran. It records that the now-running sandbox is
+fenced.
 
-**What to do:** nothing — it is informational and load-bearing (the sandbox is
-fenced now). In-flight network activity that is not DNS or a proxy will fail;
-the agent's next iteration proceeds with the fence in force.
+**What to do:** nothing — it is informational and load-bearing (the sandbox
+is fenced now). Any in-flight network activity that is not DNS or a proxy
+will be dropped from this point on.
 
 ### Event `PlanChangedReHold` (F38)
 
@@ -325,30 +344,49 @@ fork`) or a new Loop seeded from that checkpoint; do not edit the field.
 
 ### Warning `ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed` (F36)
 
-**What you see:** a Warning Event naming the snapshot: setting or removing the
-fork-retention label failed.
+**What you see:** Warning Events naming the snapshot, repeating on every
+reconcile until the patch succeeds: setting or removing the fork-retention
+label failed.
 
 **What it means:** the fork's source VolumeSnapshot was not (or could not be)
-marked for retention. On the set failure, the source's garbage collection may
-delete the snapshot while the fork is restoring; on the remove failure, the
-label persists and the source's GC skips the snapshot (a known B2 limitation).
+marked for retention (`ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed`,
+emitted from `internal/controller/loop_restore.go`). On the set failure, the
+source's garbage collection may delete the snapshot while the fork is
+restoring; on the remove failure, the label persists and the source's GC
+skips the snapshot (a known B2 limitation).
 
 **What to do:** check the operator's RBAC for `patch` on volumesnapshots
 (`kubectl auth can-i patch volumesnapshots --as=<the operator's
-ServiceAccount>`), then retry the operation once RBAC is correct.
+ServiceAccount>`); once RBAC is correct the next reconcile retries the patch
+and the Events stop.
 
-### `VerifyInfraFailed` / `TamperUnknown` — was the agent tampering? (F39)
+### `VerifyInfraFailed` — was the agent tampering? (F39)
 
-**What you see:** the Loop ends `Failed` with reason `VerifyInfraFailed`, or
-the tamper verdict is `TamperUnknown` — not `TamperedVerify`.
+**What you see:** Warning Events `VerifyInfraRetry` ("verify infrastructure
+failed (attempt N of 3); recreating the verify Job") while the verify Job is
+recreated, and the Loop ends `Failed` with reason `VerifyInfraFailed` and a
+final `VerifyInfraFailed` Warning Event.
 
-**What it means:** the tamper script exited `2` (`tamperGitErrorExit`), which
-the verdict map in the controller maps to an infrastructure failure (git
-itself failed — a missing rev, a corrupt index, a clone problem), never to
-tampering. Verify infra failures are retried twice (three total runs) before
-the Loop fails with `VerifyInfraFailed`, a reason distinct from
+**What it means:** the tamper script exited `2` (`tamperGitErrorExit` in
+`internal/controller/loop_verify_job.go`), which the verdict map in the
+controller maps to the internal `TamperUnknown` verdict — an infrastructure
+failure (git itself failed — a missing rev, a corrupt index, a clone problem),
+never tampering. Verify infra failures are retried twice (three total runs)
+before the Loop fails with `VerifyInfraFailed`, a reason distinct from
 `TamperedVerify` (a protected path actually changed) and from check failures.
 
 **What to do:** treat it as infrastructure: check the repo is reachable from
 the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
 The agent did not tamper; the check could not run.
+
+### The other holds on a Suspended sandbox
+
+The entries above cover the holds added on 2026-10-24. A sandbox can also be
+held by earlier gates: a tool proxy that is not owned+Ready
+(`toolProxyGatesSuspended` in `internal/controller/loop_controller.go`), the
+Manual-approval hold at `AwaitingApproval` (`approvalHoldPhase` in
+`internal/controller/loop_approval.go`), the restore-in-progress hold
+(`loop_restore.go`), a budget pause (token/cost cap reached), and the engine
+hold (`PolicyEnforced` condition, `internal/controller/loop_controller.go`).
+The `NetworkEnforced=False` hold has its own section above
+(`NetworkEnforced=False` with `--allow-unenforced-network`).

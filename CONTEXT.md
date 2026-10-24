@@ -66,7 +66,7 @@ One of: Pending, Planning, AwaitingApproval, Implementing, Verifying, Succeeded,
 _Avoid_: state, stage, step
 
 **Result file**:
-`/workspace/.coxswain/result.json` — the only output the operator reads from the runner. Schema: `status` (success|blocked|needs_input), `summary`, `filesChanged[]`, `verificationNotes`, `nextIterationPlan?`, `lessons[]`. If the runner crashes without writing it, the iteration is `Failed:RunnerNoResult`. `status: needs_input` triggers `AwaitingApproval`.
+`/workspace/.coxswain/result.json` — the only output the operator reads from the runner. Schema: `status` (success|blocked), `summary`, `filesChanged[]`, `verificationNotes`, `nextIterationPlan?`, `lessons[]`. If the runner crashes without writing it, the iteration is `Failed:RunnerNoResult`. `AwaitingApproval` is the Manual plan gate's hold, reached on a fresh Planning success claim — not a result-file status.
 _Avoid_: output, report, response
 
 **Prompt**:

@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `2f95627`); each claim cites its merged PR and
+merged code on `main` (as of `a0f7fd6`); each claim cites its merged PR and
 the squash commit it landed as.
 
 ## Security fixes
@@ -190,6 +190,37 @@ the squash commit it landed as.
 
 ## Other changes
 
+### F31: a no-pod memory-writer Job is decided from its own conditions — #229
+
+- **What was wrong.** `recordMemoryWriterOutcome` requeued whenever the
+  Job had no pod, before reading the Job's own conditions. A Job that is
+  Failed or Complete with no pod (pod GC, eviction, admission reject)
+  requeued every 5 s forever, never set `MemoryWriteDone`, and `cox memory
+  delete` refused forever (PR #229).
+- **What changed.** With no pod, the outcome is now decided from the Job's
+  conditions: Failed sets `MemoryWriteFailed` naming the Job's reason
+  (Warning Event, failed metric once); Complete sets `MemoryWritten` with
+  no summary; neither means still in progress (requeue) (merged `aedc33d`
+  = PR #229). This closes the no-pod half of the F31 item (see Known
+  issues: F73 covers a Job that failed while its pod is still stuck).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #229).
+
+### F54: the "evil agent" end-to-end test now exists — #222
+
+A test addition, not a product change: the agent must be stopped from
+reading its service-account token, reaching the API server or model proxy
+directly, reaching the cloud metadata address, pushing code with a
+forged credential, and tampering with the verify step (merged `eb6ce98`
+= PR #222). It runs two Loop variants (the real runner with a hostile
+model stand-in, and the F42 no-endpoint shape) plus a tamper Loop, with
+gate conditions and Events added on 2026-10-24. Verified on kind (Calico
++ KubeArmor): the pre-fix build FAILED (variant b escaped seven probes
+and the tamper Loop), the fixed build `evil-agent-e2e: OK`, and the
+five named mutations (M1–M5) each failed the run (PR #222). Steps the
+e2e could not yet prove (probe 6's direct leg — kind has no metadata
+service — and a few assertions) are queued as F72 (see Known issues).
+No operator or image changed, so no upgrade action (PR #222).
+
 ### F30: memory-write metrics — #206
 
 New Prometheus metrics, registered in the operator and documented with PromQL
@@ -212,7 +243,7 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
   `kept`/`static-drop` were not observed. All four outcomes are covered by
   the envtest specs (merged `dcd79da` = PR #206).
 
-### Docs — #208, #209, #224, #225
+### Docs — #208, #209, #224, #225, #227, #228, #230
 
 - #208 (merged `2a3208f`): user docs — corrected a non-existent failure name
   in `docs/QUICKSTART.md` (the deliver credential is only read when
@@ -240,11 +271,25 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
   the gate conditions and Events added with this batch of fixes.
 - #225 (merged `2f95627`): a new `docs/OPERATOR.md` section on what the
   sandbox can and cannot reach.
+- #227 (merged `17a5587`): readability pass on `docs/TROUBLESHOOTING.md`
+  and `docs/OPERATOR.md` — mostly rewording for a first-time reader. Two
+  substantive changes: TROUBLESHOOTING now says A1–A6 are the alpha
+  plan's work items (A6 the acceptance run), and the "Loops stuck in
+  Implementing" PromQL example was removed from OPERATOR because its
+  `timestamp()` wrap returns the scrape time, not the pod age (PR #227).
+- #228 (merged `a32bfc5`): a new `docs/GLOSSARY.md` — a plain-language
+  glossary of the terms an operator meets in the docs, each entry linked
+  to the section that defines it (PR #228).
+- #230 (merged `a0f7fd6`): readability pass on `docs/QUICKSTART.md`
+  prose for a first-time reader; touches no commands or code blocks.
+  The command defects in §9 it found are queued separately as F71 (see
+  Known issues) (PR #230).
 
 ## Known issues still open
 
 The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
-merged. In plain words, the items still open:
+merged, and F31 (no-pod memory-writer Job) and F54 (the evil-agent e2e)
+were closed by #229 and #222. In plain words, the items still open:
 
 **P1 (security):**
 
@@ -257,8 +302,6 @@ merged. In plain words, the items still open:
 
 **P2:**
 
-- **F31**: a memory-keeper step can retry forever and never report done if
-  its worker vanishes.
 - **F32**: saved lessons have no count or size cap; oversized memory silently
   disappears from the agent's context.
 - **F43**: the commit the system verifies and delivers is agent-chosen, with
@@ -276,9 +319,6 @@ merged. In plain words, the items still open:
   "reached"; a missing checker leaves the gate open.
 - **F53**: the verify step's code folder is writable by the agent's own code
   between checks, and the verify step has no time limit.
-- **F54**: the "evil agent" end-to-end test (the agent must be stopped from
-  reading secrets, reaching the API server, and pushing code) is not built;
-  a draft is in progress.
 - **F56**: a standard deployment ships no runner image and unpullable proxy
   images, so the agent quietly runs "do nothing".
 - **F62**: the "agent action blocked" counter and alert are never written,
@@ -296,6 +336,18 @@ merged. In plain words, the items still open:
   unvalidated, so a crafted value can reach the credentialed scripts.
 - **F69**: the delivered PR body's facts section carries the agent's own
   claim text presented as an operator fact, with no cap.
+- **F70**: a forked Loop with an external repo can wait for an egress proxy
+  it never uses; on an install where the proxy image can't be pulled it
+  hangs with no condition (PR #222's run).
+- **F71**: the from-source build commands in `docs/QUICKSTART.md` §9 are
+  wrong (a duplicated `PROXY_IMG`, `build-installer` given only the
+  controller tag, and an uncreated `/tmp/d61-loop.yaml`) (PR #230's run).
+- **F72**: some of the evil-agent e2e's steps are still UNPROVEN (the
+  verify-checkout assertions, the probe 15 control Loop, exec-path
+  equivalence; probe 6's direct leg is unproven because kind has no
+  metadata service) (PR #222).
+- **F73**: a memory-writer Job that failed while its pod is stuck can
+  retry forever (the pod-present half of the closed F31 item; PR #229).
 
 **P3 (and P3 bundle):**
 

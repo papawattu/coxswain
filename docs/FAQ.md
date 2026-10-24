@@ -27,7 +27,7 @@ That is distinct from a plain acceptance-check failure and from
 not tampering). The verify Job's log is the evidence for what changed and why
 the checks failed.
 
-See: [GLOSSARY.md#glossary](GLOSSARY.md#glossary)
+See: [GLOSSARY.md#glossary](GLOSSARY.md#glossary), [TROUBLESHOOTING.md#verifyinfrafailed--was-the-agent-tampering-f39](TROUBLESHOOTING.md#verifyinfrafailed--was-the-agent-tampering-f39)
 
 ## 3. How do I give the agent access to a host?
 
@@ -76,7 +76,7 @@ there is no user-facing knob to tune the timeout, so reduce the load or the
 context size. Check the proxy log and the model endpoint
 (`spec.agent.endpointSecretRef` / `modelEndpoint`).
 
-See: [TROUBLESHOOTING.md#a-loop-stuck-in-implementing-with-no-model-traffic](TROUBLESHOOTING.md#a-loop-stuck-in-implementing-with-no-model-traffic)
+See: [QUICKSTART.md#8-model-timeout-and-tuning](QUICKSTART.md#8-model-timeout-and-tuning), [TROUBLESHOOTING.md#modelavailablefalse--modelunavailable-on-the-loop](TROUBLESHOOTING.md#modelavailablefalse--modelunavailable-on-the-loop)
 
 ## 7. Why did my Loop fail with VerifyInfraFailed?
 
@@ -131,7 +131,7 @@ agent's NetworkPolicy, so the agent uses the tool without holding that
 credential. A tool proxy that the Loop does not own or that is not Ready
 holds the sandbox Suspended.
 
-See: [OPERATOR.md#what-the-sandbox-can-reach](OPERATOR.md#what-the-sandbox-can-reach)
+See: [GLOSSARY.md#glossary](GLOSSARY.md#glossary) (the tool proxy entry), [TROUBLESHOOTING.md#the-other-holds-on-a-suspended-sandbox](TROUBLESHOOTING.md#the-other-holds-on-a-suspended-sandbox) (the suspend hold), [OPERATOR.md#what-the-sandbox-can-reach](OPERATOR.md#what-the-sandbox-can-reach) (the egress peer)
 
 ## 12. Where does the git credential live, and can the agent read it?
 
@@ -171,8 +171,8 @@ See: [OPERATOR.md#shared-memory-storage-phase-5](OPERATOR.md#shared-memory-stora
 ## 15. What do the conditions mean?
 
 `kubectl cox describe <loop>` shows the conditions with status, reason, and
-message: `Succeeded` (the goal was met — verify passed and delivery is
-terminal), `Verifying=True reason=Delivering` (verify passed, delivery in
+message: `status.phase=Succeeded` (the goal was met — verify passed and
+delivery is terminal; there is no separate `Succeeded` condition), `Verifying=True reason=Delivering` (verify passed, delivery in
 progress), `Failed=True reason=Stalled` (k consecutive identical verify
 failures), `Failed=True reason=BudgetExceeded` (a cap was hit),
 `ModelAvailable=False reason=ModelUnavailable` (the backend is unreachable or

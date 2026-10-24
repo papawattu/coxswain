@@ -52,10 +52,14 @@ import (
 func writeLessonsFile(workspace string, lessons []string) {
 	// Cap the proposals (shape + count) at proposal time.
 	capped := capLessons(lessons)
-	if len(capped) == 0 {
-		return // nothing to propose (a fresh run with no lessons).
-	}
 	path := filepath.Join(workspace, resultDirName, lessonsFileName)
+	if len(capped) == 0 {
+		// Nothing to propose. Remove any file an EARLIER iteration left on
+		// the (persistent) workspace, or the operator would persist that
+		// stale proposal as this iteration's (F34 P3-3).
+		removeStaleLessons(path)
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		log.Printf("runner: lessons.json mkdir: %v", err)
 		return
@@ -63,6 +67,7 @@ func writeLessonsFile(workspace string, lessons []string) {
 	data, err := json.Marshal(capped)
 	if err != nil {
 		log.Printf("runner: lessons.json marshal: %v", err)
+		removeStaleLessons(path)
 		return
 	}
 	if len(data) > maxLessonsJSONBytes {
@@ -70,6 +75,7 @@ func writeLessonsFile(workspace string, lessons []string) {
 		// write an unbounded file): drop the proposal (the operator finds no
 		// file and persists nothing — best-effort, ADR-0004).
 		log.Printf("runner: lessons.json %d bytes > %d cap; dropping proposal", len(data), maxLessonsJSONBytes)
+		removeStaleLessons(path)
 		return
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
@@ -174,4 +180,12 @@ func parseLessons(answer string) []string {
 		}
 	}
 	return out
+}
+
+// removeStaleLessons deletes a lessons file left by an earlier iteration.
+// Best-effort (ADR-0004): a missing file is the goal; other errors are logged.
+func removeStaleLessons(path string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("runner: lessons.json remove stale: %v", err)
+	}
 }

@@ -29,10 +29,11 @@ behaviour; the ADR text itself is left unchanged.
 `loop.Status.Phase == LoopPhaseSucceeded` or the Loop holds
 Verifying+Delivering for delivery (`loopHoldingForDelivery`, `:694-704`), and
 `ensureDeliverJob` (`:775`) creates exactly one Job per verifiedCommit — the
-Job is stamped with the `coxswain.io/verified-commit` annotation and a
-`backoffLimit` of 0 (`:968`), so a failed deliver Job is terminal and never
-retried (one Job per verifiedCommit, `:43`, `:59`). No per-iteration publish
-step exists.
+Job is stamped with the `coxswain.io/verified-commit` annotation
+(`:898`) and a `backoffLimit` of 0 (`:964-968`), so a failed deliver Job is
+terminal and never retried (one Job per verifiedCommit, `:43`, `:59`; a failed
+delivery is re-runnable only via the `coxswain.io/redeliver` annotation,
+`:449-454`). No per-iteration publish step exists.
 
 **Decision now recorded:** the Loop is one-shot — exactly one goal, ending in
 `Succeeded` or `Failed` (ADR-0003) — so publish-once on terminal Succeeded is
@@ -58,28 +59,36 @@ labels) with deny-all ingress and an egress allowlist of:
 - the model proxy pod (one rule, `modelProxyEgress` at `:4153-4162`, added at
   `:4213`), present only when `spec.agent.endpointSecretRef` is set;
 - the egress proxy pod (`:4214-4218`), present only when network allows exist
-  (`needsEgressProxy`, `:4212`);
+  (`needsEgressProxy`, called at `:4212`, defined `:3142`);
 - DNS (`:4220-4223`);
 - the repo host for the workspace init container's first clone — a **pod-wide**
   rule, documented in-place as an accepted MVP widening (the comment at
   `:4236-4240` says the agent container can also reach the repo host; the rule
   is at `:4244-4248`, plus an egress-proxy route for external repo hosts,
   `:4257-4261`); and
-- one rule per tool proxy (`:4265-4273`), one per tool in the effective
+- one rule per tool proxy (`:4264-4274`), one per tool in the effective
   policy (D41d).
 
-The per-container behaviour the ADR describes (agent reaches only its
-proxies, no direct model endpoint) is enforced **inside the pod** by the
-engine (the KubeArmor eBPF layer, ADR-0007 D29/D35): the agent container
-carries no model key, and its model calls are pointed at the proxy pod's
-Service URL (D33). The pod-scoped NetworkPolicy is the outer fence; the
-engine is the inner one.
+The per-container fence the ADR describes is **not built**: the engine emits a
+pod-level union of every container's allows
+(`internal/engine/kubearmor.go:114-130` — "Union the allows across containers
+(pod-level policy)") and the proxy's allow set is the model endpoint itself
+(`internal/policy/effective.go:156-162`), so the engine cannot distinguish
+the agent container from the proxy (I107 row 26, marked `[BROKEN] [sec]` in
+the same review round: the fence is the D34 NetworkPolicy, not per-container
+eBPF). Today the agent's inability to reach the model endpoint directly comes
+from the NetworkPolicy, which does not name the endpoint in the agent pod's
+allowlist (the agent's peers are the proxies, DNS, the repo host and the tool
+proxies, `:4213-4274`), and because the proxy holds the key (D33): recording
+a per-container engine as the built inner fence would overstate the fence.
 
-**Decision now recorded:** the built mechanism is D33/D34/D41 — a pod-scoped
-NetworkPolicy as the outer fence plus the per-container eBPF layer for
-within-pod enforcement. The ADR's "egress only from the proxy container"
-wording is over-precise (NetworkPolicy cannot express it) and is superseded by
-this record.
+**Decision now recorded:** the built mechanism is D33/D34/D41 — the pod-scoped
+NetworkPolicy is the egress fence (the agent pod's allowlist names the proxies,
+DNS, the repo host and the tool proxies, never the model endpoint), and the
+proxy pod holds the key (D33). The per-container eBPF fence the ADR describes
+is not built (the engine policy is a pod-level union, I107 row 26). The ADR's
+"egress only from the proxy container" wording is over-precise (NetworkPolicy
+cannot express it) and is superseded by this record.
 
 ### Row 17 — the model proxy is a separate pod (I107 row 17)
 
@@ -93,7 +102,7 @@ lines 53-58).
 operator-owned pod** (`<loop>-proxy`, `ensureProxy`,
 `internal/controller/loop_controller.go:2410`), not a sidecar in the sandbox
 pod. The agent's `COX_MODEL_BASE_URL` is the proxy's in-cluster Service FQDN
-(`proxyServiceURL`, `:2694-2697`; set at `:1542`), not `localhost`. The model
+(`proxyServiceURL`, `:2694-2696`; set at `:1542`), not `localhost`. The model
 Secret is mounted into the proxy pod only (D33 comment at `:1948-1949`). The
 only Secret volume the sandbox pod ever carries is the git credential for the
 workspace init container's first clone (S3a, `:1740-1755`, mounted read-only
@@ -110,7 +119,7 @@ ADR-0006 carries no D33 pointer; this row is that pointer.
 "Cluster defaults come from a `coxswain-agent-defaults` ConfigMap so the README
 sample stays short" (item 5, line 87; repeated at lines 147-148: "the
 `spec.agent` CRD fields and the `coxswain-agent-defaults` ConfigMap are new
-Phase 1 surfaces").
+Phase 1 surfaces (the README sample gets an `agent:` block)").
 
 **What was built:** no such ConfigMap exists. `grep -rn 'agent-defaults'
 --include=*.go --include=*.yaml .` outside `docs/` finds 0 hits. The `spec.agent`
@@ -118,15 +127,18 @@ CRD fields were built (`api/v1alpha1/loop_types.go:545-580`, `AgentConfig`), but
 there are no kubebuilder `default` markers on the agent fields (`Image`,
 `Model`, `EndpointSecretRef`, `ModelEndpoint` are all `+optional` with no
 default; a grep for `+kubebuilder:default` in the file finds defaults only on
-unrelated fields, e.g. `:89`, `:98`, `:224`). The README sample sets the agent
-fields explicitly; there is no ConfigMap to fall back to. (The operator does
+unrelated fields, e.g. `:89`, `:98`, `:224`). The samples set the agent fields
+explicitly (`config/samples/loop-*.yaml`); the README's inline sample does not
+(`README.md:54-69` carries no `agent:` block), so the ADR's parenthetical
+"the README sample gets an `agent:` block" was not built either — and there is
+no ConfigMap to fall back to. (The operator does
 have a different, real ConfigMap, `coxswain-model-prices`, for model pricing —
-`api/v1alpha1/loop_types.go:529-535`; that is not the agent-defaults ConfigMap.)
+`api/v1alpha1/loop_types.go:530-535`; that is not the agent-defaults ConfigMap.)
 
 **Decision now recorded:** the `coxswain-agent-defaults` ConfigMap is dropped
 from the record. Defaults come from the CRD markers (none on the agent
-fields) plus the operator's flags; the README sample does not rely on the
-ConfigMap.
+fields) plus the operator's flags; the samples, not the README, set the agent
+fields explicitly.
 
 ## What this amendment does NOT change
 
@@ -135,7 +147,7 @@ ConfigMap.
   credential volume is removed once the base SHA is pinned, `:1740-1755`).
 - **Row 19** (the "evil agent" e2e, `0006:91-99`) — that row's disposition is
   *build* (F54), not amend; it is not part of this amendment.
-- **ADR-0007's matching rows** (D33, D34, the pod-level engine union) are
-  amended under ADR-0007's own amendment, per I107; this amendment only records
-  the ADR-0006 side.
+- **ADR-0007's matching rows** (D33, D34, the pod-level engine union) will be
+  amended under ADR-0007's own amendment (per I107, still open); this
+  amendment only records the ADR-0006 side.
 - **`CONTEXT.md`** — I107 names no CONTEXT.md line for ADR-0006; no change.

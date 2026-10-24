@@ -1090,3 +1090,26 @@ func TestMemoryWriteDuplicateAtCapEvictsNothing(t *testing.T) {
 		t.Errorf("a duplicate must not evict:\n%s", summary)
 	}
 }
+
+// A single write with far more lessons than the cap (lessons.json is agent-
+// writable, so the count is untrusted) must neither evict the whole dir nor end
+// above the cap: the batch is bounded and the audit says so.
+func TestMemoryWriteHugeBatchStaysUnderCap(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	var batch []string
+	for i := range 3 * memorywrite.MaxLessons {
+		batch = append(batch, fmt.Sprintf("batch lesson %03d: a distinct note", i))
+	}
+	summary := runCapped(t, mem, batch)
+	if got := len(readMemoryFiles(t, mem)); got > memorywrite.MaxLessons {
+		t.Fatalf("memory dir has %d files, above the cap %d", got, memorywrite.MaxLessons)
+	}
+	if got := len(readMemoryFiles(t, mem)); got < memorywrite.MaxLessons-memorywrite.MaxLessonsPerWrite {
+		t.Fatalf("memory dir has %d files: a huge batch wiped the old lessons", got)
+	}
+	want := fmt.Sprintf("truncated %d lessons over the batch cap %d", len(batch)-memorywrite.MaxLessonsPerWrite, memorywrite.MaxLessonsPerWrite)
+	if !strings.Contains(summary, want) {
+		t.Errorf("summary lacks %q:\n%s", want, summary)
+	}
+}

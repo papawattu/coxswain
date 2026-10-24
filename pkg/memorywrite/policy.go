@@ -42,6 +42,13 @@ const MaxLessonChars = 500
 // before writing.
 const MaxLessons = 100
 
+// MaxLessonsPerWrite bounds one writer run's input (the runner proposes at most
+// 10 and the operator seeds one, but lessons.json is a file the agent can
+// write, so the writer must not trust the count). Lessons past it are not
+// processed and the audit says how many. MaxLessonsPerWrite < MaxLessons, so
+// after eviction the dir never ends above the cap.
+const MaxLessonsPerWrite = 20
+
 // credKeys are the credential-assignment keywords.
 const credKeys = `(?:password|passwd|secret|token|api[_-]?key)`
 

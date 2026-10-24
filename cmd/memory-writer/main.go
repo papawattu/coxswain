@@ -193,6 +193,14 @@ func run(outcome string) (int, error) {
 		lessons = append(seeded, lessons...)
 	}
 
+	// Bound the batch (the agent can write lessons.json: the count is untrusted).
+	// Lessons past the bound are not processed; the audit counts them.
+	overBatch := 0
+	if len(lessons) > memorywrite.MaxLessonsPerWrite {
+		overBatch = len(lessons) - memorywrite.MaxLessonsPerWrite
+		lessons = lessons[:memorywrite.MaxLessonsPerWrite]
+	}
+
 	// Screen the proposals (the operator's static write policy). The outcome
 	// eligibility is applied FIRST (a non-qualifying outcome drops every
 	// lesson, regardless of the per-lesson rules — the operator only invokes
@@ -291,7 +299,15 @@ func run(outcome string) (int, error) {
 
 	total := len(lessons)
 	dropped := total - written
-	emitSummary(summaryLines(lessons, reasons, evicted, total, written, dropped))
+	audit := make([]string, 0, len(evicted)+1)
+	for _, n := range evicted {
+		sha := strings.TrimSuffix(n, ".txt")
+		audit = append(audit, "evicted "+sha[:min(shaPrefixLen, len(sha))]+" cap")
+	}
+	if overBatch > 0 {
+		audit = append(audit, fmt.Sprintf("truncated %d lessons over the batch cap %d", overBatch, memorywrite.MaxLessonsPerWrite))
+	}
+	emitSummary(summaryLines(lessons, reasons, audit, total, written, dropped))
 	return 0, nil
 }
 
@@ -364,8 +380,8 @@ func countSurvivors(reasons []string) int {
 // It returns ONLY lines — the lesson text is NEVER in a line. This is the
 // pure content of the summary (the emission — stdout + the termination
 // message file — is in emitSummary).
-func summaryLines(lessons, reasons, evicted []string, total, written, dropped int) []string {
-	out := make([]string, 0, len(lessons)+len(evicted)+1)
+func summaryLines(lessons, reasons, audit []string, total, written, dropped int) []string {
+	out := make([]string, 0, len(lessons)+len(audit)+1)
 	for i, lesson := range lessons {
 		status := "written"
 		rule := "eligible"
@@ -382,12 +398,9 @@ func summaryLines(lessons, reasons, evicted []string, total, written, dropped in
 		}
 		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
 	}
-	// D71: each eviction is in the audit ("evicted <sha12> cap"): the sha prefix
-	// of the removed file's name, never its text.
-	for _, n := range evicted {
-		sha := strings.TrimSuffix(n, ".txt")
-		out = append(out, "evicted "+sha[:min(shaPrefixLen, len(sha))]+" cap")
-	}
+	// D71: each eviction ("evicted <sha12> cap") and a batch truncation are in the
+	// audit: sha prefixes and counts, never lesson text.
+	out = append(out, audit...)
 	out = append(out, summaryLine(total, written, dropped))
 	return out
 }

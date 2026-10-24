@@ -232,3 +232,123 @@ stall in Implementing (vLLM backends, environmental)"):**
    going quiet — so the absence of that condition while the Loop is stuck
    is itself evidence that the runner is not even reaching the model client
    (look at the agent log and the proxy usage lines, as #124 did).
+
+## Why is my Loop Suspended or Failed?
+
+The gates and failure paths added on 2026-10-24 (F42, F55, F38, F35, F36, F39)
+put new conditions, Events and reasons on the object. Each entry below: the
+symptom as it appears in `kubectl cox describe`, what it means, and what to do.
+Code is cited by function name; line numbers drift.
+
+### `AgentNetworkPolicyReady=False`
+
+**What you see:** the condition is `False` with a message naming the error
+(`persistNetPolFailure` writes it).
+
+**What it means:** the operator could not ensure the agent pod's NetworkPolicy
+(RBAC denied the write, a foreign object of the same name is not controlled by
+the Loop, or the policy is invalid). The sandbox stays Suspended until it is
+`True`.
+
+**What to do:** read the condition message; check the operator's RBAC
+(`kubectl auth can-i create networkpolicies --as=<the operator's
+ServiceAccount>`), and `kubectl get networkpolicy <loop>-agent-netpol` to see
+whether a foreign object is in the way.
+
+### Sandbox Suspended with no condition explaining why (F42-b)
+
+**What you see:** the sandbox is `Suspended` and nothing names the cause.
+
+**What it means:** the agent NetworkPolicy is **absent** — `agentNetPolMissing`
+is a gate term in the sandbox-suspended check, so a missing netpol holds the
+sandbox just like a foreign one does. The absence is silent by design; the
+`AgentNetworkPolicyReady` condition above is only set when the ensure
+*fails*, not when the object is simply gone.
+
+**What to do:** `kubectl get networkpolicy -n <ns>` and look for
+`<loop>-agent-netpol`. If it is missing, the operator's ensure has not run or
+is erroring; check the operator log for the ensure error.
+
+### Sandbox Suspended while the `<loop>-egress-proxy` pod is not Ready (F55-a)
+
+**What you see:** the sandbox stays Suspended; no condition names the egress
+proxy.
+
+**What it means:** the sandbox gate now also waits for the egress proxy when
+the workspace-init clone must traverse it (`workspaceInitProxyCreated`), not
+only when network allows exist. For an external repo with no network allows,
+the init clone goes through the egress proxy, so the sandbox cannot start until
+that pod is Ready.
+
+**What to do:** `kubectl get pod <loop>-egress-proxy` and its logs. Once it is
+Ready the gate releases.
+
+### Event `AgentEgressFenced` (F55-b)
+
+**What you see:** a one-shot Normal Event: "The agent NetworkPolicy now applies
+to this Loop's running sandbox: agent egress is now fenced to DNS and the
+proxies."
+
+**What it means:** the operator was upgraded (F42) while this Loop's sandbox
+was already running without a fence; `ensureAgentNetPolBeforeSandbox` created
+the netpol early and records that the now-running sandbox is fenced.
+
+**What to do:** nothing — it is informational and load-bearing (the sandbox is
+fenced now). In-flight network activity that is not DNS or a proxy will fail;
+the agent's next iteration proceeds with the fence in force.
+
+### Event `PlanChangedReHold` (F38)
+
+**What you see:** a Normal Event: "the re-plan differs from the approved plan;
+the approval was cleared and the plan must be re-approved", and the Loop re-enters
+`AwaitingApproval` in `ApprovalModeManual`.
+
+**What it means:** the runner detected that its plan changed after approval
+(a re-plan); the stale approval was cleared so an unapproved re-plan cannot be
+implemented.
+
+**What to do:** approve the new plan (`cox approve`) or reject it. If you did
+not expect a re-plan, read the plan in the Loop's workspace to see what
+changed.
+
+### Editing `spec.restoreFrom` is rejected by admission (F35)
+
+**What you see:** `Error: ... restoreFrom is immutable (a different rollback
+target is a fork)`.
+
+**What it means:** the field carries a CEL rule (`self == oldSelf`) so a
+mid-Loop rollback target cannot be swapped; a different rollback target is a
+fork, not an edit.
+
+**What to do:** to roll back to a different checkpoint, create a fork (`cox
+fork`) or a new Loop seeded from that checkpoint; do not edit the field.
+
+### Warning `ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed` (F36)
+
+**What you see:** a Warning Event naming the snapshot: setting or removing the
+fork-retention label failed.
+
+**What it means:** the fork's source VolumeSnapshot was not (or could not be)
+marked for retention. On the set failure, the source's garbage collection may
+delete the snapshot while the fork is restoring; on the remove failure, the
+label persists and the source's GC skips the snapshot (a known B2 limitation).
+
+**What to do:** check the operator's RBAC for `patch` on volumesnapshots
+(`kubectl auth can-i patch volumesnapshots --as=<the operator's
+ServiceAccount>`), then retry the operation once RBAC is correct.
+
+### `VerifyInfraFailed` / `TamperUnknown` — was the agent tampering? (F39)
+
+**What you see:** the Loop ends `Failed` with reason `VerifyInfraFailed`, or
+the tamper verdict is `TamperUnknown` — not `TamperedVerify`.
+
+**What it means:** the tamper script exited `2` (`tamperGitErrorExit`), which
+the verdict map in the controller maps to an infrastructure failure (git
+itself failed — a missing rev, a corrupt index, a clone problem), never to
+tampering. Verify infra failures are retried twice (three total runs) before
+the Loop fails with `VerifyInfraFailed`, a reason distinct from
+`TamperedVerify` (a protected path actually changed) and from check failures.
+
+**What to do:** treat it as infrastructure: check the repo is reachable from
+the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
+The agent did not tamper; the check could not run.

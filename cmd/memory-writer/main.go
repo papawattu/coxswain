@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -277,7 +278,7 @@ func run(outcome string) (int, error) {
 	// Write the eligible lessons to the memory PVC (files named by sha256;
 	// a lesson whose sha256 matches an existing file is dropped as a
 	// duplicate).
-	written, writtenNames, err := writeLessons(md, survivors)
+	written, writtenNames, evicted, err := writeLessons(md, survivors)
 	if err != nil {
 		return 1, fmt.Errorf("write lessons to %s: %w", md, err)
 	}
@@ -289,7 +290,7 @@ func run(outcome string) (int, error) {
 
 	total := len(lessons)
 	dropped := total - written
-	emitSummary(summaryLines(lessons, reasons, total, written, dropped))
+	emitSummary(summaryLines(lessons, reasons, evicted, total, written, dropped))
 	return 0, nil
 }
 
@@ -362,8 +363,8 @@ func countSurvivors(reasons []string) int {
 // It returns ONLY lines — the lesson text is NEVER in a line. This is the
 // pure content of the summary (the emission — stdout + the termination
 // message file — is in emitSummary).
-func summaryLines(lessons, reasons []string, total, written, dropped int) []string {
-	out := make([]string, 0, len(lessons)+1)
+func summaryLines(lessons, reasons, evicted []string, total, written, dropped int) []string {
+	out := make([]string, 0, len(lessons)+len(evicted)+1)
 	for i, lesson := range lessons {
 		status := "written"
 		rule := "eligible"
@@ -379,6 +380,11 @@ func summaryLines(lessons, reasons []string, total, written, dropped int) []stri
 			rule = stripReasonCR(reasons[i])
 		}
 		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
+	}
+	// D71: each eviction is in the audit ("evicted <sha12> cap"): the sha prefix
+	// of the removed file's name, never its text.
+	for _, n := range evicted {
+		out = append(out, "evicted "+strings.TrimSuffix(n, ".txt")[:min(shaPrefixLen, len(strings.TrimSuffix(n, ".txt")))]+" cap")
 	}
 	out = append(out, summaryLine(total, written, dropped))
 	return out
@@ -452,23 +458,32 @@ func screenLessons(lessons []string, eligibleOutcome bool) (survivors, reasons [
 // dupes is the number of survivors that were dropped as duplicates (their
 // sha256 matched an existing file). The caller uses dupes to mark the
 // duplicate lessons in the summary.
-func writeLessons(dir string, survivors []string) (int, []string, error) {
+func writeLessons(dir string, survivors []string) (int, []string, []string, error) {
 	if len(survivors) == 0 {
-		return 0, nil, nil
+		return 0, nil, nil, nil
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return 0, nil, fmt.Errorf("mkdir %s: %w", dir, err)
+		return 0, nil, nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	// List the existing files (the dedup set: the sha256 names already in
 	// memory). A read failure of the dir is a write failure (the mount is
 	// not readable — treat it as a write error).
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0, nil, fmt.Errorf("list %s: %w", dir, err)
+		return 0, nil, nil, fmt.Errorf("list %s: %w", dir, err)
 	}
 	existing := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		existing[e.Name()] = true
+	}
+	// D71 (a): the per-PVC lesson cap. Evict the oldest (by mtime) so the dir
+	// never holds more than memorywrite.MaxLessons after this write.
+	evicted, err := evictOldest(dir, entries, survivors, memorywrite.MaxLessons)
+	if err != nil {
+		return 0, nil, evicted, err
+	}
+	for _, n := range evicted {
+		delete(existing, n)
 	}
 	written := 0
 	writtenNames := make([]string, 0, len(survivors))
@@ -488,13 +503,73 @@ func writeLessons(dir string, survivors []string) (int, []string, error) {
 		// the reader trims it).
 		path := dir + "/" + name
 		if err := os.WriteFile(path, []byte(lesson+"\n"), 0o644); err != nil {
-			return written, nil, fmt.Errorf("write %s: %w", name, err)
+			return written, nil, evicted, fmt.Errorf("write %s: %w", name, err)
 		}
 		existing[name] = true
 		written++
 		writtenNames = append(writtenNames, name)
 	}
-	return written, writtenNames, nil
+	return written, writtenNames, evicted, nil
+}
+
+// evictOldest enforces the D71 cap: if the existing lesson files plus the new
+// (non-duplicate) survivors would exceed max, it removes the oldest existing
+// lessons by mtime (ties broken by name, so it is deterministic) until they
+// fit. A file whose name equals a survivor's is never evicted (that survivor is
+// a duplicate and its file is the lesson). Only <sha256>.txt regular files
+// count. Returns the evicted file names.
+func evictOldest(dir string, entries []os.DirEntry, survivors []string, max int) ([]string, error) {
+	type lf struct {
+		name string
+		mod  time.Time
+	}
+	survivorNames := make(map[string]bool, len(survivors))
+	for _, l := range survivors {
+		sum := sha256.Sum256([]byte(l))
+		survivorNames[hex.EncodeToString(sum[:])+".txt"] = true
+	}
+	var files []lf
+	existingSet := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".txt") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		existingSet[e.Name()] = true
+		if !survivorNames[e.Name()] {
+			files = append(files, lf{e.Name(), info.ModTime()})
+		}
+	}
+	newCount := 0
+	for n := range survivorNames {
+		if !existingSet[n] {
+			newCount++
+		}
+	}
+	over := len(existingSet) + newCount - max
+	if over <= 0 {
+		return nil, nil
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if !files[i].mod.Equal(files[j].mod) {
+			return files[i].mod.Before(files[j].mod)
+		}
+		return files[i].name < files[j].name
+	})
+	var evicted []string
+	for _, f := range files {
+		if len(evicted) >= over {
+			break
+		}
+		if err := os.Remove(dir + "/" + f.name); err != nil {
+			return evicted, fmt.Errorf("evict %s: %w", f.name, err)
+		}
+		evicted = append(evicted, f.name)
+	}
+	return evicted, nil
 }
 
 // shaPrefix returns the first shaPrefixLen hex chars of the lesson's

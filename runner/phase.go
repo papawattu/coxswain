@@ -61,6 +61,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -133,7 +134,10 @@ const planMaxBytes = 4 * 1024
 // context).
 const (
 	memoryDir            = "memory"
-	memoryFileMaxBytes   = 512
+	// memoryFileMaxBytes is >= 4*MaxLessonChars (pkg/memorywrite, 500): a
+	// 500-rune lesson is up to 2000 UTF-8 bytes, so the reader must never cut a
+	// lesson the writer accepted (F32 P2-3; the runner cannot import it).
+	memoryFileMaxBytes   = 2000
 	memoryPromptMaxBytes = 16 * 1024
 )
 
@@ -1279,7 +1283,9 @@ func implementingPrompt(workspace, goal string) string {
 // P5b's writer Job to the memory PVC, copied in by the operator's copy-in
 // init container), or "" when the dir is absent or empty (a fresh repo: the
 // prompt is unchanged). The section is capped to memoryPromptMaxBytes (a
-// runaway or untrusted dir must not blow the model's context); each file is
+// runaway or untrusted dir must not blow the model's context): files are added
+// whole until the next one would pass the cap, then the rest are omitted with a
+// slog warning (F32; the section is not dropped wholesale); each file is
 // capped to memoryFileMaxBytes (P5b bounds a lesson to 500 chars; the cap is
 // the runner's protection). Files are listed in sorted order (os.ReadDir
 // returns sorted names — a stable, deterministic prompt: the same memory
@@ -1308,16 +1314,16 @@ func readMemorySection(workspace string) string {
 		if len(data) > memoryFileMaxBytes {
 			data = data[:memoryFileMaxBytes]
 		}
-		sawAny = true
-		fmt.Fprintf(&b, "-- %s:\n", e.Name())
-		b.Write(data)
-		b.WriteByte('\n')
-		if b.Len() > memoryPromptMaxBytes {
-			// The dir is too large: drop the section (the runner must not blow
-			// the model's context with a runaway or untrusted dir). A bounded
-			// memory (P5b's ≤500-char lessons) never trips this.
-			return ""
+		// F32 P2-4: stop adding files at the section cap (whole files only, never
+		// half a lesson), and say so, instead of dropping the whole section.
+		entry := "-- " + e.Name() + ":\n" + string(data) + "\n"
+		if b.Len()+len(entry) > memoryPromptMaxBytes {
+			slog.Warn("memory section truncated: remaining lesson files not included",
+				"cap_bytes", memoryPromptMaxBytes, "first_omitted", e.Name())
+			break
 		}
+		sawAny = true
+		b.WriteString(entry)
 	}
 	if !sawAny {
 		return "" // an empty dir (or only subdirs): the prompt is unchanged.

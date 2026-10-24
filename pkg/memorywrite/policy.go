@@ -32,10 +32,15 @@ import (
 )
 
 // MaxLessonChars is P5b's size cap: a lesson is bounded to 500 characters.
-// The runner's memory reader caps each file at memoryFileMaxBytes (1000) and
-// drops the whole section above memoryPromptMaxBytes (10000); a 500-char
-// lesson keeps even a few dozen lessons well under those caps.
+// The runner's memory reader caps each file at 4*MaxLessonChars bytes (a
+// 500-rune lesson is up to 2000 UTF-8 bytes) and stops adding whole files at
+// its 16 KiB section cap (F32), so the reader never reads half a lesson.
 const MaxLessonChars = 500
+
+// MaxLessons is D71's per-PVC lesson cap (PLAN-PHASE5.md:479, option (a)): the
+// writer Job keeps at most this many lessons and evicts the oldest by mtime
+// before writing.
+const MaxLessons = 100
 
 // credKeys are the credential-assignment keywords.
 const credKeys = `(?:password|passwd|secret|token|api[_-]?key)`

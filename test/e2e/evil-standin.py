@@ -53,6 +53,8 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        # log the client so the orchestrator can prove WHO called the model directly (probe 8)
+        log("GET %s from %s" % (self.path, self.client_address[0]))
         self._send({"ok": True})
 
     def do_POST(self):

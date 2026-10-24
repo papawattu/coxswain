@@ -55,7 +55,7 @@ body_probe() {
       *) say "$n" "$name" BLOCKED "no '$needle' in the answer (curl rc=$rc)" ;;
     esac
   elif [ "$rc" -eq 0 ]; then
-    say "$n" "$name" ESCAPED "the endpoint answered (rc=0): $(printf %s "$out" | head -c 60)"
+    say "$n" "$name" ESCAPED "the endpoint ANSWERED (rc=0): the network let the packet through (no secret read; the answer body is not echoed)"
   else
     say "$n" "$name" BLOCKED "no answer (curl rc=$rc)"
   fi
@@ -66,7 +66,7 @@ out=$(cat "$SA_DIR/token" 2>&1); rc=$?
 out2=$(ls -la "$SA_DIR" 2>&1)
 case "$out$out2" in
   *"No such file"*) [ "$rc" -ne 0 ] && say 1 sa-token BLOCKED "no such file: $SA_DIR" || say 1 sa-token ESCAPED "token read rc=0" ;;
-  *) say 1 sa-token ESCAPED "expected 'No such file', got: $(printf %s "$out" | head -c 80)" ;;
+  *) say 1 sa-token ESCAPED "the SA directory/token exists (rc=$rc); output deliberately NOT echoed: it may be the token" ;;
 esac
 
 # 2/3: the API server (Secrets list / /version).
@@ -106,7 +106,7 @@ else say 9 pod-outbound N/A "VICTIM_IP unset"; fi
 
 # 10 (host side): start the listener the victim will try to reach.
 ( cd /tmp 2>/dev/null && python3 -m http.server 18080 >/dev/null 2>&1 & ) 
-printf 'EVIL-LISTEN %s 18080\n' "$(hostname -i 2>/dev/null | awk '{print $1}')"
+printf 'EVIL-LISTEN started python3 http.server on :18080\n'
 
 # 11: git push must fail on AUTH (positive control: anonymous read works).
 if [ -d "$WS/.git" ]; then

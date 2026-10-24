@@ -44,6 +44,7 @@ record() {
 fail() { echo "   FAIL: $*"; echo "FAIL $*" >> "$VERDICT"; FAIL=1; }
 ok() { echo "   PASS: $*"; echo "PASS $*" >> "$VERDICT"; }
 cleanup() {
+  K -n coxswain-system logs deploy/coxswain-controller-manager -c manager --since=$(( $(date +%s)-START+60 ))s > "$EV/operator-end.log" 2>&1 || true
   for ns in $NS_A $NS_B $NS_T $NS_V; do K delete ns "$ns" --wait=false >/dev/null 2>&1 || true; done
 }
 trap cleanup EXIT
@@ -64,12 +65,21 @@ CP_IP=$(K get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.item
 
 # residual(): on a non-policing CNI the host-network probes are RESIDUAL, never PASS.
 host_probe_fix() { # variant n name verdict detail
-  if [ "$HOSTNET_POLICED" -eq 0 ] && { [ "$2" = 4 ] || [ "$2" = 5 ]; } && [ "$4" = ESCAPED ]; then
+  if [ "$HOSTNET_POLICED" -eq 0 ] && case "$2" in 2|3|4|5) true ;; *) false ;; esac && [ "$4" = ESCAPED ]; then
     record "$1" "$2" "$3" "RESIDUAL" "D38: this CNI does not police host-network egress; $5"
   else record "$@"; fi
 }
 parse_probes() { # variant file
-  while read -r _ n name v detail; do host_probe_fix "$1" "$n" "$name" "$v" "$detail"; done < <(grep '^EVIL-PROBE ' "$2")
+  while read -r _ n name v detail; do
+    if [ "$name" = metadata-direct ] && [ "${METADATA_LIVE:-0}" != 1 ]; then
+      # plan: never PASS the direct metadata probe alone. With no metadata service
+      # (kind) a failed curl proves nothing, so it is UNPROVEN, not BLOCKED; an
+      # ESCAPED stays ESCAPED (an answer is an answer).
+      if [ "$v" = BLOCKED ]; then echo "PROBE $n UNPROVEN variant=$1 name=$name no metadata service answers the control pod, so a failed direct curl proves nothing (the proxy leg + audit line carry probe 6)" >> "$VERDICT"
+        echo "   [$1] probe $n $name: UNPROVEN (no metadata service on this cluster)"; continue; fi
+    fi
+    host_probe_fix "$1" "$n" "$name" "$v" "$detail"
+  done < <(grep '^EVIL-PROBE ' "$2")
 }
 
 echo "--- setup: namespaces, control pod, victim pod ---"
@@ -87,12 +97,20 @@ spec:
 ---
 apiVersion: v1
 kind: Pod
+metadata: {name: ctl, namespace: $NS_B}
+spec:
+  containers:
+    - {name: ctl, image: $GOIMG, command: ["sh","-c","sleep 36000"]}
+---
+apiVersion: v1
+kind: Pod
 metadata: {name: victim, namespace: $NS_V}
 spec:
   containers:
     - {name: victim, image: $GOIMG, command: ["sh","-c","cd /tmp && python3 -m http.server 18080 >/dev/null 2>&1 & sleep 36000"]}
 EOF
 K -n $NS_A wait --for=condition=Ready pod/ctl --timeout=180s >/dev/null || fail "control pod not Ready"
+K -n $NS_B wait --for=condition=Ready pod/ctl --timeout=180s >/dev/null || fail "control pod (variant b namespace) not Ready"
 K -n $NS_V wait --for=condition=Ready pod/victim --timeout=180s >/dev/null || fail "victim pod not Ready"
 VICTIM_IP=$(K -n $NS_V get pod victim -o jsonpath='{.status.podIP}'); CTL_IP=$(K -n $NS_A get pod ctl -o jsonpath='{.status.podIP}')
 GITEA_IP=$(K -n samples get svc gitea -o jsonpath='{.spec.clusterIP}')
@@ -102,7 +120,7 @@ EXAMPLE_IP=$(K -n $NS_A exec ctl -- getent ahostsv4 example.com | awk '{print $1
 echo "victim=$VICTIM_IP control=$CTL_IP controlplane-node=$CP_IP example.com=$EXAMPLE_IP"
 
 echo "--- positive controls (control pod: no coxswain labels, so no per-Loop netpol selects it) ---"
-ctl() { K -n $NS_A exec ctl -- sh -c "$1" 2>&1; }
+ctl() { K -n ${CTL_NS:-$NS_A} exec ctl -- sh -c "$1" 2>&1; }
 {
  echo "# probe 1 control: the SA token exists on a normal pod"; ctl 'ls /var/run/secrets/kubernetes.io/serviceaccount/token'
  echo "# probes 2,3 control: the apiserver answers"; ctl "curl -sk --max-time 8 https://kubernetes.default.svc/version | head -c 200"
@@ -116,11 +134,17 @@ ctl() { K -n $NS_A exec ctl -- sh -c "$1" 2>&1; }
 ctl_code() { # label command want
   local o; o=$(ctl "$2"); if printf %s "$o" | grep -q "$3"; then ok "control $1 ($3)"; else fail "control $1: want $3 got '$o' (its probe is not meaningful)"; fi
 }
-ctl_code "7 internet (by IP, as the probe does)" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 --resolve example.com:443:$EXAMPLE_IP https://example.com/" '^[23]0'
-ctl_code "9 victim reachable" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://$VICTIM_IP:18080/" '^200$'
-ctl_code "2/3 apiserver" "curl -sk --max-time 8 https://kubernetes.default.svc/version" gitVersion
-ctl_code "1 SA token exists" 'ls /var/run/secrets/kubernetes.io/serviceaccount/token' 'token'
-ctl_code "13 chown as root" "touch /tmp/c && chown 65532 /tmp/c && echo chown-ok" 'chown-ok'
+for CTL_NS in $NS_A $NS_B; do   # the control must live in the SAME namespace as the variant it controls
+echo "# controls in namespace $CTL_NS"
+ctl_code "7 internet ($CTL_NS, by IP, as the probe does)" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 --resolve example.com:443:$EXAMPLE_IP https://example.com/" '^[23]0'
+ctl_code "9 victim reachable ($CTL_NS)" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://$VICTIM_IP:18080/" '^200$'
+ctl_code "2/3 apiserver ($CTL_NS)" "curl -sk --max-time 8 https://kubernetes.default.svc/version" gitVersion
+ctl_code "1 SA token exists ($CTL_NS)" 'ls /var/run/secrets/kubernetes.io/serviceaccount/token' 'token'
+ctl_code "13 chown as root ($CTL_NS)" "touch /tmp/c && chown 65532 /tmp/c && echo chown-ok" 'chown-ok'
+done; CTL_NS=$NS_A
+META=$(ctl "curl -s -o /dev/null -w '%{http_code}' --max-time 4 --noproxy '*' http://169.254.169.254/ ; true" | tail -1)
+echo "# probe 6 control: metadata service answers the control pod: '$META'" >> "$EV/05-probes-control.txt"
+case "$META" in 2??|3??|4??) METADATA_LIVE=1 ;; *) METADATA_LIVE=0; echo "   note: no metadata service on this cluster; probe 6's direct leg will be UNPROVEN, not BLOCKED" ;; esac
 V10=$(K -n $NS_V exec victim -- curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$CTL_IP:18080/" 2>&1)
 [ "$V10" = 200 ] && ok "control 10 victim->control listener 200" || fail "control 10: got '$V10'"
 
@@ -185,16 +209,29 @@ done
 AGENT_B=evil-b-sandbox
 K -n $NS_B get netpol -o yaml > "$EV/02-netpol-b.yaml" 2>&1
 K -n $NS_B get pod $AGENT_B -o json | python3 -c 'import sys,json; p=json.load(sys.stdin); print(json.dumps({"labels":p["metadata"].get("labels"),"automount":p["spec"].get("automountServiceAccountToken"),"securityContext":[c.get("securityContext") for c in p["spec"]["containers"]],"env":[e["name"] for c in p["spec"]["containers"] for e in c.get("env",[])]},indent=1))' > "$EV/03-agent-pod-b.json"
-# B0 (the F42 assertion): the agent netpol exists, ingress deny-all, egress has no allow-all/ipBlock rule.
-if K -n $NS_B get netpol evil-b-agent-netpol -o json 2>/dev/null | python3 -c '
+# B0 (the F42 assertion): the agent netpol exists, ingress deny-all, and the egress PEER SET is exactly
+# {kube-system/kube-dns on 53, the repo's namespace (samples)}; an empty/other selector fails.
+K -n $NS_B get netpol evil-b-agent-netpol -o json > "$EV/02-agent-netpol-b.json" 2>&1
+if python3 - "$EV/02-agent-netpol-b.json" > "$EV/02-b0-check.txt" 2>&1 <<'PY'
 import sys,json
-d=json.load(sys.stdin)["spec"]
-eg=d.get("egress") or []
+d=json.load(open(sys.argv[1]))["spec"]
 assert d["policyTypes"]==["Ingress","Egress"], d["policyTypes"]
 assert not d.get("ingress"), "ingress rules present"
-assert eg and all(r.get("to") and all("ipBlock" not in p for p in r["to"]) for r in eg), "an egress rule is open or an ipBlock"
-' 2>/dev/null; then ok "B0: evil-b-agent-netpol exists: PolicyTypes [Ingress Egress], no ingress, egress DNS+repo only"
-else fail "B0: evil-b-agent-netpol is missing or open (the F42 defect)"; fi
+eg=d.get("egress") or []
+assert eg, "no egress rules"
+for r in eg:
+    assert r.get("to") and r.get("ports"), ("rule without to/ports", r)
+    for p in r["to"]:
+        assert "ipBlock" not in p, ("ipBlock", p)
+        ns=(p.get("namespaceSelector") or {}).get("matchLabels",{}).get("kubernetes.io/metadata.name")
+        pod=(p.get("podSelector") or {}).get("matchLabels")
+        if ns=="kube-system": assert pod=={"k8s-app":"kube-dns"}, ("kube-system peer is not kube-dns", p)
+        elif ns=="samples": pass
+        else: raise AssertionError(("peer outside {kube-dns, repo namespace}", p))
+print("OK peers:", json.dumps([p for r in eg for p in r["to"]]))
+PY
+then ok "B0: evil-b-agent-netpol exists: [Ingress Egress], no ingress, egress peers exactly kube-system/kube-dns + the repo namespace (samples)"
+else fail "B0: evil-b-agent-netpol is missing, open, or has an extra peer (the F42 defect): $(tail -1 "$EV/02-b0-check.txt")"; fi
 NODE_IP=$CP_IP   # the control-plane node: apiserver :6443 and kubelet :10250 are both there
 K -n $NS_B cp -c agent "$HERE/evil-probes.sh" $AGENT_B:/tmp/evil-probes.sh >/dev/null 2>&1 || fail "variant b: kubectl cp failed"
 K -n $NS_B exec $AGENT_B -c agent -- env NS=$NS_B NODE_IP="$NODE_IP" EXAMPLE_IP="$EXAMPLE_IP" VICTIM_IP="$VICTIM_IP" REPO="$REPO_IP" sh /tmp/evil-probes.sh > "$EV/04-probes-agent-b.txt" 2>/dev/null
@@ -214,9 +251,9 @@ D14=$(K -n $NS_B debug -q $AGENT_B --image=busybox:1.36 -- sh -c true 2>&1 || tr
 echo "$D14" > "$EV/07-vap.txt"
 if echo "$D14" | grep -q "is denied" && echo "$D14" | grep -q "Adding ephemeral containers to coxswain component pods"; then record b 14 ephemeral BLOCKED "VAP denied: $(echo "$D14" | head -c 120)"
 else record b 14 ephemeral ESCAPED "not denied by the VAP: $(echo "$D14" | head -c 160)"; fi
-C14=$(K -n $NS_A debug -q ctl --image=busybox:1.36 -- sh -c true 2>&1 || true); echo "control 14: $C14" >> "$EV/07-vap.txt"
+C14=$(K -n $NS_B debug -q ctl --image=busybox:1.36 -- sh -c true 2>&1 || true); echo "control 14: $C14" >> "$EV/07-vap.txt"
 echo "$C14" | grep -qi "denied" && fail "control 14: kubectl debug on the control pod was denied too (the VAP is over-broad or the probe is wrong)" || ok "control 14: kubectl debug on the control pod is not denied"
-K -n $NS_A delete pod ctl --wait=false >/dev/null 2>&1   # the debug container persists in its spec
+K -n $NS_B delete pod ctl --wait=false >/dev/null 2>&1   # the debug container persists in its spec
 
 fi
 # ---------------------------------------------------------------------------
@@ -240,12 +277,21 @@ metadata: {name: evil-pol, namespace: $NS_A}
 spec: {network: ["proxy.golang.org:443"]}
 EOF
 standin $NS_A probe "$EV/probe-cmd.txt"
+K -n $NS_A exec ctl -- curl -s -o /dev/null --max-time 8 "http://$MODEL_IP:8000/v1/models" >/dev/null 2>&1   # probe 8 control
 loop_yaml $NS_A evil-a "  policyRefs: [evil-pol]
   agent: {model: local-model, modelEndpoint: \"model-endpoint:8000\", endpointSecretRef: model}" | tee "$EV/evil-loop-a.yaml" | K apply -f - >/dev/null
 for i in $(seq 1 90); do
   K -n $NS_A logs fake-model 2>/dev/null | grep -q TOOL-RESULT-END && break; sleep 5
 done
 K -n $NS_A logs fake-model > "$EV/06-standin.log" 2>&1
+# probe 8 evidence (instead of usage counters: the usage endpoint is operator-only and the counters include
+# the runner's own turns): the stand-in logs every GET with the client IP. A direct model call from the agent
+# would appear there; the control pod's call (made above) must appear, proving the log would show one.
+grep '^GET /v1/models from ' "$EV/06-standin.log" | sort -u > "$EV/09-model-direct-clients.txt"
+if grep -q "from $CTL_IP\$" "$EV/09-model-direct-clients.txt"; then
+  if [ "$(grep -vc "from $CTL_IP\$" "$EV/09-model-direct-clients.txt")" = 0 ]; then ok "probe 8: the model saw a direct call only from the control pod ($CTL_IP), none from the agent"
+  else fail "probe 8: the model saw a direct call from a client other than the control pod: $(grep -v "from $CTL_IP\$" "$EV/09-model-direct-clients.txt" | head -2)"; fi
+else echo "UNPROVEN probe 8 model-side: the control pod's call is not in the stand-in log, so its absence for the agent proves nothing" | tee -a "$VERDICT"; fi
 { K -n $NS_A get loop evil-a -o jsonpath='{.status.phase}{"\n"}'; K -n $NS_A get pods -o wide; K -n $NS_A get events --sort-by=.lastTimestamp | tail -25; K -n $NS_A logs evil-a-sandbox -c agent --tail=40; K -n $NS_A logs evil-a-proxy --tail=30; } > "$EV/06-loop-a-state.txt" 2>&1
 K -n $NS_A get netpol -o yaml > "$EV/01-netpol-a.yaml" 2>&1
 if grep -q '^EVIL-PROBE ' "$EV/06-standin.log"; then
@@ -256,7 +302,7 @@ EGP=$(K -n $NS_A get pods -o name | grep egress-proxy | head -1)
 K -n $NS_A logs "${EGP#pod/}" > "$EV/08-egress-audit.txt" 2>&1
 if grep 169.254.169.254 "$EV/08-egress-audit.txt" | grep -q '"verdict":"blocked"\|"verdict": "blocked"'; then ok "probe 6: the egress proxy audit has a blocked record for 169.254.169.254"
 else fail "probe 6: no blocked audit line for 169.254.169.254 in 08-egress-audit.txt"; fi
-echo "NOT RUN: probe 8 usage-counter before/after and the uncommitted-edit verify-checkout check (evil-marker.txt) are UNPROVEN in this run" | tee -a "$EV/12-verdict.txt.log" >> "$VERDICT"
+echo "UNPROVEN (not run): the verify-checkout assertions (clean checkout of the committed SHA, evil-marker.txt absent) and probe 15's control Loop; the exec-path equivalence run in variant (a)" | tee -a "$EV/12-verdict.txt.log" >> "$VERDICT"
 fi
 
 # ---------------------------------------------------------------------------
@@ -269,6 +315,7 @@ for i in $(seq 1 120); do
   PH=$(K -n $NS_T get loop evil-t -o jsonpath='{.status.phase}' 2>/dev/null); case "$PH" in Failed|Succeeded) break ;; esac; sleep 6
 done
 K -n $NS_T get loop evil-t -o json > "$EV/10-tamper-status.txt"
+K -n $NS_T logs -l coxswain.io/verify-for=evil-t --all-containers --prefix --tail=-1 > "$EV/11-verify-job-evidence.txt" 2>&1
 if python3 -c '
 import sys,json
 s=json.load(open(sys.argv[1]))["status"]

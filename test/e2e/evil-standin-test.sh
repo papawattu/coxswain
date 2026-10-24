@@ -24,4 +24,6 @@ chk "implementing turn 2 (after the tool result): plain text, no tool call" \
 R3="$(post '{"messages":[{"role":"user","content":"You are in the PLANNING phase"}]}')"
 chk "planning phase: no tool call" "m=d['choices'][0]['message']; assert not m.get('tool_calls')" "$R3"
 if grep -q "EVIL-PROBE 1 sa-token BLOCKED x" "$LOG"; then echo "PASS: the tool result is logged verbatim"; else echo "FAIL: tool result not logged"; FAIL=1; fi
+curl -s "http://127.0.0.1:$PORT/v1/models" >/dev/null; sleep 0.3
+if grep -q '^GET /v1/models from 127.0.0.1$' "$LOG"; then echo "PASS: a GET is logged with its client IP (probe 8 evidence)"; else echo "FAIL: GET not logged with the client"; FAIL=1; fi
 [ "$FAIL" -eq 0 ] && echo "evil-standin-test: OK" || { echo "evil-standin-test: FAILED"; exit 1; }

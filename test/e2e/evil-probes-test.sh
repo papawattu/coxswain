@@ -32,8 +32,8 @@ case "$*" in
 esac
 S
 printf '#!/bin/sh\nexit 0\n' > "$T/bin/python3"
-printf '#!/bin/sh\necho "unshare: unshare failed: Operation not permitted" >&2; exit 1\n' > "$T/bin/unshare"
-printf '#!/bin/sh\necho "mount: permission denied (not permitted)" >&2; exit 1\n' > "$T/bin/mount"
+printf '#!/bin/sh\n[ "$STUB_PRIV" = escaped ] && exit 0\necho "unshare: unshare failed: Operation not permitted" >&2; exit 1\n' > "$T/bin/unshare"
+printf '#!/bin/sh\n[ "$STUB_PRIV" = escaped ] && exit 0\necho "mount: permission denied (not permitted)" >&2; exit 1\n' > "$T/bin/mount"
 chmod +x "$T"/bin/*
 
 run() { # env assignments...
@@ -79,6 +79,18 @@ mkdir -p "$T/creds"; echo u > "$T/creds/username"
 CR="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok EVIL_CREDS_DIR="$T/creds")"
 want "mounted credential => ESCAPED" "$CR" "^EVIL-PROBE 11 git-credential ESCAPED"
 want "no credential => BLOCKED" "$B" "^EVIL-PROBE 11 git-credential BLOCKED"
+# probe 13: privilege commands that SUCCEED are an escape (a probe that cannot fail is not a probe)
+mkdir -p "$T/sa"
+P="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok STUB_PRIV=escaped)"
+want "unshare/mount succeed => probe 13 ESCAPED" "$P" "^EVIL-PROBE 13 privilege ESCAPED"
+# probe 12: a writable hostname file is an escape
+: > "$T/hostname-rw"
+H="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok EVIL_HOSTNAME_FILE="$T/hostname-rw")"
+want "writable hostname file => probe 12 ESCAPED" "$H" "^EVIL-PROBE 12 rootfs-write ESCAPED"
+# probe 1 must never echo what it read (the token)
+echo "SECRET-TOKEN-VALUE" > "$T/sa/token"
+S2="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok EVIL_SA_DIR="$T/sa")"
+want "probe 1 does not echo the token" "$(printf '%s\n' "$S2" | grep -c SECRET-TOKEN-VALUE)" '^0$'
 # missing targets => N/A
 M="$(run STUB_CURL=blocked STUB_GIT=auth STUB_GIT_CTL=ok MODEL= PROXY= VICTIM_IP= NODE_IP=)"
 for p in "4 node-apiserver" "5 kubelet" "6 metadata-proxy" "8 model-direct" "9 pod-outbound"; do want "missing target: $p N/A" "$M" "^EVIL-PROBE $p N/A"; done

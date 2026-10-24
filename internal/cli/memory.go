@@ -40,7 +40,7 @@ func newMemoryCommand() *cobra.Command {
 			return memoryRepo(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
 		},
 	}
-	c.AddCommand(newMemoryExportCommand(), newMemoryImportCommand())
+	c.AddCommand(newMemoryExportCommand(), newMemoryImportCommand(), newMemoryDeleteCommand())
 	return c
 }
 

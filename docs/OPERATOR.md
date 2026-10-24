@@ -356,6 +356,28 @@ it at most once per Loop. It is recorded on the Loop with the
 `coxswain.io/memory-pvc-unbound-notified` annotation and is re-emitted only if
 that annotation is cleared while the PVC is still unbound.
 
+### Memory PVC lifecycle and removal (I101)
+
+There is one memory PVC per (namespace, repo URL), named
+`memory-<first 12 hex of sha256(repo URL as written in spec.workspace.repo)>`.
+It is created by the first Loop on that repo and **persists after every Loop on
+the repo is deleted**: deleting a namespace's Loops does not clear the lessons.
+A PVC lives only in its own namespace, so the same repo in another namespace has
+its own.
+
+To start a repo's memory from scratch:
+
+```sh
+kubectl cox memory export <repo-url> -o backup.tar.gz   # optional: keep a copy
+kubectl cox memory delete <repo-url> -n <namespace>
+```
+
+`delete` refuses while any Loop on that repo in the namespace is not
+`Succeeded` or `Failed` (including `Paused` and one with no phase yet), and
+names the Loops. Otherwise it deletes the PVC. A repo with no PVC prints a note.
+The next Loop on the repo creates a fresh, empty PVC. (`kubectl delete pvc
+memory-<hash>` also works, but has no Loop check.)
+
 ## Reading Loop status
 
 The `kubectl cox describe` command is the primary way to read a Loop's

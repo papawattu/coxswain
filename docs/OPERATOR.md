@@ -166,12 +166,21 @@ kill $PF_PID
 | `coxswain_loop_stalls_total` | Counter | — | Total times the P2e stall gate fired (a new verify Job reached k consecutive identical check outputs). |
 | `coxswain_loops_active` | Gauge | `phase` | Loops currently in a non-terminal phase, by phase. Counted from the manager's cache at scrape time (custom Collector, not set on reconcile). Terminal phases (Succeeded, Failed) are excluded. |
 | `coxswain_loop_tokens_total` | Counter | `kind` (prompt\|completion) | Total model tokens consumed, as folded into `status.budget` from the proxy reading, by kind. Bumped by the delta on each same-bootID, no-drop reading. |
+| `coxswain_memory_writes_total` | Counter | `outcome` (written\|failed) | Memory-writer outcomes (F30), bumped once per Loop on the transition that sets the `MemoryWriteDone` condition: `written` when the writer Job succeeded (including a write where every lesson was dropped), `failed` when it failed. A Loop with no write (ineligible, no lessons, or still running) bumps nothing. |
+| `coxswain_memory_lessons_total` | Counter | `verdict` (kept\|static-drop\|curator-drop) | Lessons in successful writes' summaries (F30), bumped with `written`: `kept` = written to the PVC; `curator-drop` = the curator dropped it or was unavailable; `static-drop` = any other drop (static write policy, ineligible outcome, duplicate). |
 
 **Alerting examples** (PromQL):
 
 ```promql
 # Loops that have stalled more than once in the last hour.
 sum(increase(coxswain_loop_stalls_total[1h])) by (namespace) > 1
+
+# Memory-write rate (writes per hour) and the failed share.
+sum(increase(coxswain_memory_writes_total[1h])) by (outcome)
+sum(rate(coxswain_memory_writes_total{outcome="failed"}[1h])) / sum(rate(coxswain_memory_writes_total[1h]))
+
+# Share of proposed lessons the curator or static policy drops.
+1 - sum(increase(coxswain_memory_lessons_total{verdict="kept"}[1d])) / sum(increase(coxswain_memory_lessons_total[1d]))
 
 # Token consumption rate (tokens/second) over the last 5 minutes.
 sum(rate(coxswain_loop_tokens_total[5m]))

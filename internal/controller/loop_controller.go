@@ -124,6 +124,21 @@ var (
 		Name: "coxswain_loop_tokens_total",
 		Help: "Total model tokens consumed, as folded into status.budget from the proxy reading, by kind (prompt|completion).",
 	}, []string{"kind"})
+	// F30 (PLAN.md Phase 7 "memory-write rate"): coxswain_memory_writes_total
+	// is bumped once per Loop on the transition that sets the MemoryWriteDone
+	// condition (written = the writer Job succeeded, failed = it failed).
+	memoryWritesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_memory_writes_total",
+		Help: "Total memory-writer outcomes, once per Loop, by outcome (written|failed).",
+	}, []string{"outcome"})
+	// coxswain_memory_lessons_total counts the lessons in a successful write's
+	// summary by verdict: kept (written), static-drop (any drop not made by the
+	// curator: static policy, ineligible outcome, duplicate), curator-drop (the
+	// curator dropped it or was unavailable).
+	memoryLessonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "coxswain_memory_lessons_total",
+		Help: "Total lessons in memory-writer summaries, by verdict (kept|static-drop|curator-drop).",
+	}, []string{"verdict"})
 )
 
 func init() {
@@ -134,6 +149,8 @@ func init() {
 	metrics.Registry.MustRegister(loopStallsTotal)
 	// B5a: loops_active is a custom Collector, registered in SetupWithManager.
 	metrics.Registry.MustRegister(loopTokensTotal)
+	metrics.Registry.MustRegister(memoryWritesTotal)
+	metrics.Registry.MustRegister(memoryLessonsTotal)
 }
 
 // C2 (ADR-0006 item 2): the model proxy sidecar contract. The agent holds no

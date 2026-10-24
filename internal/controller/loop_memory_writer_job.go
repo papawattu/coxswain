@@ -741,9 +741,14 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 		// so re-reconciles of the same terminal outcome do not re-emit).
 		transitioned := setMemoryWriterCondition(loop, memoryWrittenReason,
 			memoryWriteAuditMessage(summary))
-		if transitioned && r.Recorder != nil {
-			r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
-				"memory write audit: %s", memoryWriteAuditText(summary))
+		if transitioned {
+			// F30: once per Loop, on the transition only (a re-reconcile of
+			// the already-set condition does not bump).
+			bumpMemoryWriteMetrics("written", summary)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
+					"memory write audit: %s", memoryWriteAuditText(summary))
+			}
 		}
 		return false
 
@@ -759,7 +764,9 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 		if deadlineExceeded {
 			msg = "memory write failed (the Job hit its activeDeadlineSeconds deadline — the pod never became terminal; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
 		}
-		setMemoryWriterCondition(loop, memoryWriteFailedReason, msg)
+		if setMemoryWriterCondition(loop, memoryWriteFailedReason, msg) {
+			bumpMemoryWriteMetrics("failed", "") // F30: once, on the transition.
+		}
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
 				"memory write failed: the memory-writer Job's pod failed (%s)", memoryWriterJobName(loop))
@@ -884,6 +891,65 @@ func memoryWriterSummary(pod *corev1.Pod) string {
 		}
 	}
 	return ""
+}
+
+// bumpMemoryWriteMetrics records one memory-write outcome (F30). The caller
+// invokes it only on the transition that sets MemoryWriteDone. For a written
+// outcome it also counts the summary's per-lesson verdicts.
+func bumpMemoryWriteMetrics(outcome, summary string) {
+	memoryWritesTotal.WithLabelValues(outcome).Inc()
+	if outcome != "written" {
+		return
+	}
+	kept, static, cur := memoryWriteVerdicts(summary)
+	memoryLessonsTotal.WithLabelValues("kept").Add(float64(kept))
+	memoryLessonsTotal.WithLabelValues("static-drop").Add(float64(static))
+	memoryLessonsTotal.WithLabelValues("curator-drop").Add(float64(cur))
+}
+
+// memoryWriteVerdicts counts the lessons of the writer's summary by verdict.
+// The summary's COUNTS line ("summary: total=N written=W dropped=D",
+// cmd/memory-writer summaryLine) is authoritative for kept and for the total
+// dropped: the per-lesson lines can disagree with it (two identical lessons in
+// one batch both read "written" while the counts say written=1 dropped=1,
+// reviewer finding P3-2, queued as F33). The per-lesson lines are used only to
+// split the drops: a line "dropped" with a reason that starts "curator: " or is
+// "curator unavailable" is a curator drop; the remaining drops (static policy,
+// ineligible outcome, duplicate) are static drops. A summary with no counts
+// line falls back to counting the per-lesson lines alone.
+func memoryWriteVerdicts(summary string) (kept, static, curatorDrop int) {
+	var lineKept, lineStatic int
+	var written, dropped int
+	haveCounts := false
+	for line := range strings.SplitSeq(summary, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 4 && f[0] == "summary:" {
+			var w, d int
+			if _, err := fmt.Sscanf(strings.Join(f[1:], " "), "total=%d written=%d dropped=%d", new(int), &w, &d); err == nil {
+				written, dropped, haveCounts = w, d, true
+			}
+			continue
+		}
+		if len(f) < 3 || !strings.HasPrefix(f[0], "lesson-") {
+			continue
+		}
+		switch f[2] {
+		case "written":
+			lineKept++
+		case "dropped":
+			reason := strings.Join(f[3:], " ")
+			if strings.HasPrefix(reason, "curator: ") || reason == "curator unavailable" {
+				curatorDrop++
+			} else {
+				lineStatic++
+			}
+		}
+	}
+	if !haveCounts {
+		return lineKept, lineStatic, curatorDrop
+	}
+	static = max(dropped-curatorDrop, 0)
+	return written, static, curatorDrop
 }
 
 // memoryWriteAuditMessage builds the MemoryWriteDone condition's message

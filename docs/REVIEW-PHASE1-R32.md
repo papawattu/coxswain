@@ -37,7 +37,7 @@ committed:
 
 ## P2
 
-- [ ] **I111: the evil-agent e2e can pass without proving what it reports**
+- [ ] **I111: the evil-agent e2e can report OK when some probes were never measured**
 
   **Where:** `test/e2e/evil-agent-e2e.sh` (`expect`, `record`, the final
   verdict lines, the preflight); `Makefile` (the `evil-agent-e2e` target's
@@ -48,9 +48,9 @@ committed:
     run whose probes report `N/A`, `UNPROVEN`, `ABSENT` or `RESIDUAL` still
     prints `evil-agent-e2e: OK` and exits 0. Nothing counts how many probes
     were actually measured.
-  - (b) The preflight notices missing KubeArmor and carries on. It never
-    checks that the operator, the samples namespace or the host tools are
-    present.
+  - (b) The preflight notices missing KubeArmor but keeps going.
+    It never checks that the operator, the samples namespace or the host
+    tools are present.
   - (c) Nothing in the repo builds the environment the harness needs. The
     passing runs used kind-ref on the lab VM, set up by hand.
 
@@ -60,7 +60,7 @@ committed:
 
   **Fix:** F72 (queued; (a)-(c) above are F72 (c)-(e)). Assert the proved
   set per variant, and print `proved=`/`not-proved=` counts that the exit
-  code depends on. Make the preflight fail fast. Add a recipe or docs page
+  code depends on. Make the preflight stop the run when something is missing. Add a recipe or docs page
   that builds the environment. Design note: `.samples/design-f72-f73.md`.
 
   **Acceptance:** a run where one required probe reports `N/A` exits
@@ -77,8 +77,7 @@ committed:
   the source's snapshot and already carries the init marker, so its clone
   never runs. The gate still holds the fork Suspended until the egress
   proxy is Ready. On a `make deploy` install the proxy image can't be pulled
-  (F56), so the fork is held indefinitely, and no condition names the
-  egress proxy as the cause.
+  (F56), so the fork waits forever, and no condition says the egress proxy is what holds it.
 
   **Fix:** F70, done with F56 (both queued). Exclude a Loop whose restore
   has completed (`restoreCompletedForSpec`) from the gate's clone term.

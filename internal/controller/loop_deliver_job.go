@@ -571,7 +571,7 @@ func (r *LoopReconciler) ensureDeliverRedeliver(ctx context.Context, loop *coxv1
 		// annotation (and clear the stale Delivered condition if present).
 	case err != nil:
 		return false, fmt.Errorf("get deliver Job %s for redeliver: %w", jobName, err)
-	case existing.Status.Failed == 0 && existing.Status.Succeeded == 0:
+	case existing.Status.Failed == 0 && existing.Status.Succeeded == 0 && !deliverJobFailedCondition(existing):
 		// In progress (or just created): leave the annotation in place (the
 		// documented in-progress behaviour). A COMPLETED Job (Succeeded=1,
 		// Failed=0) is NOT in progress — it fell through to the delete path
@@ -687,6 +687,10 @@ func deliveryEnabled(loop *coxv1alpha1.Loop) bool {
 // loopHoldingForDelivery (P5f, I98, D69 option i) reports whether the Loop
 // passed verify but is held at phase Verifying (condition Verifying=True,
 // reason Delivering) until the Delivered condition is terminal.
+// NOTE: the hold is carried ONLY by this condition's reason; the operator is
+// its single writer (verify outcome sets it, settleDeliveryHold clears it).
+// Any new writer of the Verifying condition must preserve or deliberately
+// clear the Delivering reason, or the hold is lost/stuck.
 func loopHoldingForDelivery(loop *coxv1alpha1.Loop) bool {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
 		return false
@@ -729,7 +733,14 @@ func deliveryTerminal(loop *coxv1alpha1.Loop) bool {
 // failed delivery is still Succeeded). It sets both phase and desiredPhase and
 // clears the hold condition. Returns true when it changed the Loop.
 func settleDeliveryHold(loop *coxv1alpha1.Loop) bool {
-	if !loopHoldingForDelivery(loop) || !deliveryTerminal(loop) {
+	if !loopHoldingForDelivery(loop) {
+		return false
+	}
+	// A hold whose delivery is no longer enabled (spec.delivery cleared or the
+	// repo removed mid-hold; spec.delivery has no immutability rule) has no
+	// deliver Job and no Delivered condition to wait for: it settles like a
+	// delivery-off Loop instead of holding forever.
+	if deliveryEnabled(loop) && !deliveryTerminal(loop) {
 		return false
 	}
 	conds := make([]metav1.Condition, 0, len(loop.Status.Conditions))
@@ -842,7 +853,7 @@ func (r *LoopReconciler) deliverJobOutcome(loop *coxv1alpha1.Loop, job *batchv1.
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryInProgress, "deliver Job succeeded; reading the push container's termination message")
 		return true, nil
-	case job.Status.Failed > 0:
+	case job.Status.Failed > 0 || deliverJobFailedCondition(job):
 		setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
 			coxv1alpha1.ReasonDeliveryFailed,
 			fmt.Sprintf("deliver Job %s failed (no retry: one Job per verifiedCommit; re-run delivery with the coxswain.io/redeliver annotation — I52)",
@@ -853,6 +864,24 @@ func (r *LoopReconciler) deliverJobOutcome(loop *coxv1alpha1.Loop, job *batchv1.
 			coxv1alpha1.ReasonDeliveryInProgress, "deliver Job in progress")
 		return true, nil
 	}
+}
+
+// deliverJobActiveDeadlineSeconds bounds the deliver Job (P5f, I98): a hung
+// clone/push would otherwise hold the Loop at Verifying/Delivering forever.
+// A deadline-exceeded Job gets the JobFailed condition (reason
+// DeadlineExceeded) and maps to Delivered=False/DeliveryFailed (terminal,
+// D64; re-run with coxswain.io/redeliver).
+const deliverJobActiveDeadlineSeconds = int64(600)
+
+// deliverJobFailedCondition reports whether the Job carries a true Failed
+// condition (e.g. DeadlineExceeded), which can be set while status.failed is 0.
+func deliverJobFailedCondition(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // buildDeliverJob builds the deliver Job (owned by the Loop, annotated with
@@ -933,9 +962,11 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 	})
 
 	backoff := int32(0)
+	deadline := deliverJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
 	return batchv1.JobSpec{
-		BackoffLimit: &backoff,
+		BackoffLimit:          &backoff,
+		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: deliverJobLabels(loop.Name)},
 			Spec: corev1.PodSpec{

@@ -395,7 +395,7 @@ starts only after the Loop is `Succeeded`, not during the hold.
 
 | Condition | What it means |
 |-----------|---------------|
-| `Succeeded=True` | The Loop's goal was met; the verify checks all passed. |
+| `status.phase=Succeeded` (no separate `Succeeded` condition type) | The goal was met: the verify checks passed and delivery is terminal (or delivery is off). |
 | `Verifying=True reason=Delivering` | Verify passed and delivery is on: the Loop is held at phase `Verifying` (sandbox Suspended) until the `Delivered` condition is terminal. |
 | `Failed=True reason=Stalled` | The P2e stall gate fired (k consecutive identical verify failures). |
 | `Failed=True reason=BudgetExceeded` | A budget cap (tokens, wall-clock, cost) was hit. |

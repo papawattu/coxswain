@@ -8,6 +8,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -22,6 +23,33 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/cni"
 )
+
+// TestP5fDeadlineExceededMapsToDeliveryFailed: a deliver Job that hit its
+// activeDeadlineSeconds carries a JobFailed condition (status.failed may be 0)
+// and is Delivered=False/DeliveryFailed, which settles a held Loop.
+func TestP5fDeadlineExceededMapsToDeliveryFailed(t *testing.T) {
+	r := &LoopReconciler{}
+	loop := &coxv1alpha1.Loop{}
+	loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+	loop.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest}
+	loop.Spec.Workspace.Repo = "http://x/y.git"
+	loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "abc"}
+	loop.Status.Conditions = []metav1.Condition{{
+		Type: string(coxv1alpha1.LoopPhaseVerifying), Status: metav1.ConditionTrue,
+		Reason: coxv1alpha1.ReasonVerifyingDelivering,
+	}}
+	job := &batchv1.Job{}
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "DeadlineExceeded"}}
+	if _, err := r.deliverJobOutcome(loop, job); err != nil {
+		t.Fatal(err)
+	}
+	if !deliveryTerminal(loop) {
+		t.Fatalf("a deadline-exceeded Job must be a terminal DeliveryFailed; conditions=%v", loop.Status.Conditions)
+	}
+	if !settleDeliveryHold(loop) || loop.Status.Phase != coxv1alpha1.LoopPhaseSucceeded {
+		t.Fatalf("the held Loop must settle to Succeeded; phase=%s", loop.Status.Phase)
+	}
+}
 
 // TestP5fSandboxGateStoppedOnDeliveryHold: the extended loopSandboxStopped
 // gate stops the sandbox for Verifying+Delivering only (a Verifying Loop that
@@ -47,13 +75,16 @@ func TestP5fSandboxGateStoppedOnDeliveryHold(t *testing.T) {
 // p5fToVerifyPassed drives a fresh Loop through Planning/Implementing and a
 // passing verify Job, WITHOUT forcing Succeeded. delivery=false clears
 // spec.delivery; lessons sets lessonsAvailable on the Implementing claim.
-func p5fToVerifyPassed(name, ns string, delivery, lessons bool) *LoopReconciler {
+func p5fToVerifyPassed(name, ns string, delivery, lessons bool, mutate ...func(*coxv1alpha1.Loop)) *LoopReconciler {
 	ctx := context.Background()
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	s5aEnsureSandbox(ns, name)
 	loop := s6Loop(name, ns, "")
 	if !delivery {
 		loop.Spec.Delivery = nil
+	}
+	for _, m := range mutate {
+		m(loop)
 	}
 	Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 	s6Reconcile(r, ns, name)
@@ -241,12 +272,76 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 
 		By("Verifying + reason Delivering stops the sandbox")
 		l = p5fGet(ns, name)
+		l.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest}
+		Expect(k8sClient.Update(ctx, l)).To(Succeed())
+		l = p5fGet(ns, name)
+		l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: s6HeadCommit}
 		setCondition(l, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue, coxv1alpha1.ReasonVerifyingDelivering, "hold")
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
 		rec()
 		rec()
 		Expect(p5fGet(ns, name).Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 		Expect(p5fSandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended))
+	})
+
+	It("P2-1: a held Loop past its wall-clock budget (onExceeded=Fail) stays held, accrues no time, and settles to Succeeded", func() {
+		ns := freshNS("p5f-budget")
+		name := "budget1"
+		r := p5fToVerifyPassed(name, ns, true, false, func(l *coxv1alpha1.Loop) {
+			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxWallClock: "1m", OnExceeded: coxv1alpha1.BudgetExceededActionFail}
+		})
+		s6Reconcile(r, ns, name)
+		Expect(loopHoldingForDelivery(p5fGet(ns, name))).To(BeTrue())
+		before := p5fGet(ns, name).Status.Budget
+		var activeBefore int64
+		if before != nil {
+			activeBefore = before.ActiveSeconds
+		}
+		By("the clock jumps 2h during the hold")
+		r.now = func() metav1.Time { return metav1.NewTime(time.Now().Add(2 * time.Hour)) }
+		s6DeliverPod(ns, name, corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})
+		var loop *coxv1alpha1.Loop
+		for range 3 {
+			loop = s6Reconcile(r, ns, name)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "the budget must not fail a verified, delivering Loop")
+		Expect(loopHoldingForDelivery(loop)).To(BeTrue())
+		if loop.Status.Budget != nil {
+			Expect(loop.Status.Budget.ActiveSeconds).To(Equal(activeBefore), "no wall-clock accrual during the hold")
+		}
+		pushDone(ns, name, 0, s6ValidTermination(loop))
+		for range 3 {
+			loop = s6Reconcile(r, ns, name)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+		Expect(loop.Status.Delivery).ToNot(BeNil(), "the delivery result is recorded")
+	})
+
+	It("P2-2: clearing spec.delivery mid-hold settles to Succeeded (no permanent hold)", func() {
+		ns := freshNS("p5f-clear")
+		name := "clear1"
+		r := p5fToVerifyPassed(name, ns, true, false)
+		Expect(loopHoldingForDelivery(p5fGet(ns, name))).To(BeTrue())
+		l := p5fGet(ns, name)
+		l.Spec.Delivery = nil
+		Expect(k8sClient.Update(ctx, l)).To(Succeed())
+		var loop *coxv1alpha1.Loop
+		for range 3 {
+			loop = s6Reconcile(r, ns, name)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+		Expect(loopHoldingForDelivery(loop)).To(BeFalse())
+	})
+
+	It("the deliver Job carries an ActiveDeadlineSeconds", func() {
+		ns := freshNS("p5f-deadline")
+		name := "deadline1"
+		r := p5fToVerifyPassed(name, ns, true, false)
+		s6Reconcile(r, ns, name)
+		job := s6GetJob(ns, name)
+		Expect(job.Spec.ActiveDeadlineSeconds).ToNot(BeNil())
+		Expect(*job.Spec.ActiveDeadlineSeconds).To(Equal(deliverJobActiveDeadlineSeconds))
 	})
 
 	Context("memory writer interaction (P5b/P5c)", func() {

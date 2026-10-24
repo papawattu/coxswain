@@ -4,6 +4,24 @@ For an operator upgrading from v0.1.2. All items are verified against the
 merged code on `main` (as of `a0f7fd6`); each claim cites its merged PR and
 the squash commit it landed as.
 
+## Upgrade
+
+Must-do items for an operator upgrading from v0.1.2; each points to
+`docs/UPGRADE.md` (section "Upgrading from v0.1.2").
+
+- If your RBAC is managed outside `install.yaml`, apply the new
+  `serviceaccounts` (create, get, list, watch) rule to the operator's
+  ClusterRole (F29, #199). A standard install picks it up automatically.
+- Set `--memory-writer-image` to the operator image if your install is not
+  `config/default` (PR #182); set `--memory-storage-class` to a
+  ReadWriteMany-capable StorageClass if your cluster's default does not
+  support ReadWriteMany (PR #191).
+
+Nothing else to do: `spec.workspace.restoreFrom` is now immutable (F35,
+#215); the agent NetworkPolicy is always created (F42, #213); the sandbox
+waits for the egress proxy for the init clone (F55, #220); and the memory
+lesson cap is 100 per PVC (F32, #233).
+
 ## Security fixes
 
 ### F37: `shellQuote` escaped an apostrophe wrongly (command injection) — #207

@@ -687,9 +687,13 @@ func (r *LoopReconciler) ensureMemoryWriterServiceAccount(ctx context.Context, n
 // recordMemoryWriterOutcome reads the memory-writer Job's pod's terminal
 // phase + the bounded summary (the termination message) and records the
 // outcome on the Loop's MemoryWriteDone condition. Returns (requeue): true
-// when the Job's pod is not yet terminal (the operator must requeue to read
-// the outcome); false when a terminal outcome was recorded (Succeeded ->
-// MemoryWritten, Failed -> MemoryWriteFailed).
+// when there is no decision yet: a pod read error, or the Job is still in
+// progress (its pod is absent or not yet terminal, and the Job has neither a
+// Complete nor a Failed condition); false when a terminal outcome was
+// recorded. With a pod, its phase decides (Succeeded -> MemoryWritten, Failed
+// -> MemoryWriteFailed); with NO pod (pod GC, eviction, an admission reject),
+// the Job's own Complete/Failed condition decides (F31,
+// recordMemoryWriterOutcomeNoPod).
 //
 // A Succeeded Job is MemoryWritten (the write completed — whether or not
 // any lesson was eligible; a zero-eligible write is a valid "nothing to
@@ -1083,11 +1087,13 @@ func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, 
 		return false
 	}
 	if jobTerminalCondition(job, batchv1.JobComplete) != nil {
-		if setMemoryWriterCondition(loop, memoryWrittenReason, memoryWriteAuditMessage("")) {
+		// N1: nobody read the pod (it is gone), so do not claim it succeeded.
+		const msg = "memory write completed (the Job is Complete; its pod is gone, so no per-lesson audit summary is available)"
+		if setMemoryWriterCondition(loop, memoryWrittenReason, msg) {
 			r.notePendingMemoryMetric(loop, "written", "")
 			if r.Recorder != nil {
 				r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
-					"memory write audit: %s", memoryWriteAuditText(""))
+					"memory write completed: the memory-writer Job is Complete but its pod is gone, so no per-lesson audit summary is available (%s)", memoryWriterJobName(loop))
 			}
 		}
 		return false

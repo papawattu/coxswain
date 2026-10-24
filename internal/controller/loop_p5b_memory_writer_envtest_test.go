@@ -620,6 +620,7 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		{"p5b-mw-nopod-failed", string(batchv1.JobFailed), "BackoffLimitExceeded", memoryWriteFailedReason},
 		{"p5b-mw-nopod-complete", string(batchv1.JobComplete), "", memoryWrittenReason},
 		{"p5b-mw-nopod-running", "", "", ""},
+		{"p5b-mw-nopod-target", string(batchv1.JobFailureTarget), "", ""}, // N4: only FailureTarget=True is no decision
 	} {
 		It("decides a no-pod Job from its conditions: "+tc.name, func() {
 			r := s6SucceededLessonsAvailable(tc.name, ns)
@@ -634,7 +635,7 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 				if tc.cond == string(batchv1.JobFailed) {
 					job.Status.Conditions = append([]batchv1.JobCondition{{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: tc.reason}}, job.Status.Conditions...)
 					job.Status.Failed = 1
-				} else {
+				} else if tc.cond == string(batchv1.JobComplete) {
 					job.Status.CompletionTime = &now
 					job.Status.Succeeded = 1
 					job.Status.Conditions = append([]batchv1.JobCondition{{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue}}, job.Status.Conditions...)
@@ -654,6 +655,11 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 			Expect(cond.Reason).To(Equal(tc.wantReason))
 			if tc.reason != "" {
 				Expect(cond.Message).To(ContainSubstring(tc.reason), "the message names the Job's reason")
+			}
+			if tc.wantReason == memoryWrittenReason {
+				// N1: never claim a pod succeeded when it is gone.
+				Expect(cond.Message).To(ContainSubstring("its pod is gone"))
+				Expect(cond.Message).NotTo(ContainSubstring("pod succeeded"))
 			}
 		})
 	}

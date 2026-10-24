@@ -133,7 +133,7 @@ const planMaxBytes = 4 * 1024
 // runaway or untrusted dir (a single huge file must not blow the model's
 // context).
 const (
-	memoryDir            = "memory"
+	memoryDir = "memory"
 	// memoryFileMaxBytes is >= 4*MaxLessonChars (pkg/memorywrite, 500): a
 	// 500-rune lesson is up to 2000 UTF-8 bytes, so the reader must never cut a
 	// lesson the writer accepted (F32 P2-3; the runner cannot import it).

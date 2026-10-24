@@ -7,6 +7,7 @@ package controller
 
 import (
 	"context"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -14,10 +15,34 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/cni"
 )
+
+// TestP5fSandboxGateStoppedOnDeliveryHold: the extended loopSandboxStopped
+// gate stops the sandbox for Verifying+Delivering only (a Verifying Loop that
+// is not holding keeps its sandbox Running).
+func TestP5fSandboxGateStoppedOnDeliveryHold(t *testing.T) {
+	r := &LoopReconciler{}
+	held := &coxv1alpha1.Loop{}
+	held.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+	held.Status.Conditions = []metav1.Condition{{
+		Type: string(coxv1alpha1.LoopPhaseVerifying), Status: metav1.ConditionTrue,
+		Reason: coxv1alpha1.ReasonVerifyingDelivering,
+	}}
+	if got := r.sandboxOperatingMode(held, false); got != sandboxv1beta1.SandboxOperatingModeSuspended {
+		t.Fatalf("Verifying+Delivering: mode = %s, want Suspended", got)
+	}
+	plain := &coxv1alpha1.Loop{}
+	plain.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+	if got := r.sandboxOperatingMode(plain, false); got != sandboxv1beta1.SandboxOperatingModeRunning {
+		t.Fatalf("plain Verifying: mode = %s, want Running", got)
+	}
+}
 
 // p5fToVerifyPassed drives a fresh Loop through Planning/Implementing and a
 // passing verify Job, WITHOUT forcing Succeeded. delivery=false clears
@@ -112,7 +137,7 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 		s6Reconcile(r, ns, name)
 		loop := p5fGet(ns, name)
 		pushDone(ns, name, 0, s6ValidTermination(loop))
-		loop = s6Reconcile(r, ns, name)
+		_ = s6Reconcile(r, ns, name)
 		loop = s6Reconcile(r, ns, name)
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
 		Expect(loop.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
@@ -170,6 +195,58 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 		present, _, _ := s6Cond(loop)
 		Expect(present).To(BeFalse())
 		Expect(loopHoldingForDelivery(loop)).To(BeFalse())
+	})
+
+	It("keeps a REAL sandbox Suspended during the hold (gates satisfied: not masked by D30/D35a), Running at plain Verifying", func() {
+		ns := freshNS("p5f-gate")
+		name := "gate1"
+		r := &LoopReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(), AllowUnenforced: true,
+			CNIProber: cni.NewFakeProber(), Recorder: record.NewFakeRecorder(64),
+			readPhaseClaim: func(context.Context, *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil },
+		}
+		r.CNIProber.(*cni.FakeProber).SetResult(cni.CNIProbeResult{Reason: cni.ReasonCNIEnforced})
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: p2fModelSecret, Namespace: ns},
+			StringData: map[string]string{modelAPIKey: "p5f-dummy", modelBaseURL: p2fModelEndpoint},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal: "P5f gate", Workspace: testWorkspace(),
+				Agent: coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel, EndpointSecretRef: p2fModelSecret, ModelEndpoint: p2fModelEndpoint},
+			},
+		})).To(Succeed())
+		Expect(r.ensureProxy(ctx, p5fGet(ns, name))).To(Succeed())
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: proxyPodName(name), Namespace: ns}, pod)).To(Succeed())
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()}}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		rec := func() {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		rec()
+		rec()
+		rec()
+		Expect(p5fSandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning), "baseline: Running")
+
+		By("plain Verifying (no hold) keeps the sandbox Running")
+		l := p5fGet(ns, name)
+		l.Status.Phase, l.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying, coxv1alpha1.LoopPhaseVerifying
+		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+		rec()
+		rec()
+		Expect(p5fSandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning))
+
+		By("Verifying + reason Delivering stops the sandbox")
+		l = p5fGet(ns, name)
+		setCondition(l, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue, coxv1alpha1.ReasonVerifyingDelivering, "hold")
+		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+		rec()
+		rec()
+		Expect(p5fGet(ns, name).Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		Expect(p5fSandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended))
 	})
 
 	Context("memory writer interaction (P5b/P5c)", func() {

@@ -949,14 +949,9 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// FINAL return) — never a controller error, never an in-same-reconcile
 	// create. The egress proxy's SNI allowlist carries the repo host +
 	// api.github.com (GitHub) for the push + the provider API.
-	deliverRequeue, deliverKeep, err := r.ensureDeliver(ctx, &loop)
+	deliverRequeue, deliverKeep, err := r.ensureDeliverAndSettle(ctx, &loop, &changed)
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-	// P5f (I98): a Loop held at Verifying+Delivering becomes Succeeded once
-	// the Delivered condition is terminal.
-	if settleDeliveryHold(&loop) {
-		changed = true
 	}
 
 	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the

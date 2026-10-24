@@ -276,6 +276,20 @@ func (r *LoopReconciler) ensureDeliver(ctx context.Context, loop *coxv1alpha1.Lo
 	return requeue, keep, nil
 }
 
+// ensureDeliverAndSettle runs ensureDeliver, then (P5f, I98) settles a Loop
+// held at Verifying+Delivering to Succeeded once Delivered is terminal,
+// setting *changed when it did.
+func (r *LoopReconciler) ensureDeliverAndSettle(ctx context.Context, loop *coxv1alpha1.Loop, changed *bool) (bool, bool, error) {
+	requeue, keep, err := r.ensureDeliver(ctx, loop)
+	if err != nil {
+		return false, false, err
+	}
+	if settleDeliveryHold(loop) {
+		*changed = true
+	}
+	return requeue, keep, nil
+}
+
 // deliverDescriptionConfigReady ensures the deliver description ConfigMap
 // (the R27/P1 ordering fix: it is called BEFORE the deliver Job is created,
 // and returns true only when the ConfigMap exists or the ensure is a

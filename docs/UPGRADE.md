@@ -174,10 +174,18 @@ The operator now always creates the `<loop>-agent-netpol` NetworkPolicy,
 even when `spec.agent.endpointSecretRef` is empty and the policy has no
 network allows (F42, PR #213). Before this change, such a Loop's agent ran
 with no ingress or egress restrictions. After the upgrade, the agent netpol
-carries deny-all ingress and DNS-only egress. On upgrade, existing Loops
-that previously ran with an open network are held `Suspended` until the
-first reconcile creates and confirms the netpol. There is nothing to do;
-the operator creates it on the first reconcile post-upgrade.
+carries deny-all ingress, and egress only to DNS plus the narrow set every
+Loop gets: the model proxy (if the Loop has one), the egress proxy (for an
+external repo's init clone), the repo host (for an in-cluster repo), and its
+tool proxies.
+
+The operator creates the netpol on the first reconcile after the upgrade,
+before it touches the sandbox, so there is nothing to do. But it applies to
+running pods at once: a Loop that is mid-implementation loses any network
+access it had been relying on and can start failing straight away. If a Loop
+needs a host, add it to the Loop's `AgentPolicy` network allows (or add the
+tool to the policy) so the egress or tool proxy carries it. Terminal Loops
+are unaffected.
 
 ### The sandbox waits for the egress proxy for the init clone
 

@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -208,6 +209,52 @@ func TestPlainHTTPAllowed(t *testing.T) {
 	}
 	if got := rec.header.Get("X-Upstream"); got != "ok" {
 		t.Fatalf("upstream header not copied; got %q", got)
+	}
+}
+
+// TestPlainHTTPDoesNotFollowRedirect (F40): an allowlisted upstream that 302s
+// to a carved-out address (cloud metadata) must NOT be followed or dialed; the
+// 3xx goes back to the agent unchanged.
+func TestPlainHTTPDoesNotFollowRedirect(t *testing.T) {
+	const metadata = "http://169.254.169.254/latest/meta-data/"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, metadata, http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	allowHost := "151.101.0.223"
+	p := newHandlerWithResolver([]string{allowHost + ":80"}, nil, "loop-x", "ns", "hash", net.DefaultResolver)
+	upstreamAddr := upstream.Listener.Addr().String()
+	var dialed []string
+	var mu sync.Mutex
+	p.dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		var d net.Dialer
+		// Every dial lands on the fake upstream; the recorded addr is what the
+		// proxy asked to reach.
+		return d.DialContext(ctx, network, upstreamAddr)
+	}
+	req := &http.Request{
+		Method:     methodGet,
+		Host:       allowHost + ":80",
+		URL:        mustParse("http://" + allowHost + ":80/"),
+		Header:     http.Header{},
+		RequestURI: "/",
+	}
+	rec := newRecorder()
+	p.handlePlainHTTP(rec, req)
+	if rec.code != http.StatusFound {
+		t.Fatalf("want the 302 passed back to the agent, got %d body=%s", rec.code, rec.body)
+	}
+	if got := rec.header.Get("Location"); got != metadata {
+		t.Fatalf("Location = %q, want %q passed back unchanged", got, metadata)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dialed) != 1 || dialed[0] != allowHost+":80" {
+		t.Fatalf("dials = %v, want exactly [%s:80] (the redirect target must not be dialed)", dialed, allowHost)
 	}
 }
 

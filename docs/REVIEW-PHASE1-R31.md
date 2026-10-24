@@ -49,7 +49,7 @@ work merged since R30 was drafted. Code line numbers are against main at
   ADR-0004:
   - 1 `0004:20-22` [BROKEN]: `result.json` carries `needs_input` → `Result` has
     no `NeedsInput` (`runner/runner.go:123-129`). `CONTEXT.md:69` repeats it.
-  - 2 `0004:23` (and `0005:122-123`) [BROKEN]: the operator reads `result.json`
+  - 2 `0004:23` (and `0005:121-122`, `:127-128`) [BROKEN]: the operator reads `result.json`
     via `kubectl exec cat` → it reads the agent's termination message
     (`loop_s4_phase.go:313`).
   - 3 `0004:63-65` (and `0005:319-322`) [NOT BUILT]: the operator gains

@@ -687,9 +687,13 @@ func (r *LoopReconciler) ensureMemoryWriterServiceAccount(ctx context.Context, n
 // recordMemoryWriterOutcome reads the memory-writer Job's pod's terminal
 // phase + the bounded summary (the termination message) and records the
 // outcome on the Loop's MemoryWriteDone condition. Returns (requeue): true
-// when the Job's pod is not yet terminal (the operator must requeue to read
-// the outcome); false when a terminal outcome was recorded (Succeeded ->
-// MemoryWritten, Failed -> MemoryWriteFailed).
+// when there is no decision yet: a pod read error, or the Job is still in
+// progress (its pod is absent or not yet terminal, and the Job has neither a
+// Complete nor a Failed condition); false when a terminal outcome was
+// recorded. With a pod, its phase decides (Succeeded -> MemoryWritten, Failed
+// -> MemoryWriteFailed); with NO pod (pod GC, eviction, an admission reject),
+// the Job's own Complete/Failed condition decides (F31,
+// recordMemoryWriterOutcomeNoPod).
 //
 // A Succeeded Job is MemoryWritten (the write completed — whether or not
 // any lesson was eligible; a zero-eligible write is a valid "nothing to
@@ -705,9 +709,12 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 		return true
 	}
 	if pod == nil {
-		// The Job has no pod yet (the batch controller has not created it):
-		// requeue.
-		return true
+		// F31: no pod. Either the batch controller has not created it yet (the
+		// Job has neither condition: no decision, requeue), or the Job is
+		// already terminal and its pod is gone (pod GC, eviction, an admission
+		// reject). Decide from the Job's own Complete/Failed conditions rather
+		// than requeueing forever.
+		return r.recordMemoryWriterOutcomeNoPod(loop, job)
 	}
 	// The Job's terminal state (the batch Job's conditions: Complete or
 	// Failed). The pod's phase is the authoritative signal (the Job's
@@ -1056,4 +1063,52 @@ func (r *LoopReconciler) runTamperGate(loop *coxv1alpha1.Loop, changed *bool) {
 	if r.applyTamperGate(loop) {
 		*changed = true
 	}
+}
+
+// recordMemoryWriterOutcomeNoPod decides the outcome of a memory-writer Job
+// that has no pod, from the Job's own terminal conditions (F31). Failed ->
+// MemoryWriteFailed naming the Job's reason; Complete -> MemoryWritten with no
+// summary (the pod, and with it the termination message, is gone). A Job with
+// neither condition is still in progress: no decision (requeue).
+func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, job *batchv1.Job) bool {
+	if c := jobTerminalCondition(job, batchv1.JobFailed); c != nil {
+		reason := c.Reason
+		if reason == "" {
+			reason = "unknown"
+		}
+		msg := fmt.Sprintf("memory write failed (the Job failed with reason %s and has no pod; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)", reason)
+		if setMemoryWriterCondition(loop, memoryWriteFailedReason, msg) {
+			r.notePendingMemoryMetric(loop, "failed", "")
+		}
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
+				"memory write failed: the memory-writer Job failed (%s, reason %s) and has no pod", memoryWriterJobName(loop), reason)
+		}
+		return false
+	}
+	if jobTerminalCondition(job, batchv1.JobComplete) != nil {
+		// N1: nobody read the pod (it is gone), so do not claim it succeeded.
+		const msg = "memory write completed (the Job is Complete; its pod is gone, so no per-lesson audit summary is available)"
+		if setMemoryWriterCondition(loop, memoryWrittenReason, msg) {
+			r.notePendingMemoryMetric(loop, "written", "")
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
+					"memory write completed: the memory-writer Job is Complete but its pod is gone, so no per-lesson audit summary is available (%s)", memoryWriterJobName(loop))
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// jobTerminalCondition returns the Job's condition of the given type when it
+// is True, else nil.
+func jobTerminalCondition(job *batchv1.Job, condType batchv1.JobConditionType) *batchv1.JobCondition {
+	for i := range job.Status.Conditions {
+		c := &job.Status.Conditions[i]
+		if c.Type == condType && c.Status == corev1.ConditionTrue {
+			return c
+		}
+	}
+	return nil
 }

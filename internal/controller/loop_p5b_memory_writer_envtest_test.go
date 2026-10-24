@@ -610,6 +610,60 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
 	})
 
+	// F31: a Job that is terminal with NO pod (pod GC, eviction, an admission
+	// reject) is decided from the Job's own conditions; a Job with neither
+	// condition and no pod is still in progress (no decision).
+	for _, tc := range []struct {
+		name, cond, reason string
+		wantReason         string // "" = no decision
+	}{
+		{"p5b-mw-nopod-failed", string(batchv1.JobFailed), "BackoffLimitExceeded", memoryWriteFailedReason},
+		{"p5b-mw-nopod-complete", string(batchv1.JobComplete), "", memoryWrittenReason},
+		{"p5b-mw-nopod-running", "", "", ""},
+		{"p5b-mw-nopod-target", string(batchv1.JobFailureTarget), "", ""}, // N4: only FailureTarget=True is no decision
+	} {
+		It("decides a no-pod Job from its conditions: "+tc.name, func() {
+			r := s6SucceededLessonsAvailable(tc.name, ns)
+			p5bMemoryWriterReconcile(r, ns, tc.name) // creates the Job
+			job := p5bGetMemoryJob(ns, tc.name)
+			if tc.cond != "" {
+				now := metav1.Now()
+				job.Status.StartTime = &now
+				job.Status.Conditions = []batchv1.JobCondition{
+					{Type: batchv1.JobConditionType(tc.cond), Status: corev1.ConditionTrue, Reason: tc.reason},
+				}
+				if tc.cond == string(batchv1.JobFailed) {
+					job.Status.Conditions = append([]batchv1.JobCondition{{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: tc.reason}}, job.Status.Conditions...)
+					job.Status.Failed = 1
+				} else if tc.cond == string(batchv1.JobComplete) {
+					job.Status.CompletionTime = &now
+					job.Status.Succeeded = 1
+					job.Status.Conditions = append([]batchv1.JobCondition{{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue}}, job.Status.Conditions...)
+				}
+				Expect(k8sClient.Status().Update(context.Background(), job)).To(Succeed())
+			}
+			// No pod is fabricated: the pod is absent.
+			s6Reconcile(r, ns, tc.name)
+			s6Reconcile(r, ns, tc.name)
+			loop := p5bMustLoop(ns, tc.name)
+			cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
+			if tc.wantReason == "" {
+				Expect(cond).To(BeNil(), "an in-progress Job with no pod makes no decision")
+				return
+			}
+			Expect(cond).NotTo(BeNil(), "a terminal Job with no pod must be decided")
+			Expect(cond.Reason).To(Equal(tc.wantReason))
+			if tc.reason != "" {
+				Expect(cond.Message).To(ContainSubstring(tc.reason), "the message names the Job's reason")
+			}
+			if tc.wantReason == memoryWrittenReason {
+				// N1: never claim a pod succeeded when it is gone.
+				Expect(cond.Message).To(ContainSubstring("its pod is gone"))
+				Expect(cond.Message).NotTo(ContainSubstring("pod succeeded"))
+			}
+		})
+	}
+
 	It("does nothing on a non-terminal phase (the eligibility rule)", func() {
 		// A non-terminal phase (e.g. Implementing) is ineligible: the operator
 		// records NOTHING (no condition, no Job) — the Loop is still running

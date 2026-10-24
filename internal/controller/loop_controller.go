@@ -5563,9 +5563,13 @@ echo "workspace initialised at $(cat "${DEST}/.coxswain/base-commit")"
 
 // shellQuote quotes a string for safe embedding in an sh -c script (S3a).
 // The repo/ref are CRD-validated (a pattern), but quote them anyway so an
-// unusual-but-valid value cannot inject shell.
+// unusual-but-valid value cannot inject shell. An apostrophe cannot appear
+// inside single quotes, so each one becomes: close the quote, a
+// backslash-escaped apostrophe, reopen the quote. F37: it was replaced by
+// three apostrophes, which leaves the string open after one apostrophe and
+// lets two inject commands.
 func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'''`) + "'"
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // phaseInitScript (S4, ADR-0004; B3 approval files) returns the sh script

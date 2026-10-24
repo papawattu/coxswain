@@ -101,9 +101,14 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	// origin remote, which we point at the local bare repo).
 	const loopName = "pushtask1"
 	repoURL := testGiteaExampleRepoURL
+	// F37: the goal carries apostrophes (it becomes PR_TITLE, shell-quoted
+	// into the script that holds the git credential). With the three-quote
+	// escape the script is a syntax error / injects.
+	const apostropheGoal = "Fix the user's login and don't break 'quoted' things"
 	loop := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: loopName},
 		Spec: coxv1alpha1.LoopSpec{
+			Goal: apostropheGoal,
 			Workspace: coxv1alpha1.Workspace{
 				Repo:                repoURL,
 				Ref:                 baseBranch,
@@ -240,6 +245,16 @@ func TestDeliverPushScriptExecutes(t *testing.T) {
 	wantPRURL := "http://gitea.example:3000/samples/gocli/pulls/42"
 	if outcome.PRURL != wantPRURL {
 		t.Fatalf("termination prURL %s; want the provider html_url %s (the PR page of THIS repo)", outcome.PRURL, wantPRURL)
+	}
+	// F37: the apostrophe goal reached the PR create payload intact.
+	var created struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal((*posts)[0].payload, &created); err != nil {
+		t.Fatalf("decode PR create payload: %v", err)
+	}
+	if !strings.HasSuffix(created.Title, deliverytitle.Title(apostropheGoal)) || !strings.Contains(created.Title, "user's login") {
+		t.Fatalf("PR title %q does not carry the apostrophe goal %q", created.Title, deliverytitle.Title(apostropheGoal))
 	}
 }
 
@@ -1008,8 +1023,9 @@ func prTitleLine(script string) string {
 }
 
 // parseScriptPRTitle extracts and unquotes the PR_TITLE value from a deliver
-// push script. The value is shell-quoted by shellQuote (single-quoted with
-// ” for embedded '), so we strip the outer quotes and unescape.
+// push script. The value is shell-quoted by shellQuote (single-quoted, each
+// embedded apostrophe written as close-quote, backslash-apostrophe,
+// reopen-quote), so we strip the outer quotes and unescape.
 func parseScriptPRTitle(t *testing.T, script string) string {
 	t.Helper()
 	line := prTitleLine(script)
@@ -1020,7 +1036,7 @@ func parseScriptPRTitle(t *testing.T, script string) string {
 	// shellQuote wraps in single quotes; strip them.
 	if len(val) >= 2 && strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'") {
 		val = val[1 : len(val)-1]
-		val = strings.ReplaceAll(val, "''", "'")
+		val = strings.ReplaceAll(val, `'\''`, "'")
 	}
 	return val
 }

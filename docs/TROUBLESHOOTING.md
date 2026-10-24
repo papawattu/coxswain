@@ -24,9 +24,9 @@ visible — `applyModelAvailableCondition` in
 `internal/controller/loop_s4_phase.go` (I89, merged as 06a0157 / PR #136). The
 condition is diagnostic only; it does not gate the phase machine.
 
-**Worst case:** about 6.2 minutes before the condition appears — 3 model
-calls of 120s plus 6s of backoff (2s, 4s; QUICKSTART §8, written with I89).
-Pre-I89 the
+**Worst case:** about 8 minutes before the condition appears — 4 model
+calls of 120s plus 14s of backoff (2s, 4s, 8s; QUICKSTART §8, written with
+I89). Pre-I89 the
 same hang meant a single 10-minute timeout plus kubelet back-off restarts
 with no named reason (the finding I89 in `docs/REVIEW-PHASE1-R26.md:138` —
 "in #124, the vLLM backends went silent for about 24 minutes. Each runner

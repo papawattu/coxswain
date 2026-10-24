@@ -172,14 +172,16 @@ kubectl create secret generic git-cred -n <namespace> \
 
 Create the Secret in **every namespace** where a Loop may run (the deliver Job
 reads it from the Loop's namespace). If `spec.workspace.gitCredentialSecret`
-points at a missing Secret (or is left empty), the deliver Job's push fails:
-with an empty field the git push is attempted unauthenticated and the PR
-create call has no API auth; with a missing Secret the pod cannot start
-(`CreateContainerConfigError`) and the push never runs. Either way the Loop's
-PR is not opened — the failure is visible in the deliver Job's pod events /
-termination log, and the operator records it in `status.delivery`.
-(`internal/controller/loop_deliver_job.go`: the credential volume and the
-git/PR auth flags are added only when the field is non-empty.)
+points at a missing Secret (or is left empty), the deliver Job fails and the
+Loop's PR is not opened. With the field left empty the git push is attempted
+unauthenticated and the PR create call has no API auth; with a Secret name
+that does not exist the credential is mounted as a Secret **volume** (not an
+env), so the deliver pod is stuck in `ContainerCreating` with `FailedMount`
+events (kubelet: `secret "…" not found`) until the Job's deadline. Either way
+the failure is recorded on the Loop as `Delivered=False` reason
+`DeliveryFailed` (the operator's deliver read-back, `ensureDeliverReadback`
+in `internal/controller/loop_deliver_job.go`), and the supported way back is
+the `coxswain.io/redeliver` annotation.
 
 ## 4. A first Loop
 
@@ -330,28 +332,29 @@ it when the snapshot is absent (the Restore condition is False, reason
 ## 8. Model timeout and tuning
 
 The runner's model client uses a 120-second per-request timeout (I89). If
-the model backend hangs (no response within 120s), the runner makes at most
-3 calls total, sleeping 2s then 4s between them (exponential backoff from a
-2s base, `runner/runner.go`). After all calls fail, the
-runner surfaces `ModelUnavailable` in its claim and exits with a blocked
-status. The operator maps this to a `ModelAvailable=False` condition (reason
-`ModelUnavailable`) on the Loop, visible via `kubectl cox describe`.
+the model backend hangs (no response within 120s), the runner retries up to
+3 times with exponential backoff (2s, 4s, 8s). After all retries are
+exhausted, the runner surfaces `ModelUnavailable` in its claim and exits
+with a blocked status. The operator maps this to a `ModelAvailable=False`
+condition (reason `ModelUnavailable`) on the Loop, visible via
+`kubectl cox describe`.
 
-**Worst case:** with the defaults (120s timeout, 3 calls), a fully hung model
-backend surfaces `ModelUnavailable` after about 6.2 minutes
-(3×120s + 6s of backoff). This is an improvement over the pre-I89 behaviour
-(a single 10-minute timeout followed by kubelet back-off churn with no named
-reason).
+**Worst case:** with the defaults (120s timeout, 3 retries), a fully hung
+model backend surfaces `ModelUnavailable` after about 8 minutes
+(4×120s + 14s of backoff). This is an improvement over the pre-I89
+behaviour (a single 10-minute timeout followed by kubelet back-off churn
+with no named reason).
 
-**Tuning:** there is currently no user-facing knob for the timeout. The
-runner's `runConfig.ModelTimeout` field (`runner/runner.go`) exists but the
-runner entrypoint (`runner/cmd/main.go`) never sets it, so it always
-defaults to `defaultModelTimeout` (120s). If you see spurious
-`ModelUnavailable` conditions on a healthy backend (a local 27B-class model
-under load can approach 120s; #124 saw a 60s worst case), the fix today is to
-reduce the load or the context size, not to tune the timeout. The retry count
-and backoff base are constants (`defaultModelRetries = 3`,
-`defaultModelRetryBackoff = 2s` in `runner/runner.go`).
+**Tuning:** the timeout is not user-configurable today: the runner's
+`runConfig.ModelTimeout` field (`runner/runner.go`) exists but the runner
+entrypoint (`runner/cmd/main.go`) never sets it, so the timeout is always
+the `defaultModelTimeout` (120s). For a local 27B-class model under load, a
+legitimate response can approach 120s (#124 saw a 60s worst case); if you
+see spurious `ModelUnavailable` conditions on a healthy backend, the fix
+today is to reduce the load or the context size, not to tune the timeout.
+The retry count and backoff base are currently constants
+(`defaultModelRetries = 3`, `defaultModelRetryBackoff = 2s` in
+`runner/runner.go`).
 
 ## 9. Calico + KubeArmor VM (both gates enforcing)
 

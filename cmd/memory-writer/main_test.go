@@ -926,3 +926,66 @@ func TestMemoryWriteCuratorReasonCRStrippedFromSummary(t *testing.T) {
 		t.Fatalf("summary line 0 must carry the flattened reason (CR/LF -> space); got %q", lines[0])
 	}
 }
+
+// TestSummaryLinesStripsCRFromReason: the writer-level stripReasonCR in
+// summaryLines is defence in depth at the summary's single entry point. The
+// curator client already strips CR/LF (pkg/curator/curator.go:193-195), so
+// a reason that reaches summaryLines via the curator path is always
+// single-line; this spec isolates the writer-level strip by feeding a CR/LF
+// reason DIRECTLY into summaryLines (bypassing the client), proving the
+// strip is reachable and effective even if a future code path bypasses the
+// client.
+//
+// Mutation (the spec must FAIL): remove the stripReasonCR call in
+// summaryLines (cmd/memory-writer/main.go) — the reason keeps its "\n"/
+// "\r\n", and the lesson line gains a phantom newline (the line is no longer
+// single-line).
+func TestSummaryLinesStripsCRFromReason(t *testing.T) {
+	lesson := "foo/bar: the retry must back off before the 500"
+	// A drop reason carrying CR/LF, fed straight into summaryLines (no
+	// client in the path — this isolates the writer-level strip).
+	reason := "dropped curator: too generic\r\nand\nnot specific"
+	lines := summaryLines([]string{lesson}, []string{reason}, 1, 0, 1)
+	// Exactly 2 elements: 1 lesson line + 1 counts line. (The CR/LF is
+	// inside the lesson-line string, not between slice elements — the strip
+	// makes the string single-line.)
+	if len(lines) != 2 {
+		t.Fatalf("summaryLines must return exactly 2 elements (1 lesson + counts), got %d: %q", len(lines), lines)
+	}
+	// The reason is flattened: CR/LF become spaces, so the lesson line is
+	// single-line (no \n or \r inside it) and reads
+	// "dropped curator: too generic and not specific".
+	want := "dropped curator: too generic and not specific"
+	if !strings.Contains(lines[0], want) {
+		t.Fatalf("summaryLines lesson line must carry the flattened reason (CR/LF -> space); want %q in %q", want, lines[0])
+	}
+	// The lesson line must be single-line (no CR/LF inside it). An unstripped
+	// reason would leave \r\n or \n in the string.
+	if strings.ContainsAny(lines[0], "\r\n") {
+		t.Fatalf("summaryLines lesson line must be single-line (no CR/LF); got %q", lines[0])
+	}
+	// The counts line is the last element and must be well-formed.
+	if lines[1] != "summary: total=1 written=0 dropped=1" {
+		t.Fatalf("summaryLines counts line = %q; want %q", lines[1], "summary: total=1 written=0 dropped=1")
+	}
+}
+
+// TestMutationSummaryLinesStripReasonCRRemoved: mutation test for the
+// writer-level stripReasonCR in summaryLines. Removing the strip lets a
+// CR/LF reason through to the lesson-line string, leaving \r\n or \n inside
+// the line (the line is no longer single-line). This spec asserts the line
+// IS single-line (no CR/LF); with the mutation applied, the line contains
+// CR/LF and the spec FAILS.
+func TestMutationSummaryLinesStripReasonCRRemoved(t *testing.T) {
+	lesson := "foo/bar: the retry must back off before the 500"
+	reason := "dropped curator: too generic\r\nand\nnot specific"
+	lines := summaryLines([]string{lesson}, []string{reason}, 1, 0, 1)
+	// The lesson line must be single-line (no CR/LF). With the mutation
+	// (stripReasonCR removed), the line contains CR/LF and this FAILS.
+	if strings.ContainsAny(lines[0], "\r\n") {
+		msg := "MUTATION DETECTED: summaryLines lesson line contains CR/LF " +
+			"(stripReasonCR removed). Got: %q. Mutation: remove the " +
+			"stripReasonCR call in summaryLines (cmd/memory-writer/main.go)."
+		t.Fatalf(msg, lines[0])
+	}
+}

@@ -75,6 +75,8 @@ type Deps struct {
 	Memory MemoryReader
 	// MemoryStore is the export/import boundary (P5d); nil = real pods.
 	MemoryStore MemoryStore
+	// MemoryAdmin is the `memory delete` boundary (I101); nil = kubectl.
+	MemoryAdmin MemoryAdmin
 }
 
 // currentDeps is the active seam set. It is set by NewRootCommand/Execute and

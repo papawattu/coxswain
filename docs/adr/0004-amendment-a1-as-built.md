@@ -7,6 +7,8 @@
 (`.samples/r31-adr-corrections.md`).
 **Supersedes:** the two ADR-0004 rows quoted below. The original ADR is a
 decision record and is not edited; this amendment records what was built.
+**Code line numbers:** as of `6eb74c2` (main on 2026-10-24); later merges may
+move them; the function names are the stable anchor.
 
 ## Context
 

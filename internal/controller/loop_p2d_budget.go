@@ -31,6 +31,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"net/http"
 	"time"
@@ -38,6 +39,7 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -66,6 +68,20 @@ const (
 	// counter dropped WITHOUT a bootID change (a corrupted/partial file or a
 	// torn read — the operator rebases and adds nothing).
 	meteringAnomalyReason = "MeteringAnomaly"
+	// meteringDegradedReason is the Warning Event reason (and the condition
+	// reason) when the proxy forwarded requests it could not meter (F44).
+	meteringDegradedReason = "UnmeteredRequests"
+	// budgetReadingStaleReason is the Warning Event reason (and the condition
+	// reason) when the usage read has failed budgetReadFailureThreshold times
+	// in a row (F44).
+	budgetReadingStaleReason = "UsageReadFailed"
+	// budgetReadFailureThreshold is the consecutive failed reads before
+	// BudgetReadingStale is set (F44): a single miss (a pod mid-restart) is
+	// not worth a condition.
+	budgetReadFailureThreshold = 3
+	// meteringEventQuiet is how long MeteringDegraded must have been False
+	// before a re-degrade emits a second Warning Event (F44).
+	meteringEventQuiet = 5 * time.Minute
 	// budgetExceededEventReason is the Normal Event reason when a budget cap
 	// fires (onExceeded=Fail).
 	budgetExceededEventReason = "BudgetExceeded"
@@ -161,8 +177,15 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// UNCHANGED (no reset, no delta — the operator does not guess; the
 	// decision is on the last SUCCESSFUL read, never an estimate).
 	if loop.Spec.Agent.EndpointSecretRef != "" {
-		if reading, err := r.resolveProxyUsageRead(ctx, loop); err == nil && reading != nil {
+		reading, err := r.resolveProxyUsageRead(ctx, loop)
+		if err == nil && reading != nil {
+			r.noteUsageReadOK(loop, now)
 			r.applyUsageReading(ctx, loop, *reading)
+		} else if err != nil {
+			// F44: the caps stay on the last good reading (fail-open, by
+			// design until the owner decides otherwise), but the staleness
+			// is recorded and surfaced.
+			r.noteUsageReadFailed(loop, err)
 		}
 	}
 
@@ -183,6 +206,87 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	}
 
 	return budgetRequeue
+}
+
+// noteUsageReadOK records a successful usage read (F44): stamps
+// lastUsageReadAt, resets the failure counter and clears BudgetReadingStale.
+func (r *LoopReconciler) noteUsageReadOK(loop *coxv1alpha1.Loop, now metav1.Time) {
+	if loop.Status.Budget == nil {
+		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
+	}
+	b := loop.Status.Budget
+	b.LastUsageReadAt = &now
+	b.ConsecutiveReadFailures = 0
+	if conditionIsTrue(loop, coxv1alpha1.BudgetReadingStaleCondition) {
+		setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionFalse,
+			"UsageReadRecovered", "the model proxy usage endpoint was read successfully")
+	}
+}
+
+// noteUsageReadFailed records a failed usage read (F44). status.budget is
+// otherwise untouched (no delta, no reset). At budgetReadFailureThreshold
+// consecutive failures BudgetReadingStale is set True with ONE Warning Event
+// (transition-gated: later failures do not re-emit).
+func (r *LoopReconciler) noteUsageReadFailed(loop *coxv1alpha1.Loop, err error) {
+	if loop.Status.Budget == nil {
+		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
+	}
+	b := loop.Status.Budget
+	if b.ConsecutiveReadFailures < math.MaxInt32 {
+		b.ConsecutiveReadFailures++
+	}
+	if b.ConsecutiveReadFailures < budgetReadFailureThreshold {
+		return
+	}
+	wasStale := conditionIsTrue(loop, coxv1alpha1.BudgetReadingStaleCondition)
+	setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionTrue,
+		budgetReadingStaleReason,
+		"the model proxy usage endpoint could not be read; the token and cost caps are evaluating the last successful reading: "+err.Error())
+	if !wasStale && r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, budgetReadingStaleReason,
+			"usage read failed %d times in a row (%v): the token and cost caps are evaluating the last successful reading",
+			b.ConsecutiveReadFailures, err)
+	}
+}
+
+// noteUnmetered surfaces requests the proxy forwarded without a parseable
+// usage object (F44). delta > 0 sets MeteringDegraded True with ONE Warning
+// Event on the transition; delta == 0 clears a True condition.
+func (r *LoopReconciler) noteUnmetered(loop *coxv1alpha1.Loop, delta int64) {
+	b := loop.Status.Budget
+	if delta <= 0 {
+		if conditionIsTrue(loop, coxv1alpha1.MeteringDegradedCondition) {
+			setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionFalse,
+				"MeteringOK", "no new unmetered requests since the last read")
+		}
+		return
+	}
+	loopUnmeteredRequestsTotal.Add(float64(delta))
+	// One Event per degradation episode: not while already True, and not for
+	// a re-degrade within meteringEventQuiet of the clear (a stream that
+	// alternates metered and unmetered reads would otherwise flap an Event
+	// per reconcile).
+	wasDegraded := conditionIsTrue(loop, coxv1alpha1.MeteringDegradedCondition)
+	if c := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.MeteringDegradedCondition); c != nil &&
+		c.Status == metav1.ConditionFalse && r.operatorNow().Sub(c.LastTransitionTime.Time) < meteringEventQuiet {
+		wasDegraded = true
+	}
+	msg := fmt.Sprintf("the model proxy forwarded requests without a usage object: %d unmetered in total; they do not count toward the token or cost caps", b.UnmeteredRequests)
+	setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionTrue, meteringDegradedReason, msg)
+	if !wasDegraded && r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, meteringDegradedReason,
+			"%d request(s) forwarded without a usage object (%d in total): not counted toward the token or cost caps",
+			delta, b.UnmeteredRequests)
+	}
+}
+
+func conditionIsTrue(loop *coxv1alpha1.Loop, condType string) bool {
+	for _, c := range loop.Status.Conditions {
+		if c.Type == condType {
+			return c.Status == metav1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // resolveProxyUsageRead dispatches to the readProxyUsage test seam when it is
@@ -325,6 +429,7 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 		b.CompletionTokens += reading.CompletionTokens
 		b.Requests += reading.Requests
 		b.UnmeteredRequests += reading.UnmeteredRequests
+		r.noteUnmetered(loop, reading.UnmeteredRequests)
 		b.LastBootID = reading.BootID
 		b.LastPromptTokens = reading.PromptTokens
 		b.LastCompletionTokens = reading.CompletionTokens
@@ -372,7 +477,9 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 	b.PromptTokens += promptDelta
 	b.CompletionTokens += completionDelta
 	b.Requests += max(0, reading.Requests-b.LastRequests)
-	b.UnmeteredRequests += max(0, reading.UnmeteredRequests-b.LastUnmeteredRequests)
+	unmeteredDelta := max(0, reading.UnmeteredRequests-b.LastUnmeteredRequests)
+	b.UnmeteredRequests += unmeteredDelta
+	r.noteUnmetered(loop, unmeteredDelta)
 	// B5a: bump the token metric by the same deltas (the metric is the
 	// process-wide, per-process sum of what the operator has folded into
 	// status.budget; it is NOT per-Loop — the per-Loop view is status.budget).

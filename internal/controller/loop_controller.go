@@ -125,6 +125,13 @@ var (
 		Name: "coxswain_loop_tokens_total",
 		Help: "Total model tokens consumed, as folded into status.budget from the proxy reading, by kind (prompt|completion).",
 	}, []string{"kind"})
+	// F44: requests the model proxy forwarded without a parseable usage
+	// object, as folded into status.budget (process-wide; the per-Loop view is
+	// status.budget.unmeteredRequests and the MeteringDegraded condition).
+	loopUnmeteredRequestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "coxswain_unmetered_requests_total",
+		Help: "Total model requests forwarded without a usage object, as folded into status.budget (not counted toward token or cost caps).",
+	})
 	// F30 (PLAN.md Phase 7 "memory-write rate"): coxswain_memory_writes_total
 	// is bumped once per Loop on the transition that sets the MemoryWriteDone
 	// condition (written = the writer Job succeeded, failed = it failed).
@@ -150,6 +157,7 @@ func init() {
 	metrics.Registry.MustRegister(loopStallsTotal)
 	// B5a: loops_active is a custom Collector, registered in SetupWithManager.
 	metrics.Registry.MustRegister(loopTokensTotal)
+	metrics.Registry.MustRegister(loopUnmeteredRequestsTotal)
 	metrics.Registry.MustRegister(memoryWritesTotal)
 	metrics.Registry.MustRegister(memoryLessonsTotal)
 }

@@ -286,13 +286,11 @@ func isStreaming(body []byte) bool {
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return false
 	}
-	var req struct {
-		Stream bool `json:"stream"`
-	}
+	var req map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &req); err != nil {
 		return false
 	}
-	return req.Stream
+	return streamRequested(req["stream"])
 }
 
 // readDir / openFile are the indirection points the tests override to feed

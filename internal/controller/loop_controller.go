@@ -568,7 +568,12 @@ type LoopReconciler struct {
 // D38: the operator emits a Kubernetes Event on every Loop when its
 // NetworkEnforced condition changes (the probe Runnable's re-gate Event lives
 // in internal/cni; this is the condition-change Event the reconcile side emits).
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// F48b: get;list are the operator's read of a sandbox pod's own Events (the
+// kubelet reports FailedMount/FailedAttachVolume only there, never in the pod
+// status). No watch: the read is a per-reconcile namespaced List through the
+// uncached apiReader, so nothing needs a cache watch (and an Events informer
+// would cache the highest-churn type in the API).
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list
 // S5a (B3): the operator owns the per-Loop verify Job (ensureVerifyJob + the
 // exit-code reader; the Job runs the operator's trusted check containers, not
 // agent code).

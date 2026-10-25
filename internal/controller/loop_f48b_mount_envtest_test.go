@@ -1,0 +1,212 @@
+package controller
+
+// F48b: a sandbox pod the kubelet cannot mount its volumes for is an Event-only
+// fact (the pod status says Pending + ContainerCreating, exactly like a slow
+// image pull), so it needs its own grace and its own read: a matching Warning
+// Event on THIS pod, past sandboxMountGrace, is a bounded sandbox infra failure.
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	cov "github.com/papawattu/coxswain/api/v1alpha1"
+)
+
+var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
+	const goal = "F48b test"
+
+	// plant creates a Loop (Planning), its Sandbox and a controlled Pending pod
+	// whose only container is Waiting/ContainerCreating — the shape the kubelet
+	// shows for both "still starting" and "a volume will not mount". It returns
+	// a reconciler whose clock is pod.creationTimestamp + the given offset.
+	plant := func(name string) (*cov.Loop, *corev1.Pod, *LoopReconciler, *time.Duration, *record.FakeRecorder) {
+		ns := "f48b-" + name + "-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		})
+		loop := &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+			Spec: cov.LoopSpec{Goal: goal, Agent: cov.AgentConfig{Image: "example.com/cox-agent:v1"},
+				Workspace: cov.Workspace{Repo: "https://example.com/repo.git", GitCredentialSecret: "git-cred-missing"}},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		loop.Status.Phase = cov.LoopPhasePlanning
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		f6PlantSandboxAndPodFn(ns, name)
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, pod)).To(Succeed())
+		pod.Status = corev1.PodStatus{
+			Phase: corev1.PodPending,
+			ContainerStatuses: []corev1.ContainerStatus{{Name: "agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}}},
+		}
+		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
+		offset := new(time.Duration)
+		rec := record.NewFakeRecorder(64)
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
+		r.now = func() metav1.Time { return metav1.NewTime(pod.CreationTimestamp.Add(*offset)) }
+		return loop, pod, r, offset, rec
+	}
+	// plantMountEvent creates the kubelet's Event on the pod, for the given
+	// involved UID (a previous attempt's Event carries the OLD UID).
+	plantMountEvent := func(pod *corev1.Pod, reason, msg string, uid types.UID) {
+		ev := &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: pod.Namespace,
+				Name:      pod.Name + "." + strings.ToLower(reason) + "-" + nowSuffix(),
+			},
+			InvolvedObject: corev1.ObjectReference{
+				Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: uid,
+			},
+			Reason:         reason,
+			Message:        msg,
+			Type:           corev1.EventTypeWarning,
+			Count:          1,
+			FirstTimestamp: metav1.Now(),
+			LastTimestamp:  metav1.Now(),
+		}
+		Expect(k8sClient.Create(ctx, ev)).To(Succeed())
+	}
+	countEvents := func(rec *record.FakeRecorder, reason string) int {
+		n := 0
+		for _, e := range drainEvents(rec) {
+			if strings.Contains(e, reason) {
+				n++
+			}
+		}
+		return n
+	}
+
+	It("bounds a FailedMount past the grace: AgentFailed(FailedMount), one retry, the Sandbox deleted", func() {
+		loop, pod, r, offset, rec := plant("f48bmount")
+		plantMountEvent(pod, "FailedMount",
+			`MountVolume.SetUp failed for volume "git-cred" : secret "git-cred-missing" not found`, pod.UID)
+
+		*offset = sandboxMountGrace + 10*time.Second
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).NotTo(BeNil(), "a FailedMount Event past the grace is an infra failure")
+		Expect(f.reason).To(Equal("FailedMount"))
+		Expect(f.mountFailure).To(BeTrue(), "the message must not claim a container terminated")
+
+		Expect(r.applySandboxFailure(ctx, loop, f)).To(BeTrue())
+		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(1)))
+		cond := findConditionFn(loop.Status.Conditions, cov.AgentFailedCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Reason).To(Equal("FailedMount"))
+		Expect(cond.Message).To(ContainSubstring("cannot mount its volumes"))
+		Expect(cond.Message).To(ContainSubstring(`secret "git-cred-missing" not found`), "the kubelet's own text")
+		Expect(countEvents(rec, sandboxInfraRetryEventReason)).To(Equal(1), "one retry Event")
+
+		By("the Sandbox is deleted so the next reconcile recreates it")
+		sb := &sandboxv1beta1.Sandbox{}
+		gerr := k8sClient.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, sb)
+		Expect(apierrors.IsNotFound(gerr)).To(BeTrue(), "the Sandbox is deleted for the recreate, got %v", gerr)
+	})
+
+	It("decides nothing when the pod's events say nothing about a mount", func() {
+		loop, _, r, offset, _ := plant("f48bnoevent")
+		*offset = sandboxMountGrace + 10*time.Minute
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "no Event: no decision (this is exactly a slow image pull, I49)")
+	})
+
+	It("decides nothing for a Warning Event that is not a mount failure", func() {
+		loop, pod, r, offset, _ := plant("f48bbackoff")
+		plantMountEvent(pod, "BackOff", "Back-off restarting failed container", pod.UID)
+		*offset = sandboxMountGrace + 10*time.Minute
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "a crashloop is not a mount failure (and is a different, in-progress shape)")
+	})
+
+	It("decides nothing on the PREVIOUS attempt's mount Event (the UID filter)", func() {
+		loop, pod, r, offset, _ := plant("f48bstale")
+		plantMountEvent(pod, "FailedMount", "secret not found (previous sandbox)", types.UID("old-pod-uid"))
+		*offset = sandboxMountGrace + 10*time.Minute
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "Events outlive the pod: without the UID filter the fresh attempt would be failed on the old evidence")
+	})
+
+	It("decides nothing inside sandboxMountGrace", func() {
+		loop, pod, r, offset, _ := plant("f48bgrace")
+		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
+		*offset = sandboxMountGrace - 10*time.Second
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "a mount that resolves in seconds (a slow CSI attach) must not burn an attempt")
+	})
+
+	It("fails the Loop once the retries are exhausted, naming the kubelet's evidence", func() {
+		loop, pod, r, offset, rec := plant("f48bbound")
+		plantMountEvent(pod, "FailedAttachVolume", "attaching volume: rpc error: deadline exceeded", pod.UID)
+		*offset = sandboxMountGrace + time.Minute
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).NotTo(BeNil())
+		Expect(f.reason).To(Equal("FailedAttachVolume"))
+
+		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: sandboxInfraRetries}
+		Expect(r.applySandboxFailure(ctx, loop, f)).To(BeTrue())
+		Expect(loop.Status.Phase).To(Equal(cov.LoopPhaseFailed))
+		failed := findConditionFn(loop.Status.Conditions, string(cov.LoopPhaseFailed))
+		Expect(failed).NotTo(BeNil())
+		Expect(failed.Reason).To(Equal(sandboxInfraFailedCondition))
+		Expect(failed.Message).To(ContainSubstring("cannot mount its volumes"))
+		Expect(failed.Message).To(ContainSubstring("deadline exceeded"))
+		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(sandboxInfraRetries + 1)))
+		Expect(countEvents(rec, sandboxInfraFinalEventReason)).To(Equal(1))
+	})
+
+	It("surfaces an unreadable Events list once (no decision, no failure) instead of skipping it silently", func() {
+		loop, pod, clock, offset, rec := plant("f48bforbidden")
+		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
+		*offset = sandboxMountGrace + time.Minute
+		// The same clock as the plant (the pod is past its grace), but an
+		// apiReader whose Event List is Forbidden.
+		r := &LoopReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(),
+			apiReader: forbidEventsReader{Client: k8sClient}, Recorder: rec,
+		}
+		r.now = clock.now
+
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred(), "a read error is never a controller error")
+		Expect(f).To(BeNil(), "and never a failure decision (I49)")
+		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(Equal(1), "the blindness is visible (R26 I90)")
+
+		By("a second pass emits no second Event (the one-shot annotation)")
+		f, err = r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil())
+		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(BeZero())
+	})
+})
+
+// forbidEventsReader is a client.Reader whose Event List is Forbidden (a
+// missing events get;list rule), for the F48b unreadable-Events spec.
+type forbidEventsReader struct{ client.Client }
+
+func (f forbidEventsReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.EventList); ok {
+		return apierrors.NewForbidden(schema.GroupResource{Resource: "events"}, "", errors.New("events is forbidden"))
+	}
+	return f.Client.List(ctx, list, opts...)
+}

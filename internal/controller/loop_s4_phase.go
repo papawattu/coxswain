@@ -1039,7 +1039,33 @@ const (
 	// verdict that the image reference cannot be parsed: it never retries, so
 	// zero grace is right (the pod will never start on this spec).
 	sandboxInvalidImageNameReason = "InvalidImageName"
+	// sandboxMountGrace (F48b) is how long a Pending pod with no container
+	// started may exist before a kubelet mount failure Event counts as an infra
+	// failure (bounded by sandboxInfraRetries). Measured on the POD's age (the
+	// operator's clock, r.now), never on the event's timestamp: a slow CSI
+	// attach that resolves in seconds must not burn an attempt, and the decision
+	// clock must stay the operator's.
+	sandboxMountGrace = 60 * time.Second
+	// sandboxEventsUnreadableReason (F48b) is the one-shot Warning Event
+	// reason when the operator's Events list fails: the mount-failure path is
+	// blind while it does (no decision, never a failure), so the degradation
+	// must be visible (R26 I90).
+	sandboxEventsUnreadableReason = "SandboxEventsUnreadable"
+	// sandboxEventsUnreadableAnnotation is the operator-owned one-shot marker
+	// for that Event (the memoryPVCUnboundNotified pattern: one Event per Loop,
+	// not one per reconcile).
+	sandboxEventsUnreadableAnnotation = "coxswain.io/sandbox-events-unreadable-notified"
 )
+
+// sandboxMountFailureReasons are the kubelet Event reasons that mean the pod
+// cannot start because a volume cannot be mounted (F48b). The kubelet reports
+// these ONLY as Events — never in the pod status — which is why the pod looks
+// identical to a slow image pull (I49).
+var sandboxMountFailureReasons = map[string]bool{
+	"FailedMount":        true,
+	"FailedAttachVolume": true,
+	"FailedMapVolume":    true,
+}
 
 // sandboxFailure is the operator's read of the sandbox pod for the F6
 // failure check: it reports the pod's failed-without-a-claim state (nil when
@@ -1060,6 +1086,11 @@ type sandboxFailure struct {
 	// (CreateContainerConfigError): nothing terminated, so the message must
 	// not say it did.
 	neverStarted bool
+	// mountFailure is true when the pod is Pending because the kubelet cannot
+	// mount its volumes (F48b): the reason and message come from the kubelet's
+	// FailedMount/FailedAttachVolume Event, and no container was named (nothing
+	// started), so the message says so.
+	mountFailure bool
 }
 
 // The F6 claim-wins check: the agent's own claim (its termination message)
@@ -1128,6 +1159,77 @@ func configErrorWaiting(pod *corev1.Pod) *waitingConfigError {
 		}
 	}
 	return nil
+}
+
+// sandboxMountFailureEvent (F48b) returns the kubelet's mount-failure Event
+// for THIS sandbox pod, or nil when there is none. The kubelet reports a
+// volume it cannot mount only as an Event (FailedMount / FailedAttachVolume /
+// FailedMapVolume), never in the pod status. The read is the uncached apiReader
+// (an Events informer would be a cluster-wide cache of the highest-churn type
+// in the API for one namespaced list per Pending pod) and the filter is done in
+// memory — including the pod's UID, which is load-bearing: the retry deletes
+// the Sandbox, so the previous attempt's Events still exist in the namespace
+// (Events outlive the pod by up to --event-ttl), and without the UID filter the
+// new pod would be failed on the old pod's evidence, burning all attempts in a
+// few reconciles (the F14/I65 UID-dedup failure mode).
+func (r *LoopReconciler) sandboxMountFailureEvent(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod) (*corev1.Event, error) {
+	reader := r.apiReader
+	if reader == nil {
+		if r.Client == nil {
+			return nil, nil
+		}
+		reader = r
+	}
+	// A namespaced list, no field selector: a cached client's MatchingFields
+	// needs a registered field index (which the apiReader path does not have),
+	// and one Loop's namespace of 1h-TTL Events is small.
+	var events corev1.EventList
+	if err := reader.List(ctx, &events, client.InNamespace(loop.Namespace)); err != nil {
+		return nil, err
+	}
+	for i := range events.Items {
+		ev := &events.Items[i]
+		if ev.InvolvedObject.Kind != "Pod" || ev.InvolvedObject.Name != pod.Name || ev.InvolvedObject.UID != pod.UID {
+			continue
+		}
+		if ev.Type != corev1.EventTypeWarning || !sandboxMountFailureReasons[ev.Reason] {
+			continue
+		}
+		return ev, nil
+	}
+	return nil, nil
+}
+
+// surfaceEventsUnreadable (F48b) makes a failed Events read visible (R26 I90)
+// with ONE Warning Event per Loop: the mount-failure bound is blind while the
+// read fails, so the Loop falls back to F48's surfacing — that degradation must
+// not be silent. The one-shot marker is the operator-owned annotation (the
+// memoryPVCUnboundNotified pattern). Best-effort: a failed annotation patch
+// never blocks the reconcile (the condition path is unaffected).
+func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv1alpha1.Loop, cause error) {
+	logf.FromContext(ctx).Error(cause, "sandbox pod Events read failed; no mount-failure decision (the Loop is back to surfacing only)", "loop", loop.Name)
+	if loop.Annotations != nil && loop.Annotations[sandboxEventsUnreadableAnnotation] == "true" {
+		return
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, sandboxEventsUnreadableReason,
+			"the sandbox pod's events could not be read (%v); a pod that cannot mount its volumes is not bounded until this works", cause)
+	}
+	// Patch a COPY (a full Update would write the server's stale status back
+	// into `loop`, dropping this reconcile's conditions — the S4/S6 lesson).
+	patched := loop.DeepCopy()
+	if patched.Annotations == nil {
+		patched.Annotations = make(map[string]string)
+	}
+	patched.Annotations[sandboxEventsUnreadableAnnotation] = "true"
+	if err := r.Patch(ctx, patched, client.MergeFrom(loop.DeepCopy())); err != nil {
+		logf.FromContext(ctx).Error(err, "mark sandbox events unreadable notified", "loop", loop.Name)
+		return
+	}
+	if loop.Annotations == nil {
+		loop.Annotations = make(map[string]string)
+	}
+	loop.Annotations[sandboxEventsUnreadableAnnotation] = "true"
 }
 
 // applySandboxNotStarting (F48) surfaces a sandbox pod that has been Pending
@@ -1260,6 +1362,33 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 				message:      w.message,
 				neverStarted: true,
 			}, nil
+		}
+		// F48b: a volume the kubelet cannot mount is an Event-only fact (the pod
+		// status says nothing — it is Pending with ContainerCreating, exactly
+		// like a slow image pull), so it needs its own grace: past
+		// sandboxMountGrace, a matching Warning Event on THIS pod is an infra
+		// failure, bounded by the same sandboxInfraRetries as any other.
+		if r.operatorNow().Sub(pod.CreationTimestamp.Time) >= sandboxMountGrace {
+			ev, eerr := r.sandboxMountFailureEvent(ctx, loop, pod)
+			if eerr != nil {
+				// A failed Events read is no decision (I49), never a failure —
+				// but the blindness is surfaced (R26 I90: a fallback must show
+				// its failure), at most once per Loop.
+				r.surfaceEventsUnreadable(ctx, loop, eerr)
+				return nil, nil
+			}
+			if ev != nil {
+				if r.hasValidSandboxClaim(ctx, loop) {
+					return nil, nil // the claim wins (ADR-0004), as on the Failed path
+				}
+				return &sandboxFailure{
+					sandboxUID:   sb.UID,
+					container:    "<pod>",
+					reason:       ev.Reason,
+					message:      ev.Message,
+					mountFailure: true,
+				}, nil
+			}
 		}
 		return nil, nil
 	}
@@ -1481,6 +1610,13 @@ func (r *LoopReconciler) ReissueSandboxDelete(ctx context.Context, loop *coxv1al
 func sandboxFailureMessage(f *sandboxFailure) string {
 	if f == nil {
 		return "sandbox pod failed without a phase claim"
+	}
+	if f.mountFailure {
+		s := "the sandbox pod cannot start: the kubelet cannot mount its volumes (" + f.reason + ")"
+		if f.message != "" {
+			s += ": " + truncate(s4ClaimMaxBytes, f.message)
+		}
+		return s
 	}
 	if f.neverStarted {
 		s := "the sandbox pod's " + f.container + " container has not started (waiting: " + f.reason + ")"

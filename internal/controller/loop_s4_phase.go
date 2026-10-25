@@ -1536,6 +1536,7 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 		// no claim; the decision below is the same (surface + retry) but the
 		// condition names the pod-level reason instead of a container's.
 		podReason, podMsg := podStatusMessage(pod)
+		podReason, podMsg = sandboxFailureReason(podReason, podMsg)
 		return &sandboxFailure{
 			sandboxUID: sb.UID,
 			container:  "<pod>",
@@ -1584,19 +1585,15 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 			message = podMsg
 		}
 	}
-	// F89: ContainerStateTerminated.Reason is OPTIONAL in the API. An empty
-	// value here would reach setCondition, and the CRD requires a condition
-	// reason (minLength 1), so the API server rejects the WHOLE status write:
-	// AgentFailed never persists and neither does status.agent.infraAttempts
-	// (mutated by applySandboxFailure just before the shared write), so the
-	// dedupe never engages, the bounded retry never exhausts, and the Loop
-	// recreates the sandbox forever. Use the same pod-level default
-	// podStatusMessage falls back to when the kubelet said nothing (the
-	// message builder already tolerates an empty reason —
-	// sandboxFailureMessage).
-	if reason == "" {
-		reason = podFailedReason
-	}
+	// F89/F89b: the reason handed to setCondition must be one the CONDITION
+	// schema can store. An empty ContainerStateTerminated.Reason (F89) or a
+	// free-text pod.status.reason the pattern rejects (F89b) would otherwise
+	// reach the API server, which rejects the WHOLE status write: AgentFailed
+	// never persists and neither does status.agent.infraAttempts (mutated by
+	// applySandboxFailure just before the shared write), so the dedupe never
+	// engages, the bounded retry never exhausts, and the Loop recreates the
+	// sandbox forever.
+	reason, message = sandboxFailureReason(reason, message)
 	return &sandboxFailure{
 		sandboxUID: sb.UID,
 		container:  agent.Name,
@@ -1842,6 +1839,43 @@ func agentContainerStatus(pod *corev1.Pod) *corev1.ContainerStatus {
 }
 
 const podFailedReason = "PodFailed"
+
+// sandboxFailureReason turns the kubelet's failure reason into one the
+// CONDITION schema can store, keeping the kubelet's own words in the message
+// (pod.status.reason and ContainerStateTerminated.Reason are both free text —
+// see podStatusMessage, which copies the pod-level one verbatim — so a value
+// like "Low on ephemeral-storage" fails the condition's
+// ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$ and the API server rejects the whole
+// status write: F89's chain).
+//
+// Both fallbacks — "the kubelet recorded no reason" and "a reason this schema
+// cannot store" — land on podFailedReason because that is the value the other
+// sandbox-failure paths already use (podStatusMessage's default, so a reader
+// keeps one vocabulary), and the two cases are told apart in the MESSAGE, not
+// in the reason: that is where the kubelet's evidence belongs, and where it is
+// preserved. The setCondition guard substitutes conditionReasonUnknown instead,
+// deliberately: that one flags a caller's bug, not a pod failure, and it must
+// not look like a plausible cause.
+//
+// Do NOT normalise inside podStatusMessage: its "reason != podFailedReason"
+// return is a sentinel for "the pod status has a reason of its own", and
+// normalising there would make a free-text pod reason look like "no pod reason",
+// so the container's coarser reason would win while the pod text quietly moved
+// into the message.
+func sandboxFailureReason(reason, message string) (string, string) {
+	if reason == "" {
+		return podFailedReason, message
+	}
+	if storableConditionReason(reason) {
+		return reason, message
+	}
+	raw := "the kubelet recorded the failure reason " + strconv.Quote(reason) +
+		", which the condition schema cannot store"
+	if message != "" {
+		raw += ": " + message
+	}
+	return podFailedReason, raw
+}
 
 // podStatusMessage returns the pod-level failure evidence from the POD
 // STATUS (the kubelet's own words): pod.status.reason ("Evicted", "Low

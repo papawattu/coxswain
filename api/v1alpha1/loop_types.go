@@ -279,14 +279,16 @@ type VerifyConfig struct {
 // status field. The operator writes valid values, and every consumer that ACTS
 // on a status value must validate it first: the checkpoint GC and the lost-PVC
 // restore check the name shape and that the VolumeSnapshot carries this Loop's
-// label before deleting or restoring from it. Other consumers (e.g. the tamper
-// gate's inputs) are not yet hardened this way; narrowing the editor role is an
-// owner decision.
+// label before deleting or restoring from it. The tamper gate (F83) accepts a
+// recorded tamperExitCode only when the CURRENT verify Job's UID and that
+// Job's pod's terminated tamper init agree with it, so a status write alone
+// cannot fail a Loop. Narrowing the editor role is an owner decision.
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
 	// operator copies the pin it wrote on entering Verifying
-	// (status.currentVerify.verifiedCommit). Evidence that names a different verifiedCommit (e.g. left over from a
-	// previous iteration's Job) is treated as no evidence (D24).
+	// (status.currentVerify.verifiedCommit). Evidence that names a different
+	// verifiedCommit (e.g. left over from a previous iteration's Job) is treated
+	// as no evidence (D24).
 	// +optional
 	VerifiedCommit string `json:"verifiedCommit,omitempty"`
 

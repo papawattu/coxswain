@@ -1324,8 +1324,9 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// P5f: a Loop held for delivery has already passed verify.
 		return false, false, nil, nil
 	}
-	// The B2 tamper gate runs FIRST (every reconcile, order-independent). If
-	// it flipped the Loop to Failed, do nothing here.
+	// The B2 tamper gate runs AFTER this function (loop_controller.go:
+	// applyVerifyOutcome, then runTamperGate) and judges the same Job/pod read
+	// this function returns (F83), so the two cannot disagree.
 	pod, err := r.readVerifyJobPod(ctx, loop)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "verify pod read failed; requeueing", "loop", loop.Name)

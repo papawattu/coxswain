@@ -1310,8 +1310,9 @@ spec:
                     description: |-
                       verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
                       operator copies the pin it wrote on entering Verifying
-                      (status.currentVerify.verifiedCommit). Evidence that names a different verifiedCommit (e.g. left over from a
-                      previous iteration's Job) is treated as no evidence (D24).
+                      (status.currentVerify.verifiedCommit). Evidence that names a different
+                      verifiedCommit (e.g. left over from a previous iteration's Job) is treated
+                      as no evidence (D24).
                     type: string
                 type: object
             type: object

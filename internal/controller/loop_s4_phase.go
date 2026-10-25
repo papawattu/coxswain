@@ -1339,13 +1339,18 @@ func clearSandboxInfraEpisode(loop *coxv1alpha1.Loop) bool {
 // complete only for the transitions that move one of those two fields — the
 // verify iterate and the onVerifyFail=Plan re-plan move `iteration`
 // (loop_verify_job.go), the approve and the Planning hold move `desiredPhase`
-// (loop_approval.go, loop_s4_phase.go). A run change that moves neither needs
-// its own clear: the rejection re-plan (loop_approval.go, Planning -> Planning
-// with PlanAttempt++) is ended by the accepted-claim clear in
-// advancePhaseFromClaim when the re-planned attempt's PLANNING claim is
-// accepted (loop_s4_phase.go, F48b) — the rejection itself clears nothing, it
-// only bumps PlanAttempt and the conditions — and a workspace
-// rebuild by the three clears in loop_restore.go (the two restore completions
+// (loop_approval.go, loop_s4_phase.go). The rejection re-plan is the case that
+// moves desiredPhase WITHOUT moving `iteration`: it goes AwaitingApproval ->
+// Planning (loop_approval.go, next to PlanAttempt++), so the key compare below
+// starts a new episode at the next counted failure — AND the accepted PLANNING
+// claim of the re-planned attempt ends it immediately, through the F48b
+// accepted-claim clear in advancePhaseFromClaim. Both halves matter: the key
+// compare alone would leave the old count standing until the next failure, and
+// the claim clear is what actually fires in the normal path (the re-plan's
+// first act is a Planning run whose claim is accepted). The rejection arm
+// itself clears nothing; it only bumps PlanAttempt and moves the conditions. A
+// workspace
+// rebuild is cleared by the three clears in loop_restore.go (the two restore completions
 // and the A2 empty fallback, F48h). If a new transition can start a run without
 // a claim and without iteration or desiredPhase moving, it must clear
 // explicitly — this key will not see it.

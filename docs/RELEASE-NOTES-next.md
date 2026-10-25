@@ -279,6 +279,12 @@ existing Loops are unaffected, but new ones are.
 
 F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop reaches Failed or Succeeded, and a proxy pod that could not be read is no longer reported as not existing. Nothing to do on upgrade.
 
+### F84c: `ModelProxyNotReady` no longer sticks when another gate holds, and a flapping proxy read no longer rewrites status every pass — #277
+
+- **What was wrong.** The clear for `ModelProxyNotReady` lived inside the model-proxy hold itself, which the reconcile only reaches after the earlier gates — so a Loop that reached Failed or Succeeded while an earlier gate held (including a missing AgentPolicy reference) kept `ModelProxyNotReady=True` forever, outliving the reason it was set. And a proxy pod that could not be read put the raw error text in the condition's message, so a read error whose text changed between passes re-stamped the condition with a new message on every reconcile pass (F84c).
+- **What changed.** The terminal clear now runs on every reconcile of a finished Loop, ahead of the validation, restore and NetworkEnforced holds and on the deleting path, so a finished Loop no longer keeps `ModelProxyNotReady=True` while another gate (a missing AgentPolicy reference included) holds (F84c, PR #277). A failed proxy read now reports a stable reason; the error text goes to the Event and the log instead of the condition message, so a flapping read no longer rewrites the condition every pass (F84c, PR #277).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #277).
+
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
 - **What was wrong.** `status.checkpoints` is user-writable (the editor role, since B3), and the operator acted on it without trusting it: the retention GC would delete any VolumeSnapshot a status entry named, even one belonging to another Loop, and the lost-PVC restore could take a forged entry as its restore source (PR #254, review finding review-api P2-1).

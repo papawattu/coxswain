@@ -45,7 +45,8 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`.
   (the I135 precedent; the corrected text is below). The ticks are still blocked
   by D87.
 - **Runs:** the reviewer re-ran mutations on each code PR in a scratch worktree
-  (`.samples/mut-277.md`, `-278.md`, `-279.md`); #280's was read from its log. This
+  (`.samples/mut-277.md`, `-278.md`, `-279.md`; the review bodies of #277, #278
+  and #279 name the worktree commit); #280's was read from its log. This
   round's text re-ran nothing: `make test`, `make lint` and the chart checks are
   taken from the builders' logs and CI.
 
@@ -59,7 +60,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`.
   nothing at the tip and once at `a9d8605` (`loop_s4_phase.go`), and the comment now
   names both real ends of the episode (`loop_s4_phase.go:1337-1356`); S9 pins them
   in order (`loop_f48g_episode_boundaries_envtest_test.go:579-589` nothing has
-  re-counted and the key *has* moved, `:591-614` the accepted claim clears the
+  re-counted and the key *has* moved, `:597-614` the accepted claim clears the
   persisted 2). Tick against `7251618` once an R37 tick can land.
 - **I140 (the guard's length limit counts bytes while the schema's counts
   characters): fixed by #279 (`7251618`) on a corrected acceptance.**
@@ -109,7 +110,7 @@ pinned"; no rune count is required.
   one. The pre-review cannot open the evidence, so the mutation and gate claims can
   only be taken on trust — the thing R28 I92 exists to prevent ("a cited path the
   reviewer cannot open is not an output"). Both cases were fixed by a
-  copy after the review had already been written. #278's cited mutation diffs were
+  copy after the pre-review (and, for #277, the review) had already been written. #278's cited mutation diffs were
   in the shared `.samples/f48e-mut/` (the reviewer applied them from there).
 
   **Fix:** the builder writes evidence to the shared
@@ -130,7 +131,8 @@ pinned"; no rune count is required.
   1. `loop_s4_phase.go:1337-1356` (fixed in `9ea1c62`) — #279's draft said the
      rejection re-plan is "a run change that moves neither" `iteration` nor
      `desiredPhase`. The rejection sets `desiredPhase = Planning` from
-     AwaitingApproval in `loop_approval.go`, next to `PlanAttempt++`. (The text it
+     AwaitingApproval at `loop_approval.go:337-339`, next to `PlanAttempt++`; the wrong
+     text was at `cdafb52:1342`. (The text it
      replaced, R37 I138, named a "PlanApproved claim" that does not exist.)
   2. `loop_f48e_accumulation_envtest_test.go:236-241` (fixed in `9accaeb`) — the new
      comment said "the Get above fails if there is no Sandbox at all". The Get
@@ -161,8 +163,9 @@ pinned"; no rune count is required.
 
 - [ ] **I143: an assertion whose ability to fail is argued, not shown**
 
-  **Where:** #277's deleting-path spec (mutation F left it passing; R3 pinned it
-  with the reviewer's mutation E, `.samples/mut-277.md`); #278's
+  **Where:** #277's deleting-path clear went unpinned (the reviewer's mutation E passed
+  in round 2 and fails in round 3, `.samples/mut-277.md`; mutation F, the
+  Reconcile clear, never failed that spec); #278's
   `Expect(sandboxName(name)).NotTo(BeEmpty())` (`loop_f48e_accumulation_envtest_test.go:236`
   at `a9d8605`, un-failable by construction); #280's replacement at `:242-244`,
   whose only recorded mutation (`M-F48e2`, `.samples/f48e2-mut/M-F48e2.txt`) fails

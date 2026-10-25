@@ -28,6 +28,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -152,8 +155,11 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 			rec := record.NewFakeRecorder(32)
 			r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient,
 				AllowUnenforced: false, Recorder: rec, CNIProber: cni.NewFakeProber()}
-			// The D30 gate HOLDS: the CNI is not enforced and the escape hatch is
-			// off, so sandboxSuspendedByGate returns before the model proxy gate.
+			// The D30 gate HOLDS: no Enforcer is wired and AllowUnenforced is
+			// false, so enforcementStatus reports not-enforced and
+			// sandboxSuspendedByGate returns before the model proxy gate. (The
+			// prober below feeds D38, which is the LAST check in the gate, after
+			// the model proxy one — it is not what holds this fixture.)
 			r.CNIProber.(*cni.FakeProber).SetResult(cni.CNIProbeResult{Reason: cni.ReasonCNIUnenforced})
 
 			By("the Loop reaches " + string(phase) + " carrying a recorded hold")
@@ -209,6 +215,90 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 		Entry("an apiserver error: a distinct, stable phrase plus the detail",
 			apierrors.NewInternalError(errors.New("boom")), "it could not be read", true),
 	)
+
+	// F84c (P2, the review round): the clear must run before EVERY hold that can
+	// return early, including validateStep — which PERSISTS status while it
+	// holds, so a stale ModelProxyNotReady=True would be written on every pass,
+	// indefinitely, for a terminal Loop whose referenced policy was deleted.
+	It("F84c: a missing policy reference cannot keep the model proxy hold on a terminal Loop", func() {
+		ns := "f84c-missing-policy-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		})
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "f84cmissing"},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:       "F84c missing policy",
+				Workspace:  testWorkspace(),
+				PolicyRefs: []string{"a-policy-that-does-not-exist"},
+				Agent: coxv1alpha1.AgentConfig{
+					Image:             runnerImage,
+					Model:             testModel,
+					EndpointSecretRef: f84ModelSecret,
+					ModelEndpoint:     "model.example.com:443",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionTrue, "ModelProxyNotReady",
+			"the model proxy pod f84cmissing-proxy is not Ready: it does not exist yet; the sandbox is held Suspended")
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		rec := record.NewFakeRecorder(32)
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient,
+			AllowUnenforced: false, Recorder: rec, CNIProber: cni.NewFakeProber()}
+		r.CNIProber.(*cni.FakeProber).SetResult(cni.CNIProbeResult{Reason: cni.ReasonCNIEnforced})
+
+		// validateStep is what returns this pass (the policy is missing), and it
+		// persists status while it holds — which is exactly why the clear has to
+		// run before it.
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loop.Name}})
+		Expect(err).NotTo(HaveOccurred())
+
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: loop.Name}, got)).To(Succeed())
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)
+		Expect(cond).NotTo(BeNil(), "the condition is cleared, not removed")
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse),
+			"a hold that no longer applies must not be persisted by the validateStep hold")
+		Expect(cond.Reason).To(Equal(modelProxyTerminalReason))
+	})
+
+	// F84c (P3, the pre-review's finding 4): the why/detail routing in
+	// modelProxyHold had no end-to-end spec — the phrase table tests
+	// modelProxyNotReady alone and the byte-identical spec tests setCondition
+	// alone, so a transposition (or wiring the raw error back into `why`) would
+	// have put the error text in the condition message again with nothing
+	// failing.
+	It("F84c: a read error reaches the Event, and never the condition message", func() {
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "f84creaderr"},
+			Spec: coxv1alpha1.LoopSpec{
+				Agent: coxv1alpha1.AgentConfig{EndpointSecretRef: f84ModelSecret, ModelEndpoint: "model.example.com:443"},
+			},
+		}
+		rec := record.NewFakeRecorder(8)
+		c := fake.NewClientBuilder().WithScheme(k8sClient.Scheme()).WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+				return apierrors.NewInternalError(errors.New("boom-read-failure"))
+			},
+		}).Build()
+		r := &LoopReconciler{Client: c, Scheme: k8sClient.Scheme(), Recorder: rec}
+
+		Expect(r.modelProxyHold(ctx, loop)).To(BeTrue(), "an unreadable proxy pod is the same fail-closed hold")
+		cond := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Message).To(ContainSubstring("could not be read"), "the stable phrase")
+		Expect(cond.Message).NotTo(ContainSubstring("boom-read-failure"),
+			"the raw error belongs in the Event and the log, never in a setCondition message")
+
+		events := strings.Join(drainEvents(rec), "\n")
+		Expect(events).To(ContainSubstring("ModelProxyNotReady"))
+		Expect(events).To(ContainSubstring("boom-read-failure"), "the one Event carries the detail")
+	})
 
 	It("F84c: the read-error condition message is byte-identical across two different read errors", func() {
 		ns := "f84c-readerr-" + nowSuffix()

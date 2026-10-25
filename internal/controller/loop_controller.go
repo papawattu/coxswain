@@ -870,6 +870,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// F84c: a terminal Loop is not held for its model proxy, and the clear must
+	// run before EVERY hold that can return early — including validateStep just
+	// below, which PERSISTS status while it holds (agentPoliciesValid /
+	// modelConfigInvalid both call Status().Update), and the restore/b2 and D30
+	// holds further down (sandboxSuspendedByGate reaches the D35a gate only
+	// after them, and a b2 hold skips the bootstrap and the gate entirely).
+	// It runs BEFORE the condsBefore snapshot, so conditionsChanged cannot be
+	// what persists it: the flag is ORed into changed below, and the holding
+	// paths carry the cleared condition out on their own write. Only the two
+	// genuine error returns (applyEffectivePolicyAndConditions, the restore
+	// step) leave it in memory, which is correct — they retry.
+	terminalCleared := clearModelProxyHoldForTerminal(&loop, false)
+
 	// C6a + D34: validate the referenced AgentPolicies and the
 	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
 	// the Reconcile within the gocyclo budget).
@@ -900,17 +913,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed := b2Changed // the B2 restore step's condition change (the I90 point-of-decision write)
-
-	// F84c: a terminal Loop is not held for its model proxy, and that must not
-	// depend on any other gate's health. The clear used to live inside the D35a
-	// gate (modelProxyHold), which sandboxSuspendedByGate reaches only after the
-	// restore and D30 holds — and a b2 hold skips the bootstrap (and the gate)
-	// entirely — so a Loop that finished while an earlier gate held kept
-	// ModelProxyNotReady=True forever. The terminal test lives in the helper to
-	// keep Reconcile inside its gocyclo budget; this runs after the condsBefore
-	// snapshot above, so conditionsChanged persists it.
-	changed = clearModelProxyHoldForTerminal(&loop, changed)
+	changed := b2Changed || terminalCleared // the B2 restore step's condition change (the I90 point-of-decision write) and the F84c terminal clear
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
@@ -2060,13 +2063,24 @@ func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, why, 
 
 // clearModelProxyHoldForTerminal is the terminal clear (F84b, F84c): a finished
 // Loop is not held for its model proxy, so the condition must not outlive the
-// work it describes (the R34 I120(b) class). Reconcile calls it on EVERY pass
-// (with the current changed flag, returned updated), whatever the other gates
-// say — that is the F84c point: the D30/restore holds return before the D35a
-// gate, and a b2 hold skips the bootstrap, so a clear inside the gate is not
-// unconditional. The terminal test is here rather than in Reconcile to keep
-// Reconcile inside its gocyclo budget; modelProxyHold only refuses to hold at a
-// terminal phase (it never clears).
+// work it describes (the R34 I120(b) class). Called from Reconcile before every
+// hold that can return early (validateStep, the restore/b2 step, D30/35a) and
+// from the deleting path, which persists the conditions as its durable record;
+// both OR the returned flag into the write they already make. Only the genuine
+// error returns leave it in memory, which is correct — they retry.
+//
+// Two notes on what that placement buys, and what is pinned by a spec:
+//   - the restore-hold (b2Hold) half is PLACEMENT-guaranteed and not spec-pinned
+//     (the F84 table's fixture sets no restoreFrom, so b2Hold is false there; a
+//     mutation that moves the call below b2GatedBootstrap still passes). The
+//     comment is the record, by the F48g precedent;
+//   - the validateStep half IS spec-pinned (a Failed Loop with a missing policy
+//     reference: F84c's "a missing policy cannot keep the hold" spec), because
+//     that path persists status while it holds.
+//
+// The terminal test lives here rather than in Reconcile to keep Reconcile inside
+// its gocyclo budget; modelProxyHold only refuses to hold at a terminal phase
+// (it never clears).
 func clearModelProxyHoldForTerminal(loop *coxv1alpha1.Loop, changed bool) bool {
 	if !isTerminalPhase(loop.Status.Phase) {
 		return changed

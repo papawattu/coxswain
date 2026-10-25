@@ -342,9 +342,11 @@ plain failure message, because a failed write is unreliable evidence and
 the operator does not fabricate an audit for a write that did not
 happen. The condition-message copy of the audit is capped at 1000 bytes
 on a rune boundary (the client-go Event cap is 1024; the Job's
-termination message is bounded to 4096), so a long write's per-lesson
-lines may be cut in the **condition message** — the Job log carries the
-full summary.
+termination message is bounded to 4096), so a long write is cut in the
+**condition message**. The counts line (`summary: total=…`) is the last
+line of the summary, so it is usually the first thing lost: if the
+condition message has no `summary:` line, read the Job log, which carries
+the full summary.
 
 ### The caps
 
@@ -371,15 +373,18 @@ the cap and the first omitted file name.
 
 - **`kubectl cox describe <loop>`** (or `kubectl get loop <loop> -o
   yaml`): the `MemoryWriteDone` condition and its reason/message (the
-list above), plus the `memory write audit` Event on a successful
-write (the operator emits it once per Loop, on the condition's
-transition to the recorded reason).
+  list above). `cox describe` shows conditions only, not Events.
+- **The `memory write audit` Event** (emitted once per Loop, on the
+  condition's transition to the recorded reason): `kubectl get events
+  --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>`
+  or `kubectl describe loop <loop>`.
 - **The memory-writer Job log**: `kubectl logs -n <loop-ns>
   job/<loop>-memory-write-<iteration>`. The Job writes the
   same bounded summary to stdout as to its termination message, so the
   log carries the **full** per-lesson audit when the condition message's
-  1000-byte copy is truncated. The summary never contains lesson text
-  (only the 12-hex SHA prefix per lesson).
+  1000-byte copy is truncated. The per-lesson lines carry only the
+  12-hex SHA prefix for the lesson itself; a curator reason may quote the
+  lesson (see above).
 - **The runner's log**: the `memory section truncated` warning when the
   shared-memory prompt section hits its 16 KiB cap.
 

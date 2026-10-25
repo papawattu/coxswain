@@ -387,6 +387,19 @@ type VerifyStatus struct {
 	// and without the UID guard every reconcile would re-read that stale
 	// failed pod and burn another attempt (one flake burning every retry
 	// before a single retried Job runs).
+	//
+	// Reset rule for the attempt counters in this API (F48e; the same rule
+	// applies to status.agent.infraAttempts, whose boundaries are listed on
+	// that field): a count is ended only at an EPISODE BOUNDARY the operator
+	// decides on — here, a new pin (advancePhaseFromClaim zeroes the count and
+	// this UID guard when the verifiedCommit changes). It is NEVER ended
+	// because the counted object's UID changed: the operator's own retry
+	// recreates the object (a new verify Job, a new Sandbox), so a "the UID
+	// differs, reset" rule makes the bound unreachable by construction. That
+	// was the F6/F48b defect: the retry re-emitted "attempt 1 of 3" on every
+	// recreate and the bound never tripped. The UID guard has the OPPOSITE
+	// job: it stops a re-read of the SAME failed object from counting (and so
+	// from deleting it) twice.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	InfraAttempts int32 `json:"infraAttempts,omitempty"`

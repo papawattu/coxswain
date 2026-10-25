@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `a652bb6` = PR #262); each claim cites its
+merged code on `main` (as of `b729cf4` = PR #264); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -216,6 +216,12 @@ existing Loops are unaffected, but new ones are.
   read) is closed by this fix.
 
 ## Other changes
+
+### F83c: the tamper decision comes only from the verify Job's pod; an OOM-killed tamper check is an infrastructure failure — #264
+
+- **What was wrong.** The status-driven tamper gate that F83 kept could never fire, so the tamper decision had a second path that was dead code (F83c); and a tamper check container killed for running out of memory was a terminal `verifyTampered` failure instead of a retried infrastructure failure (F83c).
+- **What changed.** The dead status-driven tamper gate is deleted, and the verify Job's own pod is now the only tamper decision; a tamper check container killed for running out of memory is now a retried infrastructure failure, not a terminal 'tampered' failure (PR #264).
+- **On upgrade.** Nothing to do; the fix is in the operator (PR #264).
 
 ### F48d: `SandboxNotStarting` is saved, fires once, and clears; a bad image name fails at once — #262
 
@@ -540,9 +546,11 @@ alarm while the proxy pod is starting), F85 (the `cox describe` budget block
 reading a non-existent field), F48d and F48c (the `SandboxNotStarting`
 condition not saved at Verifying, and not cleared when the pod is gone),
 F46 (the unwired model timeout),
-and F83 (the unrecorded tamper evidence) were closed by #229, #222, #233,
-#234, #238, #243, #241, #244, #248, #254, #259, #260, #262, #252, and #258. In
-plain words, the items still open:
+F83 (the unrecorded tamper evidence), and F83c (the status-driven tamper
+gate that could never fire, and an OOM-killed tamper check reading as a
+terminal tampered failure) were closed by #229, #222, #233, #234, #238,
+#243, #241, #244, #248, #254, #259, #260, #264, #252, and #258. In plain
+words, the items still open:
 
 **P1 (security):**
 

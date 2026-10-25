@@ -769,8 +769,9 @@ The `NetworkEnforced=False` hold has its own section above
 
 ### `CheckpointEntryUntrusted` Warning Event on a Loop
 
-**What you see:** `kubectl get events` (or `kubectl cox describe`) shows a
-Warning Event on the Loop with reason `CheckpointEntryUntrusted` and a
+**What you see:** `kubectl get events --field-selector
+involvedObject.kind=Loop,involvedObject.name=<loop>` (or `kubectl describe
+loop <loop>`; `kubectl cox describe` shows conditions only) shows a Warning Event on the Loop with reason `CheckpointEntryUntrusted` and a
 message like:
 
 ```
@@ -778,8 +779,9 @@ status.checkpoints entry "checkpoint-other-loop-iter-7" is not a checkpoint
 of this Loop; dropped without deleting anything
 ```
 
-The Loop's `status.checkpoints` entry that named that snapshot is removed
-from the status on the next reconcile. No snapshot is deleted.
+The `status.checkpoints` entry that named that snapshot is removed from the
+status when the retention GC next runs over it (after a checkpoint is
+taken), not necessarily on the next reconcile. No snapshot is deleted.
 
 **What it means:** a `status.checkpoints` entry named a VolumeSnapshot that
 the operator did not write for this Loop. `status` is user-writable

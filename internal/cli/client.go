@@ -68,24 +68,26 @@ func (d *dynamicLoopClient) Create(ctx context.Context, obj runtime.Object) erro
 	return err
 }
 
-// Patch applies a JSON merge patch to the named Loop's main resource.
-// (The CLI's commands patch only the main resource — spec.suspend and
-// metadata.annotations. The subresource parameter is accepted for interface
-// stability but is not used by the CLI's commands today.)
+// Patch applies a JSON merge patch to the named Loop. The subresource is ""
+// for the main resource (spec.suspend, metadata.annotations) and "status"
+// for the status subresource (the approve/reject conditions — F87).
 func (d *dynamicLoopClient) Patch(ctx context.Context, name, subresource string, patch []byte) error {
-	_, err := d.c.Resource(loopGVR).Namespace(d.ns).Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
+	_, err := d.c.Resource(loopGVR).Namespace(d.ns).Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{}, subresource)
 	return err
 }
 
-// Update writes the whole object (used to set annotations / spec.suspend).
-// Update writes the whole object. The Loop CRD has a status subresource, and the
-// CLI's commands (approve/reject) write status.conditions. A main-resource Update
-// does NOT persist status (the server resets status to the live value); a
-// status-subresource PUT is rejected for a bare-status body ("must be of type Loop:
-// Kind is missing"). The verified working path (the kind cluster: a full-object PUT
-// to /status returns 200 and persists the condition) is a whole-object PUT to the
-// status subresource. The CLI therefore sends the whole object (kind + status) to
-// the status subresource.
+// Update writes the whole object to the status subresource. Nothing in the CLI
+// uses it for approvals any more (F87 moved cox approve/reject to a merge patch
+// of status.conditions, see approval.go); it is kept because the LoopClient
+// interface still offers it and `fork`'s spec must keep proving it does NOT go
+// through Update.
+//
+// The pre-F87 history of this method: a main-resource Update does not persist
+// status (the server resets it), and a bare-status body to the status
+// subresource is rejected ("must be of type Loop: Kind is missing"), so a
+// whole-object PUT to /status was the only working write — a kind experiment
+// recorded that it returns 200 and persists the condition. That experiment is
+// retired: a merge patch of status.conditions is the write path.
 func (d *dynamicLoopClient) Update(ctx context.Context, obj runtime.Object) error {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {

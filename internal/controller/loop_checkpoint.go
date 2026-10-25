@@ -164,10 +164,10 @@ func checkpointNameShapeOK(loop *coxv1alpha1.Loop, cp coxv1alpha1.CheckpointStat
 // checkpointEntryTrusted (F47) decides whether a status.checkpoints entry may
 // be ACTED ON (deleted, used as a restore source, or trusted to suppress a
 // checkpoint at its iteration). status is writable by anyone bound to the
-// editor role (cox approve/reject PUT /status), so the operator must not treat
-// a name read from it as one it wrote: it must have the shape checkpointName
-// produces for this Loop AND name a VolumeSnapshot labelled for this Loop
-// (newVolumeSnapshotObj sets loopLabelKey).
+// editor role (cox approve/reject write /status), so the operator must not
+// treat a name read from it as one it wrote: it must have the shape
+// checkpointName produces for this Loop AND name a VolumeSnapshot labelled
+// for this Loop (newVolumeSnapshotObj sets loopLabelKey).
 func (r *LoopReconciler) checkpointEntryTrusted(ctx context.Context, loop *coxv1alpha1.Loop, cp coxv1alpha1.CheckpointStatus) checkpointTrust {
 	if !checkpointNameShapeOK(loop, cp) {
 		return checkpointForeign

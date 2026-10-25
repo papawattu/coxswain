@@ -40,10 +40,12 @@ chart's rendered output).
 ## Driving Manual-mode approvals with the cox CLI (rbac.helpers.enabled)
 
 `cox approve <loop>` and `cox reject <loop> --reason <reason>` read the Loop
-with `get` and set the PlanApproved / PlanRejected conditions on its
-`loops/status` subresource. Both also read `PLAN.md` from the workspace
-through a short-lived peek pod (`internal/cli/workspace.go`), so the user
-needs pod RBAC in the Loop's namespace as well. The chart installs no
+with `get` and patch its `loops/status` subresource with the PlanApproved /
+PlanRejected conditions (a JSON merge patch of `status.conditions`; `cox
+approve`/`reject` no longer write the whole object back). Both also read
+`PLAN.md` from the workspace through a short-lived peek pod
+(`internal/cli/workspace.go`), so the user needs pod RBAC in the Loop's
+namespace as well. The chart installs no
 user-facing role by default (the operator's own role grants these to its
 ServiceAccount, not to you), so a human driving Manual-mode approvals
 (`approval.mode: Manual`) needs both:
@@ -71,14 +73,12 @@ ServiceAccount, not to you), so a human driving Manual-mode approvals
   a Role in the Loop's namespace granting `create`, `get`, `delete` on `pods`
   and `get` on `pods/log`.
 
-- or create your own Role/ClusterRole with: `get` on `loops`, `update` on
+- or create your own Role/ClusterRole with: `get` on `loops`, `patch` on
   `loops/status`, and the pod rules above (the minimum `cox approve` /
-  `cox reject` need today; the CLI writes status with a whole-object PUT, so
-  `update` is the verb it is authorized by — F87(d) moves it to a status merge
-  patch, which needs `patch` too). A role with only `patch` on `loops` is NOT
-  enough: the API server answers Forbidden on `loops/status`, and `cox
-  approve` fails at `create peek pod` without the pod rules. (`cox pause` /
-  `cox resume` use `patch` on `loops`, a separate verb.)
+  `cox reject` need). A role with only `patch` on `loops` is NOT enough — it
+  is a different resource: the API server answers Forbidden on
+  `loops/status`, and `cox approve` fails at `create peek pod` without the pod
+  rules. (`cox pause` / `cox resume` use `patch` on `loops`, a separate verb.)
 
 Without such a binding, `cox approve`/`reject` are rejected by the API
 server. The operator is unaffected: Auto-mode Loops advance without any

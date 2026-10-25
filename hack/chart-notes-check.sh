@@ -19,10 +19,11 @@
 #  4. they carry both forms — `--role=` and `--clusterrole=` — because
 #     rbac.namespaced renders a Role or a ClusterRole.
 #
-# Deliberately NOT asserted: the write's verb. F87(d) changes it from a
-# whole-object status PUT to a status merge patch, so a guard that pinned
-# `update` (or banned `PATCH`) would make the next correct sentence fail and
-# invite a doc reword away from the truth.
+# Deliberately NOT asserted: the write's verb. F87(d) changed it from a
+# whole-object status PUT to a status merge patch (`patch` on loops/status), and
+# a guard that pinned either verb would have had to be reworded to stay green —
+# which is how a doc ends up teaching a write the CLI no longer makes. The
+# stable claims are the subresource and the conditions.
 #
 # Template SYNTAX is not this guard's job and does not need one: `helm lint`
 # parses NOTES.txt and exits 1 on a broken action (verified: a broken

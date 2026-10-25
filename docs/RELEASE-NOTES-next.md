@@ -240,6 +240,12 @@ existing Loops are unaffected, but new ones are.
 - **What changed.** The dead status-driven tamper gate is deleted, and the verify Job's own pod is now the only tamper decision; a tamper check container killed for running out of memory is now a retried infrastructure failure, not a terminal 'tampered' failure (PR #264).
 - **On upgrade.** Nothing to do; the fix is in the operator (PR #264).
 
+### F83d: the tamper record no longer outlives the run it belongs to — #274
+
+- **What was wrong.** The tamper record (exit code, verified commit, Job UID) survived into the next run, so a delivered PR body could still show the previous run's tamper result after a new verify run had started; a verify-infrastructure failure message printed only the exit code (137) without the kubelet's reason; and the CRD field docs promised a pin-vs-evidence comparison that F83c deleted (F83d).
+- **What changed.** The tamper record is cleared when a new verify run starts, so a delivered PR body no longer shows the previous run's result; a verify-infrastructure failure message now carries the kubelet's reason (for example `OOMKilled`); and the CRD field docs for the verify status fields are corrected to what the code actually does (PR #274).
+- **On upgrade.** Nothing to do beyond the new CRD — the doc-text change is picked up by a standard install (PR #274).
+
 ### F48d: `SandboxNotStarting` is saved, fires once, and clears; a bad image name fails at once — #262
 
 - **What was wrong.** During Verifying, the `SandboxNotStarting` condition was not saved, so its Warning Event fired on every reconcile (F48d); the condition was also not cleared when the pod or its Sandbox is gone (F48c); and a bad image name (`InvalidImageName`) waited forever instead of failing the sandbox start (F48d).
@@ -576,7 +582,9 @@ block reading a non-existent field, #260), F88 (the wall-clock line missing from
 the pod is gone, #262), F46 (the unwired model timeout, #252), F83 (the
 unrecorded tamper evidence, #258), F83c (the status-driven tamper gate
 that could never fire, and an OOM-killed tamper check reading as a terminal
-tampered failure, #264), F48b (the sandbox pod stuck on an unmountable
+tampered failure, #264), F83d (the tamper record outliving the run it
+belonged to, and a verify-infrastructure failure message without the kubelet's
+reason, #274), F48b (the sandbox pod stuck on an unmountable
 volume, and the infra-retry bound that never tripped, #266), and F48g (the
 sandbox-failure count that outlived the run it belonged to, #269), and F89
 (a sandbox failure with no kubelet reason that wedged the whole status

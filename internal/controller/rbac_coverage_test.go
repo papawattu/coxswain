@@ -67,6 +67,14 @@ var knownResourceGroup = map[string]string{
 	"services":               coreGroup,
 	"configmaps":             coreGroup,
 	"persistentvolumeclaims": coreGroup,
+	// events is core/v1. The trap is events.k8s.io: it is a DIFFERENT group, an
+	// RBAC rule on one does not grant the other, and the operator reads the
+	// same objects the kubelet and its own Recorder write (corev1.Event), so the
+	// marker's group must be "". This entry is explicit because the default
+	// would be right by luck, and a default-correct entry is not a guard (the
+	// B1 storageclasses P1 was exactly a marker and a test agreeing on the
+	// wrong group).
+	"events": coreGroup,
 	// non-core
 	"storageclasses":        storageGroup,
 	"sandboxes":             agentsGroup,
@@ -190,6 +198,15 @@ func TestRBACCoverage(t *testing.T) {
 		// client (loop_controller.go r.Get).
 		{group: "", resource: "persistentvolumeclaims",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
+		// Events (F48b): the sandbox pod's own FailedMount / FailedAttachVolume
+		// Events are the only place the kubelet reports a volume it cannot
+		// mount — the read is a namespaced List through the uncached apiReader
+		// (sandboxMountFailureEvent), so get;list is the grant it uses and no
+		// watch is needed (no informer). The create;patch half is the Recorder
+		// (the Events the operator emits); minVerbs keeps both halves honest, so
+		// a get;list-only rewrite of the marker fails here.
+		{group: "", resource: "events",
+			minVerbs: []string{verbGet, verbList, verbCreate, verbPatch}},
 		// ServiceAccounts: the operator ensures the memory-writer Job's
 		// dedicated ServiceAccount in the Loop's namespace
 		// (ensureMemoryWriterServiceAccount, loop_memory_writer_job.go — the

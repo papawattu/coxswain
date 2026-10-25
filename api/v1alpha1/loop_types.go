@@ -1308,7 +1308,12 @@ const (
 	// Pending for several minutes with no container started (e.g. a Secret
 	// volume whose Secret does not exist: the kubelet reports it only as a
 	// FailedMount Event). It returns to False once the pod starts. Surfacing
-	// only: it does not fail the Loop.
+	// only: it does not fail the Loop. Since F48b the volume case is bounded:
+	// a FailedMount / FailedAttachVolume / FailedMapVolume Event on the pod
+	// past sandboxMountGrace counts as a sandbox infra failure (AgentFailed=True
+	// with the kubelet's reason, retried sandboxInfraRetries times, then
+	// Failed:SandboxFailed). A wedge that produces no such Event is still only
+	// surfaced here.
 	SandboxNotStartingCondition = "SandboxNotStarting"
 	// BudgetReadingStaleCondition (F44) is True while the operator cannot
 	// read the model proxy's usage endpoint (consecutive failures at or past

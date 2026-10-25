@@ -570,6 +570,14 @@ requests and stale usage reads) were closed by #229, #222, #233, #234,
   doesn't.
 - **F61**: sample agent-policy files are not shipped.
 
+- **F83**: delivered PR bodies say "no tamper evidence" even when the
+  tamper check passed, because the tamper exit code is never recorded
+  (tamper failures are still caught and still fail the Loop).
+- **F84**: the `BudgetReadingStale` condition can raise a false alarm
+  while the model proxy pod is still starting up.
+- **F85**: `cox describe`'s budget block misses the new usage-read fields
+  (`lastUsageReadAt`, `consecutiveReadFailures`).
+
 **Waiting on owner decisions (not builder tasks):**
 
 - a precondition before the operator mounts a named Secret and presents it

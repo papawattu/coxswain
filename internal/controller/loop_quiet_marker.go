@@ -82,8 +82,7 @@ func quietMarkerNotifiedAt(value string) (time.Time, bool) {
 
 // markAndSurfaceQuietly emits m.reason as a Warning Event on the Loop at most
 // once per m.quiet window, and records the emission time in the operator-owned
-// annotation m.key. It returns true when this pass emitted (and marked) the
-// Event.
+// annotation m.key.
 //
 // The marker value is a TIME, not a bool (F48f): a condition that persists
 // re-announces once per window instead of going silent when its Event expires
@@ -93,10 +92,10 @@ func quietMarkerNotifiedAt(value string) (time.Time, bool) {
 // Best-effort: a failed annotation patch never blocks the reconcile (the
 // caller's decision or condition path is unaffected), it just means the Event
 // may repeat on the next pass.
-func (r *LoopReconciler) markAndSurfaceQuietly(ctx context.Context, loop *coxv1alpha1.Loop, m quietMarker) bool {
+func (r *LoopReconciler) markAndSurfaceQuietly(ctx context.Context, loop *coxv1alpha1.Loop, m quietMarker) {
 	now := r.operatorNow()
 	if at, ok := quietMarkerNotifiedAt(loop.Annotations[m.key]); ok && now.Sub(at) < m.quiet {
-		return false
+		return
 	}
 	if r.Recorder != nil {
 		r.Recorder.Eventf(loop, corev1.EventTypeWarning, m.reason, "%s", m.message)
@@ -111,7 +110,7 @@ func (r *LoopReconciler) markAndSurfaceQuietly(ctx context.Context, loop *coxv1a
 	patched.Annotations[m.key] = notified
 	if err := r.Patch(ctx, patched, client.MergeFrom(loop.DeepCopy())); err != nil {
 		logf.FromContext(ctx).Error(err, "mark quiet-window Event notified", "loop", loop.Name, "annotation", m.key)
-		return false
+		return
 	}
 	if loop.Annotations == nil {
 		loop.Annotations = make(map[string]string)
@@ -129,8 +128,7 @@ func (r *LoopReconciler) markAndSurfaceQuietly(ctx context.Context, loop *coxv1a
 		if !apierrors.IsNotFound(gerr) {
 			logf.FromContext(ctx).Error(gerr, "re-get Loop after the quiet-window Event mark", "loop", loop.Name)
 		}
-		return true
+		return
 	}
 	loop.ResourceVersion = fresh.ResourceVersion
-	return true
 }

@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `b729cf4` = PR #264); each claim cites its
+merged code on `main` (as of `74d4a03` = PR #265); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -247,6 +247,8 @@ existing Loops are unaffected, but new ones are.
 - **What was wrong.** The budget's usage read counted a model-proxy pod that is starting or not yet up (no pod yet, or no pod IP yet) as a *failed* read, so a normally starting proxy pod burned consecutive failed reads until `BudgetReadingStale` raised a false alarm (F84), and the stale message claimed a "last successful reading" that had never happened (PR #259).
 - **What changed.** A proxy pod that is starting or not yet up is now a **no reading** (`ErrNotReady`) with a start-up grace, not a failed read: the consecutive-read-failure counter is not burned while the proxy is coming up. While the model proxy holds the sandbox's model access, a new `ModelProxyNotReady` condition says when it is holding, with one Warning Event on the transition (not per reconcile) — the silent no-op is no longer invisible. The stale-reading message no longer claims a last reading that never happened, and the no-endpoint `MeteringDegraded` / `BudgetReadingStale` conditions are now cleared on recovery (PR #259).
 - **On upgrade.** Nothing to do; the fix is in the operator (PR #259).
+
+F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop reaches Failed or Succeeded, and a proxy pod that could not be read is no longer reported as not existing. Nothing to do on upgrade.
 
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
@@ -542,15 +544,19 @@ merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
 lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
 curator failure), F43 (the agent-chosen pin), F44 (surfacing unmetered
 requests and stale usage reads), F47 (untrusted checkpoint status entries), F84 (the `BudgetReadingStale` false
-alarm while the proxy pod is starting), F85 (the `cox describe` budget block
+alarm while the proxy pod is starting), F84b (the `ModelProxyNotReady`
+condition sticking at a terminal phase, and a failed proxy read reported as a
+missing pod), F85 (the `cox describe` budget block
 reading a non-existent field), F48d and F48c (the `SandboxNotStarting`
 condition not saved at Verifying, and not cleared when the pod is gone),
 F46 (the unwired model timeout),
-F83 (the unrecorded tamper evidence), and F83c (the status-driven tamper
+F83 (the unrecorded tamper evidence), F83c (the status-driven tamper
 gate that could never fire, and an OOM-killed tamper check reading as a
-terminal tampered failure) were closed by #229, #222, #233, #234, #238,
-#243, #241, #244, #248, #254, #259, #260, #264, #252, and #258. In plain
-words, the items still open:
+terminal tampered failure), and F84b (the `ModelProxyNotReady` condition
+sticking at a terminal phase, and a failed proxy read reported as a missing
+pod) were closed by #229, #222, #233, #234, #238, #243, #241, #244, #248,
+#254, #259, #260, #264, #265, #252, and #258. In plain words, the items still
+open:
 
 **P1 (security):**
 

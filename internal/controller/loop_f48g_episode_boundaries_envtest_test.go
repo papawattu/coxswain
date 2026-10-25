@@ -529,7 +529,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 type f48hLogSink struct{ msgs *[]string }
 
 func (s *f48hLogSink) Init(logr.RuntimeInfo) {}
-func (s *f48hLogSink) Enabled(int) bool     { return true }
+func (s *f48hLogSink) Enabled(int) bool      { return true }
 func (s *f48hLogSink) Info(_ int, msg string, kv ...any) {
 	*s.msgs = append(*s.msgs, f48hLogLine(msg, kv))
 }
@@ -548,4 +548,4 @@ func f48hLogLine(msg string, kv []any) string {
 	return msg + " " + strings.Join(parts, " ")
 }
 func (s *f48hLogSink) WithValues(...any) logr.LogSink { return s }
-func (s *f48hLogSink) WithName(string) logr.LogSink  { return s }
+func (s *f48hLogSink) WithName(string) logr.LogSink   { return s }

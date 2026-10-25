@@ -19,11 +19,12 @@
 //     per lesson, named by the trimmed lesson's sha256 — the dedup key; the
 //     `lesson-<n>` in the audit lines is the 1-based input index, not the
 //     file name);
-//  4. reports a BOUNDED summary to stdout (well under 4096 bytes — the
-//     termination message cap): the counts (total / written / dropped), plus
-//     one line per lesson with its sha256-prefix, written|dropped, and the
-//     rule. NEVER the lesson text (a lesson that failed the secrets screen
-//     must not be echoed into the Job's logs / termination message).
+//  4. reports a summary to stdout and the termination message: the counts
+//     (total / written / dropped), plus one line per lesson with its
+//     sha256-prefix, written|dropped, and the rule. A lesson that failed the
+//     secrets screen is never echoed, but a curator reason is free model text
+//     and may quote a kept lesson. (The summary is not size-bounded here;
+//     the termination message is capped at 4096 bytes by Kubernetes: F80.)
 //
 // Exit 0 on success (the write completed, whether or not any lesson was
 // eligible — a zero-eligible write is a valid "nothing to write"); exit
@@ -615,16 +616,6 @@ func shaPrefix(lesson string) string {
 	sum := sha256.Sum256([]byte(lesson))
 	return hex.EncodeToString(sum[:])[:shaPrefixLen]
 }
-
-// printSummary emits one line per lesson (the bounded per-lesson record):
-//
-//	lesson-<n> <sha256-prefix> written|dropped <rule>
-//
-// The rule is the drop reason for a dropped lesson (a survivor's rule is
-// "eligible"). NEVER the lesson text. The lines are in input order (n is
-// the 1-based input index, so a dropped lesson's n is its input position,
-// not the written file's n — the written-file n is only assigned to
-// survivors, in survivor order).
 
 // summaryLine is the final bounded summary line (the counts): the operator
 // parses this from the termination message.

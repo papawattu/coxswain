@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# F54 / ADR-0006:95-99 "evil agent" e2e. Runs the 15 probes of
+# F54 / ADR-0006:95-99 "evil agent" e2e. Runs the probes of
 # test/e2e/evil-probes.sh against a REAL agent pod, each paired with a positive
 # control, for two Loop variants:
 #   (a) a model endpoint present: the real runner, driven by a hostile model

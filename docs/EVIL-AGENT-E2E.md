@@ -8,7 +8,7 @@ anything the repo does not provide is marked **not in the repo yet** or
 
 ## What the test proves
 
-The harness runs 16 distinct probes: probes 1-9, 11 (twice — git-push and
+The harness runs 16 probe runs (15 probe numbers; probe 11 runs twice): probes 1-9, 11 (twice — git-push and
 git-credential, the "11b" group), 12 and 13 inside the agent container,
 and probes 10, 14 and 15 from the host side. The harness asserts 14 probe
 numbers for variant (b) and 12 for variant (a) in its `expect` lists

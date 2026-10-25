@@ -22,7 +22,7 @@
 // now - that time against the window. These specs pin the value and the window
 // on the verify surface; the sandbox surface's value assertion is in
 // loop_f48b_mount_envtest_test.go ("runs the trailing status write after the
-// one-shot annotation patch"), and both surfaces now run the same helper
+// marker patch"), and both surfaces now run the same helper
 // (loop_quiet_marker.go).
 package controller
 

@@ -1556,6 +1556,19 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 			message = podMsg
 		}
 	}
+	// F89: ContainerStateTerminated.Reason is OPTIONAL in the API. An empty
+	// value here would reach setCondition, and the CRD requires a condition
+	// reason (minLength 1), so the API server rejects the WHOLE status write:
+	// AgentFailed never persists and neither does status.agent.infraAttempts
+	// (mutated by applySandboxFailure just before the shared write), so the
+	// dedupe never engages, the bounded retry never exhausts, and the Loop
+	// recreates the sandbox forever. Use the same pod-level default
+	// podStatusMessage falls back to when the kubelet said nothing (the
+	// message builder already tolerates an empty reason —
+	// sandboxFailureMessage).
+	if reason == "" {
+		reason = podFailedReason
+	}
 	return &sandboxFailure{
 		sandboxUID: sb.UID,
 		container:  agent.Name,

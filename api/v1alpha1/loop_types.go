@@ -1354,7 +1354,8 @@ const (
 	// claim — the silent-Planning wedge F6 fixes). The condition's reason is
 	// the pod's failure reason (Evicted / OOMKilled / Error / … — the
 	// pod.status.reason / pod condition reason when set, falling back to the
-	// container's termination reason) and its message carries the kubelet
+	// container's termination reason; `PodFailed` when the kubelet recorded
+	// neither — F89) and its message carries the kubelet
 	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi").
 	// F48: it is also set, with reason CreateContainerConfigError, when a
 	// container NEVER STARTED because the kubelet could not configure it; the

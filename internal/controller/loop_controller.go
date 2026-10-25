@@ -5422,7 +5422,28 @@ func (r *LoopReconciler) ensureNetPoliciesIfConfigured(ctx context.Context, loop
 // is a string (a terminal phase like "Failed", or a non-phase condition type
 // like "PolicyEnforced" or "PolicyValid"). It is the operator's audit record
 // (ADR-0004); the runner never writes it.
+// conditionReasonUnknown is the reason setCondition substitutes when a caller
+// passes an empty one (F89). metav1.Condition requires a non-empty reason (the
+// CRD's minLength 1 + CamelCase pattern), and a rejected status update loses the
+// WHOLE write, not just the condition.
+const conditionReasonUnknown = "Unknown"
+
 func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
+	// F89: a condition reason is REQUIRED by the CRD (minLength 1 + the
+	// CamelCase pattern), and a rejected status update loses MORE than the
+	// condition — it loses the whole write, including counters the caller just
+	// mutated (that is F89: an empty kubelet termination reason lost
+	// status.agent.infraAttempts, so the bounded retry never exhausted).
+	// Fix the source when you can (sandboxFailure defaults its reason); this
+	// keeps a future caller from losing a status write outright. The substitute
+	// is self-describing in the object (`cox describe` prints
+	// `reason=Unknown`) rather than a plausible-looking cause, so a caller's
+	// bug is not misattributed to a pod failure. Non-empty values are NOT
+	// sanitised: the CRD pattern accepts every kubelet reason in use, and a
+	// regexp guard would rewrite the kubelet's own evidence.
+	if reason == "" {
+		reason = conditionReasonUnknown
+	}
 	now := metav1.Now()
 	for i := range loop.Status.Conditions {
 		if loop.Status.Conditions[i].Type == condType {

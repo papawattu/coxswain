@@ -1288,70 +1288,24 @@ func eventTimestamp(ev *corev1.Event) time.Time {
 	}
 }
 
-// sandboxEventsNotifiedAt reads the unreadable-Events marker value: the time of
-// the last Warning Event (F48f), or ok=false when the marker is absent or is not
-// a time. Both of those mean "not recently notified", so nothing is ever muted
-// forever — a pre-F48f `true` marker, or garbage, simply announces once and is
-// rewritten as a time.
-func sandboxEventsNotifiedAt(value string) (time.Time, bool) {
-	if value == "" {
-		return time.Time{}, false
-	}
-	at, err := time.Parse(time.RFC3339, value)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return at, true
-}
-
 // surfaceEventsUnreadable (F48b, F48f) makes a failed Events read visible
 // (R26 I90) with a Warning Event: the mount-failure bound is blind while the
 // read fails, so the Loop falls back to F48's surfacing — that degradation must
-// not be silent. The operator-owned marker is the last Event's TIME (RFC3339,
-// the memoryPVCUnboundNotified pattern re-armed per F48f §F3): a repeat inside
-// sandboxEventsUnreadableQuiet emits nothing, and a failure that persists past
-// it announces again, so neither a transient nor a permanent read failure can
-// mute the surface. Best-effort: a failed annotation patch never blocks the
-// reconcile (the condition path is unaffected).
+// not be silent. The gate (one Event per sandboxEventsUnreadableQuiet, marked
+// on the Loop as the last Event's time) is the shared quiet-window helper
+// (F83f, markAndSurfaceQuietly): a repeat inside the window emits nothing, and
+// a failure that persists past it announces again, so neither a transient nor
+// a permanent read failure can mute the surface. Best-effort: a failed
+// annotation patch never blocks the reconcile (the condition path is
+// unaffected).
 func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv1alpha1.Loop, cause error) {
 	logf.FromContext(ctx).Error(cause, "sandbox pod Events read failed; no mount-failure decision (the Loop is back to surfacing only)", "loop", loop.Name)
-	now := r.operatorNow()
-	if at, ok := sandboxEventsNotifiedAt(loop.Annotations[sandboxEventsUnreadableAnnotation]); ok &&
-		now.Sub(at) < sandboxEventsUnreadableQuiet {
-		return
-	}
-	if r.Recorder != nil {
-		r.Recorder.Eventf(loop, corev1.EventTypeWarning, sandboxEventsUnreadableReason,
-			"the sandbox pod's events could not be read (%v); a pod that cannot mount its volumes is not bounded until this works", cause)
-	}
-	// Patch a COPY (a full Update would write the server's stale status back
-	// into `loop`, dropping this reconcile's conditions — the S4/S6 lesson).
-	notified := now.UTC().Format(time.RFC3339)
-	patched := loop.DeepCopy()
-	if patched.Annotations == nil {
-		patched.Annotations = make(map[string]string)
-	}
-	patched.Annotations[sandboxEventsUnreadableAnnotation] = notified
-	if err := r.Patch(ctx, patched, client.MergeFrom(loop.DeepCopy())); err != nil {
-		logf.FromContext(ctx).Error(err, "mark sandbox events unreadable notified", "loop", loop.Name)
-		return
-	}
-	if loop.Annotations == nil {
-		loop.Annotations = make(map[string]string)
-	}
-	loop.Annotations[sandboxEventsUnreadableAnnotation] = notified
-	// Refresh the caller's resourceVersion (the patch bumped it) exactly as
-	// markMemoryPVCUnboundNotified does (loop_p5a_memory.go): this reconcile's
-	// trailing Status().Update sends loop's RV, and a stale one is a 409
-	// conflict — a lost pass, an error log and the conditions set earlier in
-	// the pass only persisted on the requeue. The caller's in-memory status is
-	// intact (the patch was on a copy).
-	fresh := &coxv1alpha1.Loop{}
-	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil && !apierrors.IsNotFound(gerr) {
-		logf.FromContext(ctx).Error(gerr, "re-get Loop after the sandbox events unreadable mark", "loop", loop.Name)
-		return
-	}
-	loop.ResourceVersion = fresh.ResourceVersion
+	r.markAndSurfaceQuietly(ctx, loop, quietMarker{
+		key:     sandboxEventsUnreadableAnnotation,
+		quiet:   sandboxEventsUnreadableQuiet,
+		reason:  sandboxEventsUnreadableReason,
+		message: fmt.Sprintf("the sandbox pod's events could not be read (%v); a pod that cannot mount its volumes is not bounded until this works", cause),
+	})
 }
 
 // clearSandboxInfraEpisode ends a sandbox infra failure episode early (F48b,

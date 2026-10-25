@@ -1848,47 +1848,21 @@ func foreignVerifyJob(job *batchv1.Job, loop *coxv1alpha1.Loop) bool {
 // surfaceForeignVerifyJob makes a foreign verify Job visible (R26 I90: a
 // fallback must show its failure, never degrade silently): the Loop holds at
 // Verifying with no decision, so without the Event the wedge would look like a
-// stuck reconcile. Transition-gated by the verifyJobForeignAnnotation marker
-// (last-notified time), so a condition that persists re-announces once per
-// verifyJobForeignQuiet. Best-effort: a failed patch never blocks the reconcile.
+// stuck reconcile. Transition-gated by the shared quiet-window helper (F83f,
+// markAndSurfaceQuietly) on the verifyJobForeignAnnotation marker (last-notified
+// time), so a condition that persists re-announces once per
+// verifyJobForeignQuiet. Best-effort: a failed patch never blocks the
+// reconcile.
 func (r *LoopReconciler) surfaceForeignVerifyJob(ctx context.Context, loop *coxv1alpha1.Loop) {
 	logf.FromContext(ctx).Info("verify Job with this Loop's name is not owned by the Loop; refusing to adopt, delete or trust it",
 		"loop", loop.Name, "job", verifyJobName(loop))
-	now := r.operatorNow()
-	if at, ok := sandboxEventsNotifiedAt(loop.Annotations[verifyJobForeignAnnotation]); ok &&
-		now.Sub(at) < verifyJobForeignQuiet {
-		return
-	}
-	if r.Recorder != nil {
-		r.Recorder.Eventf(loop, corev1.EventTypeWarning, verifyJobForeignEventReason,
-			"the Job %s is not owned by this Loop (ownerReference missing or names another object); refusing to adopt, delete or trust it",
-			verifyJobName(loop))
-	}
-	notified := now.UTC().Format(time.RFC3339)
-	patched := loop.DeepCopy()
-	if patched.Annotations == nil {
-		patched.Annotations = make(map[string]string)
-	}
-	patched.Annotations[verifyJobForeignAnnotation] = notified
-	if err := r.Patch(ctx, patched, client.MergeFrom(loop.DeepCopy())); err != nil {
-		logf.FromContext(ctx).Error(err, "mark verify job foreign notified", "loop", loop.Name)
-		return
-	}
-	if loop.Annotations == nil {
-		loop.Annotations = make(map[string]string)
-	}
-	loop.Annotations[verifyJobForeignAnnotation] = notified
-	// Refresh the caller's resourceVersion (the patch bumped it), as the F48f
-	// sandbox marker does: this reconcile's trailing Status().Update sends
-	// loop's RV, and a stale one is a 409.
-	fresh := &coxv1alpha1.Loop{}
-	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil {
-		if !apierrors.IsNotFound(gerr) {
-			logf.FromContext(ctx).Error(gerr, "re-get Loop after the verify job foreign mark", "loop", loop.Name)
-		}
-		return
-	}
-	loop.ResourceVersion = fresh.ResourceVersion
+	r.markAndSurfaceQuietly(ctx, loop, quietMarker{
+		key:    verifyJobForeignAnnotation,
+		quiet:  verifyJobForeignQuiet,
+		reason: verifyJobForeignEventReason,
+		message: fmt.Sprintf("the Job %s is not owned by this Loop (ownerReference missing or names another object); refusing to adopt, delete or trust it",
+			verifyJobName(loop)),
+	})
 }
 
 // jobCondition returns the Job's batch condition of the given type (nil when

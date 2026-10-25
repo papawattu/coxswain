@@ -266,7 +266,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(f).To(BeNil(), "a superseded FailedMount must not burn a retry")
 	})
 
-	It("runs the trailing status write after the one-shot annotation patch (the resourceVersion is refreshed)", func() {
+	It("runs the trailing status write after the marker patch (the resourceVersion is refreshed)", func() {
 		loop, pod, clock, offset, rec := plant("f48brv")
 		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
 		*offset = sandboxMountGrace + time.Minute
@@ -307,7 +307,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(f).To(BeNil(), "and never a failure decision (I49)")
 		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(Equal(1), "the blindness is visible (R26 I90)")
 
-		By("a second pass emits no second Event (the one-shot annotation)")
+		By("a second pass emits no second Event (the quiet-window marker)")
 		f, err = r.sandboxFailure(ctx, loop)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(f).To(BeNil())

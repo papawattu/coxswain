@@ -599,8 +599,7 @@ The agent did not tamper; the check could not run.
 ### `PinNotDescendant` — the verify Job refused the pinned commit (F43)
 
 **What you see:** the Loop ends `Failed` with reason `PinNotDescendant`
-(a single terminal Warning Event, no retries), plus a `Warning` Event of
-the same reason naming both commits:
+(ONE terminal Warning Event, no retries; the message names both commits):
 
 ```
 the pinned commit <sha> is not a descendant of baseCommit <sha>; failing the Loop
@@ -632,10 +631,11 @@ never built in this Loop is refused. (The tamper diff is tree-to-tree and
 cannot catch this: an unchanged pre-existing tree reads as clean.)
 
 **What to do:**
-- `kubectl cox describe` the Loop: compare `status.baseCommit` and
-  `status.currentVerify.verifiedCommit`, and `git merge-base
-  --is-ancestor <base> <pin>` in a clone of the repo to confirm the
-  refusal.
+- `kubectl cox describe` the Loop: compare the `Base commit:` and `Verified:`
+  lines (the abbreviated `status.baseCommit` and
+  `status.currentVerify.verifiedCommit`; `-o yaml` has the full SHA), and
+  `git merge-base --is-ancestor <base> <pin>` in a clone of the repo to
+  confirm the refusal.
 - If the pin is honest (the agent really ended there), the workspace
   likely diverged from base (a reset, a branch checkout, a rebase onto
   something else): fix the Loop's starting point and re-run.
@@ -659,8 +659,10 @@ check runs: the agent's claimed work does not even sit on the Loop's base.
 
 **What you see:** `kubectl cox describe` shows the `MeteringDegraded` and/or
 `BudgetReadingStale` condition `True`, and/or Warning Events with reasons
-`UnmeteredRequests` or `UsageReadFailed`. `status.budget` may also carry a
-stale `lastUsageReadAt` and a non-zero `consecutiveReadFailures`.
+`UnmeteredRequests` or `UsageReadFailed`. `cox describe` prints the relevant
+facts as `unmetered:`, `lastRead:` and `readFails:` (from
+`status.budget.unmeteredRequests`, `lastUsageReadAt` and
+`consecutiveReadFailures`).
 
 **Background:** for a Loop with a model endpoint (`spec.agent.endpointSecretRef`),
 each reconcile the operator reads the Loop's model proxy's

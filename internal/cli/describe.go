@@ -51,6 +51,14 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 	if goal, ok := getNestedString(u, "spec", "goal"); ok {
 		w.printf("Goal:         %s\n", goal)
 	}
+	// F43/F85: the commit pin the verify evidence is measured against (they are
+	// what docs/TROUBLESHOOTING.md tells the operator to compare).
+	if bc, ok := getNestedString(u, "status", "baseCommit"); ok && bc != "" {
+		w.printf("Base commit:  %s\n", shortSHA(bc))
+	}
+	if vc, ok := getNestedString(u, "status", "currentVerify", "verifiedCommit"); ok && vc != "" {
+		w.printf("Verified:     %s\n", shortSHA(vc))
+	}
 
 	// Conditions (status.conditions[]).
 	conds, _ := getNestedSlice(u, "status", "conditions")
@@ -78,8 +86,29 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 	// Budget (status.budget).
 	if bmap, ok := getNestedMap(u, "status", "budget"); ok {
 		w.printf("\nBudget:\n")
-		if t, _ := bmap["tokens"].(float64); t > 0 {
+		// F85: status.budget has promptTokens/completionTokens, never a
+		// "tokens" field; the label is the sum (kept for a familiar output).
+		prompt := numberField(bmap, "promptTokens")
+		completion := numberField(bmap, "completionTokens")
+		if t := prompt + completion; t > 0 {
 			w.printf("  tokens:     %.0f\n", t)
+		}
+		if r := numberField(bmap, "requests"); r > 0 {
+			w.printf("  requests:   %.0f\n", r)
+		}
+		// F44's durable signal: requests forwarded without a usage object.
+		if n := numberField(bmap, "unmeteredRequests"); n > 0 {
+			w.printf("  unmetered:  %.0f\n", n)
+		}
+		if c, _ := bmap["costUsd"].(string); c != "" {
+			w.printf("  cost:       $%s\n", c)
+		}
+		if at, _ := bmap["lastUsageReadAt"].(string); at != "" {
+			w.printf("  lastRead:   %s\n", at)
+		}
+		// F44: consecutive failed usage reads (BudgetReadingStale's counter).
+		if n := numberField(bmap, "consecutiveReadFailures"); n > 0 {
+			w.printf("  readFails:  %.0f\n", n)
 		}
 		if ex, _ := bmap["exceeded"].(bool); ex {
 			reason, _ := bmap["exceededReason"].(string)
@@ -93,14 +122,41 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 		if branch, _ := dmap["branch"].(string); branch != "" {
 			w.printf("  branch:     %s\n", branch)
 		}
-		if pr, _ := dmap["prNumber"].(float64); pr > 0 {
+		// F85: prNumber is an int64 in the status (so it is an int64 in the
+		// unstructured object), and the JSON tag is prURL — a float64/"prUrl"
+		// read printed neither line for a real Loop.
+		if pr := numberField(dmap, "prNumber"); pr > 0 {
 			w.printf("  pr:         #%v\n", int64(pr))
 		}
-		if url, _ := dmap["prUrl"].(string); url != "" {
+		if url, _ := dmap["prURL"].(string); url != "" {
 			w.printf("  url:        %s\n", url)
 		}
 	}
 	return w.err()
+}
+
+// numberField reads a numeric field from an unstructured map. An integer status
+// field (status.budget counts are int64) is an int64 here, a CRD float a
+// float64 — both are numbers to describe.
+func numberField(m map[string]any, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case int64:
+		return float64(v)
+	case int:
+		return float64(v)
+	}
+	return 0
+}
+
+// shortSHA abbreviates a 40-hex SHA for the describe header (the full value is
+// in -o yaml); a non-SHA value is printed as it is.
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }
 
 func phaseOrDash(p string) string {

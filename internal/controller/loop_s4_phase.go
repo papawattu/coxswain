@@ -720,7 +720,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	// the Loop fails with the distinct SandboxFailed reason once the bound is
 	// exhausted — the I65 VerifyInfraFailed pattern mirrored onto the sandbox.
 	var stop bool
-	stop, changed, claimReadPending = r.sandboxFailureStep(ctx, loop, changed, claimReadPending)
+	stop, changed, claimReadPending = r.sandboxFailureStep(ctx, loop, changed)
 	if stop {
 		return false, changed, ""
 	}
@@ -1065,8 +1065,8 @@ func (r *LoopReconciler) hasValidSandboxClaim(ctx context.Context, loop *coxv1al
 // surfacing. stop is true when a failure was handled (the caller returns
 // without reading the claim); changed reports a status mutation; pending
 // asks for a requeue (a failed pod read).
-func (r *LoopReconciler) sandboxFailureStep(ctx context.Context, loop *coxv1alpha1.Loop, changedIn, pendingIn bool) (stop, changed, pending bool) {
-	changed, pending = changedIn, pendingIn
+func (r *LoopReconciler) sandboxFailureStep(ctx context.Context, loop *coxv1alpha1.Loop, changedIn bool) (stop, changed, pending bool) {
+	changed = changedIn
 	f, serr := r.sandboxFailure(ctx, loop)
 	if serr != nil {
 		// A transient read error (the sandbox pod read failed): no decision
@@ -1075,12 +1075,12 @@ func (r *LoopReconciler) sandboxFailureStep(ctx context.Context, loop *coxv1alph
 		return false, changed, true
 	}
 	if f != nil {
-		return true, r.applySandboxFailure(ctx, loop, f), pending
+		return true, r.applySandboxFailure(ctx, loop, f), false
 	}
 	if r.applySandboxNotStarting(ctx, loop) {
 		changed = true
 	}
-	return false, changed, pending
+	return false, changed, false
 }
 
 // waitingConfigError names a container the kubelet reports as unable to be

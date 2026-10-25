@@ -68,17 +68,17 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		loop, pod, r, offset, rec := plant("f48stuck", waiting("PodInitializing", ""))
 
 		*offset = sandboxStartGrace - time.Minute
-		_, ch, _ := r.sandboxFailureStep(ctx, loop, false, false)
+		_, ch, _ := r.sandboxFailureStep(ctx, loop, false)
 		Expect(ch).To(BeFalse(), "in progress (a slow image pull looks the same): no decision")
 		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeFalse())
 		Expect(countEvents(rec, sandboxNotStartingEventReason)).To(BeZero())
 
 		*offset = sandboxStartGrace + time.Minute
-		stop, ch, _ := r.sandboxFailureStep(ctx, loop, false, false)
+		stop, ch, _ := r.sandboxFailureStep(ctx, loop, false)
 		Expect(stop).To(BeFalse(), "surfacing only: it never stops the phase machine")
 		Expect(ch).To(BeTrue())
 		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
-		_, ch, _ = r.sandboxFailureStep(ctx, loop, false, false)
+		_, ch, _ = r.sandboxFailureStep(ctx, loop, false)
 		Expect(ch).To(BeTrue())
 		Expect(countEvents(rec, sandboxNotStartingEventReason)).To(Equal(1), "exactly one Warning Event across passes")
 
@@ -87,7 +87,7 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		pod.Status.Phase = corev1.PodRunning
 		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "agent", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
 		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
-		_, ch, _ = r.sandboxFailureStep(ctx, loop, false, false)
+		_, ch, _ = r.sandboxFailureStep(ctx, loop, false)
 		Expect(ch).To(BeTrue())
 		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeFalse())
 	})

@@ -993,10 +993,15 @@ type LoopStatus struct {
 // SandboxFailed reason.
 type AgentStatus struct {
 	// infraAttempts is the number of sandbox pods the operator has counted as
-	// failed-without-a-claim for the current Sandbox generation (F6). The
-	// operator recreates the Sandbox a bounded number of times (the
-	// sandboxInfraRetries cap, the controller's constant) and fails the Loop
-	// with the SandboxFailed reason once the bound is exhausted.
+	// failed-without-a-claim in the CURRENT RUN (F6, F48g). A run is one
+	// (status.iteration, status.desiredPhase) pair: the operator recreates the
+	// Sandbox a bounded number of times (the sandboxInfraRetries cap, the
+	// controller's constant) and fails the Loop with the SandboxFailed reason
+	// once the bound is exhausted. The count is reset when the run changes (a
+	// verify iterate/re-plan, an approval advance, a restore — see
+	// infraEpisode) and when a phase claim the operator accepts ends the
+	// episode early, so a failure episode cannot consume a later run's retry
+	// budget. A retry recreate does NOT reset it: the retry is inside the run.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	InfraAttempts int32 `json:"infraAttempts,omitempty"`
@@ -1010,6 +1015,17 @@ type AgentStatus struct {
 	// attempt has been counted yet.
 	// +optional
 	InfraSandboxUID string `json:"infraSandboxUID,omitempty"`
+
+	// infraEpisode identifies the run infraAttempts belongs to, as
+	// "<iteration>/<desiredPhase>" (F48g). The operator zeroes the count when
+	// the run key changes, so an episode cannot leak into a later run — the
+	// transitions that start a new run without a phase claim (the verify
+	// iterate/re-plan, an approval advance, a rollback) are covered without a
+	// per-transition hook. empty means no episode is in progress (the count is
+	// 0 and nothing has been counted since the last clear).
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	InfraEpisode string `json:"infraEpisode,omitempty"`
 }
 
 // ApprovalStatus is the operator's record of the plan-approval state (B3,

@@ -780,7 +780,14 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("stale claim from a previous iteration ignored",
 				"claimIteration", claim.Iteration,
 				"statusIteration", loop.Status.Iteration)
-			return false, false, ""
+			// P3-3 (the F48d class): a stale claim advances nothing, but the
+			// F6 clearRecoveredCondition above may have cleared AgentFailed on
+			// this pass, and dropping `changed` would lose that write. The
+			// four stale/consumed guards below return `changed` for the same
+			// reason. (The sandbox-failure count is unaffected: a counted
+			// failure requires no valid claim, which is the same resolvePhaseClaim
+			// these guards test.)
+			return false, changed, ""
 		}
 		// I42b: a claim from a PREVIOUS plan attempt is ignored — no advance,
 		// no progress write. The planAttempt counter is incremented on every
@@ -813,12 +820,12 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("stale claim from a previous plan attempt ignored",
 				"claimPlanAttempt", claim.PlanAttempt,
 				"statusPlanAttempt", loop.Status.PlanAttempt)
-			return false, false, ""
+			return false, changed, ""
 		}
 		if claim.ObservedPhase == coxv1alpha1.LoopPhasePlanning && claim.PlanAttempt == 0 && loop.Status.Approval != nil && loop.Status.Approval.LastRejectionReason != "" {
 			logf.FromContext(ctx).Info("stale claim from a previous plan attempt ignored (rejection reason present, planAttempt 0)",
 				"claimPlanAttempt", claim.PlanAttempt)
-			return false, false, ""
+			return false, changed, ""
 		}
 		// S5a (OS5 P3): a CONSUMED claim is discarded, not re-consumed.
 		// advancePhaseFromClaim runs every reconcile while the phase is not
@@ -847,7 +854,7 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("claim already consumed (observedPhase no longer matches the current phase); discarding",
 				"observedPhase", claim.ObservedPhase,
 				"currentPhase", loop.Status.Phase)
-			return false, false, ""
+			return false, changed, ""
 		}
 		// S4 review P2 (R18): the clock is injected (r.now, defaulting to
 		// metav1.Now) so a test can advance it more than 1s between reconciles
@@ -1297,20 +1304,36 @@ func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv
 	loop.ResourceVersion = fresh.ResourceVersion
 }
 
-// clearSandboxInfraEpisode ends a sandbox infra failure episode (F48b): the
-// count belongs to the EPISODE, not to one Sandbox (the operator's own retry
-// recreates the Sandbox, which used to reset it — see the count's comment in
-// ensureSandbox), so it is cleared by the recovery signal instead: a phase
-// claim the operator accepts. A fresh pod that succeeds must not carry the old
-// episode's count into the next failure's bound. Returns whether it changed
-// anything.
+// clearSandboxInfraEpisode ends a sandbox infra failure episode early (F48b,
+// F48g): the count belongs to a RUN (see sandboxRunKey), not to one Sandbox —
+// the operator's own retry recreates the Sandbox and must NOT reset it. The two
+// boundaries are: (1) a phase claim the operator accepts (the recovery signal —
+// a fresh pod that succeeds must not carry the old count into the next
+// failure's bound), and (2) a completed restore (loop_restore.go), which
+// rebuilds the workspace without moving the run key. The other claim-free
+// boundaries (the verify iterate/re-plan, an approval advance) need no call
+// site: applySandboxFailure compares sandboxRunKey and restarts the count when
+// the run changed. Returns whether it changed anything.
 func clearSandboxInfraEpisode(loop *coxv1alpha1.Loop) bool {
-	if loop.Status.Agent == nil || (loop.Status.Agent.InfraAttempts == 0 && loop.Status.Agent.InfraSandboxUID == "") {
+	if loop.Status.Agent == nil || (loop.Status.Agent.InfraAttempts == 0 && loop.Status.Agent.InfraSandboxUID == "" && loop.Status.Agent.InfraEpisode == "") {
 		return false
 	}
 	loop.Status.Agent.InfraAttempts = 0
 	loop.Status.Agent.InfraSandboxUID = ""
+	// F48g: an empty episode key means "no episode in progress", so a claim the
+	// operator holds (no phase move) cannot be mistaken for a live episode.
+	loop.Status.Agent.InfraEpisode = ""
 	return true
+}
+
+// sandboxRunKey names the run an infra-failure count belongs to: one
+// (iteration, desiredPhase) pair (F48g). `desiredPhase`, not `phase`, because a
+// pause changes the phase and not the desired phase (the pod is restarted in
+// place, not recreated) and a pause must not reset the count; `iteration`
+// because the verify iterate moves it even when the phase returns to one it has
+// already been in.
+func sandboxRunKey(loop *coxv1alpha1.Loop) string {
+	return fmt.Sprintf("%d/%s", loop.Status.Iteration, loop.Status.DesiredPhase)
 }
 
 // applySandboxNotStarting (F48) surfaces a sandbox pod that has been Pending
@@ -1590,6 +1613,19 @@ func (r *LoopReconciler) applySandboxFailure(ctx context.Context, loop *coxv1alp
 		}
 		log.Info("sandbox failure re-read (same UID); skipping (already counted)", "loop", loop.Name, "attempt", loop.Status.Agent.InfraAttempts)
 		return false
+	}
+	// F48g: a different RUN starts a different episode. The count's key is the
+	// run (iteration + desiredPhase), not the Sandbox: the transitions that
+	// start a new run without a phase claim (the verify iterate/re-plan, an
+	// approval advance, a rollback) cannot be cleared by the claim clear, and
+	// at Verifying that clear is unreachable while a mount failure can still be
+	// counted — so the old count would make the new run's first failure look
+	// like attempt 3 and fail the Loop terminally. The UID dedupe above stays
+	// FIRST: during the recycle window the outgoing run's Terminating pod is
+	// still readable, and the UID match is what stops it being counted again.
+	if ep := sandboxRunKey(loop); loop.Status.Agent.InfraEpisode != ep {
+		loop.Status.Agent.InfraAttempts = 0
+		loop.Status.Agent.InfraEpisode = ep
 	}
 	loop.Status.Agent.InfraAttempts++
 	loop.Status.Agent.InfraSandboxUID = string(f.sandboxUID)

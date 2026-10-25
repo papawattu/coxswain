@@ -1791,11 +1791,17 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// (.samples/f48b/08-operator-log-f48b.log), so a pod whose volume could
 		// not be mounted would have retried forever. The count now belongs to
 		// the FAILURE EPISODE, not to one Sandbox, and is cleared where the
-		// episode ends: a valid phase claim the operator accepts
-		// (advancePhaseFromClaim) — the same recovery signal that clears
-		// AgentFailed. A user who deletes the Sandbox mid-episode keeps the
-		// count (the failure has not recovered); the next successful claim
-		// clears it.
+		// episode ends — and the episode ends at every boundary F48g names, not
+		// only at a claim: (1) a valid phase claim the operator accepts
+		// (advancePhaseFromClaim, the same recovery signal that clears
+		// AgentFailed); (2) a run change — applySandboxFailure compares
+		// sandboxRunKey (iteration + desiredPhase) and restarts the count, which
+		// covers the claim-free transitions (the verify iterate/re-plan, an
+		// approval advance) without a per-transition hook; (3) a completed
+		// restore (loop_restore.go), which rebuilds the workspace without moving
+		// the run key. A user who deletes the Sandbox mid-episode keeps the
+		// count (the failure has not recovered), and so does the operator's own
+		// retry delete — the retry is inside the run.
 	} else if !apierrors.IsNotFound(gerr) {
 		// A failed read (not NotFound): fail closed (I49 — a failed read is
 		// never a success); the reconcile retries.

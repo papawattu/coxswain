@@ -164,7 +164,9 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(f.reason).To(Equal("FailedAttachVolume"))
 
 		By("the boundary: the LAST permitted retry still retries (attempt == sandboxInfraRetries)")
-		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: sandboxInfraRetries - 1}
+		// F48g: the seeded count belongs to THIS run (the operator wrote it
+		// during the episode), so the run key must match or the count restarts.
+		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: sandboxInfraRetries - 1, InfraEpisode: sandboxRunKey(loop)}
 		Expect(r.applySandboxFailure(ctx, loop, f)).To(BeTrue())
 		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(sandboxInfraRetries)))
 		Expect(loop.Status.Phase).To(Equal(cov.LoopPhasePlanning), "the last permitted attempt recreates, it does not fail")

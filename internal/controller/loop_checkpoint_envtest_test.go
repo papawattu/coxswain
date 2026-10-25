@@ -705,7 +705,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		By("dropping the untrusted entries from status and warning once each")
 		fresh := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
-		var names []string
+		names := make([]string, 0, len(fresh.Status.Checkpoints))
 		for _, cp := range fresh.Status.Checkpoints {
 			names = append(names, cp.Name)
 		}

@@ -99,6 +99,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -282,10 +283,10 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 	// forged name that points at another Loop's snapshot.
 	var last coxv1alpha1.CheckpointStatus
 	found := false
-	for i := len(cps) - 1; i >= 0; i-- {
-		switch r.checkpointEntryTrusted(ctx, loop, cps[i]) {
+	for _, cp := range slices.Backward(cps) {
+		switch r.checkpointEntryTrusted(ctx, loop, cp) {
 		case checkpointTrusted:
-			last, found = cps[i], true
+			last, found = cp, true
 		case checkpointUnknown:
 			return nil // a failed read is no decision
 		}

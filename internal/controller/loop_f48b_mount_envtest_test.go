@@ -245,6 +245,10 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(changed).To(BeTrue())
 		Expect(loop.Status.Agent.InfraAttempts).To(BeZero(), "a fresh claim is the recovery: the episode's count ends")
 		Expect(loop.Status.Agent.InfraSandboxUID).To(BeEmpty())
+		// F48e (F3): the third field the claim clear zeroes. Without it nothing
+		// asserted that the clear ends the KEY too, so a clear that left the key
+		// behind (and with it, the next failure's wrong-episode read) passed.
+		Expect(loop.Status.Agent.InfraEpisode).To(BeEmpty())
 	})
 
 	It("ignores a FailedMount the kubelet has superseded (a later Normal event for the same pod)", func() {

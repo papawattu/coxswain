@@ -1640,7 +1640,12 @@ func (r *LoopReconciler) applySandboxFailure(ctx context.Context, loop *coxv1alp
 	// I65 P1-A (mirrored): count at most ONE infra attempt per Sandbox UID. A
 	// re-read of the same failing Sandbox (the reconcile re-ran before the
 	// delete completed, or the stale pod still owned by the old Sandbox) must
-	// not burn another attempt.
+	// not burn another attempt. A NEW UID may add an attempt; it never clears
+	// the count (F48e): this guarded increment is not a reset site. The reset
+	// sites are an accepted claim (clearSandboxInfraEpisode, called from
+	// advancePhaseFromClaim), a completed restore — the lost-PVC/fork rebuild
+	// and the rollback — and the A2 empty-workspace rebuild (all three in
+	// loop_restore.go), and a change of run (the key compare below).
 	if loop.Status.Agent.InfraSandboxUID != "" && string(f.sandboxUID) == loop.Status.Agent.InfraSandboxUID {
 		// Already counted: re-issue the delete if the Sandbox is still present
 		// and not Terminating (a transient delete failure left it in place),

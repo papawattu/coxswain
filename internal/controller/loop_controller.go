@@ -30,6 +30,7 @@ import (
 	neturl "net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1329,7 +1330,13 @@ func (r *LoopReconciler) cniNetworkStatus() (run bool, reason cni.Reason, status
 // given status/reason/message would produce differs from the one the Loop
 // currently carries (D38 design point 3: an Event is emitted on each
 // CHANGE — not on every reconcile).
+//
+// The reason is normalised first because the STORED condition holds a
+// normalised value while the caller holds a raw one: comparing them directly
+// would report "changed" forever for any reason setCondition had to substitute
+// (F89b), and the Event would fire on every reconcile.
 func (r *LoopReconciler) networkEnforcedChanged(loop *coxv1alpha1.Loop, status metav1.ConditionStatus, reason, message string) bool {
+	reason = normalizeReason(reason)
 	for i := range loop.Status.Conditions {
 		c := loop.Status.Conditions[i]
 		if c.Type != cni.NetworkEnforcedCondition {
@@ -1347,6 +1354,10 @@ func (r *LoopReconciler) emitNetworkEnforcedEvent(loop *coxv1alpha1.Loop, status
 	if r.Recorder == nil {
 		return
 	}
+	// Normalise for the same reason the comparator does: the Event text must
+	// name the reason the condition stores, or `cox describe` and the Event
+	// disagree about the same transition (F89b).
+	reason = normalizeReason(reason)
 	var typ string
 	if status == metav1.ConditionTrue {
 		typ = corev1.EventTypeNormal
@@ -5420,32 +5431,72 @@ func (r *LoopReconciler) ensureNetPoliciesIfConfigured(ctx context.Context, loop
 	return nil
 }
 
+// conditionReasonUnknown is the reason setCondition substitutes when a caller
+// passes a reason the condition schema cannot store (F89, F89b): empty, over
+// the CRD's maxLength, or not matching the CRD's pattern.
+//
+// The value collides with cni.ReasonUnknown (internal/cni/cni.go), which
+// legitimately lands on the NetworkEnforced condition when the probe has no
+// result yet: a stored "Unknown" cannot be told apart from a substituted one.
+// That collision is harmless *because* the comparison path normalises the
+// caller's reason before comparing (networkEnforcedChanged), so both sides
+// speak the same stored vocabulary — do not "fix" it by renaming one of them.
+const conditionReasonUnknown = "Unknown"
+
+// conditionReasonRe mirrors the reason schema controller-gen renders for
+// metav1.Condition (config/crd/bases/coxswain.wattu.com_loops.yaml: the
+// conditions item's reason has maxLength 1024, minLength 1 and this pattern;
+// the Helm chart's CRD copy carries the same). It is a copy of a generated
+// schema and cannot be made single-source cheaply — controller-gen owns the
+// CRD — so the F89b envtest is its drift detector: it drives a real status
+// write against the CRD envtest installs, and its assertions on the stored
+// reason fail if a future CRD loosens or tightens this shape.
+var conditionReasonRe = regexp.MustCompile(`^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$`)
+
+const conditionReasonMaxLen = 1024
+
+// storableConditionReason reports whether the CRD will accept reason on a status
+// write. An unstorable reason is not cosmetic: the API server rejects the WHOLE
+// update, so a caller that passes one loses every other field it set in the same
+// pass (F89: status.agent.infraAttempts).
+func storableConditionReason(reason string) bool {
+	return reason != "" &&
+		len(reason) <= conditionReasonMaxLen &&
+		conditionReasonRe.MatchString(reason)
+}
+
+// normalizeReason is the ONE place a caller's reason becomes a stored reason:
+// setCondition applies it before the upsert, and networkEnforcedChanged applies
+// it before comparing stored-vs-supplied, so a substituted value is not read
+// back as a change on every pass (F89b).
+func normalizeReason(reason string) string {
+	if !storableConditionReason(reason) {
+		return conditionReasonUnknown
+	}
+	return reason
+}
+
 // setCondition upserts a condition on the Loop's status. The condition's Type
 // is a string (a terminal phase like "Failed", or a non-phase condition type
 // like "PolicyEnforced" or "PolicyValid"). It is the operator's audit record
 // (ADR-0004); the runner never writes it.
-// conditionReasonUnknown is the reason setCondition substitutes when a caller
-// passes an empty one (F89). metav1.Condition requires a non-empty reason (the
-// CRD's minLength 1 + CamelCase pattern), and a rejected status update loses the
-// WHOLE write, not just the condition.
-const conditionReasonUnknown = "Unknown"
-
+//
+// It also guards the reason: a reason the CRD cannot store is substituted with
+// conditionReasonUnknown rather than losing the whole write (F89 for the empty
+// case; F89b for a non-empty value the pattern rejects — pod.status.reason is
+// free text, and the repo's own example is "Low on ephemeral-storage",
+// loop_s4_phase.go's podStatusMessage). Sanitising happens ONLY when the value
+// is unstorable: rewriting a storable value would rewrite the kubelet's own
+// evidence, and the source helper (sandboxFailureReason) keeps that evidence in
+// the message when it has to substitute.
+//
+// Four condition writers in this package bypass this function by calling
+// meta.SetStatusCondition directly (loop_checkpoint.go: the checkpoint
+// conditions; loop_restore.go: the restore condition) and get no protection.
+// All of them currently pass constants; route a new dynamic reason through
+// setCondition, or normaliseReason explicitly.
 func setCondition(loop *coxv1alpha1.Loop, condType string, status metav1.ConditionStatus, reason, message string) {
-	// F89: a condition reason is REQUIRED by the CRD (minLength 1 + the
-	// CamelCase pattern), and a rejected status update loses MORE than the
-	// condition — it loses the whole write, including counters the caller just
-	// mutated (that is F89: an empty kubelet termination reason lost
-	// status.agent.infraAttempts, so the bounded retry never exhausted).
-	// Fix the source when you can (sandboxFailure defaults its reason); this
-	// keeps a future caller from losing a status write outright. The substitute
-	// is self-describing in the object (`cox describe` prints
-	// `reason=Unknown`) rather than a plausible-looking cause, so a caller's
-	// bug is not misattributed to a pod failure. Non-empty values are NOT
-	// sanitised: the CRD pattern accepts every kubelet reason in use, and a
-	// regexp guard would rewrite the kubelet's own evidence.
-	if reason == "" {
-		reason = conditionReasonUnknown
-	}
+	reason = normalizeReason(reason)
 	now := metav1.Now()
 	for i := range loop.Status.Conditions {
 		if loop.Status.Conditions[i].Type == condType {

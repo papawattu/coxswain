@@ -1357,8 +1357,12 @@ const (
 	// the pod's failure reason (Evicted / OOMKilled / Error / … — the
 	// pod.status.reason / pod condition reason when set, falling back to the
 	// container's termination reason; `PodFailed` when the kubelet recorded
-	// neither — F89) and its message carries the kubelet
+	// neither) and its message carries the kubelet
 	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi").
+	// `PodFailed` is also the reason when the kubelet recorded a reason the
+	// condition schema cannot store (pod.status.reason is free text; e.g.
+	// "Low on ephemeral-storage") — the kubelet's text stays in the message
+	// then, so the evidence is not lost (F89, F89b).
 	// F48: it is also set, with reason CreateContainerConfigError, when a
 	// container NEVER STARTED because the kubelet could not configure it; the
 	// message then says "has not started (waiting: ...)", not "terminated".

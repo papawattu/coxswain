@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `5e82c96` = PR #238); each claim cites its
+merged code on `main` (as of `23124e7` = PR #242); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -216,6 +216,25 @@ survives into a later iteration (F34, #238).
 - **What changed.** The audit hash is now over the trimmed text; duplicate lessons are counted once per occurrence in the summary; the NetworkPolicy is created before the Job (merged `069a655` = PR #234).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #234).
 
+### F78: the memory-writer audit keeps its counts line, and the 1000-byte cut is line-oriented — #243
+
+- **What was wrong.** The audit text cut at 1000 bytes on a byte/rune
+  boundary, and the counts line was last, so a long write lost
+  `summary: total=...` (the line `cox describe` and the verdicts metric
+  parse) to a mid-line fragment; the `ensureMemoryWriterJobAndNetPolicy`
+  doc and the netpol-before-Job comment described the writer's egress fence
+  oppositely ("deny-all" / "no network calls" instead of the actual proxy +
+  DNS allowlist); and four spec names no longer described what they assert
+  (merged `bd4c457` = PR #243).
+- **What changed.** `summaryLines` emits the counts line first, then the
+  audit lines, then the per-lesson lines; `memoryWriteAuditText` is
+  line-oriented — whole lines up to 1000 bytes, then ` … N more lines`,
+  never a mid-line fragment; `memoryWriteVerdicts` reads the counts line by
+  content, so the metric is unchanged; the fence comments now say proxy +
+  DNS egress only; the misnamed specs were renamed (merged `bd4c457` = PR
+  #243).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #243).
+
 ### F34: a stale lessons.json no longer survives into a later iteration, and the restore hold covers StoppingWorkloads — #238
 
 - **What was wrong.** A `lessons.json` left in the workspace from a previous iteration survived into the next one, so a check that found no lessons to propose still saw the old file (P3-3); and the restore hold checked only two of the three workload-stopping conditions the memory-writer Job documents, so a Loop could start a memory write while a restore was in progress (P3-4) (PR #238).
@@ -331,13 +350,48 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
 - #240 (merged `b850406`): a new `docs/MEMORY-WRITE.md` — how to read the
   memory-write outcome (the `MemoryWritten` / `MemoryWriteFailed` conditions
   and the curator verdicts) (PR #240).
+- #242 (merged `23124e7`): cross-doc consistency fixes — the operator FAQ's
+  `cox logs` flag form and the hold list (now including
+  `NetworkEnforced=False`), the glossary's real `cox` subcommand list (from
+  `internal/cli/cli.go`: no `get`/`apply`; adds `diff`/`memory`) plus the
+  100-lesson cap and the reader caps, a runnable `cox memory export` line in
+  QUICKSTART, "sidecar" reworded to the separate proxy pods in
+  TROUBLESHOOTING, and UPGRADE: the F55 entry's condition worded precisely,
+  a code line number dropped, the cap wording narrowed, and a
+  `MemoryPVCUnbound` entry (that Event isn't in v0.1.2). Docs only (PR #242).
+
+### F41: the curator call is retried on a transport failure — #241
+
+- **What was wrong.** On the k3d-hermes-sim lab cluster the memory writer's
+  curator call failed for every lesson ("curator unavailable (call failed)")
+  while the same writer worked on kind-ref. The mechanism was never shown
+  (the failure is a start-up transport error that clears by itself,
+  bracketed at (0s, 10s] — a writer started immediately against the same
+  proxy fails, one delayed 10s succeeds), so the fix makes the writer
+  resilient to a transient transport failure instead of failing closed on
+  the first one (merged `4b71ff4` = PR #241).
+- **What changed.** `pkg/curator` retries a transport failure (no HTTP
+  response) up to 3 times on a 1s/2s/4s backoff (7s for one lesson); the
+  retry wait is bounded per batch — one Client (one writer batch, up to 20
+  lessons) shares a 20s retry budget, so a down proxy costs at most 20s
+  instead of 20 × 7s, and once spent a failed call is dropped at once
+  ("call failed", fail-closed). An HTTP status or a bad body is never
+  retried; each retry logs `retry n/N in <delay>: <err>` to the Job log
+  (merged `4b71ff4` = PR #241). One post-fix lab run: `written=2 dropped=1`
+  on the cluster that previously failed every call (PR #241).
+- **On upgrade.** Nothing required; the fix is in the operator (the curator
+  client ships in the operator image, which is the default memory-writer
+  image; set `--memory-writer-image` to the new image if your install is not
+  `config/default`) (PR #241).
 
 ## Known issues still open
 
 The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
 merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
-(D71 memory lesson cap), F33 (memory-writer audit), and F34 (stale
-lessons.json) were closed by #229, #222, #233, #234, and #238. In plain
+(D71 memory lesson cap), F33 (memory-writer audit), F34 (stale
+lessons.json), F78 (memory-writer audit counts line), and F41 (the unknown
+curator failure) were closed by #229, #222, #233, #234, #238, #243, and
+#241. In plain
 words, the items still open:
 
 **P1 (security):**
@@ -404,12 +458,13 @@ words, the items still open:
   complete for any target (F75), a failed fork-retention label SET that is
   not retried although the doc says it is (F76), and a rollback whose
   post-state is undefined (F77) (PR #238's run).
-- **F78**: the memory-writer audit text drops the counts line first when the
-  summary exceeds 1000 bytes (the counts line is last, so `cox describe` can
-  lose `summary: total=...` for a 20-lesson write with long curator
-  reasons); two comments in the same file describe the writer's egress fence
-  oppositely; four spec names no longer describe what they assert (P2; PR
-  #238's run).
+- **F80**: the memory writer's summary field is not size-bounded by the
+  operator: `MemoryWritten.summary` carries the audit text (which can
+  include a whole lesson line quoted in a curator reason), and Kubernetes
+  truncates Event message strings at 4096 bytes without marking the cut, so
+  a summary longer than that silently loses its tail (the operator-side
+  1000-byte audit cut, F33/F78, bounds the audit text only — the condition
+  message can exceed it when a quoted lesson line is long).
 
 - **F50/F45/F46/F57/F52**: small and low items — shipped samples pointing at
   repo contents they test, an inert second admission-policy binding, the
@@ -419,11 +474,6 @@ words, the items still open:
 - **F59**: a code comment claims a "suspicious pattern scan" exists; it
   doesn't.
 - **F61**: sample agent-policy files are not shipped.
-
-**Investigation open:**
-
-- **F41**: the memory-writer's curator call fails on one lab cluster and
-  works on another; the cause is unknown and the investigation is open.
 
 **Waiting on owner decisions (not builder tasks):**
 

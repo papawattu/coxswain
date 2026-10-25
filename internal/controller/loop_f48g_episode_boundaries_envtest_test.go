@@ -540,6 +540,80 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		Expect(approved.Status.Agent.InfraEpisode).To(Equal(fmt.Sprintf("%d/%s", approved.Status.Iteration, cov.LoopPhaseImplementing)))
 	})
 
+	// F91b (R37 I138): the run-key comment used to claim that the rejection
+	// re-plan is ended by a "claim" the user sets — there is no such claim
+	// (claims are the runner's PhaseClaim; the approval is a CONDITION), and it
+	// got the mechanics wrong in the other direction too: the rejection DOES
+	// move desiredPhase (AwaitingApproval -> Planning), so both halves are real.
+	// This spec pins them in order.
+	It("S9: the rejection re-plan moves the run key, and the accepted Planning claim ends the episode at once", func() {
+		ns := f48gNs("f48g-s9")
+		const name = "f48g-s9"
+		Expect(k8sClient.Create(ctx, &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: cov.LoopSpec{
+				Goal:      "F91b rejection re-plan",
+				Workspace: testWorkspace(),
+				Approval:  &cov.Approval{Mode: cov.ApprovalModeManual, OnReject: cov.OnRejectReplan},
+			},
+		})).To(Succeed())
+
+		loop := f48gGet(ns, name)
+		loop.Status.Phase = cov.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = cov.LoopPhaseAwaitingApproval
+		loop.Status.Conditions = []metav1.Condition{{
+			Type: cov.PlanRejectedCondition, Status: metav1.ConditionTrue, Reason: "Rejected",
+			Message:            "the plan misses the rounding cases",
+			LastTransitionTime: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		holdKey := sandboxRunKey(f48gGet(ns, name))
+		f48gSeedCount(ns, name, 2, holdKey)
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r.wireApprovalGate()
+		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) { return nil, nil }
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("the rejection re-enters Planning and bumps PlanAttempt, and clears NO episode itself")
+		replanned := f48gGet(ns, name)
+		Expect(replanned.Status.Phase).To(Equal(cov.LoopPhasePlanning), "the rejection re-plans")
+		Expect(replanned.Status.PlanAttempt).To(Equal(1), "the rejection bumps planAttempt (I42b)")
+		Expect(replanned.Status.Agent).NotTo(BeNil())
+		Expect(replanned.Status.Agent.InfraAttempts).To(Equal(int32(2)),
+			"the rejection arm is not an episode boundary: it clears nothing")
+		Expect(replanned.Status.Agent.InfraEpisode).To(Equal(holdKey),
+			"the stored key is still the HOLD's: desiredPhase has moved under it, but nothing has re-counted yet")
+		Expect(sandboxRunKey(replanned)).NotTo(Equal(holdKey),
+			"the rejection DID move desiredPhase (AwaitingApproval -> Planning), so the key moved with it")
+
+		By("one failure in the re-planned run is attempt 1: the key compare ends the old episode")
+		Expect(r.applySandboxFailure(ctx, replanned, f48gFailure())).To(BeTrue())
+		Expect(replanned.Status.Agent.InfraAttempts).To(Equal(int32(1)),
+			"the old count cannot carry into the re-planned run: desiredPhase moved")
+		Expect(replanned.Status.Agent.InfraEpisode).To(Equal(sandboxRunKey(replanned)))
+
+		By("the accepted PLANNING claim of that attempt ends the episode immediately, without a failure")
+		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) {
+			return &PhaseClaim{
+				ObservedPhase: cov.LoopPhasePlanning,
+				Status:        claimSuccess,
+				Iteration:     replanned.Status.Iteration,
+				PlanAttempt:   replanned.Status.PlanAttempt,
+			}, nil
+		}
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+
+		accepted := f48gGet(ns, name)
+		Expect(accepted.Status.Agent).NotTo(BeNil())
+		Expect(accepted.Status.Agent.InfraAttempts).To(BeZero(),
+			"F48b: a claim the operator accepts is the recovery signal, so the episode's count ends")
+		Expect(accepted.Status.Agent.InfraSandboxUID).To(BeEmpty())
+		Expect(accepted.Status.Agent.InfraEpisode).To(BeEmpty())
+	})
+
 	// F48e (#273 P3-2): S7 only proves the gate ADVANCES once the approval is
 	// there. The hold is the gate's other direction and nothing in the tree
 	// asserted it, so a gate that advances unconditionally would pass every

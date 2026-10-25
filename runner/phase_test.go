@@ -214,6 +214,43 @@ func TestPhaseRunVerifyingIdlesUntilStop(t *testing.T) {
 	}
 }
 
+// TestPhaseRunBlockedImplementingClearsStaleLessons (F34): a blocked
+// Implementing run removes a lessons.json an earlier iteration left, and its
+// claim does not advertise it.
+func TestPhaseRunBlockedImplementingClearsStaleLessons(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{StatusCode: 500, RawBody: `{"error":"boom"}`})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	stale := filepath.Join(ws, resultDirName, lessonsFileName)
+	if err := os.MkdirAll(filepath.Dir(stale), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte(`["an old lesson"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan any)
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
+
+	if res.Status != statusBlocked || res.ObservedPhase != PhaseImplementing {
+		t.Fatalf("setup: status=%q phase=%q, want blocked Implementing", res.Status, res.ObservedPhase)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale lessons.json survived a blocked Implementing (err=%v)", err)
+	}
+	if res.LessonsAvailable {
+		t.Fatal("blocked Implementing advertised lessonsAvailable from a stale file")
+	}
+	if v, ok := parseClaim(t, claimPath)["lessonsAvailable"].(bool); ok && v {
+		t.Fatal("claim lessonsAvailable=true from a stale file")
+	}
+}
+
 func TestPhaseRunModelFailureBlocked(t *testing.T) {
 	// A model failure (non-200) makes the phase end blocked: the claim
 	// carries status=blocked with the reason (the operator requeues).

@@ -328,7 +328,7 @@ func parseRestoreFrom(s string) (int, error) {
 // b2RestoreHoldSuspended reports whether the B2 workspace restore is in
 // progress in a way that must hold the sandbox Suspended (the reviewer's
 // design point (b), R-B2): the Restore condition is False, reason
-// StoppingSandbox or DeletingPVC. ensureSandbox consults it BEFORE the
+// StoppingWorkloads, StoppingSandbox or DeletingPVC. ensureSandbox consults it BEFORE the
 // gate cascade: while the restore is in progress, the sandbox must not be
 // flipped back to Running mid-restore (a flip would remount the PVC the
 // restore is about to delete — kubernetes.io/pvc-protection would hold the
@@ -345,7 +345,9 @@ func (r *LoopReconciler) b2RestoreHoldSuspended(loop *coxv1alpha1.Loop) bool {
 	if c == nil || c.Status != metav1.ConditionFalse {
 		return false
 	}
-	return c.Reason == coxv1alpha1.RestoreReasonStoppingSandbox || c.Reason == coxv1alpha1.RestoreReasonDeletingPVC
+	return c.Reason == coxv1alpha1.RestoreReasonStoppingWorkloads ||
+		c.Reason == coxv1alpha1.RestoreReasonStoppingSandbox ||
+		c.Reason == coxv1alpha1.RestoreReasonDeletingPVC
 }
 
 // sandboxPodGone reports whether the Loop's sandbox POD is gone — the

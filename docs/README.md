@@ -12,6 +12,10 @@
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — Symptoms alpha users have hit, with the documented cause and the documented fix. Every entry cites the review doc, PR, or evidence file it comes from.
 - **[UPGRADE.md](UPGRADE.md)** — Upgrade notes: what changes to watch for when moving between coxswain versions, including one-off migration steps for NetworkPolicies and other in-place objects.
 
+## Testing
+
+- **[EVIL-AGENT-E2E.md](EVIL-AGENT-E2E.md)** — Running the evil-agent e2e: what the 15 probes prove, what the harness needs (and what is not in the repo yet), the verdict words, where the evidence goes, and the known gaps from the post-merge review.
+
 ## Design (ADR)
 
 - **[0001 — Keep the name "Coxswain", use GitHub-hosted module path](adr/0001-name-collision.md)**

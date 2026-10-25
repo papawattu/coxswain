@@ -163,7 +163,15 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(f).NotTo(BeNil())
 		Expect(f.reason).To(Equal("FailedAttachVolume"))
 
-		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: sandboxInfraRetries}
+		By("the boundary: the LAST permitted retry still retries (attempt == sandboxInfraRetries)")
+		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: sandboxInfraRetries - 1}
+		Expect(r.applySandboxFailure(ctx, loop, f)).To(BeTrue())
+		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(sandboxInfraRetries)))
+		Expect(loop.Status.Phase).To(Equal(cov.LoopPhasePlanning), "the last permitted attempt recreates, it does not fail")
+		Expect(countEvents(rec, sandboxInfraRetryEventReason)).To(Equal(1))
+
+		By("then the next attempt (a FRESH Sandbox UID) fails the Loop")
+		loop.Status.Agent.InfraSandboxUID = "earlier-sandbox-uid"
 		Expect(r.applySandboxFailure(ctx, loop, f)).To(BeTrue())
 		Expect(loop.Status.Phase).To(Equal(cov.LoopPhaseFailed))
 		failed := findConditionFn(loop.Status.Conditions, string(cov.LoopPhaseFailed))

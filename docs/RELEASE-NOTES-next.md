@@ -303,6 +303,12 @@ F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop 
 - **What changed.** The mount-failure Events read now sends the pod's UID to the apiserver as a field selector (`involvedObject.uid`) whenever it goes through the uncached apiReader, so the filter happens server-side (the in-memory UID/kind/name check stays on both paths as the correctness rule) (F48f, PR #282). The "Events unreadable" marker now records the last notification time and the Warning Event repeats every 5 minutes while the read keeps failing, instead of only once per Loop (F48f, PR #282).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #282).
 
+### F83b: a verify Job that is not the Loop's is never trusted as evidence, and each verify decision reads one Job snapshot — #283
+
+- **What was wrong.** The verify decision did not check that the Job it read was the Loop's own: a Job that happened to carry the Loop's verify name could be used as evidence (burning a retry attempt) and could be adopted and deleted as stale (F83b). And the decision read the Job twice, so between the two reads the operator's own retry could have recreated the Job under the same name and the decision mixed two Jobs' evidence (F83b).
+- **What changed.** A verify Job that is not controller-owned by the Loop is now refused outright: it is never trusted as evidence (no decision, no attempt — the Loop stays `Verifying`), and it is never adopted or deleted; instead one `VerifyJobForeign` Warning Event is raised (re-announced every 5 minutes while the foreign Job persists) (F83b, PR #283). Each verify decision now reads the Job once, and the pod and the `JobFailed` condition come from that single snapshot (F83b, PR #283).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #283).
+
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
 - **What was wrong.** `status.checkpoints` is user-writable (the editor role, since B3), and the operator acted on it without trusting it: the retention GC would delete any VolumeSnapshot a status entry named, even one belonging to another Loop, and the lost-PVC restore could take a forged entry as its restore source (PR #254, review finding review-api P2-1).

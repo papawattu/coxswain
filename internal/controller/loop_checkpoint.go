@@ -913,6 +913,14 @@ func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1al
 		logf.FromContext(ctx).Info("Deleting Loop: the spec validation observed an incomplete endpoint pair (recorded as a condition; NOT holding the pass — F10b)",
 			"loop", loop.Name)
 	}
+	// F84c: this path PERSISTS the conditions as the durable record a deleting
+	// Loop leaves behind (finalizeLoopStatus), so the terminal model-proxy clear
+	// has to run here too — otherwise the record of a Failed/Succeeded Loop
+	// deleted while the hold was recorded carries "held Suspended until it is
+	// Ready" for a hold that does not exist. Before condsBefore, so the D38
+	// capture below compares against the cleared value; the flag is ORed into
+	// b2Changed for the write that follows.
+	terminalCleared := clearModelProxyHoldForTerminal(loop)
 	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
 	copy(condsBefore, loop.Status.Conditions)
 	if policiesReadable {
@@ -932,6 +940,7 @@ func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1al
 			"loop", loop.Name)
 	}
 	b2Changed, b2Requeue, _, err := r.b2ApplyRestoreStep(ctx, loop)
+	b2Changed = b2Changed || terminalCleared
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Deleting Loop: the B2 restore step failed; requeueing", "loop", loop.Name)
 		return ctrl.Result{}, err

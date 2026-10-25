@@ -844,7 +844,16 @@ with one Warning Event on the transition. It clears to `False`/`Ready` when the
 pod is Ready and to `False`/`NoEndpoint` if the Loop loses its model endpoint.
 It also clears to `False`/`LoopTerminal` when the Loop reaches a terminal phase
 (`Succeeded`/`Failed`): a finished Loop is Suspended for that phase itself, so
-the condition must not outlive the hold it described (F84b).
+the condition must not outlive the hold it described (F84b). That clear does not
+depend on the other gates — it runs before every hold that can return early
+(`validateStep`'s policy/endpoint validation, the restore hold, the
+`NetworkEnforced` gate, and the deleting path that persists a Loop's final
+conditions) (F84c). If the proxy pod cannot be **read** (an API error, not
+`NotFound`), the condition says `could not be read`: that phrase is stable on
+purpose, so a held Loop does not rewrite its status every pass. The error itself
+is in the Warning Event — which carries the FIRST error of the hold, because the
+Event is emitted on the transition — and in the operator log at `-v=1`, which
+carries the current one (F84c).
 The usual causes are a pod that cannot be scheduled, an image that cannot be
 pulled, or the proxy's Secret missing; look at
 `kubectl get events -n <ns> | grep <loop>-proxy`. While this condition is True

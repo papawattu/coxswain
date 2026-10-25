@@ -599,8 +599,7 @@ The agent did not tamper; the check could not run.
 ### `PinNotDescendant` — the verify Job refused the pinned commit (F43)
 
 **What you see:** the Loop ends `Failed` with reason `PinNotDescendant`
-(a single terminal Warning Event, no retries), plus a `Warning` Event of
-the same reason naming both commits:
+(ONE terminal Warning Event, no retries; the message names both commits):
 
 ```
 the pinned commit <sha> is not a descendant of baseCommit <sha>; failing the Loop

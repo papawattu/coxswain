@@ -72,7 +72,9 @@ func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 		// F85: the sum of promptTokens+completionTokens, the F44 fields, and the
 		// F43 commit pin the docs tell the operator to compare.
 		"tokens:     1234", "requests:   7", "unmetered:  2", "readFails:  3", "lastRead:   2026-03-04T05:06:07Z",
-		"cost:       $0.42", "Base commit:  aaaaaaaaaaaa", "Verified:     bbbbbbbbbbbb"} {
+		"cost:       $0.42", "Base commit:  aaaaaaaaaaaa", "Verified:     bbbbbbbbbbbb",
+		// F85 review: prNumber is int64 (was read as float64) and the tag is prURL.
+		"pr:         #1", "url:        http://gitea/pulls/1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("describe output missing %q\noutput:\n%s", want, out)
 		}

@@ -122,10 +122,13 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 		if branch, _ := dmap["branch"].(string); branch != "" {
 			w.printf("  branch:     %s\n", branch)
 		}
-		if pr, _ := dmap["prNumber"].(float64); pr > 0 {
+		// F85: prNumber is an int64 in the status (so it is an int64 in the
+		// unstructured object), and the JSON tag is prURL — a float64/"prUrl"
+		// read printed neither line for a real Loop.
+		if pr := numberField(dmap, "prNumber"); pr > 0 {
 			w.printf("  pr:         #%v\n", int64(pr))
 		}
-		if url, _ := dmap["prUrl"].(string); url != "" {
+		if url, _ := dmap["prURL"].(string); url != "" {
 			w.printf("  url:        %s\n", url)
 		}
 	}

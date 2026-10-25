@@ -870,19 +870,30 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// D38: capture the condition set before applyEffectivePolicyAndConditions so
+	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
+	// probe result change) still triggers a status update. Without this, the
+	// "re-gate on flip" spec would never persist the new condition. It is taken
+	// BEFORE the F84c terminal clear below, so a clear-only change is persisted
+	// by conditionsChanged (and Reconcile needs no extra branch for it).
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
+
+	// F84c: a terminal Loop is not held for its model proxy, and the clear must
+	// run before EVERY hold that can return early — including validateStep just
+	// below, which PERSISTS status while it holds (agentPoliciesValid /
+	// modelConfigInvalid both call Status().Update), and the restore/b2 and D30
+	// holds further down (sandboxSuspendedByGate reaches the D35a gate only
+	// after them, and a b2 hold skips the bootstrap and the gate entirely). The
+	// return value is not needed here: the snapshot above predates the clear.
+	_ = clearModelProxyHoldForTerminal(&loop)
+
 	// C6a + D34: validate the referenced AgentPolicies and the
 	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
 	// the Reconcile within the gocyclo budget).
 	if res, done := r.validateStep(ctx, &loop); done {
 		return res, nil
 	}
-
-	// D38: capture the condition set before applyEffectivePolicyAndConditions so
-	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
-	// probe result change) still triggers a status update. Without this, the
-	// "re-gate on flip" spec would never persist the new condition.
-	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
-	copy(condsBefore, loop.Status.Conditions)
 
 	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
@@ -1968,33 +1979,36 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 // is not Ready, with the hold SURFACED as ModelProxyNotReady (condition + one
 // Warning Event on the transition) and cleared once the pod is Ready. No
 // endpoint means no proxy and no hold.
+//
+// Three things clear it: the pod becoming Ready (`clearModelProxyNotReady`,
+// here), an endpoint going away (`NoEndpoint`, the budget step in
+// loop_p2d_budget.go — not this gate), and a terminal phase (`LoopTerminal`,
+// cleared in Reconcile by clearModelProxyHoldForTerminal — F84c, so it does not
+// depend on the other gates).
 func (r *LoopReconciler) modelProxyHold(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	if loop.Spec.Agent.EndpointSecretRef == "" {
 		return false
 	}
-	// F84b: a terminal Loop is not held for its proxy any more — its sandbox is
-	// Suspended for the terminal phase itself (loopSandboxStopped), so the
-	// condition must not outlive the work it describes (the R34 I120(b)
-	// "condition outlives its subject" class): a Loop that failed or succeeded
-	// while the proxy was not Ready would otherwise carry
-	// ModelProxyNotReady=True forever, with a message promising a hold that no
-	// longer exists.
+	// F84b/F84c: a terminal Loop is never held for its proxy (its sandbox is
+	// Suspended for the terminal phase itself, loopSandboxStopped). The CLEAR is
+	// not here: Reconcile clears it unconditionally, because this gate is only
+	// reached when the restore and D30 gates pass.
 	if isTerminalPhase(loop.Status.Phase) {
-		if conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
-			setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
-				modelProxyTerminalReason,
-				fmt.Sprintf("the Loop is %s, so the model proxy hold no longer applies", loop.Status.Phase))
-		}
 		return false
 	}
 	proxyPod := &corev1.Pod{}
 	perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
-	notReady, why := modelProxyNotReady(proxyPod, loop, perr)
+	if perr != nil {
+		// F84c: the read error is logged (not put in the condition message, which
+		// must stay stable — modelProxyNotReady returns it as a separate detail).
+		logf.FromContext(ctx).V(1).Info("model proxy pod read failed", "loop", loop.Name, "err", perr)
+	}
+	notReady, why, detail := modelProxyNotReady(proxyPod, loop, perr)
 	if !notReady {
 		clearModelProxyNotReady(loop)
 		return false
 	}
-	r.surfaceModelProxyNotReady(loop, why)
+	r.surfaceModelProxyNotReady(loop, why, detail)
 	return true
 }
 
@@ -2002,36 +2016,82 @@ func (r *LoopReconciler) modelProxyHold(ctx context.Context, loop *coxv1alpha1.L
 // Ready for this Loop, and why. A read error is the same hold (fail-closed),
 // but the message distinguishes the two shapes (F84b: it must not state a
 // cause it has not observed — an apiserver error is not "it does not exist").
-func modelProxyNotReady(pod *corev1.Pod, loop *coxv1alpha1.Loop, err error) (bool, string) {
+//
+// It returns the CONDITION phrase (why — stable for a given shape) separately
+// from a human detail (the raw error). F84c: an error string must never reach a
+// setCondition message, because setCondition compares message text — a proxy
+// alternating "connection refused" / "context deadline exceeded" / "Forbidden"
+// would re-stamp the condition's LastTransitionTime and write status every pass.
+func modelProxyNotReady(pod *corev1.Pod, loop *coxv1alpha1.Loop, err error) (notReady bool, why, detail string) {
 	switch {
 	case err != nil:
 		if apierrors.IsNotFound(err) {
-			return true, "it does not exist yet"
+			return true, "it does not exist yet", ""
 		}
-		return true, fmt.Sprintf("it could not be read (%v)", err)
+		return true, "it could not be read", truncate(300, err.Error())
 	case !metav1.IsControlledBy(pod, loop):
-		return true, "it is not owned by this Loop"
+		return true, "it is not owned by this Loop", ""
 	case !isPodReady(pod):
 		if pod.Status.PodIP == "" {
-			return true, "it has no pod IP (not scheduled or not started)"
+			return true, "it has no pod IP (not scheduled or not started)", ""
 		}
-		return true, "it is not Ready"
+		return true, "it is not Ready", ""
 	}
-	return false, ""
+	return false, "", ""
 }
 
 // surfaceModelProxyNotReady (F84) records the D35a hold as a condition
 // (ModelProxyNotReady, True) and emits ONE Warning Event on the transition. The
-// message is stable for a given phase/reason (no age, no counts) so a held Loop
-// does not rewrite its status every reconcile.
-func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, why string) {
+// message is stable for a given phase/reason (no age, no counts, and — F84c — no
+// error text) so a held Loop does not rewrite its status every reconcile; the
+// read-error detail rides on the Event, which is transition-gated anyway.
+func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, why, detail string) {
 	msg := fmt.Sprintf("the model proxy pod %s is not Ready: %s; the sandbox is held Suspended until it is (the model proxy is the agent's only model egress)",
 		proxyPodName(loop.Name), why)
 	was := conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition)
 	setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionTrue, "ModelProxyNotReady", msg)
 	if !was && r.Recorder != nil {
-		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "ModelProxyNotReady", "%s", msg)
+		evMsg := msg
+		if detail != "" {
+			evMsg += " (the read error was: " + detail + ")"
+		}
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "ModelProxyNotReady", "%s", evMsg)
 	}
+}
+
+// clearModelProxyHoldForTerminal is the terminal clear (F84b, F84c): a finished
+// Loop is not held for its model proxy, so the condition must not outlive the
+// work it describes (the R34 I120(b) class). Called from Reconcile before every
+// hold that can return early (validateStep, the restore/b2 step, D30/35a) — its
+// result is discarded there because the condsBefore snapshot predates the call,
+// so conditionsChanged persists it — and from the deleting path, which ORs the
+// flag into the write it already makes. Only the two genuine error returns
+// (applyEffectivePolicyAndConditions, the restore step) leave it in memory,
+// which is correct — they retry.
+//
+// Two notes on what that placement buys, and what is pinned by a spec:
+//   - the restore-hold (b2Hold) half is PLACEMENT-guaranteed and not spec-pinned
+//     (the F84 table's fixture sets no restoreFrom, so b2Hold is false there; a
+//     mutation that moves the call below b2GatedBootstrap still passes). The
+//     comment is the record, by the F48g precedent;
+//   - the validateStep half IS spec-pinned (a Failed Loop with a missing policy
+//     reference: F84c's "a missing policy cannot keep the hold" spec), because
+//     that path persists status while it holds.
+//
+// The terminal test lives here rather than in Reconcile to keep Reconcile inside
+// its gocyclo budget; modelProxyHold only refuses to hold at a terminal phase
+// (it never clears).
+func clearModelProxyHoldForTerminal(loop *coxv1alpha1.Loop) bool {
+	if !isTerminalPhase(loop.Status.Phase) {
+		return false
+	}
+	if !conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
+		return false
+	}
+	setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
+		modelProxyTerminalReason,
+		fmt.Sprintf("the Loop is %s, so the model proxy hold no longer applies", loop.Status.Phase))
+	return true
 }
 
 // modelProxyTerminalReason is the ModelProxyNotReady reason a terminal Loop's

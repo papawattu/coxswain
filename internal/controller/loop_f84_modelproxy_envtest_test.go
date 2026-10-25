@@ -267,6 +267,75 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 		Expect(cond.Reason).To(Equal(modelProxyTerminalReason))
 	})
 
+	// F84c (the review round's remaining P2): the DELETING path persists the
+	// conditions as the durable record a deleted Loop leaves behind, so the
+	// terminal clear has to run there too — the main Reconcile clear is never
+	// reached for a Loop with a deletionTimestamp (Reconcile returns to
+	// finalizeB2DeleteStep first). Without the clear in loop_checkpoint.go the
+	// record of a Failed Loop deleted while the hold was recorded keeps saying
+	// "held Suspended until it is Ready" for a hold that no longer exists.
+	It("F84c: a deleting terminal Loop persists the cleared hold (the deleting path is the only clear it gets)", func() {
+		ns := "f84c-deleting-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		})
+		const name = "f84cdel"
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      "F84c deleting terminal Loop",
+				Workspace: testWorkspace(),
+				Agent: coxv1alpha1.AgentConfig{
+					Image:             runnerImage,
+					Model:             testModel,
+					EndpointSecretRef: f84ModelSecret,
+					ModelEndpoint:     "model.example.com:443",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		Expect(r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})).Error().NotTo(HaveOccurred())
+
+		// The durable record at the moment of the delete: a terminal Loop with
+		// the hold recorded (the F84 condition as surfaceModelProxyNotReady
+		// writes it).
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		Expect(loop.Finalizers).To(ContainElement(loopCheckpointFinalizer))
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionTrue, "ModelProxyNotReady",
+			"the model proxy pod "+proxyPodName(name)+" is not Ready: it does not exist yet; the sandbox is held Suspended until it is")
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// A foreign finalizer keeps the object alive past the operator's own
+		// finalizer removal, so the status the deleting pass persists can be
+		// read back (the apiserver deletes the object the moment the checkpoint
+		// finalizer is gone, which is what the B1 specs assert). On a real
+		// cluster any other controller's finalizer plays this role.
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
+		loop.Finalizers = append(loop.Finalizers, "test.coxswain/hold")
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+
+		Expect(k8sClient.Delete(ctx, loop)).To(Succeed())
+		deleting := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, deleting)).To(Succeed())
+		Expect(deleting.DeletionTimestamp.IsZero()).To(BeFalse(), "the delete is registered before the pass")
+
+		Expect(r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})).Error().NotTo(HaveOccurred())
+
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)
+		Expect(cond).NotTo(BeNil(), "the condition is cleared, not removed")
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse),
+			"the deleting path persists the cleared hold (its status write is the Loop's durable record)")
+		Expect(cond.Reason).To(Equal(modelProxyTerminalReason))
+	})
+
 	// F84c (P3, the pre-review's finding 4): the why/detail routing in
 	// modelProxyHold had no end-to-end spec — the phrase table tests
 	// modelProxyNotReady alone and the byte-identical spec tests setCondition

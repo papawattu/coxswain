@@ -17,12 +17,12 @@ To learn more about the release, try:
 Approval note (Manual-mode Loops, `approval.mode: Manual`):
 
   `cox approve <loop>` and `cox reject <loop> --reason <reason>` read the Loop
-  with `get` and set the PlanApproved / PlanRejected conditions on its
-  `loops/status` subresource. Both also read PLAN.md from the workspace through
-  a short-lived peek pod, so the user needs pod RBAC in the Loop's namespace as
-  well. The chart installs no user-facing role by default, so unless you bind
-  one, the API server rejects both commands (the operator's own role grants
-  these to its ServiceAccount, not to you).
+  with `get` and patch its `loops/status` subresource with the PlanApproved /
+  PlanRejected conditions (a JSON merge patch). Both also read PLAN.md from
+  the workspace through a short-lived peek pod, so the user needs pod RBAC in
+  the Loop's namespace as well. The chart installs no user-facing role by
+  default, so unless you bind one, the API server rejects both commands (the
+  operator's own role grants these to its ServiceAccount, not to you).
 {{- if .Values.rbac.helpers.enabled }}
 
   This release installed the helper roles (rbac.helpers.enabled=true): bind

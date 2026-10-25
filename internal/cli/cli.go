@@ -43,11 +43,14 @@ type LoopClient interface {
 	// uses it — a new Loop must not go through Update, which PUTs to the
 	// status subresource and 404s for a Loop that does not exist yet).
 	Create(ctx context.Context, obj runtime.Object) error
-	// Patch applies a JSON merge patch (or a raw patch) to the named Loop.
-	// The subresource is "" for the main resource, "status" for the status
-	// subresource.
+	// Patch applies a JSON merge patch to the named Loop. The subresource is
+	// "" for the main resource (spec.suspend, metadata.annotations) and
+	// "status" for the status subresource (the approve/reject conditions).
 	Patch(ctx context.Context, name, subresource string, patch []byte) error
-	// Update writes the whole object (used to set annotations / spec.suspend).
+	// Update writes the whole object to the status subresource. No command
+	// uses it since F87 moved approve/reject to a status merge patch; it stays
+	// in the contract because the fork path's spec asserts it is NOT used (a
+	// new Loop must go through Create).
 	Update(ctx context.Context, obj runtime.Object) error
 }
 

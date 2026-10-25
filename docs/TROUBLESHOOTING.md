@@ -915,7 +915,7 @@ real checkpoint taken.
 
 **What it means:** a `status.checkpoints` entry named a VolumeSnapshot that
 the operator did not write for this Loop. `status` is user-writable
-(anyone bound to the editor role can `PUT /status` — `cox approve` /
+(anyone bound to the editor role can write `/status` — `cox approve` /
 `cox reject` use the same path), so the operator does not trust a name it
 read from status. An entry is "trusted" only when **both** of these hold
 (`checkpointEntryTrusted` in `internal/controller/loop_checkpoint.go`):
@@ -970,10 +970,10 @@ nothing is restored from it.
 **What to check:**
 
 1. **Who wrote the entry.** `status.checkpoints` is writable by the editor
-   role. Check the audit log for `PUT /status` on the Loop (or who ran a
-   `cox` status subcommand) around the time the Event appeared. If you did
-   not edit the status, someone/something else did — treat that as a
-   credential or access question, not a Loop bug.
+   role. Check the audit log for writes to the Loop's `/status` subresource
+   (or who ran a `cox` status subcommand) around the time the Event
+   appeared. If you did not edit the status, someone/something else did —
+   treat that as a credential or access question, not a Loop bug.
 2. **The snapshot the entry named.** `kubectl get volumesnapshot
    <name> -n <loop-namespace> -o json` and look at its labels.
    Operator-written checkpoints carry `app.kubernetes.io/managed-by:

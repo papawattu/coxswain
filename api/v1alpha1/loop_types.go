@@ -282,8 +282,8 @@ type VerifyConfig struct {
 //
 // Integrity note (ADR-0005 D12, corrected by F47): loops/status is NOT
 // operator-only. The editor role grants update/patch on it so cox approve and
-// cox reject can PUT the object, so anyone bound to that role can write any
-// status field. The operator writes valid values, and every consumer that ACTS
+// cox reject can write the approval conditions, so anyone bound to that role
+// can write any status field. The operator writes valid values, and every consumer that ACTS
 // on a status value must validate it first: the checkpoint GC and the lost-PVC
 // restore check the name shape and that the VolumeSnapshot carries this Loop's
 // label before deleting or restoring from it. The tamper decision (F83c) reads

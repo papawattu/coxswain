@@ -252,6 +252,12 @@ existing Loops are unaffected, but new ones are.
 - **What changed.** `cox describe` now shows the real token count (prompt plus completion), requests, unmetered requests, cost, the last usage read, and consecutive read failures — the F44 surface instead of a non-existent field; the base and verified commits now print, so the F43 ancestry fact is visible without reaching for the API; and the delivered PR's number and URL lines now print, which they never did before (PR #260).
 - **On upgrade.** Nothing to do beyond picking up the new `cox` binary — the fix is in the CLI, not the operator (PR #260).
 
+### F88: `cox describe` now shows the wall clock, and empty Budget and Delivery headings are no longer printed — #268
+
+- **What was wrong.** The budget block printed tokens, requests, cost and the like but never the wall-clock time a Loop had run — so a `WallClock` cap that fired told an operator *that* it fired, not how much time was spent — and an empty `Budget:` or `Delivery:` heading could be printed bare with no lines under it (F88).
+- **What changed.** `cox describe` now shows the wall clock first in the budget block (`active: ... of ... cap`, or `active: ... (no cap)` when no cap is set), and the `Budget` and `Delivery` headings print only when they have lines to show (PR #268).
+- **On upgrade.** Nothing to do beyond picking up the new `cox` binary — the change is in the CLI, not the operator (PR #268).
+
 ### F48: a sandbox pod that never starts is surfaced, and a config-error start is bounded — #256
 
 - **What was wrong.** A sandbox pod stuck Pending with no container started (e.g. a missing `gitCredentialSecret`: kubelet reports FailedMount only as an Event) wedged the Loop with no condition, Event or timeout (F48, review-api P2-3).
@@ -565,7 +571,7 @@ F44 (surfacing unmetered requests and stale usage reads, #248), F47
 false alarm while the proxy pod is starting, #259), F84b (the
 `ModelProxyNotReady` condition sticking at a terminal phase, and a failed
 proxy read reported as a missing pod, #265), F85 (the `cox describe` budget
-block reading a non-existent field, #260), F48d and F48c (the
+block reading a non-existent field, #260), F88 (the wall-clock line missing from the budget block, and the bare Budget/Delivery headings, #268), F48d and F48c (the
 `SandboxNotStarting` condition not saved at Verifying, and not cleared when
 the pod is gone, #262), F46 (the unwired model timeout, #252), F83 (the
 unrecorded tamper evidence, #258), F83c (the status-driven tamper gate

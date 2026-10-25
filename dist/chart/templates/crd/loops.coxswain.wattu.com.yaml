@@ -1325,8 +1325,9 @@ spec:
                       tamper container finished, or status was lost) — and nil is NEVER treated
                       as clean (D24 fail-closed). The tamper decision does not read this field
                       (F83c): it reads the verify Job's pod (verifyOutcome), so this is the
-                      operator's record of what that read produced — the source of the
-                      `cox describe` and delivered-PR-body tamper line.
+                      operator's record of what that read produced, and the source of the
+                      delivered PR body's tamper line (loop_deliver_description.go). Nothing
+                      else reads it today (F83d).
                     format: int32
                     type: integer
                   tamperJobUID:

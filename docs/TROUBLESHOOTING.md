@@ -630,12 +630,18 @@ the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
 The agent did not tamper; the check could not run.
 
 A tamper init that the kubelet **OOM-killed** lands here too, not in
-`TamperedVerify`: the container is killed at its memory limit, so the exit code
-is `137` and the reason is `OOMKilled` (F83c maps it to `VerifyInfraFailed`, so
-the run is retried like any infra failure instead of failing the Loop for
-"tampering"). The condition message carries the kubelet's reason next to the
-exit code (F83d). If the retries exhaust, raise the verify Job's memory limit —
-the agent did not tamper, and the diff never ran.
+`TamperedVerify`: the exit code is `137` and the kubelet's reason is
+`OOMKilled`, which F83c maps to `VerifyInfraFailed`, so the run is retried like
+any infra failure instead of failing the Loop for "tampering". The condition
+message carries the kubelet's reason next to the exit code (F83d).
+
+The operator sets no resource requests or limits on the verify Job and the Loop
+has no memory field, so there is no per-Loop knob to raise. The reason comes
+from outside the Loop — a `LimitRange` in the namespace, or node memory
+pressure — and the operator cannot tell those apart from here. **What to do:**
+`kubectl get limitrange -n <the Loop's namespace>` and check the node's memory
+pressure; raise the limit there (or give the verify Job room by moving it to a
+namespace/node with more). The agent did not tamper.
 
 ### `PinNotDescendant` — the verify Job refused the pinned commit (F43)
 

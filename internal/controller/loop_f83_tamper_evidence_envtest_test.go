@@ -83,7 +83,7 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 		return ns, name
 	}
 
-	It("F83: records nil while the tamper init runs, then its exit code and the pin once it terminated (checks still running), and clears it on a new pin", func() {
+	It("F83: records nil while the tamper init runs, then its exit code and the pin once it terminated (checks still running); the per-pin clear is F83d's spec", func() {
 		ns, name := newLoop("f83-s1-")
 		defer func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})

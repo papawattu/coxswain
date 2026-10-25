@@ -7,9 +7,11 @@ package controller
 //     re-added status reader would see exactly what a user wrote (the
 //     delivery hold, where applyVerifyOutcome returns before the F83 writer
 //     runs) — .samples/design-f83d.md §B;
-//   - the record is per-PIN, so a new pin clears it (P3-5) instead of leaving
-//     the previous iteration's tamper verdict on display for the next run and
-//     for the delivered PR body;
+//   - the record is per-PIN, so it goes wherever the pin goes — the new-pin
+//     advance AND the iterate/re-plan that starts the next Implementing run
+//     (P3-5), instead of staying on display for a run whose pin it does not
+//     describe (and in the delivered PR body, which reads it with no pin
+//     guard);
 //   - the VerifyInfraFailed message carries the kubelet's Terminated.Reason
 //     (so an OOMKilled tamper init is readable as such, not as "exit 137").
 
@@ -20,8 +22,11 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	cov "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -88,6 +93,10 @@ var _ = Describe("F83d: the tamper record is provenance, per pin, and readable",
 					TamperJobUID:   "old-verify-job-uid",
 					InfraAttempts:  2,
 					InfraJobUID:    "old-verify-job-uid",
+					// The recorded OUTCOME (which the checkpoint keys off): the clear
+					// must not touch these.
+					Iteration:        func() *int32 { i := int32(2); return &i }(),
+					LastCheckResults: []*int32{func() *int32 { z := int32(0); return &z }()},
 				},
 			},
 		}
@@ -110,9 +119,86 @@ var _ = Describe("F83d: the tamper record is provenance, per pin, and readable",
 			"F83d (P3-5): the previous pin's tamper verdict must not describe the new pin")
 		Expect(loop.Status.Verify.VerifiedCommit).To(BeEmpty())
 		Expect(loop.Status.Verify.TamperJobUID).To(BeEmpty())
+		// The clear is scoped to the tamper record: `iteration` and
+		// `lastCheckResults` stay (the checkpoint step keys off the recorded
+		// iteration). A "clear the whole record" change would silently break B1
+		// checkpoints — pin that here.
+		Expect(loop.Status.Verify.Iteration).NotTo(BeNil(), "the recorded iteration survives the pin advance")
+		Expect(*loop.Status.Verify.Iteration).To(Equal(int32(2)))
+		Expect(loop.Status.Verify.LastCheckResults).NotTo(BeEmpty(), "the recorded outcomes survive the pin advance")
 		// The infra counters are the same per-pin reset (I65 P1-B), unchanged.
 		Expect(loop.Status.Verify.InfraAttempts).To(BeZero())
 		Expect(loop.Status.Verify.InfraJobUID).To(BeEmpty())
+	})
+
+	It("the iterate clears the previous pin's tamper record before the next Implementing run (P3-5)", func() {
+		// P3-5's window is the NEXT Implementing run, and that run starts here:
+		// at the iterate the operator drops the pin (CurrentVerify = nil) and the
+		// next run re-pins only at the following advance. The record writer stamps
+		// the tamper fields from the failed iteration's own pod BEFORE the iterate
+		// decision in the same pass, so without a clear at this boundary the
+		// record survives for the whole Implementing run and
+		// loop_deliver_description.go renders it with no pin guard.
+		ns := newNS("f83d-iterate")
+		const name = "f83d-iterate"
+		Expect(k8sClient.Create(ctx, &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		loop := p5fGet(ns, name)
+		Expect(loop.Status.Phase).To(Equal(cov.LoopPhaseVerifying), "setup: the Loop is Verifying")
+		Expect(loop.Status.CurrentVerify).NotTo(BeNil(), "setup: the pin is written on entering Verifying")
+
+		// A failing check with a CLEAN tamper init: the record says "clean at
+		// this pin" and the iterate then discards the pin.
+		jobName := verifyJobName(&cov.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		job := &batchv1.Job{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)
+		if apierrors.IsNotFound(err) {
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name + "-verify-pod",
+				Namespace: ns,
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1, Message: "FAIL: expected file /workspace/out.txt to exist",
+			}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		loop = s6Reconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(cov.LoopPhaseImplementing),
+			"setup: a failing check with onVerifyFail unset iterates to Implementing")
+		Expect(loop.Status.CurrentVerify).To(BeNil(), "setup: the iterate drops the pin")
+		Expect(loop.Status.Verify).NotTo(BeNil())
+		Expect(loop.Status.Verify.TamperExitCode).To(BeNil(),
+			"the previous pin's tamper verdict must not describe the Implementing run that follows it")
+		Expect(loop.Status.Verify.VerifiedCommit).To(BeEmpty())
+		Expect(loop.Status.Verify.TamperJobUID).To(BeEmpty())
+		// The outcome record the checkpoint keys off survives the iterate.
+		Expect(loop.Status.Verify.Iteration).NotTo(BeNil())
+		Expect(loop.Status.Verify.LastCheckResults).NotTo(BeEmpty())
 	})
 })
 

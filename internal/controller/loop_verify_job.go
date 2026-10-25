@@ -1318,6 +1318,30 @@ func recordTamperEvidence(loop *coxv1alpha1.Loop, pod *corev1.Pod, job *batchv1.
 	return changed
 }
 
+// clearTamperRecord drops the per-pin tamper record (F83d, P3-5): the tamper
+// exit code, the pin it was measured at, and the Job UID that produced it.
+//
+// Call it wherever the PIN goes away — the pin advance into Verifying (a new
+// verifiedCommit) and the iterate/re-plan (CurrentVerify = nil, the next run
+// re-pins). The record is joined to the pin, and the delivered-PR-body
+// renderer reads it with no pin guard (loop_deliver_description.go), so a
+// record left behind speaks for a pin the run never had. The iterate is the
+// boundary that matters most: that is where the NEXT Implementing run starts,
+// and it runs the whole way to the next advance before this record could
+// otherwise be replaced.
+//
+// It deliberately keeps Iteration and LastCheckResults (the checkpoint step
+// keys off the recorded iteration, loop_checkpoint.go) and the infra counters
+// (their own per-pin reset lives beside the pin advance).
+func clearTamperRecord(v *coxv1alpha1.VerifyStatus) {
+	if v == nil {
+		return
+	}
+	v.TamperExitCode = nil
+	v.VerifiedCommit = ""
+	v.TamperJobUID = ""
+}
+
 // applyVerifyOutcome maps a verifyOutcome to a phase transition (B3). It
 // returns changed (the Loop's status was mutated). The caller runs it every
 // reconcile at Verifying (it is the check/iterate/Succeeded path AND the
@@ -1508,6 +1532,13 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// only). Applies to BOTH the iterate (Implementing) and the re-plan
 		// (Planning) paths.
 		loop.Status.CurrentVerify = nil
+		// F83d (P3-5): the tamper record is per-pin, so it goes with the pin.
+		// Without this the previous pin's verdict stays on display for the WHOLE
+		// next Implementing run (the record is only re-stamped at the next
+		// advance, and the record writer runs before this decision in the same
+		// pass) — exactly the window P3-5 names, and the delivered-PR-body
+		// renderer reads it with no pin guard.
+		clearTamperRecord(loop.Status.Verify)
 		// OS1: record the failing check into progress (the next run can target
 		// it). The progress block is the operator's structured record; this is
 		// the operator's own evidence (the verify Job pod's exit codes), not a

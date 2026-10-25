@@ -561,9 +561,10 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 				reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 			loop := &coxv1alpha1.Loop{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-			// The object's presence means the operator has seen this iteration's
-			// verify Job; status.verify.iteration (nil until the outcome is applied)
-			// is the signal that an OUTCOME exists (F83d).
+			// The object's presence means the operator has read a verify Job's pod at
+			// least once; status.verify.iteration names the iteration whose OUTCOME
+			// was applied, and is not cleared when a new pin is set (F83d). While
+			// this verify is in progress there is no recorded outcome yet.
 			if loop.Status.Verify != nil {
 				Expect(loop.Status.Verify.Iteration).To(BeNil(), "no recorded verify outcome while the verify is in progress")
 				Expect(loop.Status.Checkpoint).To(BeNil())

@@ -274,8 +274,11 @@ type VerifyConfig struct {
 // VerifyStatus is the operator's record of the last verify run's evidence
 // (ADR-0005 D14). The values are kubelet-recorded container exit codes from
 // the verify Job's pod, never result.json claims. The object's presence means
-// the operator has seen this iteration's verify Job; `iteration` (nil until the
-// outcome is applied) is the signal that an outcome exists (F83d).
+// the operator has read a verify Job's pod at least once — the object is never
+// cleared (a new pin clears the per-pin fields instead), so presence does NOT
+// mean the CURRENT iteration's Job was seen. `iteration` names the iteration
+// whose outcome was applied; it is not cleared when a new pin is set, so it is
+// the outcome signal the checkpoint step keys off (F83d).
 //
 // Integrity note (ADR-0005 D12, corrected by F47): loops/status is NOT
 // operator-only. The editor role grants update/patch on it so cox approve and
@@ -328,8 +331,9 @@ type VerifyStatus struct {
 	// tamper container finished, or status was lost) — and nil is NEVER treated
 	// as clean (D24 fail-closed). The tamper decision does not read this field
 	// (F83c): it reads the verify Job's pod (verifyOutcome), so this is the
-	// operator's record of what that read produced — the source of the
-	// `cox describe` and delivered-PR-body tamper line.
+	// operator's record of what that read produced, and the source of the
+	// delivered PR body's tamper line (loop_deliver_description.go). Nothing
+	// else reads it today (F83d).
 	// +optional
 	TamperExitCode *int32 `json:"tamperExitCode,omitempty"`
 

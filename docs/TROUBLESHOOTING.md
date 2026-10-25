@@ -766,3 +766,106 @@ Manual-approval hold at `AwaitingApproval` (`approvalHoldPhase` in
 hold (`PolicyEnforced` condition, `internal/controller/loop_controller.go`).
 The `NetworkEnforced=False` hold has its own section above
 (`NetworkEnforced=False` with `--allow-unenforced-network`).
+
+### `CheckpointEntryUntrusted` Warning Event on a Loop
+
+**What you see:** `kubectl get events` (or `kubectl cox describe`) shows a
+Warning Event on the Loop with reason `CheckpointEntryUntrusted` and a
+message like:
+
+```
+status.checkpoints entry "checkpoint-other-loop-iter-7" is not a checkpoint
+of this Loop; dropped without deleting anything
+```
+
+The Loop's `status.checkpoints` entry that named that snapshot is removed
+from the status on the next reconcile. No snapshot is deleted.
+
+**What it means:** a `status.checkpoints` entry named a VolumeSnapshot that
+the operator did not write for this Loop. `status` is user-writable
+(anyone bound to the editor role can `PUT /status` — `cox approve` /
+`cox reject` use the same path), so the operator does not trust a name it
+read from status. An entry is "trusted" only when **both** of these hold
+(`checkpointEntryTrusted` in `internal/controller/loop_checkpoint.go`):
+
+1. the name has exactly the shape `checkpoint-<loop>-iter-<N>` for this
+   Loop **and the entry's recorded iteration matches the number in the
+   name** (`checkpointNameShapeOK` rejects an entry whose iteration and
+   name disagree, since the restore path re-derives the snapshot name from
+   the iteration); **and**
+2. a VolumeSnapshot with that name exists in the Loop's namespace and
+   carries the `coxswain.wattu.com/loop: <loop>` label (the operator sets
+   that label via `loopLabelKey` when it creates its own snapshots in
+   `newVolumeSnapshotObj`).
+
+An entry fails the trust check — and gets the `CheckpointEntryUntrusted`
+Event — when the name has the wrong shape (a different Loop's name, a
+hand-typed name, or a name with no/blank or a negative/non-numeric
+iteration suffix), the entry's iteration disagrees with the iteration in
+its name, **or** the snapshot exists but does not carry this Loop's label
+(it belongs to another Loop, or was created by hand without the label).
+
+**What the operator does with an untrusted entry:** nothing is deleted and
+nothing is restored from it.
+
+- **GC / retention path** (`applyCheckpointRetention` in
+  `internal/controller/loop_checkpoint.go`): when a status entry outside
+  the keep-set is found untrusted, the operator drops the *entry* from
+  `status.checkpoints` and emits the Warning Event. The VolumeSnapshot the
+  entry named is **not deleted** — a forged name could point at another
+  Loop's snapshot, and the operator must not delete an object this Loop
+  does not own.
+- **Restore path** (`b2LostPVCTarget` in
+  `internal/controller/loop_restore.go`): when the workspace PVC is lost
+  and the operator looks for a restore source, it scans `status.checkpoints`
+  backwards and takes the last entry whose verdict is `checkpointTrusted`
+  or `checkpointGone` — an untrusted entry is skipped entirely, so it is
+  never used as a restore source. If **every** recorded entry is
+  untrusted, the restore does not pick a snapshot at all: it takes the
+  visible A2 fallback — the workspace PVC is recreated **empty**, the
+  `Restored` condition is set to `RestoreReasonNoUsableCheckpoint` with a
+  message saying none of the `status.checkpoints` entries is a checkpoint
+  of this Loop, and a `NoUsableCheckpoint` Event is emitted. It is
+  visible, never a silent restore from a foreign snapshot.
+- A well-formed name whose snapshot simply does not exist (`checkpointGone`)
+  is a different case, not an Event: the entry is dropped from status in
+  GC, and on the restore path it stays the target and resolves to the
+  visible `NoUsableCheckpoint` fallback (I90).
+- A failed snapshot *read* (neither absent nor found, e.g. a transient
+  API error) is `checkpointUnknown`: the operator makes no decision and
+  requeues.
+
+**What to check:**
+
+1. **Who wrote the entry.** `status.checkpoints` is writable by the editor
+   role. Check the audit log for `PUT /status` on the Loop (or who ran a
+   `cox` status subcommand) around the time the Event appeared. If you did
+   not edit the status, someone/something else did — treat that as a
+   credential or access question, not a Loop bug.
+2. **The snapshot the entry named.** `kubectl get volumesnapshot
+   <name> -n <loop-namespace> -o json` and look at its labels.
+   Operator-written checkpoints carry `app.kubernetes.io/managed-by:
+   coxswain` and `coxswain.wattu.com/loop: <loop>`. A snapshot without the
+   `coxswain.wattu.com/loop` label for this Loop is not one the operator
+   created — it was created by hand or by another system.
+3. **The name shape and the iteration.** A legitimate entry for this Loop
+   is `checkpoint-<loop>-iter-<N>` with `N >= 0`, and the entry's
+   recorded iteration must equal the `N` in its name. Anything else
+   (a different Loop name in the middle of the string, `iter--1`,
+   `iter-07`, a trailing suffix, or a name/iteration pair that disagrees)
+   is the shape check failing.
+4. **Whether anything was lost.** The Event means the entry was dropped
+   from `status.checkpoints` only. The named snapshot — if it exists — is
+   untouched and still present. If it was a real checkpoint this Loop
+   should have (e.g. you hand-edited status and mistyped), re-check that
+   the matching trusted entries are still in `status.checkpoints` before
+   the retention GC moves past them (retention keeps the last 3 plus
+   milestone checkpoints).
+
+**Where the fix lives:** F47, `docs/REVIEW-PHASE1-R31.md`, PR #254 (merged
+as `1cad554`). Before the fix, a forged status entry that named a real but
+foreign snapshot could cause the operator to delete (GC path) or restore
+from (restore path) a snapshot belonging to a different Loop. After the
+fix, the trust check (name shape + matching iteration + Loop label) gates
+both paths: untrusted entries are dropped from status with a Warning
+Event and are never deleted or restored from.

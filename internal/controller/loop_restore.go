@@ -285,7 +285,10 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 	found := false
 	for _, cp := range slices.Backward(cps) {
 		switch r.checkpointEntryTrusted(ctx, loop, cp) {
-		case checkpointTrusted:
+		case checkpointTrusted, checkpointGone:
+			// Gone (a well-formed name whose snapshot is absent) stays the
+			// target: resolveCheckpointSource reports it Missing and the
+			// visible NoUsableCheckpoint fallback (I90) applies, as before.
 			last, found = cp, true
 		case checkpointUnknown:
 			return nil // a failed read is no decision

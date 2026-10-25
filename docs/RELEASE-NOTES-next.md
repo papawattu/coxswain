@@ -297,6 +297,12 @@ F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop 
 - **What changed.** The PR description's tamper line now uses the verify record only when its `verifiedCommit` equals the pin being delivered; a non-matching record reads as "no tamper evidence", the fail-closed reading the body already documented (F83e, PR #279). Two code comments were corrected with no behaviour change: the run-key comment (the rejection re-plan moves the run key and the accepted planning claim ends the episode, and the rejection arm itself clears nothing) and the reason-length note (F91b, PR #279).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #279).
 
+### F48f: the sandbox mount-failure Events read now filters server-side, and an unreadable Events read is re-surfaced instead of muted for the Loop's life — #282
+
+- **What was wrong.** When F48b's sandbox fails on an unmountable volume, the mount-failure decision reads the pod's `FailedMount` Events — but that read listed **every** Event in the namespace and filtered in memory (F48f); and a read that failed (the Events API unreadable) set a permanent marker, so the "Events unreadable" Warning fired once and never again, leaving the failure silent for the rest of the Loop's life (F48f).
+- **What changed.** The mount-failure Events read now sends the pod's UID to the apiserver as a field selector (`involvedObject.uid`) whenever it goes through the uncached apiReader, so the filter happens server-side (the in-memory UID/kind/name check stays on both paths as the correctness rule) (F48f, PR #282). The "Events unreadable" marker now records the last notification time and the Warning Event repeats every 5 minutes while the read keeps failing, instead of only once per Loop (F48f, PR #282).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #282).
+
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
 - **What was wrong.** `status.checkpoints` is user-writable (the editor role, since B3), and the operator acted on it without trusting it: the retention GC would delete any VolumeSnapshot a status entry named, even one belonging to another Loop, and the lost-PVC restore could take a forged entry as its restore source (PR #254, review finding review-api P2-1).

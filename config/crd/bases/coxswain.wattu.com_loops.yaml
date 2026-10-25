@@ -1305,10 +1305,9 @@ spec:
                   tamperJobUID:
                     description: |-
                       tamperJobUID is the UID of the verify Job whose pod produced
-                      tamperExitCode (F83). The tamper gate may only act when this matches the
-                      CURRENT verify Job's UID AND that Job's pod's tamper init terminated with
-                      the recorded code (status is user-writable, so a recorded code alone
-                      never fails a Loop).
+                      tamperExitCode (F83): provenance for the record. The tamper DECISION reads
+                      the verify Job's pod itself (verifyOutcome), never this status, so a
+                      status write cannot fail a Loop (F83c).
                     type: string
                   verifiedCommit:
                     description: |-

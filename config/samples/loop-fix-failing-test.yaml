@@ -3,7 +3,7 @@
 # The gocli sample app (examples/gocli) ships with Round() returning the
 # wrong value, so `go test ./...` is red. This Loop tells the agent to fix
 # round.go so the tests pass. The test files are protected paths: weakening
-# them trips the tamper gate (B2/D24).
+# them fails the Loop with TamperedVerify (B2/D24).
 #
 # Prerequisites (see docs/QUICKSTART.md):
 #   - the operator is installed and running

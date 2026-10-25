@@ -93,7 +93,28 @@ the verify Job's logs.
 
 See: [TROUBLESHOOTING.md#verifyinfrafailed--was-the-agent-tampering-f39](TROUBLESHOOTING.md#verifyinfrafailed--was-the-agent-tampering-f39)
 
-## 8. Why did the operator reject my edit to spec.restoreFrom?
+## 8. Why did my Loop fail with PinNotDescendant?
+
+`PinNotDescendant` means the verify Job's import refused the pinned commit
+before any check ran: the commit the operator pinned
+(`status.currentVerify.verifiedCommit`) does not descend from
+`status.baseCommit`. The pin is the runner's `headCommit` claim, not
+operator evidence — a runner (or a corrupted `result.json`) can pin any
+40-hex SHA reachable in the agent's repo, including pre-existing history
+that predates the Loop, so F43 makes the operator check ancestry at import
+time (`git merge-base --is-ancestor <base> <pin>` in the verify Job's
+`import-agent` init container; exit 97 maps to this reason). It is terminal
+with no retry, like `TamperedVerify`: a re-run would import the same pin. It
+is distinct from `VerifyInfraFailed` (git itself failed — that is retried
+twice) and from `TamperedVerify` (a protected path actually changed). Compare
+`status.baseCommit` and `status.currentVerify.verifiedCommit` with
+`kubectl cox describe`; if the pin is honest the workspace likely diverged
+from base, so fix the Loop's starting point and restart rather than waiting
+for a retry.
+
+See: [GLOSSARY.md#glossary](GLOSSARY.md#glossary) (the PinNotDescendant entry), [TROUBLESHOOTING.md#pinnotdescendant--the-verify-job-refused-the-pinned-commit-f43](TROUBLESHOOTING.md#pinnotdescendant--the-verify-job-refused-the-pinned-commit-f43)
+
+## 9. Why did the operator reject my edit to spec.restoreFrom?
 
 `spec.restoreFrom` is immutable (a CEL rule, `self == oldSelf`), so a
 mid-Loop rollback target cannot be swapped — a different rollback target is a
@@ -102,7 +123,7 @@ fork, not an edit. To roll back to a different checkpoint, create a fork
 
 See: [TROUBLESHOOTING.md#editing-specrestorefrom-is-rejected-by-admission-f35](TROUBLESHOOTING.md#editing-specrestorefrom-is-rejected-by-admission-f35)
 
-## 9. Why did a re-plan put my Loop back in AwaitingApproval?
+## 10. Why did a re-plan put my Loop back in AwaitingApproval?
 
 With manual approval, when the runner detects the plan changed after approval
 (a re-plan), the stale approval is cleared so an unapproved re-plan cannot be
@@ -113,7 +134,7 @@ workspace to see what changed.
 
 See: [TROUBLESHOOTING.md#event-planchangedrehold-f38](TROUBLESHOOTING.md#event-planchangedrehold-f38)
 
-## 10. My Loop Succeeded but there's no PR. What do I do?
+## 11. My Loop Succeeded but there's no PR. What do I do?
 
 A Loop that passes verify is held at phase `Verifying` (`Verifying=True
 reason=Delivering`, sandbox Suspended) until the `Delivered` condition is
@@ -125,7 +146,7 @@ on the next reconcile.
 
 See: [OPERATOR.md#7-redeliver](OPERATOR.md#7-redeliver)
 
-## 11. How do I give the agent access to a tool (not just a host)?
+## 12. How do I give the agent access to a tool (not just a host)?
 
 Declare the tool on the AgentPolicy (`spec.tools[]`); each declared tool gets
 its own credentialed, per-Loop tool proxy and its own egress peer in the
@@ -135,7 +156,7 @@ holds the sandbox Suspended.
 
 See: [GLOSSARY.md#glossary](GLOSSARY.md#glossary) (the tool proxy entry), [TROUBLESHOOTING.md#the-other-holds-on-a-suspended-sandbox](TROUBLESHOOTING.md#the-other-holds-on-a-suspended-sandbox) (the suspend hold), [OPERATOR.md#what-the-sandbox-can-reach](OPERATOR.md#what-the-sandbox-can-reach) (the egress peer)
 
-## 12. Where does the git credential live, and can the agent read it?
+## 13. Where does the git credential live, and can the agent read it?
 
 The git credential is the `git-cred` basic-auth Secret. It is mounted
 read-only into the workspace init container for the first clone only — once
@@ -146,7 +167,7 @@ credential at runtime, and it carries no service-account token either
 
 See: [QUICKSTART.md#3-the-github-token-secret](QUICKSTART.md#3-the-github-token-secret)
 
-## 13. My Loop is Paused for a stall or budget. How do I resume it?
+## 14. My Loop is Paused for a stall or budget. How do I resume it?
 
 A stall with `stallAction=Pause` or a budget cap with `onExceeded=Pause`
 holds the Loop Paused (`Paused=True reason=Stall` / `reason=Budget`). Resume
@@ -157,7 +178,7 @@ pause condition. To pause a running Loop deliberately, use `kubectl cox pause
 
 See: [OPERATOR.md#6-pause-and-resume](OPERATOR.md#6-pause-and-resume)
 
-## 14. The memory PVC won't bind. Why?
+## 15. The memory PVC won't bind. Why?
 
 The memory PVC is ReadWriteMany, but kind, k3d, and k3s ship an RWO-only
 default StorageClass, so the PVC stays Pending. `hack/rwx-storage.sh`
@@ -171,7 +192,7 @@ lessons (the memory-writer Job evicts the oldest beyond the cap).
 
 See: [OPERATOR.md#shared-memory-storage-phase-5](OPERATOR.md#shared-memory-storage-phase-5)
 
-## 15. What do the conditions mean?
+## 16. What do the conditions mean?
 
 `kubectl cox describe <loop>` shows the conditions with status, reason, and
 message: `status.phase=Succeeded` (the goal was met — verify passed and
@@ -183,7 +204,7 @@ timed out), and so on. The `reason` field is the most useful diagnostic.
 
 See: [OPERATOR.md#key-conditions-to-watch](OPERATOR.md#key-conditions-to-watch)
 
-## 16. How do I upgrade the operator?
+## 17. How do I upgrade the operator?
 
 Build the new installer manifest with your image tag, then apply it — the CRDs
 update in place and the manager Deployment rolls. The one-time fix for tool
@@ -193,7 +214,7 @@ deleting anything).
 
 See: [OPERATOR.md#upgrade](OPERATOR.md#upgrade)
 
-## 17. How do I uninstall coxswain cleanly?
+## 18. How do I uninstall coxswain cleanly?
 
 Remove the running Loops first (this deletes the sandbox pods, verify Jobs,
 deliver Jobs, and workspace PVCs) and wait until none are left, then remove

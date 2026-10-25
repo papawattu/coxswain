@@ -55,7 +55,11 @@ func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 			LastUsageReadAt:         &readAt,
 			ConsecutiveReadFailures: 3,
 			CostUsd:                 "0.42",
+			// F88: the wall clock describe never printed (OPERATOR.md:403).
+			ActiveSeconds: 3600,
 		}
+		// F88: the cap prints as the operator wrote it in the spec.
+		l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxWallClock: "2h"}
 		l.Status.Delivery = &coxv1alpha1.DeliverStatus{Branch: "ai/loop1", PRNumber: 1, PRURL: "http://gitea/pulls/1"}
 	})
 
@@ -73,6 +77,9 @@ func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 		// F43 commit pin the docs tell the operator to compare.
 		"tokens:     1234", "requests:   7", "unmetered:  2", "readFails:  3", "lastRead:   2026-03-04T05:06:07Z",
 		"cost:       $0.42", "Base commit:  aaaaaaaaaaaa", "Verified:     bbbbbbbbbbbb",
+		// F88: the wall clock OPERATOR.md:403 promises (status.budget.activeSeconds)
+		// with the spec's cap, rendered like the delivered PR body.
+		"active:     1h0m0s of 2h cap",
 		// F85 review: prNumber is int64 (was read as float64) and the tag is prURL.
 		"pr:         #1", "url:        http://gitea/pulls/1"} {
 		if !strings.Contains(out, want) {
@@ -98,6 +105,61 @@ func TestDescribe_BogusBudgetKeyPrintsNoTokens(t *testing.T) {
 	}
 	if !strings.Contains(out, "Budget:") {
 		t.Errorf("the Budget heading must still render\noutput:\n%s", out)
+	}
+	// F88: the heading is not bare even for this fixture — `active:` prints
+	// unconditionally, which is what makes the heading gate a guard rather than
+	// the fix (the F85 symptom was a heading with nothing under it).
+	if !strings.Contains(out, "active:     0s (no cap)") {
+		t.Errorf("describe must print the wall clock (F88)\noutput:\n%s", out)
+	}
+}
+
+// F88: the delivered PR body prints "(no cap)" for a Loop with no
+// spec.budget.maxWallClock (loop_deliver_description.go:430); describe prints
+// the same tail so the two surfaces cannot drift.
+func TestDescribe_NoCapPrintsNoCap(t *testing.T) {
+	l := typedLoop(t, func(l *coxv1alpha1.Loop) {
+		l.Status.Budget = &coxv1alpha1.BudgetStatus{ActiveSeconds: 90}
+	})
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+		return describeLoop(ctx, dc, ns, name, out)
+	}, "loop1")
+	if !strings.Contains(out, "active:     1m30s (no cap)") {
+		t.Errorf("describe output missing the no-cap wall clock\noutput:\n%s", out)
+	}
+}
+
+// P3-6: the condition type column is sized from the conditions printed, so the
+// status/reason columns line up for every condition the operator adds — the
+// 12-char constant broke for SandboxNotStarting (18) and
+// CheckpointsAvailable (20).
+func TestDescribe_ConditionColumnAligns(t *testing.T) {
+	l := typedLoop(t, func(l *coxv1alpha1.Loop) {
+		l.Status.Conditions = []metav1.Condition{
+			{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Done"},
+			{Type: "CheckpointsAvailable", Status: metav1.ConditionFalse, Reason: "NoStorageClass"},
+		}
+	})
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+		return describeLoop(ctx, dc, ns, name, out)
+	}, "loop1")
+	var idx []int
+	for line := range strings.SplitSeq(out, "\n") {
+		if i := strings.Index(line, "reason="); i >= 0 {
+			idx = append(idx, i)
+		}
+	}
+	if len(idx) != 2 {
+		t.Fatalf("expected two condition lines with a reason, got %d\noutput:\n%s", len(idx), out)
+	}
+	if idx[0] != idx[1] {
+		t.Errorf("the reason column is misaligned (indices %v)\noutput:\n%s", idx, out)
 	}
 }
 

@@ -273,7 +273,12 @@ type VerifyConfig struct {
 
 // VerifyStatus is the operator's record of the last verify run's evidence
 // (ADR-0005 D14). The values are kubelet-recorded container exit codes from
-// the verify Job's pod, never result.json claims.
+// the verify Job's pod, never result.json claims. The object's presence means
+// the operator has read a verify Job's pod at least once — the object is never
+// cleared (a new pin clears the per-pin fields instead), so presence does NOT
+// mean the CURRENT iteration's Job was seen. `iteration` names the iteration
+// whose outcome was applied; it is not cleared when a new pin is set, so it is
+// the outcome signal the checkpoint step keys off (F83d).
 //
 // Integrity note (ADR-0005 D12, corrected by F47): loops/status is NOT
 // operator-only. The editor role grants update/patch on it so cox approve and
@@ -288,15 +293,17 @@ type VerifyConfig struct {
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
 	// operator copies the pin it wrote on entering Verifying
-	// (status.currentVerify.verifiedCommit). Evidence that names a different
-	// verifiedCommit (e.g. left over from a previous iteration's Job) is treated
-	// as no evidence (D24).
+	// (status.currentVerify.verifiedCommit), so it always equals the pin it was
+	// recorded under (F83c): the freshness of the evidence is enforced by
+	// reading the verify Job's pod, not by comparing this field.
 	// +optional
 	VerifiedCommit string `json:"verifiedCommit,omitempty"`
 
-	// jobName is reserved and not currently written. The binding that keeps a
-	// previous Job's evidence from being reused is the operator's read of the
-	// verify Job pod filtered by the current Job's UID (D24).
+	// jobName is reserved and not currently written: the verify Job's name is
+	// derivable from the Loop name and iteration (verifyJobName), so it is not
+	// recorded, and the pod-to-Job binding is the UID (tamperJobUID). Writing it
+	// would allocate status.verify on every Verifying reconcile before any
+	// evidence exists (F83d).
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 
@@ -322,8 +329,11 @@ type VerifyStatus struct {
 	// (0 = clean, non-zero = a protected path differs between baseCommit and
 	// verifiedCommit). nil means no evidence (never ran, Job crashed before the
 	// tamper container finished, or status was lost) — and nil is NEVER treated
-	// as clean (D24 fail-closed). Only a value from a terminated container for
-	// the current verifiedCommit counts.
+	// as clean (D24 fail-closed). The tamper decision does not read this field
+	// (F83c): it reads the verify Job's pod (verifyOutcome), so this is the
+	// operator's record of what that read produced, and the source of the
+	// delivered PR body's tamper line (loop_deliver_description.go). Nothing
+	// else reads it today (F83d).
 	// +optional
 	TamperExitCode *int32 `json:"tamperExitCode,omitempty"`
 
@@ -397,14 +407,15 @@ type VerifyStatus struct {
 
 // CurrentVerifyStatus is the operator's pin of the current iteration's verified
 // commit (D11/D27). The operator writes verifiedCommit on entering Verifying
-// (resolved from the branch head it read itself, never from the agent), and the
-// verify evidence must name the same commit to be accepted. A mismatch or an
-// empty pin makes the evidence Unknown (fail-closed).
+// (resolved from the branch head it read itself, never from the agent). A stale
+// pin cannot be re-used as evidence because the verify pod is bound to the
+// current Job by UID (status.verify.tamperJobUID is provenance only — F83c).
 type CurrentVerifyStatus struct {
 	// verifiedCommit is the SHA the operator resolved from the Loop branch head
 	// at Verifying start and pinned for this iteration (D11). The verify Job
-	// checks out exactly this SHA, and the evidence's verifiedCommit must equal
-	// it for the evidence to count.
+	// checks out exactly this SHA, and the F83 writer records the same value in
+	// status.verify.verifiedCommit (the record is provenance; it is not what
+	// decides — F83c).
 	// +optional
 	VerifiedCommit string `json:"verifiedCommit,omitempty"`
 }
@@ -874,10 +885,11 @@ type LoopStatus struct {
 
 	// currentVerify is the operator's pin of the CURRENT iteration's verified
 	// commit, written by the operator on entering Verifying (D11) and used to
-	// bind the verify evidence to the commit being verified. It is distinct from
-	// verify.verifiedCommit (the commit the *evidence* names): a mismatch between
-	// the two means the evidence is stale (from a previous iteration's Job or a
-	// force-pushed branch) and must be treated as no evidence (D27 fail-closed).
+	// bind the verify evidence to the commit being verified. It is deliberate
+	// that this equals verify.verifiedCommit whenever the record was written by
+	// the operator (F83c): the two are stamped from the same pin, and a stale pin
+	// cannot be re-used as evidence because the verify pod is bound to the
+	// current Job by UID (status.verify.tamperJobUID is provenance only, D27).
 	// +optional
 	CurrentVerify *CurrentVerifyStatus `json:"currentVerify,omitempty"`
 

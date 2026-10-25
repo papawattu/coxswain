@@ -540,9 +540,7 @@ old evidence.
 then **delete and re-apply the Loop** — `Failed:SandboxFailed` is terminal and
 there is no retry command. The attempt count belongs to one **run**
 (`status.agent.infraAttempts`, keyed by `status.agent.infraEpisode` = the
-iteration + desired phase, F48g), so a new iteration, an approval advance or a
-rollback (`restoreFrom`) starts the count again: a Loop that already spent two
-attempts on a bad Secret gets a fresh three after the rollback that fixes it.
+iteration + desired phase, F48g), so a new iteration, an approval advance or a completed rollback resets the count for a Loop that has not failed yet; but a Loop already `Failed:SandboxFailed` stays `Failed` through a rollback (a rollback never changes the phase), so delete and re-apply it.
 Notes: a wedge that produces no such Event (e.g. a
 node that cannot schedule the pod) is still only surfaced as
 `SandboxNotStarting`, not failed; the kubelet's Events expire with the

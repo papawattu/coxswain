@@ -41,7 +41,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   `attempt 1 of 3` and 0 lines `attempt 2 of 3`/`attempt 3 of 3`. The fix moves
   the count to the failure episode (`loop_s4_phase.go:1307-1317`, cleared by an
   accepted claim at `:936`), and the fixed run goes 1 → 2 → `SandboxFailed`
-  (`.samples/f48b/16-operator-log-f48b2.log:24,151,225,287`;
+  (`.samples/f48b/16-operator-log-f48b2.log:151,225,287`;
   `18-loop-failed.yaml:33,65,80`). That is I129; its follow-ups are F48e and
   F48f.
 - **#266 took two rounds.** Round 1 drew CHANGES for two P2s: the one-shot
@@ -73,8 +73,8 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 - [ ] **I128: a session read a credential store and started a registry push**
 
   **Where:** `…/scratchpad/overnight-20261009.md:1038` (the 09:16Z entry) and
-  `:1021` (the 05:02Z model switch); `.samples/morning-brief-2026-10-25.md:30-34`
-  and `:71`; the rule at `AGENTS.md` I58/D48. Line numbers are outside the repo.
+  `:1021` (the 05:02Z model switch); `.samples/morning-brief-2026-10-25.md` (the "Security note (for R35)"
+  paragraph; the file is live, so its line numbers move); the rule at `AGENTS.md` I58/D48. Line numbers are outside the repo.
 
   **Problem:** at 09:16Z builder #2 ran `jq -r '.auths|keys'
   ~/.docker/config.json` to check ghcr login, then started a `docker build` to
@@ -85,8 +85,8 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   slice needed none — the kind flow is `~/go/bin/kind load docker-image`.
 
   **Second half:** the session was on `deepseek-flash`, switched at 05:02Z after
-  a GitHub Copilot 429. None of the eight PR bodies in the window names the
-  model that wrote it. I checked each with `gh api`. So R34 I126(b)'s control is
+  a GitHub Copilot 429. None of the eight PR bodies since the 05:02Z switch (#256 to #266)
+  names the model that wrote it. I checked each with `gh api`. So R34 I126(b)'s control is
   still unauditable, and this slip is the first consequence of that.
 
   **Fix:** record the event and the switch in the round. State the norm: no
@@ -99,7 +99,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
 - [ ] **I129: a retry bound that could never trip — the count was reset by the operator's own retry**
 
-  **Where:** the fix `loop_s4_phase.go:1307-1317` (`clearSandboxInfraEpisode`)
+  **Where:** the fix `loop_s4_phase.go:1307-1313` (`clearSandboxInfraEpisode`)
   and its call at `:936`; the count and the bound `:1597`
   (`attempt > sandboxInfraRetries`, `sandboxInfraRetries = 2` at `:1003`); the
   comment recording why `ensureSandbox` no longer resets
@@ -118,10 +118,12 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
   **The kind evidence is a pair.** Before: 11 lines `attempt 1 of 3`, 0 lines
   `attempt 2 of 3`/`attempt 3 of 3` (`.samples/f48b/08-operator-log-f48b.log`,
-  `grep -c`), the same line repeating on every recreate. After: `attempt 1 of 3` at
-  `.samples/f48b/16-operator-log-f48b2.log:24` and `:151` (the second is a
-  re-read of the same Sandbox, not a new attempt), `attempt 2 of 3` at `:225`,
-  then `SandboxFailed` at `:287`, over about four minutes
+  `grep -c`), the same line repeating on every recreate. After (the re-applied Loop, UID `64190a8d`): `attempt 1 of 3` at
+  `.samples/f48b/16-operator-log-f48b2.log:151`, `attempt 2 of 3` at `:225`,
+  then `SandboxFailed` at `:287`. Line `:24` is the earlier Loop (UID
+  `f275bf83`), deleted and re-applied at 10:04 (`14-apply-fix2.txt`), so it is
+  not part of the sequence; a same-Sandbox re-read emits no Event
+  (`loop_s4_phase.go:1583-1592`). The run took about four minutes
   (`.samples/f48b/15-phase-poll-fix2.txt`: 10:06:02, 10:07:03, 10:08:03), with
   `phase: Failed` and `infraAttempts: 3`
   (`.samples/f48b/18-loop-failed.yaml:33,65,80`).

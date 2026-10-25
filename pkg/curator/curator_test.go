@@ -10,8 +10,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -362,7 +364,13 @@ func TestCuratorRetryBounded(t *testing.T) {
 	defer srv.Close()
 	c := NewClient(srv.URL, "test-model")
 	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
-	v := c.Judge(context.Background(), "a good lesson")
+	// A deadline makes an unbounded ladder a fast failure, not a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	v := c.Judge(ctx, "a good lesson")
+	if ctx.Err() != nil {
+		t.Fatalf("Judge ran into the 2s deadline: the retry ladder is not bounded")
+	}
 	if v.Keep || !strings.Contains(v.Reason, "call failed") {
 		t.Fatalf("verdict = %+v, want keep=false 'call failed'", v)
 	}
@@ -388,5 +396,93 @@ func TestCuratorNoRetryOnHTTPStatus(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Errorf("requests = %d, want 1 (no retry on an HTTP status)", got)
+	}
+}
+
+// TestNewClientInstallsProductionLadder (F41): the production ladder and batch
+// retry budget are what NewClient installs; every other spec overrides them,
+// so an empty default (retries off) would otherwise pass the suite.
+func TestNewClientInstallsProductionLadder(t *testing.T) {
+	c := NewClient("http://x", "m")
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if len(c.retryDelays) != len(want) {
+		t.Fatalf("retryDelays = %v, want %v", c.retryDelays, want)
+	}
+	for i := range want {
+		if c.retryDelays[i] != want[i] {
+			t.Fatalf("retryDelays = %v, want %v", c.retryDelays, want)
+		}
+	}
+	if c.retryBudget != 20*time.Second {
+		t.Fatalf("retryBudget = %v, want 20s", c.retryBudget)
+	}
+}
+
+// TestCuratorRetryBudgetIsPerBatch (F41): the retry wait is shared by every
+// Judge call of one Client (one writer batch). With a 2ms budget and 1ms
+// delays, lesson 1 uses it (1 + 2 retries = 3 requests) and lesson 2 gets no
+// retry (1 request): 4 in total. Without the budget lesson 2 would retry too.
+func TestCuratorRetryBudgetIsPerBatch(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 1000, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	c.retryBudget = 2 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 2 {
+		if v := c.Judge(ctx, "a good lesson"); v.Keep || !strings.Contains(v.Reason, "call failed") {
+			t.Fatalf("lesson %d: verdict = %+v, want keep=false 'call failed'", i+1, v)
+		}
+	}
+	if got := hits.Load(); got != 4 {
+		t.Errorf("requests = %d, want 4 (3 for lesson 1, 1 for lesson 2)", got)
+	}
+}
+
+// TestCuratorRetryStopsOnContext (F41): a cancelled batch context ends the
+// wait between retries at once (the writer's overall budget).
+func TestCuratorRetryStopsOnContext(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 1000, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Hour}
+	c.retryBudget = 2 * time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	v := c.Judge(ctx, "a good lesson")
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("Judge waited %v: the retry wait ignored the context", time.Since(start))
+	}
+	if v.Keep || !strings.Contains(v.Reason, "call failed") {
+		t.Fatalf("verdict = %+v, want keep=false 'call failed'", v)
+	}
+}
+
+// TestCuratorLogsEachRetry (F41, R26 I90): every retry is logged (retry n/N,
+// the delay, the error) so a Job log shows the fallback.
+func TestCuratorLogsEachRetry(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	var hits atomic.Int32
+	srv := flakyProxy(t, 2, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	if v := c.Judge(context.Background(), "a good lesson"); !v.Keep {
+		t.Fatalf("setup: verdict = %+v, want keep", v)
+	}
+	out := buf.String()
+	for _, want := range []string{"retry 1/3 in 1ms", "retry 2/3 in 1ms"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "retry 3/3") {
+		t.Errorf("a third retry was logged but only two happened:\n%s", out)
 	}
 }

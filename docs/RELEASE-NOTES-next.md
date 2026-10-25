@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `c57a255` = PR #259); each claim cites its
+merged code on `main` (as of `7f8074b` = PR #260); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -216,6 +216,12 @@ existing Loops are unaffected, but new ones are.
   read) is closed by this fix.
 
 ## Other changes
+
+### F85: `cox describe` now shows the real budget and the commit pin and PR lines — #260
+
+- **What was wrong.** `cox describe`'s budget block read a field that doesn't exist and showed neither of the F44 fields, so the budget it printed was wrong and the F44 surfacing was invisible in the CLI (F85); and the commit pin (base vs verified) and the PR number/URL lines never printed at all (PR #260).
+- **What changed.** `cox describe` now shows the real token count (prompt plus completion), requests, unmetered requests, cost, the last usage read, and consecutive read failures — the F44 surface instead of a non-existent field; the base and verified commits now print, so the F43 ancestry fact is visible without reaching for the API; and the delivered PR's number and URL lines now print, which they never did before (PR #260).
+- **On upgrade.** Nothing to do beyond picking up the new `cox` binary — the fix is in the CLI, not the operator (PR #260).
 
 ### F48: a sandbox pod that never starts is surfaced, and a config-error start is bounded — #256
 
@@ -524,10 +530,11 @@ merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
 lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
 curator failure), F43 (the agent-chosen pin), F44 (surfacing unmetered
 requests and stale usage reads), F47 (untrusted checkpoint status entries), F84 (the `BudgetReadingStale` false
-alarm while the proxy pod is starting), F46 (the unwired model timeout), and
-F83 (the unrecorded tamper evidence) were closed by #229, #222, #233, #234,
-#238, #243, #241, #244, #248, #254, #259, #252, and #258. In plain words, the
-items still open:
+alarm while the proxy pod is starting), F85 (the `cox describe` budget block
+reading a non-existent field), F46 (the unwired model timeout), and F83 (the
+unrecorded tamper evidence) were closed by #229, #222, #233, #234, #238, #243,
+#241, #244, #248, #254, #259, #260, #252, and #258. In plain words, the items
+still open:
 
 **P1 (security):**
 
@@ -636,8 +643,6 @@ items still open:
   ownership-checked.
 - **F87(c)**: a forged `status.checkpoints` entry at the current iteration
   can stop the real checkpoint being taken.
-- **F85**: `cox describe`'s budget block misses the new usage-read fields
-  (`lastUsageReadAt`, `consecutiveReadFailures`).
 
 **Waiting on owner decisions (not builder tasks):**
 

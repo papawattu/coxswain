@@ -120,7 +120,8 @@ type deliverDescription struct {
 	// operator does not truncate user spec content — the goal is the
 	// Loop author's own text, and a huge goal is the author's problem).
 	Goal string
-	// Iteration is status.iteration (the operator's 1-based count).
+	// Iteration is status.iteration (the operator's 0-based run count: 0 on a
+	// first run, then 2, 3 … — 1 is skipped; F90).
 	Iteration int
 	// MaxIterations is spec.loop.maxIterations (0 when unset; the body
 	// prints "unset").
@@ -162,9 +163,9 @@ type deliverDescription struct {
 // all operator-recorded, never a runner claim) or the FINAL PASS (the
 // iteration the delivery names, with the pinned verifiedCommit).
 type verifyHistoryEntry struct {
-	// Iteration is the 1-based iteration number (the stallHistory entry's
-	// iteration for a failure; the operator's status.iteration for the
-	// final pass).
+	// Iteration is the iteration number (0 for a first run, then 2, 3 … — 1 is
+	// skipped; F90): the stallHistory entry's iteration for a failure, the
+	// operator's status.iteration for the final pass).
 	Iteration int
 	// Check is the failing check's name (empty for the final pass).
 	Check string

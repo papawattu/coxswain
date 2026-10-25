@@ -394,9 +394,15 @@ kubectl cox describe <loop>
 
 It shows:
 
-- **Phase** (Pending / Planning / Implementing / Verifying / Succeeded /
-  Failed / Paused) and the desired phase.
-- **Iteration** (the current iteration number, 1-indexed).
+- **Phase and the desired phase** (the phase is one of the `status.phase`
+  enum values: `Pending`, `Planning`, `AwaitingApproval`, `Implementing`,
+  `Verifying`, `Succeeded`, `Failed`, `Paused` — `CleaningUp` is declared in
+  the enum but the operator never writes it; the desired phase is what the
+  operator has asked the runner to be in, and it is half of the run key the
+  sandbox attempt counters use, so a budget- or stall-paused Loop shows
+  `Phase: Paused` with `DesiredPhase: Implementing`).
+- **Iteration** (`status.iteration`: 0 for the first run, then 2, 3 … — 1 is
+  skipped, the iterate advances to `max(iteration+1, 2)`).
 - **Conditions** (every condition in `status.conditions` — each with its
   status, reason, and message). The set grows as gates are added, so the
   output is what the Loop actually carries, not a fixed list.

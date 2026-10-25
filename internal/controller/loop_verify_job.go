@@ -210,9 +210,10 @@ var errVerifyStaleDeleted = errors.New("stale verify Job deleted")
 var errVerifyProxyNotReady = errors.New("verify Job held: the egress proxy pod is not Ready")
 
 // verifyJobName returns the verify Job name: <loop>-verify-<iteration>. The
-// iteration is the Loop's current 1-based iteration count (the pin in
-// status.currentVerify is the evidence the Job produces; the Job name carries
-// the iteration so a B4 re-run creates a NEW Job, never mutating the prior
+// iteration is the Loop's current status.iteration (0-based: 0 on a first run,
+// then 2, 3 … — 1 is skipped; F90; the pin in status.currentVerify is the
+// evidence the Job produces; the Job name carries the
+// iteration so a B4 re-run creates a NEW Job, never mutating the prior
 // one).
 func verifyJobName(loop *coxv1alpha1.Loop) string {
 	iter := loop.Status.Iteration

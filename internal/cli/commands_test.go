@@ -41,6 +41,8 @@ func typedLoop(t *testing.T, mutate func(*coxv1alpha1.Loop)) *unstructured.Unstr
 func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 	readAt := metav1.NewTime(time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC))
 	l := typedLoop(t, func(l *coxv1alpha1.Loop) {
+		// F90: the desired phase half of the run key, which describe now prints.
+		l.Status.DesiredPhase = "Implementing"
 		l.Status.Conditions = []metav1.Condition{
 			{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Done", Message: "verified + delivered"},
 			{Type: "Delivered", Status: metav1.ConditionTrue, Reason: "Delivered", Message: "PR #1 open"},
@@ -72,6 +74,10 @@ func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 	}, "loop1")
 
 	for _, want := range []string{"Name:         loop1", "Phase:        Succeeded", "Iteration:    2",
+		// F90: OPERATOR.md promises describe prints the desired phase; it is
+		// the operator's half of the run key (sandboxRunKey), so a paused Loop
+		// can be read without guessing why.
+		"DesiredPhase: Implementing",
 		"Goal:         make the thing work", "Ready", "Delivered", "PR #1", "branch:     ai/loop1",
 		// F85: the sum of promptTokens+completionTokens, the F44 fields, and the
 		// F43 commit pin the docs tell the operator to compare.
@@ -131,6 +137,24 @@ func TestDescribe_NoCapPrintsNoCap(t *testing.T) {
 	}, "loop1")
 	if !strings.Contains(out, "active:     1m30s (no cap)") {
 		t.Errorf("describe output missing the no-cap wall clock\noutput:\n%s", out)
+	}
+}
+
+// F90 negative control: the DesiredPhase line is gated on the field being set,
+// so a Loop that has never been given one (e.g. a CR created by hand and not yet
+// reconciled) prints no empty line. Paired with the positive assertion in
+// TestDescribe_WithConditionsBudgetDelivery, both directions of the one decision
+// are pinned.
+func TestDescribe_NoDesiredPhasePrintsNoLine(t *testing.T) {
+	l := typedLoop(t, nil) // the fixture sets no DesiredPhase
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+		return describeLoop(ctx, dc, ns, name, out)
+	}, "loop1")
+	if strings.Contains(out, "DesiredPhase:") {
+		t.Errorf("an unset status.desiredPhase must print nothing\noutput:\n%s", out)
 	}
 }
 

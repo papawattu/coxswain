@@ -67,7 +67,8 @@ import (
 
 // memoryWriterJobName returns the memory-writer Job name:
 // <loop>-memory-write-<iteration>. The iteration is the Loop's current
-// 1-based iteration count (the Job name carries the iteration so a re-plan /
+// status.iteration (0-based: 0 on a first run, then 2, 3 … — 1 is skipped;
+// F90; the Job name carries the iteration so a re-plan /
 // re-implement creates a NEW Job, never mutating the prior one — the verify
 // Job's I65 pattern: a recreated Job has a new UID and its pod is matched by
 // the Job's UID, not just its name).

@@ -141,20 +141,36 @@ func TestDescribe_NoCapPrintsNoCap(t *testing.T) {
 }
 
 // F90 negative control: the DesiredPhase line is gated on the field being set,
-// so a Loop that has never been given one (e.g. a CR created by hand and not yet
-// reconciled) prints no empty line. Paired with the positive assertion in
-// TestDescribe_WithConditionsBudgetDelivery, both directions of the one decision
-// are pinned.
+// so a Loop that has never been given one prints no empty line. Two shapes:
+// the field ABSENT (a CR created by hand, not yet reconciled) and the field
+// present but EMPTY (an unstructured object can carry `desiredPhase: ""` even
+// though the typed field is omitempty). Paired with the positive assertion in
+// TestDescribe_WithConditionsBudgetDelivery, both directions of the one
+// decision are pinned: dropping the print fails the positive, dropping the
+// `dp != ""` half prints a bare `DesiredPhase: ` and fails here.
 func TestDescribe_NoDesiredPhasePrintsNoLine(t *testing.T) {
-	l := typedLoop(t, nil) // the fixture sets no DesiredPhase
-	fc := newFakeLoopClient()
-	fc.setLoop(l)
-	deps := Deps{Loops: fc}
-	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-		return describeLoop(ctx, dc, ns, name, out)
-	}, "loop1")
-	if strings.Contains(out, "DesiredPhase:") {
-		t.Errorf("an unset status.desiredPhase must print nothing\noutput:\n%s", out)
+	for _, tc := range []struct {
+		name     string
+		setEmpty bool
+	}{
+		{name: "absent"},
+		{name: "present but empty", setEmpty: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := typedLoop(t, nil) // the fixture sets no DesiredPhase
+			if tc.setEmpty {
+				unstructuredSet(l, "desiredPhase", "")
+			}
+			fc := newFakeLoopClient()
+			fc.setLoop(l)
+			deps := Deps{Loops: fc}
+			out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+				return describeLoop(ctx, dc, ns, name, out)
+			}, "loop1")
+			if strings.Contains(out, "DesiredPhase:") {
+				t.Errorf("an unset/empty status.desiredPhase must print nothing\noutput:\n%s", out)
+			}
+		})
 	}
 }
 

@@ -932,12 +932,8 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		}
 		// F48b (kind finding): a claim the operator accepts is the recovery
 		// signal for a sandbox infra failure episode, so the attempt count the
-		// episode accumulated ends here (it is cleared where the episode ends —
-		// see the count's comment in ensureSandbox). A fresh pod that succeeds
-		// must not carry the old episode's count into the next failure's bound.
-		if loop.Status.Agent != nil && (loop.Status.Agent.InfraAttempts != 0 || loop.Status.Agent.InfraSandboxUID != "") {
-			loop.Status.Agent.InfraAttempts = 0
-			loop.Status.Agent.InfraSandboxUID = ""
+		// episode accumulated ends here (a helper: the gocyclo budget).
+		if clearSandboxInfraEpisode(loop) {
 			changed = true
 		}
 		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
@@ -1218,7 +1214,7 @@ func (r *LoopReconciler) sandboxMountFailureEvent(ctx context.Context, loop *cox
 // never blocks the reconcile (the condition path is unaffected).
 func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv1alpha1.Loop, cause error) {
 	logf.FromContext(ctx).Error(cause, "sandbox pod Events read failed; no mount-failure decision (the Loop is back to surfacing only)", "loop", loop.Name)
-	if loop.Annotations != nil && loop.Annotations[sandboxEventsUnreadableAnnotation] == "true" {
+	if loop.Annotations != nil && loop.Annotations[sandboxEventsUnreadableAnnotation] == resumeAnnotationTrue {
 		return
 	}
 	if r.Recorder != nil {
@@ -1231,7 +1227,7 @@ func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv
 	if patched.Annotations == nil {
 		patched.Annotations = make(map[string]string)
 	}
-	patched.Annotations[sandboxEventsUnreadableAnnotation] = "true"
+	patched.Annotations[sandboxEventsUnreadableAnnotation] = resumeAnnotationTrue
 	if err := r.Patch(ctx, patched, client.MergeFrom(loop.DeepCopy())); err != nil {
 		logf.FromContext(ctx).Error(err, "mark sandbox events unreadable notified", "loop", loop.Name)
 		return
@@ -1239,7 +1235,23 @@ func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv
 	if loop.Annotations == nil {
 		loop.Annotations = make(map[string]string)
 	}
-	loop.Annotations[sandboxEventsUnreadableAnnotation] = "true"
+	loop.Annotations[sandboxEventsUnreadableAnnotation] = resumeAnnotationTrue
+}
+
+// clearSandboxInfraEpisode ends a sandbox infra failure episode (F48b): the
+// count belongs to the EPISODE, not to one Sandbox (the operator's own retry
+// recreates the Sandbox, which used to reset it — see the count's comment in
+// ensureSandbox), so it is cleared by the recovery signal instead: a phase
+// claim the operator accepts. A fresh pod that succeeds must not carry the old
+// episode's count into the next failure's bound. Returns whether it changed
+// anything.
+func clearSandboxInfraEpisode(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Agent == nil || (loop.Status.Agent.InfraAttempts == 0 && loop.Status.Agent.InfraSandboxUID == "") {
+		return false
+	}
+	loop.Status.Agent.InfraAttempts = 0
+	loop.Status.Agent.InfraSandboxUID = ""
+	return true
 }
 
 // applySandboxNotStarting (F48) surfaces a sandbox pod that has been Pending

@@ -14,7 +14,7 @@
 
 ## Testing
 
-- **[EVIL-AGENT-E2E.md](EVIL-AGENT-E2E.md)** — Running the evil-agent e2e: what the 15 probes prove, what the harness needs (and what is not in the repo yet), the verdict words, where the evidence goes, and the known gaps from the post-merge review.
+- **[EVIL-AGENT-E2E.md](EVIL-AGENT-E2E.md)** — Running the evil-agent e2e: what its probes prove, what the harness needs (and what is not in the repo yet), the verdict words, where the evidence goes, and the known gaps from the post-merge review.
 
 ## Design (ADR)
 

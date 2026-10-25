@@ -8,9 +8,14 @@ anything the repo does not provide is marked **not in the repo yet** or
 
 ## What the test proves
 
-The harness runs the 15 probes of `test/e2e/evil-probes.sh` (probes 1-9,
-11, 11b, 12, 13 inside the agent container; probes 10, 14, 15 from the
-host side) against a **real agent pod**, in two Loop variants. Most probes are paired
+The harness runs 16 probe runs (15 probe numbers; probe 11 runs twice): probes 1-9, 11 (twice — git-push and
+git-credential, the "11b" group), 12 and 13 inside the agent container,
+and probes 10, 14 and 15 from the host side. The harness asserts 14 probe
+numbers for variant (b) and 12 for variant (a) in its `expect` lists
+(`evil-agent-e2e.sh`); probe 10's listener is variant (b) only (the runner
+kills a variant (a) tool call's process group, so no listener survives),
+and probe 15's result is in no `expect` list (see below). The probes run
+against a **real agent pod**, in two Loop variants. Most probes are paired
 with a positive control; the rest are judged on their detail line (see
 Verdict words):
 

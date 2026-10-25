@@ -20,9 +20,11 @@
 //     /workspace/.coxswain/lessons.json, applies the static write policy
 //     (pkg/memorywrite.Screen — secrets regex, ≤500 chars, single-line,
 //     non-blank, the size cap), writes ONLY the eligible lessons to
-//     /memory/lesson-<n>.txt, and reports a BOUNDED summary (counts + per-
-//     lesson sha256-prefix/written|dropped/rule — never the lesson text)
-//     via its termination message.
+//     /memory/<sha256>.txt (one file per lesson, named by the trimmed
+//     lesson's sha256 — the dedup key), and reports a BOUNDED summary
+//     (counts + per-lesson sha256-prefix/written|dropped/rule; a curator
+//     reason is free model text and may quote a lesson) via its
+//     termination message.
 //  3. The operator reads the Job's termination phase + the bounded summary
 //     and records the outcome on the MemoryWriteDone condition (and a
 //     Warning Event on failure). The Job's NetworkPolicy denies ALL egress

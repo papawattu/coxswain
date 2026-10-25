@@ -282,6 +282,13 @@ them as "starts with".
   there is no progress record carrying the claim); or the Loop has no
   workspace repo (no memory PVC to write to).
 
+The Events carry the same reason string as the condition in each case:
+the Warning Event on a failed write has reason `MemoryWriteFailed`
+(`loop_memory_writer_job.go`, `Eventf(..., EventTypeWarning,
+memoryWriteFailedReason, ...)`), and the one-time `Normal` audit Event
+has reason `MemoryWritten`. `kubectl get events --field-selector
+involvedObject.name=<loop>` shows them.
+
 The `MemoryWriteDone` condition is only meaningful once the Loop has
 terminated: on a non-terminal phase the operator sets no condition and
 creates no Job.
@@ -344,13 +351,15 @@ leak, but the audit is not guaranteed lesson-free.
 A failure (no write) is NOT audited: `MemoryWriteFailed` carries the
 plain failure message, because a failed write is unreliable evidence and
 the operator does not fabricate an audit for a write that did not
-happen. The condition-message copy of the audit is capped at 1000 bytes
-on a rune boundary (the client-go Event cap is 1024; the Job's
-termination message is bounded to 4096), so a long write is cut in the
-**condition message**. The cut keeps whole lines and ends with
-`… N more lines`; the counts line (`summary: total=…`) and the audit lines
-come first, so they are kept. To see the cut-off per-lesson lines, read
-the Job log, which carries the full summary.
+happen. The `memoryWriteAuditText` copy of the audit is capped at 1000
+bytes (the client-go Event cap is 1024; the Job's termination message is
+bounded to 4096), so a long write is cut in the **condition message**.
+The cut is line-oriented: whole lines are kept, then `… N more lines`
+says how many were dropped; there is never a half line. The counts line
+(`summary: total=…`) and the audit lines come first, so they are kept.
+Only a single line longer than the cap is cut on a rune boundary.
+To see the cut-off per-lesson lines, read the Job log, which carries
+the full summary.
 
 ### The caps
 

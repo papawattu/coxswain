@@ -1311,14 +1311,17 @@ func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv
 
 // clearSandboxInfraEpisode ends a sandbox infra failure episode early (F48b,
 // F48g): the count belongs to a RUN (see sandboxRunKey), not to one Sandbox —
-// the operator's own retry recreates the Sandbox and must NOT reset it. The two
-// boundaries are: (1) a phase claim the operator accepts (the recovery signal —
-// a fresh pod that succeeds must not carry the old count into the next
-// failure's bound), and (2) a completed restore (loop_restore.go), which
-// rebuilds the workspace without moving the run key. The other claim-free
-// boundaries (the verify iterate/re-plan, an approval advance) need no call
-// site: applySandboxFailure compares sandboxRunKey and restarts the count when
-// the run changed. Returns whether it changed anything.
+// the operator's own retry recreates the Sandbox and must NOT reset it. The
+// boundaries that call this are: (1) a phase claim the operator accepts (the
+// recovery signal — a fresh pod that succeeds must not carry the old count into
+// the next failure's bound), and (2) a workspace REBUILD, which replaces the
+// workspace the counted failures described without moving the run key: the two
+// restore completions (loop_restore.go: b2ApplyLostPVCRestore and
+// b2ApplyRestoreStep's rollback branch) and the A2 empty fallback (F48h, the
+// same file's b2KindLostPVC arm). The other claim-free boundaries (the verify
+// iterate/re-plan, an approval advance) need no call site: applySandboxFailure
+// compares sandboxRunKey and restarts the count when the run changed. Returns
+// whether it changed anything.
 func clearSandboxInfraEpisode(loop *coxv1alpha1.Loop) bool {
 	if loop.Status.Agent == nil || (loop.Status.Agent.InfraAttempts == 0 && loop.Status.Agent.InfraSandboxUID == "" && loop.Status.Agent.InfraEpisode == "") {
 		return false
@@ -1332,11 +1335,31 @@ func clearSandboxInfraEpisode(loop *coxv1alpha1.Loop) bool {
 }
 
 // sandboxRunKey names the run an infra-failure count belongs to: one
-// (iteration, desiredPhase) pair (F48g). `desiredPhase`, not `phase`, because a
-// pause changes the phase and not the desired phase (the pod is restarted in
-// place, not recreated) and a pause must not reset the count; `iteration`
-// because the verify iterate moves it even when the phase returns to one it has
-// already been in.
+// (iteration, desiredPhase) pair (F48g). It is a PROXY for "run", and it is
+// complete only for the transitions that move one of those two fields — the
+// verify iterate and the onVerifyFail=Plan re-plan move `iteration`
+// (loop_verify_job.go), the approve and the Planning hold move `desiredPhase`
+// (loop_approval.go, loop_s4_phase.go). A run change that moves neither needs
+// its own clear: the rejection re-plan (loop_approval.go, Planning -> Planning
+// with PlanAttempt++) is ended by the claim clear in advancePhaseFromClaim (the
+// PlanApproved claim that produced the plan cleared it first), and a workspace
+// rebuild by the three clears in loop_restore.go (the two restore completions
+// and the A2 empty fallback, F48h). If a new transition can start a run without
+// a claim and without iteration or desiredPhase moving, it must clear
+// explicitly — this key will not see it.
+//
+// desiredPhase, not phase: the count must survive a pause, and what makes that
+// true is that nothing counts while Phase == Paused (advancePhaseFromClaim
+// returns before sandboxFailureStep), not a property of desiredPhase. Two pause
+// entry points DO move it — the budget and stall pauses set desiredPhase =
+// Paused (loop_p2d_budget.go, loop_p2e_stall.go) and the resume restores it
+// (loop_p2f_paused.go) — so keeping desiredPhase in the key is defensive: if
+// counting is ever enabled at Paused, a pause still cannot look like a run
+// boundary. (The suspend pause leaves desiredPhase untouched —
+// loop_p2f_paused.go.) `iteration` is in the key because the verify iterate
+// moves it even when the phase returns to one it has already been in. No spec
+// can distinguish desiredPhase from phase here (nothing counts while
+// phase != desiredPhase), so this comment, not a test, is the record.
 func sandboxRunKey(loop *coxv1alpha1.Loop) string {
 	return fmt.Sprintf("%d/%s", loop.Status.Iteration, loop.Status.DesiredPhase)
 }
@@ -1642,6 +1665,14 @@ func (r *LoopReconciler) applySandboxFailure(ctx context.Context, loop *coxv1alp
 	// FIRST: during the recycle window the outgoing run's Terminating pod is
 	// still readable, and the UID match is what stops it being counted again.
 	if ep := sandboxRunKey(loop); loop.Status.Agent.InfraEpisode != ep {
+		// P3-7 (review-postmerge-10): the reset is a state change with a
+		// source, so it is recorded — an operator watching the Loop sees the
+		// count start again with no trace of why otherwise. A log line, not a
+		// condition/Event: this happens once per run boundary, not per pod.
+		if n := loop.Status.Agent.InfraAttempts; n > 0 {
+			log.Info("sandbox failure episode reset (the run changed); the previous count does not carry into the new run",
+				"loop", loop.Name, "from", loop.Status.Agent.InfraEpisode, "to", ep, "discardedAttempts", n)
+		}
 		loop.Status.Agent.InfraAttempts = 0
 		loop.Status.Agent.InfraEpisode = ep
 	}

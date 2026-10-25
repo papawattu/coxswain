@@ -233,7 +233,11 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 
 	It("clears the retry count when a claim the operator accepts ends the episode", func() {
 		loop, _, r, _, _ := plant("f48brecover")
-		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: 2, InfraSandboxUID: "some-sandbox-uid"}
+		// P3-5 (review-postmerge-10): seed the episode key too — a count with no
+		// key is a state the operator never writes (the claim clear only tests
+		// InfraAttempts, so the omission was invisible).
+		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: 2, InfraSandboxUID: "some-sandbox-uid",
+			InfraEpisode: sandboxRunKey(loop)}
 		r.readPhaseClaim = func(_ context.Context, _ *cov.Loop) (*PhaseClaim, error) {
 			return &PhaseClaim{ObservedPhase: cov.LoopPhasePlanning, Status: claimSuccess, Iteration: loop.Status.Iteration}, nil
 		}

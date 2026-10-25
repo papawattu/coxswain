@@ -1075,6 +1075,18 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 				lostMsg = "the workspace PVC was lost and none of the status.checkpoints entries is a checkpoint of this Loop (wrong name, iteration or owner); fell back to the A2 PVC-resume (an EMPTY workspace, I90)"
 			}
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint, lostMsg)
+			// F48h: an A2 fallback that rebuilds the workspace EMPTY is the same
+			// episode boundary as the two Restored completions (the lost-PVC/fork
+			// branch below and b2ApplyRestoreStep's rollback branch): the workspace
+			// the pre-fallback run failed against is gone — more literally than on
+			// a snapshot restore, because the content is not rolled back — and
+			// neither iteration nor desiredPhase moves, so the run key cannot see
+			// it. Without this, a count of 2 planted before the PVC was lost makes
+			// the first failure in the rebuilt workspace read attempt 3 and fail
+			// the Loop terminally (Failed:SandboxFailed has no retry). It is
+			// one-shot per PVC loss (b2LostPVCTarget returns nil once the PVC
+			// exists again), so this cannot hand out a repeating budget.
+			clearSandboxInfraEpisode(loop)
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
 				"workspace PVC lost, no usable checkpoint; A2 fallback (empty workspace)")

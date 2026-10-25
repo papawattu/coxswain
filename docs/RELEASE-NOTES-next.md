@@ -1,8 +1,8 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `a0f7fd6`); each claim cites its merged PR and
-the squash commit it landed as.
+merged code on `main` (as of `5e82c96` = PR #238); each claim cites its
+merged PR and the squash commit it landed as.
 
 ## Upgrade
 
@@ -19,8 +19,10 @@ Must-do items for an operator upgrading from v0.1.2; each points to
 
 Nothing else to do: `spec.workspace.restoreFrom` is now immutable (F35,
 #215); the agent NetworkPolicy is always created (F42, #213); the sandbox
-waits for the egress proxy for the init clone (F55, #220); and the memory
-lesson cap is 100 per PVC (F32, #233).
+waits for the egress proxy for the init clone (F55, #220); the memory
+lesson cap is 100 per PVC (F32, #233); the memory-writer audit records the
+trimmed lesson text (F33, #234); and a stale lessons file no longer
+survives into a later iteration (F34, #238).
 
 ## Security fixes
 
@@ -208,6 +210,18 @@ lesson cap is 100 per PVC (F32, #233).
 
 ## Other changes
 
+### F33: memory-writer audit now hashes the trimmed lesson, counts batch duplicates correctly, and creates the deny-all NetworkPolicy before the Job — #234
+
+- **What was wrong.** Three small defects in the memory-writer Job: the audit record's hash was over the raw lesson text, but the file was named by the trimmed text, so a lesson with leading or trailing whitespace had a hash that did not match its name (P3-1); two identical lessons in one batch produced per-lesson lines whose count did not agree with the batch total (P3-2); and the deny-all NetworkPolicy for the Job pod was created after the Job, so the pod's first seconds ran without the fence (P3-6) (PR #234).
+- **What changed.** The audit hash is now over the trimmed text; duplicate lessons are counted once per occurrence in the summary; the NetworkPolicy is created before the Job (merged `069a655` = PR #234).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #234).
+
+### F34: a stale lessons.json no longer survives into a later iteration, and the restore hold covers StoppingWorkloads — #238
+
+- **What was wrong.** A `lessons.json` left in the workspace from a previous iteration survived into the next one, so a check that found no lessons to propose still saw the old file (P3-3); and the restore hold checked only two of the three workload-stopping conditions the memory-writer Job documents, so a Loop could start a memory write while a restore was in progress (P3-4) (PR #238).
+- **What changed.** The stale `lessons.json` is removed when nothing is proposed; the restore hold now also covers `StoppingWorkloads` (merged `5e82c96` = PR #238).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #238).
+
 ### F31: a no-pod memory-writer Job is decided from its own conditions — #229
 
 - **What was wrong.** `recordMemoryWriterOutcome` requeued whenever the
@@ -261,7 +275,7 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
   `kept`/`static-drop` were not observed. All four outcomes are covered by
   the envtest specs (merged `dcd79da` = PR #206).
 
-### Docs — #208, #209, #224, #225, #227, #228, #230
+### Docs — #208, #209, #224, #225, #227, #228, #230, #231, #232, #236, #237, #239, #240
 
 - #208 (merged `2a3208f`): user docs — corrected a non-existent failure name
   in `docs/QUICKSTART.md` (the deliver credential is only read when
@@ -302,12 +316,29 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
   prose for a first-time reader; touches no commands or code blocks.
   The command defects in §9 it found are queued separately as F71 (see
   Known issues) (PR #230).
+- #231 (merged `5454541`): a new `docs/OPERATOR-FAQ.md` — plain-language
+  answers to the questions an operator asks first (PR #231).
+- #232 (merged `8533a89`): a new `docs/EGRESS-LOG.md` explaining how to read
+  the egress proxy's audit log, and a correction to the model-timeout
+  worst-case figure in `docs/OPERATOR.md` (PR #232).
+- #236 (merged `a6d73c5`): a new `docs/INDEX.md` — a table of contents for
+  the docs, each entry linked to the section (PR #236).
+- #237 (merged `f9569dc`): a new `docs/UPGRADE.md` section covering the
+  changes in this release since v0.1.2 (PR #237).
+- #239 (merged `acb40b0`): a new `docs/EVIL-AGENT-E2E.md` — how to run the
+  evil-agent e2e, what it proves, and what is still UNPROVEN (F72) (PR
+  #239).
+- #240 (merged `b850406`): a new `docs/MEMORY-WRITE.md` — how to read the
+  memory-write outcome (the `MemoryWritten` / `MemoryWriteFailed` conditions
+  and the curator verdicts) (PR #240).
 
 ## Known issues still open
 
 The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
-merged, and F31 (no-pod memory-writer Job) and F54 (the evil-agent e2e)
-were closed by #229 and #222. In plain words, the items still open:
+merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
+(D71 memory lesson cap), F33 (memory-writer audit), and F34 (stale
+lessons.json) were closed by #229, #222, #233, #234, and #238. In plain
+words, the items still open:
 
 **P1 (security):**
 
@@ -320,8 +351,6 @@ were closed by #229 and #222. In plain words, the items still open:
 
 **P2:**
 
-- **F32**: saved lessons have no count or size cap; oversized memory silently
-  disappears from the agent's context.
 - **F43**: the commit the system verifies and delivers is agent-chosen, with
   no check that it descends from the base commit.
 - **F44**: a broken or stale usage reading silently switches off the token
@@ -369,9 +398,19 @@ were closed by #229 and #222. In plain words, the items still open:
 
 **P3 (and P3 bundle):**
 
-- **F33/F34**: audit-record inconsistencies and stale-file leftovers (audit
-  hash/file-name mismatch, duplicate-lesson counts, deny-all NetworkPolicy
-  created after the Job; stale lessons file surviving restore).
+- **F74-F77**: four restore/fork edge cases left after F35 and F36 — an
+  empty-PVC fallback that leaves `baseCommit` set (F74, waits on owner
+  D84), a pre-F35 `Restored` marker with no target key that counts as
+  complete for any target (F75), a failed fork-retention label SET that is
+  not retried although the doc says it is (F76), and a rollback whose
+  post-state is undefined (F77) (PR #238's run).
+- **F78**: the memory-writer audit text drops the counts line first when the
+  summary exceeds 1000 bytes (the counts line is last, so `cox describe` can
+  lose `summary: total=...` for a 20-lesson write with long curator
+  reasons); two comments in the same file describe the writer's egress fence
+  oppositely; four spec names no longer describe what they assert (P2; PR
+  #238's run).
+
 - **F50/F45/F46/F57/F52**: small and low items — shipped samples pointing at
   repo contents they test, an inert second admission-policy binding, the
   runner model-timeout never wired, a checkpoint-recovery edge case, and a

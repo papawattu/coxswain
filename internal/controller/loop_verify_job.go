@@ -1318,6 +1318,30 @@ func recordTamperEvidence(loop *coxv1alpha1.Loop, pod *corev1.Pod, job *batchv1.
 	return changed
 }
 
+// clearTamperRecord drops the per-pin tamper record (F83d, P3-5): the tamper
+// exit code, the pin it was measured at, and the Job UID that produced it.
+//
+// Call it wherever the PIN goes away — the pin advance into Verifying (a new
+// verifiedCommit) and the iterate/re-plan (CurrentVerify = nil, the next run
+// re-pins). The record is joined to the pin, and the delivered-PR-body
+// renderer reads it with no pin guard (loop_deliver_description.go), so a
+// record left behind speaks for a pin the run never had. The iterate is the
+// boundary that matters most: that is where the NEXT Implementing run starts,
+// and it runs the whole way to the next advance before this record could
+// otherwise be replaced.
+//
+// It deliberately keeps Iteration and LastCheckResults (the checkpoint step
+// keys off the recorded iteration, loop_checkpoint.go) and the infra counters
+// (their own per-pin reset lives beside the pin advance).
+func clearTamperRecord(v *coxv1alpha1.VerifyStatus) {
+	if v == nil {
+		return
+	}
+	v.TamperExitCode = nil
+	v.VerifiedCommit = ""
+	v.TamperJobUID = ""
+}
+
 // applyVerifyOutcome maps a verifyOutcome to a phase transition (B3). It
 // returns changed (the Loop's status was mutated). The caller runs it every
 // reconcile at Verifying (it is the check/iterate/Succeeded path AND the
@@ -1440,7 +1464,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// running Job); when the bound is exhausted the Loop is Failed with the
 		// distinct VerifyInfraFailed reason (a Warning Event on the final
 		// failure and per retry, so the wedge that I65 fixes is observable).
-		return r.applyVerifyInfraFailure(ctx, loop, job, failedCheck, checkExitCode)
+		return r.applyVerifyInfraFailure(ctx, loop, pod, job, failedCheck, checkExitCode)
 	case verifyIterate:
 		// P2e stall gate (evaluated BEFORE the budget/maxIterations cap —
 		// stall wins: a capped loop that is ALSO stalled is Failed:Stalled,
@@ -1508,6 +1532,13 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// only). Applies to BOTH the iterate (Implementing) and the re-plan
 		// (Planning) paths.
 		loop.Status.CurrentVerify = nil
+		// F83d (P3-5): the tamper record is per-pin, so it goes with the pin.
+		// Without this the previous pin's verdict stays on display for the WHOLE
+		// next Implementing run (the record is only re-stamped at the next
+		// advance, and the record writer runs before this decision in the same
+		// pass) — exactly the window P3-5 names, and the delivered-PR-body
+		// renderer reads it with no pin guard.
+		clearTamperRecord(loop.Status.Verify)
 		// OS1: record the failing check into progress (the next run can target
 		// it). The progress block is the operator's structured record; this is
 		// the operator's own evidence (the verify Job pod's exit codes), not a
@@ -1794,11 +1825,39 @@ func jobCondition(job *batchv1.Job, t batchv1.JobConditionType) *batchv1.JobCond
 // failure (no container named) when the pod is gone or its statuses do not
 // explain the failure (a Failed Job with no terminated init — the
 // no-check-ran case).
-func verifyInfraFailureMessage(failedCheck string, checkExitCode int32) string {
+func verifyInfraFailureMessage(pod *corev1.Pod, failedCheck string, checkExitCode int32) string {
 	if failedCheck == "" {
 		return "the verify Job failed before the acceptance checks ran (no check init terminated; the Job condition is Failed) — the verify infrastructure failed, not the agent's work"
 	}
+	// F83d: keep the kubelet's own reason in the message. F83c maps OOMKilled (and
+	// an Evicted pod) to VerifyInfraFailed, and without the reason the operator
+	// has to know that exit 137 means SIGKILL to tell an out-of-memory init from a
+	// real failure. It helps every trusted init, not only tamper
+	// (ContainerCannotRun on the import gains its reason too).
+	if reason := initTerminatedReason(pod, failedCheck); reason != "" {
+		return fmt.Sprintf("trusted verify init %s failed (exit %d, reason %s) before the acceptance checks ran — the verify infrastructure failed, not the agent's work", failedCheck, checkExitCode, reason)
+	}
 	return fmt.Sprintf("trusted verify init %s failed (exit %d) before the acceptance checks ran — the verify infrastructure failed, not the agent's work", failedCheck, checkExitCode)
+}
+
+// initTerminatedReason returns the kubelet's Terminated.Reason for the named init
+// container, or "" when the container is absent, still running, or terminated
+// without a reason (ContainerStateTerminated.Reason is optional in the API — F89).
+func initTerminatedReason(pod *corev1.Pod, name string) string {
+	if pod == nil {
+		return ""
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		cs := &pod.Status.InitContainerStatuses[i]
+		if cs.Name != name {
+			continue
+		}
+		if t := cs.State.Terminated; t != nil {
+			return t.Reason
+		}
+		return ""
+	}
+	return ""
 }
 
 // applyVerifyInfraFailure is the I65 bounded-retry decision for a verify
@@ -1827,7 +1886,7 @@ func verifyInfraFailureMessage(failedCheck string, checkExitCode int32) string {
 // decision). It receives the verify Job already fetched by the caller
 // (applyVerifyOutcome — nil when it was NotFound; nothing to delete, the
 // recreate is the next reconcile's ensureVerifyJob).
-func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv1alpha1.Loop, job *batchv1.Job, failedCheck string, checkExitCode int32) (bool, bool) {
+func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod, job *batchv1.Job, failedCheck string, checkExitCode int32) (bool, bool) {
 	if loop.Status.Verify == nil {
 		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 	}
@@ -1878,7 +1937,7 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 		loop.Status.Verify.InfraJobUID = string(job.UID)
 	}
 	attempt := loop.Status.Verify.InfraAttempts
-	msg := verifyInfraFailureMessage(failedCheck, checkExitCode)
+	msg := verifyInfraFailureMessage(pod, failedCheck, checkExitCode)
 	if attempt > verifyInfraRetries {
 		// Exhausted: fail the Loop with the distinct reason. The bound is
 		// verifyInfraRetries RECREATIONS (the original attempt is attempt 1),

@@ -583,6 +583,11 @@ func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1
 				if loop.Status.Verify != nil {
 					loop.Status.Verify.InfraAttempts = 0
 					loop.Status.Verify.InfraJobUID = ""
+					// F83d (P3-5): the tamper record is per-pin too — the pin has just
+					// changed, so the old record describes a Job this iteration will
+					// never run. clearTamperRecord is shared with the iterate/re-plan,
+					// the other place a pin goes away (loop_verify_job.go).
+					clearTamperRecord(loop.Status.Verify)
 				}
 			}
 			advanced = true

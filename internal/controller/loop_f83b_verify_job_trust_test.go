@@ -31,6 +31,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -161,6 +162,10 @@ func TestF83bForeignVerifyJobIsNeverEvidence(t *testing.T) {
 	}).Build()
 	rec := record.NewFakeRecorder(16)
 	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	// A fixed clock so the marker's VALUE can be asserted (F83f): it must be the
+	// operator's clock, not merely present.
+	now := metav1.NewTime(time.Date(2026, 10, 25, 21, 0, 0, 0, time.UTC))
+	r.now = func() metav1.Time { return now }
 
 	_, requeue := r.applyVerifyOutcome(ctx, loop)
 	if !requeue {
@@ -175,8 +180,12 @@ func TestF83bForeignVerifyJobIsNeverEvidence(t *testing.T) {
 	if n := f83bEventCount(drainEvents(rec)); n != 1 {
 		t.Fatalf("the refusal must be visible: want 1 %s Event, got %d", verifyJobForeignEventReason, n)
 	}
-	if _, ok := loop.Annotations[verifyJobForeignAnnotation]; !ok {
-		t.Fatal("the Event must be transition-gated by the operator-owned marker")
+	// F83f: the marker assertion is VALUE-based (the last Event's time equal to
+	// the operator's clock), not presence-only: a `true` marker or the wrong time
+	// would pass a presence check while the gate reads the value.
+	if got := f83fMarker(t, loop); !got.Equal(now.UTC().Truncate(time.Second)) {
+		t.Fatalf("the marker must record the Event's time from the operator's clock: marker %s, clock %s",
+			got, now.UTC().Truncate(time.Second))
 	}
 }
 

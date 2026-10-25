@@ -561,9 +561,9 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 				reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 			loop := &coxv1alpha1.Loop{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
-			// F83 records the tamper evidence (and the pin) as soon as the
-			// tamper init terminates, i.e. before an outcome exists; the
-			// OUTCOME is status.verify.iteration, which must still be absent.
+			// The object's presence means the operator has seen this iteration's
+			// verify Job; status.verify.iteration (nil until the outcome is applied)
+			// is the signal that an OUTCOME exists (F83d).
 			if loop.Status.Verify != nil {
 				Expect(loop.Status.Verify.Iteration).To(BeNil(), "no recorded verify outcome while the verify is in progress")
 				Expect(loop.Status.Checkpoint).To(BeNil())

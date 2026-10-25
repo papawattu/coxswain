@@ -629,6 +629,14 @@ before the Loop fails with `VerifyInfraFailed`, a reason distinct from
 the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
 The agent did not tamper; the check could not run.
 
+A tamper init that the kubelet **OOM-killed** lands here too, not in
+`TamperedVerify`: the container is killed at its memory limit, so the exit code
+is `137` and the reason is `OOMKilled` (F83c maps it to `VerifyInfraFailed`, so
+the run is retried like any infra failure instead of failing the Loop for
+"tampering"). The condition message carries the kubelet's reason next to the
+exit code (F83d). If the retries exhaust, raise the verify Job's memory limit —
+the agent did not tamper, and the diff never ran.
+
 ### `PinNotDescendant` — the verify Job refused the pinned commit (F43)
 
 **What you see:** the Loop ends `Failed` with reason `PinNotDescendant`

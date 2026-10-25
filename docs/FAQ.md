@@ -83,9 +83,10 @@ See: [QUICKSTART.md#8-model-timeout-and-tuning](QUICKSTART.md#8-model-timeout-an
 ## 7. Why did my Loop fail with VerifyInfraFailed?
 
 `VerifyInfraFailed` means the tamper check could not run — git itself failed
-(a missing rev, a corrupt index, a clone problem), not that the agent
-tampered. The tamper script exiting 2 (`tamperGitErrorExit`) is mapped by
-`verifyOutcome` to `VerifyInfraFailed` (an infrastructure failure), and verify infra failures are retried
+(a missing rev, a corrupt index, a clone problem), or the tamper init was
+OOM-killed (exit 137, reason `OOMKilled`) — not that the agent tampered. The
+tamper script exiting 2 (`tamperGitErrorExit`) is mapped by `verifyOutcome` to
+`VerifyInfraFailed` (an infrastructure failure), and verify infra failures are retried
 twice (three total runs) before the Loop fails with this reason, which is
 distinct from `TamperedVerify` (a protected path actually changed). Check the
 repo is reachable from the verify Job, that `baseCommit` is a real commit, and

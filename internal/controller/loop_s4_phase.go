@@ -583,6 +583,15 @@ func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1
 				if loop.Status.Verify != nil {
 					loop.Status.Verify.InfraAttempts = 0
 					loop.Status.Verify.InfraJobUID = ""
+					// F83d (P3-5): the tamper record is per-pin too. The pin has just
+					// changed, so the old record describes a Job this iteration will
+					// never run; leaving it makes the next Implementing run and any
+					// delivered body speak for the previous pin. Clearing here cannot
+					// lose the current iteration's data: this runs at the advance INTO
+					// Verifying, before the F83 writer can stamp the new pin's record.
+					loop.Status.Verify.TamperExitCode = nil
+					loop.Status.Verify.VerifiedCommit = ""
+					loop.Status.Verify.TamperJobUID = ""
 				}
 			}
 			advanced = true

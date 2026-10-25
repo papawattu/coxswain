@@ -1440,7 +1440,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// running Job); when the bound is exhausted the Loop is Failed with the
 		// distinct VerifyInfraFailed reason (a Warning Event on the final
 		// failure and per retry, so the wedge that I65 fixes is observable).
-		return r.applyVerifyInfraFailure(ctx, loop, job, failedCheck, checkExitCode)
+		return r.applyVerifyInfraFailure(ctx, loop, pod, job, failedCheck, checkExitCode)
 	case verifyIterate:
 		// P2e stall gate (evaluated BEFORE the budget/maxIterations cap —
 		// stall wins: a capped loop that is ALSO stalled is Failed:Stalled,
@@ -1794,11 +1794,39 @@ func jobCondition(job *batchv1.Job, t batchv1.JobConditionType) *batchv1.JobCond
 // failure (no container named) when the pod is gone or its statuses do not
 // explain the failure (a Failed Job with no terminated init — the
 // no-check-ran case).
-func verifyInfraFailureMessage(failedCheck string, checkExitCode int32) string {
+func verifyInfraFailureMessage(pod *corev1.Pod, failedCheck string, checkExitCode int32) string {
 	if failedCheck == "" {
 		return "the verify Job failed before the acceptance checks ran (no check init terminated; the Job condition is Failed) — the verify infrastructure failed, not the agent's work"
 	}
+	// F83d: keep the kubelet's own reason in the message. F83c maps OOMKilled (and
+	// an Evicted pod) to VerifyInfraFailed, and without the reason the operator
+	// has to know that exit 137 means SIGKILL to tell an out-of-memory init from a
+	// real failure. It helps every trusted init, not only tamper
+	// (ContainerCannotRun on the import gains its reason too).
+	if reason := initTerminatedReason(pod, failedCheck); reason != "" {
+		return fmt.Sprintf("trusted verify init %s failed (exit %d, reason %s) before the acceptance checks ran — the verify infrastructure failed, not the agent's work", failedCheck, checkExitCode, reason)
+	}
 	return fmt.Sprintf("trusted verify init %s failed (exit %d) before the acceptance checks ran — the verify infrastructure failed, not the agent's work", failedCheck, checkExitCode)
+}
+
+// initTerminatedReason returns the kubelet's Terminated.Reason for the named init
+// container, or "" when the container is absent, still running, or terminated
+// without a reason (ContainerStateTerminated.Reason is optional in the API — F89).
+func initTerminatedReason(pod *corev1.Pod, name string) string {
+	if pod == nil {
+		return ""
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		cs := &pod.Status.InitContainerStatuses[i]
+		if cs.Name != name {
+			continue
+		}
+		if t := cs.State.Terminated; t != nil {
+			return t.Reason
+		}
+		return ""
+	}
+	return ""
 }
 
 // applyVerifyInfraFailure is the I65 bounded-retry decision for a verify
@@ -1827,7 +1855,7 @@ func verifyInfraFailureMessage(failedCheck string, checkExitCode int32) string {
 // decision). It receives the verify Job already fetched by the caller
 // (applyVerifyOutcome — nil when it was NotFound; nothing to delete, the
 // recreate is the next reconcile's ensureVerifyJob).
-func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv1alpha1.Loop, job *batchv1.Job, failedCheck string, checkExitCode int32) (bool, bool) {
+func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod, job *batchv1.Job, failedCheck string, checkExitCode int32) (bool, bool) {
 	if loop.Status.Verify == nil {
 		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 	}
@@ -1878,7 +1906,7 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 		loop.Status.Verify.InfraJobUID = string(job.UID)
 	}
 	attempt := loop.Status.Verify.InfraAttempts
-	msg := verifyInfraFailureMessage(failedCheck, checkExitCode)
+	msg := verifyInfraFailureMessage(pod, failedCheck, checkExitCode)
 	if attempt > verifyInfraRetries {
 		// Exhausted: fail the Loop with the distinct reason. The bound is
 		// verifyInfraRetries RECREATIONS (the original attempt is attempt 1),

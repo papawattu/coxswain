@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `23124e7` = PR #242); each claim cites its
+merged code on `main` (as of `4d7b5d2` = PR #245); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -216,6 +216,39 @@ survives into a later iteration (F34, #238).
 - **What changed.** The audit hash is now over the trimmed text; duplicate lessons are counted once per occurrence in the summary; the NetworkPolicy is created before the Job (merged `069a655` = PR #234).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #234).
 
+### F43: the verify Job refuses a pinned commit that does not descend from the base — #244
+
+- **What was wrong.** The commit the system verifies and delivers was
+  agent-chosen, with no check that it descends from the base commit (the
+  finding's P1-1, downgraded to P2 by the reviewer before the fix): the pin
+  was shape-checked only (a 40-hex SHA), so a runner (or a corrupted
+  `result.json`) could pin any commit reachable in the agent's repo,
+  including pre-existing history that predates the Loop — and the tamper
+  diff, which is tree-to-tree, cannot catch it (an unchanged pre-existing
+  tree reads as clean) (merged `80dac60` = PR #244).
+- **What changed.** The verify Job's `import-agent` init now runs
+  `git merge-base --is-ancestor <baseCommit> <pin>` before the checkout:
+  exit 1 ("not an ancestor") exits with a distinct code that the operator
+  maps to a terminal `Failed` reason `PinNotDescendant` (a Warning Event
+  naming both commits, a completion metric, no retry — a re-run would
+  import the same pin); any other git failure stays an infra failure
+  (`VerifyInfraFailed`, retried). A pin equal to the base is allowed ("the
+  agent changed nothing") and the checks then decide. In the runner,
+  `priorCompletedResult` re-emits a stored Implementing success only if its
+  `headCommit` is a commit in the workspace repo — a defence in depth; the
+  PR states the trusted gate is the verify Job's ancestry check (a
+  per-container-run stamp was shown to be forgeable: the agent shell runs
+  as the same user in the same container) (merged `80dac60` = PR #244).
+  Also in #244: a blocked Planning no longer truncates `PLAN.md` (the phase
+  hook runs only when the model call produced an answer), stale comments
+  that claimed a `summary` field / `result.json` reader were corrected (no
+  behaviour change), and `commitWorkspace` now returns a reason on each git
+  failure instead of an empty string. Lab run: the new import-agent script
+  ran in a real verify pod (pass path; the pin equaled the base), and the
+  refusal path is covered by the spec that executes the real generated
+  script (PR #244).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #244).
+
 ### F78: the memory-writer audit keeps its counts line, and the 1000-byte cut is line-oriented — #243
 
 - **What was wrong.** The audit text cut at 1000 bytes on a byte/rune
@@ -359,6 +392,15 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
   TROUBLESHOOTING, and UPGRADE: the F55 entry's condition worded precisely,
   a code line number dropped, the cap wording narrowed, and a
   `MemoryPVCUnbound` entry (that Event isn't in v0.1.2). Docs only (PR #242).
+- #245 (merged `4d7b5d2`): docs plus two comment-only code changes —
+  TROUBLESHOOTING names the `MemoryWriteFailed` Warning Event's reason and
+  says the audit text is now cut on whole lines with "… N more lines" (F78,
+  #243), GLOSSARY's "Stall gate" excludes verify infrastructure failures,
+  EVIL-AGENT-E2E's probe count now matches the harness `expect` lists, and
+  two stale comments that said lessons are written to
+  `/memory/lesson-<n>.txt` were corrected to `<sha256>.txt`
+  (`cmd/memory-writer/main.go`, `internal/controller/loop_memory_writer_job.go`).
+  Comments only; no behaviour change (PR #245).
 
 ### F41: the curator call is retried on a transport failure — #241
 
@@ -389,10 +431,10 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
 The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
 merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
 (D71 memory lesson cap), F33 (memory-writer audit), F34 (stale
-lessons.json), F78 (memory-writer audit counts line), and F41 (the unknown
-curator failure) were closed by #229, #222, #233, #234, #238, #243, and
-#241. In plain
-words, the items still open:
+lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
+curator failure), and F43 (the agent-chosen pin) were closed by #229,
+#222, #233, #234, #238, #243, #241, and #244. In plain words, the items
+still open:
 
 **P1 (security):**
 
@@ -405,8 +447,6 @@ words, the items still open:
 
 **P2:**
 
-- **F43**: the commit the system verifies and delivers is agent-chosen, with
-  no check that it descends from the base commit.
 - **F44**: a broken or stale usage reading silently switches off the token
   and cost caps (surface only; whether to hold the Loop is an open owner
   decision).
@@ -465,6 +505,8 @@ words, the items still open:
   a summary longer than that silently loses its tail (the operator-side
   1000-byte audit cut, F33/F78, bounds the audit text only — the condition
   message can exceed it when a quoted lesson line is long).
+- **F81**: an envtest spec is flaky: a hard-coded ClusterIP it depends on is
+  not a stable address across apiservers, so the run intermittently fails.
 
 - **F50/F45/F46/F57/F52**: small and low items — shipped samples pointing at
   repo contents they test, an inert second admission-policy binding, the

@@ -864,11 +864,11 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		})).To(Succeed())
 
 		// The no-CRD reconciler (withSupport=false, withoutCRD=true): its
-		// snapshotCRDPresent seam returns false, so NO snapshot read may be
-		// issued. It is also the client the spec's Reconcile uses, so a read
-		// would surface as an error from the fake-less envtest client (the CRD
-		// is installed in envtest, so the read would SUCCEED and the entry would
-		// be judged Gone — the old code's damage).
+		// snapshotCRDPresent seam returns false, so the checkpoint step must
+		// issue NO snapshot read. envtest HAS the VolumeSnapshot CRD installed,
+		// so a read the step still made would SUCCEED and — the seeded entry has
+		// no snapshot behind it — be judged Gone, dropping the entry: that is
+		// the pre-fix damage the M0 run records.
 		r := b1NewReconciler(false, true)
 		s5aDriveToVerifyingWithReconciler(r, ns, name)
 

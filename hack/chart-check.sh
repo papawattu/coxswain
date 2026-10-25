@@ -9,8 +9,10 @@
 #    release-namespace templating, but must not drop a resource the
 #    kustomize install ships).
 #
-# It runs offline (no kind, no cluster) so CI can run it before a helm
-# binary exists in the image (it only needs helm + go + python3).
+# It runs offline (no kind, no cluster; it only needs helm + go + python3).
+# NOTE: no workflow runs it yet. It is a manual `make chart-check` until the
+# owner lands docs/proposals/test-chart.yml.proposed (workflow edits are an
+# owner push), so a regenerated chart is only caught if someone runs it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -98,6 +100,8 @@ import sys, yaml
 from collections import Counter
 
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1]).read()) if d]
+# A SUBSET: the cluster-scoped kinds this chart renders today. A new
+# cluster-scoped kind in a future template must be added here.
 CLUSTER_SCOPED = {
     'Namespace', 'ClusterRole', 'ClusterRoleBinding', 'CustomResourceDefinition',
     'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicyBinding',
@@ -115,6 +119,11 @@ for k in dups:
 for d in docs:
     if d.get('kind') in CLUSTER_SCOPED and 'namespace' in d['metadata']:
         bad.append("cluster-scoped %s/%s carries metadata.namespace=%s" % (d['kind'], d['metadata']['name'], d['metadata']['namespace']))
+# F45's outcome is ONE effective binding: a consistent second VAP+binding pair
+# would resolve and not collide, but is the same defect in a quieter form.
+bindings = [d for d in docs if d.get('kind') == 'ValidatingAdmissionPolicyBinding']
+if len(bindings) != 1:
+    bad.append("expected exactly 1 ValidatingAdmissionPolicyBinding, found %d: %s" % (len(bindings), [b['metadata']['name'] for b in bindings]))
 if not vaps:
     bad.append("no ValidatingAdmissionPolicy in the render (the guard would pass vacuously)")
 if bad:

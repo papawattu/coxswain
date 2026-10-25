@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"strings"
@@ -29,19 +30,11 @@ func TestApproveLoop_SetsPlanApprovedCondition(t *testing.T) {
 		t.Fatalf("approveLoop: %v", err)
 	}
 	// The PlanApproved condition must be present (True, the hash in the message).
-	// The command does Get then Update: the Update carries the whole object with
-	// the condition added to status.conditions.
-	if len(f.updates) == 0 {
-		t.Fatal("no Update calls recorded (the condition was not written)")
-	}
-	u, ok := f.updates[len(f.updates)-1].(*unstructured.Unstructured)
-	if !ok {
-		t.Fatalf("last Update was not an *unstructured.Unstructured: %T", f.updates[len(f.updates)-1])
-	}
-	conds, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
-	if !found {
-		t.Fatal("status.conditions not found after approve")
-	}
+	// F87: the command does Get then a status merge patch — NOT a whole-object
+	// Update (which wrote every status field the CLI had read back).
+	_, body := assertStatusConditionPatch(t, f)
+	assertPatchHasNoOtherStatus(t, body)
+	conds := patchConditions(t, body)
 	var foundCond bool
 	for _, c := range conds {
 		cm, ok := c.(map[string]any)
@@ -65,6 +58,56 @@ func TestApproveLoop_SetsPlanApprovedCondition(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Approved the plan") {
 		t.Errorf("output = %q, want to contain 'Approved the plan'", out.String())
+	}
+}
+
+// TestApproveLoop_PatchCarriesResourceVersion verifies the status patch keeps
+// the live metadata.resourceVersion, so a racing operator write is a 409
+// Conflict rather than a silent overwrite (the whole-object PUT carried it for
+// the same reason; F87 must not drop it).
+func TestApproveLoop_PatchCarriesResourceVersion(t *testing.T) {
+	const loopName = "approve-rv"
+	loop := newFakeLoop(loopName, map[string]any{})
+	loop.SetResourceVersion("4242")
+	f := newFakeLoopClient()
+	f.setLoop(loop)
+	dc := Deps{
+		Loops:     f,
+		Workspace: &fakeWorkspace{plan: "a plan\n"},
+	}
+	var out bytes.Buffer
+	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
+		t.Fatalf("approveLoop: %v", err)
+	}
+	_, body := assertStatusConditionPatch(t, f)
+	meta, ok := body["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("the status patch carries no metadata (the resourceVersion precondition): %v", body)
+	}
+	if got := meta["resourceVersion"]; got != "4242" {
+		t.Errorf("patch metadata.resourceVersion = %v, want \"4242\" (optimistic concurrency)", got)
+	}
+}
+
+// TestRejectLoop_PatchCarriesResourceVersion is the reject counterpart.
+func TestRejectLoop_PatchCarriesResourceVersion(t *testing.T) {
+	const loopName = "reject-rv"
+	loop := newFakeLoop(loopName, map[string]any{})
+	loop.SetResourceVersion("777")
+	f := newFakeLoopClient()
+	f.setLoop(loop)
+	dc := Deps{Loops: f}
+	var out bytes.Buffer
+	if err := rejectLoop(context.Background(), dc, loopName, "wrong direction", &out); err != nil {
+		t.Fatalf("rejectLoop: %v", err)
+	}
+	_, body := assertStatusConditionPatch(t, f)
+	meta, ok := body["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("the status patch carries no metadata (the resourceVersion precondition): %v", body)
+	}
+	if got := meta["resourceVersion"]; got != "777" {
+		t.Errorf("patch metadata.resourceVersion = %v, want \"777\" (optimistic concurrency)", got)
 	}
 }
 
@@ -92,14 +135,8 @@ func TestApproveLoop_ReplaceOnReapprove(t *testing.T) {
 	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
 		t.Fatalf("approveLoop (re-approve): %v", err)
 	}
-	if len(f.updates) == 0 {
-		t.Fatal("no Update calls recorded")
-	}
-	u, ok := f.updates[len(f.updates)-1].(*unstructured.Unstructured)
-	if !ok {
-		t.Fatalf("last Update was not an *unstructured.Unstructured: %T", f.updates[len(f.updates)-1])
-	}
-	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	_, body := assertStatusConditionPatch(t, f)
+	conds := patchConditions(t, body)
 	count := 0
 	for _, c := range conds {
 		cm, ok := c.(map[string]any)
@@ -129,17 +166,9 @@ func TestRejectLoop_SetsPlanRejectedCondition(t *testing.T) {
 	if err := rejectLoop(context.Background(), dc, loopName, "the plan misses the edge case", &out); err != nil {
 		t.Fatalf("rejectLoop: %v", err)
 	}
-	if len(f.updates) == 0 {
-		t.Fatal("no Update calls recorded")
-	}
-	u, ok := f.updates[len(f.updates)-1].(*unstructured.Unstructured)
-	if !ok {
-		t.Fatalf("last Update was not an *unstructured.Unstructured: %T", f.updates[len(f.updates)-1])
-	}
-	conds, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
-	if !found {
-		t.Fatal("status.conditions not found after reject")
-	}
+	_, body := assertStatusConditionPatch(t, f)
+	assertPatchHasNoOtherStatus(t, body)
+	conds := patchConditions(t, body)
 	var foundCond bool
 	for _, c := range conds {
 		cm, ok := c.(map[string]any)
@@ -251,6 +280,78 @@ func TestDiffLoop_PlanChanged(t *testing.T) {
 	}
 }
 
+// --- F87(d): approve/reject write a status merge patch, not a whole-object PUT ---
+
+// assertStatusConditionPatch asserts the command wrote its condition with ONE
+// JSON merge patch to the status subresource, and returns the patch call and its
+// decoded body. It fails when a whole-object Update was also (or instead)
+// issued: the pre-F87 path read the whole object, edited status.conditions and
+// PUT the object back to /status, writing every other status field with it.
+func assertStatusConditionPatch(t *testing.T, f *fakeLoopClient) (patchCall, map[string]any) {
+	t.Helper()
+	if len(f.updates) != 0 {
+		t.Fatalf("%d whole-object Update(s) recorded; F87: approve/reject must not PUT the whole object back to /status", len(f.updates))
+	}
+	if len(f.patches) != 1 {
+		t.Fatalf("%d Patch call(s) recorded, want exactly 1 (one status merge patch)", len(f.patches))
+	}
+	p := f.patches[0]
+	if p.subresource != "status" {
+		t.Fatalf("patch subresource = %q, want \"status\" (the conditions live on the status subresource)", p.subresource)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(p.patch, &body); err != nil {
+		t.Fatalf("patch body is not JSON: %v (body %q)", err, p.patch)
+	}
+	return p, body
+}
+
+// patchConditions returns the status.conditions list of a status patch body.
+func patchConditions(t *testing.T, body map[string]any) []any {
+	t.Helper()
+	status, ok := body["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("patch body has no status object: %v", body)
+	}
+	conds, ok := status["conditions"].([]any)
+	if !ok {
+		t.Fatalf("patch body has no status.conditions list: %v", status)
+	}
+	return conds
+}
+
+// assertPatchHasNoOtherStatus asserts the patch carries ONLY status.conditions
+// (plus, when the object has one, the metadata.resourceVersion precondition): no
+// spec section and no other status field. That is the property the
+// whole-object PUT violated — it wrote back the phase, checkpoints, budget,
+// verify and agent the CLI had just read.
+func assertPatchHasNoOtherStatus(t *testing.T, body map[string]any) {
+	t.Helper()
+	if _, ok := body["spec"]; ok {
+		t.Error("the patch carries a spec section; approve/reject must write status.conditions only")
+	}
+	status, ok := body["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("patch body has no status object: %v", body)
+	}
+	for _, k := range []string{"phase", "checkpoints", "checkpoint", "budget", "verify", "agent"} {
+		if _, ok := status[k]; ok {
+			t.Errorf("the status patch carries status.%s; approve/reject must write status.conditions only", k)
+		}
+	}
+}
+
+// assertNoStatusWrite asserts the command wrote NOTHING (no patch, no update).
+func assertNoStatusWrite(t *testing.T, f *fakeLoopClient, what string) {
+	t.Helper()
+	if len(f.updates) != 0 {
+		t.Fatalf("%s wrote %d whole-object Update(s); nothing must be written", what, len(f.updates))
+	}
+	if len(f.patches) != 0 {
+		t.Fatalf("%s wrote %d Patch(es); nothing must be written", what, len(f.patches))
+	}
+}
+
 // fakeWorkspace is a stub WorkspaceReader for the approval command tests.
 type fakeWorkspace struct {
 	plan   string
@@ -307,9 +408,7 @@ func TestApproveLoop_PeekFailed_FailsWithoutCondition(t *testing.T) {
 	if err == nil {
 		t.Fatal("approveLoop with a failed plan read: want an error, got nil")
 	}
-	if len(f.updates) != 0 {
-		t.Fatalf("approveLoop with a failed plan read wrote %d Update(s); the condition must NOT be written", len(f.updates))
-	}
+	assertNoStatusWrite(t, f, "approveLoop with a failed plan read")
 	if !strings.Contains(err.Error(), "read the plan") {
 		t.Errorf("error = %q, want it to say the plan read failed", err)
 	}
@@ -333,9 +432,7 @@ func TestApproveLoop_EmptyPlan_Refuses(t *testing.T) {
 		if err == nil {
 			t.Fatalf("case %d: approveLoop with empty plan %q: want an error, got nil", i, plan)
 		}
-		if len(f.updates) != 0 {
-			t.Fatalf("case %d: approveLoop with empty plan wrote %d Update(s); the condition must NOT be written", i, len(f.updates))
-		}
+		assertNoStatusWrite(t, f, fmt.Sprintf("approveLoop with empty plan (case %d)", i))
 		if !strings.Contains(err.Error(), "no plan to approve") {
 			t.Errorf("case %d: error = %q, want 'no plan to approve'", i, err)
 		}
@@ -360,8 +457,8 @@ func TestApproveLoop_HashIsExactPlanBytes(t *testing.T) {
 	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
 		t.Fatalf("approveLoop: %v", err)
 	}
-	u := f.updates[len(f.updates)-1].(*unstructured.Unstructured)
-	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	_, body := assertStatusConditionPatch(t, f)
+	conds := patchConditions(t, body)
 	var msg string
 	for _, c := range conds {
 		cm, _ := c.(map[string]any)

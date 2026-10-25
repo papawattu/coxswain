@@ -83,15 +83,14 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
 	}
 	// Patch the status subresource (the condition is on the status, not the
-	// main resource). The dynamic client's Patch does not support subresources
-	// (a CLI limitation — see the client.go comment), so we read the whole
-	// object, add the condition to status.conditions, and Update the whole
-	// object. The status subresource is NOT separately addressable via a JSON
-	// merge patch on the main resource (a merge patch on the main resource does
-	// not write status.conditions; it is a no-op on the status subresource).
-	// The Update (a full replace) is the correct path: read the object, add the
-	// condition, write it back. The operator's applyApprovalGate then reads the
-	// condition on the next reconcile and advances the Loop.
+	// main resource) with the full conditions list: a JSON merge patch replaces
+	// arrays wholesale, so conds carries every condition the CLI read plus the
+	// new PlanApproved. The dynamic client's Patch passes the subresource
+	// through to the API (F87) — a merge patch of status.conditions is the
+	// write, where the pre-F87 path read the whole object, edited it and PUT it
+	// back to /status (writing every other status field with it).
+	// The operator's applyApprovalGate then reads the condition on the next
+	// reconcile and advances the Loop.
 	obj, err := dc.Loops.Get(ctx, name)
 	if err != nil {
 		return fmt.Errorf("get loop %q: %w", name, err)
@@ -129,11 +128,22 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	if !replaced {
 		conds = append(conds, cond)
 	}
-	if err := unstructured.SetNestedSlice(u.Object, conds, "status", "conditions"); err != nil {
-		return fmt.Errorf("set status.conditions: %w", err)
+	// Patch the status subresource with the FULL conditions list (F87): a JSON
+	// merge patch replaces arrays wholesale, so conds is the list the CLI just
+	// read, with this command's one condition replaced/appended. The
+	// whole-object Update this replaced wrote back every status field the CLI
+	// had read (phase, checkpoints, budget, verify, agent) — a read-modify-write
+	// of the entire status for a one-condition change. The live
+	// metadata.resourceVersion stays in the patch, so a racing operator write is
+	// a 409 (Conflict) rather than a silent overwrite.
+	patch := map[string]any{
+		"status": map[string]any{"conditions": conds},
 	}
-	if err := dc.Loops.Update(ctx, u); err != nil {
-		return fmt.Errorf("update loop %q (set PlanApproved): %w", name, err)
+	if rv := u.GetResourceVersion(); rv != "" {
+		patch["metadata"] = map[string]any{"resourceVersion": rv}
+	}
+	if err := dc.Loops.Patch(ctx, name, "status", mustJSON(patch)); err != nil {
+		return fmt.Errorf("patch loop %q status (set PlanApproved): %w", name, err)
 	}
 	_, _ = fmt.Fprintf(out, "Approved the plan for loop %q (SHA-256 %s)\n", name, hash)
 	return nil
@@ -187,9 +197,9 @@ func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer
 		"message":            "Rejected: " + reason,
 		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
 	}
-	// Read the whole object, add the condition to status.conditions, and
-	// Update (the same path as approveLoop — the Update writes the status
-	// subresource, see client.go).
+	// Read the whole object, add the condition to status.conditions, and patch
+	// the status subresource (the same write as approveLoop — see the comment
+	// there and in client.go).
 	obj, err := dc.Loops.Get(ctx, name)
 	if err != nil {
 		return fmt.Errorf("get loop %q: %w", name, err)
@@ -219,11 +229,17 @@ func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer
 	if !replaced {
 		conds = append(conds, cond)
 	}
-	if err := unstructured.SetNestedSlice(u.Object, conds, "status", "conditions"); err != nil {
-		return fmt.Errorf("set status.conditions: %w", err)
+	// Patch the status subresource with the full conditions list (the same
+	// write as approveLoop: a status merge patch, F87), keeping the live
+	// metadata.resourceVersion for optimistic concurrency.
+	patch := map[string]any{
+		"status": map[string]any{"conditions": conds},
 	}
-	if err := dc.Loops.Update(ctx, u); err != nil {
-		return fmt.Errorf("update loop %q (set PlanRejected): %w", name, err)
+	if rv := u.GetResourceVersion(); rv != "" {
+		patch["metadata"] = map[string]any{"resourceVersion": rv}
+	}
+	if err := dc.Loops.Patch(ctx, name, "status", mustJSON(patch)); err != nil {
+		return fmt.Errorf("patch loop %q status (set PlanRejected): %w", name, err)
 	}
 	_, _ = fmt.Fprintf(out, "Rejected the plan for loop %q: %s\n", name, reason)
 	return nil

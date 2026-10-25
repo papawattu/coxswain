@@ -808,8 +808,9 @@ type ForkOf struct {
 // outlives the sandbox pod and is the durability record behind
 // status.checkpoint (the latest).
 type CheckpointStatus struct {
-	// iteration is the 1-based iteration the checkpoint was taken at (the
-	// iteration whose verify just succeeded).
+	// iteration is the iteration the checkpoint was taken at (the iteration
+	// whose verify just succeeded): 0 is the first verify's checkpoint, then
+	// 2, 3 … (F90).
 	Iteration int `json:"iteration"`
 
 	// name is the VolumeSnapshot's name: checkpoint-<loop>-iter-<iteration>
@@ -840,14 +841,16 @@ type LoopStatus struct {
 	// +optional
 	Phase LoopPhase `json:"phase,omitempty"`
 
-	// iteration is the 1-based count of plan→implement→verify cycles run.
+	// iteration is the count of plan→implement→verify cycles run: 0 for the
+	// first run; the first verify RETRY is 2 (1 is skipped — the iterate
+	// advances to max(iteration+1, 2)), then 3, 4 … (F90).
 	// +kubebuilder:default=0
 	// +optional
 	Iteration int `json:"iteration,omitempty"`
 
-	// planAttempt is the 1-based count of Planning runs (incremented on
-	// every re-entry to Planning: a rejection re-plan or an onVerifyFail=Plan
-	// re-plan). The runner echoes it from .coxswain/plan-attempt into its
+	// planAttempt is the count of Planning runs: 0 on the first Planning run,
+	// incremented on every re-entry to Planning (a rejection re-plan or an
+	// onVerifyFail=Plan re-plan) — F90. The runner echoes it from .coxswain/plan-attempt into its
 	// claim; advancePhaseFromClaim ignores a claim whose planAttempt does not
 	// match status.planAttempt, so a stale Planning success claim from a prior
 	// attempt cannot satisfy the new Planning phase (I42b).
@@ -1015,7 +1018,10 @@ type AgentStatus struct {
 	// the counted failures described is gone), and when a phase claim the
 	// operator accepts ends it early, so a failure episode cannot consume a
 	// later run's retry budget. A retry recreate does NOT reset it: the retry is
-	// inside the run.
+	// inside the run. The reset rule itself is the one on
+	// status.verify.infraAttempts: an operator-decided episode boundary ends
+	// the count; a UID change never does (the UID guard only prevents double
+	// counting the same Sandbox) — F48e.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	InfraAttempts int32 `json:"infraAttempts,omitempty"`
@@ -1258,7 +1264,8 @@ type BudgetStatus struct {
 // (P2c/P2e). jobName is the dedup key (item 6): a re-read of the same verify
 // Job appends no entry.
 type StallEntry struct {
-	// iteration is the 1-based iteration number of the failing verify run.
+	// iteration is the iteration number of the failing verify run: 0 for the
+	// first run, then 2, 3 … (1 is skipped — F90).
 	Iteration int `json:"iteration"`
 
 	// jobName is the verify Job's name (<loop>-verify-<iteration>) — the

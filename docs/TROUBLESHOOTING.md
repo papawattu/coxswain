@@ -676,8 +676,9 @@ which is still open; until it lands, a stale reading means the caps keep
 evaluating the last successful reading (fail-open by design), not a frozen
 Loop.
 
-**`MeteringDegraded`.** True while the model proxy is forwarding requests it
-could not meter — the upstream response carried no parseable usage object.
+**`MeteringDegraded`.** True for the reconcile(s) after a read that saw new
+unmetered requests (a pulse, not a state: a read with no new unmetered
+requests clears it) — the upstream response carried no parseable usage object.
 Those requests are **not** counted toward the token or cost caps, and their
 count is in `status.budget.unmeteredRequests`. Common causes:
 
@@ -703,13 +704,23 @@ condition.
 
 **`BudgetReadingStale`.** True while the operator's read of the proxy's
 `/coxswain/usage` endpoint has failed 3 consecutive times
-(`budgetReadFailureThreshold`, `internal/controller/loop_p2d_budget.go`). A
-single miss (a proxy pod mid-restart) is not worth a condition. While it is
+(`budgetReadFailureThreshold`, `internal/controller/loop_p2d_budget.go`).
+A proxy pod that is still starting is **not** a read failure (F84). Three
+shapes are `proxy.ErrNotReady` and are neither counted nor cleared:
+- a pod that exists, has a pod IP, and is younger than
+  `proxyUsageStartGrace` (60s) — it may still be starting;
+- a proxy pod that **does not exist** (yet), and one that has **never obtained
+  an IP**. These two are not time-bounded by this condition — a proxy that
+  never comes up is surfaced as `ModelProxyNotReady` on the Loop (below), not
+  as `BudgetReadingStale`.
+
+A read failure **after** the pod has been up for 60s is what counts toward the
+three-failure threshold. While it is
 `True`, the token and cost caps are evaluating the **last successful**
 reading — they cannot fire on new spend — so "no cap firing" is not
 evidence that usage is low. It sets via `noteUsageReadFailed` (same file)
 with the read error in the message, and `status.budget` is otherwise
-touched on a failed read — no delta, no reset (the decision is always on
+untouched on a failed read — no delta, no reset (the decision is always on
 the last successful read). It clears on the next successful read
 (`noteUsageReadOK`, reason `UsageReadRecovered`), which also resets
 `consecutiveReadFailures` to 0.
@@ -766,6 +777,20 @@ Manual-approval hold at `AwaitingApproval` (`approvalHoldPhase` in
 hold (`PolicyEnforced` condition, `internal/controller/loop_controller.go`).
 The `NetworkEnforced=False` hold has its own section above
 (`NetworkEnforced=False` with `--allow-unenforced-network`).
+
+**The model proxy hold (`ModelProxyNotReady`).** With
+`spec.agent.endpointSecretRef` set, the sandbox is held `Suspended` until the
+Loop's model proxy pod is Ready (`modelProxyHold` in
+`internal/controller/loop_controller.go`), because the proxy is the agent's only
+model egress. Since F84 the hold is visible: the Loop carries
+`ModelProxyNotReady=True` (the message names the pod and why it is not Ready),
+with one Warning Event on the transition. It clears to `False`/`Ready` when the
+pod is Ready and to `False`/`NoEndpoint` if the Loop loses its model endpoint.
+The usual causes are a pod that cannot be scheduled, an image that cannot be
+pulled, or the proxy's Secret missing; look at
+`kubectl get events -n <ns> | grep <loop>-proxy`. While this condition is True
+the budget read is not counted as a failure (see `BudgetReadingStale` above), so
+the caps are inert — the condition is the signal.
 
 ### `CheckpointEntryUntrusted` Warning Event on a Loop
 

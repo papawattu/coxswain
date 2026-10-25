@@ -29,6 +29,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -1304,7 +1305,181 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		Expect(get().Status.Budget.LastUsageReadAt).NotTo(BeNil())
 		Expect(stale().Status).To(Equal(metav1.ConditionFalse))
 	})
+
+	// F84: a proxy pod that is not up yet is not a read failure.
+	It("F84: the real reader over a starting proxy pod counts no failures and sets no stale condition", func() {
+		ns := nsFor("f84-s1")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		r := newP2dReconciler(recorder, nil)
+		loop := createP2dLoop(ns, "f84-s1", nil)
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+		primeP2dProxy(loop)
+		// The DEFAULT reader runs (no readProxyUsage seam). The fixture's pod is
+		// Ready with an IP (the D35a gate needs that), so this spec exercises the
+		// START GRACE: a pod younger than proxyUsageStartGrace is "not there
+		// yet". The no-pod and no-IP shapes have their own rows in the
+		// readProxyUsageDefault table spec below.
+		for range budgetReadFailureThreshold + 2 {
+			reconcileP2d(r, ns, "f84-s1")
+		}
+		got := getLoopP2d(ns, "f84-s1")
+		if got.Status.Budget != nil {
+			Expect(got.Status.Budget.ConsecutiveReadFailures).To(BeEquivalentTo(0),
+				"a pod that is not up yet is no reading, not a read failure (F84)")
+		}
+		Expect(apimeta.FindStatusCondition(got.Status.Conditions, coxv1alpha1.BudgetReadingStaleCondition)).To(BeNil(),
+			"F84: a proxy pod that is not ready must not set BudgetReadingStale")
+		Expect(countEventsByReason(drainEvents(recorder), budgetReadingStaleReason)).To(BeZero())
+	})
+
+	// F84: the start grace is the pod's own clock, both directions; ErrNotReady is
+	// a no-op (never a recovery). The DEFAULT reader runs throughout, so the
+	// grace (which lives in the reader) is the thing under test: the pod is
+	// given an IP and a closed port, so the dial fails fast.
+	It("F84: inside the pod's start grace nothing counts; past it the failure counts, and ErrNotReady never clears a stale condition", func() {
+		ns := nsFor("f84-s2")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		var nowPtr *metav1.Time
+		r := newP2dReconciler(recorder, &nowPtr)
+		loop := createP2dLoop(ns, "f84-s2", nil)
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+		primeP2dProxy(loop)
+		pod := &corev1.Pod{}
+		key := types.NamespacedName{Namespace: ns, Name: proxyPodName("f84-s2")}
+		Expect(k8sClient.Get(ctx, key, pod)).To(Succeed())
+		pod.Status.PodIP = "127.0.0.1" // nothing listens on the usage port in envtest
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		By("inside the start grace the dial failure is ErrNotReady: no count, no condition")
+		*nowPtr = metav1.NewTime(pod.CreationTimestamp.Add(proxyUsageStartGrace / 2))
+		for range budgetReadFailureThreshold + 1 {
+			reconcileP2d(r, ns, "f84-s2")
+		}
+		got := getLoopP2d(ns, "f84-s2")
+		Expect(got.Status.Budget).NotTo(BeNil())
+		Expect(got.Status.Budget.ConsecutiveReadFailures).To(BeEquivalentTo(0))
+		Expect(apimeta.FindStatusCondition(got.Status.Conditions, coxv1alpha1.BudgetReadingStaleCondition)).To(BeNil())
+
+		By("past the grace the same failure counts and the condition fires once, with the honest message")
+		*nowPtr = metav1.NewTime(pod.CreationTimestamp.Add(proxyUsageStartGrace + time.Minute))
+		for range budgetReadFailureThreshold {
+			reconcileP2d(r, ns, "f84-s2")
+		}
+		got = getLoopP2d(ns, "f84-s2")
+		Expect(got.Status.Budget.ConsecutiveReadFailures).To(Equal(int32(budgetReadFailureThreshold)))
+		stale := apimeta.FindStatusCondition(got.Status.Conditions, coxv1alpha1.BudgetReadingStaleCondition)
+		Expect(stale).NotTo(BeNil())
+		Expect(stale.Status).To(Equal(metav1.ConditionTrue))
+		firstMsg := stale.Message
+		Expect(firstMsg).To(ContainSubstring("no reading has ever succeeded"),
+			"F84: no reading has ever succeeded, so the message must not claim a 'last successful reading'")
+		events := drainEvents(recorder)
+		Expect(countEventsByReason(events, budgetReadingStaleReason)).To(Equal(1))
+		Expect(strings.Join(events, "\n")).To(ContainSubstring("no reading has ever succeeded"),
+			"the Event carries the same honest effect as the condition (P3-4)")
+		Expect(strings.Join(events, "\n")).To(MatchRegexp(`[0-9]+ times in a row`),
+			"the count lives in the Event (P3-1)")
+
+		// The same pod, seen inside its start grace, is ErrNotReady: a no-op
+		// that must neither count nor clear the recorded staleness.
+		By("ErrNotReady is a no-op: it neither counts nor clears the stale condition")
+		*nowPtr = metav1.NewTime(pod.CreationTimestamp.Add(proxyUsageStartGrace / 2))
+		reconcileP2d(r, ns, "f84-s2")
+		got = getLoopP2d(ns, "f84-s2")
+		Expect(got.Status.Budget.ConsecutiveReadFailures).To(Equal(int32(budgetReadFailureThreshold)))
+		Expect(apimeta.FindStatusCondition(got.Status.Conditions, coxv1alpha1.BudgetReadingStaleCondition).Status).To(Equal(metav1.ConditionTrue),
+			"ErrNotReady must not clear a genuine staleness")
+
+		By("further failed reads leave the condition message byte-identical (no status write per pass)")
+		*nowPtr = metav1.NewTime(pod.CreationTimestamp.Add(2 * time.Hour))
+		for range 2 {
+			reconcileP2d(r, ns, "f84-s2")
+		}
+		again := apimeta.FindStatusCondition(getLoopP2d(ns, "f84-s2").Status.Conditions, coxv1alpha1.BudgetReadingStaleCondition)
+		Expect(again.Status).To(Equal(metav1.ConditionTrue))
+		Expect(again.Message).To(Equal(firstMsg), "the message must be stable while the condition stays True")
+	})
+
+	// F84: one row per ErrNotReady shape, on the real reader (P2-1: the shapes
+	// need their own spec, not just the happy fixture). Each row gets its own
+	// Loop so the pod's state is planted, never mutated.
+	It("F84: readProxyUsageDefault classifies each not-ready shape as ErrNotReady and a dialled error as a read failure", func() {
+		ns := nsFor("f84-table")
+		defer deleteNS(ctx, ns)
+		var nowPtr *metav1.Time
+		r := newP2dReconciler(record.NewFakeRecorder(16), &nowPtr)
+		cases := []struct {
+			name   string
+			plant  string // "" = no pod; "noip" = a pod with no podIP; "ip" = a pod with an IP
+			age    time.Duration
+			wantNR bool
+		}{
+			{name: "no proxy pod at all", wantNR: true},
+			{name: "old pod with no pod IP", plant: "noip", age: 2 * time.Hour, wantNR: true},
+			{name: "young pod with an IP (start grace)", plant: "ip", age: proxyUsageStartGrace / 2, wantNR: true},
+			{name: "old pod with an IP: the dial runs and fails like any read failure", plant: "ip", age: 2 * time.Hour},
+		}
+		for idx, tc := range cases {
+			By("row: " + tc.name)
+			loop := createP2dLoop(ns, fmt.Sprintf("f84-row-%d", idx), nil)
+			if tc.plant != "" {
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: proxyPodName(loop.Name)},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "proxy", Image: "example.com/proxy:v1"}}},
+				}
+				Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+				if tc.plant == "ip" {
+					pod.Status.PodIP = "127.0.0.1"
+					pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+					Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
+				}
+				*nowPtr = metav1.NewTime(pod.CreationTimestamp.Add(tc.age))
+			} else {
+				*nowPtr = metav1.Now()
+			}
+			_, err := r.readProxyUsageDefault(ctx, loop)
+			Expect(err).To(HaveOccurred(), tc.name)
+			if tc.wantNR {
+				Expect(errors.Is(err, proxy.ErrNotReady)).To(BeTrue(), "%s must be ErrNotReady: %v", tc.name, err)
+			} else {
+				Expect(errors.Is(err, proxy.ErrNotReady)).To(BeFalse(), "%s is a READ FAILURE, not not-ready: %v", tc.name, err)
+			}
+		}
+	})
+
+	// F84 (P3-6): no endpoint -> the read-related conditions are cleared.
+	It("F84: a Loop with no model endpoint clears BudgetReadingStale and MeteringDegraded", func() {
+		ns := nsFor("f84-s3")
+		defer deleteNS(ctx, ns)
+		r := newP2dReconciler(record.NewFakeRecorder(64), nil)
+		loop := createP2dNoModelLoop(ns, "f84-s3", nil)
+		seedBudget(loop, func(b *coxv1alpha1.BudgetStatus) { b.ConsecutiveReadFailures = budgetReadFailureThreshold })
+		setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionTrue, budgetReadingStaleReason, "stale")
+		setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionTrue, meteringDegradedReason, "degraded")
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+		reconcileP2d(r, ns, "f84-s3")
+		got := getLoopP2d(ns, "f84-s3")
+		for _, condType := range []string{coxv1alpha1.BudgetReadingStaleCondition, coxv1alpha1.MeteringDegradedCondition} {
+			c := apimeta.FindStatusCondition(got.Status.Conditions, condType)
+			Expect(c).NotTo(BeNil(), "%s must be present (cleared, not removed)", condType)
+			Expect(c.Status).To(Equal(metav1.ConditionFalse), "%s must be False with no endpoint", condType)
+			Expect(c.Reason).To(Equal("NoEndpoint"))
+		}
+	})
 })
+
+// countEventsByReason counts the drained events carrying a reason.
+func countEventsByReason(evs []string, reason string) int {
+	n := 0
+	for _, e := range evs {
+		if strings.Contains(e, reason) {
+			n++
+		}
+	}
+	return n
+}
 
 // findCond returns the named condition from a Loop's status (nil when absent).
 func findCond(l *coxv1alpha1.Loop, condType string) *metav1.Condition {

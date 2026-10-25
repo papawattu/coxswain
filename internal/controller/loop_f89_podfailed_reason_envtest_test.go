@@ -26,8 +26,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cov "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -39,9 +39,9 @@ var _ = Describe("F89: a failed pod whose termination records no reason", func()
 	// Failed pod whose agent container is Terminated{ExitCode: 1, Reason: ""}
 	// and whose pod status carries NO reason and NO DisruptionTarget condition
 	// — the shape the API allows and the code must survive. It returns the Loop,
-	// the pod, a reconciler with no claim (the F6 scenario: the pod failed
-	// without one) and the recorder.
-	plant := func(name string, phase cov.LoopPhase) (*cov.Loop, *corev1.Pod, *LoopReconciler, *record.FakeRecorder) {
+	// a reconciler with no claim (the F6 scenario: the pod failed without one)
+	// and the recorder.
+	plant := func(name string, phase cov.LoopPhase) (*cov.Loop, *LoopReconciler, *record.FakeRecorder) {
 		ns := "f89-" + name + "-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		DeferCleanup(func() {
@@ -116,7 +116,7 @@ var _ = Describe("F89: a failed pod whose termination records no reason", func()
 			// No claim: the pod failed BEFORE writing one (the F6 scenario).
 			readPhaseClaim: func(context.Context, *cov.Loop) (*PhaseClaim, error) { return nil, nil },
 		}
-		return loop, pod, r, rec
+		return loop, r, rec
 	}
 
 	countEvents := func(rec *record.FakeRecorder, reason string) int {
@@ -130,7 +130,7 @@ var _ = Describe("F89: a failed pod whose termination records no reason", func()
 	}
 
 	It("through Reconcile, persists AgentFailed(reason=PodFailed) and the attempt count", func() {
-		loop, _, r, rec := plant("reconcile", cov.LoopPhaseVerifying)
+		loop, r, rec := plant("reconcile", cov.LoopPhaseVerifying)
 		ns, name := loop.Namespace, loop.Name
 
 		// Reconcile's tail (finalizeLoopStatus → Status().Update,
@@ -154,7 +154,7 @@ var _ = Describe("F89: a failed pod whose termination records no reason", func()
 	})
 
 	It("sandboxFailure defaults the empty reason before the condition is built", func() {
-		loop, _, r, rec := plant("helper", cov.LoopPhasePlanning)
+		loop, r, rec := plant("helper", cov.LoopPhasePlanning)
 
 		f, err := r.sandboxFailure(ctx, loop)
 		Expect(err).NotTo(HaveOccurred())

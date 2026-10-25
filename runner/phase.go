@@ -626,6 +626,12 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 		ObservedPhase: phase,
 	}
 	res.toolConversation = messages
+	// F43 P2-1: an EMPTY successful Planning answer is refused like a failed
+	// call: writing it would leave a 0-byte PLAN.md over a plan the user may
+	// have approved (the same harm as a blocked run, reached by success).
+	if modelErr == "" && phase == PhasePlanning && strings.TrimSpace(answer) == "" {
+		modelErr = "ModelEmptyAnswer: the model returned an empty plan; PLAN.md left unchanged"
+	}
 	if modelErr != "" {
 		res.Status = statusBlocked
 		res.VerificationNotes = modelErr
@@ -779,13 +785,16 @@ func writeClaim(path string, res Result) {
 //   - stage ONLY the listed, non-refused paths (a per-path `git add`, never
 //     `git add -A`): an IGNORED path (a .gitignore'd build output) is
 //     silently skipped by the add and never enters the commit,
-//   - record the staged paths (returned; the caller lists them in the claim
-//     summary — I47 evidence of what the verified commit contains).
+//   - record the staged paths (returned; the caller appends them to the
+//     result.json summary via stagedClaimSummary — a record on the workspace
+//     volume, not evidence the operator reads; F43 P2-2).
 //
-// On any git failure (a non-git workspace, a failed add/commit, a
-// short/uppercase SHA) it returns ("", paths, "") and the caller leaves the
-// claim's headCommit empty and the operator blocks the Verifying advance
-// (ADR-0005 fail-closed — no evidence, no advance). The .coxswain exclusion
+// On a git failure it returns an empty SHA and the caller leaves the claim's
+// headCommit empty and the operator blocks the Verifying advance (ADR-0005
+// fail-closed — no evidence, no advance). A non-git workspace returns an
+// empty reason; a failed reset/add/commit or a short/uppercase SHA returns a
+// non-empty reason string (F43 P3-1) that the caller puts in the claim's
+// blockedReason. The .coxswain exclusion
 // is a pathspec so the operator's result files (result.json, PLAN.md,
 // desired-phase, the conversation state) never enter the verified commit.
 const (
@@ -876,7 +885,7 @@ func isBinaryFile(path string, scanLimit int) bool {
 }
 
 // stagedClaimSummary appends the I47 staged-paths list to Result.Summary.
-// F43 P2-2: Summary is written to result.json ONLY. The strict termination-log
+// F43 P2-2: Summary goes to result.json (and the runner's stderr log). The strict termination-log
 // claim (writeClaim) has no summary field and no operator component reads
 // result.json, so this list is a record on the workspace volume, not evidence
 // the operator sees. The list is capped to keep result.json small.

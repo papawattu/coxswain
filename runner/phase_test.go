@@ -282,6 +282,36 @@ func TestPhaseRunBlockedPlanningKeepsExistingPlan(t *testing.T) {
 	}
 }
 
+// TestPhaseRunEmptyPlanningAnswerKeepsExistingPlan (F43 P2-1): a 200 with an
+// empty answer is refused (blocked), and an existing PLAN.md stays byte-identical.
+func TestPhaseRunEmptyPlanningAnswerKeepsExistingPlan(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{Content: ""})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhasePlanning)
+	planPath := filepath.Join(ws, resultDirName, planFileName)
+	const approved = "1. do the thing\n2. test it\n"
+	if err := os.WriteFile(planPath, []byte(approved), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, make(chan any))
+
+	if res.Status != statusBlocked {
+		t.Fatalf("status = %q, want blocked for an empty plan", res.Status)
+	}
+	got, err := os.ReadFile(planPath)
+	if err != nil || string(got) != approved {
+		t.Fatalf("PLAN.md after an empty Planning answer = %q (err %v), want it unchanged %q", got, err, approved)
+	}
+	if parseClaim(t, claimPath)["status"] != statusBlocked {
+		t.Fatalf("claim is not blocked")
+	}
+}
+
 func TestPhaseRunModelFailureBlocked(t *testing.T) {
 	// A model failure (non-200) makes the phase end blocked: the claim
 	// carries status=blocked with the reason (the operator requeues).

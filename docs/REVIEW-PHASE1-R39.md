@@ -108,7 +108,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`.
 - [ ] **I144: the memory PVC degradation is an Event with a TTL, and the marker makes sure it is never repeated**
 
   **Where:** `loop_p5a_memory.go:84-91` (`memoryPVCUnboundReason`, "Emitted at
-  most once per Loop" at `:88`), `:92-99` (the marker is the boolean `"true"`,
+  most once per Loop" at `:87-88`), `:92-99` (the marker is the boolean `"true"`,
   cleared only when the PVC binds — `:285-292`), `:210-219`
   (`emitMemoryPVCUnboundEvent`'s doc, "AT MOST ONCE per Loop"), the call site
   `loop_controller.go:1856` with the marker write at `:1857` and the clear only
@@ -198,14 +198,16 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`.
   whose rules include a subresource pastes the SSAR (or the `--subresource`
   output) for it, and the reviewer can read the request body in the paste.
 
-- [ ] **I146: #283 fixed the two fixtures that failed; thirteen sites still plant a verify Job the new guard would refuse**
+- [ ] **I146: #283 fixed the two fixtures that failed; sixteen sites still plant a verify Job the new guard would refuse**
 
   **Where:** the fix set the controller reference at two sites
   (`loop_p2e_stall_plan_test.go:289`, `loop_f83_tamper_evidence_envtest_test.go:58`),
   and the guard is `foreignVerifyJob` (`loop_verify_job.go:1844`), read before the
   decision at `applyVerifyOutcome` (`:1385`). `git grep -n 'job = &batchv1.Job{' 98db918 -- internal/controller/` returns 21
-  hits. By reading, thirteen of them create a bare Job with only the verify labels
-  and no controller reference (the count is the pre-reviewer's reading, not a run):
+  hits. By reading, sixteen of them create a bare Job with only the verify labels
+  and no controller reference: the thirteen listed below plus three multi-line
+  ones at `loop_verify_job_envtest_test.go:225`, `:349`, `:413` (the count is the
+  pre-reviewer's reading, not a run):
 
   `loop_b4_replan_envtest_test.go:91`, `:130`, `:824`;
   `loop_b5a_metrics_envtest_test.go:101`; `loop_checkpoint_envtest_test.go:513`;
@@ -220,16 +222,16 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`.
 
   **Problem.** The guard is correct; its **precondition** is now an obligation on
   every fixture, written by hand at two of fifteen sites, with a comment asking
-  future authors to keep it. The only evidence the other thirteen are safe is one
+  future authors to keep it. The only evidence the other sixteen are safe is one
   green full run. That evidence is thin in both directions: if a site fires and a
   spec reconciles to a decision, the spec fails on a phase assertion far from the
   cause (as the 9 failures at `loop_p2e_stall_plan_test.go` showed, `.samples/f83b-verify/make-test-73f541e.log:161`),
   and a new spec that asserts "no decision" would pass **vacuously** on a foreign
-  Job. I could not tell, by reading, whether any of the thirteen branches ever
+  Job. I could not tell, by reading, whether any of the sixteen branches ever
   fires; that is the point.
 
   **Fix.** One helper, `plantVerifyJob(t, loop, job)` (set the reference, create,
-  keep any pin annotation), used at all fifteen sites. The `p2g` precedent is the
+  keep any pin annotation), used at all eighteen sites. The `p2g` precedent is the
   same two lines (`loop_p2g_audit_test.go:384-385`).
 
   **Acceptance.** The grep above returns no bare

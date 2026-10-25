@@ -287,21 +287,22 @@ creates no Job.
 
 On a `MemoryWritten` with a summary, the condition message (and the
 one-time `Normal` `memory write audit: …` Event) carries the writer's
-bounded summary: one line per lesson plus a counts line
-(`cmd/memory-writer/main.go`), in this shape:
+bounded summary: a counts line, the audit lines, then one line per
+lesson (`cmd/memory-writer/main.go`), in this shape:
 
 ```
+summary: total=11 written=2 dropped=9
 evicted <sha12> cap
 truncated 3 lessons over the batch cap 20
 lesson-001 <sha12> written eligible
 lesson-002 <sha12> dropped curator: <free model text>
 lesson-003 <sha12> written curator-keep: <free model text>
 lesson-004 <sha12> dropped duplicate
-summary: total=11 written=2 dropped=9
 ```
 
-The audit lines (first in the summary, so the 1000-byte truncation of
-the condition message never cuts them off):
+The counts line is first, then the audit lines, so the 1000-byte
+truncation of the condition message cuts the per-lesson lines first. The
+audit lines are:
 
 - `evicted <sha12> cap` — one line per lesson file the writer evicted
 to enforce the per-PVC cap (100 lessons). The `<sha12>` is the evicted
@@ -343,10 +344,10 @@ the operator does not fabricate an audit for a write that did not
 happen. The condition-message copy of the audit is capped at 1000 bytes
 on a rune boundary (the client-go Event cap is 1024; the Job's
 termination message is bounded to 4096), so a long write is cut in the
-**condition message**. The counts line (`summary: total=…`) is the last
-line of the summary, so it is usually the first thing lost: if the
-condition message has no `summary:` line, read the Job log, which carries
-the full summary.
+**condition message**. The cut keeps whole lines and ends with
+`… N more lines`; the counts line (`summary: total=…`) and the audit lines
+come first, so they are kept. To see the cut-off per-lesson lines, read
+the Job log, which carries the full summary.
 
 ### The caps
 

@@ -960,7 +960,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// The claim-driven advance is already recorded in advancedFrom by
 	// s4ClaimAndVerifyJob; the gate's advance is a separate decision the
 	// Event should also cover.
-	verifyChanged, verifyOutcomeRequeue, verifyJob, verifyPod := r.applyVerifyOutcome(ctx, &loop)
+	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 
@@ -998,16 +998,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// B2 (D10/D24): at Verifying, the operator's own tamper evidence is the
-	// gate (see applyTamperGate for the tri-state logic). The gate must run
-	// every reconcile — calling it into a local and only then OR-ing into
-	// changed (changed = changed || r.applyTamperGate(...)) would short-circuit
-	// the call whenever changed was already true this reconcile, skipping the
-	// security gate (the red B2 tamper spec). The runTamperGate helper runs
-	// the gate unconditionally (no short-circuit) and folds the result into
-	// changed, keeping Reconcile's cyclomatic complexity under the threshold.
-	r.runTamperGate(&loop, &changed, verifyJob, verifyPod)
 
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references
@@ -1221,76 +1211,6 @@ func isCommitSHA(s string) bool {
 // was applied (false when policyRefs is empty — the default-deny minimum). A
 // referenced AgentPolicy that does not exist is an error (the operator must not
 // silently run an agent with a narrower policy than the Loop declared).
-
-// applyTamperGate (B2, D10/D24) applies the tamper-evidence gate at Verifying.
-// tamperVerdict is a tri-state over the operator's evidence (a pointer to the
-// terminated tamper init container's exit code + the verifiedCommit it names),
-// and never reads the runner's result.json claim:
-//   - TamperTampered -> Failed:TamperedVerify, TERMINAL, before any check
-//     runs (the anti-gaming property: a runner that edited a protected file
-//     and reported success still ends Failed).
-//   - TamperClean    -> not a B2 decision; B3's check containers decide the
-//     outcome from there.
-//   - TamperUnknown  -> no evidence (nil, or stale for a different
-//     verifiedCommit/Job); NEVER treated as clean (D24 fail-closed), so the
-//     Loop stays in Verifying and B3 cannot reach Succeeded on it.
-//
-// The status inputs are user-writable, so a Tampered verdict only acts when
-// the verify Job's pod confirms it (tamperConfirmedByPod); the operator writes
-// the evidence from that pod (recordTamperEvidence, F83).
-func (r *LoopReconciler) applyTamperGate(loop *coxv1alpha1.Loop, job *batchv1.Job, pod *corev1.Pod) bool {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loop.Status.Verify == nil {
-		return false
-	}
-	// The operator's CURRENT verified commit is the one it pinned on entering
-	// Verifying (status.currentVerify.verifiedCommit, D11) — never the
-	// evidence's own commit (D27: passing the evidence's commit as both args
-	// made the stale guard a no-op in prod). The evidence's verifiedCommit
-	// (status.verify.verifiedCommit) is what the evidence NAMES. A mismatch
-	// between the two, or an empty pin, makes tamperVerdict return Unknown
-	// (fail-closed), so leftover evidence from a previous iteration's Job or a
-	// force-pushed branch cannot be reused to reach Succeeded.
-	v := loop.Status.Verify
-	var currentCommit string
-	if loop.Status.CurrentVerify != nil {
-		currentCommit = loop.Status.CurrentVerify.VerifiedCommit
-	}
-	// F83: status is user-writable (the editor role may PUT /status), so a
-	// recorded code alone never fails a Loop. The verdict only acts when the
-	// operator's own read of the CURRENT verify Job and its pod agrees: the
-	// Job is the one the UID names, and its tamper init terminated with the
-	// recorded code. The two objects are the ones applyVerifyOutcome judged in
-	// this same reconcile (no second read, so the gate cannot judge a
-	// different pod). No Job/pod (gone, evicted, a retry deleted it) is no
-	// decision: a tamper verdict is terminal in applyVerifyOutcome when the
-	// pod exists.
-	if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered &&
-		v.TamperJobUID != "" && job != nil && string(job.UID) == v.TamperJobUID &&
-		tamperPodConfirms(pod, *v.TamperExitCode) {
-		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
-			"a protected path changed between baseCommit and verifiedCommit; terminal")
-		return true
-	}
-	return false
-}
-
-// tamperPodConfirms (F83) is the pod half of the tamper gate's confirmation:
-// the pod's tamper init container terminated with the recorded code. A pod or
-// container that is absent, still running, or terminated with another code
-// does not confirm.
-func tamperPodConfirms(pod *corev1.Pod, code int32) bool {
-	if pod == nil {
-		return false
-	}
-	for i := range pod.Status.InitContainerStatuses {
-		ics := &pod.Status.InitContainerStatuses[i]
-		if ics.Name == verifyTamperInit && ics.State.Terminated != nil {
-			return ics.State.Terminated.ExitCode == code
-		}
-	}
-	return false
-}
 
 func (r *LoopReconciler) effectivePolicyHash(ctx context.Context, loop *coxv1alpha1.Loop) (string, bool, error) {
 	if len(loop.Spec.PolicyRefs) == 0 {
@@ -2414,68 +2334,6 @@ const TamperedVerifyReason = "TamperedVerify"
 // Job's import-agent init refused the pinned commit because it is not a
 // descendant of status.baseCommit (F43).
 const PinNotDescendantReason = "PinNotDescendant"
-
-// TamperVerdict is the tri-state outcome of the operator's TamperedVerify
-// decision at Verifying (ADR-0005 D24). The operator's evidence is a pointer:
-// a NON-NIL tamper exit code comes from a terminated tamper init container for
-// the current verifiedCommit; nil means no evidence.
-type TamperVerdict int
-
-const (
-	// TamperUnknown means there is no tamper evidence (nil tamperExitCode, or
-	// evidence from a different verifiedCommit/Job). It is NEVER treated as
-	// clean (D24 fail-closed): the Loop cannot advance out of Verifying on it.
-	TamperUnknown TamperVerdict = iota
-	// TamperClean means a terminated tamper init container for the current
-	// verifiedCommit exited 0 (no protected path changed). The verify proceeds
-	// to the check containers (B3).
-	TamperClean
-	// TamperTampered means a protected path differs between baseCommit and
-	// verifiedCommit (terminated tamper container exited non-zero). Terminal
-	// Failed:TamperedVerify (B2), before any check runs.
-	TamperTampered
-)
-
-// tamperVerdict is the operator's TamperedVerify decision at Verifying (B2/D24).
-// It is a pure function of the operator's OWN evidence — a pointer to the
-// tamper-check container's exit code plus the verifiedCommit that evidence
-// names — and returns a tri-state:
-//
-//
-//	tamperExitCode == nil            -> TamperUnknown (no evidence; NEVER clean)
-//	commit binding missing or stale    -> TamperUnknown (D27: both commits non-empty AND equal)
-//	*exitCode == 0                    -> TamperClean
-//	*exitCode == tamperGitErrorExit   -> TamperUnknown (git failed; infra, not tamper)
-//	*exitCode != 0                    -> TamperTampered (terminal Failed:TamperedVerify)
-//
-
-// The decision never reads the runner's result.json claim (I28/D10 anti-gaming:
-// a runner that edited a protected file and reported success still ends
-// Failed:TamperedVerify when the evidence is non-zero).
-func tamperVerdict(tamperExitCode *int32, evidenceCommit, verifiedCommit string) TamperVerdict {
-	// No evidence (nil) -> Unknown. D24 fail-closed: absence of evidence is not a
-	// pass.
-	if tamperExitCode == nil {
-		return TamperUnknown
-	}
-	// D27 fail-closed on a missing or stale binding: the evidence must be bound
-	// to a KNOWN current commit. If either commit is empty (the evidence names no
-	// commit, or the operator hasn't pinned the current one yet) or they differ
-	// (leftover from a previous iteration's Job / a force-pushed branch), the
-	// evidence is Unknown — never Clean, never Tampered-advancing.
-	if evidenceCommit == "" || verifiedCommit == "" || evidenceCommit != verifiedCommit {
-		return TamperUnknown
-	}
-	if *tamperExitCode == 0 {
-		return TamperClean
-	}
-	// F39: the script's own git failure is not evidence of tampering; it is
-	// fail-closed elsewhere (verifyInfraFailed), never TamperedVerify.
-	if *tamperExitCode == tamperGitErrorExit {
-		return TamperUnknown
-	}
-	return TamperTampered
-}
 
 func (r *LoopReconciler) cleanupProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
 	log := logf.FromContext(ctx)

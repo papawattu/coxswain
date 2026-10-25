@@ -281,10 +281,10 @@ type VerifyConfig struct {
 // status field. The operator writes valid values, and every consumer that ACTS
 // on a status value must validate it first: the checkpoint GC and the lost-PVC
 // restore check the name shape and that the VolumeSnapshot carries this Loop's
-// label before deleting or restoring from it. The tamper gate (F83) accepts a
-// recorded tamperExitCode only when the CURRENT verify Job's UID and that
-// Job's pod's terminated tamper init agree with it, so a status write alone
-// cannot fail a Loop. Narrowing the editor role is an owner decision.
+// label before deleting or restoring from it. The tamper decision (F83c) reads
+// the verify Job's pod, never this status — the recorded evidence here is
+// provenance for `cox describe` and the delivered PR body — so a status write
+// alone cannot fail a Loop. Narrowing the editor role is an owner decision.
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
 	// operator copies the pin it wrote on entering Verifying
@@ -311,10 +311,9 @@ type VerifyStatus struct {
 	Iteration *int32 `json:"iteration,omitempty"`
 
 	// tamperJobUID is the UID of the verify Job whose pod produced
-	// tamperExitCode (F83). The tamper gate may only act when this matches the
-	// CURRENT verify Job's UID AND that Job's pod's tamper init terminated with
-	// the recorded code (status is user-writable, so a recorded code alone
-	// never fails a Loop).
+	// tamperExitCode (F83): provenance for the record. The tamper DECISION reads
+	// the verify Job's pod itself (verifyOutcome), never this status, so a
+	// status write cannot fail a Loop (F83c).
 	// +optional
 	TamperJobUID string `json:"tamperJobUID,omitempty"`
 

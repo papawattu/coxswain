@@ -19,6 +19,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -124,16 +125,19 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		// for the current verifiedCommit. Plus the runner's claim that it's done.
 		// The operator pinned the current commit (D11) to the SAME SHA the
 		// evidence names, so the evidence is bound (D27).
+		// F83c: the STATUS says clean (0) and the POD's tamper init exits 1. The
+		// decision reads the pod (verifyOutcome), so the status cannot decide —
+		// if anyone reintroduced a status-driven verdict, this spec fails.
 		got.Status.Verify = &coxv1alpha1.VerifyStatus{
-			TamperExitCode: int32PtrEnv(1),
+			TamperExitCode: int32PtrEnv(0),
 			VerifiedCommit: b2Commit,
 			JobName:        "b2-tamper-verify-1",
 		}
 		got.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: b2Commit}
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
-		// F83: the status alone is user-writable and proves nothing; the verify
-		// Job's pod (operator-only evidence) carries the real tamper exit code.
+		// The verify Job's pod (operator-only evidence) carries the real tamper
+		// exit code; F83c made verifyOutcome its only reader.
 		f83SetTamperPod(ctx, ns, nn.Name,
 			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
 			corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, nil)
@@ -156,7 +160,7 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 			"the terminal condition must record reason TamperedVerify (the operator's evidence, not the claim)")
 	})
 
-	It("stays Verifying when the tamper code is clean (0) — B3's checks decide the outcome", func() {
+	It("a clean tamper pod lets verify SUCCEED (this fixture has no acceptance checks, so the clean path decides)", func() {
 		ns := "b2-clean-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
@@ -175,17 +179,24 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		got.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: b2Commit}
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+		// F83c: plant the real pod (tamper 0, artifact 0, check-0 still running),
+		// so the spec exercises verifyOutcome's clean path instead of the
+		// no-pod no-decision path (which would pass for the wrong reason).
+		runningCheck := corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+		f83SetTamperPod(ctx, ns, nn.Name,
+			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}, &runningCheck)
 
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
-		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
-			"a clean tamper code must not flip the Loop to Failed; B3's checks decide")
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
+			"a clean tamper pod must not flip the Loop to Failed: with no acceptance checks the verify passes")
 	})
 
-	It("stays Verifying when there is NO tamper evidence (nil) — D24 fail-closed, never clean", func() {
+	It("stays Verifying when there is NO tamper evidence at all (no pod, no status) — D24 fail-closed, never clean", func() {
 		ns := "b2-nonev-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
@@ -195,8 +206,10 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		driveToVerifying(nn)
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
-		// No verify block at all (the Job never ran / crashed before the tamper
-		// container finished / status lost). Absence of evidence is NOT a pass.
+		// No verify block at all and no verify pod (the Job never ran / crashed
+		// before the tamper container finished / status lost). F83c: the decision
+		// reads the POD, so this is the no-pod no-decision path. Absence of
+		// evidence is NOT a pass.
 		got.Status.Verify = nil
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
@@ -214,7 +227,7 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 			"no evidence is Unknown, not Tampered — it must not end Failed either")
 	})
 
-	It("stays Verifying when the evidence names a DIFFERENT commit than the pinned current one (D27 stale evidence)", func() {
+	It("stays Verifying when the verify pod belongs to a STALE Job (the freshness binding is the Job UID, F83c)", func() {
 		ns := "b2-stale-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
@@ -224,19 +237,36 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		driveToVerifying(nn)
 		got := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
-		// The evidence is a CLEAN 0, but it names commit A ("aaaa") — leftover from
-		// a previous iteration's Job — while the operator pinned the CURRENT
-		// commit to B ("bbbb") at Verifying start (D11). A clean-but-stale
-		// evidence must NOT be treated as clean (D27 fail-closed): the Loop stays
-		// in Verifying and B3 cannot reach Succeeded on it.
-		got.Status.Verify = &coxv1alpha1.VerifyStatus{
-			TamperExitCode: int32PtrEnv(0),
-			VerifiedCommit: "aaaa",
-			JobName:        "b2-stale-verify-1",
+		Expect(got.Status.CurrentVerify).NotTo(BeNil())
+		// F83c: the decision reads the pod, and readVerifyJobPod binds a pod to
+		// the CURRENT verify Job by UID. A pod still owned by a previous Job
+		// (the infra-retry recreate, the I65 bug) is not this attempt's evidence.
+		staleJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "b2-stale-verify-0", Namespace: ns, Labels: verifyJobLabels(nn.Name)},
+			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers:    []corev1.Container{{Name: "noop", Image: "busybox"}},
+			}}},
 		}
-		got.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "bbbb"}
-		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
-		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+		Expect(k8sClient.Create(ctx, staleJob)).To(Succeed())
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      nn.Name + "-verify-pod",
+				Namespace: ns,
+				Labels:    map[string]string{s5aJobNameLabel: verifyJobName(got), verifyForLabel: nn.Name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(), Kind: "Job",
+					Name: staleJob.Name, UID: staleJob.UID,
+					Controller: new(true), BlockOwnerDeletion: new(true),
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "noop", Image: "busybox"}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		}
+		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
 
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
@@ -244,8 +274,8 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 
 		Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
-			"D27: a clean-0 evidence bound to a different commit than the pinned current must not advance the Loop")
+			"a pod owned by a stale Job must not be this attempt's evidence (no decision)")
 		Expect(got.Status.Phase).ToNot(Equal(coxv1alpha1.LoopPhaseSucceeded),
-			"stale evidence must not be treated as clean (the loop must not reach Succeeded on it)")
+			"stale-Job evidence must not reach Succeeded")
 	})
 })

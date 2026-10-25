@@ -585,9 +585,8 @@ recreated, and the Loop ends `Failed` with reason `VerifyInfraFailed` and a
 final `VerifyInfraFailed` Warning Event.
 
 **What it means:** the tamper script exited `2` (`tamperGitErrorExit` in
-`internal/controller/loop_verify_job.go`), which the verdict map in the
-controller maps to the internal `TamperUnknown` verdict — an infrastructure
-failure (git itself failed — a missing rev, a corrupt index, a clone problem),
+`internal/controller/loop_verify_job.go`), which `verifyOutcome` maps to
+`VerifyInfraFailed` — an infrastructure failure (git itself failed — a missing rev, a corrupt index, a clone problem),
 never tampering. Verify infra failures are retried twice (three total runs)
 before the Loop fails with `VerifyInfraFailed`, a reason distinct from
 `TamperedVerify` (a protected path actually changed) and from check failures.

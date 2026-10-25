@@ -240,10 +240,10 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		reconcile("f46with", ns)
 		reconcile("f46without", ns)
 
-		withEnv := envByName(containerByName(&getSandbox("f46with", ns).Spec.PodTemplate.Spec, agentContainerName))
+		withEnv := envByName(&getSandbox("f46with", ns).Spec.PodTemplate.Spec.Containers[0])
 		Expect(withEnv).To(HaveKey(coxModelTimeout))
 		Expect(withEnv[coxModelTimeout].Value).To(Equal("300s"))
-		withoutEnv := envByName(containerByName(&getSandbox("f46without", ns).Spec.PodTemplate.Spec, agentContainerName))
+		withoutEnv := envByName(&getSandbox("f46without", ns).Spec.PodTemplate.Spec.Containers[0])
 		Expect(withoutEnv).NotTo(HaveKey(coxModelTimeout))
 
 		By("rejecting an out-of-range value at the API (Minimum=1, Maximum=3600)")

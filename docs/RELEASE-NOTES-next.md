@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `4451ade` = PR #256); each claim cites its
+merged code on `main` (as of `c57a255` = PR #259); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -223,6 +223,12 @@ existing Loops are unaffected, but new ones are.
 - **What changed.** Three decisions, all in the sandbox start path (`internal/controller/loop_s4_phase.go`): (a) a `Pending` pod with `CreateContainerConfigError` for >= 60s is a sandbox failure, bounded by the existing `sandboxInfraRetries` (2), so it fails the Loop `Failed:SandboxFailed` — with the valid-claim check first, so a claim recorded in `LastTerminationState` is not burned; (b) a `Pending` pod with no container started for >= 5m sets the new `SandboxNotStarting` condition (True) plus ONE Warning Event on the transition; it SURFACES only (a slow image pull is indistinguishable from the pod status, I49) and is cleared when the pod is no longer Pending; (c) the CRD now validates `spec.agent.gitCredentialSecret` and `spec.agent.endpointSecretRef` (MaxLength 253 + DNS-1123 subdomain pattern), so a malformed Secret name is rejected at the API server instead of surfacing only as a FailedMount Event later. A `docs/UPGRADE.md` note for the stricter validation is in the same PR (merged `4451ade` = PR #256).
 - **Scope note.** The *surface* covers every stuck shape; the *bound* covers `CreateContainerConfigError` only. A missing Secret **volume** (the `gitCredentialSecret` case) stays `ContainerCreating` with a FailedMount Event and is not bounded here — that bound needs Event read RBAC and is split to F48b (see Known issues).
 - **On upgrade.** Before upgrading, list existing Loops' `gitCredentialSecret` and `endpointSecretRef` values and look for non-matching ones — see `docs/UPGRADE.md`, section "Stricter Secret-name validation (F48)" (PR #256). A non-matching existing Loop is not deleted or changed; on Kubernetes 1.30 and later, other updates to it still work (CRD validation ratcheting lets an update through when it leaves that field unchanged). New Loops with a malformed Secret name are rejected at the API server from now on (PR #256).
+
+### F84: a proxy pod that is starting or not yet up is no longer a failed budget reading — #259
+
+- **What was wrong.** The budget's usage read counted a model-proxy pod that is starting or not yet up (no pod yet, or no pod IP yet) as a *failed* read, so a normally starting proxy pod burned consecutive failed reads until `BudgetReadingStale` raised a false alarm (F84), and the stale message claimed a "last successful reading" that had never happened (PR #259).
+- **What changed.** A proxy pod that is starting or not yet up is now a **no reading** (`ErrNotReady`) with a start-up grace, not a failed read: the consecutive-read-failure counter is not burned while the proxy is coming up. While the model proxy holds the sandbox's model access, a new `ModelProxyNotReady` condition says when it is holding, with one Warning Event on the transition (not per reconcile) — the silent no-op is no longer invisible. The stale-reading message no longer claims a last reading that never happened, and the no-endpoint `MeteringDegraded` / `BudgetReadingStale` conditions are now cleared on recovery (PR #259).
+- **On upgrade.** Nothing to do; the fix is in the operator (PR #259).
 
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
@@ -517,11 +523,11 @@ merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
 (D71 memory lesson cap), F33 (memory-writer audit), F34 (stale
 lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
 curator failure), F43 (the agent-chosen pin), F44 (surfacing unmetered
-requests and stale usage reads), F47 (untrusted checkpoint status entries),
-F46 (the unwired model timeout), and F83 (the unrecorded tamper evidence) were
-closed by #229, #222, #233, #234, #238, #243, #241, #244, #248, #254, #252, and
-#258. In plain words, the items still
-open:
+requests and stale usage reads), F47 (untrusted checkpoint status entries), F84 (the `BudgetReadingStale` false
+alarm while the proxy pod is starting), F46 (the unwired model timeout), and
+F83 (the unrecorded tamper evidence) were closed by #229, #222, #233, #234,
+#238, #243, #241, #244, #248, #254, #259, #252, and #258. In plain words, the
+items still open:
 
 **P1 (security):**
 
@@ -630,8 +636,6 @@ open:
   ownership-checked.
 - **F87(c)**: a forged `status.checkpoints` entry at the current iteration
   can stop the real checkpoint being taken.
-- **F84**: the `BudgetReadingStale` condition can raise a false alarm
-  while the model proxy pod is still starting up.
 - **F85**: `cox describe`'s budget block misses the new usage-read fields
   (`lastUsageReadAt`, `consecutiveReadFailures`).
 

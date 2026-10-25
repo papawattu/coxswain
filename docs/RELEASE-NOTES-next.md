@@ -225,7 +225,7 @@ existing Loops are unaffected, but new ones are.
 
 ### F48g: the sandbox retry count now belongs to one run — #269
 
-- **What changed.** The sandbox infra-failure count (that F48b makes trip) now belongs to a **run** — one iteration and phase — keyed on the new `status.agent.infraEpisode` field, so a failure episode cannot consume the next run's retry budget: failures in an earlier run, and failures before a rollback, no longer count toward failing a later run (PR #269, merged `0070686`).
+- **What changed.** The sandbox infra-failure count (that F48b makes trip) now belongs to a **run** — one iteration and phase — keyed on the new `status.agent.infraEpisode` field, so a failure episode cannot consume the next run's retry budget: failures in an earlier run, and failures before a rollback, no longer count toward failing a later run (PR #269, merged `0070686`). The empty-workspace fallback (a lost PVC with no usable checkpoint) now also starts the retry count again (F48h, PR #273).
 - **On upgrade.** Nothing to do beyond the new CRD: `status.agent` gains one optional field, `infraEpisode`, picked up with a standard install (PR #269).
 
 ### F89: a sandbox failure with no kubelet reason no longer wedges the whole status write — #271

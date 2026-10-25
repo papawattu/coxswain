@@ -1,4 +1,4 @@
-# Phase 1 review, round 33: the memory writer as one design, F43, and two loose bounds
+# Phase 1 review, round 33: the memory writer, F43, an unbounded summary and a pod-start window
 
 Round 33, 2026-10-25. It follows R32 (PR #235, not yet merged) and covers the
 work merged since R32 was opened (#234 to #245). Code line numbers are against
@@ -22,20 +22,20 @@ committed:
 | #236, #237, #239, #240, #242, #245 | Docs: index, upgrade notes, evil-agent e2e, memory write outcome, two consistency passes | a6d73c5, f9569dc, acb40b0, b850406, 23124e7, 4d7b5d2 |
 
 **Status:**
-- **F43 closes a way to get unrelated work verified.** The verify
-  Job now refuses a pinned commit that does not descend from the base commit,
+- **F43 closes a gap where unrelated work could pass verify.** Two fixes: the verify Job now refuses a pinned commit that does not descend from the base commit,
   and the runner no longer re-emits a stored result whose commit is not in
-  the workspace. The reviewer reproduced both mutations against the real
-  generated script.
+  the workspace. The reviewer reproduced both defects with named mutations, against the
+  real generated script.
 - **The memory writer is now consistent as one design** after F31-F34 and F78,
   except for one bound it claims and does not enforce (I115).
-- **F41's cause is still not shown.** A new pod's first calls to an in-cluster
-  proxy can fail for a few seconds on k3d-hermes-sim; the curator now retries
+- **F41's root cause is still unknown.** On k3d-hermes-sim a new pod's first
+  calls to an in-cluster proxy can fail for a few seconds (the mechanism was
+  not found); the curator now retries
   within a batch budget. The runner may hit the same window (I116).
 - **One CI flake surfaced** (I117).
 - **Pre-review kept catching real defects before merge** (I118).
-- No new owner decision. D72-D84 are still open
-  (`.samples/owner-decision-brief.md`).
+- No new owner decision this round. D72-D84 remain open (see
+  `.samples/owner-decision-brief.md`).
 
 ---
 

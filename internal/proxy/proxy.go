@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -19,6 +20,12 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// ErrNotReady means the usage endpoint is not readable *yet*: the proxy pod
+// does not exist, has no pod IP, or is still inside its start grace (F84). It
+// is not a read failure — nothing is being evaluated yet — so the operator
+// neither counts it nor clears a recorded staleness with it.
+var ErrNotReady = errors.New("model proxy usage endpoint is not ready")
 
 const maxBody = 50 << 20 // 50 MiB; model request/response bodies are small.
 

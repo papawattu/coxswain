@@ -30,15 +30,17 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"net/http"
+	"strconv"
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -79,6 +81,11 @@ const (
 	// BudgetReadingStale is set (F44): a single miss (a pod mid-restart) is
 	// not worth a condition.
 	budgetReadFailureThreshold = 3
+	// proxyUsageStartGrace is how long a proxy pod may exist without a usable
+	// usage endpoint before a read failure is counted (F84): the pod is
+	// created in the same reconcile that then reads it, and a restart replaces
+	// it, so the first seconds are "not there yet", not a failure.
+	proxyUsageStartGrace = 60 * time.Second
 	// meteringEventQuiet is how long MeteringDegraded must have been False
 	// before a re-degrade emits a second Warning Event (F44).
 	meteringEventQuiet = 5 * time.Minute
@@ -181,11 +188,26 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 		if err == nil && reading != nil {
 			r.noteUsageReadOK(loop, now)
 			r.applyUsageReading(ctx, loop, *reading)
-		} else if err != nil {
+		} else if err != nil && !errors.Is(err, proxy.ErrNotReady) {
 			// F44: the caps stay on the last good reading (fail-open, by
 			// design until the owner decides otherwise), but the staleness
 			// is recorded and surfaced.
 			r.noteUsageReadFailed(loop, err)
+		}
+		// F84: proxy.ErrNotReady (no pod, no IP, or still inside its start
+		// grace) is NO READING YET, not a failure: it neither increments the
+		// counter nor resets it, so a pod that flaps absent/up cannot erase a
+		// genuine staleness either.
+	} else {
+		// F84 (P3-6): no model is configured, so the two read-related
+		// conditions have no subject: clear them rather than leave them True.
+		if conditionTruePresent(loop, coxv1alpha1.BudgetReadingStaleCondition) {
+			setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionFalse,
+				"NoEndpoint", "no model endpoint is configured, so there is no usage endpoint to read")
+		}
+		if conditionTruePresent(loop, coxv1alpha1.MeteringDegradedCondition) {
+			setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionFalse,
+				"NoEndpoint", "no model endpoint is configured, so there is no metering to degrade")
 		}
 	}
 
@@ -217,7 +239,7 @@ func (r *LoopReconciler) noteUsageReadOK(loop *coxv1alpha1.Loop, now metav1.Time
 	b := loop.Status.Budget
 	b.LastUsageReadAt = &now
 	b.ConsecutiveReadFailures = 0
-	if conditionIsTrue(loop, coxv1alpha1.BudgetReadingStaleCondition) {
+	if conditionTruePresent(loop, coxv1alpha1.BudgetReadingStaleCondition) {
 		setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionFalse,
 			"UsageReadRecovered", "the model proxy usage endpoint was read successfully")
 	}
@@ -238,14 +260,19 @@ func (r *LoopReconciler) noteUsageReadFailed(loop *coxv1alpha1.Loop, err error) 
 	if b.ConsecutiveReadFailures < budgetReadFailureThreshold {
 		return
 	}
-	wasStale := conditionIsTrue(loop, coxv1alpha1.BudgetReadingStaleCondition)
+	wasStale := conditionTruePresent(loop, coxv1alpha1.BudgetReadingStaleCondition)
+	// F84: the message must not claim a "last successful reading" the Loop has
+	// never had (the caps are inert, which is a different fact).
+	effect := "the token and cost caps are evaluating the last successful reading"
+	if b.LastUsageReadAt == nil {
+		effect = "no reading has ever succeeded: the token and cost caps are inert ($0 spent is not evidence)"
+	}
 	setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionTrue,
 		budgetReadingStaleReason,
-		"the model proxy usage endpoint could not be read; the token and cost caps are evaluating the last successful reading: "+err.Error())
+		"the model proxy usage endpoint could not be read "+strconv.Itoa(int(b.ConsecutiveReadFailures))+" times in a row; "+effect+": "+err.Error())
 	if !wasStale && r.Recorder != nil {
 		r.Recorder.Eventf(loop, corev1.EventTypeWarning, budgetReadingStaleReason,
-			"usage read failed %d times in a row (%v): the token and cost caps are evaluating the last successful reading",
-			b.ConsecutiveReadFailures, err)
+			"usage read failed %d times in a row (%v); %s", b.ConsecutiveReadFailures, err, effect)
 	}
 }
 
@@ -255,7 +282,7 @@ func (r *LoopReconciler) noteUsageReadFailed(loop *coxv1alpha1.Loop, err error) 
 func (r *LoopReconciler) noteUnmetered(loop *coxv1alpha1.Loop, delta int64) {
 	b := loop.Status.Budget
 	if delta <= 0 {
-		if conditionIsTrue(loop, coxv1alpha1.MeteringDegradedCondition) {
+		if conditionTruePresent(loop, coxv1alpha1.MeteringDegradedCondition) {
 			setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionFalse,
 				"MeteringOK", "no new unmetered requests since the last read")
 		}
@@ -266,7 +293,7 @@ func (r *LoopReconciler) noteUnmetered(loop *coxv1alpha1.Loop, delta int64) {
 	// a re-degrade within meteringEventQuiet of the clear (a stream that
 	// alternates metered and unmetered reads would otherwise flap an Event
 	// per reconcile).
-	wasDegraded := conditionIsTrue(loop, coxv1alpha1.MeteringDegradedCondition)
+	wasDegraded := conditionTruePresent(loop, coxv1alpha1.MeteringDegradedCondition)
 	if c := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.MeteringDegradedCondition); c != nil &&
 		c.Status == metav1.ConditionFalse && r.operatorNow().Sub(c.LastTransitionTime.Time) < meteringEventQuiet {
 		wasDegraded = true
@@ -278,15 +305,6 @@ func (r *LoopReconciler) noteUnmetered(loop *coxv1alpha1.Loop, delta int64) {
 			"%d request(s) forwarded without a usage object (%d in total): not counted toward the token or cost caps",
 			delta, b.UnmeteredRequests)
 	}
-}
-
-func conditionIsTrue(loop *coxv1alpha1.Loop, condType string) bool {
-	for _, c := range loop.Status.Conditions {
-		if c.Type == condType {
-			return c.Status == metav1.ConditionTrue
-		}
-	}
-	return false
 }
 
 // resolveProxyUsageRead dispatches to the readProxyUsage test seam when it is
@@ -341,16 +359,25 @@ func (r *LoopReconciler) readProxyUsageDefault(ctx context.Context, loop *coxv1a
 	}
 	pod := &corev1.Pod{}
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod); err != nil {
-		if errors.IsNotFound(err) {
-			// No proxy pod (absent, or not yet created): not a reading.
-			return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s absent: %w", loop.Namespace, proxyPodName(loop.Name), err)
+		if apierrors.IsNotFound(err) {
+			// No proxy pod (absent, or not yet created): not a reading, and
+			// not yet a FAILURE (F84): the pod is created in the same
+			// reconcile that reads it.
+			return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s absent: %w", loop.Namespace, proxyPodName(loop.Name), proxy.ErrNotReady)
 		}
 		return proxy.Reading{}, fmt.Errorf("read proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
 	}
 	if pod.Status.PodIP == "" {
 		// The pod has not received an IP (not Ready / still scheduling): not a
 		// reading.
-		return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s has no pod IP (not Ready)", loop.Namespace, pod.Name)
+		return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s has no pod IP (not Ready): %w", loop.Namespace, pod.Name, proxy.ErrNotReady)
+	}
+	if started := pod.CreationTimestamp.Time; !started.IsZero() && r.operatorNow().Sub(started) < proxyUsageStartGrace {
+		// The pod exists but is inside its start grace: the first seconds are
+		// "not there yet" (the pod is created or replaced by this very
+		// reconcile), so nothing here is a read failure (F84).
+		return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s is still starting (age %s): %w",
+			loop.Namespace, pod.Name, r.operatorNow().Sub(started).Round(time.Second), proxy.ErrNotReady)
 	}
 	url := fmt.Sprintf("http://%s:%d/coxswain/usage", pod.Status.PodIP, proxyUsagePort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

@@ -1305,7 +1305,9 @@ const (
 	// read the model proxy's usage endpoint (consecutive failures at or past
 	// the threshold): the token and cost caps are evaluating the last
 	// successful reading, so they cannot fire on new spend. It returns to
-	// False on the next good read. Surfacing only: it does not hold the Loop.
+	// False on the next good read. A proxy pod that is not up yet (absent, no
+	// pod IP, inside proxyUsageStartGrace) is not a failure and is not counted
+	// (F84). Surfacing only: it does not hold the Loop.
 	BudgetReadingStaleCondition = "BudgetReadingStale"
 	// AgentFailedCondition (F6, dogfood finding) is True while the operator
 	// is deciding what to do about a sandbox pod that FAILED without a phase

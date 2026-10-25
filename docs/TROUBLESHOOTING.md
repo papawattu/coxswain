@@ -676,8 +676,9 @@ which is still open; until it lands, a stale reading means the caps keep
 evaluating the last successful reading (fail-open by design), not a frozen
 Loop.
 
-**`MeteringDegraded`.** True while the model proxy is forwarding requests it
-could not meter — the upstream response carried no parseable usage object.
+**`MeteringDegraded`.** True for the reconcile(s) after a read that saw new
+unmetered requests (a pulse, not a state: a read with no new unmetered
+requests clears it) — the upstream response carried no parseable usage object.
 Those requests are **not** counted toward the token or cost caps, and their
 count is in `status.budget.unmeteredRequests`. Common causes:
 
@@ -703,13 +704,16 @@ condition.
 
 **`BudgetReadingStale`.** True while the operator's read of the proxy's
 `/coxswain/usage` endpoint has failed 3 consecutive times
-(`budgetReadFailureThreshold`, `internal/controller/loop_p2d_budget.go`). A
-single miss (a proxy pod mid-restart) is not worth a condition. While it is
+(`budgetReadFailureThreshold`, `internal/controller/loop_p2d_budget.go`).
+A proxy pod that is still starting is **not** a read failure: a pod that does
+not exist yet, has no pod IP, or is younger than `proxyUsageStartGrace` (60s)
+is "not there yet" (`proxy.ErrNotReady`) and is neither counted nor cleared
+(F84). A read failure after the pod has been up for 60s is what counts. While it is
 `True`, the token and cost caps are evaluating the **last successful**
 reading — they cannot fire on new spend — so "no cap firing" is not
 evidence that usage is low. It sets via `noteUsageReadFailed` (same file)
 with the read error in the message, and `status.budget` is otherwise
-touched on a failed read — no delta, no reset (the decision is always on
+untouched on a failed read — no delta, no reset (the decision is always on
 the last successful read). It clears on the next successful read
 (`noteUsageReadOK`, reason `UsageReadRecovered`), which also resets
 `consecutiveReadFailures` to 0.

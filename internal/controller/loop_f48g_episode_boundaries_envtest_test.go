@@ -184,6 +184,58 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		Expect(restoredLoop.Status.Agent.InfraEpisode).To(BeEmpty())
 	})
 
+	It("S4b: a completed ROLLBACK (spec.restoreFrom) ends the episode too", func() {
+		ns := f48gNs("f48g-s4b")
+		const name = "f48g-s4b"
+		Expect(k8sClient.Create(ctx, &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		// The B1 checkpoint path needs a VolumeSnapshotClass (the b1/b2 fixture).
+		vsc := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion":     snapshotGV,
+			"kind":           volumeSnapshotClassKind,
+			"metadata":       map[string]any{"name": "b1-test-vsc"},
+			"driver":         b1Driver,
+			"deletionPolicy": "Delete",
+		}}
+		if err := k8sClient.Create(ctx, vsc); err != nil && !apierrors.IsAlreadyExists(err) {
+			Expect(err).NotTo(HaveOccurred(), "create the VolumeSnapshotClass fixture")
+		}
+
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b2EnsureSandboxPod(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&cov.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		By("requesting a rollback with the pre-rollback run's count in place")
+		rbLoop := f48gGet(ns, name)
+		rbLoop.Spec.RestoreFrom = "iter-0"
+		Expect(k8sClient.Update(ctx, rbLoop)).To(Succeed())
+		seeded := f48gGet(ns, name)
+		f48gSeedCount(ns, name, 2, sandboxRunKey(seeded))
+
+		By("the level-based rollback (stop -> delete -> create) drives restoreFrom to Restored")
+		b2Reconcile(r, ns, name)          // step 1: stop the sandbox
+		b2DeleteSandboxPod(ctx, ns, name) // the agent-sandbox controller removes the pod
+		b2Reconcile(r, ns, name)          // step 2: delete the PVC
+		b2RemovePVCProtectionFinalizer(ctx, ns, name)
+		restoredLoop := b2Reconcile(r, ns, name) // step 3: create the PVC from the snapshot
+		cond := b2RestoreCondition(restoredLoop)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(cov.RestoreReasonRestored), "the rollback completed")
+		Expect(restoredLoop.Status.Iteration).To(Equal(seeded.Status.Iteration),
+			"a rollback moves neither iteration nor desiredPhase — no run key can see it")
+		Expect(restoredLoop.Status.Agent).NotTo(BeNil())
+		Expect(restoredLoop.Status.Agent.InfraAttempts).To(BeZero(),
+			"F48g: the rollback is a boundary the run key cannot see, so it clears explicitly")
+		Expect(restoredLoop.Status.Agent.InfraSandboxUID).To(BeEmpty())
+		Expect(restoredLoop.Status.Agent.InfraEpisode).To(BeEmpty())
+	})
+
 	It("S5: a pause does not reset the count (the pod is restarted in place, not recreated)", func() {
 		ns := f48gNs("f48g-s5")
 		const name = "f48g-s5"

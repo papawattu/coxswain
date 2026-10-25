@@ -227,6 +227,33 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 			"the Service must select the proxy pod (not headless/no-selector)")
 	})
 
+	It("F46: spec.loop.modelTimeoutSeconds becomes COX_MODEL_TIMEOUT on the agent; absent sets nothing", func() {
+		ns := "f46-mt-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		with := buildLoop("f46with", ns)
+		with.Spec.Loop.ModelTimeoutSeconds = new(int32)
+		*with.Spec.Loop.ModelTimeoutSeconds = 300
+		Expect(k8sClient.Create(ctx, with)).To(Succeed())
+		Expect(k8sClient.Create(ctx, buildLoop("f46without", ns))).To(Succeed())
+		reconcile("f46with", ns)
+		reconcile("f46without", ns)
+
+		withEnv := envByName(containerByName(&getSandbox("f46with", ns).Spec.PodTemplate.Spec, agentContainerName))
+		Expect(withEnv).To(HaveKey(coxModelTimeout))
+		Expect(withEnv[coxModelTimeout].Value).To(Equal("300s"))
+		withoutEnv := envByName(containerByName(&getSandbox("f46without", ns).Spec.PodTemplate.Spec, agentContainerName))
+		Expect(withoutEnv).NotTo(HaveKey(coxModelTimeout))
+
+		By("rejecting an out-of-range value at the API (Minimum=1, Maximum=3600)")
+		for _, bad := range []int32{0, 3601} {
+			l := buildLoop("f46bad", ns)
+			l.Spec.Loop.ModelTimeoutSeconds = &bad
+			Expect(k8sClient.Create(ctx, l)).NotTo(Succeed(), "modelTimeoutSeconds=%d must be rejected", bad)
+		}
+	})
+
 	It("runs with no model: no proxy pod, no Service, no COX_MODEL_BASE_URL (P1 parity)", func() {
 		ns := "d33-noref-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

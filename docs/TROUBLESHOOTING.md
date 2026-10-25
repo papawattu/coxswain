@@ -37,10 +37,8 @@ for its full 10-minute timeout before the runner exited".
 **Tuning:** if you see `ModelUnavailable` on a healthy backend, the model is
 slow, not dead. A legitimate response on a local 27B-class model under load
 can approach 120s (PR #124 observed a 60s single-call tail on the healthy
-endpoint). Note there is currently no user-facing knob for the timeout: the
-runner's `runConfig.ModelTimeout` field (`runner/runner.go`, defaulting to
-`defaultModelTimeout` when unset) is never set by the runner entrypoint
-(`runner/cmd/main.go`), so the timeout is fixed at 120s in practice. The
+endpoint). Raise `spec.loop.modelTimeoutSeconds` (1-3600, passed to the runner as
+`COX_MODEL_TIMEOUT`) if the backend is healthy but slow; unset keeps 120s. The
 retry count and backoff base are constants
 (`defaultModelRetries = 3`, `defaultModelRetryBackoff = 2s` in
 `runner/runner.go`) and not user-tunable. A success claim resets the

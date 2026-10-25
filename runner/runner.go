@@ -81,9 +81,11 @@ const (
 
 	// I89: bounded retry for a model request that times out or returns a
 	// transport error. The backoff is exponential with a base of
-	// defaultModelRetryBackoff (2s), so the worst-case total wait for the
-	// default (3 retries) is 120s * 3 + 2s + 4s = 370s, well under the old
-	// 10-minute single-shot timeout.
+	// defaultModelRetryBackoff (2s) and defaultModelRetries retries, i.e. 4
+	// attempts and 2s+4s+8s of backoff, so the worst-case total wait for the
+	// default is 4*120s + 14s = 494s (F46: this said 370s), still under the
+	// old 10-minute single-shot timeout. COX_MODEL_TIMEOUT
+	// (spec.loop.modelTimeoutSeconds) overrides the 120s.
 	defaultModelRetries      = 3
 	defaultModelRetryBackoff = 2 * time.Second
 

@@ -433,6 +433,16 @@ type LoopSettings struct {
 	// +optional
 	StallAfter *int32 `json:"stallAfter,omitempty"`
 
+	// modelTimeoutSeconds bounds ONE model request from the agent runner (F46).
+	// Absent uses the runner default (120s). The runner retries a timed-out
+	// request up to 3 more times with 2s/4s/8s backoff, so the worst case is
+	// 4 x this value + 14s. Raise it for a slow self-hosted model; the
+	// operator passes it to the agent container as COX_MODEL_TIMEOUT.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	ModelTimeoutSeconds *int32 `json:"modelTimeoutSeconds,omitempty"`
+
 	// stallAction is the action taken when the stall detector fires.
 	// +kubebuilder:validation:Enum=Fail;Pause;Continue
 	// +kubebuilder:default=Fail

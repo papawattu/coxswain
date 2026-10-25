@@ -554,8 +554,8 @@ node that cannot schedule the pod) is still only surfaced as
 `SandboxNotStarting`, not failed; the kubelet's Events expire with the
 cluster's `--event-ttl` (default 1h), after which the operator is blind again
 and surfaces nothing; and if the operator's own Events read fails
-(`SandboxEventsUnreadable` Warning Event, once per Loop) the mount case is not
-bounded until it works.
+(`SandboxEventsUnreadable` Warning Event, repeated once every 5 minutes while
+the read keeps failing) the mount case is not bounded until it works.
 
 ### Event `AgentEgressFenced` (F55-b)
 

@@ -1064,10 +1064,12 @@ const (
 	// attach that resolves in seconds must not burn an attempt, and the decision
 	// clock must stay the operator's.
 	sandboxMountGrace = 60 * time.Second
-	// sandboxEventsUnreadableReason (F48b) is the one-shot Warning Event
-	// reason when the operator's Events list fails: the mount-failure path is
-	// blind while it does (no decision, never a failure), so the degradation
-	// must be visible (R26 I90).
+	// sandboxEventsUnreadableReason (F48b, F48f) is the Warning Event reason
+	// when the operator's Events list fails: the mount-failure path is blind
+	// while it does (no decision, never a failure), so the degradation must be
+	// visible (R26 I90). It repeats once per sandboxEventsUnreadableQuiet for as
+	// long as the read keeps failing — not once per Loop, because a persistent
+	// failure would otherwise go silent when the Event expires.
 	sandboxEventsUnreadableReason = "SandboxEventsUnreadable"
 	// sandboxEventsUnreadableAnnotation is the operator-owned marker for that
 	// Event (the memoryPVCUnboundNotified pattern, re-armed as F48f §F3): its
@@ -1554,8 +1556,10 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 			ev, eerr := r.sandboxMountFailureEvent(ctx, loop, pod)
 			if eerr != nil {
 				// A failed Events read is no decision (I49), never a failure —
-				// but the blindness is surfaced (R26 I90: a fallback must show
-				// its failure), at most once per Loop.
+				// but the blindness is surfaced (R26 I90: a fallback must show its
+				// failure) with one Warning Event per sandboxEventsUnreadableQuiet
+				// (F48f: the marker re-arms, so a persistent blindness keeps
+				// announcing after the previous Event has expired).
 				r.surfaceEventsUnreadable(ctx, loop, eerr)
 				return nil, nil
 			}

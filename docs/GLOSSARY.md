@@ -225,6 +225,15 @@ Alphabetical; each entry links to where the docs define the term.
   See: [QUICKSTART §6 (Plan
   approval)](QUICKSTART.md#6-plan-approval-manual-approval-gate).
 
+- **PinNotDescendant** — The terminal Failed reason (F43) the verify Job
+  reports when the pinned commit is not a descendant of the base commit:
+  the operator's `import-agent` refuses the runner's `headCommit` claim
+  before any check runs, and the Loop fails with no retry (a re-run would
+  import the same pin). Distinct from `TamperedVerify` (a protected path
+  changed) and `VerifyInfraFailed` (git itself failed, retried).
+  See: [TROUBLESHOOTING.md §`PinNotDescendant` — the verify Job refused the
+  pinned commit](TROUBLESHOOTING.md#pinnotdescendant--the-verify-job-refused-the-pinned-commit-f43).
+
 - **Policy gate (A1)** — The KubeArmor enforcement gate: the Loop's
   KubeArmorPolicy must exist and match the sandbox pod and BPF-LSM must be
   enforcing; without it the alpha is not running as designed.

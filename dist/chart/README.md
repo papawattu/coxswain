@@ -62,7 +62,9 @@ driving Manual-mode approvals (`approval.mode: Manual`) needs both:
   (the role is named `<release>-coxswain-loop-editor-role` when the release
   name does not contain `coxswain`, e.g. `my-cox-coxswain-loop-editor-role`
   for release `my-cox`; with `rbac.namespaced=false` the role is a
-  ClusterRole: use `--clusterrole=<that name> --user=<user>` without `-n`.)
+  ClusterRole: use `--clusterrole=<that name> --user=<user> -n <loop-namespace>`
+  — a RoleBinding to a ClusterRole is still namespaced, it is only the flag
+  that changes.)
 
 - **Pod access (the peek pod):** the helper role does NOT include this. Bind
   a Role in the Loop's namespace granting `create`, `get`, `delete` on `pods`

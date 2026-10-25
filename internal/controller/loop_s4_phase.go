@@ -930,6 +930,16 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 			logf.FromContext(ctx).Info("runner detected a plan change; clearing the PlanApproved condition (re-entering the hold)",
 				"loop", loop.Name)
 		}
+		// F48b (kind finding): a claim the operator accepts is the recovery
+		// signal for a sandbox infra failure episode, so the attempt count the
+		// episode accumulated ends here (it is cleared where the episode ends —
+		// see the count's comment in ensureSandbox). A fresh pod that succeeds
+		// must not carry the old episode's count into the next failure's bound.
+		if loop.Status.Agent != nil && (loop.Status.Agent.InfraAttempts != 0 || loop.Status.Agent.InfraSandboxUID != "") {
+			loop.Status.Agent.InfraAttempts = 0
+			loop.Status.Agent.InfraSandboxUID = ""
+			changed = true
+		}
 		c, advanced := r.recordPhaseClaim(ctx, loop, claim, now)
 		changed = changed || c
 		// I89: map a ModelUnavailable claim to a Loop condition so

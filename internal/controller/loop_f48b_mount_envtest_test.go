@@ -183,6 +183,64 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(countEvents(rec, sandboxInfraFinalEventReason)).To(Equal(1))
 	})
 
+	// F48b (kind finding): the sandbox infra-attempt count used to be reset
+	// whenever the live Sandbox's UID differed from status.agent.infraSandboxUID
+	// — which is exactly what the operator's own retry recreate produces. On a
+	// real cluster the bound therefore never tripped: the same "attempt 1 of 3"
+	// was re-emitted on every recreate (.samples/f48b/08-operator-log-f48b.log).
+	// The count belongs to the failure EPISODE and is cleared by a claim.
+	It("keeps the retry count across the operator's own Sandbox recreate, and trips at the bound", func() {
+		loop, pod, r, offset, _ := plant("f48brecreate")
+		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
+		*offset = sandboxMountGrace + time.Minute
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).NotTo(BeNil())
+		Expect(r.applySandboxFailure(ctx, loop, f)).To(BeTrue())
+		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(1)))
+
+		By("the operator's next reconcile recreates the Sandbox (a new UID) and ensures it")
+		fresh := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name},
+			Spec: sandboxv1beta1.SandboxSpec{
+				SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "example.com/cox-agent:v1"}}},
+					},
+				},
+				OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			},
+		}
+		Expect(k8sClient.Create(ctx, fresh)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, fresh)).To(Succeed())
+		Expect(string(fresh.UID)).NotTo(Equal(string(f.sandboxUID)), "the recreate has a new UID (the shape that used to reset the count)")
+		_, err = r.ensureSandbox(ctx, loop, true)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(1)), "the retry episode keeps its count across the recreate")
+
+		By("the next failure (a new Sandbox UID) counts again and reaches the bound")
+		second := &sandboxFailure{sandboxUID: fresh.UID, container: "<pod>", reason: "FailedMount",
+			message: "secret not found", mountFailure: true}
+		Expect(r.applySandboxFailure(ctx, loop, second)).To(BeTrue())
+		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(2)))
+		third := &sandboxFailure{sandboxUID: "another-sandbox-uid", container: "<pod>", reason: "FailedMount",
+			message: "secret not found", mountFailure: true}
+		Expect(r.applySandboxFailure(ctx, loop, third)).To(BeTrue())
+		Expect(loop.Status.Phase).To(Equal(cov.LoopPhaseFailed), "3 attempts in the episode, then Failed:SandboxFailed")
+	})
+
+	It("clears the retry count when a claim the operator accepts ends the episode", func() {
+		loop, _, r, _, _ := plant("f48brecover")
+		loop.Status.Agent = &cov.AgentStatus{InfraAttempts: 2, InfraSandboxUID: "some-sandbox-uid"}
+		r.readPhaseClaim = func(_ context.Context, _ *cov.Loop) (*PhaseClaim, error) {
+			return &PhaseClaim{ObservedPhase: cov.LoopPhasePlanning, Status: claimSuccess, Iteration: loop.Status.Iteration}, nil
+		}
+		_, changed, _ := r.advancePhaseFromClaim(ctx, loop)
+		Expect(changed).To(BeTrue())
+		Expect(loop.Status.Agent.InfraAttempts).To(BeZero(), "a fresh claim is the recovery: the episode's count ends")
+		Expect(loop.Status.Agent.InfraSandboxUID).To(BeEmpty())
+	})
+
 	It("surfaces an unreadable Events list once (no decision, no failure) instead of skipping it silently", func() {
 		loop, pod, clock, offset, rec := plant("f48bforbidden")
 		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)

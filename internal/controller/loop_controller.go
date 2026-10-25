@@ -1776,23 +1776,23 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			}
 			return false, nil // Sandbox deleted; the next reconcile creates it fresh
 		}
-		// F6 (the I65 P1-B pattern mirrored): a RECREATED Sandbox has a new
-		// UID. When the operator's last counted sandbox failure (status.agent.
-		// infraSandboxUID) names a DIFFERENT UID, the Sandbox the failure was
-		// read from is gone — the failure is the old one, and the fresh pod
-		// must get a clean attempt count (an exhausted bound on the old
-		// Sandbox must not doom the fresh one, and a fresh pod that then
-		// succeeds must not carry the old pod's count into the next failure's
-		// bound). The clear is the operator's (it is a status field, written
-		// in the shared trailing Status().Update); the phase-advance delete
-		// does NOT clear it (a phase advance is not an infra failure, and the
-		// count is per-Sandbox-UID, so the old UID's count stays bound to that
-		// UID — only a different live UID clears it).
-		if loop.Status.Agent != nil && loop.Status.Agent.InfraSandboxUID != "" &&
-			string(existingSb.UID) != loop.Status.Agent.InfraSandboxUID {
-			loop.Status.Agent.InfraAttempts = 0
-			loop.Status.Agent.InfraSandboxUID = ""
-		}
+		// F6 (the I65 P1-B pattern mirrored): status.agent.infraSandboxUID
+		// keys the count on the Sandbox the failure was read from, so a re-read
+		// of the SAME failing Sandbox never double-counts.
+		//
+		// F48b (kind finding): this block used to RESET the count whenever the
+		// live Sandbox's UID differed from infraSandboxUID — which is exactly
+		// what the operator's own retry does (applySandboxFailure deletes the
+		// Sandbox; the next reconcile recreates it). The bound therefore never
+		// tripped: the kind run re-emitted "attempt 1 of 3" on every recreate
+		// (.samples/f48b/08-operator-log-f48b.log), so a pod whose volume could
+		// not be mounted would have retried forever. The count now belongs to
+		// the FAILURE EPISODE, not to one Sandbox, and is cleared where the
+		// episode ends: a valid phase claim the operator accepts
+		// (advancePhaseFromClaim) — the same recovery signal that clears
+		// AgentFailed. A user who deletes the Sandbox mid-episode keeps the
+		// count (the failure has not recovered); the next successful claim
+		// clears it.
 	} else if !apierrors.IsNotFound(gerr) {
 		// A failed read (not NotFound): fail closed (I49 — a failed read is
 		// never a success); the reconcile retries.

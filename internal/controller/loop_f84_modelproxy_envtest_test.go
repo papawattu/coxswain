@@ -173,6 +173,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(modelProxyTerminalReason))
 			Expect(cond.Message).To(ContainSubstring(string(phase)), "the message names the terminal phase")
+			Expect(r.modelProxyHold(ctx, got)).To(BeFalse(), "a terminal Loop is never held for its proxy")
 
 			By("a second reconcile at the terminal phase: the clear is stable (no rewrite, no Event)")
 			_ = drainEvents(rec)

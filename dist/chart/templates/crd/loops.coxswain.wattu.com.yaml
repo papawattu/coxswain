@@ -380,6 +380,17 @@ spec:
                     description: maxIterations caps the plan→implement→verify cycles.
                     minimum: 1
                     type: integer
+                  modelTimeoutSeconds:
+                    description: |-
+                      modelTimeoutSeconds bounds ONE model request from the agent runner (F46).
+                      Absent uses the runner default (120s). The runner retries a timed-out
+                      request up to 3 more times with 2s/4s/8s backoff, so the worst case is
+                      4 x this value + 14s. Raise it for a slow self-hosted model; the
+                      operator passes it to the agent container as COX_MODEL_TIMEOUT.
+                    format: int32
+                    maximum: 3600
+                    minimum: 1
+                    type: integer
                   stallAction:
                     default: Fail
                     description: stallAction is the action taken when the stall detector

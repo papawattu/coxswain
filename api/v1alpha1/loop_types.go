@@ -275,10 +275,15 @@ type VerifyConfig struct {
 // (ADR-0005 D14). The values are kubelet-recorded container exit codes from
 // the verify Job's pod, never result.json claims.
 //
-// Integrity invariant (ADR-0005 D12): only the manager role may write
-// loops/status; it holds this verify evidence. The scaffolded loop_editor_role
-// and loop_admin_role grant loops/status `get` only, so today nothing but the
-// operator can set these fields. Keep it that way.
+// Integrity note (ADR-0005 D12, corrected by F47): loops/status is NOT
+// operator-only. The editor role grants update/patch on it so cox approve and
+// cox reject can PUT the object, so anyone bound to that role can write any
+// status field. The operator writes valid values, and every consumer that ACTS
+// on a status value must validate it first: the checkpoint GC and the lost-PVC
+// restore check the name shape and that the VolumeSnapshot carries this Loop's
+// label before deleting or restoring from it. Other consumers (e.g. the tamper
+// gate's inputs) are not yet hardened this way; narrowing the editor role is an
+// owner decision.
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
 	// operator records it from the branch head it resolved itself at Verifying
@@ -434,6 +439,16 @@ type LoopSettings struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	StallAfter *int32 `json:"stallAfter,omitempty"`
+
+	// modelTimeoutSeconds bounds ONE model request from the agent runner (F46).
+	// Absent uses the runner default (120s). The runner retries a timed-out
+	// request up to 3 more times with 2s/4s/8s backoff, so the worst case is
+	// 4 x this value + 14s. Raise it for a slow self-hosted model; the
+	// operator passes it to the agent container as COX_MODEL_TIMEOUT.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	ModelTimeoutSeconds *int32 `json:"modelTimeoutSeconds,omitempty"`
 
 	// stallAction is the action taken when the stall detector fires.
 	// +kubebuilder:validation:Enum=Fail;Pause;Continue

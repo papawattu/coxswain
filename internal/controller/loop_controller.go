@@ -174,6 +174,9 @@ const (
 	// to the local proxy (a Loop cannot override it: COX_* names are rejected
 	// at admission, I34).
 	coxModelBaseURL = "COX_MODEL_BASE_URL"
+	// coxModelTimeout is the env var carrying spec.loop.modelTimeoutSeconds
+	// (F46) as a Go duration; the runner reads it into PhaseConfig.ModelTimeout.
+	coxModelTimeout = "COX_MODEL_TIMEOUT"
 	// coxGoal is the env var the operator sets on the agent carrying
 	// spec.goal (S3, GAP 1: the goal was never passed to the agent). COX_* is
 	// I34-protected, so a Loop cannot override it.
@@ -1553,6 +1556,12 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		// would reject an unknown model name.
 		if loop.Spec.Agent.Model != "" {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: "COX_MODEL", Value: loop.Spec.Agent.Model})
+		}
+		// F46: the per-request model timeout (spec.loop.modelTimeoutSeconds).
+		// Operator-set like the rest of COX_*; absent leaves the runner's
+		// compiled-in default.
+		if t := loop.Spec.Loop.ModelTimeoutSeconds; t != nil && *t > 0 {
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelTimeout, Value: fmt.Sprintf("%ds", *t)})
 		}
 	}
 	// I42d: when the egress proxy is expected (network allows present, or the

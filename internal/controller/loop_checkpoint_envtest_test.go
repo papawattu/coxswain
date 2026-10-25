@@ -645,6 +645,83 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		}
 	})
 
+	// F47: status.checkpoints is user-writable (the editor role PUTs /status), so
+	// the retention GC must not delete a VolumeSnapshot just because a status
+	// entry names it.
+	It("F47: the retention GC never deletes a snapshot the Loop does not own, and drops the untrusted entries with a Warning Event", func() {
+		ns := "f47-gc-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "f47gc"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+		r := b1NewReconciler(true, false)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+
+		// Snapshots the forged entries point at.
+		foreign := b1MakeSnapshotObj("otherloop", ns, 1) // checkpoint-otherloop-iter-1, labelled otherloop
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+		oddName := "weird-snapshot" // wrong SHAPE, but labelled for THIS Loop: only the shape test catches it
+		odd := b1MakeSnapshotObj(name, ns, 2)
+		odd.SetName(oddName)
+		Expect(k8sClient.Create(ctx, odd)).To(Succeed())
+		unlabelled := b1MakeSnapshotObj(name, ns, 3) // right name, NO Loop label: only the ownership test catches it
+		unlabelled.SetLabels(map[string]string{})
+		Expect(k8sClient.Create(ctx, unlabelled)).To(Succeed())
+
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		at := metav1.Now()
+		entries := []coxv1alpha1.CheckpointStatus{
+			{Iteration: 1, Name: "checkpoint-otherloop-iter-1", At: at},
+			{Iteration: 2, Name: oddName, At: at},
+			{Iteration: 3, Name: checkpointName(loop, 3), At: at},
+			{Iteration: 4, Name: checkpointName(loop, 4), At: at}, // a genuine non-kept entry: still GC'd
+			{Iteration: 5, Name: checkpointName(loop, 5), At: at, Milestone: true},
+			{Iteration: 6, Name: checkpointName(loop, 6), At: at, Milestone: true},
+		}
+		loop.Status.Checkpoints = entries
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		b1CreateLoopSnapshots(ctx, &coxv1alpha1.Loop{ObjectMeta: loop.ObjectMeta, Status: coxv1alpha1.LoopStatus{
+			Checkpoints: []coxv1alpha1.CheckpointStatus{entries[3], entries[4], entries[5]}}})
+		s5aVerifyPod(ctx, ns, name, verifyJobName(loop), 0)
+		b1Reconcile(r, ns, name)
+
+		By("leaving every snapshot the Loop does not own untouched")
+		Expect(b1SnapshotExists(ctx, ns, "checkpoint-otherloop-iter-1")).To(BeTrue(), "another Loop's snapshot must never be deleted")
+		Expect(b1SnapshotExists(ctx, ns, oddName)).To(BeTrue(), "a wrong-shape name must not be deleted (even with this Loop's label)")
+		Expect(b1SnapshotExists(ctx, ns, checkpointName(loop, 3))).To(BeTrue(), "a snapshot without this Loop's label must not be deleted")
+		By("still GCing a genuine non-kept checkpoint")
+		Expect(b1SnapshotExists(ctx, ns, checkpointName(loop, 4))).To(BeFalse())
+
+		By("dropping the untrusted entries from status and warning once each")
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		names := make([]string, 0, len(fresh.Status.Checkpoints))
+		for _, cp := range fresh.Status.Checkpoints {
+			names = append(names, cp.Name)
+		}
+		Expect(names).NotTo(ContainElements("checkpoint-otherloop-iter-1"))
+		Expect(names).NotTo(ContainElement(oddName))
+		Expect(names).NotTo(ContainElement(checkpointName(loop, 3)))
+		Expect(names).NotTo(ContainElement(checkpointName(loop, 4)))
+		untrusted := 0
+		for _, e := range drainEvents(rec) {
+			if strings.Contains(e, "CheckpointEntryUntrusted") {
+				untrusted++
+			}
+		}
+		Expect(untrusted).To(Equal(3), "one Warning Event per untrusted entry")
+	})
+
 	It("retries the checkpoint on the next reconcile when the first create was skipped (level-based, not edge-triggered; must FAIL against the if-verifyChanged version)", func() {
 		ns := "b1-retry-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

@@ -218,3 +218,30 @@ run with no eligible lessons performs no eviction). The memory
 reader also now stops adding whole files at its 16 KiB section cap instead of
 silently dropping the whole memory section past that size. There is nothing
 to do.
+
+### The chart no longer renders a second VAP binding
+
+Helm installs from v0.1.0–v0.1.2 rendered **two** `ValidatingAdmissionPolicyBinding` objects for the one ephemeral-container `ValidatingAdmissionPolicy`: the literal `coxswain-deny-ephemeral-containers` (correct), plus a templated one named after the release's fullname, `{{ fullname }}-deny-ephemeral-containers`, whose `policyName` named the templated name and therefore no existing VAP — so the second one was **inert** (it bound nothing; the gate still worked). PR #249 (F45) removed the templated template. `helm upgrade` normally deletes objects that the previous release tracked but the new manifest no longer carries, but that is not guaranteed if the binding was created out-of-band (a hand-rendered `helm template` piped to `kubectl apply`, a switch from `install.yaml` to Helm, or lost release history) — so run the manual check below either way. It is harmless: the stale binding is inert, and deleting it cannot weaken or disable the ephemeral-container gate.
+
+**At release name `coxswain` (the default): there is nothing to do.** The two released templates collide on one object whose `policyName` names the real VAP, so there is nothing stale.
+
+**At any other release name, check for and delete the stale binding.** (The stale name is `{{ fullname }}-deny-ephemeral-containers`, where `fullname` is the release name when it contains "coxswain", otherwise `<release>-coxswain`; the check below is name-agnostic, so you do not need to work it out.)
+
+```sh
+# 1. Should be exactly one binding, `coxswain-deny-ephemeral-containers`, with
+#    POLICY = the VAP's name. A binding whose POLICY names no existing
+#    ValidatingAdmissionPolicy is the stale one.
+kubectl get validatingadmissionpolicybindings \
+  -o custom-columns=NAME:.metadata.name,POLICY:.spec.policyName
+kubectl get validatingadmissionpolicy coxswain-deny-ephemeral-containers
+
+# 2. Delete the stale one if present (inert: it binds nothing, so this cannot
+#    weaken or disable the ephemeral-container gate).
+kubectl delete validatingadmissionpolicybinding <stale-name>
+
+# 3. Confirm the gate still works (it is a Deny, so the command should be
+#    refused).
+kubectl debug -it <a coxswain pod> --image=busybox
+```
+
+If the check in step 1 shows two bindings for one release, keep the literal `coxswain-deny-ephemeral-containers` and delete the other.

@@ -362,16 +362,13 @@ model backend surfaces `ModelUnavailable` after about 8 minutes
 behaviour (a single 10-minute timeout followed by kubelet back-off churn
 with no named reason).
 
-**Tuning:** the timeout is not user-configurable today: the runner's
-`runConfig.ModelTimeout` field (`runner/runner.go`) exists but the runner
-entrypoint (`runner/cmd/main.go`) never sets it, so the timeout is always
-the `defaultModelTimeout` (120s). The value in effect is the compiled-in
-120s; there is no flag or CRD field to override it in this release. For a
-local 27B-class model under load, a
-legitimate response can approach 120s (#124 saw a 60s worst case); if you
-see spurious `ModelUnavailable` conditions on a healthy backend, the fix
-today is to reduce the load or the context size, not to tune the timeout.
-The retry count and backoff base are currently constants
+**Tuning:** set `spec.loop.modelTimeoutSeconds` (1-3600) to change the
+per-request timeout; the operator passes it to the agent as
+`COX_MODEL_TIMEOUT` (F46). Absent keeps the 120s default. The worst case is
+then 4 x the value + 14s of backoff. For a local 27B-class model under load,
+a legitimate response can approach 120s (#124 saw a 60s worst case); if you
+see spurious `ModelUnavailable` conditions on a healthy backend, raise the
+timeout or reduce the load or the context size. The retry count and backoff base are currently constants
 (`defaultModelRetries = 3`, `defaultModelRetryBackoff = 2s` in
 `runner/runner.go`).
 

@@ -1315,6 +1315,9 @@ const (
 	// pod.status.reason / pod condition reason when set, falling back to the
 	// container's termination reason) and its message carries the kubelet
 	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi").
+	// F48: it is also set, with reason CreateContainerConfigError, when a
+	// container NEVER STARTED because the kubelet could not configure it; the
+	// message then says "has not started (waiting: ...)", not "terminated".
 	// It is set to False / Recovered once the Loop advances past the failure
 	// (a fresh phase claim arrives) and removed once the bounded retry is
 	// exhausted (the distinct SandboxFailed Failed-condition carries the

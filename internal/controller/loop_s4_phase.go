@@ -1046,6 +1046,10 @@ type sandboxFailure struct {
 	exitCode   int32
 	message    string
 	podFailed  bool
+	// neverStarted is true for a container the kubelet could not create
+	// (CreateContainerConfigError): nothing terminated, so the message must
+	// not say it did.
+	neverStarted bool
 }
 
 // The F6 claim-wins check: the agent's own claim (its termination message)
@@ -1125,12 +1129,18 @@ func (r *LoopReconciler) applySandboxNotStarting(ctx context.Context, loop *coxv
 		if age < sandboxStartGrace {
 			return false
 		}
-		was := conditionIsTrue(loop, sandboxNotStartingCondition)
-		msg := fmt.Sprintf("the sandbox pod has been Pending for %s with no container started; run `kubectl describe pod %s` and read its events (a Secret that does not exist reports FailedMount there, not in the pod status)",
-			age.Round(time.Second), pod.Name)
+		if conditionIsTrue(loop, sandboxNotStartingCondition) {
+			return false // already surfaced: a fixed message, so no status write per pass
+		}
+		// The condition message is FIXED (an age in it would change every pass
+		// and cost a status write each time); the age goes in the one-shot Event.
+		msg := fmt.Sprintf("the sandbox pod has been Pending for over %s with no container started; run `kubectl describe pod %s` and read its events (a Secret that does not exist reports FailedMount there, not in the pod status)",
+			sandboxStartGrace, pod.Name)
 		setCondition(loop, sandboxNotStartingCondition, metav1.ConditionTrue, sandboxNotStartingEventReason, msg)
-		if !was && r.Recorder != nil {
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, sandboxNotStartingEventReason, "%s", msg)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, sandboxNotStartingEventReason,
+				"the sandbox pod %s has been Pending for %s with no container started; read `kubectl describe pod %s`",
+				pod.Name, age.Round(time.Second), pod.Name)
 		}
 		return true
 	}
@@ -1196,11 +1206,17 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 	// is in progress: no decision (I49).
 	if pod.Status.Phase == corev1.PodPending {
 		if w := configErrorWaiting(pod); w != nil && r.operatorNow().Sub(pod.CreationTimestamp.Time) >= sandboxConfigErrorGrace {
+			// The claim wins (ADR-0004), as on the Failed path: a valid claim
+			// means the phase finished, so this is not an infra failure.
+			if r.hasValidSandboxClaim(ctx, loop) {
+				return nil, nil
+			}
 			return &sandboxFailure{
-				sandboxUID: sb.UID,
-				container:  w.container,
-				reason:     sandboxConfigErrorReason,
-				message:    w.message,
+				sandboxUID:   sb.UID,
+				container:    w.container,
+				reason:       sandboxConfigErrorReason,
+				message:      w.message,
+				neverStarted: true,
 			}, nil
 		}
 		return nil, nil
@@ -1423,6 +1439,13 @@ func (r *LoopReconciler) ReissueSandboxDelete(ctx context.Context, loop *coxv1al
 func sandboxFailureMessage(f *sandboxFailure) string {
 	if f == nil {
 		return "sandbox pod failed without a phase claim"
+	}
+	if f.neverStarted {
+		s := "the sandbox pod's " + f.container + " container has not started (waiting: " + f.reason + ")"
+		if f.message != "" {
+			s += ": " + truncate(s4ClaimMaxBytes, f.message)
+		}
+		return s
 	}
 	s := "the sandbox pod's " + f.container + " container terminated without a phase claim"
 	if f.reason != "" {

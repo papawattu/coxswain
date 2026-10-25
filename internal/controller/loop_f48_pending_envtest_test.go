@@ -78,8 +78,12 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		Expect(stop).To(BeFalse(), "surfacing only: it never stops the phase machine")
 		Expect(ch).To(BeTrue())
 		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
+		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
+		msg := cond.Message
+		*offset = sandboxStartGrace + 2*time.Minute
 		_, ch, _ = r.sandboxFailureStep(ctx, loop, false)
-		Expect(ch).To(BeTrue())
+		Expect(ch).To(BeFalse(), "a second pass after the transition changes nothing (no status write per pass)")
+		Expect(findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition).Message).To(Equal(msg), "the message is fixed")
 		Expect(countEvents(rec, sandboxNotStartingEventReason)).To(Equal(1), "exactly one Warning Event across passes")
 
 		By("the pod starts: the condition clears")
@@ -111,7 +115,8 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(1)))
 		cond := findConditionFn(loop.Status.Conditions, cov.AgentFailedCondition)
 		Expect(cond).NotTo(BeNil())
-		Expect(cond.Message).To(ContainSubstring(`secret "x" not found`))
+		Expect(cond.Message).To(Equal(`the sandbox pod's agent container has not started (waiting: CreateContainerConfigError): secret "x" not found`),
+			"nothing terminated: the message must not say it did")
 
 		By("the bound: a later pass past sandboxInfraRetries fails the Loop with the kubelet's message")
 		loop.Status.Agent.InfraAttempts = sandboxInfraRetries
@@ -122,6 +127,19 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		Expect(failed).NotTo(BeNil())
 		Expect(failed.Reason).To(Equal(sandboxInfraFailedCondition))
 		Expect(failed.Message).To(ContainSubstring(`secret "x" not found`))
+	})
+
+	It("a CreateContainerConfigError with a valid claim in LastTerminationState is not a failure (the claim wins)", func() {
+		statuses := waiting(sandboxConfigErrorReason, `secret "x" not found`)
+		statuses[0].LastTerminationState = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0,
+			Message:  `{"observedPhase":"Planning","status":"success"}`,
+		}}
+		loop, _, r, offset, _ := plant("f48claim", statuses)
+		*offset = sandboxConfigErrorGrace + 30*time.Second
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "a valid claim means the phase finished; no infra attempt is burned")
 	})
 
 	It("a Pending pod with no kubelet reason is never a failure, however old (I49)", func() {

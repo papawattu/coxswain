@@ -261,12 +261,15 @@ If the check in step 1 shows two bindings for one release, keep the literal `cox
 now validated by the CRD: at most 253 characters and a DNS-1123 subdomain
 (`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`).
 A Loop whose existing value does not match (for example uppercase letters
-or an underscore) is not deleted or changed. On Kubernetes 1.30 and later,
-CRD validation ratcheting lets an update through when it leaves that field
-unchanged, so other spec edits and the operator's own status writes still
-work; only an update that changes the field must make it valid. On an older
-API server, any update to that Loop may be rejected until the value is fixed.
-(Not verified against a live API server for this CRD.) Kubernetes cannot have created a Secret with such
+or an underscore) is not deleted or changed. Two update paths behave
+differently. A spec or metadata update (a `kubectl edit`, or the operator
+removing its finalizer) is validated: on Kubernetes 1.30 and later,
+CRD validation ratcheting lets it through when it leaves that field
+unchanged, so only an update that changes the field must make it valid; on
+an older API server it may be rejected until the field is fixed. A status
+update never validates the spec on any version, so the operator's status
+writes are not blocked. (Not verified against a live API server for this
+CRD.) Kubernetes cannot have created a Secret with such
 a name, so a non-matching value was already a Loop that could never start.
 Before upgrading, list the values and look for non-matching ones:
 

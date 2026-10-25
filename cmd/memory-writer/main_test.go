@@ -236,11 +236,11 @@ func TestMemoryWriteWriteFailureExitsNonZero(t *testing.T) {
 	}
 }
 
-// TestMemoryWriteBoundedSummaryNeverLeaksLessonText: the bounded summary
-// (stdout) reports counts + per-lesson sha256-prefix/written|dropped/rule,
-// NEVER the lesson text. A lesson that failed the secrets screen must not be
-// echoed into the Job's logs / termination message.
-func TestMemoryWriteBoundedSummaryNeverLeaksLessonText(t *testing.T) {
+// TestMemoryWriteScreenedLessonTextIsNeverEchoed: a lesson that failed the
+// secrets screen must not be echoed into the Job's logs / termination
+// message. (A KEPT lesson's curator reason may quote the lesson, F33; this
+// spec covers only the screened one.)
+func TestMemoryWriteScreenedLessonTextIsNeverEchoed(t *testing.T) {
 	ws := t.TempDir()
 	mem := t.TempDir()
 	// A credential lesson (dropped) + an eligible lesson. The credential
@@ -266,9 +266,7 @@ func TestMemoryWriteBoundedSummaryNeverLeaksLessonText(t *testing.T) {
 	if code != 0 || err != nil {
 		t.Fatalf("run(succeeded) = (%d, %v); want (0, nil)", code, err)
 	}
-	// The credential lesson's text must NOT appear in the summary (the
-	// summary reports sha256-prefix + written|dropped + rule, never the
-	// lesson text).
+	// The screened credential lesson's text must NOT appear in the summary.
 	if strings.Contains(summary, "ghp_abcDEF1234567890abcdefghijklmnopQR") {
 		t.Errorf(
 			"summary includes the credential lesson's text:\n%s\nthe bounded summary must never leak a lesson's content",
@@ -652,7 +650,9 @@ func TestMemoryWriteCuratorTrueVerdictWrites(t *testing.T) {
 	}
 }
 
-// TestMutationCuratorKeepReasonNotRecorded: mutation test for the ADR-0002
+// (TestMutationGuard* specs: the name says which mutation the spec guards;
+// each asserts the NORMAL behaviour, which the mutation would break.)
+// TestMutationGuardCuratorKeepReasonIsRecorded: mutation test for the ADR-0002
 // keep-reason audit. The mutation: remove the keep-reason recording from
 // main.go (the v.Keep branch appends to curated but does NOT set
 // reasons[j] = "curator-keep: " + v.Reason). With the mutation, the audit
@@ -664,10 +664,10 @@ func TestMemoryWriteCuratorTrueVerdictWrites(t *testing.T) {
 //   - reasons[j] = "curator-keep: " + v.Reason
 //
 // (the line in the v.Keep branch of the curator loop in run). Then run
-// `go test -run TestMutationCuratorKeepReasonNotRecorded -count=1 .` — the
+// `go test -run TestMutationGuardCuratorKeepReasonIsRecorded -count=1 .` — the
 // test must fail (the summary lacks the keep reason). Then `git checkout .`
 // and re-run to confirm it passes.
-func TestMutationCuratorKeepReasonNotRecorded(t *testing.T) {
+func TestMutationGuardCuratorKeepReasonIsRecorded(t *testing.T) {
 	ws := t.TempDir()
 	mem := t.TempDir()
 	writeLessonsFile(t, ws, []string{"foo/bar: the retry must back off before the 500"})
@@ -926,8 +926,8 @@ func TestMemoryWriteCuratorReasonCRStrippedFromSummary(t *testing.T) {
 	}
 	// The reason is flattened: CR/LF become spaces, so the drop line reads
 	// "dropped curator: too generic and not specific" on ONE line.
-	if !strings.Contains(lines[0], "dropped curator: too generic and not specific") {
-		t.Fatalf("summary line 0 must carry the flattened reason (CR/LF -> space); got %q", lines[0])
+	if !strings.Contains(lines[1], "dropped curator: too generic and not specific") {
+		t.Fatalf("summary line 1 must carry the flattened reason (CR/LF -> space); got %q", lines[1])
 	}
 }
 
@@ -960,27 +960,27 @@ func TestSummaryLinesStripsCRFromReason(t *testing.T) {
 	// single-line (no \n or \r inside it) and reads
 	// "dropped curator: too generic and not specific".
 	want := "dropped curator: too generic and not specific"
-	if !strings.Contains(lines[0], want) {
-		t.Fatalf("summaryLines lesson line must carry the flattened reason (CR/LF -> space); want %q in %q", want, lines[0])
+	if !strings.Contains(lines[1], want) {
+		t.Fatalf("summaryLines lesson line must carry the flattened reason (CR/LF -> space); want %q in %q", want, lines[1])
 	}
 	// The lesson line must be single-line (no CR/LF inside it). An unstripped
 	// reason would leave \r\n or \n in the string.
-	if strings.ContainsAny(lines[0], "\r\n") {
-		t.Fatalf("summaryLines lesson line must be single-line (no CR/LF); got %q", lines[0])
+	if strings.ContainsAny(lines[1], "\r\n") {
+		t.Fatalf("summaryLines lesson line must be single-line (no CR/LF); got %q", lines[1])
 	}
-	// The counts line is the last element and must be well-formed.
-	if lines[1] != "summary: total=1 written=0 dropped=1" {
-		t.Fatalf("summaryLines counts line = %q; want %q", lines[1], "summary: total=1 written=0 dropped=1")
+	// The counts line is the FIRST element (F78) and must be well-formed.
+	if lines[0] != "summary: total=1 written=0 dropped=1" {
+		t.Fatalf("summaryLines counts line = %q; want %q", lines[0], "summary: total=1 written=0 dropped=1")
 	}
 }
 
-// TestMutationSummaryLinesStripReasonCRRemoved: mutation test for the
+// TestMutationGuardSummaryLinesStripReasonCR: mutation test for the
 // writer-level stripReasonCR in summaryLines. Removing the strip lets a
 // CR/LF reason through to the lesson-line string, leaving \r\n or \n inside
 // the line (the line is no longer single-line). This spec asserts the line
 // IS single-line (no CR/LF); with the mutation applied, the line contains
 // CR/LF and the spec FAILS.
-func TestMutationSummaryLinesStripReasonCRRemoved(t *testing.T) {
+func TestMutationGuardSummaryLinesStripReasonCR(t *testing.T) {
 	lesson := "foo/bar: the retry must back off before the 500"
 	reason := "dropped curator: too generic\r\nand\nnot specific"
 	lines := summaryLines([]string{lesson}, []string{reason}, nil, 1, 0, 1)
@@ -1115,8 +1115,9 @@ func TestMemoryWriteHugeBatchStaysUnderCap(t *testing.T) {
 	}
 }
 
-// Review 233 #5: the audit lines (evicted / truncated) come BEFORE the per-lesson
-// lines, because the Loop's audit text keeps only the first 1000 bytes.
+// Review 233 #5 + F78: the counts line comes FIRST, then the audit lines
+// (evicted / truncated), then the per-lesson lines, because the Loop's audit
+// text keeps whole lines from the start up to 1000 bytes.
 func TestMemoryWriteAuditLinesPrecedeLessonLines(t *testing.T) {
 	mem := t.TempDir()
 	seedLessons(t, mem, memorywrite.MaxLessons)
@@ -1132,10 +1133,10 @@ func TestMemoryWriteAuditLinesPrecedeLessonLines(t *testing.T) {
 			t.Errorf("%q (at %d) must come before lesson-001 (at %d):\n%s", marker, i, first, summary)
 		}
 	}
-	// the counts line stays last
+	// F78: the counts line is the FIRST line, before the audit lines.
 	lines := strings.Split(strings.TrimSpace(summary), "\n")
-	if !strings.HasPrefix(lines[len(lines)-1], "summary: total=") {
-		t.Errorf("the counts line must stay last:\n%s", summary)
+	if !strings.HasPrefix(lines[0], "summary: total=") {
+		t.Errorf("the counts line must be first:\n%s", summary)
 	}
 }
 

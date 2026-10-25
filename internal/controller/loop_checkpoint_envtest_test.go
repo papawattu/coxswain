@@ -42,7 +42,12 @@
 //   - the same-Loop update spec (I43): the operator does not re-take a
 //     checkpoint for an already-recorded iteration, and a new verify
 //     produces a new iteration + a new checkpoint (the operator UPDATES the
-//     object — re-reconciles and the status changes — not just creates it).
+//     object — re-reconciles and the status changes — not just creates it),
+//   - F87(c): a status.checkpoints entry only counts when
+//     checkpointEntryTrusted accepts it (status is user-writable): a forged
+//     entry at the current iteration is dropped and the real checkpoint is
+//     taken, a genuine entry keeps the idempotency, and a Gone entry is
+//     re-taken.
 //
 // The checkpoint seam: the workspace PVC is created with a nil
 // storageClassName (the cluster's default StorageClass), so the LIVE driver
@@ -73,6 +78,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -728,6 +735,238 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			}
 		}
 		Expect(untrusted).To(Equal(3), "one Warning Event per untrusted entry")
+	})
+
+	// F87(c): status.checkpoints is user-writable (the editor role PUTs
+	// /status), so an entry for the CURRENT iteration must not suppress the
+	// checkpoint unless checkpointEntryTrusted accepts it. Before F87 the
+	// idempotency loop compared the iteration only, so one status write left the
+	// iteration with no snapshot at all — and the retention GC cannot be relied
+	// on to drop the entry first (it returns early whenever the keep-set covers
+	// the whole list).
+	It("F87: a forged checkpoints entry at the current iteration does not suppress the checkpoint (the real one is taken, the forged entry dropped with a Warning Event)", func() {
+		ns := "f87-forged-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "f87forged"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		r := b1NewReconciler(true, false)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+
+		By("seeding a forged entry for the iteration the verify is about to record")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		forged := coxv1alpha1.CheckpointStatus{Iteration: 0, Name: "weird-snapshot", At: metav1.Now()}
+		loop.Status.Checkpoints = []coxv1alpha1.CheckpointStatus{forged}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		s5aVerifyPod(ctx, ns, name, verifyJobName(loop), 0)
+		b1Reconcile(r, ns, name)
+
+		By("taking the real checkpoint for the recorded iteration (the forged entry did not suppress it)")
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(fresh.Status.Verify).NotTo(BeNil(), "the verify outcome IS recorded")
+		Expect(fresh.Status.Verify.Iteration).NotTo(BeNil())
+		Expect(int(*fresh.Status.Verify.Iteration)).To(Equal(0))
+		Expect(b1SnapshotExists(ctx, ns, checkpointName(fresh, 0))).To(BeTrue(),
+			"F87: a forged checkpoints entry must not suppress the real checkpoint")
+
+		By("dropping the forged entry from status and warning once")
+		names := make([]string, 0, len(fresh.Status.Checkpoints))
+		for _, cp := range fresh.Status.Checkpoints {
+			names = append(names, cp.Name)
+		}
+		Expect(names).NotTo(ContainElement("weird-snapshot"), "the forged entry is dropped from status")
+		Expect(names).To(ContainElement(checkpointName(fresh, 0)), "the real checkpoint is recorded")
+		untrusted := 0
+		for _, e := range drainEvents(rec) {
+			if strings.Contains(e, "CheckpointEntryUntrusted") {
+				untrusted++
+			}
+		}
+		Expect(untrusted).To(Equal(1), "one Warning Event for the forged entry")
+	})
+
+	It("F87: a genuine checkpoints entry at the current iteration keeps the idempotency (no second snapshot, no second entry, no Event)", func() {
+		ns := "f87-genuine-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "f87genuine"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		r := b1NewReconciler(true, false)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+
+		By("seeding a genuine entry (the operator's name + a snapshot labelled for this Loop) at iteration 0")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(k8sClient.Create(ctx, b1MakeSnapshotObj(name, ns, 0))).To(Succeed())
+		loop.Status.Checkpoints = []coxv1alpha1.CheckpointStatus{{
+			Iteration: 0, Name: checkpointName(loop, 0), Milestone: true, At: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		s5aVerifyPod(ctx, ns, name, verifyJobName(loop), 0)
+		b1Reconcile(r, ns, name)
+
+		By("not re-taking the checkpoint and not appending a second entry")
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(volumeSnapshotListGVK)
+		Expect(k8sClient.List(ctx, list, client.InNamespace(ns),
+			client.MatchingLabels{"coxswain.wattu.com/loop": name})).To(Succeed())
+		Expect(list.Items).To(HaveLen(1), "the genuine entry still suppresses the create (idempotency kept)")
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(fresh.Status.Checkpoints).To(HaveLen(1), "no duplicate entry for the same iteration")
+		Expect(fresh.Status.Checkpoints[0].Name).To(Equal(checkpointName(fresh, 0)))
+		for _, e := range drainEvents(rec) {
+			Expect(e).NotTo(ContainSubstring("CheckpointEntryUntrusted"),
+				"a genuine entry is not reported as untrusted")
+		}
+	})
+
+	// F87 review P1: the trust read must be gated on the VolumeSnapshot CRD
+	// being present (I88), like every other snapshot read in the tree. On a
+	// CRD-less cluster a status entry at the current iteration must NOT be read
+	// (a Get of an absent type starts the cache watch) and must not be turned
+	// into a bogus Gone (NoMatchError) or an endless requeue (any other error).
+	It("F87: with no VolumeSnapshot CRD an entry at the current iteration is neither read nor dropped (the CRD gate comes first)", func() {
+		ns := "f87-nocrd-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "f87nocrd"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		// The no-CRD reconciler (withSupport=false, withoutCRD=true): its
+		// snapshotCRDPresent seam returns false, so the checkpoint step must
+		// issue NO snapshot read. envtest HAS the VolumeSnapshot CRD installed,
+		// so a read the step still made would SUCCEED and — the seeded entry has
+		// no snapshot behind it — be judged Gone, dropping the entry: that is
+		// the pre-fix damage the M0 run records.
+		r := b1NewReconciler(false, true)
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+
+		By("seeding an entry at the iteration the verify is about to record, with no snapshot behind it")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.Checkpoints = []coxv1alpha1.CheckpointStatus{{
+			Iteration: 0, Name: checkpointName(loop, 0), Milestone: true, At: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		s5aVerifyPod(ctx, ns, name, verifyJobName(loop), 0)
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("keeping the entry (there is no CRD, so no snapshot can be judged) and reporting the CRD-missing condition")
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(fresh.Status.Verify).NotTo(BeNil(), "the verify outcome IS recorded")
+		Expect(fresh.Status.Checkpoints).To(HaveLen(1), "the entry must not be dropped: with no CRD there is no snapshot to judge")
+		Expect(fresh.Status.Checkpoints[0].Name).To(Equal(checkpointName(fresh, 0)))
+		c := b1CheckpointCondition(fresh)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c.Reason).To(Equal(CheckpointReasonCRDMissing))
+		Expect(res.RequeueAfter).To(BeZero(),
+			"the checkpoint step must not requeue forever on an entry it cannot judge (the unknown branch would)")
+	})
+
+	// F87 review P3-2: the checkpointUnknown branch is a decision (requeue, no
+	// drop, no create) and needs a spec that does not need a cluster: a client
+	// whose VolumeSnapshot Get fails with a non-NotFound error.
+	It("F87: an unreadable snapshot at the current iteration is no decision (nothing dropped, requeue)", func() {
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "f87unknown", Namespace: "f87unknown-ns"},
+			Status: coxv1alpha1.LoopStatus{Checkpoints: []coxv1alpha1.CheckpointStatus{{
+				Iteration: 0, Name: "checkpoint-f87unknown-iter-0", At: metav1.Now(),
+			}}},
+		}
+		c := fake.NewClientBuilder().WithScheme(k8sClient.Scheme()).WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == volumeSnapshotGVK {
+					return apierrors.NewInternalError(fmt.Errorf("the snapshot read failed (injected)"))
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+		r := &LoopReconciler{Client: c, Scheme: k8sClient.Scheme(), apiReader: c}
+
+		kept, dropped, suppress, unknown := r.checkpointEntriesForCreate(ctx, loop, 0)
+		Expect(dropped).To(BeFalse(), "a failed read must not drop the entry")
+		Expect(suppress).To(BeFalse(), "a failed read must not suppress the checkpoint")
+		Expect(unknown).To(BeTrue(), "a failed read is no decision: the caller requeues")
+		Expect(kept).To(HaveLen(1), "the entry is kept while the read is retried")
+	})
+
+	It("F87: a Gone entry at the current iteration is re-taken (the snapshot is created and the entry is not duplicated)", func() {
+		ns := "f87-gone-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		b1CreateVSC()
+
+		name := "f87gone"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b1LoopSpec(),
+		})).To(Succeed())
+
+		r := b1NewReconciler(true, false)
+		rec := record.NewFakeRecorder(64)
+		r.Recorder = rec
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+
+		By("seeding the operator's own name at iteration 0 with NO snapshot object behind it")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.Checkpoints = []coxv1alpha1.CheckpointStatus{{
+			Iteration: 0, Name: checkpointName(loop, 0), Milestone: true, At: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		Expect(b1SnapshotExists(ctx, ns, checkpointName(loop, 0))).To(BeFalse(), "the fixture starts without the snapshot")
+
+		s5aVerifyPod(ctx, ns, name, verifyJobName(loop), 0)
+		b1Reconcile(r, ns, name)
+
+		By("re-creating the snapshot and replacing the stale entry (one entry, not two)")
+		Expect(b1SnapshotExists(ctx, ns, checkpointName(loop, 0))).To(BeTrue(),
+			"a Gone entry must not suppress the re-take")
+		fresh := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
+		Expect(fresh.Status.Checkpoints).To(HaveLen(1), "the stale entry is replaced, not duplicated")
+		Expect(fresh.Status.Checkpoints[0].Name).To(Equal(checkpointName(fresh, 0)))
+		for _, e := range drainEvents(rec) {
+			Expect(e).NotTo(ContainSubstring("CheckpointEntryUntrusted"),
+				"a Gone entry is this Loop's own name; it is not reported as untrusted")
+		}
 	})
 
 	It("retries the checkpoint on the next reconcile when the first create was skipped (level-based, not edge-triggered; must FAIL against the if-verifyChanged version)", func() {

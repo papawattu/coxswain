@@ -72,8 +72,8 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   while F83's own field doc states the opposite as fact.
 - **No P1s this round.** The security property at stake (a forged status must not
   fail a Loop) holds at `c57a255`.
-- **Eight issues are open** — I119, I120, I122-I125, I126 and I127; I121 is
-  closed by #259.
+- **Eight issues are open** — I119, I120, I123-I127; I121 is closed by
+  #259 and I122 by #260.
 
 ---
 
@@ -110,8 +110,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   `OOMKilled` init (exit 137) or an evicted pod ends the Loop terminally as "a
   protected path changed", and F83 now records and prints it.
   (c) **The record's lifecycle is incomplete.** The writer allocates
-  `status.verify` with no evidence, so the B1 checkpoint assertion became an `if`
-  that passes either way; the record survives the pin clear (`:1500`), so the
+  `status.verify` with no evidence (`loop_verify_job.go:1266-1269`); the record survives the pin clear (`:1500`), so the
   next `Implementing` run renders the previous iteration's tamper code;
   `status.verify.jobName` is a published field nothing writes; and F77 (rollback)
   will clear the pin and leave `tamperJobUID`.
@@ -129,8 +128,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
   **Acceptance:** the gate is gone with no spec deleted except the gate's own;
   the forge spec still shows a status-only verdict cannot fail a Loop; the
-  `OOMKilled` mapping has a spec and a named mutation; the B1 spec asserts an
-  absence again; `git grep -n 'fail-closed second line'` returns nothing;
+  `OOMKilled` mapping has a spec and a named mutation; `git grep -n 'fail-closed second line'` returns nothing;
   F77's queue line names `tamperJobUID`.
 
 - [ ] **I120: F48's three sandbox surfaces each stop short**
@@ -163,14 +161,18 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   Loop; the motivating F48 case (a missing `gitCredentialSecret` volume, reported
   as `FailedMount`) is F48b.
   (e) **The docs.** The UPGRADE note (the reviewer's fix `1ea7eab`) says
-  ratcheting is why "the operator's own status writes still work". Whether a
-  `/status` write validates the spec at all was not checked; if it does not, the
-  sentence gives the wrong reason. The tick must also say "surfacing only; the
+  ratcheting is why "the operator's own status writes still work". That is the
+  wrong reason: a `/status` update validates only the status schema, and
+  `PrepareForUpdate` restores the stored spec first
+  (`k8s.io/apiextensions-apiserver` v0.37.0, `registry/customresource/status_strategy.go:66-90`,
+  `validator.go:103-116`). Status writes are never blocked by a spec value on any
+  version; ratcheting matters only for spec and metadata writes (a `kubectl
+  edit`, the operator's finalizer removal). The tick must also say "surfacing only; the
   bound is F48b" rather than claim a bound F48 does not have.
 
   **Fix:** F48d for (a) and (d) (return `changed`, bound `InvalidImageName`);
   F48c with F48b for (b); record the config error's first sighting and measure
-  from it for (c); check the `/status` validation path and rewrite the UPGRADE paragraph with the two paths separated;
+  from it for (c); rewrite the UPGRADE paragraph with the two paths separated;
   write the tick against `main` at merge time, naming F48b.
 
   **Acceptance:** a Loop at `Verifying` with a Pending pod past the grace,
@@ -187,7 +189,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
   **What the review rounds caught before merge:** (a) a false evidence claim:
   the "no pod IP" spec's fixture set `PodIP = "127.0.0.1"`
-  (`loop_p2d_budget_test.go:205`), so it passed through the start grace, and
+  (`loop_p2d_budget_test.go:206`), so it passed through the start grace, and
   disabling the `PodIP == ""` branch left the suite green; fixed with a table
   spec, one row per `ErrNotReady` shape. (b) An unbounded silent fallback
   (R26 I90): the two shapes that never resolve showed nothing at all; fixed by
@@ -200,45 +202,23 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
   **Residual:** F84b (I127).
 
-- [ ] **I122: `cox describe` reads three fields that do not resolve, and #260 fixes one of the three**
+- [x] **I122: `cox describe` read fields that do not resolve — closed by #260 (`7f8074b`)**
 
-  **Where:** `internal/cli/describe.go:79-88` (the budget block; `:81` reads
-  `bmap["tokens"]`), `:119-131` (the delivery block; `:125`
-  `dmap["prNumber"].(float64)`, `:128` `dmap["prUrl"]`);
-  `api/v1alpha1/loop_delivery_types.go:123` (`PRNumber int64`, `json:"prNumber"`),
-  `:129` (`PRURL`, `json:"prURL"`); `internal/cli/commands_test.go:18` (the
-  `Delivered` condition message `"PR #1 open"`), `:21` (the fixture invents
-  `"prNumber": 1.0` and `"prUrl"`), `:31-32` (the assertions, `"PR #1"` at
-  `:32`); `docs/TROUBLESHOOTING.md:601-603`; PR #260.
+  **What it was:** the budget block read `status.budget.tokens`, which is not in
+  the API, and showed neither F44 field; the delivery block read `prNumber` as a
+  `float64` (it is `int64`) and the key `prUrl` (the tag is `prURL`), so neither
+  the `pr:` nor the `url:` line printed for a real Loop, and the spec's `"PR #1"`
+  assertion matched the condition message instead.
 
-  **Problem:** (a) the documented surface for both F44 outcomes shows neither
-  `lastUsageReadAt` nor `consecutiveReadFailures`, and reads a field that is not
-  in the API (`status.budget.tokens` does not exist), so a real Loop prints a
-  bare `Budget:` heading. (b) #260 fixes that, and the typed fixture it adds is
-  the right shape, but the delivery block beside it is broken in exactly the same
-  way and the current test cannot see it: `prNumber` is read with a `float64`
-  assertion while the CRD field is `int64` (real unstructured objects decode
-  integers as `int64`), and `prUrl` is the wrong key — a casing slip, the tag is
-  `prURL` — on **main** both lines print only because the fixture invents `1.0`
-  and `prUrl` (`commands_test.go:21`). The `"PR #1"` assertion never covered the delivery
-  line at all: it is satisfied by the condition message `"PR #1 open"`
-  (`:18`). So when #260's typed fixture makes `prNumber` an `int64` and the key
-  `prURL`, both lines stop rendering and every assertion still passes — the same
-  bug class the PR set out to fix, hidden by an assertion that was already
-  vacuous. (c) The queue's P3-1 fold-in is missing:
-  `docs/TROUBLESHOOTING.md:601-603` still describes one terminal Warning Event as
-  two, though there is exactly one (`loop_verify_job.go:1564-1568`).
-
-  **Fix:** #260 at CHANGES: read `prNumber` through `numberField` and `prURL`
-  (not `prUrl`), assert the two rendered delivery lines (named mutation: revert
-  to `.(float64)`; the new assertion fails), rename or drop the ambiguous
-  `"PR #1"`, and make the P3-1 doc edit. **#260 comes first when builder #2
-  pushes**, ahead of F84b.
-
-  **Acceptance:** the spec fails if either delivery line stops rendering;
-  `grep -rn 'prUrl' internal/cli` returns nothing; `cox describe` prints both F44
-  fields and no phantom key; `docs/TROUBLESHOOTING.md:601-603` no longer
-  describes one Event as two.
+  **What landed:** `internal/cli/describe.go:86-117` reads the real budget
+  fields; `:128` reads `prNumber` through `numberField` and `:131` reads
+  `prURL`; the spec asserts both rendered delivery lines
+  (`internal/cli/commands_test.go:77`) and a phantom budget key
+  (`TestDescribe_BogusBudgetKeyPrintsNoTokens`). The review round caught the
+  delivery block; the reviewer's two mutations (`.(float64)` restored, `prUrl`
+  restored) each fail the new assertions (`.samples/mut-260.md`).
+  `docs/TROUBLESHOOTING.md` now describes the one `PinNotDescendant` Event as
+  one.
 
 - [ ] **I123: F47 closed the status vector only; the fork/restore-spec vector is still open**
 
@@ -327,7 +307,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   (c) Evidence was written into a worktree's `.samples` for the third time; it is
   gitignored, invisible to the reviewer, and deleted with the worktree (the R28
   I92 rule inverted).
-  (d) Eleven review/doc PRs are open, so R30-R33's ticks are not on `main` and
+  (d) Twelve review/doc PRs are open, so R30-R33's ticks are not on `main` and
   R34 lands behind an unmerged R33.
   (e) **The reviewer's own misses.** The reviewer posted `Verdict: OK + notes` on
   #258 without seeing that the gate it kept is unreachable; post-merge review 7
@@ -405,7 +385,7 @@ those PRs are still open, I126(d)).
 
 - [ ] **D85: the Loop editor role can write Loop status, which makes every status-driven decision forgeable**
 
-  **Where:** `config/rbac/loop_editor_role.yaml:31-42` (`loops/status`
+  **Where:** `config/rbac/loop_editor_role.yaml:31-43` (`loops/status`
   `get;update;patch`, added for `cox approve`/`reject` in #148) against
   `docs/adr/0005-operator-verifies-via-isolated-job.md:170-177` ("only the manager
   role may write `loops/status` … **Keep it that way**"). The 17 status reads are

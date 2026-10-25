@@ -202,7 +202,8 @@ KubeArmor gate); the two flags are independent.
 
 **The supported topology is decided (D57).** The open question from the
 R26 review (Q2) is answered: the alpha ships **KubeArmor-only**. The
-KubeArmor policy gate (A1, ADR-0007) is the alpha's enforcement layer and is **required**; the D38 network gate is a second,
+KubeArmor policy gate (A1, ADR-0007) is the alpha's enforcement layer
+and is **required**; the D38 network gate is a second,
 network-layer gate that needs a CNI that enforces NetworkPolicy (e.g.
 Calico — the tested profile is `test/e2e/d38-cni-e2e.sh`). On a CNI that
 doesn't enforce NetworkPolicy (kindnet included), the released
@@ -226,6 +227,166 @@ configuration**: that `--allow-unenforced` disables the KubeArmor policy gate
 that D57 makes required. A supported enforcing setup is **Calico plus
 KubeArmor, with neither flag** (`--allow-unenforced` nor
 `--allow-unenforced-network`).
+
+## Reading the memory write outcome
+
+Source: the memory-writer changes F31 (#229), F32 (#233), F33 (#234),
+all merged on 2026-10-24, and the writer Job itself (P5b).
+
+When a Loop ends in a qualifying outcome (Succeeded, or Failed with
+reason `Stalled`), the operator creates a memory-writer Job
+(`<loop>-memory-write-<iteration>`, in
+`internal/controller/loop_memory_writer_job.go`) that screens the
+runner's proposed lessons and writes the survivors to the shared memory
+PVC. The outcome is recorded on the Loop's `MemoryWriteDone`
+condition; a failed write does not fail the Loop (ADR-0004).
+
+### The MemoryWriteDone condition
+
+The condition type is always set with status `True`; the **reason**
+carries the outcome (function names rather than line numbers, which
+change as main moves on). The message prefixes shown below are the
+shape as recorded today; the condition message is truncated, so treat
+them as "starts with".
+
+- **`MemoryWritten` — "memory write completed — audit: …"** — the
+  Job's pod succeeded. The eligible lessons are on the memory PVC; the
+  message is the audit trail (below).
+- **`MemoryWritten` — "memory write completed (the Job's pod
+  succeeded; …)"** — the pod carried no termination message (it
+  crashed before the summary was written, or the message is empty):
+  the same outcome, no per-lesson audit.
+- **`MemoryWritten` — "memory write completed (the Job is Complete;
+  its pod is gone, …)"** — F31: the Job's own `Complete` condition is
+  `True` but its pod no longer exists (pod GC, eviction, an admission
+  reject). Nobody read the pod, so the operator records the completion
+  without the per-lesson audit (`recordMemoryWriterOutcomeNoPod`).
+- **`MemoryWriteFailed` — "memory write failed (the Job's pod failed;
+  …)"** — the Job's pod is `Failed`. A Warning Event is also emitted.
+- **`MemoryWriteFailed` — "memory write failed (the Job hit its
+  activeDeadlineSeconds deadline — …)"** — the pod was stuck (e.g.
+  `CreateContainerConfigError`) and the Job's `activeDeadlineSeconds`
+  (300 s) killed it (Job reason `DeadlineExceeded`). The message names
+  the deadline so a review sees the hang.
+- **`MemoryWriteFailed` — "memory write failed (the Job failed with
+  reason <reason> and has no pod; …)"** — F31: the Job's own `Failed`
+  condition is `True` (reason as stamped by the batch controller, or
+  `unknown`) and the pod is gone.
+- **`MemoryWriteSkipped`** — no Job is created. Three forms: the Loop
+  ended in a non-qualifying terminal reason (not Succeeded or
+  Failed:Stalled — e.g. `SandboxFailed`, `BudgetExceeded`); the claim
+  did not report lessons (`lessonsAvailable` is false or absent, or
+  there is no progress record carrying the claim); or the Loop has no
+  workspace repo (no memory PVC to write to).
+
+The `MemoryWriteDone` condition is only meaningful once the Loop has
+terminated: on a non-terminal phase the operator sets no condition and
+creates no Job.
+
+### The audit lines
+
+On a `MemoryWritten` with a summary, the condition message (and the
+one-time `Normal` `memory write audit: …` Event) carries the writer's
+bounded summary: one line per lesson plus a counts line
+(`cmd/memory-writer/main.go`), in this shape:
+
+```
+evicted <sha12> cap
+truncated 3 lessons over the batch cap 20
+lesson-001 <sha12> written eligible
+lesson-002 <sha12> dropped curator: <free model text>
+lesson-003 <sha12> written curator-keep: <free model text>
+lesson-004 <sha12> dropped duplicate
+summary: total=11 written=2 dropped=9
+```
+
+The audit lines (first in the summary, so the 1000-byte truncation of
+the condition message never cuts them off):
+
+- `evicted <sha12> cap` — one line per lesson file the writer evicted
+to enforce the per-PVC cap (100 lessons). The `<sha12>` is the evicted
+file's name truncated to 12 hex chars. Eviction happens after a
+successful write, oldest-first by file mtime (ties by name), and never
+touches a lesson written in the same run.
+- `truncated N lessons over the batch cap 20` — the input had more than
+the per-write cap (20 lessons) and the surplus was not processed (the
+lessons file is writable by the agent, so the count is untrusted).
+
+The per-lesson lines carry `<sha12>` (the first 12 hex chars of the
+lesson's SHA-256 — enough to correlate a lesson without leaking its
+content), `written` or `dropped`, and the rule:
+
+- `written eligible` — the survivor passed the static screen and the
+curator; the rule column stays `eligible` for a survivor with no drop
+reason.
+- `dropped <static rule>` — a static-rule drop (the secrets patterns,
+the 500-char size cap, single-line, non-blank —
+`pkg/memorywrite/policy.go`), `dropped ineligible-outcome` (a
+non-qualifying outcome drops every lesson), or `dropped curator
+unavailable` (the curator gate is fail-closed: a call failure, a
+malformed verdict, an unparseable response, the 120 s overall curator
+budget, or no model endpoint at all drops the lesson —
+`pkg/curator/curator.go`).
+- `dropped duplicate` — the lesson's SHA-256 matched a lesson file
+already on the PVC (not written again), or an identical lesson appeared
+earlier in the same batch (F33 de-duplicates within a batch too, so the
+per-lesson lines, the counts and the metric agree).
+- `dropped curator: <reason>` / `written curator-keep: <reason>` — the
+Memory Curator's verdict. **A curator reason is free model text**
+(CR/LF-stripped and cut at 200 runes) and **may quote the lesson**: the
+lesson already passed the secrets screen, so this is not a credential
+leak, but the audit is not guaranteed lesson-free.
+
+A failure (no write) is NOT audited: `MemoryWriteFailed` carries the
+plain failure message, because a failed write is unreliable evidence and
+the operator does not fabricate an audit for a write that did not
+happen. The condition-message copy of the audit is capped at 1000 bytes
+on a rune boundary (the client-go Event cap is 1024; the Job's
+termination message is bounded to 4096), so a long write is cut in the
+**condition message**. The counts line (`summary: total=…`) is the last
+line of the summary, so it is usually the first thing lost: if the
+condition message has no `summary:` line, read the Job log, which carries
+the full summary.
+
+### The caps
+
+- **Lessons per PVC: 100** — oldest-first by mtime eviction (ties by
+  name; a lesson written this run is never evicted).
+  `pkg/memorywrite/policy.go`; the writer Job.
+- **Lessons per write: 20** — surplus is not processed and is counted
+  in the audit. `pkg/memorywrite/policy.go`.
+- **Lesson length: 500 characters** — a longer lesson is dropped by
+  the static screen. `pkg/memorywrite/policy.go`.
+- **Reader's per-file cap: 2000 bytes per lesson file** — a 500-rune
+  lesson is up to 2000 UTF-8 bytes; a file above the cap is read
+  truncated. `runner/phase.go`.
+- **Reader's section cap: 16 KiB** for the whole "SHARED MEMORY"
+  prompt section. The reader stops adding whole files at the cap (never
+  half a lesson) and logs a warning instead of dropping the whole
+  section — F32. `runner/phase.go`.
+
+The reader's warning goes to the **runner's log** (not the Loop status):
+`memory section truncated: remaining lesson files not included`, with
+the cap and the first omitted file name.
+
+### Where to look
+
+- **`kubectl cox describe <loop>`** (or `kubectl get loop <loop> -o
+  yaml`): the `MemoryWriteDone` condition and its reason/message (the
+  list above). `cox describe` shows conditions only, not Events.
+- **The `memory write audit` Event** (emitted once per Loop, on the
+  condition's transition to the recorded reason): `kubectl get events
+  --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>`
+  or `kubectl describe loop <loop>`.
+- **The memory-writer Job log**: `kubectl logs -n <loop-ns>
+  job/<loop>-memory-write-<iteration>`. The Job writes the
+  same bounded summary to stdout as to its termination message, so the
+  log carries the **full** per-lesson audit when the condition message's
+  1000-byte copy is truncated. The per-lesson lines carry only the
+  12-hex SHA prefix for the lesson itself; a curator reason may quote the
+  lesson (see above).
+- **The runner's log**: the `memory section truncated` warning when the
+  shared-memory prompt section hits its 16 KiB cap.
 
 ## A Loop stuck in Implementing with no model traffic
 

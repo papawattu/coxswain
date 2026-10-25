@@ -5515,6 +5515,16 @@ var conditionReasonRe = regexp.MustCompile(`^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_
 
 const conditionReasonMaxLen = 1024
 
+// F91b (R37 I140): the length unit is BYTES (len) and that is exact here, not a
+// bug. The pattern above is ASCII-only, so for every reason this guard accepts
+// len(reason) and the rune count are the same number and cannot disagree; a
+// multi-byte reason (500 CJK characters, say) is rejected by the PATTERN, never
+// by the length, so the "the condition schema cannot store" message is true for
+// it too. Keep len(): utf8.RuneCountInString would change nothing for any
+// storable input, and no spec could fail when it is reverted. The F89b envtest
+// is the drift detector for the pattern; if the pattern ever admits non-ASCII,
+// the unit becomes meaningful and this note is the marker.
+
 // storableConditionReason reports whether the CRD will accept reason on a status
 // write. An unstorable reason is not cosmetic: the API server rejects the WHOLE
 // update, so a caller that passes one loses every other field it set in the same

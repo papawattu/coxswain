@@ -20,23 +20,32 @@ Approval note (Manual-mode Loops, `approval.mode: Manual`):
   with `get` and set the PlanApproved / PlanRejected conditions on its
   `loops/status` subresource. Both also read PLAN.md from the workspace through
   a short-lived peek pod, so the user needs pod RBAC in the Loop's namespace as
-  well. The base operator roles grant neither.
+  well. The chart installs no user-facing role by default, so unless you bind
+  one, the API server rejects both commands (the operator's own role grants
+  these to its ServiceAccount, not to you).
 {{- if .Values.rbac.helpers.enabled }}
 
   This release installed the helper roles (rbac.helpers.enabled=true): bind
   the {{ include "coxswain.resourceName" (dict "suffix" "loop-editor-role" "context" $) }} role to a user or group to
-  grant the Loop access `cox approve`/`reject` need (it includes `get` on
-  `loops` and `update`/`patch` on `loops/status`):
+  grant the Loop access `cox approve`/`reject` need (it grants reading `loops`
+  and writing the `loops/status` subresource):
 {{- if .Values.rbac.namespaced }}
 
     kubectl create rolebinding <name> --role={{ include "coxswain.resourceName" (dict "suffix" "loop-editor-role" "context" $) }} --user=<user> -n {{ .Release.Namespace }}
+
+  That helper Role is installed in this release namespace, so the binding
+  covers Loops in {{ .Release.Namespace }} only.
 {{- else }}
 
-    kubectl create rolebinding <name> --clusterrole={{ include "coxswain.resourceName" (dict "suffix" "loop-editor-role" "context" $) }} --user=<user> -n {{ .Release.Namespace }}
+    kubectl create rolebinding <name> --clusterrole={{ include "coxswain.resourceName" (dict "suffix" "loop-editor-role" "context" $) }} --user=<user> -n <loop-namespace>
+
+  The helper is a ClusterRole (rbac.namespaced=false), but a RoleBinding is
+  namespaced: create one in each namespace whose Loops you want to approve.
 {{- end }}
 
-  It does NOT grant the peek-pod rules: bind a Role in the Loop's namespace
-  granting `create`, `get` and `delete` on `pods` and `get` on `pods/log`.
+  The helper role does NOT grant the peek-pod rules: bind a Role in the Loop's
+  namespace granting `create`, `get` and `delete` on `pods` and `get` on
+  `pods/log`.
 {{- end }}
 
 Without such a binding, `cox approve`/`reject` are rejected by the API server

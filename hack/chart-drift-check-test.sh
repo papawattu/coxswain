@@ -48,9 +48,11 @@ echo "$out" | grep -q "lessonsAvailable" || { echo "FAIL: CRD guard failed but d
 echo "OK: CRD guard passes the real chart and fails (naming lessonsAvailable) on a chart without it"
 
 # F87(a): the F45 non-default-release render guard (hack/chart-check.sh) also
-# has to bite: the real chart passes, and a copy with an inert second
-# ValidatingAdmissionPolicyBinding (the F45 defect) FAILS and names the cause.
-"$ROOT/hack/chart-check.sh" >/dev/null || { echo "FAIL: the real chart must pass chart-check"; exit 1; }
+# has to bite: a copy with an inert second ValidatingAdmissionPolicyBinding (the
+# F45 defect) FAILS and names the cause. (The real chart's PASS is not repeated
+# here: the chart-drift-test recipe runs chart-check.sh on the real chart just
+# before this harness, and chart-check.sh is two helm renders plus two
+# build-installer runs, so a third is waste - F87 review P3-3.)
 rm -rf "$TMP/chart3"
 cp -r "$ROOT/dist/chart" "$TMP/chart3"
 mkdir -p "$TMP/chart3/templates/extras"
@@ -69,11 +71,11 @@ fi
 echo "$out" | grep -q "expected exactly 1 ValidatingAdmissionPolicyBinding" || {
 	echo "FAIL: the render guard failed but did not name the binding count:"; echo "$out"; exit 1
 }
-echo "OK: render guard passes the real chart and fails (naming the binding count) on a chart with an inert second VAP binding"
+echo "OK: render guard fails (naming the binding count) on a chart with an inert second VAP binding"
 
-# F87(b): the chart NOTES guard. The real NOTES pass; the pre-F87 text (PATCH,
-# a bare `--clusterrole loop-editor`, no pods/log) FAILS and names the cause.
-"$ROOT/hack/chart-notes-check.sh" >/dev/null || { echo "FAIL: the real chart NOTES must pass"; exit 1; }
+# F87(b): the chart NOTES guard. The pre-F87 text (a bare `--clusterrole
+# loop-editor`, no pods/log, no --role= branch) FAILS and names the causes; the
+# real NOTES passing is covered by the recipe line (F87 review P3-3).
 rm -rf "$TMP/chart4"
 cp -r "$ROOT/dist/chart" "$TMP/chart4"
 cat >"$TMP/chart4/templates/NOTES.txt" <<'NOTES'
@@ -91,10 +93,10 @@ fi
 echo "$out" | grep -q "names a role that does not exist" || {
 	echo "FAIL: the NOTES guard failed but did not name the role defect:"; echo "$out"; exit 1
 }
-echo "$out" | grep -q "PATCH" || {
-	echo "FAIL: the NOTES guard did not name the PATCH defect:"; echo "$out"; exit 1
+echo "$out" | grep -q "pods/log" || {
+	echo "FAIL: the NOTES guard did not name the missing peek-pod RBAC:"; echo "$out"; exit 1
 }
-echo "OK: NOTES guard passes the real chart and fails (naming the role name and the PATCH) on the pre-F87 text"
+echo "OK: NOTES guard fails (naming the role name and the missing pods/log rule) on the pre-F87 text"
 
 # F87(a)/(b): the wiring. The guards above are called directly by this harness,
 # so nothing else proves `make test` (what CI runs) calls them. `make -n`

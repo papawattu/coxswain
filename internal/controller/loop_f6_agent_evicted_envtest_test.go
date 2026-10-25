@@ -154,6 +154,8 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		loop.Status.Agent = &cov.AgentStatus{
 			InfraAttempts:   2,
 			InfraSandboxUID: "prior-uid",
+			// F48g: the seeded count is of THIS run (see sandboxRunKey).
+			InfraEpisode: sandboxRunKey(loop),
 		}
 		// Plant a NEW sandbox + failed pod (a different UID).
 		f6PlantSandboxAndPodFn(ns, name)

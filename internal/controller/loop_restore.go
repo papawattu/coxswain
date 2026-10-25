@@ -860,6 +860,13 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	}
 	setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 		restoredMessage(loop, target))
+	// F48g: a completed restore is an episode boundary — the workspace the
+	// pre-restore run failed against no longer exists, so its sandbox-failure
+	// count must not consume the new run's budget and fail the new pod on its
+	// first transient mount failure. This is the A2 LOST-PVC / fork completion;
+	// b2ApplyRestoreStep's rollback branch (spec.restoreFrom) has its own clear,
+	// because the run key cannot see either of them.
+	clearSandboxInfraEpisode(loop)
 	restored = true
 	persist()
 	r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
@@ -937,6 +944,11 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 				restoredMessage(loop, target))
+			// F48g: a completed restore ends the sandbox-failure episode (the
+			// rollback's PVC is gone and is recreated from the snapshot), so the
+			// count the pre-rollback run accumulated does not carry into the
+			// restored run. Same boundary as b2ApplyLostPVCRestore's completion.
+			clearSandboxInfraEpisode(loop)
 			persist()
 			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
 				"workspace PVC restored from "+target.snapshot)

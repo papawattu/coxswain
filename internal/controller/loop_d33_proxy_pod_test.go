@@ -246,6 +246,19 @@ var _ = Describe("D33: proxy pod + Service per Loop (replaces the C2a sidecar)",
 		withoutEnv := envByName(&getSandbox("f46without", ns).Spec.PodTemplate.Spec.Containers[0])
 		Expect(withoutEnv).NotTo(HaveKey(coxModelTimeout))
 
+		By("same Loop: editing the field and re-reconciling updates the Sandbox template env (then removing it drops the env)")
+		live := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "f46with", Namespace: ns}, live)).To(Succeed())
+		*live.Spec.Loop.ModelTimeoutSeconds = 600
+		Expect(k8sClient.Update(ctx, live)).To(Succeed())
+		reconcile("f46with", ns)
+		Expect(envByName(&getSandbox("f46with", ns).Spec.PodTemplate.Spec.Containers[0])[coxModelTimeout].Value).To(Equal("600s"))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "f46with", Namespace: ns}, live)).To(Succeed())
+		live.Spec.Loop.ModelTimeoutSeconds = nil
+		Expect(k8sClient.Update(ctx, live)).To(Succeed())
+		reconcile("f46with", ns)
+		Expect(envByName(&getSandbox("f46with", ns).Spec.PodTemplate.Spec.Containers[0])).NotTo(HaveKey(coxModelTimeout))
+
 		By("rejecting an out-of-range value at the API (Minimum=1, Maximum=3600)")
 		for _, bad := range []int32{0, 3601} {
 			l := buildLoop("f46bad", ns)

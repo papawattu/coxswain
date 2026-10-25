@@ -864,7 +864,7 @@ nothing is restored from it.
    the retention GC moves past them (retention keeps the last 3 plus
    milestone checkpoints).
 
-**Where the fix lives:** F47, `docs/REVIEW-PHASE1-R31.md`, PR #254 (merged
+**Where the fix lives:** F47 (raised in review round R30), PR #254 (merged
 as `1cad554`). Before the fix, a forged status entry that named a real but
 foreign snapshot could cause the operator to delete (GC path) or restore
 from (restore path) a snapshot belonging to a different Loop. After the

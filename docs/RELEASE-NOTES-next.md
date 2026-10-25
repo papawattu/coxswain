@@ -219,8 +219,8 @@ existing Loops are unaffected, but new ones are.
 
 ### F48d: `SandboxNotStarting` is saved, fires once, and clears; a bad image name fails at once — #262
 
-- **What was wrong.** During Verifying, the `SandboxNotStarting` condition was not saved, so its Warning Event fired on every reconcile (F48c); and a bad image name (`InvalidImageName`) waited forever instead of failing the sandbox start (F48c).
-- **What changed.** At Verifying, the `SandboxNotStarting` condition is now saved and its Warning Event fires once, not every reconcile; the condition clears when the pod or its Sandbox is gone; and a bad image name (`InvalidImageName`) now fails the sandbox start at once instead of waiting forever (PR #262).
+- **What was wrong.** During Verifying, the `SandboxNotStarting` condition was not saved, so its Warning Event fired on every reconcile (F48d); the condition was also not cleared when the pod or its Sandbox is gone (F48c); and a bad image name (`InvalidImageName`) waited forever instead of failing the sandbox start (F48d).
+- **What changed.** At Verifying, the `SandboxNotStarting` condition is now saved and its Warning Event fires once, not every reconcile; the condition clears when the pod or its Sandbox is gone (F48c is fixed too); and a bad image name (`InvalidImageName`) now fails the sandbox start at once instead of waiting forever (PR #262).
 - **On upgrade.** Nothing to do; the fix is in the operator (PR #262).
 
 ### F85: `cox describe` now shows the real budget and the commit pin and PR lines — #260
@@ -537,8 +537,9 @@ lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
 curator failure), F43 (the agent-chosen pin), F44 (surfacing unmetered
 requests and stale usage reads), F47 (untrusted checkpoint status entries), F84 (the `BudgetReadingStale` false
 alarm while the proxy pod is starting), F85 (the `cox describe` budget block
-reading a non-existent field), F48c (the `SandboxNotStarting` condition not
-saved and its Event firing every reconcile), F46 (the unwired model timeout),
+reading a non-existent field), F48d and F48c (the `SandboxNotStarting`
+condition not saved at Verifying, and not cleared when the pod is gone),
+F46 (the unwired model timeout),
 and F83 (the unrecorded tamper evidence) were closed by #229, #222, #233,
 #234, #238, #243, #241, #244, #248, #254, #259, #260, #262, #252, and #258. In
 plain words, the items still open:

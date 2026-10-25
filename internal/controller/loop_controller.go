@@ -870,18 +870,23 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// D38: capture the condition set before applyEffectivePolicyAndConditions so
+	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
+	// probe result change) still triggers a status update. Without this, the
+	// "re-gate on flip" spec would never persist the new condition. It is taken
+	// BEFORE the F84c terminal clear below, so a clear-only change is persisted
+	// by conditionsChanged (and Reconcile needs no extra branch for it).
+	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
+	copy(condsBefore, loop.Status.Conditions)
+
 	// F84c: a terminal Loop is not held for its model proxy, and the clear must
 	// run before EVERY hold that can return early — including validateStep just
 	// below, which PERSISTS status while it holds (agentPoliciesValid /
 	// modelConfigInvalid both call Status().Update), and the restore/b2 and D30
 	// holds further down (sandboxSuspendedByGate reaches the D35a gate only
-	// after them, and a b2 hold skips the bootstrap and the gate entirely).
-	// It runs BEFORE the condsBefore snapshot, so conditionsChanged cannot be
-	// what persists it: the flag is ORed into changed below, and the holding
-	// paths carry the cleared condition out on their own write. Only the two
-	// genuine error returns (applyEffectivePolicyAndConditions, the restore
-	// step) leave it in memory, which is correct — they retry.
-	terminalCleared := clearModelProxyHoldForTerminal(&loop, false)
+	// after them, and a b2 hold skips the bootstrap and the gate entirely). The
+	// return value is not needed here: the snapshot above predates the clear.
+	_ = clearModelProxyHoldForTerminal(&loop)
 
 	// C6a + D34: validate the referenced AgentPolicies and the
 	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
@@ -889,13 +894,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if res, done := r.validateStep(ctx, &loop); done {
 		return res, nil
 	}
-
-	// D38: capture the condition set before applyEffectivePolicyAndConditions so
-	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
-	// probe result change) still triggers a status update. Without this, the
-	// "re-gate on flip" spec would never persist the new condition.
-	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
-	copy(condsBefore, loop.Status.Conditions)
 
 	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
 		return ctrl.Result{}, err
@@ -913,7 +911,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed := b2Changed || terminalCleared // the B2 restore step's condition change (the I90 point-of-decision write) and the F84c terminal clear
+	changed := b2Changed // the B2 restore step's condition change (the I90 point-of-decision write)
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
@@ -2064,10 +2062,12 @@ func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, why, 
 // clearModelProxyHoldForTerminal is the terminal clear (F84b, F84c): a finished
 // Loop is not held for its model proxy, so the condition must not outlive the
 // work it describes (the R34 I120(b) class). Called from Reconcile before every
-// hold that can return early (validateStep, the restore/b2 step, D30/35a) and
-// from the deleting path, which persists the conditions as its durable record;
-// both OR the returned flag into the write they already make. Only the genuine
-// error returns leave it in memory, which is correct — they retry.
+// hold that can return early (validateStep, the restore/b2 step, D30/35a) — its
+// result is discarded there because the condsBefore snapshot predates the call,
+// so conditionsChanged persists it — and from the deleting path, which ORs the
+// flag into the write it already makes. Only the two genuine error returns
+// (applyEffectivePolicyAndConditions, the restore step) leave it in memory,
+// which is correct — they retry.
 //
 // Two notes on what that placement buys, and what is pinned by a spec:
 //   - the restore-hold (b2Hold) half is PLACEMENT-guaranteed and not spec-pinned
@@ -2081,12 +2081,12 @@ func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, why, 
 // The terminal test lives here rather than in Reconcile to keep Reconcile inside
 // its gocyclo budget; modelProxyHold only refuses to hold at a terminal phase
 // (it never clears).
-func clearModelProxyHoldForTerminal(loop *coxv1alpha1.Loop, changed bool) bool {
+func clearModelProxyHoldForTerminal(loop *coxv1alpha1.Loop) bool {
 	if !isTerminalPhase(loop.Status.Phase) {
-		return changed
+		return false
 	}
 	if !conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
-		return changed
+		return false
 	}
 	setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
 		modelProxyTerminalReason,

@@ -920,7 +920,7 @@ func (r *LoopReconciler) finalizeB2DeleteStep(ctx context.Context, loop *coxv1al
 	// Ready" for a hold that does not exist. Before condsBefore, so the D38
 	// capture below compares against the cleared value; the flag is ORed into
 	// b2Changed for the write that follows.
-	terminalCleared := clearModelProxyHoldForTerminal(loop, false)
+	terminalCleared := clearModelProxyHoldForTerminal(loop)
 	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
 	copy(condsBefore, loop.Status.Conditions)
 	if policiesReadable {

@@ -48,7 +48,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   `status.agent.infraEpisode`** (`docs/TROUBLESHOOTING.md:542-543`). `docs/UPGRADE.md` does not, and D86's
   acceptance is unmet (I136).
 - **Rounds:** #268 one (`Verdict: OK`; three pre-review notes folded in
-  `59d9431`), #269 two (CHANGES, then OK + notes), #270 one (OK), #271 one
+  `59d9431`, a commit on #268's branch), #269 two (CHANGES, then OK + notes), #270 one (OK), #271 one
   (OK + notes; its notes are the queue's F89b).
 - **Five items are new — I133 to I137; one owner decision, D87.** I128-I132 and
   D72-D86 stay open, and their state is in the bullets below.
@@ -196,8 +196,9 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   delete-and-re-apply. UPGRADE does not. F48g also added an optional status
   field and moved the retry count from "since the last accepted claim" to "per
   run", and F48e's queue line already carries an UPGRADE line for the field. The
-  release *notes* are current — #226 carries entries for #269 (`:228-229`),
-  #271 (`:234`) and #268 (`:258`) — and the runbook now covers the operator
+  release *notes* are current — #226 carries entries for them on
+  `origin/docs/release-notes-next` (`31eb2190`): #269 `:228-229`, #271 `:234`
+  and #268 `:258` — and the runbook now covers the operator
   remedy. So the missing surface is UPGRADE, the file an operator reads before
   installing.
 
@@ -223,8 +224,9 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   one of the two had no spec at all. The reviewer's per-site runs did say: B1
   failed S4 and B2 passed, which is what found the gap and produced S4b. The
   body's section header also names one worktree (`a78cfce`) for runs on two
-  trees, which is visible in its own outputs (`Ran 5 of 588` for M-B2,
-  `Ran 6 of 589` for M-B1, the second tree being the one with S4b).
+  trees, with runs spanning two trees: M-A printed `Ran 5 of 588`, M-B1 (the one
+  that proves S4b) `Ran 6 of 589`, and the reviewer's log records the two
+  baselines (`mut-269.md:2`, `:9`).
 
   **Fix:** a norm beside the two existing mutation rules: when two sites share a
   shape, mutate one site per run, and record the tree and the spec count each
@@ -252,7 +254,8 @@ D85 in R34, D86 in R35).
   **Problem:** R30 to R35 carry I103 to I132 and D75 to D86. Each new round
   restates the same carry-forward table, because no round can be ticked while
   its own doc is open, and #204 covers R7-R22 only. The cost is visible in this
-  round: I129's fix merged two rounds ago and the item is still open, so a
+  round: I129's fix merged in R35's round (#266,
+  `de4b506`), completed by #269, and the item is still open, so a
   reader cannot tell an open defect from an open bookkeeping item.
 
   **Decision asked:** (a) merge the six rounds oldest first, then tick the

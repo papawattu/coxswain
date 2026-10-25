@@ -1901,7 +1901,10 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 	// the Job UID: increment infraAttempts only when the failing Job's UID
 	// differs from the one already recorded (infraJobUID). A recreated Job has
 	// a new UID, so its first infra-failure IS counted (the retry), while a
-	// re-read of the same failing Job is not.
+	// re-read of the same failing Job is not. A new UID may add an attempt; it
+	// never clears the count (F48e): the reset is the new pin in
+	// advancePhaseFromClaim, not this guarded increment (the reset rule itself
+	// is on status.verify.infraAttempts in the API).
 	var jobUID types.UID
 	if job != nil {
 		jobUID = job.UID

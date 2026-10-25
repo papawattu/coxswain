@@ -32,7 +32,7 @@ func TestApproveLoop_SetsPlanApprovedCondition(t *testing.T) {
 	// The PlanApproved condition must be present (True, the hash in the message).
 	// F87: the command does Get then a status merge patch — NOT a whole-object
 	// Update (which wrote every status field the CLI had read back).
-	_, body := assertStatusConditionPatch(t, f)
+	body := assertStatusConditionPatch(t, f)
 	assertPatchHasNoOtherStatus(t, body)
 	conds := patchConditions(t, body)
 	var foundCond bool
@@ -79,7 +79,7 @@ func TestApproveLoop_PatchCarriesResourceVersion(t *testing.T) {
 	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
 		t.Fatalf("approveLoop: %v", err)
 	}
-	_, body := assertStatusConditionPatch(t, f)
+	body := assertStatusConditionPatch(t, f)
 	meta, ok := body["metadata"].(map[string]any)
 	if !ok {
 		t.Fatalf("the status patch carries no metadata (the resourceVersion precondition): %v", body)
@@ -101,7 +101,7 @@ func TestRejectLoop_PatchCarriesResourceVersion(t *testing.T) {
 	if err := rejectLoop(context.Background(), dc, loopName, "wrong direction", &out); err != nil {
 		t.Fatalf("rejectLoop: %v", err)
 	}
-	_, body := assertStatusConditionPatch(t, f)
+	body := assertStatusConditionPatch(t, f)
 	meta, ok := body["metadata"].(map[string]any)
 	if !ok {
 		t.Fatalf("the status patch carries no metadata (the resourceVersion precondition): %v", body)
@@ -135,7 +135,7 @@ func TestApproveLoop_ReplaceOnReapprove(t *testing.T) {
 	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
 		t.Fatalf("approveLoop (re-approve): %v", err)
 	}
-	_, body := assertStatusConditionPatch(t, f)
+	body := assertStatusConditionPatch(t, f)
 	conds := patchConditions(t, body)
 	count := 0
 	for _, c := range conds {
@@ -166,7 +166,7 @@ func TestRejectLoop_SetsPlanRejectedCondition(t *testing.T) {
 	if err := rejectLoop(context.Background(), dc, loopName, "the plan misses the edge case", &out); err != nil {
 		t.Fatalf("rejectLoop: %v", err)
 	}
-	_, body := assertStatusConditionPatch(t, f)
+	body := assertStatusConditionPatch(t, f)
 	assertPatchHasNoOtherStatus(t, body)
 	conds := patchConditions(t, body)
 	var foundCond bool
@@ -283,11 +283,11 @@ func TestDiffLoop_PlanChanged(t *testing.T) {
 // --- F87(d): approve/reject write a status merge patch, not a whole-object PUT ---
 
 // assertStatusConditionPatch asserts the command wrote its condition with ONE
-// JSON merge patch to the status subresource, and returns the patch call and its
-// decoded body. It fails when a whole-object Update was also (or instead)
-// issued: the pre-F87 path read the whole object, edited status.conditions and
-// PUT the object back to /status, writing every other status field with it.
-func assertStatusConditionPatch(t *testing.T, f *fakeLoopClient) (patchCall, map[string]any) {
+// JSON merge patch to the status subresource, and returns the patch's decoded
+// body. It fails when a whole-object Update was also (or instead) issued: the
+// pre-F87 path read the whole object, edited status.conditions and PUT the
+// object back to /status, writing every other status field with it.
+func assertStatusConditionPatch(t *testing.T, f *fakeLoopClient) map[string]any {
 	t.Helper()
 	if len(f.updates) != 0 {
 		t.Fatalf("%d whole-object Update(s) recorded; F87: approve/reject must not PUT the whole object back to /status", len(f.updates))
@@ -303,7 +303,7 @@ func assertStatusConditionPatch(t *testing.T, f *fakeLoopClient) (patchCall, map
 	if err := json.Unmarshal(p.patch, &body); err != nil {
 		t.Fatalf("patch body is not JSON: %v (body %q)", err, p.patch)
 	}
-	return p, body
+	return body
 }
 
 // patchConditions returns the status.conditions list of a status patch body.
@@ -457,7 +457,7 @@ func TestApproveLoop_HashIsExactPlanBytes(t *testing.T) {
 	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
 		t.Fatalf("approveLoop: %v", err)
 	}
-	_, body := assertStatusConditionPatch(t, f)
+	body := assertStatusConditionPatch(t, f)
 	conds := patchConditions(t, body)
 	var msg string
 	for _, c := range conds {

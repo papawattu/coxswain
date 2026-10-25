@@ -30,6 +30,17 @@ const conditionStatusTrue = "True"
 // different module, so the CLI defines its own).
 const planRejectedConditionType = "PlanRejected"
 
+// statusSubresource is the Loop's status subresource name (the same string is
+// the object's top-level status field, so it is also the key in a merge patch
+// body and the element in an unstructured path). The CLI writes the approval
+// conditions here (F87(d): a JSON merge patch of status.conditions).
+const statusSubresource = "status"
+
+// conditionStatusField is a condition object's own status field name ("True" /
+// "False") — a different field that happens to share the name of the Loop's
+// status field above.
+const conditionStatusField = "status"
+
 // newApproveCommand builds `cox approve <loop>`: set the PlanApproved condition
 // on the Loop (the B3 plan approval gate). The CLI computes the SHA-256 of the
 // plan (read from the workspace via the existing plan reader) and sets the
@@ -77,7 +88,7 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	// condition's status is True, the reason is Approved).
 	cond := map[string]any{
 		"type":               planApprovedConditionType,
-		"status":             conditionStatusTrue,
+		conditionStatusField: conditionStatusTrue,
 		"reason":             "Approved",
 		"message":            "Approved: " + hash,
 		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
@@ -102,7 +113,7 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	// Ensure status.conditions exists (a fresh Loop may not have the status
 	// subresource populated yet — the operator creates it on the first
 	// reconcile; the CLI must not assume it exists).
-	conds, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	conds, found, _ := unstructured.NestedSlice(u.Object, statusSubresource, "conditions")
 	if !found {
 		conds = []any{}
 	}
@@ -137,12 +148,12 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	// metadata.resourceVersion stays in the patch, so a racing operator write is
 	// a 409 (Conflict) rather than a silent overwrite.
 	patch := map[string]any{
-		"status": map[string]any{"conditions": conds},
+		statusSubresource: map[string]any{"conditions": conds},
 	}
 	if rv := u.GetResourceVersion(); rv != "" {
 		patch["metadata"] = map[string]any{"resourceVersion": rv}
 	}
-	if err := dc.Loops.Patch(ctx, name, "status", mustJSON(patch)); err != nil {
+	if err := dc.Loops.Patch(ctx, name, statusSubresource, mustJSON(patch)); err != nil {
 		return fmt.Errorf("patch loop %q status (set PlanApproved): %w", name, err)
 	}
 	_, _ = fmt.Fprintf(out, "Approved the plan for loop %q (SHA-256 %s)\n", name, hash)
@@ -192,7 +203,7 @@ func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer
 	// condition's status is True, the reason is Rejected).
 	cond := map[string]any{
 		"type":               planRejectedConditionType,
-		"status":             conditionStatusTrue,
+		conditionStatusField: conditionStatusTrue,
 		"reason":             "Rejected",
 		"message":            "Rejected: " + reason,
 		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
@@ -208,7 +219,7 @@ func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer
 	if !ok {
 		return fmt.Errorf("cli: expected *unstructured.Unstructured, got %T", obj)
 	}
-	conds, found, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	conds, found, _ := unstructured.NestedSlice(u.Object, statusSubresource, "conditions")
 	if !found {
 		conds = []any{}
 	}
@@ -233,12 +244,12 @@ func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer
 	// write as approveLoop: a status merge patch, F87), keeping the live
 	// metadata.resourceVersion for optimistic concurrency.
 	patch := map[string]any{
-		"status": map[string]any{"conditions": conds},
+		statusSubresource: map[string]any{"conditions": conds},
 	}
 	if rv := u.GetResourceVersion(); rv != "" {
 		patch["metadata"] = map[string]any{"resourceVersion": rv}
 	}
-	if err := dc.Loops.Patch(ctx, name, "status", mustJSON(patch)); err != nil {
+	if err := dc.Loops.Patch(ctx, name, statusSubresource, mustJSON(patch)); err != nil {
 		return fmt.Errorf("patch loop %q status (set PlanRejected): %w", name, err)
 	}
 	_, _ = fmt.Fprintf(out, "Rejected the plan for loop %q: %s\n", name, reason)

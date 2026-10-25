@@ -906,11 +906,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// gate (modelProxyHold), which sandboxSuspendedByGate reaches only after the
 	// restore and D30 holds — and a b2 hold skips the bootstrap (and the gate)
 	// entirely — so a Loop that finished while an earlier gate held kept
-	// ModelProxyNotReady=True forever. This runs after the condsBefore snapshot
-	// above, so conditionsChanged persists it.
-	if isTerminalPhase(loop.Status.Phase) {
-		changed = clearModelProxyHoldForTerminal(&loop) || changed
-	}
+	// ModelProxyNotReady=True forever. The terminal test lives in the helper to
+	// keep Reconcile inside its gocyclo budget; this runs after the condsBefore
+	// snapshot above, so conditionsChanged persists it.
+	changed = clearModelProxyHoldForTerminal(&loop, changed)
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
@@ -2050,12 +2049,19 @@ func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, why, 
 
 // clearModelProxyHoldForTerminal is the terminal clear (F84b, F84c): a finished
 // Loop is not held for its model proxy, so the condition must not outlive the
-// work it describes (the R34 I120(b) class). It returns whether it changed the
-// status. Reconcile calls it for every terminal phase, whatever the other gates
-// say; modelProxyHold never needs it (it refuses to hold at a terminal phase).
-func clearModelProxyHoldForTerminal(loop *coxv1alpha1.Loop) bool {
+// work it describes (the R34 I120(b) class). Reconcile calls it on EVERY pass
+// (with the current changed flag, returned updated), whatever the other gates
+// say — that is the F84c point: the D30/restore holds return before the D35a
+// gate, and a b2 hold skips the bootstrap, so a clear inside the gate is not
+// unconditional. The terminal test is here rather than in Reconcile to keep
+// Reconcile inside its gocyclo budget; modelProxyHold only refuses to hold at a
+// terminal phase (it never clears).
+func clearModelProxyHoldForTerminal(loop *coxv1alpha1.Loop, changed bool) bool {
+	if !isTerminalPhase(loop.Status.Phase) {
+		return changed
+	}
 	if !conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
-		return false
+		return changed
 	}
 	setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
 		modelProxyTerminalReason,

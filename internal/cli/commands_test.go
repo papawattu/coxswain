@@ -6,19 +6,58 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // --- describe (C2: renders spec+status) ---
 
+// typedLoop converts a typed Loop to the unstructured shape the CLI fetches, so
+// a fixture can only carry fields the CRD actually defines (F85: the old
+// fixture invented status.budget."tokens", and describe printed a bare heading
+// for every real Loop because the field does not exist).
+func typedLoop(t *testing.T, mutate func(*coxv1alpha1.Loop)) *unstructured.Unstructured {
+	t.Helper()
+	l := &coxv1alpha1.Loop{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "coxswain.wattu.com/v1alpha1", Kind: "Loop"},
+		ObjectMeta: metav1.ObjectMeta{Name: "loop1", Namespace: "samples"},
+		Spec:       coxv1alpha1.LoopSpec{Goal: "make the thing work"},
+		Status:     coxv1alpha1.LoopStatus{Phase: "Succeeded", Iteration: 2},
+	}
+	if mutate != nil {
+		mutate(l)
+	}
+	m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(l)
+	if err != nil {
+		t.Fatalf("convert typed Loop: %v", err)
+	}
+	return &unstructured.Unstructured{Object: m}
+}
+
 func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
-	l := makeLoop("Succeeded", 2)
-	// Add conditions, budget, delivery.
-	unstructuredSet(l, "conditions", []any{
-		map[string]any{"type": "Ready", "status": "True", "reason": "Done", "message": "verified + delivered"},
-		map[string]any{"type": "Delivered", "status": "True", "reason": "Delivered", "message": "PR #1 open"},
+	readAt := metav1.NewTime(time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC))
+	l := typedLoop(t, func(l *coxv1alpha1.Loop) {
+		l.Status.Conditions = []metav1.Condition{
+			{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Done", Message: "verified + delivered"},
+			{Type: "Delivered", Status: metav1.ConditionTrue, Reason: "Delivered", Message: "PR #1 open"},
+		}
+		l.Status.BaseCommit = "aaaaaaaaaaaa1111111111222222222233333333"
+		l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "bbbbbbbbbbbb1111111111222222222233333333"}
+		l.Status.Budget = &coxv1alpha1.BudgetStatus{
+			PromptTokens:            1000,
+			CompletionTokens:        234,
+			Requests:                7,
+			UnmeteredRequests:       2,
+			LastUsageReadAt:         &readAt,
+			ConsecutiveReadFailures: 3,
+			CostUsd:                 "0.42",
+		}
+		l.Status.Delivery = &coxv1alpha1.DeliverStatus{Branch: "ai/loop1", PRNumber: 1, PRURL: "http://gitea/pulls/1"}
 	})
-	unstructuredSet(l, "budget", map[string]any{"tokens": 1234.0, "exceeded": false})
-	unstructuredSet(l, "delivery", map[string]any{"branch": "ai/loop1", "prNumber": 1.0, "prUrl": "http://gitea/pulls/1"})
 
 	fc := newFakeLoopClient()
 	fc.setLoop(l)
@@ -29,10 +68,34 @@ func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 	}, "loop1")
 
 	for _, want := range []string{"Name:         loop1", "Phase:        Succeeded", "Iteration:    2",
-		"Goal:         make the thing work", "Ready", "Delivered", "PR #1", "branch:     ai/loop1", "tokens:     1234"} {
+		"Goal:         make the thing work", "Ready", "Delivered", "PR #1", "branch:     ai/loop1",
+		// F85: the sum of promptTokens+completionTokens, the F44 fields, and the
+		// F43 commit pin the docs tell the operator to compare.
+		"tokens:     1234", "requests:   7", "unmetered:  2", "readFails:  3", "lastRead:   2026-03-04T05:06:07Z",
+		"cost:       $0.42", "Base commit:  aaaaaaaaaaaa", "Verified:     bbbbbbbbbbbb"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("describe output missing %q\noutput:\n%s", want, out)
 		}
+	}
+}
+
+// F85 (the anti-regression for the original bug): a bogus status.budget key
+// cannot make describe print anything — the fixture here CAN invent one (it is
+// unstructured), and describe must still not read it.
+func TestDescribe_BogusBudgetKeyPrintsNoTokens(t *testing.T) {
+	l := makeLoop("Succeeded", 2)
+	unstructuredSet(l, "budget", map[string]any{"tokens": 1234.0})
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+		return describeLoop(ctx, dc, ns, name, out)
+	}, "loop1")
+	if strings.Contains(out, "tokens:") {
+		t.Errorf("describe must not read a field the schema does not define (F85)\noutput:\n%s", out)
+	}
+	if !strings.Contains(out, "Budget:") {
+		t.Errorf("the Budget heading must still render\noutput:\n%s", out)
 	}
 }
 

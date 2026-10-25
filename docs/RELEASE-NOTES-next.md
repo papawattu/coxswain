@@ -291,6 +291,12 @@ F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop 
 - **What changed.** The API field docs (rendered into the CRD) and the operator, checkpoint, memory-writer and verify docs now state the counters as the code counts them: 0 for the first run, with the first verify retry at 2 (1 is skipped), and `planAttempt` 0 on the first Planning run (F90, PR #278). `cox describe` now prints `DesiredPhase:` when `status.desiredPhase` is set (F90, PR #278). `docs/UPGRADE.md` now covers the pre-F48g shape (a sandbox-failure count with no episode key restarts the episode) and the terminal mount-failure remedy for `status.agent.infraEpisode` (F48e, PR #278).
 - **On upgrade.** Nothing to do beyond the new CRD: the change to the loop CRD is doc-text only, picked up by a standard install (PR #278).
 
+### F83e + F91b: the delivered PR body reads only the pin's own tamper evidence; two code comments corrected — #279
+
+- **What was wrong.** The delivered PR body's tamper line took `status.verify.tamperExitCode` without checking the record belonged to the pin being delivered — and `loops/status` is user-writable — so a forged or pre-F83d record could print as this delivery's verdict (F83e); two comments also said something the code does not do (F91b).
+- **What changed.** The PR description's tamper line now uses the verify record only when its `verifiedCommit` equals the pin being delivered; a non-matching record reads as "no tamper evidence", the fail-closed reading the body already documented (F83e, PR #279). Two code comments were corrected with no behaviour change: the run-key comment (the rejection re-plan moves the run key and the accepted planning claim ends the episode, and the rejection arm itself clears nothing) and the reason-length note (F91b, PR #279).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #279).
+
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
 - **What was wrong.** `status.checkpoints` is user-writable (the editor role, since B3), and the operator acted on it without trusting it: the retention GC would delete any VolumeSnapshot a status entry named, even one belonging to another Loop, and the lost-PVC restore could take a forged entry as its restore source (PR #254, review finding review-api P2-1).

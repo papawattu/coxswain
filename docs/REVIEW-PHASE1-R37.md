@@ -27,8 +27,8 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 **Status:**
 - **No P1s and no P2s.** Two merges are the reviewed trees, byte for byte
   (`git rev-parse 5d44419^{tree} aeac42d^{tree}` → `cb28024a…` for both;
-  `347c07c^{tree}` = `7066add^{tree}` = `8721faa2…`), and #275 does what its
-  body says. Three new items, all P3.
+  `347c07c^{tree}` = `7066add^{tree}` = `8721faa2…`), and #275's code does what its
+  body says; its own evidence notes are on the PR. Three new items, all P3.
 - **#273 closed R36 I134.** The A2 empty fallback now ends the episode
   (`loop_restore.go:1089`), and the run-key comment is the one #274's window
   needed. Its four P3s were routed to F48e by the PR's review notes; R37 takes
@@ -78,7 +78,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   (`loop_f89b_unstorable_reason_envtest_test.go:228`). By reading the assertion
   is load-bearing; no run says so.
 - F48e (four P3s + the UPGRADE line) and F90 (docs) — **open**, queued
-  (`:179`, `:182`). F83e (the renderer's unguarded reads and the dead
+  (`:174`, `:179`, `:182`). F83e (the renderer's unguarded reads and the dead
   `Tampered` field) — **queued at `:185`**, and the queue line does not name the
   carried `f83-s3` title.
 - D72-D86: unchanged in this window.
@@ -127,7 +127,8 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
   **Where:** `/home/jamie/projects/coxswain/.git/FETCH_HEAD`, written by every
   `git fetch` in that clone; the reports: `.samples/mut-273.md:1` (the
-  reviewer's fetch overwritten by another agent), `.samples/prereview-274.md`
+  reviewer's first attempt read `FETCH_HEAD`, which another fetch had
+  overwritten), `.samples/r37-skeleton.md:145-151`
   (the pre-reviewer's: `fatal: ambiguous argument 'origin/main...FETCH_HEAD'` although
   `origin/main` resolved), and `.samples/prereview-275.md:188-193` (this round's: a
   mid-review fetch repointed `FETCH_HEAD` from `e83bd21` to `347c07c`, so a

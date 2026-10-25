@@ -662,7 +662,8 @@ check runs: the agent's claimed work does not even sit on the Loop's base.
 `UnmeteredRequests` or `UsageReadFailed`. `status.budget` may also carry a
 stale `lastUsageReadAt` and a non-zero `consecutiveReadFailures`.
 
-**Background:** each reconcile the operator reads the Loop's model proxy's
+**Background:** for a Loop with a model endpoint (`spec.agent.endpointSecretRef`),
+each reconcile the operator reads the Loop's model proxy's
 cumulative usage endpoint (`http://<proxy-pod-ip>:9090/coxswain/usage`) and
 folds the reading into `status.budget`. F44 (merged as 0f6915a) surfaces the
 two ways that read — or the metering behind it — can be wrong **without the

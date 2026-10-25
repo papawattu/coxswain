@@ -284,15 +284,15 @@ type VerifyConfig struct {
 // owner decision.
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
-	// operator records it from the branch head it resolved itself at Verifying
-	// start. Evidence that names a different verifiedCommit (e.g. left over from a
+	// operator copies the pin it wrote on entering Verifying
+	// (status.currentVerify.verifiedCommit). Evidence that names a different verifiedCommit (e.g. left over from a
 	// previous iteration's Job) is treated as no evidence (D24).
 	// +optional
 	VerifiedCommit string `json:"verifiedCommit,omitempty"`
 
-	// jobName is the verify Job the evidence came from (D24). Recording it (and
-	// the attempt) means evidence from a previous Job cannot be reused for the
-	// current verifiedCommit.
+	// jobName is reserved and not currently written. The binding that keeps a
+	// previous Job's evidence from being reused is the operator's read of the
+	// verify Job pod filtered by the current Job's UID (D24).
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 

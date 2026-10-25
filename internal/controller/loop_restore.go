@@ -179,6 +179,10 @@ type b2RestoreTarget struct {
 	iteration int    // the checkpoint's iteration
 	snapshot  string // the checkpoint's VolumeSnapshot name (checkpointName)
 	kind      b2Kind // the restore's kind (the condition's message)
+	// untrusted (F47) marks a lost-PVC target built when status.checkpoints
+	// has entries but none is a checkpoint of this Loop: there is no source, so
+	// the visible NoUsableCheckpoint fallback applies (iteration is -1).
+	untrusted bool
 }
 
 // b2Kind names the restore's kind (the Restore condition's message).
@@ -298,7 +302,9 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 		}
 	}
 	if !found {
-		return nil
+		// Entries recorded but none trusted: take the VISIBLE fallback (I90),
+		// not a silent empty workspace.
+		return &b2RestoreTarget{loopName: loop.Name, iteration: -1, kind: b2KindLostPVC, untrusted: true}
 	}
 	return &b2RestoreTarget{loopName: loop.Name, iteration: last.Iteration, snapshot: last.Name, kind: b2KindLostPVC}
 }
@@ -1052,8 +1058,11 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			if err := r.ensureWorkspacePVC(ctx, loop); err != nil {
 				return false, true, false, fmt.Errorf("A2 fallback: recreate workspace PVC empty: %w", err)
 			}
-			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
-				"the workspace PVC was lost and checkpoint "+target.snapshot+" does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)")
+			lostMsg := "the workspace PVC was lost and checkpoint " + target.snapshot + " does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)"
+			if target.untrusted {
+				lostMsg = "the workspace PVC was lost and none of the status.checkpoints entries is a checkpoint of this Loop (wrong name, iteration or owner); fell back to the A2 PVC-resume (an EMPTY workspace, I90)"
+			}
+			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint, lostMsg)
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
 				"workspace PVC lost, no usable checkpoint; A2 fallback (empty workspace)")

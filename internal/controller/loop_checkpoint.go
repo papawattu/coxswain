@@ -146,15 +146,19 @@ const (
 	checkpointUnknown
 )
 
-// checkpointNameShapeOK reports whether name is exactly what checkpointName
-// would produce for this Loop and some iteration (>= 0: iter-0 is valid).
-func checkpointNameShapeOK(loop *coxv1alpha1.Loop, name string) bool {
-	rest, ok := strings.CutPrefix(name, "checkpoint-"+loop.Name+"-iter-")
+// checkpointNameShapeOK reports whether the entry's name is exactly what
+// checkpointName produces for this Loop AND its recorded iteration (>= 0:
+// iter-0 is valid). The iteration is checked against the name because the
+// restore's readiness gate re-derives the snapshot name from the iteration:
+// an entry whose two fields disagree would validate one snapshot and decide on
+// another (F47 review), so it is rejected as foreign.
+func checkpointNameShapeOK(loop *coxv1alpha1.Loop, cp coxv1alpha1.CheckpointStatus) bool {
+	rest, ok := strings.CutPrefix(cp.Name, "checkpoint-"+loop.Name+"-iter-")
 	if !ok || rest == "" {
 		return false
 	}
 	n, err := strconv.Atoi(rest)
-	return err == nil && n >= 0 && strconv.Itoa(n) == rest
+	return err == nil && n >= 0 && strconv.Itoa(n) == rest && n == cp.Iteration
 }
 
 // checkpointEntryTrusted (F47) decides whether a status.checkpoints entry may
@@ -164,7 +168,7 @@ func checkpointNameShapeOK(loop *coxv1alpha1.Loop, name string) bool {
 // the shape checkpointName produces for this Loop AND name a VolumeSnapshot
 // labelled for this Loop (newVolumeSnapshotObj sets loopLabelKey).
 func (r *LoopReconciler) checkpointEntryTrusted(ctx context.Context, loop *coxv1alpha1.Loop, cp coxv1alpha1.CheckpointStatus) checkpointTrust {
-	if !checkpointNameShapeOK(loop, cp.Name) {
+	if !checkpointNameShapeOK(loop, cp) {
 		return checkpointForeign
 	}
 	snap := &unstructured.Unstructured{}

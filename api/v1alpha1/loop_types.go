@@ -998,10 +998,12 @@ type AgentStatus struct {
 	// Sandbox a bounded number of times (the sandboxInfraRetries cap, the
 	// controller's constant) and fails the Loop with the SandboxFailed reason
 	// once the bound is exhausted. The count is reset when the run changes (a
-	// verify iterate/re-plan, an approval advance, a restore — see
-	// infraEpisode) and when a phase claim the operator accepts ends the
-	// episode early, so a failure episode cannot consume a later run's retry
-	// budget. A retry recreate does NOT reset it: the retry is inside the run.
+	// verify iterate/re-plan, an approval advance — see infraEpisode), when a
+	// restore or an A2 rebuild of the workspace ends the episode (the workspace
+	// the counted failures described is gone), and when a phase claim the
+	// operator accepts ends it early, so a failure episode cannot consume a
+	// later run's retry budget. A retry recreate does NOT reset it: the retry is
+	// inside the run.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	InfraAttempts int32 `json:"infraAttempts,omitempty"`

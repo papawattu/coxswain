@@ -515,6 +515,37 @@ that pod is Ready.
 **What to do:** `kubectl get pod <loop>-egress-proxy` and its logs. Once it is
 Ready the gate releases.
 
+### `AgentFailed=True` with reason `FailedMount` — the sandbox pod cannot mount its volumes (F48b)
+
+**What you see:** the sandbox pod stays `Pending` with its container
+`ContainerCreating` (exactly what a slow image pull looks like), and the Loop
+then carries `AgentFailed=True` with the kubelet's reason (`FailedMount`,
+`FailedAttachVolume` or `FailedMapVolume`) and its message, one `SandboxRetry`
+Event per attempt, and — after three attempts — `Failed` with reason
+`SandboxFailed`. `cox describe` renders the message, which quotes the kubelet
+("MountVolume.SetUp failed for volume \"git-cred\" : secret \"git-cred\" not found").
+
+**What it means:** the kubelet reports a volume it cannot mount **only as an
+Event**, never in the pod status, so the operator reads the sandbox pod's
+Events (F48b, `sandboxMountFailureEvent` in `internal/controller/loop_s4_phase.go`);
+past `sandboxMountGrace` (60s), a matching `Warning` Event on the current pod is
+a sandbox infrastructure failure, bounded like any other by
+`sandboxInfraRetries` (3 attempts, about 4 minutes). The commonest cause is a
+`spec.workspace.gitCredentialSecret` (or another referenced volume) that names
+a Secret which does not exist. An Event that belongs to a **previous** pod is
+ignored (the read filters on the pod's UID), so the retries are not burned on
+old evidence.
+
+**What to do:** create the Secret (or fix the volume) named in the message,
+then **delete and re-apply the Loop** — `Failed:SandboxFailed` is terminal and
+there is no retry command. Notes: a wedge that produces no such Event (e.g. a
+node that cannot schedule the pod) is still only surfaced as
+`SandboxNotStarting`, not failed; the kubelet's Events expire with the
+cluster's `--event-ttl` (default 1h), after which the operator is blind again
+and surfaces nothing; and if the operator's own Events read fails
+(`SandboxEventsUnreadable` Warning Event, once per Loop) the mount case is not
+bounded until it works.
+
 ### Event `AgentEgressFenced` (F55-b)
 
 **What you see:** a one-shot Normal Event: "The agent NetworkPolicy now applies

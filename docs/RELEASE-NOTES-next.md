@@ -228,6 +228,12 @@ existing Loops are unaffected, but new ones are.
 - **What changed.** The sandbox infra-failure count (that F48b makes trip) now belongs to a **run** — one iteration and phase — keyed on the new `status.agent.infraEpisode` field, so a failure episode cannot consume the next run's retry budget: failures in an earlier run, and failures before a rollback, no longer count toward failing a later run (PR #269, merged `0070686`).
 - **On upgrade.** Nothing to do beyond the new CRD: `status.agent` gains one optional field, `infraEpisode`, picked up with a standard install (PR #269).
 
+### F89: a sandbox failure with no kubelet reason no longer wedges the whole status write — #271
+
+- **What was wrong.** A sandbox pod that failed with no reason recorded by the kubelet produced a condition whose reason the CRD rejects, and the rejection took the **whole** status write with it — so the failure condition and the retry count were never saved, and the bounded retry never exhausted (F89).
+- **What changed.** An empty termination reason now falls back to `PodFailed` — the same value the operator uses when the kubelet recorded neither a pod-level nor a container-level reason — so the write goes through and the retry limit applies (PR #271).
+- **On upgrade.** Nothing to do; the fix is in the operator (PR #271).
+
 ### F83c: the tamper decision comes only from the verify Job's pod; an OOM-killed tamper check is an infrastructure failure — #264
 
 - **What was wrong.** The status-driven tamper gate that F83 kept could never fire, so the tamper decision had a second path that was dead code (F83c); and a tamper check container killed for running out of memory was a terminal `verifyTampered` failure instead of a retried infrastructure failure (F83c).
@@ -566,7 +572,9 @@ unrecorded tamper evidence, #258), F83c (the status-driven tamper gate
 that could never fire, and an OOM-killed tamper check reading as a terminal
 tampered failure, #264), F48b (the sandbox pod stuck on an unmountable
 volume, and the infra-retry bound that never tripped, #266), and F48g (the
-sandbox-failure count that outlived the run it belonged to, #269) were
+sandbox-failure count that outlived the run it belonged to, #269), and F89
+(a sandbox failure with no kubelet reason that wedged the whole status
+write and the retry limit, #271) were
 closed by the PRs named beside them. In plain words, the items still open:
 
 **P1 (security):**

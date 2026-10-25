@@ -605,9 +605,9 @@ open:
   the Loop's status subresource (the role grants `update` and `patch` on
   `loops/status`, since #148, so that `cox approve` and `cox reject` work;
   see `config/rbac/loop_editor_role.yaml` on `main`). That means such a
-  user can change status fields the operator acts on — for example forge
-  the two approval conditions, or plant checkpoint entries another user's
-  Loop fork reads. F47 (#254) makes the operator validate the checkpoint
+  user can change status fields the operator acts on — the verify and
+  tamper evidence, the budget counters, the stall history, and checkpoint
+  entries. F47 (#254) makes the operator validate the checkpoint
   entries it acts on, but the grant itself is still broader than ADR-0005
   allows. Until the fix (owner decision D85; recommended: `cox
   approve`/`reject` writes a one-shot annotation the operator turns into

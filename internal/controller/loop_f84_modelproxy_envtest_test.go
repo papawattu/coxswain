@@ -133,6 +133,44 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal("NoEndpoint"))
 	})
+
+	// F84b: the condition must not outlive the hold it describes. A Loop that
+	// reaches a terminal phase while the proxy pod is not Ready used to keep
+	// ModelProxyNotReady=True forever (the R34 I120(b) class): the gate runs at
+	// every phase, the proxy pod stays absent (no pod is created in this spec),
+	// so only the terminal clear can remove it.
+	DescribeTable("F84b: a terminal phase clears the model proxy hold",
+		func(phase coxv1alpha1.LoopPhase) {
+			ns := "f84b-terminal-" + strings.ToLower(string(phase)) + "-" + nowSuffix()
+			r, loop, rec := newF84(ns, "f84bterm")
+
+			By("the hold is recorded first (the proxy pod does not exist)")
+			Expect(r.modelProxyHold(ctx, loop)).To(BeTrue())
+			Expect(apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition).Status).
+				To(Equal(metav1.ConditionTrue))
+			_ = drainEvents(rec)
+
+			By("the Loop reaches " + string(phase) + ": the hold no longer applies and the condition says so")
+			loop.Status.Phase = phase
+			loop.Status.DesiredPhase = phase
+			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+			Expect(r.modelProxyHold(ctx, loop)).To(BeFalse(), "a terminal Loop is not held for its proxy")
+			cond := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)
+			Expect(cond).NotTo(BeNil(), "the condition is cleared, not removed")
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(modelProxyTerminalReason))
+			Expect(cond.Message).To(ContainSubstring(string(phase)), "the message names the terminal phase")
+
+			By("a second pass at the terminal phase: the clear is stable (no rewrite, no Event)")
+			Expect(r.modelProxyHold(ctx, loop)).To(BeFalse())
+			again := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)
+			Expect(again.Message).To(Equal(cond.Message))
+			Expect(again.LastTransitionTime).To(Equal(cond.LastTransitionTime), "a cleared condition is not rewritten every pass")
+			Expect(strings.Join(drainEvents(rec), "\n")).NotTo(ContainSubstring("ModelProxyNotReady"), "no Event for a clear")
+		},
+		Entry("Failed", coxv1alpha1.LoopPhaseFailed),
+		Entry("Succeeded", coxv1alpha1.LoopPhaseSucceeded),
+	)
 })
 
 // f84ModelSecret is the endpoint Secret name the F84 fixture points at.

@@ -714,7 +714,10 @@ shapes are `proxy.ErrNotReady` and are neither counted nor cleared:
 - a proxy pod that **does not exist** (yet), and one that has **never obtained
   an IP**. These two are not time-bounded by this condition — a proxy that
   never comes up is surfaced as `ModelProxyNotReady` on the Loop (below), not
-  as `BudgetReadingStale`.
+  as `BudgetReadingStale`. That surface appears once the earlier holds (the
+  restore, approval and D30 gates) have cleared: the sandbox gate returns at
+  the first hold, so on a cluster where the D30 gate still holds (no
+  `--allow-unenforced`), `ModelProxyNotReady` is not written yet.
 
 A read failure **after** the pod has been up for 60s is what counts toward the
 three-failure threshold. While it is
@@ -754,11 +757,15 @@ pinned while the agent is still active, the upstream endpoint is likely
 dropping usage data (check the model backend's chat-completions response,
 and whether `stream` is set with a value the endpoint mishandles); a
 one-shot count that stopped growing is a historical miss, not a live
-problem. For `BudgetReadingStale`: check whether the proxy pod
-(`<loop>-proxy` in the Loop's namespace, label
-`app.kubernetes.io/component=model-proxy`) exists, is Ready, and is
-reachable at port 9090 — a restarted or crashed proxy pod is the usual
-cause; confirm recovery with `lastUsageReadAt` advancing.
+problem. For `BudgetReadingStale`: first read the F84 signal — is
+`ModelProxyNotReady` `True`, and is the proxy pod still inside its 60s start
+grace? A pod that is starting, absent, or has no IP is not counted, so it
+cannot be the cause. What does count is a proxy that keeps failing after that
+grace with an IP and a Ready pod (e.g. a crashlooping container, a non-200
+response, an undecodable body); check whether the pod (`<loop>-proxy` in the
+Loop's namespace, label `app.kubernetes.io/component=model-proxy`) exists, is
+Ready, and is reachable at port 9090, and confirm recovery with
+`lastUsageReadAt` advancing.
 
 **What these do not mean:** neither condition pauses, fails, or holds the
 Loop, and neither means the budget caps are wrong — the caps keep running
@@ -788,6 +795,9 @@ model egress. Since F84 the hold is visible: the Loop carries
 `ModelProxyNotReady=True` (the message names the pod and why it is not Ready),
 with one Warning Event on the transition. It clears to `False`/`Ready` when the
 pod is Ready and to `False`/`NoEndpoint` if the Loop loses its model endpoint.
+It also clears to `False`/`LoopTerminal` when the Loop reaches a terminal phase
+(`Succeeded`/`Failed`): a finished Loop is Suspended for that phase itself, so
+the condition must not outlive the hold it described (F84b).
 The usual causes are a pod that cannot be scheduled, an image that cannot be
 pulled, or the proxy's Secret missing; look at
 `kubectl get events -n <ns> | grep <loop>-proxy`. While this condition is True

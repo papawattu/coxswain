@@ -77,8 +77,11 @@ const (
 	// in a row (F44).
 	budgetReadingStaleReason = "UsageReadFailed"
 	// budgetReadFailureThreshold is the consecutive failed reads before
-	// BudgetReadingStale is set (F44): a single miss (a pod mid-restart) is
-	// not worth a condition.
+	// BudgetReadingStale is set (F44): a single failed read past the start grace
+	// is not worth a condition. A pod that is starting or absent is
+	// proxy.ErrNotReady and never counts at all (F84), and a restarted pod is
+	// inside the grace for its first 60s, so the threshold is about a proxy that
+	// keeps failing, not about one restart.
 	budgetReadFailureThreshold = 3
 	// proxyUsageStartGrace is how long a proxy pod may exist without a usable
 	// usage endpoint before a read failure is counted (F84): the pod is

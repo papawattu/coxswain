@@ -27,7 +27,8 @@ func TestMemoryWriteAuditTextCutsOnARuneBoundary(t *testing.T) {
 // f78Summary builds a writer summary in the real shape: the counts line first,
 // an eviction line, then n per-lesson lines (each with a long curator reason).
 func f78Summary(n int) (string, []string) {
-	lines := []string{fmt.Sprintf("summary: total=%d written=%d dropped=0", n, n), "evicted 0123456789ab cap"}
+	lines := make([]string, 0, n+2)
+	lines = append(lines, fmt.Sprintf("summary: total=%d written=%d dropped=0", n, n), "evicted 0123456789ab cap")
 	for i := range n {
 		lines = append(lines, fmt.Sprintf("lesson-%03d %012x written curator-keep: %s", i+1, i, strings.Repeat("r", 60)))
 	}

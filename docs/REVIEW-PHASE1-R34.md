@@ -1,13 +1,14 @@
 # Phase 1 review, round 34: a dead tamper gate, three short surfaces, and the review record
 
 Round 34, 2026-10-25. It follows R33 (PR #246, not yet merged) and covers the
-work merged since R33 was opened (#247 to #259). Code line numbers are against
-main at `c57a255` (the merge of #259). The review was built from these input
+work merged since R33 was opened (#247 to #260). Code line numbers are against
+main at `c57a255` (the merge of #259) unless an item says otherwise; I122 cites
+`7f8074b` (the merge of #260). The review was built from these input
 files, which are not committed:
 - a post-merge review of F48 and F83 (`.samples/review-postmerge-7.md`) and of
   F84 as merged (`.samples/postmerge-f84.md`);
 - the pre-reviews of PRs #247-#259 (`.samples/prereview-*.md`) and of the open
-  PR #260 (`.samples/prereview-260.md`);
+  PR #260 (`.samples/prereview-260.md`, merged during the round);
 - the reviewer's mutation runs for #256, #258 and #259 (`.samples/mut-256-r2.md`,
   `.samples/mut-258.md`, `.samples/mut-259.md`);
 - the citation check of the previous draft (`.samples/r34-cite-check.md`);
@@ -33,6 +34,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 | #257 | Docs: UPGRADE pointers for the memory-writer image and the RWX storage class | 61d12f1 |
 | #258 | F83: record the tamper evidence; the tamper gate acts only on operator-only evidence | 434216f |
 | #259 | F84: a proxy pod that is not up yet is no reading (ErrNotReady + start grace), an honest stale message, no-endpoint conditions cleared | c57a255 |
+| #260 | F85: cox describe reads the real budget fields, shows the F44 facts and the F43 commit pin | 7f8074b |
 
 **Status:**
 - **The tamper gate is dead, and F83 killed it a second way.** Before #258
@@ -57,11 +59,9 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   `ModelProxyNotReady` exists); and a **write storm** (the failure count inside
   the stale message re-stamped `lastTransitionTime` every pass). I121 is closed;
   what is left is F84b (I127).
-- **F85 is open at CHANGES (#260), and it is builder #2's next push** (ahead of
-  F84b): the delivery block still reads `prNumber` as a `float64` and `prUrl`
-  (the CRD tag is `prURL`), so neither the `pr:` nor the `url:` line prints for a
-  real Loop, and the new typed fixture turns the spec's `"PR #1"` assertion into
-  a no-op — which is the same bug class the PR set out to fix (I122).
+- **F85 is merged** (#260, `7f8074b`) after one CHANGES round: the review
+  caught the delivery block beside the fix reading `prNumber` as a `float64` and
+  the wrong `prUrl` key, the same bug class the PR fixed (I122, closed).
 - **The queued follow-ups**: F86 (I123), F87 (I124), F84b (I127).
 - **Neither F48's nor F83's new surface reaches the runbook** (I125). F84's did
   land (`docs/TROUBLESHOOTING.md:781-793`), which is the pattern the other two

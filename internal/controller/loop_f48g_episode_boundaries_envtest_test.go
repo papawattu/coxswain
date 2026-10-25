@@ -486,6 +486,72 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		Expect(approved.Status.Agent.InfraEpisode).To(Equal(fmt.Sprintf("%d/%s", approved.Status.Iteration, cov.LoopPhaseImplementing)))
 	})
 
+	// F91b (R37 I138): the run-key comment used to say the rejection re-plan is
+	// ended by "the PlanApproved claim that produced the plan". There is no such
+	// claim (claims are the runner's PhaseClaim; PlanApproved is a CONDITION the
+	// user sets), and the rejection clears nothing — the boundary is the
+	// accepted PLANNING claim of the re-planned attempt. The comment is fixed;
+	// this spec pins the two halves so the sentence cannot drift back.
+	It("S9: the rejection re-plan clears nothing; the accepted Planning claim is the boundary", func() {
+		ns := f48gNs("f48g-s9")
+		const name = "f48g-s9"
+		Expect(k8sClient.Create(ctx, &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: cov.LoopSpec{
+				Goal:      "F91b rejection re-plan",
+				Workspace: testWorkspace(),
+				Approval:  &cov.Approval{Mode: cov.ApprovalModeManual, OnReject: cov.OnRejectReplan},
+			},
+		})).To(Succeed())
+
+		loop := f48gGet(ns, name)
+		loop.Status.Phase = cov.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = cov.LoopPhaseAwaitingApproval
+		loop.Status.Conditions = []metav1.Condition{{
+			Type: cov.PlanRejectedCondition, Status: metav1.ConditionTrue, Reason: "Rejected",
+			Message:            "the plan misses the rounding cases",
+			LastTransitionTime: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		rejectedKey := sandboxRunKey(f48gGet(ns, name))
+		f48gSeedCount(ns, name, 2, rejectedKey)
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r.wireApprovalGate()
+		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) { return nil, nil }
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("the rejection re-enters Planning and bumps PlanAttempt, and clears NO episode")
+		replanned := f48gGet(ns, name)
+		Expect(replanned.Status.Phase).To(Equal(cov.LoopPhasePlanning), "the rejection re-plans")
+		Expect(replanned.Status.PlanAttempt).To(Equal(1), "the rejection bumps planAttempt (I42b)")
+		Expect(replanned.Status.Agent).NotTo(BeNil())
+		Expect(replanned.Status.Agent.InfraAttempts).To(Equal(int32(2)),
+			"the rejection itself is not an episode boundary: it clears nothing (the count above still stands)")
+		Expect(replanned.Status.Agent.InfraEpisode).To(Equal(rejectedKey),
+			"the run key did not move either: Planning -> AwaitingApproval are the same run")
+
+		By("the accepted PLANNING claim of the re-planned attempt is the boundary")
+		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) {
+			return &PhaseClaim{
+				ObservedPhase: cov.LoopPhasePlanning,
+				Status:        claimSuccess,
+				Iteration:     replanned.Status.Iteration,
+				PlanAttempt:   replanned.Status.PlanAttempt,
+			}, nil
+		}
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+
+		accepted := f48gGet(ns, name)
+		Expect(accepted.Status.Agent).NotTo(BeNil())
+		Expect(accepted.Status.Agent.InfraAttempts).To(BeZero(),
+			"F48b: a claim the operator accepts is the recovery signal, so the episode's count ends")
+		Expect(accepted.Status.Agent.InfraSandboxUID).To(BeEmpty())
+		Expect(accepted.Status.Agent.InfraEpisode).To(BeEmpty())
+	})
+
 	It("P3-7: a run change that discards a non-zero count is recorded in the log", func() {
 		ns := f48gNs("f48g-p37")
 		const name = "f48g-p37"

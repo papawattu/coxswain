@@ -1341,8 +1341,10 @@ func clearSandboxInfraEpisode(loop *coxv1alpha1.Loop) bool {
 // (loop_verify_job.go), the approve and the Planning hold move `desiredPhase`
 // (loop_approval.go, loop_s4_phase.go). A run change that moves neither needs
 // its own clear: the rejection re-plan (loop_approval.go, Planning -> Planning
-// with PlanAttempt++) is ended by the claim clear in advancePhaseFromClaim (the
-// PlanApproved claim that produced the plan cleared it first), and a workspace
+// with PlanAttempt++) is ended by the accepted-claim clear in
+// advancePhaseFromClaim when the re-planned attempt's PLANNING claim is
+// accepted (loop_s4_phase.go, F48b) — the rejection itself clears nothing, it
+// only bumps PlanAttempt and the conditions — and a workspace
 // rebuild by the three clears in loop_restore.go (the two restore completions
 // and the A2 empty fallback, F48h). If a new transition can start a run without
 // a claim and without iteration or desiredPhase moving, it must clear

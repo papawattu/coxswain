@@ -231,7 +231,7 @@ existing Loops are unaffected, but new ones are.
 ### F89: a sandbox failure with no kubelet reason no longer wedges the whole status write — #271
 
 - **What was wrong.** A sandbox pod that failed with no reason recorded by the kubelet produced a condition whose reason the CRD rejects, and the rejection took the **whole** status write with it — so the failure condition and the retry count were never saved, and the bounded retry never exhausted (F89).
-- **What changed.** An empty termination reason now falls back to `PodFailed` — the same value the operator uses when the kubelet recorded neither a pod-level nor a container-level reason — so the write goes through and the retry limit applies (PR #271).
+- **What changed.** An empty termination reason now falls back to `PodFailed` — the same value the operator uses when the kubelet recorded neither a pod-level nor a container-level reason — so the write goes through and the retry limit applies (PR #271). A kubelet failure reason that the condition schema cannot store (for example one containing spaces) now also falls back to `PodFailed`, with the original text kept in the condition message (F89b, PR #275).
 - **On upgrade.** Nothing to do; the fix is in the operator (PR #271).
 
 ### F83c: the tamper decision comes only from the verify Job's pod; an OOM-killed tamper check is an infrastructure failure — #264

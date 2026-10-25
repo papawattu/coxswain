@@ -145,31 +145,47 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		Expect(f).To(BeNil(), "a valid claim means the phase finished; no infra attempt is burned")
 	})
 
-	It("F48d: at Verifying the SandboxNotStarting condition is persisted and its Event fires once, not per pass", func() {
-		loop, _, r, offset, rec := plant("f48d-verifying", waiting("PodInitializing", ""))
-		// The Verifying hold is the pass under test: drive the real Reconcile.
+	It("F48d: the Verifying hold RETURNS the changed flag the not-starting surfacing set (it used to discard it)", func() {
+		loop, _, r, offset, rec := plant("f48d-return", waiting("PodInitializing", ""))
 		*offset = sandboxStartGrace + time.Minute
 		loop.Status.Phase = cov.LoopPhaseVerifying
 		loop.Status.DesiredPhase = cov.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
-		ns, name := loop.Namespace, loop.Name
-		reconcile := func() *cov.Loop {
-			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
-			Expect(err).NotTo(HaveOccurred())
-			got := &cov.Loop{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
-			return got
-		}
-		first := reconcile()
-		cond := findConditionFn(first.Status.Conditions, cov.SandboxNotStartingCondition)
-		Expect(cond).NotTo(BeNil(), "F48d: the condition must be PERSISTED at Verifying (the hold used to drop the changed flag)")
+		// The hold's return value IS what persists the condition: drive the real
+		// phase function twice and require changed=true the first time (the
+		// surfacing happened) and false the second (already surfaced).
+		advanced, changed, next := r.advancePhaseFromClaim(ctx, loop)
+		Expect(advanced).To(BeFalse(), "Verifying is evidence-gated: the claim never advances it")
+		Expect(next).To(Equal(cov.LoopPhase("")))
+		Expect(changed).To(BeTrue(),
+			"F48d: the hold must report the change it just made, or the status write (and so the condition) is dropped")
+		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-		second := reconcile()
-		Expect(second.Status.Phase).To(Equal(cov.LoopPhaseVerifying), "the hold still holds")
-		Expect(findConditionFn(second.Status.Conditions, cov.SandboxNotStartingCondition).Status).To(Equal(metav1.ConditionTrue))
+
+		advanced, changed, _ = r.advancePhaseFromClaim(ctx, loop)
+		Expect(advanced).To(BeFalse())
+		Expect(changed).To(BeFalse(), "a second pass with the condition already set changes nothing")
 		Expect(countEvents(rec, sandboxNotStartingEventReason)).To(Equal(1),
 			"exactly one Warning Event across both passes (the transition-gated Event must not re-fire)")
+	})
+
+	It("F48d: through Reconcile at Verifying the condition is written to the API", func() {
+		loop, _, r, offset, _ := plant("f48d-reconcile", waiting("PodInitializing", ""))
+		*offset = sandboxStartGrace + time.Minute
+		loop.Status.Phase = cov.LoopPhaseVerifying
+		loop.Status.DesiredPhase = cov.LoopPhaseVerifying
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		ns, name := loop.Namespace, loop.Name
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		got := &cov.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(cov.LoopPhaseVerifying), "the hold still holds")
+		cond := findConditionFn(got.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond).NotTo(BeNil(), "F48d: the condition must reach the API at Verifying")
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 	})
 
 	It("F48c: SandboxNotStarting clears when the pod it described is gone", func() {

@@ -863,10 +863,11 @@ type LoopStatus struct {
 
 	// planAttempt is the count of Planning runs: 0 on the first Planning run,
 	// incremented on every re-entry to Planning (a rejection re-plan or an
-	// onVerifyFail=Plan re-plan) — F90. The runner echoes it from .coxswain/plan-attempt into its
-	// claim; advancePhaseFromClaim ignores a claim whose planAttempt does not
-	// match status.planAttempt, so a stale Planning success claim from a prior
-	// attempt cannot satisfy the new Planning phase (I42b).
+	// onVerifyFail=Plan re-plan) — F90. The runner echoes it from
+	// .coxswain/plan-attempt into its claim; advancePhaseFromClaim ignores a
+	// claim whose planAttempt does not match status.planAttempt, so a stale
+	// Planning success claim from a prior attempt cannot satisfy the new
+	// Planning phase (I42b).
 	// +kubebuilder:default=0
 	// +optional
 	PlanAttempt int `json:"planAttempt,omitempty"`

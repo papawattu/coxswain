@@ -10,10 +10,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // openAIResponse is the OpenAI /v1/chat/completions response envelope.
@@ -129,6 +133,7 @@ func TestCuratorCallFailure(t *testing.T) {
 	// The model proxy is down (connection refused): the verdict is
 	// keep=false ("curator unavailable").
 	c := NewClient("http://127.0.0.1:1", "test-model") // nothing on port 1
+	c.retryDelays = []time.Duration{time.Millisecond}
 	v := c.Judge(context.Background(), "a good lesson")
 	if v.Keep {
 		t.Errorf("Keep = true on call failure, want false")
@@ -309,5 +314,175 @@ func TestCuratorResponseBodyBounded(t *testing.T) {
 	if !strings.Contains(v.Reason, "unparseable") {
 		// 'read error' would mean the bound is missing and ReadAll consumed the full body.
 		t.Fatalf("Reason = %q, want 'curator unparseable' (the LimitReader truncated the read)", v.Reason)
+	}
+}
+
+// flakyProxy closes the first `drop` connections without a response (a
+// transport failure: the client sees EOF), then answers keep=true. hits counts
+// every request that reached the server.
+func flakyProxy(t *testing.T, drop int, hits *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(hits.Add(1))
+		if n <= drop {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"keep\": true, \"reason\": \"ok\"}"}}]}`))
+	}))
+}
+
+// TestCuratorRetriesTransportFailure (F41): the first calls fail with no
+// response (the k3s pod-start case); a later attempt succeeds, so the lesson
+// is judged instead of dropped as "call failed".
+func TestCuratorRetriesTransportFailure(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 2, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	v := c.Judge(context.Background(), "a good lesson")
+	if !v.Keep {
+		t.Fatalf("Keep = false (%q), want true after the transport retries", v.Reason)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Errorf("requests = %d, want 3 (2 dropped + 1 answered)", got)
+	}
+}
+
+// TestCuratorRetryBounded (F41): a persistent transport failure makes exactly
+// 1+len(retryDelays) attempts, then drops fail-closed.
+func TestCuratorRetryBounded(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 1000, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	// A deadline makes an unbounded ladder a fast failure, not a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	v := c.Judge(ctx, "a good lesson")
+	if ctx.Err() != nil {
+		t.Fatalf("Judge ran into the 2s deadline: the retry ladder is not bounded")
+	}
+	if v.Keep || !strings.Contains(v.Reason, "call failed") {
+		t.Fatalf("verdict = %+v, want keep=false 'call failed'", v)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Errorf("requests = %d, want 3 (1 + 2 retries)", got)
+	}
+}
+
+// TestCuratorNoRetryOnHTTPStatus (F41): an HTTP response (even a 500) is an
+// answer, not a transport failure: one request, no retry.
+func TestCuratorNoRetryOnHTTPStatus(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	v := c.Judge(context.Background(), "a good lesson")
+	if v.Keep || !strings.Contains(v.Reason, "HTTP 500") {
+		t.Fatalf("verdict = %+v, want keep=false 'HTTP 500'", v)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("requests = %d, want 1 (no retry on an HTTP status)", got)
+	}
+}
+
+// TestNewClientInstallsProductionLadder (F41): the production ladder and batch
+// retry budget are what NewClient installs; every other spec overrides them,
+// so an empty default (retries off) would otherwise pass the suite.
+func TestNewClientInstallsProductionLadder(t *testing.T) {
+	c := NewClient("http://x", "m")
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if len(c.retryDelays) != len(want) {
+		t.Fatalf("retryDelays = %v, want %v", c.retryDelays, want)
+	}
+	for i := range want {
+		if c.retryDelays[i] != want[i] {
+			t.Fatalf("retryDelays = %v, want %v", c.retryDelays, want)
+		}
+	}
+	if c.retryBudget != 20*time.Second {
+		t.Fatalf("retryBudget = %v, want 20s", c.retryBudget)
+	}
+}
+
+// TestCuratorRetryBudgetIsPerBatch (F41): the retry wait is shared by every
+// Judge call of one Client (one writer batch). With a 2ms budget and 1ms
+// delays, lesson 1 uses it (1 + 2 retries = 3 requests) and lesson 2 gets no
+// retry (1 request): 4 in total. Without the budget lesson 2 would retry too.
+func TestCuratorRetryBudgetIsPerBatch(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 1000, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	c.retryBudget = 2 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 2 {
+		if v := c.Judge(ctx, "a good lesson"); v.Keep || !strings.Contains(v.Reason, "call failed") {
+			t.Fatalf("lesson %d: verdict = %+v, want keep=false 'call failed'", i+1, v)
+		}
+	}
+	if got := hits.Load(); got != 4 {
+		t.Errorf("requests = %d, want 4 (3 for lesson 1, 1 for lesson 2)", got)
+	}
+}
+
+// TestCuratorRetryStopsOnContext (F41): a cancelled batch context ends the
+// wait between retries at once (the writer's overall budget).
+func TestCuratorRetryStopsOnContext(t *testing.T) {
+	var hits atomic.Int32
+	srv := flakyProxy(t, 1000, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Hour}
+	c.retryBudget = 2 * time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	v := c.Judge(ctx, "a good lesson")
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("Judge waited %v: the retry wait ignored the context", time.Since(start))
+	}
+	if v.Keep || !strings.Contains(v.Reason, "call failed") {
+		t.Fatalf("verdict = %+v, want keep=false 'call failed'", v)
+	}
+}
+
+// TestCuratorLogsEachRetry (F41, R26 I90): every retry is logged (retry n/N,
+// the delay, the error) so a Job log shows the fallback.
+func TestCuratorLogsEachRetry(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	var hits atomic.Int32
+	srv := flakyProxy(t, 2, &hits)
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-model")
+	c.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	if v := c.Judge(context.Background(), "a good lesson"); !v.Keep {
+		t.Fatalf("setup: verdict = %+v, want keep", v)
+	}
+	out := buf.String()
+	for _, want := range []string{"retry 1/3 in 1ms", "retry 2/3 in 1ms"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "retry 3/3") {
+		t.Errorf("a third retry was logged but only two happened:\n%s", out)
 	}
 }

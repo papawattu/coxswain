@@ -70,11 +70,11 @@ See: [OPERATOR.md#reading-loop-status](OPERATOR.md#reading-loop-status)
 ## 6. Why is my Loop stuck in Implementing with no model traffic?
 
 The runner's model call may be hanging: a hung backend times out at 120s per
-request, retries 3 times with backoff, then surfaces `ModelUnavailable` and
+request by default (`spec.loop.modelTimeoutSeconds`), retries 3 times with backoff, then surfaces `ModelUnavailable` and
 exits blocked — the operator maps that to a `ModelAvailable=False`
-condition. Worst case is about 8 minutes before the condition appears. If you
+condition. Worst case is about 8 minutes (at the default) before the condition appears. If you
 see `ModelUnavailable` on a healthy backend, the model is slow, not dead:
-there is no user-facing knob to tune the timeout, so reduce the load or the
+raise `spec.loop.modelTimeoutSeconds` (1-3600), or reduce the load or the
 context size. Check the proxy log and the model endpoint
 (`spec.agent.endpointSecretRef` / `modelEndpoint`).
 

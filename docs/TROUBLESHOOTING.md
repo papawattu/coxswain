@@ -12,7 +12,8 @@ condition `False` with reason `ModelUnavailable` ("model backend
 unavailable: …"), and the Loop is making little or no progress.
 
 **Cause:** the runner's model call timed out and its bounded retries were
-exhausted. The runner uses a 120-second per-request timeout with 3 retries
+exhausted. By default the runner uses a 120-second per-request timeout
+(`spec.loop.modelTimeoutSeconds` overrides it) with 3 retries
 and exponential backoff (2s, 4s, 8s) — `defaultModelTimeout` /
 `defaultModelRetries` / `defaultModelRetryBackoff` in `runner/runner.go`
 (fixed in PR #135, squash commit e5af830). A non-timeout error (HTTP 500,
@@ -25,8 +26,8 @@ visible — `applyModelAvailableCondition` in
 06a0157). The
 condition is diagnostic only; it does not gate the phase machine.
 
-**Worst case:** about 8 minutes before the condition appears — 4 model
-calls of 120s plus 14s of backoff (2s, 4s, 8s; QUICKSTART §8, written with
+**Worst case:** by default about 8 minutes before the condition appears — 4
+model calls of 120s (4 × the timeout when `modelTimeoutSeconds` is set) plus 14s of backoff (2s, 4s, 8s; QUICKSTART §8, written with
 I89). Before the fix, the same hang meant a single 10-minute timeout
 followed by kubelet restarts with no named reason.
 
@@ -67,8 +68,9 @@ timeouts and does **not** retry — one request dials the upstream exactly
 once, and a non-2xx response is returned as-is (`internal/proxy`);
 the bound is on the runner side.
 
-What times out: the runner bounds each model request with a 120-second
-per-request timeout (`defaultModelTimeout` in `runner/runner.go`). There
+What times out: the runner bounds each model request with a per-request
+timeout, 120 seconds by default (`defaultModelTimeout` in `runner/runner.go`;
+`spec.loop.modelTimeoutSeconds` overrides it via `COX_MODEL_TIMEOUT`). There
 is deliberately no client-level timeout: a client-level timeout would race
 the per-request context and could cut a long request.
 
@@ -79,14 +81,14 @@ server responded, so the error is definitive. When all attempts fail, the
 runner exits blocked with a claim carrying `ModelUnavailable: <cause>`;
 the operator maps the claim to the `ModelAvailable=False` condition
 (reason `ModelUnavailable`, set in `applyModelAvailableCondition`,
-`internal/controller`). Worst case to the condition: ~8 minutes (4 × 120s
-+ 14s backoff). A success claim resets the condition to `True` (reason
+`internal/controller`). Worst case to the condition: ~8 minutes by default (4 × 120s
++ 14s backoff; 4 × the timeout + 14s when it is set). A success claim resets the condition to `True` (reason
 `Recovered`), so the condition returning to True means the backend
 recovered, not that anything was tuned.
 
-Tuning: there is no user-facing knob for the timeout, retry count, or
-backoff — the runner's `runConfig.ModelTimeout` field is never set by the
-runner entrypoint, so the timeout is fixed at 120s in practice.
+Tuning: raise `spec.loop.modelTimeoutSeconds` (1-3600, passed as
+`COX_MODEL_TIMEOUT`); unset keeps 120s. The retry count and backoff base
+remain constants.
 
 ## Service DNS NXDOMAIN from a fresh kind cluster
 

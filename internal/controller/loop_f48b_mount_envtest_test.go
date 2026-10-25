@@ -280,8 +280,14 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(r.finalizeLoopStatus(ctx, loop, true, true, false, false, "")).To(Succeed())
 		persisted := &cov.Loop{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(loop), persisted)).To(Succeed())
-		Expect(persisted.Annotations[sandboxEventsUnreadableAnnotation]).To(Equal(resumeAnnotationTrue))
-		Expect(conditionTruePresent(persisted, cov.SandboxNotStartingCondition)).To(BeTrue(), "the pass's conditions are persisted")
+		By("the pass's conditions are persisted")
+		Expect(conditionTruePresent(persisted, cov.SandboxNotStartingCondition)).To(BeTrue())
+		// F48f: the marker is now the last Event's TIME (RFC3339), not a bool.
+		marker := persisted.Annotations[sandboxEventsUnreadableAnnotation]
+		Expect(marker).NotTo(Equal(resumeAnnotationTrue), "the marker value is a time, not the bool it used to be")
+		at, perr := time.Parse(time.RFC3339, marker)
+		Expect(perr).NotTo(HaveOccurred(), "the marker records when the Event was emitted")
+		Expect(at).To(BeTemporally("==", r.operatorNow().UTC().Truncate(time.Second)))
 	})
 
 	It("surfaces an unreadable Events list once (no decision, no failure) instead of skipping it silently", func() {
@@ -306,6 +312,84 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(f).To(BeNil())
 		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(BeZero())
+	})
+
+	// F48f A1: the Events read filtered server-side on the apiReader path. Two
+	// specs: the request shape (a recording reader sees the field selector) and
+	// the apiserver's acceptance of it (a real List with the same
+	// MatchingFields — an unsupported field is an ERROR, so this cannot pass
+	// vacuously).
+	It("A1: the Events read sends the pod's UID to the apiserver as a field selector", func() {
+		loop, pod, r, _, _ := plant("f48fselector")
+		rec := &recordingListReader{Client: k8sClient}
+		r.apiReader = rec
+		_, err := r.sandboxMountFailureEvent(ctx, loop, pod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(rec.eventSelector).To(Equal("involvedObject.uid="+string(pod.UID)),
+			"the apiReader path filters on the apiserver side (no field index involved)")
+	})
+
+	It("A1: the apiserver accepts involvedObject.uid and returns only this pod's Events", func() {
+		loop, pod, r, _, _ := plant("f48fuidsel")
+		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
+		plantMountEvent(pod, "FailedMount", "a previous sandbox's mount failure", types.UID("previous-pod-uid"))
+		r.apiReader = k8sClient
+		ev, err := r.sandboxMountFailureEvent(ctx, loop, pod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ev).NotTo(BeNil())
+		Expect(ev.InvolvedObject.UID).To(Equal(pod.UID))
+
+		By("the same selector on a raw List: supported (an error otherwise) and it filters")
+		var got corev1.EventList
+		Expect(k8sClient.List(ctx, &got, client.InNamespace(pod.Namespace),
+			client.MatchingFields{"involvedObject.uid": string(pod.UID)})).To(Succeed())
+		Expect(got.Items).To(HaveLen(1), "one Event for this pod; the other UID's is filtered out")
+		Expect(got.Items[0].InvolvedObject.UID).To(Equal(pod.UID))
+	})
+
+	// F48f A2 (prereview-266 §F3): the marker used to be a permanent bool, so a
+	// transient read failure muted the surface for the Loop's life and a
+	// permanent one went silent when the Warning Event expired (--event-ttl).
+	It("A2: the unreadable-Events warning re-arms after the quiet window, not on every pass", func() {
+		loop, pod, clock, offset, rec := plant("f48fquiet")
+		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
+		*offset = sandboxMountGrace + time.Minute
+		base := clock.now().Time
+		now := base
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+			apiReader: forbidEventsReader{Client: k8sClient}, Recorder: rec}
+		r.now = func() metav1.Time { return metav1.NewTime(now) }
+
+		Expect(r.sandboxFailure(ctx, loop)).To(BeNil(), noFailure())
+		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(Equal(1))
+
+		By("a pass inside the quiet window stays quiet")
+		now = base.Add(time.Minute)
+		Expect(r.sandboxFailure(ctx, loop)).To(BeNil(), noFailure())
+		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(BeZero())
+
+		By("past the window the blindness is announced again (the Event expires, the surface does not)")
+		now = base.Add(sandboxEventsUnreadableQuiet + time.Minute)
+		Expect(r.sandboxFailure(ctx, loop)).To(BeNil(), noFailure())
+		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(Equal(1))
+	})
+
+	// F48f A3 (R35 I130(c)): the mount branch's ADR-0004 claim guard. Deleting it
+	// left the suite green, so nothing pinned it.
+	It("A3: a claim the operator accepts overrides a mount failure (the ADR-0004 guard)", func() {
+		loop, pod, clock, offset, rec := plant("f48fclaim")
+		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
+		*offset = sandboxMountGrace + time.Minute
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
+		r.now = clock.now
+		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) {
+			return &PhaseClaim{ObservedPhase: cov.LoopPhasePlanning, Status: claimSuccess,
+				Iteration: loop.Status.Iteration}, nil
+		}
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "the claim wins (ADR-0004): the mount evidence decides nothing")
+		Expect(loop.Status.Agent).To(BeNil(), "and no attempt is recorded")
 	})
 })
 
@@ -332,6 +416,27 @@ func plantEventAt(pod *corev1.Pod, reason, msg string, uid types.UID, last metav
 		ev.Type = corev1.EventTypeWarning
 	}
 	Expect(k8sClient.Create(context.Background(), ev)).To(Succeed())
+}
+
+// recordingListReader is a client.Reader that records the field selector of an
+// Event List (F48f A1): the request-shape spec needs to see what the operator
+// sent, not just that the read succeeded.
+type recordingListReader struct {
+	client.Client
+	eventSelector string
+}
+
+func (l *recordingListReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.EventList); ok {
+		lo := &client.ListOptions{}
+		for _, o := range opts {
+			o.ApplyToList(lo)
+		}
+		if lo.FieldSelector != nil {
+			l.eventSelector = lo.FieldSelector.String()
+		}
+	}
+	return l.Client.List(ctx, list, opts...)
 }
 
 // forbidEventsReader is a client.Reader whose Event List is Forbidden (a

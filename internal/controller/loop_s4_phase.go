@@ -1069,10 +1069,17 @@ const (
 	// blind while it does (no decision, never a failure), so the degradation
 	// must be visible (R26 I90).
 	sandboxEventsUnreadableReason = "SandboxEventsUnreadable"
-	// sandboxEventsUnreadableAnnotation is the operator-owned one-shot marker
-	// for that Event (the memoryPVCUnboundNotified pattern: one Event per Loop,
-	// not one per reconcile).
+	// sandboxEventsUnreadableAnnotation is the operator-owned marker for that
+	// Event (the memoryPVCUnboundNotified pattern, re-armed as F48f §F3): its
+	// VALUE is the last Event's time (RFC3339), so a read that keeps failing
+	// re-announces every sandboxEventsUnreadableQuiet and a read that recovers
+	// simply stops. A permanent failure must not go silent when the Event
+	// expires (--event-ttl, 1h), and a transient one must not mute the surface
+	// for the Loop's life.
 	sandboxEventsUnreadableAnnotation = "coxswain.io/sandbox-events-unreadable-notified"
+	// sandboxEventsUnreadableQuiet (F48f) is how long the marker above mutes a
+	// repeat Warning Event (the meteringEventQuiet precedent, F44).
+	sandboxEventsUnreadableQuiet = 5 * time.Minute
 )
 
 // sandboxMountFailureReasons are the kubelet Event reasons that mean the pod
@@ -1179,30 +1186,44 @@ func configErrorWaiting(pod *corev1.Pod) *waitingConfigError {
 	return nil
 }
 
-// sandboxMountFailureEvent (F48b) returns the kubelet's mount-failure Event
-// for THIS sandbox pod, or nil when there is none. The kubelet reports a
+// sandboxMountFailureEvent (F48b, F48f) returns the kubelet's mount-failure
+// Event for THIS sandbox pod, or nil when there is none. The kubelet reports a
 // volume it cannot mount only as an Event (FailedMount / FailedAttachVolume /
 // FailedMapVolume), never in the pod status. The read is the uncached apiReader
 // (an Events informer would be a cluster-wide cache of the highest-churn type
-// in the API for one namespaced list per Pending pod) and the filter is done in
-// memory — including the pod's UID, which is load-bearing: the retry deletes
-// the Sandbox, so the previous attempt's Events still exist in the namespace
-// (Events outlive the pod by up to --event-ttl), and without the UID filter the
-// new pod would be failed on the old pod's evidence, burning all attempts in a
-// few reconciles (the F14/I65 UID-dedup failure mode).
+// in the API for one namespaced list per Pending pod), and on that path the
+// pod's UID goes to the apiserver as a fieldSelector — the direct client sends
+// MatchingFields on the request, so no field index is involved (the index rule
+// belongs to the CACHED client; readVerifyJobPod passes MatchingLabels through
+// the same apiReader, loop_verify_job.go). The in-memory filter below stays
+// either way: it is the correctness rule (the UID/kind/name match and the
+// superseded-Event comparison), and on the cached fallback path it is the only
+// filter. The UID is load-bearing: the retry deletes the Sandbox, so the
+// previous attempt's Events still exist in the namespace (Events outlive the pod
+// by up to --event-ttl), and without the UID filter the new pod would be failed
+// on the old pod's evidence, burning all attempts in a few reconciles (the
+// F14/I65 UID-dedup failure mode).
 func (r *LoopReconciler) sandboxMountFailureEvent(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod) (*corev1.Event, error) {
 	reader := r.apiReader
+	// F48f: only the apiReader path can use the selector; the cached fallback
+	// (r.Client, as in envtest) would need a registered field index for
+	// involvedObject.uid, which it does not have.
+	filtered := reader != nil
 	if reader == nil {
 		if r.Client == nil {
 			return nil, nil
 		}
 		reader = r
 	}
-	// A namespaced list, no field selector: a cached client's MatchingFields
-	// needs a registered field index (which the apiReader path does not have),
-	// and one Loop's namespace of 1h-TTL Events is small.
+	opts := []client.ListOption{client.InNamespace(loop.Namespace)}
+	if filtered {
+		// F48f: a cost measure, not the correctness rule (below): one Loop's
+		// namespace holds every previous attempt's Events for up to
+		// --event-ttl.
+		opts = append(opts, client.MatchingFields{"involvedObject.uid": string(pod.UID)})
+	}
 	var events corev1.EventList
-	if err := reader.List(ctx, &events, client.InNamespace(loop.Namespace)); err != nil {
+	if err := reader.List(ctx, &events, opts...); err != nil {
 		return nil, err
 	}
 	var mount, progress *corev1.Event
@@ -1265,15 +1286,36 @@ func eventTimestamp(ev *corev1.Event) time.Time {
 	}
 }
 
-// surfaceEventsUnreadable (F48b) makes a failed Events read visible (R26 I90)
-// with ONE Warning Event per Loop: the mount-failure bound is blind while the
+// sandboxEventsNotifiedAt reads the unreadable-Events marker value: the time of
+// the last Warning Event (F48f), or ok=false when the marker is absent or is not
+// a time. Both of those mean "not recently notified", so nothing is ever muted
+// forever — a pre-F48f `true` marker, or garbage, simply announces once and is
+// rewritten as a time.
+func sandboxEventsNotifiedAt(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
+// surfaceEventsUnreadable (F48b, F48f) makes a failed Events read visible
+// (R26 I90) with a Warning Event: the mount-failure bound is blind while the
 // read fails, so the Loop falls back to F48's surfacing — that degradation must
-// not be silent. The one-shot marker is the operator-owned annotation (the
-// memoryPVCUnboundNotified pattern). Best-effort: a failed annotation patch
-// never blocks the reconcile (the condition path is unaffected).
+// not be silent. The operator-owned marker is the last Event's TIME (RFC3339,
+// the memoryPVCUnboundNotified pattern re-armed per F48f §F3): a repeat inside
+// sandboxEventsUnreadableQuiet emits nothing, and a failure that persists past
+// it announces again, so neither a transient nor a permanent read failure can
+// mute the surface. Best-effort: a failed annotation patch never blocks the
+// reconcile (the condition path is unaffected).
 func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv1alpha1.Loop, cause error) {
 	logf.FromContext(ctx).Error(cause, "sandbox pod Events read failed; no mount-failure decision (the Loop is back to surfacing only)", "loop", loop.Name)
-	if loop.Annotations != nil && loop.Annotations[sandboxEventsUnreadableAnnotation] == resumeAnnotationTrue {
+	now := r.operatorNow()
+	if at, ok := sandboxEventsNotifiedAt(loop.Annotations[sandboxEventsUnreadableAnnotation]); ok &&
+		now.Sub(at) < sandboxEventsUnreadableQuiet {
 		return
 	}
 	if r.Recorder != nil {
@@ -1282,11 +1324,12 @@ func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv
 	}
 	// Patch a COPY (a full Update would write the server's stale status back
 	// into `loop`, dropping this reconcile's conditions — the S4/S6 lesson).
+	notified := now.UTC().Format(time.RFC3339)
 	patched := loop.DeepCopy()
 	if patched.Annotations == nil {
 		patched.Annotations = make(map[string]string)
 	}
-	patched.Annotations[sandboxEventsUnreadableAnnotation] = resumeAnnotationTrue
+	patched.Annotations[sandboxEventsUnreadableAnnotation] = notified
 	if err := r.Patch(ctx, patched, client.MergeFrom(loop.DeepCopy())); err != nil {
 		logf.FromContext(ctx).Error(err, "mark sandbox events unreadable notified", "loop", loop.Name)
 		return
@@ -1294,7 +1337,7 @@ func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv
 	if loop.Annotations == nil {
 		loop.Annotations = make(map[string]string)
 	}
-	loop.Annotations[sandboxEventsUnreadableAnnotation] = resumeAnnotationTrue
+	loop.Annotations[sandboxEventsUnreadableAnnotation] = notified
 	// Refresh the caller's resourceVersion (the patch bumped it) exactly as
 	// markMemoryPVCUnboundNotified does (loop_p5a_memory.go): this reconcile's
 	// trailing Status().Update sends loop's RV, and a stale one is a 409

@@ -162,11 +162,12 @@ func checkpointNameShapeOK(loop *coxv1alpha1.Loop, cp coxv1alpha1.CheckpointStat
 }
 
 // checkpointEntryTrusted (F47) decides whether a status.checkpoints entry may
-// be ACTED ON (deleted, or used as a restore source). status is writable by
-// anyone bound to the editor role (cox approve/reject PUT /status), so the
-// operator must not treat a name read from it as one it wrote: it must have
-// the shape checkpointName produces for this Loop AND name a VolumeSnapshot
-// labelled for this Loop (newVolumeSnapshotObj sets loopLabelKey).
+// be ACTED ON (deleted, used as a restore source, or trusted to suppress a
+// checkpoint at its iteration). status is writable by anyone bound to the
+// editor role (cox approve/reject PUT /status), so the operator must not treat
+// a name read from it as one it wrote: it must have the shape checkpointName
+// produces for this Loop AND name a VolumeSnapshot labelled for this Loop
+// (newVolumeSnapshotObj sets loopLabelKey).
 func (r *LoopReconciler) checkpointEntryTrusted(ctx context.Context, loop *coxv1alpha1.Loop, cp coxv1alpha1.CheckpointStatus) checkpointTrust {
 	if !checkpointNameShapeOK(loop, cp) {
 		return checkpointForeign
@@ -485,6 +486,10 @@ func (r *LoopReconciler) snapshotClassForDriver(ctx context.Context, driver stri
 // reconcile to confirm it is recorded / the content is ReadyToUse — though
 // B1's durability record is the snapshot OBJECT's existence, not the
 // content's readiness; B2's restore waits for ReadyToUse).
+//
+// Idempotency is keyed on a TRUSTED status entry for the iteration (F87):
+// status is user-writable, so an entry only suppresses the create when
+// checkpointEntryTrusted accepts it.
 func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, requeue bool) {
 	// The checkpoint is keyed off the operator-recorded verify outcome
 	// (status.verify.iteration), not the current iteration. The current
@@ -496,13 +501,44 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 		return false, false // no recorded verify outcome yet (iteration 0 is a valid recorded value)
 	}
 	iteration := int(*loop.Status.Verify.Iteration)
-	// Idempotency: a checkpoint is taken ONCE per iteration. If
-	// status.checkpoints already has an entry for this iteration, the
-	// snapshot is already taken; do not re-create it.
-	for _, cp := range loop.Status.Checkpoints {
-		if cp.Iteration == iteration {
-			return false, false
+	// F87: status.checkpoints is user-writable, so an entry for this iteration
+	// only means the checkpoint is already taken when it is one this operator
+	// wrote (checkpointEntryTrusted: the name shape checkpointName produces for
+	// this Loop and iteration, and a VolumeSnapshot labelled for this Loop). A
+	// forged entry must not suppress the create: the iteration would be left
+	// with NO snapshot, so the lost-PVC restore / fork would have no source,
+	// and the retention GC cannot be relied on to drop the entry first (it
+	// returns early whenever the keep-set covers the whole list). Drop the
+	// forged entry (same Warning Event as the GC) and take the real checkpoint.
+	//
+	// The trust read is gated on the VolumeSnapshot CRD being present (I88),
+	// like every other snapshot read in the tree (checkpointSupport,
+	// gcLoopCheckpoints, resolveCheckpointSource): a Get on a cluster without
+	// the CRD would start the cache's watch for an absent type, and it would
+	// turn a status entry into a bogus checkpointGone (the NoMatchError the
+	// predicate reads as Gone) or an endless requeue (any other error). With no
+	// CRD there can be no snapshot behind any entry, so every entry is kept
+	// unjudged and checkpointSupport below reports VolumeSnapshotCRDMissing as
+	// it already does.
+	suppress, unknown := false, false
+	if r.snapshotCRDPresentCall(ctx) {
+		kept, dropped, sup, unk := r.checkpointEntriesForCreate(ctx, loop, iteration)
+		suppress, unknown = sup, unk
+		if dropped {
+			loop.Status.Checkpoints = kept
+			changed = true
 		}
+	}
+	if suppress {
+		// Idempotency: a TRUSTED entry for this iteration means the snapshot is
+		// already taken; do not re-create it.
+		return changed, false
+	}
+	if unknown {
+		// A failed VolumeSnapshot read is no decision (I49): requeue rather than
+		// create a second entry for this iteration (the create would also be an
+		// AlreadyExists on the genuine snapshot if it exists).
+		return changed, true
 	}
 	// The support check gates the create (D59). When support is absent:
 	// BestEffort carries on (the condition is False, set by
@@ -585,6 +621,66 @@ func isAlreadyExists(err error) bool {
 	return apierrors.IsAlreadyExists(err)
 }
 
+// checkpointEntriesForCreate (F87) decides what to do with status.checkpoints
+// before ensureCheckpoint takes the checkpoint for `iteration`. It returns the
+// entries that survive (kept), whether one was dropped (dropped — the caller
+// must persist the status), whether a genuine entry for this iteration already
+// covers it (suppress — the idempotency check), and whether this iteration's
+// entry could not be read (unknown — a failed read is no decision, I49, so the
+// caller requeues).
+//
+// Only the entry/entries at the iteration being taken are read and judged
+// (checkpointEntryTrusted: the name shape checkpointName produces for this Loop
+// and iteration, AND a VolumeSnapshot labelled for this Loop). That is exactly
+// the set that could collide with the create, so the cost is one cached
+// VolumeSnapshot Get per reconcile in the steady state, not one per recorded
+// checkpoint. A Foreign entry there is dropped and surfaced with the retention
+// GC's Warning Event (one story in docs/TROUBLESHOOTING.md): it names a shape
+// or ownership the operator never writes, so letting it suppress the create —
+// a status write alone hiding a checkpoint — is the defect this closes. A Gone
+// entry is dropped too, so the re-taken checkpoint replaces it instead of
+// appending a second entry for one iteration. Foreign entries at OTHER
+// iterations are left to the retention GC, which judges every entry it runs
+// over (F47).
+//
+// One case does not converge, by design of the drop: a Foreign entry AT this
+// iteration whose name is the operator's but whose snapshot exists without this
+// Loop's label. The entry is dropped, the create hits AlreadyExists (a snapshot
+// of that name exists), the create records it again, and the next pass drops it
+// again — one Warning Event per pass. That churn predates F87 (the GC drops such
+// an entry once it runs over it and the create re-records it); the alternative,
+// trusting an unlabelled snapshot, is the ownership hole F47 closed.
+func (r *LoopReconciler) checkpointEntriesForCreate(ctx context.Context, loop *coxv1alpha1.Loop, iteration int) (kept []coxv1alpha1.CheckpointStatus, dropped, suppress, unknown bool) {
+	kept = make([]coxv1alpha1.CheckpointStatus, 0, len(loop.Status.Checkpoints))
+	for _, cp := range loop.Status.Checkpoints {
+		if cp.Iteration != iteration {
+			kept = append(kept, cp)
+			continue
+		}
+		switch r.checkpointEntryTrusted(ctx, loop, cp) {
+		case checkpointTrusted:
+			suppress = true
+		case checkpointUnknown:
+			unknown = true
+		case checkpointForeign:
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "CheckpointEntryUntrusted",
+					"status.checkpoints entry %q is not a checkpoint of this Loop; dropped without deleting anything", cp.Name)
+			}
+			dropped = true
+			continue
+		case checkpointGone:
+			// The name is this Loop's but the snapshot is gone: drop the stale
+			// entry and re-take the checkpoint (the create is idempotent by
+			// name, so the entry is replaced, not duplicated).
+			dropped = true
+			continue
+		}
+		kept = append(kept, cp)
+	}
+	return kept, dropped, suppress, unknown
+}
+
 // applyCheckpointRetention applies the B1 retention policy: the last
 // checkpointRetention (3) checkpoints plus every milestone checkpoint are
 // kept; the rest are GC'd (their VolumeSnapshots deleted, the status entries
@@ -623,6 +719,10 @@ func (r *LoopReconciler) applyCheckpointRetention(ctx context.Context, loop *cox
 			continue
 		}
 		// F47: status is user-writable; only delete a snapshot this Loop owns.
+		// (ensureCheckpoint's F87 filter drops a Foreign entry before the GC
+		// sees it; this switch stays as the GC's own guard, because
+		// applyCheckpointRetention is also the path a hand-built status list
+		// reaches.)
 		switch r.checkpointEntryTrusted(ctx, loop, cp) {
 		case checkpointForeign:
 			// Drop the forged/foreign entry (so it cannot wedge the GC or the

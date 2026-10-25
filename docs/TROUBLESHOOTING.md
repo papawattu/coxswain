@@ -903,9 +903,15 @@ status.checkpoints entry "checkpoint-other-loop-iter-7" is not a checkpoint
 of this Loop; dropped without deleting anything
 ```
 
-The `status.checkpoints` entry that named that snapshot is removed from the
-status when the retention GC next runs over it (after a checkpoint is
-taken), not necessarily on the next reconcile. No snapshot is deleted.
+It is removed from the status by whichever of the two consumers evaluates it
+next: the checkpoint step (for an entry at the iteration it is about to take
+— F87) or the retention GC (for any other entry, when the GC runs over it).
+No snapshot is deleted. Before F87 an untrusted entry whose `iteration`
+matched the current one suppressed the checkpoint outright — the operator
+believed it was already taken — leaving that iteration with no snapshot and a
+later lost-PVC restore or fork with no source. A status write cannot fail a
+Loop; it can only hide a checkpoint, which is why the entry is dropped and the
+real checkpoint taken.
 
 **What it means:** a `status.checkpoints` entry named a VolumeSnapshot that
 the operator did not write for this Loop. `status` is user-writable

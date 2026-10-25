@@ -19,6 +19,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +38,17 @@ func f83SetTamperPod(ctx context.Context, ns, name string, tamper, artifact core
 	pod := &corev1.Pod{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: ns}, pod); err != nil {
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// The Job normally exists (the operator created it); make a minimal valid
+		// one when the spec's Loop never reached the Job create.
+		if k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, &batchv1.Job{}) != nil {
+			Expect(k8sClient.Create(ctx, &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)},
+				Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}},
+				}}},
+			})).To(Succeed())
+		}
 		s5aVerifyPodInProg(ctx, ns, name, jobName)
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: ns}, pod)).To(Succeed())
 	}
@@ -133,6 +145,27 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 		Expect(loop.Status.Phase).NotTo(Equal(coxv1alpha1.LoopPhaseFailed))
 		Expect(loop.Status.Verify.TamperExitCode).NotTo(BeNil())
 		Expect(*loop.Status.Verify.TamperExitCode).To(Equal(int32(0)), "a check's exit 1 must not be recorded as the tamper code")
+	})
+
+	It("F83: a FORGED status (tamperExitCode=1 + matching commits) with no confirming pod does not fail the Loop", func() {
+		ns, name := newLoop("f83-forge-")
+		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		r := s5aDriveToVerifying(ns, name)
+		loop := s5aReconcile(r, ns, name)
+		Expect(loop.Status.CurrentVerify).NotTo(BeNil())
+		// An editor-role user PUTs /status.
+		one := int32(1)
+		loop.Status.Verify = &coxv1alpha1.VerifyStatus{TamperExitCode: &one, VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		loop = s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "a forged status alone must not fail the Loop")
+
+		By("a pod whose tamper init is Running does not confirm it either")
+		f83SetTamperPod(ctx, ns, name, running, running, nil)
+		loop.Status.Verify = &coxv1alpha1.VerifyStatus{TamperExitCode: &one, VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		loop = s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 	})
 
 	It("F83: the delivered PR body says the tamper check was clean when the tamper init exited 0", func() {

@@ -132,6 +132,11 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		got.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: b2Commit}
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+		// F83: the status alone is user-writable and proves nothing; the verify
+		// Job's pod (operator-only evidence) carries the real tamper exit code.
+		f83SetTamperPod(ctx, ns, nn.Name,
+			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
+			corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, nil)
 
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})

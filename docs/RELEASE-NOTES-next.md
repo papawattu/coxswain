@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `de4b506` = PR #266); each claim cites its
+merged code on `main` (as of `0070686` = PR #269); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -222,6 +222,11 @@ existing Loops are unaffected, but new ones are.
 - **What was wrong.** A sandbox pod stuck on a volume it can't mount (for example a missing Secret, reported as FailedMount) waited forever: the F48 surface showed `SandboxNotStarting` but never failed the Loop (F48b), and the sandbox infra-retry bound itself never tripped — the operator's own Sandbox recreate reset the count (F48b).
 - **What changed.** A sandbox pod stuck on an unmountable volume now fails the Loop after the bounded retries (2) instead of waiting forever. The sandbox infra-retry bound now actually trips (the recreate no longer resets it). The operator now reads the pod's FailedMount Events to make the decision, so it needs `get` and `list` on `events` — a new RBAC rule: apply the new `install.yaml` or chart (PR #266).
 - **On upgrade.** Apply the new `install.yaml` or chart so the operator has `get`/`list` on `events`; everything else is in the new operator image (PR #266).
+
+### F48g: the sandbox retry count now belongs to one run — #269
+
+- **What changed.** The sandbox infra-failure count (that F48b makes trip) now belongs to a **run** — one iteration and phase — keyed on the new `status.agent.infraEpisode` field, so a failure episode cannot consume the next run's retry budget: failures in an earlier run, and failures before a rollback, no longer count toward failing a later run (PR #269, merged `0070686`).
+- **On upgrade.** Nothing to do beyond the new CRD: `status.agent` gains one optional field, `infraEpisode`, picked up with a standard install (PR #269).
 
 ### F83c: the tamper decision comes only from the verify Job's pod; an OOM-killed tamper check is an infrastructure failure — #264
 
@@ -559,9 +564,10 @@ block reading a non-existent field, #260), F48d and F48c (the
 the pod is gone, #262), F46 (the unwired model timeout, #252), F83 (the
 unrecorded tamper evidence, #258), F83c (the status-driven tamper gate
 that could never fire, and an OOM-killed tamper check reading as a terminal
-tampered failure, #264), and F48b (the sandbox pod stuck on an unmountable
-volume, and the infra-retry bound that never tripped, #266) were closed by
-the PRs named beside them. In plain words, the items still open:
+tampered failure, #264), F48b (the sandbox pod stuck on an unmountable
+volume, and the infra-retry bound that never tripped, #266), and F48g (the
+sandbox-failure count that outlived the run it belonged to, #269) were
+closed by the PRs named beside them. In plain words, the items still open:
 
 **P1 (security):**
 

@@ -212,8 +212,9 @@ ReadWriteMany-capable class (see the flag entry above).
 
 The memory-writer Job keeps at most 100 lessons per memory PVC, evicting the
 oldest by mtime after a successful write (F32, PR #233). An existing PVC with
-more than 100 lessons is trimmed on the next memory-writer run that writes at
-least one lesson (a run that writes nothing performs no eviction). The memory
+more than 100 lessons is trimmed on the next memory-writer run that has at
+least one eligible lesson, even if every eligible lesson is a duplicate (a
+run with no eligible lessons performs no eviction). The memory
 reader also now stops adding whole files at its 16 KiB section cap instead of
 silently dropping the whole memory section past that size. There is nothing
 to do.

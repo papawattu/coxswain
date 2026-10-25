@@ -261,7 +261,7 @@ kubectl cox pause <loop>        # set spec.suspend=true
 kubectl cox resume <loop>       # clear spec.suspend (set coxswain.io/resume for a Stall/Budget pause)
 kubectl cox redeliver <loop>    # re-trigger delivery for a failed Loop (I52 annotation)
 kubectl cox fork <name> --loop <source> --iteration <n>  # fork from a checkpoint
-kubectl cox memory export|import|delete <repo-url>  # back up or remove the memory PVC
+kubectl cox memory export <repo-url> -o backup.tar.gz  # back up the memory PVC (import/delete: OPERATOR.md)
 ```
 
 `describe` is the one to run first after a Loop finishes: it shows the

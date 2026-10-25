@@ -148,12 +148,29 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
 		r := s5aDriveToVerifying(ns, name)
-		c0 := term(1)
+
+		// Stage 1: the tamper init terminated CLEAN and check-0 is still running,
+		// so the record can be read at the pin it belongs to. What is recorded is
+		// the tamper init's own code.
+		c0 := running
 		f83SetTamperPod(ctx, ns, name, term(0), term(0), &c0)
 		loop := s5aReconcile(r, ns, name)
-		Expect(loop.Status.Phase).NotTo(Equal(coxv1alpha1.LoopPhaseFailed))
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "a running check is no decision")
+		Expect(loop.Status.Verify).NotTo(BeNil())
 		Expect(loop.Status.Verify.TamperExitCode).NotTo(BeNil())
-		Expect(*loop.Status.Verify.TamperExitCode).To(Equal(int32(0)), "a check's exit 1 must not be recorded as the tamper code")
+		Expect(*loop.Status.Verify.TamperExitCode).To(Equal(int32(0)), "the record is the tamper init's own code")
+
+		// Stage 2: check-0 now FAILS (exit 1). The verify iterates, and F83d drops
+		// the record with the pin it belongs to: the check's 1 was never the tamper
+		// code, and the old pin's record must not describe the Implementing run
+		// that follows (loop_deliver_description.go renders it with no pin guard).
+		c1 := term(1)
+		f83SetTamperPod(ctx, ns, name, term(0), term(0), &c1)
+		loop = s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "a failing check iterates")
+		Expect(loop.Status.Verify).NotTo(BeNil())
+		Expect(loop.Status.Verify.TamperExitCode).To(BeNil(),
+			"a check's exit 1 is never tamper evidence, and the old pin's record does not survive the iterate")
 	})
 
 	It("F83: a forged status.verify is overwritten from the pod and never fails the Loop", func() {

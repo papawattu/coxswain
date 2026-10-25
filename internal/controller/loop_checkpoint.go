@@ -510,10 +510,24 @@ func (r *LoopReconciler) ensureCheckpoint(ctx context.Context, loop *coxv1alpha1
 	// and the retention GC cannot be relied on to drop the entry first (it
 	// returns early whenever the keep-set covers the whole list). Drop the
 	// forged entry (same Warning Event as the GC) and take the real checkpoint.
-	kept, dropped, suppress, unknown := r.checkpointEntriesForCreate(ctx, loop, iteration)
-	if dropped {
-		loop.Status.Checkpoints = kept
-		changed = true
+	//
+	// The trust read is gated on the VolumeSnapshot CRD being present (I88),
+	// like every other snapshot read in the tree (checkpointSupport,
+	// gcLoopCheckpoints, resolveCheckpointSource): a Get on a cluster without
+	// the CRD would start the cache's watch for an absent type, and it would
+	// turn a status entry into a bogus checkpointGone (the NoMatchError the
+	// predicate reads as Gone) or an endless requeue (any other error). With no
+	// CRD there can be no snapshot behind any entry, so every entry is kept
+	// unjudged and checkpointSupport below reports VolumeSnapshotCRDMissing as
+	// it already does.
+	suppress, unknown := false, false
+	if r.snapshotCRDPresentCall(ctx) {
+		kept, dropped, sup, unk := r.checkpointEntriesForCreate(ctx, loop, iteration)
+		suppress, unknown = sup, unk
+		if dropped {
+			loop.Status.Checkpoints = kept
+			changed = true
+		}
 	}
 	if suppress {
 		// Idempotency: a TRUSTED entry for this iteration means the snapshot is
@@ -628,6 +642,14 @@ func isAlreadyExists(err error) bool {
 // appending a second entry for one iteration. Foreign entries at OTHER
 // iterations are left to the retention GC, which judges every entry it runs
 // over (F47).
+//
+// One case does not converge, by design of the drop: a Foreign entry AT this
+// iteration whose name is the operator's but whose snapshot exists without this
+// Loop's label. The entry is dropped, the create hits AlreadyExists (a snapshot
+// of that name exists), the create records it again, and the next pass drops it
+// again — one Warning Event per pass. That churn predates F87 (the GC drops such
+// an entry once it runs over it and the create re-records it); the alternative,
+// trusting an unlabelled snapshot, is the ownership hole F47 closed.
 func (r *LoopReconciler) checkpointEntriesForCreate(ctx context.Context, loop *coxv1alpha1.Loop, iteration int) (kept []coxv1alpha1.CheckpointStatus, dropped, suppress, unknown bool) {
 	kept = make([]coxv1alpha1.CheckpointStatus, 0, len(loop.Status.Checkpoints))
 	for _, cp := range loop.Status.Checkpoints {

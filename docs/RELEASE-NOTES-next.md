@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `74d4a03` = PR #265); each claim cites its
+merged code on `main` (as of `de4b506` = PR #266); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -216,6 +216,12 @@ existing Loops are unaffected, but new ones are.
   read) is closed by this fix.
 
 ## Other changes
+
+### F48b: a sandbox pod stuck on a volume it can't mount now fails the Loop instead of waiting forever — #266
+
+- **What was wrong.** A sandbox pod stuck on a volume it can't mount (for example a missing Secret, reported as FailedMount) waited forever: the F48 surface showed `SandboxNotStarting` but never failed the Loop (F48b), and the sandbox infra-retry bound itself never tripped — the operator's own Sandbox recreate reset the count (F48b).
+- **What changed.** A sandbox pod stuck on an unmountable volume now fails the Loop after the bounded retries (2) instead of waiting forever. The sandbox infra-retry bound now actually trips (the recreate no longer resets it). The operator now reads the pod's FailedMount Events to make the decision, so it needs `get` and `list` on `events` — a new RBAC rule: apply the new `install.yaml` or chart (PR #266).
+- **On upgrade.** Apply the new `install.yaml` or chart so the operator has `get`/`list` on `events`; everything else is in the new operator image (PR #266).
 
 ### F83c: the tamper decision comes only from the verify Job's pod; an OOM-killed tamper check is an infrastructure failure — #264
 
@@ -551,10 +557,11 @@ proxy read reported as a missing pod, #265), F85 (the `cox describe` budget
 block reading a non-existent field, #260), F48d and F48c (the
 `SandboxNotStarting` condition not saved at Verifying, and not cleared when
 the pod is gone, #262), F46 (the unwired model timeout, #252), F83 (the
-unrecorded tamper evidence, #258), and F83c (the status-driven tamper gate
+unrecorded tamper evidence, #258), F83c (the status-driven tamper gate
 that could never fire, and an OOM-killed tamper check reading as a terminal
-tampered failure, #264) were closed by the PRs named beside them. In plain
-words, the items still open:
+tampered failure, #264), and F48b (the sandbox pod stuck on an unmountable
+volume, and the infra-retry bound that never tripped, #266) were closed by
+the PRs named beside them. In plain words, the items still open:
 
 **P1 (security):**
 
@@ -654,8 +661,6 @@ words, the items still open:
   the condition and clears, and the editor role goes back to read-only
   status), bind the editor role only to users you would trust with the
   Loop's verdicts.
-- **F48b**: a sandbox pod stuck on a missing Secret volume shows
-  `SandboxNotStarting` but is not failed.
 - **F86**: a fork from another Loop's checkpoint named in the spec is not
   ownership-checked.
 - **F87(c)**: a forged `status.checkpoints` entry at the current iteration

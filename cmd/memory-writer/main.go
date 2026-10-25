@@ -387,15 +387,18 @@ func countSurvivors(reasons []string) int {
 }
 
 // summaryLines builds the bounded summary's lines (one line per lesson with
-// its sha256-prefix, written|dropped, and rule, plus the final counts line).
+// its sha256-prefix, written|dropped, and rule, plus the counts line).
 // It returns ONLY lines — the lesson text is NEVER in a line. This is the
 // pure content of the summary (the emission — stdout + the termination
 // message file — is in emitSummary).
 func summaryLines(lessons, reasons, audit []string, total, written, dropped int) []string {
 	out := make([]string, 0, len(lessons)+len(audit)+1)
-	// The audit lines ("evicted <sha12> cap", batch truncation) come FIRST: the
-	// Loop's bounded audit text keeps only the first 1000 bytes of the summary,
-	// so after ~11 per-lesson lines a trailing audit line would be cut off.
+	// Order matters: the Loop's bounded audit text keeps whole lines from the
+	// START of the summary up to ~1000 bytes (memoryWriteAuditText). So the
+	// COUNTS line is FIRST (the one line every other line is checked against,
+	// F78), then the audit lines ("evicted <sha12> cap", batch truncation),
+	// then the per-lesson lines, which are the ones cut first.
+	out = append(out, summaryLine(total, written, dropped))
 	out = append(out, audit...)
 	for i, lesson := range lessons {
 		status := "written"
@@ -413,7 +416,6 @@ func summaryLines(lessons, reasons, audit []string, total, written, dropped int)
 		}
 		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
 	}
-	out = append(out, summaryLine(total, written, dropped))
 	return out
 }
 

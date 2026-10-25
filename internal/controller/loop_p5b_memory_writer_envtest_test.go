@@ -626,7 +626,11 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		{"p5b-mw-nopod-running", "", "", ""},
 		{"p5b-mw-nopod-target", string(batchv1.JobFailureTarget), "", ""}, // N4: only FailureTarget=True is no decision
 	} {
-		It("decides a no-pod Job from its conditions: "+tc.name, func() {
+		verb := "decides"
+		if tc.wantReason == "" {
+			verb = "makes no decision for"
+		}
+		It(verb+" a no-pod Job from its conditions: "+tc.name, func() {
 			r := s6SucceededLessonsAvailable(tc.name, ns)
 			p5bMemoryWriterReconcile(r, ns, tc.name) // creates the Job
 			job := p5bGetMemoryJob(ns, tc.name)

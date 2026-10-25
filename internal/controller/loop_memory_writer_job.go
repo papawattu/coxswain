@@ -202,9 +202,10 @@ func (r *LoopReconciler) memoryWriterImage() string {
 // target), and the workspace PVC is mounted READ-ONLY (the Job reads the
 // lessons file but never writes the workspace).
 //
-// The NetworkPolicy denies ALL ingress and ALL egress (the writer Job makes
-// no network calls — the deny-all is the ADR-0007 fence: a lesson must not
-// be exfiltrated during the write).
+// The NetworkPolicy denies ALL ingress and ALL egress EXCEPT the Loop's model
+// proxy (the curator call) and DNS (to resolve it) — see
+// ensureMemoryWriterNetworkPolicy. That is the ADR-0007 fence: a lesson must
+// not be exfiltrated during the write.
 //
 // Returns (requeue, err). requeue is true when the Job was just created or
 // is not yet terminal (the operator must requeue to read its outcome);
@@ -317,8 +318,8 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 	}
 
 	// Create the Job (the operator-controlled memory-write entrypoint) + the
-	// NetworkPolicy (deny-all). The Job is owned by the Loop.
-	// P3-6: the deny-all NetworkPolicy BEFORE the Job, so the writer pod never
+	// NetworkPolicy (egress fence: proxy + DNS only). The Job is owned by the Loop.
+	// P3-6: the NetworkPolicy BEFORE the Job, so the writer pod never
 	// exists without its egress fence (ADR-0007: a lesson must not be
 	// exfiltrated during the write).
 	if err := r.ensureMemoryWriterNetworkPolicy(ctx, loop); err != nil {
@@ -1005,27 +1006,53 @@ func memoryWriteAuditMessage(summary string) string {
 }
 
 // memoryWriteAuditText is the bounded audit text: the summary's lines
-// joined with a single space. The per-lesson lines already carry the
-// verdict (written|dropped + the one-line reason — the curator's
-// "<reason>" string, or the static rule name), so the text shows which
-// lessons were written and why. The Event's message is capped by
-// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes, so
-// the audit text is truncated to 1000 bytes here, on a rune boundary (a byte
-// cut could split a multi-byte rune of a curator reason, F33 P3-5). The
-// truncation is bounded; the lines are sha-prefix + status + rule, where a
-// curator reason is model text (see memoryWriteAuditMessage).
+// joined with a single space. The writer puts the COUNTS line first, then the
+// audit (eviction / truncation) lines, then one line per lesson (F78), so a
+// cut loses the per-lesson lines first. The cut is LINE-oriented: whole lines
+// are kept up to 1000 bytes, then " … N more lines" says how many were
+// dropped; there is never a half line. The Event's message is capped by
+// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes. The
+// per-lesson lines are sha-prefix + status + rule, where a curator reason is
+// model text (see memoryWriteAuditMessage).
+//
+// A single line longer than the cap (not producible by the writer, which
+// bounds every line) is cut on a rune boundary (a byte cut could split a
+// multi-byte rune, F33 P3-5) and marked with "…".
 func memoryWriteAuditText(summary string) string {
 	const max = 1000
-	text := strings.ReplaceAll(summary, "\n", " ")
-	text = strings.TrimSpace(text)
-	if len(text) > max {
+	var lines []string
+	for l := range strings.SplitSeq(summary, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	text := strings.Join(lines, " ")
+	if len(text) <= max {
+		return text
+	}
+	// Keep whole lines while the kept text plus the "more lines" note fits.
+	kept, size := 0, 0
+	for i, l := range lines {
+		add := len(l)
+		if i > 0 {
+			add++ // the joining space
+		}
+		note := len(fmt.Sprintf(" … %d more lines", len(lines)-i-1))
+		if size+add+note > max {
+			break
+		}
+		size += add
+		kept = i + 1
+	}
+	if kept == 0 {
+		// Not even the first line fits: rune-boundary cut.
 		cut := max
 		for cut > 0 && !utf8.RuneStart(text[cut]) {
 			cut--
 		}
 		return text[:cut] + "…"
 	}
-	return text
+	return strings.Join(lines[:kept], " ") + fmt.Sprintf(" … %d more lines", len(lines)-kept)
 }
 
 // memoryWriterTrue / memoryWriterFalse are the bool values the memory-writer

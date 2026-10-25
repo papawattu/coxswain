@@ -159,9 +159,11 @@ Alphabetical; each entry links to where the docs define the term.
   [ADR-0003, Context](adr/0003-one-shot-loop-fork-not-retask.md).
 
 - **Memory** — The shared, per-(namespace, repo URL) ReadWriteMany PVC
-  holding lessons accumulated across Loops in that namespace; new Loops are
-  seeded from it and a memory-writer Job writes back when a Loop ends `Succeeded` or
-  `Failed:Stalled`.
+  holding at most 100 lessons per PVC (a memory-writer Job writes back when
+  a Loop ends `Succeeded` or `Failed:Stalled`, evicting the oldest by mtime
+  when the cap is exceeded); a memory reader seeds new Loops from it, reading
+  each lesson file at most 2000 bytes and the whole "SHARED MEMORY" prompt
+  section at most 16 KiB.
   Without it a Loop simply runs without seeded lessons.
   See: [OPERATOR.md §Shared memory storage
   (Phase 5)](OPERATOR.md#shared-memory-storage-phase-5),
@@ -324,10 +326,10 @@ Alphabetical; each entry links to where the docs define the term.
   See: [ADR-0005, Decision](adr/0005-operator-verifies-via-isolated-job.md#decision).
 
 - **`kubectl cox`** — The operator-facing CLI for reading and steering Loops:
-  `get`, `describe`, `apply`, `pause`/`resume`, `history`, `plan`, `fork`,
-  `approve`/`reject`, `redeliver`, `logs` (agent, proxy, verify, deliver). It
-  talks to the API server with the Loop CRD and uses `kubectl exec`/`cp` for
-  workspace reads.
+  `describe`, `history`, `plan`, `diff`, `approve`/`reject`, `pause`/`resume`,
+  `redeliver`, `fork`, `logs` (agent, proxy, verify, deliver), and `memory`
+  (`import`, `export`, `delete`). It talks to the API server with the Loop
+  CRD and uses `kubectl exec`/`cp` for workspace reads.
   See: [CLI-PLAN.md, Command set
   (one tree, both entry points)](CLI-PLAN.md#command-set-one-tree-both-entry-points),
   [OPERATOR.md §Component logs](OPERATOR.md#component-logs).

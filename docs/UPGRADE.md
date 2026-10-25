@@ -123,10 +123,10 @@ $K get networkpolicy \
 ```
 
 **Why the operator's own cleanup doesn't just do this:**
-`cleanupStaleToolProxyNetpols` lists by the `coxswain.io/tool-proxy-for`
-label (line 3816). A pre-D41d netpol for a removed tool has no label, so
-the list never sees it, and it is never deleted. Manual deletion is the
-one-time fix for netpols created before the label existed.
+`cleanupStaleToolProxyNetpols` lists by the
+`coxswain.io/tool-proxy-for` label. A pre-D41d netpol for a removed tool has
+no label, so the list never sees it, and it is never deleted. Manual
+deletion is the one-time fix for netpols created before the label existed.
 
 **Shown working on kind** (context `kind-coxswain-dev`, namespace
 `i70-demo`, 2026-10-07): three netpols created — one unlabelled tool netpol
@@ -189,17 +189,31 @@ are unaffected.
 
 ### The sandbox waits for the egress proxy for the init clone
 
-For a Loop with an external repo and no base commit, the sandbox is held
-`Suspended` until the egress proxy pod is `Ready` (F55, PR #220). Before
+For a Loop whose workspace-init clone must traverse the egress proxy (an
+external repo before the first clone), the sandbox is held `Suspended` until
+the egress proxy pod is `Ready` (F55, PR #220). Before
 this change, such a Loop could start before the proxy was ready and the
 init clone would fail. On upgrade, such a Loop may briefly be held
 `Suspended` if the proxy is not yet ready. There is nothing to do.
 
+### Memory PVC binding is now visible (P5a)
+
+While a Loop's new memory PVC is unbound (the class is not ReadWriteMany,
+or the provisioner has not created it yet), the Loop runs without memory —
+no lessons are seeded and nothing is written back. A one-shot Warning Event
+`MemoryPVCUnbound` (listable via `kubectl get events`) flags the binding
+wait: the operator emits it at most once per Loop, recorded with the
+`coxswain.io/memory-pvc-unbound-notified` annotation (re-emitted only if that
+annotation is cleared while the PVC is still unbound). There is nothing to do
+unless you want the seeding: point `--memory-storage-class` at a
+ReadWriteMany-capable class (see the flag entry above).
+
 ### Memory lesson cap
 
 The memory-writer Job keeps at most 100 lessons per memory PVC, evicting the
-oldest by mtime on the next write (F32, PR #233). An existing PVC with more
-than 100 lessons is trimmed on the next memory-writer run. The memory reader
-also now stops adding whole files at its 16 KiB section cap instead of
+oldest by mtime after a successful write (F32, PR #233). An existing PVC with
+more than 100 lessons is trimmed on the next memory-writer run that writes at
+least one lesson (a run that writes nothing performs no eviction). The memory
+reader also now stops adding whole files at its 16 KiB section cap instead of
 silently dropping the whole memory section past that size. There is nothing
 to do.

@@ -182,8 +182,10 @@ working binding, so the denial was not active in those releases. PR #130
 `install.yaml`, and the alpha.4 smoke test recorded the denial
 (`.samples/alpha4-smoke-1791809703/summary.md`, "kubectl debug DENIED").
 To inspect a coxswain pod's contents use `kubectl cp` /
-`kubectl exec` from a sidecar that is part of the pod, or attach via the
-agent's own tooling; ephemeral containers are intentionally unavailable.
+`kubectl exec` from a coxswain tool proxy pod, or attach via the
+agent's own tooling; the model, egress and tool proxies are separate
+pods (no sidecars), and ephemeral containers are intentionally
+unavailable.
 
 ## `NetworkEnforced=False` with `--allow-unenforced-network`
 

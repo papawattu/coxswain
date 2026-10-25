@@ -201,6 +201,8 @@ type Workspace struct {
 	// those two keys and passes them to the fetch as a Basic-auth
 	// http.extraHeader (nothing is written or persisted).
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	GitCredentialSecret string `json:"gitCredentialSecret,omitempty"`
 }
 
@@ -561,6 +563,8 @@ type AgentConfig struct {
 	// make CreateOrUpdate's Update fail. The operator rejects the change at
 	// admission; a new secret requires a new Loop.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="endpointSecretRef is immutable (the proxy pod's spec.volumes cannot change)"
 	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
 
@@ -1276,6 +1280,12 @@ const (
 	// False when a later read shows no new unmetered request. Surfacing
 	// only: it does not hold the Loop.
 	MeteringDegradedCondition = "MeteringDegraded"
+	// SandboxNotStartingCondition (F48) is True while the sandbox pod has been
+	// Pending for several minutes with no container started (e.g. a Secret
+	// volume whose Secret does not exist: the kubelet reports it only as a
+	// FailedMount Event). It returns to False once the pod starts. Surfacing
+	// only: it does not fail the Loop.
+	SandboxNotStartingCondition = "SandboxNotStarting"
 	// BudgetReadingStaleCondition (F44) is True while the operator cannot
 	// read the model proxy's usage endpoint (consecutive failures at or past
 	// the threshold): the token and cost caps are evaluating the last

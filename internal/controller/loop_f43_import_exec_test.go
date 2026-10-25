@@ -111,11 +111,12 @@ func TestImportAgentScriptRefusesNonDescendantPin(t *testing.T) {
 		if !tc.want(code) {
 			t.Errorf("%s: exit=%d, want %s\n%s", tc.name, code, tc.desc, out)
 		}
-		if code == 0 {
+		switch code {
+		case 0:
 			if head := f43Git(t, v, "rev-parse", "HEAD"); head != tc.pin {
 				t.Errorf("%s: checked out %s, want %s", tc.name, head, tc.pin)
 			}
-		} else if code == verifyNotDescendantExit {
+		case verifyNotDescendantExit:
 			if head := f43Git(t, v, "rev-parse", "HEAD"); head != base {
 				t.Errorf("%s: a refused pin was checked out (HEAD %s)", tc.name, head)
 			}

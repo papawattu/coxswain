@@ -322,7 +322,7 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// the same container. The operator does not trust the pin either: the verify
 	// Job refuses a pin that is not a descendant of baseCommit.)
 	if done && phase == PhaseImplementing && prior.HeadCommit != "" && !commitResolves(cfg.Workspace, prior.HeadCommit) {
-		log.Printf("runner: ignoring stored result.json: headCommit %q is not a commit in the workspace repo", prior.HeadCommit)
+		log.Printf("runner: ignoring stored result.json: headCommit %q is not a workspace commit", prior.HeadCommit)
 		done = false
 	}
 	if done {

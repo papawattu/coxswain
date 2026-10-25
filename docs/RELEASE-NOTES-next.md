@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `1cad554` = PR #254); each claim cites its
+merged code on `main` (as of `4451ade` = PR #256); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -25,7 +25,11 @@ trimmed lesson text (F33, #234); a stale lessons file no longer
 survives into a later iteration (F34, #238); a pinned commit that does not
 descend from the base is refused with a new terminal `PinNotDescendant`
 reason (F43, #244); and an unmetered request or a stale usage reading is
-surfaced, not skipped silently (F44, #248).
+surfaced, not skipped silently (F44, #248). F48 (#256) added stricter
+Secret-name validation on `spec.agent.gitCredentialSecret` and
+`spec.agent.endpointSecretRef` (MaxLength 253 + DNS-1123 subdomain): a
+Loop with a malformed Secret name is now rejected at the API server —
+existing Loops are unaffected, but new ones are.
 
 ## Security fixes
 
@@ -212,6 +216,13 @@ surfaced, not skipped silently (F44, #248).
   read) is closed by this fix.
 
 ## Other changes
+
+### F48: a sandbox pod that never starts is surfaced, and a config-error start is bounded — #256
+
+- **What was wrong.** A sandbox pod stuck Pending with no container started (e.g. a missing `gitCredentialSecret`: kubelet reports FailedMount only as an Event) wedged the Loop with no condition, Event or timeout (F48, review-api P2-3).
+- **What changed.** Three decisions, all in the sandbox start path (`internal/controller/loop_s4_phase.go`): (a) a `Pending` pod with `CreateContainerConfigError` for >= 60s is a sandbox failure, bounded by the existing `sandboxInfraRetries` (2), so it fails the Loop `Failed:SandboxFailed` — with the valid-claim check first, so a claim recorded in `LastTerminationState` is not burned; (b) a `Pending` pod with no container started for >= 5m sets the new `SandboxNotStarting` condition (True) plus ONE Warning Event on the transition; it SURFACES only (a slow image pull is indistinguishable from the pod status, I49) and is cleared when the pod is no longer Pending; (c) the CRD now validates `spec.agent.gitCredentialSecret` and `spec.agent.endpointSecretRef` (MaxLength 253 + DNS-1123 subdomain pattern), so a malformed Secret name is rejected at the API server instead of surfacing only as a FailedMount Event later. A `docs/UPGRADE.md` note for the stricter validation is in the same PR (merged `4451ade` = PR #256).
+- **Scope note.** The *surface* covers every stuck shape; the *bound* covers `CreateContainerConfigError` only. A missing Secret **volume** (the `gitCredentialSecret` case) stays `ContainerCreating` with a FailedMount Event and is not bounded here — that bound needs Event read RBAC and is split to F48b (see Known issues).
+- **On upgrade.** Nothing required; the fix is in the operator. New Loops with a malformed Secret name will be rejected at the API server from now on (PR #256).
 
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
@@ -595,6 +606,9 @@ open:
   (tamper failures are still caught and still fail the Loop).
 - **F48b**: a sandbox pod stuck on a missing Secret volume shows
   `SandboxNotStarting` but is not failed.
+- **F48c**: `SandboxNotStarting` can stay True after the pod it names is
+  replaced: it is cleared only when the current pod is no longer Pending,
+  so a recreated (or replaced) pod does not clear it.
 - **F86**: a fork from another Loop's checkpoint named in the spec is not
   ownership-checked.
 - **F87(c)**: a forged `status.checkpoints` entry at the current iteration
@@ -653,3 +667,13 @@ security items above (F58, F60, F63) are the only P1 work queued.
   never deleted and never restored from, and how the restore falls back
   visibly. (Merged after the notes' "as of" line; included here so the docs
   list is not left short one entry.)
+- #257 (merged `61d12f1`): two `docs/UPGRADE.md` pointers in the "two new
+  manager flags" entry — the chart's own `--memory-writer-image` emission
+  (derived from `manager.image`, before `manager.args`; last occurrence
+  wins, so set `manager.image` instead of duplicating the flag in
+  `manager.args`) and `hack/rwx-storage.sh` as the path for clusters whose
+  default StorageClass is RWO-only (it installs a dynamic ReadWriteMany
+  class with `bindingMode: Immediate`) (PR #257).
+- #256: a `docs/UPGRADE.md` note for F48's stricter Secret-name validation
+  (`spec.agent.gitCredentialSecret`, `spec.agent.endpointSecretRef`;
+  merged `4451ade`) (PR #256).

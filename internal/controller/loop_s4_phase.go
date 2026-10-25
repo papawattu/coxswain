@@ -1171,7 +1171,7 @@ func (r *LoopReconciler) applySandboxNotStarting(ctx context.Context, loop *coxv
 		if age < sandboxStartGrace {
 			return false
 		}
-		if conditionIsTrue(loop, sandboxNotStartingCondition) {
+		if conditionTruePresent(loop, sandboxNotStartingCondition) {
 			return false // already surfaced: a fixed message, so no status write per pass
 		}
 		// The condition message is FIXED (an age in it would change every pass
@@ -1186,7 +1186,7 @@ func (r *LoopReconciler) applySandboxNotStarting(ctx context.Context, loop *coxv
 		}
 		return true
 	}
-	if conditionIsTrue(loop, sandboxNotStartingCondition) {
+	if conditionTruePresent(loop, sandboxNotStartingCondition) {
 		setCondition(loop, sandboxNotStartingCondition, metav1.ConditionFalse, "Started", "the sandbox pod is no longer Pending without a started container")
 		return true
 	}

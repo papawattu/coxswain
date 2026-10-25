@@ -2017,6 +2017,66 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	return loopUpdated, nil
 }
 
+// modelProxyHold is the D35a gate (F84): true while the Loop's model proxy pod
+// is not Ready, with the hold SURFACED as ModelProxyNotReady (condition + one
+// Warning Event on the transition) and cleared once the pod is Ready. No
+// endpoint means no proxy and no hold.
+func (r *LoopReconciler) modelProxyHold(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if loop.Spec.Agent.EndpointSecretRef == "" {
+		return false
+	}
+	proxyPod := &corev1.Pod{}
+	perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
+	notReady, why := modelProxyNotReady(proxyPod, loop, perr)
+	if !notReady {
+		clearModelProxyNotReady(loop)
+		return false
+	}
+	r.surfaceModelProxyNotReady(loop, proxyPod, why)
+	return true
+}
+
+// modelProxyNotReady reads the D35a gate's fact: the model proxy pod is not
+// Ready for this Loop, and why. A read error (a pod that does not exist yet, or
+// an apiserver error) is the same hold (fail-closed).
+func modelProxyNotReady(pod *corev1.Pod, loop *coxv1alpha1.Loop, err error) (bool, string) {
+	switch {
+	case err != nil:
+		return true, "it does not exist yet"
+	case !metav1.IsControlledBy(pod, loop):
+		return true, "it is not owned by this Loop"
+	case !isPodReady(pod):
+		if pod.Status.PodIP == "" {
+			return true, "it has no pod IP (not scheduled or not started)"
+		}
+		return true, "it is not Ready"
+	}
+	return false, ""
+}
+
+// surfaceModelProxyNotReady (F84) records the D35a hold as a condition
+// (ModelProxyNotReady, True) and emits ONE Warning Event on the transition. The
+// message is stable for a given phase/reason (no age, no counts) so a held Loop
+// does not rewrite its status every reconcile.
+func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, pod *corev1.Pod, why string) {
+	msg := fmt.Sprintf("the model proxy pod %s is not Ready: %s; the sandbox is held Suspended until it is (the model proxy is the agent's only model egress)",
+		proxyPodName(loop.Name), why)
+	_ = pod
+	was := conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition)
+	setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionTrue, "ModelProxyNotReady", msg)
+	if !was && r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "ModelProxyNotReady", "%s", msg)
+	}
+}
+
+// clearModelProxyNotReady clears a recorded hold once the proxy pod is Ready.
+func clearModelProxyNotReady(loop *coxv1alpha1.Loop) {
+	if conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
+		setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse, "Ready",
+			"the model proxy pod is Ready; the sandbox is not held for it")
+	}
+}
+
 // sandboxSuspendedByGate reports whether any of the sandbox's suspension
 // gates holds (the sandbox must be Suspended, fail-closed): the B2 restore
 // hold (R-B2 design point (b)) runs FIRST — while the workspace restore is
@@ -2066,13 +2126,12 @@ func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1
 	if observed, _ := r.enforcementStatus(ctx, loop); !observed && !r.AllowUnenforced {
 		return true
 	}
-	// D35a: the proxy pod must be Ready and owned by the Loop.
-	if loop.Spec.Agent.EndpointSecretRef != "" {
-		proxyPod := &corev1.Pod{}
-		perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
-		if perr != nil || !metav1.IsControlledBy(proxyPod, loop) || !isPodReady(proxyPod) {
-			return true
-		}
+	// D35a: the proxy pod must be Ready and owned by the Loop. F84: the hold is
+	// SURFACED (condition + one Warning Event on the transition) — the budget
+	// read treats this shape as "no reading yet" (proxy.ErrNotReady), so
+	// BudgetReadingStale cannot fire on a proxy that never comes up.
+	if r.modelProxyHold(ctx, loop) {
+		return true
 	}
 	// I42b: the egress proxy pod must be Ready and owned by the Loop when the
 	// effective policy has network allows. Same gate pattern as D35a. Fails

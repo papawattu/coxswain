@@ -73,14 +73,14 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		*offset = sandboxStartGrace - time.Minute
 		_, ch, _ := r.sandboxFailureStep(ctx, loop, false)
 		Expect(ch).To(BeFalse(), "in progress (a slow image pull looks the same): no decision")
-		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeFalse())
+		Expect(conditionTruePresent(loop, cov.SandboxNotStartingCondition)).To(BeFalse())
 		Expect(countEvents(rec, sandboxNotStartingEventReason)).To(BeZero())
 
 		*offset = sandboxStartGrace + time.Minute
 		stop, ch, _ := r.sandboxFailureStep(ctx, loop, false)
 		Expect(stop).To(BeFalse(), "surfacing only: it never stops the phase machine")
 		Expect(ch).To(BeTrue())
-		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
+		Expect(conditionTruePresent(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
 		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
 		msg := cond.Message
 		*offset = sandboxStartGrace + 2*time.Minute
@@ -96,7 +96,7 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
 		_, ch, _ = r.sandboxFailureStep(ctx, loop, false)
 		Expect(ch).To(BeTrue())
-		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeFalse())
+		Expect(conditionTruePresent(loop, cov.SandboxNotStartingCondition)).To(BeFalse())
 	})
 
 	It("treats a CreateContainerConfigError past the grace as a bounded sandbox infra failure; before it, no decision", func() {

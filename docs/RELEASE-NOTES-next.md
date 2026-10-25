@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `de44eac` = PR #253); each claim cites its
+merged code on `main` (as of `1cad554` = PR #254); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -212,6 +212,19 @@ surfaced, not skipped silently (F44, #248).
   read) is closed by this fix.
 
 ## Other changes
+
+### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
+
+- **What was wrong.** `status.checkpoints` is user-writable (the editor role, since B3), and the operator acted on it without trusting it: the retention GC would delete any VolumeSnapshot a status entry named, even one belonging to another Loop, and the lost-PVC restore could take a forged entry as its restore source (PR #254, review finding review-api P2-1).
+- **What changed.** `checkpointEntryTrusted` (in `loop_checkpoint.go`) is the single trust gate: a `status.checkpoints` entry may be acted on only if its name is exactly `checkpoint-<this loop>-iter-<n>` (n >= 0), `n == entry.Iteration`, and the VolumeSnapshot of that name carries this Loop's ownership label. The retention GC **never deletes** a snapshot for a Foreign (unowned or misnamed) entry — it only drops the untrusted entry from status and emits a Warning Event `CheckpointEntryUntrusted`, and only when the GC loop runs (i.e. when the keep-set does not already cover the whole list); a forged entry can stay in status but is never acted on. The lost-PVC restore walks from the newest entry and takes the last Trusted one; if entries exist but none is trusted it takes the visible `NoUsableCheckpoint` fallback (condition + Event), not a silent empty workspace. No RBAC change; the safety property is "never deleted / never restored from", not "always dropped from status" (merged `1cad554` = PR #254).
+- **Scope note.** F47 closes the *status* vector only: the fork path still derives its source snapshot from `spec.forkOf` and PATCHes a `fork-of` label onto it with no ownership check, so "an editor cannot read another Loop's checkpoint" is not a property this PR establishes; the `ensureCheckpoint` idempotency guard and the tamper gate's status inputs are also not yet hardened this way (PR #254).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #254).
+
+### F46: the model timeout is now wired (`spec.loop.modelTimeoutSeconds`) — #252
+
+- **What was wrong.** The runner's model timeout was documented but never set: the entrypoint left `runConfig.ModelTimeout` at its 120s default, so a slow self-hosted model had no knob to raise it (the docs said so — see the #208 and #232 docs entries above) (PR #252).
+- **What changed.** New `spec.loop.modelTimeoutSeconds` (int32, 1–3600, validated by the CRD): the operator sets `COX_MODEL_TIMEOUT=<n>s` on the agent container (only when a model endpoint exists and the field is set), and the runner entrypoint parses it (Go duration or bare seconds; absent/invalid/<=0 keeps 120s). The Sandbox container list is rewritten on every reconcile, so editing the field on a live Loop changes the timeout without a restart. The worst-case figure in the runner's comment is corrected: 4 attempts + 2+4+8s backoff = 4 × timeout + 14s (merged `96d04e6` = PR #252).
+- **On upgrade.** Nothing required; the fix is in the operator. To use the knob, set `spec.loop.modelTimeoutSeconds` on the Loop (CRD field; also in the regenerated chart CRD) — e.g. `modelTimeoutSeconds: 300` raises the per-request model timeout from 120s to 300s (PR #252).
 
 ### F45: the chart no longer renders a second (inert) VAP binding — #249
 
@@ -486,9 +499,11 @@ The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
 merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
 (D71 memory lesson cap), F33 (memory-writer audit), F34 (stale
 lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
-curator failure), F43 (the agent-chosen pin), and F44 (surfacing unmetered
-requests and stale usage reads) were closed by #229, #222, #233, #234,
-#238, #243, #241, #244, and #248. In plain words, the items still open:
+curator failure), F43 (the agent-chosen pin), F44 (surfacing unmetered
+requests and stale usage reads), F47 (untrusted checkpoint status entries),
+and F46 (the unwired model timeout) were closed by #229, #222, #233, #234,
+#238, #243, #241, #244, #248, #254, and #252. In plain words, the items still
+open:
 
 **P1 (security):**
 
@@ -503,8 +518,10 @@ requests and stale usage reads) were closed by #229, #222, #233, #234,
 
 - **F82**: F44 follow-ups — two unspecced lines and three stale stream
   comments (PR #248's run).
-- **F47**: "editor"-level users can write status fields the operator later
-  uses to delete or restore checkpoints.
+- **F47 follow-ups** (F47 itself closed by #254): the fork path still
+  derives its source snapshot from `spec.forkOf` with no ownership check,
+  and the `ensureCheckpoint` idempotency guard and the tamper gate's
+  status inputs are not yet hardened this way (PR #254's scope note).
 - **F48**: a sandbox pod that cannot start wedges the Loop with no condition
   or timeout.
 - **F49**: the "hold the sandbox while awaiting approval" rule and a
@@ -561,14 +578,17 @@ requests and stale usage reads) were closed by #229, #222, #233, #234,
 - **F81**: an envtest spec is flaky: a hard-coded ClusterIP it depends on is
   not a stable address across apiservers, so the run intermittently fails.
 
-- **F50/F45/F46/F57/F52**: small and low items — shipped samples pointing at
-  repo contents they test, an inert second admission-policy binding, the
-  runner model-timeout never wired, a checkpoint-recovery edge case, and a
-  bundle of misc items (a failed delivery counted "in flight" forever, the
-  CLI approval command writing status with no conflict retry, and more).
+- **F50/F57/F52**: small and low items — shipped samples pointing at repo
+  contents they test, a checkpoint-recovery edge case, and a bundle of misc
+  items (a failed delivery counted "in flight" forever, the CLI approval
+  command writing status with no conflict retry, and more). (F45 closed by
+  #249; F46 closed by #252.)
 - **F59**: a code comment claims a "suspicious pattern scan" exists; it
   doesn't.
 - **F61**: sample agent-policy files are not shipped.
+- **F86**: F47 follow-ups — `ensureCheckpoint`'s idempotency guard
+  (`cp.Iteration == iteration`) and the tamper gate's status inputs are not
+  yet validated like `checkpointEntryTrusted` (PR #254's scope note).
 
 - **F83**: delivered PR bodies say "no tamper evidence" even when the
   tamper check passed, because the tamper exit code is never recorded
@@ -584,14 +604,16 @@ requests and stale usage reads) were closed by #229, #222, #233, #234,
   to a host the same author names (confused deputy);
 - whether a stale usage reading should hold the Loop at its cost cap (F44);
 - whether to enable the operator NetworkPolicy by default (F45 P3-1);
-- narrowing editor write access to the two approval conditions only (F47);
+- narrowing editor write access to the two approval conditions only (F47
+  option (a); #254 implemented option (b), validate before acting — the
+  editor role is unchanged);
 - whether to reject or document as unsupported the `spec.workspace.repo`
   ssh/scp forms the delivery path can never serve.
 
 No P1 fix outstanding from the merged batch remains open; the three P1
 security items above (F58, F60, F63) are the only P1 work queued.
 
-### Docs — the four additions after #240
+### Docs — the six additions after #240
 
 - #247 (merged `3eed62c`): a new `TROUBLESHOOTING.md` section for
   `PinNotDescendant` (F43, #244) — what you see (the terminal Failed
@@ -618,3 +640,10 @@ security items above (F58, F60, F63) are the only P1 work queued.
   binding — what the stale binding is, why the default release name is
   unaffected, and the check-and-delete steps for any other release name
   (PR #253).
+- #255: a new `TROUBLESHOOTING.md` entry for the F47 Warning Event
+  `CheckpointEntryUntrusted` (#254, merged `1cad554`) — what makes a
+  `status.checkpoints` entry trusted (the exact name shape, a matching
+  iteration, and this Loop's ownership label), that an untrusted entry is
+  never deleted and never restored from, and how the restore falls back
+  visibly. (Merged after the notes' "as of" line; included here so the docs
+  list is not left short one entry.)

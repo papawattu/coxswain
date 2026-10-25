@@ -236,9 +236,9 @@ var _ = Describe("F48e: the sandbox infra count accumulates across the operator'
 				// F48e2: this used to be `Expect(sandboxName(name)).NotTo(BeEmpty())`,
 				// which cannot fail — sandboxName is string concatenation, so the
 				// assertion was vacuous. Assert what the recycle means instead: the
-				// pass after the delete produced a DIFFERENT Sandbox object. The read
-				// is from the API (the Get above fails if there is no Sandbox at all)
-				// and the UID is the apiserver's, not a name we constructed.
+				// pass after the delete produced a DIFFERENT Sandbox object. The
+				// `f48eSandbox` call below fails if there is no Sandbox at all, and
+				// the UID is the apiserver's, not a name we constructed.
 				recreated := f48eSandbox(ns, name)
 				Expect(recreated.UID).NotTo(Equal(sb.UID),
 					"the recycle deleted the failed Sandbox and created a new one (a new UID)")

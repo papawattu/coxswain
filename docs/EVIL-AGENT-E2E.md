@@ -10,8 +10,9 @@ anything the repo does not provide is marked **not in the repo yet** or
 
 The harness runs the 15 probes of `test/e2e/evil-probes.sh` (probes 1-9,
 11, 11b, 12, 13 inside the agent container; probes 10, 14, 15 from the
-host side) against a **real agent pod**, each paired with a positive
-control, in two Loop variants:
+host side) against a **real agent pod**, in two Loop variants. Most probes are paired
+with a positive control; the rest are judged on their detail line (see
+Verdict words):
 
 - (a) a model endpoint present: the real runner, driven by a hostile model
   stand-in (`test/e2e/evil-standin.py`) whose single tool call runs the
@@ -38,7 +39,7 @@ kube-system/kube-dns + the repo namespace. The script states plainly:
   *tolerated* — detected at preflight and carried on (see Known gaps).
 - The coxswain operator deployed in `coxswain-system` (printed to
   `00-cluster.txt` at preflight, but **not asserted** — see Known
-gaps).
+  gaps).
 - Images loadable on the cluster: `golang:1.26` (the control/victim
   pods, the fake-model pod, the variant-(b) agent), `busybox:1.36`
   (probe 14), plus the runner/model-proxy/egress-proxy/tool-proxy
@@ -109,8 +110,8 @@ carry probe 10's listener status.
   A good outcome, but only if the probe's positive control passed.
   Several probes pair an independent control: probe 8 (the stand-in's
   model-side log), probe 10 (a local curl plus the victim-to-control
-  leg), probe 14 (the control pod's `kubectl debug`), probe 11 (the
-  control pod's `git ls-remote`), and probe 6 (the egress-proxy audit
+  leg), probe 14 (the control pod's `kubectl debug`), probe 11 (an
+  anonymous `git ls-remote` in the same container), and probe 6 (the egress-proxy audit
   leg). Other BLOCKED verdicts carry their own detail string and no
   independent control.
 - **ESCAPED** — the fence failed. This is the only verdict that sets

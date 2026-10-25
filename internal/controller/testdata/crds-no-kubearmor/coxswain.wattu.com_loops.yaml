@@ -66,6 +66,8 @@ spec:
                       spec.volumes is immutable, so changing this field after creation would
                       make CreateOrUpdate's Update fail. The operator rejects the change at
                       admission; a new secret requires a new Loop.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                     x-kubernetes-validations:
                     - message: endpointSecretRef is immutable (the proxy pod's spec.volumes
@@ -141,11 +143,60 @@ spec:
                     - message: modelEndpoint port must be 1-65535
                       rule: self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1])
                         <= 65535
+                  tmpSizeLimit:
+                    description: |-
+                      tmpSizeLimit is the optional size limit for the agent's /tmp emptyDir
+                      volume (F5, dogfood: the original 100Mi default was too small for
+                      agentic work — the agent's pip/npm caches, build artifacts, and scratch
+                      files easily exceed it; the platform default is now 1Gi). When set, the
+                      operator uses this value instead of the platform default (1Gi). The
+                      value must be a Kubernetes resource quantity (e.g. "500Mi", "2Gi").
+                      Bounded by the agent container's ephemeral-storage limit (default 1Gi)
+                      — a tmp sizeLimit larger than that is rejected at admission.
+                      Immutable: the emptyDir sizeLimit is part of the sandbox pod spec, which
+                      is immutable after creation (same reason as endpointSecretRef).
+                    pattern: ^[0-9]+(Mi|Gi|T)?$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: tmpSizeLimit is immutable (the sandbox pod's emptyDir
+                        sizeLimit cannot change)
+                      rule: self == oldSelf
                 type: object
                 x-kubernetes-validations:
                 - message: endpointSecretRef and modelEndpoint must be set together
                     (a Loop with a model Secret must also name the model endpoint)
                   rule: has(self.endpointSecretRef) == has(self.modelEndpoint)
+              approval:
+                description: |-
+                  approval is the user's plan-approval settings (PLAN-BETA B3; PLAN.md
+                  Phase 4). The operator reads spec.approval.mode to decide whether to
+                  hold the phase machine at AwaitingApproval after Planning, and
+                  spec.approval.onReject to decide the action when the user sets
+                  PlanRejected (Replan = re-plan with the reason, Fail = terminal).
+                  An empty/zero value reads as Auto (no approval hold).
+                properties:
+                  mode:
+                    default: Auto
+                    description: |-
+                      mode selects whether the plan requires explicit approval. Auto (the
+                      default) never holds; Manual holds at AwaitingApproval until the
+                      PlanApproved condition is set.
+                    enum:
+                    - Auto
+                    - Manual
+                    type: string
+                  onReject:
+                    default: Replan
+                    description: |-
+                      onReject is the operator's action when the user sets the PlanRejected
+                      condition. Replan (default) re-enters Planning with the rejection
+                      reason fed to the next plan; Fail terminates the Loop as
+                      Failed:PlanRejected.
+                    enum:
+                    - Replan
+                    - Fail
+                    type: string
+                type: object
               budget:
                 description: |-
                   budget caps the Loop's token, active-time and derived-cost totals
@@ -207,6 +258,21 @@ spec:
                     - Fail
                     type: string
                 type: object
+              checkpoints:
+                default: BestEffort
+                description: |-
+                  checkpoints selects the checkpoint policy (D59, PLAN-BETA B1). An
+                  empty value reads as BestEffort (the CRD default): after each
+                  successful verify the operator takes a VolumeSnapshot of the workspace
+                  PVC named checkpoint-<loop>-iter-<N> when the cluster can, and
+                  otherwise sets CheckpointsAvailable=False and carries on with the A2
+                  PVC-resume. Required makes checkpoints mandatory: without a
+                  VolumeSnapshot CRD or a VolumeSnapshotClass for the PVC's CSI driver
+                  the Loop fails at start (terminal Failed:CheckpointUnavailable).
+                enum:
+                - BestEffort
+                - Required
+                type: string
               delivery:
                 description: |-
                   Delivery configures what happens to a SUCCESSFUL, VERIFIED Loop
@@ -258,6 +324,46 @@ spec:
                     - PullRequest
                     type: string
                 type: object
+              forkOf:
+                description: |-
+                  forkOf seeds this Loop from ANOTHER Loop's checkpoint (B2, PLAN-BETA /
+                  PLAN.md Phase 3; ADR-0003: a fork, not a re-task). forkOf.loop is the
+                  source Loop's name (any namespace; the operator reads the source
+                  snapshot by name in THIS Loop's namespace) and forkOf.iteration names
+                  the source checkpoint iteration. At start the operator restores this
+                  Loop's OWN workspace PVC from the source snapshot
+                  checkpoint-<loop>-iter-<N> (PVC spec.dataSource = the VolumeSnapshot);
+                  the fork then runs a normal one-shot Loop on that content: its own
+                  branch, its own deliver, its own PR. A fork is a one-shot Loop
+                  (ADR-0003: forks, not re-tasks). The source Loop may be deleted after
+                  the fork's restore: a restored PVC owns its content, not the source
+                  snapshot, so the fork is independent (the source's snapshot GC is
+                  documented and tested — the source's finalizer still deletes its
+                  snapshots in CleaningUp; the fork's PVC survives that delete because
+                  the PVC content was materialised at restore).
+                  Immutable (a fork target is a seeding decision made at creation).
+                properties:
+                  iteration:
+                    description: |-
+                      iteration is the source checkpoint's iteration (the
+                      checkpoint-<loop>-iter-<iteration> name component). Iteration 0 is
+                      a valid checkpoint (the first verify; the same lesson as B1's iter-0).
+                    minimum: 0
+                    type: integer
+                  loop:
+                    description: |-
+                      loop is the source Loop's name (the checkpoint name is
+                      checkpoint-<loop>-iter-<iteration>). Same namespace as the fork.
+                    minLength: 1
+                    type: string
+                required:
+                - iteration
+                - loop
+                type: object
+                x-kubernetes-validations:
+                - message: forkOf is immutable (it seeds the workspace PVC from the
+                    source snapshot at creation)
+                  rule: self == oldSelf
               goal:
                 description: goal is the natural-language objective for this Loop.
                 minLength: 1
@@ -269,6 +375,17 @@ spec:
                   maxIterations:
                     default: 10
                     description: maxIterations caps the plan→implement→verify cycles.
+                    minimum: 1
+                    type: integer
+                  modelTimeoutSeconds:
+                    description: |-
+                      modelTimeoutSeconds bounds ONE model request from the agent runner (F46).
+                      Absent uses the runner default (120s). The runner retries a timed-out
+                      request up to 3 more times with 2s/4s/8s backoff, so the worst case is
+                      4 x this value + 14s. Raise it for a slow self-hosted model; the
+                      operator passes it to the agent container as COX_MODEL_TIMEOUT.
+                    format: int32
+                    maximum: 3600
                     minimum: 1
                     type: integer
                   stallAction:
@@ -299,6 +416,26 @@ spec:
                 items:
                   type: string
                 type: array
+              restoreFrom:
+                description: |-
+                  restoreFrom is the ROLLBACK target (B2, PLAN-BETA / PLAN.md Phase 3):
+                  "iter-N" names the checkpoint checkpoint-<loop>-iter-<N> the operator
+                  restores the workspace PVC from. The checkpoint must EXIST (a recorded
+                  status.checkpoints entry whose VolumeSnapshot is present) and be
+                  ReadyToUse (status.boundSnapshotVolumeReadyToUse of the snapshot is
+                  true); an unknown or not-ready iter is rejected VISIBLY (a
+                  RestoreRejected condition plus an Event, never a silent ignore). The
+                  operator deletes and recreates the workspace PVC with
+                  spec.dataSource = the VolumeSnapshot, then resumes the A2 path from
+                  the restored content. Immutable (PVC dataSource is immutable): a
+                  change is rejected at admission; a different rollback target is a
+                  fork.
+                pattern: ^iter-[0-9]+$
+                type: string
+                x-kubernetes-validations:
+                - message: restoreFrom is immutable (a different rollback target is
+                    a fork)
+                  rule: self == oldSelf
               suspend:
                 description: suspend, when true, pauses the Loop at its current phase.
                 type: boolean
@@ -327,6 +464,25 @@ spec:
                       its default check image (the controller's --verify-image flag when set,
                       else a built-in Go image so `go build` / `go test` checks work out of
                       the box).
+                    type: string
+                  onVerifyFail:
+                    default: Implement
+                    description: |-
+                      onVerifyFail is the operator's action when a verify's acceptance check
+                      FAILS (PLAN-BETA B4; PLAN.md Phase 6 remainder). Implement (the
+                      default) iterates back to Implementing (the agent re-works the failing
+                      check — the alpha behaviour, unchanged). Plan sends the Loop back to
+                      Planning with the failure summary fed into the next planning prompt
+                      (reusing B3's plan-feedback channel, .coxswain/plan-feedback, written
+                      by the phase-init from the durable status field
+                      status.verify.lastFailureSummary). A re-plan still increments the
+                      iteration (the stall detector and maxIterations count iterations across
+                      re-plans — a re-plan is not a reset); with approval.mode Manual the
+                      re-plan goes through AwaitingApproval again (the new plan needs
+                      approval).
+                    enum:
+                    - Implement
+                    - Plan
                     type: string
                   preset:
                     default: go
@@ -369,6 +525,8 @@ spec:
                       samples 'samples-git-cred'); the workspace init container mounts ONLY
                       those two keys and passes them to the fetch as a Basic-auth
                       http.extraHeader (nothing is written or persisted).
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   ref:
                     description: |-
@@ -395,6 +553,79 @@ spec:
           status:
             description: status defines the observed state of Loop
             properties:
+              agent:
+                description: |-
+                  agent is the operator's record of the sandbox pod's infrastructure state
+                  (F6, dogfood finding): the attempt count for a sandbox pod that FAILED
+                  without a claim (evicted, OOMKilled, or the agent container terminated
+                  without a claim — a pod failure, not the agent's work) and the Sandbox
+                  UID the last counted failure was read from (the "one attempt per
+                  Sandbox UID" guard, exactly the I65 P1-A infraJobUID pattern). nil until
+                  the first counted sandbox failure. Written by the operator only.
+                properties:
+                  infraAttempts:
+                    description: |-
+                      infraAttempts is the number of sandbox pods the operator has counted as
+                      failed-without-a-claim in the CURRENT RUN (F6, F48g). A run is one
+                      (status.iteration, status.desiredPhase) pair: the operator recreates the
+                      Sandbox a bounded number of times (the sandboxInfraRetries cap, the
+                      controller's constant) and fails the Loop with the SandboxFailed reason
+                      once the bound is exhausted. The count is reset when the run changes (a
+                      verify iterate/re-plan, an approval advance, a restore — see
+                      infraEpisode) and when a phase claim the operator accepts ends the
+                      episode early, so a failure episode cannot consume a later run's retry
+                      budget. A retry recreate does NOT reset it: the retry is inside the run.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  infraEpisode:
+                    description: |-
+                      infraEpisode identifies the run infraAttempts belongs to, as
+                      "<iteration>/<desiredPhase>" (F48g). The operator zeroes the count when
+                      the run key changes, so an episode cannot leak into a later run — the
+                      transitions that start a new run without a phase claim (the verify
+                      iterate/re-plan, an approval advance, a rollback) are covered without a
+                      per-transition hook. empty means no episode is in progress (the count is
+                      0 and nothing has been counted since the last clear).
+                    maxLength: 64
+                    type: string
+                  infraSandboxUID:
+                    description: |-
+                      infraSandboxUID is the UID of the Sandbox whose failed pod was most
+                      recently counted into infraAttempts (F6, the I65 P1-A UID guard): the
+                      operator increments infraAttempts only when the failing Sandbox's UID
+                      differs from the one recorded here. A recreated Sandbox has a new UID,
+                      so its first counted failure IS counted (the retry), while a re-read of
+                      the SAME failing Sandbox does not double-count. An empty value means no
+                      attempt has been counted yet.
+                    type: string
+                type: object
+              approval:
+                description: |-
+                  approval is the operator's record of the plan-approval state (B3,
+                  PLAN-BETA / PLAN.md Phase 4). lastRejectionReason is the most recent
+                  rejection reason the user set (via `cox reject --reason`), DURABLE across
+                  the Replan transition: the PlanRejected condition is CLEARED on the
+                  same reconcile the operator re-enters Planning (the re-plan starts
+                  fresh), but the phase-init container (the operator's sole writer of the
+                  .coxswain/plan-feedback file) must still carry the reason into the next
+                  planning prompt. Writing the reason to the durable status field (not the
+                  transient condition) is what makes the handoff survive the clear. Set by
+                  the operator's Replan branch; the phase-init reads it. The runner never
+                  writes it (ADR-0004: the operator is the sole writer of status). +optional
+                properties:
+                  lastRejectionReason:
+                    description: |-
+                      lastRejectionReason is the most recent rejection reason the user set
+                      (the PlanRejected condition's message, "Rejected: <reason>"). It is
+                      DURABLE: set by the operator's Replan branch on the reconcile that
+                      re-enters Planning, and read by the phase-init container to write
+                      .coxswain/plan-feedback (the runner's planning-prompt read channel). The
+                      PlanRejected condition is cleared on the same reconcile (the re-plan
+                      starts fresh), so the condition alone would not survive to the
+                      phase-init — this field does. Empty before the first rejection. +optional
+                    type: string
+                type: object
               baseCommit:
                 description: |-
                   baseCommit is the SHA resolved from spec.workspace.ref at Loop start and
@@ -428,6 +659,13 @@ spec:
                       completionTokens is the accumulated completion-token total across
                       boot-ID changes.
                     format: int64
+                    type: integer
+                  consecutiveReadFailures:
+                    description: |-
+                      consecutiveReadFailures counts usage reads that failed since the last
+                      good one (F44). At or past the operator's threshold the
+                      BudgetReadingStale condition is set; a good read resets it to 0.
+                    format: int32
                     type: integer
                   costUsd:
                     description: |-
@@ -486,6 +724,15 @@ spec:
                       counter from the proxy (item 2).
                     format: int64
                     type: integer
+                  lastUsageReadAt:
+                    description: |-
+                      lastUsageReadAt is when the operator last SUCCESSFULLY read the model
+                      proxy's usage endpoint (F44). The token and cost caps decide on the
+                      last successful read, so a stale value here means "the caps are
+                      evaluating old numbers" — the absence of a cap firing is then not
+                      evidence that usage is low. Empty before the first good read.
+                    format: date-time
+                    type: string
                   promptTokens:
                     description: |-
                       promptTokens is the accumulated prompt-token total across boot-ID
@@ -504,6 +751,100 @@ spec:
                     format: int64
                     type: integer
                 type: object
+              checkpoint:
+                description: |-
+                  checkpoint is the operator's record of the LATEST checkpoint taken
+                  after a successful verify (B1, PLAN-BETA). nil until the first
+                  successful verify has taken one (or is being taken). It is the restore
+                  point B2's PVC-recovery path reads. Same shape as the entries of
+                  status.checkpoints (the latest entry).
+                properties:
+                  at:
+                    description: |-
+                      at is the operator's record of when the snapshot was taken (the
+                      operator's clock, set when the snapshot object is recorded).
+                    format: date-time
+                    type: string
+                  iteration:
+                    description: |-
+                      iteration is the 1-based iteration the checkpoint was taken at (the
+                      iteration whose verify just succeeded).
+                    type: integer
+                  milestone:
+                    description: |-
+                      milestone is true when the checkpoint is retained beyond the
+                      last-3 window: a milestone is a checkpoint of a SUCCESSFUL verify
+                      (PLAN.md Phase 3: "the last 3 plus all milestone (successful-verify)
+                      checkpoints"). In B1 every checkpoint is taken after a successful
+                      verify, so every checkpoint is a milestone and nothing is GC'd — the
+                      milestone flag is explicit in the API so B2's restore/rollback/fork
+                      can distinguish a plain recent checkpoint from one the user is likely
+                      to want back.
+                    type: boolean
+                  name:
+                    description: |-
+                      name is the VolumeSnapshot's name: checkpoint-<loop>-iter-<iteration>
+                      (B1). It is unique per Loop (iteration numbers are never reused), so
+                      the name is the operator's record of what exists on the cluster.
+                    minLength: 1
+                    type: string
+                required:
+                - at
+                - iteration
+                - milestone
+                - name
+                type: object
+              checkpoints:
+                description: |-
+                  checkpoints is the status list of every checkpoint the operator has
+                  taken for this Loop (B1, PLAN-BETA). It carries the retention record:
+                  the last 3 plus every milestone (successful-verify) checkpoint; the
+                  rest are GC'd (their VolumeSnapshots deleted). Written by the operator
+                  only; the agent has no write path (ADR-0004).
+                items:
+                  description: |-
+                    CheckpointStatus is one VolumeSnapshot the operator took of the Loop's
+                    workspace PVC after a successful verify (B1, PLAN-BETA). The snapshot
+                    outlives the sandbox pod and is the durability record behind
+                    status.checkpoint (the latest).
+                  properties:
+                    at:
+                      description: |-
+                        at is the operator's record of when the snapshot was taken (the
+                        operator's clock, set when the snapshot object is recorded).
+                      format: date-time
+                      type: string
+                    iteration:
+                      description: |-
+                        iteration is the 1-based iteration the checkpoint was taken at (the
+                        iteration whose verify just succeeded).
+                      type: integer
+                    milestone:
+                      description: |-
+                        milestone is true when the checkpoint is retained beyond the
+                        last-3 window: a milestone is a checkpoint of a SUCCESSFUL verify
+                        (PLAN.md Phase 3: "the last 3 plus all milestone (successful-verify)
+                        checkpoints"). In B1 every checkpoint is taken after a successful
+                        verify, so every checkpoint is a milestone and nothing is GC'd — the
+                        milestone flag is explicit in the API so B2's restore/rollback/fork
+                        can distinguish a plain recent checkpoint from one the user is likely
+                        to want back.
+                      type: boolean
+                    name:
+                      description: |-
+                        name is the VolumeSnapshot's name: checkpoint-<loop>-iter-<iteration>
+                        (B1). It is unique per Loop (iteration numbers are never reused), so
+                        the name is the operator's record of what exists on the cluster.
+                      minLength: 1
+                      type: string
+                  required:
+                  - at
+                  - iteration
+                  - milestone
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
               conditions:
                 description: |-
                   conditions represent the current state of the Loop resource.
@@ -702,6 +1043,16 @@ spec:
                 - Paused
                 - CleaningUp
                 type: string
+              planAttempt:
+                default: 0
+                description: |-
+                  planAttempt is the 1-based count of Planning runs (incremented on
+                  every re-entry to Planning: a rejection re-plan or an onVerifyFail=Plan
+                  re-plan). The runner echoes it from .coxswain/plan-attempt into its
+                  claim; advancePhaseFromClaim ignores a claim whose planAttempt does not
+                  match status.planAttempt, so a stale Planning success claim from a prior
+                  attempt cannot satisfy the new Planning phase (I42b).
+                type: integer
               policy:
                 description: |-
                   policy is the operator's record of the effective AgentPolicy for the
@@ -770,6 +1121,17 @@ spec:
                       lastResultStatus is the claim's status (success/blocked) for the last
                       phase run.
                     type: string
+                  lessonsAvailable:
+                    description: |-
+                      lessonsAvailable (P5b, PLAN-PHASE5.md: "the claim carries only a
+                      lessonsAvailable boolean (present on disk)") is the runner's signal that
+                      it wrote .coxswain/lessons.json on the workspace volume for this run. The
+                      lessons FILE is the transport (a workspace file, not the 4096-byte claim);
+                      this boolean is the only lesson-related thing that rides the claim. The
+                      memory-writer gate reads it: the operator creates the memory-writer Job
+                      only when the Loop terminated with lessonsAvailable true (an old terminal
+                      Loop with no lessons file must not get a retroactive write).
+                    type: boolean
                   observedGeneration:
                     description: |-
                       observedGeneration is the spec generation the pin the operator read the
@@ -792,6 +1154,14 @@ spec:
                     - Paused
                     - CleaningUp
                     type: string
+                  planAttempt:
+                    description: |-
+                      planAttempt is the claim's planAttempt (the re-plan counter the runner
+                      read from .coxswain/plan-attempt; 0 for the first plan). Including this
+                      in progressEqual means a re-plan claim (same phase, iteration, status
+                      but a new planAttempt) triggers a progress write, which refreshes
+                      lastActivityTime on the claim-driven advance.
+                    type: integer
                 type: object
               stallHistory:
                 description: |-
@@ -885,11 +1255,22 @@ spec:
                       lingering, the reconcile re-running) does not double-count. An empty
                       value means no attempt has been counted yet.
                     type: string
+                  iteration:
+                    description: |-
+                      iteration is the Loop iteration the verify ran at (recorded when the
+                      verify outcome is applied). The checkpoint for this verify is named
+                      checkpoint-<loop>-iter-<iteration>. The operator records it so the
+                      checkpoint step can key off the recorded outcome (not the current
+                      iteration, which may have been incremented on the iterate path).
+                      nil means no completed verify has been recorded yet (iteration 0 is a
+                      valid recorded value, so an int with omitempty would be ambiguous).
+                    format: int32
+                    type: integer
                   jobName:
                     description: |-
-                      jobName is the verify Job the evidence came from (D24). Recording it (and
-                      the attempt) means evidence from a previous Job cannot be reused for the
-                      current verifiedCommit.
+                      jobName is reserved and not currently written. The binding that keeps a
+                      previous Job's evidence from being reused is the operator's read of the
+                      verify Job pod filtered by the current Job's UID (D24).
                     type: string
                   lastCheckResults:
                     description: |-
@@ -897,11 +1278,35 @@ spec:
                       (one entry per acceptance check, in order) to feed forward (B3). A nil entry
                       means that check did not run (I14 NotRun); a non-nil 0 means it ran and
                       passed. B3 distinguishes the two.
+
+                      The operator records a still-running or never-run check as the -1 sentinel
+                      (the API server rejects a nil element): -1 means "no exit code yet" — the
+                      check is still running, or it was not in the pod status at all — and is NOT
+                      a pass. The B1 milestone check treats any non-zero entry (including -1) as
+                      "the verify did not pass", so a -1 entry never flips a checkpoint into a
+                      milestone.
                     items:
                       format: int32
                       type: integer
                     type: array
                     x-kubernetes-list-type: atomic
+                  lastFailureSummary:
+                    description: |-
+                      lastFailureSummary is the DURABLE operator summary of the most recent
+                      FAILED verify check (PLAN-BETA B4; PLAN.md Phase 6 remainder). It is set
+                      by the operator when a verify's acceptance check fails AND
+                      spec.verify.onVerifyFail is Plan (the re-plan action): the phase-init
+                      container reads it to write .coxswain/plan-feedback (reusing B3's
+                      plan-feedback channel — the same file the user's rejection reason rides
+                      in) so the next planning prompt addresses the failure. It is CLEARED when
+                      the Loop leaves the re-plan (a verify succeeds, or a check fails again
+                      with a fresh summary overwriting the prior — the operator sets it fresh
+                      on every failed verify, so a stale summary from a prior iteration never
+                      leaks into a later plan). An empty value means no failed-verify summary
+                      to feed (the plan-feedback file is removed, the same as B3's empty
+                      rejection reason). The operator is the sole writer (ADR-0004); the
+                      runner never writes status.
+                    type: string
                   tamperExitCode:
                     description: |-
                       tamperExitCode is the tamper-check init container's exit code. A NON-NIL
@@ -913,12 +1318,20 @@ spec:
                       the current verifiedCommit counts.
                     format: int32
                     type: integer
+                  tamperJobUID:
+                    description: |-
+                      tamperJobUID is the UID of the verify Job whose pod produced
+                      tamperExitCode (F83): provenance for the record. The tamper DECISION reads
+                      the verify Job's pod itself (verifyOutcome), never this status, so a
+                      status write cannot fail a Loop (F83c).
+                    type: string
                   verifiedCommit:
                     description: |-
                       verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
-                      operator records it from the branch head it resolved itself at Verifying
-                      start. Evidence that names a different verifiedCommit (e.g. left over from a
-                      previous iteration's Job) is treated as no evidence (D24).
+                      operator copies the pin it wrote on entering Verifying
+                      (status.currentVerify.verifiedCommit). Evidence that names a different
+                      verifiedCommit (e.g. left over from a previous iteration's Job) is treated
+                      as no evidence (D24).
                     type: string
                 type: object
             type: object

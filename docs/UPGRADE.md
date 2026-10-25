@@ -168,6 +168,15 @@ install is not `config/default`, set it. Set `--memory-storage-class` to a
 ReadWriteMany-capable class if your cluster's default StorageClass does not
 support ReadWriteMany.
 
+**For Helm installs:** the chart also emits `--memory-writer-image`
+derived from `manager.image` (before `manager.args`), so if you put it in
+`manager.args` as well it appears twice and the last occurrence wins. Set
+`manager.image` instead, and leave it out of `manager.args` (see the note in
+`dist/chart/values.yaml`). For `--memory-storage-class`, `hack/rwx-storage.sh`
+installs a dynamic ReadWriteMany StorageClass (with `bindingMode: Immediate`,
+so a memory PVC cannot sit unbound under `WaitForFirstConsumer`) on a cluster
+whose default class is RWO-only — point `--memory-storage-class` at it.
+
 ### The agent NetworkPolicy is always created
 
 The operator now always creates the `<loop>-agent-netpol` NetworkPolicy,

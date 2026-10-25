@@ -550,6 +550,39 @@ exit 0
 `, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit)
 }
 
+// verifyNotDescendantExit is the import-agent script's exit status when the
+// pinned commit is NOT a descendant of baseCommit (F43). Distinct from a git
+// failure (any other non-zero), which stays an infra failure.
+const verifyNotDescendantExit = 97
+
+// importAgentScript builds the import-agent init's sh script. It fetches the
+// agent's pinned commit from the read-only workspace PVC, REFUSES a pin that is
+// not a descendant of baseCommit (F43: the pin is the runner's claim, shape-
+// checked only; the tamper diff is tree-to-tree and would accept any commit
+// reachable in the agent's repo, including pre-existing history), and checks
+// the commit out. `git merge-base --is-ancestor` exits 0 (ancestor), 1 (not),
+// anything else (error); only 1 maps to verifyNotDescendantExit.
+func importAgentScript(baseCommit, verifyCommit string) string {
+	return fmt.Sprintf(`
+set -e
+cd /verify
+git -c core.hooksPath=/dev/null -c protocol.file.allow=always fetch --no-tags file:///agent-src/.git %[2]s
+if git -c core.hooksPath=/dev/null merge-base --is-ancestor %[1]s %[2]s; then
+  :
+else
+  rc=$?
+  if [ "$rc" -eq 1 ]; then
+    echo "import-agent: pinned commit is not a descendant of baseCommit"
+    exit %[3]d
+  fi
+  echo "import-agent: git merge-base failed (exit $rc)"
+  exit 2
+fi
+git -c core.hooksPath=/dev/null checkout --detach %[2]s
+echo "import-agent ok"
+`, shellQuote(baseCommit), shellQuote(verifyCommit), verifyNotDescendantExit)
+}
+
 // buildVerifyJobSpec builds the verify Job's spec: the init containers in
 // evidence order + the no-op main container + restartPolicy Never +
 // backoffLimit 0 (B3b: exactly one run).
@@ -615,13 +648,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	// enters the Job, and it imports the verified COMMIT (not the working
 	// tree) — so the tamper check and the acceptance checks operate on the
 	// SAME tree (the checked-out verifiedCommit), closing the tamper bypass.
-	importScript := fmt.Sprintf(`
-set -e
-cd /verify
-git -c core.hooksPath=/dev/null -c protocol.file.allow=always fetch --no-tags file:///agent-src/.git %s
-git -c core.hooksPath=/dev/null checkout --detach %s
-echo "import-agent ok"
-`, shellQuote(verifyCommit), shellQuote(verifyCommit))
+	importScript := importAgentScript(baseCommit, verifyCommit)
 	importCt := corev1.Container{
 		Name:            verifyImportAgentInit,
 		Image:           baseImage,
@@ -1060,6 +1087,10 @@ const (
 	// number of times (status.verifyInfraAttempts), then fails the Loop with
 	// the distinct VerifyInfraFailed reason.
 	verifyInfraFailed
+	// verifyNotDescendant: the import-agent init refused the pinned commit
+	// because it is not a descendant of baseCommit (F43). Terminal, like
+	// tamper: the pin is the agent's claim and cannot be an honest one.
+	verifyNotDescendant
 )
 
 // verifyOutcome reads the pod's init statuses and returns the outcome. A
@@ -1099,6 +1130,10 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool) (int, bool, 
 		ics := &pod.Status.InitContainerStatuses[j]
 		if ics.Name != verifyCloneBaseInit && ics.Name != verifyImportAgentInit {
 			continue
+		}
+		if ics.State.Terminated != nil && ics.Name == verifyImportAgentInit &&
+			ics.State.Terminated.ExitCode == verifyNotDescendantExit {
+			return verifyNotDescendant, false, ics.Name, ics.State.Terminated.ExitCode
 		}
 		if ics.State.Terminated != nil && ics.State.Terminated.ExitCode != 0 {
 			return verifyInfraFailed, false, ics.Name, ics.State.Terminated.ExitCode
@@ -1457,6 +1492,23 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
 			return true, false
 		}
+	case verifyNotDescendant:
+		// F43: the pinned commit does not descend from baseCommit. Terminal and
+		// distinct from TamperedVerify / VerifyInfraFailed (no retry: a re-run
+		// would import the same pin).
+		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
+			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+				PinNotDescendantReason, "the pinned commit is not a descendant of baseCommit (the runner's headCommit claim was refused)")
+			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+			bumpLoopCompletion("failed", "pin_not_descendant")
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, PinNotDescendantReason,
+					"the pinned commit %s is not a descendant of baseCommit %s; failing the Loop",
+					loop.Status.CurrentVerify.VerifiedCommit, loop.Status.BaseCommit)
+			}
+			return true, false
+		}
 	case verifyTampered:
 		// The B2 tamper gate is the authority (it runs every reconcile and
 		// flips to Failed:TamperedVerify). Belt-and-suspenders: if it has not
@@ -1483,7 +1535,7 @@ func bumpVerifyResult(outcome int) {
 	switch outcome {
 	case verifySucceeded:
 		verifyResultsTotal.WithLabelValues("pass").Inc()
-	case verifyIterate, verifyTampered:
+	case verifyIterate, verifyTampered, verifyNotDescendant:
 		verifyResultsTotal.WithLabelValues("fail").Inc()
 	case verifyInfraFailed:
 		verifyResultsTotal.WithLabelValues("infra").Inc()

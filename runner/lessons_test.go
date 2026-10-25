@@ -167,6 +167,22 @@ func TestWriteLessonsFileEmptyNoFile(t *testing.T) {
 	}
 }
 
+// TestWriteLessonsFileRemovesStale (F34 P3-3): a lessons.json left by an
+// earlier iteration is removed when this run proposes nothing, so the
+// operator does not persist the stale proposal.
+func TestWriteLessonsFileRemovesStale(t *testing.T) {
+	ws := t.TempDir()
+	writeLessonsFile(ws, []string{"an old lesson"})
+	path := filepath.Join(ws, resultDirName, lessonsFileName)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("setup: first write produced no file: %v", err)
+	}
+	writeLessonsFile(ws, nil)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stale lessons.json survived an empty proposal (err=%v)", err)
+	}
+}
+
 // TestWriteLessonsFileNonFatal: a write failure (a read-only dir) does not
 // panic or return (the function is non-fatal by design — ADR-0004: a failed
 // memory write does not fail the Loop; the file simply is absent).

@@ -1,6 +1,9 @@
 package runner
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,31 +138,69 @@ func TestMemoryPromptIsSortedAndBounded(t *testing.T) {
 	}
 }
 
-// TestMemorySectionDroppedWhenDirTooLarge: a memory dir larger than
-// memoryPromptMaxBytes is dropped entirely (the runner must not blow the
-// model's context). The prompt falls back to the no-memory baseline.
-func TestMemorySectionDroppedWhenDirTooLarge(t *testing.T) {
+// TestMemorySectionStopsAtCapWholeFilesAndWarns (F32 P2-4): a memory dir whose
+// total exceeds memoryPromptMaxBytes keeps the files that fit, WHOLE, omits the
+// rest, and logs a warning; it no longer drops the whole section silently.
+func TestMemorySectionStopsAtCapWholeFilesAndWarns(t *testing.T) {
+	var logBuf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(old)
+
 	ws := t.TempDir()
-	// A single file that fits memoryFileMaxBytes (so it is included in the
-	// build) but a dir whose TOTAL exceeds memoryPromptMaxBytes: 40 files x
-	// 512B = 20480B > 16384B.
-	for i := range 40 {
-		name := filepath.Join(ws, resultDirName, memoryDir)
-		_ = os.MkdirAll(name, 0o755)
-		f := string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + ".lesson"
-		if err := os.WriteFile(filepath.Join(name, f), make([]byte, memoryFileMaxBytes), 0o644); err != nil {
+	dir := filepath.Join(ws, resultDirName, memoryDir)
+	_ = os.MkdirAll(dir, 0o755)
+	const n = 20 // 20 x ~1000B = ~20 KB > 16 KiB
+	for i := range n {
+		body := strings.Repeat(string(rune('a'+i)), 1000)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%02d", i)), []byte(body), 0o644); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 	}
-	// The prompt is the no-memory baseline PLUS P5b's lessons section (the
-	// lessons transport is always present; the memory section is what is
-	// dropped when the dir is too large).
-	wantImpl := "You are in the IMPLEMENTING phase. Use your shell tool to make the goal's changes in the workspace. " +
-		"Run the acceptance checks to confirm your work. " +
-		"Your plan lives in .coxswain/PLAN.md; do not create a root PLAN.md. " +
-		"End your reply with a summary of the files you changed and the verification you ran.\n\nGOAL:\n" +
-		"do the thing" + lessonsPromptSection()
-	if got := implementingPrompt(ws, "do the thing"); got != wantImpl {
-		t.Fatalf("prompt with an oversized memory dir is not the no-memory baseline + lessons section:\n%s", got)
+	got := readMemorySection(ws)
+	if got == "" {
+		t.Fatal("the section was dropped wholesale; it must keep the files that fit")
+	}
+	if len(got) > memoryPromptMaxBytes+200 { // + the header
+		t.Fatalf("section is %d bytes, over the cap %d", len(got), memoryPromptMaxBytes)
+	}
+	if !strings.Contains(got, "-- f00:") {
+		t.Error("the first file is missing")
+	}
+	if strings.Contains(got, "-- f19:") {
+		t.Error("the last file fit; the dir should have been cut at the cap")
+	}
+	// whole files only: every included file carries its full 1000 bytes
+	included := 0
+	for i := range n {
+		if strings.Contains(got, fmt.Sprintf("-- f%02d:", i)) {
+			included++
+			if !strings.Contains(got, strings.Repeat(string(rune('a'+i)), 1000)) {
+				t.Errorf("file f%02d is included but cut", i)
+			}
+		}
+	}
+	if included == 0 || included == n {
+		t.Errorf("included %d of %d files; want some but not all", included, n)
+	}
+	if !strings.Contains(logBuf.String(), "memory section truncated") {
+		t.Errorf("the truncation was not logged: %q", logBuf.String())
+	}
+}
+
+// TestMemoryFileCapFitsAWriterLesson (F32 P2-3): the reader's per-file cap is
+// >= 4 bytes per rune of the writer's 500-rune lesson cap.
+func TestMemoryFileCapFitsAWriterLesson(t *testing.T) {
+	if memoryFileMaxBytes < 4*500 {
+		t.Fatalf("memoryFileMaxBytes=%d < 4*500: the reader would cut a lesson the writer accepted", memoryFileMaxBytes)
+	}
+	ws := t.TempDir()
+	lesson := strings.Repeat("é", 500)  // 500 runes, 1000 bytes
+	lesson4 := strings.Repeat("😀", 500) // 500 runes, 2000 bytes
+	writeMemoryFile(t, ws, "a", lesson)
+	writeMemoryFile(t, ws, "b", lesson4)
+	got := readMemorySection(ws)
+	if !strings.Contains(got, lesson) || !strings.Contains(got, lesson4) {
+		t.Fatal("a 500-rune lesson was cut by the reader's per-file cap")
 	}
 }

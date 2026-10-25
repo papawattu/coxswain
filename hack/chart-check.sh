@@ -9,8 +9,10 @@
 #    release-namespace templating, but must not drop a resource the
 #    kustomize install ships).
 #
-# It runs offline (no kind, no cluster) so CI can run it before a helm
-# binary exists in the image (it only needs helm + go + python3).
+# It runs offline (no kind, no cluster; it only needs helm + go + python3).
+# NOTE: no workflow runs it yet. It is a manual `make chart-check` until the
+# owner lands docs/proposals/test-chart.yml.proposed (workflow edits are an
+# owner push), so a regenerated chart is only caught if someone runs it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -85,5 +87,51 @@ if missing:
 for x in extra:
     print("  (chart-only, expected: release-namespace templating)", x)
 EOF
+
+echo "=== second render at a non-default release name/namespace (F45) ==="
+# A binding whose policyName matches no VAP is accepted by the API server and
+# is silently inert; a cluster-scoped object carrying a namespace is ignored.
+# Both only show at a release name other than "coxswain", so render one.
+RENDERED2="$(mktemp)"
+trap 'rm -f "${BUILD_ERR:-}" "${RENDERED:-}" "${RENDERED2:-}"' EXIT
+helm template my-cox "$ROOT/dist/chart" --namespace ops > "$RENDERED2"
+python3 - "$RENDERED2" <<'PYEOF'
+import sys, yaml
+from collections import Counter
+
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1]).read()) if d]
+# A SUBSET: the cluster-scoped kinds this chart renders today. A new
+# cluster-scoped kind in a future template must be added here.
+CLUSTER_SCOPED = {
+    'Namespace', 'ClusterRole', 'ClusterRoleBinding', 'CustomResourceDefinition',
+    'ValidatingAdmissionPolicy', 'ValidatingAdmissionPolicyBinding',
+}
+bad = []
+vaps = {d['metadata']['name'] for d in docs if d.get('kind') == 'ValidatingAdmissionPolicy'}
+for d in docs:
+    if d.get('kind') == 'ValidatingAdmissionPolicyBinding':
+        pn = d['spec']['policyName']
+        if pn not in vaps:
+            bad.append("binding %s names policy %s, not a VAP in this render (%s)" % (d['metadata']['name'], pn, sorted(vaps)))
+dups = [k for k, n in Counter((d['kind'], d['metadata']['name'], d['metadata'].get('namespace', '')) for d in docs).items() if n > 1]
+for k in dups:
+    bad.append("duplicate object in one render: %s" % (k,))
+for d in docs:
+    if d.get('kind') in CLUSTER_SCOPED and 'namespace' in d['metadata']:
+        bad.append("cluster-scoped %s/%s carries metadata.namespace=%s" % (d['kind'], d['metadata']['name'], d['metadata']['namespace']))
+# F45's outcome is ONE effective binding: a consistent second VAP+binding pair
+# would resolve and not collide, but is the same defect in a quieter form.
+bindings = [d for d in docs if d.get('kind') == 'ValidatingAdmissionPolicyBinding']
+if len(bindings) != 1:
+    bad.append("expected exactly 1 ValidatingAdmissionPolicyBinding, found %d: %s" % (len(bindings), [b['metadata']['name'] for b in bindings]))
+if not vaps:
+    bad.append("no ValidatingAdmissionPolicy in the render (the guard would pass vacuously)")
+if bad:
+    print("FAIL: non-default-release render:")
+    for b in bad:
+        print("   ", b)
+    sys.exit(1)
+print("OK: %d objects; every VAP binding names a VAP in the render; no duplicates; no namespaced cluster-scoped object" % len(docs))
+PYEOF
 
 echo "chart-check: PASS"

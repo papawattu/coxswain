@@ -201,6 +201,8 @@ type Workspace struct {
 	// those two keys and passes them to the fetch as a Basic-auth
 	// http.extraHeader (nothing is written or persisted).
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	GitCredentialSecret string `json:"gitCredentialSecret,omitempty"`
 }
 
@@ -273,10 +275,15 @@ type VerifyConfig struct {
 // (ADR-0005 D14). The values are kubelet-recorded container exit codes from
 // the verify Job's pod, never result.json claims.
 //
-// Integrity invariant (ADR-0005 D12): only the manager role may write
-// loops/status; it holds this verify evidence. The scaffolded loop_editor_role
-// and loop_admin_role grant loops/status `get` only, so today nothing but the
-// operator can set these fields. Keep it that way.
+// Integrity note (ADR-0005 D12, corrected by F47): loops/status is NOT
+// operator-only. The editor role grants update/patch on it so cox approve and
+// cox reject can PUT the object, so anyone bound to that role can write any
+// status field. The operator writes valid values, and every consumer that ACTS
+// on a status value must validate it first: the checkpoint GC and the lost-PVC
+// restore check the name shape and that the VolumeSnapshot carries this Loop's
+// label before deleting or restoring from it. Other consumers (e.g. the tamper
+// gate's inputs) are not yet hardened this way; narrowing the editor role is an
+// owner decision.
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
 	// operator records it from the branch head it resolved itself at Verifying
@@ -433,6 +440,16 @@ type LoopSettings struct {
 	// +optional
 	StallAfter *int32 `json:"stallAfter,omitempty"`
 
+	// modelTimeoutSeconds bounds ONE model request from the agent runner (F46).
+	// Absent uses the runner default (120s). The runner retries a timed-out
+	// request up to 3 more times with 2s/4s/8s backoff, so the worst case is
+	// 4 x this value + 14s. Raise it for a slow self-hosted model; the
+	// operator passes it to the agent container as COX_MODEL_TIMEOUT.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	ModelTimeoutSeconds *int32 `json:"modelTimeoutSeconds,omitempty"`
+
 	// stallAction is the action taken when the stall detector fires.
 	// +kubebuilder:validation:Enum=Fail;Pause;Continue
 	// +kubebuilder:default=Fail
@@ -561,6 +578,8 @@ type AgentConfig struct {
 	// make CreateOrUpdate's Update fail. The operator rejects the change at
 	// admission; a new secret requires a new Loop.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="endpointSecretRef is immutable (the proxy pod's spec.volumes cannot change)"
 	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
 
@@ -1180,6 +1199,20 @@ type BudgetStatus struct {
 	// reconcile does not add the pause's duration to activeSeconds.
 	// +optional
 	LastActiveStamp *metav1.Time `json:"lastActiveStamp,omitempty"`
+
+	// lastUsageReadAt is when the operator last SUCCESSFULLY read the model
+	// proxy's usage endpoint (F44). The token and cost caps decide on the
+	// last successful read, so a stale value here means "the caps are
+	// evaluating old numbers" — the absence of a cap firing is then not
+	// evidence that usage is low. Empty before the first good read.
+	// +optional
+	LastUsageReadAt *metav1.Time `json:"lastUsageReadAt,omitempty"`
+
+	// consecutiveReadFailures counts usage reads that failed since the last
+	// good one (F44). At or past the operator's threshold the
+	// BudgetReadingStale condition is set; a good read resets it to 0.
+	// +optional
+	ConsecutiveReadFailures int32 `json:"consecutiveReadFailures,omitempty"`
 }
 
 // StallEntry is one verify-failure iteration's record in status.stallHistory
@@ -1255,6 +1288,25 @@ const (
 	// backend timed out after bounded retries. It is set back to True when
 	// a subsequent claim succeeds (the model recovered).
 	ModelAvailableCondition = "ModelAvailable"
+	// MeteringDegradedCondition (F44) is True while the model proxy is
+	// forwarding requests it could not meter (a response without a parseable
+	// usage object, e.g. an upstream that ignores include_usage). Those
+	// requests are NOT counted toward the token or cost caps. It returns to
+	// False when a later read shows no new unmetered request. Surfacing
+	// only: it does not hold the Loop.
+	MeteringDegradedCondition = "MeteringDegraded"
+	// SandboxNotStartingCondition (F48) is True while the sandbox pod has been
+	// Pending for several minutes with no container started (e.g. a Secret
+	// volume whose Secret does not exist: the kubelet reports it only as a
+	// FailedMount Event). It returns to False once the pod starts. Surfacing
+	// only: it does not fail the Loop.
+	SandboxNotStartingCondition = "SandboxNotStarting"
+	// BudgetReadingStaleCondition (F44) is True while the operator cannot
+	// read the model proxy's usage endpoint (consecutive failures at or past
+	// the threshold): the token and cost caps are evaluating the last
+	// successful reading, so they cannot fire on new spend. It returns to
+	// False on the next good read. Surfacing only: it does not hold the Loop.
+	BudgetReadingStaleCondition = "BudgetReadingStale"
 	// AgentFailedCondition (F6, dogfood finding) is True while the operator
 	// is deciding what to do about a sandbox pod that FAILED without a phase
 	// claim (evicted, OOMKilled, or the agent container terminated without a
@@ -1263,6 +1315,9 @@ const (
 	// pod.status.reason / pod condition reason when set, falling back to the
 	// container's termination reason) and its message carries the kubelet
 	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi").
+	// F48: it is also set, with reason CreateContainerConfigError, when a
+	// container NEVER STARTED because the kubelet could not configure it; the
+	// message then says "has not started (waiting: ...)", not "terminated".
 	// It is set to False / Recovered once the Loop advances past the failure
 	// (a fresh phase claim arrives) and removed once the bounded retry is
 	// exhausted (the distinct SandboxFailed Failed-condition carries the

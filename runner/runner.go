@@ -81,9 +81,11 @@ const (
 
 	// I89: bounded retry for a model request that times out or returns a
 	// transport error. The backoff is exponential with a base of
-	// defaultModelRetryBackoff (2s), so the worst-case total wait for the
-	// default (3 retries) is 120s * 3 + 2s + 4s = 370s, well under the old
-	// 10-minute single-shot timeout.
+	// defaultModelRetryBackoff (2s) and defaultModelRetries retries, i.e. 4
+	// attempts and 2s+4s+8s of backoff, so the worst-case total wait for the
+	// default is 4*120s + 14s = 494s (F46: this said 370s), still under the
+	// old 10-minute single-shot timeout. COX_MODEL_TIMEOUT
+	// (spec.loop.modelTimeoutSeconds) overrides the 120s.
 	defaultModelRetries      = 3
 	defaultModelRetryBackoff = 2 * time.Second
 
@@ -162,7 +164,10 @@ type Result struct {
 	// operator pins it to status.currentVerify.verifiedCommit on the
 	// Implementing -> Verifying advance (the verify Job checks out exactly
 	// this SHA, D11). A CLAIM (ADR-0005): the operator strictly validates the
-	// 40-hex shape before acting on it and never advances without it.
+	// 40-hex shape before acting on it and never advances without it. The
+	// agent can write the claim channel too (same user, same container), so
+	// the value is agent-influenced evidence: the verify Job refuses a pin
+	// that is not a descendant of baseCommit (F43, PinNotDescendant).
 	HeadCommit string `json:"headCommit,omitempty"`
 
 	// B3 (PLAN-BETA / PLAN.md Phase 4): true when the runner's Planning run

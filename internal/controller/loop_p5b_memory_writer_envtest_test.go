@@ -2,15 +2,19 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -610,6 +614,89 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
 	})
 
+	// F31: a Job that is terminal with NO pod (pod GC, eviction, an admission
+	// reject) is decided from the Job's own conditions; a Job with neither
+	// condition and no pod is still in progress (no decision).
+	for _, tc := range []struct {
+		name, cond, reason string
+		wantReason         string // "" = no decision
+	}{
+		{"p5b-mw-nopod-failed", string(batchv1.JobFailed), "BackoffLimitExceeded", memoryWriteFailedReason},
+		{"p5b-mw-nopod-complete", string(batchv1.JobComplete), "", memoryWrittenReason},
+		{"p5b-mw-nopod-running", "", "", ""},
+		{"p5b-mw-nopod-target", string(batchv1.JobFailureTarget), "", ""}, // N4: only FailureTarget=True is no decision
+	} {
+		verb := "decides"
+		if tc.wantReason == "" {
+			verb = "makes no decision for"
+		}
+		It(verb+" a no-pod Job from its conditions: "+tc.name, func() {
+			r := s6SucceededLessonsAvailable(tc.name, ns)
+			p5bMemoryWriterReconcile(r, ns, tc.name) // creates the Job
+			job := p5bGetMemoryJob(ns, tc.name)
+			if tc.cond != "" {
+				now := metav1.Now()
+				job.Status.StartTime = &now
+				job.Status.Conditions = []batchv1.JobCondition{
+					{Type: batchv1.JobConditionType(tc.cond), Status: corev1.ConditionTrue, Reason: tc.reason},
+				}
+				if tc.cond == string(batchv1.JobFailed) {
+					job.Status.Conditions = append([]batchv1.JobCondition{{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: tc.reason}}, job.Status.Conditions...)
+					job.Status.Failed = 1
+				} else if tc.cond == string(batchv1.JobComplete) {
+					job.Status.CompletionTime = &now
+					job.Status.Succeeded = 1
+					job.Status.Conditions = append([]batchv1.JobCondition{{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue}}, job.Status.Conditions...)
+				}
+				Expect(k8sClient.Status().Update(context.Background(), job)).To(Succeed())
+			}
+			// No pod is fabricated: the pod is absent.
+			s6Reconcile(r, ns, tc.name)
+			s6Reconcile(r, ns, tc.name)
+			loop := p5bMustLoop(ns, tc.name)
+			cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
+			if tc.wantReason == "" {
+				Expect(cond).To(BeNil(), "an in-progress Job with no pod makes no decision")
+				return
+			}
+			Expect(cond).NotTo(BeNil(), "a terminal Job with no pod must be decided")
+			Expect(cond.Reason).To(Equal(tc.wantReason))
+			if tc.reason != "" {
+				Expect(cond.Message).To(ContainSubstring(tc.reason), "the message names the Job's reason")
+			}
+			if tc.wantReason == memoryWrittenReason {
+				// N1: never claim a pod succeeded when it is gone.
+				Expect(cond.Message).To(ContainSubstring("its pod is gone"))
+				Expect(cond.Message).NotTo(ContainSubstring("pod succeeded"))
+			}
+		})
+	}
+
+	// F33 P3-6: the deny-all NetworkPolicy is created BEFORE the Job, so a writer
+	// pod never exists without its egress fence. With the netpol create failing,
+	// no Job may exist.
+	It("creates no memory-writer Job when the deny-all NetworkPolicy cannot be created", func() {
+		name := "p5b-mw-netpol-first"
+		// The fault is present from the reconcile that first creates the writer
+		// Job; the reconciler handles the failure (requeue), so the claim is only
+		// that no Job exists while the fence cannot be created.
+		r := s6SucceededLessonsAvailableWith(name, ns, func(c client.Client) client.Client {
+			return &failNetPolCreateClient{Client: c}
+		})
+		_, err := r.Reconcile(context.Background(),
+			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+		// The error text is the only signal this failure produces: assert the
+		// netpol step was reached AND failed, so "not reached" cannot pass.
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("memory-writer netpol"))
+		job := &batchv1.Job{}
+		getErr := k8sClient.Get(context.Background(), types.NamespacedName{
+			Name: memoryWriterJobName(p5bMustLoop(ns, name)), Namespace: ns,
+		}, job)
+		Expect(apierrors.IsNotFound(getErr)).To(BeTrue(),
+			"the Job must not be created before (or without) its NetworkPolicy; got %v", getErr)
+	})
+
 	It("does nothing on a non-terminal phase (the eligibility rule)", func() {
 		// A non-terminal phase (e.g. Implementing) is ineligible: the operator
 		// records NOTHING (no condition, no Job) — the Loop is still running
@@ -838,8 +925,18 @@ func p5bSetJobPodTerminationMessage(ns, loopName, msg string) {
 // S5a claim propagation path (the claim path's lessonsAvailable field is
 // tested separately in the S4 specs; the P5b specs test the gate logic).
 func s6SucceededLessonsAvailable(name, ns string) *LoopReconciler {
+	return s6SucceededLessonsAvailableWith(name, ns, nil)
+}
+
+// s6SucceededLessonsAvailableWith is the same with the reconciler's client
+// wrapped by wrap (nil = none) from the start, so a fault can be present for
+// the reconcile that first creates the memory-writer Job.
+func s6SucceededLessonsAvailableWith(name, ns string, wrap func(client.Client) client.Client) *LoopReconciler {
 	ctx := context.Background()
 	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	if wrap != nil {
+		r.Client = wrap(k8sClient)
+	}
 	s5aEnsureSandbox(ns, name)
 	// Create the Loop.
 	loop := s6Loop(name, ns, inClusterRepoURL)
@@ -864,7 +961,12 @@ func s6SucceededLessonsAvailable(name, ns string) *LoopReconciler {
 	s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
 	s6Reconcile(r, ns, name)
 	s6ForceSucceededFromHold(ns, name)
-	s6Reconcile(r, ns, name) // the memory writer reads the settled Succeeded
+	if wrap != nil {
+		// a wrapped client injects a fault into this very reconcile: its error is expected
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+	} else {
+		s6Reconcile(r, ns, name) // the memory writer reads the settled Succeeded
+	}
 	loop = &coxv1alpha1.Loop{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 	Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
@@ -910,4 +1012,14 @@ func s6FailedStalledLessonsAvailable(name, ns string) *LoopReconciler {
 	setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, "Stalled", "the runner stalled (the iteration budget was exhausted)")
 	Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 	return r
+}
+
+// failNetPolCreateClient fails every NetworkPolicy Create (F33 P3-6).
+type failNetPolCreateClient struct{ client.Client }
+
+func (c *failNetPolCreateClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if np, ok := obj.(*networkingv1.NetworkPolicy); ok && strings.HasSuffix(np.Name, "-memory-write-netpol") {
+		return fmt.Errorf("injected: cannot create the memory-writer NetworkPolicy")
+	}
+	return c.Client.Create(ctx, obj, opts...)
 }

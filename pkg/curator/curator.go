@@ -30,8 +30,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,6 +53,52 @@ type Client struct {
 	baseURL string // e.g. http://<loop>-proxy.<ns>.svc:8080
 	model   string // the model name for the request body
 	http    *http.Client
+	// retryDelays are the waits before each retry of a TRANSPORT failure
+	// (the request never got an HTTP response).
+	//
+	// Evidence (F41, .samples/f41/FINDINGS.md, ONE cluster — k3d-hermes-sim,
+	// k3s + kube-router, mechanism not shown): the writer Job's first calls,
+	// made at pod start, failed at once ("call failed") and the same call
+	// succeeded when a 10s init delay preceded it; one run on a build with
+	// this ladder wrote the lessons. The window is therefore only bracketed
+	// at (0s, 10s]; this ladder covers 7s of it, so it may not be enough
+	// where start-up is slower. The retry log line (below) lets a Job log
+	// show how long the window really was.
+	//
+	// Why this differs from the runner (runner/runner.go isTimeoutError,
+	// I89: a non-timeout error such as connection refused is "definitive, do
+	// not retry"): the F41 failure was exactly such an immediate transport
+	// error, on a brand-new pod's first call, and it cleared on its own. The
+	// runner's own first call may have the same start-up failure; that is not
+	// shown here (queued as F79) and the runner is unchanged.
+	retryDelays []time.Duration
+
+	// retryBudget is the total retry WAIT this Client may spend across ALL
+	// its Judge calls (one writer batch: up to 20 lessons). Without it a
+	// down proxy costs 7s per lesson (20 x 7s = 140s, past the writer's 120s
+	// overall budget). When it is spent, a failed call is dropped at once
+	// ("call failed", fail-closed D70) with no further waiting.
+	retryBudget time.Duration
+	mu          sync.Mutex // guards retryBudget (Judge is called serially; belt and braces)
+}
+
+// defaultRetryDelays: 3 retries, 7s for one lesson.
+var defaultRetryDelays = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+
+// defaultRetryBudget bounds the retry waiting of one Client (one batch) to
+// 20s: the first lesson can use its whole 7s ladder, and the writer's 120s
+// overall budget keeps its room for the calls themselves.
+const defaultRetryBudget = 20 * time.Second
+
+// spendRetry takes d from the retry budget; false when it is not enough.
+func (c *Client) spendRetry(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d > c.retryBudget {
+		return false
+	}
+	c.retryBudget -= d
+	return true
 }
 
 // NewClient builds a curator client. baseURL is the model proxy's base URL
@@ -61,6 +109,9 @@ func NewClient(baseURL, model string) *Client {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		model:   model,
 		http:    &http.Client{Timeout: 60 * time.Second},
+
+		retryDelays: defaultRetryDelays,
+		retryBudget: defaultRetryBudget,
 	}
 }
 
@@ -101,17 +152,33 @@ func (c *Client) Judge(ctx context.Context, lesson string) Verdict {
 		return Verdict{Keep: false, Reason: "curator unparseable (marshal error)"}
 	}
 
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(reqBody),
-	)
-	if err != nil {
-		return Verdict{Keep: false, Reason: "curator unavailable (request error)"}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return Verdict{Keep: false, Reason: "curator unavailable (call failed)"}
+	// Transport failures (no HTTP response) are retried on a short backoff;
+	// an HTTP status or a bad body is never retried (fail-closed, D70: the
+	// lesson is still dropped when every attempt fails).
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, c.baseURL+"/v1/chat/completions", bytes.NewReader(reqBody),
+		)
+		if err != nil {
+			return Verdict{Keep: false, Reason: "curator unavailable (request error)"}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err = c.http.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt >= len(c.retryDelays) || !c.spendRetry(c.retryDelays[attempt]) {
+			return Verdict{Keep: false, Reason: "curator unavailable (call failed)"}
+		}
+		// Surface the fallback (R26 I90): stderr lands in the writer Job's log.
+		log.Printf("curator: call failed, retrying (retry %d/%d in %s): %v",
+			attempt+1, len(c.retryDelays), c.retryDelays[attempt], err)
+		select {
+		case <-ctx.Done():
+			return Verdict{Keep: false, Reason: "curator unavailable (call failed)"}
+		case <-time.After(c.retryDelays[attempt]):
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 

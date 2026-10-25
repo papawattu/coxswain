@@ -214,6 +214,104 @@ func TestPhaseRunVerifyingIdlesUntilStop(t *testing.T) {
 	}
 }
 
+// TestPhaseRunBlockedImplementingClearsStaleLessons (F34): a blocked
+// Implementing run removes a lessons.json an earlier iteration left, and its
+// claim does not advertise it.
+func TestPhaseRunBlockedImplementingClearsStaleLessons(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{StatusCode: 500, RawBody: `{"error":"boom"}`})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	stale := filepath.Join(ws, resultDirName, lessonsFileName)
+	if err := os.MkdirAll(filepath.Dir(stale), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte(`["an old lesson"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan any)
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, stop)
+
+	if res.Status != statusBlocked || res.ObservedPhase != PhaseImplementing {
+		t.Fatalf("setup: status=%q phase=%q, want blocked Implementing", res.Status, res.ObservedPhase)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale lessons.json survived a blocked Implementing (err=%v)", err)
+	}
+	if res.LessonsAvailable {
+		t.Fatal("blocked Implementing advertised lessonsAvailable from a stale file")
+	}
+	if v, ok := parseClaim(t, claimPath)["lessonsAvailable"].(bool); ok && v {
+		t.Fatal("claim lessonsAvailable=true from a stale file")
+	}
+}
+
+// TestPhaseRunBlockedPlanningKeepsExistingPlan (F43 P2-1): a Planning run
+// whose model call fails must not truncate a PLAN.md already on the volume
+// (the plan the user may have approved).
+func TestPhaseRunBlockedPlanningKeepsExistingPlan(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{StatusCode: 500, RawBody: `{"error":"boom"}`})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhasePlanning)
+	planPath := filepath.Join(ws, resultDirName, planFileName)
+	const approved = "1. do the thing\n2. test it\n"
+	if err := os.WriteFile(planPath, []byte(approved), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, make(chan any))
+
+	if res.Status != statusBlocked {
+		t.Fatalf("status = %q, want blocked", res.Status)
+	}
+	got, err := os.ReadFile(planPath)
+	if err != nil || string(got) != approved {
+		t.Fatalf("PLAN.md after a blocked Planning = %q (err %v), want it unchanged %q", got, err, approved)
+	}
+	if parseClaim(t, claimPath)["status"] != statusBlocked {
+		t.Fatalf("claim is not blocked")
+	}
+}
+
+// TestPhaseRunEmptyPlanningAnswerKeepsExistingPlan (F43 P2-1): a 200 with an
+// empty answer is refused (blocked), and an existing PLAN.md stays byte-identical.
+func TestPhaseRunEmptyPlanningAnswerKeepsExistingPlan(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{Content: ""})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhasePlanning)
+	planPath := filepath.Join(ws, resultDirName, planFileName)
+	const approved = "1. do the thing\n2. test it\n"
+	if err := os.WriteFile(planPath, []byte(approved), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, make(chan any))
+
+	if res.Status != statusBlocked {
+		t.Fatalf("status = %q, want blocked for an empty plan", res.Status)
+	}
+	got, err := os.ReadFile(planPath)
+	if err != nil || string(got) != approved {
+		t.Fatalf("PLAN.md after an empty Planning answer = %q (err %v), want it unchanged %q", got, err, approved)
+	}
+	if parseClaim(t, claimPath)["status"] != statusBlocked {
+		t.Fatalf("claim is not blocked")
+	}
+}
+
 func TestPhaseRunModelFailureBlocked(t *testing.T) {
 	// A model failure (non-200) makes the phase end blocked: the claim
 	// carries status=blocked with the reason (the operator requeues).

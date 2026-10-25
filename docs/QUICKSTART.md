@@ -21,6 +21,12 @@ runs the alpha is expected to be at least that. The production floor is
 expected to be higher than the dev pin (see `docs/PLAN.md` for the tracked
 requirement), so use a recent stable Kubernetes.
 
+### A Kubernetes cluster
+
+You need a reachable cluster (kubectl in `~/.kube/config` pointing at it).
+For local dev the Makefile creates one: `make kind-up` (kind 1.34,
+agent-sandbox, KubeArmor), so the next two subsections are already done.
+
 ### agent-sandbox
 
 The operator runs each Loop in an isolated agent-sandbox workspace. Install
@@ -49,12 +55,6 @@ upstream host only) — an accepted limitation (D50, R23 I64; see
 `docs/adr/0008-tool-proxies.md`). For a fully fenced run, use a node/kernel
 with BPF-LSM enabled (the dev cluster installs KubeArmor v1.7.5 via the
 pinned `karmor` CLI; `make kind-up` does this for kind).
-
-### A Kubernetes cluster
-
-A reachable cluster (kubectl in `~/.kube/config` pointing at it). For local
-dev the Makefile creates one: `make kind-up` (kind 1.34, agent-sandbox,
-KubeArmor).
 
 ### Network gate (D38)
 
@@ -132,13 +132,19 @@ tags every coxswain image in `dist/install.yaml` with `<tag>` — see
 `install.yaml` also includes the operator's CNI self-test probe resources
 (`config/cni-probe`, applied separately from the default kustomization).
 
+The install is done when the rollout reports success and the operator pod is
+Ready in `coxswain-system`.
+
 ## 3. The GitHub token Secret
 
-The deliver Job (S6) opens the Loop's PR through the Gitea/GitHub API using a
-`kubernetes.io/basic-auth` Secret named **`git-cred`** (username
-`x-access-token`). The token is a fine-grained GitHub token scoped to the
-sandbox repo, and it must never be printed, `cat`'d, or placed on a command
-line (D55). Two ways to create it:
+The deliver Job (the operator-owned Job that opens the Loop's PR) opens the
+Loop's PR through the Gitea/GitHub API using a `kubernetes.io/basic-auth`
+Secret named **`git-cred`** (username `x-access-token`). The token is a
+fine-grained GitHub token scoped to the sandbox repo, and it must never be
+printed, `cat`'d, or placed on a command line (D55). In GitHub, create a
+fine-grained personal access token with Contents and Pull requests both set
+to Read and write on the repo the Loop will use, then save it to `~/.config/coxswain/github-token` (mode 600).
+Two ways to create the Secret:
 
 **Option A — the helper (preferred).** Put the token in
 `~/.config/coxswain/github-token` (mode `600`; the only credential a script
@@ -149,8 +155,9 @@ may read, D55), then:
 hack/github-secret.sh <namespace>            # secret name defaults to git-cred
 ```
 
-The helper reads the token via `--from-file` (never the command line) and
-applies the Secret:
+The helper reads the token from the file via `--from-file` (never the
+command line) and applies the Secret itself — you do not run the kubectl
+command below; it is shown so you can see what the helper does:
 
 ```sh
 kubectl create secret generic git-cred -n <namespace> \
@@ -188,7 +195,15 @@ the `coxswain.io/redeliver` annotation.
 Apply a minimal Loop CR (a `coxswain.wattu.com/v1alpha1` Loop). The operator
 creates the agent-sandbox workspace for it, the runner plans → implements →
 verifies inside the sandbox, and on success the Loop's PR is opened by the
-deliver Job. `config/samples` has a working example:
+deliver Job. The agent needs a model endpoint: create a Secret in the
+Loop's namespace holding the model API key under the key `model-key` (§9
+Step 7 shows one), then set `spec.agent.endpointSecretRef` to that Secret's name
+and `spec.agent.modelEndpoint` to the endpoint's `host:port`. The CRD requires
+both together, and both are immutable, so a new endpoint means a new Loop.
+`config/samples/loop-fix-failing-test.yaml` shows the two fields as a
+commented-out example.
+
+`config/samples` has a working example:
 
 ```sh
 kubectl apply -f config/samples/coxswain_v1alpha1_loop.yaml
@@ -221,7 +236,7 @@ What you will see, in order:
    and verifies the acceptance checks.
 3. Each iteration is recorded in the Loop's `status.iterations` ring; on
    success the deliver Job opens the PR (using the `git-cred` Secret from
-   step 3) while the Loop is held at `Verifying`; the phase becomes
+   section 3) while the Loop is held at `Verifying`; the phase becomes
    `Succeeded` only once delivery is terminal (the PR is open, or delivery
    failed).
 4. If the verify keeps failing, the Loop hits its `maxIterations` budget and
@@ -246,6 +261,7 @@ kubectl cox pause <loop>        # set spec.suspend=true
 kubectl cox resume <loop>       # clear spec.suspend (set coxswain.io/resume for a Stall/Budget pause)
 kubectl cox redeliver <loop>    # re-trigger delivery for a failed Loop (I52 annotation)
 kubectl cox fork <name> --loop <source> --iteration <n>  # fork from a checkpoint
+kubectl cox memory export <repo-url> -o backup.tar.gz  # back up the memory PVC (import/delete: OPERATOR.md)
 ```
 
 `describe` is the one to run first after a Loop finishes: it shows the
@@ -295,6 +311,9 @@ source Loop's checkpoint at the given iteration. The fork runs a normal
 one-shot Loop (own branch, own deliver, own PR) — it does NOT re-task the
 source Loop.
 
+`--check` replaces the fork's whole acceptance-check list (repeat the flag
+to set several); without it the fork inherits the source's checks.
+
 ```sh
 # Fork from iteration 2 of the source Loop (inherits the source's spec
 # as-is, including its acceptance checks).
@@ -318,16 +337,14 @@ source). A fork WITHOUT `--check` inherits the source's acceptance checks
 flag (when given) replaces the fork's goal (`spec.goal`); a fork WITHOUT
 `--goal` inherits the source's goal.
 
-The operator does the fork's PVC restore (the controller's
-`spec.forkOf` handling restores the fork's OWN workspace PVC from the
-source's checkpoint snapshot at the fork's start). The source Loop's
-checkpoint must exist (the source's `status.checkpoints` must have an
-entry for the given iteration) and must be ReadyToUse (the source's
-VolumeSnapshot must be ReadyToUse) — the operator defers the fork's
-restore when the snapshot is not ReadyToUse (the Restore condition is
-False, reason `RestoreSourceNotReady`, the requeue retries) and rejects
-it when the snapshot is absent (the Restore condition is False, reason
-`RestoreSourceMissing`, the fork is terminal).
+- The operator restores the fork's OWN workspace PVC from the source's
+  checkpoint snapshot at the fork's start (the controller's `spec.forkOf`
+  handling).
+- The source's snapshot for that iteration must exist (an entry in the
+  source's `status.checkpoints`) and be ReadyToUse. Not ready: the Restore
+  condition is `False` (reason `RestoreSourceNotReady`) and the operator
+  retries. Absent: the Restore condition is `False` (reason
+  `RestoreSourceMissing`) and the fork is terminal.
 
 ## 8. Model timeout and tuning
 
@@ -345,22 +362,23 @@ model backend surfaces `ModelUnavailable` after about 8 minutes
 behaviour (a single 10-minute timeout followed by kubelet back-off churn
 with no named reason).
 
-**Tuning:** the timeout is not user-configurable today: the runner's
-`runConfig.ModelTimeout` field (`runner/runner.go`) exists but the runner
-entrypoint (`runner/cmd/main.go`) never sets it, so the timeout is always
-the `defaultModelTimeout` (120s). For a local 27B-class model under load, a
-legitimate response can approach 120s (#124 saw a 60s worst case); if you
-see spurious `ModelUnavailable` conditions on a healthy backend, the fix
-today is to reduce the load or the context size, not to tune the timeout.
-The retry count and backoff base are currently constants
+**Tuning:** set `spec.loop.modelTimeoutSeconds` (1-3600) to change the
+per-request timeout; the operator passes it to the agent as
+`COX_MODEL_TIMEOUT` (F46). Absent keeps the 120s default. The worst case is
+then 4 x the value + 14s of backoff. For a local 27B-class model under load,
+a legitimate response can approach 120s (#124 saw a 60s worst case); if you
+see spurious `ModelUnavailable` conditions on a healthy backend, raise the
+timeout or reduce the load or the context size. The retry count and backoff base are currently constants
 (`defaultModelRetries = 3`, `defaultModelRetryBackoff = 2s` in
 `runner/runner.go`).
 
 ## 9. Calico + KubeArmor VM (both gates enforcing)
 
-The alpha and beta e2e runs use kindnet (the default kind CNI) with the
-`--allow-unenforced` / `--allow-unenforced-network` escape hatches. A
-production deployment requires both gates to be live without escape hatches:
+This section sets up a dedicated VM where both gates (Calico NetworkPolicy
++ KubeArmor BPF-LSM) are live with no escape hatches, as a production
+deployment requires. (For comparison: the e2e runs use kind's default
+kindnet CNI plus the `--allow-unenforced` / `--allow-unenforced-network`
+escape hatches.) Both gates live means:
 
 - **NetworkEnforced=True** — an enforcing CNI (Calico) polices pod →
   host-network egress. The operator's CNI probe confirms this.

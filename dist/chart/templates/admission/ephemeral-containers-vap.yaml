@@ -3,7 +3,7 @@ I45: the cluster-scoped ValidatingAdmissionPolicy that denies ephemeral
 containers (kubectl debug) on coxswain component pods. The kustomize
 install.yaml install applies this (config/admission, the standalone
 kustomization hack/build-installer.sh appends to install.yaml); the generated
-chart template dist/chart/templates/extras/deny-ephemeral-containers.yaml
+chart template deny-ephemeral-containers-binding.yaml (next to this one)
 carries the matching ValidatingAdmissionPolicyBinding. The binding's
 policyName must reference the VAP's rendered name (the kustomize namePrefix
 coxswain- in config/admission, not the Helm fullname — the two install

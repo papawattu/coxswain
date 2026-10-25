@@ -30,6 +30,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,6 +39,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/papawattu/coxswain/pkg/memorywrite"
 )
 
 // runMemoryWrite runs the REAL entrypoint (run) against a temp workspace +
@@ -232,11 +236,11 @@ func TestMemoryWriteWriteFailureExitsNonZero(t *testing.T) {
 	}
 }
 
-// TestMemoryWriteBoundedSummaryNeverLeaksLessonText: the bounded summary
-// (stdout) reports counts + per-lesson sha256-prefix/written|dropped/rule,
-// NEVER the lesson text. A lesson that failed the secrets screen must not be
-// echoed into the Job's logs / termination message.
-func TestMemoryWriteBoundedSummaryNeverLeaksLessonText(t *testing.T) {
+// TestMemoryWriteScreenedLessonTextIsNeverEchoed: a lesson that failed the
+// secrets screen must not be echoed into the Job's logs / termination
+// message. (A KEPT lesson's curator reason may quote the lesson, F33; this
+// spec covers only the screened one.)
+func TestMemoryWriteScreenedLessonTextIsNeverEchoed(t *testing.T) {
 	ws := t.TempDir()
 	mem := t.TempDir()
 	// A credential lesson (dropped) + an eligible lesson. The credential
@@ -262,9 +266,7 @@ func TestMemoryWriteBoundedSummaryNeverLeaksLessonText(t *testing.T) {
 	if code != 0 || err != nil {
 		t.Fatalf("run(succeeded) = (%d, %v); want (0, nil)", code, err)
 	}
-	// The credential lesson's text must NOT appear in the summary (the
-	// summary reports sha256-prefix + written|dropped + rule, never the
-	// lesson text).
+	// The screened credential lesson's text must NOT appear in the summary.
 	if strings.Contains(summary, "ghp_abcDEF1234567890abcdefghijklmnopQR") {
 		t.Errorf(
 			"summary includes the credential lesson's text:\n%s\nthe bounded summary must never leak a lesson's content",
@@ -648,7 +650,9 @@ func TestMemoryWriteCuratorTrueVerdictWrites(t *testing.T) {
 	}
 }
 
-// TestMutationCuratorKeepReasonNotRecorded: mutation test for the ADR-0002
+// (TestMutationGuard* specs: the name says which mutation the spec guards;
+// each asserts the NORMAL behaviour, which the mutation would break.)
+// TestMutationGuardCuratorKeepReasonIsRecorded: mutation test for the ADR-0002
 // keep-reason audit. The mutation: remove the keep-reason recording from
 // main.go (the v.Keep branch appends to curated but does NOT set
 // reasons[j] = "curator-keep: " + v.Reason). With the mutation, the audit
@@ -660,10 +664,10 @@ func TestMemoryWriteCuratorTrueVerdictWrites(t *testing.T) {
 //   - reasons[j] = "curator-keep: " + v.Reason
 //
 // (the line in the v.Keep branch of the curator loop in run). Then run
-// `go test -run TestMutationCuratorKeepReasonNotRecorded -count=1 .` — the
+// `go test -run TestMutationGuardCuratorKeepReasonIsRecorded -count=1 .` — the
 // test must fail (the summary lacks the keep reason). Then `git checkout .`
 // and re-run to confirm it passes.
-func TestMutationCuratorKeepReasonNotRecorded(t *testing.T) {
+func TestMutationGuardCuratorKeepReasonIsRecorded(t *testing.T) {
 	ws := t.TempDir()
 	mem := t.TempDir()
 	writeLessonsFile(t, ws, []string{"foo/bar: the retry must back off before the 500"})
@@ -922,8 +926,8 @@ func TestMemoryWriteCuratorReasonCRStrippedFromSummary(t *testing.T) {
 	}
 	// The reason is flattened: CR/LF become spaces, so the drop line reads
 	// "dropped curator: too generic and not specific" on ONE line.
-	if !strings.Contains(lines[0], "dropped curator: too generic and not specific") {
-		t.Fatalf("summary line 0 must carry the flattened reason (CR/LF -> space); got %q", lines[0])
+	if !strings.Contains(lines[1], "dropped curator: too generic and not specific") {
+		t.Fatalf("summary line 1 must carry the flattened reason (CR/LF -> space); got %q", lines[1])
 	}
 }
 
@@ -945,7 +949,7 @@ func TestSummaryLinesStripsCRFromReason(t *testing.T) {
 	// A drop reason carrying CR/LF, fed straight into summaryLines (no
 	// client in the path — this isolates the writer-level strip).
 	reason := "dropped curator: too generic\r\nand\nnot specific"
-	lines := summaryLines([]string{lesson}, []string{reason}, 1, 0, 1)
+	lines := summaryLines([]string{lesson}, []string{reason}, nil, 1, 0, 1)
 	// Exactly 2 elements: 1 lesson line + 1 counts line. (The CR/LF is
 	// inside the lesson-line string, not between slice elements — the strip
 	// makes the string single-line.)
@@ -956,30 +960,30 @@ func TestSummaryLinesStripsCRFromReason(t *testing.T) {
 	// single-line (no \n or \r inside it) and reads
 	// "dropped curator: too generic and not specific".
 	want := "dropped curator: too generic and not specific"
-	if !strings.Contains(lines[0], want) {
-		t.Fatalf("summaryLines lesson line must carry the flattened reason (CR/LF -> space); want %q in %q", want, lines[0])
+	if !strings.Contains(lines[1], want) {
+		t.Fatalf("summaryLines lesson line must carry the flattened reason (CR/LF -> space); want %q in %q", want, lines[1])
 	}
 	// The lesson line must be single-line (no CR/LF inside it). An unstripped
 	// reason would leave \r\n or \n in the string.
-	if strings.ContainsAny(lines[0], "\r\n") {
-		t.Fatalf("summaryLines lesson line must be single-line (no CR/LF); got %q", lines[0])
+	if strings.ContainsAny(lines[1], "\r\n") {
+		t.Fatalf("summaryLines lesson line must be single-line (no CR/LF); got %q", lines[1])
 	}
-	// The counts line is the last element and must be well-formed.
-	if lines[1] != "summary: total=1 written=0 dropped=1" {
-		t.Fatalf("summaryLines counts line = %q; want %q", lines[1], "summary: total=1 written=0 dropped=1")
+	// The counts line is the FIRST element (F78) and must be well-formed.
+	if lines[0] != "summary: total=1 written=0 dropped=1" {
+		t.Fatalf("summaryLines counts line = %q; want %q", lines[0], "summary: total=1 written=0 dropped=1")
 	}
 }
 
-// TestMutationSummaryLinesStripReasonCRRemoved: mutation test for the
+// TestMutationGuardSummaryLinesStripReasonCR: mutation test for the
 // writer-level stripReasonCR in summaryLines. Removing the strip lets a
 // CR/LF reason through to the lesson-line string, leaving \r\n or \n inside
 // the line (the line is no longer single-line). This spec asserts the line
 // IS single-line (no CR/LF); with the mutation applied, the line contains
 // CR/LF and the spec FAILS.
-func TestMutationSummaryLinesStripReasonCRRemoved(t *testing.T) {
+func TestMutationGuardSummaryLinesStripReasonCR(t *testing.T) {
 	lesson := "foo/bar: the retry must back off before the 500"
 	reason := "dropped curator: too generic\r\nand\nnot specific"
-	lines := summaryLines([]string{lesson}, []string{reason}, 1, 0, 1)
+	lines := summaryLines([]string{lesson}, []string{reason}, nil, 1, 0, 1)
 	// The lesson line must be single-line (no CR/LF). With the mutation
 	// (stripReasonCR removed), the line contains CR/LF and this FAILS.
 	if strings.ContainsAny(lines[0], "\r\n") {
@@ -987,5 +991,256 @@ func TestMutationSummaryLinesStripReasonCRRemoved(t *testing.T) {
 			"(stripReasonCR removed). Got: %q. Mutation: remove the " +
 			"stripReasonCR call in summaryLines (cmd/memory-writer/main.go)."
 		t.Fatalf(msg, lines[0])
+	}
+}
+
+// F32 (D71 (a), PLAN-PHASE5.md:479): the writer caps the lessons per PVC at
+// memorywrite.MaxLessons and evicts the oldest by mtime before writing; each
+// eviction is in the audit summary.
+func seedLessons(t *testing.T, dir string, n int) []string {
+	t.Helper()
+	names := make([]string, 0, n)
+	base := time.Now().Add(-48 * time.Hour)
+	for i := range n {
+		text := fmt.Sprintf("seed lesson %03d: a distinct note", i)
+		sum := sha256.Sum256([]byte(text))
+		name := hex.EncodeToString(sum[:]) + ".txt"
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(text+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// seed 000 is the oldest, each later one a minute newer.
+		mt := base.Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+func runCapped(t *testing.T, mem string, lessons []string) string {
+	t.Helper()
+	ws := t.TempDir()
+	sum := filepath.Join(t.TempDir(), "summary.txt")
+	t.Setenv("COX_SUMMARY_PATH", sum)
+	writeLessonsFile(t, ws, lessons)
+	srv := fakeCuratorProxy(t, `{"keep": true, "reason": "concrete"}`, http.StatusOK)
+	defer srv.Close()
+	if code, err := runWithCurator(t, ws, mem, srv.URL); code != 0 || err != nil {
+		t.Fatalf("run = (%d, %v)", code, err)
+	}
+	b, err := os.ReadFile(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestMemoryWriteCapEvictsOldest(t *testing.T) {
+	mem := t.TempDir()
+	names := seedLessons(t, mem, memorywrite.MaxLessons) // exactly at the cap
+	summary := runCapped(t, mem, []string{"the 101st lesson: back off before the 500"})
+	files := readMemoryFiles(t, mem)
+	if len(files) != memorywrite.MaxLessons {
+		t.Fatalf("memory dir has %d files, want the cap %d", len(files), memorywrite.MaxLessons)
+	}
+	if _, ok := files[names[0]]; ok {
+		t.Errorf("the oldest lesson %s was not evicted", names[0])
+	}
+	if _, ok := files[names[1]]; !ok {
+		t.Errorf("the second-oldest lesson was evicted too; only one eviction is needed")
+	}
+	found := false
+	for _, c := range files {
+		if c == "the 101st lesson: back off before the 500" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the new lesson was not written: %v", len(files))
+	}
+	want := "evicted " + names[0][:shaPrefixLen] + " cap"
+	if !strings.Contains(summary, want) {
+		t.Errorf("summary lacks %q:\n%s", want, summary)
+	}
+}
+
+func TestMemoryWriteBelowCapEvictsNothing(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons-1) // one slot free
+	summary := runCapped(t, mem, []string{"the 100th lesson: back off before the 500"})
+	if got := len(readMemoryFiles(t, mem)); got != memorywrite.MaxLessons {
+		t.Fatalf("memory dir has %d files, want %d", got, memorywrite.MaxLessons)
+	}
+	if strings.Contains(summary, "evicted") {
+		t.Errorf("nothing should be evicted below the cap:\n%s", summary)
+	}
+}
+
+func TestMemoryWriteDuplicateAtCapEvictsNothing(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	// seed 000 (the oldest) re-proposed: a duplicate, so no new file, no eviction.
+	summary := runCapped(t, mem, []string{"seed lesson 000: a distinct note"})
+	if got := len(readMemoryFiles(t, mem)); got != memorywrite.MaxLessons {
+		t.Fatalf("memory dir has %d files, want %d", got, memorywrite.MaxLessons)
+	}
+	if strings.Contains(summary, "evicted") {
+		t.Errorf("a duplicate must not evict:\n%s", summary)
+	}
+}
+
+// A single write with far more lessons than the cap (lessons.json is agent-
+// writable, so the count is untrusted) must neither evict the whole dir nor end
+// above the cap: the batch is bounded and the audit says so.
+func TestMemoryWriteHugeBatchStaysUnderCap(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	batch := make([]string, 0, 3*memorywrite.MaxLessons)
+	for i := range 3 * memorywrite.MaxLessons {
+		batch = append(batch, fmt.Sprintf("batch lesson %03d: a distinct note", i))
+	}
+	summary := runCapped(t, mem, batch)
+	if got := len(readMemoryFiles(t, mem)); got > memorywrite.MaxLessons {
+		t.Fatalf("memory dir has %d files, above the cap %d", got, memorywrite.MaxLessons)
+	}
+	if got := len(readMemoryFiles(t, mem)); got < memorywrite.MaxLessons-memorywrite.MaxLessonsPerWrite {
+		t.Fatalf("memory dir has %d files: a huge batch wiped the old lessons", got)
+	}
+	want := fmt.Sprintf("truncated %d lessons over the batch cap %d",
+		len(batch)-memorywrite.MaxLessonsPerWrite, memorywrite.MaxLessonsPerWrite)
+	if !strings.Contains(summary, want) {
+		t.Errorf("summary lacks %q:\n%s", want, summary)
+	}
+}
+
+// Review 233 #5 + F78: the counts line comes FIRST, then the audit lines
+// (evicted / truncated), then the per-lesson lines, because the Loop's audit
+// text keeps whole lines from the start up to 1000 bytes.
+func TestMemoryWriteAuditLinesPrecedeLessonLines(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	batch := make([]string, 0, 3*memorywrite.MaxLessons)
+	for i := range 3 * memorywrite.MaxLessons {
+		batch = append(batch, fmt.Sprintf("order lesson %03d: a distinct note", i))
+	}
+	summary := runCapped(t, mem, batch)
+	first := strings.Index(summary, "lesson-001")
+	for _, marker := range []string{"evicted ", "truncated "} {
+		i := strings.Index(summary, marker)
+		if i < 0 || first < 0 || i > first {
+			t.Errorf("%q (at %d) must come before lesson-001 (at %d):\n%s", marker, i, first, summary)
+		}
+	}
+	// F78: the counts line is the FIRST line, before the audit lines.
+	lines := strings.Split(strings.TrimSpace(summary), "\n")
+	if !strings.HasPrefix(lines[0], "summary: total=") {
+		t.Errorf("the counts line must be first:\n%s", summary)
+	}
+}
+
+// Review 233 #3: a write that fails must not leave lessons evicted with no audit.
+// The eviction runs only after every write succeeded.
+func TestMemoryWriteFailureEvictsNothing(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	calls := 0
+	orig := writeFile
+	writeFile = func(name string, data []byte, perm os.FileMode) error {
+		calls++
+		if calls == 2 {
+			return fmt.Errorf("injected write failure")
+		}
+		return orig(name, data, perm)
+	}
+	defer func() { writeFile = orig }()
+	_, _, evicted, err := writeLessons(mem, []string{"first new lesson: one", "second new lesson: two"})
+	if err == nil {
+		t.Fatal("want the injected write error")
+	}
+	if len(evicted) != 0 {
+		t.Errorf("evicted %v before/after a failed write", evicted)
+	}
+	// the 100 seeded lessons are all still there (+ the one new file written before the failure)
+	files := readMemoryFiles(t, mem)
+	if len(files) != memorywrite.MaxLessons+1 {
+		t.Errorf("memory dir has %d files, want %d (no seeded lesson lost)", len(files), memorywrite.MaxLessons+1)
+	}
+}
+
+// Review 233 #3 (name shape): only <sha256>.txt files are lessons; a stray .txt
+// is never evicted.
+func TestMemoryWriteNeverEvictsNonLessonFile(t *testing.T) {
+	mem := t.TempDir()
+	seedLessons(t, mem, memorywrite.MaxLessons)
+	junk := filepath.Join(mem, "junk.txt")
+	if err := os.WriteFile(junk, []byte("not a lesson\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-1000 * time.Hour) // older than every seeded lesson
+	if err := os.Chtimes(junk, old, old); err != nil {
+		t.Fatal(err)
+	}
+	runCapped(t, mem, []string{"a new lesson: back off"})
+	if _, err := os.Stat(junk); err != nil {
+		t.Errorf("junk.txt was evicted: %v", err)
+	}
+}
+
+// F33 P3-1: Screen trims, the file is named by the TRIMMED text, so the audit's
+// sha12 must be the trimmed text's and the lesson must read "written".
+func TestMemoryWriteAuditHashesTrimmedLesson(t *testing.T) {
+	mem := t.TempDir()
+	trimmed := "a/b.go: retry the clone"
+	sum := runCapped(t, mem, []string{"  " + trimmed + "  "})
+	files := readMemoryFiles(t, mem)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	var fileSha string
+	for n := range files {
+		fileSha = strings.TrimSuffix(n, ".txt")[:shaPrefixLen]
+	}
+	if fileSha != shaPrefix(trimmed) {
+		t.Fatalf("file sha %s != trimmed-text sha %s", fileSha, shaPrefix(trimmed))
+	}
+	if !strings.Contains(sum, "lesson-001 "+fileSha+" written ") {
+		t.Errorf("audit must say lesson-001 <file sha12> written:\n%s", sum)
+	}
+	if strings.Contains(sum, "duplicate") {
+		t.Errorf("a written lesson was reported as a duplicate:\n%s", sum)
+	}
+}
+
+// F33 P3-2: two identical lessons in one batch: one written, the other a
+// duplicate, and the lines agree with the counts line.
+func TestMemoryWriteIdenticalLessonsInBatchAgreeWithCounts(t *testing.T) {
+	mem := t.TempDir()
+	l := "a/b.go: use make lint-fix"
+	sum := runCapped(t, mem, []string{l, l})
+	if got := len(readMemoryFiles(t, mem)); got != 1 {
+		t.Fatalf("want 1 file, got %d", got)
+	}
+	if !strings.Contains(sum, "summary: total=2 written=1 dropped=1") {
+		t.Errorf("counts line:\n%s", sum)
+	}
+	w, d := 0, 0
+	for line := range strings.SplitSeq(sum, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && strings.HasPrefix(f[0], "lesson-") {
+			switch f[2] {
+			case "written":
+				w++
+			case "dropped":
+				d++
+				if !strings.Contains(line, "duplicate") {
+					t.Errorf("dropped line without the duplicate reason: %s", line)
+				}
+			}
+		}
+	}
+	if w != 1 || d != 1 {
+		t.Errorf("per-lesson lines say written=%d dropped=%d, want 1 and 1:\n%s", w, d, sum)
 	}
 }

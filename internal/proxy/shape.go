@@ -64,6 +64,18 @@ func parseStreamUsage(raw []byte) (prompt, completion int64, ok bool) {
 	return prompt, completion, seen
 }
 
+// streamRequested reports whether a raw top-level "stream" value asks for a
+// stream (F44): anything other than absent, null or the literal false counts,
+// so a coerced value ("true", 1) cannot dodge the include_usage rewrite or the
+// SSE parser selection.
+func streamRequested(raw json.RawMessage) bool {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "false", "null":
+		return false
+	}
+	return true
+}
+
 // shapeRequest rewrites the agent's request before it is dialed upstream so
 // the agent cannot steer the meter. A streaming request (top-level
 // "stream": true) is forced to carry stream_options.include_usage=true so the
@@ -79,10 +91,10 @@ func shapeRequest(body []byte) (newBody []byte, isObject bool) {
 	if err := json.Unmarshal(trimmed, &req); err != nil {
 		return body, false
 	}
-	var streamVal bool
-	if raw, ok := req["stream"]; ok {
-		_ = json.Unmarshal(raw, &streamVal)
-	}
+	// F44: any "stream" value other than the literal false/absent/null is
+	// treated as streaming, so a coerced value ("true", 1) cannot dodge the
+	// include_usage rewrite.
+	streamVal := streamRequested(req["stream"])
 	if streamVal {
 		opts := map[string]json.RawMessage{}
 		if raw, ok := req["stream_options"]; ok {

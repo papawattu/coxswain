@@ -123,10 +123,10 @@ $K get networkpolicy \
 ```
 
 **Why the operator's own cleanup doesn't just do this:**
-`cleanupStaleToolProxyNetpols` lists by the `coxswain.io/tool-proxy-for`
-label (line 3816). A pre-D41d netpol for a removed tool has no label, so
-the list never sees it, and it is never deleted. Manual deletion is the
-one-time fix for netpols created before the label existed.
+`cleanupStaleToolProxyNetpols` lists by the
+`coxswain.io/tool-proxy-for` label. A pre-D41d netpol for a removed tool has
+no label, so the list never sees it, and it is never deleted. Manual
+deletion is the one-time fix for netpols created before the label existed.
 
 **Shown working on kind** (context `kind-coxswain-dev`, namespace
 `i70-demo`, 2026-10-07): three netpols created — one unlabelled tool netpol
@@ -137,3 +137,139 @@ command printed nothing; the live and non-tool netpols were untouched.
 
 A fresh install is unaffected (every tool netpol is created labelled from
 the start).
+
+## Upgrading from v0.1.2
+
+The following changes landed after v0.1.2. Each entry says what changed and
+what you must DO (or why there is nothing to do).
+
+### The operator's ClusterRole gained a serviceaccounts rule
+
+The ClusterRole now includes `serviceaccounts` (create, get, list, watch)
+(F29, PR #199). A standard `kubectl apply -f dist/install.yaml` picks it up
+automatically; there is nothing to do. If your RBAC is managed separately
+(not via `install.yaml`), apply the new rule to your ClusterRole.
+
+### `spec.workspace.restoreFrom` is now immutable
+
+`restoreFrom` is immutable (F35, PR #215). Changing it on an existing Loop
+is now rejected by the API server; there is nothing to do. A different
+rollback target is a fork, not a re-task of the same Loop.
+
+### Two new manager flags
+
+`--memory-storage-class` (P5a, PR #191) sets the StorageClass for the
+per-(namespace, git-URL) memory PVC; empty is the cluster default.
+`--memory-writer-image` (P5b, PR #182) sets the image for the memory-writer
+Job; it must be the operator image, because only the operator image contains
+the `/usr/local/bin/coxswain-memory-write` binary. `config/default`
+(`config/manager/manager.yaml`) passes `--memory-writer-image`; if your
+install is not `config/default`, set it. Set `--memory-storage-class` to a
+ReadWriteMany-capable class if your cluster's default StorageClass does not
+support ReadWriteMany.
+
+**For Helm installs:** the chart also emits `--memory-writer-image`
+derived from `manager.image` (before `manager.args`), so if you put it in
+`manager.args` as well it appears twice and the last occurrence wins. Set
+`manager.image` instead, and leave it out of `manager.args` (see the note in
+`dist/chart/values.yaml`). For `--memory-storage-class`, `hack/rwx-storage.sh`
+installs a dynamic ReadWriteMany StorageClass (with `bindingMode: Immediate`,
+so a memory PVC cannot sit unbound under `WaitForFirstConsumer`) on a cluster
+whose default class is RWO-only — point `--memory-storage-class` at it.
+
+### The agent NetworkPolicy is always created
+
+The operator now always creates the `<loop>-agent-netpol` NetworkPolicy,
+even when `spec.agent.endpointSecretRef` is empty and the policy has no
+network allows (F42, PR #213). Before this change, such a Loop's agent ran
+with no ingress or egress restrictions. After the upgrade, the agent netpol
+carries deny-all ingress, and egress only to DNS plus the narrow set every
+Loop gets: the model proxy (if the Loop has one), the egress proxy (for an
+external repo's init clone), the repo host (for an in-cluster repo), and its
+tool proxies.
+
+The operator creates the netpol on the first reconcile after the upgrade,
+before it touches the sandbox, so there is nothing to do. But it applies to
+running pods at once: a Loop that is mid-implementation loses any network
+access it had been relying on and can start failing straight away. If a Loop
+needs a host, add it to the Loop's `AgentPolicy` network allows (or add the
+tool to the policy) so the egress or tool proxy carries it. Terminal Loops
+are unaffected.
+
+### The sandbox waits for the egress proxy for the init clone
+
+For a Loop whose workspace-init clone must traverse the egress proxy (an
+external repo before the first clone), the sandbox is held `Suspended` until
+the egress proxy pod is `Ready` (F55, PR #220). Before
+this change, such a Loop could start before the proxy was ready and the
+init clone would fail. On upgrade, such a Loop may briefly be held
+`Suspended` if the proxy is not yet ready. There is nothing to do.
+
+### Memory PVC binding is now visible (P5a)
+
+While a Loop's new memory PVC is unbound (the class is not ReadWriteMany,
+or the provisioner has not created it yet), the Loop runs without memory —
+no lessons are seeded and nothing is written back. A one-shot Warning Event
+`MemoryPVCUnbound` (listable via `kubectl get events`) flags the binding
+wait: the operator emits it at most once per Loop, recorded with the
+`coxswain.io/memory-pvc-unbound-notified` annotation (re-emitted only if that
+annotation is cleared while the PVC is still unbound). There is nothing to do
+unless you want the seeding: point `--memory-storage-class` at a
+ReadWriteMany-capable class (see the flag entry above).
+
+### Memory lesson cap
+
+The memory-writer Job keeps at most 100 lessons per memory PVC, evicting the
+oldest by mtime after a successful write (F32, PR #233). An existing PVC with
+more than 100 lessons is trimmed on the next memory-writer run that has at
+least one eligible lesson, even if every eligible lesson is a duplicate (a
+run with no eligible lessons performs no eviction). The memory
+reader also now stops adding whole files at its 16 KiB section cap instead of
+silently dropping the whole memory section past that size. There is nothing
+to do.
+
+### The chart no longer renders a second VAP binding
+
+Helm installs from v0.1.0–v0.1.2 rendered **two** `ValidatingAdmissionPolicyBinding` objects for the one ephemeral-container `ValidatingAdmissionPolicy`: the literal `coxswain-deny-ephemeral-containers` (correct), plus a templated one named after the release's fullname, `{{ fullname }}-deny-ephemeral-containers`, whose `policyName` named the templated name and therefore no existing VAP — so the second one was **inert** (it bound nothing; the gate still worked). PR #249 (F45) removed the templated template. `helm upgrade` normally deletes objects that the previous release tracked but the new manifest no longer carries, but that is not guaranteed if the binding was created out-of-band (a hand-rendered `helm template` piped to `kubectl apply`, a switch from `install.yaml` to Helm, or lost release history) — so run the manual check below either way. It is harmless: the stale binding is inert, and deleting it cannot weaken or disable the ephemeral-container gate.
+
+**At release name `coxswain` (the default): there is nothing to do.** The two released templates collide on one object whose `policyName` names the real VAP, so there is nothing stale.
+
+**At any other release name, check for and delete the stale binding.** (The stale name is `{{ fullname }}-deny-ephemeral-containers`, where `fullname` is the release name when it contains "coxswain", otherwise `<release>-coxswain`; the check below is name-agnostic, so you do not need to work it out.)
+
+```sh
+# 1. Should be exactly one binding, `coxswain-deny-ephemeral-containers`, with
+#    POLICY = the VAP's name. A binding whose POLICY names no existing
+#    ValidatingAdmissionPolicy is the stale one.
+kubectl get validatingadmissionpolicybindings \
+  -o custom-columns=NAME:.metadata.name,POLICY:.spec.policyName
+kubectl get validatingadmissionpolicy coxswain-deny-ephemeral-containers
+
+# 2. Delete the stale one if present (inert: it binds nothing, so this cannot
+#    weaken or disable the ephemeral-container gate).
+kubectl delete validatingadmissionpolicybinding <stale-name>
+
+# 3. Confirm the gate still works (it is a Deny, so the command should be
+#    refused).
+kubectl debug -it <a coxswain pod> --image=busybox
+```
+
+If the check in step 1 shows two bindings for one release, keep the literal `coxswain-deny-ephemeral-containers` and delete the other.
+
+## Stricter Secret-name validation (F48)
+
+`spec.workspace.gitCredentialSecret` and `spec.agent.endpointSecretRef` are
+now validated by the CRD: at most 253 characters and a DNS-1123 subdomain
+(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`).
+A Loop whose existing value does not match (for example uppercase letters
+or an underscore) is not deleted or changed. On Kubernetes 1.30 and later,
+CRD validation ratcheting lets an update through when it leaves that field
+unchanged, so other spec edits and the operator's own status writes still
+work; only an update that changes the field must make it valid. On an older
+API server, any update to that Loop may be rejected until the value is fixed.
+(Not verified against a live API server for this CRD.) Kubernetes cannot have created a Secret with such
+a name, so a non-matching value was already a Loop that could never start.
+Before upgrading, list the values and look for non-matching ones:
+
+```bash
+kubectl get loops -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.spec.workspace.gitCredentialSecret}{"\t"}{.spec.agent.endpointSecretRef}{"\n"}{end}'
+```

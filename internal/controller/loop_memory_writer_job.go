@@ -20,9 +20,11 @@
 //     /workspace/.coxswain/lessons.json, applies the static write policy
 //     (pkg/memorywrite.Screen — secrets regex, ≤500 chars, single-line,
 //     non-blank, the size cap), writes ONLY the eligible lessons to
-//     /memory/lesson-<n>.txt, and reports a BOUNDED summary (counts + per-
-//     lesson sha256-prefix/written|dropped/rule — never the lesson text)
-//     via its termination message.
+//     /memory/<sha256>.txt (one file per lesson, named by the trimmed
+//     lesson's sha256 — the dedup key), and reports a BOUNDED summary
+//     (counts + per-lesson sha256-prefix/written|dropped/rule; a curator
+//     reason is free model text and may quote a lesson) via its
+//     termination message.
 //  3. The operator reads the Job's termination phase + the bounded summary
 //     and records the outcome on the MemoryWriteDone condition (and a
 //     Warning Event on failure). The Job's NetworkPolicy denies ALL egress
@@ -45,6 +47,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -201,9 +204,10 @@ func (r *LoopReconciler) memoryWriterImage() string {
 // target), and the workspace PVC is mounted READ-ONLY (the Job reads the
 // lessons file but never writes the workspace).
 //
-// The NetworkPolicy denies ALL ingress and ALL egress (the writer Job makes
-// no network calls — the deny-all is the ADR-0007 fence: a lesson must not
-// be exfiltrated during the write).
+// The NetworkPolicy denies ALL ingress and ALL egress EXCEPT the Loop's model
+// proxy (the curator call) and DNS (to resolve it) — see
+// ensureMemoryWriterNetworkPolicy. That is the ADR-0007 fence: a lesson must
+// not be exfiltrated during the write.
 //
 // Returns (requeue, err). requeue is true when the Job was just created or
 // is not yet terminal (the operator must requeue to read its outcome);
@@ -316,16 +320,19 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 	}
 
 	// Create the Job (the operator-controlled memory-write entrypoint) + the
-	// NetworkPolicy (deny-all). The Job is owned by the Loop.
+	// NetworkPolicy (egress fence: proxy + DNS only). The Job is owned by the Loop.
+	// P3-6: the NetworkPolicy BEFORE the Job, so the writer pod never
+	// exists without its egress fence (ADR-0007: a lesson must not be
+	// exfiltrated during the write).
+	if err := r.ensureMemoryWriterNetworkPolicy(ctx, loop); err != nil {
+		return false, fmt.Errorf("create memory-writer netpol %s: %w", memoryWriterNetPolName(loop.Name), err)
+	}
 	job := r.buildMemoryWriterJob(loop, pvcName, outcomeArg)
 	if err := ctrl.SetControllerReference(loop, job, r.Scheme); err != nil {
 		return false, fmt.Errorf("set owner on memory-writer job %s: %w", jobName, err)
 	}
 	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
 		return false, fmt.Errorf("create memory-writer job %s: %w", jobName, err)
-	}
-	if err := r.ensureMemoryWriterNetworkPolicy(ctx, loop); err != nil {
-		return false, fmt.Errorf("create memory-writer netpol %s: %w", memoryWriterNetPolName(loop.Name), err)
 	}
 	logf.FromContext(ctx).Info("created memory-writer Job", "job", jobName, "outcome", outcomeArg)
 	// The Job was just created: requeue to read its outcome (the Job's pod
@@ -687,9 +694,13 @@ func (r *LoopReconciler) ensureMemoryWriterServiceAccount(ctx context.Context, n
 // recordMemoryWriterOutcome reads the memory-writer Job's pod's terminal
 // phase + the bounded summary (the termination message) and records the
 // outcome on the Loop's MemoryWriteDone condition. Returns (requeue): true
-// when the Job's pod is not yet terminal (the operator must requeue to read
-// the outcome); false when a terminal outcome was recorded (Succeeded ->
-// MemoryWritten, Failed -> MemoryWriteFailed).
+// when there is no decision yet: a pod read error, or the Job is still in
+// progress (its pod is absent or not yet terminal, and the Job has neither a
+// Complete nor a Failed condition); false when a terminal outcome was
+// recorded. With a pod, its phase decides (Succeeded -> MemoryWritten, Failed
+// -> MemoryWriteFailed); with NO pod (pod GC, eviction, an admission reject),
+// the Job's own Complete/Failed condition decides (F31,
+// recordMemoryWriterOutcomeNoPod).
 //
 // A Succeeded Job is MemoryWritten (the write completed — whether or not
 // any lesson was eligible; a zero-eligible write is a valid "nothing to
@@ -705,9 +716,12 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 		return true
 	}
 	if pod == nil {
-		// The Job has no pod yet (the batch controller has not created it):
-		// requeue.
-		return true
+		// F31: no pod. Either the batch controller has not created it yet (the
+		// Job has neither condition: no decision, requeue), or the Job is
+		// already terminal and its pod is gone (pod GC, eviction, an admission
+		// reject). Decide from the Job's own Complete/Failed conditions rather
+		// than requeueing forever.
+		return r.recordMemoryWriterOutcomeNoPod(loop, job)
 	}
 	// The Job's terminal state (the batch Job's conditions: Complete or
 	// Failed). The pod's phase is the authoritative signal (the Job's
@@ -930,9 +944,9 @@ func bumpMemoryWriteMetrics(outcome, summary string) {
 // memoryWriteVerdicts counts the lessons of the writer's summary by verdict.
 // The summary's COUNTS line ("summary: total=N written=W dropped=D",
 // cmd/memory-writer summaryLine) is authoritative for kept and for the total
-// dropped: the per-lesson lines can disagree with it (two identical lessons in
-// one batch both read "written" while the counts say written=1 dropped=1,
-// reviewer finding P3-2, queued as F33). The per-lesson lines are used only to
+// dropped. The per-lesson lines agree with it (the writer de-dupes identical
+// lessons in a batch before writing, F33 P3-2), so the counts line stays the
+// authority and the lines are used only to
 // split the drops: a line "dropped" with a reason that starts "curator: " or is
 // "curator unavailable" is a curator drop; the remaining drops (static policy,
 // ineligible outcome, duplicate) are static drops. A summary with no counts
@@ -976,9 +990,12 @@ func memoryWriteVerdicts(summary string) (kept, static, curatorDrop int) {
 // from the bounded summary (item 7, the Phase 5 done-when PLAN.md:85):
 // "memory write completed — audit: " + the per-lesson verdict lines (one
 // line each: "lesson-<n> <sha12> written|dropped <reason>") + the counts
-// line. The summary is the Job's own output (never lesson text — the Job's
-// summary lines carry only the sha256-prefix, written|dropped, and the
-// rule), so echoing it on the Loop leaks no lesson content. A failed write
+// line. The summary is the Job's own output. The lines carry the sha256-prefix,
+// written|dropped and the rule; for a lesson the curator judged the rule is the
+// curator's reason, which is free model text (pkg/curator strips CR/LF and cuts
+// at 200 runes) and CAN quote the lesson (F33, p5-code P3-5). The text already
+// passed the secrets screen, so this is not a credential leak, but the audit is
+// not guaranteed lesson-free. A failed write
 // is UNRELIABLE evidence (the write did not complete) and gets the plain
 // failure message — the operator does not fabricate an audit for a write
 // that did not happen. An empty summary (no termination message) falls
@@ -991,23 +1008,53 @@ func memoryWriteAuditMessage(summary string) string {
 }
 
 // memoryWriteAuditText is the bounded audit text: the summary's lines
-// joined with a single space. The per-lesson lines already carry the
-// verdict (written|dropped + the one-line reason — the curator's
-// "<reason>" string, or the static rule name), so the text shows which
-// lessons were written and why. The Event's message is capped by
-// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes, so
-// the audit text is truncated to 1000 bytes here (the per-lesson lines are
-// ≤ ~80 bytes each; the truncation never cuts mid-lesson for the bounded
-// lesson count the policy enforces). The truncation is BOUNDED and never
-// includes lesson text (the summary lines are sha-prefix + status + rule).
+// joined with a single space. The writer puts the COUNTS line first, then the
+// audit (eviction / truncation) lines, then one line per lesson (F78), so a
+// cut loses the per-lesson lines first. The cut is LINE-oriented: whole lines
+// are kept up to 1000 bytes, then " … N more lines" says how many were
+// dropped; there is never a half line. The Event's message is capped by
+// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes. The
+// per-lesson lines are sha-prefix + status + rule, where a curator reason is
+// model text (see memoryWriteAuditMessage).
+//
+// A single line longer than the cap (not producible by the writer, which
+// bounds every line) is cut on a rune boundary (a byte cut could split a
+// multi-byte rune, F33 P3-5) and marked with "…".
 func memoryWriteAuditText(summary string) string {
 	const max = 1000
-	text := strings.ReplaceAll(summary, "\n", " ")
-	text = strings.TrimSpace(text)
-	if len(text) > max {
-		return text[:max] + "…"
+	var lines []string
+	for l := range strings.SplitSeq(summary, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
 	}
-	return text
+	text := strings.Join(lines, " ")
+	if len(text) <= max {
+		return text
+	}
+	// Keep whole lines while the kept text plus the "more lines" note fits.
+	kept, size := 0, 0
+	for i, l := range lines {
+		add := len(l)
+		if i > 0 {
+			add++ // the joining space
+		}
+		note := len(fmt.Sprintf(" … %d more lines", len(lines)-i-1))
+		if size+add+note > max {
+			break
+		}
+		size += add
+		kept = i + 1
+	}
+	if kept == 0 {
+		// Not even the first line fits: rune-boundary cut.
+		cut := max
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		return text[:cut] + "…"
+	}
+	return strings.Join(lines[:kept], " ") + fmt.Sprintf(" … %d more lines", len(lines)-kept)
 }
 
 // memoryWriterTrue / memoryWriterFalse are the bool values the memory-writer
@@ -1056,4 +1103,52 @@ func (r *LoopReconciler) runTamperGate(loop *coxv1alpha1.Loop, changed *bool) {
 	if r.applyTamperGate(loop) {
 		*changed = true
 	}
+}
+
+// recordMemoryWriterOutcomeNoPod decides the outcome of a memory-writer Job
+// that has no pod, from the Job's own terminal conditions (F31). Failed ->
+// MemoryWriteFailed naming the Job's reason; Complete -> MemoryWritten with no
+// summary (the pod, and with it the termination message, is gone). A Job with
+// neither condition is still in progress: no decision (requeue).
+func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, job *batchv1.Job) bool {
+	if c := jobTerminalCondition(job, batchv1.JobFailed); c != nil {
+		reason := c.Reason
+		if reason == "" {
+			reason = "unknown"
+		}
+		msg := fmt.Sprintf("memory write failed (the Job failed with reason %s and has no pod; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)", reason)
+		if setMemoryWriterCondition(loop, memoryWriteFailedReason, msg) {
+			r.notePendingMemoryMetric(loop, "failed", "")
+		}
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
+				"memory write failed: the memory-writer Job failed (%s, reason %s) and has no pod", memoryWriterJobName(loop), reason)
+		}
+		return false
+	}
+	if jobTerminalCondition(job, batchv1.JobComplete) != nil {
+		// N1: nobody read the pod (it is gone), so do not claim it succeeded.
+		const msg = "memory write completed (the Job is Complete; its pod is gone, so no per-lesson audit summary is available)"
+		if setMemoryWriterCondition(loop, memoryWrittenReason, msg) {
+			r.notePendingMemoryMetric(loop, "written", "")
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
+					"memory write completed: the memory-writer Job is Complete but its pod is gone, so no per-lesson audit summary is available (%s)", memoryWriterJobName(loop))
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// jobTerminalCondition returns the Job's condition of the given type when it
+// is True, else nil.
+func jobTerminalCondition(job *batchv1.Job, condType batchv1.JobConditionType) *batchv1.JobCondition {
+	for i := range job.Status.Conditions {
+		c := &job.Status.Conditions[i]
+		if c.Type == condType && c.Status == corev1.ConditionTrue {
+			return c
+		}
+	}
+	return nil
 }

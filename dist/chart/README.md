@@ -39,27 +39,41 @@ chart's rendered output).
 
 ## Driving Manual-mode approvals with the cox CLI (rbac.helpers.enabled)
 
-`cox approve <loop>` and `cox reject <loop> --reason <reason>` PATCH the
-Loop's status conditions (PlanApproved / PlanRejected). The base operator
-roles do not grant a user the `patch` verb on `loops`, so a human driving
-Manual-mode approvals (`approval.mode: Manual`) needs the **loop editor**
-role — or an equivalent binding:
+`cox approve <loop>` and `cox reject <loop> --reason <reason>` read the Loop
+with `get` and write the whole object back to the `loops/status` subresource
+with an `update` (PUT; they set the PlanApproved / PlanRejected conditions).
+Both also read `PLAN.md` from the workspace through a short-lived
+peek pod (`internal/cli/workspace.go`), so the user needs pod RBAC in the
+Loop's namespace as well. The base operator roles grant neither, so a human
+driving Manual-mode approvals (`approval.mode: Manual`) needs both:
 
-- install with `--set rbac.helpers.enabled=true` (creates the `loop-editor`
-  role with `create;delete;get;list;patch;update;watch` on
-  `coxswain.wattu.com/loops`), then bind it to a user or group:
+- **Loop access:** install with `--set rbac.helpers.enabled=true` (creates
+  the `<fullname>-loop-editor-role` helper role, `coxswain-loop-editor-role`
+  at the default release name: `create;delete;get;list;patch;update;watch` on
+  `coxswain.wattu.com/loops` and `get;update;patch` on `loops/status`), then
+  bind it to a user or group:
 
   ```bash
   kubectl create rolebinding <name> \
-    --role=loop-editor --user=<user> \
+    --role=coxswain-loop-editor-role --user=<user> \
     -n <release-namespace>
   ```
 
-  (with `rbac.namespaced=false` the role is a ClusterRole: use
-  `--clusterrole=loop-editor --user=<user>` without `-n`.)
+  (the role is named `<release>-coxswain-loop-editor-role` when the release
+  name does not contain `coxswain`, e.g. `my-cox-coxswain-loop-editor-role`
+  for release `my-cox`; with `rbac.namespaced=false` the role is a
+  ClusterRole: use `--clusterrole=<that name> --user=<user>` without `-n`.)
 
-- or create your own Role/ClusterRole + binding with the `patch` verb on
-  `loops` (the minimum `cox approve`/`reject`/`diff` need).
+- **Pod access (the peek pod):** the helper role does NOT include this. Bind
+  a Role in the Loop's namespace granting `create`, `get`, `delete` on `pods`
+  and `get` on `pods/log`.
+
+- or create your own Role/ClusterRole with: `get` on `loops`, `update` on
+  `loops/status`, and the pod rules above (the minimum `cox approve` /
+  `cox reject` need). A role with only `patch` on `loops` is NOT enough: the
+  API server answers Forbidden on `loops/status`, and `cox approve` fails at
+  `create peek pod` without the pod rules. (`cox pause` / `cox resume` use
+  `patch` on `loops`, a separate verb.)
 
 Without such a binding, `cox approve`/`reject` are rejected by the API
 server. The operator is unaffected: Auto-mode Loops advance without any

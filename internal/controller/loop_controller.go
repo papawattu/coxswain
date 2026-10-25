@@ -125,6 +125,13 @@ var (
 		Name: "coxswain_loop_tokens_total",
 		Help: "Total model tokens consumed, as folded into status.budget from the proxy reading, by kind (prompt|completion).",
 	}, []string{"kind"})
+	// F44: requests the model proxy forwarded without a parseable usage
+	// object, as folded into status.budget (process-wide; the per-Loop view is
+	// status.budget.unmeteredRequests and the MeteringDegraded condition).
+	loopUnmeteredRequestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "coxswain_unmetered_requests_total",
+		Help: "Total model requests forwarded without a usage object, as folded into status.budget (not counted toward token or cost caps).",
+	})
 	// F30 (PLAN.md Phase 7 "memory-write rate"): coxswain_memory_writes_total
 	// is bumped once per Loop on the transition that sets the MemoryWriteDone
 	// condition (written = the writer Job succeeded, failed = it failed).
@@ -150,6 +157,7 @@ func init() {
 	metrics.Registry.MustRegister(loopStallsTotal)
 	// B5a: loops_active is a custom Collector, registered in SetupWithManager.
 	metrics.Registry.MustRegister(loopTokensTotal)
+	metrics.Registry.MustRegister(loopUnmeteredRequestsTotal)
 	metrics.Registry.MustRegister(memoryWritesTotal)
 	metrics.Registry.MustRegister(memoryLessonsTotal)
 }
@@ -166,6 +174,9 @@ const (
 	// to the local proxy (a Loop cannot override it: COX_* names are rejected
 	// at admission, I34).
 	coxModelBaseURL = "COX_MODEL_BASE_URL"
+	// coxModelTimeout is the env var carrying spec.loop.modelTimeoutSeconds
+	// (F46) as a Go duration; the runner reads it into PhaseConfig.ModelTimeout.
+	coxModelTimeout = "COX_MODEL_TIMEOUT"
 	// coxGoal is the env var the operator sets on the agent carrying
 	// spec.goal (S3, GAP 1: the goal was never passed to the agent). COX_* is
 	// I34-protected, so a Loop cannot override it.
@@ -1546,6 +1557,12 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		if loop.Spec.Agent.Model != "" {
 			agentEnv = append(agentEnv, corev1.EnvVar{Name: "COX_MODEL", Value: loop.Spec.Agent.Model})
 		}
+		// F46: the per-request model timeout (spec.loop.modelTimeoutSeconds).
+		// Operator-set like the rest of COX_*; absent leaves the runner's
+		// compiled-in default.
+		if t := loop.Spec.Loop.ModelTimeoutSeconds; t != nil && *t > 0 {
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: coxModelTimeout, Value: fmt.Sprintf("%ds", *t)})
+		}
 	}
 	// I42d: when the egress proxy is expected (network allows present, or the
 	// policy cannot be read — the fail-closed needsEgressProxy gate), the agent
@@ -2305,6 +2322,11 @@ func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
 // path changed between the operator-pinned baseCommit and verifiedCommit
 // (ADR-0005 D10). It is set before any acceptance check runs.
 const TamperedVerifyReason = "TamperedVerify"
+
+// PinNotDescendantReason is the terminal Failed reason recorded when the verify
+// Job's import-agent init refused the pinned commit because it is not a
+// descendant of status.baseCommit (F43).
+const PinNotDescendantReason = "PinNotDescendant"
 
 // TamperVerdict is the tri-state outcome of the operator's TamperedVerify
 // decision at Verifying (ADR-0005 D24). The operator's evidence is a pointer:

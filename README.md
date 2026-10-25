@@ -101,7 +101,7 @@ The design, most of which is still being built:
 - **Runner** — the agent inside the sandbox. It plans and writes code; it can't mark its own work as done.
 - **Acceptance checks** — your commands (like `go test ./...`). The operator runs them in a separate, locked-down pod against a pinned commit, and fails the loop if the agent changed the tests. A person reviewing the draft pull request is the final gate.
 
-The vocabulary is defined in [CONTEXT.md](CONTEXT.md); the design decisions are in [docs/adr/](docs/adr/).
+The vocabulary is defined in [CONTEXT.md](CONTEXT.md); the docs index is in [docs/README.md](docs/README.md); the glossary of terms used in the docs is in [docs/GLOSSARY.md](docs/GLOSSARY.md); the operator FAQ is in [docs/FAQ.md](docs/FAQ.md); the design decisions are in [docs/adr/](docs/adr/).
 
 ### Delivery
 

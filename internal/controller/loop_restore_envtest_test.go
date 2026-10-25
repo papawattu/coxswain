@@ -378,6 +378,118 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonRestored)
 	})
 
+	It("F47 RESTORE (reactive): a LOST PVC restores from the last TRUSTED checkpoint, never from a forged status entry naming another Loop's snapshot", func() {
+		ns := "f47-restore-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+		name := "f47-restore"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		By("forging two later status entries: another Loop's snapshot, and a wrong-shape name labelled for this Loop")
+		foreign := b1MakeSnapshotObj("victim", ns, 9)
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+		b2MakeSnapshotReady(ctx, ns, "checkpoint-victim-iter-9")
+		odd := b1MakeSnapshotObj(name, ns, 8)
+		odd.SetName("weird-snapshot")
+		Expect(k8sClient.Create(ctx, odd)).To(Succeed())
+		b2MakeSnapshotReady(ctx, ns, "weird-snapshot")
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		at := metav1.Now()
+		loop.Status.Checkpoints = append(loop.Status.Checkpoints,
+			coxv1alpha1.CheckpointStatus{Iteration: 8, Name: "weird-snapshot", At: at},
+			coxv1alpha1.CheckpointStatus{Iteration: 9, Name: "checkpoint-victim-iter-9", At: at, Milestone: true})
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		By("losing the PVC")
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred())
+		pvc.Finalizers = []string{}
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+		b2Reconcile(r, ns, name)
+
+		restored, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the operator must restore the LOST PVC")
+		Expect(restored.Spec.DataSource).NotTo(BeNil())
+		Expect(restored.Spec.DataSource.Name).To(Equal(snapName),
+			"the restore source is the last TRUSTED entry, not a forged one (got %q)", restored.Spec.DataSource.Name)
+	})
+
+	// f47Lost drives a Loop to a ready iter-0 checkpoint, replaces
+	// status.checkpoints with mk(genuine entry), and loses the PVC; the caller
+	// reconciles and asserts.
+	f47Lost := func(name string, mk func(genuine coxv1alpha1.CheckpointStatus) []coxv1alpha1.CheckpointStatus) (*LoopReconciler, *record.FakeRecorder, string, string) {
+		ns := "f47-" + name + "-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		})
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: b2LoopSpec()})).To(Succeed())
+		r, rec := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b1DriveToSucceeded(ctx, r, ns, name)
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		b2MakeSnapshotReady(ctx, ns, snapName)
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.Checkpoints = mk(loop.Status.Checkpoints[0])
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred())
+		pvc.Finalizers = []string{}
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+		return r, rec, ns, snapName
+	}
+
+	It("F47 RESTORE: an entry whose Iteration disagrees with its (valid) name is rejected; the restore uses the genuine entry and reaches Restored", func() {
+		const name = "f47-iter"
+		r, _, ns, snapName := f47Lost(name, func(g coxv1alpha1.CheckpointStatus) []coxv1alpha1.CheckpointStatus {
+			forged := g
+			forged.Iteration = 7 // the name is trusted-looking (iter-0); only the iteration is hostile
+			return []coxv1alpha1.CheckpointStatus{g, forged}
+		})
+		b2Reconcile(r, ns, name)
+		restored, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(restored.Spec.DataSource).NotTo(BeNil())
+		Expect(restored.Spec.DataSource.Name).To(Equal(snapName))
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		cond := b2RestoreCondition(loop)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored), "a forged iteration must not divert the readiness gate")
+	})
+
+	It("F47 RESTORE: a status list with NO trusted entry takes the visible NoUsableCheckpoint fallback (condition + Event), not a silent empty workspace", func() {
+		const name = "f47-alluntrusted"
+		r, rec, ns, _ := f47Lost(name, func(coxv1alpha1.CheckpointStatus) []coxv1alpha1.CheckpointStatus {
+			return []coxv1alpha1.CheckpointStatus{{Iteration: 3, Name: "checkpoint-victim-iter-3", At: metav1.Now()}}
+		})
+		b2Reconcile(r, ns, name)
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		cond := b2RestoreCondition(loop)
+		Expect(cond).NotTo(BeNil(), "the fallback must be surfaced (I90), not silent")
+		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
+		Expect(cond.Message).To(ContainSubstring("none of the status.checkpoints entries"))
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonNoUsableCheckpoint)
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the A2 fallback still recreates the PVC (empty)")
+		Expect(pvc.Spec.DataSource).To(BeNil())
+	})
+
 	It("RESTORE (reactive, not-ready): a LOST workspace PVC whose latest checkpoint is NOT ReadyToUse is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; the PVC is NOT recreated from the checkpoint — the in-progress state, no decision, I49)", func() {
 		ns := "b2-restore-notready-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

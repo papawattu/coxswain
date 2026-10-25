@@ -24,6 +24,10 @@
 //   - COX_MODEL: the model name passed to /v1/chat/completions (default
 //     "local-model"). It must match a model the upstream model server serves
 //     (vLLM validates it; e.g. 'qwen3.8-27b' on the local 192.168.1.20:8000).
+//   - COX_MODEL_TIMEOUT: optional per-request model timeout (F46), a Go
+//     duration ("90s") or a bare number of seconds. Absent, invalid or <= 0
+//     keeps the runner default (120s). Set by the operator from
+//     spec.loop.modelTimeoutSeconds.
 //
 // Flags:
 //   - -max-steps: cap on model rounds (0 = the runner default, 25).
@@ -48,10 +52,36 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/papawattu/coxswain/runner"
 )
+
+// parseModelTimeout reads COX_MODEL_TIMEOUT (F46): a Go duration or a bare
+// number of seconds. Zero (use the runner default) for absent, invalid or
+// non-positive input; an invalid value is logged, not fatal.
+func parseModelTimeout(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		n, nerr := strconv.Atoi(v)
+		if nerr != nil {
+			log.Printf("runner: ignoring invalid COX_MODEL_TIMEOUT %q: %v", v, err)
+			return 0
+		}
+		d = time.Duration(n) * time.Second
+	}
+	if d <= 0 {
+		return 0
+	}
+	return d
+}
 
 func main() {
 	maxSteps := flag.Int("max-steps", 0, "cap on model rounds (0 = the runner default)")
@@ -84,7 +114,8 @@ func main() {
 	if model == "" {
 		model = "local-model"
 	}
-	log.Printf("runner: goal=%q model=%s workspace=%s", goal, model, workspace)
+	modelTimeout := parseModelTimeout(os.Getenv("COX_MODEL_TIMEOUT"))
+	log.Printf("runner: goal=%q model=%s workspace=%s modelTimeout=%s", goal, model, workspace, modelTimeout)
 
 	// The one-shot phase driver: wait for the desired phase, do the phase's
 	// work, write the claim, and exit (0 = the phase completed the operator's
@@ -109,10 +140,11 @@ func main() {
 		// ADR-0006: the agent holds no model key; the proxy injects auth. The
 		// runner sends no API key (the proxy does not require one from the
 		// agent).
-		APIKey:    "",
-		Model:     model,
-		MaxSteps:  *maxSteps,
-		ExtraBody: extra,
+		APIKey:       "",
+		Model:        model,
+		MaxSteps:     *maxSteps,
+		ExtraBody:    extra,
+		ModelTimeout: modelTimeout,
 	}, stop)
 	code := 0
 	if res.Status == "blocked" {

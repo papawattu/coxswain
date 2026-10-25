@@ -539,7 +539,10 @@ type LoopReconciler struct {
 	// http://<pod-ip>:9090/coxswain/usage. Every envtest spec injects a fake
 	// via this field (envtest has neither a proxy pod that serves HTTP nor a
 	// kubelet). An error means NO reading this reconcile: status.budget is
-	// left unchanged (no reset, no delta — the operator does not guess).
+	// left unchanged (no reset, no delta — the operator does not guess). That
+	// is true of proxy.ErrNotReady (a starting or absent proxy pod); a read
+	// FAILURE past the start grace is counted and may set BudgetReadingStale
+	// (F44, F84b).
 	readProxyUsage func(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error)
 
 	// usageHTTPClient is the http.Client the default readProxyUsage uses. Set
@@ -1945,6 +1948,21 @@ func (r *LoopReconciler) modelProxyHold(ctx context.Context, loop *coxv1alpha1.L
 	if loop.Spec.Agent.EndpointSecretRef == "" {
 		return false
 	}
+	// F84b: a terminal Loop is not held for its proxy any more — its sandbox is
+	// Suspended for the terminal phase itself (loopSandboxStopped), so the
+	// condition must not outlive the work it describes (the R34 I120(b)
+	// "condition outlives its subject" class): a Loop that failed or succeeded
+	// while the proxy was not Ready would otherwise carry
+	// ModelProxyNotReady=True forever, with a message promising a hold that no
+	// longer exists.
+	if isTerminalPhase(loop.Status.Phase) {
+		if conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
+			setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
+				modelProxyTerminalReason,
+				fmt.Sprintf("the Loop is %s, so the model proxy hold no longer applies", loop.Status.Phase))
+		}
+		return false
+	}
 	proxyPod := &corev1.Pod{}
 	perr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, proxyPod)
 	notReady, why := modelProxyNotReady(proxyPod, loop, perr)
@@ -1952,17 +1970,21 @@ func (r *LoopReconciler) modelProxyHold(ctx context.Context, loop *coxv1alpha1.L
 		clearModelProxyNotReady(loop)
 		return false
 	}
-	r.surfaceModelProxyNotReady(loop, proxyPod, why)
+	r.surfaceModelProxyNotReady(loop, why)
 	return true
 }
 
 // modelProxyNotReady reads the D35a gate's fact: the model proxy pod is not
-// Ready for this Loop, and why. A read error (a pod that does not exist yet, or
-// an apiserver error) is the same hold (fail-closed).
+// Ready for this Loop, and why. A read error is the same hold (fail-closed),
+// but the message distinguishes the two shapes (F84b: it must not state a
+// cause it has not observed — an apiserver error is not "it does not exist").
 func modelProxyNotReady(pod *corev1.Pod, loop *coxv1alpha1.Loop, err error) (bool, string) {
 	switch {
 	case err != nil:
-		return true, "it does not exist yet"
+		if apierrors.IsNotFound(err) {
+			return true, "it does not exist yet"
+		}
+		return true, fmt.Sprintf("it could not be read (%v)", err)
 	case !metav1.IsControlledBy(pod, loop):
 		return true, "it is not owned by this Loop"
 	case !isPodReady(pod):
@@ -1978,16 +2000,19 @@ func modelProxyNotReady(pod *corev1.Pod, loop *coxv1alpha1.Loop, err error) (boo
 // (ModelProxyNotReady, True) and emits ONE Warning Event on the transition. The
 // message is stable for a given phase/reason (no age, no counts) so a held Loop
 // does not rewrite its status every reconcile.
-func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, pod *corev1.Pod, why string) {
+func (r *LoopReconciler) surfaceModelProxyNotReady(loop *coxv1alpha1.Loop, why string) {
 	msg := fmt.Sprintf("the model proxy pod %s is not Ready: %s; the sandbox is held Suspended until it is (the model proxy is the agent's only model egress)",
 		proxyPodName(loop.Name), why)
-	_ = pod
 	was := conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition)
 	setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionTrue, "ModelProxyNotReady", msg)
 	if !was && r.Recorder != nil {
 		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "ModelProxyNotReady", "%s", msg)
 	}
 }
+
+// modelProxyTerminalReason is the ModelProxyNotReady reason a terminal Loop's
+// clear uses (F84b): distinct from Ready, because the pod may well not be.
+const modelProxyTerminalReason = "LoopTerminal"
 
 // clearModelProxyNotReady clears a recorded hold once the proxy pod is Ready.
 func clearModelProxyNotReady(loop *coxv1alpha1.Loop) {

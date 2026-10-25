@@ -2306,6 +2306,11 @@ func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
 // (ADR-0005 D10). It is set before any acceptance check runs.
 const TamperedVerifyReason = "TamperedVerify"
 
+// PinNotDescendantReason is the terminal Failed reason recorded when the verify
+// Job's import-agent init refused the pinned commit because it is not a
+// descendant of status.baseCommit (F43).
+const PinNotDescendantReason = "PinNotDescendant"
+
 // TamperVerdict is the tri-state outcome of the operator's TamperedVerify
 // decision at Verifying (ADR-0005 D24). The operator's evidence is a pointer:
 // a NON-NIL tamper exit code comes from a terminated tamper init container for

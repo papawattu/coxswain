@@ -1077,6 +1077,68 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(found).To(BeTrue(), "the Failed condition carries the TamperedVerify reason")
 	})
 
+	It("maps an import-agent not-descendant exit to Failed:PinNotDescendant (terminal, F43)", func() {
+		ns := "s5a-notdesc-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "notdescloop"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		r := s5aDriveToVerifying(ns, name)
+		loop := s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID
+		// filter skips the pod — the operator's ensureVerifyJob creates it in
+		// the S5a happy path, but the spec drives its own verify Job directly).
+		job := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name + "-verify-pod",
+				Namespace: ns,
+				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       i65JobKind,
+					Name:       jobName,
+					UID:        job.UID,
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		// import-agent exits verifyNotDescendantExit (the pin does not descend
+		// from baseCommit); later inits never ran (the kubelet stops at the
+		// first non-zero init).
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+			{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyNotDescendantExit}}},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		loop = s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"a not-descendant pin -> Failed (terminal, no retry)")
+		found := false
+		for _, c := range loop.Status.Conditions {
+			if c.Type == string(coxv1alpha1.LoopPhaseFailed) && c.Reason == PinNotDescendantReason {
+				found = true
+			}
+		}
+		Expect(found).To(BeTrue(), "the Failed condition carries the PinNotDescendant reason")
+	})
+
 	// I47 (REVIEW-PHASE1-R20, PR #55 review): the operator-side build-artifact
 	// check — the trust-boundary backstop for the runner's commitWorkspace
 	// filter. The runner runs in the AGENT's container and reads the

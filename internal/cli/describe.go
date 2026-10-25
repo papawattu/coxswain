@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // newDescribeCommand builds `cox describe <loop>`: a human-readable summary of
@@ -66,6 +69,22 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 	if len(conds) == 0 {
 		w.printf("  <none>\n")
 	}
+	// P3-6: the type column is sized from the conditions printed, not a 12-char
+	// constant — every condition added since F42 overflowed it
+	// (CheckpointsAvailable is 20), so the status column stopped lining up in
+	// the output operators paste into issues.
+	width := len("<none>")
+	statusWidth := len("False")
+	for _, c := range conds {
+		if cm, _ := c.(map[string]any); cm != nil {
+			if t, _ := cm["type"].(string); len(t) > width {
+				width = len(t)
+			}
+			if s, _ := cm["status"].(string); len(s) > statusWidth {
+				statusWidth = len(s)
+			}
+		}
+	}
 	for _, c := range conds {
 		cm, _ := c.(map[string]any)
 		if cm == nil {
@@ -75,7 +94,7 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 		s, _ := cm["status"].(string)
 		reason, _ := cm["reason"].(string)
 		msg, _ := cm["message"].(string)
-		w.printf("  %-12s %s  reason=%s\n", t, s, reason)
+		w.printf("  %-*s %-*s reason=%s\n", width, t, statusWidth, s, reason)
 		if msg != "" {
 			for _, line := range splitLines(msg) {
 				w.printf("      %s\n", line)
@@ -85,54 +104,102 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 
 	// Budget (status.budget).
 	if bmap, ok := getNestedMap(u, "status", "budget"); ok {
-		w.printf("\nBudget:\n")
-		// F85: status.budget has promptTokens/completionTokens, never a
-		// "tokens" field; the label is the sum (kept for a familiar output).
-		prompt := numberField(bmap, "promptTokens")
-		completion := numberField(bmap, "completionTokens")
-		if t := prompt + completion; t > 0 {
-			w.printf("  tokens:     %.0f\n", t)
-		}
-		if r := numberField(bmap, "requests"); r > 0 {
-			w.printf("  requests:   %.0f\n", r)
-		}
-		// F44's durable signal: requests forwarded without a usage object.
-		if n := numberField(bmap, "unmeteredRequests"); n > 0 {
-			w.printf("  unmetered:  %.0f\n", n)
-		}
-		if c, _ := bmap["costUsd"].(string); c != "" {
-			w.printf("  cost:       $%s\n", c)
-		}
-		if at, _ := bmap["lastUsageReadAt"].(string); at != "" {
-			w.printf("  lastRead:   %s\n", at)
-		}
-		// F44: consecutive failed usage reads (BudgetReadingStale's counter).
-		if n := numberField(bmap, "consecutiveReadFailures"); n > 0 {
-			w.printf("  readFails:  %.0f\n", n)
-		}
-		if ex, _ := bmap["exceeded"].(bool); ex {
-			reason, _ := bmap["exceededReason"].(string)
-			w.printf("  exceeded:   %s\n", reason)
+		lines := budgetLines(u, bmap)
+		// The heading is gated on at least one printed line (P3-1): a heading
+		// with nothing under it was the reported F85 defect. `active:` prints
+		// unconditionally, so this is a guard, not the fix.
+		if len(lines) > 0 {
+			w.printf("\nBudget:\n")
+			for _, line := range lines {
+				w.printf("  %s\n", line)
+			}
 		}
 	}
 
 	// Delivery (status.delivery).
 	if dmap, ok := getNestedMap(u, "status", "delivery"); ok {
-		w.printf("\nDelivery:\n")
-		if branch, _ := dmap["branch"].(string); branch != "" {
-			w.printf("  branch:     %s\n", branch)
-		}
-		// F85: prNumber is an int64 in the status (so it is an int64 in the
-		// unstructured object), and the JSON tag is prURL — a float64/"prUrl"
-		// read printed neither line for a real Loop.
-		if pr := numberField(dmap, "prNumber"); pr > 0 {
-			w.printf("  pr:         #%v\n", int64(pr))
-		}
-		if url, _ := dmap["prURL"].(string); url != "" {
-			w.printf("  url:        %s\n", url)
+		lines := deliveryLines(dmap)
+		// Same gate as the Budget block: status.delivery is allocated before
+		// its branch/PR are known, so it can be present with nothing to print.
+		if len(lines) > 0 {
+			w.printf("\nDelivery:\n")
+			for _, line := range lines {
+				w.printf("  %s\n", line)
+			}
 		}
 	}
 	return w.err()
+}
+
+// budgetLines renders the status.budget block, one line per field present.
+func budgetLines(u *unstructured.Unstructured, bmap map[string]any) []string {
+	var lines []string
+	// F88: the wall clock. docs/OPERATOR.md promises it and F85 left it out, so
+	// `exceeded: WallClock` said the cap fired and never how much time was
+	// spent. Printed UNCONDITIONALLY (0s included): status.budget exists on
+	// every non-paused Loop and its only fields are often zero, so a
+	// conditional print is what produced the bare heading (R34 I122(a)).
+	active := humanSeconds(int64(numberField(bmap, "activeSeconds")))
+	if cap, ok := getNestedString(u, "spec", "budget", "maxWallClock"); ok && cap != "" {
+		lines = append(lines, fmt.Sprintf("active:     %s of %s cap", active, cap))
+	} else {
+		lines = append(lines, fmt.Sprintf("active:     %s (no cap)", active))
+	}
+	// F85: status.budget has promptTokens/completionTokens, never a
+	// "tokens" field; the label is the sum (kept for a familiar output).
+	prompt := numberField(bmap, "promptTokens")
+	completion := numberField(bmap, "completionTokens")
+	if t := prompt + completion; t > 0 {
+		lines = append(lines, fmt.Sprintf("tokens:     %.0f", t))
+	}
+	if r := numberField(bmap, "requests"); r > 0 {
+		lines = append(lines, fmt.Sprintf("requests:   %.0f", r))
+	}
+	// F44's durable signal: requests forwarded without a usage object.
+	if n := numberField(bmap, "unmeteredRequests"); n > 0 {
+		lines = append(lines, fmt.Sprintf("unmetered:  %.0f", n))
+	}
+	if c, _ := bmap["costUsd"].(string); c != "" {
+		lines = append(lines, fmt.Sprintf("cost:       $%s", c))
+	}
+	if at, _ := bmap["lastUsageReadAt"].(string); at != "" {
+		lines = append(lines, fmt.Sprintf("lastRead:   %s", at))
+	}
+	// F44: consecutive failed usage reads (BudgetReadingStale's counter).
+	if n := numberField(bmap, "consecutiveReadFailures"); n > 0 {
+		lines = append(lines, fmt.Sprintf("readFails:  %.0f", n))
+	}
+	if ex, _ := bmap["exceeded"].(bool); ex {
+		reason, _ := bmap["exceededReason"].(string)
+		lines = append(lines, fmt.Sprintf("exceeded:   %s", reason))
+	}
+	return lines
+}
+
+// deliveryLines renders the status.delivery block, one line per field present.
+func deliveryLines(dmap map[string]any) []string {
+	var lines []string
+	if branch, _ := dmap["branch"].(string); branch != "" {
+		lines = append(lines, fmt.Sprintf("branch:     %s", branch))
+	}
+	// F85: prNumber is an int64 in the status (so it is an int64 in the
+	// unstructured object), and the JSON tag is prURL — a float64/"prUrl"
+	// read printed neither line for a real Loop.
+	if pr := numberField(dmap, "prNumber"); pr > 0 {
+		lines = append(lines, fmt.Sprintf("pr:         #%v", int64(pr)))
+	}
+	if url, _ := dmap["prURL"].(string); url != "" {
+		lines = append(lines, fmt.Sprintf("url:        %s", url))
+	}
+	return lines
+}
+
+// humanSeconds renders whole active seconds the way the delivered PR body does
+// ("Budget (active time)", controller.humanDurationSeconds: 0s, 1m5s, 1h0m0s),
+// without importing the controller package — the CLI imports no internal/
+// package and pulling the reconciler in for a 3-line formatter is not worth it.
+func humanSeconds(total int64) string {
+	return (time.Duration(total) * time.Second).String()
 }
 
 // numberField reads a numeric field from an unstructured map. An integer status

@@ -397,11 +397,16 @@ It shows:
 - **Phase** (Pending / Planning / Implementing / Verifying / Succeeded /
   Failed / Paused) and the desired phase.
 - **Iteration** (the current iteration number, 1-indexed).
-- **Conditions** (Ready, Succeeded, Stalled, BudgetExceeded,
-  ModelAvailable, NetworkEnforced, PolicyEnforced, Paused — each with its
-  status, reason, and message).
-- **Budget** (token usage, wall-clock time, cost, the cap that was hit).
-- **Delivery** (the PR the deliver Job opened, or the failure reason).
+- **Conditions** (every condition in `status.conditions` — each with its
+  status, reason, and message). The set grows as gates are added, so the
+  output is what the Loop actually carries, not a fixed list.
+- **Budget** (`active:` — the wall-clock time counted toward
+  `spec.budget.maxWallClock`, with the cap or `(no cap)`, then token usage,
+  requests, unmetered requests, cost, the last successful usage read,
+  consecutive read failures, and the cap that was hit, `exceeded:`).
+- **Delivery** (the branch, PR number and URL the deliver Job recorded;
+  omitted until there is one). A failed delivery is not shown here — it is the
+  `Delivered` condition with reason `DeliveryFailed`.
 
 The full audit trail (phase + verify-failure history) is:
 

@@ -231,6 +231,12 @@ existing Loops are unaffected, but new ones are.
 - **Scope note.** F47 closes the *status* vector only: the fork path still derives its source snapshot from `spec.forkOf` and PATCHes a `fork-of` label onto it with no ownership check, so "an editor cannot read another Loop's checkpoint" is not a property this PR establishes; the `ensureCheckpoint` idempotency guard and the tamper gate's status inputs are also not yet hardened this way (PR #254).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #254).
 
+### F83: delivered PR bodies now report the real tamper check result, and the tamper gate acts only on operator-only evidence — #258
+
+- **What was wrong.** The tamper evidence fields (`status.verify.tamperExitCode` / `verifiedCommit`) had no production writer, so the tamper gate could never fire and every delivered PR body said "no tamper evidence (fail-closed reading)" even when the tamper check passed (PR #258).
+- **What changed.** The operator now records the tamper evidence from the verify Job's own pod while the verify runs (the exit code is `nil` while the tamper init is still Waiting/Running — never "clean" by default — then its real exit code, with the pin), so the delivered PR body reports the real result (e.g. "Tamper check: clean (no protected path changed)") instead of always "no tamper evidence". Because the gate's inputs are user-writable status, the gate now acts only when the verify Job's own pod confirms the recorded exit code: the recorded `status.verify.tamperJobUID` must equal the verify Job's UID and that Job's pod's tamper init must have terminated with the recorded code — so a status write can neither fail a Loop nor pass one through the gate (a forged status-only "tampered" verdict leaves the Loop running; the PR adds no new detection) (PR #258).
+- **On upgrade.** `status.verify` gains one field, `tamperJobUID`: apply the new CRD with the new operator (it is generated and chart-synced, so a standard install picks it up); nothing else to do (PR #258).
+
 ### F46: the model timeout is now wired (`spec.loop.modelTimeoutSeconds`) — #252
 
 - **What was wrong.** The runner's model timeout was documented but never set: the entrypoint left `runConfig.ModelTimeout` at its 120s default, so a slow self-hosted model had no knob to raise it (the docs said so — see the #208 and #232 docs entries above) (PR #252).
@@ -512,8 +518,9 @@ merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
 lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
 curator failure), F43 (the agent-chosen pin), F44 (surfacing unmetered
 requests and stale usage reads), F47 (untrusted checkpoint status entries),
-and F46 (the unwired model timeout) were closed by #229, #222, #233, #234,
-#238, #243, #241, #244, #248, #254, and #252. In plain words, the items still
+F46 (the unwired model timeout), and F83 (the unrecorded tamper evidence) were
+closed by #229, #222, #233, #234, #238, #243, #241, #244, #248, #254, #252, and
+#258. In plain words, the items still
 open:
 
 **P1 (security):**

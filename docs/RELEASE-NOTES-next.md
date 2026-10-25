@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `ced2e2a` = PR #251); each claim cites its
+merged code on `main` (as of `de44eac` = PR #253); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -88,7 +88,7 @@ surfaced, not skipped silently (F44, #248).
 - **On upgrade.** Nothing required; the fix is in the operator/egress-proxy
   image (PR #212).
 
-### F42: a Loop with no endpoint got no NetworkPolicy at all — #213
+### F42: a Loop with no endpoint and no network allows got no NetworkPolicy at all — #213
 
 - **What was wrong.** When `spec.agent.endpointSecretRef` was empty and the
   effective policy had no network allows, the operator created no agent
@@ -212,6 +212,30 @@ surfaced, not skipped silently (F44, #248).
   read) is closed by this fix.
 
 ## Other changes
+
+### F45: the chart no longer renders a second (inert) VAP binding — #249
+
+- **What was wrong.** Helm installs from v0.1.0–v0.1.2 rendered **two**
+  `ValidatingAdmissionPolicyBinding` objects for the one ephemeral-container
+  `ValidatingAdmissionPolicy`: the literal
+  `coxswain-deny-ephemeral-containers` (correct), plus a templated one named
+  after the release's fullname, whose `policyName` named the templated name
+  and therefore no existing VAP — the second was **inert** (it bound nothing;
+  the gate still worked). At the default release name `coxswain` the two
+  templates collide on one object, so it was invisible there; at any other
+  release name the stale inert binding was left behind (merged `63679f1` =
+  PR #249).
+- **What changed.** The templated second binding is removed from the chart, so
+  a render produces exactly one effective VAP binding; the guard in
+  `hack/chart-check.sh` now renders a second time at a non-default release
+  name/namespace and fails if a binding names a policy that is not a VAP in
+  that render, or if the render is not exactly one VAP binding
+  (merged `63679f1` = PR #249).
+- **On upgrade.** At the default release name `coxswain`: nothing to do. At
+  any other release name: check for and delete the stale binding per the
+  `docs/UPGRADE.md` "The chart no longer renders a second VAP binding" entry
+  (it is inert, so deleting it cannot weaken the ephemeral-container gate)
+  (PR #249).
 
 ### F44: unmetered requests and stale usage readings are surfaced — #248
 
@@ -357,7 +381,7 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
   `kept`/`static-drop` were not observed. All four outcomes are covered by
   the envtest specs (merged `dcd79da` = PR #206).
 
-### Docs — #208, #209, #224, #225, #227, #228, #230, #231, #232, #236, #237, #239, #240, #247, #251
+### Docs — #208, #209, #224, #225, #227, #228, #230, #231, #232, #236, #237, #239, #240, #247, #250, #251, #253
 
 - #208 (merged `2a3208f`): user docs — corrected a non-existent failure name
   in `docs/QUICKSTART.md` (the deliver credential is only read when
@@ -559,7 +583,7 @@ requests and stale usage reads) were closed by #229, #222, #233, #234,
 No P1 fix outstanding from the merged batch remains open; the three P1
 security items above (F58, F60, F63) are the only P1 work queued.
 
-### Docs — the two additions after #240
+### Docs — the four additions after #240
 
 - #247 (merged `3eed62c`): a new `TROUBLESHOOTING.md` section for
   `PinNotDescendant` (F43, #244) — what you see (the terminal Failed
@@ -571,7 +595,18 @@ security items above (F58, F60, F63) are the only P1 work queued.
   restart the Loop or roll back to a pre-divergence checkpoint — it is
   terminal, no retry), and how it differs from its neighbours
   (`TamperedVerify`, `VerifyInfraFailed`, `Stalled`) (PR #247).
+- #250 (merged `5fbc837`): a new `TROUBLESHOOTING.md` entry for F44 — what
+  the `MeteringDegraded` and `BudgetReadingStale` conditions and their
+  Warning Events (`UnmeteredRequests` / `UsageReadFailed`) mean, what to
+  check (the `status.budget` fields, the model proxy pod's port 9090,
+  whether `unmeteredRequests` is still growing), and why the caps stay on
+  the last good reading (fail-open; D77 hold-vs-surface is still open)
+  (PR #250).
 - #251 (merged `ced2e2a`): the operator FAQ gains the question "Why did my
   Loop fail with PinNotDescendant?" (as question 8, with the later
   questions renumbered) and the glossary gains a `PinNotDescendant` entry;
   both link to the #247 TROUBLESHOOTING section (PR #251).
+- #253 (merged `de44eac`): the `docs/UPGRADE.md` entry for the F45 stale VAP
+  binding — what the stale binding is, why the default release name is
+  unaffected, and the check-and-delete steps for any other release name
+  (PR #253).

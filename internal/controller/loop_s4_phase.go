@@ -1193,17 +1193,64 @@ func (r *LoopReconciler) sandboxMountFailureEvent(ctx context.Context, loop *cox
 	if err := reader.List(ctx, &events, client.InNamespace(loop.Namespace)); err != nil {
 		return nil, err
 	}
+	var mount, progress *corev1.Event
 	for i := range events.Items {
 		ev := &events.Items[i]
 		if ev.InvolvedObject.Kind != "Pod" || ev.InvolvedObject.Name != pod.Name || ev.InvolvedObject.UID != pod.UID {
 			continue
 		}
-		if ev.Type != corev1.EventTypeWarning || !sandboxMountFailureReasons[ev.Reason] {
-			continue
+		switch {
+		case ev.Type == corev1.EventTypeWarning && sandboxMountFailureReasons[ev.Reason]:
+			if mount == nil || eventTimestamp(ev).After(eventTimestamp(mount)) {
+				mount = ev
+			}
+		case ev.Type == corev1.EventTypeNormal && sandboxMountProgressReasons[ev.Reason]:
+			if progress == nil || eventTimestamp(ev).After(eventTimestamp(progress)) {
+				progress = ev
+			}
 		}
-		return ev, nil
 	}
-	return nil, nil
+	if mount == nil {
+		return nil, nil
+	}
+	// The mount may have SUCCEEDED on a later kubelet retry (a slow CSI attach,
+	// a Secret created a few seconds late): the old FailedMount then stays in
+	// the namespace for --event-ttl and the pod is still Pending for an
+	// unrelated reason (a slow image pull — the I49 case). A later Normal
+	// event for the same pod UID (SuccessfulMountVolume, Pulled, Created,
+	// Started) is the kubelet's own proof that the mount is history, so a
+	// FailedMount the kubelet has superseded decides nothing.
+	if progress != nil && eventTimestamp(progress).After(eventTimestamp(mount)) {
+		return nil, nil
+	}
+	return mount, nil
+}
+
+// sandboxMountProgressReasons are the kubelet's Normal Events that prove the
+// volumes mounted and the container lifecycle moved on (F48b): a FailedMount
+// older than one of these is historical.
+var sandboxMountProgressReasons = map[string]bool{
+	"SuccessfulMountVolume": true,
+	"Pulled":                true,
+	"Created":               true,
+	"Started":               true,
+}
+
+// eventTimestamp is the Event's own clock, newest field first (kubelet events
+// set lastTimestamp; events.k8s.io-style writers set eventTime). It orders two
+// Events for the same object; the DECISION clock stays the operator's (r.now,
+// on the pod's age), never this one.
+func eventTimestamp(ev *corev1.Event) time.Time {
+	switch {
+	case !ev.LastTimestamp.IsZero():
+		return ev.LastTimestamp.Time
+	case !ev.EventTime.IsZero():
+		return ev.EventTime.Time
+	case !ev.FirstTimestamp.IsZero():
+		return ev.FirstTimestamp.Time
+	default:
+		return ev.CreationTimestamp.Time
+	}
 }
 
 // surfaceEventsUnreadable (F48b) makes a failed Events read visible (R26 I90)
@@ -1236,6 +1283,18 @@ func (r *LoopReconciler) surfaceEventsUnreadable(ctx context.Context, loop *coxv
 		loop.Annotations = make(map[string]string)
 	}
 	loop.Annotations[sandboxEventsUnreadableAnnotation] = resumeAnnotationTrue
+	// Refresh the caller's resourceVersion (the patch bumped it) exactly as
+	// markMemoryPVCUnboundNotified does (loop_p5a_memory.go): this reconcile's
+	// trailing Status().Update sends loop's RV, and a stale one is a 409
+	// conflict — a lost pass, an error log and the conditions set earlier in
+	// the pass only persisted on the requeue. The caller's in-memory status is
+	// intact (the patch was on a copy).
+	fresh := &coxv1alpha1.Loop{}
+	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil && !apierrors.IsNotFound(gerr) {
+		logf.FromContext(ctx).Error(gerr, "re-get Loop after the sandbox events unreadable mark", "loop", loop.Name)
+		return
+	}
+	loop.ResourceVersion = fresh.ResourceVersion
 }
 
 // clearSandboxInfraEpisode ends a sandbox infra failure episode (F48b): the

@@ -241,6 +241,39 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(loop.Status.Agent.InfraSandboxUID).To(BeEmpty())
 	})
 
+	It("ignores a FailedMount the kubelet has superseded (a later Normal event for the same pod)", func() {
+		loop, pod, r, offset, _ := plant("f48bsuperseded")
+		// The mount FAILED, then succeeded on a retry: the kubelet's later
+		// SuccessfulMountVolume (and Started) prove the mount is history, and
+		// the pod is still Pending for a different reason (a slow image pull).
+		old := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+		plantEventAt(pod, "FailedMount", `MountVolume.SetUp failed for volume "workspace-creds" : timeout`, pod.UID, old)
+		plantEventAt(pod, "SuccessfulMountVolume", `MountVolume.SetUp succeeded for volume "workspace-creds"`, pod.UID,
+			metav1.NewTime(old.Add(5*time.Minute)))
+		*offset = sandboxMountGrace + 5*time.Minute
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).To(BeNil(), "a superseded FailedMount must not burn a retry")
+	})
+
+	It("runs the trailing status write after the one-shot annotation patch (the resourceVersion is refreshed)", func() {
+		loop, pod, clock, offset, rec := plant("f48brv")
+		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
+		*offset = sandboxMountGrace + time.Minute
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+			apiReader: forbidEventsReader{Client: k8sClient}, Recorder: rec}
+		r.now = clock.now
+		Expect(r.sandboxFailure(ctx, loop)).To(BeNil(), noFailure())
+		// markMemoryPVCUnboundNotified refreshes loop.ResourceVersion after its
+		// patch; without that the trailing Status().Update below is a 409.
+		setCondition(loop, cov.SandboxNotStartingCondition, metav1.ConditionTrue, "SandboxNotStarting", "test")
+		Expect(r.finalizeLoopStatus(ctx, loop, true, true, false, false, "")).To(Succeed())
+		persisted := &cov.Loop{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(loop), persisted)).To(Succeed())
+		Expect(persisted.Annotations[sandboxEventsUnreadableAnnotation]).To(Equal(resumeAnnotationTrue))
+		Expect(conditionTruePresent(persisted, cov.SandboxNotStartingCondition)).To(BeTrue(), "the pass's conditions are persisted")
+	})
+
 	It("surfaces an unreadable Events list once (no decision, no failure) instead of skipping it silently", func() {
 		loop, pod, clock, offset, rec := plant("f48bforbidden")
 		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
@@ -265,6 +298,31 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(countEvents(rec, sandboxEventsUnreadableReason)).To(BeZero())
 	})
 })
+
+// noFailure is a readability helper for the nil-failure assertions.
+func noFailure() string { return "no failure decision (I49)" }
+
+// plantEventAt creates a kubelet Event for the pod with an explicit last
+// timestamp (the superseded-FailedMount spec needs an ordering).
+func plantEventAt(pod *corev1.Pod, reason, msg string, uid types.UID, last metav1.Time) {
+	ev := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace,
+			Name: pod.Name + "." + strings.ToLower(reason) + "-" + nowSuffix()},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: uid},
+		Reason:         reason,
+		Message:        msg,
+		Type:           corev1.EventTypeNormal,
+		Count:          1,
+		FirstTimestamp: last,
+		LastTimestamp:  last,
+	}
+	if !sandboxMountFailureReasons[reason] {
+		ev.Type = corev1.EventTypeNormal
+	} else {
+		ev.Type = corev1.EventTypeWarning
+	}
+	Expect(k8sClient.Create(context.Background(), ev)).To(Succeed())
+}
 
 // forbidEventsReader is a client.Reader whose Event List is Forbidden (a
 // missing events get;list rule), for the F48b unreadable-Events spec.

@@ -601,9 +601,19 @@ open:
   (`cp.Iteration == iteration`) and the tamper gate's status inputs are not
   yet validated like `checkpointEntryTrusted` (PR #254's scope note).
 
-- **F83**: delivered PR bodies say "no tamper evidence" even when the
-  tamper check passed, because the tamper exit code is never recorded
-  (tamper failures are still caught and still fail the Loop).
+- **D85 / editor role**: a user bound to the Loop editor role can write
+  the Loop's status subresource (the role grants `update` and `patch` on
+  `loops/status`, since #148, so that `cox approve` and `cox reject` work;
+  see `config/rbac/loop_editor_role.yaml` on `main`). That means such a
+  user can change status fields the operator acts on — for example forge
+  the two approval conditions, or plant checkpoint entries another user's
+  Loop fork reads. F47 (#254) makes the operator validate the checkpoint
+  entries it acts on, but the grant itself is still broader than ADR-0005
+  allows. Until the fix (owner decision D85; recommended: `cox
+  approve`/`reject` writes a one-shot annotation the operator turns into
+  the condition and clears, and the editor role goes back to read-only
+  status), bind the editor role only to users you would trust with the
+  Loop's verdicts.
 - **F48b**: a sandbox pod stuck on a missing Secret volume shows
   `SandboxNotStarting` but is not failed.
 - **F48c**: `SandboxNotStarting` can stay True after the pod it names is

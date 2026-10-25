@@ -277,7 +277,25 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 	if len(cps) == 0 {
 		return nil
 	}
-	last := cps[len(cps)-1]
+	// F47: status is user-writable, so take the last entry that is a checkpoint
+	// of THIS Loop (name shape + the Loop label on the snapshot), never a
+	// forged name that points at another Loop's snapshot.
+	var last coxv1alpha1.CheckpointStatus
+	found := false
+	for i := len(cps) - 1; i >= 0; i-- {
+		switch r.checkpointEntryTrusted(ctx, loop, cps[i]) {
+		case checkpointTrusted:
+			last, found = cps[i], true
+		case checkpointUnknown:
+			return nil // a failed read is no decision
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
 	return &b2RestoreTarget{loopName: loop.Name, iteration: last.Iteration, snapshot: last.Name, kind: b2KindLostPVC}
 }
 

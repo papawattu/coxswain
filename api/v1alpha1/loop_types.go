@@ -273,10 +273,15 @@ type VerifyConfig struct {
 // (ADR-0005 D14). The values are kubelet-recorded container exit codes from
 // the verify Job's pod, never result.json claims.
 //
-// Integrity invariant (ADR-0005 D12): only the manager role may write
-// loops/status; it holds this verify evidence. The scaffolded loop_editor_role
-// and loop_admin_role grant loops/status `get` only, so today nothing but the
-// operator can set these fields. Keep it that way.
+// Integrity note (ADR-0005 D12, corrected by F47): loops/status is NOT
+// operator-only. The editor role grants update/patch on it so cox approve and
+// cox reject can PUT the object, so anyone bound to that role can write any
+// status field. The operator writes valid values, and every consumer that ACTS
+// on a status value must validate it first: the checkpoint GC and the lost-PVC
+// restore check the name shape and that the VolumeSnapshot carries this Loop's
+// label before deleting or restoring from it. Other consumers (e.g. the tamper
+// gate's inputs) are not yet hardened this way; narrowing the editor role is an
+// owner decision.
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
 	// operator records it from the branch head it resolved itself at Verifying

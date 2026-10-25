@@ -45,6 +45,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -126,6 +127,58 @@ const loopCheckpointFinalizer = "coxswain.wattu.com/checkpoints"
 // checkpoint-<loop>-iter-<N> (B1).
 func checkpointName(loop *coxv1alpha1.Loop, iteration int) string {
 	return "checkpoint-" + loop.Name + "-iter-" + strconv.Itoa(iteration)
+}
+
+// checkpointTrust is the verdict of checkpointEntryTrusted.
+type checkpointTrust int
+
+const (
+	// checkpointTrusted: the name has the operator's shape for this Loop and
+	// the VolumeSnapshot carries this Loop's label.
+	checkpointTrusted checkpointTrust = iota
+	// checkpointForeign: the name has the wrong shape, or the snapshot is not
+	// labelled for this Loop. Never delete it, never restore from it.
+	checkpointForeign
+	// checkpointGone: the name is well-formed but no such VolumeSnapshot (or
+	// no VolumeSnapshot type) exists. Nothing to delete or restore.
+	checkpointGone
+	// checkpointUnknown: the read failed for another reason; decide nothing.
+	checkpointUnknown
+)
+
+// checkpointNameShapeOK reports whether name is exactly what checkpointName
+// would produce for this Loop and some iteration (>= 0: iter-0 is valid).
+func checkpointNameShapeOK(loop *coxv1alpha1.Loop, name string) bool {
+	rest, ok := strings.CutPrefix(name, "checkpoint-"+loop.Name+"-iter-")
+	if !ok || rest == "" {
+		return false
+	}
+	n, err := strconv.Atoi(rest)
+	return err == nil && n >= 0 && strconv.Itoa(n) == rest
+}
+
+// checkpointEntryTrusted (F47) decides whether a status.checkpoints entry may
+// be ACTED ON (deleted, or used as a restore source). status is writable by
+// anyone bound to the editor role (cox approve/reject PUT /status), so the
+// operator must not treat a name read from it as one it wrote: it must have
+// the shape checkpointName produces for this Loop AND name a VolumeSnapshot
+// labelled for this Loop (newVolumeSnapshotObj sets loopLabelKey).
+func (r *LoopReconciler) checkpointEntryTrusted(ctx context.Context, loop *coxv1alpha1.Loop, cp coxv1alpha1.CheckpointStatus) checkpointTrust {
+	if !checkpointNameShapeOK(loop, cp.Name) {
+		return checkpointForeign
+	}
+	snap := &unstructured.Unstructured{}
+	snap.SetGroupVersionKind(volumeSnapshotGVK)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: cp.Name}, snap); err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return checkpointGone
+		}
+		return checkpointUnknown
+	}
+	if snap.GetLabels()[loopLabelKey] != loop.Name {
+		return checkpointForeign
+	}
+	return checkpointTrusted
 }
 
 // newVolumeSnapshotObj returns an unstructured VolumeSnapshot for the Loop's
@@ -563,6 +616,25 @@ func (r *LoopReconciler) applyCheckpointRetention(ctx context.Context, loop *cox
 	for _, cp := range loop.Status.Checkpoints {
 		if keptNames[cp.Name] {
 			rebuilt = append(rebuilt, cp)
+			continue
+		}
+		// F47: status is user-writable; only delete a snapshot this Loop owns.
+		switch r.checkpointEntryTrusted(ctx, loop, cp) {
+		case checkpointForeign:
+			// Drop the forged/foreign entry (so it cannot wedge the GC or the
+			// retention count); the object it names is NOT touched.
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "CheckpointEntryUntrusted",
+					"status.checkpoints entry %q is not a checkpoint of this Loop; dropped without deleting anything", cp.Name)
+			}
+			changed = true
+			continue
+		case checkpointGone:
+			changed = true // already gone: just drop the entry
+			continue
+		case checkpointUnknown:
+			rebuilt = append(rebuilt, cp)
+			requeue = true
 			continue
 		}
 		// GC this checkpoint's VolumeSnapshot (the class name is irrelevant

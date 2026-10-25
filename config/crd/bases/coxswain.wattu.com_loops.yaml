@@ -1298,6 +1298,14 @@ spec:
                       the current verifiedCommit counts.
                     format: int32
                     type: integer
+                  tamperJobUID:
+                    description: |-
+                      tamperJobUID is the UID of the verify Job whose pod produced
+                      tamperExitCode (F83). The tamper gate may only act when this matches the
+                      CURRENT verify Job's UID AND that Job's pod's tamper init terminated with
+                      the recorded code (status is user-writable, so a recorded code alone
+                      never fails a Loop).
+                    type: string
                   verifiedCommit:
                     description: |-
                       verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The

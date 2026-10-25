@@ -1099,8 +1099,8 @@ func (r *LoopReconciler) reconcileP5bMemoryWriter(ctx context.Context, loop *cox
 // security gate when changed was already true this reconcile (the red B2
 // tamper spec). Extracted from Reconcile to keep its cyclomatic complexity
 // under the gocyclo threshold.
-func (r *LoopReconciler) runTamperGate(loop *coxv1alpha1.Loop, changed *bool) {
-	if r.applyTamperGate(loop) {
+func (r *LoopReconciler) runTamperGate(loop *coxv1alpha1.Loop, changed *bool, job *batchv1.Job, pod *corev1.Pod) {
+	if r.applyTamperGate(loop, job, pod) {
 		*changed = true
 	}
 }

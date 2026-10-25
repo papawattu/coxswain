@@ -1252,6 +1252,58 @@ const MaxIterationsExceededReason = "MaxIterationsExceeded"
 // cap the handoff specifies: 3 cycles).
 const defaultMaxIterations = 3
 
+// recordTamperEvidence (F83) copies the current verify Job pod's tamper-init
+// status into status.verify: TamperExitCode is non-nil only when the tamper
+// container has TERMINATED (nil while Waiting/Running, never clean by
+// default), and VerifiedCommit is the operator's current pin that the
+// evidence names. It records the TAMPER container's own code, never the
+// failing check's or a trusted init's (a clone failure recorded as a tamper
+// code would flip the Loop to TamperedVerify instead of retrying). Level-based:
+// every reconcile re-derives both, so a retried Job whose tamper is still
+// running clears the previous attempt's code. The pod is the current Job's pod
+// (readVerifyJobPod filters by Job UID); nil pod means no evidence. It
+// returns whether status changed.
+func recordTamperEvidence(loop *coxv1alpha1.Loop, pod *corev1.Pod, job *batchv1.Job) bool {
+	if loop.Status.Verify == nil {
+		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
+	}
+	v := loop.Status.Verify
+	commit := ""
+	if loop.Status.CurrentVerify != nil {
+		commit = loop.Status.CurrentVerify.VerifiedCommit
+	}
+	jobUID := ""
+	if job != nil {
+		jobUID = string(job.UID)
+	}
+	var code *int32
+	if pod != nil {
+		for i := range pod.Status.InitContainerStatuses {
+			ics := &pod.Status.InitContainerStatuses[i]
+			if ics.Name == verifyTamperInit && ics.State.Terminated != nil {
+				c := ics.State.Terminated.ExitCode
+				code = &c
+				break
+			}
+		}
+	}
+	changed := false
+	if (v.TamperExitCode == nil) != (code == nil) ||
+		(v.TamperExitCode != nil && *v.TamperExitCode != *code) {
+		v.TamperExitCode = code
+		changed = true
+	}
+	if v.VerifiedCommit != commit {
+		v.VerifiedCommit = commit
+		changed = true
+	}
+	if v.TamperJobUID != jobUID {
+		v.TamperJobUID = jobUID
+		changed = true
+	}
+	return changed
+}
+
 // applyVerifyOutcome maps a verifyOutcome to a phase transition (B3). It
 // returns changed (the Loop's status was mutated). The caller runs it every
 // reconcile at Verifying (the B2 tamper gate ALSO runs every reconcile; this
@@ -1267,17 +1319,18 @@ const defaultMaxIterations = 3
 // prompt can include them in the next iteration's model work). The
 // maxIterations cap bounds the iterate: when the increment would exceed it,
 // the Loop is Failed:MaxIterationsExceeded instead of iterating.
-func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
+func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, *batchv1.Job, *corev1.Pod) {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loopHoldingForDelivery(loop) {
 		// P5f: a Loop held for delivery has already passed verify.
-		return false, false
+		return false, false, nil, nil
 	}
-	// The B2 tamper gate runs FIRST (every reconcile, order-independent). If
-	// it flipped the Loop to Failed, do nothing here.
+	// The B2 tamper gate runs AFTER this function (loop_controller.go:
+	// applyVerifyOutcome, then runTamperGate) and judges the same Job/pod read
+	// this function returns (F83), so the two cannot disagree.
 	pod, err := r.readVerifyJobPod(ctx, loop)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "verify pod read failed; requeueing", "loop", loop.Name)
-		return true, true
+		return true, true, nil, nil
 	}
 	// I65: the Job's batch condition is the Job-level failure evidence the pod
 	// statuses alone may not carry (a Failed Job can have a pod whose init
@@ -1290,12 +1343,17 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// requeue (the readVerifyJobPod pattern — a failed pod read logs and
 		// requeues, never a controller error and never a phase change).
 		logf.FromContext(ctx).Error(jobErr, "verify Job read failed; requeueing", "loop", loop.Name)
-		return true, true
+		return true, true, nil, nil
 	}
+	// F83: record the tamper evidence (the tamper init's exit code once it has
+	// TERMINATED, the pin it names, and the UID of the Job whose pod produced
+	// it) BEFORE the decision, so it is also persisted while the checks are
+	// still running.
+	evidenceChanged := recordTamperEvidence(loop, pod, job)
 	checkCount := len(loop.Spec.Verify.AcceptanceChecks)
 	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount, jobFailed)
 	if requeue {
-		return false, true
+		return evidenceChanged, true, job, pod
 	}
 	// Record the completed verify outcome in status.verify (the operator's
 	// own record of the verify result). The checkpoint step keys off this
@@ -1352,14 +1410,14 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue,
 				coxv1alpha1.ReasonVerifyingDelivering,
 				"verify passed; holding Succeeded until delivery (Delivered condition) is terminal")
-			return true, false
+			return true, false, job, pod
 		}
 		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 		// B5a: terminal transition — bump the completion counter and clear the
 		// active gauge.
 		bumpLoopCompletion("succeeded", "verify_passed")
-		return true, false
+		return true, false, job, pod
 	case verifyInfraFailed:
 		// I65: the verify infrastructure failed (a trusted init died, or the
 		// Job went Failed with no check evidence) BEFORE the evidence ran. The
@@ -1371,7 +1429,8 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// running Job); when the bound is exhausted the Loop is Failed with the
 		// distinct VerifyInfraFailed reason (a Warning Event on the final
 		// failure and per retry, so the wedge that I65 fixes is observable).
-		return r.applyVerifyInfraFailure(ctx, loop, job, failedCheck, checkExitCode)
+		c, rq := r.applyVerifyInfraFailure(ctx, loop, job, failedCheck, checkExitCode)
+		return c, rq, job, pod
 	case verifyIterate:
 		// P2e stall gate (evaluated BEFORE the budget/maxIterations cap —
 		// stall wins: a capped loop that is ALSO stalled is Failed:Stalled,
@@ -1381,7 +1440,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// stall decision. A fire applies the stall action (Fail / Pause /
 		// Continue); a non-fire falls through to the iterate below.
 		if r.applyStallGate(ctx, loop, pod, failedCheck) {
-			return true, false
+			return true, false, job, pod
 		}
 		// B4 (PLAN-BETA B4; PLAN.md Phase 6 remainder): onVerifyFail selects
 		// the destination on a failed verify. Implement (the default) iterates
@@ -1426,7 +1485,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// B5a: terminal transition — bump the completion counter and clear
 			// the active gauge.
 			bumpLoopCompletion("failed", "max_iterations")
-			return true, false
+			return true, false, job, pod
 		}
 		loop.Status.Iteration = nextIter
 		// B5a: count the iteration increment (the iterate and re-plan paths
@@ -1478,7 +1537,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// (Verifying -> Planning, never the stale phase a leftover claim
 			// would imply). The failing check + exit code ride in the message.
 			r.emitVerifyReplanEvent(loop, from, failedCheck, checkExitCode, nextIter)
-			return true, false
+			return true, false, job, pod
 		default: // OnVerifyFailImplement (the default)
 			// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
 			// is created only for a fresh pin at the next advance). The failing
@@ -1490,7 +1549,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// (Verifying -> Implementing, never the stale phase a leftover claim
 			// would imply). The failing check + exit code ride in the message.
 			r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
-			return true, false
+			return true, false, job, pod
 		}
 	case verifyNotDescendant:
 		// F43: the pinned commit does not descend from baseCommit. Terminal and
@@ -1507,12 +1566,13 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 					"the pinned commit %s is not a descendant of baseCommit %s; failing the Loop",
 					loop.Status.CurrentVerify.VerifiedCommit, loop.Status.BaseCommit)
 			}
-			return true, false
+			return true, false, job, pod
 		}
 	case verifyTampered:
-		// The B2 tamper gate is the authority (it runs every reconcile and
-		// flips to Failed:TamperedVerify). Belt-and-suspenders: if it has not
-		// yet flipped (e.g. the gate's evidence binding differs), flip here.
+		// verifyOutcome's tamper verdict (read from the pod's tamper init)
+		// is what decides on a live pod and flips here. The B2 tamper gate
+		// (which reads the evidence recordTamperEvidence wrote, F83) is the
+		// fail-closed second line, not the authority.
 		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
 			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
 				TamperedVerifyReason, "a protected path changed between baseCommit and verifiedCommit")
@@ -1521,10 +1581,10 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			// B5a: terminal transition — bump the completion counter and clear
 			// the active gauge.
 			bumpLoopCompletion("failed", "tampered")
-			return true, false
+			return true, false, job, pod
 		}
 	}
-	return false, false
+	return false, false, job, pod
 }
 
 // B5a: bumpVerifyResult bumps the verify-results metric for a verify outcome

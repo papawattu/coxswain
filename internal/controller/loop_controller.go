@@ -960,7 +960,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// The claim-driven advance is already recorded in advancedFrom by
 	// s4ClaimAndVerifyJob; the gate's advance is a separate decision the
 	// Event should also cover.
-	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
+	verifyChanged, verifyOutcomeRequeue, verifyJob, verifyPod := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 
@@ -1007,7 +1007,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// security gate (the red B2 tamper spec). The runTamperGate helper runs
 	// the gate unconditionally (no short-circuit) and folds the result into
 	// changed, keeping Reconcile's cyclomatic complexity under the threshold.
-	r.runTamperGate(&loop, &changed)
+	r.runTamperGate(&loop, &changed, verifyJob, verifyPod)
 
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references
@@ -1235,10 +1235,10 @@ func isCommitSHA(s string) bool {
 //     verifiedCommit/Job); NEVER treated as clean (D24 fail-closed), so the
 //     Loop stays in Verifying and B3 cannot reach Succeeded on it.
 //
-// In envtest the B-slice tests set status.verify.* directly (no Job
-// controller); in a real cluster B3 reads the tamper exit code from the
-// verify Job pod's initContainerStatuses.
-func (r *LoopReconciler) applyTamperGate(loop *coxv1alpha1.Loop) bool {
+// The status inputs are user-writable, so a Tampered verdict only acts when
+// the verify Job's pod confirms it (tamperConfirmedByPod); the operator writes
+// the evidence from that pod (recordTamperEvidence, F83).
+func (r *LoopReconciler) applyTamperGate(loop *coxv1alpha1.Loop, job *batchv1.Job, pod *corev1.Pod) bool {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loop.Status.Verify == nil {
 		return false
 	}
@@ -1255,11 +1255,39 @@ func (r *LoopReconciler) applyTamperGate(loop *coxv1alpha1.Loop) bool {
 	if loop.Status.CurrentVerify != nil {
 		currentCommit = loop.Status.CurrentVerify.VerifiedCommit
 	}
-	if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered {
+	// F83: status is user-writable (the editor role may PUT /status), so a
+	// recorded code alone never fails a Loop. The verdict only acts when the
+	// operator's own read of the CURRENT verify Job and its pod agrees: the
+	// Job is the one the UID names, and its tamper init terminated with the
+	// recorded code. The two objects are the ones applyVerifyOutcome judged in
+	// this same reconcile (no second read, so the gate cannot judge a
+	// different pod). No Job/pod (gone, evicted, a retry deleted it) is no
+	// decision: a tamper verdict is terminal in applyVerifyOutcome when the
+	// pod exists.
+	if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered &&
+		v.TamperJobUID != "" && job != nil && string(job.UID) == v.TamperJobUID &&
+		tamperPodConfirms(pod, *v.TamperExitCode) {
 		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
 			"a protected path changed between baseCommit and verifiedCommit; terminal")
 		return true
+	}
+	return false
+}
+
+// tamperPodConfirms (F83) is the pod half of the tamper gate's confirmation:
+// the pod's tamper init container terminated with the recorded code. A pod or
+// container that is absent, still running, or terminated with another code
+// does not confirm.
+func tamperPodConfirms(pod *corev1.Pod, code int32) bool {
+	if pod == nil {
+		return false
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[i]
+		if ics.Name == verifyTamperInit && ics.State.Terminated != nil {
+			return ics.State.Terminated.ExitCode == code
+		}
 	}
 	return false
 }

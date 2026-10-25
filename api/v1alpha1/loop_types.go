@@ -281,20 +281,22 @@ type VerifyConfig struct {
 // status field. The operator writes valid values, and every consumer that ACTS
 // on a status value must validate it first: the checkpoint GC and the lost-PVC
 // restore check the name shape and that the VolumeSnapshot carries this Loop's
-// label before deleting or restoring from it. Other consumers (e.g. the tamper
-// gate's inputs) are not yet hardened this way; narrowing the editor role is an
-// owner decision.
+// label before deleting or restoring from it. The tamper gate (F83) accepts a
+// recorded tamperExitCode only when the CURRENT verify Job's UID and that
+// Job's pod's terminated tamper init agree with it, so a status write alone
+// cannot fail a Loop. Narrowing the editor role is an owner decision.
 type VerifyStatus struct {
 	// verifiedCommit is the SHA the evidence was measured at (ADR-0005 D11). The
-	// operator records it from the branch head it resolved itself at Verifying
-	// start. Evidence that names a different verifiedCommit (e.g. left over from a
-	// previous iteration's Job) is treated as no evidence (D24).
+	// operator copies the pin it wrote on entering Verifying
+	// (status.currentVerify.verifiedCommit). Evidence that names a different
+	// verifiedCommit (e.g. left over from a previous iteration's Job) is treated
+	// as no evidence (D24).
 	// +optional
 	VerifiedCommit string `json:"verifiedCommit,omitempty"`
 
-	// jobName is the verify Job the evidence came from (D24). Recording it (and
-	// the attempt) means evidence from a previous Job cannot be reused for the
-	// current verifiedCommit.
+	// jobName is reserved and not currently written. The binding that keeps a
+	// previous Job's evidence from being reused is the operator's read of the
+	// verify Job pod filtered by the current Job's UID (D24).
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 
@@ -307,6 +309,14 @@ type VerifyStatus struct {
 	// valid recorded value, so an int with omitempty would be ambiguous).
 	// +optional
 	Iteration *int32 `json:"iteration,omitempty"`
+
+	// tamperJobUID is the UID of the verify Job whose pod produced
+	// tamperExitCode (F83). The tamper gate may only act when this matches the
+	// CURRENT verify Job's UID AND that Job's pod's tamper init terminated with
+	// the recorded code (status is user-writable, so a recorded code alone
+	// never fails a Loop).
+	// +optional
+	TamperJobUID string `json:"tamperJobUID,omitempty"`
 
 	// tamperExitCode is the tamper-check init container's exit code. A NON-NIL
 	// value means the operator copied it from a TERMINATED tamper init container

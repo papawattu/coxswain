@@ -39,9 +39,10 @@ chart's rendered output).
 
 ## Driving Manual-mode approvals with the cox CLI (rbac.helpers.enabled)
 
-`cox approve <loop>` and `cox reject <loop> --reason <reason>` PATCH the
-Loop's status conditions (PlanApproved / PlanRejected). The base operator
-roles do not grant a user the `patch` verb on `loops`, so a human driving
+`cox approve <loop>` and `cox reject <loop> --reason <reason>` read the Loop
+with `get` and write the whole object back to the `loops/status` subresource
+with an `update` (PUT; they set the PlanApproved / PlanRejected conditions).
+The base operator roles do not grant a user `update` on `loops/status`, so a human driving
 Manual-mode approvals (`approval.mode: Manual`) needs the **loop editor**
 role — or an equivalent binding:
 
@@ -58,8 +59,10 @@ role — or an equivalent binding:
   (with `rbac.namespaced=false` the role is a ClusterRole: use
   `--clusterrole=loop-editor --user=<user>` without `-n`.)
 
-- or create your own Role/ClusterRole + binding with the `patch` verb on
-  `loops` (the minimum `cox approve`/`reject`/`diff` need).
+- or create your own Role/ClusterRole + binding with `get` on `loops` and
+  `update` on `loops/status` (the minimum `cox approve`/`reject` need). A
+  role with only `patch` on `loops` is NOT enough: the API server answers
+  Forbidden on `loops/status`.
 
 Without such a binding, `cox approve`/`reject` are rejected by the API
 server. The operator is unaffected: Auto-mode Loops advance without any

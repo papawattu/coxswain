@@ -596,6 +596,65 @@ before the Loop fails with `VerifyInfraFailed`, a reason distinct from
 the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
 The agent did not tamper; the check could not run.
 
+### `PinNotDescendant` — the verify Job refused the pinned commit (F43)
+
+**What you see:** the Loop ends `Failed` with reason `PinNotDescendant`
+(a single terminal Warning Event, no retries), plus a `Warning` Event of
+the same reason naming both commits:
+
+```
+the pinned commit <sha> is not a descendant of baseCommit <sha>; failing the Loop
+```
+
+In the verify Job's pod, the `import-agent` init container terminated with
+exit code `97`, and its log ends with
+`import-agent: pinned commit is not a descendant of baseCommit`.
+
+**What it means:** the commit the operator pinned
+(`status.currentVerify.verifiedCommit`) does not descend from
+`status.baseCommit`. The verify Job's `import-agent` init now runs
+`git merge-base --is-ancestor <base> <pin>` before checking anything out;
+exit 1 — "not an ancestor" — maps to the distinct terminal outcome
+`verifyNotDescendant`, and only exit 1 is treated this way: any other git
+failure stays an infra failure (`VerifyInfraFailed`), so a broken repo or a
+flake is not mistaken for a refused pin. The decision is made when the
+operator reads the Job's outcome (`recordVerifyOutcome`), which sets
+`Failed=True` reason `PinNotDescendant` with the message "the pinned
+commit is not a descendant of baseCommit (the runner's headCommit claim
+was refused)" and no retry — a re-run would import the same pin.
+
+**Why it happens:** the pin is the *runner's claim*, not operator
+evidence. A runner (or a corrupted `result.json`) can pin any 40-hex SHA
+reachable in the agent's repo, including pre-existing history that
+predates the Loop. F43 makes the operator check ancestry at import time;
+a pin from another branch, an ancestor of base, or a commit the agent
+never built in this Loop is refused. (The tamper diff is tree-to-tree and
+cannot catch this: an unchanged pre-existing tree reads as clean.)
+
+**What to do:**
+- `kubectl cox describe` the Loop: compare `status.baseCommit` and
+  `status.currentVerify.verifiedCommit`, and `git merge-base
+  --is-ancestor <base> <pin>` in a clone of the repo to confirm the
+  refusal.
+- If the pin is honest (the agent really ended there), the workspace
+  likely diverged from base (a reset, a branch checkout, a rebase onto
+  something else): fix the Loop's starting point and re-run.
+- If the pin is not what the agent claims to have built, suspect the
+  runner's `headCommit` claim or the result transport: the runner
+  refuses a stored `result.json` whose COMPLETED claim does not match the
+  current iteration and plan attempt (`priorCompletedResult` in
+  `runner/phase.go`), so a cross-run replay is rejected there too.
+- It is terminal, like `TamperedVerify`: restart the Loop (a new Loop, or
+  a rollback to a checkpoint taken before the divergence) rather than
+  waiting for a retry.
+
+**How it differs from its neighbours:** `TamperedVerify` — a protected
+path changed between base and the pin; `VerifyInfraFailed` — git itself
+failed (retried twice, three total runs) or a check container could not
+run; `Stalled` — the checks ran and kept producing the same failing
+output. `PinNotDescendant` is the operator refusing the pin before any
+check runs: the agent's claimed work does not even sit on the Loop's base.
+
 ### The other holds on a Suspended sandbox
 
 The entries above cover the holds added on 2026-10-24. A sandbox can also be

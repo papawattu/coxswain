@@ -12,9 +12,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cov "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -140,6 +144,97 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		f, err := r.sandboxFailure(ctx, loop)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(f).To(BeNil(), "a valid claim means the phase finished; no infra attempt is burned")
+	})
+
+	It("F48d: the Verifying hold RETURNS the changed flag the not-starting surfacing set (it used to discard it)", func() {
+		loop, _, r, offset, rec := plant("f48d-return", waiting("PodInitializing", ""))
+		*offset = sandboxStartGrace + time.Minute
+		loop.Status.Phase = cov.LoopPhaseVerifying
+		loop.Status.DesiredPhase = cov.LoopPhaseVerifying
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
+		// The hold's return value IS what persists the condition: drive the real
+		// phase function twice and require changed=true the first time (the
+		// surfacing happened) and false the second (already surfaced).
+		advanced, changed, next := r.advancePhaseFromClaim(ctx, loop)
+		Expect(advanced).To(BeFalse(), "Verifying is evidence-gated: the claim never advances it")
+		Expect(next).To(Equal(cov.LoopPhase("")))
+		Expect(changed).To(BeTrue(),
+			"F48d: the hold must report the change it just made, or the status write (and so the condition) is dropped")
+		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+
+		advanced, changed, _ = r.advancePhaseFromClaim(ctx, loop)
+		Expect(advanced).To(BeFalse())
+		Expect(changed).To(BeFalse(), "a second pass with the condition already set changes nothing")
+		Expect(countEvents(rec, sandboxNotStartingEventReason)).To(Equal(1),
+			"exactly one Warning Event across both passes (the transition-gated Event must not re-fire)")
+	})
+
+	It("F48d: through Reconcile at Verifying the condition is written to the API", func() {
+		loop, _, r, offset, _ := plant("f48d-reconcile", waiting("PodInitializing", ""))
+		*offset = sandboxStartGrace + time.Minute
+		loop.Status.Phase = cov.LoopPhaseVerifying
+		loop.Status.DesiredPhase = cov.LoopPhaseVerifying
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		ns, name := loop.Namespace, loop.Name
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		got := &cov.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(cov.LoopPhaseVerifying), "the hold still holds")
+		cond := findConditionFn(got.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond).NotTo(BeNil(), "F48d: the condition must reach the API at Verifying")
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	It("F48c: SandboxNotStarting clears when the pod it described is gone", func() {
+		loop, pod, r, offset, _ := plant("f48c-gone", waiting("PodInitializing", ""))
+		*offset = sandboxStartGrace + time.Minute
+		_, ch, _ := r.sandboxFailureStep(ctx, loop, false)
+		Expect(ch).To(BeTrue())
+		Expect(conditionTruePresent(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
+
+		By("the pod is deleted (a fresh Sandbox gets its own grace)")
+		Expect(k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0))).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, podKey(pod), &corev1.Pod{}))
+		}).WithTimeout(10 * time.Second).Should(BeTrue())
+		Expect(r.applySandboxNotStarting(ctx, loop)).To(BeTrue(), "the condition must clear, not freeze on a pod that is gone")
+		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("PodGone"))
+	})
+
+	It("F48c: SandboxNotStarting clears when the SANDBOX is gone (the retry path deletes it)", func() {
+		loop, _, r, offset, _ := plant("f48c-sbgone", waiting("PodInitializing", ""))
+		*offset = sandboxStartGrace + time.Minute
+		_, ch, _ := r.sandboxFailureStep(ctx, loop, false)
+		Expect(ch).To(BeTrue())
+		Expect(conditionTruePresent(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
+
+		By("the Sandbox is deleted (the config-error retry does exactly this)")
+		sb := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}}
+		Expect(k8sClient.Delete(ctx, sb, client.GracePeriodSeconds(0))).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(sb), &sandboxv1beta1.Sandbox{}))
+		}).WithTimeout(10 * time.Second).Should(BeTrue())
+		Expect(r.applySandboxNotStarting(ctx, loop)).To(BeTrue(), "the condition must clear with the Sandbox")
+		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("PodGone"))
+	})
+
+	It("F48d: InvalidImageName is bounded at once (the kubelet never retries it)", func() {
+		loop, _, r, offset, _ := plant("f48d-image", waiting(sandboxInvalidImageNameReason, `invalid reference format`))
+		*offset = 10 * time.Second // younger than the CreateContainerConfigError grace
+		f, err := r.sandboxFailure(ctx, loop)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f).NotTo(BeNil(), "a terminal kubelet verdict needs no grace")
+		Expect(f.reason).To(Equal(sandboxInvalidImageNameReason))
+		Expect(f.neverStarted).To(BeTrue())
 	})
 
 	It("a Pending pod with no kubelet reason is never a failure, however old (I49)", func() {

@@ -78,7 +78,8 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	$(MAKE) rwx-storage-test
 	@# F29: the Helm chart's manager role and CRDs must not drift from config/ (serviceaccounts rule, lessonsAvailable were missing).
 	$(MAKE) chart-drift-test
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	@# F48d: the controller suite now needs longer than go test's 10m default when every package runs in parallel (588s standalone, +~2% under contention), so the timeout is explicit.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test -timeout 20m $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 	$(MAKE) runner-test
 
 # I3: the runner is a separate Go module (runner/go.mod); the root `go list ./...`

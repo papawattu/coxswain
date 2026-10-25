@@ -85,7 +85,7 @@ The items below are what today's reviews left open. None blocks the next slice.
 
 ### I59. A real enforcement signal (positive evidence for `PolicyEnforced`)
 
-- [ ] Open (design; builds on R9 I32)
+- [x] Open (design; builds on R9 I32) (0ea752c, #113; evidence REVIEW-PHASE1-R25.md:21-22)
 
 **Where:** `internal/engine/kubearmor_enforcer.go` `Enforcing` (`TODO(I32)`).
 

@@ -27,7 +27,7 @@ matches round 6, and C1–C5 are ordered ahead of B3.
 
 ### D28. The owner's `CONTEXT.md` introduces Policy; ADR-0006 predates it
 
-- [ ] Owner decisions recorded (ADR-0007)
+- [x] Owner decisions recorded (ADR-0007) (13a0027)
 
 **What changed:** `CONTEXT.md` now says the goal is agent isolation, "so they
 can only do what is allowed by policy. Network isolation, command white

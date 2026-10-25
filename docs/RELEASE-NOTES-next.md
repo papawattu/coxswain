@@ -539,24 +539,22 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
 ## Known issues still open
 
 The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
-merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
-(D71 memory lesson cap), F33 (memory-writer audit), F34 (stale
-lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
-curator failure), F43 (the agent-chosen pin), F44 (surfacing unmetered
-requests and stale usage reads), F47 (untrusted checkpoint status entries), F84 (the `BudgetReadingStale` false
-alarm while the proxy pod is starting), F84b (the `ModelProxyNotReady`
-condition sticking at a terminal phase, and a failed proxy read reported as a
-missing pod), F85 (the `cox describe` budget block
-reading a non-existent field), F48d and F48c (the `SandboxNotStarting`
-condition not saved at Verifying, and not cleared when the pod is gone),
-F46 (the unwired model timeout),
-F83 (the unrecorded tamper evidence), F83c (the status-driven tamper
-gate that could never fire, and an OOM-killed tamper check reading as a
-terminal tampered failure), and F84b (the `ModelProxyNotReady` condition
-sticking at a terminal phase, and a failed proxy read reported as a missing
-pod) were closed by #229, #222, #233, #234, #238, #243, #241, #244, #248,
-#254, #259, #260, #264, #265, #252, and #258. In plain words, the items still
-open:
+merged, and F31 (no-pod memory-writer Job, #229), F54 (the evil-agent e2e,
+#222), F32 (D71 memory lesson cap, #233), F33 (memory-writer audit, #234),
+F34 (stale lessons.json, #238), F78 (memory-writer audit counts line, #243),
+F41 (the unknown curator failure, #241), F43 (the agent-chosen pin, #244),
+F44 (surfacing unmetered requests and stale usage reads, #248), F47
+(untrusted checkpoint status entries, #254), F84 (the `BudgetReadingStale`
+false alarm while the proxy pod is starting, #259), F84b (the
+`ModelProxyNotReady` condition sticking at a terminal phase, and a failed
+proxy read reported as a missing pod, #265), F85 (the `cox describe` budget
+block reading a non-existent field, #260), F48d and F48c (the
+`SandboxNotStarting` condition not saved at Verifying, and not cleared when
+the pod is gone, #262), F46 (the unwired model timeout, #252), F83 (the
+unrecorded tamper evidence, #258), and F83c (the status-driven tamper gate
+that could never fire, and an OOM-killed tamper check reading as a terminal
+tampered failure, #264) were closed by the PRs named beside them. In plain
+words, the items still open:
 
 **P1 (security):**
 

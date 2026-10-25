@@ -32,6 +32,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -187,5 +188,54 @@ func TestF83fPreF48fBoolMarkerStillAnnounces(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339, raw); err != nil {
 		t.Fatalf("the rewritten marker must be RFC3339, got %q: %v", raw, err)
+	}
+}
+
+// TestF83fNotFoundAfterTheMarkerKeepsTheCallersResourceVersion pins the one
+// behaviour change this refactor made (F83f, review P2-1). The pre-F83f
+// sandbox copy refreshed the caller's resourceVersion unconditionally after the
+// marker patch: `loop.ResourceVersion = fresh.ResourceVersion`. On a NotFound
+// re-get that assigns the EMPTY resourceVersion of the missing object, so the
+// reconcile's trailing Status().Update becomes an unconditional write against a
+// Loop that is being deleted (or recreated). The helper returns without
+// touching it; this spec is the only thing that pins that half.
+func TestF83fNotFoundAfterTheMarkerKeepsTheCallersResourceVersion(t *testing.T) {
+	ctx := context.Background()
+	scheme := newI42cForeignNPScheme(t)
+	loop := f83bLoop()
+	loop.ResourceVersion = "42"
+	notFound := apierrors.NewNotFound(coxv1alpha1.GroupVersion.WithResource("loops").GroupResource(), loop.Name)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*coxv1alpha1.Loop); ok {
+				return notFound // the re-get after the marker patch finds nothing
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+	rec := record.NewFakeRecorder(8)
+	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	fixed := metav1.NewTime(time.Date(2026, 10, 25, 21, 0, 0, 0, time.UTC))
+	r.now = func() metav1.Time { return fixed }
+
+	r.markAndSurfaceQuietly(ctx, loop, quietMarker{
+		key:     verifyJobForeignAnnotation,
+		quiet:   verifyJobForeignQuiet,
+		reason:  verifyJobForeignEventReason,
+		message: "a foreign verify Job (NotFound re-get spec)",
+	})
+
+	if n := f83bEventCount(drainEvents(rec)); n != 1 {
+		t.Fatalf("the marker patch succeeded, so the surface must announce: want 1 Event, got %d", n)
+	}
+	raw, ok := loop.Annotations[verifyJobForeignAnnotation]
+	if !ok {
+		t.Fatal("the in-memory marker must still be set when the re-get fails (the patch already succeeded)")
+	}
+	if at, err := time.Parse(time.RFC3339, raw); err != nil || !at.Equal(fixed.UTC().Truncate(time.Second)) {
+		t.Fatalf("the in-memory marker must be the Event's time, got %q (err %v)", raw, err)
+	}
+	if got := loop.ResourceVersion; got != "42" {
+		t.Fatalf("a NotFound re-get must leave the caller's resourceVersion ALONE (a stale or empty RV must never be written into it), got %q", got)
 	}
 }

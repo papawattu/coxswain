@@ -69,6 +69,13 @@ type quietMarker struct {
 // those mean "not recently notified", so nothing is ever muted forever — a
 // pre-F48f `true` marker, a garbage value, or a marker left by an older
 // operator version simply announces once and is rewritten as a time.
+//
+// A marker dated AHEAD of the operator's clock (a wall-clock step back, a VM
+// restore) mutes the surface until the clock passes it plus the window; the gate
+// is deliberately not clamped to the present, because the alternative (treating
+// a future marker as "not notified") would announce on every pass while the
+// clock stays behind it, turning one straggling marker into an Event storm. The
+// window is 5 minutes, so the mute is bounded by the size of the clock step.
 func quietMarkerNotifiedAt(value string) (time.Time, bool) {
 	if value == "" {
 		return time.Time{}, false

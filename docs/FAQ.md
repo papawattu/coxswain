@@ -8,10 +8,12 @@ separately, not here.)
 ## 1. Why is my Loop Suspended?
 
 The sandbox is held Suspended while a fail-closed gate is not satisfied. The
-most common holds: the egress proxy pod not Ready (external-repo clone is
-gated on it), the agent NetworkPolicy absent or failed, a tool proxy that the
-Loop does not own or that is not Ready, the manual-approval hold, a
-restore-in-progress hold, a budget pause, or the KubeArmor policy gate.
+most common holds: `NetworkEnforced=False` (reason `CNIUnenforced` — the CNI
+does not enforce NetworkPolicy, kindnet's default), the egress proxy pod not
+Ready (external-repo clone is gated on it), the agent NetworkPolicy absent or
+failed, a tool proxy that the Loop does not own or that is not Ready, the
+manual-approval hold, a restore-in-progress hold, a budget pause, or the
+KubeArmor policy gate.
 `kubectl cox describe <loop>` shows the conditions; their `reason` field is
 the most useful diagnostic.
 
@@ -57,10 +59,10 @@ See: [QUICKSTART.md#7-forking-a-loop](QUICKSTART.md#7-forking-a-loop)
 
 ## 5. How do I read what the agent is doing?
 
-Use `kubectl cox logs <loop> agent` to stream the runner's log (planning,
-implementing, the model calls). To see the Loop's state — phase, iteration,
-conditions, budget, delivery — use `kubectl cox describe <loop>`; the full
-audit trail is `kubectl cox history <loop>` and the agent's plan is
+Use `kubectl cox logs <loop> --component agent` to stream the runner's log
+(planning, implementing, the model calls). To see the Loop's state — phase,
+iteration, conditions, budget, delivery — use `kubectl cox describe <loop>`;
+the full audit trail is `kubectl cox history <loop>` and the agent's plan is
 `kubectl cox plan <loop>`.
 
 See: [OPERATOR.md#reading-loop-status](OPERATOR.md#reading-loop-status)
@@ -164,7 +166,8 @@ StorageClass, and you then run the operator with
 `--memory-storage-class=local-shared` (render `install.yaml` with
 `MEMORY_STORAGE_CLASS=local-shared`). On a multi-node cluster the same host
 directory must be mounted at that path on every node; on a single-node
-cluster nothing else is needed.
+cluster nothing else is needed. Once bound, the PVC holds at most 100
+lessons (the memory-writer Job evicts the oldest beyond the cap).
 
 See: [OPERATOR.md#shared-memory-storage-phase-5](OPERATOR.md#shared-memory-storage-phase-5)
 

@@ -24,8 +24,8 @@ committed:
 **Status:**
 - **F43 closes a gap where unrelated work could pass verify.** Two fixes: the verify Job now refuses a pinned commit that does not descend from the base commit,
   and the runner no longer re-emits a stored result whose commit is not in
-  the workspace. The reviewer reproduced both defects with named mutations, against the
-  real generated script.
+  the workspace. The reviewer reproduced both defects with named mutations: one against the
+  real generated import-agent script, one in the runner's spec.
 - **The memory writer is now consistent as one design** after F31-F34 and F78,
   except for one bound it claims and does not enforce (I115).
 - **F41's root cause is still unknown.** On k3d-hermes-sim a new pod's first
@@ -34,8 +34,8 @@ committed:
   within a batch budget. The runner may hit the same window (I116).
 - **One CI flake surfaced** (I117).
 - **Pre-review kept catching real defects before merge** (I118).
-- No new owner decision this round. D72-D84 remain open (see
-  `.samples/owner-decision-brief.md`).
+- No new owner decision this round. D72-D84 remain open: D72-D74 are defined
+  in R29, D75-D84 in R30-R32 (open PRs #211, #217, #235).
 
 ---
 
@@ -49,13 +49,14 @@ committed:
   **Problem:** the termination message is capped at 4096 bytes by Kubernetes.
   A batch of 20 lessons (the per-write cap) with long or non-ASCII curator
   reasons produces a larger summary, so the operator reads a cut summary with
-  no marker. Comments claimed a 4096-byte bound until #245 corrected them;
-  the code never enforced one. F78 put the counts line first, so the counts
+  no marker. #245 corrected the writer's own comment, but one operator-side comment
+  still claims the bound (`internal/controller/loop_memory_writer_job.go:1016`),
+  and the code never enforced one. F78 put the counts line first, so the counts
   survive a prefix cut, but the lesson lines past the cap are lost silently.
 
   **Fix:** F80 (queued). Bound the summary in the writer below 4096 bytes,
   line-oriented like F78 (counts line, audit lines, whole lesson lines, then
-  "… N more lines").
+  "… N more lines"), and correct the remaining comment.
 
   **Acceptance:** a spec writes a summary over 4096 bytes and asserts the
   termination file is at most 4096 bytes, keeps the counts line, and ends with
@@ -130,4 +131,4 @@ committed:
 
 ## Owner decisions
 
-None new this round. D72-D84 remain open.
+None new this round. D72-D84 remain open (D72-D74 in R29; D75-D84 in R30-R32).

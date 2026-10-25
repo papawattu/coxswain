@@ -108,6 +108,10 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 		Expect(loop.Status.CurrentVerify).NotTo(BeNil())
 		Expect(loop.Status.Verify.VerifiedCommit).To(Equal(loop.Status.CurrentVerify.VerifiedCommit),
 			"the evidence must name the pin it came from")
+		vj := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: verifyJobName(loop), Namespace: ns}, vj)).To(Succeed())
+		Expect(loop.Status.Verify.TamperJobUID).To(Equal(string(vj.UID)),
+			"F83: the evidence must carry the verify Job's UID (the gate's operator-only binding)")
 
 		By("artifact and check pass: Succeeded, evidence unchanged")
 		c0 := term(0)
@@ -147,25 +151,44 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 		Expect(*loop.Status.Verify.TamperExitCode).To(Equal(int32(0)), "a check's exit 1 must not be recorded as the tamper code")
 	})
 
-	It("F83: a FORGED status (tamperExitCode=1 + matching commits) with no confirming pod does not fail the Loop", func() {
+	It("F83: a forged status.verify does not fail the Loop (the gate needs the Job's pod to agree)", func() {
 		ns, name := newLoop("f83-forge-")
-		defer func() { _ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
 		r := s5aDriveToVerifying(ns, name)
+		By("the operator's own clean evidence for the real pod")
+		c0 := term(0)
+		f83SetTamperPod(ctx, ns, name, term(0), running, &c0)
 		loop := s5aReconcile(r, ns, name)
-		Expect(loop.Status.CurrentVerify).NotTo(BeNil())
-		// An editor-role user PUTs /status.
+		Expect(loop.Status.Verify).NotTo(BeNil())
+		Expect(*loop.Status.Verify.TamperExitCode).To(Equal(int32(0)))
+		realUID := loop.Status.Verify.TamperJobUID
+		Expect(realUID).NotTo(BeEmpty())
 		one := int32(1)
-		loop.Status.Verify = &coxv1alpha1.VerifyStatus{TamperExitCode: &one, VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit}
-		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		loop = s5aReconcile(r, ns, name)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "a forged status alone must not fail the Loop")
+		forge := func(label, uid string) {
+			By("forge: " + label)
+			forged := &coxv1alpha1.VerifyStatus{TamperExitCode: &one, VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit, TamperJobUID: uid}
+			loop.Status.Verify = forged
+			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+			got := s5aReconcile(r, ns, name)
+			Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+				"a forged status.verify must not fail the Loop (F83): "+label)
+			Expect(findConditionFn(got.Status.Conditions, string(coxv1alpha1.LoopPhaseFailed))).To(BeNil(), label)
+			loop = got
+		}
+		forge("right UID, wrong code (the pod's tamper init is 0)", realUID)
+		forge("right code-shaped forge, wrong Job UID", "11111111-2222-3333-4444-555555555555")
+		forge("no UID at all (the pre-F83 shape: code + commits only)", "")
 
-		By("a pod whose tamper init is Running does not confirm it either")
-		f83SetTamperPod(ctx, ns, name, running, running, nil)
-		loop.Status.Verify = &coxv1alpha1.VerifyStatus{TamperExitCode: &one, VerifiedCommit: loop.Status.CurrentVerify.VerifiedCommit}
-		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		loop = s5aReconcile(r, ns, name)
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
+		By("positive control: the SAME gate fails the Loop when the pod's tamper init really exits 1")
+		f83SetTamperPod(ctx, ns, name, term(1), running, &c0)
+		got := s5aReconcile(r, ns, name)
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"the gate must still fire on real evidence (the forged-status spec is not vacuous)")
+		cond := findConditionFn(got.Status.Conditions, string(coxv1alpha1.LoopPhaseFailed))
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(TamperedVerifyReason))
 	})
 
 	It("F83: the delivered PR body says the tamper check was clean when the tamper init exited 0", func() {

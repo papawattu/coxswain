@@ -960,7 +960,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// The claim-driven advance is already recorded in advancedFrom by
 	// s4ClaimAndVerifyJob; the gate's advance is a separate decision the
 	// Event should also cover.
-	verifyChanged, verifyOutcomeRequeue := r.applyVerifyOutcome(ctx, &loop)
+	verifyChanged, verifyOutcomeRequeue, verifyJob, verifyPod := r.applyVerifyOutcome(ctx, &loop)
 	changed = changed || verifyChanged
 	verifyRequeue = verifyRequeue || verifyOutcomeRequeue
 
@@ -1007,7 +1007,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// security gate (the red B2 tamper spec). The runTamperGate helper runs
 	// the gate unconditionally (no short-circuit) and folds the result into
 	// changed, keeping Reconcile's cyclomatic complexity under the threshold.
-	r.runTamperGate(ctx, &loop, &changed)
+	r.runTamperGate(&loop, &changed, verifyJob, verifyPod)
 
 	// C6a (ADR-0007 Q2): record the effective AgentPolicy for the agent — the
 	// union of the allows across every AgentPolicy the Loop references
@@ -1238,7 +1238,7 @@ func isCommitSHA(s string) bool {
 // The status inputs are user-writable, so a Tampered verdict only acts when
 // the verify Job's pod confirms it (tamperConfirmedByPod); the operator writes
 // the evidence from that pod (recordTamperEvidence, F83).
-func (r *LoopReconciler) applyTamperGate(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+func (r *LoopReconciler) applyTamperGate(loop *coxv1alpha1.Loop, job *batchv1.Job, pod *corev1.Pod) bool {
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loop.Status.Verify == nil {
 		return false
 	}
@@ -1255,8 +1255,18 @@ func (r *LoopReconciler) applyTamperGate(ctx context.Context, loop *coxv1alpha1.
 	if loop.Status.CurrentVerify != nil {
 		currentCommit = loop.Status.CurrentVerify.VerifiedCommit
 	}
+	// F83: status is user-writable (the editor role may PUT /status), so a
+	// recorded code alone never fails a Loop. The verdict only acts when the
+	// operator's own read of the CURRENT verify Job and its pod agrees: the
+	// Job is the one the UID names, and its tamper init terminated with the
+	// recorded code. The two objects are the ones applyVerifyOutcome judged in
+	// this same reconcile (no second read, so the gate cannot judge a
+	// different pod). No Job/pod (gone, evicted, a retry deleted it) is no
+	// decision: a tamper verdict is terminal in applyVerifyOutcome when the
+	// pod exists.
 	if tamperVerdict(v.TamperExitCode, v.VerifiedCommit, currentCommit) == TamperTampered &&
-		r.tamperConfirmedByPod(ctx, loop, *v.TamperExitCode) {
+		v.TamperJobUID != "" && job != nil && string(job.UID) == v.TamperJobUID &&
+		tamperPodConfirms(pod, *v.TamperExitCode) {
 		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue, TamperedVerifyReason,
 			"a protected path changed between baseCommit and verifiedCommit; terminal")
@@ -1265,15 +1275,12 @@ func (r *LoopReconciler) applyTamperGate(ctx context.Context, loop *coxv1alpha1.
 	return false
 }
 
-// tamperConfirmedByPod (F83) re-confirms a status-recorded tamper code against
-// operator-only evidence: the CURRENT verify Job (matched by its UID, which
-// readVerifyJobPod enforces) has a pod whose tamper init container terminated
-// with that exact code. status.verify and status.currentVerify are
-// user-writable (the editor role may PUT /status), so a recorded code alone
-// must never fail a Loop; a read error or an absent Job/pod is no decision.
-func (r *LoopReconciler) tamperConfirmedByPod(ctx context.Context, loop *coxv1alpha1.Loop, code int32) bool {
-	pod, err := r.readVerifyJobPod(ctx, loop)
-	if err != nil || pod == nil {
+// tamperPodConfirms (F83) is the pod half of the tamper gate's confirmation:
+// the pod's tamper init container terminated with the recorded code. A pod or
+// container that is absent, still running, or terminated with another code
+// does not confirm.
+func tamperPodConfirms(pod *corev1.Pod, code int32) bool {
+	if pod == nil {
 		return false
 	}
 	for i := range pod.Status.InitContainerStatuses {

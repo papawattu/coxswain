@@ -306,6 +306,14 @@ type VerifyStatus struct {
 	// +optional
 	Iteration *int32 `json:"iteration,omitempty"`
 
+	// tamperJobUID is the UID of the verify Job whose pod produced
+	// tamperExitCode (F83). The tamper gate may only act when this matches the
+	// CURRENT verify Job's UID AND that Job's pod's tamper init terminated with
+	// the recorded code (status is user-writable, so a recorded code alone
+	// never fails a Loop).
+	// +optional
+	TamperJobUID string `json:"tamperJobUID,omitempty"`
+
 	// tamperExitCode is the tamper-check init container's exit code. A NON-NIL
 	// value means the operator copied it from a TERMINATED tamper init container
 	// (0 = clean, non-zero = a protected path differs between baseCommit and

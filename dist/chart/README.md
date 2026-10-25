@@ -40,8 +40,8 @@ chart's rendered output).
 ## Driving Manual-mode approvals with the cox CLI (rbac.helpers.enabled)
 
 `cox approve <loop>` and `cox reject <loop> --reason <reason>` read the Loop
-with `get` and write the whole object back to the `loops/status` subresource
-with an `update` (PUT; they set the PlanApproved / PlanRejected conditions).
+with `get` and set the PlanApproved / PlanRejected conditions on its
+`loops/status` subresource (the base operator roles grant neither verb).
 Both also read `PLAN.md` from the workspace through a short-lived
 peek pod (`internal/cli/workspace.go`), so the user needs pod RBAC in the
 Loop's namespace as well. The base operator roles grant neither, so a human
@@ -70,9 +70,9 @@ driving Manual-mode approvals (`approval.mode: Manual`) needs both:
   a Role in the Loop's namespace granting `create`, `get`, `delete` on `pods`
   and `get` on `pods/log`.
 
-- or create your own Role/ClusterRole with: `get` on `loops`, `update` on
-  `loops/status`, and the pod rules above (the minimum `cox approve` /
-  `cox reject` need). A role with only `patch` on `loops` is NOT enough: the
+- or create your own Role/ClusterRole with: `get` on `loops`, `update` (or
+  `patch`) on `loops/status`, and the pod rules above (the minimum `cox
+  approve` / `cox reject` need). A role with only `patch` on `loops` is NOT enough: the
   API server answers Forbidden on `loops/status`, and `cox approve` fails at
   `create peek pod` without the pod rules. (`cox pause` / `cox resume` use
   `patch` on `loops`, a separate verb.)

@@ -15,7 +15,10 @@
 #  1. every --role=/--clusterrole= value is a Helm action (a templated name),
 #     never a bare literal role name like `loop-editor`;
 #  2. the notes never call the write a PATCH (it is a status `update`);
-#  3. they name the `loops/status` subresource and the `update` verb;
+#  3. they name the `loops/status` subresource and the two conditions the CLI
+#     writes (the notes stay verb-agnostic on purpose: F87(c)/(d) change the
+#     write from a whole-object PUT to a status merge patch, so pinning a verb
+#     here would make the guard the next stale sentence);
 #  4. they mention the peek pod's `pods/log` read;
 #  5. they carry both forms — `--role=` and `--clusterrole=` — because
 #     rbac.namespaced renders a Role or a ClusterRole.
@@ -50,11 +53,12 @@ if 'PATCH' in text:
     problems.append("NOTES still calls the approve/reject write a PATCH "
                     "(it is an `update` of the loops/status subresource)")
 
-# 3. The subresource and verb the CLI writes.
+# 3. The subresource and the conditions the CLI writes.
 if 'loops/status' not in text:
     problems.append("NOTES does not name the loops/status subresource")
-if not re.search(r'\bupdate\b', text):
-    problems.append("NOTES does not name the `update` verb")
+for cond in ('PlanApproved', 'PlanRejected'):
+    if cond not in text:
+        problems.append("NOTES does not name the %s condition it sets" % cond)
 
 # 4. The peek pod's log read.
 if 'pods/log' not in text:
@@ -71,6 +75,7 @@ if problems:
     for p in problems:
         print("   ", p)
     sys.exit(1)
-print("OK: chart NOTES teach the status update, the templated helper role name, the pods/log "
-      "peek-pod rule, and both rbac.namespaced branches")
+print("OK: chart NOTES teach the loops/status write of the PlanApproved/PlanRejected "
+      "conditions, the templated helper role name, the pods/log peek-pod rule, and both "
+      "rbac.namespaced branches")
 PY

@@ -17,17 +17,16 @@ To learn more about the release, try:
 Approval note (Manual-mode Loops, `approval.mode: Manual`):
 
   `cox approve <loop>` and `cox reject <loop> --reason <reason>` read the Loop
-  with `get` and write the whole object back to the `loops/status` subresource
-  with an `update` (they set the PlanApproved / PlanRejected conditions). Both
-  also read PLAN.md from the workspace through a short-lived peek pod, so the
-  user needs pod RBAC in the Loop's namespace as well. The base operator roles
-  grant neither.
+  with `get` and set the PlanApproved / PlanRejected conditions on its
+  `loops/status` subresource. Both also read PLAN.md from the workspace through
+  a short-lived peek pod, so the user needs pod RBAC in the Loop's namespace as
+  well. The base operator roles grant neither.
 {{- if .Values.rbac.helpers.enabled }}
 
   This release installed the helper roles (rbac.helpers.enabled=true): bind
   the {{ include "coxswain.resourceName" (dict "suffix" "loop-editor-role" "context" $) }} role to a user or group to
   grant the Loop access `cox approve`/`reject` need (it includes `get` on
-  `loops` and `update` on `loops/status`):
+  `loops` and `update`/`patch` on `loops/status`):
 {{- if .Values.rbac.namespaced }}
 
     kubectl create rolebinding <name> --role={{ include "coxswain.resourceName" (dict "suffix" "loop-editor-role" "context" $) }} --user=<user> -n {{ .Release.Namespace }}

@@ -47,6 +47,14 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 	w.printf("Name:         %s\n", u.GetName())
 	w.printf("Namespace:    %s\n", ns)
 	w.printf("Phase:        %s\n", phaseOrDash(phase))
+	// F90: docs/OPERATOR.md promises the desired phase too, and it is half of
+	// the run key (sandboxRunKey) that TROUBLESHOOTING tells the operator to
+	// read — without it a paused Loop cannot be told apart from one the budget
+	// paused (desired still Implementing). Omitted when unset, like the other
+	// optional status lines.
+	if dp, ok := getNestedString(u, "status", "desiredPhase"); ok && dp != "" {
+		w.printf("DesiredPhase: %s\n", dp)
+	}
 	w.printf("Iteration:    %d\n", iter)
 	if suspend {
 		w.printf("Suspended:    true\n")

@@ -276,3 +276,31 @@ Before upgrading, list the values and look for non-matching ones:
 ```bash
 kubectl get loops -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.spec.workspace.gitCredentialSecret}{"\t"}{.spec.agent.endpointSecretRef}{"\n"}{end}'
 ```
+
+## Sandbox-failure counts recorded before F48g (no run key), and the terminal mount failure
+
+An operator older than F48g wrote `status.agent.infraAttempts` and
+`status.agent.infraSandboxUID` but no `status.agent.infraEpisode`. The key is
+what scopes the count to one run, and an absent key reads as "a run that is not
+the current one", so an in-flight failure episode restarts on the first failure
+the upgraded operator counts: a Loop that had used 2 of its 3 attempts restarts
+at attempt 1 instead of failing terminally on the next failure, gets the full
+bound again (up to `sandboxInfraRetries`, 2, extra recreate cycles), and still
+ends at `Failed:SandboxFailed` if the cause persists. If the recorded
+`infraSandboxUID` still names the live Sandbox, the UID guard skips that first
+failure instead (it is the one already counted), so nothing is double counted.
+Nothing needs doing and nothing is migrated: the next counted failure writes the
+key, and a Loop that is not mid-episode (no count) is unaffected. The upgrade is
+visible as one more "attempt 1 of 3" Warning Event on a Loop that was
+mid-episode, and the terminal failure is unchanged. `status.agent.infraEpisode`
+is a new optional status field; it needs no schema migration, and a downgrade
+simply ignores it. `status.verify.infraAttempts` needs no upgrade line: it has
+no episode key, a pre-I65 status has no count, and its reset rule (a new pin) is
+unchanged by this work.
+
+A sandbox volume the kubelet cannot mount (a `gitCredentialSecret` that does not
+exist, say) now ends at `Failed:SandboxFailed`, with one attempt per recreate up
+to the bound rather than an unbounded recreate loop. That failure is terminal and
+there is no retry command: create or fix the Secret, then **delete and re-apply
+the Loop**. A rollback does not clear it (a rollback never changes the phase), so
+do not reach for one as a retry.

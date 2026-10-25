@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -104,6 +105,53 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		Expect(fresh.Status.Phase).To(Equal(cov.LoopPhaseImplementing), "one attempt never fails the Loop")
 	})
 
+	// F48e (the audit's F6): the upgrade shape. An operator older than F48g wrote
+	// a count and a UID but no run key; the new code reads an absent key as a
+	// different run, so an in-flight episode restarts (docs/UPGRADE.md,
+	// "Sandbox-failure counts recorded before F48g"). These two assertions pin
+	// that reading, and the UID guard's other half beside it: the failure that
+	// was already counted is still skipped, key or no key.
+	It("S8: a pre-F48g status (a count with no episode key) restarts the episode; a re-read of the counted Sandbox is still skipped", func() {
+		ns := f48gNs("f48g-s8")
+		const name = "f48g-s8"
+		Expect(k8sClient.Create(ctx, &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+		loop := f48gGet(ns, name)
+		loop.Status.Phase = cov.LoopPhaseImplementing
+		loop.Status.DesiredPhase = cov.LoopPhaseImplementing
+		loop.Status.Iteration = 2
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+
+		By("a count with no key: the next failure starts the episode again (not attempt 3)")
+		legacy := f48gGet(ns, name)
+		legacy.Status.Agent = &cov.AgentStatus{InfraAttempts: 2, InfraSandboxUID: "pre-f48g-sandbox-uid"}
+		Expect(k8sClient.Status().Update(ctx, legacy)).To(Succeed())
+		fresh := f48gGet(ns, name)
+		Expect(r.applySandboxFailure(ctx, fresh, f48gFailure())).To(BeTrue())
+		Expect(fresh.Status.Agent.InfraAttempts).To(Equal(int32(1)),
+			"an absent key reads as a new run (the UPGRADE section): the episode restarts instead of carrying on to attempt 3")
+		Expect(fresh.Status.Agent.InfraEpisode).To(Equal(sandboxRunKey(fresh)))
+
+		By("the same legacy shape where the counted Sandbox IS the failing one: skipped, not reset")
+		legacy = f48gGet(ns, name)
+		legacy.Status.Agent = &cov.AgentStatus{InfraAttempts: 2, InfraSandboxUID: "pre-f48g-sandbox-uid"}
+		Expect(k8sClient.Status().Update(ctx, legacy)).To(Succeed())
+		rec := record.NewFakeRecorder(8)
+		r.Recorder = rec
+		fresh = f48gGet(ns, name)
+		same := f48gFailure()
+		same.sandboxUID = types.UID("pre-f48g-sandbox-uid")
+		Expect(r.applySandboxFailure(ctx, fresh, same)).To(BeFalse(),
+			"the failure was already counted: no change, no delete, no Event")
+		Expect(fresh.Status.Agent.InfraAttempts).To(Equal(int32(2)),
+			"the UID guard skips the failure already counted — it never resets")
+		Expect(fresh.Status.Agent.InfraEpisode).To(BeEmpty(), "the skip leaves the absent key alone")
+		Expect(drainEvents(rec)).To(BeEmpty(), "a re-read emits no Event")
+	})
+
 	It("S3: the real verify iterate (through Reconcile) ends the episode, so the next failure is attempt 1", func() {
 		ns := f48gNs("f48g-s3")
 		const name = "f48g-s3"
@@ -115,7 +163,13 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		r := s5aDriveToVerifying(ns, name)
 		s5aReconcile(r, ns, name) // the verify Job is created for the pin
 		jobName := name + "-verify-1"
-		f48gSeedCount(ns, name, 2, "1/Verifying")
+		// F48e (F4): the seed must name the run the Loop is ACTUALLY in. A fresh
+		// Loop's iteration is 0, so a count accumulated at Verifying carries
+		// sandboxRunKey(before); the old "1/Verifying" never existed (the first
+		// iterate moves to 2), and the assertion below then pinned that
+		// impossible key instead of the live one.
+		seedKey := sandboxRunKey(f48gGet(ns, name))
+		f48gSeedCount(ns, name, 2, seedKey)
 
 		By("check-0 fails: the operator iterates (Verifying -> Implementing, iteration 2)")
 		s5aVerifyPod(ctx, ns, name, jobName, 1)
@@ -125,7 +179,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		Expect(iterated.Status.Agent).NotTo(BeNil())
 		Expect(iterated.Status.Agent.InfraAttempts).To(Equal(int32(2)),
 			"the iterate itself clears nothing — the COUNT restarts when the next failure names a different run")
-		Expect(iterated.Status.Agent.InfraEpisode).To(Equal("1/Verifying"),
+		Expect(iterated.Status.Agent.InfraEpisode).To(Equal(seedKey),
 			"the recorded episode is still the one the counted failures came from")
 
 		By("one failure in the new run is attempt 1 (the run key changed under it)")
@@ -375,7 +429,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		Expect(after.Status.Agent.InfraEpisode).To(BeEmpty())
 	})
 
-	It("S5b: a Budget/Stall pause round-trip does not reset the count (both pauses move desiredPhase)", func() {
+	It("S5b: a Budget pause round-trip does not reset the count (Stall resumes through the same branch)", func() {
 		ns := f48gNs("f48g-s5b")
 		const name = "f48g-s5b"
 		// The D35a model proxy needs its Secret; the pause path re-enters the
@@ -558,6 +612,47 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 			"F48b: a claim the operator accepts is the recovery signal, so the episode's count ends")
 		Expect(accepted.Status.Agent.InfraSandboxUID).To(BeEmpty())
 		Expect(accepted.Status.Agent.InfraEpisode).To(BeEmpty())
+	})
+
+	// F48e (#273 P3-2): S7 only proves the gate ADVANCES once the approval is
+	// there. The hold is the gate's other direction and nothing in the tree
+	// asserted it, so a gate that advances unconditionally would pass every
+	// spec. Same fixture without the PlanApproved condition: the Loop must stay
+	// at AwaitingApproval, and the count it carries must survive (a hold is not
+	// an episode boundary).
+	It("S7b: without an approval the gate HOLDS AwaitingApproval (and the hold ends no episode)", func() {
+		ns := f48gNs("f48g-s7b")
+		const name = "f48g-s7b"
+		Expect(k8sClient.Create(ctx, &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: cov.LoopSpec{
+				Goal:      "F48e approval hold",
+				Workspace: testWorkspace(),
+				Approval:  &cov.Approval{Mode: cov.ApprovalModeManual},
+			},
+		})).To(Succeed())
+
+		loop := f48gGet(ns, name)
+		loop.Status.Phase = cov.LoopPhaseAwaitingApproval
+		loop.Status.DesiredPhase = cov.LoopPhaseAwaitingApproval
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		holdKey := sandboxRunKey(loop)
+		f48gSeedCount(ns, name, 2, holdKey)
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r.wireApprovalGate()
+		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) { return nil, nil }
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+
+		held := f48gGet(ns, name)
+		Expect(held.Status.Phase).To(Equal(cov.LoopPhaseAwaitingApproval),
+			"without an approval the gate holds: it must not advance unconditionally")
+		Expect(held.Status.DesiredPhase).To(Equal(cov.LoopPhaseAwaitingApproval))
+		Expect(held.Status.Agent).NotTo(BeNil())
+		Expect(held.Status.Agent.InfraAttempts).To(Equal(int32(2)),
+			"a hold is not an episode boundary: the count survives")
+		Expect(held.Status.Agent.InfraEpisode).To(Equal(holdKey))
 	})
 
 	It("P3-7: a run change that discards a non-zero count is recorded in the log", func() {

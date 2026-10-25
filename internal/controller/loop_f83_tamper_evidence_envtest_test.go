@@ -108,8 +108,13 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 		Expect(loop.Status.CurrentVerify).NotTo(BeNil())
 		Expect(loop.Status.Verify.VerifiedCommit).To(Equal(loop.Status.CurrentVerify.VerifiedCommit),
 			"the evidence must name the pin it came from")
+		// The Job's UID binding: the operator reads the Job through its (cached)
+		// client, so the UID is filled on the first reconcile whose cache has
+		// the Job (ensured in the same pass); level-based, never a decision.
 		vj := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: verifyJobName(loop), Namespace: ns}, vj)).To(Succeed())
+		loop = s5aReconcile(r, ns, name)
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
 		Expect(loop.Status.Verify.TamperJobUID).To(Equal(string(vj.UID)),
 			"F83: the evidence must carry the verify Job's UID (the gate's operator-only binding)")
 
@@ -163,6 +168,7 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 		loop := s5aReconcile(r, ns, name)
 		Expect(loop.Status.Verify).NotTo(BeNil())
 		Expect(*loop.Status.Verify.TamperExitCode).To(Equal(int32(0)))
+		loop = s5aReconcile(r, ns, name) // the Job's UID is recorded once its cache has the Job
 		realUID := loop.Status.Verify.TamperJobUID
 		Expect(realUID).NotTo(BeEmpty())
 		one := int32(1)

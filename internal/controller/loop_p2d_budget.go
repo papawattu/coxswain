@@ -35,7 +35,6 @@ import (
 	"math"
 	"math/big"
 	"net/http"
-	"strconv"
 	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -86,6 +85,9 @@ const (
 	// created in the same reconcile that then reads it, and a restart replaces
 	// it, so the first seconds are "not there yet", not a failure.
 	proxyUsageStartGrace = 60 * time.Second
+	// budgetReadFailurePhrase is the condition message's transition phrase
+	// (fixed: the count lives in the Event, see noteUsageReadFailed).
+	budgetReadFailurePhrase = "repeatedly (see the UsageReadFailed Events for the count)"
 	// meteringEventQuiet is how long MeteringDegraded must have been False
 	// before a re-degrade emits a second Warning Event (F44).
 	meteringEventQuiet = 5 * time.Minute
@@ -205,6 +207,10 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 			setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionFalse,
 				"NoEndpoint", "no model endpoint is configured, so there is no usage endpoint to read")
 		}
+		if conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
+			setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
+				"NoEndpoint", "no model endpoint is configured, so there is no model proxy to wait for")
+		}
 		if conditionTruePresent(loop, coxv1alpha1.MeteringDegradedCondition) {
 			setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionFalse,
 				"NoEndpoint", "no model endpoint is configured, so there is no metering to degrade")
@@ -267,9 +273,13 @@ func (r *LoopReconciler) noteUsageReadFailed(loop *coxv1alpha1.Loop, err error) 
 	if b.LastUsageReadAt == nil {
 		effect = "no reading has ever succeeded: the token and cost caps are inert ($0 spent is not evidence)"
 	}
+	// The message is STABLE while the condition stays True (no count, no age):
+	// metav1.Condition.LastTransitionTime is the last STATUS transition, and a
+	// message that changes every pass would re-stamp it (and cost a status
+	// write) each reconcile. The count is in the transition-gated Event.
 	setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionTrue,
 		budgetReadingStaleReason,
-		"the model proxy usage endpoint could not be read "+strconv.Itoa(int(b.ConsecutiveReadFailures))+" times in a row; "+effect+": "+err.Error())
+		"the model proxy usage endpoint could not be read "+budgetReadFailurePhrase+"; "+effect+": "+err.Error())
 	if !wasStale && r.Recorder != nil {
 		r.Recorder.Eventf(loop, corev1.EventTypeWarning, budgetReadingStaleReason,
 			"usage read failed %d times in a row (%v); %s", b.ConsecutiveReadFailures, err, effect)

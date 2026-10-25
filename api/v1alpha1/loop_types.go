@@ -1309,6 +1309,15 @@ const (
 	// pod IP, inside proxyUsageStartGrace) is not a failure and is not counted
 	// (F84). Surfacing only: it does not hold the Loop.
 	BudgetReadingStaleCondition = "BudgetReadingStale"
+	// ModelProxyNotReadyCondition (F84) is True while the D35a gate is holding
+	// the sandbox Suspended because the Loop's model proxy pod is not Ready (it
+	// does not exist, is not owned by the Loop, or is still starting). Without
+	// it the hold is silent: the budget read treats the shape as "no reading
+	// yet" (proxy.ErrNotReady), so BudgetReadingStale cannot fire on a proxy
+	// that never comes up. The message names the pod and the phase. Cleared
+	// (False/Ready) once the pod is Ready, and (False/NoEndpoint) when the Loop
+	// has no model endpoint. Surfacing only: the hold itself is unchanged.
+	ModelProxyNotReadyCondition = "ModelProxyNotReady"
 	// AgentFailedCondition (F6, dogfood finding) is True while the operator
 	// is deciding what to do about a sandbox pod that FAILED without a phase
 	// claim (evicted, OOMKilled, or the agent container terminated without a

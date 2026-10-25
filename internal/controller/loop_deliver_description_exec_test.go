@@ -51,6 +51,8 @@ import (
 	"strings"
 	"testing"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -220,6 +222,12 @@ func a4FactsLoop() *coxv1alpha1.Loop {
 			},
 			Verify: &coxv1alpha1.VerifyStatus{
 				TamperExitCode: &tamper,
+				// F83e: the record carries the pin it was recorded under (F83c
+				// writes them together; this fixture predated that guard). Without
+				// it the record is a legacy shape and the body must render "no
+				// tamper evidence" — which is a different (correct) answer, not
+				// the one this fixture is about.
+				VerifiedCommit: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
 			},
 			Progress: &coxv1alpha1.ProgressStatus{},
 			Budget: &coxv1alpha1.BudgetStatus{
@@ -312,3 +320,69 @@ func TestDeliveryTitleDerivedFromGoal(t *testing.T) {
 		t.Fatalf("Title(long) = %q (len %d), want %q (len %d)", got, len(got), expected, len(expected))
 	}
 }
+
+// f83ePin is the pin a4FactsLoop pins (the delivery's verified commit).
+const f83ePin = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+
+// F83e: the deliver description reads only the pin's OWN evidence.
+//
+// deliverDescriptionForLoop read status.currentVerify.verifiedCommit OUTSIDE
+// the nil guard it uses a few lines above it (a latent nil deref: every live
+// caller sits behind deliveryExpected, which needs a pin, so it could not fire
+// — but the read itself was unguarded), and it took status.verify's tamper code
+// whenever that code was non-nil, without checking the record belongs to the
+// pin being delivered. loops/status is user-writable (D85), so a forged or
+// pre-F83d status could carry a tamper verdict for a different commit and have
+// it printed as this delivery's evidence.
+var _ = DescribeTable("F83e: the deliver description reads only the pin's own evidence",
+	func(mutate func(*coxv1alpha1.Loop), wantCommit string, wantTamper int32, wantBody, notBody []string) {
+		l := a4FactsLoop()
+		mutate(l)
+		var d deliverDescription
+		Expect(func() { d = deliverDescriptionForLoop(l) }).NotTo(Panic(),
+			"a Loop with no status.currentVerify must not be dereferenced")
+		Expect(d.VerifiedCommit).To(Equal(wantCommit))
+		Expect(d.TamperClean).To(Equal(wantTamper))
+		body := renderDeliverDescriptionBody(d)
+		for _, want := range wantBody {
+			Expect(body).To(ContainSubstring(want))
+		}
+		for _, not := range notBody {
+			Expect(body).NotTo(ContainSubstring(not))
+		}
+	},
+	Entry("no pin and no verify record: no deref, no evidence",
+		func(l *coxv1alpha1.Loop) {
+			l.Status.CurrentVerify = nil
+			l.Status.Verify = nil
+		}, "", int32(-1),
+		[]string{"(none pinned)", "no tamper evidence"}, nil),
+	Entry("no pin but a verify record: the record speaks for nothing",
+		func(l *coxv1alpha1.Loop) {
+			l.Status.CurrentVerify = nil
+			l.Status.Verify = &coxv1alpha1.VerifyStatus{TamperExitCode: &a4TamperDirty}
+		}, "", int32(-1),
+		[]string{"(none pinned)", "no tamper evidence"}, nil),
+	Entry("a record for a DIFFERENT commit: no evidence for this pin",
+		func(l *coxv1alpha1.Loop) {
+			l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: f83ePin}
+			l.Status.Verify = &coxv1alpha1.VerifyStatus{
+				VerifiedCommit: "bbbbbbbbbbbb1111111111222222222233333333",
+				TamperExitCode: &a4TamperDirty,
+			}
+		}, f83ePin, int32(-1),
+		[]string{"no tamper evidence"}, []string{"a protected path changed"}),
+	Entry("a record for THIS pin, tampered (positive control)",
+		func(l *coxv1alpha1.Loop) {
+			l.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: f83ePin}
+			l.Status.Verify = &coxv1alpha1.VerifyStatus{
+				VerifiedCommit: f83ePin,
+				TamperExitCode: &a4TamperDirty,
+			}
+		}, f83ePin, int32(1),
+		[]string{"exit 1 (a protected path changed)"}, []string{"no tamper evidence"}),
+	Entry("a record for THIS pin, clean (positive control)",
+		func(l *coxv1alpha1.Loop) { /* a4FactsLoop is already this shape */ },
+		f83ePin, int32(0),
+		[]string{"clean (no protected path changed)"}, []string{"no tamper evidence"}),
+)

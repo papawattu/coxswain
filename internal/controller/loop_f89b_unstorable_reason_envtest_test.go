@@ -198,6 +198,28 @@ var _ = Describe("F89b: a failed pod whose kubelet reason the condition schema c
 		Expect(storableConditionReason("CreateContainerConfigError")).To(BeTrue())
 	})
 
+	// F91b (R37 I140): the length unit. The premise in I140 ("a 500-character
+	// CJK reason is 1500 bytes, so len() substitutes a value the schema would
+	// have accepted") does not hold — the reason pattern is ASCII-only, so every
+	// input where a rune count and a byte count differ is rejected by the
+	// PATTERN, and the "cannot store" message is true for it. These rows pin
+	// which term decides, so the two cannot be swapped silently:
+	//   - the boundary rows are pure length (ASCII, so len == runes);
+	//   - the kubelet-text and multi-byte rows assert BOTH that the predicate is
+	//     false AND that the regex is what rejects them.
+	DescribeTable("F91b: which term rejects a reason (length vs pattern)",
+		func(reason string, wantStorable bool, wantRegexMatch bool) {
+			Expect(storableConditionReason(reason)).To(Equal(wantStorable))
+			Expect(conditionReasonRe.MatchString(reason)).To(Equal(wantRegexMatch),
+				"the pattern is the term I140's multi-byte example trips, not the length")
+		},
+		Entry("empty (minLength)", "", false, false),
+		Entry("the boundary (1024 ASCII)", strings.Repeat("A", 1024), true, true),
+		Entry("one over the boundary (1025 ASCII)", strings.Repeat("A", 1025), false, true),
+		Entry("the kubelet's own text (spaces and a dash)", "Low on ephemeral-storage", false, false),
+		Entry("multi-byte (500 CJK characters = 1500 bytes)", strings.Repeat("失", 500), false, false),
+	)
+
 	It("the NetworkEnforced comparator normalises the caller's reason before comparing", func() {
 		msg := "the CNI does not police pod -> host-network egress"
 		// What pass 1 stores when the caller's reason is empty (a custom Prober

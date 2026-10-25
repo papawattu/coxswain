@@ -138,12 +138,6 @@ type deliverDescription struct {
 	// success path — printed as "the acceptance checks passed"; the failing
 	// record when the Loop iterated).
 	LastVerifyOutcome string
-	// Tampered reports a tampered tamper-check (a protected path changed;
-	// status.verify.tamperExitCode non-zero). Printed as its own bullet.
-	// Distinct from TamperClean (the exit-code fact): Tampered is the
-	// decision the operator makes (a tampered verify never counts as
-	// passing), and the body names it.
-	Tampered bool
 	// VerifyHistory is the per-iteration verify record (PLAN-ALPHA A4: "the
 	// verify results per iteration"): the operator's status.stallHistory
 	// verify-failure entries (one per failing iteration, in the ring's order
@@ -236,9 +230,26 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 	// refresh is persisted) makes the body deterministic: the spec reads the
 	// persisted (already-refreshed) value and computes the same body as the
 	// operator.
+	// F83e: the pin is resolved ONCE, with the nil check the verify-history
+	// append below needs anyway. A Loop with no pin has no verified commit to
+	// name (the body prints "(none pinned)") and no verify record that can
+	// speak for one: status.currentVerify is nil on every Loop that has not
+	// reached Verifying, which is most of them.
+	pin := ""
+	if loop.Status.CurrentVerify != nil {
+		pin = loop.Status.CurrentVerify.VerifiedCommit
+	}
+	// F83e: the tamper code counts only when the record belongs to THIS pin.
+	// status.verify.verifiedCommit is the pin the operator copied when it
+	// recorded the code (F83c), so a record whose commit differs — a forged or
+	// legacy status: loops/status is user-writable, D85 — is not evidence about
+	// this delivery and reads as "no evidence" (-1, the fail-closed reading).
+	// `pin != ""` matters too: otherwise an empty record would match a Loop
+	// with no pin.
 	tamper := int32(-1)
-	if loop.Status.Verify != nil && loop.Status.Verify.TamperExitCode != nil {
-		tamper = *loop.Status.Verify.TamperExitCode
+	if v := loop.Status.Verify; v != nil && v.TamperExitCode != nil &&
+		pin != "" && v.VerifiedCommit == pin {
+		tamper = *v.TamperExitCode
 	}
 	last := ""
 	if loop.Status.Progress != nil {
@@ -263,7 +274,6 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 			}
 		}
 	}
-	tampered := tamper > 0
 	// The per-iteration verify record (A4 "the verify results per
 	// iteration"): the operator's status.stallHistory verify-failure
 	// entries (in the ring's order, oldest first) plus the final pass (the
@@ -295,12 +305,11 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 		Goal:              loop.Spec.Goal,
 		Iteration:         loop.Status.Iteration,
 		MaxIterations:     loop.Spec.Loop.MaxIterations,
-		VerifiedCommit:    loop.Status.CurrentVerify.VerifiedCommit,
+		VerifiedCommit:    pin,
 		TamperClean:       tamper,
 		LastVerifyOutcome: last,
 		VerifyHistory:     verifyHistory,
 		Budget:            budget,
-		Tampered:          tampered,
 	}
 }
 

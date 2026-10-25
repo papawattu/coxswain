@@ -233,7 +233,15 @@ var _ = Describe("F48e: the sandbox infra count accumulates across the operator'
 				Expect(got.Status.Iteration).To(Equal(bootstrap.Status.Iteration))
 				Expect(got.Status.DesiredPhase).To(Equal(bootstrap.Status.DesiredPhase))
 				f48eReconcile(r, ns, name) // the pod is gone: recreates the NEXT Sandbox, no decision
-				Expect(sandboxName(name)).NotTo(BeEmpty())
+				// F48e2: this used to be `Expect(sandboxName(name)).NotTo(BeEmpty())`,
+				// which cannot fail — sandboxName is string concatenation, so the
+				// assertion was vacuous. Assert what the recycle means instead: the
+				// pass after the delete produced a DIFFERENT Sandbox object. The read
+				// is from the API (the Get above fails if there is no Sandbox at all)
+				// and the UID is the apiserver's, not a name we constructed.
+				recreated := f48eSandbox(ns, name)
+				Expect(recreated.UID).NotTo(Equal(sb.UID),
+					"the recycle deleted the failed Sandbox and created a new one (a new UID)")
 			}
 		}
 

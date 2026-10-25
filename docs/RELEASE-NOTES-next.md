@@ -593,6 +593,12 @@ open:
 - **F83**: delivered PR bodies say "no tamper evidence" even when the
   tamper check passed, because the tamper exit code is never recorded
   (tamper failures are still caught and still fail the Loop).
+- **F48b**: a sandbox pod stuck on a missing Secret volume shows
+  `SandboxNotStarting` but is not failed.
+- **F86**: a fork from another Loop's checkpoint named in the spec is not
+  ownership-checked.
+- **F87(c)**: a forged `status.checkpoints` entry at the current iteration
+  can stop the real checkpoint being taken.
 - **F84**: the `BudgetReadingStale` condition can raise a false alarm
   while the model proxy pod is still starting up.
 - **F85**: `cox describe`'s budget block misses the new usage-read fields

@@ -63,7 +63,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 		return r, loop, rec
 	}
 
-	newF84NoEndpoint := func(ns, name string) (*LoopReconciler, *coxv1alpha1.Loop, *record.FakeRecorder) {
+	newF84NoEndpoint := func(ns, name string) (*LoopReconciler, *coxv1alpha1.Loop) {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		DeferCleanup(func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
@@ -78,7 +78,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
-		return r, loop, nil
+		return r, loop
 	}
 
 	It("F84: a proxy pod that never becomes Ready sets ModelProxyNotReady (once, with one Event) and clears when it is Ready", func() {
@@ -109,7 +109,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 		owned := pod.DeepCopy()
 		owned.OwnerReferences = []metav1.OwnerReference{{
 			APIVersion: coxv1alpha1.GroupVersion.String(), Kind: "Loop", Name: loop.Name, UID: loop.UID,
-			Controller: ptrTo(true), BlockOwnerDeletion: ptrTo(true),
+			Controller: new(true), BlockOwnerDeletion: new(true),
 		}}
 		Expect(k8sClient.Update(ctx, owned)).To(Succeed())
 		owned.Status.PodIP = "127.0.0.1"
@@ -125,7 +125,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 
 	It("F84: no model endpoint clears the hold condition", func() {
 		ns := "f84-proxy-none-" + nowSuffix()
-		r, loop, _ := newF84NoEndpoint(ns, "f84noendpoint")
+		r, loop := newF84NoEndpoint(ns, "f84noendpoint")
 		setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionTrue, "ModelProxyNotReady", "held")
 		r.applyBudget(ctx, loop)
 		cond := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)
@@ -139,4 +139,3 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 const f84ModelSecret = "f84-model-creds"
 
 // ptrTo is the generic helper for the boolean owner-reference fields.
-func ptrTo[T any](v T) *T { return &v }

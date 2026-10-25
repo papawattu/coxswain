@@ -80,7 +80,10 @@ var _ = Describe("F89: a failed pod whose termination records no reason", func()
 		controller := true
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: ns, Name: name + "-sandbox", UID: types.UID(name + "-pod-uid"),
+				// No UID: the API server assigns it on create (a client-supplied
+				// one is overwritten), and the F6/F14 guard compares the
+				// ownerReference UID (the Sandbox's), not the pod's (F89b C4).
+				Namespace: ns, Name: name + "-sandbox",
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: sandboxv1beta1.GroupVersion.String(),
 					Kind:       "Sandbox",
@@ -181,9 +184,10 @@ var _ = Describe("F89: a failed pod whose termination records no reason", func()
 		Expect(guard.Reason).To(Equal(conditionReasonUnknown),
 			"the guard's value must be self-describing in the object (not a plausible cause)")
 
-		// A non-empty reason passes through byte for byte: the CRD pattern
-		// accepts every kubelet reason in use, and sanitising would rewrite the
-		// kubelet's own evidence.
+		// A STORABLE non-empty reason passes through byte for byte: rewriting it
+		// would rewrite the kubelet's own evidence. A non-empty reason the pattern
+		// rejects is substituted (F89b — see
+		// loop_f89b_unstorable_reason_envtest_test.go).
 		setCondition(loop, "F89PassThrough", metav1.ConditionTrue, "OOMKilled", "")
 		Expect(findConditionFn(loop.Status.Conditions, "F89PassThrough").Reason).To(Equal("OOMKilled"))
 	})

@@ -52,7 +52,7 @@ output.
 ### I42. How does the agent reach the hosts its AgentPolicy allows?
 
 - [x] Decided (owner, 2026-09-28): **option (b), egress proxy**
-- [ ] Done
+- [x] Done (5a227fd … 896fa95, #36)
 
 **Where:** ADR-0007 (the D34 "AgentPolicy network allows" paragraph),
 `ensureNetworkPolicy` (agent egress), and D35.

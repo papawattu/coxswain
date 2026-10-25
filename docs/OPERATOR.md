@@ -404,8 +404,9 @@ It shows:
   `spec.budget.maxWallClock`, with the cap or `(no cap)`, then token usage,
   requests, unmetered requests, cost, the last successful usage read,
   consecutive read failures, and the cap that was hit, `exceeded:`).
-- **Delivery** (the PR the deliver Job opened, or the failure reason) — the
-  block is omitted until there is something to show.
+- **Delivery** (the branch, PR number and URL the deliver Job recorded;
+  omitted until there is one). A failed delivery is not shown here — it is the
+  `Delivered` condition with reason `DeliveryFailed`.
 
 The full audit trail (phase + verify-failure history) is:
 

@@ -81,7 +81,9 @@ func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 		// with the spec's cap, rendered like the delivered PR body.
 		"active:     1h0m0s of 2h cap",
 		// F85 review: prNumber is int64 (was read as float64) and the tag is prURL.
-		"pr:         #1", "url:        http://gitea/pulls/1"} {
+		"pr:         #1", "url:        http://gitea/pulls/1",
+		// P3-2: the Delivery heading had no assertion anywhere in the suite.
+		"Delivery:"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("describe output missing %q\noutput:\n%s", want, out)
 		}
@@ -132,6 +134,25 @@ func TestDescribe_NoCapPrintsNoCap(t *testing.T) {
 	}
 }
 
+// P3-2: status.delivery is allocated before its branch/PR are known, so the
+// block can be present with nothing to print. The heading is gated on at least
+// one line (the same shape as the Budget block, and what OPERATOR.md now
+// promises: "omitted until there is one").
+func TestDescribe_EmptyDeliveryPrintsNoHeading(t *testing.T) {
+	l := typedLoop(t, func(l *coxv1alpha1.Loop) {
+		l.Status.Delivery = &coxv1alpha1.DeliverStatus{}
+	})
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+		return describeLoop(ctx, dc, ns, name, out)
+	}, "loop1")
+	if strings.Contains(out, "Delivery:") {
+		t.Errorf("an empty status.delivery must not print the heading\noutput:\n%s", out)
+	}
+}
+
 // P3-6: the condition type column is sized from the conditions printed, so the
 // status/reason columns line up for every condition the operator adds — the
 // 12-char constant broke for SandboxNotStarting (18) and
@@ -160,6 +181,25 @@ func TestDescribe_ConditionColumnAligns(t *testing.T) {
 	}
 	if idx[0] != idx[1] {
 		t.Errorf("the reason column is misaligned (indices %v)\noutput:\n%s", idx, out)
+	}
+}
+
+// P3-4: humanSeconds must agree with the delivered PR body's
+// controller.humanDurationSeconds for whole seconds — including the two values
+// the describe specs do not reach (65, 90061).
+func TestHumanSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		in   int64
+		want string
+	}{
+		{0, "0s"},
+		{65, "1m5s"},
+		{3600, "1h0m0s"},
+		{90061, "25h1m1s"},
+	} {
+		if got := humanSeconds(tc.in); got != tc.want {
+			t.Errorf("humanSeconds(%d) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

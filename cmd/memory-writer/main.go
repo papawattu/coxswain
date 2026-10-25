@@ -15,8 +15,10 @@
 //     (Succeeded or Failed:Stalled) is passed as the first arg (the
 //     eligibility rule: a lesson is eligible only on a qualifying terminal
 //     outcome);
-//  3. writes ONLY the eligible lessons to /memory/lesson-<n>.txt (one file
-//     per lesson, n zero-padded to 3 digits — lesson-001 < lesson-002 < ...);
+//  3. writes ONLY the eligible lessons to /memory/<sha256>.txt (one file
+//     per lesson, named by the trimmed lesson's sha256 — the dedup key; the
+//     `lesson-<n>` in the audit lines is the 1-based input index, not the
+//     file name);
 //  4. reports a BOUNDED summary to stdout (well under 4096 bytes — the
 //     termination message cap): the counts (total / written / dropped), plus
 //     one line per lesson with its sha256-prefix, written|dropped, and the

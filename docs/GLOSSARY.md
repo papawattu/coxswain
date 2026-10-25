@@ -281,7 +281,11 @@ Alphabetical; each entry links to where the docs define the term.
 - **Stall gate** — The gate that fires when the verify Job reaches k
   consecutive identical check outputs: `Failed=True reason=Stalled`, or
   `Paused=True reason=Stall` with `stallAction=Pause`. The stall history is
-  in `status.stallHistory`.
+  in `status.stallHistory`. Verify *infrastructure* failures (a trusted init
+  container, or a Failed Job with no check run) are a different verdict: they
+  are retried twice (three total runs) and then fail the Loop with the
+  distinct reason `VerifyInfraFailed`; they never feed the stall gate (only
+  the failing check's output does).
   See: [OPERATOR.md §Key conditions to
   watch](OPERATOR.md#key-conditions-to-watch),
   [OPERATOR.md §The B5a metrics](OPERATOR.md#the-b5a-metrics).

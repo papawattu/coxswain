@@ -557,6 +557,29 @@ and surfaces nothing; and if the operator's own Events read fails
 (`SandboxEventsUnreadable` Warning Event, repeated once every 5 minutes while
 the read keeps failing) the mount case is not bounded until it works.
 
+### Event `VerifyJobForeign` (F83b)
+
+**What you see:** a Warning Event: "the Job `<loop>-verify-<n>` is not owned
+by this Loop (ownerReference missing or names another object); refusing to
+adopt, delete or trust it". The Loop stays at `Verifying` and does not advance.
+
+**What it means:** a Job carrying this Loop's verify Job name exists but is not
+the Loop's (its `metadata.ownerReferences` do not include a controller reference
+to the Loop). The operator's own verify Job is Loop-owned
+(`SetControllerReference`), so a Job without that reference was created by
+something else. Creating a Job is enough to reach the name, so the operator
+refuses to use it as evidence (a forged pass would be indistinguishable from a
+real one) and refuses to delete it (that would be remote destruction of another
+object). The disclosure is transition-gated: one Event per five minutes while
+the foreign Job persists, so a long-lived conflict stays visible after the
+previous Event expires (`--event-ttl`).
+
+**What to do:** find it with
+`kubectl get job -n <ns> <loop>-verify-<n> -o jsonpath='{.metadata.ownerReferences}'`
+and delete it yourself if it is not needed (the operator will not). The next
+reconcile creates the Loop's own Job for the current pin. If it reappears, the
+thing creating it is the problem, not the operator.
+
 ### Event `AgentEgressFenced` (F55-b)
 
 **What you see:** a one-shot Normal Event: "The agent NetworkPolicy now applies

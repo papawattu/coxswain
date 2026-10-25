@@ -53,6 +53,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -281,6 +282,11 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 					},
 				},
 			}
+			// F83b: the operator now refuses to trust or delete a verify Job
+			// that is not the Loop's, so the fixture Job carries the controller
+			// owner reference a real verify Job gets. Do not weaken the guard
+			// for a fixture.
+			Expect(controllerutil.SetControllerReference(l, job, k8sClient.Scheme())).To(Succeed())
 			Expect(k8sClient.Create(ctx, job)).To(Succeed())
 		}
 		tamperState := corev1.ContainerState{}

@@ -68,6 +68,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -718,13 +719,9 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	// condition + a Warning Event) and retried in a bounded, visible way, or
 	// the Loop fails with the distinct SandboxFailed reason once the bound is
 	// exhausted — the I65 VerifyInfraFailed pattern mirrored onto the sandbox.
-	if f, serr := r.sandboxFailure(ctx, loop); serr != nil {
-		// A transient read error (the sandbox pod read failed): no decision
-		// (I49: a failed read is never a failure decision). Requeue.
-		logf.FromContext(ctx).Error(serr, "sandbox pod read for the F6 failure check failed; no decision", "loop", loop.Name)
-		claimReadPending = true
-	} else if f != nil {
-		changed = r.applySandboxFailure(ctx, loop, f)
+	var stop bool
+	stop, changed, claimReadPending = r.sandboxFailureStep(ctx, loop, changed)
+	if stop {
 		return false, changed, ""
 	}
 	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
@@ -1012,6 +1009,26 @@ const (
 	sandboxInfraRetryEventReason = "SandboxRetry"
 	sandboxInfraFinalEventReason = "SandboxFailed"
 	sandboxInfraFailedCondition  = "SandboxFailed"
+	// sandboxNotStartingCondition (F48) is True while the sandbox pod has been
+	// Pending for sandboxStartGrace without any container starting. It SURFACES
+	// the wedge (e.g. a Secret volume whose Secret does not exist: the pod
+	// stays Pending and the kubelet reports FailedMount only as an Event, never
+	// in the pod status, so the pod itself says nothing). It does not fail the
+	// Loop: a slow image pull looks the same from the pod status (I49).
+	sandboxNotStartingCondition   = coxv1alpha1.SandboxNotStartingCondition
+	sandboxNotStartingEventReason = "SandboxNotStarting"
+	// sandboxStartGrace is how long a sandbox pod may stay Pending with no
+	// container started before SandboxNotStarting is set.
+	sandboxStartGrace = 5 * time.Minute
+	// sandboxConfigErrorGrace is how long a container may report the
+	// kubelet's CreateContainerConfigError before it counts as an infra
+	// failure (bounded by sandboxInfraRetries); the kubelet retries it, so a
+	// transient miss gets a short grace.
+	sandboxConfigErrorGrace = 60 * time.Second
+	// sandboxConfigErrorReason is the container Waiting reason the kubelet sets
+	// when the container's config (an env Secret/ConfigMap, a bad key) cannot
+	// be resolved. It is the kubelet's own word that the pod cannot start.
+	sandboxConfigErrorReason = "CreateContainerConfigError"
 )
 
 // sandboxFailure is the operator's read of the sandbox pod for the F6
@@ -1029,6 +1046,10 @@ type sandboxFailure struct {
 	exitCode   int32
 	message    string
 	podFailed  bool
+	// neverStarted is true for a container the kubelet could not create
+	// (CreateContainerConfigError): nothing terminated, so the message must
+	// not say it did.
+	neverStarted bool
 }
 
 // The F6 claim-wins check: the agent's own claim (its termination message)
@@ -1042,6 +1063,105 @@ type sandboxFailure struct {
 func (r *LoopReconciler) hasValidSandboxClaim(ctx context.Context, loop *coxv1alpha1.Loop) bool {
 	claim, cerr := r.resolvePhaseClaim(ctx, loop)
 	return cerr == nil && claim != nil
+}
+
+// sandboxFailureStep runs the F6 failure check and the F48 not-starting
+// surfacing. stop is true when a failure was handled (the caller returns
+// without reading the claim); changed reports a status mutation; pending
+// asks for a requeue (a failed pod read).
+func (r *LoopReconciler) sandboxFailureStep(ctx context.Context, loop *coxv1alpha1.Loop, changedIn bool) (stop, changed, pending bool) {
+	changed = changedIn
+	f, serr := r.sandboxFailure(ctx, loop)
+	if serr != nil {
+		// A transient read error (the sandbox pod read failed): no decision
+		// (I49: a failed read is never a failure decision). Requeue.
+		logf.FromContext(ctx).Error(serr, "sandbox pod read for the F6 failure check failed; no decision", "loop", loop.Name)
+		return false, changed, true
+	}
+	if f != nil {
+		return true, r.applySandboxFailure(ctx, loop, f), false
+	}
+	if r.applySandboxNotStarting(ctx, loop) {
+		changed = true
+	}
+	return false, changed, false
+}
+
+// waitingConfigError names a container the kubelet reports as unable to be
+// configured.
+type waitingConfigError struct{ container, message string }
+
+// configErrorWaiting returns the first (init or main) container whose Waiting
+// reason is CreateContainerConfigError, or nil.
+func configErrorWaiting(pod *corev1.Pod) *waitingConfigError {
+	for _, list := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
+		for i := range list {
+			if w := list[i].State.Waiting; w != nil && w.Reason == sandboxConfigErrorReason {
+				return &waitingConfigError{container: list[i].Name, message: w.Message}
+			}
+		}
+	}
+	return nil
+}
+
+// applySandboxNotStarting (F48) surfaces a sandbox pod that has been Pending
+// with no container started for sandboxStartGrace: condition SandboxNotStarting
+// (True) plus ONE Warning Event on the transition; cleared (False/Started)
+// once the pod is no longer Pending. It decides nothing about the Loop (a slow
+// image pull is indistinguishable from the pod status, I49) and returns
+// whether the Loop's status changed.
+func (r *LoopReconciler) applySandboxNotStarting(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	reader := r.apiReader
+	if reader == nil {
+		if r.Client == nil {
+			return false
+		}
+		reader = r
+	}
+	sb := &sandboxv1beta1.Sandbox{}
+	pod := &corev1.Pod{}
+	key := client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}
+	if reader.Get(ctx, key, sb) != nil || reader.Get(ctx, key, pod) != nil || !metav1.IsControlledBy(pod, sb) {
+		return false // no current pod (or a read error): no decision
+	}
+	if pod.Status.Phase == corev1.PodPending && noContainerStarted(pod) {
+		age := r.operatorNow().Sub(pod.CreationTimestamp.Time)
+		if age < sandboxStartGrace {
+			return false
+		}
+		if conditionIsTrue(loop, sandboxNotStartingCondition) {
+			return false // already surfaced: a fixed message, so no status write per pass
+		}
+		// The condition message is FIXED (an age in it would change every pass
+		// and cost a status write each time); the age goes in the one-shot Event.
+		msg := fmt.Sprintf("the sandbox pod has been Pending for over %s with no container started; run `kubectl describe pod %s` and read its events (a Secret that does not exist reports FailedMount there, not in the pod status)",
+			sandboxStartGrace, pod.Name)
+		setCondition(loop, sandboxNotStartingCondition, metav1.ConditionTrue, sandboxNotStartingEventReason, msg)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, sandboxNotStartingEventReason,
+				"the sandbox pod %s has been Pending for %s with no container started; read `kubectl describe pod %s`",
+				pod.Name, age.Round(time.Second), pod.Name)
+		}
+		return true
+	}
+	if conditionIsTrue(loop, sandboxNotStartingCondition) {
+		setCondition(loop, sandboxNotStartingCondition, metav1.ConditionFalse, "Started", "the sandbox pod is no longer Pending without a started container")
+		return true
+	}
+	return false
+}
+
+// noContainerStarted is true when no init or main container of the pod is
+// Running or Terminated (nothing has started yet).
+func noContainerStarted(pod *corev1.Pod) bool {
+	for _, list := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
+		for i := range list {
+			if list[i].State.Running != nil || list[i].State.Terminated != nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.Loop) (*sandboxFailure, error) {
@@ -1080,8 +1200,29 @@ func (r *LoopReconciler) sandboxFailure(ctx context.Context, loop *coxv1alpha1.L
 	if !metav1.IsControlledBy(pod, sb) {
 		return nil, nil // the pod is not controlled by the current Sandbox (stale): no decision
 	}
-	// A pod that has not FAILED (Running/Pending): no decision (I49 — an
-	// in-progress agent is never a failure).
+	// F48: a Pending pod whose container the kubelet says cannot be configured
+	// (CreateContainerConfigError) for longer than the grace is an infra
+	// failure (bounded retry, like a Failed pod). Any other Pending/Running pod
+	// is in progress: no decision (I49).
+	if pod.Status.Phase == corev1.PodPending {
+		if w := configErrorWaiting(pod); w != nil && r.operatorNow().Sub(pod.CreationTimestamp.Time) >= sandboxConfigErrorGrace {
+			// The claim wins (ADR-0004), as on the Failed path: a valid claim
+			// means the phase finished, so this is not an infra failure.
+			if r.hasValidSandboxClaim(ctx, loop) {
+				return nil, nil
+			}
+			return &sandboxFailure{
+				sandboxUID:   sb.UID,
+				container:    w.container,
+				reason:       sandboxConfigErrorReason,
+				message:      w.message,
+				neverStarted: true,
+			}, nil
+		}
+		return nil, nil
+	}
+	// A pod that has not FAILED (Running): no decision (I49 — an in-progress
+	// agent is never a failure).
 	if pod.Status.Phase != corev1.PodFailed {
 		return nil, nil
 	}
@@ -1298,6 +1439,13 @@ func (r *LoopReconciler) ReissueSandboxDelete(ctx context.Context, loop *coxv1al
 func sandboxFailureMessage(f *sandboxFailure) string {
 	if f == nil {
 		return "sandbox pod failed without a phase claim"
+	}
+	if f.neverStarted {
+		s := "the sandbox pod's " + f.container + " container has not started (waiting: " + f.reason + ")"
+		if f.message != "" {
+			s += ": " + truncate(s4ClaimMaxBytes, f.message)
+		}
+		return s
 	}
 	s := "the sandbox pod's " + f.container + " container terminated without a phase claim"
 	if f.reason != "" {

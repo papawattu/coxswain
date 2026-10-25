@@ -254,3 +254,22 @@ kubectl debug -it <a coxswain pod> --image=busybox
 ```
 
 If the check in step 1 shows two bindings for one release, keep the literal `coxswain-deny-ephemeral-containers` and delete the other.
+
+## Stricter Secret-name validation (F48)
+
+`spec.workspace.gitCredentialSecret` and `spec.agent.endpointSecretRef` are
+now validated by the CRD: at most 253 characters and a DNS-1123 subdomain
+(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`).
+A Loop whose existing value does not match (for example uppercase letters
+or an underscore) is not deleted or changed. On Kubernetes 1.30 and later,
+CRD validation ratcheting lets an update through when it leaves that field
+unchanged, so other spec edits and the operator's own status writes still
+work; only an update that changes the field must make it valid. On an older
+API server, any update to that Loop may be rejected until the value is fixed.
+(Not verified against a live API server for this CRD.) Kubernetes cannot have created a Secret with such
+a name, so a non-matching value was already a Loop that could never start.
+Before upgrading, list the values and look for non-matching ones:
+
+```bash
+kubectl get loops -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.spec.workspace.gitCredentialSecret}{"\t"}{.spec.agent.endpointSecretRef}{"\n"}{end}'
+```

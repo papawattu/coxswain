@@ -69,6 +69,8 @@ spec:
                       spec.volumes is immutable, so changing this field after creation would
                       make CreateOrUpdate's Update fail. The operator rejects the change at
                       admission; a new secret requires a new Loop.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                     x-kubernetes-validations:
                     - message: endpointSecretRef is immutable (the proxy pod's spec.volumes
@@ -526,6 +528,8 @@ spec:
                       samples 'samples-git-cred'); the workspace init container mounts ONLY
                       those two keys and passes them to the fetch as a Basic-auth
                       http.extraHeader (nothing is written or persisted).
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   ref:
                     description: |-

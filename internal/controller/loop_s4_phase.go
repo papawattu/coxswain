@@ -1155,7 +1155,7 @@ func (r *LoopReconciler) applySandboxNotStarting(ctx context.Context, loop *coxv
 		// "Pending for over 5m" on a fresh pod. A genuine READ ERROR is no
 		// decision (I49): the silent false is kept for that.
 		if apierrors.IsNotFound(sbErr) || apierrors.IsNotFound(podErr) {
-			if conditionIsTrue(loop, sandboxNotStartingCondition) {
+			if conditionTruePresent(loop, sandboxNotStartingCondition) {
 				setCondition(loop, sandboxNotStartingCondition, metav1.ConditionFalse, "PodGone",
 					"the sandbox pod this condition described is gone; a fresh Sandbox gets its own grace")
 				return true

@@ -193,7 +193,7 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		*offset = sandboxStartGrace + time.Minute
 		_, ch, _ := r.sandboxFailureStep(ctx, loop, false)
 		Expect(ch).To(BeTrue())
-		Expect(conditionIsTrue(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
+		Expect(conditionTruePresent(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
 
 		By("the pod is deleted (a fresh Sandbox gets its own grace)")
 		Expect(k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0))).To(Succeed())

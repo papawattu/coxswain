@@ -609,42 +609,50 @@ func isAlreadyExists(err error) bool {
 
 // checkpointEntriesForCreate (F87) decides what to do with status.checkpoints
 // before ensureCheckpoint takes the checkpoint for `iteration`. It returns the
-// entries that survive (kept), whether an entry was dropped (dropped — the
-// caller must persist the status), whether a genuine entry for this iteration
-// already covers it (suppress — the idempotency check), and whether an entry
-// for this iteration could not be read (unknown — a failed read is no decision,
-// I49, so the caller requeues).
+// entries that survive (kept), whether one was dropped (dropped — the caller
+// must persist the status), whether a genuine entry for this iteration already
+// covers it (suppress — the idempotency check), and whether this iteration's
+// entry could not be read (unknown — a failed read is no decision, I49, so the
+// caller requeues).
 //
-// A Foreign entry is dropped from status and surfaced with the retention GC's
-// Warning Event (one story in docs/TROUBLESHOOTING.md): it names a snapshot
-// shape or ownership the operator never writes, so acting on it — suppressing
-// a checkpoint, deleting it, restoring from it — would be acting on a user's
-// status write. A Gone entry at this iteration is dropped too, so the re-taken
-// checkpoint replaces it instead of appending a second entry for one iteration.
+// Only the entry/entries at the iteration being taken are read and judged
+// (checkpointEntryTrusted: the name shape checkpointName produces for this Loop
+// and iteration, AND a VolumeSnapshot labelled for this Loop). That is exactly
+// the set that could collide with the create, so the cost is one cached
+// VolumeSnapshot Get per reconcile in the steady state, not one per recorded
+// checkpoint. A Foreign entry there is dropped and surfaced with the retention
+// GC's Warning Event (one story in docs/TROUBLESHOOTING.md): it names a shape
+// or ownership the operator never writes, so letting it suppress the create —
+// a status write alone hiding a checkpoint — is the defect this closes. A Gone
+// entry is dropped too, so the re-taken checkpoint replaces it instead of
+// appending a second entry for one iteration. Foreign entries at OTHER
+// iterations are left to the retention GC, which judges every entry it runs
+// over (F47).
 func (r *LoopReconciler) checkpointEntriesForCreate(ctx context.Context, loop *coxv1alpha1.Loop, iteration int) (kept []coxv1alpha1.CheckpointStatus, dropped, suppress, unknown bool) {
 	kept = make([]coxv1alpha1.CheckpointStatus, 0, len(loop.Status.Checkpoints))
 	for _, cp := range loop.Status.Checkpoints {
-		trust := r.checkpointEntryTrusted(ctx, loop, cp)
-		if trust == checkpointForeign {
+		if cp.Iteration != iteration {
+			kept = append(kept, cp)
+			continue
+		}
+		switch r.checkpointEntryTrusted(ctx, loop, cp) {
+		case checkpointTrusted:
+			suppress = true
+		case checkpointUnknown:
+			unknown = true
+		case checkpointForeign:
 			if r.Recorder != nil {
 				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "CheckpointEntryUntrusted",
 					"status.checkpoints entry %q is not a checkpoint of this Loop; dropped without deleting anything", cp.Name)
 			}
 			dropped = true
 			continue
-		}
-		if cp.Iteration == iteration {
-			switch trust {
-			case checkpointTrusted:
-				suppress = true
-			case checkpointUnknown:
-				unknown = true
-			case checkpointGone:
-				// The name is this Loop's but the snapshot is gone: drop the
-				// stale entry and re-take the checkpoint (idempotent by name).
-				dropped = true
-				continue
-			}
+		case checkpointGone:
+			// The name is this Loop's but the snapshot is gone: drop the stale
+			// entry and re-take the checkpoint (the create is idempotent by
+			// name, so the entry is replaced, not duplicated).
+			dropped = true
+			continue
 		}
 		kept = append(kept, cp)
 	}

@@ -68,7 +68,7 @@ hand patches.
 
 ## P2
 
-- [ ] **I99: a lesson wrapped across lines is stored as a fragment**
+- [x] **I99: a lesson wrapped across lines is stored as a fragment** (cfffcc2, #201)
 
   **Where:** `runner/lessons.go:149` (`parseLessons`) and its instruction at
   `runner/lessons.go:131`.
@@ -124,7 +124,7 @@ hand patches.
 
 ## P3
 
-- [ ] **I101: memory PVCs outlive their Loops, and nothing says how to remove them**
+- [x] **I101: memory PVCs outlive their Loops, and nothing says how to remove them** (8a5940b, #202; 04472d5, #203)
 
   **Where:** `internal/cli/memory.go:32`, `internal/cli/memory_transfer.go:84`
   and `:99` (`memory`, `export`, `import`: no delete); `docs/OPERATOR.md`.

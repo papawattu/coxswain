@@ -596,6 +596,102 @@ before the Loop fails with `VerifyInfraFailed`, a reason distinct from
 the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
 The agent did not tamper; the check could not run.
 
+### `MeteringDegraded=True` / `BudgetReadingStale=True` on the Loop (F44)
+
+**What you see:** `kubectl cox describe` shows the `MeteringDegraded` and/or
+`BudgetReadingStale` condition `True`, and/or Warning Events with reasons
+`UnmeteredRequests` or `UsageReadFailed`. `status.budget` may also carry a
+stale `lastUsageReadAt` and a non-zero `consecutiveReadFailures`.
+
+**Background:** each reconcile the operator reads the Loop's model proxy's
+cumulative usage endpoint (`http://<proxy-pod-ip>:9090/coxswain/usage`) and
+folds the reading into `status.budget`. F44 (merged as 0f6915a) surfaces the
+two ways that read — or the metering behind it — can be wrong **without the
+Loop knowing**: requests the proxy forwarded but could not meter, and the
+operator being unable to read the endpoint at all. Both are **surfacing only
+— they do not hold the Loop** (the condition doc comments in
+`api/v1alpha1/loop_types.go` say "it does not hold the Loop"). Whether the
+Loop should be held when the reading is stale is owner decision **D77**,
+which is still open; until it lands, a stale reading means the caps keep
+evaluating the last successful reading (fail-open by design), not a frozen
+Loop.
+
+**`MeteringDegraded`.** True while the model proxy is forwarding requests it
+could not meter — the upstream response carried no parseable usage object.
+Those requests are **not** counted toward the token or cost caps, and their
+count is in `status.budget.unmeteredRequests`. Common causes:
+
+- the upstream model ignores `include_usage` even though the proxy forced
+  `stream_options.include_usage=true` on the request (the proxy always
+  forces it on streaming requests — `shapeRequest` in
+  `internal/proxy/shape.go`);
+- a non-streaming response whose body lacks a `usage` object
+  (`parseUsage` in `internal/proxy/shape.go`);
+- a stream that ended without a final usage chunk (`parseStreamUsage`,
+  `internal/proxy/shape.go`);
+- the agent sent a non-JSON or non-object request body, which the proxy
+  forwards unmodified and counts as unmetered (`shapeRequest`,
+  `internal/proxy/shape.go`).
+
+It sets when a successful usage read shows the unmetered counter advanced
+(`noteUnmetered` in `internal/controller/loop_p2d_budget.go`), and it
+clears on the next successful read with no new unmetered request (reason
+`MeteringOK`). The cluster-wide view is the `coxswain_unmetered_requests_total`
+metric (`docs/OPERATOR.md`, metrics table); the per-Loop view is this
+condition.
+
+**`BudgetReadingStale`.** True while the operator's read of the proxy's
+`/coxswain/usage` endpoint has failed 3 consecutive times
+(`budgetReadFailureThreshold`, `internal/controller/loop_p2d_budget.go`). A
+single miss (a proxy pod mid-restart) is not worth a condition. While it is
+`True`, the token and cost caps are evaluating the **last successful**
+reading — they cannot fire on new spend — so "no cap firing" is not
+evidence that usage is low. It sets via `noteUsageReadFailed` (same file)
+with the read error in the message, and `status.budget` is otherwise
+touched on a failed read — no delta, no reset (the decision is always on
+the last successful read). It clears on the next successful read
+(`noteUsageReadOK`, reason `UsageReadRecovered`), which also resets
+`consecutiveReadFailures` to 0.
+
+**`status.budget.lastUsageReadAt` and `consecutiveReadFailures`.**
+`lastUsageReadAt` is when the operator last **successfully** read the usage
+endpoint (the caps decide on this reading, so a stale value means the caps
+are evaluating old numbers); empty before the first good read.
+`consecutiveReadFailures` counts failed reads since the last good one; at
+or past 3 the `BudgetReadingStale` condition is set, and a good read
+resets it to 0. Both fields are in `api/v1alpha1/loop_types.go` (`BudgetStatus`).
+
+**Warning Events.** `UnmeteredRequests` — one per degradation episode:
+emitted on the transition to `MeteringDegraded=True`, not again while it
+stays `True`, and not for a re-degrade within 5 minutes of a clear (a
+stream that alternates metered and unmetered reads must not flap an Event
+per reconcile). `UsageReadFailed` — one per stale episode: emitted on the
+transition to `BudgetReadingStale=True`, not on every later failed read.
+Both are in `internal/controller/loop_p2d_budget.go`. Check them with:
+
+```sh
+kubectl get events --field-selector reason=UnmeteredRequests -n <loop-namespace>
+kubectl get events --field-selector reason=UsageReadFailed -n <loop-namespace>
+```
+
+**Operator check.** For `MeteringDegraded`: look at
+`status.budget.unmeteredRequests` and whether it is still growing. If it is
+pinned while the agent is still active, the upstream endpoint is likely
+dropping usage data (check the model backend's chat-completions response,
+and whether `stream` is set with a value the endpoint mishandles); a
+one-shot count that stopped growing is a historical miss, not a live
+problem. For `BudgetReadingStale`: check whether the proxy pod
+(`<loop>-model-proxy` in the Loop's namespace) exists, is Ready, and is
+reachable at port 9090 — a restarted or crashed proxy pod is the usual
+cause; confirm recovery with `lastUsageReadAt` advancing.
+
+**What these do not mean:** neither condition pauses, fails, or holds the
+Loop, and neither means the budget caps are wrong — the caps keep running
+on the best reading the operator has. Whether a stale reading should
+instead hold the Loop (owner decision D77: hold on `maxCost`, surface-only
+on `maxTokens`, per `.samples/owner-decision-brief.md`) is still open as of
+this entry; do not assume a hold is coming.
+
 ### The other holds on a Suspended sandbox
 
 The entries above cover the holds added on 2026-10-24. A sandbox can also be

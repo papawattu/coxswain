@@ -99,7 +99,7 @@ runner-test: ## Run the runner module's tests (separate go.mod).
 # the dependency the target ran before the binary was downloaded and silently
 # skipped the coverage step.
 chart-check: install-helm kustomize ## B5a: helm lint + helm template + install.yaml coverage for dist/chart (offline).
-	@bash hack/chart-check.sh
+	@KUSTOMIZE="$(KUSTOMIZE)" bash hack/chart-check.sh
 	@KUSTOMIZE="$(KUSTOMIZE)" hack/memory-writer-image-test.sh
 
 # S1: the sample apps are separate Go/Python modules (examples/<app>); the root
@@ -497,10 +497,15 @@ build-installer: manifests generate kustomize ## A5: render dist/install.yaml wi
 	KUSTOMIZE="$(KUSTOMIZE)" IMG="$(IMG)" MEMORY_STORAGE_CLASS="$(MEMORY_STORAGE_CLASS)" MANAGER_EXTRA_ARGS="$(MANAGER_EXTRA_ARGS)" hack/build-installer.sh
 
 .PHONY: chart-drift-test
-chart-drift-test: install-helm ## F29: chart manager role covers config/rbac/role.yaml and chart CRDs equal config/crd/bases; each guard fails on a mutated chart.
+chart-drift-test: install-helm kustomize ## F29/F87: chart manager role covers config/rbac/role.yaml, chart CRDs equal config/crd/bases, the render has one effective VAP binding at any release name, and the NOTES RBAC text is right; each guard fails on a mutated chart.
 	@hack/chart-rbac-check.sh
 	@hack/chart-crd-check.sh
 	@hack/chart-drift-check-test.sh
+	@# F87: the F45 non-default-release render guard (chart-check.sh) and the new chart
+	@# NOTES RBAC guard had no caller: a chart or a NOTES regression was only caught by
+	@# hand. Both run here so `make test` (what CI runs) proves them.
+	@KUSTOMIZE="$(KUSTOMIZE)" bash hack/chart-check.sh
+	@hack/chart-notes-check.sh
 
 .PHONY: memory-writer-image-test
 memory-writer-image-test: kustomize install-helm ## F19: every shipped manifest passes --memory-writer-image = the operator's own image.

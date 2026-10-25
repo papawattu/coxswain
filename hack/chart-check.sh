@@ -10,23 +10,27 @@
 #    kustomize install ships).
 #
 # It runs offline (no kind, no cluster; it only needs helm + go + python3).
-# NOTE: no workflow runs it yet. It is a manual `make chart-check` until the
-# owner lands docs/proposals/test-chart.yml.proposed (workflow edits are an
-# owner push), so a regenerated chart is only caught if someone runs it.
+#
+# Usage: hack/chart-check.sh [chart-dir]   (default: dist/chart)
+#
+# F87: it is wired into `make chart-drift-test` (so `make test` runs it), and
+# it takes a chart directory so the mutation harness
+# (hack/chart-drift-check-test.sh) can prove the guard fails on a bad chart.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHART="${1:-$ROOT/dist/chart}"
 command -v helm >/dev/null 2>&1 || { echo "Error: helm not found (make install-helm)"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "Error: python3 not found"; exit 1; }
 BUILD_ERR="$(mktemp)"
 trap 'rm -f "${BUILD_ERR:-}" "${RENDERED:-}"' EXIT
 
-echo "=== helm lint dist/chart ==="
-helm lint "$ROOT/dist/chart"
+echo "=== helm lint $CHART ==="
+helm lint "$CHART"
 
 echo "=== helm template (release coxswain, namespace coxswain-system) ==="
 RENDERED="$(mktemp)"
-helm template coxswain "$ROOT/dist/chart" --namespace coxswain-system > "$RENDERED"
+helm template coxswain "$CHART" --namespace coxswain-system > "$RENDERED"
 
 echo "=== install.yaml coverage (every install.yaml resource must be in the chart) ==="
 # The B5a review follow-up: do not swallow build-installer's stderr — a build
@@ -34,7 +38,7 @@ echo "=== install.yaml coverage (every install.yaml resource must be in the char
 # stdout, which the coverage check then compared against a STALE install.yaml).
 # Now the stderr is captured and shown on failure.
 if ! IMG="${IMG:-ghcr.io/papawattu/coxswain-controller:placeholder}" \
-   KUSTOMIZE="$(command -v kustomize 2>/dev/null || echo "$ROOT/bin/kustomize")" \
+   KUSTOMIZE="${KUSTOMIZE:-$(command -v kustomize 2>/dev/null || echo "$ROOT/bin/kustomize")}" \
    "$ROOT/hack/build-installer.sh" 2>"$BUILD_ERR" ; then
 	echo "Error: hack/build-installer.sh failed; its stderr:" >&2
 	cat "$BUILD_ERR" >&2
@@ -94,7 +98,7 @@ echo "=== second render at a non-default release name/namespace (F45) ==="
 # Both only show at a release name other than "coxswain", so render one.
 RENDERED2="$(mktemp)"
 trap 'rm -f "${BUILD_ERR:-}" "${RENDERED:-}" "${RENDERED2:-}"' EXIT
-helm template my-cox "$ROOT/dist/chart" --namespace ops > "$RENDERED2"
+helm template my-cox "$CHART" --namespace ops > "$RENDERED2"
 python3 - "$RENDERED2" <<'PYEOF'
 import sys, yaml
 from collections import Counter

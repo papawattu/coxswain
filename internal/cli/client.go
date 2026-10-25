@@ -101,7 +101,7 @@ func (d *dynamicLoopClient) Update(ctx context.Context, obj runtime.Object) erro
 	if u.GetAPIVersion() == "" {
 		u.SetAPIVersion("coxswain.wattu.com/v1alpha1")
 	}
-	_, err := d.c.Resource(loopGVR).Namespace(d.ns).Update(ctx, u, metav1.UpdateOptions{}, "status")
+	_, err := d.c.Resource(loopGVR).Namespace(d.ns).Update(ctx, u, metav1.UpdateOptions{}, statusSubresource)
 	return err
 }
 

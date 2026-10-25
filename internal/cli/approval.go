@@ -308,13 +308,13 @@ func diffLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) erro
 		return fmt.Errorf("cli: expected *unstructured.Unstructured, got %T", obj)
 	}
 	approvedHash := ""
-	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	conds, _, _ := unstructured.NestedSlice(u.Object, statusSubresource, "conditions")
 	for _, c := range conds {
 		cm, ok := c.(map[string]any)
 		if !ok {
 			continue
 		}
-		if cm["type"] == planApprovedConditionType && cm["status"] == conditionStatusTrue {
+		if cm["type"] == planApprovedConditionType && cm[conditionStatusField] == conditionStatusTrue {
 			if msg, ok := cm["message"].(string); ok {
 				// The message format is "Approved: <hash>" (the same format
 				// approveLoop writes). Parse the hash (a 64-hex string at the

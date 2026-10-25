@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -41,13 +42,21 @@ func f83SetTamperPod(ctx context.Context, ns, name string, tamper, artifact core
 		// The Job normally exists (the operator created it); make a minimal valid
 		// one when the spec's Loop never reached the Job create.
 		if k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, &batchv1.Job{}) != nil {
-			Expect(k8sClient.Create(ctx, &batchv1.Job{
+			job := &batchv1.Job{
 				ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)},
 				Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}},
 				}}},
-			})).To(Succeed())
+			}
+			// F83b: the operator now refuses to trust or delete a verify Job that
+			// is not the Loop's, so the fixture Job carries the controller owner
+			// reference a real verify Job gets (SetControllerReference in the
+			// operator's create). Do not weaken the guard for a fixture.
+			loop := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+			Expect(controllerutil.SetControllerReference(loop, job, k8sClient.Scheme())).To(Succeed())
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
 		}
 		s5aVerifyPodInProg(ctx, ns, name, jobName)
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: ns}, pod)).To(Succeed())

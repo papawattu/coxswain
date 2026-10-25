@@ -180,6 +180,56 @@ func TestF83bForeignVerifyJobIsNeverEvidence(t *testing.T) {
 	}
 }
 
+// testF83bForeignPassingPodCannotForgeAVerdict is B2's other half (the review's
+// P2-2): the foreign Job's OWN pod, with every init terminated 0, would be a
+// PASSING verify if the Job were trusted — the harness cannot reach the verdict
+// through a Job someone else created. Without the guard the Loop advances to
+// Succeeded on a forged pass.
+func TestF83bForeignPassingPodCannotForgeAVerdict(t *testing.T) {
+	ctx := context.Background()
+	scheme := newI42cForeignNPScheme(t)
+	loop := f83bLoop()
+
+	foreign := f83bJob(loop, f83bPin, false) // never owned: no controller reference
+	term0 := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      verifyJobName(loop) + "-pod",
+			Namespace: loop.Namespace,
+			Labels:    map[string]string{verifyForLabel: loop.Name, "job-name": verifyJobName(loop)},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(), Kind: "Job", Name: foreign.Name,
+				UID: foreign.UID, Controller: new(bool), BlockOwnerDeletion: new(bool),
+			}},
+		},
+		Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+			{Name: s5aCloneBase, State: term0},
+			{Name: s5aImportAgent, State: term0},
+			{Name: s5aTamper, State: term0},
+			{Name: s5aArtifact, State: term0},
+			{Name: s5aCheck0, State: term0},
+		}},
+	}
+	*pod.OwnerReferences[0].Controller = true
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign, pod, loop).Build()
+	rec := record.NewFakeRecorder(16)
+	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+
+	_, requeue := r.applyVerifyOutcome(ctx, loop)
+	if !requeue {
+		t.Fatal("a foreign Job is no decision: the pass must requeue")
+	}
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+		t.Fatalf("a passing pod owned by a foreign Job must NOT forge a verdict, got phase %s", loop.Status.Phase)
+	}
+	if loop.Status.Verify != nil && loop.Status.Verify.TamperExitCode != nil {
+		t.Fatalf("no tamper evidence may be recorded from a foreign Job's pod, got %d", *loop.Status.Verify.TamperExitCode)
+	}
+	if n := f83bEventCount(drainEvents(rec)); n != 1 {
+		t.Fatalf("the refusal must be visible: want 1 %s Event, got %d", verifyJobForeignEventReason, n)
+	}
+}
+
 // testF83bForeignJobIsNeverDeleted pins B2's destruction half: a foreign Job
 // with stale evidence is left alone (the old code deleted it as "stale").
 func TestF83bForeignVerifyJobIsNeverDeleted(t *testing.T) {

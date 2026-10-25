@@ -995,10 +995,19 @@ func (r *LoopReconciler) ensureVerifyNetworkPolicy(ctx context.Context, loop *co
 	return nil
 }
 
-// readVerifyJobPod reads the verify Job and its pod via the APIReader (the
-// S3/S4 pod-blind pattern — the Job's pod is NOT in the manager's Pod cache, so
-// the non-cached client is required). It returns the Job it bound the pod to
-// (nil when the Job is gone) and the pod (nil when the Job has no pod yet).
+// readVerifyJobPod reads the verify Job and its pod, and it reads them through
+// the readers each one needs (F83b P2-1: the doc used to say the Job came from
+// the APIReader, which it never did):
+//
+//   - the JOB through the reconciler's client (r.Get — the manager's cache,
+//     which covers Jobs; cmd/main.go scopes only Pod and Service), because the
+//     Job's UID is the binding that ties a pod to THIS attempt;
+//   - the POD through the APIReader (the S3/S4 pod-blind pattern): the Pod cache
+//     is scoped to the proxy components (cache.ByObject in cmd/main.go), so a
+//     verify pod is not in it and a cached List would never see one.
+//
+// It returns the Job it bound the pod to (nil when the Job is gone) and the pod
+// (nil when the Job has no pod yet).
 // F83b: the Job is returned so one reconcile makes ONE decision from ONE
 // snapshot — the operator's infra-retry deletes and recreates the Job under the
 // same name, so a second read can pair a pod from Job A with Job B's batch

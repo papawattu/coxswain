@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -202,6 +203,26 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		}).WithTimeout(10 * time.Second).Should(BeTrue())
 		Expect(r.applySandboxNotStarting(ctx, loop)).To(BeTrue(), "the condition must clear, not freeze on a pod that is gone")
 		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("PodGone"))
+	})
+
+	It("F48c: SandboxNotStarting clears when the SANDBOX is gone (the retry path deletes it)", func() {
+		loop, _, r, offset, _ := plant("f48c-sbgone", waiting("PodInitializing", ""))
+		*offset = sandboxStartGrace + time.Minute
+		_, ch, _ := r.sandboxFailureStep(ctx, loop, false)
+		Expect(ch).To(BeTrue())
+		Expect(conditionTruePresent(loop, cov.SandboxNotStartingCondition)).To(BeTrue())
+
+		By("the Sandbox is deleted (the config-error retry does exactly this)")
+		sb := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}}
+		Expect(k8sClient.Delete(ctx, sb, client.GracePeriodSeconds(0))).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(sb), &sandboxv1beta1.Sandbox{}))
+		}).WithTimeout(10 * time.Second).Should(BeTrue())
+		Expect(r.applySandboxNotStarting(ctx, loop)).To(BeTrue(), "the condition must clear with the Sandbox")
+		cond := findConditionFn(loop.Status.Conditions, cov.SandboxNotStartingCondition)
+		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal("PodGone"))
 	})

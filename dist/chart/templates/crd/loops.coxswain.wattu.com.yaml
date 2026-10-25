@@ -632,6 +632,13 @@ spec:
                       boot-ID changes.
                     format: int64
                     type: integer
+                  consecutiveReadFailures:
+                    description: |-
+                      consecutiveReadFailures counts usage reads that failed since the last
+                      good one (F44). At or past the operator's threshold the
+                      BudgetReadingStale condition is set; a good read resets it to 0.
+                    format: int32
+                    type: integer
                   costUsd:
                     description: |-
                       costUsd is the derived cost in USD as a decimal string (P2d: derived
@@ -689,6 +696,15 @@ spec:
                       counter from the proxy (item 2).
                     format: int64
                     type: integer
+                  lastUsageReadAt:
+                    description: |-
+                      lastUsageReadAt is when the operator last SUCCESSFULLY read the model
+                      proxy's usage endpoint (F44). The token and cost caps decide on the
+                      last successful read, so a stale value here means "the caps are
+                      evaluating old numbers" — the absence of a cap firing is then not
+                      evidence that usage is low. Empty before the first good read.
+                    format: date-time
+                    type: string
                   promptTokens:
                     description: |-
                       promptTokens is the accumulated prompt-token total across boot-ID

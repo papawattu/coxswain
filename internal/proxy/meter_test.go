@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -322,5 +323,38 @@ func TestStreamUsageNoIncludeUsageUnmetered(t *testing.T) {
 		"data: [DONE]\n"
 	if _, _, ok := parseStreamUsage([]byte(stream)); ok {
 		t.Fatalf("a stream without a usage chunk (the include_usage-not-forced case) must be unmetered")
+	}
+}
+
+// F44: a coerced "stream" value must not dodge the include_usage rewrite or the
+// SSE parser selection.
+func TestShapeRequestTreatsNonBoolStreamAsStreaming(t *testing.T) {
+	for _, in := range []string{
+		`{"model":"x","stream":"true"}`,
+		`{"model":"x","stream":1}`,
+	} {
+		out, isObject := shapeRequest([]byte(in))
+		if !isObject {
+			t.Fatalf("%s: expected a JSON object", in)
+		}
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatal(err)
+		}
+		var opts struct {
+			IncludeUsage bool `json:"include_usage"`
+		}
+		if err := json.Unmarshal(got["stream_options"], &opts); err != nil || !opts.IncludeUsage {
+			t.Fatalf("%s: include_usage must be forced; body=%s err=%v", in, out, err)
+		}
+		if !isStreaming(out) {
+			t.Fatalf("%s: isStreaming must select the SSE parser; body=%s", in, out)
+		}
+	}
+	for _, in := range []string{`{"stream":false}`, `{"stream":null}`, `{"model":"x"}`} {
+		out, _ := shapeRequest([]byte(in))
+		if isStreaming(out) || strings.Contains(string(out), "stream_options") {
+			t.Fatalf("%s: must not be treated as streaming; body=%s", in, out)
+		}
 	}
 }

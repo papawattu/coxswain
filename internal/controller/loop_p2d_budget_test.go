@@ -30,12 +30,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -1196,6 +1198,111 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		Expect(l.Status.Budget.LastActiveStamp.Equal(stampBefore)).To(BeTrue(),
 			"a Succeeded no-cap Loop must not rewrite the stamp (the status is not rewritten by the wall clock)")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded), "the terminal phase is unchanged")
+	})
+	// F44 (a): unmetered requests are surfaced, once, and the condition clears.
+	It("F44: growing unmeteredRequests sets MeteringDegraded with one Event; a clean read clears it", func() {
+		ns := nsFor("p2d-f44a")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		r := newP2dReconciler(recorder, nil)
+		loop := createP2dLoop(ns, "p2d-f44a", nil)
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+		primeP2dProxy(loop)
+		// The reading is driven by explicit state (a reconcile may read more
+		// than once, so a sequence would drift).
+		cur := proxy.Reading{BootID: "B1"}
+		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return cur, nil
+		}
+		cond := func() *metav1.Condition {
+			return apimeta.FindStatusCondition(getLoopP2d(ns, "p2d-f44a").Status.Conditions, coxv1alpha1.MeteringDegradedCondition)
+		}
+		countDegraded := func(evs []string) int {
+			n := 0
+			for _, e := range evs {
+				if strings.Contains(e, meteringDegradedReason) {
+					n++
+				}
+			}
+			return n
+		}
+		reconcileP2d(r, ns, "p2d-f44a")
+		Expect(cond()).To(BeNil(), "the baseline read adds no condition")
+		cur = proxy.Reading{BootID: "B1", Requests: 2, UnmeteredRequests: 2}
+		reconcileP2d(r, ns, "p2d-f44a")
+		Expect(cond()).NotTo(BeNil())
+		Expect(cond().Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond().Reason).To(Equal(meteringDegradedReason))
+		Expect(getLoopP2d(ns, "p2d-f44a").Status.Budget.UnmeteredRequests).To(BeEquivalentTo(2))
+		events := drainEvents(recorder)
+		Expect(countDegraded(events)).To(Equal(1), "exactly one Warning Event on the transition: %v", events)
+		cur = proxy.Reading{BootID: "B1", Requests: 3, UnmeteredRequests: 3}
+		reconcileP2d(r, ns, "p2d-f44a") // another unmetered: still True, NO second Event
+		Expect(cond().Status).To(Equal(metav1.ConditionTrue))
+		Expect(countDegraded(drainEvents(recorder))).To(BeZero(), "no second Event while already degraded")
+		reconcileP2d(r, ns, "p2d-f44a") // same reading: no new unmetered -> cleared
+		Expect(cond().Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond().Reason).To(Equal("MeteringOK"))
+		cur = proxy.Reading{BootID: "B1", Requests: 4, UnmeteredRequests: 4}
+		reconcileP2d(r, ns, "p2d-f44a") // re-degrade right after the clear: condition True, still no flapping Event
+		Expect(cond().Status).To(Equal(metav1.ConditionTrue))
+		Expect(countDegraded(drainEvents(recorder))).To(BeZero(), "a re-degrade inside the quiet window emits no Event")
+		cur = proxy.Reading{BootID: "B1", Requests: 6, UnmeteredRequests: 4}
+		reconcileP2d(r, ns, "p2d-f44a") // clean
+		Expect(cond().Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond().Reason).To(Equal("MeteringOK"))
+	})
+
+	// F44 (b): a failing usage read is recorded and surfaced after the threshold.
+	It("F44: three failed usage reads set BudgetReadingStale once; a good read clears it and resets the count", func() {
+		ns := nsFor("p2d-f44b")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		r := newP2dReconciler(recorder, nil)
+		loop := createP2dLoop(ns, "p2d-f44b", nil)
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+		primeP2dProxy(loop)
+		fail := true
+		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			if fail {
+				return proxy.Reading{}, fmt.Errorf("dial tcp: connection refused")
+			}
+			return proxy.Reading{BootID: "B1"}, nil
+		}
+		get := func() *coxv1alpha1.Loop { return getLoopP2d(ns, "p2d-f44b") }
+		stale := func() *metav1.Condition {
+			return apimeta.FindStatusCondition(get().Status.Conditions, coxv1alpha1.BudgetReadingStaleCondition)
+		}
+		countStale := func(evs []string) int {
+			n := 0
+			for _, e := range evs {
+				if strings.Contains(e, budgetReadingStaleReason) {
+					n++
+				}
+			}
+			return n
+		}
+		for n := int32(1); n <= 2; n++ {
+			reconcileP2d(r, ns, "p2d-f44b")
+			Expect(get().Status.Budget.ConsecutiveReadFailures).To(Equal(n))
+			Expect(stale()).To(BeNil(), "below the threshold: no condition (in-progress state)")
+		}
+		Expect(countStale(drainEvents(recorder))).To(BeZero())
+		reconcileP2d(r, ns, "p2d-f44b")
+		Expect(get().Status.Budget.ConsecutiveReadFailures).To(BeEquivalentTo(3))
+		Expect(stale()).NotTo(BeNil())
+		Expect(stale().Status).To(Equal(metav1.ConditionTrue))
+		Expect(stale().Message).To(ContainSubstring("connection refused"))
+		Expect(countStale(drainEvents(recorder))).To(Equal(1))
+		reconcileP2d(r, ns, "p2d-f44b") // 4th failure: no second Event
+		Expect(countStale(drainEvents(recorder))).To(BeZero())
+		Expect(get().Status.Budget.LastUsageReadAt).To(BeNil(), "no good read yet: nothing stamped")
+
+		fail = false
+		reconcileP2d(r, ns, "p2d-f44b")
+		Expect(get().Status.Budget.ConsecutiveReadFailures).To(BeZero())
+		Expect(get().Status.Budget.LastUsageReadAt).NotTo(BeNil())
+		Expect(stale().Status).To(Equal(metav1.ConditionFalse))
 	})
 })
 

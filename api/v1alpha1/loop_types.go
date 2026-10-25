@@ -1180,6 +1180,20 @@ type BudgetStatus struct {
 	// reconcile does not add the pause's duration to activeSeconds.
 	// +optional
 	LastActiveStamp *metav1.Time `json:"lastActiveStamp,omitempty"`
+
+	// lastUsageReadAt is when the operator last SUCCESSFULLY read the model
+	// proxy's usage endpoint (F44). The token and cost caps decide on the
+	// last successful read, so a stale value here means "the caps are
+	// evaluating old numbers" — the absence of a cap firing is then not
+	// evidence that usage is low. Empty before the first good read.
+	// +optional
+	LastUsageReadAt *metav1.Time `json:"lastUsageReadAt,omitempty"`
+
+	// consecutiveReadFailures counts usage reads that failed since the last
+	// good one (F44). At or past the operator's threshold the
+	// BudgetReadingStale condition is set; a good read resets it to 0.
+	// +optional
+	ConsecutiveReadFailures int32 `json:"consecutiveReadFailures,omitempty"`
 }
 
 // StallEntry is one verify-failure iteration's record in status.stallHistory
@@ -1255,6 +1269,19 @@ const (
 	// backend timed out after bounded retries. It is set back to True when
 	// a subsequent claim succeeds (the model recovered).
 	ModelAvailableCondition = "ModelAvailable"
+	// MeteringDegradedCondition (F44) is True while the model proxy is
+	// forwarding requests it could not meter (a response without a parseable
+	// usage object, e.g. an upstream that ignores include_usage). Those
+	// requests are NOT counted toward the token or cost caps. It returns to
+	// False when a later read shows no new unmetered request. Surfacing
+	// only: it does not hold the Loop.
+	MeteringDegradedCondition = "MeteringDegraded"
+	// BudgetReadingStaleCondition (F44) is True while the operator cannot
+	// read the model proxy's usage endpoint (consecutive failures at or past
+	// the threshold): the token and cost caps are evaluating the last
+	// successful reading, so they cannot fire on new spend. It returns to
+	// False on the next good read. Surfacing only: it does not hold the Loop.
+	BudgetReadingStaleCondition = "BudgetReadingStale"
 	// AgentFailedCondition (F6, dogfood finding) is True while the operator
 	// is deciding what to do about a sandbox pod that FAILED without a phase
 	// claim (evicted, OOMKilled, or the agent container terminated without a

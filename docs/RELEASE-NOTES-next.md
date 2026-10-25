@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `4d7b5d2` = PR #245); each claim cites its
+merged code on `main` (as of `ced2e2a` = PR #251); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -21,8 +21,11 @@ Nothing else to do: `spec.workspace.restoreFrom` is now immutable (F35,
 #215); the agent NetworkPolicy is always created (F42, #213); the sandbox
 waits for the egress proxy for the init clone (F55, #220); the memory
 lesson cap is 100 per PVC (F32, #233); the memory-writer audit records the
-trimmed lesson text (F33, #234); and a stale lessons file no longer
-survives into a later iteration (F34, #238).
+trimmed lesson text (F33, #234); a stale lessons file no longer
+survives into a later iteration (F34, #238); a pinned commit that does not
+descend from the base is refused with a new terminal `PinNotDescendant`
+reason (F43, #244); and an unmetered request or a stale usage reading is
+surfaced, not skipped silently (F44, #248).
 
 ## Security fixes
 
@@ -210,6 +213,33 @@ survives into a later iteration (F34, #238).
 
 ## Other changes
 
+### F44: unmetered requests and stale usage readings are surfaced — #248
+
+- **What was wrong.** Two of the budget's inputs could silently stop
+  working: (a) a model request the proxy forwarded without a parseable
+  usage object was simply not counted, so the token and cost caps ran on
+  partial data with no signal; and (b) a usage read that failed (a proxy
+  pod mid-restart, a scrape error) was silently ignored — the caps kept
+  evaluating the last good reading and nothing recorded how stale it was
+  (merged `0f6915a` = PR #248).
+- **What changed.** The proxy now counts requests it forwarded without a
+  usage object and reports them per read; the operator surfaces both cases
+  with conditions and transition-gated Warning Events, and new status
+  fields make the staleness inspectable: `MeteringDegraded` (reason
+  `UnmeteredRequests`) goes True while a read reports new unmetered
+  requests and carries the running total, and the new
+  `status.budget.unmeteredRequests` accumulates it; `BudgetReadingStale`
+  (reason `UsageReadFailed`) goes True after 3 consecutive failed usage
+  reads and the new `status.budget.lastUsageReadAt` /
+  `status.budget.consecutiveReadFailures` fields record the last good
+  read and the failure run. Both are cleared when the next good read
+  arrives, and both carry one Warning Event per episode, not per
+  reconcile. Surfacing only: on a stale read the caps stay on the last
+  good reading (fail-open) — whether to hold the Loop instead is the open
+  owner decision (merged `0f6915a` = PR #248). A new metric,
+  `coxswain_unmetered_requests_total`, records the operator-side total.
+- **On upgrade.** Nothing required; the fix is in the operator (PR #248).
+
 ### F33: memory-writer audit now hashes the trimmed lesson, counts batch duplicates correctly, and creates the deny-all NetworkPolicy before the Job — #234
 
 - **What was wrong.** Three small defects in the memory-writer Job: the audit record's hash was over the raw lesson text, but the file was named by the trimmed text, so a lesson with leading or trailing whitespace had a hash that did not match its name (P3-1); two identical lessons in one batch produced per-lesson lines whose count did not agree with the batch total (P3-2); and the deny-all NetworkPolicy for the Job pod was created after the Job, so the pod's first seconds ran without the fence (P3-6) (PR #234).
@@ -327,7 +357,7 @@ in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
   `kept`/`static-drop` were not observed. All four outcomes are covered by
   the envtest specs (merged `dcd79da` = PR #206).
 
-### Docs — #208, #209, #224, #225, #227, #228, #230, #231, #232, #236, #237, #239, #240
+### Docs — #208, #209, #224, #225, #227, #228, #230, #231, #232, #236, #237, #239, #240, #247, #251
 
 - #208 (merged `2a3208f`): user docs — corrected a non-existent failure name
   in `docs/QUICKSTART.md` (the deliver credential is only read when
@@ -432,9 +462,9 @@ The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
 merged, and F31 (no-pod memory-writer Job), F54 (the evil-agent e2e), F32
 (D71 memory lesson cap), F33 (memory-writer audit), F34 (stale
 lessons.json), F78 (memory-writer audit counts line), F41 (the unknown
-curator failure), and F43 (the agent-chosen pin) were closed by #229,
-#222, #233, #234, #238, #243, #241, and #244. In plain words, the items
-still open:
+curator failure), F43 (the agent-chosen pin), and F44 (surfacing unmetered
+requests and stale usage reads) were closed by #229, #222, #233, #234,
+#238, #243, #241, #244, and #248. In plain words, the items still open:
 
 **P1 (security):**
 
@@ -447,9 +477,8 @@ still open:
 
 **P2:**
 
-- **F44**: a broken or stale usage reading silently switches off the token
-  and cost caps (surface only; whether to hold the Loop is an open owner
-  decision).
+- **F82**: F44 follow-ups — two unspecced lines and three stale stream
+  comments (PR #248's run).
 - **F47**: "editor"-level users can write status fields the operator later
   uses to delete or restore checkpoints.
 - **F48**: a sandbox pod that cannot start wedges the Loop with no condition
@@ -522,9 +551,27 @@ still open:
 - a precondition before the operator mounts a named Secret and presents it
   to a host the same author names (confused deputy);
 - whether a stale usage reading should hold the Loop at its cost cap (F44);
+- whether to enable the operator NetworkPolicy by default (F45 P3-1);
 - narrowing editor write access to the two approval conditions only (F47);
 - whether to reject or document as unsupported the `spec.workspace.repo`
   ssh/scp forms the delivery path can never serve.
 
 No P1 fix outstanding from the merged batch remains open; the three P1
 security items above (F58, F60, F63) are the only P1 work queued.
+
+### Docs — the two additions after #240
+
+- #247 (merged `3eed62c`): a new `TROUBLESHOOTING.md` section for
+  `PinNotDescendant` (F43, #244) — what you see (the terminal Failed
+  reason, the Warning Event naming both commits, the import-agent init
+  container exiting 97), why the verify Job refuses the pin (the runner's
+  `headCommit` claim is not operator evidence; the ancestry check runs
+  `git merge-base --is-ancestor` before any checkout), what to do (compare
+  `status.baseCommit` and `status.currentVerify.verifiedCommit`, then
+  restart the Loop or roll back to a pre-divergence checkpoint — it is
+  terminal, no retry), and how it differs from its neighbours
+  (`TamperedVerify`, `VerifyInfraFailed`, `Stalled`) (PR #247).
+- #251 (merged `ced2e2a`): the operator FAQ gains the question "Why did my
+  Loop fail with PinNotDescendant?" (as question 8, with the later
+  questions renumbered) and the glossary gains a `PinNotDescendant` entry;
+  both link to the #247 TROUBLESHOOTING section (PR #251).

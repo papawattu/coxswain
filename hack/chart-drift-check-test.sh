@@ -73,9 +73,12 @@ echo "$out" | grep -q "expected exactly 1 ValidatingAdmissionPolicyBinding" || {
 }
 echo "OK: render guard fails (naming the binding count) on a chart with an inert second VAP binding"
 
-# F87(b): the chart NOTES guard. The pre-F87 text (a bare `--clusterrole
-# loop-editor`, no pods/log, no --role= branch) FAILS and names the causes; the
-# real NOTES passing is covered by the recipe line (F87 review P3-3).
+# F87(b), F87(d): the chart NOTES guard. The pre-F87 RBAC text (a bare
+# `--clusterrole loop-editor`, no pods/log, no --role= branch) FAILS and names
+# the causes; the real NOTES passing is covered by the recipe line (F87 review
+# P3-3). The write VERB is deliberately not asserted — F87(d) made it a status
+# merge patch — so this fixture says "PATCH" and still fails, on the RBAC
+# defects the guard does pin.
 rm -rf "$TMP/chart4"
 cp -r "$ROOT/dist/chart" "$TMP/chart4"
 cat >"$TMP/chart4/templates/NOTES.txt" <<'NOTES'

@@ -559,8 +559,10 @@ func (r *LoopReconciler) recordPhaseClaim(ctx context.Context, loop *coxv1alpha1
 			if next == coxv1alpha1.LoopPhaseVerifying {
 				// Pin the CURRENT iteration's verified commit (D11): the
 				// verify Job (ensureVerifyJob) checks out exactly this SHA and
-				// the tamper check diffs baseCommit..this SHA. The pin is the
-				// operator's (written from the claim, never by the runner);
+				// the tamper check diffs baseCommit..this SHA. The pin is
+				// written by the operator FROM THE CLAIM (shape-checked only:
+				// the claim is agent-influenced, so the verify Job's import-agent
+				// refuses a pin that is not a descendant of baseCommit, F43);
 				// a verify Job naming a different commit is stale evidence
 				// (D24 fail-closed).
 				loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{

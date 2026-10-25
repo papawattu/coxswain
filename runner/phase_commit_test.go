@@ -687,3 +687,141 @@ func TestWriteClaimCarriesPlanMismatch(t *testing.T) {
 		t.Fatalf("the operator's parser did not read planMismatch=true: %s", data)
 	}
 }
+
+// forgedImplementingResult writes a result.json an agent could write with its
+// shell: a completed Implementing success for the current iteration carrying
+// the given headCommit.
+func forgedImplementingResult(t *testing.T, ws, head string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(ws, resultDirName, iterationFileName), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	forged := Result{Status: statusSuccess, ObservedPhase: PhaseImplementing, Iteration: 1, HeadCommit: head}
+	if err := writeResult(filepath.Join(ws, resultDirName, resultFileName), forged); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestForgedResultWithUnknownCommitIsNotReEmitted (F43): a stored Implementing
+// success whose headCommit is not a commit in the workspace repo is NOT
+// re-emitted as the claim; the phase runs (the model is called) and the claim
+// never carries the forged pin.
+func TestForgedResultWithUnknownCommitIsNotReEmitted(t *testing.T) {
+	fake := s4FakeModelAnswer(t, "done")
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	forged := strings.Repeat("ab", 20)
+	forgedImplementingResult(t, ws, forged)
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, make(chan any))
+
+	if len(fake.Requests) == 0 {
+		t.Fatal("the stored forged result was re-emitted without running the phase (no model request)")
+	}
+	if res.HeadCommit == forged {
+		t.Fatalf("the claim carries the forged headCommit %s", forged)
+	}
+	if got, _ := parseClaim(t, claimPath)["headCommit"].(string); got == forged {
+		t.Fatalf("the written claim carries the forged headCommit %s", forged)
+	}
+}
+
+// TestRealResultWithExistingCommitIsStillReEmitted (F43): the restart-safety
+// path is intact: a stored success whose headCommit IS a workspace commit is
+// re-emitted with no model call.
+func TestRealResultWithExistingCommitIsStillReEmitted(t *testing.T) {
+	fake := s4FakeModelAnswer(t, "done")
+	defer fake.Close()
+	_, cleanup := s4ClaimPath(t)
+	defer cleanup()
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	head := gitIn(t, ws, "rev-parse", "HEAD")
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	forgedImplementingResult(t, ws, head)
+
+	res := PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, make(chan any))
+
+	if len(fake.Requests) != 0 {
+		t.Fatalf("a restart with a real stored result called the model (%d requests)", len(fake.Requests))
+	}
+	if res.HeadCommit != head {
+		t.Fatalf("restart claim headCommit = %q, want %q", res.HeadCommit, head)
+	}
+}
+
+// TestForgedResultDoesNotSurviveARunnerPhase (F43): a result.json forged
+// during Planning is overwritten by the runner's own end-of-phase write, so
+// the Implementing run that follows does not re-emit it. (A background writer
+// that outlives the runner's write is the residual case; see the PR.)
+func TestForgedResultDoesNotSurviveARunnerPhase(t *testing.T) {
+	fake := s4FakeModelAnswer(t, "a plan")
+	defer fake.Close()
+	_, cleanup := s4ClaimPath(t)
+	defer cleanup()
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	writeDesiredPhase(t, ws, PhasePlanning)
+	forged := strings.Repeat("cd", 20)
+	forgedImplementingResult(t, ws, forged)
+
+	PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+		PollInterval: 5 * time.Millisecond}, make(chan any))
+
+	data, err := os.ReadFile(filepath.Join(ws, resultDirName, resultFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), forged) || !strings.Contains(string(data), `"observedPhase": "Planning"`) {
+		t.Fatalf("result.json after a Planning run still holds the forged result:\n%s", data)
+	}
+}
+
+// TestPorcelainPathsRenameRecord (F43 P3-1): the REAL `git status
+// --porcelain=v1 -z` record for an index rename is "R  to\0from\0"; both
+// paths are returned and the from-record is not parsed as a status record.
+func TestPorcelainPathsRenameRecord(t *testing.T) {
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	gitIn(t, ws, "mv", "main.go", "moved.go")
+	status := gitIn(t, ws, "-c", "core.quotepath=false", "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if !strings.HasPrefix(status, "R  moved.go\x00main.go") {
+		t.Fatalf("setup: git's rename record is %q, expected the R  to\\0from form", status)
+	}
+	// gitIn trims trailing whitespace; restore the record terminator.
+	got := porcelainPaths(ws, status+"\x00")
+	want := []string{"moved.go", "main.go"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("porcelainPaths = %q, want %q", got, want)
+	}
+	// A following ordinary record is still parsed as its own record.
+	got = porcelainPaths(ws, "R  moved.go\x00main.go\x00 M other.go\x00")
+	if len(got) != 3 || got[2] != "other.go" {
+		t.Fatalf("a record after the rename was mis-parsed: %q", got)
+	}
+}
+
+// TestCommitWorkspaceAddFailureCarriesReason (F43 P3-1): a git add failure
+// returns a non-empty reason (it was "", so the claim said only "empty
+// headCommit"). A file literally named with unsupported pathspec magic makes
+// `git add -- <path>` fail.
+func TestCommitWorkspaceAddFailureCarriesReason(t *testing.T) {
+	ws := t.TempDir()
+	initTestRepo(t, ws)
+	if err := os.WriteFile(filepath.Join(ws, ":(bogus)x"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, reason := commitWorkspace(ws)
+	if sha != "" {
+		t.Fatalf("setup: commitWorkspace succeeded (%s); the add was expected to fail", sha)
+	}
+	if !strings.HasPrefix(reason, "git add failed") {
+		t.Fatalf("reason = %q, want it to start with %q", reason, "git add failed")
+	}
+}

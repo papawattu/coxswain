@@ -311,10 +311,22 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// with fresh model work.
 	curIterForPrior := readIteration(cfg.Workspace)
 	curPlanAttemptForPrior := readPlanAttempt(cfg.Workspace)
-	if res, done := priorCompletedResult(
+	prior, done := priorCompletedResult(
 		filepath.Join(cfg.Workspace, resultDirName, resultFileName),
 		phase, claimIteration(curIterForPrior), curPlanAttemptForPrior,
-	); done {
+	)
+	// F43: result.json is a plain file on the workspace volume that the agent's
+	// shell can also write, so a stored Implementing success is re-emitted only
+	// when its headCommit is a commit that exists in the workspace repo. (This
+	// cannot prove the runner wrote the file: the agent runs as the same user in
+	// the same container. The operator does not trust the pin either: the verify
+	// Job refuses a pin that is not a descendant of baseCommit.)
+	if done && phase == PhaseImplementing && prior.HeadCommit != "" && !commitResolves(cfg.Workspace, prior.HeadCommit) {
+		log.Printf("runner: ignoring stored result.json: headCommit %q is not a commit in the workspace repo", prior.HeadCommit)
+		done = false
+	}
+	if done {
+		res := prior
 		// S5a (B3): an Implementing success without a headCommit re-commits
 		// (the first run's commit may have failed; the workspace is on the
 		// PVC so the work is still there). Never emit an Implementing success
@@ -433,8 +445,8 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		// empty (the operator then blocks the advance). On a BLOCKED run the
 		// work is not committed (nothing succeeded) and the claim carries no
 		// headCommit (no evidence to pin).
-		// I47: the staged paths ride into the claim summary (evidence: what the
-		// verified commit contains), and a refused commit (an oversized or
+		// I47: the staged paths go into Result.Summary (result.json only, F43
+		// P2-2: not the claim), and a refused commit (an oversized or
 		// binary new file) BLOCKS the claim with the reason — no headCommit,
 		// the operator holds the Verifying advance.
 		if res.Status == statusSuccess {
@@ -618,7 +630,10 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 		res.Status = statusBlocked
 		res.VerificationNotes = modelErr
 	}
-	if len(onAnswer) > 0 && onAnswer[0] != nil {
+	// F43 P2-1: the hook (PLAN.md write, implAnswer capture) runs only for a
+	// run that produced an answer. A blocked run's answer is empty, and
+	// writing it would truncate a PLAN.md the user already approved.
+	if modelErr == "" && len(onAnswer) > 0 && onAnswer[0] != nil {
 		onAnswer[0](answer)
 	}
 	return res
@@ -825,6 +840,15 @@ func gitRevParseHead(workspace string) string {
 	return sha
 }
 
+// commitResolves reports whether sha is a commit object in the workspace repo.
+func commitResolves(workspace, sha string) bool {
+	if !isHex40(sha) {
+		return false
+	}
+	_, err := gitC(workspace, "cat-file", "-e", sha+"^{commit}")
+	return err == nil
+}
+
 // isTrackedPath reports whether the path is tracked in the workspace repo
 // (I47: the size/binary refusal applies to NEW files only — an agent edit to
 // a large existing tracked file is source work and is committed as-is).
@@ -851,10 +875,11 @@ func isBinaryFile(path string, scanLimit int) bool {
 	return bytes.IndexByte(buf[:n], 0) >= 0
 }
 
-// stagedClaimSummary appends the I47 staged-paths list to the claim summary
-// (the claim summary is the runner's one-line status note; the path list is
-// capped so a runaway workspace cannot blow the termination-log claim size
-// budget — the claim must stay well under claimMaxBytes).
+// stagedClaimSummary appends the I47 staged-paths list to Result.Summary.
+// F43 P2-2: Summary is written to result.json ONLY. The strict termination-log
+// claim (writeClaim) has no summary field and no operator component reads
+// result.json, so this list is a record on the workspace volume, not evidence
+// the operator sees. The list is capped to keep result.json small.
 func stagedClaimSummary(summary string, staged []string) string {
 	if len(staged) == 0 {
 		return summary
@@ -867,10 +892,8 @@ func stagedClaimSummary(summary string, staged []string) string {
 		suffix = fmt.Sprintf(" (+%d more)", len(staged)-maxListed)
 	}
 	line := fmt.Sprintf("\n[staged: %d file(s): %s%s]", len(staged), strings.Join(listed, ", "), suffix)
-	// The whole claim (summary + blockedReason ride into the claim; the
-	// operator strict-parses it) must stay under claimMaxBytes; cap the
-	// appended list so it cannot push the claim over (the paths are also in
-	// result.json's tool trace and in the commit itself).
+	// Cap the appended list (the paths are also in result.json's tool trace
+	// and in the commit itself).
 	if len(summary)+len(line) > claimMaxBytes-256 {
 		return summary
 	}
@@ -892,7 +915,7 @@ func commitWorkspace(workspace string) (string, []string, string) {
 	// before the runner's own staging).
 	if out, err := gitC(workspace, "reset", "-q"); err != nil {
 		log.Printf("runner: workspace commit reset: %v: %s", err, out)
-		return "", nil, ""
+		return "", nil, "git reset failed: " + strings.TrimSpace(out)
 	}
 
 	// The paths the agent left (porcelain -z: NUL-separated so a path with a
@@ -905,7 +928,7 @@ func commitWorkspace(workspace string) (string, []string, string) {
 		"--", ":(exclude).coxswain")
 	if err != nil {
 		log.Printf("runner: workspace commit status: %v: %s", err, status)
-		return "", nil, ""
+		return "", nil, "git status failed: " + strings.TrimSpace(status)
 	}
 	if strings.TrimSpace(status) == "" {
 		// No changes: the head SHA is still the verification target (the
@@ -915,48 +938,8 @@ func commitWorkspace(workspace string) (string, []string, string) {
 
 	// The refusal set is EVERY path the worktree differs on (modified,
 	// deleted, renamed — the records with a status prefix) PLUS every
-	// untracked file (the "?? PATH" records). A rename's new path is the
-	// worktree file (refused as new when it is a binary/oversized); its old
-	// path is a deletion (always allowed — it removes, it does not add).
-	var paths []string
-	for rec := range strings.SplitSeq(status, "\x00") {
-		if len(rec) < 4 {
-			continue
-		}
-		path := rec[3:]
-		if path == resultDirName || strings.HasPrefix(path, resultDirName+"/") {
-			continue // defensive: the pathspec above already excludes it
-		}
-		if rec[0] == 'R' || rec[0] == 'C' {
-			// Rename/copy: the NEW path (rec[3:]) is the worktree file; the
-			// next record is the OLD (prefix-free) path — skip both as
-			// refusal candidates (the new path is added below as untracked
-			// via the ?? entry git emits for the destination when the source
-			// was untracked; a tracked-source rename is source work).
-			continue
-		}
-		if rec[:2] == "??" {
-			if info, statErr := os.Stat(filepath.Join(workspace, path)); statErr == nil && info.IsDir() {
-				continue // a dir entry is not a stageable file
-			}
-			// I80/D51: an UNTRACKED root PLAN.md is the agent's own plan (its
-			// plan lives in .coxswain/PLAN.md, which is excluded above). Keep
-			// it out of the verified commit so it is not delivered. A
-			// base-TRACKED root PLAN.md that the agent modified is source work
-			// (rec[:2] != "??") and is still committed, so a repo's own
-			// PLAN.md can be changed.
-			if path == "PLAN.md" && !isTrackedPath(workspace, path) {
-				continue
-			}
-			paths = append(paths, path) // untracked: new — refuse-eligible
-			continue
-		}
-		// A worktree-differing tracked file (M/D/R/C/A): source work —
-		// allowed (a modification/deletion is never a build artifact).
-		if rec[1] != ' ' {
-			paths = append(paths, path)
-		}
-	}
+	// untracked file (the "?? PATH" records).
+	paths := porcelainPaths(workspace, status)
 	if len(paths) == 0 {
 		return head, nil, ""
 	}
@@ -1000,17 +983,17 @@ func commitWorkspace(workspace string) (string, []string, string) {
 	args := append([]string{"add", "-A", "--"}, paths...)
 	if out, addErr := gitC(workspace, args...); addErr != nil {
 		log.Printf("runner: workspace commit add: %v: %s", addErr, out)
-		return "", paths, ""
+		return "", paths, "git add failed: " + strings.TrimSpace(out)
 	}
 
 	// The actual staged set (NUL-separated, core.quotepath=false so
-	// non-ASCII and odd-named paths round-trip verbatim): the claim summary
-	// lists what the commit will carry (I47 evidence).
+	// non-ASCII and odd-named paths round-trip verbatim): the Result summary
+	// lists what the commit will carry (I47; result.json only).
 	stagedOut, err := gitC(workspace, "-c", "core.quotepath=false",
 		"diff", "--cached", "-z", "--name-only")
 	if err != nil {
 		log.Printf("runner: workspace commit staged list: %v: %s", err, stagedOut)
-		return "", paths, ""
+		return "", paths, "git diff --cached failed: " + strings.TrimSpace(stagedOut)
 	}
 	var stagedPaths []string
 	for p := range strings.SplitSeq(stagedOut, "\x00") {
@@ -1034,14 +1017,78 @@ func commitWorkspace(workspace string) (string, []string, string) {
 		"commit", "-m", commitSubject()}
 	if out, commitErr := gitC(workspace, commitArgs...); commitErr != nil {
 		log.Printf("runner: workspace commit (nothing to commit or git error): %v: %s", commitErr, out)
-		return "", stagedPaths, ""
+		return "", stagedPaths, "git commit failed: " + strings.TrimSpace(out)
 	}
 
 	newHead := gitRevParseHead(workspace)
 	if newHead == "" {
-		return "", stagedPaths, ""
+		return "", stagedPaths, "git rev-parse HEAD failed after the commit"
 	}
 	return newHead, stagedPaths, ""
+}
+
+// porcelainPaths turns `git status --porcelain=v1 -z` output into the paths
+// commitWorkspace refuses-or-stages. A record is "XY path\0"; a rename or copy
+// ("R"/"C" in X) is "XY to\0from\0" (git-status(1): in -z mode the `->` is
+// omitted and the order is reversed), so it consumes the NEXT record as the
+// from-path. F43 P3-1: both paths are returned (the destination is new work
+// to refuse-check and stage; the source is the removal), and the from-record
+// is never parsed as a status record.
+func porcelainPaths(workspace, status string) []string {
+	var paths []string
+	recs := strings.Split(status, "\x00")
+	for i := 0; i < len(recs); i++ {
+		rec := recs[i]
+		if len(rec) < 4 {
+			continue
+		}
+		path := rec[3:]
+		if rec[0] == 'R' || rec[0] == 'C' {
+			var from string
+			if i+1 < len(recs) {
+				i++
+				from = recs[i]
+			}
+			if !isOperatorPath(path) {
+				paths = append(paths, path)
+			}
+			if rec[0] == 'R' && from != "" && !isOperatorPath(from) {
+				paths = append(paths, from) // the rename's removal
+			}
+			continue
+		}
+		if isOperatorPath(path) {
+			continue // defensive: the pathspec above already excludes it
+		}
+		if rec[:2] == "??" {
+			if info, statErr := os.Stat(filepath.Join(workspace, path)); statErr == nil && info.IsDir() {
+				continue // a dir entry is not a stageable file
+			}
+			// I80/D51: an UNTRACKED root PLAN.md is the agent's own plan (its
+			// plan lives in .coxswain/PLAN.md, which is excluded above). Keep
+			// it out of the verified commit so it is not delivered. A
+			// base-TRACKED root PLAN.md that the agent modified is source work
+			// (rec[:2] != "??") and is still committed, so a repo's own
+			// PLAN.md can be changed.
+			if path == "PLAN.md" && !isTrackedPath(workspace, path) {
+				continue
+			}
+			paths = append(paths, path) // untracked: new — refuse-eligible
+			continue
+		}
+		// A worktree-differing tracked file (M/D/A): source work — allowed
+		// (a modification/deletion is never a build artifact).
+		if rec[1] != ' ' {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+// isOperatorPath reports whether path is the operator-owned .coxswain dir or
+// inside it.
+func isOperatorPath(path string) bool {
+	return path == resultDirName || strings.HasPrefix(path, resultDirName+"/")
 }
 
 // readDesiredPhase reads <workspace>/.coxswain/desired-phase and returns the

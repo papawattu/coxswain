@@ -162,7 +162,10 @@ type Result struct {
 	// operator pins it to status.currentVerify.verifiedCommit on the
 	// Implementing -> Verifying advance (the verify Job checks out exactly
 	// this SHA, D11). A CLAIM (ADR-0005): the operator strictly validates the
-	// 40-hex shape before acting on it and never advances without it.
+	// 40-hex shape before acting on it and never advances without it. The
+	// agent can write the claim channel too (same user, same container), so
+	// the value is agent-influenced evidence: the verify Job refuses a pin
+	// that is not a descendant of baseCommit (F43, PinNotDescendant).
 	HeadCommit string `json:"headCommit,omitempty"`
 
 	// B3 (PLAN-BETA / PLAN.md Phase 4): true when the runner's Planning run

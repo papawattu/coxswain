@@ -197,6 +197,39 @@ var _ = Describe("F83: the operator records the tamper init's evidence", func() 
 		Expect(cond.Reason).To(Equal(TamperedVerifyReason))
 	})
 
+	It("F83: the gate refuses a status-only tampered verdict; it fires only when the verify Job and its pod agree", func() {
+		one := int32(1)
+		mkLoop := func(uid string) *coxv1alpha1.Loop {
+			return &coxv1alpha1.Loop{
+				ObjectMeta: metav1.ObjectMeta{Name: "f83gate"},
+				Status: coxv1alpha1.LoopStatus{
+					Phase:         coxv1alpha1.LoopPhaseVerifying,
+					CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "cafe"},
+					Verify:        &coxv1alpha1.VerifyStatus{TamperExitCode: &one, VerifiedCommit: "cafe", TamperJobUID: uid},
+				},
+			}
+		}
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "f83gate-verify-1", UID: types.UID("uid-real")}}
+		pod := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
+		}}}
+		cleanPod := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		}}}
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+		Expect(r.applyTamperGate(mkLoop("uid-real"), job, cleanPod)).To(BeFalse(),
+			"the forged code is not confirmed by the pod")
+		Expect(r.applyTamperGate(mkLoop("uid-forged"), job, pod)).To(BeFalse(),
+			"a forged Job UID is not the current Job")
+		Expect(r.applyTamperGate(mkLoop(""), job, pod)).To(BeFalse(),
+			"no UID binding (the pre-F83 status shape) is no evidence")
+		Expect(r.applyTamperGate(mkLoop("uid-real"), job, nil)).To(BeFalse(),
+			"no pod is no evidence")
+		Expect(r.applyTamperGate(mkLoop("uid-real"), &batchv1.Job{ObjectMeta: metav1.ObjectMeta{UID: types.UID("uid-real")}}, pod)).To(BeTrue(),
+			"control: the real Job UID and the pod's own terminated tamper 1 fail the Loop")
+	})
+
 	It("F83: the delivered PR body says the tamper check was clean when the tamper init exited 0", func() {
 		ns := "f83-body-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

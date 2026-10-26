@@ -106,6 +106,16 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 		return loop
 	}
 
+	// f58InfraAttempts reads status.verify.infraAttempts, treating a nil
+	// status.verify as zero (the object appears only once the operator has read
+	// the verify pod).
+	f58InfraAttempts := func(loop *coxv1alpha1.Loop) int32 {
+		if loop.Status.Verify == nil {
+			return 0
+		}
+		return loop.Status.Verify.InfraAttempts
+	}
+
 	// f58Events drains a FakeRecorder's events into one slice.
 	f58Events := func(recorder *record.FakeRecorder) []string {
 		out := []string{}
@@ -122,9 +132,16 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 	// f58DriveToVerifying drives a fresh Loop to Verifying and returns the
 	// reconciler plus the verify Job name. The Job exists afterwards: the
 	// operator creates it on the advance (ensureVerifyJob), which is what the
-	// shape specs assert.
+	// shape specs assert. The drive's own phase-advance Events are drained, so a
+	// decision spec's event assertions are about ITS reconcile only (PhaseAdvanced
+	// from the drive is not the subject of any spec here).
 	f58DriveToVerifying := func(r *LoopReconciler, ns, name string) string {
 		s5aDriveToVerifyingWithReconciler(r, ns, name)
+		if r.Recorder != nil {
+			if recorder, ok := r.Recorder.(*record.FakeRecorder); ok {
+				_ = f58Events(recorder)
+			}
+		}
 		return verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name}})
 	}
 
@@ -407,8 +424,7 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 		fresh := s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"an OOM-killed check is an INFRA failure: a bounded retry, not a terminal failure")
-		Expect(fresh.Status.Verify).NotTo(BeNil())
-		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+		Expect(f58InfraAttempts(fresh)).To(Equal(int32(1)),
 			"the OOM kill burns ONE infra attempt (the retry counter), not an iteration")
 		Expect(fresh.Status.Iteration).To(Equal(iterBefore),
 			"the agent's work was never judged, so the iteration must not move")
@@ -456,10 +472,8 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 			"exit 137 with reason Error is a failing check: the Loop iterates back to Implementing")
 		Expect(fresh.Status.Iteration).To(BeNumerically(">", iterBefore),
 			"a failing check burns an iteration")
-		if fresh.Status.Verify != nil {
-			Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(0)),
-				"a failing check is not an infra failure, so no infra attempt is counted")
-		}
+		Expect(f58InfraAttempts(fresh)).To(Equal(int32(0)),
+			"a failing check is not an infra failure, so no infra attempt is counted")
 		for _, e := range f58Events(recorder) {
 			Expect(e).NotTo(ContainSubstring(verifyInfraRetryEventReason),
 				"a self-killed check must not be reported as an infra retry")
@@ -495,8 +509,7 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 
 		fresh := s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
-		Expect(fresh.Status.Verify).NotTo(BeNil())
-		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(0)),
+		Expect(f58InfraAttempts(fresh)).To(Equal(int32(0)),
 			"no infra attempt may be burned while the evicted pod still reads as in progress (I49)")
 		Expect(f58Events(recorder)).To(BeEmpty(), "a no-decision reconcile emits no Event")
 
@@ -506,7 +519,7 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 		Expect(k8sClient.Delete(ctx, evicted)).To(Succeed())
 		fresh = s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
-		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+		Expect(f58InfraAttempts(fresh)).To(Equal(int32(1)),
 			"once the evicted pod is gone, the Failed Job is an infra failure (a retry)")
 		Expect(f58Events(recorder)).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
 		Expect(f58GetJob(ns, jobName)).To(BeNil(), "the failed Job is deleted so a fresh one is created")
@@ -577,8 +590,8 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"a running check is in progress, never a failure (the S5a regression)")
 		Expect(fresh.Status.Iteration).To(Equal(iterBefore))
+		Expect(f58InfraAttempts(fresh)).To(Equal(int32(0)))
 		if fresh.Status.Verify != nil {
-			Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(0)))
 			Expect(fresh.Status.Verify.LastCheckResults).To(BeNil(),
 				"no check result may be recorded while the check is still running")
 		}

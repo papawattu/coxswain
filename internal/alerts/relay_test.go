@@ -186,10 +186,9 @@ func f62NewRelay(src Source) *Relay {
 // f62UID is the count key every fixture uses.
 const f62UID = types.UID("uid-l1")
 
-func f62Fixture(t *testing.T, src Source) (*Relay, *Holder) {
+func f62Fixture(t *testing.T, src Source) *Holder {
 	t.Helper()
-	relay := f62NewRelay(src)
-	return relay, startTestRelay(t, relay)
+	return startTestRelay(t, f62NewRelay(src))
 }
 
 // TestRelayCountsBlockedAlerts is F62 spec 1: two blocked alerts (plus an
@@ -204,7 +203,7 @@ func TestRelayCountsBlockedAlerts(t *testing.T) {
 		kubeArmorBlock(base.Add(2*time.Second), "Allow", f62Sandbox, f62SandboxP, "api.example.com:443"),
 		kubeArmorBlock(base.Add(3*time.Second), "Block", f62Sandbox, f62SandboxP, "/root/.ssh/id_ed25519"),
 	}}}}
-	_, holder := f62Fixture(t, src)
+	holder := f62Fixture(t, src)
 
 	var snap Snapshot
 	waitFor(t, "a healthy count of 2", func() bool {
@@ -229,7 +228,7 @@ func TestRelayCountsBlockedAlerts(t *testing.T) {
 // Mutation: treat an outage as 0 → Unknown becomes a zero count.
 func TestRelayUnavailableWhenTheStreamNeverAttaches(t *testing.T) {
 	src := &scriptedSource{attaches: []attachment{{err: errors.New("forbidden: pods/log is not granted")}}}
-	_, holder := f62Fixture(t, src)
+	holder := f62Fixture(t, src)
 
 	var snap Snapshot
 	waitFor(t, "an unavailable stream", func() bool {
@@ -261,7 +260,7 @@ func TestRelayGapAfterReattach(t *testing.T) {
 		{lines: []string{first}},
 		{lines: []string{second}},
 	}}
-	_, holder := f62Fixture(t, src)
+	holder := f62Fixture(t, src)
 
 	waitFor(t, "a gap after the re-attach", func() bool {
 		s, ok := holder.Snapshot(f62UID)
@@ -284,7 +283,7 @@ func TestRelayReplayedLineIsNotCountedTwice(t *testing.T) {
 	line := kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")
 	allow := kubeArmorBlock(base.Add(2*time.Second), "Allow", f62Sandbox, f62SandboxP, "api")
 	src := &scriptedSource{attaches: []attachment{{lines: []string{line, line, allow}}}}
-	_, holder := f62Fixture(t, src)
+	holder := f62Fixture(t, src)
 
 	waitFor(t, "a count of 1", func() bool {
 		s, ok := holder.Snapshot(f62UID)
@@ -351,7 +350,7 @@ func TestRelayEmitsOneEnvelopeLinePerAlert(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("got %d lines for 2 alerts, want exactly one line each: %v", len(lines), lines)
 	}
-	var verdicts []string
+	verdicts := make([]string, 0, len(lines))
 	for _, line := range lines {
 		var rec map[string]string
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
@@ -428,7 +427,7 @@ func TestRelayRunOfUndecodableLinesIsUnknown(t *testing.T) {
 		`{"Operation":"File","PodName":`,
 		`{"Operation":"Network","NamespaceName":`,
 	)}}}
-	_, holder = f62Fixture(t, src)
+	holder = f62Fixture(t, src)
 	waitFor(t, "a stream with an undecodable audit-shaped run", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		if !ok {
@@ -516,7 +515,7 @@ func TestRelayRecoversFromUnavailableOnAFullReattach(t *testing.T) {
 		{err: errors.New("temporary apiserver error")},
 		{lines: []string{kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")}},
 	}}
-	_, holder := f62Fixture(t, src)
+	holder := f62Fixture(t, src)
 
 	waitFor(t, "the unavailable state", func() bool {
 		s, ok := holder.Snapshot(f62UID)

@@ -217,6 +217,38 @@ existing Loops are unaffected, but new ones are.
 
 ## Other changes
 
+### F61: the reference AgentPolicies ADR-0007 promises ship under `config/samples/policies/` — #318
+
+- **What was wrong.** ADR-0007 promises "reference policies per supported
+  agent image ship under `config/samples/policies/`" (and "the sample must
+  ship with a minimal `AgentPolicy`"), but `config/samples/policies/` did not
+  exist and nothing shipped those objects (F61, merged `46a470a` = PR #318).
+- **What changed.** `config/samples/policies/` now ships two ordinary
+  `AgentPolicy` CRs — `default-deny.yaml` (`spec: {}` — the documented
+  shape, no allows) and `go-toolchain.yaml` (network allows for
+  `proxy.golang.org:443` and `sum.golang.org:443`) — both listed in the
+  samples kustomization (`config/samples/kustomization.yaml`), so
+  `kubectl apply -k config/samples` creates them like the existing Loop
+  samples (which, like the policies, carry no namespace, so the apply takes
+  one from the current context) (PR #318). `docs/OPERATOR.md`'s "What the
+  sandbox can reach" section points at them as the reference policies
+  (PR #318). Both objects are **inert until a Loop references one**
+  (`spec.policyRefs`): no existing sample is wired to them, and a policy
+  that grants network would change the Loop's egress (and the F42 fence's
+  shape), so the samples stay unwired (PR #318). An envtest spec admits
+  every shipped policy against the CRD (strict-parse into
+  `coxv1alpha1.AgentPolicy`, then create against envtest so the apiserver
+  enforces the CRD markers and CEL rules, reading the stored spec back),
+  asserts the samples kustomization lists every shipped policy and every
+  listed policy exists (two-way, so an unlisted file is invisible to
+  `kubectl apply -k` and a dangling path is caught), and keeps
+  `default-deny`'s no-allows claim true (`Exec`/`Network`/`Files`/`Tools`
+  all empty) (PR #318). No kind run: the objects are CRs with no effect
+  until referenced, and the schema is what the spec exercises (PR #318).
+- **On upgrade.** Nothing required; the policies are inert until a Loop
+  references one, and no Loop sample changes. A cluster applying
+  `-k config/samples` now also creates the two policy objects (PR #318).
+
 ### F70: a completed fork's sandbox is not held for a workspace-init clone it will never run — #314
 
 - **What was wrong.** The sandbox gate waited for the egress proxy whenever the workspace-init clone would traverse it — but a fork's workspace comes from the source's snapshot and already carries the base commit, so the init script exits 0 with "workspace already initialised" before any clone. On an install where the proxy cannot come up (e.g. F56's unpullable `coxswain-egress-proxy:standin`), the fork's sandbox was held `Suspended` for ever with no condition naming it (`d9f5619` = PR #314, F70).

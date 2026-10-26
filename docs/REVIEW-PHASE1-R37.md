@@ -87,7 +87,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
 ## P3
 
-- [ ] **I138: the run-key comment explains a real behaviour with a claim that does not exist**
+- [x] **I138: the run-key comment explains a real behaviour with a claim that does not exist** (`7251618` (#279))
 
   **Where:** `loop_s4_phase.go:1343-1345` — "the rejection re-plan … is ended by
   the claim clear in `advancePhaseFromClaim` (the **PlanApproved claim** that
@@ -151,7 +151,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   record names the sha it read and the ref it fetched, so the two can be
   checked against each other.
 
-- [ ] **I140: the guard's length limit counts bytes while the schema's counts characters**
+- [x] **I140: the guard's length limit counts bytes while the schema's counts characters** (`7251618` (#279))
 
   **Where:** `loop_controller.go:5462-5466` on `e83bd21`
   (`storableConditionReason`: `len(reason) <= conditionReasonMaxLen`) and

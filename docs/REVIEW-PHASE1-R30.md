@@ -64,8 +64,8 @@ was run.
 
 ## P2
 
-- [ ] **I104: the D71 memory cap was decided and never built, and the reviewer's
-  Phase 5 acceptance missed it**
+- [x] **I104: the D71 memory cap was decided and never built, and the reviewer's
+  Phase 5 acceptance missed it** (`aeb3d55` (#233))
 
   **Where:** `docs/PLAN-PHASE5.md:419-424` and `:479` (D71 (a): evict the
   oldest; "enforced by the writer Job (P5b) with a spec").
@@ -107,7 +107,7 @@ was run.
 
 ## P3
 
-- [ ] **I106: drift between docs/samples and the code**
+- [x] **I106: drift between docs/samples and the code** (`63679f1` (#249), `96d04e6b` (#252), `3eaf998` (#292))
 
   **Where:** `.samples/doc-drift/REPORT.md`, `.samples/doc-drift-2/REPORT.md`.
 

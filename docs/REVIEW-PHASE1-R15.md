@@ -11,7 +11,7 @@ ADRs can be judged against it. There are no code findings in this round.
 ### D36. coxswain's long-term shape: a general orchestrator for gated, isolated agent workflows
 
 - [x] Decided (owner, 2026-09-28): **option (d), an extensible core** (below)
-- [ ] ADR written
+- [x] ADR written (`31b4093` (#205))
 
 **Owner decision:**
 - **Not SDLC-specific.** coxswain orchestrates **any** workflow that needs

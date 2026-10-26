@@ -531,16 +531,22 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(importCmd).To(ContainSubstring(s5aHeadCommit),
 			"import-agent must import the verifiedCommit")
 
-		By("import-agent sets safe.directory via GIT_CONFIG_COUNT env (fix c)")
+		By("import-agent sets safe.directory for /verify ONLY (F67: the agent store is read as objects, not as a repo)")
 		requireVerifyGitSafeEnv(inits[1], "import-agent")
+		configCount := ""
 		hasAgentSrcSafe := false
 		for _, env := range inits[1].Env {
-			if env.Name == "GIT_CONFIG_VALUE_1" && env.Value == "/agent-src/.git" {
+			if env.Name == "GIT_CONFIG_COUNT" {
+				configCount = env.Value
+			}
+			if env.Name == "GIT_CONFIG_VALUE_1" || (env.Name == "GIT_CONFIG_VALUE_0" && env.Value != verifyScratchPath) {
 				hasAgentSrcSafe = true
 			}
 		}
-		Expect(hasAgentSrcSafe).To(BeTrue(),
-			"import-agent must also allow the different-owner SOURCE repo /agent-src/.git")
+		Expect(hasAgentSrcSafe).To(BeFalse(),
+			"import-agent must not carry a safe.directory entry for the agent's repo: it reads the object store through a path (GIT_ALTERNATE_OBJECT_DIRECTORIES), so git never opens that repo AS A REPOSITORY there and the ownership exemption does not apply")
+		Expect(configCount).To(Equal("1"),
+			"exactly one GIT_CONFIG entry (safe.directory=/verify); a second entry would claim the agent's repo is declared trusted")
 
 		By("carrying safe.directory=/verify on EVERY verify container (the emptyDir is root-owned)")
 		for i := range inits {

@@ -194,6 +194,21 @@ func TestF67ImportAgentRunsNoAgentRepoProgram(t *testing.T) {
 		t.Fatalf("the agent's repo config ran a program during import: the import must not run a git server (or read the config) in the agent's repo\nscript output:\n%s", out)
 	}
 	f67AssertNoServerProcess(t, out)
+
+	// A pin that is not in the agent's store is refused by the post-copy
+	// existence check (F3) as an INFRA failure (exit 2), naming the cause —
+	// not later as a merge-base error.
+	bad := strings.Repeat("0", 40)
+	badScript := strings.ReplaceAll(importAgentScript(base, bad), "cd /verify", "cd "+v)
+	badScript = strings.ReplaceAll(badScript, "/agent-src/.git/objects", agent+"/.git/objects")
+	badCode, badOut := f67RunScript(t, badScript)
+	if badCode != 2 {
+		t.Fatalf("import-agent with an unknown pin exited %d; want 2 (an infra failure, never 97)\n%s", badCode, badOut)
+	}
+	if !strings.Contains(badOut, "not in the agent workspace .git") {
+		t.Fatalf("the unknown-pin refusal must name the cause (the pin is not in the agent's object store), got:\n%s", badOut)
+	}
+	f67AssertNoServerProcess(t, badOut)
 	// The pin's objects must be LOCAL afterwards: the alternate is an env var
 	// that dies with the container while tamper/check read /verify/.git.
 	cat := exec.Command("git", "-C", v, "cat-file", "-e", pin+"^{commit}")

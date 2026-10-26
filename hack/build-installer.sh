@@ -8,8 +8,10 @@
 #
 # It renders in a TEMP overlay (never the working tree) so the working tree is
 # left clean: kustomize v5.8.1 has no `build --images`, so a temp copy +
-# `edit set image` + an args patch is the non-dirtying path. The `deploy`
-# target keeps its own in-tree edit (local dev leaves the args empty).
+# `edit set image` + an args patch is the non-dirtying path. `make deploy` uses
+# the same approach via hack/render-deploy.sh (F56: it used to keep an in-tree
+# `edit set image` and pass none of the four component-image args, so a deployed
+# Loop ran the operator's `sleep infinity` stand-in).
 #
 # Usage: IMG=ghcr.io/<owner>/coxswain-controller:<tag> \
 #        [MEMORY_STORAGE_CLASS=<class>] KUSTOMIZE=<path> hack/build-installer.sh

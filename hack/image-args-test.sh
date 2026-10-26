@@ -53,7 +53,11 @@ check_five() {
 	done
 	n="$(grep -Fc -- "--memory-writer-image=$manager" "$file" || true)"
 	[ "$n" = "1" ] || { echo "FATAL[$label]: expected exactly one '--memory-writer-image=$manager' (found $n)"; exit 1; }
-	grep -Eq "^[[:space:]]+image: \"?${manager}\"?$" "$file" \
+	# Compare the rendered image value EXACTLY (no regex built from the image
+	# string: dots, ports and '@' would all be regex metacharacters).
+	grep -E "^[[:space:]]+image: " "$file" \
+		| sed -E 's/^[[:space:]]+image: //; s/^"//; s/"$//' \
+		| grep -Fxq -- "$manager" \
 		|| { echo "FATAL[$label]: no manager 'image: $manager' in the render"; exit 1; }
 	# The base args must survive (P1-1: the patch appends; it must not replace).
 	for base in --metrics-bind-address=:8443 --leader-elect --health-probe-bind-address=:8081; do
@@ -99,11 +103,23 @@ for flag in --runner-image --proxy-image --tool-proxy-image --egress-proxy-image
 	[ "$argtag" = "v1" ] || { echo "FATAL[deploy ported]: $flag tag is '$argtag', expected v1"; exit 1; }
 done
 
-# An IMG with no tag must be refused, not rendered with a nonsense tag.
-if render_deploy "localhost:5000/coxswain-controller" >"$TMP/notag.yaml" 2>"$TMP/notag.err"; then
-	echo "FATAL: an IMG with no tag was rendered"; head -3 "$TMP/notag.yaml"; exit 1
-fi
-grep -q "has no tag" "$TMP/notag.err" || { echo "FATAL: the no-tag refusal did not explain itself"; cat "$TMP/notag.err"; exit 1; }
+# F56 review: an IMG with no tag must be refused, not rendered with a nonsense
+# tag. Three shapes, each of which produced (or could produce) a bogus tag:
+#   - a ported registry with no tag: the "tag" would be "5000/coxswain-controller"
+#   - a BARE name with no tag: coxswain-controller would become
+#     coxswain-runner:coxswain-controller (the last ':' component is the whole
+#     string, so the tag check alone does not see it)
+#   - a digest reference: its ":' component is part of the digest
+for bad in "localhost:5000/coxswain-controller" "coxswain-controller" \
+	"ghcr.io/papawattu/coxswain-controller@sha256:0123456789abcdef"; do
+	if render_deploy "$bad" >"$TMP/bad.yaml" 2>"$TMP/bad.err"; then
+		echo "FATAL: IMG='$bad' (no tag / digest) was rendered"; head -3 "$TMP/bad.yaml"; exit 1
+	fi
+	[ -s "$TMP/bad.yaml" ] && { echo "FATAL: IMG='$bad' was refused but still rendered output"; exit 1; }
+	grep -qE "has no tag|digest reference" "$TMP/bad.err" \
+		|| { echo "FATAL: the refusal for IMG='$bad' did not explain itself"; cat "$TMP/bad.err"; exit 1; }
+done
+echo "OK[refusals]: untagged (ported, bare) and digest IMGs are refused with a message"
 
 # 2. dist/install.yaml via the real script (temp tree, working tree untouched).
 mkdir -p "$TMP/inst/hack"

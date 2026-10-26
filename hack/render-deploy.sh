@@ -33,9 +33,9 @@ cp -r "$ROOT/config" "$OVERLAY/config"
 # The four component args, derived from IMG (port-safe; see the script).
 IMG="$IMG" bash "$ROOT/hack/image-args.sh" > "$OVERLAY/config/manager/install-args.patch.yaml"
 
-# Wire the JSON6902 patch into the overlay's manager kustomization. Removing any
-# existing `patches:` block first keeps a re-run idempotent.
-sed -i '/^patches:$/d' "$OVERLAY/config/manager/kustomization.yaml" 2>/dev/null || true
+# Wire the JSON6902 patch into the overlay's manager kustomization. The copy is
+# taken fresh from config/manager (whose kustomization has `resources` and
+# `replacements`, no `patches:` block), so the append needs no cleanup step.
 printf '\npatches:\n- path: install-args.patch.yaml\n  target:\n    kind: Deployment\n' \
 	>> "$OVERLAY/config/manager/kustomization.yaml"
 

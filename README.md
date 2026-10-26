@@ -2,7 +2,7 @@
 
 A Kubernetes operator that runs long-lived **plan → implement → verify** loops for coding agents. Each loop runs in an isolated [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) workspace, stops on success, budget or stall, and hands back a pull request.
 
-> **Status: pre-alpha.** Today the operator accepts a `Loop`, creates its hardened sandbox (zero-credential agent pod, ADR-0006), runs the in-sandbox runner, verifies via an isolated check Job, and opens the delivery PR. The design is in [docs/PLAN.md](docs/PLAN.md). **Non-runner agent image:** when `spec.agent.image` is set to a non-runner image, the sandbox runs that image with a `sleep infinity` stand-in command (a deliberate debugging opt-out; an empty `spec.agent.image` runs the operator's runner, but only when `--runner-image` is set — every shipped render sets it from `IMG` (F56), and a Loop that would fall back to the stand-in because the runner is missing says so with `RunnerAvailable=False`). **Dev escape hatch:** `make deploy-dev` (the `config/dev` kustomize overlay) passes `--allow-unenforced` (and `--allow-unenforced-network`) so Loops run before the eBPF enforcement-evidence seam (the I32 relay) is wired — they run with `PolicyEnforced=False` reason `EnforcementDisabled`. `make deploy` (and the production bundle `dist/install.yaml`) do NOT carry the flags: the D30 gate then holds the sandbox Suspended until enforcement is proven (fail-closed).
+> **Status: pre-alpha.** Today the operator accepts a `Loop`, creates its hardened sandbox (zero-credential agent pod, ADR-0006), runs the in-sandbox runner, verifies via an isolated check Job, and opens the delivery PR. The design is in [docs/PLAN.md](docs/PLAN.md). **Non-runner agent image:** when `spec.agent.image` is set to a non-runner image, the sandbox runs that image with a `sleep infinity` stand-in command (a deliberate debugging opt-out; an empty `spec.agent.image` runs the operator's runner, but only when `--runner-image` is set — every production render (`make deploy`, `dist/install.yaml`, the Helm chart) sets it from `IMG` (F56), and a Loop that would fall back to the stand-in because the runner is missing says so with `RunnerAvailable=False`). **Dev escape hatch:** `make deploy-dev` (the `config/dev` kustomize overlay) passes `--allow-unenforced` (and `--allow-unenforced-network`) so Loops run before the eBPF enforcement-evidence seam (the I32 relay) is wired — they run with `PolicyEnforced=False` reason `EnforcementDisabled`. `make deploy` (and the production bundle `dist/install.yaml`) do NOT carry the flags: the D30 gate then holds the sandbox Suspended until enforcement is proven (fail-closed).
 
 ## Getting started
 
@@ -37,10 +37,13 @@ kind load docker-image coxswain:dev --name coxswain
 # Dev/kind only: deploy-dev adds --allow-unenforced (and --allow-unenforced-network)
 # so Loops run before the eBPF enforcement-evidence seam (the I32 relay) is wired.
 # For a production install use `make deploy` (fail-closed; the D30 gate holds the
-# sandbox Suspended until enforcement is proven). It derives the four component
-# images (runner + the three proxies) from IMG — same registry prefix, same tag,
-# names coxswain-runner / coxswain-model-proxy / coxswain-tool-proxy /
-# coxswain-egress-proxy — so build and push those alongside the controller.
+# sandbox Suspended until enforcement is proven): it derives the four component
+# images from IMG — same registry prefix and tag, named coxswain-runner /
+# coxswain-model-proxy / coxswain-tool-proxy / coxswain-egress-proxy — so build
+# and push those alongside the controller.
+# deploy-dev instead leaves those four args unset on purpose: the operator's
+# built-in stand-in names (coxswain-runner:dev, coxswain-proxy:standin, …) are the
+# images `make kind-up` loads, which is right for kind and wrong anywhere else.
 make deploy-dev IMG=coxswain:dev
 
 # The proxy stand-in image is built and loaded by `make kind-up` (the

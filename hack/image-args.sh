@@ -32,6 +32,16 @@ if [ -z "$IMG" ]; then
 	exit 1
 fi
 
+# A digest reference (…@sha256:…) has no tag to derive and its last ':' component
+# is part of the digest, not a tag; there is nothing here the component images
+# could be tagged with. Refuse it rather than emit a nonsense tag.
+case "$IMG" in
+*@*)
+	printf 'Error: IMG=%s is a digest reference; the component images need a tag (IMG=<registry>/<project>:<tag>)\n' "$IMG" >&2
+	exit 1
+	;;
+esac
+
 # The tag is IMG's LAST ':' component, so a registry with a port keeps its tag
 # (localhost:5000/x:v1 -> v1). If the last component still contains a '/', the
 # image has no tag at all (localhost:5000/x -> "5000/x"); refuse it rather than
@@ -45,8 +55,14 @@ case "$TAG" in
 esac
 
 # Everything before that tag, then everything before the repository's own name
-# is the prefix the component images share.
+# is the prefix the component images share. REPO == IMG means there was no ':'
+# tag at all (a bare name like coxswain-controller, whose last colon component
+# is the whole string) — the case above cannot see it, so refuse it here.
 REPO="$(printf '%s' "$IMG" | sed -E 's/:[^:\/]*$//')"
+if [ "$REPO" = "$IMG" ]; then
+	printf 'Error: IMG=%s has no tag (expected <registry>/<project>:<tag>)\n' "$IMG" >&2
+	exit 1
+fi
 PREFIX="$(printf '%s' "$REPO" | sed -E 's#/[^/]*$##')"
 if [ "$PREFIX" = "$REPO" ]; then
 	PREFIX=""

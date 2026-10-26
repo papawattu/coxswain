@@ -365,6 +365,14 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 		By("no EngineUnavailable condition was recorded (the reconcile never reached the condition half)")
 		cond := policyEnforcedCondition(f92Get(ns, name).Status.Conditions)
 		Expect(cond).To(BeNil(), "an unrelated write failure must not be reported as a missing engine")
-		Expect(f92Drain(recorder)).To(BeEmpty())
+		// F56: this recorder now also carries the RunnerUnavailable Warning (the
+		// runner-image surface runs before the enforcement write, so it is emitted
+		// even on a pass that then fails). What this spec must not see is an
+		// F92 Event for the tolerated shape — an unrelated write failure is not a
+		// missing engine, so no PolicyEnforcementUnavailable may be announced.
+		for _, e := range f92Drain(recorder) {
+			Expect(strings.Contains(e, PolicyEnforcementUnavailableEventReason)).To(BeFalse(),
+				"a Forbidden write must not announce a missing engine (got %s)", e)
+		}
 	})
 })

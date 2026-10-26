@@ -65,7 +65,7 @@ type CNIProbeResult struct {
 // TargetRow is one probe target's row.
 type TargetRow struct {
 	Label   string
-	Verdict string // REACHABLE or BLOCKED(...)
+	Verdict string // REACHABLE, BLOCKED or UNRESOLVED
 }
 
 // NetworkEnforcedCondition is the Loop condition type (D38), analogous to

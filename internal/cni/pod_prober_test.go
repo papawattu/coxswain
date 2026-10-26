@@ -17,6 +17,7 @@ package cni
 import (
 	"bytes"
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -57,7 +58,7 @@ func TestProbeCommandShape(t *testing.T) {
 	}
 	script := cmd[2]
 	for _, want := range []string{
-		"RESULT %s REACHABLE", "RESULT %s BLOCKED", "DONE",
+		"RESULT %s REACHABLE", "RESULT %s BLOCKED", "RESULT %s UNRESOLVED", "DONE",
 		"kubernetes.default.svc.cluster.local", "10250", "6443", "1.1.1.1",
 		"kube-dns.kube-system.svc.cluster.local",
 		"settimeout", "status.hostIP",
@@ -133,6 +134,12 @@ func TestProbeParseStrictValidation(t *testing.T) {
 		{"unknown verdict", "RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nRESULT DNS_POSITIVE REACHABLE\nDONE", 0},
 		{"non-zero exit", allBlocked, 1},
 		{"empty message", "", 0},
+		// F51 P2-2: an UNRESOLVED row is a missing measurement, not a
+		// verdict. It must never be CNIEnforced (the fence would look
+		// proven) and never CNIUnenforced (a resolution failure would look
+		// like a fence bypass), whichever target it is.
+		{"UNRESOLVED expected-BLOCKED target -> ProbeUnavailable", "RESULT APISERVER_SVC UNRESOLVED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE", 0},
+		{"UNRESOLVED positive control -> ProbeUnavailable", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE UNRESOLVED\nDONE", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res, err := p.parse(tc.msg, pod(tc.msg, tc.exit))
@@ -151,6 +158,28 @@ func TestProbeParseStrictValidation(t *testing.T) {
 		})
 	}
 }
+
+// F51 P2-2: UNRESOLVED is not a verdict about the fence. The result must be
+// ProbeUnavailable, and its Detail must name the target that could not be
+// resolved instead of the CNIUnenforced rendering ("REACHABLE targets: …").
+func TestProbeParseUnresolvedIsUnavailableNotAVerdict(t *testing.T) {
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
+	msg := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API UNRESOLVED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	res, err := p.parse(msg, pod(msg, 0))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if res.Reason != ReasonProbeUnavailable {
+		t.Fatalf("an UNRESOLVED target must be ProbeUnavailable, got %v", res.Reason)
+	}
+	if !strings.Contains(res.Detail, "NODE_API") {
+		t.Fatalf("the Detail must name the unresolved target, got %q", res.Detail)
+	}
+	if got := res.Describe(); strings.Contains(got, "REACHABLE targets") {
+		t.Fatalf("an unresolved target must not render as a fence bypass, got %q", got)
+	}
+}
+
 func terminatedProbePod(exit int32, message string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName},
@@ -296,6 +325,86 @@ func TestProbeCommandIsValidPython(t *testing.T) {
 	if err := cmdExec.Run(); err != nil {
 		t.Fatalf("generated probe script is not valid Python (python3 %v): %v\nstderr:\n%s\nscript (around the splice):\n%s",
 			cmdExec.ProcessState, err, eout.String(), aroundSplice(script))
+	}
+}
+
+// TestProbeScriptUnresolvedIsNotReachable executes the REAL generated probe
+// script (only the socket module is stubbed) and pins the three verdict arms of
+// probe(): F51 P2-2 was that a resolution failure printed REACHABLE, so an
+// unresolvable expected-BLOCKED target counted as a fence bypass. The refused
+// arm is pinned too (a refused connection reached the host, so it is not a
+// policy drop), and a timeout stays BLOCKED as the positive control that the
+// script still emits a real verdict when it has one.
+func TestProbeScriptUnresolvedIsNotReachable(t *testing.T) {
+	python3, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH; skipping the probe-script execution check")
+	}
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
+	cmd := p.probeCommand()
+	script := cmd[2]
+
+	const harness = `
+import os, sys, types, socket as real_socket
+mode = os.environ["PROBE_STUB_MODE"]
+stub = types.ModuleType("socket")
+class FakeSock:
+    def settimeout(self, t):
+        pass
+    def close(self):
+        pass
+    def connect(self, addr):
+        if mode == "refused":
+            raise ConnectionRefusedError(111, "Connection refused")
+        if mode == "timeout":
+            raise real_socket.timeout("timed out")
+        raise AssertionError("unexpected connect in mode %s" % mode)
+def gethostbyname(host):
+    if mode == "gaierror":
+        raise real_socket.gaierror(-2, "Name or service not known")
+    return "127.0.0.1"
+stub.socket = lambda *a, **k: FakeSock()
+stub.AF_INET = real_socket.AF_INET
+stub.SOCK_STREAM = real_socket.SOCK_STREAM
+stub.timeout = real_socket.timeout
+stub.gaierror = real_socket.gaierror
+stub.gethostbyname = gethostbyname
+sys.modules["socket"] = stub
+exec(compile(sys.stdin.read(), "probe", "exec"))
+`
+
+	for _, tc := range []struct {
+		name   string
+		mode   string
+		want   string
+		reject string
+	}{
+		{"resolution failure -> UNRESOLVED", "gaierror", "RESULT APISERVER_SVC UNRESOLVED", "REACHABLE"},
+		{"connection refused -> UNRESOLVED", "refused", "RESULT APISERVER_SVC UNRESOLVED", "BLOCKED"},
+		{"a timeout stays BLOCKED (positive control)", "timeout", "RESULT APISERVER_SVC BLOCKED", "UNRESOLVED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := exec.Command(python3, "-c", harness)
+			run.Stdin = strings.NewReader(script)
+			run.Env = append(os.Environ(), "NODE_IP=127.0.0.1", "PROBE_STUB_MODE="+tc.mode)
+			out, err := run.CombinedOutput()
+			if err != nil {
+				t.Fatalf("the generated probe script failed to run in mode %q: %v\noutput:\n%s", tc.mode, err, out)
+			}
+			got := string(out)
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("mode %q: want %q in the probe output, got:\n%s", tc.mode, tc.want, got)
+			}
+			for _, line := range strings.Split(got, "\n") {
+				if strings.HasPrefix(line, "RESULT ") && strings.Contains(line, tc.reject) {
+					t.Fatalf("mode %q: verdict %q must not appear, got line %q", tc.mode, tc.reject, line)
+				}
+			}
+			// Every target is measured in a run: five RESULT lines plus DONE.
+			if n := strings.Count(got, "RESULT "); n != expectedResultLen {
+				t.Fatalf("mode %q: want %d RESULT lines, got %d:\n%s", tc.mode, expectedResultLen, n, got)
+			}
+		})
 	}
 }
 

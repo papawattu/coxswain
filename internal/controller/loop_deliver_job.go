@@ -975,10 +975,12 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 				// F66: the deliver Job's containers run agent-chosen code
 				// (clone-base, import-agent fetch from the agent's repo and the
 				// push runs the agent's tree). They make no API calls, so no
-				// token belongs in them — the same call the memory-writer Job
-				// makes (loop_memory_writer_job.go) and every operator-built pod
-				// already makes. Without it the DEFAULT SA's token was mounted
-				// into those containers alongside the git credential.
+				// token belongs in them. D12 (REVIEW-PHASE0-R4.md:130) names the
+				// VERIFY Job; this is the deliberate extension to the deliver Job
+				// — it also holds the push credential, so it is the last pod that
+				// should carry an API token. Without the field the DEFAULT SA's
+				// token was mounted into those containers alongside that
+				// credential.
 				ServiceAccountName:           "",
 				AutomountServiceAccountToken: &deliverJobFalse,
 				Volumes:                      volumes,

@@ -26,6 +26,11 @@ limitations under the License.
 // ServiceAccountName: "" — which selects the default SA and still mounts its
 // token. A token in a container running agent code is a credential the sandbox's
 // own hardening keeps out of the agent pod.
+//
+// The requirement is decided, not stylistic: D12 (docs/REVIEW-PHASE0-R4.md:130,
+// "the verify Job gets: automountServiceAccountToken: false") and ADR-0005 §D12
+// (docs/adr/0005-operator-verifies-via-isolated-job.md:164). The deliver half
+// extends D12 past its literal text (D12 names the verify Job).
 package controller
 
 import (
@@ -43,16 +48,20 @@ import (
 // f66Pin is the verified commit the deliver Job's push container is built from.
 const f66Pin = "0123456789abcdef0123456789abcdef01234567"
 
-// f66NoAutomountOK asserts the two F66 properties on a Job's pod template: no
-// ServiceAccount token is automounted (explicitly, not by omission) and no
-// ServiceAccount is selected by name.
+// f66NoAutomountOK asserts the F66 property on a Job's pod template: no
+// ServiceAccount token is automounted, explicitly rather than by omission.
+//
+// It deliberately does NOT assert ServiceAccountName == "": that is WHY the bug
+// existed (an empty name selects the default SA, which mounted a token), so
+// pinning it would block the better fix — a dedicated no-token SA, the
+// memory-writer Job's shape (loop_memory_writer_job.go:466, the SA object at
+// :643-690). The property is the token, and AutomountServiceAccountToken false
+// holds it for either shape. (Early look of #330, finding B.)
 func f66NoAutomountOK(spec corev1.PodSpec, which string) {
 	ExpectWithOffset(1, spec.AutomountServiceAccountToken).NotTo(BeNil(),
 		"the %s Job pod must state automountServiceAccountToken explicitly (nil inherits the default SA's mount)", which)
 	ExpectWithOffset(1, *spec.AutomountServiceAccountToken).To(BeFalse(),
 		"the %s Job runs agent-chosen code and makes no API calls: no SA token may be mounted", which)
-	ExpectWithOffset(1, spec.ServiceAccountName).To(BeEmpty(),
-		"the %s Job must not select a ServiceAccount by name", which)
 }
 
 var _ = Describe("F66: the verify and deliver Job pods automount no ServiceAccount token", func() {

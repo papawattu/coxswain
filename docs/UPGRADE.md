@@ -234,6 +234,29 @@ reader also now stops adding whole files at its 16 KiB section cap instead of
 silently dropping the whole memory section past that size. There is nothing
 to do.
 
+### The verify Job checks get a read-only checkout and the Job a deadline
+
+The verify Job's acceptance checks now mount the verified checkout
+(`/verify`) **read-only**, each check container gets its **own** writable
+`/tmp` scratch, and the Job carries `activeDeadlineSeconds: 900` (F53).
+The read-only mount closes the gap where check-0 could rewrite a `*_test.go`
+that check-1 compiles (ADR-0005 D19 said the checkout is read-only
+unconditionally).
+
+A check that wrote into the checkout now fails with `read-only file system`.
+The writable places are the check's own `/tmp` (also `HOME`, `TMPDIR`,
+`GOCACHE`, `GOPATH`, `XDG_CACHE_HOME`, and `PYTHONPYCACHEPREFIX`, which keeps
+`python3 -m compileall .` working). The shipped samples moved their build
+output off the tree (`go build -o /tmp/<name> ./...`); a check of your own
+that emits a binary or a cache into the checkout needs the same treatment:
+write under `/tmp`. A check that hangs is now bounded — the Job is killed at
+the deadline and the Loop is retried (then fails with `VerifyInfraFailed`,
+which names the deadline in the message) instead of staying in `Verifying`
+for ever.
+
+There is nothing to do for an existing Loop unless one of its checks writes
+into the checkout.
+
 ### The chart no longer renders a second VAP binding
 
 Helm installs from v0.1.0–v0.1.2 rendered **two** `ValidatingAdmissionPolicyBinding` objects for the one ephemeral-container `ValidatingAdmissionPolicy`: the literal `coxswain-deny-ephemeral-containers` (correct), plus a templated one named after the release's fullname, `{{ fullname }}-deny-ephemeral-containers`, whose `policyName` named the templated name and therefore no existing VAP — so the second one was **inert** (it bound nothing; the gate still worked). PR #249 (F45) removed the templated template. `helm upgrade` normally deletes objects that the previous release tracked but the new manifest no longer carries, but that is not guaranteed if the binding was created out-of-band (a hand-rendered `helm template` piped to `kubectl apply`, a switch from `install.yaml` to Helm, or lost release history) — so run the manual check below either way. It is harmless: the stale binding is inert, and deleting it cannot weaken or disable the ephemeral-container gate.

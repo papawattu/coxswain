@@ -20,7 +20,7 @@
 //     one Job's UID, then getVerifyJob re-read the Job for the batch JobFailed
 //     condition). The operator's infra-retry deletes and recreates the Job under
 //     the same name, so between the two reads the pod can come from Job A while
-//     jobFailed comes from Job B: verifyOutcome(nil, n, true) then spends an
+//     jobFailed comes from Job B: verifyOutcome(nil, n, true, false) then spends an
 //     infra attempt on the other Job's evidence.
 //   - nothing checked that the Job carrying the Loop's verify name is the
 //     Loop's. Creating a Job reaches that name, so a foreign Job was both

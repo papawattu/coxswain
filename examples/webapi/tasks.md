@@ -47,7 +47,7 @@ spec:
     gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
-      - go build ./...
+      - go build -o /tmp/webapi ./...
       - bash test/smoke.sh ping
     preset: go
     protectedPaths:
@@ -102,7 +102,7 @@ spec:
     gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
-      - go build ./...
+      - go build -o /tmp/webapi ./...
       - bash test/smoke.sh echo
     preset: go
     protectedPaths:

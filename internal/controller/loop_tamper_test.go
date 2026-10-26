@@ -54,7 +54,7 @@ func TestVerifyOutcomeTamperExit(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _, _, _ := verifyOutcome(pod(tc.st), 1, false)
+			got, _, _, _ := verifyOutcome(pod(tc.st), 1, false, false)
 			if got != tc.want {
 				t.Errorf("verifyOutcome = %d, want %d", got, tc.want)
 			}

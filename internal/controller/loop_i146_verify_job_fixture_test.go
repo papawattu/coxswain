@@ -67,6 +67,10 @@ func plantVerifyJob(ctx context.Context, ns, name, jobName string, refine ...fun
 	for _, f := range refine {
 		f(job)
 	}
+	// ExpectWithOffset(1) names this helper's CALLER in a failure (the spec, or
+	// the s5a/p2e fixture helper that builds one), never this file: probed in
+	// .samples/i146/08-gomega-offset-probe.log — the reported line is the
+	// plantVerifyJob call site, not this line.
 	ExpectWithOffset(1, controllerutil.SetControllerReference(p5fGet(ns, name), job, k8sClient.Scheme())).To(Succeed())
 	ExpectWithOffset(1, k8sClient.Create(ctx, job)).To(Succeed())
 	return job

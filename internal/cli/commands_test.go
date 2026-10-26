@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -70,7 +72,7 @@ func TestDescribe_WithConditionsBudgetDelivery(t *testing.T) {
 	deps := Deps{Loops: fc}
 
 	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-		return describeLoop(ctx, dc, ns, name, out)
+		return describeLoop(ctx, dc, name, out)
 	}, "loop1")
 
 	for _, want := range []string{"Name:         loop1", "Phase:        Succeeded", "Iteration:    2",
@@ -106,7 +108,7 @@ func TestDescribe_BogusBudgetKeyPrintsNoTokens(t *testing.T) {
 	fc.setLoop(l)
 	deps := Deps{Loops: fc}
 	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-		return describeLoop(ctx, dc, ns, name, out)
+		return describeLoop(ctx, dc, name, out)
 	}, "loop1")
 	if strings.Contains(out, "tokens:") {
 		t.Errorf("describe must not read a field the schema does not define (F85)\noutput:\n%s", out)
@@ -133,7 +135,7 @@ func TestDescribe_NoCapPrintsNoCap(t *testing.T) {
 	fc.setLoop(l)
 	deps := Deps{Loops: fc}
 	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-		return describeLoop(ctx, dc, ns, name, out)
+		return describeLoop(ctx, dc, name, out)
 	}, "loop1")
 	if !strings.Contains(out, "active:     1m30s (no cap)") {
 		t.Errorf("describe output missing the no-cap wall clock\noutput:\n%s", out)
@@ -165,7 +167,7 @@ func TestDescribe_NoDesiredPhasePrintsNoLine(t *testing.T) {
 			fc.setLoop(l)
 			deps := Deps{Loops: fc}
 			out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-				return describeLoop(ctx, dc, ns, name, out)
+				return describeLoop(ctx, dc, name, out)
 			}, "loop1")
 			if strings.Contains(out, "DesiredPhase:") {
 				t.Errorf("an unset/empty status.desiredPhase must print nothing\noutput:\n%s", out)
@@ -186,7 +188,7 @@ func TestDescribe_EmptyDeliveryPrintsNoHeading(t *testing.T) {
 	fc.setLoop(l)
 	deps := Deps{Loops: fc}
 	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-		return describeLoop(ctx, dc, ns, name, out)
+		return describeLoop(ctx, dc, name, out)
 	}, "loop1")
 	if strings.Contains(out, "Delivery:") {
 		t.Errorf("an empty status.delivery must not print the heading\noutput:\n%s", out)
@@ -208,7 +210,7 @@ func TestDescribe_ConditionColumnAligns(t *testing.T) {
 	fc.setLoop(l)
 	deps := Deps{Loops: fc}
 	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
-		return describeLoop(ctx, dc, ns, name, out)
+		return describeLoop(ctx, dc, name, out)
 	}, "loop1")
 	var idx []int
 	for line := range strings.SplitSeq(out, "\n") {
@@ -247,7 +249,7 @@ func TestDescribe_NotFound(t *testing.T) {
 	fc := newFakeLoopClient() // no loop
 	deps := Deps{Loops: fc}
 	out := &bytes.Buffer{}
-	err := describeLoop(context.Background(), deps, "samples", "missing", out)
+	err := describeLoop(context.Background(), deps, "missing", out)
 	if err == nil {
 		t.Fatal("expected an error for a missing Loop")
 	}
@@ -469,5 +471,37 @@ func TestRedeliver_FailedDeliveryMessage(t *testing.T) {
 	}
 	if !strings.Contains(out, "DeliveryFailed") {
 		t.Errorf("redeliver output should mention the DeliveryFailed reason, got %q", out)
+	}
+}
+
+// F52 C3: the Use strings must name the <loop> argument — cobra prints Use in
+// --help and in the usage line of an argument error, and both commands take
+// exactly one loop, so a bare "describe" / "history" hides the only argument.
+func TestCommands_NameTheLoopArgument(t *testing.T) {
+	for _, cmd := range []*cobra.Command{newDescribeCommand(), newHistoryCommand()} {
+		if !strings.Contains(cmd.Use, "<loop>") {
+			t.Fatalf("%q must name the <loop> argument (F52 C3)", cmd.Use)
+		}
+	}
+}
+
+// F52 C3: describe prints the OBJECT's namespace. With -n unset the client
+// resolves the kubeconfig context's namespace (NewDeps), while namespaceOf()
+// answers "default" — so the old line named a namespace the Loop does not live
+// in. The command seam takes no namespace at all now (F52 C3 dropped the unused
+// parameter), and the fixture lives in "samples": printing "default" here would
+// mean reading the flag value instead of the object.
+func TestDescribe_NamespaceIsTheObjectsNotTheFlags(t *testing.T) {
+	fc := newFakeLoopClient()
+	fc.setLoop(typedLoop(t, nil)) // ObjectMeta.Namespace = samples
+	out := &bytes.Buffer{}
+	if err := describeLoop(context.Background(), Deps{Loops: fc}, "loop1", out); err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if !strings.Contains(out.String(), "Namespace:    samples") {
+		t.Fatalf("describe must print the object's namespace (samples), got:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "Namespace:    default") {
+		t.Fatalf("describe printed the flag-derived namespace instead of the object's:\n%s", out.String())
 	}
 }

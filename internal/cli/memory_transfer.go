@@ -243,11 +243,19 @@ func parseMemoryTarball(r io.Reader) (map[string][]byte, error) {
 		if len(body) > maxLessonBytes {
 			return nil, fmt.Errorf("tarball entry %s exceeds %d bytes", h.Name, maxLessonBytes)
 		}
-		sum := sha256.Sum256([]byte(strings.TrimSuffix(string(body), "\n")))
+		// The name is the SHA-256 of the lesson TEXT — the exact bytes the
+		// writer stored. cmd/memory-writer names a lesson by
+		// sha256.Sum256([]byte(lesson)), and a lesson carries no trailing
+		// newline, so a tarball entry that ends with one names its TRIMMED
+		// body: store that body, not the raw bytes (F52 C1). Storing the raw
+		// body left a file whose name was not the hash of its content, which
+		// dedup (by name) and `cox memory show` both rely on.
+		lesson := bytes.TrimSuffix(body, []byte("\n"))
+		sum := sha256.Sum256(lesson)
 		if hex.EncodeToString(sum[:]) != m[1] {
 			return nil, fmt.Errorf("tarball entry %s: content SHA-256 does not match its name", h.Name)
 		}
-		files[h.Name] = body
+		files[h.Name] = lesson
 	}
 	if len(files) == 0 {
 		return nil, errors.New("tarball contains no lessons")

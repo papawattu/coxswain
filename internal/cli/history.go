@@ -15,7 +15,7 @@ import (
 // regardless of which history fields are populated.
 func newHistoryCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "history",
+		Use:   "history <loop>",
 		Short: "Print a Loop's audit trail (phase + the verify-failure history ring)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

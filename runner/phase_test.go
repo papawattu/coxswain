@@ -214,6 +214,58 @@ func TestPhaseRunVerifyingIdlesUntilStop(t *testing.T) {
 	}
 }
 
+// F52 C2: a desired phase the runner does not execute used to produce a
+// BLOCKED claim with that value in observedPhase. The operator's
+// parsePhaseClaim accepts only Planning/Implementing/Verifying, so the claim
+// was rejected as malformed ("claim names an invalid observedPhase"), the
+// one-shot container exited 1, restarted, and the same bad claim repeated for
+// ever. The fix is the Runner side, not the parser's: unknown phases idle
+// exactly as Verifying does — no claim, no model call, block until SIGTERM —
+// so the claim schema stays strict.
+func TestPhaseRunUnexecutablePhaseIdlesUntilStop(t *testing.T) {
+	for _, phase := range []string{"AwaitingApproval", "Succeeded", "typo"} {
+		t.Run(phase, func(t *testing.T) {
+			fake := s4FakeModel()
+			defer fake.Close()
+			claimPath, cleanup := s4ClaimPath(t)
+			defer cleanup()
+
+			ws := t.TempDir()
+			writeDesiredPhase(t, ws, phase)
+			stop := make(chan any, 1)
+
+			done := make(chan Result, 1)
+			go func() {
+				done <- PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+					PollInterval: 5 * time.Millisecond, IdleTimeout: time.Hour}, stop)
+			}()
+
+			select {
+			case <-done:
+				t.Fatalf("PhaseRun returned before stop with desired phase %q (it must idle until SIGTERM)", phase)
+			case <-time.After(200 * time.Millisecond):
+			}
+			stop <- struct{}{}
+
+			select {
+			case res := <-done:
+				if res.Status != "" || res.ObservedPhase != "" {
+					t.Fatalf("idler returned (status=%q observedPhase=%q); want a zero Result (no claim)",
+						res.Status, res.ObservedPhase)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("PhaseRun did not return after stop (SIGTERM must break the idle)")
+			}
+			if len(fake.Requests) != 0 {
+				t.Fatalf("desired phase %q must not drive the model (%d requests)", phase, len(fake.Requests))
+			}
+			if _, err := os.Stat(claimPath); !os.IsNotExist(err) {
+				t.Fatalf("desired phase %q must not write a claim (claim path %s, stat err %v)", phase, claimPath, err)
+			}
+		})
+	}
+}
+
 // TestPhaseRunBlockedImplementingClearsStaleLessons (F34): a blocked
 // Implementing run removes a lessons.json an earlier iteration left, and its
 // claim does not advertise it.

@@ -16,10 +16,14 @@ package controller
 
 // I74: a Loop's one-shot runner executes only the Planning or Implementing
 // phase. When the Loop reaches a terminal phase (Succeeded, Failed), the
-// runner has nothing to execute: leaving the sandbox running makes the agent
+// runner has nothing to execute: leaving the sandbox running made the agent
 // container exit with 'unknown desired-phase "Succeeded"' and the restart
-// policy crashloops it for the rest of the Loop's lifetime (seen live on
-// i54-hello: after Succeeded, the sandbox agent kept restarting).
+// policy crashlooped it for the rest of the Loop's lifetime (seen live on
+// i54-hello: after Succeeded, the sandbox agent kept restarting). Since F52 C2
+// an unexecutable desired phase idles instead of exiting, so the same neglect
+// now leaves an idle pod rather than a crashloop — the stop below is still the
+// right behaviour, because there is no phase left for the runner to execute,
+// and these specs keep guarding it.
 //
 // The fix has two cooperating parts:
 //
@@ -32,7 +36,8 @@ package controller
 //     suspend on a terminal phase: even if a fresh Sandbox were recreated for
 //     the terminal phase, it would be built Suspended, not Running. A
 //     Running-mode sandbox for a terminal phase would run the one-shot runner
-//     on 'unknown desired-phase <Succeeded|Failed>' and crashloop.
+//     on 'unknown desired-phase <Succeeded|Failed>', which crashlooped before
+//     F52 C2 and idles now.
 //
 // The specs assert the OBSERVABLE outcome: on a terminal phase the sandbox is
 // deleted (S4 recycle) and NOT recreated on a re-reconcile (same-Loop
@@ -72,9 +77,10 @@ const i74HeadCommit = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
 
 // I74 unit spec (a plain Go test, not envtest): the suspension gate must
 // suspend on a terminal phase. This is the direct regression guard for the
-// crashloop — without the I74 terminal-phase branch, a Sandbox built for a
-// terminal phase is Running (the one-shot runner would exit on
-// 'unknown desired-phase <Succeeded|Failed>' and crashloop). The
+// wasted sandbox — without the I74 terminal-phase branch, a Sandbox built for a
+// terminal phase is Running, and the one-shot runner sits on
+// 'unknown desired-phase <Succeeded|Failed>' (a crashloop before F52 C2, an
+// idle pod now) for a Loop that has nothing left to run. The
 // sandboxOperatingMode gate is the single decision point; the envtest specs
 // below cover the operator's deletion + no-recreate behaviour end-to-end.
 func TestI74SandboxGateSuspendedOnTerminalPhase(t *testing.T) {

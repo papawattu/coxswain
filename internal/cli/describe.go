@@ -14,11 +14,11 @@ import (
 // phase, iteration, conditions, budget, and delivery (A3).
 func newDescribeCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "describe",
+		Use:   "describe <loop>",
 		Short: "Show a Loop's phase, iteration, conditions, budget, and delivery",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return describeLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
+			return describeLoop(cmd.Context(), currentDeps, args[0], cmd.OutOrStdout())
 		},
 	}
 	return cmd
@@ -33,7 +33,7 @@ func namespaceOf() string {
 }
 
 // describeLoop renders a Loop's summary (the describe command's core action).
-func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) error {
+func describeLoop(ctx context.Context, dc Deps, name string, out io.Writer) error {
 	u, err := getLoop(ctx, dc, name)
 	if err != nil {
 		return err
@@ -45,7 +45,11 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 	suspend, _ := getNestedBool(u, "spec", "suspend")
 
 	w.printf("Name:         %s\n", u.GetName())
-	w.printf("Namespace:    %s\n", ns)
+	// The object's namespace, not the flag-derived one: with -n unset the
+	// client resolves the kubeconfig context's namespace (NewDeps), so
+	// printing ns ("default") named a namespace the object does not live in
+	// (F52 C3).
+	w.printf("Namespace:    %s\n", u.GetNamespace())
 	w.printf("Phase:        %s\n", phaseOrDash(phase))
 	// F90: docs/OPERATOR.md promises the desired phase too, and it is half of
 	// the run key (sandboxRunKey) that TROUBLESHOOTING tells the operator to

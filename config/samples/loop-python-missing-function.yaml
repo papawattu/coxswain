@@ -10,6 +10,15 @@
 #   2. It shows the `preset: none` path (no preset to protect Python files;
 #      the protectedPaths list is the only "no cheating" boundary).
 #
+# Prerequisites (see docs/QUICKSTART.md):
+#   - the operator is installed and running
+#   - the samples namespace with the seeded in-cluster Gitea: `make
+#     samples-up` (config/samples-git) creates the namespace, the Gitea and
+#     the samples-git-cred Secret, and `make samples-seed` pushes the gocli /
+#     webapi / pylib repos. This Loop clones samples/pylib.git with samples-git-cred, so
+#     both the repo and the Secret must exist in the Loop's namespace
+#     (samples).
+#
 # Apply:
 #   kubectl apply -f config/samples/loop-python-missing-function.yaml
 #
@@ -20,7 +29,7 @@ apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
   name: loop-python-missing-function
-  namespace: default
+  namespace: samples
 spec:
   goal: >-
     Implement the missing public function in the numutils package so the

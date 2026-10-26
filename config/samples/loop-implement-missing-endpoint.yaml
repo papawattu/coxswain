@@ -8,6 +8,15 @@
 # (not just fix a broken function), so it exercises the full
 # Planning -> Implementing -> Verifying cycle with a non-trivial plan.
 #
+# Prerequisites (see docs/QUICKSTART.md):
+#   - the operator is installed and running
+#   - the samples namespace with the seeded in-cluster Gitea: `make
+#     samples-up` (config/samples-git) creates the namespace, the Gitea and
+#     the samples-git-cred Secret, and `make samples-seed` pushes the gocli /
+#     webapi / pylib repos. This Loop clones samples/webapi.git with samples-git-cred, so
+#     both the repo and the Secret must exist in the Loop's namespace
+#     (samples).
+#
 # Apply:
 #   kubectl apply -f config/samples/loop-implement-missing-endpoint.yaml
 #
@@ -23,7 +32,7 @@ apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
   name: loop-implement-missing-endpoint
-  namespace: default
+  namespace: samples
 spec:
   goal: >-
     Implement the /api/v1/ping endpoint on the existing HTTP server. It

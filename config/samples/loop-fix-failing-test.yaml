@@ -7,12 +7,16 @@
 #
 # Prerequisites (see docs/QUICKSTART.md):
 #   - the operator is installed and running
-#   - the workspace repo is reachable from the sandbox (for a local dev
-#     cluster, use the in-cluster Gitea: http://gitea.samples.svc:3000)
-#   - (optional, delivery only) with spec.delivery.mode: PullRequest and a
-#     spec.workspace.gitCredentialSecret set, the named Secret is reused by
-#     the deliver Job for the git push and the PR API. This sample sets
-#     neither, so no credential Secret is required to run it.
+#   - the samples namespace with the seeded in-cluster Gitea: `make
+#     samples-up` (config/samples-git) creates the namespace, the Gitea and
+#     the samples-git-cred Secret, and `make samples-seed` pushes the gocli /
+#     webapi / pylib repos. This Loop clones samples/gocli.git with
+#     samples-git-cred, so both the repo and the Secret must exist in the
+#     Loop's namespace (samples).
+#   - (optional, delivery only) with spec.delivery.mode: PullRequest the same
+#     gitCredentialSecret is reused by the deliver Job for the git push and
+#     the PR API. This sample does not set spec.delivery, so no PR is opened;
+#     the clone itself still needs the credential above.
 #
 # Apply:
 #   kubectl apply -f config/samples/loop-fix-failing-test.yaml
@@ -28,7 +32,7 @@ apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
   name: loop-fix-failing-test
-  namespace: default
+  namespace: samples
 spec:
   goal: >-
     Fix Round in round.go so it rounds half away from zero. The test suite

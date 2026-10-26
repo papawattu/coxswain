@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `0070686` = PR #269); each claim cites its
+merged code on `main` (as of `f534314` = PR #303); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -216,6 +216,12 @@ existing Loops are unaffected, but new ones are.
   read) is closed by this fix.
 
 ## Other changes
+
+### F52 (runner/CLI P3s): the memory import stores what its name hashes, an unknown phase idles, and describe names its argument — #303
+
+- **What was wrong.** `cox memory import` hashed the trimmed lesson content for the file name and then stored the un-trimmed bytes, so an entry whose content ends with a newline was written under a name that is not the SHA-256 of its content — the invariant the rest of the path assumes (the memory-writer names a lesson by the hash of the trimmed lesson, and dedup compares by name) (F52 C1). A desired phase the runner does not execute (for example `AwaitingApproval`, which the approval gate reaches without writing the phase itself) made the runner write a `status=blocked` claim the operator rejects as malformed: the one-shot exited 1, restarted, and repeated for ever (F52 C2). And `cox describe` / `cox history` `--help` did not name the Loop argument, while `cox describe` printed the `-n` flag's value (or `default`) instead of the namespace the Loop actually lives in (F52 C3).
+- **What changed.** The import now stores the bytes its file name hashes (the trimmed body) (`f534314` = PR #303, F52 C1). A desired phase the runner does not execute (any phase other than `Planning` or `Implementing`) now idles instead of writing the rejected claim — no claim, no model request, no `result.json`; a hold longer than the runner's 24h idle timeout gets one clean exit-and-restart, not a churn (F52 C2). `cox describe` and `cox history` name their `loop` argument in `--help`, and `cox describe` prints the Loop's own namespace (F52 C3).
+- **On upgrade.** Nothing required; pick up the new `cox` binary and operator image (the change is in the CLI and the runner, no CRD change) (PR #303).
 
 ### F52 (restore P3s): a restore with no VolumeSnapshot CRD gets its own reason, and `CheckpointsAvailable` is rewritten only when it changes — #302
 

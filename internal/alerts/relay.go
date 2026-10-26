@@ -34,10 +34,12 @@ const (
 	// defaultFollowRetry is the re-attach delay for a stream that ended or
 	// could not be opened.
 	defaultFollowRetry = 5 * time.Second
-	// maxDecodeFailures is how many CONSECUTIVE undecodable lines make the
-	// stream untrusted. One bad line (a partially written line at a rotation
-	// boundary) is tolerated; a run means the format changed or the stream is
-	// not the one we think it is.
+	// maxDecodeFailures is how many CONSECUTIVE AUDIT-SHAPED lines that fail to
+	// decode make the stream untrusted. Ordinary container output (a zap text
+	// line, an unrelated JSON object) is not a failure at all — the engine's
+	// log starts with startup noise, and counting that as "the format changed"
+	// degraded every Loop to Unknown permanently (pi3 E1). One bad audit line
+	// (a partially written line at a rotation boundary) is also tolerated.
 	maxDecodeFailures = 3
 	// maxLineBytes bounds one log line (a KubeArmor alert is ~1 KiB; this is a
 	// guard against a rogue line, not a limit anyone should reach).
@@ -62,15 +64,15 @@ type PeerKind string
 const (
 	// PeerEngine is the engine's own agent pod: ONE stream per node that
 	// carries alerts for every sandbox on it, so its health is evidence about
-	// every Loop with a sandbox (not about one Loop).
+	// every Loop whose sandbox runs on that node (not about one Loop).
 	PeerEngine PeerKind = "engine"
 	// PeerProxy is a per-Loop proxy pod of the operator's own: its stream is
 	// evidence about exactly that Loop.
 	PeerProxy PeerKind = "proxy"
 	// PeerWorkload is a sandbox pod. Its log is NOT followed (the engine
 	// writes the alerts); it exists so the relay can say "this Loop has a
-	// sandbox and the engine stream is attached", which is what makes a count
-	// of 0 publishable instead of "unseen".
+	// sandbox, and the engine stream on its node is attached", which is what
+	// makes a count of 0 publishable instead of "unseen".
 	PeerWorkload PeerKind = "workload"
 )
 
@@ -85,11 +87,18 @@ type Peer struct {
 	// from this pod (SourceKubeArmor for the engine's agent pods, the proxy's
 	// own value for the operator's proxy pods).
 	Source string
+	// Node is the node the pod runs on. An engine pod serves ONE node, so its
+	// failure must degrade only the Loops whose sandbox runs there (pi3 E6).
+	Node string
+	// Created is the pod's creation time. A sandbox pod created BEFORE the
+	// relay started cannot have had its whole life covered by the stream, so
+	// its count is not published as a complete number (pi3 E8).
+	Created time.Time
 }
 
 // Discoverer lists the pods whose logs carry alerts (and the sandbox pods that
 // need a health report). Discover is called periodically, so a pod created
-// later is picked up without a watch.
+// later is picked up without a watch, and a pod that went away is pruned.
 type Discoverer interface {
 	Discover(ctx context.Context) ([]Peer, error)
 }
@@ -187,10 +196,11 @@ func (h *Holder) observe(uid types.UID, al Alert) {
 	h.loops[uid] = snap
 }
 
-// noteHealthy records that the Loop's stream attached (or that its sandbox
-// exists on an attached engine stream). It never clears a degraded state: a gap
-// that happened is not undone by the next successful attach (the count would
-// then look complete when it is not — I32).
+// noteHealthy records that the Loop's stream coverage is established. An
+// UNAVAILABLE state may be rebuilt to Healthy (a full re-read after a failure
+// re-reads the whole current log, which IS complete evidence for a pod whose
+// life started after the relay — pi3 E6); a GAP is never cleared, because the
+// count is genuinely incomplete (I32).
 func (h *Holder) noteHealthy(uid types.UID) {
 	if h == nil || uid == "" {
 		return
@@ -198,16 +208,20 @@ func (h *Holder) noteHealthy(uid types.UID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	snap, ok := h.loops[uid]
-	if ok && snap.Health != HealthUnknown {
+	if ok && snap.Health == HealthGap {
+		return
+	}
+	if ok && snap.Health == HealthHealthy {
 		return
 	}
 	snap.Health = HealthHealthy
+	snap.Reason = ""
 	h.loops[uid] = snap
 }
 
 // degrade records that the Loop's stream cannot be trusted. The FIRST degraded
 // report wins so the condition reason is stable across retries; a degraded
-// state is never upgraded back to Healthy.
+// state is never upgraded back to Healthy (see noteHealthy for the exception).
 func (h *Holder) degrade(uid types.UID, health Health, reason string) {
 	if h == nil || uid == "" {
 		return
@@ -223,9 +237,7 @@ func (h *Holder) degrade(uid types.UID, health Health, reason string) {
 	h.loops[uid] = snap
 }
 
-// degradeAll degrades every Loop the relay already knows. The engine stream is
-// shared by every sandbox on a node, so its failure is evidence about all of
-// them — a per-pod blame would leave every other Loop publishing a stale count.
+// degradeAll degrades every Loop the relay already knows.
 func (h *Holder) degradeAll(health Health, reason string) {
 	if h == nil {
 		return
@@ -250,6 +262,79 @@ func (h *Holder) noteUnattributed() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.unattributed++
+}
+
+// podAttr is one pod's resolved Loop attribution, cached for the pod's life.
+type podAttr struct {
+	loopNS   string
+	loopName string
+	uid      types.UID
+	resolved bool
+}
+
+// attrCache remembers what discovery already resolved. A pod's Loop label and a
+// Loop's UID do not change while the pod exists, so an audit line must not cost
+// two uncached API reads (pi3 E5: under audit mode that is hundreds of requests
+// per second). The cache is rebuilt every discovery pass — an entry survives
+// only while its pod is still discovered, so a deleted pod is forgotten.
+type attrCache struct {
+	mu    sync.RWMutex
+	pods  map[string]podAttr
+	loops map[string]types.UID
+}
+
+func newAttrCache() *attrCache {
+	return &attrCache{pods: map[string]podAttr{}, loops: map[string]types.UID{}}
+}
+
+// reset starts a new discovery pass: the next lookups are unresolved until the
+// pass (or a live resolve) fills them.
+func (c *attrCache) reset() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pods = map[string]podAttr{}
+	c.loops = map[string]types.UID{}
+}
+
+func (c *attrCache) pod(key string) (podAttr, bool) {
+	if c == nil {
+		return podAttr{}, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	a, ok := c.pods[key]
+	return a, ok
+}
+
+func (c *attrCache) setPod(key string, a podAttr) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pods[key] = a
+}
+
+func (c *attrCache) loop(key string) (types.UID, bool) {
+	if c == nil {
+		return "", false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	uid, ok := c.loops[key]
+	return uid, ok
+}
+
+func (c *attrCache) setLoop(key string, uid types.UID) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loops[key] = uid
 }
 
 // Relay is the leader-elected manager Runnable that follows the audit streams,
@@ -279,36 +364,58 @@ type Relay struct {
 	// Log is the relay's logger.
 	Log logr.Logger
 
-	// mu guards the engine stream's state and the workload set: every follower
-	// goroutine reports on the engine stream, and discovery reads it when it
-	// sees a sandbox pod.
+	// mu guards the engine stream's state, the workload set and the follower
+	// table: every follower goroutine reports on the engine stream, and
+	// discovery reads the table when a pod appears or goes away.
 	mu sync.Mutex
 	// engineHealthy is "an engine agent stream is attached": what makes a
 	// count of 0 a fact rather than an absence.
 	engineHealthy bool
-	// engineFailed is "the engine stream could not be read, or lost its
-	// window": a sandbox pod's count is then UNKNOWN, never 0 (I32).
-	engineFailed bool
-	// workloads are the sandbox pod UIDs discovered so far: when the engine
-	// attaches, every one of them becomes countable.
-	workloads map[types.UID]struct{}
+	// engineFailed is "the engine stream could not be read on the node(s) we
+	// know": a sandbox pod on such a node is UNKNOWN, never 0 (I32).
+	engineFailedByNode map[string]bool
+	// workloads maps a sandbox pod's Loop UID to the node it runs on, so an
+	// engine pod's failure degrades only the Loops it serves (pi3 E6).
+	workloads map[types.UID]string
+	// followers holds the cancel func of every running stream, keyed
+	// ns/pod/container. Discovery prunes a follower whose pod is gone (pi3 E2:
+	// without it every deleted pod left a goroutine retrying forever).
+	followers map[string]context.CancelFunc
+	// startedAt is when the relay started: a sandbox pod created before it
+	// cannot have had its whole life covered (pi3 E8).
+	startedAt time.Time
+	// attr caches the pod→Loop and Loop→UID resolutions (pi3 E5).
+	attr *attrCache
 }
 
 // Start implements manager.Runnable. It returns when ctx is done.
 func (r *Relay) Start(ctx context.Context) error {
 	if r.Source == nil || r.Discoverer == nil || r.Attributor == nil || r.Holder == nil {
 		// Not configured: there is nothing to follow. The operator always
-		// configures it (cmd/main.go); a bare test reconciler does not.
+		// configures it (cmd/main.go exits if it cannot); a bare test
+		// reconciler does not.
 		return nil
 	}
 	interval := r.Interval
 	if interval <= 0 {
 		interval = DefaultDiscoverInterval
 	}
-	// followed is owned by this goroutine only: every stream is started from
-	// here, and a stream that ends stays marked (its follower re-attaches; it
-	// only goes away with the context).
-	followed := map[string]struct{}{}
+	r.mu.Lock()
+	if r.attr == nil {
+		r.attr = newAttrCache()
+	}
+	if r.followers == nil {
+		r.followers = map[string]context.CancelFunc{}
+	}
+	if r.engineFailedByNode == nil {
+		r.engineFailedByNode = map[string]bool{}
+	}
+	if r.workloads == nil {
+		r.workloads = map[types.UID]string{}
+	}
+	r.startedAt = time.Now()
+	r.mu.Unlock()
+
 	discover := func() {
 		peers, err := r.Discoverer.Discover(ctx)
 		if err != nil {
@@ -317,24 +424,25 @@ func (r *Relay) Start(ctx context.Context) error {
 			// must not blind the other two.
 			r.log().Error(err, "alert relay: pod discovery was incomplete")
 		}
+		r.attr.reset()
 		var enginePeers int
 		for _, peer := range peers {
 			if peer.Kind == PeerEngine {
 				enginePeers++
 			}
 		}
+		current := map[string]struct{}{}
 		for _, peer := range peers {
+			key := peer.Namespace + "/" + peer.Pod + "/" + peer.Container
+			current[key] = struct{}{}
+			r.resolvePeer(ctx, peer)
 			if peer.Kind == PeerWorkload {
 				r.workloadSeen(ctx, peer, enginePeers > 0)
 				continue
 			}
-			key := peer.Namespace + "/" + peer.Pod + "/" + peer.Container
-			if _, ok := followed[key]; ok {
-				continue
-			}
-			followed[key] = struct{}{}
-			go r.follow(ctx, peer)
+			r.startFollower(ctx, key, peer)
 		}
+		r.pruneFollowers(current)
 	}
 	discover()
 	ticker := time.NewTicker(interval)
@@ -342,6 +450,7 @@ func (r *Relay) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			r.pruneFollowers(nil)
 			return nil
 		case <-ticker.C:
 			discover()
@@ -349,9 +458,42 @@ func (r *Relay) Start(ctx context.Context) error {
 	}
 }
 
+// startFollower launches the stream for a peer that is not being followed yet.
+func (r *Relay) startFollower(ctx context.Context, key string, peer Peer) {
+	r.mu.Lock()
+	if _, ok := r.followers[key]; ok {
+		r.mu.Unlock()
+		return
+	}
+	fctx, cancel := context.WithCancel(ctx)
+	r.followers[key] = cancel
+	r.mu.Unlock()
+	go r.follow(fctx, peer)
+}
+
+// pruneFollowers stops the streams whose pod is no longer discovered (pi3 E2).
+// Without this a deleted proxy pod (recreated per Loop, constantly) left a
+// goroutine retrying a log read that can only ever return NotFound.
+func (r *Relay) pruneFollowers(current map[string]struct{}) {
+	r.mu.Lock()
+	var stale []context.CancelFunc
+	for key, cancel := range r.followers {
+		if _, ok := current[key]; ok {
+			continue
+		}
+		stale = append(stale, cancel)
+		delete(r.followers, key)
+	}
+	r.mu.Unlock()
+	for _, cancel := range stale {
+		cancel()
+	}
+}
+
 // follow keeps ONE pod container's stream attached: it reads lines until the
 // stream ends (a rotation, a broken read), re-attaches from the last accepted
-// alert, and retries a follow that could not be opened at all.
+// alert, and retries a follow that could not be opened at all. It returns when
+// the pod's follower is pruned or the manager stops.
 func (r *Relay) follow(ctx context.Context, peer Peer) {
 	log := r.log().WithValues("pod", peer.Namespace+"/"+peer.Pod, "container", peer.Container)
 	retry := r.Retry
@@ -366,6 +508,9 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 		}
 		rc, err := r.Source.Follow(ctx, peer.Namespace, peer.Pod, peer.Container, since)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			// The stream never opened. Before the first attach that is
 			// UNKNOWN for the affected Loop(s) — never 0 (I32).
 			if !attached {
@@ -388,8 +533,13 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 		scanner := bufio.NewScanner(rc)
 		scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 		for scanner.Scan() {
-			al, ok := ParseLine(scanner.Bytes())
-			if !ok {
+			al, kind := ClassifyLine(scanner.Bytes())
+			if kind == LineNoise {
+				// Ordinary container output (startup noise, unrelated JSON):
+				// not an audit record, so not a decode failure (pi3 E1).
+				continue
+			}
+			if kind == LineMalformed {
 				failures++
 				if failures >= maxDecodeFailures {
 					r.degraded(ctx, peer, HealthGap, ReasonUndecodable)
@@ -423,22 +573,55 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 	}
 }
 
+// resolvePeer caches a discovered pod's attribution for this pass (pi3 E5).
+func (r *Relay) resolvePeer(ctx context.Context, peer Peer) {
+	ns, name, ok := r.Attributor.PodLoop(ctx, peer.Namespace, peer.Pod)
+	key := peer.Namespace + "/" + peer.Pod
+	if !ok || name == "" {
+		r.attr.setPod(key, podAttr{resolved: true})
+		return
+	}
+	uid, haveUID := r.loopUID(ctx, ns, name)
+	r.attr.setPod(key, podAttr{loopNS: ns, loopName: name, uid: uid, resolved: haveUID})
+}
+
+// loopUID resolves and caches a Loop's UID.
+func (r *Relay) loopUID(ctx context.Context, namespace, name string) (types.UID, bool) {
+	key := namespace + "/" + name
+	if uid, ok := r.attr.loop(key); ok {
+		return uid, uid != ""
+	}
+	uid, ok := r.Attributor.LoopUID(ctx, namespace, name)
+	if !ok {
+		// Cache the miss for this pass so a burst of alerts for a Loop that is
+		// gone does not re-read the API per line.
+		uid = ""
+	}
+	r.attr.setLoop(key, uid)
+	return uid, uid != ""
+}
+
 // accept attributes one alert and records it: the per-Loop count (F62) and the
 // Q4 line (F63). An alert that cannot be attributed is counted as unattributed
 // and still emitted (with no Loop), never guessed.
 func (r *Relay) accept(ctx context.Context, peer Peer, al Alert) {
 	al.Source = firstNonEmpty(al.Source, peer.Source)
 	loopNS, loopName := al.LoopNamespace, al.Loop
-	if loopName == "" && al.Pod != "" {
-		// The engine's line names the SANDBOX pod; the Loop comes from the
-		// operator-set label on that pod.
-		loopNS, loopName, _ = r.Attributor.PodLoop(ctx, al.Namespace, al.Pod)
-	}
 	var uid types.UID
-	if loopName != "" {
-		if id, ok := r.Attributor.LoopUID(ctx, loopNS, loopName); ok {
-			uid = id
+	switch {
+	case loopName != "":
+		// The proxy records already know their Loop.
+		uid, _ = r.loopUID(ctx, loopNS, loopName)
+	case al.Pod != "":
+		// The engine's line names the SANDBOX pod; the Loop comes from the
+		// operator-set label on that pod, resolved once per pod (E5).
+		key := al.Namespace + "/" + al.Pod
+		attr, ok := r.attr.pod(key)
+		if !ok {
+			r.resolvePeer(ctx, Peer{Namespace: al.Namespace, Pod: al.Pod})
+			attr, _ = r.attr.pod(key)
 		}
+		loopNS, loopName, uid = attr.loopNS, attr.loopName, attr.uid
 	}
 	if uid == "" {
 		r.Holder.noteUnattributed()
@@ -494,25 +677,40 @@ func (r *Relay) emit(al Alert, loopName, loopNS, detail string) {
 	}
 }
 
-// attachedNow records a successful attach: the engine stream's state for every
-// Loop it serves, or one proxy pod's Loop.
+// attachedNow records a successful attach: the engine stream's state for the
+// sandbox pods on its node, or one proxy pod's Loop.
 func (r *Relay) attachedNow(ctx context.Context, peer Peer) {
 	if peer.Kind == PeerEngine {
 		r.mu.Lock()
-		// The engine log carries every sandbox's alerts, so a live engine
-		// stream is what lets a Loop's count be 0 rather than unknown. A Loop
-		// whose stream was already degraded stays degraded (fail-closed:
-		// noteHealthy never clears a gap).
+		// The engine log carries every sandbox's alerts ON ITS NODE, so a live
+		// engine stream is what lets such a Loop's count be 0 rather than
+		// unknown. A Loop whose stream was already degraded to a GAP stays
+		// degraded (fail-closed); an Unavailable one may recover (a full
+		// re-read is complete evidence — pi3 E6).
 		r.engineHealthy = true
-		r.engineFailed = false
-		for uid := range r.workloads {
-			r.Holder.noteHealthy(uid)
+		delete(r.engineFailedByNode, peer.Node)
+		uids := make([]types.UID, 0, len(r.workloads))
+		for uid, node := range r.workloads {
+			if peer.Node == "" || node == "" || node == peer.Node {
+				uids = append(uids, uid)
+			}
 		}
 		r.mu.Unlock()
+		for _, uid := range uids {
+			r.Holder.noteHealthy(uid)
+		}
 		return
 	}
-	if uid := r.peerLoopUID(ctx, peer); uid != "" {
-		r.Holder.noteHealthy(uid)
+	if peer.Kind == PeerWorkload {
+		return
+	}
+	// A proxy stream is NOT evidence about the engine (pi3 E3): its being
+	// readable says nothing about whether blocks reached us, so it must not on
+	// its own make a Loop healthy. It only feeds the count of proxy-side blocks.
+	if r.engineOK(peer.Node) {
+		if uid := r.peerLoopUID(ctx, peer); uid != "" {
+			r.Holder.noteHealthy(uid)
+		}
 	}
 }
 
@@ -520,18 +718,16 @@ func (r *Relay) attachedNow(ctx context.Context, peer Peer) {
 func (r *Relay) degraded(ctx context.Context, peer Peer, health Health, reason string) {
 	if peer.Kind == PeerEngine {
 		r.mu.Lock()
-		r.engineHealthy = false
-		r.engineFailed = true
-		// Every Loop with a sandbox on that node depends on the stream. The
-		// discovered workloads are degraded explicitly as well as through
-		// degradeAll: a workload may have been registered after the last
-		// attempt and so have no entry of its own yet.
-		uids := make([]types.UID, 0, len(r.workloads))
-		for uid := range r.workloads {
-			uids = append(uids, uid)
+		r.engineFailedByNode[peer.Node] = true
+		// The engine pod serves ONE node: degrade only the Loops whose sandbox
+		// runs there, not every Loop in the cluster (pi3 E6a).
+		var uids []types.UID
+		for uid, node := range r.workloads {
+			if peer.Node == "" || node == "" || node == peer.Node {
+				uids = append(uids, uid)
+			}
 		}
 		r.mu.Unlock()
-		r.Holder.degradeAll(health, reason)
 		for _, uid := range uids {
 			r.Holder.degrade(uid, health, reason)
 		}
@@ -542,32 +738,51 @@ func (r *Relay) degraded(ctx context.Context, peer Peer, health Health, reason s
 	}
 }
 
-// workloadSeen records a sandbox pod: with the engine stream attached, this is
-// the evidence that makes "0 blocked actions" a fact rather than an absence.
-// Without it, the Loop's count is UNKNOWN (the engine cannot be read).
+// engineOK reports whether an engine stream is attached for the given node.
+func (r *Relay) engineOK(node string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.engineHealthy {
+		return false
+	}
+	return node == "" || !r.engineFailedByNode[node]
+}
+
+// workloadSeen records a sandbox pod: with the engine stream attached on its
+// node, this is the evidence that makes "0 blocked actions" a fact rather than
+// an absence. Without it, the Loop's count is UNKNOWN (the engine cannot be
+// read), and a sandbox that predates the relay is never claimed as complete
+// (pi3 E8).
 func (r *Relay) workloadSeen(ctx context.Context, peer Peer, engineDiscovered bool) {
 	uid := r.peerLoopUID(ctx, peer)
 	if uid == "" {
 		return
 	}
 	r.mu.Lock()
-	if r.workloads == nil {
-		r.workloads = map[types.UID]struct{}{}
+	r.workloads[uid] = peer.Node
+	engineHealthy := r.engineHealthy
+	failed := r.engineFailedByNode[peer.Node]
+	if peer.Node == "" {
+		failed = len(r.engineFailedByNode) > 0
 	}
-	r.workloads[uid] = struct{}{}
-	engineHealthy, engineFailed := r.engineHealthy, r.engineFailed
 	r.mu.Unlock()
 	switch {
-	case engineHealthy:
+	case engineHealthy && !failed:
+		if !peer.Created.IsZero() && peer.Created.Before(r.startedAt) {
+			// The sandbox existed before the relay did: its earlier life was
+			// not observed, so this is a gap, not a complete count (pi3 E8).
+			r.Holder.degrade(uid, HealthGap, ReasonStreamGap)
+			return
+		}
 		r.Holder.noteHealthy(uid)
-	case engineFailed:
-		// The engine stream was found and could not be read: the count for
-		// this Loop is UNKNOWN, never 0 (I32).
+	case failed:
+		// The engine stream on this node was found and could not be read: the
+		// count for this Loop is UNKNOWN, never 0 (I32).
 		r.Holder.degrade(uid, HealthUnavailable, ReasonStreamUnavailable)
 	case engineDiscovered:
 		// An engine pod exists and its stream has not attached yet: "no news
 		// yet" — writing nothing is right (and the attach, or its failure,
-		// decides below on the next pass).
+		// decides on a later pass).
 	default:
 		// Sandbox pods but no engine pod at all: the engine is absent, which is
 		// a fact about the count, not an absence of information.
@@ -575,17 +790,25 @@ func (r *Relay) workloadSeen(ctx context.Context, peer Peer, engineDiscovered bo
 	}
 }
 
-// peerLoopUID resolves a discovered pod's Loop UID through the operator's
-// per-Loop label on it (PodLoop), then the Loop object (LoopUID).
+// peerLoopUID resolves a discovered pod's Loop UID through the cached
+// attribution (E5), then the Loop object.
 func (r *Relay) peerLoopUID(ctx context.Context, peer Peer) types.UID {
 	if peer.Pod == "" || r.Attributor == nil {
 		return ""
 	}
-	ns, name, ok := r.Attributor.PodLoop(ctx, peer.Namespace, peer.Pod)
-	if !ok || name == "" {
+	key := peer.Namespace + "/" + peer.Pod
+	attr, ok := r.attr.pod(key)
+	if !ok {
+		r.resolvePeer(ctx, peer)
+		attr, _ = r.attr.pod(key)
+	}
+	if attr.uid != "" {
+		return attr.uid
+	}
+	if attr.loopName == "" {
 		return ""
 	}
-	uid, _ := r.Attributor.LoopUID(ctx, ns, name)
+	uid, _ := r.loopUID(ctx, attr.loopNS, attr.loopName)
 	return uid
 }
 

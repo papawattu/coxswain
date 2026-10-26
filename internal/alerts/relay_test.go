@@ -92,6 +92,12 @@ func (d *fixedDiscoverer) Discover(context.Context) ([]Peer, error) {
 	return d.peers, d.err
 }
 
+func (d *fixedDiscoverer) setPeers(peers ...Peer) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.peers = peers
+}
+
 // fakeAttributor maps pods to Loops and Loops to UIDs.
 type fakeAttributor struct {
 	pods   map[string][2]string // "ns/pod" -> {loopNS, loopName}
@@ -390,22 +396,151 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 // Mutation: treat an undecodable line as an alert / ignore the run → Unknown
 // never appears.
 func TestRelayRunOfUndecodableLinesIsUnknown(t *testing.T) {
+	// pi3 E1: the engine's log starts with ordinary startup output. Three noise
+	// lines must NOT be read as "the audit format changed" — only AUDIT-SHAPED
+	// lines that fail to decode count toward the budget.
+	noise := []string{
+		`time=2026-10-26T10:00:00Z level=info msg="starting kubearmor"`,
+		`{"level":"info","msg":"watching for events","component":"runtime"}`,
+		`{"level":"debug","msg":"loaded policy","policy":"p"}`,
+	}
 	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
 	good := kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")
-	src := &scriptedSource{attaches: []attachment{{lines: []string{
-		"one bad line is skipped",
-		good,
-		"not json again",
-		`{"truncated":`,
-		`{"Operation":"Process",`,
-	}}}}
-	_, holder := f62Fixture(t, src)
 
-	waitFor(t, "a stream with an undecodable run", func() bool {
+	// Half 1: noise only (+ one good alert) — healthy.
+	quiet := &scriptedSource{attaches: []attachment{{lines: append(append([]string{}, noise...), good)}}}
+	_, holder := f62Fixture(t, quiet)
+	waitFor(t, "a healthy stream behind startup noise", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthHealthy && s.Count == 1
+	})
+	time.Sleep(20 * time.Millisecond)
+	if s, _ := holder.Snapshot(f62UID); s.Health != HealthHealthy {
+		t.Fatalf("startup noise degraded the stream to %q/%q; ordinary output is not a decode failure (E1)",
+			s.Health, s.Reason)
+	}
+
+	// Half 2: the same noise, then a run of AUDIT-SHAPED lines that do not
+	// decode — that is a real failure.
+	src := &scriptedSource{attaches: []attachment{{lines: append(append([]string{}, noise...),
+		good,
+		`{"Operation":"Process",`,
+		`{"Operation":"File","PodName":`,
+		`{"Operation":"Network","NamespaceName":`,
+	)}}}
+	_, holder = f62Fixture(t, src)
+	waitFor(t, "a stream with an undecodable audit-shaped run", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		if !ok {
 			return false
 		}
 		return s.Health == HealthGap && s.Reason == ReasonUndecodable
+	})
+}
+
+// TestRelayStopsFollowingADeletedPod is pi3 E2: the follower table is pruned on
+// re-discovery, so a deleted pod does not leave a goroutine retrying a log read
+// that can only return NotFound — forever, for every proxy pod a Loop ever had.
+//
+// Mutation: drop pruneFollowers (or never cancel) → the follow count keeps
+// growing after the pod is gone.
+func TestRelayStopsFollowingADeletedPod(t *testing.T) {
+	src := &scriptedSource{attaches: []attachment{{err: errors.New("NotFound")}}}
+	disc := &fixedDiscoverer{peers: []Peer{
+		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
+		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
+	}}
+	relay := f62NewRelay(src)
+	relay.Discoverer = disc
+	relay.Interval = 10 * time.Millisecond
+	relay.Retry = 2 * time.Millisecond
+	startTestRelay(t, relay)
+
+	waitFor(t, "the engine stream to be attempted", func() bool { return src.followCount() >= 1 })
+
+	// The engine pod is gone (a rescheduled agent, an uninstalled engine).
+	disc.setPeers(Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload})
+	// Let a discovery pass (Interval 10ms) prune the follower. One attempt may
+	// still be in flight when it is cancelled, hence the small allowance; the
+	// bug this pins grew the count by ~50 in the same window.
+	time.Sleep(50 * time.Millisecond)
+	settled := src.followCount()
+	time.Sleep(100 * time.Millisecond)
+	if got := src.followCount(); got > settled+2 {
+		t.Fatalf("the follow count grew from %d to %d after the pod was pruned: the follower is still retrying (E2)",
+			settled, got)
+	}
+}
+
+// TestRelayProxyStreamAloneIsNotHealthy is pi3 E3: a readable egress-proxy log
+// says nothing about whether the engine's blocks reached us, so it must not on
+// its own publish a count (which would read "the engine blocked 0 action(s)").
+//
+// Mutation: noteHealthy on a proxy attach regardless of the engine → Healthy.
+func TestRelayProxyStreamAloneIsNotHealthy(t *testing.T) {
+	disc := &fixedDiscoverer{peers: []Peer{
+		{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Source: SourceEgress},
+	}}
+	src := &scriptedSource{attaches: []attachment{{lines: []string{
+		`{"time":"2026-10-26T10:00:00Z","loop":"l1","namespace":"ns1","source":"egress-proxy",` +
+			`"action":"connect","target":"api:443","verdict":"blocked"}`,
+	}}}}
+	relay := f62NewRelay(src)
+	relay.Discoverer = disc
+	relay.Attributor = &fakeAttributor{
+		pods: map[string][2]string{f62LoopNS + "/l1-egress-proxy": {f62LoopNS, f62LoopName}},
+		uids: map[string]types.UID{f62LoopNS + "/" + f62LoopName: f62UID},
+	}
+	holder := startTestRelay(t, relay)
+
+	waitFor(t, "the proxy line to be counted", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Count == 1
+	})
+	time.Sleep(30 * time.Millisecond)
+	if s, _ := holder.Snapshot(f62UID); s.Health == HealthHealthy {
+		t.Fatalf("a proxy stream alone made the Loop Healthy; its count would read as a complete engine count (E3)")
+	}
+}
+
+// TestRelayRecoversFromUnavailableOnAFullReattach is pi3 E6(b): a transient
+// engine failure may recover. A full re-read (since == nil after a failure)
+// re-reads the whole current log, which IS complete evidence for a sandbox that
+// started after the relay; a GAP stays sticky (the count is genuinely
+// incomplete).
+//
+// Mutation: make noteHealthy refuse Unavailable too → the Loop stays Unknown.
+func TestRelayRecoversFromUnavailableOnAFullReattach(t *testing.T) {
+	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	src := &scriptedSource{attaches: []attachment{
+		{err: errors.New("temporary apiserver error")},
+		{lines: []string{kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")}},
+	}}
+	_, holder := f62Fixture(t, src)
+
+	waitFor(t, "the unavailable state", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthUnavailable
+	})
+	waitFor(t, "recovery to Healthy after the full re-read", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthHealthy
+	})
+}
+
+// TestRelayEngineAbsentIsUnavailable is pi3 E10's EngineUnavailable decision: a
+// sandbox pod with no engine pod at all is a fact about the count (there is no
+// engine), not an absence of information.
+func TestRelayEngineAbsentIsUnavailable(t *testing.T) {
+	disc := &fixedDiscoverer{peers: []Peer{
+		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
+	}}
+	relay := f62NewRelay(&scriptedSource{attaches: []attachment{{err: errors.New("unused")}}})
+	relay.Discoverer = disc
+	holder := startTestRelay(t, relay)
+
+	waitFor(t, "EngineUnavailable", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthUnavailable && s.Reason == ReasonEngineUnavailable
 	})
 }

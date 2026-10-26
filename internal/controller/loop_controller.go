@@ -573,7 +573,7 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;delete
 // A1 (D52): the static enforcement check reads Nodes (BPF-LSM label) and

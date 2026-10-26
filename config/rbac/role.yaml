@@ -31,10 +31,15 @@ rules:
   - ""
   resources:
   - nodes
-  - pods/log
   verbs:
   - get
   - list
+- apiGroups:
+  - ""
+  resources:
+  - pods/log
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:

@@ -33,6 +33,10 @@ import (
 	"github.com/papawattu/coxswain/internal/toolproxy"
 )
 
+// firstAttachTailLines bounds the FIRST attach's read (no sinceTime): the relay
+// reads that many of the newest lines, not the whole log file (pi3 E8).
+const firstAttachTailLines = 2000
+
 // Defaults for the engine's pods. They match the defaults of
 // engine.KubeArmorEnforcerConfig (AgentNamespace/AgentPodLabel): the operator
 // passes its own --kubearmor-* flags here, and these are used when a flag is
@@ -83,6 +87,14 @@ func (s *LogSource) Follow(ctx context.Context, namespace, pod, container string
 	}
 	if since != nil {
 		opts.SinceTime = &metav1.Time{Time: *since}
+	} else {
+		// The FIRST attach (no sinceTime) would otherwise return the whole log
+		// file — a long-lived engine pod's log can be 100 MB, and the relay
+		// does not claim anything older than its own start anyway (pi3 E8: a
+		// sandbox that predates the relay is degraded to Unknown, so the older
+		// lines cannot make a count complete). Read a bounded tail.
+		tail := int64(firstAttachTailLines)
+		opts.TailLines = &tail
 	}
 	return s.Client.CoreV1().Pods(namespace).GetLogs(pod, opts).Stream(ctx)
 }
@@ -130,6 +142,8 @@ func (d *PodDiscoverer) Discover(ctx context.Context) ([]Peer, error) {
 					Pod:       list.Items[i].Name,
 					Kind:      PeerEngine,
 					Source:    SourceKubeArmor,
+					Node:      list.Items[i].Spec.NodeName,
+					Created:   list.Items[i].CreationTimestamp.Time,
 				})
 			}
 		}
@@ -156,6 +170,8 @@ func (d *PodDiscoverer) Discover(ctx context.Context) ([]Peer, error) {
 				Pod:       list.Items[i].Name,
 				Kind:      PeerProxy,
 				Source:    proxy.source,
+				Node:      list.Items[i].Spec.NodeName,
+				Created:   list.Items[i].CreationTimestamp.Time,
 			})
 		}
 	}
@@ -169,6 +185,8 @@ func (d *PodDiscoverer) Discover(ctx context.Context) ([]Peer, error) {
 					Namespace: list.Items[i].Namespace,
 					Pod:       list.Items[i].Name,
 					Kind:      PeerWorkload,
+					Node:      list.Items[i].Spec.NodeName,
+					Created:   list.Items[i].CreationTimestamp.Time,
 				})
 			}
 		}

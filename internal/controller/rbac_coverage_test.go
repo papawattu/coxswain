@@ -163,6 +163,13 @@ func TestRBACCoverage(t *testing.T) {
 		// Sandbox status (the controller reads sandbox status).
 		{group: agentsGroup, resource: "sandboxes/status",
 			minVerbs: []string{verbGet}},
+		// pods/log — the F62 alert relay follows the engine's and the
+		// operator's own proxy pod logs. This entry is what makes the trusted
+		// table's pods/log row a GUARD: without it the group assertion never
+		// runs for the subresource (pi3 E4), and `get` is the only verb the
+		// relay uses (GetLogs().Stream() — pi3 E9).
+		{group: "", resource: "pods/log",
+			minVerbs: []string{verbGet}},
 		// Owns(&Pod{}) — the controller creates and owns proxy Pods.
 		{group: "", resource: corePodsResource,
 			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbUpdate}},

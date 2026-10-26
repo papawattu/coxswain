@@ -400,13 +400,17 @@ func main() {
 	// the per-Loop blocked-action count (status.policy.blockedCount) and emits
 	// one Q4 JSON line per alert on stdout with `iteration` joined from the
 	// Loop status. The reconcile reads the holder; the relay never writes
-	// status. A relay that cannot start must not take the operator down: the
-	// holder stays empty, so no Loop publishes a number (nil, never 0 — I32),
-	// and the failure is logged loudly (R26 I90: a fallback surfaces itself).
+	// status.
+	//
+	// A registration failure is FATAL (pi3 E7): continuing with a nil seam
+	// renders as "no news yet" for every Loop, which the reconcile deliberately
+	// does not distinguish from success — a silent, permanent absence of the
+	// count. A stream that cannot be READ later is different: that surfaces per
+	// Loop as PolicyBlocked=Unknown/AuditStreamUnavailable.
 	auditHolder, err := addAlertRelay(mgr, kaAgentNamespace, kaAgentPodLabel)
 	if err != nil {
-		setupLog.Error(err, "Failed to register the alert relay Runnable; blocked-action counts will stay UNKNOWN")
-		auditHolder = nil
+		setupLog.Error(err, "Failed to register the alert relay Runnable")
+		os.Exit(1)
 	}
 	if err := (&controller.LoopReconciler{
 		Client:                 mgr.GetClient(),

@@ -163,6 +163,48 @@ func WriteRecord(w io.Writer, rec Record) error {
 	return err
 }
 
+// LineKind classifies a log line so the relay can tell ordinary container
+// output from a line that SHOULD be an audit record and is not (E1: counting
+// startup noise as "the format changed" degraded every Loop to Unknown).
+type LineKind int
+
+const (
+	// LineNoise is ordinary container output (a zap text line, an unrelated
+	// JSON object): skipped silently, never a decode failure.
+	LineNoise LineKind = iota
+	// LineMalformed looks like an audit record of one of the three sources and
+	// still failed to decode (truncated, bad timestamp): a real failure.
+	LineMalformed
+	// LineAlert is a decoded audit record.
+	LineAlert
+)
+
+// ClassifyLine decodes one log line and says what it was. It is ParseLine plus
+// the noise/malformed distinction the relay needs for its failure budget.
+func ClassifyLine(line []byte) (Alert, LineKind) {
+	if al, ok := ParseLine(line); ok {
+		return al, LineAlert
+	}
+	if looksLikeAudit(line) {
+		return Alert{}, LineMalformed
+	}
+	return Alert{}, LineNoise
+}
+
+// looksLikeAudit reports whether a line is shaped like one of the audit
+// sources' records: a JSON object carrying a discriminator key (the engine's
+// `Operation`, the egress proxy's `verdict`, the tool proxy's `tool`). Anything
+// else is ordinary output and is skipped without touching the failure budget.
+func looksLikeAudit(line []byte) bool {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	return strings.Contains(trimmed, `"Operation"`) ||
+		strings.Contains(trimmed, `"verdict"`) ||
+		strings.Contains(trimmed, `"tool"`)
+}
+
 // ParseLine decodes one log line from any of the audit sources. It is a
 // TOLERANT decode: unknown keys are ignored (the engine gains fields between
 // releases) and a line that is not an audit line at all — a non-JSON line, a
@@ -261,12 +303,23 @@ func parseToolProxy(raw map[string]json.RawMessage) (Alert, bool) {
 		Namespace:     str(raw, "namespace"),
 		Target:        strings.TrimSpace(str(raw, "method") + " " + str(raw, "path")),
 		Source:        firstNonEmpty(str(raw, "source"), SourceToolProxy),
-		Detail:        "status=" + strconv.Itoa(status),
+		Detail:        toolProxyDetail(raw, status),
 	}
 	// The tool proxy answers 403/405/400 for a refused request; any 4xx/5xx is
 	// not an allowed call.
 	al.Blocked = status >= 400
 	return al, true
+}
+
+// toolProxyDetail renders the tool proxy's correlation data: the response
+// status and the policy hash (the egress parser keeps its policy= the same way,
+// so the two sources' detail fields carry the same kind of information).
+func toolProxyDetail(raw map[string]json.RawMessage, status int) string {
+	detail := "status=" + strconv.Itoa(status)
+	if policy := str(raw, "policy"); policy != "" {
+		detail += ", policy=" + policy
+	}
+	return detail
 }
 
 // kubeArmorTime reads the alert's own clock: UpdatedTime (RFC3339Nano) when

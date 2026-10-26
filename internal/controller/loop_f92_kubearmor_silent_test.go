@@ -31,6 +31,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -118,10 +119,12 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 		name := "l1"
 		Expect(k8sClient.Create(ctx, f92Loop(ns, name))).To(Succeed())
 
-		By("reconciling: the CRD-absent shape must NOT return an error")
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		By("reconciling: the CRD-absent shape must NOT return an error, and must requeue")
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		Expect(err).NotTo(HaveOccurred(),
 			"a missing KubeArmorPolicy CRD must not abort the reconcile (F92: that left status: {})")
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0),
+			"a held Loop must be re-checked (F92 P2-2), not left waiting for an unrelated event")
 
 		By("the Loop's status must say why (the R26 I90 norm)")
 		loop := f92Get(ns, name)
@@ -206,6 +209,19 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 			}
 		}
 		Expect(events).To(HaveLen(1), "the CRD-absent shape is surfaced once, got %v", events)
+	})
+
+	It("S4: a Loop held for a missing CRD is re-checked on a bounded window, not left waiting (F92 P2-2)", func() {
+		// The Loop is otherwise idle: its spec does not change and nothing it
+		// references changes when KubeArmor is installed, so without a requeue
+		// it would stay held until an unrelated event. The trailing requeue
+		// decision carries the flag the tolerated write error set.
+		r := &LoopReconciler{}
+		Expect(r.reconcileRequeueAfter(true, false, false, false, false, time.Duration(0), time.Duration(0), true).RequeueAfter).
+			To(Equal(kaptCRDMissingRequeue))
+		// Positive control: the same call without the flag does not requeue.
+		Expect(r.reconcileRequeueAfter(true, false, false, false, false, time.Duration(0), time.Duration(0), false).RequeueAfter).
+			To(BeZero())
 	})
 
 	It("S2: every OTHER enforcement write error still returns and retries (the tolerance is exactly the CRD-absent shape)", func() {

@@ -901,7 +901,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return res, nil
 	}
 
-	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
+	kaptCRDMissing, err := r.applyEffectivePolicyAndConditions(ctx, &loop)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -912,7 +913,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// and the sandbox build reads the PVC by name, not spec, so a restored
 	// PVC is invisible to it). A completed restore is one-shot (the Restore
 	// condition True/Restored is the marker).
-	var err error
 	b2Changed, b2Requeue, b2Hold, err := r.b2ApplyRestoreStep(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -1080,7 +1080,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue), nil
+	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue, kaptCRDMissing), nil
 }
 
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
@@ -1403,6 +1403,15 @@ const PolicyEnforcedCondition = "PolicyEnforced"
 // event is emitted on the PolicyEnforced transition, so a Loop that stays held
 // does not re-announce on every reconcile.
 const PolicyEnforcementUnavailableEventReason = "PolicyEnforcementUnavailable"
+
+// kaptCRDMissingRequeue is how long a Loop held because the KubeArmorPolicy CRD
+// is missing waits before the operator re-checks (F92 P2-2). The Loop owns
+// nothing that changes when KubeArmor is installed, so without this it could
+// stay held until an unrelated event; one minute re-checks quickly without a
+// reconcile hot loop. It does not by itself make the hold clear: that needs the
+// CRD AND a node carrying the BPF-LSM label (installing only the CRD still
+// reports NodeNotEnforcing), or --allow-unenforced.
+const kaptCRDMissingRequeue = time.Minute
 
 // PolicyTranslationLossyCondition is the Loop condition that reports a lossy
 // KubeArmor translation (I41): a host:PORT network allow that loses its port
@@ -5305,10 +5314,14 @@ func priorPolicyEnforced(loop *coxv1alpha1.Loop) (metav1.ConditionStatus, string
 // applyEffectivePolicyAndConditions (C6b+I41+D30) resolves the effective
 // policy, applies it through the Enforcer, records the hash, and sets the
 // PolicyTranslationLossy and PolicyEnforced conditions.
-func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, loop *coxv1alpha1.Loop) error {
+// applyEffectivePolicyAndConditions returns kaptCRDMissing: the write path hit a
+// MISSING KubeArmorPolicy CRD and the error was tolerated (F92). The caller turns
+// that into a bounded requeue, so the Loop recovers on its own once KubeArmor is
+// installed instead of waiting for an unrelated event (F92 P2-2).
+func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	effective, err := r.effectivePolicy(ctx, loop)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// fix/watch-kubearmorpolicy (owner D55 2026-10-12): the Kapt spec-hash
 	// gate must be ORDER-INDEPENDENT (read-before-write), like the C6b and
@@ -5345,7 +5358,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			// the status is persisted by the caller. Every other error
 			// (Forbidden, an API blip) still returns and retries.
 			if !meta.IsNoMatchError(err) {
-				return err
+				return false, err
 			}
 			logf.FromContext(ctx).Info("The KubeArmorPolicy CRD is not installed; the sandbox will be held Suspended (D30 fail-closed)",
 				"loop", loop.Name)
@@ -5434,7 +5447,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)
 		}
 	}
-	return nil
+	return kaptCRDMissing, nil
 }
 
 // applyEffectivePolicyAndConditionsBestEffort is the DELETING-path variant of
@@ -5504,7 +5517,9 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context
 				msg = "engine installed, no enforcement probe yet (I32); the Loop runs only because --allow-unenforced is set (dev escape hatch)"
 			}
 		case engine.ReasonEngineUnavailable:
-			msg = "no engine (Enforcer not installed); sandbox held Suspended (D30 fail-closed)"
+			// F92: same wording as the live path — the engine is wired, the
+			// KubeArmorPolicy CRD (or the engine read) is what is missing.
+			msg = "the KubeArmorPolicy CRD is not installed (or the engine read failed); the sandbox is held Suspended (D30 fail-closed); install KubeArmor or set --allow-unenforced"
 		default:
 			msg = "engine not enforcing the Loop policy (" + rs + "); sandbox held Suspended (D30 fail-closed)"
 		}
@@ -6553,9 +6568,17 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 // reconcile can set: the 5s work requeue below, the P2d budget window, and the
 // R39 I144 memory-PVC re-announce window (the earlier window wins, so the
 // Event's re-announce is never waiting on a longer budget timer).
-func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration) ctrl.Result {
+func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration, kaptCRDMissing bool) ctrl.Result {
 	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+	// F92 P2-2: a Loop held because the KubeArmorPolicy CRD is missing is
+	// otherwise idle (its spec does not change and nothing it references
+	// changes when KubeArmor is installed), so it would stay held until some
+	// unrelated event. Requeue on a bounded window: installing KubeArmor (or
+	// restarting the operator) is then picked up within it.
+	if kaptCRDMissing {
+		return ctrl.Result{RequeueAfter: kaptCRDMissingRequeue}
 	}
 	if memoryRequeue > 0 && (budgetRequeue == 0 || memoryRequeue < budgetRequeue) {
 		return ctrl.Result{RequeueAfter: memoryRequeue}

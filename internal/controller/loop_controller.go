@@ -1292,6 +1292,11 @@ func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha
 	return r.Enforcer.Enforcing(ctx, loop)
 }
 
+// enforcementDisabledMessage is the NetworkEnforced message for the
+// --allow-unenforced-network escape hatch (D38): the Loop runs, but the fence
+// was NOT measured (shared by the probe-result and the no-prober paths).
+const enforcementDisabledMessage = "--allow-unenforced-network is set: the Loop runs but the CNI does NOT police pod -> host-network egress (dev escape hatch)"
+
 // cniNetworkStatus (D38) reports whether the cluster's CNI polices pod ->
 // host-network egress, from the cached probe result (the probe itself runs in
 // the leader-elected Runnable — internal/cni; the reconcile only reads the
@@ -1309,7 +1314,7 @@ func (r *LoopReconciler) cniNetworkStatus() (run bool, reason cni.Reason, status
 	if r.CNIProber == nil {
 		if r.AllowUnenforcedNetwork {
 			return true, cni.ReasonEnforcementDisabled, metav1.ConditionFalse,
-				"--allow-unenforced-network is set: the Loop runs but the CNI does NOT police pod -> host-network egress (dev escape hatch)"
+				enforcementDisabledMessage
 		}
 		return false, cni.ReasonProbeUnavailable, metav1.ConditionFalse, "no CNI prober wired; sandbox held Suspended (fail-closed)"
 	}
@@ -1323,7 +1328,7 @@ func (r *LoopReconciler) cniNetworkStatus() (run bool, reason cni.Reason, status
 	// condition recording EnforcementDisabled, regardless of the result.
 	if r.AllowUnenforcedNetwork && res.Reason != cni.ReasonCNIEnforced {
 		return true, cni.ReasonEnforcementDisabled, metav1.ConditionFalse,
-			"--allow-unenforced-network is set: the Loop runs but the CNI does NOT police pod -> host-network egress (dev escape hatch)"
+			enforcementDisabledMessage
 	}
 	if !res.HoldsSuspended() {
 		// CNIEnforced (True) or EnforcementDisabled (escape hatch set).
@@ -1331,7 +1336,7 @@ func (r *LoopReconciler) cniNetworkStatus() (run bool, reason cni.Reason, status
 			return true, res.Reason, metav1.ConditionTrue, res.Describe()
 		}
 		return true, cni.ReasonEnforcementDisabled, metav1.ConditionFalse,
-			"--allow-unenforced-network is set: the Loop runs but the CNI does NOT police pod -> host-network egress (dev escape hatch)"
+			enforcementDisabledMessage
 	}
 	switch res.Reason {
 	case cni.ReasonUnknown:

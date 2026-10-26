@@ -237,23 +237,6 @@ func (h *Holder) degrade(uid types.UID, health Health, reason string) {
 	h.loops[uid] = snap
 }
 
-// degradeAll degrades every Loop the relay already knows.
-func (h *Holder) degradeAll(health Health, reason string) {
-	if h == nil {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for uid, snap := range h.loops {
-		if snap.Health == HealthGap || snap.Health == HealthUnavailable {
-			continue
-		}
-		snap.Health = health
-		snap.Reason = reason
-		h.loops[uid] = snap
-	}
-}
-
 // noteUnattributed counts an alert the relay could not attribute to a Loop.
 func (h *Holder) noteUnattributed() {
 	if h == nil {

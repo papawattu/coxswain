@@ -303,6 +303,16 @@ only ones with a knob: `spec.verify.resources` (a standard
 only `limits.memory` keeps every other default. The trusted containers keep
 the operator's constants, and no Loop field moves them.
 
+Two behaviours of that knob are worth knowing before you copy a value in from
+somewhere else (F58): **lowering** a limit lowers the matching request with it
+(each name merges independently, and a request above its own limit is an invalid
+Job, so the operator lowers the request to the limit — `limits.memory: 128Mi`
+runs the check at 128Mi/128Mi), and **raising a request alone changes nothing**
+(`requests.memory: 4Gi` without a limit is lowered to the default `2Gi` limit).
+Only `requests` and `limits` are honoured: `claims` is accepted by the schema
+because the field is a whole `ResourceRequirements`, but it is **ignored** — the
+verify Job template carries no claim set, so a claim could never be satisfied.
+
 The per-check `/tmp` scratch is bounded too: each `check-tmp-<i>` emptyDir
 carries a `1Gi` `SizeLimit`. That is a constant, not part of
 `spec.verify.resources` (an ephemeral-storage *limit* only makes the kubelet

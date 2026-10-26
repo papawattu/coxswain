@@ -26,6 +26,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -217,6 +218,31 @@ func TestVerifyInfraFailureMessageCarriesTheKubeletReason(t *testing.T) {
 	}
 	if !strings.Contains(msg, "exit 137") {
 		t.Errorf("the message must still carry the exit code:\n%s", msg)
+	}
+
+	// F58 (early-322 E4): the with-limit shape a REAL pod has — buildVerifyJobSpec
+	// sets the tamper init's 1Gi memory limit, so the F58 branch fires and the
+	// message names the limit instead of falling through to the reason-only text
+	// above. Before this the tamper branch had no coverage of the limit shape: the
+	// no-limit fixture below passes only because a spec-less pod yields no limit.
+	withLimit := &corev1.Pod{
+		Spec: corev1.PodSpec{InitContainers: []corev1.Container{{
+			Name: verifyTamperInit,
+			Resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+			},
+		}}},
+		Status: pod.Status,
+	}
+	msg = verifyInfraFailureMessage(withLimit, verifyTamperInit, 137, false)
+	if !strings.Contains(msg, "verify init tamper was OOM-killed at its 1Gi memory limit") {
+		t.Errorf("the message must name the applied memory limit:\n%s", msg)
+	}
+	if !strings.Contains(msg, "exit 137") {
+		t.Errorf("the message must still carry the exit code:\n%s", msg)
+	}
+	if strings.Contains(msg, "reason OOMKilled") {
+		t.Errorf("with a limit the kubelet's reason is replaced by the limit and the remedy (E4):\n%s", msg)
 	}
 
 	// A check init that failed without a reason (the API allows it — F89) keeps

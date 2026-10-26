@@ -301,7 +301,10 @@ type VerifyConfig struct {
 	// its effective limit, the operator lowers the REQUEST to the limit (it
 	// never raises a request and never moves a limit):
 	// limits.memory: 128Mi runs the check with 128Mi/128Mi, and
-	// limits.ephemeral-storage: 512Mi with 512Mi/512Mi.
+	// limits.ephemeral-storage: 512Mi with 512Mi/512Mi. Raising a request WITHOUT
+	// raising the limit therefore changes nothing: requests.memory: 4Gi alone
+	// runs the check at the default 2Gi limit (lowered to 2Gi/2Gi), so a check
+	// that needs more room raises limits.memory.
 	//
 	// Only `requests` and `limits` are honoured. `claims` (ResourceClaim) is
 	// IGNORED: a claim is resolved through the pod's own claim set, which the

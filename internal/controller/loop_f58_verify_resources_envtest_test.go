@@ -29,10 +29,10 @@
 //  3. an OOMKilled check maps to verifyInfraFailed (an infra retry, never a
 //     blamed iterate) while exit 137 with any other reason stays an iterate.
 //
-// The shape specs (1-3) assert the Job the OPERATOR CREATED — the Loop is
+// The shape specs assert the Job the OPERATOR CREATED — the Loop is
 // driven through Reconcile to Verifying and the Job is read back — so they also
 // cover ensureVerifyJob's wiring, not only buildVerifyJobSpec. The decision
-// specs (4-8) plant the batch Job conditions and the pod's init statuses (envtest
+// specs plant the batch Job conditions and the pod's init statuses (envtest
 // has no batch Job controller or kubelet) and drive the same reconciles.
 package controller
 
@@ -403,6 +403,68 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 			Expect(f58Qty(ct.Resources.Requests, tc.resource, "check-0")).To(Equal(tc.value),
 				"the request must be lowered to the Loop's %s limit: a request above its own limit is an invalid Job", tc.resource)
 		}
+	})
+
+	It("ignores spec.verify.resources.claims: the Job template carries no claim set", func() {
+		// early-322 E3 / round-2 residual: the field is a whole
+		// ResourceRequirements, so the CRD schema accepts `claims` — but a claim is
+		// resolved through the POD's own claim set, and the verify Job template
+		// carries none, so a claim could never be satisfied. The operator copies
+		// only requests/limits. Nothing pinned that until this spec: a future
+		// "simplification" to `res = *want` would put an unsatisfiable claim on
+		// the pod and no test would fail.
+		//
+		// Mutation: copy want.Claims through in verifyCheckResources → the
+		// container assertions below fail.
+		ns := f58Ns("f58-claims")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f58claims"
+		f58NewLoop(ns, name, func(spec *coxv1alpha1.LoopSpec) {
+			spec.Verify.Resources = &corev1.ResourceRequirements{
+				Claims: []corev1.ResourceClaim{{Name: "check-scratch"}},
+			}
+		})
+		job := f58GetJob(ns, f58DriveToVerifying(f58Reconciler(nil), ns, name))
+		Expect(job).NotTo(BeNil(),
+			"a claim must not stop the Job being built: it is ignored, not propagated")
+		for _, ct := range append(append([]corev1.Container{}, job.Spec.Template.Spec.InitContainers...),
+			job.Spec.Template.Spec.Containers...) {
+			Expect(ct.Resources.Claims).To(BeEmpty(),
+				"container %s must carry no ResourceClaim: only requests/limits are honoured", ct.Name)
+		}
+		// And the claim did not disturb the defaults it sat beside.
+		f58ExpectCheckDefaults(f58Container(job.Spec.Template.Spec, "check-0"))
+	})
+
+	It("clamps a raised request to the limit instead of raising the limit to the request", func() {
+		// early-322 R1 (round 2): the clamp only ever LOWERS. A Loop that raises
+		// only requests.memory (the natural "give the check more room" edit, and
+		// the direction the field doc did not distinguish) gets it lowered to the
+		// operator's 2Gi limit — the check still dies at 2Gi and the OOM message
+		// names spec.verify.resources.limits.memory as the field to raise. Raising
+		// a request alone changes nothing; the limit is the bound the operator
+		// set, and the Loop author raises it explicitly (D21: no upward cap).
+		//
+		// Mutation: make the clamp raise the limit to the request → the 2Gi limit
+		// assertion fails.
+		ns := f58Ns("f58-raisereq")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f58raisereq"
+		f58NewLoop(ns, name, func(spec *coxv1alpha1.LoopSpec) {
+			spec.Verify.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+			}
+		})
+		job := f58GetJob(ns, f58DriveToVerifying(f58Reconciler(nil), ns, name))
+		Expect(job).NotTo(BeNil())
+		ct := f58Container(job.Spec.Template.Spec, "check-0")
+		Expect(ct).NotTo(BeNil())
+		Expect(f58Qty(ct.Resources.Limits, corev1.ResourceMemory, "check-0")).To(Equal("2Gi"),
+			"raising a request alone must not raise the limit")
+		Expect(f58Qty(ct.Resources.Requests, corev1.ResourceMemory, "check-0")).To(Equal("2Gi"),
+			"the raised request is lowered to the limit: a request above its own limit is an invalid Job")
 	})
 
 	It("bounds each check's scratch with a SizeLimit but leaves the checkout volume unbounded (the user's repo)", func() {

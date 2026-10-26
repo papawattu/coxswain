@@ -1384,6 +1384,18 @@ const (
 	// (False/Ready) once the pod is Ready, and (False/NoEndpoint) when the Loop
 	// has no model endpoint. Surfacing only: the hold itself is unchanged.
 	ModelProxyNotReadyCondition = "ModelProxyNotReady"
+	// RunnerAvailableCondition (F56) reports whether the sandbox will actually
+	// run the operator's runner. It is False/RunnerImageUnset when neither
+	// --runner-image nor spec.agent.image is set: agentPodSpec then keeps the
+	// container's `sh -c sleep infinity` stand-in, so the Loop looks Running and
+	// never advances, and before F56 nothing on the object said so (the only
+	// trace was the missing runner in the operator's flags). It is True/
+	// RunnerImageSet when the runner runs, and True/AgentImagePinned when
+	// spec.agent.image is set to some other image — that image's stand-in is the
+	// documented debugging opt-out (see the RunnerImage field), so it is not a
+	// degradation. Surfacing only: the fallback itself is unchanged, and the
+	// condition never fails the Loop.
+	RunnerAvailableCondition = "RunnerAvailable"
 	// AgentFailedCondition (F6, dogfood finding) is True while the operator
 	// is deciding what to do about a sandbox pod that FAILED without a phase
 	// claim (evicted, OOMKilled, or the agent container terminated without a

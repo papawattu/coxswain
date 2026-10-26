@@ -1397,6 +1397,13 @@ func (r *LoopReconciler) emitNetworkEnforcedEvent(loop *coxv1alpha1.Loop, status
 // eBPF engine is enforcing the Loop's policy (D30).
 const PolicyEnforcedCondition = "PolicyEnforced"
 
+// PolicyEnforcementUnavailableEventReason is the Warning Event reason for a
+// missing enforcement engine (F92): the KubeArmorPolicy CRD is not installed (or
+// the engine read failed), so the sandbox is held Suspended by the D30 gate. The
+// event is emitted on the PolicyEnforced transition, so a Loop that stays held
+// does not re-announce on every reconcile.
+const PolicyEnforcementUnavailableEventReason = "PolicyEnforcementUnavailable"
+
 // PolicyTranslationLossyCondition is the Loop condition that reports a lossy
 // KubeArmor translation (I41): a host:PORT network allow that loses its port
 // in the translation. True + reason KubeArmorDroppedPorts lists the widened
@@ -5281,6 +5288,20 @@ func (r *LoopReconciler) enforcementApply(ctx context.Context, loop *coxv1alpha1
 	return r.Enforcer.Apply(ctx, loop, effective)
 }
 
+// priorPolicyEnforced is the PolicyEnforced condition's current status and
+// reason ("" when the condition is absent). It backs the F92 transition gate:
+// the EngineUnavailable Warning Event fires when the observation CHANGES, not
+// on every reconcile of a Loop that stays held.
+func priorPolicyEnforced(loop *coxv1alpha1.Loop) (metav1.ConditionStatus, string) {
+	for i := range loop.Status.Conditions {
+		c := &loop.Status.Conditions[i]
+		if c.Type == string(PolicyEnforcedCondition) {
+			return c.Status, c.Reason
+		}
+	}
+	return "", ""
+}
+
 // applyEffectivePolicyAndConditions (C6b+I41+D30) resolves the effective
 // policy, applies it through the Enforcer, records the hash, and sets the
 // PolicyTranslationLossy and PolicyEnforced conditions.
@@ -5306,7 +5327,22 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
 	if r.Enforcer != nil {
 		if err := r.applyEnforcementWrites(ctx, loop, effective); err != nil {
-			return err
+			// F92: a MISSING KubeArmorPolicy CRD is a permanent cluster fact,
+			// not a transient write failure. Returning it here (as the code
+			// used to) aborted Reconcile at the top-level call before ANY
+			// status write: a fresh Loop kept status: {} — no phase, no
+			// condition, no Event — for ever, and the failure was visible only
+			// in the operator log (AGENTS R26 I90: a fallback must surface its
+			// failure). Tolerate exactly that shape and fall through: the
+			// condition half below records PolicyEnforced=False /
+			// EngineUnavailable, the D30 gate holds the sandbox Suspended, and
+			// the status is persisted by the caller. Every other error
+			// (Forbidden, an API blip) still returns and retries.
+			if !meta.IsNoMatchError(err) {
+				return err
+			}
+			logf.FromContext(ctx).Info("The KubeArmorPolicy CRD is not installed; the sandbox will be held Suspended (D30 fail-closed)",
+				"loop", loop.Name)
 		}
 	}
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
@@ -5325,6 +5361,10 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		// observed reason (the Enforcer's own, or EnforcementUnverified) is
 		// kept; the escape hatch, when set, is named as the reason the Loop
 		// runs despite the observation.
+		// F92: the previous observation, so the EngineUnavailable Warning Event
+		// fires on the transition only (a Loop held Suspended re-reconciles on the
+		// requeue cadence; one Event per transition, not per pass).
+		prevStatus, prevReason := priorPolicyEnforced(loop)
 		var msg string
 		switch rs {
 		case engine.ReasonEnforcementUnverified:
@@ -5340,7 +5380,11 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 				msg = "engine installed, no enforcement probe yet (I32); the Loop runs only because --allow-unenforced is set (dev escape hatch)"
 			}
 		case engine.ReasonEngineUnavailable:
-			msg = "no engine (Enforcer not installed); sandbox held Suspended (D30 fail-closed)"
+			// F92: name the real cause. "Enforcer not installed" was the wrong
+			// half: the engine IS wired, but the KubeArmorPolicy CRD (or the
+			// engine read) is not there — what a plain `make deploy` on a
+			// cluster without KubeArmor produces.
+			msg = "the KubeArmorPolicy CRD is not installed (or the engine read failed); the sandbox is held Suspended (D30 fail-closed); install KubeArmor or set --allow-unenforced"
 		default:
 			msg = "engine not enforcing the Loop policy (" + rs + "); sandbox held Suspended (D30 fail-closed)"
 		}
@@ -5355,6 +5399,17 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			status = metav1.ConditionUnknown
 		}
 		setCondition(loop, string(PolicyEnforcedCondition), status, rs, msg)
+		// F92: surface a missing engine on the OBJECT, not only in the log. A
+		// missing KubeArmorPolicy CRD without --allow-unenforced leaves the
+		// sandbox held Suspended and the Loop otherwise idle; without this Event
+		// the only trace was the operator's log (R26 I90). Gated on the
+		// transition (the previous observation differed), so a Loop that stays in
+		// this state does not re-emit on every pass.
+		if rs == engine.ReasonEngineUnavailable && (prevStatus != status || prevReason != rs) {
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, PolicyEnforcementUnavailableEventReason, "%s", msg)
+			}
+		}
 	}
 	// D38: the NetworkEnforced condition (network layer, analogous to
 	// PolicyEnforced). The escape hatch is AllowUnenforcedNetwork (separate

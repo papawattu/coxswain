@@ -879,6 +879,21 @@ hold (`PolicyEnforced` condition, `internal/controller/loop_controller.go`).
 The `NetworkEnforced=False` hold has its own section above
 (`NetworkEnforced=False` with `--allow-unenforced-network`).
 
+**The engine hold with no KubeArmorPolicy CRD (F92).** On a cluster where
+the `KubeArmorPolicy` CRD is not installed and the operator runs **without**
+`--allow-unenforced`, every Loop is held `Suspended` by the D30 gate. Before
+F92 that hold was invisible: the reconcile returned the enforcer's error
+(`get KubeArmorPolicy …: KubeArmor CRD not installed (and --allow-unenforced
+is not set)`) before any status write, so a fresh Loop carried `status: {}` —
+no phase, no condition, no Event — and the only trace was the operator log.
+Now the Loop carries `PolicyEnforced=False` with reason `EngineUnavailable`,
+the message names the missing CRD, and one Warning
+`PolicyEnforcementUnavailable` Event fires on the transition (not per
+reconcile). **What to do:** install KubeArmor so the CRD and the enforcer are
+present (the supported configuration — see `docs/QUICKSTART.md` step 3), or
+set `--allow-unenforced` if you knowingly run the development escape hatch.
+The Loop waits either way; it does not fail.
+
 **The model proxy hold (`ModelProxyNotReady`).** With
 `spec.agent.endpointSecretRef` set, the sandbox is held `Suspended` until the
 Loop's model proxy pod is Ready (`modelProxyHold` in

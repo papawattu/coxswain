@@ -429,11 +429,13 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 	// F49 (T-3): the "no pinned verifiedCommit" branch of deliveryRequested had
 	// no spec. The Loop is at Succeeded with mode PullRequest and a repo (so
-	// every OTHER guard passes), and status.currentVerify is nil: the operator
-	// must create no deliver Job and set no Delivered condition. Driven the
-	// same way as the mode spec above (Succeeded with the mode OFF, so the
-	// Succeeded reconcile cannot create the Job this spec is asserting absent),
-	// then the mode is flipped ON and the pin cleared.
+	// every OTHER guard passes), and the pin is missing: the operator must
+	// create no deliver Job and set no Delivered condition. Driven the same way
+	// as the mode spec above (Succeeded with the mode OFF, so the Succeeded
+	// reconcile cannot create the Job this spec is asserting absent), then the
+	// mode is flipped ON. Both halves of `CurrentVerify == nil ||
+	// VerifiedCommit == ""` are exercised: the nil pin first, then a non-nil
+	// currentVerify with an empty verifiedCommit (F49b).
 	It("does not deliver a Succeeded Loop that has no pinned verifiedCommit (the deliveryRequested no-pin branch)", func() {
 		ns := freshNS("s6-nopin")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -479,6 +481,25 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		present, _, _ := s6Cond(loop)
 		Expect(present).To(BeFalse(), "no Delivered condition may be set when delivery is not requested")
+
+		By("a NON-nil currentVerify with an empty verifiedCommit takes the same branch (the empty-commit half of the condition)")
+		// deliveryRequested refuses on `CurrentVerify == nil || VerifiedCommit == ""`.
+		// The block above covers the nil half only; this covers the empty-commit
+		// half, so a mutation deleting just `|| …VerifiedCommit == ""` must fail.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.CurrentVerify = &coxv1alpha1.CurrentVerifyStatus{}
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Status.CurrentVerify).NotTo(BeNil(), "precondition: the status now HAS a currentVerify")
+		Expect(loop.Status.CurrentVerify.VerifiedCommit).To(BeEmpty(), "precondition: with no pinned commit")
+		ok, why = deliveryRequested(loop)
+		Expect(ok).To(BeFalse(), "an empty verifiedCommit must refuse delivery")
+		Expect(why).To(ContainSubstring("no verifiedCommit pinned"))
+		s6Reconcile(r, ns, name)
+		s6RequireNoJob(ns, name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		present, _, _ = s6Cond(loop)
+		Expect(present).To(BeFalse(), "no Delivered condition for an empty pin either")
 	})
 
 	It("keeps the deliver Job's credential layout (creds in clone-base + push only; no agent PVC in push; hooksPath on every git call)", func() {

@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `0070686` = PR #269); each claim cites its
+merged code on `main` (as of `08307a8` = PR #306); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -216,6 +216,12 @@ existing Loops are unaffected, but new ones are.
   read) is closed by this fix.
 
 ## Other changes
+
+### F53: the verify checkout is read-only to the checks, and the verify Job has a deadline — #306
+
+- **What was wrong.** Every `check-*` container in the verify Job mounted the checked-out tree (`/verify`) writable, so one check could change what a later check saw (ADR-0005 D19 rules that out: "the 'otherwise writable' branch let agent code in check 1 rewrite `*_test.go` after the tamper check, so check 2 could compile doctored tests") (F53 a). All checks also shared one `/tmp` scratch emptyDir, so one check could poison the next check's `HOME`/`GOCACHE`/`TMPDIR`. And the verify Job was the only one of the three operator Jobs with no deadline (deliver 600s, memory writer 300s): a check that never terminates held the Loop in `Verifying` for ever with no condition, no Event and no bound (F53 b).
+- **What changed.** Each `check-*` container now mounts `/verify` read-only (the trusted init containers, including the artifact gate that writes the artifact, keep their writable mounts, and a spec asserts both directions so a later "make everything read-only" refactor fails loudly). Each check gets its own `/tmp` scratch (`check-tmp-<i>`), and check containers gain `PYTHONPYCACHEPREFIX=/tmp/pycache` (`08307a8` = PR #306, F53 a). The verify Job now runs with `activeDeadlineSeconds: 900` (15 min, a constant like the two sibling Jobs — worst case 3 × 900s before `VerifyInfraFailed`, within the existing `verifyInfraRetries = 2`); a Job stopped by its deadline is read from the Job's own terminal `DeadlineExceeded` condition and decided as a `VerifyInfraRetry` infrastructure retry even with a pod still showing a `Waiting` or `Running` step, so the Loop is never left in `Verifying` by a hung check, and after the existing retry bound it fails with `VerifyInfraFailed` naming the deadline (F53 b).
+- **On upgrade.** A check that wrote into the checkout now fails with `read-only file system`; the writable places are its own `/tmp` scratch (listed in `docs/UPGRADE.md`) (PR #306). The shipped sample Loops and task examples were updated to build into `/tmp` (e.g. `go build -o /tmp/…`), since a single-`package main` repo's `go build ./...` previously emitted its binary at the checkout root. The Python samples need no edit — their `python3 -m compileall -q .` cache is redirected to `/tmp/pycache` by the new env var; the PR notes this is reasoned, not verified on a kind run.
 
 ### F52 (runner/CLI P3s): the memory import stores what its name hashes, an unknown phase idles, and describe names its argument — #303
 

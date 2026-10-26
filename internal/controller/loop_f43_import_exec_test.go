@@ -38,14 +38,16 @@ func f43Git(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// f43Run executes the REAL generated import-agent script with only the two
-// path constants substituted (/verify -> verifyDir, file:///agent-src/.git ->
-// the agent repo).
+// f43Run executes the REAL generated import-agent script with only the path
+// constants substituted (/verify -> verifyDir, /agent-src/.git/objects -> the
+// agent repo's object store). F67 changed the import from a fetch to an
+// alternate-object-store copy, so the substituted constant is the object path
+// the script reads, not a file:// URL.
 func f43Run(t *testing.T, verifyDir, agentDir, base, pin string) (int, string) {
 	t.Helper()
 	script := importAgentScript(base, pin)
 	script = strings.ReplaceAll(script, "cd /verify", "cd "+verifyDir)
-	script = strings.ReplaceAll(script, "file:///agent-src/.git", "file://"+agentDir+"/.git")
+	script = strings.ReplaceAll(script, "/agent-src/.git/objects", agentDir+"/.git/objects")
 	cmd := exec.Command("sh", "-c", script)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out

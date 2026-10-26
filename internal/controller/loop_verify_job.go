@@ -581,18 +581,37 @@ exit 0
 // failure (any other non-zero), which stays an infra failure.
 const verifyNotDescendantExit = 97
 
-// importAgentScript builds the import-agent init's sh script. It fetches the
+// importAgentScript builds the import-agent init's sh script. It imports the
 // agent's pinned commit from the read-only workspace PVC, REFUSES a pin that is
 // not a descendant of baseCommit (F43: the pin is the runner's claim, shape-
 // checked only; the tamper diff is tree-to-tree and would accept any commit
 // reachable in the agent's repo, including pre-existing history), and checks
 // the commit out. `git merge-base --is-ancestor` exits 0 (ancestor), 1 (not),
 // anything else (error); only 1 maps to verifyNotDescendantExit.
+//
+// F67: the objects are READ out of the agent's object store, never fetched from
+// it. `git fetch file:///agent-src/.git <sha>` makes git run upload-pack as a
+// SERVER process inside a repository whose config the agent owns, and the only
+// reason that is not a code-execution hole today is a rule of the git version
+// in the image (uploadpack.packObjectsHook is honoured only from PROTECTED
+// config, git-config(5)) — while the image is operator-configurable
+// (--workspace-git-image). Object files are data: an alternate object
+// directory is a PATH (no config is read from it), so the pinned commit's
+// closure is copied into /verify's OWN store with pack-objects. The copy is
+// also what the later containers need: the alternate is an env var that dies
+// with this container, while tamper/check read /verify/.git.
 func importAgentScript(baseCommit, verifyCommit string) string {
 	return fmt.Sprintf(`
 set -e
 cd /verify
-git -c core.hooksPath=/dev/null -c protocol.file.allow=always fetch --no-tags file:///agent-src/.git %[2]s
+# F67: no fetch — read the agent's object store through an alternate and copy
+# the pinned commit's closure here; never start a server process in (or read
+# the config of) the agent's repo.
+export GIT_ALTERNATE_OBJECT_DIRECTORIES=/agent-src/.git/objects
+git -c core.hooksPath=/dev/null rev-list --objects %[2]s | cut -d' ' -f1 | git -c core.hooksPath=/dev/null pack-objects .git/objects/pack/pack
+# From here the alternate is gone: only /verify's own store is visible, which
+# is exactly what the tamper and check containers get.
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES
 if git -c core.hooksPath=/dev/null merge-base --is-ancestor %[1]s %[2]s; then
   :
 else
@@ -898,7 +917,8 @@ func init() {
 // cloneScript builds the clone-base init container script. It fetches ONLY
 // baseCommit from origin (the agent's verifiedCommit is local and never
 // pushed, so fetching it from origin would fail). The import-agent container
-// later fetches verifiedCommit from file:///agent-src/.git.
+// later imports verifiedCommit from the agent's object store without a fetch
+// (F67).
 func cloneScript(repo, baseCommit string) string {
 	return fmt.Sprintf(`
 set -e

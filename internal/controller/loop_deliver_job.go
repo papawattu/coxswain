@@ -1063,18 +1063,20 @@ echo "deliver clone-base: base ${BASE} at $(git -C "${DEST}" ` + deliverSafeDir(
 	}
 }
 
-// deliverImportAgentContainer fetches the pinned verifiedCommit from the
+// deliverImportAgentContainer imports the pinned verifiedCommit from the
 // agent's workspace PVC (read-only) into the scratch volume's EXISTING base
 // clone (the clone-base init left /deliver checked out at the base). NO
-// credential, NO network (file:// fetch), hooks disabled (core.hooksPath=
-// /dev/null — the agent's repo could carry hooks the operator must never
-// run), and the resolved commit is ASSERTED == the pinned verifiedCommit (a
-// mismatch fails the Job — D27 evidence integrity: the deliver Job pushes
-// ONLY the commit the operator verified). The fetch also imports the agent
-// commit's parent chain (base..pinned), so the push container's PR has the
-// base's objects. (The S6 first-pass script wiped + re-inited the scratch
-// .git here, leaving clone-base's checked-out files as untracked — the
-// pinned checkout aborted on them; kind run gocli-task1, 2026-10-03.)
+// credential, NO network, NO server process in the agent's repo (F67: the
+// objects are READ through an alternate object store and copied with
+// pack-objects — a fetch would run upload-pack under the agent's repo config),
+// no hooks (core.hooksPath=/dev/null), and the resolved commit is ASSERTED ==
+// the pinned verifiedCommit (a mismatch fails the Job — D27 evidence
+// integrity: the deliver Job pushes ONLY the commit the operator verified).
+// The copy brings the agent commit's parent chain (base..pinned), so the push
+// container's PR has the base's objects. (The S6 first-pass script wiped +
+// re-inited the scratch .git here, leaving clone-base's checked-out files as
+// untracked — the pinned checkout aborted on them; kind run gocli-task1,
+// 2026-10-03.)
 func (r *LoopReconciler) deliverImportAgentContainer(loop *coxv1alpha1.Loop) corev1.Container {
 	verified := loop.Status.CurrentVerify.VerifiedCommit
 	script := `#!/bin/sh
@@ -1110,17 +1112,38 @@ if [ ! -d "${DEST}/.git" ]; then
   echo "deliver import-agent: ${DEST} is not a git repo (clone-base must run first); refusing"
   exit 1
 fi
-# Fetch the pinned commit from the agent's .git over the file protocol INTO
-# the existing base clone. protocol.file.allow=always is REQUIRED (modern
-# git refuses file:// by default); core.hooksPath=/dev/null disables any
-# hook in the imported repo; GIT_TERMINAL_PROMPT=0 is belt-and-suspenders
-# (no credential, no network — a prompt would hang).
-git -c protocol.file.allow=always -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" fetch "file://${SRC}/.git" "${PINNED}"
-# Assert the fetched commit == the pinned commit (a mismatch means the
-# evidence is stale or the agent's .git moved — fail the Job, never push).
-GOT=$(git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" rev-parse "${PINNED}")
+# F67: import the pinned commit's objects WITHOUT a fetch. A git fetch
+# from file://${SRC}/.git runs upload-pack inside the agent's repo, where git
+# obeys THAT repository's config; the only thing that stops the exec-capable
+# keys today (uploadpack.packObjectsHook) is a rule of the git version in the
+# image, and the image is operator-configurable. Object files are plain data:
+# read the agent's object store through an alternate (a PATH — no config is
+# read from it) and copy the pinned commit's closure into ${DEST}'s OWN store,
+# which is also what the push container needs (it does not mount the agent
+# PVC, and the alternate does not outlive this container).
+export GIT_ALTERNATE_OBJECT_DIRECTORIES="${SRC}/.git/objects"
+if ! (
+  cd "${DEST}" &&
+  git -c core.hooksPath=/dev/null rev-list --objects "${PINNED}" \
+    | cut -d' ' -f1 \
+    | git -c core.hooksPath=/dev/null pack-objects .git/objects/pack/pack
+); then
+  echo "deliver import-agent: could not copy the pinned commit's objects out of the agent workspace; refusing"
+  exit 1
+fi
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES
+# The pinned commit must now resolve from ${DEST}'s OWN store (the alternate
+# is gone). A rev-parse --verify <sha>^{commit} — not a bare rev-parse, which
+# echoes any 40-hex string without checking the object exists, making the old
+# "fetched != pinned" comparison vacuous. A pin that is not in the agent's
+# .git, or a copy that did not land, fails the Job here: never push a tree the
+# operator did not verify (D27).
+GOT=$(git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" rev-parse --verify --quiet "${PINNED}^{commit}") || {
+  echo "deliver import-agent: pinned ${PINNED} is not in the agent workspace .git; refusing"
+  exit 1
+}
 if [ "$GOT" != "${PINNED}" ]; then
-  echo "deliver import-agent: pinned ${PINNED} != fetched ${GOT}; refusing"
+  echo "deliver import-agent: pinned ${PINNED} != imported ${GOT}; refusing"
   exit 1
 fi
 git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` -C "${DEST}" checkout -q --detach "${PINNED}"

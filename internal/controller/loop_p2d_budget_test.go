@@ -409,6 +409,12 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		// the budget RequeueAfter (min wins): seed the baseCommit on the
 		// FIRST reconcile, then read the RequeueAfter on the SECOND.
 		reconcileP2d(r, ns, "p2d-s5")
+		// R39 I144: an UNBOUND memory PVC now schedules its own re-announce
+		// window (5 minutes), which is sooner than this spec's 1740s budget
+		// window and would win the trailing requeue (the earlier window wins).
+		// Bind it so this spec reads the budget timer it is about; the memory
+		// window has its own specs.
+		bindMemoryPVC(ns, testRepoURL)
 		res := reconcileP2d(r, ns, "p2d-s5")
 
 		l := getLoopP2d(ns, "p2d-s5")

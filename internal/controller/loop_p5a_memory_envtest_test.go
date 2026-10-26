@@ -98,6 +98,19 @@ func p5aInitContainerIndex(ps *corev1.PodSpec, name string) int {
 	return -1
 }
 
+// bindMemoryPVC marks the memory PVC for repo in ns Bound. envtest has no
+// provisioner, so the operator's decision is a pure function of that phase;
+// specs that are about ANOTHER timer bind it so the memory surface adds no
+// re-announce window of its own (R39 I144: the unbound branch now schedules
+// one, 5 minutes out).
+func bindMemoryPVC(ns, repo string) {
+	name := memkeyPVCName(repo)
+	pvc := &corev1.PersistentVolumeClaim{}
+	Expect(k8sClient.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, pvc)).To(Succeed())
+	pvc.Status.Phase = corev1.ClaimBound
+	Expect(k8sClient.Status().Update(context.Background(), pvc)).To(Succeed())
+}
+
 var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 	var (
 		ctx      context.Context
@@ -283,13 +296,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 		// boundMemoryPVC sets the memory PVC's status.phase to Bound (the
 		// envtest has no provisioner; the operator's decision is a pure
 		// function of the phase).
-		boundMemoryPVC := func(ns, repo string) {
-			name := memkeyPVCName(repo)
-			pvc := &corev1.PersistentVolumeClaim{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, pvc)).To(Succeed())
-			pvc.Status.Phase = corev1.ClaimBound
-			Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
-		}
+		boundMemoryPVC := bindMemoryPVC
 
 		It("mounts the copy-in init container + memory volume when the PVC is Bound", func() {
 			loop := p5aMakeLoop("p5a-b1", nsA, repoA)

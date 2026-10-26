@@ -880,6 +880,11 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
 		s5aVerifyPod(ctx, ns, name, verifyJobName(loop), 0)
+		// R39 I144: bind the memory PVC first, so this spec's RequeueAfter
+		// assertion is about the checkpoint step. An unbound memory PVC now
+		// schedules its own re-announce window (5 minutes), which would be the
+		// only reason this pass requeued.
+		bindMemoryPVC(ns, testRepoURL)
 		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 

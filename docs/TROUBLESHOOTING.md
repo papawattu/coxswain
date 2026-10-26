@@ -780,9 +780,13 @@ Two related facts:
 
 - The per-check `/tmp` scratch is capped at `1Gi` (`SizeLimit`) and that is
   NOT part of `spec.verify.resources`. A check that writes more than `1Gi`
-  into `/tmp` — a cold `go build` cache is the usual culprit — fails on the
-  disk bound, not on memory, and the message names the eviction (the Job goes
-  `Failed`, so it lands in `VerifyInfraFailed`).
+  into `/tmp` — a cold `go build` cache is the usual culprit — hits the disk
+  bound, not the memory limit: the kubelet evicts the pod, the Job goes
+  `Failed`, and it lands in `VerifyInfraFailed`. The operator's message for
+  that case is the generic "the verify Job failed before the acceptance checks
+  ran" (the pod is gone, so there is no container status to quote); the
+  eviction reason itself is on the pod/Event in the namespace, not in the
+  Loop's condition.
 - Exit `137` with any other reason (a check that `kill -9`s itself) is still a
   failing check: the Loop iterates and the iteration is burned, exactly as
   before F58.

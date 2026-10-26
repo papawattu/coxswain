@@ -532,8 +532,26 @@ spec:
                       included): the hard disk bound is the per-check emptyDir SizeLimit, which
                       this field cannot change, so a LOWER ephemeral-storage limit only makes
                       the kubelet evict the check sooner and a higher one does not give it more
-                      room. There is no cap on the values: the Loop author owns the checks
-                      (D21), and a heavier toolchain raises them here.
+                      room. There is no cap on the values upward: the Loop author owns the
+                      checks (D21), and a heavier toolchain raises them here.
+
+                      LOWERING a limit is supported and repaired: because each name merges
+                      independently, a request could otherwise end up ABOVE its own limit (the
+                      default requests are 250m cpu / 256Mi memory / 1Gi ephemeral-storage), and
+                      a container whose request exceeds its limit is an INVALID Job — the API
+                      server rejects it and the Loop would sit in Verifying with no Event. So
+                      after the merge, for each resource name whose effective request exceeds
+                      its effective limit, the operator lowers the REQUEST to the limit (it
+                      never raises a request and never moves a limit):
+                      limits.memory: 128Mi runs the check with 128Mi/128Mi, and
+                      limits.ephemeral-storage: 512Mi with 512Mi/512Mi.
+
+                      Only `requests` and `limits` are honoured. `claims` (ResourceClaim) is
+                      IGNORED: a claim is resolved through the pod's own claim set, which the
+                      operator's Job template does not carry, so a claim could never be
+                      satisfied here — setting one has no effect rather than building an
+                      unschedulable Job. The schema accepts it because the field is a whole
+                      ResourceRequirements; the operator copies only the two maps.
 
                       The per-check /tmp emptyDir's SizeLimit (a constant, 1Gi) is NOT part of
                       this field: the emptyDir bound is what actually caps the disk a check can

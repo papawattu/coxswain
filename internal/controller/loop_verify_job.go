@@ -501,7 +501,20 @@ func verifyCheckDefaultResources() corev1.ResourceRequirements {
 // overlaid PER RESOURCE NAME (F58). A Loop that sets only limits.memory keeps
 // every other default — including the operator-owned ephemeral-storage entry,
 // which is why the overlay is a name-by-name merge and not a wholesale
-// replacement. Nothing is capped: the Loop author owns the checks (D21).
+// replacement. Nothing is capped upward: the Loop author owns the checks (D21).
+//
+// One repair runs AFTER the overlay: a request above its own limit is lowered
+// to that limit. The pair would otherwise be an INVALID Job — the API server
+// rejects a container whose request exceeds its limit
+// (`resources.requests: Invalid value: "256Mi": must be less than or equal to
+// memory limit of 128Mi`), and ensureVerifyJob's create error only requeues
+// with backoff: no Event, no condition, and the Loop sits in Verifying looking
+// stuck. The field's own doc advertises LOWERING a limit (a small check, a
+// smaller scratch), and each name is merged independently, so lowering one
+// limit would otherwise keep the operator's HIGHER default request:
+// limits.memory: 128Mi would pair with the default 256Mi request, and
+// limits.ephemeral-storage: 512Mi with the default 1Gi request. The clamp only
+// ever lowers (never raises a request, never moves a limit).
 func verifyCheckResources(loop *coxv1alpha1.Loop) corev1.ResourceRequirements {
 	res := verifyCheckDefaultResources()
 	if want := loop.Spec.Verify.Resources; want != nil {
@@ -511,6 +524,14 @@ func verifyCheckResources(loop *coxv1alpha1.Loop) corev1.ResourceRequirements {
 		for name, q := range want.Limits {
 			res.Limits[name] = q
 		}
+	}
+	for name, limit := range res.Limits {
+		req, ok := res.Requests[name]
+		if !ok || req.Cmp(limit) <= 0 {
+			continue
+		}
+		q := limit.DeepCopy()
+		res.Requests[name] = q
 	}
 	return res
 }

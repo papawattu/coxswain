@@ -357,6 +357,46 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 		f58ExpectCheckDefaults(f58Container(defJob.Spec.Template.Spec, "check-0"))
 	})
 
+	It("lowers a request that the Loop's own lower limit would leave above it, so the Job is never invalid", func() {
+		// The foot-gun (E2): each name merges independently, so LOWERING one limit
+		// kept the operator's HIGHER default request (256Mi memory, 1Gi
+		// ephemeral-storage) and built a container with request > limit. The API
+		// server rejects that at Job create and ensureVerifyJob's error only
+		// requeues: no Event, no condition, the Loop sits in Verifying looking
+		// stuck. The operator now lowers the request to the limit.
+		//
+		// Mutation: delete the clamp loop in verifyCheckResources → the two
+		// assertions below fail (request back at the default, above the limit).
+		cases := []struct {
+			name     string
+			resource corev1.ResourceName
+			value    string
+		}{
+			{"memory", corev1.ResourceMemory, "128Mi"},
+			// The field doc advertises a lower ephemeral-storage limit, so it is
+			// the case a user is most likely to type.
+			{"ephemeralstorage", corev1.ResourceEphemeralStorage, "512Mi"},
+		}
+		for _, tc := range cases {
+			ns := f58Ns("f58-clamp-" + tc.name)
+			defer func(n string) { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: n}}) }(ns)
+			name := "f58clamp" + tc.name
+			limit := resource.MustParse(tc.value)
+			f58NewLoop(ns, name, func(spec *coxv1alpha1.LoopSpec) {
+				spec.Verify.Resources = &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{tc.resource: limit},
+				}
+			})
+			job := f58GetJob(ns, f58DriveToVerifying(f58Reconciler(nil), ns, name))
+			Expect(job).NotTo(BeNil(), "the Job must be CREATED for a lowered %s limit, not rejected by the API server", tc.resource)
+			ct := f58Container(job.Spec.Template.Spec, "check-0")
+			Expect(ct).NotTo(BeNil())
+			Expect(f58Qty(ct.Resources.Limits, tc.resource, "check-0")).To(Equal(tc.value))
+			Expect(f58Qty(ct.Resources.Requests, tc.resource, "check-0")).To(Equal(tc.value),
+				"the request must be lowered to the Loop's %s limit: a request above its own limit is an invalid Job", tc.resource)
+		}
+	})
+
 	It("bounds each check's scratch with a SizeLimit but leaves the checkout volume unbounded (the user's repo)", func() {
 		ns := f58Ns("f58-scratch")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -433,8 +473,8 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 
 		events := f58Events(recorder)
 		Expect(events).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
-		Expect(events).To(ContainElement(ContainSubstring(tamperOOMKilledReason)),
-			"the Event must say the check was OOM-killed, not that check-0 failed")
+		Expect(events).To(ContainElement(ContainSubstring("OOM-killed")),
+			"the Event must say the check was OOM-killed, not that check-0 failed (the message says 'OOM-killed' — the kubelet's Terminated.Reason 'OOMKilled' is not in the user-facing text)")
 		Expect(events).To(ContainElement(ContainSubstring("256Mi")),
 			"the Event must name the memory limit the kubelet enforced")
 		Expect(events).To(ContainElement(ContainSubstring("spec.verify.resources.limits.memory")),

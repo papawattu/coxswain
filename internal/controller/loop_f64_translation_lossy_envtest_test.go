@@ -32,6 +32,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -155,8 +156,10 @@ var _ = Describe("F64: PolicyTranslationLossy tracks the carrier, not the transl
 		c := translationLossyCondition(f64GetLoop(ns, "f64-noproxy").Status.Conditions)
 		Expect(c).NotTo(BeNil(), "the condition must be set on the first pass")
 		Expect(c.Status).To(Equal(metav1.ConditionTrue),
-			"the egress proxy pod exists but is not Ready, so nothing carries the port")
+			"nothing carries the port on the pass that creates the egress proxy")
 		Expect(c.Reason).To(Equal("KubeArmorDroppedPorts"))
+		Expect(c.Message).To(ContainSubstring("the egress proxy pod is not owned by the Loop and Ready"),
+			"the message must name the layer that is missing (the transient cause)")
 		Expect(c.Message).To(ContainSubstring(f64Allow))
 	})
 
@@ -202,6 +205,8 @@ var _ = Describe("F64: PolicyTranslationLossy tracks the carrier, not the transl
 		Expect(after.Reason).To(Equal("NoPortLoss"))
 		Expect(after.Message).NotTo(ContainSubstring(f64Allow),
 			"the cleared message must not still name the allow as unpinned")
+		Expect(after.Message).NotTo(ContainSubstring("nothing carries the port"),
+			"the cleared message must not carry the unpinned description either")
 		Expect(after.LastTransitionTime.Equal(&before.LastTransitionTime)).To(BeFalse(),
 			"I43: a True->False transition must move LastTransitionTime")
 		Expect(after.LastTransitionTime.After(before.LastTransitionTime.Time)).To(BeTrue(),
@@ -224,6 +229,10 @@ var _ = Describe("F64: PolicyTranslationLossy tracks the carrier, not the transl
 		Expect(ext.Status).To(Equal(metav1.ConditionTrue),
 			"an external model endpoint's port is carried by nothing")
 		Expect(ext.Reason).To(Equal("KubeArmorDroppedPorts"))
+		Expect(ext.Message).To(ContainSubstring("the model proxy's NetworkPolicy cannot express this endpoint"),
+			"the message must name the config shape, not the transient proxy cause")
+		Expect(ext.Message).NotTo(ContainSubstring("egress proxy pod is not owned"),
+			"an inexpressible endpoint is not a pending proxy")
 		Expect(ext.Message).To(ContainSubstring(f64ExternalEndpoint))
 
 		// An in-cluster Service endpoint: the model proxy's NetworkPolicy pins
@@ -265,50 +274,61 @@ func TestTranslationLossyAllows(t *testing.T) {
 		// underProxy is what sits under the egress proxy pod's name: "" (no pod),
 		// "notready", "ready" (owned by the Loop) or "foreign".
 		underProxy string
-		want       []string
+		// wantProxy / wantEndpoint are the two causes the helper splits its answer
+		// into (F4): a transient pending proxy and an endpoint no rule can express.
+		wantProxy    []string
+		wantEndpoint []string
 	}{
 		{
 			name:    "bare host allow: nothing to lose",
 			network: []string{"pypi.org"},
-			want:    nil,
 		},
 		{
-			name:    "host:PORT allow, no egress proxy pod yet: lossy",
-			network: []string{f64Allow},
-			want:    []string{f64Allow},
+			name:      "host:PORT allow, no egress proxy pod yet: lossy",
+			network:   []string{f64Allow},
+			wantProxy: []string{f64Allow},
 		},
 		{
 			name:       "host:PORT allow, egress proxy owned but not Ready: lossy",
 			network:    []string{f64Allow},
 			underProxy: "notready",
-			want:       []string{f64Allow},
+			wantProxy:  []string{f64Allow},
 		},
 		{
 			name:       "host:PORT allow, foreign Ready pod: lossy (not a carrier)",
 			network:    []string{f64Allow},
 			underProxy: "foreign",
-			want:       []string{f64Allow},
+			wantProxy:  []string{f64Allow},
 		},
 		{
 			name:       "host:PORT allow, egress proxy owned and Ready: carried",
 			network:    []string{f64Allow},
 			underProxy: "ready",
-			want:       nil,
 		},
 		{
-			name:     "external model endpoint with a port: lossy",
-			endpoint: f64ExternalEndpoint,
-			want:     []string{f64ExternalEndpoint},
+			name:         "external model endpoint with a port: lossy",
+			endpoint:     f64ExternalEndpoint,
+			wantEndpoint: []string{f64ExternalEndpoint},
+		},
+		{
+			// F6: the composed case — a Ready carrier for the allow AND an endpoint no
+			// rule can express. Both causes are computed, only the endpoint is lossy.
+			name:         "ready proxy carries the allow, an inexpressible endpoint does not: only the endpoint",
+			network:      []string{f64Allow},
+			endpoint:     f64ExternalEndpoint,
+			underProxy:   "ready",
+			wantEndpoint: []string{f64ExternalEndpoint},
 		},
 		{
 			name:     "in-cluster model endpoint: the NetworkPolicy pins host and port",
 			endpoint: f64InClusterEndpoint,
-			want:     nil,
 		},
 		{
-			name:     "model endpoint without a port: nothing to lose",
+			// Defensive only (F8): the CRD's pattern + CEL rule require a port, so a
+			// Loop that reached the API server always has one; the empty-endpoint half
+			// (ep == "") is the reachable shape.
+			name:     "model endpoint without a port: nothing to lose (defensive; the CRD requires a port)",
 			endpoint: "api.example.com",
-			want:     nil,
 		},
 	}
 
@@ -343,14 +363,12 @@ func TestTranslationLossyAllows(t *testing.T) {
 			if err != nil {
 				t.Fatalf("resolve effective policy: %v", err)
 			}
-			got := r.translationLossyAllows(ctx, loop, effective)
-			if len(got) != len(tc.want) {
-				t.Fatalf("translationLossyAllows() = %v, want %v", got, tc.want)
+			got := r.translationLossAllows(ctx, loop, effective)
+			if !slices.Equal(got.ProxyPending, tc.wantProxy) {
+				t.Fatalf("translationLossAllows().ProxyPending = %v, want %v", got.ProxyPending, tc.wantProxy)
 			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("translationLossyAllows() = %v, want %v", got, tc.want)
-				}
+			if !slices.Equal(got.EndpointUnpinned, tc.wantEndpoint) {
+				t.Fatalf("translationLossAllows().EndpointUnpinned = %v, want %v", got.EndpointUnpinned, tc.wantEndpoint)
 			}
 		})
 	}

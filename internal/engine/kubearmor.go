@@ -269,7 +269,7 @@ func toProtocolItems(protocols []string) []any {
 // PolicyTranslationLossy from it only when no other layer carries the port
 // (the egress proxy for the agent's network allows, the model proxy's
 // NetworkPolicy for the model endpoint — see the controller's
-// translationLossyAllows).
+// translationLossAllows).
 //
 // Special formats:
 //   - "dns/udp+tcp" (the platform-minimum DNS allow): produces protocols

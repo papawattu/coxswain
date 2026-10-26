@@ -247,14 +247,17 @@ else
     fail=1
   fi
 fi
-# ... and it must be audited as blocked for that exact host:port, for the
-# port reason (not-allowed), not some later dial failure.
+# ... and it must be audited as blocked for that exact host:port, for the port
+# reason (not-allowed), not some later dial failure. ONE expression spanning both
+# fields of the SAME record (F3): two independent greps over the whole log would
+# both be satisfied by step [3]'s already-present blocked record. AuditRecord
+# marshals target before detail (internal/egress/audit.go), so [^}]* keeps the
+# match inside one record.
 OTHER_AUDIT=$($KUBECTL -n "$NAMESPACE" logs egress-proxy-e2e 2>/dev/null || true)
-if echo "$OTHER_AUDIT" | grep -q "\"target\":\"${ALLOW_NAME}:${OTHER_PORT}\"" &&
-   echo "$OTHER_AUDIT" | grep -q 'reason=not-allowed'; then
+if echo "$OTHER_AUDIT" | grep -qE "\"target\":\"${ALLOW_NAME}:${OTHER_PORT}\"[^}]*reason=not-allowed"; then
   echo "     OK: audit log has a blocked record for ${ALLOW_NAME}:${OTHER_PORT} (reason=not-allowed)"
 else
-  echo "     FAIL: no blocked audit record for ${ALLOW_NAME}:${OTHER_PORT}"
+  echo "     FAIL: no blocked audit record whose own target is ${ALLOW_NAME}:${OTHER_PORT} with reason=not-allowed"
   echo "$OTHER_AUDIT" | tail -20
   fail=1
 fi

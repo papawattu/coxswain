@@ -698,7 +698,12 @@ not zero.
     host (`modelPeer` can express those), so for every endpoint shape this CRD
     documents as in-cluster the port IS carried and the condition stays `False`;
     a host no NetworkPolicy rule can express (an external FQDN) gets no egress
-    rule at all, and then the KubeArmor hostname-only allow is reported.
+    rule at all, and then the KubeArmor hostname-only allow is reported. The
+    `False` claim is only as good as the agent NetworkPolicy fence: if that
+    netpol is deleted out of band while the sandbox runs, the widened allow is
+    live while this condition still says `False` — that window is the
+    `AgentNetworkPolicyReady`/agent-netpol-absent hold's job, not this
+    condition's.
 - **`NetworkAllowsNotEnforced` condition (D34, I42):** it was only proposed
   in D34's design comment, never implemented. With I42 resolved by the
   egress proxy it is dropped: the I42 slice adds nothing named

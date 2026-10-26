@@ -541,8 +541,10 @@ to see whether a foreign object is in the way.
 ### `PolicyTranslationLossy=True` (a `host:PORT` allow nothing pins)
 
 **What you see:** the condition is `True` with reason `KubeArmorDroppedPorts`,
-and its message lists the allows whose port is not carried — either an
-`AgentPolicy` `spec.network` allow or the Loop's `spec.agent.modelEndpoint`.
+and its message names which cause applies and lists the allows whose port is not
+carried — either an `AgentPolicy` `spec.network` allow (the egress proxy pod is
+not owned by the Loop and Ready yet) or the Loop's `spec.agent.modelEndpoint`
+(no NetworkPolicy rule can express that host).
 
 **What it means:** KubeArmor matches egress by DNS query name + protocol
 **name** (`tcp`/`udp`, not `tcp:443`), so a `host:443` allow becomes "host" +

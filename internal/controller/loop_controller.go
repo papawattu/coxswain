@@ -2296,8 +2296,10 @@ func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1
 	// F55 (1): the agent netpol routes the workspace-init clone of an external
 	// repo through the egress proxy even with no network allows (F42), and
 	// ensureEgressProxy creates the proxy for that shape, so the gate must wait
-	// for it too or the first clone gets connection refused.
-	if needsEgressProxy(ctx, r, loop) || r.workspaceInitProxyCreated(loop) {
+	// for it too or the first clone gets connection refused. F70: only when a
+	// clone will actually run — a completed fork's workspace already carries
+	// the init marker (see egressProxyGateApplies).
+	if r.egressProxyGateApplies(ctx, loop) {
 		egPod := &corev1.Pod{}
 		errE := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod)
 		if errE != nil || !metav1.IsControlledBy(egPod, loop) || !isPodReady(egPod) {
@@ -3505,6 +3507,32 @@ func (r *LoopReconciler) workspaceInitProxyHost(loop *coxv1alpha1.Loop) string {
 		return fmt.Sprintf("%s:%d", host, port)
 	}
 	return host
+}
+
+// egressProxyGateApplies reports whether the sandbox must wait for the egress
+// proxy pod: the effective policy has network allows (needsEgressProxy), or
+// ensureEgressProxy creates the proxy for the workspace-init clone.
+//
+// F70: the workspace-init term is scoped to a clone that will RUN. A restore
+// completed for the Loop's current spec target leaves the workspace carrying
+// the init marker (a fork's PVC comes from the source's snapshot, so
+// /workspace/.coxswain/base-commit is already there and the init script prints
+// "workspace already initialised" and exits 0 before any clone). Waiting for
+// the proxy in that shape waits for a clone that never happens: on an install
+// where the proxy cannot come up (the F56 empty --egress-proxy-image, or a
+// broken registry) the fork was held Suspended for ever with no condition
+// naming it. The verify/deliver clone-base still traverses the proxy for an
+// external repo, so the proxy (and its pod) is still created for a fork; this
+// changes only whether the SANDBOX waits for it. The term is the F35
+// target-keyed marker, so an unrelated spec edit cannot re-arm the wait.
+func (r *LoopReconciler) egressProxyGateApplies(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if needsEgressProxy(ctx, r, loop) {
+		return true
+	}
+	if !r.workspaceInitProxyCreated(loop) {
+		return false
+	}
+	return !restoreCompletedForSpec(loop)
 }
 
 // workspaceInitProxyCreated reports whether ensureEgressProxy adds the

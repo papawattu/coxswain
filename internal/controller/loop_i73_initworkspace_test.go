@@ -106,7 +106,7 @@ var _ = Describe("I73: init-workspace survives an interrupted first run (executi
 		scheme := runtime.NewScheme()
 		_ = coxv1alpha1.AddToScheme(scheme)
 		_ = loop
-		c := (&LoopReconciler{Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
+		c := (&LoopReconciler{CNIProber: testCNIProber(), Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
 		// c.Command == [verifySh, "-c", script].
 		if len(c.Command) < 3 || c.Command[1] != "-c" {
 			GinkgoT().FailNow()

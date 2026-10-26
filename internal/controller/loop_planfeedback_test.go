@@ -71,7 +71,7 @@ func b3LoopWithRejectedCondition(reason string) *coxv1alpha1.Loop {
 // The reason is read from the DURABLE status.approval.lastRejectionReason (the
 // B3 Replan requirement — it survives the PlanRejected clear).
 func TestPhaseInitScriptWritesRejectionReason(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	loop := b3LoopWithDurableRejection(b3ReplanReason)
 	planHash, planFeedback := r.planApprovalFiles(loop)
 	// The operator's decision: the feedback file carries the full rejection
@@ -118,7 +118,7 @@ func TestPhaseInitScriptWritesRejectionReason(t *testing.T) {
 // container REMOVES .coxswain/plan-feedback (a stale file from a prior run
 // must not leak into the next plan).
 func TestPhaseInitScriptRemovesFeedbackWhenNoRejection(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	loop := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: "b3", Namespace: "b3"},
 		Spec:       coxv1alpha1.LoopSpec{Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual}},
@@ -138,7 +138,7 @@ func TestPhaseInitScriptRemovesFeedbackWhenNoRejection(t *testing.T) {
 // write the feedback file (the runner only reads it in Planning; a stale file
 // must not leak into a non-Planning phase).
 func TestPhaseInitScriptNoFeedbackWhenNotPlanning(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	loop := b3LoopWithRejectedCondition(b3ReplanReason)
 	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
 	_, planFeedback := r.planApprovalFiles(loop)

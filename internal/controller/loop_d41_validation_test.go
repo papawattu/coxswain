@@ -62,7 +62,7 @@ var _ = Describe("D41b: AgentPolicy.spec.tools[] validation", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:      k8sClient,
 			Scheme:      k8sClient.Scheme(),
 			PodCIDR:     d41PodCIDR,
@@ -341,7 +341,7 @@ var _ = Describe("D41b: controller-side findInClusterToolUpstream", func() {
 	var r *LoopReconciler
 
 	BeforeEach(func() {
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:      k8sClient,
 			Scheme:      k8sClient.Scheme(),
 			PodCIDR:     d41PodCIDR,
@@ -413,7 +413,7 @@ var _ = Describe("D41b: controller-side findInClusterToolUpstream", func() {
 	})
 
 	It("skips the operator-CIDR case when the reconciler has no CIDRs configured", func() {
-		rNoCIDR := &LoopReconciler{
+		rNoCIDR := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			// PodCIDR / ServiceCIDR are empty.
@@ -428,14 +428,14 @@ var _ = Describe("D41b: controller-side findInClusterToolUpstream", func() {
 			"with no operator CIDRs configured, an IP outside the standard ranges is not flagged by the operator-CIDR case")
 
 		// ...and it IS flagged once the operator carves out that range.
-		rWithCIDR := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), PodCIDR: "203.0.113.0/24"}
+		rWithCIDR := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), PodCIDR: "203.0.113.0/24"}
 		_, ok = rWithCIDR.findInClusterToolUpstream(tools)
 		Expect(ok).To(BeTrue(),
 			"with the operator's pod CIDR configured, an IP in that CIDR is flagged")
 	})
 
 	It("still catches standard-range IPs even with no operator CIDRs (fail-closed)", func() {
-		rNoCIDR := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		rNoCIDR := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		tools := []coxv1alpha1.ToolSpec{
 			{Name: "t1", Upstream: "http://10.244.0.5:8080", Rules: []coxv1alpha1.ToolRule{{Methods: []string{httpMethodGet}}}},
 		}

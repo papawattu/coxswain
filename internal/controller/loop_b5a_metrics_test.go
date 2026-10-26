@@ -143,7 +143,7 @@ func TestMetricsPhaseTransitionBumpedOnNewPhase(t *testing.T) {
 	loopPhaseTransitionsTotal.Reset()
 	_, _ = readMetric(t, "coxswain_loop_phase_transitions_total") // re-materialise
 
-	r := &LoopReconciler{Recorder: record.NewFakeRecorder(64)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Recorder: record.NewFakeRecorder(64)}
 	now := metav1.Now()
 
 	// A Loop currently in Planning. A claim reporting it just executed
@@ -187,7 +187,7 @@ func TestMetricsStallFires(t *testing.T) {
 		map[string]string{"result": "failed", "reason": "stalled"}) // re-materialise
 
 	_, h := normalizeCheckOutput(p2eStallSeamOutput)
-	r := &LoopReconciler{readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
+	r := &LoopReconciler{CNIProber: testCNIProber(), readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
 	terminatedState := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 		ExitCode:   1,
 		FinishedAt: metav1.Now(),
@@ -264,7 +264,7 @@ func TestMetricsTokenTotalBumpedOnFold(t *testing.T) {
 	loopTokensTotal.Reset()
 	_, _ = readMetric(t, "coxswain_loop_tokens_total") // re-materialise after Reset
 
-	r := &LoopReconciler{Recorder: record.NewFakeRecorder(64)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Recorder: record.NewFakeRecorder(64)}
 	// A Loop with a budget status seeded with a prior reading (boot A,
 	// cumulative prompt 5 / completion 4). A new reading on the SAME boot
 	// with prompt 11 / completion 5 is a delta of (6, 1) — no drop.

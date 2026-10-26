@@ -77,7 +77,7 @@ const (
 )
 
 func newD41cReconciler() *LoopReconciler {
-	return &LoopReconciler{
+	return &LoopReconciler{CNIProber: testCNIProber(),
 		Client:         k8sClient,
 		Scheme:         k8sClient.Scheme(),
 		PodCIDR:        d41cPodCIDR,
@@ -818,7 +818,7 @@ var _ = Describe("D41 tool proxy image", func() {
 		// unset; a real tool proxy image (rule engine, credential injection,
 		// audit) is settable via the reconciler's ToolProxyImage field / the
 		// manager's --tool-proxy-image flag (D41c).
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		Expect(r.toolProxyImage()).To(Equal("coxswain-tool-proxy:standin"))
 	})
 
@@ -826,7 +826,7 @@ var _ = Describe("D41 tool proxy image", func() {
 		// A DISTINCT value from the default (coxswain-tool-proxy:standin) so
 		// the spec actually proves the override is honoured (not just that the
 		// default is returned regardless of the field).
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), ToolProxyImage: "example.invalid/tool-proxy:override"}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), ToolProxyImage: "example.invalid/tool-proxy:override"}
 		Expect(r.toolProxyImage()).To(Equal("example.invalid/tool-proxy:override"))
 	})
 })

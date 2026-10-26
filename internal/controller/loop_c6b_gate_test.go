@@ -88,7 +88,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("holds the sandbox Suspended + PolicyEnforced=False when a declared policy is not enforced", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(),
 			Enforcer: &fakeEnforcer{enforcing: false, reason: engine.ReasonNodeNotEnforcing}}
 
 		ns := "c6b-notenforced"
@@ -114,7 +114,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("runs the sandbox + PolicyEnforced=True when the engine is enforcing the declared policy", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: &fakeEnforcer{enforcing: true}}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: &fakeEnforcer{enforcing: true}}
 
 		ns := "c6b-enforced"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
@@ -136,7 +136,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("gates a no-policyRefs Loop too (P1 #1: the gate applies to EVERY Loop)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()} // no Enforcer
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()} // no Enforcer
 
 		ns := "c6b-nogate"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
@@ -162,7 +162,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 	It("applies the effective policy via Enforcer.Apply and labels the pod (P1 #2)", func() {
 		ctx = context.Background()
 		rec := &recordingEnforcer{}
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: rec}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: rec}
 
 		ns := "c6b-apply"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
@@ -186,7 +186,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("owner-refs the KubeArmorPolicy to the Loop (P2)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN}, AllowUnenforced: true}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN}, AllowUnenforced: true}
 		ns := "c6b-ownerref"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -209,7 +209,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("reports Unknown/EnforcementUnverified when the Enforcer is nil and AllowUnenforced is set (I46)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), AllowUnenforced: true} // no Enforcer
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), AllowUnenforced: true} // no Enforcer
 		ns := "c6b-unenforced"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -245,7 +245,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 		// Without the flag: held Suspended (fail-closed unchanged), Unknown condition.
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: enf} // no AllowUnenforced
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: enf} // no AllowUnenforced
 		ns := "c6b-unverified-noflag"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -265,7 +265,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 		// With the flag: runs, same Unknown condition (the flag is named in the message).
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: enf, AllowUnenforced: true}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), Enforcer: enf, AllowUnenforced: true}
 		ns = "c6b-unverified-flag"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -287,7 +287,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("reports False/NodeNotEnforcing (the Enforcer's own reason) when the Enforcer says not-enforcing and AllowUnenforced is set (I46)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(),
 			Enforcer:        &fakeEnforcer{enforcing: false, reason: engine.ReasonNodeNotEnforcing},
 			AllowUnenforced: true}
 		ns := "c6b-notenforced-allow"
@@ -317,7 +317,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("sets PolicyTranslationLossy=True when a host:PORT network allow loses its port (I41)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		ns := "c6b-lossy"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -348,7 +348,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 
 	It("sets PolicyTranslationLossy=False when all network allows are bare hosts (I41)", func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		ns := "c6b-notlossy"
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

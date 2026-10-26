@@ -75,7 +75,7 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		i65ansDrive(r, ns, name)
 		s5aReconcile(r, ns, name) // the verify Job is created (the pin exists)
 		jobName := name + "-verify-1"
@@ -176,7 +176,7 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 		})).To(Succeed())
 
 		recorder := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		i65ansDrive(r, ns, name)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"
@@ -246,7 +246,7 @@ var _ = Describe("I65: the verify Job's pod is matched to the current Job's UID 
 		})).To(Succeed())
 
 		recorder := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		i65ansDrive(r, ns, name)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"
@@ -427,7 +427,7 @@ var _ = Describe("REVIEWER: a transient Job delete failure must not wedge the in
 		name := "rvwedge"
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: s5aLoopSpec()})).To(Succeed())
 		fc := &failJobDeleteOnce{Client: k8sClient}
-		r := &LoopReconciler{Client: fc, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: fc, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
 		i65ansDrive(r, ns, name)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"

@@ -177,7 +177,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 	// reader (apiReader = the plain client — a real, non-cached Get) and the
 	// OS5 FakeRecorder (the specs assert the PhaseAdvanced Event).
 	s4Reconciler := func(recorder *record.FakeRecorder) *LoopReconciler {
-		return &LoopReconciler{
+		return &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
@@ -1019,7 +1019,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		conflictClient := &conflictOnceClient{inner: k8sClient, left: 0}
 
 		recorder := record.NewFakeRecorder(64)
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    conflictClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,

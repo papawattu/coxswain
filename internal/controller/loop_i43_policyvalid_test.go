@@ -64,7 +64,7 @@ var _ = Describe("I43: PolicyValid same-Loop flip", func() {
 		// The real KubeArmor enforcer + AllowUnenforced so the D30 gate passes
 		// (the envtest Enforcer never reports enforcing) and the sandbox can
 		// reach Running on a clean pass.
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN},

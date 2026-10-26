@@ -54,7 +54,7 @@ func TestF42AgentNetPolExistsWithoutEndpoint(t *testing.T) {
 	scheme := newI42cForeignNPScheme(t)
 	loop := f42Loop("f42-noendpoint")
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
-	r := &LoopReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
 
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		t.Fatalf("ensureNetPoliciesIfConfigured: %v", err)
@@ -98,7 +98,7 @@ func TestF42ModelProxyRuleExistsWithEndpoint(t *testing.T) {
 	loop := f42Loop("f42-endpoint")
 	loop.Spec.Agent.EndpointSecretRef = "model-creds"
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
-	r := &LoopReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestF42NetPolFailureConditionIsPersisted(t *testing.T) {
 				return cl.Create(ctx, obj, opts...)
 			},
 		}).Build()
-	r := &LoopReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}
 
 	changed, err := r.ensureProxyAndNetPolicies(ctx, loop)
 	if err == nil || !changed {
@@ -154,7 +154,7 @@ func TestF42AbsentAgentNetPolHoldsSandboxSuspended(t *testing.T) {
 	scheme := newI42cForeignNPScheme(t)
 	loop := f42Loop("f42-gate")
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
-	r := &LoopReconciler{Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
 
 	if !r.sandboxSuspendedByGate(ctx, loop) {
 		t.Fatal("an absent agent netpol must hold the sandbox Suspended")
@@ -183,7 +183,7 @@ func TestF42NetPolCreateFailureIsSurfaced(t *testing.T) {
 			},
 		}).Build()
 	rec := record.NewFakeRecorder(10)
-	r := &LoopReconciler{Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: rec}
 
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err == nil {
 		t.Fatal("the create failure must be returned")

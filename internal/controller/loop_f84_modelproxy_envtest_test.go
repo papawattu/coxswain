@@ -84,7 +84,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		return r, loop
 	}
 
@@ -295,7 +295,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		Expect(r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})).Error().NotTo(HaveOccurred())
 
 		// The durable record at the moment of the delete: a terminal Loop with
@@ -355,7 +355,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 				return apierrors.NewInternalError(errors.New("boom-read-failure"))
 			},
 		}).Build()
-		r := &LoopReconciler{Client: c, Scheme: k8sClient.Scheme(), Recorder: rec}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: k8sClient.Scheme(), Recorder: rec}
 
 		Expect(r.modelProxyHold(ctx, loop)).To(BeTrue(), "an unreadable proxy pod is the same fail-closed hold")
 		cond := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)

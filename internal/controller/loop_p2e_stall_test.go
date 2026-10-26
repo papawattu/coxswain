@@ -226,7 +226,7 @@ func TestResolveStallAfterConfigMap(t *testing.T) {
 func TestApplyStallGateDecidesOnTerminalFailure(t *testing.T) {
 	// The check output's normalised hash (the seam returns "out").
 	_, h := normalizeCheckOutput(p2eStallSeamOutput)
-	r := &LoopReconciler{readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
+	r := &LoopReconciler{CNIProber: testCNIProber(), readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
 	terminatedState := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 		ExitCode:   1,
 		FinishedAt: metav1.Now(),
@@ -327,7 +327,7 @@ func TestApplyStallGateContinueLeavesPhaseUnchanged(t *testing.T) {
 	n := int32(2) // threshold: a new Job after one identical entry fires
 	// The check output's normalised hash (the seam returns "out").
 	_, h := normalizeCheckOutput(p2eStallSeamOutput)
-	r := &LoopReconciler{readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
+	r := &LoopReconciler{CNIProber: testCNIProber(), readCheckOutput: func(*corev1.Pod, string) (string, bool) { return p2eStallSeamOutput, true }}
 
 	terminatedState := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 		ExitCode:   1,
@@ -404,7 +404,7 @@ func TestApplyStallGateContinueLeavesPhaseUnchanged(t *testing.T) {
 //	    evidence, NOT inert (the P2h finding: the old ("", false) made a
 //	    silently-failing check un-stallable, so stallHistory stayed null).
 func TestDefaultReadCheckOutput(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	const check = "check-0"
 
 	// (a) the production path: a non-restarted check that just terminated.

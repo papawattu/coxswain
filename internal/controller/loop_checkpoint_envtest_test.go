@@ -117,7 +117,7 @@ func b1Reconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 // the driver seam resolves b1Driver). withoutCRD overrides
 // snapshotCRDPresent to false (the no-CRD branch).
 func b1NewReconciler(withSupport, withoutCRD bool) *LoopReconciler {
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	if withoutCRD {
 		r.snapshotCRDPresent = func(context.Context) bool { return false }
 	}
@@ -916,7 +916,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 				return cl.Get(ctx, key, obj, opts...)
 			},
 		}).Build()
-		r := &LoopReconciler{Client: c, Scheme: k8sClient.Scheme(), apiReader: c}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: k8sClient.Scheme(), apiReader: c}
 
 		kept, dropped, suppress, unknown := r.checkpointEntriesForCreate(ctx, loop, 0)
 		Expect(dropped).To(BeFalse(), "a failed read must not drop the entry")
@@ -1619,7 +1619,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 			Spec:       b1LoopSpec(),
 		})).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return "unmatched.csi.k8s.io", true } // known driver, no matching VSC
 		b1DriveToSucceeded(ctx, r, ns, name)
 		b1Reconcile(r, ns, name) // the reconcile that records the successful verify + takes the checkpoint

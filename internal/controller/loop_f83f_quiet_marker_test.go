@@ -91,7 +91,7 @@ func f83fForeignFixture(t *testing.T) (r *LoopReconciler, loop *coxv1alpha1.Loop
 		},
 	}).Build()
 	rec = record.NewFakeRecorder(16)
-	r = &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	r = &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
 	base := time.Date(2026, 10, 25, 21, 0, 0, 0, time.UTC)
 	offset := time.Duration(0)
 	r.now = func() metav1.Time { return metav1.NewTime(base.Add(offset)) }
@@ -214,7 +214,7 @@ func TestF83fNotFoundAfterTheMarkerKeepsTheCallersResourceVersion(t *testing.T) 
 		},
 	}).Build()
 	rec := record.NewFakeRecorder(8)
-	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
 	fixed := metav1.NewTime(time.Date(2026, 10, 25, 21, 0, 0, 0, time.UTC))
 	r.now = func() metav1.Time { return fixed }
 

@@ -90,7 +90,7 @@ var _ = Describe("P5c: the proxy NetworkPolicy admits the memory-writer pod (cur
 	}
 
 	reconcileLoop := func(name, ns string) {
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		Expect(err).ToNot(HaveOccurred(), "reconcile %s/%s: %v", ns, name, err)
 	}

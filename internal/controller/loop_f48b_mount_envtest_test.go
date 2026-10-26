@@ -57,7 +57,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
 		offset := new(time.Duration)
 		rec := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
 		r.now = func() metav1.Time { return metav1.NewTime(pod.CreationTimestamp.Add(*offset)) }
 		return loop, pod, r, offset, rec
 	}
@@ -270,7 +270,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		loop, pod, clock, offset, rec := plant("f48brv")
 		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
 		*offset = sandboxMountGrace + time.Minute
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(),
 			apiReader: forbidEventsReader{Client: k8sClient}, Recorder: rec}
 		r.now = clock.now
 		Expect(r.sandboxFailure(ctx, loop)).To(BeNil(), noFailure())
@@ -296,7 +296,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		*offset = sandboxMountGrace + time.Minute
 		// The same clock as the plant (the pod is past its grace), but an
 		// apiReader whose Event List is Forbidden.
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: k8sClient, Scheme: k8sClient.Scheme(),
 			apiReader: forbidEventsReader{Client: k8sClient}, Recorder: rec,
 		}
@@ -356,7 +356,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		*offset = sandboxMountGrace + time.Minute
 		base := clock.now().Time
 		now := base
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(),
 			apiReader: forbidEventsReader{Client: k8sClient}, Recorder: rec}
 		r.now = func() metav1.Time { return metav1.NewTime(now) }
 
@@ -380,7 +380,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		loop, pod, clock, offset, rec := plant("f48fclaim")
 		plantMountEvent(pod, "FailedMount", "secret not found", pod.UID)
 		*offset = sandboxMountGrace + time.Minute
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
 		r.now = clock.now
 		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) {
 			return &PhaseClaim{ObservedPhase: cov.LoopPhasePlanning, Status: claimSuccess,

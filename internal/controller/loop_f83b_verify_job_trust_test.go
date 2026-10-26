@@ -126,7 +126,7 @@ func TestF83bApplyVerifyOutcomeReadsOneJobSnapshot(t *testing.T) {
 		},
 	}).Build()
 	rec := record.NewFakeRecorder(16)
-	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
 
 	_, requeue := r.applyVerifyOutcome(ctx, loop)
 	if !requeue {
@@ -161,7 +161,7 @@ func TestF83bForeignVerifyJobIsNeverEvidence(t *testing.T) {
 		},
 	}).Build()
 	rec := record.NewFakeRecorder(16)
-	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
 	// A fixed clock so the marker's VALUE can be asserted (F83f): it must be the
 	// operator's clock, not merely present.
 	now := metav1.NewTime(time.Date(2026, 10, 25, 21, 0, 0, 0, time.UTC))
@@ -222,7 +222,7 @@ func TestF83bForeignPassingPodCannotForgeAVerdict(t *testing.T) {
 	*pod.OwnerReferences[0].Controller = true
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign, pod, loop).Build()
 	rec := record.NewFakeRecorder(16)
-	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
 
 	_, requeue := r.applyVerifyOutcome(ctx, loop)
 	if !requeue {
@@ -250,7 +250,7 @@ func TestF83bForeignVerifyJobIsNeverDeleted(t *testing.T) {
 	foreign := f83bJob(loop, "ffffffffffffffffffffffffffffffffffffffff", false)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign, loop).Build()
 	rec := record.NewFakeRecorder(16)
-	r := &LoopReconciler{Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, apiReader: c, Recorder: rec}
 
 	if err := r.ensureVerifyJob(ctx, loop); err != nil {
 		t.Fatalf("ensure: %v", err)

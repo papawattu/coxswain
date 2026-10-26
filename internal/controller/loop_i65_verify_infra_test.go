@@ -220,7 +220,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 		})).To(Succeed())
 
 		recorder := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		i65Drive(ns, name, r)
 		s5aReconcile(r, ns, name) // the Job is created (the pin exists)
 		jobName := name + "-verify-1"
@@ -282,7 +282,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 		})).To(Succeed())
 
 		recorder := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		i65Drive(ns, name, r)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"
@@ -316,7 +316,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 		})).To(Succeed())
 
 		recorder := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		i65Drive(ns, name, r)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"
@@ -381,7 +381,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		i65Drive(ns, name, r)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"
@@ -414,7 +414,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		i65Drive(ns, name, r)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"
@@ -447,7 +447,7 @@ var _ = Describe("I65: a verify Job that fails before the checks no longer wedge
 		})).To(Succeed())
 
 		recorder := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		i65Drive(ns, name, r)
 		s5aReconcile(r, ns, name)
 		jobName := name + "-verify-1"

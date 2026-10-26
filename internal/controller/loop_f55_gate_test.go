@@ -62,7 +62,7 @@ func TestF55ExternalRepoNoAllowsWaitsForEgressProxy(t *testing.T) {
 	scheme := f55Scheme(t)
 	loop := f55ExternalRepoLoop("f55-gate")
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
-	r := &LoopReconciler{Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestF55EmptyHostRepoIsNotHeldForAProxyThatIsNeverCreated(t *testing.T) {
 	loop := f42Loop("f55-emptyhost")
 	loop.Spec.Workspace.Repo = "https://:8080/repo.git"
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
-	r := &LoopReconciler{Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestF55InClusterRepoDoesNotWaitForEgressProxy(t *testing.T) {
 	scheme := f55Scheme(t)
 	loop := f42Loop("f55-incluster")
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
-	r := &LoopReconciler{Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
 	if err := r.ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -158,23 +158,23 @@ func TestF55GateDoesNotTrustAStaleCacheForTheAgentNetPol(t *testing.T) {
 	scheme := f55Scheme(t)
 	loop := f42Loop("f55-stale")
 	stale, direct := f55StaleNetPolClient(t, loop, scheme)
-	r := &LoopReconciler{Client: stale, apiReader: direct, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: stale, apiReader: direct, Scheme: scheme, AllowUnenforced: true, Recorder: record.NewFakeRecorder(10)}
 	// The netpol exists in the store (just created) but the cache says NotFound.
-	if err := (&LoopReconciler{Client: direct, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}).ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
+	if err := (&LoopReconciler{CNIProber: testCNIProber(), Client: direct, Scheme: scheme, Recorder: record.NewFakeRecorder(10)}).ensureNetPoliciesIfConfigured(ctx, loop); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	if agentNetPolMissing(ctx, r, loop) {
 		t.Fatal("a stale cached NotFound must be confirmed against the apiReader: the netpol exists")
 	}
 	// Positive control: without the apiReader the same stale client reports missing.
-	r2 := &LoopReconciler{Client: stale, Scheme: scheme}
+	r2 := &LoopReconciler{CNIProber: testCNIProber(), Client: stale, Scheme: scheme}
 	if !agentNetPolMissing(ctx, r2, loop) {
 		t.Fatal("control: the stale client alone must read as missing, or this spec proves nothing")
 	}
 	// And a netpol that is truly absent is still missing through the apiReader.
 	loop2 := f42Loop("f55-absent")
 	stale2, direct2 := f55StaleNetPolClient(t, loop2, scheme)
-	r3 := &LoopReconciler{Client: stale2, apiReader: direct2, Scheme: scheme}
+	r3 := &LoopReconciler{CNIProber: testCNIProber(), Client: stale2, apiReader: direct2, Scheme: scheme}
 	if !agentNetPolMissing(ctx, r3, loop2) {
 		t.Fatal("a truly absent netpol must still hold the gate")
 	}
@@ -187,7 +187,7 @@ func TestF55UpgradeEmitsFencedEventForExistingSandbox(t *testing.T) {
 	sb := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: sandboxName(loop.Name), Namespace: loop.Namespace}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop, sb).Build()
 	rec := record.NewFakeRecorder(10)
-	r := &LoopReconciler{Client: c, apiReader: c, Scheme: scheme, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, apiReader: c, Scheme: scheme, Recorder: rec}
 
 	r.ensureAgentNetPolBeforeSandbox(ctx, loop)
 	select {
@@ -215,7 +215,7 @@ func TestF55FreshLoopNoFencedEvent(t *testing.T) {
 	loop := f42Loop("f55-fresh")
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(loop).Build()
 	rec := record.NewFakeRecorder(10)
-	r := &LoopReconciler{Client: c, apiReader: c, Scheme: scheme, Recorder: rec}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, apiReader: c, Scheme: scheme, Recorder: rec}
 	r.ensureAgentNetPolBeforeSandbox(ctx, loop)
 	select {
 	case ev := <-rec.Events:

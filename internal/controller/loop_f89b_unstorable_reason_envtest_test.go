@@ -117,7 +117,7 @@ var _ = Describe("F89b: a failed pod whose kubelet reason the condition schema c
 		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
 
 		rec := record.NewFakeRecorder(64)
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
@@ -230,7 +230,7 @@ var _ = Describe("F89b: a failed pod whose kubelet reason the condition schema c
 			Reason:  conditionReasonUnknown,
 			Message: msg,
 		}}}}
-		r := &LoopReconciler{}
+		r := &LoopReconciler{CNIProber: testCNIProber()}
 
 		Expect(r.networkEnforcedChanged(loop, metav1.ConditionUnknown, "", msg)).To(BeFalse(),
 			"a normalised reason read back against the caller's raw one would fire an Event every reconcile")

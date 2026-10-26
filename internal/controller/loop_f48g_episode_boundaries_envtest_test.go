@@ -84,7 +84,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 
 		// The Loop has iterated out of Verifying (the operator's own transition:
 		// iteration 2, desiredPhase Implementing) and still carries the count
@@ -123,7 +123,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		loop.Status.DesiredPhase = cov.LoopPhaseImplementing
 		loop.Status.Iteration = 2
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 
 		By("a count with no key: the next failure starts the episode again (not attempt 3)")
 		legacy := f48gGet(ns, name)
@@ -342,7 +342,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 				}},
 			},
 		}
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			// A claim from the PREVIOUS iteration: the S5a stale guard must
 			// discard it, and a discarded claim is not a recovery signal.
 			readPhaseClaim: func(context.Context, *cov.Loop) (*PhaseClaim, error) {
@@ -523,7 +523,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		f48gSeedCount(ns, name, 2, fmt.Sprintf("%d/%s", loop.Status.Iteration, cov.LoopPhaseAwaitingApproval))
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		r.wireApprovalGate()
 		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) { return nil, nil }
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
@@ -570,7 +570,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		holdKey := sandboxRunKey(f48gGet(ns, name))
 		f48gSeedCount(ns, name, 2, holdKey)
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		r.wireApprovalGate()
 		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) { return nil, nil }
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
@@ -639,7 +639,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		holdKey := sandboxRunKey(loop)
 		f48gSeedCount(ns, name, 2, holdKey)
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		r.wireApprovalGate()
 		r.readPhaseClaim = func(context.Context, *cov.Loop) (*PhaseClaim, error) { return nil, nil }
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
@@ -671,7 +671,7 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 
 		var msgs []string
 		tctx := logf.IntoContext(ctx, logr.New(&f48hLogSink{msgs: &msgs}))
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		fresh := f48gGet(ns, name)
 		Expect(r.applySandboxFailure(tctx, fresh, f48gFailure())).To(BeTrue())
 		Expect(fresh.Status.Agent.InfraAttempts).To(Equal(int32(1)))

@@ -153,7 +153,7 @@ var _ = Describe("S4: claim reader mutation checks (I43, real code)", func() {
 		// If the production code read the pod through r.Client (the mutation
 		// `reader := client.Reader(r)`), this Get would return NotFound and
 		// the advance below would never happen.
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    podBlindClient{Client: k8sClient},
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
@@ -196,7 +196,7 @@ var _ = Describe("S4: claim reader mutation checks (I43, real code)", func() {
 		// for the current phase completes that phase) maps it to the
 		// Planning -> Implementing advance the auto-approve specs take — the
 		// deny holds exactly that step.
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,

@@ -78,7 +78,7 @@ const i74HeadCommit = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
 // sandboxOperatingMode gate is the single decision point; the envtest specs
 // below cover the operator's deletion + no-recreate behaviour end-to-end.
 func TestI74SandboxGateSuspendedOnTerminalPhase(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	cases := map[coxv1alpha1.LoopPhase]sandboxv1beta1.SandboxOperatingMode{
 		coxv1alpha1.LoopPhaseSucceeded: sandboxv1beta1.SandboxOperatingModeSuspended,
 		coxv1alpha1.LoopPhaseFailed:    sandboxv1beta1.SandboxOperatingModeSuspended,

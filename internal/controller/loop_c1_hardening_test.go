@@ -84,7 +84,7 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 
 		name := "hardening"
 		Expect(k8sClient.Create(ctx, buildLoop(name, ns))).To(Succeed())
-		sb := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
+		sb := reconcileToSandbox(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
 
 		pod := &sb.Spec.PodTemplate.Spec
 		By("automounting no ServiceAccount token on the pod")
@@ -208,7 +208,7 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 
 		name := "agentimage"
 		Expect(k8sClient.Create(ctx, buildLoop(name, ns))).To(Succeed())
-		sb := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
+		sb := reconcileToSandbox(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
 
 		agent := agentContainer(sb)
 		Expect(agent.Image).To(Equal(runnerImage),
@@ -237,7 +237,7 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		name := "f5eph-default"
 		loop := buildLoop(name, ns)
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		sb := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
+		sb := reconcileToSandbox(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
 		agent := agentContainer(sb)
 		limit := agent.Resources.Limits[corev1.ResourceEphemeralStorage]
 		var emptyDirTotal int64
@@ -257,7 +257,7 @@ var _ = Describe("C1: sandbox pod hardening + spec.agent (ADR-0006)", func() {
 		loop2 := buildLoop(name2, ns2)
 		loop2.Spec.Agent.TmpSizeLimit = "2Gi"
 		Expect(k8sClient.Create(ctx, loop2)).To(Succeed())
-		sb2 := reconcileToSandbox(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name2, ns2)
+		sb2 := reconcileToSandbox(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}, name2, ns2)
 		agent2 := agentContainer(sb2)
 		limit2 := agent2.Resources.Limits[corev1.ResourceEphemeralStorage]
 		var emptyDirTotal2 int64
@@ -304,7 +304,7 @@ var _ = Describe("P5e delivery title wiring into the agent env (M1)", func() {
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 		sb := &sandboxv1beta1.Sandbox{}

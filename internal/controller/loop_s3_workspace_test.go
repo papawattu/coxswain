@@ -187,7 +187,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		loop := s3Loop(name, ns, true)
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -333,7 +333,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 
 		name := "nocredloop"
 		Expect(k8sClient.Create(ctx, s3Loop(name, ns, false))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -379,7 +379,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		pinned.Status.BaseCommit = s3BaseCommitSHA
 		Expect(k8sClient.Status().Update(ctx, pinned)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -429,7 +429,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 
 		name := "netpolloop"
 		Expect(k8sClient.Create(ctx, s3Loop(name, ns, false))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -504,7 +504,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 
 		name := "svcreploop"
 		Expect(k8sClient.Create(ctx, s3SvcRepoLoop(name, ns, "http://gitea.samples.svc:3000/samples/gocli.git"))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		s3Reconcile(r, name, ns)
 
 		np := &networkingv1.NetworkPolicy{}
@@ -543,7 +543,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 
 		name := "svcrep2loop"
 		Expect(k8sClient.Create(ctx, s3SvcRepoLoop(name, ns, "http://gitea.samples.svc.cluster.local:3000/samples/gocli.git"))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		s3Reconcile(r, name, ns)
 
 		np := &networkingv1.NetworkPolicy{}
@@ -582,7 +582,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 
 		name := "extreloop"
 		Expect(k8sClient.Create(ctx, s3SvcRepoLoop(name, ns, "https://github.com/example/repo.git"))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		s3Reconcile(r, name, ns)
 
 		np := &networkingv1.NetworkPolicy{}
@@ -612,7 +612,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		loop1 := s3Loop(name1, ns, false)
 		loop1.Spec.Agent.Image = ""
 		Expect(k8sClient.Create(ctx, loop1)).To(Succeed())
-		r1 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), RunnerImage: s3RunnerImg}
+		r1 := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), RunnerImage: s3RunnerImg}
 		_, err := r1.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name1, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 		sb1 := &sandboxv1beta1.Sandbox{}
@@ -655,7 +655,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		loop4 := s3Loop(name4, ns, false)
 		loop4.Spec.Agent.Image = ""
 		Expect(k8sClient.Create(ctx, loop4)).To(Succeed())
-		r4 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r4 := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err = r4.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name4, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 		sb4 := &sandboxv1beta1.Sandbox{}
@@ -692,7 +692,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 
 		// Wire the APIReader path (a real, non-cached client) — the seam the
 		// live deployment uses (no exec/kubelet/ReadFile access, no new RBAC).
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		loop := s3Reconcile(r, name, ns)
 		By("recording status.baseCommit from the termination message")
 		Expect(loop.Status.BaseCommit).To(Equal(s3BaseCommitSHA), "the operator must record the clone's SHA in status.baseCommit")
@@ -720,7 +720,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}
 
 		By("requeuing while the init container has not terminated yet")
@@ -768,7 +768,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}
 
 		By("failing the read-back on a non-SHA termination message (bounded)")
@@ -821,7 +821,7 @@ var _ = Describe("S3: workspace init container + agent execution (GAP 1)", func(
 		// API server persists — the same path a live deployment uses. If the
 		// operator silently fell back to a scoped cache (the bug the reviewer
 		// found), this pod would not be found and baseCommit would stay empty.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		loop := s3Reconcile(r, name, ns)
 		Expect(loop.Status.BaseCommit).To(Equal(s3BaseCommitSHA),
 			"the read-back MUST use the APIReader path (a pod in the envtest API server must be read); a cached-client fallback would silently skip and leave baseCommit empty")

@@ -88,7 +88,7 @@ func TestForeignNetPolsFailsClosedOnGetError(t *testing.T) {
 		}).
 		Build()
 
-	r := &LoopReconciler{Client: fakeClient, Scheme: scheme}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
 
 	if got := foreignNetPols(ctx, r, loop); !got {
 		t.Fatalf("foreignNetPols = false on NetworkPolicy Get error; want true (fail-closed): a real read error must hold the sandbox Suspended, not let it run with an unknown netpol")
@@ -111,7 +111,7 @@ func TestForeignNetPolsAbsentIsNotConflict(t *testing.T) {
 		WithObjects(loop).
 		Build()
 
-	r := &LoopReconciler{Client: fakeClient, Scheme: scheme}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
 
 	if got := foreignNetPols(ctx, r, loop); got {
 		t.Fatalf("foreignNetPols = true when all per-Loop netpols are absent; want false (absent is not a conflict — ensureNetworkPolicy creates them)")
@@ -148,7 +148,7 @@ func TestForeignNetPolsOwnedIsNotConflict(t *testing.T) {
 		WithObjects(loop, ownedNP).
 		Build()
 
-	r := &LoopReconciler{Client: fakeClient, Scheme: scheme}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
 
 	if got := foreignNetPols(ctx, r, loop); got {
 		t.Fatalf("foreignNetPols = true for a netpol controlled by the Loop; want false")
@@ -174,7 +174,7 @@ func TestForeignNetPolsForeignIsConflict(t *testing.T) {
 		WithObjects(loop, foreignNP).
 		Build()
 
-	r := &LoopReconciler{Client: fakeClient, Scheme: scheme}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
 
 	if got := foreignNetPols(ctx, r, loop); !got {
 		t.Fatalf("foreignNetPols = false for an unowned netpol occupying the name; want true")

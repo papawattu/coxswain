@@ -111,7 +111,7 @@ var _ = Describe("F89: a failed pod whose termination records no reason", func()
 		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
 
 		rec := record.NewFakeRecorder(64)
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,

@@ -299,7 +299,7 @@ func envValue(env []corev1.EnvVar, name string) (string, bool) {
 // (the annotation-based phase recycle deletes it on an advance).
 func s5aDriveToVerifying(ns, name string) *LoopReconciler {
 	ctx := context.Background()
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	// A stand-in sandbox object (envtest has no agent-sandbox controller).
 	ensure := func() { s5aEnsureSandbox(ns, name) }
 	ensure()
@@ -612,7 +612,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// helper builds its own reconciler without one).
 		recorder := record.NewFakeRecorder(64)
 		ctx2 := context.Background()
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		s5aEnsureSandbox(ns, name)
 		s5aReconcile(r, ns, name) // bootstrap Pending -> Planning
 		loop := &coxv1alpha1.Loop{}
@@ -716,7 +716,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		// Drive to the Implementing phase (Planning claim), then a malformed
 		// headCommit on the Implementing claim.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		_ = r
 		// Bootstrap + Planning claim.
 		ensureSB := func() { s5aEnsureSandbox(ns, name) }
@@ -748,7 +748,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			Spec:       s5aLoopSpec(),
 		})).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		s5aReconcile(r, ns, name)
 		s5aClaimPod(ns, name, "Planning", "")
@@ -2151,7 +2151,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		// Drive to Implementing (NOT Verifying) — the verify Job is created on
 		// the Implementing -> Verifying advance, which is what the gate gates.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		s5aReconcile(r, ns, name) // Pending -> Planning
 		loop := &coxv1alpha1.Loop{}
@@ -2224,7 +2224,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		})).To(Succeed())
 
 		// Drive to Implementing (NOT Verifying).
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		s5aReconcile(r, ns, name) // Pending -> Planning
 		loop := &coxv1alpha1.Loop{}

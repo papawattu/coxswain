@@ -68,7 +68,7 @@ var _ = Describe("I77: init-workspace skips a completed clone and keeps agent wo
 		}
 		scheme := runtime.NewScheme()
 		_ = coxv1alpha1.AddToScheme(scheme)
-		c := (&LoopReconciler{Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
+		c := (&LoopReconciler{CNIProber: testCNIProber(), Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
 		// c.Command == [verifySh, "-c", script].
 		if len(c.Command) < 3 || c.Command[1] != "-c" {
 			GinkgoT().FailNow()
@@ -189,7 +189,7 @@ var _ = Describe("I77: interrupted first run (no success marker) still gets the 
 		}
 		scheme := runtime.NewScheme()
 		_ = coxv1alpha1.AddToScheme(scheme)
-		c := (&LoopReconciler{Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
+		c := (&LoopReconciler{CNIProber: testCNIProber(), Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
 		if len(c.Command) < 3 || c.Command[1] != "-c" {
 			GinkgoT().FailNow()
 		}
@@ -258,7 +258,7 @@ var _ = Describe("I77: a shape-invalid marker falls through to the wipe (executi
 		}
 		scheme := runtime.NewScheme()
 		_ = coxv1alpha1.AddToScheme(scheme)
-		c := (&LoopReconciler{Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
+		c := (&LoopReconciler{CNIProber: testCNIProber(), Scheme: scheme}).buildWorkspaceInitContainer(loop, "git-standin:latest", nil)
 		if len(c.Command) < 3 || c.Command[1] != "-c" {
 			GinkgoT().FailNow()
 		}

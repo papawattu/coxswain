@@ -91,7 +91,7 @@ var _ = Describe("Loop name validation (D20)", func() {
 		u := mkUnstructuredLoop(name, ns, loopRepo)
 		Expect(k8sClient.Create(ctx, u)).To(Succeed(), "a 55-char DNS-1035 name must be accepted")
 		// Reconcile and assert the Sandbox name is exactly <name>-sandbox.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}
 		_, err := r.Reconcile(ctx, req)
 		Expect(err).ToNot(HaveOccurred())

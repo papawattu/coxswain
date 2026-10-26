@@ -140,7 +140,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 	// pass is a ctrl.Result (not an error) and does not block the spec.
 	reconcileLoop := func(name, ns string) {
 		By("reconciling the Loop (two passes)")
-		ctrlReconciler := &LoopReconciler{
+		ctrlReconciler := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 		}
@@ -412,7 +412,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 			defer func() { _ = k8sClient.Delete(ctx, loop) }()
 
 			// Reconcile with a reconciler that has MemoryStorageClass set.
-			scReconciler := &LoopReconciler{
+			scReconciler := &LoopReconciler{CNIProber: testCNIProber(),
 				Client:             k8sClient,
 				Scheme:             k8sClient.Scheme(),
 				MemoryStorageClass: "local-shared",

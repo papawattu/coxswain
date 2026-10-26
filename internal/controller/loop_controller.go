@@ -340,10 +340,12 @@ type LoopReconciler struct {
 	// result (NetworkEnforced condition): a CNI that does not police pod ->
 	// host-network egress — or an unavailable probe — holds the sandbox
 	// Suspended (fail-closed) unless AllowUnenforcedNetwork is set.
-	// When nil, the gate applies from the shared holder (cni.Holder()), which
-	// starts Unknown — and Unknown holds the sandbox Suspended. The probe
-	// itself runs in the leader-elected Runnable (internal/cni); the reconcile
-	// only reads the current result via LatestResult().
+	// When nil there is no evidence at all: the gate reports
+	// NetworkEnforced=False reason=ProbeUnavailable and holds the sandbox
+	// Suspended (F51 P2-3) — AllowUnenforcedNetwork is the only way to run
+	// without a prober, and it records EnforcementDisabled. The probe itself
+	// runs in the leader-elected Runnable (internal/cni); the reconcile only
+	// reads the current result via LatestResult().
 	CNIProber cni.CNIProber
 	// AllowUnenforcedNetwork is the off-by-default network escape hatch (D38),
 	// separate from AllowUnenforced (the eBPF gate): when true, Loops run with
@@ -1296,16 +1298,20 @@ func (r *LoopReconciler) enforcementStatus(ctx context.Context, loop *coxv1alpha
 // cache). With AllowUnenforcedNetwork set it reports "run anyway" (the
 // condition records EnforcementDisabled). The holder starts Unknown and
 // Unknown holds the sandbox Suspended: the operator is fail-closed from
-// startup, not just from the first probe failure.
+// startup, not just from the first probe failure. A nil prober is the
+// strongest case of "no evidence" and is held Suspended too (F51 P2-3): the
+// only way to run without it is AllowUnenforcedNetwork, which records what it
+// means instead of pretending the fence was measured.
 func (r *LoopReconciler) cniNetworkStatus() (run bool, reason cni.Reason, status metav1.ConditionStatus, message string) {
-	// No prober wired: the CNI gate does not apply (the operator is not
-	// configured to probe the CNI). This is the envtest path for specs that
-	// don't set a fake prober, and a no-op in production before the probe
-	// Runnable is registered. The gate is active only when a prober is wired
-	// (D38 production path), in which case the holder starts Unknown and
-	// Unknown holds the sandbox Suspended (fail-closed from startup).
+	// No prober wired is NOT "the gate does not apply": D30/D38 are
+	// fail-closed, and a nil seam is the strongest case of "no evidence at
+	// all" (F51 P2-3).
 	if r.CNIProber == nil {
-		return true, cni.ReasonUnknown, metav1.ConditionUnknown, "CNI probe not configured; gate not active"
+		if r.AllowUnenforcedNetwork {
+			return true, cni.ReasonEnforcementDisabled, metav1.ConditionFalse,
+				"--allow-unenforced-network is set: the Loop runs but the CNI does NOT police pod -> host-network egress (dev escape hatch)"
+		}
+		return false, cni.ReasonProbeUnavailable, metav1.ConditionFalse, "no CNI prober wired; sandbox held Suspended (fail-closed)"
 	}
 	// The reconcile loop reads the CURRENT result from the prober (the real
 	// implementation's LatestResult returns the holder's cached result; the

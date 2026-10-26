@@ -62,7 +62,7 @@ import (
 // failure. The 4156154 fix moves the API auth below the push; this test
 // passes only on that ordering.
 func TestDeliverPushScriptExecutes(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 
 	// The remote (the deliver Job's origin stand-in): a local bare repo with
 	// a base branch. The push pushes HEAD (the pinned commit) to a new
@@ -478,7 +478,7 @@ func gitRemoteRef(t *testing.T, repo, ref string) string {
 // Gitea draft delivery prefixes the title with "WIP: "; GitHub honours the
 // field (no prefix); a non-draft delivery has no prefix on either provider.
 func TestDeliverDraftTitlePrefix(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	loop := &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: "drafttest"},
 		Spec: coxv1alpha1.LoopSpec{
@@ -528,7 +528,7 @@ func TestDeliverDraftTitlePrefix(t *testing.T) {
 // this case exercises the API read of default_branch (a branch name that is
 // neither main nor master).
 func TestDeliverPushScriptRefusesDefaultBranch(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 
 	// The remote (the deliver Job's origin stand-in): a local bare repo with
 	// a base branch (initial — NOT main/master, so the script's main/master
@@ -641,7 +641,7 @@ func TestDeliverPushScriptRefusesDefaultBranch(t *testing.T) {
 // (the fail-open line: the lookup failure was swallowed into an empty
 // DEFAULT_BRANCH, the guard skipped the refusal, and the push proceeded).
 func TestDeliverPushScriptRefusesWhenDefaultBranchLookupFails(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 
 	// The remote (the deliver Job's origin stand-in): a local bare repo
 	// with a base branch (initial — NOT main/master, so the script's
@@ -762,7 +762,7 @@ func TestDeliverPushScriptRefusesWhenDefaultBranchLookupFails(t *testing.T) {
 // (prNumber 42, the PR page's html_url). It must FAIL on a5cec25 (the
 // sed-based parser).
 func TestDeliverPushScriptRecordsTopLevelJSONFields(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 
 	// The remote (the deliver Job's origin stand-in): a local bare repo.
 	remoteDir := t.TempDir()
@@ -943,7 +943,7 @@ func TestDeliverPushScriptRecordsTopLevelJSONFields(t *testing.T) {
 // script no longer carries Title(goal)). The assertion is on the REAL
 // rendered script text (deliverPushContainer), not a reimplementation.
 func TestDeliverPushScriptPRTitleMatchesGoal(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	goal := "Add a TODO comment at the top of README.md.\nIt must be an HTML comment placed above the first heading."
 
 	loop := &coxv1alpha1.Loop{
@@ -982,7 +982,7 @@ func TestDeliverPushScriptPRTitleMatchesGoal(t *testing.T) {
 // if either link stops using deliverytitle.Title(goal), the strings diverge
 // and this spec FAILS.
 func TestDeliveryTitleAgentEnvAndPRTitleAgree(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	goal := "Add a TODO comment at the top of README.md.\nIt must be an HTML comment placed above the first heading."
 
 	// The agent env value (M1 wiring link): agentPodSpec sets

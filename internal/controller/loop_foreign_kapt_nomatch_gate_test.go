@@ -43,13 +43,13 @@ func TestForeignKaptPoliciesGatedOnAllowUnenforced(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "loop-x", Namespace: "ns-x"},
 	}
 	t.Run("AllowUnenforced=false: missing KubeArmor CRD fails closed (hold Suspended)", func(t *testing.T) {
-		r := &LoopReconciler{Client: c, AllowUnenforced: false}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, AllowUnenforced: false}
 		if !foreignKaptPolicies(context.Background(), r, loop) {
 			t.Fatal("foreignKaptPolicies must return true (hold Suspended) when the KubeArmor CRD is absent and --allow-unenforced is not set")
 		}
 	})
 	t.Run("AllowUnenforced=true: missing KubeArmor CRD is not a conflict", func(t *testing.T) {
-		r := &LoopReconciler{Client: c, AllowUnenforced: true}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: c, AllowUnenforced: true}
 		if foreignKaptPolicies(context.Background(), r, loop) {
 			t.Fatal("foreignKaptPolicies must return false when the KubeArmor CRD is absent and --allow-unenforced is set")
 		}

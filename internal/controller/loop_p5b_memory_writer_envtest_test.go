@@ -386,7 +386,7 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// could iterate) is ineligible: the operator records the
 		// MemoryWriteSkipped condition and does NOT create the Job.
 		name := "p5b-mw-budget"
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		loop := s6Loop(name, ns, inClusterRepoURL)
 		Expect(k8sClient.Create(context.Background(), loop)).To(Succeed())
@@ -705,7 +705,7 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// Drive a Loop to Implementing (the S4 phase machine: Planning ->
 		// Implementing on the Implementing claim).
 		name := "p5b-mw-nonterm"
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		loop := s6Loop(name, ns, inClusterRepoURL)
 		Expect(k8sClient.Create(context.Background(), loop)).To(Succeed())
@@ -933,7 +933,7 @@ func s6SucceededLessonsAvailable(name, ns string) *LoopReconciler {
 // the reconcile that first creates the memory-writer Job.
 func s6SucceededLessonsAvailableWith(name, ns string, wrap func(client.Client) client.Client) *LoopReconciler {
 	ctx := context.Background()
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	if wrap != nil {
 		r.Client = wrap(k8sClient)
 	}
@@ -982,7 +982,7 @@ func s6SucceededLessonsAvailableWith(name, ns string, wrap func(client.Client) c
 // P5c negative lesson is composed from) and the default stallAction (Fail).
 func s6FailedStalledLessonsAvailable(name, ns string) *LoopReconciler {
 	ctx := context.Background()
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	s5aEnsureSandbox(ns, name)
 	loop := s6Loop(name, ns, inClusterRepoURL)
 	Expect(k8sClient.Create(ctx, loop)).To(Succeed())

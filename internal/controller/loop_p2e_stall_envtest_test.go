@@ -66,7 +66,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 	// the gate is exercised directly) with the readCheckOutput seam set to a
 	// fixed output for the named check.
 	newP2eReconciler := func(checkOutput string) *LoopReconciler {
-		return &LoopReconciler{
+		return &LoopReconciler{CNIProber: testCNIProber(),
 			readCheckOutput: func(pod *corev1.Pod, checkName string) (string, bool) {
 				return checkOutput, true
 			},
@@ -310,7 +310,7 @@ var _ = Describe("P2e: stall gate (N consecutive identical verify failures)", fu
 		// (P2h: a terminated record counts even with an empty message) wins
 		// over lastState. The restarted-container lastState path is pinned by
 		// TestDefaultReadCheckOutput case (b).
-		r := &LoopReconciler{}
+		r := &LoopReconciler{CNIProber: testCNIProber()}
 		pod := aFailingPod()
 		for i := range pod.Status.InitContainerStatuses {
 			ics := &pod.Status.InitContainerStatuses[i]

@@ -50,7 +50,7 @@ var _ = Describe("C6a effective AgentPolicy union", func() {
 	)
 	BeforeEach(func() {
 		ctx = context.Background()
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 	})
 
 	// buildLoop is a local helper (loop builders are per-It in this package).
@@ -211,7 +211,7 @@ var _ = Describe("C6a (R15 round 3): fail-closed policy validation", func() {
 
 		// Reconcile: the controller must set PolicyValid=False (PolicyNotFound)
 		// and NOT create a sandbox pod.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: missingPolName}})
 		Expect(err).ToNot(HaveOccurred())
 
@@ -267,7 +267,7 @@ var _ = Describe("C6a (R15 round 3): fail-closed policy validation", func() {
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
 		// Reconcile: the controller should set PolicyValid=True.
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: cleanLoopName}})
 		Expect(err).ToNot(HaveOccurred())
 
@@ -313,7 +313,7 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 
 		// Reconcile: the policy doesn't exist yet, so the Loop gets
 		// PolicyValid=False (PolicyNotFound).
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: watchLoopName}})
 		Expect(err).ToNot(HaveOccurred())
 
@@ -406,7 +406,7 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 			return len(loops.Items) == 2
 		}, "10s").Should(BeTrue(), "the cache must see both Loops")
 
-		r := &LoopReconciler{Client: cachedClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: cachedClient, Scheme: k8sClient.Scheme()}
 		requests := r.agentPolicyToLoopRequests(ctx, ap)
 		Expect(requests).To(HaveLen(1),
 			"the map function should return only the Loop that references the policy")
@@ -439,7 +439,7 @@ var _ = Describe("C6a (R15 round 4 P2): AgentPolicy watch", func() {
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: loopName}})
 		Expect(err).ToNot(HaveOccurred())
 

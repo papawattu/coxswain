@@ -69,7 +69,7 @@ var _ = Describe("I42e: reject in-cluster network allows", func() {
 		// The reconciler gets the pod/service CIDRs from the operator config
 		// (in envtest, set directly on the struct; in a real cluster they come
 		// from the POD_CIDR / SERVICE_CIDR env vars, read in SetupWithManager).
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:      k8sClient,
 			Scheme:      k8sClient.Scheme(),
 			PodCIDR:     i42ePodCIDR,
@@ -245,7 +245,7 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 	var r *LoopReconciler
 
 	BeforeEach(func() {
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:      k8sClient,
 			Scheme:      k8sClient.Scheme(),
 			PodCIDR:     i42ePodCIDR,
@@ -329,7 +329,7 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 		// (TEST-NET-3) so it is flagged only via the operator's explicit CIDR,
 		// not the standard range check (which now always runs, correctly
 		// fail-closed, for 127/8 / RFC1918 / link-local / CGNAT / multicast).
-		rNoCIDR := &LoopReconciler{
+		rNoCIDR := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			// PodCIDR / ServiceCIDR are empty.
@@ -338,7 +338,7 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 		Expect(ok).To(BeFalse(),
 			"with no operator CIDRs configured, an IP outside the standard ranges is not flagged by the operator-CIDR case")
 		// ...and it IS flagged once the operator carves out that range.
-		rWithCIDR := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), PodCIDR: "203.0.113.0/24"}
+		rWithCIDR := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), PodCIDR: "203.0.113.0/24"}
 		_, ok = rWithCIDR.findInClusterNetworkAllow([]string{"203.0.113.5:8080"})
 		Expect(ok).To(BeTrue(),
 			"with the operator's pod CIDR configured, an IP in that CIDR is flagged")
@@ -348,7 +348,7 @@ var _ = Describe("I42e: controller-side findInClusterNetworkAllow", func() {
 		// The standard-range check (loopback / RFC1918 / link-local / CGNAT /…
 		// multicast) runs regardless of the operator CIDR config — a 10.x pod
 		// IP is in-cluster whether or not the operator told us the pod CIDR.
-		rNoCIDR := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		rNoCIDR := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, ok := rNoCIDR.findInClusterNetworkAllow([]string{"10.244.0.5:8080"})
 		Expect(ok).To(BeTrue(),
 			"an IP in a standard private range is in-cluster regardless of the operator CIDR config")

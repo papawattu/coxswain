@@ -74,7 +74,7 @@ var _ = Describe("I42d: *_PROXY / NO_PROXY env on the agent container", func() {
 		// The real KubeArmor enforcer: spec 7 asserts the agent
 		// KubeArmorPolicy's DNS allowlist, which the fakeEnforcer-based
 		// specs in this suite never exercise.
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN},

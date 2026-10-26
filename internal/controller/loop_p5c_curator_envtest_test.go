@@ -98,7 +98,7 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 				},
 			},
 		}
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		job := r.buildMemoryWriterJob(loop, "memory-pvc", "succeeded")
 		c := job.Spec.Template.Spec.Containers[0]
 		envNames := map[string]string{}
@@ -128,7 +128,7 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 				},
 			},
 		}
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		job := r.buildMemoryWriterJob(loop, "memory-pvc", "succeeded")
 		c := job.Spec.Template.Spec.Containers[0]
 		envNames := map[string]string{}
@@ -206,7 +206,7 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		// A reconciler with a FakeRecorder (the Event is emitted in this
 		// reconcile).
 		recorder := record.NewFakeRecorder(64)
-		rec := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		rec := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		s6Reconcile(rec, ns, name)
 
 		// The MemoryWriteDone condition is set (the write completed) and its
@@ -253,7 +253,7 @@ var _ = Describe("P5c memory curator (Phase 5, ADR-0002)", func() {
 		p5bSetJobPodTerminationMessage(ns, name,
 			"lesson-001 aaaa11111111 written eligible\nsummary: total=1 written=1 dropped=0")
 		recorder := record.NewFakeRecorder(64)
-		rec := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		rec := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		s6Reconcile(rec, ns, name)
 		// First reconcile: exactly one audit Event.
 		events1 := drainEvents(recorder)
@@ -278,7 +278,7 @@ var _ = Describe("P5c negative lesson (Phase 5, PLAN-PHASE5.md slice P5c)", func
 		Expect(k8sClient.Create(context.Background(), &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
-		r = &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	})
 
 	AfterEach(func() {

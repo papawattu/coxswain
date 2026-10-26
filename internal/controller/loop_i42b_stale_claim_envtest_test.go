@@ -59,7 +59,7 @@ var _ = Describe("I42b stale Planning claim after re-plan", func() {
 	ctx := context.Background()
 
 	i42bReconciler := func() *LoopReconciler {
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 		}

@@ -186,13 +186,13 @@ func TestEmitMemoryPVCUnboundEvent(t *testing.T) {
 	}
 	// A nil Recorder: the emission is skipped without error (the unit's
 	// contract: a nil Recorder never panics).
-	r := &LoopReconciler{Recorder: nil}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Recorder: nil}
 	r.emitMemoryPVCUnboundEvent(loop, "memory-abc")
 
 	// A non-nil Recorder: the Event is recorded (the fake recorder is a
 	// channel; drain it and check the reason).
 	fake := record.NewFakeRecorder(64)
-	r = &LoopReconciler{Recorder: fake}
+	r = &LoopReconciler{CNIProber: testCNIProber(), Recorder: fake}
 	r.emitMemoryPVCUnboundEvent(loop, "memory-abc")
 	saw := false
 	for e := range fake.Events {

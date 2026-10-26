@@ -57,7 +57,7 @@ import (
 // mutation the plan is absent from the checkout (excluded from the commit), so
 // the body renders the no-plan line and assertion 1 fails.
 func TestDeliverPlanCarriedFromPVCNotCheckout(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 
 	// The remote (the deliver Job's origin stand-in): a local bare repo with
 	// a base branch.

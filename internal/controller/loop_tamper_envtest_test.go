@@ -75,7 +75,7 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 	// Planning on the first reconcile, so the effective steps are the two
 	// completed-phase claims (Planning, then Implementing).
 	driveToVerifying := func(nn types.NamespacedName) {
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		ensureB2Sandbox(nn)
 		for _, executed := range []coxv1alpha1.LoopPhase{
 			coxv1alpha1.LoopPhasePlanning,
@@ -142,7 +142,7 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
 			corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}, nil)
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -187,7 +187,7 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
 			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}, &runningCheck)
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -214,7 +214,7 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		got.Status.ObservedPhase = coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -268,7 +268,7 @@ var _ = Describe("B2 TamperedVerify via base-commit glob diff (D10/D24)", func()
 		}
 		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
 

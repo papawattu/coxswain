@@ -283,7 +283,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 			// Wire the approval gate (the OS8 seam: the S4 default is
 			// autoApprovePhaseGate; B3 replaces it with the approval gate so the
 			// Manual-mode hold is exercised).
-			r := &LoopReconciler{
+			r := &LoopReconciler{CNIProber: testCNIProber(),
 				Client:    k8sClient,
 				Scheme:    k8sClient.Scheme(),
 				apiReader: k8sClient,
@@ -469,7 +469,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 			Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
 		})).To(Succeed())
 		rec := record.NewFakeRecorder(20)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
 		r.wireApprovalGate()
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil }
 
@@ -519,7 +519,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       b4LoopSpec(coxv1alpha1.ApprovalModeManual),
 		})).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		r.wireApprovalGate()
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) { return nil, nil }
 
@@ -614,7 +614,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		// Drive to Verifying in Manual mode (the s5aDriveToVerifying helper
 		// assumes Auto mode; Manual mode holds at AwaitingApproval after the
 		// Planning claim, so the spec must approve the plan to advance).
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		r.wireApprovalGate()
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return nil, nil

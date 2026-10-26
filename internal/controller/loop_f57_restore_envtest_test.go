@@ -288,14 +288,22 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		// reports AlreadyExists and the read that would confirm it fails, so the
 		// helper returns errWorkspacePVCUnconfirmed.
 		r, _ := b2NewReconcilerWithRecorder()
-		r.Client = &f57RestoreClient{
+		fc := &f57RestoreClient{
 			Client:        k8sClient,
 			alreadyExists: true,
 			confirmErr:    errors.New("injected transient read failure"),
 		}
+		r.Client = fc
 
 		changed, requeue, _, err := r.b2ApplyRestoreStep(ctx, b2ReconcileGet(ns, name))
 		Expect(err).NotTo(HaveOccurred())
+		// E1 (the #328 early look): "a no-decision return with no condition" is
+		// also what two other early returns produce (b2SourceError, and the
+		// rollback's own transient PVC read), so the assertions below do not by
+		// themselves prove this arm ran. The create being attempted does: it is
+		// the precondition of the errWorkspacePVCUnconfirmed sentinel.
+		Expect(fc.createTried).To(BeTrue(),
+			"the unconfirmed arm is only exercised if the restored-PVC create was attempted")
 		Expect(changed).To(BeFalse(), "an unconfirmed rollback create is no restore decision (I49)")
 		Expect(requeue).To(BeTrue(), "the step must requeue and read again")
 		c := b2RestoreCondition(b2ReconcileGet(ns, name))

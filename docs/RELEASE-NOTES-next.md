@@ -217,6 +217,12 @@ existing Loops are unaffected, but new ones are.
 
 ## Other changes
 
+### F57: a restore whose PVC cannot be confirmed is not Restored, and the fork label stops being re-patched — #313
+
+- **What was wrong.** When restoring into an already-present workspace PVC, a read-back that failed (or found the PVC gone again) fell through to "restored", so a transient read failure could record `Restored` for a restore that never happened (F57a). And on a fork, every pass re-patched the retention label on the source snapshot — and re-emitted the `Restore=False/Rejected` Warning on every pass, for the life of a failing create (F57b) (`3a99f2e` = PR #313).
+- **What changed.** An `AlreadyExists` whose read-back cannot confirm the PVC (a failed read, or a `NotFound`) is now treated as no decision on both the fork/lost-PVC path and the rollback path: the restore is requeued and decided from a fresh read on the next pass, and its log line is unfiltered because the retry is otherwise silent (F57a). The fork-retention label on the source snapshot is written once and stays while the create is retried (a patch is skipped when the label already names this fork), and is released on completion or when the fork is deleted mid-retry — the second deleting pass is a read-only no-op once the label is gone; the `Restore=False/Rejected` Warning now fires on the transition into `Rejected` only, on both the fork/lost-PVC and the rollback paths (F57b).
+- **On upgrade.** Nothing required; pick up the new operator image (no CRD, RBAC or chart change). A F36 spec that asserted a failed fork create removes the label again now asserts the F57b guarantee instead: the label stays while the retry is live (PR #313).
+
 ### F56: make deploy passes the four component-image args, and a missing runner is visible — #311
 
 - **What was wrong.** `make deploy` passed none of the four component-image args, so a deployed Loop ran the operator's `sleep infinity` stand-in (it looked Running and never advanced) and the three proxy pods pulled `…:standin`/`…:metering` tags that were never pushed; nothing on the object said so (no condition, no Event) (`64f4902` = PR #311, F56).

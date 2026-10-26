@@ -339,6 +339,24 @@ F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop 
   - `docs/TROUBLESHOOTING.md`'s `CheckpointEntryUntrusted` entry now says which consumer drops the entry (the checkpoint step, for an entry at the iteration it is about to take, or the retention GC for any other entry) (PR #285).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #285). If you are running a cluster without the VolumeSnapshot CRD, `status.checkpoints` entries are now kept as they are (no snapshot read, no drop) — the same `VolumeSnapshotCRDMissing` surface as before.
 
+### F50: the sample Loops now run against the seeded repos, in the `samples` namespace — #292
+
+- **What was wrong.** The three example Loops (`loop-fix-failing-test`, `loop-implement-missing-endpoint`, `loop-python-missing-function`) pointed at `coxswain.git` @ `main`, which has none of the files they test or protect, so they could not succeed as applied; the `samples-git-cred` Secret they needed is created in the `samples` namespace, so from `namespace: default` no clone could run; the gocli task 2 manifest `hack/sample-run.sh` requires was missing; and the chart shipped two dead value groups (`rbac.roleNamespaces` and `webhook.*`) that no template reads (merged `3eaf998` = PR #292).
+- **What changed.** Each sample Loop now points at the seeded in-cluster Gitea repo for the same `examples/<app>` tree (`samples/gocli.git`, `webapi`, `pylib`), `ref: initial`, `gitCredentialSecret: samples-git-cred`, and is `namespace: samples` (the namespace `make samples-up` creates and `hack/samples-seed.sh` seeds) (PR #292). `examples/gocli/tasks/2.loop.yaml` was added (modelled on `1.loop.yaml`), so `make sample-run APP=gocli TASK=2` no longer dies on the missing file; and the two dead chart value groups and their README bullet are deleted (PR #292).
+- **On upgrade.** Nothing required; the samples, the example manifests and the chart values are the only changes (PR #292).
+
+### F51 (P2-3): with no CNI prober wired the sandbox is held `Suspended` (fail-closed) — #293
+
+- **What was wrong.** The network-fence gate treated a nil `CNIProber` as "the gate does not apply", so the sandbox ran with no network evidence — while the D30 egress gate fails closed for a nil `Enforcer` (F51, merged `f07fee1` = PR #293).
+- **What changed.** The nil seam now fails closed: `NetworkEnforced=False` with reason `ProbeUnavailable` ("no CNI prober wired; sandbox held Suspended (fail-closed)") and the sandbox stays `Suspended`; `--allow-unenforced-network` still runs the Loop with the flag set (condition `False`/`EnforcementDisabled`, i.e. the fence was **not** measured) — mirroring the D30 escape hatch and the only way to run without a prober. `cmd/main.go` always wires a `PodProber`, so no shipped install changes behaviour (PR #293).
+- **On upgrade.** Nothing required for a standard install (the operator always wires a prober); if you built the operator without a `CNIProber` the sandbox is now held `Suspended` instead of running without a fence — use `--allow-unenforced-network` to run without one (PR #293).
+
+### F51 (P2-2): an unresolvable or refused CNI probe target makes the probe unavailable instead of counting as reachable — #291
+
+- **What was wrong.** The D38 CNI probe reported a target it could not resolve (DNS lookup failed) or that refused the connection as `REACHABLE` — the packet reaching a host and being rejected there is not evidence of a policy drop (F51, merged `b33cc7a` = PR #291). On an expected-BLOCKED target that reads as a fence bypass (`CNIUnenforced`); on the positive control it made an unmeasured fence look measured — the probe claimed a verdict it did not have.
+- **What changed.** Both shapes now emit the new `UNRESOLVED` verdict (the probe script's resolution-failure arm and `ConnectionRefusedError`; a timeout — the shape of a real policy drop — still emits `BLOCKED`), and any `UNRESOLVED` row maps the whole probe to `ProbeUnavailable` **before** the control/BLOCKED verdict logic runs: never `Enforced`, never `Unenforced`, with the `Detail` naming the unmeasured target (PR #291). That is a real change for a cluster that was reporting `CNIEnforced` on a refused or unresolvable target: it now reports `ProbeUnavailable` instead, and one unmeasured target pre-empts a `CNIUnenforced`/`CNIEnforced` verdict (PR #291's P3-3).
+- **On upgrade.** Nothing required; the change is in the operator (the probe script it generates) (PR #291).
+
 ### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
 
 - **What was wrong.** `status.checkpoints` is user-writable (the editor role, since B3), and the operator acted on it without trusting it: the retention GC would delete any VolumeSnapshot a status entry named, even one belonging to another Loop, and the lost-PVC restore could take a forged entry as its restore source (PR #254, review finding review-api P2-1).

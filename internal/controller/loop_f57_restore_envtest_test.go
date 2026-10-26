@@ -132,14 +132,14 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 
 	// f57Step runs the restore step once, directly (so a failure injected into
 	// one step cannot be confused with a later step's error).
-	f57Step := func(r *LoopReconciler, ns, name string) (bool, bool, bool, error, *coxv1alpha1.Loop) {
+	f57Step := func(r *LoopReconciler, ns, name string) (bool, bool, bool, *coxv1alpha1.Loop, error) {
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		changed, requeue, hold, err := r.b2ApplyRestoreStep(ctx, loop)
 		// The status write the step may have made is only visible on a re-read.
 		fresh := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fresh)).To(Succeed())
-		return changed, requeue, hold, err, fresh
+		return changed, requeue, hold, fresh, err
 	}
 
 	DescribeTable("F57a: an AlreadyExists create that cannot be confirmed is NOT a restored PVC",
@@ -148,7 +148,7 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 			r, _ := b2NewReconcilerWithRecorder()
 			r.Client = &f57RestoreClient{Client: k8sClient, alreadyExists: true, confirmErr: confirmErr}
 
-			changed, requeue, _, err, fresh := f57Step(r, ns, forkName)
+			changed, requeue, _, fresh, err := f57Step(r, ns, forkName)
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(changed).To(BeFalse(), "an unconfirmed create is no restore decision (I49)")
@@ -171,7 +171,7 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		r, _ := b2NewReconcilerWithRecorder()
 		r.Client = &f57RestoreClient{Client: k8sClient, raceCreate: true}
 
-		changed, requeue, _, err, fresh := f57Step(r, ns, forkName)
+		changed, requeue, _, fresh, err := f57Step(r, ns, forkName)
 
 		Expect(err).NotTo(HaveOccurred())
 		Expect(changed).To(BeTrue())

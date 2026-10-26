@@ -53,6 +53,11 @@ import (
 //     fails the Loop (terminal, reason PlanRejected).
 //   - Manual mode, plan change: a PlanChanged claim (the runner's plan-change
 //     signal) clears the PlanApproved condition (re-enter the hold).
+//   - Manual mode, sandbox hold (F49 T-2): at AwaitingApproval the sandbox is
+//     Suspended for the approval hold — not for the D30/D38 gates, which the
+//     spec satisfies and shows satisfied (NetworkEnforced=True) — and it runs
+//     again when the mode is flipped to Auto (the Manual conjunct) and after
+//     the approval.
 //
 // Each It is self-contained with its own namespace (envtest gotcha: a shared
 // namespace lets one It's sandbox/status leak into the next).
@@ -272,6 +277,28 @@ var _ = Describe("B3 plan approval gate", func() {
 		Expect(c).NotTo(BeNil(), "the CNI gate must have reported a NetworkEnforced condition")
 		Expect(c.Status).To(Equal(metav1.ConditionTrue),
 			"the network gate is SATISFIED here, so it is not what suspends the sandbox — the approval hold is")
+
+		By("the Manual conjunct: flipping the mode to Auto at AwaitingApproval lets the sandbox RUN")
+		// spec.approval.mode is mutable (no immutability rule on it; the only
+		// XValidations are on endpointSecretRef/modelEndpoint/tmpSizeLimit/
+		// restoreFrom/forkOf), so a Loop already parked at AwaitingApproval can
+		// be flipped to Auto. In Auto mode approvalHoldPhase's Manual conjunct
+		// is false, so the sandbox must run at the SAME phase — this is the
+		// step that fails if only that conjunct is deleted.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		got.Spec.Approval.Mode = coxv1alpha1.ApprovalModeAuto
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+		settle()
+		Expect(sandboxMode()).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
+			"Auto mode never holds for approval: the hold must be Manual-only")
+
+		By("flipping back to Manual re-arms the hold before the approval step")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		got.Spec.Approval.Mode = coxv1alpha1.ApprovalModeManual
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+		settle()
+		Expect(sandboxMode()).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"back in Manual mode at AwaitingApproval the hold applies again")
 
 		By("the release: an approval lets the sandbox RUN again (the hold no longer applies)")
 		setCondition(ns, name, coxv1alpha1.PlanApprovedCondition, "True",

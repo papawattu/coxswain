@@ -894,6 +894,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// return value is not needed here: the snapshot above predates the clear.
 	_ = clearModelProxyHoldForTerminal(&loop)
 
+	// F56: say on the object whether the sandbox will actually run the runner,
+	// or the 'sleep infinity' stand-in because the operator has no
+	// --runner-image. Before F56 that fallback was silent (the Loop looked
+	// Running and never advanced). The helper keeps terminal Loops untouched and
+	// adds no branch here (Reconcile is at its gocyclo budget).
+	r.surfaceRunnerAvailable(&loop)
+
 	// C6a + D34: validate the referenced AgentPolicies and the
 	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
 	// the Reconcile within the gocyclo budget).
@@ -1490,6 +1497,67 @@ func dedupToolsBySpec(tools []coxv1alpha1.ToolSpec) []coxv1alpha1.ToolSpec {
 // sandbox, which orphans it (no GC, no Owns mapping). For a sandbox owned by
 // a *different* controller, SetControllerReference returns AlreadyOwnedError,
 // so we never silently take it over.
+// runnerRuns reports whether the sandbox's agent container runs the operator's
+// runner (rather than the 'sleep infinity' stand-in). The predicate is shared by
+// agentPodSpec (which builds the command) and surfaceRunnerAvailable (which
+// reports it on the Loop), so the condition cannot drift from what the pod
+// actually runs (F56).
+func runnerRuns(r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
+	return r.RunnerImage != "" && (loop.Spec.Agent.Image == "" || loop.Spec.Agent.Image == r.RunnerImage)
+}
+
+// RunnerUnavailableEventReason is the Warning Event reason for a sandbox that
+// will run the 'sleep infinity' stand-in because the operator has no runner
+// image (F56). Emitted on the RunnerAvailable transition only.
+const RunnerUnavailableEventReason = "RunnerUnavailable"
+
+// surfaceRunnerAvailable (F56) records RunnerAvailable on the Loop and emits ONE
+// Warning Event on the transition into the degraded shape. R26 I90: a fallback
+// must surface its failure before it degrades — without this, a Loop whose
+// sandbox runs `sh -c sleep infinity` because --runner-image was never set looks
+// Running and never advances, with nothing on the object saying why.
+//
+// It does not change the fallback: 'sleep infinity' stays the documented
+// debugging opt-out for a pinned non-runner spec.agent.image (which is NOT a
+// degradation, hence AgentImagePinned). A terminal Loop is left untouched (its
+// sandbox is stopped for the phase itself, and the run is over).
+func (r *LoopReconciler) surfaceRunnerAvailable(loop *coxv1alpha1.Loop) {
+	if isTerminalPhase(loop.Status.Phase) {
+		return
+	}
+	switch {
+	case runnerRuns(r, loop):
+		setCondition(loop, coxv1alpha1.RunnerAvailableCondition, metav1.ConditionTrue, "RunnerImageSet",
+			"the sandbox runs the operator's runner image ("+r.RunnerImage+"), so the agent executes the runner")
+	case r.RunnerImage == "" && loop.Spec.Agent.Image == "":
+		// The degraded shape. Transition-gated: a Loop held here reconciles on
+		// every pass and must not re-emit.
+		was := conditionFalse(loop, coxv1alpha1.RunnerAvailableCondition, "RunnerImageUnset")
+		setCondition(loop, coxv1alpha1.RunnerAvailableCondition, metav1.ConditionFalse, "RunnerImageUnset",
+			"no --runner-image is set and spec.agent.image is empty: the sandbox runs the 'sleep infinity' stand-in ("+r.sandboxImage()+") and the Loop cannot advance; set --runner-image, or spec.agent.image for a debugging pod")
+		if !was && r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, RunnerUnavailableEventReason,
+				"no --runner-image is set and spec.agent.image is empty: the sandbox runs the 'sleep infinity' stand-in and the Loop cannot advance")
+		}
+	default:
+		setCondition(loop, coxv1alpha1.RunnerAvailableCondition, metav1.ConditionTrue, "AgentImagePinned",
+			"spec.agent.image is set to "+loop.Spec.Agent.Image+", so the sandbox runs that image rather than the operator's runner (the 'sleep infinity' stand-in is the documented debugging opt-out)")
+	}
+}
+
+// conditionFalse reports whether the Loop already carries condType with status
+// False and the given reason (F56: the transition gate for the degraded-runner
+// Event; conditionTruePresent is the True-shaped sibling).
+func conditionFalse(loop *coxv1alpha1.Loop, condType, reason string) bool {
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == condType {
+			return loop.Status.Conditions[i].Status == metav1.ConditionFalse &&
+				loop.Status.Conditions[i].Reason == reason
+		}
+	}
+	return false
+}
+
 // agentPodSpec builds the sandbox pod's container set (the agent container +
 // the workspace init container when spec.workspace.repo is set) and the pod's
 // volume set (S3a, GAP 1). Extracted from ensureSandbox for readability and
@@ -1518,7 +1586,7 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// --runner-image); any other image keeps the 'sleep infinity' stand-in (an
 	// explicit opt-out for debugging pods / non-runner images). No runner
 	// detection by image name beyond this exact match / empty.
-	isRunner := r.RunnerImage != "" && (loop.Spec.Agent.Image == "" || loop.Spec.Agent.Image == r.RunnerImage)
+	isRunner := runnerRuns(r, loop)
 	// When spec.agent.image is empty and isRunner, the agent image is the
 	// runner (not the generic sandbox default) so /usr/local/bin/runner exists.
 	if isRunner && loop.Spec.Agent.Image == "" {

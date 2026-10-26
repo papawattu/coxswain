@@ -459,6 +459,39 @@ describe` (its Conditions block); Events do not — show them with
 or `kubectl describe loop <name>`. Code references use function names and
 file paths rather than line numbers, which change as main moves on.
 
+### `RunnerAvailable=False` — the sandbox runs `sleep infinity`, not the runner (F56)
+
+**What you see:** the Loop reaches `Running`, the sandbox pod is up, and
+nothing ever advances — no model traffic, no commits, no phase change. The
+Loop carries `RunnerAvailable=False` with reason `RunnerImageUnset`, and a
+Warning `RunnerUnavailable` Event was emitted when the operator observed that
+shape: one per observed transition, not one per reconcile. (A pass that fails
+before its status write re-observes the shape on every retry, so a Loop that
+keeps failing can show one Event per retry even though the condition itself
+does not change.)
+
+**What it means:** the operator has no `--runner-image` and the Loop has no
+`spec.agent.image`, so the agent container's command is the operator's
+`sh -c sleep infinity` stand-in. That stand-in is deliberate for a debugging
+pod, but with no image named at all it is the wrong default: the container
+stays alive so the pod looks healthy while nothing runs.
+
+**Fix:** give the operator a runner image. Every **production** render derives
+it from `IMG` (`hack/image-args.sh`): `make deploy IMG=<registry>/<img>:<tag>`
+sets `--runner-image=<registry>/coxswain-runner:<tag>` (the four component
+images live beside the controller image — same registry prefix, same tag).
+The dev overlay is the exception: `config/dev` sets
+`--runner-image=coxswain-runner:dev` itself and leaves the three proxy args
+unset.
+If you install by hand, pass `--runner-image` explicitly, or set
+`spec.agent.image` to the runner image. Restarting the operator with the flag
+is enough; the Loop reconciles (the condition flips to
+`True/RunnerImageSet`).
+
+A Loop that pins its own `spec.agent.image` to some other image is **not**
+degraded: that image's stand-in is the documented debugging opt-out, and the
+condition reads `True/AgentImagePinned` naming the image.
+
 ### `AgentNetworkPolicyReady=False`
 
 **What you see:** the condition is `False` with a message naming the error

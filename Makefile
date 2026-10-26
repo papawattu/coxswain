@@ -74,6 +74,9 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	@# F20: the shipped-manifest guard (F19) runs first so a dropped --memory-writer-image fails fast.
 	$(MAKE) memory-writer-image-test
+	@# F56: the four component-image args must be in every production-shaped render (before F56 the
+	@# `make deploy` render set none of them, so a Loop ran the sleep-infinity stand-in silently).
+	$(MAKE) image-args-test
 	@# F21: the RWX-storage script's execution test (real script, stubbed kubectl).
 	$(MAKE) rwx-storage-test
 	@# F29: the Helm chart's manager role and CRDs must not drift from config/ (serviceaccounts rule, lessonsAvailable were missing).
@@ -511,6 +514,10 @@ chart-drift-test: install-helm kustomize ## F29/F87: chart manager role covers c
 memory-writer-image-test: kustomize install-helm ## F19: every shipped manifest passes --memory-writer-image = the operator's own image.
 	@KUSTOMIZE="$(KUSTOMIZE)" hack/memory-writer-image-test.sh
 
+.PHONY: image-args-test
+image-args-test: kustomize install-helm ## F56: every production-shaped render passes all five image args, derived port-safely.
+	@KUSTOMIZE="$(KUSTOMIZE)" bash hack/image-args-test.sh
+
 .PHONY: rwx-storage-test
 rwx-storage-test: ## F21: execution test of hack/rwx-storage.sh against a stubbed kubectl.
 	@hack/rwx-storage-test.sh
@@ -549,8 +556,13 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 deploy: codegen kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config (fail-closed; no --allow-unenforced).
 	@# I51/I63: IMG was already checked first (codegen prerequisite); this TARGET-specific check is a clearer message.
 	@IMG="$(IMG)" TARGET=deploy hack/require-img.sh
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+	@# F56: render through hack/render-deploy.sh so the four component-image args
+	# (--runner-image, --proxy-image, --tool-proxy-image, --egress-proxy-image)
+	# are set from IMG, in a temp overlay (the tree stays clean). Before F56 this
+	# target set none of them: a deployed Loop ran the operator's
+	# 'sleep infinity' stand-in instead of the runner, and the proxy pods pulled
+	# :standin tags that were never pushed.
+	IMG="$(IMG)" KUSTOMIZE="$(KUSTOMIZE)" hack/render-deploy.sh | "$(KUBECTL)" apply -f -
 	# I85: the admission (VAP + binding) is a standalone kustomization (not
 	# under config/default — the namespace transform would break the
 	# cluster-scoped VAP). Applied separately, like cni-probe.

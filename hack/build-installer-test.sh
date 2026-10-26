@@ -42,7 +42,8 @@ cp -r "$ROOT/config" "$TMP/config"
 # so copy the script + template into the temp tree and run them there.
 mkdir -p "$TMP/hack"
 cp "$ROOT/hack/build-installer.sh" "$TMP/hack/build-installer.sh"
-cp "$ROOT/hack/install-args.patch.tpl" "$TMP/hack/install-args.patch.tpl"
+# F56: the component args come from image-args.sh (the template is retired).
+cp "$ROOT/hack/image-args.sh" "$TMP/hack/image-args.sh"
 KUSTOMIZE="$KUSTOMIZE" IMG="ghcr.io/$PREFIX/coxswain-controller:$TAG" bash "$TMP/hack/build-installer.sh" >/dev/null
 # The script writes dist/install.yaml under ITS OWN root ($TMP).
 OUT="$TMP/dist/install.yaml"

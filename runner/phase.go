@@ -248,10 +248,11 @@ type PhaseConfig struct {
 // It exits (returns) when:
 //   - the desired phase is read and the phase's model loop completes (the
 //     normal path: one phase, one exit),
-//   - the desired phase is unknown (a typo, or a phase the runner does not
-//     execute, e.g. Verifying is operator-owned per ADR-0005): result.json
-//     carries status=blocked with the value echoed in observedPhase — a
-//     claim the operator can see, not a phase the runner executes (exit 1),
+//   - the desired phase is one the runner does not execute (Verifying is
+//     operator-owned per ADR-0005; any other value is not a phase this binary
+//     implements — e.g. AwaitingApproval while the approval gate holds the
+//     Loop): no model call, NO claim, and an idle until SIGTERM (bounded by
+//     IdleTimeout) so the one-shot container is not crash-looped (F52 C2),
 //   - stop is closed before a desired phase appears (SIGTERM: the pod is
 //     being deleted; no claim is written).
 func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
@@ -285,7 +286,9 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	// block until SIGTERM (bounded by IdleTimeout as a safety net) so the
 	// sandbox pod stays Running until the operator recreates it.
 	if phase != PhasePlanning && phase != PhaseImplementing {
-		log.Printf("runner: desired-phase %q is not a phase this runner executes (%s is operator-owned; any other value is not implemented); idling until the operator recreates the pod", phase, PhaseVerifying)
+		log.Printf("runner: desired-phase %q is not a phase this runner executes "+
+			"(%s is operator-owned; any other value is not implemented); idling until the operator recreates the pod",
+			phase, PhaseVerifying)
 		idle := cfg.IdleTimeout
 		if idle <= 0 {
 			idle = defaultIdleTimeout

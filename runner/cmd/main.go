@@ -9,9 +9,10 @@
 // the claim from the agent container's termination message (ADR-0004,
 // APIReader path), advances the phase machine one step, and recreates the
 // sandbox pod (one container run per phase — the termination message is
-// one-shot per container run). A blocked phase (unknown desired-phase, or a
-// failed model loop) exits 1 (the operator sees the claim and requeues); a
-// completed phase exits 0.
+// one-shot per container run). A blocked phase (a failed model loop) exits 1
+// (the operator sees the claim and requeues); a phase the runner does not
+// execute (Verifying, or a value this binary does not implement) writes no
+// claim and idles until SIGTERM (F52 C2); a completed phase exits 0.
 //
 // Environment (all operator-set; a Loop cannot set COX_* names, I34):
 //   - COX_GOAL: the goal / prompt (spec.goal).

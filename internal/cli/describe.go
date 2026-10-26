@@ -18,7 +18,7 @@ func newDescribeCommand() *cobra.Command {
 		Short: "Show a Loop's phase, iteration, conditions, budget, and delivery",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return describeLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())
+			return describeLoop(cmd.Context(), currentDeps, args[0], cmd.OutOrStdout())
 		},
 	}
 	return cmd
@@ -33,7 +33,7 @@ func namespaceOf() string {
 }
 
 // describeLoop renders a Loop's summary (the describe command's core action).
-func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) error {
+func describeLoop(ctx context.Context, dc Deps, name string, out io.Writer) error {
 	u, err := getLoop(ctx, dc, name)
 	if err != nil {
 		return err

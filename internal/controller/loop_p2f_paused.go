@@ -138,9 +138,12 @@ func loopPaused(loop *coxv1alpha1.Loop) bool {
 // loopSandboxStopped reports whether the operator must stop the sandbox for
 // this Loop: the Paused phase OR a terminal phase (Succeeded, Failed). A
 // terminal Loop's one-shot runner has nothing to execute (it executes only
-// Planning or Implementing) — leaving the sandbox Running makes the agent
-// container crashloop on "unknown desired-phase <Succeeded|Failed>" for the
-// rest of the Loop's lifetime (I74). The same OperatingMode=Suspended gate
+// Planning or Implementing) — leaving the sandbox Running kept the agent
+// container crashlooping on "unknown desired-phase <Succeeded|Failed>" for the
+// rest of the Loop's lifetime (I74). Since F52 C2 an unexecutable desired phase
+// idles instead of failing, so the cause is no longer a crashloop: the stop is
+// still right, because there is no phase left for the runner to execute. The
+// same OperatingMode=Suspended gate
 // the Paused phase uses (P2f) stops the sandbox: the deliver Job runs in its
 // own pod (clone-base/import-agent/push read the workspace from a volume,
 // independent of the sandbox pod), so delivery still works after Succeeded.

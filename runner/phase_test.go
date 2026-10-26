@@ -250,7 +250,8 @@ func TestPhaseRunUnexecutablePhaseIdlesUntilStop(t *testing.T) {
 			select {
 			case res := <-done:
 				if res.Status != "" || res.ObservedPhase != "" {
-					t.Fatalf("idler returned (status=%q observedPhase=%q); want a zero Result (no claim)", res.Status, res.ObservedPhase)
+					t.Fatalf("idler returned (status=%q observedPhase=%q); want a zero Result (no claim)",
+						res.Status, res.ObservedPhase)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("PhaseRun did not return after stop (SIGTERM must break the idle)")

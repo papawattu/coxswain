@@ -1,0 +1,14 @@
+# A minimal AgentPolicy: no exec, no network, no files, no tools.
+#
+# An empty spec means no allows at all. Referencing this policy
+# (spec.policyRefs: [default-deny]) adds nothing to the default-deny baseline;
+# it exists to document the shape. Copy it and add allows to your own policy.
+#
+# AgentPolicies are namespaced and additive: a Loop's effective allows are the
+# union of the policies it references (spec.policyRefs), and an AgentPolicy the
+# Loop does not reference has no effect.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: default-deny
+spec: {}

@@ -1,0 +1,15 @@
+# The Go toolchain hosts a `go build` / `go test` check needs, reached through
+# the Loop's egress proxy. Reference it with spec.policyRefs: [go-toolchain].
+#
+# Network allows are host:port strings, enforced by the per-Loop egress proxy at
+# the CONNECT / SNI / Host layer. In-cluster targets (.svc, .cluster.local,
+# localhost, 127.0.0.1) are rejected at admission: an in-cluster target would be
+# an SSRF path around the egress proxy.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: go-toolchain
+spec:
+  network:
+    - proxy.golang.org:443
+    - sum.golang.org:443

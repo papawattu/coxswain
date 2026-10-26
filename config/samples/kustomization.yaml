@@ -4,4 +4,6 @@ resources:
 - loop-fix-failing-test.yaml
 - loop-implement-missing-endpoint.yaml
 - loop-python-missing-function.yaml
+- policies/default-deny.yaml
+- policies/go-toolchain.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

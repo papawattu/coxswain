@@ -17,9 +17,12 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -29,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -36,11 +40,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/alerts"
 	"github.com/papawattu/coxswain/internal/cni"
 	"github.com/papawattu/coxswain/internal/controller"
 	"github.com/papawattu/coxswain/internal/engine"
@@ -389,6 +395,19 @@ func main() {
 		setupLog.Error(err, "Failed to register the CNI probe Runnable")
 		os.Exit(1)
 	}
+	// F62/F63: the alert relay — a leader-elected Runnable that FOLLOWS pod
+	// logs (the engine's agent pods and the operator's own proxy pods), keeps
+	// the per-Loop blocked-action count (status.policy.blockedCount) and emits
+	// one Q4 JSON line per alert on stdout with `iteration` joined from the
+	// Loop status. The reconcile reads the holder; the relay never writes
+	// status. A relay that cannot start must not take the operator down: the
+	// holder stays empty, so no Loop publishes a number (nil, never 0 — I32),
+	// and the failure is logged loudly (R26 I90: a fallback surfaces itself).
+	auditHolder, err := addAlertRelay(mgr, kaAgentNamespace, kaAgentPodLabel)
+	if err != nil {
+		setupLog.Error(err, "Failed to register the alert relay Runnable; blocked-action counts will stay UNKNOWN")
+		auditHolder = nil
+	}
 	if err := (&controller.LoopReconciler{
 		Client:                 mgr.GetClient(),
 		Scheme:                 mgr.GetScheme(),
@@ -399,6 +418,7 @@ func main() {
 		MemoryWriterImage:      memoryWriterImage,
 		CNIProber:              cniProber,
 		CNIRegateSource:        cniRegateSrc,
+		Audit:                  auditHolder,
 		ClusterDomain:          clusterDomain,
 		WorkspaceGitImage:      workspaceGitImage,
 		RunnerImage:            runnerImage,
@@ -439,4 +459,47 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// addAlertRelay wires the F62/F63 alert relay (internal/alerts): the pods/log
+// follower, the attribution reads, the per-Loop holder the Loop controller
+// reads, and the Q4 line emitter on stdout.
+//
+// The pod reads use the manager's UNCACHED reader: the manager's Pod cache is
+// scoped to the proxy components, so a cached list would silently miss the
+// engine's agent pods and the sandbox pods (the same reason the baseCommit
+// read-back uses mgr.GetAPIReader()).
+func addAlertRelay(mgr manager.Manager, agentNamespace, agentPodLabel string) (*alerts.Holder, error) {
+	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		return nil, fmt.Errorf("build the pods/log client: %w", err)
+	}
+	holder := alerts.NewHolder()
+	relay := &alerts.Relay{
+		Source: &alerts.LogSource{Client: clientset},
+		Discoverer: &alerts.PodDiscoverer{
+			Reader:         mgr.GetAPIReader(),
+			AgentNamespace: agentNamespace,
+			AgentPodLabel:  agentPodLabel,
+		},
+		Attributor: &alerts.PodAttributor{Reader: mgr.GetAPIReader()},
+		Holder:     holder,
+		Emit:       os.Stdout,
+		// Iteration joins the Q4 envelope's iteration from the Loop status at
+		// emit time — the proxies cannot fill it (their env is immutable), and
+		// an empty field is exactly the R31 I107 row 24 defect. An unreadable
+		// Loop yields "" and the relay writes "unknown" (never empty).
+		Iteration: func(namespace, name string) string {
+			var loop coxv1alpha1.Loop
+			if err := mgr.GetClient().Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: name}, &loop); err != nil {
+				return ""
+			}
+			return strconv.Itoa(loop.Status.Iteration)
+		},
+		Log: ctrl.Log.WithName("alert-relay"),
+	}
+	if err := mgr.Add(relay); err != nil {
+		return nil, fmt.Errorf("register the alert relay Runnable: %w", err)
+	}
+	return holder, nil
 }

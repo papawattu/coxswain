@@ -63,7 +63,13 @@ const (
 // live in group "").
 var knownResourceGroup = map[string]string{
 	// core (group "")
-	corePodsResource:         coreGroup,
+	corePodsResource: coreGroup,
+	// pods/log is the SUBRESOURCE grant F62's alert relay needs (the operator
+	// follows the engine's and its own proxies' container logs). The trap is
+	// that a marker written as resources=pods,verbs=get;list does NOT grant
+	// it, and a rule under the wrong group passes envtest (cluster-admin)
+	// while forbidding the read on a cluster — the B1 storageclasses lesson.
+	"pods/log":               coreGroup,
 	"services":               coreGroup,
 	"configmaps":             coreGroup,
 	"persistentvolumeclaims": coreGroup,

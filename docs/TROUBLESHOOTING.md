@@ -739,13 +739,53 @@ A tamper init that the kubelet **OOM-killed** lands here too, not in
 any infra failure instead of failing the Loop for "tampering". The condition
 message carries the kubelet's reason next to the exit code (F83d).
 
-The operator sets no resource requests or limits on the verify Job and the Loop
-has no memory field, so there is no per-Loop knob to raise. The reason comes
-from outside the Loop — a `LimitRange` in the namespace, or node memory
-pressure — and the operator cannot tell those apart from here. **What to do:**
-`kubectl get limitrange -n <the Loop's namespace>` and check the node's memory
-pressure; raise the limit there (or give the verify Job room by moving it to a
-namespace/node with more). The agent did not tamper.
+The verify Job's containers carry operator-set resources (F58): the trusted
+inits (`clone-base` / `import-agent` / `tamper` / `artifact`) and the no-op
+main run at operator constants — requests cpu `100m` / memory `128Mi`, limits
+cpu `1` / memory `1Gi` — and `spec.verify.resources` does NOT move them. So a
+TRUSTED init that was OOM-killed hit an operator constant, not a Loop field:
+the cause is outside the Loop — a `LimitRange` in the namespace, or node
+memory pressure — and the operator cannot tell those apart from here. **What
+to do:** `kubectl get limitrange -n <the Loop's namespace>`, check the node's
+memory pressure, and raise the limit there (or give the verify Job room on a
+namespace/node with more). The agent did not tamper. An OOM-killed **check**
+is a different case and has a per-Loop knob — see `A check was OOM-killed`
+below.
+
+### A check was OOM-killed (F58)
+
+**What you see:** a Warning Event `VerifyInfraRetry` whose message reads
+`acceptance check check-0 was OOM-killed at its 2Gi memory limit (exit 137) —
+raise spec.verify.resources.limits.memory if the check legitimately needs
+more; the verify infrastructure failed, not the agent's work`, the verify Job
+recreated, and — once the retries are exhausted — the Loop `Failed` with
+reason `VerifyInfraFailed`.
+
+**What it means:** the `check-*` containers run your acceptance checks (and so
+agent-authored test code) at the operator defaults: requests cpu `250m` /
+memory `256Mi`, limits cpu `2` / memory `2Gi`. The kubelet killed the check at
+its memory limit. The operator reports that as infrastructure, not as a
+failing check: no iteration is burned and no stall entry is recorded, because
+"the check ran out of memory" says nothing about whether the agent's work is
+correct (exit `137` is SIGKILL for both an OOM kill and a check that kills
+itself, so the kubelet's `OOMKilled` reason is what distinguishes them).
+
+**What to do:** give the check the room it needs —
+`spec.verify.resources.limits.memory: 4Gi` (and `requests.memory` if the
+scheduler must reserve it). The field merges per resource name, so a single
+`limits.memory` keeps every other default. Reducing the check's footprint
+also works (`go test -p 1`, a smaller build target).
+
+Two related facts:
+
+- The per-check `/tmp` scratch is capped at `1Gi` (`SizeLimit`) and that is
+  NOT part of `spec.verify.resources`. A check that writes more than `1Gi`
+  into `/tmp` — a cold `go build` cache is the usual culprit — fails on the
+  disk bound, not on memory, and the message names the eviction (the Job goes
+  `Failed`, so it lands in `VerifyInfraFailed`).
+- Exit `137` with any other reason (a check that `kill -9`s itself) is still a
+  failing check: the Loop iterates and the iteration is burned, exactly as
+  before F58.
 
 ### `PinNotDescendant` — the verify Job refused the pinned commit (F43)
 

@@ -417,6 +417,104 @@ func verifyCheckEnv() []corev1.EnvVar {
 	)
 }
 
+// verifyCheckTmpSizeLimit is the SizeLimit of each per-check /tmp emptyDir
+// (F58). The scratch is where a check's toolchain writes (GOCACHE, GOPATH,
+// TMPDIR — verifyCheckEnv), so an unbounded runaway build fills the node's
+// ephemeral storage and evicts everything on it, including other Loops'
+// PVC-backed workspaces. 1Gi sits in the neighbourhood of the check memory
+// limit (2Gi) and is enough for a cold Go build of the shipped samples.
+//
+// It is a CONSTANT, not part of spec.verify.resources: the emptyDir bound is
+// what actually caps the disk (an ephemeral-storage LIMIT only makes the
+// kubelet evict sooner), so raising it is a follow-up spec field rather than a
+// value in a ResourceRequirements (whose keys are cpu/memory/storage names). A
+// check whose legitimate build needs more than 1Gi fails as an ephemeral
+// storage eviction → Job Failed → VerifyInfraFailed (bounded retry), not as a
+// blamed failing check.
+const verifyCheckTmpSizeLimit = "1Gi"
+
+// verifyTrustedResources returns the resources of the verify Job's TRUSTED
+// containers (clone-base, import-agent, tamper, artifact — F58). They run the
+// operator's own scripts on the operator's image, so the values are constants
+// and spec.verify.resources does not move them. Burstable: a git operation on a
+// repo of unknown size may burst to 1 CPU / 1Gi, but must never reserve the
+// node (with no requests the pod was BestEffort — the first the kubelet evicts
+// under pressure, and an unbounded init could take the neighbours with it).
+//
+// A fresh list per call: several containers share these values, and a shared
+// map would let one container's mutation (a spec, a future edit) silently
+// rewrite the others.
+func verifyTrustedResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    *newLimit("100m"),
+			corev1.ResourceMemory: *newLimit("128Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    *newLimit("1"),
+			corev1.ResourceMemory: *newLimit("1Gi"),
+		},
+	}
+}
+
+// verifyNoopResources returns the resources of the Job's no-op main container
+// (`/bin/true`, F58): the smallest sensible pair, no burst needed. Trusted-class
+// values would do, but a /bin/true that asks for 1 CPU misreports what the Job
+// costs, and this is the one container whose exact need is known.
+func verifyNoopResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    *newLimit("10m"),
+			corev1.ResourceMemory: *newLimit("16Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    *newLimit("100m"),
+			corev1.ResourceMemory: *newLimit("64Mi"),
+		},
+	}
+}
+
+// verifyCheckDefaultResources returns the DEFAULT resources of the check-*
+// containers (F58): the acceptance checks run agent-authored test code, so they
+// get more room than the trusted inits (a `go build` / `go test` with a cold
+// cache) but stay Burstable and bounded (250m/256Mi requests, 2 CPU / 2Gi
+// limits). The ephemeral-storage pair tracks the per-check scratch
+// (verifyCheckTmpSizeLimit, 1Gi): the request makes the scheduler account for
+// it and the limit makes the kubelet evict THIS pod, not the node's neighbours.
+func verifyCheckDefaultResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:              *newLimit("250m"),
+			corev1.ResourceMemory:           *newLimit("256Mi"),
+			corev1.ResourceEphemeralStorage: *newLimit("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              *newLimit("2"),
+			corev1.ResourceMemory:           *newLimit("2Gi"),
+			corev1.ResourceEphemeralStorage: *newLimit("2Gi"),
+		},
+	}
+}
+
+// verifyCheckResources returns the resources of the check-* containers: the
+// operator defaults (verifyCheckDefaultResources) with spec.verify.resources
+// overlaid PER RESOURCE NAME (F58). A Loop that sets only limits.memory keeps
+// every other default — including the operator-owned ephemeral-storage entry,
+// which is why the overlay is a name-by-name merge and not a wholesale
+// replacement. Nothing is capped: the Loop author owns the checks (D21).
+func verifyCheckResources(loop *coxv1alpha1.Loop) corev1.ResourceRequirements {
+	res := verifyCheckDefaultResources()
+	if want := loop.Spec.Verify.Resources; want != nil {
+		for name, q := range want.Requests {
+			res.Requests[name] = q
+		}
+		for name, q := range want.Limits {
+			res.Limits[name] = q
+		}
+	}
+	return res
+}
+
 // artifactScript is the I47 build-artifact check's script. Over the files
 // ADDED in baseCommit..verifiedCommit (git -c core.hooksPath=/dev/null diff
 // --diff-filter=A -z --name-only, piped NUL-delimited into the loop), it
@@ -670,6 +768,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Command:         []string{verifySh, "-c", cloneScript(repo, baseCommit)},
 		SecurityContext: trustedContainerSecurityContext(),
 		Env:             verifyGitSafeEnv(),
+		Resources:       verifyTrustedResources(),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: verifyVol, MountPath: verifyScratchPath},
 		},
@@ -715,6 +814,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", importScript},
 		SecurityContext: trustedContainerSecurityContext(),
+		Resources:       verifyTrustedResources(),
 		Env: []corev1.EnvVar{
 			// One safe.directory entry: the scratch (/verify, where the clone
 			// lives — its emptyDir is root-owned while the containers run
@@ -758,6 +858,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Command:         []string{verifySh, "-c", artifactScript(baseCommit, verifyCommit)},
 		SecurityContext: trustedContainerSecurityContext(),
 		Env:             verifyGitSafeEnv(),
+		Resources:       verifyTrustedResources(),
 		VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
 	}
 
@@ -772,6 +873,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Command:         []string{verifySh, "-c", tamperScript},
 		SecurityContext: trustedContainerSecurityContext(),
 		Env:             verifyGitSafeEnv(),
+		Resources:       verifyTrustedResources(),
 		VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
 	}
 
@@ -797,6 +899,11 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
 			Env:             verifyCheckEnv(),
+			// F58: the checks are the containers that run AGENT-authored
+			// code, so they carry requests AND limits (the pod would be
+			// BestEffort without them) with the Loop's overrides merged over
+			// the operator defaults (verifyCheckResources).
+			Resources: verifyCheckResources(loop),
 			// P2e: the check carries a terminationMessagePath so the operator
 			// can read the failing check's raw output from the
 			// terminationMessage (NO pod-log read — the stall detector's
@@ -856,6 +963,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Image:           baseImage,
 		Command:         []string{"/bin/true"},
 		SecurityContext: trustedContainerSecurityContext(),
+		Resources:       verifyNoopResources(),
 	}
 
 	inits := append([]corev1.Container{cloneCt, importCt, tamperCt, artifactCt}, checkCts...)
@@ -872,8 +980,16 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	}
 	for i := range checks {
 		volumes = append(volumes, corev1.Volume{
-			Name:         verifyCheckTmpVolName(i),
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			Name: verifyCheckTmpVolName(i),
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				// F58: the scratch is BOUNDED. It holds the toolchain caches
+				// (GOCACHE/GOPATH/TMPDIR) of agent-authored check code, so an
+				// unbounded build would fill the node's ephemeral storage and
+				// evict every other pod on it. A check that legitimately needs
+				// more than verifyCheckTmpSizeLimit is a follow-up (a spec
+				// field), not a spec.verify.resources value.
+				SizeLimit: newLimit(verifyCheckTmpSizeLimit),
+			}},
 		})
 	}
 	if loop.Spec.Workspace.GitCredentialSecret != "" {
@@ -1327,6 +1443,7 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 		name := fmt.Sprintf("check-%d", i)
 		found := false
 		var code int32
+		var oom bool
 		for j := range pod.Status.InitContainerStatuses {
 			ics := &pod.Status.InitContainerStatuses[j]
 			if ics.Name != name {
@@ -1335,6 +1452,11 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 			found = true
 			if ics.State.Terminated != nil {
 				code = ics.State.Terminated.ExitCode
+				// F58: the kubelet's OOMKilled reason, read as well as the
+				// exit code. The code alone cannot tell an out-of-memory
+				// kill (137 = SIGKILL in both cases) from a check that
+				// killed itself.
+				oom = ics.State.Terminated.Reason == tamperOOMKilledReason
 			} else {
 				// Not terminated: the check is still running or waiting
 				// (kubelet has not advanced it yet). That is PENDING, not a
@@ -1351,6 +1473,18 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 			// The check init is not in the pod status at all (the Job pod has
 			// fewer inits than expected — a malformed Job). No evidence.
 			return verifyNoDecision, true, "", 0
+		}
+		// F58: an OOM-killed check is the kubelet killing the container at its
+		// memory limit, not the agent's work failing — the same
+		// fail-closed-but-not-blamed rule F83c applies to the tamper init. It
+		// goes to verifyInfraFailed (a bounded infra retry, then
+		// Failed:VerifyInfraFailed) BEFORE the code!=0 branch, because the OOM
+		// exit code is 137 and would otherwise be reported as 'check-k failed
+		// (exit 137)' — burning an iteration and a stall entry for a resource
+		// limit. Exit 137 with any other reason (a check that kill -9s itself)
+		// stays an iterate: only the kubelet's own reason is infra.
+		if oom {
+			return verifyInfraFailed, false, name, code
 		}
 		if code != 0 {
 			return verifyIterate, false, name, code
@@ -2006,12 +2140,14 @@ func jobCondition(job *batchv1.Job, t batchv1.JobConditionType) *batchv1.JobCond
 	return nil
 }
 
-// verifyInfraFailureMessage builds the human-readable failure message for the
-// VerifyInfraFailed condition / Events: it names the failed container and its
-// exit code when the pod statuses carry them, and falls back to the Job-level
-// failure (no container named) when the pod is gone or its statuses do not
-// explain the failure (a Failed Job with no terminated init — the
-// no-check-ran case).
+// verifyInfraFailureMessage builds the VerifyInfraRetry / VerifyInfraFailed
+// message for the verify Job's infra failure (I65, F53, F83d, F58). It names
+// whatever the operator can actually observe: the deadline, the failed
+// container and the kubelet's own reason, and — for an OOM-killed check — the
+// memory limit it hit and the field that raises it, so TROUBLESHOOTING has a
+// target. It falls back to the Job-level failure (no container named) when the
+// pod is gone or its statuses do not explain the failure (a Failed Job with no
+// terminated init — the no-check-ran case).
 //
 // job is the SAME Job snapshot the decision was taken from; it is used only for
 // the deadline arm, to name the value that actually killed the Job (pi3
@@ -2034,6 +2170,17 @@ func verifyInfraFailureMessage(pod *corev1.Pod, job *batchv1.Job, failedCheck st
 	}
 	if failedCheck == "" {
 		return "the verify Job failed before the acceptance checks ran (no check init terminated; the Job condition is Failed) — the verify infrastructure failed, not the agent's work"
+	}
+	// F58: an OOM-killed check is the resource limit, and the remedy is a spec
+	// field, so name both — the limit the kubelet enforced comes from the pod's
+	// own container spec (the value as applied, not the Loop's request).
+	if initTerminatedReason(pod, failedCheck) == tamperOOMKilledReason {
+		if limit, ok := initMemoryLimit(pod, failedCheck); ok {
+			if strings.HasPrefix(failedCheck, "check-") {
+				return fmt.Sprintf("acceptance check %s was OOM-killed at its %s memory limit (exit %d) — raise spec.verify.resources.limits.memory if the check legitimately needs more; the verify infrastructure failed, not the agent's work", failedCheck, limit, checkExitCode)
+			}
+			return fmt.Sprintf("verify init %s was OOM-killed at its %s memory limit (exit %d) — the verify infrastructure failed, not the agent's work", failedCheck, limit, checkExitCode)
+		}
 	}
 	// F83d: keep the kubelet's own reason in the message. F83c maps OOMKilled (and
 	// an Evicted pod) to VerifyInfraFailed, and without the reason the operator
@@ -2064,6 +2211,27 @@ func initTerminatedReason(pod *corev1.Pod, name string) string {
 		return ""
 	}
 	return ""
+}
+
+// initMemoryLimit returns the memory limit the named init container was started
+// with, as the applied pod spec records it (F58). The operator's own constants
+// are not consulted: the message must report the limit the kubelet actually
+// enforced, which is what makes an OOM message actionable after a spec change.
+func initMemoryLimit(pod *corev1.Pod, name string) (string, bool) {
+	if pod == nil {
+		return "", false
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if c.Name != name {
+			continue
+		}
+		if q, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			return q.String(), true
+		}
+		return "", false
+	}
+	return "", false
 }
 
 // applyVerifyInfraFailure is the I65 bounded-retry decision for a verify

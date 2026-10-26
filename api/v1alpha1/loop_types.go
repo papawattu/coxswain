@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -269,6 +270,37 @@ type VerifyConfig struct {
 	// the box).
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// resources sets the CPU, memory and ephemeral-storage resources of the
+	// check-* containers — the acceptance-check inits, the only containers in
+	// the verify Job that run agent-authored code (the checks run over the
+	// agent's tree, F58). It does NOT move the trusted inits (clone-base,
+	// import-agent, tamper, artifact) or the no-op main: they run operator
+	// scripts on the operator's own images and keep the operator's constants.
+	//
+	// The operator defaults are requests cpu 250m / memory 256Mi and limits
+	// cpu 2 / memory 2Gi (plus an ephemeral-storage request 1Gi / limit 2Gi for
+	// the scratch): enough for the shipped samples' `go build` / `go test` with
+	// a cold cache, small enough that a runaway check cannot take the node.
+	// The values are merged PER RESOURCE NAME over those defaults, so setting
+	// only limits.memory keeps every other default — including the
+	// operator-owned ephemeral-storage entry. A resource name set here WINS for
+	// that name (the merge has no operator-wins exception, ephemeral-storage
+	// included): the hard disk bound is the per-check emptyDir SizeLimit, which
+	// this field cannot change, so a LOWER ephemeral-storage limit only makes
+	// the kubelet evict the check sooner and a higher one does not give it more
+	// room. There is no cap on the values: the Loop author owns the checks
+	// (D21), and a heavier toolchain raises them here.
+	//
+	// The per-check /tmp emptyDir's SizeLimit (a constant, 1Gi) is NOT part of
+	// this field: the emptyDir bound is what actually caps the disk a check can
+	// write, so a check that needs more scratch is a follow-up (a spec field
+	// for the SizeLimit), not a resources entry here. A check the kubelet
+	// OOM-kills is never blamed on the agent: it is a verify INFRA failure (an
+	// infra retry, then Failed:VerifyInfraFailed), and the fix is to raise
+	// limits.memory, not the check command.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // VerifyStatus is the operator's record of the last verify run's evidence

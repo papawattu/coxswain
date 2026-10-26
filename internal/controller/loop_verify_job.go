@@ -604,9 +604,9 @@ func importAgentScript(baseCommit, verifyCommit string) string {
 	return fmt.Sprintf(`
 set -e
 cd /verify
-# F67: no fetch — read the agent's object store through an alternate and copy
-# the pinned commit's closure here; never start a server process in (or read
-# the config of) the agent's repo.
+# F67: read the agent's object store through an alternate and copy the pinned
+# commit's closure here; no server process runs in (or reads the config of) the
+# agent's repo.
 export GIT_ALTERNATE_OBJECT_DIRECTORIES=/agent-src/.git/objects
 git -c core.hooksPath=/dev/null rev-list --objects %[2]s | cut -d' ' -f1 | git -c core.hooksPath=/dev/null pack-objects .git/objects/pack/pack
 # From here the alternate is gone: only /verify's own store is visible, which

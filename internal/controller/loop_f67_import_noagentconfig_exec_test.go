@@ -102,7 +102,7 @@ func f67RunScript(t *testing.T, script string, extraEnv ...string) (int, string)
 // upload-pack, i.e. if git ran AS A SERVER in the agent's repo.
 func f67AssertNoServerProcess(t *testing.T, out string) {
 	t.Helper()
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if strings.Contains(line, "git-upload-pack") {
 			t.Fatalf("git started upload-pack (a server process) in the agent's repo; F67 removed that path: %s", line)
 		}

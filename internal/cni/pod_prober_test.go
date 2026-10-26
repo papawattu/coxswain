@@ -395,7 +395,7 @@ exec(compile(sys.stdin.read(), "probe", "exec"))
 			if !strings.Contains(got, tc.want) {
 				t.Fatalf("mode %q: want %q in the probe output, got:\n%s", tc.mode, tc.want, got)
 			}
-			for _, line := range strings.Split(got, "\n") {
+			for line := range strings.SplitSeq(got, "\n") {
 				if strings.HasPrefix(line, "RESULT ") && strings.Contains(line, tc.reject) {
 					t.Fatalf("mode %q: verdict %q must not appear, got line %q", tc.mode, tc.reject, line)
 				}

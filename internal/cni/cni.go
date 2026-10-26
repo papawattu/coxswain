@@ -54,8 +54,9 @@ const (
 type CNIProbeResult struct {
 	// Reason is one of CNIEnforced / CNIUnenforced / ProbeUnavailable.
 	Reason Reason
-	// Rows are the parsed target rows (label -> REACHABLE|BLOCKED), for the
-	// Event message and the condition message. Empty on ProbeUnavailable.
+	// Rows are the parsed target rows (label -> REACHABLE|BLOCKED|UNRESOLVED),
+	// for the Event message and the condition message. Empty on ProbeUnavailable
+	// (an UNRESOLVED row maps there before any row is kept).
 	Rows []TargetRow
 	// Detail carries the short human-readable detail for the condition
 	// message (e.g. the reachable labels, or the validation error).

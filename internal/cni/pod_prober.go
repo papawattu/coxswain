@@ -506,12 +506,13 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 		}
 		seen++
 		// UNRESOLVED is not evidence of enforcement OR of a fence bypass:
-		// the target could not be measured (no address, or the connection
-		// was refused). Any UNRESOLVED row makes the whole probe
-		// ProbeUnavailable, before the control/BLOCKED logic can claim a
-		// verdict.
+		// the target was not measurable — either its name did not resolve or
+		// the connection was refused (which proves the name DID resolve, so
+		// the detail must not assert a resolution failure). Any UNRESOLVED
+		// row makes the whole probe ProbeUnavailable, before the
+		// control/BLOCKED logic can claim a verdict.
 		if verdict == verdictUnresolved {
-			return unavailable("probe target could not be resolved: " + label), nil
+			return unavailable("probe target was not measurable: " + label), nil
 		}
 		rows = append(rows, TargetRow{Label: label, Verdict: verdict})
 		if verdict == verdictReachable {

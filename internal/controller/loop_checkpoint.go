@@ -414,16 +414,19 @@ func (r *LoopReconciler) applyCheckpointConditions(ctx context.Context, loop *co
 	// snapshotCRDPresent is called inside checkpointSupport; the driver and
 	// VSC reads only run when the CRD is present.
 	status, reason, message := r.checkpointSupport(ctx, loop)
-	before := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.CheckpointsAvailableCondition)
-	meta.SetStatusCondition(&loop.Status.Conditions, metav1.Condition{
+	// SetStatusCondition returns whether it changed anything, over exactly the
+	// fields A2 cares about (status, reason, message, observedGeneration).
+	// Do NOT snapshot the condition with FindStatusCondition and compare it
+	// after the set: that returns a POINTER INTO THIS SLICE, which the set
+	// updates in place, so the comparison would compare the new value with
+	// itself and report false on every real transition (the #302 P2).
+	changed = meta.SetStatusCondition(&loop.Status.Conditions, metav1.Condition{
 		Type:    coxv1alpha1.CheckpointsAvailableCondition,
 		Status:  status,
 		Reason:  reason,
 		Message: message,
 	})
 	after := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.CheckpointsAvailableCondition)
-	changed = before == nil || before.Status != after.Status ||
-		before.Reason != after.Reason || before.Message != after.Message
 	// D59 Required: fail at start (terminal) when checkpoints are not
 	// possible. "At start" is the phase-bootstrap moment (Pending ->
 	// Planning): the gate fires once, on the FIRST reconcile after the PVC

@@ -5,6 +5,10 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -88,4 +92,101 @@ func findConditionIn(conds []metav1.Condition, condType string) *metav1.Conditio
 		}
 	}
 	return nil
+}
+
+// F52 A2 (#302 P2): the TRANSITION case. The first fix compared the stored
+// condition before and after the set, but FindStatusCondition returns a
+// pointer into the slice SetStatusCondition mutates in place, so the compare
+// ran against itself and reported false on every real transition. These two
+// cases are what that bug made impossible to see: a stored True replaced by a
+// computed False (the support broke), and a stored False replaced by a
+// computed True (the support appeared).
+func TestF52ApplyCheckpointConditionsReportsFalseToTrue(t *testing.T) {
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "f52a-a2-up", Namespace: "default"},
+		Spec:       coxv1alpha1.LoopSpec{Checkpoints: coxv1alpha1.CheckpointPolicyBestEffort},
+		Status: coxv1alpha1.LoopStatus{
+			Phase: coxv1alpha1.LoopPhasePlanning,
+			// The stored state: no support (the CRD was missing last pass).
+			Conditions: []metav1.Condition{{
+				Type:    coxv1alpha1.CheckpointsAvailableCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  CheckpointReasonCRDMissing,
+				Message: "the VolumeSnapshot CRD is not installed",
+			}},
+		},
+	}
+	r := supportedCheckpointReconciler(t, "hostpath.csi.k8s.io")
+
+	changed, terminal := r.applyCheckpointConditions(context.Background(), loop)
+	if !changed {
+		t.Fatal("a stored False replaced by a computed True must report changed=true (F52 A2 / #302 P2)")
+	}
+	if terminal {
+		t.Fatal("BestEffort with support is not terminal")
+	}
+	cond := findConditionIn(loop.Status.Conditions, coxv1alpha1.CheckpointsAvailableCondition)
+	if cond.Status != metav1.ConditionTrue || cond.Reason != CheckpointReasonAvailable {
+		t.Fatalf("the stored condition must be the computed True/Available, got %s/%s", cond.Status, cond.Reason)
+	}
+}
+
+func TestF52ApplyCheckpointConditionsReportsTrueToFalse(t *testing.T) {
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "f52a-a2-down", Namespace: "default"},
+		Spec:       coxv1alpha1.LoopSpec{Checkpoints: coxv1alpha1.CheckpointPolicyBestEffort},
+		Status: coxv1alpha1.LoopStatus{
+			Phase: coxv1alpha1.LoopPhasePlanning,
+			// The stored state: support was available last pass; this pass the
+			// CRD is gone.
+			Conditions: []metav1.Condition{{
+				Type:    coxv1alpha1.CheckpointsAvailableCondition,
+				Status:  metav1.ConditionTrue,
+				Reason:  CheckpointReasonAvailable,
+				Message: "volume-snapshot checkpoints are being taken after each successful verify (driver hostpath.csi.k8s.io)",
+			}},
+		},
+	}
+	r := &LoopReconciler{
+		snapshotCRDPresent: func(context.Context) bool { return false },
+	}
+
+	changed, terminal := r.applyCheckpointConditions(context.Background(), loop)
+	if !changed {
+		t.Fatal("a stored True replaced by a computed False must report changed=true (F52 A2 / #302 P2)")
+	}
+	if terminal {
+		t.Fatal("BestEffort without support is not terminal (the Loop carries on)")
+	}
+	cond := findConditionIn(loop.Status.Conditions, coxv1alpha1.CheckpointsAvailableCondition)
+	if cond.Status != metav1.ConditionFalse || cond.Reason != CheckpointReasonCRDMissing {
+		t.Fatalf("the stored condition must be the computed False/CRDMissing, got %s/%s", cond.Status, cond.Reason)
+	}
+}
+
+// supportedCheckpointReconciler builds a reconciler whose checkpoint support
+// check answers True without a cluster: the CRD is reported present, the
+// workspace driver comes from the seam, and one VolumeSnapshotClass for that
+// driver is in a fake client (the only API read the support check makes).
+func supportedCheckpointReconciler(t *testing.T, driver string) *LoopReconciler {
+	t.Helper()
+	vscListGVK := volumeSnapshotClassListGVK
+	vscGVK := schema.GroupVersionKind{Group: snapshotGroup, Version: "v1", Kind: "VolumeSnapshotClass"}
+	sc := runtime.NewScheme()
+	sc.AddKnownTypeWithName(vscGVK, &unstructured.Unstructured{})
+	sc.AddKnownTypeWithName(vscListGVK, &unstructured.UnstructuredList{})
+	vsc := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": snapshotGV,
+		"kind":       "VolumeSnapshotClass",
+		"metadata":   map[string]any{"name": "f52a-vsc"},
+		"driver":     driver,
+	}}
+	c := fake.NewClientBuilder().WithScheme(sc).WithObjects(vsc).Build()
+	return &LoopReconciler{
+		Client:             c,
+		snapshotCRDPresent: func(context.Context) bool { return true },
+		workspaceDriverSeam: func(context.Context, *coxv1alpha1.Loop) (string, bool) {
+			return driver, true
+		},
+	}
 }

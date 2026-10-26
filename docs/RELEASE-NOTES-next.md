@@ -282,6 +282,14 @@ F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop 
 ### F84c: `ModelProxyNotReady` no longer sticks when another gate holds, and a flapping proxy read no longer rewrites status every pass — #277
 
 - **What was wrong.** The clear for `ModelProxyNotReady` lived inside the model-proxy hold itself, which the reconcile only reaches after the earlier gates — so a Loop that reached Failed or Succeeded while an earlier gate held (including a missing AgentPolicy reference) kept `ModelProxyNotReady=True` forever, outliving the reason it was set. And a proxy pod that could not be read put the raw error text in the condition's message, so a read error whose text changed between passes re-stamped the condition with a new message on every reconcile pass (F84c).
+### I144: the memory PVC degradation re-announces on a quiet window instead of firing once — #299
+
+- **What was wrong.** When a running Loop's memory PVC stays unbound (a StorageClass without ReadWriteMany, for example), the `MemoryPVCUnbound` Warning was gated by a one-shot marker set on the first reconcile and cleared only when the PVC bound; because Events expire at the cluster's `--event-ttl` (default 1 hour), a PVC unbound for longer than that left the degradation with no surface at all — no condition, no `cox describe` line, and the Event gone (I144).
+- **What changed.** The warning now runs through the shared quiet-window helper: the marker holds the last Event's time and the `MemoryPVCUnbound` Warning repeats once per 5-minute window while the PVC stays unbound, instead of once per Loop (I144, PR #299). The re-announce is actually scheduled — while the PVC is unbound, the reconcile requeues on the window (taking the earlier of it and the budget's read window, with the 5s work requeue still winning) — and a finished Loop is not warned again, since the surface runs only while the sandbox step runs. No condition was added (option (b) of the item); a pre-upgrade one-shot marker parses as "not recently notified", so an upgrade announces once and rewrites the marker (PR #299).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #299).
+
+### F84c: the terminal clear now runs ahead of the validation holds
+
 - **What changed.** The terminal clear now runs on every reconcile of a finished Loop, ahead of the validation, restore and NetworkEnforced holds and on the deleting path, so a finished Loop no longer keeps `ModelProxyNotReady=True` while another gate (a missing AgentPolicy reference included) holds (F84c, PR #277). A failed proxy read now reports a stable reason; the error text goes to the Event and the log instead of the condition message, so a flapping read no longer rewrites the condition every pass (F84c, PR #277).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #277).
 

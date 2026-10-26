@@ -359,14 +359,14 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 			job := &batchv1.Job{}
 			_ = k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: jobName}, job)
 			if job.UID == "" {
-				job = &batchv1.Job{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:        jobName,
-						Namespace:   ns,
-						Labels:      verifyJobLabels(loopName),
-						Annotations: map[string]string{verifyCommitAnnotation: p2gHeadCommit},
-					},
-					Spec: batchv1.JobSpec{
+				// plantVerifyJob owns the F83b controller reference every verify-Job
+				// fixture needs; the pin annotation and the pod template below are
+				// this fixture's own obligations (the D27 guard deletes a Job whose
+				// annotation does not match the CURRENT pin, and the batch
+				// controller's pod carries the job-name label).
+				job = plantVerifyJob(ctx, ns, loopName, jobName, func(j *batchv1.Job) {
+					j.Annotations = map[string]string{verifyCommitAnnotation: p2gHeadCommit}
+					j.Spec = batchv1.JobSpec{
 						Template: corev1.PodTemplateSpec{
 							ObjectMeta: metav1.ObjectMeta{
 								Labels: map[string]string{
@@ -379,10 +379,8 @@ var _ = Describe("P2g: conditions + events for every P2 transition (the auditabi
 								Containers:    []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}},
 							},
 						},
-					},
-				}
-				Expect(controllerutil.SetControllerReference(getLoop(ns, loopName), job, k8sClient.Scheme())).To(Succeed())
-				Expect(k8sClient.Create(ctx, job)).To(Succeed())
+					}
+				})
 			} else {
 				// The Job exists (from a prior iteration of this Loop, or the
 				// operator's create): stamp the CURRENT pin so the D27 guard

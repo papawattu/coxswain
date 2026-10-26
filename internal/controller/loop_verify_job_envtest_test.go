@@ -222,14 +222,7 @@ func s5aVerifyPodMultiCheck(ctx context.Context, ns, name, jobName string, check
 	// real cluster).
 	job := &batchv1.Job{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-		job = &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      jobName,
-				Namespace: ns,
-				Labels:    verifyJobLabels(name),
-			},
-		}
-		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		job = plantVerifyJob(ctx, ns, name, jobName)
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -346,14 +339,7 @@ func s5aVerifyPod(ctx context.Context, ns, name, jobName string, checkExit int32
 	// shape on a real cluster).
 	job := &batchv1.Job{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-		job = &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      jobName,
-				Namespace: ns,
-				Labels:    verifyJobLabels(name),
-			},
-		}
-		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		job = plantVerifyJob(ctx, ns, name, jobName)
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -410,14 +396,7 @@ func s5aVerifyInitStatuses(artifact corev1.ContainerState, checkExits []int32) [
 func s5aVerifyPodInProg(ctx context.Context, ns, name, jobName string) {
 	job := &batchv1.Job{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-		job = &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      jobName,
-				Namespace: ns,
-				Labels:    verifyJobLabels(name),
-			},
-		}
-		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		job = plantVerifyJob(ctx, ns, name, jobName)
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -787,8 +766,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// the S5a happy path, but the spec drives its own verify Job directly).
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -851,8 +829,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			// the S5a happy path, but the spec drives its own verify Job directly).
 			job := &batchv1.Job{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-				job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-				Expect(k8sClient.Create(ctx, job)).To(Succeed())
+				job = plantVerifyJob(ctx, ns, name, jobName)
 			}
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -981,8 +958,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// the S5a happy path, but the spec drives its own verify Job directly).
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1037,8 +1013,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// the S5a happy path, but the spec drives its own verify Job directly).
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1100,8 +1075,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// the S5a happy path, but the spec drives its own verify Job directly).
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1220,8 +1194,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// the S5a happy path, but the spec drives its own verify Job directly).
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1299,8 +1272,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		// the S5a happy path, but the spec drives its own verify Job directly).
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{

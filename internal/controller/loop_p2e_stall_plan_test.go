@@ -53,7 +53,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -259,35 +258,27 @@ var _ = Describe("P2e: stall gate plan specs (envtest-first, plan P2e 3/5/8/9/10
 		jobName := fmt.Sprintf("%s-verify-%d", loopName, iter)
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			// Use the CURRENT pin's commit (the D27 guard requires it to match
-			// the CURRENT pin's annotation, else the Job is deleted).
-			l := getLoop(ns, loopName)
-			pin := ""
-			if l.Status.CurrentVerify != nil {
-				pin = l.Status.CurrentVerify.VerifiedCommit
-			}
-			job = &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        jobName,
-					Namespace:   ns,
-					Labels:      verifyJobLabels(loopName),
-					Annotations: map[string]string{verifyCommitAnnotation: pin},
-				},
-				Spec: batchv1.JobSpec{
+			// plantVerifyJob owns the F83b controller reference every verify-Job
+			// fixture needs; the pin annotation below is this fixture's own
+			// obligation (the D27 guard deletes a Job whose annotation does not
+			// match the CURRENT pin).
+			job = plantVerifyJob(ctx, ns, loopName, jobName, func(j *batchv1.Job) {
+				// Use the CURRENT pin's commit (the D27 guard requires it to match
+				// the CURRENT pin's annotation, else the Job is deleted).
+				pin := ""
+				if l := p5fGet(ns, loopName); l.Status.CurrentVerify != nil {
+					pin = l.Status.CurrentVerify.VerifiedCommit
+				}
+				j.Annotations = map[string]string{verifyCommitAnnotation: pin}
+				j.Spec = batchv1.JobSpec{
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							RestartPolicy: corev1.RestartPolicyNever,
 							Containers:    []corev1.Container{{Name: verifyMainContainer, Image: verifyBusybox}},
 						},
 					},
-				},
-			}
-			// F83b: the operator now refuses to trust or delete a verify Job
-			// that is not the Loop's, so the fixture Job carries the controller
-			// owner reference a real verify Job gets. Do not weaken the guard
-			// for a fixture.
-			Expect(controllerutil.SetControllerReference(l, job, k8sClient.Scheme())).To(Succeed())
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+				}
+			})
 		}
 		tamperState := corev1.ContainerState{}
 		artifactState := corev1.ContainerState{}

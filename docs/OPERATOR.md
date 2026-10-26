@@ -694,6 +694,11 @@ The tool proxies. The allowlist adds one egress peer per tool proxy, one per
 tool in the effective policy (the `toolProxyNetpolPeer` rule in
 `ensureNetworkPolicy`; 0006-A1 row 16).
 
+Reference policies ship in `config/samples/policies/`: a minimal `default-deny`
+and a `go-toolchain` network allow list. They are ordinary AgentPolicy objects
+(inert until a Loop references one via `spec.policyRefs`) and are included in
+`kubectl apply -k config/samples`.
+
 ### What the sandbox cannot reach
 
 The model endpoint, directly. A direct agent → model-endpoint connection is

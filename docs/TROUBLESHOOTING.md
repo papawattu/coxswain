@@ -463,9 +463,12 @@ file paths rather than line numbers, which change as main moves on.
 
 **What you see:** the Loop reaches `Running`, the sandbox pod is up, and
 nothing ever advances — no model traffic, no commits, no phase change. The
-Loop carries `RunnerAvailable=False` with reason `RunnerImageUnset`, and one
-Warning `RunnerUnavailable` Event was emitted when it entered that state
-(not repeatedly).
+Loop carries `RunnerAvailable=False` with reason `RunnerImageUnset`, and a
+Warning `RunnerUnavailable` Event was emitted when the operator observed that
+shape: one per observed transition, not one per reconcile. (A pass that fails
+before its status write re-observes the shape on every retry, so a Loop that
+keeps failing can show one Event per retry even though the condition itself
+does not change.)
 
 **What it means:** the operator has no `--runner-image` and the Loop has no
 `spec.agent.image`, so the agent container's command is the operator's
@@ -473,10 +476,13 @@ Warning `RunnerUnavailable` Event was emitted when it entered that state
 pod, but with no image named at all it is the wrong default: the container
 stays alive so the pod looks healthy while nothing runs.
 
-**Fix:** give the operator a runner image. Every shipped render derives it
-from `IMG` (`hack/image-args.sh`): `make deploy IMG=<registry>/<img>:<tag>`
+**Fix:** give the operator a runner image. Every **production** render derives
+it from `IMG` (`hack/image-args.sh`): `make deploy IMG=<registry>/<img>:<tag>`
 sets `--runner-image=<registry>/coxswain-runner:<tag>` (the four component
 images live beside the controller image — same registry prefix, same tag).
+The dev overlay is the exception: `config/dev` sets
+`--runner-image=coxswain-runner:dev` itself and leaves the three proxy args
+unset.
 If you install by hand, pass `--runner-image` explicitly, or set
 `spec.agent.image` to the runner image. Restarting the operator with the flag
 is enough; the Loop reconciles (the condition flips to

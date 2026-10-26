@@ -147,7 +147,7 @@ var _ = Describe("F56: a missing runner image is visible on the Loop", func() {
 			"the stand-in command is what makes the Loop never advance")
 		Expect(agent.Image).To(Equal(r.sandboxImage()))
 
-		By("one Warning Event on the transition, not one per reconcile")
+		By("one Warning Event per observed transition, not one per reconcile")
 		events := f56Unavailable(f56Drain(recorder))
 		Expect(events).To(HaveLen(1), "expected exactly one RunnerUnavailable Event, got %v", events)
 		Expect(events[0]).To(ContainSubstring(corev1.EventTypeWarning))

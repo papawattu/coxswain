@@ -41,9 +41,11 @@ kind load docker-image coxswain:dev --name coxswain
 # images from IMG — same registry prefix and tag, named coxswain-runner /
 # coxswain-model-proxy / coxswain-tool-proxy / coxswain-egress-proxy — so build
 # and push those alongside the controller.
-# deploy-dev instead leaves those four args unset on purpose: the operator's
-# built-in stand-in names (coxswain-runner:dev, coxswain-proxy:standin, …) are the
-# images `make kind-up` loads, which is right for kind and wrong anywhere else.
+# deploy-dev keeps the kind/dev defaults instead: config/dev sets
+# --runner-image=coxswain-runner:dev, and the three proxy args stay unset (the
+# operator's built-in names apply — coxswain-proxy:metering for the model proxy,
+# coxswain-tool-proxy:standin and coxswain-egress-proxy:standin). That is the
+# kind path; it is not a production install.
 make deploy-dev IMG=coxswain:dev
 
 # The proxy stand-in image is built and loaded by `make kind-up` (the

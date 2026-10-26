@@ -27,18 +27,20 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
 // F61 (R31 row 21): ADR-0007 says reference AgentPolicies ship under
-// config/samples/policies/ and that the README sample must ship with a minimal
+// config/samples/policies/ and that the sample must ship with a minimal
 // AgentPolicy. These specs hold the shipped files to that promise: they parse
 // strictly into the Go type, the APISERVER admits them (the CRD's markers and
 // CEL rules are the real validation — a parse-only check would pass an
-// in-cluster network target the CRD rejects), they are listed in the samples
-// kustomization, and default-deny's own "no allows" claim is true.
+// in-cluster network target the CRD rejects), every file is listed in the
+// samples kustomization (and every listed policy exists), and default-deny's
+// own "no allows" claim is true.
 var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 	const policiesDir = "config/samples/policies"
 	const namespace = "f61-policy-samples"
@@ -47,14 +49,9 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		return filepath.Join(append([]string{"..", ".."}, parts...)...)
 	}
 
-	BeforeAll(func() {
-		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-		if err := k8sClient.Create(ctx, ns); err != nil {
-			Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "creating the %s namespace: %v", namespace, err)
-		}
-	})
-
-	It("admits every shipped policy (strict parse + apiserver validation)", func() {
+	// policyFiles lists the shipped policy documents (the test validates every
+	// file present, so a future third reference policy is covered).
+	policyFiles := func() []string {
 		entries, err := os.ReadDir(repoPath(policiesDir))
 		Expect(err).NotTo(HaveOccurred())
 		var files []string
@@ -64,7 +61,33 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 			}
 			files = append(files, filepath.Join(repoPath(policiesDir), entry.Name()))
 		}
-		Expect(files).To(HaveLen(2), "expected exactly the two shipped reference policies (default-deny, go-toolchain)")
+		return files
+	}
+
+	BeforeAll(func() {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		if err := k8sClient.Create(ctx, ns); err != nil {
+			Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "creating the %s namespace: %v", namespace, err)
+		}
+	})
+
+	AfterAll(func() {
+		// The namespace (and with it the policies) is test-owned; remove it so
+		// the specs leave nothing behind (IgnoreNotFound for a re-run).
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, ns))).To(Succeed())
+	})
+
+	It("admits every shipped policy (strict parse + apiserver validation)", func() {
+		files := policyFiles()
+		Expect(files).NotTo(BeEmpty(), "no reference policies under %s", repoPath(policiesDir))
+
+		var names []string
+		for _, path := range files {
+			names = append(names, filepath.Base(path))
+		}
+		Expect(names).To(ContainElements("default-deny.yaml", "go-toolchain.yaml"),
+			"the two reference policies ADR-0007 promises must ship")
 
 		for _, path := range files {
 			data, err := os.ReadFile(path)
@@ -90,7 +113,7 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		}
 	})
 
-	It("lists both policies in the samples kustomization", func() {
+	It("lists every shipped policy in the samples kustomization, and every listed policy exists", func() {
 		data, err := os.ReadFile(repoPath("config", "samples", "kustomization.yaml"))
 		Expect(err).NotTo(HaveOccurred())
 
@@ -98,13 +121,30 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 			Resources []string `yaml:"resources"`
 		}
 		Expect(yaml.UnmarshalStrict(data, &kustomization)).To(Succeed())
-		// A policy file that is not in the kustomization is invisible to
-		// `kubectl apply -k config/samples`, which is how the docs tell users
-		// to apply the samples.
-		Expect(kustomization.Resources).To(ContainElements(
-			"policies/default-deny.yaml",
-			"policies/go-toolchain.yaml",
-		))
+
+		var listed []string
+		for _, resource := range kustomization.Resources {
+			if strings.HasPrefix(resource, "policies/") {
+				listed = append(listed, resource)
+			}
+		}
+
+		// Direction 1: every shipped policy file is listed. A file that is not
+		// in the kustomization is invisible to `kubectl apply -k
+		// config/samples`, which is how the docs tell users to apply them.
+		var shipped []string
+		for _, path := range policyFiles() {
+			shipped = append(shipped, filepath.Join("policies", filepath.Base(path)))
+		}
+		Expect(listed).To(ConsistOf(shipped),
+			"the kustomization's policies/ entries must be exactly the shipped policy files")
+
+		// Direction 2: every listed policy path exists (no dangling entry that
+		// would make `kubectl apply -k` fail).
+		for _, resource := range listed {
+			_, err := os.Stat(repoPath("config", "samples", resource))
+			Expect(err).NotTo(HaveOccurred(), "%s is listed in the kustomization but does not exist", resource)
+		}
 	})
 
 	It("keeps default-deny's no-allows claim true", func() {

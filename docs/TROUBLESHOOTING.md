@@ -660,6 +660,20 @@ before the Loop fails with `VerifyInfraFailed`, a reason distinct from
 the verify Job, that `baseCommit` is a real commit, and the verify Job's logs.
 The agent did not tamper; the check could not run.
 
+The **same reason also means a check hung** (F53): the verify Job carries
+`activeDeadlineSeconds: 900`, and a Job the batch controller failed on that
+deadline is an infra failure (`the verify Job hit its activeDeadlineSeconds
+deadline (900s) and was stopped before the acceptance checks completed`, with
+the same `VerifyInfraRetry` / `VerifyInfraFailed` Events). The checks run
+your commands, so a `go test` on a deadlocked test, or a fetch on a half-open
+connection, can hang until the deadline.
+
+**What to do for a hung check:** `kubectl logs -n <ns> <loop>-verify-1-<pod>
+-c check-0` to see where it stopped, and give the command its own bound
+(`go test -timeout 120s ./...`). A Failed Loop has no CLI retry — fix the
+check and re-apply the Loop. The deadline is a constant (900s), not a per-Loop
+field: if a legitimate run needs longer, shorten the check instead.
+
 A tamper init that the kubelet **OOM-killed** lands here too, not in
 `TamperedVerify`: the exit code is `137` and the kubelet's reason is
 `OOMKilled`, which F83c maps to `VerifyInfraFailed`, so the run is retried like

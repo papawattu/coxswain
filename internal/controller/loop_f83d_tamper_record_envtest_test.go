@@ -210,7 +210,7 @@ func TestVerifyInfraFailureMessageCarriesTheKubeletReason(t *testing.T) {
 		{Name: "check-0", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
 	}}}
 
-	msg := verifyInfraFailureMessage(pod, verifyTamperInit, 137)
+	msg := verifyInfraFailureMessage(pod, verifyTamperInit, 137, false)
 	if !strings.Contains(msg, "reason OOMKilled") {
 		t.Errorf("the message must carry the kubelet's reason:\n%s", msg)
 	}
@@ -223,13 +223,13 @@ func TestVerifyInfraFailureMessageCarriesTheKubeletReason(t *testing.T) {
 	noReason := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
 		{Name: "check-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
 	}}}
-	msg = verifyInfraFailureMessage(noReason, "check-0", 1)
+	msg = verifyInfraFailureMessage(noReason, "check-0", 1, false)
 	if strings.Contains(msg, "reason") {
 		t.Errorf("no reason was recorded, so none may be rendered:\n%s", msg)
 	}
 
 	// The no-check case (a Failed Job with no terminated init) is unchanged.
-	if got := verifyInfraFailureMessage(nil, "", 0); !strings.Contains(got, "no check init terminated") {
+	if got := verifyInfraFailureMessage(nil, "", 0, false); !strings.Contains(got, "no check init terminated") {
 		t.Errorf("the no-check message changed: %s", got)
 	}
 }

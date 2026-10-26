@@ -383,19 +383,36 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 	return nil
 }
 
-// verifyCheckTmpVol is the name of the emptyDir mounted at /tmp in each
-// check-* container (the writable scratch area for user check commands
-// running with readOnlyRootFilesystem — the S5a kind root cause: check-0
-// (golang:1.26) failed with 'go: creating work dir: mkdir /tmp/go-build...
-// read-only file system').
-const verifyCheckTmpVol = "check-tmp"
+// verifyCheckTmpVolPrefix is the name prefix of the per-check emptyDir mounted
+// at /tmp in a check-* container (the writable scratch area for user check
+// commands running with readOnlyRootFilesystem — the S5a kind root cause:
+// check-0 (golang:1.26) failed with 'go: creating work dir: mkdir
+// /tmp/go-build... read-only file system').
+//
+// F53 (ADR-0005 D19, "each check container gets its own writable scratch"):
+// the scratch is PER CHECK — check-tmp-0, check-tmp-1, … — not one shared
+// emptyDir. A shared scratch let check-0 poison check-1's HOME/GOCACHE/TMPDIR
+// (a `go` wrapper planted on PATH, a poisoned module cache), which is the same
+// one-way-reader property the read-only /verify mount gives the evidence tree.
+const verifyCheckTmpVolPrefix = "check-tmp"
+
+// verifyCheckTmpVolName is the name of the emptyDir mounted at /tmp in the
+// check-* container at index i (F53: one scratch per check).
+func verifyCheckTmpVolName(i int) string {
+	return fmt.Sprintf("%s-%d", verifyCheckTmpVolPrefix, i)
+}
 
 // verifyCheckEnv returns the env for the check-* containers: the
 // safe.directory entry for /verify (user-authored checks may call git
 // there) PLUS the writable-scratch env (HOME/TMPDIR/GOCACHE/GOPATH/
-// XDG_CACHE_HOME all under /tmp) so toolchain caches land on the check-tmp
+// XDG_CACHE_HOME all under /tmp) so toolchain caches land on the check's own
 // emptyDir instead of the read-only root. Generic across toolchains, not
 // Go-specific.
+//
+// F53: PYTHONPYCACHEPREFIX points the Python bytecode cache at the scratch, so
+// a check that runs `python3 -m compileall .` (the shipped python samples do)
+// keeps working against the read-only /verify checkout instead of failing on
+// __pycache__.
 func verifyCheckEnv() []corev1.EnvVar {
 	env := verifyGitSafeEnv()
 	return append(env,
@@ -404,6 +421,7 @@ func verifyCheckEnv() []corev1.EnvVar {
 		corev1.EnvVar{Name: "GOCACHE", Value: "/tmp/gocache"},
 		corev1.EnvVar{Name: "GOPATH", Value: "/tmp/gopath"},
 		corev1.EnvVar{Name: "XDG_CACHE_HOME", Value: "/tmp/.cache"},
+		corev1.EnvVar{Name: "PYTHONPYCACHEPREFIX", Value: agentTmpMount + "/pycache"},
 	)
 }
 
@@ -754,14 +772,22 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			// stdout+stderr (the failure output the normaliser hashes).
 			TerminationMessagePath: verifyTerminationLogPath,
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: verifyVol, MountPath: verifyScratchPath},
+				// F53 (D19): the checkout is READ-ONLY in every check
+				// container. Init containers run in order, so without this
+				// check-0 could rewrite a *_test.go that check-1 compiles (or
+				// plant a file a later check asserts on): the checks are
+				// one-way readers of the verified tree. The artifact gate
+				// (which writes to /verify) is an INIT, before the checks, and
+				// keeps the writable mount.
+				{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
 				// The check containers run with readOnlyRootFilesystem and
 				// the user's command needs a writable scratch area (go build
-				// writes to GOCACHE / a work dir under /tmp). The small
-				// check-tmp emptyDir at /tmp is that scratch — generic enough
-				// for toolchains other than Go too (the env below points
-				// the common cache/home paths there).
-				{Name: verifyCheckTmpVol, MountPath: agentTmpMount},
+				// writes to GOCACHE / a work dir under /tmp). A PER-CHECK
+				// emptyDir at /tmp is that scratch — generic enough for
+				// toolchains other than Go too (the env below points the
+				// common cache/home paths there), and per-check so one
+				// check cannot poison the next one's toolchain.
+				{Name: verifyCheckTmpVolName(i), MountPath: agentTmpMount},
 			},
 		}
 		checkCts = append(checkCts, ct)
@@ -801,16 +827,21 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 
 	inits := append([]corev1.Container{cloneCt, importCt, tamperCt, artifactCt}, checkCts...)
 
-	// The volumes: the verify emptyDir (the fresh clone) + the check-tmp
-	// emptyDir (writable /tmp scratch for the check containers) + the
-	// agent's workspace PVC (read-only, for the import) + the git
-	// credential (only when present).
+	// The volumes: the verify emptyDir (the fresh clone) + one check-tmp-<i>
+	// emptyDir per check container (each check's own writable /tmp scratch,
+	// F53/D19) + the agent's workspace PVC (read-only, for the import) + the
+	// git credential (only when present).
 	volumes := []corev1.Volume{
 		{Name: verifyVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: verifyCheckTmpVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		{Name: verifyAgentVol, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: workspacePVCName(loop.Name), ReadOnly: true,
 		}}},
+	}
+	for i := range checks {
+		volumes = append(volumes, corev1.Volume{
+			Name:         verifyCheckTmpVolName(i),
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
 	}
 	if loop.Spec.Workspace.GitCredentialSecret != "" {
 		volumes = append(volumes, corev1.Volume{
@@ -822,9 +853,11 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	}
 
 	backoff := int32(0)
+	deadline := verifyJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
 	return batchv1.JobSpec{
-		BackoffLimit: &backoff,
+		BackoffLimit:          &backoff,
+		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: verifyJobLabels(loop.Name)},
 			Spec: corev1.PodSpec{
@@ -1142,8 +1175,10 @@ const (
 // no check ever terminating is an infra failure too (the caller decides the
 // bounded retry), even when the pod's statuses alone do not explain the
 // failure (e.g. the pod was evicted or OOM-killed between the init and the
-// evidence).
-func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool) (int, bool, string, int32) {
+// evidence). A Job the batch controller failed on its activeDeadlineSeconds
+// (F53) is an infra failure too, decided BEFORE the per-init walk and whatever
+// the init statuses still say.
+func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExceeded bool) (int, bool, string, int32) {
 	if pod == nil {
 		// No pod at all: no decision yet unless the Job itself is Failed
 		// (a failed Job whose pod is gone — evicted, garbage-collected — is
@@ -1152,6 +1187,13 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool) (int, bool, 
 			return verifyInfraFailed, false, "", 0
 		}
 		return verifyNoDecision, true, "", 0
+	}
+	// F53: a Job the batch controller already failed on its deadline can never
+	// produce evidence, whatever stale Waiting/Running state the pod read still
+	// shows (the read can race the kill). This is not an I49 violation — the
+	// Job's own terminal condition is the fact that it is not in progress.
+	if deadlineExceeded {
+		return verifyInfraFailed, false, "", 0
 	}
 	// I65: the trusted inits (clone-base, import-agent) run BEFORE the evidence
 	// inits. A terminated non-zero trusted init is an infra failure naming the
@@ -1407,13 +1449,15 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	// no check evidence is an infra failure, not the agent's work. F83b: the
 	// condition is read from the SAME Job snapshot the pod was bound to.
 	jobFailed := isJobFailed(job)
+	// F53: the deadline kill is a decision of its own (see verifyOutcome).
+	deadlineExceeded := verifyJobDeadlineExceeded(job)
 	// F83: record the tamper evidence (the tamper init's exit code once it has
 	// TERMINATED, the pin it names, and the UID of the Job whose pod produced
 	// it) BEFORE the decision, so it is also persisted while the checks are
 	// still running.
 	evidenceChanged := recordTamperEvidence(loop, pod, job)
 	checkCount := len(loop.Spec.Verify.AcceptanceChecks)
-	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount, jobFailed)
+	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount, jobFailed, deadlineExceeded)
 	if requeue {
 		return evidenceChanged, true
 	}
@@ -1491,7 +1535,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// running Job); when the bound is exhausted the Loop is Failed with the
 		// distinct VerifyInfraFailed reason (a Warning Event on the final
 		// failure and per retry, so the wedge that I65 fixes is observable).
-		return r.applyVerifyInfraFailure(ctx, loop, pod, job, failedCheck, checkExitCode)
+		return r.applyVerifyInfraFailure(ctx, loop, pod, job, failedCheck, checkExitCode, deadlineExceeded)
 	case verifyIterate:
 		// P2e stall gate (evaluated BEFORE the budget/maxIterations cap —
 		// stall wins: a capped loop that is ALSO stalled is Failed:Stalled,
@@ -1799,6 +1843,20 @@ const (
 	// forever, and the recreate does not burn a maxIterations iteration
 	// (an infra failure says nothing about the agent's work).
 	verifyInfraRetries = 2
+	// verifyJobActiveDeadlineSeconds bounds the verify Job (F53, ADR-0005
+	// D12/D17: "activeDeadlineSeconds set"): every other decision path needs
+	// the Job to FAIL — the I65 infra retry fires on JobFailed, the stall gate
+	// reads a failing check's output, and verifyOutcome makes no decision
+	// while an init is still running (I49). A check that never terminates (a
+	// `go test` on a deadlocked test, a fetch on a half-open connection, a
+	// toolchain image pull that never completes) would otherwise hold the
+	// Loop in Verifying for ever with no condition, no Event and no bound.
+	// 900s is generous for clone + import + tamper + artifact + N checks
+	// including a cold GOCACHE fill, and bounds the worst case at
+	// (verifyInfraRetries+1) * 900s = 45 minutes before
+	// Failed:VerifyInfraFailed. The two sibling Jobs bound themselves with a
+	// constant too (deliver 600s, memory writer 300s).
+	verifyJobActiveDeadlineSeconds = int64(900)
 	// verifyInfraFailedReason is the Failed condition reason when the verify
 	// infrastructure retries are exhausted (I65): distinct from
 	// MaxIterationsExceeded (the agent's checks failed) and
@@ -1822,6 +1880,20 @@ func isJobFailed(job *batchv1.Job) bool {
 	}
 	c := jobCondition(job, batchv1.JobFailed)
 	return c != nil && c.Status == corev1.ConditionTrue
+}
+
+// verifyJobDeadlineExceeded reports whether the Job's batch condition says the
+// batch controller failed it on its activeDeadlineSeconds (F53). It is a pure
+// read of the SAME Job snapshot readVerifyJobPod bound the pod to, like
+// isJobFailed: the deadline kill is the Job's own terminal condition, so it is
+// the "not in progress" fact the I49 rule asks for — a stale Waiting/Running
+// init in the pod read that races the kill cannot mean "still working".
+func verifyJobDeadlineExceeded(job *batchv1.Job) bool {
+	if job == nil {
+		return false
+	}
+	c := jobCondition(job, batchv1.JobFailed)
+	return c != nil && c.Status == corev1.ConditionTrue && c.Reason == batchv1.JobReasonDeadlineExceeded
 }
 
 const (
@@ -1885,7 +1957,13 @@ func jobCondition(job *batchv1.Job, t batchv1.JobConditionType) *batchv1.JobCond
 // failure (no container named) when the pod is gone or its statuses do not
 // explain the failure (a Failed Job with no terminated init — the
 // no-check-ran case).
-func verifyInfraFailureMessage(pod *corev1.Pod, failedCheck string, checkExitCode int32) string {
+func verifyInfraFailureMessage(pod *corev1.Pod, failedCheck string, checkExitCode int32, deadlineExceeded bool) string {
+	// F53: the deadline kill has no container-level evidence to report — the
+	// Job stopped the pod, so name the deadline (and the configured value) so
+	// the operator knows a check hung rather than that the agent's work failed.
+	if deadlineExceeded {
+		return fmt.Sprintf("the verify Job hit its activeDeadlineSeconds deadline (%ds) and was stopped before the acceptance checks completed — the check hung; the verify infrastructure failed, not the agent's work", verifyJobActiveDeadlineSeconds)
+	}
 	if failedCheck == "" {
 		return "the verify Job failed before the acceptance checks ran (no check init terminated; the Job condition is Failed) — the verify infrastructure failed, not the agent's work"
 	}
@@ -1946,7 +2024,7 @@ func initTerminatedReason(pod *corev1.Pod, name string) string {
 // decision). It receives the verify Job already fetched by the caller
 // (applyVerifyOutcome — nil when it was NotFound; nothing to delete, the
 // recreate is the next reconcile's ensureVerifyJob).
-func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod, job *batchv1.Job, failedCheck string, checkExitCode int32) (bool, bool) {
+func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod, job *batchv1.Job, failedCheck string, checkExitCode int32, deadlineExceeded bool) (bool, bool) {
 	if loop.Status.Verify == nil {
 		loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 	}
@@ -2000,7 +2078,7 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 		loop.Status.Verify.InfraJobUID = string(job.UID)
 	}
 	attempt := loop.Status.Verify.InfraAttempts
-	msg := verifyInfraFailureMessage(pod, failedCheck, checkExitCode)
+	msg := verifyInfraFailureMessage(pod, failedCheck, checkExitCode, deadlineExceeded)
 	if attempt > verifyInfraRetries {
 		// Exhausted: fail the Loop with the distinct reason. The bound is
 		// verifyInfraRetries RECREATIONS (the original attempt is attempt 1),

@@ -1613,30 +1613,36 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
 		podSpec := job.Spec.Template.Spec
 
-		// The check-tmp emptyDir volume exists on the pod.
-		var hasCheckTmpVol bool
-		for _, v := range podSpec.Volumes {
-			if v.Name == verifyCheckTmpVol && v.EmptyDir != nil {
-				hasCheckTmpVol = true
+		// F53 (D19): the scratch is PER CHECK — check-tmp-0, check-tmp-1, … —
+		// so one check cannot poison the next one's HOME/GOCACHE/TMPDIR.
+		for i := range 2 {
+			want := verifyCheckTmpVolName(i)
+			var found bool
+			for _, v := range podSpec.Volumes {
+				if v.Name == want && v.EmptyDir != nil {
+					found = true
+				}
 			}
+			Expect(found).To(BeTrue(), "the pod must declare the %s emptyDir volume", want)
 		}
-		Expect(hasCheckTmpVol).To(BeTrue(), "the pod must declare the check-tmp emptyDir volume")
 
-		// Every check-* container mounts it at /tmp and carries the env.
+		// Every check-* container mounts its OWN scratch at /tmp and carries the env.
 		var checkCount int
 		for _, ic := range podSpec.InitContainers {
 			if !strings.HasPrefix(ic.Name, "check-") {
 				continue
 			}
+			i := checkCount
 			checkCount++
+			wantVol := verifyCheckTmpVolName(i)
 			var tmpMount bool
 			for _, m := range ic.VolumeMounts {
-				if m.Name == verifyCheckTmpVol && m.MountPath == agentTmpMount {
+				if m.Name == wantVol && m.MountPath == agentTmpMount && !m.ReadOnly {
 					tmpMount = true
 				}
 			}
 			Expect(tmpMount).To(BeTrue(),
-				"check %s must mount check-tmp at /tmp (go build needs a writable scratch)", ic.Name)
+				"check %s must mount its own %s at /tmp writable (go build needs a scratch)", ic.Name, wantVol)
 			envMap := map[string]string{}
 			for _, e := range ic.Env {
 				envMap[e.Name] = e.Value
@@ -1644,6 +1650,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 			for k, want := range map[string]string{
 				"HOME": agentTmpMount, "TMPDIR": agentTmpMount, "GOCACHE": "/tmp/gocache",
 				"GOPATH": "/tmp/gopath", "XDG_CACHE_HOME": "/tmp/.cache",
+				"PYTHONPYCACHEPREFIX": agentTmpMount + "/pycache",
 			} {
 				Expect(envMap[k]).To(Equal(want),
 					"check %s must set %s=%s so toolchain caches land on the writable emptyDir", ic.Name, k, want)
@@ -1660,7 +1667,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		}
 		Expect(checkCount).To(Equal(2))
 
-		// The trusted inits and the main container do NOT get the /tmp mount
+		// The trusted inits and the main container do NOT get a /tmp scratch
 		// (their tooling is pinned; only user checks need the scratch).
 		for _, name := range []string{"clone-base", "import-agent", "tamper", verifyNoopContainer} {
 			for i := range podSpec.InitContainers {
@@ -1668,13 +1675,14 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 					continue
 				}
 				for _, m := range podSpec.InitContainers[i].VolumeMounts {
-					Expect(m.Name).NotTo(Equal(verifyCheckTmpVol),
-						"%s must not mount check-tmp", name)
+					Expect(strings.HasPrefix(m.Name, verifyCheckTmpVolPrefix)).To(BeFalse(),
+						"%s must not mount a check-tmp scratch", name)
 				}
 			}
 		}
 		for _, m := range podSpec.Containers[0].VolumeMounts {
-			Expect(m.Name).NotTo(Equal(verifyCheckTmpVol), "the no-op main must not mount check-tmp")
+			Expect(strings.HasPrefix(m.Name, verifyCheckTmpVolPrefix)).To(BeFalse(),
+				"the no-op main must not mount a check-tmp scratch")
 		}
 	})
 

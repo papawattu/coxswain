@@ -142,7 +142,7 @@ func TestVerifyOutcomeImportAgentExits(t *testing.T) {
 		{"2 (git error) -> infra", 2, verifyInfraFailed},
 		{"128 (fetch failed) -> infra", 128, verifyInfraFailed},
 	} {
-		got, _, name, _ := verifyOutcome(pod(tc.code), 1, false)
+		got, _, name, _ := verifyOutcome(pod(tc.code), 1, false, false)
 		if got != tc.want || name != verifyImportAgentInit {
 			t.Errorf("%s: verifyOutcome = %d (%q), want %d (%q)", tc.name, got, name, tc.want, verifyImportAgentInit)
 		}
@@ -151,7 +151,7 @@ func TestVerifyOutcomeImportAgentExits(t *testing.T) {
 	p := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
 		{Name: verifyCloneBaseInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyNotDescendantExit}}},
 	}}}
-	if got, _, _, _ := verifyOutcome(p, 1, false); got != verifyInfraFailed {
+	if got, _, _, _ := verifyOutcome(p, 1, false, false); got != verifyInfraFailed {
 		t.Errorf("clone-base exit 97: verifyOutcome = %d, want infra (%d)", got, verifyInfraFailed)
 	}
 }

@@ -193,7 +193,7 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		b2Reconcile(r, ns, forkName)
 		Expect(c.snapPatches).To(Equal(1), "pass 1 writes the fork-retention label once")
 		Expect(b2RestoreCondition(b2ReconcileGet(ns, forkName)).Reason).To(Equal(coxv1alpha1.RestoreReasonRejected))
-		warnings := f57DrainRestoreEvents(rec, coxv1alpha1.RestoreReasonRejected)
+		warnings := f57DrainRejectedEvents(rec)
 		Expect(warnings).To(Equal(1), "the first failing pass emits the Warning (the transition into Rejected)")
 
 		snap, err := b2GetSnapshot(ctx, ns, srcSnap)
@@ -205,7 +205,7 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		// Pass 2: same failure. No second patch, no second Warning.
 		b2Reconcile(r, ns, forkName)
 		Expect(c.snapPatches).To(Equal(1), "a second failing pass must not write the source snapshot again (it used to patch twice per pass)")
-		Expect(f57DrainRestoreEvents(rec, coxv1alpha1.RestoreReasonRejected)).To(Equal(0),
+		Expect(f57DrainRejectedEvents(rec)).To(Equal(0),
 			"the condition is the steady state: the Warning marks the transition only")
 		Expect(b2RestoreCondition(b2ReconcileGet(ns, forkName)).Reason).To(Equal(coxv1alpha1.RestoreReasonRejected),
 			"the condition still reports the failed restore")
@@ -253,13 +253,13 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		c := b2RestoreCondition(b2ReconcileGet(ns, name))
 		Expect(c).NotTo(BeNil())
 		Expect(c.Reason).To(Equal(coxv1alpha1.RestoreReasonRejected))
-		Expect(f57DrainRestoreEvents(rec, coxv1alpha1.RestoreReasonRejected)).To(Equal(1),
+		Expect(f57DrainRejectedEvents(rec)).To(Equal(1),
 			"the first failing rollback pass emits the Warning")
 
 		_, requeue, _, err = r.b2ApplyRestoreStep(ctx, b2ReconcileGet(ns, name))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(requeue).To(BeTrue())
-		Expect(f57DrainRestoreEvents(rec, coxv1alpha1.RestoreReasonRejected)).To(Equal(0),
+		Expect(f57DrainRejectedEvents(rec)).To(Equal(0),
 			"a second failing rollback pass must not re-emit the Warning (the condition is the steady state)")
 	})
 
@@ -314,15 +314,15 @@ func b2ReconcileGet(ns, name string) *coxv1alpha1.Loop {
 	return loop
 }
 
-// f57DrainRestoreEvents counts the Restore Events for the reason in the
+// f57DrainRejectedEvents counts the Restore=False/Rejected Events in the
 // recorder's buffer (the FakeRecorder's channel is drained, so a later pass
 // starts from empty).
-func f57DrainRestoreEvents(rec *record.FakeRecorder, reason string) int {
+func f57DrainRejectedEvents(rec *record.FakeRecorder) int {
 	n := 0
 	for {
 		select {
 		case e := <-rec.Events:
-			if strings.Contains(e, "reason="+reason) {
+			if strings.Contains(e, "reason="+coxv1alpha1.RestoreReasonRejected) {
 				n++
 			}
 		default:

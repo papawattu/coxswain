@@ -162,19 +162,27 @@ var _ = Describe("F36: fork-retention label (patch, before the create) and PVC r
 		Expect(strings.Join(events, "\n")).To(ContainSubstring("Warning ForkRetentionLabelFailed"))
 	})
 
-	It("P3-3: when the fork's PVC create fails the label written before it is removed again", func() {
+	It("P3-3 (revised by F57b): a failed fork create leaves the retention label in place while it retries, and the restore is not reported complete", func() {
 		ns, forkName, srcSnap := f36Fork()
 		r, _ := b2NewReconcilerWithRecorder()
 		r.Client = &f36RBACClient{Client: k8sClient, failPVCCreate: true}
 
 		b2Reconcile(r, ns, forkName)
 
+		// F57b changed this contract: the label used to be removed again on
+		// every failed pass, which patched the SOURCE snapshot twice per
+		// reconcile and opened a window in which the source's GC could delete
+		// the very snapshot the fork is still waiting for. It now stays while
+		// the create is retried and is released by the completion path or by a
+		// deleted fork Loop (loop_f57_restore_envtest_test.go).
 		snap, err := b2GetSnapshot(ctx, ns, srcSnap)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(snap.GetLabels()).NotTo(HaveKey(forkSnapshotLabelKey), "a failed restore must not leave the retention label behind")
+		Expect(snap.GetLabels()).To(HaveKeyWithValue(forkSnapshotLabelKey, forkName),
+			"the fork still needs the source snapshot: the label stays while the create is retried")
 		l := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: forkName, Namespace: ns}, l)).To(Succeed())
 		Expect(b2RestoreCondition(l).Status).To(Equal(metav1.ConditionFalse))
+		Expect(b2RestoreCondition(l).Reason).To(Equal(coxv1alpha1.RestoreReasonRejected))
 	})
 
 	It("P2-2: a fork whose own PVC is already present is DELETED and recreated from the snapshot (the restore completes)", func() {

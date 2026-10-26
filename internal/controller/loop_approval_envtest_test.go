@@ -250,7 +250,7 @@ var _ = Describe("B3 plan approval gate", func() {
 		// the live Sandbox on one pass (the desired-phase annotation mismatch)
 		// and the next pass creates the fresh one with the new phase's mode.
 		settle := func() {
-			for i := 0; i < 3; i++ {
+			for range 3 {
 				reconcileLoop(r, ns, name)
 			}
 		}

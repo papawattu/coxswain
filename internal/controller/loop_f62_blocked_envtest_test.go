@@ -71,15 +71,6 @@ var _ = Describe("F62: the blocked-action count is relayed into status", func() 
 		return ns
 	}
 
-	// f62NewLoop creates a Loop and returns its UID (the count key).
-	f62NewLoop := func(ns, name string) types.UID {
-		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       s5aLoopSpec(),
-		})).To(Succeed())
-		return f62GetLoop(ns, name).UID
-	}
-
 	f62GetLoop := func(ns, name string) *coxv1alpha1.Loop {
 		loop := &coxv1alpha1.Loop{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop); err != nil {
@@ -89,6 +80,15 @@ var _ = Describe("F62: the blocked-action count is relayed into status", func() 
 			Fail("get loop: " + err.Error())
 		}
 		return loop
+	}
+
+	// f62NewLoop creates a Loop and returns its UID (the count key).
+	f62NewLoop := func(ns, name string) types.UID {
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+		return f62GetLoop(ns, name).UID
 	}
 
 	f62Reconciler := func(audit AuditReader) *LoopReconciler {

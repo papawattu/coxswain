@@ -491,7 +491,8 @@ func addAlertRelay(mgr manager.Manager, agentNamespace, agentPodLabel string) (*
 		// Loop yields "" and the relay writes "unknown" (never empty).
 		Iteration: func(namespace, name string) string {
 			var loop coxv1alpha1.Loop
-			if err := mgr.GetClient().Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: name}, &loop); err != nil {
+			key := client.ObjectKey{Namespace: namespace, Name: name}
+			if err := mgr.GetClient().Get(context.Background(), key, &loop); err != nil {
 				return ""
 			}
 			return strconv.Itoa(loop.Status.Iteration)

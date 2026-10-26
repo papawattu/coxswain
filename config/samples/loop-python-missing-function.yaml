@@ -29,8 +29,16 @@ spec:
     defined by the tests (do not modify the test files). Run
     `python3 -m unittest discover -s tests` to verify.
   workspace:
-    repo: "https://github.com/papawattu/coxswain.git"
-    ref: "main"
+    # The seeded in-cluster Gitea repo (hack/samples-seed.sh), so the sample
+    # can run as applied. Replace it with your own repo + ref (the workspace
+    # the agent clones); set gitCredentialSecret when that repo needs
+    # credentials:
+    #   repo: "https://github.com/you/your-repo.git"
+    #   ref:  "main"
+    #   gitCredentialSecret: your-git-cred
+    repo: http://gitea.samples.svc:3000/samples/pylib.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - python3 -m compileall -q .
@@ -40,5 +48,11 @@ spec:
       - tests/
     image: docker.io/library/python:3.13-slim
   agent:
+    # image omitted: the operator's --runner-image flag supplies it.
+    # endpointSecretRef + modelEndpoint + model point at your model backend.
+    # For the coxswain dev cluster's vLLM:
+    #   endpointSecretRef: vllm-no-auth
+    #   modelEndpoint: 192.168.1.20:8000
+    #   model: qwen3.8-27b
   loop:
     maxIterations: 3

@@ -110,7 +110,8 @@ untouched (tamper check 0).
 > `main_test.go` (a protected path) is already in the tree and must pass on
 > the tests as written.
 
-**Loop spec:**
+**Loop spec** (the checked-in manifest is `tasks/2.loop.yaml`, applied by
+`make sample-run APP=gocli TASK=2`):
 
 ```yaml
 spec:
@@ -118,7 +119,8 @@ spec:
     Add a -json flag to main.go: with -json, print the rounded result as a
     single-line JSON object {"value": <input>, "places": <n>, "rounded":
     <r>} instead of the bare number. Plain output without -json is unchanged.
-    Add TestMainJSON to main_test.go covering the flag.
+    The TestMainJSON test is already in main_test.go (a protected path) and
+    must pass on the tests as written: do not change or weaken any test file.
   workspace:
     repo: http://gitea.samples.svc:3000/samples/gocli.git
     ref: initial

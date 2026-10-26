@@ -35,13 +35,16 @@ spec:
     (round_test.go) is currently red and is a protected path: do not change
     or weaken any test file. Make `go test ./...` pass on the tests as written.
   workspace:
-    # Replace with your own repo + ref (the workspace the agent clones).
-    # For the coxswain dev cluster, use the in-cluster Gitea:
-    #   repo: http://gitea.samples.svc:3000/samples/gocli.git
-    #   ref:  initial
-    #   gitCredentialSecret: samples-git-cred
-    repo: "https://github.com/papawattu/coxswain.git"
-    ref: "main"
+    # The seeded in-cluster Gitea repo (hack/samples-seed.sh), so the sample
+    # can run as applied. Replace it with your own repo + ref (the workspace
+    # the agent clones); set gitCredentialSecret when that repo needs
+    # credentials:
+    #   repo: "https://github.com/you/your-repo.git"
+    #   ref:  "main"
+    #   gitCredentialSecret: your-git-cred
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...

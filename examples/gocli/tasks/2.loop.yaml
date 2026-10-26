@@ -1,0 +1,55 @@
+# Task 2 (docs/SAMPLES-PLAN.md, examples/gocli/tasks.md): add a -json flag.
+#
+# Checked-in Loop manifest for `make sample-run APP=gocli TASK=2` (S5b).
+# Applied by hack/sample-run.sh into the samples namespace on
+# kind-coxswain-dev; the script requires `examples/<app>/tasks/<n>.loop.yaml`,
+# so task 2 had no runnable manifest before this file. Field names are the
+# real schema (api/v1alpha1/loop_types.go).
+#
+# The acceptance checks are the contents of tasks/2.checks; the reference
+# implementation is tasks/2.patch. TestMainJSON shipped in the seed behind the
+# `task2` build tag (main_test.go in the seeded repo) and is a protected path:
+# the agent may not add or weaken it.
+#
+# spec.agent.image is deliberately ABSENT: the operator uses its own
+# --runner-image flag for the sandbox entrypoint (isRunner is true when the
+# image is empty), so the demo does not pin a local build tag into the
+# manifest. hack/sample-run.sh preflights that the controller deployment is
+# Available with a non-empty --runner-image.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: gocli-task2
+  namespace: samples
+spec:
+  goal: >-
+    Add a -json flag to main.go: with -json, print the rounded result as a
+    single-line JSON object {"value": <input>, "places": <n>, "rounded":
+    <r>} instead of the bare number. Plain output without -json is unchanged.
+    The TestMainJSON test is already in main_test.go (a protected path) and
+    must pass on the tests as written: do not change or weaken any test file.
+  workspace:
+    repo: http://gitea.samples.svc:3000/samples/gocli.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
+  verify:
+    acceptanceChecks:
+      - go build ./...
+      - go vet -tags task2 ./...
+      - go test -tags task2 -run 'TestMainJSON' ./...
+    preset: go
+    protectedPaths:
+      - round_test.go
+      - main_test.go
+    image: docker.io/library/golang:1.26
+  agent:
+    # image intentionally omitted — the operator's --runner-image flag
+    # supplies it (see the header note).
+    endpointSecretRef: vllm-no-auth
+    modelEndpoint: 192.168.1.20:8000
+    model: qwen3.8-27b
+  # No policyRefs (D46, owner decision (c), 2026-10-03): exec fencing applies
+  # to the operator-owned proxies, not the agent — see the task-1
+  # AgentPolicy note. The demo runs the default-deny minimum.
+  loop:
+    maxIterations: 3

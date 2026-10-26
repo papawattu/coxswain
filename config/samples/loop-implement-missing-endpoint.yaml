@@ -33,8 +33,16 @@ spec:
     server on a free port, curls /healthz and /api/v1/ping, and expects
     both to return 200 with the correct body.
   workspace:
-    repo: "https://github.com/papawattu/coxswain.git"
-    ref: "main"
+    # The seeded in-cluster Gitea repo (hack/samples-seed.sh), so the sample
+    # can run as applied. Replace it with your own repo + ref (the workspace
+    # the agent clones); set gitCredentialSecret when that repo needs
+    # credentials:
+    #   repo: "https://github.com/you/your-repo.git"
+    #   ref:  "main"
+    #   gitCredentialSecret: your-git-cred
+    repo: http://gitea.samples.svc:3000/samples/webapi.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - go build ./...
@@ -42,18 +50,19 @@ spec:
     preset: go
     protectedPaths:
       - test/smoke.sh
-    # The image the verify Job runs the checks in. Note this check only
-    # applies when the workspace is the seeded webapi sample repo
-    # (samples/webapi.git — see the commented dev-cluster values below),
-    # where test/smoke.sh picks its free port with python3
-    # (examples/webapi/test/smoke.sh:21); a golang-only image has no
-    # python3, so the script falls back to a RANDOM port there. Use an
-    # image that carries python3 (e.g. a python:go build image) for the
-    # reliable path — the golang value below works via the RANDOM
-    # fallback in that repo. The default workspace (papawattu/coxswain at
-    # main) has no test/smoke.sh, so the check cannot run there; see the
-    # "Replace with your own repo" note above the repo field.
+    # The image the verify Job runs the checks in. test/smoke.sh picks its
+    # free port with python3 (examples/webapi/test/smoke.sh:21); a
+    # golang-only image has no python3, so the script falls back to a RANDOM
+    # port there. Use an image that carries python3 (e.g. a python+go build
+    # image) for the reliable path — the golang value below works via the
+    # RANDOM fallback in the seeded webapi repo.
     image: docker.io/library/golang:1.26
   agent:
+    # image omitted: the operator's --runner-image flag supplies it.
+    # endpointSecretRef + modelEndpoint + model point at your model backend.
+    # For the coxswain dev cluster's vLLM:
+    #   endpointSecretRef: vllm-no-auth
+    #   modelEndpoint: 192.168.1.20:8000
+    #   model: qwen3.8-27b
   loop:
     maxIterations: 5

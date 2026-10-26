@@ -54,7 +54,7 @@ done
 # copy of the script tree so the working tree's dist/ is untouched).
 mkdir -p "$TMP/inst/hack"
 cp -r "$ROOT/config" "$TMP/inst/config"
-cp "$ROOT/hack/build-installer.sh" "$ROOT/hack/install-args.patch.tpl" "$TMP/inst/hack/"
+cp "$ROOT/hack/build-installer.sh" "$ROOT/hack/image-args.sh" "$TMP/inst/hack/"
 KUSTOMIZE="$KUSTOMIZE" IMG="$IMG" bash "$TMP/inst/hack/build-installer.sh" >/dev/null
 check "install.yaml" "$TMP/inst/dist/install.yaml" "$IMG"
 

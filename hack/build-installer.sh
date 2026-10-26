@@ -21,10 +21,13 @@
 # MANAGER_EXTRA_ARGS (optional, space-separated --flag[=value]) appends other
 # manager flags the same way.
 #
-# The five ghcr arg image names are hardcoded to the release workflow's
-# public prefix (papawattu/coxswain-*); only the TAG is derived from IMG.
-# The args are APPENDED (JSON6902 op: add to /spec/.../args/-) so the base
-# args are preserved (P1-1).
+# F56: the four component images are derived from IMG by hack/image-args.sh —
+# the same registry+path prefix and the same tag, each named coxswain-<component>
+# (so IMG=ghcr.io/<owner>/coxswain-controller:<tag> renders the release's
+# coxswain-runner/-model-proxy/-tool-proxy/-egress-proxy at that tag). The
+# derivation is port-safe (the tag is IMG's last ':' component), which a
+# kustomize `replacements` tag split is not. The args are APPENDED (JSON6902
+# op: add to /spec/.../args/-) so the base args are preserved (P1-1).
 set -euo pipefail
 
 # I51: fail unless IMG is set (the in-tree require-img.sh already runs in the
@@ -48,11 +51,12 @@ trap 'rm -rf "$OVERLAY"' EXIT
 
 cp -r "$ROOT/config" "$OVERLAY/config"
 
-# Add the five ghcr image args (derived from IMG's tag) to the manager
-# container via a JSON6902 patch (op: add, one per flag, appended to the args
-# list so the base args survive). Rendered from the tree template with sed (a
-# heredoc cannot appear inside a Makefile recipe line).
-sed -e "s|__TAG__|$TAG|g" "$ROOT/hack/install-args.patch.tpl" \
+# Add the four component-image args (derived from IMG by hack/image-args.sh)
+# to the manager container via a JSON6902 patch (op: add, one per flag,
+# appended to the args list so the base args survive). --memory-writer-image
+# is not here: manager.yaml carries it as IMG_PLACEHOLDER and the F19
+# replacement fills it from the manager container's own image.
+IMG="$IMG" bash "$ROOT/hack/image-args.sh" \
 	> "$OVERLAY/config/manager/install-args.patch.yaml"
 
 # F22: optional --memory-storage-class. Must be a DNS-1123 subdomain (the same

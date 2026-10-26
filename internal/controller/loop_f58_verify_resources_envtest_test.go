@@ -235,12 +235,13 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 	}
 
-	// f58Terminated builds a terminated init status (code only — the reason is
-	// the kubelet's).
-	f58Terminated := func(name string, code int32) corev1.ContainerStatus {
+	// f58Terminated builds a terminated init status, exited 0 (the reason is
+	// the kubelet's; the fixtures that need a non-zero code or an OOM reason
+	// build their own status inline).
+	f58Terminated := func(name string) corev1.ContainerStatus {
 		return corev1.ContainerStatus{
 			Name:  name,
-			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}},
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
 		}
 	}
 
@@ -248,10 +249,10 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 	// exited 0) so the walk reaches the checks.
 	f58TrustedInits := func() []corev1.ContainerStatus {
 		return []corev1.ContainerStatus{
-			f58Terminated(s5aCloneBase, 0),
-			f58Terminated(s5aImportAgent, 0),
-			f58Terminated(s5aTamper, 0),
-			f58Terminated(s5aArtifact, 0),
+			f58Terminated(s5aCloneBase),
+			f58Terminated(s5aImportAgent),
+			f58Terminated(s5aTamper),
+			f58Terminated(s5aArtifact),
 		}
 	}
 

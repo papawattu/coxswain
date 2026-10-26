@@ -49,6 +49,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -518,12 +519,8 @@ func verifyCheckDefaultResources() corev1.ResourceRequirements {
 func verifyCheckResources(loop *coxv1alpha1.Loop) corev1.ResourceRequirements {
 	res := verifyCheckDefaultResources()
 	if want := loop.Spec.Verify.Resources; want != nil {
-		for name, q := range want.Requests {
-			res.Requests[name] = q
-		}
-		for name, q := range want.Limits {
-			res.Limits[name] = q
-		}
+		maps.Copy(res.Requests, want.Requests)
+		maps.Copy(res.Limits, want.Limits)
 	}
 	for name, limit := range res.Limits {
 		req, ok := res.Requests[name]
@@ -1462,39 +1459,22 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// check-<checkCount-1>).
 	for i := range checkCount {
 		name := fmt.Sprintf("check-%d", i)
-		found := false
-		var code int32
-		var oom bool
-		for j := range pod.Status.InitContainerStatuses {
-			ics := &pod.Status.InitContainerStatuses[j]
-			if ics.Name != name {
-				continue
-			}
-			found = true
-			if ics.State.Terminated != nil {
-				code = ics.State.Terminated.ExitCode
-				// F58: the kubelet's OOMKilled reason, read as well as the
-				// exit code. The code alone cannot tell an out-of-memory
-				// kill (137 = SIGKILL in both cases) from a check that
-				// killed itself.
-				oom = ics.State.Terminated.Reason == tamperOOMKilledReason
-			} else {
-				// Not terminated: the check is still running or waiting
-				// (kubelet has not advanced it yet). That is PENDING, not a
-				// failure — exactly like a non-terminated tamper: take no
-				// decision and requeue. Treating it as a failure (the S5a
-				// regression) iterated a passing run to Failed:
-				// MaxIterationsExceeded with the misleading text 'check-0
-				// failed (exit 0)'.
-				return verifyNoDecision, true, "", 0
-			}
-			break
-		}
-		if !found {
+		check := readVerifyCheck(pod, name)
+		if !check.found {
 			// The check init is not in the pod status at all (the Job pod has
 			// fewer inits than expected — a malformed Job). No evidence.
 			return verifyNoDecision, true, "", 0
 		}
+		if !check.terminated {
+			// Not terminated: the check is still running or waiting (kubelet
+			// has not advanced it yet). That is PENDING, not a failure —
+			// exactly like a non-terminated tamper: take no decision and
+			// requeue. Treating it as a failure (the S5a regression) iterated a
+			// passing run to Failed: MaxIterationsExceeded with the misleading
+			// text 'check-0 failed (exit 0)'.
+			return verifyNoDecision, true, "", 0
+		}
+		code, oom := check.code, check.oom
 		// F58: an OOM-killed check is the kubelet killing the container at its
 		// memory limit, not the agent's work failing — the same
 		// fail-closed-but-not-blamed rule F83c applies to the tamper init. It
@@ -1512,6 +1492,46 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 		}
 	}
 	return verifySucceeded, false, "", 0
+}
+
+// verifyCheckResult is one acceptance check's read from the pod's init statuses.
+// It exists so verifyOutcome's check scan stays inside the gocyclo budget
+// (R42: the scan plus the F58 OOM read put verifyOutcome at 31, over the 30
+// limit): the search for the container is mechanical, the decision is not.
+type verifyCheckResult struct {
+	// found means the pod status HAS a status for this check container (a
+	// malformed Job can have fewer inits than the Loop declares). No status is
+	// no evidence, not a pass.
+	found bool
+	// terminated means the container has terminated (a nil Terminated is still
+	// running or waiting: in progress, never a failure — I49/S5a).
+	terminated bool
+	// code is the kubelet-recorded exit code (meaningful only when terminated).
+	code int32
+	// oom is the kubelet's OOMKilled reason (F58): the code alone cannot tell
+	// an out-of-memory kill (137 = SIGKILL in both) from a check that killed
+	// itself.
+	oom bool
+}
+
+// readVerifyCheck reads the named check container's status from the pod.
+func readVerifyCheck(pod *corev1.Pod, name string) verifyCheckResult {
+	for j := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[j]
+		if ics.Name != name {
+			continue
+		}
+		if ics.State.Terminated == nil {
+			return verifyCheckResult{found: true}
+		}
+		return verifyCheckResult{
+			found:      true,
+			terminated: true,
+			code:       ics.State.Terminated.ExitCode,
+			oom:        ics.State.Terminated.Reason == tamperOOMKilledReason,
+		}
+	}
+	return verifyCheckResult{}
 }
 
 // verifyIteratedReason is the stable Event reason the operator emits when a

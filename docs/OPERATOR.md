@@ -359,9 +359,10 @@ re-announces every 5 minutes, because a single Event is invisible once the
 cluster's `--event-ttl` (default 1h) has passed — and a class without
 ReadWriteMany leaves the PVC unbound for far longer than that. The operator
 schedules a reconcile for that window, so an otherwise idle Loop still
-repeats the Event. A completed (Succeeded or Failed) Loop is not warned about
-its memory PVC at all: it will not read the PVC again, and warning forever
-would be a permanent 5-minute alarm with nothing to fix. The operator records
+repeats the Event. A paused, completed (Succeeded or Failed) Loop is not warned
+about its memory PVC at all: it will not read the PVC again (a paused Loop not
+until it resumes), and warning forever would be a permanent 5-minute alarm
+with nothing to fix. The operator records
 the last Event's time on the Loop with the
 `coxswain.io/memory-pvc-unbound-notified` annotation, so it can tell a fresh
 degradation from one it has already announced.

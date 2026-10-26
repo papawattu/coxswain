@@ -33,10 +33,11 @@ const planRejectedConditionType = "PlanRejected"
 // statusSubresource is the Loop's status subresource name. The same string is
 // the object's top-level status field, so it is also the key in the merge patch
 // body and the path element the approval commands read conditions through. The
-// read-only getNested*(u, "status", …) helpers in describe.go keep the literal:
-// there the argument is a field path into a rendering helper, not the
-// subresource this package writes. The CLI writes the approval conditions to
-// this subresource (F87(d): a JSON merge patch of status.conditions).
+// read-only getNested*(u, "status", …) callers in internal/cli (describe.go,
+// history.go, pause.go, redeliver.go) keep the literal: there the argument is a
+// field path into a rendering helper, not the subresource this package writes.
+// The CLI writes the approval conditions to this subresource (F87(d): a JSON
+// merge patch of status.conditions).
 const statusSubresource = "status"
 
 // conditionStatusField is a condition object's own status field name ("True" /

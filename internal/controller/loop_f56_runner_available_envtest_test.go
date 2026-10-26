@@ -222,6 +222,25 @@ var _ = Describe("F56: a missing runner image is visible on the Loop", func() {
 		By("the pinned image still gets the stand-in command (the documented opt-out)")
 		Expect(f56AgentContainer(ns, name).Command).To(Equal([]string{"sh", "-c", "sleep infinity"}))
 		Expect(f56Unavailable(f56Drain(recorder))).To(BeEmpty())
+
+		By("WITH a runner image available, a pinned non-runner image is still the pinned image")
+		// The predicate must consult spec.agent.image even when --runner-image is
+		// set: otherwise a pinned image would be handed the runner's entrypoint
+		// (a binary it does not contain). Found by a mutation that made
+		// runnerRuns ignore spec.agent.image — the first version of this spec
+		// left RunnerImage empty and did not catch it.
+		r.RunnerImage = "example.test/coxswain-runner:test"
+		name = "l3pinned"
+		Expect(k8sClient.Create(ctx, f56Loop(ns, name, "docker.io/library/busybox:1.36"))).To(Succeed())
+		f56Reconcile(r, ns, name)
+
+		pinned := f56Condition(f56Get(ns, name))
+		Expect(pinned).NotTo(BeNil())
+		Expect(pinned.Status).To(Equal(metav1.ConditionTrue))
+		Expect(pinned.Reason).To(Equal("AgentImagePinned"))
+		Expect(f56AgentContainer(ns, name).Command).To(Equal([]string{"sh", "-c", "sleep infinity"}),
+			"a pinned image must keep the stand-in even when --runner-image is set")
+		Expect(f56Unavailable(f56Drain(recorder))).To(BeEmpty())
 	})
 
 	It("S4: the condition CLEARS on the same Loop once the runner image is set (same-Loop update)", func() {

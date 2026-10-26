@@ -33,9 +33,6 @@ chart's rendered output).
   map wins over a same-name entry in the env list.
 - `manager.healthProbe.port` (default `8081`): the liveness/readiness port
   (the manager serves /healthz and /readyz on it).
-- `rbac.roleNamespaces` and `webhook.*`: currently NOT read by any template
-  (the cni-probe namespace is hard-wired and the chart ships no operator
-  webhook); changing them has no effect on the rendered chart today.
 
 ## Driving Manual-mode approvals with the cox CLI (rbac.helpers.enabled)
 

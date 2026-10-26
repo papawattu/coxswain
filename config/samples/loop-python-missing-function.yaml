@@ -10,35 +10,60 @@
 #   2. It shows the `preset: none` path (no preset to protect Python files;
 #      the protectedPaths list is the only "no cheating" boundary).
 #
+# Prerequisites (see docs/QUICKSTART.md):
+#   - the operator is installed and running
+#   - the samples namespace with the seeded in-cluster Gitea: `make
+#     samples-up` (config/samples-git) creates the namespace, the Gitea and
+#     the samples-git-cred Secret, and `make samples-seed` pushes the gocli /
+#     webapi / pylib repos. This Loop clones samples/pylib.git with samples-git-cred, so
+#     both the repo and the Secret must exist in the Loop's namespace
+#     (samples).
+#
 # Apply:
 #   kubectl apply -f config/samples/loop-python-missing-function.yaml
 #
 # Expected outcome:
-#   Planning -> Implementing (adds the missing function) ->
-#   Verifying (unittest discover passes) -> Succeeded
+#   Planning -> Implementing (adds Median) ->
+#   Verifying (`python3 -m unittest tests.test_median` passes) -> Succeeded
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
   name: loop-python-missing-function
-  namespace: default
+  namespace: samples
 spec:
   goal: >-
-    Implement the missing public function in the numutils package so the
-    test suite passes. The tests import the function from numutils and
-    assert its behaviour; the function signature and expected values are
-    defined by the tests (do not modify the test files). Run
-    `python3 -m unittest discover -s tests` to verify.
+    Implement median in numutils/stats.py and expose it as Median from
+    numutils/__init__.py. Odd length returns the middle value, even length
+    returns the average of the two middle values, an empty sequence raises
+    ValueError, and the input list must not be mutated. The acceptance
+    module tests/test_median.py is a protected path: do not change or
+    weaken it. Make `python3 -m unittest tests.test_median` pass on the
+    tests as written.
   workspace:
-    repo: "https://github.com/papawattu/coxswain.git"
-    ref: "main"
+    # The seeded in-cluster Gitea repo (hack/samples-seed.sh), so the sample
+    # can run as applied. Replace it with your own repo + ref (the workspace
+    # the agent clones); set gitCredentialSecret when that repo needs
+    # credentials:
+    #   repo: "https://github.com/you/your-repo.git"
+    #   ref:  "main"
+    #   gitCredentialSecret: your-git-cred
+    repo: http://gitea.samples.svc:3000/samples/pylib.git
+    ref: initial
+    gitCredentialSecret: samples-git-cred
   verify:
     acceptanceChecks:
       - python3 -m compileall -q .
-      - python3 -m unittest discover -s tests
+      - python3 -m unittest tests.test_median
     preset: none
     protectedPaths:
-      - tests/
+      - tests/test_median.py
     image: docker.io/library/python:3.13-slim
   agent:
+    # image omitted: the operator's --runner-image flag supplies it.
+    # endpointSecretRef + modelEndpoint + model point at your model backend.
+    # For the coxswain dev cluster's vLLM:
+    #   endpointSecretRef: vllm-no-auth
+    #   modelEndpoint: 192.168.1.20:8000
+    #   model: qwen3.8-27b
   loop:
     maxIterations: 3

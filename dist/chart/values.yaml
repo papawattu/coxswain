@@ -147,16 +147,6 @@ rbac:
   ##
   namespaced: false
 
-  ## Multi-namespace RBAC role mappings (advanced use)
-  ## Maps role suffixes to target namespaces for multi-namespace deployments.
-  ## NOTE: this value is currently NOT read by any template (the cni-probe
-  ## namespace is hard-wired to coxswain-cni-probe in the admission/ and
-  ## rbac/ templates); it is kept for future use. Changing it has no effect
-  ## on the rendered chart today.
-  ##
-  roleNamespaces:
-    "cni-probe-operator": "coxswain-cni-probe"
-
   ## Helper roles for CRD management (admin/editor/viewer)
   ##
   helpers:
@@ -208,17 +198,6 @@ metrics:
 ##
 certManager:
   enabled: false
-
-## Webhook server configuration
-## NOTE: no template currently reads webhook.* (the chart ships no
-## Mutating/Validating webhook for the operator; admission control is the
-## ValidatingAdmissionPolicy pair in templates/admission/). Kept for
-## completeness; changing it has no effect on the rendered chart today.
-##
-webhook:
-  enabled: false
-  # Webhook server port
-  port: 9443
 
 ## Prometheus ServiceMonitor for metrics scraping.
 ## Requires prometheus-operator to be installed in the cluster.

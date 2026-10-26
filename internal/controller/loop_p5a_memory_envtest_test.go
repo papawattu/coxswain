@@ -481,6 +481,66 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 				"the re-announced pass schedules the following window too")
 		})
 
+		// I144 review (P2): a TERMINAL Loop must go quiet. Without the guard the
+		// window re-arms itself through the requeue, so a Succeeded Loop on a
+		// class without ReadWriteMany would reconcile and warn every 5 minutes
+		// for the life of the cluster — for a Loop that will never run again.
+		// (On main the one-shot marker meant one Event and silence.)
+		It("a Succeeded Loop with an unbound PVC neither warns nor schedules a re-announce", func() {
+			loop := p5aMakeLoop("p5a-i144t", nsA, repoA)
+			Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, loop) }()
+
+			rec := record.NewFakeRecorder(64)
+			clock := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+			r := &LoopReconciler{
+				CNIProber: testCNIProber(),
+				Client:    k8sClient,
+				Scheme:    k8sClient.Scheme(),
+				Recorder:  rec,
+				now:       func() metav1.Time { return clock },
+				// Suppress the 5s clone-pending timer so the only RequeueAfter
+				// this spec can see is the memory one.
+				baseCommitSeeded: true,
+			}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsA, Name: "p5a-i144t"}}
+			countMemoryEvents := func() int {
+				n := 0
+				for len(rec.Events) > 0 {
+					if strings.Contains(<-rec.Events, memoryPVCUnboundReason) {
+						n++
+					}
+				}
+				return n
+			}
+
+			// A first pass at the live phase: the PVC (Pending) and the Sandbox
+			// are created and the live Loop is warned.
+			_, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(countMemoryEvents()).To(Equal(1), "setup: the live Loop is warned")
+
+			// Finish the Loop. The phase is the guard's only input.
+			got := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, req.NamespacedName, got)).To(Succeed())
+			got.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
+			Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+
+			res, err := r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeZero(),
+				"a terminal Loop must not schedule the memory re-announce")
+			Expect(countMemoryEvents()).To(Equal(0), "a terminal Loop must not warn about its memory PVC")
+
+			// Past the window: still nothing. The timer could only be re-armed by
+			// the surface the guard now skips.
+			clock = metav1.NewTime(clock.Add(2 * memoryPVCUnboundQuiet))
+			res, err = r.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeZero(), "the window never re-arms for a terminal Loop")
+			Expect(countMemoryEvents()).To(Equal(0), "no repeat past the window")
+		})
+
 		// I144 review P2-1: the window is only a cadence if something schedules
 		// the next pass. A Loop whose PVC is binding is otherwise idle — no
 		// claim, no pod event — so the unbound branch must hand the caller a

@@ -1866,10 +1866,20 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	if memErr != nil {
 		return 0, memErr
 	}
-	if !memoryBound && memoryPVCName(loop) != "" {
+	if !memoryBound && memoryPVCName(loop) != "" && !isTerminalPhase(loop.Status.Phase) {
 		// A PVC exists but is not Bound: the visible degradation (the Loop
 		// runs without memory; a repo-less Loop has no PVC at all and is
 		// "no memory", not a degradation — no Event there).
+		//
+		// A TERMINAL (Succeeded/Failed) Loop is excluded (I144 review): the
+		// sandbox is Suspended for the terminal phase itself (loopSandboxStopped),
+		// this Loop will not read the PVC again, and — the reason this is a guard
+		// and not a nicety — the quiet window re-arms itself through the requeue,
+		// so a terminal Loop on a class without RWX would reconcile and warn
+		// every 5 minutes for the life of the cluster with nothing to fix. Before
+		// the window existed, the one-shot marker meant one Event and silence; the
+		// same is true again here. (modelProxyHold gates on the terminal phase for
+		// the same reason.)
 		memoryRequeue = r.surfaceMemoryPVCUnbound(ctx, loop, memoryPVCName(loop))
 	}
 
@@ -6467,7 +6477,7 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 }
 
 // reconcileRequeueAfter is the trailing requeue decision, extracted to keep
-// Reconcile within the gocyclo budget. The wall-clock RequeueAffters this
+// Reconcile within the gocyclo budget. The wall-clock RequeueAfters this
 // reconcile can set: the 5s work requeue below, the P2d budget window, and the
 // R39 I144 memory-PVC re-announce window (the earlier window wins, so the
 // Event's re-announce is never waiting on a longer budget timer).

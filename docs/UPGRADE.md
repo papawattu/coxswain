@@ -211,15 +211,17 @@ While a Loop's new memory PVC is unbound (the class is not ReadWriteMany,
 or the provisioner has not created it yet), the Loop runs without memory —
 no lessons are seeded and nothing is written back. A Warning Event
 `MemoryPVCUnbound` (listable via `kubectl get events`) flags the binding
-wait. The Event is not a one-shot (R39 I144): while the PVC stays unbound it
-re-announces every 5 minutes, because one Event is gone after the cluster's
-`--event-ttl` (default 1h) while a class without ReadWriteMany leaves the PVC
-unbound for much longer. The operator schedules a reconcile for that window,
-so an otherwise idle Loop still repeats it. The last Event's time is recorded
-on the Loop with the `coxswain.io/memory-pvc-unbound-notified` annotation (a
-pre-upgrade `true` value there simply announces once and is rewritten). There
-is nothing to do unless you want the seeding: point `--memory-storage-class`
-at a ReadWriteMany-capable class (see the flag entry above).
+wait. The Event is not a one-shot (R39 I144): while the Loop runs and the PVC
+stays unbound it re-announces every 5 minutes, because one Event is gone after
+the cluster's `--event-ttl` (default 1h) while a class without ReadWriteMany
+leaves the PVC unbound for much longer. The operator schedules a reconcile for
+that window, so an otherwise idle Loop still repeats it. A completed
+(Succeeded or Failed) Loop is not warned about its memory PVC at all. The last
+Event's time is recorded on the Loop with the
+`coxswain.io/memory-pvc-unbound-notified` annotation (a pre-upgrade `true`
+value there simply announces once and is rewritten). There is nothing to do
+unless you want the seeding: point `--memory-storage-class` at a
+ReadWriteMany-capable class (see the flag entry above).
 
 ### Memory lesson cap
 

@@ -87,9 +87,12 @@ const (
 	// when the memory PVC is not Bound (the RWX cluster lacks the driver, or
 	// the PVC is still provisioning): the copy-in is skipped, the Loop runs
 	// without memory, and the Event is the record (R26 I90). It re-announces
-	// once per memoryPVCUnboundQuiet while the PVC stays unbound (R39 I144):
-	// an Event that is emitted once is invisible after --event-ttl (1h), which
-	// is the window a non-RWX class leaves the PVC unbound for.
+	// once per memoryPVCUnboundQuiet while the Loop RUNS and the PVC stays
+	// unbound (R39 I144): an Event that is emitted once is invisible after
+	// --event-ttl (1h), which is the window a non-RWX class leaves the PVC
+	// unbound for. A terminal (Succeeded/Failed) Loop is excluded — the caller
+	// gates on isTerminalPhase — because its PVC will not be read by it again
+	// and the window would otherwise re-arm itself forever.
 	memoryPVCUnboundReason = "MemoryPVCUnbound"
 	// memoryPVCUnboundNotifiedAnnotation is the operator-owned quiet-window
 	// marker on the Loop: the TIME of the last MemoryPVCUnbound Event
@@ -221,8 +224,9 @@ func (r *LoopReconciler) memoryPVCBound(ctx context.Context, loop *coxv1alpha1.L
 // the case docs/UPGRADE.md names for a non-RWX class) left the degradation
 // with no surface at all. It now goes through the shared quiet-window marker
 // (F83f, loop_quiet_marker.go): the marker holds the last Event's TIME and the
-// Event re-announces once per memoryPVCUnboundQuiet for as long as the PVC
-// stays unbound. That keeps it a signal rather than a per-reconcile noise
+// Event re-announces once per memoryPVCUnboundQuiet while the Loop runs and the
+// PVC stays unbound (a terminal Loop is never warned: see the call site in
+// ensureSandbox). That keeps it a signal rather than a per-reconcile noise
 // source (every envtest Loop with a repo has a Pending memory PVC) while
 // making sure it never goes silent for the Loop's life.
 //

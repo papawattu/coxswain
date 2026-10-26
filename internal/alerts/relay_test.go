@@ -408,7 +408,7 @@ func TestRelayRunOfUndecodableLinesIsUnknown(t *testing.T) {
 
 	// Half 1: noise only (+ one good alert) — healthy.
 	quiet := &scriptedSource{attaches: []attachment{{lines: append(append([]string{}, noise...), good)}}}
-	_, holder := f62Fixture(t, quiet)
+	holder := f62Fixture(t, quiet)
 	waitFor(t, "a healthy stream behind startup noise", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthHealthy && s.Count == 1

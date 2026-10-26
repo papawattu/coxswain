@@ -399,6 +399,14 @@ func checkpointPolicyCarryOn(p coxv1alpha1.CheckpointPolicy) string {
 // VolumeSnapshotClass can be created later). A flip from False to True
 // clears the Required terminal only if it has not yet fired (the gate runs
 // at start; once the Loop is Failed, nothing reverts it).
+//
+// changed is true only when the persisted condition actually differs from
+// the one this pass computed (F52 A2): meta.SetStatusCondition is a no-op
+// when every field matches, so reporting changed unconditionally turned
+// every steady-state reconcile into a status write. terminal is read from
+// the condition as STORED, not from the value the support check returned
+// before the set — the two agree today, and the stored condition is the
+// thing the caller acts on.
 func (r *LoopReconciler) applyCheckpointConditions(ctx context.Context, loop *coxv1alpha1.Loop) (changed bool, terminal bool) {
 	// The support check is gated on the CRD being present: when the CRD is
 	// absent there is nothing to read (the RESTMapper is the check, and a
@@ -406,13 +414,19 @@ func (r *LoopReconciler) applyCheckpointConditions(ctx context.Context, loop *co
 	// snapshotCRDPresent is called inside checkpointSupport; the driver and
 	// VSC reads only run when the CRD is present.
 	status, reason, message := r.checkpointSupport(ctx, loop)
-	meta.SetStatusCondition(&loop.Status.Conditions, metav1.Condition{
+	// SetStatusCondition returns whether it changed anything, over exactly the
+	// fields A2 cares about (status, reason, message, observedGeneration).
+	// Do NOT snapshot the condition with FindStatusCondition and compare it
+	// after the set: that returns a POINTER INTO THIS SLICE, which the set
+	// updates in place, so the comparison would compare the new value with
+	// itself and report false on every real transition (the #302 P2).
+	changed = meta.SetStatusCondition(&loop.Status.Conditions, metav1.Condition{
 		Type:    coxv1alpha1.CheckpointsAvailableCondition,
 		Status:  status,
 		Reason:  reason,
 		Message: message,
 	})
-	changed = true
+	after := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.CheckpointsAvailableCondition)
 	// D59 Required: fail at start (terminal) when checkpoints are not
 	// possible. "At start" is the phase-bootstrap moment (Pending ->
 	// Planning): the gate fires once, on the FIRST reconcile after the PVC
@@ -420,7 +434,7 @@ func (r *LoopReconciler) applyCheckpointConditions(ctx context.Context, loop *co
 	// phase work, so the check at the bootstrap point has the PVC. A
 	// ConditionUnknown (the driver is not known yet) is NOT a gate trigger
 	// (the check is deferred, not failed).
-	if status == metav1.ConditionFalse &&
+	if after.Status == metav1.ConditionFalse &&
 		effectiveCheckpointPolicy(loop) == coxv1alpha1.CheckpointPolicyRequired &&
 		loop.Status.Phase != coxv1alpha1.LoopPhaseFailed {
 		terminal = true
@@ -1202,7 +1216,8 @@ func (r *LoopReconciler) ensureCheckpointStep(ctx context.Context, loop *coxv1al
 // sets the terminal Failed:CheckpointUnavailable phase and writes the
 // status. Returns (changed, done, err): done is true when the gate fired
 // (the caller should return the result and stop this reconcile); changed is
-// true when the condition was (re)set this pass.
+// true when the condition actually changed this pass (F52 A2 — a steady
+// state reports false, so the caller does not write the status for it).
 func (r *LoopReconciler) applyCheckpointGate(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
 	condChanged, cpTerminal := r.applyCheckpointConditions(ctx, loop)
 	if !cpTerminal {

@@ -78,7 +78,9 @@ ReadyToUse (the source's VolumeSnapshot must be ReadyToUse) — the operator
 defers the fork's restore when the snapshot is not ReadyToUse (the
 Restore condition is False, reason RestoreSourceNotReady, the requeue
 retries) and rejects it when the snapshot is absent (the Restore condition
-is False, reason RestoreSourceMissing, the fork is terminal).
+is False, reason RestoreSourceMissing, the fork is terminal) — or when the
+cluster has no VolumeSnapshot CRD at all (reason VolumeSnapshotCRDMissing:
+no checkpoint can exist there, same terminal outcome).
 
 Optional overrides:
   --check <cmd>   (repeatable; when given, replaces the fork's acceptance

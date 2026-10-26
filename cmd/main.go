@@ -72,9 +72,12 @@ func init() {
 // docs/RELEASE-NOTES-next.md). The tag stays in the reference for humans and for
 // `kind load`/preload lists, which match on the tag.
 const (
-	pinnedCNIProbeImage     = "docker.io/library/python:3.13-alpine@sha256:bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741"
-	pinnedWorkspaceGitImage = "docker.io/alpine/git:v2.54.0@sha256:e8ceedc73bd80992ae8d58a7d24c58b8322146c354f1d2e81a97db4452068ec0"
-	pinnedVerifyImage       = "docker.io/library/golang:1.26@sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82"
+	pinnedCNIProbeImage = "docker.io/library/python:3.13-alpine@sha256:" +
+		"bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741"
+	pinnedWorkspaceGitImage = "docker.io/alpine/git:v2.54.0@sha256:" +
+		"e8ceedc73bd80992ae8d58a7d24c58b8322146c354f1d2e81a97db4452068ec0"
+	pinnedVerifyImage = "docker.io/library/golang:1.26@sha256:" +
+		"672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82"
 )
 
 func main() {

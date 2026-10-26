@@ -34,17 +34,20 @@ func TestDefaultImagesArePinnedByDigest(t *testing.T) {
 	}
 	for flag, ref := range pins {
 		if !strings.Contains(ref, "@sha256:") {
-			t.Errorf("%s default %q is not digest-pinned: a mutable tag is pulled at run time on someone else's cluster", flag, ref)
+			t.Errorf("%s default %q is not digest-pinned: "+
+				"a mutable tag is pulled at run time on someone else's cluster", flag, ref)
 		}
 		// A digest pin must not be a floating tag either: ":latest" plus a
 		// digest is a ref that reads like a moving one.
 		if strings.Contains(ref, ":latest@") {
-			t.Errorf("%s default %q pins a :latest tag; use a version tag with the digest", flag, ref)
+			t.Errorf("%s default %q pins a :latest tag; use a version tag with the digest",
+				flag, ref)
 		}
 	}
 	// The probe image moved off the floating ":3-alpine" minor tag, so the
 	// interpreter version cannot change under the operator between two probes.
 	if !strings.Contains(pinnedCNIProbeImage, "python:3.13-alpine@sha256:") {
-		t.Errorf("cni probe image = %q, want a version-exact python:3.13-alpine with a digest", pinnedCNIProbeImage)
+		t.Errorf("cni probe image = %q, want a version-exact python:3.13-alpine with a digest",
+			pinnedCNIProbeImage)
 	}
 }

@@ -51,3 +51,34 @@ func TestDefaultImagesArePinnedByDigest(t *testing.T) {
 			pinnedCNIProbeImage)
 	}
 }
+
+// TestDefaultImageDigestsAreExact (early-323 N6) spells the three refs out in
+// full. The shape checks above stay green for a digest with one wrong character,
+// and every pull then fails at run time — the exact failure this pin exists to
+// prevent. With the literals written out twice, changing a pin is a deliberate
+// two-place edit.
+//
+// Mutation: change any one hex digit in a constant above → this test fails.
+func TestDefaultImageDigestsAreExact(t *testing.T) {
+	want := []struct {
+		flag string
+		ref  string
+	}{
+		{"--cni-probe-image", "docker.io/library/python:3.13-alpine@sha256:" +
+			"bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741"},
+		{"--workspace-git-image", "docker.io/alpine/git:v2.54.0@sha256:" +
+			"e8ceedc73bd80992ae8d58a7d24c58b8322146c354f1d2e81a97db4452068ec0"},
+		{"--verify-image", "docker.io/library/golang:1.26@sha256:" +
+			"672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82"},
+	}
+	got := map[string]string{
+		"--cni-probe-image":     pinnedCNIProbeImage,
+		"--workspace-git-image": pinnedWorkspaceGitImage,
+		"--verify-image":        pinnedVerifyImage,
+	}
+	for _, tc := range want {
+		if got[tc.flag] != tc.ref {
+			t.Errorf("%s default = %q, want %q", tc.flag, got[tc.flag], tc.ref)
+		}
+	}
+}

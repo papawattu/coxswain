@@ -894,7 +894,12 @@ engine observation reports, and on a cluster with no KubeArmor-labelled node
 that is `NodeNotEnforcing` (the node-label fact is checked first), not
 `EngineUnavailable` — the CRD wording comes from the tolerated write error, so
 it is present in either case. `kubectl cox describe` shows the Loop at
-`Planning` with no sandbox (the D30 gate creates none).
+`Planning`, and — unlike the pre-F92 shape, where the pass returned before the
+bootstrap — its sandbox **is created and held `Suspended`** (the D30 gate sets
+the object's operating mode; it does not prevent the object), along with the
+workspace PVC. Both are visible on kind: `f92-kubearmor-sandbox  Suspended` and
+`persistentvolumeclaim/f92-kubearmor-workspace` waiting for its first consumer.
+The sandbox is held, not deleted, so nothing starts in it while the hold is on.
 
 **What to do:** install KubeArmor so the CRD **and** the enforcer agents are
 present (the supported configuration — see `docs/QUICKSTART.md` step 3), or
@@ -902,9 +907,10 @@ set `--allow-unenforced` if you knowingly run the development escape hatch.
 Installing only the CRD is not enough: with no node carrying the BPF-LSM
 label the engine still reports `NodeNotEnforcing` and the hold continues.
 The Loop waits either way; it does not fail. While held for this cause the
-operator re-checks on a bounded window (one minute), and the ordinary 5s work
-requeue also applies while the workspace has not been seeded, so no restart is
-needed for the hold to clear once the cause does.
+operator re-checks on a bounded window (one minute). A Loop still in the
+clone-pending stage takes the ordinary 5s work requeue first (that is the
+cadence a fresh Loop shows on kind), and a terminal Loop takes no window at all,
+so no restart is needed for the hold to clear once the cause does.
 
 **The model proxy hold (`ModelProxyNotReady`).** With
 `spec.agent.endpointSecretRef` set, the sandbox is held `Suspended` until the

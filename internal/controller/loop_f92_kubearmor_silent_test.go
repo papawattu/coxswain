@@ -125,6 +125,11 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 			"a missing KubeArmorPolicy CRD must not abort the reconcile (F92: that left status: {})")
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0),
 			"a held Loop must be re-checked (F92 P2-2), not left waiting for an unrelated event")
+		// This Loop is still clone-pending, so the window here is the 5s work
+		// requeue; the exact F92 window (Equal(kaptCRDMissingRequeue)) is pinned
+		// by S5, which seeds baseCommit to leave the F92 window as the only one.
+		Expect(res.RequeueAfter).To(BeNumerically("<", kaptCRDMissingRequeue),
+			"a clone-pending Loop takes the 5s work requeue, which is shorter than the F92 window")
 
 		By("the Loop's status must say why (the R26 I90 norm)")
 		loop := f92Get(ns, name)
@@ -163,8 +168,8 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 			return sbx.Spec.OperatingMode
 		}, "10s").Should(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
 			"the sandbox must be held Suspended while the engine is unavailable (D30)")
-		Expect(f92Get(ns, name).Status.Phase).NotTo(Equal(coxv1alpha1.LoopPhaseFailed),
-			"D30 holds the Loop, it never fails it")
+		Expect(f92Get(ns, name).Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning),
+			"the Loop must carry a phase again (I151's 'no phase for ever' half), and D30 holds it rather than failing it")
 	})
 
 	It("S3: the CRD is named on the object even when Enforcing() reports a different reason (the kind-coxswain shape)", func() {
@@ -209,6 +214,14 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 			}
 		}
 		Expect(events).To(HaveLen(1), "the CRD-absent shape is surfaced once, got %v", events)
+
+		By("a second reconcile in THIS shape does not re-announce either (the gate is not reason-specific)")
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		for _, e := range f92Drain(recorder) {
+			Expect(strings.Contains(e, PolicyEnforcementUnavailableEventReason)).To(BeFalse(),
+				"the Event is gated on the transition, not per reconcile (got %s)", e)
+		}
 	})
 
 	It("S4: a Loop held for a missing CRD is re-checked on a bounded window, not left waiting (F92 P2-2)", func() {
@@ -265,6 +278,62 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 		Expect(err).NotTo(HaveOccurred())
 		Expect(res.RequeueAfter).NotTo(Equal(kaptCRDMissingRequeue),
 			"without a tolerated no-match the F92 window is not taken, so the assertion above is not vacuous (this shape requeues on another window, observed ~5m)")
+	})
+
+	It("S6: a terminal Loop in the CRD-absent shape gets no F92 window (the #299 round-2 rule)", func() {
+		// The tolerated no-match is set on EVERY pass that hits it, whatever the
+		// phase, so a Succeeded/Failed Loop on a cluster whose CRD later goes
+		// missing would reconcile every minute for the life of the cluster. A
+		// terminal Loop is never held by the engine gate (nothing runs without
+		// enforcement), so the window must not apply to it. This is Reconcile-driven
+		// on purpose: the S5 lesson is that a helper asserted only through its own
+		// unit call does not prove the call site passes what it computes.
+		ns := f92Ns("f92-terminal")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		newReconciler := func() *LoopReconciler {
+			r := &LoopReconciler{
+				CNIProber:        testCNIProber(),
+				Client:           k8sClient,
+				Scheme:           k8sClient.Scheme(),
+				apiReader:        k8sClient,
+				Recorder:         record.NewFakeRecorder(64),
+				Enforcer:         &fakeEnforcer{enforcing: false, reason: engine.ReasonNodeNotEnforcing},
+				AllowUnenforced:  false,
+				baseCommitSeeded: true, // the F92 window is otherwise the only one
+			}
+			r.ApplyEnforcementWritesFn = func(_ context.Context, _ *coxv1alpha1.Loop, _ policy.EffectivePolicy) error {
+				return f92NoMatch()
+			}
+			return r
+		}
+
+		By("a terminal Loop: no F92 window")
+		name := "l7"
+		Expect(k8sClient.Create(ctx, f92Loop(ns, name))).To(Succeed())
+		seeded := f92Get(ns, name)
+		seeded.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
+		Expect(k8sClient.Status().Update(ctx, seeded)).To(Succeed())
+
+		res, err := newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).NotTo(Equal(kaptCRDMissingRequeue),
+			"a Succeeded Loop must not take the per-minute F92 window")
+
+		By("positive control: the same setup at a working phase does take it")
+		name = "l8"
+		Expect(k8sClient.Create(ctx, f92Loop(ns, name))).To(Succeed())
+		res, err = newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(kaptCRDMissingRequeue),
+			"the same shape at Planning does take the F92 window, so the assertion above is not vacuous")
+
+		By("the guard's truth table (a helper asserted only through itself would not pin the call site)")
+		Expect(f92HeldRequeue(true, coxv1alpha1.LoopPhaseSucceeded)).To(BeFalse())
+		Expect(f92HeldRequeue(true, coxv1alpha1.LoopPhaseFailed)).To(BeFalse())
+		Expect(f92HeldRequeue(true, coxv1alpha1.LoopPhasePlanning)).To(BeTrue())
+		Expect(f92HeldRequeue(true, coxv1alpha1.LoopPhasePaused)).To(BeTrue(), "Paused is not terminal")
+		Expect(f92HeldRequeue(false, coxv1alpha1.LoopPhasePlanning)).To(BeFalse())
 	})
 
 	It("S2: every OTHER enforcement write error still returns and retries (the tolerance is exactly the CRD-absent shape)", func() {

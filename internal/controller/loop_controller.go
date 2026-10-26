@@ -1080,7 +1080,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue, kaptCRDMissing), nil
+	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue, f92HeldRequeue(kaptCRDMissing, loop.Status.Phase)), nil
 }
 
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
@@ -1404,13 +1404,29 @@ const PolicyEnforcedCondition = "PolicyEnforced"
 // does not re-announce on every reconcile.
 const PolicyEnforcementUnavailableEventReason = "PolicyEnforcementUnavailable"
 
+// f92HeldRequeue reports whether the F92 re-check window applies: the write
+// path hit a MISSING KubeArmorPolicy CRD (kaptCRDMissing) and the Loop is not
+// terminal. A terminal Loop (Succeeded/Failed) is never held by the engine gate
+// — nothing runs without enforcement — so a Loop that finished on a cluster
+// whose CRD later goes missing must not reconcile every minute for the life of
+// the cluster (the rule #299's round 2 established for the memory window; the
+// isTerminalPhase guard in ensureMemoryPVC is the precedent). The guard lives
+// here rather than at the call site so Reconcile gains no branch (it is at its
+// gocyclo budget).
+func f92HeldRequeue(kaptCRDMissing bool, phase coxv1alpha1.LoopPhase) bool {
+	return kaptCRDMissing && !isTerminalPhase(phase)
+}
+
 // kaptCRDMissingRequeue is how long a Loop held because the KubeArmorPolicy CRD
 // is missing waits before the operator re-checks (F92 P2-2). The Loop owns
 // nothing that changes when KubeArmor is installed, so without this it could
 // stay held until an unrelated event; one minute re-checks quickly without a
-// reconcile hot loop. It does not by itself make the hold clear: that needs the
-// CRD AND a node carrying the BPF-LSM label (installing only the CRD still
-// reports NodeNotEnforcing), or --allow-unenforced.
+// reconcile hot loop. Two shapes do not take this window: a Loop still in the
+// clone-pending stage (the 5s work requeue fires first, and it is the one the
+// kind run shows), and a terminal Loop (f92HeldRequeue excludes it). It does not
+// by itself make the hold clear: that needs the CRD AND a node carrying the
+// BPF-LSM label (installing only the CRD still reports NodeNotEnforcing), or
+// --allow-unenforced.
 const kaptCRDMissingRequeue = time.Minute
 
 // PolicyTranslationLossyCondition is the Loop condition that reports a lossy
@@ -6565,9 +6581,14 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 
 // reconcileRequeueAfter is the trailing requeue decision, extracted to keep
 // Reconcile within the gocyclo budget. The wall-clock RequeueAfters this
-// reconcile can set: the 5s work requeue below, the P2d budget window, and the
-// R39 I144 memory-PVC re-announce window (the earlier window wins, so the
-// Event's re-announce is never waiting on a longer budget timer).
+// reconcile can set: the 5s work requeue below, the P2d budget window, the
+// R39 I144 memory-PVC re-announce window (the earlier of those two wins, so the
+// Event's re-announce is never waiting on a longer budget timer), and the F92
+// CRD-missing window. The F92 branch returns BEFORE that earlier-of comparison
+// because its window is the shortest by construction (kaptCRDMissingRequeue is
+// one minute; the budget and memory windows are longer), so taking it first is
+// the same as taking the earliest. Its argument is the caller's f92HeldRequeue
+// decision, which excludes a terminal Loop.
 func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration, kaptCRDMissing bool) ctrl.Result {
 	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}

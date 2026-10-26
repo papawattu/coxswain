@@ -284,13 +284,19 @@ var _ = Describe("B3 plan approval gate", func() {
 		// restoreFrom/forkOf), so a Loop already parked at AwaitingApproval can
 		// be flipped to Auto. In Auto mode approvalHoldPhase's Manual conjunct
 		// is false, so the sandbox must run at the SAME phase — this is the
-		// step that fails if only that conjunct is deleted.
+		// step that fails if only that conjunct is deleted. The phase is
+		// asserted too: the step's power rests on the phase NOT moving (an
+		// Auto advance out of AwaitingApproval would make the mutated gate
+		// false at the new phase and let M-A pass while proving nothing).
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
 		got.Spec.Approval.Mode = coxv1alpha1.ApprovalModeAuto
 		Expect(k8sClient.Update(ctx, got)).To(Succeed())
 		settle()
 		Expect(sandboxMode()).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
 			"Auto mode never holds for approval: the hold must be Manual-only")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
+			"Auto at AwaitingApproval must stay at AwaitingApproval: an advance here would move the phase out from under the mutated gate")
 
 		By("flipping back to Manual re-arms the hold before the approval step")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())

@@ -42,8 +42,8 @@ settled design, now with an owner per command:
 | `cox apply -f loop.yaml` | create a Loop | `Create` the Loop object (kubectl-apply-equivalent) |
 | `cox get [loops] [-n ns]` | list Loops | `List` Loops, print a table |
 | `cox describe <loop>` | human-readable summary | `Get` Loop + print spec/status/history |
-| `cox approve <loop> [--ns ns]` | set `PlanApproved` | `Update` a condition with PLAN.md sha256 |
-| `cox reject <loop> --reason "..."` | set `PlanRejected` | `Update` condition + reason |
+| `cox approve <loop> [--ns ns]` | set `PlanApproved` | `Patch` the status subresource: a merge patch of `status.conditions` with the PLAN.md sha256 |
+| `cox reject <loop> --reason "..."` | set `PlanRejected` | `Patch` the status subresource: a merge patch of `status.conditions` with the reason |
 | `cox pause <loop>` / `cox resume <loop>` | set/clear `spec.suspend` | `Patch` the Loop spec |
 | `cox logs <loop> [-f]` | stream sandbox logs | `kubectl exec` / pod logs of the sandbox Pod |
 | `cox history <loop>` | print audit trail | `Get` Loop, render `status.history[]` |
@@ -83,7 +83,8 @@ system boundary, so we mock *its client*, not the real cluster:
 - **C4** — *`cox pause` patches `spec.suspend`.* Fake client records a `Patch`;
   assert the patch sets `suspend: true` (and `resume` clears it).
 - **C5** — *`cox approve` sets the PlanApproved condition with the PLAN.md
-  sha256.* (Phase 4, but the seam is the same.) Fake client records an `Update`;
+  sha256.* (Phase 4, but the seam is the same.) Fake client records a `Patch` of
+  the `status` subresource (F87(d) moved it off the whole-object `Update`);
   assert the condition's `message` carries the hash.
 
 The **client interface** (the seam) is a small set: `Get`, `List`, `Create`,

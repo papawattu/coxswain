@@ -88,7 +88,7 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 			if t, _ := cm["type"].(string); len(t) > width {
 				width = len(t)
 			}
-			if s, _ := cm["status"].(string); len(s) > statusWidth {
+			if s, _ := cm[conditionStatusField].(string); len(s) > statusWidth {
 				statusWidth = len(s)
 			}
 		}
@@ -99,7 +99,7 @@ func describeLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) 
 			continue
 		}
 		t, _ := cm["type"].(string)
-		s, _ := cm["status"].(string)
+		s, _ := cm[conditionStatusField].(string)
 		reason, _ := cm["reason"].(string)
 		msg, _ := cm["message"].(string)
 		w.printf("  %-*s %-*s reason=%s\n", width, t, statusWidth, s, reason)

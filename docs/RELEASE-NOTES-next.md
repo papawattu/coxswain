@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `f534314` = PR #303); each claim cites its
+merged code on `main` (as of `0070686` = PR #269); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade

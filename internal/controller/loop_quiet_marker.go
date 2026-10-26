@@ -28,11 +28,12 @@
 //
 //   - the F44 metering gate (loop_p2d_budget.go, meteringEventQuiet) uses a
 //     DIFFERENT input — the condition's LastTransitionTime, not an annotation
-//     — so it shares the idea, not the plumbing;
-//   - the boolean memoryPVCUnboundNotified marker (loop_p5a_memory.go) is
-//     one-shot with no window: it sets a marker and never re-announces, which
-//     is the pattern F48f's comment names as its model and F48f replaced for
-//     the Events surface.
+//     — so it shares the idea, not the plumbing.
+//
+// Folded in later: the memory-PVC surface (loop_p5a_memory.go) used a boolean
+// one-shot marker until R39 I144, which is the pattern F48f's comment names as
+// its model and F48f replaced for the Events surface. It now calls this helper
+// (surfaceMemoryPVCUnbound).
 package controller
 
 import (
@@ -52,7 +53,7 @@ import (
 type quietMarker struct {
 	// key is the operator-owned annotation on the LOOP (not on the sandbox
 	// pod: the Loop is the reconcile's own object, so the marker travels with
-	// the same patch/status pass as the conditions). Both current keys are
+	// the same patch/status pass as the conditions). All current keys are
 	// coxswain.io/-prefixed; a new caller should be too.
 	key string
 	// quiet is how long the marker mutes a repeat Event.
@@ -123,13 +124,13 @@ func (r *LoopReconciler) markAndSurfaceQuietly(ctx context.Context, loop *coxv1a
 		loop.Annotations = make(map[string]string)
 	}
 	loop.Annotations[m.key] = notified
-	// Refresh the caller's resourceVersion (the patch bumped it) exactly as
-	// markMemoryPVCUnboundNotified does (loop_p5a_memory.go): this reconcile's
-	// trailing Status().Update sends loop's RV, and a stale one is a 409
-	// conflict — a lost pass, an error log, and the conditions set earlier in
-	// the pass only persisted on the requeue. The caller's in-memory status is
-	// intact (the patch was on a copy). A NotFound leaves the RV alone: the
-	// Loop is going away, so there is nothing to refresh for.
+	// Refresh the caller's resourceVersion (the patch bumped it): this
+	// reconcile's trailing Status().Update sends loop's RV, and a stale one is
+	// a 409 conflict — a lost pass, an error log, and the conditions set
+	// earlier in the pass only persisted on the requeue. The caller's
+	// in-memory status is intact (the patch was on a copy). A NotFound leaves
+	// the RV alone: the Loop is going away, so there is nothing to refresh
+	// for.
 	fresh := &coxv1alpha1.Loop{}
 	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil {
 		if !apierrors.IsNotFound(gerr) {

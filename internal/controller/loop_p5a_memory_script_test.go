@@ -14,14 +14,18 @@ package controller
 //   - Idempotent: a second run on the same contents is a no-op.
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -176,32 +180,105 @@ func TestCopyInScriptIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestEmitMemoryPVCUnboundEvent (the visible degradation, R26 I90): an
-// unbound memory PVC emits a MemoryPVCUnbound Event (the operator must not
-// silently skip memory). A nil Recorder (most envtests) skips the emission
-// without error.
-func TestEmitMemoryPVCUnboundEvent(t *testing.T) {
-	loop := &coxv1alpha1.Loop{
-		ObjectMeta: metav1.ObjectMeta{Name: "p5a-ev", Namespace: "default"},
+// TestSurfaceMemoryPVCUnbound (the visible degradation, R26 I90; re-armed by
+// R39 I144): an unbound memory PVC emits a MemoryPVCUnbound Event, and the
+// marker is a quiet WINDOW, not a one-shot: the Event repeats once
+// memoryPVCUnboundQuiet has passed while the PVC stays unbound, so a
+// degradation longer than --event-ttl (1h) is not silent.
+//
+// A nil Recorder skips the emission without error (most envtests).
+func TestSurfaceMemoryPVCUnbound(t *testing.T) {
+	ctx := context.Background()
+	newLoop := func() *coxv1alpha1.Loop {
+		return &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: "p5a-ev", Namespace: "default"}}
 	}
 	// A nil Recorder: the emission is skipped without error (the unit's
 	// contract: a nil Recorder never panics).
 	r := &LoopReconciler{CNIProber: testCNIProber(), Recorder: nil}
-	r.emitMemoryPVCUnboundEvent(loop, "memory-abc")
+	s := runtime.NewScheme()
+	if err := coxv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("build scheme: %v", err)
+	}
+	nilRecorderClient := fake.NewClientBuilder().WithScheme(s).WithObjects(newLoop()).Build()
+	r.Client = nilRecorderClient
+	r.surfaceMemoryPVCUnbound(ctx, newLoop(), "memory-abc")
 
-	// A non-nil Recorder: the Event is recorded (the fake recorder is a
-	// channel; drain it and check the reason).
-	fake := record.NewFakeRecorder(64)
-	r = &LoopReconciler{CNIProber: testCNIProber(), Recorder: fake}
-	r.emitMemoryPVCUnboundEvent(loop, "memory-abc")
-	saw := false
-	for e := range fake.Events {
-		if strings.Contains(e, memoryPVCUnboundReason) {
-			saw = true
-			break
+	// The window: one Event, then silence inside the window, then a repeat.
+	rec := record.NewFakeRecorder(64)
+	loop := newLoop()
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(loop).Build()
+	clock := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	reconciler := &LoopReconciler{
+		CNIProber: testCNIProber(),
+		Client:    cl,
+		Recorder:  rec,
+		now:       func() metav1.Time { return clock },
+	}
+	drain := func() int {
+		n := 0
+		for {
+			select {
+			case e := <-rec.Events:
+				if strings.Contains(e, memoryPVCUnboundReason) {
+					n++
+				}
+			default:
+				return n
+			}
 		}
 	}
-	if !saw {
-		t.Fatalf("an unbound memory PVC must emit a %s Event (the degradation is visible, R26 I90)", memoryPVCUnboundReason)
+
+	reconciler.surfaceMemoryPVCUnbound(ctx, loop, "memory-abc")
+	if got := drain(); got != 1 {
+		t.Fatalf("the first unbound pass must emit one %s Event, got %d", memoryPVCUnboundReason, got)
+	}
+	marker := loop.Annotations[memoryPVCUnboundNotifiedAnnotation]
+	if _, err := time.Parse(time.RFC3339, marker); err != nil {
+		t.Fatalf("the marker must be the last Event's time (RFC3339), got %q: %v", marker, err)
+	}
+
+	// Inside the window: muted (a per-reconcile Event would be noise).
+	clock = metav1.NewTime(clock.Add(memoryPVCUnboundQuiet / 2))
+	reconciler.surfaceMemoryPVCUnbound(ctx, loop, "memory-abc")
+	if got := drain(); got != 0 {
+		t.Fatalf("inside the quiet window the surface must stay silent, got %d Events", got)
+	}
+
+	// Past the window: re-announced (the deployment is still degraded, and its
+	// Event from the first pass has expired at --event-ttl).
+	clock = metav1.NewTime(clock.Add(memoryPVCUnboundQuiet))
+	reconciler.surfaceMemoryPVCUnbound(ctx, loop, "memory-abc")
+	if got := drain(); got != 1 {
+		t.Fatalf("past the quiet window the surface must re-announce exactly once, got %d Events", got)
+	}
+}
+
+// TestReconcileRequeueAfterMemoryWindow (I144 review P2-1): the memory
+// degradation's re-announce window reaches the trailing result, and the EARLIER
+// of it and the budget window wins — coming back sooner only re-evaluates, so
+// nothing is skipped either way.
+func TestReconcileRequeueAfterMemoryWindow(t *testing.T) {
+	r := &LoopReconciler{CNIProber: testCNIProber()}
+	cases := []struct {
+		name                         string
+		budgetRequeue, memoryRequeue time.Duration
+		want                         time.Duration
+	}{
+		{"the memory window alone", 0, 4 * time.Minute, 4 * time.Minute},
+		{"the memory window before a later budget window", 10 * time.Minute, 4 * time.Minute, 4 * time.Minute},
+		{"a sooner budget window wins", 2 * time.Minute, 4 * time.Minute, 2 * time.Minute},
+		{"neither", 0, 0, 0},
+	}
+	for _, tc := range cases {
+		got := r.reconcileRequeueAfter(true, false, false, false, false, tc.budgetRequeue, tc.memoryRequeue)
+		if got.RequeueAfter != tc.want {
+			t.Errorf("%s: RequeueAfter = %v, want %v", tc.name, got.RequeueAfter, tc.want)
+		}
+	}
+	// The 5s work requeue still wins: pending work is more urgent than a
+	// reminder.
+	got := r.reconcileRequeueAfter(false, true, false, false, false, 0, 4*time.Minute)
+	if got.RequeueAfter != 5*time.Second {
+		t.Errorf("pending work must keep the 5s requeue, got %v", got.RequeueAfter)
 	}
 }

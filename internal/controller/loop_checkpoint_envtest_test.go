@@ -880,6 +880,11 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
 		s5aVerifyPod(ctx, ns, name, verifyJobName(loop), 0)
+		// R39 I144: bind the memory PVC first, so this spec's RequeueAfter
+		// assertion is about the checkpoint step. An unbound memory PVC now
+		// schedules its own re-announce window (5 minutes), which would be the
+		// only reason this pass requeued.
+		bindMemoryPVC(ns, testRepoURL)
 		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -1409,7 +1414,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		// is OPEN, and FakeRecorder closes Events only when its buffer drains
 		// and the recorder is stopped. This spec never stops the recorder, so
 		// the range loop hangs at `<-recorder.Events` on the first unbuffered
-		// send (P5a: the one-shot MemoryPVCUnbound Event queued ahead of the
+		// send (P5a: the MemoryPVCUnbound Event queued ahead of the
 		// FinalizerRemovalBlocked Event made the hang deterministic; before P5a
 		// the single FinalizerRemovalBlocked Event filled the last slot and the
 		// break on it exited the loop first, which is why the spec passed for

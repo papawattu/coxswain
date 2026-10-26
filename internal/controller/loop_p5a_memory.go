@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -53,7 +54,8 @@ import (
 // and the copy-in below is SKIPPED (the operator must not mount an unbound
 // PVC into the sandbox — the kubelet would never start the pod). The
 // degradation is VISIBLE, never silent (R26 I90): an Event (reason
-// MemoryPVCUnbound) is emitted and the Loop runs without memory.
+// MemoryPVCUnbound) is emitted — re-announced once per quiet window while the
+// PVC stays unbound (R39 I144) — and the Loop runs without memory.
 //
 // The copy-in init container (D66 fallback, universal). Rather than a
 // long-lived RWX mount into the agent (the agent would hold a writable shared
@@ -84,19 +86,24 @@ const (
 	// memoryPVCUnboundReason is the Event reason for the visible degradation
 	// when the memory PVC is not Bound (the RWX cluster lacks the driver, or
 	// the PVC is still provisioning): the copy-in is skipped, the Loop runs
-	// without memory, and the Event is the record (R26 I90). Emitted at most
-	// once per Loop (the operator owns memoryPVCUnboundNotifiedAnnotation on
-	// the Loop, so the Event is a one-shot transition signal, not a per-
-	// reconcile noise source).
+	// without memory, and the Event is the record (R26 I90). It re-announces
+	// once per memoryPVCUnboundQuiet while the Loop RUNS and the PVC stays
+	// unbound (R39 I144): an Event that is emitted once is invisible after
+	// --event-ttl (1h), which is the window a non-RWX class leaves the PVC
+	// unbound for. A terminal (Succeeded/Failed) Loop is excluded — the caller
+	// gates on isTerminalPhase — because its PVC will not be read by it again
+	// and the window would otherwise re-arm itself forever.
 	memoryPVCUnboundReason = "MemoryPVCUnbound"
-	// memoryPVCUnboundNotifiedAnnotation is the operator-owned one-shot marker
-	// on the Loop: the MemoryPVCUnbound Event has been emitted for the current
-	// unbound window. The operator sets it after the Event and clears it when
-	// the PVC becomes Bound (a future unbound transition re-emits the Event).
+	// memoryPVCUnboundNotifiedAnnotation is the operator-owned quiet-window
+	// marker on the Loop: the TIME of the last MemoryPVCUnbound Event
+	// (RFC3339, F48f/I144). A pre-I144 `true` value parses as "not recently
+	// notified", so an upgrade announces once and rewrites the marker as a
+	// time. The key is unchanged so an upgraded operator reads it.
 	memoryPVCUnboundNotifiedAnnotation = "coxswain.io/memory-pvc-unbound-notified"
-	// memoryPVCUnboundNotifiedValue is the annotation's value (the goconst
-	// "true" — the marker is a boolean flag, not a variable payload).
-	memoryPVCUnboundNotifiedValue = "true"
+	// memoryPVCUnboundQuiet is how long the marker mutes a repeat Event. It
+	// matches the sibling surfaces (F48b's events-unreadable, F83b's foreign
+	// verify Job) rather than being its own number.
+	memoryPVCUnboundQuiet = 5 * time.Minute
 	// memoryCopyInScriptPath: the copy-in script's fixed DEST (the /workspace
 	// mount). A named constant so the execution test can substitute it.
 	memoryCopyInDestSub = "__DEST__"
@@ -207,102 +214,47 @@ func (r *LoopReconciler) memoryPVCBound(ctx context.Context, loop *coxv1alpha1.L
 	return pvc.Status.Phase == corev1.ClaimBound, nil
 }
 
-// emitMemoryPVCUnboundEvent surfaces the visible degradation (R26 I90): the
+// surfaceMemoryPVCUnbound surfaces the visible degradation (R26 I90): the
 // memory PVC is not Bound (the storage class lacks RWX, or it is still
 // provisioning), so the copy-in init container is SKIPPED and the Loop runs
-// without memory. Best-effort: a failure never blocks the reconcile; a nil
-// Recorder (most envtests) skips it. The Event is emitted AT MOST ONCE per
-// Loop: the operator owns an annotation (memoryPVCUnboundNotifiedAnnotation)
-// on the Loop, so the Event is a one-shot transition signal, not a per-reconcile
-// noise source (every envtest spec whose Loop has a repo sees a Pending
-// memory PVC — re-emitting on every reconcile would poison the Event-driven
-// specs). The annotation is cleared by the caller when the PVC becomes Bound.
-func (r *LoopReconciler) emitMemoryPVCUnboundEvent(loop *coxv1alpha1.Loop, pvcName string) {
-	if r.Recorder == nil {
-		return
-	}
-	if loop.Annotations != nil && loop.Annotations[memoryPVCUnboundNotifiedAnnotation] == memoryPVCUnboundNotifiedValue {
-		return // already notified (idempotent: no re-emit on every reconcile)
-	}
-	r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryPVCUnboundReason,
-		"memory PVC %s is not Bound (accessModes ReadWriteMany; the cluster storage class may not support RWX) — the Loop runs without shared memory (the copy-in init is skipped)",
-		pvcName)
-}
-
-// markMemoryPVCUnboundNotified records the one-shot annotation (the Event
-// was emitted; do not re-emit on every reconcile). The annotation is on the
-// Loop (operator-owned; the user does not set it).
+// without memory.
 //
-// The patch is applied to a DEEP COPY (metadata-only MergeFrom patch), NOT
-// the caller's `loop` object. A full r.Update(ctx, loop) writes the server
-// response back into `loop`, resetting loop.Status to the PERSISTED (old)
-// status and DROPPING the conditions set earlier in this reconcile — so the
-// trailing Status().Update would write the old status (the S4/S6 specs
-// saw "changed=true but conditions not persisted"). The MergeFrom patch
-// touches ONLY metadata.annotations (the one-shot marker); it does not
-// touch the status subresource and does not reset the caller's in-memory
-// status. The caller's `loop` keeps its in-memory status; the reconcile's
-// trailing Status().Update persists it.
-func (r *LoopReconciler) markMemoryPVCUnboundNotified(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if loop.Annotations != nil && loop.Annotations[memoryPVCUnboundNotifiedAnnotation] == memoryPVCUnboundNotifiedValue {
-		return nil // already marked (no update needed)
+// R39 I144: the Event was a one-shot (a boolean marker, cleared only when the
+// PVC bound), so a PVC unbound for longer than the cluster's --event-ttl (1h,
+// the case docs/UPGRADE.md names for a non-RWX class) left the degradation
+// with no surface at all. It now goes through the shared quiet-window marker
+// (F83f, loop_quiet_marker.go): the marker holds the last Event's TIME and the
+// Event re-announces once per memoryPVCUnboundQuiet while the Loop runs and the
+// PVC stays unbound (a terminal Loop is never warned: see the call site in
+// ensureSandbox). That keeps it a signal rather than a per-reconcile noise
+// source (every envtest Loop with a repo has a Pending memory PVC) while
+// making sure it never goes silent for the Loop's life.
+//
+// Best-effort: a nil Recorder skips the Event, and a failed marker patch only
+// means the Event may repeat on the next pass. Neither blocks the reconcile.
+//
+// It returns how long until the marker's window expires, so the caller can
+// SCHEDULE the re-announce (I144 review P2-1): the Event only repeats on a
+// reconcile, and a Loop that is merely waiting for its PVC to bind has nothing
+// else to wake it, so "re-announces every 5 minutes" needs a timer, not just a
+// window. 0 would mean the window is already open (the surface just emitted, so
+// the wait is the whole window).
+func (r *LoopReconciler) surfaceMemoryPVCUnbound(ctx context.Context, loop *coxv1alpha1.Loop, pvcName string) time.Duration {
+	r.markAndSurfaceQuietly(ctx, loop, quietMarker{
+		key:    memoryPVCUnboundNotifiedAnnotation,
+		quiet:  memoryPVCUnboundQuiet,
+		reason: memoryPVCUnboundReason,
+		message: fmt.Sprintf("memory PVC %s is not Bound (accessModes ReadWriteMany; the cluster storage class may not support RWX) — the Loop runs without shared memory (the copy-in init is skipped)",
+			pvcName),
+	})
+	// markAndSurfaceQuietly refreshed the marker in memory (it writes the
+	// emission time, or leaves the previous one when this pass was muted).
+	if at, ok := quietMarkerNotifiedAt(loop.Annotations[memoryPVCUnboundNotifiedAnnotation]); ok {
+		if d := at.Add(memoryPVCUnboundQuiet).Sub(r.operatorNow().Time); d > 0 {
+			return d
+		}
 	}
-	// Patch on a SEPARATE object (not the caller's `loop`), so the server
-	// response does NOT reset the caller's in-memory status. A MergeFrom
-	// patch on the caller's `loop` would write the server response (the
-	// persisted object, with the OLD status) back into `loop`, overwriting
-	// the conditions and phase set earlier in this reconcile (the S4/S6
-	// specs saw "changed=true but conditions not persisted" for this
-	// reason). The patch touches ONLY metadata.annotations; the caller's
-	// `loop` keeps its in-memory status.
-	patched := loop.DeepCopy()
-	if patched.Annotations == nil {
-		patched.Annotations = make(map[string]string)
-	}
-	patched.Annotations[memoryPVCUnboundNotifiedAnnotation] = memoryPVCUnboundNotifiedValue
-	patch := client.MergeFrom(loop.DeepCopy())
-	if err := r.Patch(ctx, patched, patch); err != nil {
-		return fmt.Errorf("mark memory PVC unbound notified on %s/%s: %w", loop.Namespace, loop.Name, err)
-	}
-	// Refresh the caller's resourceVersion (the patch bumped it); the
-	// caller's in-memory status is intact (the patch was on `copy`, not
-	// `loop`). The trailing Status().Update uses the fresh resourceVersion.
-	fresh := &coxv1alpha1.Loop{}
-	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil && !apierrors.IsNotFound(gerr) {
-		return fmt.Errorf("re-get Loop after memory PVC unbound mark %s/%s: %w", loop.Namespace, loop.Name, gerr)
-	}
-	loop.ResourceVersion = fresh.ResourceVersion
-	return nil
-}
-
-// clearMemoryPVCUnboundNotified clears the one-shot annotation when the PVC
-// becomes Bound (the degradation is resolved; a future unbound transition
-// re-emits the Event). Returns true when the Loop was updated (the caller ORs
-// it into its changed flag for the shared trailing Status().Update). Best-
-// effort on a failed Update: the annotation is a one-shot marker, not
-// load-bearing (a failure here just means the Event may re-emit next
-// unbound transition — the visible degradation is still surfaced).
-func (r *LoopReconciler) clearMemoryPVCUnboundNotified(ctx context.Context, loop *coxv1alpha1.Loop) bool {
-	if loop.Annotations == nil || loop.Annotations[memoryPVCUnboundNotifiedAnnotation] != memoryPVCUnboundNotifiedValue {
-		return false
-	}
-	// Patch on a SEPARATE object (not the caller's `loop`), so the server
-	// response does NOT reset the caller's in-memory status.
-	patched := loop.DeepCopy()
-	delete(patched.Annotations, memoryPVCUnboundNotifiedAnnotation)
-	patch := client.MergeFrom(loop.DeepCopy())
-	if err := r.Patch(ctx, patched, patch); err != nil {
-		// Best-effort: a failure is not load-bearing.
-		return false
-	}
-	// Refresh the caller's resourceVersion; the caller's in-memory status is
-	// intact.
-	fresh := &coxv1alpha1.Loop{}
-	if gerr := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); gerr != nil && !apierrors.IsNotFound(gerr) {
-		return false
-	}
-	loop.ResourceVersion = fresh.ResourceVersion
-	return true
+	return memoryPVCUnboundQuiet
 }
 
 // memoryCopyInScript returns the copy-in init container's sh script: copy the

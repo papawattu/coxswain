@@ -657,9 +657,10 @@ func (r *LoopReconciler) modelConfigInvalid(ctx context.Context, loop *coxv1alph
 // Reconcile moves the cluster state closer to the Loop's desired state.
 // phaseBootstrap is the Phase-0 + S4 bootstrap + P2f pause mechanics +
 // ensureSandbox step extracted from Reconcile to keep the top-level
-// reconcile within the gocyclo budget. It returns (changed, pauseBlocked,
-// resumeCleared, err).
-func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, error) {
+// reconcile within the gocyclo budget. It returns (changed, resumeCleared,
+// memoryRequeue, err); memoryRequeue is the memory degradation's re-announce
+// delay (R39 I144).
+func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, time.Duration, error) {
 	changed := false
 	if loop.Status.Phase == "" {
 		loop.Status.Phase = coxv1alpha1.LoopPhasePending
@@ -687,7 +688,7 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	// gocyclo 31). P5a: it also ensures the shared memory PVC (per
 	// (namespace, git URL)) that the sandbox's copy-in init container reads.
 	if err := r.ensureLoopArtifacts(ctx, loop); err != nil {
-		return false, false, err
+		return false, false, 0, err
 	}
 
 	// P2f: the Paused phase entry (spec.suspend=true on a non-terminal phase,
@@ -708,12 +709,11 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	// sandbox Suspended meanwhile.
 	r.ensureAgentNetPolBeforeSandbox(ctx, loop)
 
-	sandboxUpdated, err := r.ensureSandbox(ctx, loop, pauseBlocked)
+	memoryRequeue, err := r.ensureSandbox(ctx, loop, pauseBlocked)
 	if err != nil {
-		return false, false, err
+		return false, false, 0, err
 	}
-	changed = changed || sandboxUpdated
-	return changed, resumeCleared, nil
+	return changed, resumeCleared, memoryRequeue, nil
 }
 
 // validateStep is the C6a + D34 validation step extracted from Reconcile
@@ -806,12 +806,12 @@ func (r *LoopReconciler) s4ClaimAndVerifyJob(ctx context.Context, loop *coxv1alp
 // it from the snapshot). Returns the bootChanged (the bootstrap's condition
 // change) and the resumeCleared (the P2f resume annotation consumed).
 // Extracted from Reconcile to keep it within the gocyclo budget.
-func (r *LoopReconciler) b2GatedBootstrap(ctx context.Context, loop *coxv1alpha1.Loop, hold bool) (bool, bool, error) {
+func (r *LoopReconciler) b2GatedBootstrap(ctx context.Context, loop *coxv1alpha1.Loop, hold bool) (bool, bool, time.Duration, error) {
 	if hold {
-		return false, false, nil // the B2 restore is in progress / deferred / rejected — skip the bootstrap
+		return false, false, 0, nil // the B2 restore is in progress / deferred / rejected — skip the bootstrap
 	}
-	bootChanged, resumeCleared, err := r.phaseBootstrap(ctx, loop)
-	return bootChanged, resumeCleared, err
+	bootChanged, resumeCleared, memoryRequeue, err := r.phaseBootstrap(ctx, loop)
+	return bootChanged, resumeCleared, memoryRequeue, err
 }
 
 func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -924,7 +924,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// the restore decision and recreate the lost PVC empty, defeating the
 	// restore). The sandbox build is also skipped (a restored PVC is invisible
 	// to the sandbox build — the sandbox reads the PVC by name, not spec).
-	bootChanged, resumeCleared, err := r.b2GatedBootstrap(ctx, &loop, b2Hold)
+	bootChanged, resumeCleared, memoryRequeue, err := r.b2GatedBootstrap(ctx, &loop, b2Hold)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1076,7 +1076,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue), nil
+	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue), nil
 }
 
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
@@ -1774,8 +1774,14 @@ func applyBPFNodeAffinity(e engine.Enforcer, spec *corev1.PodSpec) {
 	}
 }
 
-func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) (bool, error) {
-	loopUpdated := false
+// ensureSandbox makes the Sandbox match the Loop's current phase, pause state
+// and memory state. It returns the memory degradation's re-announce delay (0
+// when there is nothing to schedule): the MemoryPVCUnbound Event repeats only on
+// a reconcile, so the caller must set a timer for it (R39 I144). The Loop-object
+// writes the memory marker used to make are gone: the shared quiet-window helper
+// patches the marker itself and refreshes the caller's resourceVersion, so there
+// is no "Loop changed" flag to report.
+func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) (time.Duration, error) {
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
 	log := logf.FromContext(ctx)
@@ -1808,9 +1814,9 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				"stale", staleAnnotation,
 				"desired", string(loop.Status.DesiredPhase))
 			if derr := r.Delete(ctx, existingSb); derr != nil && !apierrors.IsNotFound(derr) {
-				return false, fmt.Errorf("delete sandbox for phase advance: %w", derr)
+				return 0, fmt.Errorf("delete sandbox for phase advance: %w", derr)
 			}
-			return false, nil // Sandbox deleted; the next reconcile creates it fresh
+			return 0, nil // Sandbox deleted; the next reconcile creates it fresh
 		}
 		// F6 (the I65 P1-B pattern mirrored): status.agent.infraSandboxUID
 		// keys the count on the Sandbox the failure was read from, so a re-read
@@ -1840,35 +1846,41 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	} else if !apierrors.IsNotFound(gerr) {
 		// A failed read (not NotFound): fail closed (I49 — a failed read is
 		// never a success); the reconcile retries.
-		return false, fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
+		return 0, fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
 	}
 
 	// P5a (D66): the memory PVC decision (bound vs unbound) is computed BEFORE
 	// the CreateOrUpdate (the mutate func may run twice and must not emit the
-	// Event or write the annotation twice). The one-shot Event + annotation
-	// (R26 I90: a fallback must surface its failure, visible not silent) run
-	// here, once per reconcile, OUTSIDE the mutate func.
+	// Event or write the marker twice). The quiet-window Event (R26 I90: a
+	// fallback must surface its failure, visible not silent) runs here, once per
+	// reconcile, OUTSIDE the mutate func.
+	//
+	// R39 I144: the surface is no longer one-shot. It goes through the shared
+	// quiet-window marker (loop_quiet_marker.go), so a PVC that stays unbound
+	// keeps re-announcing once per memoryPVCUnboundQuiet instead of going silent
+	// when its Event expires at --event-ttl. Nothing to do when the PVC becomes
+	// Bound: the surface simply stops being called, and a later unbound window
+	// announces again once the window has passed.
+	memoryRequeue := time.Duration(0)
 	memoryBound, memErr := r.memoryPVCBound(ctx, loop)
 	if memErr != nil {
-		return false, memErr
+		return 0, memErr
 	}
-	if memoryBound && memoryPVCName(loop) != "" {
-		// The PVC is Bound: clear the one-shot unbound marker (a future
-		// unbound transition re-emits the Event).
-		if r.clearMemoryPVCUnboundNotified(ctx, loop) {
-			loopUpdated = true
-		}
-	} else if memoryPVCName(loop) != "" {
+	if !memoryBound && memoryPVCName(loop) != "" && !isTerminalPhase(loop.Status.Phase) {
 		// A PVC exists but is not Bound: the visible degradation (the Loop
 		// runs without memory; a repo-less Loop has no PVC at all and is
-		// "no memory", not a degradation — no Event there). The Event is
-		// emitted at most once per Loop (the operator-owned annotation makes
-		// it a one-shot transition signal, not a per-reconcile noise source).
-		r.emitMemoryPVCUnboundEvent(loop, memoryPVCName(loop))
-		if merr := r.markMemoryPVCUnboundNotified(ctx, loop); merr != nil {
-			return false, merr
-		}
-		loopUpdated = true
+		// "no memory", not a degradation — no Event there).
+		//
+		// A TERMINAL (Succeeded/Failed) Loop is excluded (I144 review): the
+		// sandbox is Suspended for the terminal phase itself (loopSandboxStopped),
+		// this Loop will not read the PVC again, and — the reason this is a guard
+		// and not a nicety — the quiet window re-arms itself through the requeue,
+		// so a terminal Loop on a class without RWX would reconcile and warn
+		// every 5 minutes for the life of the cluster with nothing to fix. Before
+		// the window existed, the one-shot marker meant one Event and silence; the
+		// same is true again here. (modelProxyHold gates on the terminal phase for
+		// the same reason.)
+		memoryRequeue = r.surfaceMemoryPVCUnbound(ctx, loop, memoryPVCName(loop))
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
@@ -1964,7 +1976,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		return controllerutil.SetControllerReference(loop, desired, r.Scheme)
 	})
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 
 	// Phase 0 done-when: the controller logs the sandbox it created/updated.
@@ -1983,7 +1995,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			"loop", loop.Name,
 		)
 	}
-	return loopUpdated, nil
+	return memoryRequeue, nil
 }
 
 // modelProxyHold is the D35a gate (F84): true while the Loop's model proxy pod
@@ -6465,11 +6477,16 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 }
 
 // reconcileRequeueAfter is the trailing requeue decision, extracted to keep
-// Reconcile within the gocyclo budget. P2d item 10: the wall-clock
-// RequeueAfter (the quiet-Loop rule) is the ONLY timer this reconcile sets.
-func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue time.Duration) ctrl.Result {
+// Reconcile within the gocyclo budget. The wall-clock RequeueAfters this
+// reconcile can set: the 5s work requeue below, the P2d budget window, and the
+// R39 I144 memory-PVC re-announce window (the earlier window wins, so the
+// Event's re-announce is never waiting on a longer budget timer).
+func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration) ctrl.Result {
 	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+	if memoryRequeue > 0 && (budgetRequeue == 0 || memoryRequeue < budgetRequeue) {
+		return ctrl.Result{RequeueAfter: memoryRequeue}
 	}
 	if budgetRequeue > 0 {
 		return ctrl.Result{RequeueAfter: budgetRequeue}

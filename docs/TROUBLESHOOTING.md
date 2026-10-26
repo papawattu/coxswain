@@ -926,11 +926,14 @@ the transition (not per reconcile). The condition's **reason** is whatever the
 engine observation reports, and on a cluster with no KubeArmor-labelled node
 that is `NodeNotEnforcing` (the node-label fact is checked first), not
 `EngineUnavailable` — the CRD wording comes from the tolerated write error, so
-it is present in either case. `kubectl cox describe` shows the Loop at
-`Planning`, and — unlike the pre-F92 shape, where the pass returned before the
-bootstrap — its sandbox **is created and held `Suspended`** (the D30 gate sets
-the object's operating mode; it does not prevent the object), along with the
-workspace PVC. Both are visible on kind: `f92-kubearmor-sandbox  Suspended` and
+it is present in either case. `kubectl cox describe` shows the phase the Loop
+was already in — the hold does not move it (the only phase advance here turns
+`Pending` into `Planning`, in `loop_controller.go`, so a **fresh** Loop shows
+`Planning` while a Loop that was already at `Implementing`, `Verifying`, …
+keeps that phase) — and, unlike the pre-F92 shape, where the pass returned
+before the bootstrap, its sandbox **is created and held `Suspended`** (the D30
+gate sets the object's operating mode; it does not prevent the object), along
+with the workspace PVC. Both are visible on kind: `f92-kubearmor-sandbox  Suspended` and
 `persistentvolumeclaim/f92-kubearmor-workspace` waiting for its first consumer.
 The sandbox is held, not deleted, so nothing starts in it while the hold is on.
 

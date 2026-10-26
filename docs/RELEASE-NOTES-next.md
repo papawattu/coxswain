@@ -217,6 +217,12 @@ existing Loops are unaffected, but new ones are.
 
 ## Other changes
 
+### F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, not only in the log — #308
+
+- **What was wrong.** On a cluster with no `KubeArmorPolicy` CRD and the operator running without `--allow-unenforced`, the policy-write error was returned before any status write, so every Loop sat at an empty `status` — no phase, no condition, no Event — for ever; the only trace was the operator log (`7fd171d` = PR #308, F92).
+- **What changed.** The missing-CRD no-match is now tolerated on the write path so the condition half still runs: the Loop shows `PolicyEnforced=False` with a message naming the missing CRD (the reason is whatever the engine observation reports — on kind: `NodeNotEnforcing`), one `PolicyEnforcementUnavailable` Warning Event (one per transition, not re-announced), the sandbox created and held `Suspended` with the workspace PVC, and a 1-minute re-check while held — a terminal Loop takes no such window, and a Loop that has never cloned takes the ordinary 5s work requeue first (F92).
+- **On upgrade.** Nothing required; pick up the new operator image (no CRD, RBAC or chart change). If a Loop is held this way, recovery is installing KubeArmor — installing only the CRD is not enough (the engine still reports the node not enforcing) — or restarting the operator with `--allow-unenforced` (PR #308; `docs/TROUBLESHOOTING.md` gains the F92 section).
+
 ### F53: the verify checkout is read-only to the checks, and the verify Job has a deadline — #306
 
 - **What was wrong.** Every `check-*` container in the verify Job mounted the checked-out tree (`/verify`) writable, so one check could change what a later check saw (ADR-0005 D19 rules that out: "the 'otherwise writable' branch let agent code in check 1 rewrite `*_test.go` after the tamper check, so check 2 could compile doctored tests") (F53 a). All checks also shared one `/tmp` scratch emptyDir, so one check could poison the next check's `HOME`/`GOCACHE`/`TMPDIR`. And the verify Job was the only one of the three operator Jobs with no deadline (deliver 600s, memory writer 300s): a check that never terminates held the Loop in `Verifying` for ever with no condition, no Event and no bound (F53 b).

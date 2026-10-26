@@ -55,7 +55,7 @@ var _ = Describe("I93 plan-hash check at Implementing start", func() {
 			Spec:       spec,
 		})).To(Succeed())
 
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
@@ -178,7 +178,7 @@ var _ = Describe("I93 plan-hash check at Implementing start", func() {
 		// A FakeRecorder captures the Events (the suite client has no
 		// recorder wired for this scratch reconciler).
 		rec := record.NewFakeRecorder(64)
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
@@ -287,7 +287,7 @@ var _ = Describe("I93 plan-hash check at Implementing start", func() {
 			Spec:       spec,
 		})).To(Succeed())
 
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
@@ -401,7 +401,7 @@ var _ = Describe("I93 plan-hash check at Implementing start", func() {
 			Spec:       spec,
 		})).To(Succeed())
 
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
@@ -487,7 +487,7 @@ var _ = Describe("I93 plan-hash check at Implementing start", func() {
 	// Implementing run must not carry a stale rejection/replan feedback into
 	// the conversation).
 	It("the phase-init for DesiredPhase=Implementing writes .coxswain/plan-hash with the approved hash (the runner's Implementing-start check read channel)", func() {
-		r := &LoopReconciler{}
+		r := &LoopReconciler{CNIProber: testCNIProber()}
 		// A Manual-mode Loop at Implementing (DesiredPhase=Implementing) with
 		// a valid PlanApproved condition (the user approved the plan).
 		loop := &coxv1alpha1.Loop{

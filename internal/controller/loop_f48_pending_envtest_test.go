@@ -51,7 +51,7 @@ var _ = Describe("F48: a sandbox pod that never starts", func() {
 		Expect(k8sClient.SubResource("status").Update(ctx, pod)).To(Succeed())
 		offset := new(time.Duration)
 		rec := record.NewFakeRecorder(64)
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: rec}
 		r.now = func() metav1.Time { return metav1.NewTime(pod.CreationTimestamp.Add(*offset)) }
 		return loop, pod, r, offset, rec
 	}

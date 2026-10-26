@@ -75,7 +75,7 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			PodCIDR:          i42cPodCIDR,
@@ -418,7 +418,7 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
 		// A reconciler with a DIFFERENT POD_CIDR than the default fixture.
-		alt := &LoopReconciler{
+		alt := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			PodCIDR:          i42cAltPodCIDR,
@@ -520,7 +520,7 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		Expect(np.Spec.Egress[0].To[0].IPBlock.Except).To(ContainElement(i42cPodCIDR), "initial except list uses the fixture POD_CIDR")
 
 		// Re-reconcile the SAME Loop with a reconciler whose PodCIDR differs.
-		alt := &LoopReconciler{
+		alt := &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			PodCIDR:          i42cAltPodCIDR,

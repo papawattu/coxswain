@@ -89,7 +89,7 @@ var _ = Describe("D46: agent exec list without the runner's shell fails fast", f
 		// once the policy is valid (the envtest Enforcer never reports
 		// enforcing) and the clean pass is indistinguishable from an
 		// enforcing cluster.
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN},

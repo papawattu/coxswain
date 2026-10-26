@@ -76,7 +76,7 @@ var _ = Describe("D41d: tool proxy KubeArmorPolicies (enforcer)", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:          k8sClient,
 			Scheme:          k8sClient.Scheme(),
 			PodCIDR:         d41cPodCIDR,

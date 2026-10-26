@@ -66,7 +66,7 @@ var _ = Describe("B3 plan approval gate", func() {
 	// "agent still running" ((nil, nil) — the operator requeues). reportClaim
 	// re-arms the seam to serve a specific claim for that reconcile.
 	b3Reconciler := func() *LoopReconciler {
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 		}

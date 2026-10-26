@@ -127,7 +127,7 @@ var _ = Describe("P2b: metering model proxy operator wiring", func() {
 
 		name := "p2bproxy"
 		Expect(k8sClient.Create(ctx, buildLoop(name, ns, p2bModelCredsSecret, p2bModelEndpoint))).To(Succeed())
-		reconcileWith(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), OperatorNamespace: p2bOperatorNS}, name, ns)
+		reconcileWith(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), OperatorNamespace: p2bOperatorNS}, name, ns)
 
 		pod := proxyPod(name, ns)
 		c := pod.Spec.Containers[0]
@@ -217,7 +217,7 @@ var _ = Describe("P2b: metering model proxy operator wiring", func() {
 		Expect(k8sClient.Create(ctx, buildLoop(name, ns, p2bModelCredsSecret, p2bModelEndpoint))).To(Succeed())
 		// No OperatorNamespace set: the usage ingress rule must be omitted (the
 		// usage endpoint stays unreachable rather than wide-open).
-		reconcileWith(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
+		reconcileWith(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}, name, ns)
 
 		np := proxyNP(name, ns)
 		Expect(usageIngressRule(np)).To(BeNil(),
@@ -232,7 +232,7 @@ var _ = Describe("P2b: metering model proxy operator wiring", func() {
 
 		name := "p2bi43"
 		Expect(k8sClient.Create(ctx, buildLoop(name, ns, p2bModelCredsSecret, p2bModelEndpoint))).To(Succeed())
-		reconcileWith(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), OperatorNamespace: p2bOperatorNS}, name, ns)
+		reconcileWith(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), OperatorNamespace: p2bOperatorNS}, name, ns)
 
 		npKey := types.NamespacedName{Namespace: ns, Name: name + "-proxy-netpol"}
 		np := &networkingv1.NetworkPolicy{}
@@ -264,7 +264,7 @@ var _ = Describe("P2b: metering model proxy operator wiring", func() {
 		// Reconcile the SAME Loop: the controller must restore the usage-port
 		// ingress rule on the EXISTING netpol (same UID — an in-place update,
 		// not a recreation).
-		reconcileWith(&LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), OperatorNamespace: p2bOperatorNS}, name, ns)
+		reconcileWith(&LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), OperatorNamespace: p2bOperatorNS}, name, ns)
 		np = &networkingv1.NetworkPolicy{}
 		Expect(k8sClient.Get(ctx, npKey, np)).To(Succeed())
 		Expect(np.UID).To(Equal(originalUID),

@@ -103,7 +103,7 @@ func TestNeedsEgressProxyFailsClosed(t *testing.T) {
 		}).
 		Build()
 
-	r := &LoopReconciler{Client: fakeClient, Scheme: scheme}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
 
 	if got := needsEgressProxy(ctx, r, loop); !got {
 		t.Fatalf("needsEgressProxy = false on AgentPolicy Get error; want true (fail-closed): a read error must require the egress proxy, not skip the gate")
@@ -130,7 +130,7 @@ func TestNeedsEgressProxyHappyPath(t *testing.T) {
 		WithObjects(withLoop, withoutLoop, apWith, apWithout).
 		Build()
 
-	r := &LoopReconciler{Client: fakeClient, Scheme: scheme}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
 
 	if got := needsEgressProxy(ctx, r, withLoop); !got {
 		t.Errorf("needsEgressProxy = false for a policy with network allows; want true")
@@ -156,7 +156,7 @@ func TestNeedsEgressProxyMissingPolicy(t *testing.T) {
 		WithObjects(loop).
 		Build()
 
-	r := &LoopReconciler{Client: fakeClient, Scheme: scheme}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
 
 	if got := needsEgressProxy(ctx, r, loop); !got {
 		t.Fatalf("needsEgressProxy = false for a missing referenced AgentPolicy; want true (fail-closed)")

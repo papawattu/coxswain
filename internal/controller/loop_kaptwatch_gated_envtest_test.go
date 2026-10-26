@@ -162,7 +162,7 @@ var _ = Describe("KubeArmorPolicy watch is CRD-gated (PR #129, P1)", func() {
 		Expect(kaptErr).To(HaveOccurred(),
 			"the KubeArmorPolicy GVK must NOT resolve in this environment (the CRD is absent); the gate relies on this")
 
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: mgr.GetClient(),
 			Scheme: mgr.GetScheme(),
 		}
@@ -238,7 +238,7 @@ var _ = Describe("kubeArmorPolicyToLoopRequests maps a Kapt to its Loop (PR #129
 		return u
 	}
 	it := func() {
-		r := &LoopReconciler{}
+		r := &LoopReconciler{CNIProber: testCNIProber()}
 		// 1. A coxswain-prefixed Kapt maps to the Loop with the same name in
 		//    the Kapt's namespace (coxswain-foo -> {ns, foo}).
 		reqs := r.kubeArmorPolicyToLoopRequests(context.Background(), makeKapt("ns1", "coxswain-foo"))

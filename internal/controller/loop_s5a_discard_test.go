@@ -47,7 +47,7 @@ var _ = Describe("S5a: consumed-claim discard (OS5 P3)", func() {
 	BeforeEach(func() {
 		ctx = context.Background()
 		recorder := record.NewFakeRecorder(64)
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Recorder: recorder,
 			now:      func() metav1.Time { return metav1.NewTime(time.Now().Truncate(time.Second)) },
 			// The claim is swapped per-case via the closure below (the seam

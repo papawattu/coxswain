@@ -70,7 +70,7 @@ var _ = Describe("S4 review: per-Loop workspace PVC (workspace survives the phas
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		nn := types.NamespacedName{Name: pvcLoopName, Namespace: ns}
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: pvcLoopName, Namespace: ns},
@@ -105,7 +105,7 @@ var _ = Describe("S4 review: per-Loop workspace PVC (workspace survives the phas
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		nn := types.NamespacedName{Name: pvcLoopName, Namespace: ns}
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: pvcLoopName, Namespace: ns},
@@ -147,7 +147,7 @@ var _ = Describe("S4 review: per-Loop workspace PVC (workspace survives the phas
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
 			return nil, nil // agent running (no claim yet)
 		}

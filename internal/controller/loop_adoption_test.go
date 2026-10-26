@@ -75,7 +75,7 @@ var _ = Describe("Loop existing-sandbox adoption", func() {
 		Expect(k8sClient.Create(ctx, existing)).To(Succeed())
 
 		By("reconciling")
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -154,7 +154,7 @@ var _ = Describe("Loop existing-sandbox adoption", func() {
 		Expect(k8sClient.Create(ctx, existing)).To(Succeed())
 
 		By("reconciling (must not take over the foreign-owned sandbox)")
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: fNN})
 		// Taking over is wrong; the controller must either error or leave the
 		// sandbox alone. We assert the stronger invariant: the sandbox's owner

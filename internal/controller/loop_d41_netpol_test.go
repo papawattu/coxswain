@@ -73,7 +73,7 @@ func newD41NetpolLoop() *coxv1alpha1.Loop {
 // effective policy. The URL is the tool proxy's Service FQDN (the agent
 // reaches the tool proxy directly, not through the egress proxy).
 func TestD41AgentEnvCOXTOOLURL(t *testing.T) {
-	r := &LoopReconciler{ClusterDomain: policy.DefaultClusterDomain}
+	r := &LoopReconciler{CNIProber: testCNIProber(), ClusterDomain: policy.DefaultClusterDomain}
 	t1 := coxv1alpha1.ToolSpec{
 		Name:     "gh",
 		Upstream: d41cUpstreamA,
@@ -93,7 +93,7 @@ func TestD41AgentEnvCOXTOOLURL(t *testing.T) {
 func TestD41AgentNOProxyIncludesToolProxyFQDNs(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}}
@@ -115,7 +115,7 @@ func TestD41AgentNOProxyIncludesToolProxyFQDNs(t *testing.T) {
 func TestD41AgentNetpolToolProxyEgressRule(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}}
@@ -154,7 +154,7 @@ func TestD41AgentNetpolToolProxyEgressRule(t *testing.T) {
 func TestD41AgentNetpolNoToolsNoEgressRule(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{} // no tools
@@ -205,7 +205,7 @@ func TestD41AgentEnvCOXTOOLURLReserved(t *testing.T) {
 func TestD41ToolProxyOwnedReadyGate(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}}
@@ -253,7 +253,7 @@ func TestD41ToolProxyOwnedReadyGate(t *testing.T) {
 func TestD41ToolProxyNetpolRemovedWhenToolRemoved(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{
@@ -312,7 +312,7 @@ func TestD41ToolProxyNetpolRemovedWhenToolRemoved(t *testing.T) {
 func TestD41ToolProxyNetpolCreated(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}}
@@ -350,7 +350,7 @@ func TestD41ToolProxyNetpolCreated(t *testing.T) {
 func TestD41ToolProxyNetpolCIDRsFromConfig(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: "192.168.100.0/24", ServiceCIDR: "172.20.0.0/16"}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: "192.168.100.0/24", ServiceCIDR: "172.20.0.0/16"}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}}
@@ -404,7 +404,7 @@ func TestD41ToolProxyNetpolCIDRsFromConfig(t *testing.T) {
 func TestD41ToolProxyNetpolUpstreamOnly(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{{Name: "gh", Upstream: d41cUpstreamA}}}
@@ -456,7 +456,7 @@ func TestD41ToolProxyNetpolUpstreamOnly(t *testing.T) {
 func TestD41NoToolsNoToolNetpol(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{} // no tools
@@ -481,7 +481,7 @@ func TestD41NoToolsNoToolNetpol(t *testing.T) {
 func TestD41TwoToolsTwoOfEverything(t *testing.T) {
 	ctx := context.Background()
 	cl := newD41NetpolFakeClient(t)
-	r := &LoopReconciler{Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: cl, Scheme: cl.Scheme(), ClusterDomain: policy.DefaultClusterDomain, PodCIDR: d41cPodCIDR, ServiceCIDR: d41cServiceCIDR}
 	loop := newD41NetpolLoop()
 	ap := &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: d41dNetpolPolicyRef, Namespace: d41dNetpolNS}}
 	ap.Spec = coxv1alpha1.AgentPolicySpec{Tools: []coxv1alpha1.ToolSpec{

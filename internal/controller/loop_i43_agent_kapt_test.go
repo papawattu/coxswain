@@ -55,7 +55,7 @@ var _ = Describe("I43: agent KubeArmorPolicy same-Loop update", func() {
 	BeforeEach(func() {
 		ctx = context.Background()
 		// The real KubeArmor enforcer (the fakeEnforcer writes no policies).
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			Enforcer:         &engine.KubeArmorEnforcer{Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN},

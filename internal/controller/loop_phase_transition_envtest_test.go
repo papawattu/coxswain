@@ -63,7 +63,7 @@ var _ = Describe("B1 phase transitions via Reconcile (claim seam)", func() {
 	// still running" ((nil, nil) — the operator requeues). reportPhase re-arms
 	// the seam to serve a specific claim for that reconcile.
 	b1Reconciler := func() *LoopReconciler {
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 		}

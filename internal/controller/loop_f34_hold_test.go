@@ -37,7 +37,7 @@ func f34Loop(status metav1.ConditionStatus, reason string) *coxv1alpha1.Loop {
 // in-progress reasons loop_memory_writer_job.go documents, and none of the
 // non-hold states (rejected, deferred, restored, no condition).
 func TestB2RestoreHoldSuspendedReasons(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	for _, tc := range []struct {
 		name   string
 		status metav1.ConditionStatus
@@ -74,7 +74,7 @@ func TestMemoryWriterHeldWhileStoppingWorkloads(t *testing.T) {
 			t.Fatalf("the hold did not stop the writer: it went on to the Job read (panic: %v)", rec)
 		}
 	}()
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	requeue, err := r.ensureMemoryWriterJobAndNetPolicy(context.Background(), l)
 	if requeue || err != nil {
 		t.Fatalf("held: requeue=%v err=%v, want false,nil", requeue, err)

@@ -107,7 +107,7 @@ var _ = Describe("I72: deliver Job held until the egress proxy is Ready (envtest
 	// external network allow) is created first and referenced by the Loop.
 	i72Succeeded := func(ns, name, repo, policyName string) *LoopReconciler {
 		ctx := context.Background()
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		loop := s6Loop(name, ns, repo)
 		loop.Spec.PolicyRefs = []string{policyName}

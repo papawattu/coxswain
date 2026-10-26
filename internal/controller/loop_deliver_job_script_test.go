@@ -45,7 +45,7 @@ import (
 // never execute the scripts — this test closes that gap. It must fail on
 // the wiping script and pass on the fetch-into-clone script.
 func TestDeliverCloneImportScriptsInSequence(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 
 	// The "agent workspace" repo: a base commit + one agent commit on top.
 	// The pinned verifiedCommit is the agent commit (what the verify Job

@@ -99,7 +99,7 @@ func s6Reconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 // its own) and the fresh Succeeded Loop.
 func s6Succeeded(name, ns string, repo string) *LoopReconciler {
 	ctx := context.Background()
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	s5aEnsureSandbox(ns, name)
 	// Create the Loop (the S5a helper assumes the Loop exists via its own
 	// creation path — drive it manually here: bootstrap to Planning, pin the
@@ -369,7 +369,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		// set but the phase is not Succeeded -> no deliver Job.
 		name := "trig1"
 		Expect(k8sClient.Create(ctx, s6Loop(name, ns, ""))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		s6Reconcile(r, ns, name) // Pending -> Planning
 		s6RequireNoJob(ns, name)
@@ -408,7 +408,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		loop.Spec.Delivery = nil // default None: no deliver Job
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		loop.Status.BaseCommit = s5aBaseCommit
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
@@ -1161,7 +1161,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		name := "init1"
 		Expect(k8sClient.Create(ctx, s6Loop(name, ns, githubRepoURL))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -1212,7 +1212,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 
 		name := "initin1"
 		Expect(k8sClient.Create(ctx, s6Loop(name, ns, inClusterRepoURL))).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -1701,7 +1701,7 @@ var _ = Describe("I52: coxswain.io/redeliver annotation (envtest)", func() {
 
 var _ = Describe("S6: egress proxy hosts (unit)", func() {
 	It("returns the deliver hosts for an external github.com delivery and none otherwise", func() {
-		r := &LoopReconciler{}
+		r := &LoopReconciler{CNIProber: testCNIProber()}
 		By("an in-cluster Succeeded delivery adds no proxy hosts")
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: s6SampleLoopObjMeta(),

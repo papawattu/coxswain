@@ -146,7 +146,7 @@ var _ = Describe("F12 deleting Loop with a Forbidden KubeArmorPolicy write (the 
 		// The reconciler with the forbidden Enforcer + seam: the deleting-path
 		// enforcement write (Enforcer.Apply) returns Forbidden (the terminating
 		// namespace's admission).
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:                   k8sClient,
 			Scheme:                   k8sClient.Scheme(),
 			Enforcer:                 &forbiddenEnforcer{},
@@ -189,7 +189,7 @@ var _ = Describe("F12 deleting Loop with a Forbidden KubeArmorPolicy write (the 
 		Expect(k8sClient.Create(ctx, l)).To(Succeed())
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(l), l)).To(Succeed())
 
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:                   k8sClient,
 			Scheme:                   k8sClient.Scheme(),
 			Enforcer:                 &forbiddenEnforcer{},

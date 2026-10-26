@@ -81,7 +81,7 @@ var _ = Describe("Loop Controller", func() {
 
 		It("creates a Sandbox owned by the Loop and sets phase to Pending", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &LoopReconciler{
+			controllerReconciler := &LoopReconciler{CNIProber: testCNIProber(),
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}

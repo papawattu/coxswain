@@ -119,7 +119,7 @@ var _ = Describe("I42f: proxy KubeArmorPolicies", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		r = &LoopReconciler{
+		r = &LoopReconciler{CNIProber: testCNIProber(),
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			PodCIDR:          i42bPodCIDR,

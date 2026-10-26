@@ -50,7 +50,7 @@ const (
 func TestClusterDomainFlowsThroughProxyURLs(t *testing.T) {
 	const loop, ns = i44TestLoop, i44TestNS
 
-	r := &LoopReconciler{ClusterDomain: i44AltDomain}
+	r := &LoopReconciler{CNIProber: testCNIProber(), ClusterDomain: i44AltDomain}
 
 	// COX_MODEL_BASE_URL host: <loop>-proxy.<ns>.svc.<domain>.
 	if got, want := r.proxyServiceURL(loop, ns),
@@ -78,7 +78,7 @@ func TestClusterDomainFlowsThroughProxyURLs(t *testing.T) {
 func TestClusterDomainDefaultsToClusterLocal(t *testing.T) {
 	const loop, ns = i44TestLoop, i44TestNS
 
-	r := &LoopReconciler{} // ClusterDomain unset.
+	r := &LoopReconciler{CNIProber: testCNIProber()} // ClusterDomain unset.
 
 	if got := r.clusterDomain(); got != policy.DefaultClusterDomain {
 		t.Fatalf("unset ClusterDomain must default to cluster.local, got %q", got)

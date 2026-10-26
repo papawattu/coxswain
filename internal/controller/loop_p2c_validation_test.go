@@ -274,7 +274,7 @@ var _ = Describe("P2c: budget / stall history / pausedReason API", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p2cAdditiveName}})
 		Expect(err).ToNot(HaveOccurred(), "a pre-P2c Loop must reconcile without error")
 

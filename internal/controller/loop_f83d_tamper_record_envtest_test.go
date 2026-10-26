@@ -100,7 +100,7 @@ var _ = Describe("F83d: the tamper record is provenance, per pin, and readable",
 				},
 			},
 		}
-		r := &LoopReconciler{
+		r := &LoopReconciler{CNIProber: testCNIProber(),
 			readPhaseClaim: func(context.Context, *cov.Loop) (*PhaseClaim, error) {
 				return &PhaseClaim{
 					ObservedPhase: cov.LoopPhaseImplementing, Status: claimSuccess, Iteration: 2,

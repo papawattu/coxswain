@@ -28,7 +28,7 @@ import (
 // activeDeadlineSeconds carries a JobFailed condition (status.failed may be 0)
 // and is Delivered=False/DeliveryFailed, which settles a held Loop.
 func TestP5fDeadlineExceededMapsToDeliveryFailed(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	loop := &coxv1alpha1.Loop{}
 	loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 	loop.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest}
@@ -55,7 +55,7 @@ func TestP5fDeadlineExceededMapsToDeliveryFailed(t *testing.T) {
 // gate stops the sandbox for Verifying+Delivering only (a Verifying Loop that
 // is not holding keeps its sandbox Running).
 func TestP5fSandboxGateStoppedOnDeliveryHold(t *testing.T) {
-	r := &LoopReconciler{}
+	r := &LoopReconciler{CNIProber: testCNIProber()}
 	held := &coxv1alpha1.Loop{}
 	held.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 	held.Status.Conditions = []metav1.Condition{{
@@ -77,7 +77,7 @@ func TestP5fSandboxGateStoppedOnDeliveryHold(t *testing.T) {
 // spec.delivery; lessons sets lessonsAvailable on the Implementing claim.
 func p5fToVerifyPassed(name, ns string, delivery, lessons bool, mutate ...func(*coxv1alpha1.Loop)) *LoopReconciler {
 	ctx := context.Background()
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	s5aEnsureSandbox(ns, name)
 	loop := s6Loop(name, ns, "")
 	if !delivery {

@@ -239,7 +239,7 @@ func b2RemovePVCProtectionFinalizer(ctx context.Context, ns, loopName string) {
 
 // b2NewReconciler builds a fresh reconciler for a Loop.
 func b2NewReconciler() *LoopReconciler {
-	r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 	r.workspaceDriverSeam = func(context.Context, *coxv1alpha1.Loop) (string, bool) { return b1Driver, true }
 	r.snapshotCRDPresent = func(context.Context) bool { return true }
 	return r

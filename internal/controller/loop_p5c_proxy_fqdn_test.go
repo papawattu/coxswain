@@ -31,7 +31,7 @@ func TestServiceNamespaceFromHostDomainAware(t *testing.T) {
 		{"", "a.b.c.d.svc.cluster.local", "", false},
 	}
 	for _, c := range cases {
-		r := &LoopReconciler{}
+		r := &LoopReconciler{CNIProber: testCNIProber()}
 		if c.domain != "" {
 			r.ClusterDomain = c.domain
 		}
@@ -47,7 +47,7 @@ func TestServiceNamespaceFromHostDomainAware(t *testing.T) {
 // namespaceSelector over the Service's namespace; an endpoint in the
 // default domain must be rejected (fail closed) on that cluster.
 func TestModelPeerServiceFQDNNonDefaultDomain(t *testing.T) {
-	r := &LoopReconciler{ClusterDomain: "corp.example"}
+	r := &LoopReconciler{CNIProber: testCNIProber(), ClusterDomain: "corp.example"}
 	peer := modelPeer("http://llm.mlops.svc.corp.example:8000/v1/chat/completions", r.serviceNamespaceFromHost)
 	if peer == nil || peer.NamespaceSelector == nil {
 		t.Fatalf("modelPeer(non-default domain FQDN) = %+v, want namespaceSelector peer", peer)
@@ -67,7 +67,7 @@ func TestModelPeerServiceFQDNNonDefaultDomain(t *testing.T) {
 // cluster.local parser — the pre-fix svcNamespaceFromFQDN behaviour — this
 // fails: the FQDN is not recognised and the peer is nil, fail-closed.)
 func TestModelPeerNonDefaultDomainFQDN(t *testing.T) {
-	r := &LoopReconciler{ClusterDomain: "corp.example"}
+	r := &LoopReconciler{CNIProber: testCNIProber(), ClusterDomain: "corp.example"}
 	peer := modelPeer("http://llm.mlops.svc.corp.example:8000", r.serviceNamespaceFromHost)
 	if peer == nil || peer.NamespaceSelector == nil {
 		t.Fatalf("modelPeer(%q, domain corp.example) = nil, want namespaceSelector", "llm.mlops.svc.corp.example")

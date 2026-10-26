@@ -117,7 +117,7 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, loop)).To(Succeed())
 		loop.Status.Iteration++
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		r2 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r2 := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s6Reconcile(r2, ns, name)
 
 		cm := &corev1.ConfigMap{}
@@ -195,7 +195,7 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 
 		// The foreign ConfigMap (a different name) must still exist after the
 		// operator's reconcile (the operator only deletes its OWN ConfigMap).
-		r2 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r2 := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s6Reconcile(r2, ns, name)
 		still := &corev1.ConfigMap{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: foreign.Name}, still)).To(Succeed(),
@@ -209,7 +209,7 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 		mode := coxv1alpha1.DeliveryModeNone
 		loop.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: mode}
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
-		r3 := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r3 := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s6Reconcile(r3, ns, name)
 
 		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: cmName}, &corev1.ConfigMap{})
@@ -285,7 +285,7 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 		// create the Job — the normal path) and the Job would already exist
 		// before the spec can assert it is missing.
 		wrapped := &deliverCMEnsureFails{Client: k8sClient, err: transientAPIError}
-		r := &LoopReconciler{Client: wrapped, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: wrapped, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: record.NewFakeRecorder(64)}
 		s5aEnsureSandbox(ns, name)
 		loop := s6Loop(name, ns, "http://gitea.samples.svc:3000/samples/desc5.git")
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
@@ -386,7 +386,7 @@ var _ = Describe("A4: the deliver description ConfigMap (envtest)", func() {
 		// the delivery).
 		recorder := record.NewFakeRecorder(64)
 		wrapped := &forbiddenConfigMapWrites{Client: k8sClient}
-		r := &LoopReconciler{Client: wrapped, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: wrapped, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
 		_, reconcileErr := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(reconcileErr).NotTo(HaveOccurred(), "the Succeeded reconcile must NOT error when the description ConfigMap ensure is Forbidden (best-effort; the minimal-line fallback)")
 

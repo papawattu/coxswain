@@ -82,7 +82,7 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		files := policyFiles()
 		Expect(files).NotTo(BeEmpty(), "no reference policies under %s", repoPath(policiesDir))
 
-		var names []string
+		names := make([]string, 0, len(files))
 		for _, path := range files {
 			names = append(names, filepath.Base(path))
 		}
@@ -132,8 +132,9 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		// Direction 1: every shipped policy file is listed. A file that is not
 		// in the kustomization is invisible to `kubectl apply -k
 		// config/samples`, which is how the docs tell users to apply them.
-		var shipped []string
-		for _, path := range policyFiles() {
+		files := policyFiles()
+		shipped := make([]string, 0, len(files))
+		for _, path := range files {
 			shipped = append(shipped, filepath.Join("policies", filepath.Base(path)))
 		}
 		Expect(listed).To(ConsistOf(shipped),

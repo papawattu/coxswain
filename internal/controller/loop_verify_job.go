@@ -43,14 +43,6 @@
 // B3b (restart semantics): restartPolicy Never + backoffLimit 0 — the Job runs
 // its init sequence EXACTLY once. A VerifyError re-run (B4) creates a NEW Job
 // with a fresh name; the operator never mutates a running Job.
-//
-// B3d (advisory scan): the verify Job also runs a non-blocking "advisory"
-// init container after the tamper check that greps the agent's diff for
-// subversion patterns (go:linkname, testing.Short, //go:build, os.Exit in a
-// test, etc.). It NEVER gates: its exit code is 0 regardless of findings
-// (it writes its findings to /dev/termination-log and exits 0). The operator
-// reads the advisory text for the VerifySuspicious condition (advisory only,
-// D24); the gate is the tamper + acceptance checks, full stop.
 package controller
 
 import (

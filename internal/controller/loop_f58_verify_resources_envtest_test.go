@@ -48,7 +48,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -76,8 +75,16 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 	}
 
 	// f58Reconciler builds a reconciler with the shared test prober (the D38
-	// gate needs one: a nil prober fails closed) and an optional event recorder.
+	// gate needs one: a nil prober fails closed) and an event recorder. The
+	// recorder is never nil: Recorder holds a record.EventRecorder interface, so
+	// a typed-nil *record.FakeRecorder is NOT nil and panics on the first Event
+	// (surfaceRunnerAvailable emits RunnerUnavailable for a Loop with no agent
+	// image, which every drive here hits). A spec that wants to read Events
+	// passes its own recorder; the rest get a throwaway one.
 	f58Reconciler := func(recorder *record.FakeRecorder) *LoopReconciler {
+		if recorder == nil {
+			recorder = record.NewFakeRecorder(64)
+		}
 		return &LoopReconciler{
 			CNIProber: testCNIProber(),
 			Client:    k8sClient,
@@ -576,22 +583,21 @@ var _ = Describe("F58: the verify Job's containers are bounded", func() {
 		jobName := f58DriveToVerifying(r, ns, name)
 
 		// The last allowed run fails the same way: the count is seeded at the
-		// bound (its reset belongs to a new pin, F48e) and the Job the retry
-		// would have created is planted Failed with NO pod — the residue an
-		// eviction leaves once the GC has removed the pod.
+		// bound (its reset belongs to a new pin, F48e) and the Job is Failed
+		// with NO pod — the residue an eviction leaves once the GC has removed
+		// the pod. The Job is the operator's OWN (ensureVerifyJob created it) on
+		// purpose: a planted Job carries no pin annotation, so ensureVerifyJob's
+		// D27 stale guard would delete it and requeue, and the spec would then
+		// measure the guard rather than the bound.
+		job := f58GetJob(ns, jobName)
+		Expect(job).NotTo(BeNil(), "the drive created the verify Job")
+		f58JobFailed(ns, jobName, batchv1.JobReasonBackoffLimitExceeded)
 		loop := f58GetLoop(ns, name)
 		if loop.Status.Verify == nil {
 			loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
 		}
 		loop.Status.Verify.InfraAttempts = verifyInfraRetries
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		job := f58GetJob(ns, jobName)
-		Expect(job).NotTo(BeNil())
-		Expect(k8sClient.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))).To(Succeed())
-		Eventually(func() *batchv1.Job { return f58GetJob(ns, jobName) }).Should(BeNil(),
-			"the failed Job must be gone before the replacement is planted (same name)")
-		plantVerifyJob(ctx, ns, name, jobName)
-		f58JobFailed(ns, jobName, batchv1.JobReasonBackoffLimitExceeded)
 
 		fresh := s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed))

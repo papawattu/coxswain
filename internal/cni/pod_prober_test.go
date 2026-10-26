@@ -445,3 +445,32 @@ func TestParseDoesNotWriteTheHolder(t *testing.T) {
 		t.Fatalf("parse() wrote the holder (reason=%v); the holder must only be written by probeOnce (the Runnable)", got)
 	}
 }
+
+// F65 (P2-2): the probe pod is pinned and zero-credential.
+//
+// The image is digest-pinned by the operator default (cmd/main.go), the pull
+// policy is EXPLICIT (an unset policy is derived from the ref shape, so it
+// silently changes when a digest is added), and the SA token mount stays
+// disabled — the probe needs no API access (the operator reads the pod's
+// termination message).
+//
+// Mutation: delete the ImagePullPolicy field from buildPod → this test fails.
+func TestBuildPodIsPinnedAndCredentialFree(t *testing.T) {
+	p := NewPodProber(PodProberConfig{
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
+	})
+	pod := p.buildPod()
+	if len(pod.Spec.Containers) != 1 {
+		t.Fatalf("probe pod has %d containers, want 1", len(pod.Spec.Containers))
+	}
+	if got := pod.Spec.Containers[0].ImagePullPolicy; got != corev1.PullIfNotPresent {
+		t.Errorf("probe container ImagePullPolicy = %q, want %q (explicit: a pinned image must not be re-resolved)", got, corev1.PullIfNotPresent)
+	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Error("the probe pod must not mount a service-account token (it needs no API access, ADR-0006)")
+	}
+	if pod.Spec.Containers[0].Image == "" {
+		t.Error("the probe container must carry the configured image")
+	}
+}

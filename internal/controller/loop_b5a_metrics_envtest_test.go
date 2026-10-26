@@ -98,8 +98,7 @@ var _ = Describe("B5a metrics envtest", func() {
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{

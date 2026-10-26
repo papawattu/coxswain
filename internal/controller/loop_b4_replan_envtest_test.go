@@ -88,8 +88,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
 			if apierrors.IsNotFound(err) {
-				job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-				Expect(k8sClient.Create(ctx, job)).To(Succeed())
+				job = plantVerifyJob(ctx, ns, name, jobName)
 			} else {
 				Expect(err).NotTo(HaveOccurred())
 			}
@@ -127,8 +126,7 @@ var _ = Describe("B4 re-plan on verify failure", func() {
 		job := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
 			if apierrors.IsNotFound(err) {
-				job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-				Expect(k8sClient.Create(ctx, job)).To(Succeed())
+				job = plantVerifyJob(ctx, ns, name, jobName)
 			} else {
 				Expect(err).NotTo(HaveOccurred())
 			}
@@ -821,8 +819,7 @@ func b4InProgPod(ctx context.Context, ns, name, jobName string) {
 	job := &batchv1.Job{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
 		if apierrors.IsNotFound(err) {
-			job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, Labels: verifyJobLabels(name)}}
-			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			job = plantVerifyJob(ctx, ns, name, jobName)
 		} else {
 			Expect(err).NotTo(HaveOccurred())
 		}

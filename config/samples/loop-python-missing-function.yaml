@@ -23,8 +23,8 @@
 #   kubectl apply -f config/samples/loop-python-missing-function.yaml
 #
 # Expected outcome:
-#   Planning -> Implementing (adds the missing function) ->
-#   Verifying (unittest discover passes) -> Succeeded
+#   Planning -> Implementing (adds Median) ->
+#   Verifying (`python3 -m unittest tests.test_median` passes) -> Succeeded
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
@@ -32,11 +32,13 @@ metadata:
   namespace: samples
 spec:
   goal: >-
-    Implement the missing public function in the numutils package so the
-    test suite passes. The tests import the function from numutils and
-    assert its behaviour; the function signature and expected values are
-    defined by the tests (do not modify the test files). Run
-    `python3 -m unittest discover -s tests` to verify.
+    Implement median in numutils/stats.py and expose it as Median from
+    numutils/__init__.py. Odd length returns the middle value, even length
+    returns the average of the two middle values, an empty sequence raises
+    ValueError, and the input list must not be mutated. The acceptance
+    module tests/test_median.py is a protected path: do not change or
+    weaken it. Make `python3 -m unittest tests.test_median` pass on the
+    tests as written.
   workspace:
     # The seeded in-cluster Gitea repo (hack/samples-seed.sh), so the sample
     # can run as applied. Replace it with your own repo + ref (the workspace
@@ -51,10 +53,10 @@ spec:
   verify:
     acceptanceChecks:
       - python3 -m compileall -q .
-      - python3 -m unittest discover -s tests
+      - python3 -m unittest tests.test_median
     preset: none
     protectedPaths:
-      - tests/
+      - tests/test_median.py
     image: docker.io/library/python:3.13-slim
   agent:
     # image omitted: the operator's --runner-image flag supplies it.

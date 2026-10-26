@@ -27,7 +27,8 @@
 # Expected outcome:
 #   Planning (the agent writes .coxswain/PLAN.md) ->
 #   Implementing (adds the /api/v1/ping handler) ->
-#   Verifying (smoke test curls both endpoints) -> Succeeded
+#   Verifying (`bash test/smoke.sh ping` passes: /healthz + /api/v1/ping) ->
+#   Succeeded
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
@@ -35,12 +36,10 @@ metadata:
   namespace: samples
 spec:
   goal: >-
-    Implement the /api/v1/ping endpoint on the existing HTTP server. It
-    must return HTTP 200 with a JSON body {"status":"ok"} and a
-    Content-Type: application/json header. Do not modify the /healthz
-    handler or the smoke test. The smoke test (test/smoke.sh) starts the
-    server on a free port, curls /healthz and /api/v1/ping, and expects
-    both to return 200 with the correct body.
+    Add a GET /api/v1/ping route to main.go that returns HTTP 200 with the
+    exact body "pong" (no trailing newline). The existing /healthz route is
+    unchanged. The smoke test script test/smoke.sh is a protected path: do
+    not modify or weaken it; make it pass by adding the route.
   workspace:
     # The seeded in-cluster Gitea repo (hack/samples-seed.sh), so the sample
     # can run as applied. Replace it with your own repo + ref (the workspace
@@ -55,7 +54,7 @@ spec:
   verify:
     acceptanceChecks:
       - go build ./...
-      - bash test/smoke.sh
+      - bash test/smoke.sh ping
     preset: go
     protectedPaths:
       - test/smoke.sh

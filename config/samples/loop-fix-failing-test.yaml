@@ -27,7 +27,8 @@
 #
 # Expected outcome (with a working model backend):
 #   Planning -> Implementing -> Verifying -> Succeeded
-#   status.delivery: the PR the deliver Job opened (or the failure reason).
+#   (spec.delivery is unset, so no PR is opened: the working tree carries the
+#   fix and the verify output is in the verify Job's termination message.)
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:

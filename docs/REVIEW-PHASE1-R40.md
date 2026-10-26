@@ -50,7 +50,7 @@ A bare `loop_*.go` / `loop_*_test.go` name is under `internal/controller/`.
 - **Ten verdicts for eight merges, and both `CHANGES` were fixed inside the
   window.** #291 and #292 each took `Verdict: CHANGES` at 01:10:32Z / 01:10:34Z
   and `Verdict: OK` at 03:16:32Z / 03:16:40Z. #291's item was a message that
-  asserted a cause the code had disproved (`pod_prober.go:513-514` at the time);
+  asserted a cause the code had disproved (`pod_prober.go:513-514` at `dcff1c4`);
   #292's P1 was a sample Loop that could not pass its own check
   (`examples/webapi/test/smoke.sh:63` asserts `pong`, the goal asked for
   `{"status":"ok"}`). The other six took one `OK`/`OK + notes` each.
@@ -83,7 +83,7 @@ A bare `loop_*.go` / `loop_*_test.go` name is under `internal/controller/`.
 - **Process note, one line: re-check a tick list against `main` when the PR
   opens.** The first 13 ticks were derived at 03:32:41Z; I105 became closeable at
   03:50:38Z when #294 merged, and its own rows already tracked merges up to
-  #292 — so the gap was only the last 18 minutes, and 63 seconds after that
+  #292 — so the gap was only the last 18 minutes, and 66 seconds after that
   merge the PR opened without it.
 - **The subject slip: two merges lost the `#`.** `b33cc7a` ends `(291)` and
   `3eaf998` ends `(292)`; the other six read `(#288)`, `(#289)`, `(#290)`,
@@ -97,10 +97,10 @@ A bare `loop_*.go` / `loop_*_test.go` name is under `internal/controller/`.
   at `:400`), so #293's "no shipped install changes behaviour" holds; no chart
   template reads `roleNamespaces` or `webhook.*` on `main`
   (`git grep -n 'roleNamespaces\|\.Values\.webhook' -- dist/chart/` → nothing;
-  control `git grep -c 'Values.metrics' -- dist/chart/templates/` → 3 files), so
+  control `git grep -l 'Values.metrics' -- dist/chart/templates/` → 7 files), so
   #292's "two dead value groups" holds; and #291's two script arms match its note
   (no address → `UNRESOLVED` at `pod_prober.go:212-216`, refused connection →
-  `UNRESOLVED` at `:222-225`, every other exception → `BLOCKED` at `:226`).
+  `UNRESOLVED` at `:222-225`, every other exception → `BLOCKED` at `:226-227`).
 - **Release notes grew twice in the window**: #226 created
   `docs/RELEASE-NOTES-next.md` (815 lines) and #295 appended 18 lines for
   #291-#293. Note, not an item: the file's "as of `0070686` (= PR #269)" pin
@@ -129,7 +129,7 @@ meetable):
 - **I145** (open): `AGENTS.md:285` still gives the plain `kubectl auth can-i
   <verb> <resource>` form, and `git grep -c resourceAttributes.subresource
   AGENTS.md` → 0.
-- **I146** (open): `plantVerifyJob` → 0 sites; 20 bare `job = &batchv1.Job{`
+- **I146** (open): `plantVerifyJob` → 0 sites in code; 20 bare `job = &batchv1.Job{`
   literals remain in `internal/controller/*_test.go`.
 - **I147** (met): the acceptance's checkable clause holds for five code PRs (see
   Status). Hand it to the tick list with the sentence that the evidence is the
@@ -226,7 +226,8 @@ meetable):
   set: six of the fourteen callers are not in `describe.go`, so a reader who greps
   that one file finds 8 of 14 and a reader who trusts the sentence looks in the
   wrong place for the rest. It shipped in #289, whose merged tree is the reviewed
-  tree byte for byte — so this is #289's own pre-review P3, merged unfixed, not a
+  tree byte for byte — so this is #289's own pre-review P3
+  (`.samples/prereview-289.md:106`), merged unfixed, not a
   merge-time change. Same class as R38 I142 case 3 and R37 I138: a comment that
   names a site that does not carry the work.
 
@@ -234,8 +235,8 @@ meetable):
   (`describe.go`, `history.go`, `pause.go`, `redeliver.go`) keep the literal", or
   drop the count and say "the read path's callers keep the literal".
 
-  **Acceptance:** the sentence names a set that matches the grep;
-  `git grep -n 'keep the literal' internal/cli/` names the four files.
+  **Acceptance:** the sentence names a set that matches the call-site grep in
+  *Where*, which names the four files.
 
 ## Owner decisions
 
@@ -258,7 +259,7 @@ class recurred this window (I150) and the check it asks for is cheap.
 **D72-D85 are unchanged.** No commit, PR body or doc in this window records an
 owner answer: the only mentions are the rounds that asked and the two
 "unchanged" carry-forwards (`docs/REVIEW-PHASE1-R36.md:78`,
-`docs/REVIEW-PHASE1-R37.md:84`), and `config/rbac/loop_editor_role.yaml:28-46`
+`docs/REVIEW-PHASE1-R37.md:84`), and `config/rbac/loop_editor_role.yaml:28-47`
 still grants `update`+`patch` on `loops/status` (D85).
 
 **New: none.** The window added no decision that needs the owner; I148-I150 are

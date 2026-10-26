@@ -708,11 +708,9 @@ func (r *LoopReconciler) phaseBootstrap(ctx context.Context, loop *coxv1alpha1.L
 	// sandbox Suspended meanwhile.
 	r.ensureAgentNetPolBeforeSandbox(ctx, loop)
 
-	sandboxUpdated, err := r.ensureSandbox(ctx, loop, pauseBlocked)
-	if err != nil {
+	if err := r.ensureSandbox(ctx, loop, pauseBlocked); err != nil {
 		return false, false, err
 	}
-	changed = changed || sandboxUpdated
 	return changed, resumeCleared, nil
 }
 
@@ -1774,8 +1772,12 @@ func applyBPFNodeAffinity(e engine.Enforcer, spec *corev1.PodSpec) {
 	}
 }
 
-func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) (bool, error) {
-	loopUpdated := false
+// ensureSandbox makes the Sandbox match the Loop's current phase, pause state
+// and memory state. It reports only an error: the Loop-object writes it used to
+// make (the memory PVC unbound marker) now go through the shared quiet-window
+// helper, which patches the marker itself and refreshes the caller's
+// resourceVersion (R39 I144), so there is no "Loop changed" flag to report.
+func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Loop, pauseBlocked bool) error {
 	// Pull the logger from the context (the controller-runtime idiom) so the
 	// function doesn't take both a context and a logger (logcheck).
 	log := logf.FromContext(ctx)
@@ -1808,9 +1810,9 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 				"stale", staleAnnotation,
 				"desired", string(loop.Status.DesiredPhase))
 			if derr := r.Delete(ctx, existingSb); derr != nil && !apierrors.IsNotFound(derr) {
-				return false, fmt.Errorf("delete sandbox for phase advance: %w", derr)
+				return fmt.Errorf("delete sandbox for phase advance: %w", derr)
 			}
-			return false, nil // Sandbox deleted; the next reconcile creates it fresh
+			return nil // Sandbox deleted; the next reconcile creates it fresh
 		}
 		// F6 (the I65 P1-B pattern mirrored): status.agent.infraSandboxUID
 		// keys the count on the Sandbox the failure was read from, so a re-read
@@ -1840,7 +1842,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	} else if !apierrors.IsNotFound(gerr) {
 		// A failed read (not NotFound): fail closed (I49 — a failed read is
 		// never a success); the reconcile retries.
-		return false, fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
+		return fmt.Errorf("read sandbox for the F6 reset check: %w", gerr)
 	}
 
 	// P5a (D66): the memory PVC decision (bound vs unbound) is computed BEFORE
@@ -1857,7 +1859,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	// announces again once the window has passed.
 	memoryBound, memErr := r.memoryPVCBound(ctx, loop)
 	if memErr != nil {
-		return false, memErr
+		return memErr
 	}
 	if !memoryBound && memoryPVCName(loop) != "" {
 		// A PVC exists but is not Bound: the visible degradation (the Loop
@@ -1959,7 +1961,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		return controllerutil.SetControllerReference(loop, desired, r.Scheme)
 	})
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	// Phase 0 done-when: the controller logs the sandbox it created/updated.
@@ -1978,7 +1980,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 			"loop", loop.Name,
 		)
 	}
-	return loopUpdated, nil
+	return nil
 }
 
 // modelProxyHold is the D35a gate (F84): true while the Loop's model proxy pod

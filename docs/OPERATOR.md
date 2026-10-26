@@ -357,7 +357,8 @@ read the accumulated lessons. A Warning Event `MemoryPVCUnbound`
 a one-shot (R39 I144): while the PVC stays unbound it re-announces every
 5 minutes, because a single Event is invisible once the cluster's `--event-ttl`
 (default 1h) has passed — and a class without ReadWriteMany leaves the PVC
-unbound for far longer than that. The operator records the last Event's time
+unbound for far longer than that. The operator schedules a reconcile for that
+window, so an otherwise idle Loop still repeats the Event. The operator records the last Event's time
 on the Loop with the `coxswain.io/memory-pvc-unbound-notified` annotation, so
 it can tell a fresh degradation from one it has already announced.
 

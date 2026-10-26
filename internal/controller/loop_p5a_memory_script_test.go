@@ -252,3 +252,33 @@ func TestSurfaceMemoryPVCUnbound(t *testing.T) {
 		t.Fatalf("past the quiet window the surface must re-announce exactly once, got %d Events", got)
 	}
 }
+
+// TestReconcileRequeueAfterMemoryWindow (I144 review P2-1): the memory
+// degradation's re-announce window reaches the trailing result, and the EARLIER
+// of it and the budget window wins — coming back sooner only re-evaluates, so
+// nothing is skipped either way.
+func TestReconcileRequeueAfterMemoryWindow(t *testing.T) {
+	r := &LoopReconciler{CNIProber: testCNIProber()}
+	cases := []struct {
+		name                         string
+		budgetRequeue, memoryRequeue time.Duration
+		want                         time.Duration
+	}{
+		{"the memory window alone", 0, 4 * time.Minute, 4 * time.Minute},
+		{"the memory window before a later budget window", 10 * time.Minute, 4 * time.Minute, 4 * time.Minute},
+		{"a sooner budget window wins", 2 * time.Minute, 4 * time.Minute, 2 * time.Minute},
+		{"neither", 0, 0, 0},
+	}
+	for _, tc := range cases {
+		got := r.reconcileRequeueAfter(true, false, false, false, false, tc.budgetRequeue, tc.memoryRequeue)
+		if got.RequeueAfter != tc.want {
+			t.Errorf("%s: RequeueAfter = %v, want %v", tc.name, got.RequeueAfter, tc.want)
+		}
+	}
+	// The 5s work requeue still wins: pending work is more urgent than a
+	// reminder.
+	got := r.reconcileRequeueAfter(false, true, false, false, false, 0, 4*time.Minute)
+	if got.RequeueAfter != 5*time.Second {
+		t.Errorf("pending work must keep the 5s requeue, got %v", got.RequeueAfter)
+	}
+}

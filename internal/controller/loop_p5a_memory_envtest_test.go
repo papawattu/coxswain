@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -405,10 +406,15 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 				Scheme:    k8sClient.Scheme(),
 				Recorder:  rec,
 				now:       func() metav1.Time { return clock },
+				// Suppress the 5s clone-pending timer, so the trailing
+				// RequeueAfter this spec reads is the one it is about (the
+				// seam's documented purpose: a spec asserting a specific
+				// RequeueAfter must not let the 5s timer mask it).
+				baseCommitSeeded: true,
 			}
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsA, Name: "p5a-i144"}}
-			reconcileOnce := func() {
-				_, err := r.Reconcile(ctx, req)
+			reconcileOnce := func() ctrl.Result {
+				res, err := r.Reconcile(ctx, req)
 				Expect(err).NotTo(HaveOccurred(), "reconcile must not error")
 				// The bootstrap's option-B recycle deletes the Sandbox on a
 				// phase advance; recreate it so the next pass re-ensures the
@@ -417,6 +423,7 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 				if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: "p5a-i144-sandbox"}, probe)) {
 					Expect(k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "p5a-i144-sandbox", Namespace: nsA}})).To(Succeed())
 				}
+				return res
 			}
 			drain := func() int {
 				n := 0
@@ -432,8 +439,16 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 				}
 			}
 
-			reconcileOnce()
+			res := reconcileOnce()
 			Expect(drain()).To(Equal(1), "the first unbound pass emits one MemoryPVCUnbound Event")
+			// The re-announce is SCHEDULED (I144 review P2-1): a window with no
+			// timer behind it is a doc claim, not a cadence. With the 5s
+			// clone-pending timer suppressed, this RequeueAfter can only come
+			// from the memory branch.
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0),
+				"the unbound pass must schedule the next re-announce")
+			Expect(res.RequeueAfter).To(BeNumerically("<=", memoryPVCUnboundQuiet),
+				"the next re-announce must be scheduled inside the quiet window")
 			// The marker is the Event's TIME (RFC3339), not a boolean: that is
 			// what makes the window possible.
 			got := &coxv1alpha1.Loop{}
@@ -444,15 +459,72 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 
 			// Inside the window: silent (a per-reconcile Event would be noise).
 			clock = metav1.NewTime(clock.Add(memoryPVCUnboundQuiet / 2))
-			reconcileOnce()
+			res = reconcileOnce()
 			Expect(drain()).To(Equal(0), "the surface must stay silent inside the quiet window")
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0),
+				"a muted pass still schedules the end of the window")
 
 			// Past the window: re-announced. This is the assertion the one-shot
 			// marker made impossible, and it is what fails if the surface is
 			// removed from the call site or reverted to a one-shot.
 			clock = metav1.NewTime(clock.Add(memoryPVCUnboundQuiet))
-			reconcileOnce()
+			res = reconcileOnce()
 			Expect(drain()).To(Equal(1), "past the quiet window the degradation must be re-announced")
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0),
+				"the re-announced pass schedules the following window too")
+		})
+
+		// I144 review P2-1: the window is only a cadence if something schedules
+		// the next pass. A Loop whose PVC is binding is otherwise idle — no
+		// claim, no pod event — so the unbound branch must hand the caller a
+		// requeue. This pins that return value directly (the Reconcile-level
+		// spec above cannot isolate it: at Planning the base-commit work
+		// requeue of 5s wins the trailing result on its own).
+		It("returns the window as the re-announce delay while the PVC is unbound", func() {
+			loop := p5aMakeLoop("p5a-i144r", nsA, repoA)
+			Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, loop) }()
+
+			rec := record.NewFakeRecorder(64)
+			clock := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+			r := &LoopReconciler{
+				CNIProber: testCNIProber(),
+				Client:    k8sClient,
+				Scheme:    k8sClient.Scheme(),
+				Recorder:  rec,
+				now:       func() metav1.Time { return clock },
+			}
+			// One pass creates the memory PVC (Pending: envtest has no
+			// provisioner) and the Sandbox the second pass needs.
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsA, Name: "p5a-i144r"}})
+			Expect(err).NotTo(HaveOccurred())
+			drain := func() {
+				for len(rec.Events) > 0 {
+					<-rec.Events
+				}
+			}
+			drain()
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: memkeyPVCName(repoA)}, pvc)).To(Succeed())
+			Expect(pvc.Status.Phase).NotTo(Equal(corev1.ClaimBound), "setup: envtest leaves the PVC Pending")
+
+			fresh := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: "p5a-i144r"}, fresh)).To(Succeed())
+			delay, err := r.ensureSandbox(ctx, fresh, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(delay).To(BeNumerically(">", 0),
+				"an unbound memory PVC must schedule the re-announce (a window with no timer is not a cadence)")
+			Expect(delay).To(BeNumerically("<=", memoryPVCUnboundQuiet),
+				"the re-announce must be scheduled inside the quiet window, not after it")
+
+			// A Bound PVC schedules nothing: the degradation is over.
+			pvc.Status.Phase = corev1.ClaimBound
+			Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: "p5a-i144r"}, fresh)).To(Succeed())
+			delay, err = r.ensureSandbox(ctx, fresh, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(delay).To(BeZero(), "a Bound memory PVC leaves nothing to re-announce")
 		})
 
 		It("a Bound PVC with the operator NOT writing it: the PVC is unchanged by a reconcile (no owner ref, no spec rewrite)", func() {

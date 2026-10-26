@@ -216,7 +216,7 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 		Expect(k8sClient.Create(ctx, fresh)).To(Succeed())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, fresh)).To(Succeed())
 		Expect(string(fresh.UID)).NotTo(Equal(string(f.sandboxUID)), "the recreate has a new UID (the shape that used to reset the count)")
-		err = r.ensureSandbox(ctx, loop, true)
+		_, err = r.ensureSandbox(ctx, loop, true)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(loop.Status.Agent.InfraAttempts).To(Equal(int32(1)), "the retry episode keeps its count across the recreate")
 

@@ -228,7 +228,14 @@ func (r *LoopReconciler) memoryPVCBound(ctx context.Context, loop *coxv1alpha1.L
 //
 // Best-effort: a nil Recorder skips the Event, and a failed marker patch only
 // means the Event may repeat on the next pass. Neither blocks the reconcile.
-func (r *LoopReconciler) surfaceMemoryPVCUnbound(ctx context.Context, loop *coxv1alpha1.Loop, pvcName string) {
+//
+// It returns how long until the marker's window expires, so the caller can
+// SCHEDULE the re-announce (I144 review P2-1): the Event only repeats on a
+// reconcile, and a Loop that is merely waiting for its PVC to bind has nothing
+// else to wake it, so "re-announces every 5 minutes" needs a timer, not just a
+// window. 0 would mean the window is already open (the surface just emitted, so
+// the wait is the whole window).
+func (r *LoopReconciler) surfaceMemoryPVCUnbound(ctx context.Context, loop *coxv1alpha1.Loop, pvcName string) time.Duration {
 	r.markAndSurfaceQuietly(ctx, loop, quietMarker{
 		key:    memoryPVCUnboundNotifiedAnnotation,
 		quiet:  memoryPVCUnboundQuiet,
@@ -236,6 +243,14 @@ func (r *LoopReconciler) surfaceMemoryPVCUnbound(ctx context.Context, loop *coxv
 		message: fmt.Sprintf("memory PVC %s is not Bound (accessModes ReadWriteMany; the cluster storage class may not support RWX) — the Loop runs without shared memory (the copy-in init is skipped)",
 			pvcName),
 	})
+	// markAndSurfaceQuietly refreshed the marker in memory (it writes the
+	// emission time, or leaves the previous one when this pass was muted).
+	if at, ok := quietMarkerNotifiedAt(loop.Annotations[memoryPVCUnboundNotifiedAnnotation]); ok {
+		if d := at.Add(memoryPVCUnboundQuiet).Sub(r.operatorNow().Time); d > 0 {
+			return d
+		}
+	}
+	return memoryPVCUnboundQuiet
 }
 
 // memoryCopyInScript returns the copy-in init container's sh script: copy the

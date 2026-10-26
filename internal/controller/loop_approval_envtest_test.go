@@ -25,9 +25,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/cni"
 )
 
 // B3 (PLAN-BETA / PLAN.md Phase 4): the plan approval gate. These specs
@@ -193,6 +195,93 @@ var _ = Describe("B3 plan approval gate", func() {
 		// advance, not on the claim read.
 		Expect(loop.Status.Progress).NotTo(BeNil(), "the claim is recorded into progress (OS1) even while the gate holds")
 		Expect(loop.Status.Progress.LastResultStatus).To(Equal("success"))
+	})
+
+	// F49 (T-2): the Manual-mode AwaitingApproval sandbox hold has no other
+	// spec, and "assert the sandbox is Suspended" alone would pass for the
+	// WRONG reason: a reconciler with no Enforcer and AllowUnenforced unset is
+	// held Suspended by the D30 fail-closed gate whatever the phase is. So this
+	// spec wires what D30 needs to be satisfied (a CNI prober that reports
+	// CNIEnforced) and AllowUnenforced, then asserts the NetworkEnforced
+	// condition is True while the sandbox is Suspended — the only remaining
+	// cause is approvalHoldPhase. The control is the same sandbox RUNNING at
+	// Planning before the claim, and RUNNING again after the approval.
+	It("Manual mode: the AwaitingApproval hold — not the D30/CNI hold — keeps the sandbox Suspended, and approving releases it", func() {
+		ns := "b3-holdmode-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient,
+			AllowUnenforced: true, CNIProber: cni.NewFakeProber()}
+		r.CNIProber.(*cni.FakeProber).SetResult(cni.CNIProbeResult{Reason: cni.ReasonCNIEnforced})
+		r.wireApprovalGate()
+		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
+			return nil, nil
+		}
+
+		name := "b3-holdmode"
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal: loopGoal, Workspace: testWorkspace(),
+				Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		sandboxMode := func() sandboxv1beta1.SandboxOperatingMode {
+			sb := &sandboxv1beta1.Sandbox{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: sandboxName(name)}, sb)).To(Succeed(),
+				"the operator must have created the sandbox")
+			return sb.Spec.OperatingMode
+		}
+		networkEnforced := func() *metav1.Condition {
+			got := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+			for i := range got.Status.Conditions {
+				if got.Status.Conditions[i].Type == cni.NetworkEnforcedCondition {
+					return &got.Status.Conditions[i]
+				}
+			}
+			return nil
+		}
+
+		// settle runs the reconcile to a steady state: a phase advance deletes
+		// the live Sandbox on one pass (the desired-phase annotation mismatch)
+		// and the next pass creates the fresh one with the new phase's mode.
+		settle := func() {
+			for i := 0; i < 3; i++ {
+				reconcileLoop(r, ns, name)
+			}
+		}
+
+		By("the control: at Planning, with the CNI enforced, the sandbox RUNS")
+		settle()
+		Expect(sandboxMode()).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
+			"the control condition: nothing holds the sandbox at Planning when the network gate is satisfied")
+
+		By("the hold: the Planning claim parks the Loop at AwaitingApproval and the sandbox goes Suspended")
+		reportClaim(r, ns, name, &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhasePlanning, Status: "success"})
+		settle()
+		got := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval))
+		Expect(sandboxMode()).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended),
+			"the Manual-mode AwaitingApproval hold must suspend the sandbox (approvalHoldPhase)")
+		c := networkEnforced()
+		Expect(c).NotTo(BeNil(), "the CNI gate must have reported a NetworkEnforced condition")
+		Expect(c.Status).To(Equal(metav1.ConditionTrue),
+			"the network gate is SATISFIED here, so it is not what suspends the sandbox — the approval hold is")
+
+		By("the release: an approval lets the sandbox RUN again (the hold no longer applies)")
+		setCondition(ns, name, coxv1alpha1.PlanApprovedCondition, "True",
+			"Approved: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+		reportClaim(r, ns, name, &PhaseClaim{ObservedPhase: coxv1alpha1.LoopPhasePlanning, Status: "success"})
+		settle()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(sandboxMode()).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning),
+			"with the plan approved, the approval hold is gone and the sandbox runs")
 	})
 
 	It("Manual mode: a PlanApproved condition releases the hold and the Planning claim advances to Implementing (the user's cox approve)", func() {

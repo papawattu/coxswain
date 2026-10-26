@@ -427,6 +427,60 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		s6RequireNoJob(ns, name)
 	})
 
+	// F49 (T-3): the "no pinned verifiedCommit" branch of deliveryRequested had
+	// no spec. The Loop is at Succeeded with mode PullRequest and a repo (so
+	// every OTHER guard passes), and status.currentVerify is nil: the operator
+	// must create no deliver Job and set no Delivered condition. Driven the
+	// same way as the mode spec above (Succeeded with the mode OFF, so the
+	// Succeeded reconcile cannot create the Job this spec is asserting absent),
+	// then the mode is flipped ON and the pin cleared.
+	It("does not deliver a Succeeded Loop that has no pinned verifiedCommit (the deliveryRequested no-pin branch)", func() {
+		ns := freshNS("s6-nopin")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "nopin1"
+		Expect(k8sClient.Create(ctx, s6Loop(name, ns, ""))).To(Succeed())
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Spec.Delivery = nil // drive to Succeeded first (see the comment above)
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+
+		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		s5aEnsureSandbox(ns, name)
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.BaseCommit = s5aBaseCommit
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		s5aClaimPod(ns, name, "Planning", "")
+		s6Reconcile(r, ns, name)
+		s5aEnsureSandbox(ns, name)
+		s5aClaimPod(ns, name, "Implementing", s6HeadCommit)
+		s6Reconcile(r, ns, name)
+		s5aVerifyPod(ctx, ns, name, name+"-verify-1", 0)
+		s6Reconcile(r, ns, name)
+		loop = &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+
+		By("flipping the mode to PullRequest and clearing the pin: every guard passes except the pin")
+		loop.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest}
+		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.CurrentVerify = nil
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		Expect(loop.Spec.Workspace.Repo).NotTo(BeEmpty(), "the repo guard must NOT be what refuses this delivery")
+		ok, why := deliveryRequested(loop)
+		Expect(ok).To(BeFalse(), "a nil pin must refuse delivery")
+		Expect(why).To(ContainSubstring("no verifiedCommit pinned"))
+
+		By("the reconcile creates no deliver Job and sets no Delivered condition")
+		s6Reconcile(r, ns, name)
+		s6RequireNoJob(ns, name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		present, _, _ := s6Cond(loop)
+		Expect(present).To(BeFalse(), "no Delivered condition may be set when delivery is not requested")
+	})
+
 	It("keeps the deliver Job's credential layout (creds in clone-base + push only; no agent PVC in push; hooksPath on every git call)", func() {
 		ns := freshNS("s6-layout")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

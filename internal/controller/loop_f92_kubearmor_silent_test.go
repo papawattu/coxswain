@@ -224,6 +224,49 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 			To(BeZero())
 	})
 
+	It("S5: Reconcile threads the tolerated no-match into the trailing requeue decision (F92 P2-2 wiring)", func() {
+		// S4 pins the requeue RULE; this pins the WIRING: that the flag the write
+		// path set actually reaches reconcileRequeueAfter. Without this a
+		// `return false, nil` in applyEffectivePolicyAndConditions disables the
+		// F92 P2-2 fix while S1 (its RequeueAfter only has to be > 0, satisfied by
+		// the 5s clone-pending work requeue) and S4 (a direct unit call) both stay
+		// green — a mutation that drops the return value was ONLY caught here.
+		ns := f92Ns("f92-wiring")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		newReconciler := func(writeErr error) *LoopReconciler {
+			r := &LoopReconciler{
+				CNIProber:        testCNIProber(),
+				Client:           k8sClient,
+				Scheme:           k8sClient.Scheme(),
+				apiReader:        k8sClient,
+				Recorder:         record.NewFakeRecorder(64),
+				Enforcer:         &fakeEnforcer{enforcing: false, reason: engine.ReasonNodeNotEnforcing},
+				AllowUnenforced:  false,
+				baseCommitSeeded: true, // no clone-pending 5s work requeue: the only window left is the F92 one
+			}
+			r.ApplyEnforcementWritesFn = func(_ context.Context, _ *coxv1alpha1.Loop, _ policy.EffectivePolicy) error {
+				return writeErr
+			}
+			return r
+		}
+
+		name := "l5"
+		Expect(k8sClient.Create(ctx, f92Loop(ns, name))).To(Succeed())
+		res, err := newReconciler(f92NoMatch()).Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(kaptCRDMissingRequeue),
+			"the tolerated no-match must reach the trailing requeue decision (F92 P2-2)")
+
+		By("positive control: the same shape with a SUCCESSFUL write does not take the F92 window")
+		name = "l6"
+		Expect(k8sClient.Create(ctx, f92Loop(ns, name))).To(Succeed())
+		res, err = newReconciler(nil).Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).NotTo(Equal(kaptCRDMissingRequeue),
+			"without a tolerated no-match the F92 window is not taken, so the assertion above is not vacuous (this shape requeues on another window, observed ~5m)")
+	})
+
 	It("S2: every OTHER enforcement write error still returns and retries (the tolerance is exactly the CRD-absent shape)", func() {
 		ns := f92Ns("f92-forbidden")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

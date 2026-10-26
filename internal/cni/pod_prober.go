@@ -78,6 +78,13 @@ const (
 	expectedResultLen = 5 // 4 expected-BLOCKED (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL) + 1 positive control (DNS_POSITIVE)
 	verdictReachable  = "REACHABLE"
 	verdictBlocked    = "BLOCKED"
+	// verdictUnresolved: the target's hostname could not be resolved (or the
+	// connection was refused), so the probe has no evidence either way. It is
+	// never Enforced and never Unenforced: parse() maps any UNRESOLVED row to
+	// ProbeUnavailable (F51 P2-2 — the old script reported a resolution
+	// failure as REACHABLE, i.e. an unresolvable expected-BLOCKED target
+	// counted as a fence bypass).
+	verdictUnresolved = "UNRESOLVED"
 )
 
 // knownProbeLabels is the strict set of RESULT labels the probe emits (design
@@ -202,13 +209,20 @@ def probe(label, host, port):
     try:
         host = socket.gethostbyname(host)
     except Exception:
-        out("RESULT %s REACHABLE" % label)  # unresolvable -> not a CNI failure
+        # No address means no measurement of the fence: report UNRESOLVED,
+        # never REACHABLE (an unresolvable expected-BLOCKED target used to
+        # read as a fence bypass).
+        out("RESULT %s UNRESOLVED" % label)
         return
     s = socket.socket(_s.AF_INET, _s.SOCK_STREAM)
     s.settimeout(5)
     try:
         s.connect((host, port))
         out("RESULT %s REACHABLE" % label)
+    except ConnectionRefusedError:
+        # A refused connection reached the host and was rejected there; it is
+        # not evidence that a policy dropped the packet.
+        out("RESULT %s UNRESOLVED" % label)
     except Exception:
         out("RESULT %s BLOCKED" % label)
     finally:
@@ -460,7 +474,9 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 // REACHABLE; the positive control (DNS_POSITIVE, the cluster's kube-dns :53)
 // is NOT expected-blocked — a BLOCKED control means the probe has no network
 // and the result is ProbeUnavailable (never CNIEnforced on an unproven fence,
-// never CNIUnenforced on a healthy CNI).
+// never CNIUnenforced on a healthy CNI). An UNRESOLVED row (no address, or a
+// refused connection) is also ProbeUnavailable: it is a missing measurement,
+// not a verdict about the fence (F51 P2-2).
 func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 	// A non-zero exit (container terminated with a non-zero code) is
 	// ProbeUnavailable even if the message looks valid.
@@ -482,13 +498,22 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 			return unavailable("unrecognised probe line: " + line), nil
 		}
 		label, verdict := fields[1], fields[2]
-		if verdict != verdictReachable && verdict != verdictBlocked {
+		if verdict != verdictReachable && verdict != verdictBlocked && verdict != verdictUnresolved {
 			return unavailable("unrecognised verdict: " + label + " " + verdict), nil
 		}
 		if !knownProbeLabels[label] {
 			return unavailable("unknown probe target label: " + label), nil
 		}
 		seen++
+		// UNRESOLVED is not evidence of enforcement OR of a fence bypass:
+		// the target was not measurable — either its name did not resolve or
+		// the connection was refused (which proves the name DID resolve, so
+		// the detail must not assert a resolution failure). Any UNRESOLVED
+		// row makes the whole probe ProbeUnavailable, before the
+		// control/BLOCKED logic can claim a verdict.
+		if verdict == verdictUnresolved {
+			return unavailable("probe target was not measurable: " + label), nil
+		}
 		rows = append(rows, TargetRow{Label: label, Verdict: verdict})
 		if verdict == verdictReachable {
 			reachable = append(reachable, label)

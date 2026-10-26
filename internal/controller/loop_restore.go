@@ -460,18 +460,30 @@ func (r *LoopReconciler) deleteWorkspacePVC(ctx context.Context, loop *coxv1alph
 	return nil
 }
 
-// createWorkspacePVCFromSnapshot creates the Loop's workspace PVC with
-// spec.dataSource = the named VolumeSnapshot (the level-based restore's
-// create step — it runs only when the PVC is GONE, so the name is free).
-// AlreadyExists is a success (a concurrent pass created it; the content is
-// from the snapshot either way). The restored PVC is controller-owned by
-// the Loop (the same GC contract as the original PVC — a deleted Loop's
-// restored PVC is garbage-collected with it).
 // errWorkspacePVCTerminating is returned by createWorkspacePVCFromSnapshot when
 // the name is still held by a Terminating PVC: the restore is not complete and
 // must wait for the PVC to be fully gone (F36).
 var errWorkspacePVCTerminating = errors.New("the old workspace PVC is still Terminating")
 
+// errWorkspacePVCUnconfirmed is returned by createWorkspacePVCFromSnapshot when
+// an AlreadyExists create could not be CONFIRMED by a read (F57a). The PVC is
+// then not known to exist, so the restore is not complete: the caller requeues
+// without a decision and the next pass decides from a fresh read. Both a
+// transient read failure and a NotFound (a concurrent pass created the PVC and
+// it went away again) land here — neither is evidence that the PVC carries the
+// snapshot's content. Before F57 a failed read fell through to `return nil`
+// (fail-open) and the callers recorded Restore=True/Restored for a PVC they had
+// never seen.
+var errWorkspacePVCUnconfirmed = errors.New("the restored workspace PVC could not be confirmed")
+
+// createWorkspacePVCFromSnapshot creates the Loop's workspace PVC with
+// spec.dataSource = the named VolumeSnapshot (the level-based restore's
+// create step — it runs only when the PVC is GONE, so the name is free).
+// AlreadyExists is a success only once a read CONFIRMS the PVC exists and is
+// not Terminating (F57a: a failed read is errWorkspacePVCUnconfirmed, not a
+// success). The restored PVC is controller-owned by the Loop (the same GC
+// contract as the original PVC — a deleted Loop's restored PVC is
+// garbage-collected with it).
 func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loop *coxv1alpha1.Loop, snapshotName string) error {
 	newPVC := &corev1.PersistentVolumeClaim{}
 	newPVC.Spec = workspacePVCSpec(loop).Spec
@@ -488,12 +500,24 @@ func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loo
 	}
 	if err := r.Create(ctx, newPVC); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// A concurrent pass created it: success. But a Terminating PVC
-			// still owns the name (workspacePVCPresent reports it as absent):
-			// that is NOT a restored PVC (F36 P2-1: it was reported Restored,
-			// and once it finished deleting nothing re-triggered the restore).
+			// A concurrent pass created it: success — but ONLY once the read
+			// confirms it. A Terminating PVC still owns the name
+			// (workspacePVCPresent reports it as absent): that is NOT a restored
+			// PVC (F36 P2-1: it was reported Restored, and once it finished
+			// deleting nothing re-triggered the restore). A read that fails at
+			// all is not confirmation either (F57a: it used to fall through to
+			// `return nil`, so a restore nobody had seen could be recorded as
+			// Restored).
 			existing := &corev1.PersistentVolumeClaim{}
-			if gerr := r.Get(ctx, client.ObjectKeyFromObject(newPVC), existing); gerr == nil && existing.DeletionTimestamp != nil {
+			if gerr := r.Get(ctx, client.ObjectKeyFromObject(newPVC), existing); gerr != nil {
+				// Unfiltered, like the restore step's other transient-read
+				// logs: a read that cannot confirm the PVC is why this pass
+				// made no decision, and the next pass retries silently — the
+				// log is the only trace of the interruption.
+				log.FromContext(ctx).Info("the restored workspace PVC could not be confirmed after AlreadyExists; the restore is not complete",
+					"pvc", newPVC.Name, "loop", loop.Name, "readError", gerr.Error())
+				return fmt.Errorf("%w: %v", errWorkspacePVCUnconfirmed, gerr)
+			} else if existing.DeletionTimestamp != nil {
 				return errWorkspacePVCTerminating
 			}
 			return nil
@@ -800,7 +824,6 @@ func (r *LoopReconciler) emitRestoreEvent(loop *coxv1alpha1.Loop, status bool, r
 func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget, persist func()) (bool, bool, bool, error) {
 	pvc := &corev1.PersistentVolumeClaim{}
 	pvcErr := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: workspacePVCName(loop.Name)}, pvc)
-	restored := false
 	if pvcErr == nil {
 		// The PVC is still present (even if Terminating). Stop the sandbox
 		// first (the sandbox pod carries the loop label and mounts the
@@ -847,9 +870,15 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 		return false, true, true, nil
 	}
 	// The PVC is fully gone (NotFound). Create it from the snapshot.
-	if r.markForkRetentionBeforeCreate(ctx, loop, target) {
-		defer r.unmarkForkRetentionOnFailure(ctx, loop, target, &restored)
-	}
+	//
+	// F57b: the fork-retention label is written ONCE and stays while the create
+	// keeps failing — the fork still needs the source snapshot alive, and
+	// re-marking and un-marking it on every pass wrote the source snapshot
+	// twice per reconcile for the life of the failure (and re-emitted the
+	// Warning). The label is removed when the restore completes
+	// (b2ApplyRestoreStep's completed-fork branch) and when the fork gives up
+	// (a deleted Loop, b2ApplyRestoreStep's deletion guard) — not here.
+	r.markForkRetentionBeforeCreate(ctx, loop, target)
 	if err := r.createWorkspacePVCFromSnapshot(ctx, loop, target.snapshot); err != nil {
 		if errors.Is(err, errWorkspacePVCTerminating) {
 			r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonDeletingPVC,
@@ -857,11 +886,16 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 			persist()
 			return true, true, true, nil
 		}
-		setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+		if errors.Is(err, errWorkspacePVCUnconfirmed) {
+			// F57a: the AlreadyExists create could not be confirmed, so this pass
+			// has no restore decision at all (I49): requeue and read again.
+			return false, true, true, nil
+		}
+		// F57b: the Warning marks the TRANSITION into Rejected, not every pass
+		// of a create that keeps failing (the condition is the steady state).
+		r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonRejected,
 			"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+" iter-"+strconv.Itoa(target.iteration)+") failed: "+err.Error())
 		persist()
-		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
-			"workspace PVC restore from "+target.snapshot+" failed; retrying")
 		return true, true, true, nil
 	}
 	setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
@@ -873,7 +907,6 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	// b2ApplyRestoreStep's rollback branch (spec.restoreFrom) has its own clear,
 	// because the run key cannot see either of them.
 	clearSandboxInfraEpisode(loop)
-	restored = true
 	persist()
 	r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
 		"workspace PVC restored from "+target.snapshot)
@@ -905,6 +938,14 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 	// skipped while the restore hold is active). Skip the B2 restore decision
 	// entirely when the Loop is being deleted.
 	if loop.DeletionTimestamp != nil {
+		// F57b: a fork that gave up — the Loop is going away with its restore
+		// still pending — releases the fork-retention label on the source
+		// snapshot here. The label now stays in place while a failing create is
+		// retried, so the delete is the give-up path that removes it (a
+		// completed fork's label is already gone, so this is a no-op for it).
+		if loop.Spec.ForkOf != nil {
+			r.removeForkRetentionLabel(ctx, loop)
+		}
 		return false, false, false, nil
 	}
 	// A fork whose restore is complete (the one-shot marker) has nothing
@@ -957,11 +998,16 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 					persist()
 					return true, true, true, nil
 				}
-				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+				if errors.Is(err, errWorkspacePVCUnconfirmed) {
+					// F57a: no restore decision on an unconfirmed create; requeue.
+					return false, true, true, nil
+				}
+				// F57b: the Warning marks the TRANSITION into Rejected, not
+				// every pass of a create that keeps failing (the condition is
+				// the steady state). Same as the fork/lost-PVC branch.
+				r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonRejected,
 					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+") failed: "+err.Error())
 				persist()
-				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
-					"workspace PVC restore from "+target.snapshot+" failed; retrying")
 				return true, true, true, nil
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
@@ -1153,9 +1199,9 @@ const forkSnapshotLabelKey = forkRetainedSnapshotLabelKey
 // not the snapshot's to keep serving); the label's persistence is a known
 // B2 limitation (a snapshot the source's GC skips forever), documented in
 // gcLoopCheckpoints.
-func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1alpha1.Loop, snapshotName string) bool {
+func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1alpha1.Loop, snapshotName string) {
 	if !r.snapshotCRDPresentCall(ctx) {
-		return false // no CRD: the snapshot is not present
+		return // no CRD: the snapshot is not present
 	}
 	snap := &unstructured.Unstructured{Object: map[string]any{unstructuredAPI: snapshotGV, unstructuredKind: volumeSnapshotKind}}
 	snap.SetGroupVersionKind(volumeSnapshotGVK)
@@ -1163,10 +1209,16 @@ func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1
 	if err := r.Get(ctx, key, snap); err != nil {
 		log.FromContext(ctx).V(1).Info("fork: the source snapshot is absent; the fork-retention label could not be set (best-effort)",
 			"snapshot", snapshotName, "fork", fork.Name)
-		return false
+		return
+	}
+	labels := snap.GetLabels()
+	if labels != nil && labels[forkSnapshotLabelKey] == fork.Name {
+		// F57b: the label is already where it needs to be (a previous pass
+		// wrote it and its create failed). No write: a create that keeps
+		// failing must not patch the SOURCE snapshot on every pass.
+		return
 	}
 	orig := snap.DeepCopy()
-	labels := snap.GetLabels()
 	if labels == nil {
 		labels = map[string]string{}
 	}
@@ -1178,9 +1230,7 @@ func (r *LoopReconciler) markForkRetentionLabel(ctx context.Context, fork *coxv1
 	if err := r.Patch(ctx, snap, client.MergeFrom(orig)); err != nil {
 		r.warnForkRetention(fork, "ForkRetentionLabelFailed",
 			"setting the fork-retention label on snapshot "+snapshotName+" failed ("+err.Error()+"); the source's GC may delete it while the fork restores")
-		return false
 	}
-	return true
 }
 
 // warnForkRetention emits a Warning Event for a failed fork-retention label
@@ -1194,28 +1244,23 @@ func (r *LoopReconciler) warnForkRetention(fork *coxv1alpha1.Loop, reason, msg s
 // markForkRetentionBeforeCreate writes the fork-retention label BEFORE the
 // fork's PVC is created (F36 P3-3: labelling after the create closed nothing:
 // a source GC between the snapshot read and the create left the fork's PVC
-// Pending on a deleted dataSource). It reports whether the label was written
-// (only for forks). The caller removes it again if the create fails.
-func (r *LoopReconciler) markForkRetentionBeforeCreate(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget) bool {
+// Pending on a deleted dataSource). Forks only; a no-op for a rollback or a
+// lost-PVC restore. F57b: the label STAYS while the create keeps failing (it
+// is written once, not once per pass) and is removed by the completion path or
+// by the deleted-Loop guard — not by the caller on every failure.
+func (r *LoopReconciler) markForkRetentionBeforeCreate(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget) {
 	if target.kind != b2KindFork {
-		return false
-	}
-	return r.markForkRetentionLabel(ctx, loop, target.snapshot)
-}
-
-// unmarkForkRetentionOnFailure removes the label written before the create
-// when the restore did not complete (the create failed or the old PVC is still
-// terminating); the next pass writes it again.
-func (r *LoopReconciler) unmarkForkRetentionOnFailure(ctx context.Context, loop *coxv1alpha1.Loop, target *b2RestoreTarget, restored *bool) {
-	if *restored || target.kind != b2KindFork {
 		return
 	}
-	r.removeForkRetentionLabel(ctx, loop)
+	r.markForkRetentionLabel(ctx, loop, target.snapshot)
 }
 
 // removeForkRetentionLabel removes the fork-retention label from the source
 // Loop's checkpoint snapshot (the fork's restore is complete — the fork's
 // PVC owns its content — so the source's GC is free to delete the snapshot).
+// It is also the give-up path (F57b): a fork Loop that is being deleted with a
+// restore still pending (the label written before a failing create is left in
+// place while the create retries) releases the label here.
 // The source snapshot's name is derived from the fork's spec.forkOf (the
 // checkpoint naming is deterministic: checkpoint-<source>-iter-<N>).
 // Best-effort: a failure is logged and the label persists (a known B2

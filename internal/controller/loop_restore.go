@@ -129,28 +129,34 @@ import (
 //   - decision "missing": the snapshot does not exist — the checkpoint is
 //     gone (GC'd or never taken) — the operator must not restore from it
 //     (the Restore condition names the reason; the Event is emitted).
+//   - decision "crdmissing": the VolumeSnapshot CRD is not installed, so
+//     no snapshot can be resolved at all. The operator reports this as its
+//     own decision (F52 A1) so the Restore condition does not name a cause
+//     it never checked ("never taken, or GC'd") on a cluster that cannot
+//     hold checkpoints in the first place.
 //
 // A read error (other than NotFound) is reported as "error" (the caller
 // requeues; the operator does not make a restore decision on a transient
 // read failure — the conservative reading, as in B1's support check).
 const (
-	b2SourceReady    = "ready"
-	b2SourceNotReady = "notready"
-	b2SourceMissing  = "missing"
-	b2SourceError    = "error"
+	b2SourceReady      = "ready"
+	b2SourceNotReady   = "notready"
+	b2SourceMissing    = "missing"
+	b2SourceCRDMissing = "crdmissing"
+	b2SourceError      = "error"
 )
 
 // resolveCheckpointSource reads the checkpoint's VolumeSnapshot and
-// classifies it (ready / notready / missing / error). It is a method on the
-// reconciler so the specs can drive it (the snapshot CRD seam: a cluster
-// without the CRD gets "missing" — the operator must not read a type the
-// RESTMapper does not resolve; B1's I88 gate). When the CRD is absent
-// (snapshotCRDPresent=false), every source is reported as "missing" (the
-// operator cannot read a type the RESTMapper does not resolve; reading it
-// would wedge the manager's cache — the I88 gate, B1).
+// classifies it (ready / notready / missing / crdmissing / error). It is a
+// method on the reconciler so the specs can drive it (the snapshot CRD seam:
+// a cluster without the CRD gets "crdmissing" — the operator must not read a
+// type the RESTMapper does not resolve; B1's I88 gate). When the CRD is
+// absent (snapshotCRDPresent=false), every source is reported as
+// "crdmissing" (the operator cannot read a type the RESTMapper does not
+// resolve; reading it would wedge the manager's cache — the I88 gate, B1).
 func (r *LoopReconciler) resolveCheckpointSource(ctx context.Context, ns, loopName string, iteration int) (*unstructured.Unstructured, string) {
 	if !r.snapshotCRDPresentCall(ctx) {
-		return nil, b2SourceMissing
+		return nil, b2SourceCRDMissing
 	}
 	name := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: loopName}}, iteration)
 	snap := &unstructured.Unstructured{Object: map[string]any{unstructuredAPI: snapshotGV, unstructuredKind: volumeSnapshotKind}}
@@ -874,6 +880,22 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	return true, false, false, nil
 }
 
+// sourceMissingDecision renders the Restore condition's (reason, message)
+// for a source the operator could not resolve. A missing snapshot and an
+// absent VolumeSnapshot CRD have the same consequence (no restore), but a
+// different cause, and the message must name the cause that was actually
+// checked (F52 A1): on a cluster without the CRD the operator never looked
+// for a snapshot, so "it was never taken, or it was GC'd" would be a claim
+// it cannot make.
+func sourceMissingDecision(kind b2Kind, snapshot string, crdMissing bool) (string, string) {
+	if crdMissing {
+		return coxv1alpha1.RestoreReasonCRDMissing,
+			"checkpoint " + snapshot + " (" + string(kind) + ") cannot be read: the VolumeSnapshot CRD (snapshot.storage.k8s.io) is not installed, so this cluster holds no checkpoints; the restore is rejected"
+	}
+	return coxv1alpha1.RestoreReasonSourceMissing,
+		"checkpoint " + snapshot + " (" + string(kind) + ") does not exist (it was never taken, or it was GC'd); the restore is rejected"
+}
+
 func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool, bool, error) {
 	// A deleted Loop needs no workspace (the reviewer's P1, PR #154 follow-up):
 	// the restore step runs for a Loop with a deletionTimestamp, and the
@@ -1040,17 +1062,23 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 		r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceNotReady,
 			"checkpoint "+target.snapshot+" not ReadyToUse yet; restore deferred")
 		return true, true, true, nil
-	case b2SourceMissing:
+	case b2SourceMissing, b2SourceCRDMissing:
+		// The CRD-absent decision has the same consequences as a missing
+		// snapshot, but it must not carry the missing-snapshot REASON: on a
+		// cluster without the CRD the operator never looked for a snapshot,
+		// so "it was never taken, or it was GC'd" names a cause it did not
+		// check (F52 A1).
+		crdMissing := decision == b2SourceCRDMissing
 		switch target.kind {
 		case b2KindRollback, b2KindFork:
-			// TERMINAL: the explicit target is gone. The condition names it;
-			// NO requeue (the object will not come back — the source Loop's
-			// GC deleted it, or it was never taken).
-			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
-				"checkpoint "+target.snapshot+" ("+string(target.kind)+") does not exist (it was never taken, or it was GC'd); the restore is rejected")
+			// TERMINAL: the explicit target cannot be resolved. The
+			// condition names it; NO requeue (the object will not come back —
+			// the source Loop's GC deleted it, it was never taken, or the
+			// cluster cannot hold checkpoints at all).
+			reason, missingMsg := sourceMissingDecision(target.kind, target.snapshot, crdMissing)
+			setRestoreCondition(loop, false, reason, missingMsg)
 			persist()
-			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonSourceMissing,
-				"checkpoint "+target.snapshot+" does not exist; restore rejected")
+			r.emitRestoreEvent(loop, false, reason, missingMsg)
 			// The hold covers the REJECTED state (the reviewer's diagnosis 2,
 			// R-B2): a rejected fork is not seeded with an empty PVC by the
 			// bootstrap (phaseBootstrap -> ensureLoopArtifacts would create it
@@ -1073,6 +1101,8 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			lostMsg := "the workspace PVC was lost and checkpoint " + target.snapshot + " does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)"
 			if target.untrusted {
 				lostMsg = "the workspace PVC was lost and none of the status.checkpoints entries is a checkpoint of this Loop (wrong name, iteration or owner); fell back to the A2 PVC-resume (an EMPTY workspace, I90)"
+			} else if crdMissing {
+				lostMsg = "the workspace PVC was lost and checkpoint " + target.snapshot + " cannot be read: the VolumeSnapshot CRD (snapshot.storage.k8s.io) is not installed, so the cluster holds no checkpoints; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)"
 			}
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint, lostMsg)
 			// F48h: an A2 fallback that rebuilds the workspace EMPTY is the same

@@ -892,6 +892,112 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonSourceMissing)
 	})
 
+	// F52 A1: on a cluster with no VolumeSnapshot CRD the operator never
+	// looks for a snapshot, so the Restore condition must not claim it "was
+	// never taken, or was GC'd" — that names a cause the operator did not
+	// check. The CRD-absent decision has its own reason and message; the
+	// consequence (terminal reject, no PVC change) is the same.
+	It("ROLLBACK (no VolumeSnapshot CRD): the reject names the MISSING CRD (reason VolumeSnapshotCRDMissing), not a snapshot that was never taken or GC'd", func() {
+		ns := "b2-rollback-nocrd-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "rollback-nocrd"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, rec := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		b2Reconcile(r, ns, name)
+		_, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the bootstrap-created PVC is present")
+
+		// The CRD-absent cluster, driven through the existing seam (the same
+		// override the B1 no-CRD specs use): the operator must not read a type
+		// the RESTMapper does not resolve.
+		r.snapshotCRDPresent = func(context.Context) bool { return false }
+
+		rbLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, rbLoop)).To(Succeed())
+		rbLoop.Spec.RestoreFrom = "iter-1"
+		Expect(k8sClient.Update(ctx, rbLoop)).To(Succeed())
+
+		b2Reconcile(r, ns, name)
+
+		By("setting the Restore condition False reason VolumeSnapshotCRDMissing (the cause the operator actually checked)")
+		rejectedLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, rejectedLoop)).To(Succeed())
+		cond := b2RestoreCondition(rejectedLoop)
+		Expect(cond).NotTo(BeNil(), "the operator must set the Restore condition (the reject is VISIBLE)")
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonCRDMissing))
+
+		By("naming the missing CRD in the message and NOT the unchecked cause")
+		Expect(cond.Message).To(ContainSubstring("VolumeSnapshot CRD"))
+		Expect(cond.Message).NotTo(ContainSubstring("GC'd"),
+			"a cluster without the CRD never looked for a snapshot: the message must not claim it was GC'd or never taken")
+
+		By("emitting the CRD-missing Restore Event")
+		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonCRDMissing)
+
+		By("leaving the PVC as-is (the reject is terminal, the target cannot be resolved)")
+		_, err = b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the reject path does NOT delete the PVC")
+	})
+
+	// The sibling message: a LOST PVC with no CRD still takes the A2
+	// PVC-resume fallback (BestEffort carries on, D59), and its message names
+	// the missing CRD rather than claiming the checkpoint does not exist.
+	It("LOST PVC (no VolumeSnapshot CRD): the A2 fallback still runs and names the missing CRD", func() {
+		ns := "b2-lostpvc-nocrd-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		}()
+
+		name := "lostpvc-nocrd"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       b2LoopSpec(),
+		})).To(Succeed())
+
+		r, _ := b2NewReconcilerWithRecorder()
+		b2EnsureSandbox(ns, name)
+		// Drive one successful verify so the Loop records a checkpoint entry
+		// (the reactive target's last trusted entry).
+		b1DriveToSucceeded(ctx, r, ns, name)
+
+		// LOSE the PVC, and make the cluster one without the VolumeSnapshot
+		// CRD (the seam the B1 no-CRD specs use). The recorded entry is still
+		// the reactive target; the operator cannot read the snapshot at all.
+		pvc, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
+		b2RemovePVCProtectionFinalizer(ctx, ns, name)
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+		r.snapshotCRDPresent = func(context.Context) bool { return false }
+
+		b2Reconcile(r, ns, name)
+
+		By("recreating the workspace PVC EMPTY (the A2 fallback — D59 BestEffort carries on)")
+		fallback, err := b2GetPVC(ctx, ns, name)
+		Expect(err).NotTo(HaveOccurred(), "the operator must recreate the LOST PVC (the A2 fallback)")
+		Expect(fallback.Spec.DataSource).To(BeNil(), "the A2 fallback recreates the PVC EMPTY")
+
+		By("naming the missing CRD in the NoUsableCheckpoint message, not a snapshot cause it never checked")
+		gotLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, gotLoop)).To(Succeed())
+		cond := b2RestoreCondition(gotLoop)
+		Expect(cond).NotTo(BeNil(), "the A2 fallback is VISIBLE (I90)")
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
+		Expect(cond.Message).To(ContainSubstring("VolumeSnapshot CRD"))
+		Expect(cond.Message).NotTo(ContainSubstring("GC'd"))
+	})
+
 	It("ROLLBACK (not-ReadyToUse): a NOT-READY checkpoint (status.readyToUse != true) is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; a WorkspaceRestoreUnavailable Event; no PVC is touched — the in-progress state, no decision, I49)", func() {
 		ns := "b2-rollback-notready-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())

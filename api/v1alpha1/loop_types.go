@@ -1458,6 +1458,14 @@ const (
 	// not exist (the checkpoint was GC'd, or the name/iter is unknown).
 	// Terminal: the operator does not retry (the object is gone).
 	RestoreReasonSourceMissing = "RestoreSourceMissing"
+	// RestoreReasonCRDMissing: the named checkpoint cannot be resolved
+	// because the VolumeSnapshot CRD (snapshot.storage.k8s.io) is not
+	// installed on this cluster — so no checkpoint exists to be missing.
+	// Terminal, like RestoreSourceMissing, but its own reason: the message
+	// must not claim the snapshot "was never taken or was GC'd" when the
+	// operator never looked for one (F52 A1). The value is the reason the
+	// CheckpointsAvailable condition already uses for the same cause.
+	RestoreReasonCRDMissing = "VolumeSnapshotCRDMissing"
 	// RestoreReasonSourceNotReady: the named checkpoint's VolumeSnapshot
 	// exists but is not ReadyToUse yet (the snapshot-controller has not
 	// finished). NOT terminal: the operator defers the restore and retries

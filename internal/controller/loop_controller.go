@@ -1845,30 +1845,25 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 
 	// P5a (D66): the memory PVC decision (bound vs unbound) is computed BEFORE
 	// the CreateOrUpdate (the mutate func may run twice and must not emit the
-	// Event or write the annotation twice). The one-shot Event + annotation
-	// (R26 I90: a fallback must surface its failure, visible not silent) run
-	// here, once per reconcile, OUTSIDE the mutate func.
+	// Event or write the marker twice). The quiet-window Event (R26 I90: a
+	// fallback must surface its failure, visible not silent) runs here, once per
+	// reconcile, OUTSIDE the mutate func.
+	//
+	// R39 I144: the surface is no longer one-shot. It goes through the shared
+	// quiet-window marker (loop_quiet_marker.go), so a PVC that stays unbound
+	// keeps re-announcing once per memoryPVCUnboundQuiet instead of going silent
+	// when its Event expires at --event-ttl. Nothing to do when the PVC becomes
+	// Bound: the surface simply stops being called, and a later unbound window
+	// announces again once the window has passed.
 	memoryBound, memErr := r.memoryPVCBound(ctx, loop)
 	if memErr != nil {
 		return false, memErr
 	}
-	if memoryBound && memoryPVCName(loop) != "" {
-		// The PVC is Bound: clear the one-shot unbound marker (a future
-		// unbound transition re-emits the Event).
-		if r.clearMemoryPVCUnboundNotified(ctx, loop) {
-			loopUpdated = true
-		}
-	} else if memoryPVCName(loop) != "" {
+	if !memoryBound && memoryPVCName(loop) != "" {
 		// A PVC exists but is not Bound: the visible degradation (the Loop
 		// runs without memory; a repo-less Loop has no PVC at all and is
-		// "no memory", not a degradation — no Event there). The Event is
-		// emitted at most once per Loop (the operator-owned annotation makes
-		// it a one-shot transition signal, not a per-reconcile noise source).
-		r.emitMemoryPVCUnboundEvent(loop, memoryPVCName(loop))
-		if merr := r.markMemoryPVCUnboundNotified(ctx, loop); merr != nil {
-			return false, merr
-		}
-		loopUpdated = true
+		// "no memory", not a degradation — no Event there).
+		r.surfaceMemoryPVCUnbound(ctx, loop, memoryPVCName(loop))
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {

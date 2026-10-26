@@ -1072,7 +1072,8 @@ const (
 	// failure would otherwise go silent when the Event expires.
 	sandboxEventsUnreadableReason = "SandboxEventsUnreadable"
 	// sandboxEventsUnreadableAnnotation is the operator-owned marker for that
-	// Event (the memoryPVCUnboundNotified pattern, re-armed as F48f §F3): its
+	// Event (the memoryPVCUnboundNotified pattern, which it also adopted in
+	// R39 I144 via the shared quiet-window helper): its
 	// VALUE is the last Event's time (RFC3339), so a read that keeps failing
 	// re-announces every sandboxEventsUnreadableQuiet and a read that recovers
 	// simply stops. A permanent failure must not go silent when the Event

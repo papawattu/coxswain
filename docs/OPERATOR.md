@@ -352,11 +352,14 @@ run without memory (no lessons seeded from prior Loops) while its new memory
 PVC binds. This is harmless: there are no prior lessons to seed yet, so the
 agent starts with an empty memory. Once the PVC binds (the `local-shared`
 class provisions it on the first request), subsequent Loops on the same repo
-read the accumulated lessons. A one-shot Warning Event `MemoryPVCUnbound`
-(listable via `kubectl get events`) flags the binding wait: the operator emits
-it at most once per Loop. It is recorded on the Loop with the
-`coxswain.io/memory-pvc-unbound-notified` annotation and is re-emitted only if
-that annotation is cleared while the PVC is still unbound.
+read the accumulated lessons. A Warning Event `MemoryPVCUnbound`
+(listable via `kubectl get events`) flags the binding wait. The Event is not
+a one-shot (R39 I144): while the PVC stays unbound it re-announces every
+5 minutes, because a single Event is invisible once the cluster's `--event-ttl`
+(default 1h) has passed — and a class without ReadWriteMany leaves the PVC
+unbound for far longer than that. The operator records the last Event's time
+on the Loop with the `coxswain.io/memory-pvc-unbound-notified` annotation, so
+it can tell a fresh degradation from one it has already announced.
 
 ### Memory PVC lifecycle and removal (I101)
 

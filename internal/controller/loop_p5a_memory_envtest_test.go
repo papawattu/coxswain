@@ -28,6 +28,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -36,6 +37,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -377,8 +379,80 @@ var _ = Describe("P5a memory PVC + copy-in (Phase 5, D66)", func() {
 
 			// The visible degradation: a MemoryPVCUnbound Event (R26 I90). The
 			// operator emits it via its Recorder (unit-covered by
-			// TestEmitMemoryPVCUnboundEvent); this spec asserts the decision
+			// TestSurfaceMemoryPVCUnbound); this spec asserts the decision
 			// (no copy-in, no memory volume) that the Event accompanies.
+		})
+
+		// R39 I144: the surface is no longer one-shot. An unbound PVC is the
+		// normal state for a class without ReadWriteMany, and it lasts longer
+		// than the cluster's --event-ttl (1h, the case UPGRADE.md names), so a
+		// single Event left the degradation with no surface at all. The marker
+		// is now a quiet window: the Event re-announces past
+		// memoryPVCUnboundQuiet for as long as the PVC stays unbound.
+		//
+		// Reconcile-driven on purpose (not the helper): this pins the CALL SITE,
+		// so deleting the surface there fails this spec, not just a unit test.
+		It("re-announces MemoryPVCUnbound past the quiet window while the PVC stays unbound", func() {
+			loop := p5aMakeLoop("p5a-i144", nsA, repoA)
+			Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, loop) }()
+
+			rec := record.NewFakeRecorder(64)
+			clock := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+			r := &LoopReconciler{
+				CNIProber: testCNIProber(),
+				Client:    k8sClient,
+				Scheme:    k8sClient.Scheme(),
+				Recorder:  rec,
+				now:       func() metav1.Time { return clock },
+			}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsA, Name: "p5a-i144"}}
+			reconcileOnce := func() {
+				_, err := r.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred(), "reconcile must not error")
+				// The bootstrap's option-B recycle deletes the Sandbox on a
+				// phase advance; recreate it so the next pass re-ensures the
+				// pod spec (the p5a two-pass pattern).
+				probe := &sandboxv1beta1.Sandbox{}
+				if apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: "p5a-i144-sandbox"}, probe)) {
+					Expect(k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "p5a-i144-sandbox", Namespace: nsA}})).To(Succeed())
+				}
+			}
+			drain := func() int {
+				n := 0
+				for {
+					select {
+					case e := <-rec.Events:
+						if strings.Contains(e, memoryPVCUnboundReason) {
+							n++
+						}
+					default:
+						return n
+					}
+				}
+			}
+
+			reconcileOnce()
+			Expect(drain()).To(Equal(1), "the first unbound pass emits one MemoryPVCUnbound Event")
+			// The marker is the Event's TIME (RFC3339), not a boolean: that is
+			// what makes the window possible.
+			got := &coxv1alpha1.Loop{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: nsA, Name: "p5a-i144"}, got)).To(Succeed())
+			marker := got.Annotations[memoryPVCUnboundNotifiedAnnotation]
+			_, err := time.Parse(time.RFC3339, marker)
+			Expect(err).NotTo(HaveOccurred(), "the marker must be the last Event's time (RFC3339), got %q", marker)
+
+			// Inside the window: silent (a per-reconcile Event would be noise).
+			clock = metav1.NewTime(clock.Add(memoryPVCUnboundQuiet / 2))
+			reconcileOnce()
+			Expect(drain()).To(Equal(0), "the surface must stay silent inside the quiet window")
+
+			// Past the window: re-announced. This is the assertion the one-shot
+			// marker made impossible, and it is what fails if the surface is
+			// removed from the call site or reverted to a one-shot.
+			clock = metav1.NewTime(clock.Add(memoryPVCUnboundQuiet))
+			reconcileOnce()
+			Expect(drain()).To(Equal(1), "past the quiet window the degradation must be re-announced")
 		})
 
 		It("a Bound PVC with the operator NOT writing it: the PVC is unchanged by a reconcile (no owner ref, no spec rewrite)", func() {

@@ -274,8 +274,9 @@ var _ = Describe("F48b: a sandbox pod whose volumes cannot be mounted", func() {
 			apiReader: forbidEventsReader{Client: k8sClient}, Recorder: rec}
 		r.now = clock.now
 		Expect(r.sandboxFailure(ctx, loop)).To(BeNil(), noFailure())
-		// markMemoryPVCUnboundNotified refreshes loop.ResourceVersion after its
-		// patch; without that the trailing Status().Update below is a 409.
+		// The quiet-window helper (loop_quiet_marker.go) refreshes
+		// loop.ResourceVersion after its patch; without that the trailing
+		// Status().Update below is a 409.
 		setCondition(loop, cov.SandboxNotStartingCondition, metav1.ConditionTrue, "SandboxNotStarting", "test")
 		Expect(r.finalizeLoopStatus(ctx, loop, true, true, false, false, "")).To(Succeed())
 		persisted := &cov.Loop{}

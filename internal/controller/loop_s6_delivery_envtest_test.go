@@ -447,7 +447,7 @@ var _ = Describe("S6: delivery (deliver Job) (envtest)", func() {
 		loop.Spec.Delivery = nil // drive to Succeeded first (see the comment above)
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
 
-		r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient}
 		s5aEnsureSandbox(ns, name)
 		loop = &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())

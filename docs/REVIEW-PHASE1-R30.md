@@ -86,7 +86,7 @@ was run.
   **Acceptance:** F32 merged with a spec in which a 101st lesson evicts the
   oldest. The next phase acceptance lists each D-item with its code citation.
 
-- [ ] **I105: specs that cannot fail, or that assert the bug**
+- [x] **I105: specs that cannot fail, or that assert the bug** (`dc628a5` (#210), `daf4cd6` (#214), `4869cb9` (#290), `2cd3040` (#294))
 
   **Where:** `.samples/review-tests/FINDINGS.md` (25 gate mutations judged).
 

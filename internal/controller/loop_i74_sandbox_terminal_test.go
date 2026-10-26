@@ -196,9 +196,9 @@ var _ = Describe("I74: the sandbox is stopped once the Loop is terminal (Succeed
 	// Sandbox does not exist (a transient gap after the S4 delete, before the
 	// next reconcile recreates it). The terminal-phase assertion is on the
 	// OperatingMode: the sandbox must NEVER be Running on a terminal phase
-	// (a Running-mode sandbox runs the one-shot runner on 'unknown desired-
-	// phase <Succeeded|Failed>' and crashloops). Suspended (or absent in the
-	// transient gap) is the stopped state.
+	// (before F52 C2 the one-shot runner crashlooped on 'unknown desired-
+	// phase <Succeeded|Failed>'; it idles now, and no phase is left for it to
+	// execute). Suspended (or absent in the transient gap) is the stopped state.
 	i74SandboxState := func(ns, name string) string {
 		sb := &sandboxv1beta1.Sandbox{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-sandbox"}, sb); err != nil {
@@ -212,11 +212,13 @@ var _ = Describe("I74: the sandbox is stopped once the Loop is terminal (Succeed
 
 	// i74SandboxStopped reports the sandbox is stopped on a terminal phase:
 	// either absent (transient gap after the S4 delete) or Suspended. It must
-	// NOT be Running (the crashloop).
+	// NOT be Running (that was the crashloop before F52 C2; the runner idles on
+	// an unexecutable desired phase now, and the stop is still required because
+	// no phase is left to execute).
 	i74SandboxStopped := func(ns, name string, detail string) {
 		state := i74SandboxState(ns, name)
 		Expect(state).ToNot(Equal(string(sandboxv1beta1.SandboxOperatingModeRunning)),
-			"I74: the sandbox must NOT be Running on a terminal phase (%s); got %q (a Running-mode sandbox would crashloop on the terminal desired-phase)", detail, state)
+			"I74: the sandbox must NOT be Running on a terminal phase (%s); got %q (a Running-mode sandbox has no phase to execute: before F52 C2 it crashlooped on the terminal desired-phase, and it idles now)", detail, state)
 	}
 
 	It("stops the sandbox on a Succeeded Loop (deleted on the phase advance, not recreated)", func() {

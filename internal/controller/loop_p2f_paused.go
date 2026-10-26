@@ -158,7 +158,8 @@ func (r *LoopReconciler) loopSandboxStopped(loop *coxv1alpha1.Loop) bool {
 // Suspended iff spec.suspend || phase==Paused || a terminal phase
 // (Succeeded, Failed). A budget- or stall-paused Loop has spec.suspend=false
 // — the gate still suspends it. A terminal Loop's sandbox is stopped (I74):
-// the one-shot runner would crashloop on the terminal desired-phase. The
+// before F52 C2 the one-shot runner crashlooped on the terminal desired-phase
+// and it idles on it now, but no phase is left for it to execute. The
 // deliver Job runs in its own pod (independent of the sandbox pod), so the
 // sandbox can be stopped once the Loop is terminal and delivery still works.
 // pauseBlocked (the item-F refusal) keeps the sandbox Running so the

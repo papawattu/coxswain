@@ -270,14 +270,14 @@ func TestReconcileRequeueAfterMemoryWindow(t *testing.T) {
 		{"neither", 0, 0, 0},
 	}
 	for _, tc := range cases {
-		got := r.reconcileRequeueAfter(true, false, false, false, false, tc.budgetRequeue, tc.memoryRequeue)
+		got := r.reconcileRequeueAfter(true, false, false, false, false, tc.budgetRequeue, tc.memoryRequeue, false)
 		if got.RequeueAfter != tc.want {
 			t.Errorf("%s: RequeueAfter = %v, want %v", tc.name, got.RequeueAfter, tc.want)
 		}
 	}
 	// The 5s work requeue still wins: pending work is more urgent than a
 	// reminder.
-	got := r.reconcileRequeueAfter(false, true, false, false, false, 0, 4*time.Minute)
+	got := r.reconcileRequeueAfter(false, true, false, false, false, 0, 4*time.Minute, false)
 	if got.RequeueAfter != 5*time.Second {
 		t.Errorf("pending work must keep the 5s requeue, got %v", got.RequeueAfter)
 	}

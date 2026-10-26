@@ -879,6 +879,39 @@ hold (`PolicyEnforced` condition, `internal/controller/loop_controller.go`).
 The `NetworkEnforced=False` hold has its own section above
 (`NetworkEnforced=False` with `--allow-unenforced-network`).
 
+**The engine hold with no KubeArmorPolicy CRD (F92).** On a cluster where
+the `KubeArmorPolicy` CRD is not installed and the operator runs **without**
+`--allow-unenforced`, every Loop is held `Suspended` by the D30 gate. Before
+F92 that hold was invisible: the reconcile returned the enforcer's error
+(`get KubeArmorPolicy …: KubeArmor CRD not installed (and --allow-unenforced
+is not set)`) before any status write, so a fresh Loop carried `status: {}` —
+no phase, no condition, no Event — and the only trace was the operator log.
+
+Now the Loop carries `PolicyEnforced=False` **with the missing CRD named in
+the message**, and one Warning `PolicyEnforcementUnavailable` Event fires on
+the transition (not per reconcile). The condition's **reason** is whatever the
+engine observation reports, and on a cluster with no KubeArmor-labelled node
+that is `NodeNotEnforcing` (the node-label fact is checked first), not
+`EngineUnavailable` — the CRD wording comes from the tolerated write error, so
+it is present in either case. `kubectl cox describe` shows the Loop at
+`Planning`, and — unlike the pre-F92 shape, where the pass returned before the
+bootstrap — its sandbox **is created and held `Suspended`** (the D30 gate sets
+the object's operating mode; it does not prevent the object), along with the
+workspace PVC. Both are visible on kind: `f92-kubearmor-sandbox  Suspended` and
+`persistentvolumeclaim/f92-kubearmor-workspace` waiting for its first consumer.
+The sandbox is held, not deleted, so nothing starts in it while the hold is on.
+
+**What to do:** install KubeArmor so the CRD **and** the enforcer agents are
+present (the supported configuration — see `docs/QUICKSTART.md` step 3), or
+set `--allow-unenforced` if you knowingly run the development escape hatch.
+Installing only the CRD is not enough: with no node carrying the BPF-LSM
+label the engine still reports `NodeNotEnforcing` and the hold continues.
+The Loop waits either way; it does not fail. While held for this cause the
+operator re-checks on a bounded window (one minute). A Loop still in the
+clone-pending stage takes the ordinary 5s work requeue first (that is the
+cadence a fresh Loop shows on kind), and a terminal Loop takes no window at all,
+so no restart is needed for the hold to clear once the cause does.
+
 **The model proxy hold (`ModelProxyNotReady`).** With
 `spec.agent.endpointSecretRef` set, the sandbox is held `Suspended` until the
 Loop's model proxy pod is Ready (`modelProxyHold` in

@@ -901,7 +901,8 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return res, nil
 	}
 
-	if err := r.applyEffectivePolicyAndConditions(ctx, &loop); err != nil {
+	kaptCRDMissing, err := r.applyEffectivePolicyAndConditions(ctx, &loop)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -912,7 +913,6 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// and the sandbox build reads the PVC by name, not spec, so a restored
 	// PVC is invisible to it). A completed restore is one-shot (the Restore
 	// condition True/Restored is the marker).
-	var err error
 	b2Changed, b2Requeue, b2Hold, err := r.b2ApplyRestoreStep(ctx, &loop)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -1080,7 +1080,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue), nil
+	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue, f92HeldRequeue(kaptCRDMissing, loop.Status.Phase)), nil
 }
 
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
@@ -1396,6 +1396,38 @@ func (r *LoopReconciler) emitNetworkEnforcedEvent(loop *coxv1alpha1.Loop, status
 // PolicyEnforcedCondition is the non-phase condition type recording whether the
 // eBPF engine is enforcing the Loop's policy (D30).
 const PolicyEnforcedCondition = "PolicyEnforced"
+
+// PolicyEnforcementUnavailableEventReason is the Warning Event reason for a
+// missing enforcement engine (F92): the KubeArmorPolicy CRD is not installed (or
+// the engine read failed), so the sandbox is held Suspended by the D30 gate. The
+// event is emitted on the PolicyEnforced transition, so a Loop that stays held
+// does not re-announce on every reconcile.
+const PolicyEnforcementUnavailableEventReason = "PolicyEnforcementUnavailable"
+
+// f92HeldRequeue reports whether the F92 re-check window applies: the write
+// path hit a MISSING KubeArmorPolicy CRD (kaptCRDMissing) and the Loop is not
+// terminal. A terminal Loop (Succeeded/Failed) is never held by the engine gate
+// — nothing runs without enforcement — so a Loop that finished on a cluster
+// whose CRD later goes missing must not reconcile every minute for the life of
+// the cluster (the rule #299's round 2 established for the memory window; the
+// isTerminalPhase guard in ensureMemoryPVC is the precedent). The guard lives
+// here rather than at the call site so Reconcile gains no branch (it is at its
+// gocyclo budget).
+func f92HeldRequeue(kaptCRDMissing bool, phase coxv1alpha1.LoopPhase) bool {
+	return kaptCRDMissing && !isTerminalPhase(phase)
+}
+
+// kaptCRDMissingRequeue is how long a Loop held because the KubeArmorPolicy CRD
+// is missing waits before the operator re-checks (F92 P2-2). The Loop owns
+// nothing that changes when KubeArmor is installed, so without this it could
+// stay held until an unrelated event; one minute re-checks quickly without a
+// reconcile hot loop. Two shapes do not take this window: a Loop still in the
+// clone-pending stage (the 5s work requeue fires first, and it is the one the
+// kind run shows), and a terminal Loop (f92HeldRequeue excludes it). It does not
+// by itself make the hold clear: that needs the CRD AND a node carrying the
+// BPF-LSM label (installing only the CRD still reports NodeNotEnforcing), or
+// --allow-unenforced.
+const kaptCRDMissingRequeue = time.Minute
 
 // PolicyTranslationLossyCondition is the Loop condition that reports a lossy
 // KubeArmor translation (I41): a host:PORT network allow that loses its port
@@ -5281,13 +5313,31 @@ func (r *LoopReconciler) enforcementApply(ctx context.Context, loop *coxv1alpha1
 	return r.Enforcer.Apply(ctx, loop, effective)
 }
 
+// priorPolicyEnforced is the PolicyEnforced condition's current status and
+// reason ("" when the condition is absent). It backs the F92 transition gate:
+// the EngineUnavailable Warning Event fires when the observation CHANGES, not
+// on every reconcile of a Loop that stays held.
+func priorPolicyEnforced(loop *coxv1alpha1.Loop) (metav1.ConditionStatus, string) {
+	for i := range loop.Status.Conditions {
+		c := &loop.Status.Conditions[i]
+		if c.Type == string(PolicyEnforcedCondition) {
+			return c.Status, c.Reason
+		}
+	}
+	return "", ""
+}
+
 // applyEffectivePolicyAndConditions (C6b+I41+D30) resolves the effective
 // policy, applies it through the Enforcer, records the hash, and sets the
 // PolicyTranslationLossy and PolicyEnforced conditions.
-func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, loop *coxv1alpha1.Loop) error {
+// applyEffectivePolicyAndConditions returns kaptCRDMissing: the write path hit a
+// MISSING KubeArmorPolicy CRD and the error was tolerated (F92). The caller turns
+// that into a bounded requeue, so the Loop recovers on its own once KubeArmor is
+// installed instead of waiting for an unrelated event (F92 P2-2).
+func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	effective, err := r.effectivePolicy(ctx, loop)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// fix/watch-kubearmorpolicy (owner D55 2026-10-12): the Kapt spec-hash
 	// gate must be ORDER-INDEPENDENT (read-before-write), like the C6b and
@@ -5304,9 +5354,31 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	// Captured unconditionally (before the Enforcer nil check) so the
 	// PolicyEnforced condition always reflects the pre-Apply observation.
 	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
+	// F92: set when the write path hit a MISSING KubeArmorPolicy CRD. The
+	// enforcer's own Enforcing() observation can report a different reason for
+	// the same cluster (e.g. NodeNotEnforcing first, when the nodes carry no
+	// BPF-LSM label), so the tolerated write error is the only place that knows
+	// the CRD is absent; the condition message names it.
+	kaptCRDMissing := false
 	if r.Enforcer != nil {
 		if err := r.applyEnforcementWrites(ctx, loop, effective); err != nil {
-			return err
+			// F92: a MISSING KubeArmorPolicy CRD is a permanent cluster fact,
+			// not a transient write failure. Returning it here (as the code
+			// used to) aborted Reconcile at the top-level call before ANY
+			// status write: a fresh Loop kept status: {} — no phase, no
+			// condition, no Event — for ever, and the failure was visible only
+			// in the operator log (AGENTS R26 I90: a fallback must surface its
+			// failure). Tolerate exactly that shape and fall through: the
+			// condition half below records PolicyEnforced=False /
+			// EngineUnavailable, the D30 gate holds the sandbox Suspended, and
+			// the status is persisted by the caller. Every other error
+			// (Forbidden, an API blip) still returns and retries.
+			if !meta.IsNoMatchError(err) {
+				return false, err
+			}
+			logf.FromContext(ctx).Info("The KubeArmorPolicy CRD is not installed; the sandbox will be held Suspended (D30 fail-closed)",
+				"loop", loop.Name)
+			kaptCRDMissing = true
 		}
 	}
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
@@ -5325,6 +5397,10 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		// observed reason (the Enforcer's own, or EnforcementUnverified) is
 		// kept; the escape hatch, when set, is named as the reason the Loop
 		// runs despite the observation.
+		// F92: the previous observation, so the EngineUnavailable Warning Event
+		// fires on the transition only (a Loop held Suspended re-reconciles on the
+		// requeue cadence; one Event per transition, not per pass).
+		prevStatus, prevReason := priorPolicyEnforced(loop)
 		var msg string
 		switch rs {
 		case engine.ReasonEnforcementUnverified:
@@ -5340,12 +5416,22 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 				msg = "engine installed, no enforcement probe yet (I32); the Loop runs only because --allow-unenforced is set (dev escape hatch)"
 			}
 		case engine.ReasonEngineUnavailable:
-			msg = "no engine (Enforcer not installed); sandbox held Suspended (D30 fail-closed)"
+			// F92: name the real cause. "Enforcer not installed" was the wrong
+			// half: the engine IS wired, but the KubeArmorPolicy CRD (or the
+			// engine read) is not there — what a plain `make deploy` on a
+			// cluster without KubeArmor produces.
+			msg = "the KubeArmorPolicy CRD is not installed (or the engine read failed); the sandbox is held Suspended (D30 fail-closed); install KubeArmor or set --allow-unenforced"
 		default:
 			msg = "engine not enforcing the Loop policy (" + rs + "); sandbox held Suspended (D30 fail-closed)"
 		}
 		if r.AllowUnenforced && rs != engine.ReasonEnforcementUnverified {
 			msg += "; the Loop runs because --allow-unenforced is set (dev escape hatch)"
+		}
+		// F92: name the missing CRD whenever the write path saw it, whatever
+		// reason the Enforcing() observation reported (the EngineUnavailable
+		// message above already names it).
+		if kaptCRDMissing && rs != engine.ReasonEngineUnavailable {
+			msg += " (the KubeArmorPolicy CRD is not installed)"
 		}
 		status := metav1.ConditionFalse
 		// I46: an unverified engine (no probe) is Unknown — it asserts nothing
@@ -5355,6 +5441,17 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			status = metav1.ConditionUnknown
 		}
 		setCondition(loop, string(PolicyEnforcedCondition), status, rs, msg)
+		// F92: surface a missing engine on the OBJECT, not only in the log. A
+		// missing KubeArmorPolicy CRD without --allow-unenforced leaves the
+		// sandbox held Suspended and the Loop otherwise idle; without this Event
+		// the only trace was the operator's log (R26 I90). Gated on the
+		// transition (the previous observation differed), so a Loop that stays in
+		// this state does not re-emit on every pass.
+		if (rs == engine.ReasonEngineUnavailable || kaptCRDMissing) && (prevStatus != status || prevReason != rs) {
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, PolicyEnforcementUnavailableEventReason, "%s", msg)
+			}
+		}
 	}
 	// D38: the NetworkEnforced condition (network layer, analogous to
 	// PolicyEnforced). The escape hatch is AllowUnenforcedNetwork (separate
@@ -5366,7 +5463,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)
 		}
 	}
-	return nil
+	return kaptCRDMissing, nil
 }
 
 // applyEffectivePolicyAndConditionsBestEffort is the DELETING-path variant of
@@ -5436,7 +5533,9 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context
 				msg = "engine installed, no enforcement probe yet (I32); the Loop runs only because --allow-unenforced is set (dev escape hatch)"
 			}
 		case engine.ReasonEngineUnavailable:
-			msg = "no engine (Enforcer not installed); sandbox held Suspended (D30 fail-closed)"
+			// F92: same wording as the live path — the engine is wired, the
+			// KubeArmorPolicy CRD (or the engine read) is what is missing.
+			msg = "the KubeArmorPolicy CRD is not installed (or the engine read failed); the sandbox is held Suspended (D30 fail-closed); install KubeArmor or set --allow-unenforced"
 		default:
 			msg = "engine not enforcing the Loop policy (" + rs + "); sandbox held Suspended (D30 fail-closed)"
 		}
@@ -6482,12 +6581,25 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 
 // reconcileRequeueAfter is the trailing requeue decision, extracted to keep
 // Reconcile within the gocyclo budget. The wall-clock RequeueAfters this
-// reconcile can set: the 5s work requeue below, the P2d budget window, and the
-// R39 I144 memory-PVC re-announce window (the earlier window wins, so the
-// Event's re-announce is never waiting on a longer budget timer).
-func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration) ctrl.Result {
+// reconcile can set: the 5s work requeue below, the P2d budget window, the
+// R39 I144 memory-PVC re-announce window (the earlier of those two wins, so the
+// Event's re-announce is never waiting on a longer budget timer), and the F92
+// CRD-missing window. The F92 branch returns BEFORE that earlier-of comparison
+// because its window is the shortest by construction (kaptCRDMissingRequeue is
+// one minute; the budget and memory windows are longer), so taking it first is
+// the same as taking the earliest. Its argument is the caller's f92HeldRequeue
+// decision, which excludes a terminal Loop.
+func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration, kaptCRDMissing bool) ctrl.Result {
 	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+	// F92 P2-2: a Loop held because the KubeArmorPolicy CRD is missing is
+	// otherwise idle (its spec does not change and nothing it references
+	// changes when KubeArmor is installed), so it would stay held until some
+	// unrelated event. Requeue on a bounded window: installing KubeArmor (or
+	// restarting the operator) is then picked up within it.
+	if kaptCRDMissing {
+		return ctrl.Result{RequeueAfter: kaptCRDMissingRequeue}
 	}
 	if memoryRequeue > 0 && (budgetRequeue == 0 || memoryRequeue < budgetRequeue) {
 		return ctrl.Result{RequeueAfter: memoryRequeue}

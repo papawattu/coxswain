@@ -164,6 +164,50 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 			"D30 holds the Loop, it never fails it")
 	})
 
+	It("S3: the CRD is named on the object even when Enforcing() reports a different reason (the kind-coxswain shape)", func() {
+		// On a cluster whose nodes carry no BPF-LSM label, Enforcing() returns
+		// NodeNotEnforcing — it never reaches the CRD read. The tolerated write
+		// error is then the only place that knows the CRD is absent, so the
+		// condition message must name it and the Event must still fire (that is
+		// the shape the kind run hits; S1 alone would not cover it).
+		ns := f92Ns("f92-nodelabel")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		recorder := record.NewFakeRecorder(64)
+		r := &LoopReconciler{
+			CNIProber:       testCNIProber(),
+			Client:          k8sClient,
+			Scheme:          k8sClient.Scheme(),
+			apiReader:       k8sClient,
+			Recorder:        recorder,
+			Enforcer:        &fakeEnforcer{enforcing: false, reason: engine.ReasonNodeNotEnforcing},
+			AllowUnenforced: false,
+			ApplyEnforcementWritesFn: func(_ context.Context, _ *coxv1alpha1.Loop, _ policy.EffectivePolicy) error {
+				return f92NoMatch()
+			},
+		}
+
+		name := "l3"
+		Expect(k8sClient.Create(ctx, f92Loop(ns, name))).To(Succeed())
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+
+		cond := policyEnforcedCondition(f92Get(ns, name).Status.Conditions)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(engine.ReasonNodeNotEnforcing),
+			"the observation reason is kept (a missing label is not rewritten as a missing CRD)")
+		Expect(cond.Message).To(ContainSubstring("KubeArmorPolicy CRD is not installed"),
+			"the message must name the real cause the write path saw")
+
+		var events []string
+		for _, e := range f92Drain(recorder) {
+			if strings.Contains(e, PolicyEnforcementUnavailableEventReason) {
+				events = append(events, e)
+			}
+		}
+		Expect(events).To(HaveLen(1), "the CRD-absent shape is surfaced once, got %v", events)
+	})
+
 	It("S2: every OTHER enforcement write error still returns and retries (the tolerance is exactly the CRD-absent shape)", func() {
 		ns := f92Ns("f92-forbidden")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

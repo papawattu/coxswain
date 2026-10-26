@@ -5325,6 +5325,12 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	// Captured unconditionally (before the Enforcer nil check) so the
 	// PolicyEnforced condition always reflects the pre-Apply observation.
 	preApplyEnf, preApplyRs := r.enforcementStatus(ctx, loop)
+	// F92: set when the write path hit a MISSING KubeArmorPolicy CRD. The
+	// enforcer's own Enforcing() observation can report a different reason for
+	// the same cluster (e.g. NodeNotEnforcing first, when the nodes carry no
+	// BPF-LSM label), so the tolerated write error is the only place that knows
+	// the CRD is absent; the condition message names it.
+	kaptCRDMissing := false
 	if r.Enforcer != nil {
 		if err := r.applyEnforcementWrites(ctx, loop, effective); err != nil {
 			// F92: a MISSING KubeArmorPolicy CRD is a permanent cluster fact,
@@ -5343,6 +5349,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			}
 			logf.FromContext(ctx).Info("The KubeArmorPolicy CRD is not installed; the sandbox will be held Suspended (D30 fail-closed)",
 				"loop", loop.Name)
+			kaptCRDMissing = true
 		}
 	}
 	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
@@ -5391,6 +5398,12 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		if r.AllowUnenforced && rs != engine.ReasonEnforcementUnverified {
 			msg += "; the Loop runs because --allow-unenforced is set (dev escape hatch)"
 		}
+		// F92: name the missing CRD whenever the write path saw it, whatever
+		// reason the Enforcing() observation reported (the EngineUnavailable
+		// message above already names it).
+		if kaptCRDMissing && rs != engine.ReasonEngineUnavailable {
+			msg += " (the KubeArmorPolicy CRD is not installed)"
+		}
 		status := metav1.ConditionFalse
 		// I46: an unverified engine (no probe) is Unknown — it asserts nothing
 		// about the cluster — regardless of the flag (the flag is named in the
@@ -5405,7 +5418,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 		// the only trace was the operator's log (R26 I90). Gated on the
 		// transition (the previous observation differed), so a Loop that stays in
 		// this state does not re-emit on every pass.
-		if rs == engine.ReasonEngineUnavailable && (prevStatus != status || prevReason != rs) {
+		if (rs == engine.ReasonEngineUnavailable || kaptCRDMissing) && (prevStatus != status || prevReason != rs) {
 			if r.Recorder != nil {
 				r.Recorder.Eventf(loop, corev1.EventTypeWarning, PolicyEnforcementUnavailableEventReason, "%s", msg)
 			}

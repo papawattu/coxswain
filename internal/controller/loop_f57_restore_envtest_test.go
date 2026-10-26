@@ -250,6 +250,22 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		Expect(err).NotTo(HaveOccurred())
 		Expect(snap.GetLabels()).NotTo(HaveKey(forkSnapshotLabelKey),
 			"the label must not outlive the fork: the source's GC would skip the snapshot for ever")
+
+		// And a SECOND deleting pass writes nothing: the deletion guard runs on
+		// every pass while the Loop's finalizers are still being removed, and
+		// removeForkRetentionLabel must not re-patch a snapshot whose label is
+		// already gone (a read-only no-op, the same way the mark skips an
+		// already-set label).
+		rv := snap.GetResourceVersion()
+		counter, _ := b2NewReconcilerWithRecorder()
+		counting := &f57RestoreClient{Client: k8sClient}
+		counter.Client = counting
+		_, _, _, err = counter.b2ApplyRestoreStep(ctx, gone)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(counting.snapPatches).To(Equal(0), "the second deleting pass must not write the snapshot again")
+		snap, err = b2GetSnapshot(ctx, ns, srcSnap)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(snap.GetResourceVersion()).To(Equal(rv), "no write reached the snapshot")
 	})
 })
 

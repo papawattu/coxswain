@@ -217,6 +217,12 @@ existing Loops are unaffected, but new ones are.
 
 ## Other changes
 
+### F52 (restore P3s): a restore with no VolumeSnapshot CRD gets its own reason, and `CheckpointsAvailable` is rewritten only when it changes — #302
+
+- **What was wrong.** On a cluster without the VolumeSnapshot CRD, a restore or rollback was reported with the missing-snapshot reason: the terminal message said the checkpoint "does not exist (it was never taken, or it was GC'd)" — a cause that never applied on a cluster that cannot hold checkpoints at all (F52 A1). And the `CheckpointsAvailable` condition step hard-coded `changed` true, so every steady-state reconcile wrote the condition even when nothing had changed (F52 A2).
+- **What changed.** A restore or rollback when the VolumeSnapshot CRD is not installed now reports the new `VolumeSnapshotCRDMissing` reason (the value the `CheckpointsAvailable` condition already used for this cause, so one vocabulary) instead of a missing-snapshot reason; the reject stays terminal (no requeue), and the reason is named in `cox fork --help`, `docs/FAQ.md` and `docs/QUICKSTART.md` (F52 A1, PR #302). The `CheckpointsAvailable` status is now rewritten only when the condition actually changed (PR #302).
+- **On upgrade.** Nothing required; the new reason is a constant in the operator (no CRD change) (PR #302).
+
 ### F48b: a sandbox pod stuck on a volume it can't mount now fails the Loop instead of waiting forever — #266
 
 - **What was wrong.** A sandbox pod stuck on a volume it can't mount (for example a missing Secret, reported as FailedMount) waited forever: the F48 surface showed `SandboxNotStarting` but never failed the Loop (F48b), and the sandbox infra-retry bound itself never tripped — the operator's own Sandbox recreate reset the count (F48b).

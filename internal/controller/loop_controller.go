@@ -834,12 +834,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// condition + the Event + the restored PVC are written at the point of
 	// the decision — the PVC is controller-owned, so a restored PVC is
 	// garbage-collected with the Loop, and the condition is the durable
-	// record the user asked for the restore to have). For a fork
-	// (spec.forkOf) the same applies: a fork being deleted before its
-	// restore completes gets a Restore decision (RestoreSourceMissing —
-	// the snapshot is gone with the source, or the restore is attempted
-	// once) rather than a silent disappearance. The CleaningUp work (the
-	// snapshot GC + the finalizer removal) still runs below, unchanged.
+	// record the user asked for the restore to have). No restore is APPLIED
+	// to a deleting object, though: the B2 restore step returns immediately
+	// on a deletionTimestamp (b2ApplyRestoreStep's first guard), so a fork
+	// deleted before its restore completes is NOT restored and takes no new
+	// Restore decision — the decision it leaves behind is "no restore
+	// applies" (a Restore condition written by an earlier live pass is the
+	// record that persists). The CleaningUp work (the snapshot GC + the
+	// finalizer removal) still runs below, unchanged.
 	b2Deleting := !loop.DeletionTimestamp.IsZero()
 	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
 	// on the first reconcile; idempotent). It is what keeps the Loop alive
@@ -854,12 +856,14 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// condition + the Event + the restored PVC are written at the point of
 	// the decision — the PVC is controller-owned, so a restored PVC is
 	// garbage-collected with the Loop, and the condition is the durable
-	// record the user asked for the restore to have). For a fork
-	// (spec.forkOf) the same applies: a fork being deleted before its
-	// restore completes gets a Restore decision (RestoreSourceMissing —
-	// the snapshot is gone with the source, or the restore is attempted
-	// once) rather than a silent disappearance. The CleaningUp work (the
-	// snapshot GC + the finalizer removal) still runs below, unchanged.
+	// record the user asked for the restore to have). No restore is APPLIED
+	// to a deleting object, though: the B2 restore step returns immediately
+	// on a deletionTimestamp (b2ApplyRestoreStep's first guard), so a fork
+	// deleted before its restore completes is NOT restored and takes no new
+	// Restore decision — the decision it leaves behind is "no restore
+	// applies" (a Restore condition written by an earlier live pass is the
+	// record that persists). The CleaningUp work (the snapshot GC + the
+	// finalizer removal) still runs below, unchanged.
 	if b2Deleting {
 		// B2 (PLAN-BETA, PLAN.md Phase 3 part 2): the B2-deleting early return
 		// (validate + the policy gate + the B2 restore decision + the

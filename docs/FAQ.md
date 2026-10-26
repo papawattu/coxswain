@@ -53,7 +53,8 @@ acceptance checks) and `--goal` (replaces the goal); without those flags the
 fork inherits them. The source's checkpoint for that iteration must exist and
 be ReadyToUse; the operator defers the restore while the snapshot is not ready
 (`RestoreSourceNotReady`) and rejects the fork when it is absent
-(`RestoreSourceMissing`).
+(`RestoreSourceMissing`) — or when the cluster has no VolumeSnapshot CRD at
+all (`VolumeSnapshotCRDMissing`), where no checkpoint can exist to be absent.
 
 See: [QUICKSTART.md#7-forking-a-loop](QUICKSTART.md#7-forking-a-loop)
 

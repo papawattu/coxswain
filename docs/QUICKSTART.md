@@ -344,7 +344,9 @@ flag (when given) replaces the fork's goal (`spec.goal`); a fork WITHOUT
   source's `status.checkpoints`) and be ReadyToUse. Not ready: the Restore
   condition is `False` (reason `RestoreSourceNotReady`) and the operator
   retries. Absent: the Restore condition is `False` (reason
-  `RestoreSourceMissing`) and the fork is terminal.
+  `RestoreSourceMissing`) and the fork is terminal. On a cluster without the
+  VolumeSnapshot CRD the reason is `VolumeSnapshotCRDMissing` (no checkpoint
+  can exist there), with the same terminal outcome.
 
 ## 8. Model timeout and tuning
 

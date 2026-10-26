@@ -367,6 +367,20 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		Expect(cond.Message).To(ContainSubstring("900"))
 	})
 
+	It("decides an infra failure for a deadline-killed Job with NO pod at all (the pod is GC'd or evicted first)", func() {
+		// The deadline decision is read from the Job's own terminal condition, so
+		// it does not need the pod, and it must not depend on the caller also
+		// setting jobFailed (both come from the same JobFailed condition, but the
+		// decision should stand on its own).
+		outcome, requeue, _, _ := verifyOutcome(nil, 1, false, true)
+		Expect(outcome).To(Equal(verifyInfraFailed))
+		Expect(requeue).To(BeFalse())
+		// Control: no pod and no Job failure is still no decision.
+		outcome, requeue, _, _ = verifyOutcome(nil, 1, false, false)
+		Expect(outcome).To(Equal(verifyNoDecision))
+		Expect(requeue).To(BeTrue())
+	})
+
 	It("does NOT decide when the Job failed for another reason and the pod is still starting (the I49 control)", func() {
 		ns := f53Ns("f53-control")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

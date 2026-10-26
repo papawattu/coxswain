@@ -1179,6 +1179,15 @@ const (
 // (F53) is an infra failure too, decided BEFORE the per-init walk and whatever
 // the init statuses still say.
 func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExceeded bool) (int, bool, string, int32) {
+	// F53: a Job the batch controller already failed on its deadline can never
+	// produce evidence, whatever stale Waiting/Running state the pod read still
+	// shows (the read can race the kill), and even when the pod is already gone.
+	// This is not an I49 violation — the Job's own terminal condition is the fact
+	// that it is not in progress. It sits above the pod==nil branch so the
+	// decision does not depend on the caller also reporting jobFailed.
+	if deadlineExceeded {
+		return verifyInfraFailed, false, "", 0
+	}
 	if pod == nil {
 		// No pod at all: no decision yet unless the Job itself is Failed
 		// (a failed Job whose pod is gone — evicted, garbage-collected — is
@@ -1187,13 +1196,6 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 			return verifyInfraFailed, false, "", 0
 		}
 		return verifyNoDecision, true, "", 0
-	}
-	// F53: a Job the batch controller already failed on its deadline can never
-	// produce evidence, whatever stale Waiting/Running state the pod read still
-	// shows (the read can race the kill). This is not an I49 violation — the
-	// Job's own terminal condition is the fact that it is not in progress.
-	if deadlineExceeded {
-		return verifyInfraFailed, false, "", 0
 	}
 	// I65: the trusted inits (clone-base, import-agent) run BEFORE the evidence
 	// inits. A terminated non-zero trusted init is an infra failure naming the

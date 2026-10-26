@@ -264,7 +264,7 @@ existing Loops are unaffected, but new ones are.
 ### F56: make deploy passes the four component-image args, and a missing runner is visible — #311
 
 - **What was wrong.** `make deploy` passed none of the four component-image args, so a deployed Loop ran the operator's `sleep infinity` stand-in (it looked Running and never advanced) and the three proxy pods pulled `…:standin`/`…:metering` tags that were never pushed; nothing on the object said so (no condition, no Event) (`64f4902` = PR #311, F56).
-- **What changed.** Every production render (`make deploy`, `dist/install.yaml`, the Helm chart) now derives the runner and the three proxy images from `IMG` — same registry+path prefix as the manager image, `coxswain-<component>`, IMG's tag — so a registry-port IMG such as `localhost:5000/coxswain-controller:v1` works; an untagged or digest `IMG` is refused with a message. A Loop whose runner image is unset (neither `--runner-image` nor `spec.agent.image`) now shows `RunnerAvailable=False/RunnerImageUnset` and one `RunnerUnavailable` Warning Event per observed transition into that shape (a pinned `spec.agent.image` shows `True/AgentImagePinned` — the documented debugging opt-out, not a degradation); surfacing only, the Loop is never failed or terminalised. `docs/TROUBLESHOOTING.md` gains a `RunnerAvailable=False` entry (F56).
+- **What changed.** The two kustomize renders (`make deploy`, `dist/install.yaml`) now derive the runner and the three proxy images from `IMG` — same registry+path prefix as the manager image, `coxswain-<component>`, IMG's tag — so a registry-port IMG such as `localhost:5000/coxswain-controller:v1` works; an untagged or digest `IMG` is refused with a message. The Helm chart ships the four args as `:placeholder` defaults whose tag the release workflow stamps; a chart user on another registry overrides `manager.args`. A Loop whose runner image is unset (neither `--runner-image` nor `spec.agent.image`) now shows `RunnerAvailable=False/RunnerImageUnset` and one `RunnerUnavailable` Warning Event per observed transition into that shape (a pinned `spec.agent.image` shows `True/AgentImagePinned` — the documented debugging opt-out, not a degradation); surfacing only, the Loop is never failed or terminalised. `docs/TROUBLESHOOTING.md` gains a `RunnerAvailable=False` entry (F56).
 - **On upgrade.** `config/dev` keeps its documented stand-ins: it sets `--runner-image=coxswain-runner:dev` itself and leaves the three proxy args unset, so the operator's built-in names apply (`coxswain-proxy:metering`, `coxswain-tool-proxy:standin`, `coxswain-egress-proxy:standin`). Otherwise pick up the new operator image and re-deploy (PR #311).
 
 ### F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, not only in the log — #308
@@ -772,10 +772,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   no-pin delivery branch have no automated tests.
 - **F51**: the network-fence check reads an unresolvable address as
   "reached"; a missing checker leaves the gate open.
-- **F53**: the verify step's code folder is writable by the agent's own code
-  between checks, and the verify step has no time limit.
-- **F56**: a standard deployment ships no runner image and unpullable proxy
-  images, so the agent quietly runs "do nothing".
 - **F62**: the "agent action blocked" counter and alert are never written,
   so blocks are invisible.
 - **F64**: the port-enforcement guarantee has no automated proof (the specs
@@ -819,7 +815,7 @@ closed by the PRs named beside them. In plain words, the items still open:
 - **F81**: an envtest spec is flaky: a hard-coded ClusterIP it depends on is
   not a stable address across apiservers, so the run intermittently fails.
 
-- **F50/F57/F52**: small and low items — shipped samples pointing at repo
+- **F50/F52**: small and low items — shipped samples pointing at repo
   contents they test, a checkpoint-recovery edge case, and a bundle of misc
   items (a failed delivery counted "in flight" forever, the CLI approval
   command writing status with no conflict retry, and more). (F45 closed by

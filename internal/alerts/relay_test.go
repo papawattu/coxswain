@@ -98,6 +98,48 @@ func (d *fixedDiscoverer) setPeers(peers ...Peer) {
 	d.peers = peers
 }
 
+// setError makes the next passes return a partial list plus an error (the shape
+// PodDiscoverer returns when one source's List fails: R1).
+func (d *fixedDiscoverer) setError(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.err = err
+}
+
+// blockingSource feeds one batch per attach and then holds the stream open until
+// the ctx is done. Each attach is therefore visible as exactly one Follow call:
+// a follower that was pruned and restarted shows up as a second attach (and, with
+// since = nil, re-reads its batch), while an untouched follower does not.
+type blockingSource struct {
+	mu      sync.Mutex
+	follows int
+	batch   []string
+}
+
+func (s *blockingSource) Follow(ctx context.Context, _, _, _ string, _ *time.Time) (io.ReadCloser, error) {
+	s.mu.Lock()
+	s.follows++
+	batch := append([]string{}, s.batch...)
+	s.mu.Unlock()
+	pr, pw := io.Pipe()
+	go func() {
+		for _, line := range batch {
+			if _, err := pw.Write([]byte(line + "\n")); err != nil {
+				return
+			}
+		}
+		<-ctx.Done()
+		_ = pw.CloseWithError(ctx.Err())
+	}()
+	return pr, nil
+}
+
+func (s *blockingSource) followCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.follows
+}
+
 // fakeAttributor maps pods to Loops and Loops to UIDs.
 type fakeAttributor struct {
 	pods   map[string][2]string // "ns/pod" -> {loopNS, loopName}
@@ -469,6 +511,86 @@ func TestRelayStopsFollowingADeletedPod(t *testing.T) {
 		t.Fatalf("the follow count grew from %d to %d after the pod was pruned: the follower is still retrying (E2)",
 			settled, got)
 	}
+}
+
+// followerCount reports how many streams the relay is following (the relay's own
+// table, not an inference from the source: a cancel is invisible to Follow).
+func followerCount(relay *Relay) int {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	return len(relay.followers)
+}
+
+// TestRelayIncompleteDiscoveryDoesNotPruneLiveFollowers is pi3 R1 (round 2):
+// PodDiscoverer returns the peers it DID list together with an error, so an
+// incomplete pass is missing every pod of the source that failed. Pruning
+// against that list cancels live followers, and the next complete pass restarts
+// them with since = nil — which re-reads TailLines and counts every Block a
+// second time, then publishes Healthy.
+//
+// Mutation: prune on an incomplete pass too (drop the `if err != nil { return }`
+// before pruneFollowers) → the follower table empties on the incomplete pass and
+// the engine stream is re-attached (attach count 1 → 2, published count 2 → 4).
+func TestRelayIncompleteDiscoveryDoesNotPruneLiveFollowers(t *testing.T) {
+	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	src := &blockingSource{batch: []string{
+		kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a"),
+		kubeArmorBlock(base.Add(2*time.Second), "Block", f62Sandbox, f62SandboxP, "/b"),
+	}}
+	disc := &fixedDiscoverer{peers: []Peer{
+		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
+		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
+	}}
+	relay := f62NewRelay(src)
+	relay.Discoverer = disc
+	relay.Interval = 10 * time.Millisecond
+	holder := startTestRelay(t, relay)
+
+	waitFor(t, "a healthy count of 2 from the engine stream", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthHealthy && s.Count == 2
+	})
+	if got := src.followCount(); got != 1 {
+		t.Fatalf("follow count = %d, want 1 (only the engine peer is followed)", got)
+	}
+	if got := followerCount(relay); got != 1 {
+		t.Fatalf("follower table = %d, want 1", got)
+	}
+
+	// An incomplete pass: the engine source's List fails, so Discover returns the
+	// workload peer and an error. The engine pod is NOT gone.
+	disc.setPeers(Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload})
+	disc.setError(errors.New("apiserver hiccup on the kubearmor list"))
+	time.Sleep(100 * time.Millisecond) // several 10ms passes
+	if got := followerCount(relay); got != 1 {
+		t.Fatalf("follower table = %d after an incomplete discovery pass, want 1: the live follower was pruned (R1)", got)
+	}
+	if got := src.followCount(); got != 1 {
+		t.Fatalf("attach count = %d after an incomplete discovery pass, want 1", got)
+	}
+	if s, ok := holder.Snapshot(f62UID); !ok || s.Health != HealthHealthy || s.Count != 2 {
+		t.Fatalf("count = %d health = %q (ok=%v) after an incomplete pass, want 2/healthy: the count no longer holds",
+			s.Count, s.Health, ok)
+	}
+
+	// The next COMPLETE pass (the engine peer is back) must not re-attach: with
+	// since = nil it would re-read the batch and count it again.
+	disc.setError(nil)
+	disc.setPeers(
+		Peer{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
+		Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
+	)
+	time.Sleep(100 * time.Millisecond)
+	if got := src.followCount(); got != 1 {
+		t.Fatalf("attach count = %d after the next complete pass, want 1: the follower was restarted and re-counted its tail (R1)", got)
+	}
+	if s, ok := holder.Snapshot(f62UID); !ok || s.Count != 2 || s.Health != HealthHealthy {
+		t.Fatalf("count = %d health = %q after the next complete pass, want 2/healthy", s.Count, s.Health)
+	}
+
+	// A later COMPLETE pass may prune: the engine peer is really gone now.
+	disc.setPeers(Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload})
+	waitFor(t, "the engine follower to be pruned", func() bool { return followerCount(relay) == 0 })
 }
 
 // TestRelayProxyStreamAloneIsNotHealthy is pi3 E3: a readable egress-proxy log

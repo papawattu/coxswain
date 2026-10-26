@@ -405,9 +405,24 @@ func (r *Relay) Start(ctx context.Context) error {
 			// The streams already followed are unaffected, and the peers that
 			// WERE listed are still used: a permissions problem on one source
 			// must not blind the other two.
-			r.log().Error(err, "alert relay: pod discovery was incomplete")
+			//
+			// R1 (F62 review round 2): an INCOMPLETE pass must not PRUNE. Discover
+			// returns the peers of the sources that listed successfully, so a
+			// transient List error on one source makes every pod of that source
+			// look absent. Pruning on that cancels live followers, and the next
+			// complete pass restarts them with since = nil — the replay filter
+			// only runs when since != nil — so each restarted follower re-reads
+			// TailLines and counts every Block again, then publishes Healthy. A
+			// wrong number is the one thing this relay exists to prevent.
+			//
+			// The per-pass attribution cache is left alone for the same reason:
+			// it is only rebuilt from a full read, and clearing it here would
+			// throw away resolutions that are still valid. The next COMPLETE
+			// pass resets it and prunes as usual.
+			r.log().Error(err, "alert relay: pod discovery was incomplete (following what was listed; not pruning this pass)")
+		} else {
+			r.attr.reset()
 		}
-		r.attr.reset()
 		var enginePeers int
 		for _, peer := range peers {
 			if peer.Kind == PeerEngine {
@@ -424,6 +439,12 @@ func (r *Relay) Start(ctx context.Context) error {
 				continue
 			}
 			r.startFollower(ctx, key, peer)
+		}
+		if err != nil {
+			// R1: a partial pass leaves every follower it did not see running.
+			// They are counted from their own streams (which are still attached),
+			// so nothing is lost by not pruning them here.
+			return
 		}
 		r.pruneFollowers(current)
 	}

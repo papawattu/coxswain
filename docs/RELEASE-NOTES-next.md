@@ -217,6 +217,12 @@ existing Loops are unaffected, but new ones are.
 
 ## Other changes
 
+### F70: a completed fork's sandbox is not held for a workspace-init clone it will never run — #314
+
+- **What was wrong.** The sandbox gate waited for the egress proxy whenever the workspace-init clone would traverse it — but a fork's workspace comes from the source's snapshot and already carries the base commit, so the init script exits 0 with "workspace already initialised" before any clone. On an install where the proxy cannot come up (e.g. F56's unpullable `coxswain-egress-proxy:standin`), the fork's sandbox was held `Suspended` for ever with no condition naming it (`d9f5619` = PR #314, F70).
+- **What changed.** The egress-proxy wait for the workspace-init term now applies only while a clone will actually run: a fork whose restore is complete for its current target (`Restore=True/Restored` carrying the matching target key — an unrelated spec edit cannot re-arm the wait) starts from the restored workspace and is not held, even if the egress proxy pod is unavailable. The proxy itself is still created for the fork (the verify/deliver clone-base still traverses it for an external repo) — only whether the sandbox waits for it changes. A fresh Loop is still held until its egress proxy pod is Ready (F70).
+- **On upgrade.** Nothing required; pick up the new operator image (no CRD, RBAC or chart change). A known issue about a fork waiting on an unusable egress proxy is no longer open (PR #314).
+
 ### F57: a restore whose PVC cannot be confirmed is not Restored, and the fork label stops being re-patched — #313
 
 - **What was wrong.** When restoring into an already-present workspace PVC, a read-back that failed (or found the PVC gone again) fell through to "restored", so a transient read failure could record `Restored` for a restore that never happened (F57a). And on a fork, every pass re-patched the retention label on the source snapshot — and re-emitted the `Restore=False/Rejected` Warning on every pass, for the life of a failing create (F57b) (`3a99f2e` = PR #313).
@@ -753,9 +759,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   unvalidated, so a crafted value can reach the credentialed scripts.
 - **F69**: the delivered PR body's facts section carries the agent's own
   claim text presented as an operator fact, with no cap.
-- **F70**: a forked Loop with an external repo can wait for an egress proxy
-  it never uses; on an install where the proxy image can't be pulled it
-  hangs with no condition (PR #222's run).
 - **F71**: the from-source build commands in `docs/QUICKSTART.md` §9 are
   wrong (a duplicated `PROXY_IMG`, `build-installer` given only the
   controller tag, and an uncreated `/tmp/d61-loop.yaml`) (PR #230's run).

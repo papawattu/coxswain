@@ -34,9 +34,10 @@
 //     reports observedPhase=Implementing.
 //   - Verifying is DROPPED from the runner (ADR-0005): verify evidence comes
 //     from the operator's isolated Job, never the runner. A desired-phase of
-//     Verifying (or any unknown value) is reported as status=blocked with the
-//     value echoed in observedPhase — a claim the operator can see, not a
-//     phase the runner executes.
+//     Verifying (or any value this runner does not execute) USED to be
+//     reported as status=blocked with the value echoed in observedPhase — a
+//     claim the operator's parser rejects, which made the pair repeat; it now
+//     idles until SIGTERM and writes no claim (F52 C2).
 //
 // A4 (model context continuity): within ONE iteration the Planning and
 // Implementing phase runs share the SAME conversation — the messages

@@ -272,7 +272,7 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		Expect(job).NotTo(BeNil(), "the verify Job exists after the drive")
 
 		f53PlantPod(ns, name, jobName, job, f53WaitingClone)
-		f53JobFailed(ns, jobName, string(batchv1.JobReasonDeadlineExceeded))
+		f53JobFailed(ns, jobName, batchv1.JobReasonDeadlineExceeded)
 
 		fresh := s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
@@ -313,7 +313,7 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 			// The motivating shape: a check that never terminates.
 			{Name: "check-0", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
 		})
-		f53JobFailed(ns, jobName, string(batchv1.JobReasonDeadlineExceeded))
+		f53JobFailed(ns, jobName, batchv1.JobReasonDeadlineExceeded)
 
 		fresh := s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying))
@@ -351,7 +351,7 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 
 		f53PlantPod(ns, name, jobName, job, f53WaitingClone)
-		f53JobFailed(ns, jobName, string(batchv1.JobReasonDeadlineExceeded))
+		f53JobFailed(ns, jobName, batchv1.JobReasonDeadlineExceeded)
 
 		fresh := s5aReconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed))

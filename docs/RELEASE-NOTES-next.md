@@ -217,6 +217,12 @@ existing Loops are unaffected, but new ones are.
 
 ## Other changes
 
+### F56: make deploy passes the four component-image args, and a missing runner is visible — #311
+
+- **What was wrong.** `make deploy` passed none of the four component-image args, so a deployed Loop ran the operator's `sleep infinity` stand-in (it looked Running and never advanced) and the three proxy pods pulled `…:standin`/`…:metering` tags that were never pushed; nothing on the object said so (no condition, no Event) (`64f4902` = PR #311, F56).
+- **What changed.** Every production render (`make deploy`, `dist/install.yaml`, the Helm chart) now derives the runner and the three proxy images from `IMG` — same registry+path prefix as the manager image, `coxswain-<component>`, IMG's tag — so a registry-port IMG such as `localhost:5000/coxswain-controller:v1` works; an untagged or digest `IMG` is refused with a message. A Loop whose runner image is unset (neither `--runner-image` nor `spec.agent.image`) now shows `RunnerAvailable=False/RunnerImageUnset` and one `RunnerUnavailable` Warning Event per observed transition into that shape (a pinned `spec.agent.image` shows `True/AgentImagePinned` — the documented debugging opt-out, not a degradation); surfacing only, the Loop is never failed or terminalised. `docs/TROUBLESHOOTING.md` gains a `RunnerAvailable=False` entry (F56).
+- **On upgrade.** `config/dev` keeps its documented stand-ins: it sets `--runner-image=coxswain-runner:dev` itself and leaves the three proxy args unset, so the operator's built-in names apply (`coxswain-proxy:metering`, `coxswain-tool-proxy:standin`, `coxswain-egress-proxy:standin`). Otherwise pick up the new operator image and re-deploy (PR #311).
+
 ### F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, not only in the log — #308
 
 - **What was wrong.** On a cluster with no `KubeArmorPolicy` CRD and the operator running without `--allow-unenforced`, the policy-write error was returned before any status write, so every Loop sat at an empty `status` — no phase, no condition, no Event — for ever; the only trace was the operator log (`7fd171d` = PR #308, F92).

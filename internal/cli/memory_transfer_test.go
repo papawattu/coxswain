@@ -70,6 +70,23 @@ func shaSet(files map[string][]byte) []string {
 	return out
 }
 
+// sameLessonNames fails when the two stores hold different lesson names, and
+// when any of the first store's files is not named by its own content's hash.
+// F52 C1: the name is the lesson's identity, and the imported CONTENT is the
+// trimmed body the name hashes — not the raw bytes the tarball carried.
+func sameLessonNames(t *testing.T, a, b map[string][]byte) {
+	t.Helper()
+	if got, want := slices.Sorted(maps.Keys(a)), slices.Sorted(maps.Keys(b)); !slices.Equal(got, want) {
+		t.Fatalf("lesson sets differ: %v != %v", got, want)
+	}
+	for n, body := range a {
+		sum := sha256.Sum256(body)
+		if hex.EncodeToString(sum[:])+".txt" != n {
+			t.Fatalf("store holds %q under %q: the name is not the hash of its content (F52 C1)", body, n)
+		}
+	}
+}
+
 func tarballOf(t *testing.T, s *fakeMemoryStore) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -79,7 +96,9 @@ func tarballOf(t *testing.T, s *fakeMemoryStore) []byte {
 	return buf.Bytes()
 }
 
-// Export writes a tarball whose contents are byte-identical to the PVC's.
+// Export writes a tarball whose contents are the PVC's bytes; parse returns
+// each entry as the lesson body its name hashes (F52 C1: one trailing newline
+// trimmed), so the check is the name set plus the trimmed body.
 func TestMemoryExportMatchesPVC(t *testing.T) {
 	src := newStore("fix internal/a.go build", "error: foo failed in pkg/b")
 	tb := tarballOf(t, src)
@@ -87,8 +106,11 @@ func TestMemoryExportMatchesPVC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if strings.Join(shaSet(got), ",") != strings.Join(shaSet(src.files), ",") {
-		t.Fatalf("tarball contents differ from the PVC:\n%v\n%v", shaSet(got), shaSet(src.files))
+	sameLessonNames(t, got, src.files)
+	for n, b := range src.files {
+		if string(got[n]) != strings.TrimSuffix(string(b), "\n") {
+			t.Fatalf("tarball content for %s = %q, want the PVC's bytes minus one trailing newline (%q)", n, got[n], b)
+		}
 	}
 }
 
@@ -110,8 +132,43 @@ func TestMemoryImportRestores(t *testing.T) {
 	if err != nil || w != 2 || s != 0 {
 		t.Fatalf("import = (%d,%d,%v), want (2,0,nil)", w, s, err)
 	}
-	if strings.Join(shaSet(dst.files), ",") != strings.Join(shaSet(src.files), ",") {
-		t.Fatalf("restored set differs")
+	sameLessonNames(t, dst.files, src.files)
+}
+
+// F52 C1: the importer validated the hash over the TRIMMED body and stored the
+// RAW one, so an entry whose content ends with a newline (the shape export
+// round-trips) was written with bytes whose SHA-256 is not its name — and the
+// name is the lesson's identity for dedup (`cox memory show` reads the file
+// under its hash name).
+func TestMemoryImportStoresTheBytesItsNameHashes(t *testing.T) {
+	text := "fix internal/a.go build"
+	name, body := lessonFile(text) // name = sha256(text), content = text + "\n"
+	tb := tarballOf(t, newStore(text))
+	if !bytes.HasSuffix(body, []byte("\n")) {
+		t.Fatalf("fixture drift: the entry content must end with a newline (got %q)", body)
+	}
+
+	files, err := parseMemoryTarball(bytes.NewReader(tb))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for n, b := range files {
+		sum := sha256.Sum256(b)
+		if got := hex.EncodeToString(sum[:]) + ".txt"; got != n {
+			t.Fatalf("parse stored %q under %q but its hash names it %q (F52 C1)", b, n, got)
+		}
+	}
+
+	dst := newStore()
+	if _, _, _, err := memoryImport(context.Background(), dst, memTestRepo, bytes.NewReader(tb)); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if got := string(dst.files[name]); got != text {
+		t.Fatalf("imported content = %q, want the hashed body %q", got, text)
+	}
+	sum := sha256.Sum256(dst.files[name])
+	if got := hex.EncodeToString(sum[:]) + ".txt"; got != name {
+		t.Fatalf("the written file %q does not hash to its name (%q)", name, got)
 	}
 }
 
@@ -193,9 +250,7 @@ func TestMemoryExportImportFiles(t *testing.T) {
 	if err := memoryImportFromFile(context.Background(), Deps{MemoryStore: dst}, "default", memTestRepo, path, "", out); err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	if strings.Join(shaSet(dst.files), ",") != strings.Join(shaSet(src.files), ",") {
-		t.Fatalf("restored set differs")
-	}
+	sameLessonNames(t, dst.files, src.files)
 	if !strings.Contains(out.String(), "Imported 2 lesson(s), skipped 0") {
 		t.Fatalf("output: %s", out.String())
 	}

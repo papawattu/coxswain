@@ -52,10 +52,13 @@ import (
 )
 
 const (
-	// shaPrefixLen is the sha256-prefix length reported per lesson (the
-	// bounded summary never includes the lesson text; a 12-hex-char prefix
-	// is enough to identify a lesson in the condition/history without
-	// leaking its content).
+	// shaPrefixLen is the sha256-prefix length reported per lesson: a
+	// 12-hex-char prefix is enough to identify a lesson in the
+	// condition/history. The summary carries no lesson body of its own, but
+	// the per-lesson line's `rule` field is NOT lesson-free: a curator reason
+	// is model-supplied text and can quote the lesson (F52 C7 — the old
+	// wording claimed the summary never includes lesson text, which the
+	// reason field contradicts).
 	shaPrefixLen = 12
 )
 
@@ -391,9 +394,11 @@ func countSurvivors(reasons []string) int {
 
 // summaryLines builds the bounded summary's lines (one line per lesson with
 // its sha256-prefix, written|dropped, and rule, plus the counts line).
-// It returns ONLY lines — the lesson text is NEVER in a line. This is the
-// pure content of the summary (the emission — stdout + the termination
-// message file — is in emitSummary).
+// Everything it returns is a summary LINE — the lesson body is never a line
+// of its own — with one exception worth naming: the `rule` field can be a
+// curator reason, which is model-supplied text and may quote the lesson (F52
+// C7). This is the pure content of the summary (the emission — stdout + the
+// termination message file — is in emitSummary).
 func summaryLines(lessons, reasons, audit []string, total, written, dropped int) []string {
 	out := make([]string, 0, len(lessons)+len(audit)+1)
 	// Order matters: the Loop's bounded audit text keeps whole lines from the

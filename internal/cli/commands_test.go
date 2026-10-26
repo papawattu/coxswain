@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -469,5 +471,36 @@ func TestRedeliver_FailedDeliveryMessage(t *testing.T) {
 	}
 	if !strings.Contains(out, "DeliveryFailed") {
 		t.Errorf("redeliver output should mention the DeliveryFailed reason, got %q", out)
+	}
+}
+
+// F52 C3: the Use strings must name the <loop> argument — cobra prints Use in
+// --help and in the usage line of an argument error, and both commands take
+// exactly one loop, so a bare "describe" / "history" hides the only argument.
+func TestCommands_NameTheLoopArgument(t *testing.T) {
+	for _, cmd := range []*cobra.Command{newDescribeCommand(), newHistoryCommand()} {
+		if !strings.Contains(cmd.Use, "<loop>") {
+			t.Fatalf("%q must name the <loop> argument (F52 C3)", cmd.Use)
+		}
+	}
+}
+
+// F52 C3: describe prints the OBJECT's namespace. With -n unset the client
+// resolves the kubeconfig context's namespace (NewDeps), while namespaceOf()
+// answers "default" — so the old line named a namespace the Loop does not live
+// in. The command seam is fed "default" here and the fixture lives in
+// "samples", which is the case the flag path could not distinguish.
+func TestDescribe_NamespaceIsTheObjectsNotTheFlags(t *testing.T) {
+	fc := newFakeLoopClient()
+	fc.setLoop(typedLoop(t, nil)) // ObjectMeta.Namespace = samples
+	out := &bytes.Buffer{}
+	if err := describeLoop(context.Background(), Deps{Loops: fc}, "default", "loop1", out); err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if !strings.Contains(out.String(), "Namespace:    samples") {
+		t.Fatalf("describe must print the object's namespace (samples), got:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "Namespace:    default") {
+		t.Fatalf("describe printed the flag-derived namespace instead of the object's:\n%s", out.String())
 	}
 }

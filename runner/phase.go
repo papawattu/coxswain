@@ -273,16 +273,19 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		return Result{}
 	}
 
-	// Verifying is operator-owned (ADR-0005): the verify evidence comes from
-	// the operator's isolated Job (B3, S5), never from the runner. With a
-	// Verifying desired phase the runner does NOT exit blocked (an exit would
-	// restart the one-shot container in a crash loop under restartPolicy
-	// Always, churning the pod and the operator's progress record): it logs
-	// once, makes no model call, and blocks until SIGTERM (bounded by
-	// IdleTimeout as a safety net) so the sandbox pod stays Running until the
-	// operator recreates it from the Job's evidence.
-	if phase == PhaseVerifying {
-		log.Printf("runner: desired-phase %q is operator-owned (B3); idling until the operator recreates the pod", phase)
+	// A phase the runner does not execute: Verifying is operator-owned
+	// (ADR-0005) and every other non-executable value is a phase this binary
+	// does not implement (e.g. AwaitingApproval, which the operator writes
+	// while the approval gate holds the Loop). In both cases the runner does
+	// NOT write a claim. Its claim's observedPhase is validated by the
+	// operator (parsePhaseClaim accepts only Planning/Implementing/Verifying),
+	// so a claim naming e.g. AwaitingApproval is rejected as a malformed
+	// claim, the container restarts, and the pair repeats for ever (F52 C2).
+	// Idle instead, as Verifying always did: no model call, one log line,
+	// block until SIGTERM (bounded by IdleTimeout as a safety net) so the
+	// sandbox pod stays Running until the operator recreates it.
+	if phase != PhasePlanning && phase != PhaseImplementing {
+		log.Printf("runner: desired-phase %q is not a phase this runner executes (%s is operator-owned; any other value is not implemented); idling until the operator recreates the pod", phase, PhaseVerifying)
 		idle := cfg.IdleTimeout
 		if idle <= 0 {
 			idle = defaultIdleTimeout
@@ -401,8 +404,7 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 		if res.Status == statusSuccess {
 			res.PlanChanged = planChanged(cfg.Workspace)
 		}
-	case PhaseImplementing:
-		// I93 (R29): the plan-hash check at the START of an Implementing run,
+	case PhaseImplementing: // I93 (R29): the plan-hash check at the START of an Implementing run,
 		// BEFORE any agent work. The runner was missing this: the plan-change
 		// check (planChanged) lived only after a Planning rewrite, so an edit
 		// to PLAN.md between the user's approval and the Implementing run was
@@ -487,17 +489,6 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 			// re-commit paths above are left alone: they resume the SAME
 			// iteration, whose own run wrote the file.)
 			writeLessonsFile(cfg.Workspace, nil)
-		}
-	default:
-		// Unknown phase (a typo, or a phase the runner does not execute,
-		// e.g. Verifying is operator-owned per ADR-0005). Report it as
-		// blocked with the value echoed in observedPhase (the operator sees
-		// the claim and acts). Do NOT loop forever on it.
-		res = Result{
-			Status: statusBlocked,
-			Summary: fmt.Sprintf("unknown desired-phase %q; the runner executes only %s or %s",
-				phase, PhasePlanning, PhaseImplementing),
-			ObservedPhase: phase,
 		}
 	}
 	// A4: persist the conversation for a next phase run WITHOUT a pod

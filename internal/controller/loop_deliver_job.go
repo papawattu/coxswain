@@ -964,17 +964,26 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 	backoff := int32(0)
 	deadline := deliverJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
+	deliverJobFalse := false
 	return batchv1.JobSpec{
 		BackoffLimit:          &backoff,
 		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: deliverJobLabels(loop.Name)},
 			Spec: corev1.PodSpec{
-				RestartPolicy:      never,
-				ServiceAccountName: "",
-				Volumes:            volumes,
-				InitContainers:     inits,
-				Containers:         []corev1.Container{main},
+				RestartPolicy: never,
+				// F66: the deliver Job's containers run agent-chosen code
+				// (clone-base, import-agent fetch from the agent's repo and the
+				// push runs the agent's tree). They make no API calls, so no
+				// token belongs in them — the same call the memory-writer Job
+				// makes (loop_memory_writer_job.go) and every operator-built pod
+				// already makes. Without it the DEFAULT SA's token was mounted
+				// into those containers alongside the git credential.
+				ServiceAccountName:           "",
+				AutomountServiceAccountToken: &deliverJobFalse,
+				Volumes:                      volumes,
+				InitContainers:               inits,
+				Containers:                   []corev1.Container{main},
 			},
 		},
 	}

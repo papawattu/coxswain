@@ -225,6 +225,44 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 			"a completed fork releases the label (the pre-F57 completion path)")
 	})
 
+	It("F57b: a ROLLBACK create that keeps failing also emits the Warning on the transition only", func() {
+		// The rollback branch (spec.restoreFrom, the PVC already gone) had its
+		// own copy of the create-failure handling, which still set the
+		// condition and emitted the Warning unconditionally: the same
+		// per-pass Event storm the fork/lost-PVC branch had.
+		ns := "f57-rb-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		})
+		name := "rb"
+		spec := b2LoopSpec()
+		spec.RestoreFrom = "iter-0"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: spec})).To(Succeed())
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		Expect(k8sClient.Create(ctx, b1MakeSnapshotObj(name, ns, 0))).To(Succeed())
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		r, rec := b2NewReconcilerWithRecorder()
+		r.Client = &f57RestoreClient{Client: k8sClient, failCreate: true}
+
+		_, requeue, _, err := r.b2ApplyRestoreStep(ctx, b2ReconcileGet(ns, name))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(requeue).To(BeTrue())
+		c := b2RestoreCondition(b2ReconcileGet(ns, name))
+		Expect(c).NotTo(BeNil())
+		Expect(c.Reason).To(Equal(coxv1alpha1.RestoreReasonRejected))
+		Expect(f57DrainRestoreEvents(rec, coxv1alpha1.RestoreReasonRejected)).To(Equal(1),
+			"the first failing rollback pass emits the Warning")
+
+		_, requeue, _, err = r.b2ApplyRestoreStep(ctx, b2ReconcileGet(ns, name))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(requeue).To(BeTrue())
+		Expect(f57DrainRestoreEvents(rec, coxv1alpha1.RestoreReasonRejected)).To(Equal(0),
+			"a second failing rollback pass must not re-emit the Warning (the condition is the steady state)")
+	})
+
 	It("F57b: a fork that gives up (the Loop is deleted) releases the label", func() {
 		ns, forkName, srcSnap := f57Fork()
 		r, _ := b2NewReconcilerWithRecorder()

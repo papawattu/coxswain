@@ -510,7 +510,11 @@ func (r *LoopReconciler) createWorkspacePVCFromSnapshot(ctx context.Context, loo
 			// Restored).
 			existing := &corev1.PersistentVolumeClaim{}
 			if gerr := r.Get(ctx, client.ObjectKeyFromObject(newPVC), existing); gerr != nil {
-				log.FromContext(ctx).V(1).Info("the restored workspace PVC could not be confirmed after AlreadyExists; the restore is not complete",
+				// Unfiltered, like the restore step's other transient-read
+				// logs: a read that cannot confirm the PVC is why this pass
+				// made no decision, and the next pass retries silently — the
+				// log is the only trace of the interruption.
+				log.FromContext(ctx).Info("the restored workspace PVC could not be confirmed after AlreadyExists; the restore is not complete",
 					"pvc", newPVC.Name, "loop", loop.Name, "readError", gerr.Error())
 				return fmt.Errorf("%w: %v", errWorkspacePVCUnconfirmed, gerr)
 			} else if existing.DeletionTimestamp != nil {
@@ -998,11 +1002,12 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 					// F57a: no restore decision on an unconfirmed create; requeue.
 					return false, true, true, nil
 				}
-				setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonRejected,
+				// F57b: the Warning marks the TRANSITION into Rejected, not
+				// every pass of a create that keeps failing (the condition is
+				// the steady state). Same as the fork/lost-PVC branch.
+				r.setRestoreConditionWithEvent(loop, coxv1alpha1.RestoreReasonRejected,
 					"restoring the workspace PVC from "+target.snapshot+" ("+string(target.kind)+") failed: "+err.Error())
 				persist()
-				r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonRejected,
-					"workspace PVC restore from "+target.snapshot+" failed; retrying")
 				return true, true, true, nil
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,

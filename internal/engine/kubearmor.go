@@ -259,25 +259,17 @@ func toProtocolItems(protocols []string) []any {
 	return out
 }
 
-// splitNetworkAllows splits "host:port" allows into (dnsNames, protocols). A
-// bare host (no port) yields a DNS name only; "host:port" yields a DNS name +
-// a "tcp:port" protocol so the allow does not widen to host:* (P2).
-// splitNetworkAllows splits network allows into (dnsNames, protocols). KubeArmor
-// matches egress by DNS query name + protocol — it CANNOT express a host:port
-// allow (the schema's matchProtocols items are protocol NAMES: tcp/udp, not
-// "tcp:443"). So a "host:443" allow becomes "host" + protocol "tcp": the port is
-// LOST — the allow widens to host:*, and KubeArmor alone cannot keep the
-// source rule's precision. That is the condition for the PolicyTranslationLossy
-// Loop status flag (D33 follow-up): whenever the effective policy carries a
-// host:PORT network allow, the operator must record it; the NetworkPolicy
-// (D34, post-C6) carries the host:port precision where KubeArmor cannot.
 // splitNetworkAllows splits network allows into (dnsNames, protocols).
 // KubeArmor matches egress by DNS query name + protocol — it CANNOT express
 // a host:port allow (the schema's matchProtocols items are protocol NAMES:
 // tcp/udp, not "tcp:443"). So a "host:443" allow becomes "host" + protocol
-// "tcp": the port is LOST — the allow widens to host:*, and KubeArmor alone
-// cannot keep the source rule's precision. That is the condition for the
-// PolicyTranslationLossy Loop status flag (D33 follow-up).
+// "tcp": the port is LOST — the allow widens to host:* (any port on that
+// host), and KubeArmor alone cannot keep the source rule's precision. I41:
+// NetworkLossy reports exactly those allows; the operator sets
+// PolicyTranslationLossy from it only when no other layer carries the port
+// (the egress proxy for the agent's network allows, the model proxy's
+// NetworkPolicy for the model endpoint — see the controller's
+// translationLossyAllows).
 //
 // Special formats:
 //   - "dns/udp+tcp" (the platform-minimum DNS allow): produces protocols
@@ -330,21 +322,12 @@ func dedupe(in []string) []string {
 	return out
 }
 
-// TranslationResult reports what the engine's translation dropped. The
-// controller uses this to set PolicyTranslationLossy on the Loop when the
-// translation is lossy (I41: a host:PORT allow that loses its port must be
-// reported, not silently widened).
-type TranslationResult struct {
-	// DroppedNetworkPorts lists the host:port allows that lost their port
-	// during translation (e.g. "pypi.org:443" -> "pypi.org" + tcp). Empty
-	// means the translation was not lossy.
-	DroppedNetworkPorts []string
-}
-
-// NetworkLossy returns the host:port network allows that the KubeArmor
-// translation cannot express at that precision (the port is dropped). A bare
-// host (no port) is not lossy. This is the single source of truth for the
-// PolicyTranslationLossy condition (I41).
+// NetworkLossy returns the host:port allows that the KubeArmor translation
+// cannot express at that precision (the port is dropped). A bare host (no
+// port) is not lossy. This is the single source of truth for what the
+// TRANSLATION loses (I41); whether that loss matters is the caller's call —
+// the operator reports PolicyTranslationLossy only for the allows no other
+// layer pins the port for (the egress proxy, the model proxy's NetworkPolicy).
 func NetworkLossy(ends []string) []string {
 	var lossy []string
 	for _, e := range ends {

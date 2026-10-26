@@ -41,6 +41,10 @@ ALLOW_HOST="${EGRESS_E2E_ALLOW_HOST:-proxy.golang.org:443}"
 ALLOW_JSON='["'${ALLOW_HOST}'"]'  # JSON array of "host:port" (YAML single-quoted value)
 ALLOW_NAME=$(echo "$ALLOW_HOST" | cut -d: -f1)
 DISALLOW_HOST="example.invalid:443"
+# The same host the allow names, on a port the allow does NOT name (F64: the
+# proxy must reject it — the allow is port-precise). No service is needed on
+# this port: the CONNECT is refused before any dial.
+OTHER_PORT="${EGRESS_E2E_OTHER_PORT:-8443}"
 # The kind node's pod CIDR, so the proxy carves it out (SSRF backstop).
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/12}"
@@ -227,9 +231,37 @@ else
   echo "     OK: raw TCP to a private IP blocked"
 fi
 
+# --- 6. Same allowed host, a DIFFERENT port (must be 403) ----------------
+echo "   [6] same host, other port ${ALLOW_NAME}:${OTHER_PORT} (must be 403)..."
+# The allow is host:port, so the tunnel is port-precise: the same host on
+# another port is a different allow and must be rejected before any dial (F64:
+# the port is carried HERE, not by KubeArmor's hostname-only rule).
+if run_curl -x "$PROXY_URL" "https://${ALLOW_NAME}:${OTHER_PORT}/" >/tmp/egress-otherport.out 2>/tmp/egress-otherport.err; then
+  echo "     FAIL: the same host on port ${OTHER_PORT} was relayed (the allow is not port-precise)"
+  fail=1
+else
+  if grep -qiE "403|forbidden|not allowed" /tmp/egress-otherport.err; then
+    echo "     OK: same host on port ${OTHER_PORT} rejected with 403"
+  else
+    echo "     FAIL: request failed, but not with a 403: $(cat /tmp/egress-otherport.err)"
+    fail=1
+  fi
+fi
+# ... and it must be audited as blocked for that exact host:port, for the
+# port reason (not-allowed), not some later dial failure.
+OTHER_AUDIT=$($KUBECTL -n "$NAMESPACE" logs egress-proxy-e2e 2>/dev/null || true)
+if echo "$OTHER_AUDIT" | grep -q "\"target\":\"${ALLOW_NAME}:${OTHER_PORT}\"" &&
+   echo "$OTHER_AUDIT" | grep -q 'reason=not-allowed'; then
+  echo "     OK: audit log has a blocked record for ${ALLOW_NAME}:${OTHER_PORT} (reason=not-allowed)"
+else
+  echo "     FAIL: no blocked audit record for ${ALLOW_NAME}:${OTHER_PORT}"
+  echo "$OTHER_AUDIT" | tail -20
+  fail=1
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
-  echo "PASS: I42a egress proxy e2e (allowed relayed + audited, disallowed + private-IP blocked, SNI fail-closed)"
+  echo "PASS: I42a egress proxy e2e (allowed relayed + audited, disallowed + other-port + private-IP blocked, SNI fail-closed)"
 else
   echo "FAIL: I42a egress proxy e2e"
   echo "----- proxy log -----"

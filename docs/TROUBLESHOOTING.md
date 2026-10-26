@@ -538,6 +538,38 @@ ensure is a create-or-update, so check the verbs it actually uses
 operator's ServiceAccount>`), and `kubectl get networkpolicy <loop>-agent-netpol`
 to see whether a foreign object is in the way.
 
+### `PolicyTranslationLossy=True` (a `host:PORT` allow nothing pins)
+
+**What you see:** the condition is `True` with reason `KubeArmorDroppedPorts`,
+and its message lists the allows whose port is not carried — either an
+`AgentPolicy` `spec.network` allow or the Loop's `spec.agent.modelEndpoint`.
+
+**What it means:** KubeArmor matches egress by DNS query name + protocol
+**name** (`tcp`/`udp`, not `tcp:443`), so a `host:443` allow becomes "host" +
+`tcp` — any port on that host. The port has to be carried by another layer,
+and there are two: the egress proxy (it checks the full `host:port` at CONNECT
+time) and the model proxy's NetworkPolicy (its egress rule names the endpoint
+and the port). The condition reports the allows **no layer carries**:
+
+- an agent network allow while `<loop>-egress-proxy` is not yet owned by the
+  Loop and Ready — in that shape the sandbox is Suspended (the I42b gate), so
+  the port is genuinely unenforced, and the condition clears on the pass that
+  observes the Ready proxy;
+- a model endpoint that no NetworkPolicy rule can express. The CRD documents
+  `modelEndpoint` as an in-cluster `host:port`, and the model proxy's egress
+  rule carries the port for an IP literal and for a `<svc>.<ns>.svc` host; a
+  host of another shape (a dotted external name) gets no egress rule at all.
+
+**What to do:** if the message names an agent allow, read the egress proxy:
+`kubectl -n <ns> get pod <loop>-egress-proxy -o wide` and its Ready condition
+(and `kubectl cox describe` for the sandbox's mode). A proxy that never becomes
+Ready is the problem, not the condition. If the proxy IS owned by the Loop and
+Ready and an agent allow is still listed, that is a defect: the pass that reads
+the Ready pod sets `False`/`NoPortLoss`, so report it with the condition message.
+If the message names the model endpoint, point `spec.agent.modelEndpoint` at an
+in-cluster address (`svc:port`, `svc.ns.svc:port` or an IP literal) — the model
+proxy's NetworkPolicy can then pin the port.
+
 ### Sandbox Suspended with no condition explaining why (F42-b)
 
 **What you see:** the sandbox is `Suspended` and no condition names the

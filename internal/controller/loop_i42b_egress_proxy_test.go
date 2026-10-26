@@ -27,10 +27,12 @@ package controller
 // foreign pod occupies the name. Drift detection via full pod-spec hash
 // (D33 pattern): image or env changes recreate the pod.
 //
-// I41 consequence: when the egress proxy enforces network allows, the operator
-// must NOT set PolicyTranslationLossy=True for agent network allows; it sets
-// PolicyTranslationLossy=False reason NoPortLoss when network allows are
-// present. (The condition remains True for the model proxy's egress.)
+// I41 consequence (F64, ADR-0007): when the egress proxy enforces network
+// allows, the operator must NOT set PolicyTranslationLossy=True for agent
+// network allows: a Ready, owned egress proxy pins each host:PORT allow at
+// CONNECT time. It sets False reason NoPortLoss in that shape, and True only
+// while nothing carries the port. (The condition also covers the model proxy's
+// egress, where the model proxy NetworkPolicy carries the endpoint's port.)
 
 import (
 	"context"
@@ -699,15 +701,15 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			"the foreign pod must NOT be deleted by the cleanup path either")
 	})
 
-	// spec 7: PolicyTranslationLossy condition when network allows are present.
-	// NOTE (I41 consequence, ADR-0007): when the egress proxy enforces network
-	// allows at the app layer, the operator should set PolicyTranslationLossy=False
-	// NoPortLoss (the port precision is carried by the egress proxy, not lost in
-	// KubeArmor translation). This change is NOT yet implemented — the current
-	// code still sets PolicyTranslationLossy=True for network allows (I41).
-	// This test verifies the current behavior and will be updated when the
-	// NoPortLoss change lands.
-	It("verifies the PolicyTranslationLossy condition for network allows (current: True, future: NoPortLoss)", func() {
+	// spec 7: PolicyTranslationLossy for network allows with no carrier.
+	// I41 consequence (ADR-0007, TDD-PLAN-PHASE1 §I41, F64): the egress proxy
+	// pins each agent network allow's host AND port at CONNECT time, so once its
+	// pod is owned by the Loop and Ready the allows are NOT lossy. This spec has
+	// no proxy pod at all (the pass that creates it leaves it un-Ready), so the
+	// port has no carrier and the condition is True — the concrete pair, not
+	// "either status" (F64 replaced the loose assertion; the Ready transition is
+	// pinned by the F64 specs in loop_f64_translation_lossy_envtest_test.go).
+	It("sets PolicyTranslationLossy=True for a network allow while nothing carries the port", func() {
 		ns := "i42b-lossy-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -732,13 +734,13 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 				break
 			}
 		}
-		// The condition should be set (either True for the current I41 behavior,
-		// or False NoPortLoss for the future I41 consequence).
+		// The condition names the allow it cannot pin: no layer carries the port on
+		// this pass (the egress proxy pod exists but is not Ready).
 		Expect(lossy).ToNot(BeNil(), "the PolicyTranslationLossy condition must be set")
-		// Current behavior (I41): True (network allows are lossy in KubeArmor
-		// translation). Future (I41 consequence with egress proxy): False NoPortLoss.
-		// This assertion is intentionally loose to cover both states.
-		Expect(lossy.Status).To(BeElementOf(metav1.ConditionTrue, metav1.ConditionFalse),
-			"PolicyTranslationLossy must be either True (current I41) or False NoPortLoss (future I41 consequence)")
+		Expect(lossy.Status).To(Equal(metav1.ConditionTrue),
+			"an unpinned host:PORT allow must be reported as lossy")
+		Expect(lossy.Reason).To(Equal("KubeArmorDroppedPorts"))
+		Expect(lossy.Message).To(ContainSubstring(i42bExternalAllow),
+			"the message must name the allow whose port is not carried")
 	})
 })

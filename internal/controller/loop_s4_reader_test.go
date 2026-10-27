@@ -905,7 +905,7 @@ var _ = Describe("S4: ADR-0004 claim reader + phase machine advance", func() {
 		// requeue driven by other sources or zero it.
 		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeNumerically("==", 5*time.Second),
+		Expect(res.RequeueAfter).To(Equal(workRequeue),
 			"a running agent (no claim read) must requeue on the claim-pending path, not advance")
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())

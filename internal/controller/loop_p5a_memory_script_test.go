@@ -278,7 +278,7 @@ func TestReconcileRequeueAfterMemoryWindow(t *testing.T) {
 	// The 5s work requeue still wins: pending work is more urgent than a
 	// reminder.
 	got := r.reconcileRequeueAfter(false, true, false, false, false, 0, 4*time.Minute, false)
-	if got.RequeueAfter != 5*time.Second {
+	if got.RequeueAfter != workRequeue {
 		t.Errorf("pending work must keep the 5s requeue, got %v", got.RequeueAfter)
 	}
 }

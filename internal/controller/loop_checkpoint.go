@@ -46,7 +46,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -1089,7 +1088,7 @@ func (r *LoopReconciler) finalizeB2Delete(ctx context.Context, loop *coxv1alpha1
 	}
 	logf.FromContext(ctx).Info("Deleting Loop: the restore decision was persisted", "loop", loop.Name, "conditionsChanged", conditionsChanged)
 	if b2Requeue {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: workRequeue}, nil
 	}
 	return r.reconcileCleaningUp(ctx, loop)
 }
@@ -1136,12 +1135,12 @@ func (r *LoopReconciler) reconcileCleaningUp(ctx context.Context, loop *coxv1alp
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "CheckpointGCFailed",
 				"checkpoint GC failed during namespace cleanup; requeueing (the finalizer keeps the Loop until the GC is done): %v", err)
 		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: workRequeue}, nil
 	}
 	if !done {
 		// The delete is async (the object is not gone yet): requeue.
 		logf.FromContext(ctx).Info("CleaningUp: a checkpoint delete is in progress; requeueing", "loop", loop.Name)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: workRequeue}, nil
 	}
 	logf.FromContext(ctx).Info("CleaningUp: the checkpoint GC is done (no snapshot remains); removing the finalizer", "loop", loop.Name)
 	// The GC is done (no snapshot remains): remove the finalizer so the
@@ -1163,7 +1162,7 @@ func (r *LoopReconciler) reconcileCleaningUp(ctx context.Context, loop *coxv1alp
 				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "FinalizerRemovalBlocked",
 					"finalizer removal rejected (terminating namespace); requeueing: %v", err)
 			}
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: workRequeue}, nil
 		}
 		logf.FromContext(ctx).Error(err, "CleaningUp: the finalizer removal failed; requeueing with backoff", "loop", loop.Name)
 		return ctrl.Result{}, err

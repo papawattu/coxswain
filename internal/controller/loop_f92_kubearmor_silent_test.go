@@ -127,7 +127,7 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 		// — pinned exactly rather than as "> 0", which any requeue satisfies (pi3
 		// prereview-308 finding 4). S5 seeds baseCommit to leave the F92 window
 		// as the only one and pins it with Equal(kaptCRDMissingRequeue).
-		Expect(res.RequeueAfter).To(Equal(5*time.Second),
+		Expect(res.RequeueAfter).To(Equal(workRequeue),
 			"a clone-pending Loop takes the 5s work requeue (a held Loop is re-checked, not left waiting for an unrelated event)")
 
 		By("the Loop's status must say why (the R26 I90 norm)")

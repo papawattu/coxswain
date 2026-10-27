@@ -434,8 +434,7 @@ func isRetryableModelError(err error) bool {
 	if !errors.As(err, &uerr) {
 		return false
 	}
-	var dnsErr *net.DNSError
-	if errors.As(uerr.Err, &dnsErr) {
+	if _, dnsFailure := errors.AsType[*net.DNSError](uerr.Err); dnsFailure {
 		return true
 	}
 	var opErr *net.OpError

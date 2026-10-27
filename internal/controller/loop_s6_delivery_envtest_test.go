@@ -151,6 +151,12 @@ func s6ForceSucceededFromHold(ns, name string) {
 	Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 		"P5f: a verify-passed delivery-on Loop is held at Verifying")
 	Expect(loopHoldingForDelivery(loop)).To(BeTrue())
+	// NOTE (F52 B2): the operator no longer DELETES the Verifying condition —
+	// settleDeliveryHold sets it False with the delivery outcome as the reason
+	// (loop_deliver_job.go). This helper still deletes it, because it is
+	// short-circuiting the state machine (it jumps straight to Succeeded
+	// without a Delivered condition for the settle to read), not modelling the
+	// operator. Do not read it as the production shape.
 	conds := []metav1.Condition{}
 	for _, c := range loop.Status.Conditions {
 		if c.Type != string(coxv1alpha1.LoopPhaseVerifying) {

@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -64,6 +65,12 @@ var _ = Describe("F52 B1: suspend is refused only while the delivery is not term
 		Expect(loop.Status.Delivery).To(BeNil(),
 			"the failure path records the outcome as the Delivered condition; status.delivery is written only on success (which is why the old predicate refused for ever)")
 
+		By("B2: settling the FAILED delivery keeps the verify record, carrying DeliveryFailed")
+		vc := apimeta.FindStatusCondition(loop.Status.Conditions, string(coxv1alpha1.LoopPhaseVerifying))
+		Expect(vc).NotTo(BeNil(), "the settle record survives the failed-delivery arm too, not only the success arm")
+		Expect(vc.Status).To(Equal(metav1.ConditionFalse))
+		Expect(vc.Reason).To(Equal(coxv1alpha1.ReasonDeliveryFailed))
+
 		By("suspend=true is not refused: the delivery is terminal, so no deliver Job is in flight")
 		loop = suspend(r, ns, name)
 		if c := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.PausedCondition); c != nil {
@@ -115,5 +122,40 @@ var _ = Describe("F52 B1: suspend is refused only while the delivery is not term
 		Expect(c.Reason).To(Equal(coxv1alpha1.ReasonDelivered),
 			"the settled condition carries the delivery outcome that released the hold")
 		Expect(loopHoldingForDelivery(loop)).To(BeFalse())
+	})
+
+	// pi3 early-343 P3-1: the settle record describes the iteration that
+	// settled. A later attempt that FAILS and iterates must not leave
+	// "verify passed, delivered" on a Loop going back to Implementing.
+	It("clears the settled verify record when a later attempt iterates", func() {
+		ns := freshNS("f52b2-iter")
+		name := "iter1"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+		r := s5aDriveToVerifying(ns, name)
+		s5aReconcile(r, ns, name) // the verify Job exists
+
+		By("the previous iteration's settle record is on the Loop")
+		l := p5fGet(ns, name)
+		setCondition(l, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionFalse,
+			coxv1alpha1.ReasonDelivered, "verify passed and the Loop is Succeeded (delivery: Delivered)")
+		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
+
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		s5aVerifyPod(ctx, ns, name, jobName, 1) // check-0 fails
+
+		var loop *coxv1alpha1.Loop
+		for range 10 {
+			loop = s5aReconcile(r, ns, name)
+			if loop.Status.Phase == coxv1alpha1.LoopPhaseImplementing {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing))
+		Expect(apimeta.FindStatusCondition(loop.Status.Conditions, string(coxv1alpha1.LoopPhaseVerifying))).To(BeNil(),
+			"the settle record describes the iteration that settled; this attempt failed and iterated, so it is cleared with the rest of the per-pin state")
 	})
 })

@@ -1604,6 +1604,14 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// pass) — exactly the window P3-5 names, and the delivered-PR-body
 		// renderer reads it with no pin guard.
 		clearTamperRecord(loop.Status.Verify)
+		// F52 B2 follow-up (pi3 early-343 P3-1): the settle record on the
+		// Verifying condition (False, reason Delivered / DeliveryFailed /
+		// VerifySettled) describes the iteration that settled. This attempt
+		// FAILED and the Loop is iterating, so the record is stale — clear it
+		// with the rest of the per-pin state (the line above) instead of
+		// leaving "verify passed, delivered" on a Loop that is going back to
+		// Implementing or Planning.
+		clearCondition(loop, string(coxv1alpha1.LoopPhaseVerifying))
 		// OS1: record the failing check into progress (the next run can target
 		// it). The progress block is the operator's structured record; this is
 		// the operator's own evidence (the verify Job pod's exit codes), not a

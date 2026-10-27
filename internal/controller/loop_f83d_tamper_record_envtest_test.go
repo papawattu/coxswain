@@ -235,15 +235,12 @@ func TestVerifyInfraFailureMessageCarriesTheKubeletReason(t *testing.T) {
 	}
 }
 
-// f83dSeconds returns a *int64 pointing at v (the JobSpec's pointer field).
-func f83dSeconds(v int64) *int64 { return &v }
-
 // pi3 prereview-306 note 4: the deadline in the message is the JOB's own
 // spec.activeDeadlineSeconds, not this build's constant. A Job created by an
 // older build keeps the deadline it was created with, so the constant would
 // name a value that did not kill it.
 func TestVerifyInfraFailureMessageNamesTheJobsOwnDeadline(t *testing.T) {
-	job := &batchv1.Job{Spec: batchv1.JobSpec{ActiveDeadlineSeconds: f83dSeconds(60)}}
+	job := &batchv1.Job{Spec: batchv1.JobSpec{ActiveDeadlineSeconds: new(int64(60))}}
 	msg := verifyInfraFailureMessage(nil, job, "", 0, true)
 	if !strings.Contains(msg, "(60s)") {
 		t.Fatalf("the message must name the Job's own deadline (60s):\n%s", msg)

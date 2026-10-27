@@ -115,6 +115,8 @@ var _ = Describe("F73 memory-writer outcome decision", func() {
 		Expect(cond.Reason).To(Equal(memoryWriteFailedReason))
 		Expect(cond.Message).To(ContainSubstring(batchv1.JobReasonBackoffLimitExceeded),
 			"the message names the Job's reason")
+		Expect(cond.Message).To(ContainSubstring("injected " + batchv1.JobReasonBackoffLimitExceeded + " message"),
+			"the batch controller's own condition message rides along")
 	})
 
 	It("makes no decision for a Complete Job whose pod is still Pending (the I49 control)", func() {
@@ -154,7 +156,7 @@ func f73StampJobFailed(ns, jobName, reason string) {
 	job.Status.Conditions = []batchv1.JobCondition{
 		{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: "FailureTarget"},
 		{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: reason,
-			Message: "Job has reached the specified backoff limit"},
+			Message: "injected " + reason + " message"},
 	}
 	Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 }

@@ -1428,9 +1428,11 @@ func f92HeldRequeue(kaptCRDMissing bool, phase coxv1alpha1.LoopPhase) bool {
 // is missing waits before the operator re-checks (F92 P2-2). The Loop owns
 // nothing that changes when KubeArmor is installed, so without this it could
 // stay held until an unrelated event; one minute re-checks quickly without a
-// reconcile hot loop. Two shapes do not take this window: a Loop still in the
-// clone-pending stage (the 5s work requeue fires first, and it is the one the
-// kind run shows), and a terminal Loop (f92HeldRequeue excludes it). It does not
+// reconcile hot loop. Three shapes do not take this window as the result: a
+// Loop still in the clone-pending stage (the 5s work requeue fires first, and
+// it is the one the kind run shows), a terminal Loop (f92HeldRequeue excludes
+// it), and a Loop whose budget window is sooner (the earlier of the two wins —
+// pi3 prereview-308 findings 2 and 5). It does not
 // by itself make the hold clear: that needs the CRD AND a node carrying the
 // BPF-LSM label (installing only the CRD still reports NodeNotEnforcing), or
 // --allow-unenforced.
@@ -6678,13 +6680,14 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 // reconcileRequeueAfter is the trailing requeue decision, extracted to keep
 // Reconcile within the gocyclo budget. The wall-clock RequeueAfters this
 // reconcile can set: the 5s work requeue below, the P2d budget window, the
-// R39 I144 memory-PVC re-announce window (the earlier of those two wins, so the
-// Event's re-announce is never waiting on a longer budget timer), and the F92
-// CRD-missing window. The F92 branch returns BEFORE that earlier-of comparison
-// because its window is the shortest by construction (kaptCRDMissingRequeue is
-// one minute; the budget and memory windows are longer), so taking it first is
-// the same as taking the earliest. Its argument is the caller's f92HeldRequeue
-// decision, which excludes a terminal Loop.
+// R39 I144 memory-PVC re-announce window, and the F92 CRD-missing window. The
+// EARLIEST of the last three wins, so none of them waits on a longer timer
+// (the Event's re-announce, or the F92 re-check, while a budget window is
+// ticking). The F92 window is NOT the shortest by construction — a token- or
+// cost-only budget returns 30s (F52 C6) and a nearly-elapsed wall clock can
+// return less than a minute — so it takes part in the same comparison instead
+// of returning first (pi3 prereview-308 finding 2). Its argument is the
+// caller's f92HeldRequeue decision, which excludes a terminal Loop.
 func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration, kaptCRDMissing bool) ctrl.Result {
 	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}
@@ -6693,15 +6696,18 @@ func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommit
 	// otherwise idle (its spec does not change and nothing it references
 	// changes when KubeArmor is installed), so it would stay held until some
 	// unrelated event. Requeue on a bounded window: installing KubeArmor (or
-	// restarting the operator) is then picked up within it.
-	if kaptCRDMissing {
-		return ctrl.Result{RequeueAfter: kaptCRDMissingRequeue}
+	// restarting the operator) is then picked up within it. next is the earlier
+	// of that window and the budget window (the memory window is compared
+	// against it below).
+	next := budgetRequeue
+	if kaptCRDMissing && (next == 0 || kaptCRDMissingRequeue < next) {
+		next = kaptCRDMissingRequeue
 	}
-	if memoryRequeue > 0 && (budgetRequeue == 0 || memoryRequeue < budgetRequeue) {
+	if memoryRequeue > 0 && (next == 0 || memoryRequeue < next) {
 		return ctrl.Result{RequeueAfter: memoryRequeue}
 	}
-	if budgetRequeue > 0 {
-		return ctrl.Result{RequeueAfter: budgetRequeue}
+	if next > 0 {
+		return ctrl.Result{RequeueAfter: next}
 	}
 	return ctrl.Result{}
 }

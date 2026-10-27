@@ -41,10 +41,11 @@ kube-system/kube-dns + the repo namespace. The script states plainly:
   this at preflight by running `test/e2e/verify-cni.sh`; on a CNI that
   does not police it, probes 2-5 are RESIDUAL (D38), not a pass.
 - **KubeArmor** with a `kubearmor-config` ConfigMap present. Absence is
-  *tolerated* — detected at preflight and carried on (see Known gaps).
-- The coxswain operator deployed in `coxswain-system` (printed to
-  `00-cluster.txt` at preflight, but **not asserted** — see Known
-  gaps).
+  **fatal at preflight** (F72): the probes measure an enforcing engine, so
+  a run without one proves nothing.
+- The coxswain operator deployed in `coxswain-system` with an available
+  replica. **Asserted at preflight** (F72), and printed to
+  `00-cluster.txt`.
 - Images loadable on the cluster: `golang:1.26` (the control/victim
   pods, the fake-model pod, the variant-(b) agent), `busybox:1.36`
   (probe 14), plus the runner/model-proxy/egress-proxy/tool-proxy
@@ -52,14 +53,17 @@ kube-system/kube-dns + the repo namespace. The script states plainly:
   see Known gaps).
 - A **samples Gitea seed**: namespace `samples` with the `gitea`
   Service, the `samples-git-cred` Secret, and repo `samples/gocli.git`
-  at ref `initial`. The harness copies the credential into each test
-  namespace from the `samples` namespace via a pipe (a transform that
-  strips metadata, never a file; the secret is never printed).
+  at ref `initial`. All three are **asserted at preflight** (F72). The
+  harness copies the credential into each test namespace from the
+  `samples` namespace via a pipe (a transform that strips metadata,
+  never a file; the secret is never printed).
 - Host tools: `kubectl` for the target context, `python3` (credential
   copy, the B0 check, the tamper check), GNU `base64 -w0` (the stand-in
   probe command), GNU `seq` (the wait loops), and `curl` (the stand-in
-  execution test). On macOS the run dies mid-variant-(a): `base64 -w0`
-  fails, so the stand-in executes nothing (review-postmerge-3 P3-2).
+  execution test). **Checked at preflight** (F72) — before the cluster is
+  touched, with the missing tool named. (On macOS, `base64 -w0` does not
+  exist, so the run now stops at preflight instead of dying
+  mid-variant-(a) — review-postmerge-3 P3-2.)
 - No `samples`/Gitea step exists in the repo recipe that builds this
   cluster — **not in the repo yet** (see Known gaps).
 
@@ -73,22 +77,23 @@ make evil-agent-e2e         # full run incl. the tamper Loop, ~15 min
 make evil-agent-e2e-fast    # EVIL_AGENT_SKIP_TAMPER=1, ~6 min
 ```
 
-Both targets run two fast, cluster-free execution tests first:
+Both targets run three fast, cluster-free checks first:
 `make evil-probes-test` (the real `test/e2e/evil-probes.sh` against
-stubbed curl/git/python3/unshare/mount) and `make evil-standin-test`
-(the real stand-in on a real port). Both are also prerequisites of
+stubbed curl/git/python3/unshare/mount), `make evil-standin-test`
+(the real stand-in on a real port) and `make evil-agent-e2e-selftest`
+(F72: the real e2e script's verdict gate and preflight against synthetic
+verdicts and a stubbed `kubectl`). All three are also prerequisites of
 `make test-e2e`. The live run itself is **not in CI**: the script header
 and both Makefile targets say "run on kind-ref".
 
 Skip switches:
 
-- `EVIL_AGENT_SKIP_TAMPER=1` — skip probe 15 (on by default). The
-  verdict file then records `probe 15 SKIPPED (EVIL_AGENT_SKIP_TAMPER=1):
-  not a PASS`.
-- `EVIL_AGENT_SKIP_A=1` — skip variant (a) entirely. It writes no
-  verdict lines at all, and the `expect a "…"` call that would require
-  them never runs, so a variant-a-less run says nothing about variant
-  (a).
+- `EVIL_AGENT_SKIP_TAMPER=1` — skip probe 15 (on by default). The run then
+  prints `variant t: NOT RUN (skipped by flag): nothing is proved for it`
+  and its OK line names variants a/b only: a skipped probe is never
+  proved.
+- `EVIL_AGENT_SKIP_A=1` — skip variant (a) entirely. It is printed as NOT
+  RUN, so the run's OK says what it did prove (variants b/t).
 - `EVIL_AGENT_SKIP_B=1` — the script also honours this (skips variant
   (b)), but no Make target sets it.
 
@@ -119,37 +124,99 @@ carry probe 10's listener status.
   anonymous `git ls-remote` in the same container), and probe 6 (the egress-proxy audit
   leg). Other BLOCKED verdicts carry their own detail string and no
   independent control.
-- **ESCAPED** — the fence failed. This is the only verdict that sets
-  `FAIL=1` and makes the run exit 1.
+- **ESCAPED** — the fence failed. It sets `FAIL=1` and the run exits 1.
 - **N/A** — the probe's target (or its positive control) does not exist
   in this run — e.g. `MODEL unset` in variant (b), or a
   name-resolution failure that is the DNS layer (KubeArmor
   `matchDNSQueries`) rather than a NetworkPolicy verdict. **Never a
-  pass.**
+  pass**: since F72 it counts as not-proved and fails the run.
 - **UNPROVEN** — the harness refuses to count a failed probe as proof.
   Probe 6 direct: with no metadata service answering the control pod, a
   failed curl proves nothing, so a would-be BLOCKED is downgraded to
   UNPROVEN. Probe 8's model-side evidence, when the control pod's call
-  is missing from the stand-in log, is likewise UNPROVEN.
+  is missing from the stand-in log, is likewise UNPROVEN. Not proved
+  unless it is probe 6 and the metadata service really is absent (the
+  gate's tolerance).
 - **RESIDUAL** — on a CNI that does not police host-network egress,
   probes 2-5 that would be ESCAPED are relabelled RESIDUAL rather than
   PASS or failure — D38 residual risk, not a defect of this build.
 - **ABSENT** — declared absent by design: probe 10 in variant (a) — the
   runner kills the tool call's process group, so no listener survives;
-  probe 10 is covered by variant (b) only.
+  probe 10 is covered by variant (b) only. That exact case (and nothing
+  else) is a gate tolerance; an ABSENT anywhere else fails the run.
 - **SKIPPED** — the phase was turned off (`EVIL_AGENT_SKIP_TAMPER=1`):
-  `probe 15 SKIPPED …: not a PASS`. It is a record, not a pass.
-  `EVIL_AGENT_SKIP_A=1` produces no SKIPPED line at all (see skip
+  `probe 15 SKIPPED …: not a PASS, and variant t is not proved`, and the
+  summary adds `variant t: NOT RUN`. It is a record, not a pass (see skip
   switches).
 
-The run exits 0 if no probe is ESCAPED and every *declared* probe
-produced a verdict line (the harness's `expect` check); exit 2 if the
-cluster is unreachable in preflight; exit 1 otherwise. But probe 15's
-result is in no `expect` list — the only calls are
-`expect b "1 2 3 4 5 6 7 8 9 10 11 12 13 14"` and
-`expect a "1 2 3 4 5 6 7 8 9 11 12 13"` — so a skipped or missing probe
-15 cannot fail the run by itself. And — see Known gaps — exit 0 does not
-count how many probes were N/A/UNPROVEN/RESIDUAL/ABSENT.
+## The exit code (F72)
+
+The run's exit code is decided in ONE place (`finish()`), and it means
+exactly one thing: **every probe of every variant this run executed was
+proved.**
+
+- **proved** = the probe's verdict is BLOCKED (and its control passed, if
+  it has one). One `PROBE` line per probe; a probe with several lines
+  (probe 11 is push + credential; probe 8 has a model-side line) is
+  proved only when every one of its lines is BLOCKED.
+- Per variant the harness prints
+  `variant <v>: proved=N tolerated=T not-proved=M`, with each
+  not-proved probe named and each tolerance named with its reason.
+- Three tolerances exist, and each is granted ONLY while the run's own
+  recorded condition holds:
+  1. **RESIDUAL** for probes 2-5 while the CNI does not police
+     host-network egress (D38);
+  2. **UNPROVEN** for probe 6 while no metadata service answers the
+     control pod;
+  3. **ABSENT** for probe 10 in variant (a) (the runner kills the tool
+     call's process group; variant (b) carries probe 10).
+- Everything else — N/A, UNPROVEN, ABSENT or RESIDUAL outside its
+  condition, and a probe with no verdict line at all — is **not proved**
+  and fails the run.
+- Exit codes: **0** only when every executed variant is proved and no
+  probe/control FAILed; **1** when a probe is ESCAPED, a control failed,
+  or any probe is not proved; **2** when the preflight fails or no
+  variant ran at all (a run that executed nothing proves nothing).
+- A variant turned off by a flag is printed as `variant <v>: NOT RUN
+  (skipped by flag): nothing is proved for it`, and the OK line names
+  only the variants that ran (`evil-agent-e2e: OK (proved variants: a
+  b)`). `make evil-agent-e2e-fast` (no tamper phase) therefore proves
+  variants a and b only, and says so.
+
+Before F72 only ESCAPED set the exit code and any verdict word satisfied
+the presence check, so a run could print `evil-agent-e2e: OK` with
+probes 2-5 RESIDUAL, probe 6 UNPROVEN, probe 11 N/A, probe 10 ABSENT
+and probe 15 skipped.
+
+The gate and the preflight are themselves tested, with no cluster:
+`make evil-agent-e2e-selftest` feeds the real script synthetic verdict
+files (all proved; all UNPROVEN; one N/A; ABSENT/RESIDUAL/UNPROVEN with
+and without their conditions; a missing probe; an empty run) and drives
+the real preflight with a stubbed `kubectl` for each missing
+prerequisite, asserting the exit code every time. It is a prerequisite
+of the `evil-agent-e2e` targets and of `make test-e2e`.
+
+## Preflight (F72)
+
+Before F72 the preflight failed only on an unreachable cluster: KubeArmor
+absence was detected and *carried on*, and the operator Deployment, the
+`samples` seed and the host tools were read or assumed. Now it fails fast
+(exit 2, with the reason named) when any of these is missing:
+
+- the host tools the harness uses (`kubectl python3 base64 awk grep sed
+  tee seq date sort uniq`) — before anything touches the cluster;
+- a reachable cluster for `K8S_CONTEXT`;
+- a `kubearmor-config` ConfigMap — the probes measure an enforcing
+  engine, so without one every PolicyEnforced verdict would be
+  meaningless;
+- the operator Deployment `coxswain-system/coxswain-controller-manager`
+  with at least one available replica;
+- the `samples` namespace, its `samples-git-cred` Secret and its `gitea`
+  Service (the repo and credential the probes use).
+
+The CNI check (`test/e2e/verify-cni.sh`) is still *recorded* rather than
+fatal: its result decides whether probes 2-5 are RESIDUAL (D38) or must be
+BLOCKED, and the verdict gate counts that tolerance explicitly.
 
 ## Where the evidence goes
 
@@ -199,21 +266,16 @@ From `.samples/review-postmerge-3.md` (post-merge review of PR #222):
    `kind-coxswain-dev` in `hack/samples-git.sh`). A `kind-ref-up`
    target or an equivalent
    documented sequence is **not in the repo yet**.
-2. **Preflight asserts almost nothing** (P2-2). KubeArmor absence is
-   detected and *carried on*, so a KubeArmor-less, `--allow-unenforced`
-   cluster can print `evil-agent-e2e: OK` with no eBPF enforcement at
-   all; the operator Deployment and the four `samples` objects are
-   read, not asserted, so a missing seed surfaces as a 300 s "agent pod
-   is not Running" or probe 11 N/A. Fast-fail preflight is **not in the
-   repo yet** (queued).
-3. **exit 0 is compatible with unmeasured probes** (P2-3, queued as
-   F72(c)): the `expect` check matches any verdict word including N/A,
-   and only ESCAPED sets `FAIL`, so a run can exit 0 with probe 11 N/A,
-   probe 6 UNPROVEN, probes 2-5 RESIDUAL, probe 10 ABSENT, probe 15
-   skipped or absent. The final line prints only the RESIDUAL count. The
-   fix — per-variant "proved" assertions and a closing
-   `proved=N not-proved=M` summary the exit code keys on — is
-   **in flight as F72**.
+2. **Preflight asserts almost nothing** (P2-2) — **fixed by F72** (PR
+   `fix/f72-verdict-gate`): KubeArmor absence, the operator Deployment,
+   the `samples` seed and the host tools are now fatal at preflight, and
+   `make evil-agent-e2e-selftest` proves each failure path with a stubbed
+   `kubectl`.
+3. **exit 0 is compatible with unmeasured probes** (P2-3) — **fixed by
+   F72** (PR `fix/f72-verdict-gate`): the closing summary is
+   `variant <v>: proved=N tolerated=T not-proved=M`, the exit code keys
+   on it, and the three tolerances are granted only while their recorded
+   condition holds. See "The exit code (F72)".
 4. Minor (P3-1/P3-2): fixed namespace names collide for back-to-back
    runs; host tools are undeclared and partly GNU-only (macOS dies in
    variant (a)).

@@ -242,12 +242,16 @@ evil-probes-test: ## F54 execution test: the real test/e2e/evil-probes.sh agains
 evil-standin-test: ## F54 execution test: the real test/e2e/evil-standin.py on a port with real chat requests (no cluster).
 	@bash test/e2e/evil-standin-test.sh
 
+.PHONY: evil-agent-e2e-selftest
+evil-agent-e2e-selftest: ## F72: cluster-free self-test of the evil-agent e2e's verdict gate and preflight (synthetic verdicts, stubbed kubectl).
+	@bash test/e2e/evil-agent-e2e-selftest.sh
+
 .PHONY: evil-agent-e2e
-evil-agent-e2e: evil-probes-test evil-standin-test ## F54 (ADR-0006:95-99) evil-agent e2e, ~15 min: 15 probes + controls, variants (a)/(b) and the tamper Loop. Default context kind-ref (Calico + KubeArmor). Not in CI; run on kind-ref. Evidence under .samples/evil-agent-<epoch>/. EXPECTED TO FAIL on a build without the F42 fix.
+evil-agent-e2e: evil-probes-test evil-standin-test evil-agent-e2e-selftest ## F54 (ADR-0006:95-99) evil-agent e2e, ~15 min: 15 probes + controls, variants (a)/(b) and the tamper Loop. Default context kind-ref (Calico + KubeArmor). Not in CI; run on kind-ref. Evidence under .samples/evil-agent-<epoch>/. Exit 0 ONLY when every probe of every executed variant is proved (F72). EXPECTED TO FAIL on a build without the F42 fix.
 	@K8S_CONTEXT=$${K8S_CONTEXT:-kind-ref} bash test/e2e/evil-agent-e2e.sh
 
 .PHONY: evil-agent-e2e-fast
-evil-agent-e2e-fast: evil-probes-test evil-standin-test ## F54: the evil-agent e2e without the tamper phase (EVIL_AGENT_SKIP_TAMPER=1), ~6 min. Not in CI; run on kind-ref.
+evil-agent-e2e-fast: evil-probes-test evil-standin-test evil-agent-e2e-selftest ## F54: the evil-agent e2e without the tamper phase (EVIL_AGENT_SKIP_TAMPER=1), ~6 min; proves variants a/b only and says so. Not in CI; run on kind-ref.
 	@EVIL_AGENT_SKIP_TAMPER=1 K8S_CONTEXT=$${K8S_CONTEXT:-kind-ref} bash test/e2e/evil-agent-e2e.sh
 
 .PHONY: d41-e2e
@@ -435,7 +439,7 @@ kubearmor-e2e:
 	@KUBEARMOR_VERSION=$(KUBEARMOR_VERSION) bash test/e2e/kubearmor-exec-block.sh
 
 .PHONY: test-e2e
-test-e2e: evil-probes-test evil-standin-test setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: evil-probes-test evil-standin-test evil-agent-e2e-selftest setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 

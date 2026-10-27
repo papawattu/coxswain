@@ -375,6 +375,17 @@ func parseRestoreFrom(s string) (int, error) {
 // not touch the sandbox at all — its snapshot is not ready; the rejected
 // target is gone).
 func (r *LoopReconciler) b2RestoreHoldSuspended(loop *coxv1alpha1.Loop) bool {
+	return restoreStepInProgress(loop)
+}
+
+// restoreStepInProgress reports whether the Restore condition is one of the
+// in-progress step reasons the restore passes set while they run
+// (StoppingWorkloads, StoppingSandbox, DeletingPVC). It is the phase-independent
+// "a restore has started and has not completed or been rejected" test: the
+// sandbox hold (b2RestoreHoldSuspended) and the deliver gate (deliveryRequested,
+// F77's F3.3 half) both read it. A REJECTED (False/RestoreSourceMissing) or
+// DEFERRED (False/RestoreSourceNotReady) restore is NOT in progress.
+func restoreStepInProgress(loop *coxv1alpha1.Loop) bool {
 	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
 	if c == nil || c.Status != metav1.ConditionFalse {
 		return false
@@ -678,10 +689,12 @@ func (r *LoopReconciler) stopWorkloadsForRestore(ctx context.Context, loop *coxv
 
 // restoreSpecKeyMarker brackets the spec restore target recorded in the
 // Restored condition's message (F35). A message WITHOUT the marker was written
-// before F35: it cannot be re-armed by an edit, so it counts as complete only
-// while the Loop's spec names no restore target (F75 — it must not vouch for a
-// target the spec names now, or a later spec.restoreFrom would look already
-// restored and never run).
+// before F35, so it carries no key — but it does carry the target it restored
+// in its own text ("… (rollback, iter-3)"), which is what
+// legacyMarkerCoversSpec compares with the spec (F75, and the P1 fix in pi3's
+// first review of PR #337: treating every keyless marker as incomplete re-ran
+// a COMPLETED rollback — deleting the workspace PVC and restoring the old
+// snapshot — for every Loop that restored on v0.1.1/v0.1.2).
 const restoreSpecKeyMarker = " [spec-target="
 
 // specRestoreKey identifies the restore target the Loop's SPEC names: the
@@ -714,8 +727,10 @@ func restoredMessage(loop *coxv1alpha1.Loop, target *b2RestoreTarget) string {
 // the TARGET: an unrelated edit keeps it; a different restore target (only
 // reachable by a client that bypasses the CRD immutability rule, or by setting
 // restoreFrom/forkOf on a Loop that had none) re-arms it. A marker written
-// before this key existed has no key and counts as complete (it cannot be
-// re-armed by an edit either).
+// before this key existed is compared against the target it names in its own
+// text (legacyMarkerCoversSpec) — never treated as complete or incomplete
+// wholesale, because both choices lose data or skip work for a real
+// population.
 func restoreCompletedForSpec(loop *coxv1alpha1.Loop) bool {
 	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
 	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != coxv1alpha1.RestoreReasonRestored {
@@ -723,16 +738,77 @@ func restoreCompletedForSpec(loop *coxv1alpha1.Loop) bool {
 	}
 	_, rest, found := strings.Cut(c.Message, restoreSpecKeyMarker)
 	if !found {
-		// A legacy marker (written before the key existed) has no target of its
-		// own. F75: it stays complete for a Loop that names no spec restore
-		// target, but it must not cover one the Loop names NOW — a pre-F35
-		// completion (a lost-PVC restore, say) would otherwise make a later
-		// spec.restoreFrom look already restored, and with the PVC present
-		// b2RestoreTarget would return nil, so the rollback would never run.
-		return specRestoreKey(loop) == ""
+		return legacyMarkerCoversSpec(loop, c.Message)
 	}
 	key, _, _ := strings.Cut(rest, "]")
 	return key == specRestoreKey(loop)
+}
+
+// legacyMarkerCoversSpec reports whether a keyless (pre-F35) Restored marker
+// covers the restore target the Loop's spec names now (F75, R32 I113(b)).
+//
+// The marker is not information-free: every completion since the restore
+// machinery landed writes the kind and the iteration it restored into the
+// message ("workspace PVC restored from <snap> (rollback, iter-3)"), and F35
+// only APPENDED its [spec-target=…] key to that same text. Comparing the
+// target the marker names with the spec's target distinguishes the cases a
+// blanket "keyless ⇒ incomplete when the spec names a target" rule cannot:
+//
+//   - a completed ROLLBACK whose spec.restoreFrom is still the target its
+//     marker names is COMPLETE. restoreFrom/forkOf are immutable and nothing
+//     clears restoreFrom after a rollback, so every Loop that completed a
+//     rollback or a fork on v0.1.1/v0.1.2 (which have B2 but not F35) is in
+//     exactly this shape: re-arming it deletes the workspace PVC and restores
+//     the old snapshot over everything done since, and announces it with an
+//     ordinary Restored Event — silent data loss on upgrade (pi3's P1);
+//   - a completed LOST-PVC restore plus a spec.restoreFrom set afterwards is
+//     INCOMPLETE: a lost-PVC restore does not vouch for a rollback, and the
+//     kinds differ in the text, which is what makes F75's actual defect
+//     detectable (a lost-PVC marker cannot cover a rollback target);
+//   - a marker whose target cannot be read is COMPLETE. A skipped rollback is
+//     recoverable (set the target again); a wiped workspace is not.
+func legacyMarkerCoversSpec(loop *coxv1alpha1.Loop, message string) bool {
+	// No spec target: the marker was written for a reactive (lost-PVC) restore
+	// and there is nothing in the spec for it to cover — complete, which is the
+	// behaviour the pre-F35 marker was written for.
+	if specRestoreKey(loop) == "" {
+		return true
+	}
+	kind, iteration, ok := legacyRestoreTarget(message)
+	if !ok {
+		return true // an unreadable target: prefer complete (see above)
+	}
+	if loop.Spec.ForkOf != nil {
+		return kind == b2KindFork && iteration == loop.Spec.ForkOf.Iteration
+	}
+	it, err := parseRestoreFrom(loop.Spec.RestoreFrom)
+	if err != nil {
+		return true // a malformed spec target names no restore that could run
+	}
+	return kind == b2KindRollback && iteration == it
+}
+
+// legacyRestoreTarget parses the target a pre-F35 marker recorded in its own
+// message: "… (<kind>, iter-<N>)". ok is false when the text does not carry
+// that parenthetical, so an unknown shape is never guessed at.
+func legacyRestoreTarget(message string) (kind b2Kind, iteration int, ok bool) {
+	i := strings.LastIndex(message, "(")
+	if i < 0 {
+		return "", 0, false
+	}
+	body, closed := strings.CutSuffix(message[i+1:], ")")
+	if !closed {
+		return "", 0, false
+	}
+	kindText, iterText, found := strings.Cut(body, ", iter-")
+	if !found || kindText == "" {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(iterText))
+	if err != nil || n < 0 {
+		return "", 0, false
+	}
+	return b2Kind(kindText), n, true
 }
 
 // setRestoreCondition sets the Restore condition (the B2 durable record)

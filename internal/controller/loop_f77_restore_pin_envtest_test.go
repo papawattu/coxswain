@@ -104,8 +104,9 @@ var _ = Describe("F77: a completed restore clears the verify pin", func() {
 	// the old pin. The gate is asserted as the operator computes it
 	// (deliveryRequested / deliveryEnabled, which ensureDeliverJob returns early
 	// on) with a delivery config in place; the live Loop keeps spec.delivery
-	// unset so no deliver Job is created during the rollback's in-progress
-	// passes (the pin is still set then — see the PR body).
+	// unset so this spec stays about the completed state (the live, Job-level
+	// half of the same claim — no deliver Job for the pin while the restore is in
+	// progress — is pinned in loop_f75_legacy_restore_envtest_test.go, F3.3).
 	f77ExpectCleared := func(restored *cov.Loop) {
 		Expect(restored.Status.CurrentVerify).To(BeNil(),
 			"F77: a completed restore clears status.currentVerify (the old pin describes a discarded workspace)")
@@ -135,6 +136,9 @@ var _ = Describe("F77: a completed restore clears the verify pin", func() {
 		pinned.Status.CurrentVerify = &cov.CurrentVerifyStatus{VerifiedCommit: f77Pin}
 		Expect(deliveryEnabled(pinned)).To(BeTrue(),
 			"the gate is real: with the pin present, delivery is expected (so the assertion above is not vacuous)")
+		requestedPinned, _ := deliveryRequested(pinned)
+		Expect(requestedPinned).To(BeTrue(),
+			"the control exercises the SAME function that produced the negative result (deliveryRequested), not only its phase-independent half")
 	}
 
 	// f77ExpectPinEvent asserts the completion's Normal Event names the clear

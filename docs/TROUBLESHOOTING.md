@@ -689,18 +689,20 @@ clears the verify pin — `status.currentVerify` and `status.verify`'s
 (F77). The restored workspace comes from a snapshot, so it does not hold the
 commit the pin names; the `Restored` Event says when this happened ("the verify
 pin and its tamper record were cleared…"). **A delivery that was queued before
-the rollback is dropped**: the deliver Job's gate needs the pin, and the restore
-step runs before the deliver step in the same reconcile. That is intended —
-delivering would open a PR for the work the rollback just discarded. Re-run the
-Loop (and let it verify again) if a PR is still wanted.
+the rollback is dropped**: the deliver Job's gate refuses while a restore is in
+progress, and the restore's stop step deletes the queued Job on the first
+in-progress pass; the gate then needs the pin, which the completion has cleared.
+That is intended — delivering would open a PR for the work the rollback just
+discarded. Re-run the Loop (and let it verify again) if a PR is still wanted.
 
 ### Warning `ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed` (F36)
 
 **What you see:** Warning Events naming the snapshot: setting or removing the
 fork-retention label failed. **They do not retry the same way.** The *remove*
 repeats on every reconcile until the patch succeeds. The *set* is retried only
-while the fork's PVC create keeps failing — it is written once before the
-create, and a failed set is **not** retried after the create succeeds (F76).
+while the fork's PVC create keeps failing — it is attempted once per pass, before
+**each** create attempt, until the PVC exists, and a failed set is **not**
+retried after the create succeeds (F76).
 
 **What it means:** the fork's source VolumeSnapshot was not (or could not be)
 marked for retention (`ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed`,
@@ -708,10 +710,11 @@ emitted from `internal/controller/loop_restore.go`). On the set failure, the
 source's garbage collection may delete the snapshot while the fork is
 restoring; on the remove failure, the label persists and the source's GC
 skips the snapshot (a known B2 limitation). Both writes are best-effort by
-design: a failed set does not fail the fork (the fork's PVC create has already
-been accepted — the content is the CSI driver's to materialise, not the
-snapshot's to keep serving), and a failed remove does not fail the fork either
-(the data is in the fork's PVC, which the fork's own GC deletes).
+design: a failed set does not fail the fork — it warns and the create is still
+attempted (what the CSI driver does with a snapshot that GC deleted in the
+meantime is the driver's behaviour; this operator does not rely on either
+outcome) — and a failed remove does not fail the fork either (the data is in
+the fork's PVC, which the fork's own GC deletes).
 
 **What to do:** check the operator's RBAC for `patch` on volumesnapshots
 (`kubectl auth can-i patch volumesnapshots --as=<the operator's
@@ -720,12 +723,13 @@ ServiceAccount>`). With RBAC correct:
 - `ForkRetentionLabelRemoveFailed` stops by itself — the remove runs on every
   reconcile while the completed fork's PVC is present.
 - `ForkRetentionLabelFailed` stops only if the fork's PVC create is still
-  failing (the set is retried on each create attempt). If the create has
+  failing (the set is attempted again on each create attempt). If the create has
   already succeeded, **do not expect a retry**: mark the source snapshot by
-  hand (`kubectl label volumesnapshot <snapshot> coxswain.wattu.com/fork-of=<fork>`
-  — it needs `patch`, and the operator will not re-mark it), or accept that the
-  source's GC may delete the snapshot. A fork whose PVC exists no longer needs
-  it.
+  hand (`kubectl label -n <the fork's namespace> volumesnapshot <snapshot>
+  coxswain.wattu.com/fork-of=<the fork Loop's name>` — the snapshot lives in the
+  FORK's namespace and the label value is the fork Loop's name; it needs
+  `patch`, and the operator will not re-mark it), or accept that the source's GC
+  may delete the snapshot. A fork whose PVC exists no longer needs it.
 
 ### `VerifyInfraFailed` — was the agent tampering? (F39)
 

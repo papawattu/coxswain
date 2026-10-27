@@ -80,15 +80,26 @@ func TestRestoreCompletedForSpec(t *testing.T) {
 			t.Fatal("a marker written before the key existed must not be re-armed by an edit")
 		}
 	})
-	t.Run("legacy marker does not cover a target the spec names now (F75)", func(t *testing.T) {
-		// The marker predates the key, so it cannot say which target it restored.
-		// A Loop that names spec.restoreFrom now needs a restore decision: with
-		// the marker counting as complete and the PVC present, b2RestoreTarget
-		// returns nil and the rollback never runs.
+	t.Run("legacy marker names its target: a LOST-PVC restore does not cover a rollback (F75)", func(t *testing.T) {
+		// The marker predates the key. Its text says it was a lost-PVC restore,
+		// so it cannot vouch for a rollback the spec now names: with the marker
+		// counting as complete and the PVC present, b2RestoreTarget would return
+		// nil and the rollback would never run.
+		l := mk("iter-3", nil, 7)
+		mark(l, "workspace PVC restored from snap (lostPVC, iter-3)", metav1.ConditionTrue, coxv1alpha1.RestoreReasonRestored)
+		if restoreCompletedForSpec(l) {
+			t.Fatal("a keyless lost-PVC marker must not cover a rollback target the spec names")
+		}
+	})
+	t.Run("legacy marker names its target: a restored rollback covers the same spec target (PR #337 P1)", func(t *testing.T) {
+		// restoreFrom is immutable and nothing clears it, so every rollback
+		// completed on v0.1.1/v0.1.2 (B2 yes, F35 no) is this shape. Treating it
+		// as incomplete deletes the PVC and re-restores the old snapshot on the
+		// first reconcile after upgrade.
 		l := mk("iter-3", nil, 7)
 		mark(l, "workspace PVC restored from snap (rollback, iter-3)", metav1.ConditionTrue, coxv1alpha1.RestoreReasonRestored)
-		if restoreCompletedForSpec(l) {
-			t.Fatal("a keyless marker must not cover a restore target the spec names")
+		if !restoreCompletedForSpec(l) {
+			t.Fatal("a keyless rollback marker for the iter the spec still names is complete; re-arming it wipes the workspace")
 		}
 	})
 	t.Run("in-progress or failed restore is not complete", func(t *testing.T) {

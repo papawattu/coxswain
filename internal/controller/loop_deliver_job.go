@@ -645,12 +645,25 @@ func (r *LoopReconciler) deliverClearDeliveredCondition(loop *coxv1alpha1.Loop) 
 // outcome must not suppress the new one. A failed delivery for the SAME
 // commit is re-run by the operator's redeliverAnnotation (I52,
 // ensureDeliverRedeliver).
+//
+// While a workspace restore is IN PROGRESS the answer is no (F77's F3.3 half):
+// the pin names the workspace the restore is replacing, so a Job created now
+// would deliver a commit the restored PVC will not hold. Without this term the
+// gate re-created the Job on every in-progress pass — stopWorkloadsForRestore
+// deletes it and ensureDeliverAndSettle (which runs after the restore step, not
+// behind its hold) created it again in the same pass, because the pin is
+// deliberately kept until the completion. The completion itself clears the pin
+// (clearVerifyPinAtRestore) before the deliver step runs, so the queued delivery
+// is dropped from the first in-progress pass and never comes back.
 func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
 	if !deliveryPhaseActive(loop) {
 		return false, "phase is not Succeeded (or the Verifying delivery hold)"
 	}
 	if loop.Spec.Delivery == nil || loop.Spec.Delivery.Mode != coxv1alpha1.DeliveryModePullRequest {
 		return false, "delivery mode is not PullRequest"
+	}
+	if restoreStepInProgress(loop) {
+		return false, "a workspace restore is in progress (the pin names the workspace it replaces)"
 	}
 	if loop.Status.CurrentVerify == nil || loop.Status.CurrentVerify.VerifiedCommit == "" {
 		return false, "no verifiedCommit pinned (status.currentVerify)"

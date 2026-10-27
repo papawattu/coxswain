@@ -480,11 +480,20 @@ On the devbox (where the build dependencies live):
 ```bash
 BUILD_TAG="d61-$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
 
-make proxy-build PROXY_IMG=coxswain-tool-proxy:$BUILD_TAG \
-     EGRESS_IMG=coxswain-egress-proxy:$BUILD_TAG \
-     PROXY_IMG=coxswain-model-proxy:$BUILD_TAG
-make runner-build RUNNER_IMG=coxswain-runner:$BUILD_TAG
 make docker-build IMG=coxswain-controller:$BUILD_TAG
+make runner-build RUNNER_IMG=coxswain-runner:$BUILD_TAG
+make egress-proxy-build EGRESS_IMG=coxswain-egress-proxy:$BUILD_TAG
+# model-proxy and tool-proxy have no Makefile target (proxy-build builds the
+# dev STAND-IN, cmd/proxy-standin, which is not the metering proxy). These two
+# lines are the release workflow's own mapping (.github/workflows/release.yml:
+# the model-proxy and tool-proxy matrix rows, context "."), so they build the
+# same images a release does, with no build args:
+docker build -t coxswain-model-proxy:$BUILD_TAG -f cmd/model-proxy/Dockerfile .
+docker build -t coxswain-tool-proxy:$BUILD_TAG -f cmd/tool-proxy/Dockerfile .
+
+# All five images are needed: the tag/save/load block below is fixed at five.
+# tool-proxy is built even though this Loop uses no tools — §9 is a
+# production-parity install, and dropping it would quietly weaken the section.
 
 # Transfer to the VM and load into the kind cluster
 for img in controller runner egress-proxy model-proxy tool-proxy; do
@@ -505,6 +514,15 @@ ssh <vm> "
 ```bash
 # Render install.yaml with the build tag
 make build-installer IMG=ghcr.io/papawattu/coxswain-controller:$BUILD_TAG
+# The rendered dist/install.yaml carries all five image args at IMG's tag, so no
+# separate variable is needed: the four component images (runner, model-proxy,
+# tool-proxy, egress-proxy) are derived from IMG by hack/image-args.sh — same
+# registry and path prefix as IMG, IMG's tag (that derivation is why a registry
+# with a port still works) — and --memory-writer-image comes from the kustomize
+# replacement of IMG_PLACEHOLDER in config/manager/manager.yaml.
+# The ghcr.io/papawattu/ prefix matches the names Step 5 re-tags the locally
+# built images to and loads into kind, so install.yaml and the loaded images
+# agree and nothing is pulled from the registry.
 # With RWX memory (see "RWX memory", after Step 6): add MEMORY_STORAGE_CLASS=local-shared
 #   make build-installer IMG=ghcr.io/papawattu/coxswain-controller:$BUILD_TAG MEMORY_STORAGE_CLASS=local-shared
 
@@ -552,10 +570,19 @@ ssh <vm> "
 ### Step 8: Run a Loop and verify both gates
 
 ```bash
+# config/samples/loop-d61-proof.yaml is the Loop this section's evidence was
+# taken from: spec.agent.modelEndpoint is the VM's vLLM, spec.workspace.repo is
+# the sandbox repo, and the two Secrets it names are the ones Step 7 creates.
+# If you are not the maintainer: change spec.workspace.repo to a repo your
+# git-cred token can push to, and spec.agent.endpointSecretRef /
+# spec.agent.modelEndpoint to your model backend BEFORE applying; the last two
+# are immutable, so a Loop created with the wrong endpoint must be deleted and
+# re-created. The file's exact values are the ones §9's evidence run used.
+scp config/samples/loop-d61-proof.yaml <vm>:/tmp/loop-d61-proof.yaml
 ssh <vm> "
-  kubectl --context kind-coxswain-ref apply -f /tmp/d61-loop.yaml
+  kubectl --context kind-coxswain-ref apply -f /tmp/loop-d61-proof.yaml
   # Watch the Loop
-  kubectl --context kind-coxswain-ref -n d61 get loop d61-loop -w
+  kubectl --context kind-coxswain-ref -n d61 get loop d61-proof -w
 "
 ```
 

@@ -936,6 +936,22 @@ gate sets the object's operating mode; it does not prevent the object), along
 with the workspace PVC. Both are visible on kind: `f92-kubearmor-sandbox  Suspended` and
 `persistentvolumeclaim/f92-kubearmor-workspace` waiting for its first consumer.
 The sandbox is held, not deleted, so nothing starts in it while the hold is on.
+Nothing runs in it either: the sandbox is held `Suspended`, and that mode keeps
+no pod — the sandbox controller terminates the backing pod and retains the object
+(`Suspended` in the F92 capture at `.samples/f92-kind/06-loop-final.txt:17`, with
+`SandboxSuspended` Events at `:20-21`; the workspace PVC is still
+`WaitForFirstConsumer` at `:26` and `:33`, and no `FailedScheduling` Event appears
+in the events block at `:19-33`). So there is no pod to exec into, which is the
+shape you want here. Two caveats: the template also carries a *required* node
+affinity for the BPF-labelled node (`applyBPFNodeAffinity`,
+`internal/controller/loop_controller.go:1875`, applied at `:2037`;
+`kubearmor.io/enforcer In bpf` by default,
+`internal/engine/kubearmor_enforcer.go:487-509`), so even a `Running` sandbox
+would not schedule on a cluster with no KubeArmor agent — though that affinity is
+dropped under `--allow-unenforced` (`BPFNodeAffinity` returns nil, `:481-484`),
+the escape hatch "What to do" above offers, and the F92 capture ran without it
+(`06-loop-final.txt:1`); and the capture included no `kubectl get pods`, so the pod
+list itself is not recorded — the object state above is.
 
 **What to do:** install KubeArmor so the CRD **and** the enforcer agents are
 present (the supported configuration — see `docs/QUICKSTART.md` step 3), or

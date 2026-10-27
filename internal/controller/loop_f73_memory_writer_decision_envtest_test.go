@@ -115,7 +115,7 @@ var _ = Describe("F73 memory-writer outcome decision", func() {
 		Expect(cond.Reason).To(Equal(memoryWriteFailedReason))
 		Expect(cond.Message).To(ContainSubstring(batchv1.JobReasonBackoffLimitExceeded),
 			"the message names the Job's reason")
-		Expect(cond.Message).To(ContainSubstring("injected " + batchv1.JobReasonBackoffLimitExceeded + " message"),
+		Expect(cond.Message).To(ContainSubstring("injected "+batchv1.JobReasonBackoffLimitExceeded+" message"),
 			"the batch controller's own condition message rides along")
 	})
 

@@ -463,12 +463,13 @@ file paths rather than line numbers, which change as main moves on.
 
 **What you see:** the Loop reaches `Running`, the sandbox pod is up, and
 nothing ever advances — no model traffic, no commits, no phase change. The
-Loop carries `RunnerAvailable=False` with reason `RunnerImageUnset`, and a
-Warning `RunnerUnavailable` Event was emitted when the operator observed that
-shape: one per observed transition, not one per reconcile. (A pass that fails
-before its status write re-observes the shape on every retry, so a Loop that
-keeps failing can show one Event per retry even though the condition itself
-does not change.)
+Loop carries `RunnerAvailable=False` with reason `RunnerImageUnset` — recorded
+once a pass reaches its status write, so a Loop whose every pass fails earlier
+shows the Event without the condition — and a Warning `RunnerUnavailable`
+Event was emitted when the operator observed that shape: one per observed
+transition, not one per reconcile. (A pass that fails before its status write
+re-observes the shape on every retry, so a Loop that keeps failing can show
+one Event per retry even though the condition itself does not change.)
 
 **What it means:** the operator has no `--runner-image` and the Loop has no
 `spec.agent.image`, so the agent container's command is the operator's

@@ -273,23 +273,33 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		loop := buildLoop(name, ns, []string{i42bPolicyName})
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
-		// Pre-create the egress proxy Service WITH an assigned ClusterIP (the
-		// apiserver's job on a real cluster). envtest does not run the service
-		// controller, so a Service the operator creates has no ClusterIP and the
-		// F11 guard (only reset on the create path) is invisible. Pre-creating it
-		// with a ClusterIP makes the operator's reconcile hit the UPDATE path
-		// (the Service exists with a non-empty resourceVersion + ClusterIP),
-		// where the F11 fix (don't reset the assigned ClusterIP) matters.
+		// Pre-create the egress proxy Service so the operator's reconcile takes
+		// the UPDATE path (the Service already exists with a non-empty
+		// resourceVersion), where the F11 guard (reset ClusterIP/ipFamily only
+		// on the create path) matters.
+		//
+		// F81: the ClusterIP is NOT pinned to a literal. The suite's apiserver
+		// allocates from --service-cluster-ip-range 10.0.0.0/16 (suite_test.go),
+		// so a literal IP is a cluster-global resource that a concurrent or
+		// earlier spec can already hold — a pinned IP collided with one that was
+		// already allocated (F81, R33 I117). ClusterIP allocation
+		// is the apiserver's service registry, not the service controller (which
+		// handles NodePort/LoadBalancer), so a Service the operator creates DOES
+		// get one. Let the apiserver pick, read it back, and assert it did: a
+		// future envtest without an allocation range fails loudly here instead of
+		// passing the two ClusterIP assertions vacuously.
 		svcFixture := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Name: name + "-egress-proxy", Namespace: ns},
 			Spec: corev1.ServiceSpec{
-				ClusterIP: "10.0.99.99",
-				Ports:     []corev1.ServicePort{{Name: "http", Port: egressProxyPort, Protocol: corev1.ProtocolTCP}},
-				Selector:  egressProxyLabels(name),
-				Type:      corev1.ServiceTypeClusterIP,
+				Ports:    []corev1.ServicePort{{Name: "http", Port: egressProxyPort, Protocol: corev1.ProtocolTCP}},
+				Selector: egressProxyLabels(name),
+				Type:     corev1.ServiceTypeClusterIP,
 			},
 		}
-		Expect(k8sClient.Create(ctx, svcFixture)).To(Succeed(), "pre-create the egress proxy Service with an assigned ClusterIP")
+		Expect(k8sClient.Create(ctx, svcFixture)).To(Succeed(), "pre-create the egress proxy Service")
+		Expect(svcFixture.Spec.ClusterIP).NotTo(BeEmpty(),
+			"the fixture needs an apiserver-assigned ClusterIP, or the two ClusterIP assertions below pass vacuously (F81)")
+		assignedIP := svcFixture.Spec.ClusterIP
 
 		// Reconcile 1 (the UPDATE path — the Service already exists with a
 		// ClusterIP): the operator must leave the assigned ClusterIP alone (the
@@ -299,7 +309,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		svc := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-egress-proxy"}, svc)).To(Succeed())
 		rv1 := svc.ResourceVersion
-		Expect(svc.Spec.ClusterIP).To(Equal("10.0.99.99"),
+		Expect(svc.Spec.ClusterIP).To(Equal(assignedIP),
 			"the operator must NOT reset the apiserver-assigned ClusterIP (the F11 fix)")
 
 		// Reconcile 2 (no input change): a NO-OP (resourceVersion unchanged).
@@ -310,7 +320,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-egress-proxy"}, svc)).To(Succeed())
 		Expect(svc.ResourceVersion).To(Equal(rv1),
 			"a no-op reconcile must leave the egress proxy Service UNCHANGED (no reconcile storm)")
-		Expect(svc.Spec.ClusterIP).To(Equal("10.0.99.99"),
+		Expect(svc.Spec.ClusterIP).To(Equal(assignedIP),
 			"the assigned ClusterIP must survive a no-op reconcile")
 	})
 

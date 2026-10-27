@@ -118,6 +118,19 @@ carry probe 10's listener status.
 - **BLOCKED** — the fenced agent was stopped (e.g. "no such file" for
   the SA token; the egress proxy answered 403 on the metadata endpoint).
   A good outcome, but only if the probe's positive control passed.
+  **BLOCKED does not by itself say a policy did it.** For the network
+  probes the recorded verdict is usually `curl rc=28` — a `--max-time`
+  timeout, i.e. the packet produced no answer at all: the recorded run
+  has probes 2-9 as `BLOCKED … curl rc=28`
+  (`.samples/evil-agent-after4/04-probes-agent-b.txt`). A NetworkPolicy
+  blackhole and a broken agent netns (a CNI fault, no route) look
+  identical from inside that netns, and those probes have no positive
+  control *inside* the agent's netns — the controls run from the `ctl`
+  pod, which the per-Loop netpol does not select (probe 11 sets the
+  stricter precedent: a 15 s timeout there is N/A, not BLOCKED). What a
+  BLOCKED network verdict is worth is therefore bounded by the
+  agent-side assertion B0 (variant (b)) and the egress-proxy audit line
+  (variant (a)), not by a live in-netns control.
   Several probes pair an independent control: probe 8 (the stand-in's
   model-side log), probe 10 (a local curl plus the victim-to-control
   leg), probe 14 (the control pod's `kubectl debug`), probe 11 (an
@@ -129,7 +142,11 @@ carry probe 10's listener status.
   in this run — e.g. `MODEL unset` in variant (b), or a
   name-resolution failure that is the DNS layer (KubeArmor
   `matchDNSQueries`) rather than a NetworkPolicy verdict. **Never a
-  pass**: since F72 it counts as not-proved and fails the run.
+  pass**: since F72 an N/A verdict on a required probe is not-proved and
+  fails the run. The two N/A verdicts a healthy variant (b) run always
+  emits (probe 6 `metadata-proxy`, probe 8 `model-direct`) are *not
+  required* for (b), because they are the variant's premise — so they
+  are never counted as proved either (see "The exit code (F72)").
 - **UNPROVEN** — the harness refuses to count a failed probe as proof.
   Probe 6 direct: with no metadata service answering the control pod, a
   failed curl proves nothing, so a would-be BLOCKED is downgraded to
@@ -148,20 +165,37 @@ carry probe 10's listener status.
   `probe 15 SKIPPED …: not a PASS, and variant t is not proved`, and the
   summary adds `variant t: NOT RUN`. It is a record, not a pass (see skip
   switches).
+- **DEFERRED** — a step the variant declares it did NOT run, recorded as
+  `DEFERRED variant=<v> name=<step> <detail>` rather than left as free
+  prose: variant (a)'s three F72(a) steps (the verify-checkout
+  assertions, probe 15's control Loop, the exec-path equivalence run).
+  `required_probes` lists each one, the summary counts them as
+  `deferred=D`, and they are never counted as proved; a step that stops
+  being declared fails the run as
+  `<step>(deferred-step-not-declared)`.
 
 ## The exit code (F72)
 
 The run's exit code is decided in ONE place (`finish()`), and it means
 exactly one thing: **every probe of every variant this run executed was
-proved.**
+proved**, and every step a variant declares `DEFERRED` was declared.
 
 - **proved** = the probe's verdict is BLOCKED (and its control passed, if
-  it has one). One `PROBE` line per probe; a probe with several lines
-  (probe 11 is push + credential; probe 8 has a model-side line) is
-  proved only when every one of its lines is BLOCKED.
+  it has one). A probe with several lines (probe 11 is push + credential;
+  probe 6 in variant (a) is direct + proxy; probe 8 has a model-side line)
+  is proved only when every one of its lines is BLOCKED.
+- The required set is per **(variant, probe name)**, not one probe-number
+  list for every variant (`required_probes`). Variant (b) has no egress
+  proxy and no model endpoint *by design*, so its probe 6
+  `metadata-proxy` leg and its probe 8 are not required: they are the
+  variant's premise, and variant (a) is what proves probe 8. Everything a
+  variant is supposed to emit stays required, so a *surprising* verdict
+  still fails the run — e.g. probe 6 `metadata-proxy` N/A in variant (a),
+  which does have a proxy.
 - Per variant the harness prints
-  `variant <v>: proved=N tolerated=T not-proved=M`, with each
-  not-proved probe named and each tolerance named with its reason.
+  `variant <v>: proved=N tolerated=T deferred=D not-proved=M`, with each
+  not-proved probe named, each tolerance named with its reason and each
+  deferred step named.
 - Three tolerances exist, and each is granted ONLY while the run's own
   recorded condition holds:
   1. **RESIDUAL** for probes 2-5 while the CNI does not police
@@ -171,8 +205,10 @@ proved.**
   3. **ABSENT** for probe 10 in variant (a) (the runner kills the tool
      call's process group; variant (b) carries probe 10).
 - Everything else — N/A, UNPROVEN, ABSENT or RESIDUAL outside its
-  condition, and a probe with no verdict line at all — is **not proved**
-  and fails the run.
+  condition, and a required probe with no verdict line at all — is **not
+  proved** and fails the run. So does a variant the gate does not
+  recognise: it has no required set, so nothing about it could be proved,
+  and a typo must not read as "all proved".
 - Exit codes: **0** only when every executed variant is proved and no
   probe/control FAILed; **1** when a probe is ESCAPED, a control failed,
   or any probe is not proved; **2** when the preflight fails or no
@@ -191,10 +227,21 @@ and probe 15 skipped.
 The gate and the preflight are themselves tested, with no cluster:
 `make evil-agent-e2e-selftest` feeds the real script synthetic verdict
 files (all proved; all UNPROVEN; one N/A; ABSENT/RESIDUAL/UNPROVEN with
-and without their conditions; a missing probe; an empty run) and drives
-the real preflight with a stubbed `kubectl` for each missing
-prerequisite, asserting the exit code every time. It is a prerequisite
-of the `evil-agent-e2e` targets and of `make test-e2e`.
+and without their conditions; a missing probe; a deferred step that is
+no longer declared; an unknown variant; an empty run) and drives the
+real preflight with a stubbed `kubectl` for each missing prerequisite,
+asserting the exit code every time. It also **replays a real recorded
+run's verdict stream** — `test/e2e/testdata/evil-agent-verdict-recorded.txt`,
+the closing `12-verdict.txt` of `.samples/evil-agent-after4/` — because a
+hand-written "every probe BLOCKED for both variants" fixture is what hid
+the required-set defect the pre-review found (F1: no healthy variant (b)
+run can produce probe 6 `metadata-proxy` or probe 8). The recorded file
+must come out proved, and must stop being proved when the metadata
+tolerance's condition flips, so the fixture is read rather than ignored.
+
+The self-test is a prerequisite of the `evil-agent-e2e` targets, of
+`make test-e2e`, and of `make test`, so it runs in PR CI; `make lint`
+shellchecks the two scripts (`-S warning`).
 
 ## Preflight (F72)
 
@@ -273,9 +320,21 @@ From `.samples/review-postmerge-3.md` (post-merge review of PR #222):
    `kubectl`.
 3. **exit 0 is compatible with unmeasured probes** (P2-3) — **fixed by
    F72** (PR `fix/f72-verdict-gate`): the closing summary is
-   `variant <v>: proved=N tolerated=T not-proved=M`, the exit code keys
-   on it, and the three tolerances are granted only while their recorded
-   condition holds. See "The exit code (F72)".
+   `variant <v>: proved=N tolerated=T deferred=D not-proved=M`, the exit
+   code keys on it, and the three tolerances are granted only while their
+   recorded condition holds. See "The exit code (F72)".
 4. Minor (P3-1/P3-2): fixed namespace names collide for back-to-back
    runs; host tools are undeclared and partly GNU-only (macOS dies in
    variant (a)).
+5. **BLOCKED on the network probes means "no answer", not "a policy
+   denied it"** (F72 pre-review, P3). Probes 2-9 record `curl rc=28`
+   timeouts, and a broken agent netns is indistinguishable from a netpol
+   blackhole from inside it; the controls run from the `ctl` pod, which
+   the per-Loop netpol does not select. The exit code is unaffected (a
+   timeout is a BLOCKED verdict, i.e. proved); what is *bounded* is what
+   that proved verdict is evidence of. See the BLOCKED verdict word.
+6. **Variant (a)'s three unrun steps are still unrun** (F72(a)) — the
+   verify-checkout assertions, probe 15's control Loop and the exec-path
+   equivalence run. They are now declared as `DEFERRED` verdict lines and
+   counted in `deferred=D`, so the exit code never claims them as proved;
+   implementing them is F72(a), not part of this harness.

@@ -79,6 +79,10 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	$(MAKE) image-args-test
 	@# F21: the RWX-storage script's execution test (real script, stubbed kubectl).
 	$(MAKE) rwx-storage-test
+	@# F72 review F6: the evil-agent e2e's verdict gate and preflight self-test (bash + coreutils only,
+	@# no cluster, ~2 s). The gate exists to make the e2e's exit code mean something, so it must be
+	@# seen to pass in PR CI, not only on a human-invoked e2e target.
+	$(MAKE) evil-agent-e2e-selftest
 	@# F29: the Helm chart's manager role and CRDs must not drift from config/ (serviceaccounts rule, lessonsAvailable were missing).
 	$(MAKE) chart-drift-test
 	@# F48d: the controller suite now needs longer than go test's 10m default when every package runs in parallel (588s standalone, +~2% under contention), so the timeout is explicit.
@@ -154,6 +158,9 @@ lint: golangci-lint ## Run golangci-lint linter
 	@# ubuntu-latest; fail clearly if it is missing elsewhere).
 	@command -v shellcheck >/dev/null 2>&1 || { echo "Error: shellcheck is not installed (apt install shellcheck)"; exit 1; }
 	@for f in hack/*.sh; do echo "shellcheck $$f"; shellcheck "$$f"; done
+	@# F72 review F6: the evil-agent e2e's verdict gate is a shell script, so shellcheck it too. Scoped to
+	@# the two scripts this item owns, at -S warning (they carry one style-level note each that predates it).
+	@for f in test/e2e/evil-agent-e2e.sh test/e2e/evil-agent-e2e-selftest.sh; do echo "shellcheck $$f"; shellcheck -S warning "$$f"; done
 
 .PHONY: github-secret-test
 github-secret-test: ## D55: execution test for hack/github-secret.sh (stub kubectl + fake token; never the real token file).

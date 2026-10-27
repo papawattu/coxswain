@@ -113,7 +113,9 @@ probe 10's listener. The harness rewrites each into
 `PROBE <n> <VERDICT> variant=<v> name=<name> <detail>` — a different
 field order — and appends them to `12-verdict.txt`. So the verdict file
 holds one `PROBE` line per probe, plus the `EVIL-LISTEN` lines that
-carry probe 10's listener status.
+carry probe 10's listener status, plus one `DEFERRED variant=<v>
+name=<step> …` line per step a variant declares it did not run (see the
+DEFERRED verdict word).
 
 - **BLOCKED** — the fenced agent was stopped (e.g. "no such file" for
   the SA token; the egress proxy answered 403 on the metadata endpoint).

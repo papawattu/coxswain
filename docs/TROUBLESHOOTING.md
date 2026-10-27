@@ -694,6 +694,23 @@ progress, and the restore's stop step deletes the queued Job on the first
 in-progress pass; the gate then needs the pin, which the completion has cleared.
 That is intended — delivering would open a PR for the work the rollback just
 discarded. Re-run the Loop (and let it verify again) if a PR is still wanted.
+While it holds, delivery is **visible**: the Loop carries `Delivered=False` with
+reason `DeliveryInProgress` and the message "deliver Job held: a workspace
+restore is in progress…" (the same condition shape as the egress-proxy hold).
+The condition is removed when the restore ends without a pin to deliver — a
+Loop stuck in `DeletingPVC` therefore shows *why* nothing is being delivered.
+
+**Known limitation (pre-F35 history).** A `Restored` marker written before the
+`[spec-target=…]` key is complete only when the target it names in its own text
+matches the spec. So a Loop that (on a pre-F35 build) **both** completed a
+reactive lost-PVC restore **and** earlier completed a rollback or a fork, and
+still names that rollback/fork target, is treated as not covered and re-runs
+that restore **once** after the upgrade — the PVC is replaced from the snapshot.
+The marker text cannot tell that history apart from a lost-PVC restore that was
+the Loop's only restore; preferring "run what the spec asks" is deliberate. (The
+same history completed on a build that writes the key is complete: the key
+names `rollback:iter-N` / `fork:<source>/<iter>`.) If the Loop must not be
+re-restored, fork it or keep it on the old build until you want that restore.
 
 ### Warning `ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed` (F36)
 

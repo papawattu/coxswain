@@ -101,7 +101,12 @@ var _ = Describe("F75/F77: a legacy restore marker and the restore's delivery wi
 	// It returns the Loop after the final pass.
 	f75DriveRollback := func(r *LoopReconciler, ns, name string) *cov.Loop {
 		b2Reconcile(r, ns, name) // step 1: stop the sandbox
-		b2DeleteSandboxPod(ctx, ns, name)
+		// The sandbox pod: tolerated if absent (a fork's restore can complete
+		// before any pod exists — see the fork-arm spec).
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: b2SandboxName(name), Namespace: ns}}
+		if err := k8sClient.Delete(ctx, pod); err != nil {
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "delete the stand-in sandbox pod")
+		}
 		b2Reconcile(r, ns, name) // step 2: stop the workloads and delete the PVC
 		b2RemovePVCProtectionFinalizer(ctx, ns, name)
 		return b2Reconcile(r, ns, name) // step 3: create the PVC from the snapshot
@@ -183,6 +188,56 @@ var _ = Describe("F75/F77: a legacy restore marker and the restore's delivery wi
 			"the rollback replaced the workspace PVC from the snapshot (the arm this spec exists to exercise)")
 	})
 
+	It("does not re-run a completed fork whose legacy marker names the same source (F1, N1)", func() {
+		ns := f75Ns("f75-legacy-fork")
+		const (
+			srcName  = "f75-fork-src"
+			forkName = "f75-fork"
+		)
+		r, _ := b2NewReconcilerWithRecorder()
+
+		By("a source Loop with a ready checkpoint at iter-0")
+		f75Succeeded(r, ns, srcName)
+
+		By("a fork whose restore completes (its own PVC from the source's snapshot)")
+		Expect(k8sClient.Create(ctx, &cov.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: forkName, Namespace: ns},
+			Spec: cov.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: testWorkspace(),
+				Verify:    cov.VerifyConfig{AcceptanceChecks: []string{loopCheckCmd}},
+				ForkOf:    &cov.ForkOf{Loop: srcName, Iteration: 0},
+			},
+		})).To(Succeed())
+		b2EnsureSandbox(ns, forkName)
+		forkRestored := b2Reconcile(r, ns, forkName)
+		forkCond := b2RestoreCondition(forkRestored)
+		Expect(forkCond).NotTo(BeNil())
+		Expect(forkCond.Reason).To(Equal(cov.RestoreReasonRestored), "precondition: the fork's restore completed")
+		forkPVC, err := b2GetPVC(ctx, ns, forkName)
+		Expect(err).NotTo(HaveOccurred(), "precondition: the fork's workspace PVC exists")
+		forkPVCUID := forkPVC.UID
+
+		By("the same history on a pre-F35 build: the marker is overwritten with the keyless text naming the fork source")
+		f75SeedLegacyMarker(ns, forkName, b2KindFork, 0)
+		Expect(restoreCompletedForSpec(f75Get(ns, forkName))).To(BeTrue(),
+			"precondition: the keyless fork marker names the source the immutable spec.forkOf still names")
+
+		By("driving the same passes a re-armed fork restore would need: the fork's workspace must not be touched")
+		final := f75DriveRollback(r, ns, forkName)
+
+		after, err := b2GetPVC(ctx, ns, forkName)
+		Expect(err).NotTo(HaveOccurred(), "the fork's workspace PVC must still exist")
+		Expect(after.UID).To(Equal(forkPVCUID),
+			"N1: the fork arm deletes the PVC in a DIFFERENT function (b2ApplyLostPVCRestore) from the rollback's, so it needs its own Reconcile-level detector: a completed fork must not be re-seeded")
+
+		cond := b2RestoreCondition(final)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(cov.RestoreReasonRestored))
+		Expect(cond.Message).NotTo(ContainSubstring(restoreSpecKeyMarker),
+			"no restore ran, so nothing rewrote the keyless marker with a key")
+	})
+
 	It("creates no deliver Job for the pin while a restore is in progress (F3.3)", func() {
 		ns := f75Ns("f75-deliver")
 		const name = "f75-deliver"
@@ -222,6 +277,12 @@ var _ = Describe("F75/F77: a legacy restore marker and the restore's delivery wi
 		requested, why := deliveryRequested(inProgress)
 		Expect(requested).To(BeFalse(), "F3.3: no deliver Job may be created for a pin whose workspace is being replaced")
 		Expect(why).To(ContainSubstring("restore is in progress"))
+		delivered := meta.FindStatusCondition(inProgress.Status.Conditions, cov.DeliveredCondition)
+		Expect(delivered).NotTo(BeNil(),
+			"R26 I90: the restore hold on delivery is VISIBLE (the I72 proxy hold beside it sets the same condition)")
+		Expect(delivered.Status).To(Equal(metav1.ConditionFalse))
+		Expect(delivered.Reason).To(Equal(cov.ReasonDeliveryInProgress))
+		Expect(delivered.Message).To(ContainSubstring("a workspace restore is in progress"))
 		still := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: deliverJobName(name)}, still); err == nil {
 			Expect(still.UID).To(Equal(queuedUID),
@@ -241,5 +302,7 @@ var _ = Describe("F75/F77: a legacy restore marker and the restore's delivery wi
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal(cov.RestoreReasonRestored), "precondition: the rollback completed")
 		Expect(restored.Status.CurrentVerify).To(BeNil(), "the completion cleared the pin")
+		Expect(meta.FindStatusCondition(restored.Status.Conditions, cov.DeliveredCondition)).To(BeNil(),
+			"the hold condition goes with the hold: a restore that ends without a pin leaves nothing to deliver, so a stale Delivered=False/InProgress would be the misleading steady state")
 	})
 })

@@ -1436,6 +1436,14 @@ func f92HeldRequeue(kaptCRDMissing bool, phase coxv1alpha1.LoopPhase) bool {
 // --allow-unenforced.
 const kaptCRDMissingRequeue = time.Minute
 
+// workRequeue is the "come back soon" window: how long the operator waits before
+// re-running work a pass could not finish. It is the trailing requeue decision's
+// pending-work window (a Loop whose base-commit read or claim has not landed
+// yet) and the restore-decision / checkpoint-GC / async-delete / finalizer
+// retries in loop_checkpoint.go — one constant so the cadence is stated once
+// (pi3 early-347 N: it was five bare `5 * time.Second` literals).
+const workRequeue = 5 * time.Second
+
 // PolicyTranslationLossyCondition is the Loop condition that reports a lossy
 // KubeArmor translation (I41): a host:PORT network allow that loses its port
 // in the translation. True + reason KubeArmorDroppedPorts lists the widened
@@ -6687,7 +6695,7 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 // decision, which excludes a terminal Loop.
 func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration, kaptCRDMissing bool) ctrl.Result {
 	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}
+		return ctrl.Result{RequeueAfter: workRequeue}
 	}
 	// F92 P2-2: a Loop held because the KubeArmorPolicy CRD is missing is
 	// otherwise idle (its spec does not change and nothing it references

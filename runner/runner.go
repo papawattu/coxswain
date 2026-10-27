@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -95,6 +96,13 @@ const (
 	// the curator already retries (pkg/curator/curator.go) and what F41 saw on
 	// a brand-new pod's first call; see isRetryableModelError for the rule and
 	// for what is deliberately NOT retried.
+	//
+	// Cost of the TIMEOUT class (which this ladder always retried): a timed-out
+	// request may already have been accepted, so a retry can re-send it — the
+	// model does the work and bills for it twice, and the model proxy's budget
+	// counters (D35a/F82) count the request twice for the one answer that is
+	// used. The transport class is narrower on purpose (F79): only a failure
+	// that proves the request never left the client is retried.
 	defaultModelRetries      = 3
 	defaultModelRetryBackoff = 2 * time.Second
 
@@ -359,6 +367,8 @@ func run(cfg runConfig) Result {
 		shellTimeout = defaultShellTimeout
 	}
 
+	ladder := modelRetryLadderFor(cfg.ModelRetries, cfg.ModelRetryBackoff)
+
 	messages := []chatMessage{
 		{Role: jsonRoleSystem, Content: systemPrompt},
 		{Role: jsonRoleUser, Content: cfg.Prompt},
@@ -366,7 +376,7 @@ func run(cfg runConfig) Result {
 
 	answer, trace, modelErr := driveModel(
 		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
-		messages, maxSteps, shellTimeout, modelTimeout, modelRetryLadderFor(cfg.ModelRetries, cfg.ModelRetryBackoff), cfg.ExtraBody,
+		messages, maxSteps, shellTimeout, modelTimeout, ladder, cfg.ExtraBody,
 	)
 
 	res := Result{
@@ -393,21 +403,43 @@ func isTimeoutError(err error) bool {
 }
 
 // isRetryableModelError reports whether a failed model call is worth another
-// attempt (I89, F79): a context deadline (a hung call) or a TRANSPORT error —
-// client.Do returned an error, so no HTTP response was received at all
-// (connection refused, no route, DNS, reset). A fresh pod's first call can hit
-// that class while the model endpoint becomes reachable; the curator's Judge
-// already retries it (pkg/curator/curator.go).
+// attempt (I89, F79).
 //
-// NOT retried, deliberately: an HTTP status (500, 400), a decode error, or "no
-// choices" — the server answered, so the error is definitive. Nor is a failure
-// to read the response body (the response arrived; nothing shows it transient).
+// RETRIED — the classes that prove the request never reached the model:
+//
+//   - a context deadline (a hung call; the pre-existing I89 class — note that a
+//     timed-out request MAY have been accepted, so that retry can re-send it:
+//     the model does the work and bills for it twice, and the model proxy
+//     (D35a/F82 budget counters) counts the request twice for one answer. That
+//     cost is inherent to I89's timeout retry, and is documented on
+//     defaultModelTimeout);
+//   - a DNS failure (the name never resolved);
+//   - a DIAL failure (connection refused, no route to host, unreachable
+//     network — the TCP connection never opened, so no bytes were sent).
+//
+// NOT retried, deliberately:
+//
+//   - anything after the request was written (EOF/reset/a read error): the
+//     server may have ACCEPTED and PROCESSED the completion, so re-sending it
+//     would bill and meter the same call twice for one used answer (F79 review
+//     F2). A fresh pod's first call is the dial class, not this one;
+//   - an HTTP status (500, 400), a decode error or "no choices": the server
+//     answered, so the error is definitive;
+//   - a failure to read the body of a 200 (the response arrived).
 func isRetryableModelError(err error) bool {
 	if isTimeoutError(err) {
 		return true
 	}
 	var uerr *url.Error
-	return errors.As(err, &uerr)
+	if !errors.As(err, &uerr) {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(uerr.Err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(uerr.Err, &opErr) && opErr.Op == "dial"
 }
 
 // modelRetryLadder is the bounded retry budget for one model call: retries
@@ -658,7 +690,10 @@ func driveModel(
 			if !isRetryableModelError(err) || attempt >= ladder.retries {
 				break
 			}
-			backoff := ladder.backoff << uint(attempt) // 2s, 4s, 8s, ...
+			// 2s, 4s, 8s, ... Unbounded arithmetic by design: only
+			// runConfig can grow the ladder (no operator knob), and the
+			// production value is small.
+			backoff := ladder.backoff << uint(attempt)
 			retryLine := "call model: retry " + strconv.Itoa(attempt+1) +
 				" after " + err.Error() + " (backoff " + backoff.String() + ")"
 			trace = append(trace, retryLine)

@@ -281,13 +281,13 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		// F81: the ClusterIP is NOT pinned to a literal. The suite's apiserver
 		// allocates from --service-cluster-ip-range 10.0.0.0/16 (suite_test.go),
 		// so a literal IP is a cluster-global resource that a concurrent or
-		// earlier spec can already hold — CI has failed with "failed to allocate
-		// IP 10.0.99.99: provided IP is already allocated". ClusterIP allocation
+		// earlier spec can already hold — a pinned IP collided with one that was
+		// already allocated (F81, R33 I117). ClusterIP allocation
 		// is the apiserver's service registry, not the service controller (which
 		// handles NodePort/LoadBalancer), so a Service the operator creates DOES
 		// get one. Let the apiserver pick, read it back, and assert it did: a
 		// future envtest without an allocation range fails loudly here instead of
-		// passing vacuously (with an empty ClusterIP the F11 guard is invisible).
+		// passing the two ClusterIP assertions vacuously.
 		svcFixture := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Name: name + "-egress-proxy", Namespace: ns},
 			Spec: corev1.ServiceSpec{
@@ -298,7 +298,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		}
 		Expect(k8sClient.Create(ctx, svcFixture)).To(Succeed(), "pre-create the egress proxy Service")
 		Expect(svcFixture.Spec.ClusterIP).NotTo(BeEmpty(),
-			"the fixture needs an apiserver-assigned ClusterIP for the F11 guard to be visible (F81)")
+			"the fixture needs an apiserver-assigned ClusterIP, or the two ClusterIP assertions below pass vacuously (F81)")
 		assignedIP := svcFixture.Spec.ClusterIP
 
 		// Reconcile 1 (the UPDATE path — the Service already exists with a

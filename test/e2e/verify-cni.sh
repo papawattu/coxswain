@@ -298,11 +298,21 @@ echo "   probe pod Ready"
 
 echo
 echo "--- STEP 2: TCP-connect probes from the probe pod ---"
-# The probe is a raw TCP-CONNECT test — the exact layer the CNI polices.
-# A completed connect means the CNI let the egress through (REACHABLE);
-# a timeout/refused connect means it was dropped (BLOCKED). The probe image
-# (default python:3-alpine) ships python3, so the probe uses a 4s socket
-# timeout per target (the same approach as d38-cni-e2e.sh's probe.py).
+# The probe is a raw TCP-CONNECT test — the exact layer the CNI polices —
+# classified exactly as the operator's own CNI self-test classifies it
+# (internal/cni/pod_prober.go; F51b):
+#   REACHABLE   the connect completed: the CNI let the egress through;
+#   BLOCKED     the connect was dropped (a timeout, or any other socket
+#               error);
+#   UNRESOLVED  the target had no address, or the peer REFUSED the connect.
+#               A refusal proves the packet REACHED the host and the host
+#               answered, so it is NOT evidence of enforcement: an UNRESOLVED
+#               row is a FAIL in the table below, never a pass. The old copy
+#               here reported every exception as BLOCKED and accepted BLOCKED
+#               as a pass, so `make verify-cni` could PASS a cluster that does
+#               not enforce (P2-1 of #342's pre-review).
+# The probe image (default python:3-alpine) ships python3, so the probe uses a
+# 4s socket timeout per target (the same approach as d38-cni-e2e.sh's probe.py).
 # This is the D38 property under test: on kindnet the apiserver service IP,
 # the node's :6443, and the kubelet's :10250 are REACHABLE (the L1, review
 # docs/REVIEW-PHASE1-R16.md); on Calico all five targets are BLOCKED.
@@ -312,16 +322,29 @@ echo "--- STEP 2: TCP-connect probes from the probe pod ---"
 NODE_IPS_ENV=$(echo $NODE_IPS | tr ' ' '\n' | sort -u | tr '\n' ' ')
 cat > "$TMPDIR/probe.py" <<PYEOF
 import os, socket
-def probe(label, host, port):
+# >>> verify-cni-probe-function (executed verbatim by test/e2e/d38-probe-selftest.sh)
+def probe(label, host, port, timeout=4):
+    try:
+        host = socket.gethostbyname(host)
+    except Exception:
+        # No address means no measurement of the fence: never REACHABLE, and
+        # never BLOCKED (an unresolvable target is not evidence of a drop).
+        print("RESULT %s UNRESOLVED(no-address)" % label)
+        return
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(4)
+    s.settimeout(timeout)
     try:
         s.connect((host, int(port)))
         print("RESULT %s REACHABLE" % label)
+    except ConnectionRefusedError:
+        # The peer answered with a refusal: the packet reached it, so the
+        # connect was NOT dropped by any policy. UNRESOLVED, never BLOCKED.
+        print("RESULT %s UNRESOLVED(refused)" % label)
     except Exception as exc:
         print("RESULT %s BLOCKED(%s)" % (label, type(exc).__name__))
     finally:
         s.close()
+# <<< verify-cni-probe-function
 probe("APISERVER_SVC",  os.environ["APISERVER_SVC_IP"], 443)
 for ip in os.environ["NODE_IPS"].split():
     probe("APISERVER_NODE(%s)" % ip, ip, 6443)
@@ -352,8 +375,10 @@ echo "-------------------------------------------------------------"
 # those).
 # Expected label count: 1 (APISERVER_SVC) + 2*node_count (APISERVER_NODE +
 # KUBELET_NODE per node) + 1 (CROSS_NS_POD) + 1 (EXTERNAL) = 3 + 2*node_count
+# >>> verify-cni-classify (executed verbatim by test/e2e/d38-probe-selftest.sh)
 EXPECTED_TOTAL=$((3 + 2 * $(echo $NODE_IPS | wc -w)))
 HOSTNET_FAIL=0
+HOSTNET_UNPROVEN=0
 TOTAL_FAIL=0
 TOTAL=0
 SEEN_LABELS=""
@@ -375,6 +400,15 @@ while read -r line; do
           TOTAL_FAIL=$((TOTAL_FAIL + 1))
           case "$line" in
             *APISERVER_SVC*|*APISERVER_NODE*|*KUBELET_NODE*) HOSTNET_FAIL=$((HOSTNET_FAIL + 1)) ;;
+          esac
+          ;;
+        *UNRESOLVED*)
+          # No address, or the peer REFUSED: the packet was not dropped, so
+          # enforcement is UNPROVEN here — never a pass (F51b).
+          status="UNRESOLVED  <-- NOT MEASURABLE (not a pass)"
+          TOTAL_FAIL=$((TOTAL_FAIL + 1))
+          case "$line" in
+            *APISERVER_SVC*|*APISERVER_NODE*|*KUBELET_NODE*) HOSTNET_UNPROVEN=$((HOSTNET_UNPROVEN + 1)) ;;
           esac
           ;;
         *BLOCKED*) status="BLOCKED" ;;
@@ -401,6 +435,7 @@ if [ "$PROBE_ERROR" -eq 1 ] || [ "$TOTAL" -ne "$EXPECTED_TOTAL" ]; then
   cat "$TMPDIR/results.txt"
   exit 2
 fi
+# <<< verify-cni-classify
 
 # ---------------------------------------------------------------------------
 # HARDENING section (WARN-only, never changes PASS/FAIL or the exit code).
@@ -538,6 +573,11 @@ else
     echo "      node destinations — verified: Calico v3.30.1 (make d38-cni-e2e); to be"
     echo "      confirmed with this check: Cilium, GKE Dataplane V2, EKS VPC CNI + network"
     echo "      policy, AKS."
+  elif [ "$HOSTNET_UNPROVEN" -gt 0 ]; then
+    echo "      (host-network targets NOT MEASURABLE: $HOSTNET_UNPROVEN — a refused or"
+    echo "      unresolvable target proves nothing about enforcement). The D38 property is"
+    echo "      UNPROVEN on this cluster, not shown to hold: re-run where the probe pod can"
+    echo "      resolve and reach the apiserver/node targets."
   else
     echo "      (only pod-IP/external targets reached; host-network targets were blocked.)"
     echo "      Remedy: investigate why the CNI let those through (policy enforcement is"

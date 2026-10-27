@@ -276,12 +276,20 @@ if K get ns "$PROBE_NS" >/dev/null 2>&1; then
         bad "probe reports $LBL REACHABLE (the CNI must block it; the gate should not be CNIEnforced)"
       elif echo "$PROBE_MSG" | grep -q "RESULT $LBL BLOCKED"; then
         ok "probe reports $LBL BLOCKED"
+      elif echo "$PROBE_MSG" | grep -q "RESULT $LBL UNRESOLVED"; then
+        bad "probe reports $LBL UNRESOLVED (the target was not measurable — a refused connect means the packet reached the host — so enforcement of $LBL is UNPROVEN, not blocked)"
+      else
+        bad "no RESULT line for $LBL in the probe's output (the operator's own result is unreadable here: enforcement of $LBL is UNPROVEN)"
       fi
     done
     if echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE REACHABLE"; then
       ok "probe reports DNS_POSITIVE REACHABLE (positive control: the probe has network egress to the allowed kube-dns)"
     elif echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE BLOCKED"; then
       bad "probe reports DNS_POSITIVE BLOCKED (the positive control failed: the probe has no network -> ProbeUnavailable)"
+    elif echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE UNRESOLVED"; then
+      bad "probe reports DNS_POSITIVE UNRESOLVED (the positive control was not measurable, so the fence is UNPROVEN)"
+    else
+      bad "no RESULT line for DNS_POSITIVE in the probe's output (the positive control did not report: the fence is UNPROVEN)"
     fi
   else
     echo "   (no live probe pod to read a termination message from — the operator deletes it after each run)"

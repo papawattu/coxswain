@@ -936,6 +936,14 @@ gate sets the object's operating mode; it does not prevent the object), along
 with the workspace PVC. Both are visible on kind: `f92-kubearmor-sandbox  Suspended` and
 `persistentvolumeclaim/f92-kubearmor-workspace` waiting for its first consumer.
 The sandbox is held, not deleted, so nothing starts in it while the hold is on.
+Nothing runs in it either: in the F92 kind capture no agent pod was scheduled —
+the workspace PVC stayed at `WaitForFirstConsumer` and no `FailedScheduling`
+Event appeared (`.samples/f92-kind/06-loop-final.txt:37`) — so the held object has
+no pod to exec into, which is the shape you want here. The sandbox pod template
+requires the BPF-labelled node (`applyBPFNodeAffinity` in
+`internal/controller/loop_controller.go`), which a cluster without KubeArmor has
+none of; the capture did not include a `kubectl get pods`, so the pod list itself
+is not recorded — the object state above is.
 
 **What to do:** install KubeArmor so the CRD **and** the enforcer agents are
 present (the supported configuration — see `docs/QUICKSTART.md` step 3), or

@@ -1431,8 +1431,8 @@ func f92HeldRequeue(kaptCRDMissing bool, phase coxv1alpha1.LoopPhase) bool {
 // reconcile hot loop. Three shapes do not take this window as the result: a
 // Loop still in the clone-pending stage (the 5s work requeue fires first, and
 // it is the one the kind run shows), a terminal Loop (f92HeldRequeue excludes
-// it), and a Loop whose budget window is sooner (the earlier of the two wins —
-// pi3 prereview-308 findings 2 and 5). It does not
+// it), and a Loop whose budget or memory window is sooner — the earliest of the
+// three wins (pi3 prereview-308 findings 2 and 5). It does not
 // by itself make the hold clear: that needs the CRD AND a node carrying the
 // BPF-LSM label (installing only the CRD still reports NodeNotEnforcing), or
 // --allow-unenforced.
@@ -6683,11 +6683,16 @@ func (r *LoopReconciler) ensureVerifyJobAndNetPolicies(ctx context.Context, loop
 // R39 I144 memory-PVC re-announce window, and the F92 CRD-missing window. The
 // EARLIEST of the last three wins, so none of them waits on a longer timer
 // (the Event's re-announce, or the F92 re-check, while a budget window is
-// ticking). The F92 window is NOT the shortest by construction — a token- or
-// cost-only budget returns 30s (F52 C6) and a nearly-elapsed wall clock can
-// return less than a minute — so it takes part in the same comparison instead
-// of returning first (pi3 prereview-308 finding 2). Its argument is the
-// caller's f92HeldRequeue decision, which excludes a terminal Loop.
+// ticking). The F92 window is NOT the shortest by construction — a
+// nearly-elapsed wall clock returns the time it has left, and so does the
+// memory-PVC re-announce window (surfaceMemoryPVCUnbound returns the remaining
+// time in its five-minute quiet window, which can be seconds) — so it takes
+// part in the same comparison instead of returning first (pi3 prereview-308
+// finding 2). Note what the budget window is: it is the WALL-CLOCK remaining
+// only (loop_p2d_budget.go sets it under maxWallClock; a token- or cost-only
+// budget leaves it 0), so a token cap does not by itself produce a window.
+// Its argument is the caller's f92HeldRequeue decision, which excludes a
+// terminal Loop.
 func (r *LoopReconciler) reconcileRequeueAfter(baseCommitSeeded bool, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration, kaptCRDMissing bool) ctrl.Result {
 	if !baseCommitSeeded && (baseCommitPending || claimReadPending || verifyRequeue || deliverRequeue) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}

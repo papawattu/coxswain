@@ -1,10 +1,12 @@
 // pi3 prereview-308 finding 2 (and finding 5, the same rule): the F92
 // CRD-missing window used to take the whole trailing requeue — it returned
 // BEFORE the earlier-of comparison the memory window introduced, justified by a
-// comment claiming it "is the shortest by construction". It is not: a token- or
-// cost-only budget returns 30s (F52 C6), and a nearly-elapsed wall clock can
-// return less than a minute, so a held Loop that also had a budget window waited
-// on the longer timer. The three windows now take part in the same comparison.
+// comment claiming it "is the shortest by construction". It is not: a
+// nearly-elapsed wall clock returns the time it has left, and the memory-PVC
+// re-announce window returns the remainder of its five-minute quiet window
+// (surfaceMemoryPVCUnbound), which can be seconds — so a held Loop that also had
+// either window waited on the longer timer. The three windows now take part in
+// the same comparison.
 package controller
 
 import (
@@ -28,6 +30,7 @@ func TestReconcileRequeueAfterF92TakesTheEarlierWindow(t *testing.T) {
 		{"a sooner budget window beats the F92 window", 30 * time.Second, 0, true, 30 * time.Second},
 		{"a later budget window loses to the F92 window", 10 * time.Minute, 0, true, kaptCRDMissingRequeue},
 		{"a sooner memory window beats both", 30 * time.Second, 10 * time.Second, true, 10 * time.Second},
+		{"a sooner memory window with no budget window", 0, 10 * time.Second, true, 10 * time.Second},
 		{"a later memory window loses to the F92 window", 0, 4 * time.Minute, true, kaptCRDMissingRequeue},
 		{"no F92 flag keeps the budget window", 30 * time.Second, 0, false, 30 * time.Second},
 		{"nothing to wait for", 0, 0, false, 0},

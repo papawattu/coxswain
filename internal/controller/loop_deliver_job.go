@@ -100,6 +100,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -728,10 +729,18 @@ func deliveryTerminal(loop *coxv1alpha1.Loop) bool {
 	return false
 }
 
+// verifyHoldSettledReason is the False reason on the Verifying condition once a
+// held Loop's hold is released and there is no Delivered condition to name the
+// outcome (spec.delivery was cleared mid-hold): verify passed, the hold is over.
+// With a Delivered condition present its own reason (Delivered / DeliveryFailed)
+// is carried over instead (F52 B2).
+const verifyHoldSettledReason = "VerifySettled"
+
 // settleDeliveryHold (P5f) moves a held Loop (Verifying+Delivering) to
 // Succeeded once the Delivered condition is terminal (True, or False — D64: a
 // failed delivery is still Succeeded). It sets both phase and desiredPhase and
-// clears the hold condition. Returns true when it changed the Loop.
+// releases the hold condition (set False, not deleted — F52 B2). Returns true
+// when it changed the Loop.
 func settleDeliveryHold(loop *coxv1alpha1.Loop) bool {
 	if !loopHoldingForDelivery(loop) {
 		return false
@@ -743,13 +752,17 @@ func settleDeliveryHold(loop *coxv1alpha1.Loop) bool {
 	if deliveryEnabled(loop) && !deliveryTerminal(loop) {
 		return false
 	}
-	conds := make([]metav1.Condition, 0, len(loop.Status.Conditions))
-	for _, c := range loop.Status.Conditions {
-		if c.Type != string(coxv1alpha1.LoopPhaseVerifying) {
-			conds = append(conds, c)
-		}
+	// F52 B2: the hold's marker is Verifying=True + reason Delivering
+	// (loopHoldingForDelivery), so setting the condition False releases the hold
+	// exactly as deleting the entry did — and the record that the Loop passed
+	// verify stays visible in `kubectl cox describe` afterwards.
+	verifyReason, verifyMessage := verifyHoldSettledReason,
+		"verify passed and the Loop is Succeeded (delivery is no longer enabled)"
+	if c := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.DeliveredCondition); c != nil {
+		verifyReason = c.Reason
+		verifyMessage = "verify passed and the Loop is Succeeded (delivery: " + c.Reason + ")"
 	}
-	loop.Status.Conditions = conds
+	setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionFalse, verifyReason, verifyMessage)
 	loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
 	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
 	bumpLoopCompletion("succeeded", "verify_passed")

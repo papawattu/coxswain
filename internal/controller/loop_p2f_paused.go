@@ -114,11 +114,17 @@ func (r *LoopReconciler) resumeTriggered(loop *coxv1alpha1.Loop) bool {
 }
 
 // pausedLoopInDeliveryFlight reports whether a Succeeded Loop has a deliver
-// Job in flight: spec.delivery.mode == PullRequest and no status.delivery
-// record yet (the deliver Job has not recorded its outcome). Item F:
+// Job in flight: spec.delivery.mode == PullRequest and the delivery is not
+// terminal yet (deliveryTerminal). Item F:
 // suspend=true on such a Loop is REFUSED — delivery finishes, and the
 // alternative (suspending while the deliver Job pushes) would strand a
 // half-pushed PR.
+//
+// F52 B1: "in flight" is the terminal predicate, not "status.delivery is
+// nil". A FAILED delivery never writes status.delivery — only the success path
+// does (loop_deliver_job.go) — it records Delivered=False/DeliveryFailed, so
+// testing the record refused suspend for ever on a Succeeded Loop whose
+// delivery had failed.
 func pausedLoopInDeliveryFlight(loop *coxv1alpha1.Loop) bool {
 	if !deliveryPhaseActive(loop) {
 		return false
@@ -126,7 +132,7 @@ func pausedLoopInDeliveryFlight(loop *coxv1alpha1.Loop) bool {
 	if loop.Spec.Delivery == nil || loop.Spec.Delivery.Mode != coxv1alpha1.DeliveryModePullRequest {
 		return false
 	}
-	return loop.Status.Delivery == nil
+	return !deliveryTerminal(loop)
 }
 
 // loopPaused reports whether the Loop is in the Paused phase (the suspension
@@ -246,7 +252,7 @@ func (r *LoopReconciler) handleSuspendEntry(loop *coxv1alpha1.Loop) (pauseBlocke
 		// Paused condition records the refusal (False, the reason names it).
 		setCondition(loop, coxv1alpha1.PausedCondition, metav1.ConditionFalse,
 			suspendedRefusedCondReason,
-			"suspend refused while a deliver Job is in flight (phase Succeeded, delivery not recorded)")
+			"suspend refused while a deliver Job is in flight (the delivery is not terminal yet)")
 		return true, true
 	}
 	if !isPausablePhase(loop.Status.Phase) {

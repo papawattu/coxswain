@@ -449,6 +449,11 @@ reads the Loop before its PR exists (or delivery has failed). With delivery
 off, `Succeeded` is set as soon as verify passes. The memory-writer Job
 starts only after the Loop is `Succeeded`, not during the hold.
 
+Settling the hold does not delete the `Verifying` condition: it becomes
+`Verifying=False` with the delivery outcome as its reason (`Delivered`, or
+`DeliveryFailed`), so `kubectl cox describe` still shows that verify passed
+and why the hold ended.
+
 ### Key conditions to watch
 
 | Condition | What it means |

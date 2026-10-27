@@ -47,7 +47,9 @@ package controller
 //
 // Mutation (recorded in the PR): drop the terminal-phase stop from
 // sandboxOperatingMode (revert to spec.suspend||Paused) and the I74 unit spec
-// fails (the recreated Sandbox would be built Running — the crashloop).
+// fails (the recreated Sandbox would be built Running, so a terminal phase
+// would be handed to the one-shot runner — since F52 C2 it idles instead of
+// crashlooping, and the stop is still the right behaviour).
 // The envtest specs also guard the deletion: the S4 recycle must delete the
 // sandbox on the terminal-phase advance and must not recreate it on a
 // re-reconcile.

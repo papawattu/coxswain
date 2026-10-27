@@ -65,12 +65,15 @@ type Client struct {
 	// where start-up is slower. The retry log line (below) lets a Job log
 	// show how long the window really was.
 	//
-	// Why this differs from the runner (runner/runner.go isTimeoutError,
-	// I89: a non-timeout error such as connection refused is "definitive, do
-	// not retry"): the F41 failure was exactly such an immediate transport
-	// error, on a brand-new pod's first call, and it cleared on its own. The
-	// runner's own first call may have the same start-up failure; that is not
-	// shown here (queued as F79) and the runner is unchanged.
+	// The runner retries the same class since F79
+	// (runner/runner.go isRetryableModelError: a context deadline or a
+	// TRANSPORT error, i.e. client.Do returned an error so no HTTP response
+	// arrived; an HTTP status is definitive there too). The F41 failure was
+	// exactly such an immediate transport error, on a brand-new pod's first
+	// call, and it cleared on its own; whether the runner's own first call hits
+	// the same window is still not shown — F79's measurement run (a fresh
+	// pod's first call against a Ready proxy) is the evidence for that, and no
+	// mechanism is claimed here.
 	retryDelays []time.Duration
 
 	// retryBudget is the total retry WAIT this Client may spend across ALL

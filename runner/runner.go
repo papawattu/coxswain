@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,6 +88,13 @@ const (
 	// default is 4*120s + 14s = 494s (F46: this said 370s), still under the
 	// old 10-minute single-shot timeout. COX_MODEL_TIMEOUT
 	// (spec.loop.modelTimeoutSeconds) overrides the 120s.
+	//
+	// F79: the "or returns a transport error" half of that sentence was
+	// documented here but NOT implemented (the classification retried only
+	// context deadlines) until F79 made it true. The transport class is what
+	// the curator already retries (pkg/curator/curator.go) and what F41 saw on
+	// a brand-new pod's first call; see isRetryableModelError for the rule and
+	// for what is deliberately NOT retried.
 	defaultModelRetries      = 3
 	defaultModelRetryBackoff = 2 * time.Second
 
@@ -119,6 +128,13 @@ type runConfig struct {
 	// uses defaultModelTimeout. The per-request context is kept so a run
 	// deadline can cancel it later.
 	ModelTimeout time.Duration
+	// ModelRetries and ModelRetryBackoff are the bounded retry ladder for one
+	// model call (F79). Zero uses the production defaults
+	// (defaultModelRetries / defaultModelRetryBackoff); the fields exist so a
+	// spec can run the REAL driveModel with a millisecond ladder instead of
+	// sleeping through 2s+4s+8s. A negative ModelRetries means "no retries".
+	ModelRetries      int
+	ModelRetryBackoff time.Duration
 }
 
 // Result is the result file schema (Phase 0 subset of the Phase 1 contract).
@@ -350,7 +366,7 @@ func run(cfg runConfig) Result {
 
 	answer, trace, modelErr := driveModel(
 		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
-		messages, maxSteps, shellTimeout, modelTimeout, cfg.ExtraBody,
+		messages, maxSteps, shellTimeout, modelTimeout, modelRetryLadderFor(cfg.ModelRetries, cfg.ModelRetryBackoff), cfg.ExtraBody,
 	)
 
 	res := Result{
@@ -370,16 +386,57 @@ func run(cfg runConfig) Result {
 	return res
 }
 
-// callModel posts one chat-completions request and returns the assistant
-// message (with any tool calls). The request always advertises the runner's
-// tools (I1) so a real model can emit a shell tool call.
 // isTimeoutError reports whether err is a context deadline exceeded (the
-// model call timed out). A non-timeout error (HTTP 500, connection refused,
-// bad request) is definitive and should not be retried (I89).
+// model call timed out).
 func isTimeoutError(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
 }
 
+// isRetryableModelError reports whether a failed model call is worth another
+// attempt (I89, F79): a context deadline (a hung call) or a TRANSPORT error —
+// client.Do returned an error, so no HTTP response was received at all
+// (connection refused, no route, DNS, reset). A fresh pod's first call can hit
+// that class while the model endpoint becomes reachable; the curator's Judge
+// already retries it (pkg/curator/curator.go).
+//
+// NOT retried, deliberately: an HTTP status (500, 400), a decode error, or "no
+// choices" — the server answered, so the error is definitive. Nor is a failure
+// to read the response body (the response arrived; nothing shows it transient).
+func isRetryableModelError(err error) bool {
+	if isTimeoutError(err) {
+		return true
+	}
+	var uerr *url.Error
+	return errors.As(err, &uerr)
+}
+
+// modelRetryLadder is the bounded retry budget for one model call: retries
+// attempts after the first, with a base backoff doubled per retry.
+type modelRetryLadder struct {
+	retries int
+	backoff time.Duration
+}
+
+// modelRetryLadderFor returns the configured ladder, defaulting the zero values
+// to the production one (the MaxSteps/ShellTimeout/ModelTimeout convention).
+// F79: the ladder is config so a spec exercises the real driveModel with a
+// millisecond budget; the production values are also asserted directly, because
+// an unkilled mutant of a production constant is the F41 finding-1 pattern.
+func modelRetryLadderFor(retries int, backoff time.Duration) modelRetryLadder {
+	if retries == 0 {
+		retries = defaultModelRetries
+	} else if retries < 0 {
+		retries = 0
+	}
+	if backoff <= 0 {
+		backoff = defaultModelRetryBackoff
+	}
+	return modelRetryLadder{retries: retries, backoff: backoff}
+}
+
+// callModel posts one chat-completions request and returns the assistant
+// message (with any tool calls). The request always advertises the runner's
+// tools (I1) so a real model can emit a shell tool call.
 func callModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model string, messages []chatMessage,
 	extraBody map[string]any,
@@ -570,23 +627,25 @@ var knownTools = map[string]bool{toolNameShell: true}
 // truncated before being fed back.
 func driveModel(
 	ctx context.Context, client *http.Client, baseURL, apiKey, model, workspace string,
-	messages []chatMessage, maxSteps int, shellTimeout, modelTimeout time.Duration, extraBody map[string]any,
+	messages []chatMessage, maxSteps int, shellTimeout, modelTimeout time.Duration,
+	ladder modelRetryLadder, extraBody map[string]any,
 ) (string, []string, string) {
 	known := knownTools
 	trace := []string{}
 
 	for step := range maxSteps {
 		// I11: bound each model request with modelTimeout, derived from the
-		// caller's ctx so a run deadline can still cancel it. I89: bounded
-		// retry with exponential backoff — a hung model call (context deadline
-		// exceeded) is retried up to defaultModelRetries times before the
-		// runner surfaces ModelUnavailable and exits (the kubelet restarts
-		// the container; the operator's stall gate fires after repeated
-		// failures). A non-timeout error (HTTP 500, bad request) is NOT
-		// retried: the server responded, and the error is definitive.
+		// caller's ctx so a run deadline can still cancel it. I89/F79: bounded
+		// retry with exponential backoff — a hung call (context deadline
+		// exceeded) or a transport failure (no HTTP response at all) is retried
+		// up to ladder.retries times before the runner surfaces ModelUnavailable
+		// and exits (the kubelet restarts the container; the operator's stall
+		// gate fires after repeated failures). An error the server itself
+		// produced (HTTP status, decode, no choices) is NOT retried: it is
+		// definitive (isRetryableModelError).
 		var msg assistantMessage
 		var modelErr error
-		for attempt := range defaultModelRetries + 1 { // 0..defaultModelRetries (inclusive)
+		for attempt := range ladder.retries + 1 { // 0..ladder.retries (inclusive)
 			reqCtx, cancel := context.WithTimeout(ctx, modelTimeout)
 			m, err := callModel(reqCtx, client, baseURL, apiKey, model, messages, extraBody)
 			cancel()
@@ -596,15 +655,18 @@ func driveModel(
 				break
 			}
 			modelErr = err
-			// Only retry on a timeout (context deadline exceeded). A non-
-			// timeout error (HTTP 500, connection refused) is definitive.
-			if !isTimeoutError(err) || attempt >= defaultModelRetries {
+			if !isRetryableModelError(err) || attempt >= ladder.retries {
 				break
 			}
-			backoff := defaultModelRetryBackoff << uint(attempt) // 2s, 4s, 8s, ...
-			msg := "call model: retry " + strconv.Itoa(attempt+1) +
+			backoff := ladder.backoff << uint(attempt) // 2s, 4s, 8s, ...
+			retryLine := "call model: retry " + strconv.Itoa(attempt+1) +
 				" after " + err.Error() + " (backoff " + backoff.String() + ")"
-			trace = append(trace, msg)
+			trace = append(trace, retryLine)
+			// F79 (R26 I90): the trace is not read by any operator component,
+			// so a retry is invisible unless it is logged. stderr lands in the
+			// sandbox container's log (the curator's retry line, the F41 fix,
+			// is the same shape and is what made that window measurable).
+			log.Printf("runner: call model: retry %d/%d in %s: %v", attempt+1, ladder.retries, backoff, err)
 			select {
 			case <-ctx.Done():
 				return "", append(trace, "call model: context cancelled"), "context cancelled"

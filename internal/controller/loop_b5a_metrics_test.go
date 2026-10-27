@@ -112,6 +112,7 @@ func TestMetricsRegistered(t *testing.T) {
 	loopsCompletedTotal.WithLabelValues("__test__", "__test__").Inc()
 	loopStallsTotal.Inc()
 	loopTokensTotal.WithLabelValues("__test__").Inc()
+	loopUnmeteredRequestsTotal.Inc()
 	memoryWritesTotal.WithLabelValues("__test__").Inc()
 	memoryLessonsTotal.WithLabelValues("__test__").Inc()
 	// B5a: loops_active is now a custom Collector (loops_active_collector.go),
@@ -124,6 +125,7 @@ func TestMetricsRegistered(t *testing.T) {
 		"coxswain_loops_completed_total",
 		"coxswain_loop_stalls_total",
 		"coxswain_loop_tokens_total",
+		"coxswain_unmetered_requests_total",
 		"coxswain_memory_writes_total",
 		"coxswain_memory_lessons_total",
 	} {
@@ -359,5 +361,30 @@ func TestMetricsIterationBumped(t *testing.T) {
 	after, _ := readMetric(t, "coxswain_loop_iterations_total")
 	if after != before+1 {
 		t.Fatalf("coxswain_loop_iterations_total = %v after bumpIteration(), want %v (before+1)", after, before+1)
+	}
+}
+
+// TestMetricsUnmeteredTotal: noteUnmetered bumps coxswain_unmetered_requests_total
+// by the delta it folds into status.budget (F82: the bump at the noteUnmetered
+// call site was the one line of the path with no spec).
+// Mutation: delete `loopUnmeteredRequestsTotal.Add(...)` in noteUnmetered.
+func TestMetricsUnmeteredTotal(t *testing.T) {
+	before, ok := readMetric(t, "coxswain_unmetered_requests_total")
+	if !ok {
+		t.Fatalf("coxswain_unmetered_requests_total is not registered")
+	}
+	// noteUnmetered reads and writes status.budget: the Loop needs a Budget.
+	loop := &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: "unmetered-metric", Namespace: "default"}}
+	loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
+	r := &LoopReconciler{}
+	r.noteUnmetered(loop, 2)
+	after, _ := readMetric(t, "coxswain_unmetered_requests_total")
+	if after != before+2 {
+		t.Fatalf("coxswain_unmetered_requests_total = %v after noteUnmetered(2), want %v (before+2)", after, before+2)
+	}
+	// A zero delta (a clean same-boot read) is not a bump.
+	r.noteUnmetered(loop, 0)
+	if got, _ := readMetric(t, "coxswain_unmetered_requests_total"); got != before+2 {
+		t.Fatalf("coxswain_unmetered_requests_total = %v after noteUnmetered(0), want %v (unchanged)", got, before+2)
 	}
 }

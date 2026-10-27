@@ -278,8 +278,10 @@ func (m *meteringRoundTripper) audit(req *http.Request, resp *http.Response, bod
 }
 
 // isSSE reports whether the request asked for a streaming response (the
-// internal context marker set in serve when the body had stream:true, or an
-// Accept: text/event-stream header).
+// internal context marker set in serve when the body asked to stream, or an
+// Accept: text/event-stream header). F44: "asked to stream" means any
+// top-level "stream" value other than absent, null or false (streamRequested),
+// so a coerced value ("true", 1) takes this path too.
 func isSSE(req *http.Request) bool {
 	if req.Context().Value(streamKey) == true {
 		return true
@@ -287,7 +289,9 @@ func isSSE(req *http.Request) bool {
 	return strings.Contains(req.Header.Get("Accept"), "text/event-stream")
 }
 
-// isStreaming reports whether a JSON request body asked for stream:true.
+// isStreaming reports whether a JSON request body asked to stream: any
+// top-level "stream" value other than absent, null or false counts (F44; see
+// streamRequested).
 func isStreaming(body []byte) bool {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 || trimmed[0] != '{' {

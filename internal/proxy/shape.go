@@ -77,9 +77,10 @@ func streamRequested(raw json.RawMessage) bool {
 }
 
 // shapeRequest rewrites the agent's request before it is dialed upstream so
-// the agent cannot steer the meter. A streaming request (top-level
-// "stream": true) is forced to carry stream_options.include_usage=true so the
-// upstream emits a final usage chunk. A non-JSON or non-object body is
+// the agent cannot steer the meter. A streaming request (a top-level "stream"
+// set to anything but absent/null/false — F44, see streamRequested) is forced
+// to carry stream_options.include_usage=true so the upstream emits a final
+// usage chunk. A non-JSON or non-object body is
 // forwarded unmodified and the caller counts it as unmetered. The
 // Accept-Encoding header is stripped separately by the proxy handler.
 func shapeRequest(body []byte) (newBody []byte, isObject bool) {

@@ -123,13 +123,12 @@ var _ = Describe("F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, no
 		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		Expect(err).NotTo(HaveOccurred(),
 			"a missing KubeArmorPolicy CRD must not abort the reconcile (F92: that left status: {})")
-		Expect(res.RequeueAfter).To(BeNumerically(">", 0),
-			"a held Loop must be re-checked (F92 P2-2), not left waiting for an unrelated event")
-		// This Loop is still clone-pending, so the window here is the 5s work
-		// requeue; the exact F92 window (Equal(kaptCRDMissingRequeue)) is pinned
-		// by S5, which seeds baseCommit to leave the F92 window as the only one.
-		Expect(res.RequeueAfter).To(BeNumerically("<", kaptCRDMissingRequeue),
-			"a clone-pending Loop takes the 5s work requeue, which is shorter than the F92 window")
+		// This Loop is still clone-pending, so the window is the 5s work requeue
+		// — pinned exactly rather than as "> 0", which any requeue satisfies (pi3
+		// prereview-308 finding 4). S5 seeds baseCommit to leave the F92 window
+		// as the only one and pins it with Equal(kaptCRDMissingRequeue).
+		Expect(res.RequeueAfter).To(Equal(5*time.Second),
+			"a clone-pending Loop takes the 5s work requeue (a held Loop is re-checked, not left waiting for an unrelated event)")
 
 		By("the Loop's status must say why (the R26 I90 norm)")
 		loop := f92Get(ns, name)

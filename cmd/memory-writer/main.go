@@ -23,8 +23,11 @@
 //     (total / written / dropped), plus one line per lesson with its
 //     sha256-prefix, written|dropped, and the rule. A lesson that failed the
 //     secrets screen is never echoed, but a curator reason is free model text
-//     and may quote a kept lesson. (The summary is not size-bounded here;
-//     the termination message is capped at 4096 bytes by Kubernetes: F80.)
+//     and may quote a kept lesson. The termination-message copy is bounded to
+//     summaryFileMaxBytes (4000) here, under the kubelet's 4096-byte cap, and
+//     marked with "… N more lines" when it is cut (F80); stdout keeps the FULL
+//     summary, because the Job log is where the complete per-lesson audit is
+//     read (and FallbackToLogsOnError makes the log tail a crash's message).
 //
 // Exit 0 on success (the write completed, whether or not any lesson was
 // eligible — a zero-eligible write is a valid "nothing to write"); exit
@@ -427,25 +430,75 @@ func summaryLines(lessons, reasons, audit []string, total, written, dropped int)
 	return out
 }
 
-// emitSummary writes the bounded summary's lines to stdout AND, if
-// COX_SUMMARY_PATH is set, to that file (the container's termination-message
-// path — the operator reads it from the pod's container status). A write
-// failure to the summary file is non-fatal (the summary is best-effort
-// evidence; the Lesson write already succeeded): it is logged to stderr but
-// does not change the exit code. A bounded summary must never echo a lesson's
-// text — the lines are built by summaryLines, which uses only the sha prefix.
-func emitSummary(lines []string) {
+// summaryFileMaxBytes bounds the termination-message copy of the summary (F80).
+// Kubernetes caps a container's termination message at 4096 bytes and CUTS
+// anything longer silently, so an unbounded summary arrived truncated with no
+// marker; 4000 leaves room for the truncation marker line, so the marker can
+// never be the bytes the kubelet drops.
+const summaryFileMaxBytes = 4000
+
+// summaryTruncationMarker is the last line of a bounded summary: how many whole
+// lines were dropped. F78's vocabulary, so the two cuts compose — the operator's
+// memoryWriteAuditText cuts the RECEIVED text again (to 1000 bytes) and computes
+// its own marker over the lines it received.
+func summaryTruncationMarker(dropped int) string {
+	return fmt.Sprintf("… %d more lines", dropped)
+}
+
+// renderSummary renders lines one per line (the stdout form: the FULL summary).
+func renderSummary(lines []string) []byte {
 	var buf bytes.Buffer
 	for _, line := range lines {
 		fmt.Fprintln(&buf, line)
 	}
-	// stdout (always).
-	if _, werr := os.Stdout.Write(buf.Bytes()); werr != nil {
+	return buf.Bytes()
+}
+
+// boundSummary renders lines as the termination-message copy: WHOLE lines up to
+// limit bytes, then summaryTruncationMarker for the rest. summaryLines puts the
+// counts line first, and the budget is reserved for the marker BEFORE each line
+// is added, so a kept line can never crowd the marker out. The counts line is
+// therefore always kept (it is tens of bytes against a 4000-byte budget) and a
+// reader can always tell a capped summary from a complete one.
+func boundSummary(lines []string, limit int) []byte {
+	var buf bytes.Buffer
+	kept := 0
+	for i, line := range lines {
+		markerNeed := 0
+		if remaining := len(lines) - i - 1; remaining > 0 {
+			markerNeed = len(summaryTruncationMarker(remaining)) + 1 // + newline
+		}
+		if buf.Len()+len(line)+1+markerNeed > limit {
+			break
+		}
+		fmt.Fprintln(&buf, line)
+		kept++
+	}
+	if kept < len(lines) {
+		fmt.Fprintln(&buf, summaryTruncationMarker(len(lines)-kept))
+	}
+	return buf.Bytes()
+}
+
+// emitSummary writes the summary to stdout AND, if COX_SUMMARY_PATH is set, to
+// that file (the container's termination-message path — the operator reads it
+// from the pod's container status). The two copies are NOT identical above the
+// cap (F80): stdout carries the full summary, the file the bounded copy (whole
+// lines + "… N more lines"), because the kubelet cuts the message silently and
+// the Job log is the place the complete audit is read. A write failure to the
+// summary file is non-fatal (the summary is best-effort evidence; the Lesson
+// write already succeeded): it is logged to stderr but does not change the exit
+// code. A bounded summary must never echo a lesson's text — the lines are built
+// by summaryLines, which uses only the sha prefix.
+func emitSummary(lines []string) {
+	// stdout (always): the FULL summary.
+	if _, werr := os.Stdout.Write(renderSummary(lines)); werr != nil {
 		fmt.Fprintf(os.Stderr, "memory-write: could not write the summary to stdout: %v (non-fatal)\n", werr)
 	}
-	// The termination-message file (if set). A failure here is non-fatal.
+	// The termination-message file (if set): bounded (F80). A failure here is
+	// non-fatal.
 	if p := summaryPathFromEnv(); p != "" {
-		if err := os.WriteFile(p, buf.Bytes(), 0o644); err != nil {
+		if err := os.WriteFile(p, boundSummary(lines, summaryFileMaxBytes), 0o644); err != nil {
 			fmt.Fprintf(
 				os.Stderr,
 				"memory-write: could not write the summary to %s: %v (non-fatal; the lesson write succeeded)\n",

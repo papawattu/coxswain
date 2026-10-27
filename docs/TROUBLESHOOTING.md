@@ -353,7 +353,8 @@ plain failure message, because a failed write is unreliable evidence and
 the operator does not fabricate an audit for a write that did not
 happen. The `memoryWriteAuditText` copy of the audit is capped at 1000
 bytes (the client-go Event cap is 1024; the Job's termination message is
-bounded to 4096), so a long write is cut in the **condition message**.
+bounded to 4000 by the writer — F80, under the kubelet's 4096-byte cap), so a
+long write is cut in the **condition message**.
 The cut is line-oriented: whole lines are kept, then `… N more lines`
 says how many were dropped; there is never a half line. The counts line
 (`summary: total=…`) and the audit lines come first, so they are kept.
@@ -392,10 +393,11 @@ the cap and the first omitted file name.
   --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>`
   or `kubectl describe loop <loop>`.
 - **The memory-writer Job log**: `kubectl logs -n <loop-ns>
-  job/<loop>-memory-write-<iteration>`. The Job writes the
-  same bounded summary to stdout as to its termination message, so the
-  log carries the **full** per-lesson audit when the condition message's
-  1000-byte copy is truncated. The per-lesson lines carry only the
+  job/<loop>-memory-write-<iteration>`. The Job writes the **full** summary to
+  stdout; the termination message carries the bounded copy (≤4000 bytes, whole
+  lines, marked `… N more lines`), so the log carries the **full** per-lesson
+  audit when the condition message's 1000-byte copy or the termination
+  message's 4000-byte copy is truncated. The per-lesson lines carry only the
   12-hex SHA prefix for the lesson itself; a curator reason may quote the
   lesson (see above).
 - **The runner's log**: the `memory section truncated` warning when the

@@ -290,8 +290,9 @@ func TestMemoryWriteScreenedLessonTextIsNeverEchoed(t *testing.T) {
 // COX_SUMMARY_PATH (the container's termination-message path) in ADDITION to
 // stdout — the operator's distroless image has no /bin/sh, so the binary is
 // the Job's direct entrypoint and must write the summary file itself (no
-// shell redirect). The file's content must match stdout (the same bounded
-// summary, never the lesson text).
+// shell redirect). Under the cap the file's content matches stdout exactly
+// (never the lesson text); above it they differ on purpose (stdout is the full
+// summary, the file the bounded copy — see the F80 spec).
 func TestSummaryPathFile(t *testing.T) {
 	ws := t.TempDir()
 	mem := t.TempDir()

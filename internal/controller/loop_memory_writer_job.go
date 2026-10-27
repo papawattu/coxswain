@@ -1014,7 +1014,10 @@ func memoryWriteAuditMessage(summary string) string {
 // cut loses the per-lesson lines first. The cut is LINE-oriented: whole lines
 // are kept up to 1000 bytes, then " … N more lines" says how many were
 // dropped; there is never a half line. The Event's message is capped by
-// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes. The
+// client-go (1024 bytes); the Job's termination-message summary is bounded to
+// 4000 bytes BY THE WRITER, and this copy is then cut to the 1000 here (F80:
+// the writer's bound is what makes the first cap reachable — the kubelet cuts
+// silently at 4096). The
 // per-lesson lines are sha-prefix + status + rule, where a curator reason is
 // model text (see memoryWriteAuditMessage).
 //

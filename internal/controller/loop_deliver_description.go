@@ -35,9 +35,13 @@
 //     never a runner claim;
 //   - status.iteration (the operator's own iteration count, B4 — the claim
 //     only advances the phase machine, the count is the operator's);
-//   - status.verify + status.currentVerify (the verify evidence: the pinned
-//     verifiedCommit and the tamper exit code — kubelet-recorded, ADR-0005
-//     D14, never a result.json claim);
+//   - status.verify + status.currentVerify (the verify evidence: the PIN — the
+//     agent's claimed headCommit, accepted by the operator at the Verifying
+//     transition, so claim-chosen and operator-accepted rather than
+//     kubelet-recorded — and the tamper exit code, which is kubelet-recorded,
+//     ADR-0005 D14). The pin ALONE is not a pass: the "Last verify" pass
+//     needs status.verify to name that pin (VerifyAccepted, F69 — the pin
+//     survives a failing verify);
 //   - status.currentVerify + status.stallHistory for the "Last verify" line:
 //     the line is DERIVED from the pin (the delivery names a pass) and the
 //     newest stallHistory failure (the operator's record of the verify Job
@@ -115,7 +119,10 @@ const deliverPlanCopyMaxBytes = deliverPlanMaxBytes + 4096
 // push script's python emits this label verbatim (the label is a fixed
 // string, not user data — it lives in the operator's python source, and the
 // Go constant here is the single source of truth the specs assert against).
-const deliverPlanSectionHeader = "## Plan (written by the agent, untrusted)\n\n```markdown"
+// The fence that follows it is NOT part of the constant: it is one backtick
+// longer than the longest backtick run in the plan (F3), so a plan carrying
+// its own ``` line cannot close it and escape into the PR body as markdown.
+const deliverPlanSectionHeader = "## Plan (written by the agent, untrusted)\n\n"
 
 // deliverDescription is the facts body the operator builds for the deliver
 // Job (the PR description's facts half). Rendered from the Loop's
@@ -144,13 +151,25 @@ type deliverDescription struct {
 	// MaxIterations is spec.loop.maxIterations (0 when unset; the body
 	// prints "unset").
 	MaxIterations int
-	// VerifiedCommit is status.currentVerify.verifiedCommit (the pin).
+	// VerifiedCommit is status.currentVerify.verifiedCommit (the pin). The pin is
+	// CLAIM-CHOSEN, OPERATOR-ACCEPTED: the operator writes it when the phase
+	// advances to Verifying, from the agent's claimed headCommit (shape-checked
+	// 40-hex), and it SURVIVES a failing verify — only the iterate and re-plan
+	// paths clear it. It is not the operator's proof that the checks passed;
+	// VerifyAccepted is.
 	VerifiedCommit string
+	// VerifyAccepted reports that the operator's verify RECORD names this pin
+	// (status.verify.verifiedCommit == the pin, and the pin is non-empty). The
+	// operator writes that record when it applies the verify outcome (F83c), so
+	// a match is the operator's statement that THIS pin was verified — the only
+	// evidence the body has for the "the acceptance checks passed" line (F69).
+	VerifyAccepted bool
 	// TamperClean reports the last tamper-check outcome: 0 = clean
 	// (status.verify.tamperExitCode 0), -1 = no evidence
 	// (status.verify.tamperExitCode nil — fail-closed reading, printed as
 	// "no tamper evidence"), >0 = tampered (a protected path changed; the
-	// body names the exit code).
+	// body names the exit code). It counts only with VerifyAccepted: the code
+	// belongs to the record, and the record belongs to the pin.
 	TamperClean int32
 	// VerifyHistory is the per-iteration verify record (PLAN-ALPHA A4: "the
 	// verify results per iteration"): the operator's status.stallHistory
@@ -260,9 +279,17 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 	// this delivery and reads as "no evidence" (-1, the fail-closed reading).
 	// `pin != ""` matters too: otherwise an empty record would match a Loop
 	// with no pin.
+	//
+	// F69: the same match is the PASS evidence for the "Last verify" line
+	// (VerifyAccepted), computed once here. The pin alone is not evidence: the
+	// operator writes it at the Verifying transition from the agent's claimed
+	// headCommit (loop_s4_phase.go), and it survives a failing verify (only the
+	// iterate / re-plan paths clear it), so "a pin exists" does not mean "the
+	// checks passed".
+	v := loop.Status.Verify
+	verifyAccepted := v != nil && pin != "" && v.VerifiedCommit == pin
 	tamper := int32(-1)
-	if v := loop.Status.Verify; v != nil && v.TamperExitCode != nil &&
-		pin != "" && v.VerifiedCommit == pin {
+	if verifyAccepted && v.TamperExitCode != nil {
 		tamper = *v.TamperExitCode
 	}
 	budget := &deliverBudgetFacts{}
@@ -316,6 +343,7 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 		Iteration:      loop.Status.Iteration,
 		MaxIterations:  loop.Spec.Loop.MaxIterations,
 		VerifiedCommit: pin,
+		VerifyAccepted: verifyAccepted,
 		TamperClean:    tamper,
 		VerifyHistory:  verifyHistory,
 		Budget:         budget,
@@ -404,20 +432,29 @@ func renderDeliverDescriptionBody(d deliverDescription) string {
 	}
 	// F69: the "Last verify" line is the operator's own record, never the
 	// Loop's last-status text (status.progress.lastResultStatus, which is the
-	// runner's claim on every phase claim). The pin exists only when the
-	// operator's verify outcome accepted an iteration, so it decides the
-	// pass; without a pin the newest recorded verify failure (the stall ring)
-	// speaks, and with neither there is no operator record to print.
+	// runner's claim on every phase claim).
+	//
+	// "Passed" is keyed on VerifyAccepted — the verify RECORD naming this pin —
+	// not on the pin's presence: the pin is claim-chosen and survives a failing
+	// verify (see the VerifiedCommit field doc). Without an accepted record the
+	// newest recorded verify failure (the stall ring) speaks; with neither
+	// there is no operator record to print. That last branch is unreachable at
+	// delivery today (deliveryEnabled requires the pin and a passed verify), but
+	// it keeps the line honest on the function's own inputs rather than on its
+	// callers' gate.
 	switch {
-	case d.VerifiedCommit != "":
+	case d.VerifyAccepted:
 		b.WriteString("- **Last verify:** the acceptance checks passed\n")
 	default:
 		if e, ok := lastFailedVerify(d.VerifyHistory); ok {
+			// The ring's Check is the verify Job's check CONTAINER name
+			// (check-<i>, loop_verify_job.go), not the acceptance check's text:
+			// name it as the container it is rather than calling it a check.
 			check := oneLine(e.Check)
 			if check == "" {
-				check = "(check unnamed)"
+				check = "(unnamed)"
 			}
-			fmt.Fprintf(&b, "- **Last verify:** check %q failed (iteration %d; see the per-iteration record)\n", check, e.Iteration)
+			fmt.Fprintf(&b, "- **Last verify:** the check container %q failed (iteration %d; see the per-iteration record)\n", check, e.Iteration)
 		} else {
 			b.WriteString("- **Last verify:** no verify outcome recorded\n")
 		}

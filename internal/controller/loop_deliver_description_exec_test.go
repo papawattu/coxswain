@@ -123,6 +123,61 @@ func TestDeliverPushPayloadJSONSafety(t *testing.T) {
 	}
 }
 
+// TestDeliverPushPayloadPlanFenceOutlivesThePlan (F3) runs the REAL
+// deliverPushPayloadPython with a plan that carries its own ``` fence and
+// asserts the operator's fence is LONGER, so the plan stays inside it. Before
+// F3 the fence was a fixed ```: a plan line of three backticks closed it, and
+// everything after it (operator-looking headings, remote images, links,
+// @mentions) rendered as ordinary markdown in the delivered PR body. The test
+// asserts containment, not just the fence's length: the injected heading must
+// appear BETWEEN the opening fence and the closing one. Mutation: restore the
+// fixed ``` fence -> the fence is no longer 4 backticks and the injected
+// heading lands outside the fence -> this test FAILS.
+func TestDeliverPushPayloadPlanFenceOutlivesThePlan(t *testing.T) {
+	facts := renderDeliverDescriptionBody(deliverDescriptionForLoop(a4FactsLoop()))
+	// The plan closes the fence with its own ``` line and then writes what an
+	// attacker would want in the PR body: a heading that imitates the operator's
+	// sections, an @mention (GitHub notifies from body text, not from inside a
+	// code fence) and a remote image (a tracking pixel).
+	plan := "# Plan\n\n```sh\n## Injected operator-looking heading\n@someone please approve this\n" +
+		"![](https://attacker.example/pixel.png)\n```\n"
+	planFile := filepath.Join(t.TempDir(), "PLAN.md")
+	if err := os.WriteFile(planFile, []byte(plan), 0o644); err != nil {
+		t.Fatalf("write the fenced plan: %v", err)
+	}
+
+	payload, err := runDeliverPushPayloadPython(t, facts, planFile, deliverPlanMaxBytes)
+	if err != nil {
+		t.Fatalf("the push payload python failed: %v", err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+		t.Fatalf("the PR payload is not valid JSON: %v; payload: %q", err, payload)
+	}
+	body, _ := obj["body"].(string)
+
+	// The plan is verbatim inside the section (the JSON half was already
+	// covered by TestDeliverPushPayloadJSONSafety).
+	if !strings.Contains(body, deliverPlanSectionHeader) {
+		t.Fatalf("the decoded body does not carry the plan section label %q:\n%s", deliverPlanSectionHeader, body)
+	}
+	open := "\n````markdown\n"
+	if !strings.Contains(body, open) {
+		t.Fatalf("the plan carries a ``` run, so the operator's fence must be LONGER than three backticks (want %q):\n%s", open, body)
+	}
+	rest := body[strings.Index(body, open)+len(open):]
+	closing := "\n````\n"
+	if !strings.Contains(rest, closing) {
+		t.Fatalf("the operator's fence is not closed by a matching ```` line:\n%s", body)
+	}
+	inside := rest[:strings.Index(rest, closing)]
+	for _, want := range []string{"## Injected operator-looking heading", "@someone please approve this", "```sh"} {
+		if !strings.Contains(inside, want) {
+			t.Fatalf("the plan line %q escaped the fence (it must stay between the opening and closing fence):\n%s", want, body)
+		}
+	}
+}
+
 // TestDeliverPushPayloadPlanTruncated (A4) runs the REAL deliverPushPayloadPython
 // with a plan that exceeds deliverPlanMaxBytes and asserts the plan is
 // truncated at a whole line with the truncation note appended (the cap is

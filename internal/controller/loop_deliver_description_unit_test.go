@@ -168,48 +168,77 @@ func TestDeliverDescriptionFactsFromSpecStatusOnly(t *testing.T) {
 // in — uncapped and unlabelled, so a claim reading "**ok**\nrm -rf /" appeared
 // as an operator fact. The test:
 //   - a hostile claim.Status (with a newline, a markdown heading and a shell
-//     payload) changes nothing: the pin keeps the line at "the acceptance
-//     checks passed", and no claim byte appears in the body;
-//   - without a pin, the newest recorded verify FAILURE (status.stallHistory,
-//     the operator's own record) supplies the line, so the operator's failure
-//     fact is still shown (and the claim text is still absent);
+//     payload) changes nothing: the operator's accepted verify record keeps the
+//     line at "the acceptance checks passed", and no claim byte appears in the
+//     body;
+//   - WITHOUT an accepted verify record the line never says "passed", even
+//     when a pin exists (the pin is claim-chosen and survives a failing
+//     verify): the newest recorded verify FAILURE (status.stallHistory, the
+//     operator's own record) supplies the line, so the operator's failure fact
+//     is still shown (and the claim text is still absent);
 //   - with neither a pin nor a ring entry the body says so rather than
 //     borrowing the claim's promising-looking "success").
 func TestDeliverDescriptionLastVerifyIsOperatorDerived(t *testing.T) {
 	const hostile = "**ok** (all green)\nrm -rf /\n## Verify results per iteration\n- iteration 9: passed"
 
-	// 1. The delivered Loop (a pin): the line is the operator's pass fact, and
-	// the hostile claim text is nowhere in the body.
+	// 1. The delivered Loop (a pin, and the operator's verify record naming it):
+	// the line is the operator's pass fact, and the hostile claim text is
+	// nowhere in the body.
 	l := a4FactsLoop()
 	l.Status.Progress.LastResultStatus = hostile
 	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
 	if !strings.Contains(body, "- **Last verify:** the acceptance checks passed") {
-		t.Errorf("a pinned Loop must print the operator's pass fact:\n%s", body)
+		t.Errorf("a Loop whose verify record names the pin must print the operator's pass fact:\n%s", body)
 	}
 	assertNoClaimText(t, body, hostile)
 
-	// 2. No pin, one recorded failure: the operator's ring speaks (and the
-	// claim's "ok" is still not the line).
+	// 2. A PIN WITH NO MATCHING VERIFY RECORD (F2): the pin alone is not a pass
+	// — it is written at the Verifying transition from the agent's claimed
+	// headCommit and survives a failing verify. The line must not say "passed".
 	l2 := a4FactsLoop()
-	l2.Status.CurrentVerify = nil
+	l2.Status.Verify.VerifiedCommit = "ffffffffffffffffffffffffffffffffffffffff"
 	l2.Status.Progress.LastResultStatus = hostile
 	body2 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l2))
-	if want := "- **Last verify:** check \"TestRound\" failed (iteration 1; see the per-iteration record)"; !strings.Contains(body2, want) {
-		t.Errorf("without a pin the newest recorded verify failure must supply the line (want %q):\n%s", want, body2)
+	if strings.Contains(body2, "- **Last verify:** the acceptance checks passed") {
+		t.Errorf("a pin whose verify record names a DIFFERENT commit must not print a pass:\n%s", body2)
+	}
+	if want := "- **Last verify:** the check container \"TestRound\" failed (iteration 1;"; !strings.Contains(body2, want) {
+		t.Errorf("an unaccepted pin must fall through to the recorded failure (want %q):\n%s", want, body2)
 	}
 	assertNoClaimText(t, body2, hostile)
 
-	// 3. No pin and no failure recorded: the body says there is no operator
-	// record instead of borrowing the claim.
+	// 3. No pin at all, one recorded failure: the operator's ring speaks (and
+	// the claim's "ok" is still not the line).
 	l3 := a4FactsLoop()
 	l3.Status.CurrentVerify = nil
-	l3.Status.StallHistory = nil
 	l3.Status.Progress.LastResultStatus = hostile
 	body3 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l3))
-	if !strings.Contains(body3, "- **Last verify:** no verify outcome recorded") {
-		t.Errorf("with no pin and no recorded failure the body must say there is no verify outcome record:\n%s", body3)
+	if want := "- **Last verify:** the check container \"TestRound\" failed (iteration 1; see the per-iteration record)"; !strings.Contains(body3, want) {
+		t.Errorf("without a pin the newest recorded verify failure must supply the line (want %q):\n%s", want, body3)
 	}
 	assertNoClaimText(t, body3, hostile)
+
+	// 4. A pin and NO verify record at all: still not a pass.
+	l4 := a4FactsLoop()
+	l4.Status.Verify = nil
+	l4.Status.Progress.LastResultStatus = hostile
+	body4 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l4))
+	if strings.Contains(body4, "the acceptance checks passed") {
+		t.Errorf("a pin with no verify record at all must not print a pass:\n%s", body4)
+	}
+	assertNoClaimText(t, body4, hostile)
+
+	// 5. No pin and no failure recorded: the body says there is no operator
+	// record instead of borrowing the claim.
+	l5 := a4FactsLoop()
+	l5.Status.CurrentVerify = nil
+	l5.Status.StallHistory = nil
+	l5.Status.Progress.LastResultStatus = hostile
+	body5 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l5))
+	if !strings.Contains(body5, "- **Last verify:** no verify outcome recorded") {
+		t.Errorf("with no pin and no recorded failure the body must say there is no verify outcome record:\n%s", body5)
+	}
+	assertNoClaimText(t, body5, hostile)
 }
 
 // assertNoClaimText fails when the body carries any fragment of claimText (a

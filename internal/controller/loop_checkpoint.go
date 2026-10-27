@@ -823,6 +823,15 @@ func isForbidden(err error) bool {
 	return apierrors.IsForbidden(err)
 }
 
+// isAdmissionInvalid is true when the apiserver refused the write because the
+// resulting object fails CRD validation (422 Invalid) — the F68 case: a stored
+// Loop whose spec predates a tightened bound (an over-long ref, more than 16
+// acceptance checks, ...). Unlike a Forbidden this is not a namespace teardown
+// that resolves itself: it needs a human to fix the spec (docs/UPGRADE.md).
+func isAdmissionInvalid(err error) bool {
+	return apierrors.IsInvalid(err)
+}
+
 // gcLoopCheckpoints deletes the Loop's checkpoint VolumeSnapshots (B1
 // finalizer: CleaningUp). It lists the snapshots by the Loop label and
 // deletes each (NotFound is a success — the GC is idempotent). It returns
@@ -1156,19 +1165,54 @@ func (r *LoopReconciler) reconcileCleaningUp(ctx context.Context, loop *coxv1alp
 	// resynced every cached object for the operator's lifetime to fix one
 	// case; a targeted RequeueAfter retries only this Loop).
 	if err := r.removeLoopCheckpointFinalizer(ctx, loop); err != nil {
-		if isForbidden(err) {
-			logf.FromContext(ctx).Info("CleaningUp: the finalizer-removal Update was rejected (terminating namespace); requeueing", "loop", loop.Name)
-			if r.Recorder != nil {
-				r.Recorder.Eventf(loop, corev1.EventTypeWarning, "FinalizerRemovalBlocked",
-					"finalizer removal rejected (terminating namespace); requeueing: %v", err)
-			}
-			return ctrl.Result{RequeueAfter: workRequeue}, nil
+		if res, refused := r.surfaceFinalizerRemovalRefusal(ctx, loop, err); refused {
+			return res, nil
 		}
 		logf.FromContext(ctx).Error(err, "CleaningUp: the finalizer removal failed; requeueing with backoff", "loop", loop.Name)
 		return ctrl.Result{}, err
 	}
 	logf.FromContext(ctx).Info("CleaningUp: the finalizer was removed; the Loop (and its namespace, when nothing else remains) can now be deleted", "loop", loop.Name)
 	return ctrl.Result{}, nil
+}
+
+// finalizerRemovalInvalidSpecRequeue is how long the operator waits before
+// retrying a finalizer removal that the apiserver refused because the stored
+// spec fails CRD validation (isAdmissionInvalid). The condition does not clear
+// on its own — a human has to fix the field — so this is a slow timer rather
+// than the 5s terminating-namespace retry (F68).
+const finalizerRemovalInvalidSpecRequeue = 5 * time.Minute
+
+// surfaceFinalizerRemovalRefusal turns the two Update refusals that retrying
+// with the error backoff cannot fix into a visible Event plus a targeted
+// RequeueAfter (R26 I90: a fallback must surface its failure):
+//
+//   - Forbidden — a terminating namespace rejects the Update; the namespace
+//     teardown removes the Loop, so the finalizer is moot once it is gone
+//     (F10, retried every 5s);
+//   - Invalid — the stored Loop's spec no longer passes CRD admission (F68:
+//     tightened bounds), so no Update of the object can land until the spec is
+//     fixed; retried every 5 minutes and pointed at docs/UPGRADE.md.
+//
+// refused is false for any other error: the caller returns it and the
+// controller backs off as usual.
+func (r *LoopReconciler) surfaceFinalizerRemovalRefusal(ctx context.Context, loop *coxv1alpha1.Loop, err error) (ctrl.Result, bool) {
+	forbidden := isForbidden(err)
+	if !forbidden && !isAdmissionInvalid(err) {
+		return ctrl.Result{}, false
+	}
+	requeue := 5 * time.Second
+	detail := "finalizer removal rejected (terminating namespace)"
+	if !forbidden {
+		requeue = finalizerRemovalInvalidSpecRequeue
+		detail = "finalizer removal rejected: the Loop's stored spec no longer passes CRD admission, so the object cannot be updated until the spec is fixed (see docs/UPGRADE.md)"
+	}
+	logf.FromContext(ctx).Info("CleaningUp: the finalizer-removal Update was rejected; requeueing",
+		"loop", loop.Name, "forbidden", forbidden, "requeue-after", requeue)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "FinalizerRemovalBlocked",
+			"%s; requeueing: %v", detail, err)
+	}
+	return ctrl.Result{RequeueAfter: requeue}, true
 }
 
 // removeLoopCheckpointFinalizer removes the checkpoint finalizer (B1) once

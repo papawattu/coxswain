@@ -192,17 +192,23 @@ type Workspace struct {
 	// ref is the branch, tag, or commit to check out. Defaults to the repo's
 	// default branch when empty.
 	//
-	// The pattern is defence in depth (F68): the value reaches the workspace and
-	// clone scripts as a git argument, shell-quoted (F37), so it must be a
-	// `git check-ref-format` ref name — [A-Za-z0-9._/@+] and '-', with no shell
-	// metacharacter ($ ; | & ` ' " < > ( ) { } ! space) and none of git's own
-	// forbidden ref characters (~ ^ : ? * [ \) — and it must not start with
-	// '-', because a ref-shaped argument beginning with a dash is parsed as a
-	// git OPTION (`git fetch origin --upload-pack=…`). The first character class
-	// is the second class minus '-'.
+	// The pattern is a character WHITELIST (F68), and it is defence in depth:
+	// the value reaches the workspace and clone scripts as a git argument,
+	// shell-quoted (F37), so the allowed set is the only set. Empty is allowed
+	// (it means "the default branch", see above). Otherwise the characters are
+	// [A-Za-z0-9._/@+] and '-', which excludes every shell metacharacter
+	// ($ ; | & ` ' " < > ( ) { } ! space) and git's own forbidden ref
+	// characters (~ ^ : ? * [ \) — but note that this is a whitelist, not an
+	// assertion of git's structural rules: names git refuses on its own
+	// (`a..b`, `x.lock`, a trailing `/`) can pass here and fail at clone time
+	// with git's error, and any character not listed is refused here even if
+	// git would accept it. The FIRST character may not be '-': a flag-only
+	// ref-shaped argument (`-f`, `--all`, `--force`) is parsed by git as an
+	// OPTION to the clone fetch. The first class is therefore the second class
+	// minus '-', and the whole pattern is optional so that "" stays valid.
 	// +optional
 	// +kubebuilder:validation:MaxLength=255
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/@+][A-Za-z0-9._/@+-]*$`
+	// +kubebuilder:validation:Pattern=`^([A-Za-z0-9._/@+][A-Za-z0-9._/@+-]*)?$`
 	Ref string `json:"ref,omitempty"`
 
 	// gitCredentialSecret is the name of a Secret in the Loop's namespace

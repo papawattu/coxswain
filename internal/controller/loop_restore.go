@@ -910,6 +910,9 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	}
 	setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 		restoredMessage(loop, target))
+	// F77 (pin half): the restore replaced the workspace, so the verify pin and
+	// its tamper record describe work this PVC no longer holds.
+	pinCleared := clearVerifyPinAtRestore(loop)
 	// F48g: a completed restore is an episode boundary — the workspace the
 	// pre-restore run failed against no longer exists, so its sandbox-failure
 	// count must not consume the new run's budget and fail the new pod on its
@@ -919,8 +922,54 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	clearSandboxInfraEpisode(loop)
 	persist()
 	r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
-		"workspace PVC restored from "+target.snapshot)
+		restoredEventMessage(target.snapshot, pinCleared))
 	return true, false, false, nil
+}
+
+// clearVerifyPinAtRestore drops the verify pin (status.currentVerify and
+// status.verify.verifiedCommit) and the tamper record written for it
+// (status.verify.tamperExitCode / tamperJobUID — R34 I119(c)) when a restore
+// completes (F77's pin half). The pin names a commit that the restored
+// workspace no longer contains: the rollback replaced the PVC from a snapshot,
+// so the evidence attached to the old pin describes work the restore threw
+// away. Two consequences, both intended:
+//
+//   - no deliver Job is created for the old pin. The deliver step
+//     (ensureDeliverJob) gates on deliveryRequested, which needs the pin, and
+//     the restore step runs BEFORE it in the same pass — so a delivery QUEUED
+//     before the rollback (the Loop was Succeeded with a pin and
+//     spec.delivery.mode PullRequest) is dropped rather than pushed. Delivering
+//     it would open a PR for the work the rollback just discarded. The
+//     completion's Normal Event names the clear, so the drop is visible.
+//   - the tamper record goes with the pin it was measured for: its exit code and
+//     Job UID cannot describe the restored workspace, and a stale record would
+//     be rendered into the next delivery body.
+//
+// Returns whether anything was cleared (for the completion Event's text).
+func clearVerifyPinAtRestore(loop *coxv1alpha1.Loop) bool {
+	cleared := loop.Status.CurrentVerify != nil
+	loop.Status.CurrentVerify = nil
+	if loop.Status.Verify != nil {
+		if loop.Status.Verify.VerifiedCommit != "" || loop.Status.Verify.TamperExitCode != nil ||
+			loop.Status.Verify.TamperJobUID != "" {
+			cleared = true
+		}
+		// The tamper record is per-pin (F83d's clearTamperRecord also clears
+		// verifiedCommit); a nil *VerifyStatus is a no-op.
+		clearTamperRecord(loop.Status.Verify)
+	}
+	return cleared
+}
+
+// restoredEventMessage is the Restored completion Event's text: the snapshot,
+// plus the pin-clear note when a verify pin was dropped (F77: the dropped
+// delivery is announced, not silent).
+func restoredEventMessage(snapshot string, pinCleared bool) string {
+	if !pinCleared {
+		return "workspace PVC restored from " + snapshot
+	}
+	return "workspace PVC restored from " + snapshot +
+		" (the verify pin and its tamper record were cleared: the restored workspace does not hold that verified commit, so no delivery is made for it)"
 }
 
 // sourceMissingDecision renders the Restore condition's (reason, message)
@@ -1022,6 +1071,11 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 				restoredMessage(loop, target))
+			// F77 (pin half): the rollback replaced the workspace, so the pin
+			// (and the tamper record written for it) belongs to discarded work.
+			// Dropping it here also stops a delivery queued before the rollback:
+			// the restore step runs before ensureDeliverAndSettle in this pass.
+			pinCleared := clearVerifyPinAtRestore(loop)
 			// F48g: a completed restore ends the sandbox-failure episode (the
 			// rollback's PVC is gone and is recreated from the snapshot), so the
 			// count the pre-rollback run accumulated does not carry into the
@@ -1029,7 +1083,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			clearSandboxInfraEpisode(loop)
 			persist()
 			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
-				"workspace PVC restored from "+target.snapshot)
+				restoredEventMessage(target.snapshot, pinCleared))
 			return true, false, false, nil
 		}
 		// Step 0: the Loop-owned verify and deliver Jobs must be STOPPED

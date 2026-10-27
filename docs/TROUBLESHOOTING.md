@@ -683,6 +683,17 @@ fork, not an edit.
 **What to do:** to roll back to a different checkpoint, create a fork (`cox
 fork`) or a new Loop seeded from that checkpoint; do not edit the field.
 
+A **completed** restore (a rollback, a fork's seed, or a lost-PVC restore) also
+clears the verify pin — `status.currentVerify` and `status.verify`'s
+`verifiedCommit`, with the `tamperExitCode`/`tamperJobUID` record written for it
+(F77). The restored workspace comes from a snapshot, so it does not hold the
+commit the pin names; the `Restored` Event says when this happened ("the verify
+pin and its tamper record were cleared…"). **A delivery that was queued before
+the rollback is dropped**: the deliver Job's gate needs the pin, and the restore
+step runs before the deliver step in the same reconcile. That is intended —
+delivering would open a PR for the work the rollback just discarded. Re-run the
+Loop (and let it verify again) if a PR is still wanted.
+
 ### Warning `ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed` (F36)
 
 **What you see:** Warning Events naming the snapshot: setting or removing the

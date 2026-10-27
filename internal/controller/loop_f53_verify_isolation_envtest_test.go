@@ -412,13 +412,19 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 			"the deadline kill is an infra attempt even with no pod to read")
 		Expect(f53GetJob(ns, jobName)).To(BeNil(),
 			"the deadline-killed Job is deleted so a fresh one is created")
-		// This assertion is what pins the deadline arm ABOVE the pod == nil
-		// branch in the no-pod shape (pi3 early-344 finding 3): with the arm moved
-		// below that branch — or deleted — the Job-level "no check init
-		// terminated" path still decides verifyInfraFailed and every other
-		// assertion here holds, but the Event then carries the generic message and
-		// no deadline. The deadline is the operator-facing fact (a check hung, not
-		// the agent's work), so the Event must name it.
+		// This assertion pins the deadlineExceeded value flowing from the Job
+		// condition into the operator-facing Event — NOT the deadline arm's
+		// position. pi3's early-344 round 2 corrected that: applyVerifyOutcome
+		// reads deadlineExceeded from the Job snapshot and passes the same bool to
+		// verifyInfraFailureMessage, so moving or deleting verifyOutcome's arm
+		// leaves this Event text unchanged (the generic body comes from
+		// failedCheck == "", not from which arm decided). The real mutation here is
+		// `deadlineExceeded := false` at that read: the decision still comes from
+		// jobFailed, the message falls back to "no check init terminated", and this
+		// assertion fails. The arm's ordering is pinned at the verifyOutcome seam
+		// (the "no pod at all" spec above), which is the only place it can be — a
+		// Job with reason DeadlineExceeded also satisfies isJobFailed, so no
+		// Reconcile-driven shape can separate the two arms.
 		events := f53Events(recorder)
 		Expect(events).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
 		Expect(events).To(ContainElement(ContainSubstring("activeDeadlineSeconds")),

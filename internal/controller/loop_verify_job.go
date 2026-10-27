@@ -1951,12 +1951,25 @@ func jobCondition(job *batchv1.Job, t batchv1.JobConditionType) *batchv1.JobCond
 // failure (no container named) when the pod is gone or its statuses do not
 // explain the failure (a Failed Job with no terminated init — the
 // no-check-ran case).
-func verifyInfraFailureMessage(pod *corev1.Pod, failedCheck string, checkExitCode int32, deadlineExceeded bool) string {
+//
+// job is the SAME Job snapshot the decision was taken from; it is used only for
+// the deadline arm, to name the value that actually killed the Job (pi3
+// prereview-306 note 4).
+func verifyInfraFailureMessage(pod *corev1.Pod, job *batchv1.Job, failedCheck string, checkExitCode int32, deadlineExceeded bool) string {
 	// F53: the deadline kill has no container-level evidence to report — the
 	// Job stopped the pod, so name the deadline (and the configured value) so
 	// the operator knows a check hung rather than that the agent's work failed.
+	// The value comes from the JOB's own spec, not this build's constant: a Job
+	// created by an older build keeps the deadline it was created with, and
+	// describing it with the current constant would name a value that did not
+	// kill it. The constant is only the fallback for a Job snapshot that is
+	// gone (a GC'd Job has no spec to read).
 	if deadlineExceeded {
-		return fmt.Sprintf("the verify Job hit its activeDeadlineSeconds deadline (%ds) and was stopped before the acceptance checks completed — the check hung; the verify infrastructure failed, not the agent's work", verifyJobActiveDeadlineSeconds)
+		deadlineSeconds := verifyJobActiveDeadlineSeconds
+		if job != nil && job.Spec.ActiveDeadlineSeconds != nil {
+			deadlineSeconds = *job.Spec.ActiveDeadlineSeconds
+		}
+		return fmt.Sprintf("the verify Job hit its activeDeadlineSeconds deadline (%ds) and was stopped before the acceptance checks completed — the check hung; the verify infrastructure failed, not the agent's work", deadlineSeconds)
 	}
 	if failedCheck == "" {
 		return "the verify Job failed before the acceptance checks ran (no check init terminated; the Job condition is Failed) — the verify infrastructure failed, not the agent's work"
@@ -2072,7 +2085,7 @@ func (r *LoopReconciler) applyVerifyInfraFailure(ctx context.Context, loop *coxv
 		loop.Status.Verify.InfraJobUID = string(job.UID)
 	}
 	attempt := loop.Status.Verify.InfraAttempts
-	msg := verifyInfraFailureMessage(pod, failedCheck, checkExitCode, deadlineExceeded)
+	msg := verifyInfraFailureMessage(pod, job, failedCheck, checkExitCode, deadlineExceeded)
 	if attempt > verifyInfraRetries {
 		// Exhausted: fail the Loop with the distinct reason. The bound is
 		// verifyInfraRetries RECREATIONS (the original attempt is attempt 1),

@@ -381,6 +381,40 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		Expect(requeue).To(BeTrue())
 	})
 
+	// pi3 prereview-306 note 5: the same decision driven through Reconcile with
+	// NO pod in the API — the shape a pod GC'd (or evicted) between the kill and
+	// the operator's read actually hits. The spec above pins the helper's half
+	// only; this one pins the call site (assert the decision Reconcile makes).
+	It("retries a deadline-killed Job whose pod is GONE (no pod to read, Reconcile-driven)", func() {
+		ns := f53Ns("f53-nopod")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f53nopod"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		recorder := record.NewFakeRecorder(64)
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name}})
+		Expect(f53GetJob(ns, jobName)).NotTo(BeNil(), "the verify Job exists after the drive")
+
+		// Deliberately NO f53PlantPod: the pod is already gone.
+		f53JobFailed(ns, jobName, batchv1.JobReasonDeadlineExceeded)
+
+		fresh := s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"a deadline kill is a bounded retry, not a terminal failure")
+		Expect(fresh.Status.Verify).NotTo(BeNil())
+		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+			"the deadline kill is an infra attempt even with no pod to read")
+		Expect(f53GetJob(ns, jobName)).To(BeNil(),
+			"the deadline-killed Job is deleted so a fresh one is created")
+		Expect(f53Events(recorder)).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
+	})
+
 	It("does NOT decide when the Job failed for another reason and the pod is still starting (the I49 control)", func() {
 		ns := f53Ns("f53-control")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

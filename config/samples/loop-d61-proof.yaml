@@ -3,12 +3,13 @@
 # This is the Loop the §9 evidence was taken from (Loop d61-proof reached
 # Succeeded and Delivered, draft PR on the sandbox repo). The spec below is the
 # spec that run APPLIED — byte for byte, as recorded in that Loop's
-# kubectl.kubernetes.io/last-applied-configuration annotation. Everything not
-# written here is CRD-defaulted at admission (verify.preset go,
-# verify.onVerifyFail Implement, verify.checkpoints BestEffort,
-# delivery.branchPrefix coxswain/, delivery.draft true, loop.maxIterations 10,
-# loop.stallAction Fail — config/crd/bases/coxswain.wattu.com_loops.yaml), so
-# the admitted Loop is identical to that run's.
+# kubectl.kubernetes.io/last-applied-configuration annotation (the §9 evidence
+# dir, d61-156-20261015185446/loop-state.yaml). Everything not written here is
+# CRD-defaulted at admission (verify.preset go, verify.onVerifyFail Implement,
+# checkpoints BestEffort, delivery.branchPrefix coxswain/, delivery.draft true,
+# loop.maxIterations 10, loop.stallAction Fail —
+# config/crd/bases/coxswain.wattu.com_loops.yaml), so the admitted Loop is
+# identical to that run's.
 #
 # It is NOT part of `kubectl apply -k config/samples/` (it is deliberately
 # absent from config/samples/kustomization.yaml): it names the real GitHub
@@ -28,7 +29,10 @@
 #
 # Watch it:
 #   kubectl --context kind-coxswain-ref -n d61 get loop d61-proof -w
-#   kubectl cox --context kind-coxswain-ref -n d61 describe d61-proof
+#   kubectl --context kind-coxswain-ref -n d61 describe loop d61-proof
+# (the `kubectl cox` plugin gives the richer view — `kubectl cox describe
+# d61-proof` — but §9 does not install it on the VM, so the plain kubectl form
+# above is the one that always works there.)
 #
 # Expected outcome: PolicyEnforced=True, NetworkEnforced=True,
 # ModelAvailable=True, then phase=Succeeded and Delivered=True (a draft PR on

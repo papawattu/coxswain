@@ -573,6 +573,11 @@ ssh <vm> "
 # config/samples/loop-d61-proof.yaml is the Loop this section's evidence was
 # taken from: spec.agent.modelEndpoint is the VM's vLLM, spec.workspace.repo is
 # the sandbox repo, and the two Secrets it names are the ones Step 7 creates.
+# If you are not the maintainer: change spec.workspace.repo to a repo your
+# git-cred token can push to, and spec.agent.endpointSecretRef /
+# spec.agent.modelEndpoint to your model backend BEFORE applying; the last two
+# are immutable, so a Loop created with the wrong endpoint must be deleted and
+# re-created. The file's exact values are the ones §9's evidence run used.
 scp config/samples/loop-d61-proof.yaml <vm>:/tmp/loop-d61-proof.yaml
 ssh <vm> "
   kubectl --context kind-coxswain-ref apply -f /tmp/loop-d61-proof.yaml

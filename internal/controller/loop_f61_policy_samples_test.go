@@ -18,6 +18,7 @@ package controller
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -83,33 +84,33 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		Expect(files).NotTo(BeEmpty(), "no reference policies under %s", repoPath(policiesDir))
 
 		names := make([]string, 0, len(files))
-		for _, path := range files {
-			names = append(names, filepath.Base(path))
+		for _, file := range files {
+			names = append(names, filepath.Base(file))
 		}
 		Expect(names).To(ContainElements("default-deny.yaml", "go-toolchain.yaml"),
 			"the two reference policies ADR-0007 promises must ship")
 
-		for _, path := range files {
-			data, err := os.ReadFile(path)
+		for _, file := range files {
+			data, err := os.ReadFile(file)
 			Expect(err).NotTo(HaveOccurred())
 
 			policy := &coxv1alpha1.AgentPolicy{}
 			// Strict: a typo'd field is an error here, not silently dropped.
-			Expect(yaml.UnmarshalStrict(data, policy)).To(Succeed(), "%s", path)
-			Expect(policy.Kind).To(Equal("AgentPolicy"), "%s", path)
-			Expect(policy.APIVersion).To(Equal(coxv1alpha1.GroupVersion.String()), "%s", path)
+			Expect(yaml.UnmarshalStrict(data, policy)).To(Succeed(), "%s", file)
+			Expect(policy.Kind).To(Equal("AgentPolicy"), "%s", file)
+			Expect(policy.APIVersion).To(Equal(coxv1alpha1.GroupVersion.String()), "%s", file)
 
-			base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-			Expect(policy.Name).To(Equal(base), "%s: the policy name should match the file name", path)
+			base := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+			Expect(policy.Name).To(Equal(base), "%s: the policy name should match the file name", file)
 			policy.Namespace = namespace
 
 			// Create is the validation: the apiserver enforces the CRD markers
 			// and the CEL rules (e.g. no .svc / localhost network targets).
-			Expect(k8sClient.Create(ctx, policy)).To(Succeed(), "%s must be admitted by the AgentPolicy CRD", path)
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed(), "%s must be admitted by the AgentPolicy CRD", file)
 
 			stored := &coxv1alpha1.AgentPolicy{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: policy.Name}, stored)).To(Succeed(), "%s", path)
-			Expect(stored.Spec).To(Equal(policy.Spec), "%s: the stored spec must round-trip", path)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: policy.Name}, stored)).To(Succeed(), "%s", file)
+			Expect(stored.Spec).To(Equal(policy.Spec), "%s: the stored spec must round-trip", file)
 		}
 	})
 
@@ -134,8 +135,12 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		// config/samples`, which is how the docs tell users to apply them.
 		files := policyFiles()
 		shipped := make([]string, 0, len(files))
-		for _, path := range files {
-			shipped = append(shipped, filepath.Join("policies", filepath.Base(path)))
+		for _, file := range files {
+			// path.Join, not filepath.Join: `listed` holds the kustomization's
+			// own strings, which are always slash-separated. filepath.Join would
+			// build a back-slash path on a Windows host and mismatch for a
+			// reason that has nothing to do with the assertion.
+			shipped = append(shipped, path.Join("policies", filepath.Base(file)))
 		}
 		Expect(listed).To(ConsistOf(shipped),
 			"the kustomization's policies/ entries must be exactly the shipped policy files")

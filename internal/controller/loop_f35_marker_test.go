@@ -73,11 +73,22 @@ func TestRestoreCompletedForSpec(t *testing.T) {
 			t.Fatal("a completed fork must stay complete across spec edits")
 		}
 	})
-	t.Run("legacy marker without a key stays complete", func(t *testing.T) {
-		l := mk("iter-3", nil, 7)
+	t.Run("legacy marker without a key stays complete for a Loop with no spec target", func(t *testing.T) {
+		l := mk("", nil, 7)
 		mark(l, "workspace PVC restored from snap (rollback, iter-3)", metav1.ConditionTrue, coxv1alpha1.RestoreReasonRestored)
 		if !restoreCompletedForSpec(l) {
 			t.Fatal("a marker written before the key existed must not be re-armed by an edit")
+		}
+	})
+	t.Run("legacy marker does not cover a target the spec names now (F75)", func(t *testing.T) {
+		// The marker predates the key, so it cannot say which target it restored.
+		// A Loop that names spec.restoreFrom now needs a restore decision: with
+		// the marker counting as complete and the PVC present, b2RestoreTarget
+		// returns nil and the rollback never runs.
+		l := mk("iter-3", nil, 7)
+		mark(l, "workspace PVC restored from snap (rollback, iter-3)", metav1.ConditionTrue, coxv1alpha1.RestoreReasonRestored)
+		if restoreCompletedForSpec(l) {
+			t.Fatal("a keyless marker must not cover a restore target the spec names")
 		}
 	})
 	t.Run("in-progress or failed restore is not complete", func(t *testing.T) {

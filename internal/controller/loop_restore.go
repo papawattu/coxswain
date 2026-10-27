@@ -677,7 +677,11 @@ func (r *LoopReconciler) stopWorkloadsForRestore(ctx context.Context, loop *coxv
 }
 
 // restoreSpecKeyMarker brackets the spec restore target recorded in the
-// Restored condition's message (F35).
+// Restored condition's message (F35). A message WITHOUT the marker was written
+// before F35: it cannot be re-armed by an edit, so it counts as complete only
+// while the Loop's spec names no restore target (F75 — it must not vouch for a
+// target the spec names now, or a later spec.restoreFrom would look already
+// restored and never run).
 const restoreSpecKeyMarker = " [spec-target="
 
 // specRestoreKey identifies the restore target the Loop's SPEC names: the
@@ -719,7 +723,13 @@ func restoreCompletedForSpec(loop *coxv1alpha1.Loop) bool {
 	}
 	_, rest, found := strings.Cut(c.Message, restoreSpecKeyMarker)
 	if !found {
-		return true // legacy marker (no key)
+		// A legacy marker (written before the key existed) has no target of its
+		// own. F75: it stays complete for a Loop that names no spec restore
+		// target, but it must not cover one the Loop names NOW — a pre-F35
+		// completion (a lost-PVC restore, say) would otherwise make a later
+		// spec.restoreFrom look already restored, and with the PVC present
+		// b2RestoreTarget would return nil, so the rollback would never run.
+		return specRestoreKey(loop) == ""
 	}
 	key, _, _ := strings.Cut(rest, "]")
 	return key == specRestoreKey(loop)

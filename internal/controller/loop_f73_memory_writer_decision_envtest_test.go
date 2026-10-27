@@ -83,6 +83,8 @@ var _ = Describe("F73 memory-writer outcome decision", func() {
 		Expect(cond.Reason).To(Equal(memoryWriteFailedReason))
 		Expect(cond.Message).To(ContainSubstring("activeDeadlineSeconds"),
 			"the deadline message names the deadline")
+		Expect(cond.Message).NotTo(ContainSubstring("injected"),
+			"the deadline branch keeps its own fixed wording, not the batch controller's condition message")
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
 			"a failed memory write does not fail the Loop (ADR-0004)")
 
@@ -92,17 +94,23 @@ var _ = Describe("F73 memory-writer outcome decision", func() {
 			"the Event names the deadline too, not just the condition")
 	})
 
-	It("decides from the Job's conditions when the pod list fails (a read error is not a decision)", func() {
+	It("decides a Complete Job from its condition when the pod list fails, and says the pod could not be read", func() {
 		// F73(b): a pods/list error must not short-circuit the Job-condition
 		// read. Before the fix the read error requeued and the finished Job was
 		// never recorded for as long as the list kept failing.
+		//
+		// A Complete Job isolates this path: a FAILED Job is decided before the
+		// pod is ever read (F73(a), spec 1), so a read error cannot reach that
+		// decision. The pod does exist here (it succeeded) — the operator simply
+		// cannot see it, which is why the message must not claim it is gone.
 		name := "f73-mw-listfail"
 		r := s6SucceededLessonsAvailable(name, ns)
 		res := p5bMemoryWriterReconcile(r, ns, name)
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "the memory-writer Job's create must requeue")
 		job := p5bGetMemoryJob(ns, name)
 
-		f73StampJobFailed(ns, job.Name, batchv1.JobReasonBackoffLimitExceeded)
+		f73StampJobComplete(ns, job.Name)
+		p5bFabricateJobPod(ns, job, corev1.PodSucceeded)
 		// The pod read (a labelled List through the reconciler's apiReader)
 		// fails; every other read is unaffected.
 		r.apiReader = f73FailingPodListReader{Client: k8sClient}
@@ -112,11 +120,11 @@ var _ = Describe("F73 memory-writer outcome decision", func() {
 		loop := p5bMustLoop(ns, name)
 		cond := meta.FindStatusCondition(loop.Status.Conditions, memoryWriterConditionType)
 		Expect(cond).NotTo(BeNil(), "a terminal Job must be decided even when the pod list fails")
-		Expect(cond.Reason).To(Equal(memoryWriteFailedReason))
-		Expect(cond.Message).To(ContainSubstring(batchv1.JobReasonBackoffLimitExceeded),
-			"the message names the Job's reason")
-		Expect(cond.Message).To(ContainSubstring("injected "+batchv1.JobReasonBackoffLimitExceeded+" message"),
-			"the batch controller's own condition message rides along")
+		Expect(cond.Reason).To(Equal(memoryWrittenReason))
+		Expect(cond.Message).To(ContainSubstring("could not be read"),
+			"the operator does not claim the pod is gone (I76: a cause it did not observe)")
+		Expect(cond.Message).To(ContainSubstring("injected memory-writer pod list failure"),
+			"the read error is named")
 	})
 
 	It("makes no decision for a Complete Job whose pod is still Pending (the I49 control)", func() {

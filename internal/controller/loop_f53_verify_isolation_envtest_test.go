@@ -412,7 +412,17 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 			"the deadline kill is an infra attempt even with no pod to read")
 		Expect(f53GetJob(ns, jobName)).To(BeNil(),
 			"the deadline-killed Job is deleted so a fresh one is created")
-		Expect(f53Events(recorder)).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
+		// This assertion is what pins the deadline arm ABOVE the pod == nil
+		// branch in the no-pod shape (pi3 early-344 finding 3): with the arm moved
+		// below that branch — or deleted — the Job-level "no check init
+		// terminated" path still decides verifyInfraFailed and every other
+		// assertion here holds, but the Event then carries the generic message and
+		// no deadline. The deadline is the operator-facing fact (a check hung, not
+		// the agent's work), so the Event must name it.
+		events := f53Events(recorder)
+		Expect(events).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
+		Expect(events).To(ContainElement(ContainSubstring("activeDeadlineSeconds")),
+			"the retry Event must name the deadline, not the generic no-check-init failure")
 	})
 
 	It("does NOT decide when the Job failed for another reason and the pod is still starting (the I49 control)", func() {

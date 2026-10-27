@@ -1405,7 +1405,7 @@ var _ = Describe("B1: workspace checkpoints (PLAN-BETA)", func() {
 		res, err := r.Reconcile(context.Background(),
 			reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
 		Expect(err).ToNot(HaveOccurred(), "the Reconcile must NOT return an error for a terminating-ns Forbidden (it is not a real failure)")
-		Expect(res.RequeueAfter).To(Equal(5*time.Second), "the Reconcile must requeue with a targeted 5s RequeueAfter (not the error backoff cap)")
+		Expect(res.RequeueAfter).To(Equal(workRequeue), "the Reconcile must requeue with a targeted 5s RequeueAfter (not the error backoff cap)")
 
 		// The Event must be emitted (FinalizerRemovalBlocked).
 		//

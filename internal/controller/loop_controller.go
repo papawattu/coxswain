@@ -1440,8 +1440,9 @@ const kaptCRDMissingRequeue = time.Minute
 // re-running work a pass could not finish. It is the trailing requeue decision's
 // pending-work window (a Loop whose base-commit read or claim has not landed
 // yet) and the restore-decision / checkpoint-GC / async-delete / finalizer
-// retries in loop_checkpoint.go — one constant so the cadence is stated once
-// (pi3 early-347 N: it was five bare `5 * time.Second` literals).
+// retries in loop_checkpoint.go — one constant while the two cadences agree
+// (pi3 early-347 N: it was five bare `5 * time.Second` literals; if either
+// cadence is ever retuned this has to split).
 const workRequeue = 5 * time.Second
 
 // PolicyTranslationLossyCondition is the Loop condition that reports a lossy

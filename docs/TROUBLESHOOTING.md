@@ -263,18 +263,30 @@ them as "starts with".
   its pod is gone, …)"** — F31: the Job's own `Complete` condition is
   `True` but its pod no longer exists (pod GC, eviction, an admission
   reject). Nobody read the pod, so the operator records the completion
-  without the per-lesson audit (`recordMemoryWriterOutcomeNoPod`).
+  without the per-lesson audit (`recordMemoryWriterOutcomeNoPod`). When
+  the pod list itself failed, the message says the pod **could not be
+  read** (`…could not be read: <error>…`) instead (F73): the Job is
+  still decided rather than requeued for ever, and the operator does not
+  claim a cause it did not observe.
 - **`MemoryWriteFailed` — "memory write failed (the Job's pod failed;
-  …)"** — the Job's pod is `Failed`. A Warning Event is also emitted.
+  …)"** — the Job's pod is `Failed`. A Warning Event is also emitted,
+  once: both the metric and the Event fire on the condition transition
+  (F73), so a re-reconcile of the same failure re-emits neither.
 - **`MemoryWriteFailed` — "memory write failed (the Job hit its
   activeDeadlineSeconds deadline — …)"** — the pod was stuck (e.g.
   `CreateContainerConfigError`) and the Job's `activeDeadlineSeconds`
   (300 s) killed it (Job reason `DeadlineExceeded`). The message names
-  the deadline so a review sees the hang.
+  the deadline so a review sees the hang. F73: the Job's own `Failed`
+  condition is read **before** the pod, so this is recorded even while
+  the stuck pod is still there (the pod never reaches a terminal phase,
+  and deciding from the pod first hot-looped and never recorded
+  `MemoryWriteDone`).
 - **`MemoryWriteFailed` — "memory write failed (the Job failed with
-  reason <reason> and has no pod; …)"** — F31: the Job's own `Failed`
-  condition is `True` (reason as stamped by the batch controller, or
-  `unknown`) and the pod is gone.
+  reason <reason>…)"** — F31/F73: the Job's own `Failed` condition is
+  `True` (reason as stamped by the batch controller, or `unknown`). The
+  decision is taken from the Job, not from the pod, so the message no
+  longer claims the pod is gone: the condition is decided whether or not
+  a pod exists.
 - **`MemoryWriteSkipped`** — no Job is created. Three forms: the Loop
   ended in a non-qualifying terminal reason (not Succeeded or
   Failed:Stalled — e.g. `SandboxFailed`, `BudgetExceeded`); the claim

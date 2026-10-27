@@ -1,0 +1,70 @@
+# §9 proof Loop: the production-parity run in docs/QUICKSTART.md §9, Step 8.
+#
+# This is the Loop the §9 evidence was taken from (Loop d61-proof reached
+# Succeeded and Delivered, draft PR on the sandbox repo). The spec below is the
+# spec that run APPLIED — byte for byte, as recorded in that Loop's
+# kubectl.kubernetes.io/last-applied-configuration annotation. Everything not
+# written here is CRD-defaulted at admission (verify.preset go,
+# verify.onVerifyFail Implement, verify.checkpoints BestEffort,
+# delivery.branchPrefix coxswain/, delivery.draft true, loop.maxIterations 10,
+# loop.stallAction Fail — config/crd/bases/coxswain.wattu.com_loops.yaml), so
+# the admitted Loop is identical to that run's.
+#
+# It is NOT part of `kubectl apply -k config/samples/` (it is deliberately
+# absent from config/samples/kustomization.yaml): it names the real GitHub
+# sandbox repo, the vLLM endpoint of the §9 VM and the two Secrets §9 Step 7
+# creates (git-cred via hack/github-secret.sh, beta-model-creds), so it only
+# applies inside that setup. For a self-contained sample that runs against the
+# in-cluster seeded repos instead, see loop-fix-failing-test.yaml.
+#
+# Prerequisites (docs/QUICKSTART.md §9): Steps 1-7 done on the VM — kind cluster
+# kind-coxswain-ref with Calico + KubeArmor, the operator installed with no
+# escape-hatch flags, namespace d61 with both Secrets, and the model endpoint
+# reachable from the cluster.
+#
+# Apply (Step 8):
+#   scp config/samples/loop-d61-proof.yaml <vm>:/tmp/loop-d61-proof.yaml
+#   kubectl --context kind-coxswain-ref apply -f /tmp/loop-d61-proof.yaml
+#
+# Watch it:
+#   kubectl --context kind-coxswain-ref -n d61 get loop d61-proof -w
+#   kubectl cox --context kind-coxswain-ref -n d61 describe d61-proof
+#
+# Expected outcome: PolicyEnforced=True, NetworkEnforced=True,
+# ModelAvailable=True, then phase=Succeeded and Delivered=True (a draft PR on
+# the sandbox repo). See the "Expected conditions" and "This run's evidence"
+# sections of docs/QUICKSTART.md §9.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: Loop
+metadata:
+  name: d61-proof
+  namespace: d61
+spec:
+  agent:
+    endpointSecretRef: beta-model-creds
+    model: qwen3.8-27b
+    modelEndpoint: 192.168.1.20:8000
+  delivery:
+    mode: PullRequest
+  goal: |
+    Create a Go module and a Fibonacci function.
+    1. Run: go mod init fib
+    2. Create a file fib.go in package main that defines:
+       func Fib(n int) int
+       which returns the nth Fibonacci number (Fib(0)=0, Fib(1)=1).
+    3. Create a file fib_test.go in package main with a test that
+       asserts Fib(0)=0, Fib(1)=1, Fib(6)=8, Fib(10)=55.
+    4. Do NOT add any external dependencies.
+    5. Before committing, create a .gitignore file containing:
+       /fib
+       bin/
+       *.exe
+       so that the compiled Go binary (named 'fib') is never committed.
+       Only the source files (go.mod, fib.go, fib_test.go, .gitignore) should
+       be committed. Do NOT commit any binary or build artifact.
+  verify:
+    acceptanceChecks:
+    - go test ./...
+  workspace:
+    gitCredentialSecret: git-cred
+    repo: https://github.com/papawattu/coxswain-sandbox.git

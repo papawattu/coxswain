@@ -191,7 +191,18 @@ type Workspace struct {
 
 	// ref is the branch, tag, or commit to check out. Defaults to the repo's
 	// default branch when empty.
+	//
+	// The pattern is defence in depth (F68): the value reaches the workspace and
+	// clone scripts as a git argument, shell-quoted (F37), so it must be a
+	// `git check-ref-format` ref name — [A-Za-z0-9._/@+] and '-', with no shell
+	// metacharacter ($ ; | & ` ' " < > ( ) { } ! space) and none of git's own
+	// forbidden ref characters (~ ^ : ? * [ \) — and it must not start with
+	// '-', because a ref-shaped argument beginning with a dash is parsed as a
+	// git OPTION (`git fetch origin --upload-pack=…`). The first character class
+	// is the second class minus '-'.
 	// +optional
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/@+][A-Za-z0-9._/@+-]*$`
 	Ref string `json:"ref,omitempty"`
 
 	// gitCredentialSecret is the name of a Secret in the Loop's namespace
@@ -212,8 +223,20 @@ type VerifyConfig struct {
 	// acceptanceChecks are user-authored shell commands run in the workspace.
 	// Exit code 0 is a pass. These are the ONLY gate that can flip a Loop to
 	// Succeeded; their source files are protected paths.
+	//
+	// Bounds (F68): at most 16 checks, each 1..4096 bytes and containing a
+	// non-whitespace character. The checks run SERIALLY inside one verify Job
+	// whose activeDeadlineSeconds is 900 (F53) — the deadline is per Job, not
+	// per check — so 16 is the point where one hung check still leaves the rest
+	// a realistic share of the budget. The contents stay unrestricted (a check
+	// is a shell command and quoting is shellQuote's job, F37); only blank and
+	// absurdly long entries are rejected here.
 	// +listType=atomic
 	// +optional
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=4096
+	// +kubebuilder:validation:items:Pattern=`\S`
 	AcceptanceChecks []string `json:"acceptanceChecks,omitempty"`
 
 	// preset selects the per-language protected-path glob set used by the

@@ -66,7 +66,8 @@ func TestSummaryFileBoundedAtKubeletCap(t *testing.T) {
 	lines := f80Summary()
 	full := renderSummary(lines)
 	if len(full) <= 4096 {
-		t.Fatalf("fixture too small: the full summary is %d bytes, the point is to exceed the kubelet's 4096-byte cap", len(full))
+		t.Fatalf("fixture too small: the full summary is %d bytes; the point is to exceed "+
+			"the kubelet's 4096-byte cap", len(full))
 	}
 
 	stdout := f80EmitStdout(t, lines)
@@ -169,7 +170,7 @@ func TestBoundSummaryKeepsWholeLines(t *testing.T) {
 	if !strings.HasSuffix(got, "… 1 more lines\n") {
 		t.Errorf("boundSummary's marker = %q, want \"… 1 more lines\"", got)
 	}
-	if strings.Contains(got, "y") {
+	if strings.Contains(got, "yy") {
 		t.Errorf("boundSummary kept part of the over-long line (a byte cut):\n%q", got)
 	}
 

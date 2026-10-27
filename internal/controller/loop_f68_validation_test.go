@@ -159,7 +159,7 @@ var _ = Describe("F68: ref and acceptanceChecks validation", func() {
 		defer teardown(cancel, ns)
 		many := func(n int) []string {
 			out := make([]string, 0, n)
-			for i := 0; i < n; i++ {
+			for range n {
 				out = append(out, "true")
 			}
 			return out

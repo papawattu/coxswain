@@ -25,7 +25,9 @@
 //     secrets screen is never echoed, but a curator reason is free model text
 //     and may quote a kept lesson. The termination-message copy is bounded to
 //     summaryFileMaxBytes (4000) here, under the kubelet's 4096-byte cap, and
-//     marked with "… N more lines" when it is cut (F80); stdout keeps the FULL
+//     marked with "… N more lines (M lesson lines)" when it is cut (F80); the M
+//     names how many of the cut lines were per-lesson lines, which is what the
+//     operator's verdict split is derived from (F80b). stdout keeps the FULL
 //     summary, because the Job log is where the complete per-lesson audit is
 //     read (and FallbackToLogsOnError makes the log tail a crash's message).
 //
@@ -425,7 +427,7 @@ func summaryLines(lessons, reasons, audit []string, total, written, dropped int)
 			// curator reason would corrupt the line-based summary (P3).
 			rule = stripReasonCR(reasons[i])
 		}
-		out = append(out, fmt.Sprintf("lesson-%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
+		out = append(out, fmt.Sprintf(lessonLinePrefix+"%03d %s %s %s", i+1, shaPrefix(lesson), status, rule))
 	}
 	return out
 }
@@ -438,11 +440,33 @@ func summaryLines(lessons, reasons, audit []string, total, written, dropped int)
 const summaryFileMaxBytes = 4000
 
 // summaryTruncationMarker is the last line of a bounded summary: how many whole
-// lines were dropped. F78's vocabulary, so the two cuts compose — the operator's
-// memoryWriteAuditText cuts the RECEIVED text again (to 1000 bytes) and computes
-// its own marker over the lines it received.
-func summaryTruncationMarker(dropped int) string {
-	return fmt.Sprintf("… %d more lines", dropped)
+// lines were dropped, and how many of those were PER-LESSON lines (F80b). F78's
+// vocabulary, so the two cuts compose — the operator's memoryWriteAuditText cuts
+// the RECEIVED text again (to 1000 bytes) and computes its own marker over the
+// lines it received.
+//
+// The lesson count is not decoration: the cut drops the per-lesson lines first
+// (summaryLines order), and the operator's memoryWriteVerdicts derives the
+// curator/static drop split from exactly those lines. Without the count that
+// split degraded SILENTLY (the counts line still added up), so the marker now
+// states how much of the split is missing; memoryWriteVerdicts keys on it.
+func summaryTruncationMarker(dropped, lessonsDropped int) string {
+	return fmt.Sprintf("… %d more lines (%d lesson lines)", dropped, lessonsDropped)
+}
+
+// lessonLinePrefix begins every per-lesson line summaryLines builds
+// ("lesson-<n> <sha12> <written|dropped> <rule>").
+const lessonLinePrefix = "lesson-"
+
+// countLessonLines returns how many of lines are per-lesson lines.
+func countLessonLines(lines []string) int {
+	n := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, lessonLinePrefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // renderSummary renders lines one per line (the stdout form: the FULL summary).
@@ -459,23 +483,33 @@ func renderSummary(lines []string) []byte {
 // counts line first, and the budget is reserved for the marker BEFORE each line
 // is added, so a kept line can never crowd the marker out. The counts line is
 // therefore always kept (it is tens of bytes against a 4000-byte budget) and a
-// reader can always tell a capped summary from a complete one.
+// reader can always tell a capped summary from a complete one — including how
+// much of the per-lesson audit it is missing (F80b).
 func boundSummary(lines []string, limit int) []byte {
 	var buf bytes.Buffer
 	kept := 0
+	lessonsTotal := countLessonLines(lines)
+	lessonsKept := 0
 	for i, line := range lines {
 		markerNeed := 0
 		if remaining := len(lines) - i - 1; remaining > 0 {
-			markerNeed = len(summaryTruncationMarker(remaining)) + 1 // + newline
+			lessonsAfter := lessonsTotal - lessonsKept
+			if strings.HasPrefix(line, lessonLinePrefix) {
+				lessonsAfter--
+			}
+			markerNeed = len(summaryTruncationMarker(remaining, lessonsAfter)) + 1 // + newline
 		}
 		if buf.Len()+len(line)+1+markerNeed > limit {
 			break
 		}
 		fmt.Fprintln(&buf, line)
 		kept++
+		if strings.HasPrefix(line, lessonLinePrefix) {
+			lessonsKept++
+		}
 	}
 	if kept < len(lines) {
-		fmt.Fprintln(&buf, summaryTruncationMarker(len(lines)-kept))
+		fmt.Fprintln(&buf, summaryTruncationMarker(len(lines)-kept, lessonsTotal-lessonsKept))
 	}
 	return buf.Bytes()
 }
@@ -484,11 +518,12 @@ func boundSummary(lines []string, limit int) []byte {
 // that file (the container's termination-message path — the operator reads it
 // from the pod's container status). The two copies are NOT identical above the
 // cap (F80): stdout carries the full summary, the file the bounded copy (whole
-// lines + "… N more lines"), because the kubelet cuts the message silently and
-// the Job log is the place the complete audit is read. A write failure to the
-// summary file is non-fatal (the summary is best-effort evidence; the Lesson
-// write already succeeded): it is logged to stderr but does not change the exit
-// code. A bounded summary must never echo a lesson's text — the lines are built
+// lines + "… N more lines (M lesson lines)"), because the kubelet cuts the
+// message silently and the Job log is the place the complete audit is read. A
+// write failure to the summary file is non-fatal (the summary is best-effort
+// evidence; the Lesson write already succeeded): it is logged to stderr but does
+// not change the exit code. A bounded summary must never echo a lesson's text —
+// the lines are built
 // by summaryLines, which uses only the sha prefix.
 func emitSummary(lines []string) {
 	// stdout (always): the FULL summary.

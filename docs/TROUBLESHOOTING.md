@@ -362,6 +362,17 @@ Only a single line longer than the cap is cut on a rune boundary.
 To see the cut-off per-lesson lines, read the Job log, which carries
 the full summary.
 
+The writer's own bound (the termination-message copy, ≤4000 bytes) cuts whole
+lines too, per-lesson lines first, and its marker is
+`… N more lines (M lesson lines)`: `M` is how many of the cut lines were
+per-lesson lines, so a reader can tell a complete per-lesson audit from a cut
+one. That is also why the metric's drop split is only as complete as the file:
+`coxswain_memory_lessons_total` takes `kept` and the total dropped from the
+counts line (always kept), but when the marker says lesson lines were cut the
+`curator-drop`/`static-drop` split covers only the lessons whose lines survived
+— the cut lessons' drops are left unattributed rather than padded into
+`static-drop` (F80b). The Job log has the complete list.
+
 ### The caps
 
 - **Lessons per PVC: 100** — oldest-first by mtime eviction (ties by
@@ -395,7 +406,7 @@ the cap and the first omitted file name.
 - **The memory-writer Job log**: `kubectl logs -n <loop-ns>
   job/<loop>-memory-write-<iteration>`. The Job writes the **full** summary to
   stdout; the termination message carries the bounded copy (≤4000 bytes, whole
-  lines, marked `… N more lines`), so the log carries the **full** per-lesson
+  lines, marked `… N more lines (M lesson lines)`), so the log carries the **full** per-lesson
   audit when the condition message's 1000-byte copy or the termination
   message's 4000-byte copy is truncated. The per-lesson lines carry only the
   12-hex SHA prefix for the lesson itself; a curator reason may quote the

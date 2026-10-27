@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // f80Summary builds a summary bigger than the kubelet's 4096-byte cap: 20 lessons
@@ -86,19 +87,39 @@ func TestSummaryFileBoundedAtKubeletCap(t *testing.T) {
 			fileLines[0], want)
 	}
 	last := fileLines[len(fileLines)-1]
-	marker := regexp.MustCompile(`^… (\d+) more lines$`)
+	marker := regexp.MustCompile(`^… (\d+) more lines \((\d+) lesson lines\)$`)
 	m := marker.FindStringSubmatch(last)
 	if m == nil {
-		t.Fatalf("the last line is %q, want the truncation marker \"… N more lines\"", last)
+		t.Fatalf("the last line is %q, want the truncation marker %q", last, `… N more lines (M lesson lines)`)
 	}
 	dropped, err := strconv.Atoi(m[1])
 	if err != nil {
 		t.Fatalf("parse the marker's count: %v", err)
 	}
+	lessonsCut, err := strconv.Atoi(m[2])
+	if err != nil {
+		t.Fatalf("parse the marker's lesson count: %v", err)
+	}
 	kept := len(fileLines) - 1
 	if kept+dropped != len(lines) {
 		t.Errorf("kept %d + dropped %d = %d, want the %d lines of the summary (never a lost line)",
 			kept, dropped, kept+dropped, len(lines))
+	}
+	// F80b: the marker names how many of the cut lines were PER-LESSON lines,
+	// because the operator derives the curator/static drop split from them and
+	// must be able to tell a complete split from a cut one.
+	wantLessonsCut := 0
+	for _, line := range lines[kept:] {
+		if strings.HasPrefix(line, lessonLinePrefix) {
+			wantLessonsCut++
+		}
+	}
+	if lessonsCut != wantLessonsCut {
+		t.Errorf("the marker says %d lesson lines were cut, want %d (of the %d cut lines)",
+			lessonsCut, wantLessonsCut, len(lines)-kept)
+	}
+	if wantLessonsCut == 0 {
+		t.Fatalf("fixture cut no per-lesson line: the point is that the verdict split is the part that is lost")
 	}
 	// Whole lines only: every kept line is the corresponding summary line, and
 	// the last kept line is not a partial one.
@@ -155,23 +176,16 @@ func TestSummaryFileUnderCapIsUnchanged(t *testing.T) {
 // TestBoundSummaryKeepsWholeLines pins the budget arithmetic: the marker is
 // reserved before each line is added (a kept line can never crowd it out), the
 // counts line survives a huge second line, and the output is whole lines only.
+// The fixture's output is fully determined, so this asserts EQUALITY: a byte cut
+// (of any line, of any bytes) cannot produce it.
 func TestBoundSummaryKeepsWholeLines(t *testing.T) {
 	const counts = "summary: total=2 written=1 dropped=1"
-	huge := "lesson-002 " + strings.Repeat("y", 5000)
+	huge := lessonLinePrefix + "002 " + strings.Repeat("y", 5000)
 	lines := []string{counts, huge}
 
 	got := string(boundSummary(lines, summaryFileMaxBytes))
-	if len(got) > summaryFileMaxBytes {
-		t.Fatalf("boundSummary returned %d bytes, want <= %d", len(got), summaryFileMaxBytes)
-	}
-	if !strings.HasPrefix(got, counts+"\n") {
-		t.Errorf("boundSummary dropped the counts line:\n%q", got)
-	}
-	if !strings.HasSuffix(got, "… 1 more lines\n") {
-		t.Errorf("boundSummary's marker = %q, want \"… 1 more lines\"", got)
-	}
-	if strings.Contains(got, "yy") {
-		t.Errorf("boundSummary kept part of the over-long line (a byte cut):\n%q", got)
+	if want := counts + "\n… 1 more lines (1 lesson lines)\n"; got != want {
+		t.Fatalf("boundSummary = %q, want %q (the counts line, then the marker)", got, want)
 	}
 
 	// Exact-fit boundary: the counts line plus its newline, with nothing else,
@@ -180,7 +194,48 @@ func TestBoundSummaryKeepsWholeLines(t *testing.T) {
 	if out := string(boundSummary([]string{counts}, exact)); out != counts+"\n" {
 		t.Errorf("a summary that fits exactly was changed:\n%q", out)
 	}
-	if out := string(boundSummary([]string{counts}, exact-1)); out != "… 1 more lines\n" {
+	if out := string(boundSummary([]string{counts}, exact-1)); out != "… 1 more lines (0 lesson lines)\n" {
 		t.Errorf("one byte short: got %q, want only the marker", out)
+	}
+}
+
+// TestBoundSummaryMultiByteIsByteBounded (F80 F4) closes the gap the ASCII
+// fixtures leave: the bound counts BYTES and cuts WHOLE LINES, so a summary of
+// 3-byte runes must (a) still fit the byte budget — a rune-counting bound would
+// keep this line — and (b) stay valid UTF-8, with no line cut mid-rune.
+func TestBoundSummaryMultiByteIsByteBounded(t *testing.T) {
+	const counts = "summary: total=2 written=1 dropped=1"
+	// 1400 three-byte runes = 4200 bytes: over the BYTE budget, well under it
+	// counted as runes.
+	huge := lessonLinePrefix + "002 " + strings.Repeat("数", 1400)
+	if n := utf8.RuneCountInString(huge); n >= summaryFileMaxBytes {
+		t.Fatalf("fixture is not discriminating: %d runes against a %d rune budget", n, summaryFileMaxBytes)
+	}
+	if len(huge) <= summaryFileMaxBytes {
+		t.Fatalf("fixture is not discriminating: %d bytes against a %d byte budget", len(huge), summaryFileMaxBytes)
+	}
+	lines := []string{counts, huge}
+
+	got := string(boundSummary(lines, summaryFileMaxBytes))
+	if len(got) > summaryFileMaxBytes {
+		t.Errorf("boundSummary returned %d bytes, want <= %d (the budget is in BYTES)",
+			len(got), summaryFileMaxBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("boundSummary returned invalid UTF-8 (a rune was split):\n%q", got)
+	}
+	// Whole lines only: every output line is a kept summary line, and the last
+	// is the marker.
+	out := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	if out[0] != counts {
+		t.Errorf("the first line is %q, want the counts line %q", out[0], counts)
+	}
+	if want := "… 1 more lines (1 lesson lines)"; out[len(out)-1] != want {
+		t.Errorf("the last line is %q, want the marker %q", out[len(out)-1], want)
+	}
+	for i, line := range out[:len(out)-1] {
+		if line != lines[i] {
+			t.Errorf("output line %d = %q, want the whole summary line %q", i, line, lines[i])
+		}
 	}
 }

@@ -67,6 +67,7 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -478,9 +479,9 @@ func budgetLines(bf *deliverBudgetFacts) string {
 // "Last verify" line of a body with no pin (F69); the entries are the
 // operator's own record (stallHistory), never a runner claim.
 func lastFailedVerify(vh []verifyHistoryEntry) (verifyHistoryEntry, bool) {
-	for i := len(vh) - 1; i >= 0; i-- {
-		if !vh[i].Pass {
-			return vh[i], true
+	for _, e := range slices.Backward(vh) {
+		if !e.Pass {
+			return e, true
 		}
 	}
 	return verifyHistoryEntry{}, false

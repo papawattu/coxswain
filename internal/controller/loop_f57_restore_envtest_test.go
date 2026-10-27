@@ -287,7 +287,7 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		// The rollback shape with an unconfirmable create: the restored-PVC Create
 		// reports AlreadyExists and the read that would confirm it fails, so the
 		// helper returns errWorkspacePVCUnconfirmed.
-		r, _ := b2NewReconcilerWithRecorder()
+		r, rec := b2NewReconcilerWithRecorder()
 		fc := &f57RestoreClient{
 			Client:        k8sClient,
 			alreadyExists: true,
@@ -309,6 +309,10 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 		c := b2RestoreCondition(b2ReconcileGet(ns, name))
 		Expect(c).To(BeNil(),
 			"no Restore condition may be recorded for a PVC that was never seen; without the F57a arm this pass records Restored=False/Rejected")
+		// The fall-through (the F57b branch) does not only record Rejected, it
+		// EMITS the Warning: "no decision" must mean no Event either.
+		Expect(f57DrainRejectedEvents(rec)).To(Equal(0),
+			"an unconfirmed create is no failure to announce: no Warning may be emitted")
 		_, pvcErr := b2GetPVC(ctx, ns, name)
 		Expect(apierrors.IsNotFound(pvcErr)).To(BeTrue(),
 			"nothing created: the injected AlreadyExists means the PVC is not there")

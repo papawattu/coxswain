@@ -5,7 +5,7 @@
 // Mutation: drop a registration must fail (the metric is missing from the
 // registry). The bump-site tests drive the REAL production call sites
 // (recordPhaseClaim, applyStallGate, applyUsageReading, bumpVerifyResult,
-// bumpLoopCompletion) and assert a delta.
+// bumpLoopCompletion, noteUnmetered) and assert a delta.
 package controller
 
 import (
@@ -382,7 +382,9 @@ func TestMetricsUnmeteredTotal(t *testing.T) {
 	if after != before+2 {
 		t.Fatalf("coxswain_unmetered_requests_total = %v after noteUnmetered(2), want %v (before+2)", after, before+2)
 	}
-	// A zero delta (a clean same-boot read) is not a bump.
+	// A zero delta (a clean same-boot read) leaves it alone. This is a sanity
+	// check, not evidence for the `delta <= 0` guard: adding 0 would be a no-op
+	// even if the Add had moved above the guard (early-341 P3-3).
 	r.noteUnmetered(loop, 0)
 	if got, _ := readMetric(t, "coxswain_unmetered_requests_total"); got != before+2 {
 		t.Fatalf("coxswain_unmetered_requests_total = %v after noteUnmetered(0), want %v (unchanged)", got, before+2)

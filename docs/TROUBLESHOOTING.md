@@ -685,21 +685,36 @@ fork`) or a new Loop seeded from that checkpoint; do not edit the field.
 
 ### Warning `ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed` (F36)
 
-**What you see:** Warning Events naming the snapshot, repeating on every
-reconcile until the patch succeeds: setting or removing the fork-retention
-label failed.
+**What you see:** Warning Events naming the snapshot: setting or removing the
+fork-retention label failed. **They do not retry the same way.** The *remove*
+repeats on every reconcile until the patch succeeds. The *set* is retried only
+while the fork's PVC create keeps failing — it is written once before the
+create, and a failed set is **not** retried after the create succeeds (F76).
 
 **What it means:** the fork's source VolumeSnapshot was not (or could not be)
 marked for retention (`ForkRetentionLabelFailed` / `ForkRetentionLabelRemoveFailed`,
 emitted from `internal/controller/loop_restore.go`). On the set failure, the
 source's garbage collection may delete the snapshot while the fork is
 restoring; on the remove failure, the label persists and the source's GC
-skips the snapshot (a known B2 limitation).
+skips the snapshot (a known B2 limitation). Both writes are best-effort by
+design: a failed set does not fail the fork (the fork's PVC create has already
+been accepted — the content is the CSI driver's to materialise, not the
+snapshot's to keep serving), and a failed remove does not fail the fork either
+(the data is in the fork's PVC, which the fork's own GC deletes).
 
 **What to do:** check the operator's RBAC for `patch` on volumesnapshots
 (`kubectl auth can-i patch volumesnapshots --as=<the operator's
-ServiceAccount>`); once RBAC is correct the next reconcile retries the patch
-and the Events stop.
+ServiceAccount>`). With RBAC correct:
+
+- `ForkRetentionLabelRemoveFailed` stops by itself — the remove runs on every
+  reconcile while the completed fork's PVC is present.
+- `ForkRetentionLabelFailed` stops only if the fork's PVC create is still
+  failing (the set is retried on each create attempt). If the create has
+  already succeeded, **do not expect a retry**: mark the source snapshot by
+  hand (`kubectl label volumesnapshot <snapshot> coxswain.wattu.com/fork-of=<fork>`
+  — it needs `patch`, and the operator will not re-mark it), or accept that the
+  source's GC may delete the snapshot. A fork whose PVC exists no longer needs
+  it.
 
 ### `VerifyInfraFailed` — was the agent tampering? (F39)
 

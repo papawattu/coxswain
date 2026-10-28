@@ -441,14 +441,20 @@ deploys a minimal egress proxy pod (the `cmd/egress-proxy` binary image) in
   enforcement point for `spec.network` allows, the port is enforced at
   CONNECT time, so the KubeArmor translation no longer loses the port for
   network allows. The operator must therefore **not** set
-  `PolicyTranslationLossy=True` on the grounds of an agent network allow:
-  when the egress proxy is expected (network allows present), the condition
-  is set `False` (reason `NoPortLoss` — the port is enforced by the egress
-  proxy) regardless of what the KubeArmor translation would have dropped.
-  The condition **remains** for the model proxy's egress (the model
-  endpoint's port is still protocol-name-only in KubeArmor), unchanged from
-  I41. ADR-0007 is the authority ("the `PolicyTranslationLossy` condition is
-  not set for network allows once the egress proxy is implemented").
+  `PolicyTranslationLossy=True` on the grounds of an agent network allow
+  **once the egress proxy pod is owned by the Loop and Ready** (F64 as built:
+  the Ready pod is the trigger, not "allows present" — before it exists the
+  I42b gate holds the sandbox Suspended and nothing carries the port). In that
+  shape the condition is `False` (reason `NoPortLoss` — the port is enforced by
+  the egress proxy) regardless of what the KubeArmor translation would have
+  dropped; until then it is `True`/`KubeArmorDroppedPorts` naming the allows,
+  and it clears on the pass that observes the Ready pod. The condition also
+  covers the model proxy's egress: it is `True` for a model endpoint whose port
+  no layer pins — the model proxy's NetworkPolicy carries the port for an IP
+  literal or an in-cluster Service host, and for any other host `modelPeer`
+  emits no rule at all, so the KubeArmor hostname-only allow is the whole
+  translation. ADR-0007 records the built shape ("F64 (as built) supersedes the
+  'not set' clause").
 
 **envtest-first tests** (`internal/controller/loop_i42_egress_test.go`):
 1. **Gate: no network allows → no egress proxy pod.** A Loop with a policyRef
@@ -481,12 +487,17 @@ deploys a minimal egress proxy pod (the `cmd/egress-proxy` binary image) in
    `matchLabels`/`matchExpressions` do not select the egress proxy pod's label
    set, so the agent's exec allowlist never binds to the egress proxy. This
    is the same regression guard added for the model proxy on #12 (D33).
-8. **I41: `PolicyTranslationLossy` not set for network allows (review P2).**
-   A Loop with a network-allowing AgentPolicy (the port would be lossy in the
-   KubeArmor `matchDNSQueries` translation) → after reconcile, the
-   `PolicyTranslationLossy` condition is `False` (reason `NoPortLoss`), not
-   `True`, because the egress proxy enforces the port at CONNECT time. The
-   model proxy's egress, by contrast, still sets it when lossy (unchanged).
+8. **I41: `PolicyTranslationLossy` reports a port nothing carries (review P2,
+   F64 as built).** A Loop with a network-allowing AgentPolicy (the port would
+   be lossy in the KubeArmor `matchDNSQueries` translation) → while the egress
+   proxy pod is not owned by the Loop and Ready, the condition is
+   `True`/`KubeArmorDroppedPorts` naming the allows (nothing carries the port
+   yet, and the I42b gate holds the sandbox Suspended); once the pod is owned and
+   Ready, the next reconcile sets it `False` (reason `NoPortLoss`), because the
+   egress proxy enforces the port at CONNECT time. A model endpoint whose host no
+   NetworkPolicy rule can express keeps it `True` (the model proxy's KubeArmor
+   allow is hostname-only). Both halves are pinned by
+   `loop_f64_translation_lossy_envtest_test.go`.
 
 **kind acceptance** (`--context kind-coxswain-dev`):
 - A Loop with a network-allowing AgentPolicy is created; the operator creates

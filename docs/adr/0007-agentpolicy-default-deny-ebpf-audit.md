@@ -683,6 +683,27 @@ not zero.
   does not need to carry the port (the egress proxy does), so the
   `PolicyTranslationLossy` condition is **not set** for network allows once
   the egress proxy is implemented.
+  - **F64 (as built) supersedes the "not set" clause above:** the condition is
+    **set**, and reports whether a port is carried. For the agent's network
+    allows it is `False` (reason `NoPortLoss`) once the egress proxy pod is
+    owned by the Loop and Ready — an absent condition and a stale `True` both
+    read as "something is wrong" in `kubectl cox describe`, and
+    `TDD-PLAN-PHASE1.md` §I41 ("stop setting `PolicyTranslationLossy` for agent
+    network allows") already specified the `False` form. While the proxy is not
+    Ready the sandbox is Suspended (the I42b gate), nothing carries the port,
+    and the condition is `True`/`KubeArmorDroppedPorts`, naming the allows. For
+    the model proxy's egress the condition is `True` only for an endpoint whose
+    port no layer pins: the model proxy's NetworkPolicy carries the endpoint's
+    host AND port when the endpoint is an IP literal or an in-cluster Service
+    host (`modelPeer` can express those), so for every endpoint shape this CRD
+    documents as in-cluster the port IS carried and the condition stays `False`;
+    a host no NetworkPolicy rule can express (an external FQDN) gets no egress
+    rule at all, and then the KubeArmor hostname-only allow is reported. The
+    `False` claim is only as good as the agent NetworkPolicy fence: if that
+    netpol is deleted out of band while the sandbox runs, the widened allow is
+    live while this condition still says `False` — that window is the
+    `AgentNetworkPolicyReady`/agent-netpol-absent hold's job, not this
+    condition's.
 - **`NetworkAllowsNotEnforced` condition (D34, I42):** it was only proposed
   in D34's design comment, never implemented. With I42 resolved by the
   egress proxy it is dropped: the I42 slice adds nothing named

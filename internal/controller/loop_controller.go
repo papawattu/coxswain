@@ -1467,11 +1467,128 @@ const kaptCRDMissingRequeue = time.Minute
 // cadence is ever retuned this has to split).
 const workRequeue = 5 * time.Second
 
-// PolicyTranslationLossyCondition is the Loop condition that reports a lossy
-// KubeArmor translation (I41): a host:PORT network allow that loses its port
-// in the translation. True + reason KubeArmorDroppedPorts lists the widened
-// allows; False + reason NoPortLoss when no port was lost.
+// PolicyTranslationLossyCondition is the Loop condition that reports a port the
+// KubeArmor translation drops and that no other layer carries (I41). KubeArmor
+// matches egress by hostname + protocol name, so a host:PORT allow becomes
+// "host" + "tcp" (any port); something else must pin the port. True + reason
+// KubeArmorDroppedPorts lists the allows nothing pins; False + reason
+// NoPortLoss when every host:PORT allow is carried by another layer. See
+// translationLossAllows for the carriers and the two causes.
 const PolicyTranslationLossyCondition = "PolicyTranslationLossy"
+
+// egressProxyCarriesPorts reports whether the egress proxy enforces the agent's
+// host:PORT network allows at CONNECT time: its pod exists, is owned by the
+// Loop, and is Ready — the same owned+Ready shape the I42b gate holds the
+// sandbox Suspended on (loop_controller.go's sandboxSuspendedByGate).
+//
+// A Loop with no network allows has no port to carry, so it reports true. A
+// read error reports false, and a foreign pod is not a carrier: this answer only
+// decides what the condition REPORTS, so it must never fail closed onto a
+// gate — an over-reported loss is a warning, a silently dropped one is not.
+func (r *LoopReconciler) egressProxyCarriesPorts(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if !r.egressProxyGateApplies(ctx, loop) {
+		return true
+	}
+	egPod := &corev1.Pod{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: egressProxyPodName(loop.Name)}, egPod); err != nil {
+		return false
+	}
+	return metav1.IsControlledBy(egPod, loop) && isPodReady(egPod)
+}
+
+// modelEndpointLossyPorts returns the model endpoint as a dropped-port allow
+// when its port is one nothing pins. ADR-0007 keeps PolicyTranslationLossy for
+// the model proxy's egress: the model endpoint is translated to a KubeArmor
+// hostname allow (any port). The model proxy's NetworkPolicy carries the port
+// when modelPeer can express the endpoint as an egress rule (an IP literal or an
+// in-cluster Service host); for anything else it returns no rule at all, so
+// nothing carries the port and the loss is reported.
+func (r *LoopReconciler) modelEndpointLossyPorts(loop *coxv1alpha1.Loop) []string {
+	ep := loop.Spec.Agent.ModelEndpoint
+	if ep == "" || modelEndpointPort(ep) == 0 {
+		return nil // no endpoint, or a host-only endpoint: no port to lose
+	}
+	if modelPeer(ep, r.serviceNamespaceFromHost) != nil {
+		return nil // the model proxy's NetworkPolicy pins host AND port
+	}
+	return []string{ep}
+}
+
+// translationLoss is what PolicyTranslationLossy reports: the allows whose port
+// the KubeArmor translation drops and that no layer carries, split by WHY — the
+// two causes need different operator responses, so the condition's message names
+// which one it is (F4 of the #325 review).
+type translationLoss struct {
+	// ProxyPending lists network allows nothing carries because the egress proxy
+	// pod is not owned by the Loop and Ready yet. TRANSIENT: it clears on the pass
+	// that observes the Ready pod.
+	ProxyPending []string
+	// EndpointUnpinned lists model endpoints no NetworkPolicy rule can express, so
+	// the model proxy's KubeArmor allow stays hostname-only. A config shape: it
+	// does not clear until spec.agent.modelEndpoint changes.
+	EndpointUnpinned []string
+}
+
+// empty reports whether nothing is lossy.
+func (l translationLoss) empty() bool {
+	return len(l.ProxyPending) == 0 && len(l.EndpointUnpinned) == 0
+}
+
+// translationLossAllows reports the lossy allows, by cause (I41, ADR-0007). Two
+// layers can carry a port:
+//
+//   - the egress proxy pins each agent network allow's host AND port at CONNECT
+//     time, so once its pod is owned by the Loop and Ready the agent's allows are
+//     not lossy (TDD-PLAN-PHASE1 §I41, as amended by F64: the trigger is the Ready
+//     pod, not "allows present"). Until then the I42b gate holds the sandbox
+//     Suspended and nothing carries the port, so the allows ARE reported: the
+//     condition states what is true on this pass and clears on the pass that
+//     observes the Ready proxy (I43: it is re-set, not left as its creation
+//     value).
+//   - the model proxy's NetworkPolicy pins the model endpoint's port where
+//     modelPeer can express it (see modelEndpointLossyPorts).
+//
+// Each list is sorted and de-duplicated so the condition message is stable (a
+// churning message would rewrite the condition every pass).
+func (r *LoopReconciler) translationLossAllows(ctx context.Context, loop *coxv1alpha1.Loop, effective policy.EffectivePolicy) translationLoss {
+	var loss translationLoss
+	if !r.egressProxyCarriesPorts(ctx, loop) {
+		loss.ProxyPending = sortedUnique(engine.NetworkLossy(effective.Network))
+	}
+	loss.EndpointUnpinned = sortedUnique(r.modelEndpointLossyPorts(loop))
+	return loss
+}
+
+// sortedUnique sorts and de-duplicates in place, returning nil for an empty list
+// (so an empty cause is always the nil zero value).
+func sortedUnique(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	slices.Sort(in)
+	return slices.Compact(in)
+}
+
+// setPolicyTranslationLossy records the I41 condition: True naming the cause and
+// the allows nothing pins the port for, False when every host:PORT allow's port
+// is carried by another layer. Both writes come from here so the two call sites
+// (the live path and the deleting path) cannot drift.
+func setPolicyTranslationLossy(loop *coxv1alpha1.Loop, loss translationLoss) {
+	if loss.empty() {
+		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
+			"NoPortLoss", "every host:PORT allow's port is carried by the egress proxy or the model proxy's NetworkPolicy; the KubeArmor translation matches the host")
+		return
+	}
+	var causes []string
+	if len(loss.ProxyPending) > 0 {
+		causes = append(causes, "nothing carries the port yet (the egress proxy pod is not owned by the Loop and Ready), so these allows are enforced by hostname only: "+strings.Join(loss.ProxyPending, ", "))
+	}
+	if len(loss.EndpointUnpinned) > 0 {
+		causes = append(causes, "the model proxy's NetworkPolicy cannot express this endpoint (no rule pins its port), so the KubeArmor allow is hostname-only: "+strings.Join(loss.EndpointUnpinned, ", "))
+	}
+	setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
+		"KubeArmorDroppedPorts", strings.Join(causes, "; "))
+}
 
 // effectivePolicy resolves the Loop's effective policy: the union of the
 // referenced AgentPolicies, or the platform minimum (empty EffectivePolicy) when
@@ -5516,14 +5633,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			kaptCRDMissing = true
 		}
 	}
-	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
-		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
-			"KubeArmorDroppedPorts",
-			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
-	} else {
-		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
-			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
-	}
+	setPolicyTranslationLossy(loop, r.translationLossAllows(ctx, loop, effective))
 	if enf, rs := preApplyEnf, preApplyRs; enf {
 		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
 			"the eBPF engine is enforcing the Loop's effective policy")
@@ -5647,14 +5757,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context
 			// is not silently lost).
 		}
 	}
-	if lossy := engine.NetworkLossy(effective.Network); len(lossy) > 0 {
-		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionTrue,
-			"KubeArmorDroppedPorts",
-			"these network allows lost their port in the KubeArmor translation and are enforced by hostname only (any port) until I42 is resolved: "+strings.Join(lossy, ", "))
-	} else {
-		setCondition(loop, PolicyTranslationLossyCondition, metav1.ConditionFalse,
-			"NoPortLoss", "all network allows are expressible at full precision by the KubeArmor translation")
-	}
+	setPolicyTranslationLossy(loop, r.translationLossAllows(ctx, loop, effective))
 	if enf, rs := preApplyEnf, preApplyRs; enf {
 		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
 			"the eBPF engine is enforcing the Loop's effective policy")

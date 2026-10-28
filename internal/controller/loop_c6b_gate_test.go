@@ -315,7 +315,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		Expect(c.Message).To(ContainSubstring("--allow-unenforced"), "the message must name the escape hatch as the reason the Loop runs")
 	})
 
-	It("sets PolicyTranslationLossy=True when a host:PORT network allow loses its port (I41)", func() {
+	It("sets PolicyTranslationLossy=True for a host:PORT network allow while nothing carries the port (I41)", func() {
 		ctx = context.Background()
 		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		ns := "c6b-lossy"
@@ -346,7 +346,7 @@ var _ = Describe("D30 fail-closed enforcement gate (C6b)", func() {
 		Expect(c.Message).To(ContainSubstring("pypi.org:443"))
 	})
 
-	It("sets PolicyTranslationLossy=False when all network allows are bare hosts (I41)", func() {
+	It("sets PolicyTranslationLossy=False when every allow's port is carried (a bare host has none) (I41)", func() {
 		ctx = context.Background()
 		r = &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme()}
 		ns := "c6b-notlossy"

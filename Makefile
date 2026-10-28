@@ -79,6 +79,10 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	$(MAKE) image-args-test
 	@# F21: the RWX-storage script's execution test (real script, stubbed kubectl).
 	$(MAKE) rwx-storage-test
+	@# F72 review F6: the evil-agent e2e's verdict gate and preflight self-test (bash + coreutils only,
+	@# no cluster, ~2 s). The gate exists to make the e2e's exit code mean something, so it must be
+	@# seen to pass in PR CI, not only on a human-invoked e2e target.
+	$(MAKE) evil-agent-e2e-selftest
 	@# F29: the Helm chart's manager role and CRDs must not drift from config/ (serviceaccounts rule, lessonsAvailable were missing).
 	$(MAKE) chart-drift-test
 	@# F48d: the controller suite now needs longer than go test's 10m default when every package runs in parallel (588s standalone, +~2% under contention), so the timeout is explicit.
@@ -154,6 +158,9 @@ lint: golangci-lint ## Run golangci-lint linter
 	@# ubuntu-latest; fail clearly if it is missing elsewhere).
 	@command -v shellcheck >/dev/null 2>&1 || { echo "Error: shellcheck is not installed (apt install shellcheck)"; exit 1; }
 	@for f in hack/*.sh; do echo "shellcheck $$f"; shellcheck "$$f"; done
+	@# F72 review F6: the evil-agent e2e's verdict gate is a shell script, so shellcheck it too. Scoped to
+	@# the two scripts this item owns, at -S warning (they carry one style-level note each that predates it).
+	@for f in test/e2e/evil-agent-e2e.sh test/e2e/evil-agent-e2e-selftest.sh; do echo "shellcheck $$f"; shellcheck -S warning "$$f"; done
 
 .PHONY: github-secret-test
 github-secret-test: ## D55: execution test for hack/github-secret.sh (stub kubectl + fake token; never the real token file).
@@ -242,12 +249,16 @@ evil-probes-test: ## F54 execution test: the real test/e2e/evil-probes.sh agains
 evil-standin-test: ## F54 execution test: the real test/e2e/evil-standin.py on a port with real chat requests (no cluster).
 	@bash test/e2e/evil-standin-test.sh
 
+.PHONY: evil-agent-e2e-selftest
+evil-agent-e2e-selftest: ## F72: cluster-free self-test of the evil-agent e2e's verdict gate and preflight (synthetic verdicts, stubbed kubectl).
+	@bash test/e2e/evil-agent-e2e-selftest.sh
+
 .PHONY: evil-agent-e2e
-evil-agent-e2e: evil-probes-test evil-standin-test ## F54 (ADR-0006:95-99) evil-agent e2e, ~15 min: 15 probes + controls, variants (a)/(b) and the tamper Loop. Default context kind-ref (Calico + KubeArmor). Not in CI; run on kind-ref. Evidence under .samples/evil-agent-<epoch>/. EXPECTED TO FAIL on a build without the F42 fix.
+evil-agent-e2e: evil-probes-test evil-standin-test evil-agent-e2e-selftest ## F54 (ADR-0006:95-99) evil-agent e2e, ~15 min: 15 probes + controls, variants (a)/(b) and the tamper Loop. Default context kind-ref (Calico + KubeArmor). Not in CI; run on kind-ref. Evidence under .samples/evil-agent-<epoch>/. Exit 0 ONLY when every probe of every executed variant is proved (F72). EXPECTED TO FAIL on a build without the F42 fix.
 	@K8S_CONTEXT=$${K8S_CONTEXT:-kind-ref} bash test/e2e/evil-agent-e2e.sh
 
 .PHONY: evil-agent-e2e-fast
-evil-agent-e2e-fast: evil-probes-test evil-standin-test ## F54: the evil-agent e2e without the tamper phase (EVIL_AGENT_SKIP_TAMPER=1), ~6 min. Not in CI; run on kind-ref.
+evil-agent-e2e-fast: evil-probes-test evil-standin-test evil-agent-e2e-selftest ## F54: the evil-agent e2e without the tamper phase (EVIL_AGENT_SKIP_TAMPER=1), ~6 min; proves variants a/b only and says so. Not in CI; run on kind-ref.
 	@EVIL_AGENT_SKIP_TAMPER=1 K8S_CONTEXT=$${K8S_CONTEXT:-kind-ref} bash test/e2e/evil-agent-e2e.sh
 
 .PHONY: d41-e2e
@@ -439,7 +450,7 @@ kubearmor-e2e:
 	@KUBEARMOR_VERSION=$(KUBEARMOR_VERSION) bash test/e2e/kubearmor-exec-block.sh
 
 .PHONY: test-e2e
-test-e2e: evil-probes-test evil-standin-test setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: evil-probes-test evil-standin-test evil-agent-e2e-selftest setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 

@@ -24,6 +24,14 @@ rules:
   - list
   - update
   - watch
+# F62: the alert relay follows the engine's and the operator's own proxy pod
+# logs (pods/log is a SUBRESOURCE grant: resources=pods does not include it).
+- apiGroups:
+  - ""
+  resources:
+  - pods/log
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:

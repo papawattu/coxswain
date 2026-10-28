@@ -63,7 +63,13 @@ const (
 // live in group "").
 var knownResourceGroup = map[string]string{
 	// core (group "")
-	corePodsResource:         coreGroup,
+	corePodsResource: coreGroup,
+	// pods/log is the SUBRESOURCE grant F62's alert relay needs (the operator
+	// follows the engine's and its own proxies' container logs). The trap is
+	// that a marker written as resources=pods,verbs=get;list does NOT grant
+	// it, and a rule under the wrong group passes envtest (cluster-admin)
+	// while forbidding the read on a cluster — the B1 storageclasses lesson.
+	"pods/log":               coreGroup,
 	"services":               coreGroup,
 	"configmaps":             coreGroup,
 	"persistentvolumeclaims": coreGroup,
@@ -156,6 +162,13 @@ func TestRBACCoverage(t *testing.T) {
 			minVerbs: []string{verbGet, verbList, verbWatch, verbCreate, verbUpdate}},
 		// Sandbox status (the controller reads sandbox status).
 		{group: agentsGroup, resource: "sandboxes/status",
+			minVerbs: []string{verbGet}},
+		// pods/log — the F62 alert relay follows the engine's and the
+		// operator's own proxy pod logs. This entry is what makes the trusted
+		// table's pods/log row a GUARD: without it the group assertion never
+		// runs for the subresource (pi3 E4), and `get` is the only verb the
+		// relay uses (GetLogs().Stream() — pi3 E9).
+		{group: "", resource: "pods/log",
 			minVerbs: []string{verbGet}},
 		// Owns(&Pod{}) — the controller creates and owns proxy Pods.
 		{group: "", resource: corePodsResource,

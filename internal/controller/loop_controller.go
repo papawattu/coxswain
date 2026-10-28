@@ -350,6 +350,15 @@ type LoopReconciler struct {
 	// runs in the leader-elected Runnable (internal/cni); the reconcile only
 	// reads the current result via LatestResult().
 	CNIProber cni.CNIProber
+	// Audit is the alert relay's read seam (F62): the reconcile reads the
+	// relay's per-Loop blocked-action count and stream health and writes
+	// status.policy.blockedCount + the PolicyBlocked condition. The relay runs
+	// in a leader-elected Runnable (internal/alerts) that follows the engine's
+	// and the proxies' pod logs; the reconcile never reads a log itself.
+	// When nil the relay is not installed (a bare test reconciler, or a
+	// deliberately silent install): nothing is written, so the count stays nil
+	// — never 0 (I32). AllowUnenforcedNetwork is the unrelated D38 hatch.
+	Audit AuditReader
 	// AllowUnenforcedNetwork is the off-by-default network escape hatch (D38),
 	// separate from AllowUnenforced (the eBPF gate): when true, Loops run with
 	// NetworkEnforced=False reason EnforcementDisabled rather than being held
@@ -567,6 +576,7 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;delete
 // A1 (D52): the static enforcement check reads Nodes (BPF-LSM label) and
@@ -1045,6 +1055,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 	changed = changed || hashChanged
+
+	// F62: the alert relay's blocked-action count (status.policy.blockedCount +
+	// the PolicyBlocked condition). It takes &changed rather than returning a
+	// flag so Reconcile gains no branch (it sits at its gocyclo budget). A
+	// relay outage writes UNKNOWN and clears the count — never 0 (I32) — and a
+	// block never fails or pauses the Loop (Q5).
+	r.recordBlockedActions(&loop, &changed)
 
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
 	// container's termination message (read via the operator's own APIReader

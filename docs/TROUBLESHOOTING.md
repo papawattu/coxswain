@@ -1126,3 +1126,49 @@ from (restore path) a snapshot belonging to a different Loop. After the
 fix, the trust check (name shape + matching iteration + Loop label) gates
 both paths: untrusted entries are dropped from status with a Warning
 Event and are never deleted or restored from.
+
+### `PolicyBlocked` is `Unknown`, or `blockedCount` is absent (F62)
+
+The Loop's `status.policy.blockedCount` is the operator's own count of the
+actions the engine **blocked** for that Loop (ADR-0007 Q5). It is derived from
+the engine's audit stream — the operator follows the container logs of the
+engine's agent pods and of the Loop's own proxy pods (`pods/log`), so the agent
+can never forge the number.
+
+Three states, three different meanings:
+
+| `status.policy.blockedCount` | `PolicyBlocked` | Means |
+|---|---|---|
+| a number | `True`, reason `BlocksObserved` | the stream was healthy; the message names the latest blocked target |
+| absent | `Unknown` | there is **no trustworthy number** — never read this as "nothing was blocked" (I32) |
+| absent | no condition | the relay has no news for this Loop yet (no sandbox pod, or no stream attached yet) |
+
+`Unknown` carries the reason:
+
+- `AuditStreamUnavailable` — the stream could not be read (no permission, the
+  engine's pod is not there, or the pod log could not be opened). Check
+  `kubectl auth can-i get pods/log --as=<the operator's ServiceAccount>` and
+  the operator log for `alert relay` lines.
+- `EngineUnavailable` — no engine agent pod was discovered at all (the engine's
+  namespace/label are the operator's `--kubearmor-agent-namespace` /
+  `--kubearmor-agent-pod-label`).
+- `AuditStreamGap` — the stream re-attached (a log rotation, a restarted agent)
+  and the first line arrived later than the last accepted alert: the operator
+  cannot rule out a window it never saw, so it publishes no number rather than a
+  smaller one.
+- `AuditStreamUndecodable` — a run of lines it could not decode (the engine's
+  alert format changed, or the stream is not the one it expected).
+
+The message also names how many alerts could not be attributed to **any** Loop:
+a sandbox pod without the operator's `coxswain.io/loop` label (hand-created, or
+an old pod) is a diagnostic, never a guessed attribution.
+
+**Nothing is held or failed by a block** (Q5): a `PolicyBlocked` change never
+changes the phase, never pauses, and never produces a terminal reason. Fixing a
+count means fixing the stream (the RBAC grant, the engine namespace, the pod
+labels) — not the Loop spec.
+
+The Q4 audit trail is separate: every alert, allowed and blocked, is written as
+one JSON line on the operator's stdout (`{time, loop, namespace, iteration,
+source, action, target, verdict, detail}`), with `iteration` joined from the
+Loop's status at emit time.

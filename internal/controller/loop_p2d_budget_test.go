@@ -781,6 +781,63 @@ var _ = Describe("P2d: budget decision (read + delta, wall clock, cost, onExceed
 		Expect(l2.Status.Budget.PromptTokens).To(BeEquivalentTo(130), "the same-boot delta (100+30), not a rebase-to-0 + 130 (the P1-B double-count fix)")
 	})
 
+	It("spec 10b: a boot change folds the unmetered count in FULL and surfaces it once (F82)", func() {
+		ns := nsFor("p2d-s10c")
+		defer deleteNS(ctx, ns)
+		recorder := record.NewFakeRecorder(64)
+		r := newP2dReconciler(recorder, nil)
+		loop := createP2dLoop(ns, "p2d-s10c", func(l *coxv1alpha1.Loop) {
+			l.Spec.Budget = &coxv1alpha1.BudgetConfig{MaxTokens: new(int64), OnExceeded: coxv1alpha1.BudgetExceededActionFail}
+			*l.Spec.Budget.MaxTokens = 10_000 // far above the readings: no decision on this path
+		})
+		setPhaseP2d(loop, coxv1alpha1.LoopPhasePlanning)
+		primeP2dProxy(loop)
+		// Stored state: boot B1, nothing unmetered yet.
+		seedBudget(getLoopP2d(ns, "p2d-s10c"), func(b *coxv1alpha1.BudgetStatus) {
+			b.LastBootID = "B1"
+		})
+		// A pod recreate (the D33 drift recreate, an eviction, an OOM restart):
+		// boot B2, two requests and BOTH unmetered. The emptyDir — and the boot
+		// ID file with the counters — was wiped, so the reading IS the delta from
+		// 0 and must be folded in full. An episode that straddles the recreate
+		// loses exactly its count if the boot branch folds only a delta (or
+		// nothing), and MeteringDegraded then under-reports right after it.
+		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return proxy.Reading{BootID: "B2", Requests: 2, UnmeteredRequests: 2}, nil
+		}
+		reconcileP2d(r, ns, "p2d-s10c")
+
+		l := getLoopP2d(ns, "p2d-s10c")
+		Expect(l.Status.Budget.LastBootID).To(Equal("B2"))
+		Expect(l.Status.Budget.UnmeteredRequests).To(BeEquivalentTo(2),
+			"a boot change folds the new boot's unmetered count in FULL (the reading is the delta from 0)")
+		cond := apimeta.FindStatusCondition(l.Status.Conditions, coxv1alpha1.MeteringDegradedCondition)
+		Expect(cond).NotTo(BeNil(), "the folded unmetered count must surface as MeteringDegraded")
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Reason).To(Equal(meteringDegradedReason))
+		Expect(cond.Message).To(ContainSubstring("2 unmetered in total"),
+			"the message reports the accumulated count, which is what the fold produced")
+		events := drainEvents(recorder)
+		degraded := 0
+		for _, e := range events {
+			if strings.Contains(e, meteringDegradedReason) {
+				degraded++
+			}
+		}
+		Expect(degraded).To(Equal(1), "exactly one Warning Event on the transition: %v", events)
+		Expect(events).To(ContainElement(ContainSubstring("2 request(s) forwarded without a usage object (2 in total)")),
+			"the Event carries the delta (2) and the total (2): %v", events)
+
+		By("a same-boot B2 reading with unmetered 3 adds only the delta 1 (the boot branch rebased last* to the reading)")
+		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return proxy.Reading{BootID: "B2", Requests: 3, UnmeteredRequests: 3}, nil
+		}
+		reconcileP2d(r, ns, "p2d-s10c")
+		l = getLoopP2d(ns, "p2d-s10c")
+		Expect(l.Status.Budget.UnmeteredRequests).To(BeEquivalentTo(3),
+			"3 = 2 + (3-2): a missing last* rebase in the boot branch would add 3 and reach 5")
+	})
+
 	It("spec 11: a cumulative decrease without a bootID change is an anomaly (warn + rebase + add nothing; not a bootIDChanged rebase)", func() {
 		ns := nsFor("p2d-s11")
 		defer deleteNS(ctx, ns)

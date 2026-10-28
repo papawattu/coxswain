@@ -581,18 +581,52 @@ exit 0
 // failure (any other non-zero), which stays an infra failure.
 const verifyNotDescendantExit = 97
 
-// importAgentScript builds the import-agent init's sh script. It fetches the
+// importAgentScript builds the import-agent init's sh script. It imports the
 // agent's pinned commit from the read-only workspace PVC, REFUSES a pin that is
 // not a descendant of baseCommit (F43: the pin is the runner's claim, shape-
 // checked only; the tamper diff is tree-to-tree and would accept any commit
 // reachable in the agent's repo, including pre-existing history), and checks
 // the commit out. `git merge-base --is-ancestor` exits 0 (ancestor), 1 (not),
 // anything else (error); only 1 maps to verifyNotDescendantExit.
+//
+// F67: the objects are READ out of the agent's object store, never fetched from
+// it. `git fetch file:///agent-src/.git <sha>` makes git run upload-pack as a
+// SERVER process inside a repository whose config the agent owns, and the only
+// reason that is not a code-execution hole today is a rule of the git version
+// in the image (uploadpack.packObjectsHook is honoured only from PROTECTED
+// config, git-config(5)) — while the image is operator-configurable
+// (--workspace-git-image). Object files are data: an alternate object
+// directory is a PATH (no config is read from it), so the pinned commit's
+// closure is copied into /verify's OWN store with pack-objects. The copy is
+// also what the later containers need: the alternate is an env var that dies
+// with this container, while tamper/check read /verify/.git.
+//
+// The Job's OTHER fetch is clone-base (cloneScript/cloneCredScript), which
+// fetches from `origin` — the Loop's repo on the forge, whose URL is
+// spec.workspace.repo (operator-authored) and whose server-side config no
+// git push from the agent can write. That is why it stays: F67 is about the
+// agent's OWN repository, the one the agent can run commands in.
 func importAgentScript(baseCommit, verifyCommit string) string {
 	return fmt.Sprintf(`
 set -e
 cd /verify
-git -c core.hooksPath=/dev/null -c protocol.file.allow=always fetch --no-tags file:///agent-src/.git %[2]s
+# F67: read the agent's object store through an alternate and copy the pinned
+# commit's closure here; no server process runs in (or reads the config of) the
+# agent's repo.
+export GIT_ALTERNATE_OBJECT_DIRECTORIES=/agent-src/.git/objects
+git -c core.hooksPath=/dev/null rev-list --objects %[2]s | cut -d' ' -f1 | git -c core.hooksPath=/dev/null pack-objects .git/objects/pack/pack
+# From here the alternate is gone: only /verify's own store is visible, which
+# is exactly what the tamper and check containers get.
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES
+# The copy must have landed: set -e does not catch a failing rev-list inside the
+# pipeline (the pipeline's status is pack-objects'), so a pin that is not in the
+# agent's store would otherwise surface later as a merge-base error that names
+# the wrong cause. This is the deliver Job's assertion, and it also proves
+# locality because the alternate is already unset.
+if ! git -c core.hooksPath=/dev/null rev-parse --verify --quiet %[2]s^{commit} >/dev/null; then
+  echo "import-agent: pinned commit is not in the agent workspace .git"
+  exit 2
+fi
 if git -c core.hooksPath=/dev/null merge-base --is-ancestor %[1]s %[2]s; then
   :
 else
@@ -667,13 +701,14 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		cloneCt.Command = []string{verifySh, "-c", cloneCredScript(repo, baseCommit)}
 	}
 
-	// The import-agent init: fetches the agent's verifiedCommit from the
-	// workspace PVC (READ-ONLY) via a local file:// fetch into the fresh
-	// clone at /verify. It carries NO credentials and NO agent data mounts
-	// besides the read-only workspace. This is the ONLY place agent data
-	// enters the Job, and it imports the verified COMMIT (not the working
-	// tree) — so the tamper check and the acceptance checks operate on the
-	// SAME tree (the checked-out verifiedCommit), closing the tamper bypass.
+	// The import-agent init: imports the agent's verifiedCommit from the agent's
+	// object store on the workspace PVC (READ-ONLY) into the fresh clone at
+	// /verify — no fetch, no server process, no read of the agent repo's config
+	// (F67). It carries NO credentials and NO agent data mounts besides the
+	// read-only workspace. This is the ONLY place agent data enters the Job, and
+	// it imports the verified COMMIT (not the working tree) — so the tamper
+	// check and the acceptance checks operate on the SAME tree (the checked-out
+	// verifiedCommit), closing the tamper bypass.
 	importScript := importAgentScript(baseCommit, verifyCommit)
 	importCt := corev1.Container{
 		Name:            verifyImportAgentInit,
@@ -681,15 +716,21 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Command:         []string{verifySh, "-c", importScript},
 		SecurityContext: trustedContainerSecurityContext(),
 		Env: []corev1.EnvVar{
-			// Two safe.directory entries: the scratch (/verify, where the
-			// clone lives) and the SOURCE repo on the read-only PVC
-			// (/agent-src/.git, owned by the agent's git user — a
-			// different-ownership repo). Scoped to this container alone.
-			{Name: "GIT_CONFIG_COUNT", Value: "2"},
+			// One safe.directory entry: the scratch (/verify, where the clone
+			// lives — its emptyDir is root-owned while the containers run
+			// non-root). There is deliberately NO entry for /agent-src/.git:
+			// F67 reads the agent's OBJECT STORE through
+			// GIT_ALTERNATE_OBJECT_DIRECTORIES, which is a plain path, so git
+			// never opens the agent's repo AS A REPOSITORY in this container and
+			// safe.directory (a repository-ownership exemption) does not apply.
+			// Measured: with the source store owned by another uid, the
+			// alternate copy + local rev-parse + checkout all succeed with no
+			// such entry (`.samples/f67/05-cross-owner-alternate.txt`), while
+			// opening that repo as a repository does fail with "dubious
+			// ownership" (the positive control in the same file).
+			{Name: "GIT_CONFIG_COUNT", Value: "1"},
 			{Name: "GIT_CONFIG_KEY_0", Value: verifySafeDirectory},
 			{Name: "GIT_CONFIG_VALUE_0", Value: verifyScratchPath},
-			{Name: "GIT_CONFIG_KEY_1", Value: verifySafeDirectory},
-			{Name: "GIT_CONFIG_VALUE_1", Value: "/agent-src/.git"},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: verifyVol, MountPath: verifyScratchPath},
@@ -898,7 +939,8 @@ func init() {
 // cloneScript builds the clone-base init container script. It fetches ONLY
 // baseCommit from origin (the agent's verifiedCommit is local and never
 // pushed, so fetching it from origin would fail). The import-agent container
-// later fetches verifiedCommit from file:///agent-src/.git.
+// later imports verifiedCommit from the agent's object store without a fetch
+// (F67).
 func cloneScript(repo, baseCommit string) string {
 	return fmt.Sprintf(`
 set -e

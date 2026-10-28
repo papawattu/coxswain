@@ -45,8 +45,68 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+// egressSvcWriteCounter counts the writes the reconciler issues against ONE
+// egress proxy Service, and passes every other call through.
+//
+// Why it exists: controllerutil.CreateOrUpdate's OperationResult is the fact the
+// F11 guard is about (`MutationResultNone` = the mutateFn changed nothing), but
+// the reconcile does not expose it to a spec. An UPDATE that changes nothing
+// observable is answered with the same resourceVersion, so counting writes is
+// the only way a spec can see the difference between "no write" and "a write
+// that happened to be a no-op at the storage layer".
+//
+// The trigger is the object's TYPE as well as its name: the egress proxy Pod
+// and the egress proxy Service are both derivedName(loop, "-egress-proxy"), so a
+// name-only match would also count writes to the Pod (and a failure would name
+// the Service). Only *corev1.Service is counted.
+type egressSvcWriteCounter struct {
+	client.Client
+	namespace string
+	name      string
+	creates   int
+	updates   int
+	patches   int
+	deletes   int
+}
+
+func (c *egressSvcWriteCounter) counts(obj client.Object) bool {
+	if _, ok := obj.(*corev1.Service); !ok {
+		return false
+	}
+	return obj.GetNamespace() == c.namespace && obj.GetName() == c.name
+}
+
+func (c *egressSvcWriteCounter) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if c.counts(obj) {
+		c.creates++
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func (c *egressSvcWriteCounter) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if c.counts(obj) {
+		c.updates++
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func (c *egressSvcWriteCounter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if c.counts(obj) {
+		c.patches++
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func (c *egressSvcWriteCounter) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if c.counts(obj) {
+		c.deletes++
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
 
 const (
 	// i42b test constants.
@@ -259,7 +319,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 	// resourceVersion unchanged (a no-op), while a real input change (the
 	// network allows) still updates it (the test norms: same-Loop, assert the
 	// object is updated when the input changes).
-	It("a no-op reconcile leaves the egress proxy Service resourceVersion UNCHANGED (F11, no reconcile storm)", func() {
+	It("a no-op reconcile issues no write to the egress proxy Service and leaves its resourceVersion UNCHANGED (F11, no reconcile storm)", func() {
 		ns := "f11-svc-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -312,11 +372,42 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		Expect(svc.Spec.ClusterIP).To(Equal(assignedIP),
 			"the operator must NOT reset the apiserver-assigned ClusterIP (the F11 fix)")
 
-		// Reconcile 2 (no input change): a NO-OP (resourceVersion unchanged).
-		// Without the F11 fix the mutateFn resets ClusterIP="" and the update
-		// fires (resourceVersion bumps — the storm).
+		// Reconcile 2 (no input change): a NO-OP. Two assertions, because one is
+		// not enough (I165):
+		//
+		//   - the resourceVersion is unchanged, AND
+		//   - the reconciler issued NO write to the Service at all.
+		//
+		// The second is the load-bearing one. Without the F11 fix the mutateFn
+		// resets ClusterIP=""/ipFamily on every pass, so CreateOrUpdate returns
+		// OperationResultUpdated and fires an UPDATE — but when that update
+		// changes nothing the apiserver stores, it answers with the SAME
+		// resourceVersion, so a resourceVersion-only assertion PASSES under
+		// exactly the mutation this spec exists to catch (#340: `if true` at the
+		// F11 guard in mutateEgressProxyService; measured in
+		// .samples/post-merge/340-f11-mutation-diagnosis.log, where both passes
+		// printed op=updated and rvAfter=243 on the second one). Counting the
+		// writes ties the spec to controllerutil's own OperationResult: a no-op
+		// pass is OperationResultNone, i.e. no Create, no Update, no Patch.
+		//
+		// The wrapper is the only change the pass sees: the Reconcile still runs
+		// against r.Client everywhere else (the Loop status writes, the pod
+		// ensure), and only the writes that name THIS Service are counted.
+		counter := &egressSvcWriteCounter{Client: r.Client, namespace: ns, name: name + "-egress-proxy"}
+		origClient := r.Client
+		r.Client = counter
+		defer func() { r.Client = origClient }()
 		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		r.Client = origClient
 		Expect(err).NotTo(HaveOccurred())
+		Expect(counter.creates).To(BeZero(),
+			"a no-op reconcile must not CREATE the egress proxy Service again")
+		Expect(counter.updates).To(BeZero(),
+			"a no-op reconcile must not UPDATE the egress proxy Service (CreateOrUpdate must return OperationResultNone)")
+		Expect(counter.patches).To(BeZero(),
+			"a no-op reconcile must not PATCH the egress proxy Service (CreateOrUpdate must return OperationResultNone)")
+		Expect(counter.deletes).To(BeZero(),
+			"a no-op reconcile must not DELETE the egress proxy Service")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-egress-proxy"}, svc)).To(Succeed())
 		Expect(svc.ResourceVersion).To(Equal(rv1),
 			"a no-op reconcile must leave the egress proxy Service UNCHANGED (no reconcile storm)")

@@ -407,3 +407,61 @@ to the bound rather than an unbounded recreate loop. That failure is terminal an
 there is no retry command: create or fix the Secret, then **delete and re-apply
 the Loop**. A rollback does not clear it (a rollback never changes the phase), so
 do not reach for one as a retry.
+
+## Stricter `ref`, `acceptanceChecks` and delivery-branch validation (F68)
+
+Admission now bounds four fields that reach the verify and deliver scripts
+as git/shell arguments:
+
+| field | rule |
+|---|---|
+| `spec.workspace.ref` | at most 255 characters; characters `[A-Za-z0-9._/@+]` and `-`; may not start with `-`; **empty stays valid** (it means the repo's default branch) |
+| `spec.verify.acceptanceChecks[]` | at most 16 entries, each 1–4096 characters and containing a non-whitespace character (the contents are otherwise free — a check is a shell command) |
+| `spec.delivery.baseBranch` | characters `[A-Za-z0-9._/-]`; may not start with `-` (it is interpolated into the deliver Job's `git fetch origin <base>`) |
+| `spec.delivery.branchPrefix` | the same character set and the same no-leading-dash rule |
+
+A value that starts with `-` is refused because git parses a dash-leading
+argument as an **option**: `ref: -f` or `baseBranch: --all` changes what the
+credentialed clone fetches instead of naming a branch. The other bounds exist
+because these strings are unbounded today: a 16 KiB check, a 40-entry list, or
+a 300-character ref.
+
+**Nothing is migrated, and no Loop is changed by the upgrade.** What changes is
+what the API server will accept *from now on*. An existing Loop outside these
+bounds behaves differently depending on whether your API server enforces
+updates against the new schema:
+
+- **On an API server with CRD validation ratcheting (Kubernetes 1.30 and
+  later), an update that does not change the offending field is still
+  admitted** — the same behaviour the F48 Secret-name bounds rely on (see the
+  section above). Since the operator's status writes and its finalizer removal
+  never touch `ref`/`acceptanceChecks`/the delivery branch fields, such a Loop
+  keeps running and can still be deleted normally.
+- **On an older API server, every update of that Loop is rejected** (422
+  Invalid, naming the field), because the whole stored object is validated.
+  That freezes the Loop: its status cannot be written, and on delete its
+  checkpoint finalizer cannot be removed, so it sits in `Terminating`. On
+  1.30+ this only applies to an update that *changes* the offending field.
+
+If a Loop is frozen this way (or you simply want it inside the new bounds), the
+remediation is to patch the offending field to a valid value. That update is
+valid, so it is accepted, and the operator can then write status and remove its
+finalizer:
+
+```bash
+# ref: reset to the default branch (empty is valid)
+kubectl -n <ns> patch loop <name> --type=merge -p '{"spec":{"workspace":{"ref":""}}}'
+# acceptanceChecks: trim the list (or shorten an entry) to fit the bounds
+kubectl -n <ns> patch loop <name> --type=json \
+  -p '[{"op":"replace","path":"/spec/verify/acceptanceChecks","value":["go test ./..."]}]'
+# delivery branches: drop the leading dash / fix the characters
+kubectl -n <ns> patch loop <name> --type=merge -p '{"spec":{"delivery":{"baseBranch":"main"}}}'
+```
+
+A frozen deleting Loop also emits a `FinalizerRemovalBlocked` Warning Event
+naming this document (the same Event a terminating namespace produces), so
+`kubectl describe loop <name>` shows why it is stuck.
+
+(Not verified against a live API server for this CRD: the ratcheting split
+above is the behaviour the F48 section documents, and the finalizer-removal
+Event is covered by a spec.)

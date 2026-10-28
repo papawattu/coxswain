@@ -67,10 +67,12 @@ type DeliveryConfig struct {
 	// BranchPrefix is prepended to the Loop name to form the delivery
 	// branch name (<prefix><loop-name>). The operator sets the prefix that
 	// identifies the Loop's branches; the name part is derived from the
-	// Loop. Must be a git branch prefix made of [A-Za-z0-9._/-]; the
-	// result must not collide with baseBranch or a default branch (the
-	// deliver Job refuses to push on those — see DeliverStatus).
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/-]+$`
+	// Loop. Must be a git branch prefix made of [A-Za-z0-9._/-], and it may
+	// not start with '-' (F68: the value reaches a git command as an argument,
+	// where a dash-leading one is parsed as an OPTION); the result must not
+	// collide with baseBranch or a default branch (the deliver Job refuses to
+	// push on those — see DeliverStatus).
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/][A-Za-z0-9._/-]*$`
 	// +kubebuilder:default="coxswain/"
 	// +optional
 	BranchPrefix string `json:"branchPrefix,omitempty"`
@@ -78,8 +80,11 @@ type DeliveryConfig struct {
 	// BaseBranch is the PR base branch (the branch the delivery branch is
 	// compared against when the PR is opened). Default: spec.workspace.ref
 	// (the ref the workspace clone started from), so a Loop with no
-	// baseBranch override opens its PR against the ref it cloned.
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/-]+$`
+	// baseBranch override opens its PR against the ref it cloned. Characters
+	// are [A-Za-z0-9._/-], and the value may not start with '-' (F68: it is
+	// interpolated into the deliver Job's git fetch as a base argument, where
+	// a dash-leading one is parsed as an OPTION).
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/][A-Za-z0-9._/-]*$`
 	// +optional
 	BaseBranch string `json:"baseBranch,omitempty"`
 

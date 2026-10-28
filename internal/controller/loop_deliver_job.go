@@ -645,7 +645,27 @@ func (r *LoopReconciler) deliverClearDeliveredCondition(loop *coxv1alpha1.Loop) 
 // outcome must not suppress the new one. A failed delivery for the SAME
 // commit is re-run by the operator's redeliverAnnotation (I52,
 // ensureDeliverRedeliver).
+//
+// While a workspace restore is IN PROGRESS the answer is no (F77's F3.3 half):
+// the pin names the workspace the restore is replacing, so a Job created now
+// would deliver a commit the restored PVC will not hold. Without this term the
+// gate re-created the Job on every in-progress pass — stopWorkloadsForRestore
+// deletes it and ensureDeliverAndSettle (which runs after the restore step, not
+// behind its hold) created it again in the same pass, because the pin is
+// deliberately kept until the completion. The completion itself clears the pin
+// (clearVerifyPinAtRestore) before the deliver step runs, so the queued delivery
+// is dropped from the first in-progress pass and never comes back.
 func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
+	return deliveryRequestedIgnoringRestoreHold(loop, false)
+}
+
+// deliveryRequestedIgnoringRestoreHold is deliveryRequested with the
+// in-progress-restore term optionally skipped. The restore term is evaluated
+// LAST on purpose: ensureDeliverJob asks again with it skipped, and a true
+// answer then means the restore hold is the ONLY thing refusing delivery —
+// which is when the hold is surfaced as a Delivered condition (R26 I90: a
+// degradation must be visible, like the I72 proxy hold beside it).
+func deliveryRequestedIgnoringRestoreHold(loop *coxv1alpha1.Loop, ignoreRestoreHold bool) (bool, string) {
 	if !deliveryPhaseActive(loop) {
 		return false, "phase is not Succeeded (or the Verifying delivery hold)"
 	}
@@ -660,6 +680,9 @@ func deliveryRequested(loop *coxv1alpha1.Loop) (bool, string) {
 	}
 	if loop.Status.Delivery != nil && loop.Status.Delivery.Commit == loop.Status.CurrentVerify.VerifiedCommit {
 		return false, "delivery already recorded for this verifiedCommit (status.delivery.commit)"
+	}
+	if !ignoreRestoreHold && restoreStepInProgress(loop) {
+		return false, "a workspace restore is in progress (the pin names the workspace it replaces)"
 	}
 	return true, ""
 }
@@ -785,8 +808,39 @@ type deliverOutcome struct {
 // reason DeliveryFailed — no retry). A Job stamped for a DIFFERENT
 // verifiedCommit is deleted (Background propagation) and the reconcile
 // requeues (D27 stale guard, like the verify Job's errVerifyStaleDeleted).
+// deliverRestoreHoldMessage is the Delivered condition's message while a
+// workspace restore holds delivery (F77's F3.3 half, R26 I90). Its prefix is the
+// marker clearRestoreDeliverHold matches, so this file never removes a
+// Delivered condition another path set.
+const deliverRestoreHoldMessage = "deliver Job held: a workspace restore is in progress (the pinned commit names the workspace the restore is replacing, so no delivery is made for it while the restore runs)"
+
+// clearRestoreDeliverHold removes the hold this file published once it no
+// longer applies — the restore completed (the completion clears the pin, so
+// delivery has nothing to do) or was rejected. Only OUR message is removed: a
+// Delivered=False set by the I72 proxy hold or by a Job outcome stays.
+func clearRestoreDeliverHold(loop *coxv1alpha1.Loop) {
+	c := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.DeliveredCondition)
+	if c == nil || c.Reason != coxv1alpha1.ReasonDeliveryInProgress || c.Message != deliverRestoreHoldMessage {
+		return
+	}
+	apimeta.RemoveStatusCondition(&loop.Status.Conditions, coxv1alpha1.DeliveredCondition)
+}
+
 func (r *LoopReconciler) ensureDeliverJob(ctx context.Context, loop *coxv1alpha1.Loop) (bool, error) {
 	if ok, _ := deliveryRequested(loop); !ok {
+		// R26 I90: a restore in progress holds the delivery VISIBLY. Without
+		// this the Loop sat delivery-blocked with only the Restore condition to
+		// explain it (a stuck DeletingPVC would look like nothing was wrong).
+		// The I72 proxy hold below sets the same condition for the same reason;
+		// the second ask with the restore term skipped proves the hold is the
+		// ONLY refusal, so a Loop that never pinned a commit (or already
+		// delivered one) gets no Delivered condition from this path.
+		if held, _ := deliveryRequestedIgnoringRestoreHold(loop, true); held && restoreStepInProgress(loop) {
+			setCondition(loop, coxv1alpha1.DeliveredCondition, metav1.ConditionFalse,
+				coxv1alpha1.ReasonDeliveryInProgress, deliverRestoreHoldMessage)
+		} else {
+			clearRestoreDeliverHold(loop)
+		}
 		return false, nil
 	}
 	jobName := deliverJobName(loop.Name)

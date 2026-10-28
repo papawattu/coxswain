@@ -375,6 +375,17 @@ func parseRestoreFrom(s string) (int, error) {
 // not touch the sandbox at all — its snapshot is not ready; the rejected
 // target is gone).
 func (r *LoopReconciler) b2RestoreHoldSuspended(loop *coxv1alpha1.Loop) bool {
+	return restoreStepInProgress(loop)
+}
+
+// restoreStepInProgress reports whether the Restore condition is one of the
+// in-progress step reasons the restore passes set while they run
+// (StoppingWorkloads, StoppingSandbox, DeletingPVC). It is the phase-independent
+// "a restore has started and has not completed or been rejected" test: the
+// sandbox hold (b2RestoreHoldSuspended) and the deliver gate (deliveryRequested,
+// F77's F3.3 half) both read it. A REJECTED (False/RestoreSourceMissing) or
+// DEFERRED (False/RestoreSourceNotReady) restore is NOT in progress.
+func restoreStepInProgress(loop *coxv1alpha1.Loop) bool {
 	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
 	if c == nil || c.Status != metav1.ConditionFalse {
 		return false
@@ -677,7 +688,13 @@ func (r *LoopReconciler) stopWorkloadsForRestore(ctx context.Context, loop *coxv
 }
 
 // restoreSpecKeyMarker brackets the spec restore target recorded in the
-// Restored condition's message (F35).
+// Restored condition's message (F35). A message WITHOUT the marker was written
+// before F35, so it carries no key — but it does carry the target it restored
+// in its own text ("… (rollback, iter-3)"), which is what
+// legacyMarkerCoversSpec compares with the spec (F75, and the P1 fix in pi3's
+// first review of PR #337: treating every keyless marker as incomplete re-ran
+// a COMPLETED rollback — deleting the workspace PVC and restoring the old
+// snapshot — for every Loop that restored on v0.1.1/v0.1.2).
 const restoreSpecKeyMarker = " [spec-target="
 
 // specRestoreKey identifies the restore target the Loop's SPEC names: the
@@ -710,8 +727,10 @@ func restoredMessage(loop *coxv1alpha1.Loop, target *b2RestoreTarget) string {
 // the TARGET: an unrelated edit keeps it; a different restore target (only
 // reachable by a client that bypasses the CRD immutability rule, or by setting
 // restoreFrom/forkOf on a Loop that had none) re-arms it. A marker written
-// before this key existed has no key and counts as complete (it cannot be
-// re-armed by an edit either).
+// before this key existed is compared against the target it names in its own
+// text (legacyMarkerCoversSpec) — never treated as complete or incomplete
+// wholesale, because both choices lose data or skip work for a real
+// population.
 func restoreCompletedForSpec(loop *coxv1alpha1.Loop) bool {
 	c := meta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.RestoreCondition)
 	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != coxv1alpha1.RestoreReasonRestored {
@@ -719,10 +738,77 @@ func restoreCompletedForSpec(loop *coxv1alpha1.Loop) bool {
 	}
 	_, rest, found := strings.Cut(c.Message, restoreSpecKeyMarker)
 	if !found {
-		return true // legacy marker (no key)
+		return legacyMarkerCoversSpec(loop, c.Message)
 	}
 	key, _, _ := strings.Cut(rest, "]")
 	return key == specRestoreKey(loop)
+}
+
+// legacyMarkerCoversSpec reports whether a keyless (pre-F35) Restored marker
+// covers the restore target the Loop's spec names now (F75, R32 I113(b)).
+//
+// The marker is not information-free: every completion since the restore
+// machinery landed writes the kind and the iteration it restored into the
+// message ("workspace PVC restored from <snap> (rollback, iter-3)"), and F35
+// only APPENDED its [spec-target=…] key to that same text. Comparing the
+// target the marker names with the spec's target distinguishes the cases a
+// blanket "keyless ⇒ incomplete when the spec names a target" rule cannot:
+//
+//   - a completed ROLLBACK whose spec.restoreFrom is still the target its
+//     marker names is COMPLETE. restoreFrom/forkOf are immutable and nothing
+//     clears restoreFrom after a rollback, so every Loop that completed a
+//     rollback or a fork on v0.1.1/v0.1.2 (which have B2 but not F35) is in
+//     exactly this shape: re-arming it deletes the workspace PVC and restores
+//     the old snapshot over everything done since, and announces it with an
+//     ordinary Restored Event — silent data loss on upgrade (pi3's P1);
+//   - a completed LOST-PVC restore plus a spec.restoreFrom set afterwards is
+//     INCOMPLETE: a lost-PVC restore does not vouch for a rollback, and the
+//     kinds differ in the text, which is what makes F75's actual defect
+//     detectable (a lost-PVC marker cannot cover a rollback target);
+//   - a marker whose target cannot be read is COMPLETE. A skipped rollback is
+//     recoverable (set the target again); a wiped workspace is not.
+func legacyMarkerCoversSpec(loop *coxv1alpha1.Loop, message string) bool {
+	// No spec target: the marker was written for a reactive (lost-PVC) restore
+	// and there is nothing in the spec for it to cover — complete, which is the
+	// behaviour the pre-F35 marker was written for.
+	if specRestoreKey(loop) == "" {
+		return true
+	}
+	kind, iteration, ok := legacyRestoreTarget(message)
+	if !ok {
+		return true // an unreadable target: prefer complete (see above)
+	}
+	if loop.Spec.ForkOf != nil {
+		return kind == b2KindFork && iteration == loop.Spec.ForkOf.Iteration
+	}
+	it, err := parseRestoreFrom(loop.Spec.RestoreFrom)
+	if err != nil {
+		return true // a malformed spec target names no restore that could run
+	}
+	return kind == b2KindRollback && iteration == it
+}
+
+// legacyRestoreTarget parses the target a pre-F35 marker recorded in its own
+// message: "… (<kind>, iter-<N>)". ok is false when the text does not carry
+// that parenthetical, so an unknown shape is never guessed at.
+func legacyRestoreTarget(message string) (kind b2Kind, iteration int, ok bool) {
+	i := strings.LastIndex(message, "(")
+	if i < 0 {
+		return "", 0, false
+	}
+	body, closed := strings.CutSuffix(message[i+1:], ")")
+	if !closed {
+		return "", 0, false
+	}
+	kindText, iterText, found := strings.Cut(body, ", iter-")
+	if !found || kindText == "" {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(iterText))
+	if err != nil || n < 0 {
+		return "", 0, false
+	}
+	return b2Kind(kindText), n, true
 }
 
 // setRestoreCondition sets the Restore condition (the B2 durable record)
@@ -900,6 +986,9 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	}
 	setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 		restoredMessage(loop, target))
+	// F77 (pin half): the restore replaced the workspace, so the verify pin and
+	// its tamper record describe work this PVC no longer holds.
+	pinCleared := clearVerifyPinAtRestore(loop)
 	// F48g: a completed restore is an episode boundary — the workspace the
 	// pre-restore run failed against no longer exists, so its sandbox-failure
 	// count must not consume the new run's budget and fail the new pod on its
@@ -909,8 +998,54 @@ func (r *LoopReconciler) b2ApplyLostPVCRestore(ctx context.Context, loop *coxv1a
 	clearSandboxInfraEpisode(loop)
 	persist()
 	r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
-		"workspace PVC restored from "+target.snapshot)
+		restoredEventMessage(target.snapshot, pinCleared))
 	return true, false, false, nil
+}
+
+// clearVerifyPinAtRestore drops the verify pin (status.currentVerify and
+// status.verify.verifiedCommit) and the tamper record written for it
+// (status.verify.tamperExitCode / tamperJobUID — R34 I119(c)) when a restore
+// completes (F77's pin half). The pin names a commit that the restored
+// workspace no longer contains: the rollback replaced the PVC from a snapshot,
+// so the evidence attached to the old pin describes work the restore threw
+// away. Two consequences, both intended:
+//
+//   - no deliver Job is created for the old pin. The deliver step
+//     (ensureDeliverJob) gates on deliveryRequested, which needs the pin, and
+//     the restore step runs BEFORE it in the same pass — so a delivery QUEUED
+//     before the rollback (the Loop was Succeeded with a pin and
+//     spec.delivery.mode PullRequest) is dropped rather than pushed. Delivering
+//     it would open a PR for the work the rollback just discarded. The
+//     completion's Normal Event names the clear, so the drop is visible.
+//   - the tamper record goes with the pin it was measured for: its exit code and
+//     Job UID cannot describe the restored workspace, and a stale record would
+//     be rendered into the next delivery body.
+//
+// Returns whether anything was cleared (for the completion Event's text).
+func clearVerifyPinAtRestore(loop *coxv1alpha1.Loop) bool {
+	cleared := loop.Status.CurrentVerify != nil
+	loop.Status.CurrentVerify = nil
+	if loop.Status.Verify != nil {
+		if loop.Status.Verify.VerifiedCommit != "" || loop.Status.Verify.TamperExitCode != nil ||
+			loop.Status.Verify.TamperJobUID != "" {
+			cleared = true
+		}
+		// The tamper record is per-pin (F83d's clearTamperRecord also clears
+		// verifiedCommit); a nil *VerifyStatus is a no-op.
+		clearTamperRecord(loop.Status.Verify)
+	}
+	return cleared
+}
+
+// restoredEventMessage is the Restored completion Event's text: the snapshot,
+// plus the pin-clear note when a verify pin was dropped (F77: the dropped
+// delivery is announced, not silent).
+func restoredEventMessage(snapshot string, pinCleared bool) string {
+	if !pinCleared {
+		return "workspace PVC restored from " + snapshot
+	}
+	return "workspace PVC restored from " + snapshot +
+		" (the verify pin and its tamper record were cleared: the restored workspace does not hold that verified commit, so no delivery is made for it)"
 }
 
 // sourceMissingDecision renders the Restore condition's (reason, message)
@@ -1012,6 +1147,11 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			}
 			setRestoreCondition(loop, true, coxv1alpha1.RestoreReasonRestored,
 				restoredMessage(loop, target))
+			// F77 (pin half): the rollback replaced the workspace, so the pin
+			// (and the tamper record written for it) belongs to discarded work.
+			// Dropping it here also stops a delivery queued before the rollback:
+			// the restore step runs before ensureDeliverAndSettle in this pass.
+			pinCleared := clearVerifyPinAtRestore(loop)
 			// F48g: a completed restore ends the sandbox-failure episode (the
 			// rollback's PVC is gone and is recreated from the snapshot), so the
 			// count the pre-rollback run accumulated does not carry into the
@@ -1019,7 +1159,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			clearSandboxInfraEpisode(loop)
 			persist()
 			r.emitRestoreEvent(loop, true, coxv1alpha1.RestoreReasonRestored,
-				"workspace PVC restored from "+target.snapshot)
+				restoredEventMessage(target.snapshot, pinCleared))
 			return true, false, false, nil
 		}
 		// Step 0: the Loop-owned verify and deliver Jobs must be STOPPED

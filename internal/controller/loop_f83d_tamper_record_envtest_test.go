@@ -17,6 +17,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -210,7 +211,7 @@ func TestVerifyInfraFailureMessageCarriesTheKubeletReason(t *testing.T) {
 		{Name: "check-0", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
 	}}}
 
-	msg := verifyInfraFailureMessage(pod, verifyTamperInit, 137, false)
+	msg := verifyInfraFailureMessage(pod, nil, verifyTamperInit, 137, false)
 	if !strings.Contains(msg, "reason OOMKilled") {
 		t.Errorf("the message must carry the kubelet's reason:\n%s", msg)
 	}
@@ -223,14 +224,35 @@ func TestVerifyInfraFailureMessageCarriesTheKubeletReason(t *testing.T) {
 	noReason := &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
 		{Name: "check-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
 	}}}
-	msg = verifyInfraFailureMessage(noReason, "check-0", 1, false)
+	msg = verifyInfraFailureMessage(noReason, nil, "check-0", 1, false)
 	if strings.Contains(msg, "reason") {
 		t.Errorf("no reason was recorded, so none may be rendered:\n%s", msg)
 	}
 
 	// The no-check case (a Failed Job with no terminated init) is unchanged.
-	if got := verifyInfraFailureMessage(nil, "", 0, false); !strings.Contains(got, "no check init terminated") {
+	if got := verifyInfraFailureMessage(nil, nil, "", 0, false); !strings.Contains(got, "no check init terminated") {
 		t.Errorf("the no-check message changed: %s", got)
+	}
+}
+
+// pi3 prereview-306 note 4: the deadline in the message is the JOB's own
+// spec.activeDeadlineSeconds, not this build's constant. A Job created by an
+// older build keeps the deadline it was created with, so the constant would
+// name a value that did not kill it.
+func TestVerifyInfraFailureMessageNamesTheJobsOwnDeadline(t *testing.T) {
+	job := &batchv1.Job{Spec: batchv1.JobSpec{ActiveDeadlineSeconds: new(int64(60))}}
+	msg := verifyInfraFailureMessage(nil, job, "", 0, true)
+	if !strings.Contains(msg, "(60s)") {
+		t.Fatalf("the message must name the Job's own deadline (60s):\n%s", msg)
+	}
+	if strings.Contains(msg, fmt.Sprintf("(%ds)", verifyJobActiveDeadlineSeconds)) {
+		t.Fatalf("the message must not substitute this build's constant (%ds) for the Job's value:\n%s",
+			verifyJobActiveDeadlineSeconds, msg)
+	}
+
+	// The constant is the fallback only when the Job snapshot is gone.
+	if got := verifyInfraFailureMessage(nil, nil, "", 0, true); !strings.Contains(got, fmt.Sprintf("(%ds)", verifyJobActiveDeadlineSeconds)) {
+		t.Fatalf("with no Job snapshot the constant is the only value available:\n%s", got)
 	}
 }
 

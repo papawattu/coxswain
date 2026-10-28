@@ -381,6 +381,56 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		Expect(requeue).To(BeTrue())
 	})
 
+	// pi3 prereview-306 note 5: the same decision driven through Reconcile with
+	// NO pod in the API — the shape a pod GC'd (or evicted) between the kill and
+	// the operator's read actually hits. The spec above pins the helper's half
+	// only; this one pins the call site (assert the decision Reconcile makes).
+	It("retries a deadline-killed Job whose pod is GONE (no pod to read, Reconcile-driven)", func() {
+		ns := f53Ns("f53-nopod")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f53nopod"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       s5aLoopSpec(),
+		})).To(Succeed())
+
+		recorder := record.NewFakeRecorder(64)
+		r := &LoopReconciler{CNIProber: testCNIProber(), Client: k8sClient, Scheme: k8sClient.Scheme(), apiReader: k8sClient, Recorder: recorder}
+		s5aDriveToVerifyingWithReconciler(r, ns, name)
+		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name}})
+		Expect(f53GetJob(ns, jobName)).NotTo(BeNil(), "the verify Job exists after the drive")
+
+		// Deliberately NO f53PlantPod: the pod is already gone.
+		f53JobFailed(ns, jobName, batchv1.JobReasonDeadlineExceeded)
+
+		fresh := s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"a deadline kill is a bounded retry, not a terminal failure")
+		Expect(fresh.Status.Verify).NotTo(BeNil())
+		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+			"the deadline kill is an infra attempt even with no pod to read")
+		Expect(f53GetJob(ns, jobName)).To(BeNil(),
+			"the deadline-killed Job is deleted so a fresh one is created")
+		// This assertion pins the deadlineExceeded value flowing from the Job
+		// condition into the operator-facing Event — NOT the deadline arm's
+		// position. pi3's early-344 round 2 corrected that: applyVerifyOutcome
+		// reads deadlineExceeded from the Job snapshot and passes the same bool to
+		// verifyInfraFailureMessage, so moving or deleting verifyOutcome's arm
+		// leaves this Event text unchanged (the generic body comes from
+		// failedCheck == "", not from which arm decided). The real mutation here is
+		// `deadlineExceeded := false` at that read: the decision still comes from
+		// jobFailed, the message falls back to "no check init terminated", and this
+		// assertion fails. The arm's ordering is pinned at the verifyOutcome seam
+		// (the "no pod at all" spec above), which is the only place it can be — a
+		// Job with reason DeadlineExceeded also satisfies isJobFailed, so no
+		// Reconcile-driven shape can separate the two arms.
+		events := f53Events(recorder)
+		Expect(events).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
+		Expect(events).To(ContainElement(ContainSubstring("activeDeadlineSeconds")),
+			"the retry Event must name the deadline, not the generic no-check-init failure")
+	})
+
 	It("does NOT decide when the Job failed for another reason and the pod is still starting (the I49 control)", func() {
 		ns := f53Ns("f53-control")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

@@ -942,6 +942,13 @@ func bumpMemoryWriteMetrics(outcome, summary string) {
 	memoryLessonsTotal.WithLabelValues("curator-drop").Add(float64(cur))
 }
 
+// summaryCappedEllipsis starts the memory writer's truncation marker line (F80,
+// cmd/memory-writer summaryTruncationMarker): "… N more lines (M lesson lines)".
+// The writer bounds its termination-message copy to 4000 bytes, under the
+// kubelet's silent 4096-byte cut, and drops whole lines with the per-lesson
+// lines first (F80b reads the M).
+const summaryCappedEllipsis = "…"
+
 // memoryWriteVerdicts counts the lessons of the writer's summary by verdict.
 // The summary's COUNTS line ("summary: total=N written=W dropped=D",
 // cmd/memory-writer summaryLine) is authoritative for kept and for the total
@@ -952,16 +959,37 @@ func bumpMemoryWriteMetrics(outcome, summary string) {
 // "curator unavailable" is a curator drop; the remaining drops (static policy,
 // ineligible outcome, duplicate) are static drops. A summary with no counts
 // line falls back to counting the per-lesson lines alone.
+//
+// F80b: the writer BOUNDS its termination message to 4000 bytes and cuts whole
+// lines, per-lesson lines first — exactly the lines the split is derived from.
+// So when its marker says per-lesson lines were cut, the split is derived from
+// the lines that survived and the total is NOT topped up by subtraction: the
+// drops of the cut lessons cannot be attributed (their reason lines are gone),
+// and pretending they were static drops (the pre-F80b behaviour) inflated
+// static-drop and deflated curator-drop with nothing to show for it. The marker
+// states how many lessons the split is missing.
 func memoryWriteVerdicts(summary string) (kept, static, curatorDrop int) {
 	var lineKept, lineStatic int
 	var written, dropped int
 	haveCounts := false
+	markerSeen, markerParsed, cutLessons := false, false, 0
 	for line := range strings.SplitSeq(summary, "\n") {
 		f := strings.Fields(line)
 		if len(f) == 4 && f[0] == "summary:" {
 			var w, d int
 			if _, err := fmt.Sscanf(strings.Join(f[1:], " "), "total=%d written=%d dropped=%d", new(int), &w, &d); err == nil {
 				written, dropped, haveCounts = w, d, true
+			}
+			continue
+		}
+		if len(f) >= 4 && f[0] == summaryCappedEllipsis && f[2] == "more" && f[3] == "lines" {
+			// The writer's truncation marker: "… N more lines (M lesson lines)".
+			markerSeen = true
+			if len(f) > 4 {
+				var n int
+				if _, err := fmt.Sscanf(strings.Join(f[4:], " "), "(%d lesson lines)", &n); err == nil {
+					cutLessons, markerParsed = n, true
+				}
 			}
 			continue
 		}
@@ -982,6 +1010,12 @@ func memoryWriteVerdicts(summary string) (kept, static, curatorDrop int) {
 	}
 	if !haveCounts {
 		return lineKept, lineStatic, curatorDrop
+	}
+	if markerSeen && (!markerParsed || cutLessons > 0) {
+		// A marked summary with per-lesson lines cut (or a marker we cannot
+		// read, which is the same uncertainty): count the split from the lines
+		// present rather than inventing static drops for the cut ones.
+		return written, lineStatic, curatorDrop
 	}
 	static = max(dropped-curatorDrop, 0)
 	return written, static, curatorDrop
@@ -1014,7 +1048,10 @@ func memoryWriteAuditMessage(summary string) string {
 // cut loses the per-lesson lines first. The cut is LINE-oriented: whole lines
 // are kept up to 1000 bytes, then " … N more lines" says how many were
 // dropped; there is never a half line. The Event's message is capped by
-// client-go (1024 bytes); the Job's summary is bounded to 4096 bytes. The
+// client-go (1024 bytes); the Job's termination-message summary is bounded to
+// 4000 bytes BY THE WRITER, and this copy is then cut to the 1000 here (F80:
+// the writer's bound is what makes the first cap reachable — the kubelet cuts
+// silently at 4096). The
 // per-lesson lines are sha-prefix + status + rule, where a curator reason is
 // model text (see memoryWriteAuditMessage).
 //

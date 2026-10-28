@@ -143,7 +143,10 @@ var (
 	// coxswain_memory_lessons_total counts the lessons in a successful write's
 	// summary by verdict: kept (written), static-drop (any drop not made by the
 	// curator: static policy, ineligible outcome, duplicate), curator-drop (the
-	// curator dropped it or was unavailable).
+	// curator dropped it or was unavailable). When the writer capped the summary
+	// (F80/F80b) the counts line still gives kept and the total dropped, but the
+	// drop split covers only the per-lesson lines that survived the cut — see
+	// memoryWriteVerdicts.
 	memoryLessonsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "coxswain_memory_lessons_total",
 		Help: "Total lessons in memory-writer summaries, by verdict (kept|static-drop|curator-drop).",

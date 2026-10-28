@@ -234,7 +234,7 @@ func TestVerifyInfraFailureMessageCarriesTheKubeletReason(t *testing.T) {
 		}}},
 		Status: pod.Status,
 	}
-	msg = verifyInfraFailureMessage(withLimit, verifyTamperInit, 137, false)
+	msg = verifyInfraFailureMessage(withLimit, nil, verifyTamperInit, 137, false)
 	if !strings.Contains(msg, "verify init tamper was OOM-killed at its 1Gi memory limit") {
 		t.Errorf("the message must name the applied memory limit:\n%s", msg)
 	}

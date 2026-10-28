@@ -977,17 +977,28 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 	backoff := int32(0)
 	deadline := deliverJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
+	deliverJobFalse := false
 	return batchv1.JobSpec{
 		BackoffLimit:          &backoff,
 		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: deliverJobLabels(loop.Name)},
 			Spec: corev1.PodSpec{
-				RestartPolicy:      never,
-				ServiceAccountName: "",
-				Volumes:            volumes,
-				InitContainers:     inits,
-				Containers:         []corev1.Container{main},
+				RestartPolicy: never,
+				// F66: the deliver Job's containers run agent-chosen code
+				// (clone-base, import-agent fetch from the agent's repo and the
+				// push runs the agent's tree). They make no API calls, so no
+				// token belongs in them. D12 (REVIEW-PHASE0-R4.md:130) names the
+				// VERIFY Job; this is the deliberate extension to the deliver Job
+				// — it also holds the push credential, so it is the last pod that
+				// should carry an API token. Without the field the DEFAULT SA's
+				// token was mounted into those containers alongside that
+				// credential.
+				ServiceAccountName:           "",
+				AutomountServiceAccountToken: &deliverJobFalse,
+				Volumes:                      volumes,
+				InitContainers:               inits,
+				Containers:                   []corev1.Container{main},
 			},
 		},
 	}

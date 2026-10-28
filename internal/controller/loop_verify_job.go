@@ -888,17 +888,28 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	backoff := int32(0)
 	deadline := verifyJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
+	verifyJobFalse := false
 	return batchv1.JobSpec{
 		BackoffLimit:          &backoff,
 		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: verifyJobLabels(loop.Name)},
 			Spec: corev1.PodSpec{
-				RestartPolicy:      never,
-				ServiceAccountName: "",
-				Volumes:            volumes,
-				InitContainers:     inits,
-				Containers:         []corev1.Container{mainCt},
+				RestartPolicy: never,
+				// F66: the Job's containers run agent-chosen code (check-* runs
+				// the agent's tests, import-agent its repo). They make no API
+				// calls, so no token belongs in them. This is not a tidiness
+				// choice: D12 (REVIEW-PHASE0-R4.md:130) decided it and ADR-0005
+				// §D12 states it (docs/adr/0005-operator-verifies-via-isolated-job.md:164)
+				// — "the Job gets: automountServiceAccountToken: false,
+				// read-only clone credentials only". Without it the DEFAULT SA's
+				// token was mounted into those containers, so the verify Job
+				// contradicted D12 for as long as it has existed.
+				ServiceAccountName:           "",
+				AutomountServiceAccountToken: &verifyJobFalse,
+				Volumes:                      volumes,
+				InitContainers:               inits,
+				Containers:                   []corev1.Container{mainCt},
 			},
 		},
 	}

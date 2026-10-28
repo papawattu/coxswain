@@ -855,7 +855,6 @@ closed by the PRs named beside them. In plain words, the items still open:
 - **F60**: there is no "canary" control check that is required to fail — a
   passing canary would mean the checks were tampered with, but nothing
   detects that.
-- **F63**: blocked agent actions are not recorded in the audit log.
 
 **P2:**
 

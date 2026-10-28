@@ -79,7 +79,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
 ## P2
 
-- [ ] **I119: the tamper gate is dead, and F83 made it unreachable**
+- [x] **I119: the tamper gate is dead, and F83 made it unreachable** (`b729cf4` (#264), `347c07c` (#274))
 
   **Where:** `internal/controller/loop_controller.go:1241-1276`
   (`applyTamperGate`), `:1278-1293` (`tamperPodConfirms`), its call order
@@ -242,7 +242,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   Loop's snapshot), the three P3s each with a spec or an accepted residual, and a
   decision recorded for the fork-ownership rule.
 
-- [ ] **I124: F87 — three guards that do not run, and one status consumer F47 left behind**
+- [x] **I124: F87 — three guards that do not run, and one status consumer F47 left behind** (`058529c` (#284), `defc770` (#285), `98db918` (#286), `23c0d23` (#289))
 
   **Where:** `hack/chart-check.sh` (not wired into `make test`; `Makefile:74` is
   the `test` target, `:100` the separate `chart-check` target),
@@ -328,7 +328,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   switch; `find ~/projects -maxdepth 2 -name .samples -type d` returns only
   `coxswain/.samples`; the round record states the open review/doc count.
 
-- [ ] **I127 (F84b): what F84 left behind — one hold at a time, no terminal clear, and five stale sentences**
+- [x] **I127 (F84b): what F84 left behind — one hold at a time, no terminal clear, and five stale sentences** (`74d4a03` (#265), `01b7b28` (#277))
 
   **Where:** `docs/TROUBLESHOOTING.md:712-715` (the "surfaced as
   `ModelProxyNotReady`" sentence), `:755-759` ("a restarted or crashed proxy pod

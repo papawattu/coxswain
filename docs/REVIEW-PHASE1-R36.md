@@ -81,7 +81,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
 ## P2
 
-- [ ] **I133: a reason that is not empty and still cannot be stored wedges the same status write**
+- [x] **I133: a reason that is not empty and still cannot be stored wedges the same status write** (`8b55779` (#275))
 
   **Where:** `loop_s4_phase.go:1569-1571` (the fallback tests `reason == ""`
   only); `:1552-1558` (the pod-level reason overrides the container's); the
@@ -119,7 +119,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   fails today at the status update and passes after. The comment at
   `loop_controller.go:5441-5443` is then either true or scoped.
 
-- [ ] **I134: the A2 empty-workspace fallback rebuilds the workspace and keeps the count**
+- [x] **I134: the A2 empty-workspace fallback rebuilds the workspace and keeps the count** (`5d44419` (#273))
 
   **Where:** `loop_restore.go:1065-1082` (the `b2KindLostPVC` default arm);
   `:1077` (`Restore=False/NoUsableCheckpoint`), `:1078` (`persist`), `:1081`
@@ -151,7 +151,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
 ## P3
 
-- [ ] **I135: the new reason guard is invisible to the one comparator that reads a stored reason**
+- [x] **I135: the new reason guard is invisible to the one comparator that reads a stored reason** (`8b55779` (#275))
 
   **Where:** `loop_controller.go:1332-1339` (`networkEnforcedChanged`), its
   callers at `:5264-5267` and `:5353-5356`, and the guard at `:5441-5446`;
@@ -183,7 +183,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
   **Acceptance:** a stubbed `Prober` returning an empty reason, two reconciles,
   and one `NetworkEnforced` Event in total.
 
-- [ ] **I136: the release surface for a terminal mount failure and the new status field**
+- [x] **I136: the release surface for a terminal mount failure and the new status field** (`a9d8605` (#278))
 
   **Where:** `docs/UPGRADE.md` (no `SandboxFailed`, `infraAttempts` or
   `infraEpisode` line; its last section is `## Stricter Secret-name validation

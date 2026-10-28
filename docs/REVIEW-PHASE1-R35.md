@@ -157,7 +157,7 @@ A bare `loop_*.go` or `loop_*_test.go` name is under `internal/controller/`;
 
 ## P3
 
-- [ ] **I130: what F48b left behind (F48f)**
+- [x] **I130: what F48b left behind (F48f)** (`d7c421d` (#282))
 
   **Where:** `loop_s4_phase.go:1181-1256` (the Events read and its in-memory
   filter), `:1189-1191` (the no-field-selector comment), `:1262-1300` (the

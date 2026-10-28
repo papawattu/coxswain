@@ -64,8 +64,8 @@ was run.
 
 ## P2
 
-- [ ] **I104: the D71 memory cap was decided and never built, and the reviewer's
-  Phase 5 acceptance missed it**
+- [x] **I104: the D71 memory cap was decided and never built, and the reviewer's
+  Phase 5 acceptance missed it** (`aeb3d55` (#233))
 
   **Where:** `docs/PLAN-PHASE5.md:419-424` and `:479` (D71 (a): evict the
   oldest; "enforced by the writer Job (P5b) with a spec").
@@ -86,7 +86,7 @@ was run.
   **Acceptance:** F32 merged with a spec in which a 101st lesson evicts the
   oldest. The next phase acceptance lists each D-item with its code citation.
 
-- [ ] **I105: specs that cannot fail, or that assert the bug**
+- [x] **I105: specs that cannot fail, or that assert the bug** (`dc628a5` (#210), `daf4cd6` (#214), `4869cb9` (#290), `2cd3040` (#294))
 
   **Where:** `.samples/review-tests/FINDINGS.md` (25 gate mutations judged).
 
@@ -107,7 +107,7 @@ was run.
 
 ## P3
 
-- [ ] **I106: drift between docs/samples and the code**
+- [x] **I106: drift between docs/samples and the code** (`63679f1` (#249), `96d04e6b` (#252), `3eaf998` (#292))
 
   **Where:** `.samples/doc-drift/REPORT.md`, `.samples/doc-drift-2/REPORT.md`.
 

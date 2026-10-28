@@ -58,6 +58,11 @@ import (
 // observable is answered with the same resourceVersion, so counting writes is
 // the only way a spec can see the difference between "no write" and "a write
 // that happened to be a no-op at the storage layer".
+//
+// The trigger is the object's TYPE as well as its name: the egress proxy Pod
+// and the egress proxy Service are both derivedName(loop, "-egress-proxy"), so a
+// name-only match would also count writes to the Pod (and a failure would name
+// the Service). Only *corev1.Service is counted.
 type egressSvcWriteCounter struct {
 	client.Client
 	namespace string
@@ -65,9 +70,13 @@ type egressSvcWriteCounter struct {
 	creates   int
 	updates   int
 	patches   int
+	deletes   int
 }
 
 func (c *egressSvcWriteCounter) counts(obj client.Object) bool {
+	if _, ok := obj.(*corev1.Service); !ok {
+		return false
+	}
 	return obj.GetNamespace() == c.namespace && obj.GetName() == c.name
 }
 
@@ -90,6 +99,13 @@ func (c *egressSvcWriteCounter) Patch(ctx context.Context, obj client.Object, pa
 		c.patches++
 	}
 	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func (c *egressSvcWriteCounter) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if c.counts(obj) {
+		c.deletes++
+	}
+	return c.Client.Delete(ctx, obj, opts...)
 }
 
 const (
@@ -303,7 +319,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 	// resourceVersion unchanged (a no-op), while a real input change (the
 	// network allows) still updates it (the test norms: same-Loop, assert the
 	// object is updated when the input changes).
-	It("a no-op reconcile leaves the egress proxy Service resourceVersion UNCHANGED (F11, no reconcile storm)", func() {
+	It("a no-op reconcile issues no write to the egress proxy Service and leaves its resourceVersion UNCHANGED (F11, no reconcile storm)", func() {
 		ns := "f11-svc-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
@@ -380,6 +396,7 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 		counter := &egressSvcWriteCounter{Client: r.Client, namespace: ns, name: name + "-egress-proxy"}
 		origClient := r.Client
 		r.Client = counter
+		defer func() { r.Client = origClient }()
 		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		r.Client = origClient
 		Expect(err).NotTo(HaveOccurred())
@@ -389,6 +406,8 @@ var _ = Describe("I42b: ensureEgressProxy", func() {
 			"a no-op reconcile must not UPDATE the egress proxy Service (CreateOrUpdate must return OperationResultNone)")
 		Expect(counter.patches).To(BeZero(),
 			"a no-op reconcile must not PATCH the egress proxy Service (CreateOrUpdate must return OperationResultNone)")
+		Expect(counter.deletes).To(BeZero(),
+			"a no-op reconcile must not DELETE the egress proxy Service")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name + "-egress-proxy"}, svc)).To(Succeed())
 		Expect(svc.ResourceVersion).To(Equal(rv1),
 			"a no-op reconcile must leave the egress proxy Service UNCHANGED (no reconcile storm)")

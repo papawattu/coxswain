@@ -858,8 +858,6 @@ closed by the PRs named beside them. In plain words, the items still open:
 
 **P2:**
 
-- **F82**: F44 follow-ups — two unspecced lines and three stale stream
-  comments (PR #248's run).
 - **F47 follow-ups** (F47 itself closed by #254): the fork path still
   derives its source snapshot from `spec.forkOf` with no ownership check,
   and the `ensureCheckpoint` idempotency guard and the tamper gate's
@@ -872,8 +870,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   "reached"; a missing checker leaves the gate open.
 - **F64**: the port-enforcement guarantee has no automated proof (the specs
   asserting a blocked `host:PORT` is actually blocked were never written).
-- **F65**: runtime-pulled images are tag-pinned only; the image that mounts
-  the git credential should be pinned by digest.
 - **F68**: `spec.workspace.ref` and `spec.verify.acceptanceChecks` are
   unvalidated, so a crafted value can reach the credentialed scripts.
 - **F71**: the from-source build commands in `docs/QUICKSTART.md` §9 are
@@ -892,13 +888,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   complete for any target (F75), a failed fork-retention label SET that is
   not retried although the doc says it is (F76), and a rollback whose
   post-state is undefined (F77) (PR #238's run).
-- **F80**: the memory writer's summary field is not size-bounded by the
-  operator: `MemoryWritten.summary` carries the audit text (which can
-  include a whole lesson line quoted in a curator reason), and Kubernetes
-  truncates Event message strings at 4096 bytes without marking the cut, so
-  a summary longer than that silently loses its tail (the operator-side
-  1000-byte audit cut, F33/F78, bounds the audit text only — the condition
-  message can exceed it when a quoted lesson line is long).
 - **F81**: an envtest spec is flaky: a hard-coded ClusterIP it depends on is
   not a stable address across apiservers, so the run intermittently fails.
 

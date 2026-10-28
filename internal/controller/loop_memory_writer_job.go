@@ -692,16 +692,22 @@ func (r *LoopReconciler) ensureMemoryWriterServiceAccount(ctx context.Context, n
 	return nil
 }
 
-// recordMemoryWriterOutcome reads the memory-writer Job's pod's terminal
-// phase + the bounded summary (the termination message) and records the
-// outcome on the Loop's MemoryWriteDone condition. Returns (requeue): true
-// when there is no decision yet: a pod read error, or the Job is still in
-// progress (its pod is absent or not yet terminal, and the Job has neither a
-// Complete nor a Failed condition); false when a terminal outcome was
-// recorded. With a pod, its phase decides (Succeeded -> MemoryWritten, Failed
-// -> MemoryWriteFailed); with NO pod (pod GC, eviction, an admission reject),
-// the Job's own Complete/Failed condition decides (F31,
-// recordMemoryWriterOutcomeNoPod).
+// recordMemoryWriterOutcome records the memory-writer Job's outcome on the
+// Loop's MemoryWriteDone condition. Returns (requeue): true when there is no
+// decision yet (the Job is in progress: no Failed condition, and either no pod
+// or a pod that is not terminal); false when a terminal outcome was recorded.
+//
+// The Job's own conditions are read FIRST (F73). The batch controller stamps
+// Failed when the Job is over — DeadlineExceeded when activeDeadlineSeconds
+// kills a pod that never became terminal, BackoffLimitExceeded, ... — and that
+// decides the outcome whether or not a pod is still there: a pod stuck in
+// CreateContainerConfigObject stays Pending for ever, so deciding from the pod
+// first hot-loops on it and never records MemoryWriteDone. Otherwise the pod
+// decides by its phase (Succeeded -> MemoryWritten, Failed -> MemoryWriteFailed)
+// and, with no pod at all (pod GC, eviction, an admission reject), the Job's
+// Complete condition does (F31, recordMemoryWriterOutcomeNoPod). A pod read
+// error is not a decision: it falls through to the same Job-condition read, so a
+// finished Job is still recorded while the pod list is failing (F73).
 //
 // A Succeeded Job is MemoryWritten (the write completed — whether or not
 // any lesson was eligible; a zero-eligible write is a valid "nothing to
@@ -709,30 +715,31 @@ func (r *LoopReconciler) ensureMemoryWriterServiceAccount(ctx context.Context, n
 // MemoryWriteFailed (a Warning Event surfaces the failure; the Loop still
 // Succeeds, ADR-0004).
 func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *coxv1alpha1.Loop, job *batchv1.Job) bool {
+	if jobTerminalCondition(job, batchv1.JobFailed) != nil {
+		// F73(a): a Job the batch controller failed is decided here, before the
+		// pod is read — the DeadlineExceeded case leaves a pod behind that may
+		// never reach a terminal phase.
+		r.recordMemoryWriterFailure(loop, job)
+		return false
+	}
 	pod, err := r.readMemoryWriterJobPod(ctx, loop, job)
 	if err != nil {
-		// A pod read error (the pod is gone, the read failed): requeue (the
-		// Job may be creating the pod; a transient error is not a terminal
-		// outcome).
-		return true
+		// F73(b): a pod read error is not a decision. Fall through to the Job's
+		// own conditions (a Job that has finished must still be recorded while
+		// the pod list is failing); with neither condition this requeues.
+		return r.recordMemoryWriterOutcomeNoPod(loop, job, err)
 	}
 	if pod == nil {
 		// F31: no pod. Either the batch controller has not created it yet (the
 		// Job has neither condition: no decision, requeue), or the Job is
 		// already terminal and its pod is gone (pod GC, eviction, an admission
-		// reject). Decide from the Job's own Complete/Failed conditions rather
-		// than requeueing forever.
-		return r.recordMemoryWriterOutcomeNoPod(loop, job)
+		// reject). Decide from the Job's own Complete condition rather than
+		// requeueing forever (a Failed Job was decided above).
+		return r.recordMemoryWriterOutcomeNoPod(loop, job, nil)
 	}
-	// The Job's terminal state (the batch Job's conditions: Complete or
-	// Failed). The pod's phase is the authoritative signal (the Job's
-	// conditions are updated by the batch controller after the pod
-	// terminates). The Job's own conditions are the direct record of a
-	// deadline fail: the activeDeadlineSeconds kill (reason DeadlineExceeded
-	// — the hung-writer-pod fix) is a Job-level condition the batch
-	// controller stamps when the pod never became terminal; the condition's
-	// message names the deadline so the review sees the hang.
-	deadlineExceeded := jobHasConditionReason(job, batchv1.JobFailed, batchv1.JobReasonDeadlineExceeded)
+	// The Job's pod is not terminal, so the pod's phase is the authoritative
+	// signal (the Job's conditions are updated by the batch controller after the
+	// pod terminates — a Failed condition was decided above).
 	podPhase := pod.Status.Phase
 	// The bounded summary (the termination message). The container's
 	// TerminationMessagePolicy is FallbackToLogsOnError, so a pod that crashed
@@ -769,24 +776,12 @@ func (r *LoopReconciler) recordMemoryWriterOutcome(ctx context.Context, loop *co
 		return false
 
 	case corev1.PodFailed:
-		// The Job's pod failed: a write failure. Record MemoryWriteFailed +
-		// a Warning Event (the Loop still Succeeds, ADR-0004). When the
-		// failure is the activeDeadlineSeconds deadline (reason
-		// DeadlineExceeded — the hung-writer-pod fix: a pod stuck in
-		// CreateContainerConfigError etc. that the deadline killed), the
-		// condition's message names the deadline so the review sees the
-		// hang, not just a generic failure.
-		msg := "memory write failed (the Job's pod failed; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
-		if deadlineExceeded {
-			msg = "memory write failed (the Job hit its activeDeadlineSeconds deadline — the pod never became terminal; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
-		}
-		if setMemoryWriterCondition(loop, memoryWriteFailedReason, msg) {
-			r.notePendingMemoryMetric(loop, "failed", "") // F30: once, after persist.
-		}
-		if r.Recorder != nil {
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
-				"memory write failed: the memory-writer Job's pod failed (%s)", memoryWriterJobName(loop))
-		}
+		// The Job's pod failed: a write failure (the Loop still Succeeds,
+		// ADR-0004). The Job's own Failed condition is not stamped yet in this
+		// branch (the batch controller lags the pod), so the message is the
+		// generic one; recordMemoryWriterFailure reads the condition anyway and
+		// names the reason when the batch controller has caught up.
+		r.recordMemoryWriterFailure(loop, job)
 		return false
 	default:
 		// The pod is not yet terminal (Pending / Running): requeue.
@@ -843,20 +838,44 @@ func podOwnedByJobUID(pod *corev1.Pod, jobUID types.UID) bool {
 	return false
 }
 
-// jobHasConditionReason reports whether the Job's status carries the given
-// condition type (ConditionTrue) with the given reason (the deadline-fail
-// detection: Failed/DeadlineExceeded — the batch controller stamps it when
-// activeDeadlineSeconds elapses without the Job completing). An absent
-// condition is false (the envtest specs stamp the condition themselves
-// because envtest has no batch controller).
-func jobHasConditionReason(job *batchv1.Job, condType batchv1.JobConditionType, reason string) bool {
-	for i := range job.Status.Conditions {
-		c := &job.Status.Conditions[i]
-		if c.Type == condType && c.Status == corev1.ConditionTrue && c.Reason == reason {
-			return true
+// recordMemoryWriterFailure records MemoryWriteFailed for a memory-writer Job
+// that failed, from the Job's own Failed condition when the batch controller has
+// stamped one (F73(a): a Job that failed while its pod was still Pending or
+// Running) and generically from the pod phase otherwise (F73(c): the pod fails
+// first, so the Job's condition lags it). The message names the Job's reason —
+// DeadlineExceeded keeps the hung-writer-pod wording that names
+// activeDeadlineSeconds — and the metric AND the Warning Event fire only on the
+// condition transition, so a re-reconcile of the same failure re-emits neither
+// (F73(c); the metric was already gated by F30).
+func (r *LoopReconciler) recordMemoryWriterFailure(loop *coxv1alpha1.Loop, job *batchv1.Job) {
+	cond := jobTerminalCondition(job, batchv1.JobFailed)
+	var msg, detail string
+	switch {
+	case cond == nil:
+		msg = "memory write failed (the Job's pod failed; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
+		detail = "the memory-writer Job's pod failed"
+	case cond.Reason == batchv1.JobReasonDeadlineExceeded:
+		msg = "memory write failed (the Job hit its activeDeadlineSeconds deadline — the pod never became terminal; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)"
+		detail = "the memory-writer Job hit its activeDeadlineSeconds deadline"
+	default:
+		reason := cond.Reason
+		if reason == "" {
+			reason = "unknown"
+		}
+		reasonDetail := ""
+		if cond.Message != "" {
+			reasonDetail = ": " + cond.Message
+		}
+		msg = fmt.Sprintf("memory write failed (the Job failed with reason %s%s; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)", reason, reasonDetail)
+		detail = fmt.Sprintf("the memory-writer Job failed (reason %s)", reason)
+	}
+	if setMemoryWriterCondition(loop, memoryWriteFailedReason, msg) {
+		r.notePendingMemoryMetric(loop, "failed", "") // F30: once, after persist.
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
+				"memory write failed: %s (%s)", detail, memoryWriterJobName(loop))
 		}
 	}
-	return false
 }
 
 // setMemoryWriterCondition records the memory-writer outcome on the Loop's
@@ -1132,34 +1151,30 @@ func (r *LoopReconciler) reconcileP5bMemoryWriter(ctx context.Context, loop *cox
 }
 
 // recordMemoryWriterOutcomeNoPod decides the outcome of a memory-writer Job
-// that has no pod, from the Job's own terminal conditions (F31). Failed ->
-// MemoryWriteFailed naming the Job's reason; Complete -> MemoryWritten with no
-// summary (the pod, and with it the termination message, is gone). A Job with
-// neither condition is still in progress: no decision (requeue).
-func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, job *batchv1.Job) bool {
-	if c := jobTerminalCondition(job, batchv1.JobFailed); c != nil {
-		reason := c.Reason
-		if reason == "" {
-			reason = "unknown"
-		}
-		msg := fmt.Sprintf("memory write failed (the Job failed with reason %s and has no pod; the Loop still Succeeds — ADR-0004 a failed memory write does not fail the Loop)", reason)
-		if setMemoryWriterCondition(loop, memoryWriteFailedReason, msg) {
-			r.notePendingMemoryMetric(loop, "failed", "")
-		}
-		if r.Recorder != nil {
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, memoryWriteFailedReason,
-				"memory write failed: the memory-writer Job failed (%s, reason %s) and has no pod", memoryWriterJobName(loop), reason)
-		}
-		return false
-	}
+// whose pod was not read, from the Job's own terminal conditions (F31). Complete
+// -> MemoryWritten with no summary (the pod, and with it the termination
+// message, is unavailable). A Failed Job is decided before the pod is read (F73,
+// recordMemoryWriterFailure), so a Job with no condition left here is still in
+// progress: no decision (requeue).
+//
+// podReadErr distinguishes the two ways a pod is unavailable without claiming a
+// cause the operator did not observe (I76): nil = the list succeeded and held no
+// pod for this Job (gone — GC, eviction, an admission reject); non-nil = the
+// list itself failed (F73(b): the Job is still decided rather than requeueing
+// for ever, and the message and Event name the read error).
+func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, job *batchv1.Job, podReadErr error) bool {
 	if jobTerminalCondition(job, batchv1.JobComplete) != nil {
-		// N1: nobody read the pod (it is gone), so do not claim it succeeded.
-		const msg = "memory write completed (the Job is Complete; its pod is gone, so no per-lesson audit summary is available)"
+		// N1: nobody read the pod, so do not claim it succeeded.
+		msg := "memory write completed (the Job is Complete; its pod is gone, so no per-lesson audit summary is available)"
+		eventMsg := "memory write completed: the memory-writer Job is Complete but its pod is gone, so no per-lesson audit summary is available"
+		if podReadErr != nil {
+			msg = fmt.Sprintf("memory write completed (the Job is Complete; its pod could not be read: %v — no per-lesson audit summary is available)", podReadErr)
+			eventMsg = fmt.Sprintf("memory write completed: the memory-writer Job is Complete and its pod could not be read: %v — no per-lesson audit summary is available", podReadErr)
+		}
 		if setMemoryWriterCondition(loop, memoryWrittenReason, msg) {
 			r.notePendingMemoryMetric(loop, "written", "")
 			if r.Recorder != nil {
-				r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason,
-					"memory write completed: the memory-writer Job is Complete but its pod is gone, so no per-lesson audit summary is available (%s)", memoryWriterJobName(loop))
+				r.Recorder.Eventf(loop, corev1.EventTypeNormal, memoryWrittenReason, "%s (%s)", eventMsg, memoryWriterJobName(loop))
 			}
 		}
 		return false

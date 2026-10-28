@@ -62,6 +62,19 @@ override is yours to pin.
 
 ## Security fixes
 
+### F68: `spec.workspace.ref` and `spec.verify.acceptanceChecks` validated at admission — #332
+
+- **What was wrong.** Both values are interpolated into the verify and deliver scripts (shell-quoted since F37), so a crafted `spec.workspace.ref` or `spec.verify.acceptanceChecks` entry reached the credentialed scripts with no gate. `ref` was unbounded in length and charset, and a dash-leading ref-shaped argument is parsed by git as an **option** — a ref of `--upload-pack=/bin/true` makes the credentialed `git fetch origin <ref>` run that program (measured in `.samples/f68/01-ref-option-parse.txt`) (F68, PR #332, merged `911d2c6`).
+- **What changed.** Admission now bounds four fields: `spec.workspace.ref` (at most 255 characters, a git ref-name charset `[A-Za-z0-9._/@+]` and `-`, no leading dash, **empty stays valid** — it means the repo's default branch); `spec.verify.acceptanceChecks[]` (at most 16 entries, each 1–4096 characters and non-blank; contents otherwise free — a check is a shell command and quoting is `shellQuote`' job); and `spec.delivery.baseBranch` / `spec.delivery.branchPrefix` (the same no-leading-dash first class, since `baseBranch` is interpolated into the deliver Job's `git fetch origin <base>`). A finalizer-removal `Update` rejected as `Invalid` (a stored spec that no longer passes admission) is surfaced with a `FinalizerRemovalBlocked` Warning Event and a slow 5-minute requeue rather than the error backoff (PR #332). The CRD schema changed (`config/crd/bases/coxswain.wattu.com_loops.yaml`, chart CRD synced, both envtest testdata copies updated).
+- **On upgrade.** Apply the new `config/crd` (or chart) so the bounds take effect; nothing is migrated and no Loop is changed by the upgrade. An existing Loop outside these bounds behaves differently by API server version: on Kubernetes 1.30+ (CRD validation ratcheting) an update that does not change the offending field is still admitted, so such a Loop keeps running and can still be deleted; on an older API server every update is rejected (422 Invalid), which freezes the Loop — its status cannot be written and on delete its checkpoint finalizer cannot be removed, so it sits in `Terminating`. The remediation is to patch the offending field to a valid value (that update is valid); see `docs/UPGRADE.md`, "Stricter `ref`, `acceptanceChecks` and delivery-branch validation (F68)" (PR #332).
+
+### F58: the verify Job's containers are resource-bounded, and an OOM-killed check is an infra failure — #322
+
+- **What was wrong.** The verify Job runs the agent's own code (the `check-*` containers run the acceptance checks, `go test` over the agent's tree) and declared no resources, so its pod was BestEffort — the first pod the kubelet evicts under node pressure, and an unbounded check could take the node with it; both emptyDirs were unbounded too (PR #322, merged `17be3ba`).
+- **Who could exploit it, and how.** A Loop author whose checks run unbounded could take the node (and the sandbox on it) under memory pressure, and a check could not be told apart from an infrastructure failure when the node had no headroom left (PR #322).
+- **What changed.** Every container in the verify Job now carries CPU and memory requests **and** limits (trusted inits `100m/128Mi` → `1/1Gi`; `check-*` `250m/256Mi`/`1Gi` → `2/2Gi`/`2Gi`; the no-op main `10m/16Mi` → `100m/64Mi`). The knob is the new `spec.verify.resources` (`*corev1.ResourceRequirements`), applied to the `check-*` containers **only** and merged **per resource name** over the operator defaults: lowering a limit lowers the matching request with it, raising a request alone changes nothing, and `claims` is accepted by the schema but ignored. Each per-check `/tmp` scratch gets a `1Gi` `SizeLimit`; the `verify` checkout emptyDir stays unbounded on purpose (its size is the user's repository) (PR #322). An OOM-killed check is now an infrastructure failure: the check scan reads `Terminated.Reason` as well as `ExitCode`, and the kubelet's `OOMKilled` maps to a bounded infra retry (`VerifyInfraRetry`, then `VerifyInfraFailed` at the bound) before the `code != 0` iterate — no iteration burned, no stall entry; the message names the applied memory limit and the field that raises it. Exit `137` with any other reason (a check that `kill -9`s itself) still iterates (PR #322).
+- **On upgrade.** `spec.verify.resources` is a new CRD field: apply the new `config/crd` (or chart) so it is available. Nothing else is required for an existing Loop whose checks fit cpu `2` / memory `2Gi` and write less than `1Gi` into `/tmp`; a heavier build sets `spec.verify.resources` (e.g. `limits.memory: 4Gi`). A check that legitimately needs more than `1Gi` of scratch cannot raise it yet — that bound is a follow-up field; write less, or clean up as you go (PR #322; `docs/UPGRADE.md`, "The verify Job's containers are resource-bounded").
+
 ### F66: no ServiceAccount token in the verify and deliver Job pods — #330
 
 - **What was wrong.** The two Job pod builders left `AutomountServiceAccountToken` unset with `ServiceAccountName: ""`, which selects the namespace's **default** ServiceAccount and mounts its token at `/var/run/secrets/kubernetes.io/serviceaccount` — in the very pods whose containers run agent-chosen commands (the verify `check-*` and `import-agent` containers; the deliver `clone-base`/`import-agent`/`push` containers, beside the mounted git credential). This contradicted D12, which had already fixed the verify Job as `automountServiceAccountToken: false` with read-only clone credentials only (`docs/REVIEW-PHASE0-R4.md:130`, ADR-0005 §D12): the verify Job had carried a token it was decided not to carry, for as long as it had existed (PR #330, merged `26a831f`).
@@ -266,6 +279,18 @@ override is yours to pin.
   read) is closed by this fix.
 
 ## Other changes
+
+### F64: `PolicyTranslationLossy` reports a port nothing carries — #325
+
+- **What was wrong.** The `PolicyTranslationLossy` condition could report a `host:PORT` allow as lost (or report none) even though no layer actually carried that port's enforcement: the decision keyed on the egress proxy being *expected* rather than on any carrier existing and ready, and the model-endpoint half was not consulted (F64, PR #325, merged `54b3786`).
+- **What changed.** `translationLossAllows` now returns the allows whose port **no layer carries**, split by cause: `ProxyPending` (the egress proxy pod is not owned by the Loop and Ready yet — a read error and a foreign pod both count as not a carrier) and `EndpointUnpinned` (the model endpoint has a port and no model-proxy NetworkPolicy rule pins it). `False/NoPortLoss` means "no port is lost" and is true of both carriers; `True` now names which cause applies, and the live and deleting paths share the single writer so status, reason and message cannot drift. A TROUBLESHOOTING entry for `PolicyTranslationLossy=True` and a kind e2e step (same allowed host on a different port must be `403` and audit-blocked) landed with it (PR #325).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change). The condition now reports a port **nothing carries**, so a Loop whose egress proxy is Ready reads `False/NoPortLoss`, and a `True` now names the missing layer (PR #325).
+
+### F75 + F76-doc + F77-pin: restore "do now" (PR A of the F74-F82 split) — #337
+
+- **What was wrong.** A pre-F35 `Restored` marker with no target key counted as complete for **any** target (F75), so the first reconcile after an upgrade re-armed a completed pre-F35 restore and could delete the workspace PVC and re-create it from the old snapshot silently (PR #337, merged `d7311ca`). A failed fork-retention label SET was not retried although the doc says it is (F76, doc half), and a rollback's post-state was undefined (F77, pin half).
+- **What changed.** `legacyMarkerCoversSpec` now parses the target out of the marker's own text and re-arms only a marker that names a **different** target: a keyless `(rollback, iter-3)` marker with `restoreFrom: iter-3` is complete (no wipe); a keyless `(lostPVC, …)` marker against a rollback spec is not (the rollback runs — a lost-PVC restore does not vouch for a rollback); and unreadable marker text is treated as complete (a skipped rollback is recoverable, a wiped workspace is not). The F76 doc half documents the fork-retention label SET as "attempted once per pass, before each create attempt, until the PVC exists" with the observable failure and the manual remedy. The F77 pin half keeps the verify pin until the restore completion and refuses a queued deliver Job while the restore is in progress, so a delivery is never made for a commit the restored (or empty) workspace does not hold; the completion's Event announces the clear, and the hold is visible as `Delivered=False/DeliveryInProgress` while it is active (PR #337). This is partial: F74 and F77's phase/iteration half are NOT in this PR — they wait on owner decision D84 (see Known issues, F74-F77).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change). Three deliberate behaviour changes on upgrade: a same-target legacy marker is left alone; a Loop that (pre-F35) both completed a reactive lost-PVC restore and earlier completed a rollback/fork re-runs that restore **once** after upgrade (documented in `docs/TROUBLESHOOTING.md`'s `spec.restoreFrom` section); and a `Succeeded` + delivery-enabled Loop whose workspace PVC is lost now shows a visible `Delivered=False/DeliveryInProgress` hold instead of a `Delivered=False/DeliveryFailed` Job (PR #337).
 
 ### F62/F63: the engine's blocked-action count is relayed into status, and the Q4 audit lines are emitted — #324
 
@@ -850,8 +875,6 @@ closed by the PRs named beside them. In plain words, the items still open:
 
 **P1 (security):**
 
-- **F58**: the verify step, which runs the agent's own code, has no resource
-  limits.
 - **F60**: there is no "canary" control check that is required to fail — a
   passing canary would mean the checks were tampered with, but nothing
   detects that.
@@ -868,10 +891,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   no-pin delivery branch have no automated tests.
 - **F51**: the network-fence check reads an unresolvable address as
   "reached"; a missing checker leaves the gate open.
-- **F64**: the port-enforcement guarantee has no automated proof (the specs
-  asserting a blocked `host:PORT` is actually blocked were never written).
-- **F68**: `spec.workspace.ref` and `spec.verify.acceptanceChecks` are
-  unvalidated, so a crafted value can reach the credentialed scripts.
 - **F71**: the from-source build commands in `docs/QUICKSTART.md` §9 are
   wrong (a duplicated `PROXY_IMG`, `build-installer` given only the
   controller tag, and an uncreated `/tmp/d61-loop.yaml`) (PR #230's run).
@@ -933,8 +952,8 @@ closed by the PRs named beside them. In plain words, the items still open:
 - whether to reject or document as unsupported the `spec.workspace.repo`
   ssh/scp forms the delivery path can never serve.
 
-No P1 fix outstanding from the merged batch remains open; the two P1
-security items above (F58, F60) are the only P1 work queued.
+No P1 fix outstanding from the merged batch remains open; the one P1 security
+item above (F60) is the only P1 work queued.
 
 ### Docs — the six additions after #240
 

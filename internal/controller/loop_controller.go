@@ -1984,7 +1984,7 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 	if memErr != nil {
 		return 0, memErr
 	}
-	if !memoryBound && memoryPVCName(loop) != "" && !isTerminalPhase(loop.Status.Phase) {
+	if !memoryBound && memoryPVCName(loop) != "" && !isTerminalPhase(loop.Status.Phase) && !loopPaused(loop) {
 		// A PVC exists but is not Bound: the visible degradation (the Loop
 		// runs without memory; a repo-less Loop has no PVC at all and is
 		// "no memory", not a degradation — no Event there).
@@ -1998,6 +1998,14 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// the window existed, the one-shot marker meant one Event and silence; the
 		// same is true again here. (modelProxyHold gates on the terminal phase for
 		// the same reason.)
+		//
+		// A PAUSED Loop is excluded for the same reason (R41 I152: the guard used
+		// to read isTerminalPhase only, so a parked Loop kept the requeue and
+		// re-announced every quiet window while doing no work and being unable to
+		// fix the PVC). Its sandbox is Suspended (loopSandboxStopped), and a resume
+		// reconciles again — announcing then if the PVC is still unbound. The
+		// budget requeue helper excludes the paused phase the same way
+		// (loop_p2d_budget.go).
 		memoryRequeue = r.surfaceMemoryPVCUnbound(ctx, loop, memoryPVCName(loop))
 	}
 

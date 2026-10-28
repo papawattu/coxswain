@@ -263,6 +263,61 @@ var _ = Describe("F57: the restore's unconfirmed PVC, and the fork label's write
 			"a second failing rollback pass must not re-emit the Warning (the condition is the steady state)")
 	})
 
+	// I163 (R41): the rollback branch has its OWN copy of the F57a unconfirmed
+	// guard — `if errors.Is(err, errWorkspacePVCUnconfirmed) { return false, true,
+	// true, nil }` in loop_restore.go's b2SourceReady/rollback path. The F57a
+	// table above drives the FORK shape only, so that arm was unspeced: deleting
+	// it left every spec green and the rollback recorded Restore=False/Rejected
+	// (the fall-through below) instead of taking no decision.
+	It("F57a: a ROLLBACK create that cannot be confirmed is NOT a restore (I163)", func() {
+		ns := "f57-rb-unconf-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+		})
+		name := "rb-unconf"
+		spec := b2LoopSpec()
+		spec.RestoreFrom = "iter-0"
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: spec})).To(Succeed())
+		snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		Expect(k8sClient.Create(ctx, b1MakeSnapshotObj(name, ns, 0))).To(Succeed())
+		b2MakeSnapshotReady(ctx, ns, snapName)
+
+		// The rollback shape with an unconfirmable create: the restored-PVC Create
+		// reports AlreadyExists and the read that would confirm it fails, so the
+		// helper returns errWorkspacePVCUnconfirmed.
+		r, rec := b2NewReconcilerWithRecorder()
+		fc := &f57RestoreClient{
+			Client:        k8sClient,
+			alreadyExists: true,
+			confirmErr:    errors.New("injected transient read failure"),
+		}
+		r.Client = fc
+
+		changed, requeue, _, err := r.b2ApplyRestoreStep(ctx, b2ReconcileGet(ns, name))
+		Expect(err).NotTo(HaveOccurred())
+		// E1 (the #328 early look): "a no-decision return with no condition" is
+		// also what two other early returns produce (b2SourceError, and the
+		// rollback's own transient PVC read), so the assertions below do not by
+		// themselves prove this arm ran. The create being attempted does: it is
+		// the precondition of the errWorkspacePVCUnconfirmed sentinel.
+		Expect(fc.createTried).To(BeTrue(),
+			"the unconfirmed arm is only exercised if the restored-PVC create was attempted")
+		Expect(changed).To(BeFalse(), "an unconfirmed rollback create is no restore decision (I49)")
+		Expect(requeue).To(BeTrue(), "the step must requeue and read again")
+		c := b2RestoreCondition(b2ReconcileGet(ns, name))
+		Expect(c).To(BeNil(),
+			"no Restore condition may be recorded for a PVC that was never seen; without the F57a arm this pass records Restored=False/Rejected")
+		// The fall-through (the F57b branch) does not only record Rejected, it
+		// EMITS the Warning: "no decision" must mean no Event either.
+		Expect(f57DrainRejectedEvents(rec)).To(Equal(0),
+			"an unconfirmed create is no failure to announce: no Warning may be emitted")
+		_, pvcErr := b2GetPVC(ctx, ns, name)
+		Expect(apierrors.IsNotFound(pvcErr)).To(BeTrue(),
+			"nothing created: the injected AlreadyExists means the PVC is not there")
+	})
+
 	It("F57b: a fork that gives up (the Loop is deleted) releases the label", func() {
 		ns, forkName, srcSnap := f57Fork()
 		r, _ := b2NewReconcilerWithRecorder()

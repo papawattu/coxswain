@@ -58,7 +58,7 @@ The string attached to `Failed` or a warning. Terminal reasons: `TamperedVerify`
 _Avoid_: error, fault, exception
 
 **VerifySuspicious condition**:
-**Not implemented at `d9f5619`; planned (ADR-0005 D17.2).** The planned advisory, non-terminal `VerifySuspicious=True` condition (reason `SubversionPatternInDiff`) the operator would record when the D17 static diff scan (ADR-0005, D21) finds a subversion pattern (`testing.Testing()`, `os.Exit` in `init`, `//go:linkname`, `flag.Lookup("test.`) in the base→verified diff of *non-protected* files. It is **advisory only** — the Loop can still reach `Succeeded` — and the condition never writes `spec` (which is user-owned). Phase 6's planned PR step would read it: `effectiveReady = spec.pr.ready && !VerifySuspicious`, so a suspicious Loop would open its draft PR as non-ready.
+**Planned (ADR-0005 D17.2); not implemented.** The planned advisory, non-terminal `VerifySuspicious=True` condition (reason `SubversionPatternInDiff`) the operator would record when the D17 static diff scan (ADR-0005, D21) finds a subversion pattern (`testing.Testing()`, `os.Exit` in `init`, `//go:linkname`, `flag.Lookup("test.`) in the base→verified diff of *non-protected* files. It is **advisory only** — the Loop can still reach `Succeeded` — and the condition never writes `spec` (which is user-owned). Phase 6's planned PR step would read it: `effectiveReady = spec.pr.ready && !VerifySuspicious`, so a suspicious Loop would open its draft PR as non-ready.
 _Avoid_: failure, block, reject
 
 **Phase**:

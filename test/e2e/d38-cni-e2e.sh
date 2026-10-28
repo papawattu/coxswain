@@ -10,7 +10,9 @@
 #   C1  apiserver service IP (10.96.0.1:443) is BLOCKED
 #   C2  apiserver node IP (<node>:6443)     is BLOCKED
 #   C3  kubelet node IP    (<node>:10250)   is BLOCKED
-#   C4  a cluster-internal pod IP            is BLOCKED (also holds on kindnet)
+#   C4  a cluster-internal pod IP            is BLOCKED (a REFUSED connect is
+#                                            UNRESOLVED = FAIL, not a pass —
+#                                            F51b)
 #   C5  a disallowed external IP             is BLOCKED (also holds on kindnet)
 #   C6  an allowed host via the egress proxy succeeds (HTTP 200)
 #   C7  a disallowed host via the egress proxy gets 403
@@ -274,12 +276,20 @@ if K get ns "$PROBE_NS" >/dev/null 2>&1; then
         bad "probe reports $LBL REACHABLE (the CNI must block it; the gate should not be CNIEnforced)"
       elif echo "$PROBE_MSG" | grep -q "RESULT $LBL BLOCKED"; then
         ok "probe reports $LBL BLOCKED"
+      elif echo "$PROBE_MSG" | grep -q "RESULT $LBL UNRESOLVED"; then
+        bad "probe reports $LBL UNRESOLVED (the target was not measurable — a refused connect means the packet reached the host — so enforcement of $LBL is UNPROVEN, not blocked)"
+      else
+        bad "no RESULT line for $LBL in the probe's output (the operator's own result is unreadable here: enforcement of $LBL is UNPROVEN)"
       fi
     done
     if echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE REACHABLE"; then
       ok "probe reports DNS_POSITIVE REACHABLE (positive control: the probe has network egress to the allowed kube-dns)"
     elif echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE BLOCKED"; then
       bad "probe reports DNS_POSITIVE BLOCKED (the positive control failed: the probe has no network -> ProbeUnavailable)"
+    elif echo "$PROBE_MSG" | grep -q "RESULT DNS_POSITIVE UNRESOLVED"; then
+      bad "probe reports DNS_POSITIVE UNRESOLVED (the positive control was not measurable, so the fence is UNPROVEN)"
+    else
+      bad "no RESULT line for DNS_POSITIVE in the probe's output (the positive control did not report: the fence is UNPROVEN)"
     fi
   else
     echo "   (no live probe pod to read a termination message from — the operator deletes it after each run)"
@@ -334,35 +344,56 @@ GH_IP=$(getent hosts github.com 2>/dev/null | awk '{print $1}' | head -1)
 [ -z "$GH_IP" ] && GH_IP="1.1.1.1"
 echo "   disallowed external IP for check 5: $GH_IP (github.com)"
 
-# The one probe script. It tests every endpoint from inside the agent
-# container. Each probe is a pure TCP-CONNECT test (the layer the CNI actually
-# polices): a REACHABLE endpoint means the TCP connect succeeded (the CNI let
-# the egress through, even if a later TLS/HTTP layer then failed); a BLOCKED
-# endpoint means the connect was dropped/refused/timed out. Using the connect
-# layer (not the HTTP response code) avoids the ambiguity where a reachable
-# apiserver with a cert-name mismatch returns curl exit 60 / HTTP 000.
 # The one probe. It runs INSIDE the real agent pod (golang:1.26 ships
-# python3). Each endpoint is tested with a raw TCP socket connect - the
-# exact layer the CNI polices. A successful connect means the CNI let the
-# egress through (REACHABLE); a timeout / connection-refused means the CNI
-# dropped it (BLOCKED). Unlike curl, a dropped connection is unambiguous:
-# curl can report a blocked connect as exit 56 (empty reply) which looks
-# like a successful-but-empty HTTP exchange, or a reachable-but-mismatched
-# TLS handshake as exit 60 - neither is a reliable blocked/allowed signal.
-# We write the python probe and a thin sh launcher (the rest of this suite
-# expects `sh /tmp/d38-probe.sh`), passing the IPs in via the environment.
+# python3) and tests each endpoint with a raw TCP socket connect — the exact
+# layer the CNI polices. The verdicts are deliberately the OPERATOR's
+# (internal/cni/pod_prober.go; F51b), because the direct probes and the
+# operator's NetworkEnforced condition must agree about the same fence:
+#
+#   REACHABLE   the connect succeeded: the CNI let the egress through (a
+#               later TLS/HTTP failure does not change that);
+#   BLOCKED     the connect was dropped (a timeout, or any other socket
+#               error): the CNI blocked it;
+#   UNRESOLVED  the target had no address, or the peer REFUSED the connect.
+#               Neither is evidence of enforcement — a refusal proves the
+#               packet REACHED the host and the host answered. Reporting a
+#               refusal as BLOCKED (what this script used to do) let
+#               assert_blocked pass a connection the CNI had let through, so
+#               an UNRESOLVED expected-BLOCKED target is a FAIL here, never a
+#               PASS (F51b, R25 I84: no PASS for an unproven step).
+#
+# Using the connect layer (not an HTTP response code) avoids the ambiguity
+# where a reachable-but-mismatched-TLS endpoint looks like a failure. A thin
+# sh launcher is written too (the rest of this suite expects
+# `sh /tmp/d38-probe.sh`), passing the IPs in via the environment.
+#
+# The two blocks below are EXECUTED verbatim by
+# test/e2e/d38-probe-selftest.sh (no cluster needed) — keep the sentinels.
 cat > "$TMPDIR/probe.py" <<'PYEOF'
 import os, socket
+# >>> d38-probe-function (executed verbatim by test/e2e/d38-probe-selftest.sh)
 def probe(label, host, port, timeout=4):
+    try:
+        host = socket.gethostbyname(host)
+    except Exception:
+        # No address means no measurement of the fence: never REACHABLE, and
+        # never BLOCKED (an unresolvable target is not evidence of a drop).
+        print("RESULT %s UNRESOLVED(no-address)" % label)
+        return
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect((host, port))
         print("RESULT %s REACHABLE" % label)
+    except ConnectionRefusedError:
+        # The peer answered with a refusal: the packet reached it, so the
+        # connect was NOT dropped by any policy. UNRESOLVED, never BLOCKED.
+        print("RESULT %s UNRESOLVED(refused)" % label)
     except Exception as exc:
         print("RESULT %s BLOCKED(%s)" % (label, type(exc).__name__))
     finally:
         s.close()
+# <<< d38-probe-function
 probe("APISERVER_SVC",  os.environ["APISERVER_SVC_IP"], 443)
 probe("APISERVER_NODE", os.environ["NODE_IP"], 6443)
 probe("KUBELET_NODE",   os.environ["NODE_IP"], 10250)
@@ -385,22 +416,28 @@ echo "--- CHECKS 1-5: blocked endpoints from the agent pod ---"
 PROBE_OUT=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/d38-probe.sh 2>&1)
 echo "$PROBE_OUT" | sed 's/^/   /'
 
+# >>> assert_blocked (executed verbatim by test/e2e/d38-probe-selftest.sh)
 blocked_line() { # $1 = label
   echo "$PROBE_OUT" | grep "^RESULT $1 " || echo "RESULT $1 MISSING"
 }
 assert_blocked() { # $1 = label, $2 = human description
-  # The probe emits either "RESULT <label> REACHABLE" (the TCP connect
-  # succeeded — the CNI let the egress through = a FAIL) or
-  # "RESULT <label> BLOCKED(curl_exit=<n>)" (the connect was dropped/refused/
-  # timed out — the CNI blocked it = a PASS).
+  # The probe emits exactly one of pod_prober.go's verdicts (F51b):
+  #   RESULT <label> REACHABLE          the connect succeeded       -> FAIL
+  #   RESULT <label> BLOCKED(<reason>)  the connect was dropped     -> PASS
+  #   RESULT <label> UNRESOLVED(<why>)  no address, or the peer REFUSED the
+  #                                     connect: the packet was not dropped,
+  #                                     so this is UNPROVEN  -> FAIL, never
+  #                                     a PASS (an old refusal read BLOCKED)
   line=$(blocked_line "$1")
   case "$line" in
     *"MISSING"*) bad "$2: probe line missing from output" ;;
     *"REACHABLE"*) bad "$2: REACHABLE — the enforcing CNI failed to block it" ;;
+    *"UNRESOLVED"*) bad "$2: UNRESOLVED — $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'); the connect was not dropped, so the fence is UNPROVEN here (not a pass)" ;;
     *"BLOCKED"*) ok "$2 (blocked: $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'))" ;;
     *) bad "$2: unrecognised probe result: $line" ;;
   esac
 }
+# <<< assert_blocked
 echo "  (C1) apiserver service IP $APISERVER_SVC_IP:443"
 assert_blocked APISERVER_SVC "apiserver svc IP $APISERVER_SVC_IP:443"
 echo "  (C2) apiserver node $NODE_IP:6443"

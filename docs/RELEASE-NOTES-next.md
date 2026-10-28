@@ -12,6 +12,12 @@ Must-do items for an operator upgrading from v0.1.2; each points to
 - If your RBAC is managed outside `install.yaml`, apply the new
   `serviceaccounts` (create, get, list, watch) rule to the operator's
   ClusterRole (F29, #199). A standard install picks it up automatically.
+- If your RBAC is managed outside `install.yaml`, apply the new `pods/log`
+  (`get`) subresource rule to the operator's ClusterRole (F62/F63, #324). A
+  standard install picks it up automatically. Note this is a cluster-wide
+  grant: the alert relay follows the engine agent pods and the operator's own
+  proxy pods' logs by namespace, and the design's alternative (namespaced
+  Roles) cannot cover Loop namespaces created later (PR #324).
 - Set `--memory-writer-image` to the operator image if your install is not
   `config/default` (PR #182); set `--memory-storage-class` to a
   ReadWriteMany-capable StorageClass if your cluster's default does not
@@ -55,6 +61,27 @@ override is yours to pin.
 
 
 ## Security fixes
+
+### F66: no ServiceAccount token in the verify and deliver Job pods — #330
+
+- **What was wrong.** The two Job pod builders left `AutomountServiceAccountToken` unset with `ServiceAccountName: ""`, which selects the namespace's **default** ServiceAccount and mounts its token at `/var/run/secrets/kubernetes.io/serviceaccount` — in the very pods whose containers run agent-chosen commands (the verify `check-*` and `import-agent` containers; the deliver `clone-base`/`import-agent`/`push` containers, beside the mounted git credential). This contradicted D12, which had already fixed the verify Job as `automountServiceAccountToken: false` with read-only clone credentials only (`docs/REVIEW-PHASE0-R4.md:130`, ADR-0005 §D12): the verify Job had carried a token it was decided not to carry, for as long as it had existed (PR #330, merged `26a831f`).
+- **Who could exploit it, and how.** A sandbox agent whose code runs in a verify or deliver container could read the namespace's default ServiceAccount token and use it for API calls the Loop should not have been able to make (PR #330).
+- **What changed.** Both builders now set `AutomountServiceAccountToken: false` explicitly (the verify Job per D12; the deliver Job as a deliberate extension of D12, whose literal text names only the verify Job, since the deliver Job also runs agent-chosen code and holds the push credential); no RBAC change, since the pods never made an API call (PR #330, merged `26a831f`).
+- **On upgrade.** Jobs created **before** the upgrade keep their token until the next iteration creates a new Job: `ensureVerifyJob` reuses the Job whose `verifyCommit` annotation matches and nothing re-creates a Job on a pod-spec change, so a Loop mid-verify or mid-deliver at upgrade time keeps the pre-upgrade Job (and its token); the next Job the operator creates is the one without it (PR #330).
+
+### F67: import-agent reads the agent's object store instead of fetching from it — #331
+
+- **What was wrong.** The `import-agent` init containers (verify and deliver) ran `git fetch file:///agent-src/.git <sha>` to pull the pinned commit from the agent's own workspace repository. That fetch's safety rested on the git version honouring the protected-config rule (`uploadpack.packObjectsHook` and the like are only respected from protected configuration) — an image detail, since the verify/deliver images are operator-configurable (`--workspace-git-image`). The deliver half additionally compared `git rev-parse <sha>` to the pinned SHA, which echoes any 40-hex string without checking the object exists — a check that asserted nothing (though the path stayed fail-closed via `set -eu`, so this is a vacuous check, not a shipped hole) (PR #331, merged `d4fe61f`).
+- **Who could exploit it, and how.** An agent that can write its own repository's `.git/config` could have the import step run a command it chose (the `uploadpack.packObjectsHook` / `core.fsmonitor` vectors), if the git version honoured it from unprotected config (PR #331).
+- **What changed.** Both `import-agent` scripts now read the agent's object store through `GIT_ALTERNATE_OBJECT_DIRECTORIES=<agent>/.git/objects` — a path, from which git reads no config — and copy the pinned commit's closure into the Job's own object store with `pack-objects`; no `fetch`, no `upload-pack`, no `protocol.file.allow` (the copy is required anyway: the alternate is an env var that dies with the init container, while `tamper` and the `check-*` containers read `/verify/.git`, and the deliver push container does not mount the agent PVC at all). The deliver Job's existence check is now `rev-parse --verify <sha>^{commit}`; the import container also loses its second `safe.directory` entry (`/agent-src/.git`) and keeps only `/verify` (PR #331, merged `d4fe61f`). The one `git fetch` that remains in each Job is `clone-base`, which fetches from `origin` — the Loop's repo on the forge, whose URL is operator-authored and whose server-side config no `git push` from the agent can write; it is out of scope.
+- **On upgrade.** Nothing required; the fix is in the operator (the generated Job scripts) — no RBAC, pod-shape, CRD or script change outside the two `import-agent` containers (PR #331).
+
+### F69: the delivered PR body's last-verify line is operator-derived — #333
+
+- **What was wrong.** The delivered PR body's facts section carried `status.progress.lastResultStatus` — a field the runner writes (the claim) on every accepted phase claim and the operator writes (the iterate path) only on the failing-check record — with no provenance recorded, so the body showed the last run's claim rather than the operator's verify verdict. And the body's plan section fenced the agent's plan with a fixed triple-backtick: a plan line of three backticks closed it, and everything after rendered as ordinary markdown in the delivered PR body — operator-looking headings, remote images, `@mentions` (which GitHub notifies from body text) (PR #333, merged `9f836ba`).
+- **Who could exploit it, and how.** An agent whose claim text reached the delivered PR body could render markdown in it (headings, images, `@mentions`); a hostile plan could break its own fence and do the same (PR #333).
+- **What changed.** The `Last verify:` line is now derived from fields the operator owns: `VerifyAccepted` (the F83e match the body already computed for the tamper arm, hoisted — `status.verify.verifiedCommit == pin && pin != ""`) → "the acceptance checks passed"; otherwise the newest recorded verify failure (the stall ring) → `the check container "<name>" failed (iteration N; see the per-iteration record)`; otherwise "no verify outcome recorded". The body no longer reads `status.progress` at all. The plan fence is now one backtick longer than the longest backtick run in the plan (`max(3, longest + 1)`), so the plan stays verbatim inside it (PR #333, merged `9f836ba`).
+- **On upgrade.** Nothing required; the fix is in the operator (the delivered PR body is generated by it) (PR #333).
 
 ### F37: `shellQuote` escaped an apostrophe wrongly (command injection) — #207
 
@@ -239,6 +266,30 @@ override is yours to pin.
   read) is closed by this fix.
 
 ## Other changes
+
+### F62/F63: the engine's blocked-action count is relayed into status, and the Q4 audit lines are emitted — #324
+
+- **What was wrong.** A blocked agent action was invisible on the Loop: nothing wrote a count or a condition, so an operator could not tell that the engine had blocked the Loop's sandbox from doing something (F62). And the engine's blocked-action alerts were not recorded in any audit stream the operator could read (F63) (PR #324, merged `b3e2e00`).
+- **What changed.** A leader-elected relay follows the engine's agent pods and the operator's own egress/tool-proxy pods' `pods/log` (never a poller — a poller cannot tell a rotation gap from "nothing happened"), re-attaching with `sinceTime` = the last accepted alert (a first line later than that is a gap, never a smaller number). A count is published only when the stream is healthy **and** the Loop's sandbox pod exists on it — so `0` means "seen, nothing blocked", never "not seen". `status.policy.blockedCount` and a `PolicyBlocked` condition surface the count: `True`/`BlocksObserved` naming the latest target and the unattributed count when healthy; `Unknown` with the relay's reason (and the count cleared, never `0`) on a gap / unavailable / undecodable / no-engine; absent when the relay has no news for the Loop. A block never changes the phase, never pauses, never a terminal reason (the ADR's Q5) (F62, PR #324). Every alert, allowed and blocked, is one JSON line on the operator's stdout in the Q4 envelope (`{time, loop, namespace, iteration, source, action, target, verdict, detail}`); `iteration` is joined from the Loop status at emit time and written as `unknown` when the Loop cannot be read, so the field is never empty. The stream is unfiltered (every allowed alert is emitted); sampling/rate limiting is a follow-up (F63, PR #324). New RBAC: `pods/log` (`get` only, a subresource grant) on the operator's ServiceAccount — see the Upgrade section for a must-do line if your RBAC is managed outside `install.yaml` (PR #324).
+- **On upgrade.** A standard install (or chart) picks up the new `pods/log` grant automatically; if your RBAC is managed outside `install.yaml`, apply the rule (see above). The fix is otherwise in the operator (no CRD, chart or pod-shape change) (PR #324).
+
+### F73: the memory-writer outcome is decided from the Job before its pod — #336
+
+- **What was wrong.** A memory-writer Job the batch controller failed (e.g. `DeadlineExceeded` when `activeDeadlineSeconds` kills a pod that never became terminal, or `BackoffLimitExceeded`) with its pod still `Pending`/`Running` hot-looped at the requeue interval and never recorded `MemoryWriteDone` — the decision was made from the pod's phase, and a stuck pod's phase is never `Failed` or `Succeeded`. A `pods/list` error also short-circuited before any Job condition was read, and the `MemoryWriteFailed` Warning Event was emitted on every reconcile of the same failure (F73, PR #336, merged `83060bd`).
+- **What changed.** The Job's own `Failed` condition is now read **before** the pod, so the outcome is recorded while the stuck pod is still there (`DeadlineExceeded` keeps the hung-writer-pod wording that names `activeDeadlineSeconds`; any other reason carries the batch controller's reason and message). A `pods/list` error is "an error, not a decision": it falls through to the same Job-condition read, so a finished Job is still decided while the list keeps failing, and the no-pod path's message says the pod could not be read rather than claiming a cause. The Warning Event and the F30 metric fire only on the transition (not on every reconcile) (F73, PR #336, merged `83060bd`).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change) (PR #336).
+
+### I152: a Paused Loop does not re-announce MemoryPVCUnbound — #329
+
+- **What was wrong.** The `MemoryPVCUnbound` surface ran while the Loop was in a non-terminal phase, and a Paused Loop requeues on the quiet window — so a parked Loop on a StorageClass without ReadWriteMany reconciled and warned every 5 minutes for the life of the cluster, with nothing it could do about the PVC (I152, PR #329, merged `8c46987`). The docs' "while the Loop runs" was the correct promise; the code was the thing not keeping it.
+- **What changed.** The `ensureSandbox` memory branch now also requires `!loopPaused(loop)`, so a paused Loop is not warned at all and does not schedule a re-announce; a resume reconciles again and re-announces if the PVC is still unbound (a pause is not a mute). The two docs' "while the Loop runs" clause is now literally true (I152, PR #329, merged `8c46987`).
+- **On upgrade.** An operator alerting on `MemoryPVCUnbound` for paused Loops loses those events while the Loop is parked — which is what both docs promise. Nothing else required; the fix is in the operator (no CRD, RBAC or chart change) (PR #329).
+
+### F79: the runner retries a transport failure — #338
+
+- **What was wrong.** The runner's model-request retry retried only a context deadline, while the comment described the class as "a model request that times out or returns a transport error" — an immediate transport failure (DNS, dial refused, no route) made one attempt, surfaced `ModelUnavailable`, and blocked the claim. The runner's and `pkg/curator`'s classifications disagreed about the same failure (F41 had already retried the class in the curator) (F79, PR #338, merged `2917675`).
+- **What changed.** The runner now retries only the transport failures that prove the request never reached the model: a context deadline, a DNS failure, or a dial failure (TCP connection never opened, so no bytes were sent). A failure **after the request was written** (EOF, reset, read error) is **not** retried — the server may have accepted and processed the completion, so re-sending it would make the model do the work twice and count the request twice in the proxy's budget counters. One log line per retry (`runner: call model: retry N/M in <backoff>: <err>`); the ladder is a `runConfig` field (`ModelRetries`/`ModelRetryBackoff`, zero = the production 3 retries at 2s) so the specs drive the real `driveModel` without sleeping (F79, PR #338, merged `2917675`).
+- **On upgrade.** Nothing required; the fix is in the runner (in the operator image; no CRD, RBAC or chart change). Note the cost the PR states: a dead endpoint now spends the full ladder per step instead of failing at once, and the timeout class is unchanged (a timed-out request may already have been accepted, so that retry can re-send it) (PR #338).
 
 ### F52 (B1+B2): a Loop whose delivery FAILED is no longer "in flight", and settling the delivery hold keeps the verify record — #343
 

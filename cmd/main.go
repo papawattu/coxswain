@@ -68,6 +68,24 @@ func init() {
 }
 
 // nolint:gocyclo
+// F65 (supply chain P2-1/P2-2): the three runtime-pulled DEFAULT images are
+// pinned by TAG + DIGEST. A tag alone is mutable, and the operator pulls these
+// at run time on other people's clusters; the workspace-git image matters most
+// because it is the container that carries the git credential (clone/deliver),
+// so what it runs must not change under the operator between two Loops. The
+// digest is the registry's multi-arch manifest-list digest (resolved with
+// `docker buildx imagetools inspect <ref>`; the values are listed in
+// docs/RELEASE-NOTES-next.md). The tag stays in the reference for humans and for
+// `kind load`/preload lists, which match on the tag.
+const (
+	pinnedCNIProbeImage = "docker.io/library/python:3.13-alpine@sha256:" +
+		"bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741"
+	pinnedWorkspaceGitImage = "docker.io/alpine/git:v2.54.0@sha256:" +
+		"e8ceedc73bd80992ae8d58a7d24c58b8322146c354f1d2e81a97db4452068ec0"
+	pinnedVerifyImage = "docker.io/library/golang:1.26@sha256:" +
+		"672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82"
+)
+
 func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
@@ -133,8 +151,10 @@ func main() {
 			"contains /usr/local/bin/coxswain-memory-write). Empty = the workspace "+
 			"git image (the Job's container will not find the binary).")
 	var cniProbeImage string
-	flag.StringVar(&cniProbeImage, "cni-probe-image", "python:3-alpine",
-		"The image the CNI probe pod runs (D38). Must be pullable by the probe node.")
+	flag.StringVar(&cniProbeImage, "cni-probe-image", pinnedCNIProbeImage,
+		"The image the CNI probe pod runs (D38). Must be pullable by the probe node. "+
+			"Default: "+pinnedCNIProbeImage+" (tag + digest: the probe pod runs on every node and a moving tag "+
+			"would change what is probed between runs).")
 	var cniProbeNamespace string
 	flag.StringVar(&cniProbeNamespace, "cni-probe-namespace", "coxswain-cni-probe",
 		"The fixed namespace the CNI probe pod + NetworkPolicy live in (D38; created at install).")
@@ -185,10 +205,11 @@ func main() {
 	// spec.workspace.repo (it must carry git + sh). The operator selects it so
 	// the agent's image never controls the clone.
 	var workspaceGitImage string
-	flag.StringVar(&workspaceGitImage, "workspace-git-image", "docker.io/alpine/git:v2.54.0",
+	flag.StringVar(&workspaceGitImage, "workspace-git-image", pinnedWorkspaceGitImage,
 		"The image the sandbox pod's workspace init container runs to clone the Loop's workspace repo. "+
-			"Must carry git and sh. Default: docker.io/alpine/git:v2.54.0 (pinned release — the init "+
-			"container handles the git credential, so a moving :latest tag is not acceptable).")
+			"Must carry git and sh. Default: "+pinnedWorkspaceGitImage+" (tag + digest — F65: this container "+
+			"handles the git credential, so neither a moving :latest tag nor a tag whose digest can move "+
+			"is acceptable).")
 	// S3b (GAP 1): the image the operator recognises as the runner. When
 	// spec.agent.image is empty or equals this, the agent container's Command is
 	// the runner's entrypoint; any other image keeps 'sleep infinity'.
@@ -201,10 +222,10 @@ func main() {
 	// a Loop declares acceptance checks without spec.verify.image. A Go image
 	// by default so `go build` / `go test` checks work out of the box.
 	var verifyImage string
-	flag.StringVar(&verifyImage, "verify-image", "docker.io/library/golang:1.26",
+	flag.StringVar(&verifyImage, "verify-image", pinnedVerifyImage,
 		"The image the verify Job's check-* acceptance-check containers run when a Loop does not set spec.verify.image. "+
-			"Must carry a POSIX shell. Default: docker.io/library/golang:1.26 (the acceptance checks may be Go commands, "+
-			"and the trusted git image has no Go toolchain).")
+			"Must carry a POSIX shell. Default: "+pinnedVerifyImage+" (the acceptance checks may be Go commands, "+
+			"and the trusted git image has no Go toolchain; F65 pins it by digest because it runs agent-authored code).")
 	// D41c (ADR-0008): the image the per-tool tool proxy pods run. The
 	// reconciler default is a Go dev stand-in; an e2e or operator that wants
 	// the real cmd/tool-proxy binary (the rule engine, credential injection,

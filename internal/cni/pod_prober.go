@@ -381,6 +381,13 @@ func (p *PodProber) buildPod() *corev1.Pod {
 					Name:    "probe",
 					Image:   p.cfg.ProbeImage,
 					Command: p.probeCommand(),
+					// F65 (P2-2): an EXPLICIT pull policy. Unset, the kubelet derives it
+					// from the ref shape (:latest or a digest => Always, otherwise
+					// IfNotPresent), so the policy silently changes with the reference.
+					// The default probe image is digest-pinned: IfNotPresent uses the
+					// node's copy when present and pulls the EXACT digest when not,
+					// instead of re-resolving the tag on every probe.
+					ImagePullPolicy: corev1.PullIfNotPresent,
 					// terminationMessagePolicy FallbackToLogsOnError: the probe's
 					// RESULT lines go to stdout, captured into the container's
 					// terminationMessage (design point 2). The output (4 RESULT

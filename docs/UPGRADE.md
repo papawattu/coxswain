@@ -258,6 +258,32 @@ for ever.
 There is nothing to do for an existing Loop unless one of its checks writes
 into the checkout.
 
+### The operator's default images are digest-pinned (F65)
+
+Three images the operator pulls at run time now carry a registry digest:
+`--cni-probe-image` (`docker.io/library/python:3.13-alpine@sha256:bf12ecc0…`),
+`--workspace-git-image` (`docker.io/alpine/git:v2.54.0@sha256:e8ceedc7…`) and
+`--verify-image` (`docker.io/library/golang:1.26@sha256:672c944c…`). The
+workspace-git image is the container that mounts the git credential, and a tag
+is mutable, so what runs could otherwise change under the operator between two
+Loops.
+
+Two consequences:
+
+- **The CNI probe image moved from `python:3-alpine` to `python:3.13-alpine`**
+  (version-exact, then pinned). A probe on a node whose cached `3-alpine` was a
+  different minor version now runs 3.13. The probe script only uses the standard
+  library, so nothing else changes.
+- **The probe container pulls `IfNotPresent`** (explicit, instead of the policy
+  the kubelet derives from the reference shape). A node with no cached copy
+  pulls the exact digest; a node with one keeps it. A cluster that cannot reach
+  Docker Hub must pre-load the image (the `kind-calico-up` target's `kind load`
+  loop does, and its list now carries `python:3.13-alpine` to match the pin).
+
+There is nothing to do unless you override one of the three flags: an override
+is yours to pin. `grep -c 'sha256:' dist/install.yaml` is non-zero for the
+operator's own image, as before.
+
 ### The chart no longer renders a second VAP binding
 
 Helm installs from v0.1.0–v0.1.2 rendered **two** `ValidatingAdmissionPolicyBinding` objects for the one ephemeral-container `ValidatingAdmissionPolicy`: the literal `coxswain-deny-ephemeral-containers` (correct), plus a templated one named after the release's fullname, `{{ fullname }}-deny-ephemeral-containers`, whose `policyName` named the templated name and therefore no existing VAP — so the second one was **inert** (it bound nothing; the gate still worked). PR #249 (F45) removed the templated template. `helm upgrade` normally deletes objects that the previous release tracked but the new manifest no longer carries, but that is not guaranteed if the binding was created out-of-band (a hand-rendered `helm template` piped to `kubectl apply`, a switch from `install.yaml` to Helm, or lost release history) — so run the manual check below either way. It is harmless: the stale binding is inert, and deleting it cannot weaken or disable the ephemeral-container gate.

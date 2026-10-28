@@ -31,6 +31,29 @@ Secret-name validation on `spec.agent.gitCredentialSecret` and
 Loop with a malformed Secret name is now rejected at the API server —
 existing Loops are unaffected, but new ones are.
 
+## Supply chain: the operator's default images are digest-pinned (F65)
+
+The three images the operator pulls at RUN TIME now carry a registry digest
+next to their tag, so what runs cannot change under the operator between two
+Loops (a tag is mutable; the workspace-git image handles the git credential):
+
+| flag | default |
+|---|---|
+| `--cni-probe-image` | `docker.io/library/python:3.13-alpine@sha256:bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741` |
+| `--workspace-git-image` | `docker.io/alpine/git:v2.54.0@sha256:e8ceedc73bd80992ae8d58a7d24c58b8322146c354f1d2e81a97db4452068ec0` |
+| `--verify-image` | `docker.io/library/golang:1.26@sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82` |
+
+The digests are the registries' multi-arch manifest-list digests, resolved with
+an anonymous registry HEAD on the tag (`GET /v2/<repo>/manifests/<tag>` with an
+index `Accept` list, reading `Docker-Content-Digest`) — the exact command and
+its output are in `.samples/f65/registry-digests.txt`. The CNI probe image also
+moved off the floating `python:3-alpine` minor tag to a version-exact
+`python:3.13-alpine` (P2-2), and the probe container now sets
+`ImagePullPolicy: IfNotPresent` explicitly instead of leaving it derived from the
+reference shape. Nothing to do unless you override one of the three flags — an
+override is yours to pin.
+
+
 ## Security fixes
 
 ### F37: `shellQuote` escaped an apostrophe wrongly (command injection) — #207

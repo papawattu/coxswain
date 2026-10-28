@@ -348,10 +348,13 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 	@$(MAKE) proxy-build
 	@echo "   Loading images into the kind node $(CALICO_CLUSTER)..."
 	# golang:1.26 = the e2e agent image; busybox:1.36 = the i42-e2e throwaway
-	# pod; python:3-alpine = the operator's CNI self-test probe pod
+	# pod; python:3.13-alpine = the operator's CNI self-test probe pod
 	# (--cni-probe-image default; the operator pulls it by name, so it must be
-	# pre-loaded for offline hosts).
-	@for img in coxswain-controller:d38 $(EGRESS_IMG) $(PROXY_IMG) golang:1.26 busybox:1.36 python:3-alpine; do \
+	# pre-loaded for offline hosts). F65: the probe image is DIGEST-pinned in
+	# cmd/main.go, and `kind load` matches on the TAG, so this preload line must
+	# carry the same tag as the pin (python:3.13-alpine) or the node pulls the
+	# digest over the network mid-probe.
+	@for img in coxswain-controller:d38 $(EGRESS_IMG) $(PROXY_IMG) golang:1.26 busybox:1.36 python:3.13-alpine; do \
 		echo "     kind load: $$img"; \
 		$(KIND) load docker-image "$$img" --name $(CALICO_CLUSTER) || { echo "FATAL: kind load $$img failed"; exit 1; }; \
 	done

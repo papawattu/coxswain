@@ -24,10 +24,10 @@
 //     because the body would then name a value the operator's fields do not
 //     carry);
 //  2. the verify OUTCOME appears as the operator's verify evidence (the
-//     pinned verifiedCommit + the tamper exit code + the lastResultStatus),
-//     not from the claim (status.progress.lastResultStatus is the
-//     operator's own record, written by the operator from the verify
-//     evidence — not a gate input);
+//     pinned verifiedCommit + the tamper exit code + the last-verify line
+//     DERIVED from the pin and the stall ring), not from the claim —
+//     status.progress.lastResultStatus is where the runner's claim.Status
+//     lands, so the body does not read it at all (F69).
 //  3. budget used vs limit (the accumulated consumption + the caps, and the
 //     operator's gate fact when the budget decision exceeded a cap);
 //  4. the Loop's namespace/name, the goal, and the iteration count (the
@@ -131,10 +131,16 @@ func TestDeliverDescriptionFactsFromSpecStatusOnly(t *testing.T) {
 	if got := mut(func(l *loopT) { l.Status.Verify.TamperExitCode = &a4TamperDirty }); !strings.Contains(got, "- **Tamper check:** exit 1 (a protected path changed)") {
 		t.Errorf("the body did not reflect a tampered tamper-check:\n%s", got)
 	}
-	// The last verify outcome (status.progress.lastResultStatus) — a failing
-	// last verify changes the body.
-	if got := mut(func(l *loopT) { l.Status.Progress.LastResultStatus = "check-failed: unit (exit 1)" }); !strings.Contains(got, "- **Last verify:** check-failed: unit (exit 1)") {
-		t.Errorf("the body did not reflect a failing last verify:\n%s", got)
+	// The last verify outcome is NOT sourced from status.progress.
+	// lastResultStatus (F69): that field is the runner's claim.Status on every
+	// phase claim, and nothing records who last wrote it. Changing it must
+	// leave the body BYTE-IDENTICAL (the "Last verify" line is derived from
+	// the pin + the stall ring — TestDeliverDescriptionLastVerifyIsOperator-
+	// Derived pins each branch).
+	if got := mut(func(l *loopT) {
+		l.Status.Progress.LastResultStatus = "check-failed: unit (exit 1)\n## injected heading\nrm -rf /"
+	}); got != baseBody {
+		t.Errorf("the body must not read status.progress.lastResultStatus (agent-controlled claim text, F69):\n\nbase:\n%s\n\nwith a hostile lastResultStatus:\n%s", baseBody, got)
 	}
 	// The budget consumption (status.budget) — a different accumulation
 	// changes the body.
@@ -152,6 +158,117 @@ func TestDeliverDescriptionFactsFromSpecStatusOnly(t *testing.T) {
 	// carry the claim's text, and this assertion fails).
 	if strings.Contains(baseBody, "observedPhase") || strings.Contains(baseBody, "headCommit") {
 		t.Errorf("the facts body must not carry the runner's claim text (observedPhase/headCommit are not facts):\n%s", baseBody)
+	}
+}
+
+// f69HostileClaim is the claim text the F69 specs feed
+// status.progress.lastResultStatus: a plausible runner "ok", a shell payload, its
+// own copy of one of the body's headings, and a per-iteration line. It is the
+// shape a runner claim can take, so every spec renders it and asserts none of it
+// reaches the body.
+const f69HostileClaim = "**ok** (all green)\nrm -rf /\n## Verify results per iteration\n- iteration 9: passed"
+
+// TestDeliverDescriptionLastVerifyIsOperatorDerived (F69) asserts the "Last
+// verify" bullet is built ONLY from operator-held fields, so no agent text
+// reaches it: the reported defect was that the bullet rendered
+// status.progress.lastResultStatus — the field the runner's claim.Status lands
+// in — uncapped and unlabelled, so a claim reading "**ok**\nrm -rf /" appeared
+// as an operator fact. The test:
+//   - a hostile claim.Status (with a newline, a markdown heading and a shell
+//     payload) changes nothing: the operator's accepted verify record keeps the
+//     line at "the acceptance checks passed", and no claim byte appears in the
+//     body;
+//   - WITHOUT an accepted verify record the line never says "passed", even
+//     when a pin exists (the pin is claim-chosen and survives a failing
+//     verify): the newest recorded verify FAILURE (status.stallHistory, the
+//     operator's own record) supplies the line, so the operator's failure fact
+//     is still shown (and the claim text is still absent);
+//   - with neither a pin nor a ring entry the body says so rather than
+//     borrowing the claim's promising-looking "success").
+func TestDeliverDescriptionLastVerifyIsOperatorDerived(t *testing.T) {
+	// 1. The delivered Loop (a pin, and the operator's verify record naming it):
+	// the line is the operator's pass fact, and the hostile claim text is
+	// nowhere in the body.
+	l := a4FactsLoop()
+	l.Status.Progress.LastResultStatus = f69HostileClaim
+	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
+	if !strings.Contains(body, "- **Last verify:** the acceptance checks passed") {
+		t.Errorf("a Loop whose verify record names the pin must print the operator's pass fact:\n%s", body)
+	}
+	assertNoClaimText(t, body)
+
+	// 2. A PIN WITH NO MATCHING VERIFY RECORD (F2): the pin alone is not a pass
+	// — it is written at the Verifying transition from the agent's claimed
+	// headCommit and survives a failing verify. The line must not say "passed".
+	l2 := a4FactsLoop()
+	l2.Status.Verify.VerifiedCommit = "ffffffffffffffffffffffffffffffffffffffff"
+	l2.Status.Progress.LastResultStatus = f69HostileClaim
+	body2 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l2))
+	if strings.Contains(body2, "- **Last verify:** the acceptance checks passed") {
+		t.Errorf("a pin whose verify record names a DIFFERENT commit must not print a pass:\n%s", body2)
+	}
+	if want := "- **Last verify:** the check container \"TestRound\" failed (iteration 1;"; !strings.Contains(body2, want) {
+		t.Errorf("an unaccepted pin must fall through to the recorded failure (want %q):\n%s", want, body2)
+	}
+	assertNoClaimText(t, body2)
+
+	// 3. No pin at all, one recorded failure: the operator's ring speaks (and
+	// the claim's "ok" is still not the line).
+	l3 := a4FactsLoop()
+	l3.Status.CurrentVerify = nil
+	l3.Status.Progress.LastResultStatus = f69HostileClaim
+	body3 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l3))
+	if want := "- **Last verify:** the check container \"TestRound\" failed (iteration 1; see the per-iteration record)"; !strings.Contains(body3, want) {
+		t.Errorf("without a pin the newest recorded verify failure must supply the line (want %q):\n%s", want, body3)
+	}
+	assertNoClaimText(t, body3)
+
+	// 4. A pin and NO verify record at all: still not a pass.
+	l4 := a4FactsLoop()
+	l4.Status.Verify = nil
+	l4.Status.Progress.LastResultStatus = f69HostileClaim
+	body4 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l4))
+	if strings.Contains(body4, "the acceptance checks passed") {
+		t.Errorf("a pin with no verify record at all must not print a pass:\n%s", body4)
+	}
+	assertNoClaimText(t, body4)
+
+	// 5. No pin and no failure recorded: the body says there is no operator
+	// record instead of borrowing the claim.
+	l5 := a4FactsLoop()
+	l5.Status.CurrentVerify = nil
+	l5.Status.StallHistory = nil
+	l5.Status.Progress.LastResultStatus = f69HostileClaim
+	body5 := renderDeliverDescriptionBody(deliverDescriptionForLoop(l5))
+	if !strings.Contains(body5, "- **Last verify:** no verify outcome recorded") {
+		t.Errorf("with no pin and no recorded failure the body must say there is no verify outcome record:\n%s", body5)
+	}
+	assertNoClaimText(t, body5)
+}
+
+// assertNoClaimText fails when the body carries any fragment of the hostile
+// claim (f69HostileClaim itself, its markdown heading, or its payload). The
+// body's bullet count is not asserted — the point is that no claim byte is
+// rendered and no claim newline split a line.
+func assertNoClaimText(t *testing.T, body string) {
+	t.Helper()
+	for _, raw := range []string{
+		f69HostileClaim,
+		"**ok** (all green)",
+		"rm -rf /",
+		"iteration 9: passed",
+	} {
+		if strings.Contains(body, raw) {
+			t.Errorf("the facts body carries agent claim text %q (F69: the last-verify line is operator-derived only):\n%s", raw, body)
+		}
+	}
+	// The claim's multi-line text must not have produced a line break: every
+	// line in the body starts with a markdown list marker, a heading, a blank,
+	// or prose the operator wrote — never a bare claim fragment. The claim's
+	// own heading ("## Verify results per iteration") exists in the body as an
+	// OPERATOR heading only once, so a second occurrence is an injection.
+	if got := strings.Count(body, "## Verify results per iteration"); got > 1 {
+		t.Errorf("the claim injected a second %q heading (%d occurrences):\n%s", "## Verify results per iteration", got, body)
 	}
 }
 
@@ -275,10 +392,11 @@ func TestDeliverDescriptionVerifyHistoryPerIteration(t *testing.T) {
 	}
 
 	// The record is operator-side: the body does NOT carry the runner's claim
-	// (status.progress.lastResultStatus is a separate line — "Last verify" —
-	// and the per-iteration record is built from stallHistory +
-	// currentVerify, not the claim). A mutation that sourced a per-iteration
-	// fact from the claim would make the body carry the claim's text.
+	// (the per-iteration record is built from stallHistory + currentVerify,
+	// and the "Last verify" line from the pin + that ring — F69 — never from
+	// status.progress.lastResultStatus, the field the runner's claim.Status
+	// lands in). A mutation that sourced a per-iteration fact from the claim
+	// would make the body carry the claim's text.
 	if strings.Contains(got, "observedPhase") || strings.Contains(got, "headCommit") {
 		t.Errorf("the per-iteration record must not carry the runner's claim text:\n%s", got)
 	}
@@ -290,9 +408,10 @@ func TestDeliverDescriptionVerifyHistoryPerIteration(t *testing.T) {
 // the claim". The body is a pure function of the Loop's spec/status; the
 // runner's claim (result.json: the claim's observedPhase / resultStatus /
 // headCommit / iteration) is NOT a fact source. The test sets the claim's
-// fields to DISTINCT sentinel values and asserts the body does NOT carry
-// them: a regression that sources a fact from the claim (result.json) would
-// make the body carry a sentinel, and the test fails.
+// fields, INCLUDING status.progress.lastResultStatus (the status field
+// claim.Status lands in — F69), to DISTINCT sentinel values and asserts the
+// body does NOT carry them: a regression that sources a fact from the claim
+// would make the body carry a sentinel, and the test fails.
 func TestDeliverDescriptionDoesNotReadTheClaim(t *testing.T) {
 	l := a4FactsLoop()
 	// The runner's claim (result.json), set to DISTINCT sentinel values that
@@ -300,38 +419,30 @@ func TestDeliverDescriptionDoesNotReadTheClaim(t *testing.T) {
 	// sourced a fact from the claim (the mutation), the body would carry one
 	// of these sentinels and the test fails.
 	l.Status.ObservedPhase = coxv1alpha1.LoopPhase("CLAIM-OBSERVED-SENTINEL")
-	// The claim's result status (in result.json) is the RUNNER's claim, not a
-	// field the operator records in status (the operator records the verify
-	// evidence in status.verify, and the last verify OUTCOME in
-	// status.progress.lastResultStatus — its OWN record, written from the
-	// verify evidence, not a gate input). The claim's observedPhase (the
-	// operator's record of what the runner reported) and the claim's headCommit
-	// are the runner's claim values. The body must not carry any of them.
-	l.Status.ObservedPhase = coxv1alpha1.LoopPhase("CLAIM-OBSERVED-SENTINEL")
 	if l.Status.Progress == nil {
 		l.Status.Progress = &coxv1alpha1.ProgressStatus{}
 	}
-	// The operator's OWN record of the last verify outcome (status.progress.
-	// lastResultStatus) is a FACT source (the body reads it). For this test it
-	// is "" (the success path), so the body prints "the acceptance checks
-	// passed". The claim's result status is a DIFFERENT thing (in result.json,
-	// not a status field the body reads).
-	_ = l.Status.ObservedPhase
+	// status.progress.lastResultStatus is where the runner's claim.Status
+	// lands (recordPhaseClaim, loop_s4_phase.go). F69: the operator writes its
+	// own check-failed record there too, and nothing records which writer was
+	// last, so the field is NOT a fact source and the body must not carry it.
+	l.Status.Progress.LastResultStatus = "CLAIM-STATUS-SENTINEL"
 
 	body := renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
 	for _, sentinel := range []string{
 		"CLAIM-OBSERVED-SENTINEL",
+		"CLAIM-STATUS-SENTINEL",
 	} {
 		if strings.Contains(body, sentinel) {
 			t.Fatalf("the facts body carries the runner's claim sentinel %q (a mutation sourced a fact from result.json / the claim):\n%s", sentinel, body)
 		}
 	}
-	// The body's last-verify line is the operator's record
-	// (status.progress.lastResultStatus, "" here -> "the acceptance checks
-	// passed"), NOT the claim's result status (a result.json value the body
-	// never reads). TestDeliverDescriptionFactsFromSpecStatusOnly proves the
-	// body reads the operator's record (it sets status.progress.lastResultStatus
-	// and asserts the body reflects it); this test proves the body does NOT
-	// read the claim (it sets status.observedPhase to a sentinel and asserts
-	// the body does not carry it).
+	// The body's last-verify line is the operator's own record: the pin (the
+	// verify outcome the operator accepted) says the checks passed. The claim
+	// text (status.progress.lastResultStatus) is a different thing and the
+	// body never reads it (F69); TestDeliverDescriptionLastVerifyIsOperator-
+	// Derived pins every branch of that line.
+	if !strings.Contains(body, "- **Last verify:** the acceptance checks passed") {
+		t.Fatalf("the last-verify line must come from the operator's pin:\n%s", body)
+	}
 }

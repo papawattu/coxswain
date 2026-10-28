@@ -681,7 +681,8 @@ F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop 
   (Warning Event, failed metric once); Complete sets `MemoryWritten` with
   no summary; neither means still in progress (requeue) (merged `aedc33d`
   = PR #229). This closes the no-pod half of the F31 item (see Known
-  issues: F73 covers a Job that failed while its pod is still stuck).
+  issues: the F73 entry (#336) covers a Job that failed while its pod is
+  still stuck).
 - **On upgrade.** Nothing required; the fix is in the operator (PR #229).
 
 ### F54: the "evil agent" end-to-end test now exists — #222
@@ -854,12 +855,9 @@ closed by the PRs named beside them. In plain words, the items still open:
 - **F60**: there is no "canary" control check that is required to fail — a
   passing canary would mean the checks were tampered with, but nothing
   detects that.
-- **F63**: blocked agent actions are not recorded in the audit log.
 
 **P2:**
 
-- **F82**: F44 follow-ups — two unspecced lines and three stale stream
-  comments (PR #248's run).
 - **F47 follow-ups** (F47 itself closed by #254): the fork path still
   derives its source snapshot from `spec.forkOf` with no ownership check,
   and the `ensureCheckpoint` idempotency guard and the tamper gate's
@@ -870,21 +868,10 @@ closed by the PRs named beside them. In plain words, the items still open:
   no-pin delivery branch have no automated tests.
 - **F51**: the network-fence check reads an unresolvable address as
   "reached"; a missing checker leaves the gate open.
-- **F62**: the "agent action blocked" counter and alert are never written,
-  so blocks are invisible.
 - **F64**: the port-enforcement guarantee has no automated proof (the specs
   asserting a blocked `host:PORT` is actually blocked were never written).
-- **F65**: runtime-pulled images are tag-pinned only; the image that mounts
-  the git credential should be pinned by digest.
-- **F66**: the verify and deliver Jobs leave the service-account token
-  mounted in containers that run the agent's own code.
-- **F67**: the "import the agent's commit" step lets git read the agent's own
-  repo config, so an agent-chosen program can run inside the trusted import
-  step — in the deliver case, the same pod as the git credential.
 - **F68**: `spec.workspace.ref` and `spec.verify.acceptanceChecks` are
   unvalidated, so a crafted value can reach the credentialed scripts.
-- **F69**: the delivered PR body's facts section carries the agent's own
-  claim text presented as an operator fact, with no cap.
 - **F71**: the from-source build commands in `docs/QUICKSTART.md` §9 are
   wrong (a duplicated `PROXY_IMG`, `build-installer` given only the
   controller tag, and an uncreated `/tmp/d61-loop.yaml`) (PR #230's run).
@@ -892,8 +879,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   verify-checkout assertions, the probe 15 control Loop, exec-path
   equivalence; probe 6's direct leg is unproven because kind has no
   metadata service) (PR #222).
-- **F73**: a memory-writer Job that failed while its pod is stuck can
-  retry forever (the pod-present half of the closed F31 item; PR #229).
 
 **P3 (and P3 bundle):**
 
@@ -903,13 +888,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   complete for any target (F75), a failed fork-retention label SET that is
   not retried although the doc says it is (F76), and a rollback whose
   post-state is undefined (F77) (PR #238's run).
-- **F80**: the memory writer's summary field is not size-bounded by the
-  operator: `MemoryWritten.summary` carries the audit text (which can
-  include a whole lesson line quoted in a curator reason), and Kubernetes
-  truncates Event message strings at 4096 bytes without marking the cut, so
-  a summary longer than that silently loses its tail (the operator-side
-  1000-byte audit cut, F33/F78, bounds the audit text only — the condition
-  message can exceed it when a quoted lesson line is long).
 - **F81**: an envtest spec is flaky: a hard-coded ClusterIP it depends on is
   not a stable address across apiservers, so the run intermittently fails.
 
@@ -955,8 +933,8 @@ closed by the PRs named beside them. In plain words, the items still open:
 - whether to reject or document as unsupported the `spec.workspace.repo`
   ssh/scp forms the delivery path can never serve.
 
-No P1 fix outstanding from the merged batch remains open; the three P1
-security items above (F58, F60, F63) are the only P1 work queued.
+No P1 fix outstanding from the merged batch remains open; the two P1
+security items above (F58, F60) are the only P1 work queued.
 
 ### Docs — the six additions after #240
 

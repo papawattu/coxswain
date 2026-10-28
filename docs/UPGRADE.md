@@ -284,6 +284,53 @@ There is nothing to do unless you override one of the three flags: an override
 is yours to pin. `grep -c 'sha256:' dist/install.yaml` is non-zero for the
 operator's own image, as before.
 
+### The verify Job's containers are resource-bounded (F58)
+
+Every container in the verify Job now carries CPU and memory requests **and**
+limits (F58). Before this the Job was BestEffort: the first pod the kubelet
+evicts under node pressure, and a check that allocated without bound could
+take the node (and the sandbox on it) with it.
+
+| container | requests | limits |
+|---|---|---|
+| `clone-base`, `import-agent`, `tamper`, `artifact` (trusted) | cpu `100m`, memory `128Mi` | cpu `1`, memory `1Gi` |
+| `check-*` (your acceptance checks) | cpu `250m`, memory `256Mi`, ephemeral-storage `1Gi` | cpu `2`, memory `2Gi`, ephemeral-storage `2Gi` |
+| `noop` (the no-op main) | cpu `10m`, memory `16Mi` | cpu `100m`, memory `64Mi` |
+
+The `check-*` containers are the ones that run your commands, so they are the
+only ones with a knob: `spec.verify.resources` (a standard
+`ResourceRequirements`) replaces the defaults **per resource name** — setting
+only `limits.memory` keeps every other default. The trusted containers keep
+the operator's constants, and no Loop field moves them.
+
+Two behaviours of that knob are worth knowing before you copy a value in from
+somewhere else (F58): **lowering** a limit lowers the matching request with it
+(each name merges independently, and a request above its own limit is an invalid
+Job, so the operator lowers the request to the limit — `limits.memory: 128Mi`
+runs the check at 128Mi/128Mi), and **raising a request alone changes nothing**
+(`requests.memory: 4Gi` without a limit is lowered to the default `2Gi` limit).
+Only `requests` and `limits` are honoured: `claims` is accepted by the schema
+because the field is a whole `ResourceRequirements`, but it is **ignored** — the
+verify Job template carries no claim set, so a claim could never be satisfied.
+
+The per-check `/tmp` scratch is bounded too: each `check-tmp-<i>` emptyDir
+carries a `1Gi` `SizeLimit`. That is a constant, not part of
+`spec.verify.resources` (an ephemeral-storage *limit* only makes the kubelet
+evict sooner; the SizeLimit is what caps the disk). The `verify` checkout
+volume stays unbounded on purpose — its size is your repository.
+
+An acceptance check the kubelet **OOM-kills** is now reported as an
+infrastructure failure (`VerifyInfraRetry`, then `VerifyInfraFailed` at the
+bound), with the memory limit and the field that raises it in the message. It
+no longer comes back as `check-0 failed (exit 137)` and burns an iteration.
+Exit `137` with any other reason (a check that kills itself) still iterates.
+
+**What to do:** nothing, for an existing Loop whose checks fit cpu `2` /
+memory `2Gi` and write less than `1Gi` into `/tmp`. A heavier build sets
+`spec.verify.resources` (e.g. `limits.memory: 4Gi`). A check that legitimately
+needs more than `1Gi` of scratch cannot raise it yet — that bound is a
+follow-up field; write less, or clean up as you go.
+
 ### The chart no longer renders a second VAP binding
 
 Helm installs from v0.1.0–v0.1.2 rendered **two** `ValidatingAdmissionPolicyBinding` objects for the one ephemeral-container `ValidatingAdmissionPolicy`: the literal `coxswain-deny-ephemeral-containers` (correct), plus a templated one named after the release's fullname, `{{ fullname }}-deny-ephemeral-containers`, whose `policyName` named the templated name and therefore no existing VAP — so the second one was **inert** (it bound nothing; the gate still worked). PR #249 (F45) removed the templated template. `helm upgrade` normally deletes objects that the previous release tracked but the new manifest no longer carries, but that is not guaranteed if the binding was created out-of-band (a hand-rendered `helm template` piped to `kubectl apply`, a switch from `install.yaml` to Helm, or lost release history) — so run the manual check below either way. It is harmless: the stale binding is inert, and deleting it cannot weaken or disable the ephemeral-container gate.

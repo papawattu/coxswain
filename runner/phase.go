@@ -609,9 +609,13 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 	messages = append(messages, chatMessage{Role: jsonRoleUser, Content: prompt})
 
 	client := &http.Client{}
+	// F79: the phase drive (the runner binary's path, runner/cmd/main.go) runs
+	// the PRODUCTION ladder. The injectable seam is runConfig's
+	// ModelRetries/ModelRetryBackoff, which the F79 specs use against the same
+	// shared driveModel; PhaseConfig has no operator knob for it.
 	answer, trace, modelErr := driveModel(
 		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
-		messages, maxSteps, shellTimeout, modelTimeout, cfg.ExtraBody,
+		messages, maxSteps, shellTimeout, modelTimeout, modelRetryLadderFor(0, 0), cfg.ExtraBody,
 	)
 
 	res := Result{

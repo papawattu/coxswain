@@ -1094,12 +1094,13 @@ no pod — the sandbox controller terminates the backing pod and retains the obj
 `WaitForFirstConsumer` at `:26` and `:33`, and no `FailedScheduling` Event appears
 in the events block at `:19-33`). So there is no pod to exec into, which is the
 shape you want here. Two caveats: the template also carries a *required* node
-affinity for the BPF-labelled node (`applyBPFNodeAffinity`,
-`internal/controller/loop_controller.go:1875`, applied at `:2037`;
-`kubearmor.io/enforcer In bpf` by default,
-`internal/engine/kubearmor_enforcer.go:487-509`), so even a `Running` sandbox
-would not schedule on a cluster with no KubeArmor agent — though that affinity is
-dropped under `--allow-unenforced` (`BPFNodeAffinity` returns nil, `:481-484`),
+affinity for the BPF-labelled node (`applyBPFNodeAffinity` in
+`internal/controller/loop_controller.go`, applied by `ensureSandbox`;
+`kubearmor.io/enforcer In bpf` by default, from
+`KubeArmorEnforcer.BPFNodeAffinity` in `internal/engine/kubearmor_enforcer.go`),
+so even a `Running` sandbox would not schedule on a cluster with no KubeArmor
+agent — though that affinity is dropped under `--allow-unenforced`
+(`BPFNodeAffinity` returns nil),
 the escape hatch "What to do" above offers, and the F92 capture ran without it
 (`06-loop-final.txt:1`); and the capture included no `kubectl get pods`, so the pod
 list itself is not recorded — the object state above is.

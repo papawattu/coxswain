@@ -150,7 +150,7 @@ meetable):
 
 ## P3
 
-- [ ] **I148: #293 gave every spec reconciler a fake prober except one, and that one is the F49 no-pin spec**
+- [x] **I148: #293 gave every spec reconciler a fake prober except one, and that one is the F49 no-pin spec** (`534af86` (#298))
 
   **Where:** `internal/controller/loop_s6_delivery_envtest_test.go:450`
   (`r := &LoopReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
@@ -184,7 +184,7 @@ meetable):
   either sets a `CNIProber` or is the nil-prober spec, checked by grep; the S6
   focus stays green.
 
-- [ ] **I149: the Auto-mode step's comment promises the phase and the spec never asserts it**
+- [x] **I149: the Auto-mode step's comment promises the phase and the spec never asserts it** (`6a18beb` (#301))
 
   **Where:** `internal/controller/loop_approval_envtest_test.go:286-287` ("the
   sandbox must run at the SAME phase — this is the step that fails if only that
@@ -212,7 +212,7 @@ meetable):
   flip; `f49b-mA` still fails at `:292`; a mutation that makes Auto advance the
   phase fails the new assertion instead of passing silently.
 
-- [ ] **I150: a comment names `describe.go` as the home of a literal six of whose fourteen callers live elsewhere**
+- [x] **I150: a comment names `describe.go` as the home of a literal six of whose fourteen callers live elsewhere** (`6a18beb` (#301))
 
   **Where:** `internal/cli/approval.go:35-37` — "The read-only `getNested*(u,
   "status", …)` helpers in describe.go keep the literal". The call sites on

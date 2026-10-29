@@ -166,7 +166,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
 
 ## P2
 
-- [ ] **I151: a missing `KubeArmorPolicy` CRD leaves every Loop with an empty status (F92, fixed by #308 — `7fd171d`)**
+- [x] **I151: a missing `KubeArmorPolicy` CRD leaves every Loop with an empty status (F92, fixed by #308 — `7fd171d`)** (`7fd171d` (#308))
 
   **Fixed by #308 (`7fd171d`), merged 12:50Z: tick this box with that hash when the round merges.**
   **Every line number in this paragraph is at `7fd171d`** (the `33595e6` values are in the parenthesis
@@ -235,7 +235,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
 
 ## P3
 
-- [ ] **I152: the I144 terminal guard does not cover Paused, and both docs say it does**
+- [x] **I152: the I144 terminal guard does not cover Paused, and both docs say it does** (`8c46987` (#329))
 
   **Where:** `isTerminalPhase` (`loop_controller.go:6616-6618` at `7fd171d`, `:6712-6714` at `33595e6`,
   `:6504-6506` at `d2135d0` — Succeeded/Failed only) used by the memory re-announce guard (`loop_controller.go:1905`
@@ -255,7 +255,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   **Acceptance:** one sentence in both docs matching the code, or a spec asserting a Paused Loop
   schedules no re-announce window; whichever is chosen, a mutation on that clause fails it.
 
-- [ ] **I153: the I144 release-notes section sat inside the F84c entry, orphaning F84c's own bullets — fixed by #309**
+- [x] **I153: the I144 release-notes section sat inside the F84c entry, orphaning F84c's own bullets — fixed by #309** (`6a0407b` (#309))
 
   **Fixed by #309 (`6a0407b` = `6a0407ba…`), merged 12:12Z: tick this box with that hash when the
   round merges.**
@@ -279,7 +279,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   under its own heading and `### I144` after them, with the blank line (`6a0407b:300-306` holds all
   three).
 
-- [ ] **I154: four comments still describe the crashloop that C2 removed**
+- [x] **I154: four comments still describe the crashloop that C2 removed** (`9f77622` (#326))
 
   **Where:** `loop_i74_sandbox_terminal_test.go:200` ("…and crashloops"), `:215` ("the crashloop"),
   `:219` (the failure message "would crashloop on the terminal desired-phase") and
@@ -324,7 +324,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   **Acceptance:** the next three builder PRs' bodies name the merge-time tip and every cited line
   number resolves at that tip (checked by the reviewer at the ready mark).
 
-- [ ] **I156: the F53 deadline evidence is a unit seam for the no-pod case, and the message names the build constant**
+- [x] **I156: the F53 deadline evidence is a unit seam for the no-pod case, and the message names the build constant** (`d872d6d` (#344))
 
   **Where:** `loop_f53_verify_isolation_envtest_test.go:370-379` (the "no pod at all" case calls
   `verifyOutcome(nil, 1, false, true)` directly, not through `Reconcile`);
@@ -380,7 +380,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   command and its output are in the record, and each merged body that claims a restored cluster names that
   command.
 
-- [ ] **I158: the R40 tag is not applied yet**
+- [x] **I158: the R40 tag is not applied yet** (tag `review/phase1-r40` on `f372446` (#297))
 
   **Where:** `git tag -l 'review/phase1-r4*'` at `d2135d0` → `review/phase1-r4` (round 4,
   `6b4deb0`) only; #297 is open at `41f32d9`, not merged.
@@ -393,7 +393,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   **Acceptance:** `git tag -l 'review/phase1-r40'` names the squash commit of #297, and
   `git rev-list -1 review/phase1-r40` is that commit.
 
-- [ ] **I159: the F92 TROUBLESHOOTING sentence states the held Loop's phase as universal**
+- [x] **I159: the F92 TROUBLESHOOTING sentence states the held Loop's phase as universal** (`818c7ba` (#327))
 
   **Where:** `docs/TROUBLESHOOTING.md:896-897` at `7fd171d` (`:930-931` at `33595e6` — F56's entry above it
   moved the section): "`kubectl cox describe` shows the Loop at
@@ -479,7 +479,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   at `30e61e8`: `:902`, `:1535`, `:1538-1541`, `:1551-1558`, `:5339-5342`, `:5354-5356`, `:5444-5446`,
   `:911-914`.
 
-- [ ] **I161: #312's F56 release note says the Helm chart derives the four component images from `IMG`; it does not**
+- [x] **I161: #312's F56 release note says the Helm chart derives the four component images from `IMG`; it does not** (`05ca5bf` (#321))
 
   **Where:** `docs/RELEASE-NOTES-next.md:223` at `30e61e8` (`:267` at `33595e6`) — "Every production render (`make deploy`,
   `dist/install.yaml`, the Helm chart) now derives the runner and the three proxy images from `IMG` — same
@@ -507,7 +507,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   against `dist/chart/values.yaml:39-42`, `.github/workflows/release.yml:94-99` and
   `hack/image-args-test.sh:131-138`.
 
-- [ ] **I162: three fixed items are still listed under "Known issues still open"**
+- [x] **I162: three fixed items are still listed under "Known issues still open"** (`05ca5bf` (#321))
 
   **Where:** `docs/RELEASE-NOTES-next.md` at `221e012`, all under `## Known issues still open` (`:688`; `:726`
   at `33595e6`) whose lead-in says "In plain words, the items still open" (`:712`; `:750` at `33595e6`):
@@ -539,7 +539,7 @@ pi3 role could not verify read-only (anything on `kind-coxswain`) say so explici
   the F50/F52 leftovers, with F57 gone from the umbrella's name), and each item's own `###` entry remains the
   only other place it is named.
 
-- [ ] **I163: the rollback's F57a arm has no spec, so deleting it would keep the suite green**
+- [x] **I163: the rollback's F57a arm has no spec, so deleting it would keep the suite green** (`67aefc0` (#328))
 
   **Where:** `internal/controller/loop_restore.go:1001-1004` at `221e012` (the rollback branch's
   `errors.Is(err, errWorkspacePVCUnconfirmed)` → `return false, true, true, nil`). The round-2 spec that covers

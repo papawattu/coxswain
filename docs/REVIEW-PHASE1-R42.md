@@ -116,7 +116,7 @@ on `kind-coxswain`) say so explicitly. Every citation in this draft is audited i
 
 ## P3
 
-- [ ] **I166: the Known-issues list still names the two defects this window fixed**
+- [x] **I166: the Known-issues list still names the two defects this window fixed** (`273e4cc` (#364))
 
   **Where:** `docs/RELEASE-NOTES-next.md:790-792` — "**F71**: the from-source build commands in
   `docs/QUICKSTART.md` §9 are wrong (a duplicated `PROXY_IMG`, `build-installer` given only the

@@ -891,9 +891,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   no-pin delivery branch have no automated tests.
 - **F51**: the network-fence check reads an unresolvable address as
   "reached"; a missing checker leaves the gate open.
-- **F71**: the from-source build commands in `docs/QUICKSTART.md` §9 are
-  wrong (a duplicated `PROXY_IMG`, `build-installer` given only the
-  controller tag, and an uncreated `/tmp/d61-loop.yaml`) (PR #230's run).
 - **F72**: some of the evil-agent e2e's steps are still UNPROVEN (the
   verify-checkout assertions, the probe 15 control Loop, exec-path
   equivalence; probe 6's direct leg is unproven because kind has no
@@ -907,8 +904,6 @@ closed by the PRs named beside them. In plain words, the items still open:
   complete for any target (F75), a failed fork-retention label SET that is
   not retried although the doc says it is (F76), and a rollback whose
   post-state is undefined (F77) (PR #238's run).
-- **F81**: an envtest spec is flaky: a hard-coded ClusterIP it depends on is
-  not a stable address across apiservers, so the run intermittently fails.
 
 - **F50/F52**: small and low items — shipped samples pointing at repo
   contents they test, a checkpoint-recovery edge case, and a bundle of misc

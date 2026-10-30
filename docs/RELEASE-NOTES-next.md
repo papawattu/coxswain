@@ -62,6 +62,16 @@ override is yours to pin.
 
 ## Security fixes
 
+### F60: the verify canary, a negative control for in-process subversion — #366
+
+- **What was wrong.** The verify Job's acceptance checks and the other trusted inits run in the same pod as the agent's checkout: an agent that subverts the test harness in-process (the round-8 probe was a test that force-exited the binary with `os.Exit(0)`) could make every check exit 0 and the verify would pass with no detection (F60, PR #366, merged `fc04736`).
+- **What changed.** The verify Job now carries a canary init container (the `canary` container) that runs between the `artifact` and `check-0` inits: the init order in `buildVerifyJobSpec` is clone → import-agent → tamper → artifact → **canary** → the acceptance checks. The canary's script (`canaryCheckScript` in `internal/controller/loop_verify_job.go`) picks one of the agent's packages that has at least one `*_test.go`, copies it to its own writable scratch (post-F53 `/verify` is read-only), adds a generated `zzz_canary_test.go` that sorts last and contains a forced `t.Fatal`, and runs the package's full `go test`. Because the file sorts after the agent's test files, any in-process probe that force-exits the test binary kills it before the canary fires — which is exactly the subversion the canary is built to catch. The operator reads the canary init's exit code from the pod status (`readVerifyCanary`) and `verifyOutcome` maps it:
+  - **exit 43** — the test binary exited 0 despite the forced-failure canary test being present: the harness is subverted. The Loop is failed terminally with reason `SubvertedVerify`; no new verify Job is spawned.
+  - **exit 44** — the canary is unavailable: the target package has no `*_test.go`, or the canary test did not run (nothing to canary). **No decision** on the agent's work is recorded: the operator emits a one-shot `VerifyCanaryUnavailable` Warning Event (gated by the `coxswain.io/canary-unavailable-noted` annotation) and requeues, so the Loop stays in `Verifying`.
+  - **exit 45** — `go test`'s output matched a build-error pattern (`build failed`, `cannot find package`, `undefined:`, `syntax error`, and similar): **infrastructure** failure, never a subversion verdict — the *agent's* package may be what fails to build, not the canary's code. It is retried with the bounded verify-infra retry budget (`verifyInfraFailed`).
+  - **exit 0** — `go test` exited non-zero and its output matched neither the build-error nor the no-tests patterns: the harness respects failures and the negative control held. The forced `t.Fatal` firing is the intended case, but any other non-zero exit reads as healthy too. The acceptance checks then run.
+- **Open limits (observed by the reviewer running the exact canary script outside the cluster; open, not fixed).** The canary catches in-process subversion of a *tested* Go package; its coverage is narrower: a Go repository whose tests sit in a nested package (no `go.mod` at the repo root) is reported **healthy** even when its probe is subverted; a subverted package can be hidden behind an honest one when the canary tests the honest package first; an agent-controlled probe that makes `go test` print `testing: warning: no tests to run` turns a would-be 43 into a 44 (observed); an agent-controlled probe that prints a build-error string turns a would-be 43 into a 45 (this follows from the script's output grep — the build-error check runs before the no-tests check — and was not run); and a non-Go repository (for example `config/samples/loop-python-missing-function.yaml`) gets 44 and stays in `Verifying` with no end. No cause beyond these observations is claimed.
+
 ### F68: `spec.workspace.ref` and `spec.verify.acceptanceChecks` validated at admission — #332
 
 - **What was wrong.** Both values are interpolated into the verify and deliver scripts (shell-quoted since F37), so a crafted `spec.workspace.ref` or `spec.verify.acceptanceChecks` entry reached the credentialed scripts with no gate. `ref` was unbounded in length and charset, and a dash-leading ref-shaped argument is parsed by git as an **option** — a ref of `--upload-pack=/bin/true` makes the credentialed `git fetch origin <ref>` run that program (measured in `.samples/f68/01-ref-option-parse.txt`) (F68, PR #332, merged `911d2c6`).
@@ -875,9 +885,7 @@ closed by the PRs named beside them. In plain words, the items still open:
 
 **P1 (security):**
 
-- **F60**: there is no "canary" control check that is required to fail — a
-  passing canary would mean the checks were tampered with, but nothing
-  detects that.
+- **F60**: the verify canary shipped in #366 — it detects in-process subversion of a tested Go package (exit 43 → the terminal `SubvertedVerify`), but four limits were observed by the reviewer running the exact canary script outside the cluster, and they are **open, not fixed**: a Go repo whose tests sit in a nested package (no `go.mod` at the repo root) is reported healthy even when its probe is subverted; a subverted package can be hidden behind an honest package that the canary tests first; an agent-controlled probe that makes `go test` print `testing: warning: no tests to run` turns a would-be 43 into a 44 (a build-error string turns it into a 45 — from the script's output grep, not run); and a non-Go repo (e.g. `config/samples/loop-python-missing-function.yaml`) gets 44 and stays in `Verifying` with no end. No cause beyond these observations is claimed.
 
 **P2:**
 
@@ -947,8 +955,10 @@ closed by the PRs named beside them. In plain words, the items still open:
 - whether to reject or document as unsupported the `spec.workspace.repo`
   ssh/scp forms the delivery path can never serve.
 
-No P1 fix outstanding from the merged batch remains open; the one P1 security
-item above (F60) is the only P1 work queued.
+No P1 fix outstanding from the merged batch remains open; the F60 verify
+canary shipped in #366 closes the "no canary at all" gap, and the four
+open limits of that canary listed under the F60 P1 bullet above are the only
+P1 work queued.
 
 ### Docs — the six additions after #240
 

@@ -1605,157 +1605,43 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 		return verifyNoDecision, true, "", 0
 	}
 	// I65: the trusted inits (clone-base, import-agent) run BEFORE the evidence
-	// inits. A terminated non-zero trusted init is an infra failure naming the
-	// failed container — the checks never ran. A trusted init still Running or
-	// Waiting is PENDING (no decision, requeue — the I49 norm: in-progress is
-	// never a failure).
-	for j := range pod.Status.InitContainerStatuses {
-		ics := &pod.Status.InitContainerStatuses[j]
-		if ics.Name != verifyCloneBaseInit && ics.Name != verifyImportAgentInit {
-			continue
-		}
-		if ics.State.Terminated != nil && ics.Name == verifyImportAgentInit &&
-			ics.State.Terminated.ExitCode == verifyNotDescendantExit {
-			return verifyNotDescendant, false, ics.Name, ics.State.Terminated.ExitCode
-		}
-		if ics.State.Terminated != nil && ics.State.Terminated.ExitCode != 0 {
-			return verifyInfraFailed, false, ics.Name, ics.State.Terminated.ExitCode
-		}
-		if ics.State.Terminated == nil {
-			// Still Running or Waiting: the evidence inits cannot have started.
-			// No decision, requeue — even if the Job condition is already Failed
-			// (a backoff-retry is in flight for a Never-restart Job the pod is
-			// still settling; the next poll decides).
-			return verifyNoDecision, true, "", 0
-		}
+	// inits. Their decision is read by trustedInitDecision (F60-lint: extracted
+	// here to keep this function inside the gocyclo budget): a terminated
+	// non-zero trusted init is an infra failure naming the failed container —
+	// the checks never ran; a trusted init still Running or Waiting is PENDING
+	// (no decision, requeue — the I49 norm: in-progress is never a failure).
+	if d := trustedInitDecision(pod); d != nil {
+		return d.outcome, d.requeue, d.container, d.exitCode
 	}
-	// Find the tamper init.
-	tamperIdx := -1
-	for i := range pod.Status.InitContainerStatuses {
-		if pod.Status.InitContainerStatuses[i].Name == verifyTamperInit {
-			tamperIdx = i
-			break
-		}
+	// The evidence gates are walked in evidence order (tamper -> artifact ->
+	// canary -> checks); each helper returns the decision for its own gate
+	// only, and nil when the gate is not in force yet or has not finished
+	// (F60-lint: extracted from this function, same order, same decisions).
+	// The evidence gates are walked in evidence order (tamper -> artifact ->
+	// canary -> checks); each helper returns the decision for its own gate
+	// only, and a nil when the gate is not in force yet (absent from the
+	// pod's status) so the caller falls through to the next gate (F60-lint:
+	// extracted from this function, same order, same decisions).
+	if d := tamperGateDecision(pod); d != nil {
+		return d.outcome, d.requeue, d.container, d.exitCode
 	}
-	if tamperIdx < 0 {
-		return verifyNoDecision, true, "", 0
-	}
-	tamperStatus := pod.Status.InitContainerStatuses[tamperIdx]
-	if tamperStatus.State.Terminated == nil {
-		return verifyNoDecision, true, "", 0
-	}
-	// F39: exit tamperGitErrorExit means the script's own git diff failed (an
-	// infrastructure fault), not that the agent changed a protected path. It
-	// fails closed as an infra failure, never as TamperedVerify.
-	if tamperStatus.State.Terminated.ExitCode == tamperGitErrorExit {
-		return verifyInfraFailed, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
-	}
-	// F83c: an OOMKilled tamper init is the kubelet's kill, not a
-	// protected-path diff. Mapping it to verifyTampered would fail the Loop
-	// permanently for a resource limit, so it is an infra failure (the same
-	// fail-closed-but-not-blamed treatment as the git-error exit above).
-	if tamperStatus.State.Terminated.Reason == tamperOOMKilledReason {
-		return verifyInfraFailed, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
-	}
-	if tamperStatus.State.Terminated.ExitCode != 0 {
-		return verifyTampered, false, verifyTamperInit, tamperStatus.State.Terminated.ExitCode
-	}
-	// The I47 artifact check (the operator-side filter) runs BEFORE the
-	// checks: it is the gate to the acceptance checks, exactly like tamper is
-	// the gate to artifact (evidence order: tamper -> artifact -> checks).
-	// A non-zero artifact exit is an ITERATE with the container's own name
-	// ('artifact') and exit code. In progress (Terminated == nil) it is
-	// PENDING — no decision, requeue (the S5a pending-regression class).
-	// Checking it before the checks matters: when the artifact fails the
-	// checks never ran (the kubelet stops on the first non-zero init), so a
-	// check-0 status is ABSENT — reading the checks first would take the
-	// 'check not found' branch (noDecision) and never reach the artifact gate.
-	for j := range pod.Status.InitContainerStatuses {
-		ics := &pod.Status.InitContainerStatuses[j]
-		if ics.Name != verifyArtifactInit {
-			continue
-		}
-		if ics.State.Terminated == nil {
-			return verifyNoDecision, true, "", 0
-		}
-		if ics.State.Terminated.ExitCode != 0 {
-			return verifyIterate, false, verifyArtifactInit, ics.State.Terminated.ExitCode
-		}
-		break
+	if d := artifactGateDecision(pod); d != nil {
+		return d.outcome, d.requeue, d.container, d.exitCode
 	}
 	// F60 (D17.1): the canary runs BETWEEN artifact and check-0 (tamper ->
 	// artifact -> canary -> checks). Tamper and artifact are clean at this
-	// point, so the canary is the next gate. A terminated canary with exit 43
-	// is subversion (verifySubverted, terminal), 44 is canary-unavailable
-	// (verifyCanaryUnavailable, no decision + one event), 45 is an infra
-	// failure (verifyInfraFailed, bounded retry). A terminated canary with
-	// exit 0 is the HEALTHY negative control — proceed to the checks. A
-	// canary still Running/Waiting is PENDING (no decision, requeue — the I49
-	// norm, exactly like the tamper / artifact gates above).
-	canary := readVerifyCanary(pod)
-	if canary.found {
-		if !canary.terminated {
-			return verifyNoDecision, true, "", 0
-		}
-		switch canary.code {
-		case verifyCanarySubvertedExit:
-			return verifySubverted, false, verifyCanaryInit, canary.code
-		case verifyCanaryUnavailableExit:
-			// The target package has no *_test.go (the canary has nothing to run):
-			// NO decision on the agent's work. Return requeue=false so the Reconcile
-			// reaches applyVerifyOutcome, which records the one-time
-			// VerifyCanaryUnavailable event and requeues (staying Verifying). It is
-			// not a subversion verdict, not an infra retry (M7).
-			return verifyCanaryUnavailable, false, verifyCanaryInit, canary.code
-		case verifyCanaryBuildErrorExit:
-			// A build error is an infra failure (bounded retry), NEVER a
-			// subversion verdict (M8's trap: mapping 45 to infra is correct; the
-			// subverted path is exit 43 only).
-			return verifyInfraFailed, false, verifyCanaryInit, canary.code
-		}
-		// exit 0 (healthy): the generated test honestly failed, the negative
-		// control held. Proceed to the acceptance checks below.
-	}
-	// The canary is absent from the pod's status (a pre-F60 legacy pod, or a
-	// test fixture that plants the old init set): the canary gate is not in
+	// point, so the canary is the next gate. A canary still Running/Waiting is
+	// PENDING (no decision, requeue — the I49 norm, exactly like the tamper /
+	// artifact gates above); a canary absent from the pod's status (a pre-F60
+	// legacy pod, or a test fixture that plants the old init set) is not in
 	// force, so fall through to the checks (the pre-F60 decision path).
-	// Tamper clean + artifact clean + canary healthy: read the check inits
-	// (check-0 .. check-<checkCount-1>).
-	for i := range checkCount {
-		name := fmt.Sprintf("check-%d", i)
-		check := readVerifyCheck(pod, name)
-		if !check.found {
-			// The check init is not in the pod status at all (the Job pod has
-			// fewer inits than expected — a malformed Job). No evidence.
-			return verifyNoDecision, true, "", 0
-		}
-		if !check.terminated {
-			// Not terminated: the check is still running or waiting (kubelet
-			// has not advanced it yet). That is PENDING, not a failure —
-			// exactly like a non-terminated tamper: take no decision and
-			// requeue. Treating it as a failure (the S5a regression) iterated a
-			// passing run to Failed: MaxIterationsExceeded with the misleading
-			// text 'check-0 failed (exit 0)'.
-			return verifyNoDecision, true, "", 0
-		}
-		code, oom := check.code, check.oom
-		// F58: an OOM-killed check is the kubelet killing the container at its
-		// memory limit, not the agent's work failing — the same
-		// fail-closed-but-not-blamed rule F83c applies to the tamper init. It
-		// goes to verifyInfraFailed (a bounded infra retry, then
-		// Failed:VerifyInfraFailed) BEFORE the code!=0 branch, because the OOM
-		// exit code is 137 and would otherwise be reported as 'check-k failed
-		// (exit 137)' — burning an iteration and a stall entry for a resource
-		// limit. Exit 137 with any other reason (a check that kill -9s itself)
-		// stays an iterate: only the kubelet's own reason is infra.
-		if oom {
-			return verifyInfraFailed, false, name, code
-		}
-		if code != 0 {
-			return verifyIterate, false, name, code
-		}
+	if d := canaryGateDecision(pod); d != nil {
+		return d.outcome, d.requeue, d.container, d.exitCode
 	}
-	return verifySucceeded, false, "", 0
+	// Tamper clean + artifact clean + canary healthy (or absent): read the
+	// check inits (check-0 .. check-<checkCount-1>).
+	d := checkGateDecision(pod, checkCount)
+	return d.outcome, d.requeue, d.container, d.exitCode
 }
 
 // verifyCheckResult is one acceptance check's read from the pod's init statuses.
@@ -1968,57 +1854,18 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	iter := int32(loop.Status.Iteration)
 	loop.Status.Verify.Iteration = &iter
 	// Record the check exit codes (one per acceptance check, in order).
-	// A check that did not run (the pod status lacks it) is recorded as nil.
-	if pod != nil {
-		results := make([]*int32, checkCount)
-		for i := range checkCount {
-			name := fmt.Sprintf("check-%d", i)
-			found := false
-			for j := range pod.Status.InitContainerStatuses {
-				if pod.Status.InitContainerStatuses[j].Name == name {
-					if pod.Status.InitContainerStatuses[j].State.Terminated != nil {
-						code := pod.Status.InitContainerStatuses[j].State.Terminated.ExitCode
-						results[i] = &code
-					} else {
-						// The check is still running (not terminated): record -1
-						// as a sentinel (the API server rejects nil).
-						notRun := int32(-1)
-						results[i] = &notRun
-					}
-					found = true
-					break
-				}
-			}
-			if !found {
-				// The check did not run: record -1 as a sentinel.
-				notRun := int32(-1)
-				results[i] = &notRun
-			}
-		}
-		loop.Status.Verify.LastCheckResults = results
-	}
+	// A check that did not run (the pod status lacks it) is recorded as -1
+	// as a sentinel (the API server rejects nil). recordCheckResults was
+	// extracted from this function (F60-lint: the nested found/notRun
+	// branches added complexity).
+	recordCheckResults(pod, loop, checkCount)
 	// B5a: bumpVerifyResult is called for every verify outcome decision.
 	bumpVerifyResult(outcome)
 	switch outcome {
 	case verifySucceeded:
-		// B4: clear the failure summary (the last verify passed — the failure
-		// is resolved; the next planning prompt must not carry a stale summary).
-		clearLastFailureSummary(loop)
-		if deliveryEnabled(loop) {
-			// P5f (I98, D69 option i): hold at Verifying (reason Delivering)
-			// until the Delivered condition is terminal; Succeeded (phase and
-			// desiredPhase) is set by settleDeliveryHold.
-			setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue,
-				coxv1alpha1.ReasonVerifyingDelivering,
-				"verify passed; holding Succeeded until delivery (Delivered condition) is terminal")
-			return true, false
-		}
-		loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
-		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
-		// B5a: terminal transition — bump the completion counter and clear the
-		// active gauge.
-		bumpLoopCompletion("succeeded", "verify_passed")
-		return true, false
+		// F60-lint: the case body moved verbatim to applyVerifySucceeded to
+		// keep this function inside the gocyclo budget.
+		return r.applyVerifySucceeded(loop)
 	case verifyInfraFailed:
 		// I65: the verify infrastructure failed (a trusted init died, or the
 		// Job went Failed with no check evidence) BEFORE the evidence ran. The
@@ -2032,173 +1879,23 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// failure and per retry, so the wedge that I65 fixes is observable).
 		return r.applyVerifyInfraFailure(ctx, loop, pod, job, failedCheck, checkExitCode, deadlineExceeded)
 	case verifyIterate:
-		// P2e stall gate (evaluated BEFORE the budget/maxIterations cap —
-		// stall wins: a capped loop that is ALSO stalled is Failed:Stalled,
-		// not Failed:MaxIterationsExceeded). Read the failing check's raw
-		// output (the readCheckOutput seam / terminationMessage), normalise
-		// it, append the StallEntry (dedup'd by jobName), and evaluate the
-		// stall decision. A fire applies the stall action (Fail / Pause /
-		// Continue); a non-fire falls through to the iterate below.
-		if r.applyStallGate(ctx, loop, pod, failedCheck) {
-			return true, false
-		}
-		// B4 (PLAN-BETA B4; PLAN.md Phase 6 remainder): onVerifyFail selects
-		// the destination on a failed verify. Implement (the default) iterates
-		// back to Implementing (the agent re-works the failing check — the
-		// alpha behaviour). Plan sends the Loop back to PLANNING with the
-		// failure summary fed into the next planning prompt (reusing B3's
-		// plan-feedback channel, .coxswain/plan-feedback, written by the
-		// phase-init from the durable status field status.verify.
-		// lastFailureSummary). The iteration is STILL incremented either way
-		// (the stall detector and maxIterations count iterations across
-		// re-plans — a re-plan is not a reset; the cap below applies to both
-		// destinations). The pin is cleared either way (the next run produces
-		// a new headCommit and re-pins on the next advance). With
-		// approval.mode Manual the re-plan goes through AwaitingApproval again
-		// (the claim-driven advance: the runner's next Planning claim, once the
-		// user approves, advances to Implementing — the gate's hold re-enters
-		// on the new plan). The operator is the sole writer of status
-		// (ADR-0004).
-		onVerifyFail := loop.Spec.Verify.OnVerifyFail
-		if onVerifyFail == "" {
-			onVerifyFail = coxv1alpha1.OnVerifyFailImplement // the CRD default
-		}
-		nextIter := max(loop.Status.Iteration+1, 2)
-		cap := loop.Spec.Loop.MaxIterations
-		if cap <= 0 {
-			cap = defaultMaxIterations
-		}
-		if nextIter > cap {
-			// The cap is hit: the last allowed iteration's check failed. Fail
-			// the Loop (terminal) instead of iterating again — this is the
-			// hot-loop guard (a failing check without a cap would create
-			// verify-N jobs in a tight loop). The cap applies to BOTH the
-			// iterate (Implementing) and the re-plan (Planning) paths: a
-			// re-plan does not bypass it (the increment is the same either way,
-			// so the cap is reached at the same iteration).
-			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
-				MaxIterationsExceededReason,
-				fmt.Sprintf("acceptance check %s failed (exit %d) on iteration %d; the maxIterations cap (%d) is reached",
-					failedCheck, checkExitCode, loop.Status.Iteration, cap))
-			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
-			// B5a: terminal transition — bump the completion counter and clear
-			// the active gauge.
-			bumpLoopCompletion("failed", "max_iterations")
-			return true, false
-		}
-		loop.Status.Iteration = nextIter
-		// B5a: count the iteration increment (the iterate and re-plan paths
-		// both increment status.iteration; this is the "iterations per Loop"
-		// metric from PLAN-BETA B5).
-		bumpIteration()
-		from := loop.Status.Phase // Verifying — the ACTUAL previous phase (OS5)
-		// Clear the current pin: the next run will produce a new headCommit and
-		// re-pin on the next advance (the fresh Job is created for THAT pin
-		// only). Applies to BOTH the iterate (Implementing) and the re-plan
-		// (Planning) paths.
-		loop.Status.CurrentVerify = nil
-		// F83d (P3-5): the tamper record is per-pin, so it goes with the pin.
-		// Without this the previous pin's verdict stays on display for the WHOLE
-		// next Implementing run (the record is only re-stamped at the next
-		// advance, and the record writer runs before this decision in the same
-		// pass) — exactly the window P3-5 names, and the delivered-PR-body
-		// renderer reads it with no pin guard.
-		clearTamperRecord(loop.Status.Verify)
-		// F52 B2 follow-up (pi3 early-343 P3-1): the settle record on the
-		// Verifying condition (False, reason Delivered / DeliveryFailed /
-		// VerifySettled) describes the iteration that settled. This attempt
-		// FAILED and the Loop is iterating, so the record is stale — clear it
-		// with the rest of the per-pin state (the line above) instead of
-		// leaving "verify passed, delivered" on a Loop that is going back to
-		// Implementing or Planning.
-		clearCondition(loop, string(coxv1alpha1.LoopPhaseVerifying))
-		// OS1: record the failing check into progress (the next run can target
-		// it). The progress block is the operator's structured record; this is
-		// the operator's own evidence (the verify Job pod's exit codes), not a
-		// runner claim.
-		if loop.Status.Progress == nil {
-			loop.Status.Progress = &coxv1alpha1.ProgressStatus{}
-		}
-		loop.Status.Progress.LastResultStatus = fmt.Sprintf("check-failed: %s (exit %d)", failedCheck, checkExitCode)
-		loop.Status.Progress.Iteration = loop.Status.Iteration
-		switch onVerifyFail {
-		case coxv1alpha1.OnVerifyFailPlan:
-			// B4: re-plan — back to Planning with the failure summary fed into
-			// the next planning prompt (the B3 plan-feedback channel). The
-			// failure summary is made DURABLE on status.verify.lastFailureSummary
-			// (the operator's record; the phase-init reads it to write .coxswain/
-			// plan-feedback). The summary names the failing check, its exit code,
-			// and (when readable) the check's raw output tail (reusing the
-			// readCheckOutputSeam the stall gate already read — no second read).
-			loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
-			loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
-			// I42b: increment planAttempt so a stale Planning success claim
-			// from a prior attempt is rejected by advancePhaseFromClaim (the
-			// claim's planAttempt does not match the new status.planAttempt).
-			loop.Status.PlanAttempt++
-			// F38 (gates P1-1): the re-plan invalidates the prior approval, as
-			// the rejection path does (loop_approval.go). Left in place, the
-			// stale approved hash opens the Planning -> Implementing gate for a
-			// plan the user never saw.
-			if conditionTruePresent(loop, coxv1alpha1.PlanApprovedCondition) {
-				clearCondition(loop, coxv1alpha1.PlanApprovedCondition)
-			}
-			if loop.Status.Verify == nil {
-				loop.Status.Verify = &coxv1alpha1.VerifyStatus{}
-			}
-			loop.Status.Verify.LastFailureSummary = verifyFailureSummary(pod, failedCheck, checkExitCode)
-			// OS5: the re-plan is a distinct Event with the correct from-phase
-			// (Verifying -> Planning, never the stale phase a leftover claim
-			// would imply). The failing check + exit code ride in the message.
-			r.emitVerifyReplanEvent(loop, from, failedCheck, checkExitCode, nextIter)
-			return true, false
-		default: // OnVerifyFailImplement (the default)
-			// Back to Implementing, iteration+1 — NOT a new verify Job (the Job
-			// is created only for a fresh pin at the next advance). The failing
-			// check rides into status.progress so the next Implementing run can
-			// target it.
-			loop.Status.Phase = coxv1alpha1.LoopPhaseImplementing
-			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
-			// OS5: the iterate is a distinct Event with the correct from-phase
-			// (Verifying -> Implementing, never the stale phase a leftover claim
-			// would imply). The failing check + exit code ride in the message.
-			r.emitVerifyIteratedEvent(loop, from, failedCheck, checkExitCode, nextIter)
-			return true, false
-		}
+		// F60-lint: the case body (stall gate, maxIterations cap, the
+		// Implement/Plan destination split) moved verbatim to
+		// applyVerifyIterate to keep this function inside the gocyclo budget.
+		return r.applyVerifyIterate(ctx, loop, pod, failedCheck, checkExitCode)
 	case verifyNotDescendant:
 		// F43: the pinned commit does not descend from baseCommit. Terminal and
 		// distinct from TamperedVerify / VerifyInfraFailed (no retry: a re-run
-		// would import the same pin).
-		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
-			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
-				PinNotDescendantReason, "the pinned commit is not a descendant of baseCommit (the runner's headCommit claim was refused)")
-			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
-			bumpLoopCompletion("failed", "pin_not_descendant")
-			if r.Recorder != nil {
-				r.Recorder.Eventf(loop, corev1.EventTypeWarning, PinNotDescendantReason,
-					"the pinned commit %s is not a descendant of baseCommit %s; failing the Loop",
-					loop.Status.CurrentVerify.VerifiedCommit, loop.Status.BaseCommit)
-			}
-			return true, false
-		}
+		// would import the same pin). F60-lint: the case body moved verbatim
+		// to applyVerifyNotDescendant.
+		return r.applyVerifyNotDescendant(loop)
 	case verifyTampered:
 		// The tamper verdict: verifyOutcome read the pod's tamper init (the
 		// operator-only evidence), and this is the terminal decision. There is
 		// no other reader of status.verify.tamperExitCode that decides a Loop
 		// (F83c deleted the status-driven gate); a nil code is no decision, not
-		// clean.
-		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
-			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
-				TamperedVerifyReason, "a protected path changed between baseCommit and verifiedCommit")
-			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
-			// B5a: terminal transition — bump the completion counter and clear
-			// the active gauge.
-			bumpLoopCompletion("failed", "tampered")
-			return true, false
-		}
+		// clean. F60-lint: the case body moved verbatim to applyVerifyTampered.
+		return r.applyVerifyTampered(loop)
 	case verifySubverted:
 		// F60 (D17.1): the canary detected in-process subversion — the test
 		// binary ignored the forced t.Fatal (exit 43, the round-8 os.Exit(0)
@@ -2206,21 +1903,8 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// test binary dishonest, so no acceptance check is trustworthy. Fail the
 		// Loop with the distinct SubvertedVerify reason; no new verify Job is
 		// created (a re-run would import the same subverted commit).
-		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
-			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
-				SubvertedVerifyReason,
-				"the verify canary detected in-process subversion: the test binary ignored the forced failure (round-8 probe)")
-			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
-			// B5a: terminal transition — bump the completion counter and clear
-			// the active gauge.
-			bumpLoopCompletion("failed", "subverted")
-			if r.Recorder != nil {
-				r.Recorder.Eventf(loop, corev1.EventTypeWarning, SubvertedVerifyReason,
-					"the verify canary detected in-process subversion (the test binary ignored the forced failure); failing the Loop")
-			}
-			return true, false
-		}
+		// F60-lint: the case body moved verbatim to applyVerifySubverted.
+		return r.applyVerifySubverted(loop)
 	case verifyCanaryUnavailable:
 		// F60: the canary exited 44 — the target package has no *_test.go
 		// (nothing to canary). NO decision on the agent's work: the Loop stays
@@ -2230,17 +1914,8 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// Verifying until the next pin re-creates a fresh verify Job (the
 		// requeue keeps it alive); a Loop with no testable package is a
 		// configuration smell the user sees via the event, not a verdict.
-		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying &&
-			loop.Annotations[verifyCanaryUnavailableAnnotation] != "1" && r.Recorder != nil {
-			if loop.Annotations == nil {
-				loop.Annotations = map[string]string{}
-			}
-			loop.Annotations[verifyCanaryUnavailableAnnotation] = "1"
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, VerifyCanaryUnavailableReason,
-				"the verify canary is unavailable (no *_test.go in the target package); no decision recorded")
-			return true, true // requeue (stays Verifying)
-		}
-		return true, true // no decision: requeue, stay Verifying
+		// F60-lint: the case body moved verbatim to applyVerifyCanaryUnavailable.
+		return r.applyVerifyCanaryUnavailable(loop)
 	}
 	return false, false
 }

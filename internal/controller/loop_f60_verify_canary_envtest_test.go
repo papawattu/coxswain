@@ -139,8 +139,8 @@ var _ = Describe("F60: the verify canary (D17.1 negative control)", func() {
 	// ("" when the volume is absent or has no SizeLimit).
 	f60VolumeSizeLimit := func(podSpec corev1.PodSpec, name string) string {
 		for _, v := range podSpec.Volumes {
-			if v.Name == name && v.VolumeSource.EmptyDir != nil && v.VolumeSource.EmptyDir.SizeLimit != nil {
-				return v.VolumeSource.EmptyDir.SizeLimit.String()
+			if v.Name == name && v.EmptyDir != nil && v.EmptyDir.SizeLimit != nil {
+				return v.EmptyDir.SizeLimit.String()
 			}
 		}
 		return ""

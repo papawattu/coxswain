@@ -51,7 +51,9 @@ func TestCanaryCheckScript(t *testing.T) {
 	t.Run("healthy: the forced-failure canary test makes go test non-zero", func(t *testing.T) {
 		root := t.TempDir()
 		verify := filepath.Join(root, "verify")
-		os.MkdirAll(verify, 0o755)
+		if err := os.MkdirAll(verify, 0o755); err != nil {
+			t.Fatalf("mkdir verify: %v", err)
+		}
 		mustWriteFile(t, filepath.Join(verify, "go.mod"), []byte("module demo\n\ngo 1.26\n"))
 		writeFile(t, verify, "main.go", "package demo\n\nfunc Add(a, b int) int { return a + b }\n")
 		writeFile(t, verify, "main_test.go",
@@ -73,7 +75,9 @@ func TestCanaryCheckScript(t *testing.T) {
 	t.Run("subverted: the test binary exits 0 regardless (init os.Exit(0) probe)", func(t *testing.T) {
 		root := t.TempDir()
 		verify := filepath.Join(root, "verify")
-		os.MkdirAll(verify, 0o755)
+		if err := os.MkdirAll(verify, 0o755); err != nil {
+			t.Fatalf("mkdir verify: %v", err)
+		}
 		mustWriteFile(t, filepath.Join(verify, "go.mod"), []byte("module demo\n\ngo 1.26\n"))
 		writeFile(t, verify, "main.go", "package demo\n\nfunc Add(a, b int) int { return a + b }\n")
 		// The subversion: a test init() that exits the binary 0 BEFORE any test
@@ -95,7 +99,9 @@ func TestCanaryCheckScript(t *testing.T) {
 	t.Run("unavailable: a package with no *_test.go", func(t *testing.T) {
 		root := t.TempDir()
 		verify := filepath.Join(root, "verify")
-		os.MkdirAll(verify, 0o755)
+		if err := os.MkdirAll(verify, 0o755); err != nil {
+			t.Fatalf("mkdir verify: %v", err)
+		}
 		mustWriteFile(t, filepath.Join(verify, "go.mod"), []byte("module demo\n\ngo 1.26\n"))
 		writeFile(t, verify, "main.go", "package demo\n\nfunc Add(a, b int) int { return a + b }\n")
 
@@ -108,7 +114,9 @@ func TestCanaryCheckScript(t *testing.T) {
 	t.Run("build error: a package that does not compile", func(t *testing.T) {
 		root := t.TempDir()
 		verify := filepath.Join(root, "verify")
-		os.MkdirAll(verify, 0o755)
+		if err := os.MkdirAll(verify, 0o755); err != nil {
+			t.Fatalf("mkdir verify: %v", err)
+		}
 		mustWriteFile(t, filepath.Join(verify, "go.mod"), []byte("module demo\n\ngo 1.26\n"))
 		// A non-test source file with a syntax error: the package does not
 		// compile → the canary exits 45 (infra), never 43 (subversion).

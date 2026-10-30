@@ -116,7 +116,7 @@ on `kind-coxswain`) say so explicitly. Every citation in this draft is audited i
 
 ## P3
 
-- [ ] **I166: the Known-issues list still names the two defects this window fixed**
+- [x] **I166: the Known-issues list still names the two defects this window fixed** (`273e4cc` (#364))
 
   **Where:** `docs/RELEASE-NOTES-next.md:790-792` — "**F71**: the from-source build commands in
   `docs/QUICKSTART.md` §9 are wrong (a duplicated `PROXY_IMG`, `build-installer` given only the
@@ -271,7 +271,7 @@ on `kind-coxswain`) say so explicitly. Every citation in this draft is audited i
   `loop_f75_legacy_restore_envtest_test.go`; and the next restore/marker change's first cut carries
   that legacy-state spec (checked at the early look, not the second round).
 
-- [ ] **I173: #348's first cut cited an evidence line that does not exist, and named the wrong cause for the missing pod**
+- [x] **I173: #348's first cut cited an evidence line that does not exist, and named the wrong cause for the missing pod** (`fec72f1` (#365))
 
   **Where:** the first cut of #348 cited `.samples/f92-kind/06-loop-final.txt:37` — the file has **33
   lines** (`wc -l`), the `WaitForFirstConsumer` evidence is at `:26` and `:33`, and the "no pod"

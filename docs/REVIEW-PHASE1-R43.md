@@ -90,7 +90,7 @@ the merge list (`gh pr list --state merged`), and the current builder brief
 
 ## P2
 
-- [ ] **I177: #340's egress-proxy spec cannot detect the mutation its own body says it detects**
+- [x] **I177: #340's egress-proxy spec cannot detect the mutation its own body says it detects** (`9da5cb7` (#359))
 
   **Where:** the spec is `It("a no-op reconcile leaves the egress proxy Service resourceVersion
   UNCHANGED (F11, no reconcile storm)", …)` at `internal/controller/loop_i42b_egress_proxy_test.go:262`;

@@ -2724,6 +2724,22 @@ func nextPhase(current, reported coxv1alpha1.LoopPhase) coxv1alpha1.LoopPhase {
 // (ADR-0005 D10). It is set before any acceptance check runs.
 const TamperedVerifyReason = "TamperedVerify"
 
+// SubvertedVerifyReason (F60, D17.1) is the terminal Failed reason recorded
+// when the verify canary detected in-process subversion: the test binary
+// ignored the forced t.Fatal (exited 0 despite the generated canary test
+// failing — the round-8 os.Exit(0)/testing.M probe). It is set before any
+// acceptance check is trusted: the agent's own code made the test binary
+// dishonest, so every check's exit code is untrustworthy. Terminal, like
+// TamperedVerify: the Loop is Failed and no new verify Job is created.
+const SubvertedVerifyReason = "SubvertedVerify"
+
+// VerifyCanaryUnavailableReason (F60) is the Warning Event reason the
+// operator records when the canary init exited 44 — the target package has
+// no *_test.go (nothing to canary). It is a NO-DECISION event: the Loop
+// stays Verifying and no verdict is drawn on the agent's work. Emitted
+// exactly once (idempotent — see the one-shot annotation in applyVerifyOutcome).
+const VerifyCanaryUnavailableReason = "VerifyCanaryUnavailable"
+
 // PinNotDescendantReason is the terminal Failed reason recorded when the verify
 // Job's import-agent init refused the pinned commit because it is not a
 // descendant of status.baseCommit (F43).

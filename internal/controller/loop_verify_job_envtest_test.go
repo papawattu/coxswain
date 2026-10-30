@@ -469,12 +469,13 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		By("ordering the init containers: clone-base, import-agent, tamper, artifact, then the checks")
 		inits := job.Spec.Template.Spec.InitContainers
-		Expect(inits).To(HaveLen(5), "clone + import + tamper + artifact + 1 check")
+		Expect(inits).To(HaveLen(6), "clone + import + tamper + artifact + canary + 1 check")
 		Expect(inits[0].Name).To(Equal("clone-base"))
 		Expect(inits[1].Name).To(Equal("import-agent"))
 		Expect(inits[2].Name).To(Equal("tamper"))
 		Expect(inits[3].Name).To(Equal("artifact"))
-		Expect(inits[4].Name).To(Equal("check-0"))
+		Expect(inits[4].Name).To(Equal("canary"), "F60: the canary sits after artifact, before the checks")
+		Expect(inits[5].Name).To(Equal("check-0"))
 		Expect(job.Spec.Template.Spec.Containers).To(HaveLen(1))
 		Expect(job.Spec.Template.Spec.Containers[0].Name).To(Equal("noop"))
 
@@ -1150,10 +1151,11 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)).To(Succeed())
 		inits := job.Spec.Template.Spec.InitContainers
-		Expect(inits).To(HaveLen(5), "clone + import + tamper + artifact + 1 check")
+		Expect(inits).To(HaveLen(6), "clone + import + tamper + artifact + canary + 1 check")
 		Expect(inits[2].Name).To(Equal("tamper"))
-		Expect(inits[3].Name).To(Equal("artifact"), "the artifact check sits AFTER tamper, BEFORE the checks")
-		Expect(inits[4].Name).To(Equal("check-0"))
+		Expect(inits[3].Name).To(Equal("artifact"), "the artifact check sits AFTER tamper, BEFORE the canary and the checks")
+		Expect(inits[4].Name).To(Equal("canary"), "F60: the canary sits after artifact, before the checks")
+		Expect(inits[5].Name).To(Equal("check-0"))
 
 		By("the artifact container is a trusted git container: base image, safe.directory env, hardened profile, NO credential mount")
 		art := inits[3]
@@ -1555,8 +1557,8 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		inits := job.Spec.Template.Spec.InitContainers
 		// check-0 uses the Loop's verify.image... (it sits AFTER the artifact
 		// check — clone + import + tamper + artifact are the trusted inits).
-		Expect(inits[4].Name).To(Equal("check-0"))
-		Expect(inits[4].Image).To(Equal(verifyDefaultCheckImage),
+		Expect(inits[5].Name).To(Equal("check-0"))
+		Expect(inits[5].Image).To(Equal(verifyDefaultCheckImage),
 			"check-* containers must run on spec.verify.image (they may need a Go toolchain)")
 		// ...while the trusted inits stay on the git image (they never run
 		// user commands — the I47 artifact check is one of them: it runs the
@@ -1592,10 +1594,10 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		inits := job.Spec.Template.Spec.InitContainers
 		// check-0 sits after the I47 artifact check (clone + import + tamper
 		// + artifact = indices 0-3).
-		Expect(inits[4].Name).To(Equal("check-0"))
-		Expect(inits[4].Image).To(Equal(verifyDefaultCheckImage),
+		Expect(inits[5].Name).To(Equal("check-0"))
+		Expect(inits[5].Image).To(Equal(verifyDefaultCheckImage),
 			"without spec.verify.image the checks run on the built-in Go default (go: not found fix)")
-		Expect(inits[4].Image).NotTo(Equal("docker.io/alpine/git:v2.54.0"),
+		Expect(inits[5].Image).NotTo(Equal("docker.io/alpine/git:v2.54.0"),
 			"the git image has no Go toolchain — the S5a check-0 exit 127 root cause")
 	})
 

@@ -104,6 +104,26 @@ const (
 	// name (the operator-side filter for ADDED files in the verified
 	// commit).
 	verifyArtifactInit = "artifact"
+	// verifyCanaryInit is the F60 (D17.1) negative-control canary init
+	// container's name: it runs BETWEEN artifact and check-0 (a canary named
+	// check-N would be read as a user check — verifyOutcome counts check-%d
+	// by index). It runs a generated Go test that is REQUIRED to fail; a
+	// subverted test binary (the round-8 os.Exit(0) probe) that exits 0
+	// regardless of tests makes the canary report subversion.
+	verifyCanaryInit = "canary"
+	// verifyCanaryTmpVolName is the canary init's own writable /tmp scratch
+	// (F53: post-F53 /verify is read-only, so the canary copies the checkout
+	// to its own scratch and runs the generated test there). Bounded like the
+	// per-check scratch.
+	verifyCanaryTmpVolName = "check-tmp-canary"
+	// verifyCanaryUnavailableAnnotation is the one-shot annotation the
+	// operator sets when it records the VerifyCanaryUnavailable event (F60):
+	// it gates the event so it fires exactly ONCE per Loop (idempotent across
+	// the requeues that hold the Loop at Verifying). Cleared by the next pin
+	// (a fresh verify Job resets the annotation map on the new Job object; the
+	// annotation lives on the Loop and is re-cleared at the pin in
+	// ensureVerifyJob when a new Job is created — see the annotation clear).
+	verifyCanaryUnavailableAnnotation = "coxswain.io/canary-unavailable-noted"
 	// verifyArtifactMaxBytes is the I47 size cap for a file ADDED in
 	// baseCommit..verifiedCommit (1 MiB — the same cap the runner's
 	// commitWorkspace refuses against on the agent side).
@@ -596,6 +616,135 @@ exit 0
 		verifyArtifactScanBytes, shellQuote(verifyCommit), verifyArtifactScanBytes, verifyArtifactScanBytes/1024)
 }
 
+// canaryCheckScript builds the F60 (D17.1) canary init's sh script: the NEGATIVE
+// CONTROL for in-process subversion. The canary generates a Go test that is
+// REQUIRED to fail (t.Fatal with a random token), runs it in a separate copy
+// of a tested package, and maps the outcome to a canary exit code the
+// operator reads from the pod's init status:
+//
+//	0  → the generated test honestly failed (the forced t.Fatal fired; the
+//	     test binary respected the failure). The healthy negative control:
+//	     a real, functioning test binary. The token is printed to the log
+//	     as the proof the honest failure actually ran.
+//	43 → the test binary ignored the forced failure (exited 0 despite
+//	     t.Fatal) — the round-8 os.Exit(0)/testing.M probe. Subversion
+//	     detected → the operator maps this to the terminal SubvertedVerify
+//	     verdict.
+//	44 → the target package has no *_test.go (nothing to canary) — the
+//	     operator records a VerifyCanaryUnavailable event and takes no
+//	     decision.
+//	45 → the canary code does not compile (a build error) — the operator
+//	     treats it as an infra failure (bounded retry), never as subversion.
+//
+// The canary runs on the operator's built-in Go image (verifyDefaultCheckImage
+// — NOT spec.verify.image: a control that runs in the user's image could be
+// subverted by that image, see M10), on its OWN scratch (F53: post-F53 /verify
+// is read-only, so the canary copies the package to /tmp and runs the
+// generated test there). It needs no git credential and no network (go test on a
+// local package with no external deps; a package that needs a module fetch
+// would fail to build → 45, the correct fail-closed behaviour).
+func canaryCheckScript() string {
+	return `set -u
+export TMPDIR=/tmp
+cd /verify
+
+# The random seed for the canary test. RANDOM is dash/ash-extended; fall
+# back to a $$/time seed so the seed is unique per run on plain sh too.
+SEED=$( { echo "$RANDOM$RANDOM"; echo "$$$(date +%s)"; } | od -An -v -t d1 2>/dev/null | tr -d ' \\n' | head -c 8 )
+[ -n "$SEED" ] || SEED=$(date +%s | tr -d ' ')
+TOKEN="canary-$SEED"
+
+# Pick a tested package: the first directory under /verify that contains at
+# least one *_test.go AND a non-test .go file (a real Go package with a real
+# test to canary). The canary only needs ONE honest package to be a valid
+# negative control — a subverted test binary affects every go test in the
+# tree, so any one package's binary is representative.
+PKG_DIR=""
+for f in $(find /verify -name '*_test.go' -not -path '*/.git/*' 2>/dev/null); do
+  d=$(dirname "$f")
+  if ls "$d"/*.go >/dev/null 2>&1; then PKG_DIR="$d"; break; fi
+done
+
+# No tested package: nothing to canary → unavailable (the operator records a
+# VerifyCanaryUnavailable event and takes no decision).
+if [ -z "$PKG_DIR" ]; then
+  echo "canary: no tested package found; canary unavailable"
+  exit 44
+fi
+
+# Copy the WHOLE package (source + all the agent's tests) to a writable
+# scratch (F53: /verify is read-only). Keeping the agent's tests matters: the
+# round-8 subversion probe is a test the AGENT added that force-exits the
+# binary (os.Exit(0)), and go test runs tests in source-file order (alphabetical
+# by filename), so the agent's tests run and their os.Exit(0) kills the process
+# before the canary's own test. A healthy package's agent tests pass and the
+# canary's forced-failure test (added LAST, so it runs last) then t.Fatal's.
+SCRATCH=/tmp/canary-$SEED
+mkdir -p "$SCRATCH"
+cp -r "$PKG_DIR/". "$SCRATCH/"
+trap 'rm -rf "$SCRATCH"' EXIT
+
+# Package name from a non-test file (the canary test must be in the same
+# package to compile).
+PKG_NAME=$(sed -n 's/^package[[:space:]]*\([a-zA-Z0-9_]*\).*/\1/p' "$SCRATCH"/*.go 2>/dev/null | grep -v 'package main' | head -n1)
+[ -z "$PKG_NAME" ] && PKG_NAME=$(sed -n 's/^package[[:space:]]*\([a-zA-Z0-9_]*\).*/\1/p' "$SCRATCH"/*.go 2>/dev/null | head -n1)
+[ -n "$PKG_NAME" ] || { echo "canary: could not determine package name"; exit 44; }
+
+# The canary test: MUST fail (t.Fatal with the token). The FILENAME sorts
+# LAST (zzz_) so the agent's tests (their normal *_test.go names) run first and
+# any os.Exit(0) probe in them kills the process before the canary fires —
+# which is exactly the subversion the canary is designed to catch.
+cat > "$SCRATCH/zzz_canary_test.go" <<EOF
+package $PKG_NAME
+
+import "testing"
+
+func TestZZZCanary$SEED(t *testing.T) {
+	t.Fatal("$TOKEN")
+}
+EOF
+
+# Run the FULL package's tests (agent's + the canary's). cwd = the copied
+# package. The exit code is the evidence:
+#   0      → the binary exited 0 despite the forced-failure canary test being
+#            present → a test force-exited it (the round-8 probe) → SUBVERTED.
+#   non-zero → at least one test honestly failed (the binary respects test
+#            failures) → the healthy negative control. The token is printed to
+#            the log as the proof the honest failure ran.
+#   build error → the canary code does not compile (an INFRA failure, never a
+#            subversion verdict).
+cd "$SCRATCH"
+OUT=$(go test -count=1 . 2>&1)
+RC=$?
+echo "$OUT"
+echo "canary: go test exit $RC"
+
+# Build failure → 45 (infra, never subversion). A package that needs a module
+# fetch / external dep, or a broken tree, fails to build; the canary is
+# fail-closed on the build, not a subversion verdict.
+if echo "$OUT" | grep -qiE 'build failed|cannot find package|could not import|undefined:|syntax error|could not compile|imported and not used|redeclared'; then
+  echo "canary: build error (not a subversion verdict)"
+  exit 45
+fi
+# No tests to run → the package had no runnable tests (the agent's tests were
+# filtered out or the canary test did not compile) → unavailable, not subversion.
+if echo "$OUT" | grep -qi 'no tests to run'; then
+  echo "canary: no tests to run; canary unavailable"
+  exit 44
+fi
+# The decision (order-independent): a package that contains the forced-failure
+# canary test can only exit 0 if the binary ignored a test failure / a test
+# force-exited it (the round-8 os.Exit(0) probe). Non-zero means the binary
+# respected a failure — the healthy negative control.
+if [ "$RC" -eq 0 ]; then
+  echo "canary: SUBVERTED — the test binary exited 0 despite the forced-failure canary test ($TOKEN)"
+  exit 43
+fi
+echo "canary: OK — the test binary exited non-zero (it respects failures); negative control held ($TOKEN)"
+exit 0
+`
+}
+
 // verifyGitSafeEnv returns the safe.directory env for the /verify scratch
 // (the emptyDir mount point, root-owned while the containers run non-root —
 // the same class of bug as the runner's /workspace dubious-ownership fix).
@@ -650,6 +799,36 @@ const tamperGitErrorExit = 2
 // tamperOOMKilledReason is the kubelet's terminated reason for a container the
 // kernel OOM-killed: an infrastructure fault, never tampering (F83c).
 const tamperOOMKilledReason = "OOMKilled"
+
+// F60 (D17.1) canary script exit codes. The canary is a NEGATIVE CONTROL: it
+// generates a Go test that is REQUIRED to fail (t.Fatal) and runs it. The
+// operator reads the canary init's exit code from the pod status.
+//
+// The healthy outcome (the generated test HONESTLY failed — go test non-zero,
+// the forced t.Fatal fired) is reported as exit 0 (so the acceptance checks
+// proceed) and the random token is printed to the log (the proof the honest
+// failure actually ran). Only a SUBVERTED binary — one that exits 0 despite
+// the forced failure (the round-8 os.Exit(0) / testing.M probe) — is a
+// subversion signal, reported as exit verifyCanarySubvertedExit (43).
+const (
+	// verifyCanaryHealthyExit is the canary's exit when the generated test
+	// honestly failed (the t.Fatal fired → the test binary exited non-zero)
+	// — the healthy negative control. Mapped to 0 so the checks proceed.
+	verifyCanaryHealthyExit = 0
+	// verifyCanarySubvertedExit is the canary's exit when the test binary
+	// ignored the forced failure (exited 0 despite t.Fatal, or the round-8
+	// os.Exit(0) probe) — subversion detected.
+	verifyCanarySubvertedExit = 43
+	// verifyCanaryUnavailableExit is the canary's exit when the target package
+	// has no *_test.go (nothing to canary) — the operator records a
+	// VerifyCanaryUnavailable event and takes no decision.
+	verifyCanaryUnavailableExit = 44
+	// verifyCanaryBuildErrorExit is the canary's exit when the canary code
+	// does not compile (a build error, NOT the subversion probe) — the
+	// operator treats it as an infra failure (bounded retry), never as a
+	// subversion verdict.
+	verifyCanaryBuildErrorExit = 45
+)
 
 // tamperCheckScript builds the tamper init's sh script (B2, F39). It diffs
 // baseCommit..verifiedCommit over the protected globs and exits 1 listing any
@@ -895,6 +1074,37 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
 	}
 
+	// The F60 (D17.1) canary init: the negative control for in-process
+	// subversion, run BETWEEN the tamper/artifact gate and check-0. It runs
+	// a generated Go test that is REQUIRED to fail (t.Fatal with a random
+	// token) in a separate copy of a tested package; a subverted test binary
+	// (the round-8 os.Exit(0) probe) that exits 0 regardless of tests makes
+	// the canary report subversion (exit 43 → the terminal SubvertedVerify
+	// verdict).
+	//
+	// Image: the operator's built-in Go image (verifyDefaultCheckImage), NOT
+	// spec.verify.image — a control that runs in the user's image could be
+	// subverted by that image (M10), so the canary is pinned to the operator
+	// default. Resources: the check defaults (verifyCheckResources) — F58's
+	// trusted table may be tight for a large go test (the design's stated
+	// choice). Its own writable scratch (verifyCanaryTmpVolName, bounded):
+	// post-F53 /verify is read-only, so the canary copies the package to its
+	// /tmp and runs the generated test there (F53 ordering — the canary is
+	// not the one writable-checkout exception).
+	canaryCt := corev1.Container{
+		Name:            verifyCanaryInit,
+		Image:           verifyDefaultCheckImage,
+		Command:         []string{verifySh, "-c", canaryCheckScript()},
+		WorkingDir:      "/verify",
+		SecurityContext: trustedContainerSecurityContext(),
+		Env:             verifyCheckEnv(),
+		Resources:       verifyCheckResources(loop),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
+			{Name: verifyCanaryTmpVolName, MountPath: agentTmpMount},
+		},
+	}
+
 	// The acceptance-check inits: one per spec.acceptanceChecks, in order.
 	// Each runs the check command in /verify (the agent's tree) and exits
 	// with the check's exit code (0 = pass). The operator reads each check's
@@ -984,7 +1194,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Resources:       verifyNoopResources(),
 	}
 
-	inits := append([]corev1.Container{cloneCt, importCt, tamperCt, artifactCt}, checkCts...)
+	inits := append([]corev1.Container{cloneCt, importCt, tamperCt, artifactCt, canaryCt}, checkCts...)
 
 	// The volumes: the verify emptyDir (the fresh clone) + one check-tmp-<i>
 	// emptyDir per check container (each check's own writable /tmp scratch,
@@ -994,6 +1204,12 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		{Name: verifyVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		{Name: verifyAgentVol, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: workspacePVCName(loop.Name), ReadOnly: true,
+		}}},
+		// F60 (D17.1): the canary's own writable /tmp scratch (post-F53 /verify
+		// is read-only; the canary copies the package here). Bounded like the
+		// per-check scratch.
+		{Name: verifyCanaryTmpVolName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: newLimit(verifyCheckTmpSizeLimit),
 		}}},
 	}
 	for i := range checks {
@@ -1335,6 +1551,18 @@ const (
 	// because it is not a descendant of baseCommit (F43). Terminal, like
 	// tamper: the pin is the agent's claim and cannot be an honest one.
 	verifyNotDescendant
+	// verifySubverted (F60, D17.1): the canary init detected in-process
+	// subversion — the test binary ignored the forced t.Fatal (exited 0 despite
+	// the generated test failing, the round-8 os.Exit(0) probe). Terminal, like
+	// tamper: the agent's own code made the test binary dishonest, so no check
+	// can be trusted. The Loop is Failed with reason SubvertedVerify.
+	verifySubverted
+	// verifyCanaryUnavailable (F60): the canary init exited 44 — the target
+	// package has no *_test.go (nothing to canary). NO decision on the
+	// agent's work: the Loop stays Verifying and the operator records a
+	// VerifyCanaryUnavailable event (exactly once). Distinct from subverted (a
+	// verdict) and from infra (a retry): there is simply nothing to canary.
+	verifyCanaryUnavailable
 )
 
 // verifyOutcome reads the pod's init statuses and returns the outcome. A
@@ -1455,8 +1683,44 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 		}
 		break
 	}
-	// Tamper clean + artifact clean: read the check inits (check-0 ..
-	// check-<checkCount-1>).
+	// F60 (D17.1): the canary runs BETWEEN artifact and check-0 (tamper ->
+	// artifact -> canary -> checks). Tamper and artifact are clean at this
+	// point, so the canary is the next gate. A terminated canary with exit 43
+	// is subversion (verifySubverted, terminal), 44 is canary-unavailable
+	// (verifyCanaryUnavailable, no decision + one event), 45 is an infra
+	// failure (verifyInfraFailed, bounded retry). A terminated canary with
+	// exit 0 is the HEALTHY negative control — proceed to the checks. A
+	// canary still Running/Waiting is PENDING (no decision, requeue — the I49
+	// norm, exactly like the tamper / artifact gates above).
+	canary := readVerifyCanary(pod)
+	if canary.found {
+		if !canary.terminated {
+			return verifyNoDecision, true, "", 0
+		}
+		switch canary.code {
+		case verifyCanarySubvertedExit:
+			return verifySubverted, false, verifyCanaryInit, canary.code
+		case verifyCanaryUnavailableExit:
+			// The target package has no *_test.go (the canary has nothing to run):
+			// NO decision on the agent's work. Return requeue=false so the Reconcile
+			// reaches applyVerifyOutcome, which records the one-time
+			// VerifyCanaryUnavailable event and requeues (staying Verifying). It is
+			// not a subversion verdict, not an infra retry (M7).
+			return verifyCanaryUnavailable, false, verifyCanaryInit, canary.code
+		case verifyCanaryBuildErrorExit:
+			// A build error is an infra failure (bounded retry), NEVER a
+			// subversion verdict (M8's trap: mapping 45 to infra is correct; the
+			// subverted path is exit 43 only).
+			return verifyInfraFailed, false, verifyCanaryInit, canary.code
+		}
+		// exit 0 (healthy): the generated test honestly failed, the negative
+		// control held. Proceed to the acceptance checks below.
+	}
+	// The canary is absent from the pod's status (a pre-F60 legacy pod, or a
+	// test fixture that plants the old init set): the canary gate is not in
+	// force, so fall through to the checks (the pre-F60 decision path).
+	// Tamper clean + artifact clean + canary healthy: read the check inits
+	// (check-0 .. check-<checkCount-1>).
 	for i := range checkCount {
 		name := fmt.Sprintf("check-%d", i)
 		check := readVerifyCheck(pod, name)
@@ -1532,6 +1796,15 @@ func readVerifyCheck(pod *corev1.Pod, name string) verifyCheckResult {
 		}
 	}
 	return verifyCheckResult{}
+}
+
+// readVerifyCanary reads the canary init's status from the pod (F60, D17.1).
+// It is mechanically identical to readVerifyCheck (same verifyCheckResult
+// shape) but reads the canary by its own name (verifyCanaryInit). The canary
+// is an init whose exit CODE is the evidence (43/44/45/0), exactly like the
+// tamper / artifact gates.
+func readVerifyCanary(pod *corev1.Pod) verifyCheckResult {
+	return readVerifyCheck(pod, verifyCanaryInit)
 }
 
 // verifyIteratedReason is the stable Event reason the operator emits when a
@@ -1926,6 +2199,48 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 			bumpLoopCompletion("failed", "tampered")
 			return true, false
 		}
+	case verifySubverted:
+		// F60 (D17.1): the canary detected in-process subversion — the test
+		// binary ignored the forced t.Fatal (exit 43, the round-8 os.Exit(0)
+		// probe). Terminal, like TamperedVerify: the agent's own code made the
+		// test binary dishonest, so no acceptance check is trustworthy. Fail the
+		// Loop with the distinct SubvertedVerify reason; no new verify Job is
+		// created (a re-run would import the same subverted commit).
+		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
+			setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+				SubvertedVerifyReason,
+				"the verify canary detected in-process subversion: the test binary ignored the forced failure (round-8 probe)")
+			loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+			loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+			// B5a: terminal transition — bump the completion counter and clear
+			// the active gauge.
+			bumpLoopCompletion("failed", "subverted")
+			if r.Recorder != nil {
+				r.Recorder.Eventf(loop, corev1.EventTypeWarning, SubvertedVerifyReason,
+					"the verify canary detected in-process subversion (the test binary ignored the forced failure); failing the Loop")
+			}
+			return true, false
+		}
+	case verifyCanaryUnavailable:
+		// F60: the canary exited 44 — the target package has no *_test.go
+		// (nothing to canary). NO decision on the agent's work: the Loop stays
+		// Verifying (requeue), and the operator records a VerifyCanaryUnavailable
+		// Warning event exactly ONCE (idempotent — gated on a one-shot
+		// annotation so it does not repeat every reconcile). The Loop is held at
+		// Verifying until the next pin re-creates a fresh verify Job (the
+		// requeue keeps it alive); a Loop with no testable package is a
+		// configuration smell the user sees via the event, not a verdict.
+		if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying &&
+			loop.Annotations[verifyCanaryUnavailableAnnotation] != "1" && r.Recorder != nil {
+			if loop.Annotations == nil {
+				loop.Annotations = map[string]string{}
+			}
+			loop.Annotations[verifyCanaryUnavailableAnnotation] = "1"
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, VerifyCanaryUnavailableReason,
+				"the verify canary is unavailable (no *_test.go in the target package); no decision recorded")
+			return true, true // requeue (stays Verifying)
+		}
+		return true, true // no decision: requeue, stay Verifying
 	}
 	return false, false
 }
@@ -1938,10 +2253,12 @@ func bumpVerifyResult(outcome int) {
 	switch outcome {
 	case verifySucceeded:
 		verifyResultsTotal.WithLabelValues("pass").Inc()
-	case verifyIterate, verifyTampered, verifyNotDescendant:
+	case verifyIterate, verifyTampered, verifyNotDescendant, verifySubverted:
 		verifyResultsTotal.WithLabelValues("fail").Inc()
 	case verifyInfraFailed:
 		verifyResultsTotal.WithLabelValues("infra").Inc()
+		// verifyCanaryUnavailable: no decision (the Loop stays Verifying) — it is
+		// not a pass/fail/infra verdict, so it does not enter the pass-rate ratio.
 	}
 }
 

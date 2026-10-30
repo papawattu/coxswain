@@ -95,6 +95,16 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 					"check %s must NOT be able to write the verified checkout (D19): check-0 could otherwise rewrite the test check-1 compiles", ct.Name)
 				continue
 			}
+			if ct.Name == "canary" {
+				// F60: the canary reads the checkout read-only (it compiles the
+				// generated test from a /tmp scratch; it must NOT write
+				// /verify, exactly like the checks).
+				m := f53Mount(ct, verifyVol)
+				Expect(m).NotTo(BeNil(), "the canary must mount the checkout /verify")
+				Expect(m.ReadOnly).To(BeTrue(),
+					"the canary must NOT be able to write the verified checkout (D19)")
+				continue
+			}
 			trusted++
 			m := f53Mount(ct, verifyVol)
 			Expect(m).NotTo(BeNil(), "trusted init %s must mount /verify", ct.Name)

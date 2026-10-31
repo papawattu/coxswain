@@ -244,6 +244,35 @@ var _ = Describe("F60: the verify canary (D17.1 negative control)", func() {
 		Expect(canaryTmp).NotTo(BeNil(), "the canary must mount its own writable /tmp scratch")
 		Expect(f60VolumeSizeLimit(podSpec, verifyCanaryTmpVolName)).To(Equal(verifyCheckTmpSizeLimit),
 			"the canary's scratch must be bounded (like the per-check scratch)")
+
+		// (d) I199/D94: the canary's /tmp scratch is the out-of-band seed
+		// channel. The checks mount a DIFFERENT /tmp volume (their own
+		// check-tmp-<i>), so the seed file the canary writes to ITS /tmp
+		// (verifyCanaryTokenPath, /tmp/canary-seed) is invisible to the check
+		// containers (the verify Job's containers all run as the same uid
+		// 65532, so plain file permissions would NOT isolate the seed — the
+		// channel is volume isolation, not file permissions).
+		check0 := &podSpec.InitContainers[check0Idx]
+		var check0Tmp *corev1.VolumeMount
+		for i := range check0.VolumeMounts {
+			if check0.VolumeMounts[i].MountPath == agentTmpMount {
+				check0Tmp = &check0.VolumeMounts[i]
+			}
+		}
+		Expect(check0Tmp).NotTo(BeNil(), "check-0 must mount its own writable /tmp scratch")
+		Expect(check0Tmp.Name).NotTo(Equal(verifyCanaryTmpVolName),
+			"check-0 must NOT share the canary's /tmp volume: the seed file is on the canary's OWN volume and must be invisible to the checks (I199/D94)")
+
+		// (e) I199/D94: the canary's script body names the seed-file path and
+		// inlines the seed into the generated test via $(cat ...) — the seed
+		// never lands in the /verify checkout or in any volume the checks can
+		// see. The script is the container's command[2] (sh -c <script>).
+		Expect(len(canary.Command)).To(BeNumerically(">=", 3), "the canary must run sh -c <script>")
+		script := canary.Command[2]
+		Expect(script).To(ContainSubstring("SEED_FILE=\""+verifyCanaryTokenPath+"\""),
+			"the canary's script must write the seed to the seed-file path")
+		Expect(script).To(ContainSubstring("t.Fatal(\"canary-$(cat \"$SEED_FILE\")\")"),
+			"the generated canary test must inline the seed via $(cat ...), not a literal string (a probe that reads the seed file would need to GUESS the t.Fatal message)")
 	})
 
 	It("fails the Loop with SubvertedVerify (terminal) when the canary exits 43 with all checks passing", func() {

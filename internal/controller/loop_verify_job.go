@@ -111,6 +111,18 @@ const (
 	// subverted test binary (the round-8 os.Exit(0) probe) that exits 0
 	// regardless of tests makes the canary report subversion.
 	verifyCanaryInit = "canary"
+	// verifyCanaryTokenPath is the canary's seed-file path. The /tmp mount
+	// (verifyCanaryTmpVolName, the canary's private scratch) is the channel:
+	// the checks mount their OWN /tmp volume (a different emptyDir), so a
+	// file the canary writes to ITS /tmp is invisible to the check
+	// containers (the verify Job's containers all run as the same uid
+	// 65532, so plain file permissions would NOT isolate the seed — the
+	// channel is volume isolation, not file permissions). The seed file
+	// (this path) is written before the tree is copied to SCRATCH and
+	// before the generated zzz_canary_test.go is injected: the test source
+	// inlines the seed via $(cat ...), so the seed never lands in the
+	// /verify checkout or in any volume the checks can see.
+	verifyCanaryTokenPath = "/tmp/canary-seed"
 	// verifyCanaryTmpVolName is the canary init's own writable /tmp scratch
 	// (F53: post-F53 /verify is read-only, so the canary copies the checkout
 	// to its own scratch and runs the generated test there). Bounded like the
@@ -651,6 +663,22 @@ exit 0
 // build-fail event of the package under test, not from grepping error strings
 // the agent can print.
 //
+// I199/D94 (the out-of-band token channel): the token's SEED is written to a
+// seed file (verifyCanaryTokenPath) that only the canary container can see.
+// The verify Job's containers all run as the same uid (trustedContainer
+// SecurityContext: runAsUser 65532), so a plain file on a shared volume would
+// be world-readable to the check containers. The channel is instead a
+// volume mounted ONLY into the canary (verifyCanaryTokenVolName, a 1Mi
+// emptyDir): the checks mount a DIFFERENT volume (their own check-tmp-<i>),
+// so a file written by the canary into its private volume is invisible to
+// the checks. The canary test still names the token (it is the t.Fatal
+// message go test reports), but the seed itself — the part a probe would
+// need to read and echo — never lands in the /verify checkout or in any
+// volume the check containers can see. The token is NOT a secret: it is a
+// random 64-bit decimal per Job, and the subversion the canary detects is
+// a probe that force-exits the test binary, not a probe that reads the seed
+// file.
+//
 // Cost is bounded: at most 50 packages are tested — a package is a
 // DIRECTORY holding a *_test.go (the cap counts packages, not test files) —
 // the first N in sort order; hitting the cap is logged ("canary: capped")
@@ -677,17 +705,45 @@ exit 0
 //	     build-fail for THAT package) — the operator treats it as an infra
 //	     failure (bounded retry), never as subversion.
 func canaryCheckScript() string {
-	return `set -u
+	return canaryCheckScriptBody
+}
+
+// canaryCheckScriptBody is the canary script body.
+//
+// I199/D94 (the out-of-band token channel): the token's SEED is written to a
+// seed file at /tmp/canary-seed (verifyCanaryTokenPath) on the canary's OWN
+// private /tmp volume (verifyCanaryTmpVolName, the canary's scratch). The
+// verify Job's containers all run as the same uid (trustedContainer
+// SecurityContext: runAsUser 65532), so plain file permissions would NOT
+// isolate the seed; the channel is volume isolation — the checks mount a
+// DIFFERENT /tmp volume (their own check-tmp-<i>), so a file the canary
+// writes to ITS /tmp is invisible to the check containers. The generated
+// zzz_canary_test.go inlines the seed via $(cat ...), so the test source the
+// agent's code compiles is a plain t.Fatal with a message the probe would
+// have to GUESS, and the seed file itself never lands in the /verify checkout
+// or in any volume the checks can see.
+const canaryCheckScriptBody = `set -u
 export TMPDIR="/tmp"
 
-# The seed for the canary test: 8 random octets from /dev/urandom as an
-# unsigned 64-bit decimal (od -tu8). Random so two concurrent canary Jobs
-# get different tokens. It is NOT a secret — the token is written in plain
-# text to the generated zzz_canary_test.go in the same package dir the
-# agent's code runs in, and a probe that reads that file can print it
-# (open limit; a real fix needs a channel the agent's code cannot read).
+# I199/D94: the seed file lives on the canary's OWN private volume
+# (mounted ONLY into the canary init; the checks mount a different volume and
+# the checkout mount is read-only, so the seed is unreadable from the check
+# containers). The seed is the one thing a subverted probe would need to
+# echo in the t.Fatal message for the go test -json output to carry the
+# token; with the seed on a channel the agent's code cannot read, the probe
+# cannot read it and cannot echo it. The seed file is written BEFORE the
+# tree is copied to SCRATCH and BEFORE the generated zzz_canary_test.go is
+# injected: the test source inlines the seed via $(cat ...) so the seed is
+# never inlined into the test source from the checkout, and the file itself
+# never lands in SCRATCH (which is the copy of the checkout, not the
+# canary's private volume).
+SEED_FILE="/tmp/canary-seed"
 SEED=$(od -An -N8 -tu8 /dev/urandom 2>/dev/null | tr -d ' \n')
 [ -n "$SEED" ] || SEED=$(date +%s | tr -d ' ')
+printf '%s' "$SEED" > "$SEED_FILE" 2>/dev/null || {
+  echo "canary: cannot write seed file at $SEED_FILE; canary unavailable"
+  exit 44
+}
 TOKEN="canary-$SEED"
 # Double-quoted: $SEED must expand to the per-Job seed. Single quotes leave
 # the literal string '^TestZZZCanary$SEED$', which matches no test — go test
@@ -763,7 +819,7 @@ package $pkg
 import "testing"
 
 func TestZZZCanary$SEED(t *testing.T) {
-	t.Fatal("$TOKEN")
+	t.Fatal("canary-$(cat "$SEED_FILE")")
 }
 EOF
 done
@@ -834,7 +890,6 @@ fi
 echo "canary: OK — every tested package honestly failed the canary test; negative control held ($TOKEN)"
 exit 0
 `
-}
 
 // verifyGitSafeEnv returns the safe.directory env for the /verify scratch
 // (the emptyDir mount point, root-owned while the containers run non-root —
@@ -1204,6 +1259,10 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			Resources:       verifyCheckResources(loop),
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
+				// The canary's OWN /tmp scratch (F53) — also the I199/D94
+				// seed-file channel: the checks mount a DIFFERENT /tmp volume
+				// (their own check-tmp-<i>), so the seed file the canary writes
+				// here is invisible to the check containers.
 				{Name: verifyCanaryTmpVolName, MountPath: agentTmpMount},
 			},
 		}
@@ -1213,6 +1272,10 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 				SizeLimit: newLimit(verifyCheckTmpSizeLimit),
 			}},
 		}
+		// I199/D94: the seed file lives on the canary's OWN /tmp volume
+		// (verifyCanaryTmpVolName, already mounted at /tmp above). The checks
+		// mount a DIFFERENT /tmp volume (their own check-tmp-<i>), so the
+		// seed file is invisible to them. No new volume needed.
 	}
 
 	// The acceptance-check inits: one per spec.acceptanceChecks, in order.

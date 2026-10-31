@@ -22,7 +22,7 @@
 // Verifying and the Job read back — so it covers ensureVerifyJob's wiring, not
 // only buildVerifyJobSpec. The decision specs plant the batch Job's pod init
 // statuses (envtest has no batch Job controller or kubelet) and drive the same
-// reconciles. The four specs:
+// reconciles. The six specs:
 //
 //  1. container placement: the canary init sits BETWEEN artifact and check-0,
 //     runs on the operator's built-in Go image (NOT spec.verify.image — a
@@ -34,10 +34,19 @@
 //     VerifyCanaryUnavailable Event across two reconciles (idempotent).
 //  4. canary exit 45 → verifyInfraRetry: status.verifyInfraAttempts == 1 and
 //     the Job is recreated (a bounded infra retry), NEVER a subversion verdict.
+//  5. OOM-killed canary (137/OOMKilled, check-0 still Waiting) → the bounded
+//     infra retry (infraAttempts == 1, the retry Event names the canary), NOT
+//     a requeue-forever wedge (the kind defect: the default case used to
+//     return nil → check-0 not terminated → requeue forever).
+//  6. canary exit 1 (unrecognized non-zero code, check-0 still Waiting) →
+//     the same infra retry path (a terminated canary outside 0/43/44/45
+//     means the negative control died without a defined outcome; the checks
+//     must not run on that evidence).
 package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -409,5 +418,93 @@ var _ = Describe("F60: the verify canary (D17.1 negative control)", func() {
 		Expect(canarySkipped).NotTo(BeNil(), "the CanarySkipped condition must be present (I90: the skip is visible)")
 		Expect(canarySkipped.Status).To(Equal(metav1.ConditionTrue), "CanarySkipped must be True (the canary was intentionally omitted)")
 		Expect(canarySkipped.Reason).To(Equal(CanaryNotApplicableReason), "the reason must be CanaryNotApplicable")
+	})
+
+	It("treats an OOM-killed canary (137/OOMKilled) as a bounded infra retry, not a requeue-forever wedge", func() {
+		ns := f60Ns("f60-canary-oom")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f60canaryoom"
+		recorder := record.NewFakeRecorder(64)
+		r := f60Reconciler(recorder)
+		jobName := f60DriveToVerifying(r, ns, name)
+		job := f60GetJob(ns, jobName)
+		Expect(job).NotTo(BeNil())
+
+		// The kind shape observed on f58-oom-probe (fc04736): the canary was
+		// OOM-killed by the kubelet at its memory limit (exit 137 + the
+		// OOMKilled reason) and check-0 never started (Waiting
+		// PodInitializing). The canary's death means the negative control
+		// never ran — the checks must NOT run on that evidence (proceeding
+		// would let a subverted binary pass silently). It is an INFRA failure
+		// (a bounded retry, like F58 for an OOM-killed check), never a
+		// subversion verdict and never a requeue forever.
+		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
+			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"}}},
+			corev1.ContainerStatus{Name: s5aCheck0, State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}},
+		))
+
+		fresh := s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"an OOM-killed canary is an INFRA failure: a bounded retry, not a terminal verdict")
+		Expect(fresh.Status.Verify).NotTo(BeNil())
+		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+			"the OOM-killed canary burns ONE infra attempt (the retry counter), not a requeue forever")
+		// The retry Event names the infra retry and the CANARY (the container
+		// that failed) — so an operator reading the event knows the negative
+		// control died, not a check.
+		evs := f60Events(recorder)
+		Expect(evs).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
+		var namedCanary bool
+		for _, e := range evs {
+			if strings.Contains(e, verifyCanaryInit) {
+				namedCanary = true
+			}
+		}
+		Expect(namedCanary).To(BeTrue(), "the infra retry event must name the canary container")
+		for _, e := range evs {
+			Expect(e).NotTo(ContainSubstring(SubvertedVerifyReason),
+				"an OOM-killed canary must never be reported as a subversion verdict")
+		}
+	})
+
+	It("treats a canary exit with an unrecognized non-zero code (1) as a bounded infra retry", func() {
+		ns := f60Ns("f60-canary-exit1")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f60canarye1"
+		recorder := record.NewFakeRecorder(64)
+		r := f60Reconciler(recorder)
+		jobName := f60DriveToVerifying(r, ns, name)
+		job := f60GetJob(ns, jobName)
+		Expect(job).NotTo(BeNil())
+
+		// A terminated canary with a code outside 0/43/44/45 (here exit 1,
+		// no reason) means the canary process died without reporting a
+		// defined outcome. The negative control never ran: the checks must
+		// not run on that evidence. INFRA failure (bounded retry), never a
+		// subversion verdict, never a silent requeue-forever wedge (the kind
+		// defect: default: return nil → check-0 not terminated → requeue
+		// forever, jobFailed ignored once a pod exists).
+		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
+			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}},
+			corev1.ContainerStatus{Name: s5aCheck0, State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}},
+		))
+
+		fresh := s5aReconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
+			"an unrecognized canary exit is an INFRA failure: a bounded retry, not a terminal verdict")
+		Expect(fresh.Status.Verify).NotTo(BeNil())
+		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+			"the unrecognized canary exit burns ONE infra attempt (the retry counter)")
+		evs := f60Events(recorder)
+		Expect(evs).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)))
+		var namedCanary bool
+		for _, e := range evs {
+			if strings.Contains(e, verifyCanaryInit) {
+				namedCanary = true
+			}
+		}
+		Expect(namedCanary).To(BeTrue(), "the infra retry event must name the canary container")
 	})
 })

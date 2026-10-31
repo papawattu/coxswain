@@ -662,7 +662,7 @@ cd /verify
 
 # The random seed for the canary test. RANDOM is dash/ash-extended; fall
 # back to a $$/time seed so the seed is unique per run on plain sh too.
-SEED=$( { echo "$RANDOM$RANDOM"; echo "$$$(date +%s)"; } | od -An -v -t d1 2>/dev/null | tr -d ' \\n' | head -c 8 )
+SEED=$( { echo "${RANDOM:-}${RANDOM:-}"; echo "$$$(date +%s)"; } | od -An -v -t d1 2>/dev/null | tr -d ' \\n' | head -c 8 )
 [ -n "$SEED" ] || SEED=$(date +%s | tr -d ' ')
 TOKEN="canary-$SEED"
 

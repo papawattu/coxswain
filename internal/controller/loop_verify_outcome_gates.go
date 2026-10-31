@@ -186,11 +186,20 @@ func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
 		// gate, the caller proceeds to the acceptance checks.
 		return nil
 	default:
-		// Unrecognized code (not 0/43/44/45): not a defined canary outcome.
-		// No decision — the caller falls through to the check scan (the
-		// original verifyOutcome's fall-through for 0, now also for any other
-		// code, since the canary script never produces one).
-		return nil
+		// OOMKilled (the kubelet killed the canary at its memory limit) or any
+		// other unrecognized non-zero code: an INFRA failure (bounded retry),
+		// never a subversion verdict and never a silent fall-through. The
+		// script can exit with SIGKILL (137) without the OOMKilled reason
+		// (the kubelet kills at the limit; the exit code alone does not say
+		// why). A terminated canary with a code outside 0/43/44/45 means the
+		// canary process died without reporting a defined outcome, and the
+		// checks must NOT run on that evidence (the negative control failed
+		// to run — proceeding would let a subverted binary pass silently,
+		// exactly the wedge observed on kind: a 137 canary + check-0 waiting
+		// requeued forever, the jobFailed flag ignored once a pod exists).
+		// F58's rule for OOM-killed checks applies here: resource-limit
+		// deaths are infra, not the agent's work.
+		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
 	}
 }
 

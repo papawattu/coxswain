@@ -229,6 +229,47 @@ func TestCanaryCheckScript(t *testing.T) {
 			t.Fatalf("canary exited %d for a package clause after a leading comment; want 0. output: %s", code, out)
 		}
 	})
+
+	t.Run("honest nested module: go.mod only in svc/, an honest passing test", func(t *testing.T) {
+		// Reviewer P1 (R45): a multi-module repo whose go.mod lives only in
+		// svc/. The pre-R45 script ran go test from the tree root, which
+		// failed with "go.mod file not found" and that non-zero exit READ AS
+		// SUBVERTED (43) — a false terminal SubvertedVerify on an honest
+		// repo. The canary now walks up to the nearest go.mod and runs go
+		// test ./<rel> from there.
+		verify := t.TempDir()
+		writeFile(t, verify, "svc/go.mod", "module example.com/svc\n\ngo 1.26\n")
+		writeFile(t, verify, "svc/add.go", "package svc\n\nfunc Add(a, b int) int { return a + b }\n")
+		writeFile(t, verify, "svc/add_test.go",
+			"package svc\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal(\"x\") } }\n")
+
+		out, code := runCanaryScript(t, verify)
+		if code != 0 {
+			t.Fatalf("canary exited %d for an honest nested-module package; want 0 (the honest failure ran in its own module). output: %s", code, out)
+		}
+		if !strings.Contains(out, "OK — every tested package") {
+			t.Fatalf("canary output lacks the healthy verdict. output: %s", out)
+		}
+	})
+
+	t.Run("subverted nested module: init os.Exit(0) probe in svc/ with go.mod only there", func(t *testing.T) {
+		// The nested-module version of scenario B: the probe is in its own
+		// module (go.mod only in svc/). The canary must find the module
+		// root, run there, and still see the probe's exit 0 → 43.
+		verify := t.TempDir()
+		writeFile(t, verify, "svc/go.mod", "module example.com/svc\n\ngo 1.26\n")
+		writeFile(t, verify, "svc/add.go", "package svc\n\nfunc Add(a, b int) int { return a + b }\n")
+		writeFile(t, verify, "svc/probe_test.go",
+			"package svc\n\nimport \"os\"\n\nfunc init() { os.Exit(0) }\n")
+
+		out, code := runCanaryScript(t, verify)
+		if code != 43 {
+			t.Fatalf("canary exited %d for a subverted nested-module package; want 43. output: %s", code, out)
+		}
+		if !strings.Contains(out, "SUBVERTED") {
+			t.Fatalf("canary output lacks the subverted verdict. output: %s", out)
+		}
+	})
 }
 
 // runCanaryScript runs the REAL canaryCheckScript against a scratch Go tree:

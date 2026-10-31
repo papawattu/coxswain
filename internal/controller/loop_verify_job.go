@@ -651,9 +651,17 @@ exit 0
 // build-fail event of the package under test, not from grepping error strings
 // the agent can print.
 //
-// Cost is bounded: at most 50 packages are tested (first N in sort order);
-// hitting the cap is logged ("canary: capped") so the log says which packages
-// were judged and that some were not.
+// Cost is bounded: at most 50 packages are tested — a package is a
+// DIRECTORY holding a *_test.go (the cap counts packages, not test files) —
+// the first N in sort order; hitting the cap is logged ("canary: capped")
+// so the log says which packages were judged and that some were not.
+//
+// The verdict loop runs from the NEAREST ancestor of each package that
+// holds a go.mod (go test ./<rel> must run from the module root, or a
+// multi-module repo with go.mod only in svc/ fails with "go.mod file not
+// found" and that non-zero exit would read as subverted). A package with
+// no go.mod above it is skipped with a log line; if every package is
+// skipped the canary exits 44 (unavailable).
 //
 // Exit codes (the contract the operator's verifyOutcome reads):
 //
@@ -672,11 +680,13 @@ func canaryCheckScript() string {
 	return `set -u
 export TMPDIR="/tmp"
 
-# The random seed for the canary test: one token per Job (the token is the
-# forgery probe — it cannot be pre-printed by the agent's tree). RANDOM is
-# dash/ash-extended; fall back to a $$/time seed so the seed is unique per
-# run on plain sh too.
-SEED=$( { echo "${RANDOM:-}${RANDOM:-}"; echo "$$$(date +%s)"; } | od -An -v -t d1 2>/dev/null | tr -d ' \n' | head -c 8 )
+# The seed for the canary test: 8 random octets from /dev/urandom as an
+# unsigned 64-bit decimal (od -tu8). Random so two concurrent canary Jobs
+# get different tokens. It is NOT a secret — the token is written in plain
+# text to the generated zzz_canary_test.go in the same package dir the
+# agent's code runs in, and a probe that reads that file can print it
+# (open limit; a real fix needs a channel the agent's code cannot read).
+SEED=$(od -An -N8 -tu8 /dev/urandom 2>/dev/null | tr -d ' \n')
 [ -n "$SEED" ] || SEED=$(date +%s | tr -d ' ')
 TOKEN="canary-$SEED"
 # Double-quoted: $SEED must expand to the per-Job seed. Single quotes leave
@@ -702,23 +712,25 @@ cd "$SCRATCH"
 # a VerifyCanaryUnavailable event and takes no decision).
 command -v go >/dev/null 2>&1 || { echo "canary: no go toolchain; canary unavailable"; exit 44; }
 
-# Every directory that has a *_test.go (NUL-safe: a -print0 | sort -z | xargs
-# -0 chain — shell word-splitting would mangle a path with spaces or a tab).
-# Hitting the cap (50) is logged; the first N in sort order are the ones
-# tested.
-N=$(find . -name '*_test.go' -not -path './.git/*' -print0 | sort -z | xargs -0 -n1 dirname 2>/dev/null | awk 'END{print NR}')
-[ -n "$N" ] && [ "$N" -gt 0 ] 2>/dev/null || N=0
+# Every directory that has a *_test.go (NUL-safe: a -print0 | sort -z chain
+# with a while-read loop — shell word-splitting would mangle a path with
+# spaces or a tab). N is the number of DIRECTORIES (a package), not the
+# number of test files. Hitting the cap (50) is logged; the first N in sort
+# order are the ones tested.
+DIRLIST="$SCRATCH/.canary-dirs"
+find . -name '*_test.go' -not -path './.git/*' -print0 | sort -z | xargs -0 -n1 dirname 2>/dev/null | tr '\0' '\n' | awk 'NF' | sort -u > "$DIRLIST"
+N=$(awk 'NF' "$DIRLIST" | wc -l)
 if [ "$N" -eq 0 ]; then
   echo "canary: no *_test.go anywhere; canary unavailable"
   exit 44
 fi
 if [ "$N" -gt "$CAP" ]; then
-  echo "canary: capped — $N tested packages found, testing only the first $CAP (sorted)"
+  echo "canary: capped — $N packages found, testing only the first $CAP (sorted)"
 fi
 # The injection loop is a piped while (a subshell): its output is files on
 # disk, not shell variables — the verdict loop below re-finds the injected
 # files itself, so the subshell's writes persist regardless.
-find . -name '*_test.go' -not -path './.git/*' -print0 | sort -z | head -z -n "$CAP" | xargs -0 -n1 dirname 2>/dev/null | while IFS= read -r d; do
+head -n "$CAP" "$DIRLIST" | while IFS= read -r d; do
   # Package clause: the first line that matches ^package (NOT head -1 of a
   # test file, which breaks on a leading comment or //go:build tag). Prefer a
   # test file (the canary test must land in the SAME package as the tests it
@@ -756,26 +768,40 @@ func TestZZZCanary$SEED(t *testing.T) {
 EOF
 done
 
-# Find the module root for the -run target (go test resolves ./<dir> paths
-# relative to the module root). go.mod at the tree root: use "."; otherwise
-# each package's own go.mod root is its own directory.
-MODROOT="."
-[ -f go.mod ] || MODROOT=""
-
 SUBVERTED=0
 BUILDFAIL=0
-for d in $(find . -name 'zzz_canary_test.go' -not -path './.git/*' -print0 | sort -z | xargs -0 -n1 dirname 2>/dev/null); do
-  if [ -n "$MODROOT" ]; then
-    target="$d"
-  else
-    # No module root at the tree root: this package's own go.mod (or the
-    # package dir itself, if it is its own module / GOPATH-style) is the
-    # target. go test ./<pkg> from the package's module root.
-    if [ -f "$d/go.mod" ]; then target="$d"; else target=""; fi
+TESTED=0
+SKIPPED=0
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  [ -f "$d/zzz_canary_test.go" ] || continue
+  # Nearest ancestor of $d that holds a go.mod (the package's module root):
+  # go test ./<rel> must run FROM the module root, or a multi-module repo
+  # (go.mod only in svc/) fails with "go.mod file not found" and that
+  # non-zero exit would read as subverted.
+  mroot=""
+  p="$d"
+  # Walk up: $d, its parent, ... the tree root (.).
+  while :; do
+    if [ -f "$p/go.mod" ]; then mroot="$p"; break; fi
+    [ "$p" = "." ] && break
+    p="${p%/*}"
+    case "$p" in
+      .*) p="." ;;   # "./pkg" -> "." (the tree root)
+    esac
+  done
+  if [ -z "$mroot" ]; then
+    echo "canary: $d has no go.mod above it; skipping"
+    SKIPPED=$((SKIPPED+1))
+    continue
   fi
-  [ -n "$target" ] || target="$d"
-  OUTF="$SCRATCH/canary-out-$SEED.$$"
-  go test -count=1 -run "$RUN" -json "$target" > "$OUTF" 2>&1
+  if [ "$mroot" = "$d" ]; then
+    target="."
+  else
+    target="./${d#./}"
+  fi
+  OUTF="$SCRATCH/canary-out-$SEED.$(basename "$d")"
+  ( cd "$mroot" && go test -count=1 -run "$RUN" -json "$target" ) > "$OUTF" 2>&1
   rc=$?
   if [ "$rc" -eq 0 ]; then
     echo "canary: $d exited 0 despite the forced-failure canary test ($TOKEN) — SUBVERTED"
@@ -789,8 +815,9 @@ for d in $(find . -name 'zzz_canary_test.go' -not -path './.git/*' -print0 | sor
   else
     echo "canary: $d OK — the forced t.Fatal ran and was reported ($TOKEN)"
   fi
+  TESTED=$((TESTED+1))
   rm -f "$OUTF"
-done
+done < "$DIRLIST"
 
 if [ "$SUBVERTED" -eq 1 ]; then
   echo "canary: SUBVERTED — a tested package ignored or hid the forced-failure canary test ($TOKEN)"
@@ -799,6 +826,10 @@ fi
 if [ "$BUILDFAIL" -eq 1 ]; then
   echo "canary: build error (not a subversion verdict)"
   exit 45
+fi
+if [ "$TESTED" -eq 0 ]; then
+  echo "canary: every package was skipped (no go.mod above any package); canary unavailable"
+  exit 44
 fi
 echo "canary: OK — every tested package honestly failed the canary test; negative control held ($TOKEN)"
 exit 0

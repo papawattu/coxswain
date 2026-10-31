@@ -11,9 +11,10 @@
 # config/crd/bases/coxswain.wattu.com_loops.yaml), so the admitted Loop is
 # identical to that run's.
 #
-# It is NOT part of `kubectl apply -k config/samples/` (it is deliberately
-# absent from config/samples/kustomization.yaml): it names the real GitHub
-# sandbox repo, the vLLM endpoint of the §9 VM and the two Secrets §9 Step 7
+# It is applied by path only (not part of `kubectl apply -k config/samples/`;
+# it is deliberately absent from config/samples/kustomization.yaml): it names
+# the real GitHub sandbox repo, the vLLM endpoint of the §9 VM and the two
+# Secrets §9 Step 7
 # creates (git-cred via hack/github-secret.sh, beta-model-creds), so it only
 # applies inside that setup. For a self-contained sample that runs against the
 # in-cluster seeded repos instead, see loop-fix-failing-test.yaml.

@@ -114,7 +114,7 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		}
 	})
 
-	It("lists every shipped policy in the samples kustomization, and every listed policy exists", func() {
+	It("lists every shipped sample in the samples kustomization, and every listed sample exists", func() {
 		data, err := os.ReadFile(repoPath("config", "samples", "kustomization.yaml"))
 		Expect(err).NotTo(HaveOccurred())
 
@@ -123,30 +123,53 @@ var _ = Describe("F61: the shipped sample AgentPolicies", Ordered, func() {
 		}
 		Expect(yaml.UnmarshalStrict(data, &kustomization)).To(Succeed())
 
-		var listed []string
-		for _, resource := range kustomization.Resources {
-			if strings.HasPrefix(resource, "policies/") {
-				listed = append(listed, resource)
+		// Every config/samples/*.yaml (loop samples and coxswain_v1alpha1_*)
+		// that is NOT declared by-path-only is expected in the kustomization.
+		// (I167: extending the policies/-only ConsistOf to the loop samples so
+		// a future omission fails.)
+		entries, err := os.ReadDir(repoPath("config", "samples"))
+		Expect(err).NotTo(HaveOccurred())
+		shipped := map[string]bool{}
+		for _, entry := range entries {
+			if entry.IsDir() || entry.Name() == "kustomization.yaml" ||
+				!strings.HasSuffix(entry.Name(), ".yaml") {
+				continue
+			}
+			data, err := os.ReadFile(repoPath("config", "samples", entry.Name()))
+			Expect(err).NotTo(HaveOccurred())
+			shipped[entry.Name()] = !strings.Contains(string(data), "applied by path only")
+		}
+
+		// The reference policies: a by-path-only exemption is not allowed, so
+		// they are always expected.
+		policyEntries, err := os.ReadDir(repoPath(policiesDir))
+		Expect(err).NotTo(HaveOccurred())
+		for _, entry := range policyEntries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".yaml") {
+				shipped[path.Join("policies", entry.Name())] = true
 			}
 		}
 
-		// Direction 1: every shipped policy file is listed. A file that is not
-		// in the kustomization is invisible to `kubectl apply -k
-		// config/samples`, which is how the docs tell users to apply them.
-		files := policyFiles()
-		shipped := make([]string, 0, len(files))
-		for _, file := range files {
-			// path.Join, not filepath.Join: `listed` holds the kustomization's
-			// own strings, which are always slash-separated. filepath.Join would
-			// build a back-slash path on a Windows host and mismatch for a
-			// reason that has nothing to do with the assertion.
-			shipped = append(shipped, path.Join("policies", filepath.Base(file)))
+		// Direction 1: the kustomization's resources are exactly the shipped
+		// files that are not by-path-only. A file that is missing from the
+		// kustomization (and not declared by-path-only) is invisible to
+		// `kubectl apply -k config/samples`.
+		listed := append([]string{}, kustomization.Resources...)
+		expected := make([]string, 0)
+		for name, include := range shipped {
+			if include {
+				expected = append(expected, name)
+			}
 		}
-		Expect(listed).To(ConsistOf(shipped),
-			"the kustomization's policies/ entries must be exactly the shipped policy files")
+		// path.Join, not filepath.Join: `listed` holds the kustomization's
+		// own strings, which are always slash-separated. filepath.Join would
+		// build a back-slash path on a Windows host and mismatch for a
+		// reason that has nothing to do with the assertion.
+		Expect(listed).To(ConsistOf(expected),
+			"the kustomization's resources must be exactly the shipped files that are not by-path-only")
 
-		// Direction 2: every listed policy path exists (no dangling entry that
-		// would make `kubectl apply -k` fail).
+		// Direction 2: every listed path exists (no dangling entry that would
+		// make `kubectl apply -k` fail).
 		for _, resource := range listed {
 			_, err := os.Stat(repoPath("config", "samples", resource))
 			Expect(err).NotTo(HaveOccurred(), "%s is listed in the kustomization but does not exist", resource)

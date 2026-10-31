@@ -393,6 +393,18 @@ func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.
 		}
 		return fmt.Errorf("create verify job %s: %w", name, err)
 	}
+	// F60 / I90: when the canary was SKIPPED (preset none — a non-Go repo),
+	// record the CanarySkipped condition so the skip is visible to
+	// `kubectl cox describe`. The canary (D17.1) is a Go negative control;
+	// a repo with no Go tests has nothing to canary, and running the canary
+	// would exit 44 and wedge the Loop in Verifying forever (the acceptance
+	// checks never get a decision). Skipping it lets the checks run; the
+	// condition is the I90 surface (a fallback/degradation must be visible).
+	if tamper.Preset(loop.Spec.Verify.Preset) == tamper.PresetNone {
+		setCondition(loop, CanarySkippedCondition, metav1.ConditionTrue,
+			CanaryNotApplicableReason,
+			"the verify canary was skipped: the Loop declared spec.verify.preset=none (a non-Go repo has no *_test.go to canary); the acceptance checks ran without the Go negative control")
+	}
 	return nil
 }
 
@@ -1091,18 +1103,37 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	// post-F53 /verify is read-only, so the canary copies the package to its
 	// /tmp and runs the generated test there (F53 ordering — the canary is
 	// not the one writable-checkout exception).
-	canaryCt := corev1.Container{
-		Name:            verifyCanaryInit,
-		Image:           verifyDefaultCheckImage,
-		Command:         []string{verifySh, "-c", canaryCheckScript()},
-		WorkingDir:      "/verify",
-		SecurityContext: trustedContainerSecurityContext(),
-		Env:             verifyCheckEnv(),
-		Resources:       verifyCheckResources(loop),
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
-			{Name: verifyCanaryTmpVolName, MountPath: agentTmpMount},
-		},
+	//
+	// Gate: the canary runs ONLY when the repo is declared Go-capable
+	// (spec.verify.preset != "none"). A non-Go repo (preset none) has no
+	// *_test.go to canary, so the canary would exit 44 (unavailable) and
+	// wedge the Loop in Verifying forever — the acceptance checks never get
+	// a decision. Skipping the canary for preset none lets the checks run on
+	// the non-Go evidence (the negative control is not applicable to a repo
+	// with no Go tests); the skip is surfaced with the CanarySkipped
+	// condition (I90: a fallback/degradation must be visible).
+	canaryCt := corev1.Container{}
+	canaryTmpVol := corev1.Volume{}
+	if tamper.Preset(loop.Spec.Verify.Preset) != tamper.PresetNone {
+		canaryCt = corev1.Container{
+			Name:            verifyCanaryInit,
+			Image:           verifyDefaultCheckImage,
+			Command:         []string{verifySh, "-c", canaryCheckScript()},
+			WorkingDir:      "/verify",
+			SecurityContext: trustedContainerSecurityContext(),
+			Env:             verifyCheckEnv(),
+			Resources:       verifyCheckResources(loop),
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
+				{Name: verifyCanaryTmpVolName, MountPath: agentTmpMount},
+			},
+		}
+		canaryTmpVol = corev1.Volume{
+			Name: verifyCanaryTmpVolName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: newLimit(verifyCheckTmpSizeLimit),
+			}},
+		}
 	}
 
 	// The acceptance-check inits: one per spec.acceptanceChecks, in order.
@@ -1194,7 +1225,14 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Resources:       verifyNoopResources(),
 	}
 
-	inits := append([]corev1.Container{cloneCt, importCt, tamperCt, artifactCt, canaryCt}, checkCts...)
+	// Build the inits list: skip the canary (and its scratch volume) for
+	// preset none (a non-Go repo — the canary would 44 and wedge, and the
+	// negative control is not applicable to a repo with no Go tests).
+	inits := []corev1.Container{cloneCt, importCt, tamperCt, artifactCt}
+	if canaryCt.Name != "" {
+		inits = append(inits, canaryCt)
+	}
+	inits = append(inits, checkCts...)
 
 	// The volumes: the verify emptyDir (the fresh clone) + one check-tmp-<i>
 	// emptyDir per check container (each check's own writable /tmp scratch,
@@ -1205,12 +1243,14 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		{Name: verifyAgentVol, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: workspacePVCName(loop.Name), ReadOnly: true,
 		}}},
-		// F60 (D17.1): the canary's own writable /tmp scratch (post-F53 /verify
-		// is read-only; the canary copies the package here). Bounded like the
-		// per-check scratch.
-		{Name: verifyCanaryTmpVolName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-			SizeLimit: newLimit(verifyCheckTmpSizeLimit),
-		}}},
+	}
+	// F60 (D17.1): the canary's own writable /tmp scratch (post-F53 /verify
+	// is read-only; the canary copies the package here). Bounded like the
+	// per-check scratch. Only present when the canary is present (preset
+	// != none — for a non-Go repo the canary is omitted and so is its
+	// scratch volume).
+	if canaryTmpVol.Name != "" {
+		volumes = append(volumes, canaryTmpVol)
 	}
 	for i := range checks {
 		volumes = append(volumes, corev1.Volume{

@@ -2740,6 +2740,23 @@ const SubvertedVerifyReason = "SubvertedVerify"
 // exactly once (idempotent — see the one-shot annotation in applyVerifyOutcome).
 const VerifyCanaryUnavailableReason = "VerifyCanaryUnavailable"
 
+// CanarySkippedCondition is the condition Type recorded when the verify
+// canary is SKIPPED because the Loop declared a non-Go repo
+// (spec.verify.preset == "none"). The canary (D17.1) is a Go negative
+// control: it runs a generated Go test, so it has no meaning for a repo
+// with no Go tests. Skipping it (instead of running it and letting it exit
+// 44 → wedge in Verifying forever) is the I90 fallback — surfaced with a
+// condition so the skip is visible to `kubectl cox describe`.
+// Status True + reason CanaryNotApplicable means the canary was
+// intentionally omitted from the verify Job; the acceptance checks run
+// without the negative control.
+const CanarySkippedCondition = "CanarySkipped"
+
+// CanaryNotApplicableReason is the condition reason recorded when the canary
+// is skipped for a non-Go repo (preset none). The canary is a Go negative
+// control; a repo with no Go tests has nothing to canary.
+const CanaryNotApplicableReason = "CanaryNotApplicable"
+
 // PinNotDescendantReason is the terminal Failed reason recorded when the verify
 // Job's import-agent init refused the pinned commit because it is not a
 // descendant of status.baseCommit (F43).

@@ -364,6 +364,62 @@ var _ = Describe("F60: the verify canary (D17.1 negative control)", func() {
 		}
 	})
 
+	It("skips the canary init for preset:none and records CanarySkipped=True", func() {
+		ns := f60Ns("f60-nongo")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f60nongo"
+		recorder := record.NewFakeRecorder(64)
+		r := f60Reconciler(recorder)
+
+		// A Loop with preset: none — the operator-visible "this repo is not
+		// Go" signal. The canary (D17.1) is a Go negative control; a non-Go
+		// repo has no *_test.go to canary, so running the canary would exit
+		// 44 and wedge the Loop in Verifying forever. The operator must skip
+		// the canary init (no canary in the Job) and record the skip with a
+		// condition (I90: a fallback/degradation must be visible).
+		f60NewLoop(ns, name, func(spec *coxv1alpha1.LoopSpec) {
+			spec.Verify.Preset = "none"
+		})
+		jobName := f60DriveToVerifying(r, ns, name)
+		job := f60GetJob(ns, jobName)
+		Expect(job).NotTo(BeNil(), "the operator creates the verify Job on the Verifying advance")
+
+		// (i) The Job has NO canary init (the canary is omitted for preset none).
+		canaryIdx := f60InitIndex(job.Spec.Template.Spec, verifyCanaryInit)
+		Expect(canaryIdx).To(Equal(-1),
+			"the canary init must be ABSENT from the Job when preset: none (a non-Go repo has no *_test.go to canary; running the canary would exit 44 and wedge)")
+
+		// (ii) The checks are still present and run.
+		check0Idx := f60InitIndex(job.Spec.Template.Spec, s5aCheck0)
+		Expect(check0Idx).NotTo(Equal(-1), "check-0 must be present even when the canary is skipped")
+
+		// (iii) The CanarySkipped condition is present (I90: the skip is
+		// visible to `kubectl cox describe`).
+		// Plant the checks (no canary status — the canary init is absent from
+		// the pod spec, so canaryGateDecision sees !canary.found and returns
+		// nil, falling through to the checks, the pre-F60 decision path).
+		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
+			corev1.ContainerStatus{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		))
+		fresh := s5aReconcile(r, ns, name)
+		// The Loop must reach Succeeded (the checks pass, no canary gate in
+		// force — the canary init is absent from the pod status, so
+		// canaryGateDecision returns nil and the checks decide the Loop).
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
+			"with the canary skipped and check-0 passing, the Loop must reach Succeeded (the checks decide, not a 44 wedge)")
+		// The CanarySkipped condition is present.
+		var canarySkipped *metav1.Condition
+		for i := range fresh.Status.Conditions {
+			if fresh.Status.Conditions[i].Type == CanarySkippedCondition {
+				canarySkipped = &fresh.Status.Conditions[i]
+			}
+		}
+		Expect(canarySkipped).NotTo(BeNil(), "the CanarySkipped condition must be present (I90: the skip is visible)")
+		Expect(canarySkipped.Status).To(Equal(metav1.ConditionTrue), "CanarySkipped must be True (the canary was intentionally omitted)")
+		Expect(canarySkipped.Reason).To(Equal(CanaryNotApplicableReason), "the reason must be CanaryNotApplicable")
+	})
+
 	It("treats an OOM-killed canary (137/OOMKilled) as a bounded infra retry, not a requeue-forever wedge", func() {
 		ns := f60Ns("f60-canary-oom")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

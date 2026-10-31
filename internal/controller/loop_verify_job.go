@@ -628,86 +628,125 @@ exit 0
 		verifyArtifactScanBytes, shellQuote(verifyCommit), verifyArtifactScanBytes, verifyArtifactScanBytes/1024)
 }
 
-// canaryCheckScript builds the F60 (D17.1) canary init's sh script: the NEGATIVE
-// CONTROL for in-process subversion. The canary generates a Go test that is
-// REQUIRED to fail (t.Fatal with a random token), runs it in a separate copy
-// of a tested package, and maps the outcome to a canary exit code the
-// operator reads from the pod's init status:
+// canaryCheckScript builds the F60 (D17.1) canary init's sh script: the
+// NEGATIVE CONTROL for in-process subversion. It runs on the operator's
+// built-in Go image (verifyDefaultCheckImage — NOT spec.verify.image: a
+// control that runs in the user's image could be subverted by that image),
+// on its OWN scratch (F53: post-F53 /verify is read-only, so the canary
+// copies the tree to /tmp and runs the generated tests there). It needs no
+// git credential and no network (go test on local packages; a module that
+// needs a fetch would fail to build → 45, the correct fail-closed
+// behaviour).
 //
-//	0  → the generated test honestly failed (the forced t.Fatal fired; the
-//	     test binary respected the failure). The healthy negative control:
-//	     a real, functioning test binary. The token is printed to the log
-//	     as the proof the honest failure actually ran.
-//	43 → the test binary ignored the forced failure (exited 0 despite
-//	     t.Fatal) — the round-8 os.Exit(0)/testing.M probe. Subversion
-//	     detected → the operator maps this to the terminal SubvertedVerify
-//	     verdict.
-//	44 → the target package has no *_test.go (nothing to canary) — the
-//	     operator records a VerifyCanaryUnavailable event and takes no
-//	     decision.
-//	45 → the canary code does not compile (a build error) — the operator
-//	     treats it as an infra failure (bounded retry), never as subversion.
+// The per-package judgement (rather than one combined go test exit) is what
+// keeps the DECOY case honest: with one combined run, an honest package that
+// fails the canary makes the exit non-zero and a subverted package behind it
+// reads as healthy. Judging each package on its own token output makes ANY
+// subverted package exit 43.
 //
-// The canary runs on the operator's built-in Go image (verifyDefaultCheckImage
-// — NOT spec.verify.image: a control that runs in the user's image could be
-// subverted by that image, see M10), on its OWN scratch (F53: post-F53 /verify
-// is read-only, so the canary copies the package to /tmp and runs the
-// generated test there). It needs no git credential and no network (go test on a
-// local package with no external deps; a package that needs a module fetch
-// would fail to build → 45, the correct fail-closed behaviour).
+// The decision is on the RANDOM TOKEN, not on English strings from go test's
+// output (the old "no tests to run" grep was spoofable by an agent test that
+// printed that line; a forced-failure t.Fatal never produces it, and the
+// token check subsumes it). Build failures are detected from the -json
+// build-fail event of the package under test, not from grepping error strings
+// the agent can print.
+//
+// Cost is bounded: at most 50 packages are tested (first N in sort order);
+// hitting the cap is logged ("canary: capped") so the log says which packages
+// were judged and that some were not.
+//
+// Exit codes (the contract the operator's verifyOutcome reads):
+//
+//	0  → every tested package honestly failed the canary test (the negative
+//	     control held); the acceptance checks run.
+//	43 → a tested package's canary test exited 0 (despite the forced
+//	     t.Fatal), or exited non-zero without the token in its -json output:
+//	     the harness is subverted in that package.
+//	44 → the canary is unavailable: no *_test.go anywhere, or no go binary
+//	     on PATH — the operator records a VerifyCanaryUnavailable event and
+//	     takes no decision.
+//	45 → some tested package's canary could not even build (a go test -json
+//	     build-fail for THAT package) — the operator treats it as an infra
+//	     failure (bounded retry), never as subversion.
 func canaryCheckScript() string {
 	return `set -u
-export TMPDIR=/tmp
-cd /verify
+export TMPDIR="/tmp"
 
-# The random seed for the canary test. RANDOM is dash/ash-extended; fall
-# back to a $$/time seed so the seed is unique per run on plain sh too.
-SEED=$( { echo "${RANDOM:-}${RANDOM:-}"; echo "$$$(date +%s)"; } | od -An -v -t d1 2>/dev/null | tr -d ' \\n' | head -c 8 )
+# The random seed for the canary test: one token per Job (the token is the
+# forgery probe — it cannot be pre-printed by the agent's tree). RANDOM is
+# dash/ash-extended; fall back to a $$/time seed so the seed is unique per
+# run on plain sh too.
+SEED=$( { echo "${RANDOM:-}${RANDOM:-}"; echo "$$$(date +%s)"; } | od -An -v -t d1 2>/dev/null | tr -d ' \n' | head -c 8 )
 [ -n "$SEED" ] || SEED=$(date +%s | tr -d ' ')
 TOKEN="canary-$SEED"
+# Double-quoted: $SEED must expand to the per-Job seed. Single quotes leave
+# the literal string '^TestZZZCanary$SEED$', which matches no test — go test
+# then exits 0 (no test matched) and an honest package reads as subverted.
+RUN="^TestZZZCanary$SEED$"
+CAP=50
 
-# Pick a tested package: the first directory under /verify that contains at
-# least one *_test.go AND a non-test .go file (a real Go package with a real
-# test to canary). The canary only needs ONE honest package to be a valid
-# negative control — a subverted test binary affects every go test in the
-# tree, so any one package's binary is representative.
-PKG_DIR=""
-for f in $(find /verify -name '*_test.go' -not -path '*/.git/*' 2>/dev/null); do
-  d=$(dirname "$f")
-  if ls "$d"/*.go >/dev/null 2>&1; then PKG_DIR="$d"; break; fi
-done
+# Copy the WHOLE tree (so a nested package's go.mod comes along) to a
+# writable scratch (F53: the checkout mount is read-only). Keep the agent's
+# tests: the subversion probe is a test the AGENT added that force-exits the
+# binary (os.Exit(0)); with -run restricted to the canary the agent's tests
+# do not RUN, but their init() code is in the binary — an init() os.Exit(0)
+# still kills the process before the canary fires, which is exactly the
+# subversion the canary is built to catch.
+SCRATCH="/tmp/canary-$SEED"
+mkdir -p "$SCRATCH"
+cp -a /verify/. "$SCRATCH/"
+trap 'rm -rf "$SCRATCH"' EXIT
+cd "$SCRATCH"
 
-# No tested package: nothing to canary → unavailable (the operator records a
-# VerifyCanaryUnavailable event and takes no decision).
-if [ -z "$PKG_DIR" ]; then
-  echo "canary: no tested package found; canary unavailable"
+# No go toolchain: nothing to canary with → unavailable (the operator records
+# a VerifyCanaryUnavailable event and takes no decision).
+command -v go >/dev/null 2>&1 || { echo "canary: no go toolchain; canary unavailable"; exit 44; }
+
+# Every directory that has a *_test.go (NUL-safe: a -print0 | sort -z | xargs
+# -0 chain — shell word-splitting would mangle a path with spaces or a tab).
+# Hitting the cap (50) is logged; the first N in sort order are the ones
+# tested.
+N=$(find . -name '*_test.go' -not -path './.git/*' -print0 | sort -z | xargs -0 -n1 dirname 2>/dev/null | awk 'END{print NR}')
+[ -n "$N" ] && [ "$N" -gt 0 ] 2>/dev/null || N=0
+if [ "$N" -eq 0 ]; then
+  echo "canary: no *_test.go anywhere; canary unavailable"
   exit 44
 fi
-
-# Copy the WHOLE package (source + all the agent's tests) to a writable
-# scratch (F53: /verify is read-only). Keeping the agent's tests matters: the
-# round-8 subversion probe is a test the AGENT added that force-exits the
-# binary (os.Exit(0)), and go test runs tests in source-file order (alphabetical
-# by filename), so the agent's tests run and their os.Exit(0) kills the process
-# before the canary's own test. A healthy package's agent tests pass and the
-# canary's forced-failure test (added LAST, so it runs last) then t.Fatal's.
-SCRATCH=/tmp/canary-$SEED
-mkdir -p "$SCRATCH"
-cp -r "$PKG_DIR/". "$SCRATCH/"
-trap 'rm -rf "$SCRATCH"' EXIT
-
-# Package name from a non-test file (the canary test must be in the same
-# package to compile).
-PKG_NAME=$(sed -n 's/^package[[:space:]]*\([a-zA-Z0-9_]*\).*/\1/p' "$SCRATCH"/*.go 2>/dev/null | grep -v 'package main' | head -n1)
-[ -z "$PKG_NAME" ] && PKG_NAME=$(sed -n 's/^package[[:space:]]*\([a-zA-Z0-9_]*\).*/\1/p' "$SCRATCH"/*.go 2>/dev/null | head -n1)
-[ -n "$PKG_NAME" ] || { echo "canary: could not determine package name"; exit 44; }
-
-# The canary test: MUST fail (t.Fatal with the token). The FILENAME sorts
-# LAST (zzz_) so the agent's tests (their normal *_test.go names) run first and
-# any os.Exit(0) probe in them kills the process before the canary fires —
-# which is exactly the subversion the canary is designed to catch.
-cat > "$SCRATCH/zzz_canary_test.go" <<EOF
-package $PKG_NAME
+if [ "$N" -gt "$CAP" ]; then
+  echo "canary: capped — $N tested packages found, testing only the first $CAP (sorted)"
+fi
+# The injection loop is a piped while (a subshell): its output is files on
+# disk, not shell variables — the verdict loop below re-finds the injected
+# files itself, so the subshell's writes persist regardless.
+find . -name '*_test.go' -not -path './.git/*' -print0 | sort -z | head -z -n "$CAP" | xargs -0 -n1 dirname 2>/dev/null | while IFS= read -r d; do
+  # Package clause: the first line that matches ^package (NOT head -1 of a
+  # test file, which breaks on a leading comment or //go:build tag). Prefer a
+  # test file (the canary test must land in the SAME package as the tests it
+  # protects); fall back to any .go file; keep the _test suffix if the clause
+  # carries it.
+  pkg=""
+  for f in "$d"/*_test.go; do
+    [ -e "$f" ] || continue
+    pkg=$(sed -n 's/^package[[:space:]]\{1,\}\([a-zA-Z0-9_]*\).*/\1/p' "$f" | head -n1)
+    [ -n "$pkg" ] && break
+  done
+  if [ -z "$pkg" ]; then
+    for f in "$d"/*.go; do
+      [ -e "$f" ] || continue
+      case "$f" in *_test.go) continue ;; esac
+      pkg=$(sed -n 's/^package[[:space:]]\{1,\}\([a-zA-Z0-9_]*\).*/\1/p' "$f" | head -n1)
+      [ -n "$pkg" ] && break
+    done
+  fi
+  if [ -z "$pkg" ]; then
+    echo "canary: $d has *_test.go but no readable package clause; skipping"
+    continue
+  fi
+  # The canary test: MUST fail (t.Fatal with the token). Filename sorts LAST
+  # (zzz_) — harmless now (only the canary test runs, -run restricted), kept
+  # for parity with the pre-F60 shape.
+  cat > "$d/zzz_canary_test.go" <<EOF
+package $pkg
 
 import "testing"
 
@@ -715,44 +754,53 @@ func TestZZZCanary$SEED(t *testing.T) {
 	t.Fatal("$TOKEN")
 }
 EOF
+done
 
-# Run the FULL package's tests (agent's + the canary's). cwd = the copied
-# package. The exit code is the evidence:
-#   0      → the binary exited 0 despite the forced-failure canary test being
-#            present → a test force-exited it (the round-8 probe) → SUBVERTED.
-#   non-zero → at least one test honestly failed (the binary respects test
-#            failures) → the healthy negative control. The token is printed to
-#            the log as the proof the honest failure ran.
-#   build error → the canary code does not compile (an INFRA failure, never a
-#            subversion verdict).
-cd "$SCRATCH"
-OUT=$(go test -count=1 . 2>&1)
-RC=$?
-echo "$OUT"
-echo "canary: go test exit $RC"
+# Find the module root for the -run target (go test resolves ./<dir> paths
+# relative to the module root). go.mod at the tree root: use "."; otherwise
+# each package's own go.mod root is its own directory.
+MODROOT="."
+[ -f go.mod ] || MODROOT=""
 
-# Build failure → 45 (infra, never subversion). A package that needs a module
-# fetch / external dep, or a broken tree, fails to build; the canary is
-# fail-closed on the build, not a subversion verdict.
-if echo "$OUT" | grep -qiE 'build failed|cannot find package|could not import|undefined:|syntax error|could not compile|imported and not used|redeclared'; then
+SUBVERTED=0
+BUILDFAIL=0
+for d in $(find . -name 'zzz_canary_test.go' -not -path './.git/*' -print0 | sort -z | xargs -0 -n1 dirname 2>/dev/null); do
+  if [ -n "$MODROOT" ]; then
+    target="$d"
+  else
+    # No module root at the tree root: this package's own go.mod (or the
+    # package dir itself, if it is its own module / GOPATH-style) is the
+    # target. go test ./<pkg> from the package's module root.
+    if [ -f "$d/go.mod" ]; then target="$d"; else target=""; fi
+  fi
+  [ -n "$target" ] || target="$d"
+  OUTF="$SCRATCH/canary-out-$SEED.$$"
+  go test -count=1 -run "$RUN" -json "$target" > "$OUTF" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "canary: $d exited 0 despite the forced-failure canary test ($TOKEN) — SUBVERTED"
+    SUBVERTED=1
+  elif grep -q '"Action":"build-fail"' "$OUTF"; then
+    echo "canary: $d failed to build (go test build-fail) — infra, not subversion"
+    BUILDFAIL=1
+  elif ! grep -q "$TOKEN" "$OUTF"; then
+    echo "canary: $d exited non-zero without the token ($TOKEN) — the honest failure did not run — SUBVERTED"
+    SUBVERTED=1
+  else
+    echo "canary: $d OK — the forced t.Fatal ran and was reported ($TOKEN)"
+  fi
+  rm -f "$OUTF"
+done
+
+if [ "$SUBVERTED" -eq 1 ]; then
+  echo "canary: SUBVERTED — a tested package ignored or hid the forced-failure canary test ($TOKEN)"
+  exit 43
+fi
+if [ "$BUILDFAIL" -eq 1 ]; then
   echo "canary: build error (not a subversion verdict)"
   exit 45
 fi
-# No tests to run → the package had no runnable tests (the agent's tests were
-# filtered out or the canary test did not compile) → unavailable, not subversion.
-if echo "$OUT" | grep -qi 'no tests to run'; then
-  echo "canary: no tests to run; canary unavailable"
-  exit 44
-fi
-# The decision (order-independent): a package that contains the forced-failure
-# canary test can only exit 0 if the binary ignored a test failure / a test
-# force-exited it (the round-8 os.Exit(0) probe). Non-zero means the binary
-# respected a failure — the healthy negative control.
-if [ "$RC" -eq 0 ]; then
-  echo "canary: SUBVERTED — the test binary exited 0 despite the forced-failure canary test ($TOKEN)"
-  exit 43
-fi
-echo "canary: OK — the test binary exited non-zero (it respects failures); negative control held ($TOKEN)"
+echo "canary: OK — every tested package honestly failed the canary test; negative control held ($TOKEN)"
 exit 0
 `
 }

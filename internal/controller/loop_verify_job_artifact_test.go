@@ -146,7 +146,11 @@ func gitSHA(t *testing.T, repo string) string {
 // writeFile writes a text file (0644).
 func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
-	mustWriteFile(t, filepath.Join(dir, name), []byte(content))
+	path := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	mustWriteFile(t, path, []byte(content))
 }
 
 // mustWriteFile writes a file (0644), failing on error.

@@ -270,6 +270,49 @@ func TestCanaryCheckScript(t *testing.T) {
 			t.Fatalf("canary output lacks the subverted verdict. output: %s", out)
 		}
 	})
+
+	t.Run("honest package below its module root: go.mod in svc/, tests in svc/sub", func(t *testing.T) {
+		// Reviewer P1 (R45 round 2): a package BELOW its module root. The
+		// pre-round-2 walk's `case .*) p="."` matched every relative path, so
+		// the walk jumped from ./svc/sub straight to . and never looked at
+		// ./svc/go.mod — the package was skipped, TESTED stayed 0, and the
+		// honest repo exited 44 (stuck in Verifying forever). The fixed walk
+		// strips one component at a time and only reaches "." at the last
+		// step, so ./svc/go.mod is found and go test runs ./sub from ./svc.
+		verify := t.TempDir()
+		writeFile(t, verify, "svc/go.mod", "module example.com/svc\n\ngo 1.26\n")
+		writeFile(t, verify, "svc/sub/add.go", "package sub\n\nfunc Add(a, b int) int { return a + b }\n")
+		writeFile(t, verify, "svc/sub/add_test.go",
+			"package sub\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal(\"x\") } }\n")
+
+		out, code := runCanaryScript(t, verify)
+		if code != 0 {
+			t.Fatalf("canary exited %d for an honest package below its module root; want 0. output: %s", code, out)
+		}
+		if !strings.Contains(out, "OK — every tested package") {
+			t.Fatalf("canary output lacks the healthy verdict. output: %s", out)
+		}
+	})
+
+	t.Run("subverted package below its module root: init os.Exit(0) probe in svc/sub", func(t *testing.T) {
+		// The below-module-root version of scenario B: the probe is in
+		// svc/sub, whose module root is svc/. The canary must find that
+		// module root, run go test ./sub from there, and still see the
+		// probe's exit 0 despite the forced t.Fatal → 43.
+		verify := t.TempDir()
+		writeFile(t, verify, "svc/go.mod", "module example.com/svc\n\ngo 1.26\n")
+		writeFile(t, verify, "svc/sub/add.go", "package sub\n\nfunc Add(a, b int) int { return a + b }\n")
+		writeFile(t, verify, "svc/sub/probe_test.go",
+			"package sub\n\nimport \"os\"\n\nfunc init() { os.Exit(0) }\n")
+
+		out, code := runCanaryScript(t, verify)
+		if code != 43 {
+			t.Fatalf("canary exited %d for a subverted package below its module root; want 43. output: %s", code, out)
+		}
+		if !strings.Contains(out, "SUBVERTED") {
+			t.Fatalf("canary output lacks the subverted verdict. output: %s", out)
+		}
+	})
 }
 
 // runCanaryScript runs the REAL canaryCheckScript against a scratch Go tree:

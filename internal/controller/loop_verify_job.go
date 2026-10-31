@@ -785,9 +785,9 @@ while IFS= read -r d; do
   while :; do
     if [ -f "$p/go.mod" ]; then mroot="$p"; break; fi
     [ "$p" = "." ] && break
-    p="${p%/*}"
     case "$p" in
-      .*) p="." ;;   # "./pkg" -> "." (the tree root)
+      */*) p="${p%/*}" ;;   # "./svc/sub" -> "./svc" -> "."
+      *) p="." ;;
     esac
   done
   if [ -z "$mroot" ]; then
@@ -798,7 +798,7 @@ while IFS= read -r d; do
   if [ "$mroot" = "$d" ]; then
     target="."
   else
-    target="./${d#./}"
+    target="./${d#"$mroot"/}"   # relative to the module root, not the tree root
   fi
   OUTF="$SCRATCH/canary-out-$SEED.$(basename "$d")"
   ( cd "$mroot" && go test -count=1 -run "$RUN" -json "$target" ) > "$OUTF" 2>&1

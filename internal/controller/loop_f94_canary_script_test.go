@@ -246,12 +246,11 @@ func f94SetupRepo(t *testing.T, files map[string]string, baseMsg string) (string
 func f94AddCommit(t *testing.T, dir, file, content, msg string) {
 	t.Helper()
 	writeFile(t, dir, file, content)
-	git := func(args ...string) string {
+	git := func(args ...string) {
 		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, string(out))
 		}
-		return string(out)
 	}
 	git("add", "--", file)
 	git("commit", "-m", msg)

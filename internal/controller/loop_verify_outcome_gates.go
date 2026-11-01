@@ -134,7 +134,7 @@ func artifactGateDecision(pod *corev1.Pod) *verifyDecision {
 }
 
 // canaryGateDecision reads the canary init's gate decision from the pod's
-// init statuses (F60, D17.1). canaryGateSkipped (F94 s4) reports whether the
+// init statuses (F60, D17.1). The second return value (F94 s4/s5) reports whether the
 // canary RAN and self-reported a skip (exit 0 + the skip marker in its
 // termination message — the repo has no *_test.go at the base or verified
 // commit): the caller records CanarySkipped=True/NoTestsInRepo there (the
@@ -160,31 +160,31 @@ func artifactGateDecision(pod *corev1.Pod) *verifyDecision {
 // pre-F60 decision path) or the canary has not terminated yet (a canary
 // still Running/Waiting is PENDING — no decision, requeue, exactly like the
 // tamper / artifact gates above).
-func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
+func canaryGateDecision(pod *corev1.Pod) (*verifyDecision, bool) {
 	canary := readVerifyCanary(pod)
 	if !canary.found {
 		// Absent: the canary gate is not in force (pre-F60 legacy pod or a
 		// fixture that plants the old init set) — fall through to the checks.
-		return nil
+		return nil, false
 	}
 	if !canary.terminated {
 		// Still Running or Waiting: in progress — no decision, requeue (the
 		// I49 norm, exactly like the tamper / artifact gates above).
-		return &verifyDecision{outcome: verifyNoDecision, requeue: true, container: verifyCanaryInit, exitCode: 0}
+		return &verifyDecision{outcome: verifyNoDecision, requeue: true, container: verifyCanaryInit, exitCode: 0}, false
 	}
 	switch canary.code {
 	case verifyCanarySubvertedExit:
 		// The test binary ignored the forced t.Fatal (the round-8 os.Exit(0)
 		// probe) — subversion. Terminal, like tamper: the agent's own code
 		// made the test binary dishonest, so no check can be trusted.
-		return &verifyDecision{outcome: verifySubverted, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
+		return &verifyDecision{outcome: verifySubverted, requeue: false, container: verifyCanaryInit, exitCode: canary.code}, false
 	case verifyCanaryTestsRemovedExit:
 		// F94a: HEAD has no *_test.go and the base commit HAD tests — the
 		// agent removed every test (go test would pass vacuously). Terminal,
 		// like tamper: the agent's own commit made the evidence dishonest, so
 		// no check can be trusted. No retry: a re-run would import the same
 		// pin.
-		return &verifyDecision{outcome: verifyTestsRemoved, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
+		return &verifyDecision{outcome: verifyTestsRemoved, requeue: false, container: verifyCanaryInit, exitCode: canary.code}, false
 	case verifyCanaryUnavailableExit:
 		// F94c: the canary is unavailable (no go toolchain, every package
 		// skipped, or the base commit's tree unreadable — the script fails
@@ -193,12 +193,12 @@ func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
 		// bound), never a subversion verdict and never a forever-hold at
 		// Verifying (the F60 one-shot no-decision path is gone — it wedged
 		// every testless repo).
-		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
+		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}, false
 	case verifyCanaryBuildErrorExit:
 		// A build error is an infra failure (bounded retry), NEVER a
 		// subversion verdict (M8's trap: mapping 45 to infra is correct; the
 		// subverted path is exit 43 only).
-		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
+		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}, false
 	case verifyCanaryHealthyExit:
 		// exit 0 (verifyCanaryHealthyExit): the generated test honestly failed,
 		// the negative control held. The gate passes — no decision from this
@@ -211,12 +211,11 @@ func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
 		// NO verdict change, because exit 0 already proceeds to the acceptance
 		// checks (a subverted binary is caught by the exit-43 path, not by the
 		// skip marker).
-		// The gate has no Loop to write to, so the skip is only FLAGGED here
-		// (see canaryGateSkipped); applyVerifyOutcome records it once the
-		// decision is final. Fall through to the checks, exactly as a healthy
-		// exit 0 does.
-		canaryGateSkipped = strings.Contains(canary.message, verifyCanarySkipMarker)
-		return nil
+		// The gate has no Loop to write to, so the skip is only FLAGGED on
+		// the decision (canarySkipped, F94 s5 — per call, not a package
+		// global); applyVerifyOutcome records it once the decision is final.
+		// Fall through to the checks, exactly as a healthy exit 0 does.
+		return nil, strings.Contains(canary.message, verifyCanarySkipMarker)
 	default:
 		// OOMKilled (the kubelet killed the canary at its memory limit) or any
 		// other unrecognized non-zero code: an INFRA failure (bounded retry),
@@ -231,18 +230,9 @@ func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
 		// requeued forever, the jobFailed flag ignored once a pod exists).
 		// F58's rule for OOM-killed checks applies here: resource-limit
 		// deaths are infra, not the agent's work.
-		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
+		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}, false
 	}
 }
-
-// canaryGateSkipped (F94 s4): set by canaryGateDecision when the canary ran
-// and self-reported a skip (exit 0 + marker in its termination message),
-// and consumed by applyVerifyOutcome after the decision, where the Loop is
-// available for the CanarySkipped condition (the gate function has no Loop
-// to write to). It mirrors verifyOutcome's requeue/decision shape: a fresh
-// reconcile re-derives it, so a retried Job whose canary did not skip
-// clears the flag.
-var canaryGateSkipped = false
 
 // checkGateDecision reads the check inits' gate decision from the pod's init
 // statuses (check-0 .. check-<checkCount-1). A terminated check with a

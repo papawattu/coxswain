@@ -1796,7 +1796,7 @@ const (
 // evidence). A Job the batch controller failed on its activeDeadlineSeconds
 // (F53) is an infra failure too, decided BEFORE the per-init walk and whatever
 // the init statuses still say.
-func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExceeded bool) (int, bool, string, int32) {
+func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExceeded bool) (int, bool, string, int32, bool) {
 	// F53: a Job the batch controller already failed on its deadline can never
 	// produce evidence, whatever stale Waiting/Running state the pod read still
 	// shows (the read can race the kill), and even when the pod is already gone.
@@ -1804,16 +1804,16 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// that it is not in progress. It sits above the pod==nil branch so the
 	// decision does not depend on the caller also reporting jobFailed.
 	if deadlineExceeded {
-		return verifyInfraFailed, false, "", 0
+		return verifyInfraFailed, false, "", 0, false
 	}
 	if pod == nil {
 		// No pod at all: no decision yet unless the Job itself is Failed
 		// (a failed Job whose pod is gone — evicted, garbage-collected — is
 		// still a decision: the evidence was never produced).
 		if jobFailed {
-			return verifyInfraFailed, false, "", 0
+			return verifyInfraFailed, false, "", 0, false
 		}
-		return verifyNoDecision, true, "", 0
+		return verifyNoDecision, true, "", 0, false
 	}
 	// I65: the trusted inits (clone-base, import-agent) run BEFORE the evidence
 	// inits. Their decision is read by trustedInitDecision (F60-lint: extracted
@@ -1822,7 +1822,7 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// the checks never ran; a trusted init still Running or Waiting is PENDING
 	// (no decision, requeue — the I49 norm: in-progress is never a failure).
 	if d := trustedInitDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+		return d.outcome, d.requeue, d.container, d.exitCode, false
 	}
 	// The evidence gates are walked in evidence order (tamper -> artifact ->
 	// canary -> checks); each helper returns the decision for its own gate
@@ -1834,10 +1834,10 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// pod's status) so the caller falls through to the next gate (F60-lint:
 	// extracted from this function, same order, same decisions).
 	if d := tamperGateDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+		return d.outcome, d.requeue, d.container, d.exitCode, false
 	}
 	if d := artifactGateDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+		return d.outcome, d.requeue, d.container, d.exitCode, false
 	}
 	// F60 (D17.1): the canary runs BETWEEN artifact and check-0 (tamper ->
 	// artifact -> canary -> checks). Tamper and artifact are clean at this
@@ -1846,13 +1846,30 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// artifact gates above); a canary absent from the pod's status (a pre-F60
 	// legacy pod, or a test fixture that plants the old init set) is not in
 	// force, so fall through to the checks (the pre-F60 decision path).
-	if d := canaryGateDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+	// The canary gate returns (decision, skipped): a nil decision with skipped=true
+	// means the canary exited 0 with the skip marker — the walk continues to the
+	// checks (exactly as a healthy exit 0 does), and the skip flag is carried
+	// by a local variable (F94 s5: per call, not a package global).
+	canaryDecision, canarySkipped := canaryGateDecision(pod)
+	if canaryDecision != nil {
+		return canaryDecision.outcome, canaryDecision.requeue, canaryDecision.container, canaryDecision.exitCode, false
 	}
 	// Tamper clean + artifact clean + canary healthy (or absent): read the
-	// check inits (check-0 .. check-<checkCount-1>).
-	d := checkGateDecision(pod, checkCount)
-	return d.outcome, d.requeue, d.container, d.exitCode
+	// check inits (check-0 .. check-<checkCount-1). A decision from the check
+	// gate carries the canary skip flag when the canary self-reported a skip
+	// (exit 0 + marker), so applyVerifyOutcome records CanarySkipped once the
+	// check decision is final.
+	if d := checkGateDecision(pod, checkCount); d != nil {
+		return d.outcome, d.requeue, d.container, d.exitCode, canarySkipped
+	}
+	// No decision from the check gate (not in force — the pod lacks the check
+	// status): the checks never produced evidence on this read. The canary may
+	// still have self-reported a skip (exit 0 + marker), so that skip is not
+	// lost with the walk: report it on the no-decision requeue.
+	if cd2, _ := canaryGateDecision(pod); cd2 != nil {
+		return verifyNoDecision, true, cd2.container, cd2.exitCode, canarySkipped
+	}
+	return verifyNoDecision, true, "", 0, canarySkipped
 }
 
 // verifyCheckResult is one acceptance check's read from the pod's init statuses.
@@ -2058,7 +2075,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	// still running.
 	evidenceChanged := recordTamperEvidence(loop, pod, job)
 	checkCount := len(loop.Spec.Verify.AcceptanceChecks)
-	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount, jobFailed, deadlineExceeded)
+	outcome, requeue, failedCheck, checkExitCode, canarySkipped := verifyOutcome(pod, checkCount, jobFailed, deadlineExceeded)
 	if requeue {
 		return evidenceChanged, true
 	}
@@ -2079,21 +2096,21 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	// extracted from this function (F60-lint: the nested found/notRun
 	// branches added complexity).
 	recordCheckResults(pod, loop, checkCount)
-	// F94 s4: the canary RAN (preset go) and self-reported a skip (exit 0 +
+	// F94 s4/s5: the canary RAN (preset go) and self-reported a skip (exit 0 +
 	// the skip marker in its termination message — the repo has no *_test.go
 	// at the base or verified commit). Record CanarySkipped=True with the
 	// NoTestsInRepo reason so the skip is visible to `kubectl cox describe`
 	// (the I90 surface, the same condition preset none records at Job
 	// creation); the decision itself is unchanged — exit 0 already proceeded
 	// to the acceptance checks (see the SPOOF LIMIT on canaryGateDecision).
-	// The flag is reset so a retried Job whose canary did not skip does not
-	// inherit a stale skip from the previous attempt's reconcile.
-	if canaryGateSkipped {
+	// The skip rides on the decision (canarySkipped), per call, so a retried
+	// Job whose canary did not skip cannot inherit a stale skip from a
+	// previous attempt's reconcile.
+	if canarySkipped {
 		setCondition(loop, CanarySkippedCondition, metav1.ConditionTrue,
 			NoTestsInRepoReason,
 			"the verify canary was skipped: the repository has no *_test.go at the base or verified commit; the acceptance checks ran without the Go negative control")
 	}
-	canaryGateSkipped = false
 	// B5a: bumpVerifyResult is called for every verify outcome decision.
 	bumpVerifyResult(outcome)
 	switch outcome {

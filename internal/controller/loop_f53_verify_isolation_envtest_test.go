@@ -382,11 +382,11 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		// it does not need the pod, and it must not depend on the caller also
 		// setting jobFailed (both come from the same JobFailed condition, but the
 		// decision should stand on its own).
-		outcome, requeue, _, _ := verifyOutcome(nil, 1, false, true)
+		outcome, requeue, _, _, _ := verifyOutcome(nil, 1, false, true)
 		Expect(outcome).To(Equal(verifyInfraFailed))
 		Expect(requeue).To(BeFalse())
 		// Control: no pod and no Job failure is still no decision.
-		outcome, requeue, _, _ = verifyOutcome(nil, 1, false, false)
+		outcome, requeue, _, _, _ = verifyOutcome(nil, 1, false, false)
 		Expect(outcome).To(Equal(verifyNoDecision))
 		Expect(requeue).To(BeTrue())
 	})

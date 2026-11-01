@@ -724,8 +724,8 @@ cp -a /verify/. "$SCRATCH/"
 trap 'rm -rf "$SCRATCH"' EXIT
 cd "$SCRATCH"
 
-# No go toolchain: nothing to canary with → unavailable (the operator records
-# a VerifyCanaryUnavailable event and takes no decision).
+# No go toolchain: nothing to canary with → unavailable (the operator
+# treats 44 as a bounded infra failure, F94c).
 command -v go >/dev/null 2>&1 || { echo "canary: no go toolchain; canary unavailable"; exit 44; }
 
 # Every directory that has a *_test.go (NUL-safe: a -print0 | sort -z chain
@@ -972,9 +972,11 @@ const (
 	// ignored the forced failure (exited 0 despite t.Fatal, or the round-8
 	// os.Exit(0) probe) — subversion detected.
 	verifyCanarySubvertedExit = 43
-	// verifyCanaryUnavailableExit is the canary's exit when the target package
-	// has no *_test.go (nothing to canary) — the operator records a
-	// VerifyCanaryUnavailable event and takes no decision.
+	// verifyCanaryUnavailableExit is the canary's exit when it is unavailable
+	// (no go toolchain, every package skipped, or the base commit's tree
+	// unreadable — the script fails closed on any git error): the operator
+	// treats it as a bounded infra failure (F94c), retried to the infra
+	// bound and then Failed:VerifyInfraFailed — never a no-decision hold.
 	verifyCanaryUnavailableExit = 44
 	// verifyCanaryBuildErrorExit is the canary's exit when the canary code
 	// does not compile (a build error, NOT the subversion probe) — the

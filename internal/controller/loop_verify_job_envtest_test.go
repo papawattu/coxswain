@@ -2337,7 +2337,7 @@ func d61EgressPod(ctx context.Context, ns, loopName string, ready bool) {
 	}
 	loop := &coxv1alpha1.Loop{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: loopName, Namespace: ns}, loop)).To(Succeed())
-	pod := buildEgressProxyPod(loopName, ns, "coxswain-egress-proxy:standin",
+	pod := (&LoopReconciler{}).buildEgressProxyPod(loopName, ns, "coxswain-egress-proxy:standin",
 		[]string{"github.com:443"}, "testhash", "10.244.0.0/16", "10.96.0.0/12")
 	pod.Annotations = map[string]string{proxySpecHashAnnotation: egressProxyPodSpecHash(pod)}
 	// No owner ref: the pod is FOREIGN. The operator's ensureEgressProxy bails

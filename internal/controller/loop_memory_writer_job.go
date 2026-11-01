@@ -421,7 +421,7 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 	// it from the Job's pod's container status). The path is the operator's
 	// constant (no user input, so it is unquoted in the entrypoint script).
 	termMsgPath := "/tmp/memory-write-summary.txt"
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      memoryWriterJobName(loop),
 			Namespace: loop.Namespace,
@@ -535,6 +535,11 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 			},
 		},
 	}
+	// C2 + D101: the memory-writer Job's pod template carries the CURRENT
+	// Loop node placement (Jobs are immutable and short-lived: a flag change
+	// re-places NEW memory-writer Jobs only — documented in OPERATOR.md).
+	r.applyLoopPlacement(&job.Spec.Template.Spec)
+	return job
 }
 
 // ensureMemoryWriterNetworkPolicy creates (idempotently) the memory-writer

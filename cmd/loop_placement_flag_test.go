@@ -53,7 +53,6 @@ func TestParseLoopNodeSelector(t *testing.T) {
 		" a=v, b2",        // the bad token is the second one
 		"k=v=extra",       // too many =
 		"k1=v1,,k2",       // a malformed entry, not a blank one
-		"k=v:colon",       // a colon is not a key/value separator
 	}
 	for _, in := range bad {
 		_, err := parseLoopNodeSelector(in)
@@ -75,61 +74,88 @@ func TestParseLoopNodeSelector(t *testing.T) {
 }
 
 func TestParseLoopTolerations(t *testing.T) {
+	// The approved plan's format (PLAN-PHASE6.md:101-102):
+	// key:op:effect[:value[:seconds]], op always field 2.
 	if _, err := parseLoopTolerations(""); err != nil {
 		t.Fatalf("empty flag = no tolerations, got error: %v", err)
 	}
-	tol, err := parseLoopTolerations("k:NoSchedule")
+
+	// 3 fields: key:op:effect (no value, no seconds).
+	tols, err := parseLoopTolerations("k:Exists:NoExecute")
 	if err != nil {
-		t.Fatalf("parse k:NoSchedule: %v", err)
+		t.Fatalf("parse k:Exists:NoExecute: %v", err)
 	}
-	if tol.Key != "k" || tol.Operator != "Equal" || tol.Effect != "NoSchedule" {
-		t.Fatalf("k:NoSchedule = %+v, want {k Equal NoSchedule} (op defaults to Equal)", tol)
+	tol := tols[0]
+	if tol.Key != "k" || tol.Operator != "Exists" || tol.Value != "" || tol.Effect != "NoExecute" || tol.TolerationSeconds != nil {
+		t.Fatalf("k:Exists:NoExecute = %+v, want {k Exists NoExecute, no value/seconds}", tol)
 	}
 
-	tol, err = parseLoopTolerations("k:v:Exists")
+	// 4 fields: key:Equal:NoSchedule:loops (the reviewer's example).
+	tols, err = parseLoopTolerations("coxswain.io/pool:Equal:NoSchedule:loops")
 	if err != nil {
-		t.Fatalf("parse k:v:Exists: %v", err)
+		t.Fatalf("parse coxswain.io/pool:Equal:NoSchedule:loops: %v", err)
 	}
-	if tol.Key != "k" || tol.Value != "v" || tol.Operator != "Equal" || tol.Effect != "Exists" {
-		t.Fatalf("k:v:Exists = %+v, want {k Equal v Exists}", tol)
+	tol = tols[0]
+	if tol.Key != "coxswain.io/pool" || tol.Operator != "Equal" || tol.Value != "loops" || tol.Effect != "NoSchedule" || tol.TolerationSeconds != nil {
+		t.Fatalf("4-field = %+v, want {pool Equal loops NoSchedule}", tol)
 	}
 
-	tol, err = parseLoopTolerations("k:v:NotEqual:NoSchedule")
+	// 5 fields with seconds.
+	tols, err = parseLoopTolerations("k:Equal:NoSchedule:loops:120")
 	if err != nil {
-		t.Fatalf("parse k:v:NotEqual:NoSchedule: %v", err)
+		t.Fatalf("parse k:Equal:NoSchedule:loops:120: %v", err)
 	}
-	if tol.Operator != "NotEqual" || tol.Effect != "NoSchedule" {
-		t.Fatalf("k:v:NotEqual:NoSchedule = %+v, want op NotEqual effect NoSchedule", tol)
+	tol = tols[0]
+	if tol.Value != "loops" || tol.TolerationSeconds == nil || *tol.TolerationSeconds != 120 {
+		t.Fatalf("5-field = %+v, want seconds 120", tol)
 	}
 
-	// The seconds form: the trailing token is the tolerationSeconds value.
-	tol, err = parseLoopTolerations("k:NoSchedule:300")
+	// Exists with seconds but NO value: the empty value slot keeps seconds in
+	// field 5 (key:Exists:NoExecute::30).
+	tols, err = parseLoopTolerations("k:Exists:NoExecute::30")
 	if err != nil {
-		t.Fatalf("parse k:NoSchedule:300: %v", err)
+		t.Fatalf("parse k:Exists:NoExecute::30: %v", err)
 	}
-	if tol.TolerationSeconds == nil || *tol.TolerationSeconds != 300 {
-		t.Fatalf("k:NoSchedule:300 TolerationSeconds = %v, want 300", tol.TolerationSeconds)
+	tol = tols[0]
+	if tol.Operator != "Exists" || tol.Value != "" || tol.TolerationSeconds == nil || *tol.TolerationSeconds != 30 {
+		t.Fatalf("Exists::30 = %+v, want Exists NoExecute seconds 30, empty value", tol)
 	}
 
-	// Multiple tolerations.
-	tols, err := parseLoopTolerations("a:NoSchedule,b:Exists:120")
+	// PreferNoSchedule effect.
+	tols, err = parseLoopTolerations("k:Equal:PreferNoSchedule:loops")
+	if err != nil {
+		t.Fatalf("parse k:Equal:PreferNoSchedule:loops: %v", err)
+	}
+	tol = tols[0]
+	if tol.Effect != "PreferNoSchedule" {
+		t.Fatalf("PreferNoSchedule = %+v, want effect PreferNoSchedule", tol)
+	}
+
+	// Multiple tolerations, one of each operator.
+	tols, err = parseLoopTolerations("a:Equal:NoSchedule:pool,b:Exists:NoExecute")
 	if err != nil {
 		t.Fatalf("parse two tolerations: %v", err)
 	}
-	if len(tols) != 2 || tols[0].Key != "a" || tols[1].Key != "b" {
-		t.Fatalf("two tolerations = %+v, want a then b", tols)
+	if len(tols) != 2 || tols[0].Key != "a" || tols[1].Key != "b" || tols[1].Operator != "Exists" {
+		t.Fatalf("two tolerations = %+v, want a then b (Exists)", tols)
 	}
 
 	bad := []string{
-		"justkey",            // no colon at all
-		":NoSchedule",        // empty key
-		"k:",                 // empty effect
-		"k:NoSchedule:bad",   // trailing seconds that is not an int
-		"k:a:b:c:d",          // five fields: neither a value nor a seconds shape
-		"k:NoSchedule:1:2",   // value+seconds AND extra fields
-		"k:BogusOp:NoSchedule", // a non-default operator that is not Equal/Exists/NotEqual
-		"k:NoSchedule:300 extra",
-		"a:NoSchedule, b2:NoSchedule:xyz",
+		"justkey",              // no colons at all
+		"k:NoSchedule",         // two fields: op is missing
+		":Equal:NoSchedule",    // empty key
+		"k:Equal:",             // empty effect
+		"k:Equal",              // missing effect entirely
+		"k:Equal:NoSchedule",   // Equal with no value
+		"k:Exists:NoExecute:v", // Exists with a value
+		"k:NotEqual:NoSchedule:loops", // NotEqual is not a k8s toleration operator
+		"k:BogusOp:NoSchedule:loops",  // a non-Equal/Exists operator
+		"k:Equal:BogusEffect:loops",   // a bad taint effect
+		"k:Equal:NoSchedule:loops:x",  // seconds that is not an int
+		"k:Equal:NoSchedule:loops:-1", // negative seconds
+		"k:Exists:NoExecute:30",       // seconds in the VALUE slot (value with Exists)
+		"k:Equal:NoSchedule:loops:1:2", // six fields
+		"a:Equal:NoSchedule:pool, b2:NoSchedule", // the second token is bad
 	}
 	for _, in := range bad {
 		_, err := parseLoopTolerations(in)

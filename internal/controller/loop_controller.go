@@ -383,6 +383,18 @@ type LoopReconciler struct {
 	// and the copy-in init container runs.
 	MemoryStorageClass string
 
+	// LoopNodeSelector is the C2 + D101 node-placement flag
+	// (--loop-node-selector): the node labels every operator-owned Loop
+	// workload (the sandbox template, the proxy pods, the verify/deliver/
+	// memory-writer Jobs) is pinned to. Empty (the default) = no placement —
+	// today's behaviour.
+	LoopNodeSelector map[string]string
+	// LoopTolerations is the C2 + D101 node-placement flag
+	// (--loop-tolerations): the node tolerations every operator-owned Loop
+	// workload carries (the pool's NoSchedule taint). Empty (the default) =
+	// no tolerations.
+	LoopTolerations []corev1.Toleration
+
 	// MemoryWriterImage is the image the P5b memory-writer Job's container
 	// runs (the operator-controlled memory-write entrypoint — the operator's
 	// own binary with the memory-write subcommand, cmd/memory-writer). When
@@ -2038,11 +2050,29 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 // is in flight — suspending would strand a half-pushed PR, so the operator
 // refuses the pause and lets delivery complete).
 // applyBPFNodeAffinity sets the sandbox pod's required node affinity (A1, D52).
-// Nil affinity (allow-unenforced) is a no-op.
+// F93b: it assigns UNCONDITIONALLY, nil included — a reconciler pass with no
+// enforcer affinity (allow-unenforced) CLEARS the stale affinity, so a flag
+// flip does not strand the sandbox on the old affinity (the F93 defect: the
+// old set-only form kept a stale affinity across every pass).
 func applyBPFNodeAffinity(e engine.Enforcer, spec *corev1.PodSpec) {
-	if aff := e.BPFNodeAffinity(); aff != nil {
-		spec.Affinity = aff
-	}
+	spec.Affinity = e.BPFNodeAffinity()
+}
+
+// applyLoopPlacement pins the pod spec to the Loop node pool (C2 + D101) from
+// the CURRENT flags on EVERY call — including clearing the fields to nil when
+// the flags are empty (the F93b contract, the same set-and-clear rule as
+// applyBPFNodeAffinity: a stale placement from a previous flag state must not
+// survive a flag change). The sandbox template is mutated in place
+// (ensureSandbox's mutate runs this every pass); the proxy pods and Jobs are
+// built with it (their spec hashes cover the placement, so a flag change
+// recreates the proxy pods and re-places new Jobs only). It APPENDS the flag
+// tolerations — it never removes or rewrites other tolerations the pod spec
+// already carries (e.g. the sandbox pod's node unschedulable/unreachable
+// tolerations, which the sandbox controller adds; those must survive every
+// reconcile pass).
+func (r *LoopReconciler) applyLoopPlacement(spec *corev1.PodSpec) {
+	spec.NodeSelector = r.LoopNodeSelector
+	spec.Tolerations = append(spec.Tolerations, r.LoopTolerations...)
 }
 
 // ensureSandbox makes the Sandbox match the Loop's current phase, pause state
@@ -2210,6 +2240,20 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// not have its sandboxes wedged Pending).
 		if r.Enforcer != nil {
 			applyBPFNodeAffinity(r.Enforcer, &desired.Spec.PodTemplate.Spec)
+		}
+		// C2 + D101: the sandbox template carries the CURRENT Loop node
+		// placement every pass (set AND clear — F93b): a flag change re-places
+		// the existing sandbox via the template update, and dropping the flags
+		// clears the stale placement. applyLoopPlacement runs HERE (not at the
+		// end of the mutate, where the sandbox pod's built-in node tolerations
+		// have been appended) so that a flag clear does not delete them (F93b
+		// applies to the FLAG-derived fields only; the pod's own tolerations
+		// must survive every pass).
+		r.applyLoopPlacement(&desired.Spec.PodTemplate.Spec)
+		if r.LoopNodeSelector != nil {
+			desired.Spec.PodTemplate.Spec.NodeSelector = r.LoopNodeSelector
+		} else {
+			desired.Spec.PodTemplate.Spec.NodeSelector = nil
 		}
 		// I36: the agent and any future sidecars do not share a process
 		// namespace (no nsenter / /proc/<pid> cross-container access).
@@ -2845,7 +2889,7 @@ func (r *LoopReconciler) ensureProxy(ctx context.Context, loop *coxv1alpha1.Loop
 	// Build the desired pod spec first, then hash it. The hash covers the
 	// actual spec (image, command, limits, volumes), so any operator upgrade
 	// that changes the spec produces a different hash.
-	podDesired := buildProxyPod(loop, loopName, ns, r.proxyImage())
+	podDesired := r.buildProxyPod(loop, loopName, ns, r.proxyImage())
 	// Set the Loop as the controller owner (D33: GC with the Loop).
 	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
 		return fmt.Errorf("set owner ref on proxy pod %s/%s: %w", ns, proxyPodName(loopName), ownerErr)
@@ -2950,7 +2994,7 @@ func proxyNdotsOneDNSConfig() *corev1.PodDNSConfig {
 	}
 }
 
-func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.Pod {
+func (r *LoopReconciler) buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.Pod {
 	secretMode := readOnlyMode
 	falseP := false
 	trueP := true
@@ -3057,6 +3101,12 @@ func buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.P
 			},
 		},
 	}
+	// C2 + D101: the model proxy pod carries the CURRENT Loop node placement
+	// (D101: it is Loop-scoped infrastructure — leaving it on the default
+	// pool is an invisible surprise). The pod's spec-hash delete+recreate
+	// contract (ensureModelProxyPod) covers the placement, so a flag change
+	// recreates the pod on the new pool.
+	r.applyLoopPlacement(&pod.Spec)
 	return pod
 }
 
@@ -3590,7 +3640,7 @@ func (r *LoopReconciler) egressProxyImage() string {
 // policy hash as EGRESS_POLICY_HASH, and the operator's pod/service CIDRs as
 // POD_CIDR / SERVICE_CIDR. UID/GID 65534 (nobody); no SA token; no model
 // creds; no HTTPS_PROXY / HTTP_PROXY (I42d sets those on the agent container).
-func buildEgressProxyPod(loopName, ns, image string, networkAllows []string, policyHash string, podCIDR, serviceCIDR string) *corev1.Pod {
+func (r *LoopReconciler) buildEgressProxyPod(loopName, ns, image string, networkAllows []string, policyHash string, podCIDR, serviceCIDR string) *corev1.Pod {
 	falseP := false
 	trueP := true
 	readOnlyRootfs := true
@@ -3665,6 +3715,9 @@ func buildEgressProxyPod(loopName, ns, image string, networkAllows []string, pol
 			},
 			}},
 	}
+	// C2 + D101: the egress proxy pod carries the CURRENT Loop node
+	// placement (it is Loop-scoped infrastructure, like the model proxy).
+	r.applyLoopPlacement(&pod.Spec)
 	return pod
 }
 
@@ -3876,7 +3929,7 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 	if hashErr != nil {
 		return fmt.Errorf("compute egress proxy policy hash for %s/%s: %w", ns, loopName, hashErr)
 	}
-	podDesired := buildEgressProxyPod(loopName, ns, r.egressProxyImage(), networkAllows, policyHash, r.PodCIDR, r.ServiceCIDR)
+	podDesired := r.buildEgressProxyPod(loopName, ns, r.egressProxyImage(), networkAllows, policyHash, r.PodCIDR, r.ServiceCIDR)
 	if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
 		return fmt.Errorf("set owner ref on egress proxy pod %s/%s: %w", ns, egressProxyPodName(loopName), ownerErr)
 	}
@@ -4151,7 +4204,7 @@ func toolSpecEqual(a, b coxv1alpha1.ToolSpec) bool {
 // <name> mode 0444 + TOOL_CREDENTIAL_FILE), and TCP 8080 liveness /
 // readiness. The agent sandbox pod never carries the credential (asserted
 // by the envtest spec 3).
-func buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, policyHash, podCIDR, serviceCIDR string) *corev1.Pod {
+func (r *LoopReconciler) buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, policyHash, podCIDR, serviceCIDR string) *corev1.Pod {
 	falseP := false
 	trueP := true
 	readOnlyRootfs := true
@@ -4258,6 +4311,9 @@ func buildToolProxyPod(loopName, ns, image string, tool coxv1alpha1.ToolSpec, po
 			Volumes: volumes,
 		},
 	}
+	// C2 + D101: the tool proxy pod carries the CURRENT Loop node placement
+	// (it is Loop-scoped infrastructure, like the model proxy).
+	r.applyLoopPlacement(&pod.Spec)
 	return pod
 }
 
@@ -4363,7 +4419,7 @@ func (r *LoopReconciler) ensureToolProxies(ctx context.Context, loop *coxv1alpha
 		log.V(1).Info("ensured loop tool proxy service", "op", svcOp, "service", toolProxyServiceName(loopName, tool.Name), "tool", tool.Name)
 
 		// --- tool proxy pod (Get/create/delete, never Update a Pod spec) ---
-		podDesired := buildToolProxyPod(loopName, ns, r.toolProxyImage(), tool, policyHash, r.PodCIDR, r.ServiceCIDR)
+		podDesired := r.buildToolProxyPod(loopName, ns, r.toolProxyImage(), tool, policyHash, r.PodCIDR, r.ServiceCIDR)
 		if ownerErr := controllerutil.SetControllerReference(loop, podDesired, r.Scheme); ownerErr != nil {
 			return fmt.Errorf("set owner ref on tool proxy pod %s/%s: %w", ns, toolProxyPodName(loopName, tool.Name), ownerErr)
 		}

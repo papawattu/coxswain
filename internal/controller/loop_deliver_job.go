@@ -1032,7 +1032,7 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 	deadline := deliverJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
 	deliverJobFalse := false
-	return batchv1.JobSpec{
+	jobSpec := batchv1.JobSpec{
 		BackoffLimit:          &backoff,
 		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
@@ -1056,6 +1056,11 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 			},
 		},
 	}
+	// C2 + D101: the deliver Job's pod template carries the CURRENT Loop node
+	// placement (Jobs are immutable and short-lived: a flag change re-places
+	// NEW deliver Jobs only — documented in OPERATOR.md).
+	r.applyLoopPlacement(&jobSpec.Template.Spec)
+	return jobSpec
 }
 
 // deliverCredItems restricts the git-cred Secret mount to the two keys

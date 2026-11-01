@@ -266,12 +266,25 @@ func main() {
 	var loopTolerations string
 	flag.StringVar(&loopTolerations, "loop-tolerations", "",
 		"Comma-separated node tolerations for every operator-owned Loop workload (C2/D101). "+
-			"Forms: key:effect | key:value:effect | key:value:op:effect | key:value:op:effect:seconds " +
-			"(op: Equal, Exists, NotEqual). Default: empty (no tolerations). A malformed token fails " +
-			"startup with the token named.")
-	// C2: the parse runs at STARTUP (before the manager is built) so a bad
-	// token names itself in the log and the operator does not start with a
-	// silently different placement.
+			"Forms (the approved plan's format, PLAN-PHASE6.md): key:op:effect, key:op:effect:value, " +
+			"key:op:effect:value:seconds (op is always field 2: Equal | Exists — NotEqual is not a " +
+			"Kubernetes toleration operator; effect: NoSchedule | PreferNoSchedule | NoExecute). " +
+			"Equal requires a value; Exists must not have one (seconds-only Exists keeps the value " +
+			"slot empty: key:Exists:NoExecute::30). Default: empty (no tolerations). A malformed token " +
+			"fails startup with the token named.")
+	flag.BoolVar(&enableHTTP2, "enable-http2", false,
+		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	opts := zap.Options{
+		Development: true,
+	}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// C2: the parse runs at STARTUP (after flag.Parse so the flag values are
+	// read, after the logger is set so a bad token names itself in the log)
+	// so the operator does not start with a silently different placement.
 	loopNodeSelectorMap, err := parseLoopNodeSelector(loopNodeSelector)
 	if err != nil {
 		setupLog.Error(err, "Invalid --loop-node-selector")
@@ -282,15 +295,6 @@ func main() {
 		setupLog.Error(err, "Invalid --loop-tolerations")
 		os.Exit(1)
 	}
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
-
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -496,6 +500,10 @@ func main() {
 			EgressProxyImage:       egressProxyImage,
 			ProxyImage:             proxyImage,
 			OperatorNamespace:      operatorNamespace,
+			// C2 + D101: the Loop node-placement flags (parsed above; empty =
+			// no placement, today's behaviour).
+			LoopNodeSelector:       loopNodeSelectorMap,
+			LoopTolerations:        loopTolerationsList,
 		}, kaEnforcer, cniProber, cniRegateSrc, auditHolder)
 	if err := loopReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")

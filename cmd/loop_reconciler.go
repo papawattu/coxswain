@@ -13,6 +13,7 @@ import (
 	"github.com/papawattu/coxswain/internal/cni"
 	"github.com/papawattu/coxswain/internal/controller"
 	"github.com/papawattu/coxswain/internal/engine"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,6 +61,14 @@ type newLoopReconcilerOptions struct {
 	// OperatorNamespace is the operator's namespace
 	// (--operator-namespace, default $POD_NAMESPACE).
 	OperatorNamespace string
+	// LoopNodeSelector is the parsed --loop-node-selector flag (C2 + D101):
+	// the node labels every operator-owned Loop workload is pinned to. Empty
+	// (the default) = no placement (today's behaviour).
+	LoopNodeSelector map[string]string
+	// LoopTolerations is the parsed --loop-tolerations flag (C2 + D101):
+	// the node tolerations every operator-owned Loop workload carries. Empty
+	// (the default) = no tolerations.
+	LoopTolerations []corev1.Toleration
 }
 
 // newLoopReconciler builds the LoopReconciler from the manager's client and
@@ -100,6 +109,10 @@ func newLoopReconciler(c client.Client, scheme *runtime.Scheme,
 		// namespace (the proxy pod's usage-port ingress source).
 		ProxyImage:        o.ProxyImage,
 		OperatorNamespace: o.OperatorNamespace,
+		// C2 + D101: the Loop node-placement flags (empty = no placement, the
+		// default; the cmd test pins the wiring like SecretOptInRequired).
+		LoopNodeSelector: o.LoopNodeSelector,
+		LoopTolerations:  o.LoopTolerations,
 		// D38: the NetworkEnforced condition-change Event (the manager's
 		// recorder posts it as a Kubernetes Event; the re-gate Event lives
 		// in the probe Runnable).

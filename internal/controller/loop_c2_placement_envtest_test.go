@@ -298,8 +298,8 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 		// the real cluster's Owns(Pod) watch requeues the Loop after the
 		// delete lands; envtest drives the next pass explicitly.
 		pg := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, pg)).To(
-			WithOffset(1, MatchError(apierrors.IsNotFoundErr)))
+		ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, pg)).To(
+			MatchError(apierrors.IsNotFound))
 		reconcile(r2, name)
 		p2 := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p2)).To(Succeed())

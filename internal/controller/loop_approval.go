@@ -24,16 +24,23 @@ limitations under the License.
 // sha256> / coxswain.io/reject: <reason>), and this file consumes the
 // annotation — turning it into the condition (the same message format the
 // CLI wrote before D85, so approvedPlanHash / rejectedPlanReason keep
-// working) and removing it. This file is the operator's read of the
+// working) and removing it.
+//
+// The operator does NOT read the plan (no peek pod, no pod-log read): the
+// approve annotation's hash is copied VERBATIM into PlanApproved. A stale
+// approval (the plan re-planned after the user approved) is caught
+// downstream by I93 — the runner compares the current PLAN.md with the
+// approved hash at Implementing start and claims PlanMismatch, the operator
+// sets PlanMismatch (internal/controller/loop_s4_phase.go) and the approval
+// gate re-holds the Loop. This file is the operator's read of the
 // conditions + the phase-machine decision they drive:
 //
 //   - Manual mode (spec.approval.mode == Manual): the operator holds the
-//     phase machine at AwaitingApproval after Planning, until the user sets
-//     PlanApproved with the SHA-256 of the plan (parsed from the condition's
-//     message). A plan change after approval (a fresh Planning run re-writes
-//     PLAN.md, the runner detects the mismatch with the approved hash and
-//     re-writes the PlanApproved condition as stale) clears the condition and
-//     the Loop re-enters the hold.
+//     phase machine at AwaitingApproval after Planning, until the operator
+//     sets PlanApproved with the SHA-256 the CLI put in the one-shot
+//     approve annotation (parsed back from the condition's message). A plan
+//     change after approval (a fresh Planning run re-writes PLAN.md, the
+//     runner's I93 plan-hash check claims PlanMismatch) re-holds the Loop.
 //   - Rejection: when the user sets PlanRejected, the operator's action
 //     depends on spec.approval.onReject: Replan (default) re-enters Planning
 //     (the operator writes the reason to the workspace via the phase-init
@@ -54,11 +61,7 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
 	"regexp"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -316,16 +319,15 @@ func (r *LoopReconciler) planApprovalFiles(loop *coxv1alpha1.Loop) (string, stri
 // before the decision — turns the annotation into the condition the
 // operator writes ITSELF and removes the annotation:
 //
-//   - approve, CURRENT plan (the annotation's hash equals the hash of the
-//     plan on disk, read through the readLoopPlan seam): set PlanApproved
-//     True (message "Approved: <hash>" — the same format approvedPlanHash
-//     parses, so the downstream parsing is unchanged) and remove the
-//     annotation. The gate's approved branch then releases the hold on this
-//     same reconcile.
-//   - approve, STALE hash (the plan on disk no longer hashes to the
-//     annotation — a re-plan): NO PlanApproved; a Warning StaleApproval
-//     Event naming both hashes; the annotation is removed (the user
-//     re-approves against the current plan); the hold keeps.
+//   - approve: set PlanApproved True copying the annotation's hash
+//     VERBATIM (message "Approved: <hash>" — the same format
+//     approvedPlanHash parses, so the downstream parsing is unchanged) and
+//     remove the annotation. The gate's approved branch then releases the
+//     hold on this same reconcile. The operator does NOT re-read the plan
+//     to check the hash (no peek pod, no pod-log read): a stale hash (a
+//     re-plan between the CLI's read and this reconcile) is caught
+//     downstream by I93 (the runner's plan-hash check at Implementing start
+//     claims PlanMismatch; see loop_i93_planhash_envtest_test.go).
 //   - reject: set PlanRejected True (message "Rejected: <reason>") and
 //     remove the annotation; the gate's existing reject flow (onReject
 //     Replan / Fail) continues on this same reconcile.
@@ -574,15 +576,12 @@ const (
 //     and removes the reject annotation. When BOTH are present, the
 //     approve annotation is also removed and a RejectWins Event says so
 //     (the collision is a user error).
-//     - approve (no reject): the operator reads the CURRENT plan through
-//     the readLoopPlan seam (nil in most envtests — then the hash match
-//     is vacuously true, the operator trusts the user's hash, and the
-//     gate's approved branch runs). When the read succeeds and the
-//     annotation's hash equals the plan's SHA-256: set PlanApproved True
-//     (message "Approved: <hash>") and remove the annotation. When the
-//     hash is stale (the read succeeds and differs): NO condition; a
-//     Warning StaleApproval Event naming both hashes; remove the
-//     annotation; the hold keeps.
+//     - approve (no reject): set PlanApproved True copying the
+//     annotation's hash VERBATIM (message "Approved: <hash>") and remove
+//     the annotation. The operator does NOT read the plan: a stale hash is
+//     I93's job (the runner's plan-hash check at Implementing start claims
+//     PlanMismatch and the gate re-holds; see
+//     loop_i93_planhash_envtest_test.go).
 //
 // The annotation removal is a JSON merge-patch on a FRESH read: the
 // caller's trailing status persist carries the STALE in-memory
@@ -627,37 +626,13 @@ func (r *LoopReconciler) consumeApprovalAnnotations(loop *coxv1alpha1.Loop) bool
 			}
 		}
 	} else if approvePresent {
-		// Approve (no reject): match the annotation's hash against the
-		// CURRENT plan (the readLoopPlan seam; nil in most envtests = the
-		// operator trusts the user's hash, and the gate's approved branch
-		// runs).
-		if r.readLoopPlan != nil {
-			plan, err := r.readLoopPlan(ctxFor(loop), loop)
-			if err == nil && plan != "" {
-				current := sha256Hex([]byte(plan))
-				if approveHash := loop.Annotations[approveAnnotationKey]; approveHash != current {
-					// Stale: the plan on disk no longer hashes to the
-					// approval (a re-plan). No condition; a Warning Event
-					// names both hashes; the annotation is removed (the
-					// user re-approves against the current plan); the hold
-					// keeps.
-					if r.Recorder != nil {
-						r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StaleApproval",
-							"approval hash %s does not match the current plan (hash %s); the annotation was removed, re-approve against the current plan",
-							approveHash, current)
-					}
-					if err := r.removeApprovalAnnotations(loop, true, false); err != nil {
-						logf.FromContext(ctxFor(loop)).Error(err, "remove the stale approve annotation")
-						return false
-					}
-					return true
-				}
-			}
-		}
-		// Current (or the hash read is unavailable — trust the user's
-		// hash): set PlanApproved itself (the same message format the CLI
-		// wrote before D85 — "Approved: <hash>" — so approvedPlanHash
-		// keeps parsing it).
+		// Approve (no reject): copy the annotation's hash VERBATIM into
+		// PlanApproved (the same message format the CLI wrote before D85 —
+		// "Approved: <hash>" — so approvedPlanHash keeps parsing it). The
+		// operator does NOT read the plan (no peek pod, no pod-log read):
+		// a stale hash is caught downstream by I93 (the runner's plan-hash
+		// check at Implementing start claims PlanMismatch and the gate
+		// re-holds; see loop_i93_planhash_envtest_test.go).
 		setCondition(loop, coxv1alpha1.PlanApprovedCondition, metav1.ConditionTrue,
 			"Approved", "Approved: "+loop.Annotations[approveAnnotationKey])
 	}
@@ -726,15 +701,6 @@ func (r *LoopReconciler) removeApprovalAnnotations(loop *coxv1alpha1.Loop, appro
 // correct; a cancel during the patch would leave the requeue to retry).
 func ctxFor(_ *coxv1alpha1.Loop) context.Context {
 	return context.Background()
-}
-
-// sha256Hex is the lowercase-hex SHA-256 of the bytes (the same hash the
-// CLI's planSHA256 computes and puts in the coxswain.io/approve annotation —
-// the operator's comparison is byte-exact, so the two must use the same
-// encoding).
-func sha256Hex(b []byte) string {
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
 }
 
 // approvalPhaseGate is the B3 phase-gate implementation (the OS8 seam): it
@@ -808,164 +774,3 @@ func (r *LoopReconciler) approvalHoldPhase(loop *coxv1alpha1.Loop) bool {
 		loop.Status.Phase == coxv1alpha1.LoopPhaseAwaitingApproval
 }
 
-// D85 (owner decision, R34): the live plan-read seam (the operator's peek
-// pod against the workspace PVC). The CLI's approve reads the plan through
-// a peek pod (internal/cli/memory_reader.go's pattern, but on the workspace
-// PVC and for PLAN.md); the operator now makes the SAME read to verify the
-// coxswain.io/approve hash matches the plan on disk (the stale-hash check).
-//
-// The peek pod is a hardened one-shot pod (the same shape as the CLI's
-// memory peek pod): non-root, read-only rootfs, drop ALL, no ServiceAccount
-// token. It mounts the workspace PVC read-only and cats
-// /workspace/.coxswain/PLAN.md (the plan's path in the sandbox; the same
-// path the runner writes — internal/runner's planPath constant mirrors
-// this). A missing file (the plan has not been written yet) is an empty
-// read (the check is vacuously true: the approve annotation is trusted,
-// and the hold keeps the Loop until the plan exists).
-//
-// The pod is created via the operator's client (the operator's RBAC covers
-// pods in the Loop's namespace — the sandbox pod is the operator's own).
-// generateName gives a unique name (a leftover peek pod never collides with
-// a new one); the pod is deleted best-effort after the read (by label).
-// The read is bounded: a 30s deadline (the peek pod's one-shot cat is fast;
-// a timeout means the PVC is not Bound or the node is wedged — the check
-// degrades to "trust the user's hash", which is the fail-open direction:
-// the stale-hash case is the RARE one (a re-plan between the user's read
-// and the operator's reconcile), and the runner's plan-change detection is
-// the backstop that catches it on the next Planning run).
-func (r *LoopReconciler) peekReadLoopPlan(ctx context.Context, loop *coxv1alpha1.Loop) (string, error) {
-	const (
-		peekLabel    = "coxswain.io/plan-peek"
-		planFilePath = "/workspace/.coxswain/PLAN.md"
-		peekImage    = "docker.io/library/busybox:1.36" // pinned (the CLI's memory peek image)
-		peekDeadline = 30 * time.Second
-	)
-	ctx, cancel := context.WithTimeout(ctx, peekDeadline)
-	defer cancel()
-	labelVal := loop.Name
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "cox-plan-peek-",
-			Namespace:    loop.Namespace,
-			Labels:       map[string]string{peekLabel: labelVal},
-		},
-		Spec: corev1.PodSpec{
-			RestartPolicy:                corev1.RestartPolicyNever,
-			AutomountServiceAccountToken: pointerTo(false),
-			SecurityContext:              &corev1.PodSecurityContext{RunAsNonRoot: pointerTo(true), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
-			Containers: []corev1.Container{{
-				Name:            "peek",
-				Image:           peekImage,
-				ImagePullPolicy: corev1.PullIfNotPresent,
-				SecurityContext: &corev1.SecurityContext{
-					RunAsNonRoot:             pointerTo(true),
-					RunAsUser:                pointerTo(int64(65532)),
-					RunAsGroup:               pointerTo(int64(65532)),
-					AllowPrivilegeEscalation: pointerTo(false),
-					ReadOnlyRootFilesystem:   pointerTo(true),
-					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-				},
-				Command: []string{"/bin/sh", "-c",
-					"if [ -f " + planFilePath + " ]; then cat " + planFilePath + "; else exit 0; fi"},
-				VolumeMounts: []corev1.VolumeMount{{Name: "ws", MountPath: "/workspace", ReadOnly: true}},
-			}},
-			Volumes: []corev1.Volume{{
-				Name: "ws",
-				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: workspacePVCName(loop.Name),
-						ReadOnly:  true,
-					},
-				},
-			}},
-		},
-	}
-	if err := r.Create(ctx, pod); err != nil {
-		return "", fmt.Errorf("create plan-peek pod: %w", err)
-	}
-	// Best-effort cleanup (by label — the pod's name is generated).
-	defer func() {
-		_ = r.DeleteAllOf(context.Background(), &corev1.Pod{},
-			client.InNamespace(loop.Namespace),
-			client.MatchingLabels{peekLabel: labelVal})
-	}()
-	// Poll for the terminal phase (the bounded-poll pattern the CLI uses).
-	var outcome corev1.PodPhase
-	for i := 0; i < 60; i++ { // ~30s at 500ms
-		fresh := &corev1.Pod{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(pod), fresh); err != nil {
-			return "", fmt.Errorf("get plan-peek pod: %w", err)
-		}
-		switch fresh.Status.Phase {
-		case corev1.PodSucceeded:
-			outcome = corev1.PodSucceeded
-		case corev1.PodFailed:
-			outcome = corev1.PodFailed
-		default:
-		}
-		if outcome != "" {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("plan-peek pod %q did not reach a terminal phase within %s", pod.Name, peekDeadline)
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	if outcome != corev1.PodSucceeded {
-		return "", fmt.Errorf("plan-peek pod %q did not succeed (phase=%s)", pod.Name, outcome)
-	}
-	// Read the log (the cat output) via the Pod's container-logs subresource.
-	// The operator's client does not expose a Log() method directly, so the
-	// read goes through the REST client's Pod logs endpoint (the same
-	// mechanism kubectl logs uses; the operator's ServiceAccount has the
-	// pods/log get RBAC rule — the same grant the verify Job's read uses).
-	if err := r.waitPeekTerminal(ctx, loop, pod, peekLabel, labelVal); err != nil {
-		return "", err
-	}
-	logs, err := r.peekPodLog(ctx, loop.Namespace, pod.Name)
-	if err != nil {
-		return "", fmt.Errorf("read plan-peek pod log: %w", err)
-	}
-	return logs, nil
-}
-
-// pointerTo is the pointer helper the peek pod's spec uses (the operator's
-// codebase avoids the k8s.io/utils/pointer dep — a bare func is the same
-// thing for a bool/int64).
-func pointerTo[T any](v T) *T {
-	return &v
-}
-
-// waitPeekTerminal polls the peek pod until it reaches a terminal phase
-// (the bounded-poll loop inlined above was replaced by this helper for the
-// log read's ordering — the log must be read AFTER the terminal phase, and
-// the helper centralises the poll). It is a no-op when the pod already
-// reached a terminal phase (the inline poll above already broke out).
-func (r *LoopReconciler) waitPeekTerminal(ctx context.Context, loop *coxv1alpha1.Loop, pod *corev1.Pod, labelKey, labelVal string) error {
-	fresh := &corev1.Pod{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(pod), fresh); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	_ = labelKey
-	_ = labelVal
-	return nil
-}
-
-// peekPodLog reads the peek pod's container log via the REST client (the
-// same endpoint kubectl logs uses). The operator's client (controller-
-// runtime) does not expose a Log() method, so the read goes through the
-// client's underlying REST interface (the Pod's /log subresource). A
-// missing log (the pod is still running, or the log is empty) is "" (the
-// check degrades to vacuously true — the approve annotation is trusted).
-func (r *LoopReconciler) peekPodLog(ctx context.Context, ns, podName string) (string, error) {
-	// The controller-runtime client's RESTClient: the Pod log endpoint is
-	// /pods/<name>/log?container=peek in the pod's namespace.
-	rest := r.Client // the embedded client interface does not expose REST()
-	_ = rest
-	// Fallback: read via the k8s API's Pod log endpoint (the operator's
-	// RBAC covers pods/log — the same grant the verify Job uses). The read
-	// is a simple HTTP GET on the API server's /log subresource.
-	// A missing/empty log is "" (the check degrades to vacuously true).
-	return "", nil
-}

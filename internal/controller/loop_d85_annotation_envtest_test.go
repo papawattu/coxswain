@@ -28,8 +28,10 @@ limitations under the License.
 // The specs cover (TDD — red first):
 //   - approve with the CURRENT plan hash at AwaitingApproval → PlanApproved
 //     True and the annotation is gone;
-//   - approve with a STALE hash → no PlanApproved, a Warning Event, the
-//     annotation is gone, the hold keeps;
+//   - approve → the operator copies the annotation's hash VERBATIM into
+//     PlanApproved (the operator does NOT read the plan — staleness is
+//     I93's job, the runner's plan-hash check at Implementing start, see
+//     loop_i93_planhash_envtest_test.go);
 //   - reject → PlanRejected, and the existing reject flow continues
 //     (Replan: reason durable, phase to Planning, condition cleared);
 //   - BOTH annotations → reject wins, both are removed, an Event says so;
@@ -120,20 +122,6 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		Expect(err).NotTo(HaveOccurred())
 	}
 
-	// d85ReconcilerSeam is the same as d85Reconciler but with a
-	// readLoopPlan seam that returns the given plan bytes (the stale-hash
-	// spec wires it to return the CURRENT plan, so the operator's fresh
-	// read hashes to a different value than the user's annotation — which
-	// was computed from the plan the user approved BEFORE the re-plan — and
-	// the approve is rejected with a Warning Event).
-	d85ReconcilerSeam := func(currentPlan string) *LoopReconciler {
-		r := d85Reconciler()
-		r.readLoopPlan = func(_ context.Context, _ *coxv1alpha1.Loop) (string, error) {
-			return currentPlan, nil
-		}
-		return r
-	}
-
 	// d85Loop creates a Manual-mode Loop (the S4 bootstrap primes it) and
 	// moves it to the given phase with a Status().Update (the same
 	// phase-forcing the B3 suite uses for its hold specs).
@@ -154,29 +142,6 @@ var _ = Describe("D85 plan-approval annotation", func() {
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		}
 		return nn, r
-	}
-
-	// d85LoopNoReconcile is the same as d85Loop but WITHOUT the bootstrap
-	// reconcile (the stale-hash spec uses it so the SPEC's reconciler — with
-	// its readLoopPlan seam — is the one that consumes the annotation and
-	// runs the gate; the bootstrap reconcile would consume the annotation
-	// with a nil readLoopPlan, which trusts the user's hash and would set
-	// PlanApproved, defeating the stale-hash test).
-	d85LoopNoReconcile := func(ns, name string, phase coxv1alpha1.LoopPhase) types.NamespacedName {
-		nn := types.NamespacedName{Name: name, Namespace: ns}
-		loop := &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec: coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace(),
-				Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual}},
-		}
-		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
-		if phase != "" {
-			Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-			loop.Status.Phase = phase
-			loop.Status.DesiredPhase = phase
-			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
-		}
-		return nn
 	}
 
 	// annotate patches the Loop's metadata with the given annotations
@@ -265,42 +230,28 @@ var _ = Describe("D85 plan-approval annotation", func() {
 			"D85: an approved current plan releases the hold (AwaitingApproval -> Implementing)")
 	})
 
-	It("approve with a STALE hash: no PlanApproved, a Warning Event naming both hashes, the annotation is gone and the hold keeps", func() {
-		ns := "d85-stale-" + nowSuffix()
+	It("the operator copies the annotation's hash VERBATIM into PlanApproved (it does not read the plan)", func() {
+		ns := "d85-verbatim-" + nowSuffix()
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
-		staleHash := sha("plan-v1\n") // the plan the user approved BEFORE the re-plan
-		// (the CURRENT plan at the hold is a different one — the annotation's
-		// hash does not match it, so the approval is stale). The hash match is
-		// the test's seam: the spec asserts on the STALE hash's effect, not on
-		// a live workspace read (the d85ReconcilerSeam below wires the
-		// operator's readLoopPlan to return the CURRENT plan, so the
-		// operator's fresh read hashes to a different value than the
-		// annotation's — the exact stale-hash condition).
-		currentPlan := "plan-v2 (re-planned)\n"
-		nn := d85LoopNoReconcile(ns, "d85-stale", coxv1alpha1.LoopPhaseAwaitingApproval)
-		r := d85ReconcilerSeam(currentPlan)
-		annotate(nn, map[string]string{approveAnnotation: staleHash})
-		reconcileLoop(r, ns, "d85-stale")
+		// The operator does NOT read the plan (no peek pod, no pod-log
+		// read): whatever hash the annotation carries is copied VERBATIM
+		// into the PlanApproved message — staleness is I93's job (the
+		// runner's plan-hash check at Implementing start, see
+		// loop_i93_planhash_envtest_test.go). An arbitrary 64-hex value
+		// (not a real plan's hash) must still land in the message.
+		arbHash := sha("not-a-plan-hash\n")
+		nn, r := d85Loop(ns, "d85-verbatim", coxv1alpha1.LoopPhaseAwaitingApproval)
+		annotate(nn, map[string]string{approveAnnotation: arbHash})
+		reconcileLoop(r, ns, "d85-verbatim")
 
-		// No PlanApproved (the hash does not match the CURRENT plan): the
-		// hold keeps and the phase is unchanged.
 		msg := conditionMessage(nn, coxv1alpha1.PlanApprovedCondition)
-		Expect(msg).To(BeEmpty(), "D85: a stale-hash approve annotation must NOT set PlanApproved")
-		loop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
-		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseAwaitingApproval),
-			"D85: the hold keeps on a stale-hash approval")
-		// The one-shot annotation is removed (a stale hash is still consumed:
-		// the user re-approves against the current plan).
+		Expect(msg).To(ContainSubstring(arbHash),
+			"D85: the operator copies the annotation's hash verbatim into PlanApproved (no plan read)")
 		Expect(annotationAbsent(nn, approveAnnotation)).To(BeTrue(),
-			"D85: the operator removes the stale approve annotation")
-		// A Warning Event names the situation (the StaleApproval reason).
-		ev := loopEvents(nn, "Stale")
-		Expect(ev).ToNot(BeEmpty(), "D85: a stale-hash approval emits a Warning Event (StaleApproval)")
-		Expect(ev[0].Type).To(Equal(corev1.EventTypeWarning))
+			"D85: the operator removes the approve annotation after consuming it")
 	})
 
 	It("reject: the operator sets PlanRejected from the annotation and the existing reject flow continues (Replan)", func() {

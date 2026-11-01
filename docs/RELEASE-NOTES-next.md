@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `0070686` = PR #269); each claim cites its
+merged code on `main` (as of `ff6783c` = PR #380); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -67,9 +67,9 @@ override is yours to pin.
 - **On upgrade.** Nothing required; the flags default to empty, so an install that does not set them behaves exactly as before. With the flags set but no matching node, the model proxy and egress proxy pods sit Pending with FailedScheduling events, the Loop holds at `Planning` with `ModelProxyNotReady=True` (no sandbox pod is created, so `SandboxNotStarting` never appears), and the Loop does not yet fail on its own — F93a, a later slice.
 
 
-### Shared memory per repository: lessons learned by one Loop are available to the next — #179, plus the memory-writer Job from #180
+### Shared memory per repository: lessons learned by one Loop are available to the next — #179, plus the memory-writer Job (P5b, `f12d2dc`)
 
-A Loop now works against a shared memory PVC keyed per (namespace, git URL): the operator ensures the PVC (`--memory-storage-class` names the StorageClass, empty = cluster default), a copy-in init container copies the lessons into the workspace, and the implementing prompt carries a lessons section so the agent sees what earlier runs of the same repo learned. After a successful run the agent proposes the lessons it learned (`LESSON:` lines) into a file in the workspace; the operator runs a memory-writer Job (its own `coxswain-memory-write` binary, gated on `Succeeded` or `Failed:Stalled` and the run having reported lessons) that screens those lessons against a static write policy — secrets patterns (AWS keys, OpenAI `sk-` keys, GitHub tokens, Anthropic keys, JWTs, Kubernetes basic-auth tokens, Slack bot tokens, Google API keys, Bearer tokens, PEM blocks, secret files, credential assignments, high-entropy tokens), a size cap, single-line shape, a path-or-error-signature rule, and SHA-256 dedup — and persists the survivors to the memory PVC. The outcome is on the `MemoryWriteDone` condition (`MemoryWritten` / `MemoryWriteFailed` / `MemoryWriteSkipped`); a failed write never fails the Loop (memory is best-effort). The writer Job's container is hardened: the operator's image runs the binary directly (no shell), non-root with an explicit UID/GID, drop-all-caps, seccomp, read-only rootfs, a deny-all NetworkPolicy, and no ServiceAccount token (the dedicated ServiceAccount is ensured in the Loop's namespace with `automountServiceAccountToken: false`). (The writer Job slice merged as `f12d2dc`, P5b; #180's squash was superseded by that commit — cite `f12d2dc`.)
+A Loop now works against a shared memory PVC keyed per (namespace, git URL): the operator ensures the PVC (`--memory-storage-class` names the StorageClass, empty = cluster default), a copy-in init container copies the lessons into the workspace, and the implementing prompt carries a lessons section so the agent sees what earlier runs of the same repo learned. After a successful run the agent proposes the lessons it learned (`LESSON:` lines) into a file in the workspace; the operator runs a memory-writer Job (its own `coxswain-memory-write` binary, gated on `Succeeded` or `Failed:Stalled` and the run having reported lessons) that screens those lessons against a static write policy — secrets patterns (AWS keys, OpenAI `sk-` keys, GitHub tokens, Anthropic keys, JWTs, Kubernetes basic-auth tokens, Slack bot tokens, Google API keys, Bearer tokens, PEM blocks, secret files, credential assignments, high-entropy tokens), a size cap, single-line shape, a path-or-error-signature rule, and SHA-256 dedup — and persists the survivors to the memory PVC. The outcome is on the `MemoryWriteDone` condition (`MemoryWritten` / `MemoryWriteFailed` / `MemoryWriteSkipped`); a failed write never fails the Loop (memory is best-effort). The writer Job's container is hardened: the operator's image runs the binary directly (no shell), non-root with an explicit UID/GID, drop-all-caps, seccomp, read-only rootfs, a deny-all NetworkPolicy, and no ServiceAccount token (the dedicated ServiceAccount is ensured in the Loop's namespace with `automountServiceAccountToken: false`).
 
 ### `cox memory`: export, import, and delete — #186, #202, #203
 
@@ -89,7 +89,7 @@ The runner re-checks the approved plan hash BEFORE any agent work at the start o
 
 ### Behaviour change: `Succeeded` now waits until delivery is terminal — #198 (D64)
 
-The Loop now holds `Succeeded` until the `Delivered` condition is terminal. Before this, `Succeeded` was set as soon as verify passed and delivery ran afterwards — so a user or script waiting for `Succeeded` could read the Loop before its PR existed. You may notice it: a Loop that passed verify but has not finished (or failed) delivery is still in `Succeeded`-pending. A failed delivery still reports `Succeeded` with `Delivered=False` — delivery failure does not change the work's verdict, only the delivery's. Nothing to do; the operator stops the sandbox while the hold is active and budgets are frozen during it. — #198 (`a84b7c9`)
+The Loop now holds `Succeeded` until the `Delivered` condition is terminal. Before this, `Succeeded` was set as soon as verify passed and delivery ran afterwards — so a user or script waiting for `Succeeded` could read the Loop before its PR existed. You may notice it: a Loop that passed verify stays at phase `Verifying` (the `Verifying` condition's reason is `Delivering`) until the deliver Job ends, and only then moves to `Succeeded`. A failed delivery still ends `Succeeded`, with `Delivered=False` — a delivery failure does not change the work's verdict, only the delivery's (D64). The budget stops counting during the hold. Nothing to do. — #198 (`a84b7c9`)
 
 ## Security fixes
 
@@ -363,7 +363,7 @@ The Loop now holds `Succeeded` until the `Delivered` condition is terminal. Befo
 
 ### F16: the memory-writer Job's NetworkPolicy now denies all — #184
 
-The memory-writer Job's NetworkPolicy shipped with an empty rule, and in Kubernetes an empty `policyTypes` / empty rules list means **allow all**, so the writer pod — which runs the operator's own binary with a write access to the memory PVC — had an open network path in both directions. The rule now denies all ingress and egress (the pod makes no network calls). Nothing to do; the NetworkPolicy the operator creates for each Loop is deny-all. — #184 (`0e49905`)
+The memory-writer Job's NetworkPolicy carried one empty ingress rule and one empty egress rule (`{}`). In Kubernetes an empty rule matches everything, so the policy **allowed** all ingress and all egress, the opposite of the intended fence. The policy is now deny-all: both policy types, with no rules. Nothing to do; the operator recreates the policy as deny-all. — #184 (`0e49905`)
 
 ### F18: the credential-assignment rule is case-insensitive, and Authorization and AWS secret-key rules are added — #187
 

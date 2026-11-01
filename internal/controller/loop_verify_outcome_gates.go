@@ -137,10 +137,13 @@ func artifactGateDecision(pod *corev1.Pod) *verifyDecision {
 // (tamper -> artifact -> canary -> checks). Tamper and artifact are clean at
 // this point, so the canary is the next gate. A terminated canary with exit
 // verifyCanarySubvertedExit (43) is subversion (verifySubverted, terminal),
-// verifyCanaryUnavailableExit (44) is canary-unavailable
-// (verifyCanaryUnavailable, no decision + one event),
-// verifyCanaryBuildErrorExit (45) is an infra failure (verifyInfraFailed,
-// bounded retry). A terminated canary with exit verifyCanaryHealthyExit (0)
+// verifyCanaryUnavailableExit (44) is canary-unavailable (no go toolchain,
+// every package skipped, or the base commit's tree unreadable) and is an
+// infra failure (verifyInfraFailed, bounded retry; F94c: a permanent 44
+// must end in Failed after the bound, never hold Verifying forever),
+// verifyCanaryTestsRemovedExit (46) is tests removed (verifyTestsRemoved,
+// terminal), verifyCanaryBuildErrorExit (45) is an infra failure
+// (verifyInfraFailed, bounded retry). A terminated canary with exit verifyCanaryHealthyExit (0)
 // is the HEALTHY negative control — the generated test honestly failed and
 // the gate passes, so the caller proceeds to the acceptance checks.
 //
@@ -168,13 +171,22 @@ func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
 		// probe) — subversion. Terminal, like tamper: the agent's own code
 		// made the test binary dishonest, so no check can be trusted.
 		return &verifyDecision{outcome: verifySubverted, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
+	case verifyCanaryTestsRemovedExit:
+		// F94a: HEAD has no *_test.go and the base commit HAD tests — the
+		// agent removed every test (go test would pass vacuously). Terminal,
+		// like tamper: the agent's own commit made the evidence dishonest, so
+		// no check can be trusted. No retry: a re-run would import the same
+		// pin.
+		return &verifyDecision{outcome: verifyTestsRemoved, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
 	case verifyCanaryUnavailableExit:
-		// The target package has no *_test.go (the canary has nothing to run):
-		// NO decision on the agent's work. Return requeue=false so the
-		// Reconcile reaches applyVerifyOutcome, which records the one-time
-		// VerifyCanaryUnavailable event and requeues (staying Verifying). It
-		// is not a subversion verdict, not an infra retry (M7).
-		return &verifyDecision{outcome: verifyCanaryUnavailable, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
+		// F94c: the canary is unavailable (no go toolchain, every package
+		// skipped, or the base commit's tree unreadable — the script fails
+		// closed with 44 rather than reading a git failure as "no tests").
+		// That is an INFRA failure (bounded retry, then Failed after the
+		// bound), never a subversion verdict and never a forever-hold at
+		// Verifying (the F60 one-shot no-decision path is gone — it wedged
+		// every testless repo).
+		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
 	case verifyCanaryBuildErrorExit:
 		// A build error is an infra failure (bounded retry), NEVER a
 		// subversion verdict (M8's trap: mapping 45 to infra is correct; the
@@ -351,24 +363,30 @@ func (r *LoopReconciler) applyVerifySubverted(loop *coxv1alpha1.Loop) (bool, boo
 	return false, false
 }
 
-// applyVerifyCanaryUnavailable is the applyVerifyOutcome
-// verifyCanaryUnavailable case (F60): the canary exited 44 — the target
-// package has no *_test.go (nothing to canary). NO decision on the agent's
-// work: the Loop stays Verifying (requeue), and the operator records a
-// VerifyCanaryUnavailable Warning event exactly ONCE (idempotent — gated on
-// a one-shot annotation so it does not repeat every reconcile).
-func (r *LoopReconciler) applyVerifyCanaryUnavailable(loop *coxv1alpha1.Loop) (bool, bool) {
-	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying &&
-		loop.Annotations[verifyCanaryUnavailableAnnotation] != "1" && r.Recorder != nil {
-		if loop.Annotations == nil {
-			loop.Annotations = map[string]string{}
+// applyVerifyTestsRemoved is the applyVerifyOutcome verifyTestsRemoved case
+// (F94a): the canary exited 46 — HEAD has no *_test.go and the base commit
+// HAD tests, so the agent removed every test (go test would pass vacuously).
+// Terminal, like TamperedVerify / SubvertedVerify: the agent's own commit
+// made the evidence dishonest, so no acceptance check is trustworthy. Fail
+// the Loop with the distinct TestsRemoved reason; no new verify Job is
+// created (a re-run would import the same pin).
+func (r *LoopReconciler) applyVerifyTestsRemoved(loop *coxv1alpha1.Loop) (bool, bool) {
+	if loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
+		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+			TestsRemovedReason,
+			fmt.Sprintf("the verify canary found no *_test.go at HEAD but the base commit %s had tests: the agent removed every test", loop.Status.BaseCommit))
+		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+		// B5a: terminal transition — bump the completion counter and clear the
+		// active gauge.
+		bumpLoopCompletion("failed", "tests_removed")
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, TestsRemovedReason,
+				"the verify canary found no *_test.go at HEAD but the base commit %s had tests; failing the Loop", loop.Status.BaseCommit)
 		}
-		loop.Annotations[verifyCanaryUnavailableAnnotation] = "1"
-		r.Recorder.Eventf(loop, corev1.EventTypeWarning, VerifyCanaryUnavailableReason,
-			"the verify canary is unavailable (no *_test.go in the target package); no decision recorded")
-		return true, true // requeue (stays Verifying)
+		return true, false
 	}
-	return true, true // no decision: requeue, stay Verifying
+	return false, false
 }
 
 // applyVerifyIterate is the applyVerifyOutcome verifyIterate case: a failing

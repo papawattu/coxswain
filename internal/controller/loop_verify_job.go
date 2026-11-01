@@ -127,14 +127,6 @@ const (
 	// to its own scratch and runs the generated test there). Bounded like the
 	// per-check scratch.
 	verifyCanaryTmpVolName = "check-tmp-canary"
-	// verifyCanaryUnavailableAnnotation is the one-shot annotation the
-	// operator sets when it records the VerifyCanaryUnavailable event (F60):
-	// it gates the event so it fires exactly ONCE per Loop (idempotent across
-	// the requeues that hold the Loop at Verifying). Cleared by the next pin
-	// (a fresh verify Job resets the annotation map on the new Job object; the
-	// annotation lives on the Loop and is re-cleared at the pin in
-	// ensureVerifyJob when a new Job is created — see the annotation clear).
-	verifyCanaryUnavailableAnnotation = "coxswain.io/canary-unavailable-noted"
 	// verifyArtifactMaxBytes is the I47 size cap for a file ADDED in
 	// baseCommit..verifiedCommit (1 MiB — the same cap the runner's
 	// commitWorkspace refuses against on the agent side).
@@ -681,10 +673,11 @@ exit 0
 //	43 → a tested package's canary test exited 0 (despite the forced
 //	     t.Fatal), or exited non-zero without the token in its -json output:
 //	     the harness is subverted in that package.
-//	44 → the canary is unavailable: no go binary on PATH, or every package
-//	     skipped (no go.mod above any package) — the operator records a
-//	     VerifyCanaryUnavailable event and takes no decision (F94c, session
-//	     2, bounds this hold).
+//	44 → the canary is unavailable: no go binary on PATH, every package
+//	     skipped (no go.mod above any package), or the base commit's tree
+//	     could not be read (ls-tree failed — fail closed, never read as
+//	     "the base had no tests") — the operator treats it as an infra
+//	     failure (bounded retry, then Failed:VerifyInfraFailed; F94c).
 //	45 → some tested package's canary could not even build (a go test -json
 //	     build-fail for THAT package) — the operator treats it as an infra
 //	     failure (bounded retry), never as subversion.
@@ -757,7 +750,17 @@ N=$(awk 'NF' "$DIRLIST" | wc -l)
 if [ "$N" -eq 0 ]; then
   if [ -n "${BASE_COMMIT:-}" ] && [ -n "${TERMINATION_MESSAGE_PATH:-}" ] && [ -n "${TERMINATION_MESSAGE_MARKER:-}" ]; then
     BASE_TESTLIST="$SCRATCH/.canary-base-tests"
-    git -c safe.directory='*' ls-tree -r --name-only "$BASE_COMMIT" 2>/dev/null | grep '_test\.go$' > "$BASE_TESTLIST"
+    # Fail closed: run git ls-tree ON ITS OWN and check its exit status
+    # BEFORE grepping. A non-zero exit (unreachable base SHA, safe.directory
+    # / ownership error, missing git) must NOT read as "the base had no
+    # tests" — that would let the canary skip on a tree the agent emptied and
+    # the vacuous go test would pass. Non-zero git exit → 44 (the operator
+    # treats it as the bounded unavailable path, F94c), never a skip.
+    if ! git -c safe.directory='*' ls-tree -r --name-only "$BASE_COMMIT" > "$BASE_TESTLIST.raw"; then
+      echo "canary: cannot read the base commit's tree; canary unavailable"
+      exit 44
+    fi
+    grep '_test\.go$' "$BASE_TESTLIST.raw" > "$BASE_TESTLIST" || true
     # The base commit had tests and HEAD deleted them all: subversion (go
     # test would pass vacuously) — terminal. The base listing is the
     # reference, not the HEAD tree (HEAD's empty listing is why we are in
@@ -1756,11 +1759,20 @@ const (
 	// tamper: the agent's own code made the test binary dishonest, so no check
 	// can be trusted. The Loop is Failed with reason SubvertedVerify.
 	verifySubverted
-	// verifyCanaryUnavailable (F60): the canary init exited 44 — the target
-	// package has no *_test.go (nothing to canary). NO decision on the
-	// agent's work: the Loop stays Verifying and the operator records a
-	// VerifyCanaryUnavailable event (exactly once). Distinct from subverted (a
-	// verdict) and from infra (a retry): there is simply nothing to canary.
+	// verifyTestsRemoved (F94a): the canary init exited 46 — HEAD has no
+	// *_test.go and the BASE commit had tests, so the agent removed every
+	// test (go test would pass vacuously). Terminal, like tamper/subverted:
+	// the agent's own commit made the evidence dishonest, so no check is
+	// trustworthy and no new verify Job is created (a re-run would import the
+	// same pin). The Loop is Failed with reason TestsRemoved.
+	verifyTestsRemoved
+	// verifyCanaryUnavailable (F94c): the canary init exited 44 — the canary
+	// is unavailable (no go toolchain, every package skipped, or the base
+	// commit's tree unreadable — the script fails closed with 44 rather than
+	// reading a git failure as "no tests"). It is an INFRA failure (bounded
+	// retry, then Failed:VerifyInfraFailed), not a decision and not a
+	// forever-hold: the F60 one-shot no-decision path that held a testless
+	// repo at Verifying forever is gone.
 	verifyCanaryUnavailable
 )
 
@@ -2104,17 +2116,22 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// created (a re-run would import the same subverted commit).
 		// F60-lint: the case body moved verbatim to applyVerifySubverted.
 		return r.applyVerifySubverted(loop)
+	case verifyTestsRemoved:
+		// F94a: the canary exited 46 — HEAD has no *_test.go and the base
+		// commit HAD tests: the agent removed every test. Terminal, like
+		// SubvertedVerify: the agent's own commit made the evidence dishonest,
+		// so no acceptance check is trustworthy. Fail the Loop with the
+		// distinct TestsRemoved reason; no new verify Job is created (a re-run
+		// would import the same pin).
+		return r.applyVerifyTestsRemoved(loop)
 	case verifyCanaryUnavailable:
-		// F60: the canary exited 44 — the target package has no *_test.go
-		// (nothing to canary). NO decision on the agent's work: the Loop stays
-		// Verifying (requeue), and the operator records a VerifyCanaryUnavailable
-		// Warning event exactly ONCE (idempotent — gated on a one-shot
-		// annotation so it does not repeat every reconcile). The Loop is held at
-		// Verifying until the next pin re-creates a fresh verify Job (the
-		// requeue keeps it alive); a Loop with no testable package is a
-		// configuration smell the user sees via the event, not a verdict.
-		// F60-lint: the case body moved verbatim to applyVerifyCanaryUnavailable.
-		return r.applyVerifyCanaryUnavailable(loop)
+		// F94c: the canary exited 44 — unavailable (no go toolchain, every
+		// package skipped, or the base tree unreadable). It is an INFRA
+		// failure: the bounded-retry path (status.verify.infraAttempts, the
+		// verifyInfraRetries cap, then Failed:VerifyInfraFailed) — a permanent
+		// 44 ends in Failed after the bound instead of holding Verifying
+		// forever.
+		return r.applyVerifyInfraFailure(ctx, loop, pod, job, failedCheck, checkExitCode, deadlineExceeded)
 	}
 	return false, false
 }
@@ -2127,12 +2144,12 @@ func bumpVerifyResult(outcome int) {
 	switch outcome {
 	case verifySucceeded:
 		verifyResultsTotal.WithLabelValues("pass").Inc()
-	case verifyIterate, verifyTampered, verifyNotDescendant, verifySubverted:
+	case verifyIterate, verifyTampered, verifyNotDescendant, verifySubverted, verifyTestsRemoved:
 		verifyResultsTotal.WithLabelValues("fail").Inc()
 	case verifyInfraFailed:
 		verifyResultsTotal.WithLabelValues("infra").Inc()
-		// verifyCanaryUnavailable: no decision (the Loop stays Verifying) — it is
-		// not a pass/fail/infra verdict, so it does not enter the pass-rate ratio.
+		// verifyCanaryUnavailable is an infra failure (F94c: bounded retry,
+		// then Failed) — it enters the ratio via verifyInfraFailed.
 	}
 }
 

@@ -121,6 +121,47 @@ func TestCanaryCheckScriptF94(t *testing.T) {
 		}
 	})
 
+	t.Run("(iv) unreadable base: BASE_COMMIT is a SHA not in the repo → 44 (fail closed, no 46, no skip)", func(t *testing.T) {
+		// The P1 the reviewer found: `git ls-tree ... | grep ... > file` treats
+		// ANY git failure (an unreachable base SHA, safe.directory/ownership
+		// errors, a missing git) as "the base had no tests" — the canary would
+		// SKIP and the vacuous go test would pass. ls-tree must run on its own
+		// and a non-zero exit must be 44 (the bounded unavailable path), never
+		// a skip and never a 46.
+		verify, _ := f94SetupRepo(t,
+			map[string]string{
+				"go.mod":    "module demo\n\ngo 1.26\n",
+				"main.go":   "package demo\n\nfunc Add(a, b int) int { return a + b }\n",
+				"a_test.go": "package demo\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {}\n",
+			},
+			"base: with tests")
+		if out, err := exec.Command("git", "-C", verify, "rm", "a_test.go").CombinedOutput(); err != nil {
+			t.Fatalf("git rm a_test.go: %v: %s", err, string(out))
+		}
+		if out, err := exec.Command("git", "-C", verify, "commit", "-m", "head: tests removed").CombinedOutput(); err != nil {
+			t.Fatalf("git commit: %v: %s", err, string(out))
+		}
+
+		root := t.TempDir()
+		term := filepath.Join(root, "termination.log")
+		// A well-formed SHA that does not exist in this repo: git ls-tree
+		// exits non-zero ("unknown revision or path not in the working tree").
+		bogusSHA := "0123456789abcdef0123456789abcdef01234567"
+		out, code := f94RunCanary(t, verify, bogusSHA, term, verifyCanarySkipMarker)
+		if code != verifyCanaryUnavailableExit {
+			t.Fatalf("canary exited %d for an unreadable base commit; want %d (fail closed: a git failure must not read as \"the base had no tests\", and a 46/0 here would let the vacuous go test pass). output: %s", code, verifyCanaryUnavailableExit, out)
+		}
+		if !strings.Contains(out, "cannot read the base commit's tree") {
+			t.Fatalf("the unreadable-base path must name the failure. output: %s", out)
+		}
+		if strings.Contains(out, "tests removed") || strings.Contains(out, verifyCanarySkipMarker) {
+			t.Fatalf("the unreadable-base path must report neither tests-removed nor a skip. output: %s", out)
+		}
+		if _, err := os.Stat(term); !os.IsNotExist(err) {
+			t.Fatalf("the 44 path must not write the termination file (stat err: %v)", err)
+		}
+	})
+
 	t.Run("env contract: BASE_COMMIT unset → 44 (fail closed, no 46, no skip)", func(t *testing.T) {
 		verify, baseSHA := f94SetupRepo(t,
 			map[string]string{

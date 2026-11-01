@@ -467,6 +467,48 @@ and why the hold ended.
 | `Paused=True reason=Budget` | A budget cap was hit with `onExceeded=Pause`; the Loop is held Paused until resumed. |
 | `NetworkEnforced=False reason=CNIUnenforced` | The CNI does not enforce NetworkPolicy; the Loop is held Suspended (fail-closed). |
 | `ModelAvailable=False reason=ModelUnavailable` | The model backend is unreachable or returned no response within the timeout. |
+| `SecretsUsable=False reason=NamespaceNotEnabled` | The namespace has no D102 `RoleBinding` for the `coxswain-secret-reader` ClusterRole; the Loop is held (no sandbox) until it is added (Secret opt-in, below). |
+| `SecretsUsable=False reason=SecretNotOptedIn` | A named Secret is missing the `coxswain.io/usable: "true"` label; the message names the Secret and the field that references it. |
+| `SecretsUsable=False reason=SecretNotFound` | A named Secret does not exist in the Loop's namespace. |
+
+### Secret opt-in (D76/D102)
+
+A Loop can name Secrets in three places — `spec.workspace.gitCredentialSecret`,
+`spec.agent.endpointSecretRef`, and the AgentPolicy tools' `credentialSecretRef`
+(the tool proxy). The operator never gets a cluster-wide Secret read: its
+ClusterRole has no `secrets` rule. A Secret is usable only when the NAMESPACE
+is enabled (a `RoleBinding` from the shipped `coxswain-secret-reader`
+ClusterRole — `get` on secrets only — to the operator's ServiceAccount) AND
+the Secret carries the label `coxswain.io/usable: "true"`.
+
+Enable a namespace and opt in its Secrets:
+
+```bash
+# Enable the namespace (defaults: the operator's namespace/serviceaccount).
+# --clusterrole=coxswain-secret-reader for a Helm chart install; a
+# `kubectl apply -f dist/install.yaml` install renders the ClusterRole as
+# coxswain-coxswain-secret-reader (the kustomize namePrefix doubles the
+# prefix) — use that name in --clusterrole= for such an install.
+kubectl -n <namespace> create rolebinding coxswain-secret-reader \
+  --clusterrole=coxswain-secret-reader \
+  --serviceaccount=coxswain-system:coxswain-controller-manager
+
+# Opt in the Secrets the Loops name.
+kubectl -n <namespace> label secret <git-credential-secret> coxswain.io/usable=true
+kubectl -n <namespace> label secret <model-endpoint-secret> coxswain.io/usable=true
+kubectl -n <namespace> label secret <tool-credential-secret> coxswain.io/usable=true
+```
+
+The check is METADATA-only (the operator reads the Secret's labels, never its
+data) and is re-run on every reconcile: a Loop in a disabled namespace, or
+naming an unlabelled or missing Secret, is held with `SecretsUsable=False`
+before the sandbox is created (no sandbox, no verify/deliver Job, no proxy
+objects) until the label or the binding is added; labelling the Secret or
+creating the RoleBinding releases the SAME Loop on its next reconcile (no
+restart). A Loop that names no Secret is unaffected (`SecretsUsable=True
+reason=NoSecrets`). Unlabelling a Secret, deleting it, or removing the
+RoleBinding re-holds the Loop on its next reconcile (fail-closed). See
+`docs/UPGRADE.md` (the D76/D102 section) and `docs/TROUBLESHOOTING.md`.
 
 ---
 

@@ -7,6 +7,9 @@ resources:
 - service_account.yaml
 - role.yaml
 - role_binding.yaml
+# D102: the per-namespace Secret opt-in ClusterRole (get on secrets only, no
+# binding shipped — see the file's header for the enabling RoleBinding).
+- secret_reader_role.yaml
 - leader_election_role.yaml
 - leader_election_role_binding.yaml
 # The following RBAC configurations are used to protect

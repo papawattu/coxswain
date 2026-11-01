@@ -319,6 +319,17 @@ type LoopReconciler struct {
 	// without SetupWithManager) falls back to the cached client for the Get.
 	apiReader client.Reader
 
+	// SecretOptInRequired is the D76(a) + D102 secret-opt-in gate (R30, owner
+	// decisions 2026-11-01). When true, every Secret a Loop names must exist
+	// and carry coxswain.io/usable: "true" before any object that mounts or
+	// uses it is created (see applySecretsGate). cmd/main.go sets it to true
+	// (fail-closed by default); the test reconcilers built by the shared
+	// helpers keep the zero value (off) so the specs that name test Secrets
+	// that never existed or were never labelled are unaffected — the D76
+	// specs opt in explicitly (the cmd-level test asserts main's default is
+	// true, so a missed wiring cannot silently disable the gate).
+	SecretOptInRequired bool
+
 	// Enforcer is the eBPF engine seam (ADR-0007 Q3/D30). When set, the operator
 	// emits the Loop's effective policy through the engine and gates the sandbox
 	// on positive evidence that enforcement is active (D30). When nil, the
@@ -747,6 +758,14 @@ func (r *LoopReconciler) validateStep(ctx context.Context, loop *coxv1alpha1.Loo
 	// misconfiguration that would crash-loop the proxy; reject it early.
 	if r.modelConfigInvalid(ctx, loop) {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	}
+	// D76/D102: the Secret opt-in gate. Every Secret the Loop names must
+	// exist and carry coxswain.io/usable: "true" BEFORE any object that
+	// mounts or uses a Secret is created (the sandbox's init-clone mount,
+	// the model/egress/tool proxies, the verify/deliver Jobs). A held Loop
+	// gets no sandbox, no verify/deliver Job, and no proxy objects.
+	if res, done := r.applySecretsGate(ctx, loop); done {
+		return res, true
 	}
 	return ctrl.Result{}, false
 }

@@ -78,6 +78,8 @@ func init() {
 // docs/RELEASE-NOTES-next.md). The tag stays in the reference for humans and for
 // `kind load`/preload lists, which match on the tag.
 const (
+	defaultSecretOptIn = true // D76/D102: the Secret opt-in gate is fail-closed by default
+
 	pinnedCNIProbeImage = "docker.io/library/python:3.13-alpine@sha256:" +
 		"bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741"
 	pinnedWorkspaceGitImage = "docker.io/alpine/git:v2.54.0@sha256:" +
@@ -125,6 +127,13 @@ func main() {
 	flag.BoolVar(&allowUnenforcedNetwork, "allow-unenforced-network", false,
 		"Run Loops even when the CNI does not police pod -> host-network egress (off by default; dev escape hatch). "+
 			"Loops run with NetworkEnforced=False reason EnforcementDisabled.")
+	// D76/D102 (R30): the Secret opt-in gate is fail-closed by default — every
+	// Secret a Loop names must exist and carry coxswain.io/usable: "true"
+	// before any object that mounts or uses it is created. The escape flag is
+	// dev/kind-only (a fresh dev cluster without the RoleBinding/labels would
+	// hold every Secret-using Loop); production must run it ON. The cmd-level
+	// test (cmd/loop_secrets_flag_test.go) asserts this default is true.
+	optIn := registerSecretOptInFlag(flag.CommandLine)
 	var cniCheckInterval time.Duration
 	flag.DurationVar(&cniCheckInterval, "cni-check-interval", 10*time.Minute,
 		"How often the leader-elected probe Runnable re-probes the CNI self-test (D38).")
@@ -433,38 +442,34 @@ func main() {
 		setupLog.Error(err, "Failed to register the alert relay Runnable")
 		os.Exit(1)
 	}
-	if err := (&controller.LoopReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		Enforcer:               kaEnforcer,
-		AllowUnenforced:        allowUnenforced,
-		AllowUnenforcedNetwork: allowUnenforcedNetwork,
-		MemoryStorageClass:     memoryStorageClass,
-		MemoryWriterImage:      memoryWriterImage,
-		CNIProber:              cniProber,
-		CNIRegateSource:        cniRegateSrc,
-		Audit:                  auditHolder,
-		ClusterDomain:          clusterDomain,
-		WorkspaceGitImage:      workspaceGitImage,
-		RunnerImage:            runnerImage,
-		VerifyImage:            verifyImage,
-		ToolProxyImage:         toolProxyImage,
-		EgressProxyImage:       egressProxyImage,
-		// P2b (ADR-0009): the metering model proxy image (default empty -> the
-		// reconciler's coxswain-proxy:metering) and the operator's namespace (the
-		// proxy pod's usage-port ingress source).
-		ProxyImage:        proxyImage,
-		OperatorNamespace: operatorNamespace,
-		// D38: the NetworkEnforced condition-change Event (the manager's
-		// recorder posts it as a Kubernetes Event; the re-gate Event lives
-		// in the probe Runnable).
-		// GetEventRecorderFor is deprecated in controller-runtime v0.25 in favour
-		// of GetEventRecorder (new events.k8s.io/v1 API) — but that returns the
-		// new events.EventRecorder (AnnotatedEventf) whose method set differs
-		// from LoopReconciler.Recorder (client-go record.EventRecorder). Keep the
-		// old (v1 Event, still fully supported) API until the recorder is ported.
-		Recorder: mgr.GetEventRecorderFor("loop-controller"), //nolint:staticcheck
-	}).SetupWithManager(mgr); err != nil {
+	// D76/D102 (R45 review, PR #380 P2): the reconciler construction is a
+	// function (newLoopReconciler, loop_reconciler.go) so main's wiring of the
+	// parsed flags into the reconciler is covered by a cmd test — a missed
+	// SecretOptInRequired wiring fails the test, not a production install.
+	loopReconciler := newLoopReconciler(mgr.GetClient(), mgr.GetScheme(),
+		// GetEventRecorderFor is deprecated in controller-runtime v0.25 in
+		// favour of GetEventRecorder (new events.k8s.io/v1 API) — but that
+		// returns the new events.EventRecorder (AnnotatedEventf) whose method
+		// set differs from LoopReconciler.Recorder (client-go
+		// record.EventRecorder). Keep the old (v1 Event, still fully
+		// supported) API until the recorder is ported.
+		mgr.GetEventRecorderFor("loop-controller"), //nolint:staticcheck
+		newLoopReconcilerOptions{
+			SecretOptInRequired:    *optIn,
+			AllowUnenforced:        allowUnenforced,
+			AllowUnenforcedNetwork: allowUnenforcedNetwork,
+			MemoryStorageClass:     memoryStorageClass,
+			MemoryWriterImage:      memoryWriterImage,
+			ClusterDomain:          clusterDomain,
+			WorkspaceGitImage:      workspaceGitImage,
+			RunnerImage:            runnerImage,
+			VerifyImage:            verifyImage,
+			ToolProxyImage:         toolProxyImage,
+			EgressProxyImage:       egressProxyImage,
+			ProxyImage:             proxyImage,
+			OperatorNamespace:      operatorNamespace,
+		}, kaEnforcer, cniProber, cniRegateSrc, auditHolder)
+	if err := loopReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")
 		os.Exit(1)
 	}

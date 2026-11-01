@@ -134,7 +134,7 @@ var _ = Describe("F84: the model proxy hold is surfaced", func() {
 		ns := "f84-proxy-none-" + nowSuffix()
 		r, loop := newF84NoEndpoint(ns, "f84noendpoint")
 		setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionTrue, "ModelProxyNotReady", "held")
-		r.applyBudget(ctx, loop)
+		r.stepUsageRead(ctx, loop) // the no-endpoint clear lives in the read step (D77: extracted from applyBudget)
 		cond := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.ModelProxyNotReadyCondition)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))

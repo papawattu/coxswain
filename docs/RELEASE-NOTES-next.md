@@ -67,6 +67,30 @@ override is yours to pin.
 - **On upgrade.** Nothing required; the flags default to empty, so an install that does not set them behaves exactly as before. With the flags set but no matching node, the model proxy and egress proxy pods sit Pending with FailedScheduling events, the Loop holds at `Planning` with `ModelProxyNotReady=True` (no sandbox pod is created, so `SandboxNotStarting` never appears), and the Loop does not yet fail on its own — F93a, a later slice.
 
 
+### Shared memory per repository: lessons learned by one Loop are available to the next — #179, plus the memory-writer Job from #180
+
+A Loop now works against a shared memory PVC keyed per (namespace, git URL): the operator ensures the PVC (`--memory-storage-class` names the StorageClass, empty = cluster default), a copy-in init container copies the lessons into the workspace, and the implementing prompt carries a lessons section so the agent sees what earlier runs of the same repo learned. After a successful run the agent proposes the lessons it learned (`LESSON:` lines) into a file in the workspace; the operator runs a memory-writer Job (its own `coxswain-memory-write` binary, gated on `Succeeded` or `Failed:Stalled` and the run having reported lessons) that screens those lessons against a static write policy — secrets patterns (AWS keys, OpenAI `sk-` keys, GitHub tokens, Anthropic keys, JWTs, Kubernetes basic-auth tokens, Slack bot tokens, Google API keys, Bearer tokens, PEM blocks, secret files, credential assignments, high-entropy tokens), a size cap, single-line shape, a path-or-error-signature rule, and SHA-256 dedup — and persists the survivors to the memory PVC. The outcome is on the `MemoryWriteDone` condition (`MemoryWritten` / `MemoryWriteFailed` / `MemoryWriteSkipped`); a failed write never fails the Loop (memory is best-effort). The writer Job's container is hardened: the operator's image runs the binary directly (no shell), non-root with an explicit UID/GID, drop-all-caps, seccomp, read-only rootfs, a deny-all NetworkPolicy, and no ServiceAccount token (the dedicated ServiceAccount is ensured in the Loop's namespace with `automountServiceAccountToken: false`). (The writer Job slice merged as `f12d2dc`, P5b; #180's squash was superseded by that commit — cite `f12d2dc`.)
+
+### `cox memory`: export, import, and delete — #186, #202, #203
+
+`cox memory export` and `cox memory import` move the shared memory PVC's lessons between clusters as a tarball: export reads the PVC's files; import screens each lesson with the same static write policy as the memory-writer Job (screened-out lessons are skipped, not dropped, and the screen result is reported) and writes the survivors, with `--storage-class` to name the target StorageClass. The CLI's pods carry no ServiceAccount token and run a pinned image. `cox memory delete` wipes a repo's memory PVC, and refuses while a terminal Loop's memory write is still pending, so a delete never races a writer Job that is about to persist lessons. The memory PVC's lifecycle (who creates it, when it is garbage-collected, what delete does) is documented in `docs/OPERATOR.md`. — #186 (`a57b947`), #202 (`8a5940b`), #203 (`04472d5`)
+
+### RWX storage for the memory PVC on kind: `hack/rwx-storage.sh` — #189, #193
+
+A kind cluster's default StorageClass (rancher.io/local-path) is RWO-only, so the memory PVC (`ReadWriteMany`) can never bind and the copy-in init never runs. `hack/rwx-storage.sh` installs a second pinned local-path provisioner with a shared filesystem path and an RWX StorageClass for it (the class's `bindingMode` is `Immediate` — `WaitForFirstConsumer` never binds the memory PVC, whose consumer is decided per pod); the script takes the shared path and provisioner image as validated flags, runs a helper pod without a ServiceAccount token, and rolls the provisioner pod when its config changes. Set `--memory-storage-class` to the installed class (or point it at any RWX-capable class on your cluster). — #189 (`c911357`), #193 (`cf788e6`)
+
+### The delivery PR title and commit subject come from `spec.goal` — #174
+
+The delivered PR's title and the commit subject it carries are derived from the Loop's `spec.goal` (first line, trimmed, capped at 72 runes) instead of a constant subject: the operator hands the derived title to the sandbox as `COX_DELIVERY_TITLE` and to the deliver Job as the PR title, so the commit subject and the PR title match by construction. Nothing to do; existing Loops get the derived title on their next delivery. — #174 (`407cbf8`)
+
+### The plan-hash check at the start of Implementing — #172
+
+The runner re-checks the approved plan hash BEFORE any agent work at the start of an Implementing run: an edit to `PLAN.md` after approval (or a missing `PLAN.md` with an approved hash on file) blocks the run — no agent call, no commit — and the operator clears `PlanApproved`, sets the `PlanMismatch` condition and the `PlanHashMismatch` Warning Event (both visible via `kubectl cox describe`), and re-enters the `AwaitingApproval` hold until you re-approve the current plan. Re-approving clears the condition. A stale claim left over from before a pause is discarded on resume, so a pause/resume cannot advance the phase on a pre-pause result. — #172 (`1902f8e`)
+
+### Behaviour change: `Succeeded` now waits until delivery is terminal — #198 (D64)
+
+The Loop now holds `Succeeded` until the `Delivered` condition is terminal. Before this, `Succeeded` was set as soon as verify passed and delivery ran afterwards — so a user or script waiting for `Succeeded` could read the Loop before its PR existed. You may notice it: a Loop that passed verify but has not finished (or failed) delivery is still in `Succeeded`-pending. A failed delivery still reports `Succeeded` with `Delivered=False` — delivery failure does not change the work's verdict, only the delivery's. Nothing to do; the operator stops the sandbox while the hold is active and budgets are frozen during it. — #198 (`a84b7c9`)
+
 ## Security fixes
 
 ### D76/D102: Secrets are opt-in — the operator has no cluster-wide Secret read, and a named Secret must be labelled before the Loop can use it — PR #380
@@ -336,6 +360,14 @@ override is yours to pin.
 ### D77: a maxCost Loop holds on a stale usage reading, and releases on the next fresh one (R30)
 
 - **What changed.** A Loop with a `spec.budget.maxCostUsd` cap now HOLDS when its usage reading is stale (`BudgetReadingStale=True`, F44): the operator sets `BudgetHold=True` (reason `StaleReading`) and suspends the running sandbox — the maxCost cap cannot be enforced without a fresh reading, so the Loop waits instead of running on uncapped (owner choice (b) for maxCost). The model proxy stays up (its read is the release) and the usage read keeps being retried; the hold releases on its own on the next fresh reading (`BudgetHold=False` reason `ReadingFresh`, sandbox resumed) — no restart, no manual resume. The gate is inert in Paused, in the delivery hold, and in terminal phases. Loops with only `maxTokens` (or no budget cap) are unchanged: stale readings are still surfaced but never hold. UPGRADE (behaviour change; nothing to do — see "A maxCost Loop holds when its usage reading is stale (D77)") and a TROUBLESHOOTING entry for `BudgetHold=True` / `StaleReading` (check the model proxy pod and its usage endpoint) landed with it (this PR).
+
+### F16: the memory-writer Job's NetworkPolicy now denies all — #184
+
+The memory-writer Job's NetworkPolicy shipped with an empty rule, and in Kubernetes an empty `policyTypes` / empty rules list means **allow all**, so the writer pod — which runs the operator's own binary with a write access to the memory PVC — had an open network path in both directions. The rule now denies all ingress and egress (the pod makes no network calls). Nothing to do; the NetworkPolicy the operator creates for each Loop is deny-all. — #184 (`0e49905`)
+
+### F18: the credential-assignment rule is case-insensitive, and Authorization and AWS secret-key rules are added — #187
+
+The static write policy's credential-assignment rule (the one that drops a lesson containing `password=`, `token=`, and the like) only matched lower-case keys, so a lesson written with `PASSWORD=` or `ApiKey=` slipped through to the memory PVC. The rule is now case-insensitive, and two new rules cover credential assignment via the `Authorization` HTTP header and AWS secret keys. The screening runs in the memory-writer Job before a lesson is persisted, and on `cox memory import`. Nothing to do; existing memory files are not re-screened (a re-import screens them). — #187 (`669be17`)
 
 ## Other changes
 

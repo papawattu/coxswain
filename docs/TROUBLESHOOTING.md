@@ -231,6 +231,14 @@ that D57 makes required. A supported enforcing setup is **Calico plus
 KubeArmor, with neither flag** (`--allow-unenforced` nor
 `--allow-unenforced-network`).
 
+**The probe is one-node evidence (D80, decided 2026-11-01).** The CNI probe
+runs ONE probe pod on ONE node (`internal/cni/pod_prober.go`), so the gate
+verifies enforcement on that node only. On a multi-node cluster, a node whose
+CNI does not enforce NetworkPolicy would not be detected, and Loops landing on
+it would run with the network fence unpoliced there. A per-node probe (one
+probe pod per node, each sandbox gated on its own node's result) is
+deliberately deferred until multi-node clusters are a support target (D80(b)).
+
 ## Reading the memory write outcome
 
 Source: the memory-writer changes F31 (#229), F32 (#233), F33 (#234),

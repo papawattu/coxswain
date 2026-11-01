@@ -57,6 +57,16 @@ const (
 // status field above.
 const conditionStatusField = "status"
 
+// metadataField and annotationsField are the JSON field names of the Loop
+// object's metadata block and its annotations map. They are the constants a
+// merge patch on the main resource names (the approve/reject annotation
+// writes, pause's setAnnotation, fork's seed) — goconst forbids the bare
+// string literals (they occur 3-4 times in the package).
+const (
+	metadataField    = "metadata"
+	annotationsField = "annotations"
+)
+
 // newApproveCommand builds `cox approve <loop>`: set the PlanApproved condition
 // on the Loop (the B3 plan approval gate). The CLI computes the SHA-256 of the
 // plan (read from the workspace via the existing plan reader) and sets the
@@ -115,8 +125,8 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 	// the patch (a racing operator write is not a 409 here: the annotation's
 	// value is a hash, and the operator's consume is idempotent).
 	patch := map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]any{approveAnnotationKey: hash},
+		metadataField: map[string]any{
+			annotationsField: map[string]any{approveAnnotationKey: hash},
 		},
 	}
 	if err := dc.Loops.Patch(ctx, name, "", mustJSON(patch)); err != nil {
@@ -169,8 +179,8 @@ func newRejectCommand() *cobra.Command {
 // the operator is the sole writer of the condition.
 func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer) error {
 	patch := map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]any{rejectAnnotationKey: reason},
+		metadataField: map[string]any{
+			annotationsField: map[string]any{rejectAnnotationKey: reason},
 		},
 	}
 	if err := dc.Loops.Patch(ctx, name, "", mustJSON(patch)); err != nil {

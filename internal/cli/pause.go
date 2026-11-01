@@ -90,6 +90,6 @@ func setAnnotation(ctx context.Context, dc Deps, name, key, value string) error 
 	if value != "" {
 		ann[key] = value
 	}
-	patch := map[string]any{"metadata": map[string]any{"annotations": ann}}
+	patch := map[string]any{metadataField: map[string]any{annotationsField: ann}}
 	return dc.Loops.Patch(ctx, name, "", mustJSON(patch))
 }

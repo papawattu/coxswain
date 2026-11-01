@@ -46,6 +46,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"maps"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -153,9 +154,7 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		if loop.Annotations == nil {
 			loop.Annotations = map[string]string{}
 		}
-		for k, v := range annotations {
-			loop.Annotations[k] = v
-		}
+		maps.Copy(loop.Annotations, annotations)
 		Expect(k8sClient.Update(ctx, loop)).To(Succeed())
 	}
 

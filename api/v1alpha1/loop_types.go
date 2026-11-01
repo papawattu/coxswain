@@ -1568,6 +1568,8 @@ const (
 )
 
 // SecretsUsable condition reasons (the named values on the condition).
+type SecretsUsableReason string
+
 const (
 	// SecretsUsableReasonOptedIn: every named Secret exists and carries the
 	// opt-in label.

@@ -485,6 +485,10 @@ Enable a namespace and opt in its Secrets:
 
 ```bash
 # Enable the namespace (defaults: the operator's namespace/serviceaccount).
+# --clusterrole=coxswain-secret-reader for a Helm chart install; a
+# `kubectl apply -f dist/install.yaml` install renders the ClusterRole as
+# coxswain-coxswain-secret-reader (the kustomize namePrefix doubles the
+# prefix) — use that name in --clusterrole= for such an install.
 kubectl -n <namespace> create rolebinding coxswain-secret-reader \
   --clusterrole=coxswain-secret-reader \
   --serviceaccount=coxswain-system:coxswain-controller-manager

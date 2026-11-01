@@ -159,10 +159,16 @@ var _ = Describe("D76/D102 secret opt-in (SecretsUsable gate)", func() {
 		broadcaster := record.NewBroadcaster()
 		broadcaster.StartRecordingToSink(d76EventSink{client: k8sClient})
 		return &LoopReconciler{CNIProber: testCNIProber(),
-			Client:    k8sClient,
-			Scheme:    k8sClient.Scheme(),
-			Recorder:  broadcaster.NewRecorder(k8sClient.Scheme(), corev1.EventSource{Component: "d76-spec"}),
-			apiReader: reader,
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			// The gate is ON for these specs: the shared test helpers keep the
+			// zero value (off) so specs that name test Secrets that were never
+			// created or labelled are unaffected; the D76 specs opt in
+			// explicitly (cmd/main.go sets it true by default — asserted by
+			// the cmd-level test).
+			SecretOptInRequired: true,
+			Recorder:            broadcaster.NewRecorder(k8sClient.Scheme(), corev1.EventSource{Component: "d76-spec"}),
+			apiReader:           reader,
 		}
 	}
 

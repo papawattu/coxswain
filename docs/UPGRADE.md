@@ -143,6 +143,26 @@ the start).
 The following changes landed after v0.1.2. Each entry says what changed and
 what you must DO (or why there is nothing to do).
 
+- **BREAKING (D76/D102): every namespace that runs Loops that name Secrets
+  now needs the per-namespace `RoleBinding` and the per-Secret label, or its
+  Loops hold with `SecretsUsable=False`.** The operator's ClusterRole has no
+  `secrets` rule; a namespace is enabled by binding the shipped
+  `coxswain-secret-reader` ClusterRole to the operator's ServiceAccount, and
+  each named Secret must carry `coxswain.io/usable: "true"`. Enable each
+  namespace and label each Secret:
+
+  ```bash
+  kubectl -n <namespace> create rolebinding coxswain-secret-reader \
+    --clusterrole=coxswain-secret-reader \
+    --serviceaccount=coxswain-system:coxswain-controller-manager
+  kubectl -n <namespace> label secret <name> coxswain.io/usable=true
+  ```
+
+  (With a `dist/install.yaml` install the ClusterRole is rendered as
+  `coxswain-coxswain-secret-reader` — the kustomize `namePrefix` doubles the
+  prefix; use that name in `--clusterrole=` for such an install.) The full
+  section below has the details and the `SecretsUsable` reasons.
+
 - **Upgrade the `cox` CLI together with the operator.** Plan approval moved
   to a one-shot metadata annotation (D85): `cox approve` / `cox reject`
   patch the Loop's `coxswain.io/approve` / `coxswain.io/reject` annotation
@@ -176,6 +196,14 @@ the `/usr/local/bin/coxswain-memory-write` binary. `config/default`
 install is not `config/default`, set it. Set `--memory-storage-class` to a
 ReadWriteMany-capable class if your cluster's default StorageClass does not
 support ReadWriteMany.
+
+### A third new manager flag: `--secret-opt-in`
+
+`--secret-opt-in` (D76/D102) defaults to `true` (fail-closed): Loops whose
+named Secrets are not opted in are held with `SecretsUsable=False` (see the
+D76/D102 section below). `--secret-opt-in=false` is a dev/kind escape hatch
+for a fresh cluster without the RoleBinding/labels — never for production.
+Do not set it to false in a production install.
 
 **For Helm installs:** the chart also emits `--memory-writer-image`
 derived from `manager.image` (before `manager.args`), so if you put it in
@@ -501,7 +529,11 @@ If you use Secrets in any namespace, enable it on upgrade (one command per
 namespace):
 
 ```bash
-# Enable a namespace (the operator's default namespace/serviceaccount):
+# Enable the namespace (defaults: the operator's namespace/serviceaccount).
+# --clusterrole=coxswain-secret-reader for a Helm chart install; with a
+# `kubectl apply -f dist/install.yaml` install the ClusterRole is rendered as
+# coxswain-coxswain-secret-reader (the kustomize namePrefix doubles the
+# prefix) and that name must be used in --clusterrole=.
 kubectl -n <namespace> create rolebinding coxswain-secret-reader \
   --clusterrole=coxswain-secret-reader \
   --serviceaccount=coxswain-system:coxswain-controller-manager

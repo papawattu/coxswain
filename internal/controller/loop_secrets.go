@@ -44,7 +44,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -114,7 +115,7 @@ func loopNamedSecrets(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.
 			add(tool.CredentialSecretRef.Name, "agentPolicy."+ap.Name+".spec.tools[].credentialSecretRef")
 		}
 	}
-	sort.Slice(named, func(i, j int) bool { return named[i].name < named[j].name })
+	slices.SortFunc(named, func(a, b namedSecret) int { return strings.Compare(a.name, b.name) })
 	return named
 }
 
@@ -200,6 +201,22 @@ func checkSecretUsable(ctx context.Context, reader client.Reader, ns string, nam
 // A Warning Event fires on each transition to False (the same
 // lastStatus==true comparison the other gate Events use).
 func (r *LoopReconciler) applySecretsGate(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, bool) {
+	if r.SecretOptInRequired {
+		if res, done := r.applySecretsGateEnabled(ctx, loop); done {
+			return res, true
+		}
+	}
+	return ctrl.Result{}, false
+}
+
+// applySecretsGateEnabled runs the gate's check (the SecretOptInRequired
+// field is checked by the caller; it is split so the Reconcile-side call
+// site stays within the gocyclo budget and the specs can drive the gate
+// directly).
+func (r *LoopReconciler) applySecretsGateEnabled(ctx context.Context, loop *coxv1alpha1.Loop) (ctrl.Result, bool) {
+	if !r.SecretOptInRequired {
+		return ctrl.Result{}, false
+	}
 	named := loopNamedSecrets(ctx, r, loop)
 	if len(named) == 0 {
 		setCondition(loop, coxv1alpha1.SecretsUsableCondition, metav1.ConditionTrue,
@@ -251,7 +268,7 @@ func (r *LoopReconciler) applySecretsGate(ctx context.Context, loop *coxv1alpha1
 		// or a binding was removed): a Warning Event, per the gate's event
 		// rule. A False -> False message change does NOT re-emit.
 		if r.Recorder != nil {
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, string(blocker.reason), "%s", blocker.message)
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, string(coxv1alpha1.SecretsUsableReason(blocker.reason)), "%s", blocker.message)
 		}
 	}
 	// Held: no sandbox, no verify Job, no deliver Job, no proxy objects. The

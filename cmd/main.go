@@ -78,6 +78,8 @@ func init() {
 // docs/RELEASE-NOTES-next.md). The tag stays in the reference for humans and for
 // `kind load`/preload lists, which match on the tag.
 const (
+	defaultSecretOptIn = true // D76/D102: the Secret opt-in gate is fail-closed by default
+
 	pinnedCNIProbeImage = "docker.io/library/python:3.13-alpine@sha256:" +
 		"bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741"
 	pinnedWorkspaceGitImage = "docker.io/alpine/git:v2.54.0@sha256:" +
@@ -125,6 +127,13 @@ func main() {
 	flag.BoolVar(&allowUnenforcedNetwork, "allow-unenforced-network", false,
 		"Run Loops even when the CNI does not police pod -> host-network egress (off by default; dev escape hatch). "+
 			"Loops run with NetworkEnforced=False reason EnforcementDisabled.")
+	// D76/D102 (R30): the Secret opt-in gate is fail-closed by default — every
+	// Secret a Loop names must exist and carry coxswain.io/usable: "true"
+	// before any object that mounts or uses it is created. The escape flag is
+	// dev/kind-only (a fresh dev cluster without the RoleBinding/labels would
+	// hold every Secret-using Loop); production must run it ON. The cmd-level
+	// test (cmd/loop_secrets_flag_test.go) asserts this default is true.
+	optIn := registerSecretOptInFlag(flag.CommandLine)
 	var cniCheckInterval time.Duration
 	flag.DurationVar(&cniCheckInterval, "cni-check-interval", 10*time.Minute,
 		"How often the leader-elected probe Runnable re-probes the CNI self-test (D38).")
@@ -440,6 +449,7 @@ func main() {
 		AllowUnenforced:        allowUnenforced,
 		AllowUnenforcedNetwork: allowUnenforcedNetwork,
 		MemoryStorageClass:     memoryStorageClass,
+		SecretOptInRequired:    *optIn,
 		MemoryWriterImage:      memoryWriterImage,
 		CNIProber:              cniProber,
 		CNIRegateSource:        cniRegateSrc,

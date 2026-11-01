@@ -1338,7 +1338,10 @@ restart), and unlabelling or removing the binding re-holds it (fail-closed).
 **What to do:**
 
 ```bash
-# 1. Enable the namespace (an admin; defaults shown):
+# 1. Enable the namespace (an admin; defaults shown). --clusterrole=
+# coxswain-secret-reader for a Helm chart install; a dist/install.yaml install
+# renders the ClusterRole as coxswain-coxswain-secret-reader (kustomize
+# namePrefix) — use that name there.
 kubectl -n <namespace> create rolebinding coxswain-secret-reader \
   --clusterrole=coxswain-secret-reader \
   --serviceaccount=coxswain-system:coxswain-controller-manager

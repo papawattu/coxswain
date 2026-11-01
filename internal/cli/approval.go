@@ -67,16 +67,16 @@ const (
 	annotationsField = "annotations"
 )
 
-// newApproveCommand builds `cox approve <loop>`: set the PlanApproved condition
-// on the Loop (the B3 plan approval gate). The CLI computes the SHA-256 of the
-// plan (read from the workspace via the existing plan reader) and sets the
-// condition's message to "Approved: <hash>". The operator's approval gate sees
-// the condition True (with a valid hash) and advances the Loop to Implementing
-// (if it is at AwaitingApproval).
+// newApproveCommand builds `cox approve <loop>` (the B3 plan approval
+// gate). The CLI computes the SHA-256 of the plan (read from the workspace
+// via the existing plan reader) and writes the one-shot
+// coxswain.io/approve annotation with that hash; the OPERATOR sets the
+// PlanApproved condition from the annotation (message "Approved: <hash>")
+// while the Loop is held for approval and advances it to Implementing.
 func newApproveCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "approve <loop>",
-		Short: "Approve the Loop's plan (set the PlanApproved condition with the plan's SHA-256)",
+		Short: "Approve the Loop's plan (write the one-shot approve annotation with the plan's SHA-256; the operator sets the PlanApproved condition)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return approveLoop(cmd.Context(), currentDeps, namespaceOf(), args[0], cmd.OutOrStdout())

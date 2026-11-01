@@ -38,7 +38,16 @@ limitations under the License.
 //   - an annotation on a Loop that is NOT held for approval → removed with a
 //     Normal Event and no effect;
 //   - re-approving after a re-plan → the approval binds to the NEW hash
-//     (approvedPlanHash on the new plan, the old stale one does not advance).
+//     (approvedPlanHash on the new plan, the old stale one does not advance);
+//   - a FAILED status write at consume time → the annotation is NOT removed
+//     (the user's decision survives on the object), and the next reconcile
+//     (no failure) converts it to the condition and removes the annotation
+//     (the P1 on #377: the annotation removal must not precede the
+//     condition's persistence);
+//   - a reject annotation whose value already starts with "Rejected: " →
+//     the leading prefix is stripped at consume time (no doubling in the
+//     condition's message — the RejectedEvent's message carries the reason
+//     exactly as the user wrote it, no "Rejected: Rejected: ").
 
 package controller
 
@@ -46,13 +55,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"maps"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,6 +73,142 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
+
+// d85StatusFaultClient makes the FIRST status-subresource write of the named
+// Loop fail with an injected error (the P1 fault-injection spec on #377: a
+// failed status write at consume time must NOT remove the annotation).
+// Every other call passes through to the inner client. It implements
+// client.Client by delegation (the envtest plain client does not implement
+// client.WithWatch, so the conflictOnceClient/b1CreateFailClient idiom is
+// used rather than client/interceptor). The SubResourceWriter methods (the
+// "status" subresource the consume writes through Status().Patch /
+// Status().Update) are the ones that inject; the plain-resource methods
+// (Get/List/Create/Delete/Update/Patch/DeleteAllOf/Apply) are pass-through.
+type d85StatusFaultClient struct {
+	inner client.Client
+	name  string
+	left  int
+}
+
+func (c *d85StatusFaultClient) isTarget(obj client.Object) bool {
+	l, ok := obj.(*coxv1alpha1.Loop)
+	return ok && l.Name == c.name
+}
+
+// injectNextWrite fails once when c.left > 0 (the injected status write),
+// decrementing left; otherwise nil.
+func (c *d85StatusFaultClient) injectNextWrite(obj client.Object) error {
+	if c.isTarget(obj) && c.left > 0 {
+		c.left--
+		return fmt.Errorf("injected: first status write at consume time must fail")
+	}
+	return nil
+}
+
+// client.Client methods (pass-through — the consume's metadata PATCH and
+// every other write must reach the API unharmed; only the status write
+// carries the fault).
+
+func (c *d85StatusFaultClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.inner.Get(ctx, key, obj, opts...)
+}
+
+func (c *d85StatusFaultClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.inner.List(ctx, list, opts...)
+}
+
+func (c *d85StatusFaultClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	return c.inner.Create(ctx, obj, opts...)
+}
+
+func (c *d85StatusFaultClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	return c.inner.Delete(ctx, obj, opts...)
+}
+
+func (c *d85StatusFaultClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	return c.inner.Update(ctx, obj, opts...)
+}
+
+func (c *d85StatusFaultClient) Patch(ctx context.Context, obj client.Object, data client.Patch, opts ...client.PatchOption) error {
+	return c.inner.Patch(ctx, obj, data, opts...)
+}
+
+func (c *d85StatusFaultClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
+	return c.inner.DeleteAllOf(ctx, obj, opts...)
+}
+
+func (c *d85StatusFaultClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+	return c.inner.Apply(ctx, obj, opts...)
+}
+
+func (c *d85StatusFaultClient) GroupVersionKindFor(obj runtime.Object) (schema.GroupVersionKind, error) {
+	return c.inner.GroupVersionKindFor(obj)
+}
+
+func (c *d85StatusFaultClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
+	return c.inner.IsObjectNamespaced(obj)
+}
+
+func (c *d85StatusFaultClient) Scheme() *runtime.Scheme {
+	return c.inner.Scheme()
+}
+
+func (c *d85StatusFaultClient) RESTMapper() meta.RESTMapper {
+	return c.inner.RESTMapper()
+}
+
+// SubResource returns the inner client's sub-resource client (the fault
+// lives on the Status() path; SubResource is not used by the consume).
+func (c *d85StatusFaultClient) SubResource(subResource string) client.SubResourceClient {
+	return c.inner.SubResource(subResource)
+}
+
+// compile-time check.
+var _ client.Client = (*d85StatusFaultClient)(nil)
+var _ client.SubResourceWriter = (*d85StatusFaultSubWriter)(nil)
+
+// d85StatusFaultSubWriter is the SubResourceWriter the consume's status
+// writes go through. It is a separate type so the SubResourceWriter's own
+// Create/Update/Patch/Apply methods (different signatures from the
+// plain-resource ones) do not collide with d85StatusFaultClient's.
+type d85StatusFaultSubWriter struct {
+	c     *d85StatusFaultClient
+	inner client.SubResourceWriter
+}
+
+func (w *d85StatusFaultSubWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	return w.inner.Create(ctx, obj, subResource, opts...)
+}
+
+func (w *d85StatusFaultSubWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if err := w.c.injectNextWrite(obj); err != nil {
+		return err
+	}
+	return w.inner.Update(ctx, obj, opts...)
+}
+
+func (w *d85StatusFaultSubWriter) Patch(ctx context.Context, obj client.Object, data client.Patch, opts ...client.SubResourcePatchOption) error {
+	if err := w.c.injectNextWrite(obj); err != nil {
+		return err
+	}
+	return w.inner.Patch(ctx, obj, data, opts...)
+}
+
+func (w *d85StatusFaultSubWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	return w.inner.Apply(ctx, obj, opts...)
+}
+
+// statusWriter returns a new sub-writer (the fault state is on the outer
+// client, so the left counter is shared across calls).
+func (c *d85StatusFaultClient) statusWriter() *d85StatusFaultSubWriter {
+	return &d85StatusFaultSubWriter{c: c, inner: c.inner.Status()}
+}
+
+// Status returns the sub-writer (the fault lives on the subresource methods,
+// not on the plain-resource ones).
+func (c *d85StatusFaultClient) Status() client.SubResourceWriter {
+	return c.statusWriter()
+}
 
 // d85EventSink is the broadcaster's EventSink (it posts the Event to the
 // envtest cluster via k8sClient.Create — the broadcaster's default sink
@@ -264,6 +413,9 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		annotate(nn, map[string]string{rejectAnnotation: reason})
 		reconcileLoop(r, ns, "d85-reject")
 
+		// The reject annotation's value is consumed as-is (a leading
+		// "Rejected: " prefix the user wrote by hand is stripped at consume
+		// time, so the message never carries it twice — the next spec).
 		// The existing reject flow continues: the gate's Replan branch ran on
 		// this same reconcile — the durable reason is set, the condition is
 		// CLEARED (the re-plan starts fresh), and the phase moved to Planning.
@@ -283,6 +435,74 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		Expect(hasRejected).To(BeFalse(), "D85: the PlanRejected condition is cleared by the existing flow (the re-plan starts fresh)")
 		Expect(annotationAbsent(nn, rejectAnnotation)).To(BeTrue(),
 			"D85: the operator removes the reject annotation after consuming it")
+	})
+
+	It("a reject annotation whose value already starts with 'Rejected: ': the leading prefix is stripped at consume time", func() {
+		ns := "d85-rejprefix-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		nn, r := d85Loop(ns, "d85-rejprefix", coxv1alpha1.LoopPhaseAwaitingApproval)
+		annotate(nn, map[string]string{rejectAnnotation: "Rejected: the reason already prefixed"})
+		reconcileLoop(r, ns, "d85-rejprefix")
+
+		// The consume stripped the leading "Rejected: " so the condition's
+		// message ("Rejected: <reason>") carries the reason once — not
+		// "Rejected: Rejected: <reason>". The Replan flow cleared the
+		// condition on this same pass (the durable reason survives on
+		// status.approval.lastRejectionReason). The strip is observed on the
+		// durable reason: the operator's format "Rejected: <reason>" applied
+		// to the user's "Rejected: <reason>" (with the leading prefix
+		// stripped) is "Rejected: <reason>" — not "Rejected: Rejected: <reason>".
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Status.Approval).ToNot(BeNil(), "D85: the rejection reason is durable")
+		// The reason (the whole message, the operator's format "Rejected: <reason>")
+		// carries the reason ONCE. If the prefix had NOT been stripped, the reason
+		// would be "Rejected: Rejected: <reason>".
+		Expect(loop.Status.Approval.LastRejectionReason).To(Equal("Rejected: the reason already prefixed"),
+			"D85: the durable reason carries the reason ONCE (not 'Rejected: Rejected: <reason>')")
+		Expect(annotationAbsent(nn, rejectAnnotation)).To(BeTrue(),
+			"D85: the operator removes the reject annotation after consuming it")
+	})
+
+	It("a FAILED status write at consume time: the annotation is kept and the next reconcile converts it (P1 on #377)", func() {
+		ns := "d85-faultstatus-" + nowSuffix()
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		Expect(k8sClient.Create(ctx, nsObj)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
+
+		// The operator persists the condition FIRST (a status write) and
+		// removes the annotation only after that write succeeds. Inject a
+		// failure into the FIRST status write of the Loop: the consume must
+		// abort WITHOUT removing the annotation (the user's decision survives
+		// on the object), and no condition is set.
+		faultClient := &d85StatusFaultClient{inner: k8sClient, name: "d85-faultstatus", left: 1}
+		faultReconciler := d85Reconciler()
+		faultReconciler.Client = faultClient
+
+		nn, _ := d85Loop(ns, "d85-faultstatus", coxv1alpha1.LoopPhaseAwaitingApproval)
+		annotate(nn, map[string]string{approveAnnotation: sha("plan-v1\n")})
+		reconcileLoop(faultReconciler, ns, "d85-faultstatus")
+
+		// Pass 1 (the injected failure): the annotation is STILL present —
+		// the consume's persist failed and the annotation removal was not
+		// attempted, so the user's decision survives on the object.
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+		Expect(loop.Annotations[approveAnnotation]).ToNot(BeEmpty(),
+			"D85 P1: a failed status write at consume time must NOT remove the annotation")
+
+		// Pass 2 (no injection): the still-present annotation is re-consumed
+		// (idempotent: same hash, same condition) — PlanApproved is set and
+		// the annotation is gone.
+		reconcileLoop(faultReconciler, ns, "d85-faultstatus")
+		msg := conditionMessage(nn, coxv1alpha1.PlanApprovedCondition)
+		Expect(msg).To(ContainSubstring(sha("plan-v1\n")),
+			"D85 P1: the next reconcile converts the surviving annotation to PlanApproved")
+		Expect(annotationAbsent(nn, approveAnnotation)).To(BeTrue(),
+			"D85 P1: the annotation is removed after the successful consume")
 	})
 
 	It("BOTH annotations: reject wins, both are removed, and the Event says so", func() {

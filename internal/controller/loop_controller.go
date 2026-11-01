@@ -6354,8 +6354,9 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// B3 replaces it with the approval gate so the Manual-mode hold is
 	// exercised. In Auto mode (spec.approval.mode == Auto, the default) the
 	// gate is a no-op (the S4 behaviour is preserved); in Manual mode it
-	// holds the Planning -> AwaitingApproval advance until the user sets
-	// the PlanApproved condition (via cox approve).
+	// holds the Planning -> AwaitingApproval advance until the user's
+	// approve annotation is consumed (the operator sets the PlanApproved
+	// condition from it; cox approve writes the annotation).
 	r.wireApprovalGate()
 	// S3a: wire the baseCommit read-back to the operator's non-cached client
 	// (APIReader). The sandbox pod is NOT in the manager's Pod cache (the

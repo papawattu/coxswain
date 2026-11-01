@@ -41,7 +41,8 @@ limitations under the License.
 //     approve annotation (parsed back from the condition's message). A plan
 //     change after approval (a fresh Planning run re-writes PLAN.md, the
 //     runner's I93 plan-hash check claims PlanMismatch) re-holds the Loop.
-//   - Rejection: when the user sets PlanRejected, the operator's action
+//   - Rejection: when the operator has set PlanRejected from the user's
+//     one-shot reject annotation, the operator's action
 //     depends on spec.approval.onReject: Replan (default) re-enters Planning
 //     (the operator writes the reason to the workspace via the phase-init
 //     container for the next plan); Fail is terminal (the operator sets the
@@ -62,6 +63,7 @@ package controller
 import (
 	"context"
 	"regexp"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -351,13 +353,14 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 	// MUST act on it this pass — reject flow / approved release) or when
 	// it removed an annotation (the switch then matches no branch — the
 	// object is unchanged — and the trailing persist is a no-op). The
-	// annotation removal was already persisted as a metadata patch inside
-	// the consume (the in-memory resourceVersion was refreshed, so the
-	// trailing persist writes cleanly). Do NOT early-return here: the
-	// condition the consume just set is read by the switch on this same
-	// pass (a consumed reject must re-plan on this same reconcile; a
-	// consumed current-hash approve must release the hold on this same
-	// reconcile).
+	// consume persists its two writes itself (the condition's status patch
+	// FIRST, then the annotation's metadata patch) and refreshes loop from
+	// a fresh read, so the trailing persist writes cleanly (no 409) and
+	// carries only the rest of the reconcile's changes. Do NOT
+	// early-return here: the condition the consume just set is read by the
+	// switch on this same pass (a consumed reject must re-plan on this same
+	// reconcile; a consumed current-hash approve must release the hold on
+	// this same reconcile).
 	changed := r.consumeApprovalAnnotations(loop)
 	planRejected := rejectedPlanReason(loop) != ""
 	planApproved := approvedPlanHash(loop) != ""
@@ -508,12 +511,6 @@ func (r *LoopReconciler) applyApprovalGate(loop *coxv1alpha1.Loop) bool {
 	return changed
 }
 
-// clearCondition removes a condition from the Loop's status (the operator's
-// "clear" for a user-set condition: the user set it, the operator removes it
-// when its reason no longer applies). It is a no-op when the condition is
-// absent. Unlike setCondition (which upserts), clearCondition never creates
-// a condition (the user is the sole creator of PlanApproved / PlanRejected;
-// the operator only clears them).
 // conditionTruePresent reports whether the loop's status carries condType as
 // True (any reason). It is the Event-dedup guard: a Warning Event is emitted
 // only on the transition into True, not on every reconcile while the
@@ -575,7 +572,9 @@ const (
 //     "Rejected: <value>" — the same format rejectedPlanReason expects)
 //     and removes the reject annotation. When BOTH are present, the
 //     approve annotation is also removed and a RejectWins Event says so
-//     (the collision is a user error).
+//     (the collision is a user error). A leading "Rejected: " in the
+//     annotation's value is stripped so the message never carries the
+//     prefix twice.
 //     - approve (no reject): set PlanApproved True copying the
 //     annotation's hash VERBATIM (message "Approved: <hash>") and remove
 //     the annotation. The operator does NOT read the plan: a stale hash is
@@ -583,12 +582,19 @@ const (
 //     PlanMismatch and the gate re-holds; see
 //     loop_i93_planhash_envtest_test.go).
 //
-// The annotation removal is a JSON merge-patch on a FRESH read: the
-// caller's trailing status persist carries the STALE in-memory
-// resourceVersion (the Loop was read at the top of Reconcile, before the
-// CLI wrote the annotation), so the removal goes on its own metadata patch
-// and the in-memory object's resourceVersion is REFRESHED to the
-// post-patch value — the trailing persist then writes cleanly (no 409).
+// Ordering (review P1 on #377): the CONDITION is persisted FIRST (a status
+// merge patch from a fresh read, persistConsumedApprovalCondition below) and
+// the annotation is removed only AFTER that write succeeds (a metadata
+// merge patch from a fresh read). A failed status write must NOT drop the
+// user's decision — the annotation stays on the object, and the next
+// reconcile re-consumes it (idempotent: same hash, same condition —
+// setCondition is a no-op when the condition is already set with the same
+// reason+message+status). After both writes are durable the in-memory loop
+// is refreshed from a fresh read (its resourceVersion is two writes stale,
+// and the pass's trailing status write must not overwrite a concurrent
+// status change with the stale version); a refresh failure aborts the pass
+// (the requeue re-consumes from a fresh state — the consumed decision is
+// already durable).
 func (r *LoopReconciler) consumeApprovalAnnotations(loop *coxv1alpha1.Loop) bool {
 	approvePresent := loop.Annotations[approveAnnotationKey] != ""
 	rejectPresent := loop.Annotations[rejectAnnotationKey] != ""
@@ -598,6 +604,9 @@ func (r *LoopReconciler) consumeApprovalAnnotations(loop *coxv1alpha1.Loop) bool
 	// The Loop must be held for approval (the approval window is open).
 	// Out-of-hold: remove the annotations with a Normal Event and no effect.
 	if loop.Status.Phase != coxv1alpha1.LoopPhaseAwaitingApproval {
+		// Out-of-hold: nothing to persist (no condition); the removal is
+		// safe on its own (a failed removal requeues; the stale annotation
+		// is re-removed on the next reconcile).
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeNormal, "StaleApprovalAnnotation",
 				"approval annotation outside the approval hold was removed (no effect)")
@@ -608,13 +617,17 @@ func (r *LoopReconciler) consumeApprovalAnnotations(loop *coxv1alpha1.Loop) bool
 		}
 		return true
 	}
+	// Review P1: persist the condition BEFORE removing the annotation, so a
+	// failed status write leaves the user's decision on the object (the
+	// next reconcile re-consumes the still-present annotation — idempotent:
+	// same hash, same condition).
 	if rejectPresent {
 		// Reject wins (the user's decision to stop the plan): set
 		// PlanRejected from the annotation's value (the operator is the
 		// sole writer — before D85 the CLI wrote this condition; the
 		// message format is unchanged, so rejectedPlanReason / the
 		// gate's reject flow keep working).
-		reason := loop.Annotations[rejectAnnotationKey]
+		reason := strings.TrimPrefix(loop.Annotations[rejectAnnotationKey], "Rejected: ")
 		setCondition(loop, coxv1alpha1.PlanRejectedCondition, metav1.ConditionTrue, "Rejected", "Rejected: "+reason)
 		if approvePresent {
 			// BOTH present: reject wins; the approve annotation is dropped
@@ -636,19 +649,63 @@ func (r *LoopReconciler) consumeApprovalAnnotations(loop *coxv1alpha1.Loop) bool
 		setCondition(loop, coxv1alpha1.PlanApprovedCondition, metav1.ConditionTrue,
 			"Approved", "Approved: "+loop.Annotations[approveAnnotationKey])
 	}
+	if err := r.persistConsumedApprovalCondition(loop); err != nil {
+		// The condition is not durable — do NOT remove the annotation, so the
+		// user's decision survives on the object for the next reconcile.
+		return false
+	}
 	if err := r.removeApprovalAnnotations(loop, approvePresent, rejectPresent); err != nil {
 		logf.FromContext(context.Background()).Error(err, "remove the consumed approval annotation")
 		return false
 	}
+	// removeApprovalAnnotations refreshed loop from a fresh read (its own
+	// final step — the metadata patch bumped the resourceVersion, and the
+	// trailing status write must not overwrite a concurrent status change
+	// with the stale version). Both writes are durable; the consume's job is
+	// done.
 	return true
+}
+
+// persistConsumedApprovalCondition writes the condition the consume just set
+// (PlanApproved or PlanRejected) to the status subresource as a merge patch
+// from a FRESH read, before the annotation is removed (review P1: a failed
+// write must not drop the user's decision). The fresh read carries the
+// annotation (irrelevant to a status patch), and the merge patch touches
+// only status, so the write never races the metadata write that follows.
+func (r *LoopReconciler) persistConsumedApprovalCondition(loop *coxv1alpha1.Loop) error {
+	var cond *metav1.Condition
+	for i := range loop.Status.Conditions {
+		if loop.Status.Conditions[i].Type == coxv1alpha1.PlanApprovedCondition ||
+			loop.Status.Conditions[i].Type == coxv1alpha1.PlanRejectedCondition {
+			c := &loop.Status.Conditions[i]
+			if c.Status == metav1.ConditionTrue {
+				cond = c
+			}
+			break
+		}
+	}
+	if cond == nil {
+		return nil // nothing to persist (a defensive path — the caller sets one)
+	}
+	fresh := &coxv1alpha1.Loop{}
+	if err := r.Get(ctxFor(loop), client.ObjectKeyFromObject(loop), fresh); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	freshCopy := fresh.DeepCopy()
+	setCondition(freshCopy, cond.Type, cond.Status, cond.Reason, cond.Message)
+	if err := r.Status().Patch(ctxFor(loop), freshCopy, client.MergeFrom(fresh)); err != nil {
+		logf.FromContext(context.Background()).Error(err, "persist the consumed approval condition")
+		return err
+	}
+	return nil
 }
 
 // removeApprovalAnnotations patches the Loop's METADATA to drop the given
 // approval annotations (D85, the I52/removeResumeAnnotation pattern: a merge
-// patch from a FRESH read — the trailing status update carries the stale
-// resourceVersion, so the removal goes on its own write, BEFORE the caller's
-// status change is persisted, and refreshes the in-memory resourceVersion so
-// the two writes never 409).
+// patch from a FRESH read — the consumed condition is persisted FIRST by the
+// caller (persistConsumedApprovalCondition), and only then is the annotation
+// removed; a failed removal leaves the annotation in place and the next
+// reconcile re-consumes it (idempotent: same hash, same condition)).
 func (r *LoopReconciler) removeApprovalAnnotations(loop *coxv1alpha1.Loop, approve, reject bool) error {
 	if !approve && !reject {
 		return nil
@@ -680,15 +737,17 @@ func (r *LoopReconciler) removeApprovalAnnotations(loop *coxv1alpha1.Loop, appro
 	if err := r.Patch(ctxFor(loop), updated, client.MergeFrom(fresh)); err != nil {
 		return err
 	}
-	loop.ResourceVersion = updated.ResourceVersion
-	if loop.Annotations == nil {
-		loop.Annotations = make(map[string]string)
-	}
-	if approve {
-		delete(loop.Annotations, approveAnnotationKey)
-	}
-	if reject {
-		delete(loop.Annotations, rejectAnnotationKey)
+	// The patch bumped the Loop's resourceVersion; the in-memory loop is now
+	// stale. Refresh it from a fresh read (the patch is the durable write —
+	// a refresh failure aborts the pass and the requeue re-runs from a fresh
+	// state, the annotation already gone). The fresh read carries the
+	// authoritative post-patch state (the annotation is gone), so the
+	// in-memory loop's resourceVersion now matches the fresh object and the
+	// pass's trailing status write (the shared Status().Update) does not 409
+	// on the stale version.
+	if err := r.Get(ctxFor(loop), client.ObjectKeyFromObject(loop), loop); err != nil {
+		logf.FromContext(context.Background()).Error(err, "refresh the Loop after the annotation removal")
+		return err
 	}
 	return nil
 }
@@ -707,7 +766,8 @@ func ctxFor(_ *coxv1alpha1.Loop) context.Context {
 // decides whether the phase machine may advance from current to next. In
 // Manual mode, the gate HOLDS the Planning -> AwaitingApproval advance (the
 // claim-driven advance, driven by the runner's Planning claim) until the
-// user sets PlanApproved. The gate is the operator's sole hold point for the
+// user's approve annotation is consumed (PlanApproved True).
+// The gate is the operator's sole hold point for the
 // approval: the applyApprovalGate function above is the operator's read of
 // the conditions (the phase change + the condition clears); this gate is
 // the hold on the claim-driven advance (the runner's Planning claim must not
@@ -734,7 +794,8 @@ func (approvalPhaseGate) Allow(loop *coxv1alpha1.Loop, current, next coxv1alpha1
 	}
 	// The Manual-mode hold: the Planning -> Implementing advance (the
 	// claim-driven advance, driven by the runner's Planning claim) is held
-	// until the user sets PlanApproved. The nextPhase table advances
+	// until the user's approve annotation is consumed (PlanApproved True).
+	// The nextPhase table advances
 	// Planning -> Implementing directly (there is no AwaitingApproval phase
 	// between them in the table); the gate's hold is on that advance (the
 	// operator's decision, not the runner's — ADR-0005).
@@ -742,7 +803,7 @@ func (approvalPhaseGate) Allow(loop *coxv1alpha1.Loop, current, next coxv1alpha1
 		if approvedPlanHash(loop) != "" {
 			return true, ""
 		}
-		return false, "awaiting plan approval (set the PlanApproved condition via cox approve)"
+		return false, "awaiting plan approval (run cox approve)"
 	}
 	return true, ""
 }

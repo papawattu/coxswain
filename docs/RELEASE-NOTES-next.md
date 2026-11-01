@@ -69,7 +69,7 @@ override is yours to pin.
 
 ## Security fixes
 
-### D76/D102: Secrets are opt-in — the operator has no cluster-wide Secret read, and a named Secret must be labelled before the Loop can use it — PR #N/A (this PR)
+### D76/D102: Secrets are opt-in — the operator has no cluster-wide Secret read, and a named Secret must be labelled before the Loop can use it — PR #380
 
 - **What was wrong.** A Loop author could name ANY Secret in their namespace
   (`spec.workspace.gitCredentialSecret`, `spec.agent.endpointSecretRef`, or
@@ -979,6 +979,21 @@ closed by the PRs named beside them. In plain words, the items still open:
 - **F86**: F47 follow-ups — `ensureCheckpoint`'s idempotency guard
   (`cp.Iteration == iteration`) and the tamper gate's status inputs are not
   yet validated like `checkpointEntryTrusted` (PR #254's scope note).
+- **F93**: a Loop whose sandbox pod can never be scheduled stays
+  `SandboxNotStarting` forever and never reaches `Failed` (F93a; the
+  unmountable-volume bound of F48b does not trip for an unschedulable pod —
+  the cause is unknown, the evidence shows a 20h+ wedge with no decision).
+  Separately, the Sandbox template's BPF node affinity was not reconciled
+  when the operator's `--allow-unenforced` flag changed, so a recreated pod
+  kept the stale affinity (F93b; fixed by C2 #381 if merged before the tag).
+- **F94**: a Go repo with no `*_test.go` makes the verify canary exit 44
+  (`VerifyCanaryUnavailable`), which means "no decision" — and with no bound,
+  timeout or terminal path, the Loop holds in `Verifying` forever. A fix
+  needs an owner decision on the base commit: had the base tests (agent
+  deleted them → terminal) or not (skip the canary, decide on the
+  acceptance checks, as #370 does), plus a bound so no state holds
+  `Verifying` forever. (Owner decision 2026-11-01: (a)+(b)+(c) accepted;
+  queued for b2 after F93a.)
 
 - **D85 / editor role**: a user bound to the Loop editor role can write
   the Loop's status subresource (the role grants `update` and `patch` on

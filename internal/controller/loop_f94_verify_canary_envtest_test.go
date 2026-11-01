@@ -67,30 +67,6 @@ var _ = Describe("F94: the verify canary's no-test exits (session 2 gates)", fun
 		return loop
 	}
 
-	// f94PatchJobConditions sets the Job's batch conditions (envtest has no
-	// batch Job controller: a real verify Job whose canary init exited before
-	// the evidence inits ran is FAILED by the kubelet — the Job carries a
-	// Failed batch condition, the jobFailed evidence verifyOutcome reads;
-	// the I65 shape the F60 45 / 137 / exit-1 specs rely on).
-	f94PatchJobConditions := func(job *batchv1.Job, conds ...batchv1.JobCondition) {
-		job.Status.Conditions = conds
-		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
-	}
-
-	// f94FailedJobCondition is the Job's Failed batch condition (the shape a
-	// verify Job that failed before the checks ran carries).
-	f94FailedJobCondition := func() batchv1.JobCondition {
-		now := metav1.Now()
-		return batchv1.JobCondition{
-			Type:               batchv1.JobFailed,
-			Status:             corev1.ConditionTrue,
-			Reason:             batchv1.JobReasonBackoffLimitExceeded,
-			Message:            "backoff limit exceeded",
-			LastProbeTime:      now,
-			LastTransitionTime: now,
-		}
-	}
-
 	f94Events := func(recorder *record.FakeRecorder) []string {
 		out := []string{}
 		for {
@@ -123,7 +99,6 @@ var _ = Describe("F94: the verify canary's no-test exits (session 2 gates)", fun
 		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
 			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyCanaryTestsRemovedExit}}},
 		))
-		f94PatchJobConditions(job, f94FailedJobCondition())
 
 		fresh := f94Reconcile(r, ns, name)
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
@@ -176,13 +151,11 @@ var _ = Describe("F94: the verify canary's no-test exits (session 2 gates)", fun
 		//
 		// Attempt 1: the original Job's pod shows the canary terminated with
 		// 44 (the canary init sits before check-0, so a canary exit fails the
-		// pod — the Job carries the Failed batch condition: the jobFailed
-		// evidence verifyOutcome reads, the I65 shape the F60 45 / 137 /
-		// exit-1 specs exercise via the same path).
+		// pod — the pod's canary status is the evidence canaryGateDecision
+		// reads, the same shape the F60 45 spec plants).
 		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
 			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyCanaryUnavailableExit}}},
 		))
-		f94PatchJobConditions(job, f94FailedJobCondition())
 		first := f94Reconcile(r, ns, name)
 		Expect(first.Status.Verify).NotTo(BeNil(), "the infra attempt is recorded in status.verify")
 		Expect(first.Status.Verify.InfraAttempts).To(Equal(int32(1)),
@@ -211,49 +184,46 @@ var _ = Describe("F94: the verify canary's no-test exits (session 2 gates)", fun
 		// so attempt verifyInfraRetries+1 is the last allowed run. The
 		// attempt guard is the Job UID (a recreated Job has a new UID, so
 		// each fresh Job's first failure IS counted — the shape a real
-		// cluster shows). Each iteration: delete the previous attempt's Job,
-		// reconcile (ensureVerifyJob creates the fresh Job; on the SAME
-		// reconcile verifyOutcome sees the failing pod owned by the new Job
-		// — the new UID differs from the recorded one, so the attempt is
-		// counted), then plant the failing pod for the NEXT attempt.
-		attempt := int32(2)
-		for attempt <= verifyInfraRetries+1 {
-			// Delete the previous attempt's Job (it is in Terminating or
-			// already gone).
-			if job.DeletionTimestamp == nil {
-				_ = k8sClient.Delete(ctx, job)
+		// cluster shows; the i65-exhaust spec drives the identical loop).
+		//
+		// The pod alone is the decision's evidence: canaryGateDecision reads
+		// the POD's canary init (a 44 is verifyInfraFailed, the infra-failure
+		// outcome), so the fixture plants ONLY the pod — exactly the F60 45
+		// spec's shape. No Job batch conditions are stamped: envtest's
+		// 1.34 API server requires status.startTime plus the FailureTarget
+		// condition before a Failed batch condition is accepted, and the
+		// decision does not read the Job's conditions at all.
+		attempts := int32(1)
+		for attempts <= verifyInfraRetries {
+			// The current attempt's Job (recreated with a new UID on the
+			// previous iteration) has its failing pod planted; the reconcile
+			// counts the attempt and deletes the failed Job.
+			job = f60GetJob(ns, jobName)
+			if job == nil {
+				// No Job yet (the delete was still in flight): the next
+				// reconcile recreates it (ensureVerifyJob).
+				f94Reconcile(r, ns, name)
+				continue
 			}
-			// The fresh Job does not exist yet (ensureVerifyJob creates it on
-			// this reconcile). Plant nothing for THIS Job: the previous
-			// attempt's failing pod is what verifyOutcome reads. But the
-			// previous pod is owned by the DELETED Job — readVerifyJobPod
-			// filters to the CURRENT Job's UID, and with no current Job it
-			// sees no pod. To mirror a real cluster (the old pod lingers until
-			// GC), keep the previous attempt's pod; the new Job's UID differs,
-			// so the pod is NOT counted as this attempt's evidence and the
-			// jobFailed path (no pod) counts the attempt instead.
-			f94Reconcile(r, ns, name)
-			freshJob := f60GetJob(ns, jobName)
-			if freshJob == nil {
-				Fail("the recreated Job must exist (ensureVerifyJob recreates it on the next reconcile)")
-			}
-			// Plant the failing pod for the NEXT attempt.
-			f60PlantPod(ns, name, jobName, freshJob, append(f60TrustedPrefix(),
+			f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
 				corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyCanaryUnavailableExit}}},
 			))
-			f94PatchJobConditions(freshJob, f94FailedJobCondition())
-			job = freshJob
-			attempt++
+			first = f94Reconcile(r, ns, name)
+			attempts = first.Status.Verify.InfraAttempts
+			if first.Status.Phase == coxv1alpha1.LoopPhaseFailed {
+				break
+			}
 		}
-		// The last attempt (verifyInfraRetries+1) was counted on the reconcile
-		// that created its Job. One final reconcile reads that attempt's
-		// failing pod/Job and applies the bound: Failed:VerifyInfraFailed.
-		f94Reconcile(r, ns, name)
+		// The last attempt (verifyInfraRetries+1) fails the Loop on the
+		// reconcile that counted it: the bound is verifyInfraRetries
+		// recreations, so attempt verifyInfraRetries+1 is the final failure.
+		fresh := first
 
 		// The bound is exhausted: the Loop is Failed:VerifyInfraFailed — a
 		// permanent 44 ends in Failed after the bound, never a
-		// forever-Verifying hold.
-		fresh := f94GetLoop(ns, name)
+		// forever-Verifying hold. (fresh is the last counted attempt's
+		// reconcile read above.)
+		_ = f94GetLoop(ns, name) // the namespace is torn down with the spec
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
 			"a permanent 44 must end in Failed after the infra-retry bound (F94c: no forever-Verifying hold)")
 		var failed *metav1.Condition
@@ -265,8 +235,9 @@ var _ = Describe("F94: the verify canary's no-test exits (session 2 gates)", fun
 		}
 		Expect(failed).NotTo(BeNil(), "the Loop must carry a Failed condition")
 		Expect(failed.Reason).To(Equal(verifyInfraFailedReason), "the Failed reason must be VerifyInfraFailed")
-		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(verifyInfraRetries+1),
+		Expect(fresh.Status.Verify.InfraAttempts).To(Equal(int32(verifyInfraRetries+1)),
 			"the bound is verifyInfraRetries recreations: attempt verifyInfraRetries+1 is the final failure")
+		_ = f94Events(recorder) // drain the final Warning Event
 	})
 
 	It("takes no decision while the canary is still Running or Waiting (the I49 norm)", func() {

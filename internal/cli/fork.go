@@ -215,9 +215,9 @@ func forkLoop(ctx context.Context, dc Deps, ns, forkName, sourceLoop string, ite
 // fork's seed).
 func buildForkLoop(forkName, ns string, spec map[string]any) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "coxswain.wattu.com/v1alpha1",
-		"kind":       "Loop",
-		"metadata":   map[string]any{"name": forkName, "namespace": ns},
-		"spec":       spec,
+		"apiVersion":  "coxswain.wattu.com/v1alpha1",
+		"kind":        "Loop",
+		metadataField: map[string]any{"name": forkName, "namespace": ns},
+		"spec":        spec,
 	}}
 }

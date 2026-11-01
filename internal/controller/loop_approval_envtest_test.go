@@ -347,7 +347,9 @@ var _ = Describe("B3 plan approval gate", func() {
 		defer func() { _ = k8sClient.Delete(context.Background(), nsObj) }()
 
 		nn, r := makeLoop(ns, "b3-planchange", coxv1alpha1.ApprovalModeManual, "")
-		// Set the PlanApproved condition (the user approved a plan). Then the
+		// Set the PlanApproved condition directly (a TEST SHORTCUT — in
+		// production the operator sets the condition from the user's
+		// one-shot approve annotation; the gate's reads are the same). Then the
 		// runner's Planning run detects a plan change (the PlanChanged claim
 		// is true). The operator's advancePhaseFromClaim consumes the claim
 		// and clears the PlanApproved condition (re-enter the hold — the gate's
@@ -412,8 +414,9 @@ var _ = Describe("B3 plan approval gate", func() {
 		// applyApprovalGate sees PlanRejected True (at Planning — but the
 		// Planning branch clears it for a re-plan, not a fail). The Fail
 		// action applies at AwaitingApproval or Implementing. So first advance
-		// to AwaitingApproval (set the PlanApproved condition to release the
-		// hold, deliver the claim to advance), then reject.
+		// to AwaitingApproval (set the PlanApproved condition directly — a
+		// test shortcut for the operator's annotation-consumed write — to
+		// release the hold, deliver the claim to advance), then reject.
 		//
 		// Simpler: set the condition directly at the phase the Fail branch
 		// handles. The gate's AwaitingApproval branch handles the rejection.

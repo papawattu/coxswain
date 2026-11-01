@@ -31,17 +31,18 @@ rules:
   - loops/status
   verbs:
   - get
-  # B3 (PLAN-BETA / PLAN.md Phase 4): the CLI's `cox approve` / `cox reject`
-  # write the PlanApproved / PlanRejected conditions to the Loop's status
-  # subresource (the CLI's write path — client.go Patch sends a JSON merge
-  # patch of status.conditions to /status; F87(d) replaced the pre-F87
-  # whole-object PUT, which `update` authorised. Both verbs stay granted: the
-  # merge patch is authorised by `patch`, and `update` remains for the
-  # whole-object status write the CLI no longer makes but other tools may).
-  # The editor role grants these writes so an editor-bound user can
-  # approve/reject a plan (the operator is the only other writer of
-  # the phase; the user owns the two approval conditions). R1 review (CHANGES
-  # on #148) P2: the editor role had only `get` on loops/status, so an
-  # editor-only user could not approve/reject.
-  - update
-  - patch
+  # D85 (owner decision, R34): the editor role's loops/status grant went
+  # back to GET-ONLY. The CLI's `cox approve` / `cox reject` no longer
+  # write the PlanApproved / PlanRejected conditions to the status
+  # subresource (the F87/B3 write `patch`/`update` authorised here was the
+  # defect: it let an editor-bound user write every status field the
+  # operator acts on — phase, checkpoints, budget, verify, agent — the
+  # "editor can self-advance" class of R20 I63). The commands now patch the
+  # Loop object's METADATA with a one-shot annotation (coxswain.io/approve:
+  # <plan sha256> / coxswain.io/reject: <reason>) on the MAIN resource, which
+  # the `patch` verb on `loops` above already authorises; the operator
+  # consumes the annotation and is now the ONLY writer of the two approval
+  # conditions. (A pre-D85 status write still lands on a D85 operator: the
+  # conditions the CLI used to set are read back as the operator's own
+  # writes and the hold releases — the known-issue documented in
+  # UPGRADE.md's v0.1.2 note; this role change is the durable fix.)

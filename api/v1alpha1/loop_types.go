@@ -91,8 +91,9 @@ type Approval struct {
 	// +optional
 	Mode ApprovalMode `json:"mode,omitempty"`
 
-	// onReject is the operator's action when the user sets the PlanRejected
-	// condition. Replan (default) re-enters Planning with the rejection
+	// onReject is the operator's action when the PlanRejected condition is
+	// True (the operator sets it from the user's one-shot reject
+	// annotation). Replan (default) re-enters Planning with the rejection
 	// reason fed to the next plan; Fail terminates the Loop as
 	// Failed:PlanRejected.
 	// +kubebuilder:validation:Enum=Replan;Fail
@@ -814,8 +815,9 @@ type LoopSpec struct {
 	// approval is the user's plan-approval settings (PLAN-BETA B3; PLAN.md
 	// Phase 4). The operator reads spec.approval.mode to decide whether to
 	// hold the phase machine at AwaitingApproval after Planning, and
-	// spec.approval.onReject to decide the action when the user sets
-	// PlanRejected (Replan = re-plan with the reason, Fail = terminal).
+	// spec.approval.onReject to decide the action when the PlanRejected
+	// condition is True (Replan = re-plan with the reason, Fail =
+	// terminal).
 	// An empty/zero value reads as Auto (no approval hold).
 	// +optional
 	Approval *Approval `json:"approval,omitempty"`
@@ -1388,26 +1390,30 @@ type StallEntry struct {
 
 // Loop condition types (the DeliveredCondition pattern).
 const (
-	// PlanApprovedCondition (PLAN-BETA B3; PLAN.md Phase 4) is the
-	// user-settable approval signal for a Loop's plan. The user (via
-	// cox approve) sets it to True with reason Approved and a message that
-	// carries the SHA-256 of the plan (the operator parses the hash from
-	// the message — the operator does NOT compute the hash itself, and a
+	// PlanApprovedCondition (PLAN-BETA B3; PLAN.md Phase 4) is the plan
+	// approval signal. The operator is the SOLE writer: it sets it to True
+	// with reason Approved and a message that carries the SHA-256 of the
+	// plan, consumed from the user's one-shot coxswain.io/approve
+	// annotation (cox approve writes the annotation — the operator parses
+	// the hash from the annotation, does NOT compute the hash itself, and a
 	// missing/incorrect hash is the operator's decision, not the user's
 	// mistake). When the plan changes (a fresh Planning run re-writes
 	// PLAN.md), the operator clears the condition and the Loop re-enters
 	// AwaitingApproval (the plan the user approved is no longer the one on
 	// the disk).
 	//
-	// The operator is the sole writer of the condition in the Manual-approve
-	// flow: the user sets it, the operator clears it when the plan changes
-	// and re-stamps LastTransitionTime. The user does NOT set it to False
-	// (rejection is PlanRejected, a separate condition).
+	// The user does not write this condition (before D85 the CLI set it;
+	// since D85 the CLI patches only the annotation, and the editor role's
+	// loops/status grant is get-only). The operator clears the condition
+	// when the plan changes and re-stamps LastTransitionTime. Rejection is
+	// PlanRejected, a separate condition.
 	PlanApprovedCondition = "PlanApproved"
-	// PlanRejectedCondition (PLAN-BETA B3; PLAN.md Phase 4) is the
-	// user-settable rejection signal. The user (via cox reject --reason) sets
-	// it to True with reason Rejected and a message that carries the reason
-	// (the operator parses the reason from the message — a missing/empty
+	// PlanRejectedCondition (PLAN-BETA B3; PLAN.md Phase 4) is the rejection
+	// signal. The operator is the sole writer: it sets it to True with
+	// reason Rejected and a message that carries the reason, consumed from
+	// the user's one-shot coxswain.io/reject annotation (cox reject
+	// --reason writes the annotation — the operator parses the reason from
+	// the annotation — a missing/empty
 	// reason is the operator's decision to treat as Replan with an empty
 	// reason, not a hard fail). The operator's action on it depends on
 	// spec.approval.onReject: Replan re-enters Planning (the operator writes

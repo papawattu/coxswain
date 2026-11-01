@@ -174,8 +174,9 @@ spec:
                   approval is the user's plan-approval settings (PLAN-BETA B3; PLAN.md
                   Phase 4). The operator reads spec.approval.mode to decide whether to
                   hold the phase machine at AwaitingApproval after Planning, and
-                  spec.approval.onReject to decide the action when the user sets
-                  PlanRejected (Replan = re-plan with the reason, Fail = terminal).
+                  spec.approval.onReject to decide the action when the PlanRejected
+                  condition is True (Replan = re-plan with the reason, Fail =
+                  terminal).
                   An empty/zero value reads as Auto (no approval hold).
                 properties:
                   mode:
@@ -191,8 +192,9 @@ spec:
                   onReject:
                     default: Replan
                     description: |-
-                      onReject is the operator's action when the user sets the PlanRejected
-                      condition. Replan (default) re-enters Planning with the rejection
+                      onReject is the operator's action when the PlanRejected condition is
+                      True (the operator sets it from the user's one-shot reject
+                      annotation). Replan (default) re-enters Planning with the rejection
                       reason fed to the next plan; Fail terminates the Loop as
                       Failed:PlanRejected.
                     enum:

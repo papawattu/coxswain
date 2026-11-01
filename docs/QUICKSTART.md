@@ -255,8 +255,8 @@ kubectl cox history <loop>      # the audit trail (phase + verify-failure histor
 kubectl cox logs <loop> --component agent|proxy|verify|deliver  # stream a component's logs (default: agent)
 kubectl cox plan <loop>         # read the plan (.coxswain/PLAN.md) from the workspace
 kubectl cox diff <loop>         # show the plan diff (current vs. last approved plan)
-kubectl cox approve <loop>      # approve the plan (set the PlanApproved condition)
-kubectl cox reject <loop> --reason <reason>  # reject the plan (set the PlanRejected condition)
+kubectl cox approve <loop>      # approve the plan (write the one-shot approve annotation; the operator sets the PlanApproved condition)
+kubectl cox reject <loop> --reason <reason>  # reject the plan (write the one-shot reject annotation; the operator sets the PlanRejected condition)
 kubectl cox pause <loop>        # set spec.suspend=true
 kubectl cox resume <loop>       # clear spec.suspend (set coxswain.io/resume for a Stall/Budget pause)
 kubectl cox redeliver <loop>    # re-trigger delivery for a failed Loop (I52 annotation)
@@ -284,12 +284,13 @@ kubectl cox plan <loop>
 # Show the diff (the current plan vs. the last approved plan, if any).
 kubectl cox diff <loop>
 
-# Approve: sets the PlanApproved condition with the plan's SHA-256.
-# The operator's approval gate sees the condition True and advances the
-# Loop to Implementing.
+# Approve: writes the one-shot approve annotation with the plan's SHA-256.
+# The operator consumes the annotation, sets the PlanApproved condition
+# itself, and its approval gate advances the Loop to Implementing.
 kubectl cox approve <loop>
 
-# Reject: sets the PlanRejected condition with a reason. The operator's
+# Reject: writes the one-shot reject annotation with a reason. The operator
+# consumes the annotation, sets the PlanRejected condition itself, and its
 # approval gate applies the onReject action (Replan: re-enter Planning
 # with the reason; Fail: terminal). The reason is shown to the agent on
 # the next Planning pass.

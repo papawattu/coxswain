@@ -38,7 +38,7 @@ An optional sidecar that produces a pass/fail verdict after deterministic verify
 _Avoid_: reviewer, evaluator, critic, LLM judge
 
 **Plan**:
-The runner's written proposal for what it will do, at `/workspace/.coxswain/PLAN.md`. A ≤4KB summary lives in `status.plan.summary`. With `spec.approval.mode: Manual`, the Loop stops at `AwaitingApproval` until a human sets `PlanApproved` carrying the SHA-256 of PLAN.md. If PLAN.md changes after approval, the condition clears and the Loop re-enters `AwaitingApproval`. Rejection feeds the reason into the next plan prompt (configurable: `Replan` or `Fail`).
+The runner's written proposal for what it will do, at `/workspace/.coxswain/PLAN.md`. A ≤4KB summary lives in `status.plan.summary`. With `spec.approval.mode: Manual`, the Loop stops at `AwaitingApproval` until a human runs `cox approve`, which writes the one-shot `coxswain.io/approve` annotation, and the operator sets `PlanApproved` carrying the SHA-256 of PLAN.md. If PLAN.md changes after approval, the condition clears and the Loop re-enters `AwaitingApproval`. Rejection feeds the reason into the next plan prompt (configurable: `Replan` or `Fail`).
 _Avoid_: proposal, design, spec
 
 **Version target**:

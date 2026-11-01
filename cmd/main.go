@@ -254,6 +254,34 @@ func main() {
 		"The image the egress proxy sidecar pods run (one per Loop with network allows, I42b). "+
 			"Default: empty (the reconciler's coxswain-egress-proxy:standin dev stand-in; the release's "+
 			"ghcr.io/<owner>/coxswain-egress-proxy image may be kind-loaded / pre-pulled and passed here).")
+	// C2 + D101 (Phase 6): the Loop node-placement flags. Empty (the default)
+	// means no placement — today's behaviour. A malformed token is a STARTUP
+	// error naming the bad token (parsed in loop_placement_flag.go; the
+	// malformed-token contract is pinned by cmd/loop_placement_flag_test.go).
+	var loopNodeSelector string
+	flag.StringVar(&loopNodeSelector, "loop-node-selector", "",
+		"Comma-separated key=value node labels every operator-owned Loop workload (sandbox, "+
+			"proxy pods, verify/deliver/memory-writer Jobs) is pinned to (C2/D101). "+
+			"Default: empty (no placement). A malformed token fails startup with the token named.")
+	var loopTolerations string
+	flag.StringVar(&loopTolerations, "loop-tolerations", "",
+		"Comma-separated node tolerations for every operator-owned Loop workload (C2/D101). "+
+			"Forms: key:effect | key:value:effect | key:value:op:effect | key:value:op:effect:seconds " +
+			"(op: Equal, Exists, NotEqual). Default: empty (no tolerations). A malformed token fails " +
+			"startup with the token named.")
+	// C2: the parse runs at STARTUP (before the manager is built) so a bad
+	// token names itself in the log and the operator does not start with a
+	// silently different placement.
+	loopNodeSelectorMap, err := parseLoopNodeSelector(loopNodeSelector)
+	if err != nil {
+		setupLog.Error(err, "Invalid --loop-node-selector")
+		os.Exit(1)
+	}
+	loopTolerationsList, err := parseLoopTolerations(loopTolerations)
+	if err != nil {
+		setupLog.Error(err, "Invalid --loop-tolerations")
+		os.Exit(1)
+	}
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{

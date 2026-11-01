@@ -12,10 +12,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-// TestApproveLoop_SetsPlanApprovedCondition verifies that approveLoop reads the
-// plan from the workspace, computes its SHA-256, and sets the PlanApproved
-// condition (True, message "Approved: <hash>") on the Loop's status.
-func TestApproveLoop_SetsPlanApprovedCondition(t *testing.T) {
+// TestApproveLoop_SetsApprovalAnnotation verifies D85: approveLoop reads the
+// plan from the workspace, computes its SHA-256, and patches the Loop
+// object's metadata with the one-shot annotation coxswain.io/approve:
+// <hash> on the MAIN resource (no request to the /status subresource — the
+// operator is now the sole writer of the PlanApproved condition).
+func TestApproveLoop_SetsApprovalAnnotation(t *testing.T) {
 	const plan = "step one\nstep two\n"
 	const loopName = "approve-me"
 
@@ -29,165 +31,32 @@ func TestApproveLoop_SetsPlanApprovedCondition(t *testing.T) {
 	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
 		t.Fatalf("approveLoop: %v", err)
 	}
-	// The PlanApproved condition must be present (True, the hash in the message).
-	// F87: the command does Get then a status merge patch — NOT a whole-object
-	// Update (which wrote every status field the CLI had read back).
-	body := assertStatusConditionPatch(t, f)
-	assertPatchHasNoOtherStatus(t, body)
-	conds := patchConditions(t, body)
-	var foundCond bool
-	for _, c := range conds {
-		cm, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if cm["type"] == "PlanApproved" {
-			foundCond = true
-			if cm["status"] != "True" {
-				t.Errorf("PlanApproved.status = %v, want True", cm["status"])
-			}
-			wantHash := planSHA256([]byte(plan))
-			msg, _ := cm["message"].(string)
-			if !strings.Contains(msg, wantHash) {
-				t.Errorf("PlanApproved.message = %q, want to contain hash %q", msg, wantHash)
-			}
-		}
-	}
-	if !foundCond {
-		t.Error("PlanApproved condition not found after approve")
+	// D85: the command issues ONE merge patch on the MAIN resource (no
+	// /status write, no whole-object PUT).
+	body := assertApprovalPatch(t, f)
+	wantHash := planSHA256([]byte(plan))
+	if got := d85Annotation(t, body, approveAnnotationKey); got != wantHash {
+		t.Errorf("approve annotation = %q, want the plan's SHA-256 %q", got, wantHash)
 	}
 	if !strings.Contains(out.String(), "Approved the plan") {
 		t.Errorf("output = %q, want to contain 'Approved the plan'", out.String())
 	}
 }
 
-// TestApproveLoop_PatchCarriesResourceVersion verifies the status patch keeps
-// the live metadata.resourceVersion, so a racing operator write is a 409
-// Conflict rather than a silent overwrite (the whole-object PUT carried it for
-// the same reason; F87 must not drop it).
-func TestApproveLoop_PatchCarriesResourceVersion(t *testing.T) {
-	const loopName = "approve-rv"
-	loop := newFakeLoop(loopName, map[string]any{})
-	loop.SetResourceVersion("4242")
-	f := newFakeLoopClient()
-	f.setLoop(loop)
-	dc := Deps{
-		Loops:     f,
-		Workspace: &fakeWorkspace{plan: "a plan\n"},
-	}
-	var out bytes.Buffer
-	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
-		t.Fatalf("approveLoop: %v", err)
-	}
-	body := assertStatusConditionPatch(t, f)
-	meta, ok := body["metadata"].(map[string]any)
-	if !ok {
-		t.Fatalf("the status patch carries no metadata (the resourceVersion precondition): %v", body)
-	}
-	if got := meta["resourceVersion"]; got != "4242" {
-		t.Errorf("patch metadata.resourceVersion = %v, want \"4242\" (optimistic concurrency)", got)
-	}
-}
-
-// TestRejectLoop_PatchCarriesResourceVersion is the reject counterpart.
-func TestRejectLoop_PatchCarriesResourceVersion(t *testing.T) {
-	const loopName = "reject-rv"
-	loop := newFakeLoop(loopName, map[string]any{})
-	loop.SetResourceVersion("777")
-	f := newFakeLoopClient()
-	f.setLoop(loop)
-	dc := Deps{Loops: f}
-	var out bytes.Buffer
-	if err := rejectLoop(context.Background(), dc, loopName, "wrong direction", &out); err != nil {
-		t.Fatalf("rejectLoop: %v", err)
-	}
-	body := assertStatusConditionPatch(t, f)
-	meta, ok := body["metadata"].(map[string]any)
-	if !ok {
-		t.Fatalf("the status patch carries no metadata (the resourceVersion precondition): %v", body)
-	}
-	if got := meta["resourceVersion"]; got != "777" {
-		t.Errorf("patch metadata.resourceVersion = %v, want \"777\" (optimistic concurrency)", got)
-	}
-}
-
-// TestApproveLoop_ReplaceOnReapprove verifies that a re-approval (a plan change
-// after a prior approval) REPLACES the prior PlanApproved condition in place
-// (no duplicate condition is appended).
-func TestApproveLoop_ReplaceOnReapprove(t *testing.T) {
-	const loopName = "reapprove"
-	// A prior approval (the operator or a prior cox approve set the condition).
-	priorCond := map[string]any{
-		"type":    "PlanApproved",
-		"status":  "True",
-		"reason":  "Approved",
-		"message": "Approved: deadbeef",
-	}
-	f := newFakeLoopClient()
-	f.setLoop(newFakeLoop(loopName, map[string]any{
-		"conditions": []any{priorCond},
-	}))
-	dc := Deps{
-		Loops:     f,
-		Workspace: &fakeWorkspace{plan: "a different plan\n"},
-	}
-	var out bytes.Buffer
-	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
-		t.Fatalf("approveLoop (re-approve): %v", err)
-	}
-	body := assertStatusConditionPatch(t, f)
-	conds := patchConditions(t, body)
-	count := 0
-	for _, c := range conds {
-		cm, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if cm["type"] == "PlanApproved" {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Errorf("PlanApproved condition count = %d, want 1 (the re-approval replaced the prior condition)", count)
-	}
-}
-
-// TestRejectLoop_SetsPlanRejectedCondition verifies that rejectLoop sets the
-// PlanRejected condition (True, message "Rejected: <reason>") on the Loop's
-// status.
-func TestRejectLoop_SetsPlanRejectedCondition(t *testing.T) {
+// TestRejectLoop_SetsRejectAnnotation verifies D85: rejectLoop patches the
+// Loop object's metadata with the one-shot annotation coxswain.io/reject:
+// <reason> on the MAIN resource (no request to the /status subresource).
+func TestRejectLoop_SetsRejectAnnotation(t *testing.T) {
 	const loopName = "reject-me"
 	f := newFakeLoopClient()
 	f.setLoop(newFakeLoop(loopName, map[string]any{}))
-	dc := Deps{
-		Loops: f,
-	}
 	var out bytes.Buffer
-	if err := rejectLoop(context.Background(), dc, loopName, "the plan misses the edge case", &out); err != nil {
+	if err := rejectLoop(context.Background(), Deps{Loops: f}, loopName, "the plan misses the edge case", &out); err != nil {
 		t.Fatalf("rejectLoop: %v", err)
 	}
-	body := assertStatusConditionPatch(t, f)
-	assertPatchHasNoOtherStatus(t, body)
-	conds := patchConditions(t, body)
-	var foundCond bool
-	for _, c := range conds {
-		cm, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if cm["type"] == "PlanRejected" {
-			foundCond = true
-			if cm["status"] != "True" {
-				t.Errorf("PlanRejected.status = %v, want True", cm["status"])
-			}
-			msg, _ := cm["message"].(string)
-			if !strings.Contains(msg, "the plan misses the edge case") {
-				t.Errorf("PlanRejected.message = %q, want to contain the reason", msg)
-			}
-		}
-	}
-	if !foundCond {
-		t.Error("PlanRejected condition not found after reject")
+	body := assertApprovalPatch(t, f)
+	if got := d85Annotation(t, body, rejectAnnotationKey); got != "the plan misses the edge case" {
+		t.Errorf("reject annotation = %q, want the reason", got)
 	}
 	if !strings.Contains(out.String(), "Rejected the plan") {
 		t.Errorf("output = %q, want to contain 'Rejected the plan'", out.String())
@@ -280,65 +149,31 @@ func TestDiffLoop_PlanChanged(t *testing.T) {
 	}
 }
 
-// --- F87(d): approve/reject write a status merge patch, not a whole-object PUT ---
+// --- D85: approve/reject write ONE metadata merge patch on the MAIN
+// resource (a one-shot annotation), and never touch the /status subresource
+// (the operator is the sole writer of the approval conditions) ---
 
-// assertStatusConditionPatch asserts the command wrote its condition with ONE
-// JSON merge patch to the status subresource, and returns the patch's decoded
-// body. It fails when a whole-object Update was also (or instead) issued: the
-// pre-F87 path read the whole object, edited status.conditions and PUT the
-// object back to /status, writing every other status field with it.
-func assertStatusConditionPatch(t *testing.T, f *fakeLoopClient) map[string]any {
+// assertApprovalPatch asserts the command's write shape (D85): NO
+// whole-object Update, exactly one Patch, on the MAIN resource (subresource
+// "" — a JSON merge patch of metadata.annotations; NOT the /status
+// subresource), and returns the patch's decoded body.
+func assertApprovalPatch(t *testing.T, f *fakeLoopClient) map[string]any {
 	t.Helper()
 	if len(f.updates) != 0 {
-		t.Fatalf("%d whole-object Update(s) recorded; F87: approve/reject must not PUT the whole object back to /status", len(f.updates))
+		t.Fatalf("%d whole-object Update(s) recorded; D85: approve/reject must not PUT the whole object", len(f.updates))
 	}
 	if len(f.patches) != 1 {
-		t.Fatalf("%d Patch call(s) recorded, want exactly 1 (one status merge patch)", len(f.patches))
+		t.Fatalf("%d Patch call(s) recorded, want exactly 1 (one metadata merge patch on the main resource)", len(f.patches))
 	}
 	p := f.patches[0]
-	if p.subresource != "status" {
-		t.Fatalf("patch subresource = %q, want \"status\" (the conditions live on the status subresource)", p.subresource)
+	if p.subresource != "" {
+		t.Fatalf("patch subresource = %q, want \"\" (the main resource — D85: no request to the /status subresource)", p.subresource)
 	}
 	var body map[string]any
 	if err := json.Unmarshal(p.patch, &body); err != nil {
 		t.Fatalf("patch body is not JSON: %v (body %q)", err, p.patch)
 	}
 	return body
-}
-
-// patchConditions returns the status.conditions list of a status patch body.
-func patchConditions(t *testing.T, body map[string]any) []any {
-	t.Helper()
-	status, ok := body["status"].(map[string]any)
-	if !ok {
-		t.Fatalf("patch body has no status object: %v", body)
-	}
-	conds, ok := status["conditions"].([]any)
-	if !ok {
-		t.Fatalf("patch body has no status.conditions list: %v", status)
-	}
-	return conds
-}
-
-// assertPatchHasNoOtherStatus asserts the patch carries ONLY status.conditions
-// (plus, when the object has one, the metadata.resourceVersion precondition): no
-// spec section and no other status field. That is the property the
-// whole-object PUT violated — it wrote back the phase, checkpoints, budget,
-// verify and agent the CLI had just read.
-func assertPatchHasNoOtherStatus(t *testing.T, body map[string]any) {
-	t.Helper()
-	if _, ok := body["spec"]; ok {
-		t.Error("the patch carries a spec section; approve/reject must write status.conditions only")
-	}
-	status, ok := body["status"].(map[string]any)
-	if !ok {
-		t.Fatalf("patch body has no status object: %v", body)
-	}
-	for _, k := range []string{"phase", "checkpoints", "checkpoint", "budget", "verify", "agent"} {
-		if _, ok := status[k]; ok {
-			t.Errorf("the status patch carries status.%s; approve/reject must write status.conditions only", k)
-		}
-	}
 }
 
 // assertNoStatusWrite asserts the command wrote NOTHING (no patch, no update).
@@ -457,22 +292,15 @@ func TestApproveLoop_HashIsExactPlanBytes(t *testing.T) {
 	if err := approveLoop(context.Background(), dc, "ns", loopName, &out); err != nil {
 		t.Fatalf("approveLoop: %v", err)
 	}
-	body := assertStatusConditionPatch(t, f)
-	conds := patchConditions(t, body)
-	var msg string
-	for _, c := range conds {
-		cm, _ := c.(map[string]any)
-		if cm["type"] == "PlanApproved" {
-			msg, _ = cm["message"].(string)
-		}
-	}
+	body := assertApprovalPatch(t, f)
+	got := d85Annotation(t, body, approveAnnotationKey)
 	wantExact := planSHA256([]byte(plan)) // the raw bytes, newline included
-	if !strings.Contains(msg, wantExact) {
-		t.Errorf("message = %q, want hash of the exact plan bytes %s", msg, wantExact)
+	if got != wantExact {
+		t.Errorf("approve annotation = %q, want hash of the exact plan bytes %s", got, wantExact)
 	}
 	trimmed := planSHA256([]byte(strings.TrimRight(plan, "\n")))
-	if trimmed != wantExact && strings.Contains(msg, trimmed) {
-		t.Errorf("message = %q, must NOT be the hash of the trimmed plan %s (the newline is content)", msg, trimmed)
+	if trimmed != wantExact && got == trimmed {
+		t.Errorf("approve annotation = %q, must NOT be the hash of the trimmed plan %s (the newline is content)", got, trimmed)
 	}
 }
 

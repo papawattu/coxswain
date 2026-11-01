@@ -7,38 +7,50 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/spf13/cobra"
 )
 
-// planApprovedConditionType is the PlanApproved condition's type string (the
-// goconst for the CLI's approve command — the operator's constant is in a
-// different module, so the CLI defines its own).
-const planApprovedConditionType = "PlanApproved"
-
 // conditionStatusTrue is the condition's status "True" (the goconst for the
-// CLI's approve/reject commands — the operator's constant is in a different
+// read-only condition checks — the operator's constant is in a different
 // module, so the CLI defines its own).
 const conditionStatusTrue = "True"
 
-// planRejectedConditionType is the PlanRejected condition's type string (the
-// goconst for the CLI's reject command — the operator's constant is in a
-// different module, so the CLI defines its own).
-const planRejectedConditionType = "PlanRejected"
+// planApprovedConditionType is the PlanApproved condition's type string (the
+// read-only diff command reads it; the operator's constant is in a different
+// module, so the CLI defines its own). D85: the CLI no longer WRITES the
+// condition (the operator does, from the one-shot annotation) — the diff
+// command's read of the operator-written condition is unchanged.
+const planApprovedConditionType = "PlanApproved"
 
 // statusSubresource is the Loop's status subresource name. The same string is
-// the object's top-level status field, so it is also the key in the merge patch
-// body and the path element the approval commands read conditions through. The
-// read-only getNested*(u, "status", …) callers in internal/cli (describe.go,
-// history.go, pause.go, redeliver.go) keep the literal: there the argument is a
-// field path into a rendering helper, not the subresource this package writes.
-// The CLI writes the approval conditions to this subresource (F87(d): a JSON
-// merge patch of status.conditions).
+// the object's top-level status field, so it is also the key in a merge patch
+// body and the path element the approval commands read conditions through.
+// The read-only getNested*(u, "status", …) callers in internal/cli
+// (describe.go, history.go, pause.go, redeliver.go) keep the literal: there
+// the argument is a field path into a rendering helper, not the subresource
+// this package writes. D85 (owner decision, R34): the CLI NO LONGER writes
+// this subresource — approve/reject patch the Loop object's metadata with a
+// one-shot annotation on the MAIN resource, and the operator (the sole
+// writer of the approval conditions) turns the annotation into the
+// condition. The constant survives because client.go's Update (the
+// `fork`-proof whole-object status PUT) still targets it.
 const statusSubresource = "status"
+
+// D85: the one-shot approval annotations the CLI writes to the Loop object's
+// metadata (a JSON merge patch on the MAIN resource — the editor role's
+// existing `patch` on `loops` authorises it, and its `loops/status` grant
+// went back to get-only). The operator consumes each exactly once: it turns
+// the annotation into the PlanApproved / PlanRejected condition (the same
+// message format the CLI wrote before D85, so the operator's hash/reason
+// parsing keeps working) and removes the annotation (a stale or out-of-hold
+// annotation is still removed, with an Event).
+const (
+	approveAnnotationKey = "coxswain.io/approve"
+	rejectAnnotationKey  = "coxswain.io/reject"
+)
 
 // conditionStatusField is a condition object's own status field name ("True" /
 // "False") — a different field that happens to share the name of the Loop's
@@ -62,10 +74,15 @@ func newApproveCommand() *cobra.Command {
 	}
 }
 
-// approveLoop is the approve command's core action. It reads the plan from the
-// workspace (the existing plan reader), computes its SHA-256, and sets the
-// PlanApproved condition (True, message "Approved: <hash>") on the Loop's
-// status subresource. The operator's approval gate then advances the Loop.
+// approveLoop is the approve command's core action. It reads the plan from
+// the workspace (the existing plan reader), computes its SHA-256, and patches
+// the Loop object's METADATA with the one-shot annotation
+// coxswain.io/approve: <hash> on the MAIN resource (D85). The operator's
+// approval gate then consumes the annotation while the Loop is held for
+// approval: it sets the PlanApproved condition itself (message
+// "Approved: <hash>" — the same format approvedPlanHash parses) and removes
+// the annotation. The operator is now the ONLY writer of the condition (the
+// editor role's loops/status grant went back to get-only).
 func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) error {
 	// Read the plan from the workspace (the existing plan reader). If the plan
 	// is absent (a fresh Loop that has not reached Planning, or a Loop whose
@@ -87,78 +104,23 @@ func approveLoop(ctx context.Context, dc Deps, ns, name string, out io.Writer) e
 		return fmt.Errorf("no plan to approve: %s is missing or empty in the workspace of loop %q (wait for the Planning phase to write it)", planPath, name)
 	}
 	hash := planSHA256([]byte(plan))
-	// Build the condition (the user is the sole writer of PlanApproved). The
-	// message carries the hash (the operator parses it from the message; the
-	// condition's status is True, the reason is Approved).
-	cond := map[string]any{
-		"type":               planApprovedConditionType,
-		conditionStatusField: conditionStatusTrue,
-		"reason":             "Approved",
-		"message":            "Approved: " + hash,
-		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
-	}
-	// Patch the status subresource (the condition is on the status, not the
-	// main resource) with the full conditions list: a JSON merge patch replaces
-	// arrays wholesale, so conds carries every condition the CLI read plus the
-	// new PlanApproved. The dynamic client's Patch passes the subresource
-	// through to the API (F87) — a merge patch of status.conditions is the
-	// write, where the pre-F87 path read the whole object, edited it and PUT it
-	// back to /status (writing every other status field with it).
-	// The operator's applyApprovalGate then reads the condition on the next
-	// reconcile and advances the Loop.
-	obj, err := dc.Loops.Get(ctx, name)
-	if err != nil {
-		return fmt.Errorf("get loop %q: %w", name, err)
-	}
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return fmt.Errorf("cli: expected *unstructured.Unstructured, got %T", obj)
-	}
-	// Ensure status.conditions exists (a fresh Loop may not have the status
-	// subresource populated yet — the operator creates it on the first
-	// reconcile; the CLI must not assume it exists).
-	conds, found, _ := unstructured.NestedSlice(u.Object, statusSubresource, "conditions")
-	if !found {
-		conds = []any{}
-	}
-	// Replace (or insert) the PlanApproved condition. A single condition of
-	// this type is the contract (the user approves one plan at a time; a
-	// re-approval after a plan change REPLACES the prior condition). A found
-	// marker avoids the "append only when absent" bug: if the loop already has
-	// a PlanApproved condition (the user re-approves after a plan change), the
-	// condition is REPLACED in place, not appended (a duplicate condition
-	// would break the operator's read — the operator takes the first match).
-	replaced := false
-	for i, c := range conds {
-		cm, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if cm["type"] == planApprovedConditionType {
-			conds[i] = cond
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		conds = append(conds, cond)
-	}
-	// Patch the status subresource with the FULL conditions list (F87): a JSON
-	// merge patch replaces arrays wholesale, so conds is the list the CLI just
-	// read, with this command's one condition replaced/appended. The
-	// whole-object Update this replaced wrote back every status field the CLI
-	// had read (phase, checkpoints, budget, verify, agent) — a read-modify-write
-	// of the entire status for a one-condition change. The live
-	// metadata.resourceVersion stays in the patch, so a racing operator write is
-	// a 409 (Conflict) rather than a silent overwrite.
+	// D85: the write is a JSON merge patch of metadata.annotations on the MAIN
+	// resource (a one-shot annotation the operator consumes and removes) — NOT
+	// a patch of the /status subresource (the F87 write the editor role
+	// authorising was the defect: it let an editor-bound user write every
+	// status field the operator acts on). A merge patch ADDS/REPLACES the
+	// annotation key without touching the rest of the object (and an
+	// annotation the user re-sends simply re-triggers the operator's consume —
+	// the level-based decision), so no optimistic-concurrency metadata rides
+	// the patch (a racing operator write is not a 409 here: the annotation's
+	// value is a hash, and the operator's consume is idempotent).
 	patch := map[string]any{
-		statusSubresource: map[string]any{"conditions": conds},
+		"metadata": map[string]any{
+			"annotations": map[string]any{approveAnnotationKey: hash},
+		},
 	}
-	if rv := u.GetResourceVersion(); rv != "" {
-		patch["metadata"] = map[string]any{"resourceVersion": rv}
-	}
-	if err := dc.Loops.Patch(ctx, name, statusSubresource, mustJSON(patch)); err != nil {
-		return fmt.Errorf("patch loop %q status (set PlanApproved): %w", name, err)
+	if err := dc.Loops.Patch(ctx, name, "", mustJSON(patch)); err != nil {
+		return fmt.Errorf("patch loop %q (set the %s approval annotation): %w", name, approveAnnotationKey, err)
 	}
 	_, _ = fmt.Fprintf(out, "Approved the plan for loop %q (SHA-256 %s)\n", name, hash)
 	return nil
@@ -175,15 +137,16 @@ func planSHA256(plan []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-// newRejectCommand builds `cox reject <loop> --reason <reason>`: set the
-// PlanRejected condition on the Loop (the B3 plan approval gate). The CLI sets
-// the condition's message to "Rejected: <reason>". The operator's approval
-// gate sees the condition True and applies the onReject action (Replan:
-// re-enter Planning with the reason; Fail: terminal).
+// newRejectCommand builds `cox reject <loop> --reason <reason>`: patch the
+// Loop object's metadata with the one-shot annotation
+// coxswain.io/reject: <reason> (D85). The operator's approval gate consumes
+// the annotation while the Loop is held for approval: it sets the PlanRejected
+// condition (message "Rejected: <reason>") itself and applies the onReject
+// action (Replan: re-enter Planning with the reason; Fail: terminal).
 func newRejectCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "reject <loop>",
-		Short: "Reject the Loop's plan (set the PlanRejected condition with a reason)",
+		Short: "Reject the Loop's plan (patch the one-shot reject annotation; the operator sets the PlanRejected condition)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			reason := cmd.Flag("reason").Value.String()
@@ -197,64 +160,21 @@ func newRejectCommand() *cobra.Command {
 	return cmd
 }
 
-// rejectLoop is the reject command's core action. It sets the PlanRejected
-// condition (True, message "Rejected: <reason>") on the Loop's status
-// subresource. The operator's approval gate then applies the onReject action
-// (Replan: re-enter Planning with the reason; Fail: terminal).
+// rejectLoop is the reject command's core action. D85: it patches the Loop
+// object's METADATA with the one-shot annotation coxswain.io/reject:
+// <reason> on the MAIN resource (the same write shape as approveLoop). The
+// operator's approval gate consumes the annotation, sets the PlanRejected
+// condition itself and applies the onReject action (Replan: re-enter Planning
+// with the reason; Fail: terminal). No request to the /status subresource:
+// the operator is the sole writer of the condition.
 func rejectLoop(ctx context.Context, dc Deps, name, reason string, out io.Writer) error {
-	// Build the condition (the user is the sole writer of PlanRejected). The
-	// message carries the reason (the operator reads it from the message; the
-	// condition's status is True, the reason is Rejected).
-	cond := map[string]any{
-		"type":               planRejectedConditionType,
-		conditionStatusField: conditionStatusTrue,
-		"reason":             "Rejected",
-		"message":            "Rejected: " + reason,
-		"lastTransitionTime": metav1.Now().Format(time.RFC3339),
-	}
-	// Read the whole object, add the condition to status.conditions, and patch
-	// the status subresource (the same write as approveLoop — see the comment
-	// there and in client.go).
-	obj, err := dc.Loops.Get(ctx, name)
-	if err != nil {
-		return fmt.Errorf("get loop %q: %w", name, err)
-	}
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return fmt.Errorf("cli: expected *unstructured.Unstructured, got %T", obj)
-	}
-	conds, found, _ := unstructured.NestedSlice(u.Object, statusSubresource, "conditions")
-	if !found {
-		conds = []any{}
-	}
-	// Replace (or insert) the PlanRejected condition (the same single-condition
-	// contract as PlanApproved).
-	replaced := false
-	for i, c := range conds {
-		cm, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if cm["type"] == planRejectedConditionType {
-			conds[i] = cond
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		conds = append(conds, cond)
-	}
-	// Patch the status subresource with the full conditions list (the same
-	// write as approveLoop: a status merge patch, F87), keeping the live
-	// metadata.resourceVersion for optimistic concurrency.
 	patch := map[string]any{
-		statusSubresource: map[string]any{"conditions": conds},
+		"metadata": map[string]any{
+			"annotations": map[string]any{rejectAnnotationKey: reason},
+		},
 	}
-	if rv := u.GetResourceVersion(); rv != "" {
-		patch["metadata"] = map[string]any{"resourceVersion": rv}
-	}
-	if err := dc.Loops.Patch(ctx, name, statusSubresource, mustJSON(patch)); err != nil {
-		return fmt.Errorf("patch loop %q status (set PlanRejected): %w", name, err)
+	if err := dc.Loops.Patch(ctx, name, "", mustJSON(patch)); err != nil {
+		return fmt.Errorf("patch loop %q (set the %s annotation): %w", name, rejectAnnotationKey, err)
 	}
 	_, _ = fmt.Fprintf(out, "Rejected the plan for loop %q: %s\n", name, reason)
 	return nil

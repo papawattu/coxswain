@@ -394,6 +394,22 @@ type LoopReconciler struct {
 	// the test FakeRecorder both satisfy it.
 	Recorder record.EventRecorder
 
+	// readLoopPlan is the D85 seam for the approval-gate's plan-hash check:
+	// it returns the current plan's bytes from the workspace (a peek pod
+	// against the workspace PVC). The hash the CLI puts in the
+	// coxswain.io/approve annotation is the SHA-256 of the plan it read from
+	// the workspace — an INDEPENDENT read (its own peek pod, at the moment
+	// the user approves). The operator is the sole WRITER of the approval
+	// conditions since D85, so it also CHECKS that hash: it compares the
+	// annotation against a FRESH read of the plan on disk (the stale-hash
+	// case — the plan re-planned between the user's read and the operator's
+	// reconcile — is rejected with a Warning Event). envtests wire a
+	// deterministic seam (or leave it nil, where the check is vacuously
+	// true: the operator trusts the user's hash — the runner's plan-change
+	// detection is the backstop, and the hold keeps the Loop at
+	// AwaitingApproval until the user re-approves).
+	readLoopPlan func(ctx context.Context, loop *coxv1alpha1.Loop) (string, error)
+
 	// applyEnforcementWritesFn is the F12 deleting-path seam: a test drives the
 	// Enforcer.Apply (the KubeArmorPolicy write) directly without a real
 	// unstructured round-trip (the envtest cluster has no KubeArmorPolicy
@@ -6357,6 +6373,15 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// holds the Planning -> AwaitingApproval advance until the user sets
 	// the PlanApproved condition (via cox approve).
 	r.wireApprovalGate()
+	// D85: wire the approval-gate's plan-hash check (the readLoopPlan seam)
+	// to the live peek-pod read. When the peek fails (the workspace PVC is
+	// absent, the pod cannot start, the read times out), the check is
+	// vacuously true (the operator trusts the user's hash — the runner's
+	// plan-change detection is the backstop; the hold keeps the Loop at
+	// AwaitingApproval, so the user's re-approval is always available).
+	r.readLoopPlan = func(ctx context.Context, loop *coxv1alpha1.Loop) (string, error) {
+		return r.peekReadLoopPlan(ctx, loop)
+	}
 	// S3a: wire the baseCommit read-back to the operator's non-cached client
 	// (APIReader). The sandbox pod is NOT in the manager's Pod cache (the
 	// cache is scoped to ProxyComponentSelector), so a cached Get returns

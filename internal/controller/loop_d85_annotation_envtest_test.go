@@ -51,11 +51,35 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
+
+// d85EventSink is the broadcaster's EventSink (it posts the Event to the
+// envtest cluster via k8sClient.Create — the broadcaster's default sink
+// writes to a file, which the specs cannot see).
+type d85EventSink struct {
+	client client.Client
+}
+
+func (s d85EventSink) Create(e *corev1.Event) (*corev1.Event, error) {
+	out := &corev1.Event{}
+	err := s.client.Create(context.Background(), e)
+	return out, err
+}
+
+func (s d85EventSink) Update(e *corev1.Event) (*corev1.Event, error) {
+	out := &corev1.Event{}
+	err := s.client.Update(context.Background(), e)
+	return out, err
+}
+
+func (s d85EventSink) Patch(e *corev1.Event, data []byte) (*corev1.Event, error) {
+	return e, nil
+}
 
 var _ = Describe("D85 plan-approval annotation", func() {
 	ctx := context.Background()
@@ -72,11 +96,17 @@ var _ = Describe("D85 plan-approval annotation", func() {
 
 	// d85Reconciler builds the reconciler the specs drive (the same setup as
 	// the B3 suite: a plain client, a readPhaseClaim seam that serves
-	// "agent still running", the approval gate wired).
+	// "agent still running", the approval gate wired). A REAL event recorder
+	// is wired (the broadcaster posts Kubernetes Events to the envtest
+	// cluster; the specs assert on the live Events via k8sClient.List — the
+	// FakeRecorder's channel would be invisible to the API).
 	d85Reconciler := func() *LoopReconciler {
+		broadcaster := record.NewBroadcaster()
+		broadcaster.StartRecordingToSink(d85EventSink{client: k8sClient})
 		r := &LoopReconciler{CNIProber: testCNIProber(),
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: broadcaster.NewRecorder(k8sClient.Scheme(), corev1.EventSource{Component: "d85-spec"}),
 		}
 		r.wireApprovalGate()
 		r.readPhaseClaim = func(_ context.Context, _ *coxv1alpha1.Loop) (*PhaseClaim, error) {
@@ -90,6 +120,20 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		Expect(err).NotTo(HaveOccurred())
 	}
 
+	// d85ReconcilerSeam is the same as d85Reconciler but with a
+	// readLoopPlan seam that returns the given plan bytes (the stale-hash
+	// spec wires it to return the CURRENT plan, so the operator's fresh
+	// read hashes to a different value than the user's annotation — which
+	// was computed from the plan the user approved BEFORE the re-plan — and
+	// the approve is rejected with a Warning Event).
+	d85ReconcilerSeam := func(currentPlan string) *LoopReconciler {
+		r := d85Reconciler()
+		r.readLoopPlan = func(_ context.Context, _ *coxv1alpha1.Loop) (string, error) {
+			return currentPlan, nil
+		}
+		return r
+	}
+
 	// d85Loop creates a Manual-mode Loop (the S4 bootstrap primes it) and
 	// moves it to the given phase with a Status().Update (the same
 	// phase-forcing the B3 suite uses for its hold specs).
@@ -98,7 +142,7 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		r := d85Reconciler()
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace(),
+			Spec: coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace(),
 				Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual}},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
@@ -110,6 +154,29 @@ var _ = Describe("D85 plan-approval annotation", func() {
 			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		}
 		return nn, r
+	}
+
+	// d85LoopNoReconcile is the same as d85Loop but WITHOUT the bootstrap
+	// reconcile (the stale-hash spec uses it so the SPEC's reconciler — with
+	// its readLoopPlan seam — is the one that consumes the annotation and
+	// runs the gate; the bootstrap reconcile would consume the annotation
+	// with a nil readLoopPlan, which trusts the user's hash and would set
+	// PlanApproved, defeating the stale-hash test).
+	d85LoopNoReconcile := func(ns, name string, phase coxv1alpha1.LoopPhase) types.NamespacedName {
+		nn := types.NamespacedName{Name: name, Namespace: ns}
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace(),
+				Approval: &coxv1alpha1.Approval{Mode: coxv1alpha1.ApprovalModeManual}},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		if phase != "" {
+			Expect(k8sClient.Get(ctx, nn, loop)).To(Succeed())
+			loop.Status.Phase = phase
+			loop.Status.DesiredPhase = phase
+			Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+		}
+		return nn
 	}
 
 	// annotate patches the Loop's metadata with the given annotations
@@ -208,8 +275,13 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		// (the CURRENT plan at the hold is a different one — the annotation's
 		// hash does not match it, so the approval is stale). The hash match is
 		// the test's seam: the spec asserts on the STALE hash's effect, not on
-		// a live workspace read.
-		nn, r := d85Loop(ns, "d85-stale", coxv1alpha1.LoopPhaseAwaitingApproval)
+		// a live workspace read (the d85ReconcilerSeam below wires the
+		// operator's readLoopPlan to return the CURRENT plan, so the
+		// operator's fresh read hashes to a different value than the
+		// annotation's — the exact stale-hash condition).
+		currentPlan := "plan-v2 (re-planned)\n"
+		nn := d85LoopNoReconcile(ns, "d85-stale", coxv1alpha1.LoopPhaseAwaitingApproval)
+		r := d85ReconcilerSeam(currentPlan)
 		annotate(nn, map[string]string{approveAnnotation: staleHash})
 		reconcileLoop(r, ns, "d85-stale")
 
@@ -369,4 +441,3 @@ var _ = Describe("D85 plan-approval annotation", func() {
 		Expect(annotationAbsent(nn, approveAnnotation)).To(BeTrue())
 	})
 })
-

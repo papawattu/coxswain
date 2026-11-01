@@ -85,8 +85,19 @@ const (
 	// the failure output (the 4 KB tail) in the terminationMessage the
 	// operator reads for the stall normaliser — NO pod-log read. It lives on
 	// the /tmp check-tmp emptyDir (writable, the readOnlyRootFilesystem
-	// exception).
+	// exception). The canary init reuses the SAME path (F94b): when the repo
+	// has no tests at the base commit either, the canary exits 0 after writing
+	// the skip marker here, and the operator reads the marker from the
+	// canary's terminationMessage (exit 0 only — a non-zero exit is a defined
+	// canary outcome, not a skip).
 	verifyTerminationLogPath = "/tmp/termination.log"
+	// verifyCanarySkipMarker is the line the canary writes to its
+	// terminationMessage when the repo has no *_test.go at the BASE commit
+	// either (F94b): there is nothing to canary and the exit is 0 (NOT a new
+	// non-zero code — a non-zero init exit fails the pod and the acceptance
+	// checks would never run). The operator reads the marker ONLY when the
+	// canary's exit is 0 (F94, session 2).
+	verifyCanarySkipMarker = "canary-skipped: no-tests-in-repo"
 	// verifyCloneBaseInit is the base-commit clone init container's name.
 	verifyCloneBaseInit = "clone-base"
 	// verifyImportAgentInit is the agent-workspace import init container's name.
@@ -670,12 +681,24 @@ exit 0
 //	43 → a tested package's canary test exited 0 (despite the forced
 //	     t.Fatal), or exited non-zero without the token in its -json output:
 //	     the harness is subverted in that package.
-//	44 → the canary is unavailable: no *_test.go anywhere, or no go binary
-//	     on PATH — the operator records a VerifyCanaryUnavailable event and
-//	     takes no decision.
+//	44 → the canary is unavailable: no go binary on PATH, or every package
+//	     skipped (no go.mod above any package) — the operator records a
+//	     VerifyCanaryUnavailable event and takes no decision (F94c, session
+//	     2, bounds this hold).
 //	45 → some tested package's canary could not even build (a go test -json
 //	     build-fail for THAT package) — the operator treats it as an infra
 //	     failure (bounded retry), never as subversion.
+//	46 → no *_test.go anywhere at HEAD and the BASE commit HAD tests:
+//	     the agent removed every test — terminal (F94a). The 44 hold
+//	     that kept this case is what stops a vacuously-passing `go test`
+//	     after test removal; reading the base commit is the distinction
+//	     (clone-base fetched it, so it is reachable in /verify/.git).
+//	0  (with the skip marker) → no *_test.go at HEAD and none at the base
+//	     either: the repo has nothing to canary. The canary first writes
+//	     "canary-skipped: no-tests-in-repo" to its terminationMessage file
+//	     and exits 0 (a non-zero exit would fail the pod and the acceptance
+//	     checks would never run); the operator reads the marker ONLY when
+//	     the exit is 0 (F94b, session 2).
 func canaryCheckScript() string {
 	return `set -u
 export TMPDIR="/tmp"
@@ -720,10 +743,46 @@ command -v go >/dev/null 2>&1 || { echo "canary: no go toolchain; canary unavail
 DIRLIST="$SCRATCH/.canary-dirs"
 find . -name '*_test.go' -not -path './.git/*' -print0 | sort -z | xargs -0 -n1 dirname 2>/dev/null | tr '\0' '\n' | awk 'NF' | sort -u > "$DIRLIST"
 N=$(awk 'NF' "$DIRLIST" | wc -l)
+
+# F94: when the operator sets BASE_COMMIT + TERMINATION_MESSAGE_PATH/MARKER
+# (always, since F94), the no-*_test.go branch decides by the BASE commit —
+# the checkout holds BOTH the base and the verified commit (clone-base
+# fetched baseCommit; import-agent grafted the verified commit on top), so git
+# ls-tree over the base SHA lists the tree as the base had it. The env is
+# computed LAZILY (only when HEAD has no tests): the F60 execution test drives
+# the pre-F94 shape (no .git in the tree, no env) and its 44 "no tests"
+# branch must keep reading 44 there. With the env missing, the branch falls
+# back to the pre-F94 44 (it cannot tell tests-removed from never-had-tests;
+# a marker file that is never written would mislead the session-2 reader).
 if [ "$N" -eq 0 ]; then
+  if [ -n "${BASE_COMMIT:-}" ] && [ -n "${TERMINATION_MESSAGE_PATH:-}" ] && [ -n "${TERMINATION_MESSAGE_MARKER:-}" ]; then
+    BASE_TESTLIST="$SCRATCH/.canary-base-tests"
+    git -c safe.directory='*' ls-tree -r --name-only "$BASE_COMMIT" 2>/dev/null | grep '_test\.go$' > "$BASE_TESTLIST"
+    # The base commit had tests and HEAD deleted them all: subversion (go
+    # test would pass vacuously) — terminal. The base listing is the
+    # reference, not the HEAD tree (HEAD's empty listing is why we are in
+    # this branch).
+    if [ -s "$BASE_TESTLIST" ]; then
+      echo "canary: no *_test.go at HEAD but the base commit $BASE_COMMIT had tests — tests removed (subversion)"
+      exit 46
+    fi
+    # Never had tests: skip the canary. Exit 0 (NOT a new non-zero code: a
+    # non-zero init exit fails the pod and the acceptance checks would never
+    # run). Write the skip marker to the termination-message file FIRST
+    # (before exit, so the kubelet records it in the canary's
+    # terminationMessage even though the exit is 0); it also lands on
+    # stdout for the pod log.
+    {
+      echo "canary: no *_test.go at HEAD or at the base commit $BASE_COMMIT — nothing to canary; skipping"
+      echo "$TERMINATION_MESSAGE_MARKER"
+    } | tee "$TERMINATION_MESSAGE_PATH"
+    exit 0
+  fi
+  # Pre-F94 fallback (env missing): the no-tests branch stays the old 44.
   echo "canary: no *_test.go anywhere; canary unavailable"
   exit 44
 fi
+
 if [ "$N" -gt "$CAP" ]; then
   echo "canary: capped — $N packages found, testing only the first $CAP (sorted)"
 fi
@@ -919,6 +978,11 @@ const (
 	// operator treats it as an infra failure (bounded retry), never as a
 	// subversion verdict.
 	verifyCanaryBuildErrorExit = 45
+	// verifyCanaryTestsRemovedExit is the canary's exit when HEAD has no
+	// *_test.go but the BASE commit had tests (F94a): the agent removed every
+	// test — subversion (go test would pass vacuously). Terminal; the gate
+	// mapping lands in session 2.
+	verifyCanaryTestsRemovedExit = 46
 )
 
 // tamperCheckScript builds the tamper init's sh script (B2, F39). It diffs
@@ -1200,8 +1264,24 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			Command:         []string{verifySh, "-c", canaryCheckScript()},
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
-			Env:             verifyCheckEnv(),
-			Resources:       verifyCheckResources(loop),
+			// F94: the canary needs the base commit (BASE_COMMIT) to tell
+			// "tests removed" (46) from "never had tests" (skip marker, exit
+			// 0) when HEAD has no *_test.go — the same value the tamper and
+			// artifact scripts receive. TERMINATION_MESSAGE_PATH is the skip
+			// marker's file and TERMINATION_MESSAGE_MARKER the marker line
+			// itself (the operator reads the marker only on exit 0 — session
+			// 2).
+			Env: append(verifyCheckEnv(),
+				corev1.EnvVar{Name: "BASE_COMMIT", Value: baseCommit},
+				corev1.EnvVar{Name: "TERMINATION_MESSAGE_PATH", Value: verifyTerminationLogPath},
+				corev1.EnvVar{Name: "TERMINATION_MESSAGE_MARKER", Value: verifyCanarySkipMarker},
+			),
+			// F94b: the skip marker (exit 0, never-had-tests) has to reach the
+			// operator WITHOUT a pod-log read — the same path as the check
+			// containers' teed termination logs (P2e). It lives on the
+			// canary's own /tmp scratch (check-tmp-canary, agentTmpMount).
+			TerminationMessagePath: verifyTerminationLogPath,
+			Resources:              verifyCheckResources(loop),
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
 				{Name: verifyCanaryTmpVolName, MountPath: agentTmpMount},

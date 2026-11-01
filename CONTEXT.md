@@ -15,8 +15,8 @@ An LLM invocation, run by the operator, that decides whether a lesson is worth w
 _Avoid_: curation, reviewer, filter
 
 **Runner**:
-The in-sandbox daemon that executes phases and talks to a model. Pluggable: Claude API, kagent, Codex. The only component allowed to inspect workspace contents. The operator sets `status.desiredPhase`; the runner does the work and writes `status.observedPhase` plus the result file. Runs continuously for the Loop's life; model context survives across phases within an iteration. If `observedPhase` doesn't advance within `spec.loop.phaseTimeout` (default 30 min), the operator sets `Failed:PhaseTimeout` and restarts the sandbox from the last checkpoint.
-_Avoid_: phase driver, agent, worker, executor, bot
+The in-sandbox one-shot phase driver: one container run per phase. The operator writes the desired phase to `.coxswain/desired-phase` (the phase-init container); the runner executes that phase once, writes result.json plus a strict claim mirrored to `/dev/termination-log`, and exits (`runner/phase.go:1-27`; the ADR-0004 claim channel is `runner/phase.go:15-27`). `status.observedPhase` is the operator's record of that claim (`api/v1alpha1/loop_types.go:966-971`); the runner never writes the field itself. The operator reads the claim, advances `status.phase`, and recreates the sandbox pod for the next phase. Model context: within one iteration the Planning and Implementing runs share the model conversation; the conversation is discarded when the pod is recycled. If no claim arrives within `spec.loop.phaseTimeout` (default 30 min), the operator sets `Failed:PhaseTimeout` and restarts the sandbox from the last checkpoint.
+_Avoid_: worker, executor, bot
 
 **AgentPolicy**:
 A default-deny allowlist of what an agent may do, its own CRD (`AgentPolicy`,
@@ -38,7 +38,7 @@ An optional sidecar that produces a pass/fail verdict after deterministic verify
 _Avoid_: reviewer, evaluator, critic, LLM judge
 
 **Plan**:
-The runner's written proposal for what it will do, at `/workspace/.coxswain/PLAN.md`. A ≤4KB summary lives in `status.plan.summary`. With `spec.approval: Manual`, the Loop stops at `AwaitingApproval` until a human sets `PlanApproved` carrying the SHA-256 of PLAN.md. If PLAN.md changes after approval, the condition clears and the Loop re-enters `AwaitingApproval`. Rejection feeds the reason into the next plan prompt (configurable: `Replan` or `Fail`).
+The runner's written proposal for what it will do, at `/workspace/.coxswain/PLAN.md`. A ≤4KB summary lives in `status.plan.summary`. With `spec.approval.mode: Manual`, the Loop stops at `AwaitingApproval` until a human sets `PlanApproved` carrying the SHA-256 of PLAN.md. If PLAN.md changes after approval, the condition clears and the Loop re-enters `AwaitingApproval`. Rejection feeds the reason into the next plan prompt (configurable: `Replan` or `Fail`).
 _Avoid_: proposal, design, spec
 
 **Version target**:
@@ -46,11 +46,11 @@ Development targets k8s 1.32 (kind stable). Production requires k8s ≥1.37 (age
 _Avoid_: target, stack
 
 **kubectl-cox**:
-A kubectl plugin that talks directly to the CRD (no operator HTTP API). Commands: `approve`, `reject --reason`, `pause`, `resume`, `logs`, `history`, `diff`, `plan`, `describe`, `fork --from iter-N`, `memory <repo-url>`. Every command is a CRD mutation or a `kubectl exec`.
+A kubectl plugin that talks directly to the CRD (no operator HTTP API). Commands: `approve`, `reject --reason`, `pause`, `resume`, `logs`, `history`, `diff`, `plan`, `describe`, `fork --from iter-N`, `memory <repo-url>`, `redeliver`. Every command is a CRD mutation or a `kubectl exec`.
 _Avoid_: CLI, tool, kubectl plugin
 
 **PR**:
-Opened by the runner on Succeeded. Draft by default; `spec.pr.ready: true` overrides. Description includes: goal, iteration count, full `status.history[]`, the plan, and a link to the Loop object. The operator reads `status.prUrl` from the result file and does not watch the PR's fate — Succeeded is terminal.
+Opened by the operator-owned deliver Job on delivery (`internal/controller/loop_deliver_job.go:230` creates the Job; `:1494-1501` posts to `api.github.com`), using the Secret named by `spec.workspace.gitCredentialSecret` in the Loop's namespace (`api/v1alpha1/loop_types.go:215-224`). Draft by default; `spec.delivery.draft: false` opts out (`loop_deliver_job.go:443-448`). Description includes: goal, iteration count, the history, the plan, and a link to the Loop object. The operator records the result in `status.delivery` + the `Delivered` condition; Succeeded is set only after delivery is terminal (`api/v1alpha1/loop_types.go:143-145`). A failed delivery is `Delivered=False reason=DeliveryFailed`, retried via `cox redeliver`.
 _Avoid_: pull request, merge request, branch
 
 **Failure reason**:
@@ -74,7 +74,7 @@ The operator-built input to the runner: goal + iteration number + previous verif
 _Avoid_: instruction, task, input
 
 **Checkpoint**:
-A VolumeSnapshot of the workspace PVC taken after each verify. Named `checkpoint-<loop-name>-iter-<N>`. Retention: last 3 + all milestone (successful verify) checkpoints; older non-milestones are GC'd. The git branch is the recovery mechanism; the checkpoint is the durability mechanism. Checkpointing is mandatory — if the StorageClass doesn't support snapshots, the Loop fails at start with `CheckpointUnavailable`.
+A VolumeSnapshot of the workspace PVC taken after each successful verify. Named `checkpoint-<loop-name>-iter-<N>`. Retention: last 3 + all milestone (successful verify) checkpoints; older non-milestones are GC'd. The git branch is the recovery mechanism; the checkpoint is the durability mechanism. Best-effort by default: when the cluster cannot take snapshots (no VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI driver), the operator sets `CheckpointsAvailable=False` and carries on (`api/v1alpha1/loop_types.go:160-165`). `spec.checkpoints: Required` opts into fail-at-start with `Failed:CheckpointUnavailable` (`:170-175`). Checkpoints are what forks and rollbacks restore from.
 _Avoid_: save point, backup, restore point
 
 **Stall**:
@@ -82,12 +82,12 @@ N consecutive iterations with the same normalised failure hash. Default N=3. On 
 _Avoid_: deadlock, loop, spin
 
 **Budget**:
-A set of caps (tokens, wall clock, cost) on a Loop. The operator reads counters from a metering sidecar and applies `spec.budget.onExceeded` (Pause | Fail) when any cap is hit. Cost is derived (tokens × price from a ConfigMap), not measured. Caps and policy are per-Loop; price table is cluster-wide with per-Loop override.
+A set of caps (tokens, wall clock, cost) on a Loop. The operator reads usage from the model proxy's `/coxswain/usage` endpoint (`internal/controller/loop_controller.go:558-559` — the `readProxyUsage` seam; the budget decision at `:1085`) and applies `spec.budget.onExceeded` (Pause | Fail) when any cap is hit. Hitting a cap gives `Failed:BudgetExceeded` or `Paused=True reason=Budget` (`api/v1alpha1/loop_types.go:596-601`, `:1254-1256`); usage is folded into `status.budget` (`:1029`). Cost is derived (tokens × price from a ConfigMap), not measured. Caps and policy are per-Loop; price table is cluster-wide with per-Loop override.
 _Avoid_: limit, cap, quota
 
-**Metering sidecar**:
-A thin HTTP proxy in front of the model API, inside the sandbox. Counts tokens from responses, writes counters to a file. Reports only — the operator makes the pause/fail decision.
-_Avoid_: proxy, gateway, interceptor
+**Metering**:
+The model proxy's report-only token accounting (prompt/completion tokens). The proxy is an operator-owned pod per Loop, outside the agent (`internal/controller/loop_controller.go:577` — "the operator owns the per-Loop proxy pod + Service"); the operator reads the cumulative usage from the proxy pod's `/coxswain/usage` endpoint (`loop_controller.go:558-564`). Reports only — the operator makes the pause/fail decision.
+_Avoid_: sidecar, gateway, interceptor
 
 **Workspace**:
 The git clone inside the sandbox. Created at Loop start from `spec.workspace.repo` + `spec.workspace.ref`. One branch per Loop (`coxswain/<loop-name>`), pushed after each iteration. Credentials via `spec.workspace.gitCredentialSecret`.
@@ -114,7 +114,7 @@ Tests the runner writes in the workspace during implement. Useful signal fed bac
 _Avoid_: unit tests, self-tests
 
 **Loop**:
-A one-shot object with a single goal. It ends in Succeeded or Failed. New goal = new Loop, optionally forked from a checkpoint. "Long-lived" means many iterations within one Loop, not re-tasking across goals.
+A one-shot object with a single goal. It ends Succeeded or Failed — or Paused when a budget cap or stall fires with a `Pause` action (`api/v1alpha1/loop_types.go:123` lists Paused as a first-class phase; `:596-601` and `:583-584` confirm `onExceeded`/`stallAction` can be Pause). New goal = new Loop, optionally forked from a checkpoint. "Long-lived" means many iterations within one Loop, not re-tasking across goals.
 _Avoid_: task, job, run
 
 **TamperedVerify**:

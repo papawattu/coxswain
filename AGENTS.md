@@ -216,6 +216,10 @@ make test       # Run unit tests
 - When a reviewer names a mutation, the builder applies **exactly** that diff
   in a scratch worktree and records the result. A broader mutation doesn't
   count.
+- **When a change moves the meaning of a marker, a gate, a window or a read
+  path, grep the old wording across `internal/` and `docs/` before the
+  verdict, and paste the grep with a positive control** (R39 D88). A comment
+  or doc elsewhere that still describes the old meaning is a finding.
 - **An e2e never prints PASS for a skipped or unproven step** (R25 I84). If a
   step is skipped (e.g. a condition is not met, a resource is absent), the
   script must say so explicitly and must not print a PASS line for that step.
@@ -264,6 +268,15 @@ make test       # Run unit tests
   `git checkout -b <branch> main` after a pull). Never cut a fix branch
   from a feature branch or a release branch — that carries unreviewed
   changes from the parent branch into the fix PR and muddies the review.
+- **Rebase in a worktree, never in the shared checkout** (R43 D91(a), I184).
+  The shared tree (`/home/jamie/projects/coxswain`) stays on `main` so every
+  reader's `git grep` and `make test` answer about `main`. A hand rebase
+  happens in its own `git worktree add`, and the worktree is removed after.
+- **A behaviour PR does not merge until its evidence exists** (R42/R43
+  D90/D91(b)). Every mutation the body names and every cluster item it owes
+  has output before the merge, not after. A resource pause (disk, memory,
+  cluster) blocks merges; it never lowers the evidence bar. Docs-only
+  changes are the only exception.
 - **Kill by PID, never `pkill -f`** (R26 I90). `pkill -f <pattern>` matches
   any process whose full command line contains the pattern, which can kill
   an unrelated process (e.g. a shell that has the pattern in its
@@ -282,10 +295,15 @@ make test       # Run unit tests
   finalizer). Before marking a slice ready: (a) the RBAC coverage test must
   check each resource's group against a trusted table (not just the presence of
   a rule for the resource), so a wrong group fails the test; (b) deploy to a kind
-  cluster and confirm `kubectl auth can-i <verb> <resource> --as=<the
-  operator's ServiceAccount>` returns yes for every rule the new code reads,
-  and that the operator log has **zero** `forbidden` errors after a Loop
-  lifecycle (create + delete) that exercises the new reads. Show both in the PR.
+  cluster and confirm `kubectl auth can-i <verb> <resource>
+  [--subresource=<sub>] --as=<the operator's ServiceAccount>` returns yes for
+  every rule the new code reads, and that the operator log has **zero**
+  `forbidden` errors after a Loop lifecycle (create + delete) that exercises
+  the new reads. Show both in the PR. For a subresource, pass
+  `--subresource=<sub>`: `can-i get pods/log` reads `pods/log` as a resource
+  *name* and answers `yes` whether or not the rule exists (R43 I180). The
+  same check run **before** the fix must print `no`; paste that `no` as the
+  positive control beside the `yes`.
 - **A count or grep used as evidence needs a positive control** (R28 I92).
   Show the same pattern matching a line known to contain it, or present the
   count as a before/after pair where the "before" is non-zero. #165 counted

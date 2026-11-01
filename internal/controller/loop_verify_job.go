@@ -1873,6 +1873,14 @@ type verifyCheckResult struct {
 	// an out-of-memory kill (137 = SIGKILL in both) from a check that killed
 	// itself.
 	oom bool
+	// message is the kubelet-recorded termination message (F94 s4): the
+	// canary's skip marker rides here via its TERMINATION_MESSAGE_PATH env
+	// (the canary writes verifyCanarySkipMarker to the termination file when
+	// the repo has no *_test.go at the base or verified commit and exits 0).
+	// Meaningful only when terminated; read ONLY on exit 0 (a non-zero exit
+	// keeps its own meaning — a marker in a non-zero exit's message is
+	// ignored).
+	message string
 }
 
 // readVerifyCheck reads the named check container's status from the pod.
@@ -1890,6 +1898,7 @@ func readVerifyCheck(pod *corev1.Pod, name string) verifyCheckResult {
 			terminated: true,
 			code:       ics.State.Terminated.ExitCode,
 			oom:        ics.State.Terminated.Reason == tamperOOMKilledReason,
+			message:    ics.State.Terminated.Message,
 		}
 	}
 	return verifyCheckResult{}
@@ -2070,6 +2079,21 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	// extracted from this function (F60-lint: the nested found/notRun
 	// branches added complexity).
 	recordCheckResults(pod, loop, checkCount)
+	// F94 s4: the canary RAN (preset go) and self-reported a skip (exit 0 +
+	// the skip marker in its termination message — the repo has no *_test.go
+	// at the base or verified commit). Record CanarySkipped=True with the
+	// NoTestsInRepo reason so the skip is visible to `kubectl cox describe`
+	// (the I90 surface, the same condition preset none records at Job
+	// creation); the decision itself is unchanged — exit 0 already proceeded
+	// to the acceptance checks (see the SPOOF LIMIT on canaryGateDecision).
+	// The flag is reset so a retried Job whose canary did not skip does not
+	// inherit a stale skip from the previous attempt's reconcile.
+	if canaryGateSkipped {
+		setCondition(loop, CanarySkippedCondition, metav1.ConditionTrue,
+			NoTestsInRepoReason,
+			"the verify canary was skipped: the repository has no *_test.go at the base or verified commit; the acceptance checks ran without the Go negative control")
+	}
+	canaryGateSkipped = false
 	// B5a: bumpVerifyResult is called for every verify outcome decision.
 	bumpVerifyResult(outcome)
 	switch outcome {

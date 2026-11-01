@@ -2777,6 +2777,15 @@ const CanarySkippedCondition = "CanarySkipped"
 // control; a repo with no Go tests has nothing to canary.
 const CanaryNotApplicableReason = "CanaryNotApplicable"
 
+// NoTestsInRepoReason (F94 s4) is the CanarySkipped condition reason recorded
+// when the canary RAN (preset go) but exited 0 with its skip marker (the repo
+// has no *_test.go at the base or verified commit, so there was nothing to
+// canary). Distinct from CanaryNotApplicableReason (the operator omitted the
+// canary init for preset none): here the canary ran, ran clean, and self-
+// reported the skip — the acceptance checks ran without the Go negative
+// control and the skip is surfaced with the same condition (I90).
+const NoTestsInRepoReason = "NoTestsInRepo"
+
 // PinNotDescendantReason is the terminal Failed reason recorded when the verify
 // Job's import-agent init refused the pinned commit because it is not a
 // descendant of status.baseCommit (F43).

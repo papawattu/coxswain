@@ -28,6 +28,17 @@
 //     forever (the pre-F94 one-shot no-decision path is gone).
 //  3. a canary still Running or Waiting → NO decision (the I49 norm: an
 //     in-progress gate takes no decision and requeues).
+//
+// Session 4 (exit 0 + skip marker → CanarySkipped/NoTestsInRepo):
+//
+//  4. canary exit 0 + the skip marker in its termination message →
+//     CanarySkipped=True/NoTestsInRepo AND the Loop proceeds to the checks
+//     (with check-0 passing, Succeeded — the marker is a surface, not a gate);
+//  5. canary exit 0 with NO marker → NO CanarySkipped condition (the healthy
+//     path);
+//  6. canary exit 46 WITH the marker text in its message → still terminal
+//     TestsRemoved (the marker is read ONLY on exit 0 — a non-zero exit keeps
+//     its own meaning).
 package controller
 
 import (
@@ -268,5 +279,121 @@ var _ = Describe("F94: the verify canary's no-test exits (session 2 gates)", fun
 		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
 			"a still-waiting canary is IN PROGRESS: no decision (no Succeeded, no Failed)")
 		_ = f94Events(recorder) // drain (the no-decision reconciles record none)
+	})
+
+	// f94CanaryCondition reads the named condition from the Loop's status.
+	f94CanaryCondition := func(loop *coxv1alpha1.Loop) *metav1.Condition {
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == CanarySkippedCondition {
+				return &loop.Status.Conditions[i]
+			}
+		}
+		return nil
+	}
+
+	It("records CanarySkipped/NoTestsInRepo and proceeds to the checks when the canary exits 0 with the skip marker", func() {
+		ns := f60Ns("f94-skip-marker")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f94skip"
+		recorder := record.NewFakeRecorder(64)
+		r := f60Reconciler(recorder)
+		jobName := f60DriveToVerifying(r, ns, name)
+		job := f60GetJob(ns, jobName)
+		Expect(job).NotTo(BeNil())
+
+		// F94 s4: the canary RAN (preset go) but the repository has no
+		// *_test.go at the base or verified commit — the script writes the
+		// skip marker to its termination file (TERMINATION_MESSAGE_PATH) and
+		// exits 0. The marker rides into the pod status as the container's
+		// terminated Message. The operator must record CanarySkipped=True
+		// with the NoTestsInRepo reason AND proceed to the acceptance checks
+		// exactly as a healthy exit 0 does (the marker is a surface, not a
+		// gate). With check-0 passing the Loop reaches Succeeded.
+		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
+			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyCanaryHealthyExit, Message: verifyCanarySkipMarker}}},
+			corev1.ContainerStatus{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		))
+
+		fresh := f94Reconcile(r, ns, name)
+		// The Loop proceeded to the checks: check-0 passed, so Succeeded.
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
+			"exit 0 + skip marker proceeds to the acceptance checks exactly as a healthy exit 0 does (the marker is a surface, not a gate)")
+		// The skip is recorded (the I90 surface: the degradation must be
+		// visible to `kubectl cox describe`).
+		skip := f94CanaryCondition(fresh)
+		Expect(skip).NotTo(BeNil(), "the skip must be visible as the CanarySkipped condition")
+		Expect(skip.Status).To(Equal(metav1.ConditionTrue), "the CanarySkipped condition must be True")
+		Expect(skip.Reason).To(Equal(NoTestsInRepoReason), "the reason must be NoTestsInRepo")
+		Expect(skip.Message).To(ContainSubstring("no *_test.go at the base or verified commit"),
+			"the message must name the reason for the skip (no tests at base or verified commit)")
+		Expect(skip.Message).To(ContainSubstring("the acceptance checks ran without the Go negative control"),
+			"the message must say the checks ran without the Go negative control")
+	})
+
+	It("records NO CanarySkipped condition when the canary exits 0 without the skip marker (the healthy path)", func() {
+		ns := f60Ns("f94-skip-healthy")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f94hlt"
+		recorder := record.NewFakeRecorder(64)
+		r := f60Reconciler(recorder)
+		jobName := f60DriveToVerifying(r, ns, name)
+		job := f60GetJob(ns, jobName)
+		Expect(job).NotTo(BeNil())
+
+		// The healthy negative control: the generated test honestly failed
+		// (exit 0) and the canary wrote NO skip marker (an empty termination
+		// message). The checks run and pass (Succeeded), and NO CanarySkipped
+		// condition is recorded — the skip surface is reserved for a markered
+		// skip, and the preset-none surface is reserved for a canary the
+		// operator omitted entirely.
+		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
+			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyCanaryHealthyExit}}},
+			corev1.ContainerStatus{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		))
+
+		fresh := f94Reconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded),
+			"a healthy exit 0 proceeds to the acceptance checks (the checks decide)")
+		Expect(f94CanaryCondition(fresh)).To(BeNil(),
+			"no skip marker means NO CanarySkipped condition (the healthy path; the surface is reserved for a markered skip or a preset-none omission)")
+	})
+
+	It("still fails the Loop with TestsRemoved when the canary exits 46 with the marker text in its message (the marker is ignored on a non-zero exit)", func() {
+		ns := f60Ns("f94-skip-46")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f94s46"
+		recorder := record.NewFakeRecorder(64)
+		r := f60Reconciler(recorder)
+		jobName := f60DriveToVerifying(r, ns, name)
+		job := f60GetJob(ns, jobName)
+		Expect(job).NotTo(BeNil())
+
+		// SPOOF LIMIT, spec (c): the marker is read ONLY on exit 0. A canary
+		// that exits 46 (tests removed) with the skip marker text in its
+		// termination message is still a terminal TestsRemoved verdict — the
+		// non-zero exit keeps its own meaning, and no CanarySkipped condition
+		// is recorded (a forged or accidental marker must not soften a
+		// terminal verdict into a skip).
+		f60PlantPod(ns, name, jobName, job, append(f60TrustedPrefix(),
+			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: verifyCanaryTestsRemovedExit, Message: verifyCanarySkipMarker}}},
+		))
+
+		fresh := f94Reconcile(r, ns, name)
+		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"exit 46 with a marker in its message is still terminal TestsRemoved (the marker is ignored on a non-zero exit)")
+		var failed *metav1.Condition
+		for i := range fresh.Status.Conditions {
+			if fresh.Status.Conditions[i].Type == string(coxv1alpha1.LoopPhaseFailed) &&
+				fresh.Status.Conditions[i].Status == metav1.ConditionTrue {
+				failed = &fresh.Status.Conditions[i]
+			}
+		}
+		Expect(failed).NotTo(BeNil(), "the Loop must carry a Failed condition")
+		Expect(failed.Reason).To(Equal(TestsRemovedReason), "the Failed reason must still be TestsRemoved")
+		Expect(f94CanaryCondition(fresh)).To(BeNil(),
+			"the marker in a 46's message must NOT record a CanarySkipped condition (the marker is read only on exit 0)")
 	})
 })

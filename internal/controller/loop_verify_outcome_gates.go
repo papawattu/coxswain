@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -133,7 +134,13 @@ func artifactGateDecision(pod *corev1.Pod) *verifyDecision {
 }
 
 // canaryGateDecision reads the canary init's gate decision from the pod's
-// init statuses (F60, D17.1). The canary runs BETWEEN artifact and check-0
+// init statuses (F60, D17.1). canaryGateSkipped (F94 s4) reports whether the
+// canary RAN and self-reported a skip (exit 0 + the skip marker in its
+// termination message — the repo has no *_test.go at the base or verified
+// commit): the caller records CanarySkipped=True/NoTestsInRepo there (the
+// gate has no Loop to write to) and then falls through to the checks, exactly
+// as a healthy exit 0 does. The marker is read ONLY on exit 0: a non-zero exit
+// keeps its own meaning (a marker in a 46's message is ignored). The canary runs BETWEEN artifact and check-0
 // (tamper -> artifact -> canary -> checks). Tamper and artifact are clean at
 // this point, so the canary is the next gate. A terminated canary with exit
 // verifyCanarySubvertedExit (43) is subversion (verifySubverted, terminal),
@@ -195,7 +202,20 @@ func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
 	case verifyCanaryHealthyExit:
 		// exit 0 (verifyCanaryHealthyExit): the generated test honestly failed,
 		// the negative control held. The gate passes — no decision from this
-		// gate, the caller proceeds to the acceptance checks.
+		// gate, the caller proceeds to the acceptance checks. SPOOF LIMIT: the
+		// marker below is the canary's termination message, and the AGENT's own
+		// test code runs inside the canary container (the canary test is
+		// generated against the agent's package) and could write
+		// verifyCanarySkipMarker to its termination file to forge the skip. A
+		// spoofed marker yields only a misleading CanarySkipped condition —
+		// NO verdict change, because exit 0 already proceeds to the acceptance
+		// checks (a subverted binary is caught by the exit-43 path, not by the
+		// skip marker).
+		// The gate has no Loop to write to, so the skip is only FLAGGED here
+		// (see canaryGateSkipped); applyVerifyOutcome records it once the
+		// decision is final. Fall through to the checks, exactly as a healthy
+		// exit 0 does.
+		canaryGateSkipped = strings.Contains(canary.message, verifyCanarySkipMarker)
 		return nil
 	default:
 		// OOMKilled (the kubelet killed the canary at its memory limit) or any
@@ -214,6 +234,15 @@ func canaryGateDecision(pod *corev1.Pod) *verifyDecision {
 		return &verifyDecision{outcome: verifyInfraFailed, requeue: false, container: verifyCanaryInit, exitCode: canary.code}
 	}
 }
+
+// canaryGateSkipped (F94 s4): set by canaryGateDecision when the canary ran
+// and self-reported a skip (exit 0 + marker in its termination message),
+// and consumed by applyVerifyOutcome after the decision, where the Loop is
+// available for the CanarySkipped condition (the gate function has no Loop
+// to write to). It mirrors verifyOutcome's requeue/decision shape: a fresh
+// reconcile re-derives it, so a retried Job whose canary did not skip
+// clears the flag.
+var canaryGateSkipped = false
 
 // checkGateDecision reads the check inits' gate decision from the pod's init
 // statuses (check-0 .. check-<checkCount-1). A terminated check with a

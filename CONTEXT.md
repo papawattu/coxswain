@@ -15,7 +15,7 @@ An LLM invocation, run by the operator, that decides whether a lesson is worth w
 _Avoid_: curation, reviewer, filter
 
 **Runner**:
-The in-sandbox one-shot phase driver: one container run per phase. The operator writes the desired phase to `.coxswain/desired-phase` (the phase-init container); the runner executes that phase once, writes result.json plus a strict claim mirrored to `/dev/termination-log`, and exits (`runner/phase.go:231-236`; the ADR-0004 claim channel is `runner/phase.go:15-27`). `status.observedPhase` is the operator's record of that claim (`api/v1alpha1/loop_types.go:966-971`); the runner never writes the field itself. The operator reads the claim, advances `status.phase`, and recreates the sandbox pod for the next phase. Model context: within one iteration the Planning and Implementing runs share the model conversation; the conversation is discarded when the pod is recycled. If no claim arrives within `spec.loop.phaseTimeout` (default 30 min), the operator sets `Failed:PhaseTimeout` and restarts the sandbox from the last checkpoint.
+The in-sandbox one-shot phase driver: one container run per phase. The operator writes the desired phase to `.coxswain/desired-phase` (the phase-init container); the runner executes that phase once, writes result.json plus a strict claim mirrored to `/dev/termination-log`, and exits (`runner/phase.go:1-27`; the ADR-0004 claim channel is `runner/phase.go:15-27`). `status.observedPhase` is the operator's record of that claim (`api/v1alpha1/loop_types.go:966-971`); the runner never writes the field itself. The operator reads the claim, advances `status.phase`, and recreates the sandbox pod for the next phase. Model context: within one iteration the Planning and Implementing runs share the model conversation; the conversation is discarded when the pod is recycled. If no claim arrives within `spec.loop.phaseTimeout` (default 30 min), the operator sets `Failed:PhaseTimeout` and restarts the sandbox from the last checkpoint.
 _Avoid_: worker, executor, bot
 
 **AgentPolicy**:
@@ -50,7 +50,7 @@ A kubectl plugin that talks directly to the CRD (no operator HTTP API). Commands
 _Avoid_: CLI, tool, kubectl plugin
 
 **PR**:
-Opened by the operator-owned deliver Job on delivery (`internal/controller/loop_deliver_job.go:230` creates the Job; `:1494-1501` posts to `api.github.com`), using the `git-cred` basic-auth Secret in the Loop's namespace. Draft by default; `spec.delivery.draft: false` opts out (`loop_deliver_job.go:443-448`). Description includes: goal, iteration count, the history, the plan, and a link to the Loop object. The operator records the result in `status.delivery` + the `Delivered` condition; Succeeded is set only after delivery is terminal (`api/v1alpha1/loop_types.go:143-145`). A failed delivery is `Delivered=False reason=DeliveryFailed`, retried via `cox redeliver`.
+Opened by the operator-owned deliver Job on delivery (`internal/controller/loop_deliver_job.go:230` creates the Job; `:1494-1501` posts to `api.github.com`), using the Secret named by `spec.workspace.gitCredentialSecret` in the Loop's namespace (`api/v1alpha1/loop_types.go:215-224`). Draft by default; `spec.delivery.draft: false` opts out (`loop_deliver_job.go:443-448`). Description includes: goal, iteration count, the history, the plan, and a link to the Loop object. The operator records the result in `status.delivery` + the `Delivered` condition; Succeeded is set only after delivery is terminal (`api/v1alpha1/loop_types.go:143-145`). A failed delivery is `Delivered=False reason=DeliveryFailed`, retried via `cox redeliver`.
 _Avoid_: pull request, merge request, branch
 
 **Failure reason**:
@@ -114,7 +114,7 @@ Tests the runner writes in the workspace during implement. Useful signal fed bac
 _Avoid_: unit tests, self-tests
 
 **Loop**:
-A one-shot object with a single goal. It ends Succeeded or Failed — or Paused when a budget cap or stall fires with a `Pause` action (`api/v1alpha1/loop_types.go:122` lists Paused as a first-class phase; `:596-601` and `:450-453` confirm `onExceeded`/`stallAction` can be Pause). New goal = new Loop, optionally forked from a checkpoint. "Long-lived" means many iterations within one Loop, not re-tasking across goals.
+A one-shot object with a single goal. It ends Succeeded or Failed — or Paused when a budget cap or stall fires with a `Pause` action (`api/v1alpha1/loop_types.go:123` lists Paused as a first-class phase; `:596-601` and `:583-584` confirm `onExceeded`/`stallAction` can be Pause). New goal = new Loop, optionally forked from a checkpoint. "Long-lived" means many iterations within one Loop, not re-tasking across goals.
 _Avoid_: task, job, run
 
 **TamperedVerify**:

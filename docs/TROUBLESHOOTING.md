@@ -236,7 +236,7 @@ runs ONE probe pod on ONE node (`internal/cni/pod_prober.go`), so the gate
 verifies enforcement on that node only. On a multi-node cluster, a node whose
 CNI does not enforce NetworkPolicy would not be detected, and Loops landing on
 it would run with the network fence unpoliced there. A per-node probe (one
-probe pod per node, the gate satisfied only when every node passes) is
+probe pod per node, each sandbox gated on its own node's result) is
 deliberately deferred until multi-node clusters are a support target (D80(b)).
 
 ## Reading the memory write outcome

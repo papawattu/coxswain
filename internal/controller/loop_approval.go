@@ -773,4 +773,3 @@ func (r *LoopReconciler) approvalHoldPhase(loop *coxv1alpha1.Loop) bool {
 	return approvalMode(loop) == coxv1alpha1.ApprovalModeManual &&
 		loop.Status.Phase == coxv1alpha1.LoopPhaseAwaitingApproval
 }
-

@@ -2243,17 +2243,8 @@ func (r *LoopReconciler) ensureSandbox(ctx context.Context, loop *coxv1alpha1.Lo
 		// C2 + D101: the sandbox template carries the CURRENT Loop node
 		// placement every pass (set AND clear — F93b): a flag change re-places
 		// the existing sandbox via the template update, and dropping the flags
-		// clears the stale placement. applyLoopPlacement runs HERE (not at the
-		// end of the mutate, where the sandbox pod's built-in node tolerations
-		// have been appended) so that a flag clear does not delete them (F93b
-		// applies to the FLAG-derived fields only; the pod's own tolerations
-		// must survive every pass).
+		// clears the stale placement.
 		r.applyLoopPlacement(&desired.Spec.PodTemplate.Spec)
-		if r.LoopNodeSelector != nil {
-			desired.Spec.PodTemplate.Spec.NodeSelector = r.LoopNodeSelector
-		} else {
-			desired.Spec.PodTemplate.Spec.NodeSelector = nil
-		}
 		// I36: the agent and any future sidecars do not share a process
 		// namespace (no nsenter / /proc/<pid> cross-container access).
 		noShare := false

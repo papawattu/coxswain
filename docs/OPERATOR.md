@@ -976,9 +976,15 @@ pod, so `kubectl get pod -o yaml` shows them alongside the ones from the
 flag.
 
 **A note on a pool with no matching node:** with the flags set but no node
-matching them, the sandbox stays Pending and the Loop shows
-`SandboxNotStarting`. The Loop does not yet fail on its own — that is F93a,
-a later slice.
+matching them, the model proxy and egress proxy pods sit Pending with
+FailedScheduling events; the Loop holds at `Planning` with
+`ModelProxyNotReady=True`; no sandbox pod is created (the template update
+suspends the Sandbox, and with no Ready proxy pod it is not restarted), so
+`SandboxNotStarting` never appears; and the Loop does not yet fail on its
+own — that is F93a, a later slice. Check `kubectl get pod -o wide` and the
+pods' FailedScheduling events. Changing the flags also recreates the proxy
+pods of every Loop that has one — terminal Loops included (their spec hash
+covers placement), while existing Jobs keep their old placement.
 
 ## Upgrade
 

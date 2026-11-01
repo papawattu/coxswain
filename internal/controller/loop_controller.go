@@ -1104,6 +1104,21 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	budgetRequeue, budgetChanged := r.applyBudgetStep(ctx, &loop)
 	changed = changed || budgetChanged
 
+	// D77 (R30): the budget-hold gate (maxCost + a stale reading -> hold). It
+	// runs AFTER the proxy ensure (above) and AFTER applyBudgetStep's read
+	// (just above) — not in validateStep (a hold there would deadlock a new
+	// maxCost Loop with no reading yet: it would never get a proxy, so never
+	// a reading). While held it blocks the phase advance and any new
+	// sandbox/iteration: the claim reader below only runs at Verifying, the
+	// verify Job is only ensured at Verifying, and the sandbox was built and
+	// (if running) suspended by the gate BEFORE it, in this same reconcile. The
+	// proxy and the usage read kept running while held, so the recovered
+	// reading releases the hold on the next pass (no restart, no manual resume).
+	// A held pass returns budgetHoldRequeue after the trailing status write.
+	if r.applyBudgetHoldGate(ctx, &loop) {
+		return ctrl.Result{RequeueAfter: budgetHoldRequeue}, nil
+	}
+
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
 	// (AFTER it, so the two Loop writes never race) are extracted to
 	// finalizeLoopStatus to keep the top-level reconcile within the gocyclo

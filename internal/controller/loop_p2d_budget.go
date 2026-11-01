@@ -44,6 +44,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/papawattu/coxswain/internal/proxy"
 )
@@ -101,6 +102,21 @@ const (
 	// budgetFailedReason is the Failed-condition reason recorded when
 	// onExceeded=Fail (distinct from the BudgetExceeded condition).
 	budgetFailedReason = "BudgetExceeded"
+	// D77 (R30): the budget-hold surface (maxCost + a stale reading).
+	// budgetHoldEventReason is the Warning Event reason on the
+	// False->True transition; budgetHoldRequeue is the bounded requeue while
+	// held (a recovered proxy pod also fires the watch).
+	budgetHoldEventReason = "BudgetHold"
+	budgetHoldRequeue     = 30 * time.Second
+	// budgetHoldReason* are the BudgetHold condition's stable reasons.
+	budgetHoldReasonStale  = "StaleReading"
+	budgetHoldReasonFresh  = "ReadingFresh"
+	// budgetHoldMessage / budgetReleaseMessage are the STABLE condition
+	// messages (a message that changed every pass would re-stamp
+	// LastTransitionTime and cost a status write each reconcile — the same
+	// rule as noteUsageReadFailed's message).
+	budgetHoldMessage    = "holding: the maxCost cap cannot be enforced without a fresh usage reading (see the UsageReadFailed Events)"
+	budgetReleaseMessage = "released: the usage reading is fresh again; the maxCost cap is enforcing it"
 )
 
 // modelPrices is the resolved prompt/completion price pair (USD per million
@@ -238,6 +254,96 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	}
 
 	return budgetRequeue
+}
+
+// applyBudgetHoldGate is the D77 hold (R30: owner chose (b) for maxCost,
+// (a) for maxTokens): a Loop with a maxCost cap holds while its usage
+// reading is stale (BudgetReadingStale == True, F44). It is called in
+// Reconcile AFTER the proxy ensure and AFTER applyBudgetStep's read — NOT in
+// validateStep, which runs BEFORE the proxy objects exist and BEFORE the
+// read: a hold there would deadlock a NEW maxCost Loop (it would never get a
+// proxy, so never a reading, so be held forever) and a stale Loop whose
+// proxy pod is gone (it could never get it back). Trigger is
+// BudgetReadingStale == True ONLY (F44's noteUsageReadFailed covers the
+// never-had-a-reading case: its message says so and the threshold trips the
+// same way), so a starting Loop (proxy not Ready yet, under the threshold)
+// is not held, and a proxy that never comes up IS held once the threshold
+// trips (owner's choice).
+//
+// While held the gate:
+//   - suspends the running sandbox (suspendSandboxIfRunning — the agent
+//     spends model money; stopping it is the point of a cost hold); the
+//     sandbox is NOT deleted (a mid-step response is partial progress, and
+//     the D35a proxy gate keeps the sandbox Suspended for a new one anyway);
+//   - leaves the proxy UP and the usage read RUNNING (both already ran this
+//     reconcile, before the gate): the recovered reading is the release;
+//   - blocks the phase advance and any new sandbox/iteration: the claim
+//     reader below only runs at Verifying, the verify Job is only ensured at
+//     Verifying, and the sandbox was built + suspended BEFORE the gate this
+//     reconcile, so the hold lands in this same pass; and
+//   - returns RequeueAfter=budgetHoldRequeue (bounded; a recovered proxy pod
+//     also fires the watch).
+//
+// Inert (never held) in Paused (the P2f decision is re-evaluated on resume —
+// the same predicate as applyBudgetDecision's phase guard), in the P5f
+// delivery hold (holding would lose the delivery result), and in terminal
+// phases (a finished Loop's reading going stale is a surface, not a hold).
+//
+// It sets the BudgetHold condition (True/StaleReading while held; False/
+// ReadingFresh on the release — the condition is the durable surface of both
+// sides) and one transition-gated Warning Event (the noteUsageReadFailed
+// pattern). It returns the held flag; when held, Reconcile persists the
+// condition via an in-pass Status().Update (the C6a gate shape) and returns
+// budgetHoldRequeue so a held pass re-checks while the reading is stale.
+func (r *LoopReconciler) applyBudgetHoldGate(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	// The first line is the maxTokens-only carve-out (owner choice (a)): only
+	// a maxCost cap is enforceable from the reading, so only it can hold —
+	// the same predicate capName uses to make the cost cap live
+	// (spec.MaxCostUsd != "").
+	spec := loop.Spec.Budget
+	if spec == nil || spec.MaxCostUsd == "" {
+		return false
+	}
+	// Inert states: Paused (P2f), the P5f delivery hold, and terminal phases.
+	if loopPaused(loop) || isTerminalPhase(loop.Status.Phase) || loopHoldingForDelivery(loop) {
+		return false
+	}
+	held := conditionTruePresent(loop, coxv1alpha1.BudgetReadingStaleCondition)
+	if !held {
+		// The release (no restart, no manual resume): a fresh read cleared
+		// BudgetReadingStale above (noteUsageReadOK), so the gate sets
+		// BudgetHold False and the reconcile proceeds.
+		if conditionTruePresent(loop, coxv1alpha1.BudgetHoldCondition) {
+			setCondition(loop, coxv1alpha1.BudgetHoldCondition, metav1.ConditionFalse,
+				budgetHoldReasonFresh, budgetReleaseMessage)
+		}
+		return false
+	}
+	// Held. Set the condition (stable message) and one transition-gated
+	// Warning Event (the noteUsageReadFailed pattern: only on the transition).
+	wasHeld := conditionTruePresent(loop, coxv1alpha1.BudgetHoldCondition)
+	setCondition(loop, coxv1alpha1.BudgetHoldCondition, metav1.ConditionTrue,
+		budgetHoldReasonStale, budgetHoldMessage)
+	if !wasHeld && r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, budgetHoldEventReason,
+			"holding the Loop: the maxCost cap cannot be enforced without a fresh usage reading; the running sandbox is suspended and the phase advance and new iterations are blocked until the reading recovers")
+	}
+// Suspend the running sandbox (the agent spends model money; stopping it
+	// is the point of a cost hold). The proxy is NOT touched: its read is the
+	// release, so it stays up while held.
+	if err := r.suspendSandboxIfRunning(ctx, loop); err != nil {
+		// A sandbox-read failure does not clear the hold (the condition +
+		// requeue are set below) and does not fail the pass: the next
+		// reconcile retries the suspension. The hold is not downgraded.
+		logf.FromContext(ctx).Error(err, "could not suspend the sandbox during the budget hold; retrying next reconcile", "loop", loop.Name)
+	}
+	// Persist the condition in-pass (the C6a gate shape: the hold must be
+	// visible even though the pass stops before the trailing status write).
+	// A status-write failure keeps the in-memory hold (it is re-evaluated,
+	// level-based, on the next reconcile) and returns held: the caller's
+	// requeue retries while the reading is stale.
+	_ = r.Status().Update(ctx, loop)
+	return true
 }
 
 // noteUsageReadOK records a successful usage read (F44): stamps

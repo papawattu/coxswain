@@ -557,9 +557,7 @@ type LoopReconciler struct {
 	// POD_NAMESPACE from env).
 	OperatorNamespace string
 
-	
-
-// readProxyUsage is the operator's proxy-usage read seam (P2a item 12,
+	// readProxyUsage is the operator's proxy-usage read seam (P2a item 12,
 	// P2d). It reads the proxy's cumulative usage reading from the proxy pod's
 	// /coxswain/usage endpoint. The default (nil) resolves the proxy pod's IP
 	// from the pod status the operator already reads (no new RBAC — the operator
@@ -777,67 +775,16 @@ func (r *LoopReconciler) validateStep(ctx context.Context, loop *coxv1alpha1.Loo
 // budget before the applyBudget call (a COPY of the struct, not a pointer
 // — the DeepEqual must compare the pointed-to structs, not the pointer
 // values) and returns the RequeueAfter (the quiet wall-clock rule) and
-// whether the budget was mutated. The step runs stepUsageRead FIRST: the
-// D77 hold gate runs in Reconcile after it, and a held pass needs the read
-// (and its F44 staleness surface) to have run in this same reconcile so the
-// recovered reading is the release.
+// whether the budget was mutated.
 func (r *LoopReconciler) applyBudgetStep(ctx context.Context, loop *coxv1alpha1.Loop) (time.Duration, bool) {
 	var budgetBefore *coxv1alpha1.BudgetStatus
 	if loop.Status.Budget != nil {
 		b := *loop.Status.Budget
 		budgetBefore = &b
 	}
-	budgetRequeue := r.applyBudgetClockAndDecision(ctx, loop)
-	r.stepUsageRead(ctx, loop)
+	budgetRequeue := r.applyBudget(ctx, loop)
 	budgetChanged := !equality.Semantic.DeepEqual(budgetBefore, loop.Status.Budget)
 	return budgetRequeue, budgetChanged
-}
-
-// stepUsageRead is the P2d usage-reading half of applyBudget (item 2, P1-B):
-// read the proxy's usage endpoint (the readProxyUsage seam), fold the reading
-// into status.budget (noteUsageReadOK + applyUsageReading), and record the
-// failure surface (noteUsageReadFailed, F44) or the no-endpoint clears. A
-// read FAILURE leaves status.budget unchanged (no reset, no delta — the
-// operator does not guess; the decision is on the last SUCCESSFUL read, never
-// an estimate). Extracted from applyBudget so the D77 held pass (Reconcile
-// returns budgetHoldRequeue after this pass) still runs the read: the proxy
-// stays up and the reading keeps being probed while held, so the recovered
-// reading is the release (no restart, no manual resume).
-func (r *LoopReconciler) stepUsageRead(ctx context.Context, loop *coxv1alpha1.Loop) {
-	// No model -> no proxy pod -> no read; the token/cost caps are inert
-	// (the wall clock still applies, spec 9).
-	if loop.Spec.Agent.EndpointSecretRef != "" {
-		now := r.operatorNow()
-		reading, err := r.resolveProxyUsageRead(ctx, loop)
-		if err == nil && reading != nil {
-			r.noteUsageReadOK(loop, now)
-			r.applyUsageReading(ctx, loop, *reading)
-		} else if err != nil && !errors.Is(err, proxy.ErrNotReady) {
-			// F44: the caps stay on the last good reading (fail-open, by
-			// design until the owner decides otherwise), but the staleness
-			// is recorded and surfaced.
-			r.noteUsageReadFailed(loop, err)
-		}
-		// F84: proxy.ErrNotReady (no pod, no IP, or still inside its start
-		// grace) is NO READING YET, not a failure: it neither increments the
-		// counter nor resets it, so a pod that flaps absent/up cannot erase a
-		// genuine staleness either.
-		return
-	}
-	// F84 (P3-6): no model is configured, so the two read-related conditions
-	// have no subject: clear them rather than leave them True.
-	if conditionTruePresent(loop, coxv1alpha1.BudgetReadingStaleCondition) {
-		setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionFalse,
-			"NoEndpoint", "no model endpoint is configured, so there is no usage endpoint to read")
-	}
-	if conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
-		setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
-			"NoEndpoint", "no model endpoint is configured, so there is no model proxy to wait for")
-	}
-	if conditionTruePresent(loop, coxv1alpha1.MeteringDegradedCondition) {
-		setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionFalse,
-			"NoEndpoint", "no model endpoint is configured, so there is no metering to degrade")
-	}
 }
 
 // s4ClaimAndVerifyJob is the S4 claim read (the runner's claim from the agent
@@ -1167,16 +1114,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// (if running) suspended by the gate BEFORE it, in this same reconcile. The
 	// proxy and the usage read kept running while held, so the recovered
 	// reading releases the hold on the next pass (no restart, no manual resume).
-	// A held pass still runs stepUsageRead above and the trailing status write
-	// below (finalizeLoopStatus), so the reading keeps being probed and the
-	// BudgetHold condition (and the suspended sandbox) are persisted; the pass
-	// then returns budgetHoldRequeue instead of the trailing requeue.
-	budgetHeld := r.applyBudgetHoldGate(ctx, &loop)
-
-	if budgetHeld {
-		// D77: the trailing status write still runs — the hold is persisted, not
-		// just in memory (the C6a gate shape, like the D76 secrets gate's own
-		// Status().Update).
+	// A held pass runs the trailing status write (finalizeLoopStatus) so the
+	// BudgetHold condition is persisted, then returns budgetHoldRequeue instead
+	// of the trailing requeue.
+	if r.applyBudgetHoldGate(ctx, &loop) {
+		// D77: the held pass persists via the trailing status write
+		// (finalizeLoopStatus) before it returns budgetHoldRequeue — the hold is
+		// not left in memory only.
 		if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 			return ctrl.Result{}, err
 		}

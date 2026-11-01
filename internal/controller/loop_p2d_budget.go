@@ -30,6 +30,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -129,6 +130,130 @@ type modelPrices struct {
 // hasAny returns whether both prices are present (a complete price pair).
 func (p *modelPrices) hasAny() bool {
 	return p != nil && p.prompt != nil && p.completion != nil
+}
+
+// applyBudget is the P2d reconcile step: read the usage, accumulate the wall
+// clock, update status.budget, and apply the caps. It runs on every reconcile
+// (including Paused — the decision does not re-fire). The wall clock stops in
+// Paused (item E) AND in terminal phases (Succeeded/Failed — a finished Loop's
+// active time is fixed; re-reconciles of a terminal Loop must not keep
+// accumulating and rewriting status). It returns the wall-clock RequeueAfter
+// (0 when the cap is unset or already hit) and an error only for transient
+// budget-status persistence failures (a read failure is NOT an error —
+// status.budget is left unchanged and the decision waits for the next
+// successful read).
+func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop) time.Duration {
+	now := r.operatorNow()
+
+	// --- wall clock (item 10 / item E) ---
+	// activeSeconds accumulates ACTIVE time: each reconcile adds
+	// now - lastActiveStamp when the Loop is not Paused and not terminal
+	// (the pause and the terminal phases stop the clock), and
+	// lastActiveStamp is set to now on every such reconcile (reset on resume,
+	// P2f). A fresh accumulation (no stamp yet) adds 0.
+	var budgetRequeue time.Duration
+	// The wall clock is accumulated on every non-paused, non-terminal
+	// reconcile. The cap only decides enforcement (onExceeded), not recording
+	// (I95): active time is useful without a cap — a Loop with no spec.budget
+	// still carries its wall clock in status.budget.activeSeconds, and the
+	// deliver description body prints it. A Paused Loop does not accumulate
+	// (item E: the pause stops the clock), and neither does a terminal Loop
+	// (Succeeded/Failed): a finished Loop's active time is fixed — every later
+	// reconcile would add now - lastActiveStamp and rewrite the stamp, so
+	// terminal Loops re-reconciled on any trigger (I96) would keep growing
+	// activeSeconds without bound. Stopping the clock in terminal phases is
+	// the same treatment as Paused.
+	var added int64
+	var stamp *metav1.Time
+	// P5f: a Loop held for delivery (Verifying+Delivering) already passed
+	// verify; its clock is stopped like a terminal Loop's, and no budget
+	// decision may fail it (it would lose the delivery result).
+	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
+		b := loop.Status.Budget
+		if b != nil && b.LastActiveStamp != nil {
+			added = max(0, int64(now.Sub(b.LastActiveStamp.Time).Seconds()))
+		}
+		// Set/refresh the stamp on every non-paused, non-terminal reconcile.
+		// The stamp is set regardless of whether a cap is set (I95: the wall
+		// clock is always accumulated; the cap only decides enforcement).
+		// A Paused Loop does not set the stamp (item E: the pause stops the
+		// clock). A terminal Loop does not set the stamp either (the clock is
+		// stopped the same way: a finished Loop's active time is fixed).
+		st := now
+		stamp = &st
+	}
+	var current int64
+	if loop.Status.Budget != nil {
+		current = loop.Status.Budget.ActiveSeconds
+	}
+	current += added
+	r.ensureBudgetStatus(loop, current, stamp)
+	// The RequeueAfter for a quiet wall-clock Loop (item 10): only when the
+	// cap is set and not yet hit, re-reconcile at the remaining time.
+	if loop.Spec.Budget != nil && loop.Spec.Budget.MaxWallClock != "" {
+		if d, err := coxv1alpha1.ParseMaxWallClock(loop.Spec.Budget.MaxWallClock); err == nil && d > 0 {
+			remaining := d - time.Duration(current)*time.Second
+			if remaining > 0 {
+				budgetRequeue = remaining
+			}
+		}
+	}
+
+	// --- the read + delta (item 2, P1-B) ---
+	// No model -> no proxy pod -> no read; the token/cost caps are inert
+	// (the wall clock still applies, spec 9). A read failure (the proxy pod
+	// not Ready, the dial refused, the pod absent) leaves status.budget
+	// UNCHANGED (no reset, no delta — the operator does not guess; the
+	// decision is on the last SUCCESSFUL read, never an estimate).
+	if loop.Spec.Agent.EndpointSecretRef != "" {
+		reading, err := r.resolveProxyUsageRead(ctx, loop)
+		if err == nil && reading != nil {
+			r.noteUsageReadOK(loop, now)
+			r.applyUsageReading(ctx, loop, *reading)
+		} else if err != nil && !errors.Is(err, proxy.ErrNotReady) {
+			// F44: the caps stay on the last good reading (fail-open, by
+			// design until the owner decides otherwise), but the staleness
+			// is recorded and surfaced.
+			r.noteUsageReadFailed(loop, err)
+		}
+		// F84: proxy.ErrNotReady (no pod, no IP, or still inside its start
+		// grace) is NO READING YET, not a failure: it neither increments the
+		// counter nor resets it, so a pod that flaps absent/up cannot erase a
+		// genuine staleness either.
+	} else {
+		// F84 (P3-6): no model is configured, so the two read-related
+		// conditions have no subject: clear them rather than leave them True.
+		if conditionTruePresent(loop, coxv1alpha1.BudgetReadingStaleCondition) {
+			setCondition(loop, coxv1alpha1.BudgetReadingStaleCondition, metav1.ConditionFalse,
+				"NoEndpoint", "no model endpoint is configured, so there is no usage endpoint to read")
+		}
+		if conditionTruePresent(loop, coxv1alpha1.ModelProxyNotReadyCondition) {
+			setCondition(loop, coxv1alpha1.ModelProxyNotReadyCondition, metav1.ConditionFalse,
+				"NoEndpoint", "no model endpoint is configured, so there is no model proxy to wait for")
+		}
+		if conditionTruePresent(loop, coxv1alpha1.MeteringDegradedCondition) {
+			setCondition(loop, coxv1alpha1.MeteringDegradedCondition, metav1.ConditionFalse,
+				"NoEndpoint", "no model endpoint is configured, so there is no metering to degrade")
+		}
+	}
+
+	// --- the decision (pure function of status.budget + spec.budget) ---
+	// Gated on phase != Paused (P2f: the budget decision is inert in Paused —
+	// a wall-clock hit while paused records exceeded but does not change the
+	// phase/reason; re-evaluated on resume) and on every terminal phase
+	// (item 8: a budget entry on a terminal phase would overwrite the
+	// terminal record — a Succeeded Loop must not flip to Paused/Failed on a
+	// cap hit, and a Failed Loop's stall record must not be clobbered by a
+	// budget Fail; the reading is still folded into status.budget above, so
+	// the BudgetExceeded CONDITION may still be recorded, but the onExceeded
+	// phase action does not fire). The decision runs AFTER the verify/stall
+	// decisions (item 8: a phase already changed by the stall decision is seen
+	// here and the budget decision is inert).
+	if !loopPaused(loop) && isPausablePhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
+		r.applyBudgetDecision(ctx, loop)
+	}
+
+	return budgetRequeue
 }
 
 // applyBudgetHoldGate is the D77 hold (R30: owner chose (b) for maxCost,
@@ -638,90 +763,6 @@ func (r *LoopReconciler) applyBudgetDecision(ctx context.Context, loop *coxv1alp
 		return false
 	}
 	return r.fireBudgetExceeded(ctx, loop, spec, hit, reason, value)
-}
-
-// applyBudgetClockAndDecision is the P2d budget step with the usage read
-// removed (stepUsageRead in loop_controller.go carries it — the D77 held
-// pass runs the read while the caps are inert, so the caps never enforce on
-// a stale reading while a new one is still probed). It accumulates the wall
-// clock (item 10 / item E) and applies the spec.budget caps (the decision
-// below), and returns the wall-clock RequeueAfter (0 when the cap is unset
-// or already hit). A read failure is NOT an error — status.budget is left
-// unchanged and the decision waits for the next successful read.
-func (r *LoopReconciler) applyBudgetClockAndDecision(ctx context.Context, loop *coxv1alpha1.Loop) time.Duration {
-	now := r.operatorNow()
-
-	// --- wall clock (item 10 / item E) ---
-	// activeSeconds accumulates ACTIVE time: each reconcile adds
-	// now - lastActiveStamp when the Loop is not Paused and not terminal
-	// (the pause and the terminal phases stop the clock), and
-	// lastActiveStamp is set to now on every such reconcile (reset on resume,
-	// P2f). A fresh accumulation (no stamp yet) adds 0.
-	var budgetRequeue time.Duration
-	// The wall clock is accumulated on every non-paused, non-terminal
-	// reconcile. The cap only decides enforcement (onExceeded), not recording
-	// (I95): active time is useful without a cap — a Loop with no spec.budget
-	// still carries its wall clock in status.budget.activeSeconds, and the
-	// deliver description body prints it. A Paused Loop does not accumulate
-	// (item E: the pause stops the clock), and neither does a terminal Loop
-	// (Succeeded/Failed): a finished Loop's active time is fixed — every
-	// later reconcile would add now - lastActiveStamp and rewrite the stamp,
-	// so terminal Loops re-reconciled on any trigger (I96) would keep
-	// growing activeSeconds without bound. Stopping the clock in terminal
-	// phases is the same treatment as Paused.
-	var added int64
-	var stamp *metav1.Time
-	// P5f: a Loop held for delivery (Verifying+Delivering) already passed
-	// verify; its clock is stopped like a terminal Loop's, and no budget
-	// decision may fail it (it would lose the delivery result).
-	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
-		b := loop.Status.Budget
-		if b != nil && b.LastActiveStamp != nil {
-			added = max(0, int64(now.Sub(b.LastActiveStamp.Time).Seconds()))
-		}
-		// Set/refresh the stamp on every non-paused, non-terminal reconcile.
-		// The stamp is set regardless of whether a cap is set (I95: the wall
-		// clock is always accumulated; the cap only decides enforcement).
-		// A Paused Loop does not set the stamp (item E: the pause stops the
-		// clock). A terminal Loop does not set the stamp either (the clock is
-		// stopped the same way: a finished Loop's active time is fixed).
-		st := now
-		stamp = &st
-	}
-	var current int64
-	if loop.Status.Budget != nil {
-		current = loop.Status.Budget.ActiveSeconds
-	}
-	current += added
-	r.ensureBudgetStatus(loop, current, stamp)
-	// The RequeueAfter for a quiet wall-clock Loop (item 10): only when the
-	// cap is set and not yet hit, re-reconcile at the remaining time.
-	if loop.Spec.Budget != nil && loop.Spec.Budget.MaxWallClock != "" {
-		if d, err := coxv1alpha1.ParseMaxWallClock(loop.Spec.Budget.MaxWallClock); err == nil && d > 0 {
-			remaining := d - time.Duration(current)*time.Second
-			if remaining > 0 {
-				budgetRequeue = remaining
-			}
-		}
-	}
-
-	// --- the decision (pure function of status.budget + spec.budget) ---
-	// Gated on phase != Paused (P2f: the budget decision is inert in Paused —
-	// a wall-clock hit while paused records exceeded but does not change the
-	// phase/reason; re-evaluated on resume) and on every terminal phase
-	// (item 8: a budget entry on a terminal phase would overwrite the
-	// terminal record — a Succeeded Loop must not flip to Paused/Failed on a
-	// cap hit, and a Failed Loop's stall record must not be clobbered by a
-	// budget Fail; the reading is still folded into status.budget by
-	// stepUsageRead, so the BudgetExceeded CONDITION may still be recorded,
-	// but the onExceeded phase action does not fire). The decision runs AFTER
-	// the verify/stall decisions (item 8: a phase already changed by the
-	// stall decision is seen here and the budget decision is inert).
-	if !loopPaused(loop) && isPausablePhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
-		r.applyBudgetDecision(ctx, loop)
-	}
-
-	return budgetRequeue
 }
 
 // capName returns the name of the first spec.budget cap the current counts

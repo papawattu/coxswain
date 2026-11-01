@@ -135,9 +135,31 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		})
 	}
 
+	// reconcile drives the Loop through the full Reconcile (including the
+	// trailing status write) and re-reads it from the API. The budget read
+	// (applyBudget, every non-hold pass) runs inside Reconcile, so one
+	// reconcile is one failed read — driving N failed reads takes N
+	// reconciles (budgetReadFailureThreshold trips after 3, one per pass).
 	reconcile := func(r *LoopReconciler, ns, name string) {
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
 		Expect(err).NotTo(HaveOccurred(), "reconcile %s/%s", ns, name)
+		if l := getLoop(ns, name); l.Status.Phase == coxv1alpha1.LoopPhaseVerifying {
+			// A claimless Planning Loop advances to Verifying (the verifyJob
+			// step) where the verify reader early-returns; park it back at
+			// Planning (the D77 specs test the budget read, not the verify
+			// outcome).
+			l.Status.Phase = coxv1alpha1.LoopPhasePlanning
+			Expect(k8sClient.Status().Update(ctx, l)).To(Succeed(), "park %s/%s at Planning", ns, name)
+		}
+	}
+
+	// failReads drives the seam into consecutive failed reads (the
+	// BudgetReadingStale trigger: budgetReadFailureThreshold, one per
+	// reconcile).
+	failReads := func(r *LoopReconciler) {
+		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return proxy.Reading{}, errors.New("usage endpoint refused")
+		}
 	}
 
 	getSandbox := func(ns, name string) *sandboxv1beta1.Sandbox {
@@ -190,6 +212,9 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		r := newReconciler(recorder)
 		loop := createLoop(ns, "d77-s1", nil)
 		primeProxy(r, loop)
+		// The bootstrap reconcile may advance the Loop to Verifying (the
+		// claimless-Planning advance); parking at Planning is harmless — the
+			// D77 specs test the budget read + hold gate, not the verify outcome.
 		reconcile(r, ns, "d77-s1") // bootstrap to Planning
 		Expect(getLoop(ns, "d77-s1").Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 
@@ -207,10 +232,13 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition)).NotTo(BeTrue(), "a successful read is not stale (absent or False)")
 		Expect(cond(l, coxv1alpha1.BudgetHoldCondition)).NotTo(BeTrue(), "a fresh reading is not a hold (absent or False)")
 
-		By("3 consecutive failed reads -> BudgetReadingStale=True (F44) and BudgetHold=True")
-		fails = 4 // 3 failures trip the threshold (4th read still fails, keeps the condition True)
-		reconcile(r, ns, "d77-s1")
+		By("3 consecutive failed reads (one per reconcile) -> BudgetReadingStale=True (F44) and BudgetHold=True")
+		failReads(r)
+		for i := 0; i < budgetReadFailureThreshold; i++ {
+			reconcile(r, ns, "d77-s1")
+		}
 		l = getLoop(ns, "d77-s1")
+		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning), "the hold is at Planning")
 		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition)).To(BeTrue(), "F44: 3 failed reads set BudgetReadingStale")
 		hold := cond(l, coxv1alpha1.BudgetHoldCondition)
 		Expect(hold).NotTo(BeNil(), "BudgetHold condition must be set")
@@ -247,22 +275,19 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		loop := createLoop(ns, "d77-s2", nil)
 		primeProxy(r, loop)
 		reconcile(r, ns, "d77-s2")
-		fails := 4
-		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
-			if fails > 0 {
-				fails--
-				return proxy.Reading{}, errors.New("usage endpoint refused")
-			}
-			return proxy.Reading{BootID: "B1", PromptTokens: 10, CompletionTokens: 5, Requests: 1}, nil
+		failReads(r)
+		for i := 0; i < budgetReadFailureThreshold; i++ {
+			reconcile(r, ns, "d77-s2")
 		}
-		reconcile(r, ns, "d77-s2")
 		l := getLoop(ns, "d77-s2")
 		held := cond(l, coxv1alpha1.BudgetHoldCondition)
 		Expect(held).NotTo(BeNil(), "the hold condition is persisted on the held pass (re-read from the API)")
 		Expect(held.Status).To(Equal(metav1.ConditionTrue), "held first")
 
 		By("the seam flips to a fresh reading: the release is automatic")
-		fails = 0
+		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return proxy.Reading{BootID: "B1", PromptTokens: 10, CompletionTokens: 5, Requests: 1}, nil
+		}
 		reconcile(r, ns, "d77-s2")
 		l = getLoop(ns, "d77-s2")
 		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition).Status).To(Equal(metav1.ConditionFalse),
@@ -288,15 +313,10 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		})
 		primeProxy(r, loop)
 		reconcile(r, ns, "d77-s3")
-		fails := 4
-		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
-			if fails > 0 {
-				fails--
-				return proxy.Reading{}, errors.New("usage endpoint refused")
-			}
-			return proxy.Reading{}, errors.New("usage endpoint refused")
+		failReads(r)
+		for i := 0; i < budgetReadFailureThreshold; i++ {
+			reconcile(r, ns, "d77-s3")
 		}
-		reconcile(r, ns, "d77-s3")
 		l := getLoop(ns, "d77-s3")
 		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition).Status).To(Equal(metav1.ConditionTrue),
 			"F44 still SURFACES the staleness for a maxTokens-only Loop")
@@ -338,14 +358,6 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		Expect(hold).NotTo(BeNil())
 		Expect(hold.Status).To(Equal(metav1.ConditionTrue), "a maxCost Loop is held once its reading is stale")
 	})
-
-	// staleReading drives the seam into 3+ consecutive failed reads (the
-	// BudgetReadingStale trigger) over one reconcile.
-	failReads := func(r *LoopReconciler) {
-		r.readProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
-			return proxy.Reading{}, errors.New("usage endpoint refused")
-		}
-	}
 
 	// reconcileStale reconciles past the F44 threshold (threshold+1 failed
 	// reads) on the named Loop with the given reconciler.

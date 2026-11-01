@@ -139,12 +139,12 @@ to the node pool.
   homelab runs k3s with flannel and SMB-backed storage). OPERATOR.md's
   tested profiles today are kind + the D38 Calico test profile
   (`config/calico/kustomization.yaml`, `docs/TROUBLESHOOTING.md:220-232`).
-  **This slice is written after the homelab H3 (flannel under the D38 CNI
-  gate) and H4 (SMB storage) results come back** (`papawattu/homelab` PR
+  **This slice is written after the homelab H3 (SMB storage) and H4
+  (flannel under the D38 CNI gate) results come back** (`papawattu/homelab` PR
   #149), so its contents carry that evidence, not assumptions.
 - **What:** a new section in `docs/OPERATOR.md`: the k3s profile — install
-  (install.yaml/chart on k3s), the D38 network gate under flannel (the H3
-  evidence says how; if H3 shows a gap, the section documents the gap + the
+  (install.yaml/chart on k3s), the D38 network gate under flannel (the H4
+  evidence says how; if H4 shows a gap, the section documents the gap + the
   flag that works around it, and the gap becomes a queue item, not a silent
   workaround in the docs, R26 I90); the SMB storage profile — the
   StorageClass for workspace PVCs and the memory PVC (P5a's

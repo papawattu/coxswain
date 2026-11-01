@@ -78,6 +78,11 @@ if missing:
         ('ClusterRole', 'coxswain-loop-admin-role'),   # rbac.helpers.enabled=false in the chart
         ('ClusterRole', 'coxswain-loop-editor-role'),  # rbac.helpers.enabled=false in the chart
         ('ClusterRole', 'coxswain-loop-viewer-role'),  # rbac.helpers.enabled=false in the chart
+        # D102: the secret-reader ClusterRole ships under the chart's static
+        # name `coxswain-secret-reader` (the docs command hardcodes it), but
+        # config/default's namePrefix renders it `coxswain-coxswain-secret-reader`
+        # in install.yaml (the prefix already carries the project name).
+        ('ClusterRole', 'coxswain-coxswain-secret-reader'),
     }
     unexpected = [x for x in missing if x not in expected]
     if unexpected:

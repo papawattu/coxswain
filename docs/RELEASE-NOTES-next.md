@@ -62,6 +62,42 @@ override is yours to pin.
 
 ## Security fixes
 
+### D76/D102: Secrets are opt-in — the operator has no cluster-wide Secret read, and a named Secret must be labelled before the Loop can use it — PR #N/A (this PR)
+
+- **What was wrong.** A Loop author could name ANY Secret in their namespace
+  (`spec.workspace.gitCredentialSecret`, `spec.agent.endpointSecretRef`, or
+  the AgentPolicy tools' `credentialSecretRef`), and the operator mounted it
+  and presented it to a host the SAME author chose (e.g. the model endpoint).
+  The operator was a confused deputy: any author could read any Secret in
+  their namespace by routing it to their own host.
+- **What changed.** Two gates, both checked in `validateStep` BEFORE the
+  sandbox is created (no sandbox, no verify/deliver Job, no proxy objects
+  while held; requeue until fixed — the hold releases on the SAME Loop's next
+  reconcile, no restart):
+  1. **D102 (per-namespace opt-in).** The operator's ClusterRole has NO
+     `secrets` rule at all (the RBAC coverage test asserts it). A new
+     `coxswain-secret-reader` ClusterRole (`get` on secrets ONLY) ships with
+     NO binding (config/rbac/ + the chart). An admin enables a namespace by
+     creating a RoleBinding from that ClusterRole to the operator's
+     ServiceAccount (the command is in `docs/OPERATOR.md` + `docs/UPGRADE.md`).
+     In a disabled namespace the metadata read is Forbidden and the Loop
+     holds with `SecretsUsable=False reason=NamespaceNotEnabled`.
+  2. **D76(a) (per-Secret opt-in).** Each named Secret must carry the label
+     `coxswain.io/usable: "true"`. The operator checks METADATA only (a
+     `PartialObjectMetadata` read through the API reader — never the data).
+     An unlabelled Secret holds with `SecretsUsable=False reason=
+     SecretNotOptedIn`; a missing Secret with `SecretNotFound`.
+  The `SecretsUsable` condition is always set (never absent): `True
+  reason=NoSecrets` when the Loop names no Secret, `True reason=OptedIn`
+  when every named Secret is opted in. A True→False transition emits one
+  Warning Event. The three references are all covered (envtest specs for
+  each); unlabelling or removing the binding re-holds (fail-closed).
+- **On upgrade.** If you use Secrets in a namespace, run the RoleBinding
+  command and label the Secrets — see `docs/UPGRADE.md` ("Secret opt-in:
+  `SecretsUsable` holds Loops in namespaces without the binding") and
+  `docs/TROUBLESHOOTING.md` (`SecretsUsable=False`). A Loop that names no
+  Secret is unaffected.
+
 ### F60: the verify canary, a negative control for in-process subversion — #366
 
 - **What was wrong.** The verify Job's acceptance checks and the other trusted inits run in the same pod as the agent's checkout: an agent that subverts the test harness in-process (the round-8 probe was a test that force-exited the binary with `os.Exit(0)`) could make every check exit 0 and the verify would pass with no detection (F60, PR #366, merged `fc04736`).
@@ -957,8 +993,11 @@ closed by the PRs named beside them. In plain words, the items still open:
 
 **Waiting on owner decisions (not builder tasks):**
 
-- a precondition before the operator mounts a named Secret and presents it
-  to a host the same author names (confused deputy);
+- ~~a precondition before the operator mounts a named Secret and presents it
+  to a host the same author names (confused deputy)~~ — SHIPPED as D76/D102
+  (Secret opt-in, above): the RoleBinding + `coxswain.io/usable` label, both
+  admin-only (the builder cannot create them), and a metadata-only check that
+  holds the Loop while unmet.
 - whether a stale usage reading should hold the Loop at its cost cap (F44);
 - whether to enable the operator NetworkPolicy by default (F45 P3-1);
 - narrowing editor write access to the two approval conditions only (F47

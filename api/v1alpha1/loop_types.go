@@ -1546,6 +1546,46 @@ const (
 	// preserved: the re-hold comes from clearing the PlanApproved condition
 	// + the approval gate, the condition only surfaces the mismatch).
 	PlanMismatchCondition = "PlanMismatch"
+	// SecretsUsableCondition (R30 D76/D102) records whether every Secret the
+	// Loop names is opted in for use by the operator. The operator mounts or
+	// presents the three Secret references a Loop names (spec.workspace.
+	// gitCredentialSecret, spec.agent.endpointSecretRef, and the referenced
+	// AgentPolicies' tools credentialSecretRef) — before ANY object that uses
+	// a Secret is created, the operator checks that each exists and carries
+	// the label coxswain.io/usable: "true". The check reads Secret METADATA
+	// ONLY through the manager's API reader (never the cached client — a
+	// cached Get on Secrets would start a cluster-wide list/watch the operator
+	// has no RBAC for). True + reason OptedIn = every named Secret is opted
+	// in and the Loop proceeds. False + a named reason = the Loop is HELD
+	// (no sandbox, no verify/deliver Job, no proxy objects) and requeued:
+	// NamespaceNotEnabled (the operator has no secrets get grant in the
+	// Loop's namespace — the D102 opt-in RoleBinding is missing),
+	// SecretNotFound (the named Secret does not exist), SecretNotOptedIn
+	// (the Secret exists but its coxswain.io/usable label is missing or not
+	// "true"). True + reason NoSecrets = the Loop names no Secret; the
+	// condition is set (never absent) so the absence never means "unchecked".
+	SecretsUsableCondition = "SecretsUsable"
+)
+
+// SecretsUsable condition reasons (the named values on the condition).
+const (
+	// SecretsUsableReasonOptedIn: every named Secret exists and carries the
+	// opt-in label.
+	SecretsUsableReasonOptedIn = "OptedIn"
+	// SecretsUsableReasonNoSecrets: the Loop names no Secret (the condition
+	// is True so the absence never means "unchecked").
+	SecretsUsableReasonNoSecrets = "NoSecrets"
+	// SecretsUsableReasonNamespaceNotEnabled: the operator's Get on a named
+	// Secret returned Forbidden — the D102 per-namespace opt-in RoleBinding
+	// (the coxswain-secret-reader ClusterRole bound to the operator's
+	// ServiceAccount in the Loop's namespace) is missing.
+	SecretsUsableReasonNamespaceNotEnabled = "NamespaceNotEnabled"
+	// SecretsUsableReasonSecretNotFound: the named Secret does not exist in
+	// the Loop's namespace.
+	SecretsUsableReasonSecretNotFound = "SecretNotFound"
+	// SecretsUsableReasonSecretNotOptedIn: the named Secret exists but its
+	// coxswain.io/usable label is missing or not "true".
+	SecretsUsableReasonSecretNotOptedIn = "SecretNotOptedIn"
 )
 
 // B2 restore condition reasons (the RestoreCondition's named reasons;

@@ -317,6 +317,139 @@ var (
 	_ = regexp.MustCompile
 )
 
+// TestRBACNoSecretsInOperatorRole asserts the D76 (R30) confused-deputy
+// fix, part 1 (D102): the operator's ClusterRole has NO secrets rule at
+// all — the operator never gets a cluster-wide Secret read. The Secret
+// read is the per-namespace opt-in (TestRBACSecretReaderRole): a
+// get-only ClusterRole (coxswain-secret-reader) that an admin binds to the
+// operator's ServiceAccount in a single namespace. A secrets rule in
+// role.yaml (any verb, including get alone) would make every namespace
+// opt-in by default and the D76 defect returns.
+func TestRBACNoSecretsInOperatorRole(t *testing.T) {
+	rolePath := filepath.Join("..", "..", "config", "rbac", "role.yaml")
+	data, err := os.ReadFile(rolePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", rolePath, err)
+	}
+
+	var role struct {
+		Rules []struct {
+			APIGroups []string `yaml:"apiGroups"`
+			Resources []string `yaml:"resources"`
+			Verbs     []string `yaml:"verbs"`
+		} `yaml:"rules"`
+	}
+	if err := yaml.Unmarshal(data, &role); err != nil {
+		t.Fatalf("unmarshal role.yaml: %v", err)
+	}
+
+	for i, rule := range role.Rules {
+		for _, res := range rule.Resources {
+			if res == "secrets" {
+				t.Errorf("operator ClusterRole rule %d grants %v on secrets (group %q): the operator must have NO cluster-wide Secret access (D76/D102); the per-namespace opt-in is the coxswain-secret-reader ClusterRole (get only, no binding shipped)",
+					i, rule.Verbs, strings.Join(rule.APIGroups, ","))
+			}
+		}
+	}
+}
+
+// TestRBACSecretReaderRole asserts the D102 per-namespace Secret opt-in:
+// the shipped coxswain-secret-reader ClusterRole (config/rbac/
+// secret_reader_role.yaml) grants EXACTLY get on secrets in the core
+// group "" — no other verb (list/watch would be a broader read than the
+// metadata Get the gate needs, and the gate reads one named Secret at a
+// time, never a list), no other resource, no extra rule, and no binding
+// shipped (config/rbac/kustomization.yaml lists the ClusterRole but no
+// RoleBinding/ClusterRoleBinding for it; the admin creates the
+// per-namespace RoleBinding by hand — docs/OPERATOR.md + docs/UPGRADE.md).
+func TestRBACSecretReaderRole(t *testing.T) {
+	rolePath := filepath.Join("..", "..", "config", "rbac", "secret_reader_role.yaml")
+	data, err := os.ReadFile(rolePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", rolePath, err)
+	}
+
+	var doc struct {
+		Kind     string `yaml:"kind"`
+		Metadata struct {
+			Name string `yaml:"name"`
+		} `yaml:"metadata"`
+		Rules []struct {
+			APIGroups []string `yaml:"apiGroups"`
+			Resources []string `yaml:"resources"`
+			Verbs     []string `yaml:"verbs"`
+		} `yaml:"rules"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal secret_reader_role.yaml: %v", err)
+	}
+
+	if doc.Kind != "ClusterRole" {
+		t.Fatalf("secret_reader_role.yaml kind is %q, want ClusterRole", doc.Kind)
+	}
+	if doc.Metadata.Name != "coxswain-secret-reader" {
+		t.Fatalf("ClusterRole name is %q, want coxswain-secret-reader", doc.Metadata.Name)
+	}
+
+	// The group must be the core group "" (the trusted table's group for
+	// secrets; the B1 storageclasses lesson: a wrong group passes envtest
+	// and wedges the real read). Note secrets is intentionally NOT in the
+	// operator's cached-read set (it is read through the API reader, never
+	// the cache), so the knownResourceGroup table does not list it — pin the
+	// group here explicitly.
+	if groupForResource("secrets") != coreGroup {
+		t.Fatalf("the trusted table says secrets is group %q, want the core group %%q (a stale table entry — the D102 ClusterRole pins the core group)", groupForResource("secrets"))
+	}
+
+	if len(doc.Rules) != 1 {
+		t.Fatalf("coxswain-secret-reader has %d rules, want exactly 1 (get on secrets only)", len(doc.Rules))
+	}
+	rule := doc.Rules[0]
+	if len(rule.APIGroups) != 1 || rule.APIGroups[0] != coreGroup {
+		t.Errorf("rule apiGroups is %v, want exactly [\"\"] (the core group where secrets lives)", rule.APIGroups)
+	}
+	if len(rule.Resources) != 1 || rule.Resources[0] != "secrets" {
+		t.Errorf("rule resources is %v, want exactly [secrets] (nothing else)", rule.Resources)
+	}
+	if len(rule.Verbs) != 1 || rule.Verbs[0] != "get" {
+		t.Errorf("rule verbs is %v, want exactly [get] (no list/watch/patch/update/delete — the gate reads ONE named Secret's metadata at a time)", rule.Verbs)
+	}
+
+	// No binding shipped: the kustomization lists the ClusterRole but must
+	// not list a RoleBinding/ClusterRoleBinding that references it (the
+	// admin creates the per-namespace RoleBinding by hand; a shipped
+	// cluster-wide binding would enable every namespace and defeat the
+	// opt-in).
+	kustPath := filepath.Join("..", "..", "config", "rbac", "kustomization.yaml")
+	kustData, err := os.ReadFile(kustPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", kustPath, err)
+	}
+	var kust struct {
+		Resources []string `yaml:"resources"`
+	}
+	if err := yaml.Unmarshal(kustData, &kust); err != nil {
+		t.Fatalf("unmarshal kustomization.yaml: %v", err)
+	}
+	listed := false
+	for _, r := range kust.Resources {
+		if r == "secret_reader_role.yaml" {
+			listed = true
+		}
+		// A binding that targets the secret-reader ClusterRole by name
+		// (the D102 opt-in binding) must not ship: the admin creates the
+		// per-namespace RoleBinding by hand. (The other bindings the
+		// kustomization lists — leader election, metrics auth — are
+		// unrelated pre-existing scaffolding.)
+		if strings.Contains(r, "secret_reader") && strings.Contains(r, "binding") {
+			t.Errorf("config/rbac/kustomization.yaml lists a secret-reader binding (%s): the D102 opt-in ships NO binding (the admin creates the per-namespace RoleBinding by hand)", r)
+		}
+	}
+	if !listed {
+		t.Errorf("config/rbac/kustomization.yaml does not list secret_reader_role.yaml (the ClusterRole must ship)")
+	}
+}
+
 // TestRBACCachedClientReads asserts the A6 P1: every resource the manager's
 // CACHE Gets/Lists/Watches has get;list;watch in config/rbac/role.yaml.
 //

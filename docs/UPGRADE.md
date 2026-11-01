@@ -474,3 +474,46 @@ naming this document (the same Event a terminating namespace produces), so
 (Not verified against a live API server for this CRD: the ratcheting split
 above is the behaviour the F48 section documents, and the finalizer-removal
 Event is covered by a spec.)
+
+## Secret opt-in: `SecretsUsable` holds Loops in namespaces without the binding (D76/D102)
+
+A Loop can name Secrets in three places — `spec.workspace.gitCredentialSecret`,
+`spec.agent.endpointSecretRef`, and the AgentPolicy tools' `credentialSecretRef`
+(the tool proxy). After this change the operator checks each named Secret
+BEFORE it uses it: the operator's ClusterRole has no `secrets` rule at all
+(no cluster-wide Secret read), and a Secret is usable only when (a) the
+namespace has the D102 opt-in — a `RoleBinding` from the shipped
+`coxswain-secret-reader` ClusterRole (`get` on secrets only) to the operator's
+ServiceAccount — and (b) the Secret itself carries the label
+`coxswain.io/usable: "true"`. The operator reads only the Secret's METADATA
+(never the data), and the check is re-run on every reconcile.
+
+A Loop in a namespace without the binding, or naming a Secret without the
+label, is HELD before the sandbox is created (no sandbox, no verify/deliver
+Job, no proxy objects) with
+`SecretsUsable=False reason=NamespaceNotEnabled|SecretNotOptedIn|
+SecretNotFound` (the message names the blocking Secret and the field that
+references it), and it requeues until the label or the binding is added.
+Label the Secret or bind the namespace and the SAME Loop proceeds on its
+next reconcile — no restart.
+
+If you use Secrets in any namespace, enable it on upgrade (one command per
+namespace):
+
+```bash
+# Enable a namespace (the operator's default namespace/serviceaccount):
+kubectl -n <namespace> create rolebinding coxswain-secret-reader \
+  --clusterrole=coxswain-secret-reader \
+  --serviceaccount=coxswain-system:coxswain-controller-manager
+
+# Opt in each Secret the Loops name (git credential, model endpoint, tool credentials):
+kubectl -n <namespace> label secret <name> coxswain.io/usable=true
+```
+
+Loops that name no Secret are unaffected (`SecretsUsable=True
+reason=NoSecrets`). The check is metadata-only, so labelling does not expose
+any Secret data to the operator, and unlabelling a Secret (or deleting the
+RoleBinding) re-holds the Loop on its next reconcile (fail-closed). The
+`kubectl describe loop` `SecretsUsable` condition names the blocking Secret
+and the field; the same condition appears in `docs/OPERATOR.md` (Key
+conditions to watch) and `docs/TROUBLESHOOTING.md`.

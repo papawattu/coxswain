@@ -748,6 +748,14 @@ func (r *LoopReconciler) validateStep(ctx context.Context, loop *coxv1alpha1.Loo
 	if r.modelConfigInvalid(ctx, loop) {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
 	}
+	// D76/D102: the Secret opt-in gate. Every Secret the Loop names must
+	// exist and carry coxswain.io/usable: "true" BEFORE any object that
+	// mounts or uses a Secret is created (the sandbox's init-clone mount,
+	// the model/egress/tool proxies, the verify/deliver Jobs). A held Loop
+	// gets no sandbox, no verify/deliver Job, and no proxy objects.
+	if res, done := r.applySecretsGate(ctx, loop); done {
+		return res, true
+	}
 	return ctrl.Result{}, false
 }
 

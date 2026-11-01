@@ -1306,3 +1306,49 @@ The Q4 audit trail is separate: every alert, allowed and blocked, is written as
 one JSON line on the operator's stdout (`{time, loop, namespace, iteration,
 source, action, target, verdict, detail}`), with `iteration` joined from the
 Loop's status at emit time.
+
+## `SecretsUsable=False` — the Loop is held on a Secret it names (D76/D102)
+
+**What you see:** a Loop that names a Secret — in `spec.workspace.
+gitCredentialSecret`, `spec.agent.endpointSecretRef`, or the AgentPolicy tools'
+`credentialSecretRef` — is held BEFORE the sandbox is created (no sandbox, no
+verify/deliver Job, no proxy objects) with a `SecretsUsable=False` condition
+(the message names the blocking Secret and the field that references it) and
+requeues until it is fixed:
+
+| Reason | Means |
+|---|---|
+| `NamespaceNotEnabled` | the namespace has no `RoleBinding` from the `coxswain-secret-reader` ClusterRole to the operator's ServiceAccount (the D102 per-namespace opt-in is missing) |
+| `SecretNotOptedIn` | the Secret exists but does not carry the label `coxswain.io/usable: "true"` (D76(a)) — or the operator could not read it (a transient read error fails closed to this reason) |
+| `SecretNotFound` | the named Secret does not exist in the Loop's namespace |
+
+**What it means:** the D76 confused-deputy fix. A Loop author could previously
+name ANY Secret in their namespace, and the operator mounted it and presented
+it to a host the SAME author chose — so the operator was a confused deputy
+that let one author read any Secret. The operator's ClusterRole has no
+`secrets` rule at all (no cluster-wide Secret read); a namespace is enabled by
+an ADMIN binding the shipped `coxswain-secret-reader` ClusterRole (`get` on
+secrets only) to the operator's ServiceAccount, and each Secret is opted in
+by the `coxswain.io/usable: "true"` label. The operator reads only the
+Secret's METADATA (a `PartialObjectMetadata` read through the API reader —
+never the data), and re-checks on every reconcile, so labelling the Secret or
+creating the RoleBinding releases the SAME Loop on its next reconcile (no
+restart), and unlabelling or removing the binding re-holds it (fail-closed).
+
+**What to do:**
+
+```bash
+# 1. Enable the namespace (an admin; defaults shown):
+kubectl -n <namespace> create rolebinding coxswain-secret-reader \
+  --clusterrole=coxswain-secret-reader \
+  --serviceaccount=coxswain-system:coxswain-controller-manager
+
+# 2. Opt in the Secret the condition names (the message says which field):
+kubectl -n <namespace> label secret <name> coxswain.io/usable=true
+```
+
+For `SecretNotFound`, create the Secret (or fix the Loop's spec to name the
+right one). A Loop that names no Secret is unaffected: it carries
+`SecretsUsable=True reason=NoSecrets` (the condition is always set, never
+absent). See `docs/OPERATOR.md` (Secret opt-in) and `docs/UPGRADE.md` (the
+D76/D102 section).

@@ -143,6 +143,15 @@ the start).
 The following changes landed after v0.1.2. Each entry says what changed and
 what you must DO (or why there is nothing to do).
 
+- **Upgrade the `cox` CLI together with the operator.** Plan approval moved
+  to a one-shot metadata annotation (D85): `cox approve` / `cox reject`
+  patch the Loop's `coxswain.io/approve` / `coxswain.io/reject` annotation
+  instead of the `loops/status` subresource, and the editor role's
+  `loops/status` grant is now `get` only. An older CLI's approve and reject
+  now fail for editor-bound users (they still write the status subresource,
+  which the editor role no longer allows) — upgrade the CLI with the
+  operator, not separately.
+
 ### The operator's ClusterRole gained a serviceaccounts rule
 
 The ClusterRole now includes `serviceaccounts` (create, get, list, watch)

@@ -940,11 +940,16 @@ closed by the PRs named beside them. In plain words, the items still open:
   tamper evidence, the budget counters, the stall history, and checkpoint
   entries. F47 (#254) makes the operator validate the checkpoint
   entries it acts on, but the grant itself is still broader than ADR-0005
-  allows. Until the fix (owner decision D85; recommended: `cox
-  approve`/`reject` writes a one-shot annotation the operator turns into
-  the condition and clears, and the editor role goes back to read-only
-  status), bind the editor role only to users you would trust with the
-  Loop's verdicts.
+  allows. **Fixed by #377** (owner decision D85, option (b)): `cox
+  approve`/`reject` no longer writes the status subresource — it patches
+  the Loop's metadata with a one-shot annotation (`coxswain.io/approve` /
+  `coxswain.io/reject`) that the operator turns into the condition and
+  clears, and the editor role's `loops/status` grant is back to `get`
+  only. A stale approval (a re-plan after the CLI's read) is caught by the
+  I93 plan-hash check at Implementing start. The `loop_admin_role.yaml`
+  admin role is unchanged (the trusted role). Until this release lands,
+  bind the editor role only to users you would trust with the Loop's
+  verdicts.
 - **F86**: a fork from another Loop's checkpoint named in the spec is not
   ownership-checked.
 - **F87(c)**: a forged `status.checkpoints` entry at the current iteration

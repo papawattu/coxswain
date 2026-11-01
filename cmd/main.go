@@ -442,39 +442,34 @@ func main() {
 		setupLog.Error(err, "Failed to register the alert relay Runnable")
 		os.Exit(1)
 	}
-	if err := (&controller.LoopReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		Enforcer:               kaEnforcer,
-		AllowUnenforced:        allowUnenforced,
-		AllowUnenforcedNetwork: allowUnenforcedNetwork,
-		MemoryStorageClass:     memoryStorageClass,
-		SecretOptInRequired:    *optIn,
-		MemoryWriterImage:      memoryWriterImage,
-		CNIProber:              cniProber,
-		CNIRegateSource:        cniRegateSrc,
-		Audit:                  auditHolder,
-		ClusterDomain:          clusterDomain,
-		WorkspaceGitImage:      workspaceGitImage,
-		RunnerImage:            runnerImage,
-		VerifyImage:            verifyImage,
-		ToolProxyImage:         toolProxyImage,
-		EgressProxyImage:       egressProxyImage,
-		// P2b (ADR-0009): the metering model proxy image (default empty -> the
-		// reconciler's coxswain-proxy:metering) and the operator's namespace (the
-		// proxy pod's usage-port ingress source).
-		ProxyImage:        proxyImage,
-		OperatorNamespace: operatorNamespace,
-		// D38: the NetworkEnforced condition-change Event (the manager's
-		// recorder posts it as a Kubernetes Event; the re-gate Event lives
-		// in the probe Runnable).
-		// GetEventRecorderFor is deprecated in controller-runtime v0.25 in favour
-		// of GetEventRecorder (new events.k8s.io/v1 API) — but that returns the
-		// new events.EventRecorder (AnnotatedEventf) whose method set differs
-		// from LoopReconciler.Recorder (client-go record.EventRecorder). Keep the
-		// old (v1 Event, still fully supported) API until the recorder is ported.
-		Recorder: mgr.GetEventRecorderFor("loop-controller"), //nolint:staticcheck
-	}).SetupWithManager(mgr); err != nil {
+	// D76/D102 (R45 review, PR #380 P2): the reconciler construction is a
+	// function (newLoopReconciler, loop_reconciler.go) so main's wiring of the
+	// parsed flags into the reconciler is covered by a cmd test — a missed
+	// SecretOptInRequired wiring fails the test, not a production install.
+	loopReconciler := newLoopReconciler(mgr.GetClient(), mgr.GetScheme(),
+		// GetEventRecorderFor is deprecated in controller-runtime v0.25 in
+		// favour of GetEventRecorder (new events.k8s.io/v1 API) — but that
+		// returns the new events.EventRecorder (AnnotatedEventf) whose method
+		// set differs from LoopReconciler.Recorder (client-go
+		// record.EventRecorder). Keep the old (v1 Event, still fully
+		// supported) API until the recorder is ported.
+		mgr.GetEventRecorderFor("loop-controller"), //nolint:staticcheck
+		newLoopReconcilerOptions{
+			SecretOptInRequired:    *optIn,
+			AllowUnenforced:        allowUnenforced,
+			AllowUnenforcedNetwork: allowUnenforcedNetwork,
+			MemoryStorageClass:     memoryStorageClass,
+			MemoryWriterImage:      memoryWriterImage,
+			ClusterDomain:          clusterDomain,
+			WorkspaceGitImage:      workspaceGitImage,
+			RunnerImage:            runnerImage,
+			VerifyImage:            verifyImage,
+			ToolProxyImage:         toolProxyImage,
+			EgressProxyImage:       egressProxyImage,
+			ProxyImage:             proxyImage,
+			OperatorNamespace:      operatorNamespace,
+		}, kaEnforcer, cniProber, cniRegateSrc, auditHolder)
+	if err := loopReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")
 		os.Exit(1)
 	}

@@ -1335,6 +1335,16 @@ never the data), and re-checks on every reconcile, so labelling the Secret or
 creating the RoleBinding releases the SAME Loop on its next reconcile (no
 restart), and unlabelling or removing the binding re-holds it (fail-closed).
 
+**While a sandbox is already running:** the gate runs before any object is
+created, so removing the label (or the namespace's RoleBinding) holds LATER
+steps (verify, deliver, proxy objects) but does not suspend a sandbox that is
+already running. Re-adding the label releases the later steps.
+
+**`SecretNotOptedIn` on a label that is there:** a transient read error on the
+operator's metadata read of the Secret also fails closed to this reason
+(re-hold; it clears on the next reconcile) — before you unlabel or re-bind,
+wait one reconcile and check the label again.
+
 **What to do:**
 
 ```bash

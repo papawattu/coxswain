@@ -59,6 +59,13 @@ moved off the floating `python:3-alpine` minor tag to a version-exact
 reference shape. Nothing to do unless you override one of the three flags — an
 override is yours to pin.
 
+## New features
+
+### C2: pinning Loops to a node pool — operator flags `--loop-node-selector` and `--loop-tolerations` (PR #381, this PR)
+
+- **What changed.** Two operator flags pin every operator-owned Loop workload (the sandbox, the model/egress/tool proxy pods, and the verify, deliver and memory-writer Jobs) to a dedicated node pool (C2/D101): `--loop-node-selector key=value[,key=value]` and `--loop-tolerations key:op:effect[:value[:seconds]]` (op `Equal` or `Exists`; `Exists` takes no value, and a seconds-only Exists token keeps the value slot empty: `key:Exists:NoExecute::30`). Empty (the default) means no placement — today's behaviour. A malformed token is a STARTUP error that names the bad token, never a silent drop. `kubectl label node <n> coxswain.io/pool=loops` + `kubectl taint node <n> coxswain.io/pool=loops:NoSchedule` + the matching flags is the documented workflow (docs/OPERATOR.md, new section "Pinning Loops to a node pool (C2)").
+- **On upgrade.** Nothing required; the flags default to empty, so an install that does not set them behaves exactly as before. With the flags set but no matching node, the sandbox stays Pending and the Loop shows `SandboxNotStarting` (the Loop does not yet fail on its own — F93a, a later slice).
+
 
 ## Security fixes
 

@@ -266,11 +266,11 @@ func main() {
 	var loopTolerations string
 	flag.StringVar(&loopTolerations, "loop-tolerations", "",
 		"Comma-separated node tolerations for every operator-owned Loop workload (C2/D101). "+
-			"Forms (the approved plan's format, PLAN-PHASE6.md): key:op:effect, key:op:effect:value, " +
-			"key:op:effect:value:seconds (op is always field 2: Equal | Exists — NotEqual is not a " +
-			"Kubernetes toleration operator; effect: NoSchedule | PreferNoSchedule | NoExecute). " +
-			"Equal requires a value; Exists must not have one (seconds-only Exists keeps the value " +
-			"slot empty: key:Exists:NoExecute::30). Default: empty (no tolerations). A malformed token " +
+			"Forms (the approved plan's format, PLAN-PHASE6.md): key:op:effect, key:op:effect:value, "+
+			"key:op:effect:value:seconds (op is always field 2: Equal | Exists — NotEqual is not a "+
+			"Kubernetes toleration operator; effect: NoSchedule | PreferNoSchedule | NoExecute). "+
+			"Equal requires a value; Exists must not have one (seconds-only Exists keeps the value "+
+			"slot empty: key:Exists:NoExecute::30). Default: empty (no tolerations). A malformed token "+
 			"fails startup with the token named.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
@@ -502,8 +502,8 @@ func main() {
 			OperatorNamespace:      operatorNamespace,
 			// C2 + D101: the Loop node-placement flags (parsed above; empty =
 			// no placement, today's behaviour).
-			LoopNodeSelector:       loopNodeSelectorMap,
-			LoopTolerations:        loopTolerationsList,
+			LoopNodeSelector: loopNodeSelectorMap,
+			LoopTolerations:  loopTolerationsList,
 		}, kaEnforcer, cniProber, cniRegateSrc, auditHolder)
 	if err := loopReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")

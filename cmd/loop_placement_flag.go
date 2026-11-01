@@ -27,7 +27,7 @@ import (
 // double comma) is a blank, not a malformed token.
 func parseLoopNodeSelector(raw string) (map[string]string, error) {
 	out := map[string]string{}
-	for _, tok := range strings.Split(raw, ",") {
+	for tok := range strings.SplitSeq(raw, ",") {
 		tok = strings.TrimSpace(tok)
 		if tok == "" {
 			continue
@@ -70,55 +70,76 @@ func parseLoopNodeSelector(raw string) (map[string]string, error) {
 // not a malformed token.
 func parseLoopTolerations(raw string) ([]corev1.Toleration, error) {
 	var out []corev1.Toleration
-	for _, tok := range strings.Split(raw, ",") {
+	for tok := range strings.SplitSeq(raw, ",") {
 		tok = strings.TrimSpace(tok)
 		if tok == "" {
 			continue
 		}
-		f := strings.Split(tok, ":")
-		if len(f) < 3 || len(f) > 5 {
-			return nil, fmt.Errorf("--loop-tolerations token %q is malformed (want key:op:effect, key:op:effect:value or key:op:effect:value:seconds)", tok)
-		}
-		if f[0] == "" || f[1] == "" || f[2] == "" {
-			return nil, fmt.Errorf("--loop-tolerations token %q is malformed (key, op and effect must be non-empty)", tok)
-		}
-		op, err := loopTolerationOperator(f[1])
+		tol, err := parseLoopTolerationToken(tok)
 		if err != nil {
-			return nil, fmt.Errorf("--loop-tolerations token %q is malformed: %v", tok, err)
+			return nil, err
 		}
-		effect, err := loopTolerationEffect(f[2])
-		if err != nil {
-			return nil, fmt.Errorf("--loop-tolerations token %q is malformed: %v", tok, err)
-		}
-		value := ""
-		if len(f) >= 4 {
-			value = f[3]
-		}
-		var seconds *int64
-		if len(f) == 5 {
-			if f[4] == "" {
-				return nil, fmt.Errorf("--loop-tolerations token %q is malformed (the seconds field is empty in a 5-field token)", tok)
-			}
-			si, err := strconv.Atoi(f[4])
-			if err != nil || si < 0 {
-				return nil, fmt.Errorf("--loop-tolerations token %q is malformed (the seconds field %q is not a non-negative integer)", tok, f[4])
-			}
-			v := int64(si)
-			seconds = &v
-		}
-		switch op {
-		case corev1.TolerationOpEqual:
-			if value == "" {
-				return nil, fmt.Errorf("--loop-tolerations token %q is malformed (op Equal requires a value)", tok)
-			}
-		case corev1.TolerationOpExists:
-			if value != "" {
-				return nil, fmt.Errorf("--loop-tolerations token %q is malformed (op Exists must not carry a value)", tok)
-			}
-		}
-		out = append(out, corev1.Toleration{Key: f[0], Operator: op, Value: value, Effect: effect, TolerationSeconds: seconds})
+		out = append(out, tol)
 	}
 	return out, nil
+}
+
+// parseLoopTolerationToken parses one non-blank --loop-tolerations token
+// (see parseLoopTolerations for the full contract). Extracted per-token so
+// the caller stays a flat loop.
+func parseLoopTolerationToken(tok string) (corev1.Toleration, error) {
+	f := strings.Split(tok, ":")
+	if len(f) < 3 || len(f) > 5 {
+		return corev1.Toleration{}, fmt.Errorf(
+			"--loop-tolerations token %q is malformed (want key:op:effect, "+
+				"key:op:effect:value or key:op:effect:value:seconds)", tok)
+	}
+	if f[0] == "" || f[1] == "" || f[2] == "" {
+		return corev1.Toleration{}, fmt.Errorf(
+			"--loop-tolerations token %q is malformed (key, op and effect must be non-empty)", tok)
+	}
+	op, err := loopTolerationOperator(f[1])
+	if err != nil {
+		return corev1.Toleration{}, fmt.Errorf("--loop-tolerations token %q is malformed: %v", tok, err)
+	}
+	effect, err := loopTolerationEffect(f[2])
+	if err != nil {
+		return corev1.Toleration{}, fmt.Errorf("--loop-tolerations token %q is malformed: %v", tok, err)
+	}
+	value := ""
+	if len(f) >= 4 {
+		value = f[3]
+	}
+	var seconds *int64
+	if len(f) == 5 {
+		if f[4] == "" {
+			return corev1.Toleration{}, fmt.Errorf(
+				"--loop-tolerations token %q is malformed (the seconds field is empty in a 5-field token)", tok)
+		}
+		si, err := strconv.Atoi(f[4])
+		if err != nil || si < 0 {
+			return corev1.Toleration{}, fmt.Errorf(
+				"--loop-tolerations token %q is malformed (the seconds field %q is not a non-negative integer)", tok, f[4])
+		}
+		v := int64(si)
+		seconds = &v
+	}
+	switch op {
+	case corev1.TolerationOpEqual:
+		if value == "" {
+			return corev1.Toleration{}, fmt.Errorf(
+				"--loop-tolerations token %q is malformed (op Equal requires a value)", tok)
+		}
+	case corev1.TolerationOpExists:
+		if value != "" {
+			return corev1.Toleration{}, fmt.Errorf(
+				"--loop-tolerations token %q is malformed (op Exists must not carry a value)", tok)
+		}
+	}
+	return corev1.Toleration{
+		Key: f[0], Operator: op, Value: value,
+		Effect: effect, TolerationSeconds: seconds,
+	}, nil
 }
 
 // loopTolerationOperator maps the op field (always field 2) to a k8s
@@ -132,7 +153,8 @@ func loopTolerationOperator(s string) (corev1.TolerationOperator, error) {
 	case "Exists":
 		return corev1.TolerationOpExists, nil
 	default:
-		return "", fmt.Errorf("the operator %q is not one of Equal, Exists (NotEqual is not a Kubernetes toleration operator)", s)
+		return "", fmt.Errorf(
+			"the operator %q is not one of Equal, Exists (NotEqual is not a Kubernetes toleration operator)", s)
 	}
 }
 

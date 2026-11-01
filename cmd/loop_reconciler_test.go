@@ -94,7 +94,10 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		ProxyImage:             "proxy:tag",
 		OperatorNamespace:      "coxswain-system",
 		LoopNodeSelector:       map[string]string{"pool": "loops", "zone": "a"},
-		LoopTolerations:        []corev1.Toleration{{Key: "pool", Operator: corev1.TolerationOpEqual, Value: "loops", Effect: corev1.TaintEffectNoSchedule}},
+		LoopTolerations: []corev1.Toleration{{
+			Key: "pool", Operator: corev1.TolerationOpEqual,
+			Value: "loops", Effect: corev1.TaintEffectNoSchedule,
+		}},
 	}
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -134,14 +137,16 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 	if len(r.LoopNodeSelector) != 2 || r.LoopNodeSelector["pool"] != "loops" || r.LoopNodeSelector["zone"] != "a" {
 		t.Errorf("LoopNodeSelector not wired: %v", r.LoopNodeSelector)
 	}
-	if len(r.LoopTolerations) != 1 || r.LoopTolerations[0].Key != "pool" || r.LoopTolerations[0].Effect != corev1.TaintEffectNoSchedule {
+	if len(r.LoopTolerations) != 1 || r.LoopTolerations[0].Key != "pool" ||
+		r.LoopTolerations[0].Effect != corev1.TaintEffectNoSchedule {
 		t.Errorf("LoopTolerations not wired: %+v", r.LoopTolerations)
 	}
 	// Positive control for the EMPTY flags: defaults mean no placement
 	// (today's behaviour). The options above are the only source of the
 	// fields, so this asserts the mapping does not inject defaults.
-	if r := newLoopReconciler(fake.NewClientBuilder().WithScheme(scheme).Build(),
-		scheme, nil, newLoopReconcilerOptions{}, nil, nil, nil, nil); len(r.LoopNodeSelector) != 0 || len(r.LoopTolerations) != 0 {
+	r = newLoopReconciler(fake.NewClientBuilder().WithScheme(scheme).Build(),
+		scheme, nil, newLoopReconcilerOptions{}, nil, nil, nil, nil)
+	if len(r.LoopNodeSelector) != 0 || len(r.LoopTolerations) != 0 {
 		t.Errorf("empty options must carry no placement: selector=%v tolerations=%+v",
 			r.LoopNodeSelector, r.LoopTolerations)
 	}

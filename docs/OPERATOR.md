@@ -16,6 +16,7 @@ see `docs/QUICKSTART.md`.
 - [Uninstall](#uninstall)
 - [What the sandbox can and cannot reach](#what-the-sandbox-can-and-cannot-reach)
 - [Reading the egress proxy log](#reading-the-egress-proxy-log)
+- [Pinning Loops to a node pool (C2)](#pinning-loops-to-a-node-pool-c2)
 - [Upgrade](#upgrade)
 
 ---
@@ -929,6 +930,55 @@ Note: non-JSON lines in the same stream (the startup
 `egress-proxy: listening on :3128, ...` line and audit-write error log
 lines) are operator logs, not audit records — filter for JSON lines when
 grepping.
+
+## Pinning Loops to a node pool (C2)
+
+Two operator flags pin every Loop's operator-owned workloads to a dedicated
+node pool. Empty (the default) means no placement — today's behaviour. A
+malformed token is a STARTUP error that names the bad token (the operator
+refuses to start with a silently different placement than configured).
+
+- `--loop-node-selector` — comma-separated `key=value` node labels, e.g.
+  `--loop-node-selector coxswain.io/pool=loops`.
+- `--loop-tolerations` — comma-separated
+  `key:op:effect[:value[:seconds]]` (the op field is ALWAYS field 2, so a
+  token is never ambiguous). `op` is `Equal` or `Exists` (NotEqual is not a
+  Kubernetes toleration operator and is rejected); effect is `NoSchedule`,
+  `PreferNoSchedule` or `NoExecute`. `Equal` requires a value; `Exists` must
+  not have one — a seconds-only Exists token keeps the value slot empty:
+  `key:Exists:NoExecute::30`.
+
+### Worked example: a dedicated loop pool
+
+```sh
+# 1. Mark the node(s).
+kubectl label node <n> coxswain.io/pool=loops
+
+# 2. Taint the node(s) so nothing else lands there.
+kubectl taint node <n> coxswain.io/pool=loops:NoSchedule
+
+# 3. Run the operator with the matching flags.
+--loop-node-selector=coxswain.io/pool=loops \
+--loop-tolerations=coxswain.io/pool:Equal:NoSchedule:loops
+```
+
+**What is pinned (D101):** the sandbox pod, the model proxy pod, the egress
+and tool proxy pods, and the verify, deliver and memory-writer Jobs.
+
+**What happens when the flags change:** the sandbox template is updated in
+place (and cleared when the flags are emptied); the proxy pods are recreated
+(their spec hash covers placement); existing Jobs keep their old placement,
+and new Jobs use the new flags.
+
+**A note on default tolerations:** Kubernetes automatically adds the
+not-ready/unreachable default tolerations (DefaultTolerationSeconds) to every
+pod, so `kubectl get pod -o yaml` shows them alongside the ones from the
+flag.
+
+**A note on a pool with no matching node:** with the flags set but no node
+matching them, the sandbox stays Pending and the Loop shows
+`SandboxNotStarting`. The Loop does not yet fail on its own — that is F93a,
+a later slice.
 
 ## Upgrade
 

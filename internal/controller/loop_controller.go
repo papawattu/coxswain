@@ -2065,14 +2065,13 @@ func applyBPFNodeAffinity(e engine.Enforcer, spec *corev1.PodSpec) {
 // survive a flag change). The sandbox template is mutated in place
 // (ensureSandbox's mutate runs this every pass); the proxy pods and Jobs are
 // built with it (their spec hashes cover the placement, so a flag change
-// recreates the proxy pods and re-places new Jobs only). It APPENDS the flag
-// tolerations — it never removes or rewrites other tolerations the pod spec
-// already carries (e.g. the sandbox pod's node unschedulable/unreachable
-// tolerations, which the sandbox controller adds; those must survive every
-// reconcile pass).
+// recreates the proxy pods and re-places new Jobs only). It ASSIGNS the flag
+// tolerations wholesale — never appending: appending would keep stale flag
+// tolerations from a previous flag state and duplicate entries on every
+// reconcile pass.
 func (r *LoopReconciler) applyLoopPlacement(spec *corev1.PodSpec) {
 	spec.NodeSelector = r.LoopNodeSelector
-	spec.Tolerations = append(spec.Tolerations, r.LoopTolerations...)
+	spec.Tolerations = r.LoopTolerations
 }
 
 // ensureSandbox makes the Sandbox match the Loop's current phase, pause state

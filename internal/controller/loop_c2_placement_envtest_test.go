@@ -77,13 +77,13 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 	// the flag) and the C2 placement fields.
 	c2Reconciler := func(selector map[string]string, tols []corev1.Toleration) *LoopReconciler {
 		return &LoopReconciler{
-			CNIProber:        testCNIProber(),
-			Client:           k8sClient,
-			Scheme:           k8sClient.Scheme(),
-			AllowUnenforced:  true,
+			CNIProber:              testCNIProber(),
+			Client:                 k8sClient,
+			Scheme:                 k8sClient.Scheme(),
+			AllowUnenforced:        true,
 			AllowUnenforcedNetwork: true,
-			LoopNodeSelector: selector,
-			LoopTolerations:  tols,
+			LoopNodeSelector:       selector,
+			LoopTolerations:        tols,
 		}
 	}
 
@@ -121,10 +121,64 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 	// else (an unexpected key or toleration is a fail — the flags are the
 	// only source; an empty flag set means empty fields).
 	carryPlacement := func(spec corev1.PodSpec, wantSel map[string]string, wantTols []corev1.Toleration) {
-		Expect(spec.NodeSelector).To(Equal(wantSel),
-			"the pod template's nodeSelector must be exactly the flag's (empty flags = empty selector)")
-		Expect(spec.Tolerations).To(Equal(wantTols),
-			"the pod template's tolerations must be exactly the flag's (empty flags = none)")
+		GinkgoHelper()
+		if len(wantSel) == 0 {
+			Expect(spec.NodeSelector).To(BeEmpty(),
+				"the pod template's nodeSelector must be exactly the flag's (empty flags = empty selector)")
+		} else {
+			Expect(spec.NodeSelector).To(Equal(wantSel),
+				"the pod template's nodeSelector must be exactly the flag's (empty flags = empty selector)")
+		}
+		if len(wantTols) == 0 {
+			Expect(spec.Tolerations).To(BeEmpty(),
+				"the pod template's tolerations must be exactly the flag's (empty flags = none)")
+		} else {
+			Expect(spec.Tolerations).To(Equal(wantTols),
+				"the pod template's tolerations must be exactly the flag's (empty flags = none)")
+		}
+	}
+
+	// defaultPodTolerations are the two entries the kube-apiserver's
+	// DefaultTolerationSeconds admission plugin adds to EVERY pod at create
+	// time (it is enabled by default; envtest's apiserver runs it). Evidence:
+	// they appear on the bare proxy PODS only, not on the Sandbox template or
+	// the Job templates. The pod's spec hash is computed from the BUILT pod,
+	// before admission (loop_controller.go: proxySpecHash :=
+	// proxyPodSpecHash(podDesired) runs before r.Create), so these extra
+	// entries cannot trigger a delete+recreate loop.
+	c2TolSecs := int64(300)
+	defaultPodTolerations := []corev1.Toleration{
+		{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists,
+			Effect: corev1.TaintEffectNoExecute, TolerationSeconds: &c2TolSecs},
+		{Key: "node.kubernetes.io/unreachable", Operator: corev1.TolerationOpExists,
+			Effect: corev1.TaintEffectNoExecute, TolerationSeconds: &c2TolSecs},
+	}
+
+	// stripDefaultPodTolerations removes the DefaultTolerationSeconds
+	// entries from a BUILT pod's tolerations so the assertions can compare
+	// the operator's placement against the flag's.
+	stripDefaultPodTolerations := func(tols []corev1.Toleration) []corev1.Toleration {
+		GinkgoHelper()
+		want := map[string]bool{}
+		for _, d := range defaultPodTolerations {
+			want[d.Key] = true
+		}
+		var out []corev1.Toleration
+		for _, t := range tols {
+			if !want[t.Key] {
+				out = append(out, t)
+			}
+		}
+		return out
+	}
+
+	// carryPodPlacement is carryPlacement for a BUILT pod (the proxy pods):
+	// the DefaultTolerationSeconds entries are filtered out before comparing.
+	carryPodPlacement := func(podSpec corev1.PodSpec, wantSel map[string]string, wantTols []corev1.Toleration) {
+		GinkgoHelper()
+		stripped := podSpec
+		stripped.Tolerations = stripDefaultPodTolerations(podSpec.Tolerations)
+		carryPlacement(stripped, wantSel, wantTols)
 	}
 
 	// c2ModelLoop creates a Loop with an endpointSecretRef (the model proxy
@@ -168,7 +222,7 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 		By("the model proxy pod")
 		p := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p)).To(Succeed())
-		carryPlacement(p.Spec, c2SelectorA, []corev1.Toleration{c2Toleration})
+		carryPodPlacement(p.Spec, c2SelectorA, []corev1.Toleration{c2Toleration})
 
 		By("the verify Job (phase Verifying, pin + baseCommit set)")
 		loop := c2GetLoop(name)
@@ -209,7 +263,7 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 		carryPlacement(c2GetSandbox("c2poff").Spec.PodTemplate.Spec, map[string]string{}, []corev1.Toleration{})
 		p2 := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "c2poff-proxy", Namespace: ns}, p2)).To(Succeed())
-		carryPlacement(p2.Spec, map[string]string{}, []corev1.Toleration{})
+		carryPodPlacement(p2.Spec, map[string]string{}, []corev1.Toleration{})
 		loop2 := c2GetLoop("c2poff")
 		loop2.Status.Phase = coxv1alpha1.LoopPhaseVerifying
 		loop2.Status.BaseCommit = "a1b2c3"
@@ -287,7 +341,7 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 		reconcile(r, name)
 		p1 := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p1)).To(Succeed())
-		carryPlacement(p1.Spec, c2SelectorA, []corev1.Toleration{c2Toleration})
+		carryPodPlacement(p1.Spec, c2SelectorA, []corev1.Toleration{c2Toleration})
 		uid1 := p1.UID
 
 		By("the operator restarts with different flags: the spec-hash drift runs the delete+recreate")
@@ -299,13 +353,13 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 		// delete lands; envtest drives the next pass explicitly.
 		pg := &corev1.Pod{}
 		ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, pg)).To(
-			MatchError(apierrors.IsNotFound))
+			MatchError(apierrors.IsNotFound, "the stale-hash pass must have DELETED the old pod (bare pod spec is immutable — only a delete+recreate can change it)"))
 		reconcile(r2, name)
 		p2 := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-proxy", Namespace: ns}, p2)).To(Succeed())
 		Expect(p2.UID).NotTo(Equal(uid1),
 			"the recreated pod is a NEW pod (the bare pod's spec is immutable — the flag change could only be applied by recreation)")
-		carryPlacement(p2.Spec, c2SelectorB, []corev1.Toleration{})
+		carryPodPlacement(p2.Spec, c2SelectorB, []corev1.Toleration{})
 	})
 
 	It("Jobs are NOT deleted+recreated on a flag change (documented in OPERATOR.md: new Jobs only)", func() {
@@ -317,7 +371,7 @@ var _ = Describe("C2: operator Loop node placement (flags pin every Loop workloa
 		r := c2Reconciler(c2SelectorA, []corev1.Toleration{c2Toleration})
 		loop := &coxv1alpha1.Loop{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec: coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()},
+			Spec:       coxv1alpha1.LoopSpec{Goal: loopGoal, Workspace: testWorkspace()},
 		}
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 		loop = c2GetLoop(name)

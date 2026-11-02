@@ -287,3 +287,42 @@ type AgentPolicyList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AgentPolicy `json:"items"`
 }
+
+// ClusterAgentPolicy is the Schema for the clusteragentpolicies API (P6a,
+// ADR-0007 Q2, D81(b)): the cluster-scoped companion to AgentPolicy. A Loop's
+// spec.policyRefs entry may name a ClusterAgentPolicy instead of a namespaced
+// AgentPolicy, so an org-wide allow exists ONCE and applies to Loops in any
+// namespace that reference it. The spec is identical to AgentPolicySpec (same
+// type reused as the plan directs: "reuse the types, second Kind"); validation
+// (absolute exec paths, in-cluster network rejects, tool rules) is the same
+// controller-side gate as for AgentPolicy. RBAC: who may create a
+// ClusterAgentPolicy is a different role from who may create a Loop
+// (ADR-0007 Q2), same as AgentPolicy.
+//
+// Name-collision rule (P6a plan + owner digest D98, namespaced wins): when a
+// policyRefs entry names BOTH a namespaced AgentPolicy and a
+// ClusterAgentPolicy, the namespaced one wins and the controller emits a
+// Warning Event (PolicyNameCollision) — the Loop author's explicit choice is
+// honoured, and the collision is visible on the object rather than a
+// rejection (a shared-name org policy must not break Loops).
+//
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:printcolumn:name="Generation",type=integer,JSONPath=`.status.observedGeneration`
+type ClusterAgentPolicy struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   AgentPolicySpec   `json:"spec,omitempty"`
+	Status AgentPolicyStatus `json:"status,omitempty"`
+}
+
+// ClusterAgentPolicyList contains a list of ClusterAgentPolicy.
+//
+// +kubebuilder:object:root=true
+type ClusterAgentPolicyList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ClusterAgentPolicy `json:"items"`
+}

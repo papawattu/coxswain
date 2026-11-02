@@ -81,6 +81,7 @@ rules:
   - coxswain.wattu.com
   resources:
   - agentpolicies
+  - clusteragentpolicies
   verbs:
   - get
   - list

@@ -596,6 +596,9 @@ type LoopReconciler struct {
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
 // +kubebuilder:rbac:groups=coxswain.wattu.com,resources=agentpolicies,verbs=get;list;watch
+// P6a (D81(b)): the loop's ClusterAgentPolicy is read through the cached
+// client (loop_controller.go resolvePolicyRefs), same verbs as AgentPolicy.
+// +kubebuilder:rbac:groups=coxswain.wattu.com,resources=clusteragentpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=security.kubearmor.com,resources=kubearmorpolicies,verbs=get;list;watch;create;update;patch;delete
 // D33: the operator owns the per-Loop proxy pod + Service (ensureProxy).
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
@@ -662,6 +665,15 @@ func (r *LoopReconciler) agentPoliciesValid(ctx context.Context, loop *coxv1alph
 		if len(loop.Spec.PolicyRefs) > 0 {
 			setCondition(loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
 		}
+		// P6a (D98): surface a policyRefs name that names BOTH a namespaced
+		// AgentPolicy and a ClusterAgentPolicy (namespaced wins). The set is
+		// the resolver's own (validateAgentPolicies already ran both Gets per
+		// ref) — no extra API calls here. Transition-gated on the sorted
+		// collision set: a Loop that stays collided re-reconciles on the
+		// requeue cadence, so one Event per change, not per pass. An Event
+		// emission never blocks the gate (a Recorder failure is not a policy
+		// failure).
+		r.emitPolicyNameCollision(ctx, loop, polResult.policyNameCollisions)
 		return true
 	}
 	setCondition(loop, "PolicyValid", metav1.ConditionFalse, polResult.reason, polResult.message)
@@ -1676,18 +1688,127 @@ func setPolicyTranslationLossy(loop *coxv1alpha1.Loop, loss translationLoss) {
 // agent narrower than declared).
 func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.Loop) (policy.EffectivePolicy, error) {
 	union := policy.EffectivePolicy{}
-	for _, name := range loop.Spec.PolicyRefs {
-		var ap coxv1alpha1.AgentPolicy
-		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap); err != nil {
-			return policy.EffectivePolicy{}, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
-		}
-		union.Exec = append(union.Exec, ap.Spec.Exec...)
-		union.Network = append(union.Network, ap.Spec.Network...)
-		union.Files = append(union.Files, ap.Spec.Files...)
-		union.Tools = append(union.Tools, ap.Spec.Tools...)
+	res, err := r.resolvePolicyRefs(ctx, loop)
+	if err != nil {
+		return policy.EffectivePolicy{}, err
+	}
+	for i := range res.specs {
+		pol := &res.specs[i]
+		union.Exec = append(union.Exec, pol.Exec...)
+		union.Network = append(union.Network, pol.Network...)
+		union.Files = append(union.Files, pol.Files...)
+		union.Tools = append(union.Tools, pol.Tools...)
 	}
 	union.Tools = dedupToolsBySpec(union.Tools)
 	return union, nil
+}
+
+// resolvePolicyRefs resolves the Loop's spec.policyRefs[] to the policy specs
+// they select (P6a, ADR-0007 Q2, D81(b)): an entry names a namespaced
+// AgentPolicy in the Loop's namespace, or — when no namespaced AgentPolicy
+// carries the name — a cluster-scoped ClusterAgentPolicy. This single resolver
+// feeds every effective-policy read (the effectivePolicy union that
+// validateAgentPolicies + KaptSpecHash + the egress/tool proxy policy hashes
+// consume), so a ClusterAgentPolicy allow is enforced exactly like a
+// namespaced one.
+//
+// Name-collision rule (D98, namespaced wins): an entry that names BOTH a
+// namespaced AgentPolicy and a ClusterAgentPolicy resolves to the NAMESPACED
+// one (the Loop author's explicit choice); the collision is surfaced, not
+// rejected (a shared-name org policy must not break Loops). The caller
+// (agentPoliciesValid, the policy-validity gate that runs every pass BEFORE
+// any sandbox write) emits the transition-gated PolicyNameCollision Warning
+// Event from the returned set, so the event fires once per transition, not
+// per pass (a Loop that stays collided re-reconciles on the requeue cadence).
+//
+// A name that matches NEITHER scope is a NotFound error — the caller maps it
+// to the existing unknown-policy gate (PolicyValid=False PolicyNotFound), so
+// the fail-closed behaviour is unchanged.
+type policyRefsResolution struct {
+	specs      []coxv1alpha1.AgentPolicySpec
+	collisions []string // policyRefs names that name BOTH a namespaced and a cluster policy
+}
+
+func (r *LoopReconciler) resolvePolicyRefs(ctx context.Context, loop *coxv1alpha1.Loop) (policyRefsResolution, error) {
+	res := policyRefsResolution{specs: make([]coxv1alpha1.AgentPolicySpec, 0, len(loop.Spec.PolicyRefs))}
+	for _, name := range loop.Spec.PolicyRefs {
+		var ap coxv1alpha1.AgentPolicy
+		nsErr := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, &ap)
+		var cap coxv1alpha1.ClusterAgentPolicy
+		clusterErr := r.Get(ctx, client.ObjectKey{Name: name}, &cap)
+		switch {
+		case nsErr == nil && apierrors.IsNotFound(clusterErr):
+			res.specs = append(res.specs, ap.Spec) // namespaced only
+		case apierrors.IsNotFound(nsErr) && clusterErr == nil:
+			res.specs = append(res.specs, cap.Spec) // cluster only (the fallback)
+		case nsErr == nil && clusterErr == nil:
+			// D98: BOTH scopes name it — the namespaced one wins (the author's
+			// explicit choice); the collision is surfaced by the caller
+			// (transition-gated PolicyNameCollision Warning Event), not
+			// rejected (a shared-name org policy must not break Loops).
+			res.specs = append(res.specs, ap.Spec)
+			res.collisions = append(res.collisions, name)
+		case apierrors.IsNotFound(nsErr) && apierrors.IsNotFound(clusterErr):
+			// Neither scope names it: the caller maps to PolicyNotFound.
+			return policyRefsResolution{}, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, nsErr)
+		default:
+			// A non-NotFound error on either read: transient — fail closed.
+			if nsErr != nil {
+				return policyRefsResolution{}, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, nsErr)
+			}
+			return policyRefsResolution{}, fmt.Errorf("resolve ClusterAgentPolicy %s: %w", name, clusterErr)
+		}
+	}
+	return res, nil
+}
+
+// emitPolicyNameCollision (P6a, D98) emits ONE Warning Event per
+// transition of the collision set (not per pass): the sorted current set is
+// recorded in the coxswain.io/policy-collisions annotation (the durable
+// per-Loop surface; the operator already writes annotations on the Loop for
+// the I52 resume + deliver-keep patterns) and the Event fires only when the
+// set changes. When the set becomes empty the annotation is removed and no
+// Event fires (the collision is gone; PolicyValid stays True).
+func (r *LoopReconciler) emitPolicyNameCollision(ctx context.Context, loop *coxv1alpha1.Loop, collisions []string) {
+	slices.Sort(collisions)
+	key := "coxswain.io/policy-collisions"
+	var prev string
+	if loop.Annotations != nil {
+		prev = loop.Annotations[key]
+	}
+	cur := strings.Join(collisions, ",")
+	if prev == cur {
+		return // unchanged: no Event, no write
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "PolicyNameCollision",
+			"policyRefs %v name both a namespaced AgentPolicy and a ClusterAgentPolicy; the namespaced one wins (D98) — drop one of the colliding names if the collision is unexpected", collisions)
+	}
+	if loop.Annotations == nil {
+		loop.Annotations = map[string]string{}
+	}
+	if cur == "" {
+		delete(loop.Annotations, key)
+	} else {
+		loop.Annotations[key] = cur
+	}
+	r.updateLoopAnnotations(ctx, loop)
+}
+
+// updateLoopAnnotations persists loop.Annotations (the collision set's
+// durable surface, the PolicyValid condition, and the other annotation
+// writes) via a re-fetch + metadata-only Update (the I42e/conditional-update
+// pattern: re-fetch to avoid clobbering a concurrent writer; a lost race
+// re-lands on the next pass — the transition gate re-fires only when the
+// set actually changes, so a lost write degrades to a later Event, never a
+// missed one).
+func (r *LoopReconciler) updateLoopAnnotations(ctx context.Context, loop *coxv1alpha1.Loop) {
+	var fresh coxv1alpha1.Loop
+	if err := r.Get(ctx, client.ObjectKeyFromObject(loop), &fresh); err != nil {
+		return
+	}
+	fresh.Annotations = loop.Annotations
+	_ = r.Update(ctx, &fresh)
 }
 
 // dedupToolsBySpec removes duplicate ToolSpecs from the union by full struct
@@ -4180,14 +4301,19 @@ func (r *LoopReconciler) toolProxyImage() string {
 // like network / exec / files). Returns (tools, error); error propagates
 // (fail-closed: a transient read error must never be treated as "no tools"
 // — the gate and the ensure path both fail closed).
+// effectivePolicyTools returns the deduped tool union across the Loop's
+// referenced policies (P6a: resolved through resolvePolicyRefs so a
+// ClusterAgentPolicy ref contributes its tools the same way a namespaced
+// AgentPolicy ref does — the single resolver feeds every effective-policy
+// read).
 func (r *LoopReconciler) effectivePolicyTools(ctx context.Context, loop *coxv1alpha1.Loop) ([]coxv1alpha1.ToolSpec, error) {
 	union := make([]coxv1alpha1.ToolSpec, 0)
-	for _, name := range loop.Spec.PolicyRefs {
-		ap := &coxv1alpha1.AgentPolicy{}
-		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
-			return nil, fmt.Errorf("resolve AgentPolicy %s/%s: %w", loop.Namespace, name, err)
-		}
-		union = append(union, ap.Spec.Tools...)
+	res, err := r.resolvePolicyRefs(ctx, loop)
+	if err != nil {
+		return nil, err
+	}
+	for i := range res.specs {
+		union = append(union, res.specs[i].Tools...)
 	}
 	return dedupTools(union), nil
 }
@@ -6744,8 +6870,15 @@ type policyValidationResult struct {
 	// PolicyNotFound) when valid is false.
 	reason string
 	// message is the human-readable explanation.
-	message            string
+	message string
+	// transientReadError is true when the failure was a transient read error
+	// (the caller requeues without failing the Loop).
 	transientReadError bool
+	// policyNameCollisions (P6a, D98): the policyRefs names that name BOTH a
+	// namespaced AgentPolicy and a ClusterAgentPolicy (namespaced wins in the
+	// resolution; the set is surfaced by agentPoliciesValid via the
+	// transition-gated PolicyNameCollision Warning Event, never rejected).
+	policyNameCollisions []string
 }
 
 // findInClusterNetworkAllow (I42e) delegates to the pure policy check. It
@@ -6835,31 +6968,41 @@ func toolUpstreamHost(upstream string) string {
 // rejected with reason InClusterAllow (PolicyValid=False + sandbox suspend,
 // same fail-closed pattern as C6a's PolicyNotFound).
 // Runs BEFORE ensureSandbox so a bad policy never creates a sandbox pod.
+// validateAgentPolicies is the controller-level policy validation (the
+// second line of defence after the CRD CEL rule): it walks every referenced
+// policy's exec list (the eBPF translation's input) and rejects
+// non-canonical paths. (P6a: it resolves refs through resolvePolicyRefs so a
+// ClusterAgentPolicy ref is validated identically, and carries the D98
+// collision set onto the success result so agentPoliciesValid can surface
+// it.)
 func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1alpha1.Loop) policyValidationResult {
+	res, rerr := r.resolvePolicyRefs(ctx, loop)
+	if rerr != nil {
+		if apierrors.IsNotFound(rerr) {
+			// Neither scope named the ref: the EXISTING unknown-policy gate
+			// (fail-closed, unchanged by P6a).
+			return policyValidationResult{valid: false, reason: "PolicyNotFound",
+				message: fmt.Sprintf("%s not found (referenced by policyRefs)", rerr.Error())}
+		}
+		// Unreadable (transient error): fail closed, requeue.
+		return policyValidationResult{valid: false, reason: "PolicyNotFound",
+			message:            rerr.Error(),
+			transientReadError: true}
+	}
 	unionNetwork := make([]string, 0)
 	unionExec := make([]string, 0)
 	unionTools := make([]coxv1alpha1.ToolSpec, 0)
-	for _, name := range loop.Spec.PolicyRefs {
-		ap := &coxv1alpha1.AgentPolicy{}
-		if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: name}, ap); err != nil {
-			if apierrors.IsNotFound(err) {
-				return policyValidationResult{valid: false, reason: "PolicyNotFound",
-					message: fmt.Sprintf("AgentPolicy %s/%s not found (referenced by policyRefs)", loop.Namespace, name)}
-			}
-			// Unreadable (transient error): fail closed, requeue.
-			return policyValidationResult{valid: false, reason: "PolicyNotFound",
-				message:            fmt.Sprintf("AgentPolicy %s/%s could not be read: %v", loop.Namespace, name, err),
-				transientReadError: true}
-		}
-		for _, e := range ap.Spec.Exec {
+	for i, name := range loop.Spec.PolicyRefs {
+		spec := &res.specs[i]
+		for _, e := range spec.Exec {
 			if isNonCanonicalPath(e) {
 				return policyValidationResult{valid: false, reason: "NonCanonicalExecPath",
 					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
 			}
 		}
-		unionExec = append(unionExec, ap.Spec.Exec...)
-		unionNetwork = append(unionNetwork, ap.Spec.Network...)
-		unionTools = append(unionTools, ap.Spec.Tools...)
+		unionExec = append(unionExec, spec.Exec...)
+		unionNetwork = append(unionNetwork, spec.Network...)
+		unionTools = append(unionTools, spec.Tools...)
 	}
 	// D41c (ADR-0008): a union conflict — the same tool name with different
 	// specs across the referenced policies — is unsolvable (which upstream /
@@ -6907,7 +7050,7 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 		return policyValidationResult{valid: false, reason: "ExecListMissingShell",
 			message: fmt.Sprintf("D46: an agent exec list (%q) does not include the runner's shell %q (the runner runs every tool call via %q -c); exec fencing does not apply to the agent in the MVP — drop the agent exec list or add the shell. Exec fencing stays for the operator-owned proxies; per-tool agent proxies (no general shell) are the D41 follow-on", unionExec, runnerShellPath, runnerShellBase)}
 	}
-	return policyValidationResult{valid: true}
+	return policyValidationResult{valid: true, policyNameCollisions: res.collisions}
 }
 
 // isNonCanonicalPath returns true if the path is non-canonical: it contains

@@ -266,8 +266,8 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 					}},
 				},
 				Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{Name: "sandbox", Image: runnerImage}},
-					},
+					Containers: []corev1.Container{{Name: "sandbox", Image: runnerImage}},
+				},
 				Status: corev1.PodStatus{Phase: corev1.PodPending},
 			}
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())

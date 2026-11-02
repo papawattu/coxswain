@@ -63,14 +63,6 @@ const (
 	// 20h+ with no decision).
 	unschedulableLoopPodsBound = 10 * time.Minute
 
-	// unschedulableRequeueAfter is the requeue interval the caller (Reconcile)
-	// applies while the Loop has at least one unschedulable pod: the caller
-	// sets verifyRequeue (the bool) so the shared reconcileRequeueAfter returns
-	// workRequeue (5s) on the stuck pass. Five seconds matches the repo's
-	// other short requeues; the bound is re-checked every pass, and a node
-	// added or re-labelled resolves the state well inside the bound.
-	unschedulableRequeueAfter = workRequeue
-
 	// unschedulableLoopPodsCondition is the Loop condition that SURFACES an
 	// unschedulable Loop pod (I90). True + Unschedulable while any Loop pod
 	// is unschedulable (the message names the pod(s) + the scheduler's own

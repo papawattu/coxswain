@@ -229,8 +229,8 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		}
 		reconcile(r, ns, "d77-s1")
 		l := getLoop(ns, "d77-s1")
-		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition)).NotTo(BeTrue(), "a successful read is not stale (absent or False)")
-		Expect(cond(l, coxv1alpha1.BudgetHoldCondition)).NotTo(BeTrue(), "a fresh reading is not a hold (absent or False)")
+		Expect(conditionTruePresent(l, coxv1alpha1.BudgetReadingStaleCondition)).To(BeFalse(), "a successful read is not stale (absent or False)")
+		Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(), "a fresh reading is not a hold (absent or False)")
 
 		By("3 consecutive failed reads (one per reconcile) -> BudgetReadingStale=True (F44) and BudgetHold=True")
 		failReads(r)
@@ -239,7 +239,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		}
 		l = getLoop(ns, "d77-s1")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning), "the hold is at Planning")
-		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition)).To(BeTrue(), "F44: 3 failed reads set BudgetReadingStale")
+		Expect(conditionTruePresent(l, coxv1alpha1.BudgetReadingStaleCondition)).To(BeTrue(), "F44: 3 failed reads set BudgetReadingStale")
 		hold := cond(l, coxv1alpha1.BudgetHoldCondition)
 		Expect(hold).NotTo(BeNil(), "BudgetHold condition must be set")
 		Expect(hold.Status).To(Equal(metav1.ConditionTrue), "a maxCost Loop with a stale reading is held")
@@ -299,7 +299,8 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning), "release is not a phase change (no restart)")
 		By("the budget keeps working after the release (the read folded in: the cost was derived)")
 		Expect(l.Status.Budget).NotTo(BeNil())
-		Expect(l.Status.Budget.CostUsd).NotTo(BeEmpty(), "a post-release fresh read derives the cost (the read kept running)")
+		Expect(l.Status.Budget.LastUsageReadAt).NotTo(BeNil(), "a post-release fresh read updated the last read time (the read kept running)")
+		Expect(l.Status.Budget.ConsecutiveReadFailures).To(BeZero(), "the release came from a successful read, not counted failures")
 	})
 
 	It("spec 3: maxTokens only + stale reading -> NOT held (the owner chose surface-only for maxTokens)", func() {
@@ -320,7 +321,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		l := getLoop(ns, "d77-s3")
 		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition).Status).To(Equal(metav1.ConditionTrue),
 			"F44 still SURFACES the staleness for a maxTokens-only Loop")
-		Expect(cond(l, coxv1alpha1.BudgetHoldCondition)).NotTo(BeTrue(),
+		Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(),
 			"maxTokens-only: the stale reading surfaces, it does not hold (owner choice (a); absent or False)")
 	})
 
@@ -344,7 +345,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		for i := 0; i < budgetReadFailureThreshold-1; i++ {
 			reconcile(r, ns, "d77-s4")
 			l := getLoop(ns, "d77-s4")
-			Expect(cond(l, coxv1alpha1.BudgetHoldCondition)).NotTo(BeTrue(),
+			Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(),
 				"failures below the F44 threshold (%d) must NOT hold the Loop (absent or False)", budgetReadFailureThreshold)
 		}
 
@@ -385,7 +386,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhasePaused), "suspend=true -> Paused")
 		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition).Status).To(Equal(metav1.ConditionTrue),
 			"the stale reading is still SURFACED while paused (the surface is not inert)")
-		Expect(cond(l, coxv1alpha1.BudgetHoldCondition)).NotTo(BeTrue(),
+		Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(),
 			"the gate is inert in Paused: the decision is re-evaluated on resume (P2f; absent or False)")
 
 		By("P5f delivery hold: the gate is inert (it would lose the delivery result)")
@@ -409,7 +410,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition).Status).To(Equal(metav1.ConditionTrue),
 			"the stale reading is still surfaced in the delivery hold")
 		Expect(loopHoldingForDelivery(l)).To(BeTrue(), "fixture: the P5f delivery hold is active")
-		Expect(cond(l, coxv1alpha1.BudgetHoldCondition)).NotTo(BeTrue(),
+		Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(),
 			"the gate is inert in the P5f delivery hold: it would lose the delivery result (absent or False)")
 
 		By("terminal phases (Succeeded): the gate is inert (a finished Loop is never held)")
@@ -427,6 +428,6 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		reconcileStale(r3, ns3, "d77-s5c")
 		l = getLoop(ns3, "d77-s5c")
 		Expect(l.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded), "terminal is not touched")
-		Expect(cond(l, coxv1alpha1.BudgetHoldCondition)).NotTo(BeTrue(), "the gate is inert in a terminal phase (absent or False)")
+		Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(), "the gate is inert in a terminal phase (absent or False)")
 	})
 })

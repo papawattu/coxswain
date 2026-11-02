@@ -103,16 +103,16 @@ func loopNamedSecrets(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.
 	}
 	add(loop.Spec.Workspace.GitCredentialSecret, "spec.workspace.gitCredentialSecret")
 	add(loop.Spec.Agent.EndpointSecretRef, "spec.agent.endpointSecretRef")
-	// The tool-credential references live on the referenced AgentPolicies
-	// (the same reads validateAgentPolicies does; an unreadable policy is the
-	// PolicyValid gate's problem, not this one — it holds upstream).
-	for _, ref := range loop.Spec.PolicyRefs {
-		ap := &coxv1alpha1.AgentPolicy{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: ref}, ap); err != nil {
-			continue // the PolicyValid gate holds the Loop for this
-		}
-		for _, tool := range ap.Spec.Tools {
-			add(tool.CredentialSecretRef.Name, "agentPolicy."+ap.Name+".spec.tools[].credentialSecretRef")
+	// The tool-credential references live on the referenced policies (P6a:
+	// resolved through resolvePolicyRefs so a ClusterAgentPolicy ref's tools
+	// are named the same way; the PolicyValid gate holds the Loop for a
+	// resolvable ref, so a resolution failure here is the gate's problem, not
+	// this one — it holds upstream).
+	if res, rerr := r.resolvePolicyRefs(ctx, loop); rerr == nil {
+		for i, ref := range loop.Spec.PolicyRefs {
+			for _, tool := range res.specs[i].Tools {
+				add(tool.CredentialSecretRef.Name, "agentPolicy."+ref+".spec.tools[].credentialSecretRef")
+			}
 		}
 	}
 	slices.SortFunc(named, func(a, b namedSecret) int { return strings.Compare(a.name, b.name) })

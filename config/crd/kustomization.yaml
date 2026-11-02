@@ -4,6 +4,7 @@
 resources:
 - bases/coxswain.wattu.com_loops.yaml
 - bases/coxswain.wattu.com_agentpolicies.yaml
+- bases/coxswain.wattu.com_clusteragentpolicies.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

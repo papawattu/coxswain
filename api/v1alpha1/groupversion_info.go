@@ -37,7 +37,7 @@ var (
 	SchemeBuilder = runtime.NewSchemeBuilder(
 		func(scheme *runtime.Scheme) error {
 			metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
-			scheme.AddKnownTypes(SchemeGroupVersion, &Loop{}, &LoopList{}, &AgentPolicy{}, &AgentPolicyList{})
+			scheme.AddKnownTypes(SchemeGroupVersion, &Loop{}, &LoopList{}, &AgentPolicy{}, &AgentPolicyList{}, &ClusterAgentPolicy{}, &ClusterAgentPolicyList{})
 			return nil
 		},
 	)

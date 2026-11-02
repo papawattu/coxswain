@@ -93,6 +93,7 @@ var knownResourceGroup = map[string]string{
 	"loops/status":          coxGroup,
 	"loops/finalizers":      coxGroup,
 	"agentpolicies":         coxGroup,
+	"clusteragentpolicies":  coxGroup,
 }
 
 // groupForResource returns the resource's real API group from the trusted
@@ -234,6 +235,11 @@ func TestRBACCoverage(t *testing.T) {
 		// AgentPolicies: the loop's AgentPolicy is read through the cached
 		// client (loop_controller.go r.Get).
 		{group: coxGroup, resource: "agentpolicies",
+			minVerbs: []string{verbGet, verbList, verbWatch}},
+		// ClusterAgentPolicy (P6a): the cluster-scoped companion is read
+		// through the cached client the same way (resolvePolicyRefs' cluster
+		// fallback + policyRefsCollisions).
+		{group: coxGroup, resource: "clusteragentpolicies",
 			minVerbs: []string{verbGet, verbList, verbWatch}},
 		// VolumeSnapshots: the B1 checkpoint reads (ensureCheckpoint's
 		// AlreadyExists re-read, applyCheckpointRetention's list + delete,
@@ -512,6 +518,7 @@ func TestRBACCachedClientReads(t *testing.T) {
 		{"", "serviceaccounts"},                  // r.Get the memory-writer SA (the ensure's idempotency read; the Loop's namespace)
 		{coxGroup, "loops"},                      // r.Get/r.List the Loops
 		{coxGroup, "agentpolicies"},              // r.Get the loop's AgentPolicy
+		{coxGroup, "clusteragentpolicies"},       // P6a: r.Get the cluster fallback + collision check
 		{agentsGroup, "sandboxes"},               // r.Get the sandbox
 		// B1 (I86): the checkpoint VolumeSnapshots are read through the cached
 		// client (ensureCheckpoint / applyCheckpointRetention / gcLoopCheckpoints).

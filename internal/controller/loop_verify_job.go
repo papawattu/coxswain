@@ -1358,7 +1358,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	deadline := verifyJobActiveDeadlineSeconds
 	never := corev1.RestartPolicyNever
 	verifyJobFalse := false
-	return batchv1.JobSpec{
+	jobSpec := batchv1.JobSpec{
 		BackoffLimit:          &backoff,
 		ActiveDeadlineSeconds: &deadline,
 		Template: corev1.PodTemplateSpec{
@@ -1382,6 +1382,11 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			},
 		},
 	}
+	// C2 + D101: the verify Job's pod template carries the CURRENT Loop node
+	// placement. Jobs are immutable and short-lived: a flag change re-places
+	// NEW verify Jobs only (documented in OPERATOR.md).
+	r.applyLoopPlacement(&jobSpec.Template.Spec)
+	return jobSpec
 }
 
 // trustedContainerSecurityContext is the hardened profile every verify Job

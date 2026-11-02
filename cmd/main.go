@@ -254,6 +254,24 @@ func main() {
 		"The image the egress proxy sidecar pods run (one per Loop with network allows, I42b). "+
 			"Default: empty (the reconciler's coxswain-egress-proxy:standin dev stand-in; the release's "+
 			"ghcr.io/<owner>/coxswain-egress-proxy image may be kind-loaded / pre-pulled and passed here).")
+	// C2 + D101 (Phase 6): the Loop node-placement flags. Empty (the default)
+	// means no placement — today's behaviour. A malformed token is a STARTUP
+	// error naming the bad token (parsed in loop_placement_flag.go; the
+	// malformed-token contract is pinned by cmd/loop_placement_flag_test.go).
+	var loopNodeSelector string
+	flag.StringVar(&loopNodeSelector, "loop-node-selector", "",
+		"Comma-separated key=value node labels every operator-owned Loop workload (sandbox, "+
+			"proxy pods, verify/deliver/memory-writer Jobs) is pinned to (C2/D101). "+
+			"Default: empty (no placement). A malformed token fails startup with the token named.")
+	var loopTolerations string
+	flag.StringVar(&loopTolerations, "loop-tolerations", "",
+		"Comma-separated node tolerations for every operator-owned Loop workload (C2/D101). "+
+			"Forms (the approved plan's format, PLAN-PHASE6.md): key:op:effect, key:op:effect:value, "+
+			"key:op:effect:value:seconds (op is always field 2: Equal | Exists — NotEqual is not a "+
+			"Kubernetes toleration operator; effect: NoSchedule | PreferNoSchedule | NoExecute). "+
+			"Equal requires a value; Exists must not have one (seconds-only Exists keeps the value "+
+			"slot empty: key:Exists:NoExecute::30). Default: empty (no tolerations). A malformed token "+
+			"fails startup with the token named.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	opts := zap.Options{
@@ -263,6 +281,20 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// C2: the parse runs at STARTUP (after flag.Parse so the flag values are
+	// read, after the logger is set so a bad token names itself in the log)
+	// so the operator does not start with a silently different placement.
+	loopNodeSelectorMap, err := parseLoopNodeSelector(loopNodeSelector)
+	if err != nil {
+		setupLog.Error(err, "Invalid --loop-node-selector")
+		os.Exit(1)
+	}
+	loopTolerationsList, err := parseLoopTolerations(loopTolerations)
+	if err != nil {
+		setupLog.Error(err, "Invalid --loop-tolerations")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -468,6 +500,10 @@ func main() {
 			EgressProxyImage:       egressProxyImage,
 			ProxyImage:             proxyImage,
 			OperatorNamespace:      operatorNamespace,
+			// C2 + D101: the Loop node-placement flags (parsed above; empty =
+			// no placement, today's behaviour).
+			LoopNodeSelector: loopNodeSelectorMap,
+			LoopTolerations:  loopTolerationsList,
 		}, kaEnforcer, cniProber, cniRegateSrc, auditHolder)
 	if err := loopReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "loop")

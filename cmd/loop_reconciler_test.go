@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/papawattu/coxswain/internal/controller"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -92,6 +93,11 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		EgressProxyImage:       "ep:tag",
 		ProxyImage:             "proxy:tag",
 		OperatorNamespace:      "coxswain-system",
+		LoopNodeSelector:       map[string]string{"pool": "loops", "zone": "a"},
+		LoopTolerations: []corev1.Toleration{{
+			Key: "pool", Operator: corev1.TolerationOpEqual,
+			Value: "loops", Effect: corev1.TaintEffectNoSchedule,
+		}},
 	}
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -125,6 +131,24 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		t.Errorf("ProxyImage not wired: %q", r.ProxyImage)
 	case r.OperatorNamespace != "coxswain-system":
 		t.Errorf("OperatorNamespace not wired: %q", r.OperatorNamespace)
+	}
+	// C2: the placement flags reach the reconciler (a dropped mapping fails a
+	// test: silently unplaced Loops are the defect the flags exist to fix).
+	if len(r.LoopNodeSelector) != 2 || r.LoopNodeSelector["pool"] != "loops" || r.LoopNodeSelector["zone"] != "a" {
+		t.Errorf("LoopNodeSelector not wired: %v", r.LoopNodeSelector)
+	}
+	if len(r.LoopTolerations) != 1 || r.LoopTolerations[0].Key != "pool" ||
+		r.LoopTolerations[0].Effect != corev1.TaintEffectNoSchedule {
+		t.Errorf("LoopTolerations not wired: %+v", r.LoopTolerations)
+	}
+	// Positive control for the EMPTY flags: defaults mean no placement
+	// (today's behaviour). The options above are the only source of the
+	// fields, so this asserts the mapping does not inject defaults.
+	r = newLoopReconciler(fake.NewClientBuilder().WithScheme(scheme).Build(),
+		scheme, nil, newLoopReconcilerOptions{}, nil, nil, nil, nil)
+	if len(r.LoopNodeSelector) != 0 || len(r.LoopTolerations) != 0 {
+		t.Errorf("empty options must carry no placement: selector=%v tolerations=%+v",
+			r.LoopNodeSelector, r.LoopTolerations)
 	}
 	// The embedded client must be the one main handed over (not nil): the
 	// reconciler's Get/Update calls all go through it.
